@@ -1203,13 +1203,13 @@
     ],
     "references": [
       { "rule": "operand" },
-      { "rule": "structTypeRef", "nameMatch": "lastIdentifier", "isTagReference": true },
-      { "rule": "unionTypeRef",  "nameMatch": "lastIdentifier", "isTagReference": true },
-      { "rule": "enumTypeRef",   "nameMatch": "lastIdentifier", "isTagReference": true },
-      { "$c25Comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the REFERENCE arm of the unified specifiers. A body-ABSENT `structSpec`/`unionSpec`/`enumSpec` (`struct S v;` / `struct S;`) is a TAG reference — these rows resolve its tag in the Tag namespace, exactly as the former `structTypeRef`/etc. did, via the SAME isTagReference path. The DEFINITION arm (body present) is the paired declarations-row above; the engine routes per-node on the body child's presence (`definesWhenChild`), so a definition is never double-processed as a reference. `nameMatch: lastIdentifier` extracts the tag from [Kw, Identifier].",
-        "rule": "structSpec", "nameMatch": "lastIdentifier", "isTagReference": true },
-      { "rule": "unionSpec", "nameMatch": "lastIdentifier", "isTagReference": true },
-      { "rule": "enumSpec",  "nameMatch": "lastIdentifier", "isTagReference": true }
+      { "rule": "structTypeRef", "nameMatch": "lastIdentifier", "isTagReference": true, "compositeKind": "struct" },
+      { "rule": "unionTypeRef",  "nameMatch": "lastIdentifier", "isTagReference": true, "compositeKind": "union" },
+      { "rule": "enumTypeRef",   "nameMatch": "lastIdentifier", "isTagReference": true, "compositeKind": "enum" },
+      { "$c25Comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the REFERENCE arm of the unified specifiers. A body-ABSENT `structSpec`/`unionSpec`/`enumSpec` (`struct S v;` / `struct S;`) is a TAG reference — these rows resolve its tag in the Tag namespace, exactly as the former `structTypeRef`/etc. did, via the SAME isTagReference path. The DEFINITION arm (body present) is the paired declarations-row above; the engine routes per-node on the body child's presence (`definesWhenChild`), so a definition is never double-processed as a reference. `nameMatch: lastIdentifier` extracts the tag from [Kw, Identifier]. c35 (D-CSUBSET-FORWARD-STRUCT-DECLARATION): `compositeKind` drives the forward-mint of an INCOMPLETE composite on a tag MISS (an opaque `struct S *` / `typedef struct S S;` whose S is never defined — sqlite3_stmt), so the reference resolves to a sizeable Ptr<incomplete> instead of S_UnknownType; a VALUE/by-value-member/sizeof of it still fails loud (computeLayout incomplete guard). `enum` keeps the fail-loud miss (value-typed).",
+        "rule": "structSpec", "nameMatch": "lastIdentifier", "isTagReference": true, "compositeKind": "struct" },
+      { "rule": "unionSpec", "nameMatch": "lastIdentifier", "isTagReference": true, "compositeKind": "union" },
+      { "rule": "enumSpec",  "nameMatch": "lastIdentifier", "isTagReference": true, "compositeKind": "enum" }
     ],
     "memberAccesses": [
       { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,

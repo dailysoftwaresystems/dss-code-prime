@@ -5516,7 +5516,15 @@ struct Lowerer {
         // requireNamedDeclarators arm, so it must NOT re-report here.
         if (!singleMode && declarators.empty() && decl->requireNamedDeclarators) {
             NodeId const spec = findCompositeSpecifierIn(node);
-            if (!spec.valid()) {
+            // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: a body-ABSENT NAMED
+            // composite specifier as a LOCAL statement (`struct S;` inside a
+            // block) is a forward DECLARATION of an opaque tag — the semantic
+            // tier already minted the incomplete tag (block-scoped via c24/c28).
+            // Emit NOTHING (no runtime effect), exactly like the top-level
+            // forward-decl path; only a head with NEITHER a definition NOR a
+            // forward-declared tag (`int;`) declares nothing and stays loud.
+            if (!spec.valid()
+                && !findForwardCompositeSpecifierIn(node).valid()) {
                 emitH(DiagnosticCode::S_DeclarationDeclaresNothing, node,
                       std::string{tree().text(node)});
             }
@@ -5720,9 +5728,12 @@ struct Lowerer {
     // (`definesWhenChild`) carries `fieldChildren` whether or not its body is
     // present — but a body-ABSENT occurrence (`struct S;` forward-decl /
     // `struct S v;` head) is a tag REFERENCE, not a definition, so it must NOT be
-    // recovered as the type-declaring node (else `struct S;` would lower to a
-    // TypeDecl instead of keeping its current `S_DeclarationDeclaresNothing` — a
-    // regression of forward-decl behavior). Require the body child present for a
+    // recovered HERE as the type-declaring node (which emits a TypeDecl). A
+    // body-absent NAMED form is instead matched by the c35
+    // `findForwardCompositeSpecifierIn` sibling, which makes a bare `struct S;`
+    // emit NOTHING (an opaque forward declaration — the incomplete tag was minted
+    // semantically), NOT `S_DeclarationDeclaresNothing`
+    // (D-CSUBSET-FORWARD-STRUCT-DECLARATION). Require the body child present for a
     // gated row.
     // c25: is a dual-mode composite specifier a DEFINITION at node `n` (its body
     // child present)? A non-gated row is always a definition. Mirrors the
@@ -5760,6 +5771,56 @@ struct Lowerer {
             if (hit.valid()) return hit;
         }
         return NodeId{};
+    }
+
+    // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: the sibling of
+    // `findCompositeSpecifierIn` for the FORWARD-DECLARATION form — a composite
+    // specifier (`fieldChildren`) whose body is ABSENT but that carries a tag
+    // NAME (`struct S;` — NOT `struct;`, NOT a body-present definition). The
+    // semantic analyzer already FORWARD-MINTED the incomplete tag for such a
+    // head (the isTagReference arm / a later definition completes it), so a bare
+    // forward declaration needs NO runtime HIR node — it is the C-legal opaque
+    // declaration of a tag, not a declares-nothing constraint violation. A
+    // body-PRESENT definition is recovered by `findCompositeSpecifierIn` above
+    // (emits a TypeDecl); a head with NO composite specifier at all (`int ;`)
+    // matches NEITHER and still fails loud. Agnostic: keyed on the `fieldChildren`
+    // config + the declaration row's `name` child resolving to a real identifier
+    // leaf, never a rule-name or keyword.
+    NodeId findForwardCompositeSpecifierIn(NodeId n) {
+        if (!n.valid() || tree().kind(n) != NodeKind::Internal) return NodeId{};
+        auto it = declMap_.find(tree().rule(n).v);
+        if (it != declMap_.end()) {
+            DeclarationRule const& d = sem.declarations[it->second];
+            if (d.fieldChildren.has_value()
+                && !compositeSpecifierIsDefinition(d, n)
+                && compositeSpecifierHasTagName(d, n)) {
+                return n;
+            }
+        }
+        for (NodeId c : visible(n)) {
+            NodeId const hit = findForwardCompositeSpecifierIn(c);
+            if (hit.valid()) return hit;
+        }
+        return NodeId{};
+    }
+
+    // c35: does composite specifier `n` carry a tag NAME — i.e. is its `name`
+    // child a real identifier leaf (`struct S` / `union U`), distinguishing a
+    // forward DECLARATION (`struct S;`, mints/refs a tag) from an anonymous
+    // body-less `struct;` (which declares nothing and must stay loud)? Reads the
+    // declaration row's positional `name` child via the same `declRoleChildren`
+    // the binder uses, so it is positionally exact for the unified specifier
+    // shape `[Kw, {opt Identifier}, {opt body}]`.
+    [[nodiscard]] bool
+    compositeSpecifierHasTagName(DeclarationRule const& decl, NodeId n) const {
+        if (!decl.nameChild.has_value()) return false;
+        auto vis = declRoleChildren(tree(), n, decl);
+        if (*decl.nameChild >= vis.size()) return false;
+        NodeId const nameNode = vis[*decl.nameChild];
+        if (!nameNode.valid() || tree().kind(nameNode) != NodeKind::Token)
+            return false;
+        SchemaTokenId const tk = tree().tokenKind(nameNode);
+        return sem.identifierToken.valid() && tk == sem.identifierToken;
     }
 
     // FC4 c1: declarator-mode topLevelDecl — Function (the kindByChild
@@ -5877,6 +5938,17 @@ struct Lowerer {
             NodeId const spec = findCompositeSpecifierIn(node);
             if (spec.valid()) {
                 out.push_back(lowerTypeDecl(spec));
+            } else if (findForwardCompositeSpecifierIn(node).valid()) {
+                // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: a bare FORWARD
+                // declaration (`struct S;` — a body-ABSENT NAMED composite
+                // specifier) declares an OPAQUE tag, not nothing. The semantic
+                // analyzer already forward-minted the incomplete tag (or a later
+                // definition completed it); emit NO runtime HIR node here (a
+                // TypeDecl would carry no complete layout and no MIR effect — a
+                // forward decl is a pure declaration). A `Ptr<incomplete>` use
+                // resolves through the minted tag; a VALUE/by-value-member/sizeof
+                // of it still fails loud through the unchanged computeLayout
+                // incomplete guard.
             } else {
                 // C 6.7p2: a declaration with NEITHER a named declarator NOR a
                 // tag (`int ;`) declares nothing — a constraint violation, now

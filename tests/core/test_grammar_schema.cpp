@@ -1920,6 +1920,76 @@ TEST(GrammarSchema, SemanticsDefinesWhenChildUnknownChildRuleReportsUnknownShape
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
 }
 
+// ── c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: references[].compositeKind ──────
+//
+// `compositeKind` on a `references[]` row drives the opaque-tag forward-mint
+// (struct/union mint an incomplete tag on a miss; enum keeps the fail-loud miss).
+// It is meaningful ONLY on a tag-reference row, and only for the three composite
+// kinds — each misconfiguration gets a red-on-disable loader pin (the
+// guard-needs-a-red-test discipline).
+
+// `compositeKind` on a NON-tag-reference row → C_InvalidSemantics (it would be a
+// silently-ignored field — a config author would expect it to do something).
+TEST(GrammarSchema, ReferenceCompositeKindOnNonTagRowReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root": { "sequence": [ "ref", "Semi" ] },
+        "ref": { "sequence": [ "Identifier" ] }
+      },
+      "semantics": {
+        "references": [ { "rule": "ref", "compositeKind": "struct" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// An UNKNOWN `compositeKind` string on a tag-reference row → C_InvalidSemantics
+// (a typo must not silently default to Struct and mis-mint a union/enum tag).
+TEST(GrammarSchema, ReferenceCompositeKindUnknownValueReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root": { "sequence": [ "ref", "Semi" ] },
+        "ref": { "sequence": [ "Identifier" ] }
+      },
+      "semantics": {
+        "references": [ { "rule": "ref", "isTagReference": true,
+                          "compositeKind": "telepathic" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// POSITIVE: a tag-reference row WITH a valid `compositeKind` loads clean (the
+// happy path the negatives above bracket).
+TEST(GrammarSchema, ReferenceCompositeKindOnTagRowLoadsClean) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root": { "sequence": [ "ref", "Semi" ] },
+        "ref": { "sequence": [ "Identifier" ] }
+      },
+      "semantics": {
+        "references": [ { "rule": "ref", "isTagReference": true,
+                          "compositeKind": "union" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    EXPECT_TRUE(r.has_value())
+        << "a tag-reference row with a valid compositeKind must load clean";
+}
+
 // ── D-LK10-ENTRY-MAIN-IMPLICIT-RETURN loader negative tests ───────
 //
 // `implicitReturnZeroForFunctionNames` on `DeclarationRule` accepts

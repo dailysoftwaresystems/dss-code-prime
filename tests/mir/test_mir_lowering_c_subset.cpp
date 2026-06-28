@@ -7506,3 +7506,65 @@ TEST(MirLoweringCSubsetVolatile, ContainerVolatileIndexThenMember) {
     EXPECT_EQ(countOpWithVolatile(L2.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u)
         << "a plain `struct S arr[4]` `arr[i].a` must NOT be volatile";
 }
+
+// ── c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION — opaque / incomplete struct ──
+// These pin the FAIL-LOUD axis end-to-end: an opaque (forward-declared, never
+// defined) struct is INCOMPLETE; a `Ptr<incomplete>` is sizeable and usable, but
+// any VALUE / by-value-member / sizeof of the incomplete type has NO knowable
+// size and must FAIL LOUD at the storage tier (the computeLayout incomplete
+// guard, UNCHANGED by c35) — never a silent zero-size slot / wrong offset. The
+// semantic phase ACCEPTS these forms (the forward-mint gives the tag a valid but
+// incomplete TypeId); the guard fires at HIR/MIR lowering, so these pins run the
+// FULL pipeline and assert `!L.mir.ok` (or a HIR diagnostic). RED-on-disable:
+// weaken the computeLayout incomplete guard and one of these silently lowers.
+
+// VALUE of an incomplete struct (a local object) — fails loud end-to-end. c35
+// rejects it at the SEMANTIC tier (S_IncompleteTypeObject, the earliest point
+// with the full type); the MIR allocaForLocal computeLayout guard is the deeper
+// backstop. Either way the full pipeline must NOT silently produce a zero-size
+// frame slot.
+TEST(MirLoweringCSubset, C35ValueOfIncompleteFailsLoud) {
+    auto L = lowerCSubset(
+        "struct S;\n"
+        "int main(void){ struct S v; (void)v; return 0; }\n");
+    EXPECT_TRUE(L.model.hasErrors() || !L.hir->ok || !L.mir.ok)
+        << "a by-value local object of an incomplete struct must fail loud — "
+           "never a silent zero-size frame slot";
+}
+
+// MEMBER through a pointer to an incomplete struct — fieldByteOffset has no layout.
+TEST(MirLoweringCSubset, C35MemberOfIncompletePointerFailsLoud) {
+    auto L = lowerCSubset(
+        "struct S;\n"
+        "int g(struct S *p){ return p->x; }\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_TRUE(L.model.hasErrors() || !L.hir->ok || !L.mir.ok)
+        << "a member access through a pointer to an incomplete struct must fail "
+           "loud — its layout is unknowable";
+}
+
+// SIZEOF of an incomplete struct (in a value context) — computeLayout returns none.
+TEST(MirLoweringCSubset, C35SizeofOfIncompleteFailsLoud) {
+    auto L = lowerCSubset(
+        "struct S;\n"
+        "int main(void){ return (int)sizeof(struct S); }\n");
+    EXPECT_TRUE(L.model.hasErrors() || !L.hir->ok || !L.mir.ok)
+        << "sizeof of an incomplete struct must fail loud — never a guessed size";
+}
+
+// POSITIVE end-to-end: an OPAQUE handle (`struct Stmt;` never defined) passed BY
+// POINTER through a NON-inlined call lowers CLEAN — `Ptr<incomplete>` is sizeable
+// and usable. The sqlite3_stmt pattern. RED-on-disable: without the forward-mint
+// this would not even reach lowering (S_UnknownType in the semantic phase).
+TEST(MirLoweringCSubset, C35OpaqueHandleViaPointerLowersClean) {
+    auto L = lowerCSubset(
+        "struct Stmt;\n"
+        "int probe(struct Stmt *p){ return p ? 1 : 0; }\n"
+        "int main(void){ return probe(0) + 42; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+}

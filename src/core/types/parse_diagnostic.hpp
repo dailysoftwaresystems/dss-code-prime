@@ -455,6 +455,21 @@ enum class DiagnosticCode : std::uint16_t {
     // the emit is gated by emitOnMiss; the reject is not), so the name is NEVER
     // silently dropped and mis-parsed as the bare base type (`(int x)` → `(int)`).
     S_TypeNameDeclaratorNotAbstract = 0xE027,
+    // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: an OBJECT (a variable / global,
+    // NOT a member) declared with an INCOMPLETE composite type by VALUE —
+    // `struct S v;` where `struct S` is forward-declared but never defined (C
+    // 6.7p7 / 6.2.5: an object shall not have an incomplete type, except as
+    // permitted for a tentative array). c35 made an opaque tag forward-MINT an
+    // incomplete TypeId (so an opaque `struct S *` pointer compiles); the SAME
+    // mint means `struct S v;` now resolves the tag — so the by-VALUE object of
+    // an incomplete type must be REJECTED HERE at the semantic tier (the earliest
+    // point with the full type), rather than only at MIR lowering (the
+    // allocaForLocal computeLayout guard). A POINTER to an incomplete type
+    // (`struct S *p`) is LEGAL and never trips this; an ARRAY of incomplete
+    // element (`struct S a[4]`) does (its element has no size). The sibling of
+    // S_IncompleteTypeMember (the by-value MEMBER case) — together they keep a
+    // by-value use of an incomplete composite from EVER silently folding to size 0.
+    S_IncompleteTypeObject        = 0xE028,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 69> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 70> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -270,6 +270,16 @@ constexpr std::array<DiagnosticCode, 69> kUnsuppressableCodes{{
     // Same silent-miscompile-guard class as the entries above; a pointer-to-
     // incomplete (`struct N *`) is legal and is NOT rejected.
     DiagnosticCode::S_IncompleteTypeMember,
+    // S_IncompleteTypeObject (c35, D-CSUBSET-FORWARD-STRUCT-DECLARATION,
+    // 2026-06-28): a by-VALUE OBJECT (local/global) of an INCOMPLETE composite —
+    // `struct S v;` where `struct S` is forward-declared but never defined. c35's
+    // opaque-tag forward-mint makes the reference RESOLVE (so an opaque `struct S
+    // *` pointer compiles); suppressing this by-value reject would let the object
+    // fold its frame/.bss size to 0 (the incomplete composite has no layout) — a
+    // silent wrong-bytes object. Same silent-miscompile-guard class as
+    // S_IncompleteTypeMember (the by-value MEMBER case); a pointer-to-incomplete is
+    // legal and is NOT rejected.
+    DiagnosticCode::S_IncompleteTypeObject,
     // S_TypeNameDeclaratorNotAbstract (c26, D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME,
     // 2026-06-27): a TYPE-NAME (cast / sizeof / compound-literal) whose abstract
     // declarator illegally carries a NAME (`(int x)expr`). NOTE — unlike the

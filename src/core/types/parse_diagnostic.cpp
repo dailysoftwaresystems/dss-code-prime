@@ -128,6 +128,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_IncompleteTypeMember";
         case DiagnosticCode::S_TypeNameDeclaratorNotAbstract:
             return "S_TypeNameDeclaratorNotAbstract";
+        case DiagnosticCode::S_IncompleteTypeObject:
+            return "S_IncompleteTypeObject";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

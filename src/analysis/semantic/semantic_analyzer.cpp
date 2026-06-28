@@ -819,6 +819,14 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                    NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
                    bool allowFlexibleArray);
 
+// c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: forward declaration — the
+// tag-namespace-scope floater (defined below) is consumed early by
+// `resolveTypeNodeImpl`'s isTagReference arm to bind an opaque forward-minted
+// composite tag into the nearest enclosing namespace scope (C11 6.2.1).
+[[nodiscard]] ScopeId
+floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
+                      Tree const& tree, ScopeId scope);
+
 // Resolve a type-position subtree to a TypeId. Walks `typeShapes`
 // recursively (e.g. pointerType[innerType] → Ptr<innerType>) and looks
 // the leaf up in `builtinTypes`. A leaf that is not a built-in type but
@@ -997,11 +1005,64 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             return rec.type;
                         }
                     }
+                    // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: the tag is NOT
+                    // bound — an OPAQUE / forward-declared composite (`struct S *`,
+                    // `typedef struct S S;` where S is never defined; the
+                    // sqlite3_stmt handle). For a Struct/Union tag reference,
+                    // FORWARD-MINT an INCOMPLETE composite NOW and bind it into the
+                    // Tag namespace of the nearest enclosing namespace scope (C11
+                    // 6.2.1 — a tag belongs to the enclosing block/file scope, never
+                    // a transient declarator-dominator), so this reference and every
+                    // later reference to the same tag resolve to ONE TypeId (the
+                    // Tag binding deduplicates — only the first miss mints). The
+                    // result is INCOMPLETE: a `Ptr<incomplete>` is sizeable and
+                    // usable (the opaque-handle case), while a VALUE / by-value
+                    // member / sizeof of it fails loud through the UNCHANGED
+                    // computeLayout incomplete guard (the no-silent-miscompile
+                    // backstop — never a guessed/zero size). A same-TU DEFINITION
+                    // of the tag needs NO merge step here: Pass 1's whole-tree
+                    // PRE-ORDER binds a definition's COMPLETE tag BEFORE any type
+                    // reference resolves, so this forward-mint fires ONLY for a
+                    // genuinely-never-defined tag — a forward-then-define resolves
+                    // every reference to the definition's complete TypeId. Enum is
+                    // value-typed (no incomplete representation), so an Enum tag-miss
+                    // falls through to the fail-loud arm below — `compositeKind` is
+                    // config, never a hardcoded keyword. The decl-site key packs the
+                    // reference node so the mint is unique-but-deterministic; the
+                    // Tag binding (not this key) is what unifies repeat references.
+                    auto const& tagRef = cfg.references[refIt->second];
+                    if (tagRef.compositeKind != CompositeKind::Enum) {
+                        TypeKind const compKind =
+                            tagRef.compositeKind == CompositeKind::Union
+                                ? TypeKind::Union
+                                : TypeKind::Struct;
+                        std::uint64_t const declSiteKey =
+                            (static_cast<std::uint64_t>(tree.id().v) << 32)
+                            | static_cast<std::uint64_t>(node.v);
+                        TypeId const incomplete =
+                            s.lattice.interner().forwardComposite(
+                                compKind, rn.name, declSiteKey);
+                        ScopeId const bindScope =
+                            floatToNamespaceScope(s, cfg, tree, scope);
+                        SymbolRecord rec;
+                        rec.name         = rn.name;
+                        rec.scope        = bindScope;
+                        rec.declNode     = node;
+                        rec.declRuleNode = node;
+                        rec.tree         = tree.id();
+                        rec.kind         = DeclarationKind::Type;
+                        rec.type         = incomplete;
+                        SymbolId const newId = s.symbols.mint(rec);
+                        s.scopes.bind(bindScope, rn.name, newId,
+                                      SymbolNamespace::Tag);
+                        return incomplete;
+                    }
                 }
                 // Tag miss: fall through to the generic miss arm (below) so an
-                // undeclared `struct Nope` fails loud with S_UnknownType. Do
-                // NOT descend into the StructKeyword/Identifier children (the
-                // Identifier would resolve ORDINARY and cross the namespaces).
+                // undeclared `struct Nope` / `enum Nope` fails loud with
+                // S_UnknownType. Do NOT descend into the StructKeyword/Identifier
+                // children (the Identifier would resolve ORDINARY and cross the
+                // namespaces).
                 if (emitOnMiss && !specifierDiagnosed) {
                     ParseDiagnostic d;
                     d.code     = DiagnosticCode::S_UnknownType;
@@ -2871,6 +2932,37 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                         if (declTy.valid()) {
                             s.symbols.at(sym).type = declTy;
                             s.nodeToType.set(nameNode, declTy);
+                            // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: an OBJECT
+                            // (a named local/global, `requireNamedDeclarators` —
+                            // NOT a param, NOT a struct field [those route through
+                            // the composite-composition incomplete-MEMBER guard],
+                            // NOT a typedef [kind != Variable]) declared BY VALUE
+                            // with an INCOMPLETE composite type fails loud HERE (C
+                            // 6.7p7 / 6.2.5 — an object shall have a complete type).
+                            // c35's opaque-tag forward-mint makes `struct S v;`
+                            // RESOLVE the tag (so `struct S *p` opaque pointers
+                            // compile); this is the by-value counterpart that keeps
+                            // a never-defined `struct S v;` from silently folding to
+                            // size 0 — the earliest tier with the full type (the MIR
+                            // allocaForLocal computeLayout guard is the deeper
+                            // backstop). A POINTER to an incomplete type is a Ptr
+                            // (never an incomplete composite) and is correctly NOT
+                            // flagged; an `extern` declaration (completed elsewhere)
+                            // is excluded. Mirrors S_IncompleteTypeMember.
+                            if (s.symbols.at(sym).kind
+                                        == DeclarationKind::Variable
+                                && decl.requireNamedDeclarators
+                                && !s.symbols.at(sym).isExternDeclaration
+                                && s.lattice.interner()
+                                       .isIncompleteComposite(declTy)) {
+                                ParseDiagnostic d;
+                                d.code     = DiagnosticCode::S_IncompleteTypeObject;
+                                d.severity = DiagnosticSeverity::Error;
+                                d.buffer   = tree.source().id();
+                                d.span     = tree.span(nameNode);
+                                d.actual   = std::string{tree.text(nameNode)};
+                                s.reporter.report(std::move(d));
+                            }
                         }
                         // c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR: a NAMED
                         // struct/union bit-field (`int x : 3;` / per-slot

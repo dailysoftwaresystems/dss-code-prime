@@ -729,6 +729,18 @@ struct DSS_EXPORT ReferenceRule {
     // per-language config (c-subset's structTypeRef/unionTypeRef/enumTypeRef),
     // never a hardcoded keyword.
     bool isTagReference = false;
+    // D-CSUBSET-FORWARD-STRUCT-DECLARATION (c35): the composite kind this tag
+    // reference names — read ONLY when `isTagReference` is true. When a tag
+    // reference MISSES (the tag was never bound) and this kind is Struct/Union,
+    // the resolver FORWARD-MINTS an INCOMPLETE composite (`forwardComposite`) and
+    // binds it into the Tag namespace, so an opaque handle (`struct S *` whose S
+    // is never defined — the sqlite3_stmt/sqlite3_blob pattern) resolves to a
+    // sizeable `Ptr<incomplete>` instead of failing S_UnknownType. A VALUE /
+    // by-value member / sizeof of the incomplete type still fails loud through
+    // the unchanged computeLayout incomplete guard. Enum is value-typed (an
+    // opaque enum has no representation), so an Enum tag-miss keeps the
+    // fail-loud path. Default Struct; the loader only honours it on tag rows.
+    CompositeKind compositeKind = CompositeKind::Struct;
 };
 
 // Source built-in type name → lattice type mapping. Used during

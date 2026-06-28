@@ -5731,6 +5731,44 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     entry.at("isTagReference").get<bool>();
                             }
                         }
+                        // D-CSUBSET-FORWARD-STRUCT-DECLARATION (c35): the
+                        // composite KIND a tag reference names — drives the
+                        // forward-mint of an INCOMPLETE composite when an opaque
+                        // tag (`struct S *`, never defined) misses. Only honoured
+                        // on a tag-reference row (`isTagReference`); Struct/Union
+                        // mint, Enum keeps the fail-loud miss (value-typed, no
+                        // incomplete representation). Mirrors the
+                        // `fieldChildren.compositeKind` spelling so the two
+                        // composite-kind axes read identically.
+                        if (entry.contains("compositeKind")) {
+                            if (!entry.at("compositeKind").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/compositeKind",
+                                          "'compositeKind' must be a string "
+                                          "'struct', 'union' or 'enum'");
+                            } else if (!rule.isTagReference) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/compositeKind",
+                                          "'compositeKind' is only meaningful on a "
+                                          "tag-reference row ('isTagReference': true)");
+                            } else {
+                                auto const k =
+                                    entry.at("compositeKind").get<std::string>();
+                                if (k == "struct") {
+                                    rule.compositeKind = CompositeKind::Struct;
+                                } else if (k == "union") {
+                                    rule.compositeKind = CompositeKind::Union;
+                                } else if (k == "enum") {
+                                    rule.compositeKind = CompositeKind::Enum;
+                                } else {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/compositeKind",
+                                              std::format("'compositeKind' must be "
+                                                          "'struct', 'union' or 'enum' "
+                                                          "(got '{}')", k));
+                                }
+                            }
+                        }
                         cfg.references.push_back(std::move(rule));
                     }
                 }

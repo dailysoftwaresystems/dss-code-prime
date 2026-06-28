@@ -3839,18 +3839,23 @@ TEST(SemanticAnalyzerCSubset, TagAndAliasBothResolveSameType) {
     EXPECT_FALSE(model.hasErrors());
 }
 
-// (c) The negative is PRESERVED: an undeclared tag `struct Nope x;` still fails
-// loud with exactly one S_UnknownType.
-// RED-ON-DISABLE: drop the `emitOnMiss` fail-loud arm inside MF-1 (return
-// InvalidType silently on a tag miss) and this count falls to 0 — a silent
-// accept of an unknown tag.
-TEST(SemanticAnalyzerCSubset, UnknownTagFiresUnknownType) {
+// (c) The negative is PRESERVED, with the c35-correct manifestation: a
+// never-defined tag used BY VALUE (`struct Nope x;`) is an OBJECT of an
+// INCOMPLETE type (c35: the opaque tag forward-mints incomplete, so the
+// reference RESOLVES — it is no longer "unknown"; the error moves to the
+// by-value object). Fail loud with S_IncompleteTypeObject. RED-ON-DISABLE: drop
+// the c35 incomplete-object guard and `struct Nope x;` silently accepts a
+// zero-size object at the semantic tier.
+TEST(SemanticAnalyzerCSubset, UnknownTagByValueFiresIncompleteObject) {
     auto model = analyzeShipped("c-subset", {
         "typedef struct Pair { int a; } Pair;\n"
         "int main(void) { struct Nope x; return 0; }\n",
     });
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
-        << "an undeclared struct tag must fail loud exactly once";
+    EXPECT_TRUE(model.hasErrors())
+        << "a by-value object of a never-defined struct tag must fail loud";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompleteTypeObject), 1u)
+        << "an object of an incomplete (forward-only) struct type fails loud once";
 }
 
 // A struct TAG `S` and an ordinary OBJECT `S` coexist in one scope chain and
@@ -4127,12 +4132,13 @@ TEST(SemanticAnalyzerCSubset, TypedefSelfReferentialStructCompiles) {
 // `struct A { struct B *b; }; struct B { struct A *a; };`. A's body references
 // `struct B` by pointer BEFORE B is defined; Pass-1 forward-mints BOTH tags
 // (whole-tree pre-order) so the pointer resolves to an incomplete `struct B`,
-// completed when B's body is processed, and B then references A. NOTE: a BARE
-// `struct B;` forward-declaration STATEMENT is a SEPARATE, deferred feature
-// (D-CSUBSET-FORWARD-STRUCT-DECLARATION) — it does NOT parse today, so it is
-// deliberately NOT used here (an earlier version of this test included it and
-// was FALSE-GREEN: model.hasErrors() reads only the semantic reporter and was
-// blind to the bare-decl PARSE error).
+// completed when B's body is processed, and B then references A. (c35 NOTE: a
+// BARE `struct B;` forward-declaration STATEMENT now ALSO works —
+// D-CSUBSET-FORWARD-STRUCT-DECLARATION — but the IMPLICIT pointer form here is
+// the original c24 path and is kept as its own pin. An earlier version of this
+// test used a bare `struct B;` and was FALSE-GREEN: `model.hasErrors()` reads
+// only the semantic reporter and was blind to the then-PARSE-error; today the
+// bare form parses, but this test stays on the implicit form to pin c24.)
 TEST(SemanticAnalyzerCSubset, MutuallyRecursiveStructsCompile) {
     auto model = analyzeShipped("c-subset", {
         "struct A { struct B *b; int x; };\n"
@@ -4269,18 +4275,23 @@ TEST(SemanticAnalyzerCSubset, C25ForwardPointerFieldResolves) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
 }
 
-// (3c) A tag reference to an UNDEFINED struct fails loud — S_UnknownType,
-// the EXACT code the former `structTypeRef` emitted (unchanged). RED-on-disable:
-// if a body-absent `structSpec` wrongly took the inline-type-definition arm
-// (which returns InvalidType silently), this would emit a DIFFERENT code / none.
-TEST(SemanticAnalyzerCSubset, C25UndefinedStructTagFailsLoudUnknownType) {
+// (3c) A by-VALUE object of an UNDEFINED struct fails loud. c35: the opaque tag
+// forward-mints an INCOMPLETE type so `struct Nope` RESOLVES (no S_UnknownType);
+// the by-value object `struct Nope v;` is then an OBJECT of incomplete type →
+// S_IncompleteTypeObject. (Pre-c35 this was S_UnknownType; c35 moves the error to
+// the precise constraint — an incomplete object, not an unknown type. An opaque
+// `struct Nope *p` POINTER would be CLEAN.) RED-on-disable: drop the c35
+// incomplete-object guard and this silently accepts a zero-size object.
+TEST(SemanticAnalyzerCSubset, C35UndefinedStructTagByValueFailsLoudIncompleteObject) {
     auto cu = buildShippedUnit("c-subset", {
         "int main() { struct Nope v; return 0; }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
-        << "a bare `struct Nope` (undefined tag) must fail loud S_UnknownType";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompleteTypeObject), 1u)
+        << "a by-value `struct Nope v;` (undefined tag) is an incomplete object — "
+           "must fail loud S_IncompleteTypeObject";
 }
 
 // (3d) Redefinition of a tag collides — S_RedeclaredSymbol, exactly as today.
@@ -4295,24 +4306,132 @@ TEST(SemanticAnalyzerCSubset, C25StructTagRedefinitionCollides) {
         << "two definitions of tag S must collide exactly as before c25";
 }
 
-// (3 forward-decl) A bare `struct S;` (no body, no object) — now grammar-
-// parseable as the unified `structSpec` REFERENCE form — must NOT silently
-// become a type definition. The dual-mode binder routes the body-absent spec to
-// the tag-reference path; the tag `S` is undefined (a real forward-declaration as
-// a DEFINITION is the separate deferred D-CSUBSET-FORWARD-STRUCT-DECLARATION), so
-// it FAILS LOUD with S_UnknownType. RED-on-disable: if a body-absent `structSpec`
-// wrongly took the inline-type-DEFINITION arm (minting a phantom type), no
-// S_UnknownType would fire and the bare decl would be silently accepted.
-TEST(SemanticAnalyzerCSubset, C25BareStructForwardDeclFailsLoud) {
+// (c35 forward-decl) A bare `struct S;` (no body, no object) is a FORWARD
+// DECLARATION of an opaque tag (C 6.7.2.3) — it MINTS an INCOMPLETE composite
+// and binds it into the Tag namespace, with NO error. (INVERTS the former
+// C25BareStructForwardDeclFailsLoud, which asserted the pre-c35 S_UnknownType:
+// c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION deliberately changes that behavior so
+// the sqlite3_stmt opaque-handle pattern compiles.) RED-on-disable: drop the
+// isTagReference forward-mint and the tag misses → S_UnknownType returns and the
+// `S` symbol is never an incomplete Type. The incomplete flag is the witness
+// that the type stays UN-sizeable — a VALUE/by-value-member/sizeof of it fails
+// loud through the unchanged computeLayout guard (covered by the dedicated
+// fail-loud pins below).
+TEST(SemanticAnalyzerCSubset, C35BareStructForwardDeclMintsIncompleteTag) {
     auto cu = buildShippedUnit("c-subset", {
         "struct S;\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "`struct S;` (a forward declaration) must compile, minting an opaque tag";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "a forward-declared tag is NOT an unknown type — it is an incomplete one";
+    SymbolRecord const* s = findSym(model, "S");
+    ASSERT_NE(s, nullptr) << "the forward declaration must mint a Type symbol `S`";
+    EXPECT_EQ(s->kind, DeclarationKind::Type);
+    ASSERT_TRUE(s->type.valid());
+    EXPECT_TRUE(model.lattice().interner().isIncompleteComposite(s->type))
+        << "a never-defined forward-declared `struct S` stays INCOMPLETE "
+           "(un-sizeable) — the no-silent-zero-size backstop";
+}
+
+// (c35) OPAQUE handle via pointer: `typedef struct S S;` (S never defined) used
+// ONLY as `S *` — the sqlite3_stmt shape. The tag-reference miss forward-mints an
+// INCOMPLETE composite; the typedef alias resolves to it; `S *p` is a sizeable
+// Ptr<incomplete> and the whole TU is clean. RED-on-disable: without the
+// forward-mint the base `struct S` misses → S_UnknownType on both the typedef and
+// the param.
+TEST(SemanticAnalyzerCSubset, C35OpaqueTypedefViaPointerCompiles) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef struct S S;\n"
+        "int use(S *p){ return p ? 1 : 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "an opaque typedef'd struct used only by pointer must compile";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
+    SymbolRecord const* s = findSym(model, "S");
+    ASSERT_NE(s, nullptr);
+    ASSERT_TRUE(s->type.valid());
+    EXPECT_TRUE(model.lattice().interner().isIncompleteComposite(s->type))
+        << "the opaque handle's underlying tag stays incomplete";
+}
+
+// (c35) FORWARD-then-DEFINE completes the SAME tag: `struct S; struct S { int a; };`
+// — the later definition COMPLETES the forward-declared tag (no collision), and a
+// member of an object of it resolves. RED-on-disable: a redefinition collision
+// here (S_RedeclaredSymbol) or a member miss (S_NotAComposite) flags a broken
+// forward→complete unification.
+TEST(SemanticAnalyzerCSubset, C35ForwardThenDefineCompletesNoCollision) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S;\n"
+        "struct S { int a; };\n"
+        "int main(void){ struct S v; v.a = 42; return v.a; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a forward declaration completed by a later definition must be clean";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "completing a forward tag is NOT a redeclaration";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotAComposite), 0u)
+        << "the member access resolves through the completed tag";
+    SymbolRecord const* s = findSym(model, "S");
+    ASSERT_NE(s, nullptr);
+    ASSERT_TRUE(s->type.valid());
+    EXPECT_FALSE(model.lattice().interner().isIncompleteComposite(s->type))
+        << "after its definition the tag is COMPLETE (sizeable)";
+}
+
+// (c35 ★ fail-loud) The VALUE-of-incomplete fail-loud (`struct S v;` — a local
+// OBJECT of a never-defined struct) is enforced at the STORAGE tier (the MIR
+// allocaForLocal / data-producer computeLayout incomplete guard), NOT the
+// semantic phase — see C35ValueOfIncompleteFailsLoud in the MIR-lowering suite
+// (tests/mir/test_mir_lowering_c_subset.cpp), which runs the full pipeline.
+
+// (c35 ★ fail-loud) MEMBER of an incomplete-pointer: `struct S; p->x` where S is
+// incomplete — the member access has no layout to resolve and must FAIL LOUD
+// (S_NotAComposite / the layout miss), never a wrong offset. RED-on-disable: a
+// dropped incomplete guard would resolve a phantom offset.
+TEST(SemanticAnalyzerCSubset, C35MemberOfIncompletePointerFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S;\n"
+        "int g(struct S *p){ return p->x; }\n"
+        "int main(void){ return 0; }\n",
+    });
     EXPECT_TRUE(model.hasErrors())
-        << "`struct S;` (no body, no object) must fail loud, never silently mint";
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
-        << "the body-absent `struct S` resolves as a reference to an UNDEFINED tag";
+        << "a member access through a pointer to an incomplete struct must fail "
+           "loud — its layout is unknowable";
+}
+
+// (c35 ★ fail-loud) SIZEOF of an incomplete type: `sizeof(struct S)` where S is
+// incomplete is ill-formed (C 6.5.3.4) — must FAIL LOUD, never a guessed size.
+// RED-on-disable: a 0 (or any) size leaking out would silently size the array.
+TEST(SemanticAnalyzerCSubset, C35SizeofOfIncompleteFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S;\n"
+        "int a[sizeof(struct S)];\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_TRUE(model.hasErrors())
+        << "sizeof of an incomplete struct must fail loud";
+}
+
+// (c35 PRESERVE) TWO DEFINITIONS still collide: `struct S { int a; }; struct S
+// { int b; };` — two COMPLETE definitions of the same tag are a redefinition
+// (S_RedeclaredSymbol). The forward-decl relaxation must NOT swallow this — only
+// an INCOMPLETE prior tag is completable; a complete one collides. RED-on-disable:
+// losing this lets a struct be silently redefined with a different layout.
+TEST(SemanticAnalyzerCSubset, C35TwoDefinitionsStillCollide) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int a; };\n"
+        "struct S { int b; };\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "two complete definitions of the same tag must still collide";
 }
 
 // (3b) Anonymous typedef struct: `typedef struct { int x; } T; T v; v.x;` —
@@ -4374,12 +4493,17 @@ TEST(SemanticAnalyzerCSubset, C25UnionDefineMintsRefResolves) {
     EXPECT_EQ(u->type.v, un.v) << "`union U u;` resolves to the minted union type";
 }
 
-TEST(SemanticAnalyzerCSubset, C25UndefinedUnionTagFailsLoudUnknownType) {
+// c35: the union mirror — a by-value object of an undefined union tag is an
+// object of an incomplete type (the opaque tag forward-mints incomplete) →
+// S_IncompleteTypeObject (pre-c35: S_UnknownType).
+TEST(SemanticAnalyzerCSubset, C35UndefinedUnionTagByValueFailsLoudIncompleteObject) {
     auto model = analyzeShipped("c-subset", {
         "int main() { union Nope u; return 0; }\n",
     });
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
-        << "a bare `union Nope` (undefined tag) must fail loud S_UnknownType";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompleteTypeObject), 1u)
+        << "a by-value `union Nope u;` (undefined tag) is an incomplete object — "
+           "must fail loud S_IncompleteTypeObject";
 }
 
 // (3f-enum) ENUM define/reference parity. The enum DEFINITION mints the type
@@ -4526,11 +4650,16 @@ TEST(SemanticAnalyzerCSubset, C28LocalUnionAndEnumDefine) {
     EXPECT_TRUE(e->type.valid());
 }
 
-// (c28c) ★ BLOCK-SCOPING NON-LEAK (the c27 lesson): a local `struct S {int a;}`
-// minted in an INNER block must NOT be visible to a SIBLING/outer scope. The
-// outer `struct S w;` (after the inner block closed) sees no S → S_UnknownType.
-// RED-ON-DISABLE: if the tag leaked to the function/module scope, the outer ref
-// would resolve and the diagnostic would vanish — a silent scope-leak miscompile.
+// (c28c) ★ BLOCK-SCOPING NON-LEAK (the c27 lesson, c35-updated manifestation): a
+// local `struct S {int a;}` minted in an INNER block must NOT be visible to a
+// SIBLING/outer scope. Post-c35 the outer `struct S w;` (after the inner block
+// closed) forward-mints a FRESH INCOMPLETE `struct S` (NOT the inner COMPLETE
+// one) — so `w` is an object of an INCOMPLETE type → S_IncompleteTypeObject, and
+// `w.a` cannot resolve. The incompleteness IS the non-leak witness: if the inner
+// COMPLETE tag had leaked, `w` would be COMPLETE, `struct S w;` would be CLEAN,
+// and `w.a` would silently resolve a phantom field — the exact scope-leak
+// miscompile this pins. RED-ON-DISABLE: a leak makes `w` complete → no
+// S_IncompleteTypeObject and the test fails.
 TEST(SemanticAnalyzerCSubset, C28LocalStructDoesNotLeakToOuterScope) {
     auto cu = buildShippedUnit("c-subset", {
         "int main(void){ { struct S { int a; }; } struct S w; w.a = 1; return 0; }\n",
@@ -4539,8 +4668,10 @@ TEST(SemanticAnalyzerCSubset, C28LocalStructDoesNotLeakToOuterScope) {
     auto model = analyze(cu);
     EXPECT_TRUE(model.hasErrors())
         << "the outer `struct S w;` must fail — S is block-local to the inner {}";
-    EXPECT_GT(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
-        << "an inner-block struct S must NOT leak to the enclosing scope";
+    EXPECT_GT(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompleteTypeObject), 0u)
+        << "the outer `struct S` is a FRESH incomplete tag (the inner COMPLETE "
+           "struct S must NOT leak to the enclosing scope)";
 }
 
 // (c28d) NOMINAL distinctness (c24 decl-site identity) across scopes: an OUTER

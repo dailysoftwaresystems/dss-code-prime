@@ -845,10 +845,11 @@ TEST(HirLoweringCSubset, TopLevelDeclaresNothingFailsLoudNoCrash) {
 // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: a body-PRESENT specifier WITH a
 // declarator (`struct S { int x; } v;`) is a definition-introducing global — it
 // lowers cleanly (the `compositeSpecifierIsDefinition` gate admits it because its
-// body child is present). The body-ABSENT counterpart (`struct S;`) is a tag
-// reference that fails loud (S_UnknownType at the semantic tier) — pinned in the
-// semantic suite (SemanticAnalyzerCSubset.C25BareStructForwardDeclFailsLoud).
-// RED-on-disable: if the gate were inverted, THIS would spuriously fail-loud.
+// body child is present). The body-ABSENT counterpart (`struct S;`) is now a
+// FORWARD DECLARATION (c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION): it mints an
+// opaque tag at the semantic tier and lowers to NOTHING (no TypeDecl, no fail) —
+// pinned in TopLevelForwardStructDeclLowersToNothing below. RED-on-disable: if
+// the body-present gate were inverted, THIS would spuriously fail-loud.
 TEST(HirLoweringCSubset, StructDefinitionWithObjectLowersClean) {
     SemanticModel model = analyzeCSubset(
         "struct S { int x; } v;\nint main(void) { return 0; }\n");
@@ -860,6 +861,42 @@ TEST(HirLoweringCSubset, StructDefinitionWithObjectLowersClean) {
     EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
     EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 0u)
         << "`struct S { int x; } v;` declares an object — must NOT fail loud";
+}
+
+// c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: a bare top-level FORWARD declaration
+// (`struct S;` — a body-ABSENT NAMED composite specifier) is the opaque-tag
+// declaration. The semantic tier minted the incomplete tag; the HIR lowering must
+// emit NOTHING and must NOT fail loud (it is NOT a declares-nothing constraint
+// violation). RED-on-disable: drop the `findForwardCompositeSpecifierIn` no-op arm
+// and the bare forward decl re-emits S_DeclarationDeclaresNothing (res->ok false).
+// Contrast TopLevelDeclaresNothingFailsLoudNoCrash (`int ;`, NO tag → still loud).
+TEST(HirLoweringCSubset, TopLevelForwardStructDeclLowersToNothing) {
+    SemanticModel model = analyzeCSubset(
+        "struct S;\nint main(void) { return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 0u)
+        << "`struct S;` is a forward declaration of an opaque tag — must NOT fail loud";
+}
+
+// c35: the LOCAL twin — a bare `struct S;` as a block STATEMENT is a (block-scoped)
+// forward declaration; lowers to nothing, no fail-loud. Contrast
+// LocalDeclaresNothingFailsLoud (`int;`, NO tag → still loud).
+TEST(HirLoweringCSubset, LocalForwardStructDeclLowersToNothing) {
+    SemanticModel model = analyzeCSubset(
+        "int main(void){ struct S; return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 0u)
+        << "a block-scoped `struct S;` forward declaration must NOT fail loud";
 }
 
 // D5.1: a struct used as a pointer-typed parameter + member access via `->`
