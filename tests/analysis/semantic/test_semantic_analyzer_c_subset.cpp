@@ -1305,6 +1305,128 @@ TEST(SemanticAnalyzerCSubset, CompoundAssignToNonConstIsClean) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u);
 }
 
+// ===== c36 (D-CSUBSET-MUTABLE-POINTER-TO-CONST) =====
+// `const` qualifies the type it directly modifies (C 6.7.3). For a pointer
+// declarator the OBJECT is const iff the OUTERMOST (last source-order) pointer
+// layer carries `* const` — a HEAD/pointee const (`const char *p`) leaves the
+// pointer OBJECT mutable. The verdict is read from the declarator structure
+// (declaratorObjectIsConst), NOT a coarse whole-decl const scan. Each form
+// below is a red-on-disable pin: revert the fix and the GROUP-2/5/8/9 "clean"
+// pins flip to a spurious S_ConstViolation.
+
+// GROUP 2 — pointer-to-const: the pointer object is MUTABLE (the bug; was a
+// spurious S_ConstViolation before c36). This is the sqlite `zFormat += 4`.
+TEST(SemanticAnalyzerCSubset, MutablePointerToConstParamIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(const char *p){ p += 4; return (int)*p; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+}
+TEST(SemanticAnalyzerCSubset, MutablePointerToConstEastIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(char const *p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+}
+
+// GROUP 3 — const POINTER: the object IS const → modifying it violates.
+TEST(SemanticAnalyzerCSubset, ConstPointerParamEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(char * const p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// GROUP 4 — const pointer to const: object const → violates.
+TEST(SemanticAnalyzerCSubset, ConstPointerToConstParamEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(const char * const p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// GROUP 5 — multi-level pointers: the OUTERMOST layer decides.
+// `char * const *p` — inner pointer const, OUTER pointer mutable → clean.
+TEST(SemanticAnalyzerCSubset, MultiLevelInnerConstOuterMutableIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(char * const *p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+}
+// `char ** const p` — OUTER pointer const → violates.
+TEST(SemanticAnalyzerCSubset, MultiLevelOuterConstEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(char ** const p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+// `const char **p` — pointee const, both pointers mutable → clean.
+TEST(SemanticAnalyzerCSubset, MultiLevelHeadConstIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(const char **p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+}
+
+// GROUP 8 — multi-declarator: each declarator's OWN outermost layer decides.
+// `const int *p, x;` → p is pointer-to-const (mutable), x is a const scalar.
+TEST(SemanticAnalyzerCSubset, MultiDeclaratorPointerCleanScalarViolates) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(){ const int *p, x; p += 1; x = 2; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // exactly one violation — on `x` (the const scalar), NOT on `p`.
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_ConstViolation) EXPECT_EQ(d.actual, "x");
+    }
+}
+
+// GROUP 9 — const + volatile together must NOT regress c27.
+// `volatile char * const p` — const POINTER (volatile pointee) → violates.
+TEST(SemanticAnalyzerCSubset, VolatilePointeeConstPointerEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(volatile char * const p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+// `const volatile char *p` — cv POINTEE, pointer object mutable → clean.
+TEST(SemanticAnalyzerCSubset, ConstVolatilePointeeMutablePointerIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(const volatile char *p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+}
+
+// GROUP 1 — scalar east-const still violates (no-pointer path unchanged).
+TEST(SemanticAnalyzerCSubset, EastConstScalarStillEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { int const x = 1; x = 2; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
 // SE5: a `typedef int Foo;` mints a Type-kind alias symbol carrying the
 // aliased TypeId (I32). (c-subset's grammar parses the typedef DECL; the
 // alias-in-type-position USE site is exercised generically — see the

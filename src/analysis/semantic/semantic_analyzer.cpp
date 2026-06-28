@@ -617,6 +617,63 @@ subtreeContainsToken(Tree const& tree, NodeId node, SchemaTokenId kind,
     return false;
 }
 
+// c36 (D-CSUBSET-MUTABLE-POINTER-TO-CONST): does THIS declarator declare a
+// const OBJECT? `const` qualifies the type it directly modifies (C 6.7.3):
+// `const char *p` qualifies the POINTEE — the pointer OBJECT `p` is MUTABLE
+// (`p += 1` is legal); only a POST-star `* const` (inside the OUTERMOST pointer
+// layer) qualifies the object itself (`char * const p`). The legacy coarse
+// `subtreeContainsToken(const)` over the whole declaration mis-fires for a
+// pointer-to-const — it sees the head/pointee const and wrongly marks the
+// pointer object const. This is the SAME bug c27 fixed for `volatile` (which
+// became a type qualifier because it affects CODEGEN; const affects only
+// assignability, so it stays a symbol flag — computed correctly HERE).
+//
+// Rule: descend to the inner declaratorRule; if it has >=1 pointer layer, the
+// object is const iff the LAST (outermost, source-order) pointer layer carries
+// the const marker. With NO pointer layer (a scalar, or a pointer hidden in a
+// typedef) the head/east const applies to the object directly — the legacy
+// whole-declaration scan is exactly right. Mirrors the per-layer walk in
+// `declaratorDeclaredType` (the c27 volatile path) — one structural model, the
+// const verdict cannot drift from the type the declarator actually forms.
+//
+// SCOPE: a GROUPED pointer declarator `char (* const p)` hides its layer inside
+// the group, so it falls to the whole-decl scan (STATUS QUO — no regression; it
+// was coarse before too). Grouped-with-head-const stays a pre-existing
+// over-approximation (anchor D-CSUBSET-GROUPED-DECLARATOR-CONST).
+[[nodiscard]] bool
+declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
+                        DeclaratorConfig const& dc, SchemaTokenId constMarker,
+                        std::unordered_map<std::uint32_t, std::size_t> const*
+                            declByRule) {
+    // Descend a per-slot wrapper (initDeclarator / memberDeclarator) to the
+    // inner declaratorRule — the same descent declaratorDeclaredType uses.
+    NodeId inner = dNode;
+    if (dNode.valid() && tree.kind(dNode) == NodeKind::Internal) {
+        RuleId const dr = tree.rule(dNode);
+        if (dr == dc.initDeclaratorRule
+            || (dc.memberDeclaratorRule.has_value()
+                && dr == *dc.memberDeclaratorRule)) {
+            NodeId const d = declarator_walk_detail::firstChildOfRule(
+                TreeDeclaratorView{tree}, dNode, dc.declaratorRule);
+            if (d.valid()) inner = d;
+        }
+    }
+    // The LAST pointer layer in source order = the outermost pointer, whose
+    // qualifier governs the OBJECT. visibleChildren is source-ordered.
+    NodeId lastLayer{};
+    if (inner.valid() && tree.kind(inner) == NodeKind::Internal) {
+        for (NodeId c : visibleChildren(tree, inner)) {
+            if (tree.kind(c) == NodeKind::Internal
+                && tree.rule(c) == dc.pointerLayerRule) {
+                lastLayer = c;
+            }
+        }
+    }
+    if (lastLayer.valid())
+        return subtreeContainsToken(tree, lastLayer, constMarker, declByRule);
+    return subtreeContainsToken(tree, declNode, constMarker, declByRule);
+}
+
 // Extract identifier text + the bound NodeId per the requested matching mode.
 //   Self           — the node IS the name (or wraps a single visible
 //                    identifier).
@@ -2348,9 +2405,19 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         rec.fieldIndex   = static_cast<std::uint32_t>(
                             s.scopes.scopes()[bindScope.v].bindings.size());
                         if (decl.constMarker.has_value()) {
-                            rec.isConst = subtreeContainsToken(
-                                tree, node, *decl.constMarker,
-                                &s.idx().declByRule);
+                            // c36 (D-CSUBSET-MUTABLE-POINTER-TO-CONST): the
+                            // OBJECT's const-ness — a `const char *p` pointer is
+                            // MUTABLE (only `char * const p` is a const object),
+                            // NOT a coarse whole-decl const scan. See
+                            // declaratorObjectIsConst. Falls back to the legacy
+                            // scan only if this language has no declarator config.
+                            rec.isConst = cfg.declarators.has_value()
+                                ? declaratorObjectIsConst(
+                                      tree, node, dNode, *cfg.declarators,
+                                      *decl.constMarker, &s.idx().declByRule)
+                                : subtreeContainsToken(
+                                      tree, node, *decl.constMarker,
+                                      &s.idx().declByRule);
                         }
                         // c27 (D-CSUBSET-VOLATILE-POINTEE): object-volatility is now
                         // derived from the symbol's resolved TYPE (top-level
@@ -2415,6 +2482,13 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         rec.fieldIndex   = static_cast<std::uint32_t>(
                             s.scopes.scopes()[current.v].bindings.size());
                         if (decl.constMarker.has_value()) {
+                            // c36 (D-CSUBSET-MUTABLE-POINTER-TO-CONST): an
+                            // ANONYMOUS field has NO declarator (no pointer layer
+                            // to redirect const onto a pointee) and is NEVER an
+                            // assignment LHS, so its isConst is never read at the
+                            // const-violation check — the coarse whole-node scan
+                            // is harmless here (`int *;` is already rejected as
+                            // declares-nothing). Left as-is by design.
                             rec.isConst = subtreeContainsToken(
                                 tree, node, *decl.constMarker,
                                 &s.idx().declByRule);
@@ -2529,6 +2603,15 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // SE4: const-marking. Scan the type subtree (or the
                     // whole decl subtree when no typeChild) for the
                     // language's const-marker token.
+                    // c36 (D-CSUBSET-MUTABLE-POINTER-TO-CONST): in c-subset NO
+                    // positional-name row sets constMarker (the const-bearing
+                    // rows — varDecl/identVarDecl/forDecl/forIdentDecl/param/
+                    // topLevelDecl — all take the declarator-mode path above,
+                    // which uses declaratorObjectIsConst), so this coarse scan is
+                    // currently unreached. A future positional-name language that
+                    // sets constMarker WITH pointer types must adopt
+                    // declaratorObjectIsConst here too (else `const T *p` here
+                    // would wrongly mark the pointer object const).
                     if (decl.constMarker.has_value()) {
                         NodeId scanRoot = node;
                         if (decl.typeChild.has_value()
