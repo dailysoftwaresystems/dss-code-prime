@@ -244,6 +244,27 @@ TEST(GrammarSchema, MissingRootShapeReportsCode) {
     }));
 }
 
+// c31 D-CSUBSET-LABEL-BUDGET-CLIFF: the `commitAfterPrefix` PEG-cut facet must be
+// a boolean. A non-boolean is a config typo and is rejected LOUD at load
+// (C_UnknownShape "must be a boolean") — never silently ignored. (The sibling
+// mutual-exclusion with `commitRequiresTypeName` is also fail-loud in the loader;
+// it needs a valid type-position config to exercise and is left to a follow-up.)
+TEST(GrammarSchema, CommitAfterPrefixRejectsNonBoolean) {
+    constexpr std::string_view bad = R"({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "shapes": {
+        "root": { "sequence": ["Identifier"], "commitAfterPrefix": 5 }
+      }
+    })";
+    auto result = GrammarSchema::loadFromText(bad);
+    ASSERT_FALSE(result.has_value());
+    auto const& diags = result.error();
+    EXPECT_TRUE(std::ranges::any_of(diags, [](auto const& d) {
+        return d.code == DiagnosticCode::C_UnknownShape;
+    }));
+}
+
 // ─── loadShipped + the on-disk toy.lang.json ─────────────────────────────
 
 TEST(GrammarSchema, LoadShippedToy) {

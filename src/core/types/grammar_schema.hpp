@@ -660,6 +660,18 @@ public:
     [[nodiscard]] TypeNameCommitPolarity
         typeNameCommitPolarity(RuleId rule) const noexcept;
 
+    // commitAfterPrefix CUT (`commitAfterPrefix` on the shape body; PEG
+    // "cut"; D-CSUBSET-LABEL-BUDGET-CLIFF, p19 Cluster G c31). True iff a
+    // speculative probe of `rule` should COMMIT the moment the rule's fixed
+    // leading token-prefix (`predictivePrefixLen(rule)` tokens) is consumed
+    // without failure — the rest of the rule then parses non-speculatively
+    // (no probe budget). False for every rule that omits the flag. The cut
+    // is sound only where no other alternative can match past that prefix;
+    // the config author asserts that by setting the flag. See
+    // `Parser::Impl::trySpeculativeBranch`. Names no token, rule, or
+    // language.
+    [[nodiscard]] bool commitAfterPrefix(RuleId rule) const noexcept;
+
     // Pratt-walker wrapper rule ids declared by `expr.wrapperRules`
     // for `rule`. The loader auto-interned the declared names and
     // validated all three were present, so for an `isExprRule(rule)`

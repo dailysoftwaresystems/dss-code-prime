@@ -210,6 +210,21 @@ struct CompiledRule {
     // `typeNameCommitRule.valid()`.
     TypeNameCommitPolarity     typeNameCommitPolarity =
         TypeNameCommitPolarity::PreferType;
+
+    // commitAfterPrefix CUT (PEG "cut"; D-CSUBSET-LABEL-BUDGET-CLIFF, p19
+    // Cluster G c31). When true, a speculative probe of this rule COMMITS
+    // as soon as the rule's FIXED leading token-prefix (predictivePrefix,
+    // `predictivePrefixLen` tokens) has been consumed without failure — the
+    // rest of the rule then parses NON-speculatively (no probe budget),
+    // driven by the outer dispatch loop on the still-open frame. The cut is
+    // sound only where, after the fixed prefix, no OTHER alternative of the
+    // enclosing alt can match (so committing discards nothing); the config
+    // author asserts that by setting the flag. Sibling facet to
+    // `typeNameCommitRule` — a rule uses at most one. Config-sourced
+    // (`commitAfterPrefix` on the shape body); the engine names no token,
+    // rule, or language. Default false ⇒ standard rollback-on-failure
+    // speculation.
+    bool                       commitAfterPrefix = false;
 };
 
 } // namespace dss::detail

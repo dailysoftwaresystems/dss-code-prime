@@ -733,7 +733,11 @@
     },
     "gotoLabel":    { "sequence": [ "GotoKeyword", "Identifier", "EndStatement" ] },
     "gotoIndirect": { "sequence": [ "GotoKeyword", "StarOp", "expression", "EndStatement" ] },
-    "labelStmt": { "sequence": [ "Identifier", "Colon", "statement" ] },
+    "labelStmt": {
+      "$c31Comment": "D-CSUBSET-LABEL-BUDGET-CLIFF (p19 Cluster G c31): the shape STAYS `Identifier Colon statement` so a label stays correct in every context, incl. a braceless control-flow body (`if(x) L: s;` — `s` IS the if's body). `commitAfterPrefix` is a PEG cut: after `Identifier Colon` no other declOrExprStmt alt (identVarDecl/exprStmt — neither has Colon in 2nd position) can match, so once the rule's fixed leading token-prefix is consumed in the probe (predictivePrefixLen = 3: `Identifier`, `Colon`, plus the first `statement` token — one harmless extra token, still far under budget) the parser COMMITS and parses the (arbitrarily large) `statement` child NON-speculatively, off the lookahead*16 probe budget. Without it a labeled statement >4096 tokens (sqlite3.c:213922 `json_parse_restart:` before a ~900-case switch) exhausts the budget → rollback → exprStmt → P0001 'got :'.",
+      "sequence": [ "Identifier", "Colon", "statement" ],
+      "commitAfterPrefix": true
+    },
     "emptyStmt": { "sequence": [ "EndStatement" ] },
 
     "localDeclSpecifiers": {

@@ -1074,6 +1074,35 @@ void buildPositionTables(GrammarSchemaData& data, json const& shapesJson,
                           "{rule, polarity} object");
             }
         }
+
+        // `commitAfterPrefix` (PEG cut; D-CSUBSET-LABEL-BUDGET-CLIFF, p19
+        // Cluster G c31): a boolean flag on the shape body. When true, a
+        // speculative probe of this rule commits the instant its fixed
+        // leading token-prefix is consumed without failure (see
+        // CompiledRule::commitAfterPrefix). Sibling facet to
+        // `commitRequiresTypeName` — a rule may carry at most ONE (both
+        // would contend for the same probe's commit decision); reject the
+        // overlap loud. Must be a boolean if present (mirror the loader's
+        // other type-checks); absent ⇒ false.
+        if (body.is_object() && body.contains("commitAfterPrefix")) {
+            json const& flag = body.at("commitAfterPrefix");
+            const auto flagPath =
+                std::format("{}/commitAfterPrefix", shapePath);
+            if (!flag.is_boolean()) {
+                coll.emit(DiagnosticCode::C_UnknownShape, flagPath,
+                          "'commitAfterPrefix' must be a boolean");
+            } else if (flag.get<bool>()) {
+                if (rule.typeNameCommitRule.valid()) {
+                    coll.emit(DiagnosticCode::C_UnknownShape, flagPath,
+                              "'commitAfterPrefix' and "
+                              "'commitRequiresTypeName' are mutually exclusive "
+                              "on a single shape — both govern the same "
+                              "speculative probe's commit decision");
+                } else {
+                    rule.commitAfterPrefix = true;
+                }
+            }
+        }
     }
 }
 

@@ -444,6 +444,12 @@ GrammarSchema::typeNameCommitPolarity(RuleId rule) const noexcept {
     return it->second.typeNameCommitPolarity;
 }
 
+bool GrammarSchema::commitAfterPrefix(RuleId rule) const noexcept {
+    auto it = d_.compiledRules.find(rule.v);
+    if (it == d_.compiledRules.end()) return false;
+    return it->second.commitAfterPrefix;
+}
+
 ExprWrapperRules GrammarSchema::exprWrapperRules(RuleId rule) const noexcept {
     auto it = d_.exprWrapperRules.find(rule.v);
     if (it == d_.exprWrapperRules.end()) return ExprWrapperRules{};

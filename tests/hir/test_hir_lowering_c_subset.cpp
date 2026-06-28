@@ -451,6 +451,81 @@ TEST(HirLoweringCSubset, LabelBeforeAdjacentCasesAndDefaultChainArms) {
     EXPECT_EQ(res->hir.kind(b2[0]), HirKind::LabelStmt);
 }
 
+// D-CSUBSET-LABEL-BUDGET-CLIFF (p19 Cluster G c31) — the `commitAfterPrefix`
+// CUT lets `declOrExprStmt`'s `labelStmt` probe COMMIT after its 2-token fixed
+// prefix (`Identifier Colon`) is consumed, so the (arbitrarily large) labeled
+// `statement` then parses NON-speculatively (off the lookahead*16 = 4096-token
+// probe budget). This pin builds a label before a statement whose token count
+// is FAR over 4096; with the cut it parses clean, lowers, and runs. RED-ON-
+// DISABLE: revert `"commitAfterPrefix": true` on labelStmt (or the parser cut)
+// and the labelStmt probe exhausts its budget, rolls back, falls through to
+// exprStmt, and emits P0001 ("got ':'") — `model.hasErrors()` then trips the
+// ASSERT below. The body (`i = i + vN`, fold-resistant on a parameter) also
+// makes the result observable so the labeled block is not DCE'd to nothing.
+TEST(HirLoweringCSubset, LabelBeforeOversizeStatementParsesPastProbeBudget) {
+    // ~500 statements inside the labeled block ⇒ ~5500 tokens, comfortably
+    // over the 4096-token speculative-probe budget (lookahead 256 * 16).
+    std::string src = "int f(int i){\n  L: {\n";
+    for (int n = 0; n < 500; ++n) {
+        src += "    int v" + std::to_string(n) + " = " + std::to_string(n)
+             + "; i = i + v" + std::to_string(n) + ";\n";
+    }
+    src += "  }\n  return i;\n}\n";
+    SemanticModel model = analyzeCSubset(std::move(src));
+    // The load-bearing assertion: a clean front end. On revert this is the
+    // P0001 'got :' from the budget rollback.
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    ASSERT_EQ(res->hir.kind(fn), HirKind::Function);
+    auto body = res->hir.children(res->hir.functionBody(fn));
+    ASSERT_EQ(body.size(), 2u);                           // labeled block + return
+    EXPECT_EQ(res->hir.kind(body[0]), HirKind::LabelStmt);
+    EXPECT_EQ(res->hir.kind(res->hir.labelBody(body[0])), HirKind::Block);
+}
+
+// ★★ BRACELESS-BODY CORRECTNESS — the silent-miscompile guard for the cut.
+// `labelStmt` STAYS `Identifier Colon statement`, so a label in a braceless
+// control-flow body keeps its labeled statement AS that body: in
+// `if(x) L: g=42;` the `L: g=42` IS the if's then-branch, NOT a sibling that
+// runs unconditionally. Were labelStmt ever flattened to a 2-token statement
+// (label + a SEPARATE following statement), `g=42` would detach from the `if`
+// and execute even when `x==0` — a C-semantics miscompile that runs green on
+// any test that only checks the x!=0 path. This pin pins the STRUCTURE: the
+// if's then-branch is the LabelStmt, and the assignment hangs UNDER it. The
+// `label_before_switch_goto` runtime corpus is the executable companion; the
+// gate's `f(0)→5` (the assignment is skipped) is the same property at runtime.
+TEST(HirLoweringCSubset, LabelAsBracelessIfBodyStaysInsideTheIf) {
+    SemanticModel model = analyzeCSubset(
+        "int g; int f(int x){ g = 5; if(x) L: g = 42; return g; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    // f is the SECOND module decl (g is the first — a global var).
+    HirNodeId fn{};
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) == HirKind::Function) { fn = d; break; }
+    }
+    ASSERT_TRUE(fn.valid());
+    auto body = res->hir.children(res->hir.functionBody(fn));
+    // EXACTLY three statements: `g=5`, the `if`, `return g`. A flattened label
+    // would make `g=42` a FOURTH sibling here (and the if's then-branch empty).
+    ASSERT_EQ(body.size(), 3u);
+    EXPECT_EQ(res->hir.kind(body[0]), HirKind::AssignStmt);   // g = 5
+    ASSERT_EQ(res->hir.kind(body[1]), HirKind::IfStmt);       // if (x) ...
+    EXPECT_EQ(res->hir.kind(body[2]), HirKind::ReturnStmt);   // return g
+    // The if's then-branch IS the label, and `g=42` hangs under it. (The
+    // assignment lowers to AssignStmt — the load-bearing structural fact is
+    // that it nests UNDER the LabelStmt UNDER the if, not that it is a
+    // sibling of the if running unconditionally.)
+    HirNodeId thenBranch = res->hir.ifThen(body[1]);
+    ASSERT_EQ(res->hir.kind(thenBranch), HirKind::LabelStmt);
+    EXPECT_EQ(res->hir.kind(res->hir.labelBody(thenBranch)), HirKind::AssignStmt);
+}
+
 TEST(HirLoweringCSubset, CallAndTypedef) {
     SemanticModel model = analyzeCSubset(
         "typedef int myint;\n"

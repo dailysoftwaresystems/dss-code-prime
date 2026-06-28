@@ -1221,6 +1221,14 @@ struct Parser::Impl {
             return targetDepth_;
         }
 
+        // Token position at probe construction. Used by the
+        // commitAfterPrefix CUT to measure how many tokens the branch has
+        // consumed since the probe opened (vs. the rule's fixed prefix
+        // length). See `trySpeculativeBranch`.
+        [[nodiscard]] std::size_t startPos() const noexcept {
+            return probeStartPos_;
+        }
+
         [[nodiscard]] bool isDesynced() const noexcept {
             return impl_.walker.isDesynced() && !desyncedBefore_;
         }
@@ -1460,6 +1468,20 @@ struct Parser::Impl {
             // half-built branch. Mirror the loop-head checks.
             if (probe.emittedDiag()) return false;
             if (probe.isDesynced())  return false;
+
+            // commitAfterPrefix CUT (PEG cut): once this branch's fixed
+            // leading token-prefix is consumed without failure, no other alt
+            // can match, so COMMIT and hand the still-open frame to the
+            // non-speculative dispatch loop — the rest of the rule parses
+            // with NO budget. Fully generic (names no token/rule/language).
+            // Mirrors the unique-production direct descent's "open frame, let
+            // the outer loop drive it".
+            if (const std::size_t pfx = schema->commitAfterPrefix(branch)
+                                            ? schema->predictivePrefixLen(branch) : 0;
+                pfx > 0 && (tokens.position() - probe.startPos()) >= pfx) {
+                probe.commit();
+                return true;
+            }
         }
 
         // FC2 type-name commit guard: a `commitRequiresTypeName`-marked
