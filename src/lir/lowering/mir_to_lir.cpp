@@ -2050,10 +2050,67 @@ struct Lowerer {
             }
             std::optional<LirReg> const index = regForValue(operands[1]);
             if (!index.has_value()) return;
+            // c42 (D-CSUBSET-INDEX-NEGATIVE-WIDEN): the runtime index is a BYTE
+            // offset the 4-op `lea` / arm64 ADD consumes as a FULL 64-bit address
+            // register. A sub-64-bit index (I32/U32 — the usual `int`/`unsigned`
+            // subscript) only defines the low 32 bits; the upper half holds
+            // whatever the producer left. For a NEGATIVE offset (`p[-1]` →
+            // -sizeof(*p), e.g. 0xFFFFFFF4) the hardware does NOT sign-extend a
+            // 32-bit source into the 64-bit address — it reads as a huge positive
+            // value → wrong address → SIGSEGV. A SILENT run-time miscompile:
+            // `*(p-1)` (which lowers the pointer arithmetic, then a plain Load)
+            // works, but `p[-1]` (this Gep-index path) crashes. Widen the index
+            // to a full 64-bit register first — SIGN-extend a signed source (the
+            // C subscript is sign-extended) / ZERO-extend an unsigned one. An
+            // already-64-bit index (I64/U64/Ptr — e.g. c41's pre-widened `p ± n`
+            // byte offset) needs no widen, and is left untouched so c41 is not
+            // double-extended. A subscript expression is integer-PROMOTED (C
+            // 6.3.1.1) before it reaches here, so in practice ONLY the I32 (SExt),
+            // U32 (ZExt), and 64-bit (no-op) arms fire — an enum index promotes to
+            // its underlying int (I32 → SExt), it does NOT reach `default`. The
+            // narrow Char/I8/I16/U8/U16 arms are DEFENSIVE: they mirror the SExt /
+            // ZExt source-width gates (the SExt arm takes Char/I8/I16/I32, the
+            // ZExt arm U8/U16/U32) so the widen stays correct-by-construction —
+            // and always one those gates accept — IF a future non-promoted narrow
+            // index ever reaches here; `default` is a fail-safe for a non-integer
+            // kind (which a Gep index should never be) → no widen, status quo. The
+            // CONSTANT-displacement form above is unaffected: the hardware sign-extends
+            // disp32 as part of the `lea [base + disp32]` encoding, so a constant
+            // negative subscript was already correct and never reaches here. The
+            // widen vreg is short-lived (consumed by the very next `lea`) and
+            // coalesceable — unlike a MIR-tier widen it adds no
+            // address-computation-spanning live range, so deep index chains keep
+            // their register budget.
+            LirReg lirIndex = *index;
+            std::optional<MnemonicSlot> widenSlot;
+            switch (interner.kind(mir.instType(operands[1]))) {
+                case TypeKind::I64: case TypeKind::U64: case TypeKind::Ptr:
+                    break;  // already a full 64-bit address register
+                case TypeKind::U8: case TypeKind::U16: case TypeKind::U32:
+                    widenSlot = MnemonicSlot::ZExt;  // unsigned → zero-extend
+                    break;
+                case TypeKind::Char: case TypeKind::I8:
+                case TypeKind::I16:  case TypeKind::I32:
+                    widenSlot = MnemonicSlot::SExt;  // signed → sign-extend
+                    break;
+                default:
+                    break;  // non-integer/unexpected — a promoted index never reaches here
+            }
+            if (widenSlot.has_value()) {
+                if (!opcode(*widenSlot).has_value()) {
+                    reportMissingOpcode(*widenSlot, "MIR Gep (runtime index widen)");
+                    return;
+                }
+                LirReg const index64 = lir.newVReg(LirRegClass::GPR);
+                std::array<LirOperand, 1> widenOps{LirOperand::makeReg(*index)};
+                emitInst(*opcode(*widenSlot), index64, widenOps, /*payload=*/0,
+                         widthFlagsForType(mir.instType(operands[1])));
+                lirIndex = index64;
+            }
             LirReg const result = lir.newVReg(LirRegClass::GPR);
             std::array<LirOperand, 4> ops{
                 LirOperand::makeReg(*base),
-                LirOperand::makeReg(*index),
+                LirOperand::makeReg(lirIndex),
                 LirOperand::makeMemBase(1),
                 LirOperand::makeMemOffset(0),
             };
