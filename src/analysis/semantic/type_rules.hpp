@@ -356,6 +356,9 @@ namespace detail::type_rules {
 //   * Ptr ↔ Ptr — any object-pointer pair (mapCast: Bitcast).
 //   * Ptr ↔ integer — C's implementation-defined round-trip (mapCast:
 //     PtrToInt / IntToPtr). Float↔Ptr stays ILLEGAL (C constraint).
+//   * Ptr ← FnSig — a function DESIGNATOR decays to its address (c37,
+//     D-CSUBSET-FUNCTION-DESIGNATOR-CAST; mapCast: FnSig→Ptr Bitcast). A
+//     function→integer cast stays REJECTED (target not Ptr).
 //   * InvalidType on either side → allowed (cascade suppression, same
 //     posture as isAssignable).
 //
@@ -397,6 +400,19 @@ namespace detail::type_rules {
     };
     if (isCastableScalar(tk) && isCastableScalar(ok)) return true;
     if (tk == TypeKind::Ptr && ok == TypeKind::Ptr)   return true;
+    // c37 (D-CSUBSET-FUNCTION-DESIGNATOR-CAST) C 6.3.2.1p4 + 6.3.2.3p8: a
+    // function DESIGNATOR (FnSig) decays to the function's ADDRESS, so a cast
+    // to ANY pointer target is value-preserving (mapCast lowers FnSig→Ptr as a
+    // Bitcast over the GlobalAddr — already present from c12; NO HIR/MIR change).
+    // Cross-signature fn-ptr casts ARE legal (C 6.3.2.3p8 — calling THROUGH an
+    // incompatible type is UB, the CAST is not), so this is NOT gated on a
+    // signature match — the sqlite `(sqlite3_destructor_type)fn` /
+    // `(sqlite3_syscall_ptr)fn` shapes are exactly that conversion. SIBLING:
+    // `isAssignable`'s Ptr/FnSig arm admits the same decay for init/assign/arg;
+    // this closes the explicit-CAST path. A non-Ptr TARGET (`(long)g`) and a
+    // non-FnSig OPERAND (`(fp)struct`) stay rejected (the tk==Ptr / ok==FnSig
+    // guards do not fire for them) — verified by red-on-disable pins.
+    if (tk == TypeKind::Ptr && ok == TypeKind::FnSig) return true;
     if (tk == TypeKind::Ptr && isCastableInt(ok))     return true;
     if (isCastableInt(tk) && ok == TypeKind::Ptr)     return true;
     return false;

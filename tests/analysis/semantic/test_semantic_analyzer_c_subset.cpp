@@ -2557,6 +2557,58 @@ TEST(SemanticAnalyzerCSubset, StructValueCastsAreRejected) {
         << "struct->int AND ->struct directions must BOTH fail loud";
 }
 
+// ── c37 D-CSUBSET-FUNCTION-DESIGNATOR-CAST — `(fp)g` (function name -> fn-ptr) ──
+// C 6.3.2.1p4 + 6.3.2.3p8: a function DESIGNATOR decays to the function's
+// address; casting it to any fn-ptr type (even a DIFFERENT signature) is legal
+// and value-preserving. The sqlite `(sqlite3_destructor_type)fn` /
+// `(sqlite3_syscall_ptr)fn` shapes (29x). Red-on-disable: drop the
+// `(Ptr && FnSig)` arm in isExplicitCastable and the two positive pins fire
+// S_InvalidCast; the two negative pins guard against over-admission.
+
+// Positive — same-signature function -> fn-ptr typedef (the SQLite pattern).
+TEST(SemanticAnalyzerCSubset, FunctionDesignatorToFnPtrCastIsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef void(*dtor)(void*);\n"
+        "void real(void* p){ (void)p; }\n"
+        "int main(){ dtor d = (dtor)real; return d ? 0 : 1; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 0u)
+        << "a function designator cast to its own fn-ptr type is legal C";
+}
+
+// Positive — CROSS-signature fn-ptr cast (C 6.3.2.3p8; sqlite syscall shapes).
+TEST(SemanticAnalyzerCSubset, CrossSignatureFnPtrCastIsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int(*fp)(int);\n"
+        "void g(void* x){ (void)x; }\n"
+        "int main(){ fp f = (fp)g; return f ? 0 : 1; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 0u)
+        << "cross-signature fn-ptr cast is legal C (calling through it is UB, the cast is not)";
+}
+
+// Negative (over-admission guard) — STRUCT value -> fn-ptr stays REJECTED.
+TEST(SemanticAnalyzerCSubset, StructToFnPtrCastStillRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef void(*fp)(void);\n"
+        "struct S { int x; };\n"
+        "int main(){ struct S s; s.x = 0; fp f = (fp)s; return f ? 0 : 1; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 1u)
+        << "a struct value is not a function designator — must stay fail-loud";
+}
+
+// Negative (over-admission guard) — function designator -> INT stays REJECTED
+// (the new arm is pointer-target-only: tk==Ptr).
+TEST(SemanticAnalyzerCSubset, FunctionDesignatorToIntStillRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "void g(void){}\n"
+        "int main(){ long p = (long)g; return (int)p; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 1u)
+        << "casting a function designator directly to an integer stays rejected";
+}
+
 // ── c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME — fn-ptr cast/sizeof typing ──
 //
 // The shared `castTypeRef` now routes an abstract `directDeclarator` tail
