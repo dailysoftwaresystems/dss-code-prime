@@ -136,6 +136,14 @@ struct SchemaIndexes {
     // stringLiteralExpr rule). Resolved by NAME at the index-build call site —
     // source-agnostic (any grammar with a `stringLiteralExpr` rule opts in).
     RuleId                                         stringLiteralExprRule{};
+    // c34 (D-CSUBSET-ARRAY-SIZE-INFERENCE): the brace-init-list rule + its
+    // top-level element rule, resolved by NAME (like `stringLiteralExprRule`).
+    // Used ONLY to count the top-level `initElement` children of a `[]` array's
+    // brace initializer so an `int a[] = {e0,e1,…}` infers `Array<elem, count>`
+    // (C 6.7.9p22). Invalid (no such rule) ⇒ the inference never fires for a
+    // brace init (toy/tsql, or a grammar without these rules). Source-agnostic.
+    RuleId                                         braceInitListRule{};
+    RuleId                                         initElementRule{};
     // FC3 c1: type-specifier multiset resolution (C 6.7.2). The
     // VOCABULARY is every token kind appearing in any `typeSpecifiers`
     // row — `resolveTypeNode` treats an Internal node whose visible
@@ -2593,6 +2601,108 @@ scopeAnchoredAt(EngineState& s, Tree const& tree, NodeId node) {
     return InvalidScope;
 }
 
+// c34 (D-CSUBSET-ARRAY-SIZE-INFERENCE): the INITIALIZER node of an init-declarator
+// `dNode` (`declarator ('=' init)?`), or InvalidNode if there is none. The init is
+// the init-declarator's visible Internal child that is NOT the declarator itself —
+// the SAME shape the HIR lowering reads (cst_to_hir's `lowerVarLikeInto` init scan).
+// A plain `declarator` (no initDeclarator wrapper) or a structurally-bare
+// declarator yields InvalidNode (no initializer to infer from). Config-driven:
+// keyed on the resolved `initDeclaratorRule` / `declaratorRule` roles.
+[[nodiscard]] NodeId
+initializerNodeOf(Tree const& tree, NodeId dNode, DeclaratorConfig const& dc) {
+    if (!dNode.valid() || tree.kind(dNode) != NodeKind::Internal) return {};
+    if (tree.rule(dNode).v != dc.initDeclaratorRule.v) return {};
+    for (NodeId c : visibleChildren(tree, dNode)) {
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        if (tree.rule(c).v == dc.declaratorRule.v) continue;
+        return c;   // the `= init` value subtree
+    }
+    return {};
+}
+
+// c34 (D-CSUBSET-ARRAY-SIZE-INFERENCE, C 6.7.9p22): complete an INCOMPLETE-ARRAY
+// declared type from its initializer's shape. Returns the SIZED `Array<elem, N>`
+// when `declTy` is `T[]` (incomplete) AND `initNode` is a recognizable initializer
+// whose length we can derive EXACTLY; otherwise returns `declTy` unchanged (a
+// non-array, an already-sized array, or an absent/unrecognized initializer — the
+// caller keeps whatever the resolver produced, so a bare `[]` with no init stays
+// incomplete and fails loud downstream, never silently sized).
+//
+//   * STRING-literal init (`char x[] = "abc"`): N = decoded body length + 1 (the
+//     trailing NUL) — the EXACT count the per-occurrence string typer uses,
+//     computed via the SHARED `decodeAdjacentStringBodies` chokepoint so escapes
+//     count once (`"\x41\x42"` → 2 + NUL = 3). A malformed escape leaves `declTy`
+//     incomplete (no guessed size; the HIR tier fails loud on the bad literal).
+//   * BRACE init (`int a[] = {e0,e1,…}`): N = the number of TOP-LEVEL `initElement`
+//     children of the brace list (C 6.7.9 positional element count).
+//
+// The single-occurrence completion site is the Pass-1.5 var/global declared-type
+// stamp, so every downstream consumer (sizeof, layout, element access, BOTH HIR
+// paths) observes the SAME sized array — there is no second place to keep in sync.
+[[nodiscard]] TypeId
+completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
+                                Tree const& tree, NodeId initNode, TypeId declTy) {
+    TypeInterner& interner = s.lattice.interner();
+    if (!declTy.valid() || !interner.isIncompleteArray(declTy)) return declTy;
+    if (!initNode.valid()) return declTy;
+    auto const ops = interner.operands(declTy);
+    if (ops.empty() || !ops[0].valid()) return declTy;   // malformed — leave as-is
+    TypeId const elem = ops[0];
+
+    // An incomplete-array VARIABLE reaches this helper ONLY with an initializer
+    // that must SIZE it (C 6.7.9). If the initializer cannot determine a positive
+    // length — an EMPTY brace `T x[] = {}` (top-level count 0), or no string/brace
+    // initializer at all — the array stays INCOMPLETE. Returned silently it flows
+    // into the HIR/MIR tier, which has no incomplete-array guard, and LOOPS on the
+    // -1 sentinel length. Fail LOUD here instead (an inferred 0-or-undeterminable
+    // length is exactly the non-positive `int a[0]` case → S_ArrayLengthOutOfRange),
+    // matching the no-initializer path's clean error rather than a compiler hang.
+    auto failUnsized = [&]() -> TypeId {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_ArrayLengthOutOfRange;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(initNode);
+        d.actual   = std::string{tree.text(initNode)};
+        s.reporter.report(std::move(d));
+        return InvalidType;
+    };
+
+    // Descend the initializer subtree to the FIRST string-literal expr OR brace
+    // list (the init may sit under transparent wrappers — `initValue`, paren
+    // groups). Both rule kinds are mutually exclusive at a given init position.
+    std::vector<NodeId> stack{initNode};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId c = stack.back(); stack.pop_back();
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        RuleId const r = tree.rule(c);
+        if (idx.stringLiteralExprRule.valid()
+            && idx.stringLiteralBodyToken.valid()
+            && r.v == idx.stringLiteralExprRule.v) {
+            if (auto decoded = decodeAdjacentStringBodies(
+                    tree, c, idx.stringLiteralBodyToken)) {
+                return interner.array(
+                    elem, static_cast<std::int64_t>(decoded->size() + 1));
+            }
+            return declTy;   // malformed escape — stay incomplete, fail loud later
+        }
+        if (idx.braceInitListRule.valid() && idx.initElementRule.valid()
+            && r.v == idx.braceInitListRule.v) {
+            std::int64_t count = 0;
+            for (NodeId e : visibleChildren(tree, c)) {
+                if (tree.kind(e) == NodeKind::Internal
+                    && tree.rule(e).v == idx.initElementRule.v) {
+                    ++count;
+                }
+            }
+            if (count <= 0) return failUnsized();   // `T x[] = {}` — fail loud, no hang
+            return interner.array(elem, count);
+        }
+        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+    }
+    return failUnsized();   // no string/brace initializer found — fail loud, no hang
+}
+
 // ── Pass 1.5: post-order — resolve declaration types + FnSigs ──────────────
 void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                       NodeId node, ScopeId current) {
@@ -2714,9 +2824,36 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                     // `ptrQualifier` INSIDE the declarator (after the star), not a
                     // base qualifier, so the co-located arm excludes it.
                     for (NodeId dNode : declarators) {
-                        TypeId const declTy = declaratorDeclaredType(
+                        // c34 (D-CSUBSET-ARRAY-SIZE-INFERENCE): a `[]` (empty-bound)
+                        // array on a VARIABLE WITH AN INITIALIZER infers its size
+                        // from that initializer (C 6.7.9p22). The resolver's
+                        // absent-length branch already yields an INCOMPLETE array
+                        // when missing-length-is-OK (`allowFlexibleArray`) — reuse
+                        // that exact path by relaxing the flag ONLY when this
+                        // declarator HAS an initializer, then COMPLETE the incomplete
+                        // array below. A `[]` with NO initializer keeps the original
+                        // flag (false for a var/global rule) ⇒ the resolver's
+                        // S_NonConstantArrayLength fires, never a silently-sized
+                        // array. A struct-field rule's allowFlexibleArray is
+                        // untouched (its `||` short-circuits true regardless). The
+                        // top-level fold sees the relaxed flag; the group recursion
+                        // into a nested declarator passes false (a nested fn-ptr
+                        // param's `[]` still errors).
+                        NodeId const initNode =
+                            initializerNodeOf(tree, dNode, *cfg.declarators);
+                        bool const allowIncomplete =
+                            decl.allowFlexibleArray || initNode.valid();
+                        TypeId declTy = declaratorDeclaredType(
                             s, cfg, tree, dNode, headTy, here,
-                            /*emitOnMiss=*/true, decl.allowFlexibleArray);
+                            /*emitOnMiss=*/true, allowIncomplete);
+                        // Complete an inferred `[]` from its initializer (string
+                        // length + NUL, or brace top-level element count). A
+                        // non-array / already-sized / no-init type passes through
+                        // unchanged. ONE completion site → every downstream tier
+                        // (sizeof, layout, indexing, both HIR paths) agrees.
+                        if (!decl.allowFlexibleArray)
+                            declTy = completeIncompleteArrayFromInit(
+                                s, s.idx(), tree, initNode, declTy);
                         // SINGLE-declarator rows (param-like): also stamp
                         // the row node — an ABSTRACT param has no name
                         // node to carry the type, but its slot still
@@ -5519,6 +5656,12 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         // same name HIR lowering's library-override path uses. Invalid for a
         // grammar without the rule (the per-token typing fallback then fires).
         idx.stringLiteralExprRule = sch.rules().find("stringLiteralExpr");
+        // c34 (D-CSUBSET-ARRAY-SIZE-INFERENCE): the brace-init-list + init-element
+        // rules, by name from THIS schema — the same source as stringLiteralExprRule
+        // (the HIR-lowering config names them too, but the semantic tier resolves its
+        // own copy rather than reach across into the HIR config).
+        idx.braceInitListRule = sch.rules().find("braceInitList");
+        idx.initElementRule   = sch.rules().find("initElement");
         buildIndexes(s, idx, sch.semantics());
         distinctSchemas.push_back(&sch);
     }

@@ -128,6 +128,135 @@ TEST(SemanticAnalyzerCSubset, OutOfRangeArrayLengthEmitsDiagnostic) {
                         DiagnosticCode::S_ArrayLengthOutOfRange), 1u);
 }
 
+// ── c34 (D-CSUBSET-ARRAY-SIZE-INFERENCE, C 6.7.9p22) ────────────────────────
+// A `[]` (empty-bound) array WITH an initializer infers its length from the
+// initializer: a string literal → decoded-bytes + 1 (the NUL); a brace list →
+// the top-level element count. The completion happens ONCE in the semantic model
+// (Pass 1.5), so the SYMBOL's resolved type is the sized array every downstream
+// tier observes. These pins assert the symbol's `.type` directly (red-on-disable:
+// without the completion the type stays an incomplete array — scalars()[0] is the
+// kIncompleteArrayLength sentinel, not N).
+
+[[nodiscard]] inline SymbolRecord const*
+findSym(SemanticModel const& m, std::string_view name) {
+    for (std::size_t i = 1; i < m.symbols().size(); ++i)
+        if (m.symbols()[i].name == name) return &m.symbols()[i];
+    return nullptr;
+}
+
+// (1) `char x[] = "abc"` resolves to a 4-element char array ("abc" + NUL).
+TEST(SemanticAnalyzerCSubset, ArraySizeInferredFromStringInit) {
+    auto cu = buildShippedUnit("c-subset", { "char x[] = \"abc\";\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->type.valid());
+    ASSERT_EQ(ti.kind(x->type), TypeKind::Array);
+    ASSERT_FALSE(ti.isIncompleteArray(x->type));
+    ASSERT_EQ(ti.scalars(x->type).size(), 1u);
+    EXPECT_EQ(ti.scalars(x->type)[0], 4);   // 'a' 'b' 'c' '\0'
+}
+
+// (2) `int a[] = {1,2,3}` → Array<I32, 3> (top-level brace element count).
+TEST(SemanticAnalyzerCSubset, ArraySizeInferredFromBraceInit) {
+    auto cu = buildShippedUnit("c-subset", { "int a[] = {1, 2, 3};\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = findSym(model, "a");
+    ASSERT_NE(a, nullptr);
+    ASSERT_TRUE(a->type.valid());
+    ASSERT_EQ(ti.kind(a->type), TypeKind::Array);
+    ASSERT_FALSE(ti.isIncompleteArray(a->type));
+    EXPECT_EQ(ti.scalars(a->type)[0], 3);
+    EXPECT_EQ(ti.kind(ti.operands(a->type)[0]), TypeKind::I32);
+}
+
+// (3) LOCAL variant — block-scope `[]`-with-init infers at the SAME Pass-1.5 site
+// (the local var path shares `resolveDeclTypes`, not a separate completion).
+TEST(SemanticAnalyzerCSubset, ArraySizeInferredFromInitLocal) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "int main(void){ int a[] = {10, 20, 30}; return a[2]; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = findSym(model, "a");
+    ASSERT_NE(a, nullptr);
+    ASSERT_EQ(ti.kind(a->type), TypeKind::Array);
+    ASSERT_FALSE(ti.isIncompleteArray(a->type));
+    EXPECT_EQ(ti.scalars(a->type)[0], 3);
+}
+
+// (4) PRESERVE — an EXPLICIT `[N]` is unchanged by the inference path (the
+// resolved length folds normally; completion is a no-op on an already-sized
+// array). `char x[4] = "abc"` stays Array<Char,4>, NOT re-derived to 4-from-init.
+TEST(SemanticAnalyzerCSubset, ExplicitArraySizeUnchangedByInference) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "int a[3] = {1, 2, 3}; char x[8] = \"abc\";\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = findSym(model, "a");
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(a, nullptr);
+    ASSERT_EQ(ti.kind(a->type), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(a->type)[0], 3);
+    ASSERT_NE(x, nullptr);
+    ASSERT_EQ(ti.kind(x->type), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(x->type)[0], 8)   // the DECLARED 8, not "abc"+NUL == 4
+        << "an explicit [N] must keep N — inference only fills an empty []";
+}
+
+// (5) A `[]` with NO initializer is NOT silently sized — the resolver's
+// S_NonConstantArrayLength still fires (inference is gated on an initializer
+// being present, so a bare `int x[];` is unaffected by c34).
+TEST(SemanticAnalyzerCSubset, EmptyArrayNoInitNotSized) {
+    auto cu = buildShippedUnit("c-subset", { "int main(void){ int a[]; return 0; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 1u);
+    // The symbol's type must NOT be a sized array (it stays unresolved/incomplete).
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = findSym(model, "a");
+    if (a != nullptr && a->type.valid() && ti.kind(a->type) == TypeKind::Array) {
+        EXPECT_TRUE(ti.isIncompleteArray(a->type))
+            << "a no-init [] must never be silently completed to a sized array";
+    }
+}
+
+// c34 fail-loud (audit-caught regression): an EMPTY-brace inferred array
+// `int a[] = {}` cannot determine a positive length, so it must FAIL LOUD — NOT
+// leave a silently-incomplete array type that flows into the unguarded HIR/MIR
+// tier and LOOPS on the -1 sentinel length (a compiler HANG). An inferred 0/
+// undeterminable length is the non-positive `int a[0]` case → S_ArrayLengthOutOfRange.
+// RED-ON-DISABLE: revert the `failUnsized` guard (empty-brace returns the
+// incomplete array with no diagnostic) → this flips AND a CLI compile hangs.
+TEST(SemanticAnalyzerCSubset, ArraySizeInferenceEmptyBraceFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "int a[] = {};\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_TRUE(model.hasErrors())
+        << "`int a[] = {}` cannot infer a positive size — must fail loud, not hang";
+    EXPECT_GT(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 0u)
+        << "empty-brace inferred array → S_ArrayLengthOutOfRange (inferred 0-length)";
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = findSym(model, "a");
+    if (a != nullptr && a->type.valid() && ti.kind(a->type) == TypeKind::Array) {
+        EXPECT_TRUE(ti.isIncompleteArray(a->type))
+            << "an un-sizable [] must never be a usable sized array";
+    }
+}
+
 // SE-pointers (G5): `int *p` declarator → Ptr<I32>; `int **pp` → Ptr<Ptr<I32>>.
 // The declarator stars wrap the base type one level each (declarator-depth).
 TEST(SemanticAnalyzerCSubset, PointerDeclaratorTypedAsPtr) {
