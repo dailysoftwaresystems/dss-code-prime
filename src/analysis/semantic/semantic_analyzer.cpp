@@ -874,7 +874,8 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
 [[nodiscard]] TypeId
 directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                    NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
-                   bool allowFlexibleArray);
+                   bool allowFlexibleArray,
+                   bool allowInitInferredArray = false);
 
 // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: forward declaration — the
 // tag-namespace-scope floater (defined below) is consumed early by
@@ -1744,7 +1745,8 @@ resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& d
 declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                        Tree const& tree, NodeId node, TypeId base,
                        ScopeId scope, bool emitOnMiss,
-                       bool allowFlexibleArray = false);
+                       bool allowFlexibleArray = false,
+                       bool allowInitInferredArray = false);
 
 // The declared type of ONE declaration-row node — the fn-suffix param
 // harvest's per-param resolution. Legacy rows resolve their `typeChild`
@@ -1913,7 +1915,7 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
 [[nodiscard]] TypeId
 directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                    NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
-                   bool allowFlexibleArray) {
+                   bool allowFlexibleArray, bool allowInitInferredArray) {
     if (!cfg.declarators.has_value()) return InvalidType;
     DeclaratorConfig const& dc = *cfg.declarators;
     if (!direct.valid() || !base.valid()) return InvalidType;
@@ -1962,13 +1964,19 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         NodeId const inner = declarator_walk_detail::firstChildOfRule(
             TreeDeclaratorView{tree}, group, dc.declaratorRule);
         if (!inner.valid()) return InvalidType;   // malformed group
-        // GOTCHA (c10 plan-lock): do NOT propagate the field's FAM-ness into a
-        // grouped/parenthesized inner declarator — a nested fn-ptr param's
-        // array (`int (*f)(int x[]))`) is its OWN declarator and must keep the
-        // ordinary `S_NonConstantArrayLength` behavior; only the field's
-        // top-level array suffix is a flexible array member.
-        return declaratorDeclaredType(s, cfg, tree, inner, t, scope,
-                                      emitOnMiss, /*allowFlexibleArray=*/false);
+        // GOTCHA (c10 plan-lock): FAM-ness does NOT cross into a grouped/
+        // parenthesized inner declarator — a nested fn-ptr param's array
+        // (`int (*f)(int x[]))`) is its OWN declarator and keeps the ordinary
+        // `S_NonConstantArrayLength` behavior; only the field's TOP-LEVEL array
+        // suffix is a flexible array member (so allowFlexibleArray stays false).
+        // c47 (D-CSUBSET-FNPTR-ARRAY-SIZE-INFERENCE): an INIT-INFERRED `[]` DOES
+        // cross in — `int (*const arr[])(T) = {…}` (an inferred-size array of
+        // fn-ptrs) carries its `[]` on THIS inner declarator and is sized from the
+        // top-level initializer. Propagate ONLY that init-inference signal as the
+        // inner's flexible flag; a NO-init grouped `[]` keeps it false ⇒ S000B.
+        return declaratorDeclaredType(s, cfg, tree, inner, t, scope, emitOnMiss,
+                                      /*allowFlexibleArray=*/allowInitInferredArray,
+                                      /*allowInitInferredArray=*/allowInitInferredArray);
     }
     return t;   // abstract direct — the type itself
 }
@@ -1976,7 +1984,7 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                               Tree const& tree, NodeId node, TypeId base,
                               ScopeId scope, bool emitOnMiss,
-                              bool allowFlexibleArray) {
+                              bool allowFlexibleArray, bool allowInitInferredArray) {
     if (!cfg.declarators.has_value()) return InvalidType;
     DeclaratorConfig const& dc = *cfg.declarators;
     if (!node.valid() || !base.valid()) return InvalidType;
@@ -1987,7 +1995,8 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
             TreeDeclaratorView{tree}, node, dc.declaratorRule);
         if (!inner.valid()) return InvalidType;
         return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
-                                      emitOnMiss, allowFlexibleArray);
+                                      emitOnMiss, allowFlexibleArray,
+                                      allowInitInferredArray);
     }
     // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR) FIX 1: a struct/union member-list
     // slot wraps ONE declarator (+ its own bitfield suffix). Descend to the
@@ -2008,7 +2017,8 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
             TreeDeclaratorView{tree}, node, dc.declaratorRule);
         if (!inner.valid()) return InvalidType;
         return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
-                                      emitOnMiss, allowFlexibleArray);
+                                      emitOnMiss, allowFlexibleArray,
+                                      allowInitInferredArray);
     }
     if (r != dc.declaratorRule) return InvalidType;
 
@@ -2046,7 +2056,7 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
     // resolver uses; see its comment). `t` already carries the pointer-star
     // depth from the loop above.
     return directDeclaredType(s, cfg, tree, direct, t, scope, emitOnMiss,
-                              allowFlexibleArray);
+                              allowFlexibleArray, allowInitInferredArray);
 }
 
 // FC4 c1 (M5): first token of `kind` in `node`'s subtree in SOURCE order —
@@ -3065,15 +3075,18 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                         // array. A struct-field rule's allowFlexibleArray is
                         // untouched (its `||` short-circuits true regardless). The
                         // top-level fold sees the relaxed flag; the group recursion
-                        // into a nested declarator passes false (a nested fn-ptr
-                        // param's `[]` still errors).
+                        // propagates ONLY the init-inference signal (c47 —
+                        // D-CSUBSET-FNPTR-ARRAY-SIZE-INFERENCE), so a nested fn-ptr
+                        // PARAM / FAM `[]` still errors, but an inferred-size fn-ptr
+                        // ARRAY `(*const arr[])(T) = {…}` is sized from its init.
                         NodeId const initNode =
                             initializerNodeOf(tree, dNode, *cfg.declarators);
                         bool const allowIncomplete =
                             decl.allowFlexibleArray || initNode.valid();
                         TypeId declTy = declaratorDeclaredType(
                             s, cfg, tree, dNode, headTy, here,
-                            /*emitOnMiss=*/true, allowIncomplete);
+                            /*emitOnMiss=*/true, allowIncomplete,
+                            /*allowInitInferredArray=*/initNode.valid());
                         // Complete an inferred `[]` from its initializer (string
                         // length + NUL, or brace top-level element count). A
                         // non-array / already-sized / no-init type passes through
