@@ -5690,8 +5690,15 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 f.c0 = result; f.phase = 2; NodeId n = f.list[2]; enter(n);
             } else {
                 TypeId thenT = f.c0;
+                // CAPTURE the arm node-ids BEFORE pop_back: `f` is `Frame& =
+                // work.back()`, so the pop dangles it (the Binary arm above copies
+                // `e`/`lt` first for the same reason). Reading `f.list[*]` after the
+                // pop is a use-after-pop — UB that MSVC tolerated (Windows green) but
+                // gcc/clang clobbered → a `NodeId out of range` crash on WSL/qemu.
+                NodeId thenN = f.list[1];
+                NodeId elseN = f.list[2];
                 work.pop_back();
-                result = combineTernary(thenT, result, f.list[1], f.list[2]);
+                result = combineTernary(thenT, result, thenN, elseN);
             }
             break;
         case Frame::Kind::Wrapper:
