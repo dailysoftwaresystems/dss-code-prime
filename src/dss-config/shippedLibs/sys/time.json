@@ -3,6 +3,10 @@
   "header": "sys/time.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "symbols": [
+    { "name": "utimes", "signature": "fn(ptr<char>, ptr<void>) -> i32", "kind": "function", "linkage": "external" }
+  ],
   "structs": [
     {
       "name": "timeval",
