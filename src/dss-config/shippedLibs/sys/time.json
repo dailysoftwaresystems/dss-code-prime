@@ -1,11 +1,12 @@
 {
-  "$comment": "Neutral shipped <sys/time.h> (POSIX) — SEED of the struct-body descriptor surface (the FIRST `structs` consumer). `struct timeval` is two LP64 longs: tv_sec (time_t) + tv_usec (suseconds_t), both i64 → offsets 0 and 8 (no padding). Field types are spelled as their RESOLVED hir-text form (i64), since parseTypeFromText resolves hir-text builtins, not descriptor typedef names. The semantic phase interns the struct + injects `timeval` into the TAG namespace + a field scope, so c-subset `struct timeval tv; tv.tv_sec` resolves and the layout engine derives the offsets from the field sizes. A SUBDIRECTORY descriptor (sys/time.json — resolved by the c6 subdir fix, distinct from a future <time.h> → time.json). This descriptor is the struct-mechanism PROOF; the rest of sys/time.h (gettimeofday + struct timezone) is added in that header's own cycle (the surfaces are additive).",
+  "$comment": "Neutral shipped <sys/time.h> (POSIX) — SEED of the struct-body descriptor surface (the FIRST `structs` consumer). `struct timeval` is two LP64 longs: tv_sec (time_t) + tv_usec (suseconds_t), both i64 → offsets 0 and 8 (no padding). Field types are spelled as their RESOLVED hir-text form (i64), since parseTypeFromText resolves hir-text builtins, not descriptor typedef names. The semantic phase interns the struct + injects `timeval` into the TAG namespace + a field scope, so c-subset `struct timeval tv; tv.tv_sec` resolves and the layout engine derives the offsets from the field sizes. A SUBDIRECTORY descriptor (sys/time.json — resolved by the c6 subdir fix, distinct from a future <time.h> → time.json). This descriptor is the struct-mechanism PROOF; c51 added the first symbol utimes; c53 adds gettimeofday(struct timeval*, void* tz) — both ptr<void> (SQLite passes &tv + a 0/NULL tz, so struct timezone needs no shipped body). The timeval struct (below) is gettimeofday's first arg. (the surfaces are additive — struct timezone stays deferred until a use needs its body).",
   "header": "sys/time.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho"],
   "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "symbols": [
-    { "name": "utimes", "signature": "fn(ptr<char>, ptr<void>) -> i32", "kind": "function", "linkage": "external" }
+    { "name": "gettimeofday", "signature": "fn(ptr<void>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "utimes",       "signature": "fn(ptr<char>, ptr<void>) -> i32", "kind": "function", "linkage": "external" }
   ],
   "structs": [
     {

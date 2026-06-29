@@ -1,5 +1,5 @@
 {
-  "$comment": "Neutral shipped <unistd.h> (POSIX) — c14 (linux) + c15c (macOS). The core POSIX I/O syscalls SQLite's os_unix.c routes through its aSyscall table. The LP64 widths (ssize_t/off_t=i64, size_t=u64) AGREE between Linux and macOS, and SEEK_* + the access() mode bits F_OK/R_OK/W_OK/X_OK are byte-identical (verified against xnu/bsd/sys/unistd.h + _seek_set.h) — so every constant + signature stays flat (no per-format variant). fdatasync + fallocate are LINUX-ONLY (macOS uses fcntl F_FULLFSYNC / F_PREALLOCATE): each carries a per-symbol `availableObjectFormats` of elf-only so it is NOT injected on a macho target (DSS imports EVERY declared shipped extern → a macho-declared fdatasync would plant an undefined import; libSystem has no fdatasync). They ARE injected on elf for linux SQLite's use. (D-SHIPPED-SYMBOL-PER-TARGET-AVAILABILITY) Gated availableObjectFormats:[elf,macho] (elf=WSL run target, macho=macos-latest leg). No over-ship: SQLite's aSyscall surface. open/fcntl/fstat/lstat/stat/mkdir/mmap live in their own headers.",
+  "$comment": "Neutral shipped <unistd.h> (POSIX) — c14 (linux) + c15c (macOS). The core POSIX I/O syscalls SQLite's os_unix.c routes through its aSyscall table. The LP64 widths (ssize_t/off_t=i64, size_t=u64) AGREE between Linux and macOS, and SEEK_* + the access() mode bits F_OK/R_OK/W_OK/X_OK are byte-identical (verified against xnu/bsd/sys/unistd.h + _seek_set.h) — so every constant + signature stays flat (no per-format variant). fdatasync + fallocate are LINUX-ONLY (macOS uses fcntl F_FULLFSYNC / F_PREALLOCATE): each carries a per-symbol `availableObjectFormats` of elf-only so it is NOT injected on a macho target (DSS imports EVERY declared shipped extern → a macho-declared fdatasync would plant an undefined import; libSystem has no fdatasync). They ARE injected on elf for linux SQLite's use. (D-SHIPPED-SYMBOL-PER-TARGET-AVAILABILITY) Gated availableObjectFormats:[elf,macho] (elf=WSL run target, macho=macos-latest leg). No over-ship: SQLite's aSyscall surface. open/fcntl/fstat/lstat/stat/mkdir/mmap live in their own headers. c53 += lseek/sysconf/getpid (elf+macho) for os_unix seek/page-size/pid + the _SC_PAGESIZE constant. lseek returns off_t=i64 (NOT i32 — SQLite assigns the result to an i64; a 32-bit return would sign-truncate >2GB file offsets) and ships as PLAIN `lseek` not lseek64 (the default model leaves __USE_FILE_OFFSET64 off, so libc exports the plain name with off_t=8; verified by nm of an -O0 compile). _SC_PAGESIZE DIVERGES per-format (elf=30 / macho=29) so it ships with per-target `variants` (the FILENAME_MAX mechanism); both linux arches share 30 (glibc bits/confname.h is arch-generic).",
   "header": "unistd.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho"],
@@ -10,6 +10,7 @@
     { "name": "write",       "signature": "fn(i32, ptr<void>, u64) -> i64",              "kind": "function", "linkage": "external" },
     { "name": "pread",       "signature": "fn(i32, ptr<void>, u64, i64) -> i64",         "kind": "function", "linkage": "external" },
     { "name": "pwrite",      "signature": "fn(i32, ptr<void>, u64, i64) -> i64",         "kind": "function", "linkage": "external" },
+    { "name": "lseek",       "signature": "fn(i32, i64, i32) -> i64",                    "kind": "function", "linkage": "external" },
     { "name": "ftruncate",   "signature": "fn(i32, i64) -> i32",                         "kind": "function", "linkage": "external" },
     { "name": "fsync",       "signature": "fn(i32) -> i32",                              "kind": "function", "linkage": "external" },
     { "name": "fdatasync",   "signature": "fn(i32) -> i32",                              "kind": "function", "linkage": "external", "availableObjectFormats": ["elf"] },
@@ -20,6 +21,8 @@
     { "name": "getcwd",      "signature": "fn(ptr<char>, u64) -> ptr<char>",             "kind": "function", "linkage": "external" },
     { "name": "geteuid",     "signature": "fn() -> u32",                                 "kind": "function", "linkage": "external" },
     { "name": "getpagesize", "signature": "fn() -> i32",                                 "kind": "function", "linkage": "external" },
+    { "name": "sysconf",     "signature": "fn(i32) -> i64",                              "kind": "function", "linkage": "external" },
+    { "name": "getpid",      "signature": "fn() -> i32",                                 "kind": "function", "linkage": "external" },
     { "name": "fchmod",      "signature": "fn(i32, u32) -> i32",                         "kind": "function", "linkage": "external" },
     { "name": "fchown",      "signature": "fn(i32, u32, u32) -> i32",                    "kind": "function", "linkage": "external" },
     { "name": "fallocate",   "signature": "fn(i32, i32, i64, i64) -> i32",               "kind": "function", "linkage": "external", "availableObjectFormats": ["elf"] }
@@ -31,6 +34,10 @@
     { "name": "F_OK",     "value": 0, "type": "i32" },
     { "name": "X_OK",     "value": 1, "type": "i32" },
     { "name": "W_OK",     "value": 2, "type": "i32" },
-    { "name": "R_OK",     "value": 4, "type": "i32" }
+    { "name": "R_OK",     "value": 4, "type": "i32" },
+    { "name": "_SC_PAGESIZE", "variants": [
+        { "when": { "format": "elf" },   "value": 30, "type": "i32" },
+        { "when": { "format": "macho" }, "value": 29, "type": "i32" }
+    ] }
   ]
 }
