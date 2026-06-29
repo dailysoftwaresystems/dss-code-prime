@@ -1,0 +1,34 @@
+{
+  "$comment": "c56 (D-CSUBSET-TERNARY-NULL-FUNCTION-POINTER): a ternary with one arm a function designator (FnSig) and the other a literal-0, assigned to a fn-ptr lvalue. SQLite `w.xSelectCallback = (...) ? 0 : resolveSelectStep` (sqlite3.c:111984) fired S0003 S_TypeMismatch: combineTernary's c49 null-ptr rule matched only TypeKind::Ptr, not FnSig, so `0 : designator` fell through to I32 -> isAssignable(Ptr<FnSig>,I32) failed. FIX (the c49 fn-pointer sibling, both tiers): a FnSig arm opposite a literal-0 decays to Ptr<FnSig> (the designator -> FnSig->Ptr Bitcast, the literal-0 -> null-ptr Cast). VALUE-CORRECT (the picked fn is CALLED; BOTH arm orders, since the fix also cures a latent miscompile in the designator-first order): order1 w.cb=flag?0:add40 (flag==0 -> add40(2)=42); order2 w.cb=t?sub1:0 (t==1 -> sub1(43)=42); return 42. RED-ON-DISABLE: revert -> the `? 0 : add40` assignment -> S0003. Pure c-subset -> all 4 targets; pe RUNS on Windows.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

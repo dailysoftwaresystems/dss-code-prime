@@ -5553,6 +5553,27 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 && isLiteralIntegerZero(s, tree, thenN)) {
                 return elseT;
             }
+            // c56 (D-CSUBSET-TERNARY-NULL-FUNCTION-POINTER): the FUNCTION-POINTER
+            // sibling of the Ptr arms above. A bare function NAME is a function
+            // designator (TypeKind::FnSig, un-decayed at subtreeType); paired with a
+            // literal-0 (`cond ? 0 : fn` assigned to a fn-ptr lvalue — e.g. sqlite's
+            // `xSelectCallback = (...) ? 0 : resolveSelectStep`), the conditional
+            // type is the DECAYED pointer-to-function (C 6.3.2.1p4 function-to-pointer
+            // decay + 6.5.15p6). Returning `pointer(FnSig)` (NOT bare FnSig) makes
+            // BOTH arms coerce to Ptr<FnSig> at the HIR tier (the literal-0 → null-ptr
+            // Cast, the designator → FnSig→Ptr Bitcast) and also fixes the
+            // designator-FIRST order, which otherwise mistyped as bare FnSig (its 0
+            // arm never got the null-ptr Cast = a silent gap).
+            if (thenT.valid()
+                && interner.kind(thenT) == TypeKind::FnSig
+                && isLiteralIntegerZero(s, tree, elseN)) {
+                return interner.pointer(thenT);
+            }
+            if (elseT.valid()
+                && interner.kind(elseT) == TypeKind::FnSig
+                && isLiteralIntegerZero(s, tree, thenN)) {
+                return interner.pointer(elseT);
+            }
         }
         return thenT.valid() ? thenT : elseT;   // non-arith arms (pointers etc.)
     };

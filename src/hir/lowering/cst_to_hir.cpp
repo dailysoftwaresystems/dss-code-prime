@@ -2721,6 +2721,19 @@ struct Lowerer {
                 && interner.kind(elseE.type) == TypeKind::Ptr
                 && isIntLiteralArm(thenE)) {
                 common = elseE.type;
+            } else if (thenE.type.valid()
+                && interner.kind(thenE.type) == TypeKind::FnSig
+                && isIntLiteralArm(elseE)) {
+                // c56 (D-CSUBSET-TERNARY-NULL-FUNCTION-POINTER): the fn-pointer
+                // sibling — a function designator (FnSig) arm opposite a literal-0
+                // decays to Ptr<FnSig> (mirrors the semantic combineTernary). The
+                // designator arm then hits the FnSig→Ptr Bitcast coerce arm; the
+                // literal-0 the null-ptr Cast arm below. Handles BOTH arm orders.
+                common = interner.pointer(thenE.type);
+            } else if (elseE.type.valid()
+                && interner.kind(elseE.type) == TypeKind::FnSig
+                && isIntLiteralArm(thenE)) {
+                common = interner.pointer(elseE.type);
             }
         }
         if (common.valid()) {
