@@ -334,8 +334,18 @@ struct Lowerer {
         if (ck == TypeKind::Array && tk == TypeKind::Ptr) {
             auto const arrElem = interner.operands(child.type);
             auto const ptrElem = interner.operands(target);
-            if (!arrElem.empty() && !ptrElem.empty()
-                && arrElem[0] == ptrElem[0]) {
+            // c50 (D-CSUBSET-ARRAY-DECAY-TO-VOID-PTR): same-element array decay,
+            // OR array → void* (array decays to ptr-to-element, then T*→void*),
+            // gated on the same `implicitToVoidPtr` flag as the semantic tier.
+            // Both emit the synthetic Array→Ptr Cast that MIR re-types by the
+            // target (element-agnostic), so a string-literal / array arg lands as
+            // a width-correct `void*`.
+            bool const sameElem = !arrElem.empty() && !ptrElem.empty()
+                               && arrElem[0] == ptrElem[0];
+            bool const toVoidPtr = !ptrElem.empty()
+                && sem.pointerConversions.implicitToVoidPtr
+                && interner.kind(ptrElem[0]) == TypeKind::Void;
+            if (sameElem || toVoidPtr) {
                 HirNodeId const decay = builder.makeCast(
                     child.id, target, HirFlags::Synthetic);
                 for (auto it = spans.rbegin(); it != spans.rend(); ++it) {

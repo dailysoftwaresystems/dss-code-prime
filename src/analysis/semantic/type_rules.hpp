@@ -263,9 +263,20 @@ namespace detail::type_rules {
     if (lk == TypeKind::Ptr && rk == TypeKind::Array) {
         auto const lhsElem = interner.operands(lhs);
         auto const rhsElem = interner.operands(rhs);
-        if (!lhsElem.empty() && !rhsElem.empty()
-            && lhsElem[0] == rhsElem[0]) {
-            return true;
+        if (!lhsElem.empty() && !rhsElem.empty()) {
+            if (lhsElem[0] == rhsElem[0]) {
+                return true;
+            }
+            // c50 (D-CSUBSET-ARRAY-DECAY-TO-VOID-PTR): array → void*. An array
+            // decays to a pointer-to-element (C 6.3.2.1p3), which then converts
+            // to void* (C 6.3.2.3p1) — composing the two existing conversions for
+            // a `void*` target, gated on the SAME `implicitToVoidPtr` flag the
+            // Ptr→void arm below uses. The sqlite shape `memcpy(buf,"-Inf",5)` —
+            // `buf` is `char[N]`, `"-Inf"` a string-literal `char[5]`, both → void*.
+            if (ptrRules.implicitToVoidPtr
+                && interner.kind(lhsElem[0]) == TypeKind::Void) {
+                return true;
+            }
         }
     }
     // C-standard function-to-pointer decay (C 6.3.2.1p4): a function
