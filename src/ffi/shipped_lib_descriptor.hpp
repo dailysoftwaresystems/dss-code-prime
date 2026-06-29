@@ -352,6 +352,20 @@ readShippedLibMacros(std::filesystem::path const&    path,
 readShippedLibAvailability(std::filesystem::path const& path,
                            DiagnosticReporter&          reporter);
 
+// Read ONLY the `typedefs[].name` list from the descriptor at `path`, WITHOUT a
+// TypeInterner — the PARSE-TIME cast-vs-call ORACLE (D-CSUBSET-SHIPPED-TYPEDEF-CAST-PARSE).
+// Shipped typedefs are injected SEMANTICALLY (post-parse), so the parser's binder
+// sketch never sees `size_t` as a TYPE NAME and parses `(size_t)(expr)` as a CALL.
+// The post-parse typedef-resolution reparse (compilation_unit.cpp) seeds these
+// NAMES as parse-time global types so the reparse commits the cast. Only the names
+// are needed (not the decoded `type`), so no interner — mirrors
+// readShippedLibAvailability. LENIENT: malformed entries are skipped (the SEMANTIC
+// read owns strict typedef validation — this must be no STRICTER). std::nullopt on
+// a broken JSON; EMPTY ⇒ the descriptor declares no typedef surface.
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<std::string>>
+readShippedLibTypedefNames(std::filesystem::path const& path,
+                           DiagnosticReporter&          reporter);
+
 // True iff a header carrying availability set `availableObjectFormats` is
 // available on object-format `fmt`. EMPTY set ⇒ available on EVERY format
 // (back-compat). The SINGLE membership predicate shared by the semantic

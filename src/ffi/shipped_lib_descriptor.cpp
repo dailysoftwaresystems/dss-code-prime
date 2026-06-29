@@ -1473,6 +1473,56 @@ readShippedLibAvailability(std::filesystem::path const& path,
     return out;  // empty ⇒ available on every format
 }
 
+std::optional<std::vector<std::string>>
+readShippedLibTypedefNames(std::filesystem::path const& path,
+                           DiagnosticReporter&          reporter) {
+    // Interner-FREE TYPEDEF-NAME read for the parse-time cast-vs-call ORACLE
+    // (D-CSUBSET-SHIPPED-TYPEDEF-CAST-PARSE): the post-parse typedef-resolution
+    // reparse (compilation_unit.cpp `finish()`) seeds these names as parse-time
+    // global TYPE NAMES so a shipped-typedef `(size_t)(expr)` parses as a CAST, not
+    // a call. Only the NAMES are needed (not the decoded `type`), so no
+    // TypeInterner — mirrors readShippedLibAvailability. LENIENT: a malformed entry
+    // is skipped (no name to harvest); the SEMANTIC read (readShippedLibDescriptor)
+    // owns strict typedef validation, so this stays no STRICTER than the full read
+    // and never double-reports. nullopt only on a broken JSON.
+    std::size_t const errBefore = reporter.errorCount();
+    std::ifstream in{path, std::ios::binary};
+    if (!in) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor: failed to open '"}
+                + path.generic_string() + "' for reading");
+        return std::nullopt;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    json doc;
+    try {
+        doc = json::parse(ss.str());
+    } catch (json::parse_error const& e) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor '"} + path.generic_string()
+                + "': JSON parse error: " + e.what());
+        return std::nullopt;
+    }
+    if (!doc.is_object()) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor '"} + path.generic_string()
+                + "': top-level value must be a JSON object");
+        return std::nullopt;
+    }
+    std::vector<std::string> out;
+    if (doc.contains("typedefs") && doc.at("typedefs").is_array()) {
+        for (auto const& t : doc.at("typedefs")) {
+            if (t.is_object() && t.contains("name") && t.at("name").is_string()) {
+                std::string name = t.at("name").get<std::string>();
+                if (!name.empty()) out.push_back(std::move(name));
+            }
+        }
+    }
+    if (reporter.errorCount() != errBefore) return std::nullopt;
+    return out;  // empty ⇒ no typedef surface (the oracle learns nothing new)
+}
+
 bool objectFormatInAvailabilitySet(std::span<std::string const> availableObjectFormats,
                                    ObjectFormatKind fmt) {
     if (availableObjectFormats.empty()) return true;  // empty ⇒ every format

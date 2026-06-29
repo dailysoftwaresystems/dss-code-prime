@@ -1,0 +1,16 @@
+{
+  "$comment": "c44 D-CSUBSET-SHIPPED-TYPEDEF-CAST-PARSE: a SHIPPED-typedef cast (size_t)(parenExpr) [size_t from <stddef.h>, injected post-parse] must parse as a CAST, not a call. The fix harvests shipped descriptor typedef NAMES into the existing post-parse cast-vs-call oracle so the reparse commits the cast; c43's offsetof fold then applies. This is sqlite's exact (size_t) offsetof shape (the c43 source-typedef corpus masked it). Exit 42 iff the bare (size_t)(2+3)==5 AND the shipped-(size_t) offsetof folds (uKey==char[offsetof(K,m)=4]). RED-ON-DISABLE: revert the harvest -> (size_t)(parenExpr) parses as a call -> S0004 + S001C. The offsetof fold is at semantic time so the optimized pipelines re-verify the same compile-time size; all 4 targets.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

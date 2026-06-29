@@ -1,6 +1,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 
 #include "analysis/compilation_unit/import_resolver.hpp"
+#include "ffi/shipped_lib_descriptor.hpp"   // readShippedLibTypedefNames (c43 follow-up: the cast-vs-call oracle)
 #include "analysis/preprocess/preprocessor.hpp"
 #include "analysis/syntactic/parser.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
@@ -537,6 +538,24 @@ CompilationUnit UnitBuilder::finish() && {
             std::unordered_set<std::string> oracle;
             for (auto const& sc : sidecars_) {
                 for (auto const& n : sc.globalTypeNames) oracle.insert(n);
+            }
+            // D-CSUBSET-SHIPPED-TYPEDEF-CAST-PARSE: a SHIPPED header's typedefs
+            // (`size_t` from <stddef.h>, `ptrdiff_t`, the stdint widths, …) are
+            // injected SEMANTICALLY (post-parse), so they appear in NO tree's
+            // `globalTypeNames` — the includer parsed `(size_t)(expr)` as a CALL
+            // and recorded an AmbiguousTypeNameCandidate. Harvest each resolved
+            // shipped descriptor's typedef NAMES into the oracle so the reparse
+            // below seeds them as parse-time type names and COMMITS the cast (then
+            // c43's offsetof fold applies → sqlite's `keyinfoSpace[offsetof(...)]`
+            // dim is constant, S001C clears). Interner-free (names only); a scratch
+            // reporter so a malformed descriptor is reported ONCE by the semantic
+            // read (readShippedLibDescriptor), never double-reported here.
+            for (auto const& ref : shippedLibDescriptors) {
+                DiagnosticReporter scratch{
+                    DiagnosticReporter::Config{.dedupWindow = 0}};
+                if (auto names = ffi::readShippedLibTypedefNames(ref.path, scratch)) {
+                    for (auto& n : *names) oracle.insert(std::move(n));
+                }
             }
             // `sidecars_` is index-parallel to `trees_` by construction
             // (addTree appends both) — fatal if that invariant ever broke.
