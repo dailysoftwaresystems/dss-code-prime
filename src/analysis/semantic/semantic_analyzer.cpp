@@ -29,6 +29,7 @@
 #include "hir/hir_op.hpp"   // FC6 c-subtreeType: HirOpKind / opName / isComparison (the per-verb laws cst_to_hir uses)
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -6441,6 +6442,30 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 rec.isConst            = true;          // a macro constant is not assignable
                 SymbolId const id = s.symbols.mint(rec);
                 s.scopes.injectBinding(cuRoot, c.name, id);
+            }
+
+            // c52 (D-FFI-MATH-INFINITY): inject the descriptor's FLOAT CONSTANTS
+            // (`INFINITY` etc.) — the float sibling of the integer-`constants` loop
+            // above, sharing the SAME `isInjectedConstant` fold path. The only
+            // difference is the carried value: `enumValue` is an int64, so the
+            // double is stored as its IEEE-754 BIT-PATTERN (std::bit_cast) and the
+            // shared `constantLiteralForSymbol` builder bit_casts it back when the
+            // symbol's type is a float kind (the integer path reads `enumValue`
+            // directly). `type` is the constant's own float scalar (F32/F64).
+            for (auto const& fc : desc->floatConstants) {
+                if (userDeclaredNames.contains(fc.name)) continue;
+                if (!injectedNames.insert(fc.name).second) continue;  // first wins
+                SymbolRecord rec;
+                rec.name               = fc.name;
+                rec.scope              = cuRoot;
+                rec.tree               = InvalidTree;   // not a user decl
+                rec.kind               = DeclarationKind::Variable;
+                rec.type               = fc.type;
+                rec.enumValue          = std::bit_cast<std::int64_t>(fc.value);  // f64 bit-pattern
+                rec.isInjectedConstant = true;
+                rec.isConst            = true;          // a macro constant is not assignable
+                SymbolId const id = s.symbols.mint(rec);
+                s.scopes.injectBinding(cuRoot, fc.name, id);
             }
 
             // Item 1: inject the descriptor's TYPEDEFS as `DeclarationKind::Type`

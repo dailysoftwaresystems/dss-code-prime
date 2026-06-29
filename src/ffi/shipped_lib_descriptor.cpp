@@ -7,11 +7,13 @@
 #include "core/types/strong_ids.hpp"            // InvalidType
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind (constant integer-scalar gate)
 #include "core/types/type_lattice/type_interner.hpp" // TypeInterner::kind (constant type gate)
+#include "core/types/number_decode.hpp"          // decodeFloat (the ONE float-literal decoder)
 #include "hir/hir_text.hpp"                      // parseTypeFromText (the ONE type decoder)
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <initializer_list>
@@ -86,6 +88,49 @@ void emitMalformed(DiagnosticReporter& reporter, std::string what) {
 // at all).
 [[nodiscard]] bool isIntegerScalarKind(TypeKind k) {
     return k >= TypeKind::I8 && k <= TypeKind::U128;
+}
+
+// True for the float SCALAR kinds (F16..F128). A shipped FLOAT CONSTANT's `type`
+// (the `floatConstants` surface, c52) must be one of these — the sibling gate to
+// `isIntegerScalarKind`. F32/F64 are the host-backed kinds the fold materializes;
+// F16/F128 decode + validate here but have no host literal backing downstream (no
+// math.h float constant needs them today).
+[[nodiscard]] bool isFloatScalarKind(TypeKind k) {
+    return k == TypeKind::F16 || k == TypeKind::F32
+        || k == TypeKind::F64 || k == TypeKind::F128;
+}
+
+// Decode a FLOAT constant's STRING `value` into a `double`. JSON has no
+// Infinity/NaN literal, so the value is a string: the explicit tokens
+// "inf"/"+inf"/"-inf" (case-insensitive) map to the IEEE-754 ±infinity bit
+// patterns; any other string is a finite float literal handed to the ONE float
+// decoder (`decodeFloat`, ns=nullptr → plain decimal / C99 hex-float via strtod).
+// Returns nullopt (the caller emits the error) on a non-string value, an empty
+// string, an un-parseable literal, OR a FINITE literal that OVERFLOWS to infinity
+// (only the explicit "inf" token may yield an infinity — never a silent overflow).
+[[nodiscard]] std::optional<double> decodeFloatConstantValue(json const& v) {
+    if (!v.is_string()) return std::nullopt;
+    std::string const s = v.get<std::string>();
+    if (s.empty()) return std::nullopt;
+    // Case-insensitive match of the infinity tokens (a small, closed set).
+    auto eqi = [](std::string const& a, char const* b) {
+        if (a.size() != std::char_traits<char>::length(b)) return false;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(a[i]))
+                != std::tolower(static_cast<unsigned char>(b[i]))) return false;
+        }
+        return true;
+    };
+    if (eqi(s, "inf") || eqi(s, "+inf")) return std::numeric_limits<double>::infinity();
+    if (eqi(s, "-inf")) return -std::numeric_limits<double>::infinity();
+    // A finite float literal. ns=nullptr → plain decimal / hex-float (strtod);
+    // `ok` is false on a partial parse OR an ERANGE overflow (overflow → infinity
+    // is rejected here — an infinity must be spelled "inf", never reached by an
+    // out-of-range finite literal).
+    bool ok = false;
+    double const d = decodeFloat(s, /*ns=*/nullptr, ok);
+    if (!ok || std::isinf(d) || std::isnan(d)) return std::nullopt;
+    return d;
 }
 
 // Validate a JSON integer `value` fits the integer-scalar `kind` and return its
@@ -707,8 +752,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // accepted + ignored, never consumed by lowering.
     (void)rejectUnknownKeys(reporter, doc, "(root)",
                             {"header", "standard", "library", "availableObjectFormats",
-                             "symbols", "constants", "typedefs", "structs", "macros",
-                             "$comment"});
+                             "symbols", "constants", "floatConstants", "typedefs",
+                             "structs", "macros", "$comment"});
 
     // (4) Each symbol. Collect-all: a malformed symbol is reported but the
     // loop continues so the operator sees every problem in one pass; the
@@ -1018,6 +1063,90 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
 
             if (!selected) continue;   // no variant matched → inject nothing
             out.constants.push_back(ShippedConstant{std::move(cname), selValue, selType});
+        }
+    }
+
+    // (5.5) Optional `floatConstants` array (c52, D-FFI-MATH-INFINITY) — the
+    // FLOAT-valued sibling of `constants` (which is integer-ONLY; a float there
+    // still fails loud). A header's float object-like macros (`INFINITY`, `M_PI`,
+    // `DBL_MAX`) ship here. Each: required non-empty `name`; required hir-text
+    // `type` that MUST decode to a FLOAT SCALAR (F32/F64); required STRING `value`
+    // (JSON has no Infinity literal — "inf"/"+inf"/"-inf" map to ±infinity, any
+    // other string is a finite float literal). Collect-all (continue on error; the
+    // read still fails via the errorCount delta). A non-float-scalar type or an
+    // un-parseable / silently-overflowing value FAILS LOUD — never a silent wrong
+    // constant. No per-target `variants` (every float constant here — INFINITY — is
+    // target-invariant IEEE-754; a future per-target float would be its own cycle).
+    if (doc.contains("floatConstants")) {
+        if (!doc.at("floatConstants").is_array()) {
+            emitMalformed(reporter,
+                std::string{"shipped-lib descriptor '"} + path.generic_string()
+                    + "': 'floatConstants' must be an array");
+            return std::nullopt;
+        }
+        json const& fconstants = doc.at("floatConstants");
+        out.floatConstants.reserve(fconstants.size());
+        std::size_t fcidx = 0;
+        for (auto const& c : fconstants) {
+            std::string const at = std::string{"'"} + path.generic_string()
+                + "' floatConstants[" + std::to_string(fcidx) + "]";
+            ++fcidx;
+            if (!c.is_object()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
+                continue;
+            }
+            (void)rejectUnknownKeys(reporter, c,
+                                    "floatConstants[" + std::to_string(fcidx - 1) + "]",
+                                    {"name", "value", "type"});
+            if (!c.contains("name") || !c.at("name").is_string()
+                || c.at("name").get<std::string>().empty()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": missing or empty 'name'");
+                continue;
+            }
+            std::string cname = c.at("name").get<std::string>();
+
+            // `type` must decode to a FLOAT SCALAR (F32/F64). A non-float-scalar
+            // (or undecodable) type fails loud F_ShippedLibUnsupportedType — the
+            // float-surface sibling of the integer gate (so an INTEGER in
+            // `floatConstants` is just as out-of-scope as a float in `constants`).
+            if (!c.contains("type") || !c.at("type").is_string()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": missing or non-string 'type'");
+                continue;
+            }
+            std::string const typeText = c.at("type").get<std::string>();
+            TypeId const cty = parseTypeFromText(typeText, interner, typeReg, reporter);
+            if (!cty.valid() || cty == InvalidType) {
+                dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                            DiagnosticSeverity::Error,
+                            "shipped-lib descriptor " + at + ": float constant '" + cname
+                                + "' has a 'type' that failed to decode ('" + typeText + "')");
+                continue;
+            }
+            if (!isFloatScalarKind(interner.kind(cty))) {
+                dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                            DiagnosticSeverity::Error,
+                            "shipped-lib descriptor " + at + ": float constant '" + cname
+                                + "' type '" + typeText + "' is not a float scalar "
+                                  "(a 'floatConstants' entry must be f32/f64; an integer "
+                                  "constant belongs in 'constants')");
+                continue;
+            }
+            if (!c.contains("value")) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": missing 'value'");
+                continue;
+            }
+            auto const dv = decodeFloatConstantValue(c.at("value"));
+            if (!dv.has_value()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": float constant '"
+                    + cname + "' has an invalid 'value' (expected a string: \"inf\"/\"+inf\"/"
+                              "\"-inf\" or a finite float literal; an out-of-range finite "
+                              "literal that overflows to infinity is rejected)");
+                continue;
+            }
+            out.floatConstants.push_back(
+                ShippedFloatConstant{std::move(cname), *dv, cty});
         }
     }
 
@@ -1368,14 +1497,14 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     bool const declaredConstants      = declaresArray("constants");
     bool const declaredTypedefs       = declaresArray("typedefs");
     bool const declaredMacroVariants  = declaresArray("macros");
-    if (out.symbols.empty() && out.constants.empty() && out.typedefs.empty()
-        && out.structs.empty() && out.macros.empty()
+    if (out.symbols.empty() && out.constants.empty() && out.floatConstants.empty()
+        && out.typedefs.empty() && out.structs.empty() && out.macros.empty()
         && !declaredStructs && !declaredConstants && !declaredTypedefs
         && !declaredMacroVariants) {
         emitMalformed(reporter,
             std::string{"shipped-lib descriptor '"} + path.generic_string()
                 + "': declares nothing — needs at least one of 'symbols', "
-                  "'constants', 'typedefs', 'structs', or 'macros'");
+                  "'constants', 'floatConstants', 'typedefs', 'structs', or 'macros'");
         return std::nullopt;
     }
 

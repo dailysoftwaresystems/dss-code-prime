@@ -1,0 +1,16 @@
+{
+  "$comment": "c52 (D-FFI-MATH-INFINITY): ship INFINITY from <math.h> as an f64 float constant. sqlite uses `(double)INFINITY` (sqlite3.c:37393/37423 — a RUNTIME expression) -> S0001 INFINITY undeclared; the integer `constants` surface is integer-only, so a NEW `floatConstants` surface carries it (injected as an f64 named constant whose HIR Ref folds to a +inf literal 0x7FF0000000000000). `(double)INFINITY > 1e308` is true -> exit 42. The release/full-release-like arms ConstFold `+inf > 1e308` to true (the const-eval Float->Float identity cast preserves +inf; only Float->INT casts of inf refuse). RED-ON-DISABLE: remove the math.json floatConstants INFINITY entry -> S0001. ★ INFINITY's value + the +inf bit pattern are verified on the pe RUN (exit 42) + x86_64 disassembly of the .data f64 const. The elf/arm64 targets are COMPILE-ONLY here (runOn:[]) pending a SEPARATE libm cycle: `#include <math.h>` emits all math.json externs (sqrt etc.) as BIND_NOW undefined dynsyms, but the binary's only DT_NEEDED is libc.so.6 (math.json `library`=libc) while glibc's math symbols live in libm.so.6 -> the elf/arm64 binary fails to LOAD (undefined symbol: sqrt, exit 127). This is PRE-EXISTING (a bare `sqrt(4.0)` program reproduces it identically), NOT c52's fold. The cross-target RUN is restored once the math.h/libm DT_NEEDED gap is fixed (DCE unused shipped externs + the libm library attribution).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": [] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": [], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

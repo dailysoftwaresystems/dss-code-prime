@@ -158,6 +158,29 @@ struct DSS_EXPORT ShippedConstant {
     TypeId       type;     // an integer scalar kind; decoded via parseTypeFromText
 };
 
+// One decoded named FLOAT CONSTANT — the float-valued sibling of `ShippedConstant`
+// (c52, D-FFI-MATH-INFINITY). The integer `constants` surface is deliberately
+// integer-ONLY (a float there still fails loud F_ShippedLibUnsupportedType); a
+// header's float-valued object-like macros (`INFINITY`, `M_PI`, `DBL_MAX`) ship
+// HERE instead. `type` MUST decode to a FLOAT scalar (F32/F64); `value` is the
+// decoded `double` (an F32 constant is stored widened to double and the fold
+// narrows it back at materialization). The semantic phase injects each as a named
+// constant whose HIR Ref folds to a FLOAT literal — the SAME `isInjectedConstant`
+// path as an integer constant, the only difference being the float core/value the
+// shared `constantLiteralForSymbol` builder derives.
+//
+// VALUE ENCODING: JSON has no Infinity/NaN, so the descriptor's `value` is a
+// STRING — the special tokens "inf"/"+inf"/"-inf" map to the IEEE-754 ±infinity
+// bit patterns, and any other string is a finite float literal parsed by the ONE
+// float decoder (`number_decode.hpp`). A finite literal that OVERFLOWS to ±inf
+// fails loud (only the explicit "inf" tokens may produce an infinity — never a
+// silent overflow).
+struct DSS_EXPORT ShippedFloatConstant {
+    std::string name;
+    double      value = 0.0;
+    TypeId      type;     // a FLOAT scalar kind (F32/F64); decoded via parseTypeFromText
+};
+
 // One decoded TYPEDEF — the neutral form of a header's `typedef … name;` (e.g.
 // `size_t`). The semantic phase injects it as a `DeclarationKind::Type` symbol
 // so the name resolves in type position. `type` is any hir-text-decodable type
@@ -262,6 +285,7 @@ struct DSS_EXPORT ShippedLibDescriptor {
     // `constants` (e.g. `<limits.h>`), only `symbols`, or any mix.
     std::vector<ShippedSymbol>   symbols;     // extern functions/objects (linked)
     std::vector<ShippedConstant> constants;   // named integer constants (folded)
+    std::vector<ShippedFloatConstant> floatConstants; // named float constants (folded; c52)
     std::vector<ShippedTypedef>  typedefs;    // type aliases (resolved in type pos)
     std::vector<ShippedMacro>    macros;      // preprocessor macros (injected at #include)
     std::vector<ShippedStruct>   structs;     // named-field structs (tag + field scope)

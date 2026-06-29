@@ -26,6 +26,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -1298,6 +1299,96 @@ TEST(ShippedLibDescriptor, NonIntegerConstantTypeFailsLoud) {
     EXPECT_FALSE(desc.has_value());
     EXPECT_EQ(dss::test_support::countCode(
                   rep, DiagnosticCode::F_ShippedLibUnsupportedType), 1u);
+}
+
+// c52 (D-FFI-MATH-INFINITY): the float-constant surface decodes "inf" -> +inf
+// and a finite literal -> its value, both as f64. The INFINITY case is the
+// sqlite frontier; the finite case pins the general float-literal path.
+TEST(ShippedLibDescriptor, FloatConstantsDecodeInfAndFinite) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "math.json", R"({
+        "header": "math.h",
+        "floatConstants": [
+            { "name": "INFINITY", "value": "inf",  "type": "f64" },
+            { "name": "NEG_INF",  "value": "-inf", "type": "f64" },
+            { "name": "HALF",     "value": "0.5",  "type": "f64" },
+            { "name": "FLT_HALF", "value": "0.5",  "type": "f32" }
+        ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_TRUE(desc->constants.empty());   // floats are NOT in the integer surface
+    ASSERT_EQ(desc->floatConstants.size(), 4u);
+    EXPECT_EQ(desc->floatConstants[0].name, "INFINITY");
+    EXPECT_TRUE(std::isinf(desc->floatConstants[0].value));
+    EXPECT_GT(desc->floatConstants[0].value, 0.0);
+    EXPECT_EQ(interner.kind(desc->floatConstants[0].type), TypeKind::F64);
+    EXPECT_TRUE(std::isinf(desc->floatConstants[1].value));
+    EXPECT_LT(desc->floatConstants[1].value, 0.0);
+    EXPECT_DOUBLE_EQ(desc->floatConstants[2].value, 0.5);
+    EXPECT_EQ(interner.kind(desc->floatConstants[3].type), TypeKind::F32);
+}
+
+// c52 NEGATIVE PIN (a): an INTEGER type in `floatConstants` is out of scope —
+// F_ShippedLibUnsupportedType (the float-surface sibling of the integer gate;
+// an integer constant belongs in `constants`).
+TEST(ShippedLibDescriptor, IntegerInFloatConstantsFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "x.json", R"({
+        "header": "x.h",
+        "floatConstants": [ { "name": "N", "value": "1.0", "type": "i32" } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibUnsupportedType), 1u);
+}
+
+// c52 NEGATIVE PIN (b): a FINITE literal that OVERFLOWS to infinity is rejected
+// (only the explicit "inf" token may produce an infinity — never a silent
+// overflow). F_ShippedLibDescriptorMalformed (an invalid value).
+TEST(ShippedLibDescriptor, FloatConstantOverflowToInfFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "x.json", R"({
+        "header": "x.h",
+        "floatConstants": [ { "name": "OK",  "value": "1.0",  "type": "f64" },
+                            { "name": "BAD", "value": "1e400", "type": "f64" } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 1u);
+}
+
+// c52 NEGATIVE PIN (c): a NUMERIC (non-string) value in `floatConstants` fails
+// loud — JSON has no Infinity literal, so the value MUST be a string. This also
+// guards the encoding choice (the "inf" token shape) from silent drift. The
+// valid `OK` sibling keeps the descriptor from ALSO tripping "declares nothing",
+// isolating the single value diagnostic.
+TEST(ShippedLibDescriptor, FloatConstantNumericValueFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "x.json", R"({
+        "header": "x.h",
+        "floatConstants": [ { "name": "OK", "value": "1.0", "type": "f64" },
+                            { "name": "PI", "value": 3.14,  "type": "f64" } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 1u);
 }
 
 // Fail-loud: a value that does not fit its declared width (300 in an i8). The

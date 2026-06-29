@@ -121,8 +121,11 @@ struct DSS_EXPORT SymbolRecord {
     // missing = previous + 1, C99 §6.7.2.2), OR at descriptor injection for a
     // shipped CONSTANT (`isInjectedConstant`). Carries the int64 BIT-PATTERN —
     // for an unsigned-typed constant the uint64 value reinterpreted; the HIR
-    // fold re-reads it per the type's signedness. Meaningful only when exactly
-    // one of `isEnumerator` / `isInjectedConstant` is set; harmless 0 elsewhere.
+    // fold re-reads it per the type's signedness. c52: a FLOAT-typed injected
+    // constant (`INFINITY`) reuses this int64 carrier to hold the IEEE-754 f64
+    // BIT-PATTERN (std::bit_cast), which the fold bit_casts back to a `double`
+    // when the type is a float kind. Meaningful only when exactly one of
+    // `isEnumerator` / `isInjectedConstant` is set; harmless 0 elsewhere.
     std::int64_t    enumValue = 0;
     // D-CSUBSET-FN-PROTOTYPE: a bare function PROTOTYPE — a function-TYPED object
     // declaration with a function suffix on its NAME and NO body (`int f(int);`).
@@ -169,15 +172,17 @@ struct DSS_EXPORT SymbolRecord {
     // constant value at HIR Ref-lowering; folding a storage-backed local would be
     // a silent miscompile. Default false (every non-enumerator symbol).
     bool            isEnumerator = false;
-    // Item 1 (shipped-header constants): TRUE iff this symbol is a NAMED INTEGER
-    // CONSTANT injected from a neutral shipped-lib descriptor's `constants`
-    // (e.g. `CHAR_BIT` from `limits.json`). Like an enumerator it folds its Ref
-    // to `enumValue` at HIR lowering AND resolves to that value in a constant-
-    // expression context (array dim / case / global init) via the const-eval
-    // engines' direct-value arm — but its `type` is the constant's OWN integer
-    // scalar (NOT an Enum), so the fold derives the literal core from the type
-    // directly. INVARIANT: at most one of `isEnumerator` / `isInjectedConstant`
-    // is true on any symbol (they share `enumValue` but fold via different cores).
+    // Item 1 (shipped-header constants): TRUE iff this symbol is a NAMED CONSTANT
+    // injected from a neutral shipped-lib descriptor's `constants` (integer, e.g.
+    // `CHAR_BIT` from `limits.json`) OR `floatConstants` (float, e.g. `INFINITY`
+    // from `math.json` — c52). Like an enumerator it folds its Ref to `enumValue`
+    // at HIR lowering AND resolves to that value in a constant-expression context
+    // (array dim / case / global init) via the const-eval engines' direct-value
+    // arm — but its `type` is the constant's OWN scalar (NOT an Enum), so the fold
+    // derives the literal core from the type directly (an integer core reads the
+    // int64 carrier; a float core bit_casts it back to a double). INVARIANT: at
+    // most one of `isEnumerator` / `isInjectedConstant` is true on any symbol
+    // (they share `enumValue` but fold via different cores).
     bool            isInjectedConstant = false;
     // D-CSUBSET-BITFIELD (FC8): the declared bit-field width of a struct/union
     // field, or nullopt for an ordinary field. A TRANSIENT carrier — set at the
