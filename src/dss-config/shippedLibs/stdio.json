@@ -28,5 +28,12 @@
     { "name": "remove",   "signature": "fn(ptr<char>) -> i32",            "kind": "function", "linkage": "external" },
     { "name": "rename",   "signature": "fn(ptr<char>, ptr<char>) -> i32", "kind": "function", "linkage": "external" },
     { "name": "perror",   "signature": "fn(ptr<char>) -> void",          "kind": "function", "linkage": "external" }
+  ],
+  "constants": [
+    { "name": "FILENAME_MAX", "variants": [
+        { "when": { "format": "elf" },   "value": 4096, "type": "i32" },
+        { "when": { "format": "macho" }, "value": 1024, "type": "i32" },
+        { "when": { "format": "pe" },    "value": 260,  "type": "i32" }
+    ] }
   ]
 }

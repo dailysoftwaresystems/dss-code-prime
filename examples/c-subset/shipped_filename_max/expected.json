@@ -1,0 +1,16 @@
+{
+  "$comment": "c45 D-FFI-STDIO-FILENAME-MAX: FILENAME_MAX from <stdio.h> as a compile-time constant (the sqlite frontier after c43/c44 cleared S001C). sqlite uses `#define SQLITE_MAX_PATHLEN FILENAME_MAX` (sqlite3.c:16681) to size path buffers; the shipped <stdio.h> had no constants surface -> FILENAME_MAX undefined -> S000B. Added to stdio.json constants PER-TARGET via variants (elf 4096 / macho 1024 / pe 260). Exit 42 iff FILENAME_MAX folds to a positive buffer size in [260,4096] (a target-invariant range -- the exact per-target value is in the descriptor + verified directly: pe->260, elf->4096). RED-ON-DISABLE: revert the stdio.json constants addition -> FILENAME_MAX undefined -> S000B. The fold is at semantic time so the optimized pipelines re-verify the same compile-time size; all 4 targets.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
