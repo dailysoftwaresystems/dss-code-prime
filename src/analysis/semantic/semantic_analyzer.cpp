@@ -5505,9 +5505,32 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         return mr.status == MemberResolution::Status::Ok ? mr.fieldType
                                                          : InvalidType;
     };
-    auto const combineTernary = [&](TypeId thenT, TypeId elseT) -> TypeId {
+    auto const combineTernary = [&](TypeId thenT, TypeId elseT,
+                                    NodeId thenN, NodeId elseN) -> TypeId {
         TypeId const common = commonArithType(thenT, elseT);
         if (common.valid()) return common;
+        // C 6.5.15p6: a conditional with ONE arm a pointer and the OTHER a
+        // null-pointer-constant (a literal integer 0) has the POINTER type. Reuse
+        // the existing null-pointer-constant machinery (`isLiteralIntegerZero` —
+        // structural, no flag check) gated on the same per-language flag
+        // `admitsNullPointerConstant` reads. This MUST win over the first-arm
+        // fallback below — else the leading `0` in `cond ? 0 : ptr` would shadow
+        // the pointer arm (its int type has no arith rank vs the pointer → Invalid
+        // common → first-arm I32). The HIR tier then materializes the
+        // `Cast(0 → Ptr)` on the literal-0 arm. Handles BOTH orders. A NON-literal
+        // int arm (`n ? n : ptr`) is NOT a null-pointer-constant → falls through.
+        if (sem.pointerConversions.nullPointerConstantFromIntegerZero) {
+            if (thenT.valid()
+                && interner.kind(thenT) == TypeKind::Ptr
+                && isLiteralIntegerZero(s, tree, elseN)) {
+                return thenT;
+            }
+            if (elseT.valid()
+                && interner.kind(elseT) == TypeKind::Ptr
+                && isLiteralIntegerZero(s, tree, thenN)) {
+                return elseT;
+            }
+        }
         return thenT.valid() ? thenT : elseT;   // non-arith arms (pointers etc.)
     };
 
@@ -5667,7 +5690,8 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 f.c0 = result; f.phase = 2; NodeId n = f.list[2]; enter(n);
             } else {
                 TypeId thenT = f.c0;
-                work.pop_back(); result = combineTernary(thenT, result);
+                work.pop_back();
+                result = combineTernary(thenT, result, f.list[1], f.list[2]);
             }
             break;
         case Frame::Kind::Wrapper:

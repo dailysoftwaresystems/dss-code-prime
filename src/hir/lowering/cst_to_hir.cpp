@@ -2681,7 +2681,38 @@ struct Lowerer {
         // type-balance rule — the config-driven UAC engine when the
         // language declares the block; FC3 c1). Falls back to the
         // type-attribute-or-then.
-        TypeId const common = commonArithType(thenE.type, elseE.type);
+        TypeId common = commonArithType(thenE.type, elseE.type);
+        // C 6.5.15p6: a conditional with ONE arm a pointer and the OTHER an
+        // integer-literal null-pointer-constant has the POINTER type. The semantic
+        // tier (combineTernary) already admitted this (and vetoed value!=0), so
+        // gate STRUCTURALLY here — `HirKind::Literal` + integer type — exactly like
+        // the line-447 null-ptr coerce pattern (do NOT re-check value==0; the
+        // literal-pool lookup is host-STL-sensitive). The pointer `common` then
+        // drives the EXISTING coerce calls below: the literal-0 arm hits the
+        // null-ptr coerce arm (line 465) → `Cast(0 → Ptr)`; the pointer arm is a
+        // no-op. Handles BOTH arm orders.
+        if (!common.valid()
+            && sem.pointerConversions.nullPointerConstantFromIntegerZero) {
+            auto const isIntLiteralArm = [&](E const& arm) -> bool {
+                if (builder.kind(arm.id) != HirKind::Literal) return false;
+                TypeKind const k = interner.kind(arm.type);
+                return k == TypeKind::I8  || k == TypeKind::I16
+                    || k == TypeKind::I32 || k == TypeKind::I64
+                    || k == TypeKind::I128
+                    || k == TypeKind::U8  || k == TypeKind::U16
+                    || k == TypeKind::U32 || k == TypeKind::U64
+                    || k == TypeKind::U128;
+            };
+            if (thenE.type.valid()
+                && interner.kind(thenE.type) == TypeKind::Ptr
+                && isIntLiteralArm(elseE)) {
+                common = thenE.type;
+            } else if (elseE.type.valid()
+                && interner.kind(elseE.type) == TypeKind::Ptr
+                && isIntLiteralArm(thenE)) {
+                common = elseE.type;
+            }
+        }
         if (common.valid()) {
             thenE = coerce(thenE, common);
             elseE = coerce(elseE, common);
