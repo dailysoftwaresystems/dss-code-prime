@@ -49,6 +49,21 @@ declare -a TARGETS=(
   "linux=x86_64:elf64-x86_64-linux-exec"
   "macos=arm64:macho64-arm64-darwin-exec"
 )
+# DSS_OS: optional comma-separated target-label filter for FAST iteration
+# (e.g. DSS_OS=linux compiles only the linux leg — ~3x faster while only ONE OS
+# is the active frontier). Default (unset) = all 3 deliverable OSes; the FINAL
+# green run leaves DSS_OS unset to verify windows+linux+macos together.
+if [[ -n "${DSS_OS:-}" ]]; then
+  declare -a _dss_filtered=()
+  for _t in "${TARGETS[@]}"; do
+    case ",${DSS_OS}," in *",${_t%%=*},"*) _dss_filtered+=("$_t");; esac
+  done
+  if [[ ${#_dss_filtered[@]} -eq 0 ]]; then
+    echo "DSS_OS='${DSS_OS}' matched no target label (windows|linux|macos)" >&2
+    exit 2
+  fi
+  TARGETS=("${_dss_filtered[@]}")
+fi
 
 # ── logging / fail-loud ──────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
