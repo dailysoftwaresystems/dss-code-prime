@@ -178,10 +178,17 @@ namespace detail::type_rules {
     // Bool→int Cast). Gated on `boolWidensToArith` so ONLY the pre-coerce
     // semantic checks admit it — the post-coerce verifier stays strict. This
     // is the ASSIGNMENT direction only — `Bool` stays out of `isArithmetic`
-    // (above), so binary PROMOTION (`bool + bool`) is unaffected.
+    // (above), so binary PROMOTION (`bool + bool`) is unaffected. c48
+    // (D-CSUBSET-BOOL-CHAR-WIDENING): when `charConvertsToArith` also treats
+    // `char` (interned as `TypeKind::Char`, outside the int RANKS) as an
+    // arithmetic slot, a Bool widens into a `char` lhs too — `char c = (a==b);`,
+    // the sqlite `p->nFloor = (p->D==31)` shape. Arithmetic `char = a-b` already
+    // worked via the `charConvertsToArith` arm below (int→char); only the
+    // Bool-RESULT (comparison/logical) flowing into a plain `char` was missed.
     if (boolWidensToArith && rk == TypeKind::Bool
         && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0
-            || floatRank(lk) != 0)) {
+            || floatRank(lk) != 0
+            || (charConvertsToArith && lk == TypeKind::Char))) {
         return true;
     }
     // C 6.3.1.1 / 6.5.16.1: `char` is an integer type — implicitly convertible to AND
