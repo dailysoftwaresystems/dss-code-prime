@@ -36,6 +36,13 @@
         { "name": "tm_gmtoff", "type": "i64" },
         { "name": "tm_zone",   "type": "ptr<char>" }
       ]
+    },
+    {
+      "name": "timespec",
+      "fields": [
+        { "name": "tv_sec",  "type": "i64" },
+        { "name": "tv_nsec", "type": "i64" }
+      ]
     }
   ]
 }
