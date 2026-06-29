@@ -1,0 +1,34 @@
+{
+  "$comment": "c55 (D-CSUBSET-CALL-IN-PAREN-CAST-AMBIGUITY): a parenthesized call with an identifier arg, followed by a binary operator — the SQLite ROUND8(call) shape `(((sqlite3JournalSize(pVfs))+7)&~7)` (sqlite3.c:63552) fired S0006 S_UnknownType. The parser cast-vs-value triage (typeNameCommitApproved_ Rule 1) committed on any >1-leaf type-child, so `idn(p)`'s `(p)` tail made it commit as a cast to type `idn(p)` and skip the follower-operator test -> resolveTypeNode failed. Fix: Rule 1 keys on the BASE leaf; an identifier base (even with a `(p)`/`*` tail) falls through to the sketch lookup + follower test, which sees the `+`/`&`/`*` and rolls back to the call. The c26 sibling of the `(c*c)`/`(b[0])` exclusions. VALUE-CORRECT (idn(x)=x): r=(((idn(35))+7)&~7)=40 (exact ROUND8 shape), s=((idn(20))+22)=42 ((call)+op); return s gated on r==40. RED-ON-DISABLE: revert Rule 1 -> S0006. Pure c-subset -> all 4 targets; pe RUNS on Windows.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

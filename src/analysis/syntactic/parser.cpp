@@ -861,10 +861,23 @@ struct Parser::Impl {
             return false;
         }
 
-        // Rule 1 — not a lone identifier → commit.
+        // Rule 1 — the type-name's BASE cannot be an expression (a keyword
+        // base, struct/union/enum tag, const, …) → COMMIT: no value reading
+        // competes. The discriminator is the BASE (leftmost) leaf, NOT the
+        // whole type child's leaf COUNT: an IDENTIFIER base carrying an
+        // abstract-declarator tail (e.g. the function-type `f(p)` that
+        // `ROUND8(call)` expands to as `((f(p))+7)`, or `name*`) is still
+        // type-vs-value AMBIGUOUS and must reach rules 2-4 (the sketch lookup
+        // on the base name + the follower-operator test). c55
+        // (D-CSUBSET-CALL-IN-PAREN-CAST-AMBIGUITY): the function-call sibling
+        // of c26's `(c*c)` / `(b[0])` abstract-declarator exclusions — the
+        // earlier whole-subtree leaf COUNT made `f(p)`'s `(p)` tail commit and
+        // SKIP the follower test, mis-reading the call as a cast to a type
+        // named `f(p)` → S_UnknownType. (A genuinely-undeclared callee still
+        // errors: the rollback re-reads the call, then checkCall reports it.)
         std::vector<NodeId> typeLeaves;
         collectLeavesBelow_(typeChild, typeLeaves, /*cap=*/1);
-        if (typeLeaves.size() != 1
+        if (typeLeaves.empty()
             || builder->nodeKind(typeLeaves[0]) != NodeKind::Token
             || builder->nodeTokenKind(typeLeaves[0]).v != identifierKind.v) {
             return true;
