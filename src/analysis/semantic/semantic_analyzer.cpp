@@ -5077,6 +5077,28 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         } else {
             landedTy = subtreeType(s, tree, cur.valid() ? cur : calleeNode);
         }
+        // D-CSUBSET-FUNCTION-POINTER-DEREF (c54): the structural deref-peel
+        // above descends PAST each `*` token, which is correct only for the
+        // function-designator collapse (`*fp == fp` when fp is FnSig /
+        // Ptr<FnSig>, C 6.5.3.2p4) but DROPS a real pointer level for a data
+        // pointer — so a callee like `(**(finder_type*)pVfs->pAppData)(…)`
+        // (SQLite os_unix: `finder_type` is a fn-ptr typedef, so
+        // `finder_type*` is Ptr<Ptr<FnSig>>) landed as Ptr<Ptr<FnSig>> and
+        // was wrongly rejected S_NotCallable. subtreeType types the WHOLE
+        // callee applying derefResultType per `*` (the C-correct per-level
+        // reduction), so when it yields a callable type that result GOVERNS.
+        // This only UPGRADES the deref case: a non-callable full-callee type
+        // leaves landedTy untouched (so `int* p; (*p)(3)` stays
+        // S_NotCallable), and the landed-identifier path above is preserved
+        // intact for the variadicBuiltin + undeclared-dedup contracts.
+        {
+            TypeId const calleeExprTy = subtreeType(s, tree, calleeNode);
+            if (calleeExprTy.valid()
+                && (in.kind(calleeExprTy) == TypeKind::FnSig
+                    || isFnPointerType(in, calleeExprTy))) {
+                landedTy = calleeExprTy;
+            }
+        }
         if (!landedTy.valid()) {
             return;  // unstamped callee expression — out of v1 scope
         }
