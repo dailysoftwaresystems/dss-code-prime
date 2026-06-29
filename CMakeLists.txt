@@ -82,6 +82,20 @@ if(DSS_BUILD_TESTS)
     FetchContent_MakeAvailable(googletest)
 endif()
 
+# ── MSVC: /bigobj (raise the COFF section limit) ──
+# Several large translation units (semantic_analyzer.cpp, cst_to_hir.cpp,
+# hir_to_mir.cpp …) have grown past the default COFF object-file section limit in
+# the DEBUG configuration (no inlining + full debug sections) — MSVC fatal
+# `C1128: ... compile with /bigobj`. Release stays under the cap, so it surfaces
+# only in Debug, breaking the Debug ctest build. /bigobj raises the limit; it is
+# harmless in Release and a NO-OP on every non-MSVC toolchain (ELF / Mach-O have
+# no such cap), so it stays target-agnostic. Applied project-wide for MSVC after
+# the FetchContent deps (so it scopes to this project's targets), consistent with
+# the per-compiler global-flag convention below (the PCH /Brepro block).
+if(MSVC)
+    add_compile_options(/bigobj)
+endif()
+
 # ── Precompiled headers (build-time only — D-CI-WINDOWS-MSVC-BUILD-TIME-CEILING) ──
 # The windows-msvc-release CI leg re-parses the same heavy, templated STL
 # headers (<format>, <unordered_map>, <vector>, …) in every one of the ~280
