@@ -825,6 +825,11 @@ private:
         if (auto const* s = std::get_if<std::string>(&v.value)) {
             out_ += "str "; out_ += quote(*s); return;
         }
+        if (auto const* a = std::get_if<HirAddressValue>(&v.value)) {
+            // c43 address constant: `addr <base> <byteOffset>` (pointeeType is
+            // fold-transient and not round-tripped — invalid on the parsed value).
+            out_ += std::format("addr {} {}", a->base, a->byteOffset); return;
+        }
     }
 
     void appendOpName(std::uint32_t payload) {
@@ -1179,6 +1184,16 @@ private:
         else if (tag == "float"){ bool n = accept(Tk::Minus); double d = takeFloat();
                                   v.value = n ? -d : d; }
         else if (tag == "str")  { v.value = takeStr(); }
+        else if (tag == "addr") {
+            // c43 address constant: `addr <base> <byteOffset>` (signed offset).
+            HirAddressValue a;
+            a.base = static_cast<std::uint32_t>(takeInt());
+            bool const n = accept(Tk::Minus);
+            std::uint64_t const off = takeInt();
+            a.byteOffset = n ? static_cast<std::int64_t>(0u - off)
+                             : static_cast<std::int64_t>(off);
+            v.value = std::move(a);
+        }
         else malformed(std::format("unknown literal value tag '{}'", tag));
         return v;
     }

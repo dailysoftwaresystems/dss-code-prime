@@ -40,6 +40,28 @@ using detail::makeBoolLiteral;
     return ceOk(std::move(v));
 }
 
+// c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A): address-value helpers.
+[[nodiscard]] inline HirAddressValue const* asAddress(HirLiteralValue const& v) {
+    return std::get_if<HirAddressValue>(&v.value);
+}
+[[nodiscard]] inline HirLiteralValue makeAddress(HirAddressValue a) {
+    HirLiteralValue v;
+    v.core  = TypeKind::Ptr;
+    v.value = a;
+    return v;
+}
+// Convert a folded integer to a target integer width (C 6.3.1.3): for a narrowing
+// target, mask to `bits` and sign-extend if the target is signed; `bits >= 64` is
+// identity. Used by the integer-target cast arm so the `(size_t)` that terminates
+// the offsetof idiom (and any other const-expr int cast) folds to the right value.
+[[nodiscard]] inline std::int64_t narrowIntToBits(std::int64_t v, int bits, bool isSigned) {
+    if (bits >= 64 || bits <= 0) return v;
+    std::uint64_t const mask = (std::uint64_t{1} << bits) - 1;
+    std::uint64_t m = static_cast<std::uint64_t>(v) & mask;
+    if (isSigned && (m & (std::uint64_t{1} << (bits - 1)))) m |= ~mask;  // sign-extend
+    return static_cast<std::int64_t>(m);
+}
+
 // `opFromName` (config target name -> HirOpKind) now lives in the shared
 // `hir/const_eval_operators.hpp` so the C-preprocessor `#if` evaluator reuses
 // the identical bridge. Reachable here as `dss::opFromName` (unqualified).
@@ -109,6 +131,29 @@ combineBinaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& opti
         return fail(why != ConstEvalFailure::None
                         ? why : ConstEvalFailure::UnsupportedOperator,
                     expr);
+    }
+    // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A): address arithmetic. A
+    // pointer DIFFERENCE of two NULL-relative addresses with the SAME base folds
+    // to the integer byte difference — the offsetof terminator
+    // `(char*)&((T*)0)->M - (char*)0` (both `char*`, so the byte difference IS the
+    // member offset). `address ± integer` (`&g + N`) is a GLOBAL-init concern with
+    // a real element stride — the HIR engine owns it; fail loud here rather than
+    // guess a stride in this array-dimension context.
+    {
+        auto const* la = asAddress(*a.value);
+        auto const* ra = asAddress(*b.value);
+        if (la != nullptr && ra != nullptr) {
+            if (e.target != "Sub" || la->base != ra->base) {
+                return fail(ConstEvalFailure::NotAConstantExpression, expr);
+            }
+            HirLiteralValue v;
+            v.core  = TypeKind::I64;
+            v.value = la->byteOffset - ra->byteOffset;
+            return ok(std::move(v));
+        }
+        if (la != nullptr || ra != nullptr) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
     }
     if (!asInt64(*a.value).has_value() || !asInt64(*b.value).has_value()) {
         return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
@@ -232,7 +277,12 @@ wrapperChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
         (cfg.sizeofRule.valid()      && rule.v == cfg.sizeofRule.v)      ||
         (cfg.binaryExprRule.valid()  && rule.v == cfg.binaryExprRule.v)  ||
         (cfg.unaryExprRule.valid()   && rule.v == cfg.unaryExprRule.v)   ||
-        (cfg.ternaryExprRule.valid() && rule.v == cfg.ternaryExprRule.v);
+        (cfg.ternaryExprRule.valid() && rule.v == cfg.ternaryExprRule.v) ||
+        // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD): a cast / postfix-member node has
+        // a type-ref or follower child the peel would mishandle — keep them for
+        // evalNode's address arms (mirror sizeof).
+        (cfg.castRule.valid()        && rule.v == cfg.castRule.v)        ||
+        (cfg.postfixExprRule.valid() && rule.v == cfg.postfixExprRule.v);
     if (isDispatched) return NodeId{};
     NodeId onlyInternal{};
     int    internalCount = 0;
@@ -369,6 +419,134 @@ evalNode(NodeId                              expr,
         return ok(std::move(v));
     }
 
+    // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A): a CAST in a const-expr.
+    // Dispatched by rule-id ahead of the wrapper-peel (a cast has a type-ref AND an
+    // operand). Folds the offsetof spine's casts: `(T*)0` (int 0 → a NULL address),
+    // `(char*)x` (ptr→ptr identity, retype pointee), and the terminating
+    // `(size_t)(... - (char*)0)` (integer target). The TARGET is classified by the
+    // caller's `resolveCastTarget` closure (this engine is interner-free). Absent
+    // closure / unresolved target ⇒ non-foldable (fail loud — the prior behaviour).
+    if (cfg.castRule.valid() && rule.v == cfg.castRule.v) {
+        if (!env.resolveCastTarget) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        auto const tgt = env.resolveCastTarget(expr);
+        if (!tgt.has_value()) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        // The cast operand is the LAST visible child (after `( typeRef )`) — a
+        // token (`0`) or an internal (`(expr)`).
+        NodeId operandN{};
+        for (NodeId c : kids) operandN = c;
+        if (!operandN.valid()) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        ConstEvalResult inner =
+            evalImpl(operandN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
+        if (!inner.value.has_value()) return inner;
+        if (tgt->isPointer) {
+            if (auto const* a = asAddress(*inner.value)) {
+                HirAddressValue out = *a;           // ptr→ptr: identity, retype pointee
+                out.pointeeType = tgt->pointeeType;
+                return ok(makeAddress(out));
+            }
+            auto const iv = asInt64(*inner.value);
+            if (iv.has_value() && *iv == 0) {       // (T*)0 → a NULL-base address
+                return ok(makeAddress(HirAddressValue{HirAddressValue::kNullBase, 0,
+                                                      tgt->pointeeType}));
+            }
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);  // (T*)<nonzero>
+        }
+        if (tgt->isInteger) {
+            if (auto const* a = asAddress(*inner.value)) {
+                // address → integer: legal ONLY for a NULL-base address (a pure
+                // compile-time offset). A symbol-based address is a relocation,
+                // not an integer constant — fail loud.
+                if (a->base != HirAddressValue::kNullBase) {
+                    return fail(ConstEvalFailure::NotAConstantExpression, expr);
+                }
+                HirLiteralValue v;
+                v.core  = tgt->intSigned ? TypeKind::I64 : TypeKind::U64;
+                std::int64_t const nv = narrowIntToBits(a->byteOffset, tgt->intBits,
+                                                        tgt->intSigned);
+                if (tgt->intSigned) v.value = nv;
+                else                v.value = static_cast<std::uint64_t>(nv);
+                return ok(std::move(v));
+            }
+            auto const iv = asInt64(*inner.value);
+            if (!iv.has_value()) {
+                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+            }
+            HirLiteralValue v;
+            v.core  = tgt->intSigned ? TypeKind::I64 : TypeKind::U64;
+            std::int64_t const nv = narrowIntToBits(*iv, tgt->intBits, tgt->intSigned);
+            if (tgt->intSigned) v.value = nv;
+            else                v.value = static_cast<std::uint64_t>(nv);
+            return ok(std::move(v));
+        }
+        // A float / aggregate cast target is not part of the address surface.
+        return fail(ConstEvalFailure::NotAConstantExpression, expr);
+    }
+
+    // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A): a POSTFIX member access in
+    // a const-expr — the offsetof spine's `((T*)0)->M` / `.M`. The base folds to an
+    // address; the field's byte offset (from the container's layout, via
+    // `resolveFieldOffset`) is added — yielding the ADDRESS of the member (an `&`
+    // around it is then a no-op, see the AddressOf arm). Index `[i]` and call
+    // `(...)` are not part of the array-dim offsetof surface (`&arr[i]` constants
+    // are a GLOBAL-init concern → the HIR engine) → fail loud.
+    if (cfg.postfixExprRule.valid() && rule.v == cfg.postfixExprRule.v) {
+        NodeId baseN{}, opTok{};
+        std::vector<NodeId> followers;
+        for (NodeId c : kids) {
+            if (tree.kind(c) == NodeKind::Token) {
+                if (!opTok.valid()) opTok = c;
+            } else if (!baseN.valid()) {
+                baseN = c;
+            } else {
+                followers.push_back(c);
+            }
+        }
+        if (!baseN.valid() || !opTok.valid()) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        HirOperatorEntry const* e = opEntryFor(cfg.postfixOps, tree.tokenKind(opTok));
+        if (e == nullptr
+            || (e->target != "MemberAccess" && e->target != "MemberAccessThruPtr")) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        if (!env.resolveFieldOffset) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        // The field-name token lives in the follower subtree (the first token
+        // within it — mirrors cst_to_hir's member-access lowering).
+        NodeId const followerN = followers.empty() ? NodeId{} : followers.front();
+        NodeId fieldTok{};
+        if (followerN.valid()) {
+            for (NodeId c : visibleChildren(tree, followerN)) {
+                if (tree.kind(c) == NodeKind::Token) { fieldTok = c; break; }
+                if (!fieldTok.valid()) fieldTok = c;
+            }
+        }
+        if (!fieldTok.valid()) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        ConstEvalResult base =
+            evalImpl(baseN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
+        if (!base.value.has_value()) return base;
+        auto const* a = asAddress(*base.value);
+        if (a == nullptr) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        auto const fr = env.resolveFieldOffset(a->pointeeType, fieldTok);
+        if (!fr.has_value()) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        return ok(makeAddress(HirAddressValue{
+            a->base, a->byteOffset + static_cast<std::int64_t>(fr->offset),
+            fr->fieldType}));
+    }
+
     // Binary expression: [lhs (internal), OP-token, rhs (internal)].
     if (cfg.binaryExprRule.valid() && rule.v == cfg.binaryExprRule.v) {
         NodeId lhsN{}, rhsN{}, opTok{};
@@ -435,8 +613,21 @@ evalNode(NodeId                              expr,
         if (e == nullptr) {
             return fail(ConstEvalFailure::UnsupportedOperator, expr);
         }
-        // AddressOf / Deref aren't const-foldable.
-        if (e->target == "AddressOf" || e->target == "Deref") {
+        // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A): `&<lvalue>` of an
+        // address-fold spine (`&((T*)0)->M`). The member arm already accumulated
+        // the member's byte offset into an address value; the address OF that
+        // lvalue IS that address (address-of an lvalue at a known offset = the
+        // offset). Pass the address through. A non-address operand (taking the
+        // address of a plain value) is not const-foldable.
+        if (e->target == "AddressOf") {
+            ConstEvalResult inner = evalImpl(operandN, ctx, env, options,
+                                             currentScopeOpaque, visitedInitNodes);
+            if (!inner.value.has_value()) return inner;
+            if (asAddress(*inner.value) != nullptr) return inner;
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        // Deref is not const-foldable.
+        if (e->target == "Deref") {
             return fail(ConstEvalFailure::NotAConstantExpression, expr);
         }
         // DEAD-VIA-DRIVER fallback: fold the operand then route through the

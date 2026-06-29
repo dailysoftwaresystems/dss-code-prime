@@ -38,6 +38,14 @@ namespace {
             agg.fields.reserve(arm.fields.size());
             for (auto const& f : arm.fields) agg.fields.push_back(toMirLiteral(f));
             dst.value = std::move(agg);
+        } else if constexpr (std::is_same_v<T, HirAddressValue>) {
+            // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD): an HIR address constant maps
+            // field-for-field to the MIR symbol-address relocation (F5). The
+            // fold-transient `pointeeType` is dropped — MIR addresses carry only
+            // {symbol, addend}. A NULL-base address never reaches here (the
+            // const-eval engines collapse it to an integer before pooling); if one
+            // did, the asm emitter's symbol-address arm would fail loud on symbol 0.
+            dst.value = MirSymbolAddrValue{arm.base, arm.byteOffset};
         } else {
             dst.value = arm;
         }

@@ -1451,6 +1451,77 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
             if (!layout) return std::nullopt;
             return layout->size;
         };
+        // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A): classify a cast's
+        // TARGET type for the offsetof spine — `(T*)0` (pointer), `(char*)x`
+        // (pointer, retype), `(size_t)int` (integer width/signedness). The engine
+        // is interner-free, so this closure (which owns the interner) hands back a
+        // CstCastTarget descriptor. The cast's type-ref is the first Internal child
+        // (`( typeRef ) operand`); resolveTypeNode (c26 handles abstract cast
+        // declarators) folds it. emitOnMiss=false: an unresolved cast type ⇒
+        // nullopt ⇒ the fold fails loud (one positioned diagnostic from the caller).
+        env.resolveCastTarget = [&s, &tree, cfg, fromScope](NodeId castNode)
+            -> std::optional<CstCastTarget> {
+            NodeId typeRefN{};
+            for (NodeId c : visibleChildren(tree, castNode)) {
+                if (tree.kind(c) == NodeKind::Internal) { typeRefN = c; break; }
+            }
+            if (!typeRefN.valid()) return std::nullopt;
+            TypeId const ty = resolveTypeNode(s, *cfg, tree, typeRefN, fromScope,
+                                              /*emitOnMiss=*/false);
+            if (!ty.valid()) return std::nullopt;
+            TypeInterner const& in = s.lattice.interner();
+            CstCastTarget t;
+            TypeKind const k = in.kind(ty);
+            if (k == TypeKind::Ptr) {
+                t.isPointer = true;
+                auto const ops = in.operands(ty);
+                if (!ops.empty()) t.pointeeType = ops[0];
+                return t;
+            }
+            TypeKind ik = k;   // an enum casts as its underlying integer
+            if (k == TypeKind::Enum) {
+                auto const sc = in.scalars(ty);
+                if (!sc.empty()) ik = static_cast<TypeKind>(sc[0]);
+            }
+            switch (ik) {
+                case TypeKind::Bool: t.isInteger=true; t.intBits=1;  t.intSigned=false; break;
+                case TypeKind::Char:
+                case TypeKind::I8:   t.isInteger=true; t.intBits=8;  t.intSigned=true;  break;
+                case TypeKind::U8:   t.isInteger=true; t.intBits=8;  t.intSigned=false; break;
+                case TypeKind::I16:  t.isInteger=true; t.intBits=16; t.intSigned=true;  break;
+                case TypeKind::U16:  t.isInteger=true; t.intBits=16; t.intSigned=false; break;
+                case TypeKind::I32:  t.isInteger=true; t.intBits=32; t.intSigned=true;  break;
+                case TypeKind::U32:  t.isInteger=true; t.intBits=32; t.intSigned=false; break;
+                case TypeKind::I64:  t.isInteger=true; t.intBits=64; t.intSigned=true;  break;
+                case TypeKind::U64:  t.isInteger=true; t.intBits=64; t.intSigned=false; break;
+                default: return std::nullopt;   // float / aggregate — non-foldable cast
+            }
+            return t;
+        };
+        // c43: resolve a struct/union field's byte offset + type for `&((T*)0)->M`.
+        // Looks the field name up in the container's MEMBER SCOPE (Pass-1 binds
+        // fields there with their declaration-order `fieldIndex`), guards bit-fields
+        // (no byte offset — taking their address is illegal C), and reads the offset
+        // from the SAME computeLayout the sizeof / codegen paths use (per-target via
+        // aggregateLayout — no target branch here). nullopt ⇒ the member fold fails
+        // loud (unknown field / not-yet-completed composite / no layout params).
+        env.resolveFieldOffset = [&s, &tree](TypeId container, NodeId fieldTok)
+            -> std::optional<CstFieldResolution> {
+            if (!s.aggregateLayout.has_value()) return std::nullopt;
+            TypeInterner const& in = s.lattice.interner();
+            TypeKind const ck = in.kind(container);
+            if (ck != TypeKind::Struct && ck != TypeKind::Union) return std::nullopt;
+            auto const scopeIt = s.compositeScopeByType.find(container.v);
+            if (scopeIt == s.compositeScopeByType.end()) return std::nullopt;
+            SymbolId const fsym = s.scopes.lookup(scopeIt->second, tree.text(fieldTok));
+            if (!fsym.valid()) return std::nullopt;
+            SymbolRecord const& frec = s.symbols.at(fsym);
+            std::uint32_t const idx = frec.fieldIndex;
+            if (in.fieldBitWidth(container, idx).has_value()) return std::nullopt;  // bit-field
+            auto const layout = computeLayout(container, in, *s.aggregateLayout, s.dataModel);
+            if (!layout || idx >= layout->fieldOffsets.size()) return std::nullopt;
+            return CstFieldResolution{layout->fieldOffsets[idx], frec.type};
+        };
     }
     ConstEvalResult const r = evaluateConstantCst(node, ctx, env, {}, fromScope.v);
     if (!r.value.has_value()) return std::nullopt;
