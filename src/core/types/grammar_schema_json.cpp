@@ -7864,6 +7864,32 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     cfg.intSameSignednessNarrows = v.get<bool>();
                 }
             }
+            // C 6.3.1.4/6.3.1.5/6.5.16.1 int→float implicit assignment conversion
+            // (`double d = anInt`, read by `isAssignable`'s int→float arm). Opt-in
+            // (default false → a non-C schema keeps int and float strictly distinct).
+            if (sem.contains("intConvertsToFloat")) {
+                auto const& v = sem.at("intConvertsToFloat");
+                if (!v.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/intConvertsToFloat",
+                              "'intConvertsToFloat' must be a boolean");
+                } else {
+                    cfg.intConvertsToFloat = v.get<bool>();
+                }
+            }
+            // C 6.3.1.4/6.3.1.5/6.5.16.1 float→int implicit assignment conversion
+            // (`int n = aDouble`, read by `isAssignable`'s float→int arm). Opt-in
+            // (default false → a non-C schema keeps int and float strictly distinct).
+            if (sem.contains("floatConvertsToInt")) {
+                auto const& v = sem.at("floatConvertsToInt");
+                if (!v.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/floatConvertsToInt",
+                              "'floatConvertsToInt' must be a boolean");
+                } else {
+                    cfg.floatConvertsToInt = v.get<bool>();
+                }
+            }
 
             // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d):
             // per-language `pointerAliasing` block. Single bool field

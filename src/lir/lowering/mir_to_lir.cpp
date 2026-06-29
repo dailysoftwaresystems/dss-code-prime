@@ -1397,8 +1397,52 @@ struct Lowerer {
                                  fpsiSrcWidth);
             }
             case MirOpcode::FPToUI:  return lowerCast(id, MnemonicSlot::FpToUi,  "MIR FPToUI");
-            case MirOpcode::SIToFP:  return lowerCast(id, MnemonicSlot::SiToFp,  "MIR SIToFP");
-            case MirOpcode::UIToFP:  return lowerCast(id, MnemonicSlot::UiToFp,  "MIR UIToFP");
+            case MirOpcode::SIToFP:
+            case MirOpcode::UIToFP: {
+                // D-CSUBSET-INT-FLOAT-CONVERSION (int→float codegen): cvtsi2sd /
+                // SCVTF. Like FPToSI's MIRROR, the encoded form keys on the SOURCE
+                // INTEGER width, NOT the (float) result width — a 64-bit source
+                // selects the REX.W cvtsi2sd xmm,r64 / SCVTF Dd,Xn form, a 32-bit
+                // source the no-REX.W cvtsi2sd xmm,r32 / SCVTF Dd,Wn form. The
+                // result-width default would mis-key the source axis (and a float
+                // result has no integer width anyway), so thread the source's int
+                // width as the override. The DESTINATION float is fixed at F64 (sd /
+                // Dd) this cycle on BOTH targets — the variant guard carries ONE
+                // width axis and the source-int axis OWNS it (REX.W / Wn-vs-Xn must
+                // be exact), so a NON-F64 result (int→F32) has no encoding and FAILS
+                // LOUD here rather than silently selecting a wrong-width form
+                // (D-CSUBSET-INT-TO-F32-CODEGEN, deferred; sqlite uses `double`
+                // only). A NARROW source (Char/I8/I16 — widthFlagsForType → 8/16)
+                // also has no declared variant and fails loud at the matcher
+                // (no partial-register conversion this cycle); the C int literal
+                // `5` is I32 and the sqlite blocker is I64, both encoded.
+                TypeKind const resultK = interner.kind(mir.instType(id));
+                if (resultK != TypeKind::F64) {
+                    dss::report(reporter,
+                        DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                        DiagnosticSeverity::Error,
+                        std::format(
+                            "MIR {}: integer→float result TypeKind ordinal {} is "
+                            "not lowerable to target '{}' — only an F64 (double) "
+                            "destination has an int→float encoding this cycle; "
+                            "proceeding would silently select a wrong-width "
+                            "instruction form (D-CSUBSET-INT-TO-F32-CODEGEN)",
+                            op == MirOpcode::SIToFP ? "SIToFP" : "UIToFP",
+                            static_cast<unsigned>(resultK), target.name()));
+                    poisonValue(id);
+                    return;
+                }
+                auto const i2fOps = mir.instOperands(id);
+                std::uint8_t const i2fSrcWidth = (i2fOps.size() == 1)
+                    ? widthFlagsForType(mir.instType(i2fOps[0]))
+                    : 0;
+                return lowerCast(id,
+                                 op == MirOpcode::SIToFP ? MnemonicSlot::SiToFp
+                                                         : MnemonicSlot::UiToFp,
+                                 op == MirOpcode::SIToFP ? "MIR SIToFP"
+                                                         : "MIR UIToFP",
+                                 i2fSrcWidth);
+            }
             // ── cycle 3e: Calls + GlobalAddr ───────────────────────
             case MirOpcode::GlobalAddr:    return lowerGlobalAddr(id);
             // D-CSUBSET-COMPUTED-GOTO: `&&label` block address materialization.

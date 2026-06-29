@@ -130,6 +130,19 @@ namespace detail::type_rules {
 // charConvertsToArith / enumConvertsToArith / intCrossSignednessConverts gates;
 // completes the C integer-conversion matrix alongside intCrossSignednessConverts.
 // Closes D-CSUBSET-INT-SAME-SIGN-NARROW.
+// `intConvertsToFloat` (default false): admit an integer rhs into a float lhs
+// (`double d = 5;`, `f(anInt)` to a `double` param — the sqlite
+// `kahanBabuskaNeumaierStep(pSum, iBig)` shape feeding an `i64` to a `volatile
+// double`). `floatConvertsToInt` (default false): admit a float rhs into an
+// integer lhs (`int n = aDouble;`). C 6.3.1.4 / 6.3.1.5 / 6.5.16.1: int↔float is
+// an implicit assignment conversion (value per the usual arithmetic conversions;
+// float→int truncates toward zero, UB if out of range). BOTH directions materialize
+// through the HIR `coerce()` arithmetic-core arm (MIR SIToFP/UIToFP for int→float,
+// FPToSI/FPToUI for float→int), so the post-coerce verifier (both gates default
+// false) stays strict. The rank helpers naturally EXCLUDE pointers/structs (rank 0
+// in all three), so `double d = ptr;` / `int n = aStruct;` stay rejected. Mirrors
+// the charConvertsToArith / intCrossSignednessConverts gates; completes the C
+// arithmetic-conversion matrix. Closes D-CSUBSET-INT-FLOAT-CONVERSION.
 [[nodiscard]] inline bool isAssignable(
     TypeInterner const&                                interner,
     TypeId                                             lhs,
@@ -139,7 +152,9 @@ namespace detail::type_rules {
     bool                                               charConvertsToArith = false,
     bool                                               enumConvertsToArith = false,
     bool                                               intCrossSignednessConverts = false,
-    bool                                               intSameSignednessNarrows = false) noexcept {
+    bool                                               intSameSignednessNarrows = false,
+    bool                                               intConvertsToFloat = false,
+    bool                                               floatConvertsToInt = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     // c27 (D-CSUBSET-VOLATILE-POINTEE): volatile is IGNORED for assignment
     // compatibility — C 6.5.16.1 compares the UNQUALIFIED versions of compatible
@@ -168,6 +183,35 @@ namespace detail::type_rules {
     }
     if (floatRank(lk) != 0 && floatRank(rk) != 0) {
         return floatRank(rk) <= floatRank(lk);
+    }
+    // C 6.3.1.4 / 6.5.16.1 (D-CSUBSET-INT-FLOAT-CONVERSION, int→float): an integer
+    // value is implicitly assignable to a floating lhs — `double d = 5;`,
+    // `f(anInt)` to a `double` param (the sqlite `kahanBabuskaNeumaierStep(pSum,
+    // iBig)` shape: `i64` → `volatile double`). The same-type/same-rank arms above
+    // returned for a float↔float pair, so this arm is reached only for an int
+    // rhs / float lhs MIX. The rhs side admits BOTH the signed AND the unsigned int
+    // ranks (Char/Bool/Enum are handled by their own arms above; an Enum here has
+    // already been bridged to its underlying int by those, and a Char rhs flowing
+    // into a float is still rank-0 here — not yet admitted, an intentional narrow
+    // scope). Gated on `intConvertsToFloat`; the HIR `coerce()` arithmetic-core arm
+    // materializes the MIR SIToFP/UIToFP, so the post-coerce verifier (gate default
+    // false) stays strict. Pointers/structs (rank 0 in every helper) stay rejected.
+    if (intConvertsToFloat
+        && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0)
+        && floatRank(lk) != 0) {
+        return true;
+    }
+    // C 6.3.1.4 / 6.5.16.1 (D-CSUBSET-INT-FLOAT-CONVERSION, float→int): a floating
+    // value is implicitly assignable to an integer lhs — `int n = aDouble;` (the
+    // value truncates toward zero, UB if out of range; C admits the implicit
+    // conversion). The lhs side admits BOTH the signed AND the unsigned int ranks.
+    // Gated on `floatConvertsToInt`; the HIR `coerce()` arithmetic-core arm
+    // materializes the MIR FPToSI/FPToUI, so the post-coerce verifier (gate default
+    // false) stays strict. Pointers/structs (rank 0 in every helper) stay rejected.
+    if (floatConvertsToInt
+        && floatRank(rk) != 0
+        && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0)) {
+        return true;
     }
     // A Bool value WIDENS into any arithmetic slot (C99 6.3.1.2 — `_Bool`
     // promotes to `int`; a comparison/logical result `Bool` flowing into an

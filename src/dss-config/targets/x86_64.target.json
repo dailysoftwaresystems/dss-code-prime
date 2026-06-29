@@ -1495,16 +1495,54 @@
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
-      "$comment": "Signed-integer-to-float (SIToFP). AS1 emits cvtsi2ss / cvtsi2sd.",
+      "$comment": "Signed-integer-to-float (SIToFP) — the REVERSE of fp_to_si above. CVTSI2SD xmm, r/m = F2 [REX.W] 0F 2A /r (Intel SDM: scalar signed-int -> double). Operand roles MIRROR cvttsd2si SWAPPED: ModR/M.reg = the xmm DESTINATION (resultSlot — the result is FPR-class via the F64 MIR result type, regClassFor), ModR/M.rm = the GPR SOURCE (wire 0). The width axis here keys on the SOURCE INTEGER width (the MIR->LIR SIToFP arm threads a widthOverride from the source operand's int type): a 32-bit source -> the no-REX.W form CVTSI2SD xmm, r32 (width=32), a 64-bit source -> REX.W CVTSI2SD xmm, r64 (width=64). REX.W selects the 64-bit source-integer interpretation (NOT the dest float width — the dest is fixed F64/sd here). DESIGN NOTE (audit + qemu-arm64 scrutiny): the variant guard offers ONE width axis, but cvtsi2sd/ss needs TWO independent selectors — REX.W (source-int width) AND F2-vs-F3 prefix (dest-float width). The source-int axis MUST vary (i32 vs i64 both occur; REX.W wrong = reads the wrong register width), so it OWNS the width axis; the dest-float prefix is fixed at F2/sd (F64 destination), the dominant + sqlite-blocking case (i64 -> volatile double). int -> F32 (`float f = anInt`, ss/F3) has NO encoding this cycle and FAILS LOUD at the mir_to_lir SIToFP arm (a deferred narrow gap, D-CSUBSET-INT-TO-F32-CODEGEN); sqlite uses `double` only.",
       "mnemonic": "si_to_fp", "result": "value",
       "minOperands": 1, "maxOperands": 1,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "CVTSI2SD xmm, r64 — F2 REX.W 0F 2A /r (64-bit signed source). The sqlite i64 -> double blocker.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [242], "rexW": true, "opcode": [15, 42] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "$comment": "CVTSI2SD xmm, r32 — F2 0F 2A /r (32-bit signed source, no REX.W).",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [242], "opcode": [15, 42] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
     },
     {
-      "$comment": "Unsigned-integer-to-float (UIToFP). Similar AS1 guarded sequence.",
+      "$comment": "Unsigned-integer-to-float (UIToFP). x86 SSE2 has NO direct unsigned-int->float opcode; for the c-subset's needs (where the unsigned value fits the SIGNED range of the next-wider int — true for U32 promoted into a 64-bit cvtsi2sd, and the common case) the same CVTSI2SD path serves. The SOURCE-int-width axis matches si_to_fp: width=64 -> REX.W (a U64 whose top bit is set would mis-convert as negative — a documented x86 SSE2 limitation, not exercised by sqlite's u32/size_t-in-range usage), width=32 -> no-REX.W (a U32 source; cvtsi2sd of a 32-bit reg reads it as signed-32, but a U32 always fits the signed-64 result exactly, so the result is value-correct). Dest fixed F64/sd as in si_to_fp; U->F32 deferred (D-CSUBSET-INT-TO-F32-CODEGEN). Full correct-unsigned-i64 handling (the zero-extend + conditional-fixup sequence) is deferred as D-CSUBSET-UI-TO-FP-UNSIGNED-I64; sqlite does not hit it.",
       "mnemonic": "ui_to_fp", "result": "value",
       "minOperands": 1, "maxOperands": 1,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "CVTSI2SD xmm, r64 — F2 REX.W 0F 2A /r (64-bit source; see the unsigned-i64 caveat above).",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [242], "rexW": true, "opcode": [15, 42] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "$comment": "CVTSI2SD xmm, r32 — F2 0F 2A /r (32-bit source; a U32 fits the signed-64 result exactly -> value-correct).",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [242], "opcode": [15, 42] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
     },
     {
       "$comment": "Cross-class bit-pattern move (GPR↔FPR). AS1 emits x86_64 `movq` (the QWord variant). Cycle-3d Bitcast lowers via this opcode whenever src and dst register classes differ; same-class Bitcasts continue to use `mov` (handled by cycle 3c).",

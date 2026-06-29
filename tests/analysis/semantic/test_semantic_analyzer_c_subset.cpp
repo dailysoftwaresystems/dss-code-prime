@@ -474,41 +474,47 @@ TEST(SemanticAnalyzerCSubset, DistinctTypedReturnRemainsMismatch) {
 // ── D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS — the assignment STATEMENT
 //    now runs the SAME `isAssignable` check as the init/call-arg/return sites ──
 //
-// (a) An invalid assignment STATEMENT `x = f;` (int <- float) fails loud with a
-// positioned S_TypeMismatch — the SAME diagnostic the init site `int x = f;`
-// emits. `f` is a parameter so no narrowing initializer adds a second mismatch;
-// exactly ONE fires.
+// (a) An invalid assignment STATEMENT `p = q;` (int* <- char*, distinct typed
+// pointers) fails loud with a positioned S_TypeMismatch — the SAME diagnostic the
+// init site `int* p = q;` emits. `q` is a parameter so no initializer adds a
+// second mismatch; exactly ONE fires.
+// (NOTE: this test originally used `int x; x = f;` [int <- float], but
+// D-CSUBSET-INT-FLOAT-CONVERSION made int<->float an ADMITTED implicit assignment
+// conversion in c-subset, so that pair is no longer a mismatch; a distinct-typed-
+// pointer pair is the stable always-rejected case that still exercises the
+// assignment-statement isAssignable path.)
 // RED-ON-DISABLE: remove the assignment-statement isAssignable arm (restore the
-// bypass) -> the assignment is silently accepted (HIR coerce truncates float ->
-// int), this count drops to 0.
-TEST(SemanticAnalyzerCSubset, AssignStmtIntFromFloatFailsLoud) {
+// bypass) -> the assignment is silently accepted, this count drops to 0.
+TEST(SemanticAnalyzerCSubset, AssignStmtIntFromIncompatiblePointerFailsLoud) {
     auto cu = buildShippedUnit("c-subset", {
-        "int sink(float f) { int x; x = f; return x; }\n",
+        "int sink(char* q) { int* p; p = q; return *p; }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 1u)
-        << "an int <- float assignment STATEMENT must fail loud with the same "
-           "S_TypeMismatch the int <- float INIT (`int x = f;`) emits — the "
+        << "an int* <- char* assignment STATEMENT must fail loud with the same "
+           "S_TypeMismatch the init (`int* p = q;`) emits — the "
            "assignment-statement assignability bypass is closed";
 }
 
-// (b) PARITY pin: the init form `int x = f;` and the statement form `x = f;`
-// must behave IDENTICALLY (both reject the same incompatible pair). Reading both
-// in one TU yields exactly TWO S_TypeMismatch — one per site — proving the
-// statement is no longer the lone unchecked position.
+// (b) PARITY pin: the init form `int* p = q;` and the statement form `p = q;`
+// must behave IDENTICALLY (both reject the same incompatible distinct-typed-
+// pointer pair). Reading both in one TU yields exactly TWO S_TypeMismatch — one
+// per site — proving the statement is no longer the lone unchecked position.
+// (Swapped off int<-float for the same reason as (a): int<->float is now an
+// admitted conversion in c-subset [D-CSUBSET-INT-FLOAT-CONVERSION].)
 // RED-ON-DISABLE: with the bypass restored only the INIT fires -> count is 1.
 TEST(SemanticAnalyzerCSubset, AssignStmtAndInitRejectIncompatibleIdentically) {
     auto cu = buildShippedUnit("c-subset", {
-        "int sink(float f) { int x = f; x = f; return x; }\n",
+        "int sink(char* q) { int* p = q; p = q; return *p; }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 2u)
         << "the init site AND the assignment-statement site must each reject the "
-           "int <- float pair — two positioned S_TypeMismatch, not one";
+           "int* <- char* pair — two positioned S_TypeMismatch, not one";
 }
 
 // (c) A VALID assignment statement stays byte-identically clean: int <- int,
@@ -802,23 +808,28 @@ TEST(SemanticAnalyzerCSubset, FoldedNullMarkerIsTreeKeyedAcrossSources) {
 }
 
 // The latent-bug FIX (D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS closure): a
-// mixed-type binary in a checked position is typed against its UNIFIED (UAC)
-// type, not whichever leaf the old DFS-suppressor happened to reach. The
-// observable uses a FLOAT operand: D-CSUBSET-INT-SAME-SIGN-NARROW made integer
-// narrowing implicit (so the old long+int→int observable no longer fires), but
-// int↔float stays NON-implicit. For `sink(int); double a; int b; sink(a + b)`
-// the argument `a + b` is `double` (UAC of double+int) and double→int is NOT
-// assignable → S_TypeMismatch fires. Under the old suppressor it reached the
-// `int` leaf `b` and silently admitted. RED-ON-DISABLE: revert the binary arm to
-// a leaf type and this drops to 0 (the latent unsoundness this closure removes).
+// mixed-type binary in a checked position is typed against its UNIFIED type, not
+// whichever leaf the old DFS-suppressor happened to reach. The observable now uses
+// a POINTER binary: D-CSUBSET-INT-SAME-SIGN-NARROW made integer narrowing implicit
+// AND D-CSUBSET-INT-FLOAT-CONVERSION made int↔float implicit, so the old
+// arithmetic observables (long+int→int, double+int→int) no longer fire. For
+// `sink(float); int* a; int b; sink(a + b)` the argument `a + b` is `int*`
+// (pointer arithmetic — `combineBinary` types `ptr + int` as the pointer) and
+// `int*` is NOT assignable to the `float` param → S_TypeMismatch fires. Under the
+// old suppressor it reached the `int` leaf `b`, and `int → float` IS now
+// assignable, so it would be silently admitted — the exact "leaf would pass, the
+// unified type fails" discrimination this closure removes. RED-ON-DISABLE: revert
+// the binary arm to a leaf type and this drops to 0 (the latent unsoundness).
 TEST(SemanticAnalyzerCSubset, MixedWidthBinaryArgTypedByUacNotLeaf) {
     auto cu = buildShippedUnit("c-subset", {
-        "extern int sink(int v);\n"
-        "int f(double a, int b) { return sink(a + b); }\n",
+        "extern int sink(float v);\n"
+        "int f(int* a, int b) { return sink(a + b); }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    // `a + b` is `double` (UAC); the `int` param cannot take a float → one mismatch.
+    // `a + b` is `int*` (pointer arith); the `float` param cannot take a pointer
+    // → one mismatch. The `int` leaf `b` alone WOULD be admitted (int→float), so
+    // this isolates "typed by the unified binary type, not a leaf".
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 1u);
 }
@@ -2493,22 +2504,27 @@ TEST(SemanticAnalyzerCSubset, FF11MultipleDescriptorsEachSymbolInjectedOnce) {
 
 // ── FC2: explicit C-style casts (`semantics.casts`) ─────────────────────
 
-// THE Part-B integration point: the IMPLICIT F64→I32 narrowing in
-// `return 1.7 + 2.5;` is rejected (S_ReturnTypeMismatch — the strict
-// no-silent-conversion bar), while the EXPLICIT `(int)(1.7 + 2.5)` form
-// is accepted: the cast node's result type is the stamped target (I32),
-// which assigns cleanly into main's I32 result. Both directions in one
-// test so the contrast is pinned, not assumed.
-TEST(SemanticAnalyzerCSubset, ExplicitFloatToIntCastAcceptedWhereImplicitRejected) {
+// THE Part-B integration point: an IMPLICIT distinct-typed-pointer conversion in
+// `int* f(char* p) { return p; }` is rejected (S_ReturnTypeMismatch — the strict
+// no-silent-conversion bar), while the EXPLICIT `(int*)p` form is accepted: the
+// cast node's result type is the stamped target (int*), which returns cleanly.
+// Both directions in one test so the contrast is pinned, not assumed.
+// (This test originally contrasted the implicit F64->I32 narrowing in
+// `return 1.7+2.5;` against `(int)(1.7+2.5)`, but D-CSUBSET-INT-FLOAT-CONVERSION
+// made float->int an ADMITTED implicit conversion in c-subset, so the implicit
+// form no longer fires; a distinct-typed-pointer pair is the stable implicit-
+// rejected / explicit-accepted contrast that still exercises the same FC2
+// explicit-cast-vs-implicit-assignability split.)
+TEST(SemanticAnalyzerCSubset, ExplicitPointerCastAcceptedWhereImplicitRejected) {
     auto implicitModel = analyzeShipped("c-subset", {
-        "int main() { return 1.7 + 2.5; }\n",
+        "int* f(char* p) { return p; }\n",
     });
     EXPECT_EQ(countCode(implicitModel.diagnostics(),
                         DiagnosticCode::S_ReturnTypeMismatch), 1u)
-        << "the implicit F64->I32 narrowing must stay rejected";
+        << "the implicit char* -> int* conversion must stay rejected";
 
     auto castModel = analyzeShipped("c-subset", {
-        "int main() { return (int)(1.7 + 2.5); }\n",
+        "int* f(char* p) { return (int*)p; }\n",
     });
     EXPECT_FALSE(castModel.hasErrors())
         << (castModel.diagnostics().all().empty()

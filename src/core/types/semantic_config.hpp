@@ -1334,6 +1334,23 @@ struct DSS_EXPORT SemanticConfig {
     // (needed for SQLite). Pinned by test_type_rules `IsAssignableAdmitsSameSignednessNarrowingWhenGated`.
     bool intSameSignednessNarrows = false;
 
+    // C 6.3.1.4 / 6.3.1.5 / 6.5.16.1 (D-CSUBSET-INT-FLOAT-CONVERSION): the two
+    // directions of the int↔float implicit ASSIGNMENT conversion, gated
+    // INDEPENDENTLY. `intConvertsToFloat` — an integer rhs flows into a floating
+    // lhs (`double d = 5;`, `f(anInt)` to a `double` param; the sqlite
+    // `kahanBabuskaNeumaierStep(pSum, iBig)` shape feeds an `i64` to a `volatile
+    // double`). `floatConvertsToInt` — a floating rhs flows into an integer lhs
+    // (`int n = aDouble;`, truncating toward zero, UB if out of range). Read by
+    // `isAssignable`'s int↔float arms (init / assignment / call-arg / return). Each
+    // direction's HIR `coerce()` arithmetic-core arm materializes the width-exact
+    // Cast (MIR SIToFP/UIToFP for int→float, FPToSI/FPToUI for float→int), so the
+    // post-coerce verifier (both default false) stays strict. Default false → a
+    // non-C schema (toy/tsql) keeps int and float strictly distinct. Together with
+    // intCrossSignednessConverts + intSameSignednessNarrows this completes the C
+    // arithmetic-conversion matrix (needed for SQLite).
+    bool intConvertsToFloat = false;
+    bool floatConvertsToInt = false;
+
     // Two orthogonal per-language alias-analysis opt-ins, both threaded
     // through `MirLoweringConfig` → `Mir` and read by CSE/LICM Load
     // admission via `Mir.aliasingMode()` + `Mir.charTypesAliasAll()`.

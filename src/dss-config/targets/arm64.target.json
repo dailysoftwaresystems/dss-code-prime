@@ -1573,6 +1573,66 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-INT-FLOAT-CONVERSION (int→float): SCVTF — Scalar Convert Signed integer to Floating-point. The REVERSE of FCVTZS above. 'Conversion between FP and integer' group: sf [31] | 00 [30:29] | 11110 [28:24] | ftype [23:22] | 1 [21] | rmode=00 [20:19] | opcode=010 SCVTF [18:16] | 000000 [15:10] | Rn [9:5] | Rd [4:0]. The result is FPR-class (regClassFor sees the F64 MIR result) — rd carries the D destination, the rn wire the X/W integer source; the 5-bit slots are class-blind hwEncodings, exactly the GPR-src/FPR-dest split x86's cvtsi2sd makes through modrm.rm/modrm.reg. MIR SIToFP is the producer. The width axis keys on the SOURCE INTEGER width (the mir_to_lir SIToFP arm threads the source's int width): a 64-bit source -> SCVTF Dd, Xn (sf=1, width=64), a 32-bit source -> SCVTF Dd, Wn (sf=0, width=32). UNLIKE x86's single REX.W bit, arm64 sf+ftype are INDEPENDENT, so BOTH source-int widths keep ftype=01 (the F64 DESTINATION, Dd) — `Dd,Wn` is the i32->f64 form, the arm64 analog of cvtsi2sd xmm,r32. DESIGN NOTE (audit + qemu-arm64 scrutiny — verify these fixedWords on real hardware): dest fixed at F64/Dd this cycle (the dominant + sqlite-blocking i64->double case); int->F32 (ftype=00, Sd) is FAIL-LOUD at the mir_to_lir SIToFP arm (a deferred narrow gap, D-CSUBSET-INT-TO-F32-CODEGEN). SCVTF Dd,Xn = 0x9E620000 = sf=1[0x80000000] | 11110[0x1E000000] | ftype=01[0x00400000] | bit21[0x00200000] | opcode=010[0x00020000]; SCVTF Dd,Wn = 0x1E620000 (same MINUS the sf bit). Cross-checked against the config's FCVTZS Dn base 0x9E780000 (opcode=000, rmode=11) — same field decode.",
+      "mnemonic":      "si_to_fp",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "$comment": "SCVTF Dd, Xn — sf=1 64-bit signed source -> double. base 0x9E620000. The sqlite i64 -> volatile double blocker.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2657222656 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "SCVTF Dd, Wn — sf=0 32-bit signed source -> double. base 0x1E620000 (the arm64 analog of cvtsi2sd xmm,r32; an I32 fits the F64 result exactly).",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 509739008 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-INT-FLOAT-CONVERSION (int→float, unsigned): UCVTF — Scalar Convert Unsigned integer to Floating-point. Same 'Conversion between FP and integer' group as SCVTF but opcode=011 [18:16] (the unsigned sibling). MIR UIToFP is the producer; the SOURCE-int-width axis matches si_to_fp (width=64 -> UCVTF Dd,Xn, width=32 -> UCVTF Dd,Wn). Dest fixed F64/Dd (U->F32 deferred D-CSUBSET-INT-TO-F32-CODEGEN). Unlike x86 SSE2 (which has no unsigned cvt and must fall back to cvtsi2sd), arm64 UCVTF handles the FULL unsigned i64 range natively — so the arm64 ui_to_fp is value-correct where x86's signed-cvt fallback is not (the deferred D-CSUBSET-UI-TO-FP-UNSIGNED-I64 is an x86-only gap; sqlite does not hit it on either target). UCVTF Dd,Xn = 0x9E630000 = SCVTF Dd,Xn[0x9E620000] | opcode bit [0x00010000]; UCVTF Dd,Wn = 0x1E630000.",
+      "mnemonic":      "ui_to_fp",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "$comment": "UCVTF Dd, Xn — sf=1 64-bit unsigned source -> double. base 0x9E630000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2657288192 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "UCVTF Dd, Wn — sf=0 32-bit unsigned source -> double. base 0x1E630000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 509804544 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "D-ARM64-FLOAT-SUBSTRATE (2026-06-10): FMOV Dd, Dn — FP register-register move, double. Base 0x1E604000 = 0 0 0 11110 [31:24] | ftype=01 [23:22] | 1 [21] | opc=000000 FMOV [20:15] | 10000 [14:10] | Rn [9:5] | Rd [4:0] (FP data-processing 1 source — the single source rides Rn, NOT Rm; contrast the GPR mov's ORR alias whose source is Rm). Bound to the fpr class's `move` slot in registerClassOps[] — consumed by MIR value/phi copies and the callconv arg/return moves whenever the register class is FPR (the arm64 analog of x86's movaps role; a D-form copy moves the full 64-bit view, no upper-lane-merge hazard to dodge). FC3.5 sweep-c2 adjudication: register COPIES stay width-BLIND (variant deliberately width-absent, match-any) — the D-form move preserves an F32 value exactly (it lives in the low 4 bytes; S[n] is the low half of D[n]), the same reasoning as x86's full-register MOVAPS serving both widths. Only memory accesses (fldur/fstur) are width-exact.",
       "mnemonic":      "fmov",
       "result":        "value",
