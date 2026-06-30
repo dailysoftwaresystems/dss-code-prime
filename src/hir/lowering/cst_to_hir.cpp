@@ -2399,6 +2399,33 @@ struct Lowerer {
         // non-commutative; `n - p` has no C 6.5.6 meaning → not handled here).
         // Mutually exclusive with `ptrSub` (which needs BOTH operands Ptr) and
         // with F1 p++/p[i] (which never reach combineBinary).
+        // c59 (D-CSUBSET-ARRAY-DECAY-IN-ADDITIVE): C 6.3.2.1p3 — an ARRAY operand of
+        // `+`/`-` decays to Ptr<elem> FIRST, so `array ± index` behaves like the
+        // pointer forms (the c41 stride-Gep below + a correctly-typed Deref above).
+        // Without this the Array operand kept TypeKind::Array → ptrIntArith was false
+        // → the BinaryOp mis-typed as the array → a downstream `*(array+i)` Deref came
+        // out TYPELESS (H0001 Deref-unresolved + H0009 lvalue-classify on the
+        // assignment-LHS form — sqlite `AtomicStore(aReadMark+i,…)`). Reuses the SAME
+        // coerce array-decay as the cast path (cst_to_hir.cpp:4299). GUARD: decay an
+        // array ONLY when the OTHER operand is a scalar index (non-Array AND non-Ptr)
+        // — so `array - array` / `p - arrayName` stay on the deferred pointer-DIFF
+        // path (D-CSUBSET-POINTER-DIFF-EDGE-CASES) and `array + ptr` (no C meaning) is
+        // untouched. The right operand decays for Add only (`index + array`,
+        // canonicalized below); `array - index` keeps the array LEFT.
+        bool const lcArr = lc.type.valid() && interner.kind(lc.type) == TypeKind::Array;
+        bool const rcArr = rc.type.valid() && interner.kind(rc.type) == TypeKind::Array;
+        bool const lcIdx = lc.type.valid() && interner.kind(lc.type) != TypeKind::Array
+                           && interner.kind(lc.type) != TypeKind::Ptr;
+        bool const rcIdx = rc.type.valid() && interner.kind(rc.type) != TypeKind::Array
+                           && interner.kind(rc.type) != TypeKind::Ptr;
+        if ((*op == HirOpKind::Add || *op == HirOpKind::Sub) && lcArr && rcIdx) {
+            auto const elems = interner.operands(lc.type);
+            if (!elems.empty()) lc = coerce(lc, interner.pointer(elems[0]));
+        }
+        if (*op == HirOpKind::Add && rcArr && lcIdx) {
+            auto const elems = interner.operands(rc.type);
+            if (!elems.empty()) rc = coerce(rc, interner.pointer(elems[0]));
+        }
         if (*op == HirOpKind::Add && lc.type.valid() && rc.type.valid()
             && interner.kind(lc.type) != TypeKind::Ptr
             && interner.kind(rc.type) == TypeKind::Ptr) {
