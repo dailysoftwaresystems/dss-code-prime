@@ -2348,7 +2348,17 @@ struct Lowerer {
             return InvalidMirInst;
         }
         std::uint32_t const mirLitIdx = mir.literalPoolAdd(toMirLiteral(src));
-        (void)mir.addGlobal(hir.typeId(litNode), sym, mirLitIdx);
+        // D-CSUBSET-MUTABLE-CHAR-ARRAY-RODATA: the synthetic string-literal-pool
+        // bytes are IMMUTABLE read-only data (a string literal is const however
+        // it is used). Mint the global CONST so the asm section selection routes
+        // it to `.rodata` — `isConst` is the discriminator that lets a NAMED
+        // mutable `char arr[N]="str"` go to writable `.data` while this SYNTHETIC
+        // pool global stays read-only (tryClassifyAsSymbolAddr's string arm
+        // already mints const; this matches it for the function-body literal /
+        // pointer-decay path).
+        (void)mir.addGlobal(hir.typeId(litNode), sym, mirLitIdx, {},
+                            SymbolBinding::Global, SymbolVisibility::Default,
+                            /*isConst=*/true);
         return mir.addGlobalAddr(sym, ptrTy);
     }
 
@@ -6992,6 +7002,21 @@ struct Lowerer {
     [[nodiscard]] std::optional<std::pair<SymbolId, std::int64_t>>
     tryClassifyAsSymbolAddr(HirNodeId initNode) {
         HirKind const k = hir.kind(initNode);
+        // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a bare `Ref` to a
+        // FUNCTION symbol is a function designator that has decayed to its
+        // ADDRESS (C 6.3.2.1p4 — the value of a function designator is a
+        // pointer to the function), e.g. the `posixOpen` / `f` member of a
+        // function-pointer table. Its link-time value IS the function's
+        // address. A bare `Ref` to a GLOBAL VARIABLE is excluded: that is an
+        // rvalue LOAD of the variable's contents, not its address (`&global`
+        // arrives as AddressOf(Ref) below). Only the FUNCTION designator
+        // decays designator→address here.
+        if (k == HirKind::Ref) {
+            std::uint32_t const s = hir.payload(initNode);
+            if (functionSymbols.contains(s))
+                return std::make_pair(SymbolId{s}, std::int64_t{0});
+            return std::nullopt;
+        }
         if (k == HirKind::AddressOf) {
             auto kids = hir.children(initNode);
             if (kids.size() == 1 && hir.kind(kids[0]) == HirKind::Ref) {
@@ -7004,11 +7029,21 @@ struct Lowerer {
         }
         if (k == HirKind::Cast) {
             auto kids = hir.children(initNode);
-            if (kids.size() != 1 || hir.kind(kids[0]) != HirKind::Literal)
-                return std::nullopt;
+            if (kids.size() != 1) return std::nullopt;
             TypeId const ct = hir.typeId(initNode);
             if (!ct.valid() || interner.kind(ct) != TypeKind::Ptr)
                 return std::nullopt;
+            // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a POINTER-typed
+            // cast WRAPPING another symbol-address — `(void*)&x`, the
+            // `(sqlite3_syscall_ptr)posixOpen` member of aSyscall, any
+            // pointer-to-pointer reinterpret. A reinterpret between pointer
+            // types preserves the bit pattern, so the cast IS the same
+            // link-time address (+ addend); peel it and recurse. (Also covers
+            // the scalar top-level `void* p = (void*)&x;` form — same anchor.)
+            // The result type is already gated to Ptr above, so a cast that
+            // changes representation — `(long)&x` — never reaches here.
+            if (hir.kind(kids[0]) != HirKind::Literal)
+                return tryClassifyAsSymbolAddr(kids[0]);
             std::uint32_t const litIdx0 = hir.payload(kids[0]);
             HirLiteralValue const& src = literals.at(litIdx0);
             if (!std::holds_alternative<std::string>(src.value))
@@ -7024,6 +7059,110 @@ struct Lowerer {
             return std::make_pair(rodataSym, std::int64_t{0});
         }
         return std::nullopt;
+    }
+
+    // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): recognize a file-scope
+    // AGGREGATE global whose initializer carries a LINK-TIME-CONSTANT member —
+    // a function address, `&global`, or a string literal nested in a struct /
+    // union / array (canonical: sqlite's `static struct unix_syscall aSyscall[]
+    // = {{"open",(sqlite3_syscall_ptr)posixOpen,0},…}`). const-eval cannot fold
+    // such a member (the address is not known until link), so the whole
+    // aggregate would otherwise fall to runtimeInit and trip the
+    // bitfield-rvalue fail-loud guard. This is the AGGREGATE generalization of
+    // the F5 scalar mechanism (`tryClassifyAsSymbolAddr`, D-CSUBSET-SYMBOL-
+    // ADDRESS-GLOBAL): emit STATIC DATA with abs64 relocations at the member
+    // offsets (the C-correct, gcc-matching placement) instead of a
+    // __module_init__ store-chain.
+    //
+    // Build a `MirAggregateValue` whose `fields` pair 1:1 with the
+    // ConstructAggregate's POSITIONAL children (zero-fills already normalized at
+    // HIR lowering — same discipline the const-eval ConstructAggregate arm and
+    // `encodeAggregateValue` rely on). Each child resolves by trying, in order:
+    //   (a) `tryClassifyAsSymbolAddr` → a reloc-bearing pointer leaf (a string
+    //       member mints + pushes its own rodata PendingGlobal, the F5 path);
+    //   (b) a NESTED `tryClassifyAggregateConst` (recurse — struct-in-struct /
+    //       array-of-struct like aSyscall);
+    //   (c) `evaluateConstant` → an ordinary folded leaf (plain `0`, ints, …).
+    // If ANY member resolves by none → nullopt (the whole aggregate falls back
+    // to runtimeInit — never partially classify). `env`/`opts` are threaded
+    // from the classify loop's locals (the SAME const-eval policy globals use).
+    //   (d) a NULL POINTER CONSTANT in a pointer member — `(void*)0`, the
+    //       trailing `0` of an aSyscall row, `int(*fn)(void) = 0`. const-eval
+    //       leaves a cast-to-pointer un-folded ("pointer targets remain
+    //       non-foldable"), so peel the pointer-typed Cast, fold its INTEGER
+    //       operand, and — iff it is 0 — emit a zero pointer leaf (8 zero bytes,
+    //       NO relocation; the encoder's pre-zeroed slot already holds them).
+    [[nodiscard]] std::optional<MirLiteralValue>
+    tryClassifyAggregateConst(HirNodeId initNode, EvalEnvironment const& env,
+                              EvalOptions const& opts) {
+        if (hir.kind(initNode) != HirKind::ConstructAggregate)
+            return std::nullopt;
+        MirAggregateValue agg;
+        auto kids = hir.children(initNode);
+        agg.fields.reserve(kids.size());
+        for (HirNodeId child : kids) {
+            if (auto sa = tryClassifyAsSymbolAddr(child)) {
+                MirLiteralValue leaf;
+                leaf.value = MirSymbolAddrValue{sa->first.v, sa->second};
+                leaf.core  = TypeKind::Ptr;
+                agg.fields.push_back(std::move(leaf));
+                continue;
+            }
+            if (auto nested = tryClassifyAggregateConst(child, env, opts)) {
+                agg.fields.push_back(std::move(*nested));
+                continue;
+            }
+            if (auto np = tryClassifyNullPointerConst(child, env, opts)) {
+                agg.fields.push_back(std::move(*np));
+                continue;
+            }
+            ConstEvalResult const r =
+                evaluateConstant(hir, interner, literals, child, env, opts);
+            if (!r.value.has_value()) return std::nullopt;  // one un-foldable → bail
+            agg.fields.push_back(toMirLiteral(*r.value));
+        }
+        MirLiteralValue out;
+        out.value = std::move(agg);
+        out.core  = interner.kind(hir.typeId(initNode));  // Struct / Union / Array
+        return out;
+    }
+
+    // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a NULL POINTER CONSTANT
+    // member — an integer constant expression equal to 0 in a POINTER context
+    // (`(void*)0`, `int(*fn)(void) = 0`, the `0` member of an aSyscall row).
+    // const-eval refuses a cast-to-pointer ("pointer/aggregate targets remain
+    // non-foldable", const_eval.cpp), so peel the pointer-typed Cast and fold
+    // its INTEGER operand. iff that operand folds to 0, the member is a null
+    // pointer → a zero pointer leaf (`uint64_t 0`, core=Ptr); the encoder's
+    // scalar-leaf arm writes 8 zero bytes with NO relocation. A non-zero or
+    // non-integer operand (`(void*)0x1000`, a runtime expr) yields nullopt so
+    // the caller's evaluateConstant fallback / whole-aggregate bail still
+    // governs — this arm ONLY recognizes the standard null pointer constant.
+    [[nodiscard]] std::optional<MirLiteralValue>
+    tryClassifyNullPointerConst(HirNodeId node, EvalEnvironment const& env,
+                                EvalOptions const& opts) {
+        TypeId const ty = hir.typeId(node);
+        if (!ty.valid() || interner.kind(ty) != TypeKind::Ptr)
+            return std::nullopt;
+        HirNodeId operand = node;
+        if (hir.kind(node) == HirKind::Cast) {
+            auto kids = hir.children(node);
+            if (kids.size() != 1) return std::nullopt;
+            operand = kids[0];   // fold the integer behind the pointer cast
+        }
+        ConstEvalResult const r =
+            evaluateConstant(hir, interner, literals, operand, env, opts);
+        if (!r.value.has_value()) return std::nullopt;
+        bool isZero = false;
+        if (std::holds_alternative<std::int64_t>(r.value->value))
+            isZero = std::get<std::int64_t>(r.value->value) == 0;
+        else if (std::holds_alternative<std::uint64_t>(r.value->value))
+            isZero = std::get<std::uint64_t>(r.value->value) == 0;
+        if (!isZero) return std::nullopt;
+        MirLiteralValue leaf;
+        leaf.value = std::uint64_t{0};
+        leaf.core  = TypeKind::Ptr;
+        return leaf;
     }
 
     // Classify each module-level global into pendingGlobals. Called after
@@ -7108,6 +7247,19 @@ struct Lowerer {
                         hir, interner, literals, *initN, env, opts);
                     if (r.value.has_value()) {
                         pg.constInit = toMirLiteral(*r.value);
+                    } else if (auto aggC =
+                                   tryClassifyAggregateConst(*initN, env, opts)) {
+                        // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): an
+                        // aggregate whose initializer has a link-time-constant
+                        // member (a fn/`&global`/string address) — const-eval
+                        // can't fold the address, but the aggregate is still
+                        // STATIC DATA (reloc leaves at the member offsets), NOT
+                        // a runtime store-chain. Routes to constInit (the
+                        // assembler's aggregate arm encodes the relocs) instead
+                        // of runtimeInit. A fully-foldable aggregate already
+                        // folded above; only the address-bearing case reaches
+                        // here.
+                        pg.constInit = std::move(*aggC);
                     } else {
                         pg.runtimeInit = *initN;
                     }

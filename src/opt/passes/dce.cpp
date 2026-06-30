@@ -142,6 +142,27 @@ struct SymbolScanResult {
     std::unordered_map<std::uint32_t, FuncLiveSet> perFunc;  // keyed by MirFuncId.v
 };
 
+// c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): collect every symbol-address
+// target a global initializer references, descending into AGGREGATE literals so
+// a `MirSymbolAddrValue` LEAF nested inside a struct / array-of-struct (a
+// function-pointer table member, a `&global` / string member) is found — not
+// only a top-level scalar symbol-address. The F5 Phase-3 fixpoint below scanned
+// only a scalar `MirSymbolAddrValue` init; a function referenced ONLY through an
+// aggregate member's reloc would then be DCE'd → the linker sees
+// K_SymbolUndefined for the dangling data-item reloc (the aggregate twin of the
+// F5 scalar liveness bug this fixpoint already guards). Recurses through nested
+// aggregates; ignores plain scalar / string leaves (no symbol reference).
+void collectSymbolAddrTargets(MirLiteralValue const& v,
+                              std::vector<std::uint32_t>& out) {
+    if (auto const* sa = std::get_if<MirSymbolAddrValue>(&v.value)) {
+        out.push_back(sa->symbol);
+        return;
+    }
+    if (auto const* agg = std::get_if<MirAggregateValue>(&v.value)) {
+        for (auto const& f : agg->fields) collectSymbolAddrTargets(f, out);
+    }
+}
+
 [[nodiscard]] SymbolScanResult scanLiveSymbols(Mir const& mir) {
     SymbolScanResult out;
     std::deque<MirFuncId> funcWorklist;
@@ -247,12 +268,14 @@ struct SymbolScanResult {
             if (!out.liveSymbols.count(mir.globalSymbol(g).v)) continue;
             std::uint32_t const initIdx = mir.globalInitLiteralIndex(g);
             if (initIdx == UINT32_MAX) continue;
-            auto const* sa =
-                std::get_if<MirSymbolAddrValue>(&mir.literalValue(initIdx).value);
-            if (sa == nullptr) continue;
-            if (out.liveSymbols.insert(sa->symbol).second) {
+            // c67: collect scalar AND aggregate-nested symbol-address targets
+            // (a function-pointer table member, a `&global` / string member).
+            std::vector<std::uint32_t> targets;
+            collectSymbolAddrTargets(mir.literalValue(initIdx), targets);
+            for (std::uint32_t const sym : targets) {
+                if (!out.liveSymbols.insert(sym).second) continue;
                 changed = true;
-                if (auto it = symToFunc.find(sa->symbol); it != symToFunc.end()) {
+                if (auto it = symToFunc.find(sym); it != symToFunc.end()) {
                     funcWorklist.push_back(it->second);
                 }
             }
