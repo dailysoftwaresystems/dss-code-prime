@@ -2822,6 +2822,33 @@ struct Lowerer {
                 common = interner.pointer(elseE.type);
             }
         }
+        // c64 (D-CSUBSET-TERNARY-ARRAY-DECAY): the array-decay sibling of the
+        // null-ptr / fn-designator arms above. An ARRAY arm of a conditional
+        // decays to Ptr<elem> (C 6.3.2.1p3 + 6.5.15) — `cond ? "a" : "bb"` (two
+        // string literals) yields `char*`, not an aggregate. Setting `common` to
+        // the common pointer type drives the coerce calls below: each Array arm
+        // hits coerce's Array→Ptr decay arm (the sameElem Cast) so makeTernary
+        // carries Ptr<char> and BOTH arm nodes are pointer-typed — else the
+        // ternary types aggregate and trips the aggregate-valued-control-expr
+        // guard in hir_to_mir (no aggregate-width SSA value). Mirrors the semantic
+        // combineTernary. Conservative: BOTH arms must decay to the SAME pointer
+        // type; genuine struct/union arms (no decay) keep the aggregate
+        // by-address lowering.
+        if (!common.valid()) {
+            auto const decayArray = [&](TypeId t) -> TypeId {
+                if (!t.valid() || interner.kind(t) != TypeKind::Array) return t;
+                auto const elems = interner.operands(t);
+                return elems.empty() ? t : interner.pointer(elems[0]);
+            };
+            TypeId const thenD = decayArray(thenE.type);
+            TypeId const elseD = decayArray(elseE.type);
+            if (thenD.valid() && thenD == elseD
+                && interner.kind(thenD) == TypeKind::Ptr
+                && (interner.kind(thenE.type) == TypeKind::Array
+                    || interner.kind(elseE.type) == TypeKind::Array)) {
+                common = thenD;
+            }
+        }
         if (common.valid()) {
             thenE = coerce(thenE, common);
             elseE = coerce(elseE, common);

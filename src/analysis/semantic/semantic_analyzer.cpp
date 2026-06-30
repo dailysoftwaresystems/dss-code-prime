@@ -5615,6 +5615,35 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 return interner.pointer(elseT);
             }
         }
+        // c64 (D-CSUBSET-TERNARY-ARRAY-DECAY): C 6.3.2.1p3 + 6.5.15 — an ARRAY
+        // arm of a conditional decays to a pointer-to-element, so `cond ? "a" :
+        // "bb"` (two string literals — sqlite's `isFreeList ? "size" :
+        // "overflow list length"`) and `cond ? arr : ptr` yield the common
+        // POINTER type, never an aggregate. Without this the fallback below
+        // returns the first arm's `Array<char,N>`, so the conditional types as an
+        // aggregate and the HIR lowering trips the aggregate-valued-control-expr
+        // guard (D-CSUBSET-AGGREGATE-VALUED-CONTROL-EXPR — a phi has no
+        // aggregate-width SSA value). Genuine struct/union arms do NOT decay (no
+        // array-to-pointer rule) → they stay aggregates and reach the by-address
+        // ternary lowering. Mirrored at the HIR combineTernary, which emits the
+        // per-arm decay Cast. Conservative: requires BOTH arms to decay to the
+        // SAME pointer type (the matching-element case); incompatible-element
+        // conditionals stay on the existing fallback.
+        {
+            auto const decayArray = [&](TypeId t) -> TypeId {
+                if (!t.valid() || interner.kind(t) != TypeKind::Array) return t;
+                auto const elems = interner.operands(t);
+                return elems.empty() ? t : interner.pointer(elems[0]);
+            };
+            TypeId const thenD = decayArray(thenT);
+            TypeId const elseD = decayArray(elseT);
+            if (thenD.valid() && thenD == elseD
+                && interner.kind(thenD) == TypeKind::Ptr
+                && (interner.kind(thenT) == TypeKind::Array
+                    || interner.kind(elseT) == TypeKind::Array)) {
+                return thenD;
+            }
+        }
         return thenT.valid() ? thenT : elseT;   // non-arith arms (pointers etc.)
     };
 
