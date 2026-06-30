@@ -6209,25 +6209,29 @@ struct Lowerer {
                 return true;
             }
             case HirKind::ContinueStmt: {
-                std::uint32_t const depth = hir.branchDepth(node);
-                if (depth >= branchStack.size()) {
-                    unsupported(node, std::format(
-                        "ContinueStmt depth {} exceeds enclosing-frame count "
-                        "{} (HIR verifier should have flagged this)",
-                        depth, branchStack.size()));
+                // C 6.8.6.2: `continue` targets the innermost LOOP; switch frames are
+                // TRANSPARENT (a switch frame has continueBB invalid). Skip them — the
+                // depth counts loop frames, matching the verifier's loops-only view
+                // (so a `continue` inside a switch inside a loop reaches the loop).
+                std::uint32_t depth = hir.branchDepth(node);
+                MirBlockId target{};
+                for (std::size_t i = branchStack.size(); i-- > 0;) {
+                    BranchFrame& frame = branchStack[i];
+                    if (!frame.continueBB.valid()) continue;   // skip switch frames
+                    if (depth == 0) {
+                        frame.continueReferenced = true;
+                        target = frame.continueBB;
+                        break;
+                    }
+                    --depth;
+                }
+                if (!target.valid()) {
+                    unsupported(node,
+                        "ContinueStmt resolves to no enclosing loop (HIR "
+                        "verifier should have flagged this)");
                     return false;
                 }
-                BranchFrame& frame =
-                    branchStack[branchStack.size() - 1 - depth];
-                if (!frame.continueBB.valid()) {
-                    unsupported(node, std::format(
-                        "ContinueStmt depth {} resolves to a switch frame "
-                        "which has no continue target (HIR verifier should "
-                        "have flagged this)", depth));
-                    return false;
-                }
-                frame.continueReferenced = true;
-                mir.addBr(frame.continueBB);
+                mir.addBr(target);
                 return true;
             }
             case HirKind::GotoStmt: {

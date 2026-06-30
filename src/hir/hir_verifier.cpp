@@ -179,23 +179,28 @@ void HirVerifier::checkBreakContinueScoping(DiagnosticReporter& reporter) const 
         if (hasError(hir_.flags(id))) continue;
 
         std::uint32_t const depth = hir_.branchDepth(id);
-        std::vector<HirNodeId> const targets = enclosingBranchTargets(hir_, id);
+        std::vector<HirNodeId> targets = enclosingBranchTargets(hir_, id);
         char const* const what = (kind == HirKind::BreakStmt) ? "break" : "continue";
+
+        // C 6.8.6.2: `continue` targets the innermost ITERATION statement; a switch is
+        // TRANSPARENT to continue (it is a `break` target, NOT a `continue` target).
+        // Drop switch frames so the depth indexes loops only — a `continue` inside a
+        // switch (e.g. sqlite3VXPrintf's format loop) correctly reaches the enclosing
+        // loop. `break` keeps the full loops+switches stack (a switch IS a break target).
+        if (kind == HirKind::ContinueStmt) {
+            std::erase_if(targets, [&](HirNodeId t) {
+                return hir_.kind(t) == HirKind::SwitchStmt;
+            });
+        }
 
         if (depth >= targets.size()) {
             reportAt(reporter, DiagnosticCode::H_InvalidBreak, id,
-                     std::format("{} #{} index {} has no enclosing loop/switch at that "
-                                 "depth ({} enclosing)", what, id.v, depth, targets.size()),
+                     std::format("{} #{} index {} has no enclosing {} at that "
+                                 "depth ({} enclosing)", what, id.v, depth,
+                                 kind == HirKind::ContinueStmt ? "loop" : "loop/switch",
+                                 targets.size()),
                      sourceMap_);
             continue;
-        }
-        // continue can only target a loop — never a switch.
-        if (kind == HirKind::ContinueStmt
-            && hir_.kind(targets[depth]) == HirKind::SwitchStmt) {
-            reportAt(reporter, DiagnosticCode::H_InvalidBreak, id,
-                     std::format("continue #{} index {} resolves to a switch; continue "
-                                 "can only target a loop", id.v, depth),
-                     sourceMap_);
         }
     }
 }

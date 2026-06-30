@@ -461,10 +461,13 @@ TEST(HirVerifier, ContinueSkippingSwitchToOuterLoopIsValid) {
     TypeInterner ti = makeInterner();
     TypeId const i32   = ti.primitive(TypeKind::I32);
     TypeId const boolT = ti.primitive(TypeKind::Bool);
-    // while (..) { switch (x) { default: continue 1; } } — index 1 skips the
-    // switch (target 0) and resolves to the while (target 1), a loop: valid.
-    // c60 (Design I-A): the continue lives in the switch body under the default marker.
-    HirNodeId const co   = b.makeContinue(1);
+    // while (..) { switch (x) { default: continue; } } — a `continue` inside a switch
+    // inside a loop (the c60 Design-I-A switch body: the continue lives under the default
+    // marker). c61 (D-CSUBSET-CONTINUE-SKIPS-SWITCH, C 6.8.6.2): a switch is TRANSPARENT
+    // to continue, so it is dropped from the target list and the while is at index 0 (the
+    // innermost loop). depth 0 resolves to it — this is the real-C form (cst_to_hir emits
+    // makeContinue(0)); the continue is valid.
+    HirNodeId const co   = b.makeContinue(0);
     HirNodeId const swBody = b.makeBlock(std::array{b.makeLabelStmt(0, co)});
     HirNodeId const arm  = b.makeCaseArm(std::nullopt, /*labelOrdinal=*/0);
     HirNodeId const disc = b.makeRef(i32, 1);
