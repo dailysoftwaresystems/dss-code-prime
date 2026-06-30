@@ -333,7 +333,11 @@ TEST(HirLoweringCSubset, ForLoop) {
     EXPECT_TRUE(res->hir.forUpdate(forS).has_value());
 }
 
-TEST(HirLoweringCSubset, SwitchGroupsFlatCases) {
+// c60 (Design I-A): the switch lowers to a discriminant + a flat body Block (its
+// case/default markers are LabelStmts) + dispatch arms mapping each case value to
+// a marker ordinal. Two dispatch arms here (case 1, default); the body Block holds
+// the two case markers, each a LabelStmt.
+TEST(HirLoweringCSubset, SwitchFlattensToDispatchAndBody) {
     SemanticModel model = analyzeCSubset(
         "void f(int x) { switch (x) { case 1: break; default: break; } }");
     ASSERT_FALSE(model.hasErrors());
@@ -348,49 +352,27 @@ TEST(HirLoweringCSubset, SwitchGroupsFlatCases) {
     ASSERT_EQ(arms.size(), 2u);
     EXPECT_FALSE(res->hir.caseArmIsDefault(arms[0]));   // case 1
     EXPECT_TRUE(res->hir.caseArmIsDefault(arms[1]));     // default
+    // The body Block holds the two case markers (LabelStmts) at its top level.
+    HirNodeId const body = res->hir.switchBody(sw);
+    ASSERT_EQ(res->hir.kind(body), HirKind::Block);
+    auto const bodyStmts = res->hir.children(body);
+    ASSERT_GE(bodyStmts.size(), 2u);
+    EXPECT_EQ(res->hir.kind(bodyStmts[0]), HirKind::LabelStmt);   // case 1 marker
+    // Each dispatch arm's ordinal names a LabelStmt marker that exists in the body.
+    EXPECT_EQ(res->hir.caseArmLabelOrdinal(arms[0]),
+              res->hir.labelOrdinal(bodyStmts[0]));
 }
 
-// D-CSUBSET-LABEL-BEFORE-CASE — the load-bearing equivalence (MF-3): a goto-label
-// BEFORE a case (`foo: case 1: S`) lowers to the SAME HIR as the long-supported
-// label AFTER the colon (`case 1: foo: S`) — arm(value 1, body=[LabelStmt(foo, S), …]).
-// The label stays a real LabelStmt node (so it is pre-scanned + goto-resolvable).
-TEST(HirLoweringCSubset, LabelBeforeCaseNestsLikeLabelAfterColon) {
-    struct Shape { std::size_t arms; bool def0; HirKind body0; std::uint32_t ord; bool ok; };
-    auto shapeOf = [](std::string src) -> Shape {
-        SemanticModel model = analyzeCSubset(std::move(src));
-        DiagnosticReporter r;
-        auto res = lowerToHir(model, r);
-        if (model.hasErrors() || !res->ok) return {0, false, HirKind::Error, 0, false};
-        HirNodeId fn = firstFunction(res->hir);
-        HirNodeId sw = res->hir.children(res->hir.functionBody(fn))[0];
-        if (res->hir.kind(sw) != HirKind::SwitchStmt) return {0, false, HirKind::Error, 0, false};
-        auto arms = res->hir.switchArms(sw);
-        if (arms.empty()) return {0, false, HirKind::Error, 0, false};
-        auto body0 = res->hir.caseArmBody(arms[0]);
-        HirKind const b0 = body0.empty() ? HirKind::Error : res->hir.kind(body0[0]);
-        std::uint32_t const ord = (b0 == HirKind::LabelStmt) ? res->hir.labelOrdinal(body0[0]) : 9999u;
-        return { arms.size(), res->hir.caseArmIsDefault(arms[0]), b0, ord, true };
-    };
-    Shape const before = shapeOf("void f(int x){ switch(x){ foo: case 1: x=x+1; break; default: break; } }");
-    Shape const after  = shapeOf("void f(int x){ switch(x){ case 1: foo: x=x+1; break; default: break; } }");
-    ASSERT_TRUE(before.ok);
-    ASSERT_TRUE(after.ok);
-    EXPECT_EQ(before.arms, 2u);
-    EXPECT_EQ(before.arms, after.arms);
-    EXPECT_FALSE(before.def0);
-    EXPECT_FALSE(after.def0);
-    EXPECT_EQ(before.body0, HirKind::LabelStmt);     // label nests at the arm's entry
-    EXPECT_EQ(after.body0,  HirKind::LabelStmt);
-    EXPECT_EQ(before.ord, after.ord);                // same label, same arm entry
-}
-
-// D-CSUBSET-LABEL-BEFORE-CASE Finding 2 — the speculative switchBodyItem must keep
-// the FLAT reading for a BARE case: `case 1: x=…;` groups as caseLabel + a plain
-// body stmt, NEVER a LabelStmt- or caseStmt-wrapped arm. Guards MF-3 against a
-// future reorder of the speculative branches.
-TEST(HirLoweringCSubset, BareCaseStaysFlatNoLabelWrapper) {
+// D-CSUBSET-LABEL-BEFORE-CASE (c60, Design I-A) — a goto-label BEFORE a case
+// (`foo: case 1: S`) parses as labelStmt(foo, caseStmt(case 1, S)) and lowers to a
+// flat-body marker chain: the body's first statement is LabelStmt(foo, ...) whose
+// inner is the case-1 marker LabelStmt (its ordinal = the dispatch arm's ordinal).
+// `foo` stays a real LabelStmt (pre-scanned + goto-resolvable); the case dispatches
+// to its own marker. (The label AFTER the colon — `case 1: foo: S` — nests the case
+// marker OUTSIDE foo; both are valid C, only the relative nesting differs.)
+TEST(HirLoweringCSubset, LabelBeforeCaseLowersToMarkerChain) {
     SemanticModel model = analyzeCSubset(
-        "void f(int x){ switch(x){ case 1: x=x+1; break; default: break; } }");
+        "void f(int x){ switch(x){ foo: case 1: x=x+1; break; default: break; } }");
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
@@ -400,9 +382,38 @@ TEST(HirLoweringCSubset, BareCaseStaysFlatNoLabelWrapper) {
     ASSERT_EQ(res->hir.kind(sw), HirKind::SwitchStmt);
     auto arms = res->hir.switchArms(sw);
     ASSERT_EQ(arms.size(), 2u);
-    auto body0 = res->hir.caseArmBody(arms[0]);
-    ASSERT_FALSE(body0.empty());
-    EXPECT_NE(res->hir.kind(body0[0]), HirKind::LabelStmt);   // NOT label-wrapped
+    EXPECT_FALSE(res->hir.caseArmIsDefault(arms[0]));   // case 1
+    // body[0] = LabelStmt(foo, LabelStmt(caseMarker, …)); the inner case marker's
+    // ordinal equals the case-1 dispatch arm's ordinal.
+    auto const bodyStmts = res->hir.children(res->hir.switchBody(sw));
+    ASSERT_FALSE(bodyStmts.empty());
+    ASSERT_EQ(res->hir.kind(bodyStmts[0]), HirKind::LabelStmt);   // the named `foo`
+    HirNodeId const inner = res->hir.labelBody(bodyStmts[0]);
+    ASSERT_EQ(res->hir.kind(inner), HirKind::LabelStmt);          // the case-1 marker
+    EXPECT_EQ(res->hir.labelOrdinal(inner), res->hir.caseArmLabelOrdinal(arms[0]));
+}
+
+// c60 (Design I-A) — a BARE case (`case 1: x=…;`) lowers to a case-1 marker
+// LabelStmt whose body is the real statement (the AssignStmt/ExprStmt), with NO
+// stray nested caseStmt. The marker IS a LabelStmt (every case is a marker now),
+// but its single body must reach the case's own statement directly.
+TEST(HirLoweringCSubset, BareCaseMarkerWrapsTheBodyStatement) {
+    SemanticModel model = analyzeCSubset(
+        "void f(int x){ switch(x){ case 1: x=x+1; break; default: break; } }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId sw = res->hir.children(res->hir.functionBody(fn))[0];
+    ASSERT_EQ(res->hir.kind(sw), HirKind::SwitchStmt);
+    auto const bodyStmts = res->hir.children(res->hir.switchBody(sw));
+    ASSERT_GE(bodyStmts.size(), 1u);
+    ASSERT_EQ(res->hir.kind(bodyStmts[0]), HirKind::LabelStmt);   // case 1 marker
+    // The marker's inner is the case body (an assignment), NOT another caseStmt/
+    // label wrapper.
+    HirNodeId const inner = res->hir.labelBody(bodyStmts[0]);
+    EXPECT_NE(res->hir.kind(inner), HirKind::LabelStmt);
 }
 
 // D-CSUBSET-LABEL-BEFORE-CASE guard — a `caseStmt` that is not a direct switch-body
@@ -416,12 +427,12 @@ TEST(HirLoweringCSubset, CaseLabelOutsideSwitchFailsLoud) {
     EXPECT_GE(countCode(r, DiagnosticCode::S_CaseLabelNotInSwitch), 1u);
 }
 
-// D-CSUBSET-LABEL-BEFORE-CASE — the multi-label ADJACENT-case chain (the iterative
-// lowerCaseChain `continue` + empty-arm makeSkip path) AND a label before `default`,
-// the two forms the corpus/equivalence pins do not exercise. `foo: case 1: case 2: S`
-// → arm(1, [LabelStmt(foo, {})]) (empty, label-marked) + arm(2, [S, …]); `bar: default:`
-// → the default arm's body starts with LabelStmt(bar).
-TEST(HirLoweringCSubset, LabelBeforeAdjacentCasesAndDefaultChainArms) {
+// c60 (Design I-A) — the multi-label ADJACENT-case chain + a label before
+// `default`. `foo: case 1: case 2: S` parses as labelStmt(foo, caseStmt(1,
+// caseStmt(2, S))) → body[0] = LabelStmt(foo, LabelStmt(case1, LabelStmt(case2,
+// S))); `bar: default: S2` → LabelStmt(bar, LabelStmt(default, S2)). Three dispatch
+// arms (case 1, case 2, default), each with a distinct marker ordinal.
+TEST(HirLoweringCSubset, LabelBeforeAdjacentCasesAndDefaultMarkerChain) {
     SemanticModel model = analyzeCSubset(
         "void f(int x){ switch(x){ foo: case 1: case 2: x=x+1; break; "
         "bar: default: x=x+9; break; } }");
@@ -434,21 +445,22 @@ TEST(HirLoweringCSubset, LabelBeforeAdjacentCasesAndDefaultChainArms) {
     ASSERT_EQ(res->hir.kind(sw), HirKind::SwitchStmt);
     auto arms = res->hir.switchArms(sw);
     ASSERT_EQ(arms.size(), 3u);                          // case 1, case 2, default
-    // arm 0 = case 1: empty body, label-marked at entry (LabelStmt(foo, {}))
-    EXPECT_FALSE(res->hir.caseArmIsDefault(arms[0]));
-    auto b0 = res->hir.caseArmBody(arms[0]);
-    ASSERT_FALSE(b0.empty());
-    EXPECT_EQ(res->hir.kind(b0[0]), HirKind::LabelStmt);
-    // arm 1 = case 2: the real body statement, NOT label-wrapped
-    EXPECT_FALSE(res->hir.caseArmIsDefault(arms[1]));
-    auto b1 = res->hir.caseArmBody(arms[1]);
-    ASSERT_FALSE(b1.empty());
-    EXPECT_NE(res->hir.kind(b1[0]), HirKind::LabelStmt);
-    // arm 2 = default: label-before-default → body starts with LabelStmt(bar)
-    EXPECT_TRUE(res->hir.caseArmIsDefault(arms[2]));
-    auto b2 = res->hir.caseArmBody(arms[2]);
-    ASSERT_FALSE(b2.empty());
-    EXPECT_EQ(res->hir.kind(b2[0]), HirKind::LabelStmt);
+    EXPECT_FALSE(res->hir.caseArmIsDefault(arms[0]));    // case 1
+    EXPECT_FALSE(res->hir.caseArmIsDefault(arms[1]));    // case 2
+    EXPECT_TRUE(res->hir.caseArmIsDefault(arms[2]));     // default
+    // Distinct ordinals for the three markers.
+    EXPECT_NE(res->hir.caseArmLabelOrdinal(arms[0]), res->hir.caseArmLabelOrdinal(arms[1]));
+    EXPECT_NE(res->hir.caseArmLabelOrdinal(arms[1]), res->hir.caseArmLabelOrdinal(arms[2]));
+    // body[0] = LabelStmt(foo, LabelStmt(case1, LabelStmt(case2, …))).
+    auto const bodyStmts = res->hir.children(res->hir.switchBody(sw));
+    ASSERT_FALSE(bodyStmts.empty());
+    ASSERT_EQ(res->hir.kind(bodyStmts[0]), HirKind::LabelStmt);       // foo
+    HirNodeId const c1 = res->hir.labelBody(bodyStmts[0]);
+    ASSERT_EQ(res->hir.kind(c1), HirKind::LabelStmt);                 // case 1 marker
+    EXPECT_EQ(res->hir.labelOrdinal(c1), res->hir.caseArmLabelOrdinal(arms[0]));
+    HirNodeId const c2 = res->hir.labelBody(c1);
+    ASSERT_EQ(res->hir.kind(c2), HirKind::LabelStmt);                 // case 2 marker
+    EXPECT_EQ(res->hir.labelOrdinal(c2), res->hir.caseArmLabelOrdinal(arms[1]));
 }
 
 // D-CSUBSET-LABEL-BUDGET-CLIFF (p19 Cluster G c31) — the `commitAfterPrefix`
@@ -3617,26 +3629,55 @@ TEST(HirLoweringCSubset, DeepNestedSwitchLowersFlatOnNormalStack) {
     auto res = lowerToHir(model, r);   // lower on THIS (main) stack — flat witness
     ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 
-    // Shape walk: descend the SwitchStmt backbone. The body's switch is level 0;
-    // each level's FIRST arm (case 1) body's first statement is the next switch,
-    // kDepth deep, the innermost arm body holding the `return`. A dropped level or
-    // mis-grouped arm breaks the count here.
+    // Shape walk (c60, Design I-A): descend the SwitchStmt backbone. The body's
+    // switch is level 0; each level's body Block holds the case-1 marker
+    // (LabelStmt, ordinal = arms[0]) whose inner statement is the next switch,
+    // kDepth deep, the innermost case-1 marker wrapping the `return`. A dropped
+    // level or mis-built dispatch breaks the count here.
     HirNodeId const fnBody =
         res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
     auto const bodyStmts = res->hir.children(fnBody);
     // children: [VarDecl x, SwitchStmt, ReturnStmt].
     ASSERT_GE(bodyStmts.size(), 2u);
+    // `case 1: switch(...)` parses as a BARE caseLabel item + the switch as the NEXT
+    // switchBodyItem (the speculative switchBodyItem takes the caseLabel first), so
+    // each level's body Block is [case-1 marker(Skip), <next switch or return>,
+    // default marker]. Descend by locating the case-1 marker then the FIRST
+    // SwitchStmt/ReturnStmt sibling after it.
+    auto descendCase1 = [&](HirNodeId sw) -> HirNodeId {
+        auto const arms = res->hir.switchArms(sw);
+        if (arms.size() < 2u || res->hir.caseArmIsDefault(arms[0])
+            || !res->hir.caseArmIsDefault(arms[1])) return HirNodeId{};
+        std::uint32_t const c1Ord = res->hir.caseArmLabelOrdinal(arms[0]);
+        auto const kids = res->hir.children(res->hir.switchBody(sw));
+        bool seenMarker = false;
+        for (HirNodeId s : kids) {
+            if (!seenMarker) {
+                if (res->hir.kind(s) == HirKind::LabelStmt
+                    && res->hir.labelOrdinal(s) == c1Ord) {
+                    seenMarker = true;
+                    // The marker may directly wrap the next construct (caseStmt form)
+                    // — if so, descend into it.
+                    HirNodeId const inner = res->hir.labelBody(s);
+                    if (res->hir.kind(inner) == HirKind::SwitchStmt
+                        || res->hir.kind(inner) == HirKind::ReturnStmt)
+                        return inner;
+                }
+                continue;
+            }
+            if (res->hir.kind(s) == HirKind::SwitchStmt
+                || res->hir.kind(s) == HirKind::ReturnStmt)
+                return s;
+        }
+        return HirNodeId{};
+    };
     HirNodeId cur = bodyStmts[1];
     int switchLevels = 0;
     while (res->hir.kind(cur) == HirKind::SwitchStmt) {
         ++switchLevels;
-        auto const arms = res->hir.switchArms(cur);
-        ASSERT_GE(arms.size(), 2u) << "each level is case 1 + default";
-        EXPECT_FALSE(res->hir.caseArmIsDefault(arms[0]));   // arm 0 = case 1
-        EXPECT_TRUE(res->hir.caseArmIsDefault(arms[1]));     // arm 1 = default
-        auto const arm0Body = res->hir.caseArmBody(arms[0]);
-        ASSERT_FALSE(arm0Body.empty());
-        cur = arm0Body[0];                                   // descend into case 1's body
+        HirNodeId const next = descendCase1(cur);
+        ASSERT_TRUE(next.valid()) << "case-1 descent failed at level " << switchLevels;
+        cur = next;
     }
     // The innermost case-1 body is the `return 0;`.
     EXPECT_EQ(res->hir.kind(cur), HirKind::ReturnStmt);

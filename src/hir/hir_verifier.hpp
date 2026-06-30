@@ -59,7 +59,7 @@ class TypeInterner;
 // CST-to-HIR lowering's consumer). Required source interface:
 // `kind(id) -> HirKind`, `children(id) -> span`, `ifThen(id)`,
 // `ifElse(id) -> optional`, `switchArms(id) -> span`,
-// `caseArmBody(id) -> span`, `caseArmIsDefault(id) -> bool`. Both
+// `switchBody(id) -> HirNodeId`, `caseArmIsDefault(id) -> bool`. Both
 // `Hir` and `HirBuilder` satisfy this interface.
 template <typename Source>
 [[nodiscard]] bool pathTerminates(Source const& src, HirNodeId id) {
@@ -91,15 +91,21 @@ template <typename Source>
                 && pathTerminates(src, *elseB);
         }
         case HirKind::SwitchStmt: {
+            // c60 (Design I-A): a switch terminates on all paths iff (a) it has a
+            // `default:` arm — so the discriminant always lands inside the body
+            // rather than skipping past to the join — AND (b) the flat body Block
+            // terminates (its last statement, through transparent case markers,
+            // ends in a Return/Unreachable/goto and nothing falls off the end).
+            // Fall-through is straight-line in the flat body, so the per-arm
+            // termination the old grouped shape checked reduces to the body Block's
+            // own termination (MORE accurate: `case A: foo(); default: return;` now
+            // correctly terminates via fall-through, where the grouped form did not).
             bool hasDefault = false;
             for (HirNodeId arm : src.switchArms(id)) {
                 if (src.kind(arm) != HirKind::CaseArm) return false;
-                auto body = src.caseArmBody(arm);
-                if (body.empty() || !pathTerminates(src, body.back()))
-                    return false;
                 if (src.caseArmIsDefault(arm)) hasDefault = true;
             }
-            return hasDefault;
+            return hasDefault && pathTerminates(src, src.switchBody(id));
         }
         default:
             return false;

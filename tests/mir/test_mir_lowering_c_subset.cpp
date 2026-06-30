@@ -2090,10 +2090,13 @@ TEST(MirLoweringCSubset, SeqExprLowersStmtsThenYieldsResult) {
 
 // ─── ML2 cycle 4: Switch / Break / Continue ──────────────────────────────
 
-// A switch with two cases + default + breaks in each arm lowers to:
-//   entry → Switch(disc, [(1, caseA), (2, caseB)], default=caseD)
-//   caseA / caseB / caseD all `Br(exit)` because of the explicit break
-// Exit then runs the implicit-void-return.
+// c60 (Design I-A): a switch with two cases + default + breaks in each arm lowers
+// to a Switch in the entry whose targets are the case/default MARKER label-blocks;
+// each marker block's terminator is `Br(exit)` (the explicit break). The dispatch
+// is a jump-table (Switch), NOT a linear if-chain. (The raw lowering also emits
+// predecessor-less intermediate blocks between terminated markers — the same shape
+// a goto/label chain produces — which the downstream unreachable-prune drops; this
+// pin checks the Switch shape + arm terminators, which the prune preserves.)
 TEST(MirLoweringCSubset, SwitchWithBreaksInEachArm) {
     auto L = lowerCSubset(
         "void f(int x) {\n"
@@ -2107,23 +2110,26 @@ TEST(MirLoweringCSubset, SwitchWithBreaksInEachArm) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirFuncId const fn = m.funcAt(0);
-    // Blocks: entry, caseA, caseB, default, exit  → 5
-    EXPECT_EQ(m.funcBlockCount(fn), 5u);
     MirBlockId const entry = m.funcEntry(fn);
-    // Entry's terminator is the Switch.
+    // Entry's terminator is the Switch (the O(1) jump-table dispatch).
     MirInstId const term = m.blockTerminator(entry);
     EXPECT_EQ(m.instOpcode(term), MirOpcode::Switch);
-    // Switch successors: [case targets…, default].
+    // Switch successors: [case 1 marker, case 2 marker, default marker]. Exactly 3
+    // (2 explicit cases + the default), each a distinct block.
     auto succs = m.blockSuccessors(entry);
-    EXPECT_EQ(succs.size(), 3u);
-    // Every arm's terminator is Br (the break;).
+    ASSERT_EQ(succs.size(), 3u);
+    EXPECT_NE(succs[0], succs[1]);
+    EXPECT_NE(succs[1], succs[2]);
+    // Every arm marker's terminator is Br (the break;).
     for (std::size_t i = 0; i < succs.size(); ++i) {
         EXPECT_EQ(m.instOpcode(m.blockTerminator(succs[i])), MirOpcode::Br);
     }
 }
 
-// Fall-through: arm 1 omits `break;`, so MIR must Br to arm 2's block
-// instead of the switch-exit. C semantics preserved.
+// c60 (Design I-A) — fall-through: arm 1 omits `break;`, so its marker block must
+// Br to arm 2's marker block (straight-line fall-through in the flat body), NOT to
+// the switch-exit. Switch successors are [case 1 marker, case 2 marker, default=
+// exit].
 TEST(MirLoweringCSubset, SwitchFallthroughBranchesToNextArm) {
     auto L = lowerCSubset(
         "void f(int x) {\n"
@@ -2136,15 +2142,14 @@ TEST(MirLoweringCSubset, SwitchFallthroughBranchesToNextArm) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirFuncId const fn = m.funcAt(0);
-    // Blocks: entry, caseA(empty), caseB, exit → 4
-    EXPECT_EQ(m.funcBlockCount(fn), 4u);
     MirBlockId const entry = m.funcEntry(fn);
+    EXPECT_EQ(m.instOpcode(m.blockTerminator(entry)), MirOpcode::Switch);
     auto succs = m.blockSuccessors(entry);
-    ASSERT_EQ(succs.size(), 3u);  // [caseA, caseB, default=exit]
-    // caseA terminator branches to caseB (fall-through), NOT to exit.
+    ASSERT_EQ(succs.size(), 3u);  // [caseA marker, caseB marker, default=exit]
     MirBlockId const caseA = succs[0];
     MirBlockId const caseB = succs[1];
     MirBlockId const exit  = succs[2];
+    // caseA marker terminator branches to caseB marker (fall-through), NOT to exit.
     EXPECT_EQ(m.instOpcode(m.blockTerminator(caseA)), MirOpcode::Br);
     auto caseAExits = m.blockSuccessors(caseA);
     ASSERT_EQ(caseAExits.size(), 1u);

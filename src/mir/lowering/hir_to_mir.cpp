@@ -200,6 +200,18 @@ struct Lowerer {
         return b;
     }
 
+    // c60 (Design I-A): does a flattened switch's body Block start with a case
+    // marker (a LabelStmt)? When it does, the marker opens its own label-block right
+    // after the Switch terminator, so no extra pre-case block is needed; only a body
+    // whose first statement is a jumped-over leading declaration needs one. (An empty
+    // body Block trivially "starts with a label" — there is nothing to lower, so no
+    // pre-case block is needed either.)
+    [[nodiscard]] bool switchBodyStartsWithLabel(HirNodeId body) const {
+        if (hir.kind(body) != HirKind::Block) return false;
+        auto const kids = hir.children(body);
+        return kids.empty() || hir.kind(kids.front()) == HirKind::LabelStmt;
+    }
+
     // D-CSUBSET-COMPUTED-GOTO: the per-function set of label ordinals whose ADDRESS
     // is taken via `&&label` (LabelAddressOf). Collected once at function entry (a
     // HIR pre-scan) so `goto *p` (IndirectBr) can name EVERY address-taken block as
@@ -5218,23 +5230,11 @@ struct Lowerer {
         // If: tracks whether any path reaches the join (the recursive
         // `joinReached`). While/For/DoWhile: unused.
         bool flag0{};
-        // Block: index into `blockCtxs` (the child cursor). Switch: index into
-        // `switchData` (the minted arm blocks). Unused (0) by the others.
+        // Block: index into `blockCtxs` (the child cursor). Unused (0) by the
+        // others. (c60: the Switch frame no longer needs a per-arm cursor — its
+        // body lowers as ONE Block via the work-stack — so it carries only `bb0`.)
         std::uint32_t aux{};
-        // Switch only: index into `blockCtxs` (the arm + within-arm cursor).
-        // Block keeps its cursor in `aux`; Switch needs BOTH accumulators, so
-        // its blockCtxs index lives here. Unused (0) by the others.
-        std::uint32_t aux2BlockCtx{};
     };
-
-    // Per-switch state: the minted arm blocks (one per arm, in declaration
-    // order). Lives in a LIFO accumulator (a nested switch pushes its own) —
-    // the owning frame re-addresses `switchData[aux]` by index, never holds a
-    // reference across a sub-statement push.
-    struct SwitchData {
-        std::vector<MirBlockId> armBlocks;
-    };
-    std::vector<SwitchData> switchData;
 
     // LIFO cursor for an unbounded child-statement list (a Block's stmts, or a
     // switch arm's body). Created when the arm starts iterating, popped when it
@@ -5243,14 +5243,8 @@ struct Lowerer {
     // resume (never holds a reference across a sub-statement push).
     struct BlockIterCtx {
         std::uint32_t idx{};   // next child index to lower
-        // Switch only: the current arm index (into the arm list); the inner
-        // `idx` walks that arm's body statements. `armIdx == kNotSwitch` marks a
-        // plain Block ctx.
-        std::uint32_t armIdx{};
     };
     std::vector<BlockIterCtx> blockCtxs;
-    static constexpr std::uint32_t kNotSwitch =
-        (std::numeric_limits<std::uint32_t>::max)();
 
     // The public statement-lowering entry: a driver over an explicit heap
     // work-stack. For each node, `enterStmt` either PUSHES a frame for a
@@ -5324,7 +5318,7 @@ struct Lowerer {
             case StmtFrame::Kind::Block: {
                 if (f.phase == 0) {
                     f.aux = static_cast<std::uint32_t>(blockCtxs.size());
-                    blockCtxs.push_back({.idx = 0, .armIdx = kNotSwitch});
+                    blockCtxs.push_back({.idx = 0});
                     f.phase = 1;
                     // fall into phase 1 below (no sub-request yet)
                 }
@@ -5646,13 +5640,14 @@ struct Lowerer {
                 }
                 break;
             }
-            // ── SwitchStmt: lower discriminant (flat), mint exit + one block
-            // per arm IN ORDER, resolve cases + default, addSwitch, then lower
-            // each arm's body list (falling through to the next arm). The
-            // discriminant + block layout are emitted in phase 0; the per-arm
-            // body iteration is driven across phases via `blockCtxs[aux]`
-            // (arm cursor + within-arm statement cursor). switchData[aux] holds
-            // the minted arm blocks (re-addressed by index, realloc-safe).
+            // ── SwitchStmt (c60, Design I-A): the dispatch arms map each case
+            // value (+ default) to the ordinal of a synthetic LabelStmt marker in
+            // the FLAT body Block. phase 0 lowers the discriminant, getOrCreates the
+            // case markers' label-blocks (the SAME machinery goto/label use), emits
+            // addSwitch targeting them, pushes the break-frame, opens a fresh
+            // pre-case block, and requests the body Block; phase 1 wires the body's
+            // fall-off-the-end to the join. `bb0` = the join/exit block. NO per-arm
+            // blocks — fall-through is straight-line inside the body.
             case StmtFrame::Kind::Switch: {
                 if (f.phase == 0) {
                     HirNodeId const node2 = f.node;
@@ -5662,19 +5657,16 @@ struct Lowerer {
                     if (!disc.valid()) { work.pop_back(); ok = false; break; }
                     MirBlockId const exitBB =
                         mir.createBlock(StructCfMarker::SwitchJoin);
-                    std::vector<MirBlockId> armBlocks;
-                    armBlocks.reserve(arms.size());
-                    for (std::size_t i = 0; i < arms.size(); ++i) {
-                        armBlocks.push_back(
-                            mir.createBlock(StructCfMarker::SwitchCase));
-                    }
-                    // Build (caseValue,target) list and resolve defaultBB.
+                    // Build (caseValue, target-label-block) + resolve defaultBB,
+                    // targeting the case markers' label-blocks (lazy/forward via
+                    // getOrCreateLabelBlock — the body's LabelStmt markers fill them).
                     std::vector<std::pair<MirInstId, MirBlockId>> cases;
                     cases.reserve(arms.size());
                     MirBlockId defaultBB{};
                     bool failed = false;
-                    for (std::size_t i = 0; i < arms.size(); ++i) {
-                        HirNodeId const arm = arms[i];
+                    for (HirNodeId const arm : arms) {
+                        MirBlockId const target =
+                            getOrCreateLabelBlock(hir.caseArmLabelOrdinal(arm));
                         if (hir.caseArmIsDefault(arm)) {
                             if (defaultBB.valid()) {
                                 unsupported(arm, "switch has more than one "
@@ -5682,7 +5674,7 @@ struct Lowerer {
                                                   "should have flagged this)");
                                 failed = true; break;
                             }
-                            defaultBB = armBlocks[i];
+                            defaultBB = target;
                             continue;
                         }
                         auto const valN = hir.caseArmValue(arm);
@@ -5694,95 +5686,41 @@ struct Lowerer {
                         }
                         MirInstId const caseVal = lowerExpr(*valN);
                         if (!caseVal.valid()) { failed = true; break; }
-                        cases.emplace_back(caseVal, armBlocks[i]);
+                        cases.emplace_back(caseVal, target);
                     }
                     if (failed) {
                         sealCreatedAsUnreachable(exitBB);
-                        for (MirBlockId b : armBlocks)
-                            sealCreatedAsUnreachable(b);
                         work.pop_back(); ok = false; break;
                     }
                     if (!defaultBB.valid()) defaultBB = exitBB;
                     mir.addSwitch(disc, cases, defaultBB);
-                    // Push the break-frame ONCE for the whole switch (all arms
-                    // share it) — matches the recursive single push/pop around
-                    // the arm loop.
+                    // Push the break-frame ONCE for the whole switch.
                     branchStack.push_back({MirBlockId{}, exitBB});
-                    f.aux = static_cast<std::uint32_t>(switchData.size());
-                    switchData.push_back({std::move(armBlocks)});
-                    f.bb0 = exitBB;
-                    f.aux2BlockCtx =
-                        static_cast<std::uint32_t>(blockCtxs.size());
-                    blockCtxs.push_back({.idx = 0, .armIdx = 0});
-                    f.phase = 1;
-                    // fall through into phase 1 (begin arm 0).
-                }
-                // phase 1: begin the current arm's block + request its first
-                // body statement (or advance to the next arm / finish).
-                // phase 2: a body statement finished — handle fall-through /
-                // failure, advance the within-arm cursor or the arm cursor.
-                std::uint32_t const ctxIdx = f.aux2BlockCtx;
-                std::uint32_t const dataIdx = f.aux;
-                HirNodeId const node2 = f.node;
-                auto const arms = hir.switchArms(node2);
-                if (f.phase == 2) {
-                    if (!ok) {
-                        // Seal the remaining arm blocks + exit, pop frame.
-                        std::uint32_t const ai = blockCtxs[ctxIdx].armIdx;
-                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
-                        for (std::size_t j = ai + 1u;
-                             j < switchData[dataIdx].armBlocks.size(); ++j) {
-                            sealCreatedAsUnreachable(
-                                switchData[dataIdx].armBlocks[j]);
-                        }
-                        sealCreatedAsUnreachable(f.bb0);
-                        branchStack.pop_back();
-                        blockCtxs.pop_back();
-                        switchData.pop_back();
-                        work.pop_back(); ok = false; break;
+                    // Only a non-label-first body (a jumped-over leading decl) needs a
+                    // fresh predecessor-less block (pruned as unreachable); a case
+                    // marker opens its own label-block (see the recursive form).
+                    if (!switchBodyStartsWithLabel(hir.switchBody(node2))) {
+                        MirBlockId const preCase =
+                            mir.createBlock(StructCfMarker::Linear);
+                        mir.beginBlock(preCase);
                     }
-                    blockCtxs[ctxIdx].idx += 1u;
+                    f.bb0 = exitBB;
                     f.phase = 1;
-                }
-                // phase 1: dispatch within the current arm.
-                std::uint32_t const ai = blockCtxs[ctxIdx].armIdx;
-                if (ai >= arms.size()) {
-                    // All arms lowered. (The per-arm fall-through Br was emitted
-                    // when each arm's body ran out — see below.)
-                    branchStack.pop_back();
-                    mir.beginBlock(f.bb0);
-                    blockCtxs.pop_back();
-                    switchData.pop_back();
-                    work.pop_back(); ok = true;
+                    enterStmt(hir.switchBody(node2));  // lower body — may invalidate `f`
                     break;
                 }
-                {
-                    std::uint32_t const within = blockCtxs[ctxIdx].idx;
-                    HirNodeId const arm = arms[ai];
-                    auto const body = hir.caseArmBody(arm);
-                    if (within == 0u) {
-                        // First entry into this arm: open its block.
-                        mir.beginBlock(switchData[dataIdx].armBlocks[ai]);
-                    }
-                    if (within >= body.size()) {
-                        // Arm body exhausted: fall through to the next arm's
-                        // first block (or exit if this is the last arm).
-                        if (!mir.openBlockHasTerminator()) {
-                            MirBlockId const fall =
-                                (ai + 1u < arms.size())
-                                    ? switchData[dataIdx].armBlocks[ai + 1u]
-                                    : f.bb0;
-                            mir.addBr(fall);
-                        }
-                        blockCtxs[ctxIdx].armIdx = ai + 1u;
-                        blockCtxs[ctxIdx].idx = 0u;
-                        // loop again (no sub-request) — re-enter phase 1.
-                        break;
-                    }
-                    HirNodeId const stmt = body[within];
-                    f.phase = 2;
-                    enterStmt(stmt);   // lower arm-body stmt — may invalidate `f`
+                // phase 1: the body Block finished (`ok`). Wire fall-off-the-end to
+                // the join, pop the break-frame, and continue emitting at the join.
+                if (!ok) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(f.bb0);
+                    branchStack.pop_back();
+                    work.pop_back(); ok = false; break;
                 }
+                if (!mir.openBlockHasTerminator()) mir.addBr(f.bb0);
+                branchStack.pop_back();
+                mir.beginBlock(f.bb0);
+                work.pop_back(); ok = true;
                 break;
             }
             }
@@ -6345,20 +6283,19 @@ struct Lowerer {
                 return lowerStmt(hir.labelBody(node));
             }
             case HirKind::SwitchStmt: {
-                // C-style switch: each `CaseArm` has an optional match value
-                // and a body span; arms execute in declaration order with
-                // FALL-THROUGH when a body doesn't terminate (no break +
-                // no return). `default:` is the fall-back target. Lower as:
+                // c60 (Design I-A): a FLATTENED switch — the dispatch arms map each
+                // case value (and `default`) to the ordinal of a synthetic LabelStmt
+                // marker in the flat body Block; the body is lowered as ONE statement
+                // sequence with fall-through, exactly like a block. Lower as:
                 //   - lower discriminant
-                //   - createBlock per arm (1+ body blocks) + one exit block
-                //   - emit `Switch(disc, cases…, defaultBB)` where
-                //     defaultBB is the default arm's first block (or `exit`
-                //     if no default arm exists)
-                //   - lower each arm's body in order; fall-through arms
-                //     branch to the NEXT arm's first block; the last arm
-                //     falls through to exit.
-                //   - push `{invalid-continue, exit}` so `break;` targets
-                //     exit (continue inside switch is a HIR verifier error).
+                //   - getOrCreate a label-block per dispatch arm (the SAME label-block
+                //     machinery goto/label use); `default`'s block is `defaultBB`
+                //     (else the exit/join)
+                //   - emit `Switch(disc, cases…, defaultBB)` targeting those blocks
+                //   - push `{invalid-continue, exit}` so `break;` targets the join
+                //   - lower the flat body Block; its case/default LabelStmt markers
+                //     beginBlock their label-blocks (fall-through is straight-line);
+                //     a fall-off-the-end branches to the join.
                 HirNodeId const discN = hir.switchDiscriminant(node);
                 auto       const arms  = hir.switchArms(node);
 
@@ -6366,29 +6303,25 @@ struct Lowerer {
                 if (!disc.valid()) return false;
 
                 MirBlockId const exitBB = mir.createBlock(StructCfMarker::SwitchJoin);
-                // One block per arm, in declaration order.
-                std::vector<MirBlockId> armBlocks;
-                armBlocks.reserve(arms.size());
-                for (std::size_t i = 0; i < arms.size(); ++i) {
-                    armBlocks.push_back(mir.createBlock(StructCfMarker::SwitchCase));
-                }
 
-                // Build (caseValue, target) list and resolve defaultBB.
+                // Build the (caseValue, target-label-block) list + resolve defaultBB,
+                // targeting the case markers' label-blocks (created lazily / forward
+                // by getOrCreateLabelBlock — the body's LabelStmt markers fill them).
                 std::vector<std::pair<MirInstId, MirBlockId>> cases;
                 cases.reserve(arms.size());
                 MirBlockId defaultBB{};
-                for (std::size_t i = 0; i < arms.size(); ++i) {
-                    HirNodeId const arm = arms[i];
+                for (HirNodeId const arm : arms) {
+                    MirBlockId const target =
+                        getOrCreateLabelBlock(hir.caseArmLabelOrdinal(arm));
                     if (hir.caseArmIsDefault(arm)) {
                         if (defaultBB.valid()) {
                             unsupported(arm, "switch has more than one "
                                               "default arm (HIR verifier "
                                               "should have flagged this)");
                             sealCreatedAsUnreachable(exitBB);
-                            for (MirBlockId b : armBlocks) sealCreatedAsUnreachable(b);
                             return false;
                         }
-                        defaultBB = armBlocks[i];
+                        defaultBB = target;
                         continue;
                     }
                     auto const valN = hir.caseArmValue(arm);
@@ -6397,51 +6330,41 @@ struct Lowerer {
                                           "match value (HIR verifier "
                                           "should have flagged this)");
                         sealCreatedAsUnreachable(exitBB);
-                        for (MirBlockId b : armBlocks) sealCreatedAsUnreachable(b);
                         return false;
                     }
                     MirInstId const caseVal = lowerExpr(*valN);
                     if (!caseVal.valid()) {
                         sealCreatedAsUnreachable(exitBB);
-                        for (MirBlockId b : armBlocks) sealCreatedAsUnreachable(b);
                         return false;
                     }
-                    cases.emplace_back(caseVal, armBlocks[i]);
+                    cases.emplace_back(caseVal, target);
                 }
                 if (!defaultBB.valid()) defaultBB = exitBB;
 
                 mir.addSwitch(disc, cases, defaultBB);
 
-                // Lower each arm's body, falling through to the next arm
-                // when not self-terminated. Push the break-frame ONCE for
-                // the whole switch (all arms share it).
+                // The discriminant block is now terminated by the Switch. If the body
+                // starts with a case marker (a LabelStmt — the usual shape), that
+                // marker's lowering opens its own label-block directly. ONLY if the
+                // body starts with a non-label statement (a jumped-over leading decl)
+                // do we need a fresh predecessor-less block for it to lower into (the
+                // unreachable-prune drops it, since the dispatch jumped straight to
+                // the case/default blocks).
                 branchStack.push_back({MirBlockId{}, exitBB});
-                for (std::size_t i = 0; i < arms.size(); ++i) {
-                    mir.beginBlock(armBlocks[i]);
-                    HirNodeId const arm = arms[i];
-                    bool armOk = true;
-                    for (HirNodeId stmt : hir.caseArmBody(arm)) {
-                        if (!lowerStmt(stmt)) { armOk = false; break; }
-                    }
-                    if (!armOk) {
-                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
-                        // Seal the remaining arm blocks + exit so finish()
-                        // doesn't abort on a created-but-unfilled block.
-                        for (std::size_t j = i + 1; j < arms.size(); ++j) {
-                            sealCreatedAsUnreachable(armBlocks[j]);
-                        }
-                        sealCreatedAsUnreachable(exitBB);
-                        branchStack.pop_back();
-                        return false;
-                    }
-                    if (!mir.openBlockHasTerminator()) {
-                        // Fall through: branch to the next arm's first
-                        // block, or to exit if this is the last arm.
-                        MirBlockId const fall = (i + 1 < arms.size())
-                            ? armBlocks[i + 1] : exitBB;
-                        mir.addBr(fall);
-                    }
+                if (!switchBodyStartsWithLabel(hir.switchBody(node))) {
+                    MirBlockId const preCase =
+                        mir.createBlock(StructCfMarker::Linear);
+                    mir.beginBlock(preCase);
                 }
+                bool const bodyOk = lowerStmt(hir.switchBody(node));
+                if (!bodyOk) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(exitBB);
+                    branchStack.pop_back();
+                    return false;
+                }
+                // Fall-off-the-end of the body → the join.
+                if (!mir.openBlockHasTerminator()) mir.addBr(exitBB);
                 branchStack.pop_back();
 
                 mir.beginBlock(exitBB);

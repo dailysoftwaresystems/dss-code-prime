@@ -296,6 +296,24 @@ struct Lowerer {
     // never sees an unresolved label.
     std::unordered_map<std::string, std::uint32_t> labelOrdinals_;
 
+    // c60 (Design I-A): the per-function ordinal of each switch `case`/`default`
+    // marker — keyed by the caseLabel CST node (case labels are ANONYMOUS, so the
+    // node identity is the key, not a name). These ordinals share the SAME
+    // per-function space as `labelOrdinals_` (named labels) so MIR's label-block
+    // getOrCreate keys both uniformly and they never collide. `nextLabelOrdinal_`
+    // is the single monotonic counter both draw from (named labels in the
+    // `prescanLabels` pass, case labels in the per-switch dispatch prescan). All
+    // three are saved/restored around each function body, like `labelOrdinals_`.
+    std::unordered_map<std::uint32_t, std::uint32_t> caseLabelOrdinals_;  // NodeId.v -> ordinal
+    std::uint32_t                                    nextLabelOrdinal_{};
+    // The depth of switch BODIES we are currently lowering inside (per the CST
+    // subtree). A `caseStmt`/bare `caseLabel` reached as a statement is an
+    // IN-SWITCH nested case (lower to a LabelStmt marker) iff this is > 0 AND the
+    // node has a prescanned case ordinal; otherwise it is genuinely outside a
+    // switch body → fail loud S0023. Saved/restored as a guard around the body
+    // lowering of each switch.
+    std::uint32_t                                    switchBodyDepth_{};
+
     // The result of lowering an expression: the HIR node + its resolved type.
     struct E { HirNodeId id; TypeId type; };
 
@@ -3137,7 +3155,7 @@ struct Lowerer {
     // in the frame fields `c0`/`c1`.
     struct StmtFrame {
         enum class Kind : std::uint8_t { PassThrough, Block, If, While, For,
-                                         Label, Switch } kind;
+                                         Label, Switch, CaseMarker } kind;
         NodeId        node;     // the source node (provenance / combine anchor)
         std::uint8_t  phase;
         bool          doWhile;  // While frame: DoWhileStmt vs WhileStmt
@@ -3164,36 +3182,24 @@ struct Lowerer {
         std::vector<HirNodeId>  stmts;       // accumulated lowered statement ids
     };
 
-    // The accumulating Switch state — the full grouping machine that the recursive
-    // `lowerSwitch` ran as locals, lifted into a ctx so its TWO body-lowering
-    // re-entries (`lowerStmt(bodyCore)` in the case-chain + `lowerStmt(core)` for a
-    // plain arm body) become work-stack pushes on the OUTER `lowerStmt` driver
-    // instead of host recursion — so a switch nested in a switch-arm body carries
-    // flat O(1) host-stack cost per nesting level. Lives in a `switchCtxs` LIFO
-    // stack LOCAL to `lowerStmt` (referenced by stable INDEX `aux`, like `blockCtxs`
-    // — a nested switch grows the stack, and indices survive realloc). The
-    // bookkeeping is byte-IDENTICAL to `lowerSwitch`: `pumpSwitch` runs the same
-    // item loop + adjacent-case chain + label peeling, emitting the SAME nodes in
-    // the SAME order; the ONLY change is that a body lowers via `enterStmt` (and
-    // the Switch frame resumes the pump once `stmtResult` holds it).
+    // c60 (Design I-A): the accumulating Switch state. The body is now lowered as
+    // ONE flat Block (its case/default items become synthetic LabelStmt markers at
+    // any depth); the dispatch (`arms`) is computed up front from a per-switch
+    // prescan that assigns each caseLabel node an ordinal. Lives in a `switchCtxs`
+    // LIFO stack LOCAL to `lowerStmt` (referenced by stable INDEX `aux`, like
+    // `blockCtxs` — a nested switch grows the stack, indices survive realloc). The
+    // oracle `lowerSwitch` and the driver's Switch frame both call the shared
+    // `switchPrologue` (which builds `arms`) and then lower ONE body Block, so they
+    // stay byte-identical; the ONLY difference is the body lowers via host recursion
+    // (oracle) vs the work-stack (driver Switch frame, which suspends on the body).
     struct SwitchCtx {
-        NodeId                  node{};        // the switch CST node (provenance anchor)
-        HirNodeId               discId{};      // the (already-lowered) discriminant
-        std::vector<NodeId>     items;         // switchBodyItem wrappers (source order)
-        std::size_t             itemIdx{};     // next top-level item to process
-        // arm-grouping accumulators (the recursive `lowerSwitch` locals):
-        std::vector<HirNodeId>  arms;          // collected CaseArm ids
-        std::optional<NodeId>   curValue;      // the open arm's match expr, if any
-        bool                    curIsDefault{};// the open arm is `default`
-        bool                    haveArm{};     // an arm is open
-        std::vector<HirNodeId>  curBody;       // the open arm's collected body stmts
-        // adjacent-case chain resumption (the `lowerCaseChain` inner `for(;;)`):
-        bool                    inChain{};     // a case-chain is in progress
-        NodeId                  chainCs{};     // the current caseStmt node in the chain
-        std::vector<NodeId>     chainLabels;   // labels to wrap this chain link's body
-        // the just-entered body's pending label-wrap (applied when it completes;
-        // EMPTY ⇒ no wrap — the plain-stmt arm body):
-        std::vector<NodeId>     pendingLabels; // labels for the pending body
+        NodeId                  node{};      // the switch CST node (provenance anchor)
+        HirNodeId               discId{};    // the (already-lowered) discriminant
+        std::vector<NodeId>     items;       // switchBodyItem wrappers (source order)
+        std::vector<HirNodeId>  arms;        // the dispatch CaseArm entries (built up front)
+        // body lowering (driver): the next item + the accumulated body statements.
+        std::size_t             bodyIdx{};   // next switchBodyItem to lower
+        std::vector<HirNodeId>  bodyStmts;   // the lowered body statements (→ makeBlock)
     };
 
     // The public statement-lowering entry: a driver over an explicit work-stack.
@@ -3211,6 +3217,30 @@ struct Lowerer {
         HirNodeId stmtResult{};
 
         auto const enterStmt = [&](NodeId n) {
+            // c60 (Design I-A): a BARE `caseLabel` reached as a statement (a switch
+            // body item `case K:` / `default:` with its body in following siblings)
+            // — it has no hirKind mapping and `soleMeaningfulChild` would wrongly
+            // descend into the case-value expr. Intercept it here (BEFORE the
+            // transparent-wrapper peel): inside a switch body it lowers to a
+            // synthetic LabelStmt(ord, Skip) marker; outside any switch it is
+            // S0023. (A `caseStmt` — `caseLabel statement` — is a mapped rule and is
+            // handled in the terminal dispatch below as a CaseMarker frame.)
+            {
+                NodeId const core = peelToCore(n);
+                if (switchIsRuleNode(core, cfg.caseLabelRule)) {
+                    std::uint32_t ord{};
+                    if (switchBodyDepth_ > 0 && switchCaseOrdinal(core, ord)) {
+                        stmtResult = track(builder.makeLabelStmt(
+                            ord, track(builder.makeBlock({}), core)), core);
+                    } else {
+                        emitH(DiagnosticCode::S_CaseLabelNotInSwitch, core,
+                              "'case'/'default' label is not a direct switch-body "
+                              "item (C 6.8.1)");
+                        stmtResult = errorNode(core);
+                    }
+                    return;
+                }
+            }
             HirRuleMapping const* m = mappingFor(n);
             if (m == nullptr) {
                 // Transparent wrapper (e.g. `varDecl = [varDeclHead, ';']`):
@@ -3287,14 +3317,25 @@ struct Lowerer {
             }
             if (k == "GotoStmt")    { stmtResult = lowerGoto(n); return; }
             if (k == "IndirectGotoStmt") { stmtResult = lowerIndirectGoto(n); return; }
-            // D-CSUBSET-LABEL-BEFORE-CASE: a `case`/`default` labeled statement (the
-            // `caseStmt` form that lets a goto-label precede a case) reaches the
-            // statement dispatch ONLY when it is NOT a direct switch-body item —
-            // lowerSwitch consumes the in-switch (label-wrapped) ones first. So this
-            // is a case outside any switch, or nested in an inner block of a switch
-            // arm (the flat-switch model groups only top-level items). Fail loud
-            // (C 6.8.1) rather than emit a stray arm-less case.
+            // c60 (Design I-A): a `caseStmt` (`caseLabel statement`) reached as a
+            // statement. INSIDE a switch body (`switchBodyDepth_ > 0` AND its
+            // caseLabel was prescanned) it lowers to a synthetic LabelStmt marker
+            // wrapping its inner statement — a CaseMarker frame (mirrors the Label
+            // frame: phase 0 lowers the inner stmt, phase 1 wraps it). This is the
+            // SOLE path for BOTH a top-level case AND a case nested at any depth in
+            // a block/if of the switch body — the c60 fix. OUTSIDE any switch body
+            // it is genuinely a stray case → S0023 (C 6.8.1), preserved.
             if (k == "CaseStmt") {
+                NodeId const labelNode = switchCaseLabelOf(n);
+                std::uint32_t ord{};
+                if (switchBodyDepth_ > 0 && labelNode.valid()
+                    && switchCaseOrdinal(labelNode, ord)) {
+                    NodeId const inner = switchCaseStmtBody(n);
+                    StmtFrame fr{.kind = StmtFrame::Kind::CaseMarker, .node = n,
+                                 .n0 = inner, .labelOrd = ord};
+                    work.push_back(fr);
+                    return;
+                }
                 emitH(DiagnosticCode::S_CaseLabelNotInSwitch, n,
                       "'case'/'default' label is not a direct switch-body item (C 6.8.1)");
                 stmtResult = errorNode(n);
@@ -3328,83 +3369,21 @@ struct Lowerer {
             return true;
         };
 
-        // The Switch arm-grouping PUMP (ctx at stable index `ctxIdx`): runs the
-        // SAME item loop + adjacent-case chain + label peeling as the recursive
-        // `lowerSwitch`, emitting the SAME nodes in the SAME order — but each time
-        // it reaches a BODY to lower it `enterStmt`s the body and returns `true`
-        // (suspended; the Switch frame collects `stmtResult` on resume, applies the
-        // pending label-wrap, then calls this again). Returns `false` when all
-        // top-level items are consumed (the caller finishes the switch). The ctx is
-        // re-addressed fresh each access (a body that is itself a switch grows
-        // `switchCtxs` via `enterStmt`, so a held reference could dangle; the INDEX
-        // is stable). `enterStmt` is the LAST action before a `return true`, so the
-        // dangling-`work.back()` rule holds. The in-flight body's labels are stashed
-        // in `pendingLabels` (empty ⇒ no wrap — the plain-stmt arm body).
+        // c60 (Design I-A): the Switch BODY pump (ctx at stable index `ctxIdx`):
+        // lower each switchBodyItem left-to-right as a statement, collecting the
+        // results into the body Block (`switchCtxs[ctxIdx].arms` already holds the
+        // dispatch from the prologue prescan). A case/default item lowers to a
+        // synthetic LabelStmt marker via `enterStmt` (the bare-caseLabel intercept /
+        // the CaseStmt CaseMarker frame), since `switchBodyDepth_` is raised for the
+        // body's duration. Suspends on each item (returns true after `enterStmt`);
+        // returns false when all items are consumed. Byte-identical to the oracle
+        // `lowerSwitch`'s `for (raw : items) stmts.push_back(lowerStmt(raw))`.
         auto const pumpSwitch = [&](std::uint32_t ctxIdx) -> bool {
-            for (;;) {
-                if (switchCtxs[ctxIdx].inChain) {
-                    // One iteration of `lowerCaseChain`'s `for(;;)` for the current
-                    // chain link (`chainCs` / `chainLabels`).
-                    NodeId const cs = switchCtxs[ctxIdx].chainCs;
-                    std::vector<NodeId> labels = std::move(switchCtxs[ctxIdx].chainLabels);
-                    NodeId caseLabelNode{}, caseBody{};
-                    bool seenFirst = false;
-                    for (NodeId c : visible(cs)) {
-                        if (isToken(c)) continue;
-                        if (!seenFirst) { caseLabelNode = c; seenFirst = true; }
-                        else { caseBody = c; break; }
-                    }
-                    switchStartArm(switchCtxs[ctxIdx], switchCtxs[ctxIdx].node, caseLabelNode);
-                    if (!caseBody.valid()) {                       // empty case body (defensive)
-                        if (!labels.empty())
-                            switchCtxs[ctxIdx].curBody.push_back(switchWrapLabels(
-                                switchCtxs[ctxIdx].node, labels,
-                                switchMakeSkip(switchCtxs[ctxIdx].node)));
-                        switchCtxs[ctxIdx].inChain = false;
-                        continue;                                  // chain done → next top-level item
-                    }
-                    NodeId bodyCore = peelToCore(caseBody);
-                    std::vector<NodeId> innerLabels;
-                    NodeId bodyProbe = switchPeelLabels(bodyCore, innerLabels);
-                    if (switchIsRuleNode(bodyProbe, cfg.caseStmtRule)) {  // adjacent case
-                        if (!labels.empty())
-                            switchCtxs[ctxIdx].curBody.push_back(switchWrapLabels(
-                                switchCtxs[ctxIdx].node, labels,
-                                switchMakeSkip(switchCtxs[ctxIdx].node)));
-                        switchCtxs[ctxIdx].chainCs = bodyProbe;
-                        switchCtxs[ctxIdx].chainLabels = std::move(innerLabels);
-                        continue;                                  // → next chain link (stay inChain)
-                    }
-                    // The real body of this chain link → SUSPEND. The chain ends
-                    // after it (the recursive `lowerCaseChain` returns here).
-                    switchCtxs[ctxIdx].inChain = false;
-                    switchCtxs[ctxIdx].pendingLabels = std::move(labels);
-                    enterStmt(bodyCore);   // LAST action — may grow switchCtxs
-                    return true;
-                }
-                // The top-level item loop (`for (raw : items)`).
-                if (switchCtxs[ctxIdx].itemIdx >= switchCtxs[ctxIdx].items.size())
-                    return false;          // all items consumed → finish
-                NodeId const raw = switchCtxs[ctxIdx].items[switchCtxs[ctxIdx].itemIdx];
-                ++switchCtxs[ctxIdx].itemIdx;
-                NodeId core = peelToCore(raw);
-                std::vector<NodeId> labelToks;
-                NodeId probe = switchPeelLabels(core, labelToks);
-                if (switchIsRuleNode(probe, cfg.caseStmtRule)) {   // (label-wrapped) case statement
-                    switchCtxs[ctxIdx].inChain = true;
-                    switchCtxs[ctxIdx].chainCs = probe;
-                    switchCtxs[ctxIdx].chainLabels = std::move(labelToks);
-                    continue;                                      // enter the chain
-                } else if (switchIsRuleNode(core, cfg.caseLabelRule)) {  // bare flat case
-                    switchStartArm(switchCtxs[ctxIdx], switchCtxs[ctxIdx].node, core);
-                    continue;
-                } else if (switchCtxs[ctxIdx].haveArm) {           // plain stmt body → SUSPEND (no wrap)
-                    switchCtxs[ctxIdx].pendingLabels.clear();
-                    enterStmt(core);       // LAST action — may grow switchCtxs
-                    return true;
-                }
-                // not haveArm and not a case → nothing to emit; next item.
-            }
+            if (switchCtxs[ctxIdx].bodyIdx >= switchCtxs[ctxIdx].items.size())
+                return false;          // all items consumed → finish
+            NodeId const raw = switchCtxs[ctxIdx].items[switchCtxs[ctxIdx].bodyIdx];
+            enterStmt(raw);            // LAST action — may grow switchCtxs
+            return true;
         };
 
         enterStmt(node);
@@ -3441,28 +3420,24 @@ struct Lowerer {
                 }
                 break;
             case StmtFrame::Kind::Switch:
-                // The discriminant + items lowered in the prologue; now the
-                // arm-grouping pump (phase 0), suspending at each body so it lowers
-                // through the work-stack. On resume (else) a body just completed
-                // (`stmtResult`): apply its pending label-wrap, collect it into the
-                // open arm's body, then pump again — or finish (flush + makeSwitch).
+                // c60 (Design I-A): the discriminant + items + dispatch were built in
+                // the prologue. Now lower the body as ONE flat Block: pump each
+                // switchBodyItem (phase 0 raises `switchBodyDepth_` so case/default
+                // markers form; suspends on the first item). On resume (else) an item
+                // just completed (`stmtResult`): collect it into `bodyStmts`, advance,
+                // pump the next — or finish (makeBlock + makeSwitchStmt). Byte-
+                // identical to the oracle `lowerSwitch`'s body loop.
                 if (f.phase == 0) {
                     f.phase = 1;
                     std::uint32_t const ctxIdx = f.aux;
-                    if (pumpSwitch(ctxIdx)) break;      // entered the first body — wait
-                    finishSwitch(work, switchCtxs, ctxIdx, stmtResult);   // no bodies
+                    ++switchBodyDepth_;                 // body markers form while > 0
+                    if (pumpSwitch(ctxIdx)) break;      // entered the first item — wait
+                    finishSwitch(work, switchCtxs, ctxIdx, stmtResult);   // empty body
                 } else {
-                    // A body just completed (`stmtResult`). Wrap it in its pending
-                    // goto-labels (empty ⇒ unchanged — the plain-stmt arm body) and
-                    // collect it, exactly as the recursive `curBody.push_back(
-                    // wrapLabels(labels, lowerStmt(body)))`. Then pump the next.
                     std::uint32_t const ctxIdx = f.aux;
-                    NodeId const node2 = switchCtxs[ctxIdx].node;
-                    HirNodeId const wrapped = switchWrapLabels(
-                        node2, switchCtxs[ctxIdx].pendingLabels, stmtResult);
-                    switchCtxs[ctxIdx].curBody.push_back(wrapped);
-                    switchCtxs[ctxIdx].pendingLabels.clear();
-                    if (pumpSwitch(ctxIdx)) break;      // entered the next body — wait
+                    switchCtxs[ctxIdx].bodyStmts.push_back(stmtResult);
+                    ++switchCtxs[ctxIdx].bodyIdx;
+                    if (pumpSwitch(ctxIdx)) break;      // entered the next item — wait
                     finishSwitch(work, switchCtxs, ctxIdx, stmtResult);   // all consumed
                 }
                 break;
@@ -3576,6 +3551,26 @@ struct Lowerer {
                     stmtResult = track(builder.makeLabelStmt(ord, bodyH), node2);
                 }
                 break;
+            case StmtFrame::Kind::CaseMarker:
+                // c60 (Design I-A): a `caseStmt` (`case K: stmt`) inside a switch
+                // body — enter its inner statement (phase 0→1), then wrap it in the
+                // synthetic LabelStmt marker carrying the prescanned case ordinal
+                // (mirrors the Label frame; the MIR dispatch targets this marker's
+                // label-block). An absent inner (defensive) wraps an empty Block.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const bodyN = f.n0;
+                    if (bodyN.valid()) { enterStmt(bodyN); break; }  // may invalidate `f`
+                    stmtResult = track(builder.makeBlock({}), f.node);
+                }
+                {
+                    NodeId const node2 = f.node;
+                    std::uint32_t const ord = f.labelOrd;
+                    HirNodeId const bodyH = stmtResult;
+                    work.pop_back();
+                    stmtResult = track(builder.makeLabelStmt(ord, bodyH), node2);
+                }
+                break;
             }
         }
         return stmtResult;
@@ -3596,17 +3591,19 @@ struct Lowerer {
         stmtResult = blockH;
     }
 
-    // Finish a flattened Switch: flush the last open arm (the match VALUE lowers
-    // HERE, after its body — exactly as the recursive `lowerSwitch`'s trailing
-    // `flush()`), emit makeSwitchStmt, pop the Switch frame + its ctx (LIFO top — a
+    // c60 (Design I-A): finish a flattened Switch — lower `switchBodyDepth_` (the
+    // body is done), wrap the collected body statements in a Block, emit
+    // makeSwitchStmt(disc, body, arms), pop the Switch frame + its ctx (LIFO top — a
     // nested switch finished inner-first), and deliver into `stmtResult`. Shared by
-    // the no-bodies and all-items-consumed paths. Byte-identical to `lowerSwitch`'s
-    // `track(makeSwitchStmt(discId, arms), node)`.
+    // the empty-body and all-items-consumed paths. Byte-identical to the oracle
+    // `lowerSwitch`'s `makeSwitchStmt(disc, makeBlock(stmts), arms)`.
     void finishSwitch(std::vector<StmtFrame>& work, std::vector<SwitchCtx>& switchCtxs,
                       std::uint32_t ctxIdx, HirNodeId& stmtResult) {
         SwitchCtx& ctx = switchCtxs[ctxIdx];
-        switchFlush(ctx, ctx.node);
-        HirNodeId const swH = track(builder.makeSwitchStmt(ctx.discId, ctx.arms), ctx.node);
+        --switchBodyDepth_;
+        HirNodeId const body = track(builder.makeBlock(ctx.bodyStmts), ctx.node);
+        HirNodeId const swH =
+            track(builder.makeSwitchStmt(ctx.discId, body, ctx.arms), ctx.node);
         work.pop_back();
         switchCtxs.pop_back();
         stmtResult = swH;
@@ -3643,9 +3640,11 @@ struct Lowerer {
             if (m != nullptr && m->hirKind == "LabelStmt") {
                 NodeId const nameTok = firstIdentifierToken(node);
                 if (nameTok.valid()) {
+                    // c60: draw from the SHARED per-function ordinal counter so
+                    // named labels + switch case markers never collide.
                     auto const [it, inserted] = labelOrdinals_.try_emplace(
-                        std::string{tree().text(nameTok)},
-                        static_cast<std::uint32_t>(labelOrdinals_.size()));
+                        std::string{tree().text(nameTok)}, nextLabelOrdinal_);
+                    if (inserted) ++nextLabelOrdinal_;
                     if (!inserted) {   // C 6.8.1: a label name has function scope
                         emitH(DiagnosticCode::S_DuplicateLabel, nameTok,
                               std::format("duplicate label '{}' in this function",
@@ -5400,13 +5399,6 @@ struct Lowerer {
     // `lowerStmt` recursion; the driver's `pumpSwitch` uses `enterStmt`). All node
     // emission below is unchanged from the prior inline form. ─────────────────────
 
-    // A goto-label before a case (`foo: case 1: stmt`) parses as
-    // labelStmt(foo, caseStmt(caseLabel(1), stmt)) — the label STAYS a real
-    // labelStmt node (pre-scanned + goto-resolvable). `D-CSUBSET-LABEL-BEFORE-CASE`.
-    [[nodiscard]] bool switchIsLabelStmtNode(NodeId n) {
-        HirRuleMapping const* m = mappingFor(n);
-        return m != nullptr && m->hirKind == "LabelStmt";
-    }
     [[nodiscard]] bool switchIsRuleNode(NodeId n, RuleId r) const {
         return r.valid() && tree().kind(n) == NodeKind::Internal
             && tree().rule(n).v == r.v;
@@ -5415,65 +5407,124 @@ struct Lowerer {
         for (NodeId c : visible(n)) if (!isToken(c)) return c;
         return NodeId{};
     }
-    [[nodiscard]] HirNodeId switchMakeSkip(NodeId node) {
-        return track(builder.makeBlock({}), node);
+
+    // c60 (Design I-A): the `caseLabel` node that introduces a `caseStmt` (the
+    // `caseLabel statement` form) — its first non-token child is a `caseLabel`.
+    // For a bare caseLabel item the node IS the caseLabel.
+    [[nodiscard]] NodeId switchCaseLabelOf(NodeId n) const {
+        if (switchIsRuleNode(n, cfg.caseLabelRule)) return n;
+        // a caseStmt: caseLabel is the FIRST meaningful child.
+        for (NodeId c : visible(n)) {
+            if (isToken(c)) continue;
+            NodeId core = peelToCore(c);
+            if (switchIsRuleNode(core, cfg.caseLabelRule)) return core;
+            return NodeId{};
+        }
+        return NodeId{};
     }
-    // Flush the open arm into a CaseArm. The match VALUE lowers HERE (at flush time,
-    // exactly as the recursive form — after the arm's body statements).
-    void switchFlush(SwitchCtx& ctx, NodeId node) {
-        if (!ctx.haveArm) return;
-        std::optional<HirNodeId> value;
-        if (!ctx.curIsDefault && ctx.curValue) value = lowerExpr(*ctx.curValue).id;
-        ctx.arms.push_back(track(builder.makeCaseArm(value, ctx.curBody), node));
-        ctx.curBody.clear();
+    // The statement child of a `caseStmt` (`caseLabel statement`) — the SECOND
+    // meaningful child. Invalid for a bare caseLabel.
+    [[nodiscard]] NodeId switchCaseStmtBody(NodeId caseStmtNode) const {
+        bool seenFirst = false;
+        for (NodeId c : visible(caseStmtNode)) {
+            if (isToken(c)) continue;
+            if (!seenFirst) { seenFirst = true; continue; }
+            return c;
+        }
+        return NodeId{};
     }
-    // Open a new arm from a `caseLabel` node (the SAME match-value/default
-    // extraction the bare flat path uses).
-    void switchStartArm(SwitchCtx& ctx, NodeId node, NodeId caseLabelNode) {
-        switchFlush(ctx, node);
-        ctx.haveArm = true;
-        ctx.curIsDefault = false;
-        ctx.curValue = std::nullopt;
+    // Is `core` a case/default marker reached as a statement inside a switch body?
+    // (A bare `caseLabel`, or a `caseStmt`.) Used by the statement dispatch to route
+    // it to a LabelStmt marker rather than S0023.
+    [[nodiscard]] bool switchIsCaseMarker(NodeId core) const {
+        return switchIsRuleNode(core, cfg.caseLabelRule)
+            || switchIsRuleNode(core, cfg.caseStmtRule);
+    }
+
+    // Decode a `caseLabel` node into (isDefault, valueExpr?): the default token
+    // marks the default arm; any non-token child is the case match expression.
+    void switchDecodeLabel(NodeId caseLabelNode, bool& isDefault,
+                           std::optional<NodeId>& valueExpr) const {
+        isDefault = false;
+        valueExpr = std::nullopt;
         for (NodeId lc : visible(caseLabelNode)) {
             if (isToken(lc)) {
                 if (cfg.caseDefaultToken.valid()
                     && tree().tokenKind(lc).v == cfg.caseDefaultToken.v)
-                    ctx.curIsDefault = true;
+                    isDefault = true;
             } else {
-                ctx.curValue = lc;   // the case match expression
+                valueExpr = lc;   // the case match expression
             }
         }
     }
-    // Peel leading LabelStmt layers off `core`, collecting their name tokens;
-    // return the innermost peeled core.
-    [[nodiscard]] NodeId switchPeelLabels(NodeId core, std::vector<NodeId>& outToks) {
-        while (switchIsLabelStmtNode(core)) {
-            NodeId body = switchFirstNonToken(core);
-            if (!body.valid()) break;
-            outToks.push_back(firstIdentifierToken(core));
-            core = peelToCore(body);
+
+    // c60 (Design I-A): the per-switch PRESCAN. Walk the switch body subtree in
+    // source order; for every `caseLabel` node (bare or inside a caseStmt, at ANY
+    // depth) assign a per-function ordinal (drawn from the SHARED `nextLabelOrdinal_`
+    // counter so it never collides with a named label) and build a dispatch CaseArm
+    // (value + ordinal, or default + ordinal). The map keys the marker emission +
+    // the MIR jump-table target by the caseLabel node. An explicit heap work-stack
+    // pre-order walk (no host recursion — a 900-case switch body is deep). Does NOT
+    // descend into a NESTED switch (its cases belong to that switch's own dispatch);
+    // a nested switch is opaque here.
+    void switchPrescanDispatch(SwitchCtx& ctx) {
+        std::vector<NodeId> stack(ctx.items.rbegin(), ctx.items.rend());
+        while (!stack.empty()) {
+            NodeId const n = stack.back();
+            stack.pop_back();
+            if (tree().kind(n) != NodeKind::Internal) continue;   // token
+            NodeId const core = peelToCore(n);
+            // A nested switch: do not descend (its caseLabels are its own — they
+            // belong to that switch's dispatch, assigned by ITS prologue).
+            if (HirRuleMapping const* mm = mappingFor(core);
+                mm != nullptr && mm->hirKind == "SwitchStmt") {
+                continue;
+            }
+            if (switchIsRuleNode(core, cfg.caseLabelRule)) {
+                switchAssignCaseOrdinal(ctx, core);
+                // a bare caseLabel has only its value-expr child — nothing more to
+                // walk for cases.
+                continue;
+            }
+            // Push children (reverse → pop left-to-right pre-order). Use the PEELED
+            // core's children so a caseStmt's caseLabel + body are both visited.
+            std::size_t const mark = stack.size();
+            for (NodeId c : visible(core)) if (!isToken(c)) stack.push_back(c);
+            std::reverse(stack.begin() + static_cast<std::ptrdiff_t>(mark), stack.end());
         }
-        return core;
     }
-    // Wrap `inner` in the collected goto-labels (outermost first). Each is a real
-    // pre-scanned LabelStmt so `goto foo` resolves to this arm's entry exactly as
-    // `case 1: foo: stmt` would (C 6.8.1). EMPTY `toks` ⇒ returns `inner` unchanged.
-    [[nodiscard]] HirNodeId switchWrapLabels(NodeId node, std::vector<NodeId> const& toks,
-                                             HirNodeId inner) {
-        HirNodeId result = inner;
-        for (auto it = toks.rbegin(); it != toks.rend(); ++it) {
-            auto found = labelOrdinals_.find(std::string{tree().text(*it)});
-            if (found == labelOrdinals_.end()) continue;   // pre-scan covers all
-            result = track(builder.makeLabelStmt(found->second, result), node);
-        }
-        return result;
+    // Assign (once) the case-label ordinal for `caseLabelNode` and append its
+    // dispatch CaseArm. First-occurrence-wins (a caseLabel node is unique, so this
+    // is hit exactly once per case during the prescan).
+    void switchAssignCaseOrdinal(SwitchCtx& ctx, NodeId caseLabelNode) {
+        auto const [it, inserted] = caseLabelOrdinals_.try_emplace(
+            caseLabelNode.v, nextLabelOrdinal_);
+        if (!inserted) return;   // already assigned (defensive)
+        ++nextLabelOrdinal_;
+        std::uint32_t const ord = it->second;
+        bool isDefault = false;
+        std::optional<NodeId> valueExpr;
+        switchDecodeLabel(caseLabelNode, isDefault, valueExpr);
+        std::optional<HirNodeId> value;
+        if (!isDefault && valueExpr) value = lowerExpr(*valueExpr).id;
+        ctx.arms.push_back(track(builder.makeCaseArm(value, ord), caseLabelNode));
+    }
+    // The prescanned ordinal of a caseLabel node (the marker emission target).
+    // Returns true + the ordinal iff the node was prescanned (i.e. it is a genuine
+    // in-switch case); false ⇒ a case OUTSIDE any switch body → caller fails loud.
+    [[nodiscard]] bool switchCaseOrdinal(NodeId caseLabelNode, std::uint32_t& ord) const {
+        auto it = caseLabelOrdinals_.find(caseLabelNode.v);
+        if (it == caseLabelOrdinals_.end()) return false;
+        ord = it->second;
+        return true;
     }
 
     // The Switch PROLOGUE shared by `lowerSwitch` (recursive oracle) and the
     // `lowerStmt` driver's Switch frame: lower the discriminant INLINE (the first
-    // `Role::Expr` child, at its source position — matching the recursive scan) and
-    // collect the switchBodyItem wrappers in source order. Byte-identical to the
-    // recursive opening scan; builds the ctx the grouping machine then consumes.
+    // `Role::Expr` child, at its source position) and collect the switchBodyItem
+    // wrappers in source order, THEN prescan the body to assign case ordinals + build
+    // the dispatch. The case VALUE expressions lower HERE (in the prescan, source
+    // order) — a fixed, deterministic order identical between oracle and driver.
     [[nodiscard]] SwitchCtx switchPrologue(NodeId node) {
         SwitchCtx ctx;
         ctx.node = node;
@@ -5484,61 +5535,24 @@ struct Lowerer {
             ctx.items.push_back(c);   // switchBodyItem wrappers (caseLabel | statement)
         }
         ctx.discId = orError(disc, node, "switch has no discriminant");
+        switchPrescanDispatch(ctx);   // assign case ordinals + build dispatch arms
         return ctx;
     }
 
     // The retained RECURSIVE `lowerSwitch` (now dead via the driver, like
     // `lowerBlock`/`lowerIf` — kept as the single-source ORACLE the goldens pin
-    // against). Drives the SHARED grouping members; the body re-entries use
-    // `lowerStmt` recursion. The `lowerStmt` driver flattens the SAME logic via
-    // `pumpSwitch` (its body re-entries push onto the work-stack instead).
+    // against). c60 (Design I-A): the body is ONE flat Block — each switchBodyItem
+    // lowers as a statement (with `switchBodyDepth_ > 0` so its case/default markers,
+    // at any depth, become synthetic LabelStmts). The `lowerStmt` driver flattens the
+    // SAME body via a Block frame on the work-stack (its Switch frame suspends on it).
     HirNodeId lowerSwitch(NodeId node) {
         SwitchCtx ctx = switchPrologue(node);
-        // Lower a (label-wrapped) `caseStmt` chain into arms (adjacent
-        // `foo: case 1: case 2: stmt` → empty label-marked arms + the real body).
-        auto lowerCaseChain = [&](NodeId cs, std::vector<NodeId> labels) {
-            for (;;) {
-                NodeId caseLabelNode{}, caseBody{};
-                bool seenFirst = false;
-                for (NodeId c : visible(cs)) {
-                    if (isToken(c)) continue;
-                    if (!seenFirst) { caseLabelNode = c; seenFirst = true; }
-                    else { caseBody = c; break; }
-                }
-                switchStartArm(ctx, node, caseLabelNode);
-                if (!caseBody.valid()) {                          // empty case body (defensive)
-                    if (!labels.empty())
-                        ctx.curBody.push_back(switchWrapLabels(node, labels, switchMakeSkip(node)));
-                    return;
-                }
-                NodeId bodyCore = peelToCore(caseBody);
-                std::vector<NodeId> innerLabels;
-                NodeId bodyProbe = switchPeelLabels(bodyCore, innerLabels);
-                if (switchIsRuleNode(bodyProbe, cfg.caseStmtRule)) {  // adjacent case
-                    if (!labels.empty())
-                        ctx.curBody.push_back(switchWrapLabels(node, labels, switchMakeSkip(node)));
-                    cs = bodyProbe;
-                    labels = std::move(innerLabels);
-                    continue;                                      // → next arm
-                }
-                ctx.curBody.push_back(switchWrapLabels(node, labels, lowerStmt(bodyCore)));
-                return;
-            }
-        };
-        for (NodeId raw : ctx.items) {
-            NodeId core = peelToCore(raw);
-            std::vector<NodeId> labelToks;
-            NodeId probe = switchPeelLabels(core, labelToks);
-            if (switchIsRuleNode(probe, cfg.caseStmtRule)) {      // (label-wrapped) case statement
-                lowerCaseChain(probe, std::move(labelToks));
-            } else if (switchIsRuleNode(core, cfg.caseLabelRule)) {  // bare flat case
-                switchStartArm(ctx, node, core);
-            } else if (ctx.haveArm) {                             // plain stmt
-                ctx.curBody.push_back(lowerStmt(core));
-            }
-        }
-        switchFlush(ctx, node);
-        return track(builder.makeSwitchStmt(ctx.discId, ctx.arms), node);
+        ++switchBodyDepth_;
+        std::vector<HirNodeId> stmts;
+        for (NodeId raw : ctx.items) stmts.push_back(lowerStmt(raw));
+        --switchBodyDepth_;
+        HirNodeId const body = track(builder.makeBlock(stmts), node);
+        return track(builder.makeSwitchStmt(ctx.discId, body, ctx.arms), node);
     }
 
     // ── declarations ──────────────────────────────────────────────────────────
@@ -6025,12 +6039,18 @@ struct Lowerer {
                 sig.valid() ? interner.fnResult(sig) : InvalidType;
             currentReturnType_ = retType;
             auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
+            auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
+            std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
             labelOrdinals_.clear();
+            caseLabelOrdinals_.clear();
+            nextLabelOrdinal_ = 0;
             if (bodyNode.valid()) prescanLabels(bodyNode);
             HirNodeId body = bodyNode.valid()
                 ? lowerStmt(bodyNode)
                 : track(builder.makeBlock({}), node);
             labelOrdinals_ = std::move(savedLabels);
+            caseLabelOrdinals_ = std::move(savedCaseLabels);
+            nextLabelOrdinal_ = savedNextOrd;
             currentReturnType_ = savedReturn;
             body = maybeAppendImplicitReturnZero(node, body, sym, retType,
                                                  decl);
@@ -6256,12 +6276,18 @@ struct Lowerer {
         NodeId const bodyNode = (decl.bodyChild && *decl.bodyChild < vis.size())
                               ? vis[*decl.bodyChild] : NodeId{};
         auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
+        auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
+        std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
         labelOrdinals_.clear();
+        caseLabelOrdinals_.clear();
+        nextLabelOrdinal_ = 0;
         if (bodyNode.valid()) prescanLabels(bodyNode);
         HirNodeId body = bodyNode.valid()
                        ? lowerStmt(bodyNode)
                        : track(builder.makeBlock({}), node);
         labelOrdinals_ = std::move(savedLabels);
+        caseLabelOrdinals_ = std::move(savedCaseLabels);
+        nextLabelOrdinal_ = savedNextOrd;
         currentReturnType_ = savedReturn;
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);
@@ -6491,10 +6517,16 @@ struct Lowerer {
             sig.valid() ? interner.fnResult(sig) : InvalidType;
         currentReturnType_ = retType;
         auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
+        auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
+        std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
         labelOrdinals_.clear();
+        caseLabelOrdinals_.clear();
+        nextLabelOrdinal_ = 0;
         if (bodyNode.valid()) prescanLabels(bodyNode);
         HirNodeId body = bodyNode.valid() ? lowerStmt(bodyNode) : track(builder.makeBlock({}), node);
         labelOrdinals_ = std::move(savedLabels);
+        caseLabelOrdinals_ = std::move(savedCaseLabels);
+        nextLabelOrdinal_ = savedNextOrd;
         currentReturnType_ = savedReturn;
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);

@@ -609,8 +609,13 @@ private:
                 return;
             }
             case HirKind::SwitchStmt: {
+                // c60 (Design I-A): `switch (disc) { body: <block> case v L<ord> ...
+                // default L<ord> }`. The body Block carries the case/default markers
+                // inline; the dispatch arms map each case value to its marker ordinal.
                 out_ += "switch"; out_ += flagsStr(f); out_ += " (";
                 emitExpr(hir_.switchDiscriminant(id)); out_ += ") {\n";
+                out_ += indent(ind + 1); out_ += "body:\n";
+                emitNodeLine(hir_.switchBody(id), ind + 2);
                 for (HirNodeId arm : hir_.switchArms(id)) emitCaseArm(arm, ind + 1);
                 out_ += indent(ind); out_ += "}\n";
                 return;
@@ -673,17 +678,19 @@ private:
         out_ += '\n';
     }
 
+    // c60 (Design I-A): a dispatch entry — `case <value> L<ord>` / `default L<ord>`.
+    // The arm carries no body (the body lives on the SwitchStmt); `L<ord>` is the
+    // ordinal of the case's synthetic LabelStmt marker inside that body.
     void emitCaseArm(HirNodeId id, int ind) {
         emitAttrsBlock(id, ind);
         out_ += indent(ind);
         if (hir_.caseArmIsDefault(id)) {
-            out_ += "default"; out_ += flagsStr(hir_.flags(id)); out_ += " {\n";
+            out_ += "default"; out_ += flagsStr(hir_.flags(id));
         } else {
             out_ += "case"; out_ += flagsStr(hir_.flags(id)); out_ += ' ';
-            emitExpr(*hir_.caseArmValue(id)); out_ += " {\n";
+            emitExpr(*hir_.caseArmValue(id));
         }
-        for (HirNodeId s : hir_.caseArmBody(id)) emitNodeLine(s, ind + 1);
-        out_ += indent(ind); out_ += "}\n";
+        out_ += std::format(" L{}\n", hir_.caseArmLabelOrdinal(id));
     }
 
     // The `ext_node`/`error` wildcard form. Inline form (no indent/newline, for
@@ -1136,6 +1143,26 @@ private:
     [[nodiscard]] std::string takeIdent() {
         if (peekIs(Tk::Ident)) return lex_.take().text;
         malformed("expected identifier"); return {};
+    }
+    // c60 (Design I-A): parse a `L<ordinal>` label reference (the form goto/label/
+    // labeladdr render and the switch dispatch arms use). One `Ident` token whose
+    // text is `L` followed by decimal digits.
+    [[nodiscard]] std::uint32_t parseLabelOrdinal() {
+        if (!peekIs(Tk::Ident)) { malformed("expected a label ordinal 'L<n>'"); return 0; }
+        std::string const t = lex_.take().text;
+        if (t.size() < 2 || t[0] != 'L') {
+            malformed(std::format("expected a label ordinal 'L<n>', got '{}'", t));
+            return 0;
+        }
+        std::uint32_t ord = 0;
+        for (std::size_t i = 1; i < t.size(); ++i) {
+            if (t[i] < '0' || t[i] > '9') {
+                malformed(std::format("malformed label ordinal '{}'", t));
+                return 0;
+            }
+            ord = ord * 10u + static_cast<std::uint32_t>(t[i] - '0');
+        }
+        return ord;
     }
     [[nodiscard]] std::string takeStr() {
         if (peekIs(Tk::Str)) return lex_.take().text;
@@ -1600,8 +1627,13 @@ private:
         }
         if (kw == "for") return parseFor(flags);
         if (kw == "switch") {
+            // c60 (Design I-A): `switch (disc) { body: <block> case v L<ord> ...
+            // default L<ord> }` — the body Block then the dispatch arms.
             expect(Tk::LParen, "'('"); HirNodeId disc = parseNode(); expect(Tk::RParen, "')'");
             expect(Tk::LBrace, "'{'");
+            if (!acceptKeyword("body")) malformed("expected 'body:' in switch");
+            expect(Tk::Colon, "':'");
+            HirNodeId body = parseNode();
             std::vector<HirNodeId> arms;
             while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
                 std::uint32_t const off = cursorOff();
@@ -1609,11 +1641,25 @@ private:
                 if (cursorOff() == off) lex_.take();
             }
             expect(Tk::RBrace, "'}'");
-            return builder_.makeSwitchStmt(disc, arms, flags);
+            return builder_.makeSwitchStmt(disc, body, arms, flags);
         }
-        if (kw == "case") { HirNodeId v = parseNode(); auto body = parseBraceNodes();
-            return builder_.makeCaseArm(v, body, flags); }
-        if (kw == "default") { auto body = parseBraceNodes(); return builder_.makeCaseArm(std::nullopt, body, flags); }
+        if (kw == "case") { HirNodeId v = parseNode(); std::uint32_t ord = parseLabelOrdinal();
+            return builder_.makeCaseArm(v, ord, flags); }
+        if (kw == "default") { std::uint32_t ord = parseLabelOrdinal();
+            return builder_.makeCaseArm(std::nullopt, ord, flags); }
+        // c60 (Design I-A): `label L<ord>:` <body> and `goto L<ord>` / `goto *expr`
+        // (the switch body's case markers render as `label` statements, so the
+        // round-trip parser must read them).
+        if (kw == "label") {
+            std::uint32_t ord = parseLabelOrdinal();
+            expect(Tk::Colon, "':'");
+            HirNodeId body = parseNode();
+            return builder_.makeLabelStmt(ord, body, flags);
+        }
+        if (kw == "goto") {   // `goto L<ord>` (the plain label form)
+            std::uint32_t ord = parseLabelOrdinal();
+            return builder_.makeGotoStmt(ord, flags);
+        }
         if (kw == "break") { std::uint32_t d = peekIs(Tk::Int) ? static_cast<std::uint32_t>(takeInt()) : 0u;
             return builder_.makeBreak(d, flags); }
         if (kw == "continue") { std::uint32_t d = peekIs(Tk::Int) ? static_cast<std::uint32_t>(takeInt()) : 0u;

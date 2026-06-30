@@ -143,10 +143,16 @@ TEST(HirText, RoundTripControlFlow) {
     HirNodeId forS = b.makeForStmt(b.makeVarDecl(i32, 2, b.makeLiteral(i32, 0)), cmp(),
                                    std::nullopt, forBody);
 
+    // c60 (Design I-A): switch = [disc, body Block, dispatch arms]. The body holds
+    // the case markers (LabelStmts); each arm maps a value to its marker ordinal.
     HirNodeId armV = b.makeLiteral(i32, 5);
-    HirNodeId arm0 = b.makeCaseArm(armV, std::vector<HirNodeId>{b.makeBreak(0)});
-    HirNodeId armD = b.makeCaseArm(std::nullopt, std::vector<HirNodeId>{b.makeReturn()});
-    HirNodeId sw = b.makeSwitchStmt(b.makeLiteral(i32, 0), std::vector<HirNodeId>{arm0, armD});
+    HirNodeId swBody = b.makeBlock(std::vector<HirNodeId>{
+        b.makeLabelStmt(0, b.makeBreak(0)),
+        b.makeLabelStmt(1, b.makeReturn())});
+    HirNodeId arm0 = b.makeCaseArm(armV, /*labelOrdinal=*/0);
+    HirNodeId armD = b.makeCaseArm(std::nullopt, /*labelOrdinal=*/1);
+    HirNodeId sw = b.makeSwitchStmt(b.makeLiteral(i32, 0), swBody,
+                                    std::vector<HirNodeId>{arm0, armD});
 
     HirNodeId body = b.makeBlock(std::vector<HirNodeId>{whileS, forS, sw, b.makeReturn()});
     HirNodeId fn = b.makeFunction(sig, 1, {}, body);
@@ -159,7 +165,7 @@ TEST(HirText, RoundTripControlFlow) {
     EXPECT_NE(text.find("while ("), std::string::npos);
     EXPECT_NE(text.find("for {"), std::string::npos);
     EXPECT_NE(text.find("switch ("), std::string::npos);
-    EXPECT_NE(text.find("default {"), std::string::npos);
+    EXPECT_NE(text.find("default L1"), std::string::npos);   // c60: dispatch arm form
 }
 
 TEST(HirText, RoundTripLiteralValues) {
