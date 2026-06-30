@@ -645,7 +645,8 @@ subtreeContainsToken(Tree const& tree, NodeId node, SchemaTokenId kind,
 declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
                         DeclaratorConfig const& dc, SchemaTokenId constMarker,
                         std::unordered_map<std::uint32_t, std::size_t> const*
-                            declByRule) {
+                            declByRule,
+                        NodeId headNode) {
     // Descend a per-slot wrapper (initDeclarator / memberDeclarator) to the
     // inner declaratorRule — the same descent declaratorDeclaredType uses.
     NodeId inner = dNode;
@@ -672,7 +673,16 @@ declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
     }
     if (lastLayer.valid())
         return subtreeContainsToken(tree, lastLayer, constMarker, declByRule);
-    return subtreeContainsToken(tree, declNode, constMarker, declByRule);
+    // c58 (D-CSUBSET-INITIALIZER-CONST-TOKEN-LEAK): a SCALAR object's const comes
+    // ONLY from its type-specifier HEAD, never a `const` TOKEN inside its
+    // INITIALIZER (e.g. `int r = f((const char*)p)` — the cast's const must NOT mark
+    // `r` const; sqlite nocaseCollatingFunc). The old fallback scanned the whole
+    // `declNode`, which spans the initializer → a false S_ConstViolation on a later
+    // `r = …`. Scan the HEAD (base type, no pointer stars) — mirrors the legacy
+    // positional path's `kids[*decl.typeChild]` scoping; a genuine `const int r`
+    // keeps its const in the head, so it stays correctly rejected.
+    return subtreeContainsToken(tree, headNode.valid() ? headNode : declNode,
+                                constMarker, declByRule);
 }
 
 // Extract identifier text + the bound NodeId per the requested matching mode.
@@ -2509,7 +2519,10 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             rec.isConst = cfg.declarators.has_value()
                                 ? declaratorObjectIsConst(
                                       tree, node, dNode, *cfg.declarators,
-                                      *decl.constMarker, &s.idx().declByRule)
+                                      *decl.constMarker, &s.idx().declByRule,
+                                      (decl.headChild.has_value()
+                                       && *decl.headChild < kids.size())
+                                          ? kids[*decl.headChild] : NodeId{})
                                 : subtreeContainsToken(
                                       tree, node, *decl.constMarker,
                                       &s.idx().declByRule);
