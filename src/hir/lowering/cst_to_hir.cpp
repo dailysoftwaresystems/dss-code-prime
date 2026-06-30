@@ -2855,6 +2855,26 @@ struct Lowerer {
                 && interner.kind(elseE.type) == TypeKind::FnSig
                 && isIntLiteralArm(thenE)) {
                 common = interner.pointer(elseE.type);
+            } else if (thenE.type.valid()
+                && interner.kind(thenE.type) == TypeKind::Array
+                && isIntLiteralArm(elseE)) {
+                // c66 (D-CSUBSET-TERNARY-NULL-STRING-LITERAL): the ARRAY/string-
+                // literal sibling — `cond ? "%s" : 0` (sqlite's
+                // `sParse.zErrMsg ? "%s" : 0`). The string-literal Array arm
+                // opposite a literal-0 decays to Ptr<elem> (C 6.3.2.1p3 +
+                // 6.5.15p6). `common`=Ptr<elem> drives the coerce: the Array arm
+                // hits the Array→Ptr decay Cast (→ a GlobalAddr to the rodata
+                // string), the literal-0 the null-ptr Cast. Without this the
+                // ternary types Array → the aggregate lowering materializes the
+                // literal-0 arm as a string → H0009. The c64 array arm below needs
+                // BOTH arms to be arrays, so it misses `array : 0`.
+                auto const e = interner.operands(thenE.type);
+                if (!e.empty()) common = interner.pointer(e[0]);
+            } else if (elseE.type.valid()
+                && interner.kind(elseE.type) == TypeKind::Array
+                && isIntLiteralArm(thenE)) {
+                auto const e = interner.operands(elseE.type);
+                if (!e.empty()) common = interner.pointer(e[0]);
             }
         }
         // c64 (D-CSUBSET-TERNARY-ARRAY-DECAY): the array-decay sibling of the

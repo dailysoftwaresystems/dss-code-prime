@@ -5614,6 +5614,28 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                 && isLiteralIntegerZero(s, tree, thenN)) {
                 return interner.pointer(elseT);
             }
+            // c66 (D-CSUBSET-TERNARY-NULL-STRING-LITERAL): the ARRAY/string-literal
+            // sibling of the Ptr/FnSig arms above. A string-literal arm
+            // (`cond ? "%s" : 0` — sqlite's `sParse.zErrMsg ? "%s" : 0`) is an
+            // un-decayed Array; paired with a literal-0 (a null pointer constant),
+            // the conditional decays the array to Ptr<elem> (C 6.3.2.1p3 +
+            // 6.5.15p6) → the POINTER type. The c64 array arm below needs BOTH arms
+            // to be arrays, so it misses the `array : 0` pair → the fallback would
+            // type it Array<char,N> and the aggregate lowering then materializes
+            // the literal-0 arm as a string → H0009 (D-LK4-RODATA-PRODUCER-
+            // NONSTRING-ARRAY-LITERAL-DECAY). Handles BOTH arm orders.
+            if (thenT.valid()
+                && interner.kind(thenT) == TypeKind::Array
+                && isLiteralIntegerZero(s, tree, elseN)) {
+                auto const e = interner.operands(thenT);
+                if (!e.empty()) return interner.pointer(e[0]);
+            }
+            if (elseT.valid()
+                && interner.kind(elseT) == TypeKind::Array
+                && isLiteralIntegerZero(s, tree, thenN)) {
+                auto const e = interner.operands(elseT);
+                if (!e.empty()) return interner.pointer(e[0]);
+            }
         }
         // c64 (D-CSUBSET-TERNARY-ARRAY-DECAY): C 6.3.2.1p3 + 6.5.15 — an ARRAY
         // arm of a conditional decays to a pointer-to-element, so `cond ? "a" :

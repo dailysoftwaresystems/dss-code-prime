@@ -1,0 +1,34 @@
+{
+  "$comment": "c66 (D-CSUBSET-TERNARY-NULL-STRING-LITERAL): a conditional with a STRING-LITERAL arm and a null-pointer-constant (literal-0) arm — `cond ? \"%s\" : 0` — decays the string literal to char* (C 6.3.2.1p3) and treats 0 as a null pointer (C 6.5.15p6), so the result type is char* (a pointer), never an aggregate. Frontier sqlite `(sParse.zErrMsg ? \"%s\" : 0)` (sqlite3.c:161910) — a format-string arg whose value is the literal \"%s\" or NULL. combineTernary (BOTH tiers): commonArithType(Array,int)->Invalid; the c49 null-ptr arm needs the non-0 arm to be a Ptr (the string literal is an un-decayed Array, not Ptr); the c56 FnSig arm misses; the c64 array-decay arm needs BOTH arms to be arrays (the 0 is an int) — so all miss and the fallback returned the first arm's Array<char,3>. The conditional then typed as an aggregate, and the by-address aggregate-ternary lowering tried to string-materialize the literal-0 arm into a char[3] slot -> the Literal pool entry is an INTEGER, not a string -> H0009 (D-LK4-RODATA-PRODUCER-NONSTRING-ARRAY-LITERAL-DECAY) at hir_to_mir.cpp. c66 adds an Array-arm + integer-literal-0 arm to both combineTernary null-pointer blocks (semantic_analyzer.cpp + cst_to_hir.cpp): the array arm decays to Ptr<elem> (interner.operands(arr)[0] -> interner.pointer(elem)) -> the conditional is that pointer; at the HIR tier `common`=Ptr<char> drives the coerce -> the Array arm hits the Array->Ptr decay Cast (a GlobalAddr to the rodata string), the literal-0 the null-ptr Cast. Handles BOTH arm orders. take(cond?\"%s\":0) (the sqlite call-arg shape) -> \"%s\"/NULL; the fmt() return form -> \"%s\"/NULL; the reverse `cond ? 0 : \"err\"` -> \"err\"/NULL; each string read through the decayed pointer + each null arm checked == 0 -> 6 checks pass -> 42. PRESERVE: c49 `ptr : 0`, c56 `fn : 0`, c64 `arr : arr`/`arr : ptr` unchanged. RED-ON-DISABLE: revert the c66 combineTernary arms -> the conditional types Array<char,3> -> the aggregate lowering string-materializes the literal-0 arm -> H0009.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
