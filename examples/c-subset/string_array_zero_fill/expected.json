@@ -1,0 +1,33 @@
+{
+  "$comment": "c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): a string literal initializing a `char[N]` array zero-fills the trailing N-len bytes. The sqlite `aXformType[]` (sqlite3.c:26283) shape — a `static const struct { u8 n; char z[7]; int r; } arr[]` whose rows carry names SHORTER than the 7-byte field (\"hour\"/\"day\"/\"month\"/\"year\"; \"second\" is the exact fit) — plus the scalar `char s[7] = \"hi\"` the SAME mechanism (Option A: materialize the rodata global PADDED to N, typed Array<char,N>) fixes. SENSITIVE: the test reads BOTH the string bytes (correct?) AND the trailing padding bytes (zero?); a wrong padding or an OOB read of adjacent rodata leaves a nonzero byte where C mandates zero -> a distinct non-42 exit at the failing byte. exit 42 == every byte verified. RED-ON-DISABLE: revert the fix -> the aggregate rows -> H_VerifierFailure (child Array<char,M> != field Array<char,7>); the scalar -> S0003. Pure c-subset -> all 4 targets; the pe target RUNS on Windows. The release arm runs the shipped pipeline over the padded rodata global + the byte-wise array-init copy.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

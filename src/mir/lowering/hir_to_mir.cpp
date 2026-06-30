@@ -3128,8 +3128,15 @@ struct Lowerer {
         TypeKind const aggKind = interner.kind(aggTy);
         if (aggKind == TypeKind::Union)
             return lowerByteWiseCopy(srcPtr, dstPtr, layout->size, vf);
+        // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): a top-level
+        // ARRAY value copy — `char x[7] = "hi";` copies the N-byte rodata global
+        // (zero-padded at the producer) into the stack slot. `layout->size` is the
+        // array's full byte extent (computeLayout sizes any type incl. arrays), so
+        // a byte-wise copy moves exactly N bytes — the array twin of the Union arm.
+        if (aggKind == TypeKind::Array)
+            return lowerByteWiseCopy(srcPtr, dstPtr, layout->size, vf);
         if (aggKind != TypeKind::Struct) {
-            unsupported(atNode, "aggregate copy of a non-struct/union value "
+            unsupported(atNode, "aggregate copy of a non-struct/union/array value "
                                 "is not supported");
             return false;
         }
@@ -5853,6 +5860,22 @@ struct Lowerer {
                         // `int a[3] = {1,2,3}` — element-wise into the slot via
                         // the same helper the array-field recurse-guard uses.
                         if (!lowerArrayInitIntoSlot(*initN, alloca, ty, initVf))
+                            return false;
+                    } else if (initKind == TypeKind::Array
+                               && hir.kind(*initN) == HirKind::Literal) {
+                        // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL):
+                        // `char x[7] = "hi";` — a STRING LITERAL initializing a CHAR
+                        // ARRAY local. The HIR coerce arm retyped the literal to the
+                        // slot's `char[N]`, so its lvalue address materializes the
+                        // rodata global SIZED at N (string bytes + NUL, zero-padded to
+                        // N by the asm producer); copy those N bytes into the stack
+                        // slot. This is the array-COPY twin of the `int a[3]={…}`
+                        // element-wise arm above and the struct-field string arm —
+                        // the global is N bytes so the N-byte copy never reads OOB
+                        // (the Option-A pad-at-the-producer invariant).
+                        MirInstId const srcPtr = lowerLvalueAddress(*initN);
+                        if (!srcPtr.valid()) return false;
+                        if (!lowerAggregateCopy(*initN, srcPtr, alloca, ty, initVf))
                             return false;
                     } else if (initKind == TypeKind::Struct
                                || initKind == TypeKind::Union) {

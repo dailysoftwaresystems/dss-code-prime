@@ -667,6 +667,32 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     }
 
     if (k == TypeKind::Array) {
+        // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): a CHAR-ARRAY
+        // field/element initialized by a STRING LITERAL (`char zName[7] = "hour";`
+        // inside a static const aggregate). The const-eval folds the string-literal
+        // leaf to a `std::string` value (NOT a per-char `MirAggregateValue`), so a
+        // char[N] element here carries a string arm. Write the string bytes + the
+        // implicit NUL at `base`; the caller pre-zeroed `buf` to the full layout
+        // size, so the trailing N−(len+1) bytes are already zero (the C 6.7.9p14
+        // zero-fill) — the aggregate twin of the standalone string-literal global's
+        // producer-side padding. Element must be `char`; the NUL+bytes must fit the
+        // array's byte extent (a layout↔value disagreement fails loud). A non-char
+        // array with a string value, or an over-long string, falls through to the
+        // shape-mismatch `false` below.
+        if (std::holds_alternative<std::string>(v.value)
+            && !in.operands(ty).empty()
+            && in.kind(in.operands(ty)[0]) == TypeKind::Char) {
+            auto const& s   = std::get<std::string>(v.value);
+            auto const  lay = computeLayout(ty, in, lp, dm);
+            if (!lay.has_value()) return false;
+            if (base + s.size() + 1 > buf.size()) return false;   // NUL must fit
+            if (s.size() + 1 > lay->size)          return false;   // over-long → loud
+            for (std::size_t j = 0; j < s.size(); ++j)
+                buf[base + j] = static_cast<std::uint8_t>(s[j]);
+            // buf[base + s.size()] (the NUL) and the remaining bytes stay 0
+            // (caller pre-zeroed) — the trailing zero-fill.
+            return true;
+        }
         if (!std::holds_alternative<MirAggregateValue>(v.value)) return false;
         auto const& agg   = std::get<MirAggregateValue>(v.value);
         auto const  ops   = in.operands(ty);
@@ -861,7 +887,41 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // the literal bytes in read-only memory.
             d.section = DataSectionKind::Rodata;
             d.bytes.assign(s.begin(), s.end());
-            d.bytes.push_back(0);
+            d.bytes.push_back(0);                 // implicit NUL → s.size()+1 bytes
+            // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): when this
+            // string-literal global is the PRODUCER for a `char[N]` initializer (the
+            // HIR coerce retyped the literal node to `char[N]` with N > s.size()+1),
+            // the global's TYPE is `Array<char,N>` — so MATERIALIZE the trailing
+            // N−(s.size()+1) zero-padding bytes HERE (the Option-A "pad at the
+            // producer" choice). A consumer that copies N bytes (the aggregate-copy
+            // of the field / the array-local init) then reads GUARANTEED zeros, never
+            // an OOB read of adjacent rodata. The ORDINARY string-literal global
+            // (`char *p = "hi";`, a bare decayed `"abc"`) has type `Array<char,M>`
+            // with M == s.size()+1, so the type size equals the byte count already
+            // emitted and this padding is a NO-OP (behaviour unchanged). Only GROW
+            // (never shrink): the type size is N >= s.size()+1 by the coerce/semantic
+            // `N >= M` guards; clamp defensively so a hypothetical smaller type can
+            // never truncate the literal bytes.
+            if (interner.kind(ty) == TypeKind::Array) {
+                std::optional<std::uint64_t> typeSize;
+                if (auto const sc = interner.scalars(ty); !sc.empty()) {
+                    // Fast path: char element ⇒ N bytes == the length scalar. Use the
+                    // layout engine when present for a non-trivial element (agnostic
+                    // total size), but a char[N] string global is the only shape that
+                    // reaches here, so the scalar is exact.
+                    if (aggregateLayout.has_value()) {
+                        if (auto const lay = computeLayout(ty, interner,
+                                                           *aggregateLayout, dataModel);
+                            lay.has_value()) {
+                            typeSize = lay->size;
+                        }
+                    }
+                    if (!typeSize.has_value())
+                        typeSize = static_cast<std::uint64_t>(sc[0]);
+                }
+                if (typeSize.has_value() && *typeSize > d.bytes.size())
+                    d.bytes.resize(static_cast<std::size_t>(*typeSize), 0u);
+            }
             d.alignment = Alignment::of<1>();
             out.push_back(std::move(d));
             continue;

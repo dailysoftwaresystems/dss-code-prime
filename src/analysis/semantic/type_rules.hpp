@@ -143,6 +143,20 @@ namespace detail::type_rules {
 // in all three), so `double d = ptr;` / `int n = aStruct;` stay rejected. Mirrors
 // the charConvertsToArith / intCrossSignednessConverts gates; completes the C
 // arithmetic-conversion matrix. Closes D-CSUBSET-INT-FLOAT-CONVERSION.
+// `charArrayFromStringLiteralInit` (default false): admit `char[N] <- char[M]`
+// (N >= M, char element on BOTH sides) — C 6.7.9p14: a string literal initializing
+// a character array zero-fills the trailing N−M bytes (`char x[7] = "hi";`, the
+// sqlite `aXformType[]` `char zName[7]` field initialized by `"hour"`). The caller
+// passes `true` ONLY when the initializer IS a string literal (so an array rvalue
+// reaching an array slot through any OTHER route — which C anyway forbids for a
+// plain array-to-array init — stays a loud mismatch). EXACT-FIT (N==M) already
+// returned via `sameType` above; OVER-LONG (N < M, `char[3]="hello"`) is NOT
+// admitted by the arm (the `N >= M` guard) and stays a loud constraint error. The
+// HIR `coerce()` string-literal arm REALIZES the admission by retyping the literal
+// node to `char[N]` (so MIR materializes the rodata global padded to N), keeping
+// the admit ⟺ realize parity; the post-coerce verifier sees a `char[N]`-typed
+// child == the `char[N]` field/slot, so it stays strict. Closes
+// D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL.
 [[nodiscard]] inline bool isAssignable(
     TypeInterner const&                                interner,
     TypeId                                             lhs,
@@ -154,7 +168,8 @@ namespace detail::type_rules {
     bool                                               intCrossSignednessConverts = false,
     bool                                               intSameSignednessNarrows = false,
     bool                                               intConvertsToFloat = false,
-    bool                                               floatConvertsToInt = false) noexcept {
+    bool                                               floatConvertsToInt = false,
+    bool                                               charArrayFromStringLiteralInit = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     // c27 (D-CSUBSET-VOLATILE-POINTEE): volatile is IGNORED for assignment
     // compatibility — C 6.5.16.1 compares the UNQUALIFIED versions of compatible
@@ -288,6 +303,31 @@ namespace detail::type_rules {
         && ((signedIntRank(lk) != 0 && unsignedIntRank(rk) != 0)
             || (unsignedIntRank(lk) != 0 && signedIntRank(rk) != 0))) {
         return true;
+    }
+    // C 6.7.9p14 (D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): a string literal
+    // initializing a CHARACTER ARRAY zero-fills the trailing bytes — `char[N]` is
+    // assignable FROM the string literal's `char[M]` when N >= M (M = the literal's
+    // own array length, chars + NUL). Gated on `charArrayFromStringLiteralInit`
+    // (the caller sets it only when the init IS a string literal), so an ordinary
+    // array-to-array assignment never reaches here as `true`. Both element types
+    // must be `char` (the C string-literal element); a wide / non-char array stays
+    // out of scope. The same-type (N==M) exact fit already returned above; the
+    // `N >= M` guard keeps an OVER-LONG init (`char[3]="hello"`) a loud mismatch.
+    // The HIR `coerce()` realizes it by retyping the literal to `char[N]` so the
+    // MIR producer pads the rodata global to N (no OOB copy).
+    if (charArrayFromStringLiteralInit
+        && lk == TypeKind::Array && rk == TypeKind::Array) {
+        auto const lhsElem = interner.operands(lhs);
+        auto const rhsElem = interner.operands(rhs);
+        auto const lhsLen  = interner.scalars(lhs);
+        auto const rhsLen  = interner.scalars(rhs);
+        if (!lhsElem.empty() && !rhsElem.empty()
+            && !lhsLen.empty() && !rhsLen.empty()
+            && interner.kind(lhsElem[0]) == TypeKind::Char
+            && interner.kind(rhsElem[0]) == TypeKind::Char
+            && lhsLen[0] >= rhsLen[0]) {
+            return true;
+        }
     }
     // C-standard array-to-pointer decay (D-LK4-RODATA-PRODUCER-STRING
     // closure, 2026-06-02): `Array<T,N>` is implicitly assignable to

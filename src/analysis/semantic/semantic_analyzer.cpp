@@ -3799,6 +3799,31 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
     return tree.rule(p).v == s.idx().stringLiteralExprRule.v;
 }
 
+// C 6.7.9p14 (D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): is the initializer subtree
+// a STRING LITERAL (`= "..."`)? Descends the SINGLE-child wrapper chain from the
+// init node (initValue → expression → operand → … → stringLiteralExpr) — the same
+// chain the scalar-init `initTy` probe walks — and returns true when it reaches the
+// `stringLiteralExpr` rule node. A multi-child node (a brace-init list, a binary
+// expression) stops the descent and yields false. The scalar VarDecl assignability
+// check passes the result to `isAssignable` so a `char[N] <- char[M]` admission
+// fires ONLY for a genuine string-literal initializer (never an array-to-array
+// init, which C forbids anyway). False when the grammar has no stringLiteralExpr
+// rule (toy/tsql).
+[[nodiscard]] bool initIsStringLiteral(EngineState const& s, Tree const& tree,
+                                       NodeId initNode) {
+    if (!s.idx().stringLiteralExprRule.valid()) return false;
+    for (NodeId walk = initNode; walk.valid();) {
+        if (tree.kind(walk) == NodeKind::Internal
+            && tree.rule(walk).v == s.idx().stringLiteralExprRule.v) {
+            return true;
+        }
+        auto wk = visibleChildren(tree, walk);
+        if (wk.size() != 1) break;
+        walk = wk[0];
+    }
+    return false;
+}
+
 // ── Pass 2: post-order — resolve uses + literal/init typing + checks ───────
 // `loopDepth` (GAP C) is the count of enclosing `loopRules` subtrees the
 // walk is currently inside; a `loopControls` node at depth 0 is outside
@@ -4412,7 +4437,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt)
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode))
                                    && !admitsNullPointerConstant(
                                           s, tree, rec.type, initNode,
                                           tree.schema().semantics()
@@ -4460,7 +4485,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt)
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode))
                                    // D-LANG-NULL-POINTER-CONSTANT (step
                                    // 13.3): admit `T* p = 0;` initializer
                                    // per C §6.3.2.3.3.

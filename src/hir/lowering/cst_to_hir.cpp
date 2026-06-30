@@ -401,6 +401,47 @@ struct Lowerer {
                 return {decay, target};
             }
         }
+        // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): a STRING
+        // LITERAL (`Array<char,M>`) initializing a CHARACTER ARRAY `Array<char,N>`
+        // with N >= M zero-fills the trailing N−M bytes. REALIZE the semantic
+        // admission by RE-TYPING the literal node to the target `char[N]` (a fresh
+        // Literal sharing the SAME literal-pool index — the decoded string bytes are
+        // unchanged): the MIR producer then materializes the rodata global at N
+        // bytes (string bytes + NUL, zero-padded to N — see asm.cpp's string-literal
+        // arm) so a `char[N]`-wide aggregate copy reads guaranteed zeros, never an
+        // OOB read of adjacent rodata (the Option-A "pad at the producer" choice).
+        // The retyped node carries the field/slot's `char[N]` type, so the
+        // ConstructAggregate verifier's child==field equality holds (the struct
+        // `aXformType[]` case) AND the scalar `char x[7]="hi"` lowers as an N-byte
+        // array init. GUARDED on the child being an actual string Literal (the same
+        // `std::string` pool-variant discriminator the asm producer keys on), so an
+        // ordinary array value never reaches this arm; the `N >= M` guard keeps an
+        // over-long init out (it never admitted at the semantic tier either). Pinned
+        // to char elements on both sides (the C string-literal element type).
+        if (ck == TypeKind::Array && tk == TypeKind::Array
+            && builder.kind(child.id) == HirKind::Literal) {
+            auto const fromElem = interner.operands(child.type);
+            auto const toElem   = interner.operands(target);
+            auto const fromLen  = interner.scalars(child.type);
+            auto const toLen    = interner.scalars(target);
+            if (!fromElem.empty() && !toElem.empty()
+                && !fromLen.empty() && !toLen.empty()
+                && interner.kind(fromElem[0]) == TypeKind::Char
+                && interner.kind(toElem[0]) == TypeKind::Char
+                && toLen[0] >= fromLen[0]
+                && std::holds_alternative<std::string>(
+                       literals.at(builder.payload(child.id)).value)) {
+                HirNodeId const padded =
+                    builder.makeLiteral(target, builder.payload(child.id));
+                for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                    if (it->first == child.id) {
+                        spans.push_back({padded, it->second});
+                        break;
+                    }
+                }
+                return {padded, target};
+            }
+        }
         // D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): when
         // the active language's `pointerConversions` rules admit the
         // direction-specific `Ptr<Void>` ↔ `Ptr<T>` conversion, emit
