@@ -7015,6 +7015,20 @@ struct Lowerer {
             std::uint32_t const s = hir.payload(initNode);
             if (functionSymbols.contains(s))
                 return std::make_pair(SymbolId{s}, std::int64_t{0});
+            // c68 (D-CSUBSET-AGGREGATE-GLOBAL-NONSYMBOL-PTR-MEMBER): a bare `Ref`
+            // to a GLOBAL ARRAY variable is an array designator that DECAYS to
+            // `&arr[0]` (C 6.3.2.1p3) — a link-time symbol address, addend 0
+            // (sqlite's `aWindowFuncs[].zName = row_numberName`, a `Ref` to a
+            // `static const char[]` global, wrapped in the decay Cast peeled by
+            // the Cast arm below). A bare `Ref` to a SCALAR global stays excluded
+            // (that is an rvalue LOAD of the variable's contents, NOT its address
+            // — `&global` arrives as AddressOf(Ref)); ONLY the array-to-pointer
+            // designator decay yields an address here.
+            if (globalSymbols.contains(s)) {
+                TypeId const rt = hir.typeId(initNode);
+                if (rt.valid() && interner.kind(rt) == TypeKind::Array)
+                    return std::make_pair(SymbolId{s}, std::int64_t{0});
+            }
             return std::nullopt;
         }
         if (k == HirKind::AddressOf) {
@@ -7116,6 +7130,10 @@ struct Lowerer {
                 agg.fields.push_back(std::move(*np));
                 continue;
             }
+            if (auto ip = tryClassifyNullBaseIndexConst(child, env, opts)) {
+                agg.fields.push_back(std::move(*ip));
+                continue;
+            }
             ConstEvalResult const r =
                 evaluateConstant(hir, interner, literals, child, env, opts);
             if (!r.value.has_value()) return std::nullopt;  // one un-foldable → bail
@@ -7161,6 +7179,73 @@ struct Lowerer {
         if (!isZero) return std::nullopt;
         MirLiteralValue leaf;
         leaf.value = std::uint64_t{0};
+        leaf.core  = TypeKind::Ptr;
+        return leaf;
+    }
+
+    // c68 (D-CSUBSET-AGGREGATE-GLOBAL-NONSYMBOL-PTR-MEMBER): a NULL-BASE ARRAY-
+    // ELEMENT address constant — `(T*)&((char*)0)[X]`. This is sqlite's
+    // `SQLITE_INT_TO_PTR(X)` idiom (sqlite3.c: `#define SQLITE_INT_TO_PTR(X)
+    // ((void*)&((char*)0)[X])`): stash a small integer X in a `void*` (read back
+    // via `SQLITE_PTR_TO_INT`), used for the `pUserData` member of the built-in
+    // `FuncDef` tables (`aBuiltinFunc[]`, `aJsonFunc[]`). The address of element
+    // X of a NULL pointer base is `0 + X*sizeof(elem)` — a pointer-valued INTEGER
+    // constant: NO symbol, NO relocation (gcc folds it to the same bytes). This
+    // is the array-element sibling of c43's offsetof MEMBER folding
+    // ([[D-CSUBSET-ADDRESS-CONSTANT-FOLD]]); the CST const-eval deliberately
+    // punted the `&arr[i]` Index form to the global-init lowering ("the HIR
+    // engine", cst_const_eval.cpp Index comment) — this is that handler. Shape:
+    // peel pointer reinterpret cast(s) → AddressOf → Index(base, X).
+    // ★ CONSERVATIVE (no over-fire, the c65 discipline): the base MUST fold to a
+    // NULL pointer (address 0). `&realArray[i]` (a SYMBOL base) is NOT this idiom
+    // — its value is the symbol's address + i*stride (a reloc), NOT the bare
+    // integer — so a non-null base returns nullopt (the member falls through to
+    // the whole-aggregate bail → the fail-loud guard) rather than being silently
+    // mis-folded to an integer.
+    [[nodiscard]] std::optional<MirLiteralValue>
+    tryClassifyNullBaseIndexConst(HirNodeId node, EvalEnvironment const& env,
+                                  EvalOptions const& opts) {
+        // Peel pointer-typed reinterpret cast(s) — the outer `(void*)`.
+        while (hir.kind(node) == HirKind::Cast) {
+            TypeId const ct = hir.typeId(node);
+            if (!ct.valid() || interner.kind(ct) != TypeKind::Ptr)
+                return std::nullopt;
+            auto cKids = hir.children(node);
+            if (cKids.size() != 1) return std::nullopt;
+            node = cKids[0];
+        }
+        if (hir.kind(node) != HirKind::AddressOf) return std::nullopt;
+        auto aoKids = hir.children(node);
+        if (aoKids.size() != 1) return std::nullopt;
+        HirNodeId const idxNode = aoKids[0];
+        if (hir.kind(idxNode) != HirKind::Index) return std::nullopt;
+        auto ixKids = hir.children(idxNode);
+        if (ixKids.size() != 2) return std::nullopt;
+        // The base MUST be a null pointer constant (address 0) — only then is
+        // the element address the bare integer X*stride with no symbol/reloc.
+        if (!tryClassifyNullPointerConst(ixKids[0], env, opts)) return std::nullopt;
+        // Fold the index to an integer.
+        ConstEvalResult const ir =
+            evaluateConstant(hir, interner, literals, ixKids[1], env, opts);
+        if (!ir.value.has_value()) return std::nullopt;
+        std::int64_t idxVal = 0;
+        if (std::holds_alternative<std::int64_t>(ir.value->value))
+            idxVal = std::get<std::int64_t>(ir.value->value);
+        else if (std::holds_alternative<std::uint64_t>(ir.value->value))
+            idxVal = static_cast<std::int64_t>(
+                std::get<std::uint64_t>(ir.value->value));
+        else
+            return std::nullopt;
+        // Stride = sizeof(element). The Index node's type IS the element type
+        // (Subscript: type is the element type).
+        TypeId const elemTy = hir.typeId(idxNode);
+        auto const layout = computeLayout(elemTy, interner,
+                                          config.aggregateLayout, config.dataModel);
+        if (!layout) return std::nullopt;
+        std::uint64_t const value = static_cast<std::uint64_t>(idxVal)
+                                  * static_cast<std::uint64_t>(layout->size);
+        MirLiteralValue leaf;
+        leaf.value = value;
         leaf.core  = TypeKind::Ptr;
         return leaf;
     }

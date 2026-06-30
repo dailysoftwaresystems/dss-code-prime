@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-AGGREGATE-GLOBAL-NONSYMBOL-PTR-MEMBER (c68, 2026-06-30): the post-c67 sqlite re-probe took the aggregate-rvalue guard (D-CSUBSET-BITFIELD-RVALUE-RUNTIME) from 64->3 errors; the 3 survivors are sqlite's static FuncDef tables (aBuiltinFunc[]/aJsonFunc[]/aWindowFuncs[]) — aggregate globals with a member c67's tryClassifyAggregateConst could not fold. TWO fix-classes, both in src/mir/lowering/hir_to_mir.cpp: (A) a NULL-BASE array-element address constant `(void*)&((char*)0)[X]` (sqlite's SQLITE_INT_TO_PTR — stash int X in a void*) = the integer X*sizeof(elem) as a pointer, NO relocation. New helper tryClassifyNullBaseIndexConst (sibling of c67's tryClassifyNullPointerConst): peel ptr cast(s) -> AddressOf -> Index(nullBase, X); base MUST fold to null (conservative — `&realArray[i]` returns nullopt and stays fail-loud, no over-fire); value = X * computeLayout(elemType).size. The array-element sibling of c43's offsetof MEMBER folding which the CST const-eval punted to the HIR/global-init engine. (B) a bare Ref to a file-scope `char[]` global decays to &arr[0] — a SYMBOL address (addend 0, abs64 reloc): tryClassifyAsSymbolAddr's bare-Ref arm extended from functionSymbols to ALSO accept a global whose Ref type is Array (scalar-global Ref stays an rvalue load, rejected). With both members classified, the whole aggregate folds to static .data + relocs (c67's path). Runtime verifies: pUserData round-trips to 7/11/0, zName points at 'alpha'/'beta'/'gamma' -> 42. RED-ON-DISABLE: revert either fix -> the member fails to classify -> the aggregate falls to runtime-init -> H_UnsupportedLoweringForKind (the aggregate-rvalue guard at hir_to_mir.cpp ConstructAggregate arm). gcc/clang exit 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
