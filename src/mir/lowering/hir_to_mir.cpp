@@ -594,6 +594,36 @@ struct Lowerer {
                 std::uint32_t const sym = hir.payload(node);
                 if (auto it = addressableLocal.find(sym);
                     it != addressableLocal.end()) {
+                    // c63 (D-CSUBSET-ARRAY-DECAY-AT-CALL-ARG): an ARRAY rvalue
+                    // decays to the ADDRESS of its first element (C 6.3.2.1p3) — an
+                    // aggregate can never live in a register, so a bare `Ref` to an
+                    // array-typed addressable local must NEVER `Load`. Most array
+                    // rvalues reach MIR pre-decayed (CST→HIR `coerce()` inserts a
+                    // synthetic `Cast<Array→Ptr>` — the c59 `*(array+i)` /
+                    // string-literal-arg / `int a[5]; f(a)` paths), but when the
+                    // array type MATCHES the consuming context's type NO cast is
+                    // inserted (a SysV `va_list` `__va_list_tag[1]` arg forwarded to
+                    // a `va_list` PARAM — same Array type), so the bare `Ref` lands
+                    // here. Decay exactly as the `Cast<Array→Ptr>` arm does (a byte-
+                    // offset-0 `Gep` re-typing the base address to `Ptr<elem>` =
+                    // `&arr[0]`). `it->second` is already the array's ADDRESS — an
+                    // alloca `Ptr<Array>` for a body array, or (c63) the registered
+                    // incoming `Ptr<__va_list_tag>` for the forwarded va_list param;
+                    // the Gep(0) lands the correct `Ptr<elem>` value either way. The
+                    // decayed pointer rides a GPR (`scalarArgClass(Array)` → Gpr),
+                    // so the scalar call-arg accounting is unchanged.
+                    if (t.valid() && interner.kind(t) == TypeKind::Array) {
+                        auto const elems = interner.operands(t);
+                        if (elems.empty() || !elems[0].valid()) {
+                            unsupported(node,
+                                "array-typed Ref has no element type "
+                                "(interner invariant violated)");
+                            return InvalidMirInst;
+                        }
+                        TypeId const decayed = interner.pointer(elems[0]);
+                        std::array<MirInstId, 2> gep{it->second, constInt(0)};
+                        return mir.addInst(MirOpcode::Gep, gep, decayed);
+                    }
                     std::array<MirInstId, 1> ops{it->second};
                     // c21/c27: a Ref to a `volatile` address-taken local — its
                     // rvalue Load carries the flag. c21 via the node's VolatileAttr
@@ -3997,6 +4027,20 @@ struct Lowerer {
             if (auto s = refSymOf(target); s.has_value()) {
                 out.insert(*s);
             }
+        } else if (k == HirKind::VaArg || k == HirKind::VaStart
+                   || k == HirKind::VaEnd) {
+            // c63 (D-CSUBSET-VA-LIST-PARAM-SLOT): va_arg/va_start/va_end use the
+            // va_list as an LVALUE — the list is read AND ADVANCED in place — so a
+            // va_list PARAMETER must be slot-backed (a local va_list already is, via
+            // its VarDecl). kids[0] is the apExpr; mark it when it is a bare Ref.
+            // Drives the Win64/Apple `char*` va_list param onto the addressTaken
+            // scalar arm by USAGE (its Ptr<I8> type is indistinguishable from a plain
+            // char*); the SysV Array<__va_list_tag> param is intercepted earlier by a
+            // dedicated reception arm, so this mark is moot for it.
+            auto kids = hir.children(node);
+            if (!kids.empty()) {
+                if (auto s = refSymOf(kids[0]); s.has_value()) out.insert(*s);
+            }
         }
         for (HirNodeId child : hir.children(node)) {
             collectAddressTakenSymbols(child, out);
@@ -6555,6 +6599,27 @@ struct Lowerer {
         // function the per-class GPR ordinal equals the param index (no change); a
         // mixed int/float signature now lands each arg in its own class (fixes
         // D-ML7-2.10). `argCtr` is hoisted above (shared with the sret arg).
+        // c63 (D-CSUBSET-VA-LIST-PARAM-SLOT): is `t` a SysV `va_list` PARAM — an
+        // `__va_list_tag[1]` array (or, defensively, a Ptr<__va_list_tag>) — under the
+        // SysVRegisterSave strategy? Such a param's incoming GPR is a POINTER to the
+        // caller's tag (C 6.7.6.3p7 array-param adjustment); a dedicated arm below
+        // registers that pointer. Win64/Apple (`char*`) + AAPCS64 (`__va_list` struct)
+        // va_list params are NOT this — they ride the addressTaken-scalar / by-value-
+        // struct arms (the former marked address-taken by va_arg usage, since their
+        // Ptr<I8> type is indistinguishable from a plain char*).
+        auto isSysVVaListParam = [&](TypeId t) -> bool {
+            if (!config.vaListLayout.has_value()
+                || config.vaListLayout->strategy
+                       != VaListStrategy::SysVRegisterSave)
+                return false;
+            if (!t.valid()) return false;
+            TypeKind const tk = interner.kind(t);
+            if (tk != TypeKind::Array && tk != TypeKind::Ptr) return false;
+            auto const ops = interner.operands(t);
+            return !ops.empty() && ops[0].valid()
+                && interner.kind(ops[0]) == TypeKind::Struct
+                && interner.name(ops[0]) == "__va_list_tag";
+        };
         for (std::size_t i = 0; i < params.size(); ++i) {
             HirNodeId const p = params[i];
             // A param is a VarDecl whose typeId carries the param's type;
@@ -6597,6 +6662,28 @@ struct Lowerer {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
                 }
+                continue;
+            }
+            // c63 (D-CSUBSET-VA-LIST-PARAM-SLOT): a SysV `va_list` PARAMETER. By C
+            // 6.7.6.3p7 array-param adjustment the caller passes a POINTER to ITS OWN
+            // `__va_list_tag` in one GPR; `va_arg` must advance the CALLER's tag
+            // (forwarding semantics), so register that incoming pointer AS the symbol's
+            // address — NO alloca, NO 24-byte copy (a copy reads a stale tag = a silent
+            // miscompile). Mirrors receiveByValueParam's ByReference precedent ("the
+            // caller's copy is the param"). Consumes ONE GPR ordinal — exactly what the
+            // scalar arm would for this array-decayed pointer — so the remaining params'
+            // ordinals + the fixed-arg count stay correct. (Win64/Apple `char*` va_list
+            // params take the addressTaken-scalar arm below; AAPCS64 `__va_list` struct
+            // params took the by-value-struct arm above.)
+            if (isSysVVaListParam(ty)) {
+                auto const ops = interner.operands(ty);
+                MirInstId const ptr = mir.addArg(argCtr.next(AbiPieceClass::Gpr),
+                                                 interner.pointer(ops[0]));
+                if (!ptr.valid()) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+                addressableLocal[sym.v] = ptr;
                 continue;
             }
             // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG / fixes D-ML7-2.10): a scalar

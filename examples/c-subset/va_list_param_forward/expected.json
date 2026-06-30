@@ -1,0 +1,34 @@
+{
+  "$comment": "c63 (D-CSUBSET-VA-LIST-PARAM-SLOT): a `va_list ap` PARAMETER consumed by va_arg (the vprintf / sqlite3_str_vappendf shape) needs a storage slot — va_arg reads + ADVANCES the list (lvalue use). A va_list param was a pure-SSA Arg with no slot -> error[H0009]. FIX (per-strategy, config-driven): SysV registers the incoming caller-tag pointer as ap's address (forwarding, no copy); Win64/Apple slot-back the char* (driven address-taken by va_arg usage); AAPCS64 struct already worked. VALUE-CORRECT + SENSITIVE: sumv va_start's then FORWARDS its va_list to vsum; 10+11+12+9 = 42 (a broken forward would not give 42). RED-ON-DISABLE: revert -> H0009. Pure c-subset -> all 4 targets; pe RUNS on Windows, elf/arm64 RUN on linux/qemu (exercising SysV + AAPCS64 + Win64 va_list ABIs).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
