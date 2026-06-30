@@ -1206,6 +1206,22 @@ struct Lowerer {
             MirInstId intIdx = rhs;
             if (interner.kind(indexTy) != TypeKind::I64) {
                 MirOpcode const ext = mapCast(interner.kind(indexTy), TypeKind::I64);
+                // c65: a non-integer index kind (Array/Enum/…) has no widening
+                // cast → mapCast returns Invalid. FAIL LOUD here — passing Invalid
+                // to addInst std::abort()s the whole compiler (the c65 sqlite
+                // crash class: `p - arrayName`, now fixed at the HIR tier by array
+                // decay → ptrSub; an Enum index is the deferred
+                // D-CSUBSET-POINTER-ARITH-ENUM-INDEX). The pre-existing
+                // `.valid()` guard below runs AFTER addInst, i.e. too late.
+                if (ext == MirOpcode::Invalid) {
+                    unsupported(node, std::format(
+                        "pointer arithmetic: index TypeKind {} has no widening "
+                        "cast to a 64-bit offset (an array index must decay to a "
+                        "pointer difference; an enum index is deferred — "
+                        "D-CSUBSET-POINTER-ARITH-ENUM-INDEX)",
+                        static_cast<unsigned>(interner.kind(indexTy))));
+                    return InvalidMirInst;
+                }
                 std::array<MirInstId, 1> eo{rhs};
                 intIdx = mir.addInst(ext, eo, i64ty);
                 if (!intIdx.valid()) return InvalidMirInst;

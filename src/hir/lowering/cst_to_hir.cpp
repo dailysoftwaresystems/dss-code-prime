@@ -2436,20 +2436,55 @@ struct Lowerer {
         // (S_TypeMismatch — the sqlite `fmt - bufpt` blocker) and the MIR value
         // is the raw byte difference. The MIR tier (`combineBinaryOp`) reads this
         // I64 result type WITH Ptr operands as the signal to emit
-        // PtrToInt+Sub(+SDiv by sizeof(pointee)). Operands stay Ptr<T> (`common`
-        // was InvalidType so no coerce ran). SAME-pointee only: a mismatched
+        // PtrToInt+Sub(+SDiv by sizeof(pointee)). SAME-pointee only: a mismatched
         // `char* - int*` falls through to a Ptr-typed result — caught ONLY when
         // coerced to a numeric param (in a non-arg context like `(int)(a-b)` it
-        // is NOT diagnosed today); `p - arrayName` likewise misses (the array
-        // operand never decays to Ptr). Both are a deferred general fail-loud:
-        // D-CSUBSET-POINTER-DIFF-EDGE-CASES. `p ± n` (pointer ± integer → Ptr
-        // result) is a SEPARATE value-scaling fix (deferred c41 — keeps the Ptr
-        // type, only the VALUE scales).
+        // is NOT diagnosed today: D-CSUBSET-POINTER-DIFF-EDGE-CASES). `p ± n`
+        // (pointer ± integer → Ptr result) is the SEPARATE c41 value-scaling fix.
+        //
+        // c65 (D-CSUBSET-POINTER-DIFF-EDGE-CASES): `p - arrayName` — an ARRAY
+        // operand of pointer SUBTRACTION decays to Ptr<elem> (C 6.3.2.1p3) FIRST,
+        // so it is a true pointer DIFFERENCE `p - q` (ptrdiff_t), not the p±n
+        // index path. c59 deferred this (its array-decay fires only when the
+        // OTHER operand is a SCALAR index; here the other is a Ptr or Array).
+        // sqlite vdbeSorter `(u8)(pTask - pSorter->aTask)` (sqlite3.c:107252) —
+        // without it the un-decayed Array RHS made ptrIntArith true → the MIR
+        // `p±n` branch tried to widen the Array index via mapCast(Array,I64) →
+        // MirOpcode::Invalid → an addInst ABORT (a compiler crash). Covers
+        // `p-arr`, `arr-p`, `arr-arr`; `arr - scalarIndex` stays the c59
+        // `array - index` Ptr form (the other operand is a scalar, not Ptr/Array).
+        if (*op == HirOpKind::Sub) {
+            bool const lArr = lc.type.valid() && interner.kind(lc.type) == TypeKind::Array;
+            bool const rArr = rc.type.valid() && interner.kind(rc.type) == TypeKind::Array;
+            bool const lPtr = lc.type.valid() && interner.kind(lc.type) == TypeKind::Ptr;
+            bool const rPtr = rc.type.valid() && interner.kind(rc.type) == TypeKind::Ptr;
+            // Decay ONLY when the element/pointee types MATCH (a true pointer
+            // difference). A MISMATCHED pairing (`int* - char[]`, which gcc
+            // rejects) is left UN-decayed → it stays an Array index → the MIR p±n
+            // widen hits the c65 fail-loud guard (hir_to_mir.cpp:1208), so it
+            // fails LOUD (a clean diagnostic) rather than silently miscomputing
+            // the array's address as an index — WITHOUT this match-guard the
+            // decayed-but-mismatched `int* - char*` is non-ptrSub → it slips into
+            // the c41 p±n path (the audit's fail-loud-regression catch). The
+            // mismatched TWO-pointer `int* - char*` (no array) stays the
+            // pre-existing part-2 silent-accept (untouched here).
+            if ((lPtr && rArr) || (lArr && rPtr) || (lArr && rArr)) {
+                auto const lo = interner.operands(lc.type);
+                auto const ro = interner.operands(rc.type);
+                if (!lo.empty() && !ro.empty() && lo[0] == ro[0]) {
+                    if (lArr) lc = coerce(lc, interner.pointer(lo[0]));
+                    if (rArr) rc = coerce(rc, interner.pointer(ro[0]));
+                }
+            }
+        }
+        // ptrSub reads the (possibly array-decayed) lc/rc — identical to lhs/rhs
+        // for the plain `p - q` case (two pointers never coerce: `common` is
+        // Invalid), and now also true for the decayed `p - array`.
         bool const ptrSub =
-            *op == HirOpKind::Sub && lhs.type.valid() && rhs.type.valid()
-            && interner.kind(lhs.type) == TypeKind::Ptr
-            && interner.kind(rhs.type) == TypeKind::Ptr
-            && interner.operands(lhs.type)[0] == interner.operands(rhs.type)[0];
+            *op == HirOpKind::Sub && lc.type.valid() && rc.type.valid()
+            && interner.kind(lc.type) == TypeKind::Ptr
+            && interner.kind(rc.type) == TypeKind::Ptr
+            && interner.operands(lc.type)[0] == interner.operands(rc.type)[0];
         // c41 (D-CSUBSET-POINTER-INT-ARITHMETIC) C 6.5.6p8: `p + n` / `n + p` /
         // `p - n` (pointer ± integer → a Ptr). `n + p` is CANONICALIZED here
         // (swap lc/rc so the Ptr operand is ALWAYS kids[0]) → combineBinaryOp
