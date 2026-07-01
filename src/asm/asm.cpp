@@ -274,6 +274,16 @@ AssembledModule assemble(Lir const&                 lir,
             continue;  // skip patch resolution for this function
         }
 
+        // D-OPT-SWITCH-JUMP-TABLE (c70): publish the completed block-byte-offset
+        // table on the AssembledFunction. A dense `switch` lowers to a jump table
+        // whose `.data` slots hold the runtime addresses of the case-target blocks
+        // (abs64 relocations to synthetic per-block symbols). Those block symbols
+        // have no live block-address `lea`, so the BlockSymPatch loop below never
+        // binds them — `compile_pipeline.cpp` binds them directly from THIS map
+        // after assemble() returns. Copied once per function (cheap), only
+        // consumed when a jump-table descriptor names this function.
+        outFn.blockByteOffsets = blockOffsets;
+
         // D-CSUBSET-COMPUTED-GOTO: resolve each pending synthetic-symbol
         // ↔ block binding now that every block's byte offset is known.
         // Each binds a synthetic local symbol (the `&&label` block-address

@@ -9,8 +9,11 @@
 #include "lir/lir.hpp"
 #include "mir/mir.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 // MIR → LIR instruction selection (plan 12 ML5 cycle 3). Takes a frozen
@@ -55,9 +58,43 @@ namespace dss {
 // `LirVerifier` consumes this mapping to cross-reference LIR vreg
 // classes against MIR types WITHOUT the cycle-3e positional-alignment
 // hazard that silently skipped switch-bearing functions.
+// D-OPT-SWITCH-JUMP-TABLE (c70): one descriptor per DENSE `switch` the lowerer
+// turned into an O(1) jump table. The switch-site LIR (bounds check + indexed
+// load of a code address + indirect branch) is already emitted into the LIR; a
+// descriptor carries only what the assembler-adjacent pipeline needs to
+// MATERIALIZE the `.data` address table after `assemble()` has resolved each
+// block's byte offset. The table is `slotCount` 8-byte slots — one per value in
+// `[minCase, maxCase]` — each an abs64 relocation to the synthetic per-block
+// symbol of that value's target block (the default block for a gap). The block
+// symbols are minted by the SAME `mintBlockSymbol` sequence the computed-goto
+// `&&label` path uses (so they are unique module-wide and get an interior-block
+// VA via `link/format/interior_block_symbol_va.hpp`), but — unlike computed-goto
+// — no live block-address `lea` binds them, so the pipeline binds each directly
+// from the assembled function's `blockByteOffsets` map.
+struct DSS_EXPORT JumpTableDescriptor {
+    SymbolId    tableSymbol{};    // unique `.data` symbol for this table
+    std::size_t slotCount = 0;    // (maxCase - minCase + 1) 8-byte slots
+    std::size_t funcIndex = 0;    // index into lir.funcAt(i) of the owning function
+    // slot j (0-based, value == minCase + j) → the LIR block its code address
+    // occupies. Gaps carry the default block. Parallel to the emitted table's
+    // slots; the pipeline writes an abs64 reloc at byte (j * 8) targeting
+    // `blockSymbols[lirBlock.v]`.
+    std::vector<std::pair<std::uint32_t /*lirBlock.v*/, std::size_t /*slotIndex*/>>
+        slotBindings;
+    // Each distinct target LIR block (`lirBlock.v`) → its synthetic per-block
+    // SymbolId (minted via mintBlockSymbol; deduped by the MIR block id, so
+    // duplicate case targets and every gap-to-default share one symbol).
+    std::unordered_map<std::uint32_t, SymbolId> blockSymbols;
+};
+
 struct DSS_EXPORT MirToLirResult {
     Lir                    lir;
     std::vector<MirInstId> lirToMir;
+    // D-OPT-SWITCH-JUMP-TABLE (c70): one descriptor per dense `switch` lowered to
+    // a jump table. Consumed by `compile_pipeline.cpp` AFTER `assemble()` to emit
+    // each table's `.data` `AssembledData` (abs64 relocs to block symbols) and to
+    // bind those block symbols from the assembled function's `blockByteOffsets`.
+    std::vector<JumpTableDescriptor> jumpTableDescriptors;
     // Extern symbol descriptors propagated from `HirToMirResult.
     // externImports` (LK6 cycle 2d — D-LK6-6 closure). LIR does
     // not consume these structurally (call sites carry SymbolRef

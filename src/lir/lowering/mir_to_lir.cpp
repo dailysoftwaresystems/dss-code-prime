@@ -556,6 +556,42 @@ struct Lowerer {
         return sym;
     }
 
+    // D-OPT-SWITCH-JUMP-TABLE (c70): the jump-table lowerer's state.
+    //   * `jumpTableDescriptors_` accumulates one descriptor per dense switch;
+    //     `run()` moves it into the result for `compile_pipeline.cpp` to consume.
+    //   * `currentFuncIndex_` is the index of the function currently being
+    //     lowered (== the LIR `funcAt(i)` index, since `run()` lowers functions
+    //     in module order) — recorded on each descriptor so the pipeline can
+    //     find the right `AssembledFunction` to bind block symbols into.
+    std::vector<JumpTableDescriptor> jumpTableDescriptors_;
+    std::uint32_t                    currentFuncIndex_ = 0;
+
+    // Mint a fresh synthetic SymbolId for a jump table's `.data` item. Draws
+    // from the SAME monotone `nextBlockSym_` sequence `mintBlockSymbol` uses, so
+    // a table symbol can never collide with a block symbol (or a user / extern
+    // symbol — the shared lazy seed sits past every function/global/extern id).
+    // Not deduped (each dense switch gets its own table).
+    [[nodiscard]] SymbolId mintJumpTableSymbol() {
+        if (!nextBlockSym_.has_value()) {
+            std::uint32_t maxV = 0;
+            for (std::uint32_t fi = 0; fi < mir.moduleFuncCount(); ++fi) {
+                if (std::uint32_t const v = mir.funcSymbol(mir.funcAt(fi)).v; v > maxV) {
+                    maxV = v;
+                }
+            }
+            for (std::uint32_t gi = 0; gi < mir.moduleGlobalCount(); ++gi) {
+                if (std::uint32_t const v = mir.globalSymbol(mir.globalAt(gi)).v; v > maxV) {
+                    maxV = v;
+                }
+            }
+            for (std::uint32_t const ev : externSymbols) {
+                if (ev > maxV) maxV = ev;
+            }
+            nextBlockSym_ = maxV + 1u;
+        }
+        return SymbolId{(*nextBlockSym_)++};
+    }
+
     // Whether the running lowering pass added any error-severity
     // diagnostics. Mirrors ML2's delta-on-errorCount; reset by the ctor.
     std::uint32_t baselineErrors = 0;
@@ -1646,6 +1682,94 @@ struct Lowerer {
         emitInst(*movOp, result, ops, /*payload=*/0, flags);
         defineValue(id, result);
         return result;
+    }
+
+    // D-OPT-SWITCH-JUMP-TABLE (c70): materialize a full 64-bit integer constant
+    // into a FRESH GPR vreg with NO MIR-value binding (`emitMovToFresh` /
+    // `materializeInlineIntConst` bind to a MirInstId; the jump-table lowering
+    // needs synthetic scratch constants — the `* 8` slot-scale multiplier, and a
+    // wide `minCase` / `span-1` bound that does not fit the target's `cmp`/`sub`
+    // immediate — that have no MIR value). Emits a single `mov reg, imm32` when
+    // the value fits a mov-immediate; otherwise (a value needing higher 16-bit
+    // chunks on arm64) the MOVZ+MOVK ladder, the SAME minimal-chain logic as
+    // `materializeInlineIntConst`, so a wide bound is arch-correct on arm64 (x86
+    // takes the single mov-imm64 form). Returns nullopt (with a fail-loud
+    // diagnostic) if a required opcode is undeclared.
+    [[nodiscard]] std::optional<LirReg>
+    emitBareConstToFresh(std::int64_t value) {
+        auto const movOp = classOp(LirRegClass::GPR, RegClassOp::Move);
+        if (!movOp.has_value()) {
+            reportMissingClassOp(LirRegClass::GPR, RegClassOp::Move,
+                                 "jump-table scratch constant");
+            return std::nullopt;
+        }
+        std::uint64_t const pattern = static_cast<std::uint64_t>(value);
+        std::array<std::uint16_t, 4> chunks{};
+        for (std::size_t k = 0; k < 4; ++k) {
+            chunks[k] = static_cast<std::uint16_t>(pattern >> (16 * k));
+        }
+        bool needsChain = false;
+        for (std::size_t k = 1; k < 4; ++k) {
+            if (chunks[k] != 0) { needsChain = true; break; }
+        }
+        // Single mov-imm covers the whole value on x86 (imm64 form) and any value
+        // whose high 48 bits are zero on arm64 (a plain MOVZ). A signed value with
+        // sign bits set in the upper chunks (e.g. a small negative) also takes the
+        // single-mov path on x86; arm64 requires the ladder only for a genuinely
+        // wide MAGNITUDE — the callers here pass a non-negative bound in
+        // [0, 2^20-1] (span-1) or a signed minCase in i32 range, both of which the
+        // single mov handles on x86, and on arm64 the ladder handles the >16-bit
+        // magnitudes.
+        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        if (!needsChain || !targetHasMovkLadder()) {
+            std::array<LirOperand, 1> ops{
+                LirOperand::makeImmInt32(static_cast<std::int32_t>(value))};
+            emitInst(*movOp, result, ops);   // 64-bit (default width)
+            return result;
+        }
+        // arm64 MOVZ + MOVK ladder: seed chunk0 (MOVZ zeroes the register), then
+        // one MOVK per nonzero higher chunk. MOVK is `requires2Address` (it MERGES
+        // a 16-bit chunk into the EXISTING register), so each MOVK carries the
+        // register as its FIRST operand + the immediate as its second, writing
+        // back into the SAME register — the exact operand shape
+        // `materializeViaMovkLadder` uses. (A negative value fills all high chunks
+        // with 0xFFFF → the full 4-op ladder, matching `materializeInlineIntConst`.)
+        static constexpr std::array<MnemonicSlot, 3> kMovkSlots{
+            MnemonicSlot::MovkLsl16, MnemonicSlot::MovkLsl32,
+            MnemonicSlot::MovkLsl48};
+        {
+            std::array<LirOperand, 1> ops{
+                LirOperand::makeImmInt32(static_cast<std::int32_t>(chunks[0]))};
+            emitInst(*movOp, result, ops);
+        }
+        for (std::size_t k = 1; k < 4; ++k) {
+            if (chunks[k] == 0) continue;
+            auto const slotOp = opcode(kMovkSlots[k - 1]);
+            if (!slotOp.has_value()) {
+                reportMissingOpcode(kMovkSlots[k - 1], "jump-table wide constant");
+                return std::nullopt;
+            }
+            std::array<LirOperand, 2> ops{
+                LirOperand::makeReg(result),
+                LirOperand::makeImmInt32(static_cast<std::int32_t>(chunks[k]))};
+            emitInst(*slotOp, result, ops, /*payload=*/0);
+        }
+        return result;
+    }
+
+    // Build an ALU-op operand for a constant that is either an in-window immediate
+    // (arm64 `imm12`, unsigned 0..4095 — the tightest across the targets) or a
+    // register-materialized value (for a wider or negative constant). Returns
+    // nullopt on a materialization failure. Used by the jump-table bounds
+    // sub/cmp so a large `minCase` / `span-1` stays arch-correct on arm64.
+    [[nodiscard]] std::optional<LirOperand>
+    aluImmOrReg(std::int64_t value) {
+        if (value >= 0 && value <= 4095) {
+            return LirOperand::makeImmInt32(static_cast<std::int32_t>(value));
+        }
+        std::optional<LirReg> const r = emitBareConstToFresh(value);
+        if (!r.has_value()) return std::nullopt;
+        return LirOperand::makeReg(*r);
     }
 
     // Define a poisoned-value vreg + return false so the caller can
@@ -4039,6 +4163,309 @@ struct Lowerer {
         return true;
     }
 
+    // D-OPT-SWITCH-JUMP-TABLE (c70): the jump-table density heuristic.
+    //   * A dense switch is one whose value SPAN (maxCase-minCase+1) is at most
+    //     `kJumpTableDensityFactor` times its case COUNT — i.e. at most that many
+    //     table slots per real case (gap slots point at the default block). 3 is
+    //     a middle ground: tighter than a pure "any range" table (which could
+    //     waste memory on a `case 0; case 1000000;` pair) yet loose enough that
+    //     real dispatch tables with a scattering of gaps (sqlite's VDBE has a few)
+    //     still qualify. gcc/clang use ~1.5–2; 3 leans slightly toward tables,
+    //     which is safe here because a gap costs only 8 idle `.data` bytes, never
+    //     an instruction on the hot path.
+    //   * `kJumpTableMinCases` keeps tiny switches (< 8 cases) on the cheap
+    //     immediate-compare chain, where a table's fixed overhead (a `.data`
+    //     item + bounds check + two `lea`s + a load + an indirect branch)
+    //     outweighs the O(1) benefit.
+    //   * `kJumpTableMaxSlots` is a hard cap so a pathological but "dense-ratio"
+    //     range (e.g. millions of cases) can't request an enormous table.
+    // RED-ON-DISABLE: raise `kJumpTableMinCases` past any real case count (e.g.
+    // to SIZE_MAX) to force EVERY switch down the immediate-compare chain — that
+    // proves the sparse path alone also fixes the register pressure, and,
+    // combined with reverting the immediate-compare change, reproduces the
+    // original scratch-pool exhaustion.
+    static constexpr std::size_t kJumpTableMinCases      = 8;
+    static constexpr std::uint64_t kJumpTableDensityFactor = 3;
+    static constexpr std::uint64_t kJumpTableMaxSlots    = 1u << 20;  // 1M slots (8 MiB)
+
+    // Attempt the dense jump-table lowering of a MIR Switch. Returns true iff it
+    // took the table path (and fully emitted the switch); false means the caller
+    // must fall through to the compare chain (not dense / a non-constant case /
+    // a missing opcode / a range too wide). Emits NO diagnostics on a false
+    // return — a fall-through is not an error.
+    //
+    // MIR Switch convention: operands = [discriminant, caseConst*N]; successors =
+    // [caseTarget*N, default]. The emitted shape (arch-blind — every opcode ships
+    // on x86_64 AND arm64) is:
+    //
+    //   ; in the switch-bearing header block (phi moves already emitted here):
+    //   idx    = discrim - minCase            ; sub, at the discriminant width
+    //   cmp idx, (span-1)                      ; UNSIGNED compare
+    //   jcc(Ugt) default, bodyBlock            ; one unsigned test covers BOTH
+    //                                          ;   idx<0 (wraps huge) and idx>max
+    //   ; bodyBlock:
+    //   idx64  = (s/z)ext idx                  ; widen to a 64-bit address index
+    //   off    = idx64 << 3                    ; scale by slot size (8)
+    //   base   = lea [jumpTableSymbol]         ; table base address
+    //   addr   = lea [base + off]              ; &table[idx]
+    //   target = load [addr]                   ; the case block's runtime address
+    //   jmp *target  (succs = all distinct case blocks + default)
+    //
+    // The `.data` table itself (span 8-byte slots, each an abs64 reloc to a
+    // synthetic per-block symbol) is NOT emitted here — a JumpTableDescriptor is
+    // recorded and `compile_pipeline.cpp` materializes the AssembledData after
+    // `assemble()` resolves block byte offsets. See JumpTableDescriptor.
+    bool tryLowerSwitchJumpTable(MirInstId id,
+                                 std::span<MirInstId const> operands,
+                                 std::span<MirBlockId const> succs,
+                                 std::size_t caseCount) {
+        if (caseCount < kJumpTableMinCases) return false;
+
+        // Every case value must be a fold-constant (a C case label is an integer
+        // constant expression — this always holds; a non-constant is malformed
+        // MIR and we simply decline the table, letting the compare chain report).
+        // Collect (value → case index) and min/max in one pass.
+        std::vector<std::int64_t> caseValues;
+        caseValues.reserve(caseCount);
+        std::int64_t minCase = std::numeric_limits<std::int64_t>::max();
+        std::int64_t maxCase = std::numeric_limits<std::int64_t>::min();
+        for (std::size_t i = 0; i < caseCount; ++i) {
+            std::optional<std::int64_t> const v = constIntegerValue(operands[1 + i]);
+            if (!v.has_value()) return false;
+            caseValues.push_back(*v);
+            if (*v < minCase) minCase = *v;
+            if (*v > maxCase) maxCase = *v;
+        }
+
+        // Span = maxCase - minCase + 1, computed WIDE to dodge signed overflow
+        // (e.g. minCase INT64_MIN, maxCase INT64_MAX). The unsigned difference of
+        // two int64s is exact; +1 is the slot count.
+        std::uint64_t const spanMinusOne =
+            static_cast<std::uint64_t>(maxCase) - static_cast<std::uint64_t>(minCase);
+        if (spanMinusOne == std::numeric_limits<std::uint64_t>::max()) {
+            return false;  // span+1 would overflow — decline (compare chain).
+        }
+        std::uint64_t const span = spanMinusOne + 1;
+        if (span > kJumpTableMaxSlots) return false;               // absurdly wide
+        if (span > kJumpTableDensityFactor * caseCount) return false;  // too sparse
+        // minCase must fit i32 so `idx = discrim - minCase` and the bounds `cmp`
+        // stay clean immediate forms. True for every C `int`/`enum` discriminant
+        // (case labels are `int`); a huge-negative label on a 64-bit discriminant
+        // is declined to the compare chain (its register fallback handles it).
+        if (minCase < std::numeric_limits<std::int32_t>::min()
+            || minCase > std::numeric_limits<std::int32_t>::max()) {
+            return false;
+        }
+
+        // All opcodes the table shape needs — decline (fall to compare chain) if
+        // any is absent for this target rather than emitting a half-formed table.
+        auto const subOp  = opcode(MnemonicSlot::Sub);
+        auto const mulOp  = opcode(MnemonicSlot::Mul);
+        auto const leaOp  = opcode(MnemonicSlot::Lea);
+        auto const jmpInd = opcode(MnemonicSlot::JmpIndirect);
+        auto const loadOp = classOp(LirRegClass::GPR, RegClassOp::Load);
+        if (!subOp.has_value() || !mulOp.has_value() || !leaOp.has_value()
+            || !jmpInd.has_value() || !loadOp.has_value()
+            || !opcode(MnemonicSlot::Cmp).has_value()
+            || !opcode(MnemonicSlot::Jcc).has_value()) {
+            return false;
+        }
+        // The index widen needs SExt (the discriminant is a signed C `int`; the
+        // bounded index is non-negative after the bounds check, so a zero-extend
+        // would be equally correct, but SExt matches the source-signedness rule).
+        // Classify the discriminant width/signedness to pick the widen: an
+        // already-64-bit discriminant needs none; a signed sub-64 one SExt's; an
+        // unsigned sub-64 one ZExt's (mirrors the c42 GEP-index widen rule so an
+        // `unsigned`/`unsigned short`/`unsigned char` discriminant with the high
+        // bit set is NOT mis-sign-extended).
+        std::optional<MnemonicSlot> discrimWidenSlot;
+        switch (interner.kind(mir.instType(operands[0]))) {
+            case TypeKind::I64: case TypeKind::U64: case TypeKind::Ptr:
+                break;  // already 64-bit
+            case TypeKind::U8: case TypeKind::U16: case TypeKind::U32:
+                discrimWidenSlot = MnemonicSlot::ZExt;
+                break;
+            case TypeKind::Char: case TypeKind::I8:
+            case TypeKind::I16:  case TypeKind::I32:
+                discrimWidenSlot = MnemonicSlot::SExt;
+                break;
+            default:
+                return false;  // a non-integer discriminant is not a C switch shape
+        }
+        if (discrimWidenSlot.has_value()
+            && !opcode(*discrimWidenSlot).has_value()) {
+            return false;
+        }
+
+        // Every target block (case + default) must have a LIR block.
+        for (std::size_t i = 0; i < caseCount; ++i) {
+            if (!mirBlockToLirBlock.has(succs[i])) return false;
+        }
+        MirBlockId const defaultMir = succs[caseCount];  // already checked by caller
+
+        std::optional<LirReg> const discrim = regForValue(operands[0]);
+        if (!discrim.has_value()) return false;
+
+        std::uint8_t const discrimWidth = widthFlagsForType(mir.instType(operands[0]));
+
+        // ── Bounds check, emitted into the still-open switch-bearing (header)
+        //    block so the phi-edge moves already emitted there keep dominating
+        //    every target (identical discipline to the compare chain). ──────────
+        LirBlockId const header = lir.openBlock();
+
+        // WIDEN the discriminant to a full 64-bit register FIRST, then do the
+        // index arithmetic + bounds test + address scale all at 64-bit. Two
+        // reasons: (1) c42 D-CSUBSET-INDEX-NEGATIVE-WIDEN — a sub-64-bit value fed
+        // into the 64-bit address read leaves the upper half garbage; sign-
+        // extending up front makes `discrim - minCase` correct in 64 bits for a
+        // negative discriminant / negative minCase. (2) Arch-uniformity — arm64's
+        // `sub reg, imm32` variant is 64-bit-only (no width-32 imm sub), so a
+        // 32-bit immediate index-sub would fail to encode; at 64-bit it matches on
+        // both ISAs. A signed C `int` discriminant is SExt'd, an unsigned one
+        // ZExt'd (discrimWidenSlot); an already-64-bit discriminant is used as-is.
+        LirReg discrim64 = *discrim;
+        if (discrimWidenSlot.has_value()) {
+            LirReg const widened = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 1> wOps{LirOperand::makeReg(*discrim)};
+            emitInst(*opcode(*discrimWidenSlot), widened, wOps, /*payload=*/0,
+                     discrimWidth);
+            discrim64 = widened;
+        }
+
+        // idx = discrim64 - minCase, at 64-bit width. minCase is an immediate when
+        // it fits the arch-blind window [0, 4095]; a wider or negative minCase is
+        // register-materialized first (arm64's `sub`-imm is a non-negative imm12).
+        LirReg const idxReg = lir.newVReg(LirRegClass::GPR);
+        {
+            std::optional<LirOperand> const minOperand = aluImmOrReg(minCase);
+            if (!minOperand.has_value()) return false;
+            std::array<LirOperand, 2> subOps{
+                LirOperand::makeReg(discrim64), *minOperand};
+            emitInst(*subOp, idxReg, subOps);   // 64-bit (default width)
+        }
+
+        // cmp idx, (span-1) ; jcc(Ugt) default, body  — ONE unsigned test at
+        // 64-bit. A negative idx (discrim below min) wraps to a huge u64 > span-1;
+        // an idx above max is directly > span-1 — one branch covers both. `span-1`
+        // is an immediate when it fits [0, 4095]; a wider span (up to 2^20-1) is
+        // register-materialized first so the `cmp` stays encodable on arm64.
+        {
+            std::optional<LirOperand> const spanOperand =
+                aluImmOrReg(static_cast<std::int64_t>(spanMinusOne));
+            if (!spanOperand.has_value()) return false;
+            std::array<LirOperand, 2> cmpOps{
+                LirOperand::makeReg(idxReg), *spanOperand};
+            emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps);  // 64-bit
+        }
+        LirBlockId const body        = lir.createBlock();
+        LirBlockId const defaultLir  = mirBlockToLirBlock.get(defaultMir);
+        {
+            std::uint32_t const ugtCond =
+                static_cast<std::uint32_t>(TargetCondCode::Ugt);
+            std::array<LirOperand, 2> jccOps{
+                LirOperand::makeBlockRef(defaultLir.v),
+                LirOperand::makeBlockRef(body.v)};
+            emitCondBr(*opcode(MnemonicSlot::Jcc), jccOps, defaultLir, body, ugtCond);
+        }
+
+        // ── Body block: scale, load the code address, indirect-jump. `idxReg` is
+        //    already a full 64-bit non-negative index here (bounded to
+        //    [0, span-1]), so no further widen is needed. ────────────────────────
+        lir.beginBlock(body);
+        LirReg const idx64 = idxReg;
+
+        // off = idx64 * 8  (scale by the 8-byte slot size; the 4-op `lea`'s index
+        // is a raw byte offset — scale=1 — on both ISAs, so pre-scale here,
+        // exactly as the GEP path pre-scales an array index). Scaling uses `mul`
+        // by a materialized-8 register, NOT a shift: the shift opcodes are NOT
+        // shape-uniform across ISAs (x86 `shl` takes an imm8 or the implicit CL
+        // count; arm64 `shl`/LSL takes a reg count) — `mul reg,reg` is the plain
+        // 3-address form BOTH ISAs declare identically, keeping this lowering
+        // arch-blind with no capability branch.
+        std::optional<LirReg> const eightReg = emitBareConstToFresh(8);
+        if (!eightReg.has_value()) return false;
+        LirReg const offReg = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 2> mulOps{
+                LirOperand::makeReg(idx64), LirOperand::makeReg(*eightReg)};
+            emitInst(*mulOp, offReg, mulOps);   // 64-bit multiply (default width)
+        }
+
+        // base = lea [jumpTableSymbol]  — 1-op SymbolRef form (like lowerGlobalAddr).
+        SymbolId const tableSym = mintJumpTableSymbol();
+        LirReg const baseReg = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 1> baseOps{LirOperand::makeSymbolRef(tableSym.v)};
+            emitInst(*leaOp, baseReg, baseOps);
+        }
+
+        // addr = lea [base + off]  — 4-op indexed form (scale 1, disp 0).
+        LirReg const addrReg = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 4> addrOps{
+                LirOperand::makeReg(baseReg),
+                LirOperand::makeReg(offReg),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(0)};
+            emitInst(*leaOp, addrReg, addrOps);
+        }
+
+        // target = load [addr]  — 3-op load form, 64-bit (a code address).
+        LirReg const targetReg = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 3> ldOps{
+                LirOperand::makeReg(addrReg),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(0)};
+            emitInst(*loadOp, targetReg, ldOps);   // default (64-bit) width
+        }
+
+        // jmp *target — successors = every DISTINCT case block + default (the
+        // computed-goto contract: all possible destinations are declared so the
+        // CFG / DCE / regalloc see them). Dedup by LIR block id.
+        std::vector<LirBlockId> indSuccs;
+        {
+            std::unordered_set<std::uint32_t> seen;
+            auto addSucc = [&](LirBlockId b) {
+                if (seen.insert(b.v).second) indSuccs.push_back(b);
+            };
+            for (std::size_t i = 0; i < caseCount; ++i) {
+                addSucc(mirBlockToLirBlock.get(succs[i]));
+            }
+            addSucc(defaultLir);
+        }
+        {
+            std::array<LirOperand, 1> jOps{LirOperand::makeReg(targetReg)};
+            emitIndirectBr(*jmpInd, jOps, indSuccs);
+        }
+
+        // ── Build the descriptor: one slot per value in [minCase, maxCase]. ────
+        JumpTableDescriptor desc;
+        desc.tableSymbol = tableSym;
+        desc.slotCount   = static_cast<std::size_t>(span);
+        desc.funcIndex   = currentFuncIndex_;
+        // value → case index (last-writer-wins is irrelevant — case labels are
+        // unique per C 6.8.4.2; a duplicate would already be an HIR error).
+        std::unordered_map<std::int64_t, std::size_t> valueToCase;
+        valueToCase.reserve(caseCount);
+        for (std::size_t i = 0; i < caseCount; ++i) valueToCase.emplace(caseValues[i], i);
+        desc.slotBindings.reserve(desc.slotCount);
+        for (std::size_t j = 0; j < desc.slotCount; ++j) {
+            std::int64_t const value = minCase + static_cast<std::int64_t>(j);
+            MirBlockId targetMir = defaultMir;
+            if (auto it = valueToCase.find(value); it != valueToCase.end()) {
+                targetMir = succs[it->second];
+            }
+            LirBlockId const lirBlock = mirBlockToLirBlock.get(targetMir);
+            // Mint (dedup by MIR block) the synthetic per-block symbol.
+            SymbolId const blkSym = mintBlockSymbol(targetMir);
+            desc.blockSymbols[lirBlock.v] = blkSym;
+            desc.slotBindings.emplace_back(lirBlock.v, j);
+        }
+        jumpTableDescriptors_.push_back(std::move(desc));
+        return true;
+    }
+
     // Cascading-compare lowering of MIR Switch. Operands: [discriminant,
     // case_const_0, case_const_1, ...]. Successors: [case_target_0, ...,
     // case_target_{N-1}, default_target].
@@ -4084,6 +4511,22 @@ struct Lowerer {
             return false;
         }
 
+        // D-OPT-SWITCH-JUMP-TABLE (c70): a DENSE switch lowers to an O(1) jump
+        // table (bounds check + indexed load of a code address + indirect
+        // branch) instead of the O(n) compare chain below. This is BOTH the
+        // register-pressure cure (no per-case anything) AND the run-time speed
+        // sqlite's per-bytecode VDBE dispatch needs. `tryLowerSwitchJumpTable`
+        // returns true iff it took the table path (dense enough + every case a
+        // fitting constant + no missing opcode); otherwise the compare chain
+        // below runs unchanged (now with immediate compares). Attempted BEFORE
+        // the `switchHeader` pin / any compare block is created — the table path
+        // emits its FIRST instruction (the bounds-check sub) into the still-open
+        // switch-bearing block, preserving the phi-move dominance the compare
+        // chain also relies on.
+        if (tryLowerSwitchJumpTable(id, operands, succs, caseCount)) {
+            return true;
+        }
+
         // Pin the implicit invariant that the FIRST compare AND its
         // paired jcc both land in the switch-bearing block that was
         // open when `lowerSwitch` was called. A future refactor that
@@ -4099,11 +4542,40 @@ struct Lowerer {
         // freshly-allocated "next-compare" blocks that we register on the
         // open function.
         for (std::size_t i = 0; i < caseCount; ++i) {
-            std::optional<LirReg> const caseConst = regForValue(operands[1 + i]);
-            if (!caseConst.has_value()) return false;
             if (!mirBlockToLirBlock.has(succs[i])) {
                 reportUnsupported(MirOpcode::Switch, id);
                 return false;
+            }
+            // D-OPT-SWITCH-JUMP-TABLE (c70): the case constant is compared as an
+            // IMMEDIATE (`cmp discrim, imm32`) rather than materialized into a
+            // live register. The pre-c70 shape allocated a vreg per case via
+            // `regForValue(operands[1+i])`; for a large switch those N case-const
+            // vregs were ALL live across the compare chain (each read at its own
+            // cmp) → the regalloc drowned (L_VirtualRegInPostRegalloc, the sqlite
+            // ~348-case VDBE switch, 286 spills). An immediate carries no vreg, so
+            // the chain's register footprint is O(1). A value that does NOT fit
+            // the CONSERVATIVE ARCH-BLIND immediate window [0, 4095] FALLS BACK to
+            // register materialization (correct on every target, re-incurring a
+            // single vreg for that one case). The window is arm64's `cmp` `imm12`
+            // (unsigned 12-bit, 0..4095) — the TIGHTEST `cmp`-immediate reach
+            // across the targets (x86 `cmp reg, imm32` is far wider; arm64 has no
+            // negative `cmp`-imm form here). Small non-negative case labels (the
+            // overwhelming majority — enum/opcode dispatch) take the immediate
+            // form; wide or negative labels take the register fallback. Case
+            // labels are integer constant expressions (C 6.8.4.2), so
+            // `constIntegerValue` folds every one — a non-constant case operand is
+            // malformed MIR and fails loud.
+            std::optional<std::int64_t> const caseVal =
+                constIntegerValue(operands[1 + i]);
+            LirOperand caseOperand;
+            if (caseVal.has_value() && *caseVal >= 0 && *caseVal <= 4095) {
+                caseOperand = LirOperand::makeImmInt32(
+                    static_cast<std::int32_t>(*caseVal));
+            } else {
+                std::optional<LirReg> const caseConst =
+                    regForValue(operands[1 + i]);
+                if (!caseConst.has_value()) return false;
+                caseOperand = LirOperand::makeReg(*caseConst);
             }
             // First-iteration pre-cmp pin: the open block must still
             // be `switchHeader` when the first compare emits.
@@ -4112,7 +4584,7 @@ struct Lowerer {
                 return false;
             }
             std::array<LirOperand, 2> cmpOps{
-                LirOperand::makeReg(*discrim), LirOperand::makeReg(*caseConst)};
+                LirOperand::makeReg(*discrim), caseOperand};
             // FC3 c2: the cascade compares follow the DISCRIMINANT's
             // type width (D-CSUBSET-32BIT-ALU-FORMS).
             emitInst(*opcode(MnemonicSlot::Cmp), InvalidLirReg, cmpOps,
@@ -4396,6 +4868,11 @@ struct Lowerer {
     [[nodiscard]] MirToLirResult run() {
         std::size_t const fnCount = mir.moduleFuncCount();
         for (std::uint32_t i = 0; i < fnCount; ++i) {
+            // D-OPT-SWITCH-JUMP-TABLE (c70): `lir.addFunction` runs in this same
+            // order inside `lowerFunction`, so the LIR `funcAt(i)` index equals
+            // this loop index — record it for any jump-table descriptor emitted
+            // while lowering this function.
+            currentFuncIndex_ = i;
             lowerFunction(mir.funcAt(i));
         }
         Lir frozen = std::move(lir).finish();
@@ -4409,10 +4886,11 @@ struct Lowerer {
         // `externImports`. (code-simplifier + code-reviewer fold,
         // LK6 cycle 2d post-fold review.)
         return MirToLirResult{
-            .lir           = std::move(frozen),
-            .lirToMir      = std::move(lirToMir),
-            .externImports = {},
-            .ok            = !hadError()
+            .lir                  = std::move(frozen),
+            .lirToMir             = std::move(lirToMir),
+            .jumpTableDescriptors = std::move(jumpTableDescriptors_),
+            .externImports        = {},
+            .ok                   = !hadError()
         };
     }
 };

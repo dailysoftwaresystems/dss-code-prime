@@ -19,6 +19,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // Assembler — plan 13 AS1.
@@ -134,6 +135,24 @@ struct DSS_EXPORT AssembledFunction {
     // `link/format/interior_block_symbol_va.hpp`). Empty for every
     // function that takes no block address.
     std::vector<SyntheticBlockSymbol> blockSymbols;
+
+    // D-OPT-SWITCH-JUMP-TABLE (c70): this function's block-byte-offset table —
+    // each LirBlockId.v mapped to its byte offset within `bytes`. Populated by
+    // `assemble()` from the SAME `blockOffsets` map it builds for intra-function
+    // branch patching. A dense `switch` lowers to an O(1) jump table whose
+    // rodata-style `.data` slots hold the runtime addresses of the case-target
+    // blocks (via abs64 relocations to synthetic per-block symbols). Those block
+    // symbols have NO live block-address `lea` instruction (the table is one
+    // indexed load, not a `lea` per target), so the usual `BlockSymPatch` →
+    // `blockSymbols` binding never fires for them. `compile_pipeline.cpp` instead
+    // binds each jump-table target block's symbol directly from THIS map (the
+    // byte offset the linker needs to compute the interior-block VA) and appends
+    // the resulting `SyntheticBlockSymbol` to `blockSymbols` above. Empty for
+    // every function that contains no jump table (this map is populated
+    // unconditionally but only consumed when a jump-table descriptor names this
+    // function — a per-function map copy done once at assemble time, never per
+    // instruction).
+    std::unordered_map<std::uint32_t, std::uint32_t> blockByteOffsets;
 };
 
 // One assembled data item — bytes + symbol identity, destined for a

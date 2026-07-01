@@ -90,7 +90,17 @@ void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const 
         MirOpcodeInfo const& info = opcodeInfo(op);
         if (op != MirOpcode::Phi) {
             auto operands = mir_.instOperands(id);
-            if (operands.size() < info.minOperands || operands.size() > info.maxOperands) {
+            // c70 (D-MIR-VERIFIER-UNBOUNDED-OPERAND-SENTINEL): a VARIADIC-operand
+            // opcode declares `maxOperands == kMirUnboundedOperands` (0xFF); the
+            // upper bound does NOT apply to it — mirror the builder's exemption
+            // (mir.cpp addInst: `maxOperands != kMirUnboundedOperands && count >
+            // maxOperands`). Without this the verifier read the 0xFF sentinel as a
+            // literal max of 255 and rejected a legitimately-variadic Switch/
+            // IndirectBr with >255 operands (sqlite has a switch with ~348 cases →
+            // 349 operands) that the builder had already accepted.
+            bool const overMax = info.maxOperands != kMirUnboundedOperands
+                                 && operands.size() > info.maxOperands;
+            if (operands.size() < info.minOperands || overMax) {
                 reportInst(reporter, DiagnosticCode::I_VerifierFailure, id,
                     std::format("opcode {} operand count {} outside [{}, {}]",
                         info.mnemonic, operands.size(),

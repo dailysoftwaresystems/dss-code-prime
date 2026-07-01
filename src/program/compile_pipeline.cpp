@@ -29,6 +29,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 // Plan 14 LK10 cycle 2 — driver pipeline kernel.
@@ -578,6 +579,88 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         return std::nullopt;
     }
     assembled.dataItems = std::move(dataItems);
+
+    // D-OPT-SWITCH-JUMP-TABLE (c70): materialize each dense switch's `.data`
+    // address table from the descriptors the LIR lowerer emitted. Runs AFTER
+    // assemble() because it reads each owning AssembledFunction's blockByteOffsets
+    // (populated by the assembler) to bind the synthetic per-block symbols the
+    // table's slots relocate against — those blocks have no live block-address
+    // `lea`, so the assembler's BlockSymPatch loop never bound them. Each table
+    // is one `AssembledData{Data, span*8 bytes, abs64 reloc per slot}` — the same
+    // proven shape as a c67 symbol-address global (writable-at-load `.data` so
+    // Mach-O dyld can PIE-rebase it; ELF ET_EXEC / PE `.reloc` handle the abs64
+    // in-place / via base-relocations). `absPtrRelocKind` is the target's abs64
+    // pointer reloc (found by the widthBytes==8 && !pcRelative formula above); if
+    // the target declares none, a jump table cannot be emitted → fail loud.
+    for (auto const& desc : lir.jumpTableDescriptors) {
+        if (!absPtrRelocKind.has_value()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "jump-table (SymbolId={{ {} }}) requires an absolute-64 pointer "
+                "relocation but target '{}' declares none (D-OPT-SWITCH-JUMP-"
+                "TABLE) — the dense-switch address table cannot be emitted",
+                desc.tableSymbol.v, target.name());
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        if (desc.funcIndex >= assembled.functions.size()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "jump-table descriptor names function index {} but the assembled "
+                "module has {} function(s) (D-OPT-SWITCH-JUMP-TABLE)",
+                desc.funcIndex, assembled.functions.size());
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        AssembledFunction& outFn = assembled.functions[desc.funcIndex];
+
+        // Byte offsets already bound into blockSymbols (e.g. a target block that
+        // is ALSO a computed-goto `&&label`) — don't double-bind those.
+        std::unordered_set<std::uint32_t> alreadyBound;
+        for (auto const& bs : outFn.blockSymbols) alreadyBound.insert(bs.symbol.v);
+
+        AssembledData table;
+        table.symbol    = desc.tableSymbol;
+        table.section   = DataSectionKind::Data;
+        table.alignment = Alignment::ofRuntimePow2(8);
+        table.bytes.assign(desc.slotCount * 8u, std::uint8_t{0});
+        table.relocations.reserve(desc.slotBindings.size());
+
+        bool tableOk = true;
+        for (auto const& [lirBlockV, slotIdx] : desc.slotBindings) {
+            auto symIt = desc.blockSymbols.find(lirBlockV);
+            if (symIt == desc.blockSymbols.end()) { tableOk = false; break; }
+            SymbolId const blkSym = symIt->second;
+            // Bind the block symbol from the function's byte-offset map (once per
+            // distinct symbol; a gap/duplicate reuses the same SymbolId).
+            if (alreadyBound.insert(blkSym.v).second) {
+                auto offIt = outFn.blockByteOffsets.find(lirBlockV);
+                if (offIt == outFn.blockByteOffsets.end()) { tableOk = false; break; }
+                outFn.blockSymbols.push_back(
+                    SyntheticBlockSymbol{blkSym, offIt->second});
+            }
+            // abs64 reloc at slot byte offset (slotIdx * 8) → the block symbol.
+            table.relocations.push_back(Relocation{
+                static_cast<std::uint32_t>(slotIdx * 8u),
+                blkSym, *absPtrRelocKind, /*addend=*/0});
+        }
+        if (!tableOk) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "jump-table (SymbolId={{ {} }}) references a target block with no "
+                "byte offset or symbol — malformed descriptor (D-OPT-SWITCH-JUMP-"
+                "TABLE)", desc.tableSymbol.v);
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        assembled.dataItems.push_back(std::move(table));
+    }
 
     // D-LK4-3: stamp the owning CompilationUnit's id so the linker keys this
     // module's symbols by `(cuId, SymbolId)`. Single-CU build → one cuId; a merged
