@@ -2232,31 +2232,55 @@ struct Lowerer {
     [[nodiscard]] MirInstId
     emitBitfieldExtract(MirInstId unitVal, BitFieldPlacement const& p, TypeId fieldTy) {
         fieldTy = enumReprType(fieldTy);   // enum bit-field → underlying integer
-        std::uint32_t const B = p.unitBytes * 8;
-        // Shift/mask constants MUST be the field/unit type, NOT I32 — a 64-bit-
-        // unit bit-field (`unsigned long long x:40`) with an I32 const operand is
-        // a mixed-width op the verifier doesn't catch (silent miscompile); see
-        // constIntOfType. (Unit widths >64 are rejected at semantic, so the mask
-        // fits in u64.)
+        std::uint32_t const B0 = p.unitBytes * 8;
+        // c73 (D-CSUBSET-32BIT-ALU-FORMS): a SUB-INT (u8/u16/i8/i16/char) allocation
+        // UNIT makes the shift/mask/and ops sub-int-width, which walls at the
+        // target's sub-native ALU gate (sqlite's pervasive `u8 x:1` flag structs).
+        // Compute the extraction at the PROMOTED int width (a bit-field read
+        // promotes to int anyway, C 6.3.1.1), then Trunc the result back to the
+        // field type for the caller's node-type contract. A NATIVE unit (>=32-bit:
+        // u32/i32/u64/… incl. the wide `u64:40` case) keeps computeTy==fieldTy →
+        // the ORIGINAL path (byte-identical, zero regression). The promote-cast's
+        // SExt-vs-ZExt is irrelevant here: the field sits in the low B0 bits and
+        // the shift/mask sequence re-derives its value + sign at width B.
+        bool const promote = B0 < 32;
+        TypeId const computeTy = promote ? interner.primitive(TypeKind::I32) : fieldTy;
+        std::uint32_t const B = promote ? 32u : B0;
+        if (promote) {
+            std::array<MirInstId, 1> pa{unitVal};
+            unitVal = mir.addInst(mapCast(interner.kind(fieldTy), TypeKind::I32),
+                                  pa, computeTy);
+        }
+        // Shift/mask constants MUST match the COMPUTE type (never a stray I32 into a
+        // native u64:40 unit — a mixed-width op the verifier misses; see
+        // constIntOfType). Unit widths >64 are rejected at semantic, so mask fits u64.
         auto shiftBy = [&](MirInstId v, MirOpcode op, std::uint32_t amt) -> MirInstId {
             if (amt == 0) return v;
-            MirInstId const sh = constIntOfType(static_cast<std::int64_t>(amt), fieldTy);
+            MirInstId const sh = constIntOfType(static_cast<std::int64_t>(amt), computeTy);
             std::array<MirInstId, 2> ops{v, sh};
-            return mir.addInst(op, ops, fieldTy);
+            return mir.addInst(op, ops, computeTy);
         };
+        MirInstId result;
         if (bitfieldIsSigned(interner.kind(fieldTy))) {
             MirInstId v = shiftBy(unitVal, MirOpcode::Shl, B - p.bitOffset - p.bitWidth);
-            return shiftBy(v, MirOpcode::AShr, B - p.bitWidth);
+            result = shiftBy(v, MirOpcode::AShr, B - p.bitWidth);
+        } else {
+            MirInstId v = shiftBy(unitVal, MirOpcode::LShr, p.bitOffset);
+            if (p.bitWidth < B) {
+                std::uint64_t const mask =
+                    p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
+                MirInstId const m = constIntOfType(static_cast<std::int64_t>(mask), computeTy);
+                std::array<MirInstId, 2> ops{v, m};
+                v = mir.addInst(MirOpcode::And, ops, computeTy);
+            }
+            result = v;
         }
-        MirInstId v = shiftBy(unitVal, MirOpcode::LShr, p.bitOffset);
-        if (p.bitWidth < B) {
-            std::uint64_t const mask =
-                p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
-            MirInstId const m = constIntOfType(static_cast<std::int64_t>(mask), fieldTy);
-            std::array<MirInstId, 2> ops{v, m};
-            v = mir.addInst(MirOpcode::And, ops, fieldTy);
+        if (promote) {   // Trunc the i32 result back to the field type (caller contract)
+            std::array<MirInstId, 1> ta{result};
+            result = mir.addInst(mapCast(TypeKind::I32, interner.kind(fieldTy)),
+                                 ta, fieldTy);
         }
-        return v;
+        return result;
     }
 
     // FC8 D-CSUBSET-BITFIELD: read-modify-write a bit-field at unit address
@@ -2272,26 +2296,51 @@ struct Lowerer {
         // and the unit Store at the end) carry the flag — the whole RMW is one
         // volatile access of the unit, never elided/reordered.
         fieldTy = enumReprType(fieldTy);   // enum bit-field → underlying integer
+        // c73 (D-CSUBSET-32BIT-ALU-FORMS): mirror emitBitfieldExtract — a SUB-INT
+        // unit computes the read-modify-write at the promoted int width, then
+        // Truncs the merged unit back to the field type for the Store. A native
+        // (>=32-bit) unit keeps computeTy==fieldTy → the original path (unchanged).
+        std::uint32_t const B0 = p.unitBytes * 8;
+        bool const promote = B0 < 32;
+        TypeId const computeTy = promote ? interner.primitive(TypeKind::I32) : fieldTy;
         std::uint64_t const mask =
             p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
         std::uint64_t const fieldMask = mask << p.bitOffset;
         std::array<MirInstId, 1> lo{unitPtr};
-        MirInstId const unit = mir.addInst(MirOpcode::Load, lo, fieldTy,
-                                           /*payload=*/0, vf);
+        MirInstId unit = mir.addInst(MirOpcode::Load, lo, fieldTy,
+                                     /*payload=*/0, vf);
         if (!unit.valid()) return false;
-        MirInstId const clrK = constIntOfType(static_cast<std::int64_t>(~fieldMask), fieldTy);
+        if (promote) {
+            std::array<MirInstId, 1> ua{unit};
+            unit = mir.addInst(mapCast(interner.kind(fieldTy), TypeKind::I32),
+                               ua, computeTy);
+            // Widen the rhs to the compute type so `rhs & mask` is not a mixed-
+            // width op. rhsVal is FIELD-TYPED by the caller contract (the
+            // assignment RHS is HIR-coerced to the field type; the aggregate-init
+            // caller coerces the value to the field type before this call). Only
+            // its low `bitWidth` bits survive the mask.
+            std::array<MirInstId, 1> ra{rhsVal};
+            rhsVal = mir.addInst(mapCast(interner.kind(fieldTy), TypeKind::I32),
+                                 ra, computeTy);
+        }
+        MirInstId const clrK = constIntOfType(static_cast<std::int64_t>(~fieldMask), computeTy);
         std::array<MirInstId, 2> ca{unit, clrK};
-        MirInstId const cleared = mir.addInst(MirOpcode::And, ca, fieldTy);
-        MirInstId const mK = constIntOfType(static_cast<std::int64_t>(mask), fieldTy);
+        MirInstId const cleared = mir.addInst(MirOpcode::And, ca, computeTy);
+        MirInstId const mK = constIntOfType(static_cast<std::int64_t>(mask), computeTy);
         std::array<MirInstId, 2> ma{rhsVal, mK};
-        MirInstId masked = mir.addInst(MirOpcode::And, ma, fieldTy);
+        MirInstId masked = mir.addInst(MirOpcode::And, ma, computeTy);
         if (p.bitOffset != 0) {
-            MirInstId const sh = constIntOfType(static_cast<std::int64_t>(p.bitOffset), fieldTy);
+            MirInstId const sh = constIntOfType(static_cast<std::int64_t>(p.bitOffset), computeTy);
             std::array<MirInstId, 2> sa{masked, sh};
-            masked = mir.addInst(MirOpcode::Shl, sa, fieldTy);
+            masked = mir.addInst(MirOpcode::Shl, sa, computeTy);
         }
         std::array<MirInstId, 2> oa{cleared, masked};
-        MirInstId const merged = mir.addInst(MirOpcode::Or, oa, fieldTy);
+        MirInstId merged = mir.addInst(MirOpcode::Or, oa, computeTy);
+        if (promote) {   // Trunc the merged unit back to the field type for the Store
+            std::array<MirInstId, 1> ta{merged};
+            merged = mir.addInst(mapCast(TypeKind::I32, interner.kind(fieldTy)),
+                                 ta, fieldTy);
+        }
         std::array<MirInstId, 2> st{merged, unitPtr};
         mir.addInst(MirOpcode::Store, st, InvalidType, /*payload=*/0, vf);
         return true;
@@ -2925,8 +2974,21 @@ struct Lowerer {
             MirInstId const unitPtr = mir.addInst(
                 MirOpcode::Gep, gepOps, interner.pointer(fieldTy));
             if (!unitPtr.valid()) return false;
-            MirInstId const v = lowerExpr(child);
+            MirInstId v = lowerExpr(child);
             if (!v.valid()) return false;
+            // c73: coerce the init value to the field type (like an assignment RHS)
+            // so emitBitfieldInsert's RMW sees a field-typed rhs — its sub-int
+            // promote path widens FROM the field type. Same-kind → no cast.
+            {
+                TypeKind const ck = interner.kind(hir.typeId(child));
+                if (ck != interner.kind(fieldTy)) {
+                    MirOpcode const cc = mapCast(ck, interner.kind(fieldTy));
+                    if (cc != MirOpcode::Invalid) {
+                        std::array<MirInstId, 1> va{v};
+                        v = mir.addInst(cc, va, fieldTy);
+                    }
+                }
+            }
             if (!emitBitfieldInsert(unitPtr, v, layout->bitFields[f], fieldTy, vf))
                 return false;
         }
