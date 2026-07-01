@@ -756,19 +756,20 @@ TEST(LirCallconv, LoopFunctionMaterializesWithoutErrors) {
 }
 
 TEST(LirCallconv, SpilledFunctionMaterializesFrameOpsToLoadStore) {
-    // Use the cross-call moderate-pressure pattern from cycle 3b so
-    // there are actual frame_load/frame_store ops to materialize.
+    // Use the cross-call moderate-pressure pattern so there are actual
+    // frame_load/frame_store ops to materialize.
+    //
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the live-across-call values are
+    // never-address-taken PARAMETERS (pure SSA `Arg`s), NOT body locals — a local's
+    // alloca address is now rematerialized AFTER the call so locals no longer span
+    // it. The 8 params each feed the call argument AND the post-call sum, so each
+    // spans the call; 8 > SysV's 5 callee-saved GPRs → ≥1 cross-call spill (hence
+    // frame_load/frame_store to materialize), remat-independent.
     auto bundle = lowerThroughRewrite(
-        "int g(int a) { return a + 1; }\n"
-        "int f(int x) {\n"
-        "    int a1 = x + 1;\n"
-        "    int a2 = x + 2;\n"
-        "    int a3 = x + 3;\n"
-        "    int a4 = x + 4;\n"
-        "    int a5 = x + 5;\n"
-        "    int a6 = x + 6;\n"
-        "    int r = g(x);\n"
-        "    return a1 + a2 + a3 + a4 + a5 + a6 + r;\n"
+        "int g(int v) { return v + 1; }\n"
+        "int f(int a, int b, int c, int d, int e, int f2, int g2, int h) {\n"
+        "    int r = g(a + b + c + d + e + f2 + g2 + h);\n"
+        "    return a + b + c + d + e + f2 + g2 + h + r;\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.rewritten.ok);
@@ -843,13 +844,15 @@ TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
     // savedRegAreaSize; savedRegAreaSize == savedRegs.size() * slotSize;
     // spillAreaSize == numSpillSlots * slotSize; totalFrameSize ==
     // alignUp(savedReg + spill, stackAlignment).
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): pressure from never-address-taken
+    // PARAMETERS (pure SSA `Arg`s), not body locals (whose alloca address is now
+    // rematerialized AFTER the call, so they no longer span it). 8 params each span
+    // the call → a non-trivial spill area exercising the frame-layout invariants.
     auto bundle = lowerThroughRewrite(
-        "int g(int a) { return a + 1; }\n"
-        "int f(int x) {\n"
-        "    int a1 = x + 1; int a2 = x + 2; int a3 = x + 3;\n"
-        "    int a4 = x + 4; int a5 = x + 5; int a6 = x + 6;\n"
-        "    int r = g(x);\n"
-        "    return a1 + a2 + a3 + a4 + a5 + a6 + r;\n"
+        "int g(int v) { return v + 1; }\n"
+        "int f(int a, int b, int c, int d, int e, int f2, int g2, int h) {\n"
+        "    int r = g(a + b + c + d + e + f2 + g2 + h);\n"
+        "    return a + b + c + d + e + f2 + g2 + h + r;\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.rewritten.ok);
@@ -930,13 +933,15 @@ TEST(LirCallconv, StackPointerMissingFromSchemaIsValidationError) {
 }
 
 TEST(LirCallconv, FrameSizeAlignedToCcStackAlignment) {
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): pressure from never-address-taken
+    // PARAMETERS (pure SSA `Arg`s), not body locals (whose alloca address is now
+    // rematerialized AFTER the call, so they no longer span it). 8 params each span
+    // the call → a non-trivial spill area exercising the frame-layout invariants.
     auto bundle = lowerThroughRewrite(
-        "int g(int a) { return a + 1; }\n"
-        "int f(int x) {\n"
-        "    int a1 = x + 1; int a2 = x + 2; int a3 = x + 3;\n"
-        "    int a4 = x + 4; int a5 = x + 5; int a6 = x + 6;\n"
-        "    int r = g(x);\n"
-        "    return a1 + a2 + a3 + a4 + a5 + a6 + r;\n"
+        "int g(int v) { return v + 1; }\n"
+        "int f(int a, int b, int c, int d, int e, int f2, int g2, int h) {\n"
+        "    int r = g(a + b + c + d + e + f2 + g2 + h);\n"
+        "    return a + b + c + d + e + f2 + g2 + h + r;\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.rewritten.ok);

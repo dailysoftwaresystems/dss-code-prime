@@ -4088,6 +4088,26 @@ struct Lowerer {
         }
     }
 
+    // c69 (D-MIR-ENTRY-BLOCK-ALLOCA-HOIST): collect every body-local `VarDecl`
+    // node, so `lowerFunction` can pre-emit its storage `Alloca` into the ENTRY
+    // block (which dominates every use) BEFORE lowering the body. Without this a
+    // local declared in an ENTRY-UNREACHABLE block — the canonical case is a
+    // declaration before the first `case` of a `switch`, which the c60 switch-
+    // flatten places in a predecessor-less pre-case block — gets its `Alloca`
+    // emitted into that dead block; the mandatory unreachable-prune
+    // (D-MIR-UNREACHABLE-PRUNE-NORMALIZE) then drops the block while a reachable
+    // case body still `Load`s the slot → the MirFunctionRebuilder rewrite-map
+    // completeness abort (D-OPT2-REWRITE-MAP-COMPLETENESS). Walks the whole body
+    // subtree (no nested functions in the C-subset → every VarDecl is a local of
+    // THIS function); includes `for`-init declarations (a child of the `For`).
+    void collectLocalDecls(HirNodeId node, std::vector<HirNodeId>& out) {
+        if (!node.valid()) return;
+        if (hir.kind(node) == HirKind::VarDecl) out.push_back(node);
+        for (HirNodeId child : hir.children(node)) {
+            collectLocalDecls(child, out);
+        }
+    }
+
     // FC3.5 sweep-c1 (chip task_20b1224d): lower one `for` header
     // clause (init or update). cst_to_hir's `lowerForClause` emits one
     // of exactly three shapes:
@@ -5904,8 +5924,19 @@ struct Lowerer {
                                        "(HIR verifier should have flagged)");
                     return false;
                 }
-                MirInstId const alloca = allocaForLocal(sym, ty, node);
-                if (!alloca.valid()) return false;
+                // c69 (D-MIR-ENTRY-BLOCK-ALLOCA-HOIST): the slot was pre-emitted
+                // into the ENTRY block by lowerFunction's hoist pre-pass (so a
+                // decl in an entry-unreachable block can't strand its slot). Reuse
+                // it; the pre-pass skips only un-sizeable aggregate/array locals,
+                // for which we emit here (the old path, which then fail-louds).
+                MirInstId alloca;
+                if (auto it = addressableLocal.find(sym.v);
+                    it != addressableLocal.end()) {
+                    alloca = it->second;
+                } else {
+                    alloca = allocaForLocal(sym, ty, node);
+                    if (!alloca.valid()) return false;
+                }
                 if (auto initN = hir.varDeclInit(node); initN.has_value()) {
                     // FC7 (D-FC7-MEMBER-ACCESS): a struct/union initializer
                     // (`P p = {3,4}` / `{.y=7}`) lowers ELEMENT-WISE — one
@@ -6764,6 +6795,43 @@ struct Lowerer {
         currentFnFixedGpr_  = argCtr.gpr;
         currentFnFixedFpr_  = argCtr.fpr;
         currentFnFixedFlat_ = argCtr.flat;
+        // c69 (D-MIR-ENTRY-BLOCK-ALLOCA-HOIST): pre-emit every body-local's
+        // storage `Alloca` into the ENTRY block, which is still the open block
+        // here (the param loop appended Args/param-slots; no terminator yet) and
+        // dominates every use. This is the conventional "all allocas in entry"
+        // discipline: it keeps an ENTRY-UNREACHABLE block (e.g. a switch's
+        // pre-first-case block, c60) free of value-producing instructions so the
+        // mandatory unreachable-prune can drop it without stranding a slot that a
+        // reachable use still references (the c69 MirFunctionRebuilder abort,
+        // D-OPT2-REWRITE-MAP-COMPLETENESS). The init Store stays at the (possibly
+        // dead) decl site. The append-only MirBuilder cannot insert into a sealed
+        // block, so the slots MUST be emitted now, up front; the VarDecl lowering
+        // then reuses the pre-emitted slot. Mem2Reg still promotes/removes the
+        // unused ones. A by-value aggregate PARAM slot is already placed by the
+        // param loop (a distinct symbol); an un-sizeable aggregate/array local is
+        // skipped here and left to the VarDecl site's fail-loud (no behavior
+        // change for that invalid-C edge case).
+        {
+            std::vector<HirNodeId> localDecls;
+            collectLocalDecls(body, localDecls);
+            for (HirNodeId d : localDecls) {
+                TypeId   const dty  = hir.varDeclType(d);
+                SymbolId const dsym = hir.varDeclSymbol(d);
+                if (!dty.valid() || !dsym.valid()) continue;  // VarDecl site fail-louds
+                if (addressableLocal.contains(dsym.v)
+                    || symbolToValue.contains(dsym.v))
+                    continue;  // already slotted (defensive; locals/params are distinct)
+                TypeKind const dtk = interner.kind(dty);
+                if ((dtk == TypeKind::Struct || dtk == TypeKind::Union
+                     || dtk == TypeKind::Array)
+                    && !aggregateByteSize(dty).has_value())
+                    continue;  // un-sizeable here → leave to the VarDecl site (old path)
+                if (!allocaForLocal(dsym, dty, d).valid()) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+            }
+        }
         // Body: a single Block of statements.
         if (!lowerStmt(body)) {
             // Failed mid-body — seal the block so finish() can complete and

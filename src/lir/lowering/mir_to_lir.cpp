@@ -205,6 +205,21 @@ enum class MnemonicSlot : std::uint8_t {
     // VaOverflowArgArea (incoming-overflow base + payload byte offset) but a DISTINCT
     // op so it is not a va_start-detection signal (it occurs in non-variadic fns).
     RecvByValueStackParam,
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): a RE-REFERENCE of a body-local's
+    // stack slot — "this fresh LirReg is the ADDRESS of local-alloca #k" (k =
+    // PAYLOAD = the alloca's 0-based scan-order index within the function). The c69
+    // entry-block alloca-hoist makes every alloca's address live from entry; reusing
+    // ONE address vreg across that (now entry-spanning) range tips a register-
+    // pressure cliff (the index_negative scratch-pool exhaustion). Instead the
+    // lowering emits the `alloca` op ONCE (it reserves the slot, in scan order) and,
+    // at EACH use of the address, a fresh `lea_frame_slot k` whose result has a tiny
+    // def→use range — the conventional "rematerialize frame addresses" treatment, so
+    // hoisting costs no register pressure. lir_callconv materializes it into the SAME
+    // `lea result, [sp + offset]` the original alloca resolves to (offset looked up
+    // from the alloca-index→offset map it builds in scan order), so every re-emit and
+    // the original agree byte-for-byte on ONE reserved slot. Like the alloca/va_*
+    // address ops it is materialized away (never encoded); declared in every schema.
+    LeaFrameSlot,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -298,6 +313,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::VaOverflowArgArea,  "va_overflow_arg_area"},
     {MnemonicSlot::VaHomeArgArea,      "va_home_arg_area"},
     {MnemonicSlot::RecvByValueStackParam, "recv_by_value_stack_param"},
+    {MnemonicSlot::LeaFrameSlot,       "lea_frame_slot"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -433,6 +449,19 @@ struct Lowerer {
     // Per-function state. Cleared at the top of `lowerFunction`.
     MirAttribute<LirReg>            valueToReg;
     MirBlockAttribute<LirBlockId>   mirBlockToLirBlock;
+
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): MIR Alloca value id → its
+    // 0-based scan-order slot index (the k threaded on a `lea_frame_slot`). An
+    // Alloca is NOT entered into `valueToReg`; instead `regForValue` consults this
+    // map FIRST and, for an alloca value, emits a fresh `lea_frame_slot k` at the
+    // USE site (a tiny def→use range) rather than handing back one entry-spanning
+    // address vreg. `allocaLirCount_` is the running count of `alloca` LIR ops this
+    // function has emitted — it IS the callconv scan-order index (lir_callconv's
+    // `functionLocalAllocaPayloads` walks blocks-then-insts in the SAME order this
+    // lowering emits them), so the k recorded here is exactly the index callconv
+    // assigns the alloca's frame offset under. Both reset per function.
+    std::unordered_map<std::uint32_t, std::uint32_t> allocaSlotIndex_;
+    std::uint32_t                   allocaLirCount_ = 0;
 
     // D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD (FC3.5 sweep-c3): per-function
     // MIR value-use census — value id → (use count, last user). Built
@@ -1161,6 +1190,23 @@ struct Lowerer {
     // ── value/block map plumbing ─────────────────────────────────────
 
     [[nodiscard]] std::optional<LirReg> regForValue(MirInstId v) {
+        // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): a body-local alloca's
+        // address is NOT cached in `valueToReg` — it is rematerialized at EACH use
+        // so its live range stays tiny (no spill / scratch-pool exhaustion under the
+        // c69 entry-hoist). Emit a fresh `lea_frame_slot k` here and return it. This
+        // is the SOLE chokepoint every alloca-address consumer (Load/Store base,
+        // address-of, pointer arithmetic, call args, phi-edge moves) funnels
+        // through, so one interception covers them all. The emit lands in the
+        // CURRENT open block at the use position (regForValue is only called while
+        // lowering a use), so the recomputed `lea` precedes the use — and, for a
+        // phi-incoming alloca, lands in the predecessor before its branch (correct:
+        // the address is valid anywhere in the frame).
+        if (v.valid()) {
+            if (auto it = allocaSlotIndex_.find(v.v);
+                it != allocaSlotIndex_.end()) {
+                return emitLeaFrameSlot(it->second);
+            }
+        }
         if (!v.valid() || !valueToReg.has(v)) {
             ParseDiagnostic d;
             d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
@@ -1924,7 +1970,75 @@ struct Lowerer {
         LirReg const result = lir.newVReg(LirRegClass::GPR);
         emitInst(*opcode(MnemonicSlot::Alloca), result,
                     std::span<LirOperand const>{}, payload);
-        defineValue(id, result);
+        // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the `alloca` op above
+        // RESERVES the slot (lir_callconv assigns it a frame offset in scan order).
+        // Record this alloca's scan-order index so EACH use of its address can be
+        // rematerialized via `lea_frame_slot` instead of holding `result` live
+        // across the whole (entry-spanning, post-hoist) range. `result` itself is
+        // left def-only (a tiny range) — it is never entered into `valueToReg`, so
+        // `regForValue` always routes alloca-address uses through the remat path.
+        // `allocaLirCount_` post-increments: the index recorded is the 0-based
+        // position of this `alloca` op among the function's alloca ops, == the
+        // index lir_callconv's scan assigns its offset under.
+        if (opcode(MnemonicSlot::LeaFrameSlot).has_value()) {
+            allocaSlotIndex_.emplace(id.v, allocaLirCount_);
+        } else {
+            // Target declares `alloca` but no `lea_frame_slot` — cannot
+            // rematerialize. Fall back to the pre-c69 single-vreg model (define
+            // the address so `regForValue` hands it back directly). Correct, just
+            // without the pressure relief (no shipped target hits this: both x86_64
+            // and arm64 declare lea_frame_slot; a register-machine schema with
+            // `alloca` but no `lea_frame_slot` is a config that predates c69).
+            defineValue(id, result);
+        }
+        ++allocaLirCount_;
+    }
+
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): emit a fresh `lea_frame_slot k`
+    // re-reference of body-local-alloca `slotIndex`'s address into a brand-new GPR
+    // vreg, and return it. Called from `regForValue` at each use of an alloca
+    // address, so every use gets its OWN tiny-range address value (no long live
+    // range, no spill, no scratch-pool exhaustion). lir_callconv materializes the op
+    // into `lea result, [sp + offsetOf(slotIndex) + byteDisp]` — the SAME base offset
+    // the original `alloca` resolves to, PLUS an optional constant byte displacement
+    // `byteDisp` (default 0). The result is a pointer (GPR class), mirroring the
+    // original alloca's result class.
+    //
+    // `byteDisp` folds a CONSTANT-offset Gep whose base is THIS alloca into the frame
+    // reference (see lowerGep): `&local[constIdx]` / `&s.field` becomes ONE
+    // frame-relative `lea [sp + slotOff + disp]` (base = sp) instead of a `lea_frame_
+    // slot` (base) + a `lea [base + disp]` (Gep) pair. This is BOTH cheaper (one lea)
+    // AND correctness-load-bearing on arm64: the Gep's `lea result,[base+disp]` with a
+    // >16 MiB `disp` lowers to the arm64 MOVZ/MOVK 3-word macro `MOVZ Xd;MOVK Xd;ADD
+    // Xd,base,Xd`, which CLOBBERS `base` when the regalloc coalesces the (tiny-range,
+    // post-remat) `lea_frame_slot` base into the Gep result (base == Xd → MOVZ
+    // destroys base before the ADD) — a SIGSEGV (large_frame_beyond_16mib). Folding to
+    // `[sp + slotOff + disp]` makes the base `sp` (a reserved physreg, NEVER the
+    // result), so the same MOVZ/MOVK macro is safe (sp != Xd). The disp rides an
+    // ImmInt operand (preserved verbatim across the rewrite / legalize rebuilds).
+    [[nodiscard]] std::optional<LirReg>
+    emitLeaFrameSlot(std::uint32_t slotIndex, std::int64_t byteDisp = 0) {
+        auto const op = opcode(MnemonicSlot::LeaFrameSlot);
+        if (!op.has_value()) {
+            // Unreachable: `lowerAlloca` only records into `allocaSlotIndex_` when
+            // this opcode resolves. Defensive fail-loud against a future skew.
+            reportMissingOpcode(MnemonicSlot::LeaFrameSlot,
+                                "MIR Alloca address rematerialization");
+            return std::nullopt;
+        }
+        LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
+        if (byteDisp == 0) {
+            emitInst(*op, result, std::span<LirOperand const>{},
+                     /*payload=*/slotIndex);
+        } else {
+            // The ImmInt displacement operand — lir_callconv adds it to the slot
+            // offset. A >2 GiB displacement is out of the int32 frame-offset domain;
+            // caller (lowerGep) guards the range before folding, so we assert-fit here.
+            std::array<LirOperand, 1> ops{LirOperand::makeImmInt32(
+                static_cast<std::int32_t>(byteDisp))};
+            emitInst(*op, result, ops, /*payload=*/slotIndex);
+        }
+        return result;
     }
 
     void lowerLoad(MirInstId id) {
@@ -2034,6 +2148,31 @@ struct Lowerer {
     void lowerGep(MirInstId id) {
         auto const operands = mir.instOperands(id);
         if (operands.empty()) { reportUnsupported(MirOpcode::Gep, id); return; }
+        // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): a Gep with a body-local
+        // ALLOCA base and a CONSTANT displacement (`&local[constIdx]` / `&s.field`)
+        // folds into ONE frame-relative `lea [sp + slotOff + disp]` (base = sp) — see
+        // emitLeaFrameSlot's docblock for the WHY (cheaper + the arm64 >16 MiB
+        // base==result SIGSEGV it avoids). Handled UP FRONT, before `regForValue`
+        // materializes the base, so no dead base-`lea_frame_slot` is emitted. Only the
+        // exact `[allocaBase, const]` 2-operand shape folds; every other shape (a
+        // derived-pointer base, a runtime index, an out-of-int32 disp) takes the
+        // general path below unchanged.
+        if (opcode(MnemonicSlot::LeaFrameSlot).has_value()
+            && operands.size() == 2) {
+            if (auto slot = allocaSlotIndex_.find(operands[0].v);
+                slot != allocaSlotIndex_.end()) {
+                if (auto const disp = constIntegerValue(operands[1]);
+                    disp.has_value()
+                    && *disp >= std::numeric_limits<std::int32_t>::min()
+                    && *disp <= std::numeric_limits<std::int32_t>::max()) {
+                    if (auto folded = emitLeaFrameSlot(slot->second, *disp);
+                        folded.has_value()) {
+                        defineValue(id, *folded);
+                    }
+                    return;
+                }
+            }
+        }
         std::optional<LirReg> const base = regForValue(operands[0]);
         if (!base.has_value()) return;
         // No-index degenerate: emit explicit `mov result, base` rather
@@ -2081,6 +2220,9 @@ struct Lowerer {
                     reportUnsupported(MirOpcode::Gep, id);
                     return;
                 }
+                // (The body-local ALLOCA-base + const-disp fold is handled UP FRONT
+                // at lowerGep's top — see there. This general path is for a
+                // derived-pointer base.)
                 LirReg const result = lir.newVReg(LirRegClass::GPR);
                 std::array<LirOperand, 3> ops{
                     LirOperand::makeReg(*base),
@@ -4173,6 +4315,11 @@ struct Lowerer {
     void lowerFunction(MirFuncId mf) {
         valueToReg.clear();
         mirBlockToLirBlock.clear();
+        // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): per-function reset so the
+        // slot-index counter restarts at 0 for each function — matching the
+        // per-function scan callconv runs (`functionLocalAllocaPayloads` is per-fn).
+        allocaSlotIndex_.clear();
+        allocaLirCount_ = 0;
         computeValueUses(mf);
         lir.addFunction(mir.funcSymbol(mf));
 

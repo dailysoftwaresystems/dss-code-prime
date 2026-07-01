@@ -13,6 +13,7 @@
 #include <array>
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -824,6 +825,19 @@ struct OpcodeHandles {
     // prologue's emit site fails loud if a CC declares stackProbePageBytes
     // but the schema lacks the opcode (a config mismatch).
     std::uint16_t stackProbe;
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the `lea_frame_slot` virtual op
+    // — a RE-REFERENCE of a body-local alloca's address that the MIR→LIR lowering
+    // emits at EACH use (instead of holding one entry-spanning address vreg, which
+    // tips a register-pressure cliff under the c69 entry-hoist). PAYLOAD = the
+    // alloca's 0-based scan-order index. Materialized into `lea result, [sp +
+    // localAreaOffset() + offsetOf(index)]` — the SAME `lea` the original `alloca`
+    // (same index) resolves to, looked up from the alloca-index→offset map this pass
+    // builds in scan order. Optional — only a target with body-local allocas (hence
+    // `alloca` + `lea`) declares it; absent ⇒ field 0, `op == h.leaFrameSlot` never
+    // matches (a target with NO `lea_frame_slot` simply never emits it from MIR→LIR,
+    // because that lowering only records the remat index when this opcode resolves —
+    // so the absence is self-consistent, NOT a silent gap). Requires `lea`.
+    std::uint16_t leaFrameSlot;
 };
 
 // FC2 Part B: resolve the class-correct opcode for a register-data-
@@ -1444,7 +1458,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 23> const table{{
+    std::array<Entry, 24> const table{{
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -1481,6 +1495,12 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // handle resolved.
         {&OpcodeHandles::alloca_,    "alloca",     true},
         {&OpcodeHandles::lea,        "lea",        true},
+        // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): optional — the alloca-address
+        // re-reference op. Materialized into `lea [sp + offsetOf(index)]`; needs
+        // `lea` (present on any target that has `alloca`). Absent ⇒ field 0; never
+        // matches, and the MIR→LIR lowering correspondingly never emits it (it only
+        // records the remat index when this opcode resolves — self-consistent).
+        {&OpcodeHandles::leaFrameSlot, "lea_frame_slot", true},
         // FC12a-core (D-FC12A-VARIADIC-CALLEE): optional — only a CC with a
         // `vaListLayout` emits these. Materialized into `lea [sp + offset]`; both
         // need `lea` (guaranteed present on any register-machine target that also
@@ -1643,6 +1663,31 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     // frame-layout time, so each alloca's offset is stable AND its span
     // matches the reserved `localAreaSize` (no neighbour overlap).
     std::uint32_t localAllocaByteOffset = 0;
+
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the per-alloca FRAME OFFSET
+    // (sp-relative), indexed by the alloca's 0-based scan-order index — the SAME
+    // progression `localAllocaByteOffset` walks below, precomputed up front so a
+    // `lea_frame_slot k` re-reference (which can appear in ANY block, possibly
+    // BEFORE the original `alloca` is materialized in the loop) resolves to its
+    // alloca's offset. Built from `localAllocaPayloads` (the scan-order payload
+    // list `computeFrameLayout` already sized the local area from), with the
+    // identical `localAreaOffset() + Σ allocaSlotCount*slotSize` formula. The
+    // alloca arm below ASSERTS its running offset equals `allocaSlotOffsets[i]`
+    // (defense-in-depth: a divergence would mean a `lea_frame_slot` points at the
+    // wrong slot — a silent miscompile — so it fails loud instead).
+    std::vector<std::int32_t> allocaSlotOffsets;
+    allocaSlotOffsets.reserve(localAllocaPayloads.size());
+    {
+        std::uint32_t running = 0;
+        for (std::uint32_t const p : localAllocaPayloads) {
+            allocaSlotOffsets.push_back(static_cast<std::int32_t>(
+                outLayout.localAreaOffset() + running));
+            running += allocaSlotCount(p, slotSize) * slotSize;
+        }
+    }
+    // Running scan-order index of the alloca arm — pairs with the offset
+    // precompute above for the consistency assertion.
+    std::uint32_t allocaScanIndex = 0;
 
     // FC7 C1c: `ret_piece` instructions captured by their struct-returning call's
     // look-ahead (they must immediately follow the call). A `ret_piece` reached in
@@ -1872,10 +1917,99 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // (`payload` = its byte size, 0 = scalar = 1 slot).
                 std::int32_t const offset = static_cast<std::int32_t>(
                     outLayout.localAreaOffset() + localAllocaByteOffset);
+                // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the precomputed
+                // `allocaSlotOffsets[i]` (which `lea_frame_slot` re-references read)
+                // MUST equal this arm's running offset for the same scan index —
+                // else a re-reference would point at a DIFFERENT slot than the
+                // original alloca (a silent miscompile). Fail loud on any skew
+                // (e.g. a future change to one progression but not the other).
+                if (allocaScanIndex >= allocaSlotOffsets.size()
+                    || allocaSlotOffsets[allocaScanIndex] != offset) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: alloca scan-order index {} frame "
+                                       "offset {} disagrees with the precomputed "
+                                       "alloca-slot offset map (count {}) — the "
+                                       "lea_frame_slot rematerialization map and the "
+                                       "alloca offset progression drifted "
+                                       "(D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE)",
+                                       allocaScanIndex, offset,
+                                       allocaSlotOffsets.size()));
+                    return false;
+                }
+                ++allocaScanIndex;
                 localAllocaByteOffset +=
                     allocaSlotCount(payload, outLayout.slotSize)
                     * outLayout.slotSize;
                 emitFrameAddr(b, h.lea, result, sp, offset);
+                continue;
+            }
+
+            // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): materialize a
+            // `lea_frame_slot k` re-reference into `lea result, [sp +
+            // allocaSlotOffsets[k]]` — the SAME frame address the original `alloca`
+            // (scan index k) resolves to above. The MIR→LIR lowering emits one of
+            // these at EACH use of a body-local alloca's address (rather than
+            // holding one entry-spanning address vreg), so the address lands in a
+            // FRESH tiny-range register at the use and the entry-hoist costs no
+            // register pressure. `k` rides the PAYLOAD (preserved verbatim across
+            // the rewrite / legalize rebuilds). Bounds-checked against the map so a
+            // stray/garbage index fails loud rather than reading OOB.
+            if (h.leaFrameSlot != 0 && op == h.leaFrameSlot) {
+                if (h.lea == 0 || !result.valid() || result.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                           DiagnosticSeverity::Error,
+                           "callconv: lea_frame_slot materialization needs 'lea' + a "
+                           "physical-reg result "
+                           "(D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE)");
+                    return false;
+                }
+                if (payload >= allocaSlotOffsets.size()) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: lea_frame_slot inst {} references "
+                                       "local-alloca index {} but the function has "
+                                       "only {} alloca slot(s) "
+                                       "(D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE)",
+                                       inst.v, payload, allocaSlotOffsets.size()));
+                    return false;
+                }
+                // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): an OPTIONAL leading
+                // ImmInt operand is a folded CONSTANT byte displacement (a
+                // `&local[constIdx]`/`&s.field` Gep folded into this frame reference
+                // by lowerGep) — add it to the slot offset so the result is `lea [sp +
+                // slotOff + disp]`. `sp` as the base keeps the arm64 >16 MiB MOVZ/MOVK
+                // lea macro safe (base != Xd). The combined offset stays within the
+                // int32 frame domain by construction (lowerGep guards the disp to
+                // int32, and a frame > 2 GiB fails loud downstream at the encoder).
+                std::int64_t combinedOffset =
+                    static_cast<std::int64_t>(allocaSlotOffsets[payload]);
+                if (!ops.empty()) {
+                    if (ops[0].kind != LirOperandKind::ImmInt) {
+                        report(reporter,
+                               DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                               DiagnosticSeverity::Error,
+                               std::format("callconv: lea_frame_slot inst {} has an "
+                                           "unexpected non-ImmInt operand — only a "
+                                           "folded constant displacement is allowed "
+                                           "(D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE)",
+                                           inst.v));
+                        return false;
+                    }
+                    combinedOffset += static_cast<std::int64_t>(ops[0].immInt32);
+                }
+                if (combinedOffset < std::numeric_limits<std::int32_t>::min()
+                    || combinedOffset > std::numeric_limits<std::int32_t>::max()) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: lea_frame_slot inst {} combined "
+                                       "frame offset {} exceeds the int32 frame-offset "
+                                       "domain (D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE)",
+                                       inst.v, combinedOffset));
+                    return false;
+                }
+                emitFrameAddr(b, h.lea, result, sp,
+                              static_cast<std::int32_t>(combinedOffset));
                 continue;
             }
 

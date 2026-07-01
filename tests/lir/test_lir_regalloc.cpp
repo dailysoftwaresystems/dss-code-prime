@@ -807,25 +807,36 @@ TEST(LirRegAlloc, PressuredIndirectCalleeExcludesArgRegs) {
             if (i > 0) fpParams += ", ";
             fpParams += "int";
         }
+        // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the pool-draining values MUST
+        // be never-address-taken PARAMETERS (pure SSA `Arg`s), NOT body locals — a
+        // local's alloca address is now rematerialized at each use (a fresh
+        // `lea_frame_slot`) so it no longer holds a register across the relevant
+        // window. The previous body-local `c0..c7` (crossing) + `t0..t{k-1}` (arg)
+        // shape made this pin VACUOUS under remat — the callee stopped reaching the
+        // arg registers, so the exclusion became unobservable (verified 2026-06-30:
+        // red-on-disable went GREEN). Restored by making BOTH classes params:
+        //   * c0..c7 CROSS the call (used in the post-call `return`) → they soak the
+        //     callee-saved pool and spill beyond it;
+        //   * t0..t{k-1} are SSA values live in the ARG-SETUP WINDOW (the callee is
+        //     loaded, then they are moved into the arg registers, then the call) →
+        //     they occupy the caller-saved registers at the callee's def point,
+        //     pushing the callee's natural pick onto the arg-register tail;
+        // so only the R2 exclusion keeps the callee off an arg register. remat
+        // cannot dissolve param ranges, so the drained-pool pressure is restored.
+        std::string fParams = "int x, int n";
+        for (int i = 0; i < 8; ++i) fParams += ", int c" + std::to_string(i);
+        for (int i = 0; i < k; ++i) fParams += ", int t" + std::to_string(i);
         std::string src =
             "int pick(" + pickParams + ") { return " + pickSum + "; }\n"
-            "int f(int x, int n) {\n"
+            "int f(" + fParams + ") {\n"
             "    int (*fp)(" + fpParams + ") = &pick;\n";
-        for (int i = 0; i < 8; ++i) {            // crossing locals
-            src += "    int c" + std::to_string(i) + " = x + "
-                 + std::to_string(i + 1) + ";\n";
-        }
-        for (int i = 0; i < k; ++i) {            // arg locals
-            src += "    int t" + std::to_string(i) + " = x + "
-                 + std::to_string(i + 11) + ";\n";
-        }
         src += "    int s = fp(t0";
         for (int i = 1; i < k; ++i) src += ", t" + std::to_string(i);
         src += ");\n";
-        // Re-read fp AFTER the call so its alloca-address vreg
-        // CROSSES the call (otherwise it expires exactly at the
-        // callee load and hands its caller-saved register straight
-        // back to the callee — un-draining the pool).
+        // Re-read fp AFTER the call so its loaded value CROSSES the
+        // call (otherwise it expires exactly at the callee load and
+        // hands its caller-saved register straight back to the callee
+        // — un-draining the pool).
         src += "    int z = 0;\n";
         src += "    if (fp != 0) { z = 1; }\n";
         src += "    return s + x + n + z";
@@ -1129,10 +1140,21 @@ TEST(LirRegAlloc, CrossCallRangesLandInCalleeSavedOrSpill) {
     // A vreg live across a call must NOT be in a caller-saved register
     // — the SysV AMD64 cc's callerSaved set is well known and the
     // allocator must respect it. Build a function that calls another
-    // and uses a value before AND after the call.
+    // and uses values before AND after the call.
+    //
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the cross-call values MUST be
+    // never-address-taken PARAMETERS (pure SSA `Arg`s), NOT body locals. A local's
+    // storage is alloca-backed in this no-mem2reg fixture, and its ADDRESS is now
+    // rematerialized at each use (a fresh `lea_frame_slot` AFTER the call) — so a
+    // local no longer produces a cross-call range. The params `a..h` below are each
+    // used as a call argument (before the call) AND in the post-call sum, so each
+    // genuinely spans the call — remat-independent pressure.
     auto lowered = lowerCSubsetToLir(
-        "int g(int a) { return a + 1; }\n"
-        "int f(int x) { int y = x + 1; int z = g(x); return y + z; }\n");
+        "int g(int v) { return v + 1; }\n"
+        "int f(int a, int b, int c, int d, int e, int f2, int g2, int h) {\n"
+        "    int r = g(a + b + c + d + e + f2 + g2 + h);\n"
+        "    return a + b + c + d + e + f2 + g2 + h + r;\n"
+        "}\n");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const lv = analyzeLiveness(lowered.lir.lir);
     DiagnosticReporter regallocRep;
@@ -1498,20 +1520,25 @@ TEST(LirRegAlloc, Aapcs64PressuredIndirectStructReturnCalleeExcludesX8) {
             pickSum    += "a" + std::to_string(i);
             fpParams   += "int";
         }
+        // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the pool-draining values
+        // MUST be never-address-taken PARAMETERS (pure SSA `Arg`s), NOT body locals —
+        // a local's alloca address is now rematerialized at each use so it no longer
+        // holds a register across the relevant window, which made the prior body-
+        // local c0..c15 / t0..t{k-1} shape's red-on-disable VACUOUS under remat (same
+        // mechanism as PressuredIndirectCalleeExcludesArgRegs). Restored by making
+        // BOTH classes params: c0..c15 CROSS the call (post-call `return`) → soak the
+        // callee-saved pool; t0..t{k-1} are SSA values live in the ARG-SETUP WINDOW →
+        // drain the caller-saved LIFO toward x8; only the IRR exclusion keeps the
+        // callee off x8. remat cannot dissolve param ranges.
+        std::string fParams = "int x, int n";
+        for (int i = 0; i < 16; ++i) fParams += ", int c" + std::to_string(i);
+        for (int i = 0; i < k; ++i) fParams += ", int t" + std::to_string(i);
         std::string src =
             "typedef struct { long a; long b; long c; } Big;\n"
             "Big pick(" + pickParams + ") {\n"
             "    Big r; r.a = " + pickSum + "; r.b = 1; r.c = 2; return r; }\n"
-            "int f(int x, int n) {\n"
+            "int f(" + fParams + ") {\n"
             "    Big (*fp)(" + fpParams + ") = &pick;\n";
-        for (int i = 0; i < 16; ++i) {           // crossing locals (callee-saved)
-            src += "    int c" + std::to_string(i) + " = x + "
-                 + std::to_string(i + 1) + ";\n";
-        }
-        for (int i = 0; i < k; ++i) {            // arg locals (caller-saved LIFO)
-            src += "    int t" + std::to_string(i) + " = x + "
-                 + std::to_string(i + 31) + ";\n";
-        }
         src += "    Big s = fp(t0";
         for (int i = 1; i < k; ++i) src += ", t" + std::to_string(i);
         src += ");\n";

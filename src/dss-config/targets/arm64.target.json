@@ -81,6 +81,16 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (c69, D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE): a RE-REFERENCE of a body-local's stack slot — 'this fresh LirReg is the ADDRESS of local-alloca #k', k = PAYLOAD = the alloca's 0-based scan-order index. The c69 entry-block alloca-hoist makes every local's address live from entry; reusing ONE address vreg tips a register-pressure cliff, so MIR->LIR emits the `alloca` op ONCE (reserves the slot) and a fresh `lea_frame_slot k` at EACH use (tiny def->use range) — the conventional 'rematerialize frame addresses' treatment. lir_callconv materializes it into `lea result, [sp + localAreaOffset + offsetOf(k) + disp]` — byte-identical to the original alloca's `lea` (offset from the alloca-index->offset map built in scan order). An OPTIONAL single ImmInt operand is a folded CONSTANT byte displacement `disp` (a `&local[constIdx]`/`&s.field` Gep whose base IS this alloca, folded by lowerGep into ONE sp-based frame lea): cheaper (one lea) AND load-bearing — a >16 MiB `disp` in the un-folded two-lea form (`lea_frame_slot` base + `lea [base+disp]`) lowers to the arm64 MOVZ/MOVK macro `ADD Xd,base,Xd` which CLOBBERS base when regalloc coalesces the tiny-range remat base into the Gep result (base==Xd), a SIGSEGV; folding makes the base `sp` (a reserved physreg, never the result), so `MOVZ Xd;MOVK Xd;ADD Xd,sp,Xd` is safe. DISTINCT from `alloca` so it is INVISIBLE to the frame-layout slot-count scan (one slot per original alloca is preserved). On arm64 `lea` is the ADD-immediate frame-address form (the same op the alloca/va_* address pseudo-ops lower to). No encoding (materialized away). hasSideEffects=false (pure address computation, like lea/alloca); no LIR-tier pass removes/merges it.",
+      "mnemonic":      "lea_frame_slot",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "Virtual-ISA pseudo-op (FC12b, D-FC12B-WIN64-VARIADIC-CALLEE): the Win64 HomogeneousPointer va_start base (&home[namedArgCount]). Declared for substrate uniformity; AAPCS64 uses the dual-cursor strategy (FC12c) and never emits this op. No encoding (materialized away by lir_callconv).",
       "mnemonic":      "va_home_arg_area",
       "result":        "value",

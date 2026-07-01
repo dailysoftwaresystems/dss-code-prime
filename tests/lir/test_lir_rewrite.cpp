@@ -282,17 +282,19 @@ TEST(LirRewrite, SpilledFunctionEmitsFrameLoadStorePseudoOps) {
     // prefer callee-saved, and excess spill via
     // R_SpilledDueToCrossCallExhaustion. Total pressure remains
     // moderate so scratch room is preserved for the rewrite pass.
+    //
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the live-across-call values are
+    // never-address-taken PARAMETERS (pure SSA `Arg`s), NOT body locals. A local's
+    // alloca address is now rematerialized AFTER the call (a fresh `lea_frame_slot`),
+    // so locals no longer span the call. The 8 params are each used as a call
+    // argument AND in the post-call sum, so each spans the call; 8 cross-call values
+    // exceed SysV's 5 callee-saved GPRs → ≥1 genuine cross-call spill, remat-
+    // independent (yet moderate, so the rewrite keeps scratch room).
     auto bundle = lowerAndAllocate(
-        "int g(int a) { return a + 1; }\n"
-        "int f(int x) {\n"
-        "    int a1 = x + 1;\n"
-        "    int a2 = x + 2;\n"
-        "    int a3 = x + 3;\n"
-        "    int a4 = x + 4;\n"
-        "    int a5 = x + 5;\n"
-        "    int a6 = x + 6;\n"
-        "    int r = g(x);\n"
-        "    return a1 + a2 + a3 + a4 + a5 + a6 + r;\n"
+        "int g(int v) { return v + 1; }\n"
+        "int f(int a, int b, int c, int d, int e, int f2, int g2, int h) {\n"
+        "    int r = g(a + b + c + d + e + f2 + g2 + h);\n"
+        "    return a + b + c + d + e + f2 + g2 + h + r;\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.alloc.ok());
@@ -343,17 +345,18 @@ TEST(LirRewrite, MultiSpilledSameClassOperandsGetDistinctScratches) {
     // Build cross-call pressure that forces multiple spills, then
     // assert: across the rewritten module, no `add` instruction has
     // two operand Reg slots pointing at the same physical reg.
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): pressure comes from never-
+    // address-taken PARAMETERS (pure SSA `Arg`s), NOT body locals — a local's alloca
+    // address is now rematerialized AFTER the call so locals no longer span it. The
+    // 8 params each feed the call arguments AND the post-call sum → 8 cross-call
+    // values > SysV's 5 callee-saved GPRs → multiple spills (the multi-spill scratch
+    // distribution this test exercises). Remat-independent.
     auto bundle = lowerAndAllocate(
         "int g(int a, int b);\n"
-        "int f(int x) {\n"
-        "    int a1 = x + 1;\n"
-        "    int a2 = x + 2;\n"
-        "    int a3 = x + 3;\n"
-        "    int a4 = x + 4;\n"
-        "    int a5 = x + 5;\n"
-        "    int a6 = x + 6;\n"
-        "    int r = g(x, x);\n"
-        "    return a1 + a2 + a3 + a4 + a5 + a6 + r;\n"
+        "int f(int a, int b, int c, int d, int e, int f2, int g2, int h) {\n"
+        "    int s = a + b + c + d + e + f2 + g2 + h;\n"
+        "    int r = g(s, s);\n"
+        "    return a + b + c + d + e + f2 + g2 + h + r;\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.alloc.ok());
@@ -474,17 +477,18 @@ TEST(LirRewrite, ScratchRegPickedFromCallingConventionPoolOnly) {
     // Pins the dual of `ExhaustedClassEmitsLoudFailureNotSilentClobber`:
     // when a scratch IS picked, it must be a register that appears in
     // the calling convention's allocatable pool (no `rsp`/`rflags`/etc.).
+    //
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the live-across-call values are
+    // never-address-taken PARAMETERS (pure SSA `Arg`s) — a body local's alloca
+    // address is now rematerialized AFTER the call so locals no longer span it. The
+    // 8 params each feed the call argument AND the post-call sum → 8 cross-call
+    // values > SysV's 5 callee-saved GPRs → ≥1 spill, hence frame_load/frame_store
+    // whose scratch register this test inspects. Remat-independent.
     auto bundle = lowerAndAllocate(
-        "int g(int a) { return a + 1; }\n"
-        "int f(int x) {\n"
-        "    int a1 = x + 1;\n"
-        "    int a2 = x + 2;\n"
-        "    int a3 = x + 3;\n"
-        "    int a4 = x + 4;\n"
-        "    int a5 = x + 5;\n"
-        "    int a6 = x + 6;\n"
-        "    int r = g(x);\n"
-        "    return a1 + a2 + a3 + a4 + a5 + a6 + r;\n"
+        "int g(int v) { return v + 1; }\n"
+        "int f(int a, int b, int c, int d, int e, int f2, int g2, int h) {\n"
+        "    int r = g(a + b + c + d + e + f2 + g2 + h);\n"
+        "    return a + b + c + d + e + f2 + g2 + h + r;\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.alloc.ok());

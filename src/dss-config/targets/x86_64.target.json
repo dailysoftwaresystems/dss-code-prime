@@ -81,6 +81,16 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (c69, D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE): a RE-REFERENCE of a body-local's stack slot — 'this fresh LirReg is the ADDRESS of local-alloca #k', where k = PAYLOAD = the alloca's 0-based scan-order index within the function. The c69 entry-block alloca-hoist makes every local's address live from function entry; reusing ONE address vreg across that range tips a register-pressure cliff, so MIR->LIR emits the `alloca` op ONCE (it reserves the slot) and a fresh `lea_frame_slot k` at EACH use of the address — each result has a tiny def->use range, the conventional 'rematerialize frame addresses' treatment. lir_callconv materializes it into `lea result, [sp + localAreaOffset + offsetOf(k) + disp]` — byte-identical to the `lea` the original alloca (same k) resolves to (offset read from the alloca-index->offset map lir_callconv builds in scan order). An OPTIONAL single ImmInt operand is a folded CONSTANT byte displacement `disp` (a `&local[constIdx]`/`&s.field` Gep whose base IS this alloca, folded by lowerGep into ONE sp-based frame lea) — this is cheaper (one lea) AND keeps the arm64 >16 MiB MOVZ/MOVK lea macro safe (base = sp, never the result reg, so `MOVZ Xd;ADD Xd,sp,Xd` never clobbers the base). DISTINCT from `alloca` so it is INVISIBLE to the frame-layout slot-count scan (`functionLocalAllocaPayloads` counts only `alloca`): the frame still reserves exactly ONE slot per original alloca. No encoding (materialized away). hasSideEffects=false (a pure address computation, like `lea`/`alloca`); no LIR-tier pass removes/merges it (the pipeline runs no LIR DCE/CSE), so its result-used ranges always survive to materialization.",
+      "mnemonic":      "lea_frame_slot",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "Virtual-ISA pseudo-op (FC12b, D-FC12B-WIN64-VARIADIC-CALLEE): 'this LirReg is the ADDRESS of the Win64 HomogeneousPointer va_start base' — &home[namedArgCount], the first vararg. Win64's named-arg home space (rcx/rdx/r8/r9 slots) and the 5th+ stack args are CONTIGUOUS in the caller's outgoing area, so this single base + the named-arg slot count positions `ap` past ALL named args. PAYLOAD = the named-arg slot count; lir_callconv materializes it into `lea result, [sp + totalFrameSize + callPushBytes + payload*outgoingSlotSize]` — the NO-SHADOW base (the home space IS the caller's shadow space, so adding shadowSpaceBytes would skip it and read past every named arg). Its PRESENCE is also lir_callconv's signal to spill the named integer arg regs into their home slots. No encoding (materialized away).",
       "mnemonic":      "va_home_arg_area",
       "result":        "value",

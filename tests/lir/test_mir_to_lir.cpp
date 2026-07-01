@@ -1765,43 +1765,61 @@ TEST(MirToLir, EnumPackedFieldMemoryAccessIsWidthExactToUnderlying) {
 }
 
 TEST(MirToLir, AllocaResultIsAddressableViaStore) {
-    // Cycle-3c Alloca lowering: the LIR alloca's result register flows
-    // into the immediately following Store as its `base` operand. This
-    // pins the (Alloca result → Store base) wiring; a regression that
-    // dropped the result-register propagation would surface here.
-    //
-    // Payload semantics on Alloca are ML6/ML7-driven (the size and
-    // alignment encoding co-designs with frame-layout in cycle 3d);
-    // cycle 3c is the pass-through layer.
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): a body-local's storage
+    // address is REMATERIALIZED at each use — the `alloca` op reserves the slot
+    // (in scan order), and each USE of the address emits a fresh `lea_frame_slot k`
+    // (k = the alloca's 0-based scan-order index) whose result becomes the use's
+    // base register. So the Store writes through a `lea_frame_slot` result, NOT the
+    // `alloca` result directly. This pins the remat wiring (Store base ← a
+    // `lea_frame_slot` re-reference of the local's slot, index 0 for the sole
+    // local); a regression that reverted to caching one entry-spanning alloca
+    // address vreg, or threaded the wrong slot index, surfaces here.
     auto L = lowerCSubsetToLir(
         "int f() { int x; x = 1; return x; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok);
-    auto const allocaOp = *L.target->opcodeByMnemonic("alloca");
-    auto const storeOp  = *L.target->opcodeByMnemonic("store");
+    auto const allocaOp      = *L.target->opcodeByMnemonic("alloca");
+    auto const storeOp       = *L.target->opcodeByMnemonic("store");
+    auto const leaFrameSlotOp = *L.target->opcodeByMnemonic("lea_frame_slot");
     Lir const& lir = L.lir.lir;
     LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
-    LirReg allocaResult{};
-    bool sawAlloca = false;
+    bool sawAlloca = false, sawStore = false;
     for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
         LirInstId const inst = lir.blockInstAt(entry, i);
         if (lir.instOpcode(inst) == allocaOp) {
-            allocaResult = lir.instResult(inst);
             sawAlloca = true;
-            EXPECT_TRUE(allocaResult.valid())
-                << "Alloca must produce a valid result vreg";
+            EXPECT_TRUE(lir.instResult(inst).valid())
+                << "Alloca must produce a valid result vreg (it reserves the slot)";
         }
         if (lir.instOpcode(inst) == storeOp && sawAlloca) {
             auto const ops = lir.instOperands(inst);
             ASSERT_EQ(ops.size(), 4u);
-            // ops[1] is the base register the Store writes through.
+            // ops[1] is the base register the Store writes through — now a
+            // `lea_frame_slot` re-reference's result, not the alloca's.
             EXPECT_EQ(ops[1].kind, LirOperandKind::Reg);
-            EXPECT_EQ(ops[1].reg, allocaResult)
-                << "Store's base operand must reference Alloca's result";
+            LirReg const baseReg = ops[1].reg;
+            // The producer of `baseReg` must be a `lea_frame_slot` whose payload
+            // is the local's slot index (0 — it is the only/first alloca).
+            bool baseFromLeaFrameSlot = false;
+            for (std::uint32_t j = 0; j < lir.blockInstCount(entry); ++j) {
+                LirInstId const def = lir.blockInstAt(entry, j);
+                if (lir.instOpcode(def) == leaFrameSlotOp
+                    && lir.instResult(def) == baseReg) {
+                    baseFromLeaFrameSlot = true;
+                    EXPECT_EQ(lir.instPayload(def), 0u)
+                        << "the sole local's lea_frame_slot must carry slot index 0";
+                    break;
+                }
+            }
+            EXPECT_TRUE(baseFromLeaFrameSlot)
+                << "Store's base must be a lea_frame_slot re-reference of the "
+                   "local's slot (the remat'd address), not the alloca result";
+            sawStore = true;
             break;
         }
     }
     EXPECT_TRUE(sawAlloca);
+    EXPECT_TRUE(sawStore);
 }
 
 TEST(MirToLir, WideLiteralRoutesThroughLiteralPool) {

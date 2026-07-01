@@ -1274,11 +1274,15 @@ TEST(MirLoweringCSubset, AddressOfLocalReturnsAllocaDirectly) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirBlockId const entry = m.funcEntry(m.funcAt(0));
-    // [Alloca x, Const 1, Store, Alloca p, Store(allocaX→p), Load p, Load *p, Return]
-    // The AddressOf(x) does NOT add an instruction — it reuses alloca x.
+    // c69 (D-MIR-ENTRY-BLOCK-ALLOCA-HOIST): every body-local's storage Alloca is
+    // now pre-emitted into the entry block UP FRONT (the conventional "all allocas
+    // in entry" discipline), so BOTH allocas lead the block before any init:
+    // [Alloca x, Alloca p, Const 1, Store(Const1→x), Store(allocaX→p), Load p,
+    //  Load *p, Return]. The AddressOf(x) still does NOT add an instruction — it
+    // reuses alloca x (asserted via the store-p value operand below).
     ASSERT_EQ(m.blockInstCount(entry), 8u);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Alloca);
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Alloca);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Alloca);
     // Slot 4 stores alloca-x into the p slot — verify the value operand IS
     // the first alloca (proving AddressOf returned the alloca, not a copy).
     MirInstId const storeP = m.blockInstAt(entry, 4);
