@@ -1718,9 +1718,27 @@ struct Lowerer {
             // `OP=`: `compoundLhsRead OP rhs`. `compoundLhsRead` was emitted in
             // `enter` (BEFORE the rhs), so operand[0]'s node precedes operand[1]'s —
             // the SAME arena order as the recursive braced-init `{lvRead, rhs}`.
-            stored = builder.addParent(HirKind::BinaryOp,
-                                       std::array{ctx.compoundLhsRead, result.id},
-                                       lv.type, encodeOp(ctx.baseOp));
+            // c74 (D-CSUBSET-32BIT-ALU-FORMS): integer-PROMOTE the base op (C99
+            // `a OP= b` == `a = (T)((a) OP (b))`, the OP at the COMMON type) so a
+            // sub-int lvalue in VALUE position (`(flags &= ~M)`, `while ((x |= b))`)
+            // doesn't build a Char/U8-typed BinaryOp that walls at the sub-native
+            // ALU gate. Mirrors the statement-position `lowerCompoundAssign`; the
+            // promote-casts are pure conversions (no side effect), so the read-
+            // before-rhs order is preserved. A non-arithmetic common (Ptr compound
+            // `p += n`) keeps opType==lv.type → the c41 stride-Gep, unchanged.
+            E lhsE{ctx.compoundLhsRead, lv.type};
+            E rhsE = result;
+            TypeId const common = commonArithType(lhsE.type, rhsE.type);
+            TypeId const opType = common.valid() ? common : lv.type;
+            if (common.valid()) {
+                lhsE = coerce(lhsE, common);
+                rhsE = coerce(rhsE, common);
+            }
+            HirNodeId const opResult = builder.addParent(HirKind::BinaryOp,
+                std::array{lhsE.id, rhsE.id}, opType, encodeOp(ctx.baseOp));
+            stored = (opType.v != lv.type.v)
+                ? coerce(E{opResult, opType}, lv.type).id
+                : opResult;
         }
         std::vector<HirNodeId> stmts = lv.prep;
         stmts.push_back(lvWrite(lv, stored));
@@ -2594,9 +2612,29 @@ struct Lowerer {
                 if (!op || arityOf(*op) != HirOpArity::Binary)
                     return exprError(node, std::format("compound base op '{}' is not binary",
                                                        e.compoundBase));
-                stored = builder.addParent(HirKind::BinaryOp,
-                                           std::array{lvRead(*lv), lowerExpr(rhsN).id},
-                                           lv->type, encodeOp(*op));
+                // c74 (D-CSUBSET-32BIT-ALU-FORMS): a VALUE-position compound assign
+                // (`(flags &= ~M)`, `while ((x |= b))`) must integer-PROMOTE the base
+                // op exactly like the statement-position `lowerCompoundAssign` (C99
+                // `a OP= b` == `a = (T)((a) OP (b))`, the OP computed at the COMMON
+                // type) — else a sub-int lvalue builds a Char/U8-typed BinaryOp that
+                // walls at the sub-native ALU gate (sqlite's `p->flags &= ~M` in an
+                // if/while). Compute at `common`; narrow the result back to the
+                // lvalue type for the store. A non-arithmetic common (Ptr compound
+                // `p += n`) keeps opType == lv->type → the c41 stride-Gep path,
+                // byte-identical to before (no coerce, no narrow).
+                E lhsE{lvRead(*lv), lv->type};
+                E rhsE = lowerExpr(rhsN);
+                TypeId const common = commonArithType(lhsE.type, rhsE.type);
+                TypeId const opType = common.valid() ? common : lv->type;
+                if (common.valid()) {
+                    lhsE = coerce(lhsE, common);
+                    rhsE = coerce(rhsE, common);
+                }
+                HirNodeId const opResult = builder.addParent(HirKind::BinaryOp,
+                    std::array{lhsE.id, rhsE.id}, opType, encodeOp(*op));
+                stored = (opType.v != lv->type.v)
+                    ? coerce(E{opResult, opType}, lv->type).id
+                    : opResult;
             }
             std::vector<HirNodeId> stmts = lv->prep;
             stmts.push_back(lvWrite(*lv, stored));
