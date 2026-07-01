@@ -16,6 +16,7 @@
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_regalloc.hpp"
 #include "lir/lir_rewrite.hpp"
+#include "lir/lir_wide_call_args.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly consumes it)
@@ -476,12 +477,26 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         return std::nullopt;
     }
 
+    // 4b. Wide-call arg materialization (D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT,
+    //     option E): BEFORE regalloc, split each Call's scalar arguments beyond
+    //     the active cc's register-passed count into `store_outgoing_arg`
+    //     carriers, so no Call holds more register-operands than the machine
+    //     passes in registers (the func-2088 wide-call blocker). Config-driven
+    //     from the cc descriptor (argGprs/argFprs/slotAligned). This is the
+    //     earliest tier that both knows the active cc AND holds the LIR.
+    auto const wideEntry = reporter.errorCount();
+    auto wideLir = lowerWideCallArgs(lir.lir, target, callingConventionIndex,
+                                     reporter);
+    if (!wideLir.ok || !tierClean(reporter, wideEntry)) {
+        return std::nullopt;
+    }
+
     // 5. Liveness analysis (input to regalloc).
-    auto const liveness = analyzeLiveness(lir.lir);
+    auto const liveness = analyzeLiveness(wideLir.lir);
 
     // 6. Register allocation.
     auto const allocEntry = reporter.errorCount();
-    auto const alloc = allocateRegisters(lir.lir, target, liveness,
+    auto const alloc = allocateRegisters(wideLir.lir, target, liveness,
                                           callingConventionIndex, reporter);
     if (!alloc.ok() || !tierClean(reporter, allocEntry)) {
         return std::nullopt;
@@ -489,7 +504,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
 
     // 7. Rewrite vregs → physical registers.
     auto const rewriteEntry = reporter.errorCount();
-    auto rewritten = rewriteWithAllocation(lir.lir, target, alloc, reporter);
+    auto rewritten = rewriteWithAllocation(wideLir.lir, target, alloc, reporter);
     if (!rewritten.ok || !tierClean(reporter, rewriteEntry)) {
         return std::nullopt;
     }

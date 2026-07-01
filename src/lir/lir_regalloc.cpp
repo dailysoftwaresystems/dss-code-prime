@@ -213,7 +213,19 @@ computeReloadReserve(Lir const& lir, TargetSchema const& schema,
         for (std::uint32_t i = 0; i < n; ++i) {
             LirInstId const inst = lir.blockInstAt(blk, i);
             auto const* info = schema.opcodeInfo(lir.instOpcode(inst));
-            if (info != nullptr && info->isCall) continue;
+            // D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT (option E): calls are NO
+            // LONGER excluded. Before the pre-regalloc wide-call pass, a call's
+            // arg operands could exceed the register file (reserving that many
+            // was impossible) so calls were skipped here. The pass now bounds a
+            // call's register-operand count to the cc's register-passed pool
+            // (≤ argGprs / argFprs), so its rewriter reload demand is bounded
+            // and CAN be reserved — counting it here is what guarantees the
+            // rewriter has scratch for a wide call whose register args regalloc
+            // spilled (the func-2088 blocker). The `store_outgoing_arg` carriers
+            // the pass emits are NON-call, single-operand insts already counted
+            // below. NOTE the count still uses the raw same-class virtual-operand
+            // tally; a call's operands past the pool were removed by the pass, so
+            // this over-counts nothing.
             std::array<std::uint16_t, kLirRegClassCount> demand{};
             auto const bump = [&](LirReg r) {
                 if (!r.valid() || r.isPhysical != 0) return;

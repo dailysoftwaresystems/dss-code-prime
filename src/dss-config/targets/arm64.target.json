@@ -916,6 +916,13 @@
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
+      "$comment": "D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT (option E): outgoing-stack-arg store carrier (target-blind, NO encoding). Emitted by the PRE-REGALLOC wide-call lowering pass for every outgoing call argument beyond the cc's register-passed capacity (config: argGprs/argFprs = 8 GPR / 8 FPR on AAPCS64). Operand[0] = the arg VALUE vreg (regalloc assigns it; its live range ends HERE, not at the call). Payload = the arg's OVERFLOW SLOT INDEX (monotonic, source-order NSAA cursor). lir_callconv materializes it into `store operand, [sp + shadowSpaceBytes + payload*outgoingSlotSize]` (shadowSpaceBytes=0 on AAPCS64) via the STUR/scaled-STR chokepoint — byte-identical to the pre-existing placement-loop store. hasSideEffects=true so no pass reorders it off its call.",
+      "mnemonic": "store_outgoing_arg", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
       "$comment": "Memory LOAD — AArch64 LDUR Xt, [Xn, #simm9] (unscaled, signed 9-bit byte offset). Fixed word 0xF8400000 (size=11 64-bit, opc=01 load, unscaled mode bits 11..10 = 00). Operand layout (shared LIR load form): [base_reg, MemBase(scale=1), MemOffset(disp)] + result. Wires: result→Rt (rd, bits 0..4), base_reg(index 0)→Rn (bits 5..9), MemOffset(index 2)→Imm9 (bits 12..20, signed). The MemBase(index 1) carries no AArch64 bits (scale must be 1; the walker validates it). The callconv materializes frame_load into this. Offset range -256..255; a wider frame fails loud (scaled LDR imm12 = future).",
       "mnemonic":      "load",
       "result":        "value",

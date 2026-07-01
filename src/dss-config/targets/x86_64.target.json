@@ -1597,6 +1597,13 @@
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
+      "$comment": "D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT (option E): outgoing-stack-arg store carrier. Emitted by the PRE-REGALLOC wide-call lowering pass for every outgoing call argument beyond the cc's register-passed capacity (config: argGprs/argFprs counts + slotAligned). Operand[0] = the arg VALUE vreg (still virtual pre-regalloc — regalloc assigns it, ending its live range HERE at the store instead of at the call, which is why a wide call no longer holds N register-operands). Payload = the arg's OVERFLOW SLOT INDEX (0-based, in outgoing-slot units, monotonic across the call's stacked args in source order — the NSAA cursor). lir_callconv materializes it (post-regalloc) into `store operand, [sp + shadowSpaceBytes + payload*outgoingSlotSize]` — BYTE-IDENTICAL geometry to the pre-existing post-regalloc placement-loop stack store, so the caller-store↔callee-load offset contract is unchanged. No encoding (materialized away). hasSideEffects=true so no pass drops/reorders it off its call.",
+      "mnemonic": "store_outgoing_arg", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
       "$comment": "FC2 Part B: FPR-class register-register copy — MOVAPS xmm1, xmm2 = 0F 28 /r (NO mandatory prefix; the F2-prefixed reg-reg MOVSD form merges into the destination's upper lane, creating a false dependency on dst's prior value — MOVAPS copies the full register, the classic codegen choice). ModR/M.reg = destination (resultSlot), ModR/M.rm = source; xmm8-15 set REX.R/REX.B automatically. Bound to the `fpr` class's `move` slot in registerClassOps[] — consumed by the 2-addr legalize implicit copy, MIR→LIR mov-to-fresh/phi-edge copies, and callconv arg/return moves whenever the register class is FPR.",
       "mnemonic": "movaps", "result": "value",
       "hasSideEffects": false,
