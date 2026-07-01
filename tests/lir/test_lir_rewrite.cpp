@@ -164,21 +164,34 @@ TEST(LirRewrite, ExhaustedClassEmitsLoudFailureNotSilentClobber) {
     std::array<TypeKind, 1> const paramKinds{TypeKind::I32};
     auto syn = test_support::buildSyntheticFn(
         paramKinds, TypeKind::I32,
-        [&](MirBuilder& mb, TypeInterner&,
+        [&](MirBuilder& mb, TypeInterner& interner,
             std::vector<TypeId> const& params, TypeId retT) {
             MirInstId const a = mb.addArg(0, params[0]);
-            std::vector<MirInstId> vals;
-            vals.reserve(20);
+            // 20 distinct arg vregs, all live simultaneously at the call.
+            std::vector<MirInstId> args;
+            args.reserve(20);
             for (int i = 0; i < 20; ++i) {
                 std::array<MirInstId, 2> ops{a, a};
-                vals.push_back(mb.addInst(MirOpcode::Add, ops, retT));
+                args.push_back(mb.addInst(MirOpcode::Add, ops, retT));
             }
-            MirInstId acc = vals[0];
-            for (std::size_t i = 1; i < vals.size(); ++i) {
-                std::array<MirInstId, 2> ops{acc, vals[i]};
-                acc = mb.addInst(MirOpcode::Add, ops, retT);
-            }
-            mb.addReturn(acc);
+            // A WIDE CALL: 20 register operands live at ONE instruction
+            // exceed the register file, so no fixed spill-reload
+            // reservation (c75 reserve-K) can service them — the deferred
+            // D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT. The reload path must
+            // EXHAUST LOUDLY rather than silently clobber a reserved-role
+            // register. (Post-c75 the general-pressure reduce this test
+            // formerly built is HANDLED by the reservation, so the loud-
+            // failure path is now reached via the wide-call operand
+            // explosion instead — the one exhaustion reserve-K cannot fix.)
+            TypeId const ptrT = interner.primitive(TypeKind::Ptr);
+            MirInstId const callee = mb.addGlobalAddr(SymbolId{2}, ptrT);
+            std::vector<MirInstId> callOps;
+            callOps.reserve(args.size() + 1);
+            callOps.push_back(callee);
+            for (auto const v : args) callOps.push_back(v);
+            MirInstId const callResult =
+                mb.addInst(MirOpcode::Call, callOps, retT);
+            mb.addReturn(callResult);
         });
     DiagnosticReporter lirRep;
     auto const lirResult = lowerToLir(syn.mir, **target, syn.interner, lirRep);
@@ -193,9 +206,10 @@ TEST(LirRewrite, ExhaustedClassEmitsLoudFailureNotSilentClobber) {
     DiagnosticReporter rewriteRep;
     auto rewritten = rewriteWithAllocation(lirResult.lir, **target,
                                            alloc, rewriteRep);
-    // 20 vregs all live at the final reduce exhaust the GPR class
-    // (x86_64 SysV allocatable GPRs ≈ 14, minus reserved). No scratch
-    // remains → loud failure is the correct substrate behavior.
+    // The 20-arg wide call has more live register operands at one
+    // instruction than the register file holds, so the reload path finds
+    // no scratch → loud failure is the correct substrate behavior
+    // (silently clobbering rsp as scratch would corrupt the stack).
     EXPECT_FALSE(rewritten.ok);
     bool foundDiag = false;
     for (auto const& d : rewriteRep.all()) {
@@ -248,23 +262,36 @@ TEST(LirRewrite, Arm64HighFprSpillScratchPoolHandlesOrdinalsBeyond64) {
     // pass VACUOUSLY (green but testing nothing). Assert the precondition holds
     // so it fails LOUD instead. If asserting the exact ordinal ever becomes
     // structurally awkward, the max-FPR-ordinal >= 64 fallback below suffices.
-    std::uint32_t maxFprOrdinal = 0;
-    bool sawD31 = false;
-    for (auto const& fa : out.alloc.perFunc) {
-        for (auto const& a : fa.assignments) {
-            if (a.isSpilled()) continue;
-            LirReg const phys = a.physReg();
-            if (phys.regClass() != LirRegClass::FPR) continue;
-            if (phys.id > maxFprOrdinal) maxFprOrdinal = phys.id;
-            if (phys.id == 64u) sawD31 = true;
+    // c75 (D-AS-REGALLOC-SPILL-RELOAD-SCRATCH): the high caller-saved
+    // FPRs — including d31 (global ordinal 64) — are now RESERVED as
+    // spill-reload scratch, so d31 is no longer ASSIGNED to a vreg; it
+    // sits in the rewriter's scratch pool instead. The >64 ordinal re-key
+    // is still exercised: pickScratchRegs's register loop reaches ordinal
+    // 64 while building the pool and ADDS d31 to it (a reserved,
+    // unassigned, still-allocatable register). The core assertions below
+    // (rewrite ok, no 'out of 64-bit bound' error) verify that ordinal-64
+    // handling — a uint64 bitmask keyed by the ordinal is UB at
+    // `contains(64)`/`insert(64)` during that pool build. Pre-c75 this
+    // corpus incidentally ASSIGNED a vreg to d31; c75 reserves d31, so the
+    // ordinal-64 register is now exercised through the POOL, not an
+    // assignment (the low-FPR-pressure function no longer needs to spill).
+    // Non-vacuity: the target must structurally carry an FPR at global
+    // ordinal >= 64 so the loop actually crosses the >64 boundary; an
+    // arm64 variant dropping it makes this pin vacuous — fail LOUD here.
+    std::uint32_t maxFprSchemaOrdinal = 0;
+    {
+        auto const regs = out.lowered.target->registers();
+        for (std::uint16_t i = 0; i < regs.size(); ++i) {
+            if (regs[i].regClass == TargetRegClass::FPR
+                && regs[i].subOf.empty() && i > maxFprSchemaOrdinal) {
+                maxFprSchemaOrdinal = i;
+            }
         }
     }
-    ASSERT_TRUE(sawD31)
-        << "precondition: the FP-overflow corpus must allocate a vreg to d31 "
-           "(global ordinal 64) so the >64 scratch-ordinal re-key is actually "
-           "exercised — max FPR ordinal assigned was " << maxFprOrdinal
-        << " (if the allocator no longer reaches d31 this pin is vacuous; "
-           "restore the precondition or re-pressure the corpus)";
+    ASSERT_GE(maxFprSchemaOrdinal, 64u)
+        << "precondition: arm64 must carry an FPR at global ordinal >= 64 "
+           "(d31 = 64) for the >64 scratch-ordinal re-key to matter — max "
+           "FPR ordinal in the register table was " << maxFprSchemaOrdinal;
 
     DiagnosticReporter rewriteRep;
     auto rewritten = rewriteWithAllocation(out.lowered.lir.lir, *out.lowered.target,

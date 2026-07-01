@@ -284,6 +284,22 @@ rewriteOneFunc(Lir const&               src,
                "target schema missing frame_load / frame_store opcodes");
         return false;
     }
+    // D-AS-REGALLOC-ARG-REGISTER-OCCUPIED (c75 correctness fix): the
+    // `arg` opcode handle. When a SPILLED param's `arg` op stages its
+    // incoming value into a scratch register for the frame-store, that
+    // scratch must NOT be an incoming arg register still holding a live
+    // param — the `arg` ops are emitted CONTIGUOUSLY at the entry-block
+    // head (mir_to_lir), so at any arg op the later params' arg
+    // registers are still live; staging through one clobbers that
+    // incoming param before its own `arg` op materializes it (variant 1:
+    // x86_64 SysV r9 = the 6th int arg register AND a caller-saved
+    // scratch candidate). The forbidden set = argGprs ∪ argFprs (the
+    // SAME `forbiddenBase` the spilled-indirect-callee filter uses; the
+    // result's class pool only ever matches its own-class arg regs).
+    // `arg` ops have no operands, and every later instruction runs after
+    // all args are materialized, so the arg-op RESULT store is the sole
+    // entry-region reload that can clobber a still-live incoming arg reg.
+    auto const argOp = schema.opcodeByMnemonic("arg");
 
     auto const& funcInfo = src.funcArena().at(fn);
     b.addFunction(SymbolId{funcInfo.symbol});
@@ -327,6 +343,39 @@ rewriteOneFunc(Lir const&               src,
             // scratch filter at operand index 0.
             auto const* info = schema.opcodeInfo(op);
 
+            // D-AS-REGALLOC-ARG-REGISTER-OCCUPIED (c75 correctness fix,
+            // implicit-clobber sibling): a reload scratch for THIS
+            // instruction must NOT be one of the instruction's OWN
+            // implicit registers (inputs ∪ clobbered — e.g. x86 idiv's rax
+            // dividend + rdx high-half). reserve-K puts non-arg caller-
+            // saved registers (SysV rax) into the rewriter scratch pool;
+            // without this filter a spilled idiv DIVISOR reloads into rax
+            // and clobbers the dividend the idiv still needs — a SILENT
+            // miscompile (121 not 160). The allocator's
+            // implicitClobbersCrossedBy keeps VREG HOMES off these ordinals
+            // across the op, but the rewriter's transient reload scratch is
+            // a SEPARATE pool needing the same exclusion AT the op. Driven
+            // by the per-opcode schema declaration (no `if (op == idiv)`) —
+            // the SAME inputs∪clobbered union collectImplicitClobberPositions
+            // builds. Calls + `arg` ops carry no implicitRegisters, so this
+            // is DISJOINT from the isCall-op0 / spilled-arg-result filters.
+            std::vector<std::uint16_t> implicitForbidden;
+            if (info != nullptr && info->implicitRegisters.has_value()) {
+                auto const& ir = *info->implicitRegisters;
+                implicitForbidden.reserve(ir.inputOrdinals.size()
+                                          + ir.clobberedOrdinals.size());
+                for (auto const o : ir.inputOrdinals)
+                    implicitForbidden.push_back(o);
+                for (auto const o : ir.clobberedOrdinals) {
+                    bool dup = false;
+                    for (auto const e : implicitForbidden)
+                        if (e == o) { dup = true; break; }
+                    if (!dup) implicitForbidden.push_back(o);
+                }
+            }
+            std::span<std::uint16_t const> const implicitForbiddenSpan{
+                implicitForbidden.data(), implicitForbidden.size()};
+
             struct PendingLoad { LirReg scratch; LirSpillSlot slot; };
             std::vector<PendingLoad> loads;
             std::vector<LirOperand> newOps;
@@ -344,7 +393,8 @@ rewriteOneFunc(Lir const&               src,
                     // consumes it (see resolveReg's docblock). The
                     // L_IndirectCalleeClobberedByArgSetup backstop in
                     // lir_callconv catches any escape loudly.
-                    std::span<std::uint16_t const> forbidden{};
+                    std::span<std::uint16_t const> forbidden =
+                        implicitForbiddenSpan;
                     if (opIdx == 0 && info != nullptr && info->isCall) {
                         auto const* a = alloc.forVReg(o.reg.id);
                         if (a != nullptr && a->isSpilled()) {
@@ -379,7 +429,26 @@ rewriteOneFunc(Lir const&               src,
             LirReg newResult = srcResult;
             std::optional<LirSpillSlot> pendingStore;
             if (srcResult.valid() && srcResult.isPhysical == 0) {
-                auto const rr = resolveReg(srcResult, alloc, scratch, cursor);
+                // D-AS-REGALLOC-ARG-REGISTER-OCCUPIED (c75 correctness
+                // fix): a SPILLED `arg` op's result stages the incoming
+                // param through a scratch reg for the frame-store —
+                // forbid the cc's arg registers as that scratch (a later
+                // param's still-live incoming arg reg must not be
+                // clobbered before its own `arg` op runs). Applies only
+                // when this is an `arg` op AND its result is spilled;
+                // mirrors the spilled-indirect-callee forbidden filter.
+                std::span<std::uint16_t const> resultForbidden =
+                    implicitForbiddenSpan;
+                if (argOp.has_value() && op == *argOp) {
+                    auto const* a = alloc.forVReg(srcResult.id);
+                    if (a != nullptr && a->isSpilled()) {
+                        if (!buildForbidden()) return false;
+                        resultForbidden =
+                            std::span<std::uint16_t const>{forbiddenBase};
+                    }
+                }
+                auto const rr = resolveReg(srcResult, alloc, scratch, cursor,
+                                           resultForbidden);
                 if (!rr.phys.valid()) {
                     classExhausted = true;
                 } else {
