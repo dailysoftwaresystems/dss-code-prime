@@ -3484,16 +3484,22 @@ TEST(MirLoweringCSubset, FloatIfConditionLowersAsFCmpUneNotFpToUi) {
     EXPECT_EQ(countOp(L.mir.mir, MirOpcode::Trunc), 0u);
 }
 
-// Char condition: Char is C-scalar arithmetic — same `!= 0` test against
-// a Char-typed zero (no promotion is needed for an unequal-to-zero
-// test). Char-width ALU forms are still gated at LIR (D-CSUBSET-32BIT-
-// ALU-FORMS) so the runtime tier stays fail-loud at the right shape.
-TEST(MirLoweringCSubset, CharIfConditionLowersAsICmpNeTypedZero) {
+// Char condition (c71, D-CSUBSET-32BIT-ALU-FORMS): a `char` used as a truth
+// value integer-PROMOTES to `int` (C 6.3.1.1) before the `!= 0` test, so the
+// synthetic Ne is I32-typed (an SExt-promoted operand vs an i32 zero).
+// Pre-c71 `coerceCondition` minted a SAME-TYPE (Char) zero and skipped
+// promotion, leaving a Char-typed ICmpNe that walled at the LIR sub-native
+// ALU gap — the exact x902 blocker on sqlite3.c (`while (*z)`, `if (c)`).
+// The truth value is unchanged (any nonzero narrow is nonzero int); only the
+// compare WIDTH changes, from the gated Char form to a native i32 ICmp.
+TEST(MirLoweringCSubset, CharIfConditionIntegerPromotesToI32BeforeICmpNe) {
     auto L = lowerCSubset(
         "int f(char c) { if (c) return 1; return 0; }");
     expectTruthinessNe(L, "if(char)");
-    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 0), TypeKind::Char);
-    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 1), TypeKind::Char);
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 0), TypeKind::I32)
+        << "c71: the char cond must be SExt-promoted to i32 before the Ne";
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 1), TypeKind::I32)
+        << "c71: the synthetic zero is minted at the promoted (i32) type";
 }
 
 // Pointer condition: `if (p)` tests `p != null-pointer-constant` when

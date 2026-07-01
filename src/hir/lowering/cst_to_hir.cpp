@@ -643,9 +643,28 @@ struct Lowerer {
         TypeKind const ck = interner.kind(cond.type);
         if (ck == TypeKind::Bool) return cond;
         if (isArithmeticCore(ck)) {
-            HirNodeId const zero = synthZeroOrError(anchor, cond.type);
+            // c71 (D-CSUBSET-32BIT-ALU-FORMS): a SUB-INT arithmetic condition
+            // (a `char`/`signed char`/`short` used as a truth value — sqlite's
+            // pervasive `while (*z)`, `if (c)`) must integer-PROMOTE to `int`
+            // (C 6.3.1.1) BEFORE the `!= 0` test. Otherwise the synthetic
+            // `Ne(cond, zero)` is a Char/I8-typed ICmp that walls at the
+            // target's sub-native ALU gap (no width-8/16 compare form) — the
+            // same wall the index path guards via `integerPromotedType`. The
+            // truth value is unchanged (any nonzero narrow is nonzero int),
+            // but the compare is now I32. Reuse the SAME chokepoint; a
+            // block-less language (no `arith_`) or an already-≥int cond keeps
+            // the raw value, and a float cond passes through (integerPromoted-
+            // Type is a no-op on floats → the `Ne` stays an FCmp).
+            E promoted = cond;
+            if (arith_.has_value()) {
+                TypeId const p =
+                    integerPromotedType(interner, cond.type, *arith_);
+                if (p.valid() && p.v != cond.type.v)
+                    promoted = coerce(cond, p);
+            }
+            HirNodeId const zero = synthZeroOrError(anchor, promoted.type);
             return {track(builder.addParent(HirKind::BinaryOp,
-                                            std::array{cond.id, zero},
+                                            std::array{promoted.id, zero},
                                             boolType(),
                                             encodeOp(HirOpKind::Ne)),
                           anchor),
@@ -2700,8 +2719,26 @@ struct Lowerer {
             unsupported(node, std::format("unary target '{}' is not a core unary operator", e.target));
             return {errorNode(node), InvalidType};
         }
+        // c71 (D-CSUBSET-32BIT-ALU-FORMS): a logical `!` on a SUB-INT arithmetic
+        // operand integer-PROMOTES the operand to `int` (C 6.5.3.3p5: `!E` is
+        // `(E == 0)`, which applies the usual arithmetic conversions) — else the
+        // MIR lowering's `ICmpEq(operand, 0)` is a Char/I8-typed compare that
+        // walls at the target's sub-native ALU gap (the pervasive `if(!*z)` /
+        // `if(!c)` sqlite scan idiom). The sibling of coerceCondition's promotion
+        // (`!` is a negated truth test). Bool is EXCLUDED (its compare-to-zero
+        // ICmpEq form is already native — no widening needed, and it keeps the
+        // `!bool` shape unchanged); float/pointer/≥int operands pass through
+        // (`integerPromotedType` is a no-op → `!f`/`!p` compare at their own
+        // width). The `!` result stays Bool.
+        E notOperand = operand;
+        if (*op == HirOpKind::Not && arith_.has_value() && operand.type.valid()
+            && interner.kind(operand.type) != TypeKind::Bool) {
+            TypeId const p = integerPromotedType(interner, operand.type, *arith_);
+            if (p.valid() && p.v != operand.type.v)
+                notOperand = coerce(operand, p);
+        }
         TypeId const result = (*op == HirOpKind::Not) ? boolType() : operand.type;
-        return {track(builder.addParent(HirKind::UnaryOp, std::array{operand.id},
+        return {track(builder.addParent(HirKind::UnaryOp, std::array{notOperand.id},
                                         result, encodeOp(*op)), node), result};
     }
 
@@ -3973,13 +4010,25 @@ struct Lowerer {
     // shared single source across the three ++/-- sites — keeps postfix-int from
     // regressing). Pointer lvalues route to `pointerIncDecStep` instead.
     [[nodiscard]] HirNodeId incDecArithValue(Lvalue const& lv, bool inc, NodeId anchor) {
-        TypeId const opType = incDecArithType(lv.type);   // enum → underlying int
+        TypeId opType = incDecArithType(lv.type);         // enum → underlying int
+        // c71 (D-CSUBSET-32BIT-ALU-FORMS): a SUB-INT lvalue (`char c; c++`)
+        // must integer-PROMOTE the arithmetic to `int` (C 6.3.1.1) — else the
+        // BinaryOp Add/Sub is Char/I8-typed and walls at the target's
+        // sub-native ALU gap. The trailing `coerce` narrows the I32 result
+        // back to the lvalue type (Trunc) for the store, preserving the type's
+        // wraparound EXACTLY (C's `(char)((int)c ± 1)` — a `char 127` still
+        // wraps to `-128`). Reuse the SAME `integerPromotedType` chokepoint as
+        // the condition / index / binary-op paths; the enum remap above already
+        // established this int-typed-codegen discipline, and a block-less
+        // language keeps the raw opType (its coerces no-op as before).
+        if (arith_.has_value())
+            opType = integerPromotedType(interner, opType, *arith_);
         HirNodeId const one = synthOne(opType);
-        HirNodeId const lhs = coerce(E{lvRead(lv), lv.type}, opType).id;  // no-op if non-enum
+        HirNodeId const lhs = coerce(E{lvRead(lv), lv.type}, opType).id;  // widen (SExt/ZExt) if sub-int/enum
         HirNodeId const sum = track(builder.addParent(
             HirKind::BinaryOp, std::array{lhs, one}, opType,
             encodeOp(inc ? HirOpKind::Add : HirOpKind::Sub)), anchor);
-        return coerce(E{sum, opType}, lv.type).id;        // int → enum write-back
+        return coerce(E{sum, opType}, lv.type).id;        // narrow back for the store
     }
 
     // FC-F1: the new value `++`/`--` stores for lvalue `lv` — the scaled pointer
