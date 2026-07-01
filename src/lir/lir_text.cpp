@@ -241,6 +241,13 @@ renderOperand(LirOperand const& op, TargetSchema const& schema,
             // LIR-text fixture that needs to witness the clamp must build it via the
             // structured operand, not the textual codec.
             return std::format("byval#{}", op.byValueAggBytes);
+        case LirOperandKind::SpillSlotRef:
+            // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a spilled register-passed
+            // call-arg reference (slot + class). Debug/intermediate-LIR text
+            // only — callconv consumes it before final golden-text emission, so
+            // this arm is a diagnostic aid, not a round-tripped codec (the
+            // class is not re-parsed, mirroring the ByValueStackAgg exhaust byte).
+            return std::format("spill#{}", op.spillSlotV);
     }
     // Fall-through is a substrate-corruption signal — the discriminator
     // landed on the reserved slot 3 (formerly ImmFloat) or on an out-of-

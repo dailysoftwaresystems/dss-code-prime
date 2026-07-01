@@ -705,14 +705,21 @@ TEST(LirRewrite, SpilledVariadicIndirectCalleeReloadScratchSkipsArgAndCountRegs)
         << "every cc arg register must resolve to a distinct ordinal "
            "and the count register must not alias an arg register";
 
-    // Exact rewritten shape: 3 reloads + the call + ret.
+    // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): the two spilled register-passed
+    // ARGS (vr2 fixed, vr3 vararg) are now DEFERRED to callconv as SpillSlotRef
+    // operands — NOT scratch-reloaded here. Only the spilled CALLEE (ops[0])
+    // still reloads into a scratch register (the FC4-c2 B2 contract this test
+    // pins). So the rewritten shape is ONE frame_load (the callee) + the call +
+    // ret. The B2 pin below is UNCHANGED — the callee's scratch must still skip
+    // the cc arg/count registers; c77 only removed the redundant arg reloads.
     Lir const& dst = rewritten.lir;
     ASSERT_EQ(dst.moduleFuncCount(), 1u);
     LirFuncId const dfn = dst.funcAt(0);
     ASSERT_EQ(dst.funcBlockCount(dfn), 1u);
     LirBlockId const blk = dst.funcBlockAt(dfn, 0);
-    ASSERT_EQ(dst.blockInstCount(blk), 5u)
-        << "expected frame_load x3 + call + ret";
+    ASSERT_EQ(dst.blockInstCount(blk), 3u)
+        << "c77: expected frame_load x1 (spilled callee) + call + ret — the two "
+           "spilled register-args are deferred as SpillSlotRef operands";
 
     // Locate the call via the schema's isCall flag (agnostic walk).
     std::uint32_t callIdx   = 0;
@@ -732,57 +739,62 @@ TEST(LirRewrite, SpilledVariadicIndirectCalleeReloadScratchSkipsArgAndCountRegs)
     auto const rewrittenOps = dst.instOperands(callInst);
     ASSERT_EQ(rewrittenOps.size(), 3u);
 
-    // Map each spilled operand to its reload by SPILL-SLOT payload
-    // (slot v == opIdx+1 was assigned to operand opIdx above): exactly
-    // ONE frame_load per slot, each BEFORE the call, dest == the
-    // register the rewritten call consumes at that operand position.
-    // This is the non-vacuity spine: the callee reload REALLY happened
-    // and the call's ops[0] is REALLY its dest.
-    std::array<LirReg, 3> reloadDest{};
-    for (std::uint32_t opIdx = 0; opIdx < 3; ++opIdx) {
-        std::uint32_t const slotV = opIdx + 1u;
-        std::size_t   found   = 0;
-        std::uint32_t loadIdx = 0;
-        for (std::uint32_t i = 0; i < dst.blockInstCount(blk); ++i) {
-            LirInstId const inst = dst.blockInstAt(blk, i);
-            if (dst.instOpcode(inst) != *frameLoadOp) continue;
-            if (dst.instPayload(inst) != slotV) continue;
-            ++found;
-            loadIdx = i;
-            reloadDest[opIdx] = dst.instResult(inst);
-        }
-        ASSERT_EQ(found, 1u)
-            << "exactly one reload for spill slot " << slotV;
-        EXPECT_LT(loadIdx, callIdx)
-            << "the reload for slot " << slotV << " must precede the call";
-        ASSERT_EQ(rewrittenOps[opIdx].kind, LirOperandKind::Reg);
-        LirReg const r = rewrittenOps[opIdx].reg;
-        ASSERT_TRUE(r.valid());
-        EXPECT_EQ(r.isPhysical, 1u);
-        EXPECT_EQ(r.regClass(), LirRegClass::GPR);
-        EXPECT_EQ(reloadDest[opIdx].isPhysical, 1u);
-        EXPECT_EQ(reloadDest[opIdx].regClass(), LirRegClass::GPR);
-        EXPECT_EQ(r.id, reloadDest[opIdx].id)
-            << "call operand " << opIdx
-            << " must consume its own reload's dest";
+    // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): ops[0] (callee) is a scratch-
+    // reloaded Reg; ops[1]/ops[2] (the two spilled register-args) are now
+    // SpillSlotRef operands carrying their slots (2, 3) + class GPR — deferred
+    // to callconv's arg-setup (which loads them directly into the ABI arg regs).
+    // Exactly ONE frame_load exists (the callee, slot 1), before the call.
+    std::size_t   calleeLoads = 0;
+    std::uint32_t calleeLoadIdx = 0;
+    LirReg        calleeReloadDest{};
+    for (std::uint32_t i = 0; i < dst.blockInstCount(blk); ++i) {
+        LirInstId const inst = dst.blockInstAt(blk, i);
+        if (dst.instOpcode(inst) != *frameLoadOp) continue;
+        ++calleeLoads;
+        calleeLoadIdx    = i;
+        calleeReloadDest = dst.instResult(inst);
+        EXPECT_EQ(dst.instPayload(inst), 1u)
+            << "the only reload must be the spilled callee (slot 1); the two "
+               "arg slots (2,3) are deferred as SpillSlotRef, not reloaded";
+    }
+    ASSERT_EQ(calleeLoads, 1u)
+        << "c77: exactly one frame_load (the spilled callee) — the register "
+           "args are deferred";
+    EXPECT_LT(calleeLoadIdx, callIdx)
+        << "the callee reload must precede the call";
+
+    // ops[0] is the callee, a physical GPR == its reload's dest.
+    ASSERT_EQ(rewrittenOps[0].kind, LirOperandKind::Reg);
+    LirReg const calleeR = rewrittenOps[0].reg;
+    ASSERT_TRUE(calleeR.valid());
+    EXPECT_EQ(calleeR.isPhysical, 1u);
+    EXPECT_EQ(calleeR.regClass(), LirRegClass::GPR);
+    EXPECT_EQ(calleeR.id, calleeReloadDest.id)
+        << "the call's ops[0] must consume the callee reload's dest";
+
+    // ops[1], ops[2] are SpillSlotRef operands (deferred args) carrying their
+    // spill slots (2, 3) + class GPR — the c77 direct-arg-reload marker.
+    for (std::uint32_t opIdx = 1; opIdx < 3; ++opIdx) {
+        ASSERT_EQ(rewrittenOps[opIdx].kind, LirOperandKind::SpillSlotRef)
+            << "call arg operand " << opIdx
+            << " must be a deferred SpillSlotRef (c77)";
+        EXPECT_EQ(rewrittenOps[opIdx].spillSlotV, opIdx + 1u)
+            << "SpillSlotRef must carry the arg's spill slot";
+        EXPECT_EQ(rewrittenOps[opIdx].spillSlotClass,
+                  static_cast<std::uint8_t>(LirRegClass::GPR))
+            << "SpillSlotRef must carry the arg's register class";
     }
 
-    // ── THE B2 PIN ── the spilled CALLEE's reload scratch ordinal is
-    // outside argGprs ∪ argFprs ∪ {variadic count register}.
-    std::uint32_t const calleeOrd = reloadDest[0].id;
+    // ── THE B2 PIN (UNCHANGED by c77) ── the spilled CALLEE's reload scratch
+    // ordinal is outside argGprs ∪ argFprs ∪ {variadic count register}. c77 did
+    // not touch the callee (ops[0]) reload path; this contract still holds.
+    std::uint32_t const calleeOrd = calleeReloadDest.id;
     EXPECT_EQ(forbidden.count(calleeOrd), 0u)
         << "B2 regression: the spilled indirect-call CALLEE was "
            "reloaded into cc arg/count register ordinal " << calleeOrd
         << " — the post-regalloc arg-setup moves (or the variadic "
            "count mov) would clobber the callee before the call "
            "consumes it (silent jump through an argument value)";
-
-    // Cursor/rotation discipline: three reloads, three DISTINCT
-    // scratches — entries skipped for the callee stayed available
-    // (rotated, not burned) and no two operands share a scratch.
-    EXPECT_NE(reloadDest[0].id, reloadDest[1].id);
-    EXPECT_NE(reloadDest[0].id, reloadDest[2].id);
-    EXPECT_NE(reloadDest[1].id, reloadDest[2].id);
 
     DiagnosticReporter verifyRep;
     EXPECT_TRUE(verifyLirPostRegalloc(rewritten.lir, sch, verifyRep));

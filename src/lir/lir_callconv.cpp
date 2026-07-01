@@ -1331,7 +1331,38 @@ returnReg(TargetSchema const&            schema,
 
 // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): one `dst <- src` register copy in
 // a parallel-move set (the return-register PIECES of a by-value struct return).
-struct RegMove { LirReg dst; LirReg src; };
+//
+// c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a move may instead have a MEMORY source
+// — a spilled register-passed call arg loaded DIRECTLY into its ABI arg register
+// (`frame_load dst, [memSlot]`). `isMemSrc` selects that arm; `src` is Invalid for
+// a mem-src move. A mem-src move is a pure SINK in the parallel copy: it is never
+// another move's SOURCE (nothing reads a register FROM it), so it can neither
+// block another move nor be a cycle member — it just waits until its `dst` is
+// free-to-write (no pending move still reads dst), then emits its load. This
+// composes with the reg→reg topo-sort + cycle-break UNCHANGED.
+struct RegMove {
+    LirReg        dst;
+    LirReg        src;                  // Invalid when isMemSrc
+    bool          isMemSrc = false;
+    std::uint32_t memSlotV = 0;         // LirSpillSlot.v, when isMemSrc
+};
+
+// c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): the frame geometry `emitParallelRegMoves`
+// needs to lower a mem-src move (`frame_load argReg, [slot]`) into a real sp-
+// relative load — the SAME formula the frame_load materialization uses
+// (`spillAreaOffset() + (slot.v-1)*slotSize`), so a direct-arg reload reads the
+// exact slot the rewriter would have. `sp` + `gprLoad`/`gprLoadU` feed the
+// emitFrameLoad chokepoint (the load op itself is class-resolved per dst). Passed
+// with `hasMemSrc=false` by the return-piece caller (which never has a mem-src
+// move), so the fields are unread there.
+struct MemSrcLoadCtx {
+    bool          valid = false;
+    LirReg        sp{};
+    std::uint32_t spillAreaOffset = 0;
+    std::uint32_t slotSize = 0;
+    std::uint16_t gprLoad = 0;
+    std::uint16_t gprLoadU = 0;
+};
 
 // Pick a caller-saved register of class `cls` not among the registers `moves`
 // touches (nor among `reserved`) — a free scratch at a call/return boundary
@@ -1427,7 +1458,8 @@ emitParallelRegMoves(LirBuilder& b, TargetSchema const& schema,
                      TargetCallingConvention const& cc,
                      std::vector<RegMove> moves,
                      std::span<std::uint16_t const> reserved,
-                     std::string_view ctx, DiagnosticReporter& reporter) {
+                     std::string_view ctx, DiagnosticReporter& reporter,
+                     MemSrcLoadCtx const& memCtx = {}) {
     // D-ML7-2.3 scratch-collapse fix: every parallel-move destination holds a
     // COMMITTED value that must survive intact until the following `call` — an
     // emitted move's destination now carries its final argument; an IDENTITY
@@ -1457,21 +1489,59 @@ emitParallelRegMoves(LirBuilder& b, TargetSchema const& schema,
             scratchReserved.push_back(d);
         }
     }
-    std::erase_if(moves, [](RegMove const& m) { return m.dst.id == m.src.id; });
+    // c77: a mem-src move (src Invalid) is never an identity — the erase only
+    // drops reg→reg dst==src no-ops.
+    std::erase_if(moves, [](RegMove const& m) {
+        return !m.isMemSrc && m.dst.id == m.src.id;
+    });
     auto isPendingSrc = [&](std::uint16_t id) {
-        for (auto const& m : moves)
-            if (m.src.id == id) return true;
+        for (auto const& m : moves) {
+            // c77: a mem-src move has NO register source (src Invalid, id 0), so it
+            // never keeps another move's dst pending. Only reg-src moves count.
+            if (!m.isMemSrc && m.src.id == id) return true;
+        }
         return false;
+    };
+    // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): emit ONE move — a reg→reg `mov` or,
+    // for a mem-src move, a `frame_load dst, [slot]` lowered to the sp-relative
+    // load (byte-identical to the frame_load materialization's formula). Fails
+    // loud if a mem-src move is reached without a valid MemSrcLoadCtx (only the
+    // arg-passing caller supplies mem-src moves + the ctx — a mem-src move in the
+    // return-piece path would be an internal invariant break).
+    auto emitOne = [&](RegMove const& m) -> bool {
+        if (!m.isMemSrc) {
+            auto const mv = classOpHandle(schema, m.dst.regClass(),
+                                          RegClassOp::Move, ctx, reporter);
+            if (!mv.has_value()) return false;
+            emitMov(b, *mv, m.dst, m.src);
+            return true;
+        }
+        if (!memCtx.valid) {
+            report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                   DiagnosticSeverity::Error,
+                   std::format("{}: a memory-source (spilled call-arg) parallel "
+                               "move reached emit without frame geometry — "
+                               "internal c77 direct-arg-reload invariant break",
+                               ctx));
+            return false;
+        }
+        LirSpillSlot const slot{m.memSlotV};
+        std::int32_t const offset = static_cast<std::int32_t>(
+            memCtx.spillAreaOffset + (slot.v - 1u) * memCtx.slotSize);
+        auto const spillLoad = classOpHandle(
+            schema, m.dst.regClass(), RegClassOp::Load,
+            "materializeOneFunc: direct-arg spill reload", reporter);
+        if (!spillLoad.has_value()) return false;
+        emitFrameLoad(b, *spillLoad, m.dst, memCtx.sp, offset,
+                      memCtx.gprLoad, memCtx.gprLoadU);
+        return true;
     };
     while (!moves.empty()) {
         bool progressed = false;
         for (std::size_t i = 0; i < moves.size(); ++i) {
             // Safe to emit now iff nobody still needs to READ moves[i].dst.
             if (isPendingSrc(moves[i].dst.id)) continue;
-            auto const mv = classOpHandle(schema, moves[i].dst.regClass(),
-                                          RegClassOp::Move, ctx, reporter);
-            if (!mv.has_value()) return false;
-            emitMov(b, *mv, moves[i].dst, moves[i].src);
+            if (!emitOne(moves[i])) return false;
             moves.erase(moves.begin() + static_cast<std::ptrdiff_t>(i));
             progressed = true;
             break;
@@ -1485,7 +1555,31 @@ emitParallelRegMoves(LirBuilder& b, TargetSchema const& schema,
         // the source register so a safe move opens up next iteration, and the
         // progress scan drains the rest of the (now linear) chain. Disjoint cycles
         // are handled across successive outer iterations.
-        LirReg const cycSrc = moves.front().src;
+        //
+        // c77: a mem-src move is a pure SINK — it is never anyone's source, so it
+        // can never be a cycle member. When only cycles remain, every stuck move
+        // that is a mem-src is simply WAITING for a reg-src cycle to break and free
+        // its dst; the cycle break must therefore pick a REG-SRC victim. (A mem-src
+        // move cannot be `moves.front()` in a genuine deadlock, but scan for the
+        // first reg-src move regardless of position to be robust.)
+        RegMove const* cyc = nullptr;
+        for (auto const& m : moves) {
+            if (!m.isMemSrc) { cyc = &m; break; }
+        }
+        if (cyc == nullptr) {
+            // Only mem-src moves remain yet none can emit — impossible (a mem-src
+            // move blocks on `isPendingSrc(dst)`, which is only ever true because
+            // of a reg-src move; if no reg-src moves remain, isPendingSrc is false
+            // for all, so the progress scan drained them). Fail loud rather than
+            // spin.
+            report(reporter, DiagnosticCode::L_MoveCycleUnsupported,
+                   DiagnosticSeverity::Error,
+                   std::format("{}: parallel move stuck with only memory-source "
+                               "moves remaining — internal c77 invariant break",
+                               ctx));
+            return false;
+        }
+        LirReg const cycSrc = cyc->src;
         auto const scratch = pickScratchReg(schema, cc, cycSrc.regClass(),
                                             moves, scratchReserved, ctx, reporter);
         if (!scratch.has_value()) return false;
@@ -1494,7 +1588,7 @@ emitParallelRegMoves(LirBuilder& b, TargetSchema const& schema,
         if (!mv.has_value()) return false;
         emitMov(b, *mv, *scratch, cycSrc);
         for (auto& m : moves)
-            if (m.src.id == cycSrc.id) m.src = *scratch;
+            if (!m.isMemSrc && m.src.id == cycSrc.id) m.src = *scratch;
     }
     return true;
 }
@@ -2341,6 +2435,14 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 struct ArgMove {
                     LirReg dest;
                     LirReg src;
+                    // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a SPILLED register-
+                    // passed arg loads DIRECTLY into `dest` from its stack slot
+                    // (`frame_load dest, [memSlotV]`) instead of `mov dest, src`.
+                    // `src` is Invalid for a mem-src arg move. Carried into the
+                    // parallel-move machinery (emitParallelRegMoves) where it is a
+                    // pure sink — sequenced AFTER any reg-move that reads `dest`.
+                    bool          isMemSrc = false;
+                    std::uint32_t memSlotV = 0;
                 };
                 struct StackArgStore {
                     LirReg       src;
@@ -2428,8 +2530,24 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // FC12a-struct: the ByValueStackAgg marker is consumed WITH its
                     // preceding Reg (below) — never on its own. Skip it here.
                     if (argOp.kind == LirOperandKind::ByValueStackAgg) continue;
-                    if (argOp.kind != LirOperandKind::Reg
-                        || argOp.reg.isPhysical == 0) {
+                    // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a SpillSlotRef is a
+                    // SPILLED register-passed arg the rewriter deferred. Its class
+                    // rides `spillSlotClass`; it has no source register (it loads
+                    // from its stack slot directly into its ABI arg register). It
+                    // advances the arg cursors EXACTLY as a Reg arg of that class
+                    // would (the rewriter's classifier used the same walk), and is
+                    // never a by-value carrier (a carrier is a Reg + marker; the
+                    // rewriter never defers a carrier). Handled uniformly below via
+                    // `isSpillRef` — the register-resident branch pushes a mem-src
+                    // ArgMove. A SpillSlotRef must NEVER land in the overflow region
+                    // (lowerWideCallArgs removed overflow args pre-regalloc, and the
+                    // rewriter only defers args the cc passes in a register) — a
+                    // defensive fail-loud guards that below.
+                    bool const isSpillRef =
+                        argOp.kind == LirOperandKind::SpillSlotRef;
+                    if (!isSpillRef
+                        && (argOp.kind != LirOperandKind::Reg
+                            || argOp.reg.isPhysical == 0)) {
                         report(reporter,
                                DiagnosticCode::L_VirtualRegInPostRegalloc,
                                DiagnosticSeverity::Error,
@@ -2439,8 +2557,10 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                            argRegionIdx));
                         return false;
                     }
-                    LirReg const srcReg = argOp.reg;
-                    LirRegClass const cls = srcReg.regClass();
+                    LirReg const srcReg = isSpillRef ? InvalidLirReg : argOp.reg;
+                    LirRegClass const cls = isSpillRef
+                        ? static_cast<LirRegClass>(argOp.spillSlotClass)
+                        : srcReg.regClass();
                     // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): a Reg
                     // immediately FOLLOWED by a ByValueStackAgg marker is the by-value-
                     // stack aggregate carrier. It is passed ENTIRELY in the overflow
@@ -2449,7 +2569,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // arg register (the class/slot counters do NOT advance) and reserves
                     // ceil(bytes / slot) overflow slots. This is the force-to-stack
                     // lever the greedy register-then-overflow placement otherwise lacks.
-                    if ((i + 1) < ops.size()
+                    if (!isSpillRef && (i + 1) < ops.size()
                         && ops[i + 1].kind == LirOperandKind::ByValueStackAgg) {
                         std::uint32_t const aggBytes = ops[i + 1].byValueAggBytes;
                         std::int32_t const dstOffset =
@@ -2502,7 +2622,19 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                             argPassingReg(schema, cc, argIndex, cls,
                                           "materializeOneFunc: call", reporter);
                         if (!destReg.has_value()) return false;
-                        argMoves.push_back({*destReg, srcReg});
+                        // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a SpillSlotRef arg
+                        // becomes a MEM-SOURCE arg move — `frame_load destReg, [slot]`
+                        // — sequenced by emitParallelRegMoves as a sink (after any
+                        // reg-move that reads destReg). A normal Reg arg is the usual
+                        // reg→reg move. Both take the SAME arg-index slot, so the
+                        // move set + hazard analysis are index-consistent.
+                        if (isSpillRef) {
+                            argMoves.push_back(
+                                {*destReg, InvalidLirReg, /*isMemSrc=*/true,
+                                 argOp.spillSlotV});
+                        } else {
+                            argMoves.push_back({*destReg, srcReg});
+                        }
                         // FC12b PART 5: a register-resident FP VARARG under Win64 also
                         // duplicates into its home integer reg argGprs[slot]. Win64 is
                         // slot-aligned so `argIndex` IS the slot index; argGprs[slot]
@@ -2521,6 +2653,26 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                             fpDupMoves.push_back({*homeGpr, *destReg});
                         }
                     } else {
+                        // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a SpillSlotRef must
+                        // never reach the OVERFLOW region — lowerWideCallArgs removed
+                        // overflow scalar args pre-regalloc, and the rewriter only
+                        // defers args the cc passes in a REGISTER (classifyCallRegArgs
+                        // marks only argIndex<poolSize). A SpillSlotRef here means the
+                        // rewriter's classifier and this walk diverged → fail loud
+                        // rather than dereference an Invalid srcReg into a stack store.
+                        if (isSpillRef) {
+                            report(reporter,
+                                   DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                                   DiagnosticSeverity::Error,
+                                   std::format("callconv: call inst {} arg {} is a "
+                                               "deferred spilled-arg (SpillSlotRef) "
+                                               "but landed in the stack-overflow "
+                                               "region — the rewriter's direct-arg-"
+                                               "reload classifier disagreed with the "
+                                               "callconv arg walk (c77 invariant "
+                                               "break)", inst.v, argRegionIdx));
+                            return false;
+                        }
                         // D-ML7-2.2 stack-arg overflow: spill srcReg
                         // into THIS fn's outgoing-args area at
                         // [sp + shadowSpaceBytes + overflowIdx * slotSize].
@@ -2815,16 +2967,29 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // so those stores read their sources at the pre-move value.
                 std::vector<RegMove> argRegMoves;
                 argRegMoves.reserve(argMoves.size());
-                for (auto const& m : argMoves) argRegMoves.push_back({m.dest, m.src});
+                // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): carry the mem-src flag +
+                // slot into the parallel-move set. A mem-src move loads its arg
+                // register directly from the spill slot (sequenced as a sink).
+                for (auto const& m : argMoves)
+                    argRegMoves.push_back({m.dest, m.src, m.isMemSrc, m.memSlotV});
                 std::vector<std::uint16_t> argScratchReserved;
                 if (calleeIsReg) argScratchReserved.push_back(calleeOp.reg.id);
                 if (::dss::call_payload::isVariadic(payload)
                     && cc.variadicVectorCountReg.has_value())
                     argScratchReserved.push_back(cc.variadicVectorCountReg->ordinal);
+                // c77: frame geometry for a mem-src arg move's `frame_load argReg,
+                // [slot]` lowering — the SAME formula the frame_load materialization
+                // uses (spillAreaOffset + (slot.v-1)*slotSize). GPR load + its scaled
+                // twin feed the emitFrameLoad chokepoint (the per-move load op is
+                // class-resolved from the arg register's class).
+                MemSrcLoadCtx const argMemCtx{
+                    /*valid=*/true, sp, outLayout.spillAreaOffset(),
+                    outLayout.slotSize, h.load, h.loadU};
                 if (!emitParallelRegMoves(
                         b, schema, cc, std::move(argRegMoves),
                         argScratchReserved,
-                        "materializeOneFunc: call arg-passing move", reporter)) {
+                        "materializeOneFunc: call arg-passing move", reporter,
+                        argMemCtx)) {
                     return false;
                 }
                 // FC12b PART 5: emit the Win64 FP-vararg GPR duplications AFTER the

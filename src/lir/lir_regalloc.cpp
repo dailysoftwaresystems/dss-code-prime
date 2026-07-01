@@ -213,19 +213,21 @@ computeReloadReserve(Lir const& lir, TargetSchema const& schema,
         for (std::uint32_t i = 0; i < n; ++i) {
             LirInstId const inst = lir.blockInstAt(blk, i);
             auto const* info = schema.opcodeInfo(lir.instOpcode(inst));
-            // D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT (option E): calls are NO
-            // LONGER excluded. Before the pre-regalloc wide-call pass, a call's
-            // arg operands could exceed the register file (reserving that many
-            // was impossible) so calls were skipped here. The pass now bounds a
-            // call's register-operand count to the cc's register-passed pool
-            // (≤ argGprs / argFprs), so its rewriter reload demand is bounded
-            // and CAN be reserved — counting it here is what guarantees the
-            // rewriter has scratch for a wide call whose register args regalloc
-            // spilled (the func-2088 blocker). The `store_outgoing_arg` carriers
-            // the pass emits are NON-call, single-operand insts already counted
-            // below. NOTE the count still uses the raw same-class virtual-operand
-            // tally; a call's operands past the pool were removed by the pass, so
-            // this over-counts nothing.
+            // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): CALLS are EXCLUDED again
+            // (reverting c76's option-E removal). With direct-arg-reload, a
+            // spilled register-passed call arg becomes a `SpillSlotRef` that the
+            // rewriter does NOT scratch-reload — callconv loads it DIRECTLY into
+            // its ABI arg register (demand == supply by construction). So a call's
+            // register args need ZERO rewriter reload scratch, and counting them
+            // here would only shrink the allocatable GPR pool for the rest of the
+            // function with no correctness benefit. The wide-call blocker
+            // (func-2088) is closed by the direct reload, not by reserving K. A
+            // spilled INDIRECT-CALLEE (ops[0]) still reloads into a scratch, but
+            // that is a SINGLE same-class operand (demand ≤ 1) — well within the
+            // non-arg caller-saved supply, and general-body ops (counted below)
+            // already dominate it. The `store_outgoing_arg` carriers the wide-call
+            // pass emits are NON-call single-operand insts, still counted below.
+            if (info != nullptr && info->isCall) continue;
             std::array<std::uint16_t, kLirRegClassCount> demand{};
             auto const bump = [&](LirReg r) {
                 if (!r.valid() || r.isPhysical != 0) return;

@@ -99,6 +99,22 @@ enum class LirOperandKind : std::uint8_t {
     // and never split (SysV §3.2.3/§3.5.7). CC-neutral: the size is the
     // only datum; the overflow placement is the callconv's, config-driven.
     ByValueStackAgg = 9,
+    // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a POST-REGALLOC operand naming a
+    // SPILLED value by its stack slot + register class, NOT a virtual register.
+    // Emitted by `rewriteWithAllocation` in place of a scratch-reload for a
+    // spilled register-passed CALL ARG so `materializeCallingConvention` loads
+    // that arg DIRECTLY into its ABI argument register (`frame_load argReg,
+    // [slot]`) — instead of reload-into-scratch (rewriter) then move-scratch-
+    // into-argReg (callconv). There is exactly one arg register per register-
+    // passed arg ⇒ demand == supply, so call-arg reloads need ZERO rewriter
+    // scratch, closing the func-2088 exhaustion (≥4 spilled GPR args outran the
+    // 3 non-arg caller-saved GPR scratch). It is NOT a `Reg`, so
+    // `verifyLirPostRegalloc` (which checks only Reg-kind operands for
+    // physical-ness) accepts it; callconv CONSUMES it before final golden-text
+    // emission, so it never reaches the assembler. Carries `spillSlotV` (the
+    // LirSpillSlot.v) + `spillSlotClass` (the value's LirRegClass, so callconv
+    // picks the class-correct load).
+    SpillSlotRef = 10,
 };
 
 // One slot in the operand pool. The tag picks the active field.
@@ -111,7 +127,12 @@ struct LirOperand {
     // goes to memory (matching the callee's va_start clamp). Unused (0) for any other
     // operand kind. Repurposes one padding byte — no struct-size change.
     std::uint8_t   byValueAggExhaust = 0;        // 1
-    std::uint8_t   _pad[2] = {};                 // 2
+    // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): for a SpillSlotRef operand, the
+    // value's LirRegClass (as a uint8 — GPR/FPR/...) so callconv resolves the
+    // class-correct load op. Repurposes one of the two padding bytes — no
+    // struct-size change (still 8). Unused (0) for any other operand kind.
+    std::uint8_t   spillSlotClass = 0;           // 1
+    std::uint8_t   _pad[1] = {};                 // 1
     union {
         LirReg        reg;        // 4 — kind == Reg
         std::int32_t  immInt32;   // 4 — kind == ImmInt (truncated; full int64 lives in scalar pool)
@@ -121,6 +142,7 @@ struct LirOperand {
         std::int32_t  offset;     // 4 — kind == MemOffset
         std::uint32_t litIndex;   // 4 — kind == LiteralIndex (into LirLiteralPool)
         std::uint32_t byValueAggBytes; // 4 — kind == ByValueStackAgg (aggregate byte size)
+        std::uint32_t spillSlotV; // 4 — kind == SpillSlotRef (LirSpillSlot.v)
     };
 
     constexpr LirOperand() noexcept : kind(LirOperandKind::None), reg{} {}
@@ -185,6 +207,19 @@ struct LirOperand {
         o.kind             = LirOperandKind::ByValueStackAgg;
         o.byValueAggExhaust = exhaust;
         o.byValueAggBytes  = bytes;
+        return o;
+    }
+    // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a spilled register-passed call-arg
+    // reference — its stack slot (`slotV` = LirSpillSlot.v) + its register class
+    // (`cls`, stored as a uint8). Emitted by the rewriter, consumed by callconv's
+    // arg-setup (turned into a `frame_load argReg, [slot]` sequenced within the
+    // parallel-move machinery). See LirOperandKind::SpillSlotRef.
+    [[nodiscard]] static constexpr LirOperand
+    makeSpillSlotRef(std::uint32_t slotV, std::uint8_t cls) noexcept {
+        LirOperand o{};
+        o.kind           = LirOperandKind::SpillSlotRef;
+        o.spillSlotClass = cls;
+        o.spillSlotV     = slotV;
         return o;
     }
 };

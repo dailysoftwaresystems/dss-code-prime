@@ -2,6 +2,11 @@
 
 #include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
+// c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): the by-value-stack-arg exhaust-class
+// constants — the rewriter's call-arg classifier advances the arg cursors past a
+// by-value aggregate carrier EXACTLY as lir_callconv / lir_wide_call_args do, so a
+// spilled scalar arg's register-vs-overflow decision matches theirs.
+#include "mir/mir_opcode.hpp"
 #include "lir/lir_node.hpp"
 #include "lir/lir_pass_util.hpp"
 
@@ -203,6 +208,85 @@ resolveReg(LirReg r, LirFuncAllocation const& alloc,
 // translateNonVregOperand + emitTerminator are now in lir_pass_util
 // (D-ML7-1.1 fold — shared with lir_callconv).
 
+// c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): classify each operand of a CALL
+// instruction as a REGISTER-PASSED scalar arg (→ its LirRegClass) or not
+// (→ nullopt). Only a register-passed scalar arg is eligible to be DEFERRED to
+// callconv as a `SpillSlotRef` when spilled — the callee (ops[0]), the sret
+// pointer (ops[1] when hasIrr), a by-value-aggregate carrier (Reg + marker), the
+// marker itself, and any overflow scalar arg (already removed pre-regalloc by
+// lowerWideCallArgs) all keep the ordinary scratch-reload path.
+//
+// This MIRRORS the arg-placement cursor of lir_callconv / lir_wide_call_args
+// EXACTLY (same monotonic NSAA cursor, same slot-aligned vs independent-counter
+// pool logic, same ByValueStackAgg-carrier skip + class-exhaust clamp, same
+// hasIndirectResult / firstArgIdx / variadicForcesStack handling) so the
+// register-vs-overflow verdict here is byte-identical to the one callconv reaches
+// — a spilled arg the rewriter defers is exactly one callconv will arg-move.
+// Config-driven from the cc descriptor; no arch/format branch.
+//
+// `out[k]` is the classification of the CALL's operand index `k`. Returned by
+// value (a call has few operands); indexed by the operand loop below.
+[[nodiscard]] std::vector<std::optional<LirRegClass>>
+classifyCallRegArgs(std::span<LirOperand const> ops, std::uint32_t payload,
+                    TargetCallingConvention const& cc) {
+    std::vector<std::optional<LirRegClass>> out(ops.size(), std::nullopt);
+    std::uint32_t const gprPoolSize =
+        static_cast<std::uint32_t>(cc.argGprs.size());
+    std::uint32_t const fprPoolSize =
+        static_cast<std::uint32_t>(cc.argFprs.size());
+    std::uint32_t const slotAlignedPoolSize = std::max(gprPoolSize, fprPoolSize);
+
+    bool const hasIrr = ::dss::call_payload::hasIndirectResult(payload);
+    std::size_t const firstArgIdx = hasIrr ? 2u : 1u;
+    bool const variadicForcesStack =
+        cc.variadicArgsAlwaysStack && ::dss::call_payload::isVariadic(payload);
+    std::uint32_t const fixedOps = ::dss::call_payload::fixedOperandCount(payload);
+
+    std::uint32_t gprIdx = 0, fprIdx = 0, slotIdx = 0;
+    std::uint32_t argRegionIdx = 0;
+    for (std::size_t k = firstArgIdx; k < ops.size(); ++k) {
+        LirOperand const& argOp = ops[k];
+        if (argOp.kind == LirOperandKind::ByValueStackAgg) continue;  // marker
+        bool const isByValCarrier =
+            argOp.kind == LirOperandKind::Reg && (k + 1) < ops.size()
+            && ops[k + 1].kind == LirOperandKind::ByValueStackAgg;
+        if (isByValCarrier) {
+            // Wholly-stacked aggregate — NOT a register arg (keep scratch path).
+            // Advance the shared cursors + class-exhaust clamp as callconv does.
+            std::uint8_t const ex = ops[k + 1].byValueAggExhaust;
+            if (ex == kByValueStackArgExhaustGpr)
+                gprIdx = std::max(gprIdx, gprPoolSize);
+            else if (ex == kByValueStackArgExhaustFpr)
+                fprIdx = std::max(fprIdx, fprPoolSize);
+            ++argRegionIdx;
+            continue;
+        }
+        if (argOp.kind != LirOperandKind::Reg) { ++argRegionIdx; continue; }
+        LirRegClass const cls = argOp.reg.regClass();
+        std::uint32_t argIndex, poolSize;
+        if (cc.slotAligned) {
+            argIndex = slotIdx++;
+            poolSize = slotAlignedPoolSize;
+        } else if (cls == LirRegClass::FPR) {
+            argIndex = fprIdx++;
+            poolSize = fprPoolSize;
+        } else {
+            argIndex = gprIdx++;
+            poolSize = gprPoolSize;
+        }
+        bool const forceStack =
+            variadicForcesStack && argRegionIdx >= fixedOps;
+        if (argIndex < poolSize && !forceStack) {
+            out[k] = cls;   // register-passed scalar arg — eligible to defer
+        }
+        // else: overflow scalar arg. lowerWideCallArgs already removed these
+        // pre-regalloc, so this branch is not reached for a live scalar arg; if
+        // a target ever leaves one, it keeps the scratch-reload path (safe).
+        ++argRegionIdx;
+    }
+    return out;
+}
+
 [[nodiscard]] bool
 rewriteOneFunc(Lir const&               src,
                LirFuncId                fn,
@@ -301,6 +385,14 @@ rewriteOneFunc(Lir const&               src,
     // entry-region reload that can clobber a still-live incoming arg reg.
     auto const argOp = schema.opcodeByMnemonic("arg");
 
+    // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): the active cc, cached for the
+    // per-call arg-register classifier (classifyCallRegArgs) below. A missing cc
+    // already fails loud in pickScratchRegs; nullptr here disables the direct-arg-
+    // reload path (calls keep the scratch-reload path, still correct — just the
+    // old exhaustion surface), so no new failure mode for a bypass caller.
+    auto const* ccForArgs =
+        schema.callingConvention(alloc.callingConventionIndex);
+
     auto const& funcInfo = src.funcArena().at(fn);
     b.addFunction(SymbolId{funcInfo.symbol});
 
@@ -342,6 +434,16 @@ rewriteOneFunc(Lir const&               src,
             // `info->isCall` to apply the spilled-callee forbidden-
             // scratch filter at operand index 0.
             auto const* info = schema.opcodeInfo(op);
+
+            // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): for a CALL, classify which
+            // operands are register-passed scalar args (→ a class). A spilled one
+            // is DEFERRED to callconv as a `SpillSlotRef` rather than scratch-
+            // reloaded here, so a wide call's register args demand ZERO rewriter
+            // scratch (the func-2088 exhaustion). Empty for non-calls / no cc.
+            std::vector<std::optional<LirRegClass>> callRegArgClass;
+            if (info != nullptr && info->isCall && ccForArgs != nullptr) {
+                callRegArgClass = classifyCallRegArgs(ops, payload, *ccForArgs);
+            }
 
             // D-AS-REGALLOC-ARG-REGISTER-OCCUPIED (c75 correctness fix,
             // implicit-clobber sibling): a reload scratch for THIS
@@ -393,6 +495,28 @@ rewriteOneFunc(Lir const&               src,
                     // consumes it (see resolveReg's docblock). The
                     // L_IndirectCalleeClobberedByArgSetup backstop in
                     // lir_callconv catches any escape loudly.
+                    // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a SPILLED register-
+                    // passed CALL ARG is DEFERRED to callconv — emit a
+                    // `SpillSlotRef` (slot + class) instead of pulling a scratch +
+                    // frame_load. callconv's arg-setup then loads it DIRECTLY into
+                    // its ABI arg register, sequenced within the parallel-move
+                    // machinery (a memory-source arg move). This is what makes a
+                    // wide call's register-arg reload demand ZERO scratch (the
+                    // callee ops[0] / sret ops[1] / by-value carriers below still
+                    // scratch-reload — callRegArgClass[opIdx] is nullopt for them).
+                    if (opIdx < callRegArgClass.size()
+                        && callRegArgClass[opIdx].has_value()) {
+                        auto const* a = alloc.forVReg(o.reg.id);
+                        if (a != nullptr && a->isSpilled()) {
+                            newOps.push_back(LirOperand::makeSpillSlotRef(
+                                a->spillSlot().v,
+                                static_cast<std::uint8_t>(
+                                    *callRegArgClass[opIdx])));
+                            continue;
+                        }
+                        // Not spilled: fall through to the normal path (the arg is
+                        // register-resident; callconv reg-moves it as before).
+                    }
                     std::span<std::uint16_t const> forbidden =
                         implicitForbiddenSpan;
                     if (opIdx == 0 && info != nullptr && info->isCall) {
