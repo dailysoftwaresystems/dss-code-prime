@@ -2719,26 +2719,33 @@ struct Lowerer {
             unsupported(node, std::format("unary target '{}' is not a core unary operator", e.target));
             return {errorNode(node), InvalidType};
         }
-        // c71 (D-CSUBSET-32BIT-ALU-FORMS): a logical `!` on a SUB-INT arithmetic
-        // operand integer-PROMOTES the operand to `int` (C 6.5.3.3p5: `!E` is
-        // `(E == 0)`, which applies the usual arithmetic conversions) — else the
-        // MIR lowering's `ICmpEq(operand, 0)` is a Char/I8-typed compare that
-        // walls at the target's sub-native ALU gap (the pervasive `if(!*z)` /
-        // `if(!c)` sqlite scan idiom). The sibling of coerceCondition's promotion
-        // (`!` is a negated truth test). Bool is EXCLUDED (its compare-to-zero
-        // ICmpEq form is already native — no widening needed, and it keeps the
-        // `!bool` shape unchanged); float/pointer/≥int operands pass through
-        // (`integerPromotedType` is a no-op → `!f`/`!p` compare at their own
-        // width). The `!` result stays Bool.
-        E notOperand = operand;
-        if (*op == HirOpKind::Not && arith_.has_value() && operand.type.valid()
+        // c71+c72 (D-CSUBSET-32BIT-ALU-FORMS): a unary arithmetic operator on a
+        // SUB-INT operand integer-PROMOTES the operand to `int` (C 6.5.3.3: the
+        // integer promotions are performed on the operand of unary `+`/`-`/`~`,
+        // and `!E` is `(E == 0)`). Without it the MIR Neg / Not(bitwise) /
+        // ICmpEq(`!`) is a Char/U8/U16-typed op that walls at the target's
+        // sub-native ALU gap — sqlite's `~u8`/`-u8` flag math (c72) and the
+        // `if(!*z)` scan idiom (c71). RESULT type: `!` yields Bool; `-`/`~` yield
+        // the PROMOTED operand type (C 6.5.3.3p3/p4 — the result has the promoted
+        // type), so an assignment back to a narrow lvalue truncates via the
+        // normal coerce. Bool is EXCLUDED (its native ICmpEq-0 / narrow forms are
+        // not gated, and it keeps the `!bool`/`~bool` shape); float/pointer/≥int
+        // operands pass through (`integerPromotedType` is a no-op → `-f`/`!p`
+        // stay at their own width). `Pos` (`+`) returned above.
+        E unOperand = operand;
+        TypeId promotedTy = operand.type;
+        if ((*op == HirOpKind::Not || *op == HirOpKind::BitNot
+             || *op == HirOpKind::Neg)
+            && arith_.has_value() && operand.type.valid()
             && interner.kind(operand.type) != TypeKind::Bool) {
             TypeId const p = integerPromotedType(interner, operand.type, *arith_);
-            if (p.valid() && p.v != operand.type.v)
-                notOperand = coerce(operand, p);
+            if (p.valid() && p.v != operand.type.v) {
+                unOperand  = coerce(operand, p);
+                promotedTy = p;
+            }
         }
-        TypeId const result = (*op == HirOpKind::Not) ? boolType() : operand.type;
-        return {track(builder.addParent(HirKind::UnaryOp, std::array{notOperand.id},
+        TypeId const result = (*op == HirOpKind::Not) ? boolType() : promotedTy;
+        return {track(builder.addParent(HirKind::UnaryOp, std::array{unOperand.id},
                                         result, encodeOp(*op)), node), result};
     }
 
