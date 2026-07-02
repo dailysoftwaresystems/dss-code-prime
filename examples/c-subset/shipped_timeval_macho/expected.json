@@ -1,0 +1,12 @@
+{
+  "$comment": "c83 (D-FFI-MACHO-TIMEVAL-TV-USEC-WIDTH) — shipped <sys/time.h> struct timeval on macOS: the per-format `variants` macho leg + the RED-ON-DISABLE pin for the SAME-SIZE swap. Darwin timeval is 16B = the elf sizeof, but tv_usec is __darwin_suseconds_t = __int32_t (i32) vs glibc's long (i64) — sizeof can't tell 16 from 16, so the pins are the FIELD WIDTH (sizeof(tv.tv_usec)==4), a padding-survival STORE witness (an i64 store would zero the poisoned trailing bytes 12..15), and a gettimeofday LOAD round-trip (tv_usec in [0,1e6) — through a stale i64 field the read folds 4 undefined padding bytes into the high half). Single arm64-macho target → runs on the macos-latest CI leg (native Apple Silicon); cross-compiles (compile-checks the real descriptor variant) locally. exit 42 iff the macho timeval variant was selected. RED-ON-DISABLE: regress the macho tv_usec to i64 → exit 4; delete the macho variant → struct not injected → compile fails. Release arm runs the optimizer over the sizeof folds + padding byte stores + the gettimeofday call. Unit sibling: RealSysTimeTimevalPerFormatLayout (tests/ffi) pins the same layout locally on every leg.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

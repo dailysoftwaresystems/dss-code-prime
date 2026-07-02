@@ -839,7 +839,9 @@ TEST(ShippedLibDescriptor, StructVariantUnknownFormatValueFailsLoud) {
 // BYTE-IDENTICALLY whether activeTarget is nullopt (direct-API/LSP/test) or set (a
 // real per-target compile) — the flat path never consults the selector, so the
 // interned type + its layout are the same. This proves the new axis does not
-// perturb the single-layout structs that ship today (timeval / the opaque structs).
+// perturb the single-layout structs that ship (tm/timespec/utimbuf — timeval
+// itself moved to per-format variants at c83; the flat field list here is the
+// historical shape, kept as the back-compat fixture).
 TEST(ShippedLibDescriptor, StructFlatFieldsBackCompatRegardlessOfTarget) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "flat.json", R"JSON({
@@ -2186,6 +2188,73 @@ TEST(ShippedLibDescriptor, MacroVariantNoMatchNotInjected) {
     EXPECT_FALSE(rep.hasErrors());
     ASSERT_EQ(macros->size(), 1u) << "macho-only macro not injected for elf; flat one stays";
     EXPECT_EQ(macros->at(0).name, "ALWAYS");
+}
+
+// ── c83: REAL <sys/time.h> `struct timeval` per-FORMAT layout pin ────────────
+//
+// D-FFI-MACHO-TIMEVAL-TV-USEC-WIDTH. Reads the SHIPPED sys/time.json (the real
+// file, not an inline copy) so the pin goes red the moment the shipped macho
+// variant drifts or is dropped. Darwin repeats the c15c stat SAME-SIZE trap:
+// sizeof(struct timeval) == 16 on BOTH formats, so size alone cannot
+// discriminate — the load-bearing divergence is tv_usec's WIDTH. glibc LP64
+// suseconds_t is `long` (i64, field bytes 8..15 — one elf variant covers both
+// shipped arches); Darwin's is 32-bit — xnu bsd/sys/_types.h `typedef __int32_t
+// __darwin_suseconds_t`, declared in bsd/sys/_types/_timeval.h
+// {__darwin_time_t tv_sec; __darwin_suseconds_t tv_usec} with tv_sec staying
+// `long` (bsd/arm/_types.h + bsd/i386/_types.h) — so macho is {i64@0, i32@8}
+// + 4 TRAILING pad bytes (payload 12 aligned up to the struct's 8-alignment).
+// An i64 read of the macho field folds those undefined padding bytes into the
+// high half (little-endian misread); an i64 write clobbers them. Consumers:
+// gettimeofday (sqlite os_unix reads tv_usec) + utimes.
+//
+// Pins, for BOTH shipped arches (the format variants are arch-agnostic —
+// glibc agrees across x86_64/arm64; Darwin's fields are fixed-width):
+//   * elf:   {tv_sec i64@0, tv_usec I64@8}, sizeof 16.
+//   * macho: {tv_sec i64@0, tv_usec I32@8}, sizeof 16 — the 4 trailing pad
+//     bytes are PROVEN by size 16 with the 4-byte field ending at 12 (the
+//     layout engine's final alignUp), the exact bytes an i64 field would claim.
+// RED-ON-DISABLE: regress the shipped macho variant's tv_usec to i64 → the I32
+// width assert fails; DELETE the macho variant → no variant matches for macho →
+// the struct is not injected → the structs.size() assert fails; flatten the
+// struct back to a single field list → the macho width assert fails. The
+// runtime witness is the shipped_timeval_macho corpus on the macos-latest CI leg.
+TEST(ShippedLibDescriptor, RealSysTimeTimevalPerFormatLayout) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "sys" / "time.json";
+
+    auto checkFor = [&](std::string_view arch, ObjectFormatKind fmt,
+                        TypeKind expectedUsecKind) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, arch, fmt);
+        ASSERT_TRUE(desc.has_value()) << "arch=" << arch;
+        EXPECT_FALSE(rep.hasErrors()) << "arch=" << arch;
+        ASSERT_EQ(desc->structs.size(), 1u)
+            << "timeval variant not injected for arch=" << arch;
+        auto const& tv = desc->structs[0];
+        EXPECT_EQ(tv.name, "timeval");
+        ASSERT_EQ(tv.fields.size(), 2u) << "arch=" << arch;
+        EXPECT_EQ(tv.fields[0].name, "tv_sec");
+        EXPECT_EQ(tv.fields[1].name, "tv_usec");
+        EXPECT_EQ(interner.kind(tv.fields[0].type), TypeKind::I64)
+            << "tv_sec must be i64 on every format (Darwin __darwin_time_t is long)";
+        EXPECT_EQ(interner.kind(tv.fields[1].type), expectedUsecKind)
+            << "tv_usec width wrong for arch=" << arch;
+        auto layout = computeLayout(tv.typeId, interner, kNatural16, DataModel::Lp64);
+        ASSERT_TRUE(layout.has_value());
+        EXPECT_EQ(layout->size, 16u);            // SAME size both formats (the trap)
+        ASSERT_EQ(layout->fieldOffsets.size(), 2u);
+        EXPECT_EQ(layout->fieldOffsets[0], 0u);  // tv_sec  @ 0
+        EXPECT_EQ(layout->fieldOffsets[1], 8u);  // tv_usec @ 8
+    };
+
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        checkFor(arch, ObjectFormatKind::Elf,   TypeKind::I64);
+        checkFor(arch, ObjectFormatKind::MachO, TypeKind::I32);
+    }
 }
 
 } // namespace

@@ -1,5 +1,5 @@
 {
-  "$comment": "Neutral shipped <sys/time.h> (POSIX) — SEED of the struct-body descriptor surface (the FIRST `structs` consumer). `struct timeval` is two LP64 longs: tv_sec (time_t) + tv_usec (suseconds_t), both i64 → offsets 0 and 8 (no padding). Field types are spelled as their RESOLVED hir-text form (i64), since parseTypeFromText resolves hir-text builtins, not descriptor typedef names. The semantic phase interns the struct + injects `timeval` into the TAG namespace + a field scope, so c-subset `struct timeval tv; tv.tv_sec` resolves and the layout engine derives the offsets from the field sizes. A SUBDIRECTORY descriptor (sys/time.json — resolved by the c6 subdir fix, distinct from a future <time.h> → time.json). This descriptor is the struct-mechanism PROOF; c51 added the first symbol utimes; c53 adds gettimeofday(struct timeval*, void* tz) — both ptr<void> (SQLite passes &tv + a 0/NULL tz, so struct timezone needs no shipped body). The timeval struct (below) is gettimeofday's first arg. (the surfaces are additive — struct timezone stays deferred until a use needs its body).",
+  "$comment": "Neutral shipped <sys/time.h> (POSIX) — SEED of the struct-body descriptor surface (the FIRST `structs` consumer). ★ c83 (D-FFI-MACHO-TIMEVAL-TV-USEC-WIDTH): `struct timeval` DIVERGES per format → per-format `variants` (the plan-25 mechanism sys/stat.json seeded). glibc LP64 (both elf arches, verified /usr/include/x86_64-linux-gnu/sys/time.h → bits/types.h: time_t AND suseconds_t are `long`) is {tv_sec i64 @0, tv_usec i64 @8} sizeof 16, no padding — ONE elf variant covers x86_64+arm64 (like flock's). Darwin keeps tv_sec `long` (xnu bsd/arm/_types.h + bsd/i386/_types.h: `typedef long __darwin_time_t`) but tv_usec is 32-BIT: xnu bsd/sys/_types.h `typedef __int32_t __darwin_suseconds_t`, and bsd/sys/_types/_timeval.h declares _STRUCT_TIMEVAL {__darwin_time_t tv_sec; __darwin_suseconds_t tv_usec;} → macho {tv_sec i64 @0, tv_usec i32 @8} = 12 payload + 4 TRAILING pad = sizeof 16 (the layout engine derives the pad from the 8-alignment). ★ THE SAME-SIZE TRAP (the c15c stat lesson): sizeof agrees at 16 on BOTH formats, so a size check cannot discriminate — a macho READ of tv_usec through an i64 field folds the 4 padding bytes into the high half (little-endian misread of undefined stack bytes) and a WRITE clobbers them; gettimeofday (sqlite os_unix reads tv_usec) + utimes consume the layout. Pins: RealSysTimeTimevalPerFormatLayout (tests/ffi — reads THIS file per format; red if the macho variant regresses to i64 or is dropped) + shipped_timeval_macho (the darwin-CI runtime witness). Field types are the RESOLVED hir-text form (parseTypeFromText resolves hir-text builtins, not descriptor typedef names). The semantic phase interns the struct + injects `timeval` into the TAG namespace + a field scope, so c-subset `struct timeval tv; tv.tv_sec` resolves and the layout engine derives the offsets from the field sizes. A SUBDIRECTORY descriptor (sys/time.json — resolved by the c6 subdir fix, distinct from <time.h> → time.json). c51 added the first symbol utimes; c53 added gettimeofday(struct timeval*, void* tz) — both ptr<void> (SQLite passes &tv + a 0/NULL tz, so struct timezone needs no shipped body; the surfaces are additive — struct timezone stays deferred until a use needs its body).",
   "header": "sys/time.h",
   "standard": "posix",
   "availableObjectFormats": ["elf", "macho"],
@@ -11,9 +11,21 @@
   "structs": [
     {
       "name": "timeval",
-      "fields": [
-        { "name": "tv_sec",  "type": "i64" },
-        { "name": "tv_usec", "type": "i64" }
+      "variants": [
+        {
+          "when": { "format": "elf" },
+          "fields": [
+            { "name": "tv_sec",  "type": "i64" },
+            { "name": "tv_usec", "type": "i64" }
+          ]
+        },
+        {
+          "when": { "format": "macho" },
+          "fields": [
+            { "name": "tv_sec",  "type": "i64" },
+            { "name": "tv_usec", "type": "i32" }
+          ]
+        }
       ]
     }
   ]
