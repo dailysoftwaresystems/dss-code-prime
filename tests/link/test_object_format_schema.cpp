@@ -597,6 +597,218 @@ TEST(LK10EntrySliceB, ExitMechanismEnumRoundTrip) {
     EXPECT_FALSE(exitMechanismFromName("bogus").has_value());
 }
 
+// ── D-RUNTIME-MAIN-ARGC-ARGV (c88): ProcessArgs substrate ───────────
+//
+// The shipped elf64-*-linux-exec formats declare a `processArgs`
+// stack-vector block (SysV AMD64 psABI §3.4.1 / AAPCS64 Linux: argc at
+// [sp+0], the in-place argv vector at sp+8) so the entry trampoline
+// materializes main's argc/argv. Loader coverage mirrors the
+// ProcessExit discipline: closed-enum mechanism, explicit required
+// offsets, sentinel rejection, exec-flavor + processExit pairing.
+
+TEST(ProcessArgsSubstrate, ShippedElfExecsDeclareStackVector) {
+    for (auto const* name : {"elf64-x86_64-linux-exec",
+                             "elf64-aarch64-linux-exec"}) {
+        auto r = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(r.has_value()) << name;
+        auto const& pa = (*r)->processArgs();
+        ASSERT_TRUE(pa.has_value())
+            << name << " must declare processArgs — without it, "
+            "main(argc,argv) reads process-entry register garbage "
+            "(D-RUNTIME-MAIN-ARGC-ARGV; the c87 sqlite3 shell crash).";
+        EXPECT_EQ(pa->mechanism, ArgsMechanism::StackVector) << name;
+        EXPECT_EQ(pa->argcStackOffset, 0u)
+            << name << ": argc is the word AT the process-entry SP";
+        EXPECT_EQ(pa->argvStackOffset, 8u)
+            << name << ": the in-place argv vector starts one machine "
+            "word past argc on both LP64 Linux ABIs";
+    }
+}
+
+TEST(ProcessArgsSubstrate, ShippedNonLinuxExecsDeclareNone) {
+    // PE: the OS entry receives NO C argument vector — the CRT
+    // out-parameter route (__getmainargs) is a genuinely different
+    // mechanism, anchored D-RUNTIME-PE-MAIN-ARGS. Mach-O: LC_MAIN
+    // entry is CALLED by dyld with argc/argv already in the argument
+    // registers — pass-through (no block) IS the correct mechanism.
+    // Pin the deliberate absence so an accidental stack-vector block
+    // on either (reading a stack that holds no argv there) fails here
+    // before it ships a wild-pointer argv.
+    for (auto const* name : {"pe64-x86_64-windows-exec",
+                             "macho64-x86_64-darwin-exec",
+                             "macho64-arm64-darwin-exec"}) {
+        auto r = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(r.has_value()) << name;
+        EXPECT_FALSE((*r)->processArgs().has_value())
+            << name << " must NOT declare processArgs — its entry "
+            "contract does not place a SysV-style argument vector at "
+            "the entry SP.";
+    }
+}
+
+TEST(ProcessArgsSubstrate, UnknownMechanismRejected) {
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
+      "format": { "name": "synth", "version": "0.1", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "entryCallingConvention": "sysv_amd64",
+      "processExit": {
+        "mechanism": "syscall",
+        "syscallNumber": 231,
+        "syscallNumGpr": "rax",
+        "syscallOpcodeBytes": [15, 5]
+      },
+      "processArgs": { "mechanism": "bogus" }
+    })", "unknown processArgs.mechanism must reject — closed-enum "
+         "vocabulary, a typo can never silently skip argument setup");
+}
+
+TEST(ProcessArgsSubstrate, MechanismNoneStringRejected) {
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
+      "format": { "name": "synth", "version": "0.1", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "entryCallingConvention": "sysv_amd64",
+      "processExit": {
+        "mechanism": "syscall",
+        "syscallNumber": 231,
+        "syscallNumGpr": "rax",
+        "syscallOpcodeBytes": [15, 5]
+      },
+      "processArgs": { "mechanism": "none" }
+    })", "mechanism=\"none\" is the sentinel; absence is encoded by "
+         "omitting the block (the ProcessExit discipline)");
+}
+
+TEST(ProcessArgsSubstrate, StackVectorMissingArgcOffsetRejected) {
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
+      "format": { "name": "synth", "version": "0.1", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "entryCallingConvention": "sysv_amd64",
+      "processExit": {
+        "mechanism": "syscall",
+        "syscallNumber": 231,
+        "syscallNumGpr": "rax",
+        "syscallOpcodeBytes": [15, 5]
+      },
+      "processArgs": { "mechanism": "stack-vector",
+                       "argvStackOffset": 8 }
+    })", "stack-vector arm requires an explicit argcStackOffset — a "
+         "silent default would read argc from the wrong slot");
+}
+
+TEST(ProcessArgsSubstrate, StackVectorMissingArgvOffsetRejected) {
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
+      "format": { "name": "synth", "version": "0.1", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "entryCallingConvention": "sysv_amd64",
+      "processExit": {
+        "mechanism": "syscall",
+        "syscallNumber": 231,
+        "syscallNumGpr": "rax",
+        "syscallOpcodeBytes": [15, 5]
+      },
+      "processArgs": { "mechanism": "stack-vector",
+                       "argcStackOffset": 0 }
+    })", "stack-vector arm requires an explicit argvStackOffset");
+}
+
+TEST(ProcessArgsSubstrate, OffsetBeyondInt32Rejected) {
+    // The offsets feed a MemOffset LIR operand (int32 displacement);
+    // a value above 2^31-1 would wrap negative at the cast.
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
+      "format": { "name": "synth", "version": "0.1", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "entryCallingConvention": "sysv_amd64",
+      "processExit": {
+        "mechanism": "syscall",
+        "syscallNumber": 231,
+        "syscallNumGpr": "rax",
+        "syscallOpcodeBytes": [15, 5]
+      },
+      "processArgs": { "mechanism": "stack-vector",
+                       "argcStackOffset": 0,
+                       "argvStackOffset": 2147483648 }
+    })", "an offset beyond int32 must reject at load — it would wrap "
+         "negative in the trampoline's memory displacement");
+}
+
+TEST(ProcessArgsSubstrate, ProcessArgsWithoutProcessExitRejected) {
+    // processArgs rides the trampoline emitter, which requires a
+    // declared processExit — a processArgs-only format would be dead
+    // config whose argument setup silently never emits.
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
+      "format": { "name": "synth", "version": "0.1", "kind": "elf" },
+      "entryPoint": "",
+      "elf": {
+        "class": "elf64", "data": "lsb", "osabi": "sysv", "machine": 62,
+        "type": "exec", "pageAlign": 4096,
+        "interpreter": "/lib64/ld-linux-x86-64.so.2", "bindNow": true
+      },
+      "sections": [
+        { "kind": "text", "name": ".text", "type": 1, "flags": 6,
+          "addrAlign": 16, "entrySize": 0, "virtualAddress": 4198400 }
+      ],
+      "processArgs": { "mechanism": "stack-vector",
+                       "argcStackOffset": 0,
+                       "argvStackOffset": 8 }
+    })", "processArgs without processExit must reject — the argument "
+         "materialization is emitted by the entry trampoline "
+         "(D-RUNTIME-MAIN-ARGC-ARGV pairing rule)");
+}
+
+TEST(ProcessArgsSubstrate, ProcessArgsOnRelocatableFormatRejected) {
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
+      "format": { "name": "synth-obj", "version": "0.1", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62,
+               "type": "rel" },
+      "entryCallingConvention": "sysv_amd64",
+      "processExit": {
+        "mechanism": "syscall",
+        "syscallNumber": 231,
+        "syscallNumGpr": "rax",
+        "syscallOpcodeBytes": [15, 5]
+      },
+      "processArgs": { "mechanism": "stack-vector",
+                       "argcStackOffset": 0,
+                       "argvStackOffset": 8 }
+    })", "processArgs on ET_REL must reject — relocatable artifacts "
+         "have no entry trampoline to materialize arguments in");
+}
+
+TEST(ProcessArgsSubstrate, WasmFormatRejectsProcessArgs) {
+    expectRejected(R"({
+      "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
+      "format": { "name": "synth-wasm", "version": "0.1", "kind": "wasm" },
+      "processArgs": { "mechanism": "stack-vector",
+                       "argcStackOffset": 0,
+                       "argvStackOffset": 8 }
+    })", "WASM format must reject `processArgs` — no trampoline "
+         "emitter applies on operand-stack ABIs");
+}
+
+TEST(ProcessArgsSubstrate, ArgsMechanismEnumRoundTrip) {
+    EXPECT_EQ(argsMechanismName(ArgsMechanism::StackVector),
+              "stack-vector");
+    EXPECT_EQ(argsMechanismName(ArgsMechanism::None), "none");
+    EXPECT_EQ(argsMechanismFromName("stack-vector"),
+              std::optional{ArgsMechanism::StackVector});
+    EXPECT_FALSE(argsMechanismFromName("bogus").has_value());
+}
+
 // ── AP3: object-format `artifactProfiles[]` (which profiles a format SERVES) ──
 
 namespace {

@@ -1859,6 +1859,92 @@ struct DSS_EXPORT ProcessExit {
     std::string importMangledName;
 };
 
+// ── D-RUNTIME-MAIN-ARGC-ARGV (c88): program-entry argument setup ──
+//
+// `ArgsMechanism` (closed-enum, no `if (os == ...)` branches) — HOW
+// the OS/loader hands the C `argc`/`argv` pair to a fresh process,
+// so the entry trampoline can materialize them into the entry cc's
+// first two integer argument registers BEFORE calling the user
+// entry. Without this, `int main(int argc, char** argv)` reads
+// whatever garbage the arg registers hold at process entry (the
+// c76/c87-witnessed argc=846361312 class).
+//
+//   * `StackVector` — the kernel/loader places the argument vector
+//                     ON THE INITIAL STACK at the entry point (SysV
+//                     AMD64 psABI §3.4.1; AAPCS64 Linux mirrors it):
+//                     argc is a machine word at
+//                     [SP + argcStackOffset]; the NULL-terminated
+//                     in-place argv pointer vector STARTS at
+//                     [SP + argvStackOffset] — `argv` the VALUE is
+//                     that stack address itself (no copy exists
+//                     anywhere else). envp follows argv's NULL
+//                     terminator; it is NOT materialized (the
+//                     c-subset entry signature is
+//                     `(int, char**)` — envp is reachable via
+//                     libc `environ` for programs that need it).
+//   * `None`        — default-constructed sentinel. "No mechanism"
+//                     is encoded by `optional<ProcessArgs>` empty
+//                     (exactly the ProcessExit discipline); the
+//                     JSON loader rejects `mechanism="none"`.
+//
+// A Windows PE arm is DELIBERATELY absent (not a half-declared enum
+// slot): the OS entry point there receives NO C argument vector —
+// the CRT route is an out-parameter call
+// (`msvcrt!__getmainargs(&argc,&argv,&env,0,&startinfo)`) that needs
+// trampoline STACK LOCALS + a 5-argument import call, a genuinely
+// different mechanism anchored at D-RUNTIME-PE-MAIN-ARGS. Mach-O
+// needs NO mechanism at all: LC_MAIN entry is CALLED by dyld with
+// argc/argv/envp/apple already in the argument registers, which the
+// trampoline passes through untouched.
+enum class ArgsMechanism : std::uint8_t {
+    None        = 0,  // default-constructed zero; loader rejects "none"
+    StackVector = 1,  // argc + in-place argv vector on the entry stack
+};
+
+inline constexpr EnumNameTable<ArgsMechanism, 2> kArgsMechanismTable{{{
+    { ArgsMechanism::None,        "none"         },
+    { ArgsMechanism::StackVector, "stack-vector" },
+}}};
+
+[[nodiscard]] constexpr std::string_view argsMechanismName(ArgsMechanism m) noexcept {
+    return kArgsMechanismTable.name(m);
+}
+[[nodiscard]] constexpr std::optional<ArgsMechanism>
+argsMechanismFromName(std::string_view s) noexcept {
+    return kArgsMechanismTable.fromName(s);
+}
+
+// Per-OS program-entry argument descriptor. Lives on
+// `ObjectFormatData` (loaded from the format JSON's `processArgs`
+// block). The trampoline emitter reads the active arm based on
+// `mechanism`:
+//
+// For StackVector (Linux ELF x86_64 + aarch64):
+//   * `argcStackOffset` — byte offset of the argc machine word from
+//                         the PROCESS-ENTRY stack pointer (0 on both
+//                         Linux ABIs). The offsets are defined
+//                         relative to the UNTOUCHED entry SP — the
+//                         trampoline materializes args BEFORE any
+//                         ABI-prologue SP adjustment.
+//   * `argvStackOffset` — byte offset of the FIRST argv slot from
+//                         the process-entry stack pointer (8 on both
+//                         LP64 Linux ABIs — one machine word past
+//                         argc). The trampoline LEAs this address
+//                         into the second argument register; it
+//                         never dereferences it.
+//
+// The destination registers are intentionally NOT fields — they are
+// read from the format's `entryCallingConvention.argGprs[0..1]`
+// (single source of truth for the cc register vocabulary, exactly
+// the ProcessExit `statusArgGpr` precedent).
+struct DSS_EXPORT ProcessArgs {
+    ArgsMechanism mechanism = ArgsMechanism::None;
+
+    // StackVector arm
+    std::uint32_t argcStackOffset = 0;
+    std::uint32_t argvStackOffset = 0;
+};
+
 [[nodiscard]] DSS_EXPORT std::optional<RelocFormulaKind>
     parseRelocFormulaKind(std::string_view s) noexcept;
 

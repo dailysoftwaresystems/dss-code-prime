@@ -363,6 +363,112 @@ bool injectEntryTrampoline(AssembledModule&          module,
     auto blk = b.createBlock();
     b.beginBlock(blk);
 
+    // -1. Program-entry argument materialization
+    //     (D-RUNTIME-MAIN-ARGC-ARGV, c88). When the format declares a
+    //     `processArgs` mechanism, load argc/argv into the entry cc's
+    //     first two integer argument registers so
+    //     `int main(int argc, char** argv)` sees real values instead
+    //     of process-entry register garbage (the c87-witnessed
+    //     argc=846361312 class that crashed the sqlite3 shell inside
+    //     main). Emitted FIRST — before the ABI prologue's SP adjust —
+    //     because the StackVector offsets are defined against the
+    //     UNTOUCHED process-entry stack pointer (SysV AMD64 psABI
+    //     §3.4.1 / AAPCS64 Linux: [SP]=argc, [SP+8]=argv[0], in
+    //     place). Signature-independent: a `main(void)` simply never
+    //     reads the two registers (C-legal), so the whole corpus is
+    //     unaffected. A format WITHOUT `processArgs` emits nothing
+    //     here — Mach-O's LC_MAIN entry already receives argc/argv in
+    //     these registers from dyld (pass-through is the correct
+    //     mechanism there); PE's out-parameter CRT route
+    //     (__getmainargs) is anchored at D-RUNTIME-PE-MAIN-ARGS.
+    auto const& paOpt = format.processArgs();
+    if (paOpt.has_value()) {
+        auto const& pa = *paOpt;
+        if (pa.mechanism != ArgsMechanism::StackVector) {
+            // Closed-enum discipline: a new ArgsMechanism member must
+            // add its emitter arm HERE — never silently skip setup.
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("entry-trampoline: format '{}' declares "
+                             "processArgs.mechanism '{}' but the "
+                             "trampoline emitter has no arm for it — "
+                             "argument setup would be silently skipped "
+                             "(D-RUNTIME-MAIN-ARGC-ARGV).",
+                             std::string{format.name()},
+                             argsMechanismName(pa.mechanism)));
+            return false;
+        }
+        if (cc->argGprs.size() < 2) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("entry-trampoline: cc '{}' declares {} "
+                             "argGprs but the stack-vector processArgs "
+                             "mechanism needs TWO (argc + argv "
+                             "destinations).",
+                             ccName, cc->argGprs.size()));
+            return false;
+        }
+        if (!cc->stackPointer.has_value()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("entry-trampoline: cc '{}' has no "
+                             "`stackPointer` declared but the "
+                             "stack-vector processArgs mechanism reads "
+                             "argc/argv relative to it "
+                             "(D-RUNTIME-MAIN-ARGC-ARGV).", ccName));
+            return false;
+        }
+        auto const loadOp = target.opcodeByMnemonic("load");
+        auto const leaOp  = target.opcodeByMnemonic("lea");
+        if (!loadOp.has_value() || !leaOp.has_value()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("entry-trampoline: target '{}' lacks the "
+                             "`load` / `lea` opcode required by the "
+                             "stack-vector processArgs mechanism "
+                             "(argc = load [sp+{}], argv = lea "
+                             "[sp+{}]) (D-RUNTIME-MAIN-ARGC-ARGV).",
+                             std::string{target.name()},
+                             pa.argcStackOffset, pa.argvStackOffset));
+            return false;
+        }
+        auto const argvRegName = std::string{cc->argGprs[1]};
+        auto const argvReg     = physRegByName(target, argvRegName);
+        if (!argvReg.has_value()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("entry-trampoline: cc '{}' references "
+                             "register '{}' (argGprs[1], the argv "
+                             "destination) that the target schema "
+                             "does not declare.",
+                             ccName, argvRegName));
+            return false;
+        }
+        auto const spReg = makePhysicalReg(cc->stackPointer->ordinal,
+                                           LirRegClass::GPR);
+        // argc: a full-machine-word load — the kernel stores argc as
+        // a word-sized value; the callee's `int` parameter reads the
+        // low 32 bits (value-correct, argc is non-negative and far
+        // below 2^31). Shared 3-op LIR load form
+        // [base, MemBase(scale=1), MemOffset(disp)] — encodes as
+        // x86_64 `mov r64, [rsp+disp32]` / AArch64 `LDUR Xt, [SP,#d]`.
+        LirOperand const argcOps[] = {
+            LirOperand::makeReg(spReg),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(
+                static_cast<std::int32_t>(pa.argcStackOffset)),
+        };
+        (void)b.addInst(*loadOp, *argReg, argcOps);
+        // argv: the NULL-terminated pointer vector lives IN PLACE on
+        // the entry stack — its ADDRESS is the argv value (no copy
+        // exists anywhere else), so this is an effective-address
+        // computation, never a dereference. Same 3-op form via `lea`
+        // — x86_64 `lea r64, [rsp+disp32]` / AArch64
+        // `ADD Xd, SP, #imm12`.
+        LirOperand const argvOps[] = {
+            LirOperand::makeReg(spReg),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(
+                static_cast<std::int32_t>(pa.argvStackOffset)),
+        };
+        (void)b.addInst(*leaOp, *argvReg, argvOps);
+    }
+
     // 0. ABI prologue (D-LK10-ENTRY-TRAMP-PROLOGUE). Compute the
     //    smallest frame-size adjust satisfying BOTH (a) the cc's
     //    shadow-space requirement and (b) the cc's stack-alignment

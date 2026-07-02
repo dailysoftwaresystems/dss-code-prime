@@ -897,6 +897,28 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "trampoline to resolve a cc against. (D-LK10-ENTRY §2.13.)");
     }
 
+    // D-RUNTIME-MAIN-ARGC-ARGV (c88): `processArgs` rides the SAME
+    // trampoline emitter as `processExit` — it is meaningless without
+    // one (the emitter fails loud when processExit is absent, so a
+    // processArgs-only format would be dead config whose argument
+    // setup silently never emits). Same exec-flavor gate as
+    // processExit: relocatable artifacts have no entry trampoline.
+    if (processArgs.has_value() && !processExit.has_value()) {
+        fail("/processArgs",
+             "format declares `processArgs` but no `processExit` block "
+             "— argument materialization is emitted by the entry "
+             "trampoline, which requires a declared exit mechanism. "
+             "Declare both or neither. (D-RUNTIME-MAIN-ARGC-ARGV.)");
+    }
+    if (processArgs.has_value() && !isExecFlavor) {
+        fail("/processArgs",
+             "processArgs is only legal on exec-flavored formats "
+             "(ELF ET_EXEC / PE PE32+ Exec/Dll / Mach-O MH_EXECUTE). "
+             "Relocatable artifacts (.o / Obj / Object) have no entry "
+             "trampoline to materialize arguments in. "
+             "(D-RUNTIME-MAIN-ARGC-ARGV.)");
+    }
+
     // D-LK2-RODATA closure: producer-data-section capability is only
     // meaningful on exec-flavored formats. Relocatable artifacts
     // (PE Obj / ELF ET_REL / Mach-O MH_OBJECT) emit rodata via the

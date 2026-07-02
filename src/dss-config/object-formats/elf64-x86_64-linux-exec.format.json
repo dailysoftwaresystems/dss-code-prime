@@ -37,6 +37,13 @@
   "$entryCallingConventionComment": "SysV AMD64 calling convention — status (user fn return value in rax) is moved into argGprs[0] = rdi before SYSCALL. Read via `target.callingConventionByName(\"sysv_amd64\")` at trampoline-build time.",
   "entryCallingConvention": "sysv_amd64",
 
+  "$processArgsComment": "c88 (D-RUNTIME-MAIN-ARGC-ARGV): program-entry argc/argv materialization. SysV AMD64 psABI §3.4.1 — at the process entry point the kernel/loader leaves argc (a machine word) at [rsp+0] and the NULL-terminated argv pointer vector IN PLACE starting at [rsp+8] (envp follows argv's NULL; not materialized — the c-subset entry signature is (int, char**)). The trampoline emits `mov rdi, [rsp+0]` (argc → argGprs[0]) + `lea rsi, [rsp+8]` (the vector's ADDRESS → argGprs[1]) BEFORE any SP adjustment and before `call main`. A main(void) simply ignores the two registers (C-legal) — signature-independent setup. Without this block, main(argc,argv) reads process-entry register garbage (the c87 sqlite3 shell crash: argc=846361312). Destination registers come from entryCallingConvention.argGprs[0..1] — never declared here (single source of truth).",
+  "processArgs": {
+    "mechanism": "stack-vector",
+    "argcStackOffset": 0,
+    "argvStackOffset": 8
+  },
+
   "elf": {
     "$comment": "Elf64_Ehdr identity for an executable. type = ET_EXEC (2). class = ELFCLASS64; data = ELFDATA2LSB; osabi = sysv; machine = EM_X86_64 (62). pageAlign = 4096 (Linux x86_64 4 KB pages — kernel's PT_LOAD congruence requires p_vaddr % p_align == p_offset % p_align). ARM64 Linux on Apple Silicon / 64K configurations declares 16384 / 65536 in its own schema (D-LK6-3).",
     "class": "elf64",

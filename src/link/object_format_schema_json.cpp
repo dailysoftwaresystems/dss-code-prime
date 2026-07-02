@@ -174,6 +174,10 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // format-native). Defense-in-depth: reject loudly
             // rather than silently accept dead data.
             "processExit", "entryCallingConvention",
+            // D-RUNTIME-MAIN-ARGC-ARGV: the program-entry argument
+            // mechanism rides the same trampoline emitter — dead
+            // data on Wasm/SPIR-V for the same reason.
+            "processArgs",
             // D-LK2-RODATA closure: the producer-data-section
             // capability is meaningless on Wasm/SPIR-V (their
             // walkers emit rodata via format-native section
@@ -500,6 +504,92 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             }
             if (armOk) {
                 data.processExit = std::move(out);
+            }
+        }
+    }
+
+    // D-RUNTIME-MAIN-ARGC-ARGV (c88): `processArgs` block. One arm
+    // keyed on `mechanism`:
+    //   "stack-vector" requires argcStackOffset (u32) +
+    //                  argvStackOffset (u32) — byte offsets from the
+    //                  PROCESS-ENTRY stack pointer of the argc word
+    //                  and the first argv slot. BOTH are explicit
+    //                  (no silent defaults — a wrong offset reads
+    //                  garbage argc, the exact failure this block
+    //                  exists to close).
+    if (doc.contains("processArgs")) {
+        if (!doc.at("processArgs").is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/processArgs",
+                      "'processArgs' must be an object");
+        } else {
+            auto const& pa = doc.at("processArgs");
+            ProcessArgs out;
+            bool armOk = true;
+            if (!pa.contains("mechanism")
+             || !pa.at("mechanism").is_string()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/processArgs/mechanism",
+                          "'processArgs.mechanism' must be a string "
+                          "(\"stack-vector\")");
+                armOk = false;
+            } else {
+                auto const mechName =
+                    pa.at("mechanism").get<std::string>();
+                auto const m = argsMechanismFromName(mechName);
+                if (!m.has_value() || *m == ArgsMechanism::None) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/processArgs/mechanism",
+                              std::format("unknown processArgs.mechanism"
+                                          " '{}' — accepted: "
+                                          "\"stack-vector\"", mechName));
+                    armOk = false;
+                } else {
+                    out.mechanism = *m;
+                    // StackVector arm: both offsets explicit u32,
+                    // bounded to int32 (they feed a MemOffset LIR
+                    // operand, an int32 displacement).
+                    auto requireOffset =
+                        [&](char const* field, std::uint32_t& dst) -> bool {
+                            std::string const path =
+                                std::string{"/processArgs/"} + field;
+                            if (!pa.contains(field)
+                             || !pa.at(field).is_number_unsigned()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          path,
+                                          std::format(
+                                              "stack-vector arm requires "
+                                              "'{}' (u32 byte offset from "
+                                              "the process-entry stack "
+                                              "pointer)", field));
+                                return false;
+                            }
+                            auto const v =
+                                pa.at(field).get<std::uint64_t>();
+                            if (v > 0x7FFFFFFFull) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          path,
+                                          std::format(
+                                              "'{}' = {} exceeds the "
+                                              "int32 displacement range "
+                                              "the trampoline's memory "
+                                              "operand carries", field, v));
+                                return false;
+                            }
+                            dst = static_cast<std::uint32_t>(v);
+                            return true;
+                        };
+                    if (!requireOffset("argcStackOffset",
+                                       out.argcStackOffset)) {
+                        armOk = false;
+                    }
+                    if (!requireOffset("argvStackOffset",
+                                       out.argvStackOffset)) {
+                        armOk = false;
+                    }
+                }
+            }
+            if (armOk) {
+                data.processArgs = out;
             }
         }
     }

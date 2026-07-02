@@ -37,6 +37,13 @@
   "$entryCallingConventionComment": "AAPCS64 calling convention — the user fn's return value (returnGprs[0] = x0) is moved into argGprs[0] (= x0) before SVC. Read via `target.callingConventionByName(\"aapcs64\")` at trampoline-build time.",
   "entryCallingConvention": "aapcs64",
 
+  "$processArgsComment": "c88 (D-RUNTIME-MAIN-ARGC-ARGV): program-entry argc/argv materialization. AAPCS64 Linux mirrors the SysV stack-vector layout — at the process entry point argc (a machine word) sits at [sp+0] and the NULL-terminated argv pointer vector lives IN PLACE starting at [sp+8] (envp follows argv's NULL; not materialized — the c-subset entry signature is (int, char**)). The trampoline emits `LDUR x0, [sp,#0]` (argc → argGprs[0]) + `ADD x1, sp, #8` (the vector's ADDRESS → argGprs[1], via the target's frame-relative `lea` form) BEFORE any SP adjustment and before `BL main`. A main(void) simply ignores the two registers (C-legal) — signature-independent setup. Destination registers come from entryCallingConvention.argGprs[0..1] — never declared here (single source of truth).",
+  "processArgs": {
+    "mechanism": "stack-vector",
+    "argcStackOffset": 0,
+    "argvStackOffset": 8
+  },
+
   "elf": {
     "$comment": "Elf64_Ehdr identity for an executable. type = ET_EXEC (2). class = ELFCLASS64; data = ELFDATA2LSB; osabi = sysv; machine = EM_AARCH64 (183). pageAlign = 4096 — most ARM64 Linux distributions ship with 4 KB pages. Apple Silicon (16 KB) and high-end ARM64 server configs (64 KB) declare their own values in their respective schemas; the same kernel PT_LOAD congruence rule (`p_vaddr % p_align == p_offset % p_align`) applies uniformly.",
     "class": "elf64",

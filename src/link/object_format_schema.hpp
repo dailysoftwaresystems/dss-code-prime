@@ -722,6 +722,24 @@ struct DSS_EXPORT ObjectFormatData {
     // closed-enum schema vocabulary.
     std::optional<ProcessExit> processExit;
 
+    // ── D-RUNTIME-MAIN-ARGC-ARGV (c88): ProcessArgs substrate ──
+    //
+    // `processArgs`: per-OS program-entry argument mechanism
+    // (StackVector today), populated from the format JSON's
+    // `processArgs` block. The trampoline emitter reads it to
+    // materialize argc/argv into the entry cc's first two integer
+    // argument registers BEFORE calling the user entry (and before
+    // any ABI-prologue SP adjustment — the stack offsets are
+    // defined against the untouched process-entry SP).
+    // nullopt = the format declared no argument mechanism: the
+    // trampoline passes whatever the registers hold (correct for
+    // Mach-O LC_MAIN, where dyld already delivers argc/argv in the
+    // argument registers; the pre-c88 status quo for PE until
+    // D-RUNTIME-PE-MAIN-ARGS lands its __getmainargs arm).
+    // Vocabulary types (`ArgsMechanism` + `ProcessArgs`) live in
+    // `core/types/target_schema.hpp` beside ProcessExit.
+    std::optional<ProcessArgs> processArgs;
+
     // `entryCallingConvention`: name of the calling convention the
     // trampoline emitter resolves via
     // `target.callingConventionByName(...)` to look up the
@@ -952,6 +970,15 @@ public:
     }
     [[nodiscard]] std::string_view entryCallingConvention() const noexcept {
         return d_.entryCallingConvention;
+    }
+
+    // ── D-RUNTIME-MAIN-ARGC-ARGV accessor ────────────────────────
+    // The format's program-entry argument mechanism (StackVector),
+    // or nullopt if the format declared none (the trampoline then
+    // leaves the argument registers untouched before the user-entry
+    // call — the Mach-O LC_MAIN-correct / pre-c88 PE behavior).
+    [[nodiscard]] std::optional<ProcessArgs> const& processArgs() const noexcept {
+        return d_.processArgs;
     }
 
     // ── D-FFI-EXTERN-CALL-DISPATCH accessor ──────────────────────
