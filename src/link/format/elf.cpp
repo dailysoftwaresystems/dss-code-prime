@@ -584,21 +584,33 @@ encodeElfExecDynamic(
     std::vector<std::uint8_t> const& rodataDyn = rodataDynLayout.bytes;
     std::vector<std::uint8_t> const& dataDynBytes = dataDynLayout.bytes;
 
-    // ── (b) Group externs by library (preserve declaration order)
+    // ── (b) Collect the DISTINCT import libraries → the DT_NEEDED set
+    //
+    // c87 (D-FFI-MATH-LIBM-DT-NEEDED): one DT_NEEDED per DISTINCT
+    // `libraryPath` across ALL import rows — functions AND data. Every
+    // import row that reaches this walker is emitted into `.dynsym`
+    // and eagerly bound at load (DF_1_NOW), so every row's owning
+    // library must be listed or ld.so stops at the first symbol it
+    // cannot resolve (the c86 sqlite3 binary carried only libc.so.6
+    // while math.json's sqrt/pow/… live in libm.so.6 → "undefined
+    // symbol: sqrt" at load). The order is PINNED: lexicographic
+    // (byte-wise) over the library names — deterministic AND
+    // config-agnostic. First-appearance order (the pre-c87 shape)
+    // shifts with CU/merge order; a "libc first" rule would hardcode
+    // a library name in the engine. The names themselves come
+    // exclusively from config (shipped-lib descriptors' `library`
+    // maps, the language's `externLibraryByFormat` default, the
+    // format's `processExit.importLibraryPath`) — the engine never
+    // invents one.
     std::vector<std::string> libraryOrder;
-    std::unordered_map<std::string, std::vector<std::size_t>>
-        externsByLib;
-    for (std::size_t i = 0; i < module.externImports.size(); ++i) {
-        auto const& ext = module.externImports[i];
-        auto const it = externsByLib.find(ext.libraryPath);
-        if (it == externsByLib.end()) {
-            libraryOrder.push_back(ext.libraryPath);
-            externsByLib.emplace(ext.libraryPath,
-                                 std::vector<std::size_t>{i});
-        } else {
-            it->second.push_back(i);
-        }
+    libraryOrder.reserve(module.externImports.size());
+    for (auto const& ext : module.externImports) {
+        libraryOrder.push_back(ext.libraryPath);
     }
+    std::sort(libraryOrder.begin(), libraryOrder.end());
+    libraryOrder.erase(
+        std::unique(libraryOrder.begin(), libraryOrder.end()),
+        libraryOrder.end());
     std::size_t const numExterns = module.externImports.size();
     std::size_t const numLibs = libraryOrder.size();
     // Defense-in-depth: the linker validates per-extern non-empty
