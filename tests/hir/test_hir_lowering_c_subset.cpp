@@ -3985,3 +3985,86 @@ TEST(HirLoweringCSubset, SizeofValueOperandCarriesExpressionType) {
     EXPECT_EQ(ti.kind(ti.operands(t3)[0]), TypeKind::Array)
         << "…whose pointee is the Array itself";
 }
+
+// c90 (D-CSUBSET-ASSIGN-VALUE-RHS-COERCE): a plain `=` used as a VALUE stores
+// the RHS COERCED to the lvalue's type (C 6.5.16p3) — the tier-boundary pin
+// for `finishAssign`'s plain arm (and its `lowerBinary` Assign-arm mirror) at
+// the exact node the property lives on: the SeqExpr's AssignStmt VALUE child
+// must be a Cast carrying the LVALUE's type whenever the RHS type differs.
+// Pre-c90 the raw RHS node was stored un-coerced and the MIR store executed
+// at the RHS's width: an i16 comma-assign from a wider RHS partial-stored
+// (sqlite estimateTableWidth's `for(i=pTab->nCol, ...)` left i's upper half
+// stale → the 3822-element overrun → the every-SQL-statement SIGSEGV), and a
+// wider RHS over-stored past a sub-int lvalue (neighbor corruption). The
+// corpus witness (examples/c-subset/assign_value_coerce) proves the VALUES
+// end-to-end on all run legs; THIS pin names the tier, so a refactor that
+// drops either coerce fails HERE, not three tiers later at runtime.
+// RED-ON-DISABLE: revert `stored = coerce(result, lv.type).id` → the stored
+// value's kind flips Cast→Ref (the raw I32/F64 RHS) and its type flips
+// I16→I32/F64; the Cast asserts below flip. The SeqExpr node type + yield-Ref
+// type (I16) are the pre-existing yield thread and stay green.
+TEST(HirLoweringCSubset, PlainAssignAsValueStoresRhsCoercedToLvalueType) {
+    SemanticModel model = analyzeCSubset(
+        "long long g(int v, double d) {\n"
+        "    short s; int y; long long L;\n"
+        "    y = (s = v);\n"    // int RHS -> i16 lvalue (the sqlite shape)
+        "    L = (s = d);\n"    // double RHS -> i16 lvalue (the float leg)
+        "    return y + L + s;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+            : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    ASSERT_TRUE(fn.valid());
+    // Collect the value-position assigns: every SeqExpr in the body, pre-order
+    // = source order → [0] = (s = v), [1] = (s = d).
+    std::vector<HirNodeId> seqs;
+    auto const collect = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::SeqExpr) seqs.push_back(n);
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    collect(collect, res->hir.functionBody(fn));
+    ASSERT_EQ(seqs.size(), 2u) << "two value-position plain assigns expected";
+    auto const& ti = model.lattice().interner();
+    TypeKind const rhsKinds[2] = {TypeKind::I32, TypeKind::F64};
+    for (std::size_t k = 0; k < 2; ++k) {
+        HirNodeId const seq = seqs[k];
+        // The SeqExpr (the assignment-as-value) carries the LVALUE's type.
+        TypeId const seqTy = res->hir.typeId(seq);
+        ASSERT_TRUE(seqTy.valid());
+        EXPECT_EQ(ti.kind(seqTy), TypeKind::I16)
+            << "[" << k << "] the assign-as-value expression is lvalue-typed";
+        auto const stmts = res->hir.seqExprStmts(seq);
+        ASSERT_EQ(stmts.size(), 1u) << "[" << k << "] simple lvalue: no prep";
+        ASSERT_EQ(res->hir.kind(stmts[0]), HirKind::AssignStmt);
+        // THE c90 PROPERTY: the stored value is the RHS wrapped in a Cast to
+        // the LVALUE's type — never the raw RHS at its own width.
+        HirNodeId const stored = res->hir.assignValue(stmts[0]);
+        ASSERT_EQ(res->hir.kind(stored), HirKind::Cast)
+            << "[" << k << "] plain-=-as-value must COERCE the RHS to the "
+               "lvalue type (D-CSUBSET-ASSIGN-VALUE-RHS-COERCE)";
+        TypeId const storedTy = res->hir.typeId(stored);
+        ASSERT_TRUE(storedTy.valid());
+        EXPECT_EQ(ti.kind(storedTy), TypeKind::I16)
+            << "[" << k << "] the stored Cast carries the lvalue's I16 type";
+        auto const castKids = res->hir.children(stored);
+        ASSERT_EQ(castKids.size(), 1u);
+        TypeId const rawTy = res->hir.typeId(castKids[0]);
+        ASSERT_TRUE(rawTy.valid());
+        EXPECT_EQ(ti.kind(rawTy), rhsKinds[k])
+            << "[" << k << "] …over the raw RHS at its own type";
+        // The 6.5.16p3 yield thread: the expression's value is the lvalue
+        // re-read, typed by the lvalue (pre-existing, kept pinned).
+        HirNodeId const yield = res->hir.seqExprResult(seq);
+        ASSERT_EQ(res->hir.kind(yield), HirKind::Ref);
+        TypeId const yieldTy = res->hir.typeId(yield);
+        ASSERT_TRUE(yieldTy.valid());
+        EXPECT_EQ(ti.kind(yieldTy), TypeKind::I16)
+            << "[" << k << "] the assignment's VALUE is the post-conversion "
+               "lvalue read (C 6.5.16p3)";
+    }
+}

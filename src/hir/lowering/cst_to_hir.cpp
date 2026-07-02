@@ -1772,7 +1772,13 @@ struct Lowerer {
         NodeId const node = work.back().node;   // the binary (assign) node (provenance)
         HirNodeId stored;
         if (!ctx.compound) {
-            stored = result.id;                                       // plain `=`
+            // c90 (D-CSUBSET-ASSIGN-VALUE-RHS-COERCE): a plain `=` in VALUE position
+            // must coerce the RHS to the lvalue type before the store (mirroring the
+            // statement path `lowerAssign` -> `lowerExprOrBraceInit(rhsN, lhs.type)`),
+            // else the MIR store takes the RHS's width: a sub-int RHS partial-stores
+            // (stale upper bits -- sqlite estimateTableWidth `for(i=pTab->nCol, ...)`
+            // SIGSEGV) and a wider RHS over-stores past a sub-int lvalue.
+            stored = coerce(result, lv.type).id;                      // plain `=`
         } else {
             // `OP=`: `compoundLhsRead OP rhs`. `compoundLhsRead` was emitted in
             // `enter` (BEFORE the rhs), so operand[0]'s node precedes operand[1]'s —
@@ -2667,7 +2673,10 @@ struct Lowerer {
                 return exprError(node, "assignment sub-expression needs an lvalue and a value");
             HirNodeId stored;
             if (e.compoundBase.empty()) {
-                stored = lowerExpr(rhsN).id;                        // plain `=`
+                // c90 (D-CSUBSET-ASSIGN-VALUE-RHS-COERCE): coerce the plain-`=` RHS
+                // to the lvalue type (mirrors `lowerAssign`'s statement path) -- the
+                // twin of `finishAssign`'s plain arm; see the comment there.
+                stored = coerce(lowerExpr(rhsN), lv->type).id;      // plain `=`
             } else {
                 auto op = coreOpFromName(e.compoundBase);           // `OP=`
                 if (!op || arityOf(*op) != HirOpArity::Binary)
