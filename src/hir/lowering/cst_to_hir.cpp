@@ -714,6 +714,40 @@ struct Lowerer {
         return cond;
     }
 
+    // c79 (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY): the single argument-
+    // coercion funnel for EVERY call-argument site (work-stack Call
+    // frame phase 2, the recursive lowerPostfix Call arm, the SQL flat-
+    // call arm). A DECLARED param coerces exactly as before. An arg
+    // BEYOND the declared params (the variadic `...` tail) or an
+    // unknown-signature callee has NO target type - but C 6.5.2.2p6-7
+    // still applies the lvalue conversions to each such argument: an
+    // Array<T,N> argument DECAYS to Ptr<T> (the default argument
+    // promotions' array decay). Without this a string literal in a
+    // variadic tail (sqlite pragma foreign_key_list
+    // `sqlite3VdbeMultiLoad(..., "NONE")`) kept TypeKind::Array ->
+    // lowered through the MIR Const path -> a LIR literal-pool `mov`
+    // with NO encoder variant (A_NoMatchingEncodingVariant, pool-slot
+    // "is not an integer literal" - the c79 sqlite frontier). Decaying
+    // to pointer-to-OWN-elem keeps coerce's sameElem premise trivially
+    // true, so this reuses the SAME synthetic decay Cast every other
+    // decay site emits (a string literal materializes as a rodata
+    // GlobalAddr at HIR->MIR; a named array yields its base address).
+    // The integer/float default promotions for variadic tails are the
+    // ABI arg-setup tier's width concern, NOT re-typed here; a FnSig
+    // designator already lowers to the function's address uniformly.
+    // Non-Array / valid-param behavior is byte-identical to the prior
+    // inline `coerce(arg, paramType)` / pass-through shapes.
+    [[nodiscard]] E coerceCallArg(E arg, TypeId paramType) {
+        if (paramType.valid()) return coerce(arg, paramType);
+        if (arg.type.valid()
+            && interner.kind(arg.type) == TypeKind::Array) {
+            auto const elems = interner.operands(arg.type);
+            if (!elems.empty())
+                return coerce(arg, interner.pointer(elems[0]));
+        }
+        return arg;
+    }
+
     Lowerer(SemanticModel& m, HirLoweringConfig const& c, SemanticConfig const& s,
             NumberStyle const* ns, DiagnosticReporter& r, HirBuilder& b,
             HirLiteralPool& lits, std::vector<std::pair<HirNodeId, HirSourceLoc>>& sp,
@@ -1457,7 +1491,11 @@ struct Lowerer {
                     // inits, not the deep call chain), exactly as the recursive Call
                     // arm's `lowerExprOrBraceInit`.
                     TypeId const paramType = callParamType(callCtxs[ctxIdx], k);
-                    HirNodeId const a = lowerExprOrBraceInit(argN, paramType);
+                    // c79: the call-arg helper (brace-init args take the same
+                    // lowerBraceInit arm - behavior-identical here since this
+                    // branch is brace-init-only; scalar args coerce in the Call
+                    // frame's phase 2 below).
+                    HirNodeId const a = lowerCallArgOrBraceInit(argN, paramType);
                     callCtxs[ctxIdx].args.push_back(a);
                     ++callCtxs[ctxIdx].argIdx;
                     continue;       // process the next arg
@@ -1666,7 +1704,9 @@ struct Lowerer {
                     std::uint32_t const ctxIdx = f.aux;
                     std::size_t const k = callCtxs[ctxIdx].argIdx;   // the in-flight arg
                     TypeId const paramType = callParamType(callCtxs[ctxIdx], k);
-                    HirNodeId const a = coerce(result, paramType).id;
+                    // c79: variadic-tail args (invalid paramType) array-decay
+                    // via the shared funnel (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY).
+                    HirNodeId const a = coerceCallArg(result, paramType).id;
                     callCtxs[ctxIdx].args.push_back(a);
                     ++callCtxs[ctxIdx].argIdx;
                     if (pumpCallArgs(ctxIdx)) break;   // entered the next scalar — wait
@@ -2160,8 +2200,10 @@ struct Lowerer {
                     argNode = lowerBraceInit(core, paramType);
                 } else {
                     E const arg = lowerFlatExpr(a);
-                    E const coerced = paramType.valid() ? coerce(arg, paramType)
-                                                        : arg;
+                    // c79: same call-arg funnel as the other three sites
+                    // (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY); declared params
+                    // coerce byte-identically, Array-typed tail args decay.
+                    E const coerced = coerceCallArg(arg, paramType);
                     argNode = coerced.id;
                 }
                 args.push_back(argNode);
@@ -3089,8 +3131,10 @@ struct Lowerer {
                                        ? paramTypes[argIdx] : InvalidType;
                 // D5.3 cycle 1b.4: `f({1, 2})` lowers via the shared
                 // helper with the callee's FnSig param type pushed as
-                // the brace-init context.
-                args.push_back(lowerExprOrBraceInit(argN, paramType));
+                // the brace-init context. c79: scalar args route through
+                // the call-arg funnel so a variadic-tail Array decays
+                // (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY).
+                args.push_back(lowerCallArgOrBraceInit(argN, paramType));
                 ++argIdx;
             }
             // Prefer the semantic phase's resolved call type (it types call nodes);
@@ -4325,6 +4369,23 @@ struct Lowerer {
         E const ve = lowerExpr(valueNode);
         E const coerced = coerce(ve, contextType);
         return coerced.id;
+    }
+
+    // c79 (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY): the CALL-ARG sibling of
+    // `lowerExprOrBraceInit` - identical brace-init arm, but the scalar
+    // arm routes through `coerceCallArg` so an argument with NO declared
+    // param type (the variadic `...` tail / unknown signature) receives
+    // the C 6.5.2.2p6-7 array decay instead of passing through raw.
+    // Non-call value sites (var-init / assign / return) keep
+    // `lowerExprOrBraceInit` - an invalid context type there is error
+    // recovery, not a variadic tail.
+    [[nodiscard]] HirNodeId lowerCallArgOrBraceInit(NodeId argNode,
+                                                    TypeId paramType) {
+        NodeId const core = peelToBraceInitOrCore(argNode);
+        if (isBraceInitList(core)) {
+            return lowerBraceInit(core, paramType);
+        }
+        return coerceCallArg(lowerExpr(argNode), paramType).id;
     }
 
     // D5.3 cycle 1b.3: compound literal `(T){...}` as an expression.
