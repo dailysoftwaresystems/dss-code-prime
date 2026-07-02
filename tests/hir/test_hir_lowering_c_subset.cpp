@@ -3908,3 +3908,80 @@ TEST(HirLoweringCSubset, LocalDeclaresNothingFailsLoud) {
     EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
         << "exactly one S_DeclarationDeclaresNothing for the empty local `int;`";
 }
+
+// c89 (D-CSUBSET-SIZEOF-VALUE-OPERAND-TYPE): the VALUE-form sizeof operand is
+// sized by its full EXPRESSION type (C 6.5.3.4) — the tier-boundary pin for the
+// Pass-2 sizeofValueRule operand stamp at its exact consumption point: the
+// HirKind::SizeOf node's TypeRef child. Pre-c89, Pass 2 left operator nodes
+// unstamped and lowerSizeof's resolveStampedTypeBelow DFS sailed past the
+// unstamped `*p`/`tab[0]` into the base IDENTIFIER leaf: sizeof(*p) carried
+// Ptr<Big> (folding 8, not 48), sizeof(tab[0]) carried the WHOLE Array (336),
+// and sizeof(&tab) carried the Array — sqlite's pthreadMutexAlloc
+// `sqlite3MallocZero(sizeof(*p))` under-allocated 8 for the 40-byte recursive
+// mutex → glibc's own mutex-init writes clobbered the malloc top chunk →
+// deterministic sysmalloc SIGABRT on every invocation (the c88 smoke wall).
+// The corpus witness (examples/c-subset/sizeof_value_expression) proves the
+// folded VALUES end-to-end; THIS pin names the tier, so a future Pass-2
+// refactor that drops the operand stamp fails HERE, not three tiers later.
+// RED-ON-DISABLE: revert the Pass-2 stamp → [0] kind flips Struct→Ptr,
+// [1] Struct→Array, [2] Struct→Ptr, [3] pointee flips Array→Big(Struct);
+// every EXPECT below flips.
+TEST(HirLoweringCSubset, SizeofValueOperandCarriesExpressionType) {
+    SemanticModel model = analyzeCSubset(
+        "struct Big { double a; double b; double c; double d; double e; "
+        "double f; };\n"
+        "static struct Big tab[7];\n"
+        "unsigned long long f(struct Big *p) {\n"
+        "    return sizeof(*p) + sizeof(tab[0]) + sizeof(p[0]) + sizeof(&tab);\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+            : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    ASSERT_TRUE(fn.valid());
+    // Collect every SizeOf in the body, pre-order = source order (the `+`
+    // chain associates left, so the DFS meets them left-to-right).
+    std::vector<HirNodeId> sizeofs;
+    auto const collect = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::SizeOf) sizeofs.push_back(n);
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    collect(collect, res->hir.functionBody(fn));
+    ASSERT_EQ(sizeofs.size(), 4u) << "four value-form sizeof sites expected";
+    auto const& ti = model.lattice().interner();
+    auto const sizedType = [&](HirNodeId szNode) -> TypeId {
+        auto const kids = res->hir.children(szNode);
+        EXPECT_EQ(kids.size(), 1u) << "SizeOf carries exactly [TypeRef]";
+        return kids.empty() ? TypeId{} : res->hir.typeId(kids.front());
+    };
+    // [0] sizeof(*p): the POINTEE struct (the sqlite pthreadMutexAlloc shape).
+    TypeId const t0 = sizedType(sizeofs[0]);
+    ASSERT_TRUE(t0.valid());
+    EXPECT_EQ(ti.kind(t0), TypeKind::Struct)
+        << "sizeof(*p) must size the pointee STRUCT, not the pointer";
+    EXPECT_EQ(ti.operands(t0).size(), 6u) << "the 6-double Big, 48 bytes";
+    // [1] sizeof(tab[0]): the array ELEMENT, never the whole array.
+    TypeId const t1 = sizedType(sizeofs[1]);
+    ASSERT_TRUE(t1.valid());
+    EXPECT_EQ(ti.kind(t1), TypeKind::Struct)
+        << "sizeof(tab[0]) must size the ELEMENT, not the whole Array "
+           "(the ArraySize idiom's denominator — pre-c89 it folded to the "
+           "numerator and ArraySize collapsed to 1)";
+    // [2] sizeof(p[0]): index through a pointer — the element again.
+    TypeId const t2 = sizedType(sizeofs[2]);
+    ASSERT_TRUE(t2.valid());
+    EXPECT_EQ(ti.kind(t2), TypeKind::Struct)
+        << "sizeof(p[0]) must size the pointee STRUCT, not the pointer";
+    // [3] sizeof(&tab): address-of yields a POINTER (8), never the array (336).
+    TypeId const t3 = sizedType(sizeofs[3]);
+    ASSERT_TRUE(t3.valid());
+    ASSERT_EQ(ti.kind(t3), TypeKind::Ptr)
+        << "sizeof(&tab) must size a POINTER-to-array";
+    ASSERT_EQ(ti.operands(t3).size(), 1u);
+    EXPECT_EQ(ti.kind(ti.operands(t3)[0]), TypeKind::Array)
+        << "…whose pointee is the Array itself";
+}

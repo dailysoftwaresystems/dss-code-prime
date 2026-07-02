@@ -4262,6 +4262,26 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
         }
         if (cfg.sizeofValueRule.valid() && rule.v == cfg.sizeofValueRule.v) {
+            // c89 (D-CSUBSET-SIZEOF-VALUE-OPERAND-TYPE): stamp the VALUE-form
+            // operand with its full EXPRESSION type. Post-order means the
+            // operand subtree is already typed, and `subtreeType` is the exact
+            // deriver the Pass-1.5 array-dimension sizeof closure already uses
+            // for this same recovery. Without this stamp the HIR lowering's
+            // `resolveStampedTypeBelow` probe descends past the (unstamped)
+            // operator nodes to the FIRST STAMPED LEAF, so `sizeof(*p)` /
+            // `sizeof(p[0])` / `sizeof(arr[0])` sized the base POINTER/ARRAY,
+            // not the element: sqlite's pthreadMutexAlloc `sizeof(*p)` (40)
+            // under-allocated as 8 -> glibc pthread_mutex_init wrote the real
+            // 40 bytes -> malloc top-chunk clobber -> the deterministic
+            // sysmalloc SIGABRT on every sqlite3 invocation; and ArraySize
+            // (sizeof(X)/sizeof(X[0])) folded to 1 silently.
+            for (NodeId opnd : visibleChildren(tree, node)) {
+                if (tree.kind(opnd) != NodeKind::Internal) continue;
+                if (TypeId t = subtreeType(s, tree, opnd, here); t.valid()) {
+                    s.nodeToType.set(opnd, t);
+                }
+                break;  // the single operand child
+            }
             s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
         }
 
