@@ -1,0 +1,42 @@
+{
+  "$comment": "c85 (shell.c POSIX env surface): setenv/unsetenv ship from stdlib.json gated [elf,macho] (POSIX, not C89 — the realpath precedent; msvcrt has only _putenv) + chdir from unistd.json (flat, rides the header [elf,macho] gate). glibc-verified: prototypes /usr/include/{stdlib,unistd}.h, exports nm -D libc.so.6 W setenv/W unsetenv/W chdir on x86_64 AND aarch64 (one version each). The witness: a full setenv->getenv ROUND-TRIP through the real libc environ (byte-equal value), the overwrite flag BOTH ways (0 preserves, 1 replaces — proves the third int arg is ABI-wired), unsetenv->getenv==NULL, and chdir(\"/\")+getcwd reading back exactly \"/\" (the cwd really moved). Every branch exits with a DISTINCT code — attributable, never silent. ELF LEGS ONLY: pe does not ship setenv (honest S0001 there); the macho gate is header-verified but that leg runs only in CI — no macho target here (the stdio_stream_objects precedent). RED-ON-DISABLE witnessed: un-ship setenv -> S0001 at the call. gcc -std=c17 cross-checked in WSL (exit 42, same stdout, both arches).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "setenv:round-trip-ok\n",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "full-release-like",
+      "passes": [
+        "ConstFold",
+        "Mem2Reg",
+        "CopyProp",
+        "Cse",
+        "Licm",
+        "SimplifyCfg",
+        "Dce"
+      ]
+    },
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

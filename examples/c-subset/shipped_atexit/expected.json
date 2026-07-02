@@ -1,0 +1,51 @@
+{
+  "$comment": "c85 (shell.c `atexit(abnormalExit)`): the per-format MACRO/SYMBOL SPLIT (the errno.json pattern, pure config, zero engine change). elf: glibc exports no dynamic `atexit` (import fails at LOAD, witnessed c82) -> `atexit(f)` is a function-like macro (C 7.1.4p1) expanding to `__cxa_atexit((void (*)(void *))(f), 0, 0)` — glibc's own shim semantics (dso_handle=NULL = main-program registration); __cxa_atexit is the import (T, single-version, both arches). pe: no macro variant (0-match => un-injected) — `atexit` is the direct msvcrt.dll export (objdump-verified [1068]); ExitProcess runs msvcrt's onexit table at its CRT DLL-detach. THE RUN PROVES THE HANDLER FIRES AT EXIT: main writes+flushes its marker then returns 42 (≡ exit(42), C 5.1.2.2.3); exit runs handlers BEFORE stream close (7.22.4.4) so the handler's line lands second; the handler prints ONLY if it observed main's last write (mainRan==1) — the strict two-line stdout + exit-42 assertion fails on a dropped, early, or spurious registration. NO macho leg: atexit is deferred-unshipped there (Darwin exports it directly; lands with a macho consumer — honest S0001 meanwhile). RED-ON-DISABLE witnessed: drop the macro (elf) / the symbol (pe) -> S0001 `got atexit`. gcc -std=c17 cross-checked in WSL (exit 42, identical stdout). Line endings follow the adjacent_string_concat convention: msvcrt's text-mode stdout emits \\r\\n, so the manifest-level pin is the pe form and each elf target overrides with the \\n form.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "atexit:main-done\r\natexit:handler-ran\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "expectedStdout": "atexit:main-done\natexit:handler-ran\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "atexit:main-done\natexit:handler-ran\n"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "full-release-like",
+      "passes": [
+        "ConstFold",
+        "Mem2Reg",
+        "CopyProp",
+        "Cse",
+        "Licm",
+        "SimplifyCfg",
+        "Dce"
+      ]
+    },
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}
