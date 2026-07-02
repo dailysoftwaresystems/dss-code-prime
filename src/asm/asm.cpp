@@ -1082,11 +1082,17 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             continue;
         }
 
-        // Primitive integer arm: encode the variant's u64/i64/
-        // bool value as LE bytes sized by the type. Width is the
-        // type's primitive byte size; HIR/MIR const-eval clamps
-        // the value to the type's range before lowering.
-        auto const widthOpt = primitiveByteSize(k);
+        // Scalar arm: encode the variant's u64/i64/bool value as LE bytes
+        // sized by the type. Width comes from `scalarByteSize` — the SAME
+        // sizing chokepoint the aggregate-member leaf recursion uses (a strict
+        // superset of the former `primitiveByteSize`: it adds the pointer-
+        // class scalars, sized by the target's DataModel). c80: a TOP-LEVEL
+        // POINTER-typed global whose initializer folded to a pointer-valued
+        // integer constant (`T* g = 0;` — sqlite's `vfsList`/
+        // `sqlite3_temp_directory`; `void* g = SQLITE_INT_TO_PTR(X)`) lands
+        // here with TypeKind::Ptr — formerly nullopt → a spurious
+        // "non-primitive" fail-loud on a perfectly encodable 8-byte slot.
+        auto const widthOpt = scalarByteSize(k, dataModel);
         if (!widthOpt.has_value()) {
             emit(DiagnosticCode::K_NoMatchingObjectFormat,
                  std::format("lowerMirGlobalsToDataItems: global "
@@ -1131,12 +1137,13 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             continue;
         }
         appendLE(d.bytes, *bits, *widthOpt);
-        // `primitiveByteSize()` returns ∈ {1,2,4,8,16} — every
-        // value is a power-of-two in [1,256], so the `optional`
-        // unwrap path is dead. Use the runtime-asserting factory
-        // to express the invariant in the type (type-design audit
-        // fold 2026-06-02 — dead `K_NoMatchingObjectFormat` arm
-        // removed; the wrong-domain diagnostic that arm would
+        // `scalarByteSize()` returns ∈ {1,2,4,8,16} (pointer-class
+        // scalars are the model's 4- or 8-byte pointer width) —
+        // every value is a power-of-two in [1,256], so the
+        // `optional` unwrap path is dead. Use the runtime-asserting
+        // factory to express the invariant in the type (type-design
+        // audit fold 2026-06-02 — dead `K_NoMatchingObjectFormat`
+        // arm removed; the wrong-domain diagnostic that arm would
         // emit was a future-reader trap).
         d.alignment = Alignment::ofRuntimePow2(
             static_cast<std::uint32_t>(*widthOpt));

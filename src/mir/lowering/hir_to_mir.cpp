@@ -7174,7 +7174,8 @@ struct Lowerer {
     // collect*, so minting here is safe; pushing the rodata PendingGlobal mid-
     // classify is safe (the classify loop walks moduleDecls, not pendingGlobals).
     [[nodiscard]] std::optional<std::pair<SymbolId, std::int64_t>>
-    tryClassifyAsSymbolAddr(HirNodeId initNode) {
+    tryClassifyAsSymbolAddr(HirNodeId initNode, EvalEnvironment const& env,
+                            EvalOptions const& opts) {
         HirKind const k = hir.kind(initNode);
         // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a bare `Ref` to a
         // FUNCTION symbol is a function designator that has decayed to its
@@ -7206,13 +7207,17 @@ struct Lowerer {
             return std::nullopt;
         }
         if (k == HirKind::AddressOf) {
+            // c80 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-BASE-INDEX): the operand
+            // is a CONSTANT LVALUE PATH rooted at a global — the bare
+            // `&global` (the original F5 arm: path = a lone Ref), or the
+            // symbol-base element/field address `&arr[K]` / `&s.field`
+            // (AddressOf(Index/MemberAccess chain)) → {rootSym, byteOffset}.
+            // The path resolver owns the constant-address rules; a
+            // non-constant path (a local, a pointer-typed base, a runtime
+            // index) yields nullopt exactly as the old Ref-only arm did.
             auto kids = hir.children(initNode);
-            if (kids.size() == 1 && hir.kind(kids[0]) == HirKind::Ref) {
-                std::uint32_t const s = hir.payload(kids[0]);
-                if (globalSymbols.contains(s) || functionSymbols.contains(s)) {
-                    return std::make_pair(SymbolId{s}, std::int64_t{0});
-                }
-            }
+            if (kids.size() == 1)
+                return tryResolveConstLvaluePath(kids[0], env, opts);
             return std::nullopt;
         }
         if (k == HirKind::Cast) {
@@ -7231,7 +7236,7 @@ struct Lowerer {
             // The result type is already gated to Ptr above, so a cast that
             // changes representation — `(long)&x` — never reaches here.
             if (hir.kind(kids[0]) != HirKind::Literal)
-                return tryClassifyAsSymbolAddr(kids[0]);
+                return tryClassifyAsSymbolAddr(kids[0], env, opts);
             std::uint32_t const litIdx0 = hir.payload(kids[0]);
             HirLiteralValue const& src = literals.at(litIdx0);
             if (!std::holds_alternative<std::string>(src.value))
@@ -7245,6 +7250,89 @@ struct Lowerer {
             rg.isConst   = true;                  // string literal bytes → .rodata
             pendingGlobals.push_back(std::move(rg));
             return std::make_pair(rodataSym, std::int64_t{0});
+        }
+        return std::nullopt;
+    }
+
+    // c80 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-BASE-INDEX): resolve a CONSTANT
+    // LVALUE PATH rooted at a module global — the operand of a global
+    // initializer's `&…` — to {rootSymbol, byteOffset}. Shapes:
+    //   Ref(global|function)          → {sym, 0}   (the F5/c67 base arm)
+    //   Index(arrayPath, constIdx)    → {sym, off + constIdx * elementStride}
+    //   MemberAccess(recordPath, .f)  → {sym, off + fieldByteOffset(record, f)}
+    // Canonical sqlite shape (sqlite3.c:24077): `const unsigned char
+    // *sqlite3aLTb = &sqlite3UpperToLower[256-OP_Ne];` — an ADDRESS CONSTANT
+    // (C 6.6p9): gcc emits `.quad sqlite3UpperToLower+203` (an abs64 reloc
+    // with an addend), never a runtime store. c67's encoder already threads
+    // the addend, so RECOGNIZING the shape is the whole fix.
+    // ★ CONSERVATIVE (the c65/c68 no-over-fire discipline):
+    //   - an Index base must be ARRAY-typed: indexing THROUGH a pointer-typed
+    //     global (`&ptrGlobal[3]`) reads the pointer's RUNTIME VALUE — not an
+    //     address constant (gcc rejects it as a static initializer too) →
+    //     nullopt (stays fail-loud);
+    //   - a MemberAccess base must be Struct/Union-typed: a `p->f` deref base
+    //     arrives as Deref — no arm matches → nullopt;
+    //   - the index must fold under the SAME const-eval policy the classify
+    //     loop uses (env/opts threaded from it).
+    // Offsets accumulate SIGNED (`&arr[i-j]` with i<j is a negative addend;
+    // the Relocation addend is int64). Nested paths (`&s.arr[K]`,
+    // `&arr[K].field`, `&m[i][j]`) compose by recursion.
+    [[nodiscard]] std::optional<std::pair<SymbolId, std::int64_t>>
+    tryResolveConstLvaluePath(HirNodeId n, EvalEnvironment const& env,
+                              EvalOptions const& opts) {
+        HirKind const k = hir.kind(n);
+        if (k == HirKind::Ref) {
+            std::uint32_t const s = hir.payload(n);
+            if (globalSymbols.contains(s) || functionSymbols.contains(s))
+                return std::make_pair(SymbolId{s}, std::int64_t{0});
+            return std::nullopt;
+        }
+        if (k == HirKind::Index) {
+            auto kids = hir.children(n);
+            if (kids.size() != 2) return std::nullopt;
+            TypeId const baseTy = hir.typeId(kids[0]);
+            if (!baseTy.valid() || interner.kind(baseTy) != TypeKind::Array)
+                return std::nullopt;
+            auto const base = tryResolveConstLvaluePath(kids[0], env, opts);
+            if (!base.has_value()) return std::nullopt;
+            ConstEvalResult const ir =
+                evaluateConstant(hir, interner, literals, kids[1], env, opts);
+            if (!ir.value.has_value()) return std::nullopt;
+            std::int64_t idxVal = 0;
+            if (std::holds_alternative<std::int64_t>(ir.value->value))
+                idxVal = std::get<std::int64_t>(ir.value->value);
+            else if (std::holds_alternative<std::uint64_t>(ir.value->value))
+                idxVal = static_cast<std::int64_t>(
+                    std::get<std::uint64_t>(ir.value->value));
+            else
+                return std::nullopt;
+            // Stride = the element type's layout size (the Index node's own
+            // type IS the element type) — the SAME `elementStride` engine the
+            // runtime Gep path scales with, so the folded address equals the
+            // address the program would compute.
+            auto const stride = elementStride(hir.typeId(n));
+            if (!stride.has_value()) return std::nullopt;
+            return std::make_pair(
+                base->first,
+                base->second + idxVal * static_cast<std::int64_t>(*stride));
+        }
+        if (k == HirKind::MemberAccess) {
+            auto kids = hir.children(n);
+            if (kids.size() != 1) return std::nullopt;
+            TypeId const baseTy = hir.typeId(kids[0]);
+            if (!baseTy.valid()) return std::nullopt;
+            TypeKind const btk = interner.kind(baseTy);
+            if (btk != TypeKind::Struct && btk != TypeKind::Union)
+                return std::nullopt;
+            auto const base = tryResolveConstLvaluePath(kids[0], env, opts);
+            if (!base.has_value()) return std::nullopt;
+            // The FC7 field-offset engine (combineMemberAddr's authority) —
+            // folded field addresses match runtime member access exactly.
+            auto const off = fieldByteOffset(baseTy, hir.payload(n));
+            if (!off.has_value()) return std::nullopt;
+            return std::make_pair(
+                base->first,
+                base->second + static_cast<std::int64_t>(*off));
         }
         return std::nullopt;
     }
@@ -7289,7 +7377,7 @@ struct Lowerer {
         auto kids = hir.children(initNode);
         agg.fields.reserve(kids.size());
         for (HirNodeId child : kids) {
-            if (auto sa = tryClassifyAsSymbolAddr(child)) {
+            if (auto sa = tryClassifyAsSymbolAddr(child, env, opts)) {
                 MirLiteralValue leaf;
                 leaf.value = MirSymbolAddrValue{sa->first.v, sa->second};
                 leaf.core  = TypeKind::Ptr;
@@ -7424,6 +7512,7 @@ struct Lowerer {
         return leaf;
     }
 
+
     // Classify each module-level global into pendingGlobals. Called after
     // `collectGlobals` (so `globalSymbols` is already populated for any
     // function body that refers to globals during lowering).
@@ -7496,7 +7585,7 @@ struct Lowerer {
                 // "...";`) is a LINK-TIME constant const-eval cannot fold —
                 // recognize it FIRST (and route to a MirSymbolAddrValue / abs64
                 // reloc) before falling back to const-eval / runtime-init.
-                if (auto sa = tryClassifyAsSymbolAddr(*initN)) {
+                if (auto sa = tryClassifyAsSymbolAddr(*initN, env, opts)) {
                     pg.symbolAddrInit   = sa->first;
                     pg.symbolAddrAddend = sa->second;
                 } else {
@@ -7519,6 +7608,26 @@ struct Lowerer {
                         // folded above; only the address-bearing case reaches
                         // here.
                         pg.constInit = std::move(*aggC);
+                    } else if (auto np = tryClassifyNullPointerConst(*initN,
+                                                                    env, opts)) {
+                        // c80: a TOP-LEVEL scalar NULL POINTER CONSTANT —
+                        // `T* g = 0;` (sqlite's `vfsList`/`unixBigLock`/
+                        // `inodeList`/`sqlite3SharedCacheList`/
+                        // `sqlite3_temp_directory`/`sqlite3_data_directory`).
+                        // const-eval refuses a cast-to-pointer ("pointer
+                        // targets remain non-foldable"), and c67 wired the
+                        // null-pointer-constant recognizer only into the
+                        // AGGREGATE member loop — a bare scalar pointer
+                        // global fell to runtimeInit → the asm fail-loud.
+                        // Same classifier, same order as the member loop.
+                        pg.constInit = std::move(*np);
+                    } else if (auto ip = tryClassifyNullBaseIndexConst(*initN,
+                                                                      env, opts)) {
+                        // c80: the TOP-LEVEL scalar sibling of c68's member
+                        // arm — `void* g = SQLITE_INT_TO_PTR(X)` =
+                        // `(void*)&((char*)0)[X]` at file scope: a pointer-
+                        // valued INTEGER constant (no symbol, no reloc).
+                        pg.constInit = std::move(*ip);
                     } else {
                         pg.runtimeInit = *initN;
                     }
