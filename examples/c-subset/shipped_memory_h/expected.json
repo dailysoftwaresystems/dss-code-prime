@@ -1,0 +1,16 @@
+{
+  "$comment": "c81 (the sqlite shell.c CLI route): ship <memory.h>, the pre-ANSI legacy alias of <string.h> (shell.c:7121 includes it UNCONDITIONALLY — even on pe). memory.json mirrors string.json's mem* five; first-wins injection dedup makes the shell.c string.h+memory.h double-include mint one extern per name. This TU includes ONLY <memory.h> — the family must resolve from the alias alone. UNGATED, all 4 targets (the header exists on every platform: glibc/Darwin forwarders, MSVC CRT alias). RED-ON-DISABLE: remove memory.json -> F001A.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

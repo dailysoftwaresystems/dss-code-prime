@@ -1,0 +1,14 @@
+{
+  "$comment": "c81 (the sqlite shell.c CLI route): ship <dirent.h> — opaque DIR (typedef to the empty named struct, the stdio-FILE precedent; member access on it fails loud), the glibc-exact struct dirent (readdir returns LIBC'S struct — matching \".\" by d_name proves the 19-byte offset), opendir/readdir/closedir on real libc. Gated [elf] only — Darwin's dirent diverges (d_seekoff/d_namlen/d_name[1024]) AND Darwin-x86_64 readdir is symbol-suffixed ($INODE64); fail-loud unavailable beats a silent wrong layout. RED-ON-DISABLE: remove dirent.json -> F001A.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

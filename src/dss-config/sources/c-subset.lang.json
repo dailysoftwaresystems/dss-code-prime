@@ -307,12 +307,13 @@
     "root": { "sequence": [ { "repeat": "topLevel" } ] },
 
     "topLevel": {
-      "$comment": "NON-speculative: each alt has a disjoint FIRST. struct/union/enum heads route to topLevelDecl (via topLevelHead's body/ref specifier forms) — the bare top-level structDecl/unionDecl/enumDecl rules were folded into topLevelDecl (optional declarator) so a `struct` lead has ONE owner here and only topLevelHead's single-level speculation runs (the two-level topLevel-speculation path was unsound — D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). Those three now-unreferenced rules (+ their semantics/hirKind/scopes rows) were DELETED in the closing cycle (no dead config); the shared structField/unionField/enumerator helpers stay (the *SpecifierBody forms consume them).",
+      "$comment": "NON-speculative: each alt has a disjoint FIRST. struct/union/enum heads route to topLevelDecl (via topLevelHead's body/ref specifier forms) — the bare top-level structDecl/unionDecl/enumDecl rules were folded into topLevelDecl (optional declarator) so a `struct` lead has ONE owner here and only topLevelHead's single-level speculation runs (the two-level topLevel-speculation path was unsound — D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). Those three now-unreferenced rules (+ their semantics/hirKind/scopes rows) were DELETED in the closing cycle (no dead config); the shared structField/unionField/enumerator helpers stay (the *SpecifierBody forms consume them). c81: `emptyStmt` (a lone `;`) is admitted as an external declaration — sqlite shell.c's `SQLITE_EXTENSION_INIT1;` expands EMPTY in the static-shell build, leaving a stray file-scope semicolon (x2, base64.c/base85.c sections) that gcc/clang accept (-pedantic warns; C 6.9 formally disallows it, but accepting it is the universal implementation posture). REUSES the statement-position `emptyStmt` rule exactly as c30 reuses `typedefDecl` in both positions: FIRST = {EndStatement}, disjoint from every other alt -> unique-production direct descent, still non-speculative; its existing `hirKind: Skip` row lowers it to nothing in BOTH positions (the includeDirective->Skip top-level precedent), so no semantics/scopes row is needed.",
       "alt": [
         "includeDirective",
         "typedefDecl",
         "topLevelDecl",
-        "externDecl"
+        "externDecl",
+        "emptyStmt"
       ]
     },
 
