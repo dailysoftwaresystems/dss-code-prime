@@ -240,6 +240,8 @@ public:
                   std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
                   UnitAttribute<bool>                    nullPointerConstantNodes,
                   std::vector<ShippedExternSymbol>       shippedExterns,
+                  std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+                                                         suppressedShippedLibraries,
                   DataModel                              dataModel) noexcept
         : cu_(std::move(cu)),
           lattice_(std::move(lattice)),
@@ -252,6 +254,7 @@ public:
           compositeScopeByType_(std::move(compositeScopeByType)),
           nullPointerConstantNodes_(std::move(nullPointerConstantNodes)),
           shippedExterns_(std::move(shippedExterns)),
+          suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
           dataModel_(dataModel) {}
 
     SemanticModel(SemanticModel const&)            = delete;
@@ -327,6 +330,20 @@ public:
         return shippedExterns_;
     }
 
+    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): the per-format library map of
+    // a shipped descriptor symbol that GOAL-2 SUPPRESSED because a user
+    // declaration claimed the name (shell.c bare-declares `popen` while also
+    // `#include <stdio.h>`). Read by the CST→HIR bare-proto extern synthesis so
+    // the user's prototype re-binds the descriptor's import library instead of
+    // surviving to the linker as an undefined symbol. Availability-gated +
+    // first-wins at record time (exactly mirroring injection). Returns nullptr
+    // when no suppressed descriptor symbol carries this name.
+    [[nodiscard]] std::unordered_map<std::string, std::string> const*
+    suppressedShippedLibraryFor(std::string const& name) const noexcept {
+        auto const it = suppressedShippedLibraries_.find(name);
+        return it == suppressedShippedLibraries_.end() ? nullptr : &it->second;
+    }
+
     // FC3 c1: the data model this analysis ran under (`analyze()`'s
     // parameter — the active format's declared width triple). The HIR
     // lowering reads THIS (never a second parameter), so the two tiers'
@@ -357,6 +374,10 @@ private:
     // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the
     // CST→HIR lowerer.
     std::vector<ShippedExternSymbol>                       shippedExterns_;
+    // c86: name → per-format library map for goal-2-SUPPRESSED shipped
+    // descriptor symbols (see `suppressedShippedLibraryFor`).
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+                                                           suppressedShippedLibraries_;
     // FC3 c1: the analysis-time data model (see `dataModel()`).
     DataModel                                              dataModel_ = DataModel::Lp64;
 };

@@ -2328,6 +2328,67 @@ TEST(MirLoweringCSubset, ForwardReferenceCallResolvesViaPrePass) {
     EXPECT_TRUE(sawCall);
 }
 
+// c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): a synthetic literal-promoted
+// global's SymbolId must clear the WHOLE semantic symbol table when the
+// pipeline passes `syntheticSymbolFloor = model.symbols().size()`. The
+// minter's own scan covers only MIR-VISIBLE symbols (functions/globals/
+// externs); the semantic table also holds typedefs, tags, fields, locals,
+// and injected constants — and the LK11 merge maps MIR symbols to NAMES
+// through that table, so an aliased synthetic id fabricates a named strong
+// definition from an anonymous string literal (the sqlite3.c+shell.c probe's
+// bogus `sqlite3_stmt`/`Fts5Tokenizer` cross-CU redefinitions). RED-ON-
+// DISABLE: drop the `std::max(..., config.syntheticSymbolFloor)` seed → the
+// promoted global's id lands inside the semantic table (this fixture's
+// table carries param/local records well past the function count).
+TEST(MirLoweringCSubset, SyntheticGlobalSymbolsRespectSemanticFloor) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    UnitBuilder builder{*loaded};
+    builder.addInMemory(
+        "typedef struct opaqueTag opaqueTag;\n"   // a type-only record in the table
+        "static opaqueTag *keep;\n"
+        "char const *g(void) { keep = 0; return \"alias-floor\"; }\n",
+        "<mem>");
+    auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    auto model = analyze(cu, DataModel::Lp64);
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter hirRep;
+    auto hir = lowerToHir(model, hirRep);
+    ASSERT_TRUE(hir->ok);
+    std::uint32_t const floor =
+        static_cast<std::uint32_t>(model.symbols().size());
+    MirLoweringConfig cfg;
+    cfg.globalsAllowFloat    = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    cfg.syntheticSymbolFloor = floor;   // what compile_pipeline passes
+    DiagnosticReporter mirRep;
+    auto mir = lowerToMir(hir->hir, hir->literalPool,
+                          model.lattice().interner(), mirRep,
+                          &hir->sourceMap, cfg, /*ffiMap=*/nullptr,
+                          &hir->linkageMap, &hir->mutabilityMap,
+                          &hir->volatileMap);
+    ASSERT_TRUE(mir.ok)
+        << (mirRep.all().empty() ? "" : mirRep.all()[0].actual);
+    Mir const& m = mir.mir;
+    // Every module global is either a REAL semantic-record-backed object
+    // (its record kind is Variable — `keep`) or a SYNTHETIC one whose id
+    // cleared the floor (the promoted "alias-floor" rodata global).
+    std::size_t synthetic = 0;
+    for (std::uint32_t gi = 0; gi < m.moduleGlobalCount(); ++gi) {
+        SymbolId const sym = m.globalSymbol(m.globalAt(gi));
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->kind == DeclarationKind::Variable) {
+            continue;   // a real named global (`keep`)
+        }
+        EXPECT_GE(sym.v, floor)
+            << "synthetic global #" << sym.v << " aliases the semantic "
+            << "symbol table (size " << floor << ") — the LK11 merge would "
+            << "name it after an unrelated record";
+        ++synthetic;
+    }
+    EXPECT_GE(synthetic, 1u)
+        << "expected the promoted string-literal global to be present";
+}
+
 // VarDecl without an initializer still emits the alloca but no store —
 // reads before assignment will Load whatever the alloca's uninitialized
 // memory holds (which is HIR-policy-defined; MIR doesn't auto-init).

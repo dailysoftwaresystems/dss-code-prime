@@ -462,6 +462,31 @@ struct DSS_EXPORT DeclarationRule {
     // source-agnostic — the engine never hardcodes a rule name. Default false ⇒
     // an ordinary defining declaration (a redeclaration collides as before).
     bool            nonDefiningDeclaration = false;
+    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): when true, a SURVIVING bare
+    // function PROTOTYPE minted by this declaration (`int f(int);` — a proto with
+    // NO in-TU definition: `isProtoDeclaration && !isAbsorbedProto`, external
+    // linkage) synthesizes an ExternFunction HIR node with NO library binding
+    // (C 6.2.2p5 — an undecorated function declaration has external linkage and
+    // refers to a definition SOMEWHERE in the program). Resolution order:
+    //   (1) the whole-program LK11 merge binds it to a sibling-TU DEFINITION
+    //       (sqlite3.c defines what shell.c bare-declares) — import row stripped,
+    //       calls rewired direct;
+    //   (2) a bare re-declaration of a SHIPPED descriptor symbol re-binds to
+    //       that descriptor's library (goal-2 suppressed the descriptor's own
+    //       injection because the user decl claimed the name — the proto's
+    //       synthesized extern carries the descriptor's per-format library map
+    //       instead, so `puts` re-declared over `#include <stdio.h>` still
+    //       imports from libc);
+    //   (3) NEITHER ⇒ the import survives with an empty library and the LINKER
+    //       rejects it LOUD as an undefined symbol (K_SymbolUndefined naming the
+    //       symbol — ld's behavior).
+    // false ⇒ the pre-c86 shape: an unabsorbed proto emits nothing and a call to
+    // it fails loud at HIR→MIR (H0009 Ref to unbound symbol). Per-declaration
+    // opt-in (c-subset's `topLevelDecl` + `varDecl`), source-agnostic — the
+    // engine reads only this flag, never a rule name. Internal-linkage (`static`)
+    // and weak protos never synthesize (their reference must NOT bind another
+    // TU's public symbol); they keep the loud H0009. Default false.
+    bool            prototypeSynthesizesExtern = false;
     // D-LK10-ENTRY-MAIN-IMPLICIT-RETURN: HIR-tier implicit-return
     // insertion rule (source-agnostic). When this declaration is a
     // FUNCTION declaration AND the declared symbol's name appears

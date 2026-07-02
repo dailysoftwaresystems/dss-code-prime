@@ -437,9 +437,20 @@ synthesizeFfiFromSourceDecls(
         // format-level fallback. Source-language agnostic — any
         // language whose lowerer populates the override gets
         // per-symbol routing without further substrate change.
-        meta.importLibrary = ext.libraryOverride.empty()
-                                 ? libCopy
-                                 : std::string{ext.libraryOverride};
+        //
+        // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): a
+        // `noLibraryBinding` extern OPTS OUT of the format-default
+        // fallback entirely — its importLibrary stays EMPTY on
+        // purpose (a bare-prototype cross-TU reference resolves at
+        // the link tier: a sibling-TU definition, or a LOUD
+        // undefined-symbol reject). The flag is stamped through so
+        // the HIR→MIR extern pre-pass admits the empty library.
+        meta.noLibraryBinding = ext.noLibraryBinding;
+        if (!ext.noLibraryBinding) {
+            meta.importLibrary = ext.libraryOverride.empty()
+                                     ? libCopy
+                                     : std::string{ext.libraryOverride};
+        }
         // `soname` left empty — same convention as `ingest()`.
 
         ffiMap.set(ext.node, std::move(meta));

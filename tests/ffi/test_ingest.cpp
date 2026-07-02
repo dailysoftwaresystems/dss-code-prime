@@ -616,6 +616,47 @@ TEST(FfiSynthesize, MachOFormatAppliesLeadingUnderscore) {
     EXPECT_EQ(meta->importLibrary, "/usr/lib/libSystem.B.dylib");
 }
 
+TEST(FfiSynthesize, NoLibraryBindingLeavesImportLibraryEmpty) {
+    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): a `noLibraryBinding`
+    // ExternDeclRef (a bare-prototype cross-TU reference) OPTS OUT of the
+    // format-default fallback — `importLibrary` stays EMPTY on purpose and
+    // the flag is stamped through to FfiMetadata so the HIR→MIR extern
+    // pre-pass admits the row. The C-mangling still applies (the LK11 merge
+    // and the linker key on the mangled name) — pinned on Mach-O where the
+    // decoration is observable. RED-ON-DISABLE: dropping the flag branch in
+    // synthesizeFfiFromSourceDecls would bind the format default
+    // ("/usr/lib/libSystem.B.dylib") — a genuinely-undefined typo'd function
+    // would then "link" against libc and fail only at LOAD (the fail-loud
+    // DOWNGRADE the c86 Section-B design rejected).
+    TypeInterner ti = makeInterner();
+    auto built = buildModuleWithExtern(ti);
+    HirFfiMap ffi{built.hir};
+
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin");
+    ASSERT_TRUE(format.has_value());
+
+    DiagnosticReporter rep;
+    std::array externs{ExternDeclRef{built.externNode, "puts",
+                                     /*libraryOverride=*/{},
+                                     /*noLibraryBinding=*/true}};
+    auto result = synthesizeFfiFromSourceDecls(
+        externs, "/usr/lib/libSystem.B.dylib",
+        **target, **format, ffi, rep);
+
+    EXPECT_TRUE(result.ok());
+    EXPECT_EQ(result.externsAnnotated, 1u);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    auto const* meta = ffi.tryGet(built.externNode);
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(meta->mangledName, "_puts")
+        << "C-mangling must still apply — the merge/linker key on it";
+    EXPECT_TRUE(meta->importLibrary.empty())
+        << "a no-library-binding extern must NOT inherit the format default";
+    EXPECT_TRUE(meta->noLibraryBinding);
+}
+
 TEST(FfiSynthesize, EmptyImportLibraryFailsLoudWithDedicatedCode) {
     // The language config's `externLibraryByFormat` map has no
     // entry for the active object format ⇒ the synthesis call

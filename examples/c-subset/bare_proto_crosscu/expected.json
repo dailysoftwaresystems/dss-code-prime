@@ -1,0 +1,16 @@
+{
+  "$comment": "c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS, C 6.2.2p5): a BARE prototype (`int addRemote(int);` — no extern keyword; the sqlite3.h splice shape) with no in-TU definition synthesizes a NO-LIBRARY extern; the LK11 merge binds it to def.c's definition (import stripped, call rewired DIRECT). addRemote(30) = 42. RED-ON-DISABLE: drop `prototypeSynthesizesExtern` from the topLevelDecl row -> H0009 (Ref to unbound symbol) compile failure. gcc two-TU cross-checked. Legs mirror extern_incomplete_array_crosscu (pe + elf run targets; macho 2-TU stays off this manifest — underscore-mangled cross-CU extern matching is untested there).",
+  "language": "c-subset",
+  "sources": ["main.c", "def.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -6555,6 +6555,14 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     // This is the descriptor-model analogue of cycle-21's tree-level
     // S_RedeclaredSymbol (which no longer applies — a descriptor is not a tree).
     std::vector<ShippedExternSymbol> shippedExterns;
+    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): name → per-format library
+    // map for descriptor symbols the goal-2 skip SUPPRESSED (a user decl
+    // claimed the name). The CST→HIR bare-proto extern synthesis reads it so a
+    // user's bare re-declaration of a shipped symbol (`popen` over `#include
+    // <stdio.h>`) re-binds the descriptor's import library rather than
+    // surviving to the linker as an undefined symbol.
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+        suppressedShippedLibraries;
     {
         // Names any USER declaration (top-level, in any tree's own root scope)
         // claimed — the goal-2 skip set. A binding whose symbol's `tree` is the
@@ -6656,7 +6664,25 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
 
             for (auto const& sym : desc->symbols) {
                 // GOAL-2: a user decl of this name wins — skip the descriptor's.
-                if (userDeclaredNames.contains(sym.name)) continue;
+                if (userDeclaredNames.contains(sym.name)) {
+                    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): record the
+                    // SUPPRESSED symbol's library identity so a user BARE
+                    // PROTOTYPE that re-declares this shipped name can bind its
+                    // synthesized extern to the descriptor's library (the proto
+                    // carries the import the descriptor would have injected).
+                    // Availability-gated exactly like injection (a symbol that
+                    // does not EXIST on this target must not plant an import)
+                    // and first-wins across descriptors (emplace — the same
+                    // order injection would have used). Recording objects too
+                    // is harmless: the proto-synthesis consumer is fn-only.
+                    if (!s.activeFormat.has_value()
+                        || ffi::objectFormatInAvailabilitySet(
+                               sym.availableObjectFormats, *s.activeFormat)) {
+                        suppressedShippedLibraries.emplace(sym.name,
+                                                           desc->library);
+                    }
+                    continue;
+                }
                 // Per-SYMBOL availability gate (the symbol-granularity sibling of
                 // the header gate above). When the active object-format is KNOWN
                 // and the symbol RESTRICTS its formats and the active format is NOT
@@ -6902,6 +6928,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::move(s.compositeScopeByType),
         std::move(s.nullPointerConstantNodes),
         std::move(shippedExterns),
+        std::move(suppressedShippedLibraries),
         dataModel,
     };
 }

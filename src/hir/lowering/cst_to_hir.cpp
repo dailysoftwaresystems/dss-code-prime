@@ -6001,20 +6001,88 @@ struct Lowerer {
             }
             SymbolId const sym = model.symbolAt(nameNode);
             // D-CSUBSET-FN-PROTOTYPE: a bare function prototype declarator
-            // (`int f(int);`) emits NO HIR node — it is a function DECLARATION,
-            // not an object. The merged DEFINITION (a separate declarator with a
-            // body) emits the Function; an unabsorbed proto (declared, never
-            // defined) emits nothing AND is never registered as a global/
-            // function symbol, so a call to it fails loud at HIR→MIR (a Ref to
-            // an unbound symbol). Emitting a Global here would create a spurious
-            // FnSig-typed data global (a miscompile). Covers BOTH the absorbed
-            // proto (`isAbsorbedProto`, superseded by a def/redundant decl) and
-            // a standalone proto (`isProtoDeclaration`). A static-storage axis is
-            // per-declaration, so a proto can never share a declarator with a
-            // non-proto object — but the check is per-declarator regardless.
+            // (`int f(int);`) emits NO Global/VarDecl HIR node — it is a
+            // function DECLARATION, not an object. The merged DEFINITION (a
+            // separate declarator with a body) emits the Function; emitting a
+            // Global here would create a spurious FnSig-typed data global (a
+            // miscompile). Covers BOTH the absorbed proto (`isAbsorbedProto`,
+            // superseded by a def/redundant decl) and a standalone proto
+            // (`isProtoDeclaration`). A static-storage axis is per-declaration,
+            // so a proto can never share a declarator with a non-proto object —
+            // but the check is per-declarator regardless.
+            //
+            // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): an UNABSORBED bare
+            // proto (declared, never defined in THIS TU) with the declaration
+            // row's `prototypeSynthesizesExtern` opt-in synthesizes an
+            // ExternFunction with NO library binding (C 6.2.2p5 — external
+            // linkage refers to a definition somewhere in the PROGRAM):
+            //   * the LK11 merge binds it to a sibling-TU definition (the
+            //     sqlite3.c-defines-what-shell.c-declares case) — import
+            //     stripped, calls rewired direct;
+            //   * a bare re-declaration of a SHIPPED descriptor symbol carries
+            //     the suppressed descriptor's library map instead (goal-2: the
+            //     user decl claimed the name, so the descriptor injected
+            //     nothing — the proto IS the import, same library);
+            //   * neither ⇒ the empty-library import survives to the LINKER,
+            //     which rejects it LOUD as an undefined symbol naming the
+            //     symbol (ld's behavior).
+            // ONLY an external-linkage proto synthesizes: a `static` (Local)
+            // or weak proto must never bind another TU's public symbol
+            // (C 6.2.2p3) — those keep the pre-c86 loud H0009 at the first
+            // call. The node needs NO param children (the FnSig carries the
+            // param types — the shipped-descriptor synthesis precedent). A
+            // BLOCK-scope proto (re-homed to file scope per
+            // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE) routes to the MODULE decls via
+            // `moduleDecls_` (the static-local accumulator pattern) so the
+            // HIR→MIR extern pre-pass sees it; flag-off (or a legacy language
+            // without the row) keeps the documented pre-c86 shape: the proto
+            // emits nothing and a call fails loud at HIR→MIR (H0009).
             if (auto const* pr = model.recordFor(sym);
                 pr != nullptr
                 && (pr->isProtoDeclaration || pr->isAbsorbedProto)) {
+                // The proto's linkage: LOCALS reuse the entry-scan result
+                // (`staticLinkage` — already computed for !asGlobal, so no
+                // re-scan and no duplicated unknown-specifier diagnostics);
+                // GLOBALS re-scan ONLY when a specifier prefix exists (the
+                // bare sqlite3.h proto has none ⇒ zero extra scans; a
+                // prefix with an UNKNOWN specifier may re-emit its loud
+                // H_UnknownLinkageSpecifier — rare, never silent).
+                auto protoLinkage = [&]() -> LinkageAttr {
+                    if (!asGlobal) return staticLinkage;
+                    NodeId const pfx =
+                        specifierPrefixChild(tree(), node, *decl);
+                    return pfx.valid() ? linkageFrom(pfx, *decl)
+                                       : LinkageAttr{};
+                };
+                if (decl->prototypeSynthesizesExtern
+                    && pr->isProtoDeclaration && !pr->isAbsorbedProto
+                    && pr->kind == DeclarationKind::Function
+                    && pr->type.valid()
+                    && protoLinkage().binding == SymbolBinding::Global) {
+                    HirNodeId const ef = track(
+                        builder.makeExternFunction(pr->type, sym.v, {}), d);
+                    auto const* shipped =
+                        model.suppressedShippedLibraryFor(pr->name);
+                    externDecls.push_back(HirExternRecord{
+                        ef, pr->name,
+                        shipped != nullptr
+                            ? *shipped
+                            : std::unordered_map<std::string, std::string>{},
+                        /*noLibraryBinding=*/shipped == nullptr});
+                    if (asGlobal) {
+                        out.push_back(ef);
+                    } else if (moduleDecls_ != nullptr) {
+                        moduleDecls_->push_back(ef);
+                    } else {
+                        // Mirrors the static-local MF-3 guard: a block-scope
+                        // proto outside a module tree walk is a bug — never a
+                        // silent drop.
+                        out.push_back(reportedError(d,
+                            "bare-prototype extern synthesized with no "
+                            "module-decls accumulator (outside a module "
+                            "tree walk)"));
+                    }
+                }
                 continue;
             }
             TypeId type = InvalidType;

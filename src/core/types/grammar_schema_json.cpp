@@ -5197,6 +5197,23 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): optional
+                        // `prototypeSynthesizesExtern` flag (default false). A
+                        // surviving bare function prototype minted by this
+                        // declaration synthesizes a no-library ExternFunction
+                        // (cross-TU resolvable at the LK11 merge; an unresolved
+                        // survivor fails loud at link as an undefined symbol).
+                        if (entry.contains("prototypeSynthesizesExtern")) {
+                            if (!entry.at("prototypeSynthesizesExtern").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/prototypeSynthesizesExtern",
+                                          "'prototypeSynthesizesExtern' must be a boolean");
+                            } else {
+                                rule.prototypeSynthesizesExtern =
+                                    entry.at("prototypeSynthesizesExtern").get<bool>();
+                            }
+                        }
+
                         // FC4 c1 stage 2a: optional `requireNamedDeclarators`
                         // flag (default false). Declarator-mode named
                         // positions (locals/globals/typedefs) declare true so

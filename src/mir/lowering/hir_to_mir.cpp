@@ -267,13 +267,25 @@ struct Lowerer {
             // time `mintSyntheticGlobalSymbol()` first runs, so
             // the lazy seed naturally clears them too.
             //
+            // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): the scan alone is
+            // NOT enough — the SEMANTIC symbol table also holds typedefs,
+            // tags, fields, locals, and injected constants, none of which
+            // are MIR-visible, and the LK11 merge maps every MIR symbol to
+            // a NAME through that table. A synthetic id landing inside the
+            // table fabricates a NAMED strong def from an anonymous literal
+            // global (bogus cross-CU collisions; potential silent
+            // mis-merge). `config.syntheticSymbolFloor` (the pipeline
+            // passes `model.symbols().size()`) lifts the seed clear of the
+            // whole semantic id space.
+            //
             // UINT32_MAX seed: refuse to seed at the saturated
             // edge so the immediate `*nextSyntheticGlobalSym_`
             // read below never wraps. The caller fail-louds.
             if (maxV == std::numeric_limits<std::uint32_t>::max()) {
                 return SymbolId{};
             }
-            nextSyntheticGlobalSym_ = maxV + 1u;
+            nextSyntheticGlobalSym_ =
+                std::max(maxV + 1u, config.syntheticSymbolFloor);
         }
         std::uint32_t const minted = *nextSyntheticGlobalSym_;
         // Wrap detection (silent-failure HIGH-1 audit fold): if
@@ -7193,7 +7205,15 @@ struct Lowerer {
                     "attribute manually until then.", decl.v));
                 continue;
             }
-            if (meta->importLibrary.empty()) {
+            // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): a
+            // `noLibraryBinding` extern is EXEMPT from the library
+            // requirement — a bare-prototype cross-TU reference carries
+            // an EMPTY libraryPath on purpose. The LK11 merge resolves
+            // it against a sibling TU's definition (row stripped, calls
+            // direct); an unresolved survivor is rejected LOUD at the
+            // link tier as an undefined symbol (K_SymbolUndefined naming
+            // the symbol). Every OTHER producer keeps the hard contract.
+            if (meta->importLibrary.empty() && !meta->noLibraryBinding) {
                 unsupported(decl, std::format(
                     "HIR ExternFunction (id {}) — `importLibrary` "
                     "is missing from the HirAttribute<FfiMetadata> "

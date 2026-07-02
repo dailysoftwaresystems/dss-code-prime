@@ -64,6 +64,17 @@ struct DSS_EXPORT HirExternRecord {
     // for the ACTIVE target's format at `compile_pipeline` (step 2.5), where
     // the object format is in scope — keeping this lowering target-agnostic.
     std::unordered_map<std::string, std::string> libraryOverride;
+    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): TRUE ⇒ this extern
+    // deliberately carries NO import library — a bare-prototype cross-TU
+    // reference (C 6.2.2p5). The FFI synthesize stage then leaves
+    // `FfiMetadata.importLibrary` EMPTY (it does NOT fall back to the
+    // format default — that fallback is exactly what this flag opts out
+    // of), the HIR→MIR extern pre-pass admits the empty library, and the
+    // LINKER resolves the surviving import against a sibling TU's
+    // definition or rejects it LOUD as an undefined symbol. Mutually
+    // exclusive with a non-empty `libraryOverride` by construction (the
+    // bare-proto producer sets exactly one of the two).
+    bool noLibraryBinding = false;
 };
 
 struct DSS_EXPORT CstToHirResult {

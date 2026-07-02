@@ -1231,15 +1231,57 @@ TEST(LinkerExternResolution, EmptyMangledNameRejected) {
     EXPECT_GT(rep.errorCount(), 0u);
 }
 
-TEST(LinkerExternResolution, EmptyLibraryPathRejected) {
+// c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS) UPDATED CONTRACT: an empty
+// libraryPath is no longer an unconditional structural reject — it is the
+// bare-prototype cross-TU reference (no library ON PURPOSE), and the linker
+// applies ld's rule on the post-merge module:
+//   * REFERENCED (a reloc targets it) + unbound ⇒ K_SymbolUndefined NAMING
+//     the symbol, no bytes emitted (the first arm below);
+//   * UNREFERENCED + unbound ⇒ the row is DROPPED and the link proceeds
+//     (the second arm) — a declared-but-never-called prototype is dead
+//     surface, and a leaked row would emit a broken empty-named
+//     IMAGE_IMPORT_DESCRIPTOR.
+// (Pre-c86 both arms hard-failed with an internal "empty libraryPath"
+// wording that never named the symbol.)
+TEST(LinkerExternResolution, EmptyLibraryPathReferencedIsUndefinedSymbol) {
     auto loaded = loadShippedExec();
-    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    // call rel32 through the extern's SymbolId — the extern IS referenced.
+    AssembledModule mod = makeTrivialModule({0xE8,0,0,0,0, 0xC3}, 1);
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{99};
+    rel.kind   = RelocationKind{1};
+    mod.functions[0].relocations.push_back(rel);
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "ExitProcess", ""});
     DiagnosticReporter rep;
     LinkedImage img = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(img.bytes.empty());
-    EXPECT_GT(rep.errorCount(), 0u);
+    bool sawNamedUndefined = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_SymbolUndefined
+            && d.actual.find("undefined symbol 'ExitProcess'") != std::string::npos) {
+            sawNamedUndefined = true;
+        }
+    }
+    EXPECT_TRUE(sawNamedUndefined)
+        << "a referenced unbound extern must reject LOUD, naming the symbol";
+}
+
+TEST(LinkerExternResolution, EmptyLibraryPathUnreferencedIsDropped) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);  // no relocs — unreferenced
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "ExitProcess", ""});
+    DiagnosticReporter rep;
+    LinkedImage img = linker::link(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "an unreferenced unbound extern must not fail the link";
+    EXPECT_FALSE(img.bytes.empty()) << "the image must still emit";
+    EXPECT_TRUE(img.ok());
+    EXPECT_EQ(std::count(img.externImportNames.begin(), img.externImportNames.end(),
+                         std::string{"ExitProcess"}), 0)
+        << "the dropped row must not reach the emitted import table";
 }
 
 TEST(LinkerExternResolution, DuplicateSymbolIdAcrossFunctionsAndExternsRejected) {

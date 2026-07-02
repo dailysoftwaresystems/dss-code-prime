@@ -46,6 +46,17 @@ struct FfiMetadata {
     // ELF DT_SONAME / Mach-O install_name of `importLibrary`. Empty if not yet
     // known. Used by the linker to record the runtime dependency.
     std::string soname;
+
+    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): TRUE ⇒ this extern
+    // deliberately carries NO import library (a bare-prototype cross-TU
+    // reference, C 6.2.2p5). The HIR→MIR extern pre-pass then ADMITS the empty
+    // `importLibrary` (its ExternImport row's libraryPath stays empty) instead
+    // of failing loud; downstream, the LK11 merge resolves the import against a
+    // sibling TU's definition, and an unresolved survivor is rejected LOUD at
+    // link as an undefined symbol (K_SymbolUndefined naming the symbol). FALSE
+    // (every other producer) keeps the hard every-extern-must-declare-its-
+    // library contract unchanged.
+    bool noLibraryBinding = false;
 };
 
 } // namespace dss

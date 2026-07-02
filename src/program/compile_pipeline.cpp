@@ -321,7 +321,13 @@ static std::optional<CuMirModule> buildCuMirImpl(
         refs.reserve(hir->externDecls.size());
         for (std::size_t i = 0; i < hir->externDecls.size(); ++i) {
             auto const& r = hir->externDecls[i];
-            refs.push_back({r.node, r.canonicalName, resolvedLibs[i]});
+            // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): thread the
+            // no-library marker — FF5 then leaves the row's importLibrary
+            // EMPTY (no format-default fallback) so the reference resolves
+            // at the link tier (sibling-TU definition, or the LOUD
+            // undefined-symbol reject).
+            refs.push_back({r.node, r.canonicalName, resolvedLibs[i],
+                            r.noLibraryBinding});
         }
 
         auto const ffiEntry = reporter.errorCount();
@@ -361,6 +367,14 @@ static std::optional<CuMirModule> buildCuMirImpl(
     mirCfg.aggregateLayout.bitFieldStrategy = effectiveBfStrategy;
     mirCfg.aggregateLayoutLoaded = target.aggregateLayoutLoaded();
     mirCfg.dataModel             = format.dataModel();
+    // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): lift the synthetic-global
+    // SymbolId seed clear of the WHOLE semantic symbol table — the LK11
+    // merge maps MIR symbols to names through `model.recordFor`, so a
+    // synthetic literal global whose id aliased a typedef/tag/field/constant
+    // record would enter the merge as a NAMED strong definition (bogus
+    // cross-CU redefinitions; potential silent mis-merge onto a literal).
+    mirCfg.syntheticSymbolFloor =
+        static_cast<std::uint32_t>(model.symbols().size());
     // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the RESOLVED calling
     // convention's by-value aggregate strategy into HIR→MIR (the §B-locked
     // boundary). A struct arg/return is classified + synthesized at HIR→MIR; the
