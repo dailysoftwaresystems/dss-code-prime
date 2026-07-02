@@ -759,6 +759,27 @@ struct DSS_EXPORT ObjectFormatData {
     // unknown VALUE still fails loud at load (the loader's enum check).
     std::optional<ExternCallDispatch> externCallDispatch;
 
+    // ── D-LK-EXTERN-DATA-IMPORT: extern-DATA import binding model ───
+    //
+    // How an imported library DATA OBJECT (libc `stdout`) is bound
+    // into the emitted image. `copy-relocation` = the ELF ET_EXEC
+    // R_*_COPY mechanism (exec-local `.bss` slot + DEFINED OBJECT
+    // dynsym + one COPY reloc; the loader memcpy's the library's
+    // object in at startup). See `DataImportBinding`
+    // (core/types/object_format_kind.hpp) for the full rationale.
+    //
+    // `std::nullopt` = the format declared no data-import binding —
+    // NOT a silent default: the linker's pre-walker gate FAILS LOUD
+    // on any surviving extern data import under a nullopt-binding
+    // format (a data symbol bound through the function-import
+    // machinery would read jump-stub bytes as the object's value —
+    // the silent-miscompile class). The shipped ELF exec formats
+    // declare "copy-relocation"; PE / Mach-O / relocatable formats
+    // omit it until their models land (PE `__imp_` data thunks,
+    // Mach-O non-lazy pointers). An unknown VALUE fails loud at load
+    // (the closed-enum check — a typo never falls back).
+    std::optional<DataImportBinding> dataImportBinding;
+
     // ── D-LK2-RODATA closure: producer-data-section capability set ──
     //
     // Schema-declared set of `DataSectionKind` values the format's
@@ -941,6 +962,17 @@ public:
     [[nodiscard]] std::optional<ExternCallDispatch>
     externCallDispatch() const noexcept {
         return d_.externCallDispatch;
+    }
+
+    // ── D-LK-EXTERN-DATA-IMPORT accessor ─────────────────────────
+    // The format's extern-DATA import binding model
+    // (`copy-relocation`), or nullopt if the format declared none.
+    // The linker's pre-walker gate fails loud on a surviving data
+    // import under nullopt; the format walker implements the
+    // declared mechanism.
+    [[nodiscard]] std::optional<DataImportBinding>
+    dataImportBinding() const noexcept {
+        return d_.dataImportBinding;
     }
 
     // ── D-LK2-RODATA producer-data-section capability gate ─────

@@ -187,6 +187,10 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // linkage decorations), so a top-level declaration here
             // would be dead data.
             "externCallDispatch",
+            // D-LK-EXTERN-DATA-IMPORT: the extern-DATA import binding
+            // model (copy relocations) is likewise an ELF/PE/Mach-O
+            // dynamic-import notion — dead data on WASM/SPIR-V.
+            "dataImportBinding",
         };
         for (auto const* field : universalFields) {
             if (doc.contains(field)) {
@@ -347,6 +351,39 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                       s));
             } else {
                 data.externCallDispatch = *d;
+            }
+        }
+    }
+
+    // D-LK-EXTERN-DATA-IMPORT: `dataImportBinding` — the format's
+    // extern-DATA import binding model ("copy-relocation"). Optional in
+    // the JSON (a format whose data-import model has not landed — PE /
+    // Mach-O / every relocatable flavor — omits it; the linker's pre-
+    // walker gate then fails loud on any surviving data import instead
+    // of binding a data symbol through the function-import machinery).
+    // Present-but-unknown IS a fail-loud HERE at load (a typo must NOT
+    // silently degrade to "no data imports supported" — the
+    // externCallDispatch discipline).
+    if (doc.contains("dataImportBinding")) {
+        if (!doc.at("dataImportBinding").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      "/dataImportBinding",
+                      "'dataImportBinding' must be a string "
+                      "(\"copy-relocation\")");
+        } else {
+            auto const s =
+                doc.at("dataImportBinding").get<std::string>();
+            auto const b = dataImportBindingFromName(s);
+            if (!b.has_value()) {
+                coll.emit(DiagnosticCode::C_MalformedJson,
+                          "/dataImportBinding",
+                          std::format("unknown dataImportBinding '{}' "
+                                      "— accepted: \"copy-relocation\" "
+                                      "(ELF ET_EXEC R_*_COPY exec-local "
+                                      ".bss copy)",
+                                      s));
+            } else {
+                data.dataImportBinding = *b;
             }
         }
     }

@@ -1,0 +1,42 @@
+{
+  "$comment": "c84 D-LK-EXTERN-DATA-IMPORT (the SectionB-locked option A — ELF COPY relocations): stdout/stderr/stdin ship from stdio.json as extern DATA objects (kind:object, FILE*, availableObjectFormats:[elf]); the ELF exec walker reserves a .bss copy slot per stream, exports each as a DEFINED OBJECT dynsym (st_size=8 from the DataModel pointer width, NEVER hardcoded) and emits R_X86_64_COPY(5)/R_AARCH64_COPY(1024) in .rela.dyn; ld-linux copies libc's FILE* values in before entry. The runner's capture MERGES the child's stderr into capturedStdout, so expectedStdout asserts BOTH streams' bytes in a DETERMINISTIC order (stdout explicitly fflush'd before the stderr write; C 7.21.3p7 keeps stderr un-fully-buffered) — proving both FILE* slots bind the real libc streams; the 1>/2> SEPARATION is asserted by the manual WSL validation (a merged capture cannot express it). Both fprintf return values (22 chars each) feed the exit code; the three slots must be non-null + pairwise-distinct. ELF LEGS ONLY: pe/macho do not ship the objects (their dataImportBinding models have not landed — a reference there stays an honest S0001; the linker rejects any surviving data import loud). RED-ON-DISABLE witnessed: un-ship the objects -> S0001; drop dataImportBinding from the format -> K_FormatLacksImportSupport at link. gcc -std=c17 -no-pie cross-checked (exit 42, identical stream bytes, same COPY mechanism).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "copyreloc:stdout-live\ncopyreloc:stderr-live\n",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "full-release-like",
+      "passes": [
+        "ConstFold",
+        "Mem2Reg",
+        "CopyProp",
+        "Cse",
+        "Licm",
+        "SimplifyCfg",
+        "Dce"
+      ]
+    },
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

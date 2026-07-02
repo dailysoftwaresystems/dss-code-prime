@@ -7086,6 +7086,30 @@ struct Lowerer {
                 row.mangledName = meta->mangledName;
                 row.libraryPath = meta->importLibrary;
                 row.isData      = true;
+                // c84 (D-LK-EXTERN-DATA-IMPORT): derive the imported
+                // OBJECT's byte size + alignment from the declared
+                // type's LAYOUT (the same computeLayout every sizeof /
+                // global-emission consumer uses — a `FILE*` object is
+                // the DataModel's pointer width, never a hardcoded 8).
+                // The ELF copy-relocation emitter reserves a `.bss`
+                // slot of exactly this shape and stamps `st_size`.
+                // An INCOMPLETE declared type (`extern const char
+                // v[];` — no computable layout) legitimately leaves
+                // both 0: legal C for a cross-TU extern the LK11
+                // merge resolves against its defining sibling CU;
+                // a TRUE library import surviving to the walker with
+                // size 0 fails loud THERE (an unsized copy slot
+                // cannot be reserved), keeping the incomplete-array
+                // cross-TU case working.
+                if (config.aggregateLayoutLoaded) {
+                    auto const layout = computeLayout(
+                        ty, interner, config.aggregateLayout,
+                        config.dataModel);
+                    if (layout.has_value()) {
+                        row.dataSizeBytes  = layout->size;
+                        row.dataAlignBytes = layout->align.bytes();
+                    }
+                }
                 externImports.push_back(std::move(row));
                 globalSymbols.insert(sym.v);
                 continue;

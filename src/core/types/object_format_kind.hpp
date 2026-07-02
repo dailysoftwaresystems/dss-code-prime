@@ -117,6 +117,50 @@ externCallDispatchFromName(std::string_view s) noexcept {
     return kExternCallDispatchTable.fromName(s);
 }
 
+// ── Extern-DATA import binding model (D-LK-EXTERN-DATA-IMPORT) ─────
+//
+// How an imported library DATA OBJECT (libc's `stdout` — an extern
+// object that lives in the shared library, not a function) is BOUND
+// into the emitted image — a property of the OBJECT FORMAT's dynamic-
+// import model, exactly like `ExternCallDispatch` above. A format that
+// declares NO binding model cannot carry a data import at all: binding
+// one through the FUNCTION-import machinery (PLT stub / IAT thunk)
+// would make code read jump-stub BYTES as the object's value — the
+// silent-miscompile class the linker's pre-walker reject exists for.
+//
+//   * `copy-relocation` (ELF ET_EXEC R_X86_64_COPY / R_AARCH64_COPY):
+//     the executable reserves a correctly-sized `.bss` slot per
+//     imported object, exports the symbol as a DEFINED OBJECT at that
+//     slot, and emits one COPY relocation; the dynamic loader memcpy's
+//     the library's object into the slot at startup and every image
+//     (including the library itself, by symbol interposition) then
+//     references the executable's copy. The standard glibc non-PIE
+//     ET_EXEC mechanism — zero new instruction encodings.
+//
+// A future PIE/GOT-indirect model ("got-indirect": address loads
+// through a GOT slot the loader fills — required once DSS emits
+// ET_DYN) and the PE `__imp_` data-thunk model would be NEW members;
+// the linker gate + walkers dispatch on the declared member, never on
+// a format-name branch. Consumed by the linker's pre-walker data-
+// import gate (linker.cpp) + the per-format walker that implements
+// the declared mechanism (elf.cpp).
+enum class DataImportBinding : std::uint8_t {
+    CopyRelocation = 1,  // ELF ET_EXEC R_*_COPY exec-local .bss copy
+};
+
+inline constexpr EnumNameTable<DataImportBinding, 1> kDataImportBindingTable{{{
+    { DataImportBinding::CopyRelocation, "copy-relocation" },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+dataImportBindingName(DataImportBinding b) noexcept {
+    return kDataImportBindingTable.name(b);
+}
+[[nodiscard]] constexpr std::optional<DataImportBinding>
+dataImportBindingFromName(std::string_view s) noexcept {
+    return kDataImportBindingTable.fromName(s);
+}
+
 // THE single source of truth for the extern-call-site SHAPE selection
 // (D-FFI-EXTERN-CALL-DISPATCH). `true`  → the call site DEREFERENCES a
 // pointer slot (x86_64 `FF 15 disp32` = `call [RIP+disp]`); the LIR

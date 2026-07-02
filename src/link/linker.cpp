@@ -429,32 +429,43 @@ LinkedImage link(std::span<AssembledModule const> modules,
         image.externImportNames.push_back(ext.mangledName);
     }
 
-    // c82 (D-LK-EXTERN-DATA-IMPORT): a DATA import that SURVIVED — no
-    // sibling-CU definition resolved it away at the merge — needs the
-    // extern-data binding model (ELF R_*_COPY copy-relocation vs
-    // GOT-indirect address loads; PE __imp_ data thunks; Mach-O non-lazy
-    // pointers), which is a pending §B decision. Every current import
-    // walker binds imports as CODE (PLT-style stubs / IAT thunks) — a data
-    // symbol bound that way "links" and then reads jump-stub BYTES as the
-    // object's value at run time: the exact silent-miscompile class the
-    // fail-loud rule exists for. Reject HERE, the one chokepoint all three
-    // format walkers share, naming the symbol so the operator knows which
-    // extern object needs either a defining sibling TU or the §B model.
-    for (auto const& ext : inputModule.externImports) {
-        if (!ext.isData) continue;
-        report(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-               DiagnosticSeverity::Error,
-               std::string{"linker: extern DATA import '"} + ext.mangledName
-                   + "' (from '" + ext.libraryPath
-                   + "') cannot be bound yet — library data objects need the "
-                     "extern-data import model (D-LK-EXTERN-DATA-IMPORT, a "
-                     "pending design decision: ELF copy-relocation vs "
-                     "GOT-indirect loads). A cross-TU extern object resolves "
-                     "by compiling it WITH its defining translation unit; a "
-                     "true library data object (e.g. libc stdout) is blocked "
-                     "on that decision.");
-        image.resolvedFuncCount = 0;
-        return image;
+    // c82+c84 (D-LK-EXTERN-DATA-IMPORT): a DATA import that SURVIVED — no
+    // sibling-CU definition resolved it away at the merge — binds per the
+    // format's SCHEMA-DECLARED `dataImportBinding` model (c84: the ELF
+    // exec formats declare "copy-relocation" and their walker reserves an
+    // exec-local `.bss` copy slot + emits the R_*_COPY dynamic reloc). A
+    // format that declares NO model (PE / Mach-O until their `__imp_`
+    // data-thunk / non-lazy-pointer models land; every relocatable
+    // flavor) REJECTS LOUD here, the one chokepoint all format walkers
+    // share: its import walker binds imports as CODE (PLT-style stubs /
+    // IAT thunks) — a data symbol bound that way "links" and then reads
+    // jump-stub BYTES as the object's value at run time, the exact
+    // silent-miscompile class the fail-loud rule exists for. Schema-
+    // declared, not format-name-enumerated (the supportedDataSections
+    // discipline): a format gains data imports by declaring the field +
+    // landing its walker arm — zero gate changes.
+    if (!objectFormatSchema.dataImportBinding().has_value()) {
+        for (auto const& ext : inputModule.externImports) {
+            if (!ext.isData) continue;
+            report(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                   DiagnosticSeverity::Error,
+                   std::string{"linker: extern DATA import '"} + ext.mangledName
+                       + "' (from '" + ext.libraryPath
+                       + "') cannot be bound — format '"
+                       + std::string{objectFormatSchema.name()}
+                       + "' declares no 'dataImportBinding' model "
+                         "(D-LK-EXTERN-DATA-IMPORT). Library data objects "
+                         "bind via the format's declared mechanism (ELF exec: "
+                         "\"copy-relocation\"); binding one through the "
+                         "function-import machinery would read jump-stub "
+                         "bytes as the object's value. A cross-TU extern "
+                         "object resolves by compiling it WITH its defining "
+                         "translation unit; a true library data object "
+                         "(e.g. libc stdout) needs the format's binding "
+                         "model to land.");
+            image.resolvedFuncCount = 0;
+            return image;
+        }
     }
 
     // D-LK10-ENTRY Slice C (plan 14 §2.13): when the format declares
