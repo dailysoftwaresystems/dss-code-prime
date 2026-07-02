@@ -7013,6 +7013,83 @@ struct Lowerer {
         // post-fold review).
         std::unordered_set<std::uint32_t> seenExternSyms;
         for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
+            // c82 (D-LK-EXTERN-DATA-IMPORT): ExternGlobal — an extern DATA
+            // object with no intra-module definition (the same-TU-definition
+            // case never reaches HIR: the semantic merge suppresses the
+            // extern node). Registered EXACTLY like an extern function —
+            // an ExternImport row (flagged isData) + a symbol registration —
+            // except the symbol goes into `globalSymbols`, so a `Ref` lowers
+            // through the SAME GlobalAddr(+Load) path an intra-module global
+            // uses. Cross-TU: the LK11 merge collapses the row onto a
+            // sibling CU's definition (sqlite3.c's `sqlite3_version`) and
+            // drops the import; a TRUE library data import (libc `stdout`)
+            // survives to the link tier, which fail-louds until the
+            // extern-data binding model lands (the c82 §B).
+            if (hir.kind(decl) == HirKind::ExternGlobal) {
+                TypeId const ty = hir.externGlobalType(decl);
+                if (!ty.valid()) {
+                    unsupported(decl, std::format(
+                        "HIR ExternGlobal (id {}) — invalid TypeId; the "
+                        "semantic model failed to resolve this extern "
+                        "object's declared type.", decl.v));
+                    continue;
+                }
+                SymbolId const sym = hir.externGlobalSymbol(decl);
+                if (!sym.valid()) {
+                    unsupported(decl, std::format(
+                        "HIR ExternGlobal (id {}) — missing SymbolId; the "
+                        "semantic model failed to bind a symbol to this "
+                        "extern declaration.", decl.v));
+                    continue;
+                }
+                if (functionSymbols.contains(sym.v)
+                    || globalSymbols.contains(sym.v)) {
+                    unsupported(decl, std::format(
+                        "HIR ExternGlobal (id {}) — SymbolId #{} is already "
+                        "declared as an intra-module function or global. "
+                        "Each SymbolId must belong to exactly one "
+                        "definition surface.", decl.v, sym.v));
+                    continue;
+                }
+                if (!seenExternSyms.insert(sym.v).second) {
+                    unsupported(decl, std::format(
+                        "HIR ExternGlobal (id {}) — SymbolId #{} is already "
+                        "declared by a prior extern in this module.",
+                        decl.v, sym.v));
+                    continue;
+                }
+                FfiMetadata const* meta = (ffiMap != nullptr)
+                    ? ffiMap->tryGet(decl)
+                    : nullptr;
+                // Same fail-loud metadata contract as the function arm
+                // below: no name / no library ⇒ the linker could neither
+                // resolve nor import the symbol — surface it HERE with the
+                // source span.
+                if (meta == nullptr || meta->mangledName.empty()) {
+                    unsupported(decl, std::format(
+                        "HIR ExternGlobal (id {}) — `mangledName` is missing "
+                        "from the HirAttribute<FfiMetadata> side-table. "
+                        "Every extern symbol must carry a non-empty mangled "
+                        "name (the linker's import-table key).", decl.v));
+                    continue;
+                }
+                if (meta->importLibrary.empty()) {
+                    unsupported(decl, std::format(
+                        "HIR ExternGlobal (id {}) — `importLibrary` is "
+                        "missing from the HirAttribute<FfiMetadata> "
+                        "side-table. Every extern symbol must declare the "
+                        "dynamic library that owns it.", decl.v));
+                    continue;
+                }
+                ExternImport row;
+                row.symbol      = sym;
+                row.mangledName = meta->mangledName;
+                row.libraryPath = meta->importLibrary;
+                row.isData      = true;
+                externImports.push_back(std::move(row));
+                globalSymbols.insert(sym.v);
+                continue;
+            }
             if (hir.kind(decl) != HirKind::ExternFunction) continue;
             TypeId const sig = hir.externFunctionSignature(decl);
             if (!sig.valid()) {
@@ -7792,10 +7869,16 @@ struct Lowerer {
                     // D-LK6-6 closure.)
                     break;
                 case HirKind::ExternGlobal:
-                    unsupported(decl, std::format(
-                        "HIR ExternGlobal (id {}) — FFI symbol ingestion is "
-                        "not yet lowered", decl.v));
-                    return;
+                    // c82 (D-LK-EXTERN-DATA-IMPORT): pre-pass
+                    // (`collectExterns`) already registered the SymbolId in
+                    // `globalSymbols` and pushed an `ExternImport` row
+                    // flagged `isData`. No MIR instructions at the decl
+                    // site — a `Ref` lowers through the same
+                    // GlobalAddr(+Load) path an intra-module global uses;
+                    // the LK11 merge resolves sibling-CU-defined ones, and
+                    // the link tier fail-louds on a surviving TRUE library
+                    // data import until the binding model lands (§B).
+                    break;
                 case HirKind::TypeDecl:
                     // TypeDecl is the one structural carrier that genuinely
                     // has no MIR runtime effect — it interns a type into the

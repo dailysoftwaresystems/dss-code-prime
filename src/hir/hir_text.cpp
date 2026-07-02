@@ -1077,6 +1077,15 @@ public:
            DiagnosticReporter& reporter)
         : interner_(extInterner), typeReg_(extTypeReg), lex_(text), reporter_(reporter) {}
 
+    // c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): caller-supplied NAME → TypeId
+    // bindings for the type-text path (see parseTypeFromText's doc). Consulted
+    // by `parseType`'s identifier fallback — AFTER every structural keyword —
+    // so a binding can never shadow the grammar. The span's storage outlives
+    // the parse (the caller holds it across the parseTypeFromText call).
+    void setNamedTypes(std::span<NamedTypeBinding const> namedTypes) {
+        namedTypes_ = namedTypes;
+    }
+
     HirBuilder              builder_;
     // Owned only on the module path (empty on the type-text path); the references
     // below are the single point of use for every production.
@@ -1129,6 +1138,9 @@ private:
     std::unordered_map<std::string, HirKindId>      extKindByName_;
     std::unordered_map<std::string, HirOpId>        extOpByName_;
     std::unordered_map<std::string, HirIntrinsicId> intrinsicByName_;
+    // c82: caller-supplied identifier→TypeId aliases (type-text path only;
+    // empty on the module path). Storage owned by the caller.
+    std::span<NamedTypeBinding const> namedTypes_;
     std::uint32_t preCounter_ = 0;
 
     // ── token helpers ────────────────────────────────────────────────────────
@@ -1853,6 +1865,14 @@ private:
             TypeKindId kindId = typeReg_.registerExtension(name, {});
             return interner_.extension(kindId, name, args, scalars);
         }
+        // c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): caller-supplied named-type
+        // bindings — the LAST resort before the unknown-type reject, so a
+        // binding can never shadow a primitive or a structural keyword. A
+        // bound but INVALID TypeId falls through to the reject (never a
+        // silent InvalidType success).
+        for (NamedTypeBinding const& nb : namedTypes_) {
+            if (nb.name == kw && nb.type.valid()) return nb.type;
+        }
         malformed(std::format("unknown type '{}'", kw));
         return InvalidType;
     }
@@ -1908,12 +1928,14 @@ std::unique_ptr<HirParseResult> parseHir(std::string_view text, CompilationUnitI
 }
 
 TypeId parseTypeFromText(std::string_view typeText, TypeInterner& interner,
-                         TypeRegistry& typeReg, DiagnosticReporter& reporter) {
+                         TypeRegistry& typeReg, DiagnosticReporter& reporter,
+                         std::span<NamedTypeBinding const> namedTypes) {
     std::size_t const errBefore = reporter.errorCount();
 
     // Reuse the ONE type-grammar decoder: drive the module parser's `parseType`
     // production over `typeText`, interning into the caller's interner/registry.
     Parser parser{typeText, interner, typeReg, reporter};
+    parser.setNamedTypes(namedTypes);   // c82: caller-supplied identifier aliases
     TypeId const ty = parser.parseTypeFromTextEntry();
 
     // A standalone type string must be exactly one type. Trailing tokens (e.g.

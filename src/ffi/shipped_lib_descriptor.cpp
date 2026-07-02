@@ -512,7 +512,8 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
                                          TypeInterner& interner, TypeRegistry& typeReg,
                                          DiagnosticReporter& reporter,
                                          std::vector<ShippedField>& outFields,
-                                         std::vector<TypeId>& outFieldTypes) {
+                                         std::vector<TypeId>& outFieldTypes,
+                                         std::span<NamedTypeBinding const> namedTypes) {
     std::size_t fidx = 0;
     for (auto const& f : fields) {
         std::string const fat = at + " fields[" + std::to_string(fidx) + "]";
@@ -545,7 +546,7 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
             return false;
         }
         std::string const fTypeText = f.at("type").get<std::string>();
-        TypeId const fty = parseTypeFromText(fTypeText, interner, typeReg, reporter);
+        TypeId const fty = parseTypeFromText(fTypeText, interner, typeReg, reporter, namedTypes);
         if (!fty.valid() || fty == InvalidType) {
             dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                         DiagnosticSeverity::Error,
@@ -570,14 +571,15 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
 decodeConstantValueAndType(json const& obj, std::string const& at,
                            std::string const& cname, TypeInterner& interner,
                            TypeRegistry& typeReg, DiagnosticReporter& reporter,
-                           std::int64_t& outValue, TypeId& outType) {
+                           std::int64_t& outValue, TypeId& outType,
+                           std::span<NamedTypeBinding const> namedTypes) {
     if (!obj.contains("type") || !obj.at("type").is_string()) {
         emitMalformed(reporter, "shipped-lib descriptor " + at
                                     + ": missing or non-string 'type'");
         return false;
     }
     std::string const typeText = obj.at("type").get<std::string>();
-    TypeId const cty = parseTypeFromText(typeText, interner, typeReg, reporter);
+    TypeId const cty = parseTypeFromText(typeText, interner, typeReg, reporter, namedTypes);
     if (!cty.valid() || cty == InvalidType) {
         dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                     DiagnosticSeverity::Error,
@@ -620,7 +622,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                          DiagnosticReporter&             reporter,
                          DataModel                       dataModel,
                          std::optional<std::string_view> activeTarget,
-                         std::optional<ObjectFormatKind> activeFormat) {
+                         std::optional<ObjectFormatKind> activeFormat,
+                         std::span<NamedTypeBinding const> namedTypes) {
     std::size_t const errBefore = reporter.errorCount();
 
     // (0) Read the file. A missing/unreadable descriptor is malformed-shaped
@@ -878,7 +881,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                 }
                 std::string const ovText = kv.value().get<std::string>();
                 TypeId const ovSig =
-                    parseTypeFromText(ovText, interner, typeReg, reporter);
+                    parseTypeFromText(ovText, interner, typeReg, reporter, namedTypes);
                 if (!ovSig.valid() || ovSig == InvalidType) {
                     dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                                 DiagnosticSeverity::Error,
@@ -906,7 +909,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // and the whole read fails via the errorCount delta below). The BASE
         // text is decoded even when an override is active (both must be
         // valid); the EFFECTIVE signature is the active model's.
-        TypeId const baseSig = parseTypeFromText(sigText, interner, typeReg, reporter);
+        TypeId const baseSig = parseTypeFromText(sigText, interner, typeReg, reporter, namedTypes);
         if (!baseSig.valid() || baseSig == InvalidType) {
             dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                         DiagnosticSeverity::Error,
@@ -918,7 +921,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         }
         TypeId sig = baseSig;
         if (effectiveSigText != sigText) {
-            sig = parseTypeFromText(effectiveSigText, interner, typeReg, reporter);
+            sig = parseTypeFromText(effectiveSigText, interner, typeReg, reporter, namedTypes);
             // Already validated above; a second-parse failure here would be
             // interner drift — covered by the errorCount delta either way.
             if (!sig.valid() || sig == InvalidType) continue;
@@ -987,7 +990,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             if (cHasFlat) {
                 // FLAT: decode {value,type} via the shared scalar-constant codec.
                 if (!decodeConstantValueAndType(c, at, cname, interner, typeReg,
-                                                reporter, selValue, selType)) {
+                                                reporter, selValue, selType,
+                                                namedTypes)) {
                     continue;
                 }
                 selected = true;
@@ -1027,7 +1031,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     std::int64_t vValue = 0;
                     TypeId       vType;
                     if (!decodeConstantValueAndType(vdef, vat, cname, interner, typeReg,
-                                                    reporter, vValue, vType)) {
+                                                    reporter, vValue, vType,
+                                                    namedTypes)) {
                         okVariants = false; break;
                     }
                     WhenMatch const wm = matchVariantWhen(
@@ -1116,7 +1121,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                 continue;
             }
             std::string const typeText = c.at("type").get<std::string>();
-            TypeId const cty = parseTypeFromText(typeText, interner, typeReg, reporter);
+            TypeId const cty = parseTypeFromText(typeText, interner, typeReg, reporter, namedTypes);
             if (!cty.valid() || cty == InvalidType) {
                 dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                             DiagnosticSeverity::Error,
@@ -1194,7 +1199,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     return InvalidType;
                 }
                 std::string const typeText = obj.at("type").get<std::string>();
-                TypeId const ty = parseTypeFromText(typeText, interner, typeReg, reporter);
+                TypeId const ty = parseTypeFromText(typeText, interner, typeReg, reporter, namedTypes);
                 if (!ty.valid() || ty == InvalidType) {
                     dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                                 DiagnosticSeverity::Error,
@@ -1367,7 +1372,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                         continue;
                     }
                     if (!decodeStructFieldList(sdef.at("fields"), at, interner, typeReg,
-                                               reporter, sst.fields, fieldTypes)) {
+                                               reporter, sst.fields, fieldTypes,
+                                               namedTypes)) {
                         continue;
                     }
                     selected = true;
@@ -1421,7 +1427,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                         std::vector<ShippedField> vFields;
                         std::vector<TypeId>       vFieldTypes;
                         if (!decodeStructFieldList(vdef.at("fields"), vat, interner, typeReg,
-                                                   reporter, vFields, vFieldTypes)) {
+                                                   reporter, vFields, vFieldTypes, namedTypes)) {
                             okVariants = false; break;
                         }
 

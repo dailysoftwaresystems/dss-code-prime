@@ -1,0 +1,17 @@
+{
+  "$comment": "c82 D-FFI-SHELL-STDIO-SEMANTIC-SURFACE: FILE ships as a typedef (opaque struct \"FILE\" {} — block-scope `FILE *f;` PARSES via the shipped-typedef oracle and file-scope `static FILE *gLog;` resolves), size_t/NULL ride stdio.h (C89 7.19.1), and the printf family ships as VARIADIC externs — printf/fprintf/sprintf/sscanf + vfprintf taking a REAL `va_list` (descriptor-spelled, reader-resolved to the active CC's type) through a shell.c-cli_printf-shaped forwarder. Writes+reads back a temp file: vfprintf \"40 2\" -> fread (size_t) -> sscanf -> 40+2 = 42; sprintf/strlen cross-check. The arm64 leg exercises the AAPCS64 32-byte struct va_list against REAL glibc vfprintf. RED-ON-DISABLE: drop stdio.json's typedefs -> S0006/S0001 on the FILE decls; drop the va_list named-type thread -> stdio.json read fails loud. gcc -std=c17 cross-checked (42).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

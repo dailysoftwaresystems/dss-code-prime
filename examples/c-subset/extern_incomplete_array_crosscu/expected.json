@@ -1,0 +1,16 @@
+{
+  "$comment": "c82 D-CSUBSET-EXTERN-INCOMPLETE-ARRAY (C 6.7p7/6.9.2): `extern const char tbl[];` (the sqlite3.h sqlite3_version[] shape) resolves as an INCOMPLETE array in the declaring TU, decays/indexes by element type, and the LK11 merge collapses the extern-data import onto data.c's sized definition (import row stripped). tbl[0]+tbl[1] = 40+2 = 42. RED-ON-DISABLE: drop `allowFlexibleArray` from the externDecl row -> S000B compile failure. gcc two-TU cross-checked. Legs mirror cross_cu_call (pe) + the elf run targets; macho 2-TU stays off this manifest (underscore-mangled cross-CU extern matching is untested there).",
+  "language": "c-subset",
+  "sources": ["main.c", "data.c"],
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

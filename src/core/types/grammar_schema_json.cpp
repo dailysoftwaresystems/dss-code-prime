@@ -5037,6 +5037,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT (C 6.7.6.3p7):
+                        // optional `arrayToPointer` — when true, a declarator
+                        // whose resolved type is an array (sized or unsized)
+                        // adjusts to a pointer to its element type. Set on
+                        // declaration forms with C parameter semantics.
+                        if (entry.contains("arrayToPointer")) {
+                            json const& ap = entry.at("arrayToPointer");
+                            if (!ap.is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/arrayToPointer",
+                                          "'arrayToPointer' must be a boolean");
+                            } else {
+                                rule.arrayToPointer = ap.get<bool>();
+                            }
+                        }
+
                         // D5.1: optional `fieldChildren` descriptor — declares
                         // this declaration as a composite-type introducer.
                         //   "fieldChildren": { "rule": "structField" }

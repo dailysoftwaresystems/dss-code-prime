@@ -526,6 +526,19 @@ struct DSS_EXPORT DeclarationRule {
     // declares which declaration forms may carry a flexible array; the engine
     // never hard-codes "struct field".
     bool allowFlexibleArray = false;
+    // c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT (C 6.7.6.3p7): when true, a declarator
+    // on this declaration form whose resolved type is 'array of T' — sized OR
+    // unsized — ADJUSTS to 'pointer to T'. The flag both (a) permits the absent
+    // length (`T x[]`), resolving through the SAME incomplete-array path
+    // `allowFlexibleArray` uses, and (b) rewrites the resolved TOP-LEVEL array to
+    // Ptr<element> at both resolution sites (the definitive Pass-1.5 visit that
+    // binds the symbol, and the FnSig param harvest), so the bound symbol, the
+    // FnSig, and every call site agree on the adjusted pointer. Only declaration
+    // forms with C parameter semantics set this (c-subset's `param` row); the
+    // engine never hard-codes "parameter". Inner array dimensions are untouched
+    // (`int a[][5]` → Ptr<Array<int,5>>), and an inner ABSENT dimension still
+    // fails loud via the incomplete-element-in-aggregate guard.
+    bool arrayToPointer = false;
     // D5.1: optional composite-type collection. When set, Pass 1.5 composes the
     // declaration's `kind: type` symbol's TypeId via `interner.structType(name,
     // fieldTypes)` from the field-symbols minted in this declaration's scope.

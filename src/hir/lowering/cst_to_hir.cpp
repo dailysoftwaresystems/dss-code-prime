@@ -3329,23 +3329,41 @@ struct Lowerer {
             // top-level VolatileQual when the container is `volatile` (C 6.7.3p5).
             TypeId containerType = base.type;
             if (e.target == "MemberAccessThruPtr") {
+                // c82 (D-CSUBSET-ARRAY-ARROW-DECAY, C 6.3.2.1p3 + 6.5.2.3):
+                // an ARRAY LHS decays to a pointer to its first element
+                // BEFORE the arrow's deref — sqlite shell.c's
+                // `data.aAuxDb->zDbFilename` (aAuxDb is an in-struct array
+                // member; the arrow reads element [0]'s field). The semantic
+                // member resolver accepted the array through the same rule;
+                // reuse the ONE `coerce` Array→Ptr decay arm so the Cast
+                // shape is byte-identical to every other decay site.
+                E derefBase = base;
+                if (base.type.valid()
+                    && interner.kind(base.type) == TypeKind::Array
+                    && !interner.operands(base.type).empty()
+                    && interner.operands(base.type)[0].valid()) {
+                    TypeId const elemPtr =
+                        interner.pointer(interner.operands(base.type)[0]);
+                    derefBase = coerce(base, elemPtr);
+                }
                 // Arrow form: dereference the LHS pointer first. The Deref's
                 // result type is the pointee type (Struct) — read from the
                 // interner via the base's Ptr operand. (operands() sees THROUGH a
                 // VolatileQual ptr, but its operand IS the qualified pointee, so a
                 // `volatile struct S *` yields `VolatileQual(struct S)` here.)
                 TypeId pointeeType = InvalidType;
-                if (base.type.valid()
-                    && interner.kind(base.type) == TypeKind::Ptr
-                    && !interner.operands(base.type).empty()) {
-                    pointeeType = interner.operands(base.type)[0];
+                if (derefBase.type.valid()
+                    && interner.kind(derefBase.type) == TypeKind::Ptr
+                    && !interner.operands(derefBase.type).empty()) {
+                    pointeeType = interner.operands(derefBase.type)[0];
                 }
-                // Pass 2 also emitted S_NotAPointer if base.type wasn't a
-                // pointer, but we still need a type here for the Deref node
-                // to be HIR-verifier-valid (it requires a valid type). If
-                // pointee is invalid, leave it InvalidType — the verifier's
-                // requiresValidType rule will surface H_TypeUnresolved.
-                object = track(builder.makeDeref(base.id, pointeeType,
+                // Pass 2 also emitted S_NotAPointer if the LHS wasn't a
+                // pointer (or a decayable array), but we still need a type
+                // here for the Deref node to be HIR-verifier-valid (it
+                // requires a valid type). If pointee is invalid, leave it
+                // InvalidType — the verifier's requiresValidType rule will
+                // surface H_TypeUnresolved.
+                object = track(builder.makeDeref(derefBase.id, pointeeType,
                                                  HirFlags::Synthetic), node);
                 containerType = pointeeType;
             }

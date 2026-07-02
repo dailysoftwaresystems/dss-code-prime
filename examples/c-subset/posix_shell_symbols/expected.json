@@ -1,0 +1,42 @@
+{
+  "$comment": "c82 shell.c POSIX symbol batch against REAL libc: strtoll/realpath (stdlib.json), strdup (string.json), symlink+readlink/isatty/getuid/usleep/sleep (unistd.json), chmod+stat-mode readback (sys/stat.json). strtoll(\"42\")=42 with every roundtrip check contributing 0 when right. atexit is deliberately NOT shipped/exercised: glibc exports only __cxa_atexit (atexit = a libc_nonshared static shim; a libc.so.6-bound import fails at LOAD, witnessed) — lands with the shell.c atexit frontier item. RED-ON-DISABLE: remove any added descriptor entry -> S0001 compile failure. gcc -std=c17 -D_DEFAULT_SOURCE linux cross-checked (42; POSIX prototypes are hidden under plain -std=c17). elf legs only (the [elf,macho] gates; run legs mirror shipped_dirent_readdir).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "full-release-like",
+      "passes": [
+        "ConstFold",
+        "Mem2Reg",
+        "CopyProp",
+        "Cse",
+        "Licm",
+        "SimplifyCfg",
+        "Dce"
+      ]
+    },
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/data_model.hpp"   // DataModel (signatureByDataModel resolution)
+#include "core/types/named_type_binding.hpp" // NamedTypeBinding (c82 va_list alias thread-through)
 #include "core/types/object_format_kind.hpp" // ObjectFormatKind (availability predicate)
 #include "core/types/strong_ids.hpp"   // TypeId
 
@@ -332,6 +333,14 @@ struct DSS_EXPORT ShippedLibDescriptor {
 // nullopt for direct-API/LSP/unit callers ⇒ no variant selection (a
 // flat-`fields` struct decodes exactly as before; a struct that carries
 // ONLY `variants` is not injected when no selector is available).
+// c82 `namedTypes` (D-FFI-DESCRIPTOR-VA-LIST-TYPE): optional caller-supplied
+// NAME → TypeId bindings threaded verbatim into EVERY `parseTypeFromText`
+// call this read performs (signatures, per-model overrides, typedefs, struct
+// fields, constant types). The semantic analyzer passes its per-CC `va_list`
+// binding so a descriptor can spell an ABI-defined C alias (stdio.json's
+// `vfprintf(..., va_list)`) while staying arch-NEUTRAL — the alias resolves
+// to the SAME TypeId a user-written prototype gets. Content-blind: the reader
+// neither knows nor cares what the names mean; empty = pre-c82 behavior.
 [[nodiscard]] DSS_EXPORT std::optional<ShippedLibDescriptor>
 readShippedLibDescriptor(std::filesystem::path const&    path,
                          TypeInterner&                   interner,
@@ -339,7 +348,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                          DiagnosticReporter&             reporter,
                          DataModel                       dataModel    = DataModel::Lp64,
                          std::optional<std::string_view> activeTarget = std::nullopt,
-                         std::optional<ObjectFormatKind> activeFormat = std::nullopt);
+                         std::optional<ObjectFormatKind> activeFormat = std::nullopt,
+                         std::span<NamedTypeBinding const> namedTypes = {});
 
 // Read ONLY the `macros` surface from the neutral descriptor at `path`, WITHOUT a
 // TypeInterner. Macros are pure preprocessor token text (no types), so the

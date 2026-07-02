@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/named_type_binding.hpp"       // NamedTypeBinding (parseTypeFromText aliases)
 #include "core/types/strong_ids.hpp"               // CompilationUnitId
 #include "core/types/type_lattice/type_interner.hpp" // TypeInterner (by-value in the parse result)
 #include "hir/hir.hpp"                              // Hir
@@ -9,6 +10,7 @@
 
 #include <memory>
 #include <string>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -156,8 +158,21 @@ struct DSS_EXPORT HirParseResult {
 // `reporter` on malformed or unknown type text; it never returns a partially
 // constructed type silently. Trailing tokens after a complete type are reported
 // (the input must be a single type, nothing more).
+//
+// c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): `namedTypes` is an optional set of
+// caller-supplied NAME → TypeId bindings (core/types/named_type_binding.hpp)
+// consulted for a bare identifier that is not a builtin type keyword (checked
+// AFTER every structural keyword, so a binding can never shadow
+// `ptr`/`struct`/`fn`/...). It lets a caller resolve an ABI-defined alias
+// whose concrete type only the caller knows — the shipped-descriptor reader
+// threads the semantic tier's per-CC `va_list` here, so a descriptor can
+// spell C's `vfprintf(FILE*, const char*, va_list)` neutrally while the param
+// lands the ABI-exact TypeId (SysV `__va_list_tag[1]` / AAPCS64 `__va_list`
+// struct / Win64 `char*`). Content-blind and generic: nothing here knows what
+// the names mean. An empty span is byte-identical to the pre-c82 behavior.
 [[nodiscard]] DSS_EXPORT TypeId
 parseTypeFromText(std::string_view typeText, TypeInterner& interner,
-                  TypeRegistry& typeReg, DiagnosticReporter& reporter);
+                  TypeRegistry& typeReg, DiagnosticReporter& reporter,
+                  std::span<NamedTypeBinding const> namedTypes = {});
 
 } // namespace dss

@@ -1139,7 +1139,9 @@
         "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword", "warnIfUnused": true,
         "requireNamedDeclarators": true },
       { "rule": "param", "head": 0, "declarator": 1, "kind": "variable",
-        "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword" },
+        "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword",
+        "$arrayToPointerComment": "c82 (D-CSUBSET-PARAM-ARRAY-ADJUSTMENT, C 6.7.6.3p7): a parameter declared 'array of T' — sized (`int a[64]`), unsized (`int a[]`), or multi-dim (`int a[][5]` -> ptr to int[5]) — ADJUSTS to 'pointer to T'. The flag (a) permits the absent-length `[]` on the param's OUTERMOST suffix (resolving via the incomplete-array path, like allowFlexibleArray) and (b) rewrites the resolved top-level Array to Ptr<element> at BOTH resolution sites (the definitive Pass-1.5 visit that binds the param symbol — so sizeof(param)==8 and body uses see the pointer — and the FnSig param harvest — so call-site checking matches the decayed argument). An inner-dimension `[]` (`int a[4][]`) still fails loud (S_FlexibleArrayInAggregate via the incomplete-element guard), matching C's ill-formedness.",
+        "arrayToPointer": true },
       { "rule": "topLevelDecl", "head": 0, "declaratorList": 1, "kind": "variable",
         "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword",
         "requireNamedDeclarators": true,
@@ -1200,6 +1202,8 @@
           "paramsPath": [1]
         },
         "variadicMarker": "EllipsisOp",
+        "$allowFlexibleArrayComment": "c82 (D-CSUBSET-EXTERN-INCOMPLETE-ARRAY, C 6.7p7/6.9.2): an extern OBJECT declaration may carry an INCOMPLETE array type — sqlite3.h's `SQLITE_EXTERN const char sqlite3_version[];`. The absent-length `[]` resolves through the SAME incomplete-array path a FAM uses (interner incompleteArray = the Array kind + a length sentinel, so decay/index consumers keep working while sizeof fails loud). The symbol is non-defining: a sibling-TU DEFINITION completes it at the MIR merge (LK11 name resolution drops the import row); a NEVER-defined one survives as an extern-data import, which the link tier fail-louds on until the extern-data import model lands (the c82 §B, D-LK-EXTERN-DATA-IMPORT).",
+        "allowFlexibleArray": true,
         "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 } }
     ],
     "references": [

@@ -1,8 +1,16 @@
 {
   "header": "string.h",
   "standard": "c89",
+  "$comment": "★ c82 (shell.c): `typedefs`/`constants` re-provide size_t + NULL — C89 7.21.1 REQUIRES string.h to provide both without stddef.h; widths/values identical to stddef.json, first-wins dedup makes the multi-header provision moot (stdio/stdlib/time re-provide too, exactly like real libc headers). strdup is POSIX (C23 adopted it) → per-symbol [elf,macho]; the msvcrt spelling is _strdup (the plain-name legacy alias is unverified) — ungate when a pe consumer verifies it.",
   "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "typedefs": [
+    { "name": "size_t", "type": "u64" }
+  ],
+  "constants": [
+    { "name": "NULL", "value": 0, "type": "i64" }
+  ],
   "symbols": [
+    { "name": "strdup",  "signature": "fn(ptr<char>) -> ptr<char>",            "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "macho"] },
     { "name": "strlen",  "signature": "fn(ptr<char>) -> u64",                  "kind": "function", "linkage": "external" },
     { "name": "strcmp",  "signature": "fn(ptr<char>, ptr<char>) -> i32",       "kind": "function", "linkage": "external" },
     { "name": "strncmp", "signature": "fn(ptr<char>, ptr<char>, u64) -> i32",  "kind": "function", "linkage": "external" },

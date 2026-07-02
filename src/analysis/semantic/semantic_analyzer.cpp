@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <array>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -198,6 +199,18 @@ struct EngineState {
     // nullopt) ⇒ `ap` is `__va_list_tag[1]`/`*`; HomogeneousPointer (Win64) ⇒ `ap`
     // is `char*`. `nullopt` ⇒ the SysV-family default (back-compat).
     std::optional<VaListStrategy> vaListStrategy;
+    // c82 (D-CSUBSET-PARAM-ARRAY-ADJUSTMENT): the builtin `va_list` TypeId the
+    // per-CC injection minted (set alongside the builtin scope build). TWO
+    // consumers: the FF11 shipped-descriptor read binds it as the `va_list`
+    // named-type alias, and `adjustArrayToPointer` EXCLUDES it — a va_list
+    // param keeps its per-CC form (SysV: the `__va_list_tag[1]` array) because
+    // the va_* machinery (c63) owns va_list parameter passing END-TO-END
+    // (param slot + decay-at-call + va_arg addressing, validated per-ABI);
+    // C 7.16 makes va_list observable ONLY through va_*/forwarding, so the
+    // 6.7.6.3p7 adjustment has no program-visible effect on it, while
+    // adjusting it would silently add an indirection level under va_arg
+    // (a SysV SIGSEGV, witnessed mid-c82). `nullopt` ⇒ no exclusion.
+    std::optional<TypeId> vaListType;
     // c8: the active target's object-format (`analyze()`'s param) — gates
     // per-target shipped-header availability. `nullopt` ⇒ no gate (back-compat).
     std::optional<ObjectFormatKind> activeFormat;
@@ -1594,7 +1607,11 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     // Distinct from a present-but-non-constant length (`T x[n]`), always an error.
     bool const absentLength =
         !lenNode.valid() || tree.kind(lenNode) != NodeKind::Internal;
-    if (absentLength && decl.allowFlexibleArray) {
+    // c82: `arrayToPointer` (C 6.7.6.3p7 parameter adjustment) admits the
+    // absent length through the SAME incomplete-array path — the caller's
+    // `adjustArrayToPointer` rewrites the result to Ptr<element>, so the
+    // incomplete array never escapes as a param's final type.
+    if (absentLength && (decl.allowFlexibleArray || decl.arrayToPointer)) {
         return s.lattice.interner().incompleteArray(base);
     }
     auto len = constIntExpr(s, tree, lenNode, fromScope, cfg);
@@ -1759,6 +1776,36 @@ declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                        bool allowFlexibleArray = false,
                        bool allowInitInferredArray = false);
 
+// c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT (C 6.7.6.3p7): a declaration form with
+// `arrayToPointer` whose resolved declarator type is an ARRAY — sized
+// (`int a[64]`), incomplete (`int a[]`), or multi-dimensional (`int a[][5]`
+// — only the OUTERMOST dimension is the parameter's own type constructor) —
+// ADJUSTS to a POINTER to its element type. Applied at BOTH resolution
+// sites (the definitive Pass-1.5 visit that binds the symbol, and the
+// FnSig param harvest `declRowDeclaredType`), so the bound symbol, the
+// FnSig, and every call site agree by construction. The transparent
+// kind()/operands() accessors make a qualified element ride into the
+// pointee unchanged. Non-array types (and rows without the flag) pass
+// through untouched.
+[[nodiscard]] TypeId
+adjustArrayToPointer(EngineState& s, DeclarationRule const& decl, TypeId t) {
+    if (!decl.arrayToPointer || !t.valid()) return t;
+    // c82: the CC's `va_list` is EXCLUDED — the per-CC va_* machinery (c63)
+    // owns va_list parameter passing end-to-end (param slot, decay-at-call,
+    // va_arg addressing), and C 7.16 makes a va_list observable only through
+    // va_*/forwarding, so the adjustment has no program-visible effect on it
+    // while silently breaking the va_arg indirection depth (a SysV SIGSEGV,
+    // witnessed). Both the NAMED and the ABSTRACT param path share this
+    // helper, so prototype/definition FnSigs stay structurally equal.
+    if (s.vaListType.has_value() && t == *s.vaListType) return t;
+    auto& in = s.lattice.interner();
+    if (in.kind(t) != TypeKind::Array) return t;
+    auto const elems = in.operands(t);
+    if (elems.empty() || !elems[0].valid()) return t;  // interner invariant —
+                                                       // downstream fails loud
+    return in.pointer(elems[0]);
+}
+
 // The declared type of ONE declaration-row node — the fn-suffix param
 // harvest's per-param resolution. Legacy rows resolve their `typeChild`
 // (+ legacy array suffix, mirroring `collectParamTypes`); declarator-mode
@@ -1782,11 +1829,27 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         }
         if (decl.declaratorChild.has_value()) {
             if (*decl.declaratorChild < kids.size()) {
-                return declaratorDeclaredType(
+                // c82 (C 6.7.6.3p7): an `arrayToPointer` row admits the
+                // absent-length `T x[]` on its OWN outermost suffix (the
+                // incomplete-array resolution path), then the adjustment
+                // below rewrites any top-level array to Ptr<element> —
+                // matching the definitive visit's identical sequence.
+                TypeId const t = declaratorDeclaredType(
                     s, cfg, tree, kids[*decl.declaratorChild], head, scope,
-                    emitOnMiss);
+                    emitOnMiss,
+                    /*allowFlexibleArray=*/decl.arrayToPointer);
+                return adjustArrayToPointer(s, decl, t);
             }
-            return head;   // declarator structurally absent — type-only param
+            // Declarator structurally absent — a TYPE-ONLY (abstract) param.
+            // C 6.7.6.3p7 adjusts the declared type REGARDLESS of a name:
+            // `int f(const int[4]);` and `int f(const int a[4]);` are the
+            // SAME signature. Both the named path (above) and this abstract
+            // path run the ONE shared helper, so a prototype and its
+            // definition can never drift into an S0022/S0003 asymmetry —
+            // the exact mid-c82 shell.c failure (`sqlite3_vmprintf(const
+            // char*, va_list)` abstract vs the named caller param; va_list
+            // itself is EXCLUDED inside the helper, see its comment).
+            return adjustArrayToPointer(s, decl, head);
         }
         return InvalidType;   // a LIST row has no single param type
     }
@@ -1794,7 +1857,9 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         TypeId pty = resolveTypeNode(s, cfg, tree, kids[*decl.typeChild], scope,
                                      emitOnMiss);
         pty = applyArraySuffix(s, tree, decl, declNode, pty, scope, &cfg);
-        return pty;
+        // c82: the legacy-row twin of the declarator-mode adjustment above —
+        // the two param-resolution shapes must not drift.
+        return adjustArrayToPointer(s, decl, pty);
     }
     return InvalidType;
 }
@@ -3095,8 +3160,14 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                         // ARRAY `(*const arr[])(T) = {…}` is sized from its init.
                         NodeId const initNode =
                             initializerNodeOf(tree, dNode, *cfg.declarators);
+                        // c82 (C 6.7.6.3p7): an `arrayToPointer` row (a C
+                        // parameter) also admits the absent-length `[]` —
+                        // the adjustment below rewrites the array to
+                        // Ptr<element>, so the incomplete form never
+                        // escapes as the bound type.
                         bool const allowIncomplete =
-                            decl.allowFlexibleArray || initNode.valid();
+                            decl.allowFlexibleArray || decl.arrayToPointer
+                            || initNode.valid();
                         TypeId declTy = declaratorDeclaredType(
                             s, cfg, tree, dNode, headTy, here,
                             /*emitOnMiss=*/true, allowIncomplete,
@@ -3109,6 +3180,12 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                         if (!decl.allowFlexibleArray)
                             declTy = completeIncompleteArrayFromInit(
                                 s, s.idx(), tree, initNode, declTy);
+                        // c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT: the definitive
+                        // adjustment — the bound param symbol carries the
+                        // POINTER (sizeof(param)==pointer-size, body indexing
+                        // reads through it), mirroring the harvest site in
+                        // `declRowDeclaredType` so the FnSig agrees.
+                        declTy = adjustArrayToPointer(s, decl, declTy);
                         // SINGLE-declarator rows (param-like): also stamp
                         // the row node — an ABSTRACT param has no name
                         // node to carry the type, but its slot still
@@ -3754,8 +3831,30 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                         TypeId const declTy =
                             applyArraySuffix(s, tree, decl, node, returnTy, here, &cfg);
                         if (declTy.valid()) {
-                            s.symbols.at(sym).type = declTy;
-                            s.nodeToType.set(resolved.node, declTy);
+                            // c82 D-CSUBSET-EXTERN-INCOMPLETE-ARRAY: never
+                            // DOWNGRADE a merged symbol's already-resolved
+                            // COMPLETE array to this declaration's INCOMPLETE
+                            // one — `int g[3]; extern int g[];` keeps
+                            // Array<int,3> (C 6.2.7: the composite of a
+                            // completed and an incomplete array is the
+                            // completed one, regardless of declaration
+                            // order). The extern-first order needs no guard:
+                            // the definition's LATER write is the completion.
+                            auto& in = s.lattice.interner();
+                            TypeId const existing = s.symbols.at(sym).type;
+                            bool const downgrade =
+                                existing.valid()
+                                && in.isIncompleteArray(declTy)
+                                && in.kind(existing) == TypeKind::Array
+                                && !in.isIncompleteArray(existing);
+                            if (downgrade) {
+                                // The node still carries the (complete)
+                                // composite type for downstream walks.
+                                s.nodeToType.set(resolved.node, existing);
+                            } else {
+                                s.symbols.at(sym).type = declTy;
+                                s.nodeToType.set(resolved.node, declTy);
+                            }
                         }
                         // FC8 D-CSUBSET-BITFIELD: resolve a `: W` bit-field width
                         // (the field TYPE is unchanged — the width rides on the
@@ -5900,7 +5999,14 @@ resolveMemberAccess(EngineState const& s, SemanticConfig const& cfg,
     TypeId effectiveType = s.lattice.interner().stripVolatile(lhsType);
     if (ma->dereferences) {
         // Arrow form `p->x` = `(*p).x`: the LHS must be `Ptr<Struct>` (one level).
-        if (s.lattice.interner().kind(effectiveType) == TypeKind::Ptr) {
+        // c82 (D-CSUBSET-ARRAY-ARROW-DECAY, C 6.3.2.1p3 + 6.5.2.3): an ARRAY
+        // LHS decays to a pointer to its first element before `->` applies —
+        // sqlite shell.c's `data.aAuxDb->zDbFilename` (aAuxDb is an in-struct
+        // ARRAY member; the arrow reads element [0]'s field). Both kinds
+        // unwrap to the ELEMENT/POINTEE type identically; the HIR lowering's
+        // arrow path decays the array LHS the same way (one rule, two tiers).
+        TypeKind const lhsKind = s.lattice.interner().kind(effectiveType);
+        if (lhsKind == TypeKind::Ptr || lhsKind == TypeKind::Array) {
             auto const ops = s.lattice.interner().operands(effectiveType);
             if (ops.empty()) { out.status = MemberResolution::Status::NotAPointer; return out; }
             // Strip a VolatileQual POINTEE too (`volatile struct S *p; p->x` →
@@ -6136,6 +6242,15 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     // builtin scope, identical to CU1-CU4.
     ScopeId const cuRoot = s.scopes.root();
     std::unordered_map<std::uint32_t /*SchemaId.v*/, ScopeId> builtinScopeBySchema;
+    // c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): capture the per-CC `va_list` TypeId
+    // the builtin injection below mints, so the FF11 shipped-descriptor read
+    // can resolve a descriptor-spelled `va_list` (stdio.json's vfprintf) to
+    // the SAME TypeId a user-written prototype gets. Multi-schema CUs mint
+    // through ONE interner with ONE vaListStrategy, so re-mints dedup to the
+    // same id — last-write is deterministic. nullopt when no schema declares
+    // a va_arg surface: the descriptor alias then stays unresolved and the
+    // read fails LOUD (F_ShippedLibUnsupportedType), never a guessed type.
+    std::optional<TypeId> vaListBuiltinType;
     for (GrammarSchema const* sch : distinctSchemas) {
         ScopeId const builtinScope = s.scopes.pushScope(cuRoot, InvalidNode, InvalidTree);
         builtinScopeBySchema[sch->schemaId().v] = builtinScope;
@@ -6225,6 +6340,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 vaRec.type  = vaStructTy;   // typedef to the struct DIRECTLY
                 SymbolId const vaId = s.symbols.mint(vaRec);
                 s.scopes.injectBinding(builtinScope, "va_list", vaId);
+                vaListBuiltinType = vaStructTy;   // c82: descriptor alias
+                s.vaListType      = vaStructTy;   // c82: adjustment exclusion
             } else if (strat == VaListStrategy::HomogeneousPointer) {
                 // Win64: `va_list` is a plain `char*` (pointer to I8) — sizeof 8.
                 TypeId const charPtr = in.pointer(in.primitive(TypeKind::I8));
@@ -6236,6 +6353,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 vaRec.type  = charPtr;
                 SymbolId const vaId = s.symbols.mint(vaRec);
                 s.scopes.injectBinding(builtinScope, "va_list", vaId);
+                vaListBuiltinType = charPtr;      // c82: descriptor alias
+                s.vaListType      = charPtr;      // c82: adjustment exclusion
             } else {
                 // SysVRegisterSave (or absent): __va_list_tag[1].
                 TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
@@ -6275,6 +6394,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 vaRec.type  = vaListTy;
                 SymbolId const vaId = s.symbols.mint(vaRec);
                 s.scopes.injectBinding(builtinScope, "va_list", vaId);
+                vaListBuiltinType = vaListTy;     // c82: descriptor alias
+                s.vaListType      = vaListTy;     // c82: adjustment exclusion
             }
         }
     }
@@ -6490,9 +6611,23 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 s.activeTarget.has_value()
                     ? std::optional<std::string_view>{*s.activeTarget}
                     : std::nullopt;
+            // c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): thread the builtin `va_list`
+            // TypeId (minted per the active CC's vaListStrategy above) as a
+            // named-type binding, so a descriptor signature can spell C's
+            // `va_list` and land the SAME TypeId a user prototype gets. No
+            // schema minted one ⇒ empty span ⇒ a descriptor spelling the
+            // alias fails LOUD at decode (never a guessed layout).
+            std::array<NamedTypeBinding, 1> namedTypeStorage{};
+            std::span<NamedTypeBinding const> namedTypes{};
+            if (vaListBuiltinType.has_value()) {
+                namedTypeStorage[0] =
+                    NamedTypeBinding{"va_list", *vaListBuiltinType};
+                namedTypes = std::span<NamedTypeBinding const>{
+                    namedTypeStorage.data(), 1};
+            }
             auto desc = ffi::readShippedLibDescriptor(
                 descPath, s.lattice.interner(), s.lattice.registry(), s.reporter,
-                s.dataModel, activeTargetView, s.activeFormat);
+                s.dataModel, activeTargetView, s.activeFormat, namedTypes);
             if (!desc) continue;
 
             // c8: per-target AVAILABILITY gate. When the active object-format is

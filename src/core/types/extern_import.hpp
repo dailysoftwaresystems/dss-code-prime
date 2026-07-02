@@ -42,6 +42,15 @@ struct DSS_EXPORT ExternImport {
     SymbolId    symbol{};       // matches Relocation::target
     std::string mangledName;    // on-binary symbol name
     std::string libraryPath;    // owning dylib / DLL / SO
+    // c82 (D-LK-EXTERN-DATA-IMPORT): true for an extern DATA object
+    // (HIR ExternGlobal — e.g. libc's `stdout`, or a cross-TU
+    // `extern const char sqlite3_version[];`), false for a function.
+    // A data import that survives to the link tier (the LK11 merge
+    // resolves sibling-CU-defined ones away first) currently FAILS
+    // LOUD there: binding it needs the extern-data import model
+    // (ELF R_*_COPY vs GOT-indirect load — a §B decision); a PLT
+    // stub bound to a data symbol would be a silent miscompile.
+    bool        isData = false;
 };
 
 } // namespace dss

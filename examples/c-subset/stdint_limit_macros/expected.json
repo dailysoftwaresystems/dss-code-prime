@@ -1,0 +1,17 @@
+{
+  "$comment": "c82 D-FFI-STDINT-LIMIT-MACROS (first slice): INT64_MIN/INT64_MAX ship as stdint.json constants with EXACT int64 values (get<int64_t> decode — no double transit). Reproduces shell.c:15586 `N==INT64_MIN ? INT64_MAX : -N` verbatim + bit-exactness pins (INT64_MAX low-32 all-ones, INT64_MIN == -INT64_MAX-1). exit 42. RED-ON-DISABLE: remove the two constants -> S0001 compile failure. gcc -std=c17 cross-checked (42).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

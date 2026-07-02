@@ -26,6 +26,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -1214,6 +1215,25 @@ TEST(ShippedLibDescriptor, MissingHeaderFailsLoud) {
 
 // Ancestor-walk for the shipped dir (mirrors `findShippedConfig`) so tests work
 // whether ctest runs from build/ or the repo root. Returns empty if not found.
+
+// c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): the SysV `va_list` named-type binding
+// production threads into every shipped-descriptor read (stdio.json's
+// vfprintf spells `va_list`). Tests reading SHIPPED files bind it the same
+// way — the exact `__va_list_tag[1]` mint the analyzer's SysVRegisterSave
+// arm produces. Returns the storage by value; the caller keeps it alive
+// across the read.
+[[nodiscard]] std::array<NamedTypeBinding, 1>
+sysvVaListBinding(TypeInterner& interner) {
+    TypeId const voidPtr =
+        interner.pointer(interner.primitive(TypeKind::Void));
+    std::array<TypeId, 4> tagFields{
+        interner.primitive(TypeKind::U32), interner.primitive(TypeKind::U32),
+        voidPtr, voidPtr};
+    TypeId const vaListTy =
+        interner.array(interner.structType("__va_list_tag", tagFields), 1);
+    return {NamedTypeBinding{"va_list", vaListTy}};
+}
+
 [[nodiscard]] fs::path shippedLibsRoot() {
     fs::path here = fs::current_path();
     for (int i = 0; i < 8 && !here.empty(); ++i) {
@@ -1482,7 +1502,12 @@ TEST(ShippedLibDescriptor, AllShippedDescriptorsDecode) {
         TypeInterner interner{CompilationUnitId{1}};
         TypeRegistry typeReg;
         DiagnosticReporter rep;
-        auto desc = readShippedLibDescriptor(entry.path(), interner, typeReg, rep);
+        // c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): thread the SysV va_list
+        // binding exactly as production does (stdio.json's vfprintf).
+        auto const namedTypes = sysvVaListBinding(interner);
+        auto desc = readShippedLibDescriptor(entry.path(), interner, typeReg, rep,
+                                             DataModel::Lp64, std::nullopt,
+                                             std::nullopt, namedTypes);
         EXPECT_TRUE(desc.has_value())
             << "shipped descriptor failed to load: "
             << entry.path().generic_string();
@@ -1540,8 +1565,10 @@ TEST(ShippedLibDescriptor, ShippedStdlibSignaturesAreLp64) {
                        char const* symName) -> TypeId {
         TypeRegistry typeReg;
         DiagnosticReporter rep;
+        auto const namedTypes = sysvVaListBinding(interner);   // c82
         auto desc = readShippedLibDescriptor(
-            root / (std::string(lib) + ".json"), interner, typeReg, rep);
+            root / (std::string(lib) + ".json"), interner, typeReg, rep,
+            DataModel::Lp64, std::nullopt, std::nullopt, namedTypes);
         EXPECT_TRUE(desc.has_value()) << lib << ".json failed to load";
         EXPECT_FALSE(rep.hasErrors()) << lib << ".json emitted diagnostics";
         if (!desc.has_value()) return {};
@@ -1599,7 +1626,10 @@ TEST(ShippedLibDescriptor, ShippedStdioLibraryMapRoutesPerObjectFormat) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeRegistry typeReg;
     DiagnosticReporter rep;
-    auto desc = readShippedLibDescriptor(root / "stdio.json", interner, typeReg, rep);
+    auto const namedTypes = sysvVaListBinding(interner);   // c82: vfprintf's va_list
+    auto desc = readShippedLibDescriptor(root / "stdio.json", interner, typeReg, rep,
+                                         DataModel::Lp64, std::nullopt,
+                                         std::nullopt, namedTypes);
     ASSERT_TRUE(desc.has_value());
     EXPECT_FALSE(rep.hasErrors());
     // The neutral descriptor names the correct runtime per format — the whole
