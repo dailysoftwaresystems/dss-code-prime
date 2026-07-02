@@ -1,0 +1,14 @@
+{
+  "$comment": "c78 (fp_to_ui, 2026-07-01): (unsigned)double gains an x86 encoding identical to fp_to_si (F2 REX.W 0F 2C = cvttsd2si) + threads the source float width; a value in [0,2^32) reads exactly into the low 32 bits (byte-identical to gcc's cvttsd2si rax,xmm0). Pre-fix fp_to_ui had NO encoding -> A_NoEncodingDeclared. RED-ON-DISABLE: revert the encoding block -> A_NoEncodingDeclared fp_to_ui. x86-ONLY: arm64 declares no fp_to_ui opcode (a clean L_RequiredLirOpcodeMissing fail-loud) -> arm64/darwin legs are a deferred future cycle (native FCVTZU), so this witness omits them. => 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

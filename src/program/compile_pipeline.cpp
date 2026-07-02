@@ -677,6 +677,29 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         assembled.dataItems.push_back(std::move(table));
     }
 
+    // c78 (D-CSUBSET-FLOAT-NEG-ENCODING): materialize each x86-style float-negate
+    // sign-mask the LIR lowerer recorded. Each is a 16-byte, 16-byte-aligned
+    // `.rodata` item whose low bytes carry the sign bit (bit 63 for F64 / bit 31
+    // for F32) and whose high bytes are zero — bit-identical to gcc's `.LC0`
+    // (F64: 00 00 00 00 00 00 00 80  00×8) / `.LC1` (F32: 00 00 00 80  00×12).
+    // The `xorpd/xorps xmm, [rip+mask]` memory operand MUST be 16-byte aligned at
+    // runtime; the 16-byte `Alignment` + the section-alignment layout (ELF
+    // sh_addralign; PE 4 KiB sectionAlignment) guarantee it. NO relocations (a
+    // pure constant) — CONST → `.rodata` (read-only; a store would never occur).
+    for (auto const& mask : lir.signMaskConstants) {
+        AssembledData m;
+        m.symbol    = mask.symbol;
+        m.section   = DataSectionKind::Rodata;
+        m.alignment = Alignment::ofRuntimePow2(16);
+        m.bytes.assign(16u, std::uint8_t{0});
+        if (mask.isF64) {
+            m.bytes[7] = 0x80u;   // low qword = 0x8000000000000000 (bit 63)
+        } else {
+            m.bytes[3] = 0x80u;   // low dword = 0x80000000 (bit 31)
+        }
+        assembled.dataItems.push_back(std::move(m));
+    }
+
     // D-LK4-3: stamp the owning CompilationUnit's id so the linker keys this
     // module's symbols by `(cuId, SymbolId)`. Single-CU build → one cuId; a merged
     // whole-program image carries CU0's id (cosmetic — the merge already collapsed

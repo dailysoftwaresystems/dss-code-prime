@@ -1499,6 +1499,35 @@
       }
     },
     {
+      "$comment": "c78 (D-CSUBSET-FLOAT-NEG-ENCODING): FNEG Dd, Dn — scalar double floating-point NEGATE, FP data-processing (1 source). arm64 has a NATIVE fp-negate (unlike x86, which has no fneg instruction and takes the sign-mask XORPD fallback in mir_to_lir — the two realizations diverge by CAPABILITY, probed via this opcode's declared-encoding presence). IEEE-exact by construction: FNEG flips ONLY the sign bit (bit 63), so -(+0.0)=-0.0, -(-0.0)=+0.0, and -NaN preserves the payload while flipping the sign — the signed-zero + NaN-sign semantics C requires. Base 0x1E614000 = 000 11110 [31:24] | ftype=01 double [23:22] | 1 [21] | opcode=000010 FNEG [20:15] | 10000 [14:10] | Rn [9:5] | Rd [4:0] (ARM ARM C7.2 FNEG scalar; opcode 000001 would be FABS, 000000 FMOV). 1-source NATIVE — Rd (result), Rn (wire 0 = the value negated). NO requires2Address (Rd and Rn are independent, like neg/not). F32 sibling FNEG Sd, Sn = ftype=00 -> base 0x1E214000 rides the width axis (D-form keyed 64, S-form keyed 32).",
+      "mnemonic":      "fneg",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 509689856 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FNEG Sd, Sn — ftype=00 single, base 0x1E214000 = 505495552.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505495552 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "FC3.5 sweep-c2 (FCmp LIR lowering): FCMP Dn, Dm — floating-point compare writing NZCV, no register result (the float sibling of `cmp`). Base 0x1E602000 = 000 11110 [31:24] | ftype=01 [23:22] | 1 [21] | Rm [20:16] | op=00 [15:14] | 1000 [13:10] | Rn [9:5] | opcode2=00000 [4:0] (ARM ARM C7.2 FCMP; opcode2 bit4=1 would be FCMPE, the signaling form — DSS does not model the FP environment, so the quiet FCMP serves all predicates; the NZCV comparison RESULTS are identical). F32 sibling FCMP Sn, Sm = 0x1E202000 (ftype=00). NZCV outcomes: equal → Z=1(C=1); less → N=1; greater → C=1; unordered → C=1,V=1 — the truth table the float condCodeEncoding arms below realize (full derivation at mir_to_lir floatCmpPlan).",
       "mnemonic":      "fcmp",
       "result":        "none",

@@ -220,6 +220,16 @@ enum class MnemonicSlot : std::uint8_t {
     // the original agree byte-for-byte on ONE reserved slot. Like the alloca/va_*
     // address ops it is materialized away (never encoded); declared in every schema.
     LeaFrameSlot,
+    // c78 (D-CSUBSET-FLOAT-NEG-ENCODING): the x86 realization of float negate —
+    // `xorpd/xorps xmm, [rip+mask]` against a 16-byte rodata SIGN-MASK. NOT a
+    // separate MIR opcode: MIR FNeg stays abstract and `lowerFNeg` capability-
+    // dispatches — a target that declares a NATIVE `fneg` encoding (arm64 FNEG)
+    // emits it via MnemonicSlot::FNeg; a target WITHOUT one (x86, whose `fneg`
+    // opcode carries no encoding) mints the mask + emits THIS op. Declared only
+    // by x86 (`fneg_mask`); arm64 omits it (its cache id stays nullopt — never
+    // consulted there). The div-family precedent (SDivPre/Core vs SDivNative)
+    // for a per-target-realization-specific slot.
+    FNegMask,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -314,6 +324,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::VaHomeArgArea,      "va_home_arg_area"},
     {MnemonicSlot::RecvByValueStackParam, "recv_by_value_stack_param"},
     {MnemonicSlot::LeaFrameSlot,       "lea_frame_slot"},
+    {MnemonicSlot::FNegMask,           "fneg_mask"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -566,6 +577,12 @@ struct Lowerer {
     std::vector<JumpTableDescriptor> jumpTableDescriptors_;
     std::uint32_t                    currentFuncIndex_ = 0;
 
+    // c78 (D-CSUBSET-FLOAT-NEG-ENCODING): one entry per x86-style float-negate
+    // realized as `xorpd/xorps xmm, [rip+mask]`. `run()` moves it into the
+    // result for `compile_pipeline.cpp` to materialize as 16-byte, 16-byte-
+    // aligned `.rodata` sign-mask items. Empty on a native-fneg target (arm64).
+    std::vector<SignMaskConstant> signMaskConstants_;
+
     // Mint a fresh synthetic SymbolId for a jump table's `.data` item. Draws
     // from the SAME monotone `nextBlockSym_` sequence `mintBlockSymbol` uses, so
     // a table symbol can never collide with a block symbol (or a user / extern
@@ -591,6 +608,12 @@ struct Lowerer {
         }
         return SymbolId{(*nextBlockSym_)++};
     }
+
+    // c78 (D-CSUBSET-FLOAT-NEG-ENCODING): a fresh synthetic SymbolId for a float-
+    // negate sign-mask `.rodata` item. Draws from the SAME monotone
+    // `nextBlockSym_` sequence (via `mintJumpTableSymbol`), so a mask symbol
+    // can never collide with a block/table/user/extern symbol. Per-occurrence.
+    [[nodiscard]] SymbolId mintSignMaskSymbol() { return mintJumpTableSymbol(); }
 
     // Whether the running lowering pass added any error-severity
     // diagnostics. Mirrors ML2's delta-on-errorCount; reset by the ctor.
@@ -807,9 +830,10 @@ struct Lowerer {
     // otherwise pick a wrong-width form). Returns true (no-op) for
     // non-FPR types. Applied exactly where float encodings exist
     // (FAdd, FSub, FMul, FDiv, FCmp operands, FPToSI source, FPTrunc/FPExt
-    // source+result, FPR-class Load); the lone still-encoding-less float op
-    // (FNeg) keeps its assemble-tier A_NoEncodingDeclared fail-loud and will
-    // gain this gate alongside its encoding (D-CSUBSET-FLOAT-NEG-ENCODING).
+    // source+result, FPR-class Load, and — since c78 — FNeg, whose
+    // capability-dispatched lowering (native FNEG / sign-mask XORPD) gates
+    // here so F16/F128 fail loud before a wrong-width mask/opcode is picked
+    // (D-CSUBSET-FLOAT-NEG-ENCODING).
     [[nodiscard]] bool requireEncodedFloatWidth(MirInstId id, TypeId ty,
                                                 std::string_view context) {
         if (!ty.valid()) return true;  // upstream diagnosed the type hole
@@ -1424,7 +1448,7 @@ struct Lowerer {
                 if (!requireEncodedFloatWidth(id, mir.instType(id),
                                               "MIR FDiv")) return;
                 return lowerBinaryOp(id, MnemonicSlot::FDiv);
-            case MirOpcode::FNeg:   return lowerUnaryOp(id, MnemonicSlot::FNeg);
+            case MirOpcode::FNeg:   return lowerFNeg(id);
             // ── cycle 3d float casts (the 6 conversion variants) ───
             case MirOpcode::FPTrunc:
             case MirOpcode::FPExt: {
@@ -1478,7 +1502,31 @@ struct Lowerer {
                 return lowerCast(id, MnemonicSlot::FpToSi, "MIR FPToSI",
                                  fpsiSrcWidth);
             }
-            case MirOpcode::FPToUI:  return lowerCast(id, MnemonicSlot::FpToUi,  "MIR FPToUI");
+            case MirOpcode::FPToUI: {
+                // c78 (D-CSUBSET-FP-TO-UI-CODEGEN): fp_to_ui carries the
+                // SAME CVTTSD2SI/CVTTSS2SI encodings as fp_to_si, keyed on
+                // the SOURCE float width. A double→U32 conversion (sqlite's
+                // occurrence) truncates via CVTTSD2SI r64 and the U32 result
+                // reads its low 32 bits — VALUE-CORRECT because any double in
+                // the U32 range [0, 2^32) fits the signed-64 CVTTSD2SI result
+                // exactly (gcc emits the identical `cvttsd2si rax, xmm0`). The
+                // full-range unsigned-i64 case (a double ≥ 2^63) needs the
+                // conditional-subtract sequence — deferred
+                // (D-CSUBSET-UI-FROM-FP-UNSIGNED-I64; sqlite stays in range).
+                // Threads the source width like FPToSI (the result-width
+                // default would mis-key the SOURCE axis).
+                auto const fuOps = mir.instOperands(id);
+                if (fuOps.size() == 1
+                    && !requireEncodedFloatWidth(id, mir.instType(fuOps[0]),
+                                                 "MIR FPToUI (source)")) {
+                    return;
+                }
+                std::uint8_t const fpuiSrcWidth = (fuOps.size() == 1)
+                    ? widthFlagsForType(mir.instType(fuOps[0]))
+                    : 0;
+                return lowerCast(id, MnemonicSlot::FpToUi, "MIR FPToUI",
+                                 fpuiSrcWidth);
+            }
             case MirOpcode::SIToFP:
             case MirOpcode::UIToFP: {
                 // D-CSUBSET-INT-FLOAT-CONVERSION (int→float codegen): cvtsi2sd /
@@ -3102,6 +3150,93 @@ struct Lowerer {
 
     void lowerBinaryOp(MirInstId id, MnemonicSlot slot) { lowerNAryOp<2>(id, slot); }
     void lowerUnaryOp (MirInstId id, MnemonicSlot slot) { lowerNAryOp<1>(id, slot); }
+
+    // ── c78 (D-CSUBSET-FLOAT-NEG-ENCODING): capability-driven MIR FNeg ──
+    //
+    // `-someFloat`/`-someDouble`. There is NO single agnostic instruction:
+    //   * arm64 has a NATIVE FNEG (Dd,Dn / Sd,Sn) — 1 op, flips the sign bit.
+    //   * x86 has NO fp-negate instruction; the value-optimal realization is
+    //     gcc's `xorpd/xorps xmm, [rip+.LC0]` against a 16-byte rodata SIGN-
+    //     MASK (bit 63 set for F64 / bit 31 for F32). XOR is chosen for IEEE
+    //     exactness — it flips ONLY the sign bit, so -(+0.0)=-0.0,
+    //     -(-0.0)=+0.0, and -NaN preserves the payload; `0.0 - x` gives +0.0
+    //     for x=+0.0 (wrong signed zero) and mishandles NaN sign.
+    //
+    // The realization is selected by CAPABILITY (the sanctioned pattern the
+    // div/mod + shift lowerings use — probe the DECLARED opcode vocabulary,
+    // NEVER `if (arch == ...)`):
+    //   Rule 1 — NATIVE: the target's `fneg` opcode declares an encoding
+    //     (arm64) → the generic 1-op unary lowering (MnemonicSlot::FNeg).
+    //   Rule 2 — SIGN-MASK XOR: no native `fneg` encoding but a `fneg_mask`
+    //     opcode is declared (x86) → mint a 16-byte, 16-byte-aligned rodata
+    //     sign-mask (accumulated as a SignMaskConstant the pipeline emits)
+    //     and emit `fneg_mask xmm, [rip+mask]` with operands [value, mask].
+    //     The op is 2-address (requires2Address): the legalize inserts
+    //     `movaps dst, value` so the XORPD destination register holds the
+    //     value; the mask rides op[1] as a SymbolRef → the riprel.disp32
+    //     encoder slot (rel32 reloc).
+    //   Else → fail loud (the target declares neither realization).
+    //
+    // The width axis (F64 vs F32) selects BOTH the encoded variant (XORPD vs
+    // XORPS / D-form vs S-form FNEG) AND the mask pattern (bit 63 vs bit 31).
+    // F16/F128 fail loud at the width gate (no scalar float encodings) — a
+    // wrong-width mask would be a silent miscompile.
+    void lowerFNeg(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(mir.instOpcode(id), id);
+            return;
+        }
+        // Width gate: only F64/F32 have scalar float encodings AND a
+        // well-defined sign-mask pattern. F16/F128 → loud (poisons id).
+        if (!requireEncodedFloatWidth(id, mir.instType(id), "MIR FNeg")) {
+            return;
+        }
+
+        // Rule 1 — NATIVE fp-negate (arm64 FNEG): the `fneg` opcode declares
+        // an encoding. Probe DECLARED-ENCODING PRESENCE, not mere mnemonic
+        // presence (x86 declares `fneg` too, but with NO variants — the
+        // abstract-op probe target).
+        if (auto const nativeOp = opcode(MnemonicSlot::FNeg);
+            nativeOp.has_value()) {
+            auto const* ni = target.opcodeInfo(*nativeOp);
+            if (ni != nullptr && !ni->encoding.variants.empty()) {
+                return lowerUnaryOp(id, MnemonicSlot::FNeg);
+            }
+        }
+
+        // Rule 2 — SIGN-MASK XOR (x86): the target declares `fneg_mask`.
+        auto const maskOp = opcode(MnemonicSlot::FNegMask);
+        if (!maskOp.has_value()) {
+            // Neither a native fneg encoding NOR a fneg_mask op — the target
+            // declares no float-negate realization. Fail loud (never a silent
+            // wrong value). reportMissingOpcode names the slot + context.
+            reportMissingOpcode(MnemonicSlot::FNegMask, "MIR FNeg");
+            return;
+        }
+
+        std::optional<LirReg> const value = regForValue(operands[0]);
+        if (!value.has_value()) return;
+
+        TypeKind const k = interner.kind(mir.instType(id));
+        bool const isF64 = (k == TypeKind::F64);   // F32 already width-gated
+
+        // Mint the sign-mask rodata symbol + record its descriptor (the
+        // pipeline materializes the 16-byte, 16-byte-aligned `.rodata` item).
+        SymbolId const maskSym = mintSignMaskSymbol();
+        signMaskConstants_.push_back(SignMaskConstant{maskSym, isF64});
+
+        // Emit `fneg_mask xmm, [rip+mask]`. op[0] = the value (the 2-address
+        // legalize copies it into the result register = XORPD destination);
+        // op[1] = the mask symbol (→ riprel.disp32). Width selects XORPD/XORPS.
+        LirReg const result = lir.newVReg(regClassFor(id));
+        std::array<LirOperand, 2> const ops{
+            LirOperand::makeReg(*value),
+            LirOperand::makeSymbolRef(maskSym.v)};
+        emitInst(*maskOp, result, ops, /*payload=*/0,
+                 widthFlagsForType(mir.instType(id)));
+        defineValue(id, result);
+    }
 
     // ── FC3.5 sweep-c1: capability-driven MIR Shl/LShr/AShr lowering ──
     // (closes the D-CSUBSET-32BIT-ALU-FORMS shifts residue)
@@ -4889,6 +5024,7 @@ struct Lowerer {
             .lir                  = std::move(frozen),
             .lirToMir             = std::move(lirToMir),
             .jumpTableDescriptors = std::move(jumpTableDescriptors_),
+            .signMaskConstants    = std::move(signMaskConstants_),
             .externImports        = {},
             .ok                   = !hadError()
         };

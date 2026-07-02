@@ -87,6 +87,22 @@ struct DSS_EXPORT JumpTableDescriptor {
     std::unordered_map<std::uint32_t, SymbolId> blockSymbols;
 };
 
+// c78 (D-CSUBSET-FLOAT-NEG-ENCODING): one descriptor per x86-style float-negate
+// site the LIR lowerer realized as `xorpd/xorps xmm, [rip+mask]` (a target
+// WITHOUT a native `fneg` opcode). Like a JumpTableDescriptor it carries only
+// what the assembler-adjacent pipeline needs to MATERIALIZE the constant: a
+// 16-byte, 16-byte-aligned `.rodata` item under `symbol`, whose low bytes hold
+// the sign bit (bit 63 for F64 / bit 31 for F32) and whose high bytes are zero.
+// The XORPS/XORPD memory operand must be 16-byte aligned at runtime; the item's
+// 16-byte `Alignment` + the section-alignment layout (ELF sh_addralign; PE 4 KiB
+// sectionAlignment, a multiple of 16) guarantee it on all three legs. Minted
+// per-occurrence (no dedup — mirrors the jump-table + string/float-literal
+// producers); a native-fneg target (arm64) emits NONE of these.
+struct DSS_EXPORT SignMaskConstant {
+    SymbolId symbol{};        // unique `.rodata` symbol for this mask
+    bool     isF64 = true;    // true → F64 mask (bit 63); false → F32 mask (bit 31)
+};
+
 struct DSS_EXPORT MirToLirResult {
     Lir                    lir;
     std::vector<MirInstId> lirToMir;
@@ -95,6 +111,11 @@ struct DSS_EXPORT MirToLirResult {
     // each table's `.data` `AssembledData` (abs64 relocs to block symbols) and to
     // bind those block symbols from the assembled function's `blockByteOffsets`.
     std::vector<JumpTableDescriptor> jumpTableDescriptors;
+    // c78 (D-CSUBSET-FLOAT-NEG-ENCODING): one entry per x86-style float-negate
+    // site the lowerer realized as `xorpd/xorps xmm, [rip+mask]`. Consumed by
+    // `compile_pipeline.cpp` to emit each mask's 16-byte, 16-byte-aligned
+    // `.rodata` `AssembledData`. Empty on a native-fneg target (arm64).
+    std::vector<SignMaskConstant> signMaskConstants;
     // Extern symbol descriptors propagated from `HirToMirResult.
     // externImports` (LK6 cycle 2d — D-LK6-6 closure). LIR does
     // not consume these structurally (call sites carry SymbolRef

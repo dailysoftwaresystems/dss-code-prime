@@ -1987,7 +1987,11 @@ TEST(MirToLir, FloatArithmeticLowersToFPRClassResults) {
         {::dss::MirOpcode::FSub, "fsub", 2},
         {::dss::MirOpcode::FMul, "fmul", 2},
         {::dss::MirOpcode::FDiv, "fdiv", 2},
-        {::dss::MirOpcode::FNeg, "fneg", 1},
+        // c78 (D-CSUBSET-FLOAT-NEG-ENCODING): x86 has NO native FP-negate, so
+        // FNeg capability-dispatches to `fneg_mask` (xorpd xmm,[rip+signmask]) —
+        // still an FPR-class result. (arm64 keeps the native `fneg` opcode; this
+        // test loads the x86_64 schema, so the realized op here is fneg_mask.)
+        {::dss::MirOpcode::FNeg, "fneg_mask", 1},
     }};
     for (auto const& c : cases) {
         std::vector<::dss::TypeKind> paramKinds(c.arity, ::dss::TypeKind::F64);

@@ -401,6 +401,24 @@ struct Lowerer {
     // integer↔pointer, pointer-to-pointer (Bitcast). Same-kind casts collapse
     // to Bitcast (e.g. signed↔unsigned of the same width — no value change at
     // the bit level). Returns `MirOpcode::Invalid` for unrecognized pairs.
+    // D-CSUBSET-INT-TO-F32-CODEGEN / si_to_fp sub-int source (c78): true
+    // for an integer type NARROWER than `int` (Char/I8/U8/I16/U16/Bool/
+    // Byte) — the kinds that must integer-PROMOTE to I32 before an
+    // int→float conversion (CVTSI2SD reads r32/r64; SCVTF reads Wn/Xn —
+    // neither has a sub-32 form). I32 and wider are already ≥int and pass
+    // through. Mirrors mapCast's own 8/16-bit-width classification.
+    [[nodiscard]] static bool isSubIntPromotable(TypeKind k) noexcept {
+        switch (k) {
+            case TypeKind::Bool: case TypeKind::Byte:
+            case TypeKind::Char:
+            case TypeKind::I8:   case TypeKind::U8:
+            case TypeKind::I16:  case TypeKind::U16:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     [[nodiscard]] static MirOpcode mapCast(TypeKind from, TypeKind to) noexcept {
         auto isInt = [](TypeKind k) noexcept {
             return k == TypeKind::I8  || k == TypeKind::I16 || k == TypeKind::I32
@@ -1289,8 +1307,9 @@ struct Lowerer {
                 auto const sc = interner.scalars(ty);
                 return sc.empty() ? kk : static_cast<TypeKind>(sc[0]);
             };
-        MirOpcode const mop = mapCast(enumUnderlying(fromTy, fromK),
-                                      enumUnderlying(t, toK));
+        TypeKind const fromResolved = enumUnderlying(fromTy, fromK);
+        TypeKind const toResolved    = enumUnderlying(t, toK);
+        MirOpcode const mop = mapCast(fromResolved, toResolved);
         if (mop == MirOpcode::Invalid) {
             unsupported(node, std::format(
                 "Cast from TypeKind {} to {} has no MIR opcode",
@@ -1298,7 +1317,32 @@ struct Lowerer {
                 static_cast<unsigned>(toK)));
             return InvalidMirInst;
         }
-        std::array<MirInstId, 1> ops{operand};
+        // D-CSUBSET-INT-TO-F32-CODEGEN / si_to_fp sub-int source (c78): a
+        // sub-int (Char/I8/U8/I16/U16) → float conversion has NO
+        // sub-32-bit int→float instruction form on x86 (CVTSI2SD reads
+        // r32/r64) OR arm64 (SCVTF reads Wn/Xn). gcc integer-PROMOTES the
+        // source to `int` FIRST (`movsx/movzx ecx, cl` then `cvtsi2sd
+        // xmm, ecx`; C 6.3.1.1). Insert the SAME promotion: widen the
+        // source to I32 (SExt signed / ZExt unsigned via mapCast) before
+        // the SIToFP/UIToFP, so the conversion reads a sign/zero-extended
+        // 32-bit source. Non-sub-int sources (I32/I64 already ≥32) skip
+        // this — byte-identical to the prior single-op emit.
+        MirInstId castOperand = operand;
+        if ((mop == MirOpcode::SIToFP || mop == MirOpcode::UIToFP)
+            && isSubIntPromotable(fromResolved)) {
+            MirOpcode const ext = mapCast(fromResolved, TypeKind::I32);
+            if (ext == MirOpcode::Invalid) {
+                unsupported(node, std::format(
+                    "sub-int→float source promotion from TypeKind {} to I32 "
+                    "has no MIR opcode",
+                    static_cast<unsigned>(fromResolved)));
+                return InvalidMirInst;
+            }
+            std::array<MirInstId, 1> extOps{operand};
+            castOperand = mir.addInst(ext, extOps,
+                                      interner.primitive(TypeKind::I32));
+        }
+        std::array<MirInstId, 1> ops{castOperand};
         return mir.addInst(mop, ops, t);
     }
 

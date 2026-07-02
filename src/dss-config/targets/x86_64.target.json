@@ -1444,10 +1444,40 @@
       }
     },
     {
-      "$comment": "Float unary negate. AS1 emits xorps reg, [.LC0_signbit] OR subss zero, reg — the abstract opcode hides this.",
+      "$comment": "Float unary negate (the ABSTRACT MIR FNeg's LIR mnemonic). x86 has NO native fp-negate instruction, so this opcode carries NO encoding: `lowerFNeg` in mir_to_lir probes this opcode's declared-encoding presence (empty here) and takes the CAPABILITY fallback — mint a 16-byte rodata sign-mask + emit `fneg_mask` (xorpd/xorps reg, [rip+mask]) below. On arm64 the same-named `fneg` opcode DOES declare a native FNEG encoding, so the probe there emits it directly. Keeping this abstract-but-declared (rather than deleting it) preserves the MnemonicSlot::FNeg probe target that distinguishes the two realizations by capability (c78, D-CSUBSET-FLOAT-NEG-ENCODING).",
       "mnemonic": "fneg", "result": "value",
       "minOperands": 1, "maxOperands": 1,
       "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
+      "$comment": "c78 (D-CSUBSET-FLOAT-NEG-ENCODING): the x86 realization of float negate — XOR the value against a 16-byte rodata SIGN-MASK (bit 63 set for F64 / bit 31 for F32, high bytes zero). This is gcc's `xorpd xmm0, XMMWORD PTR .LC0[rip]`, chosen for IEEE exactness: XOR flips ONLY the sign bit, so -(+0.0)=-0.0, -(-0.0)=+0.0, and -NaN preserves the payload — the `0.0 - x` alternative gives +0.0 for x=+0.0 (wrong signed zero) and mishandles NaN. `lowerFNeg` mints an anonymous 16-byte, 16-byte-aligned CONST rodata global (a U128 whose low qword/dword holds the mask, emitted via the existing float-literal-promotion mint mechanism) and materializes its address, then emits this op with operands [value, maskSymbol]. 2-address (requires2Address): the destination xmm = ModR/M.reg (op[0], the value; the legalize inserts `movaps dst, value`), the mask is ModR/M.rm via the RIP-relative disp32 slot (mod=00 rm=101 + a rel32 relocation against the mask symbol — the SAME `riprel.disp32` slot `movsd_load`/`lea` use). SSE m128 requires the memory operand be 16-byte aligned at runtime — the mint's 16-byte alignment + the section-alignment layout guarantee it on ELF (sh_addralign) and PE (4KB sectionAlignment, a multiple of 16). F64 = XORPD 66 0F 57 /r (width 64); F32 = XORPS 0F 57 /r (NP, width 32).",
+      "mnemonic": "fneg_mask", "result": "value",
+      "requires2Address": true,
+      "minOperands": 2, "maxOperands": 2,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "F64: XORPD xmm, [rip+mask] — 66 0F 57 /r. Mirrors the fadd/fmul 2-address shape (NO explicit resultSlot — the result register IS op[0], guaranteed by the requires2Address legalize's `movaps dst, value` + operands[0]:=result rewrite; wire index:0 writes ModR/M.reg = that register). op[1] (mask symbol) -> the riprel.disp32 slot (mod=00 rm=101 + a rel32 reloc against the mask symbol).",
+            "guard":      { "operandKinds": ["reg", "symbol"], "width": 64 },
+            "template":   { "mandatoryPrefix": [102], "opcode": [15, 87] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "riprel.disp32", "relocationKind": "rel32" }
+            ]
+          },
+          {
+            "$comment": "F32: XORPS xmm, [rip+mask] — NP 0F 57 /r (no mandatory prefix — a 66 here would be XORPD). Same operand roles + riprel mask as the F64 form.",
+            "guard":      { "operandKinds": ["reg", "symbol"], "width": 32 },
+            "template":   { "opcode": [15, 87] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.reg" },
+              { "index": 1, "slotKind": "riprel.disp32", "relocationKind": "rel32" }
+            ]
+          }
+        ]
+      }
     },
     {
       "$comment": "Float-to-float precision change (FPTrunc f64→f32, FPExt f32→f64). FC3.5 sweep-c2: encoded — CVTSD2SS xmm1, xmm2 = F2 0F 5A /r (double→single) and CVTSS2SD xmm1, xmm2 = F3 0F 5A /r (single→double), Intel SDM CVTSD2SS/CVTSS2SD: SAME opcode bytes, the mandatory prefix names the SOURCE width. The width axis therefore keys on the SOURCE: the MIR→LIR FPTrunc/FPExt arm threads a widthOverride from the source operand's type (the result-width default would select exactly the WRONG sibling — FPTrunc's F32 result would pick the F3 widen). ModR/M.reg = the xmm destination (resultSlot), ModR/M.rm = the xmm source.",
@@ -1499,10 +1529,29 @@
       }
     },
     {
-      "$comment": "Float-to-unsigned-integer conversion (FPToUI). x86 has no direct opcode; AS1 emits a guarded cvttsd2si sequence.",
+      "$comment": "Float-to-unsigned-integer conversion (FPToUI). c78 (D-CSUBSET-FP-TO-UI-CODEGEN): for the c-subset's in-range needs (a double/float whose value fits the U32 result — sqlite's usage), the truncating signed CVTTSD2SI/CVTTSS2SI r64 form serves: any value in [0, 2^32) fits the signed-64 result exactly, and the U32 result reads the low 32 bits (gcc emits the identical `cvttsd2si rax, xmm0` for `(unsigned)d`). SAME encoding + operand roles + SOURCE-width axis as fp_to_si: ModR/M.reg = the GPR destination (resultSlot), ModR/M.rm = the xmm source; REX.W keeps the 64-bit destination. Full correct unsigned-i64 (a double ≥ 2^63 → the conditional-subtract sequence) is deferred as D-CSUBSET-UI-FROM-FP-UNSIGNED-I64; sqlite does not hit it.",
       "mnemonic": "fp_to_ui", "result": "value",
       "minOperands": 1, "maxOperands": 1,
-      "minSuccessors": 0, "maxSuccessors": 0
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "F64 source → CVTTSD2SI r64, xmm — F2 REX.W 0F 2C /r (truncating scalar-double → signed 64-bit; the low 32 bits are the in-range U32 result).",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [242], "rexW": true, "opcode": [15, 44] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "$comment": "F32 source → CVTTSS2SI r64, xmm — F3 REX.W 0F 2C /r.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [243], "rexW": true, "opcode": [15, 44] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
     },
     {
       "$comment": "Signed-integer-to-float (SIToFP) — the REVERSE of fp_to_si above. CVTSI2SD xmm, r/m = F2 [REX.W] 0F 2A /r (Intel SDM: scalar signed-int -> double). Operand roles MIRROR cvttsd2si SWAPPED: ModR/M.reg = the xmm DESTINATION (resultSlot — the result is FPR-class via the F64 MIR result type, regClassFor), ModR/M.rm = the GPR SOURCE (wire 0). The width axis here keys on the SOURCE INTEGER width (the MIR->LIR SIToFP arm threads a widthOverride from the source operand's int type): a 32-bit source -> the no-REX.W form CVTSI2SD xmm, r32 (width=32), a 64-bit source -> REX.W CVTSI2SD xmm, r64 (width=64). REX.W selects the 64-bit source-integer interpretation (NOT the dest float width — the dest is fixed F64/sd here). DESIGN NOTE (audit + qemu-arm64 scrutiny): the variant guard offers ONE width axis, but cvtsi2sd/ss needs TWO independent selectors — REX.W (source-int width) AND F2-vs-F3 prefix (dest-float width). The source-int axis MUST vary (i32 vs i64 both occur; REX.W wrong = reads the wrong register width), so it OWNS the width axis; the dest-float prefix is fixed at F2/sd (F64 destination), the dominant + sqlite-blocking case (i64 -> volatile double). int -> F32 (`float f = anInt`, ss/F3) has NO encoding this cycle and FAILS LOUD at the mir_to_lir SIToFP arm (a deferred narrow gap, D-CSUBSET-INT-TO-F32-CODEGEN); sqlite uses `double` only.",

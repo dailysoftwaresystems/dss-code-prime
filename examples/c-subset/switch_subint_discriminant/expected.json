@@ -1,0 +1,16 @@
+{
+  "$comment": "c78 (D-CSUBSET-NARROW-SWITCH-DISCRIMINANT-CMP, 2026-07-01): a switch on a sub-int (char/uchar/short) discriminant integer-PROMOTES the controlling expression to int at HIR (C 6.8.4.2), so the dispatch compare runs at >=32-bit width. Pre-fix the narrow discriminant reached MIR->LIR and emitted cmp at width 8/16 -> A_NoMatchingEncodingVariant (no sub-32 integer compare exists on x86 OR arm64 -> a LOWERING fix, not a per-target encoding). The 313x dominant of the post-c77 sqlite encoder frontier. RED-ON-DISABLE: revert the switchPrologue promotion -> A_NoMatchingEncodingVariant cmp width 8. => 154.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 154,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

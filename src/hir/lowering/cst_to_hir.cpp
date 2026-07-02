@@ -638,6 +638,25 @@ struct Lowerer {
     // truthiness conditions (`if (2)` would have been false; every
     // reachable case was caught by the FC3-c2 conversion-width gate, so
     // nothing miscompiled silently).
+    // D-CSUBSET-NARROW-SWITCH-DISCRIMINANT-CMP (c78): integer-PROMOTE a
+    // sub-int arithmetic value to `int` (C 6.3.1.1), reusing the SAME
+    // `integerPromotedType` + `coerce` chokepoint `coerceCondition` and
+    // the array-index path use. Char/signed→SExt, unsigned(U8/U16)→ZExt
+    // (via `mapCast`, automatic per kind). A block-less language (no
+    // `arith_`), an already-≥int value, a non-arithmetic value, or a
+    // float all pass through unchanged. Extracted here so the switch
+    // controlling-expression promotion (C 6.8.4.2 — "the integer
+    // promotions are performed on the controlling expression") shares
+    // ONE promotion primitive with the truth-value path.
+    [[nodiscard]] E promoteSubIntArith(E val) {
+        if (!val.type.valid()) return val;
+        if (!arith_.has_value()) return val;
+        if (!isArithmeticCore(interner.kind(val.type))) return val;
+        TypeId const p = integerPromotedType(interner, val.type, *arith_);
+        if (p.valid() && p.v != val.type.v) return coerce(val, p);
+        return val;
+    }
+
     [[nodiscard]] E coerceCondition(E cond, NodeId anchor) {
         if (!cond.type.valid()) return cond;
         TypeKind const ck = interner.kind(cond.type);
@@ -5748,7 +5767,16 @@ struct Lowerer {
         std::optional<HirNodeId> disc;
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
-            if (!disc && classify(c) == Role::Expr) { disc = lowerExpr(c).id; continue; }
+            // D-CSUBSET-NARROW-SWITCH-DISCRIMINANT-CMP (c78): the switch
+            // controlling expression integer-PROMOTES (C 6.8.4.2). A
+            // `char`/`short`/`u8` discriminant otherwise reaches MIR→LIR
+            // as a sub-int value and the sparse dispatch emits `cmp` at
+            // the narrow width → A_NoMatchingEncodingVariant (no width-8/16
+            // ALU form on x86 OR arm64). Promote to `int` so the compare
+            // runs at ≥32-bit width with a sign/zero-extended operand.
+            if (!disc && classify(c) == Role::Expr) {
+                disc = promoteSubIntArith(lowerExpr(c)).id; continue;
+            }
             ctx.items.push_back(c);   // switchBodyItem wrappers (caseLabel | statement)
         }
         ctx.discId = orError(disc, node, "switch has no discriminant");
