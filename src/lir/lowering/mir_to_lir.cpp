@@ -762,6 +762,41 @@ struct Lowerer {
             && opcode(MnemonicSlot::MovkLsl48).has_value();
     }
 
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA (c93): does the target's `lea` declare a
+    // base+disp form `[reg, membase, memoffset]` whose displacement slot is
+    // SIGNED — i.e. accepts a NEGATIVE MemOffset (a `p[-N]` const-disp Gep)?
+    // Capability probe over the declared variant vocabulary — the SANCTIONED
+    // pattern (see `targetHasMovImm64`), NEVER `if (arch == ...)`.
+    //
+    // A variant with NEITHER `immMin` NOR `immMax` matches ANY magnitude
+    // (`variantMatchesInst` skips the magnitude axis when both are absent), so
+    // its displacement slot swallows the full signed range — x86_64's `lea r,
+    // [base+disp32]` (a SIGNED disp32 field) is exactly this: no magnitude bound
+    // → a negative disp encodes free. arm64's every base+disp `lea`/ADD-imm
+    // variant carries an UNSIGNED magnitude bound (imm12 ≤4095 / shifted-imm12 /
+    // MOVZ-MOVK), because `variantImmMagnitude` reports nullopt for a negative
+    // value BEFORE any range check → NO arm64 variant matches a negative disp.
+    // TRUE ⇒ emit the negative-disp `lea` directly (x86, unchanged single
+    // instruction). FALSE ⇒ `lowerGep` materializes the negative disp into a
+    // fresh GPR and emits the base+index form instead (arm64). A target with
+    // NO `lea` opcode at all returns false (it cannot have a signed-disp lea).
+    [[nodiscard]] bool targetHasSignedDispLea() const {
+        auto const leaId = opcode(MnemonicSlot::Lea);
+        if (!leaId.has_value()) return false;
+        auto const* info = target.opcodeInfo(*leaId);
+        if (info == nullptr) return false;
+        for (auto const& v : info->encoding.variants) {
+            if (v.operandKinds.size() == 3
+                && v.operandKinds[0] == OperandKindFilter::Reg
+                && v.operandKinds[1] == OperandKindFilter::MemBase
+                && v.operandKinds[2] == OperandKindFilter::MemOffset
+                && !v.immMin.has_value() && !v.immMax.has_value()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // FC2 Part B: the opcode that performs `op` on a value of register
     // class `cls` (the registerClassOps resolution). GPR resolves to
     // the universal mov/load/store; a class with no declared operation
@@ -2395,6 +2430,47 @@ struct Lowerer {
                 // (The body-local ALLOCA-base + const-disp fold is handled UP FRONT
                 // at lowerGep's top — see there. This general path is for a
                 // derived-pointer base.)
+                //
+                // D-AS4-ARM64-NEGATIVE-DISP-LEA (c93): a NEGATIVE constant
+                // displacement (`p[-N]` → -N*sizeof(*p), e.g. a `char*` lookback
+                // `z[-1]` or a ConstFold-folded `int*` `p[-5]`) rides the
+                // `MemOffset` slot. On a target whose base+disp `lea` slot is
+                // SIGNED (x86 disp32) it encodes directly — the single-instruction
+                // path below, UNCHANGED. On a target whose base+disp variants are
+                // all UNSIGNED-magnitude-bounded (arm64 imm12 / shifted-imm12 /
+                // MOVZ-MOVK), a negative disp matches NO variant
+                // (A_NoMatchingEncodingVariant opcode 'lea' width 64). CONFIG-GATED
+                // (targetHasSignedDispLea, NOT an arch check): materialize the
+                // negative disp into a FRESH GPR (emitBareConstToFresh fills the
+                // sign-extended 64-bit value — arm64 MOVZ + 0xFFFF-MOVK ladder) and
+                // emit the 4-op base+index form `lea [base + idxReg*1 + 0]` — the
+                // SAME base+index `ADD Xd,Xn,Xm` the runtime-subscript path already
+                // encodes. ADD computes base + (sign-extended -N) = base - N (the
+                // correct byte address). The base survives into Rn; the
+                // materialized value is a DISTINCT fresh reg (Rm) → no clobber, no
+                // double-materialization. A POSITIVE disp (≤4095) still takes the
+                // single-word ADD-imm12 form below; the guard is `< 0` ONLY.
+                //
+                // (c93 STEP-0 named the sqlite trigger: 17 negative const-disp
+                // Geps across 9 functions, ALL disp=-1 — the 1-byte-stride
+                // `p[-1]`/`z[-1]` char-buffer lookback, which `scaleIndexToBytes`
+                // leaves as a bare negative Const with NO ConstFold, so it fires
+                // at DEBUG too. That is why the sqlite DEBUG compile hit this.)
+                if (*disp < 0 && !targetHasSignedDispLea()) {
+                    std::optional<LirReg> const dispReg =
+                        emitBareConstToFresh(*disp);
+                    if (!dispReg.has_value()) return;  // fail-loud already reported
+                    LirReg const result = lir.newVReg(LirRegClass::GPR);
+                    std::array<LirOperand, 4> ops{
+                        LirOperand::makeReg(*base),
+                        LirOperand::makeReg(*dispReg),
+                        LirOperand::makeMemBase(1),
+                        LirOperand::makeMemOffset(0),
+                    };
+                    emitInst(*opcode(MnemonicSlot::Lea), result, ops);
+                    defineValue(id, result);
+                    return;
+                }
                 LirReg const result = lir.newVReg(LirRegClass::GPR);
                 std::array<LirOperand, 3> ops{
                     LirOperand::makeReg(*base),
