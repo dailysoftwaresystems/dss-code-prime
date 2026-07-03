@@ -36,15 +36,33 @@
 static DWORD __stdcall win_contribution(DWORD seed) {
     return seed + 1u;
 }
+
+/* c96 (D-FFI-WINDOWS-KERNEL32-FUNCTIONS, the semantic frontier): the 4 Win32
+ * typedefs LPHANDLE/LPDWORD/LPBOOL/ULONG64 — the EXACT pointer-to-Win32-scalar
+ * param shape os_win.c's winLockFile/osReadFile use (a pointer-to-HANDLE,
+ * pointer-to-DWORD, pointer-to-BOOL written through + a ULONG64). Without these
+ * typedefs in windows.json the
+ * declarator is error[S0006] (parse-clean type-name tokens, semantic-undefined)
+ * — the RED-ON-DISABLE witness. The pointers are written through + read back so
+ * a wrong width silently miscompiles the round-trip (verified == 42). */
+static BOOL win_lock(LPHANDLE phFile, LPDWORD pFlags, LPBOOL pOk, ULONG64 off) {
+    *phFile = (HANDLE)0;                 /* write through HANDLE*  */
+    *pFlags = (DWORD)(off & 0xFFu);      /* write through DWORD*, ULONG64 arith */
+    *pOk    = 1;                         /* write through BOOL*    */
+    return *pOk;
+}
 #endif
 
 int main(void) {
 #if defined(_WIN32)
     DWORD  base = win_contribution(30u);   /* 31 */
-    HANDLE h    = 0;                        /* a windows.h pointer type */
-    int    pathBudget = (MAX_PATH == 260) ? 11 : 0;  /* the shipped constant */
-    (void)h;
-    return (int)base + pathBudget;         /* 31 + 11 = 42 (Windows route) */
+    HANDLE h     = (HANDLE)1;
+    DWORD  flags = 0;
+    BOOL   ok    = 0;
+    BOOL   r     = win_lock(&h, &flags, &ok, (ULONG64)7);  /* h=0, flags=7, ok=1, r=1 */
+    int    pathBudget = (MAX_PATH == 260) ? 4 : 0;  /* the shipped constant */
+    if (r != 1 || ok != 1 || flags != 7u || h != (HANDLE)0) return 1;  /* writes landed */
+    return (int)base + (int)flags + pathBudget;  /* 31 + 7 + 4 = 42 (Windows route) */
 #else
     return 42;                             /* every non-pe target (else route) */
 #endif
