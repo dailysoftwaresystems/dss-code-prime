@@ -2178,7 +2178,13 @@ TEST(Preprocessor, FC15bPredefinedNameIsConfigDrivenNotHardcoded) {
 
 // AGNOSTICISM (opt-OUT): a language with NO preprocess block declares NO
 // predefined macros, so `__LINE__` &c. stay ordinary identifiers (zero behavior
-// change for toy / tsql-subset). c-subset, by contrast, declares the 7 entries.
+// change for toy / tsql-subset). c-subset, by contrast, declares the 7 UNGATED
+// C 6.10.8 macros PLUS (c95) the pe-gated Windows-selection macros — `_WIN32` /
+// `_WIN64` (value 1) and the ABI qualifiers `__stdcall` / `__cdecl` /
+// `__fastcall` / `WINAPI` (empty value → erased). The per-format filter lives in
+// `availableObjectFormats`: EMPTY ⇒ every format (the 7 core), a non-empty set ⇒
+// that format only. This test pins the split so a stray un-gated Win32 macro
+// (which would leak `_WIN32` onto elf/macho) fails loud.
 TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     auto toy = GrammarSchema::loadShipped("toy");
     ASSERT_TRUE(toy.has_value());
@@ -2191,8 +2197,51 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
 
     auto c = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(c.has_value());
-    EXPECT_EQ((*c)->preprocess().predefinedMacros.size(), 7u)
-        << "c-subset declares the 7 C 6.10.8 predefined macros";
+    auto const& pms = (*c)->preprocess().predefinedMacros;
+    // 7 ungated (C 6.10.8) + 6 pe-gated (c95 Windows selection) = 13.
+    EXPECT_EQ(pms.size(), 13u)
+        << "c-subset declares 7 C 6.10.8 + 6 pe-gated Windows predefined macros";
+    std::size_t ungated = 0;
+    std::size_t peGated = 0;
+    for (auto const& pm : pms) {
+        if (pm.availableObjectFormats.empty()) {
+            ++ungated;
+        } else {
+            ++peGated;
+            EXPECT_EQ(pm.availableObjectFormats.size(), 1u)
+                << pm.name << " should be gated to exactly one format";
+            EXPECT_EQ(pm.availableObjectFormats.front(), "pe")
+                << pm.name << " should be pe-gated (Windows selection)";
+        }
+    }
+    EXPECT_EQ(ungated, 7u)
+        << "the 7 C 6.10.8 macros are un-gated (available on every format)";
+    EXPECT_EQ(peGated, 6u)
+        << "_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI are pe-gated";
+}
+
+// LOADER fail-loud (c95): a `predefinedMacros.availableObjectFormats` naming an
+// UNKNOWN object-format is a config typo that would silently never seed the
+// macro on any target (an OS-selection macro that never fires) -> it must be a
+// LOAD error, never accepted. We corrupt `_WIN32`'s ["pe"] to ["pee"] and assert
+// the load FAILS (C_InvalidPreprocess via objectFormatKindFromName). RED-ON-
+// DISABLE: without the loader validation this parses and the macro is dead.
+TEST(Preprocessor, FC15bPredefinedMacroBadObjectFormatIsLoadError) {
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty());
+    const std::string from =
+        "{ \"name\": \"_WIN32\",              \"kind\": \"constant\", "
+        "\"value\": \"1\", \"availableObjectFormats\": [\"pe\"] }";
+    const std::string to   =
+        "{ \"name\": \"_WIN32\",              \"kind\": \"constant\", "
+        "\"value\": \"1\", \"availableObjectFormats\": [\"pee\"] }";
+    auto const pos = text.find(from);
+    ASSERT_NE(pos, std::string::npos)
+        << "the _WIN32 predefinedMacros entry must be present verbatim";
+    text.replace(pos, from.size(), to);
+    auto loaded = GrammarSchema::loadFromText(text, "<bad-objfmt-c-subset>");
+    EXPECT_FALSE(loaded.has_value())
+        << "an unknown availableObjectFormats name ('pee') must be a load error";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

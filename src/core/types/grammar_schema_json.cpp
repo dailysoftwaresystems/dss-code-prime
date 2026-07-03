@@ -3942,6 +3942,48 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                             pm.value = e.at("value").get<std::string>();
                         }
+                        // OPTIONAL `availableObjectFormats` — a per-format
+                        // availability filter (mirrors the shipped-lib
+                        // descriptor field). Absent ⇒ available on every format.
+                        // Present: an array of object-format NAMES; each must be
+                        // a known name ("pe"/"elf"/"macho") or fail LOUD (never a
+                        // silent typo). Lets `_WIN32` be predefined pe-only.
+                        if (e.contains("availableObjectFormats")) {
+                            json const& afs = e.at("availableObjectFormats");
+                            if (!afs.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          mpath + "/availableObjectFormats",
+                                          "'predefinedMacros.availableObjectFormats'"
+                                          " must be an array of object-format names,"
+                                          " e.g. [\"pe\"]");
+                                continue;
+                            }
+                            bool afOk = true;
+                            for (std::size_t ai = 0; ai < afs.size(); ++ai) {
+                                json const& av = afs[ai];
+                                if (!av.is_string()) {
+                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                              mpath + "/availableObjectFormats",
+                                              "'availableObjectFormats' entries must "
+                                              "be strings");
+                                    afOk = false;
+                                    break;
+                                }
+                                std::string fmt = av.get<std::string>();
+                                if (!objectFormatKindFromName(fmt).has_value()) {
+                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                              mpath + "/availableObjectFormats",
+                                              std::format("unknown object-format name"
+                                                          " '{}' (expected "
+                                                          "\"pe\"/\"elf\"/\"macho\")",
+                                                          fmt));
+                                    afOk = false;
+                                    break;
+                                }
+                                pm.availableObjectFormats.push_back(std::move(fmt));
+                            }
+                            if (!afOk) continue;
+                        }
                         cfg.predefinedMacros.push_back(std::move(pm));
                     }
                 }

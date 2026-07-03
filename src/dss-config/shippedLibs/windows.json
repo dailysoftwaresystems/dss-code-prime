@@ -1,0 +1,157 @@
+{
+  "$comment": "Neutral shipped <windows.h> (Win32) SKELETON — c95 (the FLIP-AND-UNBLOCK cycle of the Windows-host sub-arc). Predefining `_WIN32` (pe-gated, c-subset.lang.json) makes sqlite's amalgamation select its OWN os_win.c VFS (SQLITE_OS_WIN) instead of os_unix. os_win.c then needs the Win32 TYPE + STRUCT + CONSTANT vocabulary to PARSE; this descriptor supplies exactly that surface (the 13 core types + the 6 field-bearing records os_win.c reads members of + the constants it references). `availableObjectFormats:[pe]` — a Win32 header is meaningless on elf/macho (a reference there fails loud). `library:{pe:kernel32.dll}` — the eventual kernel32 import library (pe already imports kernel32 for ExitProcess). ★ SCOPE (c95): enough that os_win.c PARSES. The 47 kernel32 FUNCTION declarations (the aSyscall[] table: CreateFileW/ReadFile/WriteFile/LockFileEx/GetSystemTimeAsFileTime…) are DEFERRED to c96+ — so after c95, os_win.c parses but the kernel32 CALLS are undefined (the SEMANTIC wave = the next frontier), which is EXPECTED. TYPE MAPPINGS: HANDLE/LPVOID/LPCVOID/HMODULE/HLOCAL/FARPROC and the LP*_ pointer types → ptr<void> (Win32 opaque handles + C pointer coercion); LPCSTR/LPSTR → ptr<char> (ANSI); LPCWSTR/LPWSTR → ptr<u16> (UTF-16, WCHAR=u16); DWORD/UINT/ULONG → u32; LONG/BOOL/INT → i32; SIZE_T/ULONGLONG → u64; WCHAR → u16; VOID → void (the `(VOID)` empty prototype). GET_FILEEX_INFO_LEVELS is an enum → i32. LLP64 note: Win32 `LONG` is 32-bit (i32) even on 64-bit Windows (unlike POSIX `long`); the 64-bit forms use ULONGLONG/LARGE_INTEGER, so no `long`-width axis is needed here. STRUCT LAYOUTS (natural C alignment, the layout engine derives offsets from field sizes — matching the real windows.h records os_win reads): OVERLAPPED flattens its anonymous Offset/OffsetHigh union-struct (os_win writes .Offset/.OffsetHigh/.hEvent) → 32B; LARGE_INTEGER is modeled as a struct {i64 QuadPart} (os_win only ever touches .QuadPart, the widest 8B union member — a true `union` needs a descriptor `unions` block, out of c95 scope) → 8B; SYSTEM_INFO carries the real field order so .dwPageSize@4 / .dwAllocationGranularity@40 land correctly; FILETIME {u32,u32}=8B; WIN32_FILE_ATTRIBUTE_DATA {dwFileAttributes, 3×FILETIME, nFileSizeHigh, nFileSizeLow}=36B (os_win reads .dwFileAttributes/.nFileSizeHigh/.nFileSizeLow). Each record is ALSO a bare typedef (os_win declares `OVERLAPPED ovlp;` without the `struct` keyword) whose inline `struct \"Name\"{…}` interns to the SAME TypeId as the structs-block entry (name + field-types identity), so the injected field scope resolves .member. CONSTANT values verified against the Windows SDK headers (winnt.h/winbase.h/fileapi.h/handleapi.h/memoryapi.h/errhandlingapi.h/winerror.h).",
+  "header": "windows.h",
+  "standard": "win32",
+  "availableObjectFormats": ["pe"],
+  "library": { "pe": "kernel32.dll" },
+  "typedefs": [
+    { "name": "VOID",      "type": "void" },
+    { "name": "BOOL",      "type": "i32" },
+    { "name": "INT",       "type": "i32" },
+    { "name": "UINT",      "type": "u32" },
+    { "name": "LONG",      "type": "i32" },
+    { "name": "ULONG",     "type": "u32" },
+    { "name": "DWORD",     "type": "u32" },
+    { "name": "ULONGLONG", "type": "u64" },
+    { "name": "SIZE_T",    "type": "u64" },
+    { "name": "BYTE",      "type": "u8" },
+    { "name": "WORD",      "type": "u16" },
+    { "name": "WCHAR",     "type": "u16" },
+    { "name": "CHAR",      "type": "i8" },
+    { "name": "HANDLE",    "type": "ptr<void>" },
+    { "name": "HMODULE",   "type": "ptr<void>" },
+    { "name": "HLOCAL",    "type": "ptr<void>" },
+    { "name": "HINSTANCE", "type": "ptr<void>" },
+    { "name": "FARPROC",   "type": "ptr<void>" },
+    { "name": "PVOID",     "type": "ptr<void>" },
+    { "name": "LPVOID",    "type": "ptr<void>" },
+    { "name": "LPCVOID",   "type": "ptr<void>" },
+    { "name": "LPSTR",     "type": "ptr<char>" },
+    { "name": "LPCSTR",    "type": "ptr<char>" },
+    { "name": "LPWSTR",    "type": "ptr<u16>" },
+    { "name": "LPCWSTR",   "type": "ptr<u16>" },
+    { "name": "LPSECURITY_ATTRIBUTES", "type": "ptr<void>" },
+    { "name": "GET_FILEEX_INFO_LEVELS", "type": "i32" },
+    { "name": "FILETIME",  "type": "struct \"FILETIME\" { u32, u32 }" },
+    { "name": "LPFILETIME", "type": "ptr<void>" },
+    { "name": "LARGE_INTEGER",  "type": "struct \"LARGE_INTEGER\" { i64 }" },
+    { "name": "PLARGE_INTEGER", "type": "ptr<void>" },
+    { "name": "OVERLAPPED",  "type": "struct \"OVERLAPPED\" { u64, u64, u32, u32, ptr<void> }" },
+    { "name": "LPOVERLAPPED", "type": "ptr<void>" },
+    { "name": "SYSTEM_INFO", "type": "struct \"SYSTEM_INFO\" { u32, u32, ptr<void>, ptr<void>, u64, u32, u32, u32, u16, u16 }" },
+    { "name": "LPSYSTEM_INFO", "type": "ptr<void>" },
+    { "name": "WIN32_FILE_ATTRIBUTE_DATA", "type": "struct \"WIN32_FILE_ATTRIBUTE_DATA\" { u32, struct \"FILETIME\" { u32, u32 }, struct \"FILETIME\" { u32, u32 }, struct \"FILETIME\" { u32, u32 }, u32, u32 }" }
+  ],
+  "structs": [
+    {
+      "name": "FILETIME",
+      "fields": [
+        { "name": "dwLowDateTime",  "type": "u32" },
+        { "name": "dwHighDateTime", "type": "u32" }
+      ]
+    },
+    {
+      "name": "LARGE_INTEGER",
+      "fields": [
+        { "name": "QuadPart", "type": "i64" }
+      ]
+    },
+    {
+      "name": "OVERLAPPED",
+      "fields": [
+        { "name": "Internal",     "type": "u64" },
+        { "name": "InternalHigh", "type": "u64" },
+        { "name": "Offset",       "type": "u32" },
+        { "name": "OffsetHigh",   "type": "u32" },
+        { "name": "hEvent",       "type": "ptr<void>" }
+      ]
+    },
+    {
+      "name": "SYSTEM_INFO",
+      "fields": [
+        { "name": "dwOemId",                     "type": "u32" },
+        { "name": "dwPageSize",                  "type": "u32" },
+        { "name": "lpMinimumApplicationAddress", "type": "ptr<void>" },
+        { "name": "lpMaximumApplicationAddress", "type": "ptr<void>" },
+        { "name": "dwActiveProcessorMask",       "type": "u64" },
+        { "name": "dwNumberOfProcessors",        "type": "u32" },
+        { "name": "dwProcessorType",             "type": "u32" },
+        { "name": "dwAllocationGranularity",     "type": "u32" },
+        { "name": "wProcessorLevel",             "type": "u16" },
+        { "name": "wProcessorRevision",          "type": "u16" }
+      ]
+    },
+    {
+      "name": "WIN32_FILE_ATTRIBUTE_DATA",
+      "fields": [
+        { "name": "dwFileAttributes", "type": "u32" },
+        { "name": "ftCreationTime",   "type": "struct \"FILETIME\" { u32, u32 }" },
+        { "name": "ftLastAccessTime", "type": "struct \"FILETIME\" { u32, u32 }" },
+        { "name": "ftLastWriteTime",  "type": "struct \"FILETIME\" { u32, u32 }" },
+        { "name": "nFileSizeHigh",    "type": "u32" },
+        { "name": "nFileSizeLow",     "type": "u32" }
+      ]
+    }
+  ],
+  "macros": [
+    { "name": "INVALID_HANDLE_VALUE", "replacement": "((HANDLE)-1)" }
+  ],
+  "constants": [
+    { "name": "TRUE",                           "value": 1,          "type": "i32" },
+    { "name": "FALSE",                          "value": 0,          "type": "i32" },
+    { "name": "MAX_PATH",                       "value": 260,        "type": "i32" },
+    { "name": "INVALID_FILE_ATTRIBUTES",        "value": 4294967295, "type": "u32" },
+    { "name": "INVALID_SET_FILE_POINTER",       "value": 4294967295, "type": "u32" },
+    { "name": "GENERIC_READ",                   "value": 2147483648, "type": "u32" },
+    { "name": "GENERIC_WRITE",                  "value": 1073741824, "type": "u32" },
+    { "name": "FILE_SHARE_READ",                "value": 1,          "type": "u32" },
+    { "name": "FILE_SHARE_WRITE",               "value": 2,          "type": "u32" },
+    { "name": "FILE_SHARE_DELETE",              "value": 4,          "type": "u32" },
+    { "name": "CREATE_NEW",                     "value": 1,          "type": "u32" },
+    { "name": "CREATE_ALWAYS",                  "value": 2,          "type": "u32" },
+    { "name": "OPEN_EXISTING",                  "value": 3,          "type": "u32" },
+    { "name": "OPEN_ALWAYS",                    "value": 4,          "type": "u32" },
+    { "name": "TRUNCATE_EXISTING",              "value": 5,          "type": "u32" },
+    { "name": "FILE_ATTRIBUTE_READONLY",        "value": 1,          "type": "u32" },
+    { "name": "FILE_ATTRIBUTE_HIDDEN",          "value": 2,          "type": "u32" },
+    { "name": "FILE_ATTRIBUTE_DIRECTORY",       "value": 16,         "type": "u32" },
+    { "name": "FILE_ATTRIBUTE_NORMAL",          "value": 128,        "type": "u32" },
+    { "name": "FILE_ATTRIBUTE_TEMPORARY",       "value": 256,        "type": "u32" },
+    { "name": "FILE_FLAG_DELETE_ON_CLOSE",      "value": 67108864,   "type": "u32" },
+    { "name": "FILE_FLAG_RANDOM_ACCESS",        "value": 268435456,  "type": "u32" },
+    { "name": "FILE_FLAG_OVERLAPPED",           "value": 1073741824, "type": "u32" },
+    { "name": "FILE_BEGIN",                     "value": 0,          "type": "u32" },
+    { "name": "FILE_CURRENT",                   "value": 1,          "type": "u32" },
+    { "name": "FILE_END",                       "value": 2,          "type": "u32" },
+    { "name": "FILE_MAP_WRITE",                 "value": 2,          "type": "u32" },
+    { "name": "FILE_MAP_READ",                  "value": 4,          "type": "u32" },
+    { "name": "PAGE_READONLY",                  "value": 2,          "type": "u32" },
+    { "name": "PAGE_READWRITE",                 "value": 4,          "type": "u32" },
+    { "name": "PAGE_WRITECOPY",                 "value": 8,          "type": "u32" },
+    { "name": "SECTION_MAP_WRITE",              "value": 2,          "type": "u32" },
+    { "name": "SECTION_MAP_READ",               "value": 4,          "type": "u32" },
+    { "name": "LMEM_FIXED",                     "value": 0,          "type": "u32" },
+    { "name": "LMEM_ZEROINIT",                  "value": 64,         "type": "u32" },
+    { "name": "HEAP_ZERO_MEMORY",               "value": 8,          "type": "u32" },
+    { "name": "HEAP_GENERATE_EXCEPTIONS",       "value": 4,          "type": "u32" },
+    { "name": "LOCKFILE_FAIL_IMMEDIATELY",      "value": 1,          "type": "u32" },
+    { "name": "LOCKFILE_EXCLUSIVE_LOCK",        "value": 2,          "type": "u32" },
+    { "name": "FORMAT_MESSAGE_ALLOCATE_BUFFER", "value": 256,        "type": "u32" },
+    { "name": "FORMAT_MESSAGE_IGNORE_INSERTS",  "value": 512,        "type": "u32" },
+    { "name": "FORMAT_MESSAGE_FROM_SYSTEM",     "value": 4096,       "type": "u32" },
+    { "name": "GetFileExInfoStandard",          "value": 0,          "type": "i32" },
+    { "name": "WAIT_OBJECT_0",                  "value": 0,          "type": "u32" },
+    { "name": "WAIT_TIMEOUT",                   "value": 258,        "type": "u32" },
+    { "name": "WAIT_FAILED",                    "value": 4294967295, "type": "u32" },
+    { "name": "INFINITE",                       "value": 4294967295, "type": "u32" },
+    { "name": "ERROR_FILE_NOT_FOUND",           "value": 2,          "type": "u32" },
+    { "name": "ERROR_ACCESS_DENIED",            "value": 5,          "type": "u32" },
+    { "name": "ERROR_NOT_ENOUGH_MEMORY",        "value": 8,          "type": "u32" },
+    { "name": "ERROR_NO_MORE_FILES",            "value": 18,         "type": "u32" },
+    { "name": "ERROR_HANDLE_DISK_FULL",         "value": 39,         "type": "u32" },
+    { "name": "ERROR_NOT_SUPPORTED",            "value": 50,         "type": "u32" },
+    { "name": "ERROR_LOCK_VIOLATION",           "value": 33,         "type": "u32" },
+    { "name": "ERROR_SHARING_VIOLATION",        "value": 32,         "type": "u32" },
+    { "name": "ERROR_RETRY",                    "value": 1237,       "type": "u32" }
+  ]
+}
