@@ -667,6 +667,40 @@ struct Lowerer {
                     return it->second;
                 }
                 if (globalSymbols.contains(sym)) {
+                    // c91 (D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY): the GLOBAL
+                    // twin of the c63 addressable-local arm above — an ARRAY
+                    // rvalue decays to the ADDRESS of its first element
+                    // (C 6.3.2.1p3); an aggregate can never live in a
+                    // register, so a bare Ref to an array-typed GLOBAL must
+                    // NEVER `Load`. Pre-c91 this arm loaded the array's first
+                    // bytes as the "value" — `gp != g0` compared g0's CONTENT
+                    // against gp (always-unequal for a live pointer; EQUAL to
+                    // a null pointer for a zero-filled global — both silent
+                    // wrong-branch miscompiles; the c90r4 global witness).
+                    // Nearly every array rvalue reaches MIR pre-decayed (the
+                    // HIR coerce Cast<Array→Ptr> funnel — comparisons,
+                    // conditions and `!` joined it in c91), but a NO-CAST
+                    // same-type context (a file-scope `va_list` forwarded to
+                    // a `va_list` param — the c63 shape at global scope)
+                    // still lands a bare Array-typed Ref here, and this arm
+                    // keeps any FUTURE consumer gap a correct decay instead
+                    // of a silent content-compare. Same emission as c63: a
+                    // byte-offset-0 `Gep` re-typing the base address to
+                    // `Ptr<elem>` = `&arr[0]`.
+                    if (t.valid() && interner.kind(t) == TypeKind::Array) {
+                        auto const elems = interner.operands(t);
+                        if (elems.empty() || !elems[0].valid()) {
+                            unsupported(node,
+                                "array-typed global Ref has no element type "
+                                "(interner invariant violated)");
+                            return InvalidMirInst;
+                        }
+                        MirInstId const base = mir.addGlobalAddr(
+                            SymbolId{sym}, interner.pointer(t));
+                        std::array<MirInstId, 2> gep{base, constInt(0)};
+                        return mir.addInst(MirOpcode::Gep, gep,
+                                           interner.pointer(elems[0]));
+                    }
                     // Globals: GlobalAddr's result type is pointer(t); a
                     // following Load reads the value. The HIR Ref's typeId
                     // is the global's declared type, not pointer(type).
@@ -957,6 +991,35 @@ struct Lowerer {
                 // address via the shared lvalue path, then emit `Load`.
                 MirInstId const ptr = lowerLvalueAddress(node);
                 if (!ptr.valid()) return InvalidMirInst;
+                // c91 (D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY): an
+                // ARRAY-typed member/element rvalue (`p->yystk0`,
+                // `s.in.arr`, an `a2d[i]` row) decays to its first
+                // element's ADDRESS (C 6.3.2.1p3) — NEVER a Load (the c63
+                // rule, applied uniformly: there is no aggregate-width
+                // register value). Pre-c91 this arm loaded the array's
+                // first bytes as the "value": sqlite sqlite3ParserFinalize
+                // `pParser->yystack != pParser->yystk0` compared yystack
+                // against yystk0's CONTENT → always unequal → YYFREE'd the
+                // on-stack parser → glibc `free(): invalid pointer` SIGABRT
+                // on EVERY SQL statement (the c91 wall). The HIR decay
+                // funnel (coerce Cast<Array→Ptr>) covers every KNOWN
+                // consumer; this arm keeps a no-Cast same-type context (a
+                // struct-member `va_list` forwarded to a `va_list` param)
+                // and any FUTURE consumer gap a correct decay instead of a
+                // silent content-compare. A bit-field is never array-typed,
+                // so this precedes the bit-field unit-load untouched.
+                if (t.valid() && interner.kind(t) == TypeKind::Array) {
+                    auto const elems = interner.operands(t);
+                    if (elems.empty() || !elems[0].valid()) {
+                        unsupported(node,
+                            "array-typed member/index rvalue has no element "
+                            "type (interner invariant violated)");
+                        return InvalidMirInst;
+                    }
+                    std::array<MirInstId, 2> gep{ptr, constInt(0)};
+                    return mir.addInst(MirOpcode::Gep, gep,
+                                       interner.pointer(elems[0]));
+                }
                 // FC8 D-CSUBSET-BITFIELD: a bit-field read loads the whole
                 // allocation unit (the Gep already targets the unit), then
                 // extracts the field's bits (shift + mask / sign-extend).
@@ -1289,8 +1352,30 @@ struct Lowerer {
     // symbol-level c21 flag on the deref node (a deref node itself is never a
     // c21-flagged Ref, but ORing keeps the funnel uniform).
     [[nodiscard]] MirInstId combineDeref(HirNodeId node, MirInstId ptr) {
-        std::array<MirInstId, 1> ops{ptr};
         TypeId const pointeeTy = hir.typeId(node);
+        // c91 (D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY): `*p` where the
+        // pointee is an ARRAY (`p : Ptr<Array<T,N>>`) — the deref VALUE is
+        // an array rvalue, which decays to the address of its first element
+        // (C 6.3.2.1p3): `*p` ≡ `&(*p)[0]` (numerically p itself, re-typed
+        // `Ptr<elem>`). NEVER a Load — the same c63 rule as the Ref /
+        // member / index rvalue arms (there is no aggregate-width register
+        // value; the pre-c91 Load read the array's first bytes as the
+        // "value"). Volatility is a property of the (non-)ACCESS: the decay
+        // performs no memory access, so no volatile flag applies.
+        if (pointeeTy.valid()
+            && interner.kind(pointeeTy) == TypeKind::Array) {
+            auto const elems = interner.operands(pointeeTy);
+            if (elems.empty() || !elems[0].valid()) {
+                unsupported(node,
+                    "array-typed Deref rvalue has no element type "
+                    "(interner invariant violated)");
+                return InvalidMirInst;
+            }
+            std::array<MirInstId, 2> gep{ptr, constInt(0)};
+            return mir.addInst(MirOpcode::Gep, gep,
+                               interner.pointer(elems[0]));
+        }
+        std::array<MirInstId, 1> ops{ptr};
         MirInstFlags const vf =
             volatileFlagFor(node) | volatileFlagForType(pointeeTy);
         return mir.addInst(MirOpcode::Load, ops, pointeeTy, /*payload=*/0, vf);

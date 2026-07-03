@@ -689,6 +689,29 @@ struct Lowerer {
                           anchor),
                     boolType()};
         }
+        // c91 (D-CSUBSET-ARRAY-DECAY-IN-CONDITION): an ARRAY condition
+        // (`if (arr)`, `ok && arr`, `arr ? a : b`, `if ("x")` —
+        // C 6.3.2.1p3 + 6.8.4.1p1) decays to Ptr<elem> via the ONE coerce
+        // decay funnel, then RE-ENTERS this function so the decayed pointer
+        // takes the EXISTING null-pointer `Ne` arm below — an object's
+        // address is never null, matching C's always-true truth value
+        // (gcc -Waddress warns; the code is legal and compiles). Without
+        // this the Array cond either reached the CondBr terminator raw
+        // (I_TerminatorTypeMismatch — the `if ("x")` c79 sibling) or
+        // VALUE-loaded the array's first bytes as the truth value (a
+        // member/global array in `&&`/`||` — silently FALSE whenever the
+        // content bytes are zero: `ok && g` on a zero-filled global). A
+        // shapeless Array (no element operand — malformed) falls through
+        // unchanged: stays loud downstream.
+        if (ck == TypeKind::Array) {
+            auto const elems = interner.operands(cond.type);
+            if (!elems.empty()) {
+                E const decayed = coerce(cond, interner.pointer(elems[0]));
+                if (decayed.type.valid()
+                    && interner.kind(decayed.type) == TypeKind::Ptr)
+                    return coerceCondition(decayed, anchor);
+            }
+        }
         if (ck == TypeKind::Ptr
             && sem.pointerConversions.nullPointerConstantFromIntegerZero) {
             // Null-pointer constant: Cast(Literal 0 : I32 → cond's Ptr
@@ -2533,6 +2556,45 @@ struct Lowerer {
             lc = coerce(lhs, common);
             rc = coerce(rhs, common);
         }
+        // c91 (D-CSUBSET-ARRAY-DECAY-IN-COMPARISON, closing the
+        // D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY comparison surface):
+        // C 6.3.2.1p3 — an ARRAY operand of an equality/relational operator
+        // decays to Ptr<elem> (the address of its first element) FIRST.
+        // Comparisons never enter the c59 additive / c65 pointer-diff decay
+        // arms, so an un-decayed Array operand kept TypeKind::Array and was
+        // VALUE-lowered: a member/global array operand emitted an aggregate
+        // Load — the compare read the array's first BYTES as a "pointer"
+        // (sqlite sqlite3ParserFinalize `pParser->yystack !=
+        // pParser->yystk0` always-unequal → freed the on-stack parser →
+        // the every-SQL-statement SIGABRT; a zero-filled global compared
+        // EQUAL to a null pointer) — and a string-literal operand
+        // (`z == "x"`) dead-ended in the LIR literal-pool `mov`
+        // (A_NoMatchingEncodingVariant). Reuse the ONE decay funnel every
+        // other consumer uses (coerce's Array→Ptr arm → mapCast →
+        // lowerLvalueAddress base address / rodata-string
+        // materialization). Decaying to pointer-to-OWN-elem keeps coerce's
+        // sameElem premise trivially true — BOTH operand orders, every
+        // lvalue shape (member / global / local / nested / via-deref), and
+        // `arr == arr2` (both decay). The OTHER operand's type is not
+        // consulted: `arr == 0` becomes the existing Ptr-vs-literal-0
+        // compare shape, and a mismatched-pointee `arr == otherTypePtr`
+        // becomes the same two-Ptr compare `p == q` already accepts
+        // (pre-existing latitude, not widened here). A shapeless Array
+        // (no element operand — malformed) falls through unchanged: loud.
+        if (isComparison(*op)) {
+            if (lc.type.valid()
+                && interner.kind(lc.type) == TypeKind::Array) {
+                auto const elems = interner.operands(lc.type);
+                if (!elems.empty())
+                    lc = coerce(lc, interner.pointer(elems[0]));
+            }
+            if (rc.type.valid()
+                && interner.kind(rc.type) == TypeKind::Array) {
+                auto const elems = interner.operands(rc.type);
+                if (!elems.empty())
+                    rc = coerce(rc, interner.pointer(elems[0]));
+            }
+        }
         // c40 (D-CSUBSET-POINTER-SUBTRACTION) C 6.5.6p9: `p - q` (BOTH operands
         // Ptr<T>, same pointee) yields ptrdiff_t (a SIGNED integer = the ELEMENT
         // count), NOT a pointer. Without this the fallback below types it
@@ -2842,13 +2904,36 @@ struct Lowerer {
         // stay at their own width). `Pos` (`+`) returned above.
         E unOperand = operand;
         TypeId promotedTy = operand.type;
+        // c91 (D-CSUBSET-ARRAY-DECAY-IN-CONDITION, the `!` form): `!E` is
+        // `(E == 0)` (C 6.5.3.3p5) — an ARRAY operand takes the SAME
+        // C 6.3.2.1p3 decay as a condition/comparison operand, through the
+        // ONE coerce funnel. The decayed pointer then flows the existing
+        // `!ptr` shape (an object's address is never null → constant
+        // false, gcc-matching). Without this a member/global array operand
+        // VALUE-loaded its first bytes (`!g` on a zero-filled global was
+        // TRUE — silently wrong). Neg/BitNot on an array stay un-decayed:
+        // C requires an arithmetic operand there (gcc rejects), so they
+        // keep failing loud downstream rather than silently negating an
+        // address. The sub-int promote below then reads the DECAYED
+        // operand (a no-op on the pointer — integerPromotedType only
+        // promotes arithmetic kinds); for every non-Array operand
+        // `unOperand`/`promotedTy` are byte-identical to the prior reads
+        // of `operand`.
+        if (*op == HirOpKind::Not && operand.type.valid()
+            && interner.kind(operand.type) == TypeKind::Array) {
+            auto const elems = interner.operands(operand.type);
+            if (!elems.empty()) {
+                unOperand  = coerce(operand, interner.pointer(elems[0]));
+                promotedTy = unOperand.type;
+            }
+        }
         if ((*op == HirOpKind::Not || *op == HirOpKind::BitNot
              || *op == HirOpKind::Neg)
-            && arith_.has_value() && operand.type.valid()
-            && interner.kind(operand.type) != TypeKind::Bool) {
-            TypeId const p = integerPromotedType(interner, operand.type, *arith_);
-            if (p.valid() && p.v != operand.type.v) {
-                unOperand  = coerce(operand, p);
+            && arith_.has_value() && unOperand.type.valid()
+            && interner.kind(unOperand.type) != TypeKind::Bool) {
+            TypeId const p = integerPromotedType(interner, unOperand.type, *arith_);
+            if (p.valid() && p.v != unOperand.type.v) {
+                unOperand  = coerce(unOperand, p);
                 promotedTy = p;
             }
         }

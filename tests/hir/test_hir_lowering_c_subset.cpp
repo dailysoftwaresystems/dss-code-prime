@@ -4068,3 +4068,120 @@ TEST(HirLoweringCSubset, PlainAssignAsValueStoresRhsCoercedToLvalueType) {
                "lvalue read (C 6.5.16p3)";
     }
 }
+
+// c91 (D-CSUBSET-ARRAY-DECAY-IN-COMPARISON + D-CSUBSET-ARRAY-DECAY-IN-
+// CONDITION, closing the D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY HIR surface):
+// an ARRAY operand of a comparison, a condition, or `!` decays to Ptr<elem>
+// (C 6.3.2.1p3) THROUGH THE ONE coerce funnel — the tier-boundary pin at the
+// exact nodes the property lives on. Pre-c91 the operand kept its Array type
+// and was VALUE-lowered at MIR: a member/global array operand emitted an
+// aggregate Load, so the compare read the array's first BYTES as a "pointer"
+// (sqlite sqlite3ParserFinalize `pParser->yystack != pParser->yystk0` →
+// always-unequal → freed the on-stack parser → the every-SQL-statement
+// SIGABRT), and an Array condition reached the CondBr raw
+// (I_TerminatorTypeMismatch). The corpus witness
+// (examples/c-subset/array_decay_pointer_identity) proves the VALUES
+// end-to-end on all run legs; THIS pin names the HIR tier, so a refactor
+// that drops any of the three decay arms fails HERE even while the MIR
+// value-read backstop (the c63-twin arms) keeps the end-to-end behavior
+// correct. RED-ON-DISABLE (each arm independently):
+//   - combineBinary comparison arm reverted → the Ne's rhs stays a raw
+//     Array-typed MemberAccess (the Cast asserts flip);
+//   - coerceCondition Array arm reverted → `if (g)` synthesizes no Ne
+//     (the two-Ne count flips);
+//   - combineUnaryOp `!` arm reverted → Not's operand stays a raw
+//     Array-typed Ref (the Cast asserts flip).
+TEST(HirLoweringCSubset, ArrayComparisonConditionOperandsDecayToPointer) {
+    SemanticModel model = analyzeCSubset(
+        "struct P { int *stack; int stk0[4]; };\n"
+        "int g[4];\n"
+        "int f(struct P *p) {\n"
+        "    int r = 0;\n"
+        "    if (p->stack != p->stk0) r = 1;\n"   // the sqlite ParserFinalize shape
+        "    if (g) r = r + 2;\n"                 // Array condition
+        "    if (!g) r = r + 4;\n"                // `!array`
+        "    return r;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+            : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    ASSERT_TRUE(fn.valid());
+    auto const& ti = model.lattice().interner();
+    // Collect the Ne BinaryOps and the Not UnaryOps, pre-order = source order.
+    std::vector<HirNodeId> nes;
+    std::vector<HirNodeId> nots;
+    auto const collect = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::BinaryOp
+            && isCoreOp(res->hir.payload(n))
+            && decodeCoreOp(res->hir.payload(n)) == HirOpKind::Ne)
+            nes.push_back(n);
+        if (res->hir.kind(n) == HirKind::UnaryOp
+            && isCoreOp(res->hir.payload(n))
+            && decodeCoreOp(res->hir.payload(n)) == HirOpKind::Not)
+            nots.push_back(n);
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    collect(collect, res->hir.functionBody(fn));
+    // [0] the source `!=`; [1] the Ne coerceCondition SYNTHESIZES for `if (g)`
+    // (the `!g` condition is already Bool — Not — so no third Ne).
+    ASSERT_EQ(nes.size(), 2u)
+        << "the member compare + the SYNTHESIZED `if (g)` truth test "
+           "(D-CSUBSET-ARRAY-DECAY-IN-CONDITION: a raw Array cond emits none)";
+    // THE c91 comparison property: the Array-typed member operand is wrapped
+    // in a decay Cast to Ptr<elem>; the raw MemberAccess keeps its Array type
+    // underneath.
+    auto const expectDecayCast = [&](HirNodeId operand, HirKind rawKind,
+                                     char const* what) {
+        ASSERT_EQ(res->hir.kind(operand), HirKind::Cast)
+            << what << ": the Array operand must be wrapped in the coerce "
+                       "decay Cast (C 6.3.2.1p3)";
+        TypeId const ct = res->hir.typeId(operand);
+        ASSERT_TRUE(ct.valid());
+        ASSERT_EQ(ti.kind(ct), TypeKind::Ptr)
+            << what << ": the decay Cast carries Ptr<elem>";
+        EXPECT_EQ(ti.kind(ti.operands(ct)[0]), TypeKind::I32)
+            << what << ": …whose pointee is the ELEMENT type (int)";
+        auto const kids = res->hir.children(operand);
+        ASSERT_EQ(kids.size(), 1u);
+        EXPECT_EQ(res->hir.kind(kids[0]), rawKind)
+            << what << ": …over the raw lvalue node";
+        TypeId const rt = res->hir.typeId(kids[0]);
+        ASSERT_TRUE(rt.valid());
+        EXPECT_EQ(ti.kind(rt), TypeKind::Array)
+            << what << ": …which keeps its Array type underneath";
+    };
+    {   // [0] `p->stack != p->stk0`: lhs is the Ptr member (no cast), rhs
+        // is the DECAYED Array member.
+        auto const kids = res->hir.children(nes[0]);
+        ASSERT_EQ(kids.size(), 2u);
+        TypeId const lt = res->hir.typeId(kids[0]);
+        ASSERT_TRUE(lt.valid());
+        EXPECT_EQ(ti.kind(lt), TypeKind::Ptr)
+            << "lhs (p->stack) is already a pointer — never wrapped";
+        expectDecayCast(kids[1], HirKind::MemberAccess,
+                        "comparison rhs (p->stk0)");
+    }
+    {   // [1] `if (g)`: coerceCondition decays the Array Ref then re-enters
+        // its own Ptr arm → Ne(decayCast(g), nullPtrCast), typed Bool.
+        TypeId const bt = res->hir.typeId(nes[1]);
+        ASSERT_TRUE(bt.valid());
+        EXPECT_EQ(ti.kind(bt), TypeKind::Bool)
+            << "the synthesized truth test is Bool-typed";
+        auto const kids = res->hir.children(nes[1]);
+        ASSERT_EQ(kids.size(), 2u);
+        expectDecayCast(kids[0], HirKind::Ref, "condition operand (g)");
+        EXPECT_EQ(res->hir.kind(kids[1]), HirKind::Cast)
+            << "…compared against the synthetic null-pointer Cast";
+    }
+    {   // `!g`: the Not's operand is the decayed Array Ref.
+        ASSERT_EQ(nots.size(), 1u);
+        auto const kids = res->hir.children(nots[0]);
+        ASSERT_EQ(kids.size(), 1u);
+        expectDecayCast(kids[0], HirKind::Ref, "`!` operand (g)");
+    }
+}

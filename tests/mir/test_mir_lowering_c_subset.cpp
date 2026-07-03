@@ -7644,3 +7644,68 @@ TEST(MirLoweringCSubset, C35OpaqueHandleViaPointerLowersClean) {
     ASSERT_TRUE(L.mir.ok)
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
 }
+
+// c91 (D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY): the MIR value-read BACKSTOP —
+// an ARRAY-typed rvalue read NEVER emits `Load`; it decays to the address of
+// its first element (`Gep(base, 0)` re-typed `Ptr<elem>`, C 6.3.2.1p3) at
+// EVERY lvalue shape: the c63 addressable-local arm's twins for a module
+// GLOBAL (the Ref arm), a struct MEMBER / an element (the MemberAccess/Index
+// rvalue arm), and a pointer DEREF (combineDeref). The HIR coerce funnel
+// decays every KNOWN consumer (comparisons/conditions/`!` joined it in c91),
+// so the shapes here are the NO-CAST same-type contexts that present a bare
+// Array-typed rvalue to MIR: a SysV `va_list` (`__va_list_tag[1]` — an ARRAY)
+// forwarded to a `va_list` param from a GLOBAL, a struct MEMBER, and a DEREF
+// — exactly the c63 case at the other storage classes. Pre-c91 each emitted
+// an aggregate `Load` that read the array's first bytes as the "argument"
+// (the same content-vs-address confusion that freed sqlite's on-stack parser
+// in sqlite3ParserFinalize). THE INVARIANT: no Load in the whole module has
+// an Array-typed result. RED-ON-DISABLE (each arm independently): reverting
+// the global-Ref / member-index / combineDeref decay arm re-emits the
+// Array-typed Load for its forward below and the invariant assert flips —
+// independent of the HIR arms (no comparison/condition here, so no Cast is
+// present to mask the backstop).
+TEST(MirLoweringCSubset, ArrayRvalueValueReadDecaysNeverLoads) {
+    auto L = lowerCSubset(
+        "void take(va_list ap) { }\n"
+        "struct S { int pad; va_list ap; };\n"
+        "va_list gv;\n"
+        "void f(struct S *s, va_list *pp) {\n"
+        "    take(gv);\n"      // GLOBAL va_list forward  → the Ref-global arm
+        "    take(s->ap);\n"   // MEMBER va_list forward  → the member/index arm
+        "    take(*pp);\n"     // DEREF va_list forward   → the combineDeref arm
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    // THE c91 INVARIANT: an Array-typed Load exists NOWHERE in the module.
+    std::size_t arrayLoads = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const fMir = m.funcAt(fi);
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fMir); ++b) {
+            MirBlockId const blk = m.funcBlockAt(fMir, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+                MirInstId const ix = m.blockInstAt(blk, i);
+                if (m.instOpcode(ix) != MirOpcode::Load) continue;
+                TypeId const t = m.instType(ix);
+                if (t.valid() && interner.kind(t) == TypeKind::Array)
+                    ++arrayLoads;
+            }
+        }
+    }
+    EXPECT_EQ(arrayLoads, 0u)
+        << "an ARRAY-typed rvalue read must DECAY (Gep to Ptr<elem>), never "
+           "Load — a Load-of-Array reads the array's first bytes as a scalar "
+           "value (D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY: the sqlite "
+           "ParserFinalize free-of-stack class)";
+    // Each of the three forwards decays via its arm's `Gep(base, 0)` — the
+    // caller f carries (at least) those three Geps and its three Calls.
+    std::uint32_t const fi = funcWithCall(m);
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Call), 3u);
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Gep), 3u)
+        << "each va_list forward decays through its value-read arm's Gep";
+}
