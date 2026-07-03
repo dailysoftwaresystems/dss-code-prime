@@ -3,6 +3,7 @@ add_library(core OBJECT
 
     # ── substrate/ — host/OS utilities (the first non-header-only one) ──
     substrate/large_stack_call.cpp
+    substrate/phase_timers.cpp
 
     # ── types/ — universal in-memory model ──
     types/source_span.cpp

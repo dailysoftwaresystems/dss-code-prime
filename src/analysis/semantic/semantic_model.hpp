@@ -3,6 +3,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/compilation_unit/unit_attribute.hpp"
 #include "core/export.hpp"
+#include "core/substrate/transparent_string_hash.hpp"  // c97: heterogeneous scope-binding lookup
 #include "core/types/data_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/semantic_config.hpp"
@@ -57,13 +58,16 @@ struct DSS_EXPORT ScopeRecord {
     NodeId   anchor{};   // tree node whose subtree opens this scope (or invalid for root)
     TreeId   tree{};
     // name -> SymbolId, for the ORDINARY namespace. Same-scope redeclaration
-    // is caught here.
-    std::unordered_map<std::string, SymbolId> bindings;
+    // is caught here. (c97: transparent hasher/equality — `ScopeTree::lookup`
+    // walks the parent chain with a `string_view` key, so the per-hop
+    // `std::string` materialization is gone; existing `std::string` callers
+    // are unaffected.)
+    substrate::TransparentStringMap<SymbolId> bindings;
     // C 6.2.3 tag namespace: name -> SymbolId for struct/union/enum TAGS,
     // SEPARATE from `bindings`. A tag and an ordinary symbol of the same name
     // (`typedef struct Pair {…} Pair;`) coexist — one lives here, one in
     // `bindings`. Empty for any scope that declares no tags.
-    std::unordered_map<std::string, SymbolId> tagBindings;
+    substrate::TransparentStringMap<SymbolId> tagBindings;
     std::vector<ScopeId> children;
 };
 

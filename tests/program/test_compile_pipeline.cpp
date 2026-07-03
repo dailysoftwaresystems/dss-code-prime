@@ -24,6 +24,7 @@
 // lands.
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
+#include "core/substrate/phase_timers.hpp"   // c97: per-phase --time pin
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
 #include "core/types/grammar_schema.hpp"
@@ -51,8 +52,10 @@
 #include <functional>
 #include <iterator>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -162,6 +165,61 @@ TEST(Program_CompileFiles, ZeroArgFunctionWiresThroughPipeline) {
     EXPECT_EQ(hdr[1], 'E');
     EXPECT_EQ(hdr[2], 'L');
     EXPECT_EQ(hdr[3], 'F');
+}
+
+// ── c97: per-phase --time accumulators ─────────────────────────
+//
+// Pin for the PhaseTimers substrate the `--time` report reads: after ONE
+// real end-to-end compile, (a) every CompilePhase has a distinct non-empty
+// pipeline-verb name (the report loop prints every ordinal, so name
+// coverage here pins the report's row set), (b) every phase the tiny-source
+// pipeline necessarily runs recorded at least one run, and (c) the
+// attributed total is a plausible nonzero. RED-on-disable: deleting any
+// instrumented Scope zeroes that phase's run count and the matching
+// EXPECT fails. (Phases a trivial source legitimately skips — tokenize
+// [c-subset preprocesses], reparse [no ambiguous cast], synthesize-ffi
+// [no externs] — are deliberately un-asserted.)
+TEST(Program_CompileFiles, PhaseTimersRecordEveryPipelinePhase) {
+    using dss::substrate::CompilePhase;
+    using dss::substrate::PhaseTimers;
+    using dss::substrate::compilePhaseName;
+    using dss::substrate::kCompilePhaseCount;
+
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "timed.c",
+        "int timed() { return 9; }\n");
+    scratch.useAsCwd();
+
+    PhaseTimers::reset();
+    Program prog;
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset", {"x86_64:elf64-x86_64-linux"});
+    ASSERT_EQ(rc, 0);
+
+    // (a) every phase name is a distinct, non-empty pipeline verb.
+    std::set<std::string_view> names;
+    for (std::size_t i = 0; i < kCompilePhaseCount; ++i) {
+        auto const name = compilePhaseName(static_cast<CompilePhase>(i));
+        EXPECT_FALSE(name.empty());
+        EXPECT_NE(name, "<invalid-phase>");
+        EXPECT_TRUE(names.insert(name).second)
+            << "duplicate phase name: " << name;
+    }
+
+    // (b) the phases this compile necessarily exercises each recorded a run.
+    for (CompilePhase p : {CompilePhase::Preprocess, CompilePhase::Parse,
+                           CompilePhase::ResolveImports, CompilePhase::Semantic,
+                           CompilePhase::LowerHir, CompilePhase::LowerMir,
+                           CompilePhase::Optimize, CompilePhase::LowerLir,
+                           CompilePhase::Regalloc, CompilePhase::Encode,
+                           CompilePhase::Link}) {
+        EXPECT_GE(PhaseTimers::read(p).runs, 1u)
+            << "phase '" << compilePhaseName(p) << "' recorded no run";
+    }
+
+    // (c) plausible nonzero attributed total.
+    EXPECT_GT(PhaseTimers::attributedNanoseconds(), 0u);
 }
 
 TEST(Program_CompileFiles, MultiTargetWiresDistinctArtifactDirs) {

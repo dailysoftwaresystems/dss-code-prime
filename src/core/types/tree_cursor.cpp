@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ranges>
+#include <span>
 #include <string_view>
 
 namespace dss {
@@ -56,6 +57,44 @@ SchemaTokenId TreeCursor::tokenKind() const {
 
 // ── movement ─────────────────────────────────────────────────────────────
 
+namespace {
+
+// c97 (compile-time-performance arc, MEASURED #1 hotspot): locate `self`
+// within its parent's children span in O(log K) instead of O(K).
+//
+// The builder attaches children strictly in arena-id creation order — every
+// attach path (token push, `open()`'s immediate emit, `wrapLastChildInFrame`
+// replacing the tail with a NEWER id, `finish()`'s synthetic Missing
+// appends) appends a fresh monotonic NodeId — so a parent's `children()`
+// span is ASCENDING by construction. The former linear self-search made one
+// full sibling walk O(K²): the sqlite amalgamation's ~10⁵-child root put
+// 291/294 profile samples inside this scan (15m19s of a 15m28s compile,
+// inside the import resolver's pre-order walk).
+//
+// Sortedness is an OPTIMIZATION assumption, never a correctness input: the
+// binary-search result is VERIFIED (`kids[pos] == self`) and any miss —
+// e.g. a future tree producer that splices out-of-order — falls back to the
+// legacy linear scan, byte-identical behavior. Returns kids.size() when
+// `self` is not among `kids` (the legacy "foundSelf never fired" outcome).
+[[nodiscard]] std::size_t siblingIndexOf(std::span<NodeId const> kids,
+                                         NodeId self) noexcept {
+    // Binary search on the ascending-by-construction id order.
+    std::size_t lo = 0, hi = kids.size();
+    while (lo < hi) {
+        const std::size_t mid = lo + (hi - lo) / 2;
+        if (kids[mid].v < self.v) lo = mid + 1;
+        else                      hi = mid;
+    }
+    if (lo < kids.size() && kids[lo] == self) return lo;
+    // Fallback: verify failed (unsorted producer) — legacy linear scan.
+    for (std::size_t i = 0; i < kids.size(); ++i) {
+        if (kids[i] == self) return i;
+    }
+    return kids.size();
+}
+
+} // namespace
+
 bool TreeCursor::gotoFirstChild() noexcept {
     if (!current_.valid()) return false;
     auto kids = tree_->children(current_);
@@ -87,15 +126,16 @@ bool TreeCursor::gotoNextSibling() noexcept {
     const NodeId parent = tree_->parent(current_);
     if (!parent.valid()) return false;
     auto kids = tree_->children(parent);
-    bool foundSelf = false;
-    for (NodeId k : kids) {
-        if (foundSelf) {
-            if (isVisible_(k)) {
-                current_ = k;
-                return true;
-            }
-        } else if (k == current_) {
-            foundSelf = true;
+    // c97: O(log K) self-location (verified binary search — see
+    // `siblingIndexOf`), then advance to the next VISIBLE sibling exactly
+    // as before. `self` absent from `kids` (corrupt parent link) keeps the
+    // legacy `return false`.
+    const std::size_t selfIdx = siblingIndexOf(kids, current_);
+    if (selfIdx >= kids.size()) return false;   // self not among kids — legacy outcome
+    for (std::size_t j = selfIdx + 1; j < kids.size(); ++j) {
+        if (isVisible_(kids[j])) {
+            current_ = kids[j];
+            return true;
         }
     }
     return false;
@@ -106,20 +146,16 @@ bool TreeCursor::gotoPrevSibling() noexcept {
     const NodeId parent = tree_->parent(current_);
     if (!parent.valid()) return false;
     auto kids = tree_->children(parent);
-    // One forward pass tracking the most-recent visible candidate; stop
-    // at self. The previous visible sibling is whatever candidate held
-    // when we hit self.
-    NodeId candidate = InvalidNode;
-    for (NodeId k : kids) {
-        if (k == current_) {
-            if (candidate.valid()) {
-                current_ = candidate;
-                return true;
-            }
-            return false;
-        }
-        if (isVisible_(k)) {
-            candidate = k;
+    // c97: O(log K) self-location (verified binary search), then scan
+    // BACKWARD for the nearest visible sibling — the same node the former
+    // forward candidate-tracking pass selected. `self` absent from `kids`
+    // returns kids.size() → the loop below never runs → legacy false.
+    const std::size_t selfIdx = siblingIndexOf(kids, current_);
+    if (selfIdx >= kids.size()) return false;   // self not among kids — legacy outcome
+    for (std::size_t j = selfIdx; j > 0; --j) {
+        if (isVisible_(kids[j - 1])) {
+            current_ = kids[j - 1];
+            return true;
         }
     }
     return false;

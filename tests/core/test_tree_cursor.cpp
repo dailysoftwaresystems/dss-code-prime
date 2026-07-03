@@ -249,6 +249,73 @@ TEST(TreeCursor, GotoSiblingFailsAtBoundary) {
     EXPECT_EQ(last.text(), ";");
 }
 
+// ── c97 sibling-search fallback (unsorted children) ─────────────────────
+// `siblingIndexOf` (tree_cursor.cpp) locates a node in its parent's children
+// span via a VERIFIED binary search — the span is ascending-by-construction
+// for every real builder path, so the search is O(log K). But the result is
+// verified (`kids[lo] == self`) and any miss falls back to a LINEAR scan, so
+// a hypothetical future producer that attaches children OUT of id-order stays
+// byte-identical. These pins exercise exactly that fallback: a parent whose
+// children span is NON-ascending must still navigate in LIST order. The binary
+// search mis-locates self on such a span, so ONLY the fallback yields correct
+// navigation — RED-on-disable (drop the fallback → the first gotoNextSibling
+// returns false / a wrong sibling).
+
+TEST(TreeCursor, SiblingSearchFallbackOnDescendingChildIds) {
+    RawTreeBuilder rb{"xyz"};
+    const auto rootRule = rb.internRule("root");
+    // Parent (id 1) lists its children in DESCENDING id order {4,3,2}.
+    rb.addNode(NodeKind::Internal, rootRule, SourceSpan::of(0, 3),
+               NodeFlags::None, /*parent=*/ InvalidNode,
+               /*children=*/ { NodeId{4}, NodeId{3}, NodeId{2} });
+    rb.addNode(NodeKind::Token, InvalidRule, SourceSpan::of(0, 1),
+               NodeFlags::None, /*parent=*/ NodeId{1});   // id 2, "x"
+    rb.addNode(NodeKind::Token, InvalidRule, SourceSpan::of(1, 2),
+               NodeFlags::None, /*parent=*/ NodeId{1});   // id 3, "y"
+    rb.addNode(NodeKind::Token, InvalidRule, SourceSpan::of(2, 3),
+               NodeFlags::None, /*parent=*/ NodeId{1});   // id 4, "z"
+    Tree t = std::move(rb).finish(/*root=*/ NodeId{1});
+
+    auto c = t.cursor();
+    ASSERT_TRUE(c.gotoFirstChild());          // list order → span[0] = id 4
+    EXPECT_EQ(c.current(), NodeId{4});
+    ASSERT_TRUE(c.gotoNextSibling());         // fallback finds id 4 at span[0]
+    EXPECT_EQ(c.current(), NodeId{3});
+    ASSERT_TRUE(c.gotoNextSibling());
+    EXPECT_EQ(c.current(), NodeId{2});
+    EXPECT_FALSE(c.gotoNextSibling());        // span[2] is last
+    ASSERT_TRUE(c.gotoPrevSibling());         // backward mirrors
+    EXPECT_EQ(c.current(), NodeId{3});
+    ASSERT_TRUE(c.gotoPrevSibling());
+    EXPECT_EQ(c.current(), NodeId{4});
+    EXPECT_FALSE(c.gotoPrevSibling());
+}
+
+TEST(TreeCursor, SiblingSearchFallbackOnScrambledChildIds) {
+    RawTreeBuilder rb{"xyz"};
+    const auto rootRule = rb.internRule("root");
+    // Parent (id 1) lists its children SCRAMBLED {3,2,4}.
+    rb.addNode(NodeKind::Internal, rootRule, SourceSpan::of(0, 3),
+               NodeFlags::None, /*parent=*/ InvalidNode,
+               /*children=*/ { NodeId{3}, NodeId{2}, NodeId{4} });
+    rb.addNode(NodeKind::Token, InvalidRule, SourceSpan::of(0, 1),
+               NodeFlags::None, /*parent=*/ NodeId{1});   // id 2
+    rb.addNode(NodeKind::Token, InvalidRule, SourceSpan::of(1, 2),
+               NodeFlags::None, /*parent=*/ NodeId{1});   // id 3
+    rb.addNode(NodeKind::Token, InvalidRule, SourceSpan::of(2, 3),
+               NodeFlags::None, /*parent=*/ NodeId{1});   // id 4
+    Tree t = std::move(rb).finish(/*root=*/ NodeId{1});
+
+    auto c = t.cursor();
+    ASSERT_TRUE(c.gotoFirstChild());          // span[0] = id 3
+    EXPECT_EQ(c.current(), NodeId{3});
+    ASSERT_TRUE(c.gotoNextSibling());         // fallback finds id 3 at span[0]
+    EXPECT_EQ(c.current(), NodeId{2});
+    ASSERT_TRUE(c.gotoNextSibling());
+    EXPECT_EQ(c.current(), NodeId{4});
+    EXPECT_FALSE(c.gotoNextSibling());
+}
+
 TEST(TreeCursor, AstGotoLastChildSkipsTrailingEmptySpace) {
     // Tree with EmptySpace as the LAST child — gotoLastChild in AST must
     // walk backward past it to the previous visible sibling.

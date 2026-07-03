@@ -216,6 +216,12 @@ struct DSS_EXPORT GrammarSchemaData {
     // validation. Indexed by RuleId.v. Position[0] in every rule's table is
     // the "invalid sentinel" so 0 is reserved as the invalid posId in
     // SchemaCursor.
+    //
+    // c97: this map is the LOADER's build-time container only. The
+    // GrammarSchema ctor DRAINS it into a dense `std::vector<CompiledRule>`
+    // indexed by RuleId.v (RuleIds are dense interner ids) so every
+    // per-token grammar query is an array index instead of a hash lookup —
+    // after construction this map is empty and never read.
     std::unordered_map<std::uint32_t, CompiledRule> compiledRules;
 
     // Operator precedence + associativity by (SchemaTokenId, arity).
@@ -542,10 +548,32 @@ public:
     // Consumed by the parser's AltChoice candidate enumeration so that
     // branch probe order is author-controlled (declared order), never
     // an accident of rule-interner id (= alphabetical name) order.
-    [[nodiscard]] std::vector<RuleId>
+    //
+    // c97: the enumeration is PRECOMPUTED at schema construction (the DFS
+    // depends only on static grammar data), so this is now a span read —
+    // O(1), no per-call DFS or allocation. The span is stable for the
+    // schema's lifetime.
+    [[nodiscard]] std::span<RuleId const>
     altRuleBranches(SchemaCursor cur) const noexcept;
 
     [[nodiscard]] std::span<SchemaTokenId const> expectedSet(SchemaCursor cur) const noexcept;
+
+    // c97 O(1) membership queries (bitset-backed; built once at schema
+    // construction from the same loader data the span accessors expose).
+    // Each is exactly equivalent to a linear find over the corresponding
+    // span — the parser's per-token gates call these instead.
+    //   * expectedSetContains(cur, tok)  ≡ find(expectedSet(cur), tok)
+    //   * firstSetContains(rule, tok)    ≡ find(firstSetOf(rule), tok)
+    //   * predictivePrefixExcludes(rule, i, tok) ≡ the predictive-prune
+    //     test at offset i: TRUE iff the offset is defined, carries a
+    //     non-empty admissible set, and `tok` is NOT in it (an empty /
+    //     undefined offset means "no constraint" → never excludes).
+    [[nodiscard]] bool expectedSetContains(SchemaCursor cur,
+                                           SchemaTokenId tok) const noexcept;
+    [[nodiscard]] bool firstSetContains(RuleId rule,
+                                        SchemaTokenId tok) const noexcept;
+    [[nodiscard]] bool predictivePrefixExcludes(RuleId rule, std::size_t offset,
+                                                SchemaTokenId tok) const noexcept;
 
     [[nodiscard]] SlotKind slotKind(SchemaCursor cur) const noexcept;
     [[nodiscard]] RuleId   slotRuleRef(SchemaCursor cur) const noexcept;
@@ -727,6 +755,22 @@ public:
     [[nodiscard]] bool canEndSource(SchemaCursor cur) const noexcept;
 
 private:
+    // c97: dense per-rule compiled-shape table, indexed by RuleId.v — the
+    // ctor's sealing pass drains the loader's `d_.compiledRules` map into
+    // this vector (RuleIds are dense interner ids: 1..N). An index with no
+    // loader entry (auto-interned Pratt wrapper rules; the 0 sentinel)
+    // holds a default CompiledRule, whose `entryPos == 0` / empty members
+    // reproduce the former map-miss behavior exactly. Every per-token
+    // grammar query indexes this table — no hash, no probe.
+    std::vector<detail::CompiledRule> compiledDense_;
+
+    // O(1) presence-tolerant row access: nullptr only for out-of-range ids
+    // (an in-range id with no compiled body returns the default row, whose
+    // empty fields answer every query the way the old map-miss did).
+    [[nodiscard]] detail::CompiledRule const* ruleRow(std::uint32_t v) const noexcept {
+        return v < compiledDense_.size() ? &compiledDense_[v] : nullptr;
+    }
+
     detail::GrammarSchemaData d_;
 };
 

@@ -5,6 +5,7 @@
 #include "analysis/preprocess/preprocessor.hpp"
 #include "analysis/syntactic/parser.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
+#include "core/substrate/phase_timers.hpp"   // c97: per-phase --time accumulation
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "tokenizer/tokenizer.hpp"
@@ -12,6 +13,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -232,8 +234,13 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         // FC15c: thread the system-header search path so `__has_include(<h>)`
         // resolves a system descriptor (`<stem>.json`) exactly as the post-parse
         // import resolver does for `#include <h>` (one shared mapping).
+        // c97: the preprocess phase covers the whole config-driven pass —
+        // splice + tokenize-of-the-synth-buffer + macro expansion.
+        std::optional<substrate::PhaseTimers::Scope> phase;
+        phase.emplace(substrate::CompilePhase::Preprocess);
         PreprocessResult pp = preprocess(src, schema, includeDirs_, systemDirs_,
                                          activeFormat_);
+        phase.reset();
         auto remap = pp.makeRemap();
         std::shared_ptr<SourceBuffer> synth = pp.synthBuffer;
         // The parser consumes a stream built from a COPY of the preprocessed
@@ -268,9 +275,11 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
             ppFatal
                 ? TokenStream::fromTokens({pp.tokens.back()})
                 : TokenStream::fromTokens(pp.tokens);
+        phase.emplace(substrate::CompilePhase::Parse);
         Parser p{synth, schema, std::move(stream), parserConfigFor(*schema),
                  std::move(pp.diagnostics)};
         ParseResult result = std::move(p).parse();
+        phase.reset();
         // Remap the produced tree's diagnostics off the synth buffer onto the
         // origin file(s) before ingest, so a header-origin (and post-splice
         // main-origin) diagnostic is attributed to its real file.
@@ -292,11 +301,15 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         sidecar.ppRemap         = std::move(remap);
         return trees_.back().id();
     }
+    std::optional<substrate::PhaseTimers::Scope> phase;
+    phase.emplace(substrate::CompilePhase::Tokenize);
     Tokenizer tk{src, schema};
     auto [stream, lexDiags] = std::move(tk).tokenize();
+    phase.emplace(substrate::CompilePhase::Parse);
     Parser p{src, schema, std::move(stream), parserConfigFor(*schema),
              std::move(lexDiags)};
     ParseResult result = std::move(p).parse();
+    phase.reset();
     addTree(std::move(result.tree));
     // FC2: fill the sidecar addTree just pushed — the parse's ambiguous
     // type-name candidates + exported global type names (the finish()-time
@@ -502,9 +515,18 @@ CompilationUnit UnitBuilder::finish() && {
     // was parsed with (auto-registered in parseAndAdd_), so every tree gets its
     // own language's import resolution.
     std::unordered_set<std::uint32_t> resolvedSchemaIds;
-    for (auto const& schema : schemas_) {
-        if (!resolvedSchemaIds.insert(schema->schemaId().v).second) continue;
-        chooseResolver(schema)->resolve(context);
+    {
+        // c97: resolve-imports phase — NB the loadFile callback may PARSE
+        // additional included files; those nested parses accumulate into the
+        // parse/preprocess phases (parseAndAdd_ scopes), and steady-clock
+        // wall time double-counts across nested scopes by design (each
+        // phase's number answers "how long did this phase's code run").
+        substrate::PhaseTimers::Scope resolvePhase{
+            substrate::CompilePhase::ResolveImports};
+        for (auto const& schema : schemas_) {
+            if (!resolvedSchemaIds.insert(schema->schemaId().v).second) continue;
+            chooseResolver(schema)->resolve(context);
+        }
     }
 
     // ── FC2 type-name oracle + conditional reparse ────────────────────────
@@ -597,6 +619,11 @@ CompilationUnit UnitBuilder::finish() && {
                 // retained preprocessed tokens, reparse with the type-name
                 // seed, and re-apply the line-map remap so the reparsed tree's
                 // diagnostics still attribute to the origin header/main file.
+                // c97: the oracle reparse accumulates into its OWN phase
+                // (Reparse, not Parse) so the ~2x front-end multiplier is
+                // visible in the --time breakdown.
+                substrate::PhaseTimers::Scope reparsePhase{
+                    substrate::CompilePhase::Reparse};
                 ParseResult result = [&] {
                     if (!sc.ppTokens.empty()) {
                         TokenStream stream =
@@ -646,6 +673,10 @@ CompilationUnit UnitBuilder::finish() && {
                     scratchDescriptors,
                 };
                 resolvedSchemaIds.clear();
+                // c97: the post-reparse re-resolve accumulates into the same
+                // resolve-imports phase (its `runs` count shows the 2nd pass).
+                substrate::PhaseTimers::Scope reresolvePhase{
+                    substrate::CompilePhase::ResolveImports};
                 for (auto const& schema : schemas_) {
                     if (!resolvedSchemaIds.insert(schema->schemaId().v).second) {
                         continue;

@@ -292,6 +292,16 @@ struct Parser::Impl {
     // (`exprWorkStackSizeBefore_`), exactly as it pops `frames`.
     std::vector<ExprFrame> exprWorkStack;
 
+    // c97: per-speculation-depth scratch buffers for `candidateBranches`
+    // — reused across tokens so the speculative hot path performs zero
+    // heap allocations after warmup. Sized ONCE in the ctor
+    // (maxSpeculationDepth + 2: the over-cap guard in
+    // `trySpeculativeBranch` bounds live depths at the cap, +1 for depth
+    // 0, +1 belt-and-braces) so the OUTER vector never reallocates —
+    // a span over slot D stays valid while nested probes fill slot D+1.
+    // See the lifetime contract on `candidateBranches`.
+    std::vector<std::vector<RuleId>> candidateScratch_;
+
     // Operator-precedence walker, looked up once per `expr`-rule
     // dispatch. Owned by Impl — either moved out of
     // `ParserConfig::prattWalker` (caller-provided override) or
@@ -325,6 +335,7 @@ struct Parser::Impl {
         , bodyDefaultTokenKinds(&schema->bodyDefaultTokenKinds())
         , walker(schema)
         , sketch(*schema)
+        , candidateScratch_(config.maxSpeculationDepth + 2)
         , prattWalker(std::move(cfg.prattWalker)) {}
 
     // Default Pratt walker has friend access to drive the parser's
@@ -1020,15 +1031,33 @@ struct Parser::Impl {
     //           target and surface an opaque P_BacktrackFailed instead
     //           (pinned by ParserSpeculation.BacktrackFailedAndRecoveryOn-
     //           BogusInput).
-    [[nodiscard]] std::vector<RuleId>
+    //
+    // c97 (allocation-free hot path): returns a SPAN over a per-depth
+    // SCRATCH buffer (`candidateScratch_[speculationDepth]`) instead of a
+    // fresh vector — the enumeration source (`altRuleBranches`) is itself a
+    // precomputed schema span now, so a speculative token costs ZERO heap
+    // allocations here after warmup. Scratch-lifetime contract: the span is
+    // valid until the NEXT candidateBranches call at the SAME speculation
+    // depth. Both call sites honor it — the pruned set's last use (the
+    // probe loop) precedes the structural set's computation, and a nested
+    // probe's calls run at depth+1 (its SpeculationProbe increments
+    // `speculationDepth` first), hitting a different slot. The pool is
+    // sized ONCE (maxSpeculationDepth + 2 — the over-cap guard in
+    // trySpeculativeBranch bounds live depths) so inner buffers never move
+    // while an outer span is live.
+    [[nodiscard]] std::span<RuleId const>
     candidateBranches(SchemaTokenId tokKind, std::size_t lookahead,
-                      bool applyPrune) const {
-        std::vector<RuleId> out;
+                      bool applyPrune) {
+        auto& out = candidateScratch_[
+            speculationDepth < candidateScratch_.size()
+                ? speculationDepth
+                : candidateScratch_.size() - 1];
+        out.clear();
         for (RuleId const candidate
              : schema->altRuleBranches(walker.cursor())) {
-            const auto firstSet = schema->firstSetOf(candidate);
-            if (firstSet.empty()) continue;
-            if (std::ranges::find(firstSet, tokKind) == firstSet.end()) continue;
+            // O(1) FIRST gate (bitset) — an empty FIRST contains nothing,
+            // so the former `.empty()` skip folds into the same test.
+            if (!schema->firstSetContains(candidate, tokKind)) continue;
             if (applyPrune && predictivePrefixPrunes(candidate, lookahead))
                 continue;
             const auto routed =
@@ -1076,8 +1105,6 @@ struct Parser::Impl {
         if (prefixLen < 2 || k < 2) return false;  // nothing beyond FIRST
         const std::size_t bound = std::min(prefixLen, k);
         for (std::size_t i = 1; i < bound; ++i) {
-            const auto admissible = schema->predictivePrefixAt(candidate, i);
-            if (admissible.empty()) continue;  // no constraint at this offset
             const SchemaTokenId got = peekSignificantKind(i);
             // D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD: a CONTEXTUAL observed
             // kind (a soft keyword) may DEMOTE to Identifier in the builder, so
@@ -1087,7 +1114,10 @@ struct Parser::Impl {
             // empty contextualKinds for non-contextual grammars ⇒ deep-nest O(N)
             // win preserved.
             if (schema->isContextualKind(got)) continue;
-            if (std::ranges::find(admissible, got) == admissible.end()) {
+            // c97: one O(1) bitset call replaces the span fetch + linear
+            // find; `predictivePrefixExcludes` bakes in the "empty /
+            // undefined offset = no constraint" semantics.
+            if (schema->predictivePrefixExcludes(candidate, i, got)) {
                 return true;  // observed token outside the exact set ⇒ prune
             }
         }
@@ -1668,11 +1698,12 @@ struct Parser::Impl {
                 return StepOutcome::Continue;
             }
 
-            const auto expected = walker.expectedSet();
+            // c97: O(1) bitset membership on the cursor's expectedSet — the
+            // span is only materialized on the failure path (diagnostics).
             const SchemaTokenId tokKind =
                 effectiveKind(peek, identifierKind, errorKind);
-            bool matches = !expected.empty()
-                && std::ranges::find(expected, tokKind) != expected.end();
+            bool matches =
+                schema->expectedSetContains(walker.cursor(), tokKind);
 
             // D-PARSE-PREDICTIVE-PRUNE-CONTEXTUAL-KEYWORD (probe-demotion
             // half): a CONTEXTUAL keyword whose own kind is not admissible
@@ -1693,8 +1724,8 @@ struct Parser::Impl {
             // false ⇒ this arm never fires ⇒ zero behavior change.
             SchemaTokenId advanceKind = tokKind;
             if (!matches && schema->isContextualKind(tokKind)
-                && std::ranges::find(expected, identifierKind)
-                       != expected.end()) {
+                && schema->expectedSetContains(walker.cursor(),
+                                               identifierKind)) {
                 matches     = true;
                 advanceKind = identifierKind;
             }
@@ -1712,7 +1743,7 @@ struct Parser::Impl {
             }
 
             return recoverAt(DiagnosticCode::P_UnexpectedToken,
-                             peek, expected);
+                             peek, walker.expectedSet());
         }
 
         case SlotKind::RuleLeaf: {
@@ -1724,9 +1755,10 @@ struct Parser::Impl {
             const RuleId        nextRule = walker.slotRuleRef();
             const SchemaTokenId tokKind  =
                 effectiveKind(peek, identifierKind, errorKind);
-            const auto firstSet = schema->firstSetOf(nextRule);
-            const bool tokInFirst = !firstSet.empty()
-                && std::ranges::find(firstSet, tokKind) != firstSet.end();
+            // c97: O(1) bitset membership (an empty FIRST contains nothing,
+            // matching the former `.empty()` short-circuit); the span is
+            // only materialized on the failure paths (diagnostics).
+            const bool tokInFirst = schema->firstSetContains(nextRule, tokKind);
 
             if (tokInFirst) {
                 // `expr`-shape rules hand off to the Pratt walker
@@ -1772,12 +1804,13 @@ struct Parser::Impl {
             // token the enclosing grammar needs (the `int x = ;` scope-
             // imbalance fix). Non-stop-point garbage keeps the panic path.
             if (speculationDepth == 0 && isStopPoint(tokKind)) {
-                synthesizeMissingRule(nextRule, peek, firstSet,
+                synthesizeMissingRule(nextRule, peek,
+                                      schema->firstSetOf(nextRule),
                                       /*emitDiagnostic=*/!prevStepRecovered);
                 return StepOutcome::Continue;
             }
             return recoverAt(DiagnosticCode::P_NoAlternativeMatched,
-                             peek, firstSet);
+                             peek, schema->firstSetOf(nextRule));
         }
 
         case SlotKind::AltChoice: {
@@ -1788,9 +1821,10 @@ struct Parser::Impl {
 
             const SchemaTokenId tokKind =
                 effectiveKind(peek, identifierKind, errorKind);
-            const auto expected = walker.expectedSet();
-            const bool inUnion = !expected.empty()
-                && std::ranges::find(expected, tokKind) != expected.end();
+            // c97: O(1) bitset membership on the alt's expected union — the
+            // span is only materialized on failure paths (diagnostics).
+            const bool inUnion =
+                schema->expectedSetContains(walker.cursor(), tokKind);
 
             if (walker.isSpeculativeAlt()) {
                 if (!inUnion) {
@@ -1806,7 +1840,7 @@ struct Parser::Impl {
                         return StepOutcome::Continue;
                     }
                     return recoverAt(DiagnosticCode::P_BacktrackFailed,
-                                     peek, expected);
+                                     peek, walker.expectedSet());
                 }
 
                 // Token-leaf branch route (mirror of the non-speculative
@@ -1940,7 +1974,7 @@ struct Parser::Impl {
                 }
 
                 return recoverAt(DiagnosticCode::P_BacktrackFailed,
-                                 peek, expected);
+                                 peek, walker.expectedSet());
             }
 
             // Non-speculative AltChoice.
@@ -1963,7 +1997,7 @@ struct Parser::Impl {
                 }
 
                 return recoverAt(DiagnosticCode::P_NoAlternativeMatched,
-                                 peek, expected);
+                                 peek, walker.expectedSet());
             }
 
             // Try TokenLeaf-branch route first via the schema's
@@ -1990,9 +2024,9 @@ struct Parser::Impl {
             // uniform with the speculative path regardless.
             for (RuleId const candidate
                  : schema->altRuleBranches(walker.cursor())) {
-                const auto firstSet = schema->firstSetOf(candidate);
-                if (firstSet.empty()) continue;
-                if (std::ranges::find(firstSet, tokKind) == firstSet.end()) continue;
+                // c97: O(1) FIRST gate (empty FIRST contains nothing, so
+                // the former .empty() skip folds into the same test).
+                if (!schema->firstSetContains(candidate, tokKind)) continue;
                 const auto routed = schema->routeToRuleLeaf(
                     walker.cursor(), candidate);
                 if (!routed.valid()) continue;
@@ -2022,7 +2056,7 @@ struct Parser::Impl {
             // fail-safe surfacing the invariant violation, not a
             // recovery path.
             return recoverAt(DiagnosticCode::P_NoAlternativeMatched,
-                             peek, expected);
+                             peek, walker.expectedSet());
         }
 
         }   // switch slotKind

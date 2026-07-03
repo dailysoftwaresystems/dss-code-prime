@@ -2,6 +2,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: build CUs on a large stack
+#include "core/substrate/phase_timers.hpp"      // c97: --time per-phase breakdown
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/object_format_kind.hpp"
@@ -602,14 +603,46 @@ int Program::run(int argc, char* argv[]) {
     // A zero-arg run never reaches here with time==true (parseCliArgs rejects
     // options without a mode → NoModeSelected), so the destructor only emits a
     // line for a real compile. Universal driver concern — lang/target/format-neutral.
+    //
+    // c97 (compile-time-performance arc): below the total, a per-phase
+    // breakdown from the always-on `substrate::PhaseTimers` accumulators.
+    // EVERY phase prints (zero-run phases included) so the report's shape is
+    // deterministic and pin-able; the `runs` count disambiguates multi-CU /
+    // multi-target accumulation (e.g. `parse ... (2 runs)` for a 2-TU build)
+    // and makes the oracle-reparse multiplier visible as its own row. The
+    // trailing `[other]` row is the wall total minus the attributed sum —
+    // driver/config-load/IO time no phase claims. Phase names are pipeline
+    // verbs (see compilePhaseName) — lang/target/format-neutral.
     struct WallTimeReporter {
         bool const                                  enabled;
         std::chrono::steady_clock::time_point const start;
         ~WallTimeReporter() {
             if (!enabled) return;
-            auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            auto const ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now() - start).count();
+            auto const ms = ns / 1'000'000;
             std::cerr << "dss-code-prime: compile time " << formatWallTime(ms) << "\n";
+            std::uint64_t attributedNs = 0;
+            for (std::size_t i = 0; i < substrate::kCompilePhaseCount; ++i) {
+                auto const p   = static_cast<substrate::CompilePhase>(i);
+                auto const row = substrate::PhaseTimers::read(p);
+                attributedNs += row.nanoseconds;
+                std::cerr << "dss-code-prime:   phase "
+                          << std::format("{:<16}", substrate::compilePhaseName(p))
+                          << std::format("{:>12}", formatWallTime(
+                                 static_cast<long long>(row.nanoseconds / 1'000'000u)))
+                          << std::format("  ({} run{})", row.runs,
+                                         row.runs == 1 ? "" : "s")
+                          << "\n";
+            }
+            auto const otherNs = ns > 0 && static_cast<std::uint64_t>(ns) > attributedNs
+                                     ? static_cast<std::uint64_t>(ns) - attributedNs
+                                     : 0u;
+            std::cerr << "dss-code-prime:   phase "
+                      << std::format("{:<16}", "[other]")
+                      << std::format("{:>12}", formatWallTime(
+                             static_cast<long long>(otherNs / 1'000'000u)))
+                      << "\n";
         }
     } const wallTimeReporter{args.time, std::chrono::steady_clock::now()};
     if (args.projectPath.has_value()) {

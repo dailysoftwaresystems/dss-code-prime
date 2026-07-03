@@ -12,6 +12,44 @@
 
 namespace dss {
 
+namespace {
+
+// c97 sealing helper: the depth-first RuleLeaf-branch enumeration over one
+// rule's position graph — the SAME walk (same order, same first-occurrence
+// dedup, same cycle guard) the former per-call `altRuleBranches` ran; now
+// executed ONCE per AltChoice position at schema construction and stored on
+// the Position. Pure config-data transform; names no token/rule/language.
+[[nodiscard]] std::vector<RuleId> collectAltBranchRules(
+    std::vector<detail::Position> const& positions, std::uint32_t startPos) {
+    std::vector<RuleId> out;
+    std::vector<std::uint32_t> visitedPos;
+    auto walk = [&](auto&& self, std::uint32_t posId) -> void {
+        if (posId >= positions.size()) return;
+        for (auto const seen : visitedPos) {
+            if (seen == posId) return;
+        }
+        visitedPos.push_back(posId);
+        auto const& p = positions[posId];
+        if (p.slotKind() == SlotKind::RuleLeaf) {
+            const RuleId r = p.ruleId();
+            for (auto const existing : out) {
+                if (existing.v == r.v) return;   // first occurrence wins
+            }
+            out.push_back(r);
+            return;
+        }
+        if (p.slotKind() == SlotKind::AltChoice) {
+            for (auto bid : p.branches()) self(self, bid);
+        }
+        // TokenLeaf / End: not a rule branch — token routing goes
+        // through `advance`.
+    };
+    walk(walk, startPos);
+    return out;
+}
+
+} // namespace
+
 GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::move(d)) {
 #ifndef NDEBUG
     // Cross-check the loader-computed `maxLexemeLength` against a fresh
@@ -34,6 +72,51 @@ GrammarSchema::GrammarSchema(detail::GrammarSchemaData&& d) noexcept : d_(std::m
     assert(recomputed == d_.maxLexemeLength
            && "GrammarSchemaData::maxLexemeLength out of sync with lexemeTable");
 #endif
+
+    // ── c97 sealing pass ──────────────────────────────────────────────
+    // Drain the loader's build-time `compiledRules` map into the dense
+    // RuleId-indexed vector, then derive the O(1) query companions —
+    // per-set membership bitsets + the precomputed AltChoice branch
+    // enumerations. Load-time-only work (one pass over static config
+    // data); every per-token query downstream becomes an array index /
+    // bit test. RuleIds are dense interner ids (1..N), so the vector is
+    // sized by the interner (belt-and-braces: also covers any key above
+    // it). Runs for EVERY construction path — the JSON loader and tests
+    // that build GrammarSchemaData directly.
+    {
+        std::size_t denseSize = d_.rules ? d_.rules->size() : 0;
+        for (auto const& [rid, rule] : d_.compiledRules) {
+            (void)rule;
+            if (rid + 1 > denseSize) denseSize = rid + 1;
+        }
+        compiledDense_.resize(denseSize);
+        for (auto& [rid, rule] : d_.compiledRules) {
+            compiledDense_[rid] = std::move(rule);
+        }
+        d_.compiledRules.clear();
+
+        std::size_t const universe =
+            d_.schemaTokens ? d_.schemaTokens->size() : 0;
+        for (auto& rule : compiledDense_) {
+            rule.firstBits = detail::buildTokenBits(rule.firstSet, universe);
+            rule.prefixBits.clear();
+            rule.prefixBits.reserve(rule.predictivePrefix.size());
+            for (auto const& offsetSet : rule.predictivePrefix) {
+                rule.prefixBits.push_back(
+                    detail::buildTokenBits(offsetSet, universe));
+            }
+            for (auto& pos : rule.positions) {
+                pos.sealExpectedBits(universe);
+                // Seal the branch enumeration for EVERY slot kind — the
+                // walk itself resolves each correctly (AltChoice → DFS,
+                // RuleLeaf → {rule}, TokenLeaf/End → empty), preserving
+                // the former per-call function's full contract.
+                pos.sealAltBranchRules(collectAltBranchRules(
+                    rule.positions,
+                    static_cast<std::uint32_t>(&pos - rule.positions.data())));
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -159,13 +242,13 @@ namespace {
 // Locate the position record for a cursor, or nullptr if the cursor is
 // invalid / out of range. The cursor's `posId == 0` sentinel matches the
 // loader's `positions[0]` placeholder, so this also blocks default-
-// constructed cursors before they touch real data.
+// constructed cursors before they touch real data. (c97: reads the dense
+// table — an id with no compiled body has an EMPTY positions vector, so
+// every posId is out of range, exactly the former map-miss result.)
 [[nodiscard]] detail::Position const* lookupPos(
-    detail::GrammarSchemaData const& d, SchemaCursor cur) noexcept {
-    if (!cur.valid()) return nullptr;
-    auto it = d.compiledRules.find(cur.rule().v);
-    if (it == d.compiledRules.end()) return nullptr;
-    auto const& positions = it->second.positions;
+    detail::CompiledRule const* rule, SchemaCursor cur) noexcept {
+    if (!cur.valid() || rule == nullptr) return nullptr;
+    auto const& positions = rule->positions;
     if (cur.posId() >= positions.size()) return nullptr;
     return &positions[cur.posId()];
 }
@@ -174,19 +257,21 @@ namespace {
 
 SchemaCursor GrammarSchema::rootCursor() const noexcept {
     if (!d_.rootRule.valid()) return SchemaCursor{};
-    auto it = d_.compiledRules.find(d_.rootRule.v);
-    if (it == d_.compiledRules.end()) return SchemaCursor{};
-    return SchemaCursor{d_.rootRule, it->second.entryPos};
+    auto const* r = ruleRow(d_.rootRule.v);
+    // entryPos == 0 ⇒ no compiled body (see CompiledRule) — the former
+    // map-miss result. A real rule's entry is never the 0 sentinel.
+    if (r == nullptr || r->entryPos == 0) return SchemaCursor{};
+    return SchemaCursor{d_.rootRule, r->entryPos};
 }
 
 SchemaCursor GrammarSchema::enterRule(RuleId rule) const noexcept {
-    auto it = d_.compiledRules.find(rule.v);
-    if (it == d_.compiledRules.end()) return SchemaCursor{};
-    return SchemaCursor{rule, it->second.entryPos};
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr || r->entryPos == 0) return SchemaCursor{};
+    return SchemaCursor{rule, r->entryPos};
 }
 
 SchemaCursor GrammarSchema::leaveRule(SchemaCursor parentCur) const noexcept {
-    auto const* p = lookupPos(d_, parentCur);
+    auto const* p = lookupPos(ruleRow(parentCur.rule().v), parentCur);
     if (p == nullptr) return SchemaCursor{};
     if (p->slotKind() != SlotKind::RuleLeaf) return SchemaCursor{};
     return SchemaCursor{parentCur.rule(), p->nextPos()};
@@ -194,7 +279,7 @@ SchemaCursor GrammarSchema::leaveRule(SchemaCursor parentCur) const noexcept {
 
 SchemaCursor GrammarSchema::routeToRuleLeaf(SchemaCursor parentCur,
                                             RuleId rule) const noexcept {
-    auto const* p = lookupPos(d_, parentCur);
+    auto const* p = lookupPos(ruleRow(parentCur.rule().v), parentCur);
     if (p == nullptr) return SchemaCursor{};
     if (p->slotKind() == SlotKind::RuleLeaf && p->ruleId().v == rule.v) {
         return parentCur;
@@ -213,60 +298,31 @@ SchemaCursor GrammarSchema::routeToRuleLeaf(SchemaCursor parentCur,
     return SchemaCursor{};
 }
 
-std::vector<RuleId> GrammarSchema::altRuleBranches(SchemaCursor cur) const noexcept {
-    std::vector<RuleId> out;
-    if (!cur.valid()) return out;
-    auto it = d_.compiledRules.find(cur.rule().v);
-    if (it == d_.compiledRules.end()) return out;
-    auto const& positions = it->second.positions;
-
-    // Depth-first over AltChoice branch edges, in stored (= declared
-    // JSON-array) order — the exact traversal `routeToRuleLeaf` uses,
-    // so a rule appears here iff `routeToRuleLeaf(cur, rule)` would
-    // find it. `visitedPos` guards positional cycles (a `repeat`'s
-    // tie-the-knot loop entry can be reachable from its own branch
-    // subtree when the repeated body is nullable); `routeToRuleLeaf`
-    // never revisits in loadable grammars, and pruning a revisit
-    // cannot drop a rule — every reachable RuleLeaf is collected on
-    // the first visit of its position. Counts are tiny (branch fan-
-    // out per alt), so linear membership scans beat set machinery.
-    std::vector<std::uint32_t> visitedPos;
-    auto walk = [&](auto&& self, std::uint32_t posId) -> void {
-        if (posId >= positions.size()) return;
-        for (auto const seen : visitedPos) {
-            if (seen == posId) return;
-        }
-        visitedPos.push_back(posId);
-        auto const& p = positions[posId];
-        if (p.slotKind() == SlotKind::RuleLeaf) {
-            const RuleId r = p.ruleId();
-            for (auto const existing : out) {
-                if (existing.v == r.v) return;   // first occurrence wins
-            }
-            out.push_back(r);
-            return;
-        }
-        if (p.slotKind() == SlotKind::AltChoice) {
-            for (auto bid : p.branches()) self(self, bid);
-        }
-        // TokenLeaf / End: not a rule branch — token routing goes
-        // through `advance`.
-    };
-    walk(walk, cur.posId());
-    return out;
+std::span<RuleId const> GrammarSchema::altRuleBranches(SchemaCursor cur) const noexcept {
+    // c97: the DFS over AltChoice branch edges (declared JSON-array order,
+    // first occurrence wins, positional-cycle guard — see
+    // `collectAltBranchRules`) is precomputed per position at schema
+    // construction; this is now a span read. Same contract as the former
+    // per-call walk, including `{rule}` at a RuleLeaf position and empty
+    // for invalid cursors / token positions.
+    auto const* p = lookupPos(ruleRow(cur.rule().v), cur);
+    if (p == nullptr) return {};
+    return p->altBranchRules();
 }
 
 SchemaCursor GrammarSchema::advance(SchemaCursor cur, SchemaTokenId tok) const noexcept {
-    auto it = d_.compiledRules.find(cur.rule().v);
-    if (it == d_.compiledRules.end()) return SchemaCursor{};
-    auto const& positions = it->second.positions;
+    auto const* r = ruleRow(cur.rule().v);
+    if (r == nullptr) return SchemaCursor{};
+    auto const& positions = r->positions;
     if (cur.posId() >= positions.size()) return SchemaCursor{};
 
     // Walk through AltChoice positions until we hit a TokenLeaf or fail.
     // Each AltChoice routes into the first branch whose precomputed
-    // expectedSet contains `tok`. The loader rejects ambiguous alts at
-    // load time (C_AmbiguousAlternatives), so the "first match wins"
-    // behaviour is unambiguous in any schema that loaded successfully.
+    // expectedSet contains `tok` (c97: an O(1) bit test on the sealed
+    // bitset — same first-match-wins semantics as the former linear scan).
+    // The loader rejects ambiguous alts at load time
+    // (C_AmbiguousAlternatives), so the "first match wins" behaviour is
+    // unambiguous in any schema that loaded successfully.
     std::uint32_t curPosId = cur.posId();
     while (true) {
         auto const& p = positions[curPosId];
@@ -280,10 +336,12 @@ SchemaCursor GrammarSchema::advance(SchemaCursor cur, SchemaTokenId tok) const n
             std::uint32_t matched = 0;
             bool found = false;
             for (auto bid : p.branches()) {
-                for (auto const& t : positions[bid].expectedSet()) {
-                    if (t.v == tok.v) { matched = bid; found = true; break; }
+                if (detail::tokenBitsContain(positions[bid].expectedBits(),
+                                             tok.v)) {
+                    matched = bid;
+                    found   = true;
+                    break;
                 }
-                if (found) break;
             }
             if (!found) return SchemaCursor{};
             curPosId = matched;
@@ -297,48 +355,71 @@ SchemaCursor GrammarSchema::advance(SchemaCursor cur, SchemaTokenId tok) const n
 }
 
 std::span<SchemaTokenId const> GrammarSchema::expectedSet(SchemaCursor cur) const noexcept {
-    auto const* p = lookupPos(d_, cur);
+    auto const* p = lookupPos(ruleRow(cur.rule().v), cur);
     if (p == nullptr) return {};
     return p->expectedSet();
 }
 
+bool GrammarSchema::expectedSetContains(SchemaCursor cur,
+                                        SchemaTokenId tok) const noexcept {
+    auto const* p = lookupPos(ruleRow(cur.rule().v), cur);
+    if (p == nullptr) return false;
+    return detail::tokenBitsContain(p->expectedBits(), tok.v);
+}
+
+bool GrammarSchema::firstSetContains(RuleId rule,
+                                     SchemaTokenId tok) const noexcept {
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr) return false;
+    return detail::tokenBitsContain(r->firstBits, tok.v);
+}
+
+bool GrammarSchema::predictivePrefixExcludes(RuleId rule, std::size_t offset,
+                                             SchemaTokenId tok) const noexcept {
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr) return false;                    // no rule → no constraint
+    if (offset >= r->prefixBits.size()) return false;  // undefined → no constraint
+    auto const& bits = r->prefixBits[offset];
+    if (bits.empty()) return false;                    // empty set → no constraint
+    return !detail::tokenBitsContain(bits, tok.v);
+}
+
 SlotKind GrammarSchema::slotKind(SchemaCursor cur) const noexcept {
-    auto const* p = lookupPos(d_, cur);
+    auto const* p = lookupPos(ruleRow(cur.rule().v), cur);
     return p == nullptr ? SlotKind::End : p->slotKind();
 }
 
 RuleId GrammarSchema::slotRuleRef(SchemaCursor cur) const noexcept {
-    auto const* p = lookupPos(d_, cur);
+    auto const* p = lookupPos(ruleRow(cur.rule().v), cur);
     if (p == nullptr || p->slotKind() != SlotKind::RuleLeaf) return InvalidRule;
     return p->ruleId();
 }
 
 bool GrammarSchema::isAtEndOfRule(SchemaCursor cur) const noexcept {
-    auto const* p = lookupPos(d_, cur);
+    auto const* p = lookupPos(ruleRow(cur.rule().v), cur);
     return p != nullptr && p->slotKind() == SlotKind::End;
 }
 
 bool GrammarSchema::isSpeculativeAlt(SchemaCursor cur) const noexcept {
-    auto const* p = lookupPos(d_, cur);
+    auto const* p = lookupPos(ruleRow(cur.rule().v), cur);
     return p != nullptr && p->slotKind() == SlotKind::AltChoice && p->speculative();
 }
 
 std::uint16_t GrammarSchema::lookahead(SchemaCursor cur) const noexcept {
-    auto const* p = lookupPos(d_, cur);
+    auto const* p = lookupPos(ruleRow(cur.rule().v), cur);
     return (p != nullptr && p->slotKind() == SlotKind::AltChoice) ? p->lookahead() : 0;
 }
 
 bool GrammarSchema::nullableTail(SchemaCursor cur) const noexcept {
-    auto const* p = lookupPos(d_, cur);
+    auto const* p = lookupPos(ruleRow(cur.rule().v), cur);
     return p != nullptr && p->nullableTail();
 }
 
 SchemaCursor GrammarSchema::nullableBranch(SchemaCursor cur) const noexcept {
-    auto const* p = lookupPos(d_, cur);
+    auto const* r = ruleRow(cur.rule().v);
+    auto const* p = lookupPos(r, cur);
     if (p == nullptr || p->slotKind() != SlotKind::AltChoice) return SchemaCursor{};
-    auto it = d_.compiledRules.find(cur.rule().v);
-    if (it == d_.compiledRules.end()) return SchemaCursor{};
-    auto const& positions = it->second.positions;
+    auto const& positions = r->positions;
     for (auto bid : p->branches()) {
         if (bid >= positions.size()) continue;
         if (positions[bid].nullableTail()) {
@@ -349,28 +430,28 @@ SchemaCursor GrammarSchema::nullableBranch(SchemaCursor cur) const noexcept {
 }
 
 std::span<SchemaTokenId const> GrammarSchema::firstSetOf(RuleId rule) const noexcept {
-    auto it = d_.compiledRules.find(rule.v);
-    if (it == d_.compiledRules.end()) return {};
-    return it->second.firstSet;
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr) return {};
+    return r->firstSet;
 }
 
 std::span<SchemaTokenId const> GrammarSchema::followSetOf(RuleId rule) const noexcept {
-    auto it = d_.compiledRules.find(rule.v);
-    if (it == d_.compiledRules.end()) return {};
-    return it->second.followSet;
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr) return {};
+    return r->followSet;
 }
 
 std::size_t GrammarSchema::predictivePrefixLen(RuleId rule) const noexcept {
-    auto it = d_.compiledRules.find(rule.v);
-    if (it == d_.compiledRules.end()) return 0;
-    return it->second.predictivePrefix.size();
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr) return 0;
+    return r->predictivePrefix.size();
 }
 
 std::span<SchemaTokenId const>
 GrammarSchema::predictivePrefixAt(RuleId rule, std::size_t offset) const noexcept {
-    auto it = d_.compiledRules.find(rule.v);
-    if (it == d_.compiledRules.end()) return {};
-    auto const& pfx = it->second.predictivePrefix;
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr) return {};
+    auto const& pfx = r->predictivePrefix;
     if (offset >= pfx.size()) return {};
     return pfx[offset];
 }
@@ -404,15 +485,13 @@ PreprocessConfig const& GrammarSchema::preprocess() const noexcept {
 }
 
 bool GrammarSchema::isNullable(RuleId rule) const noexcept {
-    auto it = d_.compiledRules.find(rule.v);
-    if (it == d_.compiledRules.end()) return false;
-    return it->second.nullable;
+    auto const* r = ruleRow(rule.v);
+    return r != nullptr && r->nullable;
 }
 
 bool GrammarSchema::isExprRule(RuleId rule) const noexcept {
-    auto it = d_.compiledRules.find(rule.v);
-    if (it == d_.compiledRules.end()) return false;
-    return it->second.isExpr;
+    auto const* r = ruleRow(rule.v);
+    return r != nullptr && r->isExpr;
 }
 
 bool GrammarSchema::isAutoInternedWrapperRule(RuleId rule) const noexcept {
@@ -420,34 +499,33 @@ bool GrammarSchema::isAutoInternedWrapperRule(RuleId rule) const noexcept {
 }
 
 RuleId GrammarSchema::exprAtom(RuleId rule) const noexcept {
-    auto it = d_.compiledRules.find(rule.v);
-    if (it == d_.compiledRules.end()) return RuleId{};
-    return it->second.exprAtom;
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr) return RuleId{};
+    return r->exprAtom;
 }
 
 std::int32_t GrammarSchema::exprMinPrecedence(RuleId rule) const noexcept {
-    auto it = d_.compiledRules.find(rule.v);
-    if (it == d_.compiledRules.end()) return 0;
-    return it->second.exprMinPrecedence;
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr) return 0;
+    return r->exprMinPrecedence;
 }
 
 RuleId GrammarSchema::typeNameCommitRule(RuleId rule) const noexcept {
-    auto it = d_.compiledRules.find(rule.v);
-    if (it == d_.compiledRules.end()) return RuleId{};
-    return it->second.typeNameCommitRule;
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr) return RuleId{};
+    return r->typeNameCommitRule;
 }
 
 TypeNameCommitPolarity
 GrammarSchema::typeNameCommitPolarity(RuleId rule) const noexcept {
-    auto it = d_.compiledRules.find(rule.v);
-    if (it == d_.compiledRules.end()) return TypeNameCommitPolarity::PreferType;
-    return it->second.typeNameCommitPolarity;
+    auto const* r = ruleRow(rule.v);
+    if (r == nullptr) return TypeNameCommitPolarity::PreferType;
+    return r->typeNameCommitPolarity;
 }
 
 bool GrammarSchema::commitAfterPrefix(RuleId rule) const noexcept {
-    auto it = d_.compiledRules.find(rule.v);
-    if (it == d_.compiledRules.end()) return false;
-    return it->second.commitAfterPrefix;
+    auto const* r = ruleRow(rule.v);
+    return r != nullptr && r->commitAfterPrefix;
 }
 
 ExprWrapperRules GrammarSchema::exprWrapperRules(RuleId rule) const noexcept {
@@ -484,7 +562,7 @@ bool GrammarSchema::isTokenValidInScope(SchemaTokenId tok,
 
 bool GrammarSchema::canEndSource(SchemaCursor cur) const noexcept {
     if (cur.rule().v != d_.rootRule.v) return false;
-    auto const* p = lookupPos(d_, cur);
+    auto const* p = lookupPos(ruleRow(cur.rule().v), cur);
     return p != nullptr && p->nullableTail();
 }
 

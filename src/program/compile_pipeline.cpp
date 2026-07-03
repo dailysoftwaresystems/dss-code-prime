@@ -5,6 +5,7 @@
 #include "analysis/semantic/semantic_model.hpp"
 #include "asm/asm.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: BUILD half on a large stack
+#include "core/substrate/phase_timers.hpp"      // c97: per-phase --time accumulation
 #include "core/types/parse_diagnostic.hpp"
 #include "ffi/ingest.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
@@ -86,6 +87,10 @@ bool optimizeModule(Mir&                  mir,
                     TypeInterner const&   interner,
                     CompileOptions const& opts,
                     DiagnosticReporter&   reporter) {
+    // c97: one optimize phase covering pipeline resolution + every pass +
+    // the mandatory prune-normalize — both the per-CU and merged call sites.
+    substrate::PhaseTimers::Scope optimizePhase{
+        substrate::CompilePhase::Optimize};
     auto const optEntry = reporter.errorCount();
     // MANDATORY post-lowering normalize: drop verifier-rejected unreachable
     // continuation blocks the frontend creates eagerly (D-MIR-UNREACHABLE-PRUNE-NORMALIZE).
@@ -230,10 +235,16 @@ static std::optional<CuMirModule> buildCuMirImpl(
         cc != nullptr && cc->vaListLayout.has_value()) {
         analyzeVaStrategy = cc->vaListLayout->strategy;
     }
+    // c97: sequential per-phase scoping via optional emplace — emplace
+    // destroys the prior Scope (closing its accumulation window) BEFORE
+    // opening the next, and any early return closes the live one.
+    std::optional<substrate::PhaseTimers::Scope> phase;
+    phase.emplace(substrate::CompilePhase::Semantic);
     auto model = analyze(
         std::move(borrowed), format.dataModel(), analyzeLayout, analyzeVaStrategy,
         format.kind(),       // c8: the active object-format → per-target availability gate
         target.name());      // plan 25: the active arch → per-target shipped-struct variant selector
+    phase.reset();
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
         return std::nullopt;
@@ -241,7 +252,9 @@ static std::optional<CuMirModule> buildCuMirImpl(
 
     // 2. CST → HIR.
     auto const hirEntry = reporter.errorCount();
+    phase.emplace(substrate::CompilePhase::LowerHir);
     auto hir = lowerToHir(model, reporter);
+    phase.reset();
     if (!hir || !hir->ok || !tierClean(reporter, hirEntry)) {
         return std::nullopt;
     }
@@ -331,8 +344,10 @@ static std::optional<CuMirModule> buildCuMirImpl(
         }
 
         auto const ffiEntry = reporter.errorCount();
+        phase.emplace(substrate::CompilePhase::SynthesizeFfi);
         auto const ffiResult = ffi::synthesizeFfiFromSourceDecls(
             refs, importLibrary, target, format, ffiMap, reporter);
+        phase.reset();
         (void)ffiResult;  // shape inspected via reporter.errorCount()
         if (!tierClean(reporter, ffiEntry)) {
             return std::nullopt;
@@ -398,11 +413,13 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // so HIR→MIR can lower va_start/va_arg (or fail loud when the CC omits it).
         mirCfg.vaListLayout             = cc->vaListLayout;
     }
+    phase.emplace(substrate::CompilePhase::LowerMir);
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,
                           &hir->sourceMap, mirCfg, &ffiMap,
                           &hir->linkageMap, &hir->mutabilityMap,
                           &hir->volatileMap);
+    phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;
     }
@@ -482,6 +499,10 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // D-FFI-EXTERN-CALL-DISPATCH: the active format's extern-call shape
     // selects the call-site opcode (indirect-slot → call_indirect_via_extern;
     // direct-plt → plain call). Threaded from the format at the driver.
+    // c97: sequential per-phase scoping (see buildCuMirImpl) — lower-lir
+    // covers 4+4b, regalloc covers 5-9, encode covers 10 + the data items.
+    std::optional<substrate::PhaseTimers::Scope> phase;
+    phase.emplace(substrate::CompilePhase::LowerLir);
     auto const lirEntry = reporter.errorCount();
     auto lir = lowerToLir(mir, target,
                           interner, reporter,
@@ -506,6 +527,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     }
 
     // 5. Liveness analysis (input to regalloc).
+    phase.emplace(substrate::CompilePhase::Regalloc);
     auto const liveness = analyzeLiveness(wideLir.lir);
 
     // 6. Register allocation.
@@ -547,6 +569,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     //     plan 12 D-ML3-2.1 MirSourceMap IOU). Cycle 2 acceptance
     //     pins SHAPE + BYTES, not source-map fidelity.
     auto const asmEntry = reporter.errorCount();
+    phase.emplace(substrate::CompilePhase::Encode);
     std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
     auto assembled = assemble(cc.lir, target, lirToMir, reporter,
                               lir.externImports);
@@ -926,6 +949,8 @@ bool linkAndWrite(std::span<AssembledModule const> modules,
                   ObjectFormatSchema const&        format,
                   std::filesystem::path const&     outPath,
                   DiagnosticReporter&              reporter) {
+    // c97: link phase — resolution + byte emission + image write.
+    substrate::PhaseTimers::Scope linkPhase{substrate::CompilePhase::Link};
     auto const linkEntry = reporter.errorCount();
     auto image = linker::link(modules, target, format, reporter);
     if (!image.ok() || !tierClean(reporter, linkEntry)) {

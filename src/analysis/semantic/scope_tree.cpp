@@ -45,11 +45,11 @@ namespace {
 // Select the namespace's binding map within a scope record (C 6.2.3): Tag →
 // `tagBindings`, Ordinary → `bindings`. The const overload mirrors it for the
 // read-only lookup walk.
-std::unordered_map<std::string, SymbolId>&
+substrate::TransparentStringMap<SymbolId>&
 mapFor(ScopeRecord& rec, SymbolNamespace ns) {
     return ns == SymbolNamespace::Tag ? rec.tagBindings : rec.bindings;
 }
-std::unordered_map<std::string, SymbolId> const&
+substrate::TransparentStringMap<SymbolId> const&
 mapFor(ScopeRecord const& rec, SymbolNamespace ns) {
     return ns == SymbolNamespace::Tag ? rec.tagBindings : rec.bindings;
 }
@@ -85,11 +85,11 @@ SymbolId ScopeTree::lookup(ScopeId scope, std::string_view name,
                            SymbolNamespace ns) const noexcept {
     while (scope.valid() && scope.v < scopes_.size()) {
         auto const& rec = scopes_[scope.v];
-        // unordered_map heterogeneous lookup is C++20 with custom hash/equal;
-        // a plain std::string round-trip keeps the lookup self-contained.
-        std::string key{name};
+        // c97: heterogeneous lookup (TransparentStringMap) — the former
+        // per-hop `std::string key{name}` materialization is gone; the
+        // string_view queries the map directly.
         auto const& bindings = mapFor(rec, ns);
-        auto it = bindings.find(key);
+        auto it = bindings.find(name);
         if (it != bindings.end()) return it->second;
         scope = rec.parent;
     }
