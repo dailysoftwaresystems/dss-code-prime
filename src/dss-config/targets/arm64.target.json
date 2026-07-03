@@ -1240,6 +1240,48 @@
             ]
           },
           {
+            "$comment": "NEGATIVE-DISP lea (single word, D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB) — `lea Xd, [base + #disp]` with disp in [-4095, -1] = AArch64 `SUB Xd, Xn, #|disp|`. The `p[-1]`/`z[-1]` char-buffer lookback (a NEGATIVE const-disp GEP) that x86 encodes in one signed-disp32 `lea` but arm64's UNSIGNED imm12 ADD form could not — c94 gives it a NATIVE single-instruction SUB (replacing c93's materialize-into-a-fresh-GPR + base+index fold, which cost 5-7 instructions incl. a dead const). The negative MIRROR of the positive `ADD Xd,Xn,#imm12` variant above, op-bit SET: single fixed word 0xD1000000 (3506438144 = the ADD-imm base 0x91000000 | 0x40000000, sf=1 op=1 sub S=0 sh=0), shared with `sub`'s imm12 variant. base_reg→Rn (5..9), result→Rd (0..4), MemOffset→Imm12 (bits 10..21 — the encoder writes |disp| there; the SUB base makes it a subtract). MemBase carries no bits (scale must be 1, membase.noscale). `negMemoffset:true` routes ONLY a NEGATIVE memoffset here (the sign matcher); `immMax:4095` bounds |disp|≤4095 (a larger magnitude falls through to the shifted / MOVZ-MOVK negative variants below). SUB imm encoding verified vs ARM ARM C6.2.* (add/subtract immediate: sf|op|S|100010|sh|imm12|Rn|Rd) + aarch64-gcc objdump.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "negMemoffset": true, "immMax": 4095 },
+            "template":   { "fixedWord": 3506438144 },
+            "resultSlot": "rd",
+            "wires": [
+              { "index": 0, "slotKind": "rn"              },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm12"           }
+            ]
+          },
+          {
+            "$comment": "NEGATIVE-DISP lea (shifted imm12 word-pair, D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB) — `lea Xd, [base + #disp]` with |disp| in (4095, 0xFFFFFF]. The negative mirror of the positive shifted-imm12 ADD word-pair, op-bit SET: word0 = `SUB Xd, Xn, #(|disp| & 0xFFF)` (0xD1000000, sh=0), word1 = `SUB Xd, Xd, #((|disp|>>12) & 0xFFF), LSL #12` (0xD1400000 = 0xD1000000|0x400000, sh=1). SCRATCH-FREE: word1 reads its OWN dest (Xd) — extraResultSlots thread the result reg into word1.Rd AND word1.Rn. The MemOffset (operand 2) is the sign-matched value operand; its single imm12.hilo24 wire (word0) carries |disp|, split lo→word0 / hi→word1 by the encoder. `negMemoffset:true` + `immMin:4096`/`immMax:16777215` (|disp| magnitude); a >16MiB magnitude falls through to the MOVZ/MOVK form below. Fixed words = the `sub` opcode's shifted word-pair.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "negMemoffset": true, "width": 64, "immMin": 4096, "immMax": 16777215 },
+            "template":   { "fixedWords": [3506438144, 3510632448] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rn", "wordIndex": 1 }
+            ],
+            "wires": [
+              { "index": 0, "slotKind": "rn"              },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm12.hilo24", "wordIndex": 0 }
+            ]
+          },
+          {
+            "$comment": "NEGATIVE-DISP lea (MOVZ/MOVK + EXTENDED-register 3-word form, D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB) — `lea Xd, [base + #disp]` with |disp| in (0xFFFFFF, 0x7FFFFFFF]. The negative mirror of the positive MOVZ/MOVK 3-word form, op-bit SET on the operation word. SCRATCH-FREE: |disp| materializes into the lea's DEST reg Xd, then an EXTENDED-register SUB off the base. word0 = `MOVZ Xd, #(|disp| & 0xFFFF)` (0xD2800000, Rd=Xd via resultSlot), word1 = `MOVK Xd, #((|disp|>>16) & 0xFFFF), LSL #16` (0xF2A00000, Rd=Xd via extraResultSlots word1.rd), word2 = `SUB Xd, Xn, Xd` (the EXTENDED-register form 0xCB206000: sf=1 op=1 sub, option=011 UXTX bits 15:13, bit 21 set, Rn=base wired 5..9, Rd=Xd + Rm=Xd via extraResultSlots word2.rd/word2.rm). Unlike the POSITIVE 3-word form (which bakes Rn=sp=31), the NEGATIVE form WIRES Rn to the base register (operand 0, word2) — a derived-pointer `p[-N]` base, not sp. The dest reg threads through all three words. MemOffset (operand 2) sign-matched; its imm32.movzmovk wire (word0) carries |disp|, split lo16→word0 / hi16→word1. `negMemoffset:true` + `immMin:16777216`/`immMax:2147483647`; a magnitude > 2 GiB flows through int32 as a value whose |x| is unrepresentable → no variant → fail-loud (the residual, mirrors the positive >2GiB gap). SUB-extended base 0xCB206000 = the positive lea word2 0x8B2063E0 minus the baked Rn=sp (0x3E0) with the ADD op-bit flipped to SUB (0x8B→0xCB), verified by bit-decode.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "negMemoffset": true, "width": 64, "immMin": 16777216, "immMax": 2147483647 },
+            "template":   { "fixedWords": [3531603968, 4070572032, 3407896576] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rd", "wordIndex": 2 },
+              { "slotKind": "rm", "wordIndex": 2 }
+            ],
+            "wires": [
+              { "index": 0, "slotKind": "rn",              "wordIndex": 2 },
+              { "index": 1, "slotKind": "membase.noscale", "wordIndex": 2 },
+              { "index": 2, "slotKind": "imm32.movzmovk",  "wordIndex": 0 }
+            ]
+          },
+          {
             "$comment": "BASE+INDEX lea (D-AS4-ARM64-BASE-INDEX-LEA) — `lea Xd, [base + index*1 + 0]` = AArch64 `ADD Xd, Xn, Xm` (shifted-register add, LSL #0). The 4-op form `lowerGep` emits for an indexed pointer access `p[n]` ([base_reg, index_reg, MemBase(scale=1), MemOffset(disp=0)]), MIRRORING x86_64's 4-op SIB lea so the GEP stays target-blind (closing the gap that made `p[n]` fail loud on arm64 for int AND char alike). The GEP emits scale=1 + disp=0 ALWAYS today, so this single ADD is the complete realization: base→Rn (5..9), index→Rm (16..20), result→Rd (0..4); MemBase→membase.noscale (scale MUST be 1, fail-loud) and MemOffset→memoffset.zero (disp MUST be 0 — the register-add form has NO displacement field, and bits 10..21 overlap Rm so an Imm12 wiring would corrupt it; fail-loud on nonzero). Fixed word 0x8B000000 (the ADD reg-reg base, shared with `add`'s reg-reg variant). A scale!=1 (typed-array Gep scaling by sizeof(T)) needs the shifted form `ADD Xd,Xn,Xm,LSL #log2(scale)` — a FUTURE consumer (D-AS4-ARM64-INDEXED-LEA-SCALE, co-design with ML6 address-mode synthesis), NOT built speculatively.",
             "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
             "template":   { "fixedWord": 2332033024 },

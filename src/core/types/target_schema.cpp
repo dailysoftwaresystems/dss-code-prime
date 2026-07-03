@@ -174,6 +174,28 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                      o.mnemonic, vi));
                 }
             }
+            // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: negMemoffset requires a
+            // `memoffset` operand to sign-route on — the same coherence family
+            // as immMin/immMax. A negMemoffset flag on a variant with no
+            // memoffset operand keys on a sign that does not exist (the sign
+            // axis reads only ImmInt/MemOffset; an ImmInt is never a
+            // displacement, so negMemoffset is memoffset-specific). Reject at
+            // load rather than match nothing silently.
+            if (v.negMemoffset) {
+                bool const hasMemOffset = std::any_of(
+                    v.operandKinds.begin(), v.operandKinds.end(),
+                    [](OperandKindFilter f) {
+                        return f == OperandKindFilter::MemOffset;
+                    });
+                if (!hasMemOffset) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/guard", i, vi),
+                         std::format("opcode '{}' variant {}: declares "
+                                     "negMemoffset but its operandKinds carry "
+                                     "no 'memoffset' operand — there is no "
+                                     "displacement to sign-route on",
+                                     o.mnemonic, vi));
+                }
+            }
             // `opcodeBytes` is meaningful only for the x86-variable
             // shape. fixed32 carries the analog as `fixedWord` (a
             // 32-bit base bit pattern). The "non-empty" rule
@@ -728,6 +750,17 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                 auto const& va = o.encoding.variants[a];
                 auto const& vb = o.encoding.variants[b];
                 if (va.operandKinds != vb.operandKinds) continue;
+                // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: the SIGN axis is a
+                // THIRD disambiguator. Two same-operandKinds variants that
+                // differ in `negMemoffset` route on DISJOINT sign domains (one
+                // matches only a negative memoffset, the other only a
+                // non-negative one), so neither shadows the other — regardless
+                // of width or imm-range. The effLo/effHi magnitude ranges below
+                // are per-sign (a |disp| bound on the negative half, a disp
+                // bound on the non-negative half); comparing them ACROSS the
+                // sign boundary is meaningless, so skip the overlap check when
+                // the sign axis already separates them.
+                if (va.negMemoffset != vb.negMemoffset) continue;
                 // Disjoint imm-ranges ⇒ value-distinguishable, never a
                 // shadow. `[loA,hiA]` and `[loB,hiB]` are disjoint iff
                 // hiA < loB or hiB < loA.

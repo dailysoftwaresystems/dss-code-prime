@@ -158,6 +158,39 @@ variantImmMagnitude(std::span<LirOperand const>        instOps,
     return std::nullopt;
 }
 
+// D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: the ABSOLUTE-VALUE magnitude of
+// a NEGATIVE value-bearing operand — the sign-mirror of `variantImmMagnitude`
+// (which reports non-negative magnitudes). Reads the FIRST operand whose
+// guard filter is `ImmInt` or `MemOffset`. Returns the operand's |value| ONLY
+// when the value is STRICTLY NEGATIVE; nullopt when it is non-negative (a
+// non-negative value never matches a `negMemoffset` variant — the POSITIVE
+// sibling serves it) or when no value-bearing operand exists. Computed as
+// `-(int64)v` so `INT32_MIN` (whose positive |value| overflows int32)
+// widens cleanly into the uint32 magnitude range. Source/target-agnostic:
+// reads the LIR operand pool, never the arch. Symmetric partner of
+// `variantImmMagnitude` — together they split the signed value line into
+// the non-negative half (immMin/immMax on the default axis) and the negative
+// half (immMin/immMax on the negMemoffset axis).
+[[nodiscard]] inline std::optional<std::uint32_t>
+variantNegMagnitude(std::span<LirOperand const>        instOps,
+                    std::span<OperandKindFilter const> guard) noexcept {
+    for (std::size_t i = 0; i < guard.size() && i < instOps.size(); ++i) {
+        if (guard[i] == OperandKindFilter::ImmInt
+            && instOps[i].kind == LirOperandKind::ImmInt) {
+            std::int32_t const v = instOps[i].immInt32;
+            if (v >= 0) return std::nullopt;
+            return static_cast<std::uint32_t>(-static_cast<std::int64_t>(v));
+        }
+        if (guard[i] == OperandKindFilter::MemOffset
+            && instOps[i].kind == LirOperandKind::MemOffset) {
+            std::int32_t const v = instOps[i].offset;
+            if (v >= 0) return std::nullopt;
+            return static_cast<std::uint32_t>(-static_cast<std::int64_t>(v));
+        }
+    }
+    return std::nullopt;
+}
+
 // Full variant-guard match: operand kinds AND the FC3 c2 width axis
 // (D-CSUBSET-32BIT-ALU-FORMS) AND the FC12-deferral-2 immediate-magnitude
 // axis (D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12). `instWidthBits` is the
@@ -169,8 +202,12 @@ variantImmMagnitude(std::span<LirOperand const>        instOps,
 // W-forms vs their 64-bit siblings). A variant with absent immMin/immMax
 // matches ANY immediate magnitude (every pre-existing variant); a
 // magnitude-keyed variant matches only when its value-bearing operand's
-// magnitude is in [immMin, immMax]. Shared by BOTH walkers (x86_variable +
-// fixed32) — both axes are format-agnostic by construction.
+// magnitude is in [immMin, immMax]. The D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-
+// SUB SIGN axis (`negMemoffset`) selects WHICH magnitude the range gate reads:
+// the non-negative half (default) or the |value| of a strictly-negative
+// operand (negMemoffset=true, e.g. arm64's `SUB Xd,Xn,#|disp|` negative-disp
+// lea vs its positive `ADD` sibling). Shared by BOTH walkers (x86_variable +
+// fixed32) — all three axes are format-agnostic by construction.
 [[nodiscard]] inline bool
 variantMatchesInst(std::span<LirOperand const>  instOps,
                    std::uint8_t                 instWidthBits,
@@ -181,13 +218,25 @@ variantMatchesInst(std::span<LirOperand const>  instOps,
     if (!operandsMatchGuard(instOps, v.operandKinds)) {
         return false;
     }
-    // Immediate-magnitude axis: only consulted when the variant declares a
-    // bound (absent ⇒ match-any, so every existing variant is unaffected).
-    if (v.immMin.has_value() || v.immMax.has_value()) {
-        auto const mag = variantImmMagnitude(instOps, v.operandKinds);
-        if (!mag.has_value()) return false;  // no value-bearing operand in range
-        if (v.immMin.has_value() && *mag < *v.immMin) return false;
-        if (v.immMax.has_value() && *mag > *v.immMax) return false;
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: the SIGN axis selects which
+    // magnitude the imm-range gate reads. `negMemoffset=false` (the default,
+    // every pre-existing variant) reads the NON-NEGATIVE magnitude — a
+    // negative value-bearing operand reports nullopt and matches no bounded
+    // variant, EXACTLY as before this axis existed. `negMemoffset=true` reads
+    // the |value| of a STRICTLY-NEGATIVE operand — a non-negative operand
+    // reports nullopt so a negMemoffset variant never shadows its positive
+    // sibling. The two axes partition the signed value line; the [immMin,
+    // immMax] bound then applies to whichever half's magnitude was read.
+    auto const magnitude = v.negMemoffset
+        ? variantNegMagnitude(instOps, v.operandKinds)
+        : variantImmMagnitude(instOps, v.operandKinds);
+    // A negMemoffset variant is ALWAYS sign-gated (it must reject a
+    // non-negative operand even with no immMin/immMax bound), so consult
+    // the magnitude whenever the sign axis is on OR an imm-range is declared.
+    if (v.negMemoffset || v.immMin.has_value() || v.immMax.has_value()) {
+        if (!magnitude.has_value()) return false;  // wrong sign / no operand
+        if (v.immMin.has_value() && *magnitude < *v.immMin) return false;
+        if (v.immMax.has_value() && *magnitude > *v.immMax) return false;
     }
     return true;
 }

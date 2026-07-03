@@ -1704,6 +1704,44 @@ TEST(X86VariableEncoder, NegativeDispEmitsAsTwosComplement) {
     EXPECT_EQ(bytes[6], 0xFF);
 }
 
+TEST(X86VariableEncoder, NegativeDispLeaSingleInstructionUnchanged) {
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB (c94) AGNOSTICISM GUARD: the
+    // shared variant matcher gained a `negMemoffset` SIGN axis for arm64's SUB
+    // negative-disp lea. x86_64's `lea` base+disp variant has NO immMin/immMax
+    // AND NO negMemoffset (its disp32 field is SIGNED), so it stays the
+    // match-any slot that swallows BOTH signs in ONE instruction — the sign
+    // axis must NOT perturb it. `lea rax, [rbx - 8]` → 48 8D 83 F8 FF FF FF
+    // (REX.W 0x8D /r ModR/M(mod=10 reg=rax=0 rm=rbx=3 → 0x83) disp32=-8). This
+    // is the c93 baseline byte-for-byte; a regression from the shared-matcher
+    // change (e.g. a negative disp now matching nothing, or routing to a
+    // multi-instruction form) diverges these bytes (red-on-regression).
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const leaOp = (*schema)->opcodeByMnemonic("lea");
+    ASSERT_TRUE(leaOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbx),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(-8),
+        };
+        (void)b.addInst(*leaOp, rax, ops);
+    });
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 7u);
+    EXPECT_EQ(bytes[0], 0x48);  // REX.W
+    EXPECT_EQ(bytes[1], 0x8D);  // lea opcode
+    EXPECT_EQ(bytes[2], 0x83);  // ModR/M mod=10 reg=rax rm=rbx — no SIB
+    EXPECT_EQ(bytes[3], 0xF8);  // disp32 -8 LE byte 0
+    EXPECT_EQ(bytes[4], 0xFF);
+    EXPECT_EQ(bytes[5], 0xFF);
+    EXPECT_EQ(bytes[6], 0xFF);
+}
+
 // ── D-AS4-5: SIB-with-index (indexed/scaled addressing) ──────
 
 TEST(X86VariableEncoder, LeaWithIndexScale1) {

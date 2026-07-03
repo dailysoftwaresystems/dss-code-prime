@@ -1628,6 +1628,27 @@ struct DSS_EXPORT TargetEncodingVariant {
     // (validate() rejects it — there is no value to key on).
     std::optional<std::uint32_t>       immMin;
     std::optional<std::uint32_t>       immMax;
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: OPTIONAL negative-memoffset
+    // routing axis — the JSON key `guard.negMemoffset` (bool). FALSE (the
+    // default, every pre-existing variant) ⇒ the variant's magnitude axis
+    // reads a NON-NEGATIVE value-bearing operand; a NEGATIVE memoffset
+    // reports nullopt magnitude and matches NO bounded variant (unchanged).
+    // TRUE ⇒ the variant matches ONLY a NEGATIVE MemOffset, keyed by its
+    // ABSOLUTE VALUE |disp| against [immMin, immMax]. This is the third
+    // routing axis (alongside width + imm-range) that lets one opcode carry
+    // BOTH a positive base+disp variant (`ADD Xd,Xn,#disp`) AND a negative
+    // one (`SUB Xd,Xn,#|disp|`) with the SAME operandKinds — the matcher
+    // routes by the memoffset's SIGN, agnostically (any ISA whose base+disp
+    // encoding is unsigned-magnitude with separate add/subtract opcodes
+    // declares a negMemoffset sibling; the matcher reads the LIR operand's
+    // sign, never the arch). A target whose disp field is SIGNED (x86
+    // disp32) needs no negMemoffset variant at all — its match-any
+    // (no immMin/immMax, negMemoffset=false) slot swallows both signs.
+    // The encoder writes |disp| into the variant's (unsigned) imm12 /
+    // shifted-imm12 / MOVZ-MOVK slot; the subtract semantics live in the
+    // fixedWord (the SUB base). validate() rejects negMemoffset on a
+    // variant with no `memoffset` operand (no displacement to sign-route).
+    bool                               negMemoffset = false;
     TargetEncodingTemplate             tmpl;
     // Where the instruction's RESULT register goes (when the inst
     // has a result). Nullopt for value-less instructions (e.g.

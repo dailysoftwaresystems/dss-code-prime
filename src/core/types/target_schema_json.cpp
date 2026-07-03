@@ -137,6 +137,24 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
     };
     parseImmBound("immMin", variant.immMin);
     parseImmBound("immMax", variant.immMax);
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: OPTIONAL `negMemoffset` (bool).
+    // Absent ⇒ false (the non-negative magnitude axis — every pre-existing
+    // variant). Present-and-true ⇒ the variant matches only a NEGATIVE
+    // memoffset, keyed by |disp| against [immMin, immMax]. A non-boolean is a
+    // load-time reject (never a silently dropped flag). validate() rejects
+    // negMemoffset on a guard with no `memoffset` operand (nothing to sign-
+    // route) — the same coherence family as immMin/immMax.
+    if (g.contains("negMemoffset")) {
+        auto const& nv = g.at("negMemoffset");
+        if (!nv.is_boolean()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/opcodes/{}/encoding/variants/{}/guard/negMemoffset",
+                                  opIdx, vi),
+                      "'negMemoffset' must be a boolean");
+        } else {
+            variant.negMemoffset = nv.get<bool>();
+        }
+    }
     if (!g.contains("operandKinds")) return;
     auto const& oks = g.at("operandKinds");
     if (!oks.is_array()) {

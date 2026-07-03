@@ -1,4 +1,5 @@
-/* c42 (D-CSUBSET-INDEX-NEGATIVE-WIDEN) + c93 (D-AS4-ARM64-NEGATIVE-DISP-LEA)
+/* c42 (D-CSUBSET-INDEX-NEGATIVE-WIDEN) + c94 (D-AS4-ARM64-NEGATIVE-DISP-LEA-
+ * NATIVE-SUB, née c93 D-AS4-ARM64-NEGATIVE-DISP-LEA)
  * C 6.5.2.1/6.5.6: a NEGATIVE array subscript `p[-n]` = *(p + (-n)) must step
  * -n * sizeof(*p) bytes.
  *
@@ -12,18 +13,17 @@
  *   variable-subscript cases exercise this via the register path on every target
  *   (incl. arm64 SXTW under qemu).
  *
- *   c93 (the CONSTANT-disp path, RELEASE witness): under ConstFold a constant
+ *   c94 (the CONSTANT-disp path, RELEASE witness): under ConstFold a constant
  *   `p[-N]` folds to a bare NEGATIVE Const byte-offset -> the const-disp Gep ->
- *   `lea [base + MemOffset(<0)]`. x86 encodes that as a hardware-sign-extended
- *   `lea [base+disp32]` (one instruction). arm64's every base+disp lea/ADD-imm
- *   variant is UNSIGNED-magnitude-bounded, so a negative disp matched NO variant
- *   (A_NoMatchingEncodingVariant opcode 'lea' width 64) and the function was
- *   dropped -- THE gap this corpus used to dodge by declaring no optimized arm.
- *   c93's config-gated fold (targetHasSignedDispLea() false on arm64)
- *   materializes the negative disp into a fresh GPR and emits the base+index
- *   `ADD Xd,Xn,Xm` (Xm = sign-extended -N) = base - N. So the RELEASE arms are
- *   now declared and GREEN on arm64 too. sqlite uses `p[-1]` lookback ->
- *   run-green-critical.
+ *   `lea [base + MemOffset(<0)]`. BOTH targets now encode that NATIVELY in ONE
+ *   instruction: x86 via its hardware-sign-extended `lea [base+disp32]`; arm64
+ *   via the c94 `negMemoffset` SUB variants (`SUB Xd,Xn,#|disp|` / shifted /
+ *   MOVZ-MOVK), which the shared variant matcher routes to by the memoffset's
+ *   SIGN. This REPLACED c93's config-gated fold (materialize the disp into a
+ *   fresh GPR + a 4-op base+index `ADD Xd,Xn,Xm`), which cost 5-7 arm64
+ *   instructions including a DEAD const materialization. So the RELEASE arms are
+ *   GREEN on arm64 via a native single-instruction SUB. sqlite uses `p[-1]`
+ *   lookback -> run-green-critical.
  *
  * Covers stride 1 (char*, no Mul), 4 (int*), and 12 (struct Trip*, a non-pow2
  * Mul -> the canonical -1*12 = 0xFFFFFFF4 offset), each with a CONSTANT
@@ -38,9 +38,10 @@
  *   - revert the lowerGep c42 index-widen -> the un-widened I32 negative offset
  *     zero-extends in the 64-bit lea -> a +4GiB address -> SIGSEGV (non-42) on
  *     the first runtime-stride-Mul subscript (debug).
- *   - revert the c93 negative-disp fold -> the arm64 RELEASE arm fails to
- *     compile with `A_NoMatchingEncodingVariant opcode 'lea' width 64` on the
- *     first constant `p[-N]` (x86 stays green via signed disp32). */
+ *   - revert the c94 arm64 negMemoffset SUB variants -> the arm64 RELEASE arm
+ *     fails to compile with `A_NoMatchingEncodingVariant opcode 'lea' width 64`
+ *     on the first constant `p[-N]` (x86 stays green via signed disp32; the c93
+ *     fold that used to catch this is GONE — native SUB or bust). */
 struct Trip { int x; int y; int z; };   /* sizeof 12 -> a non-pow2 stride */
 
 int main(void) {

@@ -493,6 +493,22 @@ struct Lowerer {
     // a disagreement between the two fold sites can never be silent.
     std::unordered_set<std::uint32_t> foldedGlobalAddrs_;
 
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB (c94): Const insts whose
+    // materialization is ELIDED because their SOLE use is a const-disp Gep
+    // that folds the value into a `MemOffset` IMMEDIATE (`lowerGep` reads it
+    // via `constIntegerValue`, never `regForValue`). Without this, the
+    // main-dispatch `lowerConst` materializes the Const into a register
+    // (e.g. arm64 MOVZ/MOVK of the displacement) that the folded `lea`/`ADD`/
+    // `SUB` never reads — a DEAD const materialization, sign-AGNOSTIC (it hit
+    // BOTH the positive `s.x` member-offset `ADD` and the negative `p[-N]`
+    // `SUB` alike; the c93 audit measured it as the residual dead-const on the
+    // negative path). `lowerConst` consults this to SKIP materialization; the
+    // single-use census guarantees no other consumer needs the register, so
+    // the value is never `regForValue`'d — a fold-site disagreement would fail
+    // loud on the undefined vreg, never silently mis-encode. Mirrors the
+    // `foldedGlobalAddrs_` fold-skip precedent exactly.
+    std::unordered_set<std::uint32_t> foldedConstDisps_;
+
     // Module-tier (NOT per-function) reverse-mapping LirInstId.v →
     // MirInstId. Grows as the lowerer emits LIR insts (slot 0 is the
     // arena's invalid sentinel, default-initialized `InvalidMirInst`).
@@ -762,40 +778,13 @@ struct Lowerer {
             && opcode(MnemonicSlot::MovkLsl48).has_value();
     }
 
-    // D-AS4-ARM64-NEGATIVE-DISP-LEA (c93): does the target's `lea` declare a
-    // base+disp form `[reg, membase, memoffset]` whose displacement slot is
-    // SIGNED — i.e. accepts a NEGATIVE MemOffset (a `p[-N]` const-disp Gep)?
-    // Capability probe over the declared variant vocabulary — the SANCTIONED
-    // pattern (see `targetHasMovImm64`), NEVER `if (arch == ...)`.
-    //
-    // A variant with NEITHER `immMin` NOR `immMax` matches ANY magnitude
-    // (`variantMatchesInst` skips the magnitude axis when both are absent), so
-    // its displacement slot swallows the full signed range — x86_64's `lea r,
-    // [base+disp32]` (a SIGNED disp32 field) is exactly this: no magnitude bound
-    // → a negative disp encodes free. arm64's every base+disp `lea`/ADD-imm
-    // variant carries an UNSIGNED magnitude bound (imm12 ≤4095 / shifted-imm12 /
-    // MOVZ-MOVK), because `variantImmMagnitude` reports nullopt for a negative
-    // value BEFORE any range check → NO arm64 variant matches a negative disp.
-    // TRUE ⇒ emit the negative-disp `lea` directly (x86, unchanged single
-    // instruction). FALSE ⇒ `lowerGep` materializes the negative disp into a
-    // fresh GPR and emits the base+index form instead (arm64). A target with
-    // NO `lea` opcode at all returns false (it cannot have a signed-disp lea).
-    [[nodiscard]] bool targetHasSignedDispLea() const {
-        auto const leaId = opcode(MnemonicSlot::Lea);
-        if (!leaId.has_value()) return false;
-        auto const* info = target.opcodeInfo(*leaId);
-        if (info == nullptr) return false;
-        for (auto const& v : info->encoding.variants) {
-            if (v.operandKinds.size() == 3
-                && v.operandKinds[0] == OperandKindFilter::Reg
-                && v.operandKinds[1] == OperandKindFilter::MemBase
-                && v.operandKinds[2] == OperandKindFilter::MemOffset
-                && !v.immMin.has_value() && !v.immMax.has_value()) {
-                return true;
-            }
-        }
-        return false;
-    }
+    // (D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB, c94: the c93
+    // `targetHasSignedDispLea` capability probe is GONE. A negative-disp Gep no
+    // longer needs a lowering-time fold — BOTH targets encode the plain 3-op
+    // `lea [base + MemOffset(disp<0)]` natively: x86 via its signed disp32
+    // field, arm64 via the config's `negMemoffset` SUB variants routed by the
+    // shared sign matcher. The lowering is target-blind; the config picks the
+    // encoding. See lowerGep's const-disp arm.)
 
     // FC2 Part B: the opcode that performs `op` on a value of register
     // class `cls` (the registerClassOps resolution). GPR resolves to
@@ -1961,6 +1950,20 @@ struct Lowerer {
     }
 
     void lowerConst(MirInstId id) {
+        // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB (c94): if this Const's SOLE
+        // use is a const-disp Gep that folds it into a `MemOffset` immediate
+        // (`lowerGep` reads it via `constIntegerValue`, never `regForValue`),
+        // SKIP the materialization — it would be a dead register write (the
+        // arm64 MOVZ/MOVK of the displacement the folded `SUB`/`ADD` never
+        // reads). Recorded in `foldedConstDisps_` so a stray `regForValue` on
+        // this value (a fold-site disagreement) fails LOUD on the undefined
+        // vreg rather than silently mis-encoding. Sign-agnostic: eliminates the
+        // dead const on BOTH the positive member-offset `ADD` and the negative
+        // `p[-N]` `SUB`. Mirrors the `foldedGlobalAddrs_` skip in `lowerGlobalAddr`.
+        if (constDispFoldsIntoGep(id)) {
+            foldedConstDisps_.insert(id.v);
+            return;
+        }
         if (!opcode(MnemonicSlot::Mov).has_value()) {
             reportMissingOpcode(MnemonicSlot::Mov, "MIR Const");
             return;
@@ -2431,46 +2434,29 @@ struct Lowerer {
                 // at lowerGep's top — see there. This general path is for a
                 // derived-pointer base.)
                 //
-                // D-AS4-ARM64-NEGATIVE-DISP-LEA (c93): a NEGATIVE constant
-                // displacement (`p[-N]` → -N*sizeof(*p), e.g. a `char*` lookback
-                // `z[-1]` or a ConstFold-folded `int*` `p[-5]`) rides the
-                // `MemOffset` slot. On a target whose base+disp `lea` slot is
-                // SIGNED (x86 disp32) it encodes directly — the single-instruction
-                // path below, UNCHANGED. On a target whose base+disp variants are
-                // all UNSIGNED-magnitude-bounded (arm64 imm12 / shifted-imm12 /
-                // MOVZ-MOVK), a negative disp matches NO variant
-                // (A_NoMatchingEncodingVariant opcode 'lea' width 64). CONFIG-GATED
-                // (targetHasSignedDispLea, NOT an arch check): materialize the
-                // negative disp into a FRESH GPR (emitBareConstToFresh fills the
-                // sign-extended 64-bit value — arm64 MOVZ + 0xFFFF-MOVK ladder) and
-                // emit the 4-op base+index form `lea [base + idxReg*1 + 0]` — the
-                // SAME base+index `ADD Xd,Xn,Xm` the runtime-subscript path already
-                // encodes. ADD computes base + (sign-extended -N) = base - N (the
-                // correct byte address). The base survives into Rn; the
-                // materialized value is a DISTINCT fresh reg (Rm) → no clobber, no
-                // double-materialization. A POSITIVE disp (≤4095) still takes the
-                // single-word ADD-imm12 form below; the guard is `< 0` ONLY.
+                // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB (c94): a NEGATIVE
+                // constant displacement (`p[-N]` → -N*sizeof(*p), e.g. a `char*`
+                // lookback `z[-1]` or a ConstFold-folded `int*` `p[-5]`) rides the
+                // `MemOffset` slot — SIGN AND ALL. Both targets now encode the
+                // plain 3-op `lea [base + MemOffset(disp)]` NATIVELY, in ONE
+                // instruction, with NO fold: x86 via its SIGNED disp32 field;
+                // arm64 via the c94 `negMemoffset` SUB variants (`SUB Xd,Xn,#|disp|`
+                // / shifted / MOVZ-MOVK), which the variant matcher routes to by
+                // the memoffset's SIGN. This REPLACES c93's config-gated fold
+                // (`targetHasSignedDispLea` → materialize the disp into a fresh
+                // GPR + 4-op base+index `ADD Xd,Xn,Xm`), which cost 5-7 arm64
+                // instructions including a DEAD const materialization (the MIR
+                // Const(-N) lowered by the main dispatch then left unused). The
+                // native SUB is one word (|disp|≤4095) — no fold, no dead const,
+                // no base+index. Target-agnostic: the SINGLE 3-op path below
+                // handles every disp on every target; the config picks the
+                // encoding.
                 //
                 // (c93 STEP-0 named the sqlite trigger: 17 negative const-disp
                 // Geps across 9 functions, ALL disp=-1 — the 1-byte-stride
                 // `p[-1]`/`z[-1]` char-buffer lookback, which `scaleIndexToBytes`
                 // leaves as a bare negative Const with NO ConstFold, so it fires
                 // at DEBUG too. That is why the sqlite DEBUG compile hit this.)
-                if (*disp < 0 && !targetHasSignedDispLea()) {
-                    std::optional<LirReg> const dispReg =
-                        emitBareConstToFresh(*disp);
-                    if (!dispReg.has_value()) return;  // fail-loud already reported
-                    LirReg const result = lir.newVReg(LirRegClass::GPR);
-                    std::array<LirOperand, 4> ops{
-                        LirOperand::makeReg(*base),
-                        LirOperand::makeReg(*dispReg),
-                        LirOperand::makeMemBase(1),
-                        LirOperand::makeMemOffset(0),
-                    };
-                    emitInst(*opcode(MnemonicSlot::Lea), result, ops);
-                    defineValue(id, result);
-                    return;
-                }
                 LirReg const result = lir.newVReg(LirRegClass::GPR);
                 std::array<LirOperand, 3> ops{
                     LirOperand::makeReg(*base),
@@ -3061,6 +3047,44 @@ struct Lowerer {
             return static_cast<std::int64_t>(*u);
         if (auto const* b = std::get_if<bool>(&lit.value))          return *b ? 1 : 0;
         return std::nullopt;
+    }
+
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB (c94): would this Const's value
+    // be folded into a `MemOffset` IMMEDIATE by a const-disp Gep, making its
+    // register materialization DEAD? True iff (a) the Const is an INTEGER Const
+    // whose value fits int32 (the fold path's range gate — both the frame-slot
+    // fold and the general derived-pointer const-disp fold require it), AND
+    // (b) it is SINGLE-USE, AND (c) its sole user is a 2-operand Gep in which
+    // the Const is `operands[1]` (the displacement — operand 0 is the base
+    // pointer, always a register-producing value, never this Const). Under
+    // those conditions `lowerGep` reads the value via `constIntegerValue` and
+    // emits `MemOffset(value)` — the register is never `regForValue`'d, so
+    // `lowerConst` may skip materializing it. Sign-AGNOSTIC (a positive struct-
+    // field offset AND a negative `p[-N]` disp both qualify). A Const with any
+    // OTHER use, a non-Gep user, a runtime-index Gep (Const at operand 0 is
+    // impossible; a 3+-operand Gep isn't the const-disp form), or an out-of-
+    // int32 value is NOT folded → materialized normally. `computeValueUses`
+    // must have run (it does — `lowerFunction` calls it before block lowering).
+    [[nodiscard]] bool constDispFoldsIntoGep(MirInstId constId) const {
+        if (mir.instOpcode(constId) != MirOpcode::Const) return false;
+        // The value must fit int32 — the exact gate both fold paths apply
+        // before emitting a MemOffset (a >2GiB disp fails loud / takes the
+        // general path un-folded).
+        auto const v = constIntegerValue(constId);
+        if (!v.has_value()
+            || *v < std::numeric_limits<std::int32_t>::min()
+            || *v > std::numeric_limits<std::int32_t>::max()) {
+            return false;
+        }
+        auto const it = mirValueUses_.find(constId.v);
+        if (it == mirValueUses_.end() || it->second.count != 1) return false;
+        MirInstId const user = it->second.user;
+        if (mir.instOpcode(user) != MirOpcode::Gep) return false;
+        auto const userOps = mir.instOperands(user);
+        // Only the 2-operand [base, const-disp] shape folds the disp into an
+        // immediate; a ≥3-operand (multi-index) Gep does not, and operand 0 is
+        // always the base pointer (never this Const).
+        return userOps.size() == 2 && userOps[1].v == constId.v;
     }
 
     // ── cycle 3e: aggregate ops (memory-flattening lowering) ─────────
@@ -4970,6 +4994,7 @@ struct Lowerer {
     void computeValueUses(MirFuncId mf) {
         mirValueUses_.clear();
         foldedGlobalAddrs_.clear();
+        foldedConstDisps_.clear();
         std::uint32_t const blockCount = mir.funcBlockCount(mf);
         for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
             MirBlockId const mb = mir.funcBlockAt(mf, bi);
