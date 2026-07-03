@@ -1619,6 +1619,36 @@
       }
     },
     {
+      "$comment": "c92 (D-CSUBSET-FP-TO-UI-CODEGEN, the c78 arm64 residual): FCVTZU — float to UNSIGNED integer, round toward zero. The EXACT MIRROR of fp_to_si above: same 'Conversion between FP and integer' group, same field layout (sf [31] | 00 | 11110 [28:24] | ftype [23:22] | 1 [21] | rmode=11 toward-zero [20:19] | opcode [18:16] | 000000 [15:10] | Rn [9:5] | Rd [4:0]), opcode=001 FCVTZU where FCVTZS is 000 (+0x00010000). Same SOURCE-float-width axis (the mir_to_lir FPToUI arm threads the source's width, c78) and the same FIXED X destination as fp_to_si — a U32 result reads the low 32 bits of the Xd result, VALUE-CORRECT for any double/float in [0, 2^32) (the arm64 analog of x86 fp_to_ui's CVTTSD2SI r64 low-32 convention; gcc's `fcvtzu w0, d0` agrees on every in-range value, out-of-range is C 6.3.1.4p1 UB). ★ UNLIKE x86 (whose signed CVTTSD2SI needs the deferred >2^63 conditional-subtract, D-CSUBSET-UI-FROM-FP-UNSIGNED-I64), FCVTZU Xd covers the FULL unsigned-i64 range NATIVELY — that anchor is x86-ONLY; the arm64 leg has NO >2^63 residual (gcc emits the identical `fcvtzu x0, d0`). MIR FPToUI is the producer. FCVTZU Xd,Dn = 0x9E790000 = FCVTZS Xd,Dn[0x9E780000] | opcode bit [0x00010000]; FCVTZU Xd,Sn = 0x9E390000 = FCVTZS Xd,Sn[0x9E380000] | 0x00010000 (both cross-checked against the ARM ARM field decode above + aarch64-gcc objdump).",
+      "mnemonic":      "fp_to_ui",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "$comment": "F64 source → FCVTZU Xd, Dn — ftype=01 double, base 0x9E790000 (the low 32 bits are the in-range U32 result; the full Xd is the NATIVE full-range U64).",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2658729984 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "F32 source → FCVTZU Xd, Sn — ftype=00 single, base 0x9E390000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 2654535680 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "D-CSUBSET-INT-FLOAT-CONVERSION (int→float): SCVTF — Scalar Convert Signed integer to Floating-point. The REVERSE of FCVTZS above. 'Conversion between FP and integer' group: sf [31] | 00 [30:29] | 11110 [28:24] | ftype [23:22] | 1 [21] | rmode=00 [20:19] | opcode=010 SCVTF [18:16] | 000000 [15:10] | Rn [9:5] | Rd [4:0]. The result is FPR-class (regClassFor sees the F64 MIR result) — rd carries the D destination, the rn wire the X/W integer source; the 5-bit slots are class-blind hwEncodings, exactly the GPR-src/FPR-dest split x86's cvtsi2sd makes through modrm.rm/modrm.reg. MIR SIToFP is the producer. The width axis keys on the SOURCE INTEGER width (the mir_to_lir SIToFP arm threads the source's int width): a 64-bit source -> SCVTF Dd, Xn (sf=1, width=64), a 32-bit source -> SCVTF Dd, Wn (sf=0, width=32). UNLIKE x86's single REX.W bit, arm64 sf+ftype are INDEPENDENT, so BOTH source-int widths keep ftype=01 (the F64 DESTINATION, Dd) — `Dd,Wn` is the i32->f64 form, the arm64 analog of cvtsi2sd xmm,r32. DESIGN NOTE (audit + qemu-arm64 scrutiny — verify these fixedWords on real hardware): dest fixed at F64/Dd this cycle (the dominant + sqlite-blocking i64->double case); int->F32 (ftype=00, Sd) is FAIL-LOUD at the mir_to_lir SIToFP arm (a deferred narrow gap, D-CSUBSET-INT-TO-F32-CODEGEN). SCVTF Dd,Xn = 0x9E620000 = sf=1[0x80000000] | 11110[0x1E000000] | ftype=01[0x00400000] | bit21[0x00200000] | opcode=010[0x00020000]; SCVTF Dd,Wn = 0x1E620000 (same MINUS the sf bit). Cross-checked against the config's FCVTZS Dn base 0x9E780000 (opcode=000, rmode=11) — same field decode.",
       "mnemonic":      "si_to_fp",
       "result":        "value",
