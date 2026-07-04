@@ -1528,6 +1528,49 @@ TEST(ShippedLibDescriptor, RealTimeStructTmPerFormatLayout) {
         << "macho struct tm is the Darwin 11-field layout (56 bytes)";
 }
 
+// c101 (D-FFI-WINDOWS-KERNEL32-FUNCTIONS, the sync-types slice): the real
+// windows.json ships the Win32 synchronization structs — SRWLOCK (a single PVOID
+// Ptr, 8 bytes) and CRITICAL_SECTION (the RTL_CRITICAL_SECTION 6-field layout:
+// ptr DebugInfo + i32 LockCount + i32 RecursionCount + ptr OwningThread + ptr
+// LockSemaphore + u64 SpinCount = 40 bytes on x64). SQLite's sqlite3_mutex embeds
+// `union { CRITICAL_SECTION cs; SRWLOCK srwl; }` and passes &cs/&srwl to
+// Initialize/Enter/Leave, which write the FULL struct — a too-small CRITICAL_SECTION
+// would let kernel32 overflow the caller's mutex slot. Pins the real file's pe
+// layout. RED-ON-DISABLE: drop a CRITICAL_SECTION field (e.g. SpinCount) → sizeof
+// != 40. windows.json is pe-only, so this loads with ObjectFormatKind::Pe.
+TEST(ShippedLibDescriptor, RealWindowsSyncStructLayout) {
+    fs::path const shippedRoot = shippedLibsRoot();
+    ASSERT_FALSE(shippedRoot.empty())
+        << "could not locate src/dss-config/shippedLibs from cwd";
+    fs::path const winPath = shippedRoot / "windows.json";
+    ASSERT_TRUE(fs::exists(winPath)) << winPath.generic_string();
+
+    auto sizeOf = [&](std::string_view structName) -> std::uint64_t {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(winPath, interner, typeReg, rep,
+                                             DataModel::Lp64, std::string_view{"x86_64"},
+                                             ObjectFormatKind::Pe);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        if (!desc.has_value()) return 0;
+        for (auto const& s : desc->structs) {
+            if (s.name == structName) {
+                auto layout = computeLayout(s.typeId, interner, kNatural16,
+                                            DataModel::Lp64);
+                EXPECT_TRUE(layout.has_value());
+                return layout ? layout->size : 0;
+            }
+        }
+        ADD_FAILURE() << "struct " << structName << " absent from windows.json";
+        return 0;
+    };
+    EXPECT_EQ(sizeOf("SRWLOCK"), 8u) << "SRWLOCK is a single PVOID Ptr";
+    EXPECT_EQ(sizeOf("CRITICAL_SECTION"), 40u)
+        << "RTL_CRITICAL_SECTION x64: ptr+i32+i32+ptr+ptr+u64 = 40 bytes";
+}
+
 // Every descriptor SHIPPED under src/dss-config/shippedLibs/*.json (Model 3: a
 // FLAT, platform-neutral layout — one descriptor per header) must read + decode
 // cleanly: valid JSON, a non-empty `header` that AGREES with the filename stem
