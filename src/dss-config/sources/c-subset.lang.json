@@ -1177,7 +1177,7 @@
         "$implicitReturnZeroForFunctionNamesComment": "C99 §5.1.2.2.3: when control reaches the closing '}' of main without an explicit return, the semantics are equivalent to 'return 0;'. The HIR lowering appends a synthetic ReturnStmt(IntLiteral(0)) to main's body if it doesn't structurally terminate. SOURCE-AGNOSTIC: this list lives on the per-language semantic config so each language declares its own entry-fn convention (Pascal's 'program', Rust's 'fn main', etc.) without touching shared HIR substrate. Closes D-LK10-ENTRY-MAIN-IMPLICIT-RETURN.",
         "implicitReturnZeroForFunctionNames": ["main"],
         "$entryFunctionNamesComment": "FC5: the program ENTRY-point name(s) — read by the driver's entry-symbol resolution. SEPARATE from implicitReturnZeroForFunctionNames (the C main-style return-0 set); for C both are `main`, but declaring them distinctly de-conflates the two concepts (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN).",
-        "entryFunctionNames": ["main"] },
+        "entryFunctionNames": ["main", "wmain"] },
       { "rule": "typedefDecl", "head": 1, "declarator": 2, "kind": "type",
         "volatileMarker": "VolatileKeyword",
         "requireNamedDeclarators": true },
