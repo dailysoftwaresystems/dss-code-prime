@@ -27,6 +27,18 @@ function(dss_add_test)
     dss_pch_reproducible(${target})  # consumer must match producer's PCH flags
 
     add_test(NAME ${DSS_NAME} COMMAND ${target})
+
+    # Shipped-config discovery: findShippedConfig() prefers $DSS_CONFIG_ROOT
+    # (a directory containing src/dss-config/) over its cwd-walk. Point it at
+    # the repo root so every test resolves shipped config regardless of build
+    # location — an OUT-OF-TREE build's ctest cwd is a build subdirectory with
+    # no src/dss-config/ in its ancestry, which would otherwise null the loader
+    # (loadShipped → nullptr → downstream null-deref). In-tree builds already
+    # walk to the config; this makes out-of-tree/CI builds work identically.
+    # (CTest ENVIRONMENT is a ';'-separated list; a repo path containing a
+    # literal ';' would mis-split — impossible on normal Windows/WSL paths.)
+    set_tests_properties(${DSS_NAME} PROPERTIES
+        ENVIRONMENT "DSS_CONFIG_ROOT=${CMAKE_SOURCE_DIR}")
 endfunction()
 
 # Shared PCH producer for the test executables (see DSS_PCH_HEADERS in the
