@@ -1,0 +1,17 @@
+{
+  "$comment": "Neutral shipped <io.h> (Microsoft CRT low-level I/O) — c98 (Windows-host sub-arc, the 3-header F001A batch). shell.c includes it twice on the pe route: line ~239 (the _WIN32 CLI prologue that maps isatty->_isatty, access->_access, unlink->_unlink) and line ~383 (the sqlite3_stdio.c Windows section: _setmode on console/file streams). The ACTIVE amalgamation surface is exactly: _isatty (IsConsole/UseWtext probes), _access (the access() macro), _unlink (the unlink macro), _setmode (sqlite3_fsetmode/UTF-16 console modes), plus the wide twins shellDeleteFile uses directly (_wunlink + _waccess, shell.c ~30869) and fileio_chmod uses (_wchmod, ~9942); _chmod ships as the trivial narrow pair of _wchmod. NOT shipped (unused on the active pe route): _open/_close/_read/_write/_lseek and the _findfirst family — the _wfindfirst/_wfindnext references sit in the windirent block which is `_MSC_VER`-gated (DSS predefines _WIN32 only, so it is preprocessed away); no F001A-driven need, and the _O_* mode CONSTANTS (_O_TEXT/_O_BINARY/_O_U8TEXT...) belong to <fcntl.h> per the Windows SDK layout, NOT here (they are the next semantic wave, not this header's provenance). `availableObjectFormats:[pe]` — a Microsoft-CRT header fails loud on elf/macho. `library:{pe:msvcrt.dll}` — all eight are msvcrt.dll exports (verified via dumpbin /exports: _access 171, _chmod 213, _isatty 401, _setmode 726, _unlink 847, _waccess 906, _wchmod 912, _wunlink 1050), NOT kernel32. SIGNATURES (Microsoft SDK corecrt_io.h/corecrt_wio.h): int _access(const char*,int); int _chmod(const char*,int); int _unlink(const char*); int _isatty(int); int _setmode(int,int); the wide forms take const wchar_t* — Windows wchar_t is UTF-16 u16 (== windows.json's WCHAR), so they spell ptr<u16>. NOTE: stddef.json currently ships the FORMAT-NEUTRAL `wchar_t` typedef as i32 (the glibc width) with no pe variant — a pe caller declaring `wchar_t*` therefore mismatches ptr<u16> until stddef.json gains a per-format variant; these signatures stay SDK-TRUE rather than mirroring that latent width gap.",
+  "header": "io.h",
+  "standard": "msvcrt",
+  "availableObjectFormats": ["pe"],
+  "library": { "pe": "msvcrt.dll" },
+  "symbols": [
+    { "name": "_access",  "signature": "fn(ptr<char>, i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "_waccess", "signature": "fn(ptr<u16>, i32) -> i32",  "kind": "function", "linkage": "external" },
+    { "name": "_chmod",   "signature": "fn(ptr<char>, i32) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "_wchmod",  "signature": "fn(ptr<u16>, i32) -> i32",  "kind": "function", "linkage": "external" },
+    { "name": "_unlink",  "signature": "fn(ptr<char>) -> i32",      "kind": "function", "linkage": "external" },
+    { "name": "_wunlink", "signature": "fn(ptr<u16>) -> i32",       "kind": "function", "linkage": "external" },
+    { "name": "_isatty",  "signature": "fn(i32) -> i32",            "kind": "function", "linkage": "external" },
+    { "name": "_setmode", "signature": "fn(i32, i32) -> i32",       "kind": "function", "linkage": "external" }
+  ]
+}
