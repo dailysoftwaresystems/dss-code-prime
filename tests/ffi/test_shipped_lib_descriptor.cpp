@@ -1481,6 +1481,53 @@ TEST(ShippedLibDescriptor, EmptyDescriptorFailsLoud) {
                   rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 1u);
 }
 
+// c100 (D-FFI-WINDOWS-KERNEL32-FUNCTIONS, the time.h slice): the REAL shipped
+// time.json ships a per-format `struct tm` — MSVCRT (pe) is the ISO-C 9 ints
+// (tm_sec..tm_isdst) = 36 bytes with NO tm_gmtoff/tm_zone; glibc/Darwin
+// (elf/macho) is 11 fields = 56 bytes. SQLite's os_win stack-allocates a
+// `struct tm` and localtime/localtime_s write it IN FULL, so a pe build seeing the
+// 56-byte layout would over-read the caller's frame (and an elf build seeing 36
+// would short-write). This pins the real file's per-format tm sizeof AND the
+// pe 9-int layout. RED-ON-DISABLE: drop the pe struct tm variant → the pe build
+// sees the elf 56-byte tm → the pe sizeof assert fails.
+TEST(ShippedLibDescriptor, RealTimeStructTmPerFormatLayout) {
+    fs::path const shippedRoot = shippedLibsRoot();
+    ASSERT_FALSE(shippedRoot.empty())
+        << "could not locate src/dss-config/shippedLibs from cwd";
+    fs::path const timePath = shippedRoot / "time.json";
+    ASSERT_TRUE(fs::exists(timePath)) << timePath.generic_string();
+
+    // sizeof(struct tm) from the REAL time.json, per format, via the SAME layout
+    // engine MIR uses (kNatural16 = the shipped-target LP64 params).
+    auto tmSizeFor = [&](ObjectFormatKind fmt) -> std::uint64_t {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(timePath, interner, typeReg, rep,
+                                             DataModel::Lp64, std::string_view{"x86_64"},
+                                             fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        if (!desc.has_value()) return 0;
+        for (auto const& s : desc->structs) {
+            if (s.name == "tm") {
+                auto layout = computeLayout(s.typeId, interner, kNatural16,
+                                            DataModel::Lp64);
+                EXPECT_TRUE(layout.has_value());
+                return layout ? layout->size : 0;
+            }
+        }
+        ADD_FAILURE() << "struct tm absent from time.json for the requested format";
+        return 0;
+    };
+    EXPECT_EQ(tmSizeFor(ObjectFormatKind::Pe), 36u)
+        << "pe struct tm must be the 9-int MSVCRT layout (36 bytes, no gmtoff/zone)";
+    EXPECT_EQ(tmSizeFor(ObjectFormatKind::Elf), 56u)
+        << "elf struct tm is the glibc 11-field layout (56 bytes)";
+    EXPECT_EQ(tmSizeFor(ObjectFormatKind::MachO), 56u)
+        << "macho struct tm is the Darwin 11-field layout (56 bytes)";
+}
+
 // Every descriptor SHIPPED under src/dss-config/shippedLibs/*.json (Model 3: a
 // FLAT, platform-neutral layout — one descriptor per header) must read + decode
 // cleanly: valid JSON, a non-empty `header` that AGREES with the filename stem
