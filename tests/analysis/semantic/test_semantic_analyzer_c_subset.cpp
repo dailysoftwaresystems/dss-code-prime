@@ -5259,3 +5259,92 @@ TEST(SemanticAnalyzerCSubset, C30InnerTypedefShadowsOuterDistinctType) {
     EXPECT_EQ(ti.kind(a->type), TypeKind::I32)
         << "the in-block `MyT a;` resolves to the INNER typedef (int), shadowing the outer (long)";
 }
+
+// ── c99 (D-CSUBSET-FAM-IN-UNION-MEMBER) ──────────────────────────────────────
+// C99 §6.7.2.1p18 forbids a flexible-array-member-bearing struct as a member of a
+// STRUCTURE or an ELEMENT OF AN ARRAY — it says nothing about a UNION, and
+// gcc/clang both accept a FAM-struct as a DIRECT union member (sqlite's
+// `union { SrcList sSrc; u8 srcSpace[N]; }` stack-slab idiom). So a direct
+// FAM-struct union member is PERMITTED (no S_FlexibleArrayInAggregate); a
+// FAM-struct as a struct member stays fail-loud AT the carve-out branch, and an
+// array-of-FAM-struct as a union member (the p18 "element of an array" case) stays
+// fail-loud UPSTREAM at array construction (applyArraySuffix → InvalidType), never
+// reaching the union carve-out. The two genuine red-on-disable change-guards for
+// the `ck==Union` gate are the accepted/struct-rejected pins; the array and
+// union-of-union pins lock the enforcement boundary on either side.
+
+// PERMITTED: a FAM-struct as a DIRECT union member — no S001D. (The sqlite blocker.)
+TEST(SemanticAnalyzerCSubset, FlexibleArrayStructAsUnionMemberIsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Slab { int n; int a[]; };\n"
+        "union U { struct Slab s; char space[16]; };\n"
+        "int main(void){ union U u; return (int)sizeof(u); }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArrayInAggregate), 0u)
+        << "a FAM-bearing struct is a legal DIRECT union member (gcc/clang accept it)";
+    // The union must still size (layout not rejected): sizeof(U)==16 (max of the
+    // 4-byte Slab prefix and the 16-byte space[]) — pinned end-to-end in the
+    // fam_struct_in_union_member example + TypeLayout.UnionWith… unit test.
+    EXPECT_FALSE(model.hasErrors())
+        << "the whole TU is well-typed once the union FAM member is permitted";
+}
+
+// STILL FORBIDDEN: a FAM-struct as a STRUCT member → S001D (C99 p18, unchanged
+// DSS posture). This is a GENUINE red-on-disable change-guard: the rejection is
+// emitted at the carve-out branch itself (ck==Struct ⇒ `permittedAsUnionMember`
+// false ⇒ famDiag). Widen the `ck==Union` gate to permit a FAM-struct in ANY
+// composite and this struct-member case would wrongly pass.
+TEST(SemanticAnalyzerCSubset, FlexibleArrayStructAsStructMemberStillRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Slab { int n; int a[]; };\n"
+        "struct Bad { struct Slab s; int x; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArrayInAggregate), 1u)
+        << "a FAM-bearing struct as a STRUCT member is C99 p18 ill-formed — must fail loud";
+}
+
+// STILL FORBIDDEN: an ARRAY of a FAM-struct as a UNION member → S001D. p18's
+// "element of an array" bans this even inside a union. The enforcement is UPSTREAM
+// of the c99 carve-out: an array whose element embeds a FAM is rejected at array
+// construction (semantic_analyzer.cpp applyArraySuffix, ~1630/1972 → InvalidType),
+// so this field's type is already invalid before the union carve-out runs — it
+// never reaches that branch. This is therefore a POSTURE regression-guard
+// (array-of-FAM stays rejected regardless of the union relaxation), NOT a
+// red-on-disable guard for the `ck==Union` gate — widening/removing that gate does
+// not affect this case (verified by the c99 audit). Kept as defense-in-depth.
+TEST(SemanticAnalyzerCSubset, ArrayOfFlexibleArrayStructInUnionStillRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Slab { int n; int a[]; };\n"
+        "union Bad { struct Slab arr[3]; char space[64]; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArrayInAggregate), 1u)
+        << "an ARRAY of a FAM-struct is a p18 'element of an array' violation even in a union";
+}
+
+// PERMITTED (gcc-parity, locks the completeness boundary): a UNION whose member is
+// itself a union that (transitively) contains a FAM-struct is ALSO accepted. p18
+// restricts only struct-membership and array-elementhood; a union member of a union
+// is p18-legal, and `typeContainsFlexibleArray` does not recurse into unions, so the
+// inner FAM never reaches the carve-out. gcc/clang accept it (c99 audit verified,
+// S001D=0). This is a POSTURE/parity guard (not a red-on-disable for the `ck==Union`
+// gate): it pins that the simplified gate does NOT over-reject the nested-union form
+// — the exact case the `kind(ft)==Struct` tautology, had it been kept, would have
+// wrongly rejected under a future recursion change.
+TEST(SemanticAnalyzerCSubset, UnionContainingFamStructAsUnionMemberIsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Slab { int n; int a[]; };\n"
+        "union Inner { struct Slab s; int x; };\n"
+        "union Outer { union Inner v; char space[8]; };\n"
+        "int main(void){ union Outer o; return (int)sizeof(o); }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArrayInAggregate), 0u)
+        << "a union member that is a union containing a FAM-struct is p18-legal (gcc/clang accept)";
+    EXPECT_FALSE(model.hasErrors())
+        << "the nested-union form is well-typed — the carve-out must not over-reject it";
+}

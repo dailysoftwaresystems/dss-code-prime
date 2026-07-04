@@ -3534,11 +3534,21 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                 // The not-last / sole-member checks are
                                 // struct-only (a bare FAM in a union is rejected
                                 // earlier — the `allowFlexibleArray=false` gate on
-                                // `unionField` → S_NonConstantArrayLength); but the
-                                // EMBEDDED-FAM-struct check (p18) runs for unions
-                                // too, since a FAM-bearing struct may not be a
-                                // member of a struct OR a union (gcc/clang reject
-                                // both). Enums carry no field types. This is the
+                                // `unionField` → S_NonConstantArrayLength). The
+                                // EMBEDDED-FAM check (p18) also runs for unions,
+                                // but with the c99 D-CSUBSET-FAM-IN-UNION-MEMBER
+                                // carve-out below: p18 forbids a FAM-bearing struct
+                                // as a member of a STRUCTURE or an ELEMENT OF AN
+                                // ARRAY — it says nothing about a UNION. gcc/clang
+                                // both ACCEPT a FAM-struct as a DIRECT union member
+                                // (sqlite's `union { SrcList sSrc; u8 space[N]; }`
+                                // stack-slab idiom relies on it; the FAM tail is
+                                // 0-length for sizeof, so the union sizes to
+                                // max(prefix, N) — computeLayout's Union arm already
+                                // does this). So a DIRECT FAM-struct union member is
+                                // permitted; an ARRAY-of-FAM member (`F arr[3]` — p18
+                                // "element of an array") stays forbidden EVEN in a
+                                // union. Enums carry no field types. This is the
                                 // positioned SEMANTIC surface; the layout engine's
                                 // non-last-FAM nullopt is the backstop.
                                 // D-CSUBSET-SELF-REFERENTIAL-STRUCT: set when a DIRECT
@@ -3588,10 +3598,32 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                             else if (fields.size() == 1)
                                                 famDiag(DiagnosticCode::S_FlexibleArraySoleMember);
                                         } else if (typeContainsFlexibleArray(in, ft)) {
-                                            // A field whose TYPE embeds a FAM (a
-                                            // nested FAM struct / array of one) —
-                                            // forbidden in a struct OR a union.
-                                            famDiag(DiagnosticCode::S_FlexibleArrayInAggregate);
+                                            // A field whose TYPE embeds a flexible array
+                                            // member. `ft` reaching HERE is necessarily a
+                                            // FAM-bearing STRUCT: typeContainsFlexibleArray
+                                            // recurses into struct members but NOT into
+                                            // unions, and an array whose element embeds a
+                                            // FAM is already rejected upstream at array
+                                            // construction (applyArraySuffix → InvalidType,
+                                            // which typeContainsFlexibleArray reports absent)
+                                            // before it can reach this loop. C99 §6.7.2.1p18
+                                            // forbids such a struct as a member of a
+                                            // STRUCTURE (and as an array element) — but says
+                                            // nothing about a UNION, and gcc/clang both
+                                            // ACCEPT a FAM-struct as a direct union member
+                                            // (sqlite's `union { SrcList sSrc; u8 space[N]; }`
+                                            // slab; D-CSUBSET-FAM-IN-UNION-MEMBER). So the
+                                            // gate is purely union-vs-struct: permit in a
+                                            // union, fail loud in a struct. (Deliberately
+                                            // NOT `&& kind(ft)==Struct`: that is a tautology
+                                            // here — every `ft` reaching this branch is a
+                                            // struct — and it would WRONGLY reject the
+                                            // p18-legal `union { union V v; }` were a future
+                                            // change to let a union-typed `ft` through.)
+                                            bool const permittedAsUnionMember =
+                                                ck == CompositeKind::Union;
+                                            if (!permittedAsUnionMember)
+                                                famDiag(DiagnosticCode::S_FlexibleArrayInAggregate);
                                         }
                                     }
                                 }

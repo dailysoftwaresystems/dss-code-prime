@@ -175,6 +175,50 @@ TEST(TypeLayout, NonLastFlexibleArrayMemberFailsLoud) {
             .has_value());
 }
 
+// c99 (D-CSUBSET-FAM-IN-UNION-MEMBER): a union with a FAM-bearing struct member
+// sizes to max(FAM-struct PREFIX size, other members) — the FAM tail is 0-length
+// for sizeof (C99 §6.7.2.1). This is the COMPANION layout-correctness pin the
+// semantic carve-out relies on: the c99 diff touches only the semantic gate, not
+// the layout engine, so this pins (unchanged) that once a FAM-struct is permitted
+// as a UNION member (gcc/clang accept sqlite's `union { SrcList sSrc; u8 space[N]; }`)
+// the union is sized correctly. It is NOT a red-on-disable guard for the carve-out
+// (layout is orthogonal to the gate); it guards against a silent union-sizing
+// miscompile of the newly-reachable shape. Verified against gcc: for
+// `struct Slab{int n; int a[];}` and `union U{struct Slab s; char space[16];}`,
+// sizeof(Slab)==4 and sizeof(U)==16.
+TEST(TypeLayout, UnionWithFlexibleArrayStructMemberSizesToMaxOfPrefix) {
+    auto ti = makeInterner(1);
+    // struct Slab { int n; int a[]; }  → prefix size 4, align 4, FAM tail excluded.
+    TypeId const n    = ti.primitive(TypeKind::I32);
+    TypeId const fam  = ti.incompleteArray(ti.primitive(TypeKind::I32));
+    std::array<TypeId, 2> const slabFields{n, fam};
+    TypeId const slab = ti.structType("Slab", slabFields);
+    auto const slabL = layoutOf(slab, ti);
+    ASSERT_EQ(slabL.size, 4u);           // only `n`; the FAM adds offset, not size
+    EXPECT_TRUE(slabL.hasFlexibleArrayMember);
+
+    // union U { struct Slab s; char space[16]; } → max(4, 16) = 16, align max(4,1)=4.
+    TypeId const space = ti.array(ti.primitive(TypeKind::Char), 16);
+    std::array<TypeId, 2> const uFields{slab, space};
+    auto const uL = layoutOf(ti.unionType("U", uFields), ti);
+    ASSERT_EQ(uL.fieldOffsets.size(), 2u);
+    EXPECT_EQ(uL.fieldOffsets[0], 0u);   // both members at offset 0
+    EXPECT_EQ(uL.fieldOffsets[1], 0u);
+    EXPECT_EQ(uL.size, 16u);             // max(prefix 4, space 16) — NOT the FAM tail
+    EXPECT_EQ(uL.align.bytes(), 4u);     // max(int-align 4, char-align 1)
+
+    // If the FAM-struct member DOMINATES the size (its prefix > the sibling), the
+    // union takes the prefix — proving the FAM contributes only its non-flexible
+    // prefix, never a guessed tail. `struct Big{long p; long q; int a[];}` → prefix 16.
+    TypeId const l64 = ti.primitive(TypeKind::I64);
+    std::array<TypeId, 3> const bigFields{l64, l64, fam};
+    TypeId const big = ti.structType("Big", bigFields);
+    ASSERT_EQ(layoutOf(big, ti).size, 16u);
+    TypeId const oneByte = ti.array(ti.primitive(TypeKind::Char), 1);
+    std::array<TypeId, 2> const u2Fields{big, oneByte};
+    EXPECT_EQ(layoutOf(ti.unionType("U2", u2Fields), ti).size, 16u);   // max(16, 1)
+}
+
 // ── AGNOSTICISM PIN: different params → different layout (no hardcoded rule) ──
 
 TEST(TypeLayout, MaxAlignmentCapChangesOffsetsRedOnDisable) {

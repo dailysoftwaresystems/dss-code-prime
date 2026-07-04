@@ -1,0 +1,34 @@
+{
+  "$comment": "c99 D-CSUBSET-FAM-IN-UNION-MEMBER: runtime witness for a FAM-bearing struct as a DIRECT union member (sqlite's `union{SrcList sSrc; u8 srcSpace[N];}` stack slab). The exit is built from three independent layout-sensitive facts — sizeof(union U)==16, an offset-0 type-pun read-back of the low byte of `n`, and the FAM element at offset 4 not clobbering the leading int — so any union-sizing or FAM-prefix miscompile shifts the exit off 42. The `release` arm (shippedPipeline, zero-drift) proves the union-overlap + FAM-prefix layout survives the real optimizer: Mem2Reg may promote `union U u` to SSA values and must still honor the overlapping members and the prefix-only size.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
