@@ -640,6 +640,12 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     if (k == TypeKind::Struct || k == TypeKind::Union) {
         if (!std::holds_alternative<MirAggregateValue>(v.value)) return false;
         auto const& agg = std::get<MirAggregateValue>(v.value);
+        // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): a static initializer of an
+        // explicit-offset (overlapping) struct would positionally write fields whose
+        // byte ranges overlap — a later field silently overwrites an earlier one in
+        // `buf`. An FFI overlap type is only member-accessed at runtime, never
+        // brace-inited; refuse LOUD rather than emit wrong static bytes.
+        if (in.hasExplicitOffsets(ty)) return false;
         auto const  lay = computeLayout(ty, in, lp, dm);
         if (!lay.has_value()) return false;
         auto const ops = in.operands(ty);

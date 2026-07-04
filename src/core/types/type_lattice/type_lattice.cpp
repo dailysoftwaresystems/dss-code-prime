@@ -276,14 +276,27 @@ encodeFieldBitWidths(std::size_t fieldCount,
 // (StructIsNominalAndStructural). The top bit is set so a content-derived key can
 // never collide with a decl-site key (which the semantic analyzer packs from
 // 32-bit tree/node ids — always < 2^63).
+// c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): explicit field offsets also enter the
+// content identity so an explicit-offset struct is DISTINCT from the same
+// field-types laid out naturally, AND both the shipped `structs` entry and the
+// bare typedef's inline `struct "X" { T @off }` — which carry identical offsets —
+// collapse to one TypeId. The offset mix is GUARDED on non-empty so a struct with
+// NO explicit offsets hashes byte-identically to the pre-c107 function — every
+// existing composite keeps its EXACT declSiteKey (literally no churn), and only an
+// offset-bearing struct gets the extra mix.
 [[nodiscard]] std::uint64_t
 contentDeclSiteKey(std::span<TypeId const> fields,
-                   std::span<std::int64_t const> bitWidthScalars) {
+                   std::span<std::int64_t const> bitWidthScalars,
+                   std::span<std::uint64_t const> fieldOffsets = {}) {
     std::uint64_t h = kFnvOffset;
     h = fnvMix(h, fields.size());
     for (TypeId f : fields) h = fnvMix(h, f.v);
     h = fnvMix(h, bitWidthScalars.size());
     for (std::int64_t s : bitWidthScalars) h = fnvMix(h, static_cast<std::uint64_t>(s));
+    if (!fieldOffsets.empty()) {
+        h = fnvMix(h, fieldOffsets.size());
+        for (std::uint64_t o : fieldOffsets) h = fnvMix(h, o);
+    }
     return h | (std::uint64_t{1} << 63);
 }
 } // namespace
@@ -338,7 +351,8 @@ TypeId TypeInterner::forwardComposite(TypeKind kind, std::string_view name,
 }
 
 void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
-                                     std::span<std::int64_t const> fieldBitWidths) {
+                                     std::span<std::int64_t const> fieldBitWidths,
+                                     std::span<std::uint64_t const> fieldOffsets) {
     TypeRecord const& rec = arena_.at(id);
     if (rec.kind != TypeKind::Struct && rec.kind != TypeKind::Union) {
         latticeFatal("completeComposite: TypeId is not a Struct/Union");
@@ -348,16 +362,24 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
         latticeFatal("completeComposite: TypeId was not forward-minted as a composite");
     }
     auto sc = encodeFieldBitWidths(fields.size(), fieldBitWidths);
+    // c107: explicit offsets are ALL-fields-or-NONE (a partial set is a caller bug).
+    if (!fieldOffsets.empty() && fieldOffsets.size() != fields.size()) {
+        latticeFatal("completeComposite: explicit field offsets must cover every "
+                     "field (all-or-none)");
+    }
     if (it->second.complete) {
         // Idempotent for an IDENTICAL re-completion (a benign re-resolution); a
         // CONFLICTING re-completion is a caller bug — fail loud rather than
         // silently keep stale fields or corrupt a shared TypeId.
         bool same = it->second.fields.size() == fields.size()
-                 && it->second.bitWidthScalars.size() == sc.size();
+                 && it->second.bitWidthScalars.size() == sc.size()
+                 && it->second.fieldOffsets.size() == fieldOffsets.size();
         for (std::size_t i = 0; same && i < fields.size(); ++i)
             if (it->second.fields[i].v != fields[i].v) same = false;
         for (std::size_t i = 0; same && i < sc.size(); ++i)
             if (it->second.bitWidthScalars[i] != sc[i]) same = false;
+        for (std::size_t i = 0; same && i < fieldOffsets.size(); ++i)
+            if (it->second.fieldOffsets[i] != fieldOffsets[i]) same = false;
         if (!same) {
             latticeFatal("completeComposite: composite re-completed with different "
                          "fields (double-complete / tag redecl)");
@@ -366,6 +388,7 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
     }
     it->second.fields.assign(fields.begin(), fields.end());
     it->second.bitWidthScalars = std::move(sc);
+    it->second.fieldOffsets.assign(fieldOffsets.begin(), fieldOffsets.end());
     it->second.complete = true;
     ++poolGen_;   // the field view changed — invalidate any pre-completion span
 }
@@ -398,6 +421,38 @@ TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> f
                                       contentDeclSiteKey(fields, sc));
     completeComposite(id, fields, fieldBitWidths);
     return id;
+}
+
+TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> fields,
+                                std::span<std::int64_t const> fieldBitWidths,
+                                std::span<std::uint64_t const> fieldOffsets) {
+    // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): the offsets enter the content identity
+    // (contentDeclSiteKey) so the shipped `structs` entry and the inline typedef
+    // struct-text — both carrying identical offsets — collapse to one TypeId. An
+    // empty offsets span routes exactly like the 3-arg overload (byte-identical).
+    auto const sc = encodeFieldBitWidths(fields.size(), fieldBitWidths);
+    TypeId const id = internComposite(TypeKind::Struct, name,
+                                      contentDeclSiteKey(fields, sc, fieldOffsets));
+    completeComposite(id, fields, fieldBitWidths, fieldOffsets);
+    return id;
+}
+
+bool TypeInterner::hasExplicitOffsets(TypeId id) const {
+    id = materialId_(id);
+    TypeKind const k = arena_.at(id).kind;
+    if (k != TypeKind::Struct && k != TypeKind::Union) return false;
+    auto it = compositeFields_.find(id.v);
+    return it != compositeFields_.end() && !it->second.fieldOffsets.empty();
+}
+
+std::optional<std::uint64_t>
+TypeInterner::explicitFieldOffset(TypeId id, std::size_t i) const {
+    id = materialId_(id);
+    auto it = compositeFields_.find(id.v);
+    if (it == compositeFields_.end() || i >= it->second.fieldOffsets.size()) {
+        return std::nullopt;
+    }
+    return it->second.fieldOffsets[i];
 }
 
 TypeId TypeInterner::unionType(std::string_view name, std::span<TypeId const> variants) {

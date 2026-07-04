@@ -522,7 +522,7 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
             emitMalformed(reporter, "shipped-lib descriptor " + fat + ": must be an object");
             return false;
         }
-        (void)rejectUnknownKeys(reporter, f, fat, {"name", "type"});
+        (void)rejectUnknownKeys(reporter, f, fat, {"name", "type", "offset"});
         if (!f.contains("name") || !f.at("name").is_string()
             || f.at("name").get<std::string>().empty()) {
             emitMalformed(reporter, "shipped-lib descriptor " + fat
@@ -554,7 +554,19 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
                             + fTypeText + "' failed to decode");
             return false;
         }
-        outFields.push_back(ShippedField{std::move(fname), fty});
+        // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): an optional explicit byte `offset`
+        // (a non-negative integer). All-or-none per struct is enforced by the caller
+        // once every field is decoded (it sees the full set).
+        std::optional<std::uint64_t> foff;
+        if (f.contains("offset")) {
+            if (!f.at("offset").is_number_unsigned()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + fat
+                                            + ": 'offset' must be a non-negative integer");
+                return false;
+            }
+            foff = f.at("offset").get<std::uint64_t>();
+        }
+        outFields.push_back(ShippedField{std::move(fname), fty, foff});
         outFieldTypes.push_back(fty);
     }
     return true;
@@ -1472,7 +1484,32 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                 }
 
                 if (!selected) continue;   // no variant matched → inject nothing
-                sst.typeId = interner.structType(sname, fieldTypes);
+                // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): if the SELECTED field list
+                // carries explicit offsets, intern the struct WITH them (an
+                // overlapping FFI layout). ALL-or-NONE within the struct; a mix is
+                // malformed. The offsets enter the content identity so this tag type
+                // matches the bare typedef's inline `struct "X" { T @off }` (same
+                // TypeId → the injected field scope resolves .member on a bare-typedef
+                // value). Empty → the ordinary natural-alignment struct (unchanged).
+                std::size_t withOffset = 0;
+                for (auto const& fld : sst.fields)
+                    if (fld.offset.has_value()) ++withOffset;
+                if (withOffset != 0 && withOffset != sst.fields.size()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                + ": struct field 'offset' must be "
+                                                  "all-or-none (an overlapping layout "
+                                                  "declares every field's offset)");
+                    continue;
+                }
+                if (withOffset == sst.fields.size() && !sst.fields.empty()) {
+                    std::vector<std::uint64_t> offsets;
+                    offsets.reserve(sst.fields.size());
+                    for (auto const& fld : sst.fields) offsets.push_back(*fld.offset);
+                    std::span<std::int64_t const> const noWidths{};
+                    sst.typeId = interner.structType(sname, fieldTypes, noWidths, offsets);
+                } else {
+                    sst.typeId = interner.structType(sname, fieldTypes);
+                }
                 out.structs.push_back(std::move(sst));
             }
         }

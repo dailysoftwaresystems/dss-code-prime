@@ -384,7 +384,26 @@ private:
                 out_ += "arr<"; appendType(in.operands(t)[0]);
                 out_ += std::format(", {}>", in.scalars(t)[0]); return;
             case TypeKind::Tuple:  out_ += "tuple<"; args(in.operands(t)); out_ += '>'; return;
-            case TypeKind::Struct: out_ += "struct "; out_ += quote(in.name(t)); out_ += " {"; args(in.operands(t)); out_ += '}'; return;
+            case TypeKind::Struct: {
+                out_ += "struct "; out_ += quote(in.name(t)); out_ += " {";
+                // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): emit `@<off>` per field for
+                // an explicit-offset struct so the text round-trips (reintern +
+                // canonicalization depend on the offsets surviving serialization).
+                if (in.hasExplicitOffsets(t)) {
+                    auto const ops = in.operands(t);
+                    bool first = true;
+                    for (std::size_t i = 0; i < ops.size(); ++i) {
+                        if (!first) out_ += ", ";
+                        appendType(ops[i]);
+                        auto const off = in.explicitFieldOffset(t, i);
+                        out_ += std::format(" @{}", off ? *off : 0);
+                        first = false;
+                    }
+                } else {
+                    args(in.operands(t));
+                }
+                out_ += '}'; return;
+            }
             case TypeKind::Union:  out_ += "union ";  out_ += quote(in.name(t)); out_ += " {"; args(in.operands(t)); out_ += '}'; return;
             // D5.5: enum is nominal-by-name; underlying TypeKind lives in
             // scalars[0]. Round-trip the underlying explicitly when it
@@ -1821,8 +1840,28 @@ private:
         if (kw == "tuple") { expect(Tk::LAngle, "'<'"); auto ts = parseTypeListUntil(Tk::RAngle); expect(Tk::RAngle, "'>'");
             return interner_.tuple(ts); }
         if (kw == "struct") { std::string name = takeStr(); expect(Tk::LBrace, "'{'");
-            auto ts = parseTypeListUntil(Tk::RBrace); expect(Tk::RBrace, "'}'");
-            return interner_.structType(name, ts); }
+            // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): each field is a type optionally
+            // followed by `@<byteOffset>` (an explicit overlapping layout). All-or-
+            // none: a mix is malformed. A field-local loop (NOT parseTypeListUntil)
+            // so the `@` is consumed here, never by node-attribute logic (types are
+            // never parsed where `@`-attributes are also legal, so no ambiguity).
+            std::vector<TypeId>        ts;
+            std::vector<std::uint64_t> offs;
+            std::size_t                nWithOff = 0;
+            while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+                ts.push_back(parseType());
+                if (accept(Tk::At)) { offs.push_back(takeInt()); ++nWithOff; }
+                else                { offs.push_back(0); }
+                if (!accept(Tk::Comma)) break;
+            }
+            expect(Tk::RBrace, "'}'");
+            if (nWithOff == 0) return interner_.structType(name, ts);
+            if (nWithOff != ts.size()) {
+                malformed("struct field offsets must be all-or-none");
+                return InvalidType;
+            }
+            std::span<std::int64_t const> const noWidths{};
+            return interner_.structType(name, ts, noWidths, offs); }
         if (kw == "union") { std::string name = takeStr(); expect(Tk::LBrace, "'{'");
             auto ts = parseTypeListUntil(Tk::RBrace); expect(Tk::RBrace, "'}'");
             return interner_.unionType(name, ts); }

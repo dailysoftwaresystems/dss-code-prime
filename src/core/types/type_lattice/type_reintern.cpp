@@ -151,7 +151,17 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
             for (std::int64_t enc : srcWidths)
                 widths.push_back(enc <= 0 ? kNotBitfield : enc - 1);
         }
-        dst.completeComposite(fwd, fields, widths);
+        // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): carry EXPLICIT field offsets across
+        // reintern — without this the reinterned composite loses its overlapping
+        // layout (HighPart falls back to natural offset 8) and forks the TypeId that
+        // `.member` scope keys on. Empty when the source lays out naturally.
+        std::vector<std::uint64_t> offsets;
+        if (src.hasExplicitOffsets(srcId)) {
+            offsets.reserve(srcFields.size());
+            for (std::size_t i = 0; i < srcFields.size(); ++i)
+                offsets.push_back(src.explicitFieldOffset(srcId, i).value_or(0));
+        }
+        dst.completeComposite(fwd, fields, widths, offsets);
         return fwd;
     }
 

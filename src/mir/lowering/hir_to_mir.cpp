@@ -3205,6 +3205,18 @@ struct Lowerer {
         if (hasBitfieldMember(aggTy)) {
             return lowerBitfieldAggregateInitIntoSlot(aggNode, allocaPtr, aggTy, vf);
         }
+        // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): brace-initializing an explicit-offset
+        // (overlapping) struct would positionally Store each field, so a later field
+        // silently clobbers an earlier one that shares its bytes — a wrong-but-runs
+        // aggregate. An FFI overlap type (ULARGE_INTEGER) is only ever member-assigned
+        // (overlap-immune, indexed offsets), never brace-inited; refuse LOUD rather
+        // than miscompile. (Materially strip volatile via the interner's own view.)
+        if (interner.hasExplicitOffsets(aggTy)) {
+            unsupported(aggNode, "brace-initialization of an overlapping "
+                                 "explicit-offset struct is unsupported — its members "
+                                 "share bytes; assign the members individually");
+            return false;
+        }
         auto kids = hir.children(aggNode);
         for (std::size_t i = 0; i < kids.size(); ++i) {
             auto const off =
@@ -3474,7 +3486,11 @@ struct Lowerer {
         if (anyAggregateField)
             return lowerByteWiseCopy(srcPtr, dstPtr, layout->size, vf);
 
-        // Flat scalar struct — field-wise, width-exact.
+        // Flat scalar struct — field-wise, width-exact. c107: an explicit-offset
+        // (overlapping) struct needs NO guard here — unlike brace-init/static-encode
+        // (which write distinct per-field VALUES and would clobber), a by-value COPY
+        // reads one coherent source and re-writes any overlapping byte identically,
+        // so the redundant writes are byte-equal and the copy is correct.
         for (std::size_t i = 0; i < fieldTypes.size(); ++i) {
             MirInstId const offK = constInt(
                 static_cast<std::int64_t>(layout->fieldOffsets[i]));

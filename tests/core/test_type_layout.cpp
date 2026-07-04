@@ -84,6 +84,54 @@ TEST(TypeLayout, StructCharIntCharIsThePaddingClassic) {
     EXPECT_FALSE(l.hasFlexibleArrayMember);
 }
 
+// c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): a struct with EXPLICIT per-field byte
+// offsets lays its members at those offsets — which may OVERLAP — instead of
+// deriving them by natural alignment. ULARGE_INTEGER {QuadPart u64@0, LowPart
+// u32@0, HighPart u32@4}: size is the MAX field EXTENT (8), align the max field
+// align (8), and the members share bytes. RED-ON-DISABLE: were offsets ignored,
+// the derive path would place them at 0/8/12 → size 16.
+TEST(TypeLayout, ExplicitOffsetsOverlapAndSizeIsMaxExtent) {
+    auto ti = makeInterner(1);
+    TypeId const u64 = ti.primitive(TypeKind::U64);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    std::array<TypeId, 3>        const fields{u64, u32, u32};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 3> const offsets{0, 0, 4};
+    TypeId const ov = ti.structType("ULARGE", fields, noWidths, offsets);
+    EXPECT_TRUE(ti.hasExplicitOffsets(ov));
+    auto const l = layoutOf(ov, ti);
+    ASSERT_EQ(l.fieldOffsets.size(), 3u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);   // QuadPart
+    EXPECT_EQ(l.fieldOffsets[1], 0u);   // LowPart  overlays QuadPart low
+    EXPECT_EQ(l.fieldOffsets[2], 4u);   // HighPart overlays QuadPart high
+    EXPECT_EQ(l.size, 8u);              // max extent (4 + 4), NOT 16
+    EXPECT_EQ(l.align.bytes(), 8u);     // max field align (u64)
+
+    // The same field-types laid out NATURALLY are a distinct type + a distinct
+    // (non-overlapping) layout — the identity fork that keeps an FFI overlap from
+    // ever aliasing an ordinary struct.
+    TypeId const nat = ti.structType("ULARGE", fields);
+    EXPECT_NE(ov, nat);
+    EXPECT_FALSE(ti.hasExplicitOffsets(nat));
+    EXPECT_EQ(layoutOf(nat, ti).size, 16u);
+}
+
+// c107: bit-fields and explicit offsets are mutually exclusive (the offsets ride a
+// SEPARATE channel from the bit-width scalars). A struct that somehow carried BOTH
+// must FAIL LOUD at layout (nullopt), never silently mis-place — the layout arm's
+// `!scalars(id).empty()` guard on the explicit-offset path.
+TEST(TypeLayout, ExplicitOffsetsWithBitfieldsFailsLoud) {
+    auto ti = makeInterner(1);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    std::array<TypeId, 2>        const fields{u32, u32};
+    std::array<std::int64_t, 2>  const widths{4, kNotBitfield};   // a real bit-field
+    std::array<std::uint64_t, 2> const offsets{0, 0};
+    TypeId const bad = ti.structType("BAD", fields, widths, offsets);
+    AggregateLayoutParams p{ScalarAlignmentRule::Natural, 16};
+    p.bitFieldStrategy = BitFieldStrategy::GnuPacked;   // realized, so only the c107 guard can reject
+    EXPECT_FALSE(computeLayout(bad, ti, p, DataModel::Lp64).has_value());
+}
+
 TEST(TypeLayout, StructTailPaddingAndNesting) {
     auto ti = makeInterner(1);
     TypeId const i = ti.primitive(TypeKind::I32);

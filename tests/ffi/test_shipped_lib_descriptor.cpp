@@ -2733,4 +2733,37 @@ TEST(ShippedLibDescriptor, RealStatTimeMacrosAndErrnoAccessorPerFormat) {
     EXPECT_TRUE(el);
 }
 
+// c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): windows.json models ULARGE_INTEGER as an
+// explicit-offset OVERLAP struct {QuadPart u64@0, LowPart u32@0, HighPart u32@4} —
+// the FILETIME→time idiom (shell.c writes the two u32 halves, reads the u64 whole).
+// The layout engine must place the members at their DECLARED offsets (overlapping),
+// giving size 8, not the 16 a naturally-derived {u64,u32,u32} would produce.
+// RED-ON-DISABLE: drop HighPart's `@4` (or the whole offsets set) → the derive path
+// lays QuadPart@0/LowPart@8/HighPart@12 → size 16, fieldOffsets != {0,0,4}.
+TEST(ShippedLibDescriptor, RealWindowsUlargeOverlayLayout) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    auto desc = decodeShippedFor(root / "windows.json", interner, typeReg,
+                                 ObjectFormatKind::Pe);
+    ASSERT_TRUE(desc.has_value());
+    bool saw = false;
+    for (auto const& s : desc->structs) {
+        if (s.name != "ULARGE_INTEGER") continue;
+        EXPECT_TRUE(interner.hasExplicitOffsets(s.typeId))
+            << "ULARGE_INTEGER must carry explicit offsets";
+        auto layout = computeLayout(s.typeId, interner, kNatural16,
+                                    DataModel::Lp64);
+        ASSERT_TRUE(layout.has_value());
+        EXPECT_EQ(layout->size, 8u) << "overlap → 8 bytes, not 16";
+        ASSERT_EQ(layout->fieldOffsets.size(), 3u);
+        EXPECT_EQ(layout->fieldOffsets[0], 0u) << "QuadPart @ 0";
+        EXPECT_EQ(layout->fieldOffsets[1], 0u) << "LowPart @ 0 (overlays QuadPart low)";
+        EXPECT_EQ(layout->fieldOffsets[2], 4u) << "HighPart @ 4 (overlays QuadPart high)";
+        saw = true;
+    }
+    EXPECT_TRUE(saw) << "ULARGE_INTEGER absent from windows.json structs on pe";
+}
+
 } // namespace

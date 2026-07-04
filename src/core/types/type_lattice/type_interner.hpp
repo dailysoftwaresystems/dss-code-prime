@@ -204,7 +204,8 @@ public:
     // complete composite is a caller bug and aborts loud. `id` MUST be a composite
     // minted by `forwardComposite` (else fatal).
     void completeComposite(TypeId id, std::span<TypeId const> fields,
-                           std::span<std::int64_t const> fieldBitWidths = {});
+                           std::span<std::int64_t const> fieldBitWidths = {},
+                           std::span<std::uint64_t const> fieldOffsets = {});
     // True iff `id` is a Struct/Union that was forward-minted but NOT yet completed.
     // An EXPLICIT flag, NOT "operands empty": `struct E {}` is a LEGAL COMPLETE
     // zero-field struct (size 0). A non-composite kind is never incomplete here.
@@ -230,6 +231,28 @@ public:
     // so two structs differing only in a bitfield width are distinct interned types.
     TypeId structType(std::string_view name, std::span<TypeId const> fields,
                       std::span<std::int64_t const> fieldBitWidths);
+    // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): a struct with per-field EXPLICIT byte
+    // offsets — a foreign OVERLAPPING layout (an FFI union modeled as a struct whose
+    // members may share/overlap byte ranges: ULARGE_INTEGER {QuadPart u64@0,
+    // LowPart u32@0, HighPart u32@4}). `fieldOffsets[i]` is field i's byte offset; the
+    // span is ALL-fields-or-EMPTY (a partial offset set is a caller bug). The offsets
+    // are part of the struct's CONTENT identity (they change layout), so an
+    // explicit-offset struct is a DISTINCT interned type from the same field-types
+    // laid out naturally — and both the shipped `structs` entry and the bare typedef's
+    // inline `struct "X" { T @off }` text carry identical offsets so they collapse to
+    // ONE TypeId (the tag/typedef canonicalization the field-scope injection relies on).
+    // Independent of bitfields (offsets need not compose with bit-widths); passing a
+    // non-empty offsets span with bitfields is unsupported (fail loud at layout).
+    TypeId structType(std::string_view name, std::span<TypeId const> fields,
+                      std::span<std::int64_t const> fieldBitWidths,
+                      std::span<std::uint64_t const> fieldOffsets);
+    // True iff `id` is a Struct carrying c107 explicit field offsets (non-empty
+    // `fieldOffsets`). Struct/Union only; false for every naturally-laid-out composite.
+    [[nodiscard]] bool hasExplicitOffsets(TypeId id) const;
+    // Field `i`'s explicit byte offset, or nullopt when the composite derives offsets
+    // from natural alignment (the ordinary path). Mirrors `fieldBitWidth`.
+    [[nodiscard]] std::optional<std::uint64_t> explicitFieldOffset(
+        TypeId id, std::size_t i) const;
     TypeId unionType(std::string_view name, std::span<TypeId const> variants);
     // FC8 bitfields (D-CSUBSET-BITFIELD): a union with per-member bit-field widths
     // (same `kNotBitfield`/width encoding + empty-scalars-when-none rule as the
@@ -365,6 +388,15 @@ private:
         std::vector<TypeId>       fields;            // field/variant TypeIds
         std::vector<std::int64_t> bitWidthScalars;   // (width+1)/0 encoding; EMPTY when
                                                      // no bit-field (cf. structType)
+        // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): per-field EXPLICIT byte offsets, for
+        // a struct whose foreign layout OVERLAPS (an FFI union modeled as an
+        // explicit-offset struct — ULARGE_INTEGER {QuadPart@0, LowPart@0, HighPart@4}).
+        // A SEPARATE channel from `bitWidthScalars` on purpose: the bitfield-presence
+        // test is `!scalars(id).empty()` at three lowering sites, and reintern decodes
+        // scalars as (width+1) — offsets in that pool would route the struct through
+        // the bitfield packer AND reintern as garbage widths. EMPTY = derive offsets
+        // from natural alignment (every existing struct → byte-identical TypeId).
+        std::vector<std::uint64_t> fieldOffsets;
         std::uint64_t             declSiteKey = 0;   // the nominal-identity discriminator
         bool                      complete    = false;
     };

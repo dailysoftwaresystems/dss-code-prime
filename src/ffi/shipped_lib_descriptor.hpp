@@ -226,9 +226,17 @@ struct DSS_EXPORT ShippedMacro {
 // hir-text-decodable type, spelled as its RESOLVED form (e.g. `i64` for an
 // `off_t` field — parseTypeFromText resolves hir-text builtins, NOT descriptor
 // typedef names like `off_t`).
+//
+// c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): an optional explicit byte `offset` models
+// a foreign OVERLAPPING layout (an FFI union as an explicit-offset struct — e.g.
+// ULARGE_INTEGER {QuadPart@0, LowPart@0, HighPart@4}). Within one struct it is
+// ALL-fields-or-NONE (a mix is F_ShippedLibDescriptorMalformed); offsets may
+// overlap and need not be sorted. Absent → the layout engine derives offsets by
+// natural alignment (the ordinary case, byte-identical to pre-c107).
 struct DSS_EXPORT ShippedField {
-    std::string name;
-    TypeId      type;
+    std::string                 name;
+    TypeId                      type;
+    std::optional<std::uint64_t> offset;
 };
 
 // One decoded STRUCT — the neutral form of a header's `struct tag { … };` with

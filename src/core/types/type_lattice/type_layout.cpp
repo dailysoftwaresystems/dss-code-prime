@@ -311,6 +311,29 @@ computeLayout(TypeId id, TypeInterner const& interner,
             StructLayout out{};
             out.align = Alignment::of<1>();
             out.fieldOffsets.reserve(fields.size());
+            // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): a struct carrying EXPLICIT
+            // per-field byte offsets (an FFI overlapping-union modeled as a struct)
+            // uses those offsets verbatim instead of natural-alignment derivation.
+            // Offsets may OVERLAP (ULARGE_INTEGER {QuadPart@0, LowPart@0, HighPart@4}):
+            // size = the max field extent, align = the max field alignment. This is
+            // a SEPARATE channel from bitfields (offsets are not in scalars — F1), so
+            // an explicit-offset struct never carries bit-fields; a config that pairs
+            // them is rejected here (fail loud) rather than silently mis-laid.
+            if (interner.hasExplicitOffsets(id)) {
+                if (!interner.scalars(id).empty()) return std::nullopt;  // bitfields + offsets: unsupported
+                std::uint64_t extent = 0;
+                for (std::size_t i = 0; i < fields.size(); ++i) {
+                    auto const off = interner.explicitFieldOffset(id, i);
+                    if (!off) return std::nullopt;                 // partial offsets: malformed
+                    auto const fl = computeLayout(fields[i], interner, params, dm);
+                    if (!fl) return std::nullopt;
+                    out.fieldOffsets.push_back(*off);
+                    out.align = maxAlign(out.align, fl->align);
+                    extent = std::max(extent, *off + fl->size);
+                }
+                out.size = out.align.alignUp(extent);
+                return out;
+            }
             // FC8 bitfields (D-CSUBSET-BITFIELD): a bitfield-free struct interns
             // with EMPTY scalars (see TypeInterner::structType), so this O(1) test
             // routes every existing struct down the unchanged byte path below.
