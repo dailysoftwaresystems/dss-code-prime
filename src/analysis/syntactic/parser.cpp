@@ -2171,10 +2171,14 @@ ParseResult Parser::parse() && {
     // back on (the CU oracle's input) + the global-scope TYPE names it
     // bound (the oracle's harvest surface). Both empty for binder-less
     // languages.
+    // c108: capture the total token-work BEFORE moving the builder (the stream is
+    // untouched by finish()) — the deterministic O(N)-work proxy for the perf pin.
+    std::uint64_t const accesses = I.tokens.accessCount();
     return ParseResult{
         .tree               = std::move(*I.builder).finish(),
         .typeNameCandidates = I.sketch.takeCandidates(),
         .globalTypeNames    = I.sketch.globalTypeNames(),
+        .tokenAccessCount   = accesses,
     };
 }
 

@@ -85,6 +85,7 @@ namespace {
 
 Token const& TokenStream::peek(std::size_t lookahead) const noexcept {
     if (tokens_.empty()) emptyStreamFatal();
+    ++accessCount_;   // c108: total-work proxy (see accessCount())
     const std::size_t at = pos_ + lookahead;
     if (at >= tokens_.size()) return tokens_.back();   // Eof
     return tokens_[at];
@@ -92,6 +93,7 @@ Token const& TokenStream::peek(std::size_t lookahead) const noexcept {
 
 Token TokenStream::advance() noexcept {
     if (tokens_.empty()) emptyStreamFatal();
+    ++accessCount_;   // c108: total-work proxy (see accessCount())
     if (pos_ >= tokens_.size() - 1) return tokens_.back();   // Eof: idempotent
     return tokens_[pos_++];
 }
