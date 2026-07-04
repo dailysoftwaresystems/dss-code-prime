@@ -34,6 +34,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace dss;
 using namespace dss::ffi;
@@ -1569,6 +1570,103 @@ TEST(ShippedLibDescriptor, RealWindowsSyncStructLayout) {
     EXPECT_EQ(sizeOf("SRWLOCK"), 8u) << "SRWLOCK is a single PVOID Ptr";
     EXPECT_EQ(sizeOf("CRITICAL_SECTION"), 40u)
         << "RTL_CRITICAL_SECTION x64: ptr+i32+i32+ptr+ptr+u64 = 40 bytes";
+}
+
+// c102 (D-FFI-WINDOWS-KERNEL32-FUNCTIONS, the file/heap/time slice): the real
+// windows.json ships the 47 kernel32 file/heap/mmap/library/error/sysinfo/time
+// functions the sqlite os_win VFS calls through its aSyscall[] table — every one an
+// SDK-verified real kernel32 export (HeapAlloc/HeapReAlloc/HeapSize forward to
+// NTDLL.Rtl*, loader-valid exactly like c101's AcquireSRWLockExclusive). This pins
+// the DECODED SIGNATURES so a width/arity/return regression fails loud HERE, not as
+// a silent os_win miscompile: SIZE_T must decode u64 (a u32 truncates a >4 GiB mmap
+// length); SetFilePointerEx's by-value LARGE_INTEGER (an 8-byte union) must be the
+// single i64 the Win x64 ABI passes in one register; LPCWSTR must be ptr<u16> (wide)
+// and LPCSTR ptr<char> (ANSI) — a swap silently corrupts every path string. Every
+// signature is the sqlite os_win aSyscall[] WINAPI cast (ground truth). RED-ON-DISABLE:
+// drop a symbol → the presence loop fails; change a scalar width / swap wide-vs-ANSI
+// → the shape / pointee assert fails. windows.json is pe-only (ObjectFormatKind::Pe).
+TEST(ShippedLibDescriptor, RealWindowsKernel32FileHeapTimeSignatures) {
+    fs::path const shippedRoot = shippedLibsRoot();
+    ASSERT_FALSE(shippedRoot.empty())
+        << "could not locate src/dss-config/shippedLibs from cwd";
+    fs::path const winPath = shippedRoot / "windows.json";
+    ASSERT_TRUE(fs::exists(winPath)) << winPath.generic_string();
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(winPath, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Pe);
+    ASSERT_TRUE(desc.has_value());
+    ASSERT_FALSE(rep.hasErrors());
+
+    auto sigOf = [&](std::string_view name) -> std::optional<TypeId> {
+        for (auto const& s : desc->symbols)
+            if (s.name == name) return s.signature;
+        return std::nullopt;
+    };
+
+    // (1) Every c102 kernel32 function is present + decodes to an FnSig.
+    static constexpr std::string_view kC102Fns[] = {
+        "CreateFileW", "DeleteFileW", "ReadFile", "WriteFile", "SetFilePointerEx",
+        "SetEndOfFile", "FlushFileBuffers", "GetFileSizeEx", "GetFileAttributesW",
+        "GetFileAttributesExW", "GetFullPathNameW", "GetTempPathW", "AreFileApisANSI",
+        "LockFileEx", "UnlockFileEx", "CloseHandle", "HeapCreate", "HeapDestroy",
+        "HeapAlloc", "HeapReAlloc", "HeapFree", "HeapSize", "HeapCompact",
+        "HeapValidate", "GetProcessHeap", "CreateFileMappingW", "MapViewOfFile",
+        "UnmapViewOfFile", "FlushViewOfFile", "LoadLibraryW", "FreeLibrary",
+        "GetProcAddress", "GetLastError", "FormatMessageW", "LocalFree",
+        "OutputDebugStringA", "GetSystemInfo", "GetSystemTimeAsFileTime",
+        "GetTickCount64", "QueryPerformanceCounter", "Sleep", "GetCurrentProcessId",
+        "GetCurrentThreadId", "WaitForSingleObject", "WaitForSingleObjectEx",
+        "MultiByteToWideChar", "WideCharToMultiByte",
+    };
+    for (auto name : kC102Fns) {
+        auto s = sigOf(name);
+        ASSERT_TRUE(s.has_value()) << name << " absent from windows.json symbols";
+        EXPECT_EQ(interner.kind(*s), TypeKind::FnSig) << name;
+    }
+
+    // (2) Representative signatures pinned to exact (result, params...) shape —
+    // the full scalar/pointer/void span and arities 0/1/3/4/7/8.
+    using K = TypeKind;
+    auto shape = [&](std::string_view name, K ret, std::vector<K> const& params) {
+        auto s = sigOf(name);
+        ASSERT_TRUE(s.has_value()) << name;
+        ASSERT_EQ(interner.kind(*s), K::FnSig) << name;
+        EXPECT_EQ(interner.kind(interner.fnResult(*s)), ret) << name << " return";
+        auto ps = interner.fnParams(*s);
+        ASSERT_EQ(ps.size(), params.size()) << name << " arity";
+        for (std::size_t i = 0; i < params.size(); ++i)
+            EXPECT_EQ(interner.kind(ps[i]), params[i]) << name << " param " << i;
+    };
+    shape("CreateFileW", K::Ptr,
+          {K::Ptr, K::U32, K::U32, K::Ptr, K::U32, K::U32, K::Ptr});
+    shape("SetFilePointerEx", K::I32, {K::Ptr, K::I64, K::Ptr, K::U32}); // LARGE_INTEGER by-value = i64
+    shape("HeapAlloc", K::Ptr, {K::Ptr, K::U32, K::U64});                // SIZE_T = u64
+    shape("GetLastError", K::U32, {});
+    shape("GetTickCount64", K::U64, {});
+    shape("GetSystemInfo", K::Void, {K::Ptr});
+    shape("WideCharToMultiByte", K::I32,
+          {K::U32, K::U32, K::Ptr, K::I32, K::Ptr, K::I32, K::Ptr, K::Ptr});
+
+    // (3) wide (LPCWSTR → ptr<u16>) vs ANSI (LPCSTR → ptr<char>) must not swap.
+    auto pointeeKind = [&](std::string_view name, std::size_t paramIdx) -> K {
+        auto s = sigOf(name);
+        EXPECT_TRUE(s.has_value()) << name;
+        if (!s) return K::Void;
+        auto ps = interner.fnParams(*s);
+        EXPECT_GT(ps.size(), paramIdx) << name;
+        if (ps.size() <= paramIdx) return K::Void;
+        auto elem = interner.operands(ps[paramIdx]);
+        EXPECT_EQ(elem.size(), 1u) << name << " param " << paramIdx << " is not a ptr";
+        return elem.empty() ? K::Void : interner.kind(elem[0]);
+    };
+    EXPECT_EQ(pointeeKind("CreateFileW", 0), K::U16) << "LPCWSTR path is wide (u16)";
+    EXPECT_EQ(pointeeKind("GetProcAddress", 1), K::Char) << "LPCSTR name is ANSI (char)";
+    EXPECT_EQ(pointeeKind("MultiByteToWideChar", 2), K::Char) << "LPCSTR src is ANSI";
+    EXPECT_EQ(pointeeKind("MultiByteToWideChar", 4), K::U16) << "LPWSTR dst is wide";
 }
 
 // Every descriptor SHIPPED under src/dss-config/shippedLibs/*.json (Model 3: a
