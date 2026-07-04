@@ -31,6 +31,7 @@ namespace {
         case MirOpcode::Add:           return "Add";
         case MirOpcode::Sub:           return "Sub";
         case MirOpcode::Mul:           return "Mul";
+        case MirOpcode::UMulH:         return "UMulH";
         case MirOpcode::ICmpEq:        return "ICmpEq";
         case MirOpcode::ICmpNe:        return "ICmpNe";
         case MirOpcode::ICmpSlt:       return "ICmpSlt";
@@ -154,6 +155,14 @@ enum class MnemonicSlot : std::uint8_t {
     // xor_rdx_zero+div_op) or — remainder only — the generic
     // rem = n − (n/d)·d expansion over div + mul + sub.
     SDivNative, UDivNative, SModNative, UModNative,
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): unsigned MUL-HIGH realization slots,
+    // mirroring the div/mod capability split. `UMulHNative` = a target's native
+    // 3-address high-multiply (arm64 `umulh Xd,Xn,Xm`) → ONE LIR op. `UMulHCore` =
+    // the x86 implicit-register one-operand MUL (`mul r/m64`, 0xF7 /4: RAX*rm →
+    // RDX:RAX, the high half captured from RDX by the `high` outputRole) → a
+    // mov-in / core / mov-out sequence like the div pair but with NO pre-op (MUL
+    // overwrites RDX:RAX unconditionally). A target declaring neither fails loud.
+    UMulHNative, UMulHCore,
     // FC3.5 sweep-c2 (FCmp LIR lowering — D-COND-FLOAT-NAN-TRUTHINESS-
     // FCMP): float compare writing FLAGS, no register result — the
     // float sibling of `cmp`. x86_64 binds UCOMISD (66 0F 2E, width
@@ -312,6 +321,8 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::UDivNative,    "udiv"},
     {MnemonicSlot::SModNative,    "smod"},
     {MnemonicSlot::UModNative,    "umod"},
+    {MnemonicSlot::UMulHNative,   "umulh"},    // c103: arm64 native high-multiply
+    {MnemonicSlot::UMulHCore,     "umul_op"},  // c103: x86 `mul r/m64` (0xF7 /4)
     {MnemonicSlot::FCmp,          "fcmp"},
     {MnemonicSlot::MSub,          "msub"},
     {MnemonicSlot::MovkLsl16,     "movk_lsl16"},
@@ -1341,6 +1352,7 @@ struct Lowerer {
             case MirOpcode::Add:    return lowerBinaryOp(id, MnemonicSlot::Add);
             case MirOpcode::Sub:    return lowerBinaryOp(id, MnemonicSlot::Sub);
             case MirOpcode::Mul:    return lowerBinaryOp(id, MnemonicSlot::Mul);
+            case MirOpcode::UMulH:  return lowerMulHigh(id);
             case MirOpcode::SDiv:   return lowerDivLike(id, /*isSigned=*/true,  /*wantRemainder=*/false);
             case MirOpcode::UDiv:   return lowerDivLike(id, /*isSigned=*/false, /*wantRemainder=*/false);
             case MirOpcode::SMod:   return lowerDivLike(id, /*isSigned=*/true,  /*wantRemainder=*/true);
@@ -3833,6 +3845,99 @@ struct Lowerer {
             LirOperand::makeReg(capturePhys)};
         emitInst(*movOp, result, captureOps);
         return result;
+    }
+
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): lower MIR `UMulH` (the high 64 bits of the
+    // u64*u64 128-bit product) via the SAME capability-probing pattern as div/mod,
+    // but simpler — there is NO pre-op (x86 MUL overwrites RDX:RAX unconditionally,
+    // unlike IDIV which needs CQO to sign-extend the dividend into RDX first).
+    //   Rule 1 — NATIVE: the target declares `umulh` as a `result: value` 3-address
+    //     op (arm64 `UMULH Xd,Xn,Xm`) → ONE LIR op.
+    //   Rule 2 — IMPLICIT-REGISTER CORE: the target declares `umul_op` (x86
+    //     `mul r/m64`, 0xF7 /4) with implicitRegisters {inputRoles:{multiplicand},
+    //     outputRoles:{high}} → mov op0 → multiplicand reg (RAX); core op1 (modrm.rm,
+    //     result in implicit RDX:RAX); mov result ← high-role reg (RDX). Role-based
+    //     capture mirrors the div contract (never a positional `outputs` index).
+    //   Else → fail loud (no high-multiply realization declared for this target).
+    void lowerMulHigh(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 2) {
+            reportUnsupported(mir.instOpcode(id), id);
+            return;
+        }
+        std::optional<LirReg> const a = regForValue(operands[0]);
+        std::optional<LirReg> const b = regForValue(operands[1]);
+        if (!a.has_value() || !b.has_value()) return;
+        std::uint8_t const widthFlags = widthFlagsForType(mir.instType(id));
+
+        // Rule 1 — native result-bearing high-multiply (arm64 `umulh`).
+        if (auto const nativeOp = opcode(MnemonicSlot::UMulHNative); nativeOp.has_value()) {
+            auto const* ni = target.opcodeInfo(*nativeOp);
+            if (ni == nullptr || ni->result != TargetResultRule::Value) {
+                reportUnsupported(mir.instOpcode(id), id);
+                return;
+            }
+            LirReg const result = lir.newVReg(regClassFor(id));
+            std::array<LirOperand, 2> const ops{
+                LirOperand::makeReg(*a), LirOperand::makeReg(*b)};
+            emitInst(*nativeOp, result, ops, /*payload=*/0, widthFlags);
+            defineValue(id, result);
+            return;
+        }
+
+        // Rule 2 — x86 implicit-register core (`mul r/m64`), NO pre-op.
+        auto const coreOp = opcode(MnemonicSlot::UMulHCore);
+        if (!coreOp.has_value()) {
+            // Neither realization declared — report the native verb as the
+            // canonical missing capability (mirrors emitDivLikeValue).
+            reportMissingOpcode(MnemonicSlot::UMulHNative,
+                                mirOpcodeName(mir.instOpcode(id)));
+            return;
+        }
+        auto const movOp = opcode(MnemonicSlot::Mov);
+        if (!movOp.has_value()) {
+            reportMissingOpcode(MnemonicSlot::Mov, "MIR UMulH (pin/capture)");
+            return;
+        }
+        auto const* coreInfo = target.opcodeInfo(*coreOp);
+        if (coreInfo == nullptr || !coreInfo->implicitRegisters.has_value()) {
+            reportUnsupported(mir.instOpcode(id), id);
+            return;
+        }
+        auto const& coreIr = *coreInfo->implicitRegisters;
+        auto const multOrdinal = coreIr.inputOrdinalForRole("multiplicand");
+        if (!multOrdinal.has_value()) {
+            reportMissingImplicitRole(*coreOp, "inputRoles", "multiplicand", id);
+            return;
+        }
+        auto const highOrdinal = coreIr.outputOrdinalForRole("high");
+        if (!highOrdinal.has_value()) {
+            reportMissingImplicitRole(*coreOp, "outputRoles", "high", id);
+            return;
+        }
+        auto const* multRegInfo = target.registerInfo(*multOrdinal);
+        auto const* highRegInfo = target.registerInfo(*highOrdinal);
+        if (multRegInfo == nullptr || highRegInfo == nullptr) {
+            reportUnsupported(mir.instOpcode(id), id);
+            return;
+        }
+        LirRegClass const multCls = static_cast<LirRegClass>(multRegInfo->regClass);
+        LirRegClass const highCls = static_cast<LirRegClass>(highRegInfo->regClass);
+        LirReg const multPhys = makePhysicalReg(*multOrdinal, multCls);
+
+        // 1. Pin operand 0 into the multiplicand register (RAX).
+        std::array<LirOperand, 1> const movInOps{LirOperand::makeReg(*a)};
+        emitInst(*movOp, multPhys, movInOps);
+        // 2. Core MUL: one operand (op1 in modrm.rm); product lands in the implicit
+        //    RDX:RAX pair, no SSA result (result: none — outputs are implicit).
+        std::array<LirOperand, 1> const mulOps{LirOperand::makeReg(*b)};
+        emitInst(*coreOp, InvalidLirReg, mulOps, /*payload=*/0, widthFlags);
+        // 3. Capture the high half (RDX, the "high" outputRole) into a fresh SSA result.
+        LirReg const result = lir.newVReg(regClassFor(id));
+        LirReg const highPhys = makePhysicalReg(*highOrdinal, highCls);
+        std::array<LirOperand, 1> const captureOps{LirOperand::makeReg(highPhys)};
+        emitInst(*movOp, result, captureOps);
+        defineValue(id, result);
     }
 
     void reportMissingImplicitRole(std::uint16_t opId, char const* mapName,

@@ -44,6 +44,11 @@ enum class MirOpcode : std::uint16_t {
 
     // ── integer arithmetic ──
     Add, Sub, Mul, SDiv, UDiv, SMod, UMod, Neg,
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): unsigned MUL-HIGH -- the high 64 bits of
+    // the u64*u64 128-bit product. The `__umulh` builtin (sqlite3Multiply128/160)
+    // lowers to this; x86 `mul r/m64` captures RDX, arm64 native `umulh`. Pure +
+    // commutative (high(a*b) == high(b*a)), like Mul.
+    UMulH,
     // ── floating-point arithmetic ──
     FAdd, FSub, FMul, FDiv, FNeg,
     // ── bitwise ──
@@ -260,6 +265,7 @@ struct MirOpcodeInfo {
         case MirOpcode::Add:  return {2, 2, 0, 0, R::Value, false, false, false, "add"};
         case MirOpcode::Sub:  return {2, 2, 0, 0, R::Value, false, false, false, "sub"};
         case MirOpcode::Mul:  return {2, 2, 0, 0, R::Value, false, false, false, "mul"};
+        case MirOpcode::UMulH: return {2, 2, 0, 0, R::Value, false, false, false, "umulh"};
         case MirOpcode::SDiv: return {2, 2, 0, 0, R::Value, false, false, false, "sdiv"};
         case MirOpcode::UDiv: return {2, 2, 0, 0, R::Value, false, false, false, "udiv"};
         case MirOpcode::SMod: return {2, 2, 0, 0, R::Value, false, false, false, "smod"};
@@ -427,7 +433,7 @@ struct MirOpcodeInfo {
 // (D-OPT1-CSE-NONCOMMUTATIVE-PIN).
 [[nodiscard]] constexpr bool isCommutative(MirOpcode op) noexcept {
     switch (op) {
-        case MirOpcode::Add:    case MirOpcode::Mul:
+        case MirOpcode::Add:    case MirOpcode::Mul:    case MirOpcode::UMulH:
         case MirOpcode::And:    case MirOpcode::Or:    case MirOpcode::Xor:
         case MirOpcode::FAdd:   case MirOpcode::FMul:
         case MirOpcode::ICmpEq: case MirOpcode::ICmpNe:

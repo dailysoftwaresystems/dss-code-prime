@@ -6329,6 +6329,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
             rec.kind            = DeclarationKind::Function;
             rec.type            = fnTy;
             rec.variadicBuiltin = bf.variadic;
+            rec.builtinLowering = bf.lowering;  // c103: intrinsic-lowering builtins
             SymbolId const id = s.symbols.mint(rec);
             s.scopes.injectBinding(builtinScope, bf.name, id);
         }

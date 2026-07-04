@@ -3,6 +3,7 @@
 #include "core/types/aggregate_abi.hpp"
 #include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/semantic_config.hpp"  // c103: BuiltinLowering (BuiltinCall payload)
 #include "core/types/type_lattice/type_layout.hpp"
 #include "hir/const_eval.hpp"
 #include "hir/hir_op.hpp"
@@ -798,6 +799,30 @@ struct Lowerer {
                 }
                 return mir.addInst(MirOpcode::IntrinsicCall, ctx.operands, t,
                                    ctx.intrinsicId);
+            }
+            case HirKind::BuiltinCall: {
+                // c103 (D-CSUBSET-INTRINSIC-UMULH): children = [args...]; the payload
+                // is a BuiltinLowering value. Map it to the DEDICATED MirOpcode — the
+                // ONE place MIR names the intrinsic vocabulary (a uniform enum→enum
+                // table, never an arch/name identity branch). Unlike IntrinsicCall (a
+                // generic opaque op dispatched at the encoder), this yields a REAL MIR
+                // op the optimizer + verifier + target-capability lowering understand.
+                auto kids = hir.children(node);
+                std::vector<MirInstId> operands;
+                operands.reserve(kids.size());
+                for (HirNodeId argN : kids) {
+                    MirInstId const arg = lowerExpr(argN);
+                    if (!arg.valid()) return InvalidMirInst;
+                    operands.push_back(arg);
+                }
+                switch (static_cast<BuiltinLowering>(hir.payload(node))) {
+                    case BuiltinLowering::UMulHigh:
+                        return mir.addInst(MirOpcode::UMulH, operands, t);
+                    case BuiltinLowering::None:
+                        break;
+                }
+                unsupported(node, "BuiltinCall carries no valid lowering");
+                return InvalidMirInst;
             }
             case HirKind::Ternary: {
                 // children: [cond, thenExpr, elseExpr]. Lower as a diamond

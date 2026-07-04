@@ -7491,6 +7491,28 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                             m.variadic = entry.at("variadic").get<bool>();
                         }
+                        // c103 (D-CSUBSET-INTRINSIC-UMULH): OPTIONAL `lowering`
+                        // names a compiler intrinsic this builtin lowers to (a
+                        // target instruction) instead of an ordinary call. A
+                        // present-but-unknown name is rejected (fail loud).
+                        if (entry.contains("lowering")) {
+                            if (!entry.at("lowering").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/lowering",
+                                          "'lowering' must be a string");
+                                continue;
+                            }
+                            auto const lw = builtinLoweringFromName(
+                                entry.at("lowering").get<std::string>());
+                            if (!lw) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/lowering",
+                                          std::format("unknown builtin lowering '{}'",
+                                                      entry.at("lowering").get<std::string>()));
+                                continue;
+                            }
+                            m.lowering = *lw;
+                        }
                         cfg.builtinFunctions.push_back(std::move(m));
                     }
                 }

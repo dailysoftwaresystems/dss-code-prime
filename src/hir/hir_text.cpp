@@ -219,7 +219,8 @@ namespace {
 [[nodiscard]] bool isExprKind(HirKind k) noexcept {
     switch (k) {
         case HirKind::Literal: case HirKind::Ref: case HirKind::Call:
-        case HirKind::IntrinsicCall: case HirKind::BinaryOp: case HirKind::UnaryOp:
+        case HirKind::IntrinsicCall: case HirKind::BuiltinCall:
+        case HirKind::BinaryOp: case HirKind::UnaryOp:
         case HirKind::Cast: case HirKind::MemberAccess: case HirKind::Index:
         case HirKind::Swizzle: case HirKind::ConstructAggregate: case HirKind::Ternary:
         case HirKind::LogicalAnd: case HirKind::LogicalOr: case HirKind::SizeOf:
@@ -760,6 +761,14 @@ private:
                     out_ += quote(hir_.intrinsicRegistry().descriptor(HirIntrinsicId{p}).name());
                 else { report("IntrinsicCall payload is not a registered intrinsic"); out_ += "\"?\""; }
                 out_ += " : "; appendType(hir_.typeId(id)); out_ += ' '; operands(hir_.children(id)); return;
+            }
+            case HirKind::BuiltinCall: {
+                // c103 (D-CSUBSET-INTRINSIC-UMULH): `builtincall #<lowering> : <type>
+                // (<operands>)` — the BuiltinLowering payload prints numerically.
+                header("builtincall"); out_ += ' ';
+                out_ += std::format("#{}", hir_.payload(id));
+                out_ += " : "; appendType(hir_.typeId(id)); out_ += ' ';
+                operands(hir_.children(id)); return;
             }
             case HirKind::BinaryOp: case HirKind::UnaryOp: {
                 header(hir_.kind(id) == HirKind::BinaryOp ? "binop" : "unop");

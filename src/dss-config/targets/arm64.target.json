@@ -405,6 +405,27 @@
       }
     },
     {
+      "$comment": "c103 (D-CSUBSET-INTRINSIC-UMULH): UMULH Xd, Xn, Xm — the high 64 bits of the unsigned 64x64 128-bit product. fixedWord 0x9BC07C00: data-processing (3-source) with op31=110 (bits 23:21 — UMULH; SMULH=010 → 0x9B407C00, MADD/MUL=000 → 0x9B007C00) + Ra=XZR(11111) baked in, o0=0, sf=1 (audit-recomputed vs the ARM ARM). The MIR->LIR Rule-1 NATIVE realization of MIR UMulH: a result-bearing 3-address op, no implicit registers, no pre-op (contrast x86's mov-rax + umul_op core). UMULH is inherently 64-bit (no W-form); the u64 `__umulh` is the only consumer, so a single width-64 variant.",
+      "mnemonic":      "umulh",
+      "result":        "value",
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 2613083136 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "FC1 V2-4.X (2026-06-10): NEG Xd, Xm = SUB Xd, XZR, Xm (shifted-register alias, Rn=XZR baked). Base = 0xCB000000 | (XZR=31 << 5) = 0xCB0003E0. Slots: Rd, Rm. Surfaced by the modulo corpus' negative literals — under the BASELINE (no-ConstFold) pipeline a unary minus reaches LIR as a live `neg`, and arm64 had never declared one (every prior arm64 corpus avoided unary minus).",
       "mnemonic":      "neg",
       "result":        "value",

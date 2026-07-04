@@ -357,6 +357,12 @@ public:
                                 TypeId type, HirFlags flags = HirFlags::None);
     HirNodeId makeIntrinsicCall(std::uint32_t intrinsicId, std::span<HirNodeId const> args,
                                 TypeId type, HirFlags flags = HirFlags::None);
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): builtin-intrinsic call — children are
+    // [args...]; the payload is a `BuiltinLowering` value (passed raw as a uint32
+    // to keep this header decoupled from semantic_config, mirroring the raw
+    // makeIntrinsicCall overload). HIR→MIR maps the payload to the dedicated MirOpcode.
+    HirNodeId makeBuiltinCall(std::uint32_t lowering, std::span<HirNodeId const> args,
+                              TypeId type, HirFlags flags = HirFlags::None);
 
     // Explicit conversion of [operand] to `type` (the target type).
     HirNodeId makeCast(HirNodeId operand, TypeId type, HirFlags flags = HirFlags::None);

@@ -432,6 +432,43 @@
       }
     },
     {
+      "$comment": "c103 (D-CSUBSET-INTRINSIC-UMULH) — unsigned MUL-HIGH single op. MUL r/m64 (0xF7 /4) multiplies RAX by operand 0 (modrm.rm), placing the 128-bit product's low half in RAX and the HIGH half in RDX. The __umulh intrinsic captures the RDX 'high' outputRole (the RAX low half is discarded). NO pre-op — unlike div's cqo, MUL overwrites RDX:RAX unconditionally, so RDX is output-only and NOT an implicit input (contrast div_op inputs=[rax,rdx]). implicitRegisters honour outputs ⊆ clobbered: inputs=[rax]; outputs/clobbered=[rax,rdx]; inputRoles multiplicand=rax; outputRoles high=rdx (+ low=rax for completeness — the MIR->LIR lowering reads only 'high'). Encoder auto-computes REX with W=1 + B=(operand 0's high bit).",
+      "mnemonic":      "umul_op",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "implicitRegisters": {
+        "inputs":    ["rax"],
+        "outputs":   ["rax", "rdx"],
+        "clobbered": ["rax", "rdx"],
+        "inputRoles":  { "multiplicand": "rax" },
+        "outputRoles": { "high": "rdx", "low": "rax" }
+      },
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg"], "width": 64 },
+            "template": { "rexW": true, "opcode": [247], "modrmRegExt": 4 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          },
+          {
+            "$comment": "MUL r/m32 — 0xF7 /4 without REX.W (unsigned 32-bit multiply of EAX; high half in EDX). Present for completeness; the u64 __umulh never selects it.",
+            "guard":    { "operandKinds": ["reg"], "width": 32 },
+            "template": { "opcode": [247], "modrmRegExt": 4 },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): integer compare (writes FLAGS, no GPR result). Two variants: reg-reg (REX.W 0x39 /r — cmp r/m64, r64) + reg-imm32 (REX.W 0x81 /7 imm32 — cmp r/m64, imm32 with sign-extended imm32). modrmRegExt=7 fills ModR/M.reg with the /7 opcode-extension digit. ML5 lowerICmp + lowerCondBr both emit `cmp` against an immediate-0 or against another reg.",
       "mnemonic":      "cmp",
       "result":        "none",

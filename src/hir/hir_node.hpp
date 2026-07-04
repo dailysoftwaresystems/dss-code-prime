@@ -51,7 +51,15 @@ enum class HirKind : std::uint16_t {
     //    expression); its MIR successors are every address-taken label block. ──
     GotoStmt, LabelStmt, IndirectGotoStmt,
     // ── Expressions ──
-    Literal, Ref, Call, IntrinsicCall, BinaryOp, UnaryOp, Cast, MemberAccess,
+    Literal, Ref, Call, IntrinsicCall,
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): a call to a builtin that lowers to a
+    // DEDICATED compiler intrinsic (a target instruction), NOT an ordinary Call or
+    // import. Mirrors IntrinsicCall — children = the arg expressions (no callee
+    // child); the node `payload` carries the `BuiltinLowering` enum value. CST→HIR
+    // emits it at the call arm (where the callee builtin's metadata is visible);
+    // HIR→MIR maps the payload onto the concrete MirOpcode (e.g. UMulH).
+    BuiltinCall,
+    BinaryOp, UnaryOp, Cast, MemberAccess,
     Index, Swizzle, ConstructAggregate, Ternary, LogicalAnd, LogicalOr,
     SizeOf, AddressOf, Deref, SeqExpr,
     // ── GNU label-address (D-CSUBSET-COMPUTED-GOTO): `&&label` yields a `void*`
@@ -112,7 +120,8 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
     switch (kind) {
         // ── Expressions (plan §2.2) ──
         case HirKind::Literal: case HirKind::Ref: case HirKind::Call:
-        case HirKind::IntrinsicCall: case HirKind::BinaryOp: case HirKind::UnaryOp:
+        case HirKind::IntrinsicCall: case HirKind::BuiltinCall:
+        case HirKind::BinaryOp: case HirKind::UnaryOp:
         case HirKind::Cast: case HirKind::MemberAccess: case HirKind::Index:
         case HirKind::Swizzle: case HirKind::ConstructAggregate: case HirKind::Ternary:
         case HirKind::LogicalAnd: case HirKind::LogicalOr: case HirKind::SizeOf:
@@ -227,6 +236,7 @@ struct ChildArity {
             return {0, 0};
         case HirKind::Call:               return {1, kUnboundedArity};  // [callee, args...]
         case HirKind::IntrinsicCall:      return {0, kUnboundedArity};  // [args...]
+        case HirKind::BuiltinCall:        return {0, kUnboundedArity};  // c103: [args...]
         case HirKind::ConstructAggregate: return {0, kUnboundedArity};  // [fields...]
         case HirKind::UnaryOp: case HirKind::Cast: case HirKind::MemberAccess:
         case HirKind::Swizzle: case HirKind::SizeOf: case HirKind::AddressOf:

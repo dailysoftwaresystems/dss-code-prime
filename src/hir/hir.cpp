@@ -335,6 +335,12 @@ HirNodeId HirBuilder::makeIntrinsicCall(std::uint32_t intrinsicId,
     return addParent(HirKind::IntrinsicCall, args, type, intrinsicId, flags);
 }
 
+HirNodeId HirBuilder::makeBuiltinCall(std::uint32_t lowering,
+                                      std::span<HirNodeId const> args, TypeId type,
+                                      HirFlags flags) {
+    return addParent(HirKind::BuiltinCall, args, type, lowering, flags);
+}
+
 HirNodeId HirBuilder::makeCast(HirNodeId operand, TypeId type, HirFlags flags) {
     HirNodeId const kids[] = {operand};
     return addParent(HirKind::Cast, kids, type, /*payload=*/0, flags);

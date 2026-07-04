@@ -1986,9 +1986,14 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // count from CL; the MIR→LIR shift lowering pins the count
         // vreg into the role-declared register exactly like the div
         // lowering's "dividend" pin).
-        static constexpr std::array<std::string_view, 4>
+        // c103 (D-CSUBSET-INTRINSIC-UMULH) added the MUL-HIGH projection:
+        // "multiplicand" (the RAX implicit input of x86 `mul r/m64`) plus
+        // "high"/"low" (the RDX/RAX halves of the 128-bit product; the
+        // `__umulh` lowering captures the "high" output-role). arm64's
+        // native `umulh` needs no roles (a 3-address result-bearing op).
+        static constexpr std::array<std::string_view, 7>
             kKnownImplicitRegisterRoles{"dividend", "quotient", "remainder",
-                                        "count"};
+                                        "count", "multiplicand", "high", "low"};
         auto resolveRoles =
             [&](std::vector<std::pair<std::string, std::string>> const& roles,
                 std::vector<std::pair<std::string, std::uint16_t>>& resolved,

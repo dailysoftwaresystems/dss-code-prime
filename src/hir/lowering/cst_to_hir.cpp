@@ -1771,7 +1771,8 @@ struct Lowerer {
                     std::uint32_t ctxIdx, E& result) {
         CallCtx const& ctx = callCtxs[ctxIdx];
         NodeId const callNode = work.back().node;   // the postfix Call node (provenance)
-        E const callE{track(builder.makeCall(ctx.baseE.id, ctx.args, ctx.resultType), callNode),
+        E const callE{track(emitCallOrBuiltin(ctx.base, ctx.baseE.id, ctx.args, ctx.resultType),
+                            callNode),
                       ctx.resultType};
         work.pop_back();
         callCtxs.pop_back();
@@ -2347,6 +2348,34 @@ struct Lowerer {
             for (NodeId k : visible(n)) stack.push_back(k);
         }
         return hit;
+    }
+
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): emit a BuiltinCall when the callee resolves
+    // to a builtin carrying a `lowering` (e.g. `__umulh`) — a DEDICATED intrinsic
+    // MIR op — otherwise an ordinary Call. `calleeNode` is the callee CST subtree
+    // (symbol resolution via `firstNameToken`); `calleeId` is its already-lowered
+    // HIR expr id (the ordinary-Call callee child). SHARED by the iterative
+    // `finishCall` and the recursive Call arm so the two makeCall sites stay in
+    // lockstep. Indirect calls, non-builtins, and plain builtins (COALESCE,
+    // lowering=None) stay ordinary Calls. The builtin metadata is visible here (the
+    // SemanticModel is in scope), which it is NOT at HIR→MIR — hence the seam sits here.
+    // Audit note (c103, LOW/theoretical): firstNameToken picks the first RESOLVED name
+    // in the callee subtree, so a lowering-builtin appearing as a NON-callee value in a
+    // complex callee (e.g. selected through a ternary) would misfire — unreachable
+    // today (an intrinsic has no linkable address to store/select). If a future
+    // intrinsic is address-takeable, tighten this to require a DIRECT-name callee.
+    [[nodiscard]] HirNodeId emitCallOrBuiltin(NodeId calleeNode, HirNodeId calleeId,
+                                              std::span<HirNodeId const> args,
+                                              TypeId resultType) {
+        SymbolId const sym = firstNameToken(calleeNode).sym;
+        if (sym.valid()) {
+            if (auto const* rec = model.recordFor(sym);
+                rec != nullptr && rec->builtinLowering != BuiltinLowering::None) {
+                return builder.makeBuiltinCall(
+                    static_cast<std::uint32_t>(rec->builtinLowering), args, resultType);
+            }
+        }
+        return builder.makeCall(calleeId, args, resultType);
     }
 
     // A name reference as an expression (id + type): resolves the last identifier
@@ -3237,7 +3266,7 @@ struct Lowerer {
             TypeId inferred = InvalidType;
             if (calleeSig.valid()) inferred = interner.fnResult(calleeSig);
             TypeId const result = typeAtOr(node, inferred);
-            return {track(builder.makeCall(base.id, args, result), node), result};
+            return {track(emitCallOrBuiltin(baseN, base.id, args, result), node), result};
         }
         if (e.target == "Index") {
             E idxE = rest.empty()

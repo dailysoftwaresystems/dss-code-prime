@@ -494,6 +494,47 @@ TEST(Arm64Encoder, UdivEncodesDataProc2SourceHighRegs) {
     EXPECT_EQ(bytes[3], 0x9A);
 }
 
+TEST(Arm64Encoder, UmulhEncodesDataProc3SourceHighRegs) {
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): umulh X3, X4, X14 — the high 64 bits of the
+    // unsigned 64x64 product. UMULH is a data-processing (3-source) op with Ra=XZR:
+    //   base 0x9BC07C00 (sf=1 | 00 | 11011 | U=1 | 10 | Rm | o0=0 | Ra=XZR(11111))
+    //   | Rm = X14 (enc 14) << 16 → 0x000E0000
+    //   | Rn = X4  (enc 4)  << 5  → 0x00000080
+    //   | Rd = X3  (enc 3)        → 0x00000003
+    //   = 0x9BCE7C83 — LE bytes: 83 7C CE 9B.
+    // The U bit (23) discriminates UMULH from SMULH (0x9B40...) — a flipped bit
+    // silently turns unsigned mul-high into signed. The always-on structural guard
+    // for the arm64 mul-high encoding (the qemu corpus run is the runtime witness).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const umulhOp = (*s)->opcodeByMnemonic("umulh");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(umulhOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x3 {static_cast<std::uint32_t>(*(*s)->registerByName("x3")),  1, cls};
+    LirReg const x4 {static_cast<std::uint32_t>(*(*s)->registerByName("x4")),  1, cls};
+    LirReg const x14{static_cast<std::uint32_t>(*(*s)->registerByName("x14")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const mops[] = { LirOperand::makeReg(x4),
+                                LirOperand::makeReg(x14) };
+    (void)b.addInst(*umulhOp, x3, mops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x83);
+    EXPECT_EQ(bytes[1], 0x7C);
+    EXPECT_EQ(bytes[2], 0xCE);
+    EXPECT_EQ(bytes[3], 0x9B);
+}
+
 // ── FC3.5 sweep-c3: MSUB — D-LIR-MOD-MSUB-FUSION (the fixed32 `ra`
 // slot's first consumer; rule 3's fused remainder realization) ─────
 

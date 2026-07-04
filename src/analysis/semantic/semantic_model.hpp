@@ -100,6 +100,12 @@ struct DSS_EXPORT SymbolRecord {
     // SE6: set on a builtin-function symbol declared `variadic` — the
     // call-check skips arg-count enforcement for it.
     bool            variadicBuiltin = false;
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): copied from the builtin's
+    // BuiltinFunctionMapping.lowering at injection. When != None, a CALL to this
+    // builtin symbol lowers (in CST→HIR) to a `HirKind::BuiltinCall` carrying this
+    // lowering, which HIR→MIR maps to the dedicated MirOpcode — NOT an ordinary
+    // Call. None (the default) for every non-lowering symbol.
+    BuiltinLowering builtinLowering = BuiltinLowering::None;
     // SE7/D8: copied from the minting DeclarationRule's `warnIfUnused`. After
     // analysis, a symbol with this flag set AND an empty use-set emits
     // S_UnusedVariable (a WARNING) at `declRuleNode`'s span.

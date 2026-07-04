@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -650,6 +651,29 @@ struct DSS_EXPORT CallRule {
     std::string   ruleName;
 };
 
+// c103 (D-CSUBSET-INTRINSIC-UMULH): a builtin whose call the engine lowers to a
+// DEDICATED compiler intrinsic (a target instruction) rather than an ordinary
+// call/import. A LEAF enum with NO HIR/MIR dependency (it lives in core so the
+// SemanticConfig + SymbolRecord can carry it): resolved from the config
+// `lowering` string at decode, then each downstream layer maps it into its OWN
+// vocabulary -- the HIR lowering (cst_to_hir) maps it onto a `HirKind::BuiltinCall`
+// payload, and the MIR lowering (hir_to_mir) maps THAT onto the concrete
+// `MirOpcode`. No layer depends upward and no arch/name identity branch appears
+// in shared substrate; the string->enum and enum->enum maps are uniform tables.
+enum class BuiltinLowering : std::uint16_t {
+    None = 0,     // ordinary semantic-only builtin (e.g. tsql COALESCE)
+    UMulHigh,     // __umulh: high 64 bits of the u64*u64 128-bit product
+};
+
+// Resolve the config `lowering` name to its BuiltinLowering. nullopt = an unknown
+// name (rejected with a diagnostic at the decode site) -- distinct from "absent"
+// (an ordinary builtin, which never carries a `lowering` key).
+[[nodiscard]] inline std::optional<BuiltinLowering>
+builtinLoweringFromName(std::string_view name) noexcept {
+    if (name == "umulh") { return BuiltinLowering::UMulHigh; }
+    return std::nullopt;
+}
+
 // SE6: a built-in function the engine binds into a CU-wide "builtins"
 // scope (visible everywhere, shadow-able by user decls). Interned as a
 // FnSig over `paramCores` → `resultCore`. A `variadic` builtin skips the
@@ -659,6 +683,10 @@ struct DSS_EXPORT BuiltinFunctionMapping {
     std::vector<TypeKind> paramCores;
     TypeKind              resultCore = TypeKind::Void;
     bool                  variadic   = false;
+    // c103: when != None, a call to this builtin lowers to the named compiler
+    // intrinsic (a target instruction) instead of an ordinary call. None (the
+    // default) preserves the pure-semantic builtin behaviour (COALESCE).
+    BuiltinLowering       lowering   = BuiltinLowering::None;
 };
 
 // D5.1: a member-access expression rule. When Pass 2 sees a node with this

@@ -610,6 +610,23 @@ TEST(X86VariableEncoder, DivOpRaxEmits48_F7_F0) {
     expectDivBytes("div_op", "rax", {0x48, 0xF7, 0xF0});
 }
 
+TEST(X86VariableEncoder, UmulOpRaxEmits48_F7_E0) {
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): MUL r/m64 with the multiplier in RAX —
+    // REX.W 0xF7 /4 with ModR/M = mod=11 reg=/4=100 rm=rax(000) = 0xE0. RAX*rm →
+    // RDX:RAX; the __umulh lowering captures the RDX 'high' role. Discriminates
+    // from div's /6 (0xE0 vs 0xF0) and idiv's /7 (0xF8) — a schema /-digit swap
+    // fails at byte 2. The always-on structural guard for the x86 mul-high encoding.
+    expectDivBytes("umul_op", "rax", {0x48, 0xF7, 0xE0});
+}
+
+TEST(X86VariableEncoder, UmulOpR14Emits49_F7_E6) {
+    // REX.B regression pin: MUL r/m64 with the multiplier in R14 — REX.W+B = 0x49,
+    // ModR/M = mod=11 reg=/4=100 rm=r14-low3(110) = 0xE6. A dropped REX.B would
+    // decode rm as RSI (110 without B) → multiply by the wrong register (the div
+    // family's exact high-reg trap).
+    expectDivBytes("umul_op", "r14", {0x49, 0xF7, 0xE6});
+}
+
 // ── REX.B regression pins for high-numbered registers (R8-R15) ──
 //
 // **Background**: cycle-10q's compound encoding bug was that the

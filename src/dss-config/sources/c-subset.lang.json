@@ -1273,6 +1273,10 @@
     ],
     "loopRules": [ "whileStmt", "forStmt", "doStmt", "switchStmt" ],
     "loopControls": [ { "rule": "breakStmt" }, { "rule": "continueStmt" } ],
+    "$builtinFunctionsComment": "c103 (D-CSUBSET-INTRINSIC-UMULH): compiler intrinsics exposed as builtin functions (SE6 builtins scope, shadow-able by user decls). `__umulh` = the high 64 bits of the u64*u64 128-bit product (the MSVC/sqlite intrinsic used by sqlite3Multiply128/160 on _WIN64). `lowering:umulh` binds the call to a DEDICATED MIR op (x86 `mul r/m64` -> RDX, arm64 `umulh`) rather than an ordinary call/import -- a compiler intrinsic is not a linkable symbol. Available on every target that declares the umulh mnemonic vocabulary (x86_64 + arm64); a target lacking it fails loud at lowering.",
+    "builtinFunctions": [
+      { "name": "__umulh", "params": ["U64", "U64"], "result": "U64", "lowering": "umulh" }
+    ],
     "$builtinTypesComment": "FC3 c1: the TEXT-keyed type-name table (typedef-style positions + the load-time fallback for single-word ladder/promotion names). The KEYWORD grammar path resolves through semantics.typeSpecifiers below (the C 6.7.2 multiset table) — both tables declare the SAME widths, and `long` carries the LLP64 override on BOTH so the two paths can never disagree (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH).",
     "builtinTypes": [
       { "name": "int",    "core": "I32"  },
