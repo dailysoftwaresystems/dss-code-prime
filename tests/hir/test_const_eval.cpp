@@ -141,6 +141,69 @@ TEST(ConstEval, BinaryArithmeticOpsFold) {
     check(HirOpKind::Shr,   32, 2,  8);
 }
 
+// D-CE-HOST-SIGNED-OVERFLOW-UB (the PR#34 UBSan CI catch, 2026-07-04): the
+// engine's Neg/Add/Sub/Mul folds evaluate 2's-complement WRAP over uint64 —
+// the direct signed forms were HOST UB at the INT64 boundaries (UBSan:
+// "negation of -9223372036854775808 cannot be represented", hit by
+// stdint_limit_macros through the preprocessor's #if const-eval). The wrapped
+// value is the runtime outcome on every shipped target AND gcc/clang's #if
+// fold, so these pins assert the exact wrap results. Red-on-disable: revert
+// any helper to the direct signed form → that op's pin is the UBSan trap
+// site again (the linux-clang UBSan CI leg aborts; the VALUE stays the same
+// on wrap-happy hosts, which is exactly why only a sanitizer sees it — these
+// pins lock the DEFINED semantics so the fold's answer can never drift).
+TEST(ConstEval, IntegerFoldsWrapAtInt64BoundariesWithoutHostUb) {
+    auto const i64min = std::numeric_limits<std::int64_t>::min();
+    auto const i64max = std::numeric_limits<std::int64_t>::max();
+
+    // -INT64_MIN wraps to itself (the reported UBSan site).
+    {
+        Rig r;
+        HirNodeId const lit = r.litInt(i64min, r.i64T());
+        HirNodeId const neg = r.unary(HirOpKind::Neg, lit, r.i64T());
+        auto res = eval(r, neg);
+        ASSERT_TRUE(res.value.has_value());
+        EXPECT_EQ(std::get<std::int64_t>(res.value->value), i64min);
+    }
+    auto checkWrap = [](HirOpKind op, std::int64_t lhs, std::int64_t rhs,
+                        std::int64_t expected) {
+        Rig r;
+        HirNodeId const a   = r.litInt(lhs, r.i64T());
+        HirNodeId const b   = r.litInt(rhs, r.i64T());
+        HirNodeId const exp = r.binary(op, a, b, r.i64T());
+        auto res = eval(r, exp);
+        ASSERT_TRUE(res.value.has_value())
+            << "op ordinal " << static_cast<unsigned>(op) << " should fold (wrap)";
+        EXPECT_EQ(std::get<std::int64_t>(res.value->value), expected)
+            << "op ordinal " << static_cast<unsigned>(op);
+    };
+    checkWrap(HirOpKind::Add, i64max,  1, i64min);        // INT64_MAX+1 → wrap
+    checkWrap(HirOpKind::Sub, i64min,  1, i64max);        // INT64_MIN-1 → wrap
+    checkWrap(HirOpKind::Sub, 0, i64min, i64min);         // 0-INT64_MIN → wrap (== Neg)
+    checkWrap(HirOpKind::Mul, i64max,  2, std::int64_t{-2}); // (2^63-1)*2 ≡ -2 mod 2^64
+    checkWrap(HirOpKind::Mul, i64min, -1, i64min);        // INT64_MIN*-1 → wrap
+}
+
+// The CONTRAST policy: Div/Rem at INT64_MIN/-1 REFUSE (Overflow) rather than
+// wrap — the runtime outcome is target-divergent (x86 idiv #DE traps, arm64
+// wraps), so folding any value would hide the trap; refusal keeps the op
+// live for the target to define. Guards the asymmetry the wrap pins above
+// must never erase.
+TEST(ConstEval, DivRemAtInt64MinByMinusOneRefuseWithOverflow) {
+    auto const i64min = std::numeric_limits<std::int64_t>::min();
+    for (HirOpKind const op : {HirOpKind::Div, HirOpKind::Rem}) {
+        Rig r;
+        HirNodeId const a   = r.litInt(i64min, r.i64T());
+        HirNodeId const b   = r.litInt(-1,     r.i64T());
+        HirNodeId const exp = r.binary(op, a, b, r.i64T());
+        auto res = eval(r, exp);
+        EXPECT_FALSE(res.value.has_value())
+            << "op ordinal " << static_cast<unsigned>(op) << " must refuse";
+        EXPECT_EQ(res.failure, ConstEvalFailure::Overflow)
+            << "op ordinal " << static_cast<unsigned>(op);
+    }
+}
+
 TEST(ConstEval, BinaryComparisonOpsFold) {
     auto check = [](HirOpKind op, std::int64_t lhs, std::int64_t rhs,
                     std::int64_t expected) {

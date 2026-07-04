@@ -99,6 +99,36 @@ asBool(HirLiteralValue const& v, bool allowFloat) noexcept {
     return *iv != 0;
 }
 
+// ── 2's-complement WRAPPING i64 arithmetic (D-CE-HOST-SIGNED-OVERFLOW-UB) ──
+// Neg/Add/Sub/Mul on int64 evaluate over uint64 (defined for EVERY input)
+// and value-cast back (modular, defined since C++20 — the same pattern
+// `wrapToIntTarget` below already relies on). The direct signed forms are
+// HOST UB at the overflow points (`-INT64_MIN`, `INT64_MAX+1`, …): the
+// COMPILER itself would UB folding a source program's overflow — the
+// linux-clang UBSan CI leg trapped exactly this (stdint_limit_macros ×
+// `applyUnaryInt` Neg of INT64_MIN, 2026-07-04). The WRAPPED value is the
+// correct fold: it is what the runtime op produces on every shipped target
+// (x86_64 + arm64 wrap) and what gcc/clang's preprocessor folds for `#if`
+// arithmetic — folding it is behavior-preserving. CONTRAST Div/Rem's
+// INT64_MIN/-1 below, which stay REFUSED (Overflow): there the runtime
+// outcome is target-divergent (x86 idiv #DE TRAPS), so folding any value
+// would hide the trap — refusal keeps the op live for the target to define.
+[[nodiscard]] inline std::int64_t wrapNegI64(std::int64_t v) noexcept {
+    return static_cast<std::int64_t>(0u - static_cast<std::uint64_t>(v));
+}
+[[nodiscard]] inline std::int64_t wrapAddI64(std::int64_t a, std::int64_t b) noexcept {
+    return static_cast<std::int64_t>(static_cast<std::uint64_t>(a)
+                                   + static_cast<std::uint64_t>(b));
+}
+[[nodiscard]] inline std::int64_t wrapSubI64(std::int64_t a, std::int64_t b) noexcept {
+    return static_cast<std::int64_t>(static_cast<std::uint64_t>(a)
+                                   - static_cast<std::uint64_t>(b));
+}
+[[nodiscard]] inline std::int64_t wrapMulI64(std::int64_t a, std::int64_t b) noexcept {
+    return static_cast<std::int64_t>(static_cast<std::uint64_t>(a)
+                                   * static_cast<std::uint64_t>(b));
+}
+
 // Fold a UnaryOp(Neg / BitNot / Not) on an integer operand. `Not`
 // (logical negation) re-tags the result core to Bool per C99 §6.5.3.3p5.
 // Unary `+` is identity at the value level; no v1 frontend emits it
@@ -110,7 +140,7 @@ applyUnaryInt(HirOpKind op, HirLiteralValue const& inner) {
     std::int64_t const iv = *iv64;
     HirLiteralValue folded = inner;
     switch (op) {
-        case HirOpKind::Neg:    folded.value = -iv;    return folded;
+        case HirOpKind::Neg:    folded.value = wrapNegI64(iv); return folded;
         case HirOpKind::BitNot: folded.value = ~iv;    return folded;
         case HirOpKind::Not:    folded.value = std::int64_t{iv == 0 ? 1 : 0}; folded.core = TypeKind::Bool; return folded;
         default: return std::nullopt;
@@ -146,9 +176,11 @@ applyBinaryInt(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
     std::int64_t const bv = *bv64;
     HirLiteralValue folded = a;
     switch (op) {
-        case HirOpKind::Add:    folded.value = av + bv;  return folded;
-        case HirOpKind::Sub:    folded.value = av - bv;  return folded;
-        case HirOpKind::Mul:    folded.value = av * bv;  return folded;
+        // Wrapping forms (D-CE-HOST-SIGNED-OVERFLOW-UB, see the helpers
+        // above): the direct `av + bv` was host UB at INT64 overflow.
+        case HirOpKind::Add:    folded.value = wrapAddI64(av, bv); return folded;
+        case HirOpKind::Sub:    folded.value = wrapSubI64(av, bv); return folded;
+        case HirOpKind::Mul:    folded.value = wrapMulI64(av, bv); return folded;
         case HirOpKind::Div:
             if (bv == 0) {
                 outFailure = opts.refuseOnDivByZero
