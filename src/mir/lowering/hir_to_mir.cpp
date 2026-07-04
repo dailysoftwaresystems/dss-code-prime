@@ -818,6 +818,26 @@ struct Lowerer {
                 switch (static_cast<BuiltinLowering>(hir.payload(node))) {
                     case BuiltinLowering::UMulHigh:
                         return mir.addInst(MirOpcode::UMulH, operands, t);
+                    case BuiltinLowering::AtomicCas: {
+                        // c104: MIR AtomicCas is the UNIVERSAL CAS order
+                        // [ptr, comparand(expected), newval(desired)] — the
+                        // C11 atomic_compare_exchange / LLVM cmpxchg shape a
+                        // future frontend would also target. The WIN32
+                        // intrinsic this builtin binds spells its args
+                        // (dest, EXCHANGE, comparand) — exchange BEFORE
+                        // comparand — so THIS arm (the one place the Win32
+                        // binding is defined) reorders [c0, c2, c1]. Passing
+                        // the args through positionally silently INVERTS the
+                        // CAS (the compare tests the new value, the store
+                        // writes the comparand — the exit-26 corpus catch).
+                        if (operands.size() != 3) {
+                            unsupported(node, "AtomicCas expects exactly 3 args");
+                            return InvalidMirInst;
+                        }
+                        std::array<MirInstId, 3> const casOrder{
+                            operands[0], operands[2], operands[1]};
+                        return mir.addInst(MirOpcode::AtomicCas, casOrder, t);
+                    }
                     case BuiltinLowering::None:
                         break;
                 }

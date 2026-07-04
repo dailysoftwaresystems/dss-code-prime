@@ -762,18 +762,22 @@ TEST(TargetSchema, ShippedX86_64ImplicitRegistersConsumerCount) {
     // results" consumer landed — `umul_op` (MUL r/m64, 0xF7 /4) declares
     // inputs=[rax], outputs/clobbered=[rax,rdx], inputRoles={multiplicand: rax},
     // outputRoles={high: rdx, low: rax}; the __umulh lowering captures 'high'.
-    ASSERT_EQ(mnemonicsWithConstraint.size(), 8u)
-        << "expected exactly 8 implicit-register-bearing opcodes "
+    // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): `lock_cmpxchg` (LOCK 0F B1 /r)
+    // declares inputs/outputs/clobbered=[rax], inputRoles={comparand: rax},
+    // outputRoles={old: rax} — the AtomicCas lowering pins the comparand into
+    // RAX and captures the observed-original from it.
+    ASSERT_EQ(mnemonicsWithConstraint.size(), 9u)
+        << "expected exactly 9 implicit-register-bearing opcodes "
            "(cqo + idiv_op + xor_rdx_zero + div_op from cycle 10r "
            "split; shl + shr_l + shr_a from FC3.5 shifts; umul_op "
-           "from c103 __umulh); update this count when a new "
-           "consumer lands.";
+           "from c103 __umulh; lock_cmpxchg from c104 AtomicCas); "
+           "update this count when a new consumer lands.";
     std::set<std::string> const observedSet(
         mnemonicsWithConstraint.begin(),
         mnemonicsWithConstraint.end());
     std::set<std::string> const expectedSet{
         "cqo", "idiv_op", "xor_rdx_zero", "div_op",
-        "shl", "shr_l", "shr_a", "umul_op"};
+        "shl", "shr_l", "shr_a", "umul_op", "lock_cmpxchg"};
     EXPECT_EQ(observedSet, expectedSet);
 
     // FLAG 1 discrimination: the four ops carry DIFFERENT implicit-

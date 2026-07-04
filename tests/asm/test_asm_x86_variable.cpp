@@ -627,6 +627,7 @@ TEST(X86VariableEncoder, UmulOpR14Emits49_F7_E6) {
     expectDivBytes("umul_op", "r14", {0x49, 0xF7, 0xE6});
 }
 
+
 // ── REX.B regression pins for high-numbered registers (R8-R15) ──
 //
 // **Background**: cycle-10q's compound encoding bug was that the
@@ -1619,6 +1620,84 @@ TEST(X86VariableEncoder, StoreToRspForcesSibByte) {
     EXPECT_EQ(bytes[5], 0x00);  // disp32 LE bytes 1-3 must all be 0
     EXPECT_EQ(bytes[6], 0x00);
     EXPECT_EQ(bytes[7], 0x00);
+}
+
+TEST(X86VariableEncoder, LockCmpxchgMem32LowRegsEmitsF0_0F_B1) {
+    // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): `lock cmpxchg dword [rdi + 0], esi`
+    // (the width-32 Win32 LONG CAS — NO REX.W). LOCK 0xF0 (mandatoryPrefix) +
+    // 0F B1 + ModR/M mod=10 reg=esi(110) rm=rdi(111) = 0xB7 + disp32(0).
+    // Low registers → no REX byte at all: F0 0F B1 B7 00 00 00 00.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const casOp = (*schema)->opcodeByMnemonic("lock_cmpxchg");
+    ASSERT_TRUE(casOp.has_value());
+    LirReg const rsi = physGprByName(**schema, "rsi");
+    LirReg const rdi = physGprByName(**schema, "rdi");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rsi),        // newval → modrm.reg
+            LirOperand::makeReg(rdi),        // base   → modrm.rm.mem
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*casOp, InvalidLirReg, ops, /*payload=*/0,
+                        ::dss::kLirInstFlagWidth32);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0xF0);  // LOCK
+    EXPECT_EQ(bytes[1], 0x0F);
+    EXPECT_EQ(bytes[2], 0xB1);
+    EXPECT_EQ(bytes[3], 0xB7);  // mod=10 reg=esi rm=rdi
+    EXPECT_EQ(bytes[4], 0x00);  // disp32 = 0
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
+    EXPECT_EQ(bytes[7], 0x00);
+}
+
+TEST(X86VariableEncoder, LockCmpxchgMem32HighRegsPinsLockBeforeRex) {
+    // c104 PREFIX-ORDER pin (the cycle-10q REX-overlap trap class): with
+    // HIGH registers (`lock cmpxchg dword [r8 + 0], r9d`) the auto-REX
+    // (R for r9 in modrm.reg + B for r8 in modrm.rm) must land BETWEEN the
+    // LOCK legacy prefix and the opcode: F0 45 0F B1 88 <disp32>. A REX
+    // emitted before LOCK (45 F0 0F B1 …) is an INVALID x86 encoding — REX
+    // must immediately precede the opcode; this byte-pin makes any prefix-
+    // ordering regression fail at byte 0/1 rather than fault at runtime.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const casOp = (*schema)->opcodeByMnemonic("lock_cmpxchg");
+    ASSERT_TRUE(casOp.has_value());
+    LirReg const r9 = physGprByName(**schema, "r9");
+    LirReg const r8 = physGprByName(**schema, "r8");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(r9),         // newval → modrm.reg (REX.R)
+            LirOperand::makeReg(r8),         // base   → modrm.rm.mem (REX.B)
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*casOp, InvalidLirReg, ops, /*payload=*/0,
+                        ::dss::kLirInstFlagWidth32);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 9u);
+    EXPECT_EQ(bytes[0], 0xF0);  // LOCK first
+    EXPECT_EQ(bytes[1], 0x45);  // REX.R|B second (no W — 32-bit form)
+    EXPECT_EQ(bytes[2], 0x0F);
+    EXPECT_EQ(bytes[3], 0xB1);
+    EXPECT_EQ(bytes[4], 0x88);  // mod=10 reg=r9lo(001) rm=r8lo(000)
+    EXPECT_EQ(bytes[5], 0x00);  // disp32 = 0
+    EXPECT_EQ(bytes[6], 0x00);
+    EXPECT_EQ(bytes[7], 0x00);
+    EXPECT_EQ(bytes[8], 0x00);
 }
 
 TEST(X86VariableEncoder, StoreToR12ForcesSibByteAndRexB) {

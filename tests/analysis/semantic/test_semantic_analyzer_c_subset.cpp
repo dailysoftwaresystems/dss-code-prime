@@ -40,10 +40,11 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
     // (`__va_list_tag` + `va_list`) injected into every c-subset CU's builtin scope
     // (D-FC12A-VARIADIC-CALLEE — gated on the schema declaring `vaArgRule`) + the
-    // c103 `__umulh` builtin FUNCTION (D-CSUBSET-INTRINSIC-UMULH, SE6
-    // builtinFunctions — minted into the same CU-wide builtins scope).
-    ASSERT_EQ(model.symbols().size() - 1, 5u)
-        << "main (function) + x (variable) + __va_list_tag + va_list + __umulh";
+    // 2 intrinsic builtin FUNCTIONS (SE6 builtinFunctions, minted into the same
+    // CU-wide builtins scope): c103 `__umulh` (D-CSUBSET-INTRINSIC-UMULH) + c104
+    // `_InterlockedCompareExchange` (D-CSUBSET-INTRINSIC-ATOMIC-CAS).
+    ASSERT_EQ(model.symbols().size() - 1, 6u)
+        << "main + x + __va_list_tag + va_list + __umulh + _InterlockedCompareExchange";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xRec = &model.symbols()[i];
@@ -1133,9 +1134,9 @@ TEST(SemanticAnalyzerCSubset, NestedBlocksShadowWithoutRedecl) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
         << "different blocks → different scopes → no shadow redecl";
     // main (function) + two distinct `x` symbols (one per block scope) + the 2
-    // FC12a-core builtin TYPES (__va_list_tag + va_list) + the c103 `__umulh`
-    // builtin function (D-CSUBSET-INTRINSIC-UMULH).
-    EXPECT_EQ(model.symbols().size() - 1, 6u);
+    // FC12a-core builtin TYPES (__va_list_tag + va_list) + the 2 intrinsic
+    // builtins (c103 __umulh + c104 _InterlockedCompareExchange).
+    EXPECT_EQ(model.symbols().size() - 1, 7u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -1151,9 +1152,9 @@ TEST(SemanticAnalyzerCSubset, ForwardReferenceWithinBlock) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 
     // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
-    // (__va_list_tag + va_list) + the c103 `__umulh` builtin function
-    // (D-CSUBSET-INTRINSIC-UMULH). Find x by name.
-    ASSERT_EQ(model.symbols().size() - 1, 5u);
+    // (__va_list_tag + va_list) + the 2 intrinsic builtins (c103 __umulh +
+    // c104 _InterlockedCompareExchange). Find x by name.
+    ASSERT_EQ(model.symbols().size() - 1, 6u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -3385,9 +3386,11 @@ TEST(SemanticAnalyzerCSubset, ValueStarValueStaysExpressionStatement) {
     });
     EXPECT_FALSE(model.hasErrors());
     // main + a + b + the 2 FC12a-core builtin TYPES (__va_list_tag + va_list) + the
-    // c103 `__umulh` builtin function — the multiplication must mint NO symbol.
-    EXPECT_EQ(model.symbols().size() - 1, 6u)
-        << "main + a + b + __va_list_tag + va_list + __umulh — the multiplication mints none";
+    // 2 intrinsic builtins (c103 __umulh + c104 _InterlockedCompareExchange) — the
+    // multiplication must mint NO symbol.
+    EXPECT_EQ(model.symbols().size() - 1, 7u)
+        << "main + a + b + __va_list_tag + va_list + the 2 intrinsic builtins — "
+           "the multiplication mints none";
 }
 
 // UNKNOWN `u * v;` (no `u` anywhere, single file) — the oracle-candidate

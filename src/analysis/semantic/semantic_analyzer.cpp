@@ -26,6 +26,7 @@
 #include "core/types/string_literal_decode.hpp"  // C 5.1.1.2 phase 6: decodeAdjacentStringBodies (THE chokepoint, shared with HIR)
 #include "ffi/shipped_lib_descriptor.hpp"   // FF11 neutral-JSON descriptor reader
 #include "hir/cst_const_eval.hpp"
+#include "hir/hir_text.hpp"   // c104: parseTypeFromText (builtin signatureText decode)
 #include "hir/hir_op.hpp"   // FC6 c-subtreeType: HirOpKind / opName / isComparison (the per-verb laws cst_to_hir uses)
 
 #include <algorithm>
@@ -6307,21 +6308,44 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         ScopeId const builtinScope = s.scopes.pushScope(cuRoot, InvalidNode, InvalidTree);
         builtinScopeBySchema[sch->schemaId().v] = builtinScope;
         for (auto const& bf : sch->semantics().builtinFunctions) {
-            std::vector<TypeId> paramTypes;
-            paramTypes.reserve(bf.paramCores.size());
-            for (auto pc : bf.paramCores) {
-                paramTypes.push_back(s.lattice.interner().primitive(pc));
+            // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): a builtin declaring a FULL
+            // type-text `signature` (pointer-bearing params the scalar core axis
+            // cannot spell) decodes HERE — the injection site owns the CU's
+            // interner, which the interner-free schema decode does not. Same ONE
+            // codec as shipped-lib symbol signatures. Fail loud on a non-FnSig
+            // or malformed text (parseTypeFromText already reported the detail).
+            TypeId fnTy = InvalidType;
+            if (!bf.signatureText.empty()) {
+                fnTy = parseTypeFromText(bf.signatureText, s.lattice.interner(),
+                                         s.lattice.registry(), s.reporter);
+                if (!fnTy.valid()
+                 || s.lattice.interner().kind(fnTy) != TypeKind::FnSig) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::C_InvalidSemantics;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.actual   = std::format(
+                        "builtin function '{}': 'signature' must decode to a "
+                        "function type, got '{}'", bf.name, bf.signatureText);
+                    s.reporter.report(std::move(d));
+                    continue;
+                }
+            } else {
+                std::vector<TypeId> paramTypes;
+                paramTypes.reserve(bf.paramCores.size());
+                for (auto pc : bf.paramCores) {
+                    paramTypes.push_back(s.lattice.interner().primitive(pc));
+                }
+                // CcSysV is the canonical MIR-tier placeholder (mirrors
+                // the same convention as the user-function FnSig
+                // construction earlier in this TU + `hir_to_mir.cpp:
+                // lowerModuleInit`'s moduleInit FnSig): ML7's
+                // calling-convention pass maps to the target's real
+                // convention at materialize time via `cc.name` lookup.
+                // Do NOT inspect this CallConv field at MIR tier.
+                fnTy = s.lattice.interner().fnSig(
+                    paramTypes, s.lattice.interner().primitive(bf.resultCore),
+                    CallConv::CcSysV);
             }
-            // CcSysV is the canonical MIR-tier placeholder (mirrors
-            // the same convention as the user-function FnSig
-            // construction earlier in this TU + `hir_to_mir.cpp:
-            // lowerModuleInit`'s moduleInit FnSig): ML7's
-            // calling-convention pass maps to the target's real
-            // convention at materialize time via `cc.name` lookup.
-            // Do NOT inspect this CallConv field at MIR tier.
-            TypeId const fnTy = s.lattice.interner().fnSig(
-                paramTypes, s.lattice.interner().primitive(bf.resultCore),
-                CallConv::CcSysV);
             SymbolRecord rec;
             rec.name            = bf.name;
             rec.scope           = builtinScope;

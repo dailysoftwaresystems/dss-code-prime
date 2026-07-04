@@ -535,6 +535,78 @@ TEST(Arm64Encoder, UmulhEncodesDataProc3SourceHighRegs) {
     EXPECT_EQ(bytes[3], 0x9B);
 }
 
+TEST(Arm64Encoder, LdaxrW0X1EncodesLoadAcquireExclusive) {
+    // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): ldaxr w0, [x1] — load-acquire
+    // exclusive, the LL half of the CAS retry loop. W-form base 0x885FFC00
+    // (size=10 | 001000 | L=1 | Rs=11111 | o0=1 | Rt2=11111) | Rn=x1(1)<<5 |
+    // Rt=w0(0) = 0x885FFC20 — LE bytes: 20 FC 5F 88. The result wires to the
+    // Rt field (bits 4:0, the `rd` slot); a wrong L bit silently turns the
+    // acquire-load into a store-form — byte 3/2 pin the exact class bits.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const ldaxrOp = (*s)->opcodeByMnemonic("ldaxr");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(ldaxrOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(x1) };
+    (void)b.addInst(*ldaxrOp, x0, ops, /*payload=*/0, kLirInstFlagWidth32);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0xFC);
+    EXPECT_EQ(bytes[2], 0x5F);
+    EXPECT_EQ(bytes[3], 0x88);
+}
+
+TEST(Arm64Encoder, StlxrW2W0X1EncodesStoreReleaseExclusiveStatusInRs) {
+    // c104: stlxr w2, w0, [x1] — store-release exclusive, the SC half. W-form
+    // base 0x8800FC00 | Rs=w2(2)<<16 | Rn=x1(1)<<5 | Rt=w0(0) = 0x8802FC20 —
+    // LE bytes: 20 FC 02 88. The STATUS result lives in the Rs bit-field
+    // (20:16 — the generic `rm` slot), the stored VALUE wires to the Rt field
+    // (bits 4:0, the `rd` slot position): this pin locks the Rs-vs-Rt wiring —
+    // swapping them silently stores the status and reports the value.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const stlxrOp = (*s)->opcodeByMnemonic("stlxr");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(stlxrOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x2{static_cast<std::uint32_t>(*(*s)->registerByName("x2")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(x0),    // stored value → Rt
+                               LirOperand::makeReg(x1) };  // base → Rn
+    (void)b.addInst(*stlxrOp, x2, ops, /*payload=*/0, kLirInstFlagWidth32);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0xFC);
+    EXPECT_EQ(bytes[2], 0x02);
+    EXPECT_EQ(bytes[3], 0x88);
+}
+
 // ── FC3.5 sweep-c3: MSUB — D-LIR-MOD-MSUB-FUSION (the fixed32 `ra`
 // slot's first consumer; rule 3's fused remainder realization) ─────
 

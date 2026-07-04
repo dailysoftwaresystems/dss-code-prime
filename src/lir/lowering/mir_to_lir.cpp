@@ -32,6 +32,7 @@ namespace {
         case MirOpcode::Sub:           return "Sub";
         case MirOpcode::Mul:           return "Mul";
         case MirOpcode::UMulH:         return "UMulH";
+        case MirOpcode::AtomicCas:     return "AtomicCas";
         case MirOpcode::ICmpEq:        return "ICmpEq";
         case MirOpcode::ICmpNe:        return "ICmpNe";
         case MirOpcode::ICmpSlt:       return "ICmpSlt";
@@ -163,6 +164,15 @@ enum class MnemonicSlot : std::uint8_t {
     // mov-in / core / mov-out sequence like the div pair but with NO pre-op (MUL
     // overwrites RDX:RAX unconditionally). A target declaring neither fails loud.
     UMulHNative, UMulHCore,
+    // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): the atomic compare-and-swap
+    // realizations. `LockCmpxchg` = x86's single-op form (LOCK 0F B1 /r,
+    // mem-dest; implicitRegisters comparand/old = RAX) — straight-line like the
+    // div/umulh implicit-register pattern. `Ldaxr`+`Stlxr` = the arm64
+    // load-acquire/store-release EXCLUSIVE pair realized as a REAL CFG retry
+    // loop (the fixed32 encoder has no intra-op labels — blocks + jcc, the
+    // Switch mid-lowering precedent). A target declaring neither fails loud;
+    // a HALF-declared ldaxr/stlxr pair is a misdeclaration → fail loud.
+    LockCmpxchg, Ldaxr, Stlxr,
     // FC3.5 sweep-c2 (FCmp LIR lowering — D-COND-FLOAT-NAN-TRUTHINESS-
     // FCMP): float compare writing FLAGS, no register result — the
     // float sibling of `cmp`. x86_64 binds UCOMISD (66 0F 2E, width
@@ -323,6 +333,9 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::UModNative,    "umod"},
     {MnemonicSlot::UMulHNative,   "umulh"},    // c103: arm64 native high-multiply
     {MnemonicSlot::UMulHCore,     "umul_op"},  // c103: x86 `mul r/m64` (0xF7 /4)
+    {MnemonicSlot::LockCmpxchg,   "lock_cmpxchg"}, // c104: x86 LOCK 0F B1 /r
+    {MnemonicSlot::Ldaxr,         "ldaxr"},    // c104: arm64 load-acquire exclusive
+    {MnemonicSlot::Stlxr,         "stlxr"},    // c104: arm64 store-release exclusive
     {MnemonicSlot::FCmp,          "fcmp"},
     {MnemonicSlot::MSub,          "msub"},
     {MnemonicSlot::MovkLsl16,     "movk_lsl16"},
@@ -1353,6 +1366,7 @@ struct Lowerer {
             case MirOpcode::Sub:    return lowerBinaryOp(id, MnemonicSlot::Sub);
             case MirOpcode::Mul:    return lowerBinaryOp(id, MnemonicSlot::Mul);
             case MirOpcode::UMulH:  return lowerMulHigh(id);
+            case MirOpcode::AtomicCas: return lowerAtomicCas(id);
             case MirOpcode::SDiv:   return lowerDivLike(id, /*isSigned=*/true,  /*wantRemainder=*/false);
             case MirOpcode::UDiv:   return lowerDivLike(id, /*isSigned=*/false, /*wantRemainder=*/false);
             case MirOpcode::SMod:   return lowerDivLike(id, /*isSigned=*/true,  /*wantRemainder=*/true);
@@ -3938,6 +3952,196 @@ struct Lowerer {
         std::array<LirOperand, 1> const captureOps{LirOperand::makeReg(highPhys)};
         emitInst(*movOp, result, captureOps);
         defineValue(id, result);
+    }
+
+    // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): lower MIR `AtomicCas` — operands
+    // [ptr, comparand, newval] → the ORIGINAL value at *ptr; newval stored iff
+    // original==comparand, atomically. Two capability-probed realizations
+    // (mnemonic presence, never an arch identity):
+    //
+    //   Rule 1 — SINGLE-OP (x86 `lock_cmpxchg`, LOCK 0F B1 /r, a full barrier):
+    //     the implicit-register pattern (div/umulh cousins) — pin the comparand
+    //     into the role-declared register (RAX), emit the mem-dest op
+    //     (store-shaped operands: newval→modrm.reg, ptr→modrm.rm.mem), capture
+    //     the "old" output-role (RAX: CMPXCHG loads the observed value into RAX
+    //     on BOTH outcomes). Straight-line, no CFG.
+    //
+    //   Rule 2 — LL/SC RETRY LOOP (arm64 `ldaxr`+`stlxr`, acquire-release —
+    //     the correct strength for Win32 InterlockedCompareExchange): the
+    //     fixed32 encoder has no intra-op labels, so the loop is REAL CFG
+    //     blocks created mid-lowering (the Switch precedent — the pre-allocated
+    //     MIR→LIR block map keeps incoming edges on block ENTRIES, `defineValue`
+    //     is a global map, and the builder's open-block cursor makes the MIR
+    //     block's REMAINING instructions flow into `done`):
+    //       (current)  ... jmp retry
+    //       retry:  ldaxr old, [ptr]; cmp old, comparand; b.ne done | fall→store
+    //       store:  stlxr status, newval, [ptr]; cmp status, #0;
+    //               b.ne retry | fall→done
+    //       done:   (result = old; lowering resumes here)
+    //     `old` is written once per retry iteration and read in `done`; retry
+    //     dominates store and done, so the single vreg is defined on every
+    //     path — a normal loop-spanning live range. The status cmp runs at the
+    //     DEFAULT 64-bit width deliberately: STLXR's status is architecturally
+    //     a W write, which ZERO-EXTENDS into the X view — the 64-bit compare
+    //     against #0 is exact (audit c104: a width-32 reg-imm cmp variant also
+    //     exists; the 64-bit default is chosen on the zero-extension strength,
+    //     not necessity). Deferred hardening D-LIR-LLSC-SPILL-EXCLUSION: a
+    //     regalloc SPILL of `old` would store inside the exclusive window
+    //     (impl-defined monitor clear → theoretical SC livelock under extreme
+    //     pressure) — see the registry row for the trigger.
+    //
+    //   Else → fail loud (no atomic-CAS realization declared); a half-declared
+    //   ldaxr/stlxr pair is a misdeclaration → fail loud naming the absent half.
+    void lowerAtomicCas(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 3) {
+            reportUnsupported(mir.instOpcode(id), id);
+            return;
+        }
+        std::optional<LirReg> const ptr       = regForValue(operands[0]);
+        std::optional<LirReg> const comparand = regForValue(operands[1]);
+        std::optional<LirReg> const newval    = regForValue(operands[2]);
+        if (!ptr.has_value() || !comparand.has_value() || !newval.has_value())
+            return;
+        std::uint8_t const widthFlags = widthFlagsForType(mir.instType(id));
+
+        // Rule 1 — x86 single-op `lock cmpxchg` with implicit-RAX roles.
+        if (auto const casOp = opcode(MnemonicSlot::LockCmpxchg); casOp.has_value()) {
+            auto const movOp = opcode(MnemonicSlot::Mov);
+            if (!movOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Mov, "MIR AtomicCas (pin/capture)");
+                return;
+            }
+            auto const* casInfo = target.opcodeInfo(*casOp);
+            if (casInfo == nullptr || !casInfo->implicitRegisters.has_value()) {
+                reportUnsupported(mir.instOpcode(id), id);
+                return;
+            }
+            auto const& casIr = *casInfo->implicitRegisters;
+            auto const compOrdinal = casIr.inputOrdinalForRole("comparand");
+            if (!compOrdinal.has_value()) {
+                reportMissingImplicitRole(*casOp, "inputRoles", "comparand", id);
+                return;
+            }
+            auto const oldOrdinal = casIr.outputOrdinalForRole("old");
+            if (!oldOrdinal.has_value()) {
+                reportMissingImplicitRole(*casOp, "outputRoles", "old", id);
+                return;
+            }
+            auto const* compRegInfo = target.registerInfo(*compOrdinal);
+            auto const* oldRegInfo  = target.registerInfo(*oldOrdinal);
+            if (compRegInfo == nullptr || oldRegInfo == nullptr) {
+                reportUnsupported(mir.instOpcode(id), id);
+                return;
+            }
+            LirReg const compPhys = makePhysicalReg(
+                *compOrdinal, static_cast<LirRegClass>(compRegInfo->regClass));
+            // 1. Pin the comparand into the role-declared register (RAX).
+            std::array<LirOperand, 1> const movInOps{LirOperand::makeReg(*comparand)};
+            emitInst(*movOp, compPhys, movInOps);
+            // 2. lock cmpxchg [ptr+0], newval — store-shaped mem-dest operands
+            //    (newval→modrm.reg, ptr→modrm.rm.mem). result: none — the old
+            //    value lands in the implicit RAX. The MIR value's width picks
+            //    the 32-bit (no REX.W — the Win32 LONG CAS) vs 64-bit form.
+            std::array<LirOperand, 4> const casOps{
+                LirOperand::makeReg(*newval),
+                LirOperand::makeReg(*ptr),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(0),
+            };
+            emitInst(*casOp, InvalidLirReg, casOps, /*payload=*/0, widthFlags);
+            // 3. Capture the observed-original value ("old" role, RAX).
+            LirReg const result = lir.newVReg(regClassFor(id));
+            LirReg const oldPhys = makePhysicalReg(
+                *oldOrdinal, static_cast<LirRegClass>(oldRegInfo->regClass));
+            std::array<LirOperand, 1> const captureOps{LirOperand::makeReg(oldPhys)};
+            emitInst(*movOp, result, captureOps);
+            defineValue(id, result);
+            return;
+        }
+
+        // Rule 2 — arm64 LL/SC retry loop over real CFG blocks.
+        auto const ldaxrOp = opcode(MnemonicSlot::Ldaxr);
+        auto const stlxrOp = opcode(MnemonicSlot::Stlxr);
+        if (ldaxrOp.has_value() || stlxrOp.has_value()) {
+            if (!ldaxrOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Ldaxr,
+                                    mirOpcodeName(mir.instOpcode(id)));
+                return;
+            }
+            if (!stlxrOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Stlxr,
+                                    mirOpcodeName(mir.instOpcode(id)));
+                return;
+            }
+            auto const cmpOp = opcode(MnemonicSlot::Cmp);
+            auto const jccOp = opcode(MnemonicSlot::Jcc);
+            auto const jmpOp = opcode(MnemonicSlot::Jmp);
+            if (!cmpOp.has_value() || !jccOp.has_value() || !jmpOp.has_value()) {
+                reportMissingOpcode(!cmpOp.has_value() ? MnemonicSlot::Cmp
+                                  : !jccOp.has_value() ? MnemonicSlot::Jcc
+                                                       : MnemonicSlot::Jmp,
+                                    "MIR AtomicCas (LL/SC loop)");
+                return;
+            }
+            LirBlockId const retry = lir.createBlock();
+            LirBlockId const store = lir.createBlock();
+            LirBlockId const done  = lir.createBlock();
+            // The loop-carried result + the exclusive-store status vregs are
+            // created ONCE; the retry back-edge re-executes the same
+            // instructions into the same vregs (loop-spanning live ranges).
+            LirReg const oldReg    = lir.newVReg(regClassFor(id));
+            LirReg const statusReg = lir.newVReg(LirRegClass::GPR);
+
+            emitBr(*jmpOp, retry);
+            lir.beginBlock(retry);
+            // ldaxr old, [ptr] — load-acquire exclusive; W-form via widthFlags.
+            {
+                std::array<LirOperand, 1> const ldOps{LirOperand::makeReg(*ptr)};
+                emitInst(*ldaxrOp, oldReg, ldOps, /*payload=*/0, widthFlags);
+            }
+            // cmp old, comparand (the value width); b.ne → done (CAS failure
+            // observes `old` as the result), fall through → store.
+            {
+                std::array<LirOperand, 2> const cmpOps{
+                    LirOperand::makeReg(oldReg), LirOperand::makeReg(*comparand)};
+                emitInst(*cmpOp, InvalidLirReg, cmpOps, /*payload=*/0, widthFlags);
+                std::array<LirOperand, 2> const jccOps{
+                    LirOperand::makeBlockRef(done.v),
+                    LirOperand::makeBlockRef(store.v)};
+                emitCondBr(*jccOp, jccOps, done, store,
+                           static_cast<std::uint32_t>(TargetCondCode::Ne));
+            }
+            lir.beginBlock(store);
+            // stlxr status, newval, [ptr] — store-release exclusive; status=0
+            // on success, 1 if the exclusive monitor was lost (→ retry).
+            {
+                std::array<LirOperand, 2> const stOps{
+                    LirOperand::makeReg(*newval), LirOperand::makeReg(*ptr)};
+                emitInst(*stlxrOp, statusReg, stOps, /*payload=*/0, widthFlags);
+            }
+            // cmp status, #0 at the DEFAULT 64-bit width (STLXR's W-write
+            // zero-extends, so the 64-bit compare is exact); b.ne → retry,
+            // fall → done.
+            {
+                std::array<LirOperand, 2> const cmpOps{
+                    LirOperand::makeReg(statusReg), LirOperand::makeImmInt32(0)};
+                emitInst(*cmpOp, InvalidLirReg, cmpOps);
+                std::array<LirOperand, 2> const jccOps{
+                    LirOperand::makeBlockRef(retry.v),
+                    LirOperand::makeBlockRef(done.v)};
+                emitCondBr(*jccOp, jccOps, retry, done,
+                           static_cast<std::uint32_t>(TargetCondCode::Ne));
+            }
+            lir.beginBlock(done);
+            defineValue(id, oldReg);
+            return;
+        }
+
+        // No realization declared — report the single-op verb as the canonical
+        // missing capability (mirrors emitDivLikeValue / lowerMulHigh).
+        reportMissingOpcode(MnemonicSlot::LockCmpxchg,
+                            mirOpcodeName(mir.instOpcode(id)));
     }
 
     void reportMissingImplicitRole(std::uint16_t opId, char const* mapName,

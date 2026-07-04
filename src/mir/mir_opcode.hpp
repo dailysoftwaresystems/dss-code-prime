@@ -49,6 +49,14 @@ enum class MirOpcode : std::uint16_t {
     // lowers to this; x86 `mul r/m64` captures RDX, arm64 native `umulh`. Pure +
     // commutative (high(a*b) == high(b*a)), like Mul.
     UMulH,
+    // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): atomic compare-and-swap -- operands
+    // [ptr, comparand, newval], result = the ORIGINAL value at *ptr; iff
+    // original==comparand the newval is stored, ATOMICALLY (seq-cst-ish: x86
+    // `lock cmpxchg` is a full barrier; arm64 LDAXR/STLXR is acquire-release --
+    // the correct lowering for Win32 InterlockedCompareExchange semantics).
+    // hasSideEffects=TRUE (a store): DCE keeps it live even when the result is
+    // unused, CSE never dedups two CASes, LICM never hoists one. NOT commutative.
+    AtomicCas,
     // ── floating-point arithmetic ──
     FAdd, FSub, FMul, FDiv, FNeg,
     // ── bitwise ──
@@ -266,6 +274,7 @@ struct MirOpcodeInfo {
         case MirOpcode::Sub:  return {2, 2, 0, 0, R::Value, false, false, false, "sub"};
         case MirOpcode::Mul:  return {2, 2, 0, 0, R::Value, false, false, false, "mul"};
         case MirOpcode::UMulH: return {2, 2, 0, 0, R::Value, false, false, false, "umulh"};
+        case MirOpcode::AtomicCas: return {3, 3, 0, 0, R::Value, false, true, false, "atomic_cas"};
         case MirOpcode::SDiv: return {2, 2, 0, 0, R::Value, false, false, false, "sdiv"};
         case MirOpcode::UDiv: return {2, 2, 0, 0, R::Value, false, false, false, "udiv"};
         case MirOpcode::SMod: return {2, 2, 0, 0, R::Value, false, false, false, "smod"};

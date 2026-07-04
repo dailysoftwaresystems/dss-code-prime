@@ -7438,6 +7438,58 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                       "'name' is required and must be a string");
                             continue;
                         }
+                        // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): a FULL type-text
+                        // `signature` (pointer-bearing params) is the ALTERNATIVE
+                        // to the scalar params/result axis — exactly one of the
+                        // two forms must be used (both = an ambiguous declaration;
+                        // fail loud rather than pick).
+                        if (entry.contains("signature")) {
+                            if (!entry.at("signature").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/signature",
+                                          "'signature' must be a string");
+                                continue;
+                            }
+                            if (entry.contains("params") || entry.contains("result")) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/signature",
+                                          "'signature' and 'params'/'result' are "
+                                          "mutually exclusive — declare one form");
+                                continue;
+                            }
+                            BuiltinFunctionMapping m;
+                            m.name          = entry.at("name").get<std::string>();
+                            m.signatureText = entry.at("signature").get<std::string>();
+                            if (entry.contains("variadic")) {
+                                if (!entry.at("variadic").is_boolean()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/variadic",
+                                              "'variadic' must be a boolean");
+                                    continue;
+                                }
+                                m.variadic = entry.at("variadic").get<bool>();
+                            }
+                            if (entry.contains("lowering")) {
+                                if (!entry.at("lowering").is_string()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/lowering",
+                                              "'lowering' must be a string");
+                                    continue;
+                                }
+                                auto const lw = builtinLoweringFromName(
+                                    entry.at("lowering").get<std::string>());
+                                if (!lw) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/lowering",
+                                              std::format("unknown builtin lowering '{}'",
+                                                          entry.at("lowering").get<std::string>()));
+                                    continue;
+                                }
+                                m.lowering = *lw;
+                            }
+                            cfg.builtinFunctions.push_back(std::move(m));
+                            continue;
+                        }
                         if (!entry.contains("result") || !entry.at("result").is_string()) {
                             coll.emit(DiagnosticCode::C_MissingField, path + "/result",
                                       "'result' is required and must be a string");

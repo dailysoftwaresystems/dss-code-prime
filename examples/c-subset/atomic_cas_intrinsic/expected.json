@@ -1,0 +1,35 @@
+{
+  "$comment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): runtime witness for the _InterlockedCompareExchange atomic-CAS intrinsic (x86 `lock cmpxchg` implicit-RAX / arm64 LDAXR-STLXR retry loop as REAL CFG blocks). Three arms in one exit code: success (returns original 5, stores 9), failure (comparand mismatch: NO store, returns the OBSERVED 9), and an UNUSED-RESULT CAS whose store must still land (the hasSideEffects/DCE guard: dropping it shifts the exit by -12). The arm64 qemu arm is the cross-target RUNTIME closure for the LL/SC loop (encoding pins alone are not runtime proof); the `release` arm (shippedPipeline, zero-drift) proves DCE/CSE/LICM respect the side-effecting MIR AtomicCas through the full optimizer. exit = 5+9+9+23 = 46.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 46,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

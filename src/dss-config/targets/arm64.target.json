@@ -426,6 +426,66 @@
       }
     },
     {
+      "$comment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): LDAXR Wt/Xt, [Xn] — load-acquire EXCLUSIVE (arms the exclusive monitor; the acquire half of the LL/SC CAS loop). W-form 0x885FFC00 = size=10 | 001000 | o2=0 L=1 o1=0 | Rs=11111 | o0=1 | Rt2=11111 | Rn | Rt; X-form flips size to 11 -> 0xC85FFC00. Result = the loaded value (Rt, bits 4:0 = the `rd` slot); operand 0 = the address base (Rn). The MIR AtomicCas value width picks W (the Win32 LONG i32 CAS) vs X.",
+      "mnemonic":      "ldaxr",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 2287991808 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 3361733632 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): STLXR Ws, Wt/Xt, [Xn] — store-release EXCLUSIVE (succeeds iff the monitor armed by LDAXR is still held; the release half of the LL/SC loop). W-form 0x8800FC00 = size=10 | 001000 | o2=0 L=0 o1=0 | Rs | o0=1 | Rt2=11111 | Rn | Rt; X-form 0xC800FC00. Result = the STATUS register Ws (0=stored, 1=monitor lost -> retry) — it lives in the Rs bit-field (20:16), which is the generic `rm` slot position, so resultSlot:'rm' (the slot vocabulary is bit-positional, not role-named). Operand 0 = the stored value (Rt, bits 4:0 = the `rd` slot position — an operand MAY wire to rd, the MOVK dest-wire precedent); operand 1 = the address base (Rn). The value width picks W vs X; the status is ALWAYS a W write (zero-extending — the loop's `cmp status, #0` runs at the default 64-bit width on the strength of that zero-extension).",
+      "mnemonic":      "stlxr",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 2281765888 },
+            "resultSlot": "rm",
+            "wires":      [
+              { "index": 0, "slotKind": "rd" },
+              { "index": 1, "slotKind": "rn" }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 3355507712 },
+            "resultSlot": "rm",
+            "wires":      [
+              { "index": 0, "slotKind": "rd" },
+              { "index": 1, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "FC1 V2-4.X (2026-06-10): NEG Xd, Xm = SUB Xd, XZR, Xm (shifted-register alias, Rn=XZR baked). Base = 0xCB000000 | (XZR=31 << 5) = 0xCB0003E0. Slots: Rd, Rm. Surfaced by the modulo corpus' negative literals — under the BASELINE (no-ConstFold) pipeline a unary minus reaches LIR as a live `neg`, and arm64 had never declared one (every prior arm64 corpus avoided unary minus).",
       "mnemonic":      "neg",
       "result":        "value",

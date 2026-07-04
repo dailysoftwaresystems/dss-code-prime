@@ -469,6 +469,49 @@
       }
     },
     {
+      "$comment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS) — atomic compare-and-swap, mem-dest: LOCK CMPXCHG [base+disp32], reg (LOCK 0xF0 mandatoryPrefix + 0x0F 0xB1 /r). Semantics: compares RAX/EAX (the implicit 'comparand' input-role) with [mem]; equal -> stores the wired reg (the NEW value, modrm.reg); unequal -> loads [mem] into RAX/EAX. EITHER way RAX ends holding the ORIGINAL observed value (the 'old' output-role the MIR AtomicCas lowering captures). LOCK makes it a full barrier — the correct strength for Win32 InterlockedCompareExchange. Operand shape mirrors `store`'s 4-op mem-dest form: [newval_reg, base_reg, MemBase(scale), MemOffset(disp)]. mandatoryPrefix [240] emits BEFORE the auto-REX (the 0x66 width-16-store precedent — legacy prefixes precede REX, REX immediately precedes the opcode), so a high-numbered base/newval register REX.B/R composes correctly: F0 [REX] 0F B1 /r. Width 32 = the Win32 LONG (LLP64) CAS — NO rexW; width 64 for completeness (a future 64-bit CAS consumer). implicitRegisters: inputs=[rax] (the comparand), outputs/clobbered=[rax] (the observed-original; outputs ⊆ clobbered).",
+      "mnemonic":      "lock_cmpxchg",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "implicitRegisters": {
+        "inputs":    ["rax"],
+        "outputs":   ["rax"],
+        "clobbered": ["rax"],
+        "inputRoles":  { "comparand": "rax" },
+        "outputRoles": { "old": "rax" }
+      },
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "mandatoryPrefix": [240], "opcode": [15, 177] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "$comment": "64-bit form (REX.W): lock cmpxchg qword [base+disp32], r64 — no shipped consumer yet (InterlockedCompareExchange is the 32-bit LONG CAS); declared so a future i64 CAS selects it by width instead of silently mis-encoding.",
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "mandatoryPrefix": [240], "rexW": true, "opcode": [15, 177] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): integer compare (writes FLAGS, no GPR result). Two variants: reg-reg (REX.W 0x39 /r — cmp r/m64, r64) + reg-imm32 (REX.W 0x81 /7 imm32 — cmp r/m64, imm32 with sign-extended imm32). modrmRegExt=7 fills ModR/M.reg with the /7 opcode-extension digit. ML5 lowerICmp + lowerCondBr both emit `cmp` against an immediate-0 or against another reg.",
       "mnemonic":      "cmp",
       "result":        "none",

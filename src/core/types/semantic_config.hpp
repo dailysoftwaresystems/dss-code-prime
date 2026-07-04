@@ -663,6 +663,11 @@ struct DSS_EXPORT CallRule {
 enum class BuiltinLowering : std::uint16_t {
     None = 0,     // ordinary semantic-only builtin (e.g. tsql COALESCE)
     UMulHigh,     // __umulh: high 64 bits of the u64*u64 128-bit product
+    // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): InterlockedCompareExchange — the
+    // atomic compare-and-swap. Operands (ptr, comparand, newval) → the ORIGINAL
+    // value at *ptr; iff original==comparand the newval is stored, atomically
+    // (x86 `lock cmpxchg`; arm64 LDAXR/STLXR acquire-release loop).
+    AtomicCas,
 };
 
 // Resolve the config `lowering` name to its BuiltinLowering. nullopt = an unknown
@@ -670,7 +675,8 @@ enum class BuiltinLowering : std::uint16_t {
 // (an ordinary builtin, which never carries a `lowering` key).
 [[nodiscard]] inline std::optional<BuiltinLowering>
 builtinLoweringFromName(std::string_view name) noexcept {
-    if (name == "umulh") { return BuiltinLowering::UMulHigh; }
+    if (name == "umulh")      { return BuiltinLowering::UMulHigh;  }
+    if (name == "atomic_cas") { return BuiltinLowering::AtomicCas; }
     return std::nullopt;
 }
 
@@ -687,6 +693,15 @@ struct DSS_EXPORT BuiltinFunctionMapping {
     // intrinsic (a target instruction) instead of an ordinary call. None (the
     // default) preserves the pure-semantic builtin behaviour (COALESCE).
     BuiltinLowering       lowering   = BuiltinLowering::None;
+    // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): OPTIONAL full type-text signature
+    // (the ONE shipped-lib codec, e.g. "fn(ptr<i32>, i32, i32) -> i32") for a
+    // builtin whose parameters need REAL types the scalar `paramCores` axis
+    // cannot express (pointers). Schema decode is interner-free, so the TEXT is
+    // stored here and parsed at the semantic INJECTION site (where the CU's
+    // interner exists) via `parseTypeFromText` — exactly how shipped-lib symbol
+    // signatures decode. Mutually exclusive with params/result (fail-loud at
+    // decode if both are present); must decode to an FnSig (fail-loud else).
+    std::string           signatureText;
 };
 
 // D5.1: a member-access expression rule. When Pass 2 sees a node with this

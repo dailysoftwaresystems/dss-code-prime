@@ -1991,9 +1991,15 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // "high"/"low" (the RDX/RAX halves of the 128-bit product; the
         // `__umulh` lowering captures the "high" output-role). arm64's
         // native `umulh` needs no roles (a 3-address result-bearing op).
-        static constexpr std::array<std::string_view, 7>
+        // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS) added the CAS projection:
+        // "comparand" (the RAX implicit input of x86 `lock cmpxchg`) plus
+        // "old" (RAX out — the observed-original value on BOTH outcomes; the
+        // AtomicCas lowering captures it). arm64's ldaxr/stlxr need no roles
+        // (result-bearing ops; the status rides the stlxr result slot).
+        static constexpr std::array<std::string_view, 9>
             kKnownImplicitRegisterRoles{"dividend", "quotient", "remainder",
-                                        "count", "multiplicand", "high", "low"};
+                                        "count", "multiplicand", "high", "low",
+                                        "comparand", "old"};
         auto resolveRoles =
             [&](std::vector<std::pair<std::string, std::string>> const& roles,
                 std::vector<std::pair<std::string, std::uint16_t>>& resolved,
