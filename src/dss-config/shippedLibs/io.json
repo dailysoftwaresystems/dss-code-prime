@@ -16,7 +16,7 @@
     { "name": "_wfindfirst", "signature": "fn(ptr<u16>, ptr<void>) -> i64", "kind": "function", "linkage": "external" },
     { "name": "_wfindnext", "signature": "fn(i64, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
     { "name": "_findclose", "signature": "fn(i64) -> i32", "kind": "function", "linkage": "external" },
-    { "name": "_pclose", "signature": "fn(ptr<struct \"FILE\" {}>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "_pclose", "signature": "fn(ptr<struct \"FILE\" { arr<u64, 6> }>) -> i32", "kind": "function", "linkage": "external" },
     { "name": "_fileno", "signature": "fn(ptr<void>) -> i32", "kind": "function", "linkage": "external" }
   ],
   "typedefs": [
