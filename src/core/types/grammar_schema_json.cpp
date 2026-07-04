@@ -3942,6 +3942,79 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                             pm.value = e.at("value").get<std::string>();
                         }
+                        // c105 (D-PP-FUNCTION-LIKE-PREDEFINE): OPTIONAL `params`
+                        // — a FUNCTION-LIKE predefine (e.g. the MSVC-profile
+                        // `__declspec(x)` → empty erase). Constant-kind only
+                        // (the derived kinds are inherently object-like). Each
+                        // param must be a non-empty unique string (C 6.10.3p6
+                        // duplicate-param parity with the directive handler,
+                        // enforced HERE so a config typo fails at load).
+                        if (e.contains("params")) {
+                            if (!isConstant) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          mpath + "/params",
+                                          "'params' is valid only on a 'constant' "
+                                          "predefinedMacros entry");
+                                continue;
+                            }
+                            json const& prs = e.at("params");
+                            if (!prs.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          mpath + "/params",
+                                          "'predefinedMacros.params' must be an "
+                                          "array of parameter-name strings");
+                                continue;
+                            }
+                            bool prOk = true;
+                            for (std::size_t pi = 0; pi < prs.size(); ++pi) {
+                                if (!prs[pi].is_string()
+                                    || prs[pi].get<std::string>().empty()) {
+                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                              mpath + "/params",
+                                              "each 'params' entry must be a "
+                                              "non-empty string");
+                                    prOk = false;
+                                    break;
+                                }
+                                std::string p = prs[pi].get<std::string>();
+                                // c105 audit L2: each param must BE an
+                                // identifier ([A-Za-z_][A-Za-z0-9_]*) — a
+                                // config `"a b"` would otherwise emit a
+                                // malformed prologue #define that fails only
+                                // at first preprocess, not at load.
+                                bool idOk = !(p[0] >= '0' && p[0] <= '9');
+                                for (char const c : p) {
+                                    if (!((c >= 'A' && c <= 'Z')
+                                          || (c >= 'a' && c <= 'z')
+                                          || (c >= '0' && c <= '9')
+                                          || c == '_')) {
+                                        idOk = false;
+                                        break;
+                                    }
+                                }
+                                if (!idOk) {
+                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                              mpath + "/params",
+                                              std::format("macro parameter '{}' "
+                                                          "is not an identifier",
+                                                          p));
+                                    prOk = false;
+                                    break;
+                                }
+                                if (std::find(pm.params.begin(), pm.params.end(),
+                                              p) != pm.params.end()) {
+                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                              mpath + "/params",
+                                              std::format("duplicate macro "
+                                                          "parameter '{}'", p));
+                                    prOk = false;
+                                    break;
+                                }
+                                pm.params.push_back(std::move(p));
+                            }
+                            if (!prOk) continue;
+                            pm.isFunctionLike = true;
+                        }
                         // OPTIONAL `availableObjectFormats` — a per-format
                         // availability filter (mirrors the shipped-lib
                         // descriptor field). Absent ⇒ available on every format.

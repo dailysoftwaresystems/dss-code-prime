@@ -239,7 +239,7 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         std::optional<substrate::PhaseTimers::Scope> phase;
         phase.emplace(substrate::CompilePhase::Preprocess);
         PreprocessResult pp = preprocess(src, schema, includeDirs_, systemDirs_,
-                                         activeFormat_);
+                                         activeFormat_, userDefines_);
         phase.reset();
         auto remap = pp.makeRemap();
         std::shared_ptr<SourceBuffer> synth = pp.synthBuffer;
@@ -300,6 +300,22 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         sidecar.ppTokens        = std::move(pp.tokens);
         sidecar.ppRemap         = std::move(remap);
         return trees_.back().id();
+    }
+    // c105 (D-PP-USER-DEFINE): `--define` macros can ONLY be consumed by a
+    // preprocess-enabled language. Reaching the plain tokenize→parse path with
+    // user defines pending means they would be SILENTLY ignored — fail loud
+    // (once per file taking this path; a mixed CU's preprocessed files still
+    // consume them normally).
+    if (!userDefines_.empty()) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::D_DefineRequiresPreprocess;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = src->id();
+        d.actual   = "--define was passed but language '"
+                   + std::string{schema->name()}
+                   + "' declares no preprocess block; the macro(s) cannot "
+                     "be consumed";
+        driverDiagnostics_.report(std::move(d));
     }
     std::optional<substrate::PhaseTimers::Scope> phase;
     phase.emplace(substrate::CompilePhase::Tokenize);
@@ -366,6 +382,13 @@ void UnitBuilder::setActiveFormat(ObjectFormatKind fmt) {
         cuFatal("UnitBuilder::setActiveFormat called after finish()");
     }
     activeFormat_ = fmt;
+}
+
+void UnitBuilder::setUserDefines(std::vector<std::string> defines) {
+    if (finished_) {
+        cuFatal("UnitBuilder::setUserDefines called after finish()");
+    }
+    userDefines_ = std::move(defines);
 }
 
 TreeId UnitBuilder::loadAndAdd_(std::filesystem::path const& path, bool& ok,
@@ -684,6 +707,24 @@ CompilationUnit UnitBuilder::finish() && {
                     chooseResolver(schema)->resolve(recontext);
                 }
             }
+        }
+    }
+
+    // c105 (D-PP-USER-DEFINE fold): remap every shipped-descriptor ref's
+    // carried `#include` span/buffer from SYNTH coordinates onto its ORIGIN
+    // file, exactly as tree diagnostics are remapped. Pre-c105 this was
+    // coincidentally correct — a no-splice TU's synth text was byte-identical
+    // to the main source, so the c8 availability gate's F001D landed on the
+    // right line by accident; the "<built-in>"/"<command-line>" prologues (and
+    // equally any quote-splice BEFORE an angle include — a pre-existing latent
+    // mis-attribution) shift the synth, so the ref must be remapped for real.
+    // Each preprocessed tree's ppRemap closure self-gates on its own synth
+    // buffer id, so running every ref through every remap is a no-op for
+    // non-matching refs (and for non-preprocessed trees, which have none).
+    for (auto& sc : sidecars_) {
+        if (!sc.ppRemap) continue;
+        for (auto& ref : shippedLibDescriptors) {
+            sc.ppRemap(ref.buffer, ref.span);
         }
     }
 

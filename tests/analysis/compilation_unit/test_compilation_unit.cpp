@@ -99,6 +99,26 @@ TEST(CompilationUnit, BuildSingleTreeMatchesContract) {
     EXPECT_EQ(cu.driverDiagnostics().all().size(), 0u);  // D2: D_* codes start in CU2
 }
 
+// c105 (D-PP-USER-DEFINE, the audit-F3 pin): `--define` macros on a language
+// WITHOUT a preprocess block (toy) can never be consumed — the plain
+// tokenize→parse path must fail LOUD (D_DefineRequiresPreprocess), never
+// silently ignore the user's macros. RED-ON-DISABLE: drop the guard in
+// parseAndAdd_'s non-preprocess arm → zero driver diagnostics → this fails.
+TEST(CompilationUnit, UserDefinesWithoutPreprocessBlockFailLoud) {
+    auto schema = loadToySchema();
+    UnitBuilder b{schema};
+    b.setUserDefines({"FOO=1"});
+    b.addInMemory("var x : int = 1;", "<mem>");
+    auto cu = std::move(b).finish();
+    std::size_t hits = 0;
+    for (auto const& d : cu.driverDiagnostics().all()) {
+        if (d.code == DiagnosticCode::D_DefineRequiresPreprocess) ++hits;
+    }
+    EXPECT_EQ(hits, 1u)
+        << "one non-preprocess file + pending --define macros must emit "
+           "exactly one D_DefineRequiresPreprocess";
+}
+
 TEST(CompilationUnit, BuildMultipleTreesPreservesOrder) {
     auto schema = loadToySchema();
     UnitBuilder b{schema};

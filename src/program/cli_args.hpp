@@ -62,6 +62,15 @@ struct DSS_EXPORT CliArgs {
     InputResolver::Mode      directoryMode =
         InputResolver::Mode::Recursive;        // --recursive / --no-recursive
     CompileConfig            config = CompileConfig::Debug;  // --config=release|debug
+    // c105 (D-PP-USER-DEFINE): `--define NAME[=VALUE]` (repeatable; VALUE
+    // defaults to 1) — the universal -D. Entries are carried VERBATIM to the
+    // preprocessor, which lowers each to a `#define` line in the synthetic
+    // "<command-line>" prologue (ordinary macros: #undef-able, C 6.10.3p2
+    // duplicate policy, LOUD on a config-predefine collision). The CLI layer
+    // does only the STRUCTURAL checks (non-empty NAME; no '(' — a
+    // function-like --define is not supported); tokenizer-true name
+    // validation happens in the directive handler where the real lexer lives.
+    std::vector<std::string> defines;          // --define NAME[=VALUE]
 
     // ── Output routing (D-LK10-ENTRY Slice C companion) ─────────
     //
@@ -125,6 +134,9 @@ enum class CliArgsError : std::uint8_t {
     InvalidConfig       = 9,    // --config=<not-debug-not-release>
     EmptyFilename       = 10,   // --compile "" or bare `-` as positional
     UnexpectedPositional = 11,  // bare positional outside --compile/--transpile
+    InvalidDefine       = 12,   // c105: --define with an empty NAME, or a '('
+                                // in NAME (a function-like --define is not
+                                // supported — use a config predefine)
 };
 
 [[nodiscard]] DSS_EXPORT std::string_view

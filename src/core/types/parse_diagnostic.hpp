@@ -588,6 +588,12 @@ enum class DiagnosticCode : std::uint16_t {
     //   target/format, or ship the backend that emits it). Remediation-
     //   distinct → distinct code.
     D_ArtifactProfileFormatMismatch = 0xD011,
+    // c105 (D-PP-USER-DEFINE): `--define` was passed but the language declares
+    // no preprocess block — the macros could never be consumed. Silent
+    // acceptance would let a typo'd invocation build something other than what
+    // the user asked for; fail loud instead (a language without a preprocessor
+    // has no -D semantics).
+    D_DefineRequiresPreprocess    = 0xD012,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──

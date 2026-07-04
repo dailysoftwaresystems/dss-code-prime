@@ -129,6 +129,7 @@ std::string_view cliArgsErrorName(CliArgsError e) noexcept {
         case CliArgsError::InvalidConfig:       return "InvalidConfig";
         case CliArgsError::EmptyFilename:       return "EmptyFilename";
         case CliArgsError::UnexpectedPositional: return "UnexpectedPositional";
+        case CliArgsError::InvalidDefine:        return "InvalidDefine";
     }
     return "Unknown";
 }
@@ -422,6 +423,59 @@ parseCliArgs(int argc, char* argv[]) {
             if (!m) return std::unexpected(m.error());
             if (m->has_value()) {
                 out.outputDir = std::filesystem::path{std::move(**m)};
+                continue;
+            }
+        }
+        {
+            // c105 (D-PP-USER-DEFINE): `--define NAME[=VALUE]` (repeatable).
+            // STRUCTURAL checks only here — a non-empty NAME and no '(' in
+            // NAME (a function-like --define is unsupported; config
+            // predefinedMacros carry the params axis). Tokenizer-true name
+            // validation happens in the preprocessor's directive handler.
+            auto m = valueFlag(a, i, "--define");
+            if (!m) return std::unexpected(m.error());
+            if (m->has_value()) {
+                std::string d = std::move(**m);
+                auto const eq = d.find('=');
+                std::string_view const name =
+                    std::string_view{d}.substr(0, eq);
+                if (name.empty()) {
+                    return std::unexpected(CliArgsErrorInfo{
+                        CliArgsError::InvalidDefine,
+                        "--define requires a non-empty macro NAME "
+                        "(--define NAME[=VALUE]); got: '" + d + "'"});
+                }
+                if (name.find('(') != std::string_view::npos) {
+                    return std::unexpected(CliArgsErrorInfo{
+                        CliArgsError::InvalidDefine,
+                        "a function-like --define is not supported (got '" + d
+                            + "'); declare a config predefinedMacros entry "
+                              "with 'params' instead"});
+                }
+                // c105 audit M1: NAME must be a single C-family identifier —
+                // trailing junk (`--define "FOO,BAR=1"`) would otherwise flow
+                // into the prologue as `#define FOO,BAR 1`, which the directive
+                // handler parses as name FOO with replacement `, BAR 1`: a
+                // SILENTLY WRONG macro (gcc hard-errors here: "macro names
+                // must be identifiers"). A byte-class check is honest at this
+                // C-family CLI surface (identifiers are ASCII-classed in every
+                // C dialect; the engine-tier tokenizer still re-validates the
+                // first token).
+                bool nameOk = !(name[0] >= '0' && name[0] <= '9');
+                for (char const c : name) {
+                    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                          || (c >= '0' && c <= '9') || c == '_')) {
+                        nameOk = false;
+                        break;
+                    }
+                }
+                if (!nameOk) {
+                    return std::unexpected(CliArgsErrorInfo{
+                        CliArgsError::InvalidDefine,
+                        "--define NAME must be a single identifier "
+                        "([A-Za-z_][A-Za-z0-9_]*); got: '" + d + "'"});
+                }
+                out.defines.push_back(std::move(d));
                 continue;
             }
         }

@@ -593,6 +593,7 @@ int Program::run(int argc, char* argv[]) {
     auto const cfg = buildReporterConfig(args);
     // D-LK10-ENTRY Slice C companion: route emitted binaries.
     setOutputDir(args.outputDir);
+    setUserDefines(args.defines);  // c105: --define NAME[=VALUE] → the CU builds
     // D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG: thread the CLI's
     // `--config=<debug|release>` into the kernel so the right
     // shipped pipeline gets loaded at compile_pipeline step 3.5.
@@ -920,6 +921,7 @@ int Program::compileFiles(
                 UnitBuilder builder{grammar};
                 applySystemDirs(builder, *grammar);
                 if (kind) builder.setActiveFormat(*kind);
+                builder.setUserDefines(userDefines());  // c105: --define
                 for (auto const& path : sourceFiles) {
                     builder.addFile(fs::path{path});
                 }
@@ -1002,6 +1004,7 @@ int Program::compileUnits(
                     UnitBuilder builder{grammar};
                     applySystemDirs(builder, *grammar);
                     if (kind) builder.setActiveFormat(*kind);
+                    builder.setUserDefines(userDefines());  // c105: --define
                     builder.addFile(fs::path{path});
                     return std::move(builder).finish();
                 }));

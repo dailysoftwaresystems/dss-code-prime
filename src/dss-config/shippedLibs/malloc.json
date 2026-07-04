@@ -1,0 +1,10 @@
+{
+  "$comment": "c105 (the MSVC-profile flip): shipped <malloc.h> — the Microsoft CRT allocation-introspection header (pe-only; a glibc/darwin program gets malloc from <stdlib.h>, and DSS's elf/macho surfaces never reference <malloc.h>). SCOPE: exactly what the sqlite amalgamation uses under `#if defined(_MSC_VER) && !defined(SQLITE_WITHOUT_MSIZE)` — `_msize(void*) -> size_t` (LLP64 size_t = u64), the allocation-size query backing sqlite3MemSize. `_msize` is a REAL msvcrt.dll export (dumpbin-verified; the c101 eager-import lesson: a `symbols` block may carry ONLY real exports).",
+  "header": "malloc.h",
+  "standard": "msvcrt",
+  "availableObjectFormats": ["pe"],
+  "library": { "pe": "msvcrt.dll" },
+  "symbols": [
+    { "name": "_msize", "signature": "fn(ptr<void>) -> u64", "kind": "function", "linkage": "external" }
+  ]
+}

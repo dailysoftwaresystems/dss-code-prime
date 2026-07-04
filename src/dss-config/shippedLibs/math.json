@@ -4,7 +4,8 @@
   "standard": "c89",
   "library": { "pe": "msvcrt.dll", "elf": "libm.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "floatConstants": [
-    { "name": "INFINITY", "value": "inf", "type": "f64" }
+    { "name": "INFINITY", "value": "inf", "type": "f64" },
+    { "name": "HUGE_VAL", "value": "inf", "type": "f64" }
   ],
   "symbols": [
     { "name": "sqrt",  "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },

@@ -1144,6 +1144,13 @@ public:
                     continue;
                 }
             }
+            // c105 (D-PP-FUNCTION-LIKE-PREDEFINE): a FUNCTION-LIKE predefine is
+            // NOT seeded here — it lowers to a `#define name(params) value`
+            // line in the "<built-in>" prologue (see `preprocess()`), making it
+            // an ORDINARY macro (the directive handler owns its param parsing +
+            // expansion). Seeding it here too would make the prologue #define
+            // trip the C 6.10.8.1 predefined-collision guard against itself.
+            if (pm.isFunctionLike) continue;
             predefined_.emplace(pm.name, pm);
         }
         // FC15b: compute the translation DATE/TIME spellings ONCE (C 6.10.8.1 --
@@ -2806,7 +2813,8 @@ PreprocessResult preprocess(
     std::shared_ptr<GrammarSchema const> schema,
     std::span<fs::path const>            includeDirs,
     std::span<fs::path const>            systemDirs,
-    std::optional<ObjectFormatKind>      activeFormat) {
+    std::optional<ObjectFormatKind>      activeFormat,
+    std::span<std::string const>         userDefines) {
     if (!mainSource || !schema) ppFatal("preprocess: null source or schema");
     if (!schema->preprocess().enabled) {
         ppFatal("preprocess: called with a schema whose preprocess pass is "
@@ -2817,6 +2825,70 @@ PreprocessResult preprocess(
     result.diagnostics = std::make_unique<DiagnosticReporter>();
 
     std::string synthText;
+
+    // c105 (D-PP-FUNCTION-LIKE-PREDEFINE + D-PP-USER-DEFINE): the synthetic
+    // PROLOGUES, prepended to the synth stream BEFORE the main source so the
+    // ORDINARY directive handler seeds them in stream order (the gcc model:
+    // "as if #define appeared before the first source line"). Two origins:
+    //   "<built-in>"     — config predefinedMacros WITH `params` (function-like,
+    //                      e.g. the MSVC-profile `__declspec(x)` → empty erase),
+    //                      format-filtered exactly like the predefined_ seed.
+    //   "<command-line>" — the CLI `--define NAME[=VALUE]` entries (VALUE
+    //                      defaults to 1). Because these become ORDINARY
+    //                      macros, the handler gives for free: name validation,
+    //                      the C 6.10.8.1 predefined-collision guard (a -D may
+    //                      not silently flip `_MSC_VER`), the 6.10.3p2
+    //                      duplicate policy, and #undef-ability.
+    // Each prologue is its own SourceBuffer so line-mapped diagnostics point
+    // at the synthetic origin by name. Empty prologues append nothing — the
+    // synth stream is byte-identical to the pre-c105 shape.
+    {
+        std::string builtinText;
+        for (PredefinedMacroDef const& pm : schema->preprocess().predefinedMacros) {
+            if (!pm.isFunctionLike) continue;
+            if (!pm.availableObjectFormats.empty()) {
+                if (!activeFormat.has_value()) continue;
+                if (!ffi::objectFormatInAvailabilitySet(pm.availableObjectFormats,
+                                                        *activeFormat)) {
+                    continue;
+                }
+            }
+            builtinText += "#define ";
+            builtinText += pm.name;
+            builtinText += '(';
+            for (std::size_t i = 0; i < pm.params.size(); ++i) {
+                if (i != 0) builtinText += ',';
+                builtinText += pm.params[i];
+            }
+            builtinText += ") ";
+            builtinText += pm.value;
+            builtinText += '\n';
+        }
+        if (!builtinText.empty()) {
+            auto origin = SourceBuffer::fromString(builtinText, "<built-in>");
+            appendWithContinuationSplice(origin->text(), origin, 0, synthText,
+                                         result.lineMap);
+        }
+        std::string cliText;
+        for (std::string const& d : userDefines) {
+            auto const eq = d.find('=');
+            std::string const name =
+                (eq == std::string::npos) ? d : d.substr(0, eq);
+            std::string const val =
+                (eq == std::string::npos) ? std::string{"1"} : d.substr(eq + 1);
+            cliText += "#define ";
+            cliText += name;
+            cliText += ' ';
+            cliText += val;
+            cliText += '\n';
+        }
+        if (!cliText.empty()) {
+            auto origin = SourceBuffer::fromString(cliText, "<command-line>");
+            appendWithContinuationSplice(origin->text(), origin, 0, synthText,
+                                         result.lineMap);
+        }
+    }
+
     std::vector<fs::path> includeStack;
     {
         std::error_code ec;

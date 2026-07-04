@@ -182,10 +182,20 @@ public:
     void setCompileConfig(CompileConfig c) noexcept { compileConfig_ = c; }
     [[nodiscard]] CompileConfig compileConfig() const noexcept { return compileConfig_; }
 
+    /// c105 (D-PP-USER-DEFINE): the CLI `--define NAME[=VALUE]` entries,
+    /// stamped from `CliArgs::defines` by `Program::run` before dispatch
+    /// (the setOutputDir/setCompileConfig pattern). Every CU build threads
+    /// them to the preprocessor's "<command-line>" prologue.
+    void setUserDefines(std::vector<std::string> d) { userDefines_ = std::move(d); }
+    [[nodiscard]] std::vector<std::string> const& userDefines() const noexcept {
+        return userDefines_;
+    }
+
 private:
     std::optional<std::filesystem::path>   outputDir_;
     std::optional<::dss::opt::OptPipeline> optimizerPipelineOverride_;
     CompileConfig                          compileConfig_ = CompileConfig::Debug;
+    std::vector<std::string>               userDefines_;  // c105: --define
 };
 
 } // namespace dss
