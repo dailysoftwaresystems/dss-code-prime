@@ -1,12 +1,12 @@
 {
-  "$comment": "Neutral shipped <fcntl.h> (POSIX) — c14d (linux) + c15c (macOS). The first VARIADIC-extern consumer (c14c): open/fcntl are variadic (open(path,flags,...); fcntl(fd,cmd,...) passes &flock as a vararg → struct flock is NOT in the signature). The O_*/F_* VALUES are interop-CRITICAL (a wrong flag mis-opens/mis-locks) and DIVERGE heavily between Linux (asm-generic/fcntl.h) and macOS (xnu/bsd/sys/fcntl.h) — every divergent one carries per-format `variants` (verified against both header sets): O_CREAT 64/512, O_EXCL 128/2048, O_TRUNC 512/1024, O_APPEND 1024/8, O_NONBLOCK 2048/4, O_NOFOLLOW 131072/256, O_DIRECTORY 65536/1048576, O_CLOEXEC 524288/16777216; the fcntl lock cmds F_GETLK 5/7, F_SETLK 6/8, F_SETLKW 7/9; the lock TYPES F_RDLCK 0/1, F_WRLCK 1/3 (★ macOS reorders these — F_UNLCK=2 happens to agree). O_RDONLY/WRONLY/RDWR (0/1/2), F_DUPFD/GETFD/SETFD/GETFL/SETFL (0..4), F_UNLCK (2), FD_CLOEXEC (1) AGREE → flat. O_LARGEFILE is a 64-bit no-op (0) on both (Linux 64-bit defines it 0; macOS has no LFS toggle and SQLite's own fallback is 0). O_TMPFILE is LINUX-ONLY → elf-only variant (not injected on macho; a macho reference fails loud). `struct flock` DIVERGES: Linux {short l_type,l_whence; off_t l_start,l_len; pid_t l_pid}=32B vs macOS REORDERED {off_t l_start,l_len; pid_t l_pid; short l_type,l_whence}=24B → per-format struct variants. arm64/x86_64 agree within each OS (fixed-width fields). Gated availableObjectFormats:[elf,macho].",
+  "$comment": "Neutral shipped <fcntl.h> (POSIX) — c14d (linux) + c15c (macOS). The first VARIADIC-extern consumer (c14c): open/fcntl are variadic (open(path,flags,...); fcntl(fd,cmd,...) passes &flock as a vararg → struct flock is NOT in the signature). The O_*/F_* VALUES are interop-CRITICAL (a wrong flag mis-opens/mis-locks) and DIVERGE heavily between Linux (asm-generic/fcntl.h) and macOS (xnu/bsd/sys/fcntl.h) — every divergent one carries per-format `variants` (verified against both header sets): O_CREAT 64/512, O_EXCL 128/2048, O_TRUNC 512/1024, O_APPEND 1024/8, O_NONBLOCK 2048/4, O_NOFOLLOW 131072/256, O_DIRECTORY 65536/1048576, O_CLOEXEC 524288/16777216; the fcntl lock cmds F_GETLK 5/7, F_SETLK 6/8, F_SETLKW 7/9; the lock TYPES F_RDLCK 0/1, F_WRLCK 1/3 (★ macOS reorders these — F_UNLCK=2 happens to agree). O_RDONLY/WRONLY/RDWR (0/1/2), F_DUPFD/GETFD/SETFD/GETFL/SETFL (0..4), F_UNLCK (2), FD_CLOEXEC (1) AGREE → flat. O_LARGEFILE is a 64-bit no-op (0) on both (Linux 64-bit defines it 0; macOS has no LFS toggle and SQLite's own fallback is 0). O_TMPFILE is LINUX-ONLY → elf-only variant (not injected on macho; a macho reference fails loud). `struct flock` DIVERGES: Linux {short l_type,l_whence; off_t l_start,l_len; pid_t l_pid}=32B vs macOS REORDERED {off_t l_start,l_len; pid_t l_pid; short l_type,l_whence}=24B → per-format struct variants. arm64/x86_64 agree within each OS (fixed-width fields). Gated availableObjectFormats:[elf,macho]. | c106 pe: library.pe=msvcrt.dll; open/fcntl per-symbol gated [elf,macho] (the c101 EAGER-IMPORT LAW - msvcrt exports _open not open); pe arms on O_CREAT/O_EXCL/O_TRUNC/O_APPEND (ucrt _O_ 0x100/0x400/0x200/0x8) + the 13 MSVC _O_* pe-only variants (ucrt 10.0.26100.0; _O_WTEXT 0x10000/_O_U8TEXT 0x40000 = shell.c _setmode); O_RDONLY/WRONLY/RDWR 0/1/2 coincide; POSIX-only O_* have no pe arm; F_* flats inject dead on pe (use reaches the gated fcntl()).",
   "header": "fcntl.h",
   "standard": "posix",
-  "availableObjectFormats": ["elf", "macho"],
-  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "availableObjectFormats": ["elf", "macho", "pe"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib", "pe": "msvcrt.dll" },
   "symbols": [
-    { "name": "open",  "signature": "fn(ptr<char>, i32, ...) -> i32", "kind": "function", "linkage": "external" },
-    { "name": "fcntl", "signature": "fn(i32, i32, ...) -> i32",       "kind": "function", "linkage": "external" }
+    { "name": "open",  "signature": "fn(ptr<char>, i32, ...) -> i32", "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "macho"] },
+    { "name": "fcntl", "signature": "fn(i32, i32, ...) -> i32",       "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "macho"] }
   ],
   "structs": [
     {
@@ -40,10 +40,10 @@
     { "name": "O_WRONLY",    "value": 1, "type": "i32" },
     { "name": "O_RDWR",      "value": 2, "type": "i32" },
     { "name": "O_LARGEFILE", "value": 0, "type": "i32" },
-    { "name": "O_CREAT",     "variants": [ { "when": { "format": "elf" }, "value": 64,      "type": "i32" }, { "when": { "format": "macho" }, "value": 512,      "type": "i32" } ] },
-    { "name": "O_EXCL",      "variants": [ { "when": { "format": "elf" }, "value": 128,     "type": "i32" }, { "when": { "format": "macho" }, "value": 2048,     "type": "i32" } ] },
-    { "name": "O_TRUNC",     "variants": [ { "when": { "format": "elf" }, "value": 512,     "type": "i32" }, { "when": { "format": "macho" }, "value": 1024,     "type": "i32" } ] },
-    { "name": "O_APPEND",    "variants": [ { "when": { "format": "elf" }, "value": 1024,    "type": "i32" }, { "when": { "format": "macho" }, "value": 8,        "type": "i32" } ] },
+    { "name": "O_CREAT",     "variants": [ { "when": { "format": "elf" }, "value": 64,      "type": "i32" }, { "when": { "format": "macho" }, "value": 512,      "type": "i32" } , { "when": {"format":"pe"}, "value": 256, "type": "i32" } ] },
+    { "name": "O_EXCL",      "variants": [ { "when": { "format": "elf" }, "value": 128,     "type": "i32" }, { "when": { "format": "macho" }, "value": 2048,     "type": "i32" } , { "when": {"format":"pe"}, "value": 1024, "type": "i32" } ] },
+    { "name": "O_TRUNC",     "variants": [ { "when": { "format": "elf" }, "value": 512,     "type": "i32" }, { "when": { "format": "macho" }, "value": 1024,     "type": "i32" } , { "when": {"format":"pe"}, "value": 512, "type": "i32" } ] },
+    { "name": "O_APPEND",    "variants": [ { "when": { "format": "elf" }, "value": 1024,    "type": "i32" }, { "when": { "format": "macho" }, "value": 8,        "type": "i32" } , { "when": {"format":"pe"}, "value": 8, "type": "i32" } ] },
     { "name": "O_NONBLOCK",  "variants": [ { "when": { "format": "elf" }, "value": 2048,    "type": "i32" }, { "when": { "format": "macho" }, "value": 4,        "type": "i32" } ] },
     { "name": "O_NOFOLLOW",  "variants": [ { "when": { "format": "elf" }, "value": 131072,  "type": "i32" }, { "when": { "format": "macho" }, "value": 256,      "type": "i32" } ] },
     { "name": "O_DIRECTORY", "variants": [ { "when": { "format": "elf" }, "value": 65536,   "type": "i32" }, { "when": { "format": "macho" }, "value": 1048576,  "type": "i32" } ] },
@@ -60,6 +60,19 @@
     { "name": "F_RDLCK",     "variants": [ { "when": { "format": "elf" }, "value": 0, "type": "i32" }, { "when": { "format": "macho" }, "value": 1, "type": "i32" } ] },
     { "name": "F_WRLCK",     "variants": [ { "when": { "format": "elf" }, "value": 1, "type": "i32" }, { "when": { "format": "macho" }, "value": 3, "type": "i32" } ] },
     { "name": "F_UNLCK",     "value": 2, "type": "i32" },
-    { "name": "FD_CLOEXEC",  "value": 1, "type": "i32" }
+    { "name": "FD_CLOEXEC",  "value": 1, "type": "i32" },
+    { "name": "_O_RDONLY", "variants": [{ "when": { "format": "pe" }, "value": 0, "type": "i32" }] },
+    { "name": "_O_WRONLY", "variants": [{ "when": { "format": "pe" }, "value": 1, "type": "i32" }] },
+    { "name": "_O_RDWR", "variants": [{ "when": { "format": "pe" }, "value": 2, "type": "i32" }] },
+    { "name": "_O_APPEND", "variants": [{ "when": { "format": "pe" }, "value": 8, "type": "i32" }] },
+    { "name": "_O_CREAT", "variants": [{ "when": { "format": "pe" }, "value": 256, "type": "i32" }] },
+    { "name": "_O_TRUNC", "variants": [{ "when": { "format": "pe" }, "value": 512, "type": "i32" }] },
+    { "name": "_O_EXCL", "variants": [{ "when": { "format": "pe" }, "value": 1024, "type": "i32" }] },
+    { "name": "_O_NOINHERIT", "variants": [{ "when": { "format": "pe" }, "value": 128, "type": "i32" }] },
+    { "name": "_O_TEXT", "variants": [{ "when": { "format": "pe" }, "value": 16384, "type": "i32" }] },
+    { "name": "_O_BINARY", "variants": [{ "when": { "format": "pe" }, "value": 32768, "type": "i32" }] },
+    { "name": "_O_WTEXT", "variants": [{ "when": { "format": "pe" }, "value": 65536, "type": "i32" }] },
+    { "name": "_O_U16TEXT", "variants": [{ "when": { "format": "pe" }, "value": 131072, "type": "i32" }] },
+    { "name": "_O_U8TEXT", "variants": [{ "when": { "format": "pe" }, "value": 262144, "type": "i32" }] }
   ]
 }

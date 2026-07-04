@@ -1,5 +1,5 @@
 {
-  "$comment": "Neutral shipped <io.h> (Microsoft CRT low-level I/O) — c98 (Windows-host sub-arc, the 3-header F001A batch). shell.c includes it twice on the pe route: line ~239 (the _WIN32 CLI prologue that maps isatty->_isatty, access->_access, unlink->_unlink) and line ~383 (the sqlite3_stdio.c Windows section: _setmode on console/file streams). The ACTIVE amalgamation surface is exactly: _isatty (IsConsole/UseWtext probes), _access (the access() macro), _unlink (the unlink macro), _setmode (sqlite3_fsetmode/UTF-16 console modes), plus the wide twins shellDeleteFile uses directly (_wunlink + _waccess, shell.c ~30869) and fileio_chmod uses (_wchmod, ~9942); _chmod ships as the trivial narrow pair of _wchmod. NOT shipped (unused on the active pe route): _open/_close/_read/_write/_lseek and the _findfirst family — the _wfindfirst/_wfindnext references sit in the windirent block which is `_MSC_VER`-gated (since c105's MSVC-profile flip (_MSC_VER=1943) that block IS the intended live path -- the _wfindfirst64/_wfindnext64 question re-derives when the c106 shell.c batch probes it); no F001A-driven need, and the _O_* mode CONSTANTS (_O_TEXT/_O_BINARY/_O_U8TEXT...) belong to <fcntl.h> per the Windows SDK layout, NOT here (they are the next semantic wave, not this header's provenance). `availableObjectFormats:[pe]` — a Microsoft-CRT header fails loud on elf/macho. `library:{pe:msvcrt.dll}` — all eight are msvcrt.dll exports (verified via dumpbin /exports: _access 171, _chmod 213, _isatty 401, _setmode 726, _unlink 847, _waccess 906, _wchmod 912, _wunlink 1050), NOT kernel32. SIGNATURES (Microsoft SDK corecrt_io.h/corecrt_wio.h): int _access(const char*,int); int _chmod(const char*,int); int _unlink(const char*); int _isatty(int); int _setmode(int,int); the wide forms take const wchar_t* — Windows wchar_t is UTF-16 u16 (== windows.json's WCHAR), so they spell ptr<u16>. NOTE: stddef.json currently ships the FORMAT-NEUTRAL `wchar_t` typedef as i32 (the glibc width) with no pe variant — a pe caller declaring `wchar_t*` therefore mismatches ptr<u16> until stddef.json gains a per-format variant; these signatures stay SDK-TRUE rather than mirroring that latent width gap.",
+  "$comment": "c106: +the msvcrt FIND family (_wfindfirst/_wfindnext/_findclose + _wfinddata_t) + _pclose(FILE*) + _fileno + _A_* attribute constants (corecrt_io.h). ★ x64 ABI (c106-audit runtime-probed C:\\Windows\\System32\\msvcrt.dll via P/Invoke, 0xCC-sentinel buffer): the PLAIN _wfindfirst/_wfindnext exports are the _wfinddata64i32_t shape — TIME64 (not time32; x64 msvcrt never had a 32-bit-time era, so the 'legacy names = time32' lore is x86-32-only) with a size32 field: {attrib u32@0, [pad4], time_create i64@8, time_access i64@16, time_write i64@24, size u32@32, name wchar[260]@36}, sizeof 560 (align 8). The natural-alignment engine derives the @4 pad + the @32 size + @36 name; a time32 (540B, name@20) descriptor read garbage names AND overran the shim's stack _wfinddata_t by 16B on names >=252 wchars. sqlite's windirent shim (shell.c:4030) reads data.name/data.attrib. |Neutral shipped <io.h> (Microsoft CRT low-level I/O) — c98 (Windows-host sub-arc, the 3-header F001A batch). shell.c includes it twice on the pe route: line ~239 (the _WIN32 CLI prologue that maps isatty->_isatty, access->_access, unlink->_unlink) and line ~383 (the sqlite3_stdio.c Windows section: _setmode on console/file streams). The ACTIVE amalgamation surface is exactly: _isatty (IsConsole/UseWtext probes), _access (the access() macro), _unlink (the unlink macro), _setmode (sqlite3_fsetmode/UTF-16 console modes), plus the wide twins shellDeleteFile uses directly (_wunlink + _waccess, shell.c ~30869) and fileio_chmod uses (_wchmod, ~9942); _chmod ships as the trivial narrow pair of _wchmod. NOT shipped (unused on the active pe route): _open/_close/_read/_write/_lseek and the _findfirst family — the _wfindfirst/_wfindnext references sit in the windirent block which is `_MSC_VER`-gated (since c105's MSVC-profile flip (_MSC_VER=1943) that block IS the intended live path -- the _wfindfirst64/_wfindnext64 question re-derives when the c106 shell.c batch probes it); no F001A-driven need, and the _O_* mode CONSTANTS (_O_TEXT/_O_BINARY/_O_U8TEXT...) belong to <fcntl.h> per the Windows SDK layout, NOT here (they are the next semantic wave, not this header's provenance). `availableObjectFormats:[pe]` — a Microsoft-CRT header fails loud on elf/macho. `library:{pe:msvcrt.dll}` — all eight are msvcrt.dll exports (verified via dumpbin /exports: _access 171, _chmod 213, _isatty 401, _setmode 726, _unlink 847, _waccess 906, _wchmod 912, _wunlink 1050), NOT kernel32. SIGNATURES (Microsoft SDK corecrt_io.h/corecrt_wio.h): int _access(const char*,int); int _chmod(const char*,int); int _unlink(const char*); int _isatty(int); int _setmode(int,int); the wide forms take const wchar_t* — Windows wchar_t is UTF-16 u16 (== windows.json's WCHAR), so they spell ptr<u16>. NOTE: stddef.json currently ships the FORMAT-NEUTRAL `wchar_t` typedef as i32 (the glibc width) with no pe variant — a pe caller declaring `wchar_t*` therefore mismatches ptr<u16> until stddef.json gains a per-format variant; these signatures stay SDK-TRUE rather than mirroring that latent width gap.",
   "header": "io.h",
   "standard": "msvcrt",
   "availableObjectFormats": ["pe"],
@@ -12,6 +12,40 @@
     { "name": "_unlink",  "signature": "fn(ptr<char>) -> i32",      "kind": "function", "linkage": "external" },
     { "name": "_wunlink", "signature": "fn(ptr<u16>) -> i32",       "kind": "function", "linkage": "external" },
     { "name": "_isatty",  "signature": "fn(i32) -> i32",            "kind": "function", "linkage": "external" },
-    { "name": "_setmode", "signature": "fn(i32, i32) -> i32",       "kind": "function", "linkage": "external" }
+    { "name": "_setmode", "signature": "fn(i32, i32) -> i32",       "kind": "function", "linkage": "external" },
+    { "name": "_wfindfirst", "signature": "fn(ptr<u16>, ptr<void>) -> i64", "kind": "function", "linkage": "external" },
+    { "name": "_wfindnext", "signature": "fn(i64, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "_findclose", "signature": "fn(i64) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "_pclose", "signature": "fn(ptr<struct \"FILE\" {}>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "_fileno", "signature": "fn(ptr<void>) -> i32", "kind": "function", "linkage": "external" }
+  ],
+  "typedefs": [
+    { "name": "wchar_t", "variants": [{ "when": { "format": "pe" }, "type": "u16" }] }
+  ],
+  "structs": [
+    {
+      "name": "_wfinddata_t",
+      "variants": [
+        {
+          "when": { "format": "pe" },
+          "fields": [
+            { "name": "attrib", "type": "u32" },
+            { "name": "time_create", "type": "i64" },
+            { "name": "time_access", "type": "i64" },
+            { "name": "time_write", "type": "i64" },
+            { "name": "size", "type": "u32" },
+            { "name": "name", "type": "arr<u16, 260>" }
+          ]
+        }
+      ]
+    }
+  ],
+  "constants": [
+    { "name": "_A_NORMAL", "value": 0, "type": "i32" },
+    { "name": "_A_RDONLY", "value": 1, "type": "i32" },
+    { "name": "_A_HIDDEN", "value": 2, "type": "i32" },
+    { "name": "_A_SYSTEM", "value": 4, "type": "i32" },
+    { "name": "_A_SUBDIR", "value": 16, "type": "i32" },
+    { "name": "_A_ARCH", "value": 32, "type": "i32" }
   ]
 }

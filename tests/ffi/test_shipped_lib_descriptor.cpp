@@ -2445,4 +2445,292 @@ TEST(ShippedLibDescriptor, RealSysTimeTimevalPerFormatLayout) {
     }
 }
 
+// ── c106 (the shell.c pe header/descriptor batch) ──────────────────────────
+
+// Decode a REAL shipped descriptor for one format (the RealTimeStructTm idiom).
+static std::optional<ShippedLibDescriptor> decodeShippedFor(
+    fs::path const& p, TypeInterner& interner, TypeRegistry& typeReg,
+    ObjectFormatKind fmt) {
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(p, interner, typeReg, rep,
+                                         DataModel::Lp64,
+                                         std::string_view{"x86_64"}, fmt);
+    EXPECT_TRUE(desc.has_value()) << p.generic_string();
+    EXPECT_FALSE(rep.hasErrors()) << p.generic_string();
+    return desc;
+}
+
+// c106 (D-FFI-STDDEF-WCHAR-PE-WIDTH, closing): wchar_t is 2 bytes on pe (the
+// Windows UTF-16 code unit) and 4 bytes on elf/macho (the POSIX width). A
+// wrong width mis-sizes EVERY `wchar_t buf[N]` and every wide-string object
+// the Windows shell path touches — a silent-overlay class, so the widths are
+// pinned from the REAL stddef.json through the REAL layout engine.
+// RED-ON-DISABLE: drop the pe variant → wchar_t decodes at the elf i32 → the
+// pe width assert fails.
+TEST(ShippedLibDescriptor, RealStddefWcharPerFormatWidth) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    auto widthFor = [&](ObjectFormatKind fmt) -> std::uint64_t {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = decodeShippedFor(root / "stddef.json", interner, typeReg, fmt);
+        if (!desc) return 0;
+        for (auto const& td : desc->typedefs) {
+            if (td.name == "wchar_t") {
+                auto layout = computeLayout(td.type, interner, kNatural16,
+                                            DataModel::Lp64);
+                EXPECT_TRUE(layout.has_value());
+                return layout ? layout->size : 0;
+            }
+        }
+        ADD_FAILURE() << "wchar_t typedef absent from stddef.json";
+        return 0;
+    };
+    EXPECT_EQ(widthFor(ObjectFormatKind::Pe), 2u)
+        << "pe wchar_t is the 16-bit Windows code unit";
+    EXPECT_EQ(widthFor(ObjectFormatKind::Elf), 4u);
+    EXPECT_EQ(widthFor(ObjectFormatKind::MachO), 4u);
+}
+
+// c106: the MSVC stat records. `struct _stat64`/`__stat64` are the ucrt
+// 56-byte time64 shape — st_size at 24, st_mtime at 40 (natural alignment
+// inserts 2B after gid and 4B before the i64 size). The time32 `struct _stat`
+// (the shape behind msvcrt.dll's DIRECT `_wstat` export) is 36 bytes with
+// st_size at 20. A wrong offset silently reads garbage file sizes/mtimes on
+// the Windows shell path (the sqlite .stats/.import machinery), so both
+// layouts pin through the real layout engine. The elf arm asserts ABSENCE:
+// these tags are pe-variant-only (a POSIX build must not grow MSVC records).
+// RED-ON-DISABLE: drop the pe variant (or reorder fields) → size/offset red.
+TEST(ShippedLibDescriptor, RealSysStatMsvcRecordLayouts) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    fs::path const statPath = root / "sys" / "stat.json";
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = decodeShippedFor(statPath, interner, typeReg,
+                                     ObjectFormatKind::Pe);
+        ASSERT_TRUE(desc.has_value());
+        bool saw64 = false, saw32 = false;
+        for (auto const& s : desc->structs) {
+            if (s.name == "_stat64" || s.name == "__stat64") {
+                auto layout = computeLayout(s.typeId, interner, kNatural16,
+                                            DataModel::Lp64);
+                ASSERT_TRUE(layout.has_value()) << s.name;
+                EXPECT_EQ(layout->size, 56u) << s.name;
+                ASSERT_EQ(layout->fieldOffsets.size(), 11u) << s.name;
+                EXPECT_EQ(layout->fieldOffsets[7], 24u) << s.name << " st_size";
+                EXPECT_EQ(layout->fieldOffsets[9], 40u) << s.name << " st_mtime";
+                saw64 = true;
+            }
+            if (s.name == "_stat") {
+                auto layout = computeLayout(s.typeId, interner, kNatural16,
+                                            DataModel::Lp64);
+                ASSERT_TRUE(layout.has_value());
+                // The x64 _wstat export writes the _stat64i32 shape — TIME64,
+                // size32 — 48 bytes (c106-audit runtime-probed msvcrt.dll). A
+                // 36B time32 _stat overran the caller by 12B and mis-read the
+                // times. st_size stays a 32-bit field @20; the i64 times land
+                // at 24/32/40.
+                EXPECT_EQ(layout->size, 48u) << "_stat is the x64 _stat64i32 shape";
+                ASSERT_EQ(layout->fieldOffsets.size(), 11u);
+                EXPECT_EQ(layout->fieldOffsets[7], 20u) << "_stat st_size";
+                EXPECT_EQ(layout->fieldOffsets[8], 24u) << "_stat st_atime (i64)";
+                EXPECT_EQ(layout->fieldOffsets[9], 32u) << "_stat st_mtime (i64)";
+                saw32 = true;
+            }
+        }
+        EXPECT_TRUE(saw64) << "pe must ship _stat64/__stat64";
+        EXPECT_TRUE(saw32) << "pe must ship the time32 _stat";
+    }
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = decodeShippedFor(statPath, interner, typeReg,
+                                     ObjectFormatKind::Elf);
+        ASSERT_TRUE(desc.has_value());
+        for (auto const& s : desc->structs) {
+            EXPECT_NE(s.name, "_stat64") << "MSVC records must not leak onto elf";
+            EXPECT_NE(s.name, "_stat")   << "MSVC records must not leak onto elf";
+        }
+    }
+}
+
+// c106: struct _wfinddata_t is the x64 msvcrt _wfinddata64i32_t record (the ABI
+// of the DIRECT _wfindfirst/_wfindnext exports — c106-audit runtime-probed
+// msvcrt.dll: TIME64, not time32; the "legacy names = time32" lore is x86-32
+// only). 560 bytes: {attrib u32@0, [pad4], time i64@8/16/24, size u32@32,
+// name wchar[260]@36}. The windirent shim copies data.name at @36; a time32
+// (540B, name@20) descriptor read attribute bytes as UTF-16 and overran the
+// shim's stack object by 16B. RED-ON-DISABLE: retype a time field i64→i32 →
+// name shifts off 36 → offset red.
+TEST(ShippedLibDescriptor, RealIoWfinddata64i32Layout) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    auto desc = decodeShippedFor(root / "io.json", interner, typeReg,
+                                 ObjectFormatKind::Pe);
+    ASSERT_TRUE(desc.has_value());
+    bool saw = false;
+    for (auto const& s : desc->structs) {
+        if (s.name != "_wfinddata_t") continue;
+        auto layout = computeLayout(s.typeId, interner, kNatural16,
+                                    DataModel::Lp64);
+        ASSERT_TRUE(layout.has_value());
+        EXPECT_EQ(layout->size, 560u);
+        ASSERT_EQ(layout->fieldOffsets.size(), 6u);
+        EXPECT_EQ(layout->fieldOffsets[1], 8u)   << "time_create (i64) @ 8";
+        EXPECT_EQ(layout->fieldOffsets[4], 32u)  << "size @ 32";
+        EXPECT_EQ(layout->fieldOffsets[5], 36u)  << "name (wchar[260]) @ 36";
+        saw = true;
+    }
+    EXPECT_TRUE(saw) << "_wfinddata_t absent from io.json on pe";
+}
+
+// c106 (audit MEDIUM): the windows.json records that kernel32 WRITES and the
+// program READS — WIN32_FIND_DATAW (592B, cFileName@44), SYSTEMTIME (16B),
+// CONSOLE_SCREEN_BUFFER_INFO (22B), COORD (4B), SMALL_RECT (8B). All SDK
+// 10.0.26100.0-verified; pinned so a field-order/type drift can't silently
+// mis-place a member kernel32 fills in (the same silent class as the stat/find
+// records). RED-ON-DISABLE: drop a WIN32_FIND_DATAW reserved field → cFileName
+// shifts off 44 → red.
+TEST(ShippedLibDescriptor, RealWindowsFindDataAndConsoleLayouts) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    auto desc = decodeShippedFor(root / "windows.json", interner, typeReg,
+                                 ObjectFormatKind::Pe);
+    ASSERT_TRUE(desc.has_value());
+    auto sizeOffOf = [&](std::string_view name)
+        -> std::optional<StructLayout> {
+        for (auto const& s : desc->structs)
+            if (s.name == name)
+                return computeLayout(s.typeId, interner, kNatural16,
+                                     DataModel::Lp64);
+        return std::nullopt;
+    };
+    auto fd = sizeOffOf("WIN32_FIND_DATAW");
+    ASSERT_TRUE(fd.has_value());
+    EXPECT_EQ(fd->size, 592u);
+    ASSERT_EQ(fd->fieldOffsets.size(), 10u);
+    EXPECT_EQ(fd->fieldOffsets[8], 44u) << "cFileName @ 44";
+    auto st = sizeOffOf("SYSTEMTIME");
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(st->size, 16u);
+    auto csbi = sizeOffOf("CONSOLE_SCREEN_BUFFER_INFO");
+    ASSERT_TRUE(csbi.has_value());
+    EXPECT_EQ(csbi->size, 22u);
+    ASSERT_EQ(csbi->fieldOffsets.size(), 5u);
+    EXPECT_EQ(csbi->fieldOffsets[2], 8u)  << "wAttributes @ 8";
+    EXPECT_EQ(csbi->fieldOffsets[3], 10u) << "srWindow @ 10";
+    auto co = sizeOffOf("COORD");
+    ASSERT_TRUE(co.has_value());
+    EXPECT_EQ(co->size, 4u);
+    auto sr = sizeOffOf("SMALL_RECT");
+    ASSERT_TRUE(sr.has_value());
+    EXPECT_EQ(sr->size, 8u);
+}
+
+// c106: the strtoll SPLIT — msvcrt.dll does not export strtoll (pre-C99 CRT);
+// on pe `strtoll` is a MACRO onto the real _strtoi64 export while the
+// [elf,macho]-gated strtoll SYMBOL stays un-injected; on elf the inverse.
+// A drift in either direction is a loader break (importing a phantom strtoll
+// on pe → 0xC0000139) or a broken elf build (losing the real symbol), so BOTH
+// sides of BOTH formats pin.
+TEST(ShippedLibDescriptor, RealStdlibStrtollPeMacroSplit) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    // Macro VARIANTS select at decode (flat result per format); symbol
+    // availability filters at semantic INJECTION — so the symbol side pins
+    // the per-symbol gate through the SAME predicate the injector applies
+    // (objectFormatInAvailabilitySet), never mere presence in the vector.
+    auto scan = [&](ObjectFormatKind fmt, bool& macroStrtoll,
+                    bool& symStrtoll, bool& symStrtoi64) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = decodeShippedFor(root / "stdlib.json", interner, typeReg, fmt);
+        ASSERT_TRUE(desc.has_value());
+        macroStrtoll = symStrtoll = symStrtoi64 = false;
+        for (auto const& m : desc->macros)
+            if (m.name == "strtoll") {
+                macroStrtoll = true;
+                EXPECT_EQ(m.replacement, "_strtoi64");
+            }
+        for (auto const& s : desc->symbols) {
+            if (s.name == "strtoll")
+                symStrtoll = objectFormatInAvailabilitySet(
+                    s.availableObjectFormats, fmt);
+            if (s.name == "_strtoi64")
+                symStrtoi64 = objectFormatInAvailabilitySet(
+                    s.availableObjectFormats, fmt);
+        }
+    };
+    bool m = false, s = false, s64 = false;
+    scan(ObjectFormatKind::Pe, m, s, s64);
+    EXPECT_TRUE(m)   << "pe strtoll must be the _strtoi64 macro";
+    EXPECT_FALSE(s)  << "a pe strtoll IMPORT is a phantom (msvcrt has none)";
+    EXPECT_TRUE(s64) << "pe must import the real _strtoi64";
+    scan(ObjectFormatKind::Elf, m, s, s64);
+    EXPECT_FALSE(m)  << "elf strtoll is the real symbol, not a macro";
+    EXPECT_TRUE(s);
+    EXPECT_FALSE(s64) << "_strtoi64 is pe-gated";
+}
+
+// c106: the glibc timespec-flattening macros (st_atime -> st_atim_sec …) must
+// stay OFF pe — flat, they rewrote every pe st_atime member access into a
+// nonexistent st_atim_sec field (the c106 probe's phantom). elf keeps them.
+// Also pins the pe errno accessor split (_errno on pe; __errno_location
+// stays elf-only — importing the wrong accessor is a loader break).
+TEST(ShippedLibDescriptor, RealStatTimeMacrosAndErrnoAccessorPerFormat) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    auto statMacroNames = [&](ObjectFormatKind fmt) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = decodeShippedFor(root / "sys" / "stat.json", interner,
+                                     typeReg, fmt);
+        std::vector<std::string> names;
+        if (desc)
+            for (auto const& m : desc->macros) names.push_back(m.name);
+        return names;
+    };
+    auto const peNames = statMacroNames(ObjectFormatKind::Pe);
+    for (auto const& n : peNames)
+        EXPECT_TRUE(n != "st_atime" && n != "st_mtime" && n != "st_ctime")
+            << n << " must not rewrite pe member accesses";
+    auto const elfNames = statMacroNames(ObjectFormatKind::Elf);
+    bool elfHasStAtime = false;
+    for (auto const& n : elfNames)
+        if (n == "st_atime") elfHasStAtime = true;
+    EXPECT_TRUE(elfHasStAtime)
+        << "elf keeps the glibc st_atime flattening macro";
+
+    auto errnoAccessors = [&](ObjectFormatKind fmt, bool& peAcc, bool& elfAcc) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = decodeShippedFor(root / "errno.json", interner, typeReg, fmt);
+        ASSERT_TRUE(desc.has_value());
+        peAcc = elfAcc = false;
+        // Injection-availability, not vector presence (the per-symbol gate
+        // filters at semantic injection, decode keeps every row).
+        for (auto const& s : desc->symbols) {
+            if (s.name == "_errno")
+                peAcc = objectFormatInAvailabilitySet(
+                    s.availableObjectFormats, fmt);
+            if (s.name == "__errno_location")
+                elfAcc = objectFormatInAvailabilitySet(
+                    s.availableObjectFormats, fmt);
+        }
+    };
+    bool pe = false, el = false;
+    errnoAccessors(ObjectFormatKind::Pe, pe, el);
+    EXPECT_TRUE(pe)  << "pe errno accessor is msvcrt _errno";
+    EXPECT_FALSE(el) << "__errno_location on pe is a phantom import";
+    errnoAccessors(ObjectFormatKind::Elf, pe, el);
+    EXPECT_FALSE(pe);
+    EXPECT_TRUE(el);
+}
+
 } // namespace

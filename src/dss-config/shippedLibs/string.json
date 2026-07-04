@@ -27,6 +27,7 @@
     { "name": "memcmp",  "signature": "fn(ptr<void>, ptr<void>, u64) -> i32",  "kind": "function", "linkage": "external" },
     { "name": "memchr",  "signature": "fn(ptr<void>, i32, u64) -> ptr<void>",  "kind": "function", "linkage": "external" },
     { "name": "strspn",  "signature": "fn(ptr<char>, ptr<char>) -> u64",       "kind": "function", "linkage": "external" },
-    { "name": "strcspn", "signature": "fn(ptr<char>, ptr<char>) -> u64",       "kind": "function", "linkage": "external" }
+    { "name": "strcspn", "signature": "fn(ptr<char>, ptr<char>) -> u64",       "kind": "function", "linkage": "external" },
+    { "name": "_strdup", "signature": "fn(ptr<char>) -> ptr<char>", "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"] }
   ]
 }
