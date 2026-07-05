@@ -382,7 +382,18 @@ bool injectEntryTrampoline(AssembledModule&          module,
     //     mechanism there); PE's out-parameter CRT route
     //     (__getmainargs) is anchored at D-RUNTIME-PE-MAIN-ARGS.
     auto const& paOpt = format.processArgs();
-    if (paOpt.has_value()) {
+    // c111 (D-RUNTIME-PE-MAIN-ARGS): the CRT out-parameter mechanism (Windows
+    // __wgetmainargs / __getmainargs) performs its argc/argv setup in a MIR-tier
+    // SYNTHESIZED pre-main init (`synthesizePeStartup`) — the program entry was already
+    // retargeted to that synth function, which fetches the args via the CRT export and
+    // forwards (argc, argv) to the user entry through a normally-lowered call. So the
+    // trampoline emits NO argument materialization for it here; it just calls the
+    // (synth) entry below. Every OTHER declared mechanism still flows through the
+    // closed-enum block (the StackVector emitter + the fail-loud "no arm" reject),
+    // preserving the "a new ArgsMechanism member must add an emitter arm" discipline.
+    bool const argsHandledBySynthInit =
+        paOpt.has_value() && paOpt->mechanism == ArgsMechanism::CrtOutParam;
+    if (paOpt.has_value() && !argsHandledBySynthInit) {
         auto const& pa = *paOpt;
         if (pa.mechanism != ArgsMechanism::StackVector) {
             // Closed-enum discipline: a new ArgsMechanism member must

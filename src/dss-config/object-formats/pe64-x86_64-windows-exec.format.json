@@ -27,6 +27,14 @@
     "importMangledName": "ExitProcess"
   },
 
+  "$processArgsComment": "c111 (D-RUNTIME-PE-MAIN-ARGS): the Windows program-entry argc/argv mechanism. Unlike ELF/Mach-O (where the OS entry receives the argument vector on the stack / in registers), the PE OS entry gets NOTHING — the C runtime must ASK msvcrt for the arguments via an out-parameter export. `mechanism: crt-out-param` drives the MIR-tier `synthesizePeStartup`, which synthesizes a pre-main init `int _dss_pe_start()` that declares local argc/argv/env + a zeroed msvcrt `_startupinfo`, calls the CRT export with their ADDRESSES (the out-parameters), then forwards (argc, argv) to the user entry — and retargets the program entry to that synth function. WIDE vs NARROW is chosen by the RESOLVED ENTRY'S SIGNATURE, never a format flag: a `wmain(int, wchar_t**)` entry (argv element = pe wide-char u16) binds `crtWideArgvFn` (__wgetmainargs); a `main(int, char**)` entry binds `crtNarrowArgvFn` (__getmainargs) — so ONE descriptor serves both entry shapes. Both are real msvcrt.dll exports (dumpbin ord 168 / 139). The entry-trampoline emits NO argument materialization for this mechanism — the synth init owns it. Contrast ELF/AArch64's stack-vector arm above.",
+  "processArgs": {
+    "mechanism": "crt-out-param",
+    "crtWideArgvFn": "__wgetmainargs",
+    "crtNarrowArgvFn": "__getmainargs",
+    "crtLibraryPath": "msvcrt.dll"
+  },
+
   "$entryCallingConventionComment": "MS x64 calling convention — status (user fn return value in rax) is moved into argGprs[0] = rcx before the indirect ExitProcess call. Read via `target.callingConventionByName(\"ms_x64\")` at trampoline-build time.",
   "entryCallingConvention": "ms_x64",
 

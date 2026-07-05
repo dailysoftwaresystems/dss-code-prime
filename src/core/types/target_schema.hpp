@@ -1920,11 +1920,20 @@ struct DSS_EXPORT ProcessExit {
 enum class ArgsMechanism : std::uint8_t {
     None        = 0,  // default-constructed zero; loader rejects "none"
     StackVector = 1,  // argc + in-place argv vector on the entry stack
+    // c111 (D-RUNTIME-PE-MAIN-ARGS): the Windows CRT out-parameter route. The PE
+    // OS entry receives NO C argument vector — argc/argv are ASKED for via an
+    // msvcrt call `__wgetmainargs(&argc,&argv,&env,0,&startinfo)` (wide) /
+    // `__getmainargs` (narrow). This needs stack locals + a 5-arg call, so
+    // (USER §B decision) the pipeline SYNTHESIZES a pre-main init function in
+    // ordinary MIR that makes the call and forwards (argc, argv) to the user
+    // entry; the trampoline's own arg-setup is a NO-OP for this mechanism.
+    CrtOutParam = 2,  // msvcrt __wgetmainargs/__getmainargs, via a synth init fn
 };
 
-inline constexpr EnumNameTable<ArgsMechanism, 2> kArgsMechanismTable{{{
-    { ArgsMechanism::None,        "none"         },
-    { ArgsMechanism::StackVector, "stack-vector" },
+inline constexpr EnumNameTable<ArgsMechanism, 3> kArgsMechanismTable{{{
+    { ArgsMechanism::None,        "none"          },
+    { ArgsMechanism::StackVector, "stack-vector"  },
+    { ArgsMechanism::CrtOutParam, "crt-out-param" },
 }}};
 
 [[nodiscard]] constexpr std::string_view argsMechanismName(ArgsMechanism m) noexcept {
@@ -1964,6 +1973,17 @@ struct DSS_EXPORT ProcessArgs {
     // StackVector arm
     std::uint32_t argcStackOffset = 0;
     std::uint32_t argvStackOffset = 0;
+
+    // CrtOutParam arm (c111, D-RUNTIME-PE-MAIN-ARGS). The msvcrt exports the
+    // synthesized pre-main init function calls to obtain (argc, argv). Both the
+    // WIDE (`wchar_t** argv`, for a `wmain` entry) and NARROW (`char** argv`,
+    // for a `main` entry) forms are declared; the synthesizer picks by the
+    // resolved entry's second-parameter pointee width (u16 ⇒ wide, i8 ⇒ narrow)
+    // — never a format-level flag, which would mis-call a narrow entry. The
+    // library is the import library the two symbols resolve from.
+    std::string crtWideArgvFn;    // "__wgetmainargs"
+    std::string crtNarrowArgvFn;  // "__getmainargs"
+    std::string crtLibraryPath;   // "msvcrt.dll"
 };
 
 [[nodiscard]] DSS_EXPORT std::optional<RelocFormulaKind>

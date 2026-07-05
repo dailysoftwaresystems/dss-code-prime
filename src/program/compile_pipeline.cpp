@@ -21,6 +21,7 @@
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly consumes it)
+#include "mir/merge/synth_pe_startup.hpp"  // synthesizePeStartup (c111 D-RUNTIME-PE-MAIN-ARGS)
 #include "opt/optimizer.hpp"
 #include "opt/passes/prune_unreachable.hpp"
 
@@ -875,17 +876,34 @@ resolveSingleCuUserEntry(SemanticModel const& model, GrammarSchema const& gramma
 // and the entry symbol resolved by the CU-specific scan above. Produces output
 // byte-identical to the pre-Cycle-25 monolith for any single-CU build.
 std::optional<AssembledModule>
-lowerCuMirToAssembly(CuMirModule& cuMir, DiagnosticReporter& reporter) {
+lowerCuMirToAssembly(CuMirModule&                       cuMir,
+                     std::optional<ProcessArgs> const& processArgs,
+                     DiagnosticReporter&               reporter) {
     SemanticModel&       model   = cuMir.model;
     GrammarSchema const& grammar = *cuMir.grammar;
 
     // Resolve the user-entry FIRST (fail-loud on ambiguity, exactly as the inline
     // scan did) so a multi-entry source halts before lowering — same observable
-    // failure point as pre-Cycle-25.
+    // failure point as pre-Cycle-25. Non-const: `synthesizePeStartup` may retarget it.
     bool entryOk = true;
-    std::optional<SymbolId> const userEntry =
+    std::optional<SymbolId> userEntry =
         resolveSingleCuUserEntry(model, grammar, reporter, entryOk);
     if (!entryOk) return std::nullopt;
+
+    // c111 (D-RUNTIME-PE-MAIN-ARGS): single-CU counterpart of the merge-path synth
+    // (program.cpp). When the target format fetches argc/argv via a CRT out-parameter
+    // call (Windows), append the pre-main init that makes that call + forwards
+    // (argc, argv) to the user entry, retargeting `userEntry` to it. A no-op for every
+    // other mechanism / a no-arg entry. The CU is already per-CU-optimized here, so the
+    // appended init skips the optimizer but is lowered like any other function; the
+    // interner is the CU model's (the type space this CU's TypeIds index into).
+    if (processArgs.has_value()) {
+        if (!synthesizePeStartup(cuMir.mir, model.lattice().interner(),
+                                 userEntry, cuMir.externImports,
+                                 *processArgs, reporter)) {
+            return std::nullopt;  // malformed argv parameter type — fail-loud reported.
+        }
+    }
 
     // `nameOf`: SymbolId → declared name. A SymbolId with no record (synthesized /
     // out-of-range) yields "" — the LK11a symbol-table populate then skips it as
@@ -983,7 +1001,7 @@ assembleUnit(CompilationUnit const&        cu,
     auto cuMir = buildCuMir(cu, grammar, target, format,
                             callingConventionIndex, reporter, opts);
     if (!cuMir) return std::nullopt;
-    return lowerCuMirToAssembly(*cuMir, reporter);
+    return lowerCuMirToAssembly(*cuMir, format.processArgs(), reporter);
 }
 
 bool compileSingleUnit(CompilationUnit const&        cu,

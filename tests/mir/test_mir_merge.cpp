@@ -34,7 +34,9 @@
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"
+#include "core/types/target_schema.hpp"        // ProcessArgs / ArgsMechanism (c111)
 #include "mir/merge/mir_merge.hpp"
+#include "mir/merge/synth_pe_startup.hpp"       // synthesizePeStartup (c111)
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
@@ -44,6 +46,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -88,6 +91,51 @@ findFuncByName(Mir const& mir,
     return std::nullopt;
 }
 
+// Find the function whose declared SymbolId == `sym` (c111 synth-entry resolution).
+[[nodiscard]] std::optional<MirFuncId>
+findFuncBySymbol(Mir const& mir, SymbolId sym) {
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        if (mir.funcSymbol(f).v == sym.v) return f;
+    }
+    return std::nullopt;
+}
+
+// c111: the Alloca count + the callee SymbolIds of every Call in `fn` (each Call's
+// operand[0] is its callee GlobalAddr). Lets a pin assert the synth function's BODY
+// actually fetches args + forwards to the entry — not merely that the extern row was
+// added (a body that registered the import but built a wrong/empty body would still
+// verify + still carry the extern; this walks the instructions to catch that).
+struct SynthBodyShape {
+    std::vector<std::uint32_t> callTargets;   // callee symbol .v, per Call
+    std::size_t                allocaCount = 0;
+    [[nodiscard]] bool calls(std::uint32_t symV) const {
+        for (auto v : callTargets) if (v == symV) return true;
+        return false;
+    }
+};
+[[nodiscard]] SynthBodyShape scanBody(Mir const& mir, MirFuncId fn) {
+    SynthBodyShape s;
+    std::uint32_t const nb = mir.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const blk = mir.funcBlockAt(fn, bi);
+        std::uint32_t const ni = mir.blockInstCount(blk);
+        for (std::uint32_t ii = 0; ii < ni; ++ii) {
+            MirInstId const id = mir.blockInstAt(blk, ii);
+            MirOpcode const op = mir.instOpcode(id);
+            if (op == MirOpcode::Alloca) ++s.allocaCount;
+            if (op == MirOpcode::Call) {
+                MirInstId const callee = mir.instOperands(id)[0];
+                if (mir.instOpcode(callee) == MirOpcode::GlobalAddr) {
+                    s.callTargets.push_back(mir.globalAddrSymbol(callee).v);
+                }
+            }
+        }
+    }
+    return s;
+}
+
 // The first Call instruction in a function (the cross-CU call under test).
 [[nodiscard]] std::optional<MirInstId>
 firstCall(Mir const& mir, MirFuncId f) {
@@ -118,6 +166,29 @@ std::size_t countOp(Mir const& mir, MirOpcode want) {
         }
     }
     return n;
+}
+
+// c111 (D-RUNTIME-PE-MAIN-ARGS) helpers. A one-function Mir whose entry has the
+// given signature, bound to SymbolId{100}, body `return 0;` (the synth reads only
+// the signature, then appends — the body is irrelevant to arg-fetch synthesis).
+Mir buildEntryOnly(TypeInterner& in, TypeId sig) {
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    MirBuilder mb;
+    mb.addFunction(sig, SymbolId{100});
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    return std::move(mb).finish();
+}
+
+// The Windows CRT out-parameter mechanism, wired with the real msvcrt export names.
+ProcessArgs crtOutParamPa() {
+    ProcessArgs pa;
+    pa.mechanism       = ArgsMechanism::CrtOutParam;
+    pa.crtWideArgvFn   = "__wgetmainargs";
+    pa.crtNarrowArgvFn = "__getmainargs";
+    pa.crtLibraryPath  = "msvcrt.dll";
+    return pa;
 }
 
 } // namespace
@@ -804,4 +875,111 @@ TEST(MirMerge, MergeReportsTwoStrongConflict) {
     EXPECT_EQ(test_support::countCode(rep, DiagnosticCode::K_SymbolRedefinedAcrossUnits),
               1u)
         << "exactly one two-strong conflict must be reported";
+}
+
+// ── c111 (D-RUNTIME-PE-MAIN-ARGS): synthesizePeStartup structural pins ─────────
+// The Windows CRT out-parameter args mechanism synthesizes a pre-main init that
+// fetches argc/argv via an msvcrt export and forwards them to the user entry,
+// RETARGETING the program entry to the synth fn. These pins assert that shape
+// HOST-INDEPENDENTLY — they run on EVERY leg, unlike the Windows-only runtime
+// witness in examples/c-subset/main_argc_argv (whose pe64 arm this cycle turns on):
+//   * NarrowMain — a main(int,char**) entry appends a synth fn (entry retargeted),
+//     adds the NARROW __getmainargs FUNCTION import, and the module verifies;
+//   * WideWmain — a wmain(int,wchar_t**) entry (argv element = pe wide-char u16)
+//     binds the WIDE __wgetmainargs export instead — arm chosen by the argv ELEMENT
+//     width, never a format flag (RED-on-swap if narrow/wide invert);
+//   * VoidMain — a main(void) entry needs no arg setup → NO synth;
+//   * NonCrtMechanism — a non-CrtOutParam (ELF stack-vector) mechanism → NO synth.
+
+TEST(SynthPeStartup, NarrowMainAppendsGetmainargsAndRetargets) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const charPP = in.pointer(in.pointer(in.primitive(TypeKind::Char)));
+    TypeId const sig    = in.fnSig(std::array<TypeId, 2>{i32, charPP}, i32, CallConv::CcMS64);
+    Mir mir = buildEntryOnly(in, sig);
+
+    std::optional<SymbolId>   entry = SymbolId{100};
+    std::vector<ExternImport> ext;
+    DiagnosticReporter        rep;
+    ASSERT_TRUE(synthesizePeStartup(mir, in, entry, ext, crtOutParamPa(), rep));
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    // The synth init was appended alongside the original main.
+    EXPECT_EQ(mir.moduleFuncCount(), 2u) << "the pre-main init must be appended";
+    // The program entry is retargeted AWAY from main(100) to the synth fn.
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_NE(entry->v, 100u) << "the entry must be retargeted to the synth init";
+    // Exactly the NARROW msvcrt arg-fetch export was added, as a FUNCTION import.
+    ASSERT_EQ(ext.size(), 1u);
+    EXPECT_EQ(ext[0].mangledName, "__getmainargs");
+    EXPECT_EQ(ext[0].libraryPath, "msvcrt.dll");
+    EXPECT_FALSE(ext[0].isData) << "the CRT arg-fetch is a function, not data";
+    // The retargeted entry names a REAL defined function whose BODY fetches args and
+    // forwards to the original entry — not merely an extern row + an empty shell.
+    auto const synthFn = findFuncBySymbol(mir, *entry);
+    ASSERT_TRUE(synthFn.has_value())
+        << "the new entry symbol must resolve to the appended synth function";
+    auto const body = scanBody(mir, *synthFn);
+    EXPECT_EQ(body.allocaCount, 4u)
+        << "synth locals: argc + argv + env + startupinfo";
+    EXPECT_TRUE(body.calls(ext[0].symbol.v))
+        << "the synth body must CALL the CRT arg-fetch export it registered";
+    EXPECT_TRUE(body.calls(100u))
+        << "the synth body must forward to the ORIGINAL user entry (symbol 100)";
+    // The rebuilt module is well-formed.
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << "the synthesized module must verify";
+}
+
+TEST(SynthPeStartup, WideWmainPicksWgetmainargs) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32     = in.primitive(TypeKind::I32);
+    TypeId const wcharPP = in.pointer(in.pointer(in.primitive(TypeKind::U16)));
+    TypeId const sig     = in.fnSig(std::array<TypeId, 2>{i32, wcharPP}, i32, CallConv::CcMS64);
+    Mir mir = buildEntryOnly(in, sig);
+
+    std::optional<SymbolId>   entry = SymbolId{100};
+    std::vector<ExternImport> ext;
+    DiagnosticReporter        rep;
+    ASSERT_TRUE(synthesizePeStartup(mir, in, entry, ext, crtOutParamPa(), rep));
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(ext.size(), 1u);
+    EXPECT_EQ(ext[0].mangledName, "__wgetmainargs")
+        << "a wchar_t** argv entry must bind the WIDE arg-fetch export (not narrow)";
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << "the synthesized module must verify";
+}
+
+TEST(SynthPeStartup, VoidMainNeedsNoSynth) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const sig = in.fnSig({}, i32, CallConv::CcMS64);
+    Mir mir = buildEntryOnly(in, sig);
+
+    std::optional<SymbolId>   entry = SymbolId{100};
+    std::vector<ExternImport> ext;
+    DiagnosticReporter        rep;
+    ASSERT_TRUE(synthesizePeStartup(mir, in, entry, ext, crtOutParamPa(), rep));
+    EXPECT_EQ(mir.moduleFuncCount(), 1u) << "main(void) has no argc/argv to fetch";
+    EXPECT_TRUE(ext.empty())             << "no CRT import when there is no setup";
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_EQ(entry->v, 100u)            << "the entry is left unchanged";
+}
+
+TEST(SynthPeStartup, NonCrtMechanismIsANoOp) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const charPP = in.pointer(in.pointer(in.primitive(TypeKind::Char)));
+    TypeId const sig    = in.fnSig(std::array<TypeId, 2>{i32, charPP}, i32, CallConv::CcMS64);
+    Mir mir = buildEntryOnly(in, sig);
+
+    std::optional<SymbolId>   entry = SymbolId{100};
+    std::vector<ExternImport> ext;
+    ProcessArgs               pa;
+    pa.mechanism = ArgsMechanism::StackVector;  // the ELF route — NOT the pe CRT one
+    DiagnosticReporter        rep;
+    ASSERT_TRUE(synthesizePeStartup(mir, in, entry, ext, pa, rep));
+    EXPECT_EQ(mir.moduleFuncCount(), 1u) << "a non-CRT mechanism synthesizes nothing";
+    EXPECT_TRUE(ext.empty());
+    EXPECT_EQ(entry->v, 100u);
 }

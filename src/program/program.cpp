@@ -12,6 +12,7 @@
 #include "ffi/abi/abi_catalog.hpp"
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergeCuInput, mergeCuMirs (N>1 whole-program merge)
+#include "mir/merge/synth_pe_startup.hpp"  // synthesizePeStartup (c111 D-RUNTIME-PE-MAIN-ARGS)
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
 #include "lsp/thread_pool.hpp"
@@ -343,7 +344,7 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // would re-intern CU0's types into a fresh host (a no-op for correctness, but extra
     // work + a different code path); keep the proven single-CU lowering for byte-identity.
     if (cuMirs.size() == 1) {
-        auto mod = lowerCuMirToAssembly(cuMirs[0], reporter);
+        auto mod = lowerCuMirToAssembly(cuMirs[0], (*formatR)->processArgs(), reporter);
         if (!mod) return false;  // back-half tier failure already reported via `reporter`
         return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},
                             **targetR, **formatR, outPath, reporter);
@@ -408,6 +409,21 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         std::span<std::string const>{entryNames.data(), entryNames.size()},
         reporter);
     if (!merged) return false;  // merge failure (conflict / verify) already reported.
+
+    // c111 (D-RUNTIME-PE-MAIN-ARGS): when the target format fetches argc/argv via a
+    // CRT out-parameter call (Windows __wgetmainargs/__getmainargs — the PE OS entry
+    // carries no C argument vector), synthesize the pre-main init that makes that call
+    // and forwards (argc, argv) to the user entry, retargeting `userEntrySymbol` to it.
+    // Runs BEFORE optimize so the synth function is DCE-rooted (Global) + optimized +
+    // lowered like any other. A no-op for every other mechanism / a no-arg entry. The
+    // interner is the merged host's (the type space the merged TypeIds index into).
+    if (auto const& pa = (*formatR)->processArgs(); pa.has_value()) {
+        if (!synthesizePeStartup(merged->mir, merged->host.interner(),
+                                 merged->userEntrySymbol, merged->externImports,
+                                 *pa, reporter)) {
+            return false;  // malformed argv parameter type — fail-loud already reported.
+        }
+    }
 
     // Cycle 26 (D-OPT7-1): optimize the WHOLE-PROGRAM merged module with the configured
     // pipeline. The merge made every cross-CU call an intra-module DIRECT call, so the

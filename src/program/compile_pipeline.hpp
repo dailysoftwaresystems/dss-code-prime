@@ -284,9 +284,16 @@ optimizeModule(Mir&                  mir,
 // assemble → symbol-table populate → user-entry scan. Consumes the `CuMirModule`
 // (its `externImports` are MOVED into MIR→LIR; its `mir` + `model` are read). Returns
 // nullopt on any back-half tier failure (diagnostics emitted via `reporter`).
+//
+// c111 (D-RUNTIME-PE-MAIN-ARGS): `processArgs` is the target format's declared
+// program-entry argument mechanism (nullopt when the format declares none). After the
+// user entry is resolved, this drives `synthesizePeStartup` — the single-CU counterpart
+// of the merge-path synth in `program.cpp` — which, for the CRT out-parameter mechanism,
+// appends the pre-main init that fetches argc/argv and retargets the entry to it.
 [[nodiscard]] DSS_EXPORT std::optional<AssembledModule>
-lowerCuMirToAssembly(CuMirModule&        cuMir,
-                     DiagnosticReporter& reporter);
+lowerCuMirToAssembly(CuMirModule&                       cuMir,
+                     std::optional<ProcessArgs> const& processArgs,
+                     DiagnosticReporter&               reporter);
 
 // LOWER half for the MERGED whole-program module (Cycle 25 Stage C). Drives the
 // single module `mergeCuMirs` produced (N CUs unified, cross-CU calls already DIRECT,

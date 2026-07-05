@@ -541,9 +541,10 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                               "/processArgs/mechanism",
                               std::format("unknown processArgs.mechanism"
                                           " '{}' — accepted: "
-                                          "\"stack-vector\"", mechName));
+                                          "\"stack-vector\", "
+                                          "\"crt-out-param\"", mechName));
                     armOk = false;
-                } else {
+                } else if (*m == ArgsMechanism::StackVector) {
                     out.mechanism = *m;
                     // StackVector arm: both offsets explicit u32,
                     // bounded to int32 (they feed a MemOffset LIR
@@ -584,6 +585,38 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     }
                     if (!requireOffset("argvStackOffset",
                                        out.argvStackOffset)) {
+                        armOk = false;
+                    }
+                } else {
+                    // CrtOutParam arm (c111): three non-empty string fields —
+                    // the wide + narrow msvcrt arg-fetch export names and the
+                    // import library they resolve from. The synthesizer picks
+                    // wide vs narrow by the resolved entry's signature.
+                    out.mechanism = *m;
+                    auto requireStr =
+                        [&](char const* field, std::string& dst) -> bool {
+                            std::string const path =
+                                std::string{"/processArgs/"} + field;
+                            if (!pa.contains(field)
+                             || !pa.at(field).is_string()
+                             || pa.at(field).get<std::string>().empty()) {
+                                coll.emit(DiagnosticCode::C_MalformedJson,
+                                          path,
+                                          std::format(
+                                              "crt-out-param arm requires a "
+                                              "non-empty string '{}'", field));
+                                return false;
+                            }
+                            dst = pa.at(field).get<std::string>();
+                            return true;
+                        };
+                    if (!requireStr("crtWideArgvFn", out.crtWideArgvFn)) {
+                        armOk = false;
+                    }
+                    if (!requireStr("crtNarrowArgvFn", out.crtNarrowArgvFn)) {
+                        armOk = false;
+                    }
+                    if (!requireStr("crtLibraryPath", out.crtLibraryPath)) {
                         armOk = false;
                     }
                 }

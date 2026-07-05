@@ -625,25 +625,34 @@ TEST(ProcessArgsSubstrate, ShippedElfExecsDeclareStackVector) {
     }
 }
 
-TEST(ProcessArgsSubstrate, ShippedNonLinuxExecsDeclareNone) {
-    // PE: the OS entry receives NO C argument vector — the CRT
-    // out-parameter route (__getmainargs) is a genuinely different
-    // mechanism, anchored D-RUNTIME-PE-MAIN-ARGS. Mach-O: LC_MAIN
-    // entry is CALLED by dyld with argc/argv already in the argument
-    // registers — pass-through (no block) IS the correct mechanism.
-    // Pin the deliberate absence so an accidental stack-vector block
-    // on either (reading a stack that holds no argv there) fails here
-    // before it ships a wild-pointer argv.
-    for (auto const* name : {"pe64-x86_64-windows-exec",
-                             "macho64-x86_64-darwin-exec",
+TEST(ProcessArgsSubstrate, ShippedMachoExecsDeclareNoneAndPeDeclaresCrtOutParam) {
+    // Mach-O: the LC_MAIN entry is CALLED by dyld with argc/argv already in the
+    // argument registers — pass-through (no block) IS the correct mechanism. Pin
+    // the deliberate absence so an accidental stack-vector block (reading a stack
+    // that holds no argv there) fails here before it ships a wild-pointer argv.
+    for (auto const* name : {"macho64-x86_64-darwin-exec",
                              "macho64-arm64-darwin-exec"}) {
         auto r = ObjectFormatSchema::loadShipped(name);
         ASSERT_TRUE(r.has_value()) << name;
         EXPECT_FALSE((*r)->processArgs().has_value())
-            << name << " must NOT declare processArgs — its entry "
-            "contract does not place a SysV-style argument vector at "
-            "the entry SP.";
+            << name << " must NOT declare processArgs — dyld already places "
+            "argc/argv in the argument registers at the Mach-O entry.";
     }
+    // PE (c111, D-RUNTIME-PE-MAIN-ARGS): unlike ELF/Mach-O, the Windows OS entry
+    // receives NO C argument vector, so pe64 DOES declare processArgs — the CRT
+    // out-parameter mechanism whose synthesized pre-main init fetches argc/argv via
+    // an msvcrt export. Pin the declared shape (mechanism + the wide/narrow export
+    // names + the import library) so a descriptor edit that drops or mistypes it
+    // fails here before it ships an entry that reads register garbage for argv.
+    auto pe = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(pe.has_value());
+    auto const& pa = (*pe)->processArgs();
+    ASSERT_TRUE(pa.has_value())
+        << "pe64 must declare processArgs (the CRT out-parameter args mechanism)";
+    EXPECT_EQ(pa->mechanism, ArgsMechanism::CrtOutParam);
+    EXPECT_EQ(pa->crtWideArgvFn, "__wgetmainargs");
+    EXPECT_EQ(pa->crtNarrowArgvFn, "__getmainargs");
+    EXPECT_EQ(pa->crtLibraryPath, "msvcrt.dll");
 }
 
 TEST(ProcessArgsSubstrate, UnknownMechanismRejected) {
@@ -804,8 +813,11 @@ TEST(ProcessArgsSubstrate, ArgsMechanismEnumRoundTrip) {
     EXPECT_EQ(argsMechanismName(ArgsMechanism::StackVector),
               "stack-vector");
     EXPECT_EQ(argsMechanismName(ArgsMechanism::None), "none");
+    EXPECT_EQ(argsMechanismName(ArgsMechanism::CrtOutParam), "crt-out-param");
     EXPECT_EQ(argsMechanismFromName("stack-vector"),
               std::optional{ArgsMechanism::StackVector});
+    EXPECT_EQ(argsMechanismFromName("crt-out-param"),
+              std::optional{ArgsMechanism::CrtOutParam});
     EXPECT_FALSE(argsMechanismFromName("bogus").has_value());
 }
 
