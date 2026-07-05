@@ -19,7 +19,9 @@
 #include <initializer_list>
 #include <optional>
 #include <span>
+#include <filesystem>
 #include <sstream>
+#include <unordered_map>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -44,6 +46,54 @@ using json = nlohmann::json;
 void emitMalformed(DiagnosticReporter& reporter, std::string what) {
     dss::report(reporter, DiagnosticCode::F_ShippedLibDescriptorMalformed,
                 DiagnosticSeverity::Error, std::move(what));
+}
+
+// c112 (compile-perf): a THREAD-LOCAL parse cache for shipped descriptors, keyed
+// by canonical path. Shipped descriptors are IMMUTABLE config, yet a SINGLE TU
+// re-opens + re-`json::parse`s the SAME descriptor up to 4× — the front-end
+// availability + typedef-name + macro reads AND the semantic symbol/type read —
+// and a big descriptor (windows.json) dwarfs the decode, so that was O(reads ×
+// json-size) filesystem+parse churn (the sqlite pe64 compile's preprocess/semantic
+// regression). Caching the ifstream+parse makes every read after the first O(1).
+// thread_local (not a mutex-guarded static) because the driver compiles CUs on a
+// per-TU thread pool — each thread owns its cache, no lock, no cross-thread race;
+// the within-TU 4×→1× dedup is where the win is. Returns nullptr on an I/O / parse
+// / non-object failure (diagnostic emitted to `reporter`); failures are NOT cached,
+// so a malformed descriptor still fails loud on every reader exactly as before.
+json const* cachedDescriptorJson(std::filesystem::path const& path,
+                                 DiagnosticReporter& reporter) {
+    thread_local std::unordered_map<std::string, json> cache;
+    std::error_code ec;
+    auto const canon = std::filesystem::weakly_canonical(path, ec);
+    std::string key = (ec ? path.lexically_normal() : canon).string();
+    if (auto const it = cache.find(key); it != cache.end()) return &it->second;
+
+    std::ifstream in{path, std::ios::binary};
+    if (!in) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor: failed to open '"}
+                + path.generic_string() + "' for reading");
+        return nullptr;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    json doc;
+    try {
+        doc = json::parse(ss.str());
+    } catch (json::parse_error const& e) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor '"} + path.generic_string()
+                + "': JSON parse error: " + e.what());
+        return nullptr;
+    }
+    if (!doc.is_object()) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor '"} + path.generic_string()
+                + "': top-level value must be a JSON object");
+        return nullptr;
+    }
+    auto const [it, _] = cache.emplace(std::move(key), std::move(doc));
+    return &it->second;
 }
 
 // D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD enforcement (mirrors
@@ -638,42 +688,14 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                          std::span<NamedTypeBinding const> namedTypes) {
     std::size_t const errBefore = reporter.errorCount();
 
-    // (0) Read the file. A missing/unreadable descriptor is malformed-shaped
-    // from this reader's perspective (the resolver already verified existence
-    // before recording the path, so a failure here is a real I/O fault, not a
-    // soft miss). Fail loud rather than synthesize nothing silently.
-    std::ifstream in{path, std::ios::binary};
-    if (!in) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor: failed to open '"}
-                + path.generic_string() + "' for reading");
-        return std::nullopt;
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    std::string const text = ss.str();
-
-    // (1) Parse JSON. A parse failure is C_MalformedJson — but route the
-    // descriptor-specific surface through F_ShippedLibDescriptorMalformed so
-    // the operator sees the descriptor context (the codebase pattern emits
-    // C_MalformedJson; here the dedicated FFI code is the right remediation
-    // audience and is unsuppressable).
-    json doc;
-    try {
-        doc = json::parse(text);
-    } catch (json::parse_error const& e) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': JSON parse error: " + e.what());
-        return std::nullopt;
-    }
-
-    if (!doc.is_object()) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': top-level value must be a JSON object");
-        return std::nullopt;
-    }
+    // (0)+(1) Read + parse the file — via the thread-local parse cache (the same
+    // descriptor is read up to 4× per TU; a big windows.json dwarfs the decode).
+    // A missing/unreadable/malformed descriptor fails loud there (a real I/O fault,
+    // not a soft miss — the resolver already verified existence). The cached JSON is
+    // decoded read-only below; every `doc` access is const (.contains/.at/.get).
+    json const* const docPtr = cachedDescriptorJson(path, reporter);
+    if (!docPtr) return std::nullopt;
+    json const& doc = *docPtr;
 
     ShippedLibDescriptor out;
 
@@ -1568,30 +1590,9 @@ readShippedLibMacros(std::filesystem::path const&    path,
     // Read + parse — same provenance gate as readShippedLibDescriptor, but the
     // typed surfaces (which need a TypeInterner) are NOT read here; the semantic
     // phase reads + validates those separately via readShippedLibDescriptor.
-    std::ifstream in{path, std::ios::binary};
-    if (!in) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor: failed to open '"}
-                + path.generic_string() + "' for reading");
-        return std::nullopt;
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    json doc;
-    try {
-        doc = json::parse(ss.str());
-    } catch (json::parse_error const& e) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': JSON parse error: " + e.what());
-        return std::nullopt;
-    }
-    if (!doc.is_object()) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': top-level value must be a JSON object");
-        return std::nullopt;
-    }
+    json const* const docPtr = cachedDescriptorJson(path, reporter);
+    if (!docPtr) return std::nullopt;
+    json const& doc = *docPtr;
     // NOTE: the `header` provenance gate + the typed-surface validation are the
     // SEMANTIC read's job (readShippedLibDescriptor) — NOT repeated here. The
     // macros-only read must be no STRICTER than the full read (a header-less or
@@ -1615,30 +1616,9 @@ readShippedLibAvailability(std::filesystem::path const& path,
     // broken JSON / malformed availability. No `header` or typed-surface gate —
     // the semantic read owns those (this must be no STRICTER than the full read).
     std::size_t const errBefore = reporter.errorCount();
-    std::ifstream in{path, std::ios::binary};
-    if (!in) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor: failed to open '"}
-                + path.generic_string() + "' for reading");
-        return std::nullopt;
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    json doc;
-    try {
-        doc = json::parse(ss.str());
-    } catch (json::parse_error const& e) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': JSON parse error: " + e.what());
-        return std::nullopt;
-    }
-    if (!doc.is_object()) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': top-level value must be a JSON object");
-        return std::nullopt;
-    }
+    json const* const docPtr = cachedDescriptorJson(path, reporter);
+    if (!docPtr) return std::nullopt;
+    json const& doc = *docPtr;
     std::vector<std::string> out;
     decodeShippedAvailability(doc, path.generic_string(), reporter, out);
     if (reporter.errorCount() != errBefore) return std::nullopt;
@@ -1658,30 +1638,9 @@ readShippedLibTypedefNames(std::filesystem::path const& path,
     // owns strict typedef validation, so this stays no STRICTER than the full read
     // and never double-reports. nullopt only on a broken JSON.
     std::size_t const errBefore = reporter.errorCount();
-    std::ifstream in{path, std::ios::binary};
-    if (!in) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor: failed to open '"}
-                + path.generic_string() + "' for reading");
-        return std::nullopt;
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    json doc;
-    try {
-        doc = json::parse(ss.str());
-    } catch (json::parse_error const& e) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': JSON parse error: " + e.what());
-        return std::nullopt;
-    }
-    if (!doc.is_object()) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': top-level value must be a JSON object");
-        return std::nullopt;
-    }
+    json const* const docPtr = cachedDescriptorJson(path, reporter);
+    if (!docPtr) return std::nullopt;
+    json const& doc = *docPtr;
     std::vector<std::string> out;
     if (doc.contains("typedefs") && doc.at("typedefs").is_array()) {
         for (auto const& t : doc.at("typedefs")) {
