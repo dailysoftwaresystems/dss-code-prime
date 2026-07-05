@@ -1,0 +1,15 @@
+{
+  "$comment": "c112 (D-FFI-PE-IMPORT-THUNK): the address-taken-import RUN witness. A static-init array holds the ADDRESS of an imported function (`puts`) — sqlite's os_win.c aSyscall[] shape — and main CALLS it indirectly (a `volatile` load so neither the baseline nor the release arm can fold the indirect call into a direct `puts(...)`, keeping the address-taken path live at runtime). Every hosted format must produce a CALLABLE address for an address-taken import: ELF via a PLT stub, Mach-O via a __stubs entry, and now PE via a synthesized `jmp *[IAT slot]` import THUNK (externCallDispatch=direct-plt; symbolVa[extern]=thunk VA, a .text code address). A correct run prints the line and exits 42. RED-on-disable: flip pe64-x86_64-windows-exec's `externCallDispatch` back to `indirect-slot` (or drop the pe.cpp thunk emission) -> the extern's address resolves to the raw .idata IAT data slot -> `call *ptr` executes data as code -> 0xC0000005 (no exit 42). The elf/arm64 legs already ran this construct green (sqlite on Linux, c91/c93), so all three legs prove the same source runs everywhere.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -77,6 +77,107 @@ constexpr std::size_t   kRelocRecordSize   = 10;
 // Byte-emit helpers + emit() + requireSection() now hoisted to
 // `src/link/format/byte_emit.hpp` (simplifier fold-in #1+#3).
 
+// ── Per-machine import-THUNK substrate (MIRRORS macho.cpp's __stubs
+//    and elf.cpp's PLT) — D-FFI-PE-IMPORT-THUNK ───────────────────
+//
+// A PE import thunk plays the same role as an ELF PLT stub / Mach-O
+// `__stubs` entry: one code thunk per extern, jumping indirectly
+// through the extern's IAT slot (the loader-patched FirstThunk). With
+// `externCallDispatch == direct-plt`, `symbolVa[extern]` names the
+// THUNK (code), so an ADDRESS-TAKEN import is a CALLABLE address and a
+// plain `call rel32 → thunk` reaches the callee. This retires the
+// crash where `symbolVa[extern]` named the IAT *data* slot: taking an
+// import's address and calling it indirectly (`call *reg`) jumped into
+// `.idata` and executed the pointer bytes as code (sqlite os_win.c
+// `aSyscall[]` on Windows — the pe64 leg's last run-green blocker).
+//
+// IMAGE_FILE_MACHINE (object_format_schema.hpp): AMD64 = 0x8664,
+// ARM64 = 0xAA64. The walker dispatches on the schema's `machine`
+// (read as DATA) — a 2nd ISA = a new size arm + a new emitter + a new
+// dispatch case, all localized here (the elf.cpp / macho.cpp
+// precedent). Only x86_64 ships a PE exec target today; arm64-PE has
+// no shipped format, so its emitter is deferred behind the fail-loud
+// `default` (NOT a silent tight slice — a real diagnostic).
+constexpr std::uint16_t kMachineAmd64PE = 0x8664;
+
+constexpr std::size_t kX86_64PeThunkSize = 6;  // FF 25 disp32
+
+// Per-machine import-thunk entry size in bytes. Returns 0 for an
+// unhandled machine — every CALLER pairs the size query with
+// `emitPeThunk`, whose `default` fails loud, so a 0 here never
+// silently ships a zero-stride thunk block.
+[[nodiscard]] constexpr std::size_t
+peThunkSizeFor(std::uint16_t machine) noexcept {
+    switch (machine) {
+        case kMachineAmd64PE: return kX86_64PeThunkSize;
+    }
+    return 0u;
+}
+
+// Emit one x86_64 import thunk into `text` at [thunkOff .. thunkOff+6):
+// 6-byte `FF 25 disp32` = `jmp *(rip + disp32)` jumping indirectly
+// through the extern's IAT slot. disp32 is PC-relative from the END of
+// the 6-byte instruction. Byte-shape-IDENTICAL to macho.cpp's
+// `emitX86_64MachoStub` (which jumps through `__got`) — the only
+// difference is the slot section (PE `.idata` IAT vs Mach-O `__got`),
+// both loader-patched pointer tables. The caller has already RESERVED
+// these 6 bytes (Phase (a2) `text.resize`), so this writes in place.
+[[nodiscard]] inline bool emitX86_64PeThunk(
+        std::vector<std::uint8_t>& text,
+        std::size_t                thunkOff,
+        std::uint64_t              thunkVa,
+        std::uint64_t              iatSlotVa,
+        std::size_t                externIdx,
+        DiagnosticReporter&        reporter) {
+    std::int64_t const disp =
+        static_cast<std::int64_t>(iatSlotVa) -
+        static_cast<std::int64_t>(thunkVa + kX86_64PeThunkSize);
+    if (disp < std::numeric_limits<std::int32_t>::min()
+     || disp > std::numeric_limits<std::int32_t>::max()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("pe::encodeExec: import-thunk disp32 overflow "
+                         "(0x{:x}) for extern #{}; image too large for a "
+                         "32-bit PC-relative IAT reference.",
+                         static_cast<std::uint64_t>(disp), externIdx));
+        return false;
+    }
+    auto const d32 =
+        static_cast<std::uint32_t>(static_cast<std::int32_t>(disp));
+    text[thunkOff + 0] = 0xFFu;
+    text[thunkOff + 1] = 0x25u;
+    text[thunkOff + 2] = static_cast<std::uint8_t>(d32 & 0xFFu);
+    text[thunkOff + 3] = static_cast<std::uint8_t>((d32 >> 8) & 0xFFu);
+    text[thunkOff + 4] = static_cast<std::uint8_t>((d32 >> 16) & 0xFFu);
+    text[thunkOff + 5] = static_cast<std::uint8_t>((d32 >> 24) & 0xFFu);
+    return true;
+}
+
+// Per-machine import-thunk dispatch (mirrors macho.cpp's `emitMachoStub`
+// / elf.cpp's `emitPltStub`). Writes exactly `peThunkSizeFor(machine)`
+// bytes into `text` at `thunkOff` on success. Fail-loud `default` — NO
+// silent zero-byte thunk for an unhandled machine.
+[[nodiscard]] inline bool emitPeThunk(
+        std::uint16_t              machine,
+        std::vector<std::uint8_t>& text,
+        std::size_t                thunkOff,
+        std::uint64_t              thunkVa,
+        std::uint64_t              iatSlotVa,
+        std::size_t                externIdx,
+        DiagnosticReporter&        reporter) {
+    switch (machine) {
+        case kMachineAmd64PE:
+            return emitX86_64PeThunk(text, thunkOff, thunkVa, iatSlotVa,
+                                     externIdx, reporter);
+    }
+    emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+         std::format("pe::encodeExec: machine 0x{:x} has no import-thunk "
+                     "emitter — the PE dynamic-import path supports x86_64 "
+                     "(0x{:x}). Add a per-machine emitter (see emitPeThunk) "
+                     "to ship address-taken FFI for this architecture.",
+                     machine, kMachineAmd64PE));
+    return false;
+}
+
 // ── PE/COFF name encoding ───────────────────────────────────────
 //
 // PE/COFF section names + symbol names have a dual encoding: names
@@ -555,6 +656,30 @@ encodeExec(AssembledModule const&    module,
         return {};
     }
 
+    // ── (a2) Reserve the import-thunk block at the tail of .text ──
+    // D-FFI-PE-IMPORT-THUNK: one code thunk per extern (`jmp *[IAT
+    // slot]`) — the PE analog of an ELF PLT stub / Mach-O __stubs
+    // entry. RESERVED here, BEFORE .text is sized, so textVirtualSize /
+    // textRawSize / the data-chain RVAs (incl. .idata) all account for
+    // it; the bytes are written in step (c2) once each IAT slot's VA is
+    // known. `symbolVa[extern]` then names the thunk (direct-plt),
+    // making an address-taken import a CALLABLE code address. Zero
+    // externs → `resize(+0)` no-op → byte-identical output (the
+    // extern-free byte-for-byte writer pins hold).
+    std::size_t const peThunkSize    = peThunkSizeFor(id.machine);
+    std::size_t const numImportThunks = module.externImports.size();
+    if (numImportThunks > 0 && peThunkSize == 0) {
+        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+             std::format("pe::encodeExec: machine 0x{:x} declares {} extern "
+                         "import(s) but has no import-thunk emitter — an "
+                         "address-taken import needs a callable thunk. Add "
+                         "a per-machine emitter (see emitPeThunk).",
+                         id.machine, numImportThunks));
+        return {};
+    }
+    std::size_t const thunkBlockOffset = text.size();
+    text.resize(text.size() + numImportThunks * peThunkSize, 0u);
+
     // ── (b) Resolve entry-function index from schema.entryPoint
     //
     // Mirrors the ELF ET_EXEC arm (D-LK1-1 follow-up): empty
@@ -827,6 +952,52 @@ encodeExec(AssembledModule const&    module,
         }
         thunkCursor += (externs.size() + 1) * kThunkSize;  // +1 terminator
     }
+
+    // ── (c2) Fill the import-thunk block reserved in step (a2) ──
+    // Each extern's IAT slot VA is now known (externIatVaBySym); write
+    // one `FF 25 disp32` thunk per extern jumping through it, and
+    // record the thunk VA (a .text code address) in
+    // `externThunkVaBySym`. THAT map — not `externIatVaBySym` — feeds
+    // `symbolVa` below, so every extern reference (a direct call OR an
+    // address-taken value) resolves to the callable thunk (direct-plt),
+    // never the raw IAT data slot.
+    std::unordered_map<SymbolId, std::uint64_t> externThunkVaBySym;
+    externThunkVaBySym.reserve(numImportThunks);
+    if (numImportThunks > 0) {
+        // Defense: step (a2) must have grown .text to hold the whole
+        // block; a future reorder that drops the reservation would
+        // otherwise write out of bounds here.
+        if (thunkBlockOffset + numImportThunks * peThunkSize
+                > text.size()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 "pe::encodeExec: import-thunk block was not reserved — "
+                 ".text was not grown to hold the thunks (step (a2) "
+                 "invariant violated).");
+            return {};
+        }
+        for (std::size_t i = 0; i < numImportThunks; ++i) {
+            std::size_t const thunkOff = thunkBlockOffset + i * peThunkSize;
+            std::uint64_t const thunkVa =
+                oh.imageBase + secText.virtualAddress + thunkOff;
+            auto const iatIt =
+                externIatVaBySym.find(module.externImports[i].symbol);
+            if (iatIt == externIatVaBySym.end()) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::string{"pe::encodeExec: extern #"}
+                         + std::to_string(i)
+                         + " has no IAT slot VA — externIatVaBySym is "
+                           "incomplete (import layout bug).");
+                return {};
+            }
+            if (!emitPeThunk(id.machine, text, thunkOff, thunkVa,
+                             iatIt->second, i, reporter)) {
+                return {};
+            }
+            externThunkVaBySym.emplace(module.externImports[i].symbol,
+                                       thunkVa);
+        }
+    }
+
     // HINT/NAME table starts here. Per extern: 2 bytes hint + name +
     // NUL + optional padding to even.
     std::size_t const hintNameStart = thunkCursor;
@@ -905,13 +1076,16 @@ encodeExec(AssembledModule const&    module,
             return {};
         }
     }
-    for (auto const& [sym, va] : externIatVaBySym) {
-        // Cross-format symmetry with ELF/MachO dynamic walkers
-        // (LK6 cycle 2c post-fold review — code-simplifier flagged
-        // PE as the asymmetric outlier). An extern SymbolId
-        // colliding with a function's SymbolId is a caller bug;
-        // silently overriding the in-text VA with the IAT slot VA
-        // would patch in-text rel32 to point at the wrong target.
+    for (auto const& [sym, va] : externThunkVaBySym) {
+        // D-FFI-PE-IMPORT-THUNK: an extern's symbolVa names its import
+        // THUNK (a .text code address) — the PE analog of an ELF PLT
+        // stub / Mach-O __stubs entry — NOT the `.idata` IAT data slot.
+        // This makes an address-taken import a CALLABLE code address
+        // and a direct extern call a plain `call rel32 → thunk` (the
+        // thunk does the IAT indirection); PE is no longer the
+        // asymmetric outlier. An extern SymbolId colliding with a
+        // function's SymbolId is a caller bug; silently overriding the
+        // in-text VA would patch in-text rel32 to the wrong target.
         if (!symbolVa.emplace(sym, va).second) {
             emit(reporter, DiagnosticCode::K_SymbolUndefined,
                  std::string{"pe::encodeExec: extern SymbolId #"}

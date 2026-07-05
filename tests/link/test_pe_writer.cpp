@@ -483,6 +483,102 @@ TEST(PeExecFormatJson, ShippedFileLoadsCleanly) {
     EXPECT_EQ(oh.subsystem, 3u);                       // WINDOWS_CUI
 }
 
+TEST(PeExecFormatJson, ShippedPeExecIsDirectPlt) {
+    // D-FFI-PE-IMPORT-THUNK regression pin: pe64-x86_64-windows-exec was
+    // flipped indirect-slot→direct-plt this cycle. PE now points each
+    // extern symbol's VA at a synthesized `jmp *[IAT slot]` import THUNK
+    // (code, a .text address), so an indirect-slot call site (`FF 15`
+    // deref of the thunk's CODE bytes as a pointer) would be a latent
+    // crash. The shipped exec format MUST declare direct-plt; pin it so a
+    // revert to indirect-slot is caught on EVERY leg — the sqlite
+    // aSyscall[] address-taken-import crash had no non-Windows runtime to
+    // expose it. Mirrors MachOArm64Exit.ShippedX86DarwinExecIsDirectPlt.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.format->externCallDispatch().has_value());
+    EXPECT_TRUE(*loaded.format->externCallDispatch()
+                == ExternCallDispatch::DirectPlt);
+}
+
+TEST(PeExecWriter, AddressTakenImportResolvesToTextThunkNotIdataSlot) {
+    // D-FFI-PE-IMPORT-THUNK host-independent structural pin. The PE exec
+    // walker synthesizes one `FF 25 disp32` import thunk per extern at
+    // the tail of .text (the ELF-PLT / Mach-O-__stubs analog), and an
+    // extern reference resolves to the THUNK (a .text code address), NOT
+    // the .idata IAT data slot. RED-on-disable: drop the pe.cpp thunk
+    // emission (or flip the format back to indirect-slot) → the reference
+    // resolves to .idata and no FF 25 thunk exists → these assertions
+    // fail on EVERY leg (the sqlite 0xC0000005 had no host-independent
+    // guard). Recomputes the two-hop call→thunk→IAT from the emitted
+    // section VAs, so an encoder divergence is loud.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    // main: `E8 <rel32> C3` = call the extern, then ret. The rel32 patch
+    // site is at function offset 1; the reloc targets the extern symbol.
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    fn.relocations.push_back(
+        Relocation{/*offset=*/1, SymbolId{99}, RelocationKind{1},
+                   /*addend=*/0});
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "puts", "msvcrt.dll"});
+
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(img.empty());
+
+    auto const [textRva, textPtr] =
+        findExecSection(img, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+    auto const [idataRva, idataPtr] =
+        findExecSection(img, {'.', 'i', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(textRva, 0u);
+    ASSERT_NE(idataRva, 0u);
+    (void)idataPtr;
+
+    // (1) The thunk sits at the tail of .text, right after the 6-byte
+    //     function body: `FF 25 disp32`.
+    std::size_t const thunkFileOff = static_cast<std::size_t>(textPtr) + 6u;
+    std::uint32_t const thunkRva   = textRva + 6u;
+    ASSERT_LT(thunkFileOff + 6u, img.size());
+    EXPECT_EQ(img[thunkFileOff + 0], 0xFFu) << "import thunk opcode byte 0";
+    EXPECT_EQ(img[thunkFileOff + 1], 0x25u)
+        << "import thunk opcode byte 1 (jmp [rip+disp32])";
+
+    // (2) The thunk jumps THROUGH the extern's IAT slot: its rip-relative
+    //     disp32 target lands in .idata (the loader-patched FirstThunk).
+    auto const thunkDisp =
+        static_cast<std::int32_t>(readU32LE(img, thunkFileOff + 2u));
+    std::int64_t const iatTargetRva =
+        static_cast<std::int64_t>(thunkRva) + 6 + thunkDisp;
+    EXPECT_GE(iatTargetRva, static_cast<std::int64_t>(idataRva))
+        << "import thunk must jump through the .idata IAT slot "
+           "(thunkRva=0x" << std::hex << thunkRva
+        << " disp=" << std::dec << thunkDisp << ")";
+
+    // (3) THE FIX: the extern CALL resolves to the .text THUNK, NOT the
+    //     .idata data slot. `E8 disp32` at function offset 0; target =
+    //     (funcRva + 5) + disp32 must equal the thunk RVA (in .text). A
+    //     revert points it at the .idata IAT slot → `call` into data →
+    //     the sqlite 0xC0000005.
+    auto const callDisp =
+        static_cast<std::int32_t>(readU32LE(img, textPtr + 1u));
+    std::int64_t const callTargetRva =
+        static_cast<std::int64_t>(textRva) + 5 + callDisp;
+    EXPECT_EQ(callTargetRva, static_cast<std::int64_t>(thunkRva))
+        << "extern call must resolve to the .text import thunk (0x"
+        << std::hex << thunkRva << "), not the .idata IAT slot";
+    EXPECT_LT(callTargetRva, static_cast<std::int64_t>(idataRva))
+        << "extern call target must be in .text (< .idata RVA)";
+}
+
 TEST(PeExecWriter, DosHeaderMzSignature) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
@@ -976,15 +1072,34 @@ TEST(PeExecWriter, ExternImportProducesIDataSectionAndPatchesReloc) {
         EXPECT_EQ(bytes[idataFileOff + 20 + i], 0u);
     }
 
-    // REL32 patched in .text: value = iatDirRva - 0x1001 - 4.
+    // Under direct-plt (D-FFI-PE-IMPORT-THUNK) the extern call resolves
+    // to the .text import THUNK (right after the 6-byte function body),
+    // NOT the IAT slot directly. `E8 disp32` at text RVA 0x1000; target
+    // = (textRva + 5) + disp32 == the thunk RVA (textRva + 6 = function
+    // end). The thunk (`FF 25 disp32`) then jumps through the IAT slot
+    // (iatDirRva) — the two-hop that makes an address-taken import
+    // callable and retires the sqlite aSyscall[] crash.
     constexpr std::size_t kFirstSecHdr = 0x188;
+    std::uint32_t const textRva =
+        readU32LE(bytes, kFirstSecHdr + 12);
     std::uint32_t const textFileOff =
         readU32LE(bytes, kFirstSecHdr + 20);
-    std::int32_t const expected =
-        static_cast<std::int32_t>(iatDirRva) - 0x1001 - 4;
-    EXPECT_EQ(readU32LE(bytes, textFileOff + 1),
-              static_cast<std::uint32_t>(expected));
+    std::uint32_t const thunkRva = textRva + 6u;
+    auto const callDisp =
+        static_cast<std::int32_t>(readU32LE(bytes, textFileOff + 1));
+    EXPECT_EQ(static_cast<std::int64_t>(textRva) + 5 + callDisp,
+              static_cast<std::int64_t>(thunkRva))
+        << "extern call must resolve to the .text import thunk, not the "
+           "IAT slot";
     EXPECT_EQ(bytes[textFileOff + 5], 0xC3u);
+    // The thunk `FF 25 disp32` jumps through the IAT slot.
+    EXPECT_EQ(bytes[textFileOff + 6], 0xFFu);
+    EXPECT_EQ(bytes[textFileOff + 7], 0x25u);
+    auto const thunkDisp =
+        static_cast<std::int32_t>(readU32LE(bytes, textFileOff + 8));
+    EXPECT_EQ(static_cast<std::int64_t>(thunkRva) + 6 + thunkDisp,
+              static_cast<std::int64_t>(iatDirRva))
+        << "import thunk must jump through the IAT slot";
 }
 
 TEST(PeExecWriter, IDataContainsExitProcessNameAndKernel32DllName) {
@@ -1142,10 +1257,11 @@ TEST(PeExecWriter, MultipleLibrariesEachWithOneExtern) {
 }
 
 TEST(PeExecWriter, MixedExternAndIntraModuleCallInOneFunction) {
-    // test-analyzer #3: one function with TWO relocations — one
-    // to an intra-module function (resolves to .text VA) and one
-    // to an extern (resolves to .idata IAT slot VA). The shared
-    // symbolVa kernel must dispatch both correctly.
+    // test-analyzer #3: one function with TWO relocations — one to an
+    // intra-module function (resolves to its .text VA) and one to an
+    // extern (resolves to the extern's .text import THUNK under direct-
+    // plt, D-FFI-PE-IMPORT-THUNK — the thunk then jumps through the
+    // .idata IAT slot). The shared symbolVa kernel dispatches both.
     auto loaded = loadShippedExec();
     AssembledModule mod;
     mod.expectedFuncCount = 2;
@@ -1179,12 +1295,27 @@ TEST(PeExecWriter, MixedExternAndIntraModuleCallInOneFunction) {
     std::uint32_t const textFileOff =
         readU32LE(bytes, kFirstSecHdr + 20);
     EXPECT_EQ(readU32LE(bytes, textFileOff + 1), 6u);
-    // Extern call: patches to iatDirRva - 0x1006 - 4.
+    // Extern call (direct-plt, D-FFI-PE-IMPORT-THUNK): resolves to the
+    // .text import THUNK — the single extern's thunk sits after BOTH
+    // function bodies (f0 11B + f1 1B = text offset 12). `E8 disp32` at
+    // f0 offset 5; target = (textRva + 10) + disp == thunkRva (textRva +
+    // 12), NOT the IAT slot (a `call` into .idata data → the sqlite
+    // crash). The thunk then jumps through the IAT slot.
+    std::uint32_t const textRva = readU32LE(bytes, kFirstSecHdr + 12);
+    std::uint32_t const thunkRva = textRva + 12u;
+    auto const externDisp =
+        static_cast<std::int32_t>(readU32LE(bytes, textFileOff + 6));
+    EXPECT_EQ(static_cast<std::int64_t>(textRva) + 10 + externDisp,
+              static_cast<std::int64_t>(thunkRva))
+        << "extern call must resolve to the .text import thunk";
     std::uint32_t const iatDirRva = readU32LE(bytes, 0x108 + 12*8);
-    std::int32_t const expectedExtern =
-        static_cast<std::int32_t>(iatDirRva) - 0x1006 - 4;
-    EXPECT_EQ(readU32LE(bytes, textFileOff + 6),
-              static_cast<std::uint32_t>(expectedExtern));
+    EXPECT_EQ(bytes[textFileOff + 12], 0xFFu);
+    EXPECT_EQ(bytes[textFileOff + 13], 0x25u);
+    auto const thunkDisp =
+        static_cast<std::int32_t>(readU32LE(bytes, textFileOff + 14));
+    EXPECT_EQ(static_cast<std::int64_t>(thunkRva) + 6 + thunkDisp,
+              static_cast<std::int64_t>(iatDirRva))
+        << "import thunk must jump through the IAT slot";
 }
 
 TEST(LinkerExternResolution, NeitherDefinedNorExternStillFailsLoud) {

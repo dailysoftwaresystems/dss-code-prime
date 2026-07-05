@@ -57,8 +57,11 @@ namespace {
 //   C3                 ret
 //
 // The trampoline does NOT emit a trailing `ret`: its control flow
-// is `call user_entry → mov ecx, eax → call_indirect_via_extern
-// ExitProcess → unreachable`. The user fn's `ret` IS reached
+// is `call user_entry → mov ecx, eax → call ExitProcess →
+// unreachable`. Under direct-plt (D-FFI-PE-IMPORT-THUNK) the
+// ExitProcess call is a plain `call rel32` (E8) to the synthesized
+// import thunk — was `call_indirect_via_extern` (FF 15) under the
+// retired indirect-slot model. The user fn's `ret` IS reached
 // (returning into the trampoline body), but no `ret` is reachable
 // inside the trampoline itself.
 [[nodiscard]] AssembledModule makeReturn42Module() {
@@ -289,8 +292,10 @@ TEST(LK10EntrySliceC, SyntheticExitProcessExternThreadsThroughIat) {
     EXPECT_EQ(mod.externImports[0].libraryPath, "kernel32.dll");
     EXPECT_EQ(mod.externImports[0].mangledName, "ExitProcess");
     // The trampoline at functions[0] has a Relocation targeting the
-    // synthetic ExternImport's SymbolId — that reloc patches the
-    // disp32 in `FF 15 disp32` to the IAT slot's RVA at link time.
+    // synthetic ExternImport's SymbolId — that reloc patches the call
+    // disp32 (E8 disp32 under direct-plt; was FF 15 disp32 under the
+    // retired indirect-slot model) to the ExitProcess import thunk's
+    // RVA at link time.
     ASSERT_GE(mod.functions.size(), 2u);
     auto const& tramp = mod.functions[0];
     bool found = false;
