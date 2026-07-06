@@ -14,10 +14,12 @@ namespace {
 constexpr std::uint32_t kOpcodeCount = static_cast<std::uint32_t>(MirOpcode::Count_);
 
 bool isOneOfTheTerminators(MirOpcode op) {
-    // D-CSUBSET-COMPUTED-GOTO added IndirectBr (the 6th terminator).
+    // D-CSUBSET-COMPUTED-GOTO added IndirectBr (the 6th terminator); c115 SEH
+    // (D-WIN64-SEH-FUNCLETS) added SehTryBegin + SehFilterReturn (7th, 8th).
     return op == MirOpcode::Br || op == MirOpcode::CondBr || op == MirOpcode::Switch
         || op == MirOpcode::Return || op == MirOpcode::Unreachable
-        || op == MirOpcode::IndirectBr;
+        || op == MirOpcode::IndirectBr
+        || op == MirOpcode::SehTryBegin || op == MirOpcode::SehFilterReturn;
 }
 
 } // namespace
@@ -37,7 +39,7 @@ TEST(MirOpcode, EveryOpcodeHasADescriptorWithAMnemonic) {
     }
 }
 
-TEST(MirOpcode, ExactlySixTerminators) {
+TEST(MirOpcode, ExactlyEightTerminators) {
     int terminatorCount = 0;
     for (std::uint32_t i = 0; i < kOpcodeCount; ++i) {
         auto const op = static_cast<MirOpcode>(i);
@@ -49,8 +51,9 @@ TEST(MirOpcode, ExactlySixTerminators) {
             EXPECT_FALSE(isOneOfTheTerminators(op));
         }
     }
-    // Br, CondBr, Switch, Return, Unreachable + IndirectBr (D-CSUBSET-COMPUTED-GOTO).
-    EXPECT_EQ(terminatorCount, 6);
+    // Br, CondBr, Switch, Return, Unreachable + IndirectBr (D-CSUBSET-COMPUTED-GOTO)
+    // + SehTryBegin, SehFilterReturn (c115 SEH, D-WIN64-SEH-FUNCLETS).
+    EXPECT_EQ(terminatorCount, 8);
 }
 
 TEST(MirOpcode, OnlyPhiUsesThePhiPool) {

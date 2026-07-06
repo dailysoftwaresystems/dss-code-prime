@@ -201,6 +201,12 @@ struct Lowerer {
         return b;
     }
 
+    // c115 SEH (D-WIN64-SEH-FUNCLETS): the module-wide SEH region-id counter —
+    // stamps SehTryBegin/SehFilterReturn/SehTryEnd payloads. Module-monotonic
+    // (never reset per function) so ids stay unique within every function by
+    // construction; the verifier pairs Begin/FilterReturn/End on it.
+    std::uint32_t sehRegionCounter_ = 0;
+
     // c60 (Design I-A): does a flattened switch's body Block start with a case
     // marker (a LabelStmt)? When it does, the marker opens its own label-block right
     // after the Switch terminator, so no extra pre-case block is needed; only a body
@@ -848,6 +854,16 @@ struct Lowerer {
                         // a result type is a MirBuilder fatal).
                         return mir.addInst(MirOpcode::CompilerBarrier, operands,
                                            InvalidType);
+                    case BuiltinLowering::SehExceptionCode:
+                        // c115 SEH: `_exception_code()` — a 0-operand value op
+                        // (u32) reading the dispatch context. Position legality
+                        // (filter expr / handler body only) was proven by
+                        // HirVerifier::checkSehContext before lowering ran.
+                        return mir.addInst(MirOpcode::SehExceptionCode, operands, t);
+                    case BuiltinLowering::SehExceptionInfo:
+                        // c115 SEH: `_exception_info()` — a 0-operand value op
+                        // (void* → EXCEPTION_POINTERS), filter-expression only.
+                        return mir.addInst(MirOpcode::SehExceptionInfo, operands, t);
                     case BuiltinLowering::None:
                         break;
                 }
@@ -6415,6 +6431,99 @@ struct Lowerer {
                 mir.beginBlock(joinBB);
                 if (!joinReached) {
                     mir.addUnreachable();
+                }
+                return true;
+            }
+            case HirKind::SehTryExcept: {
+                // c115 SEH (D-WIN64-SEH-FUNCLETS) — the region skeleton:
+                //   pre:      SehTryBegin(id), succs [tryBB, filterBB]
+                //   tryBB:    guarded body …; SehTryEnd(id); Br(joinBB)
+                //             (the SINGLE exit — option (C), verifier-enforced
+                //             D-CSUBSET-SEH-EARLY-EXIT; a body sealing itself
+                //             (infinite loop) simply has no End marker)
+                //   filterBB: filter expr …; SehFilterReturn(i32, id) → handlerBB
+                //   handlerBB: handler body …; Br(joinBB)
+                //   joinBB:   the continuation.
+                // All four blocks stamp Linear — the canonical marker derive
+                // (rederiveStructCfMarkers, which OVERWRITES creation stamps
+                // after finish()) classifies them from CFG shape; its if/switch
+                // rules key on CondBr/Switch only, and the verifier's single-
+                // pred rules keep back-edge/loop-exit claims off filter/handler.
+                // Locals stay memory-true: mem2reg skips SEH-containing
+                // functions (fault-time state must be observable), and
+                // SehTryBegin/End/FilterReturn are opcodeClobbersMemory members
+                // so CSE/LICM never move Load/Store across region boundaries.
+                HirNodeId const tryN     = hir.sehTryBody(node);
+                HirNodeId const filterN  = hir.sehTryFilter(node);
+                HirNodeId const handlerN = hir.sehTryHandler(node);
+
+                std::uint32_t const regionId = sehRegionCounter_++;
+                MirBlockId const tryBB     = mir.createBlock(StructCfMarker::Linear);
+                MirBlockId const filterBB  = mir.createBlock(StructCfMarker::Linear);
+                MirBlockId const handlerBB = mir.createBlock(StructCfMarker::Linear);
+                MirBlockId const joinBB    = mir.createBlock(StructCfMarker::Linear);
+                mir.addSehTryBegin(tryBB, filterBB, regionId);
+
+                bool joinReached = false;
+
+                // ── the guarded body ──
+                mir.beginBlock(tryBB);
+                if (!lowerStmt(tryN)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(filterBB);
+                    sealCreatedAsUnreachable(handlerBB);
+                    sealCreatedAsUnreachable(joinBB);
+                    return false;
+                }
+                if (!mir.openBlockHasTerminator()) {
+                    mir.addInst(MirOpcode::SehTryEnd, {}, InvalidType, regionId);
+                    mir.addBr(joinBB);
+                    joinReached = true;
+                }
+
+                // ── the filter expression (i32-coerced: MSVC's filter contract;
+                //    a Bool comparison like `_exception_code()==E` ZExts) ──
+                mir.beginBlock(filterBB);
+                MirInstId fval = lowerExpr(filterN);
+                if (!fval.valid()) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(handlerBB);
+                    sealCreatedAsUnreachable(joinBB);
+                    return false;
+                }
+                TypeId const i32Ty = interner.primitive(TypeKind::I32);
+                TypeId const ft    = hir.typeId(filterN);
+                if (ft.valid() && ft != i32Ty) {
+                    MirOpcode const castOp = mapCast(interner.kind(ft), TypeKind::I32);
+                    if (castOp == MirOpcode::Invalid) {
+                        unsupported(node, "SEH __except filter expression must be "
+                                          "an integer (MSVC: the filter value is "
+                                          "an int)");
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(handlerBB);
+                        sealCreatedAsUnreachable(joinBB);
+                        return false;
+                    }
+                    std::array<MirInstId, 1> const castOps{fval};
+                    fval = mir.addInst(castOp, castOps, i32Ty);
+                }
+                mir.addSehFilterReturn(fval, handlerBB, regionId);
+
+                // ── the handler body ──
+                mir.beginBlock(handlerBB);
+                if (!lowerStmt(handlerN)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(joinBB);
+                    return false;
+                }
+                if (!mir.openBlockHasTerminator()) {
+                    mir.addBr(joinBB);
+                    joinReached = true;
+                }
+
+                mir.beginBlock(joinBB);
+                if (!joinReached) {
+                    mir.addUnreachable();   // both paths sealed — pruned centrally
                 }
                 return true;
             }

@@ -8543,6 +8543,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 (void)resolveRuleField(hl, "caseStmtRule", "/hirLowering",
                                        cfg.caseStmtRule, cfg.caseStmtRuleName);
             }
+            if (hl.contains("sehExceptArmRule")) {   // c115 SEH (optional)
+                (void)resolveRuleField(hl, "sehExceptArmRule", "/hirLowering",
+                                       cfg.sehExceptArmRule, cfg.sehExceptArmRuleName);
+            }
+            if (hl.contains("sehFinallyArmRule")) {  // c115 SEH (optional)
+                (void)resolveRuleField(hl, "sehFinallyArmRule", "/hirLowering",
+                                       cfg.sehFinallyArmRule, cfg.sehFinallyArmRuleName);
+            }
 
             // Char / string literal lowering blocks:
             //   "charLiteral":   { "startToken": "CharStart",   "bodyToken": "CharLiteral"   }

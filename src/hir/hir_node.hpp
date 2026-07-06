@@ -50,6 +50,18 @@ enum class HirKind : std::uint16_t {
     //    unconditional transfer to a COMPUTED code address (child = the pointer
     //    expression); its MIR successors are every address-taken label block. ──
     GotoStmt, LabelStmt, IndirectGotoStmt,
+    // ── c115 (SEH arc 2/3, D-WIN64-SEH-FUNCLETS): MSVC `__try { … } __except
+    //    ( filter ) { … }`. Children = [tryBody Block, filterExpr, handlerBody
+    //    Block] — fixed arity 3. The filter evaluates DURING exception dispatch
+    //    (a c116 filter funclet); `_exception_code()`/`_exception_info()`
+    //    (BuiltinCall payloads SehExceptionCode/SehExceptionInfo) are legal only
+    //    in the filter (code also in the handler) — HirVerifier owns the context
+    //    rules (checkSehContext), incl. the option-(C) early-exit restriction
+    //    D-CSUBSET-SEH-EARLY-EXIT (no return / goto-out / break-out of the try
+    //    body until a real consumer fires the trigger). `__finally`/`__leave`
+    //    get NO HirKind — they fail loud at CST→HIR (D-CSUBSET-SEH-FINALLY /
+    //    D-CSUBSET-SEH-LEAVE, trigger-gated; sqlite ground truth: zero uses). ──
+    SehTryExcept,
     // ── Expressions ──
     Literal, Ref, Call, IntrinsicCall,
     // c103 (D-CSUBSET-INTRINSIC-UMULH): a call to a builtin that lowers to a
@@ -152,6 +164,7 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
         case HirKind::SwitchStmt: case HirKind::CaseArm: case HirKind::BreakStmt:
         case HirKind::ContinueStmt: case HirKind::ReturnStmt: case HirKind::ExprStmt:
         case HirKind::GotoStmt: case HirKind::LabelStmt: case HirKind::IndirectGotoStmt:
+        case HirKind::SehTryExcept:
         case HirKind::AssignStmt: case HirKind::Unreachable:
         case HirKind::Error: case HirKind::Extension: case HirKind::Count_:
             return false;
@@ -280,6 +293,8 @@ struct ChildArity {
         case HirKind::LabelStmt:          return {1, 1};   // [labeledStmt]; label ordinal in payload
         // D-CSUBSET-COMPUTED-GOTO: `goto *expr;` — [addressExpr], the pointer to jump to.
         case HirKind::IndirectGotoStmt:   return {1, 1};
+        // c115 SEH: [tryBody Block, filterExpr, handlerBody Block] — fixed.
+        case HirKind::SehTryExcept:       return {3, 3};
         // ── Declarations (HR4) ──
         case HirKind::Function:      return {1, kUnboundedArity};  // [params…, body Block]
         case HirKind::ExternFunction: return {0, kUnboundedArity}; // [params…] (no body)

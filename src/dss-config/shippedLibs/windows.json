@@ -59,7 +59,14 @@
     { "name": "ULARGE_INTEGER", "type": "struct \"ULARGE_INTEGER\" { u64 @0, u32 @0, u32 @4 }" },
     { "name": "WIN32_FIND_DATAW", "type": "struct \"WIN32_FIND_DATAW\" { u32, struct \"FILETIME\" { u32, u32 }, struct \"FILETIME\" { u32, u32 }, struct \"FILETIME\" { u32, u32 }, u32, u32, u32, u32, arr<u16, 260>, arr<u16, 14> }" },
     { "name": "LPWIN32_FIND_DATAW", "type": "ptr<void>" },
-    { "name": "CONSOLE_SCREEN_BUFFER_INFO", "type": "struct \"CONSOLE_SCREEN_BUFFER_INFO\" { struct \"COORD\" { i16, i16 }, struct \"COORD\" { i16, i16 }, u16, struct \"SMALL_RECT\" { i16, i16, i16, i16 }, struct \"COORD\" { i16, i16 } }" }
+    { "name": "CONSOLE_SCREEN_BUFFER_INFO", "type": "struct \"CONSOLE_SCREEN_BUFFER_INFO\" { struct \"COORD\" { i16, i16 }, struct \"COORD\" { i16, i16 }, u16, struct \"SMALL_RECT\" { i16, i16, i16, i16 }, struct \"COORD\" { i16, i16 } }" },
+    { "name": "ULONG_PTR", "type": "u64" },
+    { "name": "PCONTEXT", "type": "ptr<void>" },
+    { "name": "PEXCEPTION_RECORD", "type": "ptr<void>" },
+    { "name": "EXCEPTION_RECORD", "type": "struct \"EXCEPTION_RECORD\" { u32, u32, ptr<void>, ptr<void>, u32, arr<u64, 15> }" },
+    { "name": "EXCEPTION_POINTERS", "type": "struct \"EXCEPTION_POINTERS\" { ptr<struct \"EXCEPTION_RECORD\" { u32, u32, ptr<void>, ptr<void>, u32, arr<u64, 15> }>, ptr<void> }" },
+    { "name": "PEXCEPTION_POINTERS", "type": "ptr<void>" },
+    { "name": "LPEXCEPTION_POINTERS", "type": "ptr<void>" }
   ],
   "structs": [
     {
@@ -189,6 +196,24 @@
         { "name": "srWindow", "type": "struct \"SMALL_RECT\" { i16, i16, i16, i16 }" },
         { "name": "dwMaximumWindowSize", "type": "struct \"COORD\" { i16, i16 }" }
       ]
+    },
+    {
+      "name": "EXCEPTION_RECORD",
+      "fields": [
+        { "name": "ExceptionCode", "type": "u32" },
+        { "name": "ExceptionFlags", "type": "u32" },
+        { "name": "ExceptionRecord", "type": "ptr<void>" },
+        { "name": "ExceptionAddress", "type": "ptr<void>" },
+        { "name": "NumberParameters", "type": "u32" },
+        { "name": "ExceptionInformation", "type": "arr<u64, 15>" }
+      ]
+    },
+    {
+      "name": "EXCEPTION_POINTERS",
+      "fields": [
+        { "name": "ExceptionRecord", "type": "ptr<struct \"EXCEPTION_RECORD\" { u32, u32, ptr<void>, ptr<void>, u32, arr<u64, 15> }>" },
+        { "name": "ContextRecord", "type": "ptr<void>" }
+      ]
     }
   ],
   "symbols": [
@@ -274,13 +299,16 @@
     { "name": "GetCurrentProcess", "signature": "fn() -> ptr<void>", "kind": "function", "linkage": "external" },
     { "name": "DebugBreak", "signature": "fn() -> void", "kind": "function", "linkage": "external" },
     { "name": "LoadLibraryA", "signature": "fn(ptr<char>) -> ptr<void>", "kind": "function", "linkage": "external" },
-    { "name": "RtlLookupFunctionEntry", "signature": "fn(u64, ptr<u64>, ptr<void>) -> ptr<void>", "kind": "function", "linkage": "external" }
+    { "name": "RtlLookupFunctionEntry", "signature": "fn(u64, ptr<u64>, ptr<void>) -> ptr<void>", "kind": "function", "linkage": "external" },
+    { "name": "RaiseException", "signature": "fn(u32, u32, u32, ptr<u64>) -> void", "kind": "function", "linkage": "external" }
   ],
   "macros": [
     { "name": "INVALID_HANDLE_VALUE", "replacement": "((HANDLE)-1)" },
     { "name": "InterlockedCompareExchange", "replacement": "_InterlockedCompareExchange" },
     { "name": "TEXT", "params": ["x"], "replacement": "x" },
-    { "name": "LoadLibrary", "replacement": "LoadLibraryA" }
+    { "name": "LoadLibrary", "replacement": "LoadLibraryA" },
+    { "name": "GetExceptionCode", "params": [], "replacement": "_exception_code()" },
+    { "name": "GetExceptionInformation", "params": [], "replacement": "((void *)_exception_info())" }
   ],
   "constants": [
     { "name": "TRUE",                           "value": 1,          "type": "i32" },
@@ -360,6 +388,11 @@
     { "name": "ENABLE_VIRTUAL_TERMINAL_PROCESSING", "value": 4, "type": "u32" },
     { "name": "FILE_WRITE_ATTRIBUTES", "value": 256, "type": "u32" },
     { "name": "FILE_FLAG_BACKUP_SEMANTICS", "value": 33554432, "type": "u32" },
-    { "name": "CTRL_C_EVENT", "value": 0, "type": "u32" }
+    { "name": "CTRL_C_EVENT", "value": 0, "type": "u32" },
+    { "name": "EXCEPTION_IN_PAGE_ERROR", "value": 3221225478, "type": "u32" },
+    { "name": "EXCEPTION_EXECUTE_HANDLER", "value": 1, "type": "i32" },
+    { "name": "EXCEPTION_CONTINUE_SEARCH", "value": 0, "type": "i32" },
+    { "name": "EXCEPTION_CONTINUE_EXECUTION", "value": -1, "type": "i32" },
+    { "name": "EXCEPTION_MAXIMUM_PARAMETERS", "value": 15, "type": "i32" }
   ]
 }

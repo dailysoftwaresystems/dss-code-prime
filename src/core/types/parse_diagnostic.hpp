@@ -725,6 +725,30 @@ enum class DiagnosticCode : std::uint16_t {
     //   closed-table): silencing it cannot mask a miscompile.
     H_UnreachableCode             = 0xF00D,
 
+    // ── c115 SEH (D-WIN64-SEH-FUNCLETS) — HirVerifier::checkSehContext ──
+    // H_SehBuiltinContext: `_exception_code()` outside every enclosing __except
+    //   filter-expression/handler-body, or `_exception_info()` outside every
+    //   enclosing filter expression (MSVC: the intrinsics are dispatch-context
+    //   reads; there is no value for them elsewhere).
+    H_SehBuiltinContext           = 0xF00E,
+    // H_SehJumpIntoRegion: a goto whose target label sits inside a part of a
+    //   __try statement (guarded body / handler) that does not lexically enclose
+    //   the goto — entering a guarded PC range sideways would give it a filter
+    //   it must never have (MSVC rejects the construct too).
+    H_SehJumpIntoRegion           = 0xF00F,
+    // H_SehEarlyExit (D-CSUBSET-SEH-EARLY-EXIT, trigger-gated): a return /
+    //   goto-out / break-out / continue-out from INSIDE a __try guarded body.
+    //   Option (C) of the c115 design-audit: the guarded body has exactly ONE
+    //   exit (the fall-through) so c116's scope-table region membership stays
+    //   CFG-derivable; sqlite's ~13 SEH sites have ZERO early exits
+    //   (amalgamation-swept). MSVC-legal — the anchor carries the
+    //   mark-every-exit design for when a real consumer fires the trigger.
+    H_SehEarlyExit                = 0xF010,
+    // H_SehLabelAddress (D-CSUBSET-SEH-LABEL-ADDR, trigger-gated): `&&label`
+    //   naming a label inside any part of a __try statement — a computed goto
+    //   could then enter the guarded range undetectably at compile time.
+    H_SehLabelAddress             = 0xF011,
+
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,
     // dominance-, or type-consistency invariant on the frozen `Mir` module
@@ -791,6 +815,16 @@ enum class DiagnosticCode : std::uint16_t {
     // carry a def whose layout follows the use — the dominance arm owns
     // their semantics). Closes the D-OPT2 layout-contract class.
     I_LayoutUseBeforeDef      = 0xA010,
+    // c115 SEH (D-WIN64-SEH-FUNCLETS): the region-skeleton pairing rules —
+    // a SehTryBegin's filter block (succ[1]) must have exactly one CFG
+    // predecessor and terminate in a SehFilterReturn with the MATCHING payload
+    // (region id); the handler (the filter's succ[0]) must have exactly one
+    // predecessor; every SehTryEnd's payload must name a SehTryBegin region in
+    // the same function; SehExceptionCode/Info may appear only in a function
+    // containing a SehTryBegin. Guards the optimizer contract (SimplifyCfg's
+    // no-touch rule on SEH successors) — a merge/thread that damages the
+    // skeleton reds HERE, at the pass that did it (verify-after-every-pass).
+    I_SehStructure            = 0xA011,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //

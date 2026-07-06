@@ -296,6 +296,46 @@ TEST(Cse, LoadNotCsedAcrossCompilerBarrier) {
     EXPECT_EQ(countOpInModule(mir, MirOpcode::CompilerBarrier), 1u);
 }
 
+// c115 SEH (D-WIN64-SEH-FUNCLETS): a SehTryEnd marker (a region boundary) is
+// a full memory clobber — a Load may not be CSE-reused across it, since at c116
+// the guarded body's memory state at the boundary is what the fault-time
+// filter/handler observe. Same `opcodeClobbersMemory` chokepoint as the
+// CompilerBarrier pin above (SehTryBegin/SehTryEnd/SehFilterReturn are all on
+// the positive list). RED-on-disable: drop SehTryEnd from opcodeClobbersMemory
+// → the second Load CSE-reuses across the boundary → instructionsCsed = 1.
+TEST(Cse, LoadNotCsedAcrossSehTryEnd) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue v0; v0.value = std::int64_t{7}; v0.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(v0, i32);
+    MirInstId const s0[] = {c0, slot};
+    (void)mb.addInst(MirOpcode::Store, s0, InvalidType);
+    MirInstId const lops[] = {slot};
+    MirInstId const ld1 = mb.addInst(MirOpcode::Load, lops, i32);
+    (void)mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, /*payload=*/0);
+    MirInstId const ld2 = mb.addInst(MirOpcode::Load, lops, i32);
+    MirInstId const sum[] = {ld1, ld2};
+    MirInstId const r = mb.addInst(MirOpcode::Add, sum, i32);
+    mb.addReturn(r);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 0u)
+        << "a SehTryEnd region boundary must block Load CSE";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Load), 2u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::SehTryEnd), 1u);
+}
+
 // Positive pin (SSA-derivable Rule 2): an intervening Store to a
 // DISTINCT Alloca does NOT alias the Loaded pointer, so CSE proceeds.
 TEST(Cse, LoadCsedAcrossDistinctAllocaStore) {

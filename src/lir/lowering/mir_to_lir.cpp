@@ -51,6 +51,11 @@ namespace {
         case MirOpcode::Phi:           return "Phi";
         case MirOpcode::Return:        return "Return";
         case MirOpcode::Unreachable:   return "Unreachable";
+        case MirOpcode::SehTryBegin:      return "SehTryBegin";       // c115 SEH
+        case MirOpcode::SehFilterReturn:  return "SehFilterReturn";
+        case MirOpcode::SehTryEnd:        return "SehTryEnd";
+        case MirOpcode::SehExceptionCode: return "SehExceptionCode";
+        case MirOpcode::SehExceptionInfo: return "SehExceptionInfo";
         default:                       return "<deferred>";
     }
 }
@@ -81,7 +86,9 @@ namespace {
         || op == MirOpcode::Switch
         || op == MirOpcode::Return
         || op == MirOpcode::Unreachable
-        || op == MirOpcode::IndirectBr;  // D-CSUBSET-COMPUTED-GOTO
+        || op == MirOpcode::IndirectBr        // D-CSUBSET-COMPUTED-GOTO
+        || op == MirOpcode::SehTryBegin       // c115 SEH — fail-loud arms in
+        || op == MirOpcode::SehFilterReturn;  // lowerTerminator (D-WIN64-SEH-FUNCLETS)
 }
 
 // Single source of truth for the lowerer's opcode-mnemonic cache. The
@@ -1373,6 +1380,15 @@ struct Lowerer {
             // realized by its hasSideEffects flag in the MIR clobber walk, so
             // this lowering emits nothing.
             case MirOpcode::CompilerBarrier: return;
+            case MirOpcode::SehTryEnd:
+            case MirOpcode::SehExceptionCode:
+            case MirOpcode::SehExceptionInfo:
+                // c115 SEH: not lowerable until the c116 funclet/scope-table
+                // arc (D-WIN64-SEH-FUNCLETS) — fail LOUD on every target, and
+                // poison the value ops so downstream uses don't cascade.
+                reportSehNotLowered(op, id);
+                if (op != MirOpcode::SehTryEnd) poisonValue(id);
+                return;
             case MirOpcode::SDiv:   return lowerDivLike(id, /*isSigned=*/true,  /*wantRemainder=*/false);
             case MirOpcode::UDiv:   return lowerDivLike(id, /*isSigned=*/false, /*wantRemainder=*/false);
             case MirOpcode::SMod:   return lowerDivLike(id, /*isSigned=*/true,  /*wantRemainder=*/true);
@@ -4525,10 +4541,35 @@ struct Lowerer {
             case MirOpcode::Switch:      return lowerSwitch(termId, succs);
             case MirOpcode::IndirectBr:  return lowerIndirectBr(termId, succs);
             case MirOpcode::Unreachable: return lowerUnreachable(termId);
+            case MirOpcode::SehTryBegin:
+            case MirOpcode::SehFilterReturn:
+                // c115: the SEH frontend (parse/sema/HIR/MIR) is complete; the
+                // x64 lowering — filter/handler FUNCLETS sharing the parent
+                // frame via the establisher-frame pointer, __C_specific_handler
+                // scope tables + UNW_FLAG_EHANDLER on the c114 UNWIND_INFO, and
+                // the dispatcher wiring — is D-WIN64-SEH-FUNCLETS (c116). Fail
+                // LOUD on EVERY target (no format branch; a non-Windows format
+                // has no SEH model at all): never a silent parse-and-drop.
+                reportSehNotLowered(op, termId);
+                return false;
             default:                     break;
         }
         reportUnsupported(op, termId);
         return false;
+    }
+
+    // c115 SEH: the anchored fail-loud for the five SEH ops (the honest c115
+    // boundary — sqlite compiles SEH source through MIR and stops EXACTLY here).
+    void reportSehNotLowered(MirOpcode op, MirInstId at) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "MIR opcode '{}' (SEH __try/__except) is not yet lowered to target "
+            "'{}' (inst {}): the x64 filter-funclet + __C_specific_handler "
+            "scope-table lowering is D-WIN64-SEH-FUNCLETS (c116)",
+            mirOpcodeName(op), target.name(), at.v);
+        reporter.report(std::move(d));
     }
 
     bool lowerReturn(MirInstId id) {

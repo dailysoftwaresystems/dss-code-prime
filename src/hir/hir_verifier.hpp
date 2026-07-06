@@ -90,6 +90,21 @@ template <typename Source>
                 && pathTerminates(src, src.ifThen(id))
                 && pathTerminates(src, *elseB);
         }
+        case HirKind::SehTryExcept: {
+            // c115 SEH: like an if/else — the __try statement terminates on all
+            // paths iff BOTH the guarded body AND the handler do (control leaves
+            // via the guarded body's normal exit OR, on a fault, via the
+            // handler). With the option-(C) early-exit rule the guarded body's
+            // only non-fall-through terminator is an infinite loop (wrapped as
+            // Unreachable); the common case (body falls through) is non-
+            // terminating, so a `return` MUST follow the __try — exactly sqlite.
+            // Uses children() ([tryBody, filter, handler]) to stay within the
+            // template's Source interface (HirBuilder lacks the seh* accessors).
+            auto kids = src.children(id);
+            return kids.size() == 3
+                && pathTerminates(src, kids[0])
+                && pathTerminates(src, kids[2]);
+        }
         case HirKind::SwitchStmt: {
             // c60 (Design I-A): a switch terminates on all paths iff (a) it has a
             // `default:` arm — so the discriminant always lands inside the body
@@ -149,6 +164,14 @@ private:
     // loop/switch (`enclosingBranchTargets`); a `ContinueStmt`'s resolved target
     // must be a loop, not a switch. Each violation emits `H_InvalidBreak`.
     void checkBreakContinueScoping(DiagnosticReporter& reporter) const;
+
+    // c115 SEH (D-WIN64-SEH-FUNCLETS): the __try/__except context rules —
+    // `_exception_code`/`_exception_info` builtin placement (H_SehBuiltinContext),
+    // no jump INTO a guarded region (H_SehJumpIntoRegion), the option-(C)
+    // single-exit guarded body (H_SehEarlyExit, D-CSUBSET-SEH-EARLY-EXIT), and
+    // no `&&label` into a __try (H_SehLabelAddress, D-CSUBSET-SEH-LABEL-ADDR).
+    // Zero-cost when the module has no SehTryExcept node.
+    void checkSehContext(DiagnosticReporter& reporter) const;
 
     // Declaration structure (HR4): a `Function`'s last child is its body `Block`
     // and its other children are parameter `VarDecl`s with no initializer; an

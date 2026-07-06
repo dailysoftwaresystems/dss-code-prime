@@ -7709,3 +7709,184 @@ TEST(MirLoweringCSubset, ArrayRvalueValueReadDecaysNeverLoads) {
     EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Gep), 3u)
         << "each va_list forward decays through its value-read arm's Gep";
 }
+
+// ── c115 SEH (D-WIN64-SEH-FUNCLETS): the MIR region skeleton ──────────────────
+
+namespace {
+// Every opcode in a whole function (all blocks), for the multi-block SEH shape.
+[[nodiscard]] std::vector<MirOpcode> allFuncOpcodes(Mir const& m, MirFuncId fn) {
+    std::vector<MirOpcode> out;
+    for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+        MirBlockId const b = m.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i)
+            out.push_back(m.instOpcode(m.blockInstAt(b, i)));
+    }
+    return out;
+}
+[[nodiscard]] MirInstId findOp(Mir const& m, MirFuncId fn, MirOpcode op) {
+    for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+        MirBlockId const b = m.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+            MirInstId const id = m.blockInstAt(b, i);
+            if (m.instOpcode(id) == op) return id;
+        }
+    }
+    return {};
+}
+} // namespace
+
+// The __try/__except lowers to the 5-opcode region skeleton, and the module is
+// MirVerifier-clean (checkSehStructure: filter/handler single-pred, matching
+// region payloads). This is the exact shape the c116 funclet lowering consumes.
+TEST(MirLoweringCSubset, SehTryExceptLowersToRegionSkeleton) {
+    auto L = lowerCSubset(
+        "int f(int *p) { int rc = 0; __try { rc = *p; } "
+        "__except (_exception_code()) { rc = 42; } return rc; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty()
+        ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+    auto const ops = allFuncOpcodes(m, fn);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::SehTryBegin), 1u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::SehFilterReturn), 1u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::SehTryEnd), 1u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::SehExceptionCode), 1u)
+        << "_exception_code() in the filter lowers to its dedicated op";
+
+    // SehTryBegin: a terminator with 2 successors [tryEntry, filterEntry]; the
+    // filter block ends in SehFilterReturn with the SAME region id.
+    MirInstId const begin = findOp(m, fn, MirOpcode::SehTryBegin);
+    ASSERT_TRUE(begin.valid());
+    MirBlockId const beginBlk = m.instBlock(begin);
+    auto const succs = m.blockSuccessors(beginBlk);
+    ASSERT_EQ(succs.size(), 2u);
+    MirBlockId const filterBB = succs[1];
+    MirInstId const fterm = m.blockInstAt(
+        filterBB, m.blockInstCount(filterBB) - 1);
+    EXPECT_EQ(m.instOpcode(fterm), MirOpcode::SehFilterReturn);
+    EXPECT_EQ(m.instPayload(fterm), m.instPayload(begin))
+        << "Begin and FilterReturn share the region id";
+
+    // MirVerifier-clean (checkSehStructure ran as part of verify()).
+    DiagnosticReporter vrep;
+    MirVerifier verifier{m, &L.model.lattice().interner()};
+    EXPECT_TRUE(verifier.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+}
+
+// Audit F6: the FULL shipped release pipeline runs over a SEH function and stays
+// MirVerifier-GREEN end to end. This is the pin that catches a missing rebuild-
+// helper arm (every pass rebuilds through MirFunctionRebuilder) or inliner
+// host-emit arm — a debug-path structural test would NOT (those abort only when
+// a pass actually rebuilds the SEH function). RED-on-disable: drop the
+// SehTryBegin/SehFilterReturn arm from mir_rebuild_helper.cpp → the first pass
+// std::aborts on this fixture.
+TEST(MirLoweringCSubset, SehSurvivesFullReleasePipeline) {
+    auto L = lowerCSubset(
+        "int g;\n"
+        "static int helper(int x) { return x + 1; }\n"   // an inline candidate
+        "int f(int *p) { int rc = helper(g); __try { rc = *p; } "
+        "__except (_exception_code() == 0) { rc = 42; } return rc; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    auto pipelineR = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(pipelineR.has_value());
+
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(L.mir.mir, **targetR,
+                                      L.model.lattice().interner(),
+                                      *pipelineR, rep);
+    EXPECT_TRUE(result.ok)
+        << "release pipeline over a SEH function must stay verifier-green: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    // The region skeleton survives (no pass elided it).
+    MirFuncId fFn{};
+    for (std::uint32_t fi = 0; fi < L.mir.mir.moduleFuncCount(); ++fi) {
+        if (findOp(L.mir.mir, L.mir.mir.funcAt(fi),
+                   MirOpcode::SehTryBegin).valid()) {
+            fFn = L.mir.mir.funcAt(fi);
+        }
+    }
+    ASSERT_TRUE(fFn.v != 0u);
+    auto const ops = allFuncOpcodes(L.mir.mir, fFn);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::SehTryBegin), 1u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::SehFilterReturn), 1u);
+}
+
+// mem2reg SKIPS a SEH-containing function: a local that would normally promote
+// to SSA stays in memory (an Alloca survives the release pipeline). Fault-time
+// locals must be memory-true. RED-on-disable: remove the SEH-skip guard in
+// mem2reg.cpp → rc promotes → 0 Allocas.
+TEST(MirLoweringCSubset, SehFunctionKeepsAllocasUnpromoted) {
+    auto L = lowerCSubset(
+        "int f(int *p) { int rc = 0; __try { rc = *p; } "
+        "__except (1) { rc = 42; } return rc; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    auto pipelineR = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(pipelineR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(L.mir.mir, **targetR,
+                                      L.model.lattice().interner(),
+                                      *pipelineR, rep);
+    ASSERT_TRUE(result.ok);
+
+    MirFuncId fFn{};
+    for (std::uint32_t fi = 0; fi < L.mir.mir.moduleFuncCount(); ++fi) {
+        if (findOp(L.mir.mir, L.mir.mir.funcAt(fi),
+                   MirOpcode::SehTryBegin).valid()) {
+            fFn = L.mir.mir.funcAt(fi);
+        }
+    }
+    ASSERT_TRUE(fFn.v != 0u);
+    auto const ops = allFuncOpcodes(L.mir.mir, fFn);
+    EXPECT_GE(countOpcode(ops, MirOpcode::Alloca), 1u)
+        << "mem2reg must skip a SEH function — rc stays in memory";
+}
+
+// Audit (c/F6): a __try nested INSIDE a loop stays MirVerifier-green. The "all
+// four SEH blocks are Linear" intent holds only in a straight-line body; here
+// the region's host/blocks can derive LoopHeader/LoopExit from CFG shape, and
+// the canonical marker re-derivation (rederiveStructCfMarkers after finish)
+// must keep stored==derived. RED-on-disable: hand-stamping a non-Linear SEH
+// block Linear-and-frozen would red checkDomination's marker-equality here.
+TEST(MirLoweringCSubset, SehInsideLoopStaysVerifierGreen) {
+    auto L = lowerCSubset(
+        "int f(int *p, int n) { int rc = 0; int i = 0; "
+        "while (i < n) { __try { rc = rc + *p; } "
+        "__except (1) { rc = 42; } i = i + 1; } return rc; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty()
+        ? "" : L.mirReporter.all()[0].actual);
+
+    // Straight-out-of-lowering the module must already be verifier-clean
+    // (checkDomination re-derives markers and compares stored==derived).
+    DiagnosticReporter vrep;
+    MirVerifier verifier{L.mir.mir, &L.model.lattice().interner()};
+    EXPECT_TRUE(verifier.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+
+    // And it survives the full release pipeline (marker re-derivation runs after
+    // every CFG-mutating pass).
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    auto pipelineR = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(pipelineR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(L.mir.mir, **targetR,
+                                      L.model.lattice().interner(),
+                                      *pipelineR, rep);
+    EXPECT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+}

@@ -40,13 +40,15 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
     // (`__va_list_tag` + `va_list`) injected into every c-subset CU's builtin scope
     // (D-FC12A-VARIADIC-CALLEE — gated on the schema declaring `vaArgRule`) + the
-    // 3 intrinsic builtin FUNCTIONS (SE6 builtinFunctions, minted into the same
+    // 5 intrinsic builtin FUNCTIONS (SE6 builtinFunctions, minted into the same
     // CU-wide builtins scope): c103 `__umulh` (D-CSUBSET-INTRINSIC-UMULH) + c104
     // `_InterlockedCompareExchange` (D-CSUBSET-INTRINSIC-ATOMIC-CAS) + c113
-    // `_ReadWriteBarrier` (D-CSUBSET-INTRINSIC-BARRIER).
-    ASSERT_EQ(model.symbols().size() - 1, 7u)
+    // `_ReadWriteBarrier` (D-CSUBSET-INTRINSIC-BARRIER) + c115 `_exception_code`
+    // + `_exception_info` (D-WIN64-SEH-FUNCLETS SEH intrinsics).
+    ASSERT_EQ(model.symbols().size() - 1, 9u)
         << "main + x + __va_list_tag + va_list + __umulh + "
-           "_InterlockedCompareExchange + _ReadWriteBarrier";
+           "_InterlockedCompareExchange + _ReadWriteBarrier + "
+           "_exception_code + _exception_info";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xRec = &model.symbols()[i];
@@ -1136,10 +1138,10 @@ TEST(SemanticAnalyzerCSubset, NestedBlocksShadowWithoutRedecl) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
         << "different blocks → different scopes → no shadow redecl";
     // main (function) + two distinct `x` symbols (one per block scope) + the 2
-    // FC12a-core builtin TYPES (__va_list_tag + va_list) + the 3 intrinsic
+    // FC12a-core builtin TYPES (__va_list_tag + va_list) + the 5 intrinsic
     // builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
-    // _ReadWriteBarrier).
-    EXPECT_EQ(model.symbols().size() - 1, 8u);
+    // _ReadWriteBarrier + c115 _exception_code + _exception_info).
+    EXPECT_EQ(model.symbols().size() - 1, 10u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -1155,10 +1157,10 @@ TEST(SemanticAnalyzerCSubset, ForwardReferenceWithinBlock) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 
     // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
-    // (__va_list_tag + va_list) + the 3 intrinsic builtins (c103 __umulh +
-    // c104 _InterlockedCompareExchange + c113 _ReadWriteBarrier). Find x by
-    // name.
-    ASSERT_EQ(model.symbols().size() - 1, 7u);
+    // (__va_list_tag + va_list) + the 5 intrinsic builtins (c103 __umulh +
+    // c104 _InterlockedCompareExchange + c113 _ReadWriteBarrier + c115
+    // _exception_code + _exception_info). Find x by name.
+    ASSERT_EQ(model.symbols().size() - 1, 9u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -3390,10 +3392,11 @@ TEST(SemanticAnalyzerCSubset, ValueStarValueStaysExpressionStatement) {
     });
     EXPECT_FALSE(model.hasErrors());
     // main + a + b + the 2 FC12a-core builtin TYPES (__va_list_tag + va_list) + the
-    // 3 intrinsic builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
-    // _ReadWriteBarrier) — the multiplication must mint NO symbol.
-    EXPECT_EQ(model.symbols().size() - 1, 8u)
-        << "main + a + b + __va_list_tag + va_list + the 3 intrinsic builtins — "
+    // 5 intrinsic builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
+    // _ReadWriteBarrier + c115 _exception_code + _exception_info) — the
+    // multiplication must mint NO symbol.
+    EXPECT_EQ(model.symbols().size() - 1, 10u)
+        << "main + a + b + __va_list_tag + va_list + the 5 intrinsic builtins — "
            "the multiplication mints none";
 }
 

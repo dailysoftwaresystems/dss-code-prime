@@ -675,6 +675,16 @@ enum class BuiltinLowering : std::uint16_t {
     // side-effecting zero-operand MIR op (MirOpcode::CompilerBarrier) that the
     // CSE/LICM clobber walk treats as a full memory clobber.
     Barrier,
+    // c115 (SEH arc 2/3, D-WIN64-SEH-FUNCLETS): the two MSVC SEH intrinsics —
+    // excpt.h's `_exception_code()` (→ u32, the exception code) and
+    // `_exception_info()` (→ void*, the EXCEPTION_POINTERS). Legal ONLY inside
+    // an `__except` filter expression (_exception_code also in the handler
+    // body) — HirVerifier::checkSehContext enforces it. Each lowers to a
+    // dedicated zero-operand value MIR op (SehExceptionCode / SehExceptionInfo)
+    // that the c116 funclet lowering wires to the __C_specific_handler dispatch
+    // context; until then mir_to_lir fails loud on them.
+    SehExceptionCode,
+    SehExceptionInfo,
 };
 
 // Resolve the config `lowering` name to its BuiltinLowering. nullopt = an unknown
@@ -685,6 +695,8 @@ builtinLoweringFromName(std::string_view name) noexcept {
     if (name == "umulh")      { return BuiltinLowering::UMulHigh;  }
     if (name == "atomic_cas") { return BuiltinLowering::AtomicCas; }
     if (name == "barrier")    { return BuiltinLowering::Barrier;   }
+    if (name == "seh_exception_code") { return BuiltinLowering::SehExceptionCode; }
+    if (name == "seh_exception_info") { return BuiltinLowering::SehExceptionInfo; }
     return std::nullopt;
 }
 

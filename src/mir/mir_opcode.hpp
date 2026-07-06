@@ -183,6 +183,27 @@ enum class MirOpcode : std::uint16_t {
     // the indirect predecessor (MF-1; blockSuccessors is generic, so RPO/preds/
     // dominators/verifier handle it like any variadic-successor terminator).
     IndirectBr,
+    // ── c115 SEH (D-WIN64-SEH-FUNCLETS): MSVC `__try { … } __except (f) { … }`.
+    // The region skeleton in a flat CFG:
+    //   SehTryBegin — a 0-operand TERMINATOR with exactly 2 successors
+    //     [tryEntry, filterEntry]; payload = the per-function SEH region id.
+    //     The filter/handler blocks hang off the CFG here (reachable, dominated);
+    //     the tryEntry edge is the normal path. In the clobber list: fault-time
+    //     memory state must be ordered at the region boundary.
+    //   SehFilterReturn — the filter block's TERMINATOR: operand[0] = the i32
+    //     filter value (EXECUTE_HANDLER 1 / CONTINUE_SEARCH 0 / CONTINUE_EXEC -1),
+    //     1 successor [handlerEntry]; payload = the region id. In the clobber
+    //     list (audit F1): on x64 SEH, INNER termination handlers run BETWEEN
+    //     filter evaluation and handler entry (RtlUnwindEx phase 2), so a load
+    //     may not be CSE'd from filter into handler.
+    //   SehTryEnd — a 0-operand side-effecting MARKER at the guarded body's
+    //     single fall-through exit (option (C): D-CSUBSET-SEH-EARLY-EXIT keeps
+    //     it the ONLY exit); payload = the region id. In the clobber list.
+    //   SehExceptionCode / SehExceptionInfo — 0-operand VALUE ops (u32 / ptr):
+    //     the `_exception_code()` / `_exception_info()` intrinsics, wired to the
+    //     __C_specific_handler dispatch context by the c116 funclet lowering.
+    // Until c116, mir_to_lir FAILS LOUD on all five (every target).
+    SehTryBegin, SehFilterReturn, SehTryEnd, SehExceptionCode, SehExceptionInfo,
     // ── SIMD (reserved post-v1; vocabulary fixed now) ──
     VAdd, VSub, VMul, VShuffle, VExtract, VInsert,
 
@@ -420,6 +441,19 @@ struct MirOpcodeInfo {
         case MirOpcode::Return:      return {0, N, 0, 0, R::None, true, true, false, "return"};
         case MirOpcode::Unreachable: return {0, 0, 0, 0, R::None, true, true, false, "unreachable"};
 
+        // c115 SEH (D-WIN64-SEH-FUNCLETS). SehTryBegin: terminator, successors
+        // [tryEntry, filterEntry] (the CondBr shape, 0 operands). SehFilterReturn:
+        // terminator, operand [filterValue i32], successor [handlerEntry].
+        // SehTryEnd: the guarded body's fall-through marker (CompilerBarrier's
+        // shape). SehExceptionCode/Info: 0-operand value intrinsics (side-
+        // effecting so DCE keeps and CSE never merges them — their value is
+        // dispatch-context state, not a pure function).
+        case MirOpcode::SehTryBegin:      return {0, 0, 2, 2, R::None, true, true, false, "seh_try_begin"};
+        case MirOpcode::SehFilterReturn:  return {1, 1, 1, 1, R::None, true, true, false, "seh_filter_return"};
+        case MirOpcode::SehTryEnd:        return {0, 0, 0, 0, R::None, false, true, false, "seh_try_end"};
+        case MirOpcode::SehExceptionCode: return {0, 0, 0, 0, R::Value, false, true, false, "seh_exception_code"};
+        case MirOpcode::SehExceptionInfo: return {0, 0, 0, 0, R::Value, false, true, false, "seh_exception_info"};
+
         // SIMD (reserved — provisional arities).
         case MirOpcode::VAdd:     return {2, 2, 0, 0, R::Value, false, false, false, "vadd"};
         case MirOpcode::VSub:     return {2, 2, 0, 0, R::Value, false, false, false, "vsub"};
@@ -499,6 +533,16 @@ struct MirOpcodeInfo {
         case MirOpcode::IntrinsicCall:
         case MirOpcode::AtomicCas:
         case MirOpcode::CompilerBarrier:
+        // c115 SEH region boundaries: memory state must be exactly ordered at
+        // SehTryBegin (the filter/handler observe fault-time memory — pre-try
+        // loads may not be forwarded past it) and SehTryEnd. SehFilterReturn is
+        // in the list per the c115 design-audit F1: on x64 SEH, INNER frames'
+        // termination handlers execute BETWEEN filter evaluation and handler
+        // entry (RtlUnwindEx phase 2), so a load may not be CSE'd from the
+        // filter block into the handler block across it.
+        case MirOpcode::SehTryBegin:
+        case MirOpcode::SehTryEnd:
+        case MirOpcode::SehFilterReturn:
             return true;
         default:
             return false;

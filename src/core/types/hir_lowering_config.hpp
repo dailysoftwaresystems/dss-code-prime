@@ -157,6 +157,14 @@ struct DSS_EXPORT HirLoweringConfig {
     RuleId        caseStmtRule{};      std::string caseStmtRuleName;
     SchemaTokenId caseDefaultToken{};  std::string caseDefaultTokenName;
 
+    // c115 SEH (both optional — unset for languages without `__try`): the two
+    // handler-arm sub-rules of the try statement. The engine identifies which
+    // arm parsed by RULE identity: the except arm carries [filterExpr, block]
+    // children; the finally arm is the trigger-gated fail-loud
+    // (D-CSUBSET-SEH-FINALLY — no shipped consumer).
+    RuleId        sehExceptArmRule{};  std::string sehExceptArmRuleName;
+    RuleId        sehFinallyArmRule{}; std::string sehFinallyArmRuleName;
+
     // Char / string literal lowering. A value-bearing body literal materializes
     // in an operand as a small subtree [startToken, bodyToken] where bodyToken
     // is the COALESCED body (one in-grammar token; see DefaultTokenSpec.coalesce).

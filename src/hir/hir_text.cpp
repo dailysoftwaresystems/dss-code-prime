@@ -609,6 +609,14 @@ private:
                 if (auto e = hir_.ifElse(id)) { out_ += indent(ind); out_ += "else\n"; emitNodeLine(*e, ind + 1); }
                 return;
             }
+            case HirKind::SehTryExcept:
+                // c115 SEH: `seh_try` <tryBody> `seh_except (` filter `)` <handler>.
+                out_ += "seh_try"; out_ += flagsStr(f); out_ += '\n';
+                emitNodeLine(hir_.sehTryBody(id), ind + 1);
+                out_ += indent(ind); out_ += "seh_except (";
+                emitExpr(hir_.sehTryFilter(id)); out_ += ")\n";
+                emitNodeLine(hir_.sehTryHandler(id), ind + 1);
+                return;
             case HirKind::WhileStmt:
                 out_ += "while"; out_ += flagsStr(f); out_ += " (";
                 emitExpr(*hir_.loopCondition(id)); out_ += ")\n";
@@ -1653,6 +1661,15 @@ private:
             std::optional<HirNodeId> els;
             if (acceptKeyword("else")) els = parseNode();
             return builder_.makeIfStmt(cond, then, els, flags);
+        }
+        if (kw == "seh_try") {
+            // c115 SEH round-trip: `seh_try` <tryBody> `seh_except (` filter `)`
+            // <handler> — mirrors the writer arm exactly.
+            HirNodeId tryBody = parseNode();
+            if (!acceptKeyword("seh_except")) malformed("expected 'seh_except'");
+            expect(Tk::LParen, "'('"); HirNodeId filter = parseNode(); expect(Tk::RParen, "')'");
+            HirNodeId handler = parseNode();
+            return builder_.makeSehTryExcept(tryBody, filter, handler, flags);
         }
         if (kw == "while") {
             expect(Tk::LParen, "'('"); HirNodeId cond = parseNode(); expect(Tk::RParen, "')'");

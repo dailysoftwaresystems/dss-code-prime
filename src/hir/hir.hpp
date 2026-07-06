@@ -104,6 +104,11 @@ public:
     [[nodiscard]] HirNodeId                ifThen(HirNodeId id)      const;
     [[nodiscard]] std::optional<HirNodeId> ifElse(HirNodeId id)     const;
 
+    // c115 SEH try-except: guarded body, filter expression, handler body.
+    [[nodiscard]] HirNodeId sehTryBody(HirNodeId id)    const;
+    [[nodiscard]] HirNodeId sehTryFilter(HirNodeId id)  const;
+    [[nodiscard]] HirNodeId sehTryHandler(HirNodeId id) const;
+
     // Loop-kind-agnostic over While/DoWhile/For: the body (always present) and
     // the condition (optional — a For may omit it).
     [[nodiscard]] HirNodeId                loopBody(HirNodeId id)      const;
@@ -438,6 +443,12 @@ public:
     HirNodeId makeIfStmt(HirNodeId cond, HirNodeId thenStmt,
                          std::optional<HirNodeId> elseStmt = std::nullopt,
                          HirFlags flags = HirFlags::None);
+
+    // c115 SEH: __try tryBody __except (filterExpr) handlerBody —
+    // children [tryBody, filterExpr, handlerBody] (fixed arity 3).
+    HirNodeId makeSehTryExcept(HirNodeId tryBody, HirNodeId filterExpr,
+                               HirNodeId handlerBody,
+                               HirFlags flags = HirFlags::None);
 
     // while (cond) body — children [cond, body].
     HirNodeId makeWhileStmt(HirNodeId cond, HirNodeId body, HirFlags flags = HirFlags::None);

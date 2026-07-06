@@ -449,6 +449,12 @@ HirNodeId HirBuilder::makeIfStmt(HirNodeId cond, HirNodeId thenStmt,
     return addParent(HirKind::IfStmt, kids, InvalidType, /*payload=*/0, flags);
 }
 
+HirNodeId HirBuilder::makeSehTryExcept(HirNodeId tryBody, HirNodeId filterExpr,
+                                       HirNodeId handlerBody, HirFlags flags) {
+    HirNodeId const kids[] = {tryBody, filterExpr, handlerBody};
+    return addParent(HirKind::SehTryExcept, kids, InvalidType, /*payload=*/0, flags);
+}
+
 HirNodeId HirBuilder::makeWhileStmt(HirNodeId cond, HirNodeId body, HirFlags flags) {
     HirNodeId const kids[] = {cond, body};
     return addParent(HirKind::WhileStmt, kids, InvalidType, /*payload=*/0, flags);
@@ -612,6 +618,18 @@ HirNodeId Hir::childAt(HirNodeId id, std::uint32_t i) const {
 HirNodeId Hir::ifCondition(HirNodeId id) const {
     assert(kind(id) == HirKind::IfStmt);
     return childAt(id, 0);
+}
+HirNodeId Hir::sehTryBody(HirNodeId id) const {
+    assert(kind(id) == HirKind::SehTryExcept);
+    return childAt(id, 0);
+}
+HirNodeId Hir::sehTryFilter(HirNodeId id) const {
+    assert(kind(id) == HirKind::SehTryExcept);
+    return childAt(id, 1);
+}
+HirNodeId Hir::sehTryHandler(HirNodeId id) const {
+    assert(kind(id) == HirKind::SehTryExcept);
+    return childAt(id, 2);
 }
 HirNodeId Hir::ifThen(HirNodeId id) const {
     assert(kind(id) == HirKind::IfStmt);

@@ -3564,7 +3564,7 @@ struct Lowerer {
     // in the frame fields `c0`/`c1`.
     struct StmtFrame {
         enum class Kind : std::uint8_t { PassThrough, Block, If, While, For,
-                                         Label, Switch, CaseMarker } kind;
+                                         Label, Switch, CaseMarker, SehTry } kind;
         NodeId        node;     // the source node (provenance / combine anchor)
         std::uint8_t  phase;
         bool          doWhile;  // While frame: DoWhileStmt vs WhileStmt
@@ -3676,6 +3676,32 @@ struct Lowerer {
                 StmtFrame fr{.kind = StmtFrame::Kind::If, .node = n};
                 ifPrologue(n, fr.condId, fr.n0, fr.n1);   // cond lowered INLINE here
                 work.push_back(fr);
+                return;
+            }
+            // c115 SEH: __try block __except (filter) block. Field reuse on the
+            // frame: n0 = try block node, condNode = filter EXPR node (lowered
+            // inline at phase 1, in SOURCE order — after the try body), n1 =
+            // handler block node, c0 = lowered try body, condId = lowered filter.
+            if (k == "SehTryExcept") {
+                StmtFrame fr{.kind = StmtFrame::Kind::SehTry, .node = n};
+                NodeId finallyArm{};
+                if (!sehPrologue(n, fr.n0, fr.condNode, fr.n1, finallyArm)) {
+                    unsupported(finallyArm.valid() ? finallyArm : n,
+                                "SEH '__try { } __finally { }' termination handlers "
+                                "are not supported (D-CSUBSET-SEH-FINALLY: "
+                                "trigger-gated — no shipped consumer; sqlite uses "
+                                "only __except)");
+                    stmtResult = errorNode(n);
+                    return;
+                }
+                work.push_back(fr);
+                return;
+            }
+            if (k == "SehLeave") {
+                unsupported(n, "SEH '__leave' is not supported "
+                               "(D-CSUBSET-SEH-LEAVE: trigger-gated — no shipped "
+                               "consumer; sqlite does not use it)");
+                stmtResult = errorNode(n);
                 return;
             }
             if (k == "WhileStmt" || k == "DoWhileStmt") {
@@ -3887,6 +3913,41 @@ struct Lowerer {
                         haveThen ? thenH
                                  : reportedError(node2, "if statement has no then-branch");
                     stmtResult = track(builder.makeIfStmt(condFinal, thenFinal, els), node2);
+                }
+                break;
+            case StmtFrame::Kind::SehTry:
+                // c115 SEH, source order: try body (phase 0→1), filter expression
+                // INLINE at phase 1 (expressions are host-recursive — the same
+                // discipline as ifPrologue's cond, they never touch `work`),
+                // handler body (phase 1→2), then the finish. Missing pieces
+                // substitute reportedError at the finish (the If discipline).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const tryN = f.n0;
+                    if (tryN.valid()) { enterStmt(tryN); break; }  // may invalidate `f`
+                }
+                if (f.phase == 1) {
+                    f.phase = 2;
+                    if (f.n0.valid()) f.c0 = stmtResult;   // try-body result
+                    NodeId const filterN = f.condNode;
+                    if (filterN.valid()) f.condId = lowerExpr(filterN).id;
+                    NodeId const handlerN = f.n1;
+                    if (handlerN.valid()) { enterStmt(handlerN); break; }  // may invalidate `f`
+                }
+                {
+                    NodeId const node2 = f.node;
+                    HirNodeId const tryH = f.n0.valid()
+                        ? f.c0
+                        : reportedError(node2, "SEH __try has no guarded block");
+                    HirNodeId const filterH = f.condId.valid()
+                        ? f.condId
+                        : reportedError(node2, "SEH __except has no filter expression");
+                    HirNodeId const handlerH = f.n1.valid()
+                        ? stmtResult
+                        : reportedError(node2, "SEH __except has no handler block");
+                    work.pop_back();
+                    stmtResult = track(
+                        builder.makeSehTryExcept(tryH, filterH, handlerH), node2);
                 }
                 break;
             case StmtFrame::Kind::While:
@@ -5608,6 +5669,54 @@ struct Lowerer {
             }
         }
         if (!haveCond) condId = HirNodeId{};   // invalid → finish emits orError
+    }
+
+    // c115 SEH prologue: extract the three pieces of a `sehTryStmt` CST node —
+    // the guarded `block`, the handler ARM (except vs finally, identified by RULE
+    // via cfg.sehExceptArmRule/sehFinallyArmRule), and for the except arm its
+    // [filterExpr, handlerBlock] children. The arm may sit under the `sehHandler`
+    // alt wrapper OR appear directly (parser-shape-agnostic): the finder checks
+    // rule identity BEFORE each single-child descent — a blind peel would fall
+    // THROUGH the finally arm (whose sole meaningful child is its block).
+    // Returns false for the finally arm (the caller emits the D-CSUBSET-SEH-FINALLY
+    // fail-loud). Missing pieces are left invalid — the finish substitutes
+    // reportedError nodes (the ifPrologue error-deferral discipline).
+    [[nodiscard]] bool sehPrologue(NodeId node, NodeId& tryBlockN,
+                                   NodeId& filterN, NodeId& handlerBlockN,
+                                   NodeId& finallyArmN) {
+        NodeId handlerChild{};
+        for (NodeId c : visible(node)) {
+            if (isToken(c)) continue;
+            if (!tryBlockN.valid()) { tryBlockN = c; continue; }
+            if (!handlerChild.valid()) { handlerChild = c; break; }
+        }
+        // Find the arm: descend through single-child wrappers, checking rule
+        // identity at each level first.
+        NodeId arm = handlerChild;
+        for (int guard = 0; guard < 8 && arm.valid(); ++guard) {
+            if (switchIsRuleNode(arm, cfg.sehExceptArmRule)
+                || switchIsRuleNode(arm, cfg.sehFinallyArmRule)) break;
+            NodeId only{}; int meaningful = 0;
+            for (NodeId c : visible(arm)) {
+                if (isToken(c)) continue;
+                only = c; ++meaningful;
+            }
+            if (meaningful != 1) break;
+            arm = only;
+        }
+        if (arm.valid() && switchIsRuleNode(arm, cfg.sehFinallyArmRule)) {
+            finallyArmN = arm;
+            return false;
+        }
+        if (arm.valid() && switchIsRuleNode(arm, cfg.sehExceptArmRule)) {
+            for (NodeId c : visible(arm)) {
+                if (isToken(c)) continue;
+                Role const role = classify(c);
+                if (role == Role::Expr && !filterN.valid()) filterN = c;
+                else if (role == Role::Stmt && !handlerBlockN.valid()) handlerBlockN = c;
+            }
+        }
+        return true;
     }
 
     // The `lowerStmt` driver flattens `if` through an If frame; this recursive

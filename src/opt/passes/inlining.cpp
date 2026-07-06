@@ -332,6 +332,20 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
             // release.pipeline.json (which runs Inlining).
             if (op == MirOpcode::BlockAddress) return std::nullopt;
             if (op == MirOpcode::IndirectBr) return std::nullopt;
+            // c115 SEH (D-WIN64-SEH-FUNCLETS): refuse to inline a callee that
+            // contains ANY SEH region op. Splicing a __try region into a caller
+            // would (a) collide function-scoped region ids with the caller's
+            // (a twice-inlined callee duplicates its ids), and (b) at c116
+            // require merging the callee's scope-table entries into the
+            // caller's .xdata — machinery with zero consumers. MSVC parity:
+            // it does not inline functions containing SEH either. Fail-SAFE
+            // (forgoes the optimization, never miscompiles).
+            if (op == MirOpcode::SehTryBegin || op == MirOpcode::SehFilterReturn
+                || op == MirOpcode::SehTryEnd
+                || op == MirOpcode::SehExceptionCode
+                || op == MirOpcode::SehExceptionInfo) {
+                return std::nullopt;
+            }
             if (op == MirOpcode::Return
                 && mir.instOperands(cid).size() > 1) {
                 return std::nullopt;
@@ -1271,6 +1285,23 @@ private:
     return false;
 }
 
+// c115 SEH (D-WIN64-SEH-FUNCLETS): true iff `f` contains a SEH region opener.
+// A SEH-containing HOST must route through the single-block rebuild path (the
+// computed-goto discipline): MirFunctionRebuilder::emitTerminator carries the
+// SehTryBegin/SehFilterReturn clone arms, while MultiBlockInliner's caller-host
+// emit would abort on them. (SEH CALLEES are refused at the legality gate;
+// this predicate is about the CALLER hosting an inline of an ordinary callee.)
+[[nodiscard]] bool functionHasSeh(Mir const& mir, MirFuncId f) {
+    std::uint32_t const nb = mir.funcBlockCount(f);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const b = mir.funcBlockAt(f, bi);
+        if (mir.instOpcode(mir.blockTerminator(b)) == MirOpcode::SehTryBegin) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // True iff `caller`'s inline plan contains at least one MULTI-BLOCK
 // callee — the signal to route this function through the multi-block
 // rebuild rather than the cycle-1 `tryRewrite` path.
@@ -1333,7 +1364,10 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
         // routed through the single-block path (which remaps BlockAddress/
         // IndirectBr correctly), NEVER the MultiBlockInliner (whose caller-host
         // emit would mis-copy the block-id payload / abort on IndirectBr).
-        if (!functionHasComputedGoto(mir, f)
+        // c115 SEH: a SEH-containing host routes the same way — the rebuild
+        // path carries the SehTryBegin/SehFilterReturn clone arms the
+        // MultiBlockInliner's caller-host emit lacks (D-WIN64-SEH-FUNCLETS).
+        if (!functionHasComputedGoto(mir, f) && !functionHasSeh(mir, f)
             && planHasMultiBlock(mir, analysis, f, plan, inlineThreshold)) {
             MultiBlockInliner mb{mir, builder, plan};
             mb.rebuildFunction(f);

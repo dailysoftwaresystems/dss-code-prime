@@ -1381,6 +1381,58 @@ TEST(MirToLir, RequiredLirOpcodeMissingFailsLoud) {
         << "L_RequiredLirOpcodeMissing must fire ONCE per mnemonic, not per inst";
 }
 
+// c115 SEH (D-WIN64-SEH-FUNCLETS): the honest c115 boundary — the SEH region
+// ops fail LOUD at mir_to_lir on EVERY target (the x64 funclet lowering is c116)
+// with the anchor named in the message. RED-on-disable: a `case SehTryBegin:
+// return;` no-op would silently drop the region → the exception is never caught.
+TEST(MirToLir, SehOpcodesFailLoudCitingC116Anchor) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const i32   = interner.primitive(::dss::TypeKind::I32);
+    auto const fnSig = interner.fnSig(std::span<::dss::TypeId const>{}, i32, ::dss::CallConv::CcSysV);
+
+    // A minimal region skeleton: entry SehTryBegin(id) -> [try, filter];
+    // try: SehTryEnd + Br(join); filter: SehFilterReturn(v) -> handler;
+    // handler: Br(join); join: return.
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const entry   = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    ::dss::MirBlockId const tryBB   = mb.createBlock(::dss::StructCfMarker::Linear);
+    ::dss::MirBlockId const filterBB= mb.createBlock(::dss::StructCfMarker::Linear);
+    ::dss::MirBlockId const handBB  = mb.createBlock(::dss::StructCfMarker::Linear);
+    ::dss::MirBlockId const joinBB  = mb.createBlock(::dss::StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    mb.addSehTryBegin(tryBB, filterBB, /*regionId=*/0);
+    mb.beginBlock(tryBB);
+    mb.addInst(::dss::MirOpcode::SehTryEnd, {}, ::dss::InvalidType, /*payload=*/0);
+    mb.addBr(joinBB);
+    mb.beginBlock(filterBB);
+    ::dss::MirInstId const code = mb.addInst(::dss::MirOpcode::SehExceptionCode, {}, i32);
+    mb.addSehFilterReturn(code, handBB, /*regionId=*/0);
+    mb.beginBlock(handBB);
+    mb.addBr(joinBB);
+    mb.beginBlock(joinBB);
+    ::dss::MirLiteralValue lv; lv.value = static_cast<std::int64_t>(0); lv.core = ::dss::TypeKind::I32;
+    mb.addReturn(mb.addConst(lv, i32));
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    EXPECT_FALSE(result.ok);
+    bool sawAnchor = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode
+            && d.actual.find("D-WIN64-SEH-FUNCLETS") != std::string::npos) {
+            sawAnchor = true;
+        }
+    }
+    EXPECT_TRUE(sawAnchor)
+        << "a SEH region op must fail loud citing D-WIN64-SEH-FUNCLETS (c116)";
+}
+
 TEST(MirToLir, UnsupportedMirOpcodeFailsLoud) {
     // Cycle 3e lowers Call/IntrinsicCall/GlobalAddr + degenerate
     // ExtractValue/InsertValue. Still-deferred: float comparisons

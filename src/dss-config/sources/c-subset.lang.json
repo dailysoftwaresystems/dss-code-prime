@@ -310,7 +310,12 @@
     { "word": "extern",  "kind": "ExternKeyword"  },
 
     { "word": "static",        "kind": "StaticKeyword"    },
-    { "word": "__attribute__", "kind": "AttributeKeyword" }
+    { "word": "__attribute__", "kind": "AttributeKeyword" },
+
+    { "word": "__try",     "kind": "TryKeyword"     },
+    { "word": "__except",  "kind": "ExceptKeyword"  },
+    { "word": "__finally", "kind": "FinallyKeyword" },
+    { "word": "__leave",   "kind": "LeaveKeyword"   }
   ],
 
   "shapes": {
@@ -811,6 +816,8 @@
         "returnStmt",
         "gotoStmt",
         "caseStmt",
+        "sehTryStmt",
+        "sehLeaveStmt",
         "emptyStmt",
         "declOrExprStmt"
       ]
@@ -906,6 +913,39 @@
     },
 
     "caseStmt": { "sequence": [ "caseLabel", "statement" ] },
+
+    "sehTryStmt": {
+      "$comment": "c115 (SEH arc 2/3): MSVC `__try compound-statement (__except '(' expr ')' compound-statement | __finally compound-statement)` — learn.microsoft.com/cpp/cpp/try-except-statement. FIRST = {TryKeyword}, disjoint from every other statement alt -> unique-production direct descent, NON-speculative; the except/finally fork is disambiguated one level down by sehHandler's own disjoint FIRSTs (ExceptKeyword vs FinallyKeyword). Both bodies REUSE the `block` rule — MSVC requires compound statements (braces), so the grammar enforces it by construction. The filter expression is an ordinary `expression`; its special context (where _exception_code()/_exception_info() are legal) is a SEMANTIC property checked at CST->HIR lowering + the HIR verifier, not a grammar one. __finally parses (so the diagnostic is a positioned lowering fail-loud citing D-CSUBSET-SEH-FINALLY, not a raw P0001 cascade) but has NO consumer (sqlite ground-truth: zero uses) — trigger-gated.",
+      "sequence": [
+        "TryKeyword",
+        "block",
+        "sehHandler"
+      ]
+    },
+
+    "sehHandler": {
+      "alt": [ "sehExceptArm", "sehFinallyArm" ]
+    },
+
+    "sehExceptArm": {
+      "sequence": [
+        "ExceptKeyword",
+        "ParenOpen", "expression", "ParenClose",
+        "block"
+      ]
+    },
+
+    "sehFinallyArm": {
+      "sequence": [
+        "FinallyKeyword",
+        "block"
+      ]
+    },
+
+    "sehLeaveStmt": {
+      "$comment": "c115: `__leave ;` parses (FIRST = {LeaveKeyword}, disjoint) so the diagnostic is a positioned lowering fail-loud citing D-CSUBSET-SEH-LEAVE rather than a parse cascade. NO consumer (sqlite: zero uses) — trigger-gated; the lowering rejects it.",
+      "sequence": [ "LeaveKeyword", "EndStatement" ]
+    },
 
 
     "exprStmt": { "sequence": [ "expression", "EndStatement" ] },
@@ -1281,7 +1321,9 @@
     "builtinFunctions": [
       { "name": "__umulh", "params": ["U64", "U64"], "result": "U64", "lowering": "umulh" },
       { "name": "_InterlockedCompareExchange", "signature": "fn(ptr<i32>, i32, i32) -> i32", "lowering": "atomic_cas" },
-      { "name": "_ReadWriteBarrier", "signature": "fn() -> void", "lowering": "barrier" }
+      { "name": "_ReadWriteBarrier", "signature": "fn() -> void", "lowering": "barrier" },
+      { "name": "_exception_code", "signature": "fn() -> u32", "lowering": "seh_exception_code" },
+      { "name": "_exception_info", "signature": "fn() -> ptr<void>", "lowering": "seh_exception_info" }
     ],
     "$builtinAtomicCasComment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): `_InterlockedCompareExchange(LONG volatile* dest, LONG exch, LONG comp) -> LONG` -- the MSVC atomic compare-and-swap intrinsic (returns the ORIGINAL *dest; stores exch iff original==comp). Win32 LONG = i32 (LLP64) -> the 32-bit CAS. The UNDERSCORE name is the real intrinsic exactly as the Windows SDK spells it; windows.json's `InterlockedCompareExchange` macro expands to it (the winnt.h convention), so sqlite's `#if defined(InterlockedCompareExchange)` takes the direct-intrinsic path and its calls land here. `signature` (full type-text, c104) instead of scalar params: the dest param is a POINTER. Lowers to x86 `lock cmpxchg` (implicit-RAX comparand/old) / an arm64 LDAXR-STLXR acquire-release loop.",
     "$builtinTypesComment": "FC3 c1: the TEXT-keyed type-name table (typedef-style positions + the load-time fallback for single-word ladder/promotion names). The KEYWORD grammar path resolves through semantics.typeSpecifiers below (the C 6.7.2 multiset table) — both tables declare the SAME widths, and `long` carries the LLP64 override on BOTH so the two paths can never disagree (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH).",
@@ -1406,9 +1448,14 @@
       { "rule": "gotoIndirect", "hirKind": "IndirectGotoStmt" },
       { "rule": "labelStmt",    "hirKind": "LabelStmt"   },
       { "rule": "caseStmt",     "hirKind": "CaseStmt"    },
+      { "rule": "sehTryStmt",   "hirKind": "SehTryExcept" },
+      { "rule": "sehLeaveStmt", "hirKind": "SehLeave"    },
       { "rule": "emptyStmt",    "hirKind": "Skip"        },
       { "rule": "exprStmt",     "hirKind": "ExprStmt"    }
     ],
+
+    "sehExceptArmRule":  "sehExceptArm",
+    "sehFinallyArmRule": "sehFinallyArm",
 
     "binaryExprRule":  "binaryExpr",
     "unaryExprRule":   "unaryExpr",

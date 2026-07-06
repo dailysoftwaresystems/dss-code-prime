@@ -413,6 +413,24 @@ void MirFunctionRebuilder::emitTerminator(MirOpcode op, MirInstId oldId) {
             remember(newId);
             return;
         }
+        case MirOpcode::SehTryBegin: {
+            // c115 SEH (D-WIN64-SEH-FUNCLETS): succs [tryEntry, filterEntry];
+            // the region-id payload clones VERBATIM (region ids are function-
+            // scoped and rebuilds are whole-function, so no renumbering).
+            MirInstId const newId = dst_.addSehTryBegin(
+                mapSucc(oldSucc[0]), mapSucc(oldSucc[1]),
+                src_.instPayload(oldId));
+            remember(newId);
+            return;
+        }
+        case MirOpcode::SehFilterReturn: {
+            // operand [filterValue i32]; succ [handlerEntry]; payload verbatim.
+            MirInstId const newId = dst_.addSehFilterReturn(
+                mapOperand(oldOps[0]), mapSucc(oldSucc[0]),
+                src_.instPayload(oldId));
+            remember(newId);
+            return;
+        }
         default:
             std::fprintf(stderr,
                 "dss::opt::passes::MirFunctionRebuilder fatal: emitTerminator: "

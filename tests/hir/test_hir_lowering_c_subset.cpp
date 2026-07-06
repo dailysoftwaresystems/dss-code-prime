@@ -4185,3 +4185,106 @@ TEST(HirLoweringCSubset, ArrayComparisonConditionOperandsDecayToPointer) {
         expectDecayCast(kids[0], HirKind::Ref, "`!` operand (g)");
     }
 }
+
+// ── c115 SEH (D-WIN64-SEH-FUNCLETS): the __try/__except frontend ──────────────
+
+// The guarded body, filter expression, and handler body lower to a core
+// SehTryExcept node {tryBody Block, filterExpr, handlerBody Block}. This is the
+// structural shape the c116 x64 funclet lowering consumes.
+TEST(HirLoweringCSubset, SehTryExceptLowersToCoreNode) {
+    SemanticModel model = analyzeCSubset(
+        "int f(int *p) { int rc = 0; __try { rc = *p; } "
+        "__except (1) { rc = 42; } return rc; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    HirNodeId const seh =
+        findFirstByKind(res->hir, res->hir.functionBody(fn), HirKind::SehTryExcept);
+    ASSERT_TRUE(seh.valid()) << "a SehTryExcept node must be emitted";
+    auto const kids = res->hir.children(seh);
+    ASSERT_EQ(kids.size(), 3u) << "[tryBody, filterExpr, handlerBody]";
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Block)   << "guarded body is a Block";
+    EXPECT_EQ(res->hir.kind(kids[2]), HirKind::Block)   << "handler body is a Block";
+    // The filter (child 1) is an expression, not a statement Block.
+    EXPECT_NE(res->hir.kind(kids[1]), HirKind::Block)   << "filter is an expression";
+}
+
+// `_exception_code()` in the filter expression is LEGAL (the canonical use).
+TEST(HirLoweringCSubset, SehExceptionCodeInFilterIsLegal) {
+    SemanticModel model = analyzeCSubset(
+        "int f(int *p) { int rc = 0; __try { rc = *p; } "
+        "__except (_exception_code() == 0) { rc = 42; } return rc; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_SehBuiltinContext), 0u);
+    // The builtin lowered to a BuiltinCall inside the filter subtree.
+    HirNodeId const fn = firstFunction(res->hir);
+    HirNodeId const seh =
+        findFirstByKind(res->hir, res->hir.functionBody(fn), HirKind::SehTryExcept);
+    ASSERT_TRUE(seh.valid());
+    EXPECT_TRUE(findFirstByKind(res->hir, res->hir.children(seh)[1],
+                                HirKind::BuiltinCall).valid())
+        << "_exception_code lowers to a BuiltinCall in the filter";
+}
+
+// RED: `_exception_code()` with NO enclosing __try → H_SehBuiltinContext.
+TEST(HirLoweringCSubset, SehExceptionCodeOutsideTryIsRejected) {
+    SemanticModel model = analyzeCSubset(
+        "int f(void) { return (int)_exception_code(); }\n");
+    ASSERT_FALSE(model.hasErrors());   // resolves as a builtin call; HIR verifier rejects
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_SehBuiltinContext), 1u);
+}
+
+// RED: `_exception_info()` in the HANDLER body (filter-only) → H_SehBuiltinContext.
+// (_exception_code IS legal in the handler; _exception_info is filter-only —
+// the asymmetry is the point.)
+TEST(HirLoweringCSubset, SehExceptionInfoInHandlerIsRejected) {
+    SemanticModel model = analyzeCSubset(
+        "int f(int *p) { int rc = 0; __try { rc = *p; } "
+        "__except (1) { rc = (int)(long long)_exception_info(); } return rc; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_SehBuiltinContext), 1u);
+}
+
+// RED (option (C), D-CSUBSET-SEH-EARLY-EXIT): `return` inside the guarded body.
+TEST(HirLoweringCSubset, SehReturnInTryBodyIsRejected) {
+    SemanticModel model = analyzeCSubset(
+        "int f(int *p) { __try { return *p; } __except (1) { return 42; } }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_SehEarlyExit), 1u);
+}
+
+// FAIL-LOUD (D-CSUBSET-SEH-FINALLY): `__finally` parses but has no lowering.
+TEST(HirLoweringCSubset, SehFinallyFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int f(int *p) { int rc = 0; __try { rc = *p; } "
+        "__finally { rc = 1; } return rc; }\n");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 1u);
+}
+
+// FAIL-LOUD (D-CSUBSET-SEH-LEAVE): `__leave` parses but has no lowering.
+TEST(HirLoweringCSubset, SehLeaveFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int f(int *p) { int rc = 0; __try { __leave; rc = *p; } "
+        "__except (1) { rc = 42; } return rc; }\n");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 1u);
+}

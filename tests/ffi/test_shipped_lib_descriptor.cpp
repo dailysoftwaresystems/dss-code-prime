@@ -1572,6 +1572,89 @@ TEST(ShippedLibDescriptor, RealWindowsSyncStructLayout) {
         << "RTL_CRITICAL_SECTION x64: ptr+i32+i32+ptr+ptr+u64 = 40 bytes";
 }
 
+// c115 SEH (D-WIN64-SEH-FUNCLETS): the x64 EXCEPTION_RECORD layout the sqlite
+// sehExceptionFilter reads (.NumberParameters + .ExceptionInformation[2]) — the
+// SDK's um/winnt.h shape, natural C alignment: ExceptionCode@0, ExceptionFlags@4,
+// ExceptionRecord@8, ExceptionAddress@16, NumberParameters@24, [pad@28],
+// ExceptionInformation[15]@32, sizeof 152. A wrong offset here would read garbage
+// exception state at c116 runtime (the class the linux legs can't catch —
+// runtime-probed like the c106 _wfinddata64i32 fix). Also pins the pe-only gate
+// (EXCEPTION_RECORD is meaningless on elf/macho).
+TEST(ShippedLibDescriptor, RealWindowsExceptionRecordLayout) {
+    fs::path const shippedRoot = shippedLibsRoot();
+    ASSERT_FALSE(shippedRoot.empty());
+    fs::path const winPath = shippedRoot / "windows.json";
+    ASSERT_TRUE(fs::exists(winPath));
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(winPath, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Pe);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    // windows.json is pe-only.
+    EXPECT_TRUE(objectFormatInAvailabilitySet(desc->availableObjectFormats,
+                                              ObjectFormatKind::Pe));
+    EXPECT_FALSE(objectFormatInAvailabilitySet(desc->availableObjectFormats,
+                                               ObjectFormatKind::Elf));
+
+    auto layoutOf = [&](std::string_view name) -> std::optional<StructLayout> {
+        for (auto const& s : desc->structs) {
+            if (s.name == name) {
+                return computeLayout(s.typeId, interner, kNatural16, DataModel::Lp64);
+            }
+        }
+        ADD_FAILURE() << "struct " << name << " absent from windows.json";
+        return std::nullopt;
+    };
+
+    auto er = layoutOf("EXCEPTION_RECORD");
+    ASSERT_TRUE(er.has_value());
+    EXPECT_EQ(er->size, 152u) << "x64 EXCEPTION_RECORD is 152 bytes";
+    ASSERT_EQ(er->fieldOffsets.size(), 6u);
+    EXPECT_EQ(er->fieldOffsets[0], 0u)  << "ExceptionCode@0";
+    EXPECT_EQ(er->fieldOffsets[1], 4u)  << "ExceptionFlags@4";
+    EXPECT_EQ(er->fieldOffsets[2], 8u)  << "ExceptionRecord@8";
+    EXPECT_EQ(er->fieldOffsets[3], 16u) << "ExceptionAddress@16";
+    EXPECT_EQ(er->fieldOffsets[4], 24u) << "NumberParameters@24 (sqlite reads this)";
+    EXPECT_EQ(er->fieldOffsets[5], 32u)
+        << "ExceptionInformation[15]@32 after the u32→u64 alignment pad "
+           "(sqlite reads [2])";
+
+    auto ep = layoutOf("EXCEPTION_POINTERS");
+    ASSERT_TRUE(ep.has_value());
+    EXPECT_EQ(ep->size, 16u) << "two pointers";
+    ASSERT_EQ(ep->fieldOffsets.size(), 2u);
+    EXPECT_EQ(ep->fieldOffsets[0], 0u) << "ExceptionRecord*@0";
+    EXPECT_EQ(ep->fieldOffsets[1], 8u) << "ContextRecord*@8";
+
+    // THE load-bearing identity: EXCEPTION_POINTERS.ExceptionRecord is a pointer
+    // to an INLINE struct-text that MUST intern to the SAME TypeId as the
+    // field-bearing standalone EXCEPTION_RECORD — else `p->ExceptionRecord->
+    // NumberParameters` cannot resolve (struct identity is by name + field
+    // TYPES, ignoring field names). Pin the two TypeIds equal.
+    TypeId erStandalone{}, epFieldPointee{};
+    for (auto const& s : desc->structs) {
+        if (s.name == "EXCEPTION_RECORD")   erStandalone   = s.typeId;
+        if (s.name == "EXCEPTION_POINTERS") {
+            auto const fields = interner.operands(s.typeId);   // field types
+            ASSERT_GE(fields.size(), 1u);
+            // field 0 = ExceptionRecord* — its pointee is the inline struct.
+            auto const pointee = interner.operands(fields[0]);
+            ASSERT_GE(pointee.size(), 1u);
+            epFieldPointee = pointee[0];
+        }
+    }
+    ASSERT_TRUE(erStandalone.valid());
+    ASSERT_TRUE(epFieldPointee.valid());
+    EXPECT_EQ(erStandalone, epFieldPointee)
+        << "the inline EXCEPTION_RECORD in EXCEPTION_POINTERS.ExceptionRecord "
+           "must intern to the same TypeId as the standalone struct — the "
+           "p->ExceptionRecord->member resolution depends on it";
+}
+
 // c102 (D-FFI-WINDOWS-KERNEL32-FUNCTIONS, the file/heap/time slice): the real
 // windows.json ships the 47 kernel32 file/heap/mmap/library/error/sysinfo/time
 // functions the sqlite os_win VFS calls through its aSyscall[] table — every one an

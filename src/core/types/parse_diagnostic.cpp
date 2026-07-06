@@ -154,6 +154,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_ExternDeclMalformed:      return "H_ExternDeclMalformed";
         case DiagnosticCode::H_UnknownLinkageSpecifier:  return "H_UnknownLinkageSpecifier";
         case DiagnosticCode::H_UnreachableCode:          return "H_UnreachableCode";
+        case DiagnosticCode::H_SehBuiltinContext:        return "H_SehBuiltinContext";
+        case DiagnosticCode::H_SehJumpIntoRegion:        return "H_SehJumpIntoRegion";
+        case DiagnosticCode::H_SehEarlyExit:             return "H_SehEarlyExit";
+        case DiagnosticCode::H_SehLabelAddress:          return "H_SehLabelAddress";
         case DiagnosticCode::I_VerifierFailure:          return "I_VerifierFailure";
         case DiagnosticCode::I_NoEntryBlock:             return "I_NoEntryBlock";
         case DiagnosticCode::I_MultipleEntryBlocks:      return "I_MultipleEntryBlocks";
@@ -170,6 +174,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_TextVersionMismatch:      return "I_TextVersionMismatch";
         case DiagnosticCode::I_TextUnknownName:          return "I_TextUnknownName";
         case DiagnosticCode::I_LayoutUseBeforeDef:       return "I_LayoutUseBeforeDef";
+        case DiagnosticCode::I_SehStructure:             return "I_SehStructure";
         case DiagnosticCode::L_UnsupportedLoweringForOpcode: return "L_UnsupportedLoweringForOpcode";
         case DiagnosticCode::L_RequiredLirOpcodeMissing:     return "L_RequiredLirOpcodeMissing";
         case DiagnosticCode::L_VirtualRegInPostRegalloc:     return "L_VirtualRegInPostRegalloc";
