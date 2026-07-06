@@ -4,6 +4,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # SQLite-readiness probe harness for DSS Code Prime.
 #
+# Windows companion: build-and-test.ps1 makes the pe64 leg a fully RUNNABLE target
+# (this .sh runs on Linux, so windows/macos stay compile-only here — a Linux host
+# cannot execute a .exe). The .ps1 invokes WSL to amalgamate, then compiles + RUNS
+# sqlite3.exe natively on Windows.
+#
 # Drives the full "can DSS Code Prime build SQLite?" pipeline end-to-end on a
 # Linux or WSL host:
 #
