@@ -47,6 +47,21 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -Eeuo pipefail
 
+# ── bash 4+ required (associative arrays / `declare -A` below) ────────────────
+# macOS ships bash 3.2 (no `declare -A`). If we're running under an old bash,
+# re-exec under a newer one (Homebrew's `bash`) so the rest of the script — which
+# uses associative arrays for RUNNERS + the target map — parses. Linux hosts have
+# bash 4+/5 already, so this is a no-op there. This block itself is 3.2-safe.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  for _newer_bash in /opt/homebrew/bin/bash /usr/local/bin/bash "$(command -v bash 2>/dev/null || true)"; do
+    if [ -n "$_newer_bash" ] && [ -x "$_newer_bash" ] && "$_newer_bash" -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null; then
+      exec "$_newer_bash" "$0" "$@"
+    fi
+  done
+  echo "ERROR: this harness needs bash 4+ (found ${BASH_VERSION:-unknown}); on macOS run: brew install bash" >&2
+  exit 1
+fi
+
 # ── config (override via environment) ───────────────────────────────────────
 DSS_REPO_URL="${DSS_REPO_URL:-git@github.com:dailysoftwaresystems/dss-code-prime.git}"
 DSS_BRANCH="${DSS_BRANCH:-main}"                 # compiler is built from main per spec; override to probe a feature branch
@@ -54,14 +69,32 @@ SQLITE_REPO_URL="${SQLITE_REPO_URL:-git@github.com:sqlite/sqlite.git}"
 SRC_DIR="${SRC_DIR:-$HOME/src/dss-code-prime}"
 SQLITE_DIR="${SQLITE_DIR:-$HOME/src/sqlite}"
 OUT_DIR="${OUT_DIR:-$SRC_DIR/build/real-examples/c/sqlite}"
-JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
+JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 LANGUAGE="c-subset"
 MIN_CMAKE_MAJOR=4
+
+# ── host identification (OS + arch) ──────────────────────────────────────────
+# The RUNNABLE leg is host-adaptive: an artifact runs NATIVELY only on a host
+# whose (OS, arch) matches the target's. On Linux the ELF legs run (x86_64
+# native + arm64 under qemu); on macOS the native Mach-O leg runs directly.
+# uname -s → OS; uname -m → arch (normalized to the target-spec vocabulary).
+HOST_OS=""
+case "$(uname -s)" in
+  Linux)  HOST_OS="linux"  ;;
+  Darwin) HOST_OS="macos"  ;;
+esac
+HOST_ARCH=""
+case "$(uname -m)" in
+  arm64|aarch64) HOST_ARCH="arm64"  ;;
+  x86_64|amd64)  HOST_ARCH="x86_64" ;;
+esac
 
 # os-label = <targetName>:<formatName>  (the deliverable OSes; --target is repeatable).
 # Two Linux legs (x86_64 native + arm64 under qemu) are the RUNNABLE targets — they
 # compile the real `sqlite3` CLI (sqlite3.c + shell.c, 2-TU) and run the smoke unit
-# (step 7). windows/macos stay COMPILE-ONLY (no runner on this Linux CI host): the
+# (step 7). Which legs RUN is HOST-ADAPTIVE (see RUNNERS below): on a Linux host the
+# two Linux legs run + windows/macos are compile-only; on a macOS (Apple-Silicon) host
+# the NATIVE macho leg runs + the rest are compile-only. Non-runnable legs are: the
 # amalgamation-only single-TU compile is the deliverable-surface witness there.
 declare -a TARGETS=(
   "windows=x86_64:pe64-x86_64-windows-exec"
@@ -69,17 +102,29 @@ declare -a TARGETS=(
   "linux=x86_64:elf64-x86_64-linux-exec"
   "linux-arm64=arm64:elf64-aarch64-linux-exec"
 )
-# RUNNERS: the label -> run-command PREFIX for every target that produces a runnable
-# binary on THIS host. A native x86_64-linux artifact runs directly (empty prefix);
-# an arm64-linux ELF runs under user-mode qemu (QEMU_LD_PREFIX points its dynamic
-# loader + libc at the aarch64 sysroot). A label ABSENT from RUNNERS is compile-only
-# (windows/macos) — step 6 compiles it single-TU (amalgamation, no main) and step 7
-# skips it (no runner). This associative map is the SINGLE source of "what is
-# runnable and how" — 2-TU compilation (step 6) and the smoke (step 7) both key on it.
-declare -A RUNNERS=(
-  ["linux"]=""
-  ["linux-arm64"]="qemu-aarch64"
-)
+# RUNNERS: the label -> run-command PREFIX for every target runnable ON THIS HOST.
+# HOST-ADAPTIVE (the runnable leg follows the host OS + arch):
+#   * Linux host → the two ELF legs: x86_64-linux runs NATIVELY (empty prefix);
+#     arm64-linux runs under user-mode qemu (QEMU_LD_PREFIX → the aarch64 sysroot).
+#   * macOS host → the NATIVE Mach-O leg (empty prefix), but ONLY when the host arch
+#     matches the `macos` target arch (arm64): an arm64 Mach-O runs natively on Apple
+#     Silicon. On an Intel Mac the arm64 leg is not native (nothing runs a Mach-O off
+#     its arch) and macho64-x86_64-darwin-exec is not yet a runnable CLI, so macOS-
+#     x86_64 has NO runnable leg (every target stays compile-only).
+# A label ABSENT from RUNNERS is COMPILE-ONLY: step 6 compiles it single-TU
+# (amalgamation, no main) and step 7 skips it. This map is the SINGLE source of
+# "what is runnable and how" — 2-TU compilation (step 6) + the smoke (step 7) key on it.
+declare -A RUNNERS=()
+case "$HOST_OS" in
+  linux)
+    RUNNERS["linux"]=""
+    RUNNERS["linux-arm64"]="qemu-aarch64"
+    ;;
+  macos)
+    # the `macos` target is arm64:macho64-arm64-darwin-exec — native only on arm64.
+    [[ "$HOST_ARCH" == "arm64" ]] && RUNNERS["macos"]=""
+    ;;
+esac
 # QEMU_SYSROOT: the aarch64 sysroot qemu resolves the ELF interpreter + shared libs
 # against (Debian/Ubuntu cross package `libc6-arm64-cross` installs it here).
 QEMU_SYSROOT="${QEMU_SYSROOT:-/usr/aarch64-linux-gnu}"
@@ -113,17 +158,24 @@ warn()  { printf '%s ! %s%s\n' "$C_YLW" "$*" "$C_RST"; }
 die()   { printf '%s ✗ ERROR: %s%s\n' "$C_RED" "$*" "$C_RST" >&2; exit 1; }
 trap 'die "failed at line $LINENO (command: $BASH_COMMAND)"' ERR
 
-# ── package install helpers (Debian/Ubuntu/WSL) ──────────────────────────────
+# ── package install helpers (host-aware: apt on Linux/WSL, Homebrew on macOS) ─
 SUDO=""; [[ "$(id -u)" -eq 0 ]] || SUDO="sudo"
 APT_UPDATED=0
-apt_install() {                 # apt_install <pkg>...
-  command -v apt-get >/dev/null 2>&1 || die "apt-get not found — this harness targets Debian/Ubuntu/WSL. Install missing tools manually: $*"
-  if [[ "$APT_UPDATED" -eq 0 ]]; then $SUDO apt-get update -y >/dev/null; APT_UPDATED=1; fi
-  info "installing: $*"
-  $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null
+pkg_install() {                 # pkg_install <apt-pkg> [<brew-pkg=apt-pkg>]
+  local apt_pkg="$1" brew_pkg="${2:-$1}"
+  if [[ "$HOST_OS" == "macos" ]]; then
+    command -v brew >/dev/null 2>&1 || die "Homebrew not found — install it from https://brew.sh, then re-run (needed for: $brew_pkg)."
+    info "installing (brew): $brew_pkg"
+    brew list "$brew_pkg" >/dev/null 2>&1 || brew install "$brew_pkg"
+  else
+    command -v apt-get >/dev/null 2>&1 || die "apt-get not found — this harness targets Debian/Ubuntu/WSL + macOS. Install missing tools manually: $apt_pkg"
+    if [[ "$APT_UPDATED" -eq 0 ]]; then $SUDO apt-get update -y >/dev/null; APT_UPDATED=1; fi
+    info "installing (apt): $apt_pkg"
+    $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y "$apt_pkg" >/dev/null
+  fi
 }
-ensure_cmd() {                  # ensure_cmd <command> <apt-pkg>
-  command -v "$1" >/dev/null 2>&1 || apt_install "$2"
+ensure_cmd() {                  # ensure_cmd <command> <apt-pkg> [<brew-pkg>]
+  command -v "$1" >/dev/null 2>&1 || pkg_install "$2" "${3:-$2}"
 }
 
 # resolve a repo's default branch (origin/HEAD) — sqlite's may be master/trunk, not main
@@ -151,18 +203,37 @@ clone_or_update() {             # clone_or_update <url> <dir> <wanted-branch-or-
   info "  at $(git -C "$dir" rev-parse --short HEAD) on $(git -C "$dir" rev-parse --abbrev-ref HEAD)"
 }
 
-# ── Step 1 — host is Linux/WSL and online ────────────────────────────────────
-step "1/8  Host check (Linux / WSL, online)"
-[[ "$(uname -s)" == "Linux" ]] || die "requires Linux or WSL — uname -s = '$(uname -s)'."
-if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then info "host: WSL ($(uname -r))"; else info "host: native Linux ($(uname -r))"; fi
+# ── Step 1 — host is supported (Linux/WSL or macOS) and online ───────────────
+step "1/8  Host check (Linux / WSL / macOS, online)"
+[[ -n "$HOST_OS"   ]] || die "unsupported host OS — uname -s = '$(uname -s)' (need Linux/WSL or macOS/Darwin)."
+[[ -n "$HOST_ARCH" ]] || die "unsupported host arch — uname -m = '$(uname -m)' (need arm64/aarch64 or x86_64)."
+if [[ "$HOST_OS" == "macos" ]]; then
+  info "host: macOS ($HOST_ARCH, $(uname -r))"
+elif grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
+  info "host: WSL ($HOST_ARCH, $(uname -r))"
+else
+  info "host: native Linux ($HOST_ARCH, $(uname -r))"
+fi
+if [[ ${#RUNNERS[@]} -eq 0 ]]; then
+  warn "no NATIVE runnable leg on this host ($HOST_OS/$HOST_ARCH) — every target is compile-only"
+else
+  info "runnable leg(s) on this host: ${!RUNNERS[*]}"
+fi
 ensure_cmd curl curl
 curl -fsS --max-time 20 -o /dev/null https://github.com || die "offline — cannot reach https://github.com."
-pass "Linux/WSL host is online"
+pass "$HOST_OS/$HOST_ARCH host is online"
 
-# baseline build prerequisites (git for clones; gcc+make for SQLite's configure; tcl for the amalgamation)
+# baseline build prerequisites (git for clones; a C compiler + make for SQLite's
+# configure). On macOS these come from the Xcode Command Line Tools (git/make/cc,
+# `xcode-select --install`); on Linux from apt build-essential.
 ensure_cmd git git
-ensure_cmd gcc build-essential
-ensure_cmd make build-essential
+if [[ "$HOST_OS" == "macos" ]]; then
+  command -v cc >/dev/null 2>&1 || die "no C compiler (cc) — run 'xcode-select --install' to get the Xcode Command Line Tools."
+  command -v make >/dev/null 2>&1 || die "no 'make' — run 'xcode-select --install' (Xcode Command Line Tools)."
+else
+  ensure_cmd gcc build-essential
+  ensure_cmd make build-essential
+fi
 
 # ── Step 2 — dss-code-prime -> ~/src ─────────────────────────────────────────
 step "2/8  Fetch dss-code-prime -> $SRC_DIR (branch: $DSS_BRANCH)"
@@ -176,7 +247,26 @@ pass "sqlite ready"
 
 # ── Step 4 — amalgamate -> sqlite3.c + shell.c (autotools; needs tclsh) ───────
 step "4/8  Amalgamate SQLite (autotools: make sqlite3.c shell.c)"
-command -v tclsh >/dev/null 2>&1 || apt_install tcl tcl-dev     # mksqlite3c.tcl needs tclsh 8.6+
+# mksqlite3c.tcl needs tclsh 8.6+. macOS ships 8.5 (too old) → install Homebrew
+# tcl-tk (keg-only, so prepend its bin to PATH); Debian's `tcl` metapackage is 8.6+.
+ensure_tclsh() {
+  local ver=""
+  command -v tclsh >/dev/null 2>&1 && ver="$(echo 'puts $tcl_version' | tclsh 2>/dev/null || true)"
+  if [[ -z "$ver" ]] || ! awk "BEGIN{exit !(${ver:-0}+0 >= 8.6)}"; then
+    [[ -n "$ver" ]] && info "tclsh ${ver} is < 8.6 — installing a newer tcl"
+    pkg_install tcl tcl-tk                       # apt: tcl (8.6+) / brew: tcl-tk
+    if [[ "$HOST_OS" == "macos" ]]; then
+      local tclbin; tclbin="$(brew --prefix tcl-tk 2>/dev/null)/bin"
+      [[ -d "$tclbin" ]] && export PATH="$tclbin:$PATH"
+    fi
+    hash -r
+  fi
+  command -v tclsh >/dev/null 2>&1 || die "tclsh not found after install."
+  ver="$(echo 'puts $tcl_version' | tclsh 2>/dev/null || true)"
+  awk "BEGIN{exit !(${ver:-0}+0 >= 8.6)}" || die "tclsh ${ver:-none} is < 8.6 (mksqlite3c.tcl needs 8.6+)."
+  info "tclsh $ver ($(command -v tclsh))"
+}
+ensure_tclsh
 BLD="$SQLITE_DIR/bld-dss"
 mkdir -p "$BLD"
 # sqlite3.c is the amalgamated LIBRARY (no main); shell.c is the CLI DRIVER (its
@@ -196,6 +286,15 @@ cmake_major() { cmake --version 2>/dev/null | sed -n '1s/.*version \([0-9]*\).*/
 ensure_cmake() {                # the project requires CMake >= 4.0 (root CMakeLists: cmake_minimum_required(VERSION 4.0))
   local major; major="$(cmake_major)"
   if [[ -n "$major" && "$major" -ge "$MIN_CMAKE_MAJOR" ]]; then info "cmake: $(cmake --version | sed -n '1p')"; return; fi
+  if [[ "$HOST_OS" == "macos" ]]; then      # macOS → Homebrew (the Kitware tarball below is Linux-only)
+    warn "CMake ${MIN_CMAKE_MAJOR}+ required (found: ${major:-none}) — installing via Homebrew"
+    pkg_install cmake cmake
+    hash -r; major="$(cmake_major)"
+    [[ -n "$major" && "$major" -ge "$MIN_CMAKE_MAJOR" ]] || \
+      die "CMake ${MIN_CMAKE_MAJOR}+ install failed via brew (got '${major:-none}'). Run 'brew install cmake' and re-run."
+    info "cmake: $(cmake --version | sed -n '1p') (Homebrew)"
+    return
+  fi
   warn "CMake ${MIN_CMAKE_MAJOR}+ required (found: ${major:-none}) — installing the official Kitware Linux binary"
   ensure_cmd tar tar
   local arch json ver url dest

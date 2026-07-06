@@ -700,6 +700,76 @@ TEST(MachOExecWriter, SymbolAddressDataGlobalEmitsDyldRebaseStream) {
         << "LC_DYLD_INFO_ONLY must be present on the legacy darwin exec path.";
 }
 
+// D-LK-MACHO-DATA-EXTERN-DEAD-STUB (c119): the __stubs band is COMPACTED to the
+// FUNCTION externs — a DATA extern (got-indirect) is never called, so it gets a
+// __got slot but NO __stubs stub. A module with 1 func + 1 data extern must emit
+// exactly ONE stub (numFuncExterns), not two. RED-ON-DISABLE: the pre-c119 lockstep
+// layout emitted a dead stub per data extern → __stubs size would be 2×stubSize.
+TEST(MachOExecWriter, DataExternGetsGotSlotButNoStub) {
+    auto targetR = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(targetR.has_value());
+    auto target = std::move(targetR).value();
+    auto formatR = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-exec");
+    ASSERT_TRUE(formatR.has_value());
+    auto format = std::move(formatR).value();
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x00, 0x00, 0x00, 0x94, 0xC0, 0x03, 0x5F, 0xD6};  // BL _func_ext ; RET
+    // A FUNCTION extern (#99) is CALLED (BRANCH26) → it gets a __stubs stub + __got
+    // slot. A DATA extern (#98, isData) just needs to be in externImports — the
+    // walker builds a __got slot per extern (dyld-bound) but NO stub for data.
+    fn.relocations.push_back(Relocation{0u, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_func_ext", "/usr/lib/libSystem.B.dylib"});
+    ExternImport dataExt{SymbolId{98}, "_data_ext", "/usr/lib/libSystem.B.dylib"};
+    dataExt.isData = true;
+    mod.externImports.push_back(std::move(dataExt));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *target, *format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    // Walk LC_SEGMENT_64 sections → find __stubs → read its `size` (section_64 @ +40).
+    constexpr std::uint32_t kLcSegment64 = 0x19u;
+    std::uint32_t const ncmds = readU32LE(bytes, 16);
+    std::size_t off = 32;
+    bool sawStubs = false;
+    std::uint32_t stubsSize = 0, gotSize = 0;
+    for (std::uint32_t i = 0; i < ncmds; ++i) {
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
+        if (cmdsize == 0) break;
+        if (cmd == kLcSegment64) {
+            std::uint32_t const nsects = readU32LE(bytes, off + 64);
+            std::size_t sec = off + 72;
+            for (std::uint32_t s = 0; s < nsects; ++s, sec += 80) {
+                char const* nm = reinterpret_cast<char const*>(&bytes[sec]);
+                // sectname is a NUL-padded char[16]; compare INCLUDING the NUL
+                // terminator (the string literals carry it) so "__got" can't match
+                // a hypothetical "__got_more".
+                if (std::memcmp(nm, "__stubs", 8) == 0) { stubsSize = readU32LE(bytes, sec + 40); sawStubs = true; }
+                if (std::memcmp(nm, "__got", 6) == 0)   { gotSize   = readU32LE(bytes, sec + 40); }
+            }
+        }
+        off += cmdsize;
+    }
+    ASSERT_TRUE(sawStubs) << "the __stubs section must be present";
+    // arm64 stub = 12 bytes (ADRP x16 + LDR x16 + BR x16). ONE func extern → 12.
+    // The dead-stub bug (a stub per data extern too) would give 2×12 = 24.
+    EXPECT_EQ(stubsSize, 12u)
+        << "a DATA extern must NOT get a __stubs stub — expected 1 func-extern stub "
+           "(12 B); 24 B means the data extern got a dead stub (pre-c119 lockstep).";
+    // BOTH externs still get a __got slot (8 B each): the func's stub jumps through
+    // it, the data extern's got slot holds the dyld-bound object address.
+    EXPECT_EQ(gotSize, 16u)
+        << "every extern (func + data) keeps a __got slot — 2 × 8 B.";
+}
+
 TEST(MachOExecWriter, IntraModuleBranchAppliedByteForByte) {
     // Branch (rel32, kind 1) from fn[0] to fn[1].
     // sectionVa = pageZeroSize + 0x1000 = 0x100001000.
