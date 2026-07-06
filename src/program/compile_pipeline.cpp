@@ -495,6 +495,11 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          std::uint16_t                               callingConventionIndex,
                          CompilationUnitId                           cuId,
                          std::optional<ExternCallDispatch>           externCallDispatch,
+                         // c116 (D-WIN64-SEH-FUNCLETS): the SEH scope records the
+                         // funclet-synthesis pass produced (empty for a non-SEH
+                         // module). Threaded into MIR→LIR, which emits the
+                         // SehScopeDescriptors this body then binds post-assemble.
+                         std::vector<MirSehScope>                    sehScopes,
                          DiagnosticReporter&                         reporter) {
     // 4. MIR → LIR (vreg-based). Extern imports propagate through.
     // D-FFI-EXTERN-CALL-DISPATCH: the active format's extern-call shape
@@ -508,7 +513,8 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     auto lir = lowerToLir(mir, target,
                           interner, reporter,
                           std::move(externImports),
-                          externCallDispatch);
+                          externCallDispatch,
+                          sehScopes);
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
@@ -556,8 +562,19 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // 9. Calling-convention materialization (prologue/epilogue,
     //    frame_load/frame_store; `arg` virtual-op rewrite is the
     //    ML7 cycle 2 gap — anchored D-LK10-2 for caller awareness).
+    // c116 H1 (D-WIN64-SEH-FUNCLETS): thread the funclet→parent bindings so each
+    // funclet's `recover_parent_frame_slot` ops resolve their slot offsets against
+    // the PARENT's finalized FrameLayout (the funclet is materialized after its
+    // parent, so the parent layout is already computed). Empty for a non-SEH module.
+    std::vector<SehFuncletParent> sehFuncletParents;
+    sehFuncletParents.reserve(sehScopes.size());
+    for (auto const& s : sehScopes) {
+        sehFuncletParents.push_back(
+            SehFuncletParent{s.filterFuncletSymbol, s.parentFuncSymbol});
+    }
     auto const ccEntry = reporter.errorCount();
-    auto cc = materializeCallingConvention(legal.lir, target, alloc, reporter);
+    auto cc = materializeCallingConvention(legal.lir, target, alloc, reporter,
+                                           sehFuncletParents);
     if (!cc.ok() || !tierClean(reporter, ccEntry)) {
         return std::nullopt;
     }
@@ -777,6 +794,80 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         assembled.dataItems.push_back(std::move(m));
     }
 
+    // c116 (D-WIN64-SEH-FUNCLETS): bind each SEH scope descriptor to its owning
+    // function's `FrameUnwindInfo.sehScopes`. Runs AFTER the unwind projection
+    // (which created the FrameUnwindInfo) AND after assemble() (which populated each
+    // function's `blockByteOffsets`) — the same ordering the c70 jump-table binding
+    // relies on. Translates the descriptor's LIR block ids to byte offsets within
+    // the parent function; the pe writer resolves the funclet + personality symbols
+    // to image-RVAs and emits the __C_specific_handler scope table + EHANDLER.
+    for (auto const& desc : lir.sehScopeDescriptors) {
+        if (desc.funcIndex >= assembled.functions.size()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "SEH scope descriptor names function index {} but the assembled "
+                "module has {} function(s) (D-WIN64-SEH-FUNCLETS)",
+                desc.funcIndex, assembled.functions.size());
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        AssembledFunction& outFn = assembled.functions[desc.funcIndex];
+        if (!outFn.unwind.has_value()) {
+            // A SEH-guarding function ALWAYS has a frame (the unwind projection
+            // attaches FrameUnwindInfo to every callconv'd function). A missing one
+            // means the projection was skipped — fail loud, never emit a dangling
+            // scope table with no UNWIND_INFO to host it.
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "SEH scope on function index {} has no FrameUnwindInfo to host its "
+                "scope table (D-WIN64-SEH-FUNCLETS)", desc.funcIndex);
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        auto beginIt = outFn.blockByteOffsets.find(desc.beginLirBlockV);
+        auto endIt   = outFn.blockByteOffsets.find(desc.endLirBlockV);
+        auto handIt  = outFn.blockByteOffsets.find(desc.handlerLirBlockV);
+        if (beginIt == outFn.blockByteOffsets.end()
+            || endIt == outFn.blockByteOffsets.end()
+            || handIt == outFn.blockByteOffsets.end()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "SEH scope on function index {} references a block with no byte "
+                "offset (begin={}, end={}, handler={}) — malformed descriptor "
+                "(D-WIN64-SEH-FUNCLETS)", desc.funcIndex, desc.beginLirBlockV,
+                desc.endLirBlockV, desc.handlerLirBlockV);
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        // The guarded PC range's END = one-past the guarded body's LAST block =
+        // the byte offset of whatever block is laid out immediately AFTER it. Block
+        // LAYOUT order is NOT MIR creation order (the optimizer's mandatory prune
+        // reorders by RPO), so compute it as the smallest block offset STRICTLY
+        // GREATER than the guarded body's last-block offset — or the function's
+        // total byte size if that block is laid out last. (c116a: the guarded body
+        // is a single block, so `endLirBlockV == beginLirBlockV`.)
+        std::uint32_t const lastBlockOff = endIt->second;
+        std::uint32_t endByteOffset =
+            static_cast<std::uint32_t>(outFn.bytes.size());
+        for (auto const& [blkV, off] : outFn.blockByteOffsets) {
+            (void)blkV;
+            if (off > lastBlockOff && off < endByteOffset) endByteOffset = off;
+        }
+        SehScopeEntry e;
+        e.beginByteOffset      = beginIt->second;
+        e.endByteOffset        = endByteOffset;
+        e.jumpTargetByteOffset = handIt->second;
+        e.filterFuncletSymbol  = desc.filterFuncletSymbol;
+        e.personalitySymbol    = desc.personalitySymbol;
+        outFn.unwind->sehScopes.push_back(e);
+    }
+
     // D-LK4-3: stamp the owning CompilationUnit's id so the linker keys this
     // module's symbols by `(cuId, SymbolId)`. Single-CU build → one cuId; a merged
     // whole-program image carries CU0's id (cosmetic — the merge already collapsed
@@ -944,6 +1035,16 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         }
     }
 
+    // c116 (D-WIN64-SEH-FUNCLETS): synthesize the SEH filter funclets + record the
+    // scope ranges (post-optimize; the CU is already optimized here). Trigger =
+    // presence of SehTryBegin — a no-op fast-return for the overwhelming majority
+    // of TUs. Appends the __C_specific_handler personality import on demand.
+    std::vector<MirSehScope> sehScopes;
+    if (!synthesizeSehFunclets(cuMir.mir, model.lattice().interner(),
+                               cuMir.externImports, sehScopes, reporter)) {
+        return std::nullopt;  // unsupported SEH shape (c116b frontier) — fail-loud.
+    }
+
     // `nameOf`: SymbolId → declared name. A SymbolId with no record (synthesized /
     // out-of-range) yields "" — the LK11a symbol-table populate then skips it as
     // module-private, exactly as the old `rec == nullptr` skip did.
@@ -957,7 +1058,7 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         std::move(cuMir.externImports), userEntry, *cuMir.target,
         cuMir.dataModel, cuMir.bitFieldStrategy,
         cuMir.callingConventionIndex, cuMir.cuId,
-        cuMir.externCallDispatch, reporter);
+        cuMir.externCallDispatch, std::move(sehScopes), reporter);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -982,6 +1083,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       std::uint16_t       callingConventionIndex,
                       CompilationUnitId   cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
+                      std::vector<MirSehScope> sehScopes,
                       DiagnosticReporter& reporter) {
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
@@ -995,7 +1097,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         merged.mir, merged.host.interner(), nameOf,
         std::move(merged.externImports), merged.userEntrySymbol, target,
         dataModel, bitFieldStrategy, callingConventionIndex, cuId,
-        externCallDispatch, reporter);
+        externCallDispatch, std::move(sehScopes), reporter);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU

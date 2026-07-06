@@ -204,6 +204,22 @@ enum class MirOpcode : std::uint16_t {
     //     __C_specific_handler dispatch context by the c116 funclet lowering.
     // Until c116, mir_to_lir FAILS LOUD on all five (every target).
     SehTryBegin, SehFilterReturn, SehTryEnd, SehExceptionCode, SehExceptionInfo,
+    // ── c116 (D-WIN64-SEH-FUNCLETS, H1): generic frame-slot recovery. ──
+    // `RecoverParentFrameSlot`: operand[0] = an establisher-frame base pointer
+    // (a NORMAL SSA value — e.g. a funclet's establisher-frame parameter, NEVER a
+    // hardcoded register); payload = the 0-based scan-order slot index of a local
+    // in the frame that base points at. Result = a pointer to that frame slot. It
+    // lowers (at callconv) to `lea result, [base + frameSlotOffset(slotIndex)]`,
+    // where `frameSlotOffset` comes from the config-driven FrameLayout of the
+    // frame the base establishes — the SAME localAreaOffset() + slot*slotSize
+    // geometry `alloca` / `lea_frame_slot` resolve against. AGNOSTIC: base is an
+    // operand, the offset is from FrameLayout, and the op names nothing
+    // arch/format/SEH-specific — it is the generic analog of LLVM's
+    // `llvm.localrecover`. The c116 SEH filter funclet is its first consumer
+    // (recovering a parent local the __except filter reads); a fault-time
+    // establisher frame == the parent's post-prologue SP (FrameRegister=0), so
+    // `[base + off]` == the parent's `[SP + off]`.
+    RecoverParentFrameSlot,
     // ── SIMD (reserved post-v1; vocabulary fixed now) ──
     VAdd, VSub, VMul, VShuffle, VExtract, VInsert,
 
@@ -453,6 +469,13 @@ struct MirOpcodeInfo {
         case MirOpcode::SehTryEnd:        return {0, 0, 0, 0, R::None, false, true, false, "seh_try_end"};
         case MirOpcode::SehExceptionCode: return {0, 0, 0, 0, R::Value, false, true, false, "seh_exception_code"};
         case MirOpcode::SehExceptionInfo: return {0, 0, 0, 0, R::Value, false, true, false, "seh_exception_info"};
+        // c116 H1 (D-WIN64-SEH-FUNCLETS): 1 operand (the establisher base pointer),
+        // payload = slot index; result = a pointer to that frame slot. A pure
+        // address computation (like `alloca`/`lea_frame_slot`): NOT side-effecting,
+        // NOT a terminator. Synth appends it in the funclet AFTER the optimizer, and
+        // the pipeline runs no MIR-tier DCE/CSE afterward, so its result-use survives.
+        case MirOpcode::RecoverParentFrameSlot:
+                                          return {1, 1, 0, 0, R::Value, false, false, false, "recover_parent_frame_slot"};
 
         // SIMD (reserved — provisional arities).
         case MirOpcode::VAdd:     return {2, 2, 0, 0, R::Value, false, false, false, "vadd"};

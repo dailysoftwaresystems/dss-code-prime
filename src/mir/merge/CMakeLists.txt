@@ -6,6 +6,7 @@
 add_library(mir_merge OBJECT
     mir_merge.cpp
     synth_pe_startup.cpp
+    synth_seh_funclets.cpp
 )
 
 target_include_directories(mir_merge PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../..)

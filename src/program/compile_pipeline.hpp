@@ -12,6 +12,7 @@
 #include "core/types/type_lattice/type_interner.hpp"  // TypeInterner (optimizeModule arg)
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly arg)
+#include "mir/merge/synth_seh_funclets.hpp"  // MirSehScope (c116 D-WIN64-SEH-FUNCLETS)
 #include "mir/mir.hpp"  // Mir (CuMirModule member, move-only)
 #include "opt/optimizer.hpp"
 #include "program/cli_args.hpp"  // CompileConfig
@@ -312,6 +313,9 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       std::uint16_t        callingConventionIndex,
                       CompilationUnitId    cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
+                      // c116 (D-WIN64-SEH-FUNCLETS): SEH scope records from
+                      // `synthesizeSehFunclets` (empty for a non-SEH program).
+                      std::vector<MirSehScope> sehScopes,
                       DiagnosticReporter&  reporter);
 
 // Link N assembled CUs into one image + commit to `outPath` (the shared half of

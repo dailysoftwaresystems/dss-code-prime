@@ -737,6 +737,163 @@ TEST(PeExecWriter, FunctionUnwindInfoStackProbePrologueUsesFixedAllocLen) {
     EXPECT_EQ(readU16LE(img, w + 14), 1024u) << "frame/8 = 8192/8";
 }
 
+TEST(PeExecWriter, SehScopeTableEmitsEhandlerFlagAndScopeRecord) {
+    // c116 (D-WIN64-SEH-FUNCLETS) host-independent
+    // structural pin. A function carrying a FrameUnwindInfo with a non-empty
+    // `sehScopes` gets:
+    //   (1) UNW_FLAG_EHANDLER in its UNWIND_INFO byte0 (0x01 → 0x09);
+    //   (2) after the DWORD-aligned unwind codes: a u32 handler RVA (the
+    //       __C_specific_handler THUNK RVA) + a SCOPE_TABLE {u32 Count;
+    //       Record[]{Begin, End, Handler(=filter funclet RVA), JumpTarget}}.
+    // The scope's Begin/End/JumpTarget are the parent function's RVA + the
+    // SehScopeEntry byte offsets; Handler is the filter funclet FUNCTION's RVA;
+    // the handler field is the personality import's thunk RVA (a .text address).
+    //
+    // RED-on-disable: reverting the EHANDLER byte leaves byte0 at 0x01; dropping
+    // the scope-table emission removes the trailing handler RVA + records (the
+    // .xdata blob is then just the codes). A funclet whose symbol has no function
+    // RVA fails loud.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    // Function 0: the PARENT — sub rsp,0x20 (frame) then ret. One SEH scope over
+    // a guarded body at [begin=0x08, end=0x10) with a handler block at 0x18. The
+    // filter is function 1; the personality is the __C_specific_handler extern.
+    AssembledFunction parent;
+    parent.symbol = SymbolId{1};
+    parent.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3,   // 0..7
+                     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,   // 8..15
+                     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,   // 16..23
+                     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xC3};  // 24..31
+    {
+        FrameUnwindInfo ui;
+        ui.totalFrameSize = 0x20;
+        SehScopeEntry sc;
+        sc.beginByteOffset      = 0x08;
+        sc.endByteOffset        = 0x10;
+        sc.jumpTargetByteOffset = 0x18;
+        sc.filterFuncletSymbol  = SymbolId{2};   // function 1
+        sc.personalitySymbol    = SymbolId{3};   // the extern
+        ui.sehScopes.push_back(sc);
+        parent.unwind = std::move(ui);
+    }
+    mod.functions.push_back(std::move(parent));
+    // Function 1: the FILTER FUNCLET — a trivial `xor eax,eax; ret`. It carries a
+    // frame so it gets its own (EHANDLER-less) UNWIND_INFO; the scope table's
+    // Handler points at its function RVA.
+    AssembledFunction funclet;
+    funclet.symbol = SymbolId{2};
+    funclet.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3};
+    {
+        FrameUnwindInfo ui;
+        ui.totalFrameSize = 0x20;
+        funclet.unwind = std::move(ui);
+    }
+    mod.functions.push_back(std::move(funclet));
+    // The __C_specific_handler personality import (SEH-gated — synthesized on
+    // demand, exactly as the SEH pass does). A real msvcrt.dll export.
+    mod.externImports.push_back(
+        ExternImport{SymbolId{3}, "__C_specific_handler", "msvcrt.dll",
+                     /*isData=*/false});
+
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(img.empty());
+
+    auto const [textRva, textPtr] =
+        findExecSection(img, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+    auto const [xdataRva, xdataPtr] =
+        findExecSection(img, {'.', 'x', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(textRva, 0u);
+    ASSERT_NE(xdataRva, 0u) << ".xdata section must exist";
+
+    // The parent (function 0) is first in .text, so its RVA == textRva; its
+    // UNWIND_INFO is the first .xdata blob (xdataPtr). The funclet (function 1)
+    // follows the parent in .text: parent is 32 bytes → funclet RVA = textRva+32.
+    std::uint32_t const parentRva  = textRva;
+    std::uint32_t const funcletRva = textRva + 32u;
+
+    // (1) UNW_FLAG_EHANDLER: byte0 = 0x09 (Version 1 | Flags(1)<<3), NOT 0x01.
+    std::size_t const u = xdataPtr;
+    EXPECT_EQ(img[u + 0], 0x09u) << "UNW_FLAG_EHANDLER set (else 0x01)";
+    EXPECT_EQ(img[u + 1], 7u)    << "SizeOfProlog (sub rsp,imm32)";
+    EXPECT_EQ(img[u + 2], 1u)    << "CountOfCodes: 1 ALLOC_SMALL node";
+    // (2) After the header (4B) + 1 code node (2B), DWORD-aligned → 8 bytes. Then:
+    //     [8]  u32 handler RVA (the __C_specific_handler thunk — a .text address)
+    //     [12] u32 scope Count = 1
+    //     [16] Begin, [20] End, [24] Handler, [28] JumpTarget
+    std::uint32_t const handlerThunkRva = readU32LE(img, u + 8);
+    EXPECT_GE(handlerThunkRva, textRva) << "handler field is a .text thunk RVA";
+    EXPECT_EQ(readU32LE(img, u + 12), 1u) << "scope Count = 1";
+    EXPECT_EQ(readU32LE(img, u + 16), parentRva + 0x08u) << "Begin = parent+0x08";
+    EXPECT_EQ(readU32LE(img, u + 20), parentRva + 0x10u) << "End = parent+0x10";
+    EXPECT_EQ(readU32LE(img, u + 24), funcletRva)        << "Handler = funclet RVA";
+    EXPECT_EQ(readU32LE(img, u + 28), parentRva + 0x18u) << "JumpTarget = parent+0x18";
+}
+
+TEST(PeExecWriter, SehGuardingFunctionSavingNonVolatileXmmFailsLoud) {
+    // c116 (D-WIN64-XMM-UNWIND-RESTORE, the H5 invariant): a __try-guarding
+    // function (non-empty sehScopes) that spills a NON-VOLATILE xmm must FAIL
+    // LOUD, not silently emit an unwind table that omits UWOP_SAVE_XMM128 — the
+    // __except handler resumes in the parent frame and could read an unrestored
+    // xmm. sqlite's WAL SEH functions spill zero non-volatile xmm (the H5 proof),
+    // so this never fires for the shipped corpus; the guard converts that proof
+    // into an ENFORCED invariant. RED-on-disable: drop the guardsSeh arm in
+    // pe.cpp buildFunctionUnwindInfo → the FPR save is silently omitted (as it
+    // legitimately is for a NON-SEH function) → this function encodes cleanly and
+    // ships a broken unwind table. The paired negative (a NON-SEH function with
+    // the same xmm save encodes fine) is the FunctionUnwindInfoEmitsPdata... test
+    // above (xmm6 omitted, no error).
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    // Same parent shape as the scope-table test, but its prologue ALSO saves a
+    // non-volatile xmm (xmm6). sub rsp,0x20 (7B) then movsd [rsp],xmm6 — the
+    // bytes past [0] are opaque to the unwind builder (it reads the FrameUnwindInfo).
+    AssembledFunction parent;
+    parent.symbol = SymbolId{1};
+    parent.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00,          // sub rsp,0x20
+                     0xF2, 0x0F, 0x11, 0x34, 0x24,                      // movsd [rsp],xmm6
+                     0x90, 0x90, 0x90, 0xC3};
+    {
+        FrameUnwindInfo ui;
+        ui.totalFrameSize = 0x20;
+        ui.savedRegs = { FrameSavedReg{/*regEncoding=*/6, /*isFpr=*/true,
+                                       /*saveOffset=*/0} };   // xmm6 — non-volatile
+        SehScopeEntry sc;
+        sc.beginByteOffset      = 0x0C;
+        sc.endByteOffset        = 0x0F;
+        sc.jumpTargetByteOffset = 0x0F;
+        sc.filterFuncletSymbol  = SymbolId{2};
+        sc.personalitySymbol    = SymbolId{3};
+        ui.sehScopes.push_back(sc);
+        parent.unwind = std::move(ui);
+    }
+    mod.functions.push_back(std::move(parent));
+    AssembledFunction funclet;
+    funclet.symbol = SymbolId{2};
+    funclet.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3};
+    { FrameUnwindInfo ui; ui.totalFrameSize = 0x20; funclet.unwind = std::move(ui); }
+    mod.functions.push_back(std::move(funclet));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{3}, "__C_specific_handler", "msvcrt.dll",
+                     /*isData=*/false});
+
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a SEH-guarding function saving a non-volatile xmm must fail loud "
+           "(D-WIN64-XMM-UNWIND-RESTORE), not silently omit its restore";
+}
+
 TEST(PeExecWriter, DosHeaderMzSignature) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);

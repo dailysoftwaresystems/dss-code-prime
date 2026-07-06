@@ -134,11 +134,35 @@ struct DSS_EXPORT FrameSavedReg {
     bool          isFpr       = false;  // FPR/vector class ⇒ 16-byte XMM save, else 8-byte GPR
     std::uint32_t saveOffset  = 0;   // byte offset from post-prologue RSP where the reg is stored
 };
+// c116 (D-WIN64-SEH-FUNCLETS): one MSVC-x64 SEH scope,
+// as byte offsets WITHIN the owning (parent) function's `bytes` + the SymbolIds
+// the pe writer resolves to image-RVAs at link time. Produced by the compile
+// pipeline from the LIR `SehScopeDescriptor` (which carries LIR block ids) by
+// translating each block id to its byte offset via the parent AssembledFunction's
+// `blockByteOffsets` map (the c70 jump-table binding pattern). Consumed ONLY by
+// the pe64 writer's `.xdata` scope-table emitter (the __C_specific_handler scope
+// table + UNW_FLAG_EHANDLER — format-specific, so it lives entirely in pe.cpp;
+// this struct is format-neutral position data). The guarded PC range is
+// `[beginByteOffset, endByteOffset)`; a fault in it dispatches to the filter
+// funclet (`filterFuncletSymbol`), and on EXECUTE_HANDLER the OS resumes at
+// `jumpTargetByteOffset` (the `__except` body, in the parent frame).
+struct DSS_EXPORT SehScopeEntry {
+    std::uint32_t beginByteOffset      = 0;  // start of the guarded body (within parent bytes)
+    std::uint32_t endByteOffset        = 0;  // one-past the guarded body (half-open range)
+    std::uint32_t jumpTargetByteOffset = 0;  // the __except handler block (within parent bytes)
+    SymbolId      filterFuncletSymbol{};     // the synthesized filter-funclet function symbol
+    SymbolId      personalitySymbol{};       // __C_specific_handler extern (its thunk RVA = the UNWIND handler field)
+};
 struct DSS_EXPORT FrameUnwindInfo {
     std::uint32_t              totalFrameSize = 0;  // bytes the prologue subtracts from RSP
     bool                       usesStackProbe = false;  // frame > cc.stackProbePageBytes ⇒ the inline probe loop
     std::uint32_t              stackProbePageBytes = 0; // the cc's guard-page size (probe stride); 0 = no probing
     std::vector<FrameSavedReg> savedRegs;           // callee-saved regs stored in the prologue, ascending saveOffset
+    // c116 (D-WIN64-SEH-FUNCLETS): the SEH scopes this function guards. Empty for
+    // every function without a `__try` (the overwhelming majority). Non-empty ⇒
+    // the pe writer sets UNW_FLAG_EHANDLER + appends the __C_specific_handler
+    // scope table to this function's UNWIND_INFO.
+    std::vector<SehScopeEntry> sehScopes;
 };
 
 // One assembled function — bytes + symbol-relative metadata. `symbol`

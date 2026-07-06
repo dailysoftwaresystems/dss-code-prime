@@ -15,6 +15,7 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -867,6 +868,13 @@ struct OpcodeHandles {
     // because that lowering only records the remat index when this opcode resolves —
     // so the absence is self-consistent, NOT a silent gap). Requires `lea`.
     std::uint16_t leaFrameSlot;
+    // c116 H1 (D-WIN64-SEH-FUNCLETS): the `recover_parent_frame_slot` virtual op — a
+    // frame-slot address off the establisher-frame base register (operand[0]) using
+    // the PARENT function's finalized FrameLayout (payload = slot index). Materialized
+    // into `lea result, [establisherReg + parentLocalAreaOffset(k)]`. Optional — only
+    // a target that supports SEH funclets declares it; absent ⇒ field 0, and `op ==
+    // h.recoverParentFrameSlot` never matches (a non-SEH module never emits it).
+    std::uint16_t recoverParentFrameSlot;
 };
 
 // FC2 Part B: resolve the class-correct opcode for a register-data-
@@ -1629,7 +1637,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 25> const table{{
+    std::array<Entry, 26> const table{{
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -1672,6 +1680,11 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // matches, and the MIR→LIR lowering correspondingly never emits it (it only
         // records the remat index when this opcode resolves — self-consistent).
         {&OpcodeHandles::leaFrameSlot, "lea_frame_slot", true},
+        // c116 H1 (D-WIN64-SEH-FUNCLETS): optional — only a SEH-funclet target
+        // declares it. Materialized into `lea [establisherReg + parentSlotOffset]`;
+        // needs `lea`. Absent ⇒ field 0; `op == h.recoverParentFrameSlot` never
+        // matches (a non-SEH module never emits it).
+        {&OpcodeHandles::recoverParentFrameSlot, "recover_parent_frame_slot", true},
         // FC12a-core (D-FC12A-VARIADIC-CALLEE): optional — only a CC with a
         // `vaListLayout` emits these. Materialized into `lea [sp + offset]`; both
         // need `lea` (guaranteed present on any register-machine target that also
@@ -1736,6 +1749,15 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                    LirFuncAllocation const& alloc,
                    LirBuilder& b, OpcodeHandles const& h,
                    FrameLayout& outLayout,
+                   // c116 H1 (D-WIN64-SEH-FUNCLETS): the FrameLayouts of the
+                   // functions materialized BEFORE this one (the funclet is appended
+                   // AFTER its parent by the synth pass, so the parent's layout is
+                   // already finalized here). `parentLayoutIndex` is set iff THIS
+                   // function is a SEH filter funclet — it names its parent's index
+                   // in `siblingLayouts`. A `recover_parent_frame_slot` op resolves
+                   // its slot offset against `siblingLayouts[*parentLayoutIndex]`.
+                   std::span<FrameLayout const> siblingLayouts,
+                   std::optional<std::uint32_t> parentLayoutIndex,
                    DiagnosticReporter& reporter) {
     if (!cc.stackPointer.has_value()) {
         report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
@@ -2238,6 +2260,64 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 }
                 emitFrameAddr(b, h.lea, result, sp,
                               static_cast<std::int32_t>(combinedOffset));
+                continue;
+            }
+
+            // c116 H1 (D-WIN64-SEH-FUNCLETS): materialize `recover_parent_frame_slot`
+            // — a frame-slot address off the ESTABLISHER-frame base register
+            // (operand[0]), using the PARENT function's finalized FrameLayout. The
+            // parent local at scan-order slot `payload` sits at
+            // `parent.localAreaOffset() + slot * parent.slotSize` off the parent's
+            // post-prologue SP; a fault-time x64 establisher frame (FrameRegister=0)
+            // == that same SP, so the recovered address is `lea result,
+            // [establisherReg + parentSlotOffset]`. AGNOSTIC: the base is a NORMAL
+            // register operand (never a hardcoded rdx), the offset is from the config
+            // FrameLayout, and this op resolves ONLY inside a funclet (parentLayout
+            // Index set). The establisher register is a live funclet parameter, so
+            // the normal callconv spills it across the funclet's own call for free.
+            if (h.recoverParentFrameSlot != 0 && op == h.recoverParentFrameSlot) {
+                if (h.lea == 0 || !result.valid() || result.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                           DiagnosticSeverity::Error,
+                           "callconv: recover_parent_frame_slot materialization needs "
+                           "'lea' + a physical-reg result (D-WIN64-SEH-FUNCLETS)");
+                    return false;
+                }
+                if (!parentLayoutIndex.has_value()
+                    || *parentLayoutIndex >= siblingLayouts.size()) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: recover_parent_frame_slot in a "
+                                       "function with no resolvable SEH parent layout "
+                                       "(inst {}) — D-WIN64-SEH-FUNCLETS", inst.v));
+                    return false;
+                }
+                if (ops.empty() || ops[0].kind != LirOperandKind::Reg
+                    || ops[0].reg.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: recover_parent_frame_slot inst {} "
+                                       "expects a physical-register establisher base "
+                                       "operand (D-WIN64-SEH-FUNCLETS)", inst.v));
+                    return false;
+                }
+                FrameLayout const& parentLayout = siblingLayouts[*parentLayoutIndex];
+                std::int64_t const slotOffset =
+                    static_cast<std::int64_t>(parentLayout.localAreaOffset())
+                    + static_cast<std::int64_t>(payload)
+                          * static_cast<std::int64_t>(parentLayout.slotSize);
+                if (slotOffset < std::numeric_limits<std::int32_t>::min()
+                    || slotOffset > std::numeric_limits<std::int32_t>::max()) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: recover_parent_frame_slot inst {} "
+                                       "parent-frame offset {} exceeds the int32 "
+                                       "frame-offset domain (D-WIN64-SEH-FUNCLETS)",
+                                       inst.v, slotOffset));
+                    return false;
+                }
+                emitFrameAddr(b, h.lea, result, ops[0].reg,
+                              static_cast<std::int32_t>(slotOffset));
                 continue;
             }
 
@@ -3335,12 +3415,41 @@ LirCallconvResult
 materializeCallingConvention(Lir const&           src,
                              TargetSchema const&  schema,
                              LirAllocation const& alloc,
-                             DiagnosticReporter&  reporter) {
+                             DiagnosticReporter&  reporter,
+                             std::span<SehFuncletParent const> sehFuncletParents) {
     LirCallconvResult out;
 
     auto opcodes = resolveOpcodes(schema, reporter);
     if (!opcodes.has_value()) {
         return out;  // empty Lir + empty perFunc — `ok()` returns false
+    }
+
+    // c116 H1 (D-WIN64-SEH-FUNCLETS): resolve each funclet's parent to a FUNCTION
+    // INDEX (position in `src.funcAt(i)` == position in `out.perFunc`). The synth
+    // pass appends each funclet AFTER its parent, so the parent index is always <
+    // the funclet index ⇒ `out.perFunc[parentIndex]` is finalized when the funclet
+    // is materialized. Built once here by scanning function symbols. Empty ⇒ no SEH.
+    std::unordered_map<std::uint32_t, std::uint32_t> funcletIdxToParentIdx;
+    if (!sehFuncletParents.empty()) {
+        std::unordered_map<std::uint32_t, std::uint32_t> symToIndex;
+        std::size_t const nfAll = src.moduleFuncCount();
+        for (std::uint32_t i = 0; i < nfAll; ++i) {
+            symToIndex[src.funcArena().at(src.funcAt(i)).symbol] = i;
+        }
+        for (auto const& fp : sehFuncletParents) {
+            auto fIt = symToIndex.find(fp.funcletSymbol.v);
+            auto pIt = symToIndex.find(fp.parentSymbol.v);
+            if (fIt == symToIndex.end() || pIt == symToIndex.end()) {
+                report(reporter, DiagnosticCode::R_CallingConventionLookupFailed,
+                       DiagnosticSeverity::Error,
+                       std::format("materializeCallingConvention: SEH funclet "
+                                   "symbol {} or its parent {} not found in the LIR "
+                                   "module (D-WIN64-SEH-FUNCLETS)",
+                                   fp.funcletSymbol.v, fp.parentSymbol.v));
+                return LirCallconvResult{};
+            }
+            funcletIdxToParentIdx[fIt->second] = pIt->second;
+        }
     }
 
     LirBuilder b{schema};
@@ -3406,8 +3515,17 @@ materializeCallingConvention(Lir const&           src,
             return LirCallconvResult{};
         }
         FrameLayout layout;
+        // c116 H1 (D-WIN64-SEH-FUNCLETS): if this function is a SEH filter funclet,
+        // pass its parent's layout index. `out.perFunc` holds every already-
+        // materialized function's finalized layout (the funclet's parent among them,
+        // since synth appends funclets after parents). A non-funclet passes nullopt.
+        std::optional<std::uint32_t> parentLayoutIndex;
+        if (auto it = funcletIdxToParentIdx.find(i);
+            it != funcletIdxToParentIdx.end()) {
+            parentLayoutIndex = it->second;
+        }
         if (!materializeOneFunc(src, fn, schema, *cc, funcAlloc, b, *opcodes,
-                                layout, reporter)) {
+                                layout, out.perFunc, parentLayoutIndex, reporter)) {
             return LirCallconvResult{};
         }
         out.perFunc.push_back(std::move(layout));

@@ -56,6 +56,7 @@ namespace {
         case MirOpcode::SehTryEnd:        return "SehTryEnd";
         case MirOpcode::SehExceptionCode: return "SehExceptionCode";
         case MirOpcode::SehExceptionInfo: return "SehExceptionInfo";
+        case MirOpcode::RecoverParentFrameSlot: return "RecoverParentFrameSlot"; // c116b
         default:                       return "<deferred>";
     }
 }
@@ -256,6 +257,14 @@ enum class MnemonicSlot : std::uint8_t {
     // consulted there). The div-family precedent (SDivPre/Core vs SDivNative)
     // for a per-target-realization-specific slot.
     FNegMask,
+    // c116 H1 (D-WIN64-SEH-FUNCLETS): the `recover_parent_frame_slot` virtual op —
+    // MIR `RecoverParentFrameSlot` lowers to it. operand[0] = the establisher-frame
+    // base register; payload = the slot index. lir_callconv materializes it into
+    // `lea result, [establisherReg + parentLocalAreaOffset(slotIndex)]` (the SAME
+    // frame geometry `lea_frame_slot` uses, but based off the establisher REGISTER
+    // and the PARENT's FrameLayout). Declared in every register-machine schema that
+    // supports SEH funclets; materialized away (never encoded).
+    RecoverParentFrameSlot,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -356,6 +365,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::RecvByValueStackParam, "recv_by_value_stack_param"},
     {MnemonicSlot::LeaFrameSlot,       "lea_frame_slot"},
     {MnemonicSlot::FNegMask,           "fneg_mask"},
+    {MnemonicSlot::RecoverParentFrameSlot, "recover_parent_frame_slot"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -630,6 +640,17 @@ struct Lowerer {
     // aligned `.rodata` sign-mask items. Empty on a native-fneg target (arm64).
     std::vector<SignMaskConstant> signMaskConstants_;
 
+    // c116 (D-WIN64-SEH-FUNCLETS): the SEH scope records the SEH pass produced
+    // (keyed by REBUILT parent MIR block ids) + the per-block bookkeeping to
+    // translate them to LIR. `sehScopesIn_` is the input; as each function lowers,
+    // its blocks' MIR→LIR ids + owning func index are recorded persistently (the
+    // per-function `mirBlockToLirBlock` is cleared each function, so it can't be
+    // read after the fact). `run()` then builds one `SehScopeDescriptor` per scope.
+    std::span<MirSehScope const>                     sehScopesIn_;
+    std::unordered_map<std::uint32_t, LirBlockId>    sehMirBlockToLir_;
+    std::unordered_map<std::uint32_t, std::uint32_t> sehMirBlockFuncIndex_;
+    std::vector<SehScopeDescriptor>                  sehScopeDescriptors_;
+
     // Mint a fresh synthetic SymbolId for a jump table's `.data` item. Draws
     // from the SAME monotone `nextBlockSym_` sequence `mintBlockSymbol` uses, so
     // a table symbol can never collide with a block symbol (or a user / extern
@@ -672,10 +693,11 @@ struct Lowerer {
     Lowerer(Mir const& m, TargetSchema const& t, TypeInterner const& i,
             DiagnosticReporter& r,
             std::span<ExternImport const> externImports,
-            std::optional<ExternCallDispatch> externCallDispatch)
+            std::optional<ExternCallDispatch> externCallDispatch,
+            std::span<MirSehScope const> sehScopes)
         : mir(m), target(t), interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()),
-          externCallDispatch_(externCallDispatch) {
+          externCallDispatch_(externCallDispatch), sehScopesIn_(sehScopes) {
         baselineErrors = reporter.errorCount();
         externSymbols.reserve(externImports.size());
         for (auto const& e : externImports) {
@@ -1381,14 +1403,23 @@ struct Lowerer {
             // this lowering emits nothing.
             case MirOpcode::CompilerBarrier: return;
             case MirOpcode::SehTryEnd:
+                // c116 SEH (D-WIN64-SEH-FUNCLETS): a region MARKER at the guarded
+                // body's fall-through exit. It records the scope's [begin,end) PC
+                // range (via the SehScopeDescriptor) but emits NO instruction — the
+                // guarded body just falls through to its own Br. Like
+                // CompilerBarrier, this lowers to nothing.
+                return;
             case MirOpcode::SehExceptionCode:
             case MirOpcode::SehExceptionInfo:
-                // c115 SEH: not lowerable until the c116 funclet/scope-table
-                // arc (D-WIN64-SEH-FUNCLETS) — fail LOUD on every target, and
-                // poison the value ops so downstream uses don't cascade.
+                // c116 SEH: these VALUE ops are rewritten AWAY by
+                // synthesizeSehFunclets (into the funclet's arg0 + a load) and must
+                // never survive here — fail LOUD (defensive) + poison the value so
+                // downstream uses don't cascade. See reportSehNotLowered.
                 reportSehNotLowered(op, id);
-                if (op != MirOpcode::SehTryEnd) poisonValue(id);
+                poisonValue(id);
                 return;
+            case MirOpcode::RecoverParentFrameSlot:
+                return lowerRecoverParentFrameSlot(id);
             case MirOpcode::SDiv:   return lowerDivLike(id, /*isSigned=*/true,  /*wantRemainder=*/false);
             case MirOpcode::UDiv:   return lowerDivLike(id, /*isSigned=*/false, /*wantRemainder=*/false);
             case MirOpcode::SMod:   return lowerDivLike(id, /*isSigned=*/true,  /*wantRemainder=*/true);
@@ -2297,6 +2328,33 @@ struct Lowerer {
             emitInst(*op, result, ops, /*payload=*/slotIndex);
         }
         return result;
+    }
+
+    // c116 H1 (D-WIN64-SEH-FUNCLETS): lower `RecoverParentFrameSlot(establisher)`
+    // (payload = the parent-local slot index) to the LIR `recover_parent_frame_slot`
+    // op — operand[0] = the establisher-frame base register, payload = the slot
+    // index. lir_callconv materializes it into `lea result, [establisherReg +
+    // parentLocalAreaOffset(slotIndex)]` (the parent's config-driven FrameLayout).
+    void lowerRecoverParentFrameSlot(MirInstId id) {
+        auto const op = opcode(MnemonicSlot::RecoverParentFrameSlot);
+        if (!op.has_value()) {
+            reportMissingOpcode(MnemonicSlot::RecoverParentFrameSlot,
+                                "MIR RecoverParentFrameSlot");
+            poisonValue(id);
+            return;
+        }
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(MirOpcode::RecoverParentFrameSlot, id);
+            poisonValue(id);
+            return;
+        }
+        std::optional<LirReg> const base = regForValue(operands[0]);
+        if (!base.has_value()) { poisonValue(id); return; }
+        LirReg const result = lir.newVReg(LirRegClass::GPR);   // a pointer
+        std::array<LirOperand, 1> ops{LirOperand::makeReg(*base)};
+        emitInst(*op, result, ops, /*payload=*/mir.instPayload(id));
+        defineValue(id, result);
     }
 
     void lowerLoad(MirInstId id) {
@@ -4541,35 +4599,80 @@ struct Lowerer {
             case MirOpcode::Switch:      return lowerSwitch(termId, succs);
             case MirOpcode::IndirectBr:  return lowerIndirectBr(termId, succs);
             case MirOpcode::Unreachable: return lowerUnreachable(termId);
-            case MirOpcode::SehTryBegin:
-            case MirOpcode::SehFilterReturn:
-                // c115: the SEH frontend (parse/sema/HIR/MIR) is complete; the
-                // x64 lowering — filter/handler FUNCLETS sharing the parent
-                // frame via the establisher-frame pointer, __C_specific_handler
-                // scope tables + UNW_FLAG_EHANDLER on the c114 UNWIND_INFO, and
-                // the dispatcher wiring — is D-WIN64-SEH-FUNCLETS (c116). Fail
-                // LOUD on EVERY target (no format branch; a non-Windows format
-                // has no SEH model at all): never a silent parse-and-drop.
-                reportSehNotLowered(op, termId);
-                return false;
+            case MirOpcode::SehTryBegin:     return lowerSehTryBegin(termId, succs);
+            case MirOpcode::SehFilterReturn: return lowerSehFilterReturn(termId, succs);
             default:                     break;
         }
         reportUnsupported(op, termId);
         return false;
     }
 
-    // c115 SEH: the anchored fail-loud for the five SEH ops (the honest c115
-    // boundary — sqlite compiles SEH source through MIR and stops EXACTLY here).
+    // c116 SEH (D-WIN64-SEH-FUNCLETS): the `SehException{Code,Info}` VALUE ops are
+    // rewritten AWAY by `synthesizeSehFunclets` (into the funclet's arg0 + a load),
+    // so they must NEVER survive to mir_to_lir. This is the defensive fail-loud for
+    // that invariant: reaching it means the SEH pass did not run (or missed a
+    // region) — a real diagnostic, never a silent miscompile. (SehTryBegin /
+    // SehFilterReturn / SehTryEnd are handled as markers below; they DO survive.)
     void reportSehNotLowered(MirOpcode op, MirInstId at) {
         ParseDiagnostic d;
         d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
         d.severity = DiagnosticSeverity::Error;
         d.actual   = std::format(
-            "MIR opcode '{}' (SEH __try/__except) is not yet lowered to target "
-            "'{}' (inst {}): the x64 filter-funclet + __C_specific_handler "
-            "scope-table lowering is D-WIN64-SEH-FUNCLETS (c116)",
+            "MIR opcode '{}' (SEH intrinsic) reached mir_to_lir un-rewritten "
+            "(target '{}', inst {}): synthesizeSehFunclets must lower every "
+            "SehExceptionCode/Info into a funclet read before lowering "
+            "(D-WIN64-SEH-FUNCLETS)",
             mirOpcodeName(op), target.name(), at.v);
         reporter.report(std::move(d));
+    }
+
+    // c116 SEH (D-WIN64-SEH-FUNCLETS): SehTryBegin is a region MARKER — the OS
+    // dispatches into the filter/handler via the __C_specific_handler scope table,
+    // NOT via a runtime branch here. So it emits ONLY the fall-through into the
+    // guarded body (succ[0] = tryBB); the filter successor (succ[1]) is the H2
+    // CFG-fiction edge, kept in the MIR/LIR CFG for reachability but never turned
+    // into a branch. The scope table (built from the SehScopeDescriptor) carries
+    // the real dispatch geometry. Returns true (block sealed with the Br).
+    bool lowerSehTryBegin(MirInstId id, std::span<MirBlockId const> succs) {
+        if (succs.size() != 2) {
+            reportUnsupported(MirOpcode::SehTryBegin, id);
+            return false;
+        }
+        if (!opcode(MnemonicSlot::Jmp).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Jmp, "MIR SehTryBegin");
+            return false;
+        }
+        if (!mirBlockToLirBlock.has(succs[0])) {
+            reportUnsupported(MirOpcode::SehTryBegin, id);
+            return false;
+        }
+        emitBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(succs[0]));
+        return true;
+    }
+
+    // c116 SEH (D-WIN64-SEH-FUNCLETS): SehFilterReturn is a MARKER in the PARENT
+    // (the real filter logic was extracted into a funclet by synthesizeSehFunclets;
+    // the parent's filter block is a `[Const; SehFilterReturn]` stub reached only by
+    // the CFG-fiction edge and never executed at runtime — the guarded body branches
+    // over it). It emits NO runtime dispatch; we seal the block with a branch to its
+    // (fiction) handler successor so the LIR CFG mirrors the MIR CFG (handlerBB keeps
+    // a predecessor). Dead at runtime; the OS resumes at handlerBB via the scope
+    // table's JumpTarget. Returns true (sealed).
+    bool lowerSehFilterReturn(MirInstId id, std::span<MirBlockId const> succs) {
+        if (succs.size() != 1) {
+            reportUnsupported(MirOpcode::SehFilterReturn, id);
+            return false;
+        }
+        if (!opcode(MnemonicSlot::Jmp).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Jmp, "MIR SehFilterReturn");
+            return false;
+        }
+        if (!mirBlockToLirBlock.has(succs[0])) {
+            reportUnsupported(MirOpcode::SehFilterReturn, id);
+            return false;
+        }
+        emitBr(*opcode(MnemonicSlot::Jmp), mirBlockToLirBlock.get(succs[0]));
+        return true;
     }
 
     bool lowerReturn(MirInstId id) {
@@ -5393,6 +5496,15 @@ struct Lowerer {
             MirBlockId const mb = mir.funcBlockAt(mf, i);
             LirBlockId const lb = lir.createBlock();
             mirBlockToLirBlock.set(mb, lb);
+            // c116 (D-WIN64-SEH-FUNCLETS): persistently record each block's MIR→LIR
+            // id + owning func index so the SEH scope records (which reference
+            // parent MIR blocks) can be translated in `run()` after every function
+            // is lowered (the per-function `mirBlockToLirBlock` is cleared each
+            // function). Only populated when the module actually carries SEH scopes.
+            if (!sehScopesIn_.empty()) {
+                sehMirBlockToLir_[mb.v]     = lb;
+                sehMirBlockFuncIndex_[mb.v] = currentFuncIndex_;
+            }
         }
         // Pre-pass 2: allocate vregs for all Phi results so back-edge
         // predecessor moves resolve cleanly.
@@ -5467,6 +5579,11 @@ struct Lowerer {
             currentFuncIndex_ = i;
             lowerFunction(mir.funcAt(i));
         }
+        // c116 (D-WIN64-SEH-FUNCLETS): translate each SEH scope (parent MIR block
+        // ids) to LIR block ids + emit one SehScopeDescriptor. All three blocks of
+        // a scope live in ONE parent function, so their funcIndex agrees; we key on
+        // the begin block's owning function.
+        buildSehScopeDescriptors();
         Lir frozen = std::move(lir).finish();
         // Ensure lirToMir spans every LIR inst slot (any trailing
         // slots without recorded sources default to InvalidMirInst).
@@ -5482,9 +5599,41 @@ struct Lowerer {
             .lirToMir             = std::move(lirToMir),
             .jumpTableDescriptors = std::move(jumpTableDescriptors_),
             .signMaskConstants    = std::move(signMaskConstants_),
+            .sehScopeDescriptors  = std::move(sehScopeDescriptors_),
             .externImports        = {},
             .ok                   = !hadError()
         };
+    }
+
+    // c116 (D-WIN64-SEH-FUNCLETS): build one SehScopeDescriptor per MirSehScope by
+    // translating its (rebuilt-module) parent MIR block ids to LIR block ids via the
+    // persistent map. Fails loud (never a silent drop) if a scope block was not
+    // lowered — that would mean a region referenced a nonexistent block.
+    void buildSehScopeDescriptors() {
+        for (auto const& s : sehScopesIn_) {
+            auto beginIt = sehMirBlockToLir_.find(s.beginBlock.v);
+            auto endIt   = sehMirBlockToLir_.find(s.endBlock.v);
+            auto handIt  = sehMirBlockToLir_.find(s.handlerBlock.v);
+            auto fiIt    = sehMirBlockFuncIndex_.find(s.beginBlock.v);
+            if (beginIt == sehMirBlockToLir_.end() || endIt == sehMirBlockToLir_.end()
+                || handIt == sehMirBlockToLir_.end() || fiIt == sehMirBlockFuncIndex_.end()) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = "mir_to_lir: a SEH scope references a MIR block that "
+                             "was not lowered (D-WIN64-SEH-FUNCLETS)";
+                reporter.report(std::move(d));
+                continue;
+            }
+            SehScopeDescriptor desc;
+            desc.funcIndex           = fiIt->second;
+            desc.beginLirBlockV      = beginIt->second.v;
+            desc.endLirBlockV        = endIt->second.v;
+            desc.handlerLirBlockV    = handIt->second.v;
+            desc.filterFuncletSymbol = s.filterFuncletSymbol;
+            desc.personalitySymbol   = s.personalitySymbol;
+            sehScopeDescriptors_.push_back(desc);
+        }
     }
 };
 
@@ -5495,7 +5644,8 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           TypeInterner const& interner,
                           DiagnosticReporter& reporter,
                           std::vector<ExternImport> externImports,
-                          std::optional<ExternCallDispatch> externCallDispatch) {
+                          std::optional<ExternCallDispatch> externCallDispatch,
+                          std::span<MirSehScope const> sehScopes) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
     // extern-targeting calls from module-internal direct calls.
@@ -5505,7 +5655,7 @@ MirToLirResult lowerToLir(Mir const&          mir,
     // (direct-plt: ELF PLT stub) from it. nullopt + extern imports =
     // fail-loud (no silent default to either shape).
     Lowerer L{mir, target, interner, reporter, externImports,
-              externCallDispatch};
+              externCallDispatch, sehScopes};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /

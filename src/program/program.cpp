@@ -447,6 +447,16 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         return false;  // optimize / verify failure already reported via `reporter`
     }
 
+    // c116 (D-WIN64-SEH-FUNCLETS): synthesize the SEH filter funclets + record the
+    // scope ranges on the WHOLE-PROGRAM merged module (post-optimize, mirroring the
+    // single-CU seam). Trigger = presence of SehTryBegin (a fast no-op otherwise).
+    // Appends the __C_specific_handler personality import on demand.
+    std::vector<MirSehScope> sehScopes;
+    if (!synthesizeSehFunclets(merged->mir, merged->host.interner(),
+                               merged->externImports, sehScopes, reporter)) {
+        return false;  // unsupported SEH shape (c116b frontier) — fail-loud reported.
+    }
+
     // D-FFI-EXTERN-CALL-DISPATCH: the merged module compiles to ONE
     // (target, format); pass that format's extern-call shape so MIR→LIR
     // selects the right call-site opcode for any surviving extern import.
@@ -458,6 +468,7 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                      effectiveBitFieldStrategy(**targetR, **formatR),
                                      ccIndex, cuMirs[0].cuId,
                                      (*formatR)->externCallDispatch(),
+                                     std::move(sehScopes),
                                      reporter);
     if (!mod) return false;  // back-half tier failure already reported via `reporter`
     return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},

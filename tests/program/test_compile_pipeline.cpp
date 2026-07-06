@@ -1024,7 +1024,8 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
                                      (*formatR)->dataModel(),
                                      effectiveBitFieldStrategy(**targetR, **formatR),
                                      ccIndex,
-                                     cuMirs[0].cuId, std::nullopt, rep);
+                                     cuMirs[0].cuId, std::nullopt,
+                                     /*sehScopes=*/{}, rep);
     ASSERT_TRUE(mod.has_value()) << "errorCount=" << rep.errorCount();
 
     // (2) The lowered module carries no `add5` import either (direct call).

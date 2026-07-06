@@ -4363,6 +4363,39 @@ struct Lowerer {
         }
     }
 
+    // c116b H1 (D-WIN64-SEH-FUNCLETS): collect the symbols referenced by any SEH
+    // `__except` FILTER expression in the function body. The filter is extracted into
+    // a separate funclet function that runs at fault time; it can only reach a parent
+    // local through the parent's FRAME (RecoverParentFrameSlot). A parent PARAMETER is
+    // otherwise a pure SSA `Arg` value (not in memory), which the funclet cannot
+    // recover — so every filter-referenced symbol must be forced MEMORY-BACKED
+    // (address-taken) in the parent, exactly like mem2reg is skipped for SEH bodies.
+    // Body locals are already slot-backed via their VarDecl; this closes the PARAM
+    // gap (sqlite's `sehExceptionFilter(pWal, …)` reads the `pWal` parameter). Keyed
+    // on the SEH HIR node (a C-language construct), not arch/format.
+    void collectSehFilterReferencedSymbols(
+        HirNodeId node, std::unordered_set<std::uint32_t>& out) {
+        if (!node.valid()) return;
+        if (hir.kind(node) == HirKind::SehTryExcept) {
+            HirNodeId const filterN = hir.sehTryFilter(node);
+            collectRefSymbols(filterN, out);
+        }
+        for (HirNodeId child : hir.children(node)) {
+            collectSehFilterReferencedSymbols(child, out);
+        }
+    }
+
+    // Collect every `Ref`-node symbol reachable under `node` (any depth). Used by the
+    // SEH-filter escape analysis to force filter-referenced params into memory.
+    void collectRefSymbols(HirNodeId node,
+                           std::unordered_set<std::uint32_t>& out) {
+        if (!node.valid()) return;
+        if (hir.kind(node) == HirKind::Ref) out.insert(hir.payload(node));
+        for (HirNodeId child : hir.children(node)) {
+            collectRefSymbols(child, out);
+        }
+    }
+
     // D-CSUBSET-COMPUTED-GOTO: collect every LABEL ORDINAL whose address is taken
     // via `&&label` (LabelAddressOf) anywhere in the function body, so an IndirectBr
     // can list all address-taken blocks as successors. A forward `&&end` (textually
@@ -6959,6 +6992,13 @@ struct Lowerer {
         HirNodeId const body = hir.functionBody(node);
         std::unordered_set<std::uint32_t> addressTaken;
         collectAddressTakenSymbols(body, addressTaken);
+        // c116b H1 (D-WIN64-SEH-FUNCLETS): also force every SEH `__except` FILTER-
+        // referenced symbol memory-backed. The filter is extracted into a funclet
+        // that recovers parent locals off the establisher frame (RecoverParentFrame
+        // Slot), which only works for a FRAME slot — a bare `Arg` param is otherwise
+        // unrecoverable. Union into the address-taken set so the param-reception loop
+        // below alloca-backs it (sqlite's `sehExceptionFilter(pWal, …)` param).
+        collectSehFilterReferencedSymbols(body, addressTaken);
         // D-CSUBSET-COMPUTED-GOTO: collect the address-taken LABEL ordinals up front
         // (a forward `&&end` must be a known IndirectBr successor regardless of
         // textual order). The blocks are created lazily at first reference.

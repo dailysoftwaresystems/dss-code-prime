@@ -7,11 +7,13 @@
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "lir/lir.hpp"
+#include "mir/merge/synth_seh_funclets.hpp"   // MirSehScope (c116 D-WIN64-SEH-FUNCLETS)
 #include "mir/mir.hpp"
 
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -103,6 +105,28 @@ struct DSS_EXPORT SignMaskConstant {
     bool     isF64 = true;    // true → F64 mask (bit 63); false → F32 mask (bit 31)
 };
 
+// c116 (D-WIN64-SEH-FUNCLETS): one descriptor per MSVC-x64 `__try` region the
+// lowerer saw (via a `SehTryBegin` marker in the parent function). Like a
+// JumpTableDescriptor it carries only what the assembler-adjacent pipeline needs
+// AFTER `assemble()` resolves each block's byte offset: the LIR block ids of the
+// guarded body's [entry, exit) and the `__except` handler, plus the symbols the
+// pe writer resolves to image-RVAs (the filter funclet + the __C_specific_handler
+// personality). `compile_pipeline.cpp` translates the LIR block ids to byte
+// offsets against the owning function's `blockByteOffsets` and attaches a
+// `SehScopeEntry` to that function's `FrameUnwindInfo.sehScopes`; the pe writer
+// then emits the scope table + UNW_FLAG_EHANDLER. The SEH markers themselves
+// (`SehTryBegin`/`SehTryEnd`/`SehFilterReturn`) emit NO runtime branch — the OS
+// dispatches into the handler via the scope table, so these ids are pure position
+// data (the c114 .pdata + c70 jump-table link-time-RVA pattern).
+struct DSS_EXPORT SehScopeDescriptor {
+    std::size_t   funcIndex        = 0;  // index into lir.funcAt(i) of the owning (parent) function
+    std::uint32_t beginLirBlockV   = 0;  // LIR block .v of the guarded body's entry (try block)
+    std::uint32_t endLirBlockV     = 0;  // LIR block .v marking one-past the guarded body (the range end)
+    std::uint32_t handlerLirBlockV = 0;  // LIR block .v of the __except handler body
+    SymbolId      filterFuncletSymbol{}; // the synthesized filter-funclet function symbol
+    SymbolId      personalitySymbol{};   // __C_specific_handler extern symbol
+};
+
 struct DSS_EXPORT MirToLirResult {
     Lir                    lir;
     std::vector<MirInstId> lirToMir;
@@ -116,6 +140,11 @@ struct DSS_EXPORT MirToLirResult {
     // `compile_pipeline.cpp` to emit each mask's 16-byte, 16-byte-aligned
     // `.rodata` `AssembledData`. Empty on a native-fneg target (arm64).
     std::vector<SignMaskConstant> signMaskConstants;
+    // c116 (D-WIN64-SEH-FUNCLETS): one descriptor per `__try` region. Consumed by
+    // `compile_pipeline.cpp` AFTER `assemble()` to attach a `SehScopeEntry` to the
+    // owning function's `FrameUnwindInfo.sehScopes` (byte offsets from that
+    // function's `blockByteOffsets`). Empty for every module without a `__try`.
+    std::vector<SehScopeDescriptor> sehScopeDescriptors;
     // Extern symbol descriptors propagated from `HirToMirResult.
     // externImports` (LK6 cycle 2d — D-LK6-6 closure). LIR does
     // not consume these structurally (call sites carry SymbolRef
@@ -171,6 +200,12 @@ lowerToLir(Mir const&          mir,
            // active format's value, and only extern-bearing modules
            // consume it (a static module never reaches the guard).
            std::optional<ExternCallDispatch> externCallDispatch =
-               std::nullopt);
+               std::nullopt,
+           // c116 (D-WIN64-SEH-FUNCLETS): the SEH scope records produced by
+           // `synthesizeSehFunclets` (keyed by the REBUILT module's parent MIR
+           // block ids). Each is translated to LIR block ids + emitted as a
+           // `SehScopeDescriptor` on the result. Empty for every module without a
+           // `__try`; a non-SEH module never reaches the translation.
+           std::span<MirSehScope const> sehScopes = {});
 
 } // namespace dss

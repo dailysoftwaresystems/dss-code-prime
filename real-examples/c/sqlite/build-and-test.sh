@@ -251,17 +251,17 @@ for entry in "${TARGETS[@]}"; do
   # stdout+stderr log means the frontier stopped this target. Run the compile
   # unconditionally (its rc is unreliable either way), then classify by grep.
   # `--time` asks the compiler to self-report its wall-clock (surfaced below).
-  # c105 (the MSVC-profile flip): the pe target passes sqlite's OWN sanctioned
-  # build knob — SQLITE_OMIT_SEH (DSS's _MSC_VER mask does not implement the
-  # MSVC SEH __try/__except language extension; MinGW sqlite ships SEH-less the
-  # same way). Build configuration, not compiler behavior: exactly the -D flag
-  # an MSVC build script would pass. (SQLITE_DISABLE_INTRINSIC was DROPPED at
-  # c113: DSS resolves <intrin.h> via the pe-gated shippedLibs/intrin.json
-  # descriptor and lowers __umulh + _ReadWriteBarrier as builtin intrinsics.)
+  # The pe64 target now compiles sqlite with NO extra defines. Both former knobs are
+  # closed by real compiler support: SQLITE_DISABLE_INTRINSIC dropped at c113 (DSS
+  # resolves <intrin.h> via the pe-gated shippedLibs/intrin.json descriptor and lowers
+  # __umulh + _ReadWriteBarrier as builtin intrinsics), and SQLITE_OMIT_SEH dropped at
+  # c116 (DSS implements the MSVC x64 SEH __try/__except: c114 .pdata/.xdata, c115 the
+  # __try/__except frontend, c116 the filter FUNCLETS + __C_specific_handler scope
+  # tables + H1 parent-local recovery — the wal.c SEH_TRY/SEH_EXCEPT WAL-recovery
+  # guards now CATCH an EXCEPTION_IN_PAGE_ERROR on the mmap'd wal-index → SQLITE_IOERR,
+  # exactly like an MSVC build). The pe64 sqlite compile is now define-free, matching
+  # the ELF/Mach-O legs. (D-WIN64-SEH-FUNCLETS / D-WIN64-XMM-UNWIND-RESTORE.)
   declare -a defines=()
-  if [[ "$spec" == *"pe64"* ]]; then
-    defines+=(--define SQLITE_OMIT_SEH=1)
-  fi
   "$DSS_BIN" --compile "${units[@]}" --language "$LANGUAGE" --target "$spec" --output "$outd" --time "${defines[@]}" >"$log" 2>&1 || true
   if grep -qE 'error\[' "$log"; then
     COMPILE_FAILS=$((COMPILE_FAILS + 1))

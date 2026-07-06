@@ -1,0 +1,12 @@
+{
+  "$comment": "c116b (D-WIN64-SEH-FUNCLETS): the runtime witness that a MULTI-BLOCK __try guarded body (a loop + conditionals + a faulting read) is caught. sqlite's SEH_TRY bodies are large multi-block regions; the scope-table [BeginAddress, EndAddress) must cover the WHOLE region as ONE contiguous PC range. c116b's region-contiguity relayout lays the guarded body's blocks contiguously in .text (the optimizer's RPO order otherwise interleaves the join/handler between body blocks), so [Begin,End) covers exactly the body. Here the body runs a loop then faults on a no-access read; the fault INSIDE the multi-block body dispatches to the __except handler -> exit 42. Unforgeable: if the scope-table range did not cover the faulting block (region not contiguous) the AV escapes uncaught -> crash (no exit 42). The `release` arm proves the contiguity relayout composes with the full optimizer. pe64-ONLY: x64 SEH + windows.h are Windows. RED-on-disable: revert the c116b region-contiguity relayout -> a multi-block guarded body fails loud at compile (D-WIN64-SEH-FUNCLETS), so this does not build.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -37,9 +37,11 @@
 #include "core/types/target_schema.hpp"        // ProcessArgs / ArgsMechanism (c111)
 #include "mir/merge/mir_merge.hpp"
 #include "mir/merge/synth_pe_startup.hpp"       // synthesizePeStartup (c111)
+#include "mir/merge/synth_seh_funclets.hpp"     // synthesizeSehFunclets (c116)
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "mir/mir_struct_markers.hpp"            // rederiveStructCfMarkers (c116b test)
 #include "mir/mir_verifier.hpp"
 
 #include "diagnostic_count.hpp"
@@ -982,4 +984,352 @@ TEST(SynthPeStartup, NonCrtMechanismIsANoOp) {
     EXPECT_EQ(mir.moduleFuncCount(), 1u) << "a non-CRT mechanism synthesizes nothing";
     EXPECT_TRUE(ext.empty());
     EXPECT_EQ(entry->v, 100u);
+}
+
+// ── c116 (D-WIN64-SEH-FUNCLETS): synthesizeSehFunclets structural pins ─────────
+// The SEH funclet-synthesis pass EXTRACTS each `__try`'s filter into a synthesized
+// ms_x64 funclet, reduces the parent's filter block to a `[Const; SehFilterReturn]`
+// stub, and records the scope range. These pins assert that shape HOST-
+// INDEPENDENTLY (every leg), complementing the Windows-only AV→42 runtime witness
+// (examples/c-subset/seh_catch_av):
+//   * ExtractsFilterFuncletAndStubsParent — a single-`__try` parent gains ONE
+//     appended funclet fn, the __C_specific_handler personality import, one scope
+//     record; the funclet READS arg0 + RETURNS; the parent keeps NO SehException*
+//     op (they moved to the funclet) but KEEPS the SehTryBegin/End markers + the
+//     SehFilterReturn stub (the H2 fiction edge); the rebuilt module verifies.
+//   * NoSehIsANoOp — a module with no `__try` is untouched (no funclet, no import).
+
+// A hand-built SEH parent matching the c115 hir_to_mir CFG:
+//   entry:    SehTryBegin(id) → [tryBB, filterBB]
+//   tryBB:    <guarded body: a load>; SehTryEnd(id); Br(joinBB)
+//   filterBB: code = SehExceptionCode(); SehFilterReturn(code) → handlerBB
+//   handlerBB: Br(joinBB)
+//   joinBB:   return 0
+// `sym` is the parent's SymbolId; the guarded body is a single block (c116a).
+Mir buildSehParent(TypeInterner& in, SymbolId sym) {
+    TypeId const i32   = in.primitive(TypeKind::I32);
+    TypeId const u32   = in.primitive(TypeKind::U32);
+    TypeId const pI32  = in.pointer(i32);
+    TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    mb.addFunction(sig, sym);
+    MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tryBB    = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const filterBB = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const handlerBB= mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const joinBB   = mb.createBlock(StructCfMarker::Linear);
+    std::uint32_t const region = 0;
+
+    mb.beginBlock(entry);
+    mb.addSehTryBegin(tryBB, filterBB, region);
+
+    mb.beginBlock(tryBB);
+    // A guarded load off a stack slot (something that could fault at runtime).
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    (void)mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{slot}, i32);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, region);
+    mb.addBr(joinBB);
+
+    mb.beginBlock(filterBB);
+    MirInstId const code = mb.addInst(MirOpcode::SehExceptionCode, {}, u32);
+    // filter value = (code == 0xC0000005) as i32.
+    MirLiteralValue av; av.value = std::int64_t{0xC0000005}; av.core = TypeKind::U32;
+    MirInstId const avc = mb.addConst(std::move(av), u32);
+    MirInstId const cmp = mb.addInst(MirOpcode::ICmpEq,
+                                     std::array<MirInstId, 2>{code, avc}, i32);
+    mb.addSehFilterReturn(cmp, handlerBB, region);
+
+    mb.beginBlock(handlerBB);
+    mb.addBr(joinBB);
+
+    mb.beginBlock(joinBB);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    return std::move(mb).finish();
+}
+
+TEST(SynthSehFunclets, ExtractsFilterFuncletAndStubsParent) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSehParent(in, SymbolId{100});
+
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, scopes, rep));
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    // One funclet was appended alongside the parent.
+    EXPECT_EQ(mir.moduleFuncCount(), 2u) << "the filter funclet must be appended";
+    // Exactly the __C_specific_handler personality import was added (SEH-gated).
+    ASSERT_EQ(ext.size(), 1u);
+    EXPECT_EQ(ext[0].mangledName, "__C_specific_handler");
+    EXPECT_EQ(ext[0].libraryPath, "msvcrt.dll");
+    EXPECT_FALSE(ext[0].isData);
+    // One scope record, naming the funclet + the personality.
+    ASSERT_EQ(scopes.size(), 1u);
+    EXPECT_EQ(scopes[0].parentFuncSymbol.v, 100u);
+    EXPECT_EQ(scopes[0].personalitySymbol.v, ext[0].symbol.v);
+
+    // The funclet: resolve it by its recorded symbol; it reads arg0 (the exception
+    // pointers) and returns — NO SehException* op survives (they became a load).
+    auto const funclet = findFuncBySymbol(mir, scopes[0].filterFuncletSymbol);
+    ASSERT_TRUE(funclet.has_value());
+    bool funcletHasArg = false, funcletReturns = false, funcletSeh = false;
+    {
+        std::uint32_t const nb = mir.funcBlockCount(*funclet);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(*funclet, bi);
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t ii = 0; ii < ni; ++ii) {
+                MirOpcode const op = mir.instOpcode(mir.blockInstAt(b, ii));
+                if (op == MirOpcode::Arg) funcletHasArg = true;
+                if (op == MirOpcode::Return) funcletReturns = true;
+                if (op == MirOpcode::SehExceptionCode
+                    || op == MirOpcode::SehExceptionInfo) funcletSeh = true;
+            }
+        }
+    }
+    EXPECT_TRUE(funcletHasArg)  << "the funclet reads arg0 (EXCEPTION_POINTERS*)";
+    EXPECT_TRUE(funcletReturns) << "the funclet returns the filter value";
+    EXPECT_FALSE(funcletSeh)    << "SehException* was rewritten into a funclet load";
+
+    // The PARENT keeps the region markers + the SehFilterReturn stub (the H2
+    // fiction edge) but carries NO SehException* op (they moved to the funclet).
+    EXPECT_EQ(countOp(mir, MirOpcode::SehTryBegin), 1u);
+    EXPECT_EQ(countOp(mir, MirOpcode::SehTryEnd), 1u);
+    EXPECT_EQ(countOp(mir, MirOpcode::SehFilterReturn), 1u);
+    EXPECT_EQ(countOp(mir, MirOpcode::SehExceptionCode), 0u)
+        << "the parent's filter read moved into the funclet (stub has none)";
+
+    // The rebuilt module is well-formed.
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << "the SEH-lowered module must verify";
+}
+
+TEST(SynthSehFunclets, NoSehIsANoOp) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const sig = in.fnSig({}, i32, CallConv::CcMS64);
+    Mir mir = buildEntryOnly(in, sig);
+
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, scopes, rep));
+    EXPECT_EQ(mir.moduleFuncCount(), 1u) << "no __try → no funclet appended";
+    EXPECT_TRUE(ext.empty())             << "no __try → no personality import";
+    EXPECT_TRUE(scopes.empty())          << "no __try → no scope records";
+}
+
+// c116b (D-WIN64-SEH-FUNCLETS): a MULTI-BLOCK guarded body. The try body is a small
+// diamond (entry → {then, else} → merge; merge holds SehTryEnd) so the region spans
+// FOUR blocks. The pass must (a) accept it (not fail loud) and (b) lay the body out
+// contiguously with `endBlock` = the body's LAST laid-out block (the merge block, one
+// of the region's blocks — never the join/handler). A hand-built parent whose join is
+// deliberately created BEFORE some body blocks would, without the relayout, leave the
+// scope range non-contiguous; this pin asserts the region-contiguity invariant.
+Mir buildSehParentMultiBlockBody(TypeInterner& in, SymbolId sym) {
+    TypeId const i32   = in.primitive(TypeKind::I32);
+    TypeId const u32   = in.primitive(TypeKind::U32);
+    TypeId const pI32  = in.pointer(i32);
+    TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    mb.addFunction(sig, sym);
+    MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tryBB    = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const thenBB   = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const elseBB   = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const mergeBB  = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const filterBB = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const handlerBB= mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const joinBB   = mb.createBlock(StructCfMarker::Linear);
+    std::uint32_t const region = 0;
+
+    mb.beginBlock(entry);
+    mb.addSehTryBegin(tryBB, filterBB, region);
+
+    TypeId const boolTy = in.primitive(TypeKind::Bool);
+    mb.beginBlock(tryBB);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    MirInstId const v    = mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{slot}, i32);
+    MirInstId const zero = mb.addConst(i32Lit(0), i32);
+    MirInstId const cnd  = mb.addInst(MirOpcode::ICmpNe,
+                                      std::array<MirInstId, 2>{v, zero}, boolTy);
+    mb.addCondBr(cnd, thenBB, elseBB);
+
+    mb.beginBlock(thenBB);
+    mb.addBr(mergeBB);
+    mb.beginBlock(elseBB);
+    mb.addBr(mergeBB);
+
+    mb.beginBlock(mergeBB);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, region);
+    mb.addBr(joinBB);
+
+    mb.beginBlock(filterBB);
+    MirInstId const code = mb.addInst(MirOpcode::SehExceptionCode, {}, u32);
+    MirLiteralValue av; av.value = std::int64_t{0xC0000005}; av.core = TypeKind::U32;
+    MirInstId const avc = mb.addConst(std::move(av), u32);
+    MirInstId const cmp = mb.addInst(MirOpcode::ICmpEq,
+                                     std::array<MirInstId, 2>{code, avc}, i32);
+    mb.addSehFilterReturn(cmp, handlerBB, region);
+
+    mb.beginBlock(handlerBB);
+    mb.addBr(joinBB);
+    mb.beginBlock(joinBB);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    return std::move(mb).finish();
+}
+
+TEST(SynthSehFunclets, MultiBlockGuardedBodyIsContiguousAndBounded) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSehParentMultiBlockBody(in, SymbolId{100});
+
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, scopes, rep));
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(scopes.size(), 1u);
+
+    // The rebuilt parent must lay the guarded body's blocks (tryBB entry, then, else,
+    // merge) CONTIGUOUSLY, with `beginBlock` first and `endBlock` the last of the
+    // run. Resolve the parent, then confirm: (a) the block index of `beginBlock`
+    // through `endBlock` is a contiguous span, and (b) every block in that span is a
+    // region block (NOT the handler/join). We identify region blocks structurally:
+    // the guarded body's blocks are exactly those reachable from beginBlock without
+    // passing the SehTryEnd block's successors or the handler.
+    auto const parent = findFuncBySymbol(mir, SymbolId{100});
+    ASSERT_TRUE(parent.has_value());
+    std::uint32_t const nb = mir.funcBlockCount(*parent);
+    // Position (layout index) of begin + end in the rebuilt block list.
+    std::optional<std::uint32_t> beginPos, endPos;
+    for (std::uint32_t i = 0; i < nb; ++i) {
+        MirBlockId const b = mir.funcBlockAt(*parent, i);
+        if (b.v == scopes[0].beginBlock.v) beginPos = i;
+        if (b.v == scopes[0].endBlock.v)   endPos = i;
+    }
+    ASSERT_TRUE(beginPos.has_value());
+    ASSERT_TRUE(endPos.has_value());
+    EXPECT_LE(*beginPos, *endPos) << "the guarded body's begin must precede its end";
+    // The [begin,end] layout span must be 4 blocks (tryBB, then, else, merge) — the
+    // full region, contiguous. (Any interleaved non-region block would make the span
+    // wider than the region, breaking the scope-table [Begin,End) correctness.)
+    EXPECT_EQ(*endPos - *beginPos + 1u, 4u)
+        << "the multi-block guarded body must be laid out CONTIGUOUSLY (4 blocks) so "
+           "the scope-table [Begin,End) covers exactly the region";
+
+    // The endBlock must be the block that holds SehTryEnd (the body's fall-through
+    // exit), NOT the join/handler.
+    bool endHoldsTryEnd = false;
+    {
+        MirBlockId const eb = scopes[0].endBlock;
+        std::uint32_t const ni = mir.blockInstCount(eb);
+        for (std::uint32_t i = 0; i < ni; ++i)
+            if (mir.instOpcode(mir.blockInstAt(eb, i)) == MirOpcode::SehTryEnd)
+                endHoldsTryEnd = true;
+    }
+    EXPECT_TRUE(endHoldsTryEnd)
+        << "endBlock must be the guarded body's SehTryEnd (fall-through exit) block";
+
+    // The hand-built diamond stamps every block Linear; in the real pipeline the
+    // mandatory prune's rederiveStructCfMarkers has already canonicalized the markers
+    // (if/merge) before synthesizeSehFunclets runs. Mirror that here so the verifier's
+    // stored-vs-derived marker check reflects a real post-prune module.
+    rederiveStructCfMarkers(mir);
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << "the multi-block SEH-lowered module must verify";
+}
+
+// c116b H1 (D-WIN64-SEH-FUNCLETS): a filter that READS A PARENT LOCAL. The parent has
+// a local alloca `slot`; the filter compares `Load [slot]` against a constant. The
+// funclet-extraction must recover the parent local via a `RecoverParentFrameSlot` op
+// (off the establisher arg) — the parent alloca is NOT re-created in the funclet.
+Mir buildSehParentFilterReadsLocal(TypeInterner& in, SymbolId sym) {
+    TypeId const i32   = in.primitive(TypeKind::I32);
+    TypeId const u32   = in.primitive(TypeKind::U32);
+    TypeId const pI32  = in.pointer(i32);
+    TypeId const sig   = in.fnSig({}, i32, CallConv::CcMS64);
+    MirBuilder mb;
+    mb.addFunction(sig, sym);
+    MirBlockId const entry    = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tryBB    = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const filterBB = mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const handlerBB= mb.createBlock(StructCfMarker::Linear);
+    MirBlockId const joinBB   = mb.createBlock(StructCfMarker::Linear);
+    std::uint32_t const region = 0;
+
+    // The parent local `marker` — an alloca in the ENTRY block (the c69 convention).
+    mb.beginBlock(entry);
+    MirInstId const marker = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    mb.addSehTryBegin(tryBB, filterBB, region);
+
+    mb.beginBlock(tryBB);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pI32, 4);
+    (void)mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{slot}, i32);
+    mb.addInst(MirOpcode::SehTryEnd, {}, InvalidType, region);
+    mb.addBr(joinBB);
+
+    // filter: (SehExceptionCode()==0xC0000005) & (Load[marker]==42)  — reads a PARENT
+    // local. Bitwise & keeps it single-block.
+    mb.beginBlock(filterBB);
+    MirInstId const code = mb.addInst(MirOpcode::SehExceptionCode, {}, u32);
+    MirLiteralValue av; av.value = std::int64_t{0xC0000005}; av.core = TypeKind::U32;
+    MirInstId const avc = mb.addConst(std::move(av), u32);
+    MirInstId const c1  = mb.addInst(MirOpcode::ICmpEq,
+                                     std::array<MirInstId, 2>{code, avc}, i32);
+    MirInstId const mv  = mb.addInst(MirOpcode::Load, std::array<MirInstId, 1>{marker}, i32);
+    MirInstId const k42 = mb.addConst(i32Lit(42), i32);
+    MirInstId const c2  = mb.addInst(MirOpcode::ICmpEq,
+                                     std::array<MirInstId, 2>{mv, k42}, i32);
+    MirInstId const both= mb.addInst(MirOpcode::And,
+                                     std::array<MirInstId, 2>{c1, c2}, i32);
+    mb.addSehFilterReturn(both, handlerBB, region);
+
+    mb.beginBlock(handlerBB);
+    mb.addBr(joinBB);
+    mb.beginBlock(joinBB);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    return std::move(mb).finish();
+}
+
+TEST(SynthSehFunclets, FilterReadingParentLocalEmitsRecoverParentFrameSlot) {
+    TypeInterner in{CompilationUnitId{1}};
+    Mir mir = buildSehParentFilterReadsLocal(in, SymbolId{100});
+
+    std::vector<ExternImport> ext;
+    std::vector<MirSehScope>  scopes;
+    DiagnosticReporter        rep;
+    ASSERT_TRUE(synthesizeSehFunclets(mir, in, ext, scopes, rep));
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(scopes.size(), 1u);
+
+    // The funclet recovers the parent local via RecoverParentFrameSlot (off arg1, the
+    // establisher). The parent alloca is NOT re-created inside the funclet.
+    auto const funclet = findFuncBySymbol(mir, scopes[0].filterFuncletSymbol);
+    ASSERT_TRUE(funclet.has_value());
+    std::uint32_t recoverCount = 0, funcletAllocas = 0, funcletLoads = 0;
+    std::uint32_t const nbf = mir.funcBlockCount(*funclet);
+    for (std::uint32_t bi = 0; bi < nbf; ++bi) {
+        MirBlockId const b = mir.funcBlockAt(*funclet, bi);
+        std::uint32_t const ni = mir.blockInstCount(b);
+        for (std::uint32_t ii = 0; ii < ni; ++ii) {
+            MirOpcode const op = mir.instOpcode(mir.blockInstAt(b, ii));
+            if (op == MirOpcode::RecoverParentFrameSlot) ++recoverCount;
+            if (op == MirOpcode::Alloca) ++funcletAllocas;
+            if (op == MirOpcode::Load)   ++funcletLoads;
+        }
+    }
+    EXPECT_EQ(recoverCount, 1u)
+        << "the filter's parent-local read must recover via RecoverParentFrameSlot";
+    EXPECT_EQ(funcletAllocas, 0u)
+        << "the parent alloca must NOT be re-created in the funclet (it is recovered)";
+    // The funclet still LOADS: the recovered marker value + the exception-code chain
+    // (SehExceptionCode → *(u32*)*(void**)arg0 = two loads). So ≥1 Load survives.
+    EXPECT_GE(funcletLoads, 1u);
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << "the H1 SEH-lowered module must verify";
 }

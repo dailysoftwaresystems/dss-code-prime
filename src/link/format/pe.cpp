@@ -13,6 +13,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <span>
@@ -217,10 +218,30 @@ constexpr std::size_t  kRuntimeFunctionSize = 12;  // BeginAddress + EndAddress 
 // next one and any RUNTIME_FUNCTION stays DWORD-aligned). Returns nullopt (with a
 // loud diagnostic) on a >255-byte prologue, a > 512 KiB frame, a non-8-aligned
 // frame/save, or a prologue-shape mismatch — never a silent wrong table.
+// c116 (D-WIN64-SEH-FUNCLETS): one deferred back-patch of
+// the UNWIND_INFO exception-handler RVA field (the __C_specific_handler personality
+// THUNK RVA — a .text address resolved only in the LATER .idata pass). `xdataOffset`
+// is the byte offset WITHIN the whole `.xdata` blob of the 4-byte field; `symbol`
+// is the personality extern whose thunk RVA is written there.
+struct SehHandlerPatch { std::uint32_t xdataOffset; SymbolId symbol; };
+
 [[nodiscard]] inline std::optional<std::vector<std::uint8_t>>
 buildFunctionUnwindInfo(FrameUnwindInfo const&          ui,
                         std::span<std::uint8_t const>   funcBytes,
                         std::size_t                     funcIndex,
+                        // c116: this function's image-RVA base (= textRva0 +
+                        // funcTextStart[funcIndex]) — the scope table's Begin/End/
+                        // JumpTarget are this + the SehScopeEntry byte offsets.
+                        std::uint32_t                   funcBeginRva,
+                        // c116: SymbolId → image-RVA (the filter-funclet function's
+                        // RVA = the scope-table HandlerAddress). Returns 0 when the
+                        // symbol is not a defined function (fail-loud caller).
+                        std::function<std::uint32_t(SymbolId)> const& symbolToRva,
+                        // c116: the base byte offset THIS blob will occupy within
+                        // the whole `.xdata` (= xdataBytes.size() at the call), so
+                        // recorded handler-field patch offsets are .xdata-global.
+                        std::uint32_t                   xdataBaseOffset,
+                        std::vector<SehHandlerPatch>&   handlerPatches,
                         DiagnosticReporter&             reporter) {
     auto fail = [&](std::string msg) -> std::optional<std::vector<std::uint8_t>> {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
@@ -276,6 +297,20 @@ buildFunctionUnwindInfo(FrameUnwindInfo const&          ui,
     //     xmm6-15 with movaps + emit SAVE_XMM128, or confirm no handler reads them.
     struct Code { std::uint8_t codeOffset; std::uint8_t opAndInfo; std::uint16_t node; bool hasNode; };
     std::vector<Code> saveCodes;
+    // c116b (D-WIN64-XMM-UNWIND-RESTORE): a function that GUARDS a `__try` has an
+    // exception handler that RESUMES in this frame post-unwind and runs parent code.
+    // If that code reads a non-volatile xmm (xmm6-15) that was live before the fault,
+    // the OS must restore it during the unwind — which needs a UWOP_SAVE_XMM128 in
+    // this UNWIND_INFO (backed by a 16-byte movaps spill). DSS spills only the low 64
+    // bits (movsd) and OMITS the FPR unwind codes (fine for NON-SEH functions: an xmm
+    // save never affects RSP/return-address reconstruction). For a SEH function it is
+    // NOT fine — so fail LOUD rather than emit an unwind table that silently fails to
+    // restore a non-volatile xmm on the handler path. sqlite's WAL SEH functions are
+    // pure integer/pointer code (empirically: 0 non-volatile-xmm spills across all
+    // their prologues), so this guard never fires for sqlite; the day a SEH function
+    // DOES spill an xmm, D-WIN64-XMM-UNWIND-RESTORE's spill-with-SAVE_XMM128 path must
+    // land first. This converts the H5 "no consumer" proof into an enforced invariant.
+    bool const guardsSeh = !ui.sehScopes.empty();
     std::uint32_t cursor = allocLen;
     for (auto const& sr : ui.savedRegs) {
         std::uint32_t const width =
@@ -286,7 +321,18 @@ buildFunctionUnwindInfo(FrameUnwindInfo const&          ui,
                         "single bytes) — switch the large-frame probe to __chkstk "
                         "(D-WIN64-CHKSTK-LARGE-PROLOGUE)");
         }
-        if (sr.isFpr) continue;   // low-64 MOVSD save — omitted (RSP-irrelevant)
+        if (sr.isFpr) {
+            if (guardsSeh) {
+                return fail("a __try-guarding function saves non-volatile xmm"
+                            + std::to_string(sr.regEncoding)
+                            + " but DSS omits UWOP_SAVE_XMM128 (spills low-64 via "
+                              "movsd) — the __except handler could read an unrestored "
+                              "xmm on resume. D-WIN64-XMM-UNWIND-RESTORE (spill xmm6-"
+                              "15 with movaps + emit SAVE_XMM128) must land before a "
+                              "SEH function may use a non-volatile xmm.");
+            }
+            continue;   // non-SEH: low-64 MOVSD save — omitted (RSP-irrelevant)
+        }
         if (sr.saveOffset % 8u != 0u) {
             return fail("saved-reg offset " + std::to_string(sr.saveOffset)
                         + " not 8-aligned — UWOP_SAVE_NONVOL node is offset/8");
@@ -328,8 +374,16 @@ buildFunctionUnwindInfo(FrameUnwindInfo const&          ui,
     if (allocCode.has_value()) nodeCount += allocCode->hasNode ? 2u : 1u;
     if (nodeCount > 255u) return fail("unwind-code node count > 255");
 
+    // c116 (D-WIN64-SEH-FUNCLETS): a function that guards a `__try` sets
+    // UNW_FLAG_EHANDLER (bit 0 of the Flags nibble ⇒ (1<<3) in byte0's high nibble)
+    // and carries a trailing handler-RVA + SCOPE_TABLE after the DWORD-aligned
+    // codes. `__C_specific_handler` (the x64 C personality) walks the scope table.
+    bool const hasSeh = !ui.sehScopes.empty();
+    std::uint8_t const byte0 = hasSeh ? 0x09u   // Version=1 | Flags(EHANDLER=1)<<3
+                                      : 0x01u;   // Version=1, Flags=0
+
     std::vector<std::uint8_t> out;
-    out.push_back(0x01u);                                  // Version=1, Flags=0
+    out.push_back(byte0);
     out.push_back(static_cast<std::uint8_t>(sizeOfProlog));
     out.push_back(static_cast<std::uint8_t>(nodeCount));
     out.push_back(0x00u);                                  // FrameRegister=0, Offset=0
@@ -343,7 +397,42 @@ buildFunctionUnwindInfo(FrameUnwindInfo const&          ui,
     };
     for (auto it = saveCodes.rbegin(); it != saveCodes.rend(); ++it) pushCode(*it);
     if (allocCode.has_value()) pushCode(*allocCode);
-    while (out.size() % 4u != 0u) out.push_back(0x00u);    // DWORD-align the blob
+    while (out.size() % 4u != 0u) out.push_back(0x00u);    // DWORD-align the codes
+
+    if (hasSeh) {
+        auto pushU32 = [&](std::uint32_t v) {
+            out.push_back(static_cast<std::uint8_t>(v & 0xFFu));
+            out.push_back(static_cast<std::uint8_t>((v >> 8) & 0xFFu));
+            out.push_back(static_cast<std::uint8_t>((v >> 16) & 0xFFu));
+            out.push_back(static_cast<std::uint8_t>((v >> 24) & 0xFFu));
+        };
+        // ExceptionHandler RVA (= __C_specific_handler THUNK). Unknown until the
+        // .idata pass resolves the thunk VA → emit a placeholder + record the
+        // .xdata-global byte offset for back-patch. Every scope in this function
+        // shares one personality; use the first scope's.
+        std::uint32_t const handlerFieldOff =
+            xdataBaseOffset + static_cast<std::uint32_t>(out.size());
+        handlerPatches.push_back(
+            SehHandlerPatch{handlerFieldOff, ui.sehScopes.front().personalitySymbol});
+        pushU32(0u);   // placeholder — back-patched to the thunk RVA post-.idata
+
+        // SCOPE_TABLE: u32 Count; then Count × { Begin, End, Handler, JumpTarget }.
+        pushU32(static_cast<std::uint32_t>(ui.sehScopes.size()));
+        for (auto const& s : ui.sehScopes) {
+            std::uint32_t const filterRva = symbolToRva(s.filterFuncletSymbol);
+            if (filterRva == 0u) {
+                return fail("SEH scope's filter funclet symbol #"
+                            + std::to_string(s.filterFuncletSymbol.v)
+                            + " has no function RVA (unresolved funclet) — "
+                              "D-WIN64-SEH-FUNCLETS");
+            }
+            pushU32(funcBeginRva + s.beginByteOffset);       // BeginAddress
+            pushU32(funcBeginRva + s.endByteOffset);         // EndAddress
+            pushU32(filterRva);                              // HandlerAddress (filter funclet)
+            pushU32(funcBeginRva + s.jumpTargetByteOffset);  // JumpTarget (__except body)
+        }
+        // The blob already ends u32-aligned (every appended field is a u32).
+    }
     return out;
 }
 
@@ -1083,13 +1172,41 @@ encodeExec(AssembledModule const&    module,
     std::vector<std::uint8_t> pdataBytes;
     std::optional<DataSectionLayout> xdata;
     std::optional<DataSectionLayout> pdata;
+    // c116 (D-WIN64-SEH-FUNCLETS): deferred back-patches of each SEH function's
+    // UNWIND_INFO handler-RVA field (the __C_specific_handler thunk RVA, resolved
+    // in the .idata pass below). Filled by buildFunctionUnwindInfo, applied after
+    // `externThunkVaBySym` is populated.
+    std::vector<SehHandlerPatch> sehHandlerPatches;
     if (id.machine == kMachineAmd64PE) {
+        std::uint32_t const textRva0 =
+            static_cast<std::uint32_t>(secText.virtualAddress);
+        // c116: SymbolId → image-RVA for DEFINED functions (the filter funclet's
+        // scope-table HandlerAddress). funcTextStart is parallel to
+        // module.functions; a symbol not found ⇒ 0 (buildFunctionUnwindInfo
+        // fail-louds). Built once (cheap) only on the x64 PE path.
+        std::unordered_map<SymbolId, std::uint32_t> funcRvaBySym;
+        funcRvaBySym.reserve(module.functions.size());
+        for (std::size_t i = 0; i < module.functions.size(); ++i) {
+            funcRvaBySym[module.functions[i].symbol] =
+                textRva0 + static_cast<std::uint32_t>(funcTextStart[i]);
+        }
+        std::function<std::uint32_t(SymbolId)> const symbolToRva =
+            [&](SymbolId s) -> std::uint32_t {
+                auto it = funcRvaBySym.find(s);
+                return it == funcRvaBySym.end() ? 0u : it->second;
+            };
+
         struct PdataEntry { std::size_t funcIdx; std::uint32_t xdataOffset; };
         std::vector<PdataEntry> pdataEntries;
         for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
             auto const& fn = module.functions[fi];
             if (!fn.unwind.has_value()) continue;
-            auto uwOpt = buildFunctionUnwindInfo(*fn.unwind, fn.bytes, fi, reporter);
+            std::uint32_t const funcBeginRva =
+                textRva0 + static_cast<std::uint32_t>(funcTextStart[fi]);
+            auto uwOpt = buildFunctionUnwindInfo(
+                *fn.unwind, fn.bytes, fi, funcBeginRva, symbolToRva,
+                static_cast<std::uint32_t>(xdataBytes.size()), sehHandlerPatches,
+                reporter);
             if (!uwOpt.has_value()) return {};
             pdataEntries.push_back(
                 {fi, static_cast<std::uint32_t>(xdataBytes.size())});
@@ -1219,6 +1336,35 @@ encodeExec(AssembledModule const&    module,
             }
             externThunkVaBySym.emplace(module.externImports[i].symbol,
                                        thunkVa);
+        }
+    }
+
+    // c116 (D-WIN64-SEH-FUNCLETS): back-patch each SEH function's UNWIND_INFO
+    // handler-RVA field now that the __C_specific_handler thunk VA is resolved. The
+    // handler field is an IMAGE-RVA (the OS calls the personality imageBase-relative
+    // — the c112 address-taken-import precedent), so RVA = thunkVA - imageBase. The
+    // thunk (FF 25 jmp *[IAT]) is the callable stub, NOT the raw IAT data slot.
+    for (auto const& patch : sehHandlerPatches) {
+        auto it = externThunkVaBySym.find(patch.symbol);
+        if (it == externThunkVaBySym.end()) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"pe::encodeExec: SEH personality symbol #"}
+                     + std::to_string(patch.symbol.v)
+                     + " (__C_specific_handler) has no import thunk — the SEH pass "
+                       "must synthesize its ExternImport (D-WIN64-SEH-FUNCLETS).");
+            return {};
+        }
+        std::uint32_t const handlerRva =
+            static_cast<std::uint32_t>(it->second - oh.imageBase);
+        if (patch.xdataOffset + 4u > xdataBytes.size()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 "pe::encodeExec: SEH handler-field patch offset out of range "
+                 "(D-WIN64-SEH-FUNCLETS).");
+            return {};
+        }
+        for (int b = 0; b < 4; ++b) {
+            xdataBytes[patch.xdataOffset + b] =
+                static_cast<std::uint8_t>((handlerRva >> (b * 8)) & 0xFFu);
         }
     }
 
