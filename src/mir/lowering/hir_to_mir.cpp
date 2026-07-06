@@ -838,6 +838,16 @@ struct Lowerer {
                             operands[0], operands[2], operands[1]};
                         return mir.addInst(MirOpcode::AtomicCas, casOrder, t);
                     }
+                    case BuiltinLowering::Barrier:
+                        // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier —
+                        // a 0-operand, void, side-effecting compiler fence
+                        // (`operands` is empty; the builtin declares no params).
+                        // Emits NO runtime instruction; the side-effect flag makes
+                        // the CSE/LICM clobber walk forbid memory motion across it.
+                        // R::None ⇒ InvalidType (the Store convention — supplying
+                        // a result type is a MirBuilder fatal).
+                        return mir.addInst(MirOpcode::CompilerBarrier, operands,
+                                           InvalidType);
                     case BuiltinLowering::None:
                         break;
                 }

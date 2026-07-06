@@ -2492,6 +2492,53 @@ TEST(ShippedLibDescriptor, RealStddefWcharPerFormatWidth) {
     EXPECT_EQ(widthFor(ObjectFormatKind::MachO), 4u);
 }
 
+// c113 (D-CSUBSET-INTRINSIC-BARRIER): the shipped <intrin.h> descriptor.
+// Three load-bearing properties of the REAL file:
+//   (1) pe-ONLY — an MSVC compiler-intrinsic header is meaningless on
+//       elf/macho (the header-level availability gate rejects the include
+//       there with F_ShippedHeaderUnavailableForTarget).
+//   (2) NO `symbols` — EMPIRICALLY load-bearing: every descriptor symbol is
+//       EAGER-imported, and msvcrt.dll exports NO compiler intrinsic (a c113
+//       draft declaring _byteswap_* as symbols crashed the loader with
+//       STATUS_ENTRYPOINT_NOT_FOUND 0xC0000139 — the windows.json
+//       InterlockedCompareExchange trap, twice-proven). The intrinsics are
+//       always-on BUILTINS (c-subset.lang.json), never descriptor symbols.
+//   (3) the honest non-empty payload = the size_t→u64 typedef (MSVC's real
+//       intrin.h makes size_t visible; the string/stdio.json convention).
+// RED-on-disable: widen the gate / re-add a symbol / drop the typedef.
+TEST(ShippedLibDescriptor, RealIntrinHeaderIsPeOnlyAndCarriesNoEagerSymbols) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    auto desc = decodeShippedFor(root / "intrin.json", interner, typeReg,
+                                 ObjectFormatKind::Pe);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_EQ(desc->header, "intrin.h");
+    // (1) the header-level gate is exactly ["pe"].
+    ASSERT_EQ(desc->availableObjectFormats.size(), 1u);
+    EXPECT_EQ(desc->availableObjectFormats[0], "pe");
+    EXPECT_TRUE(objectFormatInAvailabilitySet(desc->availableObjectFormats,
+                                              ObjectFormatKind::Pe));
+    EXPECT_FALSE(objectFormatInAvailabilitySet(desc->availableObjectFormats,
+                                               ObjectFormatKind::Elf));
+    EXPECT_FALSE(objectFormatInAvailabilitySet(desc->availableObjectFormats,
+                                               ObjectFormatKind::MachO));
+    // (2) no eager-import surface — a compiler-intrinsic header must never
+    //     declare linkable symbols (the 0xC0000139 loader trap).
+    EXPECT_TRUE(desc->symbols.empty())
+        << "intrin.h intrinsics are builtins, NOT descriptor symbols — a "
+           "symbols entry here eager-imports a non-export and crashes the "
+           "pe loader (STATUS_ENTRYPOINT_NOT_FOUND)";
+    // (3) the size_t typedef is the non-empty payload, u64 on pe64/LLP64.
+    ASSERT_EQ(desc->typedefs.size(), 1u);
+    EXPECT_EQ(desc->typedefs[0].name, "size_t");
+    auto layout = computeLayout(desc->typedefs[0].type, interner, kNatural16,
+                                DataModel::Llp64);
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(layout->size, 8u);
+}
+
 // c106: the MSVC stat records. `struct _stat64`/`__stat64` are the ucrt
 // 56-byte time64 shape — st_size at 24, st_mtime at 40 (natural alignment
 // inserts 2B after gid and 4B before the i64 size). The time32 `struct _stat`

@@ -251,6 +251,51 @@ TEST(Cse, LoadNotCsedAcrossAliasingStore) {
     EXPECT_EQ(countOpInModule(mir, MirOpcode::Load), 2u);
 }
 
+// c113 (D-CSUBSET-INTRINSIC-BARRIER, audit-F1): a CompilerBarrier between
+// two identical Loads blocks CSE — the barrier is a full memory clobber
+// (an MSVC _ReadWriteBarrier forbids ANY memory motion across it), keyed
+// on the `opcodeClobbersMemory` positive list consumed by the shared
+// `mirInstClobbersLoadPtr` predicate (this SAME-BLOCK shape exercises the
+// CSE in-block slice, not the cross-block region walker — both funnel
+// through the one predicate). RED-on-disable: drop CompilerBarrier from
+// opcodeClobbersMemory (or bypass the predicate in the in-block slice) →
+// the barrier is skipped (it is not a Store) → the second Load is
+// CSE-reused ACROSS the fence → instructionsCsed becomes 1 and this fails.
+TEST(Cse, LoadNotCsedAcrossCompilerBarrier) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue v0; v0.value = std::int64_t{7}; v0.core = TypeKind::I32;
+    MirInstId const c0 = mb.addConst(v0, i32);
+    MirInstId const s0[] = {c0, slot};
+    (void)mb.addInst(MirOpcode::Store, s0, InvalidType);
+    MirInstId const lops[] = {slot};
+    MirInstId const ld1 = mb.addInst(MirOpcode::Load, lops, i32);
+    (void)mb.addInst(MirOpcode::CompilerBarrier, {}, InvalidType);
+    MirInstId const ld2 = mb.addInst(MirOpcode::Load, lops, i32);
+    MirInstId const sum[] = {ld1, ld2};
+    MirInstId const r = mb.addInst(MirOpcode::Add, sum, i32);
+    mb.addReturn(r);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 0u)
+        << "an intervening CompilerBarrier must block Load CSE — the "
+           "fence is a full memory clobber";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Load), 2u);
+    // The barrier itself must survive (side-effecting — never CSE'd).
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::CompilerBarrier), 1u);
+}
+
 // Positive pin (SSA-derivable Rule 2): an intervening Store to a
 // DISTINCT Alloca does NOT alias the Loaded pointer, so CSE proceeds.
 TEST(Cse, LoadCsedAcrossDistinctAllocaStore) {

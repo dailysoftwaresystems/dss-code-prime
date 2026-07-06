@@ -20,9 +20,7 @@ namespace dss::opt::passes {
 
 namespace {
 
-using dss::opt::analysis::MirAliasResult;
 using dss::opt::analysis::StrictTbaa;
-using dss::opt::analysis::mirMayAlias;
 using dss::opt::analysis::mirRegionBetween;
 using dss::opt::analysis::mirAnyMayAliasingStoreInRegion;
 
@@ -266,26 +264,21 @@ void CsePolicy::analyze(MirFuncId fn) {
                         std::abort();
                     }
 
+                    // c113 (audit-F1): the in-block slices funnel through
+                    // the SAME per-instruction predicate as the region
+                    // walker (`mirInstClobbersLoadPtr` — precise for
+                    // Stores, opaque clobber for the `opcodeClobbersMemory`
+                    // ops: Call / IntrinsicCall / AtomicCas /
+                    // CompilerBarrier), so the two scan sites can never
+                    // disagree on what clobbers.
                     auto storesClobber = [&](MirBlockId blk,
                                              std::uint32_t lo,
                                              std::uint32_t hi) -> bool {
                         for (std::uint32_t j = lo; j < hi; ++j) {
-                            MirInstId const sid = src_.blockInstAt(blk, j);
-                            if (src_.instOpcode(sid) != MirOpcode::Store) continue;
-                            auto const sops = src_.instOperands(sid);
-                            if (sops.size() < 2) {
-                                std::fprintf(stderr,
-                                    "dss::opt::passes::Cse fatal: "
-                                    "Store inst v=%u has fewer than "
-                                    "2 operands — verifier-contract "
-                                    "violation.\n", sid.v);
-                                std::abort();
-                            }
-                            if (mirMayAlias(src_, interner_,
-                                            loadPtr, sops[1],
-                                            strictTbaa_,
-                                            charTypesAliasAll_)
-                                != MirAliasResult::No) {
+                            if (dss::opt::analysis::mirInstClobbersLoadPtr(
+                                    src_, interner_, loadPtr,
+                                    src_.blockInstAt(blk, j),
+                                    strictTbaa_, charTypesAliasAll_)) {
                                 return true;
                             }
                         }

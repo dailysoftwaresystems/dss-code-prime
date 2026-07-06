@@ -1367,6 +1367,12 @@ struct Lowerer {
             case MirOpcode::Mul:    return lowerBinaryOp(id, MnemonicSlot::Mul);
             case MirOpcode::UMulH:  return lowerMulHigh(id);
             case MirOpcode::AtomicCas: return lowerAtomicCas(id);
+            // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier is a pure
+            // COMPILE-TIME ordering fence — it emits NO instruction. Its whole
+            // effect (forbidding CSE/LICM from moving memory ops across it) is
+            // realized by its hasSideEffects flag in the MIR clobber walk, so
+            // this lowering emits nothing.
+            case MirOpcode::CompilerBarrier: return;
             case MirOpcode::SDiv:   return lowerDivLike(id, /*isSigned=*/true,  /*wantRemainder=*/false);
             case MirOpcode::UDiv:   return lowerDivLike(id, /*isSigned=*/false, /*wantRemainder=*/false);
             case MirOpcode::SMod:   return lowerDivLike(id, /*isSigned=*/true,  /*wantRemainder=*/true);

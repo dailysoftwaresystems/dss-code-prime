@@ -57,6 +57,14 @@ enum class MirOpcode : std::uint16_t {
     // hasSideEffects=TRUE (a store): DCE keeps it live even when the result is
     // unused, CSE never dedups two CASes, LICM never hoists one. NOT commutative.
     AtomicCas,
+    // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier -- an MSVC COMPILER
+    // reordering fence. ZERO operands, produces NO value (R::None), emits NO
+    // runtime instruction; hasSideEffects=TRUE so DCE keeps it and CSE/LICM
+    // never move IT, and it is in the `opcodeClobbersMemory` positive list so
+    // the CSE/LICM clobber walk treats it as a full memory clobber -- no
+    // Load/Store is reordered ACROSS it. A pure compile-time ordering
+    // constraint -- identical on every target/format.
+    CompilerBarrier,
     // ── floating-point arithmetic ──
     FAdd, FSub, FMul, FDiv, FNeg,
     // ── bitwise ──
@@ -275,6 +283,10 @@ struct MirOpcodeInfo {
         case MirOpcode::Mul:  return {2, 2, 0, 0, R::Value, false, false, false, "mul"};
         case MirOpcode::UMulH: return {2, 2, 0, 0, R::Value, false, false, false, "umulh"};
         case MirOpcode::AtomicCas: return {3, 3, 0, 0, R::Value, false, true, false, "atomic_cas"};
+        // 0 operands, NO result (R::None), side-effecting (never DCE'd, never
+        // CSE'd/hoisted) + in the opcodeClobbersMemory list (a fence to
+        // Load/Store motion across it). Lowers to ZERO instructions.
+        case MirOpcode::CompilerBarrier: return {0, 0, 0, 0, R::None, false, true, false, "compiler_barrier"};
         case MirOpcode::SDiv: return {2, 2, 0, 0, R::Value, false, false, false, "sdiv"};
         case MirOpcode::UDiv: return {2, 2, 0, 0, R::Value, false, false, false, "udiv"};
         case MirOpcode::SMod: return {2, 2, 0, 0, R::Value, false, false, false, "smod"};
@@ -459,6 +471,38 @@ struct MirOpcodeInfo {
 }
 [[nodiscard]] constexpr std::string_view mnemonic(MirOpcode op) noexcept {
     return opcodeInfo(op).mnemonic;
+}
+// Memory-CLOBBER classification (c113, D-CSUBSET-INTRINSIC-BARRIER audit-F1
+// + its review correction) — DISTINCT from `hasSideEffects`, which is a
+// DCE-LIVENESS flag ("not removable purely because its result is unused")
+// and is true for many ops that write NO aliasable memory: every
+// terminator (Br/CondBr/Switch/Return/...), Alloca (a FRESH slot cannot
+// alias a pre-existing pointer), the Va*/address-materialization leaves,
+// BlockAddress, ReturnPiece. Conflating the two disables Load motion
+// wholesale (every loop body ends in a terminator — LICM would hoist
+// nothing; the review-caught red). An op CLOBBERS memory iff executing it
+// may WRITE (or fence) memory an independent Load's pointer could alias:
+//   * Store         — writes *operands[1] (callers alias-test it precisely)
+//   * Call /        — an opaque callee may write anything reachable
+//     IntrinsicCall
+//   * AtomicCas     — a store (the CAS write)
+//   * CompilerBarrier — an ordering FENCE: no write, but Load/Store motion
+//     across it is forbidden by contract (_ReadWriteBarrier)
+// Consumed by the Load-motion clobber walk (opt/analysis/mir_alias.hpp,
+// the CSE/LICM shared chokepoint). A future memory-writing op joins THIS
+// list (the `isCommutative` positive-list convention over the closed MIR
+// verb set — never a lang/arch/format identity).
+[[nodiscard]] constexpr bool opcodeClobbersMemory(MirOpcode op) noexcept {
+    switch (op) {
+        case MirOpcode::Store:
+        case MirOpcode::Call:
+        case MirOpcode::IntrinsicCall:
+        case MirOpcode::AtomicCas:
+        case MirOpcode::CompilerBarrier:
+            return true;
+        default:
+            return false;
+    }
 }
 
 } // namespace dss

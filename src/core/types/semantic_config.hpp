@@ -668,6 +668,13 @@ enum class BuiltinLowering : std::uint16_t {
     // value at *ptr; iff original==comparand the newval is stored, atomically
     // (x86 `lock cmpxchg`; arm64 LDAXR/STLXR acquire-release loop).
     AtomicCas,
+    // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier — an MSVC COMPILER
+    // reordering barrier (NOT a CPU fence). Takes no operands, produces no value,
+    // emits NO runtime instruction; its whole job is to forbid the optimizer from
+    // moving memory accesses (loads OR stores) across it. Realized by a
+    // side-effecting zero-operand MIR op (MirOpcode::CompilerBarrier) that the
+    // CSE/LICM clobber walk treats as a full memory clobber.
+    Barrier,
 };
 
 // Resolve the config `lowering` name to its BuiltinLowering. nullopt = an unknown
@@ -677,6 +684,7 @@ enum class BuiltinLowering : std::uint16_t {
 builtinLoweringFromName(std::string_view name) noexcept {
     if (name == "umulh")      { return BuiltinLowering::UMulHigh;  }
     if (name == "atomic_cas") { return BuiltinLowering::AtomicCas; }
+    if (name == "barrier")    { return BuiltinLowering::Barrier;   }
     return std::nullopt;
 }
 

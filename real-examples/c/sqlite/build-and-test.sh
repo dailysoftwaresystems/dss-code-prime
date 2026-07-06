@@ -252,15 +252,15 @@ for entry in "${TARGETS[@]}"; do
   # unconditionally (its rc is unreliable either way), then classify by grep.
   # `--time` asks the compiler to self-report its wall-clock (surfaced below).
   # c105 (the MSVC-profile flip): the pe target passes sqlite's OWN sanctioned
-  # build knobs — SQLITE_OMIT_SEH (DSS's _MSC_VER mask does not implement the
+  # build knob — SQLITE_OMIT_SEH (DSS's _MSC_VER mask does not implement the
   # MSVC SEH __try/__except language extension; MinGW sqlite ships SEH-less the
-  # same way) and SQLITE_DISABLE_INTRINSIC (the <intrin.h> _byteswap_* fns are
-  # compiler intrinsics DSS has not yet built as builtins — c106 adds them and
-  # DROPS this knob, restoring the __umulh fast path too). Build configuration,
-  # not compiler behavior: exactly the -D flags an MSVC build script would pass.
+  # same way). Build configuration, not compiler behavior: exactly the -D flag
+  # an MSVC build script would pass. (SQLITE_DISABLE_INTRINSIC was DROPPED at
+  # c113: DSS resolves <intrin.h> via the pe-gated shippedLibs/intrin.json
+  # descriptor and lowers __umulh + _ReadWriteBarrier as builtin intrinsics.)
   declare -a defines=()
   if [[ "$spec" == *"pe64"* ]]; then
-    defines+=(--define SQLITE_OMIT_SEH=1 --define SQLITE_DISABLE_INTRINSIC=1)
+    defines+=(--define SQLITE_OMIT_SEH=1)
   fi
   "$DSS_BIN" --compile "${units[@]}" --language "$LANGUAGE" --target "$spec" --output "$outd" --time "${defines[@]}" >"$log" 2>&1 || true
   if grep -qE 'error\[' "$log"; then

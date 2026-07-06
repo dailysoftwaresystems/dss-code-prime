@@ -315,15 +315,58 @@ mirRegionBetween(
     return result;
 }
 
-// True iff any Store instruction in the named region's blocks may
-// alias the given Load pointer. Walks each block's Stores in scan
-// order; for each, calls `mirMayAlias(loadPtr, storePtrOperand)`. The
-// Store's pointer operand convention is `operands[1]` (operand 0 is
-// the stored value); this matches Mem2Reg's `Store[op1]` gate.
+// THE per-instruction Load-motion clobber predicate — the ONE chokepoint
+// every "may this instruction invalidate a Load-reuse/hoist across it?"
+// scan funnels through (the CSE in-block slices + the region walker below
+// + LICM's loop wrapper), so a clobber class added here covers every
+// consumer by construction (the multi-site-contract rule).
 //
-// Returns true on the first may-aliasing Store found (short-circuit).
-// `strictTBAA` threaded from `Mir::aliasingMode()` (cycle 10c wiring)
-// or fixed by the caller in the meantime.
+//   * Store — PRECISE: `mirMayAlias(loadPtr, storePtrOperand)`. The Store's
+//     pointer operand convention is `operands[1]` (operand 0 is the stored
+//     value); this matches Mem2Reg's `Store[op1]` gate.
+//   * any OTHER memory-CLOBBERING op (c113, D-CSUBSET-INTRINSIC-BARRIER,
+//     audit-F1) — an OPAQUE clobber: a Call/IntrinsicCall may write memory
+//     the Load's pointer aliases, an AtomicCas IS a store, a
+//     CompilerBarrier (_ReadWriteBarrier) is an ordering fence that must
+//     forbid motion across it — and no precise alias test is possible for
+//     any of them. Keyed on `opcodeClobbersMemory` (the declarative
+//     positive list beside `opcodeInfo`), NOT on `hasSideEffects` — that
+//     is a DCE-liveness flag, true for terminators/Alloca/the Va* leaves,
+//     none of which write aliasable memory; conflating the two disables
+//     Load motion wholesale (every loop body ends in a terminator — the
+//     review-caught LICM red).
+//   * everything else — pure or non-writing; never a clobber.
+[[nodiscard]] inline bool
+mirInstClobbersLoadPtr(
+    Mir const&          mir,
+    TypeInterner const& interner,
+    MirInstId           loadPtr,
+    MirInstId           inst,
+    StrictTbaa          strictTBAA        = StrictTbaa::No,
+    bool                charTypesAliasAll = true)
+{
+    MirOpcode const op = mir.instOpcode(inst);
+    if (op != MirOpcode::Store) {
+        return opcodeClobbersMemory(op);
+    }
+    auto const ops = mir.instOperands(inst);
+    if (ops.size() < 2) {
+        std::fprintf(stderr,
+            "dss::opt::analysis::mirInstClobbersLoadPtr "
+            "fatal: Store inst v=%u has fewer than 2 operands "
+            "— verifier-contract violation.\n", inst.v);
+        std::abort();
+    }
+    return mirMayAlias(mir, interner, loadPtr, ops[1],
+                       strictTBAA, charTypesAliasAll)
+           != MirAliasResult::No;
+}
+
+// True iff any instruction in the named region's blocks may clobber the
+// given Load pointer (see `mirInstClobbersLoadPtr` — precise for Stores,
+// opaque for other side-effecting ops). Returns true on the first clobber
+// found (short-circuit). `strictTBAA` threaded from `Mir::aliasingMode()`
+// (cycle 10c wiring) or fixed by the caller in the meantime.
 [[nodiscard]] inline bool
 mirAnyMayAliasingStoreInRegion(
     Mir const&                       mir,
@@ -336,20 +379,9 @@ mirAnyMayAliasingStoreInRegion(
     for (MirBlockId const b : region) {
         std::uint32_t const ninst = mir.blockInstCount(b);
         for (std::uint32_t i = 0; i < ninst; ++i) {
-            MirInstId const id = mir.blockInstAt(b, i);
-            if (mir.instOpcode(id) != MirOpcode::Store) continue;
-            auto const ops = mir.instOperands(id);
-            if (ops.size() < 2) {
-                std::fprintf(stderr,
-                    "dss::opt::analysis::mirAnyMayAliasingStoreInRegion "
-                    "fatal: Store inst v=%u has fewer than 2 operands "
-                    "— verifier-contract violation.\n", id.v);
-                std::abort();
-            }
-            MirInstId const storePtr = ops[1];
-            if (mirMayAlias(mir, interner, loadPtr, storePtr,
-                            strictTBAA, charTypesAliasAll)
-                != MirAliasResult::No) {
+            if (mirInstClobbersLoadPtr(mir, interner, loadPtr,
+                                       mir.blockInstAt(b, i),
+                                       strictTBAA, charTypesAliasAll)) {
                 return true;  // could clobber
             }
         }

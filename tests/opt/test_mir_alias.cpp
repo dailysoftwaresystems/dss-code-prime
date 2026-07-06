@@ -486,3 +486,66 @@ TEST(MirAlias, PredicateIsSymmetric) {
         }
     }
 }
+
+// c113 (D-CSUBSET-INTRINSIC-BARRIER, audit-F1 + the review correction): the
+// region clobber walk is the ONE chokepoint gating Load motion for BOTH
+// consumers (CSE reuse-admission in-block slices + cross-block region + the
+// LICM loop wrapper all funnel through `mirInstClobbersLoadPtr`), so this
+// pins the chokepoint directly. A non-Store MEMORY-CLOBBERING op in the
+// region (CompilerBarrier here; Call/IntrinsicCall/AtomicCas by the same
+// `opcodeClobbersMemory` positive list) is an OPAQUE clobber — the walk
+// must return true even when every Store in the region provably does NOT
+// alias the Load pointer. The negative control is DOUBLY load-bearing: its
+// block contains a non-aliasing Store (distinct Allocas, Rule 2) AND ends
+// in a Return TERMINATOR (hasSideEffects=true, a DCE-liveness flag) — the
+// walk must return false, proving terminators/DCE-side-effecting ops are
+// NOT clobbers (conflating the flags disables Load motion wholesale: every
+// loop body ends in a terminator — the review-caught LICM red).
+// RED-on-disable: drop the opcodeClobbersMemory arm → the barrier is
+// skipped (not a Store) → the positive half fails; key the arm on
+// hasSideEffects instead → the negative control's terminator becomes a
+// clobber → the negative half fails.
+TEST(MirAlias, RegionWalkTreatsMemoryClobberOpsAsClobber) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const voidT = interner.primitive(TypeKind::Void);
+    TypeId const fnSig = interner.fnSig({}, voidT, CallConv::CcSysV);
+
+    // One builder recipe, two modules: [a, b, store→b] (+ barrier in the
+    // second). The Load pointer is `a`; the Store writes through `b`
+    // (distinct Alloca → Rule 2 says No), so ONLY the barrier can clobber.
+    auto const build = [&](bool withBarrier) {
+        MirBuilder mb;
+        mb.addFunction(fnSig, SymbolId{100});
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(entry);
+        MirInstId const a = mb.addInst(MirOpcode::Alloca, {}, ptr);
+        MirInstId const b = mb.addInst(MirOpcode::Alloca, {}, ptr);
+        MirLiteralValue v; v.value = std::int64_t{1}; v.core = TypeKind::I32;
+        MirInstId const c = mb.addConst(v, i32);
+        MirInstId const st[] = {c, b};
+        (void)mb.addInst(MirOpcode::Store, st, InvalidType);
+        if (withBarrier) {
+            (void)mb.addInst(MirOpcode::CompilerBarrier, {}, InvalidType);
+        }
+        mb.addReturn();
+        struct Out { Mir mir; MirInstId loadPtr; MirBlockId block; };
+        return Out{std::move(mb).finish(), a, entry};
+    };
+
+    auto const clean = build(/*withBarrier=*/false);
+    MirBlockId const cleanRegion[] = {clean.block};
+    EXPECT_FALSE(mirAnyMayAliasingStoreInRegion(
+        clean.mir, interner, clean.loadPtr, cleanRegion))
+        << "negative control: a non-aliasing Store + the block's Return "
+           "TERMINATOR (hasSideEffects=true) must NOT clobber — the walk "
+           "keys on opcodeClobbersMemory, never the DCE-liveness flag";
+
+    auto const fenced = build(/*withBarrier=*/true);
+    MirBlockId const fencedRegion[] = {fenced.block};
+    EXPECT_TRUE(mirAnyMayAliasingStoreInRegion(
+        fenced.mir, interner, fenced.loadPtr, fencedRegion))
+        << "a memory-clobbering non-Store op (CompilerBarrier) must be an "
+           "opaque clobber — Loads may not move across the fence";
+}
