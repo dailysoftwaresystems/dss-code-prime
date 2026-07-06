@@ -230,6 +230,13 @@ struct DSS_EXPORT CuMirModule {
     // selects the right call-site opcode. nullopt iff the format declared
     // none — MIR→LIR then fails loud on any extern call.
     std::optional<ExternCallDispatch> externCallDispatch;
+    // D-LK-EXTERN-DATA-IMPORT (c117): the active object format's extern-DATA
+    // binding model (got-indirect / copy-relocation), captured here for the
+    // SAME reason as `externCallDispatch` — the LOWER half (which sees only
+    // this struct) selects how a GlobalAddr of an extern-DATA object (libc
+    // stdout) materializes its address (got-indirect → lea-of-slot + deref).
+    // nullopt iff the format declared none (data imports fail loud at link).
+    std::optional<DataImportBinding> dataImportBinding;
     // D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL: the active format's data model
     // (pointer width), captured here for the SAME reason as `externCallDispatch`
     // — the LOWER half sees only this struct, and the aggregate-global rodata
@@ -313,6 +320,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       std::uint16_t        callingConventionIndex,
                       CompilationUnitId    cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
+                      std::optional<DataImportBinding> dataImportBinding,
                       // c116 (D-WIN64-SEH-FUNCLETS): SEH scope records from
                       // `synthesizeSehFunclets` (empty for a non-SEH program).
                       std::vector<MirSehScope> sehScopes,

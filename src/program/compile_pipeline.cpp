@@ -448,6 +448,10 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // D-FFI-EXTERN-CALL-DISPATCH: capture the active format's extern-call
         // shape now (the LOWER half sees only this struct, not the format).
         format.externCallDispatch(),
+        // D-LK-EXTERN-DATA-IMPORT (c117): capture the format's extern-DATA
+        // binding model now, for the same reason (the LOWER half's MIR→LIR
+        // GlobalAddr lowering selects got-indirect deref vs a direct lea).
+        format.dataImportBinding(),
         // D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL: capture the format's data
         // model now, for the same reason — the aggregate-global rodata encoder
         // (in the LOWER half) needs the pointer width to compute byte layout.
@@ -495,6 +499,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          std::uint16_t                               callingConventionIndex,
                          CompilationUnitId                           cuId,
                          std::optional<ExternCallDispatch>           externCallDispatch,
+                         std::optional<DataImportBinding>            dataImportBinding,
                          // c116 (D-WIN64-SEH-FUNCLETS): the SEH scope records the
                          // funclet-synthesis pass produced (empty for a non-SEH
                          // module). Threaded into MIR→LIR, which emits the
@@ -514,6 +519,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                           interner, reporter,
                           std::move(externImports),
                           externCallDispatch,
+                          dataImportBinding,
                           sehScopes);
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
@@ -1058,7 +1064,8 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         std::move(cuMir.externImports), userEntry, *cuMir.target,
         cuMir.dataModel, cuMir.bitFieldStrategy,
         cuMir.callingConventionIndex, cuMir.cuId,
-        cuMir.externCallDispatch, std::move(sehScopes), reporter);
+        cuMir.externCallDispatch, cuMir.dataImportBinding,
+        std::move(sehScopes), reporter);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -1083,6 +1090,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       std::uint16_t       callingConventionIndex,
                       CompilationUnitId   cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
+                      std::optional<DataImportBinding> dataImportBinding,
                       std::vector<MirSehScope> sehScopes,
                       DiagnosticReporter& reporter) {
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
@@ -1097,7 +1105,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         merged.mir, merged.host.interner(), nameOf,
         std::move(merged.externImports), merged.userEntrySymbol, target,
         dataModel, bitFieldStrategy, callingConventionIndex, cuId,
-        externCallDispatch, std::move(sehScopes), reporter);
+        externCallDispatch, dataImportBinding, std::move(sehScopes), reporter);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU

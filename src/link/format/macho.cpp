@@ -1468,7 +1468,40 @@ encodeExecDynamic(AssembledModule const&    module,
             return {};
         }
     }
+    // D-LK-EXTERN-DATA-IMPORT (c117): a FUNCTION extern resolves to its
+    // __stubs STUB (call → stub → __got jump); a DATA extern resolves to its
+    // __got SLOT (loaded as a non-lazy pointer, dyld-bound at load). The
+    // linker's pre-walker gate admits data imports only when the format
+    // DECLARES a binding model; this walker implements exactly `got-indirect`
+    // (the Mach-O __got non-lazy pointer) — a foreign model fails loud, never
+    // silently gets a got slot it did not declare (mirrors elf.cpp's
+    // copy-relocation assertion). Function symbolVa is bound here; DATA
+    // symbolVa is bound below once the __got VA is known.
+    std::size_t numDataExterns = 0;
+    for (auto const& ext : module.externImports) {
+        if (ext.isData) ++numDataExterns;
+    }
+    if (numDataExterns > 0) {
+        auto const binding = fmt.dataImportBinding();
+        if (!binding.has_value()
+            || *binding != DataImportBinding::GotIndirect) {
+            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                 "macho::encodeExecDynamic: module carries " +
+                 std::to_string(numDataExterns) +
+                 " extern DATA import(s) but format '" +
+                 std::string{fmt.name()} +
+                 "' does not declare 'dataImportBinding': "
+                 "\"got-indirect\" — the only data-import mechanism this "
+                 "walker implements (D-LK-EXTERN-DATA-IMPORT).");
+            return {};
+        }
+    }
     for (std::size_t i = 0; i < numExterns; ++i) {
+        // DATA externs skip the stub binding — bound to their __got slot
+        // below. (A data extern still occupies a __got slot at index i,
+        // lockstep with the got layout; its __stubs slot is emitted but
+        // dead — never referenced — pinned D-LK-MACHO-DATA-EXTERN-DEAD-STUB.)
+        if (module.externImports[i].isData) continue;
         std::uint64_t const stubVa =
             stubsVa + static_cast<std::uint64_t>(i) * stubSize;
         if (!symbolVa.emplace(module.externImports[i].symbol,
@@ -1589,11 +1622,38 @@ encodeExecDynamic(AssembledModule const&    module,
     // `__DATA`. Sizes: __got = numExterns*8 (one page-aligned segment).
     std::uint64_t const gotBytesEarly =
         static_cast<std::uint64_t>(numExterns) * kGotSlotSize;
-    std::uint64_t const dataConstEndVaEarly =
+    // __DATA_CONST.vmaddr (page boundary) — the __got section begins here;
+    // the LATE layout (below) recomputes gotVa via file-offset deltas and
+    // asserts congruence with this early value.
+    std::uint64_t const gotVaStart =
         alignUp((hasConst ? constSectionVa + constSize
                           : stubsVa + stubsBytes),
-                kPageSize)            // __DATA_CONST.vmaddr (page boundary)
-        + gotBytesEarly;             // + __got contents
+                kPageSize);
+    std::uint64_t const dataConstEndVaEarly =
+        gotVaStart + gotBytesEarly;             // + __got contents
+    // D-LK-EXTERN-DATA-IMPORT (c117): bind each extern-DATA symbol to its
+    // __got SLOT VA (slot i, lockstep with the got layout + bind loop below).
+    // dyld fills the slot with the library object's real address at load; a
+    // GlobalAddr of the symbol (mir_to_lir got-indirect) lea's this image-
+    // local slot VA then derefs it. Bound HERE — after the __got start VA is
+    // known but BEFORE `applyExecRelocations` — so a code reloc into the data
+    // symbol resolves to the slot VA through the SAME relocation kernel a
+    // function stub / named __const item uses (the c117 walker split: FUNC
+    // externs → stub VA above; DATA externs → __got slot VA here).
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        if (!module.externImports[i].isData) continue;
+        std::uint64_t const gotSlotVa =
+            gotVaStart + static_cast<std::uint64_t>(i) * kGotSlotSize;
+        if (!symbolVa.emplace(module.externImports[i].symbol,
+                              gotSlotVa).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 "macho::encodeExecDynamic: extern DATA SymbolId #" +
+                 std::to_string(module.externImports[i].symbol.v) +
+                 " collides with another symbol — caller must give each "
+                 "extern a unique SymbolId.");
+            return {};
+        }
+    }
     std::uint64_t const dataSegVaEarly =
         hasDataSeg ? alignUp(dataConstEndVaEarly, kPageSize) : 0;
     std::uint64_t const dataSecVa =

@@ -583,6 +583,22 @@ struct Lowerer {
     // silent default — the wrong shape miscompiles).
     std::optional<ExternCallDispatch> externCallDispatch_;
 
+    // D-LK-EXTERN-DATA-IMPORT (c117): the ACTIVE format's extern-DATA
+    // binding model + the derived set of extern-DATA SymbolIds that need
+    // GOT-indirect address materialization. `externDataGotSymbols_` is
+    // populated at ctor as {extern imports with isData} ∩ {binding ==
+    // GotIndirect}: a GlobalAddr of such a symbol materializes the OBJECT's
+    // address by LOADING its __got slot (lea-of-slot + a deref Load — the
+    // linker binds `symbolVa[dataExtern]` to the __got slot VA, and dyld
+    // fills the slot with the library object's address), NOT a bare lea
+    // (whose result would be the slot's address, off by one indirection —
+    // the silent-miscompile class the fold-suppression below closes). Under
+    // CopyRelocation (ELF) the object has a DIRECT exec-local .bss address,
+    // so its data externs are NOT in this set (the normal single-lea path).
+    // Empty for every non-got-indirect module ⇒ lowering byte-identical.
+    std::optional<DataImportBinding> dataImportBinding_;
+    std::unordered_set<std::uint32_t> externDataGotSymbols_;
+
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbol minting for `&&label`
     // block-address materialization. A block whose address is taken gets ONE local
     // symbol (deduped by MIR block id within the module). `nextBlockSym_` is seeded
@@ -694,14 +710,28 @@ struct Lowerer {
             DiagnosticReporter& r,
             std::span<ExternImport const> externImports,
             std::optional<ExternCallDispatch> externCallDispatch,
+            std::optional<DataImportBinding> dataImportBinding,
             std::span<MirSehScope const> sehScopes)
         : mir(m), target(t), interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()),
-          externCallDispatch_(externCallDispatch), sehScopesIn_(sehScopes) {
+          externCallDispatch_(externCallDispatch),
+          dataImportBinding_(dataImportBinding), sehScopesIn_(sehScopes) {
         baselineErrors = reporter.errorCount();
         externSymbols.reserve(externImports.size());
         for (auto const& e : externImports) {
             externSymbols.insert(e.symbol.v);
+        }
+        // D-LK-EXTERN-DATA-IMPORT (c117): under a GOT-indirect format
+        // (Mach-O __got), an extern-DATA object's address is not a direct
+        // symbol VA — it is LOADED from the object's __got slot. Collect
+        // those symbols so `lowerGlobalAddr` emits the extra deref (and the
+        // riprel fold is suppressed for them). Populated ONLY under
+        // GotIndirect: CopyRelocation (ELF) data externs have a direct
+        // exec-local .bss address (normal lea), so they stay out of the set.
+        if (dataImportBinding_ == DataImportBinding::GotIndirect) {
+            for (auto const& e : externImports) {
+                if (e.isData) externDataGotSymbols_.insert(e.symbol.v);
+            }
         }
         // Mnemonics in MnemonicSlot enum-declaration order. The
         // `static_assert` below closes the silent-drift hazard 4
@@ -2757,6 +2787,18 @@ struct Lowerer {
     // undefined-vreg failure in `regForValue`, never a silent wrong
     // address.
     [[nodiscard]] bool globalAddrRiprelFoldsIntoLoad(MirInstId gaId) {
+        // D-LK-EXTERN-DATA-IMPORT (c117): a GOT-indirect extern-DATA symbol
+        // is NEVER foldable. Its GlobalAddr materializes the OBJECT address
+        // by LOADING its __got slot (`lowerGlobalAddr` emits lea-of-slot +
+        // deref) — a distinct indirection that must precede the C-level
+        // Load. Folding the C-level Load into the GlobalAddr would collapse
+        // to ONE riprel load returning the __got slot CONTENTS (the object's
+        // address) where the code wanted the object's VALUE — off by one
+        // indirection, the exact silent miscompile this cycle closes. Keep
+        // the two loads distinct.
+        if (externDataGotSymbols_.contains(mir.globalAddrSymbol(gaId).v)) {
+            return false;
+        }
         auto const it = mirValueUses_.find(gaId.v);
         if (it == mirValueUses_.end() || it->second.count != 1) {
             return false;  // zero or multiple users — keep the lea
@@ -2807,7 +2849,45 @@ struct Lowerer {
             return;
         }
         SymbolId const sym = mir.globalAddrSymbol(id);
-        LirReg const result = lir.newVReg(regClassFor(id));
+        LirRegClass const cls = regClassFor(id);
+        // D-LK-EXTERN-DATA-IMPORT (c117): a GOT-indirect extern-DATA object's
+        // address is NOT its symbol VA. The linker binds `symbolVa[sym]` to
+        // the object's __got slot (a non-lazy pointer), which dyld fills at
+        // load with the library object's real address. So materialize the
+        // OBJECT address by (1) lea-ing the __got slot's own VA (image-local,
+        // PC-relative — the linker resolves `sym` to symbolVa[sym] = the slot
+        // VA) then (2) dereferencing it with a 64-bit load. TWO existing
+        // encodings (lea-of-symbol + register-base load), ZERO new
+        // instruction variants; the riprel fold is suppressed for `sym`
+        // (globalAddrRiprelFoldsIntoLoad returns false) so a C-level Load
+        // stays a distinct SECOND indirection (object address → object
+        // value). CopyRelocation (ELF) never reaches here — its data externs
+        // have a DIRECT exec-local .bss address (the plain lea path below).
+        if (externDataGotSymbols_.contains(sym.v)) {
+            auto const loadOp = classOp(cls, RegClassOp::Load);
+            if (!loadOp.has_value()) {
+                reportMissingClassOp(cls, RegClassOp::Load,
+                                     "MIR GlobalAddr (GOT-indirect extern data)");
+                return;
+            }
+            LirReg const slotAddr = lir.newVReg(cls);
+            std::array<LirOperand, 1> leaOps{LirOperand::makeSymbolRef(sym.v)};
+            emitInst(*opcode(MnemonicSlot::Lea), slotAddr, leaOps);
+            LirReg const objectAddr = lir.newVReg(cls);
+            std::array<LirOperand, 3> loadOps{
+                LirOperand::makeReg(slotAddr),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(0),
+            };
+            // The __got slot always holds a 64-bit pointer — width-default
+            // (flags 0 ⇒ 64) full-register load (memAccessWidthFlags maps a
+            // pointer type to 0 as well; 0 here IS that value, made explicit
+            // so a mis-typed GlobalAddr can never narrow the pointer load).
+            emitInst(*loadOp, objectAddr, loadOps, /*payload=*/0, /*flags=*/0);
+            defineValue(id, objectAddr);
+            return;
+        }
+        LirReg const result = lir.newVReg(cls);
         std::array<LirOperand, 1> ops{LirOperand::makeSymbolRef(sym.v)};
         emitInst(*opcode(MnemonicSlot::Lea), result, ops);
         defineValue(id, result);
@@ -5645,6 +5725,7 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           DiagnosticReporter& reporter,
                           std::vector<ExternImport> externImports,
                           std::optional<ExternCallDispatch> externCallDispatch,
+                          std::optional<DataImportBinding> dataImportBinding,
                           std::span<MirSehScope const> sehScopes) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
@@ -5655,7 +5736,7 @@ MirToLirResult lowerToLir(Mir const&          mir,
     // (direct-plt: ELF PLT stub) from it. nullopt + extern imports =
     // fail-loud (no silent default to either shape).
     Lowerer L{mir, target, interner, reporter, externImports,
-              externCallDispatch, sehScopes};
+              externCallDispatch, dataImportBinding, sehScopes};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /

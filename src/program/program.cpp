@@ -468,6 +468,7 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                      effectiveBitFieldStrategy(**targetR, **formatR),
                                      ccIndex, cuMirs[0].cuId,
                                      (*formatR)->externCallDispatch(),
+                                     (*formatR)->dataImportBinding(),
                                      std::move(sehScopes),
                                      reporter);
     if (!mod) return false;  // back-half tier failure already reported via `reporter`

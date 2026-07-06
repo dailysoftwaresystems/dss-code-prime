@@ -2528,6 +2528,105 @@ TEST(ShippedLibDescriptor, RealSysTimeTimevalPerFormatLayout) {
     }
 }
 
+// ── c117 (the macho shell.c POSIX-header batch: pwd/dirent/resource) ─────────
+// Each reads the REAL shipped descriptor per format + computes the layout the
+// MIR engine uses; red if the macho variant regresses to the elf layout or is
+// dropped. The Darwin layouts are verified against the macOS SDK (arm64).
+
+// struct passwd DIVERGES: Darwin has 10 fields (pw_change + pw_class after
+// pw_gid, pw_expire at the tail) vs glibc's 7, pushing the shell.c-read pw_dir
+// from @32 (elf) to @48 (macho) — a single layout silently misreads the home dir.
+TEST(ShippedLibDescriptor, RealPwdPerFormatPasswdLayout) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "pwd.json";
+    auto layoutFor = [&](ObjectFormatKind fmt) -> std::optional<StructLayout> {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64,
+                                             std::string_view{"arm64"}, fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_EQ(desc->structs.size(), 1u);
+        return computeLayout(desc->structs[0].typeId, interner, kNatural16,
+                             DataModel::Lp64);
+    };
+    auto elf = layoutFor(ObjectFormatKind::Elf);
+    auto macho = layoutFor(ObjectFormatKind::MachO);
+    ASSERT_TRUE(elf.has_value());
+    ASSERT_TRUE(macho.has_value());
+    EXPECT_EQ(elf->size, 48u);              // glibc struct passwd (7 fields)
+    EXPECT_EQ(macho->size, 72u);            // Darwin struct passwd (10 fields)
+    EXPECT_EQ(elf->fieldOffsets[5], 32u);   // pw_dir (index 5 on elf)  @ 32
+    EXPECT_EQ(macho->fieldOffsets[7], 48u); // pw_dir (index 7 on macho) @ 48
+}
+
+// struct dirent DIVERGES: Darwin's 64-bit-inode form (d_seekoff + d_namlen,
+// d_name[1024]) is 1048 bytes with d_name @ 21 vs glibc's 280 / d_name @ 19 —
+// shell.c reads d_name, so a single layout reads the wrong bytes.
+TEST(ShippedLibDescriptor, RealDirentPerFormatDirentLayout) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "dirent.json";
+    auto layoutFor = [&](ObjectFormatKind fmt) -> std::optional<StructLayout> {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64,
+                                             std::string_view{"arm64"}, fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_EQ(desc->structs.size(), 1u);
+        return computeLayout(desc->structs[0].typeId, interner, kNatural16,
+                             DataModel::Lp64);
+    };
+    auto elf = layoutFor(ObjectFormatKind::Elf);
+    auto macho = layoutFor(ObjectFormatKind::MachO);
+    ASSERT_TRUE(elf.has_value());
+    ASSERT_TRUE(macho.has_value());
+    EXPECT_EQ(elf->size, 280u);             // glibc struct dirent
+    EXPECT_EQ(macho->size, 1048u);          // Darwin 64-bit-inode struct dirent
+    EXPECT_EQ(elf->fieldOffsets[4], 19u);   // d_name (index 4 on elf)  @ 19
+    EXPECT_EQ(macho->fieldOffsets[5], 21u); // d_name (index 5 on macho) @ 21
+}
+
+// struct rusage keeps the SAME 144-byte size + BSD field order on Darwin, but
+// its embedded struct timeval's tv_usec is i32 (Darwin __darwin_suseconds_t)
+// vs glibc's i64 — the same-size-swap trap (shell.c .timer reads tv_usec).
+TEST(ShippedLibDescriptor, RealResourcePerFormatRusageTimeval) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "sys" / "resource.json";
+    auto checkFor = [&](ObjectFormatKind fmt, TypeKind expectedUsecKind) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64,
+                                             std::string_view{"arm64"}, fmt);
+        ASSERT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        ASSERT_EQ(desc->structs.size(), 2u);   // timeval + rusage
+        auto const& tv = desc->structs[0];
+        EXPECT_EQ(tv.name, "timeval");
+        ASSERT_EQ(tv.fields.size(), 2u);
+        EXPECT_EQ(tv.fields[1].name, "tv_usec");
+        EXPECT_EQ(interner.kind(tv.fields[1].type), expectedUsecKind)
+            << "tv_usec width wrong";
+        auto const& ru = desc->structs[1];
+        EXPECT_EQ(ru.name, "rusage");
+        auto ruLayout = computeLayout(ru.typeId, interner, kNatural16,
+                                      DataModel::Lp64);
+        ASSERT_TRUE(ruLayout.has_value());
+        EXPECT_EQ(ruLayout->size, 144u);   // SAME size both formats (the trap)
+    };
+    checkFor(ObjectFormatKind::Elf,   TypeKind::I64);
+    checkFor(ObjectFormatKind::MachO, TypeKind::I32);
+}
+
 // ── c106 (the shell.c pe header/descriptor batch) ──────────────────────────
 
 // Decode a REAL shipped descriptor for one format (the RealTimeStructTm idiom).

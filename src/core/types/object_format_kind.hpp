@@ -137,19 +137,30 @@ externCallDispatchFromName(std::string_view s) noexcept {
 //     references the executable's copy. The standard glibc non-PIE
 //     ET_EXEC mechanism — zero new instruction encodings.
 //
-// A future PIE/GOT-indirect model ("got-indirect": address loads
-// through a GOT slot the loader fills — required once DSS emits
-// ET_DYN) and the PE `__imp_` data-thunk model would be NEW members;
-// the linker gate + walkers dispatch on the declared member, never on
-// a format-name branch. Consumed by the linker's pre-walker data-
-// import gate (linker.cpp) + the per-format walker that implements
-// the declared mechanism (elf.cpp).
+//   * `got-indirect` (Mach-O `__got` S_NON_LAZY_SYMBOL_POINTERS; c117):
+//     the address of the imported object is LOADED at run time from a
+//     per-object non-lazy pointer slot (`__DATA_CONST,__got`) that the
+//     dynamic loader (dyld) binds to the library's object. Code that
+//     needs the object's ADDRESS loads the slot (x86_64 `mov r,[rip+
+//     GOTPCREL]`; arm64 `adrp+ldr`) — one extra indirection vs a direct
+//     address, but ZERO copy + PIE-compatible (macOS arm64 images are
+//     always PIE). This is the model the PE `__imp_` data thunk will
+//     also take when it lands; the __got slot infrastructure already
+//     exists for the function-import stubs (they jump THROUGH it).
+//
+// The PE `__imp_` data-thunk model would be a further NEW member; the
+// linker gate + walkers dispatch on the declared member, never on a
+// format-name branch. Consumed by the linker's pre-walker data-import
+// gate (linker.cpp) + the per-format walker that implements the
+// declared mechanism (elf.cpp copy-relocation / macho.cpp __got).
 enum class DataImportBinding : std::uint8_t {
     CopyRelocation = 1,  // ELF ET_EXEC R_*_COPY exec-local .bss copy
+    GotIndirect    = 2,  // Mach-O __got non-lazy pointer (dyld-bound)
 };
 
-inline constexpr EnumNameTable<DataImportBinding, 1> kDataImportBindingTable{{{
+inline constexpr EnumNameTable<DataImportBinding, 2> kDataImportBindingTable{{{
     { DataImportBinding::CopyRelocation, "copy-relocation" },
+    { DataImportBinding::GotIndirect,    "got-indirect" },
 }}};
 
 [[nodiscard]] constexpr std::string_view

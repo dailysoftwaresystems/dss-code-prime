@@ -1,5 +1,5 @@
 {
-  "$comment": "c84 D-LK-EXTERN-DATA-IMPORT (the SectionB-locked option A — ELF COPY relocations): stdout/stderr/stdin ship from stdio.json as extern DATA objects (kind:object, FILE*, availableObjectFormats:[elf]); the ELF exec walker reserves a .bss copy slot per stream, exports each as a DEFINED OBJECT dynsym (st_size=8 from the DataModel pointer width, NEVER hardcoded) and emits R_X86_64_COPY(5)/R_AARCH64_COPY(1024) in .rela.dyn; ld-linux copies libc's FILE* values in before entry. The runner's capture MERGES the child's stderr into capturedStdout, so expectedStdout asserts BOTH streams' bytes in a DETERMINISTIC order (stdout explicitly fflush'd before the stderr write; C 7.21.3p7 keeps stderr un-fully-buffered) — proving both FILE* slots bind the real libc streams; the 1>/2> SEPARATION is asserted by the manual WSL validation (a merged capture cannot express it). Both fprintf return values (22 chars each) feed the exit code; the three slots must be non-null + pairwise-distinct. ELF LEGS ONLY: pe/macho do not ship the objects (their dataImportBinding models have not landed — a reference there stays an honest S0001; the linker rejects any surviving data import loud). RED-ON-DISABLE witnessed: un-ship the objects -> S0001; drop dataImportBinding from the format -> K_FormatLacksImportSupport at link. gcc -std=c17 -no-pie cross-checked (exit 42, identical stream bytes, same COPY mechanism).",
+  "$comment": "c84 D-LK-EXTERN-DATA-IMPORT (the SectionB-locked option A — ELF COPY relocations): stdout/stderr/stdin ship from stdio.json as extern DATA objects (kind:object, FILE*, availableObjectFormats:[elf]); the ELF exec walker reserves a .bss copy slot per stream, exports each as a DEFINED OBJECT dynsym (st_size=8 from the DataModel pointer width, NEVER hardcoded) and emits R_X86_64_COPY(5)/R_AARCH64_COPY(1024) in .rela.dyn; ld-linux copies libc's FILE* values in before entry. The runner's capture MERGES the child's stderr into capturedStdout, so expectedStdout asserts BOTH streams' bytes in a DETERMINISTIC order (stdout explicitly fflush'd before the stderr write; C 7.21.3p7 keeps stderr un-fully-buffered) — proving both FILE* slots bind the real libc streams; the 1>/2> SEPARATION is asserted by the manual WSL validation (a merged capture cannot express it). Both fprintf return values (22 chars each) feed the exit code; the three slots must be non-null + pairwise-distinct. ★ c117 (D-LK-EXTERN-DATA-IMPORT, the got-indirect half): the MACHO ARM now runs — Darwin stdout/stderr/stdin ship as extern DATA objects (__stdoutp/__stderrp/__stdinp; macho macro rewrites the stdin/stdout/stderr tokens) bound via Mach-O __got NON-LAZY POINTERS (macho.format.json dataImportBinding:got-indirect), NOT copy relocations (that is the elf non-PIE model). The macho leg runs NATIVELY on the macos-latest (Apple-Silicon) CI leg + local ctest on a Mac — the same fprintf/stream-distinctness assertions prove the got-indirect address materialization (lea-of-__got-slot + deref) binds the REAL libSystem streams. PE still stays S0001 for the raw objects (its __imp_ data-thunk model is unbuilt; pe routes stdout through the __iob_func accessor macro instead). RED-ON-DISABLE witnessed: un-ship the objects -> S0001; drop dataImportBinding from the format -> K_FormatLacksImportSupport at link; neuter the got-indirect deref (bare lea) -> the load reads the __got slot ADDRESS as the FILE* -> crash/garbage. gcc/clang -std=c17 cross-checked (exit 42, identical stream bytes).",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,
@@ -19,6 +19,14 @@
         "linux"
       ],
       "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ],
+      "emulator": ""
     }
   ],
   "optimizedPipelines": [

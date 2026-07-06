@@ -1,9 +1,9 @@
 {
-  "$comment": "Neutral shipped <dirent.h> (POSIX) — c81 (the sqlite shell.c CLI route; shell.c includes it at 179 + 9840 [fileio.c], both !_WIN32; the static windirent opendir/readdir/closedir defs at 3948-4095 are `_WIN32 && _MSC_VER`-only, inactive here). Surface = shell.c's use: `DIR *pDir` (a fileio struct member) + opendir/readdir/closedir + `struct dirent *pEntry -> pEntry->d_name`. ★ DIR is OPAQUE (glibc: `typedef struct __dirstream DIR` — an INCOMPLETE type; user code only ever holds DIR*, opendir allocates internally): shipped as a typedef to the EMPTY named struct `struct \"DIR\" {}` — the exact FILE precedent (stdio.json types FILE* as `ptr<struct \"FILE\" {}>`), so `DIR *p` resolves in type position (the typedefs surface also seeds the parse-time cast-vs-call oracle) while member access on it stays impossible (no field scope -> fails loud), faithfully opaque. The dir-handle params/returns are ptr<void> per house style (time.json precedent — C void*<->T* coercion; the pointee layout never enters a signature). ★ struct dirent IS layout-critical (readdir returns libc's own struct; shell.c reads d_name at its glibc offset): verified against the REAL /usr/include/x86_64-linux-gnu/bits/dirent.h AND the aarch64 cross headers in WSL (IDENTICAL, LP64, non-__USE_FILE_OFFSET64 default): d_ino __ino_t(u64) @0, d_off __off_t(i64) @8, d_reclen unsigned short(u16) @16, d_type unsigned char(u8) @18, d_name char[256] @19 -> sizeof 280 (derived: 275 padded to 8-align); the layout engine derives exactly these offsets. Gated [elf] ONLY — Darwin's struct dirent DIVERGES (d_seekoff/d_namlen, d_name[1024]) AND the Darwin x86_64 symbol is suffixed (readdir$INODE64), a wrong-symbol/wrong-layout double trap; a macho consumer gets fail-loud unavailable and the Darwin form lands verified when needed. libc symbols verified in WSL: opendir/readdir/closedir @GLIBC_2.2.5 in libc.so.6.",
+  "$comment": "Neutral shipped <dirent.h> (POSIX) — c81 (the sqlite shell.c CLI route; shell.c includes it at 179 + 9840 [fileio.c], both !_WIN32; the static windirent opendir/readdir/closedir defs at 3948-4095 are `_WIN32 && _MSC_VER`-only, inactive here). Surface = shell.c's use: `DIR *pDir` (a fileio struct member) + opendir/readdir/closedir + `struct dirent *pEntry -> pEntry->d_name`. ★ DIR is OPAQUE (glibc: `typedef struct __dirstream DIR` — an INCOMPLETE type; user code only ever holds DIR*, opendir allocates internally): shipped as a typedef to the EMPTY named struct `struct \"DIR\" {}` — the exact FILE precedent (stdio.json types FILE* as `ptr<struct \"FILE\" {}>`), so `DIR *p` resolves in type position (the typedefs surface also seeds the parse-time cast-vs-call oracle) while member access on it stays impossible (no field scope -> fails loud), faithfully opaque. The dir-handle params/returns are ptr<void> per house style (time.json precedent — C void*<->T* coercion; the pointee layout never enters a signature). ★ struct dirent IS layout-critical (readdir returns libc's own struct; shell.c reads d_name at its glibc offset): verified against the REAL /usr/include/x86_64-linux-gnu/bits/dirent.h AND the aarch64 cross headers in WSL (IDENTICAL, LP64, non-__USE_FILE_OFFSET64 default): d_ino __ino_t(u64) @0, d_off __off_t(i64) @8, d_reclen unsigned short(u16) @16, d_type unsigned char(u8) @18, d_name char[256] @19 -> sizeof 280 (derived: 275 padded to 8-align); the layout engine derives exactly these offsets. ★ c117 (the macho shell.c CLI leg, user §B): the Darwin variant lands — the 64-bit-inode struct dirent (verified against the real macOS SDK sys/dirent.h `__DARWIN_STRUCT_DIRENTRY`, the arm64 default): d_ino u64 @0, d_seekoff u64 @8, d_reclen u16 @16, d_namlen u16 @18, d_type u8 @20, d_name char[1024] @21 -> sizeof 1048 (vs the glibc 280B / d_name@19); shell.c reads d_name, so a single layout would read the wrong bytes. SYMBOLS: on arm64-darwin the 64-bit-inode ABI is the ONLY ABI, so opendir/readdir/closedir are the PLAIN names (NO `$INODE64` suffix — the sys/stat.json fstat/lstat/stat precedent); the x86_64-macho `readdir$INODE64` asm-label alias has no CI leg and is a documented no-consumer residual. libc symbols verified: opendir/readdir/closedir @GLIBC_2.2.5 (libc.so.6) / _opendir/_readdir/_closedir (libSystem).",
   "header": "dirent.h",
   "standard": "posix",
-  "availableObjectFormats": ["elf"],
-  "library": { "elf": "libc.so.6" },
+  "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "symbols": [
     { "name": "opendir",  "signature": "fn(ptr<char>) -> ptr<void>", "kind": "function", "linkage": "external" },
     { "name": "readdir",  "signature": "fn(ptr<void>) -> ptr<void>", "kind": "function", "linkage": "external" },
@@ -15,12 +15,28 @@
   "structs": [
     {
       "name": "dirent",
-      "fields": [
-        { "name": "d_ino",    "type": "u64" },
-        { "name": "d_off",    "type": "i64" },
-        { "name": "d_reclen", "type": "u16" },
-        { "name": "d_type",   "type": "u8" },
-        { "name": "d_name",   "type": "arr<char, 256>" }
+      "variants": [
+        {
+          "when": { "format": "elf" },
+          "fields": [
+            { "name": "d_ino",    "type": "u64" },
+            { "name": "d_off",    "type": "i64" },
+            { "name": "d_reclen", "type": "u16" },
+            { "name": "d_type",   "type": "u8" },
+            { "name": "d_name",   "type": "arr<char, 256>" }
+          ]
+        },
+        {
+          "when": { "format": "macho" },
+          "fields": [
+            { "name": "d_ino",     "type": "u64" },
+            { "name": "d_seekoff", "type": "u64" },
+            { "name": "d_reclen",  "type": "u16" },
+            { "name": "d_namlen",  "type": "u16" },
+            { "name": "d_type",    "type": "u8" },
+            { "name": "d_name",    "type": "arr<char, 1024>" }
+          ]
+        }
       ]
     }
   ]

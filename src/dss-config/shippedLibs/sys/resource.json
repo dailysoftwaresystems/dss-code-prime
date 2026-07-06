@@ -1,9 +1,9 @@
 {
-  "$comment": "Neutral shipped <sys/resource.h> (POSIX) — c81 (the sqlite shell.c CLI route; shell.c:26135 [performance timer] under !_WIN32 && !__minux; the local struct rusage + getrusage macro at 26138-26143 are VxWorks-only [_WRS_KERNEL||__RTP__], inactive). Surface = shell.c's use: getrusage(RUSAGE_SELF,&sBegin) x2 + struct rusage statics + `.ru_utime`/`.ru_stime` (their addresses feed timeDiff(struct timeval*,...)). ★ struct rusage is LAYOUT-CRITICAL (libc FILLS the caller's 144-byte object): verified against the REAL /usr/include/x86_64-linux-gnu/bits/types/struct_rusage.h AND the aarch64 cross headers in WSL (IDENTICAL): struct timeval ru_utime @0, ru_stime @16, then the 14 `long int` fields in kernel order @32..136 (glibc wraps each long in a union with __syscall_slong_t for x32 ONLY — on LP64 both members are i64, so the flat i64 field list is byte-identical) -> sizeof 144, derived by the layout engine from the field sizes. The ru_utime/ru_stime FIELD TYPE is spelled `struct \"timeval\" {i64, i64}` — parseTypeFromText interns structType(\"timeval\",[i64,i64]), the SAME TypeId sys/time.json's timeval structs-entry interns, so `.ru_utime.tv_sec`/`tv_usec` member access resolves through the ONE compositeScopeByType field scope regardless of which descriptor injected it. timeval is ALSO shipped here as a struct (tag + field scope) because POSIX sys/resource.h PROVIDES struct timeval (glibc's struct_rusage.h includes struct_timeval.h) — a TU including ONLY <sys/resource.h> still resolves `.ru_utime.tv_sec`; when <sys/time.h> is also included (shell.c includes both) the tag dedups first-wins onto the IDENTICAL TypeId, so the two declarations can never diverge into two types. RUSAGE_SELF=0 (verified bits/resource.h) rides `constants` — shell.c's uses are UNGUARDED calls (no #ifdef RUSAGE_SELF anywhere, grep-verified), so the semantic constant surface suffices (contrast signal.json's #ifdef-guarded SIG* macros). Gated [elf] ONLY — Darwin's struct rusage has the same BSD field order BUT Darwin's struct timeval diverges (Darwin suseconds_t tv_usec = i32, not glibc's i64), so a macho rusage here would misread tv_usec; fail-loud unavailable beats a silent wrong layout, and the Darwin form lands (together with a per-format timeval story) when a macho consumer arrives. libc symbol verified in WSL: getrusage@GLIBC_2.2.5 in libc.so.6.",
+  "$comment": "Neutral shipped <sys/resource.h> (POSIX) — c81 (the sqlite shell.c CLI route; shell.c:26135 [performance timer] under !_WIN32 && !__minux; the local struct rusage + getrusage macro at 26138-26143 are VxWorks-only [_WRS_KERNEL||__RTP__], inactive). Surface = shell.c's use: getrusage(RUSAGE_SELF,&sBegin) x2 + struct rusage statics + `.ru_utime`/`.ru_stime` (their addresses feed timeDiff(struct timeval*,...)). ★ struct rusage is LAYOUT-CRITICAL (libc FILLS the caller's 144-byte object): verified against the REAL /usr/include/x86_64-linux-gnu/bits/types/struct_rusage.h AND the aarch64 cross headers in WSL (IDENTICAL): struct timeval ru_utime @0, ru_stime @16, then the 14 `long int` fields in kernel order @32..136 (glibc wraps each long in a union with __syscall_slong_t for x32 ONLY — on LP64 both members are i64, so the flat i64 field list is byte-identical) -> sizeof 144, derived by the layout engine from the field sizes. The ru_utime/ru_stime FIELD TYPE is spelled `struct \"timeval\" {i64, i64}` — parseTypeFromText interns structType(\"timeval\",[i64,i64]), the SAME TypeId sys/time.json's timeval structs-entry interns, so `.ru_utime.tv_sec`/`tv_usec` member access resolves through the ONE compositeScopeByType field scope regardless of which descriptor injected it. timeval is ALSO shipped here as a struct (tag + field scope) because POSIX sys/resource.h PROVIDES struct timeval (glibc's struct_rusage.h includes struct_timeval.h) — a TU including ONLY <sys/resource.h> still resolves `.ru_utime.tv_sec`; when <sys/time.h> is also included (shell.c includes both) the tag dedups first-wins onto the IDENTICAL TypeId, so the two declarations can never diverge into two types. RUSAGE_SELF=0 (verified bits/resource.h) rides `constants` — shell.c's uses are UNGUARDED calls (no #ifdef RUSAGE_SELF anywhere, grep-verified), so the semantic constant surface suffices (contrast signal.json's #ifdef-guarded SIG* macros). ★ c117 (the macho shell.c CLI leg, user §B): the Darwin variant lands. Darwin's struct rusage keeps the SAME BSD field order + the 14 i64 counters, BUT its embedded struct timeval diverges — Darwin __darwin_suseconds_t tv_usec = i32 (verified macOS SDK sys/_types.h), so the macho timeval variant is {tv_sec i64, tv_usec i32} (12 payload + 4 trailing pad = 16, sizeof rusage still 144). ★ THE SAME-SIZE TRAP (c15c): sizeof agrees at 144 both formats, so a size check cannot discriminate — a macho READ of tv_usec through an i64 field folds 4 padding bytes into the high half (shell.c's .timer reads ru_utime.tv_usec). The macho ru_utime/ru_stime field type is spelled `struct \"timeval\" {i64, i32}` — the SAME TypeId sys/time.json's macho timeval variant interns (c83 D-FFI-MACHO-TIMEVAL-TV-USEC-WIDTH), so `.ru_utime.tv_usec` resolves through the one field scope regardless of include order. libc symbols verified: getrusage@GLIBC_2.2.5 (libc.so.6) / _getrusage (libSystem).",
   "header": "sys/resource.h",
   "standard": "posix",
-  "availableObjectFormats": ["elf"],
-  "library": { "elf": "libc.so.6" },
+  "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
   "symbols": [
     { "name": "getrusage", "signature": "fn(i32, ptr<void>) -> i32", "kind": "function", "linkage": "external" }
   ],
@@ -13,30 +13,68 @@
   "structs": [
     {
       "name": "timeval",
-      "fields": [
-        { "name": "tv_sec",  "type": "i64" },
-        { "name": "tv_usec", "type": "i64" }
+      "variants": [
+        {
+          "when": { "format": "elf" },
+          "fields": [
+            { "name": "tv_sec",  "type": "i64" },
+            { "name": "tv_usec", "type": "i64" }
+          ]
+        },
+        {
+          "when": { "format": "macho" },
+          "fields": [
+            { "name": "tv_sec",  "type": "i64" },
+            { "name": "tv_usec", "type": "i32" }
+          ]
+        }
       ]
     },
     {
       "name": "rusage",
-      "fields": [
-        { "name": "ru_utime",    "type": "struct \"timeval\" {i64, i64}" },
-        { "name": "ru_stime",    "type": "struct \"timeval\" {i64, i64}" },
-        { "name": "ru_maxrss",   "type": "i64" },
-        { "name": "ru_ixrss",    "type": "i64" },
-        { "name": "ru_idrss",    "type": "i64" },
-        { "name": "ru_isrss",    "type": "i64" },
-        { "name": "ru_minflt",   "type": "i64" },
-        { "name": "ru_majflt",   "type": "i64" },
-        { "name": "ru_nswap",    "type": "i64" },
-        { "name": "ru_inblock",  "type": "i64" },
-        { "name": "ru_oublock",  "type": "i64" },
-        { "name": "ru_msgsnd",   "type": "i64" },
-        { "name": "ru_msgrcv",   "type": "i64" },
-        { "name": "ru_nsignals", "type": "i64" },
-        { "name": "ru_nvcsw",    "type": "i64" },
-        { "name": "ru_nivcsw",   "type": "i64" }
+      "variants": [
+        {
+          "when": { "format": "elf" },
+          "fields": [
+            { "name": "ru_utime",    "type": "struct \"timeval\" {i64, i64}" },
+            { "name": "ru_stime",    "type": "struct \"timeval\" {i64, i64}" },
+            { "name": "ru_maxrss",   "type": "i64" },
+            { "name": "ru_ixrss",    "type": "i64" },
+            { "name": "ru_idrss",    "type": "i64" },
+            { "name": "ru_isrss",    "type": "i64" },
+            { "name": "ru_minflt",   "type": "i64" },
+            { "name": "ru_majflt",   "type": "i64" },
+            { "name": "ru_nswap",    "type": "i64" },
+            { "name": "ru_inblock",  "type": "i64" },
+            { "name": "ru_oublock",  "type": "i64" },
+            { "name": "ru_msgsnd",   "type": "i64" },
+            { "name": "ru_msgrcv",   "type": "i64" },
+            { "name": "ru_nsignals", "type": "i64" },
+            { "name": "ru_nvcsw",    "type": "i64" },
+            { "name": "ru_nivcsw",   "type": "i64" }
+          ]
+        },
+        {
+          "when": { "format": "macho" },
+          "fields": [
+            { "name": "ru_utime",    "type": "struct \"timeval\" {i64, i32}" },
+            { "name": "ru_stime",    "type": "struct \"timeval\" {i64, i32}" },
+            { "name": "ru_maxrss",   "type": "i64" },
+            { "name": "ru_ixrss",    "type": "i64" },
+            { "name": "ru_idrss",    "type": "i64" },
+            { "name": "ru_isrss",    "type": "i64" },
+            { "name": "ru_minflt",   "type": "i64" },
+            { "name": "ru_majflt",   "type": "i64" },
+            { "name": "ru_nswap",    "type": "i64" },
+            { "name": "ru_inblock",  "type": "i64" },
+            { "name": "ru_oublock",  "type": "i64" },
+            { "name": "ru_msgsnd",   "type": "i64" },
+            { "name": "ru_msgrcv",   "type": "i64" },
+            { "name": "ru_nsignals", "type": "i64" },
+            { "name": "ru_nvcsw",    "type": "i64" },
+            { "name": "ru_nivcsw",   "type": "i64" }
+          ]
+        }
       ]
     }
   ]

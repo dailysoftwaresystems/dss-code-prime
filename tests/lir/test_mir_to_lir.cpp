@@ -376,6 +376,74 @@ TEST(MirToLir, UnsignedDivisionLowersToXorPlusDivNotCqoIDiv) {
            "miscompile guard, preserved through 10r split).";
 }
 
+// c117 (D-LK-EXTERN-DATA-IMPORT): a GOT-indirect extern-DATA GlobalAddr
+// materializes the OBJECT's address by lea-of-__got-slot + a DEREF load (the
+// __got slot holds the dyld-bound object address), and the GlobalAddr→Load
+// riprel fold is SUPPRESSED so a C-level load stays a distinct SECOND
+// indirection. A bare lea would yield the __got slot ADDRESS where the object
+// VALUE was wanted — off by one indirection, a silent miscompile. Always-on
+// structural guard for the macho stdout/stderr codegen (runtime witness =
+// the `stdio_stream_objects` macho arm). RED-ON-DISABLE: drop the
+// externDataGotSymbols_ membership (bare lea) → 1 memory access; keep the
+// fold (not suppressed) → the pair folds to ONE riprel load, 0 MemBase.
+TEST(MirToLir, GotIndirectExternDataGlobalAddrEmitsLeaThenDeref) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i8         = interner.primitive(TypeKind::I8);
+    TypeId const filePtr    = interner.pointer(i8);       // FILE* stand-in
+    TypeId const filePtrPtr = interner.pointer(filePtr);  // &stdout : FILE**
+    TypeId const params[]   = {i8};                        // one ignored param
+    TypeId const fnSig      = interner.fnSig(params, filePtr, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    (void)mb.addArg(0, i8);
+    // `return stdout;` — stdout (a data extern) as rvalue = Load(GlobalAddr).
+    SymbolId const dataSym{200};
+    MirInstId const ga        = mb.addGlobalAddr(dataSym, filePtrPtr);  // &stdout
+    MirInstId const loadArgs[] = {ga};
+    MirInstId const val       = mb.addInst(MirOpcode::Load, loadArgs, filePtr);
+    mb.addReturn(val);
+    Mir mir = std::move(mb).finish();
+
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> externs;
+    dss::ExternImport ei;
+    ei.symbol      = dataSym;
+    ei.mangledName = "___stdoutp";
+    ei.libraryPath = "/usr/lib/libSystem.B.dylib";
+    ei.isData      = true;
+    externs.push_back(ei);
+    auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+                           ExternCallDispatch::DirectPlt,
+                           DataImportBinding::GotIndirect);
+    ASSERT_TRUE(lirR.ok);
+    Lir const& lir = lirR.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool sawGotSlotSymbol = false;  // an inst carrying SymbolRef(dataSym)
+    int  memAccesses      = 0;      // insts with a MemBase operand (base-reg loads)
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const ops = lir.instOperands(lir.blockInstAt(bb, i));
+        bool hasSym = false, hasMem = false;
+        for (auto const& op : ops) {
+            if (op.kind == LirOperandKind::SymbolRef && op.symbolV == dataSym.v) {
+                hasSym = true;
+            }
+            if (op.kind == LirOperandKind::MemBase) hasMem = true;
+        }
+        if (hasSym) sawGotSlotSymbol = true;
+        if (hasMem) ++memAccesses;
+    }
+    EXPECT_TRUE(sawGotSlotSymbol)
+        << "the __got-slot lea must carry a SymbolRef to the data extern.";
+    EXPECT_GE(memAccesses, 2)
+        << "a got-indirect data extern needs the __got DEREF load (the object "
+           "address) BEFORE the C-level load (the object value) — two base-reg "
+           "memory accesses; a bare lea gives 1, a folded riprel load gives 0.";
+}
+
 // ─── FC1 (V2-4.X, 2026-06-10): SMod/UMod lowering + the role contract ──────
 
 namespace {

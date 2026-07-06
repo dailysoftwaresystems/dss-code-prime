@@ -1024,7 +1024,9 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
                                      (*formatR)->dataModel(),
                                      effectiveBitFieldStrategy(**targetR, **formatR),
                                      ccIndex,
-                                     cuMirs[0].cuId, std::nullopt,
+                                     cuMirs[0].cuId,
+                                     /*externCallDispatch=*/std::nullopt,
+                                     /*dataImportBinding=*/std::nullopt,
                                      /*sehScopes=*/{}, rep);
     ASSERT_TRUE(mod.has_value()) << "errorCount=" << rep.errorCount();
 
