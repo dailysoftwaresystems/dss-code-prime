@@ -42,6 +42,18 @@
 
 namespace dss::x86_variable {
 
+// The exact byte length of the Windows large-frame stack-probe prologue
+// sequence emitted by `emitStackProbeLoop` (D-WIN64-LARGE-FRAME-STACK-PROBE):
+// `mov r11d,frame` (6) + a FIXED 28-byte runtime loop body emitted ONCE (it
+// ITERATES at runtime, it is NOT unrolled per page) + `sub rsp,r11` (3) = 37,
+// independent of the frame size and page count (every imm is a fixed-width
+// imm32). Exposed so the pe64 unwind-table builder (`pe.cpp`, which recomputes
+// prologue byte offsets for `.xdata` CodeOffsets) reads the ONE authoritative
+// length instead of a private formula that can silently drift from the emitter
+// (the c114 audit caught exactly such a drift). `emitStackProbeLoop` static-
+// checks its emitted size against this value so the two can never diverge.
+inline constexpr std::uint32_t kStackProbeLoopBytes = 37u;
+
 // Encode one LIR instruction. Appends bytes to `out`; returns true on
 // success, false (with an `A_*` diagnostic) on any failure (no variant
 // guard matches, register has no registered `hwEncoding`, etc.). Pure

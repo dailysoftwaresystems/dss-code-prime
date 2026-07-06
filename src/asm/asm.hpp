@@ -115,6 +115,32 @@ struct DSS_EXPORT SyntheticBlockSymbol {
     std::uint32_t blockByteOffset = 0; // offset of the target block within THIS fn's bytes
 };
 
+// c114 (D-WIN64-PDATA-XDATA-UNWIND): a FORMAT-NEUTRAL projection of a
+// function's frame prologue — just enough for an unwind-table emitter to
+// describe the frame WITHOUT depending on `lir/` (AssembledFunction has
+// zero lir/ coupling by design). Populated by the compile pipeline from
+// the callconv pass's `FrameLayout`; consumed today ONLY by the pe64
+// writer's `.pdata`/`.xdata` builder, but the data is generic (ELF
+// `.eh_frame` / Mach-O compact-unwind are legitimate future consumers).
+//
+// The canonical DSS x86_64 prologue is `sub rsp, totalFrameSize` (or, for
+// `totalFrameSize > stackProbePageBytes`, the inline page-probe loop) then
+// one `mov [rsp + saveOffset], reg` per USED callee-saved register — no
+// push, no frame pointer. `savedRegs` is in emission (ascending-offset)
+// order; each entry carries the platform register number + class so the
+// emitter can pick UWOP_SAVE_NONVOL (GPR) vs UWOP_SAVE_XMM128 (FPR).
+struct DSS_EXPORT FrameSavedReg {
+    std::uint16_t regEncoding = 0;   // the register's platform ordinal (x64: rax=0..r15=15; xmm N = N)
+    bool          isFpr       = false;  // FPR/vector class ⇒ 16-byte XMM save, else 8-byte GPR
+    std::uint32_t saveOffset  = 0;   // byte offset from post-prologue RSP where the reg is stored
+};
+struct DSS_EXPORT FrameUnwindInfo {
+    std::uint32_t              totalFrameSize = 0;  // bytes the prologue subtracts from RSP
+    bool                       usesStackProbe = false;  // frame > cc.stackProbePageBytes ⇒ the inline probe loop
+    std::uint32_t              stackProbePageBytes = 0; // the cc's guard-page size (probe stride); 0 = no probing
+    std::vector<FrameSavedReg> savedRegs;           // callee-saved regs stored in the prologue, ascending saveOffset
+};
+
 // One assembled function — bytes + symbol-relative metadata. `symbol`
 // is sourced from the originating `lir.funcSymbol(fn)` so the linker
 // can place this function's bytes in its object-file symbol table
@@ -124,6 +150,12 @@ struct DSS_EXPORT AssembledFunction {
     std::vector<std::uint8_t>   bytes;
     std::vector<Relocation>     relocations;
     std::vector<SourceMapEntry> sourceMap;
+    // c114 (D-WIN64-PDATA-XDATA-UNWIND): the frame prologue projection an
+    // unwind-table emitter needs (see FrameUnwindInfo). nullopt when the
+    // pipeline did not attach it (object-file `.obj` path, or a producer
+    // that skips frame layout) — the pe64 exec writer then emits no
+    // unwind entry for this function (a leaf/frameless entry).
+    std::optional<FrameUnwindInfo> unwind;
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols this
     // function's block-address `lea`s reference, each paired with the
     // target block's byte offset within `bytes`. The encoder records a

@@ -1,5 +1,6 @@
 #include "link/format/pe.hpp"
 
+#include "asm/format/x86_variable.hpp"   // kStackProbeLoopBytes (unwind allocLen)
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
 #include "link/format/exec_data_section.hpp"
@@ -176,6 +177,174 @@ peThunkSizeFor(std::uint16_t machine) noexcept {
                      "to ship address-taken FFI for this architecture.",
                      machine, kMachineAmd64PE));
     return false;
+}
+
+// ── Windows x64 unwind info (.xdata UNWIND_INFO) — D-WIN64-PDATA-XDATA-UNWIND
+//
+// The x64 SEH/unwind ABI (learn.microsoft.com/cpp/build/exception-handling-x64)
+// describes each function's PROLOGUE so RtlVirtualUnwind can reconstruct the
+// caller's context from a fault anywhere in the body. The DSS x86_64 prologue is
+// `sub rsp, frame` (or, for `frame > stackProbePageBytes`, the inline page-probe
+// loop) then one `mov [rsp + saveOffset], reg` per used callee-save — no push,
+// no frame pointer. So the unwind codes are UWOP_ALLOC_{SMALL,LARGE} for the RSP
+// adjustment + UWOP_SAVE_NONVOL per saved GPR. A saved FPR (MS-x64 xmm6..15) is
+// spilled low-64 via MOVSD, for which there is no matching UWOP (SAVE_XMM128
+// describes a full-16-byte MOVAPS slot); since an xmm save does not move RSP it is
+// OMITTED from the codes — the RSP/return-address walk stays exact. Its handler-
+// case RESTORE is deferred to D-WIN64-XMM-UNWIND-RESTORE (c116).
+//
+// CRITICAL (audit-F1): each UNWIND_CODE's CodeOffset = the byte offset of the END
+// of the instruction that performs that op (NOT the whole-prologue length); the
+// `sub`/probe is FIRST (small offset), the saves AFTER (larger offsets); the array
+// must be emitted SORTED DESCENDING by CodeOffset. `SizeOfProlog` (a separate
+// header byte) is the whole-prologue length. All offsets are single bytes — a
+// prologue > 255 B is undescribable (fails loud → D-WIN64-CHKSTK-LARGE-PROLOGUE).
+//
+// Byte lengths are recomputed deterministically from FrameUnwindInfo (the
+// x86-variable encoder never emits a shorter-than-worst-case form for a fixed
+// operand shape): `sub rsp,imm32` = 7 B; the inline stack-probe loop = a FIXED
+// `kStackProbeLoopBytes` (37 B — the loop iterates at RUNTIME, it is not
+// unrolled per page; sourced from x86_variable.hpp so it can't drift from
+// emitStackProbeLoop); each GPR save `mov [rsp+disp32],r` = 8 B, each FPR save
+// `movsd [rsp+disp32],xmm` = 8 B (xmm0–7) / 9 B (xmm8–15). A first-byte-opcode
+// check fail-louds if the real prologue diverges.
+constexpr std::uint8_t kUwopAllocLarge  = 1;  // 2 nodes (opinfo 0, size/8 as u16) — frames ≤ 512 KiB
+constexpr std::uint8_t kUwopAllocSmall  = 2;  // 1 node, opinfo = size/8 - 1 — frames 8..128 B
+constexpr std::uint8_t kUwopSaveNonvol  = 4;  // 2 nodes (opinfo=reg, offset/8 as u16)
+constexpr std::size_t  kRuntimeFunctionSize = 12;  // BeginAddress + EndAddress + UnwindInfoAddress (3 u32)
+
+// Build one function's UNWIND_INFO blob (aligned to a multiple of 4 bytes so the
+// next one and any RUNTIME_FUNCTION stays DWORD-aligned). Returns nullopt (with a
+// loud diagnostic) on a >255-byte prologue, a > 512 KiB frame, a non-8-aligned
+// frame/save, or a prologue-shape mismatch — never a silent wrong table.
+[[nodiscard]] inline std::optional<std::vector<std::uint8_t>>
+buildFunctionUnwindInfo(FrameUnwindInfo const&          ui,
+                        std::span<std::uint8_t const>   funcBytes,
+                        std::size_t                     funcIndex,
+                        DiagnosticReporter&             reporter) {
+    auto fail = [&](std::string msg) -> std::optional<std::vector<std::uint8_t>> {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "pe::encodeExec: unwind info for function #"
+                 + std::to_string(funcIndex) + ": " + msg);
+        return std::nullopt;
+    };
+    std::uint32_t const frame = ui.totalFrameSize;
+    if (frame % 8u != 0u) {
+        return fail("frame size " + std::to_string(frame)
+                    + " is not 8-byte aligned — x64 UWOP_ALLOC requires /8");
+    }
+
+    // (1) The RSP-adjust instruction's byte length + its CodeOffset (= its end).
+    std::uint32_t allocLen = 0;
+    if (ui.usesStackProbe) {
+        // The inline page-probe loop is a FIXED-length sequence — it ITERATES
+        // at runtime, it is NOT unrolled per page — so its prologue byte count
+        // is the emitter's own authoritative constant, independent of frame/
+        // page. (The c114 audit caught a drifted private `9 + 28*pages + 3`
+        // here that mis-sized SizeOfProlog + every CodeOffset for any frame
+        // over one guard page → a silently-wrong unwind table.)
+        allocLen = dss::x86_variable::kStackProbeLoopBytes;
+    } else if (frame > 0u) {
+        allocLen = 7u;                       // sub rsp, imm32 = 48 81 EC id
+    }
+    // Prologue-shape guard: verify the first real byte matches (sub → 0x48, probe
+    // → 0x41) so a future prologue-encoding change can't silently desync the
+    // recomputed offsets from the emitted bytes.
+    if (allocLen > 0u) {
+        if (funcBytes.empty()) return fail("empty function body but frame > 0");
+        std::uint8_t const b0 = funcBytes[0];
+        std::uint8_t const want = ui.usesStackProbe ? 0x41u : 0x48u;
+        if (b0 != want) {
+            return fail("prologue first byte 0x"
+                        + std::format("{:02x}", b0) + " != expected 0x"
+                        + std::format("{:02x}", want)
+                        + " — the recomputed unwind offsets would desync");
+        }
+    }
+
+    // (2) Saved-reg stores. Walk them in prologue (emission) order to advance the
+    //     byte cursor by EACH store's exact width, so a later GPR save's CodeOffset
+    //     is right even after an interleaved FPR save. GPR save `mov [rsp+d32],r`
+    //     = 8 B (REX.W always present). FPR save is DSS's `movsd [rsp+d32],xmm`
+    //     (F2 0F 11 /r, the low-64 store — Win64 spill) = 8 B for xmm0-7, 9 B for
+    //     xmm8-15 (REX.R). We EMIT a UWOP_SAVE_NONVOL per GPR but OMIT the FPR
+    //     saves from the unwind codes: DSS saves only the low 64 bits via MOVSD,
+    //     for which there is no x64 UWOP (SAVE_XMM128 restores a full 16 B from a
+    //     movaps slot), and an XMM save does NOT affect RSP/return-address
+    //     reconstruction — so stack unwinding stays exact. The handler-case xmm
+    //     RESTORE is deferred to D-WIN64-XMM-UNWIND-RESTORE (c116): either spill
+    //     xmm6-15 with movaps + emit SAVE_XMM128, or confirm no handler reads them.
+    struct Code { std::uint8_t codeOffset; std::uint8_t opAndInfo; std::uint16_t node; bool hasNode; };
+    std::vector<Code> saveCodes;
+    std::uint32_t cursor = allocLen;
+    for (auto const& sr : ui.savedRegs) {
+        std::uint32_t const width =
+            sr.isFpr ? (sr.regEncoding < 8u ? 8u : 9u) : 8u;
+        cursor += width;
+        if (cursor > 255u) {
+            return fail("prologue exceeds 255 bytes (x64 UNWIND_INFO offsets are "
+                        "single bytes) — switch the large-frame probe to __chkstk "
+                        "(D-WIN64-CHKSTK-LARGE-PROLOGUE)");
+        }
+        if (sr.isFpr) continue;   // low-64 MOVSD save — omitted (RSP-irrelevant)
+        if (sr.saveOffset % 8u != 0u) {
+            return fail("saved-reg offset " + std::to_string(sr.saveOffset)
+                        + " not 8-aligned — UWOP_SAVE_NONVOL node is offset/8");
+        }
+        saveCodes.push_back(Code{
+            static_cast<std::uint8_t>(cursor),
+            static_cast<std::uint8_t>(kUwopSaveNonvol | (sr.regEncoding << 4)),
+            static_cast<std::uint16_t>(sr.saveOffset / 8u), true});
+    }
+    std::uint32_t const sizeOfProlog = cursor;
+    if (sizeOfProlog > 255u) {
+        return fail("prologue " + std::to_string(sizeOfProlog) + " > 255 bytes");
+    }
+
+    // (3) The ALLOC code (at CodeOffset allocLen — the SMALLEST prologue offset).
+    std::optional<Code> allocCode;
+    if (frame > 0u) {
+        std::uint32_t const slots = frame / 8u;
+        if (frame <= 128u) {
+            allocCode = Code{static_cast<std::uint8_t>(allocLen),
+                             static_cast<std::uint8_t>(
+                                 kUwopAllocSmall | ((slots - 1u) << 4)),
+                             0u, false};
+        } else if (slots <= 0xFFFFu) {  // ≤ 512 KiB — opinfo 0, one u16 node
+            allocCode = Code{static_cast<std::uint8_t>(allocLen),
+                             static_cast<std::uint8_t>(kUwopAllocLarge | (0u << 4)),
+                             static_cast<std::uint16_t>(slots), true};
+        } else {
+            return fail("frame " + std::to_string(frame) + " > 512 KiB needs "
+                        "UWOP_ALLOC_LARGE op-info=1 (u32 node) — no shipped "
+                        "corpus reaches it (D-WIN64-HUGE-FRAME-ALLOC)");
+        }
+    }
+
+    // (4) Emit: header, then codes DESCENDING by CodeOffset (saves — already in
+    //     ascending store order, so REVERSED — then the ALLOC last).
+    std::uint32_t nodeCount = 0;
+    for (auto const& c : saveCodes) nodeCount += c.hasNode ? 2u : 1u;
+    if (allocCode.has_value()) nodeCount += allocCode->hasNode ? 2u : 1u;
+    if (nodeCount > 255u) return fail("unwind-code node count > 255");
+
+    std::vector<std::uint8_t> out;
+    out.push_back(0x01u);                                  // Version=1, Flags=0
+    out.push_back(static_cast<std::uint8_t>(sizeOfProlog));
+    out.push_back(static_cast<std::uint8_t>(nodeCount));
+    out.push_back(0x00u);                                  // FrameRegister=0, Offset=0
+    auto pushCode = [&](Code const& c) {
+        out.push_back(c.codeOffset);
+        out.push_back(c.opAndInfo);
+        if (c.hasNode) {
+            out.push_back(static_cast<std::uint8_t>(c.node & 0xFFu));
+            out.push_back(static_cast<std::uint8_t>((c.node >> 8) & 0xFFu));
+        }
+    };
+    for (auto it = saveCodes.rbegin(); it != saveCodes.rend(); ++it) pushCode(*it);
+    if (allocCode.has_value()) pushCode(*allocCode);
+    while (out.size() % 4u != 0u) out.push_back(0x00u);    // DWORD-align the blob
+    return out;
 }
 
 // ── PE/COFF name encoding ───────────────────────────────────────
@@ -899,8 +1068,63 @@ encodeExec(AssembledModule const&    module,
     }
     std::size_t const rdataSize = rdataDataLayout.spanSize;
     std::size_t const dataSize  = dataDataLayout.spanSize;
-    // `.idata` follows the LAST data section (`dataChainRva` was advanced past
-    // .rdata/.data/.bss above), else immediately after `.text`.
+
+    // ── (b3) Windows x64 unwind tables — D-WIN64-PDATA-XDATA-UNWIND ──
+    // `.xdata` (UNWIND_INFO blobs, one per function that carries frame info)
+    // + `.pdata` (a RUNTIME_FUNCTION per entry: {BeginAddress, EndAddress,
+    // UnwindInfoAddress}). Chained after `.bss`, BEFORE `.idata`/`.reloc`
+    // (so their VA cursor + the .reloc prevVaEnd hand-off account for them
+    // with no extra edit). Emitted ONLY for the x64 machine (arm64-PE would
+    // need its own unwind format — not shipped); a function WITHOUT
+    // `unwind` (a leaf / the post-pipeline entry trampoline) gets NO entry
+    // (x64 leaf treatment). RUNTIME_FUNCTIONs are naturally ascending-by-
+    // BeginAddress (funcTextStart is ascending) — the loader binary-searches.
+    std::vector<std::uint8_t> xdataBytes;
+    std::vector<std::uint8_t> pdataBytes;
+    std::optional<DataSectionLayout> xdata;
+    std::optional<DataSectionLayout> pdata;
+    if (id.machine == kMachineAmd64PE) {
+        struct PdataEntry { std::size_t funcIdx; std::uint32_t xdataOffset; };
+        std::vector<PdataEntry> pdataEntries;
+        for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+            auto const& fn = module.functions[fi];
+            if (!fn.unwind.has_value()) continue;
+            auto uwOpt = buildFunctionUnwindInfo(*fn.unwind, fn.bytes, fi, reporter);
+            if (!uwOpt.has_value()) return {};
+            pdataEntries.push_back(
+                {fi, static_cast<std::uint32_t>(xdataBytes.size())});
+            xdataBytes.insert(xdataBytes.end(), uwOpt->begin(), uwOpt->end());
+        }
+        if (!xdataBytes.empty()) {
+            DataSectionLayout xl;
+            xl.rva = dataChainRva;
+            xl.virtualSize =
+                static_cast<std::uint32_t>(alignUp(xdataBytes.size(), sectionAlignE));
+            xdata = xl;
+            dataChainRva += xl.virtualSize;
+            std::uint32_t const textRva0 =
+                static_cast<std::uint32_t>(secText.virtualAddress);
+            for (auto const& e : pdataEntries) {
+                auto const& fn = module.functions[e.funcIdx];
+                std::uint32_t const begin = textRva0
+                    + static_cast<std::uint32_t>(funcTextStart[e.funcIdx]);
+                std::uint32_t const end =
+                    begin + static_cast<std::uint32_t>(fn.bytes.size());
+                appendU32LE(pdataBytes, begin);
+                appendU32LE(pdataBytes, end);
+                appendU32LE(pdataBytes, xl.rva + e.xdataOffset);
+            }
+            DataSectionLayout pl;
+            pl.rva = dataChainRva;
+            pl.virtualSize =
+                static_cast<std::uint32_t>(alignUp(pdataBytes.size(), sectionAlignE));
+            pdata = pl;
+            dataChainRva += pl.virtualSize;
+        }
+    }
+
+    // `.idata` follows the LAST section in the VA chain (`dataChainRva` was
+    // advanced past .rdata/.data/.bss/.xdata/.pdata above), else after `.text`.
     std::uint32_t const idataRva = hasImports ? dataChainRva : 0u;
 
     // Lay out .idata bytes (synthesized, NOT raw-data padded yet):
@@ -1411,6 +1635,28 @@ encodeExec(AssembledModule const&    module,
         bss->headerIndex = sectionHeaders.size();
         sectionHeaders.push_back(hBss);
     }
+    // .xdata + .pdata section headers (D-WIN64-PDATA-XDATA-UNWIND) — read-only
+    // initialized data (0x40000040, like .rdata), placed after .bss and before
+    // .idata. sizeOfRawData / pointerToRawData filled below.
+    constexpr std::uint32_t kUnwindCharacteristics = 0x40000040u;
+    if (xdata.has_value()) {
+        PeSectionHeader hXData{};
+        hXData.name            = encodeSectionName(".xdata", 0);
+        hXData.virtualSize     = static_cast<std::uint32_t>(xdataBytes.size());
+        hXData.virtualAddress  = xdata->rva;
+        hXData.characteristics = kUnwindCharacteristics;
+        xdata->headerIndex = sectionHeaders.size();
+        sectionHeaders.push_back(hXData);
+    }
+    if (pdata.has_value()) {
+        PeSectionHeader hPData{};
+        hPData.name            = encodeSectionName(".pdata", 0);
+        hPData.virtualSize     = static_cast<std::uint32_t>(pdataBytes.size());
+        hPData.virtualAddress  = pdata->rva;
+        hPData.characteristics = kUnwindCharacteristics;
+        pdata->headerIndex = sectionHeaders.size();
+        sectionHeaders.push_back(hPData);
+    }
     // .idata section header (when externImports non-empty).
     // Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA (0x40) |
     //                   IMAGE_SCN_MEM_READ (0x40000000) |
@@ -1511,6 +1757,22 @@ encodeExec(AssembledModule const&    module,
     }
     // .bss is NOBITS: sizeOfRawData / pointerToRawData stay 0 (set at header
     // construction); it consumes no file bytes, so `nextRawPointer` is unchanged.
+    if (xdata.has_value()) {
+        xdata->rawSize = static_cast<std::uint32_t>(
+            alignUp(xdataBytes.size(), fileAlign));
+        xdata->rawPointer = nextRawPointer;
+        sectionHeaders[xdata->headerIndex].sizeOfRawData = xdata->rawSize;
+        sectionHeaders[xdata->headerIndex].pointerToRawData = xdata->rawPointer;
+        nextRawPointer += xdata->rawSize;
+    }
+    if (pdata.has_value()) {
+        pdata->rawSize = static_cast<std::uint32_t>(
+            alignUp(pdataBytes.size(), fileAlign));
+        pdata->rawPointer = nextRawPointer;
+        sectionHeaders[pdata->headerIndex].sizeOfRawData = pdata->rawSize;
+        sectionHeaders[pdata->headerIndex].pointerToRawData = pdata->rawPointer;
+        nextRawPointer += pdata->rawSize;
+    }
     if (idata.has_value()) {
         idata->rawSize = static_cast<std::uint32_t>(
             alignUp(idataSize, fileAlign));
@@ -1548,6 +1810,12 @@ encodeExec(AssembledModule const&    module,
         // .bss contributes to the image's MEMORY extent (VirtualSize) even
         // though it has zero file footprint — the loader reserves it.
         lastSectionVaEnd = bss->rva + bss->virtualSize;
+    }
+    if (xdata.has_value()) {
+        lastSectionVaEnd = xdata->rva + xdata->virtualSize;
+    }
+    if (pdata.has_value()) {
+        lastSectionVaEnd = pdata->rva + pdata->virtualSize;
     }
     if (idata.has_value()) {
         lastSectionVaEnd = idata->rva + idata->virtualSize;
@@ -1742,10 +2010,19 @@ encodeExec(AssembledModule const&    module,
         reloc.has_value() ? reloc->rva : 0u;
     std::uint32_t const baseRelocDirSize =
         reloc.has_value() ? static_cast<std::uint32_t>(relocBytes.size()) : 0u;
+    // IMAGE_DIRECTORY_ENTRY_EXCEPTION (index 3, D-WIN64-PDATA-XDATA-UNWIND): RVA +
+    // byte size of the .pdata RUNTIME_FUNCTION array — the OS exception dispatcher
+    // + RtlLookupFunctionEntry binary-search it. Size is the array's VIRTUAL size.
+    std::uint32_t const pdataDirRva  = pdata.has_value() ? pdata->rva : 0u;
+    std::uint32_t const pdataDirSize =
+        pdata.has_value() ? static_cast<std::uint32_t>(pdataBytes.size()) : 0u;
     for (std::size_t i = 0; i < kNumberOfRvaAndSizes; ++i) {
         if (i == 1u) {
             appendU32LE(bytes, importDirRva);
             appendU32LE(bytes, importDirSize);
+        } else if (i == 3u) {
+            appendU32LE(bytes, pdataDirRva);
+            appendU32LE(bytes, pdataDirSize);
         } else if (i == 4u) {
             // IMAGE_DIRECTORY_ENTRY_SECURITY: file offset, not RVA.
             appendU32LE(bytes, certTableFileOff);
@@ -1799,6 +2076,24 @@ encodeExec(AssembledModule const&    module,
         while (bytes.size()
                 < static_cast<std::size_t>(data->rawPointer)
                     + data->rawSize) {
+            bytes.push_back(0);
+        }
+    }
+
+    // .xdata + .pdata bodies (D-WIN64-PDATA-XDATA-UNWIND), file-aligned. Emitted
+    // after .data and before .idata (their nextRawPointer order); the preceding
+    // section padded bytes.size() up to xdata->rawPointer.
+    if (xdata.has_value()) {
+        bytes.insert(bytes.end(), xdataBytes.begin(), xdataBytes.end());
+        while (bytes.size()
+                < static_cast<std::size_t>(xdata->rawPointer) + xdata->rawSize) {
+            bytes.push_back(0);
+        }
+    }
+    if (pdata.has_value()) {
+        bytes.insert(bytes.end(), pdataBytes.begin(), pdataBytes.end());
+        while (bytes.size()
+                < static_cast<std::size_t>(pdata->rawPointer) + pdata->rawSize) {
             bytes.push_back(0);
         }
     }

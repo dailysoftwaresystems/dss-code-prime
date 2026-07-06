@@ -273,7 +273,8 @@
     { "name": "GetSystemTimePreciseAsFileTime", "signature": "fn(ptr<void>) -> void", "kind": "function", "linkage": "external" },
     { "name": "GetCurrentProcess", "signature": "fn() -> ptr<void>", "kind": "function", "linkage": "external" },
     { "name": "DebugBreak", "signature": "fn() -> void", "kind": "function", "linkage": "external" },
-    { "name": "LoadLibraryA", "signature": "fn(ptr<char>) -> ptr<void>", "kind": "function", "linkage": "external" }
+    { "name": "LoadLibraryA", "signature": "fn(ptr<char>) -> ptr<void>", "kind": "function", "linkage": "external" },
+    { "name": "RtlLookupFunctionEntry", "signature": "fn(u64, ptr<u64>, ptr<void>) -> ptr<void>", "kind": "function", "linkage": "external" }
   ],
   "macros": [
     { "name": "INVALID_HANDLE_VALUE", "replacement": "((HANDLE)-1)" },

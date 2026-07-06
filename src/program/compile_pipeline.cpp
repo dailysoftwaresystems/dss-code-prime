@@ -593,6 +593,45 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         assembled.userEntrySymbol = userEntrySymbol;
     }
 
+    // c114 (D-WIN64-PDATA-XDATA-UNWIND): project each function's frame
+    // prologue (from the callconv pass's per-function FrameLayout) onto its
+    // AssembledFunction, so a downstream unwind-table emitter (the pe64
+    // writer's .pdata/.xdata builder) can describe the frame WITHOUT a lir/
+    // dependency. Positional, mirroring the dataItems/userEntrySymbol
+    // post-`assemble()` splices: cc.perFunc and assembled.functions are BOTH
+    // guaranteed size == moduleFuncCount() (cc.ok() @561 + assembled.ok()
+    // @577) and enumerated identically (asm.cpp populates via lir.funcAt(i),
+    // the same order as perFunc's `1:1 with src.funcAt(i)`). The projection
+    // is format-neutral frame data; only the pe64 writer reads it today.
+    if (cc.perFunc.size() == assembled.functions.size()) {
+        for (std::size_t fi = 0; fi < assembled.functions.size(); ++fi) {
+            FrameLayout const& fl = cc.perFunc[fi];
+            FrameUnwindInfo ui;
+            ui.totalFrameSize      = fl.totalFrameSize;
+            ui.stackProbePageBytes = fl.stackProbePageBytes;
+            ui.usesStackProbe      = fl.stackProbePageBytes > 0
+                                  && fl.totalFrameSize > fl.stackProbePageBytes;
+            std::uint32_t const base = fl.savedRegAreaOffset();
+            ui.savedRegs.reserve(fl.savedRegs.size());
+            for (std::size_t i = 0; i < fl.savedRegs.size(); ++i) {
+                LirReg const r = fl.savedRegs[i];
+                FrameSavedReg sr;
+                // The x64 unwind register number is the HARDWARE encoding
+                // (rax=0..r15=15; xmm0=0..xmm15=15) — NOT the DSS physical
+                // ORDINAL, which offsets FPRs past the 16 GPRs (xmm14 = ordinal
+                // 30). GPR ordinal == hwEncoding so it was coincidentally right;
+                // FPR needs the mapping. registerInfo(ordinal) is the source.
+                auto const* ri = target.registerInfo(static_cast<std::uint16_t>(r.id));
+                sr.regEncoding = ri != nullptr ? ri->hwEncoding
+                                               : static_cast<std::uint16_t>(r.id);
+                sr.isFpr       = r.regClass() != LirRegClass::GPR;
+                sr.saveOffset  = base + static_cast<std::uint32_t>(i) * fl.slotSize;
+                ui.savedRegs.push_back(sr);
+            }
+            assembled.functions[fi].unwind = std::move(ui);
+        }
+    }
+
     // D-LK4-RODATA-PRODUCER (2026-06-02): materialize MIR globals
     // into AssembledData items the linker emits as .rodata. The
     // MIR globals model (MirBuilder::addGlobal) was already wired

@@ -202,6 +202,12 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     FrameLayout layout;
     layout.savedRegs        = std::move(savedRegs);
     layout.slotSize         = slotWidth;
+    // c114 (D-WIN64-PDATA-XDATA-UNWIND): record the cc's guard-page probe
+    // stride (0 = no probing) so a downstream unwind-info emitter can
+    // reproduce the SAME probe-vs-plain-sub prologue decision emitPrologue
+    // makes (`stackProbePageBytes > 0 && totalFrameSize > it`) WITHOUT
+    // re-consulting the cc — the config value that already lives here.
+    layout.stackProbePageBytes = cc.stackProbePageBytes;
     // D-ML7-2.2 + D-ML7-2.6 (co-closed 2026-06-02): outgoingArgAreaSize
     // is THIS function's reserved space for ITS calls. Encompasses
     // BOTH the callee's shadow space (Win64=32, SysV=0; reserved

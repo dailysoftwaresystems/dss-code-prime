@@ -579,6 +579,164 @@ TEST(PeExecWriter, AddressTakenImportResolvesToTextThunkNotIdataSlot) {
         << "extern call target must be in .text (< .idata RVA)";
 }
 
+TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
+    // D-WIN64-PDATA-XDATA-UNWIND host-independent structural pin. A pe64
+    // function carrying a FrameUnwindInfo (frame alloc + callee-saves) gets
+    // a .pdata RUNTIME_FUNCTION + a .xdata UNWIND_INFO, and the EXCEPTION
+    // data directory (index 3) points at .pdata. Also pins the c114 FPR
+    // decision: a saved FPR (MS-x64 xmm6..15, spilled low-64 via MOVSD) is
+    // OMITTED from the unwind codes (no matching UWOP; RSP-irrelevant) while
+    // its 8-byte store STILL advances the following GPR saves' CodeOffsets.
+    //
+    // Frame 0x20 (ALLOC_SMALL slots=4) + prologue-order saves
+    // [xmm6@0, rbx@8, rbp@16]; the `mov` cursor starts at allocLen=7 (sub
+    // rsp,imm32) then +8 per store: xmm6→15 (omitted), rbx→23, rbp→31.
+    // RED-on-disable: reverting the FPR-omit to the old fail-loud makes
+    // encode() report an error; mis-passing the DSS ordinal (30) for xmm6
+    // instead of its hwEncoding (6) makes its width 9 → rbx CodeOffset 24,
+    // not 23; dropping the emission entirely removes .pdata/.xdata. Runs on
+    // every leg (pure byte inspection, no execution).
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    // sub rsp, 0x20 (48 81 EC 20 00 00 00) ; ret (C3) — first byte 0x48
+    // satisfies the prologue-shape guard; the rest is opaque to the builder.
+    fn.bytes = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3};
+    FrameUnwindInfo ui;
+    ui.totalFrameSize      = 0x20;
+    ui.usesStackProbe      = false;
+    ui.stackProbePageBytes = 0;
+    ui.savedRegs = {
+        FrameSavedReg{/*regEncoding=*/6, /*isFpr=*/true,  /*saveOffset=*/0},
+        FrameSavedReg{/*regEncoding=*/3, /*isFpr=*/false, /*saveOffset=*/8},
+        FrameSavedReg{/*regEncoding=*/5, /*isFpr=*/false, /*saveOffset=*/16},
+    };
+    fn.unwind = std::move(ui);
+    mod.functions.push_back(std::move(fn));
+
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);   // the FPR save no longer fails loud
+    ASSERT_FALSE(img.empty());
+
+    auto const [textRva, textPtr] =
+        findExecSection(img, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+    auto const [pdataRva, pdataPtr] =
+        findExecSection(img, {'.', 'p', 'd', 'a', 't', 'a', 0, 0});
+    auto const [xdataRva, xdataPtr] =
+        findExecSection(img, {'.', 'x', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(textRva, 0u);
+    ASSERT_NE(pdataRva, 0u) << ".pdata section must exist";
+    ASSERT_NE(xdataRva, 0u) << ".xdata section must exist";
+
+    // (1) The EXCEPTION data directory (index 3 → file 0x108 + 3*8 = 0x120)
+    //     points at .pdata, size = one 12-byte RUNTIME_FUNCTION.
+    EXPECT_EQ(readU32LE(img, 0x120), pdataRva) << "EXCEPTION dir RVA -> .pdata";
+    EXPECT_EQ(readU32LE(img, 0x124), 12u)      << "EXCEPTION dir size = 1 entry";
+
+    // (2) The RUNTIME_FUNCTION covers the function and points at its .xdata.
+    EXPECT_EQ(readU32LE(img, pdataPtr + 0u), textRva)      << "BeginAddress";
+    EXPECT_EQ(readU32LE(img, pdataPtr + 4u), textRva + 8u) << "EndAddress";
+    EXPECT_EQ(readU32LE(img, pdataPtr + 8u), xdataRva)     << "UnwindInfoAddress";
+
+    // (3) The UNWIND_INFO, byte-for-byte. Header: Ver=1/Flags=0, SizeOfProlog
+    //     = 31, CountOfCodes = 5 (2 GPR saves ×2 nodes + 1 ALLOC_SMALL) — NOT
+    //     7 (the xmm6 save contributes NO code), FrameReg/Off = 0. Codes are
+    //     DESCENDING by CodeOffset: rbp(31), rbx(23), then ALLOC(7).
+    std::size_t const u = xdataPtr;
+    EXPECT_EQ(img[u + 0], 0x01u) << "Version=1, Flags=0";
+    EXPECT_EQ(img[u + 1], 31u)   << "SizeOfProlog";
+    EXPECT_EQ(img[u + 2], 5u)    << "CountOfCodes: xmm6 omitted (else 7)";
+    EXPECT_EQ(img[u + 3], 0x00u) << "FrameRegister=0, FrameOffset=0";
+    // rbp: UWOP_SAVE_NONVOL(4) | reg 5<<4 = 0x54, CodeOffset 31, node 16/8=2.
+    EXPECT_EQ(img[u + 4], 31u)   << "rbp CodeOffset";
+    EXPECT_EQ(img[u + 5], 0x54u) << "rbp SAVE_NONVOL | reg=5";
+    EXPECT_EQ(readU16LE(img, u + 6), 2u) << "rbp scaled offset 16/8";
+    // rbx: 0x34, CodeOffset 23 (proves xmm6's store advanced the cursor by
+    // 8, not 9 — hwEncoding 6, not the ordinal 30), node 8/8=1.
+    EXPECT_EQ(img[u + 8], 23u)   << "rbx CodeOffset (xmm6 width was 8)";
+    EXPECT_EQ(img[u + 9], 0x34u) << "rbx SAVE_NONVOL | reg=3";
+    EXPECT_EQ(readU16LE(img, u + 10), 1u) << "rbx scaled offset 8/8";
+    // ALLOC_SMALL(2) | (slots-1=3)<<4 = 0x32, CodeOffset 7 (end of sub rsp).
+    EXPECT_EQ(img[u + 12], 7u)    << "ALLOC CodeOffset";
+    EXPECT_EQ(img[u + 13], 0x32u) << "ALLOC_SMALL | (slots-1)=3";
+}
+
+TEST(PeExecWriter, FunctionUnwindInfoStackProbePrologueUsesFixedAllocLen) {
+    // D-WIN64-PDATA-XDATA-UNWIND + D-WIN64-LARGE-FRAME-STACK-PROBE. A pe64
+    // function whose frame exceeds one guard page emits the inline page-probe
+    // prologue (mov r11d,frame / <28-B runtime loop> / sub rsp,r11), which is a
+    // FIXED 37 bytes — the loop ITERATES at runtime, it is NOT unrolled per
+    // page. The unwind builder's `allocLen` for the probe path must be that
+    // fixed 37 (kStackProbeLoopBytes), so SizeOfProlog + every CodeOffset stay
+    // pinned to the real instruction boundaries.
+    //
+    // RED-on-disable: the c114 audit caught a drifted `9 + 28*pages + 3`
+    // formula here → for this 8192-B frame (pages=2) it computed allocLen 68,
+    // putting SizeOfProlog at 84 and the saves' CodeOffsets at 76/84 — 31 bytes
+    // past the real prologue → a silently-wrong table RtlVirtualUnwind would
+    // mis-read. This test fails on that formula and passes only on the fixed 37.
+    // The prior (small-frame) unwind test exercises only the `sub rsp,imm32`
+    // (allocLen 7) path, so this is the path that was untested.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    // The probe prologue's first byte is 0x41 (mov r11d,imm) — the builder's
+    // prologue-shape guard checks exactly that; the rest of the body is opaque.
+    fn.bytes = {0x41, 0xBB, 0x00, 0x20, 0x00, 0x00, 0xC3, 0x90};
+    FrameUnwindInfo ui;
+    ui.totalFrameSize      = 0x2000;   // 8192 B = 2 guard pages → ALLOC_LARGE
+    ui.usesStackProbe      = true;
+    ui.stackProbePageBytes = 4096;
+    ui.savedRegs = {
+        FrameSavedReg{/*regEncoding=*/3, /*isFpr=*/false, /*saveOffset=*/0},
+        FrameSavedReg{/*regEncoding=*/6, /*isFpr=*/false, /*saveOffset=*/8},
+    };
+    fn.unwind = std::move(ui);
+    mod.functions.push_back(std::move(fn));
+
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    auto const [xdataRva, xdataPtr] =
+        findExecSection(img, {'.', 'x', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(xdataRva, 0u);
+
+    // allocLen = 37 (0x25). Saves ride from there: rbx CodeOffset 37+8=45,
+    // rsi 45+8=53; SizeOfProlog = 53. ALLOC_LARGE (frame>128, slots=1024) →
+    // opinfo 0, one u16 node = 1024. CountOfCodes = 2+2+2 = 6.
+    std::size_t const w = xdataPtr;
+    EXPECT_EQ(img[w + 0], 0x01u) << "Version=1, Flags=0";
+    EXPECT_EQ(img[w + 1], 53u)   << "SizeOfProlog = 37 (fixed probe) + 8 + 8";
+    EXPECT_EQ(img[w + 2], 6u)    << "CountOfCodes: 2 saves*2 + ALLOC_LARGE 2";
+    EXPECT_EQ(img[w + 3], 0x00u) << "FrameRegister=0";
+    // rsi (highest CodeOffset first): SAVE_NONVOL(4) | reg 6<<4 = 0x64, off 53.
+    EXPECT_EQ(img[w + 4], 53u)   << "rsi CodeOffset (probe was 37, not 68)";
+    EXPECT_EQ(img[w + 5], 0x64u) << "rsi SAVE_NONVOL | reg=6";
+    EXPECT_EQ(readU16LE(img, w + 6), 1u);
+    // rbx: 0x34, CodeOffset 45 = 37 + 8.
+    EXPECT_EQ(img[w + 8], 45u)   << "rbx CodeOffset = 37 + 8";
+    EXPECT_EQ(img[w + 9], 0x34u) << "rbx SAVE_NONVOL | reg=3";
+    EXPECT_EQ(readU16LE(img, w + 10), 0u);
+    // ALLOC_LARGE(1) | opinfo 0 = 0x01, CodeOffset 37 (0x25), u16 node = 1024.
+    EXPECT_EQ(img[w + 12], 37u)   << "ALLOC CodeOffset = fixed probe length";
+    EXPECT_EQ(img[w + 13], 0x01u) << "ALLOC_LARGE | opinfo 0";
+    EXPECT_EQ(readU16LE(img, w + 14), 1024u) << "frame/8 = 8192/8";
+}
+
 TEST(PeExecWriter, DosHeaderMzSignature) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);

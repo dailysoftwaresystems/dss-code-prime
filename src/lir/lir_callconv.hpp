@@ -186,6 +186,11 @@ struct DSS_EXPORT FrameLayout {
     std::uint32_t       vaRegSaveAreaSize = 0;
     std::uint32_t       slotSize          = 0;  // uniform per-class spill-slot width (bytes; = max(GPR width, FPR width))
     std::uint32_t       outgoingSlotSize  = 0;  // outgoing-arg slot width (bytes; = pointer width = GPR width)
+    // c114 (D-WIN64-PDATA-XDATA-UNWIND): the cc's guard-page stack-probe
+    // stride (bytes; 0 = no probing — Linux/macOS/arm64). A downstream
+    // unwind-info emitter reproduces the prologue's probe-vs-plain-sub
+    // decision from this + totalFrameSize (the same test emitPrologue uses).
+    std::uint32_t       stackProbePageBytes = 0;
     std::vector<LirReg> savedRegs;              // callee-saved phys regs actually used
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: did this function contain at
     // least one call-shaped opcode (per `TargetOpcodeInfo::isCall`)
