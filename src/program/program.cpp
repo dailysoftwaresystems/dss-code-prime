@@ -10,6 +10,7 @@
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"  // TypeLattice (fresh merge host)
 #include "ffi/abi/abi_catalog.hpp"
+#include "ffi/mangling/c_mangle.hpp"  // applyCMangling — the cross-CU merge-key mangling (D-LK-MACHO-CROSSCU-MANGLE-MERGE-KEY)
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergeCuInput, mergeCuMirs (N>1 whole-program merge)
 #include "mir/merge/synth_pe_startup.hpp"  // synthesizePeStartup (c111 D-RUNTIME-PE-MAIN-ARGS)
@@ -357,19 +358,34 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // each CU's `nameOf` (SemanticModel symbol names + extern mangledNames) while cloning,
     // so `cuMirs` must stay alive through `mergeCuMirs` — it does (function-local, no CU's
     // lattice is moved out: the host is FRESH, leaving every SemanticModel intact).
+    // D-LK-MACHO-CROSSCU-MANGLE-MERGE-KEY (c118): the active format's C mangling, applied
+    // to every DEFINITION merge-key (nameOf below) AND the entry-name set, so definitions
+    // match the externs' already-mangled `mangledName` on macho (identity on elf/pe). Both
+    // the def↔extern resolution and the `main` entry match key on this same convention.
+    ObjectFormatKind const fmtKind = (*formatR)->kind();
     std::vector<MergeCuInput> mergeInputs;
     mergeInputs.reserve(cuMirs.size());
     for (auto& cuMir : cuMirs) {
         MergeCuInput in;
         in.mir      = &cuMir.mir;
         in.interner = &cuMir.model.lattice().interner();
-        // nameOf: symbol id → declared name. Covers DEFINITIONS (SemanticModel record)
-        // AND extern IMPORTS (the import's mangledName, when the symbol has no record —
-        // an extern reference's SymbolId is not in the semantic symbol table). The merge
-        // keys cross-CU matching on this name exactly as the linker keys on the on-binary
-        // symbol name. Capturing `&cuMir` is safe — `cuMirs` is done growing.
-        in.nameOf = [cuMirP = &cuMir](SymbolId s) -> std::string {
-            if (SymbolRecord const* r = cuMirP->model.recordFor(s)) return r->name;
+        // nameOf: symbol id → the cross-CU MATCH KEY. Covers DEFINITIONS (SemanticModel
+        // record) AND extern IMPORTS (the import's mangledName, when the symbol has no
+        // record — an extern reference's SymbolId is not in the semantic symbol table).
+        // ★ D-LK-MACHO-CROSSCU-MANGLE-MERGE-KEY (c118): a definition's key is its source
+        // name run through the FORMAT'S C MANGLING (`applyCMangling`), so it matches the
+        // extern's already-mangled `mangledName` — on Mach-O a shell.c reference to
+        // `_sqlite3_libversion` now matches sqlite3.c's definition `sqlite3_libversion`
+        // (mangled to `_sqlite3_libversion`). applyCMangling is config-driven
+        // (`kCManglingRules`): IDENTITY on elf/pe (their cross-CU match is unchanged),
+        // one leading `_` on macho. Safe by construction — every format writer names its
+        // on-binary defined symbols synthetically (`_sym_<id>` / `sym_<id>`), so this key
+        // is a MATCH key only, never the emitted symbol name (no double-mangle). Capturing
+        // `&cuMir` is safe — `cuMirs` is done growing.
+        in.nameOf = [cuMirP = &cuMir, fmtKind](SymbolId s) -> std::string {
+            if (SymbolRecord const* r = cuMirP->model.recordFor(s)) {
+                return dss::ffi::applyCMangling(r->name, fmtKind);
+            }
             for (auto const& e : cuMirP->externImports) {
                 if (e.symbol.v == s.v) return e.mangledName;
             }
@@ -399,7 +415,11 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                 ? decl.implicitReturnZeroForFunctionNames
                                 : decl.entryFunctionNames;
         for (auto const& n : names) {
-            entryNames.push_back(n);
+            // D-LK-MACHO-CROSSCU-MANGLE-MERGE-KEY (c118): mangle the entry name to the same
+            // convention as the merge's DEFINITION keys (nameOf mangles too), so the merged
+            // `userEntrySymbol` scan — `entrySet.count(nameOf(func))` in mergeCuMirs — still
+            // finds `main` on macho (both keyed `_main`). Identity on elf/pe.
+            entryNames.push_back(dss::ffi::applyCMangling(n, fmtKind));
         }
     }
 
