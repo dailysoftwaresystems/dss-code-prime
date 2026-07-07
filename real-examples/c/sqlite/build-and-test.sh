@@ -18,17 +18,18 @@
 #   4. amalgamate SQLite -> sqlite3.c    (autotools: `make sqlite3.c`, needs tclsh)
 #   5. build dss-code-prime              (its default CMake-4 Release build)
 #   6. compile with dss-code-prime for windows + macos + linux + linux-arm64:
-#        - RUNNABLE targets (both Linux legs) → 2-TU sqlite3.c + shell.c = a real
-#          `sqlite3` CLI binary
-#        - COMPILE-ONLY targets (windows/macos) → the amalgamation alone (no runner)
+#        - EVERY target → 2-TU sqlite3.c + shell.c = a real `sqlite3` CLI binary
+#          (shell.c supplies `main`, so the entry-trampoline resolves on every OS)
+#        - RUNNABLE targets (the host's native legs) are then executed (step 7);
+#          COMPILE-ONLY targets are verified to have EMITTED a binary, not run
 #                                        -> ~/src/dss-code-prime/build/real-examples/c/sqlite/<label>/
 #   7. test each runnable CLI with a SQLite smoke unit (SELECT sum → 42 +
 #        --version → 3.54.0) against EXPECTED output: x86_64-linux NATIVE +
 #        arm64-linux under qemu-aarch64 (QEMU_LD_PREFIX = the aarch64 sysroot)
 #   8. summarise results + exit non-zero if an expected step failed for the
 #        sqlite-RUN-green goal: a RUNNABLE-target compile miss OR a runnable-target
-#        smoke miss. Compile-only (windows/macos) misses at known per-OS frontiers
-#        (os_win F001D / macOS layout) are REPORTED as warnings, not fatal.
+#        smoke miss. A COMPILE-ONLY target that fails to build a clean binary is a
+#        real cross-OS gap — REPORTED as a warning, but not fatal to the runnable exit.
 #
 # DESIGN: every step is idempotent and FAIL-LOUD. The compiler is young, so step 6
 # is the current FRONTIER — sqlite3.c + shell.c (dense C) will surface unsupported
@@ -111,9 +112,10 @@ declare -a TARGETS=(
 #     Silicon. On an Intel Mac the arm64 leg is not native (nothing runs a Mach-O off
 #     its arch) and macho64-x86_64-darwin-exec is not yet a runnable CLI, so macOS-
 #     x86_64 has NO runnable leg (every target stays compile-only).
-# A label ABSENT from RUNNERS is COMPILE-ONLY: step 6 compiles it single-TU
-# (amalgamation, no main) and step 7 skips it. This map is the SINGLE source of
-# "what is runnable and how" — 2-TU compilation (step 6) + the smoke (step 7) key on it.
+# A label ABSENT from RUNNERS is COMPILE-ONLY: step 6 STILL builds it as the full 2-TU
+# CLI (sqlite3.c + shell.c → a real binary), but step 7 skips the smoke (this host
+# cannot exec a foreign-OS binary). This map is the SINGLE source of "what is runnable
+# and how" — the smoke (step 7) keys on it; step 6 compiles every target the same way.
 declare -A RUNNERS=()
 case "$HOST_OS" in
   linux)
@@ -319,7 +321,7 @@ DSS_BIN="$(find "$SRC_DIR/build" -type f -name dss-code-prime -perm -u+x -print 
 [[ -n "$DSS_BIN" && -x "$DSS_BIN" ]] || die "dss-code-prime binary not found under $SRC_DIR/build after the build."
 pass "dss-code-prime built: $DSS_BIN"
 
-# ── Step 6 — compile sqlite3.c (+ shell.c for runnable targets) per target OS ─
+# ── Step 6 — compile the 2-TU sqlite3.c + shell.c CLI for every target OS ─────
 step "6/8  Compile SQLite with dss-code-prime (windows + macos + linux + linux-arm64)"
 mkdir -p "$OUT_DIR"
 declare -A COMPILED                 # label -> 1 on success
@@ -338,15 +340,20 @@ for entry in "${TARGETS[@]}"; do
   label="${entry%%=*}"; spec="${entry#*=}"
   outd="$OUT_DIR/$label"; mkdir -p "$outd"
   log="$outd/compile.log"
-  # A RUNNABLE target (in RUNNERS) compiles the real CLI: 2-TU sqlite3.c + shell.c
-  # (sqlite3.c FIRST — the multi-TU merge requires the library CU ahead of the
-  # driver). A COMPILE-ONLY target (windows/macos, absent from RUNNERS) compiles
-  # the amalgamation ALONE (single-TU) — its deliverable surface, no runner here.
-  declare -a units=("$AMALGAMATION")
-  local_kind="amalgamation only (compile-only)"
+  # EVERY target compiles the real 2-TU CLI: sqlite3.c + shell.c (sqlite3.c FIRST —
+  # the multi-TU merge needs the library CU ahead of the driver). shell.c supplies
+  # `main`, so the entry-trampoline resolves and a real `sqlite3` binary is emitted
+  # for every target. The ONLY per-target difference is step 7: a RUNNABLE target (in
+  # RUNNERS) is executed for the smoke; a COMPILE-ONLY target (a foreign-OS binary
+  # this host can't exec) is verified to have EMITTED a binary and is not run.
+  # (Compiling the amalgamation ALONE as an -exec was a harness BUG: sqlite3.c is a
+  # main-less LIBRARY, so it ALWAYS failed at the entry-trampoline regardless of the
+  # compiler — masking that windows/macos DO build a clean binary from the 2-TU.)
+  declare -a units=("$AMALGAMATION" "$SHELL_C")   # sqlite3.c FIRST, then the CLI driver
   if [[ -n "${RUNNERS[$label]+set}" ]]; then
-    units=("$AMALGAMATION" "$SHELL_C")   # sqlite3.c FIRST, then the CLI driver
     local_kind="sqlite3.c + shell.c (2-TU → runnable sqlite3)"
+  else
+    local_kind="sqlite3.c + shell.c (2-TU → binary emitted; foreign-OS, not run here)"
   fi
   info "[$label] $spec — $local_kind"
   # ⚠ GOTCHA (probe a6b65f8b): dss-code-prime returns EXIT 0 even on FATAL compile
@@ -367,19 +374,26 @@ for entry in "${TARGETS[@]}"; do
   # the ELF/Mach-O legs. (D-WIN64-SEH-FUNCLETS / D-WIN64-XMM-UNWIND-RESTORE.)
   declare -a defines=()
   "$DSS_BIN" --compile "${units[@]}" --language "$LANGUAGE" --target "$spec" --output "$outd" --time "${defines[@]}" >"$log" 2>&1 || true
-  if grep -qE 'error\[' "$log"; then
+  # Success = NO `error[` diagnostics AND a real `sqlite3` binary was emitted (not just
+  # the compile.log). The 2-TU build has a `main`, so every clean target emits one.
+  emitted_bin="$(find "$outd" -maxdepth 1 -type f -name 'sqlite3*' -print -quit 2>/dev/null)"
+  if grep -qE 'error\[' "$log" || [[ -z "$emitted_bin" ]]; then
     COMPILE_FAILS=$((COMPILE_FAILS + 1))
     # A RUNNABLE target's compile miss is a FATAL regression of the sqlite-RUN-green
-    # goal; a COMPILE-ONLY target's miss is DATA at a known per-OS frontier (e.g.
-    # windows os_win F001D, macOS layout gaps) — reported, but not fatal to the run.
+    # goal. A COMPILE-ONLY target's miss is a real cross-OS BUILD gap (surfaced below,
+    # non-fatal to the runnable-leg exit — those legs are the RUN-green gate here).
     if [[ -n "${RUNNERS[$label]+set}" ]]; then
       RUNNABLE_COMPILE_FAILS=$((RUNNABLE_COMPILE_FAILS + 1))
     fi
-    warn "[$label] compile FAILED$(compile_time_suffix "$log") — first diagnostics from $log:"
-    { grep -m3 -E 'error\[' "$log" || head -3 "$log"; } 2>/dev/null | sed 's/^/      /'
+    if grep -qE 'error\[' "$log"; then
+      warn "[$label] compile FAILED$(compile_time_suffix "$log") — first diagnostics from $log:"
+      { grep -m3 -E 'error\[' "$log" || head -3 "$log"; } 2>/dev/null | sed 's/^/      /'
+    else
+      warn "[$label] compile FAILED$(compile_time_suffix "$log") — 0 error[ diagnostics but no sqlite3 binary emitted under $outd"
+    fi
   else
     COMPILED["$label"]=1
-    pass "[$label] compiled -> $outd$(compile_time_suffix "$log")"
+    pass "[$label] compiled -> $emitted_bin$(compile_time_suffix "$log")"
   fi
 done
 
@@ -464,14 +478,16 @@ for entry in "${TARGETS[@]}"; do
   fi
 done
 
-# Compile-only targets (windows/macos) sit at KNOWN per-OS frontiers (windows os_win
-# F001D; macOS layout gaps) — a miss there is DATA, surfaced as a WARNING, never
-# fatal (else the harness could never go green while those frontiers stand, masking
-# the Linux RUN-green goal). Report them but do not exit on them.
+# COMPILE-ONLY targets (foreign-OS binaries this host can't exec) now build the real
+# 2-TU CLI and are EXPECTED to emit a clean binary — so a miss here is a genuine
+# cross-OS BUILD regression, not a "known frontier". Surface it loudly, but keep it
+# NON-FATAL to the runnable-leg exit: the legs that actually RUN on this host are the
+# RUN-green gate, and a foreign-OS target is run-verified via its NATIVE runner
+# (build-and-test.ps1 on Windows; an Apple-Silicon host for macOS).
 compile_only_fails=$((COMPILE_FAILS - RUNNABLE_COMPILE_FAILS))
 if [[ "$compile_only_fails" -gt 0 ]]; then
-  printf '\n%s%d compile-only target(s) did not compile (known per-OS frontier — windows os_win / macOS).%s\n' "$C_YLW" "$compile_only_fails" "$C_RST"
-  printf '%sReported, not fatal: these are tracked separately from the sqlite-RUN-green goal.%s\n' "$C_YLW" "$C_RST"
+  printf '\n%s%d compile-only target(s) did not build a clean binary — a real cross-OS build gap; inspect the compile.log.%s\n' "$C_YLW" "$compile_only_fails" "$C_RST"
+  printf '%sNon-fatal to the runnable-leg exit (foreign-OS targets are run-verified via their native runner).%s\n' "$C_YLW" "$C_RST"
 fi
 
 # Exit non-zero if an EXPECTED step failed for the sqlite-RUN-green goal: a RUNNABLE
