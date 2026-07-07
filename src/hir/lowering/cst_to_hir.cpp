@@ -1929,6 +1929,16 @@ struct Lowerer {
              && tree().rule(c).v == cfg.vaEndRule.v) {
                 return lowerVaEnd(c);
             }
+            // FC16: `_Generic(...)` routes to its dedicated lowering, which lowers
+            // ONLY the association the SEMANTIC tier selected (the non-selected
+            // sub-expressions must NOT be lowered — they are unevaluated). Like
+            // sizeof/cast, its children (the type-names) must never be lowered as
+            // expressions. Config-driven by rule id — a language without a
+            // `_Generic` surface leaves this invalid and skips it.
+            if (cfg.genericRule.valid()
+             && tree().rule(c).v == cfg.genericRule.v) {
+                return lowerGeneric(c);
+            }
         }
         for (NodeId c : visible(node)) {
             if (tree().kind(c) == NodeKind::Internal) {   // paren-wrapped
@@ -4776,6 +4786,39 @@ struct Lowerer {
         if (!ap.type.valid()) return ap;   // diagnostic already emitted
         HirNodeId const tref = track(builder.makeTypeRef(argTy), node);
         return {track(builder.makeVaArg(ap.id, tref, argTy), node), argTy};
+    }
+
+    // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): `_Generic ( ctrl ,
+    // assoc-list )` → the SELECTED association's result-expression, unchanged.
+    // 6.5.1.1p3: "the result has the type and value of the selected assignment
+    // expression" — so this lowers ONLY that one sub-expression (no conversion is
+    // applied; its type IS the result type) and NONE of the others (they are
+    // unevaluated). The SEMANTIC tier already did the compile-time type match and
+    // recorded the winner's NodeId (`model.selectedGenericExpr`); a `_Generic`
+    // that could NOT select (no match + no default, or ambiguous, or an
+    // un-typeable controlling expression) has NO recorded selection AND the
+    // analyzer already errored — fail loud here (never a silent mis-lower). The
+    // NON-selected associations' expressions are discarded WITHOUT being lowered,
+    // so a non-selected branch imposes no lowering-tier constraint (6.5.1.1p3).
+    [[nodiscard]] E lowerGeneric(NodeId node) {
+        NodeId const selected = model.selectedGenericExpr(node);
+        if (!selected.valid()) {
+            // The analyzer left this `_Generic` unselected (a constraint violation
+            // it already reported — S_GenericSelectionNoMatch / Ambiguous — or a
+            // cascade from an un-typeable controlling expression). Emit a loud HIR
+            // error so the failure is never silent even if the semantic diagnostic
+            // were suppressed; both selection-failure codes are unsuppressable.
+            return exprError(node,
+                "_Generic did not select an association (no matching type and no "
+                "default, an ambiguous match, or an un-typeable controlling "
+                "expression)");
+        }
+        // Lower ONLY the selected association's assignment-expression; its result
+        // (id + type) IS the generic selection's result. `track` re-anchors the
+        // lowered node to the `_Generic` CST node for provenance/diagnostics.
+        E const chosen = lowerExpr(selected);
+        if (!chosen.type.valid()) return chosen;   // diagnostic already emitted
+        return {track(chosen.id, node), chosen.type};
     }
 
     // FC2: explicit cast `(T)expr` (`hirLowering.castRule`). The grammar

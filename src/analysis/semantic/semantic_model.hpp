@@ -260,6 +260,7 @@ public:
                   std::vector<SymbolRecord>              symbols,
                   UnitAttribute<SymbolId>                nodeToSymbol,
                   UnitAttribute<TypeId>                  nodeToType,
+                  UnitAttribute<NodeId>                  nodeToSelectedExpr,
                   DiagnosticReporter                     diagnostics,
                   std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol,
                   std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
@@ -274,6 +275,7 @@ public:
           symbols_(std::move(symbols)),
           nodeToSymbol_(std::move(nodeToSymbol)),
           nodeToType_(std::move(nodeToType)),
+          nodeToSelectedExpr_(std::move(nodeToSelectedExpr)),
           diagnostics_(std::move(diagnostics)),
           usesBySymbol_(std::move(usesBySymbol)),
           compositeScopeByType_(std::move(compositeScopeByType)),
@@ -315,6 +317,14 @@ public:
     // tree in this CU.
     [[nodiscard]] SymbolId symbolAt(NodeId id) const;
     [[nodiscard]] TypeId   typeAt(NodeId id)   const;
+
+    // FC16 (D-CSUBSET-GENERIC-SELECTION): for a `_Generic` node, the NodeId of
+    // the selected association's result-expression (the compile-time type-match
+    // winner Pass 2 recorded). Returns InvalidNode for any node that is not a
+    // successfully-selected `_Generic` (incl. a no-match/ambiguous one, which the
+    // analyzer left untyped + errored). The CST→HIR `lowerGeneric` reads this to
+    // lower ONLY the selected sub-expression.
+    [[nodiscard]] NodeId   selectedGenericExpr(NodeId id) const;
 
     // Reverse use-index (SE7): every NodeId that resolved to `symbol`
     // during Pass 2 (the symbol's USE sites — NOT its declaration name
@@ -382,6 +392,9 @@ private:
     std::vector<SymbolRecord>              symbols_;
     UnitAttribute<SymbolId>                nodeToSymbol_;
     UnitAttribute<TypeId>                  nodeToType_;
+    // FC16 (D-CSUBSET-GENERIC-SELECTION): `_Generic` node → selected assoc's
+    // result-expression NodeId. See `selectedGenericExpr`.
+    UnitAttribute<NodeId>                  nodeToSelectedExpr_;
     DiagnosticReporter                     diagnostics_;
     // SymbolId.v → its USE-site NodeIds. Built once during analyze().
     std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol_;

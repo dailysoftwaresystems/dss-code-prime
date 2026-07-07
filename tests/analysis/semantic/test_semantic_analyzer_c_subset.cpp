@@ -1020,6 +1020,135 @@ TEST(SemanticAnalyzerCSubset, StaticAssertSizeof1ArgFolds) {
                         DiagnosticCode::S_StaticAssertFailed), 0u);
 }
 
+// ── FC16 C11/C23 6.5.1.1 _Generic — generic selection ────────────────────────
+//
+// SELECTION is a compile-time SEMANTIC-tier decision (like sizeof folding): the
+// controlling expression's type is matched against each association's resolved
+// type-name; the WINNER's result type is stamped on the genericExpr node (so the
+// enclosing expression types), and a no-match/ambiguous/value-in-type failure is
+// fail-loud. These pins prove the selection is REAL (the RESULT TYPE follows the
+// SELECTED association — an int-controlled `_Generic` picking an `int:` branch
+// that yields a `double` types the node `double`, not `int`).
+namespace {
+// The first genericExpr node across the CU's trees (the whole `_Generic (...)`
+// primary expression), for the RESULT-TYPE stamp checks.
+[[nodiscard]] std::pair<TreeId, NodeId> firstGenericNode(CompilationUnit const& cu) {
+    for (auto const& t : cu.trees()) {
+        auto const rid = t.schema().rules().find("genericExpr");
+        if (!rid.valid()) continue;
+        for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+            NodeId const n{i};
+            if (t.kind(n) == NodeKind::Internal && t.rule(n).v == rid.v)
+                return {t.id(), n};
+        }
+    }
+    return {TreeId{}, NodeId{}};
+}
+} // namespace
+
+// The selected association's TYPE is the `_Generic` node's result type. `i` is
+// `int`, so the `int:` association wins; its result expression is a `double`
+// literal — so the genericExpr node types `double` (F64), NOT `int`. This is the
+// load-bearing behavior: the result type follows the SELECTED branch's value.
+TEST(SemanticAnalyzerCSubset, GenericSelectedBranchTypeIsResultType) {
+    auto cu = buildShippedUnit("c-subset", {
+        "double f(void){ int i = 0; return _Generic(i, int: 1.5, "
+        "long: 2, default: 0); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    auto [tid, gen] = firstGenericNode(*cu);
+    ASSERT_TRUE(gen.valid()) << "a genericExpr node must exist";
+    TypeId const genTy = model.typeAt(gen);
+    ASSERT_TRUE(genTy.valid()) << "the _Generic node must be typed (selection ok)";
+    EXPECT_EQ(ti.kind(genTy), TypeKind::F64)
+        << "the result type is the SELECTED int-branch's double value (F64)";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionNoMatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionAmbiguous), 0u);
+}
+
+// A controlling type matching NO typed association AND no default fails loud
+// (S_GenericSelectionNoMatch) — `double` vs {int, char}.
+TEST(SemanticAnalyzerCSubset, GenericNoMatchNoDefaultFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ double d = 0; return _Generic(d, int: 1, char: 2); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionNoMatch), 1u)
+        << "no typed match and no default is a constraint violation";
+}
+
+// The `default` fallback is selected when no typed association matches — `char*`
+// vs {int, double} → default. No no-match error; the node types the default's
+// result type.
+TEST(SemanticAnalyzerCSubset, GenericDefaultFallbackSelected) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ char c = 0; char* p = &c; "
+        "return _Generic(p, int: 1, double: 2, default: 7); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionNoMatch), 0u)
+        << "the default association must satisfy an otherwise-no-match selection";
+    auto [tid, gen] = firstGenericNode(*cu);
+    ASSERT_TRUE(gen.valid());
+    EXPECT_TRUE(model.typeAt(gen).valid())
+        << "the default-selected _Generic node must be typed";
+}
+
+// A VALUE in an association's type position fails loud at the type-resolve — the
+// castTypeRef `commitRequiresTypeName` triage routes a value-identifier to
+// S_UnknownType (never silently treated as a type).
+TEST(SemanticAnalyzerCSubset, GenericValueInTypePositionFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ int i = 0; int notAType = 5; "
+        "return _Generic(i, notAType: 1, default: 0); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownType), 1u)
+        << "a value identifier in an association type position must fail loud";
+}
+
+// Two associations naming the SAME type (compatible types — 6.5.1.1p2 forbids it)
+// is ambiguous → S_GenericSelectionAmbiguous.
+TEST(SemanticAnalyzerCSubset, GenericAmbiguousMatchFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ int i = 0; "
+        "return _Generic(i, int: 1, int: 2, default: 0); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionAmbiguous), 1u)
+        << "two associations of the same type is a constraint violation";
+}
+
+// A typedef name in an association type position resolves through the alias and
+// matches the underlying type (`MyInt` ≡ `int` → the MyInt-branch wins for an
+// `int` controlling expression).
+TEST(SemanticAnalyzerCSubset, GenericTypedefAssociationMatches) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef int MyInt;\n"
+        "int main(void){ int i = 0; "
+        "return _Generic(i, MyInt: 42, double: 3, default: 0); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionNoMatch), 0u)
+        << "a typedef alias in type position must match the underlying type";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionAmbiguous), 0u);
+}
+
 // R1: the GENUINE forward-reference case (`int a[sizeof(b)]; int b;` — b used
 // before its declaration's type resolves) STAYS correct fail-loud (invalid C:
 // declare-before-use). This is NOT the closed member-access case — it pins the

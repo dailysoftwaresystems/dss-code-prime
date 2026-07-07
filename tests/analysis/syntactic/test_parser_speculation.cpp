@@ -566,6 +566,7 @@ TEST(ParserSpeculation, CSubsetOperandAltBranchesAreInDeclaredOrder) {
         "vaStartExpr",           // FC12a-core (D-FC12A-VARIADIC-CALLEE)
         "vaArgExpr",             // FC12a-core
         "vaEndExpr",             // FC12a-core
+        "genericExpr",           // FC16 (D-CSUBSET-GENERIC-SELECTION, `_Generic`)
         "castExpr",
         "parenExpr",
     };

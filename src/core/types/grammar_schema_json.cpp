@@ -7466,6 +7466,58 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── generic (FC16 C11/C23 6.5.1.1, D-CSUBSET-GENERIC-SELECTION) ──
+            // `{ rule, controlChild, assocRule, typedAssocRule, defaultAssocRule }`
+            // — `_Generic` generic selection. Pass 2 resolves the controlling
+            // expression's type (child `controlChild`), matches it against each
+            // `typedAssocRule` child's resolved castTypeRef type + records the
+            // winning association's result-expression node. Absent ⇒ the language
+            // has no generic-selection surface (the check never runs). A
+            // present-but-bad value (non-object, or an unknown shape) emits +
+            // fails the load — a typo can never silently disarm the selection.
+            if (sem.contains("generic")) {
+                json const& gen = sem.at("generic");
+                if (!gen.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/generic",
+                              "'semantics.generic' must be an object "
+                              "{ rule, controlChild, assocRule, typedAssocRule, "
+                              "defaultAssocRule }");
+                } else {
+                    auto readRule = [&](char const* key, RuleId& outRule,
+                                        std::string& outName) {
+                        if (!gen.contains(key) || !gen.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      std::string{"/semantics/generic/"} + key,
+                                      std::format("'{}' is required and must be a "
+                                                  "string", key));
+                            return;
+                        }
+                        outName = gen.at(key).get<std::string>();
+                        if (!data.rules->contains(outName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape,
+                                      std::string{"/semantics/generic/"} + key,
+                                      std::format("'generic.{}' references unknown "
+                                                  "shape '{}'", key, outName));
+                            outName.clear();
+                            return;
+                        }
+                        outRule = data.rules->find(outName);
+                    };
+                    readRule("rule", cfg.genericRule, cfg.genericRuleName);
+                    readRule("assocRule", cfg.genericAssocRule,
+                             cfg.genericAssocRuleName);
+                    readRule("typedAssocRule", cfg.genericTypedAssocRule,
+                             cfg.genericTypedAssocRuleName);
+                    readRule("defaultAssocRule", cfg.genericDefaultAssocRule,
+                             cfg.genericDefaultAssocRuleName);
+                    bool controlOk = true;
+                    readReqIndex(gen, "controlChild", "/semantics/generic",
+                                 cfg.genericControlChild, controlOk);
+                    (void)controlOk;
+                }
+            }
+
             // ── compoundLiterals (FC3.5 sweep-c3,
             //    D-CSUBSET-COMPOUND-LITERAL-TYPEDEF) ──
             // `{ rule, typeChild }` — the compound-literal expression
@@ -8383,6 +8435,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readExprRule("vaStartRule",         cfg.vaStartRule,         cfg.vaStartRuleName);
             readExprRule("vaArgRule",           cfg.vaArgRule,           cfg.vaArgRuleName);
             readExprRule("vaEndRule",           cfg.vaEndRule,           cfg.vaEndRuleName);
+            // FC16 C11/C23 6.5.1.1: `_Generic(...)` → the selected association's
+            // sub-expression (its type + value); lowerGeneric reads the semantic
+            // tier's recorded winner and lowers ONLY that child.
+            readExprRule("genericRule",         cfg.genericRule,         cfg.genericRuleName);
             // D-CSUBSET-COMPUTED-GOTO: `&&label` → core HirKind::LabelAddressOf.
             readExprRule("labelAddressRule",    cfg.labelAddressRule,    cfg.labelAddressRuleName);
 

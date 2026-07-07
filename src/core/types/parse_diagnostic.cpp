@@ -132,6 +132,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_IncompleteTypeObject";
         case DiagnosticCode::S_StaticAssertFailed:
             return "S_StaticAssertFailed";
+        case DiagnosticCode::S_GenericSelectionNoMatch:
+            return "S_GenericSelectionNoMatch";
+        case DiagnosticCode::S_GenericSelectionAmbiguous:
+            return "S_GenericSelectionAmbiguous";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

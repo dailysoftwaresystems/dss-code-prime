@@ -310,6 +310,8 @@
     { "word": "va_arg",   "kind": "VaArgKeyword"   },
     { "word": "va_end",   "kind": "VaEndKeyword"   },
 
+    { "word": "_Generic", "kind": "GenericKeyword" },
+
     { "word": "extern",  "kind": "ExternKeyword"  },
 
     { "word": "static",        "kind": "StaticKeyword"    },
@@ -996,6 +998,7 @@
         "vaStartExpr",
         "vaArgExpr",
         "vaEndExpr",
+        "genericExpr",
         "castExpr",
         "parenExpr"
       ],
@@ -1050,6 +1053,27 @@
     "vaEndExpr": {
       "$comment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): `va_end(ap)`. Takes the `va_list` lvalue; a no-op teardown in the SysV model.",
       "sequence": [ "VaEndKeyword", "ParenOpen", "assignmentExpr", "ParenClose" ]
+    },
+
+    "genericExpr": {
+      "$comment": "FC16 (D-CSUBSET-GENERIC-SELECTION): C11/C23 6.5.1.1 `_Generic ( controlling-expression , generic-assoc-list )` — a PRIMARY EXPRESSION whose value+type IS the selected association's expression. A leaf in the operand alternative list (parallel to vaArgExpr). The controlling expression is `assignmentExpr` (comma-free — a `,` here separates associations, so the comma-operator form must not swallow it, exactly like vaArgExpr's ap arg). The assoc-list is a NON-EMPTY comma-separated list of `type-name : assignment-expression` (genericAssoc) or `default : assignment-expression` (genericDefaultAssoc); the list shape (first + `{repeat {, item}}`) mirrors initDeclaratorList. Each genericAssoc's type position is `castTypeRef` + the SAME `commitRequiresTypeName` binder triage va_arg/casts use, so `int:`/`MyTypedef:` commit as a TYPE and a VALUE in type position fails loud at the type-resolve (S_UnknownType). SELECTION is compile-time in the SEMANTIC tier (semantics.generic): the controlling expr's type (after lvalue conversion — top-level volatile stripped) is matched against each association's resolved type for COMPATIBILITY (interned TypeId equality); EXACTLY ONE must match, else the `default` — a no-match-no-default is S_GenericSelectionNoMatch and >1 match is S_GenericSelectionAmbiguous (both unsuppressable constraint violations). Pass 2 stamps the genericExpr node with the WINNER's result type + records the winning association's expression node; the dedicated HIR lowering (hirLowering.genericRule → lowerGeneric) lowers ONLY that sub-expression (its type + value), discarding the rest (the non-selected expressions are UNEVALUATED per 6.5.1.1p3, imposing no constraints beyond being syntactically valid).",
+      "sequence": [
+        "GenericKeyword", "ParenOpen", "assignmentExpr",
+        "Comma", "genericAssoc",
+        { "repeat": { "sequence": [ "Comma", "genericAssoc" ] } },
+        "ParenClose"
+      ]
+    },
+    "genericAssoc": {
+      "$comment": "FC16 (D-CSUBSET-GENERIC-SELECTION): ONE `type-name : assignment-expression` OR `default : assignment-expression` association of a `_Generic`. The `default` form is a distinct alt (genericDefaultAssoc) so the DefaultKeyword lead is unambiguous; otherwise the type position is `castTypeRef` (typedef-admitting, with the shared `commitRequiresTypeName` triage — a value in type position fails loud). The two alts share the `: assignmentExpr` tail shape; the semantic tier discriminates default-vs-typed by the DefaultKeyword child.",
+      "alt": [ "genericDefaultAssoc", "genericTypedAssoc" ]
+    },
+    "genericTypedAssoc": {
+      "sequence": [ "castTypeRef", "Colon", "assignmentExpr" ],
+      "commitRequiresTypeName": "castTypeRef"
+    },
+    "genericDefaultAssoc": {
+      "sequence": [ "DefaultKeyword", "Colon", "assignmentExpr" ]
     },
 
     "staticAssertDecl": {
@@ -1325,6 +1349,14 @@
     },
     "$staticAssertComment": "C11/C23 6.7.10: the `_Static_assert`/`static_assert` DECLARATION rule. Pass 2 const-evaluates the condition child (visible-child 1 — the assignmentExpr after the keyword+'(') through the SAME evaluator that folds sizeof(T)/enum/arithmetic in an array dimension; ZERO ⇒ S_StaticAssertFailed (message = the OPTIONAL trailing string-literal child), NONZERO ⇒ nothing. The construct lowers to nothing (hirLowering staticAssertDecl → Skip).",
     "staticAssertRule": "staticAssertDecl",
+    "$genericComment": "FC16 (D-CSUBSET-GENERIC-SELECTION): C11/C23 6.5.1.1 generic selection. `rule` = the genericExpr shape; `controlChild` = the visible-child index of the controlling `assignmentExpr` (child 2 — after the GenericKeyword + '('). `assocRule`/`typedAssocRule`/`defaultAssocRule` name the association shapes so Pass 2 discriminates each `_Generic` child: a genericTypedAssoc's FIRST child is a castTypeRef (resolved+stamped through the SAME type resolver casts/sizeof/va_arg use — a VALUE in type position fails loud S_UnknownType) and its LAST is the result expression; a genericDefaultAssoc is the `default:` fallback (no type). Pass 2 lvalue-converts the controlling type (strips top-level volatile, the isAssignable precedent), matches it against each typed assoc's resolved type for COMPATIBILITY (interned TypeId equality via sameType), enforces EXACTLY ONE typed match (S_GenericSelectionAmbiguous on >1) OR the default (S_GenericSelectionNoMatch on none-and-no-default), stamps the genericExpr node with the winner's RESULT type, and records the winning association's result-expression node (nodeToSelectedExpr side-table). The dedicated HIR lowering (hirLowering.genericRule) lowers ONLY that recorded sub-expression.",
+    "generic": {
+      "rule": "genericExpr",
+      "controlChild": 2,
+      "assocRule": "genericAssoc",
+      "typedAssocRule": "genericTypedAssoc",
+      "defaultAssocRule": "genericDefaultAssoc"
+    },
     "$compoundLiteralsComment": "FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF): the compound-literal type position resolves + stamps through the SAME type-position resolver casts use (typedefs included). typeChild is the visible-child index into compoundLiteralExpr = [ '(' , castTypeRef , ')' , braceInitList ]. NO operandChild / cast-matrix validation — a compound literal is C 6.5.2.5 postfix syntax, not a conversion.",
     "compoundLiterals": [
       { "rule": "compoundLiteralExpr", "typeChild": 1 }
@@ -1492,6 +1524,7 @@
     "vaStartRule":         "vaStartExpr",
     "vaArgRule":           "vaArgExpr",
     "vaEndRule":           "vaEndExpr",
+    "genericRule":         "genericExpr",
 
     "globalsConstEval": { "allowFloat": true },
 

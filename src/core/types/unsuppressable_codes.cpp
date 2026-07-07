@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 72> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 74> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -299,6 +299,18 @@ constexpr std::array<DiagnosticCode, 72> kUnsuppressableCodes{{
     // REASON the closed table forbids. Closed here so a false static_assert is
     // never silent.
     DiagnosticCode::S_StaticAssertFailed,
+    // S_GenericSelectionNoMatch / S_GenericSelectionAmbiguous (FC16,
+    // D-CSUBSET-GENERIC-SELECTION, 2026-07-07): a `_Generic` whose controlling
+    // type matched no typed association (and had no `default`), or matched more
+    // than one. Same posture as S_StaticAssertFailed / S_TypeNameDeclaratorNot-
+    // Abstract above: on the no-match/ambiguous path the genericExpr node is left
+    // UNTYPED (InvalidType), so the build fails via `hasErrors()` regardless of
+    // the emit gate — no wrong bytes ship — but a suppressed constraint violation
+    // would fail the build with ZERO diagnostics shown, a confusing silent
+    // failure REASON the closed table forbids. Closed here so an unselectable
+    // `_Generic` is never silent.
+    DiagnosticCode::S_GenericSelectionNoMatch,
+    DiagnosticCode::S_GenericSelectionAmbiguous,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

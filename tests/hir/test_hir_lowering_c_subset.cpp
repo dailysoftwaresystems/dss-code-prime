@@ -212,6 +212,59 @@ TEST(HirLoweringCSubset, ReturnLiteralPopulatesPool) {
     EXPECT_EQ(v.core, TypeKind::I32);
 }
 
+// FC16 C11/C23 6.5.1.1: `_Generic` lowers to the SELECTED association's
+// expression — its type + value. `i` is `int`, so the `int:` branch is selected
+// and its Literal 5 IS the returned value (result type I32).
+TEST(HirLoweringCSubset, GenericLowersSelectedBranchValue) {
+    SemanticModel model = analyzeCSubset(
+        "int f() { int i = 0; return _Generic(i, int: 5, double: 3, "
+        "default: 0); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    HirNodeId const body = res->hir.functionBody(fn);
+    // The return value is the selected int-branch's Literal 5 (I32).
+    HirNodeId const lit =
+        findFirstByKind(res->hir, body, HirKind::Literal);
+    ASSERT_TRUE(lit.valid()) << "the selected branch's literal must be lowered";
+    EXPECT_EQ(res->hir.kind(lit), HirKind::Literal);
+    EXPECT_EQ(model.lattice().interner().kind(res->hir.typeId(lit)),
+              TypeKind::I32)
+        << "the selected int-branch's value types I32";
+}
+
+// FC16 6.5.1.1p3: the NON-selected association expressions are NOT evaluated —
+// they must NOT be lowered. The non-selected `double: 999.0` branch's distinctive
+// literal 999 must NOT reach the literal pool (only the selected `int: 5` does).
+TEST(HirLoweringCSubset, GenericNonSelectedBranchNotLowered) {
+    SemanticModel model = analyzeCSubset(
+        "int f() { int i = 0; return _Generic(i, int: 5, "
+        "double: 999, default: 777); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    // ONLY the selected branch's Literal 5 is lowered; 999 and 777 (the
+    // non-selected + default branches) must be absent from the pool.
+    bool has5 = false, has999 = false, has777 = false;
+    for (std::size_t i = 0; i < res->literalPool.size(); ++i) {
+        auto const& v = res->literalPool.at(i);
+        if (std::holds_alternative<std::int64_t>(v.value)) {
+            auto const iv = std::get<std::int64_t>(v.value);
+            if (iv == 5)   has5 = true;
+            if (iv == 999) has999 = true;
+            if (iv == 777) has777 = true;
+        }
+    }
+    EXPECT_TRUE(has5)    << "the selected int-branch literal 5 must be lowered";
+    EXPECT_FALSE(has999) << "the non-selected double-branch literal 999 must NOT "
+                            "be lowered (6.5.1.1p3: unevaluated)";
+    EXPECT_FALSE(has777) << "the unselected default-branch literal 777 must NOT "
+                            "be lowered";
+}
+
 TEST(HirLoweringCSubset, ArithmeticAndParams) {
     SemanticModel model = analyzeCSubset("int add(int a, int b) { return a + b; }");
     ASSERT_FALSE(model.hasErrors());

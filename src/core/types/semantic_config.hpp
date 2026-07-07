@@ -1208,6 +1208,31 @@ struct DSS_EXPORT SemanticConfig {
     // hirLowering row maps to Skip). Invalid ⇒ the language has no static-assertion
     // surface (toy/tsql — the check never runs).
     RuleId        staticAssertRule{}; std::string staticAssertRuleName;
+    // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): `_Generic` generic
+    // selection. `genericRule` = the `genericExpr` shape; `genericControlChild` =
+    // the visible-child index of the controlling `assignmentExpr`. When Pass 2
+    // visits a node of `genericRule` it (1) reads the controlling expression's
+    // resolved type and lvalue-converts it (strips a top-level VolatileQual, the
+    // `isAssignable` precedent); (2) walks the node's children, and for each
+    // `genericTypedAssocRule` child resolves its FIRST child (a `castTypeRef`)
+    // through the SAME type resolver casts/sizeof/va_arg use — a VALUE in type
+    // position fails loud (S_UnknownType) — and its LAST child is the result
+    // expression; a `genericDefaultAssocRule` child is the `default` fallback;
+    // (3) matches the controlling type against each typed assoc's resolved type
+    // for COMPATIBILITY (interned TypeId equality via `sameType`), requiring
+    // EXACTLY ONE typed match (>1 ⇒ S_GenericSelectionAmbiguous) OR the default
+    // (none-and-no-default ⇒ S_GenericSelectionNoMatch); (4) stamps the
+    // genericExpr node with the winner's RESULT type and records the winning
+    // association's result-expression NodeId (the `nodeToSelectedExpr` side-table)
+    // so the HIR lowering lowers ONLY that sub-expression. `genericAssocRule` is
+    // the umbrella alt (genericTypedAssoc | genericDefaultAssoc) — retained for
+    // loader validation. All invalid ⇒ the language has no generic-selection
+    // surface (toy/tsql — the check never runs).
+    RuleId        genericRule{};            std::string genericRuleName;
+    std::uint32_t genericControlChild = 0;
+    RuleId        genericAssocRule{};       std::string genericAssocRuleName;
+    RuleId        genericTypedAssocRule{};  std::string genericTypedAssocRuleName;
+    RuleId        genericDefaultAssocRule{}; std::string genericDefaultAssocRuleName;
     // FC3.5 sweep-c3: compound-literal type-position stamping rules
     // (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF). See CompoundLiteralRule.
     std::vector<CompoundLiteralRule> compoundLiteralRules;

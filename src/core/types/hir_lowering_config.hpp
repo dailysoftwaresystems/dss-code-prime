@@ -254,6 +254,17 @@ struct DSS_EXPORT HirLoweringConfig {
     RuleId      vaArgRule{};           std::string vaArgRuleName;
     RuleId      vaEndRule{};           std::string vaEndRuleName;
 
+    // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): the `_Generic` generic
+    // selection operand rule (`genericExpr`). A dedicated operand alt (the SizeOf
+    // precedent): the SELECTION is a compile-time decision made in the SEMANTIC
+    // tier (which stamps the winner's result type on the node + records the
+    // winning association's result-expression NodeId in the `nodeToSelectedExpr`
+    // side-table); the CST→HIR lowering (`lowerGeneric`) reads that recorded node
+    // and lowers ONLY that sub-expression (its type + value), discarding the rest
+    // (the non-selected expressions are UNEVALUATED per 6.5.1.1p3). Invalid ⇒ the
+    // language has no generic-selection surface (unset; the dispatch skips it).
+    RuleId      genericRule{};          std::string genericRuleName;
+
     // D-CSUBSET-COMPUTED-GOTO: the GNU `&&label` label-address operand rule
     // (`labelAddressExpr`). A dedicated operand alt (the SizeOf precedent) — its
     // `Identifier` child is a RAW label name, recovered by the CST→HIR lowering

@@ -480,6 +480,21 @@ enum class DiagnosticCode : std::uint16_t {
     // tier (the point with sizeof/enum folding), so a passed assertion produces no
     // HIR and the program runs; a failed one fails loud here.
     S_StaticAssertFailed          = 0xE029,
+    // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): a `_Generic` generic
+    // selection whose controlling expression's type matched NONE of the typed
+    // associations and there was NO `default` association (a constraint
+    // violation — C requires exactly one match or the default). Emitted at the
+    // SEMANTIC tier (the point with the resolved controlling type + resolved
+    // association types); a silent no-selection would leave the `_Generic` node
+    // untyped and mis-lower, so this is unsuppressable.
+    S_GenericSelectionNoMatch     = 0xE02A,
+    // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): a `_Generic` whose
+    // controlling type matched MORE THAN ONE typed association (a constraint
+    // violation — 6.5.1.1p2 forbids two associations naming compatible types).
+    // With interned TypeId equality this means two associations named the SAME
+    // type. Emitted at the SEMANTIC tier; unsuppressable (an ambiguous selection
+    // has no well-defined value).
+    S_GenericSelectionAmbiguous   = 0xE02B,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

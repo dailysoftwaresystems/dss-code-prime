@@ -168,6 +168,7 @@ struct EngineState {
         : lattice{cu.id(), cu.compositeSourceLanguage()},
           nodeToSymbol{cu},
           nodeToType{cu},
+          nodeToSelectedExpr{cu},
           nullPointerConstantNodes{cu} {}
 
     DiagnosticReporter         reporter;
@@ -176,6 +177,15 @@ struct EngineState {
     SymbolTable                symbols;
     UnitAttribute<SymbolId>    nodeToSymbol;
     UnitAttribute<TypeId>      nodeToType;
+    // FC16 (D-CSUBSET-GENERIC-SELECTION): for each `_Generic` node, the NodeId of
+    // the SELECTED association's result-expression (the winner of the compile-time
+    // type match). Written by Pass 2's generic-selection arm; read by the CST→HIR
+    // `lowerGeneric`, which lowers ONLY that recorded sub-expression (its type +
+    // value), discarding the non-selected associations (UNEVALUATED per 6.5.1.1p3).
+    // MUST be a TREE-KEYED UnitAttribute (NOT a flat NodeId.v map): NodeId is tree-
+    // LOCAL, so a multi-source CU restarts numbering per tree — a flat map would
+    // alias node K across files. Routes per-tree exactly like nodeToType/nodeToSymbol.
+    UnitAttribute<NodeId>      nodeToSelectedExpr;
     // R2 (D-SEMANTIC-NULL-CONSTANT-FOLDING): source nodes admitted as a null-
     // pointer constant via the FOLDED path — a non-literal integer constant
     // expression that folds to 0 (`1-1`, `-0`). The HIR lowerer materializes a
@@ -5010,6 +5020,159 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             s.reporter.report(std::move(d));
         }
     }
+
+    // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): a `_Generic ( ctrl ,
+    // assoc-list )` generic selection. The SELECTION is a compile-time decision
+    // made here (the point with the resolved controlling type + the machinery to
+    // resolve each association's type-name), mirroring how `va_arg` resolves its
+    // type child and `static_assert` const-evaluates its condition. Post-order
+    // means the controlling expression is already typed; each typed association's
+    // castTypeRef is resolved through the SAME resolver casts/sizeof/va_arg use
+    // (a VALUE in type position fails loud S_UnknownType). The controlling type
+    // is lvalue-converted (top-level volatile stripped — the isAssignable
+    // precedent; C 6.3.2.1 also drops the qualifiers, and c-subset does not
+    // materialize const). A typed association MATCHES when its resolved type is
+    // COMPATIBLE with the controlling type — interned TypeId equality (`sameType`)
+    // after stripping each association type's own top-level volatile. C 6.5.1.1p2
+    // requires EXACTLY ONE match or the `default`: zero-and-no-default is
+    // S_GenericSelectionNoMatch, two-or-more is S_GenericSelectionAmbiguous (with
+    // interned equality, two matches means two associations named the same type).
+    // On success the genericExpr node is stamped the WINNER's result type (so the
+    // enclosing expression types + the HIR lowering's `typeAt` probe find it) and
+    // the winning association's result-expression NodeId is recorded in
+    // `nodeToSelectedExpr` (so `lowerGeneric` lowers ONLY that sub-expression).
+    // The NON-selected associations are UNEVALUATED (6.5.1.1p3) — they are parsed
+    // and their type-names resolved (a value in type position of ANY association
+    // is still a constraint violation), but their result EXPRESSIONS impose no
+    // constraints and are never lowered; see the pinned deferral in the plan.
+    if (k == NodeKind::Internal
+        && cfg.genericRule.valid()
+        && tree.rule(node).v == cfg.genericRule.v) {
+        auto& in = s.lattice.interner();
+        auto kids = visibleChildren(tree, node);
+
+        // (1) The controlling expression's type, lvalue-converted.
+        TypeId ctrlTy = InvalidType;
+        if (cfg.genericControlChild < kids.size()) {
+            ctrlTy = subtreeType(s, tree, kids[cfg.genericControlChild], here);
+        }
+        TypeId const ctrlConv = ctrlTy.valid() ? in.stripVolatile(ctrlTy)
+                                               : InvalidType;
+
+        // (2) Walk the associations. Each association child is a `genericAssoc`
+        // UMBRELLA node (an `alt` rule) wrapping either a `genericTypedAssoc`
+        // ([castTypeRef, ':', assignmentExpr]) or a `genericDefaultAssoc`
+        // ([default, ':', assignmentExpr]) — the parser keeps the alt wrapper, so
+        // descend through it to the inner alternative to classify. (A grammar that
+        // referenced the two alternatives directly would skip the wrapper; the
+        // descent handles BOTH shapes, so it is robust to that grammar choice.)
+        NodeId matchedExpr = InvalidNode;   // the winning typed assoc's result expr
+        int    matchCount  = 0;             // typed matches (for the ambiguity check)
+        NodeId defaultExpr = InvalidNode;   // the `default:` result expr, if present
+        bool   anyBadType  = false;         // a value-in-type-position was rejected
+
+        // Resolve an association child to its inner typed/default node: descend
+        // through the `genericAssoc` umbrella (its sole internal child is the
+        // chosen alternative), else the child IS already a typed/default node.
+        auto innerAssoc = [&](NodeId assoc) -> NodeId {
+            RuleId const r = tree.rule(assoc);
+            bool const isInner =
+                (cfg.genericTypedAssocRule.valid()
+                 && r.v == cfg.genericTypedAssocRule.v)
+                || (cfg.genericDefaultAssocRule.valid()
+                    && r.v == cfg.genericDefaultAssocRule.v);
+            if (isInner) return assoc;
+            if (cfg.genericAssocRule.valid() && r.v == cfg.genericAssocRule.v) {
+                for (NodeId c : visibleChildren(tree, assoc)) {
+                    if (tree.kind(c) == NodeKind::Internal) return c;
+                }
+            }
+            return InvalidNode;
+        };
+
+        for (NodeId assocChild : kids) {
+            if (tree.kind(assocChild) != NodeKind::Internal) continue;
+            NodeId const assoc = innerAssoc(assocChild);
+            if (!assoc.valid()) continue;   // not an association child
+            RuleId const assocRule = tree.rule(assoc);
+            bool const isTyped =
+                cfg.genericTypedAssocRule.valid()
+                && assocRule.v == cfg.genericTypedAssocRule.v;
+            bool const isDefault =
+                cfg.genericDefaultAssocRule.valid()
+                && assocRule.v == cfg.genericDefaultAssocRule.v;
+            if (!isTyped && !isDefault) continue;
+
+            // The result expression is the LAST internal child (the assignmentExpr
+            // after the ':'); the typed form's FIRST internal child is the type.
+            NodeId typeNode{}, exprNode{};
+            for (NodeId c : visibleChildren(tree, assoc)) {
+                if (tree.kind(c) != NodeKind::Internal) continue;
+                if (isTyped && !typeNode.valid()) { typeNode = c; continue; }
+                exprNode = c;   // keep last internal child as the result expr
+            }
+
+            if (isDefault) {
+                // Two `default`s are a constraint violation (6.5.1.1p2); the
+                // exactly-one-default enforcement is pinned as a deferral — keep
+                // the FIRST default's expression here.
+                if (!defaultExpr.valid()) defaultExpr = exprNode;
+                continue;
+            }
+
+            // Typed association: resolve + stamp its castTypeRef (fail loud on a
+            // value in type position — S_UnknownType), then match.
+            TypeId assocTy = InvalidType;
+            if (typeNode.valid()) {
+                assocTy = resolveTypeNode(s, cfg, tree, typeNode, here);
+                if (assocTy.valid()) s.nodeToType.set(typeNode, assocTy);
+                else                 anyBadType = true;   // diagnostic already emitted
+            }
+            if (assocTy.valid() && ctrlConv.valid()
+                && sameType(in.stripVolatile(assocTy), ctrlConv)) {
+                ++matchCount;
+                if (!matchedExpr.valid()) matchedExpr = exprNode;
+            }
+        }
+
+        // (3) Resolve the selection + stamp / fail loud. A bad controlling type or
+        // a rejected association type-name already emitted its own diagnostic; only
+        // CASCADE-SUPPRESS the no-match report in that case (never a double error),
+        // exactly like the va_arg invalid-type path.
+        NodeId selected = matchCount == 1 ? matchedExpr
+                        : matchCount == 0 ? defaultExpr
+                        : InvalidNode;   // >1 typed match: ambiguous (handled below)
+
+        if (matchCount > 1) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_GenericSelectionAmbiguous;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(node);
+            d.actual   = "_Generic controlling type matches more than one "
+                         "association";
+            s.reporter.report(std::move(d));
+        } else if (!selected.valid() && ctrlConv.valid() && !anyBadType) {
+            // No typed match AND no default — and the failure is NOT a cascade
+            // from an unresolved controlling type / bad association type-name.
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_GenericSelectionNoMatch;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(node);
+            d.actual   = "_Generic controlling type matches no association and "
+                         "there is no default";
+            s.reporter.report(std::move(d));
+        }
+
+        if (selected.valid()) {
+            // The genericExpr's RESULT type is the selected association's result-
+            // expression type; record the selected node for the HIR lowering.
+            TypeId const resultTy = subtreeType(s, tree, selected, here);
+            if (resultTy.valid()) s.nodeToType.set(node, resultTy);
+            s.nodeToSelectedExpr.set(node, selected);
+        }
+    }
 }
 
 // pass2 — iterative whole-tree POST-ORDER walk (D-PARSE-DEEP-NEST-RECURSION-
@@ -7264,6 +7427,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::move(s.symbols).release(),
         std::move(s.nodeToSymbol),
         std::move(s.nodeToType),
+        std::move(s.nodeToSelectedExpr),
         std::move(s.reporter),
         std::move(s.usesBySymbol),
         std::move(s.compositeScopeByType),
