@@ -1,0 +1,15 @@
+{
+  "$comment": "D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF witness — a conditionally-initialized live local (`int x; if(c) x=1; return x+c;`). The release pipeline's Mem2Reg previously ABORTED on the phi's missing else-incoming (valid C — gcc/SQLite do this); it now materializes undef-as-zero (an entry-block Const 0). Debug runs no Mem2Reg (always worked); the `release` arm is the witness. exit 2 = 1+1 via a mutable global (anti-fold); g_c=1 so the then-branch defines x (the undef else edge is never dynamically taken — reading it is UB, so the pinned property is compile-does-not-abort + defined-path-correct). RED-on-disable: revert the undef-as-zero materialization in src/opt/passes/mem2reg.cpp -> the release arm Mem2Reg-aborts.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 2,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

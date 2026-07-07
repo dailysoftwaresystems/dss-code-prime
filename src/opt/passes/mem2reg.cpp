@@ -3,6 +3,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "mir/mir_cfg.hpp"
 #include "mir/mir_dom.hpp"
+#include "mir/mir_literal_pool.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
@@ -20,14 +21,21 @@ namespace dss::opt::passes {
 
 namespace {
 
-// A reaching value at a program point is either an OLD-module
-// instruction id (a value the rebuild will map via `rewrite`) or a
-// Mem2Reg-inserted Phi (a NEW SSA def the rebuild has no source for
-// — we key it by a synthetic marker).
+// A reaching value at a program point is one of:
+//   OldInst   — an OLD-module instruction id (the rebuild maps it via `rewrite`).
+//   Phi       — a Mem2Reg-inserted Phi (a NEW SSA def with no source; keyed by a
+//               synthetic marker).
+//   ZeroConst — undef-as-zero for a promoted alloca with NO reaching store on this
+//               path — a benign conditional-init (`int x; if(c) x=1; use(x);`) or a
+//               dead-path uninitialized read. Both are VALID C (gcc/LLVM materialize
+//               `undef`); DSS MIR has no Undef opcode, so we use a zero of the element
+//               type. `value` = the element TypeId.v; the rebuild emits ONE `Const 0`
+//               per element type in the ENTRY block (which dominates every edge → a
+//               valid incoming/value everywhere). D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF.
 struct ReachingValue {
-    enum class Kind : std::uint8_t { OldInst, Phi };
+    enum class Kind : std::uint8_t { OldInst, Phi, ZeroConst };
     Kind          kind  = Kind::OldInst;
-    std::uint32_t value = 0;  // OldInst: MirInstId.v ; Phi: marker key
+    std::uint32_t value = 0;  // OldInst: MirInstId.v ; Phi: marker key ; ZeroConst: element TypeId.v
 };
 
 // One Phi this pass plans to insert at block `blockOld` for alloca
@@ -47,6 +55,28 @@ struct PendingIncoming {
     ReachingValue value;
     MirBlockId    predOld{};
 };
+
+// A TypeKind whose zero value lowers as a direct integer `Const 0` (GPR class).
+// Used for undef-as-zero materialization at a missing reaching value. A FLOAT (FPR)
+// zero needs a rodata `GlobalAddr+Load` (DSS has no float-immediate Const form) and
+// aggregates/vectors have no scalar zero — an alloca with a non-zeroable element type
+// that would need an undef incoming is DE-PROMOTED (left as memory) rather than
+// Const-zeroed. Promoting those via a rodata-zero is a deferred perf refinement
+// (D-OPT-MEM2REG-FPR-CONDITIONAL-INIT-RODATA-ZERO).
+[[nodiscard]] inline bool isConstZeroable(TypeKind tk) noexcept {
+    switch (tk) {
+        case TypeKind::Bool:
+        case TypeKind::I8:  case TypeKind::I16: case TypeKind::I32: case TypeKind::I64:
+        case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32: case TypeKind::U64:
+        case TypeKind::Char: case TypeKind::Byte:
+        case TypeKind::Enum:
+        case TypeKind::Ptr: case TypeKind::Ref: case TypeKind::FnPtr:
+            return true;
+        default:
+            return false;  // F16/F32/F64/F128 (rodata), I128/U128, Struct/Union/Tuple/
+                           // Array/Slice/Vector/Matrix/Nullable/Optional/Void (no scalar zero)
+    }
+}
 
 class Mem2RegPolicy final : public MirRebuildPolicy {
 public:
@@ -83,6 +113,29 @@ public:
                       MirBuilder& dst,
                       std::unordered_map<std::uint32_t, MirInstId>& /*rewrite*/,
                       std::unordered_map<std::uint32_t, MirBlockId> const& /*blockMap*/) override {
+        // Materialize one zero `Const` per element type the rename walk found needs
+        // an undef-as-zero incoming (D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF). Emitted
+        // in the ENTRY block, which dominates every edge → the Const is a valid
+        // incoming/value everywhere; the entry is selectBlocks' first block
+        // (funcEntry == block 0), so this runs before any Load resolves against it.
+        if (oldB == entryBlock_) {
+            for (auto const& [typeV, ty] : zeroConstTypeById_) {
+                TypeKind const tk = interner_.kind(ty);
+                // Only GPR-class zeroable types reach here — an FPR/aggregate alloca
+                // that would need an undef incoming was de-promoted in analyze().
+                if (!isConstZeroable(tk)) {
+                    std::fprintf(stderr,
+                        "dss::opt::passes::Mem2Reg fatal: zero-Const requested for a "
+                        "non-zeroable element TypeKind — analyze() de-promotion should "
+                        "have removed this alloca.\n");
+                    std::abort();
+                }
+                MirLiteralValue zero;
+                zero.value = std::int64_t{0};
+                zero.core  = tk;
+                zeroConstNewIdByType_[typeV] = dst.addConst(std::move(zero), ty);
+            }
+        }
         auto it = phisByBlock_.find(oldB.v);
         if (it == phisByBlock_.end()) return;
         for (PendingPhi const& pp : it->second) {
@@ -167,6 +220,9 @@ public:
         phiIncomings_.clear();
         phiNewIdByMarker_.clear();
         loadReplacement_.clear();
+        zeroConstTypeById_.clear();
+        zeroConstNewIdByType_.clear();
+        entryBlock_ = MirBlockId{};
         nextMarker_ = 1;
     }
 
@@ -180,6 +236,20 @@ private:
                 std::fprintf(stderr,
                     "dss::opt::passes::Mem2Reg fatal: ReachingValue::Phi "
                     "marker v=%u has no emitted phi id — block-walk order "
+                    "violation.\n", rv.value);
+                std::abort();
+            }
+            return it->second;
+        }
+        if (rv.kind == ReachingValue::Kind::ZeroConst) {
+            // The undef-as-zero Const was materialized in the entry block's
+            // onBlockBegin (D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF); a miss means the
+            // rename walk requested a zero for a type onBlockBegin never emitted.
+            auto const it = zeroConstNewIdByType_.find(rv.value);
+            if (it == zeroConstNewIdByType_.end()) {
+                std::fprintf(stderr,
+                    "dss::opt::passes::Mem2Reg fatal: ZeroConst element type v=%u "
+                    "has no materialized Const — onBlockBegin(entry) invariant "
                     "violation.\n", rv.value);
                 std::abort();
             }
@@ -213,8 +283,15 @@ private:
     std::unordered_map<std::uint32_t, std::vector<PendingIncoming>> phiIncomings_;  // marker → incomings
     std::unordered_map<std::uint32_t, ReachingValue> loadReplacement_;  // load .v → reaching value
 
+    // Undef-as-zero materialization (D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF): element
+    // types for which the rename walk hit a missing reaching value (benign
+    // conditional-init). One `Const 0` per distinct type is emitted in the entry block.
+    std::unordered_map<std::uint32_t, TypeId>     zeroConstTypeById_;  // element TypeId.v → the TypeId
+
     // ── rebuild-time state ──
     std::unordered_map<std::uint32_t, MirInstId>  phiNewIdByMarker_;   // marker → new phi id
+    std::unordered_map<std::uint32_t, MirInstId>  zeroConstNewIdByType_;  // element TypeId.v → materialized Const
+    MirBlockId                                    entryBlock_{};        // function entry (zero-consts land here)
 
     // ── counters (accumulated across all functions in the module) ──
     std::size_t allocasPromoted_  = 0;
@@ -254,6 +331,7 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
     // mirror this scope or the gate would classify allocas based on
     // unreachable uses + the rename walk would miss them at runtime.
     MirBlockId const entry = src_.funcEntry(fn);
+    entryBlock_ = entry;   // zero-consts (undef-as-zero) materialize in the entry
     auto const rpo = mirReversePostOrder(src_, entry);
     std::unordered_set<std::uint32_t> reachable;
     reachable.reserve(rpo.size());
@@ -381,7 +459,6 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
         allocaElementType_.erase(aid);
     }
     if (promoted_.empty()) return;
-    allocasPromoted_ += promoted_.size();
 
     // Step 4b — FULLY-PRUNED SSA (Choi/Cytron/Sarkar) — D-OPT-MEM2REG-DEAD-PHI-PRUNE.
     // Place a Phi for promoted alloca A at an IDF block S ONLY IF A is LIVE-IN at
@@ -400,9 +477,13 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
     // Only true LIVENESS distinguishes (b); semi-pruning does not. Liveness gating
     // is PROVABLY SAFE + complete: every Phi it KEEPS is at a block where A is
     // live (its value reaches a real use), so a needed merge is never pruned (no
-    // miscompile); and the genuine-uninitialized-read fatal is PRESERVED — a
-    // truly live-but-undefined alloca (`int x; if(c) x=1; use(x);`) IS live-in at
-    // its use, so the merge Phi survives and still aborts on the undefined path.
+    // miscompile). A LIVE-but-conditionally-defined alloca (`int x; if(c) x=1;
+    // use(x);`) still gets its merge Phi (it IS live-in at the use); the missing
+    // entry incoming is materialized as undef-as-zero during the rename walk rather
+    // than aborting — valid C (gcc/LLVM emit undef); D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF.
+    // (Its GPR-Const-zeroable subset stays promoted; FPR/aggregate conditional-inits
+    // are de-promoted just below — no lowerable scalar zero.) The maybe-uninitialized
+    // DIAGNOSTIC responsibility moves to a frontend warning, D-SEMANTIC-MAYBE-UNINITIALIZED-WARN.
     // Backward dataflow: live_in[B] = use[B] ∪ (live_out[B] \ def[B]);
     //                    live_out[B] = ∪ live_in[succ];  use=upward-exposed Load,
     // def=Store. (The Alloca site is NOT a def here — it births the slot with an
@@ -449,6 +530,34 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
             if (in != cur) { cur = std::move(in); changed = true; }
         }
     }
+
+    // De-promote allocas that WOULD need an undef-as-zero incoming — they are
+    // live-in at the ENTRY block (read-before-write on some path) — but whose
+    // element type has no directly-lowerable zero `Const`: a FLOAT (FPR) zero needs
+    // a rodata `GlobalAddr+Load`, and aggregates/vectors have no scalar zero. Leaving
+    // them as MEMORY is always correct — exactly what the debug pipeline does — so
+    // this costs no correctness, only the SSA promotion of a conditionally-initialized
+    // float (rare). Promoting those via a rodata-zero is a deferred perf refinement
+    // (D-OPT-MEM2REG-FPR-CONDITIONAL-INIT-RODATA-ZERO). GPR-class conditional-init
+    // allocas stay promoted and get a `Const 0` incoming (the common case).
+    {
+        auto const liveEntryIt = liveIn.find(entryBlock_.v);
+        if (liveEntryIt != liveIn.end()) {
+            std::vector<std::uint32_t> depromote;
+            for (std::uint32_t aid : promoted_) {
+                if (!liveEntryIt->second.count(aid)) continue;  // fully init before use
+                if (!isConstZeroable(interner_.kind(allocaElementType_.at(aid)))) {
+                    depromote.push_back(aid);
+                }
+            }
+            for (std::uint32_t aid : depromote) {
+                promoted_.erase(aid);
+                allocaElementType_.erase(aid);
+            }
+        }
+    }
+    if (promoted_.empty()) return;
+    allocasPromoted_ += promoted_.size();
 
     for (std::uint32_t aid : promoted_) {
         auto const& defs = defBlocksOf[aid];
@@ -597,16 +706,19 @@ void Mem2RegPolicy::renameWalkIterative(
                 if (ops.size() == 1 && promoted_.count(ops[0].v)) {
                     auto& st = stacks[ops[0].v];
                     if (st.empty()) {
-                        std::fprintf(stderr,
-                            "dss::opt::passes::Mem2Reg fatal: Load oldId "
-                            "v=%u reads promoted alloca oldId v=%u with "
-                            "no reaching value (uninitialized read of a "
-                            "promotable stack slot — undefined behavior; "
-                            "verifier should have flagged this earlier).\n",
-                            id.v, ops[0].v);
-                        std::abort();
+                        // No reaching store on any path to this Load — a dead-path or
+                        // conditional uninitialized read (VALID C; gcc/LLVM materialize
+                        // undef). Resolve to a zero of the element type rather than
+                        // abort the compiler. De-promotion in analyze() guarantees the
+                        // element type is GPR-Const-zeroable here.
+                        // D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF.
+                        TypeId const elem = allocaElementType_.at(ops[0].v);
+                        zeroConstTypeById_[elem.v] = elem;
+                        loadReplacement_[id.v] =
+                            ReachingValue{ReachingValue::Kind::ZeroConst, elem.v};
+                    } else {
+                        loadReplacement_[id.v] = st.back();
                     }
-                    loadReplacement_[id.v] = st.back();
                 }
                 continue;
             }
@@ -624,17 +736,20 @@ void Mem2RegPolicy::renameWalkIterative(
             if (sit == phisByBlock_.end()) continue;
             for (PendingPhi const& pp : sit->second) {
                 auto stIt = stacks.find(pp.allocaOldIdV);
-                if (stIt == stacks.end() || stIt->second.empty()) {
-                    std::fprintf(stderr,
-                        "dss::opt::passes::Mem2Reg fatal: phi at block "
-                        "v=%u for alloca oldId v=%u has no reaching value "
-                        "from predecessor block v=%u (uninit / unreachable "
-                        "input — semantic violation).\n",
-                        S.v, pp.allocaOldIdV, B.v);
-                    std::abort();
-                }
                 PendingIncoming inc;
-                inc.value   = stIt->second.back();
+                if (stIt == stacks.end() || stIt->second.empty()) {
+                    // No reaching value from this predecessor — a benign
+                    // conditional-init merge (`int x; if(c) x=1; use(x);`) or a dead
+                    // predecessor path. VALID C; the undef incoming becomes a zero of
+                    // the element type (gcc/LLVM emit undef; DSS has no Undef opcode).
+                    // De-promotion in analyze() guarantees a GPR-Const-zeroable type.
+                    // D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF.
+                    TypeId const elem = allocaElementType_.at(pp.allocaOldIdV);
+                    zeroConstTypeById_[elem.v] = elem;
+                    inc.value = ReachingValue{ReachingValue::Kind::ZeroConst, elem.v};
+                } else {
+                    inc.value = stIt->second.back();
+                }
                 inc.predOld = B;
                 phiIncomings_[pp.markerV].push_back(inc);
             }
