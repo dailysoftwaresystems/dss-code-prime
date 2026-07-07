@@ -303,6 +303,9 @@
     { "word": "goto",     "kind": "GotoKeyword"     },
     { "word": "sizeof",   "kind": "SizeofKeyword"   },
 
+    { "word": "_Static_assert", "kind": "StaticAssertKeyword"       },
+    { "word": "static_assert",  "kind": "StaticAssertLegacyKeyword" },
+
     { "word": "va_start", "kind": "VaStartKeyword" },
     { "word": "va_arg",   "kind": "VaArgKeyword"   },
     { "word": "va_end",   "kind": "VaEndKeyword"   },
@@ -326,6 +329,7 @@
       "alt": [
         "includeDirective",
         "typedefDecl",
+        "staticAssertDecl",
         "topLevelDecl",
         "externDecl",
         "emptyStmt"
@@ -805,6 +809,7 @@
       "alt": [
         "varDecl",
         "typedefDecl",
+        "staticAssertDecl",
         "block",
         "ifStmt",
         "whileStmt",
@@ -1045,6 +1050,16 @@
     "vaEndExpr": {
       "$comment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): `va_end(ap)`. Takes the `va_list` lvalue; a no-op teardown in the SysV model.",
       "sequence": [ "VaEndKeyword", "ParenOpen", "assignmentExpr", "ParenClose" ]
+    },
+
+    "staticAssertDecl": {
+      "$comment": "C11/C23 6.7.10 `_Static_assert(constant-expression, string-literal);` and the C23 1-arg `_Static_assert(constant-expression);` — a static-assertion DECLARATION valid at BOTH file scope (topLevel alt) AND block scope (statement alt). Two spellings: the reserved `_Static_assert` and the C23 `static_assert` (both keywords). The condition is `assignmentExpr` (comma-free — a `,` here separates the optional message, so the comma-operator form must not swallow it, exactly like vaStartExpr's ap arg). The message is an OPTIONAL adjacent-string-concat literal (the vaStartExpr optional-second-arg pattern; ABSENT = the C23 1-arg form). SEMANTICS live in the semantic tier (semantics.staticAssertRule): the condition is const-evaluated by the SAME evaluator that folds `sizeof(T)`/enum/arithmetic in an array dimension — ZERO ⇒ S_StaticAssertFailed (message = the string literal), NONZERO ⇒ nothing. The `hirKind: Skip` row lowers a PASSED assertion to nothing in BOTH positions (the emptyStmt/includeDirective Skip precedent), and — because it is a MAPPED rule — makes peelToCore STOP here (never descending into the sole condition child of the 1-arg form).",
+      "sequence": [
+        { "alt": [ "StaticAssertKeyword", "StaticAssertLegacyKeyword" ] },
+        "ParenOpen", "assignmentExpr",
+        { "optional": { "sequence": [ "Comma", "stringLiteralExpr" ] } },
+        "ParenClose", "EndStatement"
+      ]
     },
 
     "castTypeBase": {
@@ -1308,6 +1323,8 @@
       "vaStartRule": "vaStartExpr", "vaStartApChild": 2,
       "vaEndRule":   "vaEndExpr",   "vaEndApChild":   2
     },
+    "$staticAssertComment": "C11/C23 6.7.10: the `_Static_assert`/`static_assert` DECLARATION rule. Pass 2 const-evaluates the condition child (visible-child 1 — the assignmentExpr after the keyword+'(') through the SAME evaluator that folds sizeof(T)/enum/arithmetic in an array dimension; ZERO ⇒ S_StaticAssertFailed (message = the OPTIONAL trailing string-literal child), NONZERO ⇒ nothing. The construct lowers to nothing (hirLowering staticAssertDecl → Skip).",
+    "staticAssertRule": "staticAssertDecl",
     "$compoundLiteralsComment": "FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF): the compound-literal type position resolves + stamps through the SAME type-position resolver casts use (typedefs included). typeChild is the visible-child index into compoundLiteralExpr = [ '(' , castTypeRef , ')' , braceInitList ]. NO operandChild / cast-matrix validation — a compound literal is C 6.5.2.5 postfix syntax, not a conversion.",
     "compoundLiterals": [
       { "rule": "compoundLiteralExpr", "typeChild": 1 }
@@ -1434,6 +1451,7 @@
       { "rule": "forIdentDecl", "hirKind": "VarDecl"     },
       { "rule": "param",        "hirKind": "VarDecl"     },
       { "rule": "typedefDecl",  "hirKind": "TypeDecl"    },
+      { "rule": "staticAssertDecl", "hirKind": "Skip"    },
       { "rule": "externDecl",   "hirKind": "ExternDecl"  },
       { "rule": "block",        "hirKind": "Block"       },
       { "rule": "ifStmt",       "hirKind": "IfStmt"      },

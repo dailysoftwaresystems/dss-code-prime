@@ -7437,6 +7437,35 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── staticAssertRule (C11/C23 6.7.10, D-CSUBSET-STATIC-ASSERT) ──
+            // A single OPTIONAL top-level rule reference: the
+            // `_Static_assert`/`static_assert` declaration shape. Pass 2
+            // const-evaluates its condition child + emits S_StaticAssertFailed on
+            // a zero / non-constant fold. Absent ⇒ the language has no
+            // static-assertion surface (the check never runs). A present-but-bad
+            // value (not a string, or an unknown shape) emits + fails the load —
+            // a typo can never silently disarm the assertion check.
+            if (sem.contains("staticAssertRule")) {
+                if (!sem.at("staticAssertRule").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/staticAssertRule",
+                              "'semantics.staticAssertRule' must be a string");
+                } else {
+                    cfg.staticAssertRuleName =
+                        sem.at("staticAssertRule").get<std::string>();
+                    if (!data.rules->contains(cfg.staticAssertRuleName)) {
+                        coll.emit(DiagnosticCode::C_UnknownShape,
+                                  "/semantics/staticAssertRule",
+                                  std::format("'staticAssertRule' references unknown "
+                                              "shape '{}'", cfg.staticAssertRuleName));
+                        cfg.staticAssertRuleName.clear();
+                    } else {
+                        cfg.staticAssertRule =
+                            data.rules->find(cfg.staticAssertRuleName);
+                    }
+                }
+            }
+
             // ── compoundLiterals (FC3.5 sweep-c3,
             //    D-CSUBSET-COMPOUND-LITERAL-TYPEDEF) ──
             // `{ rule, typeChild }` — the compound-literal expression

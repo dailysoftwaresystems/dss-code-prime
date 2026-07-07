@@ -1196,6 +1196,18 @@ struct DSS_EXPORT SemanticConfig {
     std::uint32_t vaStartApChild = 0;
     RuleId        vaEndRule{};        std::string vaEndRuleName;
     std::uint32_t vaEndApChild   = 0;
+    // C11/C23 6.7.10 (D-CSUBSET-STATIC-ASSERT): the `_Static_assert`/`static_assert`
+    // static-assertion DECLARATION rule. When Pass 2 visits a node of this rule it
+    // const-evaluates the FIRST meaningful child (the condition — the `assignmentExpr`
+    // after the keyword + `(`) via the SAME `constIntExpr` evaluator that folds
+    // sizeof(T)/enum/arithmetic in an array dimension: a fold to ZERO emits
+    // S_StaticAssertFailed (message = the OPTIONAL trailing string-literal child); a
+    // condition that does not fold to an integer constant expression (non-const /
+    // float / unresolved) ALSO emits S_StaticAssertFailed (C requires an ICE); a
+    // NONZERO fold produces nothing. The construct itself lowers to nothing (its
+    // hirLowering row maps to Skip). Invalid ⇒ the language has no static-assertion
+    // surface (toy/tsql — the check never runs).
+    RuleId        staticAssertRule{}; std::string staticAssertRuleName;
     // FC3.5 sweep-c3: compound-literal type-position stamping rules
     // (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF). See CompoundLiteralRule.
     std::vector<CompoundLiteralRule> compoundLiteralRules;

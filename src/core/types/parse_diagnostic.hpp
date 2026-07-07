@@ -471,6 +471,16 @@ enum class DiagnosticCode : std::uint16_t {
     // by-value use of an incomplete composite from EVER silently folding to size 0.
     S_IncompleteTypeObject        = 0xE028,
 
+    // C11/C23 6.7.10: a `_Static_assert`/`static_assert` whose constant-expression
+    // condition evaluated to ZERO (the assertion FAILED) OR could not be folded to
+    // an integer constant expression (a non-constant / float / unresolved condition
+    // — C requires an integer constant expression). ONE code for both: the message
+    // (`.actual`) discriminates "assertion failed: <string-literal>" from
+    // "condition is not an integer constant expression". Emitted at the SEMANTIC
+    // tier (the point with sizeof/enum folding), so a passed assertion produces no
+    // HIR and the program runs; a failed one fails loud here.
+    S_StaticAssertFailed          = 0xE029,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-

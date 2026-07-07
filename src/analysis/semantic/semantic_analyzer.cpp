@@ -115,6 +115,10 @@ struct SchemaIndexes {
     std::unordered_map<std::uint32_t, std::size_t> returnByRule;   // GAP A
     std::unordered_map<std::uint32_t, bool>        loopByRule;      // GAP C loop contexts
     std::unordered_map<std::uint32_t, bool>        loopControlByRule; // GAP C break/continue
+    // C11/C23 6.7.10 (D-CSUBSET-STATIC-ASSERT): true for the static-assertion
+    // declaration rule. Pass 2 (`pass2Post`) const-evaluates its condition + emits
+    // S_StaticAssertFailed on a zero / non-constant fold. Empty ⇒ no surface.
+    std::unordered_map<std::uint32_t, bool>        staticAssertByRule;
     // Built-in type name → TypeId (interned once per schema, into the CU
     // lattice; FC3 c1 — the per-row `coreByDataModel` override for the
     // ACTIVE data model is applied here, so every consumer below sees
@@ -834,6 +838,7 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
     }
     for (auto const& lr : cfg.loopRules)    idx.loopByRule[lr.rule.v] = true;
     for (auto const& lc : cfg.loopControls) idx.loopControlByRule[lc.rule.v] = true;
+    if (cfg.staticAssertRule.valid()) idx.staticAssertByRule[cfg.staticAssertRule.v] = true;
     for (auto const& bt : cfg.builtinTypes) {
         if (bt.extension.has_value()) {
             // The mapping names a registered type-extension (e.g. T-SQL's
@@ -4942,6 +4947,68 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         d.span     = tree.span(node);
         d.actual   = std::string{tree.text(node)};
         s.reporter.report(std::move(d));
+    }
+
+    // C11/C23 6.7.10 (D-CSUBSET-STATIC-ASSERT): a `_Static_assert`/`static_assert`
+    // static-assertion declaration. The construct is valid at BOTH file and block
+    // scope; `pass2Post` visits it in both because it walks EVERY node (the check
+    // is node-based, not symbol-based — the declaration mints no symbol). The
+    // condition is const-evaluated through the SAME `constIntExpr` evaluator that
+    // folds `sizeof(T)` / enum constants / arithmetic in an array dimension (it
+    // wires `resolveSizeof` off `s.aggregateLayout`), so `sizeof(int)==4` folds
+    // here exactly as `int a[sizeof(int)]` does. A fold to ZERO — OR a condition
+    // that does not fold to an integer constant expression (non-const / float /
+    // unresolved; C 6.7.10 requires an ICE) — fails loud with S_StaticAssertFailed.
+    // A NONZERO fold produces nothing (the construct also lowers to nothing: its
+    // hirLowering row maps to Skip). The child roles are POSITIONAL, matching the
+    // grammar `keyword '(' condition [ ',' message ] ')' ';'`: the FIRST meaningful
+    // (Internal) child is the condition; a SECOND, when present, is the message
+    // string-literal expression.
+    if (k == NodeKind::Internal
+        && s.idx().staticAssertByRule.contains(tree.rule(node).v)) {
+        NodeId condNode{};
+        NodeId msgNode{};
+        for (NodeId c : visibleChildren(tree, node)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;   // skip kw / ( ) ; ,
+            if (!condNode.valid())      condNode = c;
+            else if (!msgNode.valid())  msgNode  = c;
+        }
+        // Decode the message (an adjacent-string-concat literal) via the SHARED
+        // chokepoint — the exact bytes the string appears as in source. Absent (the
+        // C23 1-arg form) or a malformed escape ⇒ no message text; the diagnostic
+        // still fires (an assertion with an unreadable message is still an
+        // assertion). The message is decoration only — never the pass/fail input.
+        std::string message;
+        if (msgNode.valid() && s.idx().stringLiteralBodyToken.valid()) {
+            if (auto decoded = decodeAdjacentStringBodies(
+                    tree, msgNode, s.idx().stringLiteralBodyToken)) {
+                message = std::move(*decoded);
+            }
+        }
+        std::optional<std::int64_t> folded;
+        if (condNode.valid()) folded = constIntExpr(s, tree, condNode, here, &cfg);
+        bool const failed = !folded.has_value() || *folded == 0;
+        if (failed) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_StaticAssertFailed;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(node);
+            // The message discriminates the two failure modes on ONE code: a
+            // FALSE assertion carries the author's string; a NON-CONSTANT
+            // condition says so (C requires an integer constant expression).
+            if (!folded.has_value()) {
+                d.actual = "static assertion condition is not an integer constant "
+                           "expression";
+                if (!message.empty())
+                    d.actual += ": \"" + message + "\"";
+            } else {
+                d.actual = message.empty()
+                               ? std::string{"static assertion failed"}
+                               : "static assertion failed: \"" + message + "\"";
+            }
+            s.reporter.report(std::move(d));
+        }
     }
 }
 

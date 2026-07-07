@@ -953,6 +953,73 @@ TEST(SemanticAnalyzerCSubset, MemberAccessSizeofResolvesArrayDimension) {
         << "dimension = sizeof(int) = 4 (member s.y resolved to int)";
 }
 
+// ── C11/C23 6.7.10 static_assert — the sizeof-folding requirement ────────────
+//
+// `_Static_assert(sizeof(int)==4, ...)` is the single most common idiom. The
+// condition is const-evaluated by the SAME `constIntExpr` evaluator that folds
+// `sizeof` in an array dimension — so it folds ONLY when analyze() is given the
+// target's aggregateLayout (nullopt ⇒ deliberate fail-loud, the direct-API
+// default). These pins pass AggregateLayoutParams, exactly like the array-dim
+// sizeof pins above, and prove the fold is REAL (a true sizeof passes; a false
+// sizeof fails loud — not a rubber-stamp).
+
+TEST(SemanticAnalyzerCSubset, StaticAssertSizeofConditionFoldsTrue) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(sizeof(int) == 4, \"int is 4\");\n"
+        "int main(void){ return 42; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "sizeof(int)==4 must FOLD true in the static_assert condition";
+}
+
+TEST(SemanticAnalyzerCSubset, StaticAssertSizeofConditionFoldsFalseFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(sizeof(int) == 99, \"int is not 99\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u)
+        << "sizeof(int)==99 must FOLD false — the assertion fails loud";
+}
+
+// sizeof-of-a-STRUCT in the condition folds (exercises the aggregateLayout path,
+// not just the scalar width). `struct S{int a; int b;}` = 8 bytes under natural
+// alignment → the assertion passes; the wrong size fails loud.
+TEST(SemanticAnalyzerCSubset, StaticAssertSizeofStructConditionFolds) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int a; int b; };\n"
+        "_Static_assert(sizeof(struct S) == 8, \"S is 8\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "sizeof(struct S)==8 must fold through the aggregateLayout engine";
+}
+
+// The C23 1-ARG form with a sizeof condition (message-less) still folds — pins
+// that the peel/parse of the 1-arg form does not disturb the sizeof fold.
+TEST(SemanticAnalyzerCSubset, StaticAssertSizeof1ArgFolds) {
+    auto cu = buildShippedUnit("c-subset", {
+        "static_assert(sizeof(int) == 4);\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
 // R1: the GENUINE forward-reference case (`int a[sizeof(b)]; int b;` — b used
 // before its declaration's type resolves) STAYS correct fail-loud (invalid C:
 // declare-before-use). This is NOT the closed member-access case — it pins the

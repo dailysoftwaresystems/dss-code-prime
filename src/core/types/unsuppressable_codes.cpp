@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 71> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 72> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -290,6 +290,15 @@ constexpr std::array<DiagnosticCode, 71> kUnsuppressableCodes{{
     // constraint violation would otherwise fail the build with zero diagnostics
     // shown (a confusing silent failure REASON), which the closed table forbids.
     DiagnosticCode::S_TypeNameDeclaratorNotAbstract,
+    // S_StaticAssertFailed (FC16, D-CSUBSET-STATIC-ASSERT, 2026-07-07): a
+    // `_Static_assert(cond[, "msg"]);` whose condition is non-constant or folds
+    // to zero. Same posture as S_TypeNameDeclaratorNotAbstract above —
+    // suppressing it ships NO wrong bytes (the analyzer's error still fails the
+    // build via `hasErrors()`), but a suppressed constraint violation would
+    // fail the build with ZERO diagnostics shown — a confusing silent failure
+    // REASON the closed table forbids. Closed here so a false static_assert is
+    // never silent.
+    DiagnosticCode::S_StaticAssertFailed,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

@@ -4288,3 +4288,145 @@ TEST(HirLoweringCSubset, SehLeaveFailsLoud) {
     EXPECT_FALSE(res->ok);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 1u);
 }
+
+// ── C11/C23 6.7.10 static_assert (D-CSUBSET-STATIC-ASSERT) ──────────────────
+//
+// The condition is const-evaluated at the SEMANTIC tier (the point that folds
+// sizeof / enum / arithmetic); a zero / non-constant fold fails loud with
+// S_StaticAssertFailed. A passing assertion produces NO HIR (lowers to nothing —
+// its hirLowering row maps to Skip) and the module is left with just its real
+// declarations.
+
+// Count the top-level Function decls in a lowered module — the witness that a
+// passing static_assert added nothing at module scope.
+[[nodiscard]] std::size_t moduleFunctionCount(Hir const& hir) {
+    std::size_t n = 0;
+    for (HirNodeId d : hir.moduleDecls(hir.root()))
+        if (hir.kind(d) == HirKind::Function) ++n;
+    return n;
+}
+
+// NOTE on sizeof: an array-dim / static_assert `sizeof` folds ONLY when
+// `analyze()` is given the target's aggregateLayout. The direct-API
+// `analyzeCSubset` helper here passes nullopt (the documented direct-API
+// default), so the sizeof-in-condition FOLDING pins live in
+// test_semantic_analyzer_c_subset.cpp (which passes AggregateLayoutParams) and
+// end-to-end in examples/c-subset/static_assert_true. The pins BELOW exercise
+// the parse / peel / 1-arg / spelling / block-scope / enum / non-const paths,
+// which need no layout.
+
+// POSITIVE — the canonical passing idiom: an arithmetic condition FOLDS true,
+// the assertion passes, and NOTHING is emitted for it.
+TEST(HirLoweringCSubset, StaticAssertArithmeticTrueCompilesToNothing) {
+    SemanticModel model = analyzeCSubset(
+        "_Static_assert(2 + 2 == 4, \"math works\");\n"
+        "int main(void){ return 42; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "2+2==4 must FOLD true in the static_assert condition";
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    // The assertion contributed no module node — only `main` survives.
+    EXPECT_EQ(moduleFunctionCount(res->hir), 1u);
+}
+
+// NEGATIVE — a false arithmetic condition fails loud.
+TEST(HirLoweringCSubset, StaticAssertArithmeticFalseFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "_Static_assert(1 == 2, \"one is not two\");\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u);
+}
+
+// C23 1-ARG PASSING — `_Static_assert(1);` (no message) compiles to nothing. The
+// critical peelToCore case: the 1-arg node has a SINGLE meaningful child, so a
+// naive peel would descend past it → H0009; the Skip-mapped rule stops the peel.
+TEST(HirLoweringCSubset, StaticAssert1ArgTrueCompilesToNothing) {
+    SemanticModel model = analyzeCSubset(
+        "_Static_assert(1);\n"
+        "int main(void){ return 42; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u);
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    // No H0009 (Ref-to-unbound / unsupported lowering) — the 1-arg form must NOT
+    // fall through the wrapper peel into its condition child.
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 0u);
+    EXPECT_EQ(moduleFunctionCount(res->hir), 1u);
+}
+
+// C23 1-ARG FAILING — `_Static_assert(0);` fails loud with S_StaticAssertFailed
+// (NOT H0009). Pins that the 1-arg form is reached by the semantic check.
+TEST(HirLoweringCSubset, StaticAssert1ArgFalseFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "_Static_assert(0);\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::P_NoAlternativeMatched), 0u)
+        << "the 1-arg form must PARSE (no parse fallthrough)";
+}
+
+// C23 `static_assert` SPELLING — behaves identically to `_Static_assert`.
+TEST(HirLoweringCSubset, StaticAssertC23SpellingTrue) {
+    SemanticModel model = analyzeCSubset(
+        "static_assert(1 + 1 == 2, \"addition works\");\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+TEST(HirLoweringCSubset, StaticAssertC23SpellingFalseFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "static_assert(0, \"nope\");\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u);
+}
+
+// BLOCK SCOPE — a static_assert is a valid statement-level declaration. Both a
+// passing and a failing one are checked at the same tier.
+TEST(HirLoweringCSubset, StaticAssertBlockScopeTrueCompilesToNothing) {
+    SemanticModel model = analyzeCSubset(
+        "int main(void){ _Static_assert(3 > 1, \"three beats one\"); return 42; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u);
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+TEST(HirLoweringCSubset, StaticAssertBlockScopeFalseFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int main(void){ _Static_assert(1 == 0, \"impossible\"); return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u);
+}
+
+// BLOCK SCOPE 1-ARG — the message-less form at statement scope (both the parse
+// and the peel must handle the single-child node here too).
+TEST(HirLoweringCSubset, StaticAssertBlockScope1ArgFalseFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int main(void){ static_assert(1 > 2); return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u);
+}
+
+// ENUM CONSTANT in the condition folds (same evaluator that folds enum constants
+// in an array dimension).
+TEST(HirLoweringCSubset, StaticAssertEnumConstantFolds) {
+    SemanticModel model = analyzeCSubset(
+        "enum { KVAL = 7 };\n"
+        "_Static_assert(KVAL == 7, \"kval is 7\");\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// NON-CONSTANT condition (a float — not an integer constant expression) fails
+// loud. C 6.7.10 requires an integer constant expression; a float condition
+// cannot fold in `constIntExpr` → S_StaticAssertFailed.
+TEST(HirLoweringCSubset, StaticAssertFloatConditionFailsAsNonConstant) {
+    SemanticModel model = analyzeCSubset(
+        "_Static_assert(3.5, \"float is not an ICE\");\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u);
+}
