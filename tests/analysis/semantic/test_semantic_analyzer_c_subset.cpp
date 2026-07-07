@@ -4572,6 +4572,147 @@ TEST(SemanticAnalyzerCSubset, MultiMemberDeclaresNothingStillLoud) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23 §6.7.2.1 ¶13): the members of
+// an anonymous struct/union member are PROMOTED into the enclosing composite's
+// member namespace. `struct S { union { int a; int b; }; } s; s.a` resolves `a`
+// as if a direct member. Pins: promotion resolves clean (no S0017), member
+// access types through the anon composite, a DIRECT-member collision fails
+// loud, and an AMBIGUOUS sibling-anon name fails loud.
+// ─────────────────────────────────────────────────────────────────────────
+
+// (a) The exact S0017 probe from the feature request now resolves clean: an
+// anonymous union member whose fields are read as direct members of S.
+TEST(SemanticAnalyzerCSubset, AnonUnionMemberPromotesAndResolves) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { union { int a; int b; }; };\n"
+        "int main() { struct S s; s.a = 42; return s.a; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "s.a / s.b promoted from the anonymous union must resolve clean";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeclarationDeclaresNothing), 0u)
+        << "an anonymous COMPOSITE member is not a declares-nothing form";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "s.a must resolve through the anonymous union, not be undeclared";
+    // The promoted field `a` carries an anonAncestorPath (reached via the anon
+    // union member) and types as I32.
+    SymbolRecord const* a = fieldSym(model, "a");
+    ASSERT_NE(a, nullptr);
+    EXPECT_FALSE(a->anonAncestorPath.empty())
+        << "a is reachable only through the anonymous union member";
+    ASSERT_TRUE(a->type.valid());
+    EXPECT_EQ(model.lattice().interner().kind(a->type), TypeKind::I32);
+}
+
+// (b) A NAMED direct member alongside an anonymous union: both resolve, and the
+// anon member itself is flagged isAnonymousMember.
+TEST(SemanticAnalyzerCSubset, AnonUnionMemberBesideNamedMember) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int tag; union { int i; int j; }; };\n"
+        "int main() { struct S s; s.tag = 1; s.i = 41; return s.j; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    // The synthetic anon field is present and flagged.
+    bool sawAnon = false;
+    for (std::size_t k = 1; k < model.symbols().size(); ++k)
+        if (model.symbols()[k].isAnonymousMember) sawAnon = true;
+    EXPECT_TRUE(sawAnon) << "the anon union member must be flagged isAnonymousMember";
+}
+
+// (c) A nested anonymous struct inside an anonymous union — two-level promotion.
+TEST(SemanticAnalyzerCSubset, NestedAnonMemberPromotes) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { union { struct { int x; int y; }; int packed; }; };\n"
+        "int main() { struct S s; s.x = 40; s.y = 2; return s.x + s.y; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "x/y promoted through anon-struct-in-anon-union must resolve clean";
+    SymbolRecord const* x = fieldSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    // Reached through TWO anonymous members (union then struct).
+    EXPECT_EQ(x->anonAncestorPath.size(), 2u)
+        << "x is two anonymous levels deep";
+}
+
+// (d) A promoted name colliding with a DIRECT member fails loud (C 6.7.2.1 ¶13).
+TEST(SemanticAnalyzerCSubset, AnonMemberCollisionWithDirectFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int x; union { int x; int y; }; };\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a promoted member `x` colliding with the direct member `x` must fail loud";
+}
+
+// (d2) The collision check must be scoped to the enclosing COMPOSITE's own
+// field members — NOT the parent scope chain. C 6.2.1 gives each struct/union a
+// SEPARATE member name space disjoint from ordinary identifiers, so a promoted
+// member sharing a name with an outer GLOBAL / TYPEDEF / function is LEGAL and
+// must NOT false-error. Regression guard for the parent-walk `lookup` bug.
+TEST(SemanticAnalyzerCSubset, AnonMemberNameMayShadowOuterIdentifier) {
+    auto globalModel = analyzeShipped("c-subset", {
+        "int a;\n"
+        "struct S { struct { int a; int b; }; };\n"
+        "int main() { struct S s; s.a = 40; s.b = 2; return s.a + s.b; }\n",
+    });
+    EXPECT_FALSE(globalModel.hasErrors())
+        << "a promoted member `a` sharing a name with a global `a` is legal (C 6.2.1)";
+    EXPECT_EQ(countCode(globalModel.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "no false S_RedeclaredSymbol against an enclosing-scope identifier";
+    // A typedef in the enclosing scope must likewise not false-collide.
+    auto typedefModel = analyzeShipped("c-subset", {
+        "typedef int a;\n"
+        "struct S { struct { int a; int b; }; };\n"
+        "int main() { struct S s; s.a = 1; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(typedefModel.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "no false S_RedeclaredSymbol against an enclosing typedef";
+}
+
+// (e) An AMBIGUOUS name shared by two sibling anonymous members fails loud on
+// ACCESS (the promotion itself is fine — the ambiguity is a use-site error).
+TEST(SemanticAnalyzerCSubset, AnonMemberAmbiguousSiblingFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { union { int a; }; union { int a; }; };\n"
+        "int main() { struct S s; return s.a; }\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "s.a matching two sibling anonymous unions is ambiguous — fail loud";
+}
+
+// (f) A BIT-FIELD inside an anonymous composite must NOT trigger a false
+// S_BitFieldNonIntegerType. Regression guard: the Pass-1.5 anon-composite arm
+// must NOT run resolveBitfieldSuffix on the composite field node (its bounded
+// descendant search would find the INNER `: W` suffix and validate that width
+// against the composite HEAD type — a non-integer — falsely). The inner
+// bit-field is resolved by the anon composite's own visit; promotion resolves
+// its members clean.
+TEST(SemanticAnalyzerCSubset, AnonUnionWithInnerBitfieldNoFalseError) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { union { int a : 4; int b; }; };\n"
+        "int main() { struct S s; s.b = 42; return s.a; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a bit-field inside an anonymous union must not false-error";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_BitFieldNonIntegerType), 0u)
+        << "no false S_BitFieldNonIntegerType from the anon-composite arm";
+    // Both members promote and resolve; the bit-field width is recorded on `a`.
+    SymbolRecord const* a = fieldSym(model, "a");
+    ASSERT_NE(a, nullptr);
+    EXPECT_FALSE(a->anonAncestorPath.empty());
+    ASSERT_TRUE(a->bitFieldWidth.has_value())
+        << "the inner bit-field width is still resolved by the union's own visit";
+    EXPECT_EQ(*a->bitFieldWidth, 4u);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: dual-mode binder pins.
 //
 // ONE grammar rule (`structSpec`/`unionSpec`/`enumSpec`) is BOTH a type

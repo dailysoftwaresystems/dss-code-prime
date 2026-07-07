@@ -120,6 +120,21 @@ struct DSS_EXPORT SymbolRecord {
     // SymbolRecord precedent for kind-specific fields (`isConst`,
     // `warnIfUnused`, `variadicBuiltin`).
     std::uint32_t   fieldIndex = 0;
+    // FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23 §6.7.2.1 ¶13): true iff this
+    // is a synthetic anonymous-member field symbol (`<anon:…>`) WHOSE resolved
+    // type is a Struct/Union — i.e. a genuine anonymous struct/union whose
+    // members are PROMOTED into the enclosing composite's member namespace (NOT
+    // a bare `int : 3;` bit-field or a rejected `int ;`). Set at Pass 1.5 once
+    // the head type resolves. Member-access resolution recurses through such
+    // members' own field scopes; HIR lowering synthesizes one intermediate
+    // MemberAccess hop per promotion level. Harmless false for every other symbol.
+    bool            isAnonymousMember = false;
+    // FC16 D-CSUBSET-ANON-MEMBER-PROMOTION: for a field reachable ONLY through
+    // one or more anonymous-member promotions, the ordered chain of anonymous-
+    // member SymbolIds (outermost→innermost) that must be traversed to reach it.
+    // EMPTY for every direct field (zero overhead). HIR lowering emits one
+    // synthetic MemberAccess per entry before the final field access.
+    std::vector<SymbolId> anonAncestorPath;
     // D5.1: the inner scope holding this symbol's fields, set by Pass 1 on a
     // Type-kind symbol minted from a declaration with `fieldChildren`. Pass 2's
     // member-access resolution reads this to look up `field` in `obj.field`:

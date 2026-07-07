@@ -3490,6 +3490,34 @@ struct Lowerer {
                                                  HirFlags::Synthetic), node);
                 containerType = pointeeType;
             }
+            // FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23 §6.7.2.1 ¶13): a
+            // field reachable ONLY through one or more ANONYMOUS struct/union
+            // members carries an `anonAncestorPath` (outermost→innermost) that
+            // Pass 1.5 recorded. Synthesize ONE intermediate MemberAccess hop
+            // per ancestor BEFORE the final field access — exactly the HIR a
+            // hand-written `s.anon.field` chain lowers to (each hop selects the
+            // anon composite member of its container, then the final access
+            // selects `field` within the innermost anon composite). We thread
+            // `object` + `containerType` forward so the arrow's Deref and any
+            // container-volatility propagate through the chain unchanged.
+            if (!frec->anonAncestorPath.empty()) {
+                for (SymbolId ancestorSym : frec->anonAncestorPath) {
+                    auto const* arec = model.recordFor(ancestorSym);
+                    if (arec == nullptr) {
+                        return exprError(node, "anonymous-member ancestor "
+                                               "SymbolId has no record");
+                    }
+                    TypeId const hopType =
+                        volatileQualifiedAccess(arec->type, containerType);
+                    object = track(builder.makeMemberAccess(
+                                       object, arec->fieldIndex, hopType,
+                                       HirFlags::Synthetic),
+                                   node);
+                    // The next hop's (and the final field's) immediate container
+                    // is this anon composite.
+                    containerType = hopType;
+                }
+            }
             // c27 (D-CSUBSET-VOLATILE-POINTEE): if the CONTAINER is volatile, the
             // member's TYPE is volatile-qualified (C 6.5.2.3) — this is what flags
             // the access at the MIR site AND propagates through nested chains (see

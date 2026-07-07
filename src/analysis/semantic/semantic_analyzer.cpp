@@ -541,6 +541,7 @@ struct MemberResolution {
         NotAComposite,    // effective type has no struct scope
         BadNameNode,      // nameChild did not resolve to an identifier leaf
         UndeclaredField,  // field name not found in the struct scope
+        AmbiguousField,   // FC16: name matches ≥2 sibling anonymous members (C 6.7.2.1 ¶13) — fail loud
         Ok,               // field binding found (fieldType may still be invalid if the field's own type is unresolved)
     };
     Status      status        = Status::NotMemberAccess;
@@ -1726,6 +1727,91 @@ resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& d
     }
     out.width = static_cast<std::uint32_t>(*w);
     return out;
+}
+
+// FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23 §6.7.2.1 ¶13): recursively
+// PROMOTE the members of an anonymous struct/union member into the enclosing
+// composite's member namespace. `anonSym` is the synthetic `<anon:…>` field
+// symbol whose resolved type `anonTy` is a Struct/Union; `path` is the ordered
+// chain of anonymous-member SymbolIds (outermost→innermost) already traversed
+// to reach it; `enclosingScope` is the FIELD SCOPE of the OUTERMOST enclosing
+// composite (where the direct members were bound in Pass 1 and where a
+// promoted name must not collide). For each NAMED member of the anon composite
+// we record its `anonAncestorPath` (so member-access lookup + HIR lowering can
+// synthesize the intermediate hops); a named member that collides with a
+// DIRECT member of the enclosing composite fails loud (S_RedeclaredSymbol). A
+// nested anonymous member recurses (its own synthetic name is NOT promoted).
+//
+// Iteration order is DETERMINISTIC (by `fieldIndex`) — `bindingsOf` order is
+// unspecified, and a stable order keeps a sibling-collision diagnostic and the
+// recorded paths reproducible. Only the Ordinary namespace is promoted (a
+// nested tag stays in its own namespace).
+void promoteAnonMembers(EngineState& s, Tree const& tree, SymbolId anonSym,
+                        TypeId anonTy, std::vector<SymbolId> path,
+                        ScopeId enclosingScope) {
+    path.push_back(anonSym);
+    auto const scopeIt = s.compositeScopeByType.find(anonTy.v);
+    if (scopeIt == s.compositeScopeByType.end()) return;   // unresolved anon body
+    ScopeId const anonScope = scopeIt->second;
+    // Snapshot + sort the Ordinary bindings by declaration-order fieldIndex.
+    std::vector<SymbolId> ordered;
+    for (auto const& [name, ns, fsym] : s.scopes.bindingsOf(anonScope)) {
+        (void)name;
+        if (ns != SymbolNamespace::Ordinary) continue;
+        if (fsym.valid()) ordered.push_back(fsym);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [&](SymbolId a, SymbolId b) {
+                  return s.symbols.at(a).fieldIndex < s.symbols.at(b).fieldIndex;
+              });
+    for (SymbolId fsym : ordered) {
+        SymbolRecord& frec = s.symbols.at(fsym);
+        if (frec.isAnonymousMember) {
+            // A NESTED anonymous member — recurse to promote ITS members. The
+            // synthetic anon name itself is never promoted into the enclosing
+            // scope (it carries no user-visible name).
+            promoteAnonMembers(s, tree, fsym, frec.type, path, enclosingScope);
+            continue;
+        }
+        // A named member: it becomes visible as a member of the enclosing
+        // composite. Collision-check ONLY against a DIRECT member of the
+        // enclosing composite's OWN field scope — NOT `scopes.lookup`, which
+        // walks the parent chain and would falsely flag a member that legally
+        // shares a name with an ordinary identifier in an enclosing lexical
+        // scope (a global/typedef/function — C 6.2.1 gives each struct/union a
+        // SEPARATE member name space disjoint from ordinary identifiers). We
+        // read the field scope's `bindings` (the Ordinary namespace) directly,
+        // exactly as `resolveMemberAccess`'s direct-member lookup does. Fail
+        // loud only on a genuine same-composite duplicate.
+        std::string const memberName{s.symbols.at(fsym).name};
+        SymbolId direct{};
+        if (enclosingScope.valid()
+            && enclosingScope.v < s.scopes.scopes().size()) {
+            auto const& encBindings =
+                s.scopes.scopes()[enclosingScope.v].bindings;
+            auto const encIt = encBindings.find(memberName);
+            if (encIt != encBindings.end()) direct = encIt->second;
+        }
+        if (direct.valid()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_RedeclaredSymbol;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(s.symbols.at(fsym).declNode);
+            d.actual   = memberName;
+            auto const& dirRec = s.symbols.at(direct);
+            if (dirRec.declNode.valid() && dirRec.tree.v == tree.id().v) {
+                d.related.push_back(RelatedLocation{
+                    tree.source().id(),
+                    tree.span(dirRec.declNode),
+                    "conflicts with this direct member",
+                });
+            }
+            s.reporter.report(std::move(d));
+            continue;   // do not record a path for the colliding name
+        }
+        frec.anonAncestorPath = path;
+    }
 }
 
 // ── FC4 c1: the declarator-inversion engine (M3) ────────────────────────────
@@ -3330,34 +3416,65 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                     }
                     // c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR (anonymous fields):
                     // an ANONYMOUS field bound no named symbol — resolve its
-                    // anonymous symbol (Pass 1 minted it on `node`). Mirrors the
-                    // legacy positional anonymous-field Pass 1.5 (`fieldHasName=
-                    // false`): stamp the head as its type, resolve a `: W`
-                    // bit-field width, and — since an anonymous member is legal
-                    // ONLY as a bit-field (C 6.7.2.1) — fail loud with
-                    // S_DeclarationDeclaresNothing on `node` for an anonymous
-                    // NON-bit-field (`int ;` / `int *;`). Gated on
-                    // `bitfieldSuffix` so it fires only for a field form.
-                    if (!resolvedNamed && decl.anonymousNameAllowed
-                        && decl.bitfieldSuffix.has_value()) {
+                    // anonymous symbol (Pass 1 minted it on `node`). Stamp the
+                    // head as its type, then a THREE-way decision on the head:
+                    //   (1) a `: W` bit-field (`int : 5;`) — the c10 packing-slot
+                    //       behavior, byte-identical.
+                    //   (2) FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23
+                    //       §6.7.2.1 ¶13): a non-bit-field whose head is an
+                    //       anonymous Struct/Union — its members are PROMOTED
+                    //       into the enclosing composite's member namespace
+                    //       (`promoteAnonMembers`).
+                    //   (3) else — an anonymous NON-bit-field of a scalar type
+                    //       (`int ;` / `int *;`) declares nothing; fail loud with
+                    //       S_DeclarationDeclaresNothing on `node` (C 6.7.2.1).
+                    // The outer gate is `anonymousNameAllowed` (a field form);
+                    // `resolveBitfieldSuffix` is safe for a non-bit-field field
+                    // (returns `present=false`), and an anon composite member
+                    // carries no bit-field suffix so it falls to arm (2)/(3).
+                    if (!resolvedNamed && decl.anonymousNameAllowed) {
                         SymbolId const sym = s.symbolAtOr(node);
                         if (sym.valid() && headTy.valid()) {
                             s.symbols.at(sym).type = headTy;
                             s.nodeToType.set(node, headTy);
                         }
-                        BitfieldResolution const bf = resolveBitfieldSuffix(
-                            s, tree, decl, node, headTy, /*hasName=*/false, here,
-                            &cfg);
-                        if (sym.valid() && bf.width.has_value())
-                            s.symbols.at(sym).bitFieldWidth = bf.width;
-                        if (!bf.present) {
-                            ParseDiagnostic d;
-                            d.code     = DiagnosticCode::S_DeclarationDeclaresNothing;
-                            d.severity = DiagnosticSeverity::Error;
-                            d.buffer   = tree.source().id();
-                            d.span     = tree.span(node);
-                            d.actual   = std::string{tree.text(node)};
-                            s.reporter.report(std::move(d));
+                        bool const anonComposite =
+                            headTy.valid()
+                            && (s.lattice.interner().kind(headTy)
+                                    == TypeKind::Struct
+                                || s.lattice.interner().kind(headTy)
+                                       == TypeKind::Union);
+                        if (sym.valid() && anonComposite) {
+                            // (2) anonymous struct/union — promote its members.
+                            // An anon COMPOSITE field is never itself a bit-field,
+                            // so we DELIBERATELY do NOT call resolveBitfieldSuffix
+                            // here: its bounded descendant search from `node`
+                            // would find an INNER member's `: W` suffix (`union {
+                            // int a : 4; };`) and mis-validate that width against
+                            // the composite head type (a false
+                            // S_BitFieldNonIntegerType). Each inner bit-field is
+                            // resolved by the anon composite's OWN Pass-1.5 visit.
+                            s.symbols.at(sym).isAnonymousMember = true;
+                            promoteAnonMembers(s, tree, sym, headTy, {},
+                                               s.symbols.at(sym).scope);
+                        } else {
+                            BitfieldResolution const bf = resolveBitfieldSuffix(
+                                s, tree, decl, node, headTy, /*hasName=*/false,
+                                here, &cfg);
+                            if (bf.present) {
+                                // (1) anonymous bit-field packing slot.
+                                if (sym.valid() && bf.width.has_value())
+                                    s.symbols.at(sym).bitFieldWidth = bf.width;
+                            } else {
+                                // (3) declares nothing — loud.
+                                ParseDiagnostic d;
+                                d.code     = DiagnosticCode::S_DeclarationDeclaresNothing;
+                                d.severity = DiagnosticSeverity::Error;
+                                d.buffer   = tree.source().id();
+                                d.span     = tree.span(node);
+                                d.actual   = std::string{tree.text(node)};
+                                s.reporter.report(std::move(d));
+                            }
                         }
                     }
                 }
@@ -4496,6 +4613,19 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 case St::UndeclaredField: {
                     ParseDiagnostic d;
                     d.code     = DiagnosticCode::S_UndeclaredIdentifier;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(mr.nameNode);
+                    d.actual   = mr.fieldName;
+                    s.reporter.report(std::move(d));
+                    break;
+                }
+                case St::AmbiguousField: {
+                    // FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C 6.7.2.1 ¶13): the
+                    // member name is promoted from ≥2 sibling anonymous members
+                    // — ambiguous, fail loud rather than silently picking one.
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_RedeclaredSymbol;
                     d.severity = DiagnosticSeverity::Error;
                     d.buffer   = tree.source().id();
                     d.span     = tree.span(mr.nameNode);
@@ -6002,6 +6132,56 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     return result;
 }
 
+// FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23 §6.7.2.1 ¶13): search the
+// ANONYMOUS members of the field scope `fieldScope` for a member spelled
+// `name`, recursing through nested anonymous members. A direct member of
+// `fieldScope` is NOT searched here (the caller already tried the direct
+// lookup); only names reachable THROUGH an anonymous struct/union member are.
+// Returns the SINGLE matching promoted field symbol (whose `anonAncestorPath`
+// Pass 1.5 recorded). If the name matches ≥2 distinct fields across sibling
+// anonymous members (`struct { union{int x;}; union{int x;}; }`), `ambiguous`
+// is set and no symbol is returned (the caller fails loud, C forbids it). NO
+// side effects — read-only over the frozen Pass-1.5 symbol/scope state.
+[[nodiscard]] std::optional<SymbolId>
+findPromotedField(EngineState const& s, ScopeId fieldScope,
+                  std::string_view name, bool& ambiguous) {
+    ambiguous = false;
+    std::optional<SymbolId> found;
+    // Recursive walk implemented iteratively over a worklist of scopes to
+    // search; each anonymous member contributes its own composite scope. We
+    // collect ALL matches (across sibling anon members) so an ambiguous name is
+    // detected rather than silently resolving to the first sibling.
+    std::vector<ScopeId> worklist{fieldScope};
+    for (std::size_t wi = 0; wi < worklist.size(); ++wi) {
+        ScopeId const cur = worklist[wi];
+        for (auto const& [bindName, ns, fsym] : s.scopes.bindingsOf(cur)) {
+            (void)bindName;
+            if (ns != SymbolNamespace::Ordinary) continue;
+            if (!fsym.valid()) continue;
+            if (!s.symbols.at(fsym).isAnonymousMember) continue;
+            TypeId const anonTy = s.symbols.at(fsym).type;
+            auto const anonScopeIt = s.compositeScopeByType.find(anonTy.v);
+            if (anonScopeIt == s.compositeScopeByType.end()) continue;
+            ScopeId const anonScope = anonScopeIt->second;
+            // Direct hit inside THIS anonymous member's scope?
+            for (auto const& [mName, mNs, mSym] : s.scopes.bindingsOf(anonScope)) {
+                if (mNs != SymbolNamespace::Ordinary) continue;
+                if (!mSym.valid()) continue;
+                if (s.symbols.at(mSym).isAnonymousMember) continue;   // a nested anon name — not a member spelling
+                if (mName != name) continue;
+                if (found.has_value() && found->v != mSym.v) {
+                    ambiguous = true;
+                    return std::nullopt;
+                }
+                found = mSym;
+            }
+            // Recurse into THIS anonymous member (nested anon).
+            worklist.push_back(anonScope);
+        }
+    }
+    return found;
+}
+
 // R1: shared member-access resolver (declared after subtreeType's forward decl).
 // Walks `obj.field` / `ptr->field` → the field's declared type, reporting the
 // outcome. NO side effects (no diagnostics, no symbol binding) — the Pass-2 arm
@@ -6098,7 +6278,24 @@ resolveMemberAccess(EngineState const& s, SemanticConfig const& cfg,
     auto const& sc = s.scopes.scopes()[fieldScope.v];
     auto bindIt = sc.bindings.find(fnRes.name);
     if (bindIt == sc.bindings.end()) {
-        out.status = MemberResolution::Status::UndeclaredField; return out;
+        // FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23 §6.7.2.1 ¶13): a direct
+        // member miss — recursively search the composite's ANONYMOUS members.
+        // `struct S { union { int a; }; } s; s.a` resolves `a` through the anon
+        // union member (its `anonAncestorPath` was recorded at Pass 1.5). An
+        // AMBIGUOUS name (matching two sibling anon members) fails loud.
+        bool ambiguous = false;
+        auto const promoted =
+            findPromotedField(s, fieldScope, fnRes.name, ambiguous);
+        if (ambiguous) {
+            out.status = MemberResolution::Status::AmbiguousField; return out;
+        }
+        if (!promoted.has_value()) {
+            out.status = MemberResolution::Status::UndeclaredField; return out;
+        }
+        out.fieldSym  = *promoted;
+        out.fieldType = s.symbols.at(out.fieldSym).type;
+        out.status    = MemberResolution::Status::Ok;
+        return out;
     }
     out.fieldSym  = bindIt->second;
     out.fieldType = s.symbols.at(out.fieldSym).type;   // may be invalid ⇒ still Ok (binding found)
