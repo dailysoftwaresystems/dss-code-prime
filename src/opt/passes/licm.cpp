@@ -8,6 +8,8 @@
 #include "opt/analysis/mir_memory_clobbers.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -82,9 +84,12 @@ public:
     // index (D-OPT-MEMORYSSA-CLOBBER-WALK) — the Load hoist-admission gate
     // queries it instead of re-scanning every loop-body instruction per
     // candidate per fixed-point iteration.
+    // `domScratch` = the pass-wide reusable dominator scratch
+    // (D-OPT-DOMTREE-SCRATCH-REUSE) — byte-identical dom trees without the
+    // per-function whole-module allocation storm.
     void analyze(MirFuncId fn, DiagnosticReporter& reporter,
                  std::vector<std::vector<MirBlockId>> const& preds,
-                 MirMemoryClobbers const& clobbers);
+                 MirMemoryClobbers const& clobbers, MirDomScratch& domScratch);
 
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
@@ -182,20 +187,43 @@ private:
     std::unordered_map<MirBlockId, std::vector<MirInstId>> hoistPlan_;    // preheader-side: emit-list, in body scan order
 
     std::size_t instructionsHoisted_ = 0;
+
+public:
+    // Env-gated DSS_OPT_TRACE sub-timing accumulators (read by runLicm's
+    // one-line-per-pass-call trace; zero-cost when the trace is off).
+    std::uint64_t traceDomNs   = 0;
+    std::uint64_t traceLoopsNs = 0;
 };
 
 void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter,
                          std::vector<std::vector<MirBlockId>> const& preds,
-                         MirMemoryClobbers const& clobbers) {
+                         MirMemoryClobbers const& clobbers,
+                         MirDomScratch& domScratch) {
     resetPerFunction();
     MirBlockId const entry = src_.funcEntry(fn);
     auto const rpo = mirReversePostOrder(src_, entry);
     if (rpo.empty()) return;
 
     // `preds` is the caller's precomputed whole-module predecessor map
-    // (invariant this pass) — no per-function rebuild here anymore.
-    auto const dom   = computeMirDomTree(src_, entry, rpo, preds);
+    // (invariant this pass); the scratch-backed dom is byte-identical to the
+    // fresh path and valid until the NEXT analyze() call (function-local use
+    // only — const& binding, per the D-OPT-DOMTREE-SCRATCH-REUSE contract).
+    static bool const trace = std::getenv("DSS_OPT_TRACE") != nullptr;
+    auto const tDom0 = trace ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
+    auto const& dom = computeMirDomTree(src_, entry, rpo, preds, domScratch);
+    auto const tDom1 = trace ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
     auto const loops = mirNaturalLoops(src_, dom, preds);
+    if (trace) {
+        auto const tLoops1 = std::chrono::steady_clock::now();
+        traceDomNs += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(tDom1 - tDom0)
+                .count());
+        traceLoopsNs += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(tLoops1 - tDom1)
+                .count());
+    }
     if (loops.empty()) return;
 
     // For each loop: locate the unique non-back-edge predecessor of
@@ -369,13 +397,48 @@ LicmResult runLicm(Mir& mir, TypeInterner const& interner,
     // per-function whole-module preds rebuild (the CSE-audited argument-identity
     // hoist) + the per-candidate-per-iteration loop-body instruction scans
     // (D-OPT-MEMORYSSA-CLOBBER-WALK).
+    static bool const trace = std::getenv("DSS_OPT_TRACE") != nullptr;
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto const tSetup = now();
     auto const preds = mirBuildPredecessors(mir);
     MirMemoryClobbers const clobbers{mir, preds};
+    MirDomScratch domScratch;   // one per pass call (D-OPT-DOMTREE-SCRATCH-REUSE)
+    long long const setupMs = trace
+        ? std::chrono::duration_cast<std::chrono::milliseconds>(now() - tSetup)
+              .count()
+        : 0;
+    std::uint64_t analyzeNs = 0, rebuildNs = 0;
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
-        policy.analyze(f, reporter, preds, clobbers);
-        MirFunctionRebuilder rb{mir, builder, policy};
-        rb.rebuildFunction(f);
+        auto const tA = trace ? now() : std::chrono::steady_clock::time_point{};
+        policy.analyze(f, reporter, preds, clobbers, domScratch);
+        if (trace) {
+            auto const tR = now();
+            analyzeNs += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(tR - tA)
+                    .count());
+            MirFunctionRebuilder rb{mir, builder, policy};
+            rb.rebuildFunction(f);
+            rebuildNs += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now() - tR)
+                    .count());
+        } else {
+            MirFunctionRebuilder rb{mir, builder, policy};
+            rb.rebuildFunction(f);
+        }
+    }
+    if (trace) {
+        std::uint64_t const domLoops = policy.traceDomNs + policy.traceLoopsNs;
+        std::fprintf(stderr,
+            "opt:   Licm sub: preds+index=%lldms analyze=%llums (dom=%llums "
+            "loops=%llums hoist=%llums) rebuild=%llums\n",
+            setupMs,
+            static_cast<unsigned long long>(analyzeNs / 1000000u),
+            static_cast<unsigned long long>(policy.traceDomNs / 1000000u),
+            static_cast<unsigned long long>(policy.traceLoopsNs / 1000000u),
+            static_cast<unsigned long long>(
+                (analyzeNs - std::min(analyzeNs, domLoops)) / 1000000u),
+            static_cast<unsigned long long>(rebuildNs / 1000000u));
     }
 
     result.instructionsHoisted = policy.instructionsHoisted();

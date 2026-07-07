@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <random>
 
 using namespace dss;
 
@@ -220,4 +221,228 @@ TEST(MirDom, SingleBlockTrivialDominance) {
 
     EXPECT_EQ(mirDominatesBlock(entry, entry, dom), MirDomResult::Dominates);
     EXPECT_TRUE(df[entry.v].empty());
+}
+
+// ─── D-OPT-DOMTREE-SCRATCH-REUSE — the scratch-vs-fresh differential pins ───
+//
+// The scratch overloads MUST produce byte-identical results to the fresh-
+// allocation path on every call of any call sequence. The comparisons below
+// deliberately compare `v` AND `arenaTag` explicitly — MirBlockId::operator==
+// compares `v` only, so an equality-based check would PASS a broken reset
+// that leaves a stale-tagged zero behind. Full module-sized arrays are
+// compared after EVERY call (the bleed class: one call's leftovers surviving
+// into the next call's untouched slots).
+
+namespace {
+
+void expectDomTreesIdenticalFull(MirDomTree const& fresh,
+                                 MirDomTree const& scratch,
+                                 char const* what) {
+    ASSERT_EQ(fresh.idom.size(), scratch.idom.size()) << what;
+    ASSERT_EQ(fresh.gaveUp.size(), scratch.gaveUp.size()) << what;
+    for (std::size_t i = 0; i < fresh.idom.size(); ++i) {
+        EXPECT_EQ(fresh.idom[i].v, scratch.idom[i].v)
+            << what << ": idom slot " << i << " v mismatch";
+        EXPECT_EQ(fresh.idom[i].arenaTag, scratch.idom[i].arenaTag)
+            << what << ": idom slot " << i << " arenaTag mismatch (a reset "
+               "writing a stale-tagged zero passes operator== — this pin "
+               "compares the tag explicitly)";
+    }
+    for (std::size_t i = 0; i < fresh.gaveUp.size(); ++i) {
+        EXPECT_EQ(static_cast<int>(fresh.gaveUp[i]),
+                  static_cast<int>(scratch.gaveUp[i]))
+            << what << ": gaveUp slot " << i;
+    }
+}
+
+void expectChildrenIdenticalFull(
+    std::vector<std::vector<MirBlockId>> const& fresh,
+    std::vector<std::vector<MirBlockId>> const& scratch,
+    char const* what) {
+    ASSERT_EQ(fresh.size(), scratch.size()) << what;
+    for (std::size_t i = 0; i < fresh.size(); ++i) {
+        ASSERT_EQ(fresh[i].size(), scratch[i].size())
+            << what << ": children[" << i << "] size";
+        for (std::size_t j = 0; j < fresh[i].size(); ++j) {
+            EXPECT_EQ(fresh[i][j].v, scratch[i][j].v)
+                << what << ": children[" << i << "][" << j << "] v (inner "
+                   "ORDER is load-bearing — the CSE dom-DFS depends on it)";
+            EXPECT_EQ(fresh[i][j].arenaTag, scratch[i][j].arenaTag)
+                << what << ": children[" << i << "][" << j << "] arenaTag";
+        }
+    }
+}
+
+// Run the full fresh-vs-scratch comparison for one function against a shared
+// scratch (called in sequence to exercise the reset between calls).
+void compareFreshVsScratch(Mir const& mir, MirFuncId f,
+                           std::vector<std::vector<MirBlockId>> const& preds,
+                           MirDomScratch& scratch, char const* what) {
+    MirBlockId const entry = mir.funcEntry(f);
+    auto const rpo = mirReversePostOrder(mir, entry);
+    auto const freshDom = computeMirDomTree(mir, entry, rpo, preds);
+    auto const freshChildren = mirDomTreeChildren(mir, freshDom);
+    auto const& scratchDom =
+        computeMirDomTree(mir, entry, rpo, preds, scratch);
+    auto const& scratchChildren = mirDomTreeChildren(mir, scratchDom, scratch);
+    expectDomTreesIdenticalFull(freshDom, scratchDom, what);
+    expectChildrenIdenticalFull(freshChildren, scratchChildren, what);
+}
+
+} // namespace
+
+// The adversarial multi-function sequence: big → small → big (stale-slot
+// bleed), a function with an UNREACHABLE block that branches INTO a reachable
+// one (the preds-outside-order read in the CHK core), the same function twice
+// with one scratch (reset idempotence), then big again. Full-array
+// comparisons after every call.
+TEST(MirDomScratch, AdversarialSequenceMatchesFreshOnEveryCall) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    // fn0 — "big": a 3-level diamond cascade (10 blocks).
+    mb.addFunction(fnSig, SymbolId{100});
+    {
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId prev = entry;
+        MirInstId cond{};
+        for (int lvl = 0; lvl < 3; ++lvl) {
+            MirBlockId const t = mb.createBlock(StructCfMarker::Linear);
+            MirBlockId const e = mb.createBlock(StructCfMarker::Linear);
+            MirBlockId const j = mb.createBlock(StructCfMarker::Linear);
+            mb.beginBlock(prev);
+            if (lvl == 0) cond = mb.addArg(0, boolT);
+            mb.addCondBr(cond, t, e);
+            mb.beginBlock(t);
+            mb.addBr(j);
+            mb.beginBlock(e);
+            mb.addBr(j);
+            prev = j;
+        }
+        mb.beginBlock(prev);
+        MirLiteralValue v; v.value = std::int64_t{0}; v.core = TypeKind::I32;
+        mb.addReturn(mb.addConst(v, i32));
+    }
+    // fn1 — "small": entry → ret (1 block).
+    mb.addFunction(fnSig, SymbolId{101});
+    {
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(entry);
+        MirLiteralValue v; v.value = std::int64_t{1}; v.core = TypeKind::I32;
+        mb.addReturn(mb.addConst(v, i32));
+    }
+    // fn2 — an UNREACHABLE block branching INTO the reachable join: the CHK
+    // core reads preds[join] = {entry, dead} and must skip `dead` via the
+    // rpoIndex gate — on the SECOND+ scratch call this exercises the reset
+    // (a stale rpoIndex entry for `dead` from a prior call would flip it).
+    mb.addFunction(fnSig, SymbolId{102});
+    {
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const dead  = mb.createBlock(StructCfMarker::Linear);
+        MirBlockId const join  = mb.createBlock(StructCfMarker::Linear);
+        mb.beginBlock(entry);
+        mb.addBr(join);
+        mb.beginBlock(dead);   // never branched to — unreachable
+        mb.addBr(join);
+        mb.beginBlock(join);
+        MirLiteralValue v; v.value = std::int64_t{2}; v.core = TypeKind::I32;
+        mb.addReturn(mb.addConst(v, i32));
+    }
+    Mir mir = std::move(mb).finish();
+    auto const preds = mirBuildPredecessors(mir);
+
+    MirDomScratch scratch;
+    MirFuncId const f0 = mir.funcAt(0);
+    MirFuncId const f1 = mir.funcAt(1);
+    MirFuncId const f2 = mir.funcAt(2);
+    compareFreshVsScratch(mir, f0, preds, scratch, "call1 big");
+    compareFreshVsScratch(mir, f1, preds, scratch, "call2 small-after-big");
+    compareFreshVsScratch(mir, f2, preds, scratch,
+                          "call3 unreachable-into-reachable");
+    compareFreshVsScratch(mir, f2, preds, scratch, "call4 same-fn-twice");
+    compareFreshVsScratch(mir, f0, preds, scratch, "call5 big-again");
+    compareFreshVsScratch(mir, f1, preds, scratch, "call6 small-last");
+}
+
+// The F2 bound: a synthetic out-of-range entry slot must neither write nor
+// record out of bounds — and must produce the same all-default tree the
+// fresh path returns for it (the core's own early-return tolerance).
+TEST(MirDomScratch, OutOfRangeEntrySlotIsBoundedAndIdentical) {
+    TypeInterner interner{CompilationUnitId{1}};
+    auto d = buildDiamond(interner);
+    auto const preds = mirBuildPredecessors(d.mir);
+
+    // A fabricated entry far past blockCount, with an empty order (an RPO
+    // from a nonsense entry is empty).
+    MirBlockId const bogus{
+        static_cast<std::uint32_t>(d.mir.blockCount()) + 41u, d.mir.id().v};
+    std::vector<MirBlockId> const emptyOrder;
+    auto const fresh = computeMirDomTree(d.mir, bogus, emptyOrder, preds);
+
+    MirDomScratch scratch;
+    auto const& viaScratch =
+        computeMirDomTree(d.mir, bogus, emptyOrder, preds, scratch);
+    expectDomTreesIdenticalFull(fresh, viaScratch, "oob entry");
+
+    // And the scratch must still be healthy for a real call afterwards.
+    compareFreshVsScratch(d.mir, d.mir.funcAt(0), preds, scratch,
+                          "real call after oob entry");
+}
+
+// Seeded randomized-CFG sweep (mirrors test_mir_memory_clobbers.cpp's):
+// 25 modules × every function in sequence through ONE scratch per module,
+// full-array dom + children comparison after every call. Deterministic.
+TEST(MirDomScratch, RandomizedCfgSweepMatchesFresh) {
+    std::mt19937 rng{0xD0357EEDu};
+    for (std::uint32_t moduleIdx = 0; moduleIdx < 25; ++moduleIdx) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeId const i32   = interner.primitive(TypeKind::I32);
+        TypeId const boolT = interner.primitive(TypeKind::Bool);
+        TypeId const params[] = {boolT};
+        TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+        MirBuilder mb;
+        std::uint32_t const nfn = 2u + rng() % 3u;   // 2..4 functions
+        for (std::uint32_t fi = 0; fi < nfn; ++fi) {
+            mb.addFunction(fnSig, SymbolId{100u + fi});
+            std::uint32_t const nb = 3u + rng() % 5u;   // 3..7 blocks
+            std::vector<MirBlockId> blocks;
+            blocks.reserve(nb);
+            for (std::uint32_t i = 0; i < nb; ++i) {
+                blocks.push_back(mb.createBlock(
+                    i == 0 ? StructCfMarker::EntryBlock
+                           : StructCfMarker::Linear));
+            }
+            MirInstId cond{};
+            for (std::uint32_t i = 0; i < nb; ++i) {
+                mb.beginBlock(blocks[i]);
+                if (i == 0) cond = mb.addArg(0, boolT);
+                if (i + 1 == nb) {
+                    MirLiteralValue z; z.value = std::int64_t{0};
+                    z.core = TypeKind::I32;
+                    mb.addReturn(mb.addConst(z, i32));
+                } else if (rng() % 10u < 4u) {
+                    // Random extra edge — forward or BACKWARD (loops), or to
+                    // a skipped block (leaves some blocks unreachable).
+                    MirBlockId const other = blocks[rng() % nb];
+                    mb.addCondBr(cond, other, blocks[i + 1]);
+                } else {
+                    mb.addBr(blocks[i + 1]);
+                }
+            }
+        }
+        Mir mir = std::move(mb).finish();
+        auto const preds = mirBuildPredecessors(mir);
+
+        MirDomScratch scratch;
+        std::size_t const nf = mir.moduleFuncCount();
+        for (std::uint32_t fi = 0; fi < nf; ++fi) {
+            compareFreshVsScratch(mir, mir.funcAt(fi), preds, scratch,
+                                  "randomized sweep");
+        }
+    }
 }

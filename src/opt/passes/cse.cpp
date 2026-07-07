@@ -10,6 +10,7 @@
 #include "opt/passes/path_compress.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -108,8 +109,11 @@ public:
     // `clobbers` = the pass-wide memory-clobber index (D-OPT-MEMORYSSA-CLOBBER-WALK)
     // built ONCE beside `preds` — the Load-admission gate queries it instead of
     // re-walking the CFG + re-scanning every instruction per Load query.
+    // `domScratch` = the pass-wide reusable dominator scratch
+    // (D-OPT-DOMTREE-SCRATCH-REUSE) — byte-identical dom trees without the
+    // per-function whole-module allocation storm.
     void analyze(MirFuncId fn, std::vector<std::vector<MirBlockId>> const& preds,
-                 MirMemoryClobbers const& clobbers);
+                 MirMemoryClobbers const& clobbers, MirDomScratch& domScratch);
 
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
@@ -154,22 +158,38 @@ private:
     // with a scoped value-numbering table; path-compressed after.
     std::unordered_map<MirInstId, MirInstId> cseMap_;
     std::size_t instructionsCsed_ = 0;
+
+public:
+    // Env-gated DSS_OPT_TRACE sub-timing accumulators (read by runCse's
+    // one-line-per-pass-call trace; zero-cost when the trace is off).
+    std::uint64_t traceDomNs = 0;
 };
 
 void CsePolicy::analyze(MirFuncId fn,
                         std::vector<std::vector<MirBlockId>> const& preds,
-                        MirMemoryClobbers const& clobbers) {
+                        MirMemoryClobbers const& clobbers,
+                        MirDomScratch& domScratch) {
     resetPerFunction();
     std::uint32_t const blockCount = src_.funcBlockCount(fn);
     if (blockCount == 0) return;
 
     // Build the dom tree. CSE only walks reachable blocks (RPO). `preds` is the
-    // caller's precomputed whole-module predecessor map (invariant this pass) —
-    // no per-function rebuild here anymore.
+    // caller's precomputed whole-module predecessor map (invariant this pass);
+    // the scratch-backed dom/children are byte-identical to the fresh path and
+    // valid until the NEXT analyze() call (function-local use only — const&
+    // binding, per the D-OPT-DOMTREE-SCRATCH-REUSE contract).
     MirBlockId const entry = src_.funcEntry(fn);
+    static bool const trace = std::getenv("DSS_OPT_TRACE") != nullptr;
+    auto const tDom0 = trace ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
     auto const rpo = mirReversePostOrder(src_, entry);
-    auto const dom = computeMirDomTree(src_, entry, rpo, preds);
-    auto const dchild = mirDomTreeChildren(src_, dom);
+    auto const& dom = computeMirDomTree(src_, entry, rpo, preds, domScratch);
+    auto const& dchild = mirDomTreeChildren(src_, dom, domScratch);
+    if (trace) {
+        traceDomNs += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tDom0).count());
+    }
 
     // Iterative dom-tree DFS with Visit/Leave frame stack. Scoped
     // value-numbering table: entries added during a block's Visit are
@@ -381,13 +401,47 @@ CseResult runCse(Mir& mir, TypeInterner const& interner,
     // the per-Load-query CFG re-walk + every-instruction region scans
     // (D-OPT-MEMORYSSA-CLOBBER-WALK) — the Load-admission alias tests now touch
     // only actual clobbers via memoized reachability.
+    static bool const trace = std::getenv("DSS_OPT_TRACE") != nullptr;
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto msSince = [](std::chrono::steady_clock::time_point t0) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - t0).count();
+    };
+    auto const tSetup = now();
     auto const preds = mirBuildPredecessors(mir);
     MirMemoryClobbers const clobbers{mir, preds};
+    MirDomScratch domScratch;   // one per pass call (D-OPT-DOMTREE-SCRATCH-REUSE)
+    long long const setupMs = trace ? msSince(tSetup) : 0;
+    std::uint64_t analyzeNs = 0, rebuildNs = 0;
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
-        policy.analyze(f, preds, clobbers);
-        MirFunctionRebuilder rb{mir, builder, policy};
-        rb.rebuildFunction(f);
+        auto const tA = trace ? now() : std::chrono::steady_clock::time_point{};
+        policy.analyze(f, preds, clobbers, domScratch);
+        if (trace) {
+            auto const tR = now();
+            analyzeNs += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(tR - tA)
+                    .count());
+            MirFunctionRebuilder rb{mir, builder, policy};
+            rb.rebuildFunction(f);
+            rebuildNs += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now() - tR)
+                    .count());
+        } else {
+            MirFunctionRebuilder rb{mir, builder, policy};
+            rb.rebuildFunction(f);
+        }
+    }
+    if (trace) {
+        std::fprintf(stderr,
+            "opt:   Cse sub: preds+index=%lldms analyze=%llums (dom=%llums "
+            "vn=%llums) rebuild=%llums\n",
+            setupMs,
+            static_cast<unsigned long long>(analyzeNs / 1000000u),
+            static_cast<unsigned long long>(policy.traceDomNs / 1000000u),
+            static_cast<unsigned long long>(
+                (analyzeNs - std::min(analyzeNs, policy.traceDomNs)) / 1000000u),
+            static_cast<unsigned long long>(rebuildNs / 1000000u));
     }
 
     result.instructionsCsed = policy.instructionsCsed();

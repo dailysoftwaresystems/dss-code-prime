@@ -178,15 +178,20 @@ void rederiveStructCfMarkers(Mir& mir, MirFuncId f) {
 void rederiveStructCfMarkers(Mir& mir) {
     static bool const trace = std::getenv("DSS_OPT_TRACE") != nullptr;
     auto const t0 = std::chrono::steady_clock::now();
-    // One predecessor build for the whole module; per-function RPO/dom.
+    // One predecessor build for the whole module; per-function RPO/dom via the
+    // reusable scratch (D-OPT-DOMTREE-SCRATCH-REUSE — byte-identical trees;
+    // the residual post-dom inside deriveStructCfMarkers is the gated
+    // D-OPT-POSTDOM-SCRATCH-REUSE follow-up).
     auto const preds = mirBuildPredecessors(mir);
+    MirDomScratch domScratch;
     std::size_t const nf = mir.moduleFuncCount();
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
         if (mir.funcBlockCount(f) == 0) continue;
         MirBlockId const entry = mir.funcEntry(f);
         auto const rpo = mirReversePostOrder(mir, entry);
-        MirDomTree const dom = computeMirDomTree(mir, entry, rpo, preds);
+        MirDomTree const& dom =
+            computeMirDomTree(mir, entry, rpo, preds, domScratch);
         applyDerived(mir, f, deriveStructCfMarkers(mir, f, preds, rpo, dom));
     }
     if (trace) {
