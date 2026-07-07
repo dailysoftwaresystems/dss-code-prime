@@ -84,6 +84,54 @@ TEST(TypeLayout, StructCharIntCharIsThePaddingClassic) {
     EXPECT_FALSE(l.hasFlexibleArrayMember);
 }
 
+// c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): a struct with EXPLICIT per-field byte
+// offsets lays its members at those offsets — which may OVERLAP — instead of
+// deriving them by natural alignment. ULARGE_INTEGER {QuadPart u64@0, LowPart
+// u32@0, HighPart u32@4}: size is the MAX field EXTENT (8), align the max field
+// align (8), and the members share bytes. RED-ON-DISABLE: were offsets ignored,
+// the derive path would place them at 0/8/12 → size 16.
+TEST(TypeLayout, ExplicitOffsetsOverlapAndSizeIsMaxExtent) {
+    auto ti = makeInterner(1);
+    TypeId const u64 = ti.primitive(TypeKind::U64);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    std::array<TypeId, 3>        const fields{u64, u32, u32};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 3> const offsets{0, 0, 4};
+    TypeId const ov = ti.structType("ULARGE", fields, noWidths, offsets);
+    EXPECT_TRUE(ti.hasExplicitOffsets(ov));
+    auto const l = layoutOf(ov, ti);
+    ASSERT_EQ(l.fieldOffsets.size(), 3u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);   // QuadPart
+    EXPECT_EQ(l.fieldOffsets[1], 0u);   // LowPart  overlays QuadPart low
+    EXPECT_EQ(l.fieldOffsets[2], 4u);   // HighPart overlays QuadPart high
+    EXPECT_EQ(l.size, 8u);              // max extent (4 + 4), NOT 16
+    EXPECT_EQ(l.align.bytes(), 8u);     // max field align (u64)
+
+    // The same field-types laid out NATURALLY are a distinct type + a distinct
+    // (non-overlapping) layout — the identity fork that keeps an FFI overlap from
+    // ever aliasing an ordinary struct.
+    TypeId const nat = ti.structType("ULARGE", fields);
+    EXPECT_NE(ov, nat);
+    EXPECT_FALSE(ti.hasExplicitOffsets(nat));
+    EXPECT_EQ(layoutOf(nat, ti).size, 16u);
+}
+
+// c107: bit-fields and explicit offsets are mutually exclusive (the offsets ride a
+// SEPARATE channel from the bit-width scalars). A struct that somehow carried BOTH
+// must FAIL LOUD at layout (nullopt), never silently mis-place — the layout arm's
+// `!scalars(id).empty()` guard on the explicit-offset path.
+TEST(TypeLayout, ExplicitOffsetsWithBitfieldsFailsLoud) {
+    auto ti = makeInterner(1);
+    TypeId const u32 = ti.primitive(TypeKind::U32);
+    std::array<TypeId, 2>        const fields{u32, u32};
+    std::array<std::int64_t, 2>  const widths{4, kNotBitfield};   // a real bit-field
+    std::array<std::uint64_t, 2> const offsets{0, 0};
+    TypeId const bad = ti.structType("BAD", fields, widths, offsets);
+    AggregateLayoutParams p{ScalarAlignmentRule::Natural, 16};
+    p.bitFieldStrategy = BitFieldStrategy::GnuPacked;   // realized, so only the c107 guard can reject
+    EXPECT_FALSE(computeLayout(bad, ti, p, DataModel::Lp64).has_value());
+}
+
 TEST(TypeLayout, StructTailPaddingAndNesting) {
     auto ti = makeInterner(1);
     TypeId const i = ti.primitive(TypeKind::I32);
@@ -173,6 +221,50 @@ TEST(TypeLayout, NonLastFlexibleArrayMemberFailsLoud) {
     EXPECT_FALSE(
         computeLayout(ti.structType("BadFam", fields), ti, kNatural16, DataModel::Lp64)
             .has_value());
+}
+
+// c99 (D-CSUBSET-FAM-IN-UNION-MEMBER): a union with a FAM-bearing struct member
+// sizes to max(FAM-struct PREFIX size, other members) — the FAM tail is 0-length
+// for sizeof (C99 §6.7.2.1). This is the COMPANION layout-correctness pin the
+// semantic carve-out relies on: the c99 diff touches only the semantic gate, not
+// the layout engine, so this pins (unchanged) that once a FAM-struct is permitted
+// as a UNION member (gcc/clang accept sqlite's `union { SrcList sSrc; u8 space[N]; }`)
+// the union is sized correctly. It is NOT a red-on-disable guard for the carve-out
+// (layout is orthogonal to the gate); it guards against a silent union-sizing
+// miscompile of the newly-reachable shape. Verified against gcc: for
+// `struct Slab{int n; int a[];}` and `union U{struct Slab s; char space[16];}`,
+// sizeof(Slab)==4 and sizeof(U)==16.
+TEST(TypeLayout, UnionWithFlexibleArrayStructMemberSizesToMaxOfPrefix) {
+    auto ti = makeInterner(1);
+    // struct Slab { int n; int a[]; }  → prefix size 4, align 4, FAM tail excluded.
+    TypeId const n    = ti.primitive(TypeKind::I32);
+    TypeId const fam  = ti.incompleteArray(ti.primitive(TypeKind::I32));
+    std::array<TypeId, 2> const slabFields{n, fam};
+    TypeId const slab = ti.structType("Slab", slabFields);
+    auto const slabL = layoutOf(slab, ti);
+    ASSERT_EQ(slabL.size, 4u);           // only `n`; the FAM adds offset, not size
+    EXPECT_TRUE(slabL.hasFlexibleArrayMember);
+
+    // union U { struct Slab s; char space[16]; } → max(4, 16) = 16, align max(4,1)=4.
+    TypeId const space = ti.array(ti.primitive(TypeKind::Char), 16);
+    std::array<TypeId, 2> const uFields{slab, space};
+    auto const uL = layoutOf(ti.unionType("U", uFields), ti);
+    ASSERT_EQ(uL.fieldOffsets.size(), 2u);
+    EXPECT_EQ(uL.fieldOffsets[0], 0u);   // both members at offset 0
+    EXPECT_EQ(uL.fieldOffsets[1], 0u);
+    EXPECT_EQ(uL.size, 16u);             // max(prefix 4, space 16) — NOT the FAM tail
+    EXPECT_EQ(uL.align.bytes(), 4u);     // max(int-align 4, char-align 1)
+
+    // If the FAM-struct member DOMINATES the size (its prefix > the sibling), the
+    // union takes the prefix — proving the FAM contributes only its non-flexible
+    // prefix, never a guessed tail. `struct Big{long p; long q; int a[];}` → prefix 16.
+    TypeId const l64 = ti.primitive(TypeKind::I64);
+    std::array<TypeId, 3> const bigFields{l64, l64, fam};
+    TypeId const big = ti.structType("Big", bigFields);
+    ASSERT_EQ(layoutOf(big, ti).size, 16u);
+    TypeId const oneByte = ti.array(ti.primitive(TypeKind::Char), 1);
+    std::array<TypeId, 2> const u2Fields{big, oneByte};
+    EXPECT_EQ(layoutOf(ti.unionType("U2", u2Fields), ti).size, 16u);   // max(16, 1)
 }
 
 // ── AGNOSTICISM PIN: different params → different layout (no hardcoded rule) ──
@@ -609,4 +701,48 @@ TEST(TypeLayout, SelfReferentialStructLaysOutWithPointerField) {
     ASSERT_EQ(l.fieldOffsets.size(), 2u);
     EXPECT_EQ(l.fieldOffsets[0], 0u);   // value
     EXPECT_EQ(l.fieldOffsets[1], 8u);   // next (pointer, 8-aligned)
+}
+
+// ── c27 (D-CSUBSET-VOLATILE-POINTEE): a qualifier never changes layout ───────
+// sizeof(volatile T) == sizeof(T) and the alignment matches (C 6.7.3). The layout
+// engine strips the VolatileQual skin at entry, so a volatile scalar / pointer /
+// struct / array lays out byte-identically to its material type. RED-ON-DISABLE:
+// drop the `stripVolatile` at the top of computeLayout → a VolatileQual id hits
+// the engine's default (no scalar size, raw-kind != Struct) → nullopt → this
+// EXPECTs a layout and fails.
+TEST(TypeLayout, VolatileQualifierDoesNotChangeLayout) {
+    auto ti = makeInterner(1);
+    // scalar: volatile int ≡ int (4/4).
+    const TypeId i32  = ti.primitive(TypeKind::I32);
+    const TypeId vi32 = ti.volatileQualified(i32);
+    auto const li = layoutOf(i32, ti);
+    auto const lvi = layoutOf(vi32, ti);
+    EXPECT_EQ(lvi.size, li.size);
+    EXPECT_EQ(lvi.align.bytes(), li.align.bytes());
+    EXPECT_EQ(lvi.size, 4u);
+
+    // pointer (east `T * volatile`): VolatileQual(Ptr<int>) ≡ Ptr<int> (8/8 LP64).
+    const TypeId p  = ti.pointer(i32);
+    const TypeId vp = ti.volatileQualified(p);
+    EXPECT_EQ(layoutOf(vp, ti).size, layoutOf(p, ti).size);
+    EXPECT_EQ(layoutOf(vp, ti).size, 8u);
+
+    // struct: volatile struct S ≡ struct S (field offsets + size + align match).
+    const TypeId f32 = ti.primitive(TypeKind::F32);
+    std::array<TypeId, 2> const fields{i32, f32};
+    const TypeId s  = ti.structType("S", fields);
+    const TypeId vs = ti.volatileQualified(s);
+    auto const ls  = layoutOf(s, ti);
+    auto const lvs = layoutOf(vs, ti);
+    EXPECT_EQ(lvs.size, ls.size);
+    EXPECT_EQ(lvs.align.bytes(), ls.align.bytes());
+    ASSERT_EQ(lvs.fieldOffsets.size(), ls.fieldOffsets.size());
+    for (std::size_t i = 0; i < ls.fieldOffsets.size(); ++i)
+        EXPECT_EQ(lvs.fieldOffsets[i], ls.fieldOffsets[i]);
+
+    // array of volatile: Array<VolatileQual(int), 4> ≡ Array<int,4> (16 bytes).
+    const TypeId va  = ti.array(vi32, 4);
+    const TypeId a   = ti.array(i32, 4);
+    EXPECT_EQ(layoutOf(va, ti).size, layoutOf(a, ti).size);
+    EXPECT_EQ(layoutOf(va, ti).size, 16u);
 }

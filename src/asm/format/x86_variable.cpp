@@ -518,6 +518,7 @@ wireDisp32Mem(EncodingState& st, EncodingSlotKind slot, std::int32_t v,
 void emitStackProbeLoop(std::vector<std::uint8_t>& out,
                         std::uint32_t frame, std::uint32_t page) {
     using dss::asm_byte_emit::appendU32LE;
+    std::size_t const probeStart = out.size();
     // mov r11d, frame   — 41 BB id
     out.push_back(0x41);
     out.push_back(0xBB);
@@ -567,6 +568,12 @@ void emitStackProbeLoop(std::vector<std::uint8_t>& out,
     out.push_back(0x4C);
     out.push_back(0x29);
     out.push_back(0xDC);
+    // The probe is a FIXED-length sequence (the loop iterates at runtime, it
+    // is not unrolled) — pin it against the shared constant the pe64 unwind
+    // builder recomputes CodeOffsets from, so the two can never drift apart.
+    assert(out.size() - probeStart == dss::x86_variable::kStackProbeLoopBytes
+           && "stack-probe prologue length diverged from kStackProbeLoopBytes");
+    (void)probeStart;
 }
 
 } // namespace

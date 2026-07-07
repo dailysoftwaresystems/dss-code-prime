@@ -1,0 +1,12 @@
+{
+  "$comment": "c116b (D-WIN64-SEH-FUNCLETS, H1): the runtime witness that a SEH __except FILTER can read a PARENT LOCAL. The filter (GetExceptionCode()==EXCEPTION_ACCESS_VIOLATION) & (marker==42) reads the parent local `marker`; the filter FUNCLET (a separate ms_x64 fn at fault time) recovers it off the establisher frame (arg1) via RecoverParentFrameSlot -> [establisher + parentFrameOffset]. This is exactly sqlite's sehExceptionFilter(pWal, GetExceptionCode(), ...) shape (the filter reads the wal function's pWal parameter). Exit 42 iff the funclet recovered the TRUE parent-frame value of `marker`==42 (the filter matched AND the handler read the same local). Unforgeable: if H1 recovered garbage the filter (marker==42) is FALSE -> CONTINUE_SEARCH -> the AV escapes uncaught -> crash (no exit 42), never a silent pass; a negative control (marker set to any non-42 value) crashes instead of catching. The `release` arm proves H1 composes with the full optimizer (mem2reg SKIPS SEH functions, so `marker` stays a frame slot; the filter-referenced param is forced memory-backed). pe64-ONLY: x64 SEH + windows.h are Windows. RED-on-disable: revert the H1 RecoverParentFrameSlot lowering (or the SEH-filter param-escape) -> the parent-local read fails loud at compile (D-WIN64-SEH-FUNCLETS), so this does not build.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

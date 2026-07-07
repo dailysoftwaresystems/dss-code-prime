@@ -1,0 +1,14 @@
+{
+  "$comment": "c81 (the sqlite shell.c CLI route): ship <pwd.h> — getpwuid + the glibc-exact struct passwd (7 fields; libc returns ITS OWN struct, so reading pw_uid/pw_gid/pw_dir/pw_shell at the derived offsets is the layout proof — root's uid must echo 0, home/shell must be absolute paths). uid_t comes from sys/types.json (one canonical home). HONEST TOLERANCE: NULL from getpwuid (NSS unavailable under qemu-user) exits 42 without probing — the WSL x86_64 leg is the guaranteed layout proof. Gated [elf] only — Darwin's struct passwd diverges (pw_change/pw_class/pw_expire); fail-loud unavailable beats a silent wrong layout. RED-ON-DISABLE: remove pwd.json -> F001A.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

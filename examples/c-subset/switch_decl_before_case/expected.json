@@ -1,0 +1,34 @@
+{
+  "$comment": "D-MIR-ENTRY-BLOCK-ALLOCA-HOIST (c69, 2026-06-30): a local declaration-with-initializer before the first `case` of a switch (legal C11 6.8 — name in scope across the switch, initializer jumped over, storage must still exist). c68 cleared sqlite's aggregate-global errors so the MIR opt pipeline ran fully for the first time and aborted (SIGABRT, exit 134) in dss::opt::passes::MirFunctionRebuilder::rewriteOperand: the c60 switch-flatten put the pre-first-case decl's Alloca in a predecessor-less block, the mandatory unreachable-prune (D-MIR-UNREACHABLE-PRUNE-NORMALIZE) dropped that block, and a reachable case body's Load of the slot then had no rewrite-map entry (D-OPT2-REWRITE-MAP-COMPLETENESS). Fix (src/mir/lowering/hir_to_mir.cpp, NOT a workaround): lowerFunction pre-emits every body-local's Alloca into the ENTRY block (a collectLocalDecls body walk) which dominates all uses, before lowering the body; the VarDecl site reuses the pre-emitted slot; the init Store stays at the (dead) decl site so the jumped-over initializer still never runs. Runtime verifies the cases see their assigned value AND the jumped-over `= bump()` side effect did not run (g_sideEffect==0) -> 40 - 7 + 0 + 9 = 42. RED-ON-DISABLE: revert the hoist -> the compiler SIGABRTs on this file (exit 134), not 42. gcc/clang exit 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

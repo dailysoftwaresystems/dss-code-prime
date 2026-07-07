@@ -1,0 +1,16 @@
+{
+  "$comment": "c79 (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY, 2026-07-02): a string literal in a VARIADIC TAIL decays array->pointer (C 6.5.2.2p6-7) even though there is NO declared param type to coerce against. Pre-fix the un-decayed Array<char,N> literal lowered to a LIR literal-pool `mov` -> error[A_NoMatchingEncodingVariant] 'pool slot N is not an integer literal' + A_FunctionEncodeAborted — the LAST encoder-stage sqlite3.c error (the exact construct: sqlite3VdbeMultiLoad(v,1,\"iissssss\",...,\"NONE\") in sqlite3Pragma). FIX: coerceCallArg decays an Array arg with no valid param type via the EXISTING coerce decay arm, at all 4 call-arg lowering sites. The callee va_arg-reads the decayed char* and verifies the BYTES. RED-ON-DISABLE: revert the decay -> the exact A_ error pair. => 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

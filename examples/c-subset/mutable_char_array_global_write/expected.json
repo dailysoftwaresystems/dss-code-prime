@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-MUTABLE-CHAR-ARRAY-RODATA (folded into the c67 cycle, 2026-06-30): a MUTABLE file-scope `char m[N]=\"str\"` global is the array OBJECT itself (C 6.7.9 mutable storage) and must live in writable .data, NOT read-only .rodata — a runtime write `m[0]='J'` SEGFAULTs if it is wrongly in .rodata. Root cause: src/asm/asm.cpp lowerMirGlobalsToDataItems' string-literal arm unconditionally forced d.section=Rodata for EVERY std::string-valued global (correct for the SYNTHETIC string-literal-pool global a `char *p=\"hi\"` points to, WRONG for a NAMED user array). Fix: (1) src/mir/lowering/hir_to_mir.cpp materializeStringLiteralGlobal mints its synthetic string global isConst=true (the bytes are immutable — matching tryClassifyAsSymbolAddr's string arm which already did), so the const-based section selection routes it to .rodata; (2) asm.cpp removes the unconditional .rodata override → the section is chosen by isConst alone: a SYNTHETIC pool global (const) → .rodata, a NAMED mutable `char arr[N]=\"str\"` (non-const declaration) → writable .data. m[0]='J' write succeeds (m in .data); m[1..5] init preserved; const c[] still readable in .rodata; `char *p=\"hi\"` pointed-to bytes still readable in .rodata (regression guard) → 42. PRESERVE: a write THROUGH `char *p=\"hi\"` is UB and may fault — its bytes correctly stay .rodata. RED-ON-DISABLE: restore the unconditional .rodata override (or revert the materializeStringLiteralGlobal isConst) → the `m[0]='J'` write SEGFAULTs (exit 139), not 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "$comment": "c58 (D-CSUBSET-INITIALIZER-CONST-TOKEN-LEAK): a scalar local with an initializer containing a `const` token (a (const char*) cast) was wrongly marked const -> reassigning it fired S0007 S_ConstViolation. SQLite nocaseCollatingFunc (sqlite3.c:188075): `int r = sqlite3StrNICmp((const char*)pKey1,...); if(0==r){ r = nKey1-nKey2; }`. declaratorObjectIsConst's scalar fallback scanned the WHOLE varDecl (incl. the initializer) for the const marker; FIX: scan only the type-specifier HEAD (kids[*decl.headChild], no pointer stars). VALUE-CORRECT: r = firstByte((const char*)buf) = 5, then r = 37+r = 42 (the reassignment); return r. RED-ON-DISABLE: revert -> r marked const -> the reassignment -> S0007. NEGATIVE PIN (verified separately): a genuine `const int c=5; c=6;` still errors S0007 (its const lives in the head). Pure c-subset -> all 4 targets; pe RUNS on Windows.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

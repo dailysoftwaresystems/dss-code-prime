@@ -28,6 +28,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -698,7 +699,21 @@ TEST(Fc3Descriptor, FseekOffsetFollowsTheDataModel) {
         TypeInterner interner{CompilationUnitId{1}};
         TypeRegistry registry;
         DiagnosticReporter rep;
-        auto d = ffi::readShippedLibDescriptor(desc, interner, registry, rep, dm);
+        // c82: stdio.json's vfprintf spells `va_list` — bind it (the SysV
+        // shape) exactly as the analyzer threads it in production; this
+        // test's subject (fseek's per-model offset) is unchanged.
+        TypeId const voidPtr =
+            interner.pointer(interner.primitive(TypeKind::Void));
+        std::array<TypeId, 4> vaTagFields{
+            interner.primitive(TypeKind::U32),
+            interner.primitive(TypeKind::U32), voidPtr, voidPtr};
+        TypeId const vaListTy = interner.array(
+            interner.structType("__va_list_tag", vaTagFields), 1);
+        std::array<NamedTypeBinding, 1> namedTypes{
+            NamedTypeBinding{"va_list", vaListTy}};
+        auto d = ffi::readShippedLibDescriptor(desc, interner, registry, rep, dm,
+                                               std::nullopt, std::nullopt,
+                                               namedTypes);
         EXPECT_TRUE(d.has_value());
         EXPECT_EQ(rep.errorCount(), 0u);
         if (!d) return TypeKind::Void;

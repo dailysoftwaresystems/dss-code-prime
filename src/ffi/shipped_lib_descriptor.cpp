@@ -7,17 +7,21 @@
 #include "core/types/strong_ids.hpp"            // InvalidType
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind (constant integer-scalar gate)
 #include "core/types/type_lattice/type_interner.hpp" // TypeInterner::kind (constant type gate)
+#include "core/types/number_decode.hpp"          // decodeFloat (the ONE float-literal decoder)
 #include "hir/hir_text.hpp"                      // parseTypeFromText (the ONE type decoder)
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <initializer_list>
 #include <optional>
 #include <span>
+#include <filesystem>
 #include <sstream>
+#include <unordered_map>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -42,6 +46,54 @@ using json = nlohmann::json;
 void emitMalformed(DiagnosticReporter& reporter, std::string what) {
     dss::report(reporter, DiagnosticCode::F_ShippedLibDescriptorMalformed,
                 DiagnosticSeverity::Error, std::move(what));
+}
+
+// c112 (compile-perf): a THREAD-LOCAL parse cache for shipped descriptors, keyed
+// by canonical path. Shipped descriptors are IMMUTABLE config, yet a SINGLE TU
+// re-opens + re-`json::parse`s the SAME descriptor up to 4× — the front-end
+// availability + typedef-name + macro reads AND the semantic symbol/type read —
+// and a big descriptor (windows.json) dwarfs the decode, so that was O(reads ×
+// json-size) filesystem+parse churn (the sqlite pe64 compile's preprocess/semantic
+// regression). Caching the ifstream+parse makes every read after the first O(1).
+// thread_local (not a mutex-guarded static) because the driver compiles CUs on a
+// per-TU thread pool — each thread owns its cache, no lock, no cross-thread race;
+// the within-TU 4×→1× dedup is where the win is. Returns nullptr on an I/O / parse
+// / non-object failure (diagnostic emitted to `reporter`); failures are NOT cached,
+// so a malformed descriptor still fails loud on every reader exactly as before.
+json const* cachedDescriptorJson(std::filesystem::path const& path,
+                                 DiagnosticReporter& reporter) {
+    thread_local std::unordered_map<std::string, json> cache;
+    std::error_code ec;
+    auto const canon = std::filesystem::weakly_canonical(path, ec);
+    std::string key = (ec ? path.lexically_normal() : canon).string();
+    if (auto const it = cache.find(key); it != cache.end()) return &it->second;
+
+    std::ifstream in{path, std::ios::binary};
+    if (!in) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor: failed to open '"}
+                + path.generic_string() + "' for reading");
+        return nullptr;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    json doc;
+    try {
+        doc = json::parse(ss.str());
+    } catch (json::parse_error const& e) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor '"} + path.generic_string()
+                + "': JSON parse error: " + e.what());
+        return nullptr;
+    }
+    if (!doc.is_object()) {
+        emitMalformed(reporter,
+            std::string{"shipped-lib descriptor '"} + path.generic_string()
+                + "': top-level value must be a JSON object");
+        return nullptr;
+    }
+    auto const [it, _] = cache.emplace(std::move(key), std::move(doc));
+    return &it->second;
 }
 
 // D-CONFIG-LOADER-UNKNOWN-KEYS-FAIL-LOUD enforcement (mirrors
@@ -86,6 +138,49 @@ void emitMalformed(DiagnosticReporter& reporter, std::string what) {
 // at all).
 [[nodiscard]] bool isIntegerScalarKind(TypeKind k) {
     return k >= TypeKind::I8 && k <= TypeKind::U128;
+}
+
+// True for the float SCALAR kinds (F16..F128). A shipped FLOAT CONSTANT's `type`
+// (the `floatConstants` surface, c52) must be one of these — the sibling gate to
+// `isIntegerScalarKind`. F32/F64 are the host-backed kinds the fold materializes;
+// F16/F128 decode + validate here but have no host literal backing downstream (no
+// math.h float constant needs them today).
+[[nodiscard]] bool isFloatScalarKind(TypeKind k) {
+    return k == TypeKind::F16 || k == TypeKind::F32
+        || k == TypeKind::F64 || k == TypeKind::F128;
+}
+
+// Decode a FLOAT constant's STRING `value` into a `double`. JSON has no
+// Infinity/NaN literal, so the value is a string: the explicit tokens
+// "inf"/"+inf"/"-inf" (case-insensitive) map to the IEEE-754 ±infinity bit
+// patterns; any other string is a finite float literal handed to the ONE float
+// decoder (`decodeFloat`, ns=nullptr → plain decimal / C99 hex-float via strtod).
+// Returns nullopt (the caller emits the error) on a non-string value, an empty
+// string, an un-parseable literal, OR a FINITE literal that OVERFLOWS to infinity
+// (only the explicit "inf" token may yield an infinity — never a silent overflow).
+[[nodiscard]] std::optional<double> decodeFloatConstantValue(json const& v) {
+    if (!v.is_string()) return std::nullopt;
+    std::string const s = v.get<std::string>();
+    if (s.empty()) return std::nullopt;
+    // Case-insensitive match of the infinity tokens (a small, closed set).
+    auto eqi = [](std::string const& a, char const* b) {
+        if (a.size() != std::char_traits<char>::length(b)) return false;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(a[i]))
+                != std::tolower(static_cast<unsigned char>(b[i]))) return false;
+        }
+        return true;
+    };
+    if (eqi(s, "inf") || eqi(s, "+inf")) return std::numeric_limits<double>::infinity();
+    if (eqi(s, "-inf")) return -std::numeric_limits<double>::infinity();
+    // A finite float literal. ns=nullptr → plain decimal / hex-float (strtod);
+    // `ok` is false on a partial parse OR an ERANGE overflow (overflow → infinity
+    // is rejected here — an infinity must be spelled "inf", never reached by an
+    // out-of-range finite literal).
+    bool ok = false;
+    double const d = decodeFloat(s, /*ns=*/nullptr, ok);
+    if (!ok || std::isinf(d) || std::isnan(d)) return std::nullopt;
+    return d;
 }
 
 // Validate a JSON integer `value` fits the integer-scalar `kind` and return its
@@ -467,7 +562,8 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
                                          TypeInterner& interner, TypeRegistry& typeReg,
                                          DiagnosticReporter& reporter,
                                          std::vector<ShippedField>& outFields,
-                                         std::vector<TypeId>& outFieldTypes) {
+                                         std::vector<TypeId>& outFieldTypes,
+                                         std::span<NamedTypeBinding const> namedTypes) {
     std::size_t fidx = 0;
     for (auto const& f : fields) {
         std::string const fat = at + " fields[" + std::to_string(fidx) + "]";
@@ -476,7 +572,7 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
             emitMalformed(reporter, "shipped-lib descriptor " + fat + ": must be an object");
             return false;
         }
-        (void)rejectUnknownKeys(reporter, f, fat, {"name", "type"});
+        (void)rejectUnknownKeys(reporter, f, fat, {"name", "type", "offset"});
         if (!f.contains("name") || !f.at("name").is_string()
             || f.at("name").get<std::string>().empty()) {
             emitMalformed(reporter, "shipped-lib descriptor " + fat
@@ -500,7 +596,7 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
             return false;
         }
         std::string const fTypeText = f.at("type").get<std::string>();
-        TypeId const fty = parseTypeFromText(fTypeText, interner, typeReg, reporter);
+        TypeId const fty = parseTypeFromText(fTypeText, interner, typeReg, reporter, namedTypes);
         if (!fty.valid() || fty == InvalidType) {
             dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                         DiagnosticSeverity::Error,
@@ -508,7 +604,19 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
                             + fTypeText + "' failed to decode");
             return false;
         }
-        outFields.push_back(ShippedField{std::move(fname), fty});
+        // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): an optional explicit byte `offset`
+        // (a non-negative integer). All-or-none per struct is enforced by the caller
+        // once every field is decoded (it sees the full set).
+        std::optional<std::uint64_t> foff;
+        if (f.contains("offset")) {
+            if (!f.at("offset").is_number_unsigned()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + fat
+                                            + ": 'offset' must be a non-negative integer");
+                return false;
+            }
+            foff = f.at("offset").get<std::uint64_t>();
+        }
+        outFields.push_back(ShippedField{std::move(fname), fty, foff});
         outFieldTypes.push_back(fty);
     }
     return true;
@@ -525,14 +633,15 @@ void decodeShippedAvailability(json const& doc, std::string const& pathStr,
 decodeConstantValueAndType(json const& obj, std::string const& at,
                            std::string const& cname, TypeInterner& interner,
                            TypeRegistry& typeReg, DiagnosticReporter& reporter,
-                           std::int64_t& outValue, TypeId& outType) {
+                           std::int64_t& outValue, TypeId& outType,
+                           std::span<NamedTypeBinding const> namedTypes) {
     if (!obj.contains("type") || !obj.at("type").is_string()) {
         emitMalformed(reporter, "shipped-lib descriptor " + at
                                     + ": missing or non-string 'type'");
         return false;
     }
     std::string const typeText = obj.at("type").get<std::string>();
-    TypeId const cty = parseTypeFromText(typeText, interner, typeReg, reporter);
+    TypeId const cty = parseTypeFromText(typeText, interner, typeReg, reporter, namedTypes);
     if (!cty.valid() || cty == InvalidType) {
         dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                     DiagnosticSeverity::Error,
@@ -575,45 +684,18 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                          DiagnosticReporter&             reporter,
                          DataModel                       dataModel,
                          std::optional<std::string_view> activeTarget,
-                         std::optional<ObjectFormatKind> activeFormat) {
+                         std::optional<ObjectFormatKind> activeFormat,
+                         std::span<NamedTypeBinding const> namedTypes) {
     std::size_t const errBefore = reporter.errorCount();
 
-    // (0) Read the file. A missing/unreadable descriptor is malformed-shaped
-    // from this reader's perspective (the resolver already verified existence
-    // before recording the path, so a failure here is a real I/O fault, not a
-    // soft miss). Fail loud rather than synthesize nothing silently.
-    std::ifstream in{path, std::ios::binary};
-    if (!in) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor: failed to open '"}
-                + path.generic_string() + "' for reading");
-        return std::nullopt;
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    std::string const text = ss.str();
-
-    // (1) Parse JSON. A parse failure is C_MalformedJson — but route the
-    // descriptor-specific surface through F_ShippedLibDescriptorMalformed so
-    // the operator sees the descriptor context (the codebase pattern emits
-    // C_MalformedJson; here the dedicated FFI code is the right remediation
-    // audience and is unsuppressable).
-    json doc;
-    try {
-        doc = json::parse(text);
-    } catch (json::parse_error const& e) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': JSON parse error: " + e.what());
-        return std::nullopt;
-    }
-
-    if (!doc.is_object()) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': top-level value must be a JSON object");
-        return std::nullopt;
-    }
+    // (0)+(1) Read + parse the file — via the thread-local parse cache (the same
+    // descriptor is read up to 4× per TU; a big windows.json dwarfs the decode).
+    // A missing/unreadable/malformed descriptor fails loud there (a real I/O fault,
+    // not a soft miss — the resolver already verified existence). The cached JSON is
+    // decoded read-only below; every `doc` access is const (.contains/.at/.get).
+    json const* const docPtr = cachedDescriptorJson(path, reporter);
+    if (!docPtr) return std::nullopt;
+    json const& doc = *docPtr;
 
     ShippedLibDescriptor out;
 
@@ -707,8 +789,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     // accepted + ignored, never consumed by lowering.
     (void)rejectUnknownKeys(reporter, doc, "(root)",
                             {"header", "standard", "library", "availableObjectFormats",
-                             "symbols", "constants", "typedefs", "structs", "macros",
-                             "$comment"});
+                             "symbols", "constants", "floatConstants", "typedefs",
+                             "structs", "macros", "$comment"});
 
     // (4) Each symbol. Collect-all: a malformed symbol is reported but the
     // loop continues so the operator sees every problem in one pass; the
@@ -833,7 +915,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                 }
                 std::string const ovText = kv.value().get<std::string>();
                 TypeId const ovSig =
-                    parseTypeFromText(ovText, interner, typeReg, reporter);
+                    parseTypeFromText(ovText, interner, typeReg, reporter, namedTypes);
                 if (!ovSig.valid() || ovSig == InvalidType) {
                     dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                                 DiagnosticSeverity::Error,
@@ -861,7 +943,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // and the whole read fails via the errorCount delta below). The BASE
         // text is decoded even when an override is active (both must be
         // valid); the EFFECTIVE signature is the active model's.
-        TypeId const baseSig = parseTypeFromText(sigText, interner, typeReg, reporter);
+        TypeId const baseSig = parseTypeFromText(sigText, interner, typeReg, reporter, namedTypes);
         if (!baseSig.valid() || baseSig == InvalidType) {
             dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                         DiagnosticSeverity::Error,
@@ -873,7 +955,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         }
         TypeId sig = baseSig;
         if (effectiveSigText != sigText) {
-            sig = parseTypeFromText(effectiveSigText, interner, typeReg, reporter);
+            sig = parseTypeFromText(effectiveSigText, interner, typeReg, reporter, namedTypes);
             // Already validated above; a second-parse failure here would be
             // interner drift — covered by the errorCount delta either way.
             if (!sig.valid() || sig == InvalidType) continue;
@@ -942,7 +1024,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             if (cHasFlat) {
                 // FLAT: decode {value,type} via the shared scalar-constant codec.
                 if (!decodeConstantValueAndType(c, at, cname, interner, typeReg,
-                                                reporter, selValue, selType)) {
+                                                reporter, selValue, selType,
+                                                namedTypes)) {
                     continue;
                 }
                 selected = true;
@@ -982,7 +1065,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     std::int64_t vValue = 0;
                     TypeId       vType;
                     if (!decodeConstantValueAndType(vdef, vat, cname, interner, typeReg,
-                                                    reporter, vValue, vType)) {
+                                                    reporter, vValue, vType,
+                                                    namedTypes)) {
                         okVariants = false; break;
                     }
                     WhenMatch const wm = matchVariantWhen(
@@ -1018,6 +1102,90 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
 
             if (!selected) continue;   // no variant matched → inject nothing
             out.constants.push_back(ShippedConstant{std::move(cname), selValue, selType});
+        }
+    }
+
+    // (5.5) Optional `floatConstants` array (c52, D-FFI-MATH-INFINITY) — the
+    // FLOAT-valued sibling of `constants` (which is integer-ONLY; a float there
+    // still fails loud). A header's float object-like macros (`INFINITY`, `M_PI`,
+    // `DBL_MAX`) ship here. Each: required non-empty `name`; required hir-text
+    // `type` that MUST decode to a FLOAT SCALAR (F32/F64); required STRING `value`
+    // (JSON has no Infinity literal — "inf"/"+inf"/"-inf" map to ±infinity, any
+    // other string is a finite float literal). Collect-all (continue on error; the
+    // read still fails via the errorCount delta). A non-float-scalar type or an
+    // un-parseable / silently-overflowing value FAILS LOUD — never a silent wrong
+    // constant. No per-target `variants` (every float constant here — INFINITY — is
+    // target-invariant IEEE-754; a future per-target float would be its own cycle).
+    if (doc.contains("floatConstants")) {
+        if (!doc.at("floatConstants").is_array()) {
+            emitMalformed(reporter,
+                std::string{"shipped-lib descriptor '"} + path.generic_string()
+                    + "': 'floatConstants' must be an array");
+            return std::nullopt;
+        }
+        json const& fconstants = doc.at("floatConstants");
+        out.floatConstants.reserve(fconstants.size());
+        std::size_t fcidx = 0;
+        for (auto const& c : fconstants) {
+            std::string const at = std::string{"'"} + path.generic_string()
+                + "' floatConstants[" + std::to_string(fcidx) + "]";
+            ++fcidx;
+            if (!c.is_object()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": must be an object");
+                continue;
+            }
+            (void)rejectUnknownKeys(reporter, c,
+                                    "floatConstants[" + std::to_string(fcidx - 1) + "]",
+                                    {"name", "value", "type"});
+            if (!c.contains("name") || !c.at("name").is_string()
+                || c.at("name").get<std::string>().empty()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": missing or empty 'name'");
+                continue;
+            }
+            std::string cname = c.at("name").get<std::string>();
+
+            // `type` must decode to a FLOAT SCALAR (F32/F64). A non-float-scalar
+            // (or undecodable) type fails loud F_ShippedLibUnsupportedType — the
+            // float-surface sibling of the integer gate (so an INTEGER in
+            // `floatConstants` is just as out-of-scope as a float in `constants`).
+            if (!c.contains("type") || !c.at("type").is_string()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": missing or non-string 'type'");
+                continue;
+            }
+            std::string const typeText = c.at("type").get<std::string>();
+            TypeId const cty = parseTypeFromText(typeText, interner, typeReg, reporter, namedTypes);
+            if (!cty.valid() || cty == InvalidType) {
+                dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                            DiagnosticSeverity::Error,
+                            "shipped-lib descriptor " + at + ": float constant '" + cname
+                                + "' has a 'type' that failed to decode ('" + typeText + "')");
+                continue;
+            }
+            if (!isFloatScalarKind(interner.kind(cty))) {
+                dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
+                            DiagnosticSeverity::Error,
+                            "shipped-lib descriptor " + at + ": float constant '" + cname
+                                + "' type '" + typeText + "' is not a float scalar "
+                                  "(a 'floatConstants' entry must be f32/f64; an integer "
+                                  "constant belongs in 'constants')");
+                continue;
+            }
+            if (!c.contains("value")) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": missing 'value'");
+                continue;
+            }
+            auto const dv = decodeFloatConstantValue(c.at("value"));
+            if (!dv.has_value()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at + ": float constant '"
+                    + cname + "' has an invalid 'value' (expected a string: \"inf\"/\"+inf\"/"
+                              "\"-inf\" or a finite float literal; an out-of-range finite "
+                              "literal that overflows to infinity is rejected)");
+                continue;
+            }
+            out.floatConstants.push_back(
+                ShippedFloatConstant{std::move(cname), *dv, cty});
         }
     }
 
@@ -1065,7 +1233,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                     return InvalidType;
                 }
                 std::string const typeText = obj.at("type").get<std::string>();
-                TypeId const ty = parseTypeFromText(typeText, interner, typeReg, reporter);
+                TypeId const ty = parseTypeFromText(typeText, interner, typeReg, reporter, namedTypes);
                 if (!ty.valid() || ty == InvalidType) {
                     dss::report(reporter, DiagnosticCode::F_ShippedLibUnsupportedType,
                                 DiagnosticSeverity::Error,
@@ -1238,7 +1406,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                         continue;
                     }
                     if (!decodeStructFieldList(sdef.at("fields"), at, interner, typeReg,
-                                               reporter, sst.fields, fieldTypes)) {
+                                               reporter, sst.fields, fieldTypes,
+                                               namedTypes)) {
                         continue;
                     }
                     selected = true;
@@ -1292,7 +1461,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                         std::vector<ShippedField> vFields;
                         std::vector<TypeId>       vFieldTypes;
                         if (!decodeStructFieldList(vdef.at("fields"), vat, interner, typeReg,
-                                                   reporter, vFields, vFieldTypes)) {
+                                                   reporter, vFields, vFieldTypes, namedTypes)) {
                             okVariants = false; break;
                         }
 
@@ -1337,7 +1506,32 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                 }
 
                 if (!selected) continue;   // no variant matched → inject nothing
-                sst.typeId = interner.structType(sname, fieldTypes);
+                // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): if the SELECTED field list
+                // carries explicit offsets, intern the struct WITH them (an
+                // overlapping FFI layout). ALL-or-NONE within the struct; a mix is
+                // malformed. The offsets enter the content identity so this tag type
+                // matches the bare typedef's inline `struct "X" { T @off }` (same
+                // TypeId → the injected field scope resolves .member on a bare-typedef
+                // value). Empty → the ordinary natural-alignment struct (unchanged).
+                std::size_t withOffset = 0;
+                for (auto const& fld : sst.fields)
+                    if (fld.offset.has_value()) ++withOffset;
+                if (withOffset != 0 && withOffset != sst.fields.size()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                                                + ": struct field 'offset' must be "
+                                                  "all-or-none (an overlapping layout "
+                                                  "declares every field's offset)");
+                    continue;
+                }
+                if (withOffset == sst.fields.size() && !sst.fields.empty()) {
+                    std::vector<std::uint64_t> offsets;
+                    offsets.reserve(sst.fields.size());
+                    for (auto const& fld : sst.fields) offsets.push_back(*fld.offset);
+                    std::span<std::int64_t const> const noWidths{};
+                    sst.typeId = interner.structType(sname, fieldTypes, noWidths, offsets);
+                } else {
+                    sst.typeId = interner.structType(sname, fieldTypes);
+                }
                 out.structs.push_back(std::move(sst));
             }
         }
@@ -1368,14 +1562,14 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
     bool const declaredConstants      = declaresArray("constants");
     bool const declaredTypedefs       = declaresArray("typedefs");
     bool const declaredMacroVariants  = declaresArray("macros");
-    if (out.symbols.empty() && out.constants.empty() && out.typedefs.empty()
-        && out.structs.empty() && out.macros.empty()
+    if (out.symbols.empty() && out.constants.empty() && out.floatConstants.empty()
+        && out.typedefs.empty() && out.structs.empty() && out.macros.empty()
         && !declaredStructs && !declaredConstants && !declaredTypedefs
         && !declaredMacroVariants) {
         emitMalformed(reporter,
             std::string{"shipped-lib descriptor '"} + path.generic_string()
                 + "': declares nothing — needs at least one of 'symbols', "
-                  "'constants', 'typedefs', 'structs', or 'macros'");
+                  "'constants', 'floatConstants', 'typedefs', 'structs', or 'macros'");
         return std::nullopt;
     }
 
@@ -1396,30 +1590,9 @@ readShippedLibMacros(std::filesystem::path const&    path,
     // Read + parse — same provenance gate as readShippedLibDescriptor, but the
     // typed surfaces (which need a TypeInterner) are NOT read here; the semantic
     // phase reads + validates those separately via readShippedLibDescriptor.
-    std::ifstream in{path, std::ios::binary};
-    if (!in) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor: failed to open '"}
-                + path.generic_string() + "' for reading");
-        return std::nullopt;
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    json doc;
-    try {
-        doc = json::parse(ss.str());
-    } catch (json::parse_error const& e) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': JSON parse error: " + e.what());
-        return std::nullopt;
-    }
-    if (!doc.is_object()) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': top-level value must be a JSON object");
-        return std::nullopt;
-    }
+    json const* const docPtr = cachedDescriptorJson(path, reporter);
+    if (!docPtr) return std::nullopt;
+    json const& doc = *docPtr;
     // NOTE: the `header` provenance gate + the typed-surface validation are the
     // SEMANTIC read's job (readShippedLibDescriptor) — NOT repeated here. The
     // macros-only read must be no STRICTER than the full read (a header-less or
@@ -1443,34 +1616,42 @@ readShippedLibAvailability(std::filesystem::path const& path,
     // broken JSON / malformed availability. No `header` or typed-surface gate —
     // the semantic read owns those (this must be no STRICTER than the full read).
     std::size_t const errBefore = reporter.errorCount();
-    std::ifstream in{path, std::ios::binary};
-    if (!in) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor: failed to open '"}
-                + path.generic_string() + "' for reading");
-        return std::nullopt;
-    }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    json doc;
-    try {
-        doc = json::parse(ss.str());
-    } catch (json::parse_error const& e) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': JSON parse error: " + e.what());
-        return std::nullopt;
-    }
-    if (!doc.is_object()) {
-        emitMalformed(reporter,
-            std::string{"shipped-lib descriptor '"} + path.generic_string()
-                + "': top-level value must be a JSON object");
-        return std::nullopt;
-    }
+    json const* const docPtr = cachedDescriptorJson(path, reporter);
+    if (!docPtr) return std::nullopt;
+    json const& doc = *docPtr;
     std::vector<std::string> out;
     decodeShippedAvailability(doc, path.generic_string(), reporter, out);
     if (reporter.errorCount() != errBefore) return std::nullopt;
     return out;  // empty ⇒ available on every format
+}
+
+std::optional<std::vector<std::string>>
+readShippedLibTypedefNames(std::filesystem::path const& path,
+                           DiagnosticReporter&          reporter) {
+    // Interner-FREE TYPEDEF-NAME read for the parse-time cast-vs-call ORACLE
+    // (D-CSUBSET-SHIPPED-TYPEDEF-CAST-PARSE): the post-parse typedef-resolution
+    // reparse (compilation_unit.cpp `finish()`) seeds these names as parse-time
+    // global TYPE NAMES so a shipped-typedef `(size_t)(expr)` parses as a CAST, not
+    // a call. Only the NAMES are needed (not the decoded `type`), so no
+    // TypeInterner — mirrors readShippedLibAvailability. LENIENT: a malformed entry
+    // is skipped (no name to harvest); the SEMANTIC read (readShippedLibDescriptor)
+    // owns strict typedef validation, so this stays no STRICTER than the full read
+    // and never double-reports. nullopt only on a broken JSON.
+    std::size_t const errBefore = reporter.errorCount();
+    json const* const docPtr = cachedDescriptorJson(path, reporter);
+    if (!docPtr) return std::nullopt;
+    json const& doc = *docPtr;
+    std::vector<std::string> out;
+    if (doc.contains("typedefs") && doc.at("typedefs").is_array()) {
+        for (auto const& t : doc.at("typedefs")) {
+            if (t.is_object() && t.contains("name") && t.at("name").is_string()) {
+                std::string name = t.at("name").get<std::string>();
+                if (!name.empty()) out.push_back(std::move(name));
+            }
+        }
+    }
+    if (reporter.errorCount() != errBefore) return std::nullopt;
+    return out;  // empty ⇒ no typedef surface (the oracle learns nothing new)
 }
 
 bool objectFormatInAvailabilitySet(std::span<std::string const> availableObjectFormats,

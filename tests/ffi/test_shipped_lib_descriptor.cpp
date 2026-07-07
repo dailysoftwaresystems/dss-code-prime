@@ -26,12 +26,15 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace dss;
 using namespace dss::ffi;
@@ -837,7 +840,9 @@ TEST(ShippedLibDescriptor, StructVariantUnknownFormatValueFailsLoud) {
 // BYTE-IDENTICALLY whether activeTarget is nullopt (direct-API/LSP/test) or set (a
 // real per-target compile) — the flat path never consults the selector, so the
 // interned type + its layout are the same. This proves the new axis does not
-// perturb the single-layout structs that ship today (timeval / the opaque structs).
+// perturb the single-layout structs that ship (tm/timespec/utimbuf — timeval
+// itself moved to per-format variants at c83; the flat field list here is the
+// historical shape, kept as the back-compat fixture).
 TEST(ShippedLibDescriptor, StructFlatFieldsBackCompatRegardlessOfTarget) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "flat.json", R"JSON({
@@ -1213,6 +1218,25 @@ TEST(ShippedLibDescriptor, MissingHeaderFailsLoud) {
 
 // Ancestor-walk for the shipped dir (mirrors `findShippedConfig`) so tests work
 // whether ctest runs from build/ or the repo root. Returns empty if not found.
+
+// c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): the SysV `va_list` named-type binding
+// production threads into every shipped-descriptor read (stdio.json's
+// vfprintf spells `va_list`). Tests reading SHIPPED files bind it the same
+// way — the exact `__va_list_tag[1]` mint the analyzer's SysVRegisterSave
+// arm produces. Returns the storage by value; the caller keeps it alive
+// across the read.
+[[nodiscard]] std::array<NamedTypeBinding, 1>
+sysvVaListBinding(TypeInterner& interner) {
+    TypeId const voidPtr =
+        interner.pointer(interner.primitive(TypeKind::Void));
+    std::array<TypeId, 4> tagFields{
+        interner.primitive(TypeKind::U32), interner.primitive(TypeKind::U32),
+        voidPtr, voidPtr};
+    TypeId const vaListTy =
+        interner.array(interner.structType("__va_list_tag", tagFields), 1);
+    return {NamedTypeBinding{"va_list", vaListTy}};
+}
+
 [[nodiscard]] fs::path shippedLibsRoot() {
     fs::path here = fs::current_path();
     for (int i = 0; i < 8 && !here.empty(); ++i) {
@@ -1300,6 +1324,96 @@ TEST(ShippedLibDescriptor, NonIntegerConstantTypeFailsLoud) {
                   rep, DiagnosticCode::F_ShippedLibUnsupportedType), 1u);
 }
 
+// c52 (D-FFI-MATH-INFINITY): the float-constant surface decodes "inf" -> +inf
+// and a finite literal -> its value, both as f64. The INFINITY case is the
+// sqlite frontier; the finite case pins the general float-literal path.
+TEST(ShippedLibDescriptor, FloatConstantsDecodeInfAndFinite) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "math.json", R"({
+        "header": "math.h",
+        "floatConstants": [
+            { "name": "INFINITY", "value": "inf",  "type": "f64" },
+            { "name": "NEG_INF",  "value": "-inf", "type": "f64" },
+            { "name": "HALF",     "value": "0.5",  "type": "f64" },
+            { "name": "FLT_HALF", "value": "0.5",  "type": "f32" }
+        ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_TRUE(desc->constants.empty());   // floats are NOT in the integer surface
+    ASSERT_EQ(desc->floatConstants.size(), 4u);
+    EXPECT_EQ(desc->floatConstants[0].name, "INFINITY");
+    EXPECT_TRUE(std::isinf(desc->floatConstants[0].value));
+    EXPECT_GT(desc->floatConstants[0].value, 0.0);
+    EXPECT_EQ(interner.kind(desc->floatConstants[0].type), TypeKind::F64);
+    EXPECT_TRUE(std::isinf(desc->floatConstants[1].value));
+    EXPECT_LT(desc->floatConstants[1].value, 0.0);
+    EXPECT_DOUBLE_EQ(desc->floatConstants[2].value, 0.5);
+    EXPECT_EQ(interner.kind(desc->floatConstants[3].type), TypeKind::F32);
+}
+
+// c52 NEGATIVE PIN (a): an INTEGER type in `floatConstants` is out of scope —
+// F_ShippedLibUnsupportedType (the float-surface sibling of the integer gate;
+// an integer constant belongs in `constants`).
+TEST(ShippedLibDescriptor, IntegerInFloatConstantsFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "x.json", R"({
+        "header": "x.h",
+        "floatConstants": [ { "name": "N", "value": "1.0", "type": "i32" } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibUnsupportedType), 1u);
+}
+
+// c52 NEGATIVE PIN (b): a FINITE literal that OVERFLOWS to infinity is rejected
+// (only the explicit "inf" token may produce an infinity — never a silent
+// overflow). F_ShippedLibDescriptorMalformed (an invalid value).
+TEST(ShippedLibDescriptor, FloatConstantOverflowToInfFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "x.json", R"({
+        "header": "x.h",
+        "floatConstants": [ { "name": "OK",  "value": "1.0",  "type": "f64" },
+                            { "name": "BAD", "value": "1e400", "type": "f64" } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 1u);
+}
+
+// c52 NEGATIVE PIN (c): a NUMERIC (non-string) value in `floatConstants` fails
+// loud — JSON has no Infinity literal, so the value MUST be a string. This also
+// guards the encoding choice (the "inf" token shape) from silent drift. The
+// valid `OK` sibling keeps the descriptor from ALSO tripping "declares nothing",
+// isolating the single value diagnostic.
+TEST(ShippedLibDescriptor, FloatConstantNumericValueFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "x.json", R"({
+        "header": "x.h",
+        "floatConstants": [ { "name": "OK", "value": "1.0", "type": "f64" },
+                            { "name": "PI", "value": 3.14,  "type": "f64" } ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_EQ(dss::test_support::countCode(
+                  rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 1u);
+}
+
 // Fail-loud: a value that does not fit its declared width (300 in an i8). The
 // valid sibling (`OK`) keeps the descriptor from ALSO tripping the "declares
 // nothing" rule, isolating the single out-of-range diagnostic.
@@ -1368,6 +1482,276 @@ TEST(ShippedLibDescriptor, EmptyDescriptorFailsLoud) {
                   rep, DiagnosticCode::F_ShippedLibDescriptorMalformed), 1u);
 }
 
+// c100 (D-FFI-WINDOWS-KERNEL32-FUNCTIONS, the time.h slice): the REAL shipped
+// time.json ships a per-format `struct tm` — MSVCRT (pe) is the ISO-C 9 ints
+// (tm_sec..tm_isdst) = 36 bytes with NO tm_gmtoff/tm_zone; glibc/Darwin
+// (elf/macho) is 11 fields = 56 bytes. SQLite's os_win stack-allocates a
+// `struct tm` and localtime/localtime_s write it IN FULL, so a pe build seeing the
+// 56-byte layout would over-read the caller's frame (and an elf build seeing 36
+// would short-write). This pins the real file's per-format tm sizeof AND the
+// pe 9-int layout. RED-ON-DISABLE: drop the pe struct tm variant → the pe build
+// sees the elf 56-byte tm → the pe sizeof assert fails.
+TEST(ShippedLibDescriptor, RealTimeStructTmPerFormatLayout) {
+    fs::path const shippedRoot = shippedLibsRoot();
+    ASSERT_FALSE(shippedRoot.empty())
+        << "could not locate src/dss-config/shippedLibs from cwd";
+    fs::path const timePath = shippedRoot / "time.json";
+    ASSERT_TRUE(fs::exists(timePath)) << timePath.generic_string();
+
+    // sizeof(struct tm) from the REAL time.json, per format, via the SAME layout
+    // engine MIR uses (kNatural16 = the shipped-target LP64 params).
+    auto tmSizeFor = [&](ObjectFormatKind fmt) -> std::uint64_t {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(timePath, interner, typeReg, rep,
+                                             DataModel::Lp64, std::string_view{"x86_64"},
+                                             fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        if (!desc.has_value()) return 0;
+        for (auto const& s : desc->structs) {
+            if (s.name == "tm") {
+                auto layout = computeLayout(s.typeId, interner, kNatural16,
+                                            DataModel::Lp64);
+                EXPECT_TRUE(layout.has_value());
+                return layout ? layout->size : 0;
+            }
+        }
+        ADD_FAILURE() << "struct tm absent from time.json for the requested format";
+        return 0;
+    };
+    EXPECT_EQ(tmSizeFor(ObjectFormatKind::Pe), 36u)
+        << "pe struct tm must be the 9-int MSVCRT layout (36 bytes, no gmtoff/zone)";
+    EXPECT_EQ(tmSizeFor(ObjectFormatKind::Elf), 56u)
+        << "elf struct tm is the glibc 11-field layout (56 bytes)";
+    EXPECT_EQ(tmSizeFor(ObjectFormatKind::MachO), 56u)
+        << "macho struct tm is the Darwin 11-field layout (56 bytes)";
+}
+
+// c101 (D-FFI-WINDOWS-KERNEL32-FUNCTIONS, the sync-types slice): the real
+// windows.json ships the Win32 synchronization structs — SRWLOCK (a single PVOID
+// Ptr, 8 bytes) and CRITICAL_SECTION (the RTL_CRITICAL_SECTION 6-field layout:
+// ptr DebugInfo + i32 LockCount + i32 RecursionCount + ptr OwningThread + ptr
+// LockSemaphore + u64 SpinCount = 40 bytes on x64). SQLite's sqlite3_mutex embeds
+// `union { CRITICAL_SECTION cs; SRWLOCK srwl; }` and passes &cs/&srwl to
+// Initialize/Enter/Leave, which write the FULL struct — a too-small CRITICAL_SECTION
+// would let kernel32 overflow the caller's mutex slot. Pins the real file's pe
+// layout. RED-ON-DISABLE: drop a CRITICAL_SECTION field (e.g. SpinCount) → sizeof
+// != 40. windows.json is pe-only, so this loads with ObjectFormatKind::Pe.
+TEST(ShippedLibDescriptor, RealWindowsSyncStructLayout) {
+    fs::path const shippedRoot = shippedLibsRoot();
+    ASSERT_FALSE(shippedRoot.empty())
+        << "could not locate src/dss-config/shippedLibs from cwd";
+    fs::path const winPath = shippedRoot / "windows.json";
+    ASSERT_TRUE(fs::exists(winPath)) << winPath.generic_string();
+
+    auto sizeOf = [&](std::string_view structName) -> std::uint64_t {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(winPath, interner, typeReg, rep,
+                                             DataModel::Lp64, std::string_view{"x86_64"},
+                                             ObjectFormatKind::Pe);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        if (!desc.has_value()) return 0;
+        for (auto const& s : desc->structs) {
+            if (s.name == structName) {
+                auto layout = computeLayout(s.typeId, interner, kNatural16,
+                                            DataModel::Lp64);
+                EXPECT_TRUE(layout.has_value());
+                return layout ? layout->size : 0;
+            }
+        }
+        ADD_FAILURE() << "struct " << structName << " absent from windows.json";
+        return 0;
+    };
+    EXPECT_EQ(sizeOf("SRWLOCK"), 8u) << "SRWLOCK is a single PVOID Ptr";
+    EXPECT_EQ(sizeOf("CRITICAL_SECTION"), 40u)
+        << "RTL_CRITICAL_SECTION x64: ptr+i32+i32+ptr+ptr+u64 = 40 bytes";
+}
+
+// c115 SEH (D-WIN64-SEH-FUNCLETS): the x64 EXCEPTION_RECORD layout the sqlite
+// sehExceptionFilter reads (.NumberParameters + .ExceptionInformation[2]) — the
+// SDK's um/winnt.h shape, natural C alignment: ExceptionCode@0, ExceptionFlags@4,
+// ExceptionRecord@8, ExceptionAddress@16, NumberParameters@24, [pad@28],
+// ExceptionInformation[15]@32, sizeof 152. A wrong offset here would read garbage
+// exception state at c116 runtime (the class the linux legs can't catch —
+// runtime-probed like the c106 _wfinddata64i32 fix). Also pins the pe-only gate
+// (EXCEPTION_RECORD is meaningless on elf/macho).
+TEST(ShippedLibDescriptor, RealWindowsExceptionRecordLayout) {
+    fs::path const shippedRoot = shippedLibsRoot();
+    ASSERT_FALSE(shippedRoot.empty());
+    fs::path const winPath = shippedRoot / "windows.json";
+    ASSERT_TRUE(fs::exists(winPath));
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(winPath, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Pe);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    // windows.json is pe-only.
+    EXPECT_TRUE(objectFormatInAvailabilitySet(desc->availableObjectFormats,
+                                              ObjectFormatKind::Pe));
+    EXPECT_FALSE(objectFormatInAvailabilitySet(desc->availableObjectFormats,
+                                               ObjectFormatKind::Elf));
+
+    auto layoutOf = [&](std::string_view name) -> std::optional<StructLayout> {
+        for (auto const& s : desc->structs) {
+            if (s.name == name) {
+                return computeLayout(s.typeId, interner, kNatural16, DataModel::Lp64);
+            }
+        }
+        ADD_FAILURE() << "struct " << name << " absent from windows.json";
+        return std::nullopt;
+    };
+
+    auto er = layoutOf("EXCEPTION_RECORD");
+    ASSERT_TRUE(er.has_value());
+    EXPECT_EQ(er->size, 152u) << "x64 EXCEPTION_RECORD is 152 bytes";
+    ASSERT_EQ(er->fieldOffsets.size(), 6u);
+    EXPECT_EQ(er->fieldOffsets[0], 0u)  << "ExceptionCode@0";
+    EXPECT_EQ(er->fieldOffsets[1], 4u)  << "ExceptionFlags@4";
+    EXPECT_EQ(er->fieldOffsets[2], 8u)  << "ExceptionRecord@8";
+    EXPECT_EQ(er->fieldOffsets[3], 16u) << "ExceptionAddress@16";
+    EXPECT_EQ(er->fieldOffsets[4], 24u) << "NumberParameters@24 (sqlite reads this)";
+    EXPECT_EQ(er->fieldOffsets[5], 32u)
+        << "ExceptionInformation[15]@32 after the u32→u64 alignment pad "
+           "(sqlite reads [2])";
+
+    auto ep = layoutOf("EXCEPTION_POINTERS");
+    ASSERT_TRUE(ep.has_value());
+    EXPECT_EQ(ep->size, 16u) << "two pointers";
+    ASSERT_EQ(ep->fieldOffsets.size(), 2u);
+    EXPECT_EQ(ep->fieldOffsets[0], 0u) << "ExceptionRecord*@0";
+    EXPECT_EQ(ep->fieldOffsets[1], 8u) << "ContextRecord*@8";
+
+    // THE load-bearing identity: EXCEPTION_POINTERS.ExceptionRecord is a pointer
+    // to an INLINE struct-text that MUST intern to the SAME TypeId as the
+    // field-bearing standalone EXCEPTION_RECORD — else `p->ExceptionRecord->
+    // NumberParameters` cannot resolve (struct identity is by name + field
+    // TYPES, ignoring field names). Pin the two TypeIds equal.
+    TypeId erStandalone{}, epFieldPointee{};
+    for (auto const& s : desc->structs) {
+        if (s.name == "EXCEPTION_RECORD")   erStandalone   = s.typeId;
+        if (s.name == "EXCEPTION_POINTERS") {
+            auto const fields = interner.operands(s.typeId);   // field types
+            ASSERT_GE(fields.size(), 1u);
+            // field 0 = ExceptionRecord* — its pointee is the inline struct.
+            auto const pointee = interner.operands(fields[0]);
+            ASSERT_GE(pointee.size(), 1u);
+            epFieldPointee = pointee[0];
+        }
+    }
+    ASSERT_TRUE(erStandalone.valid());
+    ASSERT_TRUE(epFieldPointee.valid());
+    EXPECT_EQ(erStandalone, epFieldPointee)
+        << "the inline EXCEPTION_RECORD in EXCEPTION_POINTERS.ExceptionRecord "
+           "must intern to the same TypeId as the standalone struct — the "
+           "p->ExceptionRecord->member resolution depends on it";
+}
+
+// c102 (D-FFI-WINDOWS-KERNEL32-FUNCTIONS, the file/heap/time slice): the real
+// windows.json ships the 47 kernel32 file/heap/mmap/library/error/sysinfo/time
+// functions the sqlite os_win VFS calls through its aSyscall[] table — every one an
+// SDK-verified real kernel32 export (HeapAlloc/HeapReAlloc/HeapSize forward to
+// NTDLL.Rtl*, loader-valid exactly like c101's AcquireSRWLockExclusive). This pins
+// the DECODED SIGNATURES so a width/arity/return regression fails loud HERE, not as
+// a silent os_win miscompile: SIZE_T must decode u64 (a u32 truncates a >4 GiB mmap
+// length); SetFilePointerEx's by-value LARGE_INTEGER (an 8-byte union) must be the
+// single i64 the Win x64 ABI passes in one register; LPCWSTR must be ptr<u16> (wide)
+// and LPCSTR ptr<char> (ANSI) — a swap silently corrupts every path string. Every
+// signature is the sqlite os_win aSyscall[] WINAPI cast (ground truth). RED-ON-DISABLE:
+// drop a symbol → the presence loop fails; change a scalar width / swap wide-vs-ANSI
+// → the shape / pointee assert fails. windows.json is pe-only (ObjectFormatKind::Pe).
+TEST(ShippedLibDescriptor, RealWindowsKernel32FileHeapTimeSignatures) {
+    fs::path const shippedRoot = shippedLibsRoot();
+    ASSERT_FALSE(shippedRoot.empty())
+        << "could not locate src/dss-config/shippedLibs from cwd";
+    fs::path const winPath = shippedRoot / "windows.json";
+    ASSERT_TRUE(fs::exists(winPath)) << winPath.generic_string();
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(winPath, interner, typeReg, rep,
+                                         DataModel::Lp64, std::string_view{"x86_64"},
+                                         ObjectFormatKind::Pe);
+    ASSERT_TRUE(desc.has_value());
+    ASSERT_FALSE(rep.hasErrors());
+
+    auto sigOf = [&](std::string_view name) -> std::optional<TypeId> {
+        for (auto const& s : desc->symbols)
+            if (s.name == name) return s.signature;
+        return std::nullopt;
+    };
+
+    // (1) Every c102 kernel32 function is present + decodes to an FnSig.
+    static constexpr std::string_view kC102Fns[] = {
+        "CreateFileW", "DeleteFileW", "ReadFile", "WriteFile", "SetFilePointerEx",
+        "SetEndOfFile", "FlushFileBuffers", "GetFileSizeEx", "GetFileAttributesW",
+        "GetFileAttributesExW", "GetFullPathNameW", "GetTempPathW", "AreFileApisANSI",
+        "LockFileEx", "UnlockFileEx", "CloseHandle", "HeapCreate", "HeapDestroy",
+        "HeapAlloc", "HeapReAlloc", "HeapFree", "HeapSize", "HeapCompact",
+        "HeapValidate", "GetProcessHeap", "CreateFileMappingW", "MapViewOfFile",
+        "UnmapViewOfFile", "FlushViewOfFile", "LoadLibraryW", "FreeLibrary",
+        "GetProcAddress", "GetLastError", "FormatMessageW", "LocalFree",
+        "OutputDebugStringA", "GetSystemInfo", "GetSystemTimeAsFileTime",
+        "GetTickCount64", "QueryPerformanceCounter", "Sleep", "GetCurrentProcessId",
+        "GetCurrentThreadId", "WaitForSingleObject", "WaitForSingleObjectEx",
+        "MultiByteToWideChar", "WideCharToMultiByte",
+    };
+    for (auto name : kC102Fns) {
+        auto s = sigOf(name);
+        ASSERT_TRUE(s.has_value()) << name << " absent from windows.json symbols";
+        EXPECT_EQ(interner.kind(*s), TypeKind::FnSig) << name;
+    }
+
+    // (2) Representative signatures pinned to exact (result, params...) shape —
+    // the full scalar/pointer/void span and arities 0/1/3/4/7/8.
+    using K = TypeKind;
+    auto shape = [&](std::string_view name, K ret, std::vector<K> const& params) {
+        auto s = sigOf(name);
+        ASSERT_TRUE(s.has_value()) << name;
+        ASSERT_EQ(interner.kind(*s), K::FnSig) << name;
+        EXPECT_EQ(interner.kind(interner.fnResult(*s)), ret) << name << " return";
+        auto ps = interner.fnParams(*s);
+        ASSERT_EQ(ps.size(), params.size()) << name << " arity";
+        for (std::size_t i = 0; i < params.size(); ++i)
+            EXPECT_EQ(interner.kind(ps[i]), params[i]) << name << " param " << i;
+    };
+    shape("CreateFileW", K::Ptr,
+          {K::Ptr, K::U32, K::U32, K::Ptr, K::U32, K::U32, K::Ptr});
+    shape("SetFilePointerEx", K::I32, {K::Ptr, K::I64, K::Ptr, K::U32}); // LARGE_INTEGER by-value = i64
+    shape("HeapAlloc", K::Ptr, {K::Ptr, K::U32, K::U64});                // SIZE_T = u64
+    shape("GetLastError", K::U32, {});
+    shape("GetTickCount64", K::U64, {});
+    shape("GetSystemInfo", K::Void, {K::Ptr});
+    shape("WideCharToMultiByte", K::I32,
+          {K::U32, K::U32, K::Ptr, K::I32, K::Ptr, K::I32, K::Ptr, K::Ptr});
+
+    // (3) wide (LPCWSTR → ptr<u16>) vs ANSI (LPCSTR → ptr<char>) must not swap.
+    auto pointeeKind = [&](std::string_view name, std::size_t paramIdx) -> K {
+        auto s = sigOf(name);
+        EXPECT_TRUE(s.has_value()) << name;
+        if (!s) return K::Void;
+        auto ps = interner.fnParams(*s);
+        EXPECT_GT(ps.size(), paramIdx) << name;
+        if (ps.size() <= paramIdx) return K::Void;
+        auto elem = interner.operands(ps[paramIdx]);
+        EXPECT_EQ(elem.size(), 1u) << name << " param " << paramIdx << " is not a ptr";
+        return elem.empty() ? K::Void : interner.kind(elem[0]);
+    };
+    EXPECT_EQ(pointeeKind("CreateFileW", 0), K::U16) << "LPCWSTR path is wide (u16)";
+    EXPECT_EQ(pointeeKind("GetProcAddress", 1), K::Char) << "LPCSTR name is ANSI (char)";
+    EXPECT_EQ(pointeeKind("MultiByteToWideChar", 2), K::Char) << "LPCSTR src is ANSI";
+    EXPECT_EQ(pointeeKind("MultiByteToWideChar", 4), K::U16) << "LPWSTR dst is wide";
+}
+
 // Every descriptor SHIPPED under src/dss-config/shippedLibs/*.json (Model 3: a
 // FLAT, platform-neutral layout — one descriptor per header) must read + decode
 // cleanly: valid JSON, a non-empty `header` that AGREES with the filename stem
@@ -1391,7 +1775,12 @@ TEST(ShippedLibDescriptor, AllShippedDescriptorsDecode) {
         TypeInterner interner{CompilationUnitId{1}};
         TypeRegistry typeReg;
         DiagnosticReporter rep;
-        auto desc = readShippedLibDescriptor(entry.path(), interner, typeReg, rep);
+        // c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): thread the SysV va_list
+        // binding exactly as production does (stdio.json's vfprintf).
+        auto const namedTypes = sysvVaListBinding(interner);
+        auto desc = readShippedLibDescriptor(entry.path(), interner, typeReg, rep,
+                                             DataModel::Lp64, std::nullopt,
+                                             std::nullopt, namedTypes);
         EXPECT_TRUE(desc.has_value())
             << "shipped descriptor failed to load: "
             << entry.path().generic_string();
@@ -1449,8 +1838,10 @@ TEST(ShippedLibDescriptor, ShippedStdlibSignaturesAreLp64) {
                        char const* symName) -> TypeId {
         TypeRegistry typeReg;
         DiagnosticReporter rep;
+        auto const namedTypes = sysvVaListBinding(interner);   // c82
         auto desc = readShippedLibDescriptor(
-            root / (std::string(lib) + ".json"), interner, typeReg, rep);
+            root / (std::string(lib) + ".json"), interner, typeReg, rep,
+            DataModel::Lp64, std::nullopt, std::nullopt, namedTypes);
         EXPECT_TRUE(desc.has_value()) << lib << ".json failed to load";
         EXPECT_FALSE(rep.hasErrors()) << lib << ".json emitted diagnostics";
         if (!desc.has_value()) return {};
@@ -1508,7 +1899,10 @@ TEST(ShippedLibDescriptor, ShippedStdioLibraryMapRoutesPerObjectFormat) {
     TypeInterner interner{CompilationUnitId{1}};
     TypeRegistry typeReg;
     DiagnosticReporter rep;
-    auto desc = readShippedLibDescriptor(root / "stdio.json", interner, typeReg, rep);
+    auto const namedTypes = sysvVaListBinding(interner);   // c82: vfprintf's va_list
+    auto desc = readShippedLibDescriptor(root / "stdio.json", interner, typeReg, rep,
+                                         DataModel::Lp64, std::nullopt,
+                                         std::nullopt, namedTypes);
     ASSERT_TRUE(desc.has_value());
     EXPECT_FALSE(rep.hasErrors());
     // The neutral descriptor names the correct runtime per format — the whole
@@ -2065,6 +2459,540 @@ TEST(ShippedLibDescriptor, MacroVariantNoMatchNotInjected) {
     EXPECT_FALSE(rep.hasErrors());
     ASSERT_EQ(macros->size(), 1u) << "macho-only macro not injected for elf; flat one stays";
     EXPECT_EQ(macros->at(0).name, "ALWAYS");
+}
+
+// ── c83: REAL <sys/time.h> `struct timeval` per-FORMAT layout pin ────────────
+//
+// D-FFI-MACHO-TIMEVAL-TV-USEC-WIDTH. Reads the SHIPPED sys/time.json (the real
+// file, not an inline copy) so the pin goes red the moment the shipped macho
+// variant drifts or is dropped. Darwin repeats the c15c stat SAME-SIZE trap:
+// sizeof(struct timeval) == 16 on BOTH formats, so size alone cannot
+// discriminate — the load-bearing divergence is tv_usec's WIDTH. glibc LP64
+// suseconds_t is `long` (i64, field bytes 8..15 — one elf variant covers both
+// shipped arches); Darwin's is 32-bit — xnu bsd/sys/_types.h `typedef __int32_t
+// __darwin_suseconds_t`, declared in bsd/sys/_types/_timeval.h
+// {__darwin_time_t tv_sec; __darwin_suseconds_t tv_usec} with tv_sec staying
+// `long` (bsd/arm/_types.h + bsd/i386/_types.h) — so macho is {i64@0, i32@8}
+// + 4 TRAILING pad bytes (payload 12 aligned up to the struct's 8-alignment).
+// An i64 read of the macho field folds those undefined padding bytes into the
+// high half (little-endian misread); an i64 write clobbers them. Consumers:
+// gettimeofday (sqlite os_unix reads tv_usec) + utimes.
+//
+// Pins, for BOTH shipped arches (the format variants are arch-agnostic —
+// glibc agrees across x86_64/arm64; Darwin's fields are fixed-width):
+//   * elf:   {tv_sec i64@0, tv_usec I64@8}, sizeof 16.
+//   * macho: {tv_sec i64@0, tv_usec I32@8}, sizeof 16 — the 4 trailing pad
+//     bytes are PROVEN by size 16 with the 4-byte field ending at 12 (the
+//     layout engine's final alignUp), the exact bytes an i64 field would claim.
+// RED-ON-DISABLE: regress the shipped macho variant's tv_usec to i64 → the I32
+// width assert fails; DELETE the macho variant → no variant matches for macho →
+// the struct is not injected → the structs.size() assert fails; flatten the
+// struct back to a single field list → the macho width assert fails. The
+// runtime witness is the shipped_timeval_macho corpus on the macos-latest CI leg.
+TEST(ShippedLibDescriptor, RealSysTimeTimevalPerFormatLayout) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "sys" / "time.json";
+
+    auto checkFor = [&](std::string_view arch, ObjectFormatKind fmt,
+                        TypeKind expectedUsecKind) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, arch, fmt);
+        ASSERT_TRUE(desc.has_value()) << "arch=" << arch;
+        EXPECT_FALSE(rep.hasErrors()) << "arch=" << arch;
+        ASSERT_EQ(desc->structs.size(), 1u)
+            << "timeval variant not injected for arch=" << arch;
+        auto const& tv = desc->structs[0];
+        EXPECT_EQ(tv.name, "timeval");
+        ASSERT_EQ(tv.fields.size(), 2u) << "arch=" << arch;
+        EXPECT_EQ(tv.fields[0].name, "tv_sec");
+        EXPECT_EQ(tv.fields[1].name, "tv_usec");
+        EXPECT_EQ(interner.kind(tv.fields[0].type), TypeKind::I64)
+            << "tv_sec must be i64 on every format (Darwin __darwin_time_t is long)";
+        EXPECT_EQ(interner.kind(tv.fields[1].type), expectedUsecKind)
+            << "tv_usec width wrong for arch=" << arch;
+        auto layout = computeLayout(tv.typeId, interner, kNatural16, DataModel::Lp64);
+        ASSERT_TRUE(layout.has_value());
+        EXPECT_EQ(layout->size, 16u);            // SAME size both formats (the trap)
+        ASSERT_EQ(layout->fieldOffsets.size(), 2u);
+        EXPECT_EQ(layout->fieldOffsets[0], 0u);  // tv_sec  @ 0
+        EXPECT_EQ(layout->fieldOffsets[1], 8u);  // tv_usec @ 8
+    };
+
+    for (std::string_view arch : {"x86_64", "arm64"}) {
+        checkFor(arch, ObjectFormatKind::Elf,   TypeKind::I64);
+        checkFor(arch, ObjectFormatKind::MachO, TypeKind::I32);
+    }
+}
+
+// ── c117 (the macho shell.c POSIX-header batch: pwd/dirent/resource) ─────────
+// Each reads the REAL shipped descriptor per format + computes the layout the
+// MIR engine uses; red if the macho variant regresses to the elf layout or is
+// dropped. The Darwin layouts are verified against the macOS SDK (arm64).
+
+// struct passwd DIVERGES: Darwin has 10 fields (pw_change + pw_class after
+// pw_gid, pw_expire at the tail) vs glibc's 7, pushing the shell.c-read pw_dir
+// from @32 (elf) to @48 (macho) — a single layout silently misreads the home dir.
+TEST(ShippedLibDescriptor, RealPwdPerFormatPasswdLayout) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "pwd.json";
+    auto layoutFor = [&](ObjectFormatKind fmt) -> std::optional<StructLayout> {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64,
+                                             std::string_view{"arm64"}, fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_EQ(desc->structs.size(), 1u);
+        return computeLayout(desc->structs[0].typeId, interner, kNatural16,
+                             DataModel::Lp64);
+    };
+    auto elf = layoutFor(ObjectFormatKind::Elf);
+    auto macho = layoutFor(ObjectFormatKind::MachO);
+    ASSERT_TRUE(elf.has_value());
+    ASSERT_TRUE(macho.has_value());
+    EXPECT_EQ(elf->size, 48u);              // glibc struct passwd (7 fields)
+    EXPECT_EQ(macho->size, 72u);            // Darwin struct passwd (10 fields)
+    EXPECT_EQ(elf->fieldOffsets[5], 32u);   // pw_dir (index 5 on elf)  @ 32
+    EXPECT_EQ(macho->fieldOffsets[7], 48u); // pw_dir (index 7 on macho) @ 48
+}
+
+// struct dirent DIVERGES: Darwin's 64-bit-inode form (d_seekoff + d_namlen,
+// d_name[1024]) is 1048 bytes with d_name @ 21 vs glibc's 280 / d_name @ 19 —
+// shell.c reads d_name, so a single layout reads the wrong bytes.
+TEST(ShippedLibDescriptor, RealDirentPerFormatDirentLayout) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "dirent.json";
+    auto layoutFor = [&](ObjectFormatKind fmt) -> std::optional<StructLayout> {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64,
+                                             std::string_view{"arm64"}, fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        EXPECT_EQ(desc->structs.size(), 1u);
+        return computeLayout(desc->structs[0].typeId, interner, kNatural16,
+                             DataModel::Lp64);
+    };
+    auto elf = layoutFor(ObjectFormatKind::Elf);
+    auto macho = layoutFor(ObjectFormatKind::MachO);
+    ASSERT_TRUE(elf.has_value());
+    ASSERT_TRUE(macho.has_value());
+    EXPECT_EQ(elf->size, 280u);             // glibc struct dirent
+    EXPECT_EQ(macho->size, 1048u);          // Darwin 64-bit-inode struct dirent
+    EXPECT_EQ(elf->fieldOffsets[4], 19u);   // d_name (index 4 on elf)  @ 19
+    EXPECT_EQ(macho->fieldOffsets[5], 21u); // d_name (index 5 on macho) @ 21
+}
+
+// struct rusage keeps the SAME 144-byte size + BSD field order on Darwin, but
+// its embedded struct timeval's tv_usec is i32 (Darwin __darwin_suseconds_t)
+// vs glibc's i64 — the same-size-swap trap (shell.c .timer reads tv_usec).
+TEST(ShippedLibDescriptor, RealResourcePerFormatRusageTimeval) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "sys" / "resource.json";
+    auto checkFor = [&](ObjectFormatKind fmt, TypeKind expectedUsecKind) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64,
+                                             std::string_view{"arm64"}, fmt);
+        ASSERT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        ASSERT_EQ(desc->structs.size(), 2u);   // timeval + rusage
+        auto const& tv = desc->structs[0];
+        EXPECT_EQ(tv.name, "timeval");
+        ASSERT_EQ(tv.fields.size(), 2u);
+        EXPECT_EQ(tv.fields[1].name, "tv_usec");
+        EXPECT_EQ(interner.kind(tv.fields[1].type), expectedUsecKind)
+            << "tv_usec width wrong";
+        auto const& ru = desc->structs[1];
+        EXPECT_EQ(ru.name, "rusage");
+        auto ruLayout = computeLayout(ru.typeId, interner, kNatural16,
+                                      DataModel::Lp64);
+        ASSERT_TRUE(ruLayout.has_value());
+        EXPECT_EQ(ruLayout->size, 144u);   // SAME size both formats (the trap)
+    };
+    checkFor(ObjectFormatKind::Elf,   TypeKind::I64);
+    checkFor(ObjectFormatKind::MachO, TypeKind::I32);
+}
+
+// ── c106 (the shell.c pe header/descriptor batch) ──────────────────────────
+
+// Decode a REAL shipped descriptor for one format (the RealTimeStructTm idiom).
+static std::optional<ShippedLibDescriptor> decodeShippedFor(
+    fs::path const& p, TypeInterner& interner, TypeRegistry& typeReg,
+    ObjectFormatKind fmt) {
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(p, interner, typeReg, rep,
+                                         DataModel::Lp64,
+                                         std::string_view{"x86_64"}, fmt);
+    EXPECT_TRUE(desc.has_value()) << p.generic_string();
+    EXPECT_FALSE(rep.hasErrors()) << p.generic_string();
+    return desc;
+}
+
+// c106 (D-FFI-STDDEF-WCHAR-PE-WIDTH, closing): wchar_t is 2 bytes on pe (the
+// Windows UTF-16 code unit) and 4 bytes on elf/macho (the POSIX width). A
+// wrong width mis-sizes EVERY `wchar_t buf[N]` and every wide-string object
+// the Windows shell path touches — a silent-overlay class, so the widths are
+// pinned from the REAL stddef.json through the REAL layout engine.
+// RED-ON-DISABLE: drop the pe variant → wchar_t decodes at the elf i32 → the
+// pe width assert fails.
+TEST(ShippedLibDescriptor, RealStddefWcharPerFormatWidth) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    auto widthFor = [&](ObjectFormatKind fmt) -> std::uint64_t {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = decodeShippedFor(root / "stddef.json", interner, typeReg, fmt);
+        if (!desc) return 0;
+        for (auto const& td : desc->typedefs) {
+            if (td.name == "wchar_t") {
+                auto layout = computeLayout(td.type, interner, kNatural16,
+                                            DataModel::Lp64);
+                EXPECT_TRUE(layout.has_value());
+                return layout ? layout->size : 0;
+            }
+        }
+        ADD_FAILURE() << "wchar_t typedef absent from stddef.json";
+        return 0;
+    };
+    EXPECT_EQ(widthFor(ObjectFormatKind::Pe), 2u)
+        << "pe wchar_t is the 16-bit Windows code unit";
+    EXPECT_EQ(widthFor(ObjectFormatKind::Elf), 4u);
+    EXPECT_EQ(widthFor(ObjectFormatKind::MachO), 4u);
+}
+
+// c113 (D-CSUBSET-INTRINSIC-BARRIER): the shipped <intrin.h> descriptor.
+// Three load-bearing properties of the REAL file:
+//   (1) pe-ONLY — an MSVC compiler-intrinsic header is meaningless on
+//       elf/macho (the header-level availability gate rejects the include
+//       there with F_ShippedHeaderUnavailableForTarget).
+//   (2) NO `symbols` — EMPIRICALLY load-bearing: every descriptor symbol is
+//       EAGER-imported, and msvcrt.dll exports NO compiler intrinsic (a c113
+//       draft declaring _byteswap_* as symbols crashed the loader with
+//       STATUS_ENTRYPOINT_NOT_FOUND 0xC0000139 — the windows.json
+//       InterlockedCompareExchange trap, twice-proven). The intrinsics are
+//       always-on BUILTINS (c-subset.lang.json), never descriptor symbols.
+//   (3) the honest non-empty payload = the size_t→u64 typedef (MSVC's real
+//       intrin.h makes size_t visible; the string/stdio.json convention).
+// RED-on-disable: widen the gate / re-add a symbol / drop the typedef.
+TEST(ShippedLibDescriptor, RealIntrinHeaderIsPeOnlyAndCarriesNoEagerSymbols) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    auto desc = decodeShippedFor(root / "intrin.json", interner, typeReg,
+                                 ObjectFormatKind::Pe);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_EQ(desc->header, "intrin.h");
+    // (1) the header-level gate is exactly ["pe"].
+    ASSERT_EQ(desc->availableObjectFormats.size(), 1u);
+    EXPECT_EQ(desc->availableObjectFormats[0], "pe");
+    EXPECT_TRUE(objectFormatInAvailabilitySet(desc->availableObjectFormats,
+                                              ObjectFormatKind::Pe));
+    EXPECT_FALSE(objectFormatInAvailabilitySet(desc->availableObjectFormats,
+                                               ObjectFormatKind::Elf));
+    EXPECT_FALSE(objectFormatInAvailabilitySet(desc->availableObjectFormats,
+                                               ObjectFormatKind::MachO));
+    // (2) no eager-import surface — a compiler-intrinsic header must never
+    //     declare linkable symbols (the 0xC0000139 loader trap).
+    EXPECT_TRUE(desc->symbols.empty())
+        << "intrin.h intrinsics are builtins, NOT descriptor symbols — a "
+           "symbols entry here eager-imports a non-export and crashes the "
+           "pe loader (STATUS_ENTRYPOINT_NOT_FOUND)";
+    // (3) the size_t typedef is the non-empty payload, u64 on pe64/LLP64.
+    ASSERT_EQ(desc->typedefs.size(), 1u);
+    EXPECT_EQ(desc->typedefs[0].name, "size_t");
+    auto layout = computeLayout(desc->typedefs[0].type, interner, kNatural16,
+                                DataModel::Llp64);
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_EQ(layout->size, 8u);
+}
+
+// c106: the MSVC stat records. `struct _stat64`/`__stat64` are the ucrt
+// 56-byte time64 shape — st_size at 24, st_mtime at 40 (natural alignment
+// inserts 2B after gid and 4B before the i64 size). The time32 `struct _stat`
+// (the shape behind msvcrt.dll's DIRECT `_wstat` export) is 36 bytes with
+// st_size at 20. A wrong offset silently reads garbage file sizes/mtimes on
+// the Windows shell path (the sqlite .stats/.import machinery), so both
+// layouts pin through the real layout engine. The elf arm asserts ABSENCE:
+// these tags are pe-variant-only (a POSIX build must not grow MSVC records).
+// RED-ON-DISABLE: drop the pe variant (or reorder fields) → size/offset red.
+TEST(ShippedLibDescriptor, RealSysStatMsvcRecordLayouts) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    fs::path const statPath = root / "sys" / "stat.json";
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = decodeShippedFor(statPath, interner, typeReg,
+                                     ObjectFormatKind::Pe);
+        ASSERT_TRUE(desc.has_value());
+        bool saw64 = false, saw32 = false;
+        for (auto const& s : desc->structs) {
+            if (s.name == "_stat64" || s.name == "__stat64") {
+                auto layout = computeLayout(s.typeId, interner, kNatural16,
+                                            DataModel::Lp64);
+                ASSERT_TRUE(layout.has_value()) << s.name;
+                EXPECT_EQ(layout->size, 56u) << s.name;
+                ASSERT_EQ(layout->fieldOffsets.size(), 11u) << s.name;
+                EXPECT_EQ(layout->fieldOffsets[7], 24u) << s.name << " st_size";
+                EXPECT_EQ(layout->fieldOffsets[9], 40u) << s.name << " st_mtime";
+                saw64 = true;
+            }
+            if (s.name == "_stat") {
+                auto layout = computeLayout(s.typeId, interner, kNatural16,
+                                            DataModel::Lp64);
+                ASSERT_TRUE(layout.has_value());
+                // The x64 _wstat export writes the _stat64i32 shape — TIME64,
+                // size32 — 48 bytes (c106-audit runtime-probed msvcrt.dll). A
+                // 36B time32 _stat overran the caller by 12B and mis-read the
+                // times. st_size stays a 32-bit field @20; the i64 times land
+                // at 24/32/40.
+                EXPECT_EQ(layout->size, 48u) << "_stat is the x64 _stat64i32 shape";
+                ASSERT_EQ(layout->fieldOffsets.size(), 11u);
+                EXPECT_EQ(layout->fieldOffsets[7], 20u) << "_stat st_size";
+                EXPECT_EQ(layout->fieldOffsets[8], 24u) << "_stat st_atime (i64)";
+                EXPECT_EQ(layout->fieldOffsets[9], 32u) << "_stat st_mtime (i64)";
+                saw32 = true;
+            }
+        }
+        EXPECT_TRUE(saw64) << "pe must ship _stat64/__stat64";
+        EXPECT_TRUE(saw32) << "pe must ship the time32 _stat";
+    }
+    {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = decodeShippedFor(statPath, interner, typeReg,
+                                     ObjectFormatKind::Elf);
+        ASSERT_TRUE(desc.has_value());
+        for (auto const& s : desc->structs) {
+            EXPECT_NE(s.name, "_stat64") << "MSVC records must not leak onto elf";
+            EXPECT_NE(s.name, "_stat")   << "MSVC records must not leak onto elf";
+        }
+    }
+}
+
+// c106: struct _wfinddata_t is the x64 msvcrt _wfinddata64i32_t record (the ABI
+// of the DIRECT _wfindfirst/_wfindnext exports — c106-audit runtime-probed
+// msvcrt.dll: TIME64, not time32; the "legacy names = time32" lore is x86-32
+// only). 560 bytes: {attrib u32@0, [pad4], time i64@8/16/24, size u32@32,
+// name wchar[260]@36}. The windirent shim copies data.name at @36; a time32
+// (540B, name@20) descriptor read attribute bytes as UTF-16 and overran the
+// shim's stack object by 16B. RED-ON-DISABLE: retype a time field i64→i32 →
+// name shifts off 36 → offset red.
+TEST(ShippedLibDescriptor, RealIoWfinddata64i32Layout) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    auto desc = decodeShippedFor(root / "io.json", interner, typeReg,
+                                 ObjectFormatKind::Pe);
+    ASSERT_TRUE(desc.has_value());
+    bool saw = false;
+    for (auto const& s : desc->structs) {
+        if (s.name != "_wfinddata_t") continue;
+        auto layout = computeLayout(s.typeId, interner, kNatural16,
+                                    DataModel::Lp64);
+        ASSERT_TRUE(layout.has_value());
+        EXPECT_EQ(layout->size, 560u);
+        ASSERT_EQ(layout->fieldOffsets.size(), 6u);
+        EXPECT_EQ(layout->fieldOffsets[1], 8u)   << "time_create (i64) @ 8";
+        EXPECT_EQ(layout->fieldOffsets[4], 32u)  << "size @ 32";
+        EXPECT_EQ(layout->fieldOffsets[5], 36u)  << "name (wchar[260]) @ 36";
+        saw = true;
+    }
+    EXPECT_TRUE(saw) << "_wfinddata_t absent from io.json on pe";
+}
+
+// c106 (audit MEDIUM): the windows.json records that kernel32 WRITES and the
+// program READS — WIN32_FIND_DATAW (592B, cFileName@44), SYSTEMTIME (16B),
+// CONSOLE_SCREEN_BUFFER_INFO (22B), COORD (4B), SMALL_RECT (8B). All SDK
+// 10.0.26100.0-verified; pinned so a field-order/type drift can't silently
+// mis-place a member kernel32 fills in (the same silent class as the stat/find
+// records). RED-ON-DISABLE: drop a WIN32_FIND_DATAW reserved field → cFileName
+// shifts off 44 → red.
+TEST(ShippedLibDescriptor, RealWindowsFindDataAndConsoleLayouts) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    auto desc = decodeShippedFor(root / "windows.json", interner, typeReg,
+                                 ObjectFormatKind::Pe);
+    ASSERT_TRUE(desc.has_value());
+    auto sizeOffOf = [&](std::string_view name)
+        -> std::optional<StructLayout> {
+        for (auto const& s : desc->structs)
+            if (s.name == name)
+                return computeLayout(s.typeId, interner, kNatural16,
+                                     DataModel::Lp64);
+        return std::nullopt;
+    };
+    auto fd = sizeOffOf("WIN32_FIND_DATAW");
+    ASSERT_TRUE(fd.has_value());
+    EXPECT_EQ(fd->size, 592u);
+    ASSERT_EQ(fd->fieldOffsets.size(), 10u);
+    EXPECT_EQ(fd->fieldOffsets[8], 44u) << "cFileName @ 44";
+    auto st = sizeOffOf("SYSTEMTIME");
+    ASSERT_TRUE(st.has_value());
+    EXPECT_EQ(st->size, 16u);
+    auto csbi = sizeOffOf("CONSOLE_SCREEN_BUFFER_INFO");
+    ASSERT_TRUE(csbi.has_value());
+    EXPECT_EQ(csbi->size, 22u);
+    ASSERT_EQ(csbi->fieldOffsets.size(), 5u);
+    EXPECT_EQ(csbi->fieldOffsets[2], 8u)  << "wAttributes @ 8";
+    EXPECT_EQ(csbi->fieldOffsets[3], 10u) << "srWindow @ 10";
+    auto co = sizeOffOf("COORD");
+    ASSERT_TRUE(co.has_value());
+    EXPECT_EQ(co->size, 4u);
+    auto sr = sizeOffOf("SMALL_RECT");
+    ASSERT_TRUE(sr.has_value());
+    EXPECT_EQ(sr->size, 8u);
+}
+
+// c106: the strtoll SPLIT — msvcrt.dll does not export strtoll (pre-C99 CRT);
+// on pe `strtoll` is a MACRO onto the real _strtoi64 export while the
+// [elf,macho]-gated strtoll SYMBOL stays un-injected; on elf the inverse.
+// A drift in either direction is a loader break (importing a phantom strtoll
+// on pe → 0xC0000139) or a broken elf build (losing the real symbol), so BOTH
+// sides of BOTH formats pin.
+TEST(ShippedLibDescriptor, RealStdlibStrtollPeMacroSplit) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    // Macro VARIANTS select at decode (flat result per format); symbol
+    // availability filters at semantic INJECTION — so the symbol side pins
+    // the per-symbol gate through the SAME predicate the injector applies
+    // (objectFormatInAvailabilitySet), never mere presence in the vector.
+    auto scan = [&](ObjectFormatKind fmt, bool& macroStrtoll,
+                    bool& symStrtoll, bool& symStrtoi64) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = decodeShippedFor(root / "stdlib.json", interner, typeReg, fmt);
+        ASSERT_TRUE(desc.has_value());
+        macroStrtoll = symStrtoll = symStrtoi64 = false;
+        for (auto const& m : desc->macros)
+            if (m.name == "strtoll") {
+                macroStrtoll = true;
+                EXPECT_EQ(m.replacement, "_strtoi64");
+            }
+        for (auto const& s : desc->symbols) {
+            if (s.name == "strtoll")
+                symStrtoll = objectFormatInAvailabilitySet(
+                    s.availableObjectFormats, fmt);
+            if (s.name == "_strtoi64")
+                symStrtoi64 = objectFormatInAvailabilitySet(
+                    s.availableObjectFormats, fmt);
+        }
+    };
+    bool m = false, s = false, s64 = false;
+    scan(ObjectFormatKind::Pe, m, s, s64);
+    EXPECT_TRUE(m)   << "pe strtoll must be the _strtoi64 macro";
+    EXPECT_FALSE(s)  << "a pe strtoll IMPORT is a phantom (msvcrt has none)";
+    EXPECT_TRUE(s64) << "pe must import the real _strtoi64";
+    scan(ObjectFormatKind::Elf, m, s, s64);
+    EXPECT_FALSE(m)  << "elf strtoll is the real symbol, not a macro";
+    EXPECT_TRUE(s);
+    EXPECT_FALSE(s64) << "_strtoi64 is pe-gated";
+}
+
+// c106: the glibc timespec-flattening macros (st_atime -> st_atim_sec …) must
+// stay OFF pe — flat, they rewrote every pe st_atime member access into a
+// nonexistent st_atim_sec field (the c106 probe's phantom). elf keeps them.
+// Also pins the pe errno accessor split (_errno on pe; __errno_location
+// stays elf-only — importing the wrong accessor is a loader break).
+TEST(ShippedLibDescriptor, RealStatTimeMacrosAndErrnoAccessorPerFormat) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    auto statMacroNames = [&](ObjectFormatKind fmt) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = decodeShippedFor(root / "sys" / "stat.json", interner,
+                                     typeReg, fmt);
+        std::vector<std::string> names;
+        if (desc)
+            for (auto const& m : desc->macros) names.push_back(m.name);
+        return names;
+    };
+    auto const peNames = statMacroNames(ObjectFormatKind::Pe);
+    for (auto const& n : peNames)
+        EXPECT_TRUE(n != "st_atime" && n != "st_mtime" && n != "st_ctime")
+            << n << " must not rewrite pe member accesses";
+    auto const elfNames = statMacroNames(ObjectFormatKind::Elf);
+    bool elfHasStAtime = false;
+    for (auto const& n : elfNames)
+        if (n == "st_atime") elfHasStAtime = true;
+    EXPECT_TRUE(elfHasStAtime)
+        << "elf keeps the glibc st_atime flattening macro";
+
+    auto errnoAccessors = [&](ObjectFormatKind fmt, bool& peAcc, bool& elfAcc) {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        auto desc = decodeShippedFor(root / "errno.json", interner, typeReg, fmt);
+        ASSERT_TRUE(desc.has_value());
+        peAcc = elfAcc = false;
+        // Injection-availability, not vector presence (the per-symbol gate
+        // filters at semantic injection, decode keeps every row).
+        for (auto const& s : desc->symbols) {
+            if (s.name == "_errno")
+                peAcc = objectFormatInAvailabilitySet(
+                    s.availableObjectFormats, fmt);
+            if (s.name == "__errno_location")
+                elfAcc = objectFormatInAvailabilitySet(
+                    s.availableObjectFormats, fmt);
+        }
+    };
+    bool pe = false, el = false;
+    errnoAccessors(ObjectFormatKind::Pe, pe, el);
+    EXPECT_TRUE(pe)  << "pe errno accessor is msvcrt _errno";
+    EXPECT_FALSE(el) << "__errno_location on pe is a phantom import";
+    errnoAccessors(ObjectFormatKind::Elf, pe, el);
+    EXPECT_FALSE(pe);
+    EXPECT_TRUE(el);
+}
+
+// c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): windows.json models ULARGE_INTEGER as an
+// explicit-offset OVERLAP struct {QuadPart u64@0, LowPart u32@0, HighPart u32@4} —
+// the FILETIME→time idiom (shell.c writes the two u32 halves, reads the u64 whole).
+// The layout engine must place the members at their DECLARED offsets (overlapping),
+// giving size 8, not the 16 a naturally-derived {u64,u32,u32} would produce.
+// RED-ON-DISABLE: drop HighPart's `@4` (or the whole offsets set) → the derive path
+// lays QuadPart@0/LowPart@8/HighPart@12 → size 16, fieldOffsets != {0,0,4}.
+TEST(ShippedLibDescriptor, RealWindowsUlargeOverlayLayout) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty());
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    auto desc = decodeShippedFor(root / "windows.json", interner, typeReg,
+                                 ObjectFormatKind::Pe);
+    ASSERT_TRUE(desc.has_value());
+    bool saw = false;
+    for (auto const& s : desc->structs) {
+        if (s.name != "ULARGE_INTEGER") continue;
+        EXPECT_TRUE(interner.hasExplicitOffsets(s.typeId))
+            << "ULARGE_INTEGER must carry explicit offsets";
+        auto layout = computeLayout(s.typeId, interner, kNatural16,
+                                    DataModel::Lp64);
+        ASSERT_TRUE(layout.has_value());
+        EXPECT_EQ(layout->size, 8u) << "overlap → 8 bytes, not 16";
+        ASSERT_EQ(layout->fieldOffsets.size(), 3u);
+        EXPECT_EQ(layout->fieldOffsets[0], 0u) << "QuadPart @ 0";
+        EXPECT_EQ(layout->fieldOffsets[1], 0u) << "LowPart @ 0 (overlays QuadPart low)";
+        EXPECT_EQ(layout->fieldOffsets[2], 4u) << "HighPart @ 4 (overlays QuadPart high)";
+        saw = true;
+    }
+    EXPECT_TRUE(saw) << "ULARGE_INTEGER absent from windows.json structs on pe";
 }
 
 } // namespace

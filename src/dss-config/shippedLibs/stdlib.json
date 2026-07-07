@@ -1,9 +1,28 @@
 {
   "header": "stdlib.h",
   "standard": "c89",
-  "$comment": "Model 3 (2026-06-09): PLATFORM-NEUTRAL descriptor. `library` is a per-object-format map; the active target's format selects its runtime image at compile_pipeline resolution. `atol`/`strtol` (result), `strtoul` (result), and `labs` (arg+result) are the C `long`/`unsigned long` type, encoded here in the LP64 (i64/u64) form correct for the runnable elf/macho targets. FC3 c1: the Windows LLP64 (i32/u32) form for these 4 is now declared per-symbol via signatureByDataModel (the active format dataModel selects it; D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH).",
+  "$comment": "c106 pe: _putenv/_strdup?no/_wfullpath + the strtoll->_strtoi64 MACRO split (msvcrt has no strtoll; the elf atexit-split precedent inverted; the [elf,macho] strtoll SYMBOL stays un-injected on pe). | Model 3 (2026-06-09): PLATFORM-NEUTRAL descriptor. `library` is a per-object-format map; the active target's format selects its runtime image at compile_pipeline resolution. `atol`/`strtol` (result), `strtoul` (result), and `labs` (arg+result) are the C `long`/`unsigned long` type, encoded here in the LP64 (i64/u64) form correct for the runnable elf/macho targets. FC3 c1: the Windows LLP64 (i32/u32) form for these 4 is now declared per-symbol via signatureByDataModel (the active format dataModel selects it; D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH). ★ c82 (shell.c): (1) `typedefs`/`constants` re-provide size_t + NULL — C89 7.20p1 REQUIRES stdlib.h to provide both without stddef.h (shell.c includes stdlib.h, never stddef.h); widths/values identical to stddef.json, first-wins dedup makes the double-provision moot. (2) strtoll is C99 `long long` — i64 on EVERY DSS target (LP64 AND LLP64 agree on long long), so a FLAT signature with NO signatureByDataModel; gated [elf,macho] per-symbol (the OS msvcrt.dll export is unverified — _strtoi64 is the classic pe spelling; ungate when verified). (3) realpath is POSIX (not C89) → per-symbol [elf,macho]; the glibc/Darwin prototype `char *realpath(const char *restrict, char *restrict resolved)` admits NULL resolved (malloc'd result) — shell.c calls realpath(zPath, NULL) — CAVEAT (discovered c82, D-LK-ELF-SYMBOL-VERSIONING): DSS's dynamic imports carry no .gnu.version_r, and an UNVERSIONED ref binds glibc's OLDEST version — on x86_64 that is realpath@GLIBC_2.2.5, which EINVALs a NULL resolved buffer (the @@2.3 default accepts it; aarch64 glibc has only one version, unaffected). The BUFFER form works on every binding; the NULL form (and shell.c's run path) needs the version-emission anchor. (4) ★ c85 (shell.c `atexit(abnormalExit)`): atexit ships as the per-format MACRO/SYMBOL SPLIT — the errno.json pattern (per-format macro `variants` + per-format-gated accessor symbols), pure config, zero engine change. glibc does NOT export `atexit` dynamically (it lives in libc_nonshared.a as a static shim over the exported `__cxa_atexit`; a libc.so.6-bound atexit import fails at LOAD — witnessed c82). So on elf, `atexit(f)` is a FUNCTION-LIKE MACRO (C 7.1.4p1: any library function may additionally be a function-like macro) expanding to `__cxa_atexit((void (*)(void *))(f), 0, 0)` — byte-equal semantics to glibc's own shim (Itanium ABI: dso_handle=NULL registers against the main program; exit() runs the handlers LIFO before stream flush, C 7.22.4.4), and `__cxa_atexit` is the imported symbol (exported T, single-version, both arches: __cxa_atexit@GLIBC_2.2.5 x86_64 / @GLIBC_2.17 aarch64 — the D-LK-ELF-SYMBOL-VERSIONING multi-version caveat does not apply). On pe the macro has NO variant (0-match → not injected) and `atexit` is the DIRECT msvcrt.dll export (verified: objdump -p msvcrt.dll [1068] atexit; kernel32 ExitProcess runs msvcrt's onexit table at its CRT DLL-detach). RESIDUALS (honest S0001, never silent): `&atexit`/`(atexit)(f)`/`#undef atexit` on elf need the REAL function — glibc solves that with a STATIC shim a dynamic-only linker cannot bind (shell.c/sqlite3.c grep-verified: only the plain call form); ★ c117 (the macho shell.c consumer landed): the macho arm is the DIRECT `atexit` symbol — Darwin's libSystem exports `_atexit` (verified in libSystem.tbd; Apple Libc stdlib/atexit.c exports BOTH atexit and __cxa_atexit), so `atexit` gains [macho] on the SYMBOL and the elf-only macro stays 0-match on macho (un-injected) → shell.c's `atexit(f)` resolves to the direct libSystem `_atexit`. NO __cxa_atexit split needed on macho (that is the glibc-only static-shim workaround). (5) setenv/unsetenv are POSIX (not C89) → per-symbol [elf,macho] (the realpath precedent; msvcrt has only _putenv): glibc prototypes verified /usr/include/stdlib.h `int setenv(const char *__name, const char *__value, int __replace)` + `int unsetenv(const char *__name)`, exported W setenv/unsetenv@GLIBC both arches; identical prototypes on Darwin.",
   "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "typedefs": [
+    { "name": "size_t", "type": "u64" },
+    { "name": "wchar_t", "variants": [{ "when": { "format": "pe" }, "type": "u16" }] }
+  ],
+  "constants": [
+    { "name": "NULL", "value": 0, "type": "i64" }
+  ],
+  "macros": [
+    { "name": "atexit", "variants": [
+      { "when": { "format": "elf" }, "params": ["f"], "replacement": "__cxa_atexit((void (*)(void *))(f), 0, 0)" }
+    ] },
+    { "name": "strtoll", "variants": [{ "when": { "format": "pe" }, "replacement": "_strtoi64" }] }
+  ],
   "symbols": [
+    { "name": "strtoll",  "signature": "fn(ptr<char>, ptr<ptr<char>>, i32) -> i64", "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "macho"] },
+    { "name": "realpath", "signature": "fn(ptr<char>, ptr<char>) -> ptr<char>",     "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "macho"] },
+    { "name": "setenv",   "signature": "fn(ptr<char>, ptr<char>, i32) -> i32",      "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "macho"] },
+    { "name": "unsetenv", "signature": "fn(ptr<char>) -> i32",                      "kind": "function", "linkage": "external", "availableObjectFormats": ["elf", "macho"] },
+    { "name": "__cxa_atexit", "signature": "fn(ptr<fn(ptr<void>) -> void>, ptr<void>, ptr<void>) -> i32", "kind": "function", "linkage": "external", "availableObjectFormats": ["elf"] },
+    { "name": "atexit",   "signature": "fn(ptr<fn() -> void>) -> i32",              "kind": "function", "linkage": "external", "availableObjectFormats": ["pe", "macho"] },
     { "name": "malloc",  "signature": "fn(u64) -> ptr<void>",            "kind": "function", "linkage": "external" },
     { "name": "calloc",  "signature": "fn(u64, u64) -> ptr<void>",       "kind": "function", "linkage": "external" },
     { "name": "realloc", "signature": "fn(ptr<void>, u64) -> ptr<void>", "kind": "function", "linkage": "external" },
@@ -23,6 +42,9 @@
     { "name": "getenv",  "signature": "fn(ptr<char>) -> ptr<char>",      "kind": "function", "linkage": "external" },
     { "name": "system",  "signature": "fn(ptr<char>) -> i32",           "kind": "function", "linkage": "external" },
     { "name": "qsort",   "signature": "fn(ptr<void>, u64, u64, ptr<fn(ptr<void>, ptr<void>) -> i32>) -> void", "kind": "function", "linkage": "external" },
-    { "name": "bsearch", "signature": "fn(ptr<void>, ptr<void>, u64, u64, ptr<fn(ptr<void>, ptr<void>) -> i32>) -> ptr<void>", "kind": "function", "linkage": "external" }
+    { "name": "bsearch", "signature": "fn(ptr<void>, ptr<void>, u64, u64, ptr<fn(ptr<void>, ptr<void>) -> i32>) -> ptr<void>", "kind": "function", "linkage": "external" },
+    { "name": "_putenv", "signature": "fn(ptr<char>) -> i32", "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"] },
+    { "name": "_strtoi64", "signature": "fn(ptr<char>, ptr<ptr<char>>, i32) -> i64", "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"] },
+    { "name": "_wfullpath", "signature": "fn(ptr<u16>, ptr<u16>, u64) -> ptr<u16>", "kind": "function", "linkage": "external", "availableObjectFormats": ["pe"] }
   ]
 }

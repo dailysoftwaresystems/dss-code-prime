@@ -1,0 +1,34 @@
+{
+  "$comment": "D-OPT-SWITCH-JUMP-TABLE (c70): the sqlite VDBE-dispatch shape — a ~350-case DENSE contiguous switch (0..349) evaluated in a loop, exactly like sqlite3VdbeExec (the sqlite-green blocker c70 clears). Pre-c70 this exhausted the register allocator (~350 live case-constant vregs -> L_VirtualRegInPostRegalloc); the jump table makes it O(1) and the vregs vanish. step(op)=op*3+7 for op in [0..349] else -1; run() sums a fixed program in a loop to 3578; main() checks that plus first/last/above-max/below-min/interior boundary ops. gcc/clang emit a jump table and exit 42 (cross-checked x86_64 -O0/-O1, aarch64 -O1 qemu). This is the proof that c70 unblocks sqlite's switch shape. The release optimizedPipeline arm runs the shipped optimizer over the jump-table lowering.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

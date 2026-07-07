@@ -1,0 +1,16 @@
+{
+  "$comment": "c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS) shipped-name dedup — the shell.c popen/pclose shape: `#include <stdio.h>` + a bare re-declaration `int puts(const char*);`. Goal-2 suppresses the descriptor's own puts injection (user decl wins); the c86 synthesis re-binds the prototype to the SUPPRESSED descriptor's per-format library (stdio.json: msvcrt.dll / libc.so.6), so the call still imports libc puts — never an undefined symbol. Runtime-witnessed: the line reaches stdout through the real import + exit 42. Line endings per the adjacent_string_concat convention (manifest pin = pe CRLF; elf targets override LF). RED-ON-DISABLE: (a) drop `prototypeSynthesizesExtern` -> H0009 compile failure; (b) drop the analyzer's suppressed-library record -> LOUD undefined symbol 'puts' at link.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "shipped-redecl-ok\r\n",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"], "expectedStdout": "shipped-redecl-ok\n" },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64", "expectedStdout": "shipped-redecl-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

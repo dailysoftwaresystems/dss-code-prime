@@ -32,6 +32,29 @@ struct DSS_EXPORT PredefinedMacroDef {
     std::string         name;
     PredefinedMacroKind kind = PredefinedMacroKind::Constant;
     std::string         value;
+    // c105 (D-PP-FUNCTION-LIKE-PREDEFINE): OPTIONAL parameter list. A
+    // params-bearing (`isFunctionLike`) predefine — e.g. the MSVC-profile
+    // `__declspec(x)` → empty erase — is NOT seeded into `predefined_`;
+    // it lowers to a `#define name(params) value` line in the synthetic
+    // "<built-in>" PROLOGUE prepended to the synth stream, so the ordinary
+    // directive handler owns param parsing, C 6.10.3p6 duplicate-param
+    // rejection, 6.10.3p2 redefinition policy, and the function-like
+    // arg-eating expansion (zero new expander machinery — the gcc built-in
+    // model). Consequence: it is an ORDINARY macro (#undef-able); the
+    // modeled construct is a compiler keyword by convention only.
+    // `isFunctionLike` (not params.empty()) discriminates so a 0-ary
+    // function-like (`F()`) stays expressible. Constant-kind only.
+    std::vector<std::string> params;
+    bool                isFunctionLike = false;
+    // OPTIONAL per-object-format availability filter (mirrors the shipped-lib
+    // descriptor `availableObjectFormats`). EMPTY ⇒ available on EVERY format
+    // (the pre-existing behavior). A non-empty set of object-format NAMES
+    // ("pe"/"elf"/"macho") restricts the macro to those formats — the
+    // preprocessor seeds it only when the active format is in the set. This is
+    // how an OS-selection macro like `_WIN32` is predefined for the pe target
+    // ONLY, without leaking into elf/macho. Format names are validated at load
+    // (an unknown name fails loud), never matched by an `if (name=="pe")` branch.
+    std::vector<std::string> availableObjectFormats;
 };
 
 // FC15c (`__has_c_attribute` -- C23 6.10.1p4): one config-declared standard

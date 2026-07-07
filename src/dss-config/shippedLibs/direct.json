@@ -1,0 +1,17 @@
+{
+  "$comment": "Neutral shipped <direct.h> (Microsoft CRT directory management) — c98 (Windows-host sub-arc, the 3-header F001A batch). shell.c includes it on the pe route in the fileio extension (~9848, the `#else` of the !_WIN32 guard) whose mkdir macro routes to fileio_mkdir -> `_wmkdir(b1)` (~9956) — the ONLY direct.h symbol the active amalgamation calls. The remaining seven ship as the obviously-paired trivial siblings: the narrow/wide couples of the classic direct.h set (_mkdir/_wmkdir, _rmdir/_wrmdir, _chdir/_wchdir, _getcwd/_wgetcwd) — _getcwd doubles as the corpus example's live-run witness (a cwd read needs no argv, which pe lacks until D-RUNTIME-PE-MAIN-ARGS). `availableObjectFormats:[pe]` — a Microsoft-CRT header fails loud on elf/macho. `library:{pe:msvcrt.dll}` — all eight are msvcrt.dll exports (verified via dumpbin /exports: _chdir 209, _getcwd 368, _mkdir 658, _rmdir 695, _wchdir 911, _wgetcwd 985, _wmkdir 995, _wrmdir 1012), NOT kernel32. SIGNATURES (Microsoft SDK direct.h/corecrt_wdirect.h): char* _getcwd(char*,int) — note the int maxlen (POSIX getcwd takes size_t; the CRT form is i32) and the char* return (the buffer, or NULL); int _mkdir(const char*) — NO mode param (unlike POSIX mkdir(path,mode); sqlite's mkdir macro drops the mode for exactly this reason); int _rmdir(const char*); int _chdir(const char*); the wide forms take/return wchar_t* — Windows wchar_t is UTF-16 u16 (== windows.json's WCHAR), so they spell ptr<u16> (same stddef.json wchar_t=i32 latent-width note as io.json).",
+  "header": "direct.h",
+  "standard": "msvcrt",
+  "availableObjectFormats": ["pe"],
+  "library": { "pe": "msvcrt.dll" },
+  "symbols": [
+    { "name": "_getcwd",  "signature": "fn(ptr<char>, i32) -> ptr<char>", "kind": "function", "linkage": "external" },
+    { "name": "_wgetcwd", "signature": "fn(ptr<u16>, i32) -> ptr<u16>",   "kind": "function", "linkage": "external" },
+    { "name": "_mkdir",   "signature": "fn(ptr<char>) -> i32",            "kind": "function", "linkage": "external" },
+    { "name": "_wmkdir",  "signature": "fn(ptr<u16>) -> i32",             "kind": "function", "linkage": "external" },
+    { "name": "_rmdir",   "signature": "fn(ptr<char>) -> i32",            "kind": "function", "linkage": "external" },
+    { "name": "_wrmdir",  "signature": "fn(ptr<u16>) -> i32",             "kind": "function", "linkage": "external" },
+    { "name": "_chdir",   "signature": "fn(ptr<char>) -> i32",            "kind": "function", "linkage": "external" },
+    { "name": "_wchdir",  "signature": "fn(ptr<u16>) -> i32",             "kind": "function", "linkage": "external" }
+  ]
+}

@@ -72,7 +72,9 @@ popReg(std::vector<std::uint16_t>& regs) {
 
 [[nodiscard]] FreeListsByClass
 buildFreeLists(TargetSchema const&            schema,
-               TargetCallingConvention const& cc) {
+               TargetCallingConvention const& cc,
+               std::array<std::uint16_t, kLirRegClassCount> const&
+                   reloadReserve) {
     FreeListsByClass out{};
 
     std::unordered_set<std::string_view> allocatable;
@@ -107,7 +109,141 @@ buildFreeLists(TargetSchema const&            schema,
             out[classIdx].calleeSaved.push_back(i);
         }
     }
+
+    // c75 (D-AS-REGALLOC-SPILL-RELOAD-SCRATCH): reserve, per register
+    // class, `reloadReserve[c]` CALLER-SAVED registers as guaranteed
+    // spill-reload scratch. Held back from the free lists → never
+    // assigned to a vreg → the rewriter's pickScratchRegs
+    // (lir_rewrite.cpp) picks them up as scratch automatically
+    // (unassigned + still allocatable). Caller-saved so a transient
+    // reload needs no callee-save. K = reloadReserve[c] is DERIVED
+    // per-function from the max single-instruction register-reload
+    // demand (computeReloadReserve) — never a hardcoded count; each
+    // target computes its own from its own opcode operand shapes.
+    //
+    // D-AS-REGALLOC-ARG-REGISTER-OCCUPIED (c75 correctness fix): the
+    // reserved scratch MUST NOT be an incoming-argument register (nor
+    // the indirect-result register). An arg register holds an INCOMING
+    // PARAMETER at function entry until that param's `arg` op
+    // materializes the value out of it; a reload staged through it at
+    // entry (by the rewriter's pickScratchRegs, which harvests the
+    // held-back registers) clobbers the incoming param before it is
+    // read (SILENT miscompile — e.g. x86_64 SysV's last caller-saved
+    // GPR is r9 = the 6th integer arg register). Reserve K caller-saved
+    // NON-ARG (and non-sret) registers, scanning from the caller-saved
+    // END (the allocator's last-choice partition — tryAllocate prefers
+    // callee-saved) and SKIPPING any arg/sret ordinal. cc-config-driven
+    // (argGprs/argFprs/indirectResultRegister); no register names, no
+    // arch identity. x86_64 SysV non-arg caller-saved GPRs = {rax, r10,
+    // r11} = 3 ≥ K (K ≤ the max non-call same-class virtual reg
+    // operand+result count over the shipped opcodes). If a class has
+    // fewer than K non-arg caller-saved registers (ms_x64 FPR has only
+    // xmm4/xmm5 = 2), reserve what EXISTS — under-reserving only weakens
+    // the scratch GUARANTEE (a too-tight function then fails LOUD at the
+    // rewriter backstop, never silently), whereas reserving an arg
+    // register would silently re-open the clobber (see the loop below).
+    std::unordered_set<std::uint16_t> argOrdinals;
+    auto absorbArgOrds = [&](std::vector<std::string> const& names) {
+        for (auto const& n : names)
+            if (auto ord = schema.registerByName(n); ord.has_value())
+                argOrdinals.insert(*ord);
+    };
+    absorbArgOrds(cc.argGprs);
+    absorbArgOrds(cc.argFprs);
+    if (cc.indirectResultRegister.has_value())
+        argOrdinals.insert(cc.indirectResultRegister->ordinal);
+
+    for (std::size_t c = 0; c < out.size(); ++c) {
+        std::size_t const k = static_cast<std::size_t>(reloadReserve[c]);
+        if (k == 0) continue;
+        auto& caller = out[c].callerSaved;
+        // Walk from the END, moving up to K reserved NON-ARG registers
+        // out of the free list. Arg/sret ordinals are left in place
+        // (still allocatable) and skipped over — NEVER reserved (they
+        // hold incoming params at entry; reserving one re-opens the
+        // silent clobber). If a class has FEWER than K non-arg caller-
+        // saved registers (e.g. ms_x64 FPR: xmm4/xmm5 are the only non-
+        // arg caller-saved of xmm0..xmm5), reserve what EXISTS and stop.
+        // Under-reserving is SAFE: the reservation only GUARANTEES scratch
+        // availability; a function whose per-instruction reload demand
+        // exceeds the reserved-plus-otherwise-free scratch still fails
+        // LOUD at the rewriter's L_VirtualRegInPostRegalloc backstop
+        // (never a silent miscompile). Callee-saved registers are NOT
+        // drawn for the reservation — pickScratchRegs uses reserved regs
+        // raw (no prologue/epilogue save), so a callee-saved scratch
+        // would clobber the caller's value; caller-saved-only keeps the
+        // transient-reload contract. (Widening the non-call reload
+        // demand past the non-arg caller-saved supply is the deferred
+        // wide-operand concern D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT's
+        // sibling; not reachable on the shipped targets, where K ≤ 3 and
+        // every class has ≥2 non-arg caller-saved registers.)
+        std::size_t reserved = 0;
+        std::size_t scan = caller.size();
+        while (reserved < k && scan > 0) {
+            --scan;
+            if (argOrdinals.contains(caller[scan])) continue;  // never reserve an arg reg
+            caller.erase(caller.begin() + static_cast<std::ptrdiff_t>(scan));
+            ++reserved;
+        }
+    }
+
     return out;
+}
+
+// c75 (D-AS-REGALLOC-SPILL-RELOAD-SCRATCH): the max single-instruction
+// register-reload demand of `fn`, per register class — the count of
+// same-class VIRTUAL register operands (+ a virtual register result)
+// the rewriter must simultaneously materialize for ONE instruction (its
+// per-inst scratch-cursor peak, lir_rewrite.cpp resolveReg).
+// buildFreeLists reserves this many caller-saved registers per class as
+// guaranteed reload scratch. CALLS are excluded — a call's arg operands
+// can exceed the register file (the deferred wide-call anchor
+// D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT); reserving that many is neither
+// possible nor the general-pressure fix this cycle targets. Terminators
+// / `arg` / ordinary ops ARE counted (the rewriter reloads their
+// spilled operands too). Physical operands are skipped (they never
+// spill), as are immediate / block-ref operands (o.kind != Reg).
+// Derived, per-target, per-function — never a hardcoded count.
+[[nodiscard]] std::array<std::uint16_t, kLirRegClassCount>
+computeReloadReserve(Lir const& lir, TargetSchema const& schema,
+                     LirFuncLiveness const& flow) {
+    std::array<std::uint16_t, kLirRegClassCount> reserve{};
+    for (auto const& blk : flow.blockOrder) {
+        std::uint32_t const n = lir.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            LirInstId const inst = lir.blockInstAt(blk, i);
+            auto const* info = schema.opcodeInfo(lir.instOpcode(inst));
+            // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): CALLS are EXCLUDED again
+            // (reverting c76's option-E removal). With direct-arg-reload, a
+            // spilled register-passed call arg becomes a `SpillSlotRef` that the
+            // rewriter does NOT scratch-reload — callconv loads it DIRECTLY into
+            // its ABI arg register (demand == supply by construction). So a call's
+            // register args need ZERO rewriter reload scratch, and counting them
+            // here would only shrink the allocatable GPR pool for the rest of the
+            // function with no correctness benefit. The wide-call blocker
+            // (func-2088) is closed by the direct reload, not by reserving K. A
+            // spilled INDIRECT-CALLEE (ops[0]) still reloads into a scratch, but
+            // that is a SINGLE same-class operand (demand ≤ 1) — well within the
+            // non-arg caller-saved supply, and general-body ops (counted below)
+            // already dominate it. The `store_outgoing_arg` carriers the wide-call
+            // pass emits are NON-call single-operand insts, still counted below.
+            if (info != nullptr && info->isCall) continue;
+            std::array<std::uint16_t, kLirRegClassCount> demand{};
+            auto const bump = [&](LirReg r) {
+                if (!r.valid() || r.isPhysical != 0) return;
+                std::size_t const c = static_cast<std::size_t>(r.regClass());
+                if (c < demand.size()) ++demand[c];
+            };
+            for (auto const& o : lir.instOperands(inst)) {
+                if (o.kind == LirOperandKind::Reg) bump(o.reg);
+            }
+            bump(lir.instResult(inst));
+            for (std::size_t c = 0; c < reserve.size(); ++c) {
+                if (demand[c] > reserve[c]) reserve[c] = demand[c];
+            }
+        }
+    }
+    return reserve;
 }
 
 // Returns the EARLY slot (`pos`) of each call instruction, scaled to
@@ -187,6 +323,71 @@ collectIndirectCalleePositions(Lir const& lir, TargetSchema const& schema,
                                        lir.instPayload(inst)),
                                    ::dss::call_payload::hasIndirectResult(
                                        lir.instPayload(inst))});
+                }
+            }
+            pos += 2u;
+        }
+    }
+    return out;
+}
+
+// D-AS-REGALLOC-ARG-REGISTER-OCCUPIED (c75 correctness fix): for every
+// incoming-parameter `arg` op, record the physical INCOMING arg register
+// (cc.argGprs[payload] for a GPR-class result, cc.argFprs[payload] for
+// FPR) and the RELEASE position = the arg op's LATE slot. The caller
+// (post-isel) placed the k-th param in that register; the callconv pass
+// materializes `mov <regalloc-home>, <argreg>` AT the arg op POST-
+// regalloc, so the incoming register is LIVE over [entry=0, releasePos).
+// The allocator + rewriter must not reuse it in that window (assigning
+// it to another vreg, or staging a spill-reload through it, clobbers the
+// incoming param before it is read — SILENT miscompile: x86_64 SysV's
+// r9 is both the last caller-saved GPR and the 6th int arg register).
+//
+// Identified by the `arg` mnemonic — the SAME handle mir_to_lir emits
+// (MnemonicSlot::Arg = "arg") and lir_callconv materializes (h.arg). A
+// target without an `arg` op (no register-machine param passing) yields
+// an empty list — zero new behavior. `payload` is the per-class arg
+// index (D-ML7-2.10: HIR→MIR emits a monotonic per-class counter). The
+// arg register NAME→ordinal resolves via the cc; a name that fails to
+// resolve is left unrecorded (the callconv pass fails loud on it later —
+// this collector never weakens allocation on a bad schema by inventing
+// an ordinal). Entirely cc-config-driven — no register names, no arch.
+struct ArgRegisterOccupiedAt {
+    std::uint16_t ordinal;       // incoming physical arg-register ordinal
+    LirRegClass   cls;           // its register class (GPR/FPR)
+    std::uint32_t releasePos;    // arg op's LATE slot (register free at/after)
+    std::uint32_t paramVregId;   // the arg op's result vreg (its own home — NOT excluded)
+};
+
+[[nodiscard]] std::vector<ArgRegisterOccupiedAt>
+collectArgRegisterOccupied(Lir const& lir, TargetSchema const& schema,
+                           TargetCallingConvention const& cc,
+                           LirFuncLiveness const& flow) {
+    std::vector<ArgRegisterOccupiedAt> out;
+    auto const argOp = schema.opcodeByMnemonic("arg");
+    if (!argOp.has_value()) return out;  // no register-machine arg passing
+    std::uint32_t pos = 0;
+    for (auto const& b : flow.blockOrder) {
+        std::uint32_t const n = lir.blockInstCount(b);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            LirInstId const inst = lir.blockInstAt(b, i);
+            if (lir.instOpcode(inst) == *argOp) {
+                LirReg const res = lir.instResult(inst);
+                if (res.valid() && res.isPhysical == 0) {
+                    LirRegClass const cls = res.regClass();
+                    auto const& pool = (cls == LirRegClass::FPR) ? cc.argFprs
+                                                                 : cc.argGprs;
+                    std::uint32_t const idx = lir.instPayload(inst);
+                    if (idx < pool.size()) {
+                        if (auto ord = schema.registerByName(pool[idx]);
+                            ord.has_value()) {
+                            out.push_back({*ord, cls, /*releasePos=*/pos + 1u,
+                                           static_cast<std::uint32_t>(res.id)});
+                        }
+                    }
+                    // idx >= pool.size(): stack-passed param (no incoming
+                    // register to protect); callconv reads it from the
+                    // caller's outgoing area, not an arg register.
                 }
             }
             pos += 2u;
@@ -596,7 +797,8 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         return out;
     }
 
-    FreeListsByClass free = buildFreeLists(schema, *cc);
+    FreeListsByClass free =
+        buildFreeLists(schema, *cc, computeReloadReserve(lir, schema, flow));
     std::vector<std::uint32_t> const callPositions =
         collectCallPositions(lir, schema, flow);
     // Cycle 10q closure of 10p substrate: per-opcode implicit
@@ -604,6 +806,14 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
     // by every range that crosses an implicit-clobber position.
     std::vector<ImplicitClobberAt> const implicitClobbers =
         collectImplicitClobberPositions(lir, schema, flow);
+    // D-AS-REGALLOC-ARG-REGISTER-OCCUPIED (c75 correctness fix): the
+    // incoming arg registers, live [entry, argOp.late). A vreg alive in
+    // that window must not be assigned the arg register that still holds
+    // its param (variant 2: the allocator assigning xmm7 — the 8th FP
+    // arg reg — to a non-incoming vreg's home clobbers the incoming
+    // param it aliases). Consumed by the covered-window exclusion below.
+    std::vector<ArgRegisterOccupiedAt> const argOccupied =
+        collectArgRegisterOccupied(lir, schema, *cc, flow);
     // FC4 c2 (R2): indirect-call callee vregs (see IndirectCalleeAt's
     // docblock for the silent-garbage-jump hazard this rule closes).
     // The cc's arg-register ordinal set is resolved ONLY when the
@@ -882,6 +1092,33 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
                     && ccIndirectResultRegOrdinal.has_value()) {
                     addExcluded(*ccIndirectResultRegOrdinal);
                 }
+            }
+        }
+        // D-AS-REGALLOC-ARG-REGISTER-OCCUPIED (c75 correctness fix): an
+        // incoming arg register is live over [entry=0, releasePos). THIS
+        // range conflicts with it iff it starts before the register is
+        // freed (`r.start < releasePos`) — contiguous ranges start at
+        // their def, so `start < releasePos` ⇔ overlap with [0,
+        // releasePos). Exclude the arg-register ordinal from this range's
+        // allocation UNLESS this range IS that arg op's own result vreg
+        // (its start == releasePos, so `start < releasePos` is already
+        // false — the guard is belt-and-suspenders). Covers variant 2
+        // (an earlier param's home vreg, or any temp, is kept off a
+        // later param's still-live incoming register). Threaded through
+        // tryAllocateExcluding AND findSpillCandidate below, so a spill-
+        // evict never re-lands the freed register on an arg ordinal
+        // either. cc-config-driven; no register names, no arch identity.
+        if (!argOccupied.empty()) {
+            auto const addExcludedArg = [&](std::uint16_t ord) {
+                for (std::uint16_t const e : excludedScratch) {
+                    if (e == ord) return;
+                }
+                excludedScratch.push_back(ord);
+            };
+            for (auto const& ao : argOccupied) {
+                if (ao.cls != cls) continue;              // class-partitioned pools
+                if (r.vreg.id == ao.paramVregId) continue; // its own home
+                if (r.start < ao.releasePos) addExcludedArg(ao.ordinal);
             }
         }
 

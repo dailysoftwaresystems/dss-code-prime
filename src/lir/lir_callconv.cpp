@@ -13,7 +13,9 @@
 #include <array>
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -201,6 +203,12 @@ computeFrameLayout(LirFuncAllocation const& alloc,
     FrameLayout layout;
     layout.savedRegs        = std::move(savedRegs);
     layout.slotSize         = slotWidth;
+    // c114 (D-WIN64-PDATA-XDATA-UNWIND): record the cc's guard-page probe
+    // stride (0 = no probing) so a downstream unwind-info emitter can
+    // reproduce the SAME probe-vs-plain-sub prologue decision emitPrologue
+    // makes (`stackProbePageBytes > 0 && totalFrameSize > it`) WITHOUT
+    // re-consulting the cc — the config value that already lives here.
+    layout.stackProbePageBytes = cc.stackProbePageBytes;
     // D-ML7-2.2 + D-ML7-2.6 (co-closed 2026-06-02): outgoingArgAreaSize
     // is THIS function's reserved space for ITS calls. Encompasses
     // BOTH the callee's shadow space (Win64=32, SysV=0; reserved
@@ -457,6 +465,17 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
     // the placement store offsets disagree (a frame clobber).
     std::uint32_t const outgoingSlotSize = widthForClass(schema, LirRegClass::GPR);
 
+    // D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT (option E): the pre-regalloc pass
+    // moved a wide call's scalar overflow args OUT of the Call operand list and
+    // into `store_outgoing_arg` carriers, so the per-call arg walk below no
+    // longer sees them. The reservation must still cover their slots, else the
+    // stores clobber the frame. Each store's payload is its 0-based overflow
+    // slot index (per-call, restarting at 0), so max(payload+1) across all
+    // store_outgoing_arg insts = the widest single call's overflow — exactly
+    // the shared outgoing-area size needed. Folded into maxOverflow below.
+    std::uint16_t const storeOutOp =
+        schema.opcodeByMnemonic("store_outgoing_arg").value_or(0);
+
     std::uint32_t maxOverflow = 0;
     std::uint32_t const blockCount = src.funcBlockCount(fn);
     for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
@@ -465,6 +484,11 @@ computeMaxOutgoingStackArgs(Lir const& src, LirFuncId fn,
         for (std::uint32_t i = 0; i < instN; ++i) {
             LirInstId const inst = src.blockInstAt(blk, i);
             std::uint16_t const op = src.instOpcode(inst);
+            if (storeOutOp != 0 && op == storeOutOp) {
+                std::uint32_t const slots = src.instPayload(inst) + 1u;
+                if (slots > maxOverflow) maxOverflow = slots;
+                continue;
+            }
             auto const* info = schema.opcodeInfo(op);
             if (info == nullptr || !info->isCall) continue;
 
@@ -739,6 +763,13 @@ struct OpcodeHandles {
     std::uint16_t store;
     std::uint16_t frameLoad;
     std::uint16_t frameStore;
+    // D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT (option E): the pre-regalloc
+    // wide-call pass's outgoing-stack-arg store carrier. Payload = overflow
+    // slot index; operand[0] = the arg value (physical post-regalloc).
+    // Materialized into `store operand, [sp + shadowSpaceBytes +
+    // payload*outgoingSlotSize]` — byte-identical to the placement loop's
+    // stack store. Optional (only a target declaring the opcode emits it).
+    std::uint16_t storeOutgoingArg;
     // ML7 cycle 2: virtual-op handles materialized by the callconv pass.
     std::uint16_t arg;
     // FC7 C1c: the caller-side struct-return piece read (mirror of `arg`).
@@ -824,6 +855,26 @@ struct OpcodeHandles {
     // prologue's emit site fails loud if a CC declares stackProbePageBytes
     // but the schema lacks the opcode (a config mismatch).
     std::uint16_t stackProbe;
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the `lea_frame_slot` virtual op
+    // — a RE-REFERENCE of a body-local alloca's address that the MIR→LIR lowering
+    // emits at EACH use (instead of holding one entry-spanning address vreg, which
+    // tips a register-pressure cliff under the c69 entry-hoist). PAYLOAD = the
+    // alloca's 0-based scan-order index. Materialized into `lea result, [sp +
+    // localAreaOffset() + offsetOf(index)]` — the SAME `lea` the original `alloca`
+    // (same index) resolves to, looked up from the alloca-index→offset map this pass
+    // builds in scan order. Optional — only a target with body-local allocas (hence
+    // `alloca` + `lea`) declares it; absent ⇒ field 0, `op == h.leaFrameSlot` never
+    // matches (a target with NO `lea_frame_slot` simply never emits it from MIR→LIR,
+    // because that lowering only records the remat index when this opcode resolves —
+    // so the absence is self-consistent, NOT a silent gap). Requires `lea`.
+    std::uint16_t leaFrameSlot;
+    // c116 H1 (D-WIN64-SEH-FUNCLETS): the `recover_parent_frame_slot` virtual op — a
+    // frame-slot address off the establisher-frame base register (operand[0]) using
+    // the PARENT function's finalized FrameLayout (payload = slot index). Materialized
+    // into `lea result, [establisherReg + parentLocalAreaOffset(k)]`. Optional — only
+    // a target that supports SEH funclets declares it; absent ⇒ field 0, and `op ==
+    // h.recoverParentFrameSlot` never matches (a non-SEH module never emits it).
+    std::uint16_t recoverParentFrameSlot;
 };
 
 // FC2 Part B: resolve the class-correct opcode for a register-data-
@@ -1294,23 +1345,66 @@ returnReg(TargetSchema const&            schema,
 
 // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): one `dst <- src` register copy in
 // a parallel-move set (the return-register PIECES of a by-value struct return).
-struct RegMove { LirReg dst; LirReg src; };
+//
+// c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a move may instead have a MEMORY source
+// — a spilled register-passed call arg loaded DIRECTLY into its ABI arg register
+// (`frame_load dst, [memSlot]`). `isMemSrc` selects that arm; `src` is Invalid for
+// a mem-src move. A mem-src move is a pure SINK in the parallel copy: it is never
+// another move's SOURCE (nothing reads a register FROM it), so it can neither
+// block another move nor be a cycle member — it just waits until its `dst` is
+// free-to-write (no pending move still reads dst), then emits its load. This
+// composes with the reg→reg topo-sort + cycle-break UNCHANGED.
+struct RegMove {
+    LirReg        dst;
+    LirReg        src;                  // Invalid when isMemSrc
+    bool          isMemSrc = false;
+    std::uint32_t memSlotV = 0;         // LirSpillSlot.v, when isMemSrc
+};
+
+// c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): the frame geometry `emitParallelRegMoves`
+// needs to lower a mem-src move (`frame_load argReg, [slot]`) into a real sp-
+// relative load — the SAME formula the frame_load materialization uses
+// (`spillAreaOffset() + (slot.v-1)*slotSize`), so a direct-arg reload reads the
+// exact slot the rewriter would have. `sp` + `gprLoad`/`gprLoadU` feed the
+// emitFrameLoad chokepoint (the load op itself is class-resolved per dst). Passed
+// with `hasMemSrc=false` by the return-piece caller (which never has a mem-src
+// move), so the fields are unread there.
+struct MemSrcLoadCtx {
+    bool          valid = false;
+    LirReg        sp{};
+    std::uint32_t spillAreaOffset = 0;
+    std::uint32_t slotSize = 0;
+    std::uint16_t gprLoad = 0;
+    std::uint16_t gprLoadU = 0;
+};
 
 // Pick a caller-saved register of class `cls` not among the registers `moves`
-// touches — a free scratch at a call/return boundary (every caller-saved reg is
-// dead there except the return registers themselves, which are in the move set).
-// Agnostic: reads `cc.callerSaved`, never a hardcoded register. nullopt + loud
-// when none is free (would require more live return regs than exist — impossible
-// for SysV's ≤2 pieces).
+// touches (nor among `reserved`) — a free scratch at a call/return boundary
+// (every caller-saved reg is dead there except the ones the move set / the
+// call itself still need). Agnostic: reads `cc.callerSaved`, never a hardcoded
+// register. `reserved` carries the registers that survive the parallel move but
+// are NOT part of it — for the CALLER-side arg-passing move these are the
+// indirect-call callee register and the variadic vector-count register (both
+// consumed by the `call` that FOLLOWS the moves), so a cycle-break scratch must
+// not land on them (otherwise it would clobber the callee / count and the call
+// would jump through — or count — an argument value). The return-piece capture
+// runs AFTER the call and has no such survivors, so it passes an empty span.
+// nullopt + loud when none is free (would require more simultaneously-live regs
+// of the class than the ABI has caller-saved — impossible for SysV's ≤2 return
+// pieces and for any arg cycle: the arg-passing pool is disjoint from the extra
+// caller-saved scratch regs on every shipped ABI, e.g. SysV xmm8..15 / rax,r10,r11).
 [[nodiscard]] std::optional<LirReg>
 pickScratchReg(TargetSchema const& schema, TargetCallingConvention const& cc,
                LirRegClass cls, std::span<RegMove const> moves,
+               std::span<std::uint16_t const> reserved,
                std::string_view ctx, DiagnosticReporter& reporter) {
     TargetRegClass const want =
         static_cast<TargetRegClass>(static_cast<std::uint8_t>(cls));
     auto involved = [&](std::uint16_t id) {
         for (auto const& m : moves)
             if (m.dst.id == id || m.src.id == id) return true;
+        for (std::uint16_t const r : reserved)
+            if (r == id) return true;
         return false;
     };
     for (std::string_view const name : cc.callerSaved) {
@@ -1322,8 +1416,8 @@ pickScratchReg(TargetSchema const& schema, TargetCallingConvention const& cc,
         return makePhysicalReg(*ord, cls);
     }
     report(reporter, DiagnosticCode::L_MoveCycleUnsupported, DiagnosticSeverity::Error,
-           std::format("{}: no free caller-saved scratch register of the piece's "
-                       "class to break a return-register move cycle", ctx));
+           std::format("{}: no free caller-saved scratch register of the move's "
+                       "class to break a register-move cycle", ctx));
     return std::nullopt;
 }
 
@@ -1361,33 +1455,107 @@ indirectResultReg(TargetSchema const& schema, TargetCallingConvention const& cc,
 // Emit a set of parallel register copies so every SOURCE is read before its
 // register is overwritten. Non-cyclic moves emit in dependency order; a true cycle
 // (e.g. the two eightbytes of a {long,long} return landing cross-wise in rax/rdx,
-// or a 3-/4-FPR AAPCS64 HFA return cycle — FC7 C3) is broken with a scratch
-// register. D-ML7-2.3's arg path only REJECTS cycles; return pieces genuinely need
-// the break. The scratch-break linearizes a cycle of ANY length through ONE scratch
-// (it redirects all readers of one source to the scratch, freeing that source so the
-// progress scan drains the resulting chain), reused across disjoint cycles as `moves`
-// shrinks; `pickScratchReg` is the fail-loud backstop when no scratch of the class is
-// free (impossible while the move set leaves ≥1 caller-saved reg of that class idle).
+// or a 3-/4-FPR AAPCS64 HFA return cycle — FC7 C3; or a caller-side arg-passing
+// permutation such as a 2-swap `f(y,x)` or an N-way rotation across the FP arg
+// registers — D-ML7-2.3) is broken with a scratch register. The scratch-break
+// linearizes a cycle of ANY length through ONE scratch (it redirects all readers of
+// one source to the scratch, freeing that source so the progress scan drains the
+// resulting chain), reused across disjoint cycles as `moves` shrinks;
+// `pickScratchReg` is the fail-loud backstop when no scratch of the class is free
+// (impossible while the move set + `reserved` leave ≥1 caller-saved reg of that
+// class idle). `reserved` names registers that must survive the whole move set but
+// aren't part of it — the arg-passing caller passes the indirect-call callee reg +
+// variadic count reg (consumed by the FOLLOWING call); the return-piece capture
+// passes an empty span (it runs after the call).
 [[nodiscard]] bool
 emitParallelRegMoves(LirBuilder& b, TargetSchema const& schema,
                      TargetCallingConvention const& cc,
-                     std::vector<RegMove> moves, std::string_view ctx,
-                     DiagnosticReporter& reporter) {
-    std::erase_if(moves, [](RegMove const& m) { return m.dst.id == m.src.id; });
+                     std::vector<RegMove> moves,
+                     std::span<std::uint16_t const> reserved,
+                     std::string_view ctx, DiagnosticReporter& reporter,
+                     MemSrcLoadCtx const& memCtx = {}) {
+    // D-ML7-2.3 scratch-collapse fix: every parallel-move destination holds a
+    // COMMITTED value that must survive intact until the following `call` — an
+    // emitted move's destination now carries its final argument; an IDENTITY
+    // move's destination (dst==src) carries an incoming argument already in
+    // place. A cycle-break scratch must avoid EVERY destination, not merely the
+    // registers still present in the shrinking `moves` set. `pickScratchReg`
+    // excludes only registers named in the moves it is handed (+ `reserved`),
+    // so once the progress scan has emitted-and-erased a clean move — or the
+    // identity-erase below has dropped a dst==src move — that destination falls
+    // out of the exclusion and the picker would reuse it as scratch, clobbering
+    // the committed arg value (silent miscompile: an 8-FP-arg rotation whose
+    // caller sources overlap the low arg registers picked an already-written
+    // destination, destroying that arg). Capture the full destination footprint
+    // ONCE, BEFORE the identity-erase, and fold it into the reserved span passed
+    // at the cycle-break. Existence of a scratch is preserved: on every shipped
+    // ABI the caller-saved scratch pool is disjoint from the arg-register
+    // footprint (SysV xmm8..15 vs the xmm0..7 destinations; AAPCS64 d16..31 vs
+    // d0..7), so excluding all destinations still leaves a free caller-saved
+    // register of the class — and the fail-loud `L_MoveCycleUnsupported`
+    // backstop stays exact when a future ABI truly has none. Entirely
+    // cc-config-driven; no register names, no arch.
+    std::vector<std::uint16_t> scratchReserved(reserved.begin(), reserved.end());
+    for (auto const& m : moves) {
+        std::uint16_t const d = static_cast<std::uint16_t>(m.dst.id);
+        if (std::find(scratchReserved.begin(), scratchReserved.end(), d)
+            == scratchReserved.end()) {
+            scratchReserved.push_back(d);
+        }
+    }
+    // c77: a mem-src move (src Invalid) is never an identity — the erase only
+    // drops reg→reg dst==src no-ops.
+    std::erase_if(moves, [](RegMove const& m) {
+        return !m.isMemSrc && m.dst.id == m.src.id;
+    });
     auto isPendingSrc = [&](std::uint16_t id) {
-        for (auto const& m : moves)
-            if (m.src.id == id) return true;
+        for (auto const& m : moves) {
+            // c77: a mem-src move has NO register source (src Invalid, id 0), so it
+            // never keeps another move's dst pending. Only reg-src moves count.
+            if (!m.isMemSrc && m.src.id == id) return true;
+        }
         return false;
+    };
+    // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): emit ONE move — a reg→reg `mov` or,
+    // for a mem-src move, a `frame_load dst, [slot]` lowered to the sp-relative
+    // load (byte-identical to the frame_load materialization's formula). Fails
+    // loud if a mem-src move is reached without a valid MemSrcLoadCtx (only the
+    // arg-passing caller supplies mem-src moves + the ctx — a mem-src move in the
+    // return-piece path would be an internal invariant break).
+    auto emitOne = [&](RegMove const& m) -> bool {
+        if (!m.isMemSrc) {
+            auto const mv = classOpHandle(schema, m.dst.regClass(),
+                                          RegClassOp::Move, ctx, reporter);
+            if (!mv.has_value()) return false;
+            emitMov(b, *mv, m.dst, m.src);
+            return true;
+        }
+        if (!memCtx.valid) {
+            report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                   DiagnosticSeverity::Error,
+                   std::format("{}: a memory-source (spilled call-arg) parallel "
+                               "move reached emit without frame geometry — "
+                               "internal c77 direct-arg-reload invariant break",
+                               ctx));
+            return false;
+        }
+        LirSpillSlot const slot{m.memSlotV};
+        std::int32_t const offset = static_cast<std::int32_t>(
+            memCtx.spillAreaOffset + (slot.v - 1u) * memCtx.slotSize);
+        auto const spillLoad = classOpHandle(
+            schema, m.dst.regClass(), RegClassOp::Load,
+            "materializeOneFunc: direct-arg spill reload", reporter);
+        if (!spillLoad.has_value()) return false;
+        emitFrameLoad(b, *spillLoad, m.dst, memCtx.sp, offset,
+                      memCtx.gprLoad, memCtx.gprLoadU);
+        return true;
     };
     while (!moves.empty()) {
         bool progressed = false;
         for (std::size_t i = 0; i < moves.size(); ++i) {
             // Safe to emit now iff nobody still needs to READ moves[i].dst.
             if (isPendingSrc(moves[i].dst.id)) continue;
-            auto const mv = classOpHandle(schema, moves[i].dst.regClass(),
-                                          RegClassOp::Move, ctx, reporter);
-            if (!mv.has_value()) return false;
-            emitMov(b, *mv, moves[i].dst, moves[i].src);
+            if (!emitOne(moves[i])) return false;
             moves.erase(moves.begin() + static_cast<std::ptrdiff_t>(i));
             progressed = true;
             break;
@@ -1395,21 +1563,46 @@ emitParallelRegMoves(LirBuilder& b, TargetSchema const& schema,
         if (progressed) continue;
         // Only cycles remain. Break ONE cycle per outer iteration; the break
         // generalizes to any cycle length (FC7 C3 raised this from the SysV-only
-        // ≤2-piece gate — a 3-/4-FPR HFA return can form a ≥3-cycle): copy one
-        // member's source aside, then redirect every reader of that source to the
-        // scratch — freeing the source register so a safe move opens up next
-        // iteration, and the progress scan drains the rest of the (now linear)
-        // chain. Disjoint cycles are handled across successive outer iterations.
-        LirReg const cycSrc = moves.front().src;
+        // ≤2-piece gate — a 3-/4-FPR HFA return can form a ≥3-cycle; D-ML7-2.3
+        // extends it to caller-side arg permutations): copy one member's source
+        // aside, then redirect every reader of that source to the scratch — freeing
+        // the source register so a safe move opens up next iteration, and the
+        // progress scan drains the rest of the (now linear) chain. Disjoint cycles
+        // are handled across successive outer iterations.
+        //
+        // c77: a mem-src move is a pure SINK — it is never anyone's source, so it
+        // can never be a cycle member. When only cycles remain, every stuck move
+        // that is a mem-src is simply WAITING for a reg-src cycle to break and free
+        // its dst; the cycle break must therefore pick a REG-SRC victim. (A mem-src
+        // move cannot be `moves.front()` in a genuine deadlock, but scan for the
+        // first reg-src move regardless of position to be robust.)
+        RegMove const* cyc = nullptr;
+        for (auto const& m : moves) {
+            if (!m.isMemSrc) { cyc = &m; break; }
+        }
+        if (cyc == nullptr) {
+            // Only mem-src moves remain yet none can emit — impossible (a mem-src
+            // move blocks on `isPendingSrc(dst)`, which is only ever true because
+            // of a reg-src move; if no reg-src moves remain, isPendingSrc is false
+            // for all, so the progress scan drained them). Fail loud rather than
+            // spin.
+            report(reporter, DiagnosticCode::L_MoveCycleUnsupported,
+                   DiagnosticSeverity::Error,
+                   std::format("{}: parallel move stuck with only memory-source "
+                               "moves remaining — internal c77 invariant break",
+                               ctx));
+            return false;
+        }
+        LirReg const cycSrc = cyc->src;
         auto const scratch = pickScratchReg(schema, cc, cycSrc.regClass(),
-                                            moves, ctx, reporter);
+                                            moves, scratchReserved, ctx, reporter);
         if (!scratch.has_value()) return false;
         auto const mv = classOpHandle(schema, cycSrc.regClass(),
                                       RegClassOp::Move, ctx, reporter);
         if (!mv.has_value()) return false;
         emitMov(b, *mv, *scratch, cycSrc);
         for (auto& m : moves)
-            if (m.src.id == cycSrc.id) m.src = *scratch;
+            if (!m.isMemSrc && m.src.id == cycSrc.id) m.src = *scratch;
     }
     return true;
 }
@@ -1444,7 +1637,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 23> const table{{
+    std::array<Entry, 26> const table{{
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -1481,6 +1674,17 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // handle resolved.
         {&OpcodeHandles::alloca_,    "alloca",     true},
         {&OpcodeHandles::lea,        "lea",        true},
+        // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): optional — the alloca-address
+        // re-reference op. Materialized into `lea [sp + offsetOf(index)]`; needs
+        // `lea` (present on any target that has `alloca`). Absent ⇒ field 0; never
+        // matches, and the MIR→LIR lowering correspondingly never emits it (it only
+        // records the remat index when this opcode resolves — self-consistent).
+        {&OpcodeHandles::leaFrameSlot, "lea_frame_slot", true},
+        // c116 H1 (D-WIN64-SEH-FUNCLETS): optional — only a SEH-funclet target
+        // declares it. Materialized into `lea [establisherReg + parentSlotOffset]`;
+        // needs `lea`. Absent ⇒ field 0; `op == h.recoverParentFrameSlot` never
+        // matches (a non-SEH module never emits it).
+        {&OpcodeHandles::recoverParentFrameSlot, "recover_parent_frame_slot", true},
         // FC12a-core (D-FC12A-VARIADIC-CALLEE): optional — only a CC with a
         // `vaListLayout` emits these. Materialized into `lea [sp + offset]`; both
         // need `lea` (guaranteed present on any register-machine target that also
@@ -1510,6 +1714,11 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // Absent ⇒ field 0; the prologue emit site fails loud if a CC
         // declares stackProbePageBytes but the schema omits the opcode.
         {&OpcodeHandles::stackProbe,        "stack_probe",          true},
+        // D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT: optional — a target declares
+        // it to enable the pre-regalloc wide-call materialization. Absent ⇒
+        // field 0; `op == h.storeOutgoingArg` never matches (the pass would
+        // also have fail-louded at its own resolve if it ran without it).
+        {&OpcodeHandles::storeOutgoingArg,  "store_outgoing_arg",   true},
     }};
     for (auto const& [field, mnem, optional] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
@@ -1540,6 +1749,15 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                    LirFuncAllocation const& alloc,
                    LirBuilder& b, OpcodeHandles const& h,
                    FrameLayout& outLayout,
+                   // c116 H1 (D-WIN64-SEH-FUNCLETS): the FrameLayouts of the
+                   // functions materialized BEFORE this one (the funclet is appended
+                   // AFTER its parent by the synth pass, so the parent's layout is
+                   // already finalized here). `parentLayoutIndex` is set iff THIS
+                   // function is a SEH filter funclet — it names its parent's index
+                   // in `siblingLayouts`. A `recover_parent_frame_slot` op resolves
+                   // its slot offset against `siblingLayouts[*parentLayoutIndex]`.
+                   std::span<FrameLayout const> siblingLayouts,
+                   std::optional<std::uint32_t> parentLayoutIndex,
                    DiagnosticReporter& reporter) {
     if (!cc.stackPointer.has_value()) {
         report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
@@ -1643,6 +1861,51 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
     // frame-layout time, so each alloca's offset is stable AND its span
     // matches the reserved `localAreaSize` (no neighbour overlap).
     std::uint32_t localAllocaByteOffset = 0;
+
+    // D-FF3-SYSV-MIXED-CLASS-STACK-OVERFLOW-OFFSET: a running BYTE cursor over
+    // the incoming-stack (overflow) ARGUMENT area, advanced once per stack-
+    // resident `arg` op in entry-block scan order. This is the CALLEE-side
+    // mirror of the caller's single monotonic `overflowIdx` (the materialize
+    // `call` arm) — the SysV/AAPCS64 NSAA is a source-order cursor SHARED
+    // across the GPR and FPR classes, so two overflow args of DIFFERENT
+    // classes (e.g. a 7th int + a 9th double) occupy DISTINCT consecutive
+    // slots. The old per-arg formula `(payload - poolSize) * slot` restarted
+    // at 0 PER CLASS (payload is the per-class ordinal), so a GPR-overflow and
+    // an FPR-overflow arg — each "index 0 in its class's overflow" — collided
+    // on ONE slot (a silent miscompile: the callee read both from the same
+    // offset). Advancing a single shared cursor in source order reproduces the
+    // caller's monotonic placement byte-for-byte. `arg` ops are contiguous at
+    // the entry-block head, in declaration order = the caller's argument order,
+    // so this scan order matches the caller's operand order. A slot-aligned CC
+    // (Win64) never hits this path via a per-class miscount (its payload IS the
+    // flat shared slot index — see below), but the cursor is class-agnostic so
+    // it is correct there too.
+    std::uint32_t incomingStackArgByteOffset = 0;
+
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the per-alloca FRAME OFFSET
+    // (sp-relative), indexed by the alloca's 0-based scan-order index — the SAME
+    // progression `localAllocaByteOffset` walks below, precomputed up front so a
+    // `lea_frame_slot k` re-reference (which can appear in ANY block, possibly
+    // BEFORE the original `alloca` is materialized in the loop) resolves to its
+    // alloca's offset. Built from `localAllocaPayloads` (the scan-order payload
+    // list `computeFrameLayout` already sized the local area from), with the
+    // identical `localAreaOffset() + Σ allocaSlotCount*slotSize` formula. The
+    // alloca arm below ASSERTS its running offset equals `allocaSlotOffsets[i]`
+    // (defense-in-depth: a divergence would mean a `lea_frame_slot` points at the
+    // wrong slot — a silent miscompile — so it fails loud instead).
+    std::vector<std::int32_t> allocaSlotOffsets;
+    allocaSlotOffsets.reserve(localAllocaPayloads.size());
+    {
+        std::uint32_t running = 0;
+        for (std::uint32_t const p : localAllocaPayloads) {
+            allocaSlotOffsets.push_back(static_cast<std::int32_t>(
+                outLayout.localAreaOffset() + running));
+            running += allocaSlotCount(p, slotSize) * slotSize;
+        }
+    }
+    // Running scan-order index of the alloca arm — pairs with the offset
+    // precompute above for the consistency assertion.
+    std::uint32_t allocaScanIndex = 0;
 
     // FC7 C1c: `ret_piece` instructions captured by their struct-returning call's
     // look-ahead (they must immediately follow the call). A `ret_piece` reached in
@@ -1755,18 +2018,50 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 } else {
                     // Stack-resident: read from caller's outgoing area.
                     // Offset within outgoing area = shadowSpaceBytes +
-                    // (overflow_index * outgoingSlotSize). Callee reads
-                    // it at totalFrameSize + callPushBytes above its
-                    // own SP. outgoingSlotSize (= GPR width, 8 on
-                    // x86_64) is the per-stack-arg stride — NOT
-                    // slotSize (max of GPR/FPR = 16 on x86_64) which
-                    // is the spill-slot stride.
-                    std::uint32_t const overflowIdx = payload - poolSize;
+                    // incomingStackArgByteOffset (the running MONOTONIC,
+                    // source-order, class-SHARED overflow cursor — see its
+                    // declaration). Callee reads it at totalFrameSize +
+                    // callPushBytes above its own SP. outgoingSlotSize (= GPR
+                    // width, 8 on x86_64) is the per-stack-arg stride — NOT
+                    // slotSize (max of GPR/FPR = 16 on x86_64) which is the
+                    // spill-slot stride.
+                    //
+                    // D-FF3-SYSV-MIXED-CLASS-STACK-OVERFLOW-OFFSET: the offset
+                    // is the running cursor, NOT the old per-class formula
+                    // `(payload - poolSize) * slot`. For a SLOT-ALIGNED cc
+                    // (Win64) `payload` is the flat shared slot index and
+                    // poolSize = max(argGprs,argFprs), so `payload - poolSize`
+                    // ALREADY equalled the monotonic overflow index — assert
+                    // that congruence (defense-in-depth: a mismatch would mean
+                    // the scan order desynced from the payload). For an
+                    // INDEPENDENT-counter cc (SysV/AAPCS64) `payload` is the
+                    // per-class ordinal, so `payload - poolSize` was the
+                    // per-class overflow index (the BUG — it restarts at 0 per
+                    // class and collides across classes); the shared cursor is
+                    // the fix, so NO assertion there.
+                    std::uint32_t const overflowIdx =
+                        incomingStackArgByteOffset / outLayout.outgoingSlotSize;
+                    if (cc.slotAligned && (payload - poolSize) != overflowIdx) {
+                        report(reporter,
+                               DiagnosticCode::L_VirtualRegInPostRegalloc,
+                               DiagnosticSeverity::Error,
+                               std::format("callconv: slot-aligned stack-arg "
+                                           "cursor desync at inst {} "
+                                           "(per-class {} != monotonic {})",
+                                           inst.v, payload - poolSize,
+                                           overflowIdx));
+                        return false;
+                    }
                     std::int32_t const offset = static_cast<std::int32_t>(
                         outLayout.totalFrameSize
                         + static_cast<std::uint32_t>(cc.callPushBytes)
                         + static_cast<std::uint32_t>(cc.shadowSpaceBytes)
-                        + overflowIdx * outLayout.outgoingSlotSize);
+                        + incomingStackArgByteOffset);
+                    // Advance the shared cursor by ONE stack slot (the caller
+                    // stored this arg in exactly one pointer-width slot,
+                    // regardless of class — a stacked `double` is still 8
+                    // bytes). Mirrors the caller's `++overflowIdx`.
+                    incomingStackArgByteOffset += outLayout.outgoingSlotSize;
                     auto const argLoad = classOpHandle(
                         schema, cls, RegClassOp::Load,
                         "materializeOneFunc: stack-resident arg load",
@@ -1872,10 +2167,157 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // (`payload` = its byte size, 0 = scalar = 1 slot).
                 std::int32_t const offset = static_cast<std::int32_t>(
                     outLayout.localAreaOffset() + localAllocaByteOffset);
+                // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the precomputed
+                // `allocaSlotOffsets[i]` (which `lea_frame_slot` re-references read)
+                // MUST equal this arm's running offset for the same scan index —
+                // else a re-reference would point at a DIFFERENT slot than the
+                // original alloca (a silent miscompile). Fail loud on any skew
+                // (e.g. a future change to one progression but not the other).
+                if (allocaScanIndex >= allocaSlotOffsets.size()
+                    || allocaSlotOffsets[allocaScanIndex] != offset) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: alloca scan-order index {} frame "
+                                       "offset {} disagrees with the precomputed "
+                                       "alloca-slot offset map (count {}) — the "
+                                       "lea_frame_slot rematerialization map and the "
+                                       "alloca offset progression drifted "
+                                       "(D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE)",
+                                       allocaScanIndex, offset,
+                                       allocaSlotOffsets.size()));
+                    return false;
+                }
+                ++allocaScanIndex;
                 localAllocaByteOffset +=
                     allocaSlotCount(payload, outLayout.slotSize)
                     * outLayout.slotSize;
                 emitFrameAddr(b, h.lea, result, sp, offset);
+                continue;
+            }
+
+            // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): materialize a
+            // `lea_frame_slot k` re-reference into `lea result, [sp +
+            // allocaSlotOffsets[k]]` — the SAME frame address the original `alloca`
+            // (scan index k) resolves to above. The MIR→LIR lowering emits one of
+            // these at EACH use of a body-local alloca's address (rather than
+            // holding one entry-spanning address vreg), so the address lands in a
+            // FRESH tiny-range register at the use and the entry-hoist costs no
+            // register pressure. `k` rides the PAYLOAD (preserved verbatim across
+            // the rewrite / legalize rebuilds). Bounds-checked against the map so a
+            // stray/garbage index fails loud rather than reading OOB.
+            if (h.leaFrameSlot != 0 && op == h.leaFrameSlot) {
+                if (h.lea == 0 || !result.valid() || result.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                           DiagnosticSeverity::Error,
+                           "callconv: lea_frame_slot materialization needs 'lea' + a "
+                           "physical-reg result "
+                           "(D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE)");
+                    return false;
+                }
+                if (payload >= allocaSlotOffsets.size()) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: lea_frame_slot inst {} references "
+                                       "local-alloca index {} but the function has "
+                                       "only {} alloca slot(s) "
+                                       "(D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE)",
+                                       inst.v, payload, allocaSlotOffsets.size()));
+                    return false;
+                }
+                // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): an OPTIONAL leading
+                // ImmInt operand is a folded CONSTANT byte displacement (a
+                // `&local[constIdx]`/`&s.field` Gep folded into this frame reference
+                // by lowerGep) — add it to the slot offset so the result is `lea [sp +
+                // slotOff + disp]`. `sp` as the base keeps the arm64 >16 MiB MOVZ/MOVK
+                // lea macro safe (base != Xd). The combined offset stays within the
+                // int32 frame domain by construction (lowerGep guards the disp to
+                // int32, and a frame > 2 GiB fails loud downstream at the encoder).
+                std::int64_t combinedOffset =
+                    static_cast<std::int64_t>(allocaSlotOffsets[payload]);
+                if (!ops.empty()) {
+                    if (ops[0].kind != LirOperandKind::ImmInt) {
+                        report(reporter,
+                               DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                               DiagnosticSeverity::Error,
+                               std::format("callconv: lea_frame_slot inst {} has an "
+                                           "unexpected non-ImmInt operand — only a "
+                                           "folded constant displacement is allowed "
+                                           "(D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE)",
+                                           inst.v));
+                        return false;
+                    }
+                    combinedOffset += static_cast<std::int64_t>(ops[0].immInt32);
+                }
+                if (combinedOffset < std::numeric_limits<std::int32_t>::min()
+                    || combinedOffset > std::numeric_limits<std::int32_t>::max()) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: lea_frame_slot inst {} combined "
+                                       "frame offset {} exceeds the int32 frame-offset "
+                                       "domain (D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE)",
+                                       inst.v, combinedOffset));
+                    return false;
+                }
+                emitFrameAddr(b, h.lea, result, sp,
+                              static_cast<std::int32_t>(combinedOffset));
+                continue;
+            }
+
+            // c116 H1 (D-WIN64-SEH-FUNCLETS): materialize `recover_parent_frame_slot`
+            // — a frame-slot address off the ESTABLISHER-frame base register
+            // (operand[0]), using the PARENT function's finalized FrameLayout. The
+            // parent local at scan-order slot `payload` sits at
+            // `parent.localAreaOffset() + slot * parent.slotSize` off the parent's
+            // post-prologue SP; a fault-time x64 establisher frame (FrameRegister=0)
+            // == that same SP, so the recovered address is `lea result,
+            // [establisherReg + parentSlotOffset]`. AGNOSTIC: the base is a NORMAL
+            // register operand (never a hardcoded rdx), the offset is from the config
+            // FrameLayout, and this op resolves ONLY inside a funclet (parentLayout
+            // Index set). The establisher register is a live funclet parameter, so
+            // the normal callconv spills it across the funclet's own call for free.
+            if (h.recoverParentFrameSlot != 0 && op == h.recoverParentFrameSlot) {
+                if (h.lea == 0 || !result.valid() || result.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                           DiagnosticSeverity::Error,
+                           "callconv: recover_parent_frame_slot materialization needs "
+                           "'lea' + a physical-reg result (D-WIN64-SEH-FUNCLETS)");
+                    return false;
+                }
+                if (!parentLayoutIndex.has_value()
+                    || *parentLayoutIndex >= siblingLayouts.size()) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: recover_parent_frame_slot in a "
+                                       "function with no resolvable SEH parent layout "
+                                       "(inst {}) — D-WIN64-SEH-FUNCLETS", inst.v));
+                    return false;
+                }
+                if (ops.empty() || ops[0].kind != LirOperandKind::Reg
+                    || ops[0].reg.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: recover_parent_frame_slot inst {} "
+                                       "expects a physical-register establisher base "
+                                       "operand (D-WIN64-SEH-FUNCLETS)", inst.v));
+                    return false;
+                }
+                FrameLayout const& parentLayout = siblingLayouts[*parentLayoutIndex];
+                std::int64_t const slotOffset =
+                    static_cast<std::int64_t>(parentLayout.localAreaOffset())
+                    + static_cast<std::int64_t>(payload)
+                          * static_cast<std::int64_t>(parentLayout.slotSize);
+                if (slotOffset < std::numeric_limits<std::int32_t>::min()
+                    || slotOffset > std::numeric_limits<std::int32_t>::max()) {
+                    report(reporter, DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: recover_parent_frame_slot inst {} "
+                                       "parent-frame offset {} exceeds the int32 "
+                                       "frame-offset domain (D-WIN64-SEH-FUNCLETS)",
+                                       inst.v, slotOffset));
+                    return false;
+                }
+                emitFrameAddr(b, h.lea, result, ops[0].reg,
+                              static_cast<std::int32_t>(slotOffset));
                 continue;
             }
 
@@ -2079,6 +2521,14 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 struct ArgMove {
                     LirReg dest;
                     LirReg src;
+                    // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a SPILLED register-
+                    // passed arg loads DIRECTLY into `dest` from its stack slot
+                    // (`frame_load dest, [memSlotV]`) instead of `mov dest, src`.
+                    // `src` is Invalid for a mem-src arg move. Carried into the
+                    // parallel-move machinery (emitParallelRegMoves) where it is a
+                    // pure sink — sequenced AFTER any reg-move that reads `dest`.
+                    bool          isMemSrc = false;
+                    std::uint32_t memSlotV = 0;
                 };
                 struct StackArgStore {
                     LirReg       src;
@@ -2166,8 +2616,24 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // FC12a-struct: the ByValueStackAgg marker is consumed WITH its
                     // preceding Reg (below) — never on its own. Skip it here.
                     if (argOp.kind == LirOperandKind::ByValueStackAgg) continue;
-                    if (argOp.kind != LirOperandKind::Reg
-                        || argOp.reg.isPhysical == 0) {
+                    // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a SpillSlotRef is a
+                    // SPILLED register-passed arg the rewriter deferred. Its class
+                    // rides `spillSlotClass`; it has no source register (it loads
+                    // from its stack slot directly into its ABI arg register). It
+                    // advances the arg cursors EXACTLY as a Reg arg of that class
+                    // would (the rewriter's classifier used the same walk), and is
+                    // never a by-value carrier (a carrier is a Reg + marker; the
+                    // rewriter never defers a carrier). Handled uniformly below via
+                    // `isSpillRef` — the register-resident branch pushes a mem-src
+                    // ArgMove. A SpillSlotRef must NEVER land in the overflow region
+                    // (lowerWideCallArgs removed overflow args pre-regalloc, and the
+                    // rewriter only defers args the cc passes in a register) — a
+                    // defensive fail-loud guards that below.
+                    bool const isSpillRef =
+                        argOp.kind == LirOperandKind::SpillSlotRef;
+                    if (!isSpillRef
+                        && (argOp.kind != LirOperandKind::Reg
+                            || argOp.reg.isPhysical == 0)) {
                         report(reporter,
                                DiagnosticCode::L_VirtualRegInPostRegalloc,
                                DiagnosticSeverity::Error,
@@ -2177,8 +2643,10 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                            argRegionIdx));
                         return false;
                     }
-                    LirReg const srcReg = argOp.reg;
-                    LirRegClass const cls = srcReg.regClass();
+                    LirReg const srcReg = isSpillRef ? InvalidLirReg : argOp.reg;
+                    LirRegClass const cls = isSpillRef
+                        ? static_cast<LirRegClass>(argOp.spillSlotClass)
+                        : srcReg.regClass();
                     // FC12a-struct (D-FC12A-VARIADIC-MEMORY-CLASS-STRUCT): a Reg
                     // immediately FOLLOWED by a ByValueStackAgg marker is the by-value-
                     // stack aggregate carrier. It is passed ENTIRELY in the overflow
@@ -2187,7 +2655,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // arg register (the class/slot counters do NOT advance) and reserves
                     // ceil(bytes / slot) overflow slots. This is the force-to-stack
                     // lever the greedy register-then-overflow placement otherwise lacks.
-                    if ((i + 1) < ops.size()
+                    if (!isSpillRef && (i + 1) < ops.size()
                         && ops[i + 1].kind == LirOperandKind::ByValueStackAgg) {
                         std::uint32_t const aggBytes = ops[i + 1].byValueAggBytes;
                         std::int32_t const dstOffset =
@@ -2240,7 +2708,19 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                             argPassingReg(schema, cc, argIndex, cls,
                                           "materializeOneFunc: call", reporter);
                         if (!destReg.has_value()) return false;
-                        argMoves.push_back({*destReg, srcReg});
+                        // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a SpillSlotRef arg
+                        // becomes a MEM-SOURCE arg move — `frame_load destReg, [slot]`
+                        // — sequenced by emitParallelRegMoves as a sink (after any
+                        // reg-move that reads destReg). A normal Reg arg is the usual
+                        // reg→reg move. Both take the SAME arg-index slot, so the
+                        // move set + hazard analysis are index-consistent.
+                        if (isSpillRef) {
+                            argMoves.push_back(
+                                {*destReg, InvalidLirReg, /*isMemSrc=*/true,
+                                 argOp.spillSlotV});
+                        } else {
+                            argMoves.push_back({*destReg, srcReg});
+                        }
                         // FC12b PART 5: a register-resident FP VARARG under Win64 also
                         // duplicates into its home integer reg argGprs[slot]. Win64 is
                         // slot-aligned so `argIndex` IS the slot index; argGprs[slot]
@@ -2259,6 +2739,26 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                             fpDupMoves.push_back({*homeGpr, *destReg});
                         }
                     } else {
+                        // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): a SpillSlotRef must
+                        // never reach the OVERFLOW region — lowerWideCallArgs removed
+                        // overflow scalar args pre-regalloc, and the rewriter only
+                        // defers args the cc passes in a REGISTER (classifyCallRegArgs
+                        // marks only argIndex<poolSize). A SpillSlotRef here means the
+                        // rewriter's classifier and this walk diverged → fail loud
+                        // rather than dereference an Invalid srcReg into a stack store.
+                        if (isSpillRef) {
+                            report(reporter,
+                                   DiagnosticCode::L_UnsupportedLoweringForOpcode,
+                                   DiagnosticSeverity::Error,
+                                   std::format("callconv: call inst {} arg {} is a "
+                                               "deferred spilled-arg (SpillSlotRef) "
+                                               "but landed in the stack-overflow "
+                                               "region — the rewriter's direct-arg-"
+                                               "reload classifier disagreed with the "
+                                               "callconv arg walk (c77 invariant "
+                                               "break)", inst.v, argRegionIdx));
+                            return false;
+                        }
                         // D-ML7-2.2 stack-arg overflow: spill srcReg
                         // into THIS fn's outgoing-args area at
                         // [sp + shadowSpaceBytes + overflowIdx * slotSize].
@@ -2302,61 +2802,24 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     }
                     argMoves.push_back({*irr, sretOp.reg});
                 }
-                // Move-ordering hazard detection (silent-failure-hunter
-                // CRITICAL F1 fold + post-fold inversion fix). The
-                // naive emit-in-order shape is correct ONLY when, for
-                // every pair (i, j) with i < j, emitting move i does
-                // not clobber a register that move j still needs to
-                // read. The hazard predicate is:
+                // D-ML7-2.3 (closed): the arg-passing register moves are a
+                // PARALLEL COPY — every source must be read at its pre-call value
+                // before any destination overwrites it. regalloc can pin sources
+                // to registers that are ALSO destinations (a permutation), forming
+                // move-graph cycles: a 2-swap `f(y,x)` (argfpr0↔argfpr1), an N-way
+                // rotation across the FP/GPR arg registers, or several disjoint
+                // cycles mixed with orderable moves. `emitParallelRegMoves` (called
+                // below, AFTER the stack-store phase reads its sources) emits the
+                // orderable moves in dependency order and breaks each remaining
+                // cycle with a scratch register of the cycle's class drawn from
+                // `cc.callerSaved` — never a hardcoded reg. It supersedes the v1
+                // O(N^2) hazard DETECTOR that fail-loud-rejected these shapes.
                 //
-                //     dest_i == src_j   for some j > i
-                //
-                // (Move i WRITES dest_i. Move j READS src_j. If
-                // dest_i == src_j and i runs first, the value move j
-                // needed is gone.)
-                //
-                // The previous version of this loop used the inverted
-                // predicate `dest_j == src_i` which is SAFE in in-order
-                // emission (move i reads src_i before move j writes
-                // dest_j) — that loop accidentally still caught true
-                // 2-cycle swaps because swaps satisfy BOTH predicates
-                // symmetrically, but it false-rejected valid orderable
-                // sequences like (arg0: rdi←rsi, arg1: rsi←rcx). The
-                // current predicate fires on the true hazard only.
-                //
-                // The detector is conservative: it rejects any
-                // orderable chain where a true cycle is structurally
-                // possible (e.g. (a←b, b←a) — a real swap) AND
-                // multi-step shapes that the in-order emission cannot
-                // handle without re-ordering. Proper parallel-copy
-                // resolution (topo-sort + scratch-reg cycle breaking)
-                // is anchored at D-ML7-2.3 and would accept all
-                // orderable shapes by re-sorting moves before emit.
-                for (std::size_t i = 0; i < argMoves.size(); ++i) {
-                    if (argMoves[i].dest.id == argMoves[i].src.id) continue;
-                    for (std::size_t j = i + 1; j < argMoves.size(); ++j) {
-                        if (argMoves[j].dest.id == argMoves[j].src.id) continue;
-                        // Hazard: move i writes dest_i which move j
-                        // still needs to read as src_j.
-                        if (argMoves[i].dest.id == argMoves[j].src.id) {
-                            report(reporter,
-                                   DiagnosticCode::L_MoveCycleUnsupported,
-                                   DiagnosticSeverity::Error,
-                                   std::format("callconv: call inst {} arg-"
-                                               "passing moves have an order "
-                                               "hazard (move {} dest reg #{} "
-                                               "is the source of later move "
-                                               "{} — emitting in order would "
-                                               "clobber it); parallel-copy "
-                                               "resolution is anchored at "
-                                               "D-ML7-2.3",
-                                               inst.v, i,
-                                               static_cast<unsigned>(argMoves[i].dest.id),
-                                               j));
-                            return false;
-                        }
-                    }
-                }
+                // (History: the v1 detector's final predicate was
+                // `argMoves[i].dest == argMoves[j].src` for i<j — it rejected both
+                // true cycles AND some orderable chains, deferring the real fix to
+                // this anchor. That guard is now removed; the resolver accepts every
+                // orderable chain and breaks every cycle.)
                 // FC4 c2 indirect-callee backstop (the red-on-disable
                 // lever for the regalloc-tier rules): a Reg callee that
                 // regalloc parked in one of THIS call's arg-passing
@@ -2576,16 +3039,44 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         }
                     }
                 }
-                // Cycle-free — emit register moves in order. FC2
-                // Part B: each move's mnemonic follows its class
-                // (FPR arg-passing moves use movaps).
-                for (auto const& m : argMoves) {
-                    auto const argMov = classOpHandle(
-                        schema, m.dest.regClass(), RegClassOp::Move,
-                        "materializeOneFunc: call arg-passing move",
-                        reporter);
-                    if (!argMov.has_value()) return false;
-                    maybeMov(b, *argMov, m.dest, m.src);
+                // D-ML7-2.3: emit the arg-passing register moves as a PARALLEL COPY
+                // — orderable moves in dependency order, each remaining cycle broken
+                // with a class-correct scratch register (FC2 Part B: every move's
+                // mnemonic follows its class, so an FPR cycle breaks through an FPR
+                // scratch via movaps, a GPR cycle through a GPR scratch via mov). The
+                // scratch must avoid the registers the FOLLOWING `call` still needs:
+                // an indirect callee reg (jumped through) and the variadic vector-
+                // count reg (set below) — passed as `reserved`. The
+                // L_IndirectCalleeClobberedByArgSetup backstop above already proved
+                // the callee is not itself an arg-move DEST; reserving it here keeps
+                // a cycle-break scratch off it too. Runs AFTER the stack-store phase
+                // so those stores read their sources at the pre-move value.
+                std::vector<RegMove> argRegMoves;
+                argRegMoves.reserve(argMoves.size());
+                // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): carry the mem-src flag +
+                // slot into the parallel-move set. A mem-src move loads its arg
+                // register directly from the spill slot (sequenced as a sink).
+                for (auto const& m : argMoves)
+                    argRegMoves.push_back({m.dest, m.src, m.isMemSrc, m.memSlotV});
+                std::vector<std::uint16_t> argScratchReserved;
+                if (calleeIsReg) argScratchReserved.push_back(calleeOp.reg.id);
+                if (::dss::call_payload::isVariadic(payload)
+                    && cc.variadicVectorCountReg.has_value())
+                    argScratchReserved.push_back(cc.variadicVectorCountReg->ordinal);
+                // c77: frame geometry for a mem-src arg move's `frame_load argReg,
+                // [slot]` lowering — the SAME formula the frame_load materialization
+                // uses (spillAreaOffset + (slot.v-1)*slotSize). GPR load + its scaled
+                // twin feed the emitFrameLoad chokepoint (the per-move load op is
+                // class-resolved from the arg register's class).
+                MemSrcLoadCtx const argMemCtx{
+                    /*valid=*/true, sp, outLayout.spillAreaOffset(),
+                    outLayout.slotSize, h.load, h.loadU};
+                if (!emitParallelRegMoves(
+                        b, schema, cc, std::move(argRegMoves),
+                        argScratchReserved,
+                        "materializeOneFunc: call arg-passing move", reporter,
+                        argMemCtx)) {
+                    return false;
                 }
                 // FC12b PART 5: emit the Win64 FP-vararg GPR duplications AFTER the
                 // arg moves (the xmm dest now holds the value). Each is `movq_xmm_to_
@@ -2755,6 +3246,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 if (!retMoves.empty()
                     && !emitParallelRegMoves(
                            b, schema, cc, std::move(retMoves),
+                           /*reserved=*/{},
                            "materializeOneFunc: call-result capture", reporter)) {
                     return false;
                 }
@@ -2800,6 +3292,34 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // Mirror of the spill reload: a high spill slot's store swaps
                 // to store_u via the chokepoint (FPR spill keeps fstur).
                 emitFrameStore(b, *spillStore, ops[0].reg, sp, offset,
+                               h.store, h.storeU);
+                continue;
+            }
+            // D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT (option E): the pre-regalloc
+            // wide-call pass's outgoing-stack-arg store. Payload = overflow slot
+            // index; operand[0] = the (now physical) arg value. Offset =
+            // shadowSpaceBytes + payload*outgoingSlotSize — BYTE-IDENTICAL to the
+            // placement-loop stack store below, so the caller-store ↔ callee-load
+            // contract (the stack-resident `arg` read) is unchanged. Emitted in
+            // THIS fn's outgoing-args area at [sp + 0 .. outgoingArgAreaSize).
+            if (h.storeOutgoingArg != 0 && op == h.storeOutgoingArg) {
+                if (ops.empty() || ops[0].kind != LirOperandKind::Reg
+                    || ops[0].reg.isPhysical == 0) {
+                    report(reporter, DiagnosticCode::L_VirtualRegInPostRegalloc,
+                           DiagnosticSeverity::Error,
+                           std::format("callconv: store_outgoing_arg inst {} "
+                                       "operand is not a physical reg after "
+                                       "regalloc", inst.v));
+                    return false;
+                }
+                std::int32_t const offset = static_cast<std::int32_t>(
+                    static_cast<std::uint32_t>(cc.shadowSpaceBytes)
+                    + payload * outLayout.outgoingSlotSize);
+                auto const stkStore = classOpHandle(
+                    schema, ops[0].reg.regClass(), RegClassOp::Store,
+                    "materializeOneFunc: store_outgoing_arg", reporter);
+                if (!stkStore.has_value()) return false;
+                emitFrameStore(b, *stkStore, ops[0].reg, sp, offset,
                                h.store, h.storeU);
                 continue;
             }
@@ -2860,6 +3380,7 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         }
                         if (!emitParallelRegMoves(
                                 b, schema, cc, std::move(retMoves),
+                                /*reserved=*/{},
                                 "materializeOneFunc: ret-value", reporter)) {
                             return false;
                         }
@@ -2894,12 +3415,41 @@ LirCallconvResult
 materializeCallingConvention(Lir const&           src,
                              TargetSchema const&  schema,
                              LirAllocation const& alloc,
-                             DiagnosticReporter&  reporter) {
+                             DiagnosticReporter&  reporter,
+                             std::span<SehFuncletParent const> sehFuncletParents) {
     LirCallconvResult out;
 
     auto opcodes = resolveOpcodes(schema, reporter);
     if (!opcodes.has_value()) {
         return out;  // empty Lir + empty perFunc — `ok()` returns false
+    }
+
+    // c116 H1 (D-WIN64-SEH-FUNCLETS): resolve each funclet's parent to a FUNCTION
+    // INDEX (position in `src.funcAt(i)` == position in `out.perFunc`). The synth
+    // pass appends each funclet AFTER its parent, so the parent index is always <
+    // the funclet index ⇒ `out.perFunc[parentIndex]` is finalized when the funclet
+    // is materialized. Built once here by scanning function symbols. Empty ⇒ no SEH.
+    std::unordered_map<std::uint32_t, std::uint32_t> funcletIdxToParentIdx;
+    if (!sehFuncletParents.empty()) {
+        std::unordered_map<std::uint32_t, std::uint32_t> symToIndex;
+        std::size_t const nfAll = src.moduleFuncCount();
+        for (std::uint32_t i = 0; i < nfAll; ++i) {
+            symToIndex[src.funcArena().at(src.funcAt(i)).symbol] = i;
+        }
+        for (auto const& fp : sehFuncletParents) {
+            auto fIt = symToIndex.find(fp.funcletSymbol.v);
+            auto pIt = symToIndex.find(fp.parentSymbol.v);
+            if (fIt == symToIndex.end() || pIt == symToIndex.end()) {
+                report(reporter, DiagnosticCode::R_CallingConventionLookupFailed,
+                       DiagnosticSeverity::Error,
+                       std::format("materializeCallingConvention: SEH funclet "
+                                   "symbol {} or its parent {} not found in the LIR "
+                                   "module (D-WIN64-SEH-FUNCLETS)",
+                                   fp.funcletSymbol.v, fp.parentSymbol.v));
+                return LirCallconvResult{};
+            }
+            funcletIdxToParentIdx[fIt->second] = pIt->second;
+        }
     }
 
     LirBuilder b{schema};
@@ -2965,8 +3515,17 @@ materializeCallingConvention(Lir const&           src,
             return LirCallconvResult{};
         }
         FrameLayout layout;
+        // c116 H1 (D-WIN64-SEH-FUNCLETS): if this function is a SEH filter funclet,
+        // pass its parent's layout index. `out.perFunc` holds every already-
+        // materialized function's finalized layout (the funclet's parent among them,
+        // since synth appends funclets after parents). A non-funclet passes nullopt.
+        std::optional<std::uint32_t> parentLayoutIndex;
+        if (auto it = funcletIdxToParentIdx.find(i);
+            it != funcletIdxToParentIdx.end()) {
+            parentLayoutIndex = it->second;
+        }
         if (!materializeOneFunc(src, fn, schema, *cc, funcAlloc, b, *opcodes,
-                                layout, reporter)) {
+                                layout, out.perFunc, parentLayoutIndex, reporter)) {
             return LirCallconvResult{};
         }
         out.perFunc.push_back(std::move(layout));

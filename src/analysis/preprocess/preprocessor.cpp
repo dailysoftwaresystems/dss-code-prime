@@ -406,6 +406,80 @@ struct SynthBuilder {
         }
     }
 
+    // The outcome of resolving an include NAME to a shipped system descriptor +
+    // splicing its `macros` surface (the SHARED body of the ANGLE-include path AND
+    // the QUOTE→ANGLE fallback below). `NotAvailable` = no descriptor on the path,
+    // or one gated unavailable on the active format (caller leaves the include
+    // verbatim); `Malformed` = the descriptor exists but its macros failed to
+    // decode (an error was emitted; caller should not resolve it another way);
+    // `Spliced` = the descriptor exists + is available (its `#define` lines, if
+    // any, were appended to `out` — zero for a typed-only descriptor).
+    enum class SystemMacroSplice { NotAvailable, Malformed, Spliced };
+
+    // Resolve `headerName` to a `<stem>.json` system descriptor and, when it
+    // exists + is available on the active format, splice a synthetic `#define`
+    // for each of its `macros` into `out` (D-PP-DESCRIPTOR-MACRO-INJECT). This
+    // is the ONE descriptor-macro-splice used by BOTH the angle-`#include <h>`
+    // arm and the quote→angle fallback, so the two never drift on availability,
+    // malformed-handling, or the `#define` reconstruction. It appends ONLY the
+    // `#define` lines (never the include line itself); the CALLER owns whether to
+    // keep the original bytes (angle) or rewrite them to the angle form (quote
+    // fallback), and owns the surrounding `copyVerbatim`. Inert (NotAvailable)
+    // when there are no systemDirs.
+    SystemMacroSplice spliceSystemDescriptorMacros(std::string const& headerName,
+                                                   std::string& out) {
+        if (systemDirs.empty()) return SystemMacroSplice::NotAvailable;
+        auto descPath = resolveSystemDescriptor(headerName, systemDirs);
+        if (!descPath) return SystemMacroSplice::NotAvailable;
+        // If the descriptor declares this header unavailable on the active
+        // object-format, treat it EXACTLY like "no descriptor on the path" — the
+        // semantic gate then fails loud + `__has_include` returns false, so all
+        // three descriptor consumers stay consistent (c9 MUST-FIX-3).
+        if (activeFormat.has_value()
+            && !ffi::shippedHeaderAvailableForFormat(*descPath, *activeFormat)) {
+            return SystemMacroSplice::NotAvailable;
+        }
+        DiagnosticReporter macroRep;
+        // Pass the active object-format so a per-FORMAT macro variant selects the
+        // right replacement; nullopt ⇒ a variants-only macro is not injected.
+        auto macros = ffi::readShippedLibMacros(*descPath, macroRep, activeFormat);
+        if (!macros) {
+            emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError, BufferId{},
+                   SourceSpan::empty(0),
+                   std::string{"shipped-header descriptor malformed (macros): "}
+                       + descPath->generic_string());
+            return SystemMacroSplice::Malformed;
+        }
+        for (auto const& macro : *macros) {
+            // Reconstruct the neutral macro as a `#define` line; the downstream
+            // tokenizer + handleDefine build the MacroDef with the proven
+            // function-like / param / redefinition machinery (an identical
+            // re-define on a double-include is idempotent).
+            std::string def = "#define " + macro.name;
+            if (macro.params.has_value()) {
+                def += "(";
+                bool first = true;
+                for (auto const& pn : *macro.params) {
+                    if (!first) def += ",";
+                    def += pn;
+                    first = false;
+                }
+                if (macro.variadic) {
+                    if (!macro.params->empty()) def += ",";
+                    def += "...";
+                }
+                def += ")";
+            }
+            if (!macro.replacement.empty()) {
+                def += " ";
+                def += macro.replacement;
+            }
+            def += "\n";
+            out.append(def);
+        }
+        return SystemMacroSplice::Spliced;
+    }
+
     // c17: record a LIVE-branch `#define` into `localMacros` for the pre-scan's
     // `#if` evaluation. `[nameP, end)` are the directive-line PPTokens AFTER the
     // `define` word. FUNCTION-like iff the function-like-open token is IMMEDIATELY
@@ -523,7 +597,20 @@ struct SynthBuilder {
                 return sbExpand(in, buf, active, 0);
             };
         PpIsDefined definedCb = [this](std::string_view n) {
-            return localMacros.find(std::string{n}) != localMacros.end();
+            if (localMacros.find(std::string{n}) != localMacros.end()) return true;
+            // A config-seeded predefined macro (e.g. `_WIN32`) is also `defined`
+            // in the pre-scan, applying the SAME per-format availability filter
+            // as the authoritative pass — so the two agree on a
+            // `#if defined(_WIN32)`-gated quote-`#include` (never a divergence
+            // that skips a live include).
+            for (PredefinedMacroDef const& pm : schema->preprocess().predefinedMacros) {
+                if (pm.name != n) continue;
+                if (pm.availableObjectFormats.empty()) return true;
+                if (!activeFormat.has_value()) return false;
+                return ffi::objectFormatInAvailabilitySet(pm.availableObjectFormats,
+                                                          *activeFormat);
+            }
+            return false;
         };
         // Resolve `__has_include` EXACTLY as the include machinery / the macro
         // pass's callback does (quote = self-dir + includeDirs; angle =
@@ -779,7 +866,6 @@ struct SynthBuilder {
                 if (!angleKind.valid() || toks[k].tok.schemaKind != angleKind) {
                     continue;
                 }
-                if (systemDirs.empty()) continue;
                 // The angle BODY is the coalesced token immediately after the
                 // opener (mirrors the quote-body extraction below).
                 const std::size_t aBody = k + 1;
@@ -790,63 +876,22 @@ struct SynthBuilder {
                 }
                 std::string const angleName{toks[aBody].text};
                 if (angleName.empty()) continue;
-                auto descPath = resolveSystemDescriptor(angleName, systemDirs);
-                if (!descPath) continue;  // no descriptor on the path — leave verbatim
-                // c9 (MUST-FIX-3): if the descriptor declares this header
-                // unavailable on the active object-format, treat it EXACTLY like
-                // "no descriptor on the path" — leave the include verbatim, splice
-                // no macros. The semantic gate then fails loud and `__has_include`
-                // returns false: all three descriptor consumers stay consistent.
-                if (activeFormat.has_value()
-                    && !ffi::shippedHeaderAvailableForFormat(*descPath, *activeFormat)) {
+                // Splice the descriptor's macros into a LOCAL buffer FIRST (so a
+                // NotAvailable outcome touches neither `out` nor the line-map). On
+                // NotAvailable (no descriptor / unavailable) OR Malformed (already
+                // emitted) leave the include fully verbatim. Otherwise copy up to
+                // the directive, emit the `#define` lines, then KEEP the include
+                // line in place (copiedUpTo = dStart) so the post-parse import
+                // resolver still injects the typed surfaces (a typed-only
+                // descriptor splices zero macros but the line is still kept).
+                std::string defs;
+                if (spliceSystemDescriptorMacros(angleName, defs)
+                    != SystemMacroSplice::Spliced) {
                     continue;
                 }
-                DiagnosticReporter macroRep;
-                // Pass the active object-format so a per-FORMAT macro variant
-                // (errno's `__errno_location`/elf vs `__error`/macho) selects the
-                // right replacement. nullopt activeFormat ⇒ a variants-only macro
-                // is not injected (a flat macro is unaffected) — same per-format
-                // truth as the availability gate above.
-                auto macros = ffi::readShippedLibMacros(*descPath, macroRep, activeFormat);
-                if (!macros) {
-                    // Malformed descriptor: fail loud (the post-parse resolver
-                    // will also error on the typed side), never silent.
-                    emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
-                           BufferId{}, SourceSpan::empty(0),
-                           std::string{"shipped-header descriptor malformed "
-                                       "(macros): "} + descPath->generic_string());
-                    continue;
-                }
-                if (macros->empty()) continue;  // typed-only descriptor (no macros)
                 const ByteOffset dStart = toks[i].tok.span.start();
                 copyVerbatim(spliced, localMap, copiedUpTo, dStart, out, map);
-                for (auto const& macro : *macros) {
-                    // Reconstruct the neutral macro as a `#define` line; the
-                    // downstream tokenizer + handleDefine build the MacroDef with
-                    // the proven function-like / param / redefinition machinery
-                    // (an identical re-define on a double-include is idempotent).
-                    std::string def = "#define " + macro.name;
-                    if (macro.params.has_value()) {
-                        def += "(";
-                        bool first = true;
-                        for (auto const& pn : *macro.params) {
-                            if (!first) def += ",";
-                            def += pn;
-                            first = false;
-                        }
-                        if (macro.variadic) {
-                            if (!macro.params->empty()) def += ",";
-                            def += "...";
-                        }
-                        def += ")";
-                    }
-                    if (!macro.replacement.empty()) {
-                        def += " ";
-                        def += macro.replacement;
-                    }
-                    def += "\n";
-                    out.append(def);
-                }
+                out.append(defs);
                 copiedUpTo = dStart;  // KEEP the include line — final copyVerbatim copies it
                 continue;
             }
@@ -884,6 +929,37 @@ struct SynthBuilder {
 
             auto resolved = resolveQuote(filename, includingDir);
             if (!resolved) {
+                // QUOTE→ANGLE fallback (C 6.10.2p3, §B iii): a `#include "h"` NOT
+                // found on disk (self-dir + includeDirs, checked FIRST above so a
+                // real on-disk quote header is NEVER shadowed) RETRIES on the
+                // system path — the SAME `<stem>.json` shipped-descriptor lookup
+                // the angle form uses. This lets a source that quote-includes a
+                // system header (sqlite's `#include "windows.h"`) resolve the
+                // shipped descriptor. On a hit: splice its macros AND REWRITE the
+                // directive to the angle form in the output, so the post-parse
+                // import resolver (which owns typed-surface injection and, with the
+                // preprocessor enabled, ONLY sees angle includes) injects the
+                // types/structs/constants. A quote header that is neither on disk
+                // NOR a shipped descriptor stays the same hard error as before.
+                if (!filename.empty()) {
+                    std::string defs;
+                    SystemMacroSplice const sr =
+                        spliceSystemDescriptorMacros(filename, defs);
+                    if (sr != SystemMacroSplice::NotAvailable) {
+                        // Malformed already emitted its own error; on Spliced the
+                        // macros are in `defs`. Either way rewrite quote→angle:
+                        // emit the descriptor macros, then a synthetic
+                        // `#include <filename>` in place of the quote bytes.
+                        copyVerbatim(spliced, localMap, copiedUpTo, dirStart,
+                                     out, map);
+                        out.append(defs);
+                        out.append("#include <");
+                        out.append(filename);
+                        out.append(">\n");
+                        copiedUpTo = dirEnd;   // drop the original quote bytes
+                        continue;
+                    }
+                }
                 emitPP(rep, DiagnosticCode::P_PreprocessorIncludeError,
                        BufferId{}, SourceSpan::empty(0),
                        std::string{"quote include not found: "} + filename);
@@ -1054,6 +1130,27 @@ public:
         // `expand`). EMPTY when the language declares none (toy / tsql), so the
         // engine is a strict identity pass for `__LINE__` &c.
         for (PredefinedMacroDef const& pm : cfg().predefinedMacros) {
+            // Per-format availability filter (mirrors the shipped-header gate):
+            // a macro with a non-empty `availableObjectFormats` is seeded ONLY
+            // when the active object format is in its set. EMPTY ⇒ every format.
+            // A nullopt activeFormat_ (no target selected) seeds the macro
+            // UNCONDITIONALLY only when the filter is empty; a format-restricted
+            // macro stays unseeded absent a format (it is meaningless without
+            // one). This lets `_WIN32` be predefined for the pe target ONLY.
+            if (!pm.availableObjectFormats.empty()) {
+                if (!activeFormat_.has_value()) continue;
+                if (!ffi::objectFormatInAvailabilitySet(pm.availableObjectFormats,
+                                                        *activeFormat_)) {
+                    continue;
+                }
+            }
+            // c105 (D-PP-FUNCTION-LIKE-PREDEFINE): a FUNCTION-LIKE predefine is
+            // NOT seeded here — it lowers to a `#define name(params) value`
+            // line in the "<built-in>" prologue (see `preprocess()`), making it
+            // an ORDINARY macro (the directive handler owns its param parsing +
+            // expansion). Seeding it here too would make the prologue #define
+            // trip the C 6.10.8.1 predefined-collision guard against itself.
+            if (pm.isFunctionLike) continue;
             predefined_.emplace(pm.name, pm);
         }
         // FC15b: compute the translation DATE/TIME spellings ONCE (C 6.10.8.1 --
@@ -1432,7 +1529,16 @@ private:
 
     // True iff `name` is currently a defined macro (C's `defined X` / `#ifdef`).
     [[nodiscard]] bool isDefined(std::string_view name) const {
-        return table_.find(std::string{name}) != table_.end();
+        // `#ifdef X` / `#if defined(X)` is TRUE for a `#define`d macro (table_)
+        // OR a config-seeded predefined macro (predefined_ — e.g. `_WIN32`,
+        // `__STDC__`). Before, `defined()` consulted ONLY table_, so a
+        // `#if defined(_WIN32)` OS-selection guard could never see the predefined
+        // `_WIN32` (it expands to `1` in a VALUE context but read as undefined in
+        // a `defined()` context — the two must agree). predefined_ already
+        // reflects the per-format availability filter, so a format-gated macro is
+        // `defined` only on its target format.
+        return table_.find(std::string{name}) != table_.end()
+            || predefined_.find(std::string{name}) != predefined_.end();
     }
 
     // The token-text accessor + the macro-state callbacks the shared `sbHandle*`
@@ -2707,7 +2813,8 @@ PreprocessResult preprocess(
     std::shared_ptr<GrammarSchema const> schema,
     std::span<fs::path const>            includeDirs,
     std::span<fs::path const>            systemDirs,
-    std::optional<ObjectFormatKind>      activeFormat) {
+    std::optional<ObjectFormatKind>      activeFormat,
+    std::span<std::string const>         userDefines) {
     if (!mainSource || !schema) ppFatal("preprocess: null source or schema");
     if (!schema->preprocess().enabled) {
         ppFatal("preprocess: called with a schema whose preprocess pass is "
@@ -2718,6 +2825,70 @@ PreprocessResult preprocess(
     result.diagnostics = std::make_unique<DiagnosticReporter>();
 
     std::string synthText;
+
+    // c105 (D-PP-FUNCTION-LIKE-PREDEFINE + D-PP-USER-DEFINE): the synthetic
+    // PROLOGUES, prepended to the synth stream BEFORE the main source so the
+    // ORDINARY directive handler seeds them in stream order (the gcc model:
+    // "as if #define appeared before the first source line"). Two origins:
+    //   "<built-in>"     — config predefinedMacros WITH `params` (function-like,
+    //                      e.g. the MSVC-profile `__declspec(x)` → empty erase),
+    //                      format-filtered exactly like the predefined_ seed.
+    //   "<command-line>" — the CLI `--define NAME[=VALUE]` entries (VALUE
+    //                      defaults to 1). Because these become ORDINARY
+    //                      macros, the handler gives for free: name validation,
+    //                      the C 6.10.8.1 predefined-collision guard (a -D may
+    //                      not silently flip `_MSC_VER`), the 6.10.3p2
+    //                      duplicate policy, and #undef-ability.
+    // Each prologue is its own SourceBuffer so line-mapped diagnostics point
+    // at the synthetic origin by name. Empty prologues append nothing — the
+    // synth stream is byte-identical to the pre-c105 shape.
+    {
+        std::string builtinText;
+        for (PredefinedMacroDef const& pm : schema->preprocess().predefinedMacros) {
+            if (!pm.isFunctionLike) continue;
+            if (!pm.availableObjectFormats.empty()) {
+                if (!activeFormat.has_value()) continue;
+                if (!ffi::objectFormatInAvailabilitySet(pm.availableObjectFormats,
+                                                        *activeFormat)) {
+                    continue;
+                }
+            }
+            builtinText += "#define ";
+            builtinText += pm.name;
+            builtinText += '(';
+            for (std::size_t i = 0; i < pm.params.size(); ++i) {
+                if (i != 0) builtinText += ',';
+                builtinText += pm.params[i];
+            }
+            builtinText += ") ";
+            builtinText += pm.value;
+            builtinText += '\n';
+        }
+        if (!builtinText.empty()) {
+            auto origin = SourceBuffer::fromString(builtinText, "<built-in>");
+            appendWithContinuationSplice(origin->text(), origin, 0, synthText,
+                                         result.lineMap);
+        }
+        std::string cliText;
+        for (std::string const& d : userDefines) {
+            auto const eq = d.find('=');
+            std::string const name =
+                (eq == std::string::npos) ? d : d.substr(0, eq);
+            std::string const val =
+                (eq == std::string::npos) ? std::string{"1"} : d.substr(eq + 1);
+            cliText += "#define ";
+            cliText += name;
+            cliText += ' ';
+            cliText += val;
+            cliText += '\n';
+        }
+        if (!cliText.empty()) {
+            auto origin = SourceBuffer::fromString(cliText, "<command-line>");
+            appendWithContinuationSplice(origin->text(), origin, 0, synthText,
+                                         result.lineMap);
+        }
+    }
+
     std::vector<fs::path> includeStack;
     {
         std::error_code ec;

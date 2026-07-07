@@ -7,6 +7,7 @@ add_library(lir OBJECT
     lir_pass_util.cpp
     lir_regalloc.cpp
     lir_rewrite.cpp
+    lir_wide_call_args.cpp
     lir_text.cpp
     lir_verifier.cpp
 )

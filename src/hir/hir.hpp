@@ -104,6 +104,11 @@ public:
     [[nodiscard]] HirNodeId                ifThen(HirNodeId id)      const;
     [[nodiscard]] std::optional<HirNodeId> ifElse(HirNodeId id)     const;
 
+    // c115 SEH try-except: guarded body, filter expression, handler body.
+    [[nodiscard]] HirNodeId sehTryBody(HirNodeId id)    const;
+    [[nodiscard]] HirNodeId sehTryFilter(HirNodeId id)  const;
+    [[nodiscard]] HirNodeId sehTryHandler(HirNodeId id) const;
+
     // Loop-kind-agnostic over While/DoWhile/For: the body (always present) and
     // the condition (optional — a For may omit it).
     [[nodiscard]] HirNodeId                loopBody(HirNodeId id)      const;
@@ -113,13 +118,18 @@ public:
     [[nodiscard]] std::optional<HirNodeId> forUpdate(HirNodeId id) const;
     [[nodiscard]] ForClause                forClauses(HirNodeId id) const;
 
-    // switch: discriminant + the case arms.
+    // switch (c60, Design I-A): discriminant (child 0), the flat body Block
+    // (child 1), and the dispatch arms (children 2..). The body holds the case/
+    // default statements with synthetic LabelStmt markers; the arms map a case
+    // value to that marker's ordinal for the MIR jump table.
     [[nodiscard]] HirNodeId                  switchDiscriminant(HirNodeId id) const;
+    [[nodiscard]] HirNodeId                  switchBody(HirNodeId id)         const;
     [[nodiscard]] std::span<HirNodeId const> switchArms(HirNodeId id)         const;
-    // case arm: is-default flag, optional match value, the arm's statements.
-    [[nodiscard]] bool                       caseArmIsDefault(HirNodeId id) const;
-    [[nodiscard]] std::optional<HirNodeId>   caseArmValue(HirNodeId id)     const;
-    [[nodiscard]] std::span<HirNodeId const> caseArmBody(HirNodeId id)      const;
+    // case dispatch arm: is-default flag, optional match value, and the ordinal of
+    // the case's synthetic LabelStmt marker in the switch body.
+    [[nodiscard]] bool                       caseArmIsDefault(HirNodeId id)    const;
+    [[nodiscard]] std::optional<HirNodeId>   caseArmValue(HirNodeId id)        const;
+    [[nodiscard]] std::uint32_t              caseArmLabelOrdinal(HirNodeId id) const;
 
     // break/continue nesting index; return value; expr-stmt expression.
     [[nodiscard]] std::uint32_t            branchDepth(HirNodeId id)  const;
@@ -273,7 +283,7 @@ public:
     [[nodiscard]] HirNodeId                ifThen(HirNodeId id) const;
     [[nodiscard]] std::optional<HirNodeId> ifElse(HirNodeId id) const;
     [[nodiscard]] std::span<HirNodeId const> switchArms(HirNodeId id) const;
-    [[nodiscard]] std::span<HirNodeId const> caseArmBody(HirNodeId id) const;
+    [[nodiscard]] HirNodeId switchBody(HirNodeId id) const;
     [[nodiscard]] bool caseArmIsDefault(HirNodeId id) const;
 
     // Set the module's source-language tag (the value frozen into `Hir` at
@@ -352,6 +362,12 @@ public:
                                 TypeId type, HirFlags flags = HirFlags::None);
     HirNodeId makeIntrinsicCall(std::uint32_t intrinsicId, std::span<HirNodeId const> args,
                                 TypeId type, HirFlags flags = HirFlags::None);
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): builtin-intrinsic call — children are
+    // [args...]; the payload is a `BuiltinLowering` value (passed raw as a uint32
+    // to keep this header decoupled from semantic_config, mirroring the raw
+    // makeIntrinsicCall overload). HIR→MIR maps the payload to the dedicated MirOpcode.
+    HirNodeId makeBuiltinCall(std::uint32_t lowering, std::span<HirNodeId const> args,
+                              TypeId type, HirFlags flags = HirFlags::None);
 
     // Explicit conversion of [operand] to `type` (the target type).
     HirNodeId makeCast(HirNodeId operand, TypeId type, HirFlags flags = HirFlags::None);
@@ -428,6 +444,12 @@ public:
                          std::optional<HirNodeId> elseStmt = std::nullopt,
                          HirFlags flags = HirFlags::None);
 
+    // c115 SEH: __try tryBody __except (filterExpr) handlerBody —
+    // children [tryBody, filterExpr, handlerBody] (fixed arity 3).
+    HirNodeId makeSehTryExcept(HirNodeId tryBody, HirNodeId filterExpr,
+                               HirNodeId handlerBody,
+                               HirFlags flags = HirFlags::None);
+
     // while (cond) body — children [cond, body].
     HirNodeId makeWhileStmt(HirNodeId cond, HirNodeId body, HirFlags flags = HirFlags::None);
     // do body while (cond) — children [body, cond]: child 0 is what executes
@@ -442,13 +464,19 @@ public:
                           std::optional<HirNodeId> update, HirNodeId body,
                           HirFlags flags = HirFlags::None);
 
-    // switch (discriminant) { arms } — children [discriminant, caseArm...].
-    HirNodeId makeSwitchStmt(HirNodeId discriminant, std::span<HirNodeId const> arms,
+    // switch (discriminant) { body } — children [discriminant, body Block, arms...]
+    // (c60, Design I-A). `body` is the flat statement sequence whose case/default
+    // markers are synthetic LabelStmts; `arms` are the dispatch entries that map
+    // each case value to its marker ordinal for the MIR jump table.
+    HirNodeId makeSwitchStmt(HirNodeId discriminant, HirNodeId body,
+                             std::span<HirNodeId const> arms,
                              HirFlags flags = HirFlags::None);
-    // One switch arm. `value` absent ⇒ the `default:` arm (payload flags it);
-    // otherwise child 0 is the match value. `body` are the arm's statements.
-    // children: [value, body...] for a valued arm, [body...] for default.
-    HirNodeId makeCaseArm(std::optional<HirNodeId> value, std::span<HirNodeId const> body,
+    // One switch DISPATCH ENTRY (c60, Design I-A). `value` absent ⇒ the `default:`
+    // entry (payload flags it); otherwise child 0 is the match value.
+    // `labelOrdinal` is the per-function ordinal of this case's synthetic LabelStmt
+    // marker in the body — the MIR `addSwitch` targets that label-block. The entry
+    // carries NO body (children: [value] for a valued arm, [] for default).
+    HirNodeId makeCaseArm(std::optional<HirNodeId> value, std::uint32_t labelOrdinal,
                           HirFlags flags = HirFlags::None);
 
     // break / continue, by structural nesting index (0 = innermost enclosing

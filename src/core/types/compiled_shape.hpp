@@ -46,6 +46,43 @@ enum class TypeNameCommitPolarity : std::uint8_t {
 
 namespace detail {
 
+// c97 (compile-time-performance arc): O(1) token-set membership.
+//
+// The parser's hot loop asks "is token kind K in this set?" several times
+// per token (expectedSet / FIRST / predictive-prefix gates). Token kinds are
+// DENSE interned integers (SchemaTokenInterner ids, 1..N), so each set gets
+// a companion BITSET — `bits[v>>6] >> (v&63) & 1` — built ONCE at schema
+// construction (`GrammarSchema`'s ctor sealing pass) from the vector form.
+// The vector form REMAINS the source of truth and the iteration surface
+// (diagnostic rendering walks it); the bits are a load-time derived index.
+// Pure config-data transform — no token, rule, or language is named.
+//
+// An EMPTY bits span contains nothing — callers that need "empty set means
+// no constraint" semantics must test emptiness explicitly (as the
+// predictive-prefix prune does).
+[[nodiscard]] inline bool tokenBitsContain(std::span<std::uint64_t const> bits,
+                                           std::uint32_t v) noexcept {
+    std::size_t const word = static_cast<std::size_t>(v) >> 6;
+    return word < bits.size()
+        && ((bits[word] >> (v & 63u)) & 1u) != 0u;
+}
+
+// Build the bitset companion for one token-id set. `universe` is the
+// schema's token-id count (interner size); ids ≥ universe (corrupt) are
+// still admitted by growing the block count — membership stays exact.
+[[nodiscard]] inline std::vector<std::uint64_t>
+buildTokenBits(std::span<SchemaTokenId const> set, std::size_t universe) {
+    std::vector<std::uint64_t> bits;
+    if (set.empty()) return bits;
+    bits.resize((universe >> 6) + 1, 0u);
+    for (auto const t : set) {
+        std::size_t const word = static_cast<std::size_t>(t.v) >> 6;
+        if (word >= bits.size()) bits.resize(word + 1, 0u);
+        bits[word] |= (std::uint64_t{1} << (t.v & 63u));
+    }
+    return bits;
+}
+
 // One position in a rule's compiled shape body. Built once by the loader
 // via the named factories below; cursor reads through the const accessors.
 // `tokenId`, `ruleId`, `nextPos`, and `branches` are slot-kind-dependent:
@@ -53,7 +90,9 @@ namespace detail {
 // factory enforces that pairing.
 //
 // `nullableTail` is the only field updated post-construction — the loader's
-// fixed-point pass for canEndSource semantics flips it false→true.
+// fixed-point pass for canEndSource semantics flips it false→true. (c97:
+// plus the GrammarSchema ctor's sealing pass, which derives `expectedBits`
+// and `altBranchRules` from the final loader-built fields.)
 class DSS_EXPORT Position {
 public:
     Position() noexcept = default;   // default = End slot
@@ -96,6 +135,23 @@ public:
     [[nodiscard]] std::span<SchemaTokenId const> expectedSet() const noexcept { return expectedSet_; }
     [[nodiscard]] bool            nullableTail() const noexcept { return nullableTail_; }
 
+    // c97: bitset companion of `expectedSet()` (O(1) membership; built by
+    // the GrammarSchema ctor's sealing pass AFTER every loader fixed-point
+    // finished mutating `expectedSet_`). Empty until sealed.
+    [[nodiscard]] std::span<std::uint64_t const> expectedBits() const noexcept {
+        return expectedBits_;
+    }
+
+    // c97: the precomputed depth-first RuleLeaf-branch enumeration for an
+    // AltChoice position — the EXACT result the former per-call
+    // `GrammarSchema::altRuleBranches` DFS produced (declared JSON-array
+    // order, first occurrence wins), computed ONCE at schema sealing so the
+    // per-speculative-token query is a span read instead of a fresh DFS +
+    // two vector allocations. Empty for non-AltChoice positions.
+    [[nodiscard]] std::span<RuleId const> altBranchRules() const noexcept {
+        return altBranchRules_;
+    }
+
     // Speculative-alt attributes (only meaningful on AltChoice slots
     // built from an `"alt"` shape carrying `"speculative": true`). The
     // loader populates these; the cursor walker does NOT act on them.
@@ -127,6 +183,17 @@ public:
         lookahead_   = lookahead;
     }
 
+    // c97 sealing-pass writers (GrammarSchema ctor only): derive the O(1)
+    // membership bits / the precomputed alt-branch list from the FINAL
+    // loader-built fields. Not for loader use — the loader's fixed-points
+    // still mutate `expectedSet_` after construction.
+    void sealExpectedBits(std::size_t universe) {
+        expectedBits_ = buildTokenBits(expectedSet_, universe);
+    }
+    void sealAltBranchRules(std::vector<RuleId> rules) noexcept {
+        altBranchRules_ = std::move(rules);
+    }
+
 private:
     SlotKind        slotKind_    = SlotKind::End;
     SchemaTokenId   tokenId_;
@@ -134,6 +201,8 @@ private:
     std::uint32_t   nextPos_     = 0;
     std::vector<std::uint32_t> branches_;
     std::vector<SchemaTokenId> expectedSet_;
+    std::vector<std::uint64_t> expectedBits_;    // c97: sealed bitset of expectedSet_
+    std::vector<RuleId>        altBranchRules_;  // c97: sealed AltChoice DFS result
     bool            nullableTail_ = false;
     bool            speculative_  = false;
     std::uint16_t   lookahead_    = 0;
@@ -143,10 +212,21 @@ struct CompiledRule {
     // Index into `positions` for the rule's entry point. `positions[0]`
     // is reserved as a sentinel so cursor `posId == 0` means "invalid",
     // matching the strong-id zero-is-invalid pattern.
+    //
+    // c97: `entryPos == 0` doubles as the "no compiled body" marker in the
+    // GrammarSchema's dense rule table — a real compiled rule's entry is
+    // never the sentinel position, so a default-constructed CompiledRule at
+    // an index with no loader entry (e.g. an auto-interned Pratt wrapper
+    // rule) reproduces exactly the former unordered_map-miss behavior.
     std::uint32_t              entryPos = 0;
     std::vector<Position>      positions;
     std::vector<SchemaTokenId> firstSet;
     std::vector<SchemaTokenId> followSet;
+    // c97: bitset companion of `firstSet` (O(1) membership) + per-offset
+    // bitset companions of `predictivePrefix`, both built by the
+    // GrammarSchema ctor's sealing pass. Empty until sealed.
+    std::vector<std::uint64_t>              firstBits;
+    std::vector<std::vector<std::uint64_t>> prefixBits;
     bool                       nullable = false;
 
     // LL(k) PREDICTIVE PREFIX (speculative-alt candidate pruning).
@@ -210,6 +290,21 @@ struct CompiledRule {
     // `typeNameCommitRule.valid()`.
     TypeNameCommitPolarity     typeNameCommitPolarity =
         TypeNameCommitPolarity::PreferType;
+
+    // commitAfterPrefix CUT (PEG "cut"; D-CSUBSET-LABEL-BUDGET-CLIFF, p19
+    // Cluster G c31). When true, a speculative probe of this rule COMMITS
+    // as soon as the rule's FIXED leading token-prefix (predictivePrefix,
+    // `predictivePrefixLen` tokens) has been consumed without failure — the
+    // rest of the rule then parses NON-speculatively (no probe budget),
+    // driven by the outer dispatch loop on the still-open frame. The cut is
+    // sound only where, after the fixed prefix, no OTHER alternative of the
+    // enclosing alt can match (so committing discards nothing); the config
+    // author asserts that by setting the flag. Sibling facet to
+    // `typeNameCommitRule` — a rule uses at most one. Config-sourced
+    // (`commitAfterPrefix` on the shape body); the engine names no token,
+    // rule, or language. Default false ⇒ standard rollback-on-failure
+    // speculation.
+    bool                       commitAfterPrefix = false;
 };
 
 } // namespace dss::detail

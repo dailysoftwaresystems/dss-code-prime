@@ -1,0 +1,19 @@
+{
+  "$comment": "Neutral shipped <utime.h> (POSIX) — c81 (the sqlite shell.c CLI route; shell.c:9841 [fileio.c] `#include <utime.h>` under !_WIN32). shell.c uses NOTHING from it (0 utime()/utimbuf uses — fileio's active branch calls the already-shipped utimes from <sys/time.h>); the include just has to RESOLVE. An empty descriptor fails loud by design ('declares nothing'), so this ships the header's honest MINIMAL real surface instead of a hollow marker: `struct utimbuf` + `utime()` — verified against the REAL /usr/include/utime.h in WSL (x86_64 + aarch64 cross headers identical, non-__USE_TIME_BITS64 LP64 default): actime __time_t(i64) @0, modtime __time_t(i64) @8 -> sizeof 16; `int utime(const char*, const struct utimbuf*)` with the struct param as ptr<void> per house style. Darwin agrees exactly (time_t i64, same two fields, utime in libSystem) -> [elf, macho], flat. libc symbol verified in WSL: utime@GLIBC_2.2.5 in libc.so.6.",
+  "header": "utime.h",
+  "standard": "posix",
+  "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "symbols": [
+    { "name": "utime", "signature": "fn(ptr<char>, ptr<void>) -> i32", "kind": "function", "linkage": "external" }
+  ],
+  "structs": [
+    {
+      "name": "utimbuf",
+      "fields": [
+        { "name": "actime",  "type": "i64" },
+        { "name": "modtime", "type": "i64" }
+      ]
+    }
+  ]
+}

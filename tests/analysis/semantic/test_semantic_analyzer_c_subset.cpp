@@ -39,9 +39,16 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     auto model = analyze(cu);
     // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
     // (`__va_list_tag` + `va_list`) injected into every c-subset CU's builtin scope
-    // (D-FC12A-VARIADIC-CALLEE — gated on the schema declaring `vaArgRule`).
-    ASSERT_EQ(model.symbols().size() - 1, 4u)
-        << "main (function) + x (variable) + __va_list_tag + va_list";
+    // (D-FC12A-VARIADIC-CALLEE — gated on the schema declaring `vaArgRule`) + the
+    // 5 intrinsic builtin FUNCTIONS (SE6 builtinFunctions, minted into the same
+    // CU-wide builtins scope): c103 `__umulh` (D-CSUBSET-INTRINSIC-UMULH) + c104
+    // `_InterlockedCompareExchange` (D-CSUBSET-INTRINSIC-ATOMIC-CAS) + c113
+    // `_ReadWriteBarrier` (D-CSUBSET-INTRINSIC-BARRIER) + c115 `_exception_code`
+    // + `_exception_info` (D-WIN64-SEH-FUNCLETS SEH intrinsics).
+    ASSERT_EQ(model.symbols().size() - 1, 9u)
+        << "main + x + __va_list_tag + va_list + __umulh + "
+           "_InterlockedCompareExchange + _ReadWriteBarrier + "
+           "_exception_code + _exception_info";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xRec = &model.symbols()[i];
@@ -126,6 +133,135 @@ TEST(SemanticAnalyzerCSubset, OutOfRangeArrayLengthEmitsDiagnostic) {
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_ArrayLengthOutOfRange), 1u);
+}
+
+// ── c34 (D-CSUBSET-ARRAY-SIZE-INFERENCE, C 6.7.9p22) ────────────────────────
+// A `[]` (empty-bound) array WITH an initializer infers its length from the
+// initializer: a string literal → decoded-bytes + 1 (the NUL); a brace list →
+// the top-level element count. The completion happens ONCE in the semantic model
+// (Pass 1.5), so the SYMBOL's resolved type is the sized array every downstream
+// tier observes. These pins assert the symbol's `.type` directly (red-on-disable:
+// without the completion the type stays an incomplete array — scalars()[0] is the
+// kIncompleteArrayLength sentinel, not N).
+
+[[nodiscard]] inline SymbolRecord const*
+findSym(SemanticModel const& m, std::string_view name) {
+    for (std::size_t i = 1; i < m.symbols().size(); ++i)
+        if (m.symbols()[i].name == name) return &m.symbols()[i];
+    return nullptr;
+}
+
+// (1) `char x[] = "abc"` resolves to a 4-element char array ("abc" + NUL).
+TEST(SemanticAnalyzerCSubset, ArraySizeInferredFromStringInit) {
+    auto cu = buildShippedUnit("c-subset", { "char x[] = \"abc\";\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->type.valid());
+    ASSERT_EQ(ti.kind(x->type), TypeKind::Array);
+    ASSERT_FALSE(ti.isIncompleteArray(x->type));
+    ASSERT_EQ(ti.scalars(x->type).size(), 1u);
+    EXPECT_EQ(ti.scalars(x->type)[0], 4);   // 'a' 'b' 'c' '\0'
+}
+
+// (2) `int a[] = {1,2,3}` → Array<I32, 3> (top-level brace element count).
+TEST(SemanticAnalyzerCSubset, ArraySizeInferredFromBraceInit) {
+    auto cu = buildShippedUnit("c-subset", { "int a[] = {1, 2, 3};\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = findSym(model, "a");
+    ASSERT_NE(a, nullptr);
+    ASSERT_TRUE(a->type.valid());
+    ASSERT_EQ(ti.kind(a->type), TypeKind::Array);
+    ASSERT_FALSE(ti.isIncompleteArray(a->type));
+    EXPECT_EQ(ti.scalars(a->type)[0], 3);
+    EXPECT_EQ(ti.kind(ti.operands(a->type)[0]), TypeKind::I32);
+}
+
+// (3) LOCAL variant — block-scope `[]`-with-init infers at the SAME Pass-1.5 site
+// (the local var path shares `resolveDeclTypes`, not a separate completion).
+TEST(SemanticAnalyzerCSubset, ArraySizeInferredFromInitLocal) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "int main(void){ int a[] = {10, 20, 30}; return a[2]; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 0u);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = findSym(model, "a");
+    ASSERT_NE(a, nullptr);
+    ASSERT_EQ(ti.kind(a->type), TypeKind::Array);
+    ASSERT_FALSE(ti.isIncompleteArray(a->type));
+    EXPECT_EQ(ti.scalars(a->type)[0], 3);
+}
+
+// (4) PRESERVE — an EXPLICIT `[N]` is unchanged by the inference path (the
+// resolved length folds normally; completion is a no-op on an already-sized
+// array). `char x[4] = "abc"` stays Array<Char,4>, NOT re-derived to 4-from-init.
+TEST(SemanticAnalyzerCSubset, ExplicitArraySizeUnchangedByInference) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "int a[3] = {1, 2, 3}; char x[8] = \"abc\";\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = findSym(model, "a");
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(a, nullptr);
+    ASSERT_EQ(ti.kind(a->type), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(a->type)[0], 3);
+    ASSERT_NE(x, nullptr);
+    ASSERT_EQ(ti.kind(x->type), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(x->type)[0], 8)   // the DECLARED 8, not "abc"+NUL == 4
+        << "an explicit [N] must keep N — inference only fills an empty []";
+}
+
+// (5) A `[]` with NO initializer is NOT silently sized — the resolver's
+// S_NonConstantArrayLength still fires (inference is gated on an initializer
+// being present, so a bare `int x[];` is unaffected by c34).
+TEST(SemanticAnalyzerCSubset, EmptyArrayNoInitNotSized) {
+    auto cu = buildShippedUnit("c-subset", { "int main(void){ int a[]; return 0; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 1u);
+    // The symbol's type must NOT be a sized array (it stays unresolved/incomplete).
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = findSym(model, "a");
+    if (a != nullptr && a->type.valid() && ti.kind(a->type) == TypeKind::Array) {
+        EXPECT_TRUE(ti.isIncompleteArray(a->type))
+            << "a no-init [] must never be silently completed to a sized array";
+    }
+}
+
+// c34 fail-loud (audit-caught regression): an EMPTY-brace inferred array
+// `int a[] = {}` cannot determine a positive length, so it must FAIL LOUD — NOT
+// leave a silently-incomplete array type that flows into the unguarded HIR/MIR
+// tier and LOOPS on the -1 sentinel length (a compiler HANG). An inferred 0/
+// undeterminable length is the non-positive `int a[0]` case → S_ArrayLengthOutOfRange.
+// RED-ON-DISABLE: revert the `failUnsized` guard (empty-brace returns the
+// incomplete array with no diagnostic) → this flips AND a CLI compile hangs.
+TEST(SemanticAnalyzerCSubset, ArraySizeInferenceEmptyBraceFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "int a[] = {};\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_TRUE(model.hasErrors())
+        << "`int a[] = {}` cannot infer a positive size — must fail loud, not hang";
+    EXPECT_GT(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayLengthOutOfRange), 0u)
+        << "empty-brace inferred array → S_ArrayLengthOutOfRange (inferred 0-length)";
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = findSym(model, "a");
+    if (a != nullptr && a->type.valid() && ti.kind(a->type) == TypeKind::Array) {
+        EXPECT_TRUE(ti.isIncompleteArray(a->type))
+            << "an un-sizable [] must never be a usable sized array";
+    }
 }
 
 // SE-pointers (G5): `int *p` declarator → Ptr<I32>; `int **pp` → Ptr<Ptr<I32>>.
@@ -345,41 +481,47 @@ TEST(SemanticAnalyzerCSubset, DistinctTypedReturnRemainsMismatch) {
 // ── D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS — the assignment STATEMENT
 //    now runs the SAME `isAssignable` check as the init/call-arg/return sites ──
 //
-// (a) An invalid assignment STATEMENT `x = f;` (int <- float) fails loud with a
-// positioned S_TypeMismatch — the SAME diagnostic the init site `int x = f;`
-// emits. `f` is a parameter so no narrowing initializer adds a second mismatch;
-// exactly ONE fires.
+// (a) An invalid assignment STATEMENT `p = q;` (int* <- char*, distinct typed
+// pointers) fails loud with a positioned S_TypeMismatch — the SAME diagnostic the
+// init site `int* p = q;` emits. `q` is a parameter so no initializer adds a
+// second mismatch; exactly ONE fires.
+// (NOTE: this test originally used `int x; x = f;` [int <- float], but
+// D-CSUBSET-INT-FLOAT-CONVERSION made int<->float an ADMITTED implicit assignment
+// conversion in c-subset, so that pair is no longer a mismatch; a distinct-typed-
+// pointer pair is the stable always-rejected case that still exercises the
+// assignment-statement isAssignable path.)
 // RED-ON-DISABLE: remove the assignment-statement isAssignable arm (restore the
-// bypass) -> the assignment is silently accepted (HIR coerce truncates float ->
-// int), this count drops to 0.
-TEST(SemanticAnalyzerCSubset, AssignStmtIntFromFloatFailsLoud) {
+// bypass) -> the assignment is silently accepted, this count drops to 0.
+TEST(SemanticAnalyzerCSubset, AssignStmtIntFromIncompatiblePointerFailsLoud) {
     auto cu = buildShippedUnit("c-subset", {
-        "int sink(float f) { int x; x = f; return x; }\n",
+        "int sink(char* q) { int* p; p = q; return *p; }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 1u)
-        << "an int <- float assignment STATEMENT must fail loud with the same "
-           "S_TypeMismatch the int <- float INIT (`int x = f;`) emits — the "
+        << "an int* <- char* assignment STATEMENT must fail loud with the same "
+           "S_TypeMismatch the init (`int* p = q;`) emits — the "
            "assignment-statement assignability bypass is closed";
 }
 
-// (b) PARITY pin: the init form `int x = f;` and the statement form `x = f;`
-// must behave IDENTICALLY (both reject the same incompatible pair). Reading both
-// in one TU yields exactly TWO S_TypeMismatch — one per site — proving the
-// statement is no longer the lone unchecked position.
+// (b) PARITY pin: the init form `int* p = q;` and the statement form `p = q;`
+// must behave IDENTICALLY (both reject the same incompatible distinct-typed-
+// pointer pair). Reading both in one TU yields exactly TWO S_TypeMismatch — one
+// per site — proving the statement is no longer the lone unchecked position.
+// (Swapped off int<-float for the same reason as (a): int<->float is now an
+// admitted conversion in c-subset [D-CSUBSET-INT-FLOAT-CONVERSION].)
 // RED-ON-DISABLE: with the bypass restored only the INIT fires -> count is 1.
 TEST(SemanticAnalyzerCSubset, AssignStmtAndInitRejectIncompatibleIdentically) {
     auto cu = buildShippedUnit("c-subset", {
-        "int sink(float f) { int x = f; x = f; return x; }\n",
+        "int sink(char* q) { int* p = q; p = q; return *p; }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 2u)
         << "the init site AND the assignment-statement site must each reject the "
-           "int <- float pair — two positioned S_TypeMismatch, not one";
+           "int* <- char* pair — two positioned S_TypeMismatch, not one";
 }
 
 // (c) A VALID assignment statement stays byte-identically clean: int <- int,
@@ -673,23 +815,28 @@ TEST(SemanticAnalyzerCSubset, FoldedNullMarkerIsTreeKeyedAcrossSources) {
 }
 
 // The latent-bug FIX (D-SEMANTIC-SUBTREETYPE-TRANSPARENT-WRAPPERS closure): a
-// mixed-type binary in a checked position is typed against its UNIFIED (UAC)
-// type, not whichever leaf the old DFS-suppressor happened to reach. The
-// observable uses a FLOAT operand: D-CSUBSET-INT-SAME-SIGN-NARROW made integer
-// narrowing implicit (so the old long+int→int observable no longer fires), but
-// int↔float stays NON-implicit. For `sink(int); double a; int b; sink(a + b)`
-// the argument `a + b` is `double` (UAC of double+int) and double→int is NOT
-// assignable → S_TypeMismatch fires. Under the old suppressor it reached the
-// `int` leaf `b` and silently admitted. RED-ON-DISABLE: revert the binary arm to
-// a leaf type and this drops to 0 (the latent unsoundness this closure removes).
+// mixed-type binary in a checked position is typed against its UNIFIED type, not
+// whichever leaf the old DFS-suppressor happened to reach. The observable now uses
+// a POINTER binary: D-CSUBSET-INT-SAME-SIGN-NARROW made integer narrowing implicit
+// AND D-CSUBSET-INT-FLOAT-CONVERSION made int↔float implicit, so the old
+// arithmetic observables (long+int→int, double+int→int) no longer fire. For
+// `sink(float); int* a; int b; sink(a + b)` the argument `a + b` is `int*`
+// (pointer arithmetic — `combineBinary` types `ptr + int` as the pointer) and
+// `int*` is NOT assignable to the `float` param → S_TypeMismatch fires. Under the
+// old suppressor it reached the `int` leaf `b`, and `int → float` IS now
+// assignable, so it would be silently admitted — the exact "leaf would pass, the
+// unified type fails" discrimination this closure removes. RED-ON-DISABLE: revert
+// the binary arm to a leaf type and this drops to 0 (the latent unsoundness).
 TEST(SemanticAnalyzerCSubset, MixedWidthBinaryArgTypedByUacNotLeaf) {
     auto cu = buildShippedUnit("c-subset", {
-        "extern int sink(int v);\n"
-        "int f(double a, int b) { return sink(a + b); }\n",
+        "extern int sink(float v);\n"
+        "int f(int* a, int b) { return sink(a + b); }\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
-    // `a + b` is `double` (UAC); the `int` param cannot take a float → one mismatch.
+    // `a + b` is `int*` (pointer arith); the `float` param cannot take a pointer
+    // → one mismatch. The `int` leaf `b` alone WOULD be admitted (int→float), so
+    // this isolates "typed by the unified binary type, not a leaf".
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_TypeMismatch), 1u);
 }
@@ -991,8 +1138,10 @@ TEST(SemanticAnalyzerCSubset, NestedBlocksShadowWithoutRedecl) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
         << "different blocks → different scopes → no shadow redecl";
     // main (function) + two distinct `x` symbols (one per block scope) + the 2
-    // FC12a-core builtin TYPES (__va_list_tag + va_list).
-    EXPECT_EQ(model.symbols().size() - 1, 5u);
+    // FC12a-core builtin TYPES (__va_list_tag + va_list) + the 5 intrinsic
+    // builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
+    // _ReadWriteBarrier + c115 _exception_code + _exception_info).
+    EXPECT_EQ(model.symbols().size() - 1, 10u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -1008,8 +1157,10 @@ TEST(SemanticAnalyzerCSubset, ForwardReferenceWithinBlock) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
 
     // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
-    // (__va_list_tag + va_list). Find x by name.
-    ASSERT_EQ(model.symbols().size() - 1, 4u);
+    // (__va_list_tag + va_list) + the 5 intrinsic builtins (c103 __umulh +
+    // c104 _InterlockedCompareExchange + c113 _ReadWriteBarrier + c115
+    // _exception_code + _exception_info). Find x by name.
+    ASSERT_EQ(model.symbols().size() - 1, 9u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -1174,6 +1325,128 @@ TEST(SemanticAnalyzerCSubset, CompoundAssignToNonConstIsClean) {
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u);
+}
+
+// ===== c36 (D-CSUBSET-MUTABLE-POINTER-TO-CONST) =====
+// `const` qualifies the type it directly modifies (C 6.7.3). For a pointer
+// declarator the OBJECT is const iff the OUTERMOST (last source-order) pointer
+// layer carries `* const` — a HEAD/pointee const (`const char *p`) leaves the
+// pointer OBJECT mutable. The verdict is read from the declarator structure
+// (declaratorObjectIsConst), NOT a coarse whole-decl const scan. Each form
+// below is a red-on-disable pin: revert the fix and the GROUP-2/5/8/9 "clean"
+// pins flip to a spurious S_ConstViolation.
+
+// GROUP 2 — pointer-to-const: the pointer object is MUTABLE (the bug; was a
+// spurious S_ConstViolation before c36). This is the sqlite `zFormat += 4`.
+TEST(SemanticAnalyzerCSubset, MutablePointerToConstParamIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(const char *p){ p += 4; return (int)*p; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+}
+TEST(SemanticAnalyzerCSubset, MutablePointerToConstEastIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(char const *p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+}
+
+// GROUP 3 — const POINTER: the object IS const → modifying it violates.
+TEST(SemanticAnalyzerCSubset, ConstPointerParamEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(char * const p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// GROUP 4 — const pointer to const: object const → violates.
+TEST(SemanticAnalyzerCSubset, ConstPointerToConstParamEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(const char * const p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+
+// GROUP 5 — multi-level pointers: the OUTERMOST layer decides.
+// `char * const *p` — inner pointer const, OUTER pointer mutable → clean.
+TEST(SemanticAnalyzerCSubset, MultiLevelInnerConstOuterMutableIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(char * const *p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+}
+// `char ** const p` — OUTER pointer const → violates.
+TEST(SemanticAnalyzerCSubset, MultiLevelOuterConstEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(char ** const p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+// `const char **p` — pointee const, both pointers mutable → clean.
+TEST(SemanticAnalyzerCSubset, MultiLevelHeadConstIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(const char **p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+}
+
+// GROUP 8 — multi-declarator: each declarator's OWN outermost layer decides.
+// `const int *p, x;` → p is pointer-to-const (mutable), x is a const scalar.
+TEST(SemanticAnalyzerCSubset, MultiDeclaratorPointerCleanScalarViolates) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(){ const int *p, x; p += 1; x = 2; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    // exactly one violation — on `x` (the const scalar), NOT on `p`.
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+    for (auto const& d : model.diagnostics().all()) {
+        if (d.code == DiagnosticCode::S_ConstViolation) EXPECT_EQ(d.actual, "x");
+    }
+}
+
+// GROUP 9 — const + volatile together must NOT regress c27.
+// `volatile char * const p` — const POINTER (volatile pointee) → violates.
+TEST(SemanticAnalyzerCSubset, VolatilePointeeConstPointerEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(volatile char * const p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
+}
+// `const volatile char *p` — cv POINTEE, pointer object mutable → clean.
+TEST(SemanticAnalyzerCSubset, ConstVolatilePointeeMutablePointerIsClean) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(const volatile char *p){ p += 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 0u);
+}
+
+// GROUP 1 — scalar east-const still violates (no-pointer path unchanged).
+TEST(SemanticAnalyzerCSubset, EastConstScalarStillEmitsConstViolation) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { int const x = 1; x = 2; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
 }
 
 // SE5: a `typedef int Foo;` mints a Type-kind alias symbol carrying the
@@ -1683,6 +1956,147 @@ TEST(SemanticAnalyzerCSubset, DuplicateParamNamesEmitRedecl) {
     EXPECT_EQ(d->related[0].span.end(),   11u);
 }
 
+// ── c32 D-CSUBSET-FNPTR-PARAM-SCOPE: per-declarator function-prototype scope ──
+//
+// The parameter NAMES of a function-POINTER declarator (and of a bare prototype)
+// have function-prototype scope (C 6.2.1p4) — they terminate at the END of the
+// declarator and must NOT bind into / collide across the enclosing scope. A
+// function DEFINITION's params are EXEMPT (they bind into the definition's scope
+// so they reach the body). Each pin below flips RED if the per-declarator
+// prototype scope-open is reverted (the params would bind into the enclosing
+// struct/file/block scope and collide).
+
+// (1) fn-ptr STRUCT MEMBERS with a SHARED param name → no collision. This is the
+// sqlite3_io_methods frontier (`int (*xRead)(…int iAmt…); int (*xWrite)(…int
+// iAmt…);`). The two `iAmt`/`v` params live in DISTINCT prototype scopes.
+TEST(SemanticAnalyzerCSubset, FnPtrStructMembersSharedParamNameNoRedecl) {
+    auto model = analyzeShipped("c-subset", {
+        "struct M { int (*a)(int v); int (*b)(int v); };\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "sibling fn-ptr members sharing a param name must not collide "
+           "(per-declarator function-prototype scope)";
+}
+
+// (2) fn-ptr TYPEDEFS with a shared param name → no collision.
+TEST(SemanticAnalyzerCSubset, FnPtrTypedefsSharedParamNameNoRedecl) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int (*A)(int x);\n"
+        "typedef int (*B)(int x);\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "two fn-ptr typedefs sharing a param name must not collide";
+}
+
+// (3) fn-ptr PARAMS (of an ordinary function) with a shared param name → no
+// collision. `void h(int (*a)(int x), int (*b)(int x));`
+TEST(SemanticAnalyzerCSubset, FnPtrParamsSharedParamNameNoRedecl) {
+    auto model = analyzeShipped("c-subset", {
+        "void h(int (*a)(int x), int (*b)(int x));\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "fn-ptr parameters sharing a nested param name must not collide";
+}
+
+// (4) NON-LEAK: a fn-ptr's param name must NOT leak into the enclosing scope. A
+// `typedef int (*A)(int gv);` followed by a GLOBAL `int gv;` must NOT collide
+// (no S_RedeclaredSymbol), and the GLOBAL `gv` must remain the usable I32 symbol
+// — the param `gv` neither shadowed nor clashed with it. (Revert the scope-open
+// ⇒ the leaked param `gv` collides with the global ⇒ S_RedeclaredSymbol.)
+TEST(SemanticAnalyzerCSubset, FnPtrParamNameDoesNotLeakToEnclosingScope) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int (*A)(int gv);\n"
+        "int gv;\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "a fn-ptr typedef's param must not leak and collide with a later global";
+    // The surviving `gv` is the GLOBAL int (typed I32), not the leaked param — a
+    // leak would have made the param `gv` (a fn-prototype-scoped name) clash with
+    // the global at file scope. Look it up directly (typeOfSymbol lives later in
+    // this TU's anonymous namespace).
+    auto const& in = model.lattice().interner();
+    SymbolRecord const* gvRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == "gv") gvRec = &model.symbols()[i];
+    }
+    ASSERT_NE(gvRec, nullptr) << "the global `gv` must exist and be usable";
+    ASSERT_TRUE(gvRec->type.valid());
+    EXPECT_EQ(in.kind(gvRec->type), TypeKind::I32)
+        << "the surviving `gv` is the GLOBAL int, not the leaked param";
+}
+
+// (4b) ★ THE RESOLVE-FORM LEAK (decisive, distinct from the collision form above):
+// a fn-ptr typedef's param name USED outside its declarator with NO same-named
+// global must be UNDECLARED. A leak would make `gv` resolve to the
+// prototype-scoped param — a SILENT correctness bug (no diagnostic at all), which
+// the collision pin (both names I32) cannot detect. RED-ON-DISABLE: revert the
+// per-declarator prototype scope-open → `gv` resolves to the leaked param → the
+// S_UndeclaredIdentifier vanishes.
+TEST(SemanticAnalyzerCSubset, FnPtrParamNameDoesNotResolveOutsideDeclarator) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int (*A)(int gv);\n"
+        "int main(void){ return gv; }\n",
+    });
+    EXPECT_GT(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "a fn-ptr param name must NOT resolve outside its declarator "
+           "(C 6.2.1p4 function-prototype scope) — `gv` is undeclared here";
+}
+
+// (5) NESTED fn-ptr params: a fn-ptr whose own param is itself a fn-ptr with a
+// shared inner param name, declared twice → no collision at any depth.
+// `int (*a)(int (*p)(int q)); int (*b)(int (*p)(int q));`
+TEST(SemanticAnalyzerCSubset, NestedFnPtrParamsSharedNamesNoRedecl) {
+    auto model = analyzeShipped("c-subset", {
+        "struct N { int (*a)(int (*p)(int q));\n"
+        "           int (*b)(int (*p)(int q)); };\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "nested fn-ptr params (p/q) repeated across siblings must not collide";
+}
+
+// (6) ★ DEFINITION PARAMS STAY BODY-VISIBLE (the trap a wrong fix breaks). A
+// function definition's own params bind into the definition's scope so the body
+// resolves them; a NESTED definition taking two fn-ptr params with a shared inner
+// param name (`e`) keeps cb/cb2 body-visible AND isolates the inner `e`s. Clean
+// analysis (no undeclared `cb`/`cb2`, no redecl on `e`) is the witness.
+TEST(SemanticAnalyzerCSubset, DefinitionParamsRemainBodyVisible) {
+    auto model = analyzeShipped("c-subset", {
+        "int run(int (*cb)(int e), int (*cb2)(int e)){ return cb(41)+cb2(0); }\n"
+        "int g0(int e){return e+1;}\n"
+        "int g1(int e){return e;}\n"
+        "int main(void){ return run(g0,g1); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "definition params must reach the body (cb/cb2 visible) while the "
+           "fn-ptr params' inner `e`s stay isolated";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u);
+}
+
+// (7) PRESERVE: plain prototypes each with a param named `x` → clean (each
+// prototype is a topLevelDecl scope, so the params already isolate; the c32 path
+// adds a redundant-but-harmless prototype scope and must not change this).
+TEST(SemanticAnalyzerCSubset, PlainPrototypesSharedParamNameClean) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int x);\n"
+        "int g(int x);\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u);
+}
+
+// (8) PRESERVE the genuine-duplicate error: two params named `x` in ONE
+// declarator still collide (they share the SAME prototype scope), in a fn-ptr
+// member too — the isolation is PER-DECLARATOR, not per-param. (The function-
+// DEFINITION form is pinned by DuplicateParamNamesEmitRedecl above.)
+TEST(SemanticAnalyzerCSubset, DuplicateParamNameInSingleFnPtrStillCollides) {
+    auto model = analyzeShipped("c-subset", {
+        "struct M { int (*a)(int x, int x); };\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a genuine duplicate within ONE declarator's param list must still error";
+}
+
 // ── GAP C: break/continue outside loop (loopControls facet) ────────────────
 
 // `while (1) { break; }` — a break inside a loop body → clean.
@@ -2101,22 +2515,27 @@ TEST(SemanticAnalyzerCSubset, FF11MultipleDescriptorsEachSymbolInjectedOnce) {
 
 // ── FC2: explicit C-style casts (`semantics.casts`) ─────────────────────
 
-// THE Part-B integration point: the IMPLICIT F64→I32 narrowing in
-// `return 1.7 + 2.5;` is rejected (S_ReturnTypeMismatch — the strict
-// no-silent-conversion bar), while the EXPLICIT `(int)(1.7 + 2.5)` form
-// is accepted: the cast node's result type is the stamped target (I32),
-// which assigns cleanly into main's I32 result. Both directions in one
-// test so the contrast is pinned, not assumed.
-TEST(SemanticAnalyzerCSubset, ExplicitFloatToIntCastAcceptedWhereImplicitRejected) {
+// THE Part-B integration point: an IMPLICIT distinct-typed-pointer conversion in
+// `int* f(char* p) { return p; }` is rejected (S_ReturnTypeMismatch — the strict
+// no-silent-conversion bar), while the EXPLICIT `(int*)p` form is accepted: the
+// cast node's result type is the stamped target (int*), which returns cleanly.
+// Both directions in one test so the contrast is pinned, not assumed.
+// (This test originally contrasted the implicit F64->I32 narrowing in
+// `return 1.7+2.5;` against `(int)(1.7+2.5)`, but D-CSUBSET-INT-FLOAT-CONVERSION
+// made float->int an ADMITTED implicit conversion in c-subset, so the implicit
+// form no longer fires; a distinct-typed-pointer pair is the stable implicit-
+// rejected / explicit-accepted contrast that still exercises the same FC2
+// explicit-cast-vs-implicit-assignability split.)
+TEST(SemanticAnalyzerCSubset, ExplicitPointerCastAcceptedWhereImplicitRejected) {
     auto implicitModel = analyzeShipped("c-subset", {
-        "int main() { return 1.7 + 2.5; }\n",
+        "int* f(char* p) { return p; }\n",
     });
     EXPECT_EQ(countCode(implicitModel.diagnostics(),
                         DiagnosticCode::S_ReturnTypeMismatch), 1u)
-        << "the implicit F64->I32 narrowing must stay rejected";
+        << "the implicit char* -> int* conversion must stay rejected";
 
     auto castModel = analyzeShipped("c-subset", {
-        "int main() { return (int)(1.7 + 2.5); }\n",
+        "int* f(char* p) { return (int*)p; }\n",
     });
     EXPECT_FALSE(castModel.hasErrors())
         << (castModel.diagnostics().all().empty()
@@ -2163,6 +2582,493 @@ TEST(SemanticAnalyzerCSubset, StructValueCastsAreRejected) {
     });
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 2u)
         << "struct->int AND ->struct directions must BOTH fail loud";
+}
+
+// ── c37 D-CSUBSET-FUNCTION-DESIGNATOR-CAST — `(fp)g` (function name -> fn-ptr) ──
+// C 6.3.2.1p4 + 6.3.2.3p8: a function DESIGNATOR decays to the function's
+// address; casting it to any fn-ptr type (even a DIFFERENT signature) is legal
+// and value-preserving. The sqlite `(sqlite3_destructor_type)fn` /
+// `(sqlite3_syscall_ptr)fn` shapes (29x). Red-on-disable: drop the
+// `(Ptr && FnSig)` arm in isExplicitCastable and the two positive pins fire
+// S_InvalidCast; the two negative pins guard against over-admission.
+
+// Positive — same-signature function -> fn-ptr typedef (the SQLite pattern).
+TEST(SemanticAnalyzerCSubset, FunctionDesignatorToFnPtrCastIsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef void(*dtor)(void*);\n"
+        "void real(void* p){ (void)p; }\n"
+        "int main(){ dtor d = (dtor)real; return d ? 0 : 1; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 0u)
+        << "a function designator cast to its own fn-ptr type is legal C";
+}
+
+// Positive — CROSS-signature fn-ptr cast (C 6.3.2.3p8; sqlite syscall shapes).
+TEST(SemanticAnalyzerCSubset, CrossSignatureFnPtrCastIsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef int(*fp)(int);\n"
+        "void g(void* x){ (void)x; }\n"
+        "int main(){ fp f = (fp)g; return f ? 0 : 1; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 0u)
+        << "cross-signature fn-ptr cast is legal C (calling through it is UB, the cast is not)";
+}
+
+// Negative (over-admission guard) — STRUCT value -> fn-ptr stays REJECTED.
+TEST(SemanticAnalyzerCSubset, StructToFnPtrCastStillRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef void(*fp)(void);\n"
+        "struct S { int x; };\n"
+        "int main(){ struct S s; s.x = 0; fp f = (fp)s; return f ? 0 : 1; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 1u)
+        << "a struct value is not a function designator — must stay fail-loud";
+}
+
+// Negative (over-admission guard) — function designator -> INT stays REJECTED
+// (the new arm is pointer-target-only: tk==Ptr).
+TEST(SemanticAnalyzerCSubset, FunctionDesignatorToIntStillRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "void g(void){}\n"
+        "int main(){ long p = (long)g; return (int)p; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_InvalidCast), 1u)
+        << "casting a function designator directly to an integer stays rejected";
+}
+
+// ── c38 D-CSUBSET-NESTED-TAG-SCOPE — a tag nested in a struct body has
+// ENCLOSING (block/file) scope (C 6.2.1p4), not the inner struct's member
+// scope. `floatToNamespaceScope` now floats a nested tag PAST the composite
+// body. The single largest sqlite S000D class (WalSegment/sColMap/IdList_item).
+// Red-on-disable: restore the composite-body `break` and c38a/e/f fail
+// S_NotAComposite / S_IncompleteTypeObject.
+
+// c38a — accept: a tag defined nested in Outer is visible BY NAME at file scope.
+TEST(SemanticAnalyzerCSubset, NestedTagReferencedAtFileScopeComposes) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Outer { struct Inner { int x; } m; };\n"
+        "int f(struct Inner *p){ return p->x; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IncompleteTypeObject), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
+}
+
+// c38b — accept: a value object of the nested tag works (it is COMPLETE at file scope).
+TEST(SemanticAnalyzerCSubset, NestedTagValueObjectWorks) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Outer { struct Inner { int x; } m; };\n"
+        "int main(void){ struct Inner v; v.x = 5; return v.x; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IncompleteTypeObject), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u);
+}
+
+// c38c — REGRESSION guard: member composition (`o->m.x`) must STILL work
+// (the nested struct's member TYPE is resolved via structScope, independent of
+// the tag BIND scope — the fix must not break this).
+TEST(SemanticAnalyzerCSubset, NestedTagMemberAccessStillComposes) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Outer { struct Inner { int x; } m; };\n"
+        "int g(struct Outer *o){ return o->m.x; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u);
+}
+
+// c38d — OVER-FLOAT guard: a nested tag in a BLOCK-local struct floats only to
+// the BLOCK scope, NOT file scope — a file-scope reference must STILL fail.
+TEST(SemanticAnalyzerCSubset, NestedTagInBlockDoesNotLeakToFileScope) {
+    auto model = analyzeShipped("c-subset", {
+        "void f(void){ struct Outer { struct Inner { int x; } m; }; }\n"
+        "int main(void){ struct Inner v; v.x = 0; return v.x; }\n",
+    });
+    // Inner is block-scoped to f's body; at file scope it is unknown/incomplete.
+    EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_IncompleteTypeObject)
+              + countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u);
+}
+
+// c38e — union nested tag at file scope.
+TEST(SemanticAnalyzerCSubset, NestedUnionTagComposes) {
+    auto model = analyzeShipped("c-subset", {
+        "union U { struct Item { int v; } it; };\n"
+        "int f(struct Item *p){ return p->v; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IncompleteTypeObject), 0u);
+}
+
+// c38f — deeply nested (struct in struct in struct): the innermost tag floats
+// all the way to file scope.
+TEST(SemanticAnalyzerCSubset, DeeplyNestedTagComposes) {
+    auto model = analyzeShipped("c-subset", {
+        "struct A { struct B { struct C { int v; } c; } b; };\n"
+        "int f(struct C *p){ return p->v; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_IncompleteTypeObject), 0u);
+}
+
+// c38g — shadowing: a nested tag of the same name as a FILE-scope tag both land
+// in file scope → a redefinition collision (C 6.7p3 — one definition per scope).
+TEST(SemanticAnalyzerCSubset, NestedTagShadowingFileScopeTagCollides) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Inner { int a; };\n"
+        "struct Outer { struct Inner { int x; } m; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u);
+}
+
+// ── c40 D-CSUBSET-POINTER-SUBTRACTION — `p - q` is ptrdiff_t (C 6.5.6p9) ──
+// p-q (same pointer type) yields a SIGNED integer (ptrdiff_t/I64) = the element
+// count, NOT a pointer. The fix lets it pass as a numeric function ARGUMENT (the
+// sqlite `fmt - bufpt` blocker, ~50x S0003). Red-on-disable: revert and the
+// pointer-difference is typed Ptr<T> → S_TypeMismatch when passed as an arg.
+
+// c40a — the bug: p-q passed as a numeric function arg (char*).
+TEST(SemanticAnalyzerCSubset, PointerSubtractionAsCallArgIsClean) {
+    auto model = analyzeShipped("c-subset", {
+        "void g(long x){ (void)x; }\n"
+        "int f(char* a, char* b){ g(a - b); return 0; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+
+// c40b — int* p-q also passes as a numeric arg (the type is I64 regardless of pointee).
+TEST(SemanticAnalyzerCSubset, PointerSubtractionIntPtrAsCallArgIsClean) {
+    auto model = analyzeShipped("c-subset", {
+        "void g(long x){ (void)x; }\n"
+        "int f(int* a, int* b){ g(a - b); return 0; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+
+// c40c — p-q returned as long (the result type is ptrdiff_t) + assigned.
+TEST(SemanticAnalyzerCSubset, PointerSubtractionReturnAndAssignIsClean) {
+    auto model = analyzeShipped("c-subset", {
+        "long span(char* a, char* b){ long n = a - b; return n; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+
+// c40d — GUARD: MISMATCHED-pointee `char* - int*` does NOT get the ptrdiff rule
+// (same-pointee only) → it stays a Ptr-typed value. When that value is passed to
+// a NUMERIC param the call-arg `isAssignable` rejects it (S_TypeMismatch). NOTE:
+// this is the ARG-CONTEXT catch ONLY — in a non-arg context (`(int)(a-b)`,
+// `long n=a-b`) a mismatched-pointee difference is NOT diagnosed today (a
+// deferred general fail-loud, D-CSUBSET-POINTER-DIFF-EDGE-CASES, flagged by the
+// c40 audit). This pin documents the arg-context behavior, not a universal flag.
+TEST(SemanticAnalyzerCSubset, MismatchedPointeeSubtractionRejectedAsNumericArg) {
+    auto model = analyzeShipped("c-subset", {
+        "void g(long x){ (void)x; }\n"
+        "int f(char* a, int* b){ g(a - b); return 0; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+}
+
+// ── c41 D-CSUBSET-POINTER-INT-ARITHMETIC — `p ± n` is a pointer (C 6.5.6p8) ──
+// `p + n` / `n + p` / `p - n` yield a pointer (Ptr<T>), and the MIR scales n by
+// sizeof(*p). These pins assert the TYPE (the runtime stride is the corpus
+// pointer_int_arith). Red-on-disable for c41b: revert the semantic `n + p` arm
+// and `n + p` types as Int -> assigning it to `int*` fails S_TypeMismatch.
+
+TEST(SemanticAnalyzerCSubset, PointerPlusIntIsCleanPointerTyped) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int* p, int n){ int* q = p + n; return *q; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+// The key commutative case: `n + p` must type as a pointer, not the integer.
+TEST(SemanticAnalyzerCSubset, IntPlusPointerIsCleanPointerTyped) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int* p, int n){ int* q = n + p; return *q; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+TEST(SemanticAnalyzerCSubset, PointerMinusIntIsCleanPointerTyped) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int* p, int n){ int* q = p - n; return *q; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+// GUARD: `int + int` is NOT pointer arithmetic (the Ptr guard is not over-broad).
+TEST(SemanticAnalyzerCSubset, IntPlusIntUnaffectedByPtrArith) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int a, int b){ return a + b; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+
+// ── c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME — fn-ptr cast/sizeof typing ──
+//
+// The shared `castTypeRef` now routes an abstract `directDeclarator` tail
+// through `declaratorDeclaredType` (the SAME path params use), so a cast to an
+// abstract fn-pointer type yields exactly `Ptr<FnSig(params)->base>`. These pins
+// assert the EXACT interned shape (red-on-disable: drop the directDeclaredType
+// fold and the cast mistypes as the bare base `int`).
+
+namespace {
+// Find the first castExpr node across a CU's trees (helper for the typing pins).
+[[nodiscard]] inline std::pair<TreeId, NodeId>
+firstCastNode(CompilationUnit const& cu) {
+    for (auto const& t : cu.trees()) {
+        if (!t.hasSchema()) continue;
+        auto const rid = t.schema().rules().find("castExpr");
+        if (!rid.valid()) continue;
+        for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+            NodeId const n{i};
+            if (t.kind(n) == NodeKind::Internal && t.rule(n).v == rid.v)
+                return {t.id(), n};
+        }
+    }
+    return {TreeId{}, NodeId{}};
+}
+} // namespace
+
+// `(int(*)(void))p` types as `Ptr<FnSig(void)->I32>` — the exact param-position
+// type. Asserts the full interned shape: outer Ptr, inner FnSig, zero params
+// (the C 6.7.6.3p10 `(void)` normalization), I32 result.
+TEST(SemanticAnalyzerCSubset, AbstractFnPtrCastTypesAsPtrToFnVoidInt) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { void* p; return ((int(*)(void))p) != 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    auto [tid, cast] = firstCastNode(*cu);
+    ASSERT_TRUE(cast.valid());
+    TypeId const castTy = model.typeAt(cast);
+    ASSERT_TRUE(castTy.valid()) << "the fn-ptr cast node must be typed";
+    ASSERT_EQ(ti.kind(castTy), TypeKind::Ptr) << "cast result is a pointer";
+    TypeId const pointee = ti.operands(castTy)[0];
+    ASSERT_EQ(ti.kind(pointee), TypeKind::FnSig)
+        << "the pointee must be a function signature (Ptr<Fn ...>)";
+    EXPECT_EQ(ti.fnParams(pointee).size(), 0u)
+        << "(void) normalizes to zero params";
+    EXPECT_EQ(ti.kind(ti.fnResult(pointee)), TypeKind::I32)
+        << "the fn returns int";
+    EXPECT_FALSE(ti.fnIsVariadic(pointee));
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+}
+
+// `(int(*)(int))p` — a one-param fn-ptr type: `Ptr<FnSig(int)->I32>`.
+TEST(SemanticAnalyzerCSubset, AbstractFnPtrCastWithParamTypesCorrectly) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { void* p; return ((int(*)(int))p) != 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    auto [tid, cast] = firstCastNode(*cu);
+    ASSERT_TRUE(cast.valid());
+    TypeId const castTy = model.typeAt(cast);
+    ASSERT_EQ(ti.kind(castTy), TypeKind::Ptr);
+    TypeId const fn = ti.operands(castTy)[0];
+    ASSERT_EQ(ti.kind(fn), TypeKind::FnSig);
+    auto params = ti.fnParams(fn);
+    ASSERT_EQ(params.size(), 1u);
+    EXPECT_EQ(ti.kind(params[0]), TypeKind::I32);
+    EXPECT_EQ(ti.kind(ti.fnResult(fn)), TypeKind::I32);
+}
+
+// sizeof of an abstract fn-ptr type stamps size_t and resolves the type (no
+// crash) — the Pass-2 form. (The array-dimension FOLD readback is pinned in the
+// corpus runtime example, which exercises the value end-to-end.)
+TEST(SemanticAnalyzerCSubset, SizeofAbstractFnPtrResolvesCleanly) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { return (int)sizeof(int(*)(void)); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+}
+
+// FAIL-LOUD: a NAMED declarator in a type-name position (`(int x)p`) is a C
+// constraint violation (type-names are abstract) — S_TypeNameDeclaratorNotAbstract,
+// never silently parsed as `(int)`. This is the inverse of
+// S_DeclarationDeclaresNothing.
+TEST(SemanticAnalyzerCSubset, NamedCastDeclaratorFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() { int p; return (int (x))p; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeNameDeclaratorNotAbstract), 1u)
+        << "a named type-name declarator must fail loud, never silently "
+           "drop the name and cast to the bare base type";
+}
+
+// FAIL-LOUD: an UNKNOWN base type with an abstract fn-ptr declarator
+// (`(Nope(*)(void))p`) still emits S_UnknownType (the base resolves to nothing —
+// the declarator fold never masks a missing base).
+TEST(SemanticAnalyzerCSubset, AbstractFnPtrCastUnknownBaseStillUnknownType) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() { void* p; return ((Nope(*)(void))p) != 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownType), 1u)
+        << "an unknown base type must still fail loud under an abstract "
+           "fn-ptr declarator";
+}
+
+// ── c29 D-CSUBSET-POST-STAR-CAST-QUALIFIER — post-star cast qualifier stripped ──
+//
+// `castTypeRef`'s stars are now `pointerLayer` children; a POST-star qualifier
+// (`int * const` / `u32 * volatile`) rides inside the layer. A cast yields an
+// RVALUE with NO top-level cv (C 6.5.4), so the resolver STRIPS the layer's
+// ptrQualifiers: `(int * const)p` and `(int *)p` intern the SAME Ptr<int>, and a
+// post-star volatile builds Ptr<u32> with NO VolatileQual on the POINTER. The c27
+// PRE-stars volatile pointee path (`volatile u32 *`→Ptr<VolatileQual(u32)>) is
+// SEPARATE and unbroken. Red-on-disable: revert `{repeat pointerLayer}` to
+// `{repeat StarOp}` → the post-star const fails to parse (P0009); keep the layer
+// but fold its volatile into the base → the pointer wrongly carries VolatileQual.
+
+namespace {
+// The k-th (0-based) castExpr node across a CU's trees, source order.
+[[nodiscard]] inline std::pair<TreeId, NodeId>
+nthCastNode(CompilationUnit const& cu, std::size_t k) {
+    std::size_t seen = 0;
+    for (auto const& t : cu.trees()) {
+        if (!t.hasSchema()) continue;
+        auto const rid = t.schema().rules().find("castExpr");
+        if (!rid.valid()) continue;
+        for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+            NodeId const n{i};
+            if (t.kind(n) == NodeKind::Internal && t.rule(n).v == rid.v) {
+                if (seen++ == k) return {t.id(), n};
+            }
+        }
+    }
+    return {TreeId{}, NodeId{}};
+}
+} // namespace
+
+// `(int * const)p` and `(int *)p` resolve to the EXACT SAME TypeId — the post-star
+// const is stripped (a cast pointer is a top-level-cv-less rvalue). Both casts in
+// one CU so the interned ids are directly comparable.
+TEST(SemanticAnalyzerCSubset, PostStarConstCastStripsToPlainPointer) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { int* p;\n"
+        "  int* a = (int * const)p;\n"
+        "  int* b = (int *)p;\n"
+        "  return (a == b); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    auto [tA, cA] = nthCastNode(*cu, 0);
+    auto [tB, cB] = nthCastNode(*cu, 1);
+    ASSERT_TRUE(cA.valid() && cB.valid());
+    TypeId const tyConst = model.typeAt(cA);
+    TypeId const tyPlain = model.typeAt(cB);
+    ASSERT_TRUE(tyConst.valid() && tyPlain.valid());
+    EXPECT_EQ(tyConst, tyPlain)
+        << "(int * const)p and (int *)p must intern the SAME type (post-star "
+           "const stripped)";
+    ASSERT_EQ(ti.kind(tyConst), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(tyConst)[0]), TypeKind::I32);
+    EXPECT_FALSE(ti.isVolatileQualified(tyConst))
+        << "a const cast pointer is not volatile";
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+}
+
+// `(u32 * volatile)p` — a POST-star volatile is STRIPPED: the cast types as a
+// plain Ptr<u32>, with NO top-level VolatileQual on the POINTER (a cast rvalue has
+// no top-level cv, C 6.5.4). The pointee is the bare u32 (NOT volatile — the
+// volatile was the pointer object's, dropped).
+TEST(SemanticAnalyzerCSubset, PostStarVolatileCastStripsPointerVolatile) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef unsigned int u32;\n"
+        "int main() { void* p; return ((u32 * volatile)p) != 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    auto [tid, cast] = nthCastNode(*cu, 0);
+    ASSERT_TRUE(cast.valid());
+    TypeId const castTy = model.typeAt(cast);
+    ASSERT_TRUE(castTy.valid());
+    ASSERT_EQ(ti.kind(castTy), TypeKind::Ptr);
+    EXPECT_FALSE(ti.isVolatileQualified(castTy))
+        << "the post-star volatile must be STRIPPED — no VolatileQual on the "
+           "cast pointer";
+    TypeId const pointee = ti.operands(castTy)[0];
+    EXPECT_FALSE(ti.isVolatileQualified(pointee))
+        << "an east `u32 * volatile` does NOT qualify the pointee";
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+}
+
+// c27 UNBROKEN: `(volatile u32 *)p` — a PRE-stars volatile qualifies the POINTEE,
+// building Ptr<VolatileQual(u32)>. The pointer itself is NOT volatile; its pointee
+// IS. (The c29 strip applies ONLY to a layer's POST-star qualifier; the pre-stars
+// head volatile path is untouched.)
+TEST(SemanticAnalyzerCSubset, PreStarVolatileCastKeepsPointeeVolatile) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef unsigned int u32;\n"
+        "int main() { void* p; return ((volatile u32 *)p) != 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    auto [tid, cast] = nthCastNode(*cu, 0);
+    ASSERT_TRUE(cast.valid());
+    TypeId const castTy = model.typeAt(cast);
+    ASSERT_TRUE(castTy.valid());
+    ASSERT_EQ(ti.kind(castTy), TypeKind::Ptr);
+    EXPECT_FALSE(ti.isVolatileQualified(castTy))
+        << "the POINTER is not volatile (the pre-stars volatile binds the pointee)";
+    TypeId const pointee = ti.operands(castTy)[0];
+    EXPECT_TRUE(ti.isVolatileQualified(pointee))
+        << "(volatile u32 *) builds Ptr<VolatileQual(u32)> — the pointee IS "
+           "volatile (c27 unbroken)";
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+}
+
+// c27 + c29 together: `(volatile u32 **)p` — pre-stars volatile pointee with TWO
+// pointer levels → Ptr<Ptr<VolatileQual(u32)>>. (The sqlite 67392 frontier; both
+// stars are now pointerLayers, neither carries a post-star qualifier.)
+TEST(SemanticAnalyzerCSubset, PreStarVolatileDoublePtrCastBuildsNestedPointee) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef unsigned int u32;\n"
+        "int main() { void* p; return ((volatile u32 **)p) != 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    auto [tid, cast] = nthCastNode(*cu, 0);
+    ASSERT_TRUE(cast.valid());
+    TypeId const outer = model.typeAt(cast);
+    ASSERT_TRUE(outer.valid());
+    ASSERT_EQ(ti.kind(outer), TypeKind::Ptr);
+    TypeId const mid = ti.operands(outer)[0];
+    ASSERT_EQ(ti.kind(mid), TypeKind::Ptr) << "Ptr<Ptr<...>>";
+    TypeId const inner = ti.operands(mid)[0];
+    EXPECT_TRUE(ti.isVolatileQualified(inner))
+        << "innermost pointee is VolatileQual(u32)";
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
 }
 
 // Pointer casts: ptr↔ptr, int→ptr (the null-constant idiom and beyond),
@@ -2485,10 +3391,13 @@ TEST(SemanticAnalyzerCSubset, ValueStarValueStaysExpressionStatement) {
         "int main() { int a = 2; int b = 3; a * b; return a; }\n",
     });
     EXPECT_FALSE(model.hasErrors());
-    // main + a + b + the 2 FC12a-core builtin TYPES (__va_list_tag + va_list) — the
+    // main + a + b + the 2 FC12a-core builtin TYPES (__va_list_tag + va_list) + the
+    // 5 intrinsic builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
+    // _ReadWriteBarrier + c115 _exception_code + _exception_info) — the
     // multiplication must mint NO symbol.
-    EXPECT_EQ(model.symbols().size() - 1, 5u)
-        << "main + a + b + __va_list_tag + va_list — the multiplication mints none";
+    EXPECT_EQ(model.symbols().size() - 1, 10u)
+        << "main + a + b + __va_list_tag + va_list + the 5 intrinsic builtins — "
+           "the multiplication mints none";
 }
 
 // UNKNOWN `u * v;` (no `u` anywhere, single file) — the oracle-candidate
@@ -3066,9 +3975,11 @@ TEST(SemanticAnalyzerCSubset, ExternObjectIncompatibleDefinitionFailsLoud) {
         << "an incompatible extern + definition must fail loud exactly once";
 }
 
-// (g) Negative (fail-loud preserved): TWO real object definitions still collide
-// S_RedeclaredSymbol — the extern merge admits a NON-DEFINING declaration + a
-// definition, never two definitions (incl. two tentative defs).
+// (g) Negative (fail-loud preserved): TWO real (INITIALIZED) object definitions
+// still collide S_RedeclaredSymbol — the merge admits a NON-DEFINING declaration
+// (extern / proto / file-scope tentative) + at most one real definition, never two
+// real definitions. (c33: `int g; int g = 5;` does NOT collide — the tentative is
+// non-defining; only BOTH-initialized collides.)
 TEST(SemanticAnalyzerCSubset, TwoObjectDefinitionsStillCollide) {
     auto model = analyzeShipped("c-subset", {
         "int g = 1;\n"
@@ -3076,8 +3987,8 @@ TEST(SemanticAnalyzerCSubset, TwoObjectDefinitionsStillCollide) {
     });
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_RedeclaredSymbol), 1u)
-        << "two object DEFINITIONS must still collide — only an extern + a "
-           "definition merge";
+        << "two object DEFINITIONS must still collide — only a non-defining "
+           "declaration + at most one definition merge";
 }
 
 // (h) Negative (fail-loud preserved): an extern FUNCTION and a same-named OBJECT
@@ -3145,6 +4056,123 @@ TEST(SemanticAnalyzerCSubset, ExternObjectThenTypedefCrossCategoryCollides) {
            "different categories, must collide in either order";
 }
 
+// ── c33 D-CSUBSET-TENTATIVE-DEFINITION — a file-scope object declaration WITHOUT
+//    an initializer is a TENTATIVE DEFINITION (C 6.9.2): any number of tentatives
+//    + at most one real (initialized) definition of the same name MERGE into one
+//    object; two REAL definitions still collide. The merge reuses the
+//    non-defining-declaration machinery (the tentative is folded into the
+//    `mergeOrCollideRedeclaration` non-defining test) — same path as extern/proto.
+
+// (1) Tentative definition + a later real definition MERGE: zero diagnostics,
+// exactly one surviving symbol (the definition keeps the binding and its init; the
+// tentative is absorbed). This is the sqlite frontier shape (`u32 t; u32 t = 0;`).
+// RED-ON-DISABLE: drop `isTentativeDefinition` from the Pass-1 `newNonDef` fold ->
+// the tentative is treated as a definition -> S_RedeclaredSymbol fires.
+TEST(SemanticAnalyzerCSubset, TentativeDefinitionThenDefinitionMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "int g;\n"
+        "int g = 5;\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a file-scope tentative definition + a real definition must merge";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u);
+    EXPECT_EQ(countSurvivingSymbols(model, "g"), 1u)
+        << "exactly one surviving symbol for g (the definition); tentative absorbed";
+}
+
+// (2) Two tentative definitions (neither initialized) MERGE into one object (C
+// 6.9.2 — it lowers to a single zero-initialized global). Zero diagnostics, one
+// surviving symbol. RED-ON-DISABLE: drop the tentative fold -> S_RedeclaredSymbol.
+TEST(SemanticAnalyzerCSubset, TwoTentativeDefinitionsMerge) {
+    auto model = analyzeShipped("c-subset", {
+        "int g;\n"
+        "int g;\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "two file-scope tentative definitions must merge into one object";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u);
+    EXPECT_EQ(countSurvivingSymbols(model, "g"), 1u);
+}
+
+// (3) `static` tentative + a `static` real definition MERGE (internal linkage does
+// not change the tentative-definition rule). RED-ON-DISABLE: drop the tentative
+// fold -> S_RedeclaredSymbol.
+TEST(SemanticAnalyzerCSubset, StaticTentativeDefinitionThenDefinitionMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "static int g;\n"
+        "static int g = 5;\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a static tentative definition + a static definition must merge";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u);
+    EXPECT_EQ(countSurvivingSymbols(model, "g"), 1u);
+}
+
+// (4) ★ PRESERVE — two REAL (initialized) definitions still COLLIDE
+// S_RedeclaredSymbol. Both carry an initializer ⇒ both defining ⇒ not tentative.
+// This is the c33 must-stay-an-error case. RED-ON-DISABLE: if the tentative gate
+// stopped requiring "no initializer", an initialized def would be misread as
+// tentative and this collision would vanish.
+TEST(SemanticAnalyzerCSubset, TwoRealDefinitionsStillCollide_Tentative) {
+    auto model = analyzeShipped("c-subset", {
+        "int g = 1;\n"
+        "int g = 2;\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "two REAL object definitions (both initialized) must STILL collide — "
+           "the tentative merge requires an UN-initialized declaration";
+}
+
+// (5) ★ PRESERVE — a BLOCK-SCOPE duplicate is NOT a tentative definition (C 6.9.2
+// is file-scope only): `int y; int y;` inside a body must STILL collide
+// S_RedeclaredSymbol. RED-ON-DISABLE: if the file-scope gate were dropped, the two
+// block locals would merge and this collision would vanish (a real shadowing bug).
+TEST(SemanticAnalyzerCSubset, BlockScopeDuplicateNotTentativeStillCollides) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void){ int y; int y; return y; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a block-scope duplicate is not a tentative definition — it must collide";
+}
+
+// (6) ★ PRESERVE — a tentative definition + an INCOMPATIBLE real definition fail
+// loud with S_IncompatibleRedeclaration (NOT a silent merge). `int g;` then `g`
+// redefined at an incompatible type: the merge runs the SAME post-1.5 type-compat
+// sweep as extern/proto. A pointer-vs-int mismatch is target-independent (unlike
+// int-vs-long, which are the SAME type under LLP64), so it conflicts on every
+// target. RED-ON-DISABLE: disable the merged-decl compat sweep -> silently accepted.
+TEST(SemanticAnalyzerCSubset, TentativeDefinitionIncompatibleTypeFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int g;\n"
+        "int* g = 0;\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompatibleRedeclaration), 1u)
+        << "a tentative definition and an incompatible definition must fail loud — "
+           "never a silent type merge";
+}
+
+// (7) PRESERVE (unchanged) — an `extern` declaration + a definition still merge:
+// the tentative work folds ALONGSIDE the existing extern path, not over it. Guards
+// that the extern arm is untouched. (Mirror of ExternObjectThenDefinitionMerges,
+// re-asserted in the c33 block to lock the no-regression contract.)
+TEST(SemanticAnalyzerCSubset, ExternPlusDefinitionStillMerges_TentativeGuard) {
+    auto model = analyzeShipped("c-subset", {
+        "extern int g;\n"
+        "int g = 5;\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "an extern declaration + a definition must still merge (c33 must not "
+           "regress the extern path)";
+    EXPECT_EQ(countSurvivingSymbols(model, "g"), 1u);
+}
+
 // ── C 6.2.3 TAG NAMESPACE (closes the tag-namespace residue of
 //    D-CSUBSET-DECL-GRAMMAR-LOW-RESIDUES) ──
 
@@ -3190,18 +4218,23 @@ TEST(SemanticAnalyzerCSubset, TagAndAliasBothResolveSameType) {
     EXPECT_FALSE(model.hasErrors());
 }
 
-// (c) The negative is PRESERVED: an undeclared tag `struct Nope x;` still fails
-// loud with exactly one S_UnknownType.
-// RED-ON-DISABLE: drop the `emitOnMiss` fail-loud arm inside MF-1 (return
-// InvalidType silently on a tag miss) and this count falls to 0 — a silent
-// accept of an unknown tag.
-TEST(SemanticAnalyzerCSubset, UnknownTagFiresUnknownType) {
+// (c) The negative is PRESERVED, with the c35-correct manifestation: a
+// never-defined tag used BY VALUE (`struct Nope x;`) is an OBJECT of an
+// INCOMPLETE type (c35: the opaque tag forward-mints incomplete, so the
+// reference RESOLVES — it is no longer "unknown"; the error moves to the
+// by-value object). Fail loud with S_IncompleteTypeObject. RED-ON-DISABLE: drop
+// the c35 incomplete-object guard and `struct Nope x;` silently accepts a
+// zero-size object at the semantic tier.
+TEST(SemanticAnalyzerCSubset, UnknownTagByValueFiresIncompleteObject) {
     auto model = analyzeShipped("c-subset", {
         "typedef struct Pair { int a; } Pair;\n"
         "int main(void) { struct Nope x; return 0; }\n",
     });
-    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
-        << "an undeclared struct tag must fail loud exactly once";
+    EXPECT_TRUE(model.hasErrors())
+        << "a by-value object of a never-defined struct tag must fail loud";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompleteTypeObject), 1u)
+        << "an object of an incomplete (forward-only) struct type fails loud once";
 }
 
 // A struct TAG `S` and an ordinary OBJECT `S` coexist in one scope chain and
@@ -3478,12 +4511,13 @@ TEST(SemanticAnalyzerCSubset, TypedefSelfReferentialStructCompiles) {
 // `struct A { struct B *b; }; struct B { struct A *a; };`. A's body references
 // `struct B` by pointer BEFORE B is defined; Pass-1 forward-mints BOTH tags
 // (whole-tree pre-order) so the pointer resolves to an incomplete `struct B`,
-// completed when B's body is processed, and B then references A. NOTE: a BARE
-// `struct B;` forward-declaration STATEMENT is a SEPARATE, deferred feature
-// (D-CSUBSET-FORWARD-STRUCT-DECLARATION) — it does NOT parse today, so it is
-// deliberately NOT used here (an earlier version of this test included it and
-// was FALSE-GREEN: model.hasErrors() reads only the semantic reporter and was
-// blind to the bare-decl PARSE error).
+// completed when B's body is processed, and B then references A. (c35 NOTE: a
+// BARE `struct B;` forward-declaration STATEMENT now ALSO works —
+// D-CSUBSET-FORWARD-STRUCT-DECLARATION — but the IMPLICIT pointer form here is
+// the original c24 path and is kept as its own pin. An earlier version of this
+// test used a bare `struct B;` and was FALSE-GREEN: `model.hasErrors()` reads
+// only the semantic reporter and was blind to the then-PARSE-error; today the
+// bare form parses, but this test stays on the implicit form to pin c24.)
 TEST(SemanticAnalyzerCSubset, MutuallyRecursiveStructsCompile) {
     auto model = analyzeShipped("c-subset", {
         "struct A { struct B *b; int x; };\n"
@@ -3535,4 +4569,796 @@ TEST(SemanticAnalyzerCSubset, MultiMemberDeclaresNothingStillLoud) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
         << "`int ;` declares nothing -- must stay loud (anonymous non-bitfield)";
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: dual-mode binder pins.
+//
+// ONE grammar rule (`structSpec`/`unionSpec`/`enumSpec`) is BOTH a type
+// DEFINITION (body present) and a tag REFERENCE (body absent). These pins
+// assert the EXACT outcome of the binder's body-child-presence routing:
+// a definition MINTS the composite type and member access types through it;
+// a reference RESOLVES to the prior definition; an undefined tag fails loud;
+// a redefinition collides; the anonymous-typedef + nested-inline-body forms
+// still type. Each is red-on-disable: break iff the dual-mode mis-routes.
+// ─────────────────────────────────────────────────────────────────────────
+
+// (3a) STRUCT define mints + reference resolves + member access types.
+//   `struct S { int x; };`  — definition: mints a Struct type with one I32 field.
+//   `struct S v; v.x;`      — reference: `v` resolves to the SAME Struct type,
+//                             and `v.x` member access types to I32.
+TEST(SemanticAnalyzerCSubset, C25StructDefineMintsRefResolvesMemberTypes) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; };\n"
+        "int main() { struct S v; int y; y = v.x; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "define + reference + member access must be clean";
+    auto const& ti = model.lattice().interner();
+    // DEFINE: the tag minted a Struct type with one I32 field.
+    TypeId const s = composedAggregate(model, "S");
+    ASSERT_TRUE(s.valid()) << "struct S must mint a composite (definition arm)";
+    ASSERT_EQ(ti.kind(s), TypeKind::Struct);
+    ASSERT_EQ(ti.operands(s).size(), 1u);
+    EXPECT_EQ(ti.kind(ti.operands(s)[0]), TypeKind::I32);
+    // REFERENCE: `v` (declared via the body-ABSENT `struct S`) resolves to S.
+    SymbolRecord const* v = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "v") v = &model.symbols()[i];
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(v->type.valid()) << "`struct S v;` (reference) must resolve the tag";
+    EXPECT_EQ(v->type.v, s.v)
+        << "the reference must resolve to the SAME TypeId the definition minted";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u)
+        << "v.x where v is struct S with field x must NOT fire S_NotAComposite";
+}
+
+// (c25 SQLite-critical) FORWARD reference: a tag REFERENCED before it is DEFINED
+// — the pervasive `typedef struct Foo Foo;` … `struct Foo { … };`-later idiom that
+// every SQLite struct uses. The two-pass analyzer must resolve the forward
+// reference to the LATER definition; the unified `structSpec` reference arm must
+// preserve this EXACTLY as the former `structTypeRef` did. RED-on-disable: if the
+// dual-mode routing broke forward resolution, `v.x` would fail (S_UnknownType /
+// S_NotAComposite) and SQLite would regress FAR before `struct sqlite3`.
+TEST(SemanticAnalyzerCSubset, C25ForwardTypedefThenDefinitionResolves) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef struct Foo Foo;\n"
+        "struct Foo { int x; };\n"
+        "int main() { Foo v; int y; y = v.x; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "forward typedef + later definition + member access must resolve clean";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "the forward reference must resolve to the LATER definition (two-pass)";
+}
+
+// (c25 SQLite-critical) FORWARD pointer field / mutual recursion: a struct field
+// pointing at a not-yet-defined tag (`struct A { struct B *b; }; struct B {…};`).
+// The field's type reference (now a body-absent `structSpec`) must resolve to the
+// later `struct B` — pins that c24's self-/mutually-recursive struct support
+// survives the c25 specifier unification.
+TEST(SemanticAnalyzerCSubset, C25ForwardPointerFieldResolves) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct A { struct B *b; };\n"
+        "struct B { int x; };\n"
+        "int main() { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "a pointer field to a forward-declared tag must resolve to its later definition";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
+}
+
+// (3c) A by-VALUE object of an UNDEFINED struct fails loud. c35: the opaque tag
+// forward-mints an INCOMPLETE type so `struct Nope` RESOLVES (no S_UnknownType);
+// the by-value object `struct Nope v;` is then an OBJECT of incomplete type →
+// S_IncompleteTypeObject. (Pre-c35 this was S_UnknownType; c35 moves the error to
+// the precise constraint — an incomplete object, not an unknown type. An opaque
+// `struct Nope *p` POINTER would be CLEAN.) RED-on-disable: drop the c35
+// incomplete-object guard and this silently accepts a zero-size object.
+TEST(SemanticAnalyzerCSubset, C35UndefinedStructTagByValueFailsLoudIncompleteObject) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { struct Nope v; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompleteTypeObject), 1u)
+        << "a by-value `struct Nope v;` (undefined tag) is an incomplete object — "
+           "must fail loud S_IncompleteTypeObject";
+}
+
+// (3d) Redefinition of a tag collides — S_RedeclaredSymbol, exactly as today.
+TEST(SemanticAnalyzerCSubset, C25StructTagRedefinitionCollides) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; };\n"
+        "struct S { int y; };\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "two definitions of tag S must collide exactly as before c25";
+}
+
+// (c35 forward-decl) A bare `struct S;` (no body, no object) is a FORWARD
+// DECLARATION of an opaque tag (C 6.7.2.3) — it MINTS an INCOMPLETE composite
+// and binds it into the Tag namespace, with NO error. (INVERTS the former
+// C25BareStructForwardDeclFailsLoud, which asserted the pre-c35 S_UnknownType:
+// c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION deliberately changes that behavior so
+// the sqlite3_stmt opaque-handle pattern compiles.) RED-on-disable: drop the
+// isTagReference forward-mint and the tag misses → S_UnknownType returns and the
+// `S` symbol is never an incomplete Type. The incomplete flag is the witness
+// that the type stays UN-sizeable — a VALUE/by-value-member/sizeof of it fails
+// loud through the unchanged computeLayout guard (covered by the dedicated
+// fail-loud pins below).
+TEST(SemanticAnalyzerCSubset, C35BareStructForwardDeclMintsIncompleteTag) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "`struct S;` (a forward declaration) must compile, minting an opaque tag";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "a forward-declared tag is NOT an unknown type — it is an incomplete one";
+    SymbolRecord const* s = findSym(model, "S");
+    ASSERT_NE(s, nullptr) << "the forward declaration must mint a Type symbol `S`";
+    EXPECT_EQ(s->kind, DeclarationKind::Type);
+    ASSERT_TRUE(s->type.valid());
+    EXPECT_TRUE(model.lattice().interner().isIncompleteComposite(s->type))
+        << "a never-defined forward-declared `struct S` stays INCOMPLETE "
+           "(un-sizeable) — the no-silent-zero-size backstop";
+}
+
+// (c35) OPAQUE handle via pointer: `typedef struct S S;` (S never defined) used
+// ONLY as `S *` — the sqlite3_stmt shape. The tag-reference miss forward-mints an
+// INCOMPLETE composite; the typedef alias resolves to it; `S *p` is a sizeable
+// Ptr<incomplete> and the whole TU is clean. RED-on-disable: without the
+// forward-mint the base `struct S` misses → S_UnknownType on both the typedef and
+// the param.
+TEST(SemanticAnalyzerCSubset, C35OpaqueTypedefViaPointerCompiles) {
+    auto model = analyzeShipped("c-subset", {
+        "typedef struct S S;\n"
+        "int use(S *p){ return p ? 1 : 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "an opaque typedef'd struct used only by pointer must compile";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u);
+    SymbolRecord const* s = findSym(model, "S");
+    ASSERT_NE(s, nullptr);
+    ASSERT_TRUE(s->type.valid());
+    EXPECT_TRUE(model.lattice().interner().isIncompleteComposite(s->type))
+        << "the opaque handle's underlying tag stays incomplete";
+}
+
+// (c35) FORWARD-then-DEFINE completes the SAME tag: `struct S; struct S { int a; };`
+// — the later definition COMPLETES the forward-declared tag (no collision), and a
+// member of an object of it resolves. RED-on-disable: a redefinition collision
+// here (S_RedeclaredSymbol) or a member miss (S_NotAComposite) flags a broken
+// forward→complete unification.
+TEST(SemanticAnalyzerCSubset, C35ForwardThenDefineCompletesNoCollision) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S;\n"
+        "struct S { int a; };\n"
+        "int main(void){ struct S v; v.a = 42; return v.a; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a forward declaration completed by a later definition must be clean";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "completing a forward tag is NOT a redeclaration";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NotAComposite), 0u)
+        << "the member access resolves through the completed tag";
+    SymbolRecord const* s = findSym(model, "S");
+    ASSERT_NE(s, nullptr);
+    ASSERT_TRUE(s->type.valid());
+    EXPECT_FALSE(model.lattice().interner().isIncompleteComposite(s->type))
+        << "after its definition the tag is COMPLETE (sizeable)";
+}
+
+// (c35 ★ fail-loud) The VALUE-of-incomplete fail-loud (`struct S v;` — a local
+// OBJECT of a never-defined struct) is enforced at the STORAGE tier (the MIR
+// allocaForLocal / data-producer computeLayout incomplete guard), NOT the
+// semantic phase — see C35ValueOfIncompleteFailsLoud in the MIR-lowering suite
+// (tests/mir/test_mir_lowering_c_subset.cpp), which runs the full pipeline.
+
+// (c35 ★ fail-loud) MEMBER of an incomplete-pointer: `struct S; p->x` where S is
+// incomplete — the member access has no layout to resolve and must FAIL LOUD
+// (S_NotAComposite / the layout miss), never a wrong offset. RED-on-disable: a
+// dropped incomplete guard would resolve a phantom offset.
+TEST(SemanticAnalyzerCSubset, C35MemberOfIncompletePointerFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S;\n"
+        "int g(struct S *p){ return p->x; }\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_TRUE(model.hasErrors())
+        << "a member access through a pointer to an incomplete struct must fail "
+           "loud — its layout is unknowable";
+}
+
+// (c35 ★ fail-loud) SIZEOF of an incomplete type: `sizeof(struct S)` where S is
+// incomplete is ill-formed (C 6.5.3.4) — must FAIL LOUD, never a guessed size.
+// RED-on-disable: a 0 (or any) size leaking out would silently size the array.
+TEST(SemanticAnalyzerCSubset, C35SizeofOfIncompleteFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S;\n"
+        "int a[sizeof(struct S)];\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_TRUE(model.hasErrors())
+        << "sizeof of an incomplete struct must fail loud";
+}
+
+// (c35 PRESERVE) TWO DEFINITIONS still collide: `struct S { int a; }; struct S
+// { int b; };` — two COMPLETE definitions of the same tag are a redefinition
+// (S_RedeclaredSymbol). The forward-decl relaxation must NOT swallow this — only
+// an INCOMPLETE prior tag is completable; a complete one collides. RED-on-disable:
+// losing this lets a struct be silently redefined with a different layout.
+TEST(SemanticAnalyzerCSubset, C35TwoDefinitionsStillCollide) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int a; };\n"
+        "struct S { int b; };\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "two complete definitions of the same tag must still collide";
+}
+
+// (3b) Anonymous typedef struct: `typedef struct { int x; } T; T v; v.x;` —
+// the anonymous definition mints a Struct (via anonymousNameAllowed), the alias
+// resolves, and member access types. RED-on-disable: the anonymous mint relies
+// on the body child being present at the definition node.
+TEST(SemanticAnalyzerCSubset, C25AnonymousTypedefStructDefinesAndResolves) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef struct { int x; } T;\n"
+        "int main() { T v; int y; y = v.x; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "anonymous typedef struct define + alias use + member access clean";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u);
+}
+
+// (3e) Nested inline-body field: `struct Outer { struct Inner { int x; } in; };`
+// — the inner body is itself a definition (a structSpec WITH a structBody, nested
+// as a field). Both compose. RED-on-disable: the recursive define path depends on
+// the nested specifier being routed as a definition by its own body child.
+TEST(SemanticAnalyzerCSubset, C25NestedInlineBodyFieldComposes) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct Outer { struct Inner { int x; } in; };\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const inner = composedAggregate(model, "Inner");
+    TypeId const outer = composedAggregate(model, "Outer");
+    ASSERT_TRUE(inner.valid()) << "nested struct Inner must compose";
+    ASSERT_TRUE(outer.valid()) << "struct Outer must compose";
+    ASSERT_EQ(ti.operands(outer).size(), 1u) << "Outer has one member (in)";
+    EXPECT_EQ(ti.operands(outer)[0].v, inner.v)
+        << "Outer's member `in` must be the inner Struct type";
+}
+
+// (3f-union) UNION define/reference parity with struct.
+TEST(SemanticAnalyzerCSubset, C25UnionDefineMintsRefResolves) {
+    auto cu = buildShippedUnit("c-subset", {
+        "union U { int i; long l; };\n"
+        "int main() { union U u; int y; y = u.i; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const un = composedAggregate(model, "U");
+    ASSERT_TRUE(un.valid());
+    EXPECT_EQ(ti.kind(un), TypeKind::Union);
+    EXPECT_EQ(ti.operands(un).size(), 2u);
+    SymbolRecord const* u = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "u") u = &model.symbols()[i];
+    ASSERT_NE(u, nullptr);
+    ASSERT_TRUE(u->type.valid());
+    EXPECT_EQ(u->type.v, un.v) << "`union U u;` resolves to the minted union type";
+}
+
+// c35: the union mirror — a by-value object of an undefined union tag is an
+// object of an incomplete type (the opaque tag forward-mints incomplete) →
+// S_IncompleteTypeObject (pre-c35: S_UnknownType).
+TEST(SemanticAnalyzerCSubset, C35UndefinedUnionTagByValueFailsLoudIncompleteObject) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() { union Nope u; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompleteTypeObject), 1u)
+        << "a by-value `union Nope u;` (undefined tag) is an incomplete object — "
+           "must fail loud S_IncompleteTypeObject";
+}
+
+// (3f-enum) ENUM define/reference parity. The enum DEFINITION mints the type
+// and (liftToEnclosingScope) publishes its enumerators; a bare `enum E` reference
+// resolves to the same type. RED-on-disable: enumerator visibility + the
+// reference-resolves leg both depend on the dual-mode routing.
+TEST(SemanticAnalyzerCSubset, C25EnumDefineMintsEnumeratorsVisibleRefResolves) {
+    auto cu = buildShippedUnit("c-subset", {
+        "enum E { A, B, C };\n"
+        "int main() { enum E e; int y; y = B; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "enum define + enumerator use (B) + bare `enum E` ref must be clean";
+    // The enumerator `B` resolved (lifted to enclosing scope) — no undeclared id.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "enumerator B must resolve (liftToEnclosingScope) — no undeclared id";
+    // The reference `enum E e;` resolved its tag — symbol `e` is typed.
+    SymbolRecord const* e = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "e") e = &model.symbols()[i];
+    ASSERT_NE(e, nullptr);
+    EXPECT_TRUE(e->type.valid())
+        << "`enum E e;` (reference) must resolve the enum tag to a type";
+}
+
+TEST(SemanticAnalyzerCSubset, C25UndefinedEnumTagFailsLoudUnknownType) {
+    auto model = analyzeShipped("c-subset", {
+        "int main() { enum Nope e; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 1u)
+        << "a bare `enum Nope` (undefined tag) must fail loud S_UnknownType";
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// c28 D-CSUBSET-LOCAL-TYPE-DEFINITION: a BLOCK-SCOPED struct/union/enum
+// DEFINITION with NO declarator (`struct S { int a; };` as a STATEMENT inside
+// a function — sqlite3.c:68508 walMergesort). The varDecl init-declarator-list
+// became OPTIONAL (mirroring topLevelDecl), so the unified c25 structSpec
+// defines the type in the ENCLOSING BLOCK scope; a later `struct S v;` resolves
+// it. These pins assert the NODE SHAPE (a `varDecl` holding a `structSpec` with
+// a `structBody` child and NO initDeclaratorList), the RESOLVED type of the
+// defining tag + the later reference, the union/enum twins, BLOCK-SCOPING
+// non-leak (the c27 lesson — a same-name outer tag stays distinct), and that a
+// NON-defining no-declarator (`int;`) is NOT silently accepted at the semantic
+// tier (it parses + types clean; the loud declares-nothing is HIR-tier, pinned
+// in the HIR suite). Each is red-on-disable.
+// ─────────────────────────────────────────────────────────────────────────
+
+// (c28a) NODE SHAPE + RESOLVED TYPE: a local `struct S { int a; int b; };`
+// parses to a `varDecl` whose head holds a defining `structSpec` (a `structBody`
+// child present) and which carries NO `initDeclaratorList`; the tag mints a
+// 2-field Struct; the later `struct S v;` resolves `v` to the SAME TypeId and
+// `v.a` types I32 (no S_NotAComposite / S_UnknownType). RED-ON-DISABLE: revert
+// the optional-list grammar tweak → the bare local `struct S { … };` is a parse
+// error (P0009), so this never reaches the semantic assertions.
+TEST(SemanticAnalyzerCSubset, C28LocalStructDefineNodeShapeAndType) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ struct S { int a; int b; }; struct S v; int y; "
+        "y = v.a; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "a block-scoped struct definition + later ref + member access must be clean";
+    auto const& ti = model.lattice().interner();
+    // NODE SHAPE: locate a `varDecl` that contains a `structSpec` with a
+    // `structBody` descendant and has NO `initDeclaratorList` descendant.
+    Tree const& tree = cu->trees()[0];
+    RuleId const varDeclRule  = tree.schema().rules().find("varDecl");
+    RuleId const structSpec   = tree.schema().rules().find("structSpec");
+    RuleId const structBody   = tree.schema().rules().find("structBody");
+    RuleId const initDeclList = tree.schema().rules().find("initDeclaratorList");
+    ASSERT_TRUE(varDeclRule.valid() && structSpec.valid()
+                && structBody.valid() && initDeclList.valid());
+    bool foundDefiningNoDeclaratorVarDecl = false;
+    walkPreOrder(tree, [&](TreeCursor const& cursor) {
+        NodeId const n = cursor.current();
+        if (tree.kind(n) != NodeKind::Internal || tree.rule(n).v != varDeclRule.v)
+            return;
+        bool hasStructSpec = false, hasStructBody = false, hasInitList = false;
+        walkPreOrder(tree, n, [&](TreeCursor const& inner) {
+            NodeId const m = inner.current();
+            if (tree.kind(m) != NodeKind::Internal) return;
+            if (tree.rule(m).v == structSpec.v)   hasStructSpec = true;
+            if (tree.rule(m).v == structBody.v)   hasStructBody = true;
+            if (tree.rule(m).v == initDeclList.v) hasInitList   = true;
+        });
+        if (hasStructSpec && hasStructBody && !hasInitList)
+            foundDefiningNoDeclaratorVarDecl = true;
+    });
+    EXPECT_TRUE(foundDefiningNoDeclaratorVarDecl)
+        << "the bare local `struct S { … };` must be a varDecl with a defining "
+           "structSpec (structBody present) and NO initDeclaratorList";
+    // RESOLVED TYPE: the tag minted a 2-field Struct.
+    TypeId const s = composedAggregate(model, "S");
+    ASSERT_TRUE(s.valid()) << "the block-scoped struct S must mint a composite";
+    ASSERT_EQ(ti.kind(s), TypeKind::Struct);
+    ASSERT_EQ(ti.operands(s).size(), 2u);
+    EXPECT_EQ(ti.kind(ti.operands(s)[0]), TypeKind::I32);
+    EXPECT_EQ(ti.kind(ti.operands(s)[1]), TypeKind::I32);
+    // The later `struct S v;` resolved `v` to the SAME TypeId.
+    SymbolRecord const* v = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "v") v = &model.symbols()[i];
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(v->type.valid());
+    EXPECT_EQ(v->type.v, s.v)
+        << "the in-block reference must resolve to the TypeId the local define minted";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_NotAComposite), 0u);
+}
+
+// (c28b) UNION + ENUM local definitions: the same no-declarator path covers all
+// three composite kinds (the unified c25 specifiers). RED-ON-DISABLE: the
+// optional-list tweak is shared, but the union/enum bodies exercise the
+// unionSpec/enumSpec define arms in block scope.
+TEST(SemanticAnalyzerCSubset, C28LocalUnionAndEnumDefine) {
+    auto cuU = buildShippedUnit("c-subset", {
+        "int main(void){ union U { int a; int b; }; union U v; int y; "
+        "y = v.a; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cuU);
+    auto mU = analyze(cuU);
+    EXPECT_FALSE(mU.hasErrors()) << "a block-scoped union definition + ref must be clean";
+    TypeId const u = composedAggregate(mU, "U");
+    ASSERT_TRUE(u.valid());
+    EXPECT_EQ(mU.lattice().interner().kind(u), TypeKind::Union);
+
+    auto cuE = buildShippedUnit("c-subset", {
+        "int main(void){ enum E { A, B, C }; enum E e; int y; "
+        "y = B; e = A; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cuE);
+    auto mE = analyze(cuE);
+    EXPECT_FALSE(mE.hasErrors()) << "a block-scoped enum definition + ref must be clean";
+    EXPECT_EQ(countCode(mE.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "the block-scoped enumerator B must resolve (liftToEnclosingScope)";
+    SymbolRecord const* e = nullptr;
+    for (std::size_t i = 1; i < mE.symbols().size(); ++i)
+        if (mE.symbols()[i].name == "e") e = &mE.symbols()[i];
+    ASSERT_NE(e, nullptr);
+    EXPECT_TRUE(e->type.valid());
+}
+
+// (c28c) ★ BLOCK-SCOPING NON-LEAK (the c27 lesson, c35-updated manifestation): a
+// local `struct S {int a;}` minted in an INNER block must NOT be visible to a
+// SIBLING/outer scope. Post-c35 the outer `struct S w;` (after the inner block
+// closed) forward-mints a FRESH INCOMPLETE `struct S` (NOT the inner COMPLETE
+// one) — so `w` is an object of an INCOMPLETE type → S_IncompleteTypeObject, and
+// `w.a` cannot resolve. The incompleteness IS the non-leak witness: if the inner
+// COMPLETE tag had leaked, `w` would be COMPLETE, `struct S w;` would be CLEAN,
+// and `w.a` would silently resolve a phantom field — the exact scope-leak
+// miscompile this pins. RED-ON-DISABLE: a leak makes `w` complete → no
+// S_IncompleteTypeObject and the test fails.
+TEST(SemanticAnalyzerCSubset, C28LocalStructDoesNotLeakToOuterScope) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ { struct S { int a; }; } struct S w; w.a = 1; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_TRUE(model.hasErrors())
+        << "the outer `struct S w;` must fail — S is block-local to the inner {}";
+    EXPECT_GT(countCode(model.diagnostics(),
+                        DiagnosticCode::S_IncompleteTypeObject), 0u)
+        << "the outer `struct S` is a FRESH incomplete tag (the inner COMPLETE "
+           "struct S must NOT leak to the enclosing scope)";
+}
+
+// (c28d) NOMINAL distinctness (c24 decl-site identity) across scopes: an OUTER
+// `struct S {int a;}` and an INNER same-name `struct S {long b; long c;}` with a
+// DIFFERENT layout are DISTINCT types — the inner shadows in its block, the outer
+// is unaffected. Asserts two distinct composites both compose (the inner does not
+// silently alias / redefine the outer). RED-ON-DISABLE: a leak/alias would make
+// one definition collide (S_RedeclaredSymbol) or share a TypeId.
+TEST(SemanticAnalyzerCSubset, C28InnerStructShadowsOuterDistinctType) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int a; };\n"
+        "int main(void){ struct S { long b; long c; }; struct S v; "
+        "(void)v; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "an inner same-name struct must shadow (not collide with) the outer";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "a block-scoped redefinition is a SHADOW, not a redeclaration collision";
+    auto const& ti = model.lattice().interner();
+    // Collect every composite named S; the outer (1 I32 field) and inner (2 I64
+    // fields) must BOTH exist as DISTINCT TypeIds.
+    TypeId outerS{}, innerS{};
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        SymbolRecord const& r = model.symbols()[i];
+        if (r.name != "S" || !r.type.valid()) continue;
+        if (ti.kind(r.type) != TypeKind::Struct) continue;
+        if (ti.operands(r.type).size() == 1) outerS = r.type;
+        if (ti.operands(r.type).size() == 2) innerS = r.type;
+    }
+    ASSERT_TRUE(outerS.valid()) << "the outer 1-field struct S must compose";
+    ASSERT_TRUE(innerS.valid()) << "the inner 2-field struct S must compose";
+    EXPECT_NE(outerS.v, innerS.v)
+        << "the inner and outer struct S are nominally DISTINCT (c24 decl-site identity)";
+}
+
+// (c28e) The NON-defining no-declarator local (`int;`) parses + types CLEAN at
+// the semantic tier (the per-declarator declares-nothing arm never fires — the
+// list is empty). The loud declares-nothing is HIR-tier (mirroring the top-level
+// `int ;`), pinned in the HIR suite. RED-ON-DISABLE: if the semantic tier started
+// rejecting it, this flips. (Pairs with HirLoweringCSubset.LocalDeclaresNothing*.)
+TEST(SemanticAnalyzerCSubset, C28LocalIntSemicolonSemanticallyClean) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void){ int; return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "`int;` is semantically clean — the declares-nothing is owned by HIR";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeclarationDeclaresNothing), 0u);
+}
+
+// (c28f) A local ABSTRACT declarator (`int *;` — list NON-empty but unnamed) is
+// rejected by the SEMANTIC tier's requireNamedDeclarators arm — EXACTLY ONE
+// S_DeclarationDeclaresNothing, NOT double-reported by the new HIR guard (which
+// fires only for an EMPTY list). RED-ON-DISABLE: if the HIR guard fired on a
+// non-empty list, the HIR suite's companion would see a second diagnostic.
+TEST(SemanticAnalyzerCSubset, C28LocalAbstractDeclaratorSingleDiagnostic) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void){ int *; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
+        << "`int *;` (abstract declarator) is rejected ONCE at the semantic tier";
+}
+
+// (c28g) REGRESSION: making the list optional must NOT break the ordinary local
+// declaration forms (declarator present). `int x;` / `int x, y;` / `static int x;`
+// / `struct S { … } v;` still mint their symbols and stay clean.
+TEST(SemanticAnalyzerCSubset, C28OrdinaryLocalDeclsUnaffected) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void){ int x; int p, q; static int s; "
+        "struct S { int a; } v; x = 1; p = 2; q = 3; s = 4; v.a = 5; "
+        "return x + p + q + s + v.a; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "ordinary local declarations must be unaffected by the optional list";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeclarationDeclaresNothing), 0u);
+    for (char const* want : {"x", "p", "q", "s", "v"}) {
+        bool found = false;
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            if (model.symbols()[i].name == want) found = true;
+        EXPECT_TRUE(found) << "local symbol `" << want << "` must be minted";
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// c30 D-CSUBSET-LOCAL-TYPEDEF: a BLOCK-SCOPED `typedef` as a STATEMENT inside a
+// function (sqlite3.c:187603 `typedef void(*LOGFUNC_t)(void*,int,const char*);`).
+// `typedefDecl` is now a `statement` alternative; the alias binds into the
+// enclosing BLOCK scope (Ordinary namespace) and resolves there — the whole
+// typedef-name machinery (Pass-1 bind, the resolver's scope walk, the parse-time
+// BinderSketch oracle) was ALREADY scope-keyed, so the only change was the one
+// grammar line. These pins assert: the NODE SHAPE (a `typedefDecl` nested under
+// the function-body `block`, not a top-level decl), the alias's RESOLVED type +
+// a later local var, the exact sqlite fn-ptr frontier shape, ★ BLOCK-SCOPE
+// NON-LEAK (the c30 silent surface — the block-local alias does NOT escape its
+// block, so an OUTER use of the name resolves to S_UnknownType, IDENTICAL to a
+// never-defined name), and SHADOWING of an outer same-name typedef. Each is
+// red-on-disable (revert the `statement` alt → the block `typedef` is a parse
+// error and these never reach their assertions).
+// ─────────────────────────────────────────────────────────────────────────
+
+// (c30a) NODE SHAPE + RESOLVED TYPE. A block-scoped `typedef int (*FN_t)(int);`
+// parses to a `typedefDecl` nested under the function-body `block`, binds FN_t to
+// a Ptr<Fn(int)->int>, and a later `FN_t f;` resolves `f` to that pointer type.
+TEST(SemanticAnalyzerCSubset, C30LocalTypedefNodeShapeAndType) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ typedef int (*FN_t)(int); FN_t f; (void)f; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "a block-scoped fn-ptr typedef + later local var must be clean";
+    // NODE SHAPE: a `typedefDecl` exists as a descendant of the function body `block`.
+    Tree const& tree = cu->trees()[0];
+    RuleId const typedefDecl = tree.schema().rules().find("typedefDecl");
+    RuleId const blockRule   = tree.schema().rules().find("block");
+    ASSERT_TRUE(typedefDecl.valid() && blockRule.valid());
+    bool foundBlockNestedTypedef = false;
+    walkPreOrder(tree, [&](TreeCursor const& cursor){
+        NodeId const n = cursor.current();
+        if (tree.kind(n) != NodeKind::Internal || tree.rule(n).v != blockRule.v)
+            return;
+        walkPreOrder(tree, n, [&](TreeCursor const& inner){
+            NodeId const m = inner.current();
+            if (tree.kind(m) == NodeKind::Internal && tree.rule(m).v == typedefDecl.v)
+                foundBlockNestedTypedef = true;
+        });
+    });
+    EXPECT_TRUE(foundBlockNestedTypedef)
+        << "the local `typedef` must parse to a typedefDecl nested in the function body block";
+    // RESOLVED TYPE: the var `f` is Ptr<Fn(int)->int>.
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* f = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "f") f = &model.symbols()[i];
+    ASSERT_NE(f, nullptr);
+    ASSERT_TRUE(f->type.valid());
+    ASSERT_EQ(ti.kind(f->type), TypeKind::Ptr)
+        << "a fn-ptr typedef'd variable is a pointer";
+    EXPECT_EQ(ti.kind(ti.operands(f->type)[0]), TypeKind::FnSig)
+        << "the pointee is the function type int(int)";
+}
+
+// (c30b) The exact sqlite3.c:187603 frontier shape: a block-scoped fn-ptr typedef
+// with a void return + (void*,int,const char*) params, then a local var of that
+// type. Must be clean (no S_UnknownType for the in-block typedef-name use).
+TEST(SemanticAnalyzerCSubset, C30LocalTypedefFrontierShape) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ typedef void (*LOGFUNC_t)(void*, int, const char*); "
+        "LOGFUNC_t xLog; (void)xLog; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "the sqlite LOGFUNC_t block-scoped fn-ptr typedef must resolve clean";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "the in-block use `LOGFUNC_t xLog;` must find the block-local alias";
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* x = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "xLog") x = &model.symbols()[i];
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->type.valid());
+    EXPECT_EQ(ti.kind(x->type), TypeKind::Ptr);
+}
+
+// (c30c) ★ BLOCK-SCOPE NON-LEAK (the c30 silent surface). A typedef declared in
+// an INNER block must NOT be a type-name OUTSIDE that block. The scope-keyed type
+// resolver binds the alias into the inner block's scope, so an outer use `MyT v;`
+// resolves to NOTHING → S_UnknownType, EXACTLY as if MyT were never defined. (The
+// follower-operator triage commits `MyT v;` as a declaration speculatively — so
+// it is NOT a tree-builder error; the rejection is the scope-keyed resolver at
+// the SEMANTIC tier, mirroring c28c's `struct S w;` → S_UnknownType.) The control
+// (in-block use) analyzes clean; the probe (outer use) does not. RED-ON-DISABLE:
+// if the alias leaked to the enclosing scope, the outer `MyT v;` would resolve `v`
+// to int and S_UnknownType would VANISH — a silent block-scope leak.
+TEST(SemanticAnalyzerCSubset, C30LocalTypedefDoesNotLeakToOuterScope) {
+    // CONTROL: the inner-block typedef + an IN-BLOCK use analyzes clean.
+    auto okModel = analyzeShipped("c-subset", {
+        "int main(void){ { typedef int MyT; MyT a; (void)a; } return 0; }\n",
+    });
+    EXPECT_FALSE(okModel.hasErrors())
+        << "the inner-block typedef + in-block use must analyze clean (control)";
+    // LEAK PROBE: an OUTER use of the block-local name must fail S_UnknownType.
+    auto leakModel = analyzeShipped("c-subset", {
+        "int main(void){ { typedef int MyT; } MyT v; (void)v; return 0; }\n",
+    });
+    EXPECT_TRUE(leakModel.hasErrors())
+        << "the outer `MyT v;` must fail — MyT is block-local to the inner {}";
+    EXPECT_GT(countCode(leakModel.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "a block-scoped typedef must NOT leak — the outer use resolves to "
+           "S_UnknownType, identical to a never-defined name";
+}
+
+// (c30d) SHADOWING: a block-scoped typedef shadows an outer same-name typedef. An
+// outer `typedef long MyT;` (I64) and an inner (block) `typedef int MyT;` (I32):
+// the in-block `MyT a;` resolves to the INNER type (I32), and is NOT an
+// S_RedeclaredSymbol collision. RED-ON-DISABLE: if the block typedef didn't take
+// effect (or leaked/merged into the outer scope), `a` would resolve to I64.
+TEST(SemanticAnalyzerCSubset, C30InnerTypedefShadowsOuterDistinctType) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef long MyT;\n"
+        "int main(void){ typedef int MyT; MyT a; (void)a; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "an inner same-name typedef must shadow (not collide with) the outer";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "a block-scoped typedef redefinition is a SHADOW, not a collision";
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "a") a = &model.symbols()[i];
+    ASSERT_NE(a, nullptr);
+    ASSERT_TRUE(a->type.valid());
+    EXPECT_EQ(ti.kind(a->type), TypeKind::I32)
+        << "the in-block `MyT a;` resolves to the INNER typedef (int), shadowing the outer (long)";
+}
+
+// ── c99 (D-CSUBSET-FAM-IN-UNION-MEMBER) ──────────────────────────────────────
+// C99 §6.7.2.1p18 forbids a flexible-array-member-bearing struct as a member of a
+// STRUCTURE or an ELEMENT OF AN ARRAY — it says nothing about a UNION, and
+// gcc/clang both accept a FAM-struct as a DIRECT union member (sqlite's
+// `union { SrcList sSrc; u8 srcSpace[N]; }` stack-slab idiom). So a direct
+// FAM-struct union member is PERMITTED (no S_FlexibleArrayInAggregate); a
+// FAM-struct as a struct member stays fail-loud AT the carve-out branch, and an
+// array-of-FAM-struct as a union member (the p18 "element of an array" case) stays
+// fail-loud UPSTREAM at array construction (applyArraySuffix → InvalidType), never
+// reaching the union carve-out. The two genuine red-on-disable change-guards for
+// the `ck==Union` gate are the accepted/struct-rejected pins; the array and
+// union-of-union pins lock the enforcement boundary on either side.
+
+// PERMITTED: a FAM-struct as a DIRECT union member — no S001D. (The sqlite blocker.)
+TEST(SemanticAnalyzerCSubset, FlexibleArrayStructAsUnionMemberIsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Slab { int n; int a[]; };\n"
+        "union U { struct Slab s; char space[16]; };\n"
+        "int main(void){ union U u; return (int)sizeof(u); }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArrayInAggregate), 0u)
+        << "a FAM-bearing struct is a legal DIRECT union member (gcc/clang accept it)";
+    // The union must still size (layout not rejected): sizeof(U)==16 (max of the
+    // 4-byte Slab prefix and the 16-byte space[]) — pinned end-to-end in the
+    // fam_struct_in_union_member example + TypeLayout.UnionWith… unit test.
+    EXPECT_FALSE(model.hasErrors())
+        << "the whole TU is well-typed once the union FAM member is permitted";
+}
+
+// STILL FORBIDDEN: a FAM-struct as a STRUCT member → S001D (C99 p18, unchanged
+// DSS posture). This is a GENUINE red-on-disable change-guard: the rejection is
+// emitted at the carve-out branch itself (ck==Struct ⇒ `permittedAsUnionMember`
+// false ⇒ famDiag). Widen the `ck==Union` gate to permit a FAM-struct in ANY
+// composite and this struct-member case would wrongly pass.
+TEST(SemanticAnalyzerCSubset, FlexibleArrayStructAsStructMemberStillRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Slab { int n; int a[]; };\n"
+        "struct Bad { struct Slab s; int x; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArrayInAggregate), 1u)
+        << "a FAM-bearing struct as a STRUCT member is C99 p18 ill-formed — must fail loud";
+}
+
+// STILL FORBIDDEN: an ARRAY of a FAM-struct as a UNION member → S001D. p18's
+// "element of an array" bans this even inside a union. The enforcement is UPSTREAM
+// of the c99 carve-out: an array whose element embeds a FAM is rejected at array
+// construction (semantic_analyzer.cpp applyArraySuffix, ~1630/1972 → InvalidType),
+// so this field's type is already invalid before the union carve-out runs — it
+// never reaches that branch. This is therefore a POSTURE regression-guard
+// (array-of-FAM stays rejected regardless of the union relaxation), NOT a
+// red-on-disable guard for the `ck==Union` gate — widening/removing that gate does
+// not affect this case (verified by the c99 audit). Kept as defense-in-depth.
+TEST(SemanticAnalyzerCSubset, ArrayOfFlexibleArrayStructInUnionStillRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Slab { int n; int a[]; };\n"
+        "union Bad { struct Slab arr[3]; char space[64]; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArrayInAggregate), 1u)
+        << "an ARRAY of a FAM-struct is a p18 'element of an array' violation even in a union";
+}
+
+// PERMITTED (gcc-parity, locks the completeness boundary): a UNION whose member is
+// itself a union that (transitively) contains a FAM-struct is ALSO accepted. p18
+// restricts only struct-membership and array-elementhood; a union member of a union
+// is p18-legal, and `typeContainsFlexibleArray` does not recurse into unions, so the
+// inner FAM never reaches the carve-out. gcc/clang accept it (c99 audit verified,
+// S001D=0). This is a POSTURE/parity guard (not a red-on-disable for the `ck==Union`
+// gate): it pins that the simplified gate does NOT over-reject the nested-union form
+// — the exact case the `kind(ft)==Struct` tautology, had it been kept, would have
+// wrongly rejected under a future recursion change.
+TEST(SemanticAnalyzerCSubset, UnionContainingFamStructAsUnionMemberIsAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Slab { int n; int a[]; };\n"
+        "union Inner { struct Slab s; int x; };\n"
+        "union Outer { union Inner v; char space[8]; };\n"
+        "int main(void){ union Outer o; return (int)sizeof(o); }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_FlexibleArrayInAggregate), 0u)
+        << "a union member that is a union containing a FAM-struct is p18-legal (gcc/clang accept)";
+    EXPECT_FALSE(model.hasErrors())
+        << "the nested-union form is well-typed — the carve-out must not over-reject it";
 }

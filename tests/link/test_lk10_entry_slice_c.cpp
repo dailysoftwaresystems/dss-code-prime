@@ -57,8 +57,11 @@ namespace {
 //   C3                 ret
 //
 // The trampoline does NOT emit a trailing `ret`: its control flow
-// is `call user_entry → mov ecx, eax → call_indirect_via_extern
-// ExitProcess → unreachable`. The user fn's `ret` IS reached
+// is `call user_entry → mov ecx, eax → call ExitProcess →
+// unreachable`. Under direct-plt (D-FFI-PE-IMPORT-THUNK) the
+// ExitProcess call is a plain `call rel32` (E8) to the synthesized
+// import thunk — was `call_indirect_via_extern` (FF 15) under the
+// retired indirect-slot model. The user fn's `ret` IS reached
 // (returning into the trampoline body), but no `ret` is reachable
 // inside the trampoline itself.
 [[nodiscard]] AssembledModule makeReturn42Module() {
@@ -289,8 +292,10 @@ TEST(LK10EntrySliceC, SyntheticExitProcessExternThreadsThroughIat) {
     EXPECT_EQ(mod.externImports[0].libraryPath, "kernel32.dll");
     EXPECT_EQ(mod.externImports[0].mangledName, "ExitProcess");
     // The trampoline at functions[0] has a Relocation targeting the
-    // synthetic ExternImport's SymbolId — that reloc patches the
-    // disp32 in `FF 15 disp32` to the IAT slot's RVA at link time.
+    // synthetic ExternImport's SymbolId — that reloc patches the call
+    // disp32 (E8 disp32 under direct-plt; was FF 15 disp32 under the
+    // retired indirect-slot model) to the ExitProcess import thunk's
+    // RVA at link time.
     ASSERT_GE(mod.functions.size(), 2u);
     auto const& tramp = mod.functions[0];
     bool found = false;
@@ -536,11 +541,16 @@ TEST(LK10EntrySliceC, MsX64TrampolinePrologueIsSubRsp0x28) {
 TEST(LK10EntrySliceC, SysvElfTrampolineEmitsNoPrologue) {
     // Negative pin: sysv_amd64 has entryStackPointerBias=0 +
     // shadowSpaceBytes=0 → alignedSizeWithBias = 0 → NO `sub rsp,
-    // ...` op emitted. The trampoline's first instruction must be
-    // the `call user_entry` (`E8 disp32`), NOT the REX.W SUB
-    // prefix (`0x48`). A regression that always emitted the
-    // prologue (e.g. dropping the `if (adjustBytes > 0)` guard)
-    // would drift every downstream RVA by 7 bytes silently.
+    // ...` op emitted. Since c88 (D-RUNTIME-MAIN-ARGC-ARGV) the
+    // SHIPPED format's trampoline leads with the argc/argv
+    // materialization pair (see ShippedElfX64TrampolineMaterializes
+    // ArgcArgv for the byte pin); this test keeps the PROLOGUE
+    // negative-pin: no `sub rsp, imm32` (48 81 EC) may appear
+    // anywhere. A regression that always emitted the prologue
+    // (e.g. dropping the `if (adjustBytes > 0)` guard) would drift
+    // every downstream RVA by 7 bytes silently — and, worse post-
+    // c88, would break the process-entry-SP-relative argc/argv
+    // offsets if it slipped BEFORE the arg loads.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
@@ -553,16 +563,112 @@ TEST(LK10EntrySliceC, SysvElfTrampolineEmitsNoPrologue) {
     ASSERT_FALSE(mod.functions.empty());
     auto const& trampBytes = mod.functions[0].bytes;
     ASSERT_FALSE(trampBytes.empty());
-    // First byte cannot be the REX.W prefix that begins `sub rsp, ...`
-    // For SysV the trampoline starts with `E8` (CALL rel32) directly.
-    EXPECT_NE(trampBytes[0], 0x48u)
-        << "SysV trampoline must NOT emit a prologue (cc.shadow=0, "
-           "cc.entryBias=0 → adjustBytes=0). A `0x48` first byte "
-           "indicates entryStackPointerBias was set non-zero on "
-           "sysv_amd64 OR the `if (adjustBytes > 0)` guard was lost.";
-    EXPECT_EQ(trampBytes[0], 0xE8u)
-        << "SysV trampoline's first instruction is `call user_entry` "
-           "directly (no prologue).";
+    // `sub rsp, imm32` = 48 81 EC — must appear NOWHERE in the SysV
+    // trampoline (adjustBytes=0).
+    for (std::size_t i = 0; i + 2 < trampBytes.size(); ++i) {
+        bool const subRsp = trampBytes[i] == 0x48u
+                         && trampBytes[i + 1] == 0x81u
+                         && trampBytes[i + 2] == 0xECu;
+        EXPECT_FALSE(subRsp)
+            << "SysV trampoline must NOT emit a prologue (cc.shadow=0, "
+               "cc.entryBias=0 → adjustBytes=0) — found `sub rsp, "
+               "imm32` at byte offset " << i << ". Either "
+               "entryStackPointerBias was set non-zero on sysv_amd64 "
+               "OR the `if (adjustBytes > 0)` guard was lost.";
+    }
+}
+
+// ── D-RUNTIME-MAIN-ARGC-ARGV (c88): shipped-ELF argc/argv byte pins ──
+//
+// The SHIPPED elf64-*-linux-exec formats declare `processArgs` =
+// stack-vector {argc@[sp+0], argv@sp+8}, so the trampoline's FIRST two
+// instructions materialize main's arguments from the process-entry
+// stack (SysV AMD64 psABI §3.4.1 / AAPCS64 Linux) into the entry cc's
+// argGprs[0..1] — BEFORE any SP adjustment and before `call/BL main`.
+// Without them, `int main(int argc, char** argv)` reads process-entry
+// register garbage (the c87-witnessed argc=846361312 that crashed the
+// sqlite3 shell inside main while gcc's build answered 42).
+//
+// RED-on-disable: delete the `processArgs` block from either shipped
+// format JSON (runtime-read config) and its pin fails on the first
+// byte — the trampoline reverts to calling main with garbage argc.
+// The synthetic-format pins (Arm64TrampolineEmitsExactExitSequence's
+// EXACT 20-byte sequence) prove the converse: NO processArgs block ⇒
+// byte-identical pre-c88 trampoline, zero arg-setup instructions.
+TEST(LK10EntrySliceC, ShippedElfX64TrampolineMaterializesArgcArgv) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(format.has_value());
+    auto mod = makeReturn42Module();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(linker::injectEntryTrampoline(
+        mod, **target, **format, rep));
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(mod.functions.empty());
+    auto const& t = mod.functions[0].bytes;
+    ASSERT_GE(t.size(), 17u)
+        << "trampoline must lead with mov(8) + lea(8) + call(5)";
+    // mov rdi, [rsp+0]  — REX.W 8B /r, ModR/M mod=10 reg=rdi(111)
+    // rm=100(SIB), SIB=0x24 (base=rsp, no index), disp32=0.
+    std::vector<std::uint8_t> const movArgc = {
+        0x48, 0x8B, 0xBC, 0x24, 0x00, 0x00, 0x00, 0x00};
+    // lea rsi, [rsp+8]  — REX.W 8D /r, ModR/M mod=10 reg=rsi(110)
+    // rm=100(SIB), SIB=0x24, disp32=8.
+    std::vector<std::uint8_t> const leaArgv = {
+        0x48, 0x8D, 0xB4, 0x24, 0x08, 0x00, 0x00, 0x00};
+    EXPECT_EQ(std::vector<std::uint8_t>(t.begin(), t.begin() + 8),
+              movArgc)
+        << "byte 0..7 must be `mov rdi, [rsp+0]` (argc → argGprs[0]). "
+           "Drift here = the stack-vector argc load is wrong/missing "
+           "— main(argc,argv) reads garbage argc again "
+           "(D-RUNTIME-MAIN-ARGC-ARGV).";
+    EXPECT_EQ(std::vector<std::uint8_t>(t.begin() + 8, t.begin() + 16),
+              leaArgv)
+        << "byte 8..15 must be `lea rsi, [rsp+8]` (the in-place argv "
+           "vector's ADDRESS → argGprs[1]). A load (8B) here instead "
+           "of lea (8D) would DEREFERENCE the vector — argv would be "
+           "argv[0].";
+    EXPECT_EQ(t[16], 0xE8u)
+        << "the `call user_entry` must follow the two arg-setup "
+           "instructions directly (SysV: no prologue between).";
+}
+
+TEST(LK10EntrySliceC, ShippedElfArm64TrampolineMaterializesArgcArgv) {
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto format = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
+    ASSERT_TRUE(format.has_value());
+    auto mod = makeReturn42ModuleArm64();
+    DiagnosticReporter rep;
+    ASSERT_TRUE(linker::injectEntryTrampoline(
+        mod, **target, **format, rep));
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(mod.functions.empty());
+    auto const& t = mod.functions[0].bytes;
+    ASSERT_EQ(t.size() % 4u, 0u);
+    ASSERT_GE(t.size(), 12u)
+        << "trampoline must lead with LDUR + ADD + BL";
+    auto const word = [&](std::size_t i) {
+        return static_cast<std::uint32_t>(t[i])
+             | (static_cast<std::uint32_t>(t[i + 1]) << 8)
+             | (static_cast<std::uint32_t>(t[i + 2]) << 16)
+             | (static_cast<std::uint32_t>(t[i + 3]) << 24);
+    };
+    // LDUR X0, [SP, #0] = 0xF8400000 | Rn(sp=31)<<5 | Rt(x0=0).
+    EXPECT_EQ(word(0), 0xF84003E0u)
+        << "word 0 must be `LDUR X0, [SP, #0]` (argc → argGprs[0]) "
+           "(D-RUNTIME-MAIN-ARGC-ARGV).";
+    // ADD X1, SP, #8 = 0x91000000 | imm12(8)<<10 | Rn(sp=31)<<5 |
+    // Rd(x1=1) — the target's frame-relative `lea` single-word form.
+    EXPECT_EQ(word(4), 0x910023E1u)
+        << "word 1 must be `ADD X1, SP, #8` (the in-place argv "
+           "vector's ADDRESS → argGprs[1]). An LDUR here would "
+           "dereference the vector.";
+    // BL user_entry (imm26 patched by call26 reloc).
+    EXPECT_EQ(word(8) & 0xFC000000u, 0x94000000u)
+        << "the `BL user_entry` must follow the two arg-setup words "
+           "directly (AAPCS64: no prologue between).";
 }
 
 // ── D-LK10-ENTRY-ARM64 trampoline byte pin (v0.0.2 V2-1) ───────────

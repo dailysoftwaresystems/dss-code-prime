@@ -130,6 +130,33 @@ namespace detail::type_rules {
 // charConvertsToArith / enumConvertsToArith / intCrossSignednessConverts gates;
 // completes the C integer-conversion matrix alongside intCrossSignednessConverts.
 // Closes D-CSUBSET-INT-SAME-SIGN-NARROW.
+// `intConvertsToFloat` (default false): admit an integer rhs into a float lhs
+// (`double d = 5;`, `f(anInt)` to a `double` param — the sqlite
+// `kahanBabuskaNeumaierStep(pSum, iBig)` shape feeding an `i64` to a `volatile
+// double`). `floatConvertsToInt` (default false): admit a float rhs into an
+// integer lhs (`int n = aDouble;`). C 6.3.1.4 / 6.3.1.5 / 6.5.16.1: int↔float is
+// an implicit assignment conversion (value per the usual arithmetic conversions;
+// float→int truncates toward zero, UB if out of range). BOTH directions materialize
+// through the HIR `coerce()` arithmetic-core arm (MIR SIToFP/UIToFP for int→float,
+// FPToSI/FPToUI for float→int), so the post-coerce verifier (both gates default
+// false) stays strict. The rank helpers naturally EXCLUDE pointers/structs (rank 0
+// in all three), so `double d = ptr;` / `int n = aStruct;` stay rejected. Mirrors
+// the charConvertsToArith / intCrossSignednessConverts gates; completes the C
+// arithmetic-conversion matrix. Closes D-CSUBSET-INT-FLOAT-CONVERSION.
+// `charArrayFromStringLiteralInit` (default false): admit `char[N] <- char[M]`
+// (N >= M, char element on BOTH sides) — C 6.7.9p14: a string literal initializing
+// a character array zero-fills the trailing N−M bytes (`char x[7] = "hi";`, the
+// sqlite `aXformType[]` `char zName[7]` field initialized by `"hour"`). The caller
+// passes `true` ONLY when the initializer IS a string literal (so an array rvalue
+// reaching an array slot through any OTHER route — which C anyway forbids for a
+// plain array-to-array init — stays a loud mismatch). EXACT-FIT (N==M) already
+// returned via `sameType` above; OVER-LONG (N < M, `char[3]="hello"`) is NOT
+// admitted by the arm (the `N >= M` guard) and stays a loud constraint error. The
+// HIR `coerce()` string-literal arm REALIZES the admission by retyping the literal
+// node to `char[N]` (so MIR materializes the rodata global padded to N), keeping
+// the admit ⟺ realize parity; the post-coerce verifier sees a `char[N]`-typed
+// child == the `char[N]` field/slot, so it stays strict. Closes
+// D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL.
 [[nodiscard]] inline bool isAssignable(
     TypeInterner const&                                interner,
     TypeId                                             lhs,
@@ -139,8 +166,24 @@ namespace detail::type_rules {
     bool                                               charConvertsToArith = false,
     bool                                               enumConvertsToArith = false,
     bool                                               intCrossSignednessConverts = false,
-    bool                                               intSameSignednessNarrows = false) noexcept {
+    bool                                               intSameSignednessNarrows = false,
+    bool                                               intConvertsToFloat = false,
+    bool                                               floatConvertsToInt = false,
+    bool                                               charArrayFromStringLiteralInit = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
+    // c27 (D-CSUBSET-VOLATILE-POINTEE): volatile is IGNORED for assignment
+    // compatibility — C 6.5.16.1 compares the UNQUALIFIED versions of compatible
+    // types (`volatile int` ↔ `int`, `int * volatile` ↔ `int *`, `volatile struct
+    // S` ↔ `struct S` all assign freely). Strip the TOP-LEVEL VolatileQual from
+    // BOTH sides so the identity (`sameType`) and every kind/pointer-element rule
+    // below sees the material type. (A volatile-POINTEE difference — `volatile int
+    // *` vs `int *` — is a pointer-element mismatch C also permits with a
+    // diagnostic-less qualifier conversion; here the element compare reads the
+    // transparent `operands`, where `Ptr<VolatileQual(int)>` and `Ptr<int>` differ
+    // only by the inner skin, so a future strict-qualifier-mismatch rule would add
+    // its own arm — today both decay to the same pointer pipeline.)
+    lhs = interner.stripVolatile(lhs);
+    rhs = interner.stripVolatile(rhs);
     if (sameType(lhs, rhs)) return true;
     auto const lk = interner.kind(lhs);
     auto const rk = interner.kind(rhs);
@@ -156,6 +199,35 @@ namespace detail::type_rules {
     if (floatRank(lk) != 0 && floatRank(rk) != 0) {
         return floatRank(rk) <= floatRank(lk);
     }
+    // C 6.3.1.4 / 6.5.16.1 (D-CSUBSET-INT-FLOAT-CONVERSION, int→float): an integer
+    // value is implicitly assignable to a floating lhs — `double d = 5;`,
+    // `f(anInt)` to a `double` param (the sqlite `kahanBabuskaNeumaierStep(pSum,
+    // iBig)` shape: `i64` → `volatile double`). The same-type/same-rank arms above
+    // returned for a float↔float pair, so this arm is reached only for an int
+    // rhs / float lhs MIX. The rhs side admits BOTH the signed AND the unsigned int
+    // ranks (Char/Bool/Enum are handled by their own arms above; an Enum here has
+    // already been bridged to its underlying int by those, and a Char rhs flowing
+    // into a float is still rank-0 here — not yet admitted, an intentional narrow
+    // scope). Gated on `intConvertsToFloat`; the HIR `coerce()` arithmetic-core arm
+    // materializes the MIR SIToFP/UIToFP, so the post-coerce verifier (gate default
+    // false) stays strict. Pointers/structs (rank 0 in every helper) stay rejected.
+    if (intConvertsToFloat
+        && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0)
+        && floatRank(lk) != 0) {
+        return true;
+    }
+    // C 6.3.1.4 / 6.5.16.1 (D-CSUBSET-INT-FLOAT-CONVERSION, float→int): a floating
+    // value is implicitly assignable to an integer lhs — `int n = aDouble;` (the
+    // value truncates toward zero, UB if out of range; C admits the implicit
+    // conversion). The lhs side admits BOTH the signed AND the unsigned int ranks.
+    // Gated on `floatConvertsToInt`; the HIR `coerce()` arithmetic-core arm
+    // materializes the MIR FPToSI/FPToUI, so the post-coerce verifier (gate default
+    // false) stays strict. Pointers/structs (rank 0 in every helper) stay rejected.
+    if (floatConvertsToInt
+        && floatRank(rk) != 0
+        && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0)) {
+        return true;
+    }
     // A Bool value WIDENS into any arithmetic slot (C99 6.3.1.2 — `_Bool`
     // promotes to `int`; a comparison/logical result `Bool` flowing into an
     // int/float lhs, e.g. `int f(){ return a < b; }`, `int x = a && b;`).
@@ -165,10 +237,17 @@ namespace detail::type_rules {
     // Bool→int Cast). Gated on `boolWidensToArith` so ONLY the pre-coerce
     // semantic checks admit it — the post-coerce verifier stays strict. This
     // is the ASSIGNMENT direction only — `Bool` stays out of `isArithmetic`
-    // (above), so binary PROMOTION (`bool + bool`) is unaffected.
+    // (above), so binary PROMOTION (`bool + bool`) is unaffected. c48
+    // (D-CSUBSET-BOOL-CHAR-WIDENING): when `charConvertsToArith` also treats
+    // `char` (interned as `TypeKind::Char`, outside the int RANKS) as an
+    // arithmetic slot, a Bool widens into a `char` lhs too — `char c = (a==b);`,
+    // the sqlite `p->nFloor = (p->D==31)` shape. Arithmetic `char = a-b` already
+    // worked via the `charConvertsToArith` arm below (int→char); only the
+    // Bool-RESULT (comparison/logical) flowing into a plain `char` was missed.
     if (boolWidensToArith && rk == TypeKind::Bool
         && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0
-            || floatRank(lk) != 0)) {
+            || floatRank(lk) != 0
+            || (charConvertsToArith && lk == TypeKind::Char))) {
         return true;
     }
     // C 6.3.1.1 / 6.5.16.1: `char` is an integer type — implicitly convertible to AND
@@ -225,6 +304,31 @@ namespace detail::type_rules {
             || (unsignedIntRank(lk) != 0 && signedIntRank(rk) != 0))) {
         return true;
     }
+    // C 6.7.9p14 (D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): a string literal
+    // initializing a CHARACTER ARRAY zero-fills the trailing bytes — `char[N]` is
+    // assignable FROM the string literal's `char[M]` when N >= M (M = the literal's
+    // own array length, chars + NUL). Gated on `charArrayFromStringLiteralInit`
+    // (the caller sets it only when the init IS a string literal), so an ordinary
+    // array-to-array assignment never reaches here as `true`. Both element types
+    // must be `char` (the C string-literal element); a wide / non-char array stays
+    // out of scope. The same-type (N==M) exact fit already returned above; the
+    // `N >= M` guard keeps an OVER-LONG init (`char[3]="hello"`) a loud mismatch.
+    // The HIR `coerce()` realizes it by retyping the literal to `char[N]` so the
+    // MIR producer pads the rodata global to N (no OOB copy).
+    if (charArrayFromStringLiteralInit
+        && lk == TypeKind::Array && rk == TypeKind::Array) {
+        auto const lhsElem = interner.operands(lhs);
+        auto const rhsElem = interner.operands(rhs);
+        auto const lhsLen  = interner.scalars(lhs);
+        auto const rhsLen  = interner.scalars(rhs);
+        if (!lhsElem.empty() && !rhsElem.empty()
+            && !lhsLen.empty() && !rhsLen.empty()
+            && interner.kind(lhsElem[0]) == TypeKind::Char
+            && interner.kind(rhsElem[0]) == TypeKind::Char
+            && lhsLen[0] >= rhsLen[0]) {
+            return true;
+        }
+    }
     // C-standard array-to-pointer decay (D-LK4-RODATA-PRODUCER-STRING
     // closure, 2026-06-02): `Array<T,N>` is implicitly assignable to
     // `Ptr<T>` via the address-of-first-element conversion. Pinned to
@@ -243,9 +347,20 @@ namespace detail::type_rules {
     if (lk == TypeKind::Ptr && rk == TypeKind::Array) {
         auto const lhsElem = interner.operands(lhs);
         auto const rhsElem = interner.operands(rhs);
-        if (!lhsElem.empty() && !rhsElem.empty()
-            && lhsElem[0] == rhsElem[0]) {
-            return true;
+        if (!lhsElem.empty() && !rhsElem.empty()) {
+            if (lhsElem[0] == rhsElem[0]) {
+                return true;
+            }
+            // c50 (D-CSUBSET-ARRAY-DECAY-TO-VOID-PTR): array → void*. An array
+            // decays to a pointer-to-element (C 6.3.2.1p3), which then converts
+            // to void* (C 6.3.2.3p1) — composing the two existing conversions for
+            // a `void*` target, gated on the SAME `implicitToVoidPtr` flag the
+            // Ptr→void arm below uses. The sqlite shape `memcpy(buf,"-Inf",5)` —
+            // `buf` is `char[N]`, `"-Inf"` a string-literal `char[5]`, both → void*.
+            if (ptrRules.implicitToVoidPtr
+                && interner.kind(lhsElem[0]) == TypeKind::Void) {
+                return true;
+            }
         }
     }
     // C-standard function-to-pointer decay (C 6.3.2.1p4): a function
@@ -295,6 +410,20 @@ namespace detail::type_rules {
         auto const lhsElem = interner.operands(lhs);
         auto const rhsElem = interner.operands(rhs);
         if (!lhsElem.empty() && !rhsElem.empty()) {
+            // c27 (D-CSUBSET-VOLATILE-POINTEE): a POINTEE volatile-qualifier
+            // difference is assignment-compatible — C 6.5.16.1 lets the lhs
+            // pointee ADD qualifiers (`int *` → `volatile int *`, the sqlite WAL
+            // shape `s.p = &x`). Compare the pointees MODULO their top-level
+            // VolatileQual skin; identical material pointees ⇒ compatible. (C also
+            // diagnoses DROPPING volatile `volatile int *` → `int *`; we admit
+            // both directions for the shipped C surface — the qualifier never
+            // changes layout/codegen, only the access flag, which is keyed off the
+            // ACCESSED type, so a dropped-qualifier pointer simply yields a plain
+            // access through the lhs's stripped pointee — never a miscompile.)
+            if (interner.stripVolatile(lhsElem[0])
+                == interner.stripVolatile(rhsElem[0])) {
+                return true;
+            }
             bool const lhsIsVoidPtr =
                 interner.kind(lhsElem[0]) == TypeKind::Void;
             bool const rhsIsVoidPtr =
@@ -329,6 +458,9 @@ namespace detail::type_rules {
 //   * Ptr ↔ Ptr — any object-pointer pair (mapCast: Bitcast).
 //   * Ptr ↔ integer — C's implementation-defined round-trip (mapCast:
 //     PtrToInt / IntToPtr). Float↔Ptr stays ILLEGAL (C constraint).
+//   * Ptr ← FnSig — a function DESIGNATOR decays to its address (c37,
+//     D-CSUBSET-FUNCTION-DESIGNATOR-CAST; mapCast: FnSig→Ptr Bitcast). A
+//     function→integer cast stays REJECTED (target not Ptr).
 //   * InvalidType on either side → allowed (cascade suppression, same
 //     posture as isAssignable).
 //
@@ -370,6 +502,19 @@ namespace detail::type_rules {
     };
     if (isCastableScalar(tk) && isCastableScalar(ok)) return true;
     if (tk == TypeKind::Ptr && ok == TypeKind::Ptr)   return true;
+    // c37 (D-CSUBSET-FUNCTION-DESIGNATOR-CAST) C 6.3.2.1p4 + 6.3.2.3p8: a
+    // function DESIGNATOR (FnSig) decays to the function's ADDRESS, so a cast
+    // to ANY pointer target is value-preserving (mapCast lowers FnSig→Ptr as a
+    // Bitcast over the GlobalAddr — already present from c12; NO HIR/MIR change).
+    // Cross-signature fn-ptr casts ARE legal (C 6.3.2.3p8 — calling THROUGH an
+    // incompatible type is UB, the CAST is not), so this is NOT gated on a
+    // signature match — the sqlite `(sqlite3_destructor_type)fn` /
+    // `(sqlite3_syscall_ptr)fn` shapes are exactly that conversion. SIBLING:
+    // `isAssignable`'s Ptr/FnSig arm admits the same decay for init/assign/arg;
+    // this closes the explicit-CAST path. A non-Ptr TARGET (`(long)g`) and a
+    // non-FnSig OPERAND (`(fp)struct`) stay rejected (the tk==Ptr / ok==FnSig
+    // guards do not fire for them) — verified by red-on-disable pins.
+    if (tk == TypeKind::Ptr && ok == TypeKind::FnSig) return true;
     if (tk == TypeKind::Ptr && isCastableInt(ok))     return true;
     if (isCastableInt(tk) && ok == TypeKind::Ptr)     return true;
     return false;

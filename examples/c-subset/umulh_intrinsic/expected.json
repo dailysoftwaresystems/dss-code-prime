@@ -1,0 +1,35 @@
+{
+  "$comment": "c103 (D-CSUBSET-INTRINSIC-UMULH): runtime witness for the __umulh compiler intrinsic -- high 64 bits of the u64*u64 128-bit product. Lowers to a DEDICATED MIR UMulH op -> x86-64 `mul r/m64` (capture RDX, the 'high' role) / arm64 native `umulh`, NOT an import. Operands (a=0x123456789ABCDEF0, b=2^32) give high64=0x12345678 (nonzero AND != the low word 0x9ABCDEF000000000) -- a RAX/RDX role swap returns low & 0xFF = 0 != 120 and a missing lowering fails to compile (the design-audit's role-swap guard). The `release` arm (shippedPipeline, zero-drift) proves the intrinsic survives the full optimizer: Inlining folds umulh_high into main, and UMulH -- pure + commutative but NOT ConstFold-folded -- stays live. exit = high64 & 0xFF = 0x78 = 120.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 120,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

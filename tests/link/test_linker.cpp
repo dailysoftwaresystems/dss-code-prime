@@ -435,6 +435,124 @@ TEST(Linker, CrossCuExternWithoutDefinitionStaysFfiImport) {
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_CrossCuMergeUnsupported), 0u);
 }
 
+// c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): a NO-LIBRARY extern (empty
+// libraryPath — the bare-prototype cross-TU reference) that a SIBLING CU
+// defines resolves exactly like a library-bound one: the reference binds to
+// the definition, the import is stripped, and NO undefined-symbol reject
+// fires. Pins that `rejectUnboundExterns` runs on the POST-merge module (a
+// pre-resolution empty-library reject would falsely fail this legal C shape).
+TEST(Linker, CrossCuNoLibraryExternResolvesToSiblingDefinition) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    std::vector<AssembledModule> mods;
+    {
+        AssembledModule m;  // CU #1 references "foo" via a NO-LIBRARY extern
+        m.cuId = CompilationUnitId{1};
+        ExternImport ext;
+        ext.symbol      = SymbolId{5};
+        ext.mangledName = "foo";
+        ext.libraryPath = "";   // bare-proto cross-TU reference: no library ON PURPOSE
+        m.externImports.push_back(std::move(ext));
+        mods.push_back(std::move(m));
+    }
+    mods.push_back(lkCu(2, {lkSym(2, "foo", SymbolBinding::Global)}));  // CU #2 DEFINES "foo"
+    DiagnosticReporter rep;
+    auto image = lkLink(mods, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(image.resolvedCrossCuRefs.size(), 1u);
+    EXPECT_EQ(image.resolvedCrossCuRefs[0].reference.cuId.v, 1u);
+    EXPECT_EQ(image.resolvedCrossCuRefs[0].definition.cuId.v, 2u);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 0u)
+        << "a sibling-defined no-library extern is NOT an undefined symbol";
+    EXPECT_EQ(std::count(image.externImportNames.begin(), image.externImportNames.end(),
+                         std::string{"foo"}), 0)
+        << "the resolved reference must be stripped from the emitted imports";
+}
+
+// c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): a NO-LIBRARY extern that NO
+// linked CU defines is an UNDEFINED SYMBOL — the linker rejects LOUD, NAMING
+// the symbol (ld's behavior; C 6.2.2p5), before any walker emission. Pre-c86
+// the empty libraryPath produced an internal "empty libraryPath" wording that
+// never named the symbol; this pins the user-facing surface. RED-ON-DISABLE:
+// drop the `rejectUnboundExterns` call in link() → the module flows to the
+// format walker with a library-less import (a null IAT slot / zero-DT_NEEDED
+// image — the silent-failure class this reject closes).
+TEST(Linker, NoLibraryExternWithoutDefinitionIsUndefinedSymbol) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    // Single module (N==1): nothing to resolve against — definitely undefined.
+    AssembledModule m;
+    m.cuId = CompilationUnitId{1};
+    m.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    Relocation rel;
+    rel.offset = 4;
+    rel.target = SymbolId{5};       // the extern's symbol — declared, so the
+    rel.kind   = RelocationKind{1}; // reloc RESOLVES; undefinedness is the
+    fn.relocations.push_back(rel);  // no-library reject's job, not the reloc's
+    m.functions.push_back(std::move(fn));
+    m.symbols.push_back(ModuleSymbol{SymbolId{1}, "f1",
+                                     SymbolBinding::Global, SymbolVisibility::Default});
+    ExternImport ext;
+    ext.symbol      = SymbolId{5};
+    ext.mangledName = "neverDefined";
+    ext.libraryPath = "";           // no library, no sibling definition
+    m.externImports.push_back(std::move(ext));
+    DiagnosticReporter rep;
+    auto image = linker::link(m, *loaded.target, *loaded.format, rep);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 1u)
+        << "an unresolved no-library extern must be rejected exactly once";
+    bool namedTheSymbol = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_SymbolUndefined
+            && d.actual.find("neverDefined") != std::string::npos) {
+            namedTheSymbol = true;
+        }
+    }
+    EXPECT_TRUE(namedTheSymbol)
+        << "the undefined-symbol diagnostic must NAME the symbol";
+    EXPECT_FALSE(image.ok())
+        << "an undefined symbol must block image emission";
+    EXPECT_EQ(image.resolvedFuncCount, 0u);
+}
+
+// c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): an UNREFERENCED no-library
+// extern is NOT an error — ld's rule: only a REFERENCED undefined symbol
+// fails the link. A bare prototype nobody calls (sqlite3.h declares the whole
+// API; a TU calls a subset, and a config-gated symbol may be defined nowhere)
+// is dead declaration surface: the row is DROPPED before emission so no
+// format walker ever sees a library-less import group (an empty DT_NEEDED /
+// IMAGE_IMPORT_DESCRIPTOR name — a broken image). RED-ON-DISABLE: skipping
+// the drop leaks the row to the emitted import table (externImportNames
+// gains "neverCalled") or, pre-c86, hard-failed the whole link on a symbol
+// nothing uses.
+TEST(Linker, UnreferencedNoLibraryExternIsDroppedNotRejected) {
+    auto loaded = loadMinimal();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule m;
+    m.cuId = CompilationUnitId{1};
+    m.expectedFuncCount = 1;
+    AssembledFunction fn;      // no relocations — nothing references the extern
+    fn.symbol = SymbolId{1};
+    m.functions.push_back(std::move(fn));
+    m.symbols.push_back(ModuleSymbol{SymbolId{1}, "f1",
+                                     SymbolBinding::Global, SymbolVisibility::Default});
+    ExternImport ext;
+    ext.symbol      = SymbolId{5};
+    ext.mangledName = "neverCalled";
+    ext.libraryPath = "";      // unbound AND unreferenced
+    m.externImports.push_back(std::move(ext));
+    DiagnosticReporter rep;
+    auto image = linker::link(m, *loaded.target, *loaded.format, rep);
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_SymbolUndefined), 0u)
+        << "an unreferenced unbound extern must not fail the link";
+    EXPECT_TRUE(image.ok()) << "the link must proceed to a clean image";
+    EXPECT_EQ(image.resolvedFuncCount, 1u);
+    EXPECT_EQ(std::count(image.externImportNames.begin(), image.externImportNames.end(),
+                         std::string{"neverCalled"}), 0)
+        << "the dropped row must not reach the emitted import table";
+}
+
 // A relocation whose target is neither defined nor imported in its own CU is an
 // undefined reference — fail loud (the per-CU compound index does not contain it).
 TEST(Linker, CrossCuUndefinedRelocationFailsLoud) {

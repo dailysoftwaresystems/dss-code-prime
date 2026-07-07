@@ -70,6 +70,7 @@ bool MirVerifier::verify(DiagnosticReporter& reporter) const {
     checkEntryBlocks(reporter);
     checkBlockTermination(reporter);
     checkPhiIncomings(reporter);
+    checkSehStructure(reporter);
     // StructCfMarker equality lives INSIDE checkDomination — the
     // derivation needs the same per-function preds/RPO/dom the
     // use-dom-def scan computes, so they share one computation.
@@ -90,7 +91,17 @@ void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const 
         MirOpcodeInfo const& info = opcodeInfo(op);
         if (op != MirOpcode::Phi) {
             auto operands = mir_.instOperands(id);
-            if (operands.size() < info.minOperands || operands.size() > info.maxOperands) {
+            // c70 (D-MIR-VERIFIER-UNBOUNDED-OPERAND-SENTINEL): a VARIADIC-operand
+            // opcode declares `maxOperands == kMirUnboundedOperands` (0xFF); the
+            // upper bound does NOT apply to it — mirror the builder's exemption
+            // (mir.cpp addInst: `maxOperands != kMirUnboundedOperands && count >
+            // maxOperands`). Without this the verifier read the 0xFF sentinel as a
+            // literal max of 255 and rejected a legitimately-variadic Switch/
+            // IndirectBr with >255 operands (sqlite has a switch with ~348 cases →
+            // 349 operands) that the builder had already accepted.
+            bool const overMax = info.maxOperands != kMirUnboundedOperands
+                                 && operands.size() > info.maxOperands;
+            if (operands.size() < info.minOperands || overMax) {
                 reportInst(reporter, DiagnosticCode::I_VerifierFailure, id,
                     std::format("opcode {} operand count {} outside [{}, {}]",
                         info.mnemonic, operands.size(),
@@ -213,6 +224,99 @@ void MirVerifier::checkPhiIncomings(DiagnosticReporter& reporter) const {
             }
         }
     });
+}
+
+// c115 SEH (D-WIN64-SEH-FUNCLETS): the region-skeleton pairing rules. Runs
+// verify-after-every-pass, so an optimizer transform that damages the skeleton
+// (SimplifyCfg merging a filter/handler block, a rebuild dropping a marker's
+// pairing) reds AT the pass that did it. Zero-cost when no SehTryBegin exists.
+void MirVerifier::checkSehStructure(DiagnosticReporter& reporter) const {
+    // One flat scan; bail before building predecessors when SEH-free.
+    bool anySeh = false;
+    forEachInst(mir_, [&](MirInstId id) {
+        if (mir_.instOpcode(id) == MirOpcode::SehTryBegin) anySeh = true;
+    });
+    if (!anySeh) return;
+
+    auto const preds = mirBuildPredecessors(mir_);
+    auto predCount = [&](MirBlockId b) -> std::size_t {
+        return b.v < preds.size() ? preds[b.v].size() : 0u;
+    };
+
+    for (std::uint32_t fi = 0; fi < mir_.moduleFuncCount(); ++fi) {
+        MirFuncId const f = mir_.funcAt(fi);
+        // Gather the function's region ids (SehTryBegin payloads) + check the
+        // per-Begin skeleton; then validate End pairing + Code/Info containment.
+        std::unordered_set<std::uint32_t> regionIds;
+        bool fnHasBegin = false;
+        for (std::uint32_t bi = 0; bi < mir_.funcBlockCount(f); ++bi) {
+            MirBlockId const b = mir_.funcBlockAt(f, bi);
+            std::uint32_t const n = mir_.blockInstCount(b);
+            if (n == 0) continue;
+            MirInstId const term = mir_.blockInstAt(b, n - 1);
+            if (mir_.instOpcode(term) != MirOpcode::SehTryBegin) continue;
+            fnHasBegin = true;
+            std::uint32_t const region = mir_.instPayload(term);
+            regionIds.insert(region);
+
+            auto const succs = mir_.blockSuccessors(b);
+            if (succs.size() != 2) continue;   // structural check owns arity
+            MirBlockId const filterBB = succs[1];
+            if (predCount(filterBB) != 1) {
+                reportInst(reporter, DiagnosticCode::I_SehStructure, term,
+                    std::format("SEH region {}: filter block #{} must have "
+                                "exactly one predecessor (its SehTryBegin), "
+                                "found {}",
+                        region, filterBB.v, predCount(filterBB)));
+                continue;
+            }
+            std::uint32_t const fn2 = mir_.blockInstCount(filterBB);
+            MirInstId const fterm = fn2 > 0
+                ? mir_.blockInstAt(filterBB, fn2 - 1) : MirInstId{};
+            if (!fterm.valid()
+                || mir_.instOpcode(fterm) != MirOpcode::SehFilterReturn) {
+                reportInst(reporter, DiagnosticCode::I_SehStructure, term,
+                    std::format("SEH region {}: filter block #{} must terminate "
+                                "in SehFilterReturn", region, filterBB.v));
+                continue;
+            }
+            if (mir_.instPayload(fterm) != region) {
+                reportInst(reporter, DiagnosticCode::I_SehStructure, fterm,
+                    std::format("SehFilterReturn payload {} does not match its "
+                                "SehTryBegin region {}",
+                        mir_.instPayload(fterm), region));
+            }
+            auto const fsuccs = mir_.blockSuccessors(filterBB);
+            if (fsuccs.size() == 1 && predCount(fsuccs[0]) != 1) {
+                reportInst(reporter, DiagnosticCode::I_SehStructure, fterm,
+                    std::format("SEH region {}: handler block #{} must have "
+                                "exactly one predecessor (its filter), found {}",
+                        region, fsuccs[0].v, predCount(fsuccs[0])));
+            }
+        }
+        // SehTryEnd pairing + intrinsic containment (per function).
+        for (std::uint32_t bi = 0; bi < mir_.funcBlockCount(f); ++bi) {
+            MirBlockId const b = mir_.funcBlockAt(f, bi);
+            for (std::uint32_t ii = 0; ii < mir_.blockInstCount(b); ++ii) {
+                MirInstId const inst = mir_.blockInstAt(b, ii);
+                MirOpcode const op = mir_.instOpcode(inst);
+                if (op == MirOpcode::SehTryEnd
+                    && !regionIds.contains(mir_.instPayload(inst))) {
+                    reportInst(reporter, DiagnosticCode::I_SehStructure, inst,
+                        std::format("SehTryEnd names region {} but this function "
+                                    "has no SehTryBegin with that id",
+                            mir_.instPayload(inst)));
+                }
+                if ((op == MirOpcode::SehExceptionCode
+                     || op == MirOpcode::SehExceptionInfo)
+                    && !fnHasBegin) {
+                    reportInst(reporter, DiagnosticCode::I_SehStructure, inst,
+                        "SehExceptionCode/Info in a function with no SehTryBegin "
+                        "(the HIR-tier context rule should have rejected this)");
+                }
+            }
+        }
+    }
 }
 
 void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {

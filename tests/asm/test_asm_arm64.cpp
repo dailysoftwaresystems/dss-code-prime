@@ -494,6 +494,119 @@ TEST(Arm64Encoder, UdivEncodesDataProc2SourceHighRegs) {
     EXPECT_EQ(bytes[3], 0x9A);
 }
 
+TEST(Arm64Encoder, UmulhEncodesDataProc3SourceHighRegs) {
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): umulh X3, X4, X14 — the high 64 bits of the
+    // unsigned 64x64 product. UMULH is a data-processing (3-source) op with Ra=XZR:
+    //   base 0x9BC07C00 (sf=1 | 00 | 11011 | U=1 | 10 | Rm | o0=0 | Ra=XZR(11111))
+    //   | Rm = X14 (enc 14) << 16 → 0x000E0000
+    //   | Rn = X4  (enc 4)  << 5  → 0x00000080
+    //   | Rd = X3  (enc 3)        → 0x00000003
+    //   = 0x9BCE7C83 — LE bytes: 83 7C CE 9B.
+    // The U bit (23) discriminates UMULH from SMULH (0x9B40...) — a flipped bit
+    // silently turns unsigned mul-high into signed. The always-on structural guard
+    // for the arm64 mul-high encoding (the qemu corpus run is the runtime witness).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const umulhOp = (*s)->opcodeByMnemonic("umulh");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(umulhOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x3 {static_cast<std::uint32_t>(*(*s)->registerByName("x3")),  1, cls};
+    LirReg const x4 {static_cast<std::uint32_t>(*(*s)->registerByName("x4")),  1, cls};
+    LirReg const x14{static_cast<std::uint32_t>(*(*s)->registerByName("x14")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const mops[] = { LirOperand::makeReg(x4),
+                                LirOperand::makeReg(x14) };
+    (void)b.addInst(*umulhOp, x3, mops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x83);
+    EXPECT_EQ(bytes[1], 0x7C);
+    EXPECT_EQ(bytes[2], 0xCE);
+    EXPECT_EQ(bytes[3], 0x9B);
+}
+
+TEST(Arm64Encoder, LdaxrW0X1EncodesLoadAcquireExclusive) {
+    // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): ldaxr w0, [x1] — load-acquire
+    // exclusive, the LL half of the CAS retry loop. W-form base 0x885FFC00
+    // (size=10 | 001000 | L=1 | Rs=11111 | o0=1 | Rt2=11111) | Rn=x1(1)<<5 |
+    // Rt=w0(0) = 0x885FFC20 — LE bytes: 20 FC 5F 88. The result wires to the
+    // Rt field (bits 4:0, the `rd` slot); a wrong L bit silently turns the
+    // acquire-load into a store-form — byte 3/2 pin the exact class bits.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const ldaxrOp = (*s)->opcodeByMnemonic("ldaxr");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(ldaxrOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(x1) };
+    (void)b.addInst(*ldaxrOp, x0, ops, /*payload=*/0, kLirInstFlagWidth32);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0xFC);
+    EXPECT_EQ(bytes[2], 0x5F);
+    EXPECT_EQ(bytes[3], 0x88);
+}
+
+TEST(Arm64Encoder, StlxrW2W0X1EncodesStoreReleaseExclusiveStatusInRs) {
+    // c104: stlxr w2, w0, [x1] — store-release exclusive, the SC half. W-form
+    // base 0x8800FC00 | Rs=w2(2)<<16 | Rn=x1(1)<<5 | Rt=w0(0) = 0x8802FC20 —
+    // LE bytes: 20 FC 02 88. The STATUS result lives in the Rs bit-field
+    // (20:16 — the generic `rm` slot), the stored VALUE wires to the Rt field
+    // (bits 4:0, the `rd` slot position): this pin locks the Rs-vs-Rt wiring —
+    // swapping them silently stores the status and reports the value.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const stlxrOp = (*s)->opcodeByMnemonic("stlxr");
+    auto const retOp   = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(stlxrOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+    LirReg const x2{static_cast<std::uint32_t>(*(*s)->registerByName("x2")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(x0),    // stored value → Rt
+                               LirOperand::makeReg(x1) };  // base → Rn
+    (void)b.addInst(*stlxrOp, x2, ops, /*payload=*/0, kLirInstFlagWidth32);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0xFC);
+    EXPECT_EQ(bytes[2], 0x02);
+    EXPECT_EQ(bytes[3], 0x88);
+}
+
 // ── FC3.5 sweep-c3: MSUB — D-LIR-MOD-MSUB-FUSION (the fixed32 `ra`
 // slot's first consumer; rule 3's fused remainder realization) ─────
 
@@ -1017,6 +1130,180 @@ TEST(Arm64Encoder, BaseIndexLeaNonZeroDispFailsLoud) {
     EXPECT_GT(rep.errorCount(), 0u)
         << "a base+index lea with a nonzero displacement must fail loud "
            "(memoffset.zero guard), never silently drop or mis-encode it";
+}
+
+TEST(Arm64Encoder, NegativeDispLeaEncodesNativeSubImm12) {
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB (c94): a NEGATIVE const-disp
+    // GEP (`p[-N]` → the 3-op `lea Xd,[base + MemOffset(<0)]`) now encodes in
+    // ONE NATIVE instruction `SUB Xd,Xn,#|disp|` — the negMemoffset sign
+    // matcher routes it to the SUB variant; the encoder writes |disp| into the
+    // unsigned imm12 field (the SUB base makes it a subtract). This REPLACES
+    // c93's 5-7-instruction materialize-into-fresh-GPR + base+index fold (with
+    // its DEAD const). HOST-INDEPENDENT byte-pin: the runtime witness is the
+    // qemu-gated index_negative corpus (one leg), so this pin guards the native
+    // SUB on EVERY leg (§A.5 cross-target closure).
+    //   lea X2, [X1 + (-24)] → SUB X2, X1, #24. Base 0xD1000000.
+    //   Rd    = X2 (2)  at bits 0..4   → 0x002
+    //   Rn    = X1 (1)  at bits 5..9   → 0x020
+    //   Imm12 = 24      at bits 10..21 → 24<<10 = 0x6000
+    // word = 0xD1006022; LE: 22 60 00 D1. Distinct Rd≠Rn + the SUB op-bit
+    // (0xD1 vs the ADD 0x91) → an ADD mis-encode, a dropped/negated disp, or
+    // an Rd/Rn swap all fail (red-on-disable).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(-24)
+    };
+    (void)b.addInst(*leaOp, gpr(**s, "x2"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x22);
+    EXPECT_EQ(bytes[1], 0x60);
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0xD1);
+}
+
+TEST(Arm64Encoder, NegativeDispLeaAtImm12BoundaryEncodesSub) {
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB boundary pin: |disp| = 4095 is
+    // the LARGEST magnitude the single-word SUB-imm12 form encodes (immMax:4095
+    // on the negMemoffset variant). A magnitude 4096 falls through to the
+    // shifted variant (next test). `lea X0, [X3 + (-4095)]` → SUB X0, X3, #4095:
+    //   Rd=X0(0), Rn=X3(3)→0x60, imm12=4095(0xFFF)→0xFFF<<10 = 0x3FFC00
+    // word = 0xD13FFC60; LE: 60 FC 3F D1.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x3")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(-4095)
+    };
+    (void)b.addInst(*leaOp, gpr(**s, "x0"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x60);
+    EXPECT_EQ(bytes[1], 0xFC);
+    EXPECT_EQ(bytes[2], 0x3F);
+    EXPECT_EQ(bytes[3], 0xD1);
+}
+
+TEST(Arm64Encoder, NegativeDispLeaWiderThanImm12SplitsToShiftedSub) {
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: a negative disp whose |disp| >
+    // 4095 SPLITS into a 2-word `SUB Xd,Xn,#lo` + `SUB Xd,Xd,#hi,LSL#12` macro
+    // (the imm12.hilo24 slot, SUB base) — the negative mirror of the positive
+    // shifted ADD. `lea x2, [x1 + (-35996)]`, |disp| = 35996 = 0x8C9C →
+    // lo = 0xC9C, hi = 0x8:
+    //   word0 = SUB x2, x1, #0xC9C     : 0xD1000000|(0xC9C<<10)|(1<<5)|2 = 0xD1327022 → 22 70 32 D1
+    //   word1 = SUB x2, x2, #0x8,LSL12 : 0xD1400000|(0x8<<10)|(2<<5)|2   = 0xD1402042 → 42 20 40 D1
+    // word1 reads its OWN dest (x2) — SCRATCH-FREE. A missing sh=1 bit
+    // (0x400000), a lo/hi swap, or an ADD-vs-SUB op-bit error all diverge.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(-35996)
+    };
+    (void)b.addInst(*leaOp, gpr(**s, "x2"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    // word0 (22 70 32 D1)
+    EXPECT_EQ(bytes[0], 0x22);
+    EXPECT_EQ(bytes[1], 0x70);
+    EXPECT_EQ(bytes[2], 0x32);
+    EXPECT_EQ(bytes[3], 0xD1);
+    // word1 (42 20 40 D1)
+    EXPECT_EQ(bytes[4], 0x42);
+    EXPECT_EQ(bytes[5], 0x20);
+    EXPECT_EQ(bytes[6], 0x40);
+    EXPECT_EQ(bytes[7], 0xD1);
+}
+
+TEST(Arm64Encoder, NegativeDispLeaBeyond16MiBSplitsToMovzMovkSub) {
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: a negative disp with |disp| >
+    // 0xFFFFFF SPLITS into a 3-word MOVZ/MOVK + EXTENDED-register `SUB Xd,Xn,Xd`
+    // macro — the negative mirror of the positive MOVZ/MOVK form. SCRATCH-FREE:
+    // |disp| materializes into the DEST reg (x2), then `SUB x2, x1, x2`. UNLIKE
+    // the positive form (Rn=sp baked), the NEGATIVE form WIRES Rn to the base
+    // (x1). `lea x2, [x1 + (-0x1234000)]`, |disp| = 0x1234000, lo16 = 0x4000,
+    // hi16 = 0x123:
+    //   word0 = MOVZ x2,#0x4000       : 0xD2800000|(0x4000<<5)|2 = 0xD2880002 → 02 00 88 D2
+    //   word1 = MOVK x2,#0x123,LSL#16 : 0xF2A00000|(0x123<<5)|2  = 0xF2A02462 → 62 24 A0 F2
+    //   word2 = SUB x2,x1,x2 (EXTENDED): 0xCB206000|(1<<5)|(2<<16)|2 = 0xCB226022 → 22 60 22 CB
+    // word2's FULL word is pinned (a shifted-register mis-encode 0xCB026022
+    // would read x2 as the base instead of x1 — corrupt address; the ADD form
+    // 0x8B... would ADD not SUB). Red-on-disable: revert the variant and
+    // 0x1234000-magnitude fails A_NoMatchingEncodingVariant.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const leaOp = (*s)->opcodeByMnemonic("lea");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(leaOp.has_value() && retOp.has_value());
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = {
+        LirOperand::makeReg(gpr(**s, "x1")),
+        LirOperand::makeMemBase(1),
+        LirOperand::makeMemOffset(-0x1234000)
+    };
+    (void)b.addInst(*leaOp, gpr(**s, "x2"), ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 12u);
+    // word0 — MOVZ x2,#0x4000 (02 00 88 D2)
+    EXPECT_EQ(bytes[0], 0x02);
+    EXPECT_EQ(bytes[1], 0x00);
+    EXPECT_EQ(bytes[2], 0x88);
+    EXPECT_EQ(bytes[3], 0xD2);
+    // word1 — MOVK x2,#0x123,LSL#16 (62 24 A0 F2)
+    EXPECT_EQ(bytes[4], 0x62);
+    EXPECT_EQ(bytes[5], 0x24);
+    EXPECT_EQ(bytes[6], 0xA0);
+    EXPECT_EQ(bytes[7], 0xF2);
+    // word2 — SUB x2,x1,x2 EXTENDED (22 60 22 CB) — full word, F1 critical
+    EXPECT_EQ(bytes[8],  0x22);
+    EXPECT_EQ(bytes[9],  0x60);
+    EXPECT_EQ(bytes[10], 0x22);
+    EXPECT_EQ(bytes[11], 0xCB);
 }
 
 TEST(Arm64Encoder, FrameLeaOffsetWiderThanImm12SplitsToShifted) {

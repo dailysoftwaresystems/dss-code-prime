@@ -734,6 +734,37 @@ bool encode(Lir const&                  lir,
                         wire.wordIndex))
                 return false;
         } else if (srcOp.kind == LirOperandKind::MemOffset) {
+            // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: a `negMemoffset`
+            // variant (the arm64 `SUB Xd,Xn,#|disp|` negative-disp lea) writes
+            // the ABSOLUTE VALUE of a NEGATIVE displacement into its (unsigned)
+            // imm12 / shifted-imm12 / MOVZ-MOVK slot — the subtract semantics
+            // live in the SUB base word, not the field, so the field carries
+            // |disp|. The matcher (variantNegMagnitude) only routes a strictly-
+            // negative memoffset here, but the encoder DEFENDS the invariant:
+            // a non-negative disp on a negMemoffset variant is a lowering/
+            // schema bug and fails LOUD (never silently negate a positive into
+            // a wrong address). `effectiveDisp` is |disp| for the negMemoffset
+            // path (computed as -(int64) so INT32_MIN widens cleanly) and the
+            // raw signed disp otherwise — so every slot arm below feeds the
+            // correct magnitude with no per-arm sign branching. A non-
+            // negMemoffset variant is byte-identical to before (effectiveDisp
+            // == srcOp.offset).
+            std::int64_t effectiveDisp = srcOp.offset;
+            if (selected->negMemoffset) {
+                if (srcOp.offset >= 0) {
+                    report(reporter, DiagnosticCode::A_ImmediateOperandOutOfRange,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': the negative-displacement "
+                                       "form (SUB base) requires a NEGATIVE "
+                                       "memory offset (got {}) — a non-negative "
+                                       "displacement must route to the positive "
+                                       "ADD form; the sign matcher should have "
+                                       "excluded this",
+                                       info->mnemonic, srcOp.offset));
+                    return false;
+                }
+                effectiveDisp = -static_cast<std::int64_t>(srcOp.offset);
+            }
             // A memory displacement → one of two AArch64 displacement
             // fields, distinguished by slot:
             //   * Imm9  — SIGNED 9-bit unscaled LDUR/STUR byte offset
@@ -746,6 +777,9 @@ bool encode(Lir const&                  lir,
             //             the `add`/`sub` immediate variants already use;
             //             frame offsets are non-negative, so the unsigned
             //             imm12 reach is the right fit — larger than Imm9.)
+            //             D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: the SUB
+            //             negative-disp lea also wires |disp| here for
+            //             |disp| ≤ 4095.
             // A future scaled LDR/STR form adds its own slot when that
             // consumer lands. Mirrors the ImmInt arm's dual-slot shape.
             //
@@ -876,8 +910,14 @@ bool encode(Lir const&                  lir,
             // Handled BEFORE the Imm9/Imm12 reject so the word-pair slot
             // never leaks into the single-word range logic. `writeHiLo24`
             // owns the non-negative + 24-bit-magnitude fail-loud gate.
+            // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: the negative-disp lea's
+            // shifted `SUB Xd,Xn,#|disp|; SUB Xd,Xd,#hi,LSL#12` word-pair rides
+            // the SAME imm12.hilo24 slot; `effectiveDisp` is already |disp| for
+            // the negMemoffset variant, so writeHiLo24 splits the magnitude
+            // identically to the positive ADD word-pair (the SUB base word
+            // makes it a subtract).
             if (wire.slotKind == EncodingSlotKind::Imm12HiLo24) {
-                if (!writeHiLo24(static_cast<std::int64_t>(srcOp.offset),
+                if (!writeHiLo24(effectiveDisp,
                                  wire.wordIndex, "memory offset"))
                     return false;
                 continue;
@@ -892,8 +932,13 @@ bool encode(Lir const&                  lir,
             // Rn=sp). Handled BEFORE the Imm9/Imm12 reject so the 3-word slot
             // never leaks into the single-word range logic. `writeMovzMovk`
             // owns the non-negative + int32-ceiling fail-loud gate.
+            // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: the negative-disp lea's
+            // MOVZ/MOVK + extended-register `SUB Xd,Xn,Xd` 3-word form rides
+            // the SAME imm32.movzmovk slot; `effectiveDisp` is |disp|, so the
+            // magnitude materializes into the dest reg identically to the
+            // positive ADD 3-word form (word2's SUB base subtracts it).
             if (wire.slotKind == EncodingSlotKind::Imm32MovzMovk) {
-                if (!writeMovzMovk(static_cast<std::int64_t>(srcOp.offset),
+                if (!writeMovzMovk(effectiveDisp,
                                    wire.wordIndex, "memory offset"))
                     return false;
                 continue;
@@ -921,7 +966,13 @@ bool encode(Lir const&                  lir,
                                    encodingSlotKindName(wire.slotKind)));
                 return false;
             }
-            std::int32_t const disp = srcOp.offset;
+            // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: the value the field
+            // receives. For the unsigned Imm12 slot the SUB negative-disp lea
+            // wires |disp| here (effectiveDisp is already |disp| ≤ 4095 for the
+            // negMemoffset variant, the magnitude range-checked below). For the
+            // signed Imm9 slot negMemoffset is always false, so effectiveDisp
+            // == srcOp.offset — the two's-complement range/write is unchanged.
+            std::int32_t const disp = static_cast<std::int32_t>(effectiveDisp);
             if (isSignedSlot) {
                 // SIGNED range derived from the slot WIDTH (two's-
                 // complement): [-(2^(w-1)), 2^(w-1)-1] — for Imm9 that is

@@ -14,7 +14,9 @@
     { "name": "pthread_mutexattr_destroy", "signature": "fn(ptr<void>) -> i32",         "kind": "function", "linkage": "external" },
     { "name": "pthread_mutexattr_settype", "signature": "fn(ptr<void>, i32) -> i32",    "kind": "function", "linkage": "external" },
     { "name": "pthread_self",           "signature": "fn() -> u64",                     "kind": "function", "linkage": "external" },
-    { "name": "pthread_equal",          "signature": "fn(u64, u64) -> i32",             "kind": "function", "linkage": "external" }
+    { "name": "pthread_equal",          "signature": "fn(u64, u64) -> i32",             "kind": "function", "linkage": "external" },
+    { "name": "pthread_create",         "signature": "fn(ptr<void>, ptr<void>, ptr<void>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "pthread_join",           "signature": "fn(u64, ptr<void>) -> i32",       "kind": "function", "linkage": "external" }
   ],
   "typedefs": [
     { "name": "pthread_t", "type": "u64" },

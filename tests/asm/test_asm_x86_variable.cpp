@@ -610,6 +610,24 @@ TEST(X86VariableEncoder, DivOpRaxEmits48_F7_F0) {
     expectDivBytes("div_op", "rax", {0x48, 0xF7, 0xF0});
 }
 
+TEST(X86VariableEncoder, UmulOpRaxEmits48_F7_E0) {
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): MUL r/m64 with the multiplier in RAX —
+    // REX.W 0xF7 /4 with ModR/M = mod=11 reg=/4=100 rm=rax(000) = 0xE0. RAX*rm →
+    // RDX:RAX; the __umulh lowering captures the RDX 'high' role. Discriminates
+    // from div's /6 (0xE0 vs 0xF0) and idiv's /7 (0xF8) — a schema /-digit swap
+    // fails at byte 2. The always-on structural guard for the x86 mul-high encoding.
+    expectDivBytes("umul_op", "rax", {0x48, 0xF7, 0xE0});
+}
+
+TEST(X86VariableEncoder, UmulOpR14Emits49_F7_E6) {
+    // REX.B regression pin: MUL r/m64 with the multiplier in R14 — REX.W+B = 0x49,
+    // ModR/M = mod=11 reg=/4=100 rm=r14-low3(110) = 0xE6. A dropped REX.B would
+    // decode rm as RSI (110 without B) → multiply by the wrong register (the div
+    // family's exact high-reg trap).
+    expectDivBytes("umul_op", "r14", {0x49, 0xF7, 0xE6});
+}
+
+
 // ── REX.B regression pins for high-numbered registers (R8-R15) ──
 //
 // **Background**: cycle-10q's compound encoding bug was that the
@@ -1604,6 +1622,84 @@ TEST(X86VariableEncoder, StoreToRspForcesSibByte) {
     EXPECT_EQ(bytes[7], 0x00);
 }
 
+TEST(X86VariableEncoder, LockCmpxchgMem32LowRegsEmitsF0_0F_B1) {
+    // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): `lock cmpxchg dword [rdi + 0], esi`
+    // (the width-32 Win32 LONG CAS — NO REX.W). LOCK 0xF0 (mandatoryPrefix) +
+    // 0F B1 + ModR/M mod=10 reg=esi(110) rm=rdi(111) = 0xB7 + disp32(0).
+    // Low registers → no REX byte at all: F0 0F B1 B7 00 00 00 00.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const casOp = (*schema)->opcodeByMnemonic("lock_cmpxchg");
+    ASSERT_TRUE(casOp.has_value());
+    LirReg const rsi = physGprByName(**schema, "rsi");
+    LirReg const rdi = physGprByName(**schema, "rdi");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rsi),        // newval → modrm.reg
+            LirOperand::makeReg(rdi),        // base   → modrm.rm.mem
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*casOp, InvalidLirReg, ops, /*payload=*/0,
+                        ::dss::kLirInstFlagWidth32);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 8u);
+    EXPECT_EQ(bytes[0], 0xF0);  // LOCK
+    EXPECT_EQ(bytes[1], 0x0F);
+    EXPECT_EQ(bytes[2], 0xB1);
+    EXPECT_EQ(bytes[3], 0xB7);  // mod=10 reg=esi rm=rdi
+    EXPECT_EQ(bytes[4], 0x00);  // disp32 = 0
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
+    EXPECT_EQ(bytes[7], 0x00);
+}
+
+TEST(X86VariableEncoder, LockCmpxchgMem32HighRegsPinsLockBeforeRex) {
+    // c104 PREFIX-ORDER pin (the cycle-10q REX-overlap trap class): with
+    // HIGH registers (`lock cmpxchg dword [r8 + 0], r9d`) the auto-REX
+    // (R for r9 in modrm.reg + B for r8 in modrm.rm) must land BETWEEN the
+    // LOCK legacy prefix and the opcode: F0 45 0F B1 88 <disp32>. A REX
+    // emitted before LOCK (45 F0 0F B1 …) is an INVALID x86 encoding — REX
+    // must immediately precede the opcode; this byte-pin makes any prefix-
+    // ordering regression fail at byte 0/1 rather than fault at runtime.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const casOp = (*schema)->opcodeByMnemonic("lock_cmpxchg");
+    ASSERT_TRUE(casOp.has_value());
+    LirReg const r9 = physGprByName(**schema, "r9");
+    LirReg const r8 = physGprByName(**schema, "r8");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(r9),         // newval → modrm.reg (REX.R)
+            LirOperand::makeReg(r8),         // base   → modrm.rm.mem (REX.B)
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*casOp, InvalidLirReg, ops, /*payload=*/0,
+                        ::dss::kLirInstFlagWidth32);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 9u);
+    EXPECT_EQ(bytes[0], 0xF0);  // LOCK first
+    EXPECT_EQ(bytes[1], 0x45);  // REX.R|B second (no W — 32-bit form)
+    EXPECT_EQ(bytes[2], 0x0F);
+    EXPECT_EQ(bytes[3], 0xB1);
+    EXPECT_EQ(bytes[4], 0x88);  // mod=10 reg=r9lo(001) rm=r8lo(000)
+    EXPECT_EQ(bytes[5], 0x00);  // disp32 = 0
+    EXPECT_EQ(bytes[6], 0x00);
+    EXPECT_EQ(bytes[7], 0x00);
+    EXPECT_EQ(bytes[8], 0x00);
+}
+
 TEST(X86VariableEncoder, StoreToR12ForcesSibByteAndRexB) {
     // `mov [r12 + 0x10], rax` → 49 89 44 24 10 00 00 00
     // r12 is rsp-family in REX-extended space.
@@ -1699,6 +1795,44 @@ TEST(X86VariableEncoder, NegativeDispEmitsAsTwosComplement) {
     EXPECT_EQ(bytes[1], 0x8B);
     EXPECT_EQ(bytes[2], 0x85);  // mod=10 reg=rax rm=rbp → 0x80|0x00|0x05
     EXPECT_EQ(bytes[3], 0xF8);  // -8 LE byte 0
+    EXPECT_EQ(bytes[4], 0xFF);
+    EXPECT_EQ(bytes[5], 0xFF);
+    EXPECT_EQ(bytes[6], 0xFF);
+}
+
+TEST(X86VariableEncoder, NegativeDispLeaSingleInstructionUnchanged) {
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB (c94) AGNOSTICISM GUARD: the
+    // shared variant matcher gained a `negMemoffset` SIGN axis for arm64's SUB
+    // negative-disp lea. x86_64's `lea` base+disp variant has NO immMin/immMax
+    // AND NO negMemoffset (its disp32 field is SIGNED), so it stays the
+    // match-any slot that swallows BOTH signs in ONE instruction — the sign
+    // axis must NOT perturb it. `lea rax, [rbx - 8]` → 48 8D 83 F8 FF FF FF
+    // (REX.W 0x8D /r ModR/M(mod=10 reg=rax=0 rm=rbx=3 → 0x83) disp32=-8). This
+    // is the c93 baseline byte-for-byte; a regression from the shared-matcher
+    // change (e.g. a negative disp now matching nothing, or routing to a
+    // multi-instruction form) diverges these bytes (red-on-regression).
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const leaOp = (*schema)->opcodeByMnemonic("lea");
+    ASSERT_TRUE(leaOp.has_value());
+    LirReg const rax = physGprByName(**schema, "rax");
+    LirReg const rbx = physGprByName(**schema, "rbx");
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rbx),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(-8),
+        };
+        (void)b.addInst(*leaOp, rax, ops);
+    });
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 7u);
+    EXPECT_EQ(bytes[0], 0x48);  // REX.W
+    EXPECT_EQ(bytes[1], 0x8D);  // lea opcode
+    EXPECT_EQ(bytes[2], 0x83);  // ModR/M mod=10 reg=rax rm=rbx — no SIB
+    EXPECT_EQ(bytes[3], 0xF8);  // disp32 -8 LE byte 0
     EXPECT_EQ(bytes[4], 0xFF);
     EXPECT_EQ(bytes[5], 0xFF);
     EXPECT_EQ(bytes[6], 0xFF);

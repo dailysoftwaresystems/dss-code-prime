@@ -1,0 +1,15 @@
+{
+  "$comment": "c32 D-CSUBSET-FNPTR-PARAM-SCOPE: a struct of function-pointer members whose param NAMES are SHARED across siblings (`int (*lo)(int v); int (*hi)(int v);` — the sqlite3_io_methods xRead/xWrite shape) parses, member-assigns, and CALLS THROUGH at runtime -> exit 42. Before this cycle the second `v` collided with the first because fn-ptr param names bound into the enclosing struct scope (error[S0002] S_RedeclaredSymbol); the fix opens a per-declarator function-prototype scope (C 6.2.1p4) so each declarator's params isolate. RED-ON-DISABLE: revert the prototype-scope open (semantic_analyzer.cpp nodeOpensChildScope / isPrototypeParamScopeNode) and the source fails to compile (the second `v` collides -> the struct is rejected). The pe arm RUNS on the windows leg (a native runtime witness); elf/macho/arm64 run on the linux/darwin/qemu legs. The release arm witnesses the optimizer over the member-fnptr GEP/load + indirect-call shapes.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

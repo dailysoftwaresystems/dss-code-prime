@@ -81,6 +81,26 @@
       "maxSuccessors": 0
     },
     {
+      "$comment": "Virtual-ISA pseudo-op (c69, D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE): a RE-REFERENCE of a body-local's stack slot — 'this fresh LirReg is the ADDRESS of local-alloca #k', k = PAYLOAD = the alloca's 0-based scan-order index. The c69 entry-block alloca-hoist makes every local's address live from entry; reusing ONE address vreg tips a register-pressure cliff, so MIR->LIR emits the `alloca` op ONCE (reserves the slot) and a fresh `lea_frame_slot k` at EACH use (tiny def->use range) — the conventional 'rematerialize frame addresses' treatment. lir_callconv materializes it into `lea result, [sp + localAreaOffset + offsetOf(k) + disp]` — byte-identical to the original alloca's `lea` (offset from the alloca-index->offset map built in scan order). An OPTIONAL single ImmInt operand is a folded CONSTANT byte displacement `disp` (a `&local[constIdx]`/`&s.field` Gep whose base IS this alloca, folded by lowerGep into ONE sp-based frame lea): cheaper (one lea) AND load-bearing — a >16 MiB `disp` in the un-folded two-lea form (`lea_frame_slot` base + `lea [base+disp]`) lowers to the arm64 MOVZ/MOVK macro `ADD Xd,base,Xd` which CLOBBERS base when regalloc coalesces the tiny-range remat base into the Gep result (base==Xd), a SIGSEGV; folding makes the base `sp` (a reserved physreg, never the result), so `MOVZ Xd;MOVK Xd;ADD Xd,sp,Xd` is safe. DISTINCT from `alloca` so it is INVISIBLE to the frame-layout slot-count scan (one slot per original alloca is preserved). On arm64 `lea` is the ADD-immediate frame-address form (the same op the alloca/va_* address pseudo-ops lower to). No encoding (materialized away). hasSideEffects=false (pure address computation, like lea/alloca); no LIR-tier pass removes/merges it.",
+      "mnemonic":      "lea_frame_slot",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
+      "$comment": "Virtual-ISA pseudo-op (c116 H1, D-WIN64-SEH-FUNCLETS): 'this fresh LirReg is the ADDRESS of local-slot #k IN THE FRAME the operand[0] register establishes' — the generic analog of llvm.localrecover. operand[0] = an establisher-frame base pointer register; PAYLOAD = k. lir_callconv materializes it into `lea result, [establisherReg + parentLocalAreaOffset(k)]` (the config FrameLayout of the frame the base establishes; on arm64 `lea` is the ADD-immediate frame-address form). Declared for substrate uniformity; x64 SEH funclets are its only consumer today (windows.json is pe-only, so no `__try` reaches arm64 and this op is never emitted here). No encoding (materialized away). hasSideEffects=false (pure address computation, like lea/alloca/lea_frame_slot).",
+      "mnemonic":      "recover_parent_frame_slot",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0
+    },
+    {
       "$comment": "Virtual-ISA pseudo-op (FC12b, D-FC12B-WIN64-VARIADIC-CALLEE): the Win64 HomogeneousPointer va_start base (&home[namedArgCount]). Declared for substrate uniformity; AAPCS64 uses the dual-cursor strategy (FC12c) and never emits this op. No encoding (materialized away by lir_callconv).",
       "mnemonic":      "va_home_arg_area",
       "result":        "value",
@@ -389,6 +409,87 @@
             "wires":      [
               { "index": 0, "slotKind": "rn" },
               { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "c103 (D-CSUBSET-INTRINSIC-UMULH): UMULH Xd, Xn, Xm — the high 64 bits of the unsigned 64x64 128-bit product. fixedWord 0x9BC07C00: data-processing (3-source) with op31=110 (bits 23:21 — UMULH; SMULH=010 → 0x9B407C00, MADD/MUL=000 → 0x9B007C00) + Ra=XZR(11111) baked in, o0=0, sf=1 (audit-recomputed vs the ARM ARM). The MIR->LIR Rule-1 NATIVE realization of MIR UMulH: a result-bearing 3-address op, no implicit registers, no pre-op (contrast x86's mov-rax + umul_op core). UMULH is inherently 64-bit (no W-form); the u64 `__umulh` is the only consumer, so a single width-64 variant.",
+      "mnemonic":      "umulh",
+      "result":        "value",
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 2613083136 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): LDAXR Wt/Xt, [Xn] — load-acquire EXCLUSIVE (arms the exclusive monitor; the acquire half of the LL/SC CAS loop). W-form 0x885FFC00 = size=10 | 001000 | o2=0 L=1 o1=0 | Rs=11111 | o0=1 | Rt2=11111 | Rn | Rt; X-form flips size to 11 -> 0xC85FFC00. Result = the loaded value (Rt, bits 4:0 = the `rd` slot); operand 0 = the address base (Rn). The MIR AtomicCas value width picks W (the Win32 LONG i32 CAS) vs X.",
+      "mnemonic":      "ldaxr",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 2287991808 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 3361733632 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): STLXR Ws, Wt/Xt, [Xn] — store-release EXCLUSIVE (succeeds iff the monitor armed by LDAXR is still held; the release half of the LL/SC loop). W-form 0x8800FC00 = size=10 | 001000 | o2=0 L=0 o1=0 | Rs | o0=1 | Rt2=11111 | Rn | Rt; X-form 0xC800FC00. Result = the STATUS register Ws (0=stored, 1=monitor lost -> retry) — it lives in the Rs bit-field (20:16), which is the generic `rm` slot position, so resultSlot:'rm' (the slot vocabulary is bit-positional, not role-named). Operand 0 = the stored value (Rt, bits 4:0 = the `rd` slot position — an operand MAY wire to rd, the MOVK dest-wire precedent); operand 1 = the address base (Rn). The value width picks W vs X; the status is ALWAYS a W write (zero-extending — the loop's `cmp status, #0` runs at the default 64-bit width on the strength of that zero-extension).",
+      "mnemonic":      "stlxr",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 32 },
+            "template":   { "fixedWord": 2281765888 },
+            "resultSlot": "rm",
+            "wires":      [
+              { "index": 0, "slotKind": "rd" },
+              { "index": 1, "slotKind": "rn" }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 3355507712 },
+            "resultSlot": "rm",
+            "wires":      [
+              { "index": 0, "slotKind": "rd" },
+              { "index": 1, "slotKind": "rn" }
             ]
           }
         ]
@@ -906,6 +1007,13 @@
       "minSuccessors": 0, "maxSuccessors": 0
     },
     {
+      "$comment": "D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT (option E): outgoing-stack-arg store carrier (target-blind, NO encoding). Emitted by the PRE-REGALLOC wide-call lowering pass for every outgoing call argument beyond the cc's register-passed capacity (config: argGprs/argFprs = 8 GPR / 8 FPR on AAPCS64). Operand[0] = the arg VALUE vreg (regalloc assigns it; its live range ends HERE, not at the call). Payload = the arg's OVERFLOW SLOT INDEX (monotonic, source-order NSAA cursor). lir_callconv materializes it into `store operand, [sp + shadowSpaceBytes + payload*outgoingSlotSize]` (shadowSpaceBytes=0 on AAPCS64) via the STUR/scaled-STR chokepoint — byte-identical to the pre-existing placement-loop store. hasSideEffects=true so no pass reorders it off its call.",
+      "mnemonic": "store_outgoing_arg", "result": "none",
+      "hasSideEffects": true,
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0
+    },
+    {
       "$comment": "Memory LOAD — AArch64 LDUR Xt, [Xn, #simm9] (unscaled, signed 9-bit byte offset). Fixed word 0xF8400000 (size=11 64-bit, opc=01 load, unscaled mode bits 11..10 = 00). Operand layout (shared LIR load form): [base_reg, MemBase(scale=1), MemOffset(disp)] + result. Wires: result→Rt (rd, bits 0..4), base_reg(index 0)→Rn (bits 5..9), MemOffset(index 2)→Imm9 (bits 12..20, signed). The MemBase(index 1) carries no AArch64 bits (scale must be 1; the walker validates it). The callconv materializes frame_load into this. Offset range -256..255; a wider frame fails loud (scaled LDR imm12 = future).",
       "mnemonic":      "load",
       "result":        "value",
@@ -1223,6 +1331,48 @@
             ]
           },
           {
+            "$comment": "NEGATIVE-DISP lea (single word, D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB) — `lea Xd, [base + #disp]` with disp in [-4095, -1] = AArch64 `SUB Xd, Xn, #|disp|`. The `p[-1]`/`z[-1]` char-buffer lookback (a NEGATIVE const-disp GEP) that x86 encodes in one signed-disp32 `lea` but arm64's UNSIGNED imm12 ADD form could not — c94 gives it a NATIVE single-instruction SUB (replacing c93's materialize-into-a-fresh-GPR + base+index fold, which cost 5-7 instructions incl. a dead const). The negative MIRROR of the positive `ADD Xd,Xn,#imm12` variant above, op-bit SET: single fixed word 0xD1000000 (3506438144 = the ADD-imm base 0x91000000 | 0x40000000, sf=1 op=1 sub S=0 sh=0), shared with `sub`'s imm12 variant. base_reg→Rn (5..9), result→Rd (0..4), MemOffset→Imm12 (bits 10..21 — the encoder writes |disp| there; the SUB base makes it a subtract). MemBase carries no bits (scale must be 1, membase.noscale). `negMemoffset:true` routes ONLY a NEGATIVE memoffset here (the sign matcher); `immMax:4095` bounds |disp|≤4095 (a larger magnitude falls through to the shifted / MOVZ-MOVK negative variants below). SUB imm encoding verified vs ARM ARM C6.2.* (add/subtract immediate: sf|op|S|100010|sh|imm12|Rn|Rd) + aarch64-gcc objdump.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "negMemoffset": true, "immMax": 4095 },
+            "template":   { "fixedWord": 3506438144 },
+            "resultSlot": "rd",
+            "wires": [
+              { "index": 0, "slotKind": "rn"              },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm12"           }
+            ]
+          },
+          {
+            "$comment": "NEGATIVE-DISP lea (shifted imm12 word-pair, D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB) — `lea Xd, [base + #disp]` with |disp| in (4095, 0xFFFFFF]. The negative mirror of the positive shifted-imm12 ADD word-pair, op-bit SET: word0 = `SUB Xd, Xn, #(|disp| & 0xFFF)` (0xD1000000, sh=0), word1 = `SUB Xd, Xd, #((|disp|>>12) & 0xFFF), LSL #12` (0xD1400000 = 0xD1000000|0x400000, sh=1). SCRATCH-FREE: word1 reads its OWN dest (Xd) — extraResultSlots thread the result reg into word1.Rd AND word1.Rn. The MemOffset (operand 2) is the sign-matched value operand; its single imm12.hilo24 wire (word0) carries |disp|, split lo→word0 / hi→word1 by the encoder. `negMemoffset:true` + `immMin:4096`/`immMax:16777215` (|disp| magnitude); a >16MiB magnitude falls through to the MOVZ/MOVK form below. Fixed words = the `sub` opcode's shifted word-pair.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "negMemoffset": true, "width": 64, "immMin": 4096, "immMax": 16777215 },
+            "template":   { "fixedWords": [3506438144, 3510632448] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rn", "wordIndex": 1 }
+            ],
+            "wires": [
+              { "index": 0, "slotKind": "rn"              },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "imm12.hilo24", "wordIndex": 0 }
+            ]
+          },
+          {
+            "$comment": "NEGATIVE-DISP lea (MOVZ/MOVK + EXTENDED-register 3-word form, D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB) — `lea Xd, [base + #disp]` with |disp| in (0xFFFFFF, 0x7FFFFFFF]. The negative mirror of the positive MOVZ/MOVK 3-word form, op-bit SET on the operation word. SCRATCH-FREE: |disp| materializes into the lea's DEST reg Xd, then an EXTENDED-register SUB off the base. word0 = `MOVZ Xd, #(|disp| & 0xFFFF)` (0xD2800000, Rd=Xd via resultSlot), word1 = `MOVK Xd, #((|disp|>>16) & 0xFFFF), LSL #16` (0xF2A00000, Rd=Xd via extraResultSlots word1.rd), word2 = `SUB Xd, Xn, Xd` (the EXTENDED-register form 0xCB206000: sf=1 op=1 sub, option=011 UXTX bits 15:13, bit 21 set, Rn=base wired 5..9, Rd=Xd + Rm=Xd via extraResultSlots word2.rd/word2.rm). Unlike the POSITIVE 3-word form (which bakes Rn=sp=31), the NEGATIVE form WIRES Rn to the base register (operand 0, word2) — a derived-pointer `p[-N]` base, not sp. The dest reg threads through all three words. MemOffset (operand 2) sign-matched; its imm32.movzmovk wire (word0) carries |disp|, split lo16→word0 / hi16→word1. `negMemoffset:true` + `immMin:16777216`/`immMax:2147483647`; a magnitude > 2 GiB flows through int32 as a value whose |x| is unrepresentable → no variant → fail-loud (the residual, mirrors the positive >2GiB gap). SUB-extended base 0xCB206000 = the positive lea word2 0x8B2063E0 minus the baked Rn=sp (0x3E0) with the ADD op-bit flipped to SUB (0x8B→0xCB), verified by bit-decode.",
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "negMemoffset": true, "width": 64, "immMin": 16777216, "immMax": 2147483647 },
+            "template":   { "fixedWords": [3531603968, 4070572032, 3407896576] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rd", "wordIndex": 2 },
+              { "slotKind": "rm", "wordIndex": 2 }
+            ],
+            "wires": [
+              { "index": 0, "slotKind": "rn",              "wordIndex": 2 },
+              { "index": 1, "slotKind": "membase.noscale", "wordIndex": 2 },
+              { "index": 2, "slotKind": "imm32.movzmovk",  "wordIndex": 0 }
+            ]
+          },
+          {
             "$comment": "BASE+INDEX lea (D-AS4-ARM64-BASE-INDEX-LEA) — `lea Xd, [base + index*1 + 0]` = AArch64 `ADD Xd, Xn, Xm` (shifted-register add, LSL #0). The 4-op form `lowerGep` emits for an indexed pointer access `p[n]` ([base_reg, index_reg, MemBase(scale=1), MemOffset(disp=0)]), MIRRORING x86_64's 4-op SIB lea so the GEP stays target-blind (closing the gap that made `p[n]` fail loud on arm64 for int AND char alike). The GEP emits scale=1 + disp=0 ALWAYS today, so this single ADD is the complete realization: base→Rn (5..9), index→Rm (16..20), result→Rd (0..4); MemBase→membase.noscale (scale MUST be 1, fail-loud) and MemOffset→memoffset.zero (disp MUST be 0 — the register-add form has NO displacement field, and bits 10..21 overlap Rm so an Imm12 wiring would corrupt it; fail-loud on nonzero). Fixed word 0x8B000000 (the ADD reg-reg base, shared with `add`'s reg-reg variant). A scale!=1 (typed-array Gep scaling by sizeof(T)) needs the shifted form `ADD Xd,Xn,Xm,LSL #log2(scale)` — a FUTURE consumer (D-AS4-ARM64-INDEXED-LEA-SCALE, co-design with ML6 address-mode synthesis), NOT built speculatively.",
             "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"] },
             "template":   { "fixedWord": 2332033024 },
@@ -1482,6 +1632,35 @@
       }
     },
     {
+      "$comment": "c78 (D-CSUBSET-FLOAT-NEG-ENCODING): FNEG Dd, Dn — scalar double floating-point NEGATE, FP data-processing (1 source). arm64 has a NATIVE fp-negate (unlike x86, which has no fneg instruction and takes the sign-mask XORPD fallback in mir_to_lir — the two realizations diverge by CAPABILITY, probed via this opcode's declared-encoding presence). IEEE-exact by construction: FNEG flips ONLY the sign bit (bit 63), so -(+0.0)=-0.0, -(-0.0)=+0.0, and -NaN preserves the payload while flipping the sign — the signed-zero + NaN-sign semantics C requires. Base 0x1E614000 = 000 11110 [31:24] | ftype=01 double [23:22] | 1 [21] | opcode=000010 FNEG [20:15] | 10000 [14:10] | Rn [9:5] | Rd [4:0] (ARM ARM C7.2 FNEG scalar; opcode 000001 would be FABS, 000000 FMOV). 1-source NATIVE — Rd (result), Rn (wire 0 = the value negated). NO requires2Address (Rd and Rn are independent, like neg/not). F32 sibling FNEG Sd, Sn = ftype=00 -> base 0x1E214000 rides the width axis (D-form keyed 64, S-form keyed 32).",
+      "mnemonic":      "fneg",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 509689856 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "FNEG Sd, Sn — ftype=00 single, base 0x1E214000 = 505495552.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 505495552 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "FC3.5 sweep-c2 (FCmp LIR lowering): FCMP Dn, Dm — floating-point compare writing NZCV, no register result (the float sibling of `cmp`). Base 0x1E602000 = 000 11110 [31:24] | ftype=01 [23:22] | 1 [21] | Rm [20:16] | op=00 [15:14] | 1000 [13:10] | Rn [9:5] | opcode2=00000 [4:0] (ARM ARM C7.2 FCMP; opcode2 bit4=1 would be FCMPE, the signaling form — DSS does not model the FP environment, so the quiet FCMP serves all predicates; the NZCV comparison RESULTS are identical). F32 sibling FCMP Sn, Sm = 0x1E202000 (ftype=00). NZCV outcomes: equal → Z=1(C=1); less → N=1; greater → C=1; unordered → C=1,V=1 — the truth table the float condCodeEncoding arms below realize (full derivation at mir_to_lir floatCmpPlan).",
       "mnemonic":      "fcmp",
       "result":        "none",
@@ -1564,6 +1743,96 @@
             "$comment": "FC3.5: FCVTZS Xd, Sn — ftype=00 single source, base 0x9E380000.",
             "guard":      { "operandKinds": ["reg"], "width": 32 },
             "template":   { "fixedWord": 2654470144 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "c92 (D-CSUBSET-FP-TO-UI-CODEGEN, the c78 arm64 residual): FCVTZU — float to UNSIGNED integer, round toward zero. The EXACT MIRROR of fp_to_si above: same 'Conversion between FP and integer' group, same field layout (sf [31] | 00 | 11110 [28:24] | ftype [23:22] | 1 [21] | rmode=11 toward-zero [20:19] | opcode [18:16] | 000000 [15:10] | Rn [9:5] | Rd [4:0]), opcode=001 FCVTZU where FCVTZS is 000 (+0x00010000). Same SOURCE-float-width axis (the mir_to_lir FPToUI arm threads the source's width, c78) and the same FIXED X destination as fp_to_si — a U32 result reads the low 32 bits of the Xd result, VALUE-CORRECT for any double/float in [0, 2^32) (the arm64 analog of x86 fp_to_ui's CVTTSD2SI r64 low-32 convention; gcc's `fcvtzu w0, d0` agrees on every in-range value, out-of-range is C 6.3.1.4p1 UB). ★ UNLIKE x86 (whose signed CVTTSD2SI needs the deferred >2^63 conditional-subtract, D-CSUBSET-UI-FROM-FP-UNSIGNED-I64), FCVTZU Xd covers the FULL unsigned-i64 range NATIVELY — that anchor is x86-ONLY; the arm64 leg has NO >2^63 residual (gcc emits the identical `fcvtzu x0, d0`). MIR FPToUI is the producer. FCVTZU Xd,Dn = 0x9E790000 = FCVTZS Xd,Dn[0x9E780000] | opcode bit [0x00010000]; FCVTZU Xd,Sn = 0x9E390000 = FCVTZS Xd,Sn[0x9E380000] | 0x00010000 (both cross-checked against the ARM ARM field decode above + aarch64-gcc objdump).",
+      "mnemonic":      "fp_to_ui",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "$comment": "F64 source → FCVTZU Xd, Dn — ftype=01 double, base 0x9E790000 (the low 32 bits are the in-range U32 result; the full Xd is the NATIVE full-range U64).",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2658729984 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "F32 source → FCVTZU Xd, Sn — ftype=00 single, base 0x9E390000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 2654535680 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-INT-FLOAT-CONVERSION (int→float): SCVTF — Scalar Convert Signed integer to Floating-point. The REVERSE of FCVTZS above. 'Conversion between FP and integer' group: sf [31] | 00 [30:29] | 11110 [28:24] | ftype [23:22] | 1 [21] | rmode=00 [20:19] | opcode=010 SCVTF [18:16] | 000000 [15:10] | Rn [9:5] | Rd [4:0]. The result is FPR-class (regClassFor sees the F64 MIR result) — rd carries the D destination, the rn wire the X/W integer source; the 5-bit slots are class-blind hwEncodings, exactly the GPR-src/FPR-dest split x86's cvtsi2sd makes through modrm.rm/modrm.reg. MIR SIToFP is the producer. The width axis keys on the SOURCE INTEGER width (the mir_to_lir SIToFP arm threads the source's int width): a 64-bit source -> SCVTF Dd, Xn (sf=1, width=64), a 32-bit source -> SCVTF Dd, Wn (sf=0, width=32). UNLIKE x86's single REX.W bit, arm64 sf+ftype are INDEPENDENT, so BOTH source-int widths keep ftype=01 (the F64 DESTINATION, Dd) — `Dd,Wn` is the i32->f64 form, the arm64 analog of cvtsi2sd xmm,r32. DESIGN NOTE (audit + qemu-arm64 scrutiny — verify these fixedWords on real hardware): dest fixed at F64/Dd this cycle (the dominant + sqlite-blocking i64->double case); int->F32 (ftype=00, Sd) is FAIL-LOUD at the mir_to_lir SIToFP arm (a deferred narrow gap, D-CSUBSET-INT-TO-F32-CODEGEN). SCVTF Dd,Xn = 0x9E620000 = sf=1[0x80000000] | 11110[0x1E000000] | ftype=01[0x00400000] | bit21[0x00200000] | opcode=010[0x00020000]; SCVTF Dd,Wn = 0x1E620000 (same MINUS the sf bit). Cross-checked against the config's FCVTZS Dn base 0x9E780000 (opcode=000, rmode=11) — same field decode.",
+      "mnemonic":      "si_to_fp",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "$comment": "SCVTF Dd, Xn — sf=1 64-bit signed source -> double. base 0x9E620000. The sqlite i64 -> volatile double blocker.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2657222656 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "SCVTF Dd, Wn — sf=0 32-bit signed source -> double. base 0x1E620000 (the arm64 analog of cvtsi2sd xmm,r32; an I32 fits the F64 result exactly).",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 509739008 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-INT-FLOAT-CONVERSION (int→float, unsigned): UCVTF — Scalar Convert Unsigned integer to Floating-point. Same 'Conversion between FP and integer' group as SCVTF but opcode=011 [18:16] (the unsigned sibling). MIR UIToFP is the producer; the SOURCE-int-width axis matches si_to_fp (width=64 -> UCVTF Dd,Xn, width=32 -> UCVTF Dd,Wn). Dest fixed F64/Dd (U->F32 deferred D-CSUBSET-INT-TO-F32-CODEGEN). Unlike x86 SSE2 (which has no unsigned cvt and must fall back to cvtsi2sd), arm64 UCVTF handles the FULL unsigned i64 range natively — so the arm64 ui_to_fp is value-correct where x86's signed-cvt fallback is not (the deferred D-CSUBSET-UI-TO-FP-UNSIGNED-I64 is an x86-only gap; sqlite does not hit it on either target). UCVTF Dd,Xn = 0x9E630000 = SCVTF Dd,Xn[0x9E620000] | opcode bit [0x00010000]; UCVTF Dd,Wn = 0x1E630000.",
+      "mnemonic":      "ui_to_fp",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "$comment": "UCVTF Dd, Xn — sf=1 64-bit unsigned source -> double. base 0x9E630000.",
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2657288192 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "$comment": "UCVTF Dd, Wn — sf=0 32-bit unsigned source -> double. base 0x1E630000.",
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 509804544 },
             "resultSlot": "rd",
             "wires":      [
               { "index": 0, "slotKind": "rn" }

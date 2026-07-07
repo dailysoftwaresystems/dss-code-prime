@@ -333,7 +333,11 @@ TEST(HirLoweringCSubset, ForLoop) {
     EXPECT_TRUE(res->hir.forUpdate(forS).has_value());
 }
 
-TEST(HirLoweringCSubset, SwitchGroupsFlatCases) {
+// c60 (Design I-A): the switch lowers to a discriminant + a flat body Block (its
+// case/default markers are LabelStmts) + dispatch arms mapping each case value to
+// a marker ordinal. Two dispatch arms here (case 1, default); the body Block holds
+// the two case markers, each a LabelStmt.
+TEST(HirLoweringCSubset, SwitchFlattensToDispatchAndBody) {
     SemanticModel model = analyzeCSubset(
         "void f(int x) { switch (x) { case 1: break; default: break; } }");
     ASSERT_FALSE(model.hasErrors());
@@ -348,49 +352,27 @@ TEST(HirLoweringCSubset, SwitchGroupsFlatCases) {
     ASSERT_EQ(arms.size(), 2u);
     EXPECT_FALSE(res->hir.caseArmIsDefault(arms[0]));   // case 1
     EXPECT_TRUE(res->hir.caseArmIsDefault(arms[1]));     // default
+    // The body Block holds the two case markers (LabelStmts) at its top level.
+    HirNodeId const body = res->hir.switchBody(sw);
+    ASSERT_EQ(res->hir.kind(body), HirKind::Block);
+    auto const bodyStmts = res->hir.children(body);
+    ASSERT_GE(bodyStmts.size(), 2u);
+    EXPECT_EQ(res->hir.kind(bodyStmts[0]), HirKind::LabelStmt);   // case 1 marker
+    // Each dispatch arm's ordinal names a LabelStmt marker that exists in the body.
+    EXPECT_EQ(res->hir.caseArmLabelOrdinal(arms[0]),
+              res->hir.labelOrdinal(bodyStmts[0]));
 }
 
-// D-CSUBSET-LABEL-BEFORE-CASE — the load-bearing equivalence (MF-3): a goto-label
-// BEFORE a case (`foo: case 1: S`) lowers to the SAME HIR as the long-supported
-// label AFTER the colon (`case 1: foo: S`) — arm(value 1, body=[LabelStmt(foo, S), …]).
-// The label stays a real LabelStmt node (so it is pre-scanned + goto-resolvable).
-TEST(HirLoweringCSubset, LabelBeforeCaseNestsLikeLabelAfterColon) {
-    struct Shape { std::size_t arms; bool def0; HirKind body0; std::uint32_t ord; bool ok; };
-    auto shapeOf = [](std::string src) -> Shape {
-        SemanticModel model = analyzeCSubset(std::move(src));
-        DiagnosticReporter r;
-        auto res = lowerToHir(model, r);
-        if (model.hasErrors() || !res->ok) return {0, false, HirKind::Error, 0, false};
-        HirNodeId fn = firstFunction(res->hir);
-        HirNodeId sw = res->hir.children(res->hir.functionBody(fn))[0];
-        if (res->hir.kind(sw) != HirKind::SwitchStmt) return {0, false, HirKind::Error, 0, false};
-        auto arms = res->hir.switchArms(sw);
-        if (arms.empty()) return {0, false, HirKind::Error, 0, false};
-        auto body0 = res->hir.caseArmBody(arms[0]);
-        HirKind const b0 = body0.empty() ? HirKind::Error : res->hir.kind(body0[0]);
-        std::uint32_t const ord = (b0 == HirKind::LabelStmt) ? res->hir.labelOrdinal(body0[0]) : 9999u;
-        return { arms.size(), res->hir.caseArmIsDefault(arms[0]), b0, ord, true };
-    };
-    Shape const before = shapeOf("void f(int x){ switch(x){ foo: case 1: x=x+1; break; default: break; } }");
-    Shape const after  = shapeOf("void f(int x){ switch(x){ case 1: foo: x=x+1; break; default: break; } }");
-    ASSERT_TRUE(before.ok);
-    ASSERT_TRUE(after.ok);
-    EXPECT_EQ(before.arms, 2u);
-    EXPECT_EQ(before.arms, after.arms);
-    EXPECT_FALSE(before.def0);
-    EXPECT_FALSE(after.def0);
-    EXPECT_EQ(before.body0, HirKind::LabelStmt);     // label nests at the arm's entry
-    EXPECT_EQ(after.body0,  HirKind::LabelStmt);
-    EXPECT_EQ(before.ord, after.ord);                // same label, same arm entry
-}
-
-// D-CSUBSET-LABEL-BEFORE-CASE Finding 2 — the speculative switchBodyItem must keep
-// the FLAT reading for a BARE case: `case 1: x=…;` groups as caseLabel + a plain
-// body stmt, NEVER a LabelStmt- or caseStmt-wrapped arm. Guards MF-3 against a
-// future reorder of the speculative branches.
-TEST(HirLoweringCSubset, BareCaseStaysFlatNoLabelWrapper) {
+// D-CSUBSET-LABEL-BEFORE-CASE (c60, Design I-A) — a goto-label BEFORE a case
+// (`foo: case 1: S`) parses as labelStmt(foo, caseStmt(case 1, S)) and lowers to a
+// flat-body marker chain: the body's first statement is LabelStmt(foo, ...) whose
+// inner is the case-1 marker LabelStmt (its ordinal = the dispatch arm's ordinal).
+// `foo` stays a real LabelStmt (pre-scanned + goto-resolvable); the case dispatches
+// to its own marker. (The label AFTER the colon — `case 1: foo: S` — nests the case
+// marker OUTSIDE foo; both are valid C, only the relative nesting differs.)
+TEST(HirLoweringCSubset, LabelBeforeCaseLowersToMarkerChain) {
     SemanticModel model = analyzeCSubset(
-        "void f(int x){ switch(x){ case 1: x=x+1; break; default: break; } }");
+        "void f(int x){ switch(x){ foo: case 1: x=x+1; break; default: break; } }");
     ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
@@ -400,9 +382,38 @@ TEST(HirLoweringCSubset, BareCaseStaysFlatNoLabelWrapper) {
     ASSERT_EQ(res->hir.kind(sw), HirKind::SwitchStmt);
     auto arms = res->hir.switchArms(sw);
     ASSERT_EQ(arms.size(), 2u);
-    auto body0 = res->hir.caseArmBody(arms[0]);
-    ASSERT_FALSE(body0.empty());
-    EXPECT_NE(res->hir.kind(body0[0]), HirKind::LabelStmt);   // NOT label-wrapped
+    EXPECT_FALSE(res->hir.caseArmIsDefault(arms[0]));   // case 1
+    // body[0] = LabelStmt(foo, LabelStmt(caseMarker, …)); the inner case marker's
+    // ordinal equals the case-1 dispatch arm's ordinal.
+    auto const bodyStmts = res->hir.children(res->hir.switchBody(sw));
+    ASSERT_FALSE(bodyStmts.empty());
+    ASSERT_EQ(res->hir.kind(bodyStmts[0]), HirKind::LabelStmt);   // the named `foo`
+    HirNodeId const inner = res->hir.labelBody(bodyStmts[0]);
+    ASSERT_EQ(res->hir.kind(inner), HirKind::LabelStmt);          // the case-1 marker
+    EXPECT_EQ(res->hir.labelOrdinal(inner), res->hir.caseArmLabelOrdinal(arms[0]));
+}
+
+// c60 (Design I-A) — a BARE case (`case 1: x=…;`) lowers to a case-1 marker
+// LabelStmt whose body is the real statement (the AssignStmt/ExprStmt), with NO
+// stray nested caseStmt. The marker IS a LabelStmt (every case is a marker now),
+// but its single body must reach the case's own statement directly.
+TEST(HirLoweringCSubset, BareCaseMarkerWrapsTheBodyStatement) {
+    SemanticModel model = analyzeCSubset(
+        "void f(int x){ switch(x){ case 1: x=x+1; break; default: break; } }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    HirNodeId sw = res->hir.children(res->hir.functionBody(fn))[0];
+    ASSERT_EQ(res->hir.kind(sw), HirKind::SwitchStmt);
+    auto const bodyStmts = res->hir.children(res->hir.switchBody(sw));
+    ASSERT_GE(bodyStmts.size(), 1u);
+    ASSERT_EQ(res->hir.kind(bodyStmts[0]), HirKind::LabelStmt);   // case 1 marker
+    // The marker's inner is the case body (an assignment), NOT another caseStmt/
+    // label wrapper.
+    HirNodeId const inner = res->hir.labelBody(bodyStmts[0]);
+    EXPECT_NE(res->hir.kind(inner), HirKind::LabelStmt);
 }
 
 // D-CSUBSET-LABEL-BEFORE-CASE guard — a `caseStmt` that is not a direct switch-body
@@ -416,12 +427,12 @@ TEST(HirLoweringCSubset, CaseLabelOutsideSwitchFailsLoud) {
     EXPECT_GE(countCode(r, DiagnosticCode::S_CaseLabelNotInSwitch), 1u);
 }
 
-// D-CSUBSET-LABEL-BEFORE-CASE — the multi-label ADJACENT-case chain (the iterative
-// lowerCaseChain `continue` + empty-arm makeSkip path) AND a label before `default`,
-// the two forms the corpus/equivalence pins do not exercise. `foo: case 1: case 2: S`
-// → arm(1, [LabelStmt(foo, {})]) (empty, label-marked) + arm(2, [S, …]); `bar: default:`
-// → the default arm's body starts with LabelStmt(bar).
-TEST(HirLoweringCSubset, LabelBeforeAdjacentCasesAndDefaultChainArms) {
+// c60 (Design I-A) — the multi-label ADJACENT-case chain + a label before
+// `default`. `foo: case 1: case 2: S` parses as labelStmt(foo, caseStmt(1,
+// caseStmt(2, S))) → body[0] = LabelStmt(foo, LabelStmt(case1, LabelStmt(case2,
+// S))); `bar: default: S2` → LabelStmt(bar, LabelStmt(default, S2)). Three dispatch
+// arms (case 1, case 2, default), each with a distinct marker ordinal.
+TEST(HirLoweringCSubset, LabelBeforeAdjacentCasesAndDefaultMarkerChain) {
     SemanticModel model = analyzeCSubset(
         "void f(int x){ switch(x){ foo: case 1: case 2: x=x+1; break; "
         "bar: default: x=x+9; break; } }");
@@ -434,21 +445,97 @@ TEST(HirLoweringCSubset, LabelBeforeAdjacentCasesAndDefaultChainArms) {
     ASSERT_EQ(res->hir.kind(sw), HirKind::SwitchStmt);
     auto arms = res->hir.switchArms(sw);
     ASSERT_EQ(arms.size(), 3u);                          // case 1, case 2, default
-    // arm 0 = case 1: empty body, label-marked at entry (LabelStmt(foo, {}))
-    EXPECT_FALSE(res->hir.caseArmIsDefault(arms[0]));
-    auto b0 = res->hir.caseArmBody(arms[0]);
-    ASSERT_FALSE(b0.empty());
-    EXPECT_EQ(res->hir.kind(b0[0]), HirKind::LabelStmt);
-    // arm 1 = case 2: the real body statement, NOT label-wrapped
-    EXPECT_FALSE(res->hir.caseArmIsDefault(arms[1]));
-    auto b1 = res->hir.caseArmBody(arms[1]);
-    ASSERT_FALSE(b1.empty());
-    EXPECT_NE(res->hir.kind(b1[0]), HirKind::LabelStmt);
-    // arm 2 = default: label-before-default → body starts with LabelStmt(bar)
-    EXPECT_TRUE(res->hir.caseArmIsDefault(arms[2]));
-    auto b2 = res->hir.caseArmBody(arms[2]);
-    ASSERT_FALSE(b2.empty());
-    EXPECT_EQ(res->hir.kind(b2[0]), HirKind::LabelStmt);
+    EXPECT_FALSE(res->hir.caseArmIsDefault(arms[0]));    // case 1
+    EXPECT_FALSE(res->hir.caseArmIsDefault(arms[1]));    // case 2
+    EXPECT_TRUE(res->hir.caseArmIsDefault(arms[2]));     // default
+    // Distinct ordinals for the three markers.
+    EXPECT_NE(res->hir.caseArmLabelOrdinal(arms[0]), res->hir.caseArmLabelOrdinal(arms[1]));
+    EXPECT_NE(res->hir.caseArmLabelOrdinal(arms[1]), res->hir.caseArmLabelOrdinal(arms[2]));
+    // body[0] = LabelStmt(foo, LabelStmt(case1, LabelStmt(case2, …))).
+    auto const bodyStmts = res->hir.children(res->hir.switchBody(sw));
+    ASSERT_FALSE(bodyStmts.empty());
+    ASSERT_EQ(res->hir.kind(bodyStmts[0]), HirKind::LabelStmt);       // foo
+    HirNodeId const c1 = res->hir.labelBody(bodyStmts[0]);
+    ASSERT_EQ(res->hir.kind(c1), HirKind::LabelStmt);                 // case 1 marker
+    EXPECT_EQ(res->hir.labelOrdinal(c1), res->hir.caseArmLabelOrdinal(arms[0]));
+    HirNodeId const c2 = res->hir.labelBody(c1);
+    ASSERT_EQ(res->hir.kind(c2), HirKind::LabelStmt);                 // case 2 marker
+    EXPECT_EQ(res->hir.labelOrdinal(c2), res->hir.caseArmLabelOrdinal(arms[1]));
+}
+
+// D-CSUBSET-LABEL-BUDGET-CLIFF (p19 Cluster G c31) — the `commitAfterPrefix`
+// CUT lets `declOrExprStmt`'s `labelStmt` probe COMMIT after its 2-token fixed
+// prefix (`Identifier Colon`) is consumed, so the (arbitrarily large) labeled
+// `statement` then parses NON-speculatively (off the lookahead*16 = 4096-token
+// probe budget). This pin builds a label before a statement whose token count
+// is FAR over 4096; with the cut it parses clean, lowers, and runs. RED-ON-
+// DISABLE: revert `"commitAfterPrefix": true` on labelStmt (or the parser cut)
+// and the labelStmt probe exhausts its budget, rolls back, falls through to
+// exprStmt, and emits P0001 ("got ':'") — `model.hasErrors()` then trips the
+// ASSERT below. The body (`i = i + vN`, fold-resistant on a parameter) also
+// makes the result observable so the labeled block is not DCE'd to nothing.
+TEST(HirLoweringCSubset, LabelBeforeOversizeStatementParsesPastProbeBudget) {
+    // ~500 statements inside the labeled block ⇒ ~5500 tokens, comfortably
+    // over the 4096-token speculative-probe budget (lookahead 256 * 16).
+    std::string src = "int f(int i){\n  L: {\n";
+    for (int n = 0; n < 500; ++n) {
+        src += "    int v" + std::to_string(n) + " = " + std::to_string(n)
+             + "; i = i + v" + std::to_string(n) + ";\n";
+    }
+    src += "  }\n  return i;\n}\n";
+    SemanticModel model = analyzeCSubset(std::move(src));
+    // The load-bearing assertion: a clean front end. On revert this is the
+    // P0001 'got :' from the budget rollback.
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId fn = firstFunction(res->hir);
+    ASSERT_EQ(res->hir.kind(fn), HirKind::Function);
+    auto body = res->hir.children(res->hir.functionBody(fn));
+    ASSERT_EQ(body.size(), 2u);                           // labeled block + return
+    EXPECT_EQ(res->hir.kind(body[0]), HirKind::LabelStmt);
+    EXPECT_EQ(res->hir.kind(res->hir.labelBody(body[0])), HirKind::Block);
+}
+
+// ★★ BRACELESS-BODY CORRECTNESS — the silent-miscompile guard for the cut.
+// `labelStmt` STAYS `Identifier Colon statement`, so a label in a braceless
+// control-flow body keeps its labeled statement AS that body: in
+// `if(x) L: g=42;` the `L: g=42` IS the if's then-branch, NOT a sibling that
+// runs unconditionally. Were labelStmt ever flattened to a 2-token statement
+// (label + a SEPARATE following statement), `g=42` would detach from the `if`
+// and execute even when `x==0` — a C-semantics miscompile that runs green on
+// any test that only checks the x!=0 path. This pin pins the STRUCTURE: the
+// if's then-branch is the LabelStmt, and the assignment hangs UNDER it. The
+// `label_before_switch_goto` runtime corpus is the executable companion; the
+// gate's `f(0)→5` (the assignment is skipped) is the same property at runtime.
+TEST(HirLoweringCSubset, LabelAsBracelessIfBodyStaysInsideTheIf) {
+    SemanticModel model = analyzeCSubset(
+        "int g; int f(int x){ g = 5; if(x) L: g = 42; return g; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    // f is the SECOND module decl (g is the first — a global var).
+    HirNodeId fn{};
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) == HirKind::Function) { fn = d; break; }
+    }
+    ASSERT_TRUE(fn.valid());
+    auto body = res->hir.children(res->hir.functionBody(fn));
+    // EXACTLY three statements: `g=5`, the `if`, `return g`. A flattened label
+    // would make `g=42` a FOURTH sibling here (and the if's then-branch empty).
+    ASSERT_EQ(body.size(), 3u);
+    EXPECT_EQ(res->hir.kind(body[0]), HirKind::AssignStmt);   // g = 5
+    ASSERT_EQ(res->hir.kind(body[1]), HirKind::IfStmt);       // if (x) ...
+    EXPECT_EQ(res->hir.kind(body[2]), HirKind::ReturnStmt);   // return g
+    // The if's then-branch IS the label, and `g=42` hangs under it. (The
+    // assignment lowers to AssignStmt — the load-bearing structural fact is
+    // that it nests UNDER the LabelStmt UNDER the if, not that it is a
+    // sibling of the if running unconditionally.)
+    HirNodeId thenBranch = res->hir.ifThen(body[1]);
+    ASSERT_EQ(res->hir.kind(thenBranch), HirKind::LabelStmt);
+    EXPECT_EQ(res->hir.kind(res->hir.labelBody(thenBranch)), HirKind::AssignStmt);
 }
 
 TEST(HirLoweringCSubset, CallAndTypedef) {
@@ -765,6 +852,63 @@ TEST(HirLoweringCSubset, TopLevelDeclaresNothingFailsLoudNoCrash) {
         << "`int ;` declares nothing — lowering must fail loud, not accept";
     EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
         << "exactly one S_DeclarationDeclaresNothing for the empty `int ;` decl";
+}
+
+// c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: a body-PRESENT specifier WITH a
+// declarator (`struct S { int x; } v;`) is a definition-introducing global — it
+// lowers cleanly (the `compositeSpecifierIsDefinition` gate admits it because its
+// body child is present). The body-ABSENT counterpart (`struct S;`) is now a
+// FORWARD DECLARATION (c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION): it mints an
+// opaque tag at the semantic tier and lowers to NOTHING (no TypeDecl, no fail) —
+// pinned in TopLevelForwardStructDeclLowersToNothing below. RED-on-disable: if
+// the body-present gate were inverted, THIS would spuriously fail-loud.
+TEST(HirLoweringCSubset, StructDefinitionWithObjectLowersClean) {
+    SemanticModel model = analyzeCSubset(
+        "struct S { int x; } v;\nint main(void) { return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 0u)
+        << "`struct S { int x; } v;` declares an object — must NOT fail loud";
+}
+
+// c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: a bare top-level FORWARD declaration
+// (`struct S;` — a body-ABSENT NAMED composite specifier) is the opaque-tag
+// declaration. The semantic tier minted the incomplete tag; the HIR lowering must
+// emit NOTHING and must NOT fail loud (it is NOT a declares-nothing constraint
+// violation). RED-on-disable: drop the `findForwardCompositeSpecifierIn` no-op arm
+// and the bare forward decl re-emits S_DeclarationDeclaresNothing (res->ok false).
+// Contrast TopLevelDeclaresNothingFailsLoudNoCrash (`int ;`, NO tag → still loud).
+TEST(HirLoweringCSubset, TopLevelForwardStructDeclLowersToNothing) {
+    SemanticModel model = analyzeCSubset(
+        "struct S;\nint main(void) { return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 0u)
+        << "`struct S;` is a forward declaration of an opaque tag — must NOT fail loud";
+}
+
+// c35: the LOCAL twin — a bare `struct S;` as a block STATEMENT is a (block-scoped)
+// forward declaration; lowers to nothing, no fail-loud. Contrast
+// LocalDeclaresNothingFailsLoud (`int;`, NO tag → still loud).
+TEST(HirLoweringCSubset, LocalForwardStructDeclLowersToNothing) {
+    SemanticModel model = analyzeCSubset(
+        "int main(void){ struct S; return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 0u)
+        << "a block-scoped `struct S;` forward declaration must NOT fail loud";
 }
 
 // D5.1: a struct used as a pointer-typed parameter + member access via `->`
@@ -3271,11 +3415,12 @@ TEST(HirLoweringCSubset, D5_5_LiftOptOutRespected) {
     std::string const target =
         "\"compositeKind\": \"enum\",\n"
         "                           \"liftToEnclosingScope\": true";
-    // The enum-composite lift flag now rides ONE row — the `enumSpecifierBody`
-    // (the dead statement-position `enumDecl` row was deleted in the struct-head
-    // closing cycle, D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). Flip EVERY
-    // occurrence so the opt-out is total — the bare-name `A` below (its enum is
-    // parsed via `enumSpecifierBody`) must then resolve through NO lift.
+    // The enum-composite lift flag now rides ONE row — the unified `enumSpec`
+    // (c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER REPLACED the `enumSpecifierBody`
+    // row; the dead statement-position `enumDecl` row was deleted earlier in
+    // D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). Flip EVERY occurrence so the
+    // opt-out is total — the bare-name `A` below (its enum is parsed via the
+    // unified `enumSpec`) must then resolve through NO lift.
     std::size_t flipped = 0;
     for (auto pos = text.find(target); pos != std::string::npos;
          pos = text.find(target, pos)) {
@@ -3484,26 +3629,55 @@ TEST(HirLoweringCSubset, DeepNestedSwitchLowersFlatOnNormalStack) {
     auto res = lowerToHir(model, r);   // lower on THIS (main) stack — flat witness
     ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
 
-    // Shape walk: descend the SwitchStmt backbone. The body's switch is level 0;
-    // each level's FIRST arm (case 1) body's first statement is the next switch,
-    // kDepth deep, the innermost arm body holding the `return`. A dropped level or
-    // mis-grouped arm breaks the count here.
+    // Shape walk (c60, Design I-A): descend the SwitchStmt backbone. The body's
+    // switch is level 0; each level's body Block holds the case-1 marker
+    // (LabelStmt, ordinal = arms[0]) whose inner statement is the next switch,
+    // kDepth deep, the innermost case-1 marker wrapping the `return`. A dropped
+    // level or mis-built dispatch breaks the count here.
     HirNodeId const fnBody =
         res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
     auto const bodyStmts = res->hir.children(fnBody);
     // children: [VarDecl x, SwitchStmt, ReturnStmt].
     ASSERT_GE(bodyStmts.size(), 2u);
+    // `case 1: switch(...)` parses as a BARE caseLabel item + the switch as the NEXT
+    // switchBodyItem (the speculative switchBodyItem takes the caseLabel first), so
+    // each level's body Block is [case-1 marker(Skip), <next switch or return>,
+    // default marker]. Descend by locating the case-1 marker then the FIRST
+    // SwitchStmt/ReturnStmt sibling after it.
+    auto descendCase1 = [&](HirNodeId sw) -> HirNodeId {
+        auto const arms = res->hir.switchArms(sw);
+        if (arms.size() < 2u || res->hir.caseArmIsDefault(arms[0])
+            || !res->hir.caseArmIsDefault(arms[1])) return HirNodeId{};
+        std::uint32_t const c1Ord = res->hir.caseArmLabelOrdinal(arms[0]);
+        auto const kids = res->hir.children(res->hir.switchBody(sw));
+        bool seenMarker = false;
+        for (HirNodeId s : kids) {
+            if (!seenMarker) {
+                if (res->hir.kind(s) == HirKind::LabelStmt
+                    && res->hir.labelOrdinal(s) == c1Ord) {
+                    seenMarker = true;
+                    // The marker may directly wrap the next construct (caseStmt form)
+                    // — if so, descend into it.
+                    HirNodeId const inner = res->hir.labelBody(s);
+                    if (res->hir.kind(inner) == HirKind::SwitchStmt
+                        || res->hir.kind(inner) == HirKind::ReturnStmt)
+                        return inner;
+                }
+                continue;
+            }
+            if (res->hir.kind(s) == HirKind::SwitchStmt
+                || res->hir.kind(s) == HirKind::ReturnStmt)
+                return s;
+        }
+        return HirNodeId{};
+    };
     HirNodeId cur = bodyStmts[1];
     int switchLevels = 0;
     while (res->hir.kind(cur) == HirKind::SwitchStmt) {
         ++switchLevels;
-        auto const arms = res->hir.switchArms(cur);
-        ASSERT_GE(arms.size(), 2u) << "each level is case 1 + default";
-        EXPECT_FALSE(res->hir.caseArmIsDefault(arms[0]));   // arm 0 = case 1
-        EXPECT_TRUE(res->hir.caseArmIsDefault(arms[1]));     // arm 1 = default
-        auto const arm0Body = res->hir.caseArmBody(arms[0]);
-        ASSERT_FALSE(arm0Body.empty());
-        cur = arm0Body[0];                                   // descend into case 1's body
+        HirNodeId const next = descendCase1(cur);
+        ASSERT_TRUE(next.valid()) << "case-1 descent failed at level " << switchLevels;
+        cur = next;
     }
     // The innermost case-1 body is the `return 0;`.
     EXPECT_EQ(res->hir.kind(cur), HirKind::ReturnStmt);
@@ -3667,4 +3841,450 @@ TEST(HirLoweringCSubset, NonLvalueIncDecFailsLoud) {
         EXPECT_FALSE(res->ok) << src;
         EXPECT_EQ(countCode(r, DiagnosticCode::S_IncDecNeedsModifiableLvalue), 1u) << src;
     }
+}
+
+// c28 D-CSUBSET-LOCAL-TYPE-DEFINITION: a BLOCK-SCOPED struct/union/enum
+// DEFINITION with NO declarator (`struct S { … };` as a statement — sqlite3.c:
+// 68508 walMergesort) lowers CLEANLY: the type is minted + interned at the
+// SEMANTIC tier (the unified c25 define path), so the no-declarator statement
+// needs no runtime HIR node, and a later `struct S v; v.a` resolves through the
+// interned type. RED-on-disable: revert the optional-list grammar tweak → P0009
+// at parse (the front-end gate in analyzeCSubset fails first).
+TEST(HirLoweringCSubset, LocalStructDefinitionLowersClean) {
+    SemanticModel model = analyzeCSubset(
+        "int main(void){ struct S { int a; int b; }; struct S v; v.a = 1; "
+        "return v.a; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+            : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 0u)
+        << "a block-scoped struct DEFINITION declares a type — must NOT fail loud";
+}
+
+// c28: a local define+declare (`struct S { … } v;`) still lowers cleanly (the
+// declarator IS present — the ordinary path), and a local REFERENCE to an
+// outer-defined tag (`struct S v;`) resolves. RED-on-disable: if the optional
+// list mis-routed the declarator-present form, these regress.
+TEST(HirLoweringCSubset, LocalStructDefineAndDeclareAndRefLowerClean) {
+    SemanticModel m1 = analyzeCSubset(
+        "int main(void){ struct S { int a; } v; v.a = 7; return v.a; }\n");
+    ASSERT_FALSE(m1.hasErrors())
+        << (m1.diagnostics().all().empty() ? std::string{}
+            : m1.diagnostics().all()[0].actual);
+    DiagnosticReporter r1;
+    auto res1 = lowerToHir(m1, r1);
+    EXPECT_TRUE(res1->ok) << (r1.all().empty() ? "" : r1.all()[0].actual);
+
+    SemanticModel m2 = analyzeCSubset(
+        "struct S { int a; };\n"
+        "int main(void){ struct S v; v.a = 3; return v.a; }\n");
+    ASSERT_FALSE(m2.hasErrors())
+        << (m2.diagnostics().all().empty() ? std::string{}
+            : m2.diagnostics().all()[0].actual);
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(m2, r2);
+    EXPECT_TRUE(res2->ok) << (r2.all().empty() ? "" : r2.all()[0].actual);
+}
+
+// c28: a NON-defining no-declarator LOCAL (`int;`) declares nothing (C 6.7p2).
+// Mirroring the top-level `int ;` (TopLevelDeclaresNothingFailsLoudNoCrash), the
+// front end (parse + semantic) ACCEPTS it, and the HIR lowering FAILS LOUD with
+// S_DeclarationDeclaresNothing — the local twin of the top-level no-object path
+// (lowerVarLikeInto: an empty list-mode declarator carrier with NO composite
+// specifier in the head). Must NOT crash and must NOT silently accept.
+// RED-on-disable: drop the lowerVarLikeInto declares-nothing guard → res->ok
+// stays true and the count is 0 (a silent accept).
+TEST(HirLoweringCSubset, LocalDeclaresNothingFailsLoud) {
+    SemanticModel model = analyzeCSubset("int main(void){ int; return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "parse + semantic accept `int;` — the constraint is HIR-tier";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok)
+        << "`int;` (no declarator, no tag) declares nothing — lowering must fail loud";
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
+        << "exactly one S_DeclarationDeclaresNothing for the empty local `int;`";
+}
+
+// c89 (D-CSUBSET-SIZEOF-VALUE-OPERAND-TYPE): the VALUE-form sizeof operand is
+// sized by its full EXPRESSION type (C 6.5.3.4) — the tier-boundary pin for the
+// Pass-2 sizeofValueRule operand stamp at its exact consumption point: the
+// HirKind::SizeOf node's TypeRef child. Pre-c89, Pass 2 left operator nodes
+// unstamped and lowerSizeof's resolveStampedTypeBelow DFS sailed past the
+// unstamped `*p`/`tab[0]` into the base IDENTIFIER leaf: sizeof(*p) carried
+// Ptr<Big> (folding 8, not 48), sizeof(tab[0]) carried the WHOLE Array (336),
+// and sizeof(&tab) carried the Array — sqlite's pthreadMutexAlloc
+// `sqlite3MallocZero(sizeof(*p))` under-allocated 8 for the 40-byte recursive
+// mutex → glibc's own mutex-init writes clobbered the malloc top chunk →
+// deterministic sysmalloc SIGABRT on every invocation (the c88 smoke wall).
+// The corpus witness (examples/c-subset/sizeof_value_expression) proves the
+// folded VALUES end-to-end; THIS pin names the tier, so a future Pass-2
+// refactor that drops the operand stamp fails HERE, not three tiers later.
+// RED-ON-DISABLE: revert the Pass-2 stamp → [0] kind flips Struct→Ptr,
+// [1] Struct→Array, [2] Struct→Ptr, [3] pointee flips Array→Big(Struct);
+// every EXPECT below flips.
+TEST(HirLoweringCSubset, SizeofValueOperandCarriesExpressionType) {
+    SemanticModel model = analyzeCSubset(
+        "struct Big { double a; double b; double c; double d; double e; "
+        "double f; };\n"
+        "static struct Big tab[7];\n"
+        "unsigned long long f(struct Big *p) {\n"
+        "    return sizeof(*p) + sizeof(tab[0]) + sizeof(p[0]) + sizeof(&tab);\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+            : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    ASSERT_TRUE(fn.valid());
+    // Collect every SizeOf in the body, pre-order = source order (the `+`
+    // chain associates left, so the DFS meets them left-to-right).
+    std::vector<HirNodeId> sizeofs;
+    auto const collect = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::SizeOf) sizeofs.push_back(n);
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    collect(collect, res->hir.functionBody(fn));
+    ASSERT_EQ(sizeofs.size(), 4u) << "four value-form sizeof sites expected";
+    auto const& ti = model.lattice().interner();
+    auto const sizedType = [&](HirNodeId szNode) -> TypeId {
+        auto const kids = res->hir.children(szNode);
+        EXPECT_EQ(kids.size(), 1u) << "SizeOf carries exactly [TypeRef]";
+        return kids.empty() ? TypeId{} : res->hir.typeId(kids.front());
+    };
+    // [0] sizeof(*p): the POINTEE struct (the sqlite pthreadMutexAlloc shape).
+    TypeId const t0 = sizedType(sizeofs[0]);
+    ASSERT_TRUE(t0.valid());
+    EXPECT_EQ(ti.kind(t0), TypeKind::Struct)
+        << "sizeof(*p) must size the pointee STRUCT, not the pointer";
+    EXPECT_EQ(ti.operands(t0).size(), 6u) << "the 6-double Big, 48 bytes";
+    // [1] sizeof(tab[0]): the array ELEMENT, never the whole array.
+    TypeId const t1 = sizedType(sizeofs[1]);
+    ASSERT_TRUE(t1.valid());
+    EXPECT_EQ(ti.kind(t1), TypeKind::Struct)
+        << "sizeof(tab[0]) must size the ELEMENT, not the whole Array "
+           "(the ArraySize idiom's denominator — pre-c89 it folded to the "
+           "numerator and ArraySize collapsed to 1)";
+    // [2] sizeof(p[0]): index through a pointer — the element again.
+    TypeId const t2 = sizedType(sizeofs[2]);
+    ASSERT_TRUE(t2.valid());
+    EXPECT_EQ(ti.kind(t2), TypeKind::Struct)
+        << "sizeof(p[0]) must size the pointee STRUCT, not the pointer";
+    // [3] sizeof(&tab): address-of yields a POINTER (8), never the array (336).
+    TypeId const t3 = sizedType(sizeofs[3]);
+    ASSERT_TRUE(t3.valid());
+    ASSERT_EQ(ti.kind(t3), TypeKind::Ptr)
+        << "sizeof(&tab) must size a POINTER-to-array";
+    ASSERT_EQ(ti.operands(t3).size(), 1u);
+    EXPECT_EQ(ti.kind(ti.operands(t3)[0]), TypeKind::Array)
+        << "…whose pointee is the Array itself";
+}
+
+// c90 (D-CSUBSET-ASSIGN-VALUE-RHS-COERCE): a plain `=` used as a VALUE stores
+// the RHS COERCED to the lvalue's type (C 6.5.16p3) — the tier-boundary pin
+// for `finishAssign`'s plain arm (and its `lowerBinary` Assign-arm mirror) at
+// the exact node the property lives on: the SeqExpr's AssignStmt VALUE child
+// must be a Cast carrying the LVALUE's type whenever the RHS type differs.
+// Pre-c90 the raw RHS node was stored un-coerced and the MIR store executed
+// at the RHS's width: an i16 comma-assign from a wider RHS partial-stored
+// (sqlite estimateTableWidth's `for(i=pTab->nCol, ...)` left i's upper half
+// stale → the 3822-element overrun → the every-SQL-statement SIGSEGV), and a
+// wider RHS over-stored past a sub-int lvalue (neighbor corruption). The
+// corpus witness (examples/c-subset/assign_value_coerce) proves the VALUES
+// end-to-end on all run legs; THIS pin names the tier, so a refactor that
+// drops either coerce fails HERE, not three tiers later at runtime.
+// RED-ON-DISABLE: revert `stored = coerce(result, lv.type).id` → the stored
+// value's kind flips Cast→Ref (the raw I32/F64 RHS) and its type flips
+// I16→I32/F64; the Cast asserts below flip. The SeqExpr node type + yield-Ref
+// type (I16) are the pre-existing yield thread and stay green.
+TEST(HirLoweringCSubset, PlainAssignAsValueStoresRhsCoercedToLvalueType) {
+    SemanticModel model = analyzeCSubset(
+        "long long g(int v, double d) {\n"
+        "    short s; int y; long long L;\n"
+        "    y = (s = v);\n"    // int RHS -> i16 lvalue (the sqlite shape)
+        "    L = (s = d);\n"    // double RHS -> i16 lvalue (the float leg)
+        "    return y + L + s;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+            : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    ASSERT_TRUE(fn.valid());
+    // Collect the value-position assigns: every SeqExpr in the body, pre-order
+    // = source order → [0] = (s = v), [1] = (s = d).
+    std::vector<HirNodeId> seqs;
+    auto const collect = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::SeqExpr) seqs.push_back(n);
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    collect(collect, res->hir.functionBody(fn));
+    ASSERT_EQ(seqs.size(), 2u) << "two value-position plain assigns expected";
+    auto const& ti = model.lattice().interner();
+    TypeKind const rhsKinds[2] = {TypeKind::I32, TypeKind::F64};
+    for (std::size_t k = 0; k < 2; ++k) {
+        HirNodeId const seq = seqs[k];
+        // The SeqExpr (the assignment-as-value) carries the LVALUE's type.
+        TypeId const seqTy = res->hir.typeId(seq);
+        ASSERT_TRUE(seqTy.valid());
+        EXPECT_EQ(ti.kind(seqTy), TypeKind::I16)
+            << "[" << k << "] the assign-as-value expression is lvalue-typed";
+        auto const stmts = res->hir.seqExprStmts(seq);
+        ASSERT_EQ(stmts.size(), 1u) << "[" << k << "] simple lvalue: no prep";
+        ASSERT_EQ(res->hir.kind(stmts[0]), HirKind::AssignStmt);
+        // THE c90 PROPERTY: the stored value is the RHS wrapped in a Cast to
+        // the LVALUE's type — never the raw RHS at its own width.
+        HirNodeId const stored = res->hir.assignValue(stmts[0]);
+        ASSERT_EQ(res->hir.kind(stored), HirKind::Cast)
+            << "[" << k << "] plain-=-as-value must COERCE the RHS to the "
+               "lvalue type (D-CSUBSET-ASSIGN-VALUE-RHS-COERCE)";
+        TypeId const storedTy = res->hir.typeId(stored);
+        ASSERT_TRUE(storedTy.valid());
+        EXPECT_EQ(ti.kind(storedTy), TypeKind::I16)
+            << "[" << k << "] the stored Cast carries the lvalue's I16 type";
+        auto const castKids = res->hir.children(stored);
+        ASSERT_EQ(castKids.size(), 1u);
+        TypeId const rawTy = res->hir.typeId(castKids[0]);
+        ASSERT_TRUE(rawTy.valid());
+        EXPECT_EQ(ti.kind(rawTy), rhsKinds[k])
+            << "[" << k << "] …over the raw RHS at its own type";
+        // The 6.5.16p3 yield thread: the expression's value is the lvalue
+        // re-read, typed by the lvalue (pre-existing, kept pinned).
+        HirNodeId const yield = res->hir.seqExprResult(seq);
+        ASSERT_EQ(res->hir.kind(yield), HirKind::Ref);
+        TypeId const yieldTy = res->hir.typeId(yield);
+        ASSERT_TRUE(yieldTy.valid());
+        EXPECT_EQ(ti.kind(yieldTy), TypeKind::I16)
+            << "[" << k << "] the assignment's VALUE is the post-conversion "
+               "lvalue read (C 6.5.16p3)";
+    }
+}
+
+// c91 (D-CSUBSET-ARRAY-DECAY-IN-COMPARISON + D-CSUBSET-ARRAY-DECAY-IN-
+// CONDITION, closing the D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY HIR surface):
+// an ARRAY operand of a comparison, a condition, or `!` decays to Ptr<elem>
+// (C 6.3.2.1p3) THROUGH THE ONE coerce funnel — the tier-boundary pin at the
+// exact nodes the property lives on. Pre-c91 the operand kept its Array type
+// and was VALUE-lowered at MIR: a member/global array operand emitted an
+// aggregate Load, so the compare read the array's first BYTES as a "pointer"
+// (sqlite sqlite3ParserFinalize `pParser->yystack != pParser->yystk0` →
+// always-unequal → freed the on-stack parser → the every-SQL-statement
+// SIGABRT), and an Array condition reached the CondBr raw
+// (I_TerminatorTypeMismatch). The corpus witness
+// (examples/c-subset/array_decay_pointer_identity) proves the VALUES
+// end-to-end on all run legs; THIS pin names the HIR tier, so a refactor
+// that drops any of the three decay arms fails HERE even while the MIR
+// value-read backstop (the c63-twin arms) keeps the end-to-end behavior
+// correct. RED-ON-DISABLE (each arm independently):
+//   - combineBinary comparison arm reverted → the Ne's rhs stays a raw
+//     Array-typed MemberAccess (the Cast asserts flip);
+//   - coerceCondition Array arm reverted → `if (g)` synthesizes no Ne
+//     (the two-Ne count flips);
+//   - combineUnaryOp `!` arm reverted → Not's operand stays a raw
+//     Array-typed Ref (the Cast asserts flip).
+TEST(HirLoweringCSubset, ArrayComparisonConditionOperandsDecayToPointer) {
+    SemanticModel model = analyzeCSubset(
+        "struct P { int *stack; int stk0[4]; };\n"
+        "int g[4];\n"
+        "int f(struct P *p) {\n"
+        "    int r = 0;\n"
+        "    if (p->stack != p->stk0) r = 1;\n"   // the sqlite ParserFinalize shape
+        "    if (g) r = r + 2;\n"                 // Array condition
+        "    if (!g) r = r + 4;\n"                // `!array`
+        "    return r;\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+            : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    ASSERT_TRUE(fn.valid());
+    auto const& ti = model.lattice().interner();
+    // Collect the Ne BinaryOps and the Not UnaryOps, pre-order = source order.
+    std::vector<HirNodeId> nes;
+    std::vector<HirNodeId> nots;
+    auto const collect = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::BinaryOp
+            && isCoreOp(res->hir.payload(n))
+            && decodeCoreOp(res->hir.payload(n)) == HirOpKind::Ne)
+            nes.push_back(n);
+        if (res->hir.kind(n) == HirKind::UnaryOp
+            && isCoreOp(res->hir.payload(n))
+            && decodeCoreOp(res->hir.payload(n)) == HirOpKind::Not)
+            nots.push_back(n);
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    collect(collect, res->hir.functionBody(fn));
+    // [0] the source `!=`; [1] the Ne coerceCondition SYNTHESIZES for `if (g)`
+    // (the `!g` condition is already Bool — Not — so no third Ne).
+    ASSERT_EQ(nes.size(), 2u)
+        << "the member compare + the SYNTHESIZED `if (g)` truth test "
+           "(D-CSUBSET-ARRAY-DECAY-IN-CONDITION: a raw Array cond emits none)";
+    // THE c91 comparison property: the Array-typed member operand is wrapped
+    // in a decay Cast to Ptr<elem>; the raw MemberAccess keeps its Array type
+    // underneath.
+    auto const expectDecayCast = [&](HirNodeId operand, HirKind rawKind,
+                                     char const* what) {
+        ASSERT_EQ(res->hir.kind(operand), HirKind::Cast)
+            << what << ": the Array operand must be wrapped in the coerce "
+                       "decay Cast (C 6.3.2.1p3)";
+        TypeId const ct = res->hir.typeId(operand);
+        ASSERT_TRUE(ct.valid());
+        ASSERT_EQ(ti.kind(ct), TypeKind::Ptr)
+            << what << ": the decay Cast carries Ptr<elem>";
+        EXPECT_EQ(ti.kind(ti.operands(ct)[0]), TypeKind::I32)
+            << what << ": …whose pointee is the ELEMENT type (int)";
+        auto const kids = res->hir.children(operand);
+        ASSERT_EQ(kids.size(), 1u);
+        EXPECT_EQ(res->hir.kind(kids[0]), rawKind)
+            << what << ": …over the raw lvalue node";
+        TypeId const rt = res->hir.typeId(kids[0]);
+        ASSERT_TRUE(rt.valid());
+        EXPECT_EQ(ti.kind(rt), TypeKind::Array)
+            << what << ": …which keeps its Array type underneath";
+    };
+    {   // [0] `p->stack != p->stk0`: lhs is the Ptr member (no cast), rhs
+        // is the DECAYED Array member.
+        auto const kids = res->hir.children(nes[0]);
+        ASSERT_EQ(kids.size(), 2u);
+        TypeId const lt = res->hir.typeId(kids[0]);
+        ASSERT_TRUE(lt.valid());
+        EXPECT_EQ(ti.kind(lt), TypeKind::Ptr)
+            << "lhs (p->stack) is already a pointer — never wrapped";
+        expectDecayCast(kids[1], HirKind::MemberAccess,
+                        "comparison rhs (p->stk0)");
+    }
+    {   // [1] `if (g)`: coerceCondition decays the Array Ref then re-enters
+        // its own Ptr arm → Ne(decayCast(g), nullPtrCast), typed Bool.
+        TypeId const bt = res->hir.typeId(nes[1]);
+        ASSERT_TRUE(bt.valid());
+        EXPECT_EQ(ti.kind(bt), TypeKind::Bool)
+            << "the synthesized truth test is Bool-typed";
+        auto const kids = res->hir.children(nes[1]);
+        ASSERT_EQ(kids.size(), 2u);
+        expectDecayCast(kids[0], HirKind::Ref, "condition operand (g)");
+        EXPECT_EQ(res->hir.kind(kids[1]), HirKind::Cast)
+            << "…compared against the synthetic null-pointer Cast";
+    }
+    {   // `!g`: the Not's operand is the decayed Array Ref.
+        ASSERT_EQ(nots.size(), 1u);
+        auto const kids = res->hir.children(nots[0]);
+        ASSERT_EQ(kids.size(), 1u);
+        expectDecayCast(kids[0], HirKind::Ref, "`!` operand (g)");
+    }
+}
+
+// ── c115 SEH (D-WIN64-SEH-FUNCLETS): the __try/__except frontend ──────────────
+
+// The guarded body, filter expression, and handler body lower to a core
+// SehTryExcept node {tryBody Block, filterExpr, handlerBody Block}. This is the
+// structural shape the c116 x64 funclet lowering consumes.
+TEST(HirLoweringCSubset, SehTryExceptLowersToCoreNode) {
+    SemanticModel model = analyzeCSubset(
+        "int f(int *p) { int rc = 0; __try { rc = *p; } "
+        "__except (1) { rc = 42; } return rc; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    HirNodeId const seh =
+        findFirstByKind(res->hir, res->hir.functionBody(fn), HirKind::SehTryExcept);
+    ASSERT_TRUE(seh.valid()) << "a SehTryExcept node must be emitted";
+    auto const kids = res->hir.children(seh);
+    ASSERT_EQ(kids.size(), 3u) << "[tryBody, filterExpr, handlerBody]";
+    EXPECT_EQ(res->hir.kind(kids[0]), HirKind::Block)   << "guarded body is a Block";
+    EXPECT_EQ(res->hir.kind(kids[2]), HirKind::Block)   << "handler body is a Block";
+    // The filter (child 1) is an expression, not a statement Block.
+    EXPECT_NE(res->hir.kind(kids[1]), HirKind::Block)   << "filter is an expression";
+}
+
+// `_exception_code()` in the filter expression is LEGAL (the canonical use).
+TEST(HirLoweringCSubset, SehExceptionCodeInFilterIsLegal) {
+    SemanticModel model = analyzeCSubset(
+        "int f(int *p) { int rc = 0; __try { rc = *p; } "
+        "__except (_exception_code() == 0) { rc = 42; } return rc; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_SehBuiltinContext), 0u);
+    // The builtin lowered to a BuiltinCall inside the filter subtree.
+    HirNodeId const fn = firstFunction(res->hir);
+    HirNodeId const seh =
+        findFirstByKind(res->hir, res->hir.functionBody(fn), HirKind::SehTryExcept);
+    ASSERT_TRUE(seh.valid());
+    EXPECT_TRUE(findFirstByKind(res->hir, res->hir.children(seh)[1],
+                                HirKind::BuiltinCall).valid())
+        << "_exception_code lowers to a BuiltinCall in the filter";
+}
+
+// RED: `_exception_code()` with NO enclosing __try → H_SehBuiltinContext.
+TEST(HirLoweringCSubset, SehExceptionCodeOutsideTryIsRejected) {
+    SemanticModel model = analyzeCSubset(
+        "int f(void) { return (int)_exception_code(); }\n");
+    ASSERT_FALSE(model.hasErrors());   // resolves as a builtin call; HIR verifier rejects
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_SehBuiltinContext), 1u);
+}
+
+// RED: `_exception_info()` in the HANDLER body (filter-only) → H_SehBuiltinContext.
+// (_exception_code IS legal in the handler; _exception_info is filter-only —
+// the asymmetry is the point.)
+TEST(HirLoweringCSubset, SehExceptionInfoInHandlerIsRejected) {
+    SemanticModel model = analyzeCSubset(
+        "int f(int *p) { int rc = 0; __try { rc = *p; } "
+        "__except (1) { rc = (int)(long long)_exception_info(); } return rc; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_SehBuiltinContext), 1u);
+}
+
+// RED (option (C), D-CSUBSET-SEH-EARLY-EXIT): `return` inside the guarded body.
+TEST(HirLoweringCSubset, SehReturnInTryBodyIsRejected) {
+    SemanticModel model = analyzeCSubset(
+        "int f(int *p) { __try { return *p; } __except (1) { return 42; } }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_SehEarlyExit), 1u);
+}
+
+// FAIL-LOUD (D-CSUBSET-SEH-FINALLY): `__finally` parses but has no lowering.
+TEST(HirLoweringCSubset, SehFinallyFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int f(int *p) { int rc = 0; __try { rc = *p; } "
+        "__finally { rc = 1; } return rc; }\n");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 1u);
+}
+
+// FAIL-LOUD (D-CSUBSET-SEH-LEAVE): `__leave` parses but has no lowering.
+TEST(HirLoweringCSubset, SehLeaveFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int f(int *p) { int rc = 0; __try { __leave; rc = *p; } "
+        "__except (1) { rc = 42; } return rc; }\n");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 1u);
 }

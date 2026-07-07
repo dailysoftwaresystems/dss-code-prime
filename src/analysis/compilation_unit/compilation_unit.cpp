@@ -1,9 +1,11 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 
 #include "analysis/compilation_unit/import_resolver.hpp"
+#include "ffi/shipped_lib_descriptor.hpp"   // readShippedLibTypedefNames (c43 follow-up: the cast-vs-call oracle)
 #include "analysis/preprocess/preprocessor.hpp"
 #include "analysis/syntactic/parser.hpp"
 #include "core/substrate/mint_monotonic_id.hpp"
+#include "core/substrate/phase_timers.hpp"   // c97: per-phase --time accumulation
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "tokenizer/tokenizer.hpp"
@@ -11,6 +13,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -231,8 +234,13 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         // FC15c: thread the system-header search path so `__has_include(<h>)`
         // resolves a system descriptor (`<stem>.json`) exactly as the post-parse
         // import resolver does for `#include <h>` (one shared mapping).
+        // c97: the preprocess phase covers the whole config-driven pass —
+        // splice + tokenize-of-the-synth-buffer + macro expansion.
+        std::optional<substrate::PhaseTimers::Scope> phase;
+        phase.emplace(substrate::CompilePhase::Preprocess);
         PreprocessResult pp = preprocess(src, schema, includeDirs_, systemDirs_,
-                                         activeFormat_);
+                                         activeFormat_, userDefines_);
+        phase.reset();
         auto remap = pp.makeRemap();
         std::shared_ptr<SourceBuffer> synth = pp.synthBuffer;
         // The parser consumes a stream built from a COPY of the preprocessed
@@ -267,9 +275,11 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
             ppFatal
                 ? TokenStream::fromTokens({pp.tokens.back()})
                 : TokenStream::fromTokens(pp.tokens);
+        phase.emplace(substrate::CompilePhase::Parse);
         Parser p{synth, schema, std::move(stream), parserConfigFor(*schema),
                  std::move(pp.diagnostics)};
         ParseResult result = std::move(p).parse();
+        phase.reset();
         // Remap the produced tree's diagnostics off the synth buffer onto the
         // origin file(s) before ingest, so a header-origin (and post-splice
         // main-origin) diagnostic is attributed to its real file.
@@ -291,11 +301,31 @@ TreeId UnitBuilder::parseAndAdd_(std::shared_ptr<SourceBuffer> src,
         sidecar.ppRemap         = std::move(remap);
         return trees_.back().id();
     }
+    // c105 (D-PP-USER-DEFINE): `--define` macros can ONLY be consumed by a
+    // preprocess-enabled language. Reaching the plain tokenize→parse path with
+    // user defines pending means they would be SILENTLY ignored — fail loud
+    // (once per file taking this path; a mixed CU's preprocessed files still
+    // consume them normally).
+    if (!userDefines_.empty()) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::D_DefineRequiresPreprocess;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = src->id();
+        d.actual   = "--define was passed but language '"
+                   + std::string{schema->name()}
+                   + "' declares no preprocess block; the macro(s) cannot "
+                     "be consumed";
+        driverDiagnostics_.report(std::move(d));
+    }
+    std::optional<substrate::PhaseTimers::Scope> phase;
+    phase.emplace(substrate::CompilePhase::Tokenize);
     Tokenizer tk{src, schema};
     auto [stream, lexDiags] = std::move(tk).tokenize();
+    phase.emplace(substrate::CompilePhase::Parse);
     Parser p{src, schema, std::move(stream), parserConfigFor(*schema),
              std::move(lexDiags)};
     ParseResult result = std::move(p).parse();
+    phase.reset();
     addTree(std::move(result.tree));
     // FC2: fill the sidecar addTree just pushed — the parse's ambiguous
     // type-name candidates + exported global type names (the finish()-time
@@ -352,6 +382,13 @@ void UnitBuilder::setActiveFormat(ObjectFormatKind fmt) {
         cuFatal("UnitBuilder::setActiveFormat called after finish()");
     }
     activeFormat_ = fmt;
+}
+
+void UnitBuilder::setUserDefines(std::vector<std::string> defines) {
+    if (finished_) {
+        cuFatal("UnitBuilder::setUserDefines called after finish()");
+    }
+    userDefines_ = std::move(defines);
 }
 
 TreeId UnitBuilder::loadAndAdd_(std::filesystem::path const& path, bool& ok,
@@ -501,9 +538,18 @@ CompilationUnit UnitBuilder::finish() && {
     // was parsed with (auto-registered in parseAndAdd_), so every tree gets its
     // own language's import resolution.
     std::unordered_set<std::uint32_t> resolvedSchemaIds;
-    for (auto const& schema : schemas_) {
-        if (!resolvedSchemaIds.insert(schema->schemaId().v).second) continue;
-        chooseResolver(schema)->resolve(context);
+    {
+        // c97: resolve-imports phase — NB the loadFile callback may PARSE
+        // additional included files; those nested parses accumulate into the
+        // parse/preprocess phases (parseAndAdd_ scopes), and steady-clock
+        // wall time double-counts across nested scopes by design (each
+        // phase's number answers "how long did this phase's code run").
+        substrate::PhaseTimers::Scope resolvePhase{
+            substrate::CompilePhase::ResolveImports};
+        for (auto const& schema : schemas_) {
+            if (!resolvedSchemaIds.insert(schema->schemaId().v).second) continue;
+            chooseResolver(schema)->resolve(context);
+        }
     }
 
     // ── FC2 type-name oracle + conditional reparse ────────────────────────
@@ -537,6 +583,24 @@ CompilationUnit UnitBuilder::finish() && {
             std::unordered_set<std::string> oracle;
             for (auto const& sc : sidecars_) {
                 for (auto const& n : sc.globalTypeNames) oracle.insert(n);
+            }
+            // D-CSUBSET-SHIPPED-TYPEDEF-CAST-PARSE: a SHIPPED header's typedefs
+            // (`size_t` from <stddef.h>, `ptrdiff_t`, the stdint widths, …) are
+            // injected SEMANTICALLY (post-parse), so they appear in NO tree's
+            // `globalTypeNames` — the includer parsed `(size_t)(expr)` as a CALL
+            // and recorded an AmbiguousTypeNameCandidate. Harvest each resolved
+            // shipped descriptor's typedef NAMES into the oracle so the reparse
+            // below seeds them as parse-time type names and COMMITS the cast (then
+            // c43's offsetof fold applies → sqlite's `keyinfoSpace[offsetof(...)]`
+            // dim is constant, S001C clears). Interner-free (names only); a scratch
+            // reporter so a malformed descriptor is reported ONCE by the semantic
+            // read (readShippedLibDescriptor), never double-reported here.
+            for (auto const& ref : shippedLibDescriptors) {
+                DiagnosticReporter scratch{
+                    DiagnosticReporter::Config{.dedupWindow = 0}};
+                if (auto names = ffi::readShippedLibTypedefNames(ref.path, scratch)) {
+                    for (auto& n : *names) oracle.insert(std::move(n));
+                }
             }
             // `sidecars_` is index-parallel to `trees_` by construction
             // (addTree appends both) — fatal if that invariant ever broke.
@@ -578,6 +642,11 @@ CompilationUnit UnitBuilder::finish() && {
                 // retained preprocessed tokens, reparse with the type-name
                 // seed, and re-apply the line-map remap so the reparsed tree's
                 // diagnostics still attribute to the origin header/main file.
+                // c97: the oracle reparse accumulates into its OWN phase
+                // (Reparse, not Parse) so the ~2x front-end multiplier is
+                // visible in the --time breakdown.
+                substrate::PhaseTimers::Scope reparsePhase{
+                    substrate::CompilePhase::Reparse};
                 ParseResult result = [&] {
                     if (!sc.ppTokens.empty()) {
                         TokenStream stream =
@@ -627,6 +696,10 @@ CompilationUnit UnitBuilder::finish() && {
                     scratchDescriptors,
                 };
                 resolvedSchemaIds.clear();
+                // c97: the post-reparse re-resolve accumulates into the same
+                // resolve-imports phase (its `runs` count shows the 2nd pass).
+                substrate::PhaseTimers::Scope reresolvePhase{
+                    substrate::CompilePhase::ResolveImports};
                 for (auto const& schema : schemas_) {
                     if (!resolvedSchemaIds.insert(schema->schemaId().v).second) {
                         continue;
@@ -634,6 +707,24 @@ CompilationUnit UnitBuilder::finish() && {
                     chooseResolver(schema)->resolve(recontext);
                 }
             }
+        }
+    }
+
+    // c105 (D-PP-USER-DEFINE fold): remap every shipped-descriptor ref's
+    // carried `#include` span/buffer from SYNTH coordinates onto its ORIGIN
+    // file, exactly as tree diagnostics are remapped. Pre-c105 this was
+    // coincidentally correct — a no-splice TU's synth text was byte-identical
+    // to the main source, so the c8 availability gate's F001D landed on the
+    // right line by accident; the "<built-in>"/"<command-line>" prologues (and
+    // equally any quote-splice BEFORE an angle include — a pre-existing latent
+    // mis-attribution) shift the synth, so the ref must be remapped for real.
+    // Each preprocessed tree's ppRemap closure self-gates on its own synth
+    // buffer id, so running every ref through every remap is a no-op for
+    // non-matching refs (and for non-preprocessed trees, which have none).
+    for (auto& sc : sidecars_) {
+        if (!sc.ppRemap) continue;
+        for (auto& ref : shippedLibDescriptors) {
+            sc.ppRemap(ref.buffer, ref.span);
         }
     }
 

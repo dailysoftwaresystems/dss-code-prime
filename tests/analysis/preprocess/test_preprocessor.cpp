@@ -10,6 +10,7 @@
 #include "core/types/char_decode.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/object_format_kind.hpp"   // c105: per-format prologue tests
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/source_buffer.hpp"
 #include "tokenizer/tokenizer.hpp"
@@ -19,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -2178,7 +2180,13 @@ TEST(Preprocessor, FC15bPredefinedNameIsConfigDrivenNotHardcoded) {
 
 // AGNOSTICISM (opt-OUT): a language with NO preprocess block declares NO
 // predefined macros, so `__LINE__` &c. stay ordinary identifiers (zero behavior
-// change for toy / tsql-subset). c-subset, by contrast, declares the 7 entries.
+// change for toy / tsql-subset). c-subset, by contrast, declares the 7 UNGATED
+// C 6.10.8 macros PLUS (c95) the pe-gated Windows-selection macros — `_WIN32` /
+// `_WIN64` (value 1) and the ABI qualifiers `__stdcall` / `__cdecl` /
+// `__fastcall` / `WINAPI` (empty value → erased). The per-format filter lives in
+// `availableObjectFormats`: EMPTY ⇒ every format (the 7 core), a non-empty set ⇒
+// that format only. This test pins the split so a stray un-gated Win32 macro
+// (which would leak `_WIN32` onto elf/macho) fails loud.
 TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     auto toy = GrammarSchema::loadShipped("toy");
     ASSERT_TRUE(toy.has_value());
@@ -2191,8 +2199,54 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
 
     auto c = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(c.has_value());
-    EXPECT_EQ((*c)->preprocess().predefinedMacros.size(), 7u)
-        << "c-subset declares the 7 C 6.10.8 predefined macros";
+    auto const& pms = (*c)->preprocess().predefinedMacros;
+    // 7 ungated (C 6.10.8) + 10 pe-gated = 17: the c95 Windows selection
+    // (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the c105
+    // MSVC-profile flip (_MSC_VER/__int64/__forceinline/__declspec).
+    EXPECT_EQ(pms.size(), 17u)
+        << "c-subset declares 7 C 6.10.8 + 10 pe-gated Windows predefined macros";
+    std::size_t ungated = 0;
+    std::size_t peGated = 0;
+    for (auto const& pm : pms) {
+        if (pm.availableObjectFormats.empty()) {
+            ++ungated;
+        } else {
+            ++peGated;
+            EXPECT_EQ(pm.availableObjectFormats.size(), 1u)
+                << pm.name << " should be gated to exactly one format";
+            EXPECT_EQ(pm.availableObjectFormats.front(), "pe")
+                << pm.name << " should be pe-gated (Windows selection)";
+        }
+    }
+    EXPECT_EQ(ungated, 7u)
+        << "the 7 C 6.10.8 macros are un-gated (available on every format)";
+    EXPECT_EQ(peGated, 10u)
+        << "_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI (c95) + "
+           "_MSC_VER/__int64/__forceinline/__declspec (c105) are pe-gated";
+}
+
+// LOADER fail-loud (c95): a `predefinedMacros.availableObjectFormats` naming an
+// UNKNOWN object-format is a config typo that would silently never seed the
+// macro on any target (an OS-selection macro that never fires) -> it must be a
+// LOAD error, never accepted. We corrupt `_WIN32`'s ["pe"] to ["pee"] and assert
+// the load FAILS (C_InvalidPreprocess via objectFormatKindFromName). RED-ON-
+// DISABLE: without the loader validation this parses and the macro is dead.
+TEST(Preprocessor, FC15bPredefinedMacroBadObjectFormatIsLoadError) {
+    std::string text = loadShippedCSubsetText();
+    ASSERT_FALSE(text.empty());
+    const std::string from =
+        "{ \"name\": \"_WIN32\",              \"kind\": \"constant\", "
+        "\"value\": \"1\", \"availableObjectFormats\": [\"pe\"] }";
+    const std::string to   =
+        "{ \"name\": \"_WIN32\",              \"kind\": \"constant\", "
+        "\"value\": \"1\", \"availableObjectFormats\": [\"pee\"] }";
+    auto const pos = text.find(from);
+    ASSERT_NE(pos, std::string::npos)
+        << "the _WIN32 predefinedMacros entry must be present verbatim";
+    text.replace(pos, from.size(), to);
+    auto loaded = GrammarSchema::loadFromText(text, "<bad-objfmt-c-subset>");
+    EXPECT_FALSE(loaded.has_value())
+        << "an unknown availableObjectFormats name ('pee') must be a load error";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3305,4 +3359,116 @@ TEST(Preprocessor, PositionalDefineInsideLiveIfBranch) {
     ASSERT_EQ(lexs.size(), 10u) << "int a = X ; int b = 5 ;";
     EXPECT_EQ(lexs[3], "X") << "use before the #define (in a live #if) stays";
     EXPECT_EQ(lexs[8], "5") << "use after the #define (in a live #if) expands";
+}
+
+// ── c105: --define user macros (D-PP-USER-DEFINE) + function-like predefined
+//    macros (D-PP-FUNCTION-LIKE-PREDEFINE) — the "<command-line>"/"<built-in>"
+//    prologue mechanism ─────────────────────────────────────────────────────
+
+// Run preprocess with user --define entries (+ optional active format).
+[[nodiscard]] static std::vector<std::string> ppLexemesWithDefines(
+        std::string text, std::vector<std::string> const& defines,
+        PreprocessResult& out,
+        std::optional<ObjectFormatKind> fmt = std::nullopt) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(std::move(text), "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    out = preprocess(buf, schema, noDirs, {}, fmt, defines);
+    std::vector<std::string> lexs;
+    for (Token const& t : out.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{out.synthBuffer->slice(t.span)});
+    }
+    return lexs;
+}
+
+// `--define FOO=2` is an ORDINARY macro seeded before the first source line
+// (the gcc -D model): it expands in the source, and `#undef FOO` WORKS (a
+// predefined_-seeded macro would fail loud on the #undef — this pin locks the
+// ordinary-table contract). RED-ON-DISABLE: dropping the prologue emission
+// leaves FOO an identifier.
+TEST(Preprocessor, UserDefineSeedsOrdinaryUndefableMacro) {
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDefines(
+        "int a = FOO;\n#undef FOO\nint b = FOO;\n", {"FOO=2"}, r);
+    ASSERT_EQ(lexs.size(), 10u) << "int a = 2 ; int b = FOO ;";
+    EXPECT_EQ(lexs[3], "2")   << "--define FOO=2 expands before the #undef";
+    EXPECT_EQ(lexs[8], "FOO") << "after #undef the name is a bare identifier";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
+        << "a --define macro is ORDINARY: #undef must not trip the 6.10.8.1 guard";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroRedefinition));
+}
+
+// A value-less `--define BAR` defaults to 1 (the -D convention).
+TEST(Preprocessor, UserDefineWithoutValueDefaultsToOne) {
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDefines("int a = BAR;\n", {"BAR"}, r);
+    ASSERT_EQ(lexs.size(), 5u);
+    EXPECT_EQ(lexs[3], "1");
+}
+
+// C 6.10.3p2 duplicate policy rides the ordinary #define handler: an IDENTICAL
+// duplicate --define is tolerated silently; a CONFLICTING one is loud.
+TEST(Preprocessor, UserDefineDuplicatePolicyIsC61032) {
+    PreprocessResult ok;
+    (void)ppLexemesWithDefines("int a = X;\n", {"X=3", "X=3"}, ok);
+    EXPECT_FALSE(hasPPCode(ok, DiagnosticCode::P_PreprocessorMacroRedefinition))
+        << "identical duplicate --define is idempotent (C 6.10.3p2)";
+    PreprocessResult bad;
+    (void)ppLexemesWithDefines("int a = X;\n", {"X=3", "X=4"}, bad);
+    EXPECT_TRUE(hasPPCode(bad, DiagnosticCode::P_PreprocessorMacroRedefinition))
+        << "conflicting duplicate --define must fail loud";
+}
+
+// A --define naming a CONFIG PREDEFINED macro (here `__STDC__`) trips the
+// C 6.10.8.1 guard — a user may not silently flip a profile macro (the
+// _MSC_VER/_WIN32 silent-miscompile channel).
+TEST(Preprocessor, UserDefineCollidingWithConfigPredefineIsLoud) {
+    PreprocessResult r;
+    (void)ppLexemesWithDefines("int a = 0;\n", {"__STDC__=0"}, r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
+        << "--define of a predefined macro must fail loud, not override";
+}
+
+// c105 (D-PP-FUNCTION-LIKE-PREDEFINE): the pe-gated `__declspec(x)` → empty
+// erase — a params-bearing config predefine lowered through the "<built-in>"
+// prologue. The NESTED-paren argument (`align(128)`) is the hard case: the
+// arg-eater must balance parens, leaving `int x ;` exactly. Also pins the
+// declaration-position cleanliness of `__declspec(dllexport)`.
+TEST(Preprocessor, FunctionLikePredefineErasesArgsOnPe) {
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDefines(
+        "__declspec(align(128)) int x;\n__declspec(dllexport) int f(void);\n",
+        {}, r, ObjectFormatKind::Pe);
+    std::vector<std::string> const expect{
+        "int", "x", ";", "int", "f", "(", "void", ")", ";"};
+    EXPECT_EQ(lexs, expect)
+        << "__declspec(...) must erase to nothing on pe, args fully eaten";
+}
+
+// The SAME source WITHOUT the pe format: `__declspec` is format-gated
+// (availableObjectFormats:["pe"]), so off-pe it stays an ordinary identifier —
+// the c9-class per-format filter exercised on the NEW params axis.
+TEST(Preprocessor, FunctionLikePredefineOffFormatStaysIdentifier) {
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDefines(
+        "__declspec(align(128)) int x;\n", {}, r, ObjectFormatKind::Elf);
+    ASSERT_FALSE(lexs.empty());
+    EXPECT_EQ(lexs[0], "__declspec")
+        << "off-pe the name must survive verbatim (no erase, no expansion)";
+}
+
+// c105 (the MSVC-profile flip): `__int64` is a pe predefine expanding to the
+// TWO-token `long long` — `typedef unsigned __int64 T;` must land the exact
+// specifier run `unsigned long long` (the multiset row), proving a multi-token
+// predefine value re-tokenizes correctly.
+TEST(Preprocessor, Int64PredefineExpandsToLongLongOnPe) {
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDefines(
+        "typedef unsigned __int64 dss_u64_t;\n", {}, r, ObjectFormatKind::Pe);
+    std::vector<std::string> const expect{
+        "typedef", "unsigned", "long", "long", "dss_u64_t", ";"};
+    EXPECT_EQ(lexs, expect);
 }

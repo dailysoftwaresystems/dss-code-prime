@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/data_model.hpp"   // DataModel (signatureByDataModel resolution)
+#include "core/types/named_type_binding.hpp" // NamedTypeBinding (c82 va_list alias thread-through)
 #include "core/types/object_format_kind.hpp" // ObjectFormatKind (availability predicate)
 #include "core/types/strong_ids.hpp"   // TypeId
 
@@ -158,6 +159,29 @@ struct DSS_EXPORT ShippedConstant {
     TypeId       type;     // an integer scalar kind; decoded via parseTypeFromText
 };
 
+// One decoded named FLOAT CONSTANT — the float-valued sibling of `ShippedConstant`
+// (c52, D-FFI-MATH-INFINITY). The integer `constants` surface is deliberately
+// integer-ONLY (a float there still fails loud F_ShippedLibUnsupportedType); a
+// header's float-valued object-like macros (`INFINITY`, `M_PI`, `DBL_MAX`) ship
+// HERE instead. `type` MUST decode to a FLOAT scalar (F32/F64); `value` is the
+// decoded `double` (an F32 constant is stored widened to double and the fold
+// narrows it back at materialization). The semantic phase injects each as a named
+// constant whose HIR Ref folds to a FLOAT literal — the SAME `isInjectedConstant`
+// path as an integer constant, the only difference being the float core/value the
+// shared `constantLiteralForSymbol` builder derives.
+//
+// VALUE ENCODING: JSON has no Infinity/NaN, so the descriptor's `value` is a
+// STRING — the special tokens "inf"/"+inf"/"-inf" map to the IEEE-754 ±infinity
+// bit patterns, and any other string is a finite float literal parsed by the ONE
+// float decoder (`number_decode.hpp`). A finite literal that OVERFLOWS to ±inf
+// fails loud (only the explicit "inf" tokens may produce an infinity — never a
+// silent overflow).
+struct DSS_EXPORT ShippedFloatConstant {
+    std::string name;
+    double      value = 0.0;
+    TypeId      type;     // a FLOAT scalar kind (F32/F64); decoded via parseTypeFromText
+};
+
 // One decoded TYPEDEF — the neutral form of a header's `typedef … name;` (e.g.
 // `size_t`). The semantic phase injects it as a `DeclarationKind::Type` symbol
 // so the name resolves in type position. `type` is any hir-text-decodable type
@@ -202,9 +226,17 @@ struct DSS_EXPORT ShippedMacro {
 // hir-text-decodable type, spelled as its RESOLVED form (e.g. `i64` for an
 // `off_t` field — parseTypeFromText resolves hir-text builtins, NOT descriptor
 // typedef names like `off_t`).
+//
+// c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): an optional explicit byte `offset` models
+// a foreign OVERLAPPING layout (an FFI union as an explicit-offset struct — e.g.
+// ULARGE_INTEGER {QuadPart@0, LowPart@0, HighPart@4}). Within one struct it is
+// ALL-fields-or-NONE (a mix is F_ShippedLibDescriptorMalformed); offsets may
+// overlap and need not be sorted. Absent → the layout engine derives offsets by
+// natural alignment (the ordinary case, byte-identical to pre-c107).
 struct DSS_EXPORT ShippedField {
-    std::string name;
-    TypeId      type;
+    std::string                 name;
+    TypeId                      type;
+    std::optional<std::uint64_t> offset;
 };
 
 // One decoded STRUCT — the neutral form of a header's `struct tag { … };` with
@@ -262,6 +294,7 @@ struct DSS_EXPORT ShippedLibDescriptor {
     // `constants` (e.g. `<limits.h>`), only `symbols`, or any mix.
     std::vector<ShippedSymbol>   symbols;     // extern functions/objects (linked)
     std::vector<ShippedConstant> constants;   // named integer constants (folded)
+    std::vector<ShippedFloatConstant> floatConstants; // named float constants (folded; c52)
     std::vector<ShippedTypedef>  typedefs;    // type aliases (resolved in type pos)
     std::vector<ShippedMacro>    macros;      // preprocessor macros (injected at #include)
     std::vector<ShippedStruct>   structs;     // named-field structs (tag + field scope)
@@ -308,6 +341,14 @@ struct DSS_EXPORT ShippedLibDescriptor {
 // nullopt for direct-API/LSP/unit callers ⇒ no variant selection (a
 // flat-`fields` struct decodes exactly as before; a struct that carries
 // ONLY `variants` is not injected when no selector is available).
+// c82 `namedTypes` (D-FFI-DESCRIPTOR-VA-LIST-TYPE): optional caller-supplied
+// NAME → TypeId bindings threaded verbatim into EVERY `parseTypeFromText`
+// call this read performs (signatures, per-model overrides, typedefs, struct
+// fields, constant types). The semantic analyzer passes its per-CC `va_list`
+// binding so a descriptor can spell an ABI-defined C alias (stdio.json's
+// `vfprintf(..., va_list)`) while staying arch-NEUTRAL — the alias resolves
+// to the SAME TypeId a user-written prototype gets. Content-blind: the reader
+// neither knows nor cares what the names mean; empty = pre-c82 behavior.
 [[nodiscard]] DSS_EXPORT std::optional<ShippedLibDescriptor>
 readShippedLibDescriptor(std::filesystem::path const&    path,
                          TypeInterner&                   interner,
@@ -315,7 +356,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
                          DiagnosticReporter&             reporter,
                          DataModel                       dataModel    = DataModel::Lp64,
                          std::optional<std::string_view> activeTarget = std::nullopt,
-                         std::optional<ObjectFormatKind> activeFormat = std::nullopt);
+                         std::optional<ObjectFormatKind> activeFormat = std::nullopt,
+                         std::span<NamedTypeBinding const> namedTypes = {});
 
 // Read ONLY the `macros` surface from the neutral descriptor at `path`, WITHOUT a
 // TypeInterner. Macros are pure preprocessor token text (no types), so the
@@ -350,6 +392,20 @@ readShippedLibMacros(std::filesystem::path const&    path,
 // The caller tests membership of the active target's `objectFormatKindName`.
 [[nodiscard]] DSS_EXPORT std::optional<std::vector<std::string>>
 readShippedLibAvailability(std::filesystem::path const& path,
+                           DiagnosticReporter&          reporter);
+
+// Read ONLY the `typedefs[].name` list from the descriptor at `path`, WITHOUT a
+// TypeInterner — the PARSE-TIME cast-vs-call ORACLE (D-CSUBSET-SHIPPED-TYPEDEF-CAST-PARSE).
+// Shipped typedefs are injected SEMANTICALLY (post-parse), so the parser's binder
+// sketch never sees `size_t` as a TYPE NAME and parses `(size_t)(expr)` as a CALL.
+// The post-parse typedef-resolution reparse (compilation_unit.cpp) seeds these
+// NAMES as parse-time global types so the reparse commits the cast. Only the names
+// are needed (not the decoded `type`), so no interner — mirrors
+// readShippedLibAvailability. LENIENT: malformed entries are skipped (the SEMANTIC
+// read owns strict typedef validation — this must be no STRICTER). std::nullopt on
+// a broken JSON; EMPTY ⇒ the descriptor declares no typedef surface.
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<std::string>>
+readShippedLibTypedefNames(std::filesystem::path const& path,
                            DiagnosticReporter&          reporter);
 
 // True iff a header carrying availability set `availableObjectFormats` is

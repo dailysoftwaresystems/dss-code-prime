@@ -1,0 +1,34 @@
+{
+  "$comment": "c76 (D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT, option E; 2026-07-01): a Call whose scalar argument count exceeds the calling convention's register-passed capacity (SysV: 6 GPR) must split the overflow args to stack `store_outgoing_arg` carriers BEFORE regalloc, via the new pre-regalloc lowerWideCallArgs pass (src/lir/lir_wide_call_args.cpp, invoked in compile_pipeline.cpp step 4b). Without it a single wide Call holds more live register-operands than the machine has registers and the allocator exhausts the file -> error[L_VirtualRegInPostRegalloc]. This is sqlite's func-2088 blocker. WITNESS: `probe` takes 12 int params; a7..a12 overflow the 6 SysV GPR arg registers to the outgoing stack. Overflow args are distinct-valued (1..6) AND distinct-weighted (*2..*7) so a wrong overflow-slot offset OR a swap of any two overflow args changes the exit code (never a swap-hiding sum). 6*1 + (1*2+2*3+3*4+4*5+5*6+6*7) = 6 + 112 = 118. RED-ON-DISABLE (WITNESSED): revert the pass or its compile_pipeline invocation -> error[L_VirtualRegInPostRegalloc] on x86_64. Int-only, so the release optimizedPipeline arm is safe (no FP-constant materialization). => 118.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 118,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

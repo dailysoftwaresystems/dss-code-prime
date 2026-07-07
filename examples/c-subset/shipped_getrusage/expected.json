@@ -1,0 +1,14 @@
+{
+  "$comment": "c81 (the sqlite shell.c CLI route): ship <sys/resource.h> — getrusage + RUSAGE_SELF(=0, `constants`: shell.c's uses are unguarded calls, no #ifdef) + the glibc-exact struct rusage (2 struct timeval + 14 i64, sizeof 144 — libc FILLS the caller's object, layout verified against bits/types/struct_rusage.h, x86_64 == arm64). Run-proof on real libc: rc==0, nested .ru_utime.tv_sec/tv_usec sane, the last field (ru_nivcsw @136) overwritten from -1 to >=0, frame sentinel intact. Gated [elf] only — Darwin's timeval diverges (tv_usec i32), so no macho target here (fail-loud unavailable beats a silent wrong layout). RED-ON-DISABLE: remove sys/resource.json -> F001A.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -1468,9 +1468,54 @@ encodeExecDynamic(AssembledModule const&    module,
             return {};
         }
     }
+    // D-LK-EXTERN-DATA-IMPORT (c117): a FUNCTION extern resolves to its
+    // __stubs STUB (call → stub → __got jump); a DATA extern resolves to its
+    // __got SLOT (loaded as a non-lazy pointer, dyld-bound at load). The
+    // linker's pre-walker gate admits data imports only when the format
+    // DECLARES a binding model; this walker implements exactly `got-indirect`
+    // (the Mach-O __got non-lazy pointer) — a foreign model fails loud, never
+    // silently gets a got slot it did not declare (mirrors elf.cpp's
+    // copy-relocation assertion). Function symbolVa is bound here; DATA
+    // symbolVa is bound below once the __got VA is known.
+    std::size_t numDataExterns = 0;
+    for (auto const& ext : module.externImports) {
+        if (ext.isData) ++numDataExterns;
+    }
+    if (numDataExterns > 0) {
+        auto const binding = fmt.dataImportBinding();
+        if (!binding.has_value()
+            || *binding != DataImportBinding::GotIndirect) {
+            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                 "macho::encodeExecDynamic: module carries " +
+                 std::to_string(numDataExterns) +
+                 " extern DATA import(s) but format '" +
+                 std::string{fmt.name()} +
+                 "' does not declare 'dataImportBinding': "
+                 "\"got-indirect\" — the only data-import mechanism this "
+                 "walker implements (D-LK-EXTERN-DATA-IMPORT).");
+            return {};
+        }
+    }
+    // D-LK-MACHO-DATA-EXTERN-DEAD-STUB (c119): a FUNCTION extern gets a __stubs
+    // stub (a call jumps to the stub, which jumps through its __got slot); a
+    // DATA extern is never CALLED, so it gets NO stub — only its __got slot. So
+    // the __stubs band is COMPACTED to the function externs (stub index j),
+    // while the __got band stays LOCKSTEP with EVERY extern (slot index i, the
+    // dyld bind loop + chained fixups are unchanged). `funcExternIdxs[j]` = the
+    // extern index of the j-th stub; a func extern's stub references ITS OWN got
+    // slot (got index funcExternIdxs[j], NOT the stub index j). numExterns =
+    // numFuncExterns + numDataExterns.
+    std::vector<std::size_t> funcExternIdxs;
+    funcExternIdxs.reserve(numExterns - numDataExterns);
     for (std::size_t i = 0; i < numExterns; ++i) {
+        if (!module.externImports[i].isData) funcExternIdxs.push_back(i);
+    }
+    std::size_t const numFuncExterns = funcExternIdxs.size();
+    // FUNCTION externs → their __stubs stub VA (the COMPACTED stub index j).
+    for (std::size_t j = 0; j < numFuncExterns; ++j) {
+        std::size_t const i = funcExternIdxs[j];
         std::uint64_t const stubVa =
-            stubsVa + static_cast<std::uint64_t>(i) * stubSize;
+            stubsVa + static_cast<std::uint64_t>(j) * stubSize;
         if (!symbolVa.emplace(module.externImports[i].symbol,
                               stubVa).second) {
             emit(reporter, DiagnosticCode::K_SymbolUndefined,
@@ -1557,10 +1602,11 @@ encodeExecDynamic(AssembledModule const&    module,
              "format declares no 'bss' section row (D-LK4-DATA-PRODUCER).");
         return {};
     }
-    // __stubs occupies `numExterns * stubSize` bytes contiguously
-    // after __text; __const starts at the H1-aligned VA above them.
+    // __stubs occupies `numFuncExterns * stubSize` bytes contiguously
+    // after __text (DATA externs get no stub — D-LK-MACHO-DATA-EXTERN-DEAD-STUB);
+    // __const starts at the H1-aligned VA above them.
     std::uint64_t const stubsBytes =
-        static_cast<std::uint64_t>(numExterns) * stubSize;
+        static_cast<std::uint64_t>(numFuncExterns) * stubSize;
     std::uint64_t const constSectionVa =
         hasConst
             ? alignUp(stubsVa + stubsBytes, constLayout.maxAlign)
@@ -1589,11 +1635,38 @@ encodeExecDynamic(AssembledModule const&    module,
     // `__DATA`. Sizes: __got = numExterns*8 (one page-aligned segment).
     std::uint64_t const gotBytesEarly =
         static_cast<std::uint64_t>(numExterns) * kGotSlotSize;
-    std::uint64_t const dataConstEndVaEarly =
+    // __DATA_CONST.vmaddr (page boundary) — the __got section begins here;
+    // the LATE layout (below) recomputes gotVa via file-offset deltas and
+    // asserts congruence with this early value.
+    std::uint64_t const gotVaStart =
         alignUp((hasConst ? constSectionVa + constSize
                           : stubsVa + stubsBytes),
-                kPageSize)            // __DATA_CONST.vmaddr (page boundary)
-        + gotBytesEarly;             // + __got contents
+                kPageSize);
+    std::uint64_t const dataConstEndVaEarly =
+        gotVaStart + gotBytesEarly;             // + __got contents
+    // D-LK-EXTERN-DATA-IMPORT (c117): bind each extern-DATA symbol to its
+    // __got SLOT VA (slot i, lockstep with the got layout + bind loop below).
+    // dyld fills the slot with the library object's real address at load; a
+    // GlobalAddr of the symbol (mir_to_lir got-indirect) lea's this image-
+    // local slot VA then derefs it. Bound HERE — after the __got start VA is
+    // known but BEFORE `applyExecRelocations` — so a code reloc into the data
+    // symbol resolves to the slot VA through the SAME relocation kernel a
+    // function stub / named __const item uses (the c117 walker split: FUNC
+    // externs → stub VA above; DATA externs → __got slot VA here).
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        if (!module.externImports[i].isData) continue;
+        std::uint64_t const gotSlotVa =
+            gotVaStart + static_cast<std::uint64_t>(i) * kGotSlotSize;
+        if (!symbolVa.emplace(module.externImports[i].symbol,
+                              gotSlotVa).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 "macho::encodeExecDynamic: extern DATA SymbolId #" +
+                 std::to_string(module.externImports[i].symbol.v) +
+                 " collides with another symbol — caller must give each "
+                 "extern a unique SymbolId.");
+            return {};
+        }
+    }
     std::uint64_t const dataSegVaEarly =
         hasDataSeg ? alignUp(dataConstEndVaEarly, kPageSize) : 0;
     std::uint64_t const dataSecVa =
@@ -1879,9 +1952,14 @@ encodeExecDynamic(AssembledModule const&    module,
         // encode the import ordinal directly, so the indirect symbol
         // table is redundant. Skip construction (and the matching
         // LC_DYSYMTAB + __LINKEDIT emission below) on chained path.
-        indirectSyms.reserve(numExterns * 2);
-        for (std::size_t i = 0; i < numExterns; ++i)
-            indirectSyms.push_back(numDefs + static_cast<std::uint32_t>(i));
+        indirectSyms.reserve(numFuncExterns + numExterns);
+        // __stubs band: one entry per FUNCTION extern (compacted — a DATA extern
+        // has no stub, D-LK-MACHO-DATA-EXTERN-DEAD-STUB), the func extern's
+        // undefined-symbol index. Order MATCHES the stub-emit loop (funcExternIdxs).
+        for (std::size_t j = 0; j < numFuncExterns; ++j)
+            indirectSyms.push_back(
+                numDefs + static_cast<std::uint32_t>(funcExternIdxs[j]));
+        // __got band: one entry per extern (LOCKSTEP with the __got slots).
         for (std::size_t i = 0; i < numExterns; ++i)
             indirectSyms.push_back(numDefs + static_cast<std::uint32_t>(i));
     }
@@ -2008,7 +2086,7 @@ encodeExecDynamic(AssembledModule const&    module,
     std::uint64_t const textFileSize = textBody.size();
     std::uint64_t const stubsFileOff = textFileOff + textFileSize;
     std::uint64_t const stubsFileSize =
-        static_cast<std::uint64_t>(numExterns) * stubSize;
+        static_cast<std::uint64_t>(numFuncExterns) * stubSize;
 
     // __TEXT,__const file offset — H1-aligned above __stubs, inside the
     // same __TEXT segment (D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror). Because
@@ -2158,11 +2236,12 @@ encodeExecDynamic(AssembledModule const&    module,
     // emitter writes `stubSize` bytes or fails loud.
     std::vector<std::uint8_t> stubsBody;
     stubsBody.reserve(stubsFileSize);
-    for (std::size_t i = 0; i < numExterns; ++i) {
+    for (std::size_t j = 0; j < numFuncExterns; ++j) {
+        std::size_t const i = funcExternIdxs[j];  // the extern this stub serves
         std::uint64_t const stubVa = stubsVa +
-            static_cast<std::uint64_t>(i) * stubSize;
+            static_cast<std::uint64_t>(j) * stubSize;      // COMPACTED stub index j
         std::uint64_t const gotSlotVa = gotVa +
-            static_cast<std::uint64_t>(i) * kGotSlotSize;
+            static_cast<std::uint64_t>(i) * kGotSlotSize;  // ITS __got slot (lockstep i)
         if (!emitMachoStub(id.cputype, stubsBody, stubVa, gotSlotVa, i,
                            reporter)) {
             return {};
@@ -2175,10 +2254,10 @@ encodeExecDynamic(AssembledModule const&    module,
     if (stubsBody.size() != stubsFileSize) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
              std::format("macho::encodeExecDynamic: emitted {} __stubs "
-                         "bytes but layout reserved {} ({} externs × {} "
+                         "bytes but layout reserved {} ({} func externs × {} "
                          "stride) — emitMachoStub and machoStubSizeFor "
                          "disagree (substrate invariant violation).",
-                         stubsBody.size(), stubsFileSize, numExterns,
+                         stubsBody.size(), stubsFileSize, numFuncExterns,
                          stubSize));
         return {};
     }
@@ -2369,15 +2448,17 @@ encodeExecDynamic(AssembledModule const&    module,
     std::uint64_t const linkeditSegVmsize =
         alignUp(linkeditFileSize, kPageSize);
 
-    // Indirect-symtab reserved1 indices: __stubs uses [0..numExterns),
-    // __got uses [numExterns..2*numExterns). On the chained-fixups
-    // path the indirect symbol table is absent; reserved1 = 0 for
-    // both sections (D-LK6-14-INTEGRATION-GOT-SLOTS — chained
-    // pointers in __got encode the ordinal directly).
+    // Indirect-symtab reserved1 indices: __stubs uses [0..numFuncExterns) —
+    // one entry per FUNCTION extern (a DATA extern has no stub,
+    // D-LK-MACHO-DATA-EXTERN-DEAD-STUB) — and __got uses
+    // [numFuncExterns .. numFuncExterns + numExterns). On the chained-fixups
+    // path the indirect symbol table is absent; reserved1 = 0 for both
+    // sections (D-LK6-14-INTEGRATION-GOT-SLOTS — chained pointers in __got
+    // encode the ordinal directly).
     constexpr std::uint32_t kStubsReserved1 = 0;
     std::uint32_t const kGotReserved1 = useChainedFixups
         ? 0u
-        : static_cast<std::uint32_t>(numExterns);
+        : static_cast<std::uint32_t>(numFuncExterns);
 
     // ── (m) Emit bytes ───────────────────────────────────────────
     std::vector<std::uint8_t> bytes;

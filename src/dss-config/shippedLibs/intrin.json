@@ -1,0 +1,9 @@
+{
+  "$comment": "Neutral shipped <intrin.h> (Microsoft compiler-intrinsic header) — c113. sqlite3.c's `#if defined(_MSC_VER) ... #if !defined(SQLITE_DISABLE_INTRINSIC)` block (~line 15130) does `#include <intrin.h>` + `#pragma intrinsic(...)`; DSS drops the pragma (unknown directive, C 6.10.6p2) and resolves the include here, so the amalgamation compiles WITHOUT -DSQLITE_DISABLE_INTRINSIC. availableObjectFormats:[pe] — an MSVC compiler-intrinsic header is meaningless on elf/macho (a reference there fails loud, mirroring windows.json/process.json). The intrinsics themselves are NOT symbols here: `__umulh` and `_ReadWriteBarrier` are pure compiler intrinsics with NO library export, realized as always-on lowered BUILTINS in c-subset.lang.json (`lowering:umulh`/`lowering:barrier`) — declaring a non-export in `symbols` eager-imports it and breaks the pe loader with STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139), EMPIRICALLY re-confirmed this cycle: msvcrt.dll exports NO _byteswap_* (objdump -p, positive control memcpy/_msize/puts) and a draft that declared them crashed the loader exactly so. The `_byteswap_*` family is therefore NOT declared at all — sqlite's byte-reverse fast path is #if'd out under DSS's config (SQLITE_BYTEORDER!=1234 → the portable byte-by-byte #else) so nothing references them; the day a pe program actually calls one, the fail-loud S0001 fires and D-CSUBSET-INTRINSIC-BSWAP (trigger-gated: a dedicated bswap builtin lowering, x86 BSWAP/arm64 REV via the capability-probe seam) closes it. Non-empty content = the honest `size_t` typedef: MSVC's real <intrin.h> makes size_t visible (its prototypes use it, via the vcruntime include chain); u64 = the pe64/LLP64 x64 width (string.json/stdio.json convention).",
+  "header": "intrin.h",
+  "standard": "msvcrt",
+  "availableObjectFormats": ["pe"],
+  "typedefs": [
+    { "name": "size_t", "type": "u64" }
+  ]
+}

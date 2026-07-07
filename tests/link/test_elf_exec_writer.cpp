@@ -624,10 +624,12 @@ TEST(ElfExecWriter, PtLoad2PageAlignCongruence) {
     EXPECT_EQ(vaddr % align, offset % align);
 }
 
-TEST(ElfExecWriter, MultipleExternsInTwoLibrariesEmitTwoDtNeeded) {
+TEST(ElfExecWriter, MultipleExternsInOneLibraryCollapseToOneDtNeeded) {
     // test-analyzer Gap #4 (criticality 9): N=1 today collapses
-    // loops; verify with 2 externs in 2 libraries that DT_NEEDED
-    // appears twice and the .hash chain handles N>1.
+    // loops; verify with 2 externs sharing ONE library that DT_NEEDED
+    // appears exactly once and the .hash chain handles N>1. (Renamed
+    // in c87 — the old name claimed two libraries; the true
+    // two-library pin is TwoLibrariesEmitTwoDtNeededInLexicographicOrder.)
     auto loaded = loadShipped();
     AssembledModule mod;
     mod.expectedFuncCount = 1;
@@ -659,6 +661,74 @@ TEST(ElfExecWriter, MultipleExternsInTwoLibrariesEmitTwoDtNeeded) {
     }
     EXPECT_EQ(dtNeeded, 1);
     // .rela.dyn size = 2 externs × 24 = 48 bytes.
+    std::uint64_t relaSz = 0;
+    for (std::size_t off = dynamicOff; off + 16 <= bytes.size(); off += 16) {
+        std::uint64_t const tag = readU64LE(bytes, off);
+        std::uint64_t const val = readU64LE(bytes, off + 8);
+        if (tag == 8u) relaSz = val;
+        if (tag == 0u) break;
+    }
+    EXPECT_EQ(relaSz, 48u);
+}
+
+TEST(ElfExecWriter, TwoLibrariesEmitTwoDtNeededInLexicographicOrder) {
+    // c87 (D-FFI-MATH-LIBM-DT-NEEDED): externs owned by TWO distinct
+    // libraries (libm.so.6 `sqrt` + libc.so.6 `printf` — the math.json
+    // shape after c87) emit exactly one DT_NEEDED per DISTINCT library,
+    // in LEXICOGRAPHIC order of the library NAME — regardless of extern
+    // declaration order. The externs here are deliberately declared
+    // libm-FIRST so a first-appearance emission (the pre-c87 shape)
+    // would flunk the order assertion: the pinned rule is sorted names
+    // (libc.so.6 < libm.so.6), never declaration order (which shifts
+    // with CU/merge order) and never a hardcoded library name.
+    auto loaded = loadShipped();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8,0,0,0,0, 0xE8,0,0,0,0, 0xC3};
+    Relocation r1; r1.offset = 1; r1.target = SymbolId{10};
+    r1.kind = RelocationKind{1};
+    Relocation r2; r2.offset = 6; r2.target = SymbolId{11};
+    r2.kind = RelocationKind{1};
+    fn.relocations.push_back(r1);
+    fn.relocations.push_back(r2);
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{10}, "sqrt",   "libm.so.6"});
+    mod.externImports.push_back(
+        ExternImport{SymbolId{11}, "printf", "libc.so.6"});
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // Walk .dynamic: collect every DT_NEEDED val + DT_STRTAB va.
+    std::uint64_t const phoff = readU64LE(bytes, 32);
+    std::uint64_t const dynamicOff = readU64LE(bytes, phoff + 56*4 + 8);
+    std::vector<std::uint64_t> neededOffs;
+    std::uint64_t strtabVa = 0;
+    for (std::size_t off = dynamicOff; off + 16 <= bytes.size(); off += 16) {
+        std::uint64_t const tag = readU64LE(bytes, off);
+        std::uint64_t const val = readU64LE(bytes, off + 8);
+        if (tag == 1u) neededOffs.push_back(val);   // DT_NEEDED
+        if (tag == 5u) strtabVa = val;              // DT_STRTAB
+        if (tag == 0u) break;
+    }
+    ASSERT_EQ(neededOffs.size(), 2u);
+    ASSERT_NE(strtabVa, 0u);
+    // .dynstr lives in PT_LOAD #1 (baseImageVa = 0x400000, file offset
+    // == va - base — the same mapping RelaDynEntriesPackedAsGlobDat uses).
+    std::size_t const strtabFileOff = strtabVa - 0x400000ull;
+    auto nameAt = [&](std::uint64_t strOff) {
+        std::string s;
+        for (std::size_t p = strtabFileOff + strOff;
+             p < bytes.size() && bytes[p] != 0; ++p) {
+            s.push_back(static_cast<char>(bytes[p]));
+        }
+        return s;
+    };
+    EXPECT_EQ(nameAt(neededOffs[0]), "libc.so.6");
+    EXPECT_EQ(nameAt(neededOffs[1]), "libm.so.6");
+    // Both dynsym import rows still emit (one GLOB_DAT each).
     std::uint64_t relaSz = 0;
     for (std::size_t off = dynamicOff; off + 16 <= bytes.size(); off += 16) {
         std::uint64_t const tag = readU64LE(bytes, off);

@@ -201,11 +201,23 @@ struct DSS_EXPORT PreprocessResult {
 // → pure-existence behavior, identical to before. Because `__has_include` (and the
 // descriptor macro-splice) now depend on it, the front-end must be built ONCE PER
 // DISTINCT object-format (the driver groups targets by kind; nullopt builds once).
+// c105 (D-PP-USER-DEFINE): `userDefines` are the CLI `--define NAME[=VALUE]`
+// entries, verbatim. Each lowers to a `#define NAME VALUE` line (VALUE
+// defaults to `1`) in a synthetic "<command-line>" PROLOGUE prepended to the
+// synth stream — the C/gcc model ("as if #define appeared before the first
+// source line"). The ORDINARY directive handler then owns everything: name
+// validation, the C 6.10.8.1 predefined-collision guard (a user may not
+// silently flip a profile macro like `_MSC_VER` — loud), the 6.10.3p2
+// duplicate policy (identical dup tolerated; conflicting dup loud), and
+// #undef-ability (a -D macro is an ordinary macro). Function-like predefined
+// macros (PredefinedMacroDef.isFunctionLike) ride the same mechanism via a
+// "<built-in>" prologue. Defaults to {} — every existing caller unchanged.
 [[nodiscard]] DSS_EXPORT PreprocessResult preprocess(
     std::shared_ptr<SourceBuffer>        mainSource,
     std::shared_ptr<GrammarSchema const> schema,
     std::span<std::filesystem::path const> includeDirs,
     std::span<std::filesystem::path const> systemDirs = {},
-    std::optional<ObjectFormatKind>      activeFormat = std::nullopt);
+    std::optional<ObjectFormatKind>      activeFormat = std::nullopt,
+    std::span<std::string const>         userDefines  = {});
 
 } // namespace dss

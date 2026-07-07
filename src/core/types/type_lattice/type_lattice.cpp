@@ -184,6 +184,37 @@ TypeId TypeInterner::optional(TypeId inner) {
     return internContent(TypeKind::Optional, {}, ops, {}, {});
 }
 
+// ── volatile qualifier (D-CSUBSET-VOLATILE-POINTEE / c27) ──
+
+TypeId TypeInterner::volatileQualified(TypeId inner) {
+    if (!inner.valid()) return InvalidType;
+    // Idempotent: a VolatileQual over a VolatileQual is the same VolatileQual.
+    // Read the RAW record kind (not the transparent `kind()`, which would see
+    // through and re-wrap). `volatile (volatile T)` ≡ `volatile T` (C 6.7.3p5).
+    if (arena_.at(inner).kind == TypeKind::VolatileQual) return inner;
+    std::array<TypeId, 1> const ops{inner};
+    return internContent(TypeKind::VolatileQual, {}, ops, {}, {});
+}
+
+TypeId TypeInterner::materialId_(TypeId id) const {
+    // Strip VolatileQual skins to the material type. Idempotency keeps the chain
+    // at one level, but loop defensively (cost: a handful of valid ids never
+    // exceed depth 1). Reads `arena_` directly so `kind()`/`operands()` can call
+    // this without recursing back into themselves.
+    while (id.valid() && arena_.at(id).kind == TypeKind::VolatileQual) {
+        id = operandPool_[arena_.at(id).operandStart];
+    }
+    return id;
+}
+
+TypeId TypeInterner::stripVolatile(TypeId id) const {
+    return materialId_(id);
+}
+
+bool TypeInterner::isVolatileQualified(TypeId id) const {
+    return id.valid() && arena_.at(id).kind == TypeKind::VolatileQual;
+}
+
 TypeId TypeInterner::array(TypeId element, std::int64_t length) {
     std::array<TypeId, 1> const ops{element};
     std::array<std::int64_t, 1> const sc{length};
@@ -200,6 +231,10 @@ TypeId TypeInterner::incompleteArray(TypeId element) {
 }
 
 bool TypeInterner::isIncompleteArray(TypeId id) const {
+    // c27: a `volatile T[]` is still an incomplete array — strip the skin first
+    // so the raw-kind check sees Array (the public `kind()` is transparent, but
+    // this reads `arena_` directly).
+    id = materialId_(id);
     if (arena_.at(id).kind != TypeKind::Array) return false;
     auto const sc = scalars(id);
     return !sc.empty() && sc[0] == kIncompleteArrayLength;
@@ -241,14 +276,27 @@ encodeFieldBitWidths(std::size_t fieldCount,
 // (StructIsNominalAndStructural). The top bit is set so a content-derived key can
 // never collide with a decl-site key (which the semantic analyzer packs from
 // 32-bit tree/node ids — always < 2^63).
+// c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): explicit field offsets also enter the
+// content identity so an explicit-offset struct is DISTINCT from the same
+// field-types laid out naturally, AND both the shipped `structs` entry and the
+// bare typedef's inline `struct "X" { T @off }` — which carry identical offsets —
+// collapse to one TypeId. The offset mix is GUARDED on non-empty so a struct with
+// NO explicit offsets hashes byte-identically to the pre-c107 function — every
+// existing composite keeps its EXACT declSiteKey (literally no churn), and only an
+// offset-bearing struct gets the extra mix.
 [[nodiscard]] std::uint64_t
 contentDeclSiteKey(std::span<TypeId const> fields,
-                   std::span<std::int64_t const> bitWidthScalars) {
+                   std::span<std::int64_t const> bitWidthScalars,
+                   std::span<std::uint64_t const> fieldOffsets = {}) {
     std::uint64_t h = kFnvOffset;
     h = fnvMix(h, fields.size());
     for (TypeId f : fields) h = fnvMix(h, f.v);
     h = fnvMix(h, bitWidthScalars.size());
     for (std::int64_t s : bitWidthScalars) h = fnvMix(h, static_cast<std::uint64_t>(s));
+    if (!fieldOffsets.empty()) {
+        h = fnvMix(h, fieldOffsets.size());
+        for (std::uint64_t o : fieldOffsets) h = fnvMix(h, o);
+    }
     return h | (std::uint64_t{1} << 63);
 }
 } // namespace
@@ -303,7 +351,8 @@ TypeId TypeInterner::forwardComposite(TypeKind kind, std::string_view name,
 }
 
 void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
-                                     std::span<std::int64_t const> fieldBitWidths) {
+                                     std::span<std::int64_t const> fieldBitWidths,
+                                     std::span<std::uint64_t const> fieldOffsets) {
     TypeRecord const& rec = arena_.at(id);
     if (rec.kind != TypeKind::Struct && rec.kind != TypeKind::Union) {
         latticeFatal("completeComposite: TypeId is not a Struct/Union");
@@ -313,16 +362,24 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
         latticeFatal("completeComposite: TypeId was not forward-minted as a composite");
     }
     auto sc = encodeFieldBitWidths(fields.size(), fieldBitWidths);
+    // c107: explicit offsets are ALL-fields-or-NONE (a partial set is a caller bug).
+    if (!fieldOffsets.empty() && fieldOffsets.size() != fields.size()) {
+        latticeFatal("completeComposite: explicit field offsets must cover every "
+                     "field (all-or-none)");
+    }
     if (it->second.complete) {
         // Idempotent for an IDENTICAL re-completion (a benign re-resolution); a
         // CONFLICTING re-completion is a caller bug — fail loud rather than
         // silently keep stale fields or corrupt a shared TypeId.
         bool same = it->second.fields.size() == fields.size()
-                 && it->second.bitWidthScalars.size() == sc.size();
+                 && it->second.bitWidthScalars.size() == sc.size()
+                 && it->second.fieldOffsets.size() == fieldOffsets.size();
         for (std::size_t i = 0; same && i < fields.size(); ++i)
             if (it->second.fields[i].v != fields[i].v) same = false;
         for (std::size_t i = 0; same && i < sc.size(); ++i)
             if (it->second.bitWidthScalars[i] != sc[i]) same = false;
+        for (std::size_t i = 0; same && i < fieldOffsets.size(); ++i)
+            if (it->second.fieldOffsets[i] != fieldOffsets[i]) same = false;
         if (!same) {
             latticeFatal("completeComposite: composite re-completed with different "
                          "fields (double-complete / tag redecl)");
@@ -331,11 +388,15 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
     }
     it->second.fields.assign(fields.begin(), fields.end());
     it->second.bitWidthScalars = std::move(sc);
+    it->second.fieldOffsets.assign(fieldOffsets.begin(), fieldOffsets.end());
     it->second.complete = true;
     ++poolGen_;   // the field view changed — invalidate any pre-completion span
 }
 
 bool TypeInterner::isIncompleteComposite(TypeId id) const {
+    // c27: a `volatile struct S` is incomplete iff S is — strip the skin so the
+    // raw-kind check + side-table key see the material composite.
+    id = materialId_(id);
     TypeKind const k = arena_.at(id).kind;
     if (k != TypeKind::Struct && k != TypeKind::Union) return false;
     auto it = compositeFields_.find(id.v);
@@ -360,6 +421,38 @@ TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> f
                                       contentDeclSiteKey(fields, sc));
     completeComposite(id, fields, fieldBitWidths);
     return id;
+}
+
+TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> fields,
+                                std::span<std::int64_t const> fieldBitWidths,
+                                std::span<std::uint64_t const> fieldOffsets) {
+    // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): the offsets enter the content identity
+    // (contentDeclSiteKey) so the shipped `structs` entry and the inline typedef
+    // struct-text — both carrying identical offsets — collapse to one TypeId. An
+    // empty offsets span routes exactly like the 3-arg overload (byte-identical).
+    auto const sc = encodeFieldBitWidths(fields.size(), fieldBitWidths);
+    TypeId const id = internComposite(TypeKind::Struct, name,
+                                      contentDeclSiteKey(fields, sc, fieldOffsets));
+    completeComposite(id, fields, fieldBitWidths, fieldOffsets);
+    return id;
+}
+
+bool TypeInterner::hasExplicitOffsets(TypeId id) const {
+    id = materialId_(id);
+    TypeKind const k = arena_.at(id).kind;
+    if (k != TypeKind::Struct && k != TypeKind::Union) return false;
+    auto it = compositeFields_.find(id.v);
+    return it != compositeFields_.end() && !it->second.fieldOffsets.empty();
+}
+
+std::optional<std::uint64_t>
+TypeInterner::explicitFieldOffset(TypeId id, std::size_t i) const {
+    id = materialId_(id);
+    auto it = compositeFields_.find(id.v);
+    if (it == compositeFields_.end() || i >= it->second.fieldOffsets.size()) {
+        return std::nullopt;
+    }
+    return it->second.fieldOffsets[i];
 }
 
 TypeId TypeInterner::unionType(std::string_view name, std::span<TypeId const> variants) {
@@ -431,8 +524,22 @@ TypeId TypeInterner::extension(TypeKindId kind, std::string_view name,
 
 // ── TypeInterner: accessors ───────────────────────────────────────────────
 
+TypeKind TypeInterner::kind(TypeId id) const {
+    // c27 VolatileQual transparency: report the MATERIAL kind so every structural
+    // consumer (layout/arith/codegen/classification — ~128 sites) dispatches on
+    // the underlying kind WITHOUT a per-site strip. The wrapper is observable only
+    // via `isVolatileQualified` / `get()`. A non-VolatileQual id is unaffected.
+    return arena_.at(materialId_(id)).kind;
+}
+
 GuardedSpan<TypeId> TypeInterner::operands(TypeId id) const {
-    TypeRecord const& record = arena_.at(id);
+    // c27: see through a VolatileQual skin to the material type's operands — a
+    // `volatile T`'s "children" ARE T's children (e.g. layout of a
+    // VolatileQual(Ptr<X>) reads [X] exactly like Ptr<X>). Resolve the material id
+    // ONCE and use it for BOTH the record read AND the composite side-table key
+    // (so `volatile struct S` redirects to S's fields). Idempotency-safe.
+    TypeId const mid = materialId_(id);
+    TypeRecord const& record = arena_.at(mid);
     // D-CSUBSET-SELF-REFERENTIAL-STRUCT: a nominal composite stores its fields in
     // the side-table, not the operand pool — redirect transparently so every
     // existing composite-operand consumer (layout/ABI/HIR-verifier/brace-init/
@@ -440,7 +547,7 @@ GuardedSpan<TypeId> TypeInterner::operands(TypeId id) const {
     // `fields` vector is pointer-stable; the GuardedSpan still rides `poolGen_`
     // (bumped on completion) so a span held across a later mutation aborts as usual.
     if (record.kind == TypeKind::Struct || record.kind == TypeKind::Union) {
-        auto it = compositeFields_.find(id.v);
+        auto it = compositeFields_.find(mid.v);
         if (it != compositeFields_.end()) {
             return guard_<TypeId>({it->second.fields.data(), it->second.fields.size()});
         }
@@ -449,12 +556,15 @@ GuardedSpan<TypeId> TypeInterner::operands(TypeId id) const {
 }
 
 GuardedSpan<std::int64_t> TypeInterner::scalars(TypeId id) const {
-    TypeRecord const& record = arena_.at(id);
+    // c27: transparent over VolatileQual (see `operands`). Material id once, used
+    // for both the record and the composite side-table key.
+    TypeId const mid = materialId_(id);
+    TypeRecord const& record = arena_.at(mid);
     // Composite bit-field widths likewise live in the side-table (read by the
     // layout engine's "any bit-field?" test + `fieldBitWidth`); redirect to keep
     // those consumers unchanged. Enum/FnSig/array scalars stay in the pool.
     if (record.kind == TypeKind::Struct || record.kind == TypeKind::Union) {
-        auto it = compositeFields_.find(id.v);
+        auto it = compositeFields_.find(mid.v);
         if (it != compositeFields_.end()) {
             return guard_<std::int64_t>(
                 {it->second.bitWidthScalars.data(), it->second.bitWidthScalars.size()});

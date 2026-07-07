@@ -1,0 +1,16 @@
+{
+  "$comment": "c87 (D-FFI-MATH-LIBM-DT-NEEDED): the RUN witness for the libm link — 16 math.h functions (sqrt/pow/sin/cos/tan/asin/acos/atan/atan2/exp/log/log10/fabs/floor/ceil/fmod) + ldexp called on VOLATILE runtime inputs, results checked exactly where IEEE-754-exact (sqrt(4)==2, pow(2,10)==1024, ldexp(1,10)==1024, log(1)==0, fmod(10,4)==2) and within 1e-15 elsewhere -> puts marker + exit 42. On elf the imports split across TWO libraries (math.json elf library = libm.so.6; puts/exit stay libc.so.6) and the ELF walker emits one DT_NEEDED per DISTINCT library in LEXICOGRAPHIC order: `readelf -d main` shows NEEDED libc.so.6 then NEEDED libm.so.6 — the loader resolves the math symbols from libm (the c86 sqlite3 binary died at load on exactly this: `undefined symbol: sqrt`, exit 127, with only libc.so.6 NEEDED). pe imports everything from msvcrt.dll (single C runtime — unchanged). VERSIONING NOTE (D-LK-ELF-SYMBOL-VERSIONING, open): DSS's unversioned refs bind glibc's pow/log/exp GLIBC_2.2.5 compat wrappers (not the 2.29 defaults); both route to the same __ieee754_* cores so the VALUES here are bit-identical — the residual divergence is SVID errno/matherr edge handling on domain errors only. RED-ON-DISABLE: revert math.json's elf `library` to libc.so.6 -> the image carries only NEEDED libc.so.6 and ld.so refuses to load (undefined symbol: sqrt, exit 127).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "math-libm-ok\r\n",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"], "expectedStdout": "math-libm-ok\n" },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64", "expectedStdout": "math-libm-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

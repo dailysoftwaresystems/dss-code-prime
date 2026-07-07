@@ -12,6 +12,7 @@
 #include "core/types/type_lattice/type_interner.hpp"  // TypeInterner (optimizeModule arg)
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly arg)
+#include "mir/merge/synth_seh_funclets.hpp"  // MirSehScope (c116 D-WIN64-SEH-FUNCLETS)
 #include "mir/mir.hpp"  // Mir (CuMirModule member, move-only)
 #include "opt/optimizer.hpp"
 #include "program/cli_args.hpp"  // CompileConfig
@@ -229,6 +230,13 @@ struct DSS_EXPORT CuMirModule {
     // selects the right call-site opcode. nullopt iff the format declared
     // none — MIR→LIR then fails loud on any extern call.
     std::optional<ExternCallDispatch> externCallDispatch;
+    // D-LK-EXTERN-DATA-IMPORT (c117): the active object format's extern-DATA
+    // binding model (got-indirect / copy-relocation), captured here for the
+    // SAME reason as `externCallDispatch` — the LOWER half (which sees only
+    // this struct) selects how a GlobalAddr of an extern-DATA object (libc
+    // stdout) materializes its address (got-indirect → lea-of-slot + deref).
+    // nullopt iff the format declared none (data imports fail loud at link).
+    std::optional<DataImportBinding> dataImportBinding;
     // D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL: the active format's data model
     // (pointer width), captured here for the SAME reason as `externCallDispatch`
     // — the LOWER half sees only this struct, and the aggregate-global rodata
@@ -284,9 +292,16 @@ optimizeModule(Mir&                  mir,
 // assemble → symbol-table populate → user-entry scan. Consumes the `CuMirModule`
 // (its `externImports` are MOVED into MIR→LIR; its `mir` + `model` are read). Returns
 // nullopt on any back-half tier failure (diagnostics emitted via `reporter`).
+//
+// c111 (D-RUNTIME-PE-MAIN-ARGS): `processArgs` is the target format's declared
+// program-entry argument mechanism (nullopt when the format declares none). After the
+// user entry is resolved, this drives `synthesizePeStartup` — the single-CU counterpart
+// of the merge-path synth in `program.cpp` — which, for the CRT out-parameter mechanism,
+// appends the pre-main init that fetches argc/argv and retargets the entry to it.
 [[nodiscard]] DSS_EXPORT std::optional<AssembledModule>
-lowerCuMirToAssembly(CuMirModule&        cuMir,
-                     DiagnosticReporter& reporter);
+lowerCuMirToAssembly(CuMirModule&                       cuMir,
+                     std::optional<ProcessArgs> const& processArgs,
+                     DiagnosticReporter&               reporter);
 
 // LOWER half for the MERGED whole-program module (Cycle 25 Stage C). Drives the
 // single module `mergeCuMirs` produced (N CUs unified, cross-CU calls already DIRECT,
@@ -305,6 +320,10 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       std::uint16_t        callingConventionIndex,
                       CompilationUnitId    cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
+                      std::optional<DataImportBinding> dataImportBinding,
+                      // c116 (D-WIN64-SEH-FUNCLETS): SEH scope records from
+                      // `synthesizeSehFunclets` (empty for a non-SEH program).
+                      std::vector<MirSehScope> sehScopes,
                       DiagnosticReporter&  reporter);
 
 // Link N assembled CUs into one image + commit to `outPath` (the shared half of

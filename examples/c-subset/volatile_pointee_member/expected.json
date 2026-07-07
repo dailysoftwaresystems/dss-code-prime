@@ -1,0 +1,27 @@
+{
+  "$comment": "c27 (D-CSUBSET-VOLATILE-POINTEE) — the volatile-pointee STRUCT MEMBER pin (the SQLite WAL `volatile u32 **apWiData` shape, scaled down). The member `p` is `volatile int *` = Ptr<VolatileQual(int)>; `*s.p` carries MirInstFlags::Volatile so the RELEASE optimizer keeps the volatile loads/store. main() re-reads `*s.p` after a re-assign and returns 42 (volatile => observes 7, not a cached 35). Renamed in place from the retired pointee-reject example `volatile_member_error`. No stdout (libc-free); exit code only. arm64-elf runs under qemu.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

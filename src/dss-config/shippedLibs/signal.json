@@ -1,0 +1,17 @@
+{
+  "$comment": "Neutral shipped <signal.h> — c81 (the sqlite shell.c CLI route; shell.c:172 `#include <signal.h>` under !_WIN32). Surface = exactly what shell.c uses: `signal()` x3 (SIGINT/SIGTERM/SIGHUP handler registration) + `raise()` x1 (SIGTRAP debugger break under SQLITE_DEBUG_BREAK). signal's handler param/return are FUNCTION POINTERS (glibc `typedef void (*__sighandler_t)(int)`; prototype verified /usr/include/signal.h: `__sighandler_t signal(int, __sighandler_t)`) — typed as the full `ptr<fn(i32) -> void>` per house style (README `a function pointer -> ptr<fn(...) -> ...>`; the qsort/bsearch comparator in stdlib.json is the precedent), so passing a function designator type-checks exactly. ★ THE SIGNAL NUMBERS RIDE THE `macros` (PP-VISIBLE) SURFACE, NOT `constants`: shell.c GUARDS each registration with `#ifdef SIGINT`/`#ifdef SIGTERM`/`#ifdef SIGHUP` (38171/38178/38181) and the debug-break with `#elif defined(SIGTRAP)` (38164) — a semantic-only `constants` injection is invisible to the preprocessor, so the handlers would SILENTLY compile out (compile-green, run-degraded: no ^C handling). An object-like macro is also exactly what the real header ships (`#define SIGINT 2`); a macro-expanded name never reaches the semantic tier, so a duplicate `constants` row would be dead config. VALUES verified against glibc bits/signum-generic.h (x86_64 + aarch64 cross headers identical) AND agree with Darwin sys/signal.h (classic BSD numbering): SIGHUP=1 SIGINT=2 SIGTRAP=5 SIGTERM=15 -> FLAT macros, no per-format variants. SIG_DFL/SIG_IGN/SIG_ERR are NOT shipped: shell.c has 0 uses (grep-verified) and their values are object-like pointer casts ((void(*)(int))0 etc.) — additive when a consumer arrives. Gated [elf,macho]: signal.h is ISO C89 7.14 and Windows msvcrt does ship signal/raise, but the pe surface diverges (no SIGHUP/SIGTRAP on Windows — those two are POSIX) and shell.c's include is !_WIN32-guarded, so the pe form is deferred until a pe consumer needs per-format macro variants. libc symbols verified in WSL: signal@GLIBC_2.2.5 + raise@GLIBC_2.2.5 in libc.so.6 (glibc 2.34+ merged); Darwin has both in libSystem.",
+  "header": "signal.h",
+  "standard": "c89",
+  "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "symbols": [
+    { "name": "signal", "signature": "fn(i32, ptr<fn(i32) -> void>) -> ptr<fn(i32) -> void>", "kind": "function", "linkage": "external" },
+    { "name": "raise",  "signature": "fn(i32) -> i32",                                        "kind": "function", "linkage": "external" }
+  ],
+  "macros": [
+    { "name": "SIGHUP",  "replacement": "1"  },
+    { "name": "SIGINT",  "replacement": "2"  },
+    { "name": "SIGTRAP", "replacement": "5"  },
+    { "name": "SIGTERM", "replacement": "15" }
+  ]
+}

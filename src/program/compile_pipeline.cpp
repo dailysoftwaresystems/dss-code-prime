@@ -5,6 +5,7 @@
 #include "analysis/semantic/semantic_model.hpp"
 #include "asm/asm.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: BUILD half on a large stack
+#include "core/substrate/phase_timers.hpp"      // c97: per-phase --time accumulation
 #include "core/types/parse_diagnostic.hpp"
 #include "ffi/ingest.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
@@ -16,9 +17,11 @@
 #include "lir/lir_liveness.hpp"
 #include "lir/lir_regalloc.hpp"
 #include "lir/lir_rewrite.hpp"
+#include "lir/lir_wide_call_args.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly consumes it)
+#include "mir/merge/synth_pe_startup.hpp"  // synthesizePeStartup (c111 D-RUNTIME-PE-MAIN-ARGS)
 #include "opt/optimizer.hpp"
 #include "opt/passes/prune_unreachable.hpp"
 
@@ -29,6 +32,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 // Plan 14 LK10 cycle 2 — driver pipeline kernel.
@@ -84,6 +88,10 @@ bool optimizeModule(Mir&                  mir,
                     TypeInterner const&   interner,
                     CompileOptions const& opts,
                     DiagnosticReporter&   reporter) {
+    // c97: one optimize phase covering pipeline resolution + every pass +
+    // the mandatory prune-normalize — both the per-CU and merged call sites.
+    substrate::PhaseTimers::Scope optimizePhase{
+        substrate::CompilePhase::Optimize};
     auto const optEntry = reporter.errorCount();
     // MANDATORY post-lowering normalize: drop verifier-rejected unreachable
     // continuation blocks the frontend creates eagerly (D-MIR-UNREACHABLE-PRUNE-NORMALIZE).
@@ -228,10 +236,16 @@ static std::optional<CuMirModule> buildCuMirImpl(
         cc != nullptr && cc->vaListLayout.has_value()) {
         analyzeVaStrategy = cc->vaListLayout->strategy;
     }
+    // c97: sequential per-phase scoping via optional emplace — emplace
+    // destroys the prior Scope (closing its accumulation window) BEFORE
+    // opening the next, and any early return closes the live one.
+    std::optional<substrate::PhaseTimers::Scope> phase;
+    phase.emplace(substrate::CompilePhase::Semantic);
     auto model = analyze(
         std::move(borrowed), format.dataModel(), analyzeLayout, analyzeVaStrategy,
         format.kind(),       // c8: the active object-format → per-target availability gate
         target.name());      // plan 25: the active arch → per-target shipped-struct variant selector
+    phase.reset();
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
         return std::nullopt;
@@ -239,7 +253,9 @@ static std::optional<CuMirModule> buildCuMirImpl(
 
     // 2. CST → HIR.
     auto const hirEntry = reporter.errorCount();
+    phase.emplace(substrate::CompilePhase::LowerHir);
     auto hir = lowerToHir(model, reporter);
+    phase.reset();
     if (!hir || !hir->ok || !tierClean(reporter, hirEntry)) {
         return std::nullopt;
     }
@@ -319,12 +335,20 @@ static std::optional<CuMirModule> buildCuMirImpl(
         refs.reserve(hir->externDecls.size());
         for (std::size_t i = 0; i < hir->externDecls.size(); ++i) {
             auto const& r = hir->externDecls[i];
-            refs.push_back({r.node, r.canonicalName, resolvedLibs[i]});
+            // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): thread the
+            // no-library marker — FF5 then leaves the row's importLibrary
+            // EMPTY (no format-default fallback) so the reference resolves
+            // at the link tier (sibling-TU definition, or the LOUD
+            // undefined-symbol reject).
+            refs.push_back({r.node, r.canonicalName, resolvedLibs[i],
+                            r.noLibraryBinding});
         }
 
         auto const ffiEntry = reporter.errorCount();
+        phase.emplace(substrate::CompilePhase::SynthesizeFfi);
         auto const ffiResult = ffi::synthesizeFfiFromSourceDecls(
             refs, importLibrary, target, format, ffiMap, reporter);
+        phase.reset();
         (void)ffiResult;  // shape inspected via reporter.errorCount()
         if (!tierClean(reporter, ffiEntry)) {
             return std::nullopt;
@@ -359,6 +383,14 @@ static std::optional<CuMirModule> buildCuMirImpl(
     mirCfg.aggregateLayout.bitFieldStrategy = effectiveBfStrategy;
     mirCfg.aggregateLayoutLoaded = target.aggregateLayoutLoaded();
     mirCfg.dataModel             = format.dataModel();
+    // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): lift the synthetic-global
+    // SymbolId seed clear of the WHOLE semantic symbol table — the LK11
+    // merge maps MIR symbols to names through `model.recordFor`, so a
+    // synthetic literal global whose id aliased a typedef/tag/field/constant
+    // record would enter the merge as a NAMED strong definition (bogus
+    // cross-CU redefinitions; potential silent mis-merge onto a literal).
+    mirCfg.syntheticSymbolFloor =
+        static_cast<std::uint32_t>(model.symbols().size());
     // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): thread the RESOLVED calling
     // convention's by-value aggregate strategy into HIR→MIR (the §B-locked
     // boundary). A struct arg/return is classified + synthesized at HIR→MIR; the
@@ -382,11 +414,13 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // so HIR→MIR can lower va_start/va_arg (or fail loud when the CC omits it).
         mirCfg.vaListLayout             = cc->vaListLayout;
     }
+    phase.emplace(substrate::CompilePhase::LowerMir);
     auto mir = lowerToMir(hir->hir, hir->literalPool,
                           model.lattice().interner(), reporter,
                           &hir->sourceMap, mirCfg, &ffiMap,
                           &hir->linkageMap, &hir->mutabilityMap,
                           &hir->volatileMap);
+    phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;
     }
@@ -414,6 +448,10 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // D-FFI-EXTERN-CALL-DISPATCH: capture the active format's extern-call
         // shape now (the LOWER half sees only this struct, not the format).
         format.externCallDispatch(),
+        // D-LK-EXTERN-DATA-IMPORT (c117): capture the format's extern-DATA
+        // binding model now, for the same reason (the LOWER half's MIR→LIR
+        // GlobalAddr lowering selects got-indirect deref vs a direct lea).
+        format.dataImportBinding(),
         // D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL: capture the format's data
         // model now, for the same reason — the aggregate-global rodata encoder
         // (in the LOWER half) needs the pointer width to compute byte layout.
@@ -461,26 +499,53 @@ lowerMirModuleToAssembly(Mir&                                        mir,
                          std::uint16_t                               callingConventionIndex,
                          CompilationUnitId                           cuId,
                          std::optional<ExternCallDispatch>           externCallDispatch,
+                         std::optional<DataImportBinding>            dataImportBinding,
+                         // c116 (D-WIN64-SEH-FUNCLETS): the SEH scope records the
+                         // funclet-synthesis pass produced (empty for a non-SEH
+                         // module). Threaded into MIR→LIR, which emits the
+                         // SehScopeDescriptors this body then binds post-assemble.
+                         std::vector<MirSehScope>                    sehScopes,
                          DiagnosticReporter&                         reporter) {
     // 4. MIR → LIR (vreg-based). Extern imports propagate through.
     // D-FFI-EXTERN-CALL-DISPATCH: the active format's extern-call shape
     // selects the call-site opcode (indirect-slot → call_indirect_via_extern;
     // direct-plt → plain call). Threaded from the format at the driver.
+    // c97: sequential per-phase scoping (see buildCuMirImpl) — lower-lir
+    // covers 4+4b, regalloc covers 5-9, encode covers 10 + the data items.
+    std::optional<substrate::PhaseTimers::Scope> phase;
+    phase.emplace(substrate::CompilePhase::LowerLir);
     auto const lirEntry = reporter.errorCount();
     auto lir = lowerToLir(mir, target,
                           interner, reporter,
                           std::move(externImports),
-                          externCallDispatch);
+                          externCallDispatch,
+                          dataImportBinding,
+                          sehScopes);
     if (!lir.ok || !tierClean(reporter, lirEntry)) {
         return std::nullopt;
     }
 
+    // 4b. Wide-call arg materialization (D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT,
+    //     option E): BEFORE regalloc, split each Call's scalar arguments beyond
+    //     the active cc's register-passed count into `store_outgoing_arg`
+    //     carriers, so no Call holds more register-operands than the machine
+    //     passes in registers (the func-2088 wide-call blocker). Config-driven
+    //     from the cc descriptor (argGprs/argFprs/slotAligned). This is the
+    //     earliest tier that both knows the active cc AND holds the LIR.
+    auto const wideEntry = reporter.errorCount();
+    auto wideLir = lowerWideCallArgs(lir.lir, target, callingConventionIndex,
+                                     reporter);
+    if (!wideLir.ok || !tierClean(reporter, wideEntry)) {
+        return std::nullopt;
+    }
+
     // 5. Liveness analysis (input to regalloc).
-    auto const liveness = analyzeLiveness(lir.lir);
+    phase.emplace(substrate::CompilePhase::Regalloc);
+    auto const liveness = analyzeLiveness(wideLir.lir);
 
     // 6. Register allocation.
     auto const allocEntry = reporter.errorCount();
-    auto const alloc = allocateRegisters(lir.lir, target, liveness,
+    auto const alloc = allocateRegisters(wideLir.lir, target, liveness,
                                           callingConventionIndex, reporter);
     if (!alloc.ok() || !tierClean(reporter, allocEntry)) {
         return std::nullopt;
@@ -488,7 +553,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
 
     // 7. Rewrite vregs → physical registers.
     auto const rewriteEntry = reporter.errorCount();
-    auto rewritten = rewriteWithAllocation(lir.lir, target, alloc, reporter);
+    auto rewritten = rewriteWithAllocation(wideLir.lir, target, alloc, reporter);
     if (!rewritten.ok || !tierClean(reporter, rewriteEntry)) {
         return std::nullopt;
     }
@@ -503,8 +568,19 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // 9. Calling-convention materialization (prologue/epilogue,
     //    frame_load/frame_store; `arg` virtual-op rewrite is the
     //    ML7 cycle 2 gap — anchored D-LK10-2 for caller awareness).
+    // c116 H1 (D-WIN64-SEH-FUNCLETS): thread the funclet→parent bindings so each
+    // funclet's `recover_parent_frame_slot` ops resolve their slot offsets against
+    // the PARENT's finalized FrameLayout (the funclet is materialized after its
+    // parent, so the parent layout is already computed). Empty for a non-SEH module.
+    std::vector<SehFuncletParent> sehFuncletParents;
+    sehFuncletParents.reserve(sehScopes.size());
+    for (auto const& s : sehScopes) {
+        sehFuncletParents.push_back(
+            SehFuncletParent{s.filterFuncletSymbol, s.parentFuncSymbol});
+    }
     auto const ccEntry = reporter.errorCount();
-    auto cc = materializeCallingConvention(legal.lir, target, alloc, reporter);
+    auto cc = materializeCallingConvention(legal.lir, target, alloc, reporter,
+                                           sehFuncletParents);
     if (!cc.ok() || !tierClean(reporter, ccEntry)) {
         return std::nullopt;
     }
@@ -517,6 +593,7 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     //     plan 12 D-ML3-2.1 MirSourceMap IOU). Cycle 2 acceptance
     //     pins SHAPE + BYTES, not source-map fidelity.
     auto const asmEntry = reporter.errorCount();
+    phase.emplace(substrate::CompilePhase::Encode);
     std::vector<MirInstId> lirToMir(cc.lir.instCount(), InvalidMirInst);
     auto assembled = assemble(cc.lir, target, lirToMir, reporter,
                               lir.externImports);
@@ -537,6 +614,45 @@ lowerMirModuleToAssembly(Mir&                                        mir,
     // trampoline injector then falls through to its own default).
     if (userEntrySymbol.has_value()) {
         assembled.userEntrySymbol = userEntrySymbol;
+    }
+
+    // c114 (D-WIN64-PDATA-XDATA-UNWIND): project each function's frame
+    // prologue (from the callconv pass's per-function FrameLayout) onto its
+    // AssembledFunction, so a downstream unwind-table emitter (the pe64
+    // writer's .pdata/.xdata builder) can describe the frame WITHOUT a lir/
+    // dependency. Positional, mirroring the dataItems/userEntrySymbol
+    // post-`assemble()` splices: cc.perFunc and assembled.functions are BOTH
+    // guaranteed size == moduleFuncCount() (cc.ok() @561 + assembled.ok()
+    // @577) and enumerated identically (asm.cpp populates via lir.funcAt(i),
+    // the same order as perFunc's `1:1 with src.funcAt(i)`). The projection
+    // is format-neutral frame data; only the pe64 writer reads it today.
+    if (cc.perFunc.size() == assembled.functions.size()) {
+        for (std::size_t fi = 0; fi < assembled.functions.size(); ++fi) {
+            FrameLayout const& fl = cc.perFunc[fi];
+            FrameUnwindInfo ui;
+            ui.totalFrameSize      = fl.totalFrameSize;
+            ui.stackProbePageBytes = fl.stackProbePageBytes;
+            ui.usesStackProbe      = fl.stackProbePageBytes > 0
+                                  && fl.totalFrameSize > fl.stackProbePageBytes;
+            std::uint32_t const base = fl.savedRegAreaOffset();
+            ui.savedRegs.reserve(fl.savedRegs.size());
+            for (std::size_t i = 0; i < fl.savedRegs.size(); ++i) {
+                LirReg const r = fl.savedRegs[i];
+                FrameSavedReg sr;
+                // The x64 unwind register number is the HARDWARE encoding
+                // (rax=0..r15=15; xmm0=0..xmm15=15) — NOT the DSS physical
+                // ORDINAL, which offsets FPRs past the 16 GPRs (xmm14 = ordinal
+                // 30). GPR ordinal == hwEncoding so it was coincidentally right;
+                // FPR needs the mapping. registerInfo(ordinal) is the source.
+                auto const* ri = target.registerInfo(static_cast<std::uint16_t>(r.id));
+                sr.regEncoding = ri != nullptr ? ri->hwEncoding
+                                               : static_cast<std::uint16_t>(r.id);
+                sr.isFpr       = r.regClass() != LirRegClass::GPR;
+                sr.saveOffset  = base + static_cast<std::uint32_t>(i) * fl.slotSize;
+                ui.savedRegs.push_back(sr);
+            }
+            assembled.functions[fi].unwind = std::move(ui);
+        }
     }
 
     // D-LK4-RODATA-PRODUCER (2026-06-02): materialize MIR globals
@@ -578,6 +694,185 @@ lowerMirModuleToAssembly(Mir&                                        mir,
         return std::nullopt;
     }
     assembled.dataItems = std::move(dataItems);
+
+    // D-OPT-SWITCH-JUMP-TABLE (c70): materialize each dense switch's `.data`
+    // address table from the descriptors the LIR lowerer emitted. Runs AFTER
+    // assemble() because it reads each owning AssembledFunction's blockByteOffsets
+    // (populated by the assembler) to bind the synthetic per-block symbols the
+    // table's slots relocate against — those blocks have no live block-address
+    // `lea`, so the assembler's BlockSymPatch loop never bound them. Each table
+    // is one `AssembledData{Data, span*8 bytes, abs64 reloc per slot}` — the same
+    // proven shape as a c67 symbol-address global (writable-at-load `.data` so
+    // Mach-O dyld can PIE-rebase it; ELF ET_EXEC / PE `.reloc` handle the abs64
+    // in-place / via base-relocations). `absPtrRelocKind` is the target's abs64
+    // pointer reloc (found by the widthBytes==8 && !pcRelative formula above); if
+    // the target declares none, a jump table cannot be emitted → fail loud.
+    for (auto const& desc : lir.jumpTableDescriptors) {
+        if (!absPtrRelocKind.has_value()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "jump-table (SymbolId={{ {} }}) requires an absolute-64 pointer "
+                "relocation but target '{}' declares none (D-OPT-SWITCH-JUMP-"
+                "TABLE) — the dense-switch address table cannot be emitted",
+                desc.tableSymbol.v, target.name());
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        if (desc.funcIndex >= assembled.functions.size()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "jump-table descriptor names function index {} but the assembled "
+                "module has {} function(s) (D-OPT-SWITCH-JUMP-TABLE)",
+                desc.funcIndex, assembled.functions.size());
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        AssembledFunction& outFn = assembled.functions[desc.funcIndex];
+
+        // Byte offsets already bound into blockSymbols (e.g. a target block that
+        // is ALSO a computed-goto `&&label`) — don't double-bind those.
+        std::unordered_set<std::uint32_t> alreadyBound;
+        for (auto const& bs : outFn.blockSymbols) alreadyBound.insert(bs.symbol.v);
+
+        AssembledData table;
+        table.symbol    = desc.tableSymbol;
+        table.section   = DataSectionKind::Data;
+        table.alignment = Alignment::ofRuntimePow2(8);
+        table.bytes.assign(desc.slotCount * 8u, std::uint8_t{0});
+        table.relocations.reserve(desc.slotBindings.size());
+
+        bool tableOk = true;
+        for (auto const& [lirBlockV, slotIdx] : desc.slotBindings) {
+            auto symIt = desc.blockSymbols.find(lirBlockV);
+            if (symIt == desc.blockSymbols.end()) { tableOk = false; break; }
+            SymbolId const blkSym = symIt->second;
+            // Bind the block symbol from the function's byte-offset map (once per
+            // distinct symbol; a gap/duplicate reuses the same SymbolId).
+            if (alreadyBound.insert(blkSym.v).second) {
+                auto offIt = outFn.blockByteOffsets.find(lirBlockV);
+                if (offIt == outFn.blockByteOffsets.end()) { tableOk = false; break; }
+                outFn.blockSymbols.push_back(
+                    SyntheticBlockSymbol{blkSym, offIt->second});
+            }
+            // abs64 reloc at slot byte offset (slotIdx * 8) → the block symbol.
+            table.relocations.push_back(Relocation{
+                static_cast<std::uint32_t>(slotIdx * 8u),
+                blkSym, *absPtrRelocKind, /*addend=*/0});
+        }
+        if (!tableOk) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "jump-table (SymbolId={{ {} }}) references a target block with no "
+                "byte offset or symbol — malformed descriptor (D-OPT-SWITCH-JUMP-"
+                "TABLE)", desc.tableSymbol.v);
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        assembled.dataItems.push_back(std::move(table));
+    }
+
+    // c78 (D-CSUBSET-FLOAT-NEG-ENCODING): materialize each x86-style float-negate
+    // sign-mask the LIR lowerer recorded. Each is a 16-byte, 16-byte-aligned
+    // `.rodata` item whose low bytes carry the sign bit (bit 63 for F64 / bit 31
+    // for F32) and whose high bytes are zero — bit-identical to gcc's `.LC0`
+    // (F64: 00 00 00 00 00 00 00 80  00×8) / `.LC1` (F32: 00 00 00 80  00×12).
+    // The `xorpd/xorps xmm, [rip+mask]` memory operand MUST be 16-byte aligned at
+    // runtime; the 16-byte `Alignment` + the section-alignment layout (ELF
+    // sh_addralign; PE 4 KiB sectionAlignment) guarantee it. NO relocations (a
+    // pure constant) — CONST → `.rodata` (read-only; a store would never occur).
+    for (auto const& mask : lir.signMaskConstants) {
+        AssembledData m;
+        m.symbol    = mask.symbol;
+        m.section   = DataSectionKind::Rodata;
+        m.alignment = Alignment::ofRuntimePow2(16);
+        m.bytes.assign(16u, std::uint8_t{0});
+        if (mask.isF64) {
+            m.bytes[7] = 0x80u;   // low qword = 0x8000000000000000 (bit 63)
+        } else {
+            m.bytes[3] = 0x80u;   // low dword = 0x80000000 (bit 31)
+        }
+        assembled.dataItems.push_back(std::move(m));
+    }
+
+    // c116 (D-WIN64-SEH-FUNCLETS): bind each SEH scope descriptor to its owning
+    // function's `FrameUnwindInfo.sehScopes`. Runs AFTER the unwind projection
+    // (which created the FrameUnwindInfo) AND after assemble() (which populated each
+    // function's `blockByteOffsets`) — the same ordering the c70 jump-table binding
+    // relies on. Translates the descriptor's LIR block ids to byte offsets within
+    // the parent function; the pe writer resolves the funclet + personality symbols
+    // to image-RVAs and emits the __C_specific_handler scope table + EHANDLER.
+    for (auto const& desc : lir.sehScopeDescriptors) {
+        if (desc.funcIndex >= assembled.functions.size()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "SEH scope descriptor names function index {} but the assembled "
+                "module has {} function(s) (D-WIN64-SEH-FUNCLETS)",
+                desc.funcIndex, assembled.functions.size());
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        AssembledFunction& outFn = assembled.functions[desc.funcIndex];
+        if (!outFn.unwind.has_value()) {
+            // A SEH-guarding function ALWAYS has a frame (the unwind projection
+            // attaches FrameUnwindInfo to every callconv'd function). A missing one
+            // means the projection was skipped — fail loud, never emit a dangling
+            // scope table with no UNWIND_INFO to host it.
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "SEH scope on function index {} has no FrameUnwindInfo to host its "
+                "scope table (D-WIN64-SEH-FUNCLETS)", desc.funcIndex);
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        auto beginIt = outFn.blockByteOffsets.find(desc.beginLirBlockV);
+        auto endIt   = outFn.blockByteOffsets.find(desc.endLirBlockV);
+        auto handIt  = outFn.blockByteOffsets.find(desc.handlerLirBlockV);
+        if (beginIt == outFn.blockByteOffsets.end()
+            || endIt == outFn.blockByteOffsets.end()
+            || handIt == outFn.blockByteOffsets.end()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "SEH scope on function index {} references a block with no byte "
+                "offset (begin={}, end={}, handler={}) — malformed descriptor "
+                "(D-WIN64-SEH-FUNCLETS)", desc.funcIndex, desc.beginLirBlockV,
+                desc.endLirBlockV, desc.handlerLirBlockV);
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        // The guarded PC range's END = one-past the guarded body's LAST block =
+        // the byte offset of whatever block is laid out immediately AFTER it. Block
+        // LAYOUT order is NOT MIR creation order (the optimizer's mandatory prune
+        // reorders by RPO), so compute it as the smallest block offset STRICTLY
+        // GREATER than the guarded body's last-block offset — or the function's
+        // total byte size if that block is laid out last. (c116a: the guarded body
+        // is a single block, so `endLirBlockV == beginLirBlockV`.)
+        std::uint32_t const lastBlockOff = endIt->second;
+        std::uint32_t endByteOffset =
+            static_cast<std::uint32_t>(outFn.bytes.size());
+        for (auto const& [blkV, off] : outFn.blockByteOffsets) {
+            (void)blkV;
+            if (off > lastBlockOff && off < endByteOffset) endByteOffset = off;
+        }
+        SehScopeEntry e;
+        e.beginByteOffset      = beginIt->second;
+        e.endByteOffset        = endByteOffset;
+        e.jumpTargetByteOffset = handIt->second;
+        e.filterFuncletSymbol  = desc.filterFuncletSymbol;
+        e.personalitySymbol    = desc.personalitySymbol;
+        outFn.unwind->sehScopes.push_back(e);
+    }
 
     // D-LK4-3: stamp the owning CompilationUnit's id so the linker keys this
     // module's symbols by `(cuId, SymbolId)`. Single-CU build → one cuId; a merged
@@ -717,17 +1012,44 @@ resolveSingleCuUserEntry(SemanticModel const& model, GrammarSchema const& gramma
 // and the entry symbol resolved by the CU-specific scan above. Produces output
 // byte-identical to the pre-Cycle-25 monolith for any single-CU build.
 std::optional<AssembledModule>
-lowerCuMirToAssembly(CuMirModule& cuMir, DiagnosticReporter& reporter) {
+lowerCuMirToAssembly(CuMirModule&                       cuMir,
+                     std::optional<ProcessArgs> const& processArgs,
+                     DiagnosticReporter&               reporter) {
     SemanticModel&       model   = cuMir.model;
     GrammarSchema const& grammar = *cuMir.grammar;
 
     // Resolve the user-entry FIRST (fail-loud on ambiguity, exactly as the inline
     // scan did) so a multi-entry source halts before lowering — same observable
-    // failure point as pre-Cycle-25.
+    // failure point as pre-Cycle-25. Non-const: `synthesizePeStartup` may retarget it.
     bool entryOk = true;
-    std::optional<SymbolId> const userEntry =
+    std::optional<SymbolId> userEntry =
         resolveSingleCuUserEntry(model, grammar, reporter, entryOk);
     if (!entryOk) return std::nullopt;
+
+    // c111 (D-RUNTIME-PE-MAIN-ARGS): single-CU counterpart of the merge-path synth
+    // (program.cpp). When the target format fetches argc/argv via a CRT out-parameter
+    // call (Windows), append the pre-main init that makes that call + forwards
+    // (argc, argv) to the user entry, retargeting `userEntry` to it. A no-op for every
+    // other mechanism / a no-arg entry. The CU is already per-CU-optimized here, so the
+    // appended init skips the optimizer but is lowered like any other function; the
+    // interner is the CU model's (the type space this CU's TypeIds index into).
+    if (processArgs.has_value()) {
+        if (!synthesizePeStartup(cuMir.mir, model.lattice().interner(),
+                                 userEntry, cuMir.externImports,
+                                 *processArgs, reporter)) {
+            return std::nullopt;  // malformed argv parameter type — fail-loud reported.
+        }
+    }
+
+    // c116 (D-WIN64-SEH-FUNCLETS): synthesize the SEH filter funclets + record the
+    // scope ranges (post-optimize; the CU is already optimized here). Trigger =
+    // presence of SehTryBegin — a no-op fast-return for the overwhelming majority
+    // of TUs. Appends the __C_specific_handler personality import on demand.
+    std::vector<MirSehScope> sehScopes;
+    if (!synthesizeSehFunclets(cuMir.mir, model.lattice().interner(),
+                               cuMir.externImports, sehScopes, reporter)) {
+        return std::nullopt;  // unsupported SEH shape (c116b frontier) — fail-loud.
+    }
 
     // `nameOf`: SymbolId → declared name. A SymbolId with no record (synthesized /
     // out-of-range) yields "" — the LK11a symbol-table populate then skips it as
@@ -742,7 +1064,8 @@ lowerCuMirToAssembly(CuMirModule& cuMir, DiagnosticReporter& reporter) {
         std::move(cuMir.externImports), userEntry, *cuMir.target,
         cuMir.dataModel, cuMir.bitFieldStrategy,
         cuMir.callingConventionIndex, cuMir.cuId,
-        cuMir.externCallDispatch, reporter);
+        cuMir.externCallDispatch, cuMir.dataImportBinding,
+        std::move(sehScopes), reporter);
 }
 
 // LOWER half (merged whole-program): thin wrapper over the shared
@@ -767,6 +1090,8 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       std::uint16_t       callingConventionIndex,
                       CompilationUnitId   cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
+                      std::optional<DataImportBinding> dataImportBinding,
+                      std::vector<MirSehScope> sehScopes,
                       DiagnosticReporter& reporter) {
     // `nameOf`: merged SymbolId → declared name from the merge's `symbolNames` map.
     // A synthesized / nameless merged symbol is absent from the map → "" → skipped
@@ -780,7 +1105,7 @@ lowerMergedToAssembly(MergedMirModule&    merged,
         merged.mir, merged.host.interner(), nameOf,
         std::move(merged.externImports), merged.userEntrySymbol, target,
         dataModel, bitFieldStrategy, callingConventionIndex, cuId,
-        externCallDispatch, reporter);
+        externCallDispatch, dataImportBinding, std::move(sehScopes), reporter);
 }
 
 // Link N assembled CUs into one image + commit to disk. N==1 is the v1 single-CU
@@ -791,6 +1116,8 @@ bool linkAndWrite(std::span<AssembledModule const> modules,
                   ObjectFormatSchema const&        format,
                   std::filesystem::path const&     outPath,
                   DiagnosticReporter&              reporter) {
+    // c97: link phase — resolution + byte emission + image write.
+    substrate::PhaseTimers::Scope linkPhase{substrate::CompilePhase::Link};
     auto const linkEntry = reporter.errorCount();
     auto image = linker::link(modules, target, format, reporter);
     if (!image.ok() || !tierClean(reporter, linkEntry)) {
@@ -823,7 +1150,7 @@ assembleUnit(CompilationUnit const&        cu,
     auto cuMir = buildCuMir(cu, grammar, target, format,
                             callingConventionIndex, reporter, opts);
     if (!cuMir) return std::nullopt;
-    return lowerCuMirToAssembly(*cuMir, reporter);
+    return lowerCuMirToAssembly(*cuMir, format.processArgs(), reporter);
 }
 
 bool compileSingleUnit(CompilationUnit const&        cu,

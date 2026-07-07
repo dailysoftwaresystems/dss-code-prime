@@ -42,6 +42,7 @@
 
 # Build directory
 .temp/
+.cache/
 build/
 build-wsl/
 # Ad-hoc out-of-source build dirs (e.g. build-rel / build-dbg used for

@@ -1,25 +1,29 @@
 // D-SEMANTIC-ASSIGN-STMT-ASSIGNABILITY-BYPASS witness (negative / diagnostic):
-// the assignment STATEMENT `x = f;` (int <- float) must fail loud with the SAME
-// positioned S_TypeMismatch the INIT site (`int x = f;`) already emits. Pre-fix
-// the bare assignment ran NO semantic assignability check (only the
-// S_ConstViolation check) — type compatibility was enforced only downstream by
-// the HIR coerce() (which silently truncated float->int, a correct C VALUE but
-// the c-subset "no silent C-style implicit conversion" strictness bypassed). The
-// fix routes the assignment RHS through the SAME shared `isAssignable` chokepoint
-// the init / call-arg / return sites use, positioned at the RHS.
+// the assignment STATEMENT `p = q;` (int* <- char*, distinct typed pointers) must
+// fail loud with the SAME positioned S_TypeMismatch the INIT site (`int* p = q;`)
+// already emits. Pre-fix the bare assignment ran NO semantic assignability check
+// (only the S_ConstViolation check) — type compatibility was enforced only
+// downstream. The fix routes the assignment RHS through the SAME shared
+// `isAssignable` chokepoint the init / call-arg / return sites use.
 //
-// `f` is a PARAMETER (no narrowing initializer), so exactly ONE mismatch fires —
-// the `x = f;` statement at 22:9 (the RHS). A valid assignment (`x = 5;`) is unaffected
-// (same int<-int path the four checked sites accept). Front-end only
-// (semantic-tier), so any single target witnesses it.
+// NOTE: this corpus originally used `int x; x = f;` (int <- float), but
+// D-CSUBSET-INT-FLOAT-CONVERSION made int<->float an ADMITTED implicit assignment
+// conversion in c-subset, so that pair is no longer a mismatch. A distinct-typed-
+// pointer pair (`int*` <- `char*`) is the stable always-rejected case that still
+// exercises the assignment-statement assignability path; it is NOT a null-pointer
+// constant (q is a parameter, not literal 0), so it stays a loud mismatch.
+//
+// `q` is a PARAMETER, so exactly ONE mismatch fires — the `p = q;` statement at
+// 23:9 (the RHS). A valid assignment (`p = z;`, int*<-int*) is unaffected.
+// Front-end only (semantic-tier), so any single target witnesses it.
 //
 // RED-ON-DISABLE: delete the assignment-statement `isAssignable` arm in
-// semantic_analyzer.cpp (restore the bypass) -> `x = f;` is silently accepted,
+// semantic_analyzer.cpp (restore the bypass) -> `p = q;` is silently accepted,
 // no S_TypeMismatch fires, and the expect-diagnostics set is empty -> mismatch.
-int sink(float f) {
-    int x;
-    x = 5;     // valid int<-int assignment statement — must stay clean
-    x = f;     // invalid int<-float assignment statement — S_TypeMismatch here
-    return x;
+int sink(char* q, int* z) {
+    int* p;
+    p = z;     // valid int*<-int* assignment statement — must stay clean
+    p = q;     // invalid int*<-char* assignment statement — S_TypeMismatch here
+    return *p;
 }
 int main(void) { return 0; }

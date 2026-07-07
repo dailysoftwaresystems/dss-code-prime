@@ -701,3 +701,67 @@ TEST(CliArgs, OutputFlagMissingValueRejected) {
     EXPECT_FALSE(r.has_value())
         << "--output with no following arg must reject";
 }
+
+// ── c105 (D-PP-USER-DEFINE): the --define CLI surface ────────────────────────
+
+TEST(CliArgs, DefineFlagCollectsRepeatableVerbatim) {
+    // Both spellings (`--define X` / `--define=Y=2`), repeatable, carried
+    // VERBATIM (the preprocessor splits NAME=VALUE; the CLI only validates).
+    Argv a{"dss-code-prime", "--compile", "hello.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--define", "X",
+           "--define=Y=2"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->defines.size(), 2u);
+    EXPECT_EQ(r->defines[0], "X");
+    EXPECT_EQ(r->defines[1], "Y=2");
+}
+
+TEST(CliArgs, DefineFlagFunctionLikeRejected) {
+    // A '(' in NAME = a function-like -D — unsupported; must reject with a
+    // pointer at the config predefinedMacros params axis, never half-parse.
+    Argv a{"dss-code-prime", "--compile", "hello.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--define", "F(x)=x"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidDefine);
+}
+
+TEST(CliArgs, DefineFlagNonIdentifierNameRejected) {
+    // c105 audit M1: trailing junk in NAME (`FOO,BAR=1`) must reject LOUDLY —
+    // passed through, the prologue would define macro FOO with replacement
+    // `, BAR 1` (a silently wrong macro; gcc: "macro names must be
+    // identifiers"). Also pins the leading-digit arm.
+    {
+        Argv a{"dss-code-prime", "--compile", "hello.c",
+               "--language", "c-subset",
+               "--target", "x86_64:elf64-x86_64-linux",
+               "--define", "FOO,BAR=1"};
+        auto r = parseCliArgs(a.argc(), a.argv());
+        ASSERT_FALSE(r.has_value());
+        EXPECT_EQ(r.error().kind, CliArgsError::InvalidDefine);
+    }
+    {
+        Argv a{"dss-code-prime", "--compile", "hello.c",
+               "--language", "c-subset",
+               "--target", "x86_64:elf64-x86_64-linux",
+               "--define", "1BAD=2"};
+        auto r = parseCliArgs(a.argc(), a.argv());
+        ASSERT_FALSE(r.has_value());
+        EXPECT_EQ(r.error().kind, CliArgsError::InvalidDefine);
+    }
+}
+
+TEST(CliArgs, DefineFlagEmptyNameRejected) {
+    Argv a{"dss-code-prime", "--compile", "hello.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--define", "=2"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidDefine);
+}

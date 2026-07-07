@@ -98,10 +98,40 @@ using CstSizeofResolver =
 using CstSymbolValueResolver =
     std::function<std::optional<HirLiteralValue>(NodeId, std::uint32_t)>;
 
+// c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A): resolved cast-target shape.
+// The CST engine is interner-free, so the closure (semantic side) introspects the
+// resolved target type and hands back exactly what the fold needs: whether it is a
+// pointer (an int 0 → a null address; ptr→ptr identity) and, for an integer
+// target, its width/signedness (so the engine narrows an int cast correctly —
+// e.g. the `(size_t)` that terminates the offsetof idiom — without a TypeInterner).
+struct CstCastTarget {
+    bool   isPointer = false;
+    bool   isInteger = false;
+    int    intBits   = 0;       // integer target width (8/16/32/64)
+    bool   intSigned = false;
+    TypeId pointeeType{};       // a pointer target's pointee (retype / future stride)
+};
+
+// c43: cast-target resolver — given a cast CST node, return its TARGET descriptor
+// (via resolveTypeNode + a width/pointer classification), or nullopt. Absent ⇒
+// casts stay non-foldable (the prior behaviour). Recognizes `(T*)0`, `(char*)x`,
+// and `(size_t)int` (the offsetof spine).
+using CstCastTargetResolver = std::function<std::optional<CstCastTarget>(NodeId)>;
+
+// c43: field-offset resolver — given a struct/union CONTAINER TypeId + a field-name
+// token, return the field's {byteOffset, fieldType}, or nullopt (unknown field /
+// bit-field / no layout params / not a composite). Owns computeLayout + the
+// composite member-scope lookup; lets the engine fold `&((T*)0)->M` member offsets.
+struct CstFieldResolution { std::uint64_t offset = 0; TypeId fieldType{}; };
+using CstFieldOffsetResolver =
+    std::function<std::optional<CstFieldResolution>(TypeId, NodeId)>;
+
 struct CstEvalEnvironment {
     CstSymbolInitResolver  resolveSymbolInit{};
     CstSymbolValueResolver resolveSymbolValue{};  // Item 1 — direct inline constant value
     CstSizeofResolver      resolveSizeof{};   // FC6 — sizeof in a const-expr context
+    CstCastTargetResolver  resolveCastTarget{};   // c43 — (T*)0 / (char*)x / (size_t)int
+    CstFieldOffsetResolver resolveFieldOffset{};  // c43 — &((T*)0)->M offsets
 };
 
 // Static recognition context. All fields are non-owning references

@@ -1,0 +1,17 @@
+{
+  "$comment": "c82 D-CSUBSET-ARRAY-ARROW-DECAY (C 6.3.2.1p3 + 6.5.2.3): an ARRAY LHS of `->` decays to &elem[0] — the sqlite shell.c `data.aAuxDb->zDbFilename` shape (in-struct array member) + a file-scope array-of-struct. Element-0 IDENTITY proven (arrow writes read back via explicit [0]; neighbors untouched; off-offset-0 member). 40+2 = 42. RED-ON-DISABLE: revert the semantic Array arm -> S000E, or the lowering decay -> H0001 (both witnessed pre-fix). gcc -std=c17 cross-checked (42).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

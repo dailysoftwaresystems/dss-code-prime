@@ -51,6 +51,7 @@ namespace {
         case TypeKind::Param:     return "Param";
         case TypeKind::Bind:      return "Bind";
         case TypeKind::Extension: return "Extension";
+        case TypeKind::VolatileQual: return "VolatileQual";
         case TypeKind::Count_:    return "Count_";
     }
     return "<unknown>";
@@ -95,7 +96,26 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
     if (auto it = remap.find(srcId.v); it != remap.end()) return it->second;
 
     TypeInterner& dst        = dstHost.interner();
-    TypeKind const kind      = src.kind(srcId);
+    // c27 (D-CSUBSET-VOLATILE-POINTEE): read the RAW record kind, NOT the
+    // transparent `kind()` — `kind()` sees THROUGH a VolatileQual skin to the
+    // material kind, so using it here would reintern a `volatile T` AS a plain `T`,
+    // silently DROPPING the qualifier (a miscompile in the cross-CU merge / text
+    // round-trip). The raw kind preserves VolatileQual so the wrapper round-trips.
+    TypeKind const kind      = src.get(srcId).kind;
+
+    // ── volatile qualifier (D-CSUBSET-VOLATILE-POINTEE) ──
+    // A VolatileQual wraps exactly ONE inner type. Re-intern the inner into the
+    // host, then re-wrap. Handled HERE (before the transparent operand read below)
+    // because `src.operands(VolatileQual(T))` redirects to T's operands (NOT [T]).
+    // `stripVolatile` recovers the inner (idempotency keeps VolatileQual one level
+    // deep, so the strip yields exactly the wrapped type).
+    if (kind == TypeKind::VolatileQual) {
+        TypeId const inner  = reinternType(src, src.stripVolatile(srcId),
+                                           dstHost, remap);
+        TypeId const result = dst.volatileQualified(inner);
+        remap.emplace(srcId.v, result);
+        return result;
+    }
 
     // ── NOMINAL composites (D-CSUBSET-SELF-REFERENTIAL-STRUCT) ──
     // A composite's field list may CONTAIN A CYCLE — a self-referential
@@ -131,7 +151,17 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
             for (std::int64_t enc : srcWidths)
                 widths.push_back(enc <= 0 ? kNotBitfield : enc - 1);
         }
-        dst.completeComposite(fwd, fields, widths);
+        // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): carry EXPLICIT field offsets across
+        // reintern — without this the reinterned composite loses its overlapping
+        // layout (HighPart falls back to natural offset 8) and forks the TypeId that
+        // `.member` scope keys on. Empty when the source lays out naturally.
+        std::vector<std::uint64_t> offsets;
+        if (src.hasExplicitOffsets(srcId)) {
+            offsets.reserve(srcFields.size());
+            for (std::size_t i = 0; i < srcFields.size(); ++i)
+                offsets.push_back(src.explicitFieldOffset(srcId, i).value_or(0));
+        }
+        dst.completeComposite(fwd, fields, widths, offsets);
         return fwd;
     }
 

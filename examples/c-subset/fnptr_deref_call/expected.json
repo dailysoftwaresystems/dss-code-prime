@@ -1,0 +1,34 @@
+{
+  "$comment": "c54 (D-CSUBSET-FUNCTION-POINTER-DEREF): calling through a dereferenced pointer-to-a-function-pointer. SQLite os_unix `pLockingStyle = (**(finder_type*)pVfs->pAppData)(zFilename, pNew)` (sqlite3.c:46575; finder_type is a fn-ptr typedef, so finder_type* = Ptr<Ptr<FnSig>>) fired S0004 S_NotCallable: checkCall's structural deref-peel descended PAST each `*` and typed the inner node (right for the function-designator collapse `*fp==fp`, but it dropped a real pointer level for a data pointer). Fix: when the whole-callee type (subtreeType, applying derefResultType per `*`) is callable, it governs the triage. Semantic-only (the fn-ptr deref + indirect-call lowering was already correct). VALUE-CORRECT (sum/return 42): a=(**(finder_t*)app)(2)==add40(2)==42 (the exact sqlite cast+double-deref shape, app a void* aliasing &f); b=(*pf)(2)==add40(2)==42 (single-deref through finder_t*, the smaller form). RED-ON-DISABLE: revert the upgrade -> both forms land on the pointer-to-fn-ptr -> S0004 (does not compile). Pure c-subset (no shipped headers) -> all 4 targets; pe RUNS on Windows for a host runtime check.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

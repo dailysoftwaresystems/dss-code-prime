@@ -1,5 +1,6 @@
 #include "link/format/pe.hpp"
 
+#include "asm/format/x86_variable.hpp"   // kStackProbeLoopBytes (unwind allocLen)
 #include "core/types/parse_diagnostic.hpp"
 #include "link/format/byte_emit.hpp"
 #include "link/format/exec_data_section.hpp"
@@ -12,6 +13,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <span>
@@ -76,6 +78,363 @@ constexpr std::size_t   kRelocRecordSize   = 10;
 
 // Byte-emit helpers + emit() + requireSection() now hoisted to
 // `src/link/format/byte_emit.hpp` (simplifier fold-in #1+#3).
+
+// ── Per-machine import-THUNK substrate (MIRRORS macho.cpp's __stubs
+//    and elf.cpp's PLT) — D-FFI-PE-IMPORT-THUNK ───────────────────
+//
+// A PE import thunk plays the same role as an ELF PLT stub / Mach-O
+// `__stubs` entry: one code thunk per extern, jumping indirectly
+// through the extern's IAT slot (the loader-patched FirstThunk). With
+// `externCallDispatch == direct-plt`, `symbolVa[extern]` names the
+// THUNK (code), so an ADDRESS-TAKEN import is a CALLABLE address and a
+// plain `call rel32 → thunk` reaches the callee. This retires the
+// crash where `symbolVa[extern]` named the IAT *data* slot: taking an
+// import's address and calling it indirectly (`call *reg`) jumped into
+// `.idata` and executed the pointer bytes as code (sqlite os_win.c
+// `aSyscall[]` on Windows — the pe64 leg's last run-green blocker).
+//
+// IMAGE_FILE_MACHINE (object_format_schema.hpp): AMD64 = 0x8664,
+// ARM64 = 0xAA64. The walker dispatches on the schema's `machine`
+// (read as DATA) — a 2nd ISA = a new size arm + a new emitter + a new
+// dispatch case, all localized here (the elf.cpp / macho.cpp
+// precedent). Only x86_64 ships a PE exec target today; arm64-PE has
+// no shipped format, so its emitter is deferred behind the fail-loud
+// `default` (NOT a silent tight slice — a real diagnostic).
+constexpr std::uint16_t kMachineAmd64PE = 0x8664;
+
+constexpr std::size_t kX86_64PeThunkSize = 6;  // FF 25 disp32
+
+// Per-machine import-thunk entry size in bytes. Returns 0 for an
+// unhandled machine — every CALLER pairs the size query with
+// `emitPeThunk`, whose `default` fails loud, so a 0 here never
+// silently ships a zero-stride thunk block.
+[[nodiscard]] constexpr std::size_t
+peThunkSizeFor(std::uint16_t machine) noexcept {
+    switch (machine) {
+        case kMachineAmd64PE: return kX86_64PeThunkSize;
+    }
+    return 0u;
+}
+
+// Emit one x86_64 import thunk into `text` at [thunkOff .. thunkOff+6):
+// 6-byte `FF 25 disp32` = `jmp *(rip + disp32)` jumping indirectly
+// through the extern's IAT slot. disp32 is PC-relative from the END of
+// the 6-byte instruction. Byte-shape-IDENTICAL to macho.cpp's
+// `emitX86_64MachoStub` (which jumps through `__got`) — the only
+// difference is the slot section (PE `.idata` IAT vs Mach-O `__got`),
+// both loader-patched pointer tables. The caller has already RESERVED
+// these 6 bytes (Phase (a2) `text.resize`), so this writes in place.
+[[nodiscard]] inline bool emitX86_64PeThunk(
+        std::vector<std::uint8_t>& text,
+        std::size_t                thunkOff,
+        std::uint64_t              thunkVa,
+        std::uint64_t              iatSlotVa,
+        std::size_t                externIdx,
+        DiagnosticReporter&        reporter) {
+    std::int64_t const disp =
+        static_cast<std::int64_t>(iatSlotVa) -
+        static_cast<std::int64_t>(thunkVa + kX86_64PeThunkSize);
+    if (disp < std::numeric_limits<std::int32_t>::min()
+     || disp > std::numeric_limits<std::int32_t>::max()) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("pe::encodeExec: import-thunk disp32 overflow "
+                         "(0x{:x}) for extern #{}; image too large for a "
+                         "32-bit PC-relative IAT reference.",
+                         static_cast<std::uint64_t>(disp), externIdx));
+        return false;
+    }
+    auto const d32 =
+        static_cast<std::uint32_t>(static_cast<std::int32_t>(disp));
+    text[thunkOff + 0] = 0xFFu;
+    text[thunkOff + 1] = 0x25u;
+    text[thunkOff + 2] = static_cast<std::uint8_t>(d32 & 0xFFu);
+    text[thunkOff + 3] = static_cast<std::uint8_t>((d32 >> 8) & 0xFFu);
+    text[thunkOff + 4] = static_cast<std::uint8_t>((d32 >> 16) & 0xFFu);
+    text[thunkOff + 5] = static_cast<std::uint8_t>((d32 >> 24) & 0xFFu);
+    return true;
+}
+
+// Per-machine import-thunk dispatch (mirrors macho.cpp's `emitMachoStub`
+// / elf.cpp's `emitPltStub`). Writes exactly `peThunkSizeFor(machine)`
+// bytes into `text` at `thunkOff` on success. Fail-loud `default` — NO
+// silent zero-byte thunk for an unhandled machine.
+[[nodiscard]] inline bool emitPeThunk(
+        std::uint16_t              machine,
+        std::vector<std::uint8_t>& text,
+        std::size_t                thunkOff,
+        std::uint64_t              thunkVa,
+        std::uint64_t              iatSlotVa,
+        std::size_t                externIdx,
+        DiagnosticReporter&        reporter) {
+    switch (machine) {
+        case kMachineAmd64PE:
+            return emitX86_64PeThunk(text, thunkOff, thunkVa, iatSlotVa,
+                                     externIdx, reporter);
+    }
+    emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+         std::format("pe::encodeExec: machine 0x{:x} has no import-thunk "
+                     "emitter — the PE dynamic-import path supports x86_64 "
+                     "(0x{:x}). Add a per-machine emitter (see emitPeThunk) "
+                     "to ship address-taken FFI for this architecture.",
+                     machine, kMachineAmd64PE));
+    return false;
+}
+
+// ── Windows x64 unwind info (.xdata UNWIND_INFO) — D-WIN64-PDATA-XDATA-UNWIND
+//
+// The x64 SEH/unwind ABI (learn.microsoft.com/cpp/build/exception-handling-x64)
+// describes each function's PROLOGUE so RtlVirtualUnwind can reconstruct the
+// caller's context from a fault anywhere in the body. The DSS x86_64 prologue is
+// `sub rsp, frame` (or, for `frame > stackProbePageBytes`, the inline page-probe
+// loop) then one `mov [rsp + saveOffset], reg` per used callee-save — no push,
+// no frame pointer. So the unwind codes are UWOP_ALLOC_{SMALL,LARGE} for the RSP
+// adjustment + UWOP_SAVE_NONVOL per saved GPR. A saved FPR (MS-x64 xmm6..15) is
+// spilled low-64 via MOVSD, for which there is no matching UWOP (SAVE_XMM128
+// describes a full-16-byte MOVAPS slot); since an xmm save does not move RSP it is
+// OMITTED from the codes — the RSP/return-address walk stays exact. Its handler-
+// case RESTORE is deferred to D-WIN64-XMM-UNWIND-RESTORE (c116).
+//
+// CRITICAL (audit-F1): each UNWIND_CODE's CodeOffset = the byte offset of the END
+// of the instruction that performs that op (NOT the whole-prologue length); the
+// `sub`/probe is FIRST (small offset), the saves AFTER (larger offsets); the array
+// must be emitted SORTED DESCENDING by CodeOffset. `SizeOfProlog` (a separate
+// header byte) is the whole-prologue length. All offsets are single bytes — a
+// prologue > 255 B is undescribable (fails loud → D-WIN64-CHKSTK-LARGE-PROLOGUE).
+//
+// Byte lengths are recomputed deterministically from FrameUnwindInfo (the
+// x86-variable encoder never emits a shorter-than-worst-case form for a fixed
+// operand shape): `sub rsp,imm32` = 7 B; the inline stack-probe loop = a FIXED
+// `kStackProbeLoopBytes` (37 B — the loop iterates at RUNTIME, it is not
+// unrolled per page; sourced from x86_variable.hpp so it can't drift from
+// emitStackProbeLoop); each GPR save `mov [rsp+disp32],r` = 8 B, each FPR save
+// `movsd [rsp+disp32],xmm` = 8 B (xmm0–7) / 9 B (xmm8–15). A first-byte-opcode
+// check fail-louds if the real prologue diverges.
+constexpr std::uint8_t kUwopAllocLarge  = 1;  // 2 nodes (opinfo 0, size/8 as u16) — frames ≤ 512 KiB
+constexpr std::uint8_t kUwopAllocSmall  = 2;  // 1 node, opinfo = size/8 - 1 — frames 8..128 B
+constexpr std::uint8_t kUwopSaveNonvol  = 4;  // 2 nodes (opinfo=reg, offset/8 as u16)
+constexpr std::size_t  kRuntimeFunctionSize = 12;  // BeginAddress + EndAddress + UnwindInfoAddress (3 u32)
+
+// Build one function's UNWIND_INFO blob (aligned to a multiple of 4 bytes so the
+// next one and any RUNTIME_FUNCTION stays DWORD-aligned). Returns nullopt (with a
+// loud diagnostic) on a >255-byte prologue, a > 512 KiB frame, a non-8-aligned
+// frame/save, or a prologue-shape mismatch — never a silent wrong table.
+// c116 (D-WIN64-SEH-FUNCLETS): one deferred back-patch of
+// the UNWIND_INFO exception-handler RVA field (the __C_specific_handler personality
+// THUNK RVA — a .text address resolved only in the LATER .idata pass). `xdataOffset`
+// is the byte offset WITHIN the whole `.xdata` blob of the 4-byte field; `symbol`
+// is the personality extern whose thunk RVA is written there.
+struct SehHandlerPatch { std::uint32_t xdataOffset; SymbolId symbol; };
+
+[[nodiscard]] inline std::optional<std::vector<std::uint8_t>>
+buildFunctionUnwindInfo(FrameUnwindInfo const&          ui,
+                        std::span<std::uint8_t const>   funcBytes,
+                        std::size_t                     funcIndex,
+                        // c116: this function's image-RVA base (= textRva0 +
+                        // funcTextStart[funcIndex]) — the scope table's Begin/End/
+                        // JumpTarget are this + the SehScopeEntry byte offsets.
+                        std::uint32_t                   funcBeginRva,
+                        // c116: SymbolId → image-RVA (the filter-funclet function's
+                        // RVA = the scope-table HandlerAddress). Returns 0 when the
+                        // symbol is not a defined function (fail-loud caller).
+                        std::function<std::uint32_t(SymbolId)> const& symbolToRva,
+                        // c116: the base byte offset THIS blob will occupy within
+                        // the whole `.xdata` (= xdataBytes.size() at the call), so
+                        // recorded handler-field patch offsets are .xdata-global.
+                        std::uint32_t                   xdataBaseOffset,
+                        std::vector<SehHandlerPatch>&   handlerPatches,
+                        DiagnosticReporter&             reporter) {
+    auto fail = [&](std::string msg) -> std::optional<std::vector<std::uint8_t>> {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "pe::encodeExec: unwind info for function #"
+                 + std::to_string(funcIndex) + ": " + msg);
+        return std::nullopt;
+    };
+    std::uint32_t const frame = ui.totalFrameSize;
+    if (frame % 8u != 0u) {
+        return fail("frame size " + std::to_string(frame)
+                    + " is not 8-byte aligned — x64 UWOP_ALLOC requires /8");
+    }
+
+    // (1) The RSP-adjust instruction's byte length + its CodeOffset (= its end).
+    std::uint32_t allocLen = 0;
+    if (ui.usesStackProbe) {
+        // The inline page-probe loop is a FIXED-length sequence — it ITERATES
+        // at runtime, it is NOT unrolled per page — so its prologue byte count
+        // is the emitter's own authoritative constant, independent of frame/
+        // page. (The c114 audit caught a drifted private `9 + 28*pages + 3`
+        // here that mis-sized SizeOfProlog + every CodeOffset for any frame
+        // over one guard page → a silently-wrong unwind table.)
+        allocLen = dss::x86_variable::kStackProbeLoopBytes;
+    } else if (frame > 0u) {
+        allocLen = 7u;                       // sub rsp, imm32 = 48 81 EC id
+    }
+    // Prologue-shape guard: verify the first real byte matches (sub → 0x48, probe
+    // → 0x41) so a future prologue-encoding change can't silently desync the
+    // recomputed offsets from the emitted bytes.
+    if (allocLen > 0u) {
+        if (funcBytes.empty()) return fail("empty function body but frame > 0");
+        std::uint8_t const b0 = funcBytes[0];
+        std::uint8_t const want = ui.usesStackProbe ? 0x41u : 0x48u;
+        if (b0 != want) {
+            return fail("prologue first byte 0x"
+                        + std::format("{:02x}", b0) + " != expected 0x"
+                        + std::format("{:02x}", want)
+                        + " — the recomputed unwind offsets would desync");
+        }
+    }
+
+    // (2) Saved-reg stores. Walk them in prologue (emission) order to advance the
+    //     byte cursor by EACH store's exact width, so a later GPR save's CodeOffset
+    //     is right even after an interleaved FPR save. GPR save `mov [rsp+d32],r`
+    //     = 8 B (REX.W always present). FPR save is DSS's `movsd [rsp+d32],xmm`
+    //     (F2 0F 11 /r, the low-64 store — Win64 spill) = 8 B for xmm0-7, 9 B for
+    //     xmm8-15 (REX.R). We EMIT a UWOP_SAVE_NONVOL per GPR but OMIT the FPR
+    //     saves from the unwind codes: DSS saves only the low 64 bits via MOVSD,
+    //     for which there is no x64 UWOP (SAVE_XMM128 restores a full 16 B from a
+    //     movaps slot), and an XMM save does NOT affect RSP/return-address
+    //     reconstruction — so stack unwinding stays exact. The handler-case xmm
+    //     RESTORE is deferred to D-WIN64-XMM-UNWIND-RESTORE (c116): either spill
+    //     xmm6-15 with movaps + emit SAVE_XMM128, or confirm no handler reads them.
+    struct Code { std::uint8_t codeOffset; std::uint8_t opAndInfo; std::uint16_t node; bool hasNode; };
+    std::vector<Code> saveCodes;
+    // c116b (D-WIN64-XMM-UNWIND-RESTORE): a function that GUARDS a `__try` has an
+    // exception handler that RESUMES in this frame post-unwind and runs parent code.
+    // If that code reads a non-volatile xmm (xmm6-15) that was live before the fault,
+    // the OS must restore it during the unwind — which needs a UWOP_SAVE_XMM128 in
+    // this UNWIND_INFO (backed by a 16-byte movaps spill). DSS spills only the low 64
+    // bits (movsd) and OMITS the FPR unwind codes (fine for NON-SEH functions: an xmm
+    // save never affects RSP/return-address reconstruction). For a SEH function it is
+    // NOT fine — so fail LOUD rather than emit an unwind table that silently fails to
+    // restore a non-volatile xmm on the handler path. sqlite's WAL SEH functions are
+    // pure integer/pointer code (empirically: 0 non-volatile-xmm spills across all
+    // their prologues), so this guard never fires for sqlite; the day a SEH function
+    // DOES spill an xmm, D-WIN64-XMM-UNWIND-RESTORE's spill-with-SAVE_XMM128 path must
+    // land first. This converts the H5 "no consumer" proof into an enforced invariant.
+    bool const guardsSeh = !ui.sehScopes.empty();
+    std::uint32_t cursor = allocLen;
+    for (auto const& sr : ui.savedRegs) {
+        std::uint32_t const width =
+            sr.isFpr ? (sr.regEncoding < 8u ? 8u : 9u) : 8u;
+        cursor += width;
+        if (cursor > 255u) {
+            return fail("prologue exceeds 255 bytes (x64 UNWIND_INFO offsets are "
+                        "single bytes) — switch the large-frame probe to __chkstk "
+                        "(D-WIN64-CHKSTK-LARGE-PROLOGUE)");
+        }
+        if (sr.isFpr) {
+            if (guardsSeh) {
+                return fail("a __try-guarding function saves non-volatile xmm"
+                            + std::to_string(sr.regEncoding)
+                            + " but DSS omits UWOP_SAVE_XMM128 (spills low-64 via "
+                              "movsd) — the __except handler could read an unrestored "
+                              "xmm on resume. D-WIN64-XMM-UNWIND-RESTORE (spill xmm6-"
+                              "15 with movaps + emit SAVE_XMM128) must land before a "
+                              "SEH function may use a non-volatile xmm.");
+            }
+            continue;   // non-SEH: low-64 MOVSD save — omitted (RSP-irrelevant)
+        }
+        if (sr.saveOffset % 8u != 0u) {
+            return fail("saved-reg offset " + std::to_string(sr.saveOffset)
+                        + " not 8-aligned — UWOP_SAVE_NONVOL node is offset/8");
+        }
+        saveCodes.push_back(Code{
+            static_cast<std::uint8_t>(cursor),
+            static_cast<std::uint8_t>(kUwopSaveNonvol | (sr.regEncoding << 4)),
+            static_cast<std::uint16_t>(sr.saveOffset / 8u), true});
+    }
+    std::uint32_t const sizeOfProlog = cursor;
+    if (sizeOfProlog > 255u) {
+        return fail("prologue " + std::to_string(sizeOfProlog) + " > 255 bytes");
+    }
+
+    // (3) The ALLOC code (at CodeOffset allocLen — the SMALLEST prologue offset).
+    std::optional<Code> allocCode;
+    if (frame > 0u) {
+        std::uint32_t const slots = frame / 8u;
+        if (frame <= 128u) {
+            allocCode = Code{static_cast<std::uint8_t>(allocLen),
+                             static_cast<std::uint8_t>(
+                                 kUwopAllocSmall | ((slots - 1u) << 4)),
+                             0u, false};
+        } else if (slots <= 0xFFFFu) {  // ≤ 512 KiB — opinfo 0, one u16 node
+            allocCode = Code{static_cast<std::uint8_t>(allocLen),
+                             static_cast<std::uint8_t>(kUwopAllocLarge | (0u << 4)),
+                             static_cast<std::uint16_t>(slots), true};
+        } else {
+            return fail("frame " + std::to_string(frame) + " > 512 KiB needs "
+                        "UWOP_ALLOC_LARGE op-info=1 (u32 node) — no shipped "
+                        "corpus reaches it (D-WIN64-HUGE-FRAME-ALLOC)");
+        }
+    }
+
+    // (4) Emit: header, then codes DESCENDING by CodeOffset (saves — already in
+    //     ascending store order, so REVERSED — then the ALLOC last).
+    std::uint32_t nodeCount = 0;
+    for (auto const& c : saveCodes) nodeCount += c.hasNode ? 2u : 1u;
+    if (allocCode.has_value()) nodeCount += allocCode->hasNode ? 2u : 1u;
+    if (nodeCount > 255u) return fail("unwind-code node count > 255");
+
+    // c116 (D-WIN64-SEH-FUNCLETS): a function that guards a `__try` sets
+    // UNW_FLAG_EHANDLER (bit 0 of the Flags nibble ⇒ (1<<3) in byte0's high nibble)
+    // and carries a trailing handler-RVA + SCOPE_TABLE after the DWORD-aligned
+    // codes. `__C_specific_handler` (the x64 C personality) walks the scope table.
+    bool const hasSeh = !ui.sehScopes.empty();
+    std::uint8_t const byte0 = hasSeh ? 0x09u   // Version=1 | Flags(EHANDLER=1)<<3
+                                      : 0x01u;   // Version=1, Flags=0
+
+    std::vector<std::uint8_t> out;
+    out.push_back(byte0);
+    out.push_back(static_cast<std::uint8_t>(sizeOfProlog));
+    out.push_back(static_cast<std::uint8_t>(nodeCount));
+    out.push_back(0x00u);                                  // FrameRegister=0, Offset=0
+    auto pushCode = [&](Code const& c) {
+        out.push_back(c.codeOffset);
+        out.push_back(c.opAndInfo);
+        if (c.hasNode) {
+            out.push_back(static_cast<std::uint8_t>(c.node & 0xFFu));
+            out.push_back(static_cast<std::uint8_t>((c.node >> 8) & 0xFFu));
+        }
+    };
+    for (auto it = saveCodes.rbegin(); it != saveCodes.rend(); ++it) pushCode(*it);
+    if (allocCode.has_value()) pushCode(*allocCode);
+    while (out.size() % 4u != 0u) out.push_back(0x00u);    // DWORD-align the codes
+
+    if (hasSeh) {
+        auto pushU32 = [&](std::uint32_t v) {
+            out.push_back(static_cast<std::uint8_t>(v & 0xFFu));
+            out.push_back(static_cast<std::uint8_t>((v >> 8) & 0xFFu));
+            out.push_back(static_cast<std::uint8_t>((v >> 16) & 0xFFu));
+            out.push_back(static_cast<std::uint8_t>((v >> 24) & 0xFFu));
+        };
+        // ExceptionHandler RVA (= __C_specific_handler THUNK). Unknown until the
+        // .idata pass resolves the thunk VA → emit a placeholder + record the
+        // .xdata-global byte offset for back-patch. Every scope in this function
+        // shares one personality; use the first scope's.
+        std::uint32_t const handlerFieldOff =
+            xdataBaseOffset + static_cast<std::uint32_t>(out.size());
+        handlerPatches.push_back(
+            SehHandlerPatch{handlerFieldOff, ui.sehScopes.front().personalitySymbol});
+        pushU32(0u);   // placeholder — back-patched to the thunk RVA post-.idata
+
+        // SCOPE_TABLE: u32 Count; then Count × { Begin, End, Handler, JumpTarget }.
+        pushU32(static_cast<std::uint32_t>(ui.sehScopes.size()));
+        for (auto const& s : ui.sehScopes) {
+            std::uint32_t const filterRva = symbolToRva(s.filterFuncletSymbol);
+            if (filterRva == 0u) {
+                return fail("SEH scope's filter funclet symbol #"
+                            + std::to_string(s.filterFuncletSymbol.v)
+                            + " has no function RVA (unresolved funclet) — "
+                              "D-WIN64-SEH-FUNCLETS");
+            }
+            pushU32(funcBeginRva + s.beginByteOffset);       // BeginAddress
+            pushU32(funcBeginRva + s.endByteOffset);         // EndAddress
+            pushU32(filterRva);                              // HandlerAddress (filter funclet)
+            pushU32(funcBeginRva + s.jumpTargetByteOffset);  // JumpTarget (__except body)
+        }
+        // The blob already ends u32-aligned (every appended field is a u32).
+    }
+    return out;
+}
 
 // ── PE/COFF name encoding ───────────────────────────────────────
 //
@@ -555,6 +914,30 @@ encodeExec(AssembledModule const&    module,
         return {};
     }
 
+    // ── (a2) Reserve the import-thunk block at the tail of .text ──
+    // D-FFI-PE-IMPORT-THUNK: one code thunk per extern (`jmp *[IAT
+    // slot]`) — the PE analog of an ELF PLT stub / Mach-O __stubs
+    // entry. RESERVED here, BEFORE .text is sized, so textVirtualSize /
+    // textRawSize / the data-chain RVAs (incl. .idata) all account for
+    // it; the bytes are written in step (c2) once each IAT slot's VA is
+    // known. `symbolVa[extern]` then names the thunk (direct-plt),
+    // making an address-taken import a CALLABLE code address. Zero
+    // externs → `resize(+0)` no-op → byte-identical output (the
+    // extern-free byte-for-byte writer pins hold).
+    std::size_t const peThunkSize    = peThunkSizeFor(id.machine);
+    std::size_t const numImportThunks = module.externImports.size();
+    if (numImportThunks > 0 && peThunkSize == 0) {
+        emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+             std::format("pe::encodeExec: machine 0x{:x} declares {} extern "
+                         "import(s) but has no import-thunk emitter — an "
+                         "address-taken import needs a callable thunk. Add "
+                         "a per-machine emitter (see emitPeThunk).",
+                         id.machine, numImportThunks));
+        return {};
+    }
+    std::size_t const thunkBlockOffset = text.size();
+    text.resize(text.size() + numImportThunks * peThunkSize, 0u);
+
     // ── (b) Resolve entry-function index from schema.entryPoint
     //
     // Mirrors the ELF ET_EXEC arm (D-LK1-1 follow-up): empty
@@ -774,8 +1157,91 @@ encodeExec(AssembledModule const&    module,
     }
     std::size_t const rdataSize = rdataDataLayout.spanSize;
     std::size_t const dataSize  = dataDataLayout.spanSize;
-    // `.idata` follows the LAST data section (`dataChainRva` was advanced past
-    // .rdata/.data/.bss above), else immediately after `.text`.
+
+    // ── (b3) Windows x64 unwind tables — D-WIN64-PDATA-XDATA-UNWIND ──
+    // `.xdata` (UNWIND_INFO blobs, one per function that carries frame info)
+    // + `.pdata` (a RUNTIME_FUNCTION per entry: {BeginAddress, EndAddress,
+    // UnwindInfoAddress}). Chained after `.bss`, BEFORE `.idata`/`.reloc`
+    // (so their VA cursor + the .reloc prevVaEnd hand-off account for them
+    // with no extra edit). Emitted ONLY for the x64 machine (arm64-PE would
+    // need its own unwind format — not shipped); a function WITHOUT
+    // `unwind` (a leaf / the post-pipeline entry trampoline) gets NO entry
+    // (x64 leaf treatment). RUNTIME_FUNCTIONs are naturally ascending-by-
+    // BeginAddress (funcTextStart is ascending) — the loader binary-searches.
+    std::vector<std::uint8_t> xdataBytes;
+    std::vector<std::uint8_t> pdataBytes;
+    std::optional<DataSectionLayout> xdata;
+    std::optional<DataSectionLayout> pdata;
+    // c116 (D-WIN64-SEH-FUNCLETS): deferred back-patches of each SEH function's
+    // UNWIND_INFO handler-RVA field (the __C_specific_handler thunk RVA, resolved
+    // in the .idata pass below). Filled by buildFunctionUnwindInfo, applied after
+    // `externThunkVaBySym` is populated.
+    std::vector<SehHandlerPatch> sehHandlerPatches;
+    if (id.machine == kMachineAmd64PE) {
+        std::uint32_t const textRva0 =
+            static_cast<std::uint32_t>(secText.virtualAddress);
+        // c116: SymbolId → image-RVA for DEFINED functions (the filter funclet's
+        // scope-table HandlerAddress). funcTextStart is parallel to
+        // module.functions; a symbol not found ⇒ 0 (buildFunctionUnwindInfo
+        // fail-louds). Built once (cheap) only on the x64 PE path.
+        std::unordered_map<SymbolId, std::uint32_t> funcRvaBySym;
+        funcRvaBySym.reserve(module.functions.size());
+        for (std::size_t i = 0; i < module.functions.size(); ++i) {
+            funcRvaBySym[module.functions[i].symbol] =
+                textRva0 + static_cast<std::uint32_t>(funcTextStart[i]);
+        }
+        std::function<std::uint32_t(SymbolId)> const symbolToRva =
+            [&](SymbolId s) -> std::uint32_t {
+                auto it = funcRvaBySym.find(s);
+                return it == funcRvaBySym.end() ? 0u : it->second;
+            };
+
+        struct PdataEntry { std::size_t funcIdx; std::uint32_t xdataOffset; };
+        std::vector<PdataEntry> pdataEntries;
+        for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+            auto const& fn = module.functions[fi];
+            if (!fn.unwind.has_value()) continue;
+            std::uint32_t const funcBeginRva =
+                textRva0 + static_cast<std::uint32_t>(funcTextStart[fi]);
+            auto uwOpt = buildFunctionUnwindInfo(
+                *fn.unwind, fn.bytes, fi, funcBeginRva, symbolToRva,
+                static_cast<std::uint32_t>(xdataBytes.size()), sehHandlerPatches,
+                reporter);
+            if (!uwOpt.has_value()) return {};
+            pdataEntries.push_back(
+                {fi, static_cast<std::uint32_t>(xdataBytes.size())});
+            xdataBytes.insert(xdataBytes.end(), uwOpt->begin(), uwOpt->end());
+        }
+        if (!xdataBytes.empty()) {
+            DataSectionLayout xl;
+            xl.rva = dataChainRva;
+            xl.virtualSize =
+                static_cast<std::uint32_t>(alignUp(xdataBytes.size(), sectionAlignE));
+            xdata = xl;
+            dataChainRva += xl.virtualSize;
+            std::uint32_t const textRva0 =
+                static_cast<std::uint32_t>(secText.virtualAddress);
+            for (auto const& e : pdataEntries) {
+                auto const& fn = module.functions[e.funcIdx];
+                std::uint32_t const begin = textRva0
+                    + static_cast<std::uint32_t>(funcTextStart[e.funcIdx]);
+                std::uint32_t const end =
+                    begin + static_cast<std::uint32_t>(fn.bytes.size());
+                appendU32LE(pdataBytes, begin);
+                appendU32LE(pdataBytes, end);
+                appendU32LE(pdataBytes, xl.rva + e.xdataOffset);
+            }
+            DataSectionLayout pl;
+            pl.rva = dataChainRva;
+            pl.virtualSize =
+                static_cast<std::uint32_t>(alignUp(pdataBytes.size(), sectionAlignE));
+            pdata = pl;
+            dataChainRva += pl.virtualSize;
+        }
+    }
+
+    // `.idata` follows the LAST section in the VA chain (`dataChainRva` was
+    // advanced past .rdata/.data/.bss/.xdata/.pdata above), else after `.text`.
     std::uint32_t const idataRva = hasImports ? dataChainRva : 0u;
 
     // Lay out .idata bytes (synthesized, NOT raw-data padded yet):
@@ -827,6 +1293,81 @@ encodeExec(AssembledModule const&    module,
         }
         thunkCursor += (externs.size() + 1) * kThunkSize;  // +1 terminator
     }
+
+    // ── (c2) Fill the import-thunk block reserved in step (a2) ──
+    // Each extern's IAT slot VA is now known (externIatVaBySym); write
+    // one `FF 25 disp32` thunk per extern jumping through it, and
+    // record the thunk VA (a .text code address) in
+    // `externThunkVaBySym`. THAT map — not `externIatVaBySym` — feeds
+    // `symbolVa` below, so every extern reference (a direct call OR an
+    // address-taken value) resolves to the callable thunk (direct-plt),
+    // never the raw IAT data slot.
+    std::unordered_map<SymbolId, std::uint64_t> externThunkVaBySym;
+    externThunkVaBySym.reserve(numImportThunks);
+    if (numImportThunks > 0) {
+        // Defense: step (a2) must have grown .text to hold the whole
+        // block; a future reorder that drops the reservation would
+        // otherwise write out of bounds here.
+        if (thunkBlockOffset + numImportThunks * peThunkSize
+                > text.size()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 "pe::encodeExec: import-thunk block was not reserved — "
+                 ".text was not grown to hold the thunks (step (a2) "
+                 "invariant violated).");
+            return {};
+        }
+        for (std::size_t i = 0; i < numImportThunks; ++i) {
+            std::size_t const thunkOff = thunkBlockOffset + i * peThunkSize;
+            std::uint64_t const thunkVa =
+                oh.imageBase + secText.virtualAddress + thunkOff;
+            auto const iatIt =
+                externIatVaBySym.find(module.externImports[i].symbol);
+            if (iatIt == externIatVaBySym.end()) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::string{"pe::encodeExec: extern #"}
+                         + std::to_string(i)
+                         + " has no IAT slot VA — externIatVaBySym is "
+                           "incomplete (import layout bug).");
+                return {};
+            }
+            if (!emitPeThunk(id.machine, text, thunkOff, thunkVa,
+                             iatIt->second, i, reporter)) {
+                return {};
+            }
+            externThunkVaBySym.emplace(module.externImports[i].symbol,
+                                       thunkVa);
+        }
+    }
+
+    // c116 (D-WIN64-SEH-FUNCLETS): back-patch each SEH function's UNWIND_INFO
+    // handler-RVA field now that the __C_specific_handler thunk VA is resolved. The
+    // handler field is an IMAGE-RVA (the OS calls the personality imageBase-relative
+    // — the c112 address-taken-import precedent), so RVA = thunkVA - imageBase. The
+    // thunk (FF 25 jmp *[IAT]) is the callable stub, NOT the raw IAT data slot.
+    for (auto const& patch : sehHandlerPatches) {
+        auto it = externThunkVaBySym.find(patch.symbol);
+        if (it == externThunkVaBySym.end()) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"pe::encodeExec: SEH personality symbol #"}
+                     + std::to_string(patch.symbol.v)
+                     + " (__C_specific_handler) has no import thunk — the SEH pass "
+                       "must synthesize its ExternImport (D-WIN64-SEH-FUNCLETS).");
+            return {};
+        }
+        std::uint32_t const handlerRva =
+            static_cast<std::uint32_t>(it->second - oh.imageBase);
+        if (patch.xdataOffset + 4u > xdataBytes.size()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 "pe::encodeExec: SEH handler-field patch offset out of range "
+                 "(D-WIN64-SEH-FUNCLETS).");
+            return {};
+        }
+        for (int b = 0; b < 4; ++b) {
+            xdataBytes[patch.xdataOffset + b] =
+                static_cast<std::uint8_t>((handlerRva >> (b * 8)) & 0xFFu);
+        }
+    }
+
     // HINT/NAME table starts here. Per extern: 2 bytes hint + name +
     // NUL + optional padding to even.
     std::size_t const hintNameStart = thunkCursor;
@@ -905,13 +1446,16 @@ encodeExec(AssembledModule const&    module,
             return {};
         }
     }
-    for (auto const& [sym, va] : externIatVaBySym) {
-        // Cross-format symmetry with ELF/MachO dynamic walkers
-        // (LK6 cycle 2c post-fold review — code-simplifier flagged
-        // PE as the asymmetric outlier). An extern SymbolId
-        // colliding with a function's SymbolId is a caller bug;
-        // silently overriding the in-text VA with the IAT slot VA
-        // would patch in-text rel32 to point at the wrong target.
+    for (auto const& [sym, va] : externThunkVaBySym) {
+        // D-FFI-PE-IMPORT-THUNK: an extern's symbolVa names its import
+        // THUNK (a .text code address) — the PE analog of an ELF PLT
+        // stub / Mach-O __stubs entry — NOT the `.idata` IAT data slot.
+        // This makes an address-taken import a CALLABLE code address
+        // and a direct extern call a plain `call rel32 → thunk` (the
+        // thunk does the IAT indirection); PE is no longer the
+        // asymmetric outlier. An extern SymbolId colliding with a
+        // function's SymbolId is a caller bug; silently overriding the
+        // in-text VA would patch in-text rel32 to the wrong target.
         if (!symbolVa.emplace(sym, va).second) {
             emit(reporter, DiagnosticCode::K_SymbolUndefined,
                  std::string{"pe::encodeExec: extern SymbolId #"}
@@ -1237,6 +1781,28 @@ encodeExec(AssembledModule const&    module,
         bss->headerIndex = sectionHeaders.size();
         sectionHeaders.push_back(hBss);
     }
+    // .xdata + .pdata section headers (D-WIN64-PDATA-XDATA-UNWIND) — read-only
+    // initialized data (0x40000040, like .rdata), placed after .bss and before
+    // .idata. sizeOfRawData / pointerToRawData filled below.
+    constexpr std::uint32_t kUnwindCharacteristics = 0x40000040u;
+    if (xdata.has_value()) {
+        PeSectionHeader hXData{};
+        hXData.name            = encodeSectionName(".xdata", 0);
+        hXData.virtualSize     = static_cast<std::uint32_t>(xdataBytes.size());
+        hXData.virtualAddress  = xdata->rva;
+        hXData.characteristics = kUnwindCharacteristics;
+        xdata->headerIndex = sectionHeaders.size();
+        sectionHeaders.push_back(hXData);
+    }
+    if (pdata.has_value()) {
+        PeSectionHeader hPData{};
+        hPData.name            = encodeSectionName(".pdata", 0);
+        hPData.virtualSize     = static_cast<std::uint32_t>(pdataBytes.size());
+        hPData.virtualAddress  = pdata->rva;
+        hPData.characteristics = kUnwindCharacteristics;
+        pdata->headerIndex = sectionHeaders.size();
+        sectionHeaders.push_back(hPData);
+    }
     // .idata section header (when externImports non-empty).
     // Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA (0x40) |
     //                   IMAGE_SCN_MEM_READ (0x40000000) |
@@ -1337,6 +1903,22 @@ encodeExec(AssembledModule const&    module,
     }
     // .bss is NOBITS: sizeOfRawData / pointerToRawData stay 0 (set at header
     // construction); it consumes no file bytes, so `nextRawPointer` is unchanged.
+    if (xdata.has_value()) {
+        xdata->rawSize = static_cast<std::uint32_t>(
+            alignUp(xdataBytes.size(), fileAlign));
+        xdata->rawPointer = nextRawPointer;
+        sectionHeaders[xdata->headerIndex].sizeOfRawData = xdata->rawSize;
+        sectionHeaders[xdata->headerIndex].pointerToRawData = xdata->rawPointer;
+        nextRawPointer += xdata->rawSize;
+    }
+    if (pdata.has_value()) {
+        pdata->rawSize = static_cast<std::uint32_t>(
+            alignUp(pdataBytes.size(), fileAlign));
+        pdata->rawPointer = nextRawPointer;
+        sectionHeaders[pdata->headerIndex].sizeOfRawData = pdata->rawSize;
+        sectionHeaders[pdata->headerIndex].pointerToRawData = pdata->rawPointer;
+        nextRawPointer += pdata->rawSize;
+    }
     if (idata.has_value()) {
         idata->rawSize = static_cast<std::uint32_t>(
             alignUp(idataSize, fileAlign));
@@ -1374,6 +1956,12 @@ encodeExec(AssembledModule const&    module,
         // .bss contributes to the image's MEMORY extent (VirtualSize) even
         // though it has zero file footprint — the loader reserves it.
         lastSectionVaEnd = bss->rva + bss->virtualSize;
+    }
+    if (xdata.has_value()) {
+        lastSectionVaEnd = xdata->rva + xdata->virtualSize;
+    }
+    if (pdata.has_value()) {
+        lastSectionVaEnd = pdata->rva + pdata->virtualSize;
     }
     if (idata.has_value()) {
         lastSectionVaEnd = idata->rva + idata->virtualSize;
@@ -1568,10 +2156,19 @@ encodeExec(AssembledModule const&    module,
         reloc.has_value() ? reloc->rva : 0u;
     std::uint32_t const baseRelocDirSize =
         reloc.has_value() ? static_cast<std::uint32_t>(relocBytes.size()) : 0u;
+    // IMAGE_DIRECTORY_ENTRY_EXCEPTION (index 3, D-WIN64-PDATA-XDATA-UNWIND): RVA +
+    // byte size of the .pdata RUNTIME_FUNCTION array — the OS exception dispatcher
+    // + RtlLookupFunctionEntry binary-search it. Size is the array's VIRTUAL size.
+    std::uint32_t const pdataDirRva  = pdata.has_value() ? pdata->rva : 0u;
+    std::uint32_t const pdataDirSize =
+        pdata.has_value() ? static_cast<std::uint32_t>(pdataBytes.size()) : 0u;
     for (std::size_t i = 0; i < kNumberOfRvaAndSizes; ++i) {
         if (i == 1u) {
             appendU32LE(bytes, importDirRva);
             appendU32LE(bytes, importDirSize);
+        } else if (i == 3u) {
+            appendU32LE(bytes, pdataDirRva);
+            appendU32LE(bytes, pdataDirSize);
         } else if (i == 4u) {
             // IMAGE_DIRECTORY_ENTRY_SECURITY: file offset, not RVA.
             appendU32LE(bytes, certTableFileOff);
@@ -1625,6 +2222,24 @@ encodeExec(AssembledModule const&    module,
         while (bytes.size()
                 < static_cast<std::size_t>(data->rawPointer)
                     + data->rawSize) {
+            bytes.push_back(0);
+        }
+    }
+
+    // .xdata + .pdata bodies (D-WIN64-PDATA-XDATA-UNWIND), file-aligned. Emitted
+    // after .data and before .idata (their nextRawPointer order); the preceding
+    // section padded bytes.size() up to xdata->rawPointer.
+    if (xdata.has_value()) {
+        bytes.insert(bytes.end(), xdataBytes.begin(), xdataBytes.end());
+        while (bytes.size()
+                < static_cast<std::size_t>(xdata->rawPointer) + xdata->rawSize) {
+            bytes.push_back(0);
+        }
+    }
+    if (pdata.has_value()) {
+        bytes.insert(bytes.end(), pdataBytes.begin(), pdataBytes.end());
+        while (bytes.size()
+                < static_cast<std::size_t>(pdata->rawPointer) + pdata->rawSize) {
             bytes.push_back(0);
         }
     }

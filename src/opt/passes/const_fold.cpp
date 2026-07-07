@@ -61,6 +61,12 @@ MirLiteralValue toMirLiteral(HirLiteralValue const& src) {
             agg.fields.reserve(arm.fields.size());
             for (auto const& f : arm.fields) agg.fields.push_back(toMirLiteral(f));
             dst.value = std::move(agg);
+        } else if constexpr (std::is_same_v<T, HirAddressValue>) {
+            // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD): mirror the main hir_to_mir
+            // toMirLiteral — an HIR address constant → the MIR symbol-address
+            // relocation (the inverse of the toHirLiteral MirSymbolAddrValue arm
+            // above, which stays monostate: a symbol address is non-foldable here).
+            dst.value = MirSymbolAddrValue{arm.base, arm.byteOffset};
         } else {
             dst.value = arm;
         }

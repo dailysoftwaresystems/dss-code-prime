@@ -243,13 +243,18 @@ TEST(PruneUnreachable, ForReturningBodyOrphansUpdate) {
         /*expectedOrphans=*/1);
 }
 
-// ── switch, ALL arms return — the switch exit orphans (cf_switch shape). ─
-// `switch(x){ case 1: return 1; default: return 2; }` — every arm seals,
-// so the eagerly-created exit (SwitchJoin) has no predecessor.
+// ── switch, ALL arms return — the switch exit + one inter-marker dead block
+// orphan (the c60 flat-body cf_switch shape). `switch(x){ case 1: return 1;
+// default: return 2; }` lowers to a flat body Block [LabelStmt(case1, return),
+// LabelStmt(default, return)]: each marker block seals on its return, so (a) the
+// eagerly-created exit (SwitchJoin) has no predecessor, and (b) the Block lowering
+// opens a fresh dead block between the two terminated markers (the same shape a
+// goto/label chain produces) that only branches to the default marker → also
+// predecessor-less. TWO orphans; the prune drops both.
 TEST(PruneUnreachable, SwitchAllArmsReturnOrphansExit) {
     expectSealedConstructPruned(
         "int main(){ int x=1; switch(x){ case 1: return 1; default: return 2; } }",
-        /*expectedOrphans=*/1);
+        /*expectedOrphans=*/2);
 }
 
 // NOTE on related shapes covered ELSEWHERE (not re-pinned in this prune file):

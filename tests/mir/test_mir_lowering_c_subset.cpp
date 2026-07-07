@@ -1274,11 +1274,15 @@ TEST(MirLoweringCSubset, AddressOfLocalReturnsAllocaDirectly) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirBlockId const entry = m.funcEntry(m.funcAt(0));
-    // [Alloca x, Const 1, Store, Alloca p, Store(allocaX→p), Load p, Load *p, Return]
-    // The AddressOf(x) does NOT add an instruction — it reuses alloca x.
+    // c69 (D-MIR-ENTRY-BLOCK-ALLOCA-HOIST): every body-local's storage Alloca is
+    // now pre-emitted into the entry block UP FRONT (the conventional "all allocas
+    // in entry" discipline), so BOTH allocas lead the block before any init:
+    // [Alloca x, Alloca p, Const 1, Store(Const1→x), Store(allocaX→p), Load p,
+    //  Load *p, Return]. The AddressOf(x) still does NOT add an instruction — it
+    // reuses alloca x (asserted via the store-p value operand below).
     ASSERT_EQ(m.blockInstCount(entry), 8u);
     EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 0)), MirOpcode::Alloca);
-    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 3)), MirOpcode::Alloca);
+    EXPECT_EQ(m.instOpcode(m.blockInstAt(entry, 1)), MirOpcode::Alloca);
     // Slot 4 stores alloca-x into the p slot — verify the value operand IS
     // the first alloca (proving AddressOf returned the alloca, not a copy).
     MirInstId const storeP = m.blockInstAt(entry, 4);
@@ -2090,10 +2094,13 @@ TEST(MirLoweringCSubset, SeqExprLowersStmtsThenYieldsResult) {
 
 // ─── ML2 cycle 4: Switch / Break / Continue ──────────────────────────────
 
-// A switch with two cases + default + breaks in each arm lowers to:
-//   entry → Switch(disc, [(1, caseA), (2, caseB)], default=caseD)
-//   caseA / caseB / caseD all `Br(exit)` because of the explicit break
-// Exit then runs the implicit-void-return.
+// c60 (Design I-A): a switch with two cases + default + breaks in each arm lowers
+// to a Switch in the entry whose targets are the case/default MARKER label-blocks;
+// each marker block's terminator is `Br(exit)` (the explicit break). The dispatch
+// is a jump-table (Switch), NOT a linear if-chain. (The raw lowering also emits
+// predecessor-less intermediate blocks between terminated markers — the same shape
+// a goto/label chain produces — which the downstream unreachable-prune drops; this
+// pin checks the Switch shape + arm terminators, which the prune preserves.)
 TEST(MirLoweringCSubset, SwitchWithBreaksInEachArm) {
     auto L = lowerCSubset(
         "void f(int x) {\n"
@@ -2107,23 +2114,26 @@ TEST(MirLoweringCSubset, SwitchWithBreaksInEachArm) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirFuncId const fn = m.funcAt(0);
-    // Blocks: entry, caseA, caseB, default, exit  → 5
-    EXPECT_EQ(m.funcBlockCount(fn), 5u);
     MirBlockId const entry = m.funcEntry(fn);
-    // Entry's terminator is the Switch.
+    // Entry's terminator is the Switch (the O(1) jump-table dispatch).
     MirInstId const term = m.blockTerminator(entry);
     EXPECT_EQ(m.instOpcode(term), MirOpcode::Switch);
-    // Switch successors: [case targets…, default].
+    // Switch successors: [case 1 marker, case 2 marker, default marker]. Exactly 3
+    // (2 explicit cases + the default), each a distinct block.
     auto succs = m.blockSuccessors(entry);
-    EXPECT_EQ(succs.size(), 3u);
-    // Every arm's terminator is Br (the break;).
+    ASSERT_EQ(succs.size(), 3u);
+    EXPECT_NE(succs[0], succs[1]);
+    EXPECT_NE(succs[1], succs[2]);
+    // Every arm marker's terminator is Br (the break;).
     for (std::size_t i = 0; i < succs.size(); ++i) {
         EXPECT_EQ(m.instOpcode(m.blockTerminator(succs[i])), MirOpcode::Br);
     }
 }
 
-// Fall-through: arm 1 omits `break;`, so MIR must Br to arm 2's block
-// instead of the switch-exit. C semantics preserved.
+// c60 (Design I-A) — fall-through: arm 1 omits `break;`, so its marker block must
+// Br to arm 2's marker block (straight-line fall-through in the flat body), NOT to
+// the switch-exit. Switch successors are [case 1 marker, case 2 marker, default=
+// exit].
 TEST(MirLoweringCSubset, SwitchFallthroughBranchesToNextArm) {
     auto L = lowerCSubset(
         "void f(int x) {\n"
@@ -2136,15 +2146,14 @@ TEST(MirLoweringCSubset, SwitchFallthroughBranchesToNextArm) {
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
     Mir const& m = L.mir.mir;
     MirFuncId const fn = m.funcAt(0);
-    // Blocks: entry, caseA(empty), caseB, exit → 4
-    EXPECT_EQ(m.funcBlockCount(fn), 4u);
     MirBlockId const entry = m.funcEntry(fn);
+    EXPECT_EQ(m.instOpcode(m.blockTerminator(entry)), MirOpcode::Switch);
     auto succs = m.blockSuccessors(entry);
-    ASSERT_EQ(succs.size(), 3u);  // [caseA, caseB, default=exit]
-    // caseA terminator branches to caseB (fall-through), NOT to exit.
+    ASSERT_EQ(succs.size(), 3u);  // [caseA marker, caseB marker, default=exit]
     MirBlockId const caseA = succs[0];
     MirBlockId const caseB = succs[1];
     MirBlockId const exit  = succs[2];
+    // caseA marker terminator branches to caseB marker (fall-through), NOT to exit.
     EXPECT_EQ(m.instOpcode(m.blockTerminator(caseA)), MirOpcode::Br);
     auto caseAExits = m.blockSuccessors(caseA);
     ASSERT_EQ(caseAExits.size(), 1u);
@@ -2317,6 +2326,67 @@ TEST(MirLoweringCSubset, ForwardReferenceCallResolvesViaPrePass) {
     EXPECT_TRUE(sawGlobalAddr) << "forward-referenced callee should resolve "
                                   "via GlobalAddr from the pre-pass";
     EXPECT_TRUE(sawCall);
+}
+
+// c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): a synthetic literal-promoted
+// global's SymbolId must clear the WHOLE semantic symbol table when the
+// pipeline passes `syntheticSymbolFloor = model.symbols().size()`. The
+// minter's own scan covers only MIR-VISIBLE symbols (functions/globals/
+// externs); the semantic table also holds typedefs, tags, fields, locals,
+// and injected constants — and the LK11 merge maps MIR symbols to NAMES
+// through that table, so an aliased synthetic id fabricates a named strong
+// definition from an anonymous string literal (the sqlite3.c+shell.c probe's
+// bogus `sqlite3_stmt`/`Fts5Tokenizer` cross-CU redefinitions). RED-ON-
+// DISABLE: drop the `std::max(..., config.syntheticSymbolFloor)` seed → the
+// promoted global's id lands inside the semantic table (this fixture's
+// table carries param/local records well past the function count).
+TEST(MirLoweringCSubset, SyntheticGlobalSymbolsRespectSemanticFloor) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    UnitBuilder builder{*loaded};
+    builder.addInMemory(
+        "typedef struct opaqueTag opaqueTag;\n"   // a type-only record in the table
+        "static opaqueTag *keep;\n"
+        "char const *g(void) { keep = 0; return \"alias-floor\"; }\n",
+        "<mem>");
+    auto cu    = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    auto model = analyze(cu, DataModel::Lp64);
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter hirRep;
+    auto hir = lowerToHir(model, hirRep);
+    ASSERT_TRUE(hir->ok);
+    std::uint32_t const floor =
+        static_cast<std::uint32_t>(model.symbols().size());
+    MirLoweringConfig cfg;
+    cfg.globalsAllowFloat    = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    cfg.syntheticSymbolFloor = floor;   // what compile_pipeline passes
+    DiagnosticReporter mirRep;
+    auto mir = lowerToMir(hir->hir, hir->literalPool,
+                          model.lattice().interner(), mirRep,
+                          &hir->sourceMap, cfg, /*ffiMap=*/nullptr,
+                          &hir->linkageMap, &hir->mutabilityMap,
+                          &hir->volatileMap);
+    ASSERT_TRUE(mir.ok)
+        << (mirRep.all().empty() ? "" : mirRep.all()[0].actual);
+    Mir const& m = mir.mir;
+    // Every module global is either a REAL semantic-record-backed object
+    // (its record kind is Variable — `keep`) or a SYNTHETIC one whose id
+    // cleared the floor (the promoted "alias-floor" rodata global).
+    std::size_t synthetic = 0;
+    for (std::uint32_t gi = 0; gi < m.moduleGlobalCount(); ++gi) {
+        SymbolId const sym = m.globalSymbol(m.globalAt(gi));
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->kind == DeclarationKind::Variable) {
+            continue;   // a real named global (`keep`)
+        }
+        EXPECT_GE(sym.v, floor)
+            << "synthetic global #" << sym.v << " aliases the semantic "
+            << "symbol table (size " << floor << ") — the LK11 merge would "
+            << "name it after an unrelated record";
+        ++synthetic;
+    }
+    EXPECT_GE(synthetic, 1u)
+        << "expected the promoted string-literal global to be present";
 }
 
 // VarDecl without an initializer still emits the alloca but no store —
@@ -3475,16 +3545,22 @@ TEST(MirLoweringCSubset, FloatIfConditionLowersAsFCmpUneNotFpToUi) {
     EXPECT_EQ(countOp(L.mir.mir, MirOpcode::Trunc), 0u);
 }
 
-// Char condition: Char is C-scalar arithmetic — same `!= 0` test against
-// a Char-typed zero (no promotion is needed for an unequal-to-zero
-// test). Char-width ALU forms are still gated at LIR (D-CSUBSET-32BIT-
-// ALU-FORMS) so the runtime tier stays fail-loud at the right shape.
-TEST(MirLoweringCSubset, CharIfConditionLowersAsICmpNeTypedZero) {
+// Char condition (c71, D-CSUBSET-32BIT-ALU-FORMS): a `char` used as a truth
+// value integer-PROMOTES to `int` (C 6.3.1.1) before the `!= 0` test, so the
+// synthetic Ne is I32-typed (an SExt-promoted operand vs an i32 zero).
+// Pre-c71 `coerceCondition` minted a SAME-TYPE (Char) zero and skipped
+// promotion, leaving a Char-typed ICmpNe that walled at the LIR sub-native
+// ALU gap — the exact x902 blocker on sqlite3.c (`while (*z)`, `if (c)`).
+// The truth value is unchanged (any nonzero narrow is nonzero int); only the
+// compare WIDTH changes, from the gated Char form to a native i32 ICmp.
+TEST(MirLoweringCSubset, CharIfConditionIntegerPromotesToI32BeforeICmpNe) {
     auto L = lowerCSubset(
         "int f(char c) { if (c) return 1; return 0; }");
     expectTruthinessNe(L, "if(char)");
-    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 0), TypeKind::Char);
-    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 1), TypeKind::Char);
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 0), TypeKind::I32)
+        << "c71: the char cond must be SExt-promoted to i32 before the Ne";
+    EXPECT_EQ(firstOperandKindOf(L, MirOpcode::ICmpNe, 1), TypeKind::I32)
+        << "c71: the synthetic zero is minted at the promoted (i32) type";
 }
 
 // Pointer condition: `if (p)` tests `p != null-pointer-constant` when
@@ -6894,43 +6970,79 @@ TEST(MirLoweringCSubsetVolatile, NonVolatileBaselineHasNoVolatileFlags) {
         << "a program with no `volatile` must emit NO volatile Stores";
 }
 
-// Test 6 — the pointer-to-volatile-POINTEE reject COMPLETENESS. Each form below
-// is a `volatile <base> *` (the volatility rides the deref — model B cannot
-// express it) and MUST fail loud S_VolatilePointeeNotSupported, never silently
-// compile a non-volatile Deref. Covers the simple local decl, a complex pointer-
-// arithmetic deref, and a function param — proving the reject is at the
-// TYPE-NAME level (decl + param), not just `*Ref(sym)`.
-TEST(MirLoweringCSubsetVolatile, PointerToVolatilePointeeFailsLoud) {
+// Test 6 (c27 D-CSUBSET-VOLATILE-POINTEE) — a pointer-to-volatile-POINTEE
+// (`volatile <base> *p`) now COMPILES (the c21 reject is retired) and a deref
+// through it emits a VOLATILE Load (the volatile lives in the pointee TYPE
+// `Ptr<VolatileQual(T)>` and is read at the access). The OLD test asserted the
+// reject fired; c27 INVERTS it — these are the exact SQLite forms (cast/member/
+// local/param) that must carry the volatile, not drop it. RED-ON-DISABLE: drop
+// the `volatileFlagForType` thread in `combineDeref` → the Load loses the flag.
+TEST(MirLoweringCSubsetVolatile, PointerToVolatilePointeeDerefIsVolatile) {
     auto hasPointeeReject = [](DiagnosticReporter const& r) {
         for (auto const& d : r.all())
             if (d.code == DiagnosticCode::S_VolatilePointeeNotSupported) return true;
         return false;
     };
-    // 6a — simple local decl `volatile int *p;` then a deref read `*p`.
+    // 6a — simple local decl `volatile int *p = &x;` then a deref read `*p`: compiles,
+    // and the deref Load is volatile (the pointee `VolatileQual(int)` drives it).
     {
         auto L = lowerCSubset(
-            "int main(void) { volatile int *p; return *p; }\n");
-        EXPECT_TRUE(hasPointeeReject(L.model.diagnostics()))
-            << "`volatile int *p` (pointee-volatile local) must fail loud";
+            "int main(void) { int x = 0; volatile int *p = &x; return *p; }\n");
+        ASSERT_FALSE(hasPointeeReject(L.model.diagnostics()))
+            << "`volatile int *p` (pointee-volatile local) must now COMPILE";
+        ASSERT_FALSE(L.model.hasErrors())
+            << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+            << "the deref `*p` through a volatile pointee must emit a VOLATILE Load";
     }
     // 6b — a COMPLEX deref through pointer arithmetic `*(p + 1)`: proves the
-    // reject is by TYPE construction (the type-name never builds), not a narrow
-    // `Deref(Ref(sym))` pattern match that `*(p+1)` would slip past.
+    // volatile is carried by TYPE construction (not a narrow `Deref(Ref(sym))`
+    // pattern) — `*(p+1)` is still a deref of a `Ptr<VolatileQual(int)>`.
     {
         auto L = lowerCSubset(
-            "int main(void) { volatile int *p; return *(p + 1); }\n");
-        EXPECT_TRUE(hasPointeeReject(L.model.diagnostics()))
-            << "a complex deref `*(p+1)` of a pointee-volatile must STILL fail "
-               "loud (the type-name reject is complete by construction)";
+            "int main(void) { int a[2]; volatile int *p = a; return *(p + 1); }\n");
+        ASSERT_FALSE(hasPointeeReject(L.model.diagnostics()))
+            << "a complex deref `*(p+1)` of a pointee-volatile must COMPILE";
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+            << "a complex deref `*(p+1)` must STILL be volatile (type-carried)";
     }
-    // 6c — a function PARAMETER `volatile int *p`: the param position must reject
-    // too (the declarator-mode head+declarator arm), not just object decls.
+    // 6c — a function PARAMETER `volatile int *p`: the param declarator position
+    // must build `Ptr<VolatileQual(int)>` too, and its deref be volatile.
     {
         auto L = lowerCSubset(
             "int rd(volatile int *p) { return *p; }\n");
-        EXPECT_TRUE(hasPointeeReject(L.model.diagnostics()))
-            << "a `volatile int *` PARAMETER must fail loud (param is a declarator "
-               "position the reject must cover)";
+        ASSERT_FALSE(hasPointeeReject(L.model.diagnostics()))
+            << "a `volatile int *` PARAMETER must COMPILE (declarator position)";
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+            << "a deref of a `volatile int *` parameter must be a VOLATILE Load";
+    }
+    // 6d — a CAST `(volatile int *)` then deref (the sqlite 67392 form): the cast
+    // builds `Ptr<VolatileQual(int)>`, so `*(volatile int *)&x` is a volatile Load.
+    {
+        auto L = lowerCSubset(
+            "int main(void) { int x = 0; return *(volatile int *)&x; }\n");
+        ASSERT_FALSE(hasPointeeReject(L.model.diagnostics()))
+            << "the cast `(volatile int *)` must PARSE + TYPE (no P0009/S0025)";
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+            << "the deref of a `(volatile int *)` cast must be a VOLATILE Load";
+    }
+    // 6e — a NON-volatile control: `int *p` deref is NOT volatile (proves 6a–6d
+    // are the qualifier's effect, not deref-always-volatile).
+    {
+        auto L = lowerCSubset(
+            "int main(void) { int x = 0; int *p = &x; return *p; }\n");
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u)
+            << "a deref of a NON-volatile `int *p` must NOT be volatile";
     }
 }
 
@@ -7045,15 +7157,12 @@ TEST(MirLoweringCSubsetVolatile, NonVolatileAggregateAssignCopyNotFlagged) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// c21 review batch — the CO-LOCATED pointee-reject arm (struct/union member) is
-// the SOLE catcher for the SQLite aggregate shape; pin it directly (it was
-// only exercised end-to-end before — the c12/c13 "green over a subset of reject
-// sites" trap). Each asserts S_VolatilePointeeNotSupported AND that the model
-// stays clean (no MIR produced). NOTE (c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR):
-// member pointer stars no longer bind to a head `{repeat StarOp}` (removed so
-// `int *a, b;` types b as int) — a struct/union MEMBER `volatile int *p` is now
-// caught by the PER-DECLARATOR arm, and a TYPEDEF by its own arm; the co-located
-// head arm still serves cast/sizeof type-names. Either way the reject must fire.
+// c27 (D-CSUBSET-VOLATILE-POINTEE) review batch — the c21 reject tests for
+// struct/union MEMBER + double-pointer + multi-declarator + typedef pointee-
+// volatile forms are INVERTED: each now COMPILES, and the deref through the
+// volatile pointee emits a VOLATILE Load (the volatile rides the pointee TYPE).
+// These are the exact SQLite aggregate shapes (`volatile <T> *` member /
+// `volatile <T> **` / `volatile <T> *a, *b` list / `typedef volatile <T> *`).
 // ─────────────────────────────────────────────────────────────────────────────
 
 namespace {
@@ -7064,91 +7173,720 @@ namespace {
 }
 } // namespace
 
-// Test 10 — struct MEMBER `volatile int *p` (the SQLite aggregate-shape catcher).
-// Must fail loud. ★ c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR) moved the member
-// pointer star OUT of the head (`typeRefAllowingStruct` no longer consumes
-// `{repeat StarOp}` — stars bind PER-DECLARATOR so `int *a, b;` types b as int).
-// So a member's `volatile int *p` is now caught by the PER-DECLARATOR typing arm
-// (head `volatile` + a declarator `*`), whose diagnostic `actual` is the
-// DECLARATOR text ("*p" — a star but NO base "int"), positioned on the
-// declarator. The reject stays COMPLETE; only the arm/position changed (the
-// co-located head arm is unreachable for a member now that no star lands in the
-// head — it still serves cast/sizeof type-names). Pin the per-declarator shape.
-TEST(MirLoweringCSubsetVolatile, StructMemberPointeeVolatileFailsLoudViaPerDeclaratorArm) {
-    auto L = lowerCSubset("struct S { volatile int *p; };\n"
-                          "int main(void){ return 0; }\n");
-    bool sawReject = false;
-    bool perDeclaratorShape = false;
-    for (auto const& d : L.model.diagnostics().all()) {
-        if (d.code != DiagnosticCode::S_VolatilePointeeNotSupported) continue;
-        sawReject = true;
-        // The per-declarator arm's `actual` is the DECLARATOR text — a star but
-        // NOT the base type "int" (the head `volatile int` is a sibling). Pin
-        // that shape so a regression re-routing the reject is caught.
-        if (d.actual.find('*') != std::string::npos
-            && d.actual.find("int") == std::string::npos) {
-            perDeclaratorShape = true;
+// Test 10 (c27) — struct MEMBER `volatile int *p` now COMPILES; `*s->p` deref is
+// volatile (the member load of the plain pointer `s->p` is NOT — only the deref
+// reaching the `volatile int` pointee is). The c21 reject is retired.
+TEST(MirLoweringCSubsetVolatile, StructMemberPointeeVolatileNowCompilesAndDerefVolatile) {
+    auto L = lowerCSubset(
+        "struct S { volatile int *p; };\n"
+        "int rd(struct S *s){ return *s->p; }\n");
+    ASSERT_FALSE(hasVolatilePointeeReject(L.model.diagnostics()))
+        << "a `volatile int *` STRUCT MEMBER must now COMPILE (pointee in the type)";
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    // `*s->p` is the deref of the volatile-pointee member → exactly one volatile
+    // Load (the `s->p` member read of the plain pointer is NOT volatile).
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "the deref `*s->p` through a volatile-pointee member must be a VOLATILE Load";
+}
+
+// Test 11 — union MEMBER `volatile int *p` compiles + deref is volatile.
+TEST(MirLoweringCSubsetVolatile, UnionMemberPointeeVolatileNowCompiles) {
+    auto L = lowerCSubset(
+        "union U { volatile int *p; int x; };\n"
+        "int rd(union U *u){ return *u->p; }\n");
+    ASSERT_FALSE(hasVolatilePointeeReject(L.model.diagnostics()))
+        << "a `volatile int *` UNION MEMBER must now COMPILE";
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "the deref `*u->p` of a volatile-pointee union member must be volatile";
+}
+
+// Test 12 — struct MEMBER DOUBLE pointer `volatile int **pp` (sqlite `apWiData`):
+// builds `Ptr<Ptr<VolatileQual(int)>>`. `**s->pp` — ONLY the innermost deref (the
+// one reaching the volatile int) is volatile; the intermediate `*s->pp` deref
+// (a `Ptr<VolatileQual(int)>` value) is NOT. Pins volatile binds the INNERMOST
+// pointee (C 6.7.3), not every level.
+TEST(MirLoweringCSubsetVolatile, StructMemberDoublePointeeVolatileInnermostOnly) {
+    auto L = lowerCSubset(
+        "struct S { volatile int **pp; };\n"
+        "int rd(struct S *s){ return **s->pp; }\n");
+    ASSERT_FALSE(hasVolatilePointeeReject(L.model.diagnostics()))
+        << "a `volatile int **` STRUCT MEMBER must now COMPILE";
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    // Exactly ONE volatile Load: the innermost `*(...)` reaching `volatile int`.
+    // (`s->pp` member load + the intermediate `*s->pp` load are NON-volatile.)
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "only the INNERMOST deref of a `volatile int **` is volatile (C 6.7.3)";
+    EXPECT_GE(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/false), 2u)
+        << "the member load + the intermediate deref must be NON-volatile";
+}
+
+// Test 12b (c23 × c27) — a MULTI-DECLARATOR volatile-pointer LIST `volatile int
+// *a, *b;` builds BOTH `a` and `b` as `Ptr<VolatileQual(int)>` (each slot takes
+// the head VolatileQual base independently). Pins the per-declarator engine wraps
+// EVERY slot's pointee (a first-slot-only build would type `b` as a plain `int *`
+// — a silent volatile DROP on `*s.b`).
+TEST(MirLoweringCSubsetVolatile, StructMemberPointeeVolatileListEverySlotVolatile) {
+    auto L = lowerCSubset(
+        "struct S { volatile int *a, *b; };\n"
+        "int rd(struct S *s){ return *s->a + *s->b; }\n");
+    ASSERT_FALSE(hasVolatilePointeeReject(L.model.diagnostics()))
+        << "`volatile int *a, *b;` members must now COMPILE";
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    // BOTH `*s->a` and `*s->b` are volatile derefs → two volatile Loads. A
+    // first-slot-only build would give `b` a plain `int *` → only one.
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 2u)
+        << "EACH slot of `volatile int *a, *b;` is a volatile pointee — both "
+           "derefs must be volatile (a first-slot-only build would drop `*b`)";
+}
+
+// Test 13 (c27) — a `volatile`-carrying TYPEDEF now works through the TYPE: a
+// `typedef volatile int vint;` aliases `VolatileQual(int)`, so a `vint` OBJECT is
+// volatile (its access flagged), and `typedef volatile int *vip;` aliases
+// `Ptr<VolatileQual(int)>` so a `vip` deref is volatile. The c21 typedef reject is
+// retired — volatility rides the aliased type, never silently dropped.
+TEST(MirLoweringCSubsetVolatile, VolatileTypedefCarriesThroughType) {
+    {
+        auto L = lowerCSubset(
+            "typedef volatile int vint;\n"
+            "int rd(void){ vint x = 0; return x; }\n");
+        ASSERT_FALSE(hasVolatilePointeeReject(L.model.diagnostics()))
+            << "`typedef volatile int vint;` must now COMPILE (volatile in the alias)";
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        EXPECT_GE(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+            << "a `vint` (= volatile int) object read must be a VOLATILE Load";
+    }
+    {
+        auto L = lowerCSubset(
+            "typedef volatile int *vip;\n"
+            "int rd(vip p){ return *p; }\n");
+        ASSERT_FALSE(hasVolatilePointeeReject(L.model.diagnostics()))
+            << "`typedef volatile int *vip;` must now COMPILE";
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+            << "a deref of a `vip` (= volatile int *) must be a VOLATILE Load";
+    }
+}
+
+// Test 14 (c27) — `const` gets NO VolatileQual wrapper, so a deref of a `const int
+// *` pointee is NOT volatile (const never affects codegen; only volatile is
+// materialized). Pins the asymmetry: volatile wraps, const does not.
+TEST(MirLoweringCSubsetVolatile, ConstPointeeStaysNonVolatile) {
+    auto L = lowerCSubset(
+        "int main(void) { int x = 0; const int *p = &x; return *p; }\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u)
+        << "a deref of a `const int *` pointee must NOT be volatile (const is "
+           "ignored for codegen; only volatile is materialized)";
+}
+
+// Test 15 (c27) — `sizeof(volatile T)` == `sizeof(T)`: a qualifier never changes
+// the size (C 6.7.3). VolatileQual is transparent to layout (`computeLayout`
+// strips it). A `volatile int` array and an `int` array have the same size.
+TEST(MirLoweringCSubsetVolatile, SizeofVolatileEqualsSizeofUnqualified) {
+    auto L = lowerCSubset(
+        "int main(void) { return (int)(sizeof(volatile int) - sizeof(int)); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    // The program returns sizeof(volatile int) - sizeof(int) == 0 by construction;
+    // we only assert it lowered (the const-eval folded the equal sizes).
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u)
+        << "a sizeof expression emits no volatile access";
+}
+
+// Test 16 (c27) — a `volatile`-element ARRAY index `va[i]` (va's element is
+// `VolatileQual(int)`) is a VOLATILE Load (the element TYPE drives it). Control:
+// a plain `int va[4]` index is NOT volatile.
+TEST(MirLoweringCSubsetVolatile, VolatileArrayElementIndexIsVolatile) {
+    auto L = lowerCSubset(
+        "int rd(int i) { volatile int va[4]; return va[i]; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "indexing a `volatile int va[4]` element must be a VOLATILE Load";
+    // Control: a plain `int va[4]` index is NOT volatile.
+    auto L2 = lowerCSubset(
+        "int rd(int i) { int va[4]; return va[i]; }\n");
+    ASSERT_TRUE(L2.mir.ok)
+        << (L2.mirReporter.all().empty() ? "" : L2.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L2.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u)
+        << "indexing a plain `int va[4]` element must NOT be volatile";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// c27 CONTAINER-volatility (D-CSUBSET-VOLATILE-POINTEE, container half) — a
+// member/element/by-value access of a `volatile`-qualified CONTAINER is a
+// volatile access EVEN WHEN the field/element is a plain (non-volatile) type
+// (C 6.7.3p5 / 6.5.2.3). `combineMember`/`combineIndex` qualify the access
+// RESULT TYPE when the container is volatile (which the MIR sites read via
+// `volatileFlagForType`, and which PROPAGATES through nested chains); the
+// brace-init + by-value/return copy sites thread the dest/source volatility.
+// Each test pins the EXACT volatile flag count with a non-volatile control;
+// RED-ON-DISABLE: drop the container-volatility thread for that form → the
+// count drops to 0 (a silent miscompile — the optimizer reassociates/CSEs/
+// elides the access). These are the SQLite Kahan-summation + WAL shapes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Test 17 — member READ through a `volatile struct S *` pointer (plain field).
+// `p->a` is a volatile Load even though `a` is a plain `int`.
+TEST(MirLoweringCSubsetVolatile, ContainerVolatileMemberReadThroughPtr) {
+    auto L = lowerCSubset(
+        "struct S { int a; int b; };\n"
+        "int rd(volatile struct S *p){ return p->a; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "`p->a` through a `volatile struct S *` must be a VOLATILE Load (C 6.7.3p5)";
+    // Control: a plain `struct S *p` member read is NOT volatile.
+    auto L2 = lowerCSubset(
+        "struct S { int a; int b; };\n"
+        "int rd(struct S *p){ return p->a; }\n");
+    ASSERT_TRUE(L2.mir.ok)
+        << (L2.mirReporter.all().empty() ? "" : L2.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L2.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u)
+        << "`p->a` through a plain `struct S *` must NOT be volatile";
+}
+
+// Test 18 — member WRITE through a `volatile struct S *` pointer (plain field).
+// `p->a = 5` is a volatile Store. Mirrors the WAL `pInfo->nBackfill = 0` shape.
+TEST(MirLoweringCSubsetVolatile, ContainerVolatileMemberWriteThroughPtr) {
+    auto L = lowerCSubset(
+        "struct S { int a; int b; };\n"
+        "void wr(volatile struct S *p){ p->a = 5; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Store, /*wantVolatile=*/true), 1u)
+        << "`p->a = 5` through a `volatile struct S *` must be a VOLATILE Store";
+    auto L2 = lowerCSubset(
+        "struct S { int a; int b; };\n"
+        "void wr(struct S *p){ p->a = 5; }\n");
+    ASSERT_TRUE(L2.mir.ok)
+        << (L2.mirReporter.all().empty() ? "" : L2.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L2.mir.mir, MirOpcode::Store, /*wantVolatile=*/true), 0u)
+        << "`p->a = 5` through a plain `struct S *` must NOT be volatile";
+}
+
+// Test 19 — member of a `volatile struct S` LOCAL (`s.a`): both the write `s.a=1`
+// and the read `s.a` are volatile (the object `s` is volatile, plain field `a`).
+TEST(MirLoweringCSubsetVolatile, ContainerVolatileMemberOfLocal) {
+    auto L = lowerCSubset(
+        "struct S { int a; int b; };\n"
+        "int rd(void){ volatile struct S s; s.a = 1; return s.a; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Store, /*wantVolatile=*/true), 1u)
+        << "`s.a = 1` on a `volatile struct S` local must be a VOLATILE Store";
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "`return s.a` on a `volatile struct S` local must be a VOLATILE Load";
+    auto L2 = lowerCSubset(
+        "struct S { int a; int b; };\n"
+        "int rd(void){ struct S s; s.a = 1; return s.a; }\n");
+    ASSERT_TRUE(L2.mir.ok)
+        << (L2.mirReporter.all().empty() ? "" : L2.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L2.mir.mir, MirOpcode::Store, /*wantVolatile=*/true), 0u)
+        << "a plain `struct S` local member write must NOT be volatile";
+    EXPECT_EQ(countOpWithVolatile(L2.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u)
+        << "a plain `struct S` local member read must NOT be volatile";
+}
+
+// Test 20 — index into a `volatile`-CONTAINER array whose element is a PLAIN type
+// (the container's qualifier rides through a typedef, so the element type is a
+// bare `int`): `va[i]` is volatile via the CONTAINER, not the element type.
+TEST(MirLoweringCSubsetVolatile, ContainerVolatileIndexOfArray) {
+    auto L = lowerCSubset(
+        "typedef int IntArr[4];\n"
+        "int rd(int i){ volatile IntArr va; return va[i]; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "`va[i]` of a `volatile IntArr` (volatile CONTAINER) must be a VOLATILE Load";
+    auto L2 = lowerCSubset(
+        "typedef int IntArr[4];\n"
+        "int rd(int i){ IntArr va; return va[i]; }\n");
+    ASSERT_TRUE(L2.mir.ok)
+        << (L2.mirReporter.all().empty() ? "" : L2.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L2.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u)
+        << "`va[i]` of a plain `IntArr` must NOT be volatile";
+}
+
+// Test 21 — NESTED member chain through a volatile OUTER (`p->inner.x`): the
+// qualifier PROPAGATES — `p->inner` is volatile-typed, so the outer `.x` is a
+// volatile Load even though both `inner` and `x` are plain fields. RED-ON-DISABLE:
+// without the result-type qualification, only `p->inner` (not `.x`) would carry
+// the flag, and `.x` is the actual memory access → silent miscompile.
+TEST(MirLoweringCSubsetVolatile, ContainerVolatileNestedMemberPropagates) {
+    auto L = lowerCSubset(
+        "struct Inner { int x; };\n"
+        "struct Outer { struct Inner inner; };\n"
+        "int rd(volatile struct Outer *p){ return p->inner.x; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "`p->inner.x` through a volatile OUTER must propagate volatility to `.x`";
+    auto L2 = lowerCSubset(
+        "struct Inner { int x; };\n"
+        "struct Outer { struct Inner inner; };\n"
+        "int rd(struct Outer *p){ return p->inner.x; }\n");
+    ASSERT_TRUE(L2.mir.ok)
+        << (L2.mirReporter.all().empty() ? "" : L2.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L2.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u)
+        << "a plain nested member chain must NOT be volatile";
+}
+
+// Test 22 — COMPOUND-assign of a volatile-container member (`p->s += r`, the
+// Kahan-summation shape): the read AND the write-back of `p->s` are BOTH volatile
+// even though `s` is a plain `double` and the lvalue is COMPLEX (read+written via
+// a temp pointer). RED-ON-DISABLE: without the lvalue-type qualification the temp
+// pointer points at a plain `double`, dropping BOTH flags → the optimizer
+// reassociates the compensated sum (the exact miscompile the volatile prevents).
+TEST(MirLoweringCSubsetVolatile, ContainerVolatileCompoundAssignMember) {
+    auto L = lowerCSubset(
+        "struct C { double s; };\n"
+        "void step(volatile struct C *p, double r){ p->s += r; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "`p->s += r` must read `p->s` VOLATILE (the Kahan-sum guard)";
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Store, /*wantVolatile=*/true), 1u)
+        << "`p->s += r` must write `p->s` VOLATILE";
+    auto L2 = lowerCSubset(
+        "struct C { double s; };\n"
+        "void step(struct C *p, double r){ p->s += r; }\n");
+    ASSERT_TRUE(L2.mir.ok)
+        << (L2.mirReporter.all().empty() ? "" : L2.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L2.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u)
+        << "a plain-container `p->s += r` must NOT be volatile";
+    EXPECT_EQ(countOpWithVolatile(L2.mir.mir, MirOpcode::Store, /*wantVolatile=*/true), 0u)
+        << "a plain-container `p->s += r` must NOT be volatile";
+}
+
+// Test 23 — passing a `volatile struct` BY VALUE (>16B → memory copy): the
+// source-reading Loads of the by-value copy are volatile (the whole object is
+// read, C 6.7.3p5). Control: a plain by-value pass has ZERO volatile flags.
+TEST(MirLoweringCSubsetVolatile, ContainerVolatileByValueArg) {
+    auto L = lowerCSubset(
+        "struct S { long a; long b; long c; };\n"
+        "void take(struct S q){ (void)q; }\n"
+        "void f(void){ volatile struct S s; take(s); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_GE(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "the by-value copy of a `volatile struct` arg must read it VOLATILE";
+    auto L2 = lowerCSubset(
+        "struct S { long a; long b; long c; };\n"
+        "void take(struct S q){ (void)q; }\n"
+        "void f(void){ struct S s; take(s); }\n");
+    ASSERT_TRUE(L2.mir.ok)
+        << (L2.mirReporter.all().empty() ? "" : L2.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L2.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u)
+        << "a plain by-value struct arg copy must NOT be volatile";
+}
+
+// Test 24 — RETURNING a `volatile struct` BY VALUE (>16B → sret copy): the
+// source-reading Loads of the return copy are volatile. Control = plain return.
+TEST(MirLoweringCSubsetVolatile, ContainerVolatileStructReturn) {
+    auto L = lowerCSubset(
+        "struct S { long a; long b; long c; };\n"
+        "struct S g(void){ volatile struct S s; return s; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_GE(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "returning a `volatile struct` by value must read it VOLATILE";
+    auto L2 = lowerCSubset(
+        "struct S { long a; long b; long c; };\n"
+        "struct S g(void){ struct S s; return s; }\n");
+    ASSERT_TRUE(L2.mir.ok)
+        << (L2.mirReporter.all().empty() ? "" : L2.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L2.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u)
+        << "a plain by-value struct return must NOT be volatile";
+}
+
+// Test 25 — BRACE-INIT of a `volatile` aggregate (`volatile struct S s = {1,2}`):
+// every field-init Store is a volatile access (C 6.7.3p5). The scalar-array form
+// (`volatile int va[3] = {1,2,3}`) distributes the qualifier to the ELEMENT type,
+// so its element stores are volatile too. Controls have ZERO volatile stores.
+TEST(MirLoweringCSubsetVolatile, ContainerVolatileBraceInit) {
+    auto L = lowerCSubset(
+        "struct S { int a; int b; };\n"
+        "int rd(void){ volatile struct S s = {1, 2}; return s.a; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Store, /*wantVolatile=*/true), 2u)
+        << "a `volatile struct S s = {1,2}` brace-init must emit 2 VOLATILE field stores";
+    // Scalar-array brace-init: 3 volatile element stores.
+    auto La = lowerCSubset(
+        "int rd(void){ volatile int va[3] = {1, 2, 3}; return va[0]; }\n");
+    ASSERT_TRUE(La.mir.ok)
+        << (La.mirReporter.all().empty() ? "" : La.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(La.mir.mir, MirOpcode::Store, /*wantVolatile=*/true), 3u)
+        << "a `volatile int va[3] = {1,2,3}` brace-init must emit 3 VOLATILE element stores";
+    // Control: plain struct brace-init has ZERO volatile stores.
+    auto L2 = lowerCSubset(
+        "struct S { int a; int b; };\n"
+        "int rd(void){ struct S s = {1, 2}; return s.a; }\n");
+    ASSERT_TRUE(L2.mir.ok)
+        << (L2.mirReporter.all().empty() ? "" : L2.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L2.mir.mir, MirOpcode::Store, /*wantVolatile=*/true), 0u)
+        << "a plain `struct S s = {1,2}` brace-init must emit NO volatile stores";
+}
+
+// Test 26 — INDEX-then-MEMBER through a `volatile`-container array of structs
+// (`arr[i].a`): the array container is volatile → `arr[i]` is volatile-typed →
+// `.a` is a volatile Load. Pins the Index→Member propagation.
+TEST(MirLoweringCSubsetVolatile, ContainerVolatileIndexThenMember) {
+    auto L = lowerCSubset(
+        "struct S { int a; };\n"
+        "int rd(int i){ volatile struct S arr[4]; return arr[i].a; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 1u)
+        << "`arr[i].a` of a `volatile struct S arr[4]` must be a VOLATILE Load";
+    auto L2 = lowerCSubset(
+        "struct S { int a; };\n"
+        "int rd(int i){ struct S arr[4]; return arr[i].a; }\n");
+    ASSERT_TRUE(L2.mir.ok)
+        << (L2.mirReporter.all().empty() ? "" : L2.mirReporter.all()[0].actual);
+    EXPECT_EQ(countOpWithVolatile(L2.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u)
+        << "a plain `struct S arr[4]` `arr[i].a` must NOT be volatile";
+}
+
+// ── c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION — opaque / incomplete struct ──
+// These pin the FAIL-LOUD axis end-to-end: an opaque (forward-declared, never
+// defined) struct is INCOMPLETE; a `Ptr<incomplete>` is sizeable and usable, but
+// any VALUE / by-value-member / sizeof of the incomplete type has NO knowable
+// size and must FAIL LOUD at the storage tier (the computeLayout incomplete
+// guard, UNCHANGED by c35) — never a silent zero-size slot / wrong offset. The
+// semantic phase ACCEPTS these forms (the forward-mint gives the tag a valid but
+// incomplete TypeId); the guard fires at HIR/MIR lowering, so these pins run the
+// FULL pipeline and assert `!L.mir.ok` (or a HIR diagnostic). RED-on-disable:
+// weaken the computeLayout incomplete guard and one of these silently lowers.
+
+// VALUE of an incomplete struct (a local object) — fails loud end-to-end. c35
+// rejects it at the SEMANTIC tier (S_IncompleteTypeObject, the earliest point
+// with the full type); the MIR allocaForLocal computeLayout guard is the deeper
+// backstop. Either way the full pipeline must NOT silently produce a zero-size
+// frame slot.
+TEST(MirLoweringCSubset, C35ValueOfIncompleteFailsLoud) {
+    auto L = lowerCSubset(
+        "struct S;\n"
+        "int main(void){ struct S v; (void)v; return 0; }\n");
+    EXPECT_TRUE(L.model.hasErrors() || !L.hir->ok || !L.mir.ok)
+        << "a by-value local object of an incomplete struct must fail loud — "
+           "never a silent zero-size frame slot";
+}
+
+// MEMBER through a pointer to an incomplete struct — fieldByteOffset has no layout.
+TEST(MirLoweringCSubset, C35MemberOfIncompletePointerFailsLoud) {
+    auto L = lowerCSubset(
+        "struct S;\n"
+        "int g(struct S *p){ return p->x; }\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_TRUE(L.model.hasErrors() || !L.hir->ok || !L.mir.ok)
+        << "a member access through a pointer to an incomplete struct must fail "
+           "loud — its layout is unknowable";
+}
+
+// SIZEOF of an incomplete struct (in a value context) — computeLayout returns none.
+TEST(MirLoweringCSubset, C35SizeofOfIncompleteFailsLoud) {
+    auto L = lowerCSubset(
+        "struct S;\n"
+        "int main(void){ return (int)sizeof(struct S); }\n");
+    EXPECT_TRUE(L.model.hasErrors() || !L.hir->ok || !L.mir.ok)
+        << "sizeof of an incomplete struct must fail loud — never a guessed size";
+}
+
+// POSITIVE end-to-end: an OPAQUE handle (`struct Stmt;` never defined) passed BY
+// POINTER through a NON-inlined call lowers CLEAN — `Ptr<incomplete>` is sizeable
+// and usable. The sqlite3_stmt pattern. RED-on-disable: without the forward-mint
+// this would not even reach lowering (S_UnknownType in the semantic phase).
+TEST(MirLoweringCSubset, C35OpaqueHandleViaPointerLowersClean) {
+    auto L = lowerCSubset(
+        "struct Stmt;\n"
+        "int probe(struct Stmt *p){ return p ? 1 : 0; }\n"
+        "int main(void){ return probe(0) + 42; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+}
+
+// c91 (D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY): the MIR value-read BACKSTOP —
+// an ARRAY-typed rvalue read NEVER emits `Load`; it decays to the address of
+// its first element (`Gep(base, 0)` re-typed `Ptr<elem>`, C 6.3.2.1p3) at
+// EVERY lvalue shape: the c63 addressable-local arm's twins for a module
+// GLOBAL (the Ref arm), a struct MEMBER / an element (the MemberAccess/Index
+// rvalue arm), and a pointer DEREF (combineDeref). The HIR coerce funnel
+// decays every KNOWN consumer (comparisons/conditions/`!` joined it in c91),
+// so the shapes here are the NO-CAST same-type contexts that present a bare
+// Array-typed rvalue to MIR: a SysV `va_list` (`__va_list_tag[1]` — an ARRAY)
+// forwarded to a `va_list` param from a GLOBAL, a struct MEMBER, and a DEREF
+// — exactly the c63 case at the other storage classes. Pre-c91 each emitted
+// an aggregate `Load` that read the array's first bytes as the "argument"
+// (the same content-vs-address confusion that freed sqlite's on-stack parser
+// in sqlite3ParserFinalize). THE INVARIANT: no Load in the whole module has
+// an Array-typed result. RED-ON-DISABLE (each arm independently): reverting
+// the global-Ref / member-index / combineDeref decay arm re-emits the
+// Array-typed Load for its forward below and the invariant assert flips —
+// independent of the HIR arms (no comparison/condition here, so no Cast is
+// present to mask the backstop).
+TEST(MirLoweringCSubset, ArrayRvalueValueReadDecaysNeverLoads) {
+    auto L = lowerCSubset(
+        "void take(va_list ap) { }\n"
+        "struct S { int pad; va_list ap; };\n"
+        "va_list gv;\n"
+        "void f(struct S *s, va_list *pp) {\n"
+        "    take(gv);\n"      // GLOBAL va_list forward  → the Ref-global arm
+        "    take(s->ap);\n"   // MEMBER va_list forward  → the member/index arm
+        "    take(*pp);\n"     // DEREF va_list forward   → the combineDeref arm
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    // THE c91 INVARIANT: an Array-typed Load exists NOWHERE in the module.
+    std::size_t arrayLoads = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const fMir = m.funcAt(fi);
+        for (std::uint32_t b = 0; b < m.funcBlockCount(fMir); ++b) {
+            MirBlockId const blk = m.funcBlockAt(fMir, b);
+            for (std::uint32_t i = 0; i < m.blockInstCount(blk); ++i) {
+                MirInstId const ix = m.blockInstAt(blk, i);
+                if (m.instOpcode(ix) != MirOpcode::Load) continue;
+                TypeId const t = m.instType(ix);
+                if (t.valid() && interner.kind(t) == TypeKind::Array)
+                    ++arrayLoads;
+            }
         }
     }
-    EXPECT_TRUE(sawReject)
-        << "a `volatile int *` STRUCT MEMBER must fail loud "
-           "(pointer-to-volatile-pointee is unsupported under model B)";
-    EXPECT_TRUE(perDeclaratorShape)
-        << "c23: the member star binds per-declarator, so the reject fires via "
-           "the per-declarator arm (diagnostic `actual` = the declarator `*p`, "
-           "not the whole `volatile int *` type node)";
+    EXPECT_EQ(arrayLoads, 0u)
+        << "an ARRAY-typed rvalue read must DECAY (Gep to Ptr<elem>), never "
+           "Load — a Load-of-Array reads the array's first bytes as a scalar "
+           "value (D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY: the sqlite "
+           "ParserFinalize free-of-stack class)";
+    // Each of the three forwards decays via its arm's `Gep(base, 0)` — the
+    // caller f carries (at least) those three Geps and its three Calls.
+    std::uint32_t const fi = funcWithCall(m);
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Call), 3u);
+    EXPECT_GE(countOpcodeAllBlocks(m, fi, MirOpcode::Gep), 3u)
+        << "each va_list forward decays through its value-read arm's Gep";
 }
 
-// Test 11 — union MEMBER `volatile int *p`. Must fail loud.
-TEST(MirLoweringCSubsetVolatile, UnionMemberPointeeVolatileFailsLoud) {
-    auto L = lowerCSubset("union U { volatile int *p; int x; };\n"
-                          "int main(void){ return 0; }\n");
-    EXPECT_TRUE(hasVolatilePointeeReject(L.model.diagnostics()))
-        << "a `volatile int *` UNION MEMBER must fail loud (per-declarator arm)";
-}
+// ── c115 SEH (D-WIN64-SEH-FUNCLETS): the MIR region skeleton ──────────────────
 
-// Test 12 — struct MEMBER DOUBLE pointer `volatile int **pp` — must fail loud.
-// c23: both stars bind in the declarator's pointerLayer (the head no longer
-// consumes stars), so the per-declarator arm catches it; the reject must fire.
-TEST(MirLoweringCSubsetVolatile, StructMemberDoublePointeeVolatileFailsLoud) {
-    auto L = lowerCSubset("struct S { volatile int **pp; };\n"
-                          "int main(void){ return 0; }\n");
-    EXPECT_TRUE(hasVolatilePointeeReject(L.model.diagnostics()))
-        << "a `volatile int **` STRUCT MEMBER must fail loud (per-declarator arm)";
-}
-
-// Test 12b (c23 × c21 interaction) — a MULTI-DECLARATOR volatile-pointer LIST
-// `volatile int *a, *b;` must reject EVERY slot. c23's per-declarator arm iterates
-// each declarator; this locks the per-slot iteration so a regression that checks
-// only the first declarator (and silently compiles `*b` with a non-volatile Load)
-// is caught. Both slots are pointer-to-volatile-pointee ⇒ TWO rejects.
-TEST(MirLoweringCSubsetVolatile, StructMemberPointeeVolatileListRejectsEverySlot) {
-    auto L = lowerCSubset("struct S { volatile int *a, *b; };\n"
-                          "int main(void){ return 0; }\n");
-    int rejects = 0;
-    for (auto const& d : L.model.diagnostics().all())
-        if (d.code == DiagnosticCode::S_VolatilePointeeNotSupported) ++rejects;
-    EXPECT_EQ(rejects, 2)
-        << "each slot of `volatile int *a, *b;` is a pointer-to-volatile-pointee "
-           "and must fail loud independently (the per-declarator arm iterates all "
-           "slots — a first-slot-only check would silently miscompile `*b`)";
-}
-
-// Test 13 — TYPEDEF wholesale reject: BOTH `typedef volatile int vint;` (object —
-// model B can't thread typedef-carried volatility) AND `typedef volatile int
-// *vip;` (laundered pointee) fail loud. The typedef arm is the SOLE catcher.
-TEST(MirLoweringCSubsetVolatile, VolatileTypedefFailsLoud) {
-    {
-        auto L = lowerCSubset("typedef volatile int vint;\n"
-                              "int main(void){ return 0; }\n");
-        EXPECT_TRUE(hasVolatilePointeeReject(L.model.diagnostics()))
-            << "`typedef volatile int vint;` (object) must fail loud — model B "
-               "cannot carry typedef volatility";
+namespace {
+// Every opcode in a whole function (all blocks), for the multi-block SEH shape.
+[[nodiscard]] std::vector<MirOpcode> allFuncOpcodes(Mir const& m, MirFuncId fn) {
+    std::vector<MirOpcode> out;
+    for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+        MirBlockId const b = m.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i)
+            out.push_back(m.instOpcode(m.blockInstAt(b, i)));
     }
-    {
-        auto L = lowerCSubset("typedef volatile int *vip;\n"
-                              "int main(void){ return 0; }\n");
-        EXPECT_TRUE(hasVolatilePointeeReject(L.model.diagnostics()))
-            << "`typedef volatile int *vip;` (laundered pointee) must fail loud";
+    return out;
+}
+[[nodiscard]] MirInstId findOp(Mir const& m, MirFuncId fn, MirOpcode op) {
+    for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+        MirBlockId const b = m.funcBlockAt(fn, bi);
+        for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+            MirInstId const id = m.blockInstAt(b, i);
+            if (m.instOpcode(id) == op) return id;
+        }
     }
+    return {};
+}
+} // namespace
+
+// The __try/__except lowers to the 5-opcode region skeleton, and the module is
+// MirVerifier-clean (checkSehStructure: filter/handler single-pred, matching
+// region payloads). This is the exact shape the c116 funclet lowering consumes.
+TEST(MirLoweringCSubset, SehTryExceptLowersToRegionSkeleton) {
+    auto L = lowerCSubset(
+        "int f(int *p) { int rc = 0; __try { rc = *p; } "
+        "__except (_exception_code()) { rc = 42; } return rc; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty()
+        ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    MirFuncId const fn = m.funcAt(0);
+    auto const ops = allFuncOpcodes(m, fn);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::SehTryBegin), 1u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::SehFilterReturn), 1u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::SehTryEnd), 1u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::SehExceptionCode), 1u)
+        << "_exception_code() in the filter lowers to its dedicated op";
+
+    // SehTryBegin: a terminator with 2 successors [tryEntry, filterEntry]; the
+    // filter block ends in SehFilterReturn with the SAME region id.
+    MirInstId const begin = findOp(m, fn, MirOpcode::SehTryBegin);
+    ASSERT_TRUE(begin.valid());
+    MirBlockId const beginBlk = m.instBlock(begin);
+    auto const succs = m.blockSuccessors(beginBlk);
+    ASSERT_EQ(succs.size(), 2u);
+    MirBlockId const filterBB = succs[1];
+    MirInstId const fterm = m.blockInstAt(
+        filterBB, m.blockInstCount(filterBB) - 1);
+    EXPECT_EQ(m.instOpcode(fterm), MirOpcode::SehFilterReturn);
+    EXPECT_EQ(m.instPayload(fterm), m.instPayload(begin))
+        << "Begin and FilterReturn share the region id";
+
+    // MirVerifier-clean (checkSehStructure ran as part of verify()).
+    DiagnosticReporter vrep;
+    MirVerifier verifier{m, &L.model.lattice().interner()};
+    EXPECT_TRUE(verifier.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+}
+
+// Audit F6: the FULL shipped release pipeline runs over a SEH function and stays
+// MirVerifier-GREEN end to end. This is the pin that catches a missing rebuild-
+// helper arm (every pass rebuilds through MirFunctionRebuilder) or inliner
+// host-emit arm — a debug-path structural test would NOT (those abort only when
+// a pass actually rebuilds the SEH function). RED-on-disable: drop the
+// SehTryBegin/SehFilterReturn arm from mir_rebuild_helper.cpp → the first pass
+// std::aborts on this fixture.
+TEST(MirLoweringCSubset, SehSurvivesFullReleasePipeline) {
+    auto L = lowerCSubset(
+        "int g;\n"
+        "static int helper(int x) { return x + 1; }\n"   // an inline candidate
+        "int f(int *p) { int rc = helper(g); __try { rc = *p; } "
+        "__except (_exception_code() == 0) { rc = 42; } return rc; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok);
+
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    auto pipelineR = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(pipelineR.has_value());
+
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(L.mir.mir, **targetR,
+                                      L.model.lattice().interner(),
+                                      *pipelineR, rep);
+    EXPECT_TRUE(result.ok)
+        << "release pipeline over a SEH function must stay verifier-green: "
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    // The region skeleton survives (no pass elided it).
+    MirFuncId fFn{};
+    for (std::uint32_t fi = 0; fi < L.mir.mir.moduleFuncCount(); ++fi) {
+        if (findOp(L.mir.mir, L.mir.mir.funcAt(fi),
+                   MirOpcode::SehTryBegin).valid()) {
+            fFn = L.mir.mir.funcAt(fi);
+        }
+    }
+    ASSERT_TRUE(fFn.v != 0u);
+    auto const ops = allFuncOpcodes(L.mir.mir, fFn);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::SehTryBegin), 1u);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::SehFilterReturn), 1u);
+}
+
+// mem2reg SKIPS a SEH-containing function: a local that would normally promote
+// to SSA stays in memory (an Alloca survives the release pipeline). Fault-time
+// locals must be memory-true. RED-on-disable: remove the SEH-skip guard in
+// mem2reg.cpp → rc promotes → 0 Allocas.
+TEST(MirLoweringCSubset, SehFunctionKeepsAllocasUnpromoted) {
+    auto L = lowerCSubset(
+        "int f(int *p) { int rc = 0; __try { rc = *p; } "
+        "__except (1) { rc = 42; } return rc; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    auto pipelineR = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(pipelineR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(L.mir.mir, **targetR,
+                                      L.model.lattice().interner(),
+                                      *pipelineR, rep);
+    ASSERT_TRUE(result.ok);
+
+    MirFuncId fFn{};
+    for (std::uint32_t fi = 0; fi < L.mir.mir.moduleFuncCount(); ++fi) {
+        if (findOp(L.mir.mir, L.mir.mir.funcAt(fi),
+                   MirOpcode::SehTryBegin).valid()) {
+            fFn = L.mir.mir.funcAt(fi);
+        }
+    }
+    ASSERT_TRUE(fFn.v != 0u);
+    auto const ops = allFuncOpcodes(L.mir.mir, fFn);
+    EXPECT_GE(countOpcode(ops, MirOpcode::Alloca), 1u)
+        << "mem2reg must skip a SEH function — rc stays in memory";
+}
+
+// Audit (c/F6): a __try nested INSIDE a loop stays MirVerifier-green. The "all
+// four SEH blocks are Linear" intent holds only in a straight-line body; here
+// the region's host/blocks can derive LoopHeader/LoopExit from CFG shape, and
+// the canonical marker re-derivation (rederiveStructCfMarkers after finish)
+// must keep stored==derived. RED-on-disable: hand-stamping a non-Linear SEH
+// block Linear-and-frozen would red checkDomination's marker-equality here.
+TEST(MirLoweringCSubset, SehInsideLoopStaysVerifierGreen) {
+    auto L = lowerCSubset(
+        "int f(int *p, int n) { int rc = 0; int i = 0; "
+        "while (i < n) { __try { rc = rc + *p; } "
+        "__except (1) { rc = 42; } i = i + 1; } return rc; }");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty()
+        ? "" : L.mirReporter.all()[0].actual);
+
+    // Straight-out-of-lowering the module must already be verifier-clean
+    // (checkDomination re-derives markers and compares stored==derived).
+    DiagnosticReporter vrep;
+    MirVerifier verifier{L.mir.mir, &L.model.lattice().interner()};
+    EXPECT_TRUE(verifier.verify(vrep))
+        << (vrep.all().empty() ? "" : vrep.all()[0].actual);
+
+    // And it survives the full release pipeline (marker re-derivation runs after
+    // every CFG-mutating pass).
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    auto pipelineR = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(pipelineR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(L.mir.mir, **targetR,
+                                      L.model.lattice().interner(),
+                                      *pipelineR, rep);
+    EXPECT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
 }

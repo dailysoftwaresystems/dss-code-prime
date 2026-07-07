@@ -296,6 +296,24 @@ struct Lowerer {
     // never sees an unresolved label.
     std::unordered_map<std::string, std::uint32_t> labelOrdinals_;
 
+    // c60 (Design I-A): the per-function ordinal of each switch `case`/`default`
+    // marker — keyed by the caseLabel CST node (case labels are ANONYMOUS, so the
+    // node identity is the key, not a name). These ordinals share the SAME
+    // per-function space as `labelOrdinals_` (named labels) so MIR's label-block
+    // getOrCreate keys both uniformly and they never collide. `nextLabelOrdinal_`
+    // is the single monotonic counter both draw from (named labels in the
+    // `prescanLabels` pass, case labels in the per-switch dispatch prescan). All
+    // three are saved/restored around each function body, like `labelOrdinals_`.
+    std::unordered_map<std::uint32_t, std::uint32_t> caseLabelOrdinals_;  // NodeId.v -> ordinal
+    std::uint32_t                                    nextLabelOrdinal_{};
+    // The depth of switch BODIES we are currently lowering inside (per the CST
+    // subtree). A `caseStmt`/bare `caseLabel` reached as a statement is an
+    // IN-SWITCH nested case (lower to a LabelStmt marker) iff this is > 0 AND the
+    // node has a prescanned case ordinal; otherwise it is genuinely outside a
+    // switch body → fail loud S0023. Saved/restored as a guard around the body
+    // lowering of each switch.
+    std::uint32_t                                    switchBodyDepth_{};
+
     // The result of lowering an expression: the HIR node + its resolved type.
     struct E { HirNodeId id; TypeId type; };
 
@@ -334,8 +352,18 @@ struct Lowerer {
         if (ck == TypeKind::Array && tk == TypeKind::Ptr) {
             auto const arrElem = interner.operands(child.type);
             auto const ptrElem = interner.operands(target);
-            if (!arrElem.empty() && !ptrElem.empty()
-                && arrElem[0] == ptrElem[0]) {
+            // c50 (D-CSUBSET-ARRAY-DECAY-TO-VOID-PTR): same-element array decay,
+            // OR array → void* (array decays to ptr-to-element, then T*→void*),
+            // gated on the same `implicitToVoidPtr` flag as the semantic tier.
+            // Both emit the synthetic Array→Ptr Cast that MIR re-types by the
+            // target (element-agnostic), so a string-literal / array arg lands as
+            // a width-correct `void*`.
+            bool const sameElem = !arrElem.empty() && !ptrElem.empty()
+                               && arrElem[0] == ptrElem[0];
+            bool const toVoidPtr = !ptrElem.empty()
+                && sem.pointerConversions.implicitToVoidPtr
+                && interner.kind(ptrElem[0]) == TypeKind::Void;
+            if (sameElem || toVoidPtr) {
                 HirNodeId const decay = builder.makeCast(
                     child.id, target, HirFlags::Synthetic);
                 for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
@@ -371,6 +399,47 @@ struct Lowerer {
                     }
                 }
                 return {decay, target};
+            }
+        }
+        // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): a STRING
+        // LITERAL (`Array<char,M>`) initializing a CHARACTER ARRAY `Array<char,N>`
+        // with N >= M zero-fills the trailing N−M bytes. REALIZE the semantic
+        // admission by RE-TYPING the literal node to the target `char[N]` (a fresh
+        // Literal sharing the SAME literal-pool index — the decoded string bytes are
+        // unchanged): the MIR producer then materializes the rodata global at N
+        // bytes (string bytes + NUL, zero-padded to N — see asm.cpp's string-literal
+        // arm) so a `char[N]`-wide aggregate copy reads guaranteed zeros, never an
+        // OOB read of adjacent rodata (the Option-A "pad at the producer" choice).
+        // The retyped node carries the field/slot's `char[N]` type, so the
+        // ConstructAggregate verifier's child==field equality holds (the struct
+        // `aXformType[]` case) AND the scalar `char x[7]="hi"` lowers as an N-byte
+        // array init. GUARDED on the child being an actual string Literal (the same
+        // `std::string` pool-variant discriminator the asm producer keys on), so an
+        // ordinary array value never reaches this arm; the `N >= M` guard keeps an
+        // over-long init out (it never admitted at the semantic tier either). Pinned
+        // to char elements on both sides (the C string-literal element type).
+        if (ck == TypeKind::Array && tk == TypeKind::Array
+            && builder.kind(child.id) == HirKind::Literal) {
+            auto const fromElem = interner.operands(child.type);
+            auto const toElem   = interner.operands(target);
+            auto const fromLen  = interner.scalars(child.type);
+            auto const toLen    = interner.scalars(target);
+            if (!fromElem.empty() && !toElem.empty()
+                && !fromLen.empty() && !toLen.empty()
+                && interner.kind(fromElem[0]) == TypeKind::Char
+                && interner.kind(toElem[0]) == TypeKind::Char
+                && toLen[0] >= fromLen[0]
+                && std::holds_alternative<std::string>(
+                       literals.at(builder.payload(child.id)).value)) {
+                HirNodeId const padded =
+                    builder.makeLiteral(target, builder.payload(child.id));
+                for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                    if (it->first == child.id) {
+                        spans.push_back({padded, it->second});
+                        break;
+                    }
+                }
+                return {padded, target};
             }
         }
         // D-LANG-POINTER-VOID-CONVERT (step 13.2, 2026-06-02): when
@@ -569,18 +638,79 @@ struct Lowerer {
     // truthiness conditions (`if (2)` would have been false; every
     // reachable case was caught by the FC3-c2 conversion-width gate, so
     // nothing miscompiled silently).
+    // D-CSUBSET-NARROW-SWITCH-DISCRIMINANT-CMP (c78): integer-PROMOTE a
+    // sub-int arithmetic value to `int` (C 6.3.1.1), reusing the SAME
+    // `integerPromotedType` + `coerce` chokepoint `coerceCondition` and
+    // the array-index path use. Char/signed→SExt, unsigned(U8/U16)→ZExt
+    // (via `mapCast`, automatic per kind). A block-less language (no
+    // `arith_`), an already-≥int value, a non-arithmetic value, or a
+    // float all pass through unchanged. Extracted here so the switch
+    // controlling-expression promotion (C 6.8.4.2 — "the integer
+    // promotions are performed on the controlling expression") shares
+    // ONE promotion primitive with the truth-value path.
+    [[nodiscard]] E promoteSubIntArith(E val) {
+        if (!val.type.valid()) return val;
+        if (!arith_.has_value()) return val;
+        if (!isArithmeticCore(interner.kind(val.type))) return val;
+        TypeId const p = integerPromotedType(interner, val.type, *arith_);
+        if (p.valid() && p.v != val.type.v) return coerce(val, p);
+        return val;
+    }
+
     [[nodiscard]] E coerceCondition(E cond, NodeId anchor) {
         if (!cond.type.valid()) return cond;
         TypeKind const ck = interner.kind(cond.type);
         if (ck == TypeKind::Bool) return cond;
         if (isArithmeticCore(ck)) {
-            HirNodeId const zero = synthZeroOrError(anchor, cond.type);
+            // c71 (D-CSUBSET-32BIT-ALU-FORMS): a SUB-INT arithmetic condition
+            // (a `char`/`signed char`/`short` used as a truth value — sqlite's
+            // pervasive `while (*z)`, `if (c)`) must integer-PROMOTE to `int`
+            // (C 6.3.1.1) BEFORE the `!= 0` test. Otherwise the synthetic
+            // `Ne(cond, zero)` is a Char/I8-typed ICmp that walls at the
+            // target's sub-native ALU gap (no width-8/16 compare form) — the
+            // same wall the index path guards via `integerPromotedType`. The
+            // truth value is unchanged (any nonzero narrow is nonzero int),
+            // but the compare is now I32. Reuse the SAME chokepoint; a
+            // block-less language (no `arith_`) or an already-≥int cond keeps
+            // the raw value, and a float cond passes through (integerPromoted-
+            // Type is a no-op on floats → the `Ne` stays an FCmp).
+            E promoted = cond;
+            if (arith_.has_value()) {
+                TypeId const p =
+                    integerPromotedType(interner, cond.type, *arith_);
+                if (p.valid() && p.v != cond.type.v)
+                    promoted = coerce(cond, p);
+            }
+            HirNodeId const zero = synthZeroOrError(anchor, promoted.type);
             return {track(builder.addParent(HirKind::BinaryOp,
-                                            std::array{cond.id, zero},
+                                            std::array{promoted.id, zero},
                                             boolType(),
                                             encodeOp(HirOpKind::Ne)),
                           anchor),
                     boolType()};
+        }
+        // c91 (D-CSUBSET-ARRAY-DECAY-IN-CONDITION): an ARRAY condition
+        // (`if (arr)`, `ok && arr`, `arr ? a : b`, `if ("x")` —
+        // C 6.3.2.1p3 + 6.8.4.1p1) decays to Ptr<elem> via the ONE coerce
+        // decay funnel, then RE-ENTERS this function so the decayed pointer
+        // takes the EXISTING null-pointer `Ne` arm below — an object's
+        // address is never null, matching C's always-true truth value
+        // (gcc -Waddress warns; the code is legal and compiles). Without
+        // this the Array cond either reached the CondBr terminator raw
+        // (I_TerminatorTypeMismatch — the `if ("x")` c79 sibling) or
+        // VALUE-loaded the array's first bytes as the truth value (a
+        // member/global array in `&&`/`||` — silently FALSE whenever the
+        // content bytes are zero: `ok && g` on a zero-filled global). A
+        // shapeless Array (no element operand — malformed) falls through
+        // unchanged: stays loud downstream.
+        if (ck == TypeKind::Array) {
+            auto const elems = interner.operands(cond.type);
+            if (!elems.empty()) {
+                E const decayed = coerce(cond, interner.pointer(elems[0]));
+                if (decayed.type.valid()
+                    && interner.kind(decayed.type) == TypeKind::Ptr)
+                    return coerceCondition(decayed, anchor);
+            }
         }
         if (ck == TypeKind::Ptr
             && sem.pointerConversions.nullPointerConstantFromIntegerZero) {
@@ -605,6 +735,40 @@ struct Lowerer {
                     boolType()};
         }
         return cond;
+    }
+
+    // c79 (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY): the single argument-
+    // coercion funnel for EVERY call-argument site (work-stack Call
+    // frame phase 2, the recursive lowerPostfix Call arm, the SQL flat-
+    // call arm). A DECLARED param coerces exactly as before. An arg
+    // BEYOND the declared params (the variadic `...` tail) or an
+    // unknown-signature callee has NO target type - but C 6.5.2.2p6-7
+    // still applies the lvalue conversions to each such argument: an
+    // Array<T,N> argument DECAYS to Ptr<T> (the default argument
+    // promotions' array decay). Without this a string literal in a
+    // variadic tail (sqlite pragma foreign_key_list
+    // `sqlite3VdbeMultiLoad(..., "NONE")`) kept TypeKind::Array ->
+    // lowered through the MIR Const path -> a LIR literal-pool `mov`
+    // with NO encoder variant (A_NoMatchingEncodingVariant, pool-slot
+    // "is not an integer literal" - the c79 sqlite frontier). Decaying
+    // to pointer-to-OWN-elem keeps coerce's sameElem premise trivially
+    // true, so this reuses the SAME synthetic decay Cast every other
+    // decay site emits (a string literal materializes as a rodata
+    // GlobalAddr at HIR->MIR; a named array yields its base address).
+    // The integer/float default promotions for variadic tails are the
+    // ABI arg-setup tier's width concern, NOT re-typed here; a FnSig
+    // designator already lowers to the function's address uniformly.
+    // Non-Array / valid-param behavior is byte-identical to the prior
+    // inline `coerce(arg, paramType)` / pass-through shapes.
+    [[nodiscard]] E coerceCallArg(E arg, TypeId paramType) {
+        if (paramType.valid()) return coerce(arg, paramType);
+        if (arg.type.valid()
+            && interner.kind(arg.type) == TypeKind::Array) {
+            auto const elems = interner.operands(arg.type);
+            if (!elems.empty())
+                return coerce(arg, interner.pointer(elems[0]));
+        }
+        return arg;
     }
 
     Lowerer(SemanticModel& m, HirLoweringConfig const& c, SemanticConfig const& s,
@@ -852,25 +1016,57 @@ struct Lowerer {
         if (rec != nullptr && rec->isConst)
             mutability.push_back({node, MutabilityAttr{/*isConst=*/true}});
     }
-    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): record an ACCESS HIR node's volatility
-    // from its bound symbol's `SymbolRecord.isVolatile` (sparse: only volatile
-    // accesses are stored; absence ⇒ plain access). Called at the object-Ref +
-    // VarDecl/Global lowering sites. The member-access form reads the FIELD record
-    // directly (its symbol is not the object's) — see `recordMemberVolatility`.
+    // c21/c27: record an ACCESS HIR node's OBJECT-volatility — true iff the bound
+    // symbol's STORAGE is itself volatile, i.e. its resolved type is TOP-LEVEL
+    // VolatileQual (`volatile int x` → VolatileQual(int); east `int * volatile p`
+    // → VolatileQual(Ptr<int>)). c27 (D-CSUBSET-VOLATILE-POINTEE) DERIVES this from
+    // the TYPE rather than the c21 coarse `isVolatile` token-scan, which mis-fired
+    // for a pointer-to-volatile-POINTEE (`volatile int *p`): there the volatile
+    // qualifies the POINTEE (type `Ptr<VolatileQual(int)>`, top-level Ptr — the
+    // OBJECT `p` is NOT volatile), and reading `p` must be a PLAIN Load; the
+    // volatile rides the DEREF `*p` instead (carried by the pointee type at the
+    // access — see hir_to_mir `volatileFlagForType`). Sparse: only object-volatile
+    // symbols are annotated. Called at the object-Ref + VarDecl/Global sites.
     void recordVolatility(HirNodeId node, SymbolId sym) {
         if (!node.valid() || !sym.valid()) return;
         auto const* rec = model.recordFor(sym);
-        if (rec != nullptr && rec->isVolatile)
+        if (rec != nullptr && interner.isVolatileQualified(rec->type))
             volatileAcc.push_back({node, VolatileAttr{/*isVolatile=*/true}});
     }
-    // c21: record a MemberAccess HIR node's volatility from the FIELD's record
-    // (`frec->isVolatile`) — the volatile-ness is the field declaration's, not
-    // the object's. The MemberAccess node keys both the rvalue Load and (when it
-    // is an assignment target) the Store.
+    // c21: record a MemberAccess HIR node's FIELD-volatility — true iff the field's
+    // OWN storage is volatile (top-level VolatileQual: `volatile int m`). A
+    // `volatile int *m` field is NOT object-volatile (top-level Ptr); `p->m` reads
+    // the plain pointer, and `*p->m` is volatile via the deref's pointee type. The
+    // MemberAccess node keys both the rvalue Load and (as an assign target) the
+    // Store. CONTAINER-volatility (a member of a `volatile struct`, C 6.7.3p5) is
+    // handled ORTHOGONALLY by `volatileQualifiedAccess` qualifying the access
+    // RESULT TYPE (which the MIR sites read via `volatileFlagForType`, and which
+    // PROPAGATES through nested member/index chains) — see `combineMember`.
     void recordMemberVolatility(HirNodeId node, SymbolRecord const* frec) {
         if (!node.valid() || frec == nullptr) return;
-        if (frec->isVolatile)
+        if (interner.isVolatileQualified(frec->type))
             volatileAcc.push_back({node, VolatileAttr{/*isVolatile=*/true}});
+    }
+    // c27 (D-CSUBSET-VOLATILE-POINTEE): the RESULT TYPE of a member/index access
+    // of a `volatile`-qualified CONTAINER is itself `volatile`-qualified (C 6.5.2.3
+    // / 6.7.3p5: a member of a `volatile struct/union` — and an element of a
+    // `volatile` array — is so-qualified). `accessedType` is the field/element
+    // type; `containerType` is the object/base type. When the container is volatile
+    // we wrap the accessed type so:
+    //   (1) the MIR access site (read Load / write Store / by-value copy) flags the
+    //       access via `volatileFlagForType` — no per-form annotation needed;
+    //   (2) the qualifier PROPAGATES — a nested `p->inner.x` makes `p->inner`
+    //       volatile-typed, so the outer `.x` container is volatile in turn;
+    //   (3) a complex lvalue (`pSum->rErr += r`, `++(p->a)`) read+written via a
+    //       temp pointer gets a `volatile T *` pointee, so its Deref carries the
+    //       flag (the Kahan-summation miscompile guard).
+    // Idempotent (volatileQualified never double-wraps); a non-volatile container
+    // returns `accessedType` unchanged (a plain access stays plain).
+    [[nodiscard]] TypeId volatileQualifiedAccess(TypeId accessedType,
+                                                 TypeId containerType) {
+        if (accessedType.valid() && interner.isVolatileQualified(containerType))
+            return interner.volatileQualified(accessedType);
+        return accessedType;
     }
 
     [[nodiscard]] bool isExprNode(NodeId n) const {
@@ -1318,7 +1514,11 @@ struct Lowerer {
                     // inits, not the deep call chain), exactly as the recursive Call
                     // arm's `lowerExprOrBraceInit`.
                     TypeId const paramType = callParamType(callCtxs[ctxIdx], k);
-                    HirNodeId const a = lowerExprOrBraceInit(argN, paramType);
+                    // c79: the call-arg helper (brace-init args take the same
+                    // lowerBraceInit arm - behavior-identical here since this
+                    // branch is brace-init-only; scalar args coerce in the Call
+                    // frame's phase 2 below).
+                    HirNodeId const a = lowerCallArgOrBraceInit(argN, paramType);
                     callCtxs[ctxIdx].args.push_back(a);
                     ++callCtxs[ctxIdx].argIdx;
                     continue;       // process the next arg
@@ -1527,7 +1727,9 @@ struct Lowerer {
                     std::uint32_t const ctxIdx = f.aux;
                     std::size_t const k = callCtxs[ctxIdx].argIdx;   // the in-flight arg
                     TypeId const paramType = callParamType(callCtxs[ctxIdx], k);
-                    HirNodeId const a = coerce(result, paramType).id;
+                    // c79: variadic-tail args (invalid paramType) array-decay
+                    // via the shared funnel (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY).
+                    HirNodeId const a = coerceCallArg(result, paramType).id;
                     callCtxs[ctxIdx].args.push_back(a);
                     ++callCtxs[ctxIdx].argIdx;
                     if (pumpCallArgs(ctxIdx)) break;   // entered the next scalar — wait
@@ -1569,7 +1771,8 @@ struct Lowerer {
                     std::uint32_t ctxIdx, E& result) {
         CallCtx const& ctx = callCtxs[ctxIdx];
         NodeId const callNode = work.back().node;   // the postfix Call node (provenance)
-        E const callE{track(builder.makeCall(ctx.baseE.id, ctx.args, ctx.resultType), callNode),
+        E const callE{track(emitCallOrBuiltin(ctx.base, ctx.baseE.id, ctx.args, ctx.resultType),
+                            callNode),
                       ctx.resultType};
         work.pop_back();
         callCtxs.pop_back();
@@ -1593,14 +1796,38 @@ struct Lowerer {
         NodeId const node = work.back().node;   // the binary (assign) node (provenance)
         HirNodeId stored;
         if (!ctx.compound) {
-            stored = result.id;                                       // plain `=`
+            // c90 (D-CSUBSET-ASSIGN-VALUE-RHS-COERCE): a plain `=` in VALUE position
+            // must coerce the RHS to the lvalue type before the store (mirroring the
+            // statement path `lowerAssign` -> `lowerExprOrBraceInit(rhsN, lhs.type)`),
+            // else the MIR store takes the RHS's width: a sub-int RHS partial-stores
+            // (stale upper bits -- sqlite estimateTableWidth `for(i=pTab->nCol, ...)`
+            // SIGSEGV) and a wider RHS over-stores past a sub-int lvalue.
+            stored = coerce(result, lv.type).id;                      // plain `=`
         } else {
             // `OP=`: `compoundLhsRead OP rhs`. `compoundLhsRead` was emitted in
             // `enter` (BEFORE the rhs), so operand[0]'s node precedes operand[1]'s —
             // the SAME arena order as the recursive braced-init `{lvRead, rhs}`.
-            stored = builder.addParent(HirKind::BinaryOp,
-                                       std::array{ctx.compoundLhsRead, result.id},
-                                       lv.type, encodeOp(ctx.baseOp));
+            // c74 (D-CSUBSET-32BIT-ALU-FORMS): integer-PROMOTE the base op (C99
+            // `a OP= b` == `a = (T)((a) OP (b))`, the OP at the COMMON type) so a
+            // sub-int lvalue in VALUE position (`(flags &= ~M)`, `while ((x |= b))`)
+            // doesn't build a Char/U8-typed BinaryOp that walls at the sub-native
+            // ALU gate. Mirrors the statement-position `lowerCompoundAssign`; the
+            // promote-casts are pure conversions (no side effect), so the read-
+            // before-rhs order is preserved. A non-arithmetic common (Ptr compound
+            // `p += n`) keeps opType==lv.type → the c41 stride-Gep, unchanged.
+            E lhsE{ctx.compoundLhsRead, lv.type};
+            E rhsE = result;
+            TypeId const common = commonArithType(lhsE.type, rhsE.type);
+            TypeId const opType = common.valid() ? common : lv.type;
+            if (common.valid()) {
+                lhsE = coerce(lhsE, common);
+                rhsE = coerce(rhsE, common);
+            }
+            HirNodeId const opResult = builder.addParent(HirKind::BinaryOp,
+                std::array{lhsE.id, rhsE.id}, opType, encodeOp(ctx.baseOp));
+            stored = (opType.v != lv.type.v)
+                ? coerce(E{opResult, opType}, lv.type).id
+                : opResult;
         }
         std::vector<HirNodeId> stmts = lv.prep;
         stmts.push_back(lvWrite(lv, stored));
@@ -2003,8 +2230,10 @@ struct Lowerer {
                     argNode = lowerBraceInit(core, paramType);
                 } else {
                     E const arg = lowerFlatExpr(a);
-                    E const coerced = paramType.valid() ? coerce(arg, paramType)
-                                                        : arg;
+                    // c79: same call-arg funnel as the other three sites
+                    // (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY); declared params
+                    // coerce byte-identically, Array-typed tail args decay.
+                    E const coerced = coerceCallArg(arg, paramType);
                     argNode = coerced.id;
                 }
                 args.push_back(argNode);
@@ -2119,6 +2348,34 @@ struct Lowerer {
             for (NodeId k : visible(n)) stack.push_back(k);
         }
         return hit;
+    }
+
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): emit a BuiltinCall when the callee resolves
+    // to a builtin carrying a `lowering` (e.g. `__umulh`) — a DEDICATED intrinsic
+    // MIR op — otherwise an ordinary Call. `calleeNode` is the callee CST subtree
+    // (symbol resolution via `firstNameToken`); `calleeId` is its already-lowered
+    // HIR expr id (the ordinary-Call callee child). SHARED by the iterative
+    // `finishCall` and the recursive Call arm so the two makeCall sites stay in
+    // lockstep. Indirect calls, non-builtins, and plain builtins (COALESCE,
+    // lowering=None) stay ordinary Calls. The builtin metadata is visible here (the
+    // SemanticModel is in scope), which it is NOT at HIR→MIR — hence the seam sits here.
+    // Audit note (c103, LOW/theoretical): firstNameToken picks the first RESOLVED name
+    // in the callee subtree, so a lowering-builtin appearing as a NON-callee value in a
+    // complex callee (e.g. selected through a ternary) would misfire — unreachable
+    // today (an intrinsic has no linkable address to store/select). If a future
+    // intrinsic is address-takeable, tighten this to require a DIRECT-name callee.
+    [[nodiscard]] HirNodeId emitCallOrBuiltin(NodeId calleeNode, HirNodeId calleeId,
+                                              std::span<HirNodeId const> args,
+                                              TypeId resultType) {
+        SymbolId const sym = firstNameToken(calleeNode).sym;
+        if (sym.valid()) {
+            if (auto const* rec = model.recordFor(sym);
+                rec != nullptr && rec->builtinLowering != BuiltinLowering::None) {
+                return builder.makeBuiltinCall(
+                    static_cast<std::uint32_t>(rec->builtinLowering), args, resultType);
+            }
+        }
+        return builder.makeCall(calleeId, args, resultType);
     }
 
     // A name reference as an expression (id + type): resolves the last identifier
@@ -2328,7 +2585,149 @@ struct Lowerer {
             lc = coerce(lhs, common);
             rc = coerce(rhs, common);
         }
+        // c91 (D-CSUBSET-ARRAY-DECAY-IN-COMPARISON, closing the
+        // D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY comparison surface):
+        // C 6.3.2.1p3 — an ARRAY operand of an equality/relational operator
+        // decays to Ptr<elem> (the address of its first element) FIRST.
+        // Comparisons never enter the c59 additive / c65 pointer-diff decay
+        // arms, so an un-decayed Array operand kept TypeKind::Array and was
+        // VALUE-lowered: a member/global array operand emitted an aggregate
+        // Load — the compare read the array's first BYTES as a "pointer"
+        // (sqlite sqlite3ParserFinalize `pParser->yystack !=
+        // pParser->yystk0` always-unequal → freed the on-stack parser →
+        // the every-SQL-statement SIGABRT; a zero-filled global compared
+        // EQUAL to a null pointer) — and a string-literal operand
+        // (`z == "x"`) dead-ended in the LIR literal-pool `mov`
+        // (A_NoMatchingEncodingVariant). Reuse the ONE decay funnel every
+        // other consumer uses (coerce's Array→Ptr arm → mapCast →
+        // lowerLvalueAddress base address / rodata-string
+        // materialization). Decaying to pointer-to-OWN-elem keeps coerce's
+        // sameElem premise trivially true — BOTH operand orders, every
+        // lvalue shape (member / global / local / nested / via-deref), and
+        // `arr == arr2` (both decay). The OTHER operand's type is not
+        // consulted: `arr == 0` becomes the existing Ptr-vs-literal-0
+        // compare shape, and a mismatched-pointee `arr == otherTypePtr`
+        // becomes the same two-Ptr compare `p == q` already accepts
+        // (pre-existing latitude, not widened here). A shapeless Array
+        // (no element operand — malformed) falls through unchanged: loud.
+        if (isComparison(*op)) {
+            if (lc.type.valid()
+                && interner.kind(lc.type) == TypeKind::Array) {
+                auto const elems = interner.operands(lc.type);
+                if (!elems.empty())
+                    lc = coerce(lc, interner.pointer(elems[0]));
+            }
+            if (rc.type.valid()
+                && interner.kind(rc.type) == TypeKind::Array) {
+                auto const elems = interner.operands(rc.type);
+                if (!elems.empty())
+                    rc = coerce(rc, interner.pointer(elems[0]));
+            }
+        }
+        // c40 (D-CSUBSET-POINTER-SUBTRACTION) C 6.5.6p9: `p - q` (BOTH operands
+        // Ptr<T>, same pointee) yields ptrdiff_t (a SIGNED integer = the ELEMENT
+        // count), NOT a pointer. Without this the fallback below types it
+        // `lhs.type` (Ptr<T>) → it fails to pass as a numeric function ARGUMENT
+        // (S_TypeMismatch — the sqlite `fmt - bufpt` blocker) and the MIR value
+        // is the raw byte difference. The MIR tier (`combineBinaryOp`) reads this
+        // I64 result type WITH Ptr operands as the signal to emit
+        // PtrToInt+Sub(+SDiv by sizeof(pointee)). SAME-pointee only: a mismatched
+        // `char* - int*` falls through to a Ptr-typed result — caught ONLY when
+        // coerced to a numeric param (in a non-arg context like `(int)(a-b)` it
+        // is NOT diagnosed today: D-CSUBSET-POINTER-DIFF-EDGE-CASES). `p ± n`
+        // (pointer ± integer → Ptr result) is the SEPARATE c41 value-scaling fix.
+        //
+        // c65 (D-CSUBSET-POINTER-DIFF-EDGE-CASES): `p - arrayName` — an ARRAY
+        // operand of pointer SUBTRACTION decays to Ptr<elem> (C 6.3.2.1p3) FIRST,
+        // so it is a true pointer DIFFERENCE `p - q` (ptrdiff_t), not the p±n
+        // index path. c59 deferred this (its array-decay fires only when the
+        // OTHER operand is a SCALAR index; here the other is a Ptr or Array).
+        // sqlite vdbeSorter `(u8)(pTask - pSorter->aTask)` (sqlite3.c:107252) —
+        // without it the un-decayed Array RHS made ptrIntArith true → the MIR
+        // `p±n` branch tried to widen the Array index via mapCast(Array,I64) →
+        // MirOpcode::Invalid → an addInst ABORT (a compiler crash). Covers
+        // `p-arr`, `arr-p`, `arr-arr`; `arr - scalarIndex` stays the c59
+        // `array - index` Ptr form (the other operand is a scalar, not Ptr/Array).
+        if (*op == HirOpKind::Sub) {
+            bool const lArr = lc.type.valid() && interner.kind(lc.type) == TypeKind::Array;
+            bool const rArr = rc.type.valid() && interner.kind(rc.type) == TypeKind::Array;
+            bool const lPtr = lc.type.valid() && interner.kind(lc.type) == TypeKind::Ptr;
+            bool const rPtr = rc.type.valid() && interner.kind(rc.type) == TypeKind::Ptr;
+            // Decay ONLY when the element/pointee types MATCH (a true pointer
+            // difference). A MISMATCHED pairing (`int* - char[]`, which gcc
+            // rejects) is left UN-decayed → it stays an Array index → the MIR p±n
+            // widen hits the c65 fail-loud guard (hir_to_mir.cpp:1208), so it
+            // fails LOUD (a clean diagnostic) rather than silently miscomputing
+            // the array's address as an index — WITHOUT this match-guard the
+            // decayed-but-mismatched `int* - char*` is non-ptrSub → it slips into
+            // the c41 p±n path (the audit's fail-loud-regression catch). The
+            // mismatched TWO-pointer `int* - char*` (no array) stays the
+            // pre-existing part-2 silent-accept (untouched here).
+            if ((lPtr && rArr) || (lArr && rPtr) || (lArr && rArr)) {
+                auto const lo = interner.operands(lc.type);
+                auto const ro = interner.operands(rc.type);
+                if (!lo.empty() && !ro.empty() && lo[0] == ro[0]) {
+                    if (lArr) lc = coerce(lc, interner.pointer(lo[0]));
+                    if (rArr) rc = coerce(rc, interner.pointer(ro[0]));
+                }
+            }
+        }
+        // ptrSub reads the (possibly array-decayed) lc/rc — identical to lhs/rhs
+        // for the plain `p - q` case (two pointers never coerce: `common` is
+        // Invalid), and now also true for the decayed `p - array`.
+        bool const ptrSub =
+            *op == HirOpKind::Sub && lc.type.valid() && rc.type.valid()
+            && interner.kind(lc.type) == TypeKind::Ptr
+            && interner.kind(rc.type) == TypeKind::Ptr
+            && interner.operands(lc.type)[0] == interner.operands(rc.type)[0];
+        // c41 (D-CSUBSET-POINTER-INT-ARITHMETIC) C 6.5.6p8: `p + n` / `n + p` /
+        // `p - n` (pointer ± integer → a Ptr). `n + p` is CANONICALIZED here
+        // (swap lc/rc so the Ptr operand is ALWAYS kids[0]) → combineBinaryOp
+        // sees a uniform (Ptr, Int) shape + emits a stride-scaled Gep (reusing
+        // F1's scaleIndexToBytes). `p - n` keeps the pointer LEFT (Sub is
+        // non-commutative; `n - p` has no C 6.5.6 meaning → not handled here).
+        // Mutually exclusive with `ptrSub` (which needs BOTH operands Ptr) and
+        // with F1 p++/p[i] (which never reach combineBinary).
+        // c59 (D-CSUBSET-ARRAY-DECAY-IN-ADDITIVE): C 6.3.2.1p3 — an ARRAY operand of
+        // `+`/`-` decays to Ptr<elem> FIRST, so `array ± index` behaves like the
+        // pointer forms (the c41 stride-Gep below + a correctly-typed Deref above).
+        // Without this the Array operand kept TypeKind::Array → ptrIntArith was false
+        // → the BinaryOp mis-typed as the array → a downstream `*(array+i)` Deref came
+        // out TYPELESS (H0001 Deref-unresolved + H0009 lvalue-classify on the
+        // assignment-LHS form — sqlite `AtomicStore(aReadMark+i,…)`). Reuses the SAME
+        // coerce array-decay as the cast path (cst_to_hir.cpp:4299). GUARD: decay an
+        // array ONLY when the OTHER operand is a scalar index (non-Array AND non-Ptr)
+        // — so `array - array` / `p - arrayName` stay on the deferred pointer-DIFF
+        // path (D-CSUBSET-POINTER-DIFF-EDGE-CASES) and `array + ptr` (no C meaning) is
+        // untouched. The right operand decays for Add only (`index + array`,
+        // canonicalized below); `array - index` keeps the array LEFT.
+        bool const lcArr = lc.type.valid() && interner.kind(lc.type) == TypeKind::Array;
+        bool const rcArr = rc.type.valid() && interner.kind(rc.type) == TypeKind::Array;
+        bool const lcIdx = lc.type.valid() && interner.kind(lc.type) != TypeKind::Array
+                           && interner.kind(lc.type) != TypeKind::Ptr;
+        bool const rcIdx = rc.type.valid() && interner.kind(rc.type) != TypeKind::Array
+                           && interner.kind(rc.type) != TypeKind::Ptr;
+        if ((*op == HirOpKind::Add || *op == HirOpKind::Sub) && lcArr && rcIdx) {
+            auto const elems = interner.operands(lc.type);
+            if (!elems.empty()) lc = coerce(lc, interner.pointer(elems[0]));
+        }
+        if (*op == HirOpKind::Add && rcArr && lcIdx) {
+            auto const elems = interner.operands(rc.type);
+            if (!elems.empty()) rc = coerce(rc, interner.pointer(elems[0]));
+        }
+        if (*op == HirOpKind::Add && lc.type.valid() && rc.type.valid()
+            && interner.kind(lc.type) != TypeKind::Ptr
+            && interner.kind(rc.type) == TypeKind::Ptr) {
+            std::swap(lc, rc);   // n + p → canonicalize: Ptr always left
+        }
+        bool const ptrIntArith =
+            (*op == HirOpKind::Add || *op == HirOpKind::Sub)
+            && lc.type.valid() && rc.type.valid()
+            && interner.kind(lc.type) == TypeKind::Ptr
+            && interner.kind(rc.type) != TypeKind::Ptr;
         TypeId const result = isComparison(*op) ? boolType()
+                            : ptrSub      ? interner.primitive(TypeKind::I64)
+                            : ptrIntArith ? lc.type   // Ptr<T> (the pointer operand)
                             : (common.valid() ? common
                                               : (lhs.type.valid() ? lhs.type : rhs.type));
         return {track(builder.addParent(HirKind::BinaryOp, std::array{lc.id, rc.id},
@@ -2365,15 +2764,38 @@ struct Lowerer {
                 return exprError(node, "assignment sub-expression needs an lvalue and a value");
             HirNodeId stored;
             if (e.compoundBase.empty()) {
-                stored = lowerExpr(rhsN).id;                        // plain `=`
+                // c90 (D-CSUBSET-ASSIGN-VALUE-RHS-COERCE): coerce the plain-`=` RHS
+                // to the lvalue type (mirrors `lowerAssign`'s statement path) -- the
+                // twin of `finishAssign`'s plain arm; see the comment there.
+                stored = coerce(lowerExpr(rhsN), lv->type).id;      // plain `=`
             } else {
                 auto op = coreOpFromName(e.compoundBase);           // `OP=`
                 if (!op || arityOf(*op) != HirOpArity::Binary)
                     return exprError(node, std::format("compound base op '{}' is not binary",
                                                        e.compoundBase));
-                stored = builder.addParent(HirKind::BinaryOp,
-                                           std::array{lvRead(*lv), lowerExpr(rhsN).id},
-                                           lv->type, encodeOp(*op));
+                // c74 (D-CSUBSET-32BIT-ALU-FORMS): a VALUE-position compound assign
+                // (`(flags &= ~M)`, `while ((x |= b))`) must integer-PROMOTE the base
+                // op exactly like the statement-position `lowerCompoundAssign` (C99
+                // `a OP= b` == `a = (T)((a) OP (b))`, the OP computed at the COMMON
+                // type) — else a sub-int lvalue builds a Char/U8-typed BinaryOp that
+                // walls at the sub-native ALU gate (sqlite's `p->flags &= ~M` in an
+                // if/while). Compute at `common`; narrow the result back to the
+                // lvalue type for the store. A non-arithmetic common (Ptr compound
+                // `p += n`) keeps opType == lv->type → the c41 stride-Gep path,
+                // byte-identical to before (no coerce, no narrow).
+                E lhsE{lvRead(*lv), lv->type};
+                E rhsE = lowerExpr(rhsN);
+                TypeId const common = commonArithType(lhsE.type, rhsE.type);
+                TypeId const opType = common.valid() ? common : lv->type;
+                if (common.valid()) {
+                    lhsE = coerce(lhsE, common);
+                    rhsE = coerce(rhsE, common);
+                }
+                HirNodeId const opResult = builder.addParent(HirKind::BinaryOp,
+                    std::array{lhsE.id, rhsE.id}, opType, encodeOp(*op));
+                stored = (opType.v != lv->type.v)
+                    ? coerce(E{opResult, opType}, lv->type).id
+                    : opResult;
             }
             std::vector<HirNodeId> stmts = lv->prep;
             stmts.push_back(lvWrite(*lv, stored));
@@ -2496,8 +2918,56 @@ struct Lowerer {
             unsupported(node, std::format("unary target '{}' is not a core unary operator", e.target));
             return {errorNode(node), InvalidType};
         }
-        TypeId const result = (*op == HirOpKind::Not) ? boolType() : operand.type;
-        return {track(builder.addParent(HirKind::UnaryOp, std::array{operand.id},
+        // c71+c72 (D-CSUBSET-32BIT-ALU-FORMS): a unary arithmetic operator on a
+        // SUB-INT operand integer-PROMOTES the operand to `int` (C 6.5.3.3: the
+        // integer promotions are performed on the operand of unary `+`/`-`/`~`,
+        // and `!E` is `(E == 0)`). Without it the MIR Neg / Not(bitwise) /
+        // ICmpEq(`!`) is a Char/U8/U16-typed op that walls at the target's
+        // sub-native ALU gap — sqlite's `~u8`/`-u8` flag math (c72) and the
+        // `if(!*z)` scan idiom (c71). RESULT type: `!` yields Bool; `-`/`~` yield
+        // the PROMOTED operand type (C 6.5.3.3p3/p4 — the result has the promoted
+        // type), so an assignment back to a narrow lvalue truncates via the
+        // normal coerce. Bool is EXCLUDED (its native ICmpEq-0 / narrow forms are
+        // not gated, and it keeps the `!bool`/`~bool` shape); float/pointer/≥int
+        // operands pass through (`integerPromotedType` is a no-op → `-f`/`!p`
+        // stay at their own width). `Pos` (`+`) returned above.
+        E unOperand = operand;
+        TypeId promotedTy = operand.type;
+        // c91 (D-CSUBSET-ARRAY-DECAY-IN-CONDITION, the `!` form): `!E` is
+        // `(E == 0)` (C 6.5.3.3p5) — an ARRAY operand takes the SAME
+        // C 6.3.2.1p3 decay as a condition/comparison operand, through the
+        // ONE coerce funnel. The decayed pointer then flows the existing
+        // `!ptr` shape (an object's address is never null → constant
+        // false, gcc-matching). Without this a member/global array operand
+        // VALUE-loaded its first bytes (`!g` on a zero-filled global was
+        // TRUE — silently wrong). Neg/BitNot on an array stay un-decayed:
+        // C requires an arithmetic operand there (gcc rejects), so they
+        // keep failing loud downstream rather than silently negating an
+        // address. The sub-int promote below then reads the DECAYED
+        // operand (a no-op on the pointer — integerPromotedType only
+        // promotes arithmetic kinds); for every non-Array operand
+        // `unOperand`/`promotedTy` are byte-identical to the prior reads
+        // of `operand`.
+        if (*op == HirOpKind::Not && operand.type.valid()
+            && interner.kind(operand.type) == TypeKind::Array) {
+            auto const elems = interner.operands(operand.type);
+            if (!elems.empty()) {
+                unOperand  = coerce(operand, interner.pointer(elems[0]));
+                promotedTy = unOperand.type;
+            }
+        }
+        if ((*op == HirOpKind::Not || *op == HirOpKind::BitNot
+             || *op == HirOpKind::Neg)
+            && arith_.has_value() && unOperand.type.valid()
+            && interner.kind(unOperand.type) != TypeKind::Bool) {
+            TypeId const p = integerPromotedType(interner, unOperand.type, *arith_);
+            if (p.valid() && p.v != unOperand.type.v) {
+                unOperand  = coerce(unOperand, p);
+                promotedTy = p;
+            }
+        }
+        TypeId const result = (*op == HirOpKind::Not) ? boolType() : promotedTy;
+        return {track(builder.addParent(HirKind::UnaryOp, std::array{unOperand.id},
                                         result, encodeOp(*op)), node), result};
     }
 
@@ -2608,7 +3078,98 @@ struct Lowerer {
         // type-balance rule — the config-driven UAC engine when the
         // language declares the block; FC3 c1). Falls back to the
         // type-attribute-or-then.
-        TypeId const common = commonArithType(thenE.type, elseE.type);
+        TypeId common = commonArithType(thenE.type, elseE.type);
+        // C 6.5.15p6: a conditional with ONE arm a pointer and the OTHER an
+        // integer-literal null-pointer-constant has the POINTER type. The semantic
+        // tier (combineTernary) already admitted this (and vetoed value!=0), so
+        // gate STRUCTURALLY here — `HirKind::Literal` + integer type — exactly like
+        // the line-447 null-ptr coerce pattern (do NOT re-check value==0; the
+        // literal-pool lookup is host-STL-sensitive). The pointer `common` then
+        // drives the EXISTING coerce calls below: the literal-0 arm hits the
+        // null-ptr coerce arm (line 465) → `Cast(0 → Ptr)`; the pointer arm is a
+        // no-op. Handles BOTH arm orders.
+        if (!common.valid()
+            && sem.pointerConversions.nullPointerConstantFromIntegerZero) {
+            auto const isIntLiteralArm = [&](E const& arm) -> bool {
+                if (builder.kind(arm.id) != HirKind::Literal) return false;
+                TypeKind const k = interner.kind(arm.type);
+                return k == TypeKind::I8  || k == TypeKind::I16
+                    || k == TypeKind::I32 || k == TypeKind::I64
+                    || k == TypeKind::I128
+                    || k == TypeKind::U8  || k == TypeKind::U16
+                    || k == TypeKind::U32 || k == TypeKind::U64
+                    || k == TypeKind::U128;
+            };
+            if (thenE.type.valid()
+                && interner.kind(thenE.type) == TypeKind::Ptr
+                && isIntLiteralArm(elseE)) {
+                common = thenE.type;
+            } else if (elseE.type.valid()
+                && interner.kind(elseE.type) == TypeKind::Ptr
+                && isIntLiteralArm(thenE)) {
+                common = elseE.type;
+            } else if (thenE.type.valid()
+                && interner.kind(thenE.type) == TypeKind::FnSig
+                && isIntLiteralArm(elseE)) {
+                // c56 (D-CSUBSET-TERNARY-NULL-FUNCTION-POINTER): the fn-pointer
+                // sibling — a function designator (FnSig) arm opposite a literal-0
+                // decays to Ptr<FnSig> (mirrors the semantic combineTernary). The
+                // designator arm then hits the FnSig→Ptr Bitcast coerce arm; the
+                // literal-0 the null-ptr Cast arm below. Handles BOTH arm orders.
+                common = interner.pointer(thenE.type);
+            } else if (elseE.type.valid()
+                && interner.kind(elseE.type) == TypeKind::FnSig
+                && isIntLiteralArm(thenE)) {
+                common = interner.pointer(elseE.type);
+            } else if (thenE.type.valid()
+                && interner.kind(thenE.type) == TypeKind::Array
+                && isIntLiteralArm(elseE)) {
+                // c66 (D-CSUBSET-TERNARY-NULL-STRING-LITERAL): the ARRAY/string-
+                // literal sibling — `cond ? "%s" : 0` (sqlite's
+                // `sParse.zErrMsg ? "%s" : 0`). The string-literal Array arm
+                // opposite a literal-0 decays to Ptr<elem> (C 6.3.2.1p3 +
+                // 6.5.15p6). `common`=Ptr<elem> drives the coerce: the Array arm
+                // hits the Array→Ptr decay Cast (→ a GlobalAddr to the rodata
+                // string), the literal-0 the null-ptr Cast. Without this the
+                // ternary types Array → the aggregate lowering materializes the
+                // literal-0 arm as a string → H0009. The c64 array arm below needs
+                // BOTH arms to be arrays, so it misses `array : 0`.
+                auto const e = interner.operands(thenE.type);
+                if (!e.empty()) common = interner.pointer(e[0]);
+            } else if (elseE.type.valid()
+                && interner.kind(elseE.type) == TypeKind::Array
+                && isIntLiteralArm(thenE)) {
+                auto const e = interner.operands(elseE.type);
+                if (!e.empty()) common = interner.pointer(e[0]);
+            }
+        }
+        // c64 (D-CSUBSET-TERNARY-ARRAY-DECAY): the array-decay sibling of the
+        // null-ptr / fn-designator arms above. An ARRAY arm of a conditional
+        // decays to Ptr<elem> (C 6.3.2.1p3 + 6.5.15) — `cond ? "a" : "bb"` (two
+        // string literals) yields `char*`, not an aggregate. Setting `common` to
+        // the common pointer type drives the coerce calls below: each Array arm
+        // hits coerce's Array→Ptr decay arm (the sameElem Cast) so makeTernary
+        // carries Ptr<char> and BOTH arm nodes are pointer-typed — else the
+        // ternary types aggregate and trips the aggregate-valued-control-expr
+        // guard in hir_to_mir (no aggregate-width SSA value). Mirrors the semantic
+        // combineTernary. Conservative: BOTH arms must decay to the SAME pointer
+        // type; genuine struct/union arms (no decay) keep the aggregate
+        // by-address lowering.
+        if (!common.valid()) {
+            auto const decayArray = [&](TypeId t) -> TypeId {
+                if (!t.valid() || interner.kind(t) != TypeKind::Array) return t;
+                auto const elems = interner.operands(t);
+                return elems.empty() ? t : interner.pointer(elems[0]);
+            };
+            TypeId const thenD = decayArray(thenE.type);
+            TypeId const elseD = decayArray(elseE.type);
+            if (thenD.valid() && thenD == elseD
+                && interner.kind(thenD) == TypeKind::Ptr
+                && (interner.kind(thenE.type) == TypeKind::Array
+                    || interner.kind(elseE.type) == TypeKind::Array)) {
+                common = thenD;
+            }
+        }
         if (common.valid()) {
             thenE = coerce(thenE, common);
             elseE = coerce(elseE, common);
@@ -2693,8 +3254,10 @@ struct Lowerer {
                                        ? paramTypes[argIdx] : InvalidType;
                 // D5.3 cycle 1b.4: `f({1, 2})` lowers via the shared
                 // helper with the callee's FnSig param type pushed as
-                // the brace-init context.
-                args.push_back(lowerExprOrBraceInit(argN, paramType));
+                // the brace-init context. c79: scalar args route through
+                // the call-arg funnel so a variadic-tail Array decays
+                // (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY).
+                args.push_back(lowerCallArgOrBraceInit(argN, paramType));
                 ++argIdx;
             }
             // Prefer the semantic phase's resolved call type (it types call nodes);
@@ -2703,7 +3266,7 @@ struct Lowerer {
             TypeId inferred = InvalidType;
             if (calleeSig.valid()) inferred = interner.fnResult(calleeSig);
             TypeId const result = typeAtOr(node, inferred);
-            return {track(builder.makeCall(base.id, args, result), node), result};
+            return {track(emitCallOrBuiltin(baseN, base.id, args, result), node), result};
         }
         if (e.target == "Index") {
             E idxE = rest.empty()
@@ -2804,9 +3367,16 @@ struct Lowerer {
         // element-of-base derivation — the SINGLE source shared with the
         // semantic-tier typer (type_rules.hpp `indexResultType`).
         TypeId const inferred = indexResultType(interner, base.type);
-        TypeId const result = typeAtOr(node, inferred);
-        return {track(builder.makeIndex(base.id, idxE.id, result), node),
-                result};
+        TypeId const elemType = typeAtOr(node, inferred);
+        // c27 (D-CSUBSET-VOLATILE-POINTEE): indexing a `volatile`-qualified
+        // CONTAINER (`volatile T va[]` / a `volatile`-array struct member) yields a
+        // volatile-qualified element type (C 6.5.2.1 / 6.7.3p5). The MIR access site
+        // reads this via `volatileFlagForType`, and it propagates through a nested
+        // `arr[i].x` chain. (An element type that is ALREADY volatile — `volatile
+        // int va[]` whose element is VolatileQual — stays so; idempotent wrap.)
+        TypeId const result = volatileQualifiedAccess(elemType, base.type);
+        HirNodeId const idxNode = track(builder.makeIndex(base.id, idxE.id, result), node);
+        return {idxNode, result};
     }
 
     // The MEMBER-ACCESS epilogue given the ALREADY-lowered `base`. Shared by
@@ -2877,32 +3447,62 @@ struct Lowerer {
             TypeId fieldType = model.typeAt(fieldNameN);
             if (!fieldType.valid()) fieldType = frec->type;
             HirNodeId object = base.id;
+            // The CONTAINER's resolved type — the object whose member is taken.
+            // `s.a` ⇒ `base.type`; `p->a` ⇒ the Deref's pointee type. Carries the
+            // top-level VolatileQual when the container is `volatile` (C 6.7.3p5).
+            TypeId containerType = base.type;
             if (e.target == "MemberAccessThruPtr") {
+                // c82 (D-CSUBSET-ARRAY-ARROW-DECAY, C 6.3.2.1p3 + 6.5.2.3):
+                // an ARRAY LHS decays to a pointer to its first element
+                // BEFORE the arrow's deref — sqlite shell.c's
+                // `data.aAuxDb->zDbFilename` (aAuxDb is an in-struct array
+                // member; the arrow reads element [0]'s field). The semantic
+                // member resolver accepted the array through the same rule;
+                // reuse the ONE `coerce` Array→Ptr decay arm so the Cast
+                // shape is byte-identical to every other decay site.
+                E derefBase = base;
+                if (base.type.valid()
+                    && interner.kind(base.type) == TypeKind::Array
+                    && !interner.operands(base.type).empty()
+                    && interner.operands(base.type)[0].valid()) {
+                    TypeId const elemPtr =
+                        interner.pointer(interner.operands(base.type)[0]);
+                    derefBase = coerce(base, elemPtr);
+                }
                 // Arrow form: dereference the LHS pointer first. The Deref's
                 // result type is the pointee type (Struct) — read from the
-                // interner via the base's Ptr operand.
+                // interner via the base's Ptr operand. (operands() sees THROUGH a
+                // VolatileQual ptr, but its operand IS the qualified pointee, so a
+                // `volatile struct S *` yields `VolatileQual(struct S)` here.)
                 TypeId pointeeType = InvalidType;
-                if (base.type.valid()
-                    && interner.kind(base.type) == TypeKind::Ptr
-                    && !interner.operands(base.type).empty()) {
-                    pointeeType = interner.operands(base.type)[0];
+                if (derefBase.type.valid()
+                    && interner.kind(derefBase.type) == TypeKind::Ptr
+                    && !interner.operands(derefBase.type).empty()) {
+                    pointeeType = interner.operands(derefBase.type)[0];
                 }
-                // Pass 2 also emitted S_NotAPointer if base.type wasn't a
-                // pointer, but we still need a type here for the Deref node
-                // to be HIR-verifier-valid (it requires a valid type). If
-                // pointee is invalid, leave it InvalidType — the verifier's
-                // requiresValidType rule will surface H_TypeUnresolved.
-                object = track(builder.makeDeref(base.id, pointeeType,
+                // Pass 2 also emitted S_NotAPointer if the LHS wasn't a
+                // pointer (or a decayable array), but we still need a type
+                // here for the Deref node to be HIR-verifier-valid (it
+                // requires a valid type). If pointee is invalid, leave it
+                // InvalidType — the verifier's requiresValidType rule will
+                // surface H_TypeUnresolved.
+                object = track(builder.makeDeref(derefBase.id, pointeeType,
                                                  HirFlags::Synthetic), node);
+                containerType = pointeeType;
             }
+            // c27 (D-CSUBSET-VOLATILE-POINTEE): if the CONTAINER is volatile, the
+            // member's TYPE is volatile-qualified (C 6.5.2.3) — this is what flags
+            // the access at the MIR site AND propagates through nested chains (see
+            // `volatileQualifiedAccess`). The FIELD's own volatility is recorded
+            // separately on the node (c21).
+            TypeId const accessType = volatileQualifiedAccess(fieldType, containerType);
             HirNodeId const maNode = track(builder.makeMemberAccess(
-                                               object, fieldIndex, fieldType), node);
-            // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a `volatile` struct/union FIELD
-            // — the MemberAccess node keys both its rvalue Load and (as an assign
-            // target) its Store. The volatility is the FIELD's (`frec`), NOT the
-            // object's; a non-volatile sibling field's MemberAccess stays plain.
+                                               object, fieldIndex, accessType), node);
+            // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a `volatile`-declared FIELD — the
+            // MemberAccess node keys both its rvalue Load and (as an assign target)
+            // its Store. (Container-volatility rides `accessType` above instead.)
             recordMemberVolatility(maNode, frec);
-            return {maNode, fieldType};
+            return {maNode, accessType};
         }
         return exprError(node, std::format("postfix target '{}' has no lowering", e.target));
     }
@@ -2964,7 +3564,7 @@ struct Lowerer {
     // in the frame fields `c0`/`c1`.
     struct StmtFrame {
         enum class Kind : std::uint8_t { PassThrough, Block, If, While, For,
-                                         Label, Switch } kind;
+                                         Label, Switch, CaseMarker, SehTry } kind;
         NodeId        node;     // the source node (provenance / combine anchor)
         std::uint8_t  phase;
         bool          doWhile;  // While frame: DoWhileStmt vs WhileStmt
@@ -2991,36 +3591,24 @@ struct Lowerer {
         std::vector<HirNodeId>  stmts;       // accumulated lowered statement ids
     };
 
-    // The accumulating Switch state — the full grouping machine that the recursive
-    // `lowerSwitch` ran as locals, lifted into a ctx so its TWO body-lowering
-    // re-entries (`lowerStmt(bodyCore)` in the case-chain + `lowerStmt(core)` for a
-    // plain arm body) become work-stack pushes on the OUTER `lowerStmt` driver
-    // instead of host recursion — so a switch nested in a switch-arm body carries
-    // flat O(1) host-stack cost per nesting level. Lives in a `switchCtxs` LIFO
-    // stack LOCAL to `lowerStmt` (referenced by stable INDEX `aux`, like `blockCtxs`
-    // — a nested switch grows the stack, and indices survive realloc). The
-    // bookkeeping is byte-IDENTICAL to `lowerSwitch`: `pumpSwitch` runs the same
-    // item loop + adjacent-case chain + label peeling, emitting the SAME nodes in
-    // the SAME order; the ONLY change is that a body lowers via `enterStmt` (and
-    // the Switch frame resumes the pump once `stmtResult` holds it).
+    // c60 (Design I-A): the accumulating Switch state. The body is now lowered as
+    // ONE flat Block (its case/default items become synthetic LabelStmt markers at
+    // any depth); the dispatch (`arms`) is computed up front from a per-switch
+    // prescan that assigns each caseLabel node an ordinal. Lives in a `switchCtxs`
+    // LIFO stack LOCAL to `lowerStmt` (referenced by stable INDEX `aux`, like
+    // `blockCtxs` — a nested switch grows the stack, indices survive realloc). The
+    // oracle `lowerSwitch` and the driver's Switch frame both call the shared
+    // `switchPrologue` (which builds `arms`) and then lower ONE body Block, so they
+    // stay byte-identical; the ONLY difference is the body lowers via host recursion
+    // (oracle) vs the work-stack (driver Switch frame, which suspends on the body).
     struct SwitchCtx {
-        NodeId                  node{};        // the switch CST node (provenance anchor)
-        HirNodeId               discId{};      // the (already-lowered) discriminant
-        std::vector<NodeId>     items;         // switchBodyItem wrappers (source order)
-        std::size_t             itemIdx{};     // next top-level item to process
-        // arm-grouping accumulators (the recursive `lowerSwitch` locals):
-        std::vector<HirNodeId>  arms;          // collected CaseArm ids
-        std::optional<NodeId>   curValue;      // the open arm's match expr, if any
-        bool                    curIsDefault{};// the open arm is `default`
-        bool                    haveArm{};     // an arm is open
-        std::vector<HirNodeId>  curBody;       // the open arm's collected body stmts
-        // adjacent-case chain resumption (the `lowerCaseChain` inner `for(;;)`):
-        bool                    inChain{};     // a case-chain is in progress
-        NodeId                  chainCs{};     // the current caseStmt node in the chain
-        std::vector<NodeId>     chainLabels;   // labels to wrap this chain link's body
-        // the just-entered body's pending label-wrap (applied when it completes;
-        // EMPTY ⇒ no wrap — the plain-stmt arm body):
-        std::vector<NodeId>     pendingLabels; // labels for the pending body
+        NodeId                  node{};      // the switch CST node (provenance anchor)
+        HirNodeId               discId{};    // the (already-lowered) discriminant
+        std::vector<NodeId>     items;       // switchBodyItem wrappers (source order)
+        std::vector<HirNodeId>  arms;        // the dispatch CaseArm entries (built up front)
+        // body lowering (driver): the next item + the accumulated body statements.
+        std::size_t             bodyIdx{};   // next switchBodyItem to lower
+        std::vector<HirNodeId>  bodyStmts;   // the lowered body statements (→ makeBlock)
     };
 
     // The public statement-lowering entry: a driver over an explicit work-stack.
@@ -3038,6 +3626,30 @@ struct Lowerer {
         HirNodeId stmtResult{};
 
         auto const enterStmt = [&](NodeId n) {
+            // c60 (Design I-A): a BARE `caseLabel` reached as a statement (a switch
+            // body item `case K:` / `default:` with its body in following siblings)
+            // — it has no hirKind mapping and `soleMeaningfulChild` would wrongly
+            // descend into the case-value expr. Intercept it here (BEFORE the
+            // transparent-wrapper peel): inside a switch body it lowers to a
+            // synthetic LabelStmt(ord, Skip) marker; outside any switch it is
+            // S0023. (A `caseStmt` — `caseLabel statement` — is a mapped rule and is
+            // handled in the terminal dispatch below as a CaseMarker frame.)
+            {
+                NodeId const core = peelToCore(n);
+                if (switchIsRuleNode(core, cfg.caseLabelRule)) {
+                    std::uint32_t ord{};
+                    if (switchBodyDepth_ > 0 && switchCaseOrdinal(core, ord)) {
+                        stmtResult = track(builder.makeLabelStmt(
+                            ord, track(builder.makeBlock({}), core)), core);
+                    } else {
+                        emitH(DiagnosticCode::S_CaseLabelNotInSwitch, core,
+                              "'case'/'default' label is not a direct switch-body "
+                              "item (C 6.8.1)");
+                        stmtResult = errorNode(core);
+                    }
+                    return;
+                }
+            }
             HirRuleMapping const* m = mappingFor(n);
             if (m == nullptr) {
                 // Transparent wrapper (e.g. `varDecl = [varDeclHead, ';']`):
@@ -3064,6 +3676,32 @@ struct Lowerer {
                 StmtFrame fr{.kind = StmtFrame::Kind::If, .node = n};
                 ifPrologue(n, fr.condId, fr.n0, fr.n1);   // cond lowered INLINE here
                 work.push_back(fr);
+                return;
+            }
+            // c115 SEH: __try block __except (filter) block. Field reuse on the
+            // frame: n0 = try block node, condNode = filter EXPR node (lowered
+            // inline at phase 1, in SOURCE order — after the try body), n1 =
+            // handler block node, c0 = lowered try body, condId = lowered filter.
+            if (k == "SehTryExcept") {
+                StmtFrame fr{.kind = StmtFrame::Kind::SehTry, .node = n};
+                NodeId finallyArm{};
+                if (!sehPrologue(n, fr.n0, fr.condNode, fr.n1, finallyArm)) {
+                    unsupported(finallyArm.valid() ? finallyArm : n,
+                                "SEH '__try { } __finally { }' termination handlers "
+                                "are not supported (D-CSUBSET-SEH-FINALLY: "
+                                "trigger-gated — no shipped consumer; sqlite uses "
+                                "only __except)");
+                    stmtResult = errorNode(n);
+                    return;
+                }
+                work.push_back(fr);
+                return;
+            }
+            if (k == "SehLeave") {
+                unsupported(n, "SEH '__leave' is not supported "
+                               "(D-CSUBSET-SEH-LEAVE: trigger-gated — no shipped "
+                               "consumer; sqlite does not use it)");
+                stmtResult = errorNode(n);
                 return;
             }
             if (k == "WhileStmt" || k == "DoWhileStmt") {
@@ -3114,14 +3752,25 @@ struct Lowerer {
             }
             if (k == "GotoStmt")    { stmtResult = lowerGoto(n); return; }
             if (k == "IndirectGotoStmt") { stmtResult = lowerIndirectGoto(n); return; }
-            // D-CSUBSET-LABEL-BEFORE-CASE: a `case`/`default` labeled statement (the
-            // `caseStmt` form that lets a goto-label precede a case) reaches the
-            // statement dispatch ONLY when it is NOT a direct switch-body item —
-            // lowerSwitch consumes the in-switch (label-wrapped) ones first. So this
-            // is a case outside any switch, or nested in an inner block of a switch
-            // arm (the flat-switch model groups only top-level items). Fail loud
-            // (C 6.8.1) rather than emit a stray arm-less case.
+            // c60 (Design I-A): a `caseStmt` (`caseLabel statement`) reached as a
+            // statement. INSIDE a switch body (`switchBodyDepth_ > 0` AND its
+            // caseLabel was prescanned) it lowers to a synthetic LabelStmt marker
+            // wrapping its inner statement — a CaseMarker frame (mirrors the Label
+            // frame: phase 0 lowers the inner stmt, phase 1 wraps it). This is the
+            // SOLE path for BOTH a top-level case AND a case nested at any depth in
+            // a block/if of the switch body — the c60 fix. OUTSIDE any switch body
+            // it is genuinely a stray case → S0023 (C 6.8.1), preserved.
             if (k == "CaseStmt") {
+                NodeId const labelNode = switchCaseLabelOf(n);
+                std::uint32_t ord{};
+                if (switchBodyDepth_ > 0 && labelNode.valid()
+                    && switchCaseOrdinal(labelNode, ord)) {
+                    NodeId const inner = switchCaseStmtBody(n);
+                    StmtFrame fr{.kind = StmtFrame::Kind::CaseMarker, .node = n,
+                                 .n0 = inner, .labelOrd = ord};
+                    work.push_back(fr);
+                    return;
+                }
                 emitH(DiagnosticCode::S_CaseLabelNotInSwitch, n,
                       "'case'/'default' label is not a direct switch-body item (C 6.8.1)");
                 stmtResult = errorNode(n);
@@ -3155,83 +3804,21 @@ struct Lowerer {
             return true;
         };
 
-        // The Switch arm-grouping PUMP (ctx at stable index `ctxIdx`): runs the
-        // SAME item loop + adjacent-case chain + label peeling as the recursive
-        // `lowerSwitch`, emitting the SAME nodes in the SAME order — but each time
-        // it reaches a BODY to lower it `enterStmt`s the body and returns `true`
-        // (suspended; the Switch frame collects `stmtResult` on resume, applies the
-        // pending label-wrap, then calls this again). Returns `false` when all
-        // top-level items are consumed (the caller finishes the switch). The ctx is
-        // re-addressed fresh each access (a body that is itself a switch grows
-        // `switchCtxs` via `enterStmt`, so a held reference could dangle; the INDEX
-        // is stable). `enterStmt` is the LAST action before a `return true`, so the
-        // dangling-`work.back()` rule holds. The in-flight body's labels are stashed
-        // in `pendingLabels` (empty ⇒ no wrap — the plain-stmt arm body).
+        // c60 (Design I-A): the Switch BODY pump (ctx at stable index `ctxIdx`):
+        // lower each switchBodyItem left-to-right as a statement, collecting the
+        // results into the body Block (`switchCtxs[ctxIdx].arms` already holds the
+        // dispatch from the prologue prescan). A case/default item lowers to a
+        // synthetic LabelStmt marker via `enterStmt` (the bare-caseLabel intercept /
+        // the CaseStmt CaseMarker frame), since `switchBodyDepth_` is raised for the
+        // body's duration. Suspends on each item (returns true after `enterStmt`);
+        // returns false when all items are consumed. Byte-identical to the oracle
+        // `lowerSwitch`'s `for (raw : items) stmts.push_back(lowerStmt(raw))`.
         auto const pumpSwitch = [&](std::uint32_t ctxIdx) -> bool {
-            for (;;) {
-                if (switchCtxs[ctxIdx].inChain) {
-                    // One iteration of `lowerCaseChain`'s `for(;;)` for the current
-                    // chain link (`chainCs` / `chainLabels`).
-                    NodeId const cs = switchCtxs[ctxIdx].chainCs;
-                    std::vector<NodeId> labels = std::move(switchCtxs[ctxIdx].chainLabels);
-                    NodeId caseLabelNode{}, caseBody{};
-                    bool seenFirst = false;
-                    for (NodeId c : visible(cs)) {
-                        if (isToken(c)) continue;
-                        if (!seenFirst) { caseLabelNode = c; seenFirst = true; }
-                        else { caseBody = c; break; }
-                    }
-                    switchStartArm(switchCtxs[ctxIdx], switchCtxs[ctxIdx].node, caseLabelNode);
-                    if (!caseBody.valid()) {                       // empty case body (defensive)
-                        if (!labels.empty())
-                            switchCtxs[ctxIdx].curBody.push_back(switchWrapLabels(
-                                switchCtxs[ctxIdx].node, labels,
-                                switchMakeSkip(switchCtxs[ctxIdx].node)));
-                        switchCtxs[ctxIdx].inChain = false;
-                        continue;                                  // chain done → next top-level item
-                    }
-                    NodeId bodyCore = peelToCore(caseBody);
-                    std::vector<NodeId> innerLabels;
-                    NodeId bodyProbe = switchPeelLabels(bodyCore, innerLabels);
-                    if (switchIsRuleNode(bodyProbe, cfg.caseStmtRule)) {  // adjacent case
-                        if (!labels.empty())
-                            switchCtxs[ctxIdx].curBody.push_back(switchWrapLabels(
-                                switchCtxs[ctxIdx].node, labels,
-                                switchMakeSkip(switchCtxs[ctxIdx].node)));
-                        switchCtxs[ctxIdx].chainCs = bodyProbe;
-                        switchCtxs[ctxIdx].chainLabels = std::move(innerLabels);
-                        continue;                                  // → next chain link (stay inChain)
-                    }
-                    // The real body of this chain link → SUSPEND. The chain ends
-                    // after it (the recursive `lowerCaseChain` returns here).
-                    switchCtxs[ctxIdx].inChain = false;
-                    switchCtxs[ctxIdx].pendingLabels = std::move(labels);
-                    enterStmt(bodyCore);   // LAST action — may grow switchCtxs
-                    return true;
-                }
-                // The top-level item loop (`for (raw : items)`).
-                if (switchCtxs[ctxIdx].itemIdx >= switchCtxs[ctxIdx].items.size())
-                    return false;          // all items consumed → finish
-                NodeId const raw = switchCtxs[ctxIdx].items[switchCtxs[ctxIdx].itemIdx];
-                ++switchCtxs[ctxIdx].itemIdx;
-                NodeId core = peelToCore(raw);
-                std::vector<NodeId> labelToks;
-                NodeId probe = switchPeelLabels(core, labelToks);
-                if (switchIsRuleNode(probe, cfg.caseStmtRule)) {   // (label-wrapped) case statement
-                    switchCtxs[ctxIdx].inChain = true;
-                    switchCtxs[ctxIdx].chainCs = probe;
-                    switchCtxs[ctxIdx].chainLabels = std::move(labelToks);
-                    continue;                                      // enter the chain
-                } else if (switchIsRuleNode(core, cfg.caseLabelRule)) {  // bare flat case
-                    switchStartArm(switchCtxs[ctxIdx], switchCtxs[ctxIdx].node, core);
-                    continue;
-                } else if (switchCtxs[ctxIdx].haveArm) {           // plain stmt body → SUSPEND (no wrap)
-                    switchCtxs[ctxIdx].pendingLabels.clear();
-                    enterStmt(core);       // LAST action — may grow switchCtxs
-                    return true;
-                }
-                // not haveArm and not a case → nothing to emit; next item.
-            }
+            if (switchCtxs[ctxIdx].bodyIdx >= switchCtxs[ctxIdx].items.size())
+                return false;          // all items consumed → finish
+            NodeId const raw = switchCtxs[ctxIdx].items[switchCtxs[ctxIdx].bodyIdx];
+            enterStmt(raw);            // LAST action — may grow switchCtxs
+            return true;
         };
 
         enterStmt(node);
@@ -3268,28 +3855,24 @@ struct Lowerer {
                 }
                 break;
             case StmtFrame::Kind::Switch:
-                // The discriminant + items lowered in the prologue; now the
-                // arm-grouping pump (phase 0), suspending at each body so it lowers
-                // through the work-stack. On resume (else) a body just completed
-                // (`stmtResult`): apply its pending label-wrap, collect it into the
-                // open arm's body, then pump again — or finish (flush + makeSwitch).
+                // c60 (Design I-A): the discriminant + items + dispatch were built in
+                // the prologue. Now lower the body as ONE flat Block: pump each
+                // switchBodyItem (phase 0 raises `switchBodyDepth_` so case/default
+                // markers form; suspends on the first item). On resume (else) an item
+                // just completed (`stmtResult`): collect it into `bodyStmts`, advance,
+                // pump the next — or finish (makeBlock + makeSwitchStmt). Byte-
+                // identical to the oracle `lowerSwitch`'s body loop.
                 if (f.phase == 0) {
                     f.phase = 1;
                     std::uint32_t const ctxIdx = f.aux;
-                    if (pumpSwitch(ctxIdx)) break;      // entered the first body — wait
-                    finishSwitch(work, switchCtxs, ctxIdx, stmtResult);   // no bodies
+                    ++switchBodyDepth_;                 // body markers form while > 0
+                    if (pumpSwitch(ctxIdx)) break;      // entered the first item — wait
+                    finishSwitch(work, switchCtxs, ctxIdx, stmtResult);   // empty body
                 } else {
-                    // A body just completed (`stmtResult`). Wrap it in its pending
-                    // goto-labels (empty ⇒ unchanged — the plain-stmt arm body) and
-                    // collect it, exactly as the recursive `curBody.push_back(
-                    // wrapLabels(labels, lowerStmt(body)))`. Then pump the next.
                     std::uint32_t const ctxIdx = f.aux;
-                    NodeId const node2 = switchCtxs[ctxIdx].node;
-                    HirNodeId const wrapped = switchWrapLabels(
-                        node2, switchCtxs[ctxIdx].pendingLabels, stmtResult);
-                    switchCtxs[ctxIdx].curBody.push_back(wrapped);
-                    switchCtxs[ctxIdx].pendingLabels.clear();
-                    if (pumpSwitch(ctxIdx)) break;      // entered the next body — wait
+                    switchCtxs[ctxIdx].bodyStmts.push_back(stmtResult);
+                    ++switchCtxs[ctxIdx].bodyIdx;
+                    if (pumpSwitch(ctxIdx)) break;      // entered the next item — wait
                     finishSwitch(work, switchCtxs, ctxIdx, stmtResult);   // all consumed
                 }
                 break;
@@ -3330,6 +3913,41 @@ struct Lowerer {
                         haveThen ? thenH
                                  : reportedError(node2, "if statement has no then-branch");
                     stmtResult = track(builder.makeIfStmt(condFinal, thenFinal, els), node2);
+                }
+                break;
+            case StmtFrame::Kind::SehTry:
+                // c115 SEH, source order: try body (phase 0→1), filter expression
+                // INLINE at phase 1 (expressions are host-recursive — the same
+                // discipline as ifPrologue's cond, they never touch `work`),
+                // handler body (phase 1→2), then the finish. Missing pieces
+                // substitute reportedError at the finish (the If discipline).
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const tryN = f.n0;
+                    if (tryN.valid()) { enterStmt(tryN); break; }  // may invalidate `f`
+                }
+                if (f.phase == 1) {
+                    f.phase = 2;
+                    if (f.n0.valid()) f.c0 = stmtResult;   // try-body result
+                    NodeId const filterN = f.condNode;
+                    if (filterN.valid()) f.condId = lowerExpr(filterN).id;
+                    NodeId const handlerN = f.n1;
+                    if (handlerN.valid()) { enterStmt(handlerN); break; }  // may invalidate `f`
+                }
+                {
+                    NodeId const node2 = f.node;
+                    HirNodeId const tryH = f.n0.valid()
+                        ? f.c0
+                        : reportedError(node2, "SEH __try has no guarded block");
+                    HirNodeId const filterH = f.condId.valid()
+                        ? f.condId
+                        : reportedError(node2, "SEH __except has no filter expression");
+                    HirNodeId const handlerH = f.n1.valid()
+                        ? stmtResult
+                        : reportedError(node2, "SEH __except has no handler block");
+                    work.pop_back();
+                    stmtResult = track(
+                        builder.makeSehTryExcept(tryH, filterH, handlerH), node2);
                 }
                 break;
             case StmtFrame::Kind::While:
@@ -3403,6 +4021,26 @@ struct Lowerer {
                     stmtResult = track(builder.makeLabelStmt(ord, bodyH), node2);
                 }
                 break;
+            case StmtFrame::Kind::CaseMarker:
+                // c60 (Design I-A): a `caseStmt` (`case K: stmt`) inside a switch
+                // body — enter its inner statement (phase 0→1), then wrap it in the
+                // synthetic LabelStmt marker carrying the prescanned case ordinal
+                // (mirrors the Label frame; the MIR dispatch targets this marker's
+                // label-block). An absent inner (defensive) wraps an empty Block.
+                if (f.phase == 0) {
+                    f.phase = 1;
+                    NodeId const bodyN = f.n0;
+                    if (bodyN.valid()) { enterStmt(bodyN); break; }  // may invalidate `f`
+                    stmtResult = track(builder.makeBlock({}), f.node);
+                }
+                {
+                    NodeId const node2 = f.node;
+                    std::uint32_t const ord = f.labelOrd;
+                    HirNodeId const bodyH = stmtResult;
+                    work.pop_back();
+                    stmtResult = track(builder.makeLabelStmt(ord, bodyH), node2);
+                }
+                break;
             }
         }
         return stmtResult;
@@ -3423,17 +4061,19 @@ struct Lowerer {
         stmtResult = blockH;
     }
 
-    // Finish a flattened Switch: flush the last open arm (the match VALUE lowers
-    // HERE, after its body — exactly as the recursive `lowerSwitch`'s trailing
-    // `flush()`), emit makeSwitchStmt, pop the Switch frame + its ctx (LIFO top — a
+    // c60 (Design I-A): finish a flattened Switch — lower `switchBodyDepth_` (the
+    // body is done), wrap the collected body statements in a Block, emit
+    // makeSwitchStmt(disc, body, arms), pop the Switch frame + its ctx (LIFO top — a
     // nested switch finished inner-first), and deliver into `stmtResult`. Shared by
-    // the no-bodies and all-items-consumed paths. Byte-identical to `lowerSwitch`'s
-    // `track(makeSwitchStmt(discId, arms), node)`.
+    // the empty-body and all-items-consumed paths. Byte-identical to the oracle
+    // `lowerSwitch`'s `makeSwitchStmt(disc, makeBlock(stmts), arms)`.
     void finishSwitch(std::vector<StmtFrame>& work, std::vector<SwitchCtx>& switchCtxs,
                       std::uint32_t ctxIdx, HirNodeId& stmtResult) {
         SwitchCtx& ctx = switchCtxs[ctxIdx];
-        switchFlush(ctx, ctx.node);
-        HirNodeId const swH = track(builder.makeSwitchStmt(ctx.discId, ctx.arms), ctx.node);
+        --switchBodyDepth_;
+        HirNodeId const body = track(builder.makeBlock(ctx.bodyStmts), ctx.node);
+        HirNodeId const swH =
+            track(builder.makeSwitchStmt(ctx.discId, body, ctx.arms), ctx.node);
         work.pop_back();
         switchCtxs.pop_back();
         stmtResult = swH;
@@ -3470,9 +4110,11 @@ struct Lowerer {
             if (m != nullptr && m->hirKind == "LabelStmt") {
                 NodeId const nameTok = firstIdentifierToken(node);
                 if (nameTok.valid()) {
+                    // c60: draw from the SHARED per-function ordinal counter so
+                    // named labels + switch case markers never collide.
                     auto const [it, inserted] = labelOrdinals_.try_emplace(
-                        std::string{tree().text(nameTok)},
-                        static_cast<std::uint32_t>(labelOrdinals_.size()));
+                        std::string{tree().text(nameTok)}, nextLabelOrdinal_);
+                    if (inserted) ++nextLabelOrdinal_;
                     if (!inserted) {   // C 6.8.1: a label name has function scope
                         emitH(DiagnosticCode::S_DuplicateLabel, nameTok,
                               std::format("duplicate label '{}' in this function",
@@ -3678,13 +4320,25 @@ struct Lowerer {
     // shared single source across the three ++/-- sites — keeps postfix-int from
     // regressing). Pointer lvalues route to `pointerIncDecStep` instead.
     [[nodiscard]] HirNodeId incDecArithValue(Lvalue const& lv, bool inc, NodeId anchor) {
-        TypeId const opType = incDecArithType(lv.type);   // enum → underlying int
+        TypeId opType = incDecArithType(lv.type);         // enum → underlying int
+        // c71 (D-CSUBSET-32BIT-ALU-FORMS): a SUB-INT lvalue (`char c; c++`)
+        // must integer-PROMOTE the arithmetic to `int` (C 6.3.1.1) — else the
+        // BinaryOp Add/Sub is Char/I8-typed and walls at the target's
+        // sub-native ALU gap. The trailing `coerce` narrows the I32 result
+        // back to the lvalue type (Trunc) for the store, preserving the type's
+        // wraparound EXACTLY (C's `(char)((int)c ± 1)` — a `char 127` still
+        // wraps to `-128`). Reuse the SAME `integerPromotedType` chokepoint as
+        // the condition / index / binary-op paths; the enum remap above already
+        // established this int-typed-codegen discipline, and a block-less
+        // language keeps the raw opType (its coerces no-op as before).
+        if (arith_.has_value())
+            opType = integerPromotedType(interner, opType, *arith_);
         HirNodeId const one = synthOne(opType);
-        HirNodeId const lhs = coerce(E{lvRead(lv), lv.type}, opType).id;  // no-op if non-enum
+        HirNodeId const lhs = coerce(E{lvRead(lv), lv.type}, opType).id;  // widen (SExt/ZExt) if sub-int/enum
         HirNodeId const sum = track(builder.addParent(
             HirKind::BinaryOp, std::array{lhs, one}, opType,
             encodeOp(inc ? HirOpKind::Add : HirOpKind::Sub)), anchor);
-        return coerce(E{sum, opType}, lv.type).id;        // int → enum write-back
+        return coerce(E{sum, opType}, lv.type).id;        // narrow back for the store
     }
 
     // FC-F1: the new value `++`/`--` stores for lvalue `lv` — the scaled pointer
@@ -3917,6 +4571,23 @@ struct Lowerer {
         E const ve = lowerExpr(valueNode);
         E const coerced = coerce(ve, contextType);
         return coerced.id;
+    }
+
+    // c79 (D-CSUBSET-VARIADIC-ARG-ARRAY-DECAY): the CALL-ARG sibling of
+    // `lowerExprOrBraceInit` - identical brace-init arm, but the scalar
+    // arm routes through `coerceCallArg` so an argument with NO declared
+    // param type (the variadic `...` tail / unknown signature) receives
+    // the C 6.5.2.2p6-7 array decay instead of passing through raw.
+    // Non-call value sites (var-init / assign / return) keep
+    // `lowerExprOrBraceInit` - an invalid context type there is error
+    // recovery, not a variadic tail.
+    [[nodiscard]] HirNodeId lowerCallArgOrBraceInit(NodeId argNode,
+                                                    TypeId paramType) {
+        NodeId const core = peelToBraceInitOrCore(argNode);
+        if (isBraceInitList(core)) {
+            return lowerBraceInit(core, paramType);
+        }
+        return coerceCallArg(lowerExpr(argNode), paramType).id;
     }
 
     // D5.3 cycle 1b.3: compound literal `(T){...}` as an expression.
@@ -4397,7 +5068,7 @@ struct Lowerer {
                     continue;
                 }
                 ScopeId const unionScope =
-                    model.compositeScopeFor(contextType);
+                    model.compositeScopeFor(interner.stripVolatile(contextType));
                 if (!unionScope.valid()) {
                     reportedError(designatorCore,
                         "could not resolve members of the target union "
@@ -4550,7 +5221,8 @@ struct Lowerer {
         if (isStruct) {
             // A field index is NAMED iff the composite's scope binds a real
             // (non-synthetic) name to it. Anonymous fields bind under `<anon:…>`.
-            ScopeId const sscope = model.compositeScopeFor(contextType);
+            ScopeId const sscope =
+                model.compositeScopeFor(interner.stripVolatile(contextType));
             // Only classify when the composite scope is resolvable — otherwise we
             // can't tell named from anonymous, so skip NOTHING (never mis-skip a
             // named bit-field; the worst case degrades to the prior behaviour).
@@ -4630,7 +5302,8 @@ struct Lowerer {
                         continue;
                     }
                     ScopeId const structScope =
-                        model.compositeScopeFor(designatorCurrentType);
+                        model.compositeScopeFor(
+                            interner.stripVolatile(designatorCurrentType));
                     if (!structScope.valid()) {
                         reportedError(designatorCore,
                             "field designator's container is not a struct");
@@ -4792,6 +5465,14 @@ struct Lowerer {
         if (!target.type.valid()) return std::nullopt;
         Lvalue lv;
         lv.simple  = false;
+        // c27 (D-CSUBSET-VOLATILE-POINTEE): `target.type` already carries the
+        // VolatileQual skin when this lvalue is a member/index access of a volatile
+        // container (`combineMember`/`combineIndex` qualify the access type). So the
+        // temp pointer `lv.ptrType = Ptr<VolatileQual(T)>` and the `*q` Deref that
+        // `lvRead`/`lvWrite` emit are flagged at the MIR site — no extra wrap is
+        // needed here. This is what makes a complex-lvalue COMPOUND-assign /
+        // inc-dec (`pSum->rErr += r`, `++(p->a)`) preserve volatility (the Kahan-sum
+        // miscompile guard).
         lv.type    = target.type;
         lv.ptrType = interner.pointer(target.type);
         lv.sym     = freshSymbol();
@@ -4988,6 +5669,54 @@ struct Lowerer {
             }
         }
         if (!haveCond) condId = HirNodeId{};   // invalid → finish emits orError
+    }
+
+    // c115 SEH prologue: extract the three pieces of a `sehTryStmt` CST node —
+    // the guarded `block`, the handler ARM (except vs finally, identified by RULE
+    // via cfg.sehExceptArmRule/sehFinallyArmRule), and for the except arm its
+    // [filterExpr, handlerBlock] children. The arm may sit under the `sehHandler`
+    // alt wrapper OR appear directly (parser-shape-agnostic): the finder checks
+    // rule identity BEFORE each single-child descent — a blind peel would fall
+    // THROUGH the finally arm (whose sole meaningful child is its block).
+    // Returns false for the finally arm (the caller emits the D-CSUBSET-SEH-FINALLY
+    // fail-loud). Missing pieces are left invalid — the finish substitutes
+    // reportedError nodes (the ifPrologue error-deferral discipline).
+    [[nodiscard]] bool sehPrologue(NodeId node, NodeId& tryBlockN,
+                                   NodeId& filterN, NodeId& handlerBlockN,
+                                   NodeId& finallyArmN) {
+        NodeId handlerChild{};
+        for (NodeId c : visible(node)) {
+            if (isToken(c)) continue;
+            if (!tryBlockN.valid()) { tryBlockN = c; continue; }
+            if (!handlerChild.valid()) { handlerChild = c; break; }
+        }
+        // Find the arm: descend through single-child wrappers, checking rule
+        // identity at each level first.
+        NodeId arm = handlerChild;
+        for (int guard = 0; guard < 8 && arm.valid(); ++guard) {
+            if (switchIsRuleNode(arm, cfg.sehExceptArmRule)
+                || switchIsRuleNode(arm, cfg.sehFinallyArmRule)) break;
+            NodeId only{}; int meaningful = 0;
+            for (NodeId c : visible(arm)) {
+                if (isToken(c)) continue;
+                only = c; ++meaningful;
+            }
+            if (meaningful != 1) break;
+            arm = only;
+        }
+        if (arm.valid() && switchIsRuleNode(arm, cfg.sehFinallyArmRule)) {
+            finallyArmN = arm;
+            return false;
+        }
+        if (arm.valid() && switchIsRuleNode(arm, cfg.sehExceptArmRule)) {
+            for (NodeId c : visible(arm)) {
+                if (isToken(c)) continue;
+                Role const role = classify(c);
+                if (role == Role::Expr && !filterN.valid()) filterN = c;
+                else if (role == Role::Stmt && !handlerBlockN.valid()) handlerBlockN = c;
+            }
+        }
+        return true;
     }
 
     // The `lowerStmt` driver flattens `if` through an If frame; this recursive
@@ -5217,13 +5946,6 @@ struct Lowerer {
     // `lowerStmt` recursion; the driver's `pumpSwitch` uses `enterStmt`). All node
     // emission below is unchanged from the prior inline form. ─────────────────────
 
-    // A goto-label before a case (`foo: case 1: stmt`) parses as
-    // labelStmt(foo, caseStmt(caseLabel(1), stmt)) — the label STAYS a real
-    // labelStmt node (pre-scanned + goto-resolvable). `D-CSUBSET-LABEL-BEFORE-CASE`.
-    [[nodiscard]] bool switchIsLabelStmtNode(NodeId n) {
-        HirRuleMapping const* m = mappingFor(n);
-        return m != nullptr && m->hirKind == "LabelStmt";
-    }
     [[nodiscard]] bool switchIsRuleNode(NodeId n, RuleId r) const {
         return r.valid() && tree().kind(n) == NodeKind::Internal
             && tree().rule(n).v == r.v;
@@ -5232,130 +5954,161 @@ struct Lowerer {
         for (NodeId c : visible(n)) if (!isToken(c)) return c;
         return NodeId{};
     }
-    [[nodiscard]] HirNodeId switchMakeSkip(NodeId node) {
-        return track(builder.makeBlock({}), node);
+
+    // c60 (Design I-A): the `caseLabel` node that introduces a `caseStmt` (the
+    // `caseLabel statement` form) — its first non-token child is a `caseLabel`.
+    // For a bare caseLabel item the node IS the caseLabel.
+    [[nodiscard]] NodeId switchCaseLabelOf(NodeId n) const {
+        if (switchIsRuleNode(n, cfg.caseLabelRule)) return n;
+        // a caseStmt: caseLabel is the FIRST meaningful child.
+        for (NodeId c : visible(n)) {
+            if (isToken(c)) continue;
+            NodeId core = peelToCore(c);
+            if (switchIsRuleNode(core, cfg.caseLabelRule)) return core;
+            return NodeId{};
+        }
+        return NodeId{};
     }
-    // Flush the open arm into a CaseArm. The match VALUE lowers HERE (at flush time,
-    // exactly as the recursive form — after the arm's body statements).
-    void switchFlush(SwitchCtx& ctx, NodeId node) {
-        if (!ctx.haveArm) return;
-        std::optional<HirNodeId> value;
-        if (!ctx.curIsDefault && ctx.curValue) value = lowerExpr(*ctx.curValue).id;
-        ctx.arms.push_back(track(builder.makeCaseArm(value, ctx.curBody), node));
-        ctx.curBody.clear();
+    // The statement child of a `caseStmt` (`caseLabel statement`) — the SECOND
+    // meaningful child. Invalid for a bare caseLabel.
+    [[nodiscard]] NodeId switchCaseStmtBody(NodeId caseStmtNode) const {
+        bool seenFirst = false;
+        for (NodeId c : visible(caseStmtNode)) {
+            if (isToken(c)) continue;
+            if (!seenFirst) { seenFirst = true; continue; }
+            return c;
+        }
+        return NodeId{};
     }
-    // Open a new arm from a `caseLabel` node (the SAME match-value/default
-    // extraction the bare flat path uses).
-    void switchStartArm(SwitchCtx& ctx, NodeId node, NodeId caseLabelNode) {
-        switchFlush(ctx, node);
-        ctx.haveArm = true;
-        ctx.curIsDefault = false;
-        ctx.curValue = std::nullopt;
+    // Is `core` a case/default marker reached as a statement inside a switch body?
+    // (A bare `caseLabel`, or a `caseStmt`.) Used by the statement dispatch to route
+    // it to a LabelStmt marker rather than S0023.
+    [[nodiscard]] bool switchIsCaseMarker(NodeId core) const {
+        return switchIsRuleNode(core, cfg.caseLabelRule)
+            || switchIsRuleNode(core, cfg.caseStmtRule);
+    }
+
+    // Decode a `caseLabel` node into (isDefault, valueExpr?): the default token
+    // marks the default arm; any non-token child is the case match expression.
+    void switchDecodeLabel(NodeId caseLabelNode, bool& isDefault,
+                           std::optional<NodeId>& valueExpr) const {
+        isDefault = false;
+        valueExpr = std::nullopt;
         for (NodeId lc : visible(caseLabelNode)) {
             if (isToken(lc)) {
                 if (cfg.caseDefaultToken.valid()
                     && tree().tokenKind(lc).v == cfg.caseDefaultToken.v)
-                    ctx.curIsDefault = true;
+                    isDefault = true;
             } else {
-                ctx.curValue = lc;   // the case match expression
+                valueExpr = lc;   // the case match expression
             }
         }
     }
-    // Peel leading LabelStmt layers off `core`, collecting their name tokens;
-    // return the innermost peeled core.
-    [[nodiscard]] NodeId switchPeelLabels(NodeId core, std::vector<NodeId>& outToks) {
-        while (switchIsLabelStmtNode(core)) {
-            NodeId body = switchFirstNonToken(core);
-            if (!body.valid()) break;
-            outToks.push_back(firstIdentifierToken(core));
-            core = peelToCore(body);
+
+    // c60 (Design I-A): the per-switch PRESCAN. Walk the switch body subtree in
+    // source order; for every `caseLabel` node (bare or inside a caseStmt, at ANY
+    // depth) assign a per-function ordinal (drawn from the SHARED `nextLabelOrdinal_`
+    // counter so it never collides with a named label) and build a dispatch CaseArm
+    // (value + ordinal, or default + ordinal). The map keys the marker emission +
+    // the MIR jump-table target by the caseLabel node. An explicit heap work-stack
+    // pre-order walk (no host recursion — a 900-case switch body is deep). Does NOT
+    // descend into a NESTED switch (its cases belong to that switch's own dispatch);
+    // a nested switch is opaque here.
+    void switchPrescanDispatch(SwitchCtx& ctx) {
+        std::vector<NodeId> stack(ctx.items.rbegin(), ctx.items.rend());
+        while (!stack.empty()) {
+            NodeId const n = stack.back();
+            stack.pop_back();
+            if (tree().kind(n) != NodeKind::Internal) continue;   // token
+            NodeId const core = peelToCore(n);
+            // A nested switch: do not descend (its caseLabels are its own — they
+            // belong to that switch's dispatch, assigned by ITS prologue).
+            if (HirRuleMapping const* mm = mappingFor(core);
+                mm != nullptr && mm->hirKind == "SwitchStmt") {
+                continue;
+            }
+            if (switchIsRuleNode(core, cfg.caseLabelRule)) {
+                switchAssignCaseOrdinal(ctx, core);
+                // a bare caseLabel has only its value-expr child — nothing more to
+                // walk for cases.
+                continue;
+            }
+            // Push children (reverse → pop left-to-right pre-order). Use the PEELED
+            // core's children so a caseStmt's caseLabel + body are both visited.
+            std::size_t const mark = stack.size();
+            for (NodeId c : visible(core)) if (!isToken(c)) stack.push_back(c);
+            std::reverse(stack.begin() + static_cast<std::ptrdiff_t>(mark), stack.end());
         }
-        return core;
     }
-    // Wrap `inner` in the collected goto-labels (outermost first). Each is a real
-    // pre-scanned LabelStmt so `goto foo` resolves to this arm's entry exactly as
-    // `case 1: foo: stmt` would (C 6.8.1). EMPTY `toks` ⇒ returns `inner` unchanged.
-    [[nodiscard]] HirNodeId switchWrapLabels(NodeId node, std::vector<NodeId> const& toks,
-                                             HirNodeId inner) {
-        HirNodeId result = inner;
-        for (auto it = toks.rbegin(); it != toks.rend(); ++it) {
-            auto found = labelOrdinals_.find(std::string{tree().text(*it)});
-            if (found == labelOrdinals_.end()) continue;   // pre-scan covers all
-            result = track(builder.makeLabelStmt(found->second, result), node);
-        }
-        return result;
+    // Assign (once) the case-label ordinal for `caseLabelNode` and append its
+    // dispatch CaseArm. First-occurrence-wins (a caseLabel node is unique, so this
+    // is hit exactly once per case during the prescan).
+    void switchAssignCaseOrdinal(SwitchCtx& ctx, NodeId caseLabelNode) {
+        auto const [it, inserted] = caseLabelOrdinals_.try_emplace(
+            caseLabelNode.v, nextLabelOrdinal_);
+        if (!inserted) return;   // already assigned (defensive)
+        ++nextLabelOrdinal_;
+        std::uint32_t const ord = it->second;
+        bool isDefault = false;
+        std::optional<NodeId> valueExpr;
+        switchDecodeLabel(caseLabelNode, isDefault, valueExpr);
+        std::optional<HirNodeId> value;
+        if (!isDefault && valueExpr) value = lowerExpr(*valueExpr).id;
+        ctx.arms.push_back(track(builder.makeCaseArm(value, ord), caseLabelNode));
+    }
+    // The prescanned ordinal of a caseLabel node (the marker emission target).
+    // Returns true + the ordinal iff the node was prescanned (i.e. it is a genuine
+    // in-switch case); false ⇒ a case OUTSIDE any switch body → caller fails loud.
+    [[nodiscard]] bool switchCaseOrdinal(NodeId caseLabelNode, std::uint32_t& ord) const {
+        auto it = caseLabelOrdinals_.find(caseLabelNode.v);
+        if (it == caseLabelOrdinals_.end()) return false;
+        ord = it->second;
+        return true;
     }
 
     // The Switch PROLOGUE shared by `lowerSwitch` (recursive oracle) and the
     // `lowerStmt` driver's Switch frame: lower the discriminant INLINE (the first
-    // `Role::Expr` child, at its source position — matching the recursive scan) and
-    // collect the switchBodyItem wrappers in source order. Byte-identical to the
-    // recursive opening scan; builds the ctx the grouping machine then consumes.
+    // `Role::Expr` child, at its source position) and collect the switchBodyItem
+    // wrappers in source order, THEN prescan the body to assign case ordinals + build
+    // the dispatch. The case VALUE expressions lower HERE (in the prescan, source
+    // order) — a fixed, deterministic order identical between oracle and driver.
     [[nodiscard]] SwitchCtx switchPrologue(NodeId node) {
         SwitchCtx ctx;
         ctx.node = node;
         std::optional<HirNodeId> disc;
         for (NodeId c : visible(node)) {
             if (isToken(c)) continue;
-            if (!disc && classify(c) == Role::Expr) { disc = lowerExpr(c).id; continue; }
+            // D-CSUBSET-NARROW-SWITCH-DISCRIMINANT-CMP (c78): the switch
+            // controlling expression integer-PROMOTES (C 6.8.4.2). A
+            // `char`/`short`/`u8` discriminant otherwise reaches MIR→LIR
+            // as a sub-int value and the sparse dispatch emits `cmp` at
+            // the narrow width → A_NoMatchingEncodingVariant (no width-8/16
+            // ALU form on x86 OR arm64). Promote to `int` so the compare
+            // runs at ≥32-bit width with a sign/zero-extended operand.
+            if (!disc && classify(c) == Role::Expr) {
+                disc = promoteSubIntArith(lowerExpr(c)).id; continue;
+            }
             ctx.items.push_back(c);   // switchBodyItem wrappers (caseLabel | statement)
         }
         ctx.discId = orError(disc, node, "switch has no discriminant");
+        switchPrescanDispatch(ctx);   // assign case ordinals + build dispatch arms
         return ctx;
     }
 
     // The retained RECURSIVE `lowerSwitch` (now dead via the driver, like
     // `lowerBlock`/`lowerIf` — kept as the single-source ORACLE the goldens pin
-    // against). Drives the SHARED grouping members; the body re-entries use
-    // `lowerStmt` recursion. The `lowerStmt` driver flattens the SAME logic via
-    // `pumpSwitch` (its body re-entries push onto the work-stack instead).
+    // against). c60 (Design I-A): the body is ONE flat Block — each switchBodyItem
+    // lowers as a statement (with `switchBodyDepth_ > 0` so its case/default markers,
+    // at any depth, become synthetic LabelStmts). The `lowerStmt` driver flattens the
+    // SAME body via a Block frame on the work-stack (its Switch frame suspends on it).
     HirNodeId lowerSwitch(NodeId node) {
         SwitchCtx ctx = switchPrologue(node);
-        // Lower a (label-wrapped) `caseStmt` chain into arms (adjacent
-        // `foo: case 1: case 2: stmt` → empty label-marked arms + the real body).
-        auto lowerCaseChain = [&](NodeId cs, std::vector<NodeId> labels) {
-            for (;;) {
-                NodeId caseLabelNode{}, caseBody{};
-                bool seenFirst = false;
-                for (NodeId c : visible(cs)) {
-                    if (isToken(c)) continue;
-                    if (!seenFirst) { caseLabelNode = c; seenFirst = true; }
-                    else { caseBody = c; break; }
-                }
-                switchStartArm(ctx, node, caseLabelNode);
-                if (!caseBody.valid()) {                          // empty case body (defensive)
-                    if (!labels.empty())
-                        ctx.curBody.push_back(switchWrapLabels(node, labels, switchMakeSkip(node)));
-                    return;
-                }
-                NodeId bodyCore = peelToCore(caseBody);
-                std::vector<NodeId> innerLabels;
-                NodeId bodyProbe = switchPeelLabels(bodyCore, innerLabels);
-                if (switchIsRuleNode(bodyProbe, cfg.caseStmtRule)) {  // adjacent case
-                    if (!labels.empty())
-                        ctx.curBody.push_back(switchWrapLabels(node, labels, switchMakeSkip(node)));
-                    cs = bodyProbe;
-                    labels = std::move(innerLabels);
-                    continue;                                      // → next arm
-                }
-                ctx.curBody.push_back(switchWrapLabels(node, labels, lowerStmt(bodyCore)));
-                return;
-            }
-        };
-        for (NodeId raw : ctx.items) {
-            NodeId core = peelToCore(raw);
-            std::vector<NodeId> labelToks;
-            NodeId probe = switchPeelLabels(core, labelToks);
-            if (switchIsRuleNode(probe, cfg.caseStmtRule)) {      // (label-wrapped) case statement
-                lowerCaseChain(probe, std::move(labelToks));
-            } else if (switchIsRuleNode(core, cfg.caseLabelRule)) {  // bare flat case
-                switchStartArm(ctx, node, core);
-            } else if (ctx.haveArm) {                             // plain stmt
-                ctx.curBody.push_back(lowerStmt(core));
-            }
-        }
-        switchFlush(ctx, node);
-        return track(builder.makeSwitchStmt(ctx.discId, ctx.arms), node);
+        ++switchBodyDepth_;
+        std::vector<HirNodeId> stmts;
+        for (NodeId raw : ctx.items) stmts.push_back(lowerStmt(raw));
+        --switchBodyDepth_;
+        HirNodeId const body = track(builder.makeBlock(stmts), node);
+        return track(builder.makeSwitchStmt(ctx.discId, body, ctx.arms), node);
     }
 
     // ── declarations ──────────────────────────────────────────────────────────
@@ -5436,6 +6189,39 @@ struct Lowerer {
             emitAbstractSlot();
             return;
         }
+        // c28 D-CSUBSET-LOCAL-TYPE-DEFINITION: a LIST-mode local declaration
+        // whose init-declarator-list is ABSENT (`struct S { … };` /  `int;` as a
+        // STATEMENT inside a block — now grammar-parseable since varDecl's list
+        // became optional, mirroring topLevelDecl). This is the LOCAL twin of the
+        // no-object branch in lowerTopLevelInto: a head that DEFINES a composite
+        // type (`struct S { … };`) already minted + interned that type at the
+        // SEMANTIC tier (the unified c25 structSpec/unionSpec/enumSpec define
+        // path, binding the tag into the ENCLOSING BLOCK scope) — so it needs NO
+        // runtime HIR node here (a later `struct S v;` resolves through the
+        // already-interned type; a TypeDecl, as the top level emits, would be
+        // redundant in a body and carries no MIR effect). A head that introduces
+        // NO composite (`int;`) declares nothing (C 6.7p2) — fail loud with the
+        // SAME diagnostic + tier as the top-level path. Gated on
+        // requireNamedDeclarators (the named-position contract — locals/globals/
+        // typedefs) AND an EMPTY list: an ABSTRACT declarator (`int *;`, list
+        // non-empty) is already rejected loud by the semantic analyzer's
+        // requireNamedDeclarators arm, so it must NOT re-report here.
+        if (!singleMode && declarators.empty() && decl->requireNamedDeclarators) {
+            NodeId const spec = findCompositeSpecifierIn(node);
+            // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: a body-ABSENT NAMED
+            // composite specifier as a LOCAL statement (`struct S;` inside a
+            // block) is a forward DECLARATION of an opaque tag — the semantic
+            // tier already minted the incomplete tag (block-scoped via c24/c28).
+            // Emit NOTHING (no runtime effect), exactly like the top-level
+            // forward-decl path; only a head with NEITHER a definition NOR a
+            // forward-declared tag (`int;`) declares nothing and stays loud.
+            if (!spec.valid()
+                && !findForwardCompositeSpecifierIn(node).valid()) {
+                emitH(DiagnosticCode::S_DeclarationDeclaresNothing, node,
+                      std::string{tree().text(node)});
+            }
+            return;
+        }
         for (NodeId d : declarators) {
             NodeId const nameNode = declaratorNameNode(tree(), d, dc);
             if (!nameNode.valid()) {
@@ -5447,20 +6233,88 @@ struct Lowerer {
             }
             SymbolId const sym = model.symbolAt(nameNode);
             // D-CSUBSET-FN-PROTOTYPE: a bare function prototype declarator
-            // (`int f(int);`) emits NO HIR node — it is a function DECLARATION,
-            // not an object. The merged DEFINITION (a separate declarator with a
-            // body) emits the Function; an unabsorbed proto (declared, never
-            // defined) emits nothing AND is never registered as a global/
-            // function symbol, so a call to it fails loud at HIR→MIR (a Ref to
-            // an unbound symbol). Emitting a Global here would create a spurious
-            // FnSig-typed data global (a miscompile). Covers BOTH the absorbed
-            // proto (`isAbsorbedProto`, superseded by a def/redundant decl) and
-            // a standalone proto (`isProtoDeclaration`). A static-storage axis is
-            // per-declaration, so a proto can never share a declarator with a
-            // non-proto object — but the check is per-declarator regardless.
+            // (`int f(int);`) emits NO Global/VarDecl HIR node — it is a
+            // function DECLARATION, not an object. The merged DEFINITION (a
+            // separate declarator with a body) emits the Function; emitting a
+            // Global here would create a spurious FnSig-typed data global (a
+            // miscompile). Covers BOTH the absorbed proto (`isAbsorbedProto`,
+            // superseded by a def/redundant decl) and a standalone proto
+            // (`isProtoDeclaration`). A static-storage axis is per-declaration,
+            // so a proto can never share a declarator with a non-proto object —
+            // but the check is per-declarator regardless.
+            //
+            // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): an UNABSORBED bare
+            // proto (declared, never defined in THIS TU) with the declaration
+            // row's `prototypeSynthesizesExtern` opt-in synthesizes an
+            // ExternFunction with NO library binding (C 6.2.2p5 — external
+            // linkage refers to a definition somewhere in the PROGRAM):
+            //   * the LK11 merge binds it to a sibling-TU definition (the
+            //     sqlite3.c-defines-what-shell.c-declares case) — import
+            //     stripped, calls rewired direct;
+            //   * a bare re-declaration of a SHIPPED descriptor symbol carries
+            //     the suppressed descriptor's library map instead (goal-2: the
+            //     user decl claimed the name, so the descriptor injected
+            //     nothing — the proto IS the import, same library);
+            //   * neither ⇒ the empty-library import survives to the LINKER,
+            //     which rejects it LOUD as an undefined symbol naming the
+            //     symbol (ld's behavior).
+            // ONLY an external-linkage proto synthesizes: a `static` (Local)
+            // or weak proto must never bind another TU's public symbol
+            // (C 6.2.2p3) — those keep the pre-c86 loud H0009 at the first
+            // call. The node needs NO param children (the FnSig carries the
+            // param types — the shipped-descriptor synthesis precedent). A
+            // BLOCK-scope proto (re-homed to file scope per
+            // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE) routes to the MODULE decls via
+            // `moduleDecls_` (the static-local accumulator pattern) so the
+            // HIR→MIR extern pre-pass sees it; flag-off (or a legacy language
+            // without the row) keeps the documented pre-c86 shape: the proto
+            // emits nothing and a call fails loud at HIR→MIR (H0009).
             if (auto const* pr = model.recordFor(sym);
                 pr != nullptr
                 && (pr->isProtoDeclaration || pr->isAbsorbedProto)) {
+                // The proto's linkage: LOCALS reuse the entry-scan result
+                // (`staticLinkage` — already computed for !asGlobal, so no
+                // re-scan and no duplicated unknown-specifier diagnostics);
+                // GLOBALS re-scan ONLY when a specifier prefix exists (the
+                // bare sqlite3.h proto has none ⇒ zero extra scans; a
+                // prefix with an UNKNOWN specifier may re-emit its loud
+                // H_UnknownLinkageSpecifier — rare, never silent).
+                auto protoLinkage = [&]() -> LinkageAttr {
+                    if (!asGlobal) return staticLinkage;
+                    NodeId const pfx =
+                        specifierPrefixChild(tree(), node, *decl);
+                    return pfx.valid() ? linkageFrom(pfx, *decl)
+                                       : LinkageAttr{};
+                };
+                if (decl->prototypeSynthesizesExtern
+                    && pr->isProtoDeclaration && !pr->isAbsorbedProto
+                    && pr->kind == DeclarationKind::Function
+                    && pr->type.valid()
+                    && protoLinkage().binding == SymbolBinding::Global) {
+                    HirNodeId const ef = track(
+                        builder.makeExternFunction(pr->type, sym.v, {}), d);
+                    auto const* shipped =
+                        model.suppressedShippedLibraryFor(pr->name);
+                    externDecls.push_back(HirExternRecord{
+                        ef, pr->name,
+                        shipped != nullptr
+                            ? *shipped
+                            : std::unordered_map<std::string, std::string>{},
+                        /*noLibraryBinding=*/shipped == nullptr});
+                    if (asGlobal) {
+                        out.push_back(ef);
+                    } else if (moduleDecls_ != nullptr) {
+                        moduleDecls_->push_back(ef);
+                    } else {
+                        // Mirrors the static-local MF-3 guard: a block-scope
+                        // proto outside a module tree walk is a bug — never a
+                        // silent drop.
+                        out.push_back(reportedError(d,
+                            "bare-prototype extern synthesized with no "
+                            "module-decls accumulator (outside a module "
+                            "tree walk)"));
+                    }
+                }
                 continue;
             }
             TypeId type = InvalidType;
@@ -5620,15 +6474,43 @@ struct Lowerer {
     }
 
     // DFS for the first descendant of `root` whose rule is a composite
-    // (fieldChildren) TYPE declaration — c-subset's structSpecifierBody /
-    // unionSpecifierBody / enumSpecifierBody. Used to recover the type-
-    // declaring node of a no-object top-level declaration (`struct P { … };`),
+    // (fieldChildren) TYPE DEFINITION — c-subset's unified structSpec / unionSpec
+    // / enumSpec (which REPLACED the *SpecifierBody rules). Used to recover the
+    // type-declaring node of a no-object top-level declaration (`struct P { … };`),
     // which — since the bare top-level structDecl/unionDecl/enumDecl rules were
     // folded into topLevelDecl (D-CSUBSET-STRUCT-BODY-VARDECL-POSITION) — now
     // lives inside the head specifier rather than being the top node itself.
     // Agnostic: driven by the `fieldChildren` declarations config, not a rule-
     // name list. First-match returns the OUTERMOST body (a nested inline body
     // sits deeper), which is the one this declaration introduces.
+    //
+    // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: a dual-mode specifier
+    // (`definesWhenChild`) carries `fieldChildren` whether or not its body is
+    // present — but a body-ABSENT occurrence (`struct S;` forward-decl /
+    // `struct S v;` head) is a tag REFERENCE, not a definition, so it must NOT be
+    // recovered HERE as the type-declaring node (which emits a TypeDecl). A
+    // body-absent NAMED form is instead matched by the c35
+    // `findForwardCompositeSpecifierIn` sibling, which makes a bare `struct S;`
+    // emit NOTHING (an opaque forward declaration — the incomplete tag was minted
+    // semantically), NOT `S_DeclarationDeclaresNothing`
+    // (D-CSUBSET-FORWARD-STRUCT-DECLARATION). Require the body child present for a
+    // gated row.
+    // c25: is a dual-mode composite specifier a DEFINITION at node `n` (its body
+    // child present)? A non-gated row is always a definition. Mirrors the
+    // analyzer's `isDefinitionAtNode` — the HIR tier keeps its own copy (it has no
+    // access to the analyzer's anonymous-namespace helpers).
+    [[nodiscard]] bool
+    compositeSpecifierIsDefinition(DeclarationRule const& decl, NodeId n) const {
+        if (!decl.definesWhenChildRule.has_value()) return true;
+        for (NodeId c : visible(n)) {
+            if (tree().kind(c) == NodeKind::Internal
+                && tree().rule(c) == *decl.definesWhenChildRule) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     NodeId findCompositeSpecifierIn(NodeId n) {
         // `visible()` yields TOKEN children too, and `tree().rule()` is valid
         // only on Internal nodes. A token is never a composite body and has no
@@ -5640,7 +6522,8 @@ struct Lowerer {
         if (!n.valid() || tree().kind(n) != NodeKind::Internal) return NodeId{};
         auto it = declMap_.find(tree().rule(n).v);
         if (it != declMap_.end()
-            && sem.declarations[it->second].fieldChildren.has_value()) {
+            && sem.declarations[it->second].fieldChildren.has_value()
+            && compositeSpecifierIsDefinition(sem.declarations[it->second], n)) {
             return n;
         }
         for (NodeId c : visible(n)) {
@@ -5648,6 +6531,56 @@ struct Lowerer {
             if (hit.valid()) return hit;
         }
         return NodeId{};
+    }
+
+    // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: the sibling of
+    // `findCompositeSpecifierIn` for the FORWARD-DECLARATION form — a composite
+    // specifier (`fieldChildren`) whose body is ABSENT but that carries a tag
+    // NAME (`struct S;` — NOT `struct;`, NOT a body-present definition). The
+    // semantic analyzer already FORWARD-MINTED the incomplete tag for such a
+    // head (the isTagReference arm / a later definition completes it), so a bare
+    // forward declaration needs NO runtime HIR node — it is the C-legal opaque
+    // declaration of a tag, not a declares-nothing constraint violation. A
+    // body-PRESENT definition is recovered by `findCompositeSpecifierIn` above
+    // (emits a TypeDecl); a head with NO composite specifier at all (`int ;`)
+    // matches NEITHER and still fails loud. Agnostic: keyed on the `fieldChildren`
+    // config + the declaration row's `name` child resolving to a real identifier
+    // leaf, never a rule-name or keyword.
+    NodeId findForwardCompositeSpecifierIn(NodeId n) {
+        if (!n.valid() || tree().kind(n) != NodeKind::Internal) return NodeId{};
+        auto it = declMap_.find(tree().rule(n).v);
+        if (it != declMap_.end()) {
+            DeclarationRule const& d = sem.declarations[it->second];
+            if (d.fieldChildren.has_value()
+                && !compositeSpecifierIsDefinition(d, n)
+                && compositeSpecifierHasTagName(d, n)) {
+                return n;
+            }
+        }
+        for (NodeId c : visible(n)) {
+            NodeId const hit = findForwardCompositeSpecifierIn(c);
+            if (hit.valid()) return hit;
+        }
+        return NodeId{};
+    }
+
+    // c35: does composite specifier `n` carry a tag NAME — i.e. is its `name`
+    // child a real identifier leaf (`struct S` / `union U`), distinguishing a
+    // forward DECLARATION (`struct S;`, mints/refs a tag) from an anonymous
+    // body-less `struct;` (which declares nothing and must stay loud)? Reads the
+    // declaration row's positional `name` child via the same `declRoleChildren`
+    // the binder uses, so it is positionally exact for the unified specifier
+    // shape `[Kw, {opt Identifier}, {opt body}]`.
+    [[nodiscard]] bool
+    compositeSpecifierHasTagName(DeclarationRule const& decl, NodeId n) const {
+        if (!decl.nameChild.has_value()) return false;
+        auto vis = declRoleChildren(tree(), n, decl);
+        if (*decl.nameChild >= vis.size()) return false;
+        NodeId const nameNode = vis[*decl.nameChild];
+        if (!nameNode.valid() || tree().kind(nameNode) != NodeKind::Token)
+            return false;
+        SchemaTokenId const tk = tree().tokenKind(nameNode);
+        return sem.identifierToken.valid() && tk == sem.identifierToken;
     }
 
     // FC4 c1: declarator-mode topLevelDecl — Function (the kindByChild
@@ -5730,12 +6663,18 @@ struct Lowerer {
                 sig.valid() ? interner.fnResult(sig) : InvalidType;
             currentReturnType_ = retType;
             auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
+            auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
+            std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
             labelOrdinals_.clear();
+            caseLabelOrdinals_.clear();
+            nextLabelOrdinal_ = 0;
             if (bodyNode.valid()) prescanLabels(bodyNode);
             HirNodeId body = bodyNode.valid()
                 ? lowerStmt(bodyNode)
                 : track(builder.makeBlock({}), node);
             labelOrdinals_ = std::move(savedLabels);
+            caseLabelOrdinals_ = std::move(savedCaseLabels);
+            nextLabelOrdinal_ = savedNextOrd;
             currentReturnType_ = savedReturn;
             body = maybeAppendImplicitReturnZero(node, body, sym, retType,
                                                  decl);
@@ -5765,6 +6704,17 @@ struct Lowerer {
             NodeId const spec = findCompositeSpecifierIn(node);
             if (spec.valid()) {
                 out.push_back(lowerTypeDecl(spec));
+            } else if (findForwardCompositeSpecifierIn(node).valid()) {
+                // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: a bare FORWARD
+                // declaration (`struct S;` — a body-ABSENT NAMED composite
+                // specifier) declares an OPAQUE tag, not nothing. The semantic
+                // analyzer already forward-minted the incomplete tag (or a later
+                // definition completed it); emit NO runtime HIR node here (a
+                // TypeDecl would carry no complete layout and no MIR effect — a
+                // forward decl is a pure declaration). A `Ptr<incomplete>` use
+                // resolves through the minted tag; a VALUE/by-value-member/sizeof
+                // of it still fails loud through the unchanged computeLayout
+                // incomplete guard.
             } else {
                 // C 6.7p2: a declaration with NEITHER a named declarator NOR a
                 // tag (`int ;`) declares nothing — a constraint violation, now
@@ -5950,12 +6900,18 @@ struct Lowerer {
         NodeId const bodyNode = (decl.bodyChild && *decl.bodyChild < vis.size())
                               ? vis[*decl.bodyChild] : NodeId{};
         auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
+        auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
+        std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
         labelOrdinals_.clear();
+        caseLabelOrdinals_.clear();
+        nextLabelOrdinal_ = 0;
         if (bodyNode.valid()) prescanLabels(bodyNode);
         HirNodeId body = bodyNode.valid()
                        ? lowerStmt(bodyNode)
                        : track(builder.makeBlock({}), node);
         labelOrdinals_ = std::move(savedLabels);
+        caseLabelOrdinals_ = std::move(savedCaseLabels);
+        nextLabelOrdinal_ = savedNextOrd;
         currentReturnType_ = savedReturn;
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);
@@ -6185,10 +7141,16 @@ struct Lowerer {
             sig.valid() ? interner.fnResult(sig) : InvalidType;
         currentReturnType_ = retType;
         auto savedLabels = std::move(labelOrdinals_);   // FC5: per-function label scope
+        auto savedCaseLabels = std::move(caseLabelOrdinals_);   // c60
+        std::uint32_t const savedNextOrd = nextLabelOrdinal_;   // c60
         labelOrdinals_.clear();
+        caseLabelOrdinals_.clear();
+        nextLabelOrdinal_ = 0;
         if (bodyNode.valid()) prescanLabels(bodyNode);
         HirNodeId body = bodyNode.valid() ? lowerStmt(bodyNode) : track(builder.makeBlock({}), node);
         labelOrdinals_ = std::move(savedLabels);
+        caseLabelOrdinals_ = std::move(savedCaseLabels);
+        nextLabelOrdinal_ = savedNextOrd;
         currentReturnType_ = savedReturn;
         body = maybeAppendImplicitReturnZero(
             node, body, sym, retType, decl);

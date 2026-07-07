@@ -1,0 +1,34 @@
+{
+  "$comment": "c76 (D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT, option E; 2026-07-01): the pre-regalloc wide-call materialization (lir_wide_call_args.cpp) must handle a VARIADIC callee. On SysV the fixed `n` takes rdi and the 10 int varargs travel the variadicArgsAlwaysStack path to the outgoing stack; the outgoing arg list exceeds the register file, so the split to `store_outgoing_arg` carriers is required or the Call exhausts regalloc. WITNESS: vsum weights each vararg by position k (1..10); values descending 10..1 give every position a distinct value AND weight, so a swap or a wrong overflow-slot read changes the sum (delta=(vi-vj)(j-i)!=0). sum_{k=1..10}(11-k)*k = 220. RED-ON-DISABLE: revert the pass -> error[L_VirtualRegInPostRegalloc]. Int-only varargs, so the release arm is safe. => 220.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 220,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

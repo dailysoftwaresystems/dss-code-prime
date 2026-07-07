@@ -246,6 +246,25 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn) {
     auto const rpo = mirReversePostOrder(src_, entry);
     if (rpo.empty()) return;
 
+    // c115 SEH (D-WIN64-SEH-FUNCLETS): blocks that are DIRECT SUCCESSORS of a
+    // SEH terminator (SehTryBegin's [tryEntry, filterEntry], SehFilterReturn's
+    // [handlerEntry]) are region-skeleton anchors — never trampoline-elide or
+    // merge-absorb them. The reachable hazard: an EMPTY handler `__except(e){}`
+    // lowers handlerEntry = [Br(join)], a 1-inst trampoline; eliding it would
+    // retarget SehFilterReturn at the join block (2 preds) and red the
+    // MirVerifier's handler-single-pred rule on a LEGAL program. The address-
+    // taken-block discipline (MF-B), applied to the SEH skeleton.
+    std::unordered_set<std::uint32_t> sehSuccessors;
+    for (MirBlockId const b : rpo) {
+        std::uint32_t const n = src_.blockInstCount(b);
+        if (n == 0) continue;
+        MirOpcode const top = src_.instOpcode(src_.blockInstAt(b, n - 1));
+        if (top != MirOpcode::SehTryBegin && top != MirOpcode::SehFilterReturn)
+            continue;
+        for (MirBlockId const s : src_.blockSuccessors(b))
+            sehSuccessors.insert(s.v);
+    }
+
     // Step 1: identify trampoline blocks. A block B is a trampoline iff:
     //   - It is NOT the function entry (we cannot elide the entry).
     //   - Its instruction count is exactly 1 (the terminator).
@@ -270,6 +289,8 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn) {
         // offset pointing at deleted/moved code — a SILENT MISCOMPILE. Keep it
         // verbatim (the indirect edge keeps it reachable anyway).
         if (src_.isBlockAddressTaken(b)) continue;
+        // c115 SEH: a region-skeleton anchor is never elided (see above).
+        if (sehSuccessors.count(b.v) != 0) continue;
         if (src_.blockInstCount(b) != 1) continue;
         MirInstId const term = src_.blockInstAt(b, 0);
         if (src_.instOpcode(term) != MirOpcode::Br) continue;
@@ -316,6 +337,8 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn) {
         // synthetic block symbol's offset would no longer name B's first
         // instruction — a SILENT MISCOMPILE.
         if (src_.isBlockAddressTaken(B)) return false;
+        // c115 SEH: a region-skeleton anchor is never absorbed (see above).
+        if (sehSuccessors.count(B.v) != 0) return false;
         if (jumpThreadMap_.count(P) || jumpThreadMap_.count(B)) return false;
         if (B.v >= preds.size() || preds[B.v].size() != 1) return false;
         if (preds[B.v][0].v != P.v) return false;

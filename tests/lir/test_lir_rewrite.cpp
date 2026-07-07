@@ -164,21 +164,34 @@ TEST(LirRewrite, ExhaustedClassEmitsLoudFailureNotSilentClobber) {
     std::array<TypeKind, 1> const paramKinds{TypeKind::I32};
     auto syn = test_support::buildSyntheticFn(
         paramKinds, TypeKind::I32,
-        [&](MirBuilder& mb, TypeInterner&,
+        [&](MirBuilder& mb, TypeInterner& interner,
             std::vector<TypeId> const& params, TypeId retT) {
             MirInstId const a = mb.addArg(0, params[0]);
-            std::vector<MirInstId> vals;
-            vals.reserve(20);
+            // 20 distinct arg vregs, all live simultaneously at the call.
+            std::vector<MirInstId> args;
+            args.reserve(20);
             for (int i = 0; i < 20; ++i) {
                 std::array<MirInstId, 2> ops{a, a};
-                vals.push_back(mb.addInst(MirOpcode::Add, ops, retT));
+                args.push_back(mb.addInst(MirOpcode::Add, ops, retT));
             }
-            MirInstId acc = vals[0];
-            for (std::size_t i = 1; i < vals.size(); ++i) {
-                std::array<MirInstId, 2> ops{acc, vals[i]};
-                acc = mb.addInst(MirOpcode::Add, ops, retT);
-            }
-            mb.addReturn(acc);
+            // A WIDE CALL: 20 register operands live at ONE instruction
+            // exceed the register file, so no fixed spill-reload
+            // reservation (c75 reserve-K) can service them — the deferred
+            // D-AS-REGALLOC-WIDE-CALL-OPERAND-COUNT. The reload path must
+            // EXHAUST LOUDLY rather than silently clobber a reserved-role
+            // register. (Post-c75 the general-pressure reduce this test
+            // formerly built is HANDLED by the reservation, so the loud-
+            // failure path is now reached via the wide-call operand
+            // explosion instead — the one exhaustion reserve-K cannot fix.)
+            TypeId const ptrT = interner.primitive(TypeKind::Ptr);
+            MirInstId const callee = mb.addGlobalAddr(SymbolId{2}, ptrT);
+            std::vector<MirInstId> callOps;
+            callOps.reserve(args.size() + 1);
+            callOps.push_back(callee);
+            for (auto const v : args) callOps.push_back(v);
+            MirInstId const callResult =
+                mb.addInst(MirOpcode::Call, callOps, retT);
+            mb.addReturn(callResult);
         });
     DiagnosticReporter lirRep;
     auto const lirResult = lowerToLir(syn.mir, **target, syn.interner, lirRep);
@@ -193,9 +206,10 @@ TEST(LirRewrite, ExhaustedClassEmitsLoudFailureNotSilentClobber) {
     DiagnosticReporter rewriteRep;
     auto rewritten = rewriteWithAllocation(lirResult.lir, **target,
                                            alloc, rewriteRep);
-    // 20 vregs all live at the final reduce exhaust the GPR class
-    // (x86_64 SysV allocatable GPRs ≈ 14, minus reserved). No scratch
-    // remains → loud failure is the correct substrate behavior.
+    // The 20-arg wide call has more live register operands at one
+    // instruction than the register file holds, so the reload path finds
+    // no scratch → loud failure is the correct substrate behavior
+    // (silently clobbering rsp as scratch would corrupt the stack).
     EXPECT_FALSE(rewritten.ok);
     bool foundDiag = false;
     for (auto const& d : rewriteRep.all()) {
@@ -248,23 +262,36 @@ TEST(LirRewrite, Arm64HighFprSpillScratchPoolHandlesOrdinalsBeyond64) {
     // pass VACUOUSLY (green but testing nothing). Assert the precondition holds
     // so it fails LOUD instead. If asserting the exact ordinal ever becomes
     // structurally awkward, the max-FPR-ordinal >= 64 fallback below suffices.
-    std::uint32_t maxFprOrdinal = 0;
-    bool sawD31 = false;
-    for (auto const& fa : out.alloc.perFunc) {
-        for (auto const& a : fa.assignments) {
-            if (a.isSpilled()) continue;
-            LirReg const phys = a.physReg();
-            if (phys.regClass() != LirRegClass::FPR) continue;
-            if (phys.id > maxFprOrdinal) maxFprOrdinal = phys.id;
-            if (phys.id == 64u) sawD31 = true;
+    // c75 (D-AS-REGALLOC-SPILL-RELOAD-SCRATCH): the high caller-saved
+    // FPRs — including d31 (global ordinal 64) — are now RESERVED as
+    // spill-reload scratch, so d31 is no longer ASSIGNED to a vreg; it
+    // sits in the rewriter's scratch pool instead. The >64 ordinal re-key
+    // is still exercised: pickScratchRegs's register loop reaches ordinal
+    // 64 while building the pool and ADDS d31 to it (a reserved,
+    // unassigned, still-allocatable register). The core assertions below
+    // (rewrite ok, no 'out of 64-bit bound' error) verify that ordinal-64
+    // handling — a uint64 bitmask keyed by the ordinal is UB at
+    // `contains(64)`/`insert(64)` during that pool build. Pre-c75 this
+    // corpus incidentally ASSIGNED a vreg to d31; c75 reserves d31, so the
+    // ordinal-64 register is now exercised through the POOL, not an
+    // assignment (the low-FPR-pressure function no longer needs to spill).
+    // Non-vacuity: the target must structurally carry an FPR at global
+    // ordinal >= 64 so the loop actually crosses the >64 boundary; an
+    // arm64 variant dropping it makes this pin vacuous — fail LOUD here.
+    std::uint32_t maxFprSchemaOrdinal = 0;
+    {
+        auto const regs = out.lowered.target->registers();
+        for (std::uint16_t i = 0; i < regs.size(); ++i) {
+            if (regs[i].regClass == TargetRegClass::FPR
+                && regs[i].subOf.empty() && i > maxFprSchemaOrdinal) {
+                maxFprSchemaOrdinal = i;
+            }
         }
     }
-    ASSERT_TRUE(sawD31)
-        << "precondition: the FP-overflow corpus must allocate a vreg to d31 "
-           "(global ordinal 64) so the >64 scratch-ordinal re-key is actually "
-           "exercised — max FPR ordinal assigned was " << maxFprOrdinal
-        << " (if the allocator no longer reaches d31 this pin is vacuous; "
-           "restore the precondition or re-pressure the corpus)";
+    ASSERT_GE(maxFprSchemaOrdinal, 64u)
+        << "precondition: arm64 must carry an FPR at global ordinal >= 64 "
+           "(d31 = 64) for the >64 scratch-ordinal re-key to matter — max "
+           "FPR ordinal in the register table was " << maxFprSchemaOrdinal;
 
     DiagnosticReporter rewriteRep;
     auto rewritten = rewriteWithAllocation(out.lowered.lir.lir, *out.lowered.target,
@@ -282,17 +309,19 @@ TEST(LirRewrite, SpilledFunctionEmitsFrameLoadStorePseudoOps) {
     // prefer callee-saved, and excess spill via
     // R_SpilledDueToCrossCallExhaustion. Total pressure remains
     // moderate so scratch room is preserved for the rewrite pass.
+    //
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the live-across-call values are
+    // never-address-taken PARAMETERS (pure SSA `Arg`s), NOT body locals. A local's
+    // alloca address is now rematerialized AFTER the call (a fresh `lea_frame_slot`),
+    // so locals no longer span the call. The 8 params are each used as a call
+    // argument AND in the post-call sum, so each spans the call; 8 cross-call values
+    // exceed SysV's 5 callee-saved GPRs → ≥1 genuine cross-call spill, remat-
+    // independent (yet moderate, so the rewrite keeps scratch room).
     auto bundle = lowerAndAllocate(
-        "int g(int a) { return a + 1; }\n"
-        "int f(int x) {\n"
-        "    int a1 = x + 1;\n"
-        "    int a2 = x + 2;\n"
-        "    int a3 = x + 3;\n"
-        "    int a4 = x + 4;\n"
-        "    int a5 = x + 5;\n"
-        "    int a6 = x + 6;\n"
-        "    int r = g(x);\n"
-        "    return a1 + a2 + a3 + a4 + a5 + a6 + r;\n"
+        "int g(int v) { return v + 1; }\n"
+        "int f(int a, int b, int c, int d, int e, int f2, int g2, int h) {\n"
+        "    int r = g(a + b + c + d + e + f2 + g2 + h);\n"
+        "    return a + b + c + d + e + f2 + g2 + h + r;\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.alloc.ok());
@@ -343,17 +372,18 @@ TEST(LirRewrite, MultiSpilledSameClassOperandsGetDistinctScratches) {
     // Build cross-call pressure that forces multiple spills, then
     // assert: across the rewritten module, no `add` instruction has
     // two operand Reg slots pointing at the same physical reg.
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): pressure comes from never-
+    // address-taken PARAMETERS (pure SSA `Arg`s), NOT body locals — a local's alloca
+    // address is now rematerialized AFTER the call so locals no longer span it. The
+    // 8 params each feed the call arguments AND the post-call sum → 8 cross-call
+    // values > SysV's 5 callee-saved GPRs → multiple spills (the multi-spill scratch
+    // distribution this test exercises). Remat-independent.
     auto bundle = lowerAndAllocate(
         "int g(int a, int b);\n"
-        "int f(int x) {\n"
-        "    int a1 = x + 1;\n"
-        "    int a2 = x + 2;\n"
-        "    int a3 = x + 3;\n"
-        "    int a4 = x + 4;\n"
-        "    int a5 = x + 5;\n"
-        "    int a6 = x + 6;\n"
-        "    int r = g(x, x);\n"
-        "    return a1 + a2 + a3 + a4 + a5 + a6 + r;\n"
+        "int f(int a, int b, int c, int d, int e, int f2, int g2, int h) {\n"
+        "    int s = a + b + c + d + e + f2 + g2 + h;\n"
+        "    int r = g(s, s);\n"
+        "    return a + b + c + d + e + f2 + g2 + h + r;\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.alloc.ok());
@@ -474,17 +504,18 @@ TEST(LirRewrite, ScratchRegPickedFromCallingConventionPoolOnly) {
     // Pins the dual of `ExhaustedClassEmitsLoudFailureNotSilentClobber`:
     // when a scratch IS picked, it must be a register that appears in
     // the calling convention's allocatable pool (no `rsp`/`rflags`/etc.).
+    //
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the live-across-call values are
+    // never-address-taken PARAMETERS (pure SSA `Arg`s) — a body local's alloca
+    // address is now rematerialized AFTER the call so locals no longer span it. The
+    // 8 params each feed the call argument AND the post-call sum → 8 cross-call
+    // values > SysV's 5 callee-saved GPRs → ≥1 spill, hence frame_load/frame_store
+    // whose scratch register this test inspects. Remat-independent.
     auto bundle = lowerAndAllocate(
-        "int g(int a) { return a + 1; }\n"
-        "int f(int x) {\n"
-        "    int a1 = x + 1;\n"
-        "    int a2 = x + 2;\n"
-        "    int a3 = x + 3;\n"
-        "    int a4 = x + 4;\n"
-        "    int a5 = x + 5;\n"
-        "    int a6 = x + 6;\n"
-        "    int r = g(x);\n"
-        "    return a1 + a2 + a3 + a4 + a5 + a6 + r;\n"
+        "int g(int v) { return v + 1; }\n"
+        "int f(int a, int b, int c, int d, int e, int f2, int g2, int h) {\n"
+        "    int r = g(a + b + c + d + e + f2 + g2 + h);\n"
+        "    return a + b + c + d + e + f2 + g2 + h + r;\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.alloc.ok());
@@ -674,14 +705,21 @@ TEST(LirRewrite, SpilledVariadicIndirectCalleeReloadScratchSkipsArgAndCountRegs)
         << "every cc arg register must resolve to a distinct ordinal "
            "and the count register must not alias an arg register";
 
-    // Exact rewritten shape: 3 reloads + the call + ret.
+    // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): the two spilled register-passed
+    // ARGS (vr2 fixed, vr3 vararg) are now DEFERRED to callconv as SpillSlotRef
+    // operands — NOT scratch-reloaded here. Only the spilled CALLEE (ops[0])
+    // still reloads into a scratch register (the FC4-c2 B2 contract this test
+    // pins). So the rewritten shape is ONE frame_load (the callee) + the call +
+    // ret. The B2 pin below is UNCHANGED — the callee's scratch must still skip
+    // the cc arg/count registers; c77 only removed the redundant arg reloads.
     Lir const& dst = rewritten.lir;
     ASSERT_EQ(dst.moduleFuncCount(), 1u);
     LirFuncId const dfn = dst.funcAt(0);
     ASSERT_EQ(dst.funcBlockCount(dfn), 1u);
     LirBlockId const blk = dst.funcBlockAt(dfn, 0);
-    ASSERT_EQ(dst.blockInstCount(blk), 5u)
-        << "expected frame_load x3 + call + ret";
+    ASSERT_EQ(dst.blockInstCount(blk), 3u)
+        << "c77: expected frame_load x1 (spilled callee) + call + ret — the two "
+           "spilled register-args are deferred as SpillSlotRef operands";
 
     // Locate the call via the schema's isCall flag (agnostic walk).
     std::uint32_t callIdx   = 0;
@@ -701,57 +739,62 @@ TEST(LirRewrite, SpilledVariadicIndirectCalleeReloadScratchSkipsArgAndCountRegs)
     auto const rewrittenOps = dst.instOperands(callInst);
     ASSERT_EQ(rewrittenOps.size(), 3u);
 
-    // Map each spilled operand to its reload by SPILL-SLOT payload
-    // (slot v == opIdx+1 was assigned to operand opIdx above): exactly
-    // ONE frame_load per slot, each BEFORE the call, dest == the
-    // register the rewritten call consumes at that operand position.
-    // This is the non-vacuity spine: the callee reload REALLY happened
-    // and the call's ops[0] is REALLY its dest.
-    std::array<LirReg, 3> reloadDest{};
-    for (std::uint32_t opIdx = 0; opIdx < 3; ++opIdx) {
-        std::uint32_t const slotV = opIdx + 1u;
-        std::size_t   found   = 0;
-        std::uint32_t loadIdx = 0;
-        for (std::uint32_t i = 0; i < dst.blockInstCount(blk); ++i) {
-            LirInstId const inst = dst.blockInstAt(blk, i);
-            if (dst.instOpcode(inst) != *frameLoadOp) continue;
-            if (dst.instPayload(inst) != slotV) continue;
-            ++found;
-            loadIdx = i;
-            reloadDest[opIdx] = dst.instResult(inst);
-        }
-        ASSERT_EQ(found, 1u)
-            << "exactly one reload for spill slot " << slotV;
-        EXPECT_LT(loadIdx, callIdx)
-            << "the reload for slot " << slotV << " must precede the call";
-        ASSERT_EQ(rewrittenOps[opIdx].kind, LirOperandKind::Reg);
-        LirReg const r = rewrittenOps[opIdx].reg;
-        ASSERT_TRUE(r.valid());
-        EXPECT_EQ(r.isPhysical, 1u);
-        EXPECT_EQ(r.regClass(), LirRegClass::GPR);
-        EXPECT_EQ(reloadDest[opIdx].isPhysical, 1u);
-        EXPECT_EQ(reloadDest[opIdx].regClass(), LirRegClass::GPR);
-        EXPECT_EQ(r.id, reloadDest[opIdx].id)
-            << "call operand " << opIdx
-            << " must consume its own reload's dest";
+    // c77 (D-AS-REGALLOC-DIRECT-ARG-RELOAD): ops[0] (callee) is a scratch-
+    // reloaded Reg; ops[1]/ops[2] (the two spilled register-args) are now
+    // SpillSlotRef operands carrying their slots (2, 3) + class GPR — deferred
+    // to callconv's arg-setup (which loads them directly into the ABI arg regs).
+    // Exactly ONE frame_load exists (the callee, slot 1), before the call.
+    std::size_t   calleeLoads = 0;
+    std::uint32_t calleeLoadIdx = 0;
+    LirReg        calleeReloadDest{};
+    for (std::uint32_t i = 0; i < dst.blockInstCount(blk); ++i) {
+        LirInstId const inst = dst.blockInstAt(blk, i);
+        if (dst.instOpcode(inst) != *frameLoadOp) continue;
+        ++calleeLoads;
+        calleeLoadIdx    = i;
+        calleeReloadDest = dst.instResult(inst);
+        EXPECT_EQ(dst.instPayload(inst), 1u)
+            << "the only reload must be the spilled callee (slot 1); the two "
+               "arg slots (2,3) are deferred as SpillSlotRef, not reloaded";
+    }
+    ASSERT_EQ(calleeLoads, 1u)
+        << "c77: exactly one frame_load (the spilled callee) — the register "
+           "args are deferred";
+    EXPECT_LT(calleeLoadIdx, callIdx)
+        << "the callee reload must precede the call";
+
+    // ops[0] is the callee, a physical GPR == its reload's dest.
+    ASSERT_EQ(rewrittenOps[0].kind, LirOperandKind::Reg);
+    LirReg const calleeR = rewrittenOps[0].reg;
+    ASSERT_TRUE(calleeR.valid());
+    EXPECT_EQ(calleeR.isPhysical, 1u);
+    EXPECT_EQ(calleeR.regClass(), LirRegClass::GPR);
+    EXPECT_EQ(calleeR.id, calleeReloadDest.id)
+        << "the call's ops[0] must consume the callee reload's dest";
+
+    // ops[1], ops[2] are SpillSlotRef operands (deferred args) carrying their
+    // spill slots (2, 3) + class GPR — the c77 direct-arg-reload marker.
+    for (std::uint32_t opIdx = 1; opIdx < 3; ++opIdx) {
+        ASSERT_EQ(rewrittenOps[opIdx].kind, LirOperandKind::SpillSlotRef)
+            << "call arg operand " << opIdx
+            << " must be a deferred SpillSlotRef (c77)";
+        EXPECT_EQ(rewrittenOps[opIdx].spillSlotV, opIdx + 1u)
+            << "SpillSlotRef must carry the arg's spill slot";
+        EXPECT_EQ(rewrittenOps[opIdx].spillSlotClass,
+                  static_cast<std::uint8_t>(LirRegClass::GPR))
+            << "SpillSlotRef must carry the arg's register class";
     }
 
-    // ── THE B2 PIN ── the spilled CALLEE's reload scratch ordinal is
-    // outside argGprs ∪ argFprs ∪ {variadic count register}.
-    std::uint32_t const calleeOrd = reloadDest[0].id;
+    // ── THE B2 PIN (UNCHANGED by c77) ── the spilled CALLEE's reload scratch
+    // ordinal is outside argGprs ∪ argFprs ∪ {variadic count register}. c77 did
+    // not touch the callee (ops[0]) reload path; this contract still holds.
+    std::uint32_t const calleeOrd = calleeReloadDest.id;
     EXPECT_EQ(forbidden.count(calleeOrd), 0u)
         << "B2 regression: the spilled indirect-call CALLEE was "
            "reloaded into cc arg/count register ordinal " << calleeOrd
         << " — the post-regalloc arg-setup moves (or the variadic "
            "count mov) would clobber the callee before the call "
            "consumes it (silent jump through an argument value)";
-
-    // Cursor/rotation discipline: three reloads, three DISTINCT
-    // scratches — entries skipped for the callee stayed available
-    // (rotated, not burned) and no two operands share a scratch.
-    EXPECT_NE(reloadDest[0].id, reloadDest[1].id);
-    EXPECT_NE(reloadDest[0].id, reloadDest[2].id);
-    EXPECT_NE(reloadDest[1].id, reloadDest[2].id);
 
     DiagnosticReporter verifyRep;
     EXPECT_TRUE(verifyLirPostRegalloc(rewritten.lir, sch, verifyRep));

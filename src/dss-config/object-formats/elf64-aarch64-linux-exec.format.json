@@ -19,6 +19,8 @@
   "entryPoint": "",
   "$externCallDispatchComment": "ELF resolves imports through the PLT: the linker synthesizes a 16-byte ARM64 PLT stub per extern (ADRP+LDR+BR+NOP through the GOT slot) and points the extern symbol's VA at the STUB, so the call site is a PLAIN DIRECT call (BL imm26 to the stub, R_AARCH64_CALL26). No inline ADRP+LDR+BLR macro-op is needed at the call site -- the stub does the GOT indirection. D-FFI-EXTERN-CALL-DISPATCH.",
   "externCallDispatch": "direct-plt",
+  "$dataImportBindingComment": "c84 (D-LK-EXTERN-DATA-IMPORT): extern library DATA objects (libc stdout/stderr/stdin) bind via ELF COPY RELOCATIONS — the standard glibc non-PIE ET_EXEC mechanism: the exec reserves a correctly-sized+aligned .bss slot per imported object, exports the symbol as a DEFINED OBJECT (st_size = the layout-derived object size) at that slot, and emits one R_AARCH64_COPY (1024) in .rela.dyn; ld-linux-aarch64 memcpy's the library's object into the slot before entry and ALL images (incl. libc itself, by interposition) reference the exec's copy. Zero new instruction encodings — module code reaches the object through the normal GlobalAddr path. Same shared elf.cpp walker as the x86_64 exec format; arch differs only via the per-machine reloc constant. A format WITHOUT this field rejects data imports loud at the linker's pre-walker gate.",
+  "dataImportBinding": "copy-relocation",
 
   "$supportedDataSectionsComment": "D-LK1-ELF-EXEC-DATA-SECTIONS (rodata) + D-LK4-DATA-PRODUCER (writable `.data` + zero-fill `.bss`): the ELF ET_EXEC walker emits `.rodata`/`.data`/`.bss` from `AssembledModule.dataItems` per item `section`. Same field + same shared `elf.cpp` code path as the x86_64-ELF exec format; arch differs only via config (pageAlign/machine). Cross-format agnosticism: zero format-name branches in the gate.",
   "supportedDataSections": ["rodata", "data", "bss"],
@@ -34,6 +36,13 @@
 
   "$entryCallingConventionComment": "AAPCS64 calling convention — the user fn's return value (returnGprs[0] = x0) is moved into argGprs[0] (= x0) before SVC. Read via `target.callingConventionByName(\"aapcs64\")` at trampoline-build time.",
   "entryCallingConvention": "aapcs64",
+
+  "$processArgsComment": "c88 (D-RUNTIME-MAIN-ARGC-ARGV): program-entry argc/argv materialization. AAPCS64 Linux mirrors the SysV stack-vector layout — at the process entry point argc (a machine word) sits at [sp+0] and the NULL-terminated argv pointer vector lives IN PLACE starting at [sp+8] (envp follows argv's NULL; not materialized — the c-subset entry signature is (int, char**)). The trampoline emits `LDUR x0, [sp,#0]` (argc → argGprs[0]) + `ADD x1, sp, #8` (the vector's ADDRESS → argGprs[1], via the target's frame-relative `lea` form) BEFORE any SP adjustment and before `BL main`. A main(void) simply ignores the two registers (C-legal) — signature-independent setup. Destination registers come from entryCallingConvention.argGprs[0..1] — never declared here (single source of truth).",
+  "processArgs": {
+    "mechanism": "stack-vector",
+    "argcStackOffset": 0,
+    "argvStackOffset": 8
+  },
 
   "elf": {
     "$comment": "Elf64_Ehdr identity for an executable. type = ET_EXEC (2). class = ELFCLASS64; data = ELFDATA2LSB; osabi = sysv; machine = EM_AARCH64 (183). pageAlign = 4096 — most ARM64 Linux distributions ship with 4 KB pages. Apple Silicon (16 KB) and high-end ARM64 server configs (64 KB) declare their own values in their respective schemas; the same kernel PT_LOAD congruence rule (`p_vaddr % p_align == p_offset % p_align`) applies uniformly.",

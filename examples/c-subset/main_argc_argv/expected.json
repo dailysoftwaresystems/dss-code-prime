@@ -1,0 +1,15 @@
+{
+  "$comment": "c88 (D-RUNTIME-MAIN-ARGC-ARGV): the program-entry argc/argv RUN witness. The shipped elf64-*-linux-exec formats declare `processArgs` = stack-vector (SysV AMD64 psABI 3.4.1 / AAPCS64 Linux: argc at [sp+0], the in-place NULL-terminated argv vector at sp+8), so the entry trampoline loads argc into argGprs[0] and LEAs the vector's address into argGprs[1] BEFORE calling main. The runner spawns with no extra args -> main must see argc==1 + a non-empty argv[0] (the program path) + argv[1]==NULL -> exit 42; each failed layer exits a distinct 90..94 (see main.c). The pe64 leg RUNS as of c111 (D-RUNTIME-PE-MAIN-ARGS): the Windows OS entry receives NO C argument vector, so a MIR-tier synthesized pre-main init (synthesizePeStartup) calls the msvcrt out-parameter export (__getmainargs for this narrow char** entry; __wgetmainargs for a wide wmain) to fetch argc/argv and forwards them to main -> the SAME main.c must see argc==1 + a non-empty argv[0] (the program path) + argv[1]==NULL -> exit 42 on Windows too, exercising the CRT out-parameter arm end-to-end. RED-on-disable: remove `processArgs` from the pe64 (or either ELF) shipped exec JSON (runtime-read config) -> that leg reads garbage entry-register argc -> exit 90 instead of 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

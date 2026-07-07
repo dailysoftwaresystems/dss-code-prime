@@ -890,41 +890,20 @@ namespace {
     return s;
 }
 
-// Median wall-clock of `runs` clean flat-chain parses at `additions` length.
-// Uses EXPECT_ (not ASSERT_) so the helper stays valid in a non-void context.
-[[nodiscard]] std::chrono::nanoseconds
-timeFlatChainParse(std::shared_ptr<GrammarSchema const> const& schema,
-                   std::size_t additions, int runs) {
-    std::vector<std::chrono::nanoseconds> samples;
-    for (int r = 0; r < runs; ++r) {
-        auto src = SourceBuffer::fromString(flatChainSource(additions), "<flat>");
-        Tokenizer tk{src, schema};
-        auto [stream, lexDiags] = std::move(tk).tokenize();
-        Parser p{src, schema, std::move(stream)};
-        const auto t0 = std::chrono::steady_clock::now();
-        auto result = std::move(p).parse();
-        const auto t1 = std::chrono::steady_clock::now();
-        EXPECT_FALSE(result.tree.diagnostics().hasErrors())
-            << "flat chain of " << additions << " additions must parse clean";
-        samples.push_back(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0));
-    }
-    std::ranges::sort(samples);
-    // Return the MINIMUM, not the median: scheduler/allocator noise (a context
-    // switch, a page fault, a loaded shared CI runner) can only ADD time, so the
-    // fastest run is the least-perturbed estimate of the true algorithmic cost.
-    // The median still folds in slow runs — that is what flaked the wall-clock
-    // ratio on the shared gcc-release CI runners (a sub-ms baseline made any
-    // jitter dominate). min is the standard benchmark statistic for exactly this.
-    return samples.front();
-}
-
-// Node count of a single clean flat-chain parse (deterministic — one parse,
-// no timing). Used to pin the O(N)-STRUCTURE half of the linearity claim
-// independently of any wall-clock measurement.
-[[nodiscard]] std::uint32_t
-flatChainNodeCount(std::shared_ptr<GrammarSchema const> const& schema,
-                   std::size_t additions) {
+// One clean flat-chain parse; returns (nodeCount, tokenAccessCount) — the two
+// DETERMINISTIC metrics the linearity pin uses. No timing: a wall-clock ratio of
+// sub-ms parses flaked on shared gcc-release CI runners (a contention spike on the
+// tiny baseline dominated even min-of-9). `tokenAccessCount` is the total token-
+// stream work (peek + advance, incl. every speculative re-scan): O(N) for a
+// correct parse, super-linear for a backtracking blowup — the exact quantity the
+// old wall-clock ratio was a noisy proxy for, now measured exactly.
+struct FlatChainMetrics {
+    std::uint32_t nodeCount;
+    std::uint64_t tokenAccessCount;
+};
+[[nodiscard]] FlatChainMetrics
+flatChainParseMetrics(std::shared_ptr<GrammarSchema const> const& schema,
+                      std::size_t additions) {
     auto src = SourceBuffer::fromString(flatChainSource(additions), "<flat>");
     Tokenizer tk{src, schema};
     auto [stream, lexDiags] = std::move(tk).tokenize();
@@ -932,49 +911,54 @@ flatChainNodeCount(std::shared_ptr<GrammarSchema const> const& schema,
     auto result = std::move(p).parse();
     EXPECT_FALSE(result.tree.diagnostics().hasErrors())
         << "flat chain of " << additions << " additions must parse clean";
-    return result.tree.nodeCount();
+    return {static_cast<std::uint32_t>(result.tree.nodeCount()),
+            result.tokenAccessCount};
 }
 
 } // namespace
 
+// c108 (D-PARSE-FLAT-CHAIN-WORK-LINEAR): the flat left-assoc chain
+// `0+0+…+0` must parse in LINEAR total work. Pinned by TWO deterministic,
+// zero-flake first-difference tests over equally-spaced lengths (500/1000/1500,
+// spacing 500) — a linear quantity has a CONSTANT first difference; a super-
+// linear one does not. Grammar-agnostic (no magic per-element constant):
+//   (1) NODE count — the O(N) STRUCTURE (the tree the parse emits);
+//   (2) token ACCESS count — the O(N) total WORK (peek+advance, incl. every
+//       speculative re-scan). A backtracking O(N²) (the D-PARSE-SPECULATION-
+//       OPERAND-QUADRATIC class) re-consumes a growing prefix → the access
+//       first difference would GROW; a per-node rescan that emits no extra
+//       nodes (a time-only O(N²) the node pin misses) also shows here.
+// This REPLACES a wall-clock ratio pin that flaked on shared CI at a sub-ms
+// baseline: work-count is exact, so the guard is deterministic AND strictly
+// stronger (it catches the same O(N²) classes without measuring time). The
+// deep-nest residual (an N-deep HOST-recursion memory-hierarchy constant
+// factor, moot under the depth cap) is the separate, still-open
+// D-PARSE-DEEP-NEST-RECURSION-MEMORY.
 TEST(ParserSpeculation, FlatChainParseWorkIsLinear) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(loaded.has_value());
     auto schema = *loaded;
 
-    constexpr int kRuns = 9;  // MIN-of-9: more samples → a better shot at one
-                              // uninterrupted run on a loaded shared CI runner
-    (void)timeFlatChainParse(schema, 100, 1);  // warm allocator/caches
-    const auto t500  = timeFlatChainParse(schema, 500,  kRuns);
-    const auto t2000 = timeFlatChainParse(schema, 2000, kRuns);
+    const auto m500  = flatChainParseMetrics(schema, 500);
+    const auto m1000 = flatChainParseMetrics(schema, 1000);
+    const auto m1500 = flatChainParseMetrics(schema, 1500);
 
-    // Quadrupling the chain length must scale ~4× (linear), not ~16× (O(N²)).
-    // A floor on the denominator avoids divide-by-noise on a fast baseline.
-    const double small =
-        std::max<double>(static_cast<double>(t500.count()), 1.0);
-    const double ratio = static_cast<double>(t2000.count()) / small;
-    EXPECT_LT(ratio, 8.0)
-        << "flat-chain parse scaled " << ratio << "× when the chain length "
-           "quadrupled (500→2000); linear is ~4×. A ratio approaching 16× "
-           "signals an O(N²) regression in the SHARED TreeBuilder / node-arena "
-           "/ schema-walker machinery (the deep-nest residual is a separate "
-           "memory-hierarchy effect -- D-PARSE-DEEP-NEST-RECURSION-MEMORY). "
-           "t500=" << (static_cast<double>(t500.count()) / 1e6) << "ms t2000="
-        << (static_cast<double>(t2000.count()) / 1e6) << "ms";
-
-    // O(N)-STRUCTURE pin (zero-flake complement to the timing guard above):
-    // the parse node count grows by a CONSTANT per added `+0` element, so its
-    // FIRST DIFFERENCE over equally-spaced lengths is constant ⇒ exactly
-    // linear. Using 500/1000/1500 (spacing 500) keeps this grammar-agnostic —
-    // no magic per-element constant. A super-linear NODE emission (structural
-    // O(N²), distinct from a time-only O(N²) the ratio above catches) would
-    // make the second difference non-zero.
-    const std::uint32_t n500  = flatChainNodeCount(schema, 500);
-    const std::uint32_t n1000 = flatChainNodeCount(schema, 1000);
-    const std::uint32_t n1500 = flatChainNodeCount(schema, 1500);
-    EXPECT_EQ(n1000 - n500, n1500 - n1000)
+    // (1) O(N) STRUCTURE — constant node-count first difference.
+    EXPECT_EQ(m1000.nodeCount - m500.nodeCount,
+              m1500.nodeCount - m1000.nodeCount)
         << "flat-chain node count must grow by a constant per element (linear "
            "first difference); a non-constant difference signals super-linear "
-           "node emission. n500=" << n500 << " n1000=" << n1000
-        << " n1500=" << n1500;
+           "node emission. n500=" << m500.nodeCount
+        << " n1000=" << m1000.nodeCount << " n1500=" << m1500.nodeCount;
+
+    // (2) O(N) WORK — constant token-access first difference. A speculative-
+    // backtracking O(N²) would re-scan a growing prefix and break this.
+    EXPECT_EQ(m1000.tokenAccessCount - m500.tokenAccessCount,
+              m1500.tokenAccessCount - m1000.tokenAccessCount)
+        << "flat-chain token-access count must grow by a constant per element "
+           "(linear total parse work); a non-constant first difference signals "
+           "a super-linear re-scan (speculative backtracking O(N²)). "
+           "a500=" << m500.tokenAccessCount
+        << " a1000=" << m1000.tokenAccessCount
+        << " a1500=" << m1500.tokenAccessCount;
 }

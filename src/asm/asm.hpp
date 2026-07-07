@@ -19,6 +19,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // Assembler — plan 13 AS1.
@@ -114,6 +115,56 @@ struct DSS_EXPORT SyntheticBlockSymbol {
     std::uint32_t blockByteOffset = 0; // offset of the target block within THIS fn's bytes
 };
 
+// c114 (D-WIN64-PDATA-XDATA-UNWIND): a FORMAT-NEUTRAL projection of a
+// function's frame prologue — just enough for an unwind-table emitter to
+// describe the frame WITHOUT depending on `lir/` (AssembledFunction has
+// zero lir/ coupling by design). Populated by the compile pipeline from
+// the callconv pass's `FrameLayout`; consumed today ONLY by the pe64
+// writer's `.pdata`/`.xdata` builder, but the data is generic (ELF
+// `.eh_frame` / Mach-O compact-unwind are legitimate future consumers).
+//
+// The canonical DSS x86_64 prologue is `sub rsp, totalFrameSize` (or, for
+// `totalFrameSize > stackProbePageBytes`, the inline page-probe loop) then
+// one `mov [rsp + saveOffset], reg` per USED callee-saved register — no
+// push, no frame pointer. `savedRegs` is in emission (ascending-offset)
+// order; each entry carries the platform register number + class so the
+// emitter can pick UWOP_SAVE_NONVOL (GPR) vs UWOP_SAVE_XMM128 (FPR).
+struct DSS_EXPORT FrameSavedReg {
+    std::uint16_t regEncoding = 0;   // the register's platform ordinal (x64: rax=0..r15=15; xmm N = N)
+    bool          isFpr       = false;  // FPR/vector class ⇒ 16-byte XMM save, else 8-byte GPR
+    std::uint32_t saveOffset  = 0;   // byte offset from post-prologue RSP where the reg is stored
+};
+// c116 (D-WIN64-SEH-FUNCLETS): one MSVC-x64 SEH scope,
+// as byte offsets WITHIN the owning (parent) function's `bytes` + the SymbolIds
+// the pe writer resolves to image-RVAs at link time. Produced by the compile
+// pipeline from the LIR `SehScopeDescriptor` (which carries LIR block ids) by
+// translating each block id to its byte offset via the parent AssembledFunction's
+// `blockByteOffsets` map (the c70 jump-table binding pattern). Consumed ONLY by
+// the pe64 writer's `.xdata` scope-table emitter (the __C_specific_handler scope
+// table + UNW_FLAG_EHANDLER — format-specific, so it lives entirely in pe.cpp;
+// this struct is format-neutral position data). The guarded PC range is
+// `[beginByteOffset, endByteOffset)`; a fault in it dispatches to the filter
+// funclet (`filterFuncletSymbol`), and on EXECUTE_HANDLER the OS resumes at
+// `jumpTargetByteOffset` (the `__except` body, in the parent frame).
+struct DSS_EXPORT SehScopeEntry {
+    std::uint32_t beginByteOffset      = 0;  // start of the guarded body (within parent bytes)
+    std::uint32_t endByteOffset        = 0;  // one-past the guarded body (half-open range)
+    std::uint32_t jumpTargetByteOffset = 0;  // the __except handler block (within parent bytes)
+    SymbolId      filterFuncletSymbol{};     // the synthesized filter-funclet function symbol
+    SymbolId      personalitySymbol{};       // __C_specific_handler extern (its thunk RVA = the UNWIND handler field)
+};
+struct DSS_EXPORT FrameUnwindInfo {
+    std::uint32_t              totalFrameSize = 0;  // bytes the prologue subtracts from RSP
+    bool                       usesStackProbe = false;  // frame > cc.stackProbePageBytes ⇒ the inline probe loop
+    std::uint32_t              stackProbePageBytes = 0; // the cc's guard-page size (probe stride); 0 = no probing
+    std::vector<FrameSavedReg> savedRegs;           // callee-saved regs stored in the prologue, ascending saveOffset
+    // c116 (D-WIN64-SEH-FUNCLETS): the SEH scopes this function guards. Empty for
+    // every function without a `__try` (the overwhelming majority). Non-empty ⇒
+    // the pe writer sets UNW_FLAG_EHANDLER + appends the __C_specific_handler
+    // scope table to this function's UNWIND_INFO.
+    std::vector<SehScopeEntry> sehScopes;
+};
+
 // One assembled function — bytes + symbol-relative metadata. `symbol`
 // is sourced from the originating `lir.funcSymbol(fn)` so the linker
 // can place this function's bytes in its object-file symbol table
@@ -123,6 +174,12 @@ struct DSS_EXPORT AssembledFunction {
     std::vector<std::uint8_t>   bytes;
     std::vector<Relocation>     relocations;
     std::vector<SourceMapEntry> sourceMap;
+    // c114 (D-WIN64-PDATA-XDATA-UNWIND): the frame prologue projection an
+    // unwind-table emitter needs (see FrameUnwindInfo). nullopt when the
+    // pipeline did not attach it (object-file `.obj` path, or a producer
+    // that skips frame layout) — the pe64 exec writer then emits no
+    // unwind entry for this function (a leaf/frameless entry).
+    std::optional<FrameUnwindInfo> unwind;
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols this
     // function's block-address `lea`s reference, each paired with the
     // target block's byte offset within `bytes`. The encoder records a
@@ -134,6 +191,24 @@ struct DSS_EXPORT AssembledFunction {
     // `link/format/interior_block_symbol_va.hpp`). Empty for every
     // function that takes no block address.
     std::vector<SyntheticBlockSymbol> blockSymbols;
+
+    // D-OPT-SWITCH-JUMP-TABLE (c70): this function's block-byte-offset table —
+    // each LirBlockId.v mapped to its byte offset within `bytes`. Populated by
+    // `assemble()` from the SAME `blockOffsets` map it builds for intra-function
+    // branch patching. A dense `switch` lowers to an O(1) jump table whose
+    // rodata-style `.data` slots hold the runtime addresses of the case-target
+    // blocks (via abs64 relocations to synthetic per-block symbols). Those block
+    // symbols have NO live block-address `lea` instruction (the table is one
+    // indexed load, not a `lea` per target), so the usual `BlockSymPatch` →
+    // `blockSymbols` binding never fires for them. `compile_pipeline.cpp` instead
+    // binds each jump-table target block's symbol directly from THIS map (the
+    // byte offset the linker needs to compute the interior-block VA) and appends
+    // the resulting `SyntheticBlockSymbol` to `blockSymbols` above. Empty for
+    // every function that contains no jump table (this map is populated
+    // unconditionally but only consumed when a jump-table descriptor names this
+    // function — a per-function map copy done once at assemble time, never per
+    // instruction).
+    std::unordered_map<std::uint32_t, std::uint32_t> blockByteOffsets;
 };
 
 // One assembled data item — bytes + symbol identity, destined for a

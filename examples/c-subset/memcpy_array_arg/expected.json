@@ -1,0 +1,34 @@
+{
+  "$comment": "c50 (D-CSUBSET-ARRAY-DECAY-TO-VOID-PTR): an ARRAY or string literal passed to a void* parameter (memcpy/memset dst/src) decays to a pointer-to-element (C 6.3.2.1p3) then converts to void* (C 6.3.2.3p1). Frontier: sqlite sqlite3VXPrintf `memcpy(buf, \"-Inf\", 5)` (buf is char[N]) -> S0003 on both buf (array) and \"-Inf\" (string literal). ROOT: the isAssignable array-decay arm (type_rules.hpp) only admitted Array<T>->Ptr<T> (same element); Array<char>->Ptr<void> fell through, and the Ptr->void arm never fired (rhs is Array not Ptr) -> so char*/u8* pointer args passed but bare ARRAY names + string literals failed. FIX (NOT §B; one disjunct per tier reusing the existing implicitToVoidPtr flag): semantic isAssignable + HIR coerce both admit Array->Ptr<void> + emit the synthetic Array->Ptr Cast (MIR re-types by the void* target, element-agnostic; NO MIR/verifier change). a[8]: memset(a,0,8) then memcpy(a,\"xyz\",4) -> a={'x','y','z',0,...} -> exit 42. RED-ON-DISABLE: revert either arm -> memcpy(a,\"xyz\",4) -> S0003. memcpy/memset link against real libc on all legs (as ffi_memcpy proves). Scope: clears the array/string-literal->void* family (buf, \"-Inf\", \"unistr('\", probably x); the function-designator chacha20_init->void* is a SEPARATE frontier (FnSig->Ptr<void>).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

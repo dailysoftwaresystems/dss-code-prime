@@ -1074,6 +1074,35 @@ void buildPositionTables(GrammarSchemaData& data, json const& shapesJson,
                           "{rule, polarity} object");
             }
         }
+
+        // `commitAfterPrefix` (PEG cut; D-CSUBSET-LABEL-BUDGET-CLIFF, p19
+        // Cluster G c31): a boolean flag on the shape body. When true, a
+        // speculative probe of this rule commits the instant its fixed
+        // leading token-prefix is consumed without failure (see
+        // CompiledRule::commitAfterPrefix). Sibling facet to
+        // `commitRequiresTypeName` — a rule may carry at most ONE (both
+        // would contend for the same probe's commit decision); reject the
+        // overlap loud. Must be a boolean if present (mirror the loader's
+        // other type-checks); absent ⇒ false.
+        if (body.is_object() && body.contains("commitAfterPrefix")) {
+            json const& flag = body.at("commitAfterPrefix");
+            const auto flagPath =
+                std::format("{}/commitAfterPrefix", shapePath);
+            if (!flag.is_boolean()) {
+                coll.emit(DiagnosticCode::C_UnknownShape, flagPath,
+                          "'commitAfterPrefix' must be a boolean");
+            } else if (flag.get<bool>()) {
+                if (rule.typeNameCommitRule.valid()) {
+                    coll.emit(DiagnosticCode::C_UnknownShape, flagPath,
+                              "'commitAfterPrefix' and "
+                              "'commitRequiresTypeName' are mutually exclusive "
+                              "on a single shape — both govern the same "
+                              "speculative probe's commit decision");
+                } else {
+                    rule.commitAfterPrefix = true;
+                }
+            }
+        }
     }
 }
 
@@ -3913,6 +3942,121 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                             pm.value = e.at("value").get<std::string>();
                         }
+                        // c105 (D-PP-FUNCTION-LIKE-PREDEFINE): OPTIONAL `params`
+                        // — a FUNCTION-LIKE predefine (e.g. the MSVC-profile
+                        // `__declspec(x)` → empty erase). Constant-kind only
+                        // (the derived kinds are inherently object-like). Each
+                        // param must be a non-empty unique string (C 6.10.3p6
+                        // duplicate-param parity with the directive handler,
+                        // enforced HERE so a config typo fails at load).
+                        if (e.contains("params")) {
+                            if (!isConstant) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          mpath + "/params",
+                                          "'params' is valid only on a 'constant' "
+                                          "predefinedMacros entry");
+                                continue;
+                            }
+                            json const& prs = e.at("params");
+                            if (!prs.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          mpath + "/params",
+                                          "'predefinedMacros.params' must be an "
+                                          "array of parameter-name strings");
+                                continue;
+                            }
+                            bool prOk = true;
+                            for (std::size_t pi = 0; pi < prs.size(); ++pi) {
+                                if (!prs[pi].is_string()
+                                    || prs[pi].get<std::string>().empty()) {
+                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                              mpath + "/params",
+                                              "each 'params' entry must be a "
+                                              "non-empty string");
+                                    prOk = false;
+                                    break;
+                                }
+                                std::string p = prs[pi].get<std::string>();
+                                // c105 audit L2: each param must BE an
+                                // identifier ([A-Za-z_][A-Za-z0-9_]*) — a
+                                // config `"a b"` would otherwise emit a
+                                // malformed prologue #define that fails only
+                                // at first preprocess, not at load.
+                                bool idOk = !(p[0] >= '0' && p[0] <= '9');
+                                for (char const c : p) {
+                                    if (!((c >= 'A' && c <= 'Z')
+                                          || (c >= 'a' && c <= 'z')
+                                          || (c >= '0' && c <= '9')
+                                          || c == '_')) {
+                                        idOk = false;
+                                        break;
+                                    }
+                                }
+                                if (!idOk) {
+                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                              mpath + "/params",
+                                              std::format("macro parameter '{}' "
+                                                          "is not an identifier",
+                                                          p));
+                                    prOk = false;
+                                    break;
+                                }
+                                if (std::find(pm.params.begin(), pm.params.end(),
+                                              p) != pm.params.end()) {
+                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                              mpath + "/params",
+                                              std::format("duplicate macro "
+                                                          "parameter '{}'", p));
+                                    prOk = false;
+                                    break;
+                                }
+                                pm.params.push_back(std::move(p));
+                            }
+                            if (!prOk) continue;
+                            pm.isFunctionLike = true;
+                        }
+                        // OPTIONAL `availableObjectFormats` — a per-format
+                        // availability filter (mirrors the shipped-lib
+                        // descriptor field). Absent ⇒ available on every format.
+                        // Present: an array of object-format NAMES; each must be
+                        // a known name ("pe"/"elf"/"macho") or fail LOUD (never a
+                        // silent typo). Lets `_WIN32` be predefined pe-only.
+                        if (e.contains("availableObjectFormats")) {
+                            json const& afs = e.at("availableObjectFormats");
+                            if (!afs.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                          mpath + "/availableObjectFormats",
+                                          "'predefinedMacros.availableObjectFormats'"
+                                          " must be an array of object-format names,"
+                                          " e.g. [\"pe\"]");
+                                continue;
+                            }
+                            bool afOk = true;
+                            for (std::size_t ai = 0; ai < afs.size(); ++ai) {
+                                json const& av = afs[ai];
+                                if (!av.is_string()) {
+                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                              mpath + "/availableObjectFormats",
+                                              "'availableObjectFormats' entries must "
+                                              "be strings");
+                                    afOk = false;
+                                    break;
+                                }
+                                std::string fmt = av.get<std::string>();
+                                if (!objectFormatKindFromName(fmt).has_value()) {
+                                    coll.emit(DiagnosticCode::C_InvalidPreprocess,
+                                              mpath + "/availableObjectFormats",
+                                              std::format("unknown object-format name"
+                                                          " '{}' (expected "
+                                                          "\"pe\"/\"elf\"/\"macho\")",
+                                                          fmt));
+                                    afOk = false;
+                                    break;
+                                }
+                                pm.availableObjectFormats.push_back(std::move(fmt));
+                            }
+                            if (!afOk) continue;
+                        }
                         cfg.predefinedMacros.push_back(std::move(pm));
                     }
                 }
@@ -4250,7 +4394,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.declarators' must be an object of "
                               "declarator role names");
                 } else {
-                    static constexpr std::array<std::string_view, 14>
+                    static constexpr std::array<std::string_view, 16>
                         kDeclaratorKeys{
                             "declaratorRule",     "pointerLayerRule",
                             "pointerToken",       "directRule",
@@ -4261,9 +4405,15 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): the OPTIONAL
                             // struct/union member-declarator + member-list roles.
                             "memberDeclaratorRule", "memberListRule",
+                            // c26 (D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME): the OPTIONAL
+                            // abstract direct-declarator role (type-name position).
+                            "directAbstractRule",
                             // FC12a-core (D-FC12A-VARIADIC-CALLEE): declarator-level
                             // `...` marker for variadic function definitions / fn-ptr types.
-                            "variadicMarker"};
+                            "variadicMarker",
+                            // c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): the OPTIONAL param-list
+                            // rule that opens a per-declarator function-prototype scope.
+                            "prototypeParamScopeRule"};
                     bool dOk = true;
                     for (auto it = dj.begin(); it != dj.end(); ++it) {
                         bool known = false;
@@ -4408,6 +4558,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                          dc.memberDeclaratorRuleName);
                     readOptionalRuleRole("memberListRule", dc.memberListRule,
                                          dc.memberListRuleName);
+                    // c26 (D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME): the OPTIONAL
+                    // abstract direct-declarator role — same optional-role
+                    // discipline (absent ⇒ no abstract type-name declarator).
+                    readOptionalRuleRole("directAbstractRule",
+                                         dc.directAbstractRule,
+                                         dc.directAbstractRuleName);
+                    // c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): the OPTIONAL param-list
+                    // rule that opens a per-declarator function-prototype scope —
+                    // same optional-role discipline (absent ⇒ params bind into the
+                    // enclosing scope, the prior behavior).
+                    readOptionalRuleRole("prototypeParamScopeRule",
+                                         dc.prototypeParamScopeRule,
+                                         dc.prototypeParamScopeRuleName);
                     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the declarator-level
                     // `...` marker, so the SHARED suffix resolver builds a variadic
                     // FnSig for function DEFINITIONS + fn-pointer types (the legacy
@@ -4989,6 +5152,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT (C 6.7.6.3p7):
+                        // optional `arrayToPointer` — when true, a declarator
+                        // whose resolved type is an array (sized or unsized)
+                        // adjusts to a pointer to its element type. Set on
+                        // declaration forms with C parameter semantics.
+                        if (entry.contains("arrayToPointer")) {
+                            json const& ap = entry.at("arrayToPointer");
+                            if (!ap.is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/arrayToPointer",
+                                          "'arrayToPointer' must be a boolean");
+                            } else {
+                                rule.arrayToPointer = ap.get<bool>();
+                            }
+                        }
+
                         // D5.1: optional `fieldChildren` descriptor — declares
                         // this declaration as a composite-type introducer.
                         //   "fieldChildren": { "rule": "structField" }
@@ -5073,6 +5252,36 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: optional
+                        // `definesWhenChild` — names a CHILD RULE whose PRESENCE
+                        // (as a visible child of the matched node) makes this row
+                        // a DEFINITION; when absent the node is a pure reference
+                        // (resolved by a paired `references[]` row on the same
+                        // rule). Lets ONE grammar rule serve both C's
+                        // type-definition and tag-reference forms. The paired
+                        // reference-row requirement is cross-validated below (after
+                        // references load). Here: the named child rule must exist.
+                        if (entry.contains("definesWhenChild")) {
+                            if (!entry.at("definesWhenChild").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/definesWhenChild",
+                                          "'definesWhenChild' must be a child-rule-name "
+                                          "string");
+                            } else {
+                                auto const cn =
+                                    entry.at("definesWhenChild").get<std::string>();
+                                if (!data.rules->contains(cn)) {
+                                    coll.emit(DiagnosticCode::C_UnknownShape,
+                                              path + "/definesWhenChild",
+                                              std::format("'definesWhenChild' references "
+                                                          "unknown shape '{}'", cn));
+                                } else {
+                                    rule.definesWhenChildRule = data.rules->find(cn);
+                                    rule.definesWhenChildRuleName = cn;
+                                }
+                            }
+                        }
+
                         // D8: optional `warnIfUnused` flag (default false).
                         // A non-bool value is the same C_InvalidSemantics
                         // discipline used for other declaration sub-fields.
@@ -5100,6 +5309,23 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             } else {
                                 rule.nonDefiningDeclaration =
                                     entry.at("nonDefiningDeclaration").get<bool>();
+                            }
+                        }
+
+                        // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): optional
+                        // `prototypeSynthesizesExtern` flag (default false). A
+                        // surviving bare function prototype minted by this
+                        // declaration synthesizes a no-library ExternFunction
+                        // (cross-TU resolvable at the LK11 merge; an unresolved
+                        // survivor fails loud at link as an undefined symbol).
+                        if (entry.contains("prototypeSynthesizesExtern")) {
+                            if (!entry.at("prototypeSynthesizesExtern").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/prototypeSynthesizesExtern",
+                                          "'prototypeSynthesizesExtern' must be a boolean");
+                            } else {
+                                rule.prototypeSynthesizesExtern =
+                                    entry.at("prototypeSynthesizesExtern").get<bool>();
                             }
                         }
 
@@ -5653,6 +5879,44 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     entry.at("isTagReference").get<bool>();
                             }
                         }
+                        // D-CSUBSET-FORWARD-STRUCT-DECLARATION (c35): the
+                        // composite KIND a tag reference names — drives the
+                        // forward-mint of an INCOMPLETE composite when an opaque
+                        // tag (`struct S *`, never defined) misses. Only honoured
+                        // on a tag-reference row (`isTagReference`); Struct/Union
+                        // mint, Enum keeps the fail-loud miss (value-typed, no
+                        // incomplete representation). Mirrors the
+                        // `fieldChildren.compositeKind` spelling so the two
+                        // composite-kind axes read identically.
+                        if (entry.contains("compositeKind")) {
+                            if (!entry.at("compositeKind").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/compositeKind",
+                                          "'compositeKind' must be a string "
+                                          "'struct', 'union' or 'enum'");
+                            } else if (!rule.isTagReference) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/compositeKind",
+                                          "'compositeKind' is only meaningful on a "
+                                          "tag-reference row ('isTagReference': true)");
+                            } else {
+                                auto const k =
+                                    entry.at("compositeKind").get<std::string>();
+                                if (k == "struct") {
+                                    rule.compositeKind = CompositeKind::Struct;
+                                } else if (k == "union") {
+                                    rule.compositeKind = CompositeKind::Union;
+                                } else if (k == "enum") {
+                                    rule.compositeKind = CompositeKind::Enum;
+                                } else {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/compositeKind",
+                                              std::format("'compositeKind' must be "
+                                                          "'struct', 'union' or 'enum' "
+                                                          "(got '{}')", k));
+                                }
+                            }
+                        }
                         cfg.references.push_back(std::move(rule));
                     }
                 }
@@ -5824,6 +6088,32 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                           "not in 'scopes' — fields must bind "
                                           "into the struct's own scope",
                                           d.ruleName));
+                }
+            }
+
+            // ── c25: cross-field validation for `definesWhenChild` ──
+            // A dual-mode declaration (a definition only when its body child is
+            // present) MUST have a paired `references[]` row for the SAME rule —
+            // otherwise a body-ABSENT occurrence (`struct S v;`) would resolve to
+            // nothing, silently. Validate after both declarations and references
+            // have loaded. (The named child rule's existence was checked at parse
+            // time above.)
+            for (std::size_t i = 0; i < cfg.declarations.size(); ++i) {
+                auto const& d = cfg.declarations[i];
+                if (!d.definesWhenChildRule.has_value()) continue;
+                const auto path = std::format("/semantics/declarations/{}", i);
+                bool hasRefRow = false;
+                for (auto const& r : cfg.references) {
+                    if (r.rule.v == d.rule.v) { hasRefRow = true; break; }
+                }
+                if (!hasRefRow) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              path + "/definesWhenChild",
+                              std::format("declaration '{}' is dual-mode "
+                                          "('definesWhenChild') but no 'references' "
+                                          "row exists for the same rule — a "
+                                          "body-absent occurrence would resolve to "
+                                          "nothing", d.ruleName));
                 }
             }
 
@@ -7221,6 +7511,58 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                       "'name' is required and must be a string");
                             continue;
                         }
+                        // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): a FULL type-text
+                        // `signature` (pointer-bearing params) is the ALTERNATIVE
+                        // to the scalar params/result axis — exactly one of the
+                        // two forms must be used (both = an ambiguous declaration;
+                        // fail loud rather than pick).
+                        if (entry.contains("signature")) {
+                            if (!entry.at("signature").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/signature",
+                                          "'signature' must be a string");
+                                continue;
+                            }
+                            if (entry.contains("params") || entry.contains("result")) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/signature",
+                                          "'signature' and 'params'/'result' are "
+                                          "mutually exclusive — declare one form");
+                                continue;
+                            }
+                            BuiltinFunctionMapping m;
+                            m.name          = entry.at("name").get<std::string>();
+                            m.signatureText = entry.at("signature").get<std::string>();
+                            if (entry.contains("variadic")) {
+                                if (!entry.at("variadic").is_boolean()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/variadic",
+                                              "'variadic' must be a boolean");
+                                    continue;
+                                }
+                                m.variadic = entry.at("variadic").get<bool>();
+                            }
+                            if (entry.contains("lowering")) {
+                                if (!entry.at("lowering").is_string()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/lowering",
+                                              "'lowering' must be a string");
+                                    continue;
+                                }
+                                auto const lw = builtinLoweringFromName(
+                                    entry.at("lowering").get<std::string>());
+                                if (!lw) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/lowering",
+                                              std::format("unknown builtin lowering '{}'",
+                                                          entry.at("lowering").get<std::string>()));
+                                    continue;
+                                }
+                                m.lowering = *lw;
+                            }
+                            cfg.builtinFunctions.push_back(std::move(m));
+                            continue;
+                        }
                         if (!entry.contains("result") || !entry.at("result").is_string()) {
                             coll.emit(DiagnosticCode::C_MissingField, path + "/result",
                                       "'result' is required and must be a string");
@@ -7273,6 +7615,28 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 continue;
                             }
                             m.variadic = entry.at("variadic").get<bool>();
+                        }
+                        // c103 (D-CSUBSET-INTRINSIC-UMULH): OPTIONAL `lowering`
+                        // names a compiler intrinsic this builtin lowers to (a
+                        // target instruction) instead of an ordinary call. A
+                        // present-but-unknown name is rejected (fail loud).
+                        if (entry.contains("lowering")) {
+                            if (!entry.at("lowering").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/lowering",
+                                          "'lowering' must be a string");
+                                continue;
+                            }
+                            auto const lw = builtinLoweringFromName(
+                                entry.at("lowering").get<std::string>());
+                            if (!lw) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/lowering",
+                                          std::format("unknown builtin lowering '{}'",
+                                                      entry.at("lowering").get<std::string>()));
+                                continue;
+                            }
+                            m.lowering = *lw;
                         }
                         cfg.builtinFunctions.push_back(std::move(m));
                     }
@@ -7722,6 +8086,32 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     cfg.intSameSignednessNarrows = v.get<bool>();
                 }
             }
+            // C 6.3.1.4/6.3.1.5/6.5.16.1 int→float implicit assignment conversion
+            // (`double d = anInt`, read by `isAssignable`'s int→float arm). Opt-in
+            // (default false → a non-C schema keeps int and float strictly distinct).
+            if (sem.contains("intConvertsToFloat")) {
+                auto const& v = sem.at("intConvertsToFloat");
+                if (!v.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/intConvertsToFloat",
+                              "'intConvertsToFloat' must be a boolean");
+                } else {
+                    cfg.intConvertsToFloat = v.get<bool>();
+                }
+            }
+            // C 6.3.1.4/6.3.1.5/6.5.16.1 float→int implicit assignment conversion
+            // (`int n = aDouble`, read by `isAssignable`'s float→int arm). Opt-in
+            // (default false → a non-C schema keeps int and float strictly distinct).
+            if (sem.contains("floatConvertsToInt")) {
+                auto const& v = sem.at("floatConvertsToInt");
+                if (!v.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/floatConvertsToInt",
+                              "'floatConvertsToInt' must be a boolean");
+                } else {
+                    cfg.floatConvertsToInt = v.get<bool>();
+                }
+            }
 
             // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING (cycle 10d):
             // per-language `pointerAliasing` block. Single bool field
@@ -8152,6 +8542,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             if (hl.contains("caseStmtRule")) {   // D-CSUBSET-LABEL-BEFORE-CASE (optional)
                 (void)resolveRuleField(hl, "caseStmtRule", "/hirLowering",
                                        cfg.caseStmtRule, cfg.caseStmtRuleName);
+            }
+            if (hl.contains("sehExceptArmRule")) {   // c115 SEH (optional)
+                (void)resolveRuleField(hl, "sehExceptArmRule", "/hirLowering",
+                                       cfg.sehExceptArmRule, cfg.sehExceptArmRuleName);
+            }
+            if (hl.contains("sehFinallyArmRule")) {  // c115 SEH (optional)
+                (void)resolveRuleField(hl, "sehFinallyArmRule", "/hirLowering",
+                                       cfg.sehFinallyArmRule, cfg.sehFinallyArmRuleName);
             }
 
             // Char / string literal lowering blocks:

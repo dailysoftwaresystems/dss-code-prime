@@ -2,11 +2,13 @@
 
 #include "core/export.hpp"
 #include "core/types/diagnostic_reporter.hpp"
+#include "core/types/strong_ids.hpp"          // SymbolId (c116 SEH funclet-parent map)
 #include "core/types/target_schema.hpp"
 #include "lir/lir.hpp"
 #include "lir/lir_regalloc.hpp"
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 // LIR calling-convention lowering pass (ML7). Consumes a post-
@@ -186,6 +188,11 @@ struct DSS_EXPORT FrameLayout {
     std::uint32_t       vaRegSaveAreaSize = 0;
     std::uint32_t       slotSize          = 0;  // uniform per-class spill-slot width (bytes; = max(GPR width, FPR width))
     std::uint32_t       outgoingSlotSize  = 0;  // outgoing-arg slot width (bytes; = pointer width = GPR width)
+    // c114 (D-WIN64-PDATA-XDATA-UNWIND): the cc's guard-page stack-probe
+    // stride (bytes; 0 = no probing — Linux/macOS/arm64). A downstream
+    // unwind-info emitter reproduces the prologue's probe-vs-plain-sub
+    // decision from this + totalFrameSize (the same test emitPrologue uses).
+    std::uint32_t       stackProbePageBytes = 0;
     std::vector<LirReg> savedRegs;              // callee-saved phys regs actually used
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY: did this function contain at
     // least one call-shaped opcode (per `TargetOpcodeInfo::isCall`)
@@ -278,10 +285,26 @@ struct DSS_EXPORT LirCallconvResult {
     }
 };
 
+// c116 H1 (D-WIN64-SEH-FUNCLETS): one SEH filter-funclet ↔ its guarding parent
+// binding, by SymbolId. The funclet's `recover_parent_frame_slot` ops resolve their
+// slot offsets against the PARENT's FrameLayout, so callconv must know, for each
+// funclet function, which function is its parent. Derived from the `MirSehScope`
+// records (funclet + parent symbols) by the compile pipeline and passed to
+// `materializeCallingConvention`. Empty for every non-SEH module.
+struct DSS_EXPORT SehFuncletParent {
+    SymbolId funcletSymbol{};   // the synthesized filter funclet
+    SymbolId parentSymbol{};    // the function that guards the __try
+};
+
 [[nodiscard]] DSS_EXPORT LirCallconvResult
 materializeCallingConvention(Lir const&           src,
                              TargetSchema const&  schema,
                              LirAllocation const& alloc,
-                             DiagnosticReporter&  reporter);
+                             DiagnosticReporter&  reporter,
+                             // c116 H1 (D-WIN64-SEH-FUNCLETS): the funclet→parent
+                             // bindings so a funclet's `recover_parent_frame_slot`
+                             // ops resolve against the parent's finalized layout.
+                             // Empty for every non-SEH module (the default).
+                             std::span<SehFuncletParent const> sehFuncletParents = {});
 
 } // namespace dss

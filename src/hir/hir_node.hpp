@@ -50,8 +50,28 @@ enum class HirKind : std::uint16_t {
     //    unconditional transfer to a COMPUTED code address (child = the pointer
     //    expression); its MIR successors are every address-taken label block. ──
     GotoStmt, LabelStmt, IndirectGotoStmt,
+    // ── c115 (SEH arc 2/3, D-WIN64-SEH-FUNCLETS): MSVC `__try { … } __except
+    //    ( filter ) { … }`. Children = [tryBody Block, filterExpr, handlerBody
+    //    Block] — fixed arity 3. The filter evaluates DURING exception dispatch
+    //    (a c116 filter funclet); `_exception_code()`/`_exception_info()`
+    //    (BuiltinCall payloads SehExceptionCode/SehExceptionInfo) are legal only
+    //    in the filter (code also in the handler) — HirVerifier owns the context
+    //    rules (checkSehContext), incl. the option-(C) early-exit restriction
+    //    D-CSUBSET-SEH-EARLY-EXIT (no return / goto-out / break-out of the try
+    //    body until a real consumer fires the trigger). `__finally`/`__leave`
+    //    get NO HirKind — they fail loud at CST→HIR (D-CSUBSET-SEH-FINALLY /
+    //    D-CSUBSET-SEH-LEAVE, trigger-gated; sqlite ground truth: zero uses). ──
+    SehTryExcept,
     // ── Expressions ──
-    Literal, Ref, Call, IntrinsicCall, BinaryOp, UnaryOp, Cast, MemberAccess,
+    Literal, Ref, Call, IntrinsicCall,
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): a call to a builtin that lowers to a
+    // DEDICATED compiler intrinsic (a target instruction), NOT an ordinary Call or
+    // import. Mirrors IntrinsicCall — children = the arg expressions (no callee
+    // child); the node `payload` carries the `BuiltinLowering` enum value. CST→HIR
+    // emits it at the call arm (where the callee builtin's metadata is visible);
+    // HIR→MIR maps the payload onto the concrete MirOpcode (e.g. UMulH).
+    BuiltinCall,
+    BinaryOp, UnaryOp, Cast, MemberAccess,
     Index, Swizzle, ConstructAggregate, Ternary, LogicalAnd, LogicalOr,
     SizeOf, AddressOf, Deref, SeqExpr,
     // ── GNU label-address (D-CSUBSET-COMPUTED-GOTO): `&&label` yields a `void*`
@@ -112,7 +132,8 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
     switch (kind) {
         // ── Expressions (plan §2.2) ──
         case HirKind::Literal: case HirKind::Ref: case HirKind::Call:
-        case HirKind::IntrinsicCall: case HirKind::BinaryOp: case HirKind::UnaryOp:
+        case HirKind::IntrinsicCall: case HirKind::BuiltinCall:
+        case HirKind::BinaryOp: case HirKind::UnaryOp:
         case HirKind::Cast: case HirKind::MemberAccess: case HirKind::Index:
         case HirKind::Swizzle: case HirKind::ConstructAggregate: case HirKind::Ternary:
         case HirKind::LogicalAnd: case HirKind::LogicalOr: case HirKind::SizeOf:
@@ -143,6 +164,7 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
         case HirKind::SwitchStmt: case HirKind::CaseArm: case HirKind::BreakStmt:
         case HirKind::ContinueStmt: case HirKind::ReturnStmt: case HirKind::ExprStmt:
         case HirKind::GotoStmt: case HirKind::LabelStmt: case HirKind::IndirectGotoStmt:
+        case HirKind::SehTryExcept:
         case HirKind::AssignStmt: case HirKind::Unreachable:
         case HirKind::Error: case HirKind::Extension: case HirKind::Count_:
             return false;
@@ -191,9 +213,17 @@ inline constexpr std::uint32_t kForClauseMask = 0b111;  // all valid ForClause b
     return (m & 1u) + ((m >> 1) & 1u) + ((m >> 2) & 1u);
 }
 
-// `CaseArm` payload bit: set iff the arm is the `default:` arm (which has no
-// match-value child). A valued case arm carries its match value as child 0.
-inline constexpr std::uint32_t kCaseArmIsDefault = 1u << 0;
+// `CaseArm` is the DISPATCH ENTRY of a flattened switch (c60, Design I-A): it
+// carries the case's match VALUE (child 0, absent for `default:`) and the
+// per-function ordinal of the synthetic `LabelStmt` marker that `case`/`default`
+// lowers to in the switch BODY. The MIR dispatch (`addSwitch`) targets that
+// label-block by ordinal (the same label-block machinery `goto`/`label:` use).
+// Payload bit 0 = the `default:` flag; bits 1.. = the case-label ordinal (so a
+// default arm with ordinal 0 is distinguishable from a valued arm by the flag,
+// not the ordinal). The arm carries NO body — the body is a flat Block child of
+// the SwitchStmt, with case/default markers inline at any depth.
+inline constexpr std::uint32_t kCaseArmIsDefault   = 1u << 0;
+inline constexpr unsigned      kCaseArmOrdinalShift = 1;
 
 // ── Per-kind child-arity (HR3) — the single source of truth ──────────────────
 //
@@ -219,6 +249,7 @@ struct ChildArity {
             return {0, 0};
         case HirKind::Call:               return {1, kUnboundedArity};  // [callee, args...]
         case HirKind::IntrinsicCall:      return {0, kUnboundedArity};  // [args...]
+        case HirKind::BuiltinCall:        return {0, kUnboundedArity};  // c103: [args...]
         case HirKind::ConstructAggregate: return {0, kUnboundedArity};  // [fields...]
         case HirKind::UnaryOp: case HirKind::Cast: case HirKind::MemberAccess:
         case HirKind::Swizzle: case HirKind::SizeOf: case HirKind::AddressOf:
@@ -246,8 +277,12 @@ struct ChildArity {
         case HirKind::WhileStmt: case HirKind::DoWhileStmt: case HirKind::AssignStmt:
             return {2, 2};
         case HirKind::ForStmt:            return {1, 4};                // body + 0..3 clauses (+ mask check)
-        case HirKind::SwitchStmt:         return {1, kUnboundedArity};  // [discriminant, arms...]
-        case HirKind::CaseArm:            return {0, kUnboundedArity};  // [value?, stmts...] (+ default check)
+        // c60 (Design I-A): SwitchStmt = [discriminant, body Block, dispatch arms...]
+        // (≥2: a switch ALWAYS carries a body Block, even an empty one). CaseArm is
+        // a dispatch entry = [value?] — child 0 is the match value (absent ⇒ default),
+        // the label ordinal is in the payload; the arm carries no body.
+        case HirKind::SwitchStmt:         return {2, kUnboundedArity};  // [disc, body, arms...]
+        case HirKind::CaseArm:            return {0, 1};                // [value?] (+ default check)
         case HirKind::ExprStmt:           return {1, 1};
         case HirKind::ReturnStmt: case HirKind::VarDecl:
             return {0, 1};                                             // [value/init?]
@@ -258,6 +293,8 @@ struct ChildArity {
         case HirKind::LabelStmt:          return {1, 1};   // [labeledStmt]; label ordinal in payload
         // D-CSUBSET-COMPUTED-GOTO: `goto *expr;` — [addressExpr], the pointer to jump to.
         case HirKind::IndirectGotoStmt:   return {1, 1};
+        // c115 SEH: [tryBody Block, filterExpr, handlerBody Block] — fixed.
+        case HirKind::SehTryExcept:       return {3, 3};
         // ── Declarations (HR4) ──
         case HirKind::Function:      return {1, kUnboundedArity};  // [params…, body Block]
         case HirKind::ExternFunction: return {0, kUnboundedArity}; // [params…] (no body)

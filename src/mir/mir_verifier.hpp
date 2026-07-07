@@ -75,6 +75,13 @@ private:
     // `blockSuccessors`. Emits I_PhiPredNotInCfg.
     void checkPhiIncomings(DiagnosticReporter& reporter) const;
 
+    // c115 SEH (D-WIN64-SEH-FUNCLETS): the region-skeleton pairing rules —
+    // filter (SehTryBegin succ[1]) single-pred + SehFilterReturn-terminated
+    // with the matching region payload; handler single-pred; SehTryEnd payload
+    // names an existing region; SehExceptionCode/Info only in SEH functions.
+    // Emits I_SehStructure. Zero-cost when the module has no SehTryBegin.
+    void checkSehStructure(DiagnosticReporter& reporter) const;
+
     // SSA invariant: every value operand is defined in a block that
     // DOMINATES the use site (or in the same block, with the def
     // preceding the use). Computes dominator tree via Cooper-Harvey-

@@ -148,13 +148,67 @@ TEST(TypeRules, IsAssignableAdmitsSameSignednessNarrowingWhenGated) {
     EXPECT_FALSE(N(u16, i32)) << "same-sign gate does NOT admit I32->U16 (needs cross gate)";
 }
 
-// Int ↔ Float is NOT assignable.
+// Int ↔ Float is NOT assignable with the gates OFF (the default — a non-C schema).
+// This is the RED-ON-DISABLE reference for the gated-ON test below.
 TEST(TypeRules, IsAssignableRejectsIntFloatCross) {
     auto in  = makeInterner();
     auto i32 = in.primitive(TypeKind::I32);
     auto f64 = in.primitive(TypeKind::F64);
     EXPECT_FALSE(isAssignable(in, i32, f64));
     EXPECT_FALSE(isAssignable(in, f64, i32));
+}
+
+// D-CSUBSET-INT-FLOAT-CONVERSION: with `intConvertsToFloat` / `floatConvertsToInt`
+// ON (c-subset), the int↔float implicit ASSIGNMENT conversion is admitted in the
+// gated direction — `double d = 5;` (int→float), `int n = aDouble;` (float→int) —
+// C 6.3.1.4 / 6.3.1.5 / 6.5.16.1. The two gates are INDEPENDENT: each admits only
+// its own direction. coerce()'s arithmetic-core arm materializes the MIR
+// SIToFP/UIToFP (int→float) / FPToSI/FPToUI (float→int). RED-ON-DISABLE: the SAME
+// calls with both gates OFF (IsAssignableRejectsIntFloatCross above) REJECT.
+// SCOPE GUARD: the gates admit int↔float ONLY — a pointer/struct (rank 0 in every
+// helper) stays a loud mismatch, so `double d = ptr;` is NOT admitted.
+TEST(TypeRules, IsAssignableAdmitsIntFloatWhenGated) {
+    auto in  = makeInterner();
+    auto i32 = in.primitive(TypeKind::I32);
+    auto i64 = in.primitive(TypeKind::I64);
+    auto u32 = in.primitive(TypeKind::U32);
+    auto u64 = in.primitive(TypeKind::U64);
+    auto f32 = in.primitive(TypeKind::F32);
+    auto f64 = in.primitive(TypeKind::F64);
+    auto pi  = in.pointer(i32);   // int*
+    // intConvertsToFloat ON only (10th arg), floatConvertsToInt OFF (11th default).
+    auto const I2F = [&](TypeId l, TypeId r) {
+        return isAssignable(in, l, r, {}, /*boolWidensToArith=*/false,
+                            /*charConvertsToArith=*/false, /*enumConvertsToArith=*/false,
+                            /*intCrossSignednessConverts=*/false,
+                            /*intSameSignednessNarrows=*/false,
+                            /*intConvertsToFloat=*/true);
+    };
+    // floatConvertsToInt ON only (11th arg).
+    auto const F2I = [&](TypeId l, TypeId r) {
+        return isAssignable(in, l, r, {}, false, false, false, false, false,
+                            /*intConvertsToFloat=*/false,
+                            /*floatConvertsToInt=*/true);
+    };
+    // int → float (both signednesses, both float widths), the sqlite i64→f64 shape.
+    EXPECT_TRUE(I2F(f64, i64)) << "i64 -> f64 (the sqlite volatile-double-param shape)";
+    EXPECT_TRUE(I2F(f64, i32)) << "i32 -> f64";
+    EXPECT_TRUE(I2F(f32, i32)) << "i32 -> f32";
+    EXPECT_TRUE(I2F(f64, u64)) << "u64 -> f64";
+    EXPECT_TRUE(I2F(f32, u32)) << "u32 -> f32";
+    // The int→float gate does NOT admit the REVERSE (float→int) — that is the
+    // independent floatConvertsToInt gate (off here).
+    EXPECT_FALSE(I2F(i32, f64)) << "intConvertsToFloat does NOT admit f64 -> i32";
+    EXPECT_FALSE(I2F(i64, f64)) << "intConvertsToFloat does NOT admit f64 -> i64";
+    // float → int (both signednesses), via the independent gate.
+    EXPECT_TRUE(F2I(i32, f64)) << "f64 -> i32 (`int n = aDouble;`)";
+    EXPECT_TRUE(F2I(i64, f64)) << "f64 -> i64";
+    EXPECT_TRUE(F2I(u32, f32)) << "f32 -> u32";
+    // The float→int gate does NOT admit the reverse (int→float).
+    EXPECT_FALSE(F2I(f64, i32)) << "floatConvertsToInt does NOT admit i32 -> f64";
+    // SCOPE GUARD: neither gate admits a pointer ↔ float pair (rank 0 → no arm).
+    EXPECT_FALSE(I2F(f64, pi)) << "int->float gate does NOT admit int* -> f64";
+    EXPECT_FALSE(F2I(pi, f64)) << "float->int gate does NOT admit f64 -> int*";
 }
 
 // InvalidType passes through on either side (cascade suppression: a

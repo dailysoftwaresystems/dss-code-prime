@@ -1,0 +1,29 @@
+{
+  "$comment": "c98 (Windows-host sub-arc): the 3 shipped Microsoft-CRT header descriptors <io.h>/<direct.h>/<process.h> (io.json/direct.json/process.json — availableObjectFormats:[pe], library pe:msvcrt.dll), the exact trio behind the post-c96 sqlite 2-TU re-probe's 4x error[F001A] frontier (process.h in sqlite3.c's SQLITE_OS_WIN_THREADS block; io.h twice + direct.h in shell.c). The pe leg RUNS live msvcrt calls and DERIVES exit 42 entirely from their results: _getcwd buffer round-trip (+10/+10), _chdir(\".\") (+5), _access(\".\",0) (+5), _unlink of a never-created name failing cleanly (+4), and _beginthreadex spawning a real thread in sqlite3ThreadCreate's exact shape — fn-designator decays to unsigned(__stdcall*)(void*) with __stdcall erased (c95), uintptr_t(u64) result cast to void*, the proc exiting via a live _endthreadex(0) (+8). Every non-pe target takes the trivial #else branch (the guarded includes never resolve off-pe, matching the descriptors' pe-only availability) so one shared exitCode runs the manifest on every host with zero elf/macho/arm64 regression. RED-ON-DISABLE: removing any one of the three descriptor jsons turns the pe compile into that header's exact F001A (F_ShippedHeaderNotFound) — witnessed in the c98 scratchpad (red_on_disable.txt).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ]
+}

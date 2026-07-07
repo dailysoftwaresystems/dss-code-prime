@@ -1628,6 +1628,27 @@ struct DSS_EXPORT TargetEncodingVariant {
     // (validate() rejects it — there is no value to key on).
     std::optional<std::uint32_t>       immMin;
     std::optional<std::uint32_t>       immMax;
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: OPTIONAL negative-memoffset
+    // routing axis — the JSON key `guard.negMemoffset` (bool). FALSE (the
+    // default, every pre-existing variant) ⇒ the variant's magnitude axis
+    // reads a NON-NEGATIVE value-bearing operand; a NEGATIVE memoffset
+    // reports nullopt magnitude and matches NO bounded variant (unchanged).
+    // TRUE ⇒ the variant matches ONLY a NEGATIVE MemOffset, keyed by its
+    // ABSOLUTE VALUE |disp| against [immMin, immMax]. This is the third
+    // routing axis (alongside width + imm-range) that lets one opcode carry
+    // BOTH a positive base+disp variant (`ADD Xd,Xn,#disp`) AND a negative
+    // one (`SUB Xd,Xn,#|disp|`) with the SAME operandKinds — the matcher
+    // routes by the memoffset's SIGN, agnostically (any ISA whose base+disp
+    // encoding is unsigned-magnitude with separate add/subtract opcodes
+    // declares a negMemoffset sibling; the matcher reads the LIR operand's
+    // sign, never the arch). A target whose disp field is SIGNED (x86
+    // disp32) needs no negMemoffset variant at all — its match-any
+    // (no immMin/immMax, negMemoffset=false) slot swallows both signs.
+    // The encoder writes |disp| into the variant's (unsigned) imm12 /
+    // shifted-imm12 / MOVZ-MOVK slot; the subtract semantics live in the
+    // fixedWord (the SUB base). validate() rejects negMemoffset on a
+    // variant with no `memoffset` operand (no displacement to sign-route).
+    bool                               negMemoffset = false;
     TargetEncodingTemplate             tmpl;
     // Where the instruction's RESULT register goes (when the inst
     // has a result). Nullopt for value-less instructions (e.g.
@@ -1857,6 +1878,112 @@ struct DSS_EXPORT ProcessExit {
     // ByNameImport arm
     std::string importLibraryPath;
     std::string importMangledName;
+};
+
+// ── D-RUNTIME-MAIN-ARGC-ARGV (c88): program-entry argument setup ──
+//
+// `ArgsMechanism` (closed-enum, no `if (os == ...)` branches) — HOW
+// the OS/loader hands the C `argc`/`argv` pair to a fresh process,
+// so the entry trampoline can materialize them into the entry cc's
+// first two integer argument registers BEFORE calling the user
+// entry. Without this, `int main(int argc, char** argv)` reads
+// whatever garbage the arg registers hold at process entry (the
+// c76/c87-witnessed argc=846361312 class).
+//
+//   * `StackVector` — the kernel/loader places the argument vector
+//                     ON THE INITIAL STACK at the entry point (SysV
+//                     AMD64 psABI §3.4.1; AAPCS64 Linux mirrors it):
+//                     argc is a machine word at
+//                     [SP + argcStackOffset]; the NULL-terminated
+//                     in-place argv pointer vector STARTS at
+//                     [SP + argvStackOffset] — `argv` the VALUE is
+//                     that stack address itself (no copy exists
+//                     anywhere else). envp follows argv's NULL
+//                     terminator; it is NOT materialized (the
+//                     c-subset entry signature is
+//                     `(int, char**)` — envp is reachable via
+//                     libc `environ` for programs that need it).
+//   * `None`        — default-constructed sentinel. "No mechanism"
+//                     is encoded by `optional<ProcessArgs>` empty
+//                     (exactly the ProcessExit discipline); the
+//                     JSON loader rejects `mechanism="none"`.
+//
+// A Windows PE arm is DELIBERATELY absent (not a half-declared enum
+// slot): the OS entry point there receives NO C argument vector —
+// the CRT route is an out-parameter call
+// (`msvcrt!__getmainargs(&argc,&argv,&env,0,&startinfo)`) that needs
+// trampoline STACK LOCALS + a 5-argument import call, a genuinely
+// different mechanism anchored at D-RUNTIME-PE-MAIN-ARGS. Mach-O
+// needs NO mechanism at all: LC_MAIN entry is CALLED by dyld with
+// argc/argv/envp/apple already in the argument registers, which the
+// trampoline passes through untouched.
+enum class ArgsMechanism : std::uint8_t {
+    None        = 0,  // default-constructed zero; loader rejects "none"
+    StackVector = 1,  // argc + in-place argv vector on the entry stack
+    // c111 (D-RUNTIME-PE-MAIN-ARGS): the Windows CRT out-parameter route. The PE
+    // OS entry receives NO C argument vector — argc/argv are ASKED for via an
+    // msvcrt call `__wgetmainargs(&argc,&argv,&env,0,&startinfo)` (wide) /
+    // `__getmainargs` (narrow). This needs stack locals + a 5-arg call, so
+    // (USER §B decision) the pipeline SYNTHESIZES a pre-main init function in
+    // ordinary MIR that makes the call and forwards (argc, argv) to the user
+    // entry; the trampoline's own arg-setup is a NO-OP for this mechanism.
+    CrtOutParam = 2,  // msvcrt __wgetmainargs/__getmainargs, via a synth init fn
+};
+
+inline constexpr EnumNameTable<ArgsMechanism, 3> kArgsMechanismTable{{{
+    { ArgsMechanism::None,        "none"          },
+    { ArgsMechanism::StackVector, "stack-vector"  },
+    { ArgsMechanism::CrtOutParam, "crt-out-param" },
+}}};
+
+[[nodiscard]] constexpr std::string_view argsMechanismName(ArgsMechanism m) noexcept {
+    return kArgsMechanismTable.name(m);
+}
+[[nodiscard]] constexpr std::optional<ArgsMechanism>
+argsMechanismFromName(std::string_view s) noexcept {
+    return kArgsMechanismTable.fromName(s);
+}
+
+// Per-OS program-entry argument descriptor. Lives on
+// `ObjectFormatData` (loaded from the format JSON's `processArgs`
+// block). The trampoline emitter reads the active arm based on
+// `mechanism`:
+//
+// For StackVector (Linux ELF x86_64 + aarch64):
+//   * `argcStackOffset` — byte offset of the argc machine word from
+//                         the PROCESS-ENTRY stack pointer (0 on both
+//                         Linux ABIs). The offsets are defined
+//                         relative to the UNTOUCHED entry SP — the
+//                         trampoline materializes args BEFORE any
+//                         ABI-prologue SP adjustment.
+//   * `argvStackOffset` — byte offset of the FIRST argv slot from
+//                         the process-entry stack pointer (8 on both
+//                         LP64 Linux ABIs — one machine word past
+//                         argc). The trampoline LEAs this address
+//                         into the second argument register; it
+//                         never dereferences it.
+//
+// The destination registers are intentionally NOT fields — they are
+// read from the format's `entryCallingConvention.argGprs[0..1]`
+// (single source of truth for the cc register vocabulary, exactly
+// the ProcessExit `statusArgGpr` precedent).
+struct DSS_EXPORT ProcessArgs {
+    ArgsMechanism mechanism = ArgsMechanism::None;
+
+    // StackVector arm
+    std::uint32_t argcStackOffset = 0;
+    std::uint32_t argvStackOffset = 0;
+
+    // CrtOutParam arm (c111, D-RUNTIME-PE-MAIN-ARGS). The msvcrt exports the
+    // synthesized pre-main init function calls to obtain (argc, argv). Both the
+    // WIDE (`wchar_t** argv`, for a `wmain` entry) and NARROW (`char** argv`,
+    // for a `main` entry) forms are declared; the synthesizer picks by the
+    // resolved entry's second-parameter pointee width (u16 ⇒ wide, i8 ⇒ narrow)
+    // — never a format-level flag, which would mis-call a narrow entry. The
+    // library is the import library the two symbols resolve from.
+    std::string crtWideArgvFn;    // "__wgetmainargs"
+    std::string crtNarrowArgvFn;  // "__getmainargs"
+    std::string crtLibraryPath;   // "msvcrt.dll"
 };
 
 [[nodiscard]] DSS_EXPORT std::optional<RelocFormulaKind>

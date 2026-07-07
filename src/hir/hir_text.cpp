@@ -219,7 +219,8 @@ namespace {
 [[nodiscard]] bool isExprKind(HirKind k) noexcept {
     switch (k) {
         case HirKind::Literal: case HirKind::Ref: case HirKind::Call:
-        case HirKind::IntrinsicCall: case HirKind::BinaryOp: case HirKind::UnaryOp:
+        case HirKind::IntrinsicCall: case HirKind::BuiltinCall:
+        case HirKind::BinaryOp: case HirKind::UnaryOp:
         case HirKind::Cast: case HirKind::MemberAccess: case HirKind::Index:
         case HirKind::Swizzle: case HirKind::ConstructAggregate: case HirKind::Ternary:
         case HirKind::LogicalAnd: case HirKind::LogicalOr: case HirKind::SizeOf:
@@ -383,7 +384,26 @@ private:
                 out_ += "arr<"; appendType(in.operands(t)[0]);
                 out_ += std::format(", {}>", in.scalars(t)[0]); return;
             case TypeKind::Tuple:  out_ += "tuple<"; args(in.operands(t)); out_ += '>'; return;
-            case TypeKind::Struct: out_ += "struct "; out_ += quote(in.name(t)); out_ += " {"; args(in.operands(t)); out_ += '}'; return;
+            case TypeKind::Struct: {
+                out_ += "struct "; out_ += quote(in.name(t)); out_ += " {";
+                // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): emit `@<off>` per field for
+                // an explicit-offset struct so the text round-trips (reintern +
+                // canonicalization depend on the offsets surviving serialization).
+                if (in.hasExplicitOffsets(t)) {
+                    auto const ops = in.operands(t);
+                    bool first = true;
+                    for (std::size_t i = 0; i < ops.size(); ++i) {
+                        if (!first) out_ += ", ";
+                        appendType(ops[i]);
+                        auto const off = in.explicitFieldOffset(t, i);
+                        out_ += std::format(" @{}", off ? *off : 0);
+                        first = false;
+                    }
+                } else {
+                    args(in.operands(t));
+                }
+                out_ += '}'; return;
+            }
             case TypeKind::Union:  out_ += "union ";  out_ += quote(in.name(t)); out_ += " {"; args(in.operands(t)); out_ += '}'; return;
             // D5.5: enum is nominal-by-name; underlying TypeKind lives in
             // scalars[0]. Round-trip the underlying explicitly when it
@@ -589,6 +609,14 @@ private:
                 if (auto e = hir_.ifElse(id)) { out_ += indent(ind); out_ += "else\n"; emitNodeLine(*e, ind + 1); }
                 return;
             }
+            case HirKind::SehTryExcept:
+                // c115 SEH: `seh_try` <tryBody> `seh_except (` filter `)` <handler>.
+                out_ += "seh_try"; out_ += flagsStr(f); out_ += '\n';
+                emitNodeLine(hir_.sehTryBody(id), ind + 1);
+                out_ += indent(ind); out_ += "seh_except (";
+                emitExpr(hir_.sehTryFilter(id)); out_ += ")\n";
+                emitNodeLine(hir_.sehTryHandler(id), ind + 1);
+                return;
             case HirKind::WhileStmt:
                 out_ += "while"; out_ += flagsStr(f); out_ += " (";
                 emitExpr(*hir_.loopCondition(id)); out_ += ")\n";
@@ -609,8 +637,13 @@ private:
                 return;
             }
             case HirKind::SwitchStmt: {
+                // c60 (Design I-A): `switch (disc) { body: <block> case v L<ord> ...
+                // default L<ord> }`. The body Block carries the case/default markers
+                // inline; the dispatch arms map each case value to its marker ordinal.
                 out_ += "switch"; out_ += flagsStr(f); out_ += " (";
                 emitExpr(hir_.switchDiscriminant(id)); out_ += ") {\n";
+                out_ += indent(ind + 1); out_ += "body:\n";
+                emitNodeLine(hir_.switchBody(id), ind + 2);
                 for (HirNodeId arm : hir_.switchArms(id)) emitCaseArm(arm, ind + 1);
                 out_ += indent(ind); out_ += "}\n";
                 return;
@@ -673,17 +706,19 @@ private:
         out_ += '\n';
     }
 
+    // c60 (Design I-A): a dispatch entry — `case <value> L<ord>` / `default L<ord>`.
+    // The arm carries no body (the body lives on the SwitchStmt); `L<ord>` is the
+    // ordinal of the case's synthetic LabelStmt marker inside that body.
     void emitCaseArm(HirNodeId id, int ind) {
         emitAttrsBlock(id, ind);
         out_ += indent(ind);
         if (hir_.caseArmIsDefault(id)) {
-            out_ += "default"; out_ += flagsStr(hir_.flags(id)); out_ += " {\n";
+            out_ += "default"; out_ += flagsStr(hir_.flags(id));
         } else {
             out_ += "case"; out_ += flagsStr(hir_.flags(id)); out_ += ' ';
-            emitExpr(*hir_.caseArmValue(id)); out_ += " {\n";
+            emitExpr(*hir_.caseArmValue(id));
         }
-        for (HirNodeId s : hir_.caseArmBody(id)) emitNodeLine(s, ind + 1);
-        out_ += indent(ind); out_ += "}\n";
+        out_ += std::format(" L{}\n", hir_.caseArmLabelOrdinal(id));
     }
 
     // The `ext_node`/`error` wildcard form. Inline form (no indent/newline, for
@@ -753,6 +788,14 @@ private:
                     out_ += quote(hir_.intrinsicRegistry().descriptor(HirIntrinsicId{p}).name());
                 else { report("IntrinsicCall payload is not a registered intrinsic"); out_ += "\"?\""; }
                 out_ += " : "; appendType(hir_.typeId(id)); out_ += ' '; operands(hir_.children(id)); return;
+            }
+            case HirKind::BuiltinCall: {
+                // c103 (D-CSUBSET-INTRINSIC-UMULH): `builtincall #<lowering> : <type>
+                // (<operands>)` — the BuiltinLowering payload prints numerically.
+                header("builtincall"); out_ += ' ';
+                out_ += std::format("#{}", hir_.payload(id));
+                out_ += " : "; appendType(hir_.typeId(id)); out_ += ' ';
+                operands(hir_.children(id)); return;
             }
             case HirKind::BinaryOp: case HirKind::UnaryOp: {
                 header(hir_.kind(id) == HirKind::BinaryOp ? "binop" : "unop");
@@ -824,6 +867,11 @@ private:
         }
         if (auto const* s = std::get_if<std::string>(&v.value)) {
             out_ += "str "; out_ += quote(*s); return;
+        }
+        if (auto const* a = std::get_if<HirAddressValue>(&v.value)) {
+            // c43 address constant: `addr <base> <byteOffset>` (pointeeType is
+            // fold-transient and not round-tripped — invalid on the parsed value).
+            out_ += std::format("addr {} {}", a->base, a->byteOffset); return;
         }
     }
 
@@ -1065,6 +1113,15 @@ public:
            DiagnosticReporter& reporter)
         : interner_(extInterner), typeReg_(extTypeReg), lex_(text), reporter_(reporter) {}
 
+    // c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): caller-supplied NAME → TypeId
+    // bindings for the type-text path (see parseTypeFromText's doc). Consulted
+    // by `parseType`'s identifier fallback — AFTER every structural keyword —
+    // so a binding can never shadow the grammar. The span's storage outlives
+    // the parse (the caller holds it across the parseTypeFromText call).
+    void setNamedTypes(std::span<NamedTypeBinding const> namedTypes) {
+        namedTypes_ = namedTypes;
+    }
+
     HirBuilder              builder_;
     // Owned only on the module path (empty on the type-text path); the references
     // below are the single point of use for every production.
@@ -1117,6 +1174,9 @@ private:
     std::unordered_map<std::string, HirKindId>      extKindByName_;
     std::unordered_map<std::string, HirOpId>        extOpByName_;
     std::unordered_map<std::string, HirIntrinsicId> intrinsicByName_;
+    // c82: caller-supplied identifier→TypeId aliases (type-text path only;
+    // empty on the module path). Storage owned by the caller.
+    std::span<NamedTypeBinding const> namedTypes_;
     std::uint32_t preCounter_ = 0;
 
     // ── token helpers ────────────────────────────────────────────────────────
@@ -1131,6 +1191,26 @@ private:
     [[nodiscard]] std::string takeIdent() {
         if (peekIs(Tk::Ident)) return lex_.take().text;
         malformed("expected identifier"); return {};
+    }
+    // c60 (Design I-A): parse a `L<ordinal>` label reference (the form goto/label/
+    // labeladdr render and the switch dispatch arms use). One `Ident` token whose
+    // text is `L` followed by decimal digits.
+    [[nodiscard]] std::uint32_t parseLabelOrdinal() {
+        if (!peekIs(Tk::Ident)) { malformed("expected a label ordinal 'L<n>'"); return 0; }
+        std::string const t = lex_.take().text;
+        if (t.size() < 2 || t[0] != 'L') {
+            malformed(std::format("expected a label ordinal 'L<n>', got '{}'", t));
+            return 0;
+        }
+        std::uint32_t ord = 0;
+        for (std::size_t i = 1; i < t.size(); ++i) {
+            if (t[i] < '0' || t[i] > '9') {
+                malformed(std::format("malformed label ordinal '{}'", t));
+                return 0;
+            }
+            ord = ord * 10u + static_cast<std::uint32_t>(t[i] - '0');
+        }
+        return ord;
     }
     [[nodiscard]] std::string takeStr() {
         if (peekIs(Tk::Str)) return lex_.take().text;
@@ -1179,6 +1259,16 @@ private:
         else if (tag == "float"){ bool n = accept(Tk::Minus); double d = takeFloat();
                                   v.value = n ? -d : d; }
         else if (tag == "str")  { v.value = takeStr(); }
+        else if (tag == "addr") {
+            // c43 address constant: `addr <base> <byteOffset>` (signed offset).
+            HirAddressValue a;
+            a.base = static_cast<std::uint32_t>(takeInt());
+            bool const n = accept(Tk::Minus);
+            std::uint64_t const off = takeInt();
+            a.byteOffset = n ? static_cast<std::int64_t>(0u - off)
+                             : static_cast<std::int64_t>(off);
+            v.value = std::move(a);
+        }
         else malformed(std::format("unknown literal value tag '{}'", tag));
         return v;
     }
@@ -1572,6 +1662,15 @@ private:
             if (acceptKeyword("else")) els = parseNode();
             return builder_.makeIfStmt(cond, then, els, flags);
         }
+        if (kw == "seh_try") {
+            // c115 SEH round-trip: `seh_try` <tryBody> `seh_except (` filter `)`
+            // <handler> — mirrors the writer arm exactly.
+            HirNodeId tryBody = parseNode();
+            if (!acceptKeyword("seh_except")) malformed("expected 'seh_except'");
+            expect(Tk::LParen, "'('"); HirNodeId filter = parseNode(); expect(Tk::RParen, "')'");
+            HirNodeId handler = parseNode();
+            return builder_.makeSehTryExcept(tryBody, filter, handler, flags);
+        }
         if (kw == "while") {
             expect(Tk::LParen, "'('"); HirNodeId cond = parseNode(); expect(Tk::RParen, "')'");
             HirNodeId body = parseNode();
@@ -1585,8 +1684,13 @@ private:
         }
         if (kw == "for") return parseFor(flags);
         if (kw == "switch") {
+            // c60 (Design I-A): `switch (disc) { body: <block> case v L<ord> ...
+            // default L<ord> }` — the body Block then the dispatch arms.
             expect(Tk::LParen, "'('"); HirNodeId disc = parseNode(); expect(Tk::RParen, "')'");
             expect(Tk::LBrace, "'{'");
+            if (!acceptKeyword("body")) malformed("expected 'body:' in switch");
+            expect(Tk::Colon, "':'");
+            HirNodeId body = parseNode();
             std::vector<HirNodeId> arms;
             while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
                 std::uint32_t const off = cursorOff();
@@ -1594,11 +1698,25 @@ private:
                 if (cursorOff() == off) lex_.take();
             }
             expect(Tk::RBrace, "'}'");
-            return builder_.makeSwitchStmt(disc, arms, flags);
+            return builder_.makeSwitchStmt(disc, body, arms, flags);
         }
-        if (kw == "case") { HirNodeId v = parseNode(); auto body = parseBraceNodes();
-            return builder_.makeCaseArm(v, body, flags); }
-        if (kw == "default") { auto body = parseBraceNodes(); return builder_.makeCaseArm(std::nullopt, body, flags); }
+        if (kw == "case") { HirNodeId v = parseNode(); std::uint32_t ord = parseLabelOrdinal();
+            return builder_.makeCaseArm(v, ord, flags); }
+        if (kw == "default") { std::uint32_t ord = parseLabelOrdinal();
+            return builder_.makeCaseArm(std::nullopt, ord, flags); }
+        // c60 (Design I-A): `label L<ord>:` <body> and `goto L<ord>` / `goto *expr`
+        // (the switch body's case markers render as `label` statements, so the
+        // round-trip parser must read them).
+        if (kw == "label") {
+            std::uint32_t ord = parseLabelOrdinal();
+            expect(Tk::Colon, "':'");
+            HirNodeId body = parseNode();
+            return builder_.makeLabelStmt(ord, body, flags);
+        }
+        if (kw == "goto") {   // `goto L<ord>` (the plain label form)
+            std::uint32_t ord = parseLabelOrdinal();
+            return builder_.makeGotoStmt(ord, flags);
+        }
         if (kw == "break") { std::uint32_t d = peekIs(Tk::Int) ? static_cast<std::uint32_t>(takeInt()) : 0u;
             return builder_.makeBreak(d, flags); }
         if (kw == "continue") { std::uint32_t d = peekIs(Tk::Int) ? static_cast<std::uint32_t>(takeInt()) : 0u;
@@ -1739,8 +1857,28 @@ private:
         if (kw == "tuple") { expect(Tk::LAngle, "'<'"); auto ts = parseTypeListUntil(Tk::RAngle); expect(Tk::RAngle, "'>'");
             return interner_.tuple(ts); }
         if (kw == "struct") { std::string name = takeStr(); expect(Tk::LBrace, "'{'");
-            auto ts = parseTypeListUntil(Tk::RBrace); expect(Tk::RBrace, "'}'");
-            return interner_.structType(name, ts); }
+            // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): each field is a type optionally
+            // followed by `@<byteOffset>` (an explicit overlapping layout). All-or-
+            // none: a mix is malformed. A field-local loop (NOT parseTypeListUntil)
+            // so the `@` is consumed here, never by node-attribute logic (types are
+            // never parsed where `@`-attributes are also legal, so no ambiguity).
+            std::vector<TypeId>        ts;
+            std::vector<std::uint64_t> offs;
+            std::size_t                nWithOff = 0;
+            while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
+                ts.push_back(parseType());
+                if (accept(Tk::At)) { offs.push_back(takeInt()); ++nWithOff; }
+                else                { offs.push_back(0); }
+                if (!accept(Tk::Comma)) break;
+            }
+            expect(Tk::RBrace, "'}'");
+            if (nWithOff == 0) return interner_.structType(name, ts);
+            if (nWithOff != ts.size()) {
+                malformed("struct field offsets must be all-or-none");
+                return InvalidType;
+            }
+            std::span<std::int64_t const> const noWidths{};
+            return interner_.structType(name, ts, noWidths, offs); }
         if (kw == "union") { std::string name = takeStr(); expect(Tk::LBrace, "'{'");
             auto ts = parseTypeListUntil(Tk::RBrace); expect(Tk::RBrace, "'}'");
             return interner_.unionType(name, ts); }
@@ -1791,6 +1929,14 @@ private:
             }
             TypeKindId kindId = typeReg_.registerExtension(name, {});
             return interner_.extension(kindId, name, args, scalars);
+        }
+        // c82 (D-FFI-DESCRIPTOR-VA-LIST-TYPE): caller-supplied named-type
+        // bindings — the LAST resort before the unknown-type reject, so a
+        // binding can never shadow a primitive or a structural keyword. A
+        // bound but INVALID TypeId falls through to the reject (never a
+        // silent InvalidType success).
+        for (NamedTypeBinding const& nb : namedTypes_) {
+            if (nb.name == kw && nb.type.valid()) return nb.type;
         }
         malformed(std::format("unknown type '{}'", kw));
         return InvalidType;
@@ -1847,12 +1993,14 @@ std::unique_ptr<HirParseResult> parseHir(std::string_view text, CompilationUnitI
 }
 
 TypeId parseTypeFromText(std::string_view typeText, TypeInterner& interner,
-                         TypeRegistry& typeReg, DiagnosticReporter& reporter) {
+                         TypeRegistry& typeReg, DiagnosticReporter& reporter,
+                         std::span<NamedTypeBinding const> namedTypes) {
     std::size_t const errBefore = reporter.errorCount();
 
     // Reuse the ONE type-grammar decoder: drive the module parser's `parseType`
     // production over `typeText`, interning into the caller's interner/registry.
     Parser parser{typeText, interner, typeReg, reporter};
+    parser.setNamedTypes(namedTypes);   // c82: caller-supplied identifier aliases
     TypeId const ty = parser.parseTypeFromTextEntry();
 
     // A standalone type string must be exactly one type. Trailing tokens (e.g.

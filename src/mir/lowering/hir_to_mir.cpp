@@ -3,6 +3,7 @@
 #include "core/types/aggregate_abi.hpp"
 #include "core/types/call_payload.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/semantic_config.hpp"  // c103: BuiltinLowering (BuiltinCall payload)
 #include "core/types/type_lattice/type_layout.hpp"
 #include "hir/const_eval.hpp"
 #include "hir/hir_op.hpp"
@@ -38,6 +39,14 @@ namespace {
             agg.fields.reserve(arm.fields.size());
             for (auto const& f : arm.fields) agg.fields.push_back(toMirLiteral(f));
             dst.value = std::move(agg);
+        } else if constexpr (std::is_same_v<T, HirAddressValue>) {
+            // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD): an HIR address constant maps
+            // field-for-field to the MIR symbol-address relocation (F5). The
+            // fold-transient `pointeeType` is dropped — MIR addresses carry only
+            // {symbol, addend}. A NULL-base address never reaches here (the
+            // const-eval engines collapse it to an integer before pooling); if one
+            // did, the asm emitter's symbol-address arm would fail loud on symbol 0.
+            dst.value = MirSymbolAddrValue{arm.base, arm.byteOffset};
         } else {
             dst.value = arm;
         }
@@ -192,6 +201,24 @@ struct Lowerer {
         return b;
     }
 
+    // c115 SEH (D-WIN64-SEH-FUNCLETS): the module-wide SEH region-id counter —
+    // stamps SehTryBegin/SehFilterReturn/SehTryEnd payloads. Module-monotonic
+    // (never reset per function) so ids stay unique within every function by
+    // construction; the verifier pairs Begin/FilterReturn/End on it.
+    std::uint32_t sehRegionCounter_ = 0;
+
+    // c60 (Design I-A): does a flattened switch's body Block start with a case
+    // marker (a LabelStmt)? When it does, the marker opens its own label-block right
+    // after the Switch terminator, so no extra pre-case block is needed; only a body
+    // whose first statement is a jumped-over leading declaration needs one. (An empty
+    // body Block trivially "starts with a label" — there is nothing to lower, so no
+    // pre-case block is needed either.)
+    [[nodiscard]] bool switchBodyStartsWithLabel(HirNodeId body) const {
+        if (hir.kind(body) != HirKind::Block) return false;
+        auto const kids = hir.children(body);
+        return kids.empty() || hir.kind(kids.front()) == HirKind::LabelStmt;
+    }
+
     // D-CSUBSET-COMPUTED-GOTO: the per-function set of label ordinals whose ADDRESS
     // is taken via `&&label` (LabelAddressOf). Collected once at function entry (a
     // HIR pre-scan) so `goto *p` (IndirectBr) can name EVERY address-taken block as
@@ -247,13 +274,25 @@ struct Lowerer {
             // time `mintSyntheticGlobalSymbol()` first runs, so
             // the lazy seed naturally clears them too.
             //
+            // c86 (D-MIR-SYNTHETIC-GLOBAL-SYMBOL-ALIAS): the scan alone is
+            // NOT enough — the SEMANTIC symbol table also holds typedefs,
+            // tags, fields, locals, and injected constants, none of which
+            // are MIR-visible, and the LK11 merge maps every MIR symbol to
+            // a NAME through that table. A synthetic id landing inside the
+            // table fabricates a NAMED strong def from an anonymous literal
+            // global (bogus cross-CU collisions; potential silent
+            // mis-merge). `config.syntheticSymbolFloor` (the pipeline
+            // passes `model.symbols().size()`) lifts the seed clear of the
+            // whole semantic id space.
+            //
             // UINT32_MAX seed: refuse to seed at the saturated
             // edge so the immediate `*nextSyntheticGlobalSym_`
             // read below never wraps. The caller fail-louds.
             if (maxV == std::numeric_limits<std::uint32_t>::max()) {
                 return SymbolId{};
             }
-            nextSyntheticGlobalSym_ = maxV + 1u;
+            nextSyntheticGlobalSym_ =
+                std::max(maxV + 1u, config.syntheticSymbolFloor);
         }
         std::uint32_t const minted = *nextSyntheticGlobalSym_;
         // Wrap detection (silent-failure HIGH-1 audit fold): if
@@ -301,6 +340,22 @@ struct Lowerer {
         if (auto const* p = volatileMap->tryGet(accessNode); p != nullptr && p->isVolatile)
             return MirInstFlags::Volatile;
         return MirInstFlags::None;
+    }
+
+    // c27 (D-CSUBSET-VOLATILE-POINTEE): the TYPE-derived half of the access-
+    // volatility funnel. A Load/Store whose ACCESSED type (the thing read/written
+    // — the pointee for a deref/index, the field for a member, the value for a
+    // scalar) is `volatile`-qualified IS a volatile access, regardless of any
+    // symbol-level c21 flag. Every access form's Load/Store ORs this with
+    // `volatileFlagFor(node)` so the flag's coverage is by-construction at one
+    // place per form: c21 carries volatile that lives on a SYMBOL (a `volatile`
+    // object/member/pointer-object), c27 carries volatile that lives in the TYPE
+    // (a deref/index/member through a `volatile`-pointee `Ptr<VolatileQual(T)>`).
+    // A missed OR here = a silent miscompile (the optimizer elides/caches the
+    // access), so it is threaded at the SAME sites as `volatileFlagFor`.
+    [[nodiscard]] MirInstFlags volatileFlagForType(TypeId accessedTy) const {
+        return interner.isVolatileQualified(accessedTy) ? MirInstFlags::Volatile
+                                                        : MirInstFlags::None;
     }
 
     // Map a HIR core operator + operand TypeKind to a MIR opcode. Integer
@@ -365,6 +420,24 @@ struct Lowerer {
     // integer↔pointer, pointer-to-pointer (Bitcast). Same-kind casts collapse
     // to Bitcast (e.g. signed↔unsigned of the same width — no value change at
     // the bit level). Returns `MirOpcode::Invalid` for unrecognized pairs.
+    // D-CSUBSET-INT-TO-F32-CODEGEN / si_to_fp sub-int source (c78): true
+    // for an integer type NARROWER than `int` (Char/I8/U8/I16/U16/Bool/
+    // Byte) — the kinds that must integer-PROMOTE to I32 before an
+    // int→float conversion (CVTSI2SD reads r32/r64; SCVTF reads Wn/Xn —
+    // neither has a sub-32 form). I32 and wider are already ≥int and pass
+    // through. Mirrors mapCast's own 8/16-bit-width classification.
+    [[nodiscard]] static bool isSubIntPromotable(TypeKind k) noexcept {
+        switch (k) {
+            case TypeKind::Bool: case TypeKind::Byte:
+            case TypeKind::Char:
+            case TypeKind::I8:   case TypeKind::U8:
+            case TypeKind::I16:  case TypeKind::U16:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     [[nodiscard]] static MirOpcode mapCast(TypeKind from, TypeKind to) noexcept {
         auto isInt = [](TypeKind k) noexcept {
             return k == TypeKind::I8  || k == TypeKind::I16 || k == TypeKind::I32
@@ -558,26 +631,94 @@ struct Lowerer {
                 std::uint32_t const sym = hir.payload(node);
                 if (auto it = addressableLocal.find(sym);
                     it != addressableLocal.end()) {
+                    // c63 (D-CSUBSET-ARRAY-DECAY-AT-CALL-ARG): an ARRAY rvalue
+                    // decays to the ADDRESS of its first element (C 6.3.2.1p3) — an
+                    // aggregate can never live in a register, so a bare `Ref` to an
+                    // array-typed addressable local must NEVER `Load`. Most array
+                    // rvalues reach MIR pre-decayed (CST→HIR `coerce()` inserts a
+                    // synthetic `Cast<Array→Ptr>` — the c59 `*(array+i)` /
+                    // string-literal-arg / `int a[5]; f(a)` paths), but when the
+                    // array type MATCHES the consuming context's type NO cast is
+                    // inserted (a SysV `va_list` `__va_list_tag[1]` arg forwarded to
+                    // a `va_list` PARAM — same Array type), so the bare `Ref` lands
+                    // here. Decay exactly as the `Cast<Array→Ptr>` arm does (a byte-
+                    // offset-0 `Gep` re-typing the base address to `Ptr<elem>` =
+                    // `&arr[0]`). `it->second` is already the array's ADDRESS — an
+                    // alloca `Ptr<Array>` for a body array, or (c63) the registered
+                    // incoming `Ptr<__va_list_tag>` for the forwarded va_list param;
+                    // the Gep(0) lands the correct `Ptr<elem>` value either way. The
+                    // decayed pointer rides a GPR (`scalarArgClass(Array)` → Gpr),
+                    // so the scalar call-arg accounting is unchanged.
+                    if (t.valid() && interner.kind(t) == TypeKind::Array) {
+                        auto const elems = interner.operands(t);
+                        if (elems.empty() || !elems[0].valid()) {
+                            unsupported(node,
+                                "array-typed Ref has no element type "
+                                "(interner invariant violated)");
+                            return InvalidMirInst;
+                        }
+                        TypeId const decayed = interner.pointer(elems[0]);
+                        std::array<MirInstId, 2> gep{it->second, constInt(0)};
+                        return mir.addInst(MirOpcode::Gep, gep, decayed);
+                    }
                     std::array<MirInstId, 1> ops{it->second};
-                    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a Ref to a `volatile`
-                    // address-taken local — its rvalue Load carries the flag.
+                    // c21/c27: a Ref to a `volatile` address-taken local — its
+                    // rvalue Load carries the flag. c21 via the node's VolatileAttr
+                    // (object-volatile symbol); c27 also OR's the value type `t`
+                    // (top-level VolatileQual) so the two halves agree by
+                    // construction.
                     return mir.addInst(MirOpcode::Load, ops, t, /*payload=*/0,
-                                       volatileFlagFor(node));
+                                       volatileFlagFor(node) | volatileFlagForType(t));
                 }
                 if (auto it = symbolToValue.find(sym); it != symbolToValue.end()) {
                     return it->second;
                 }
                 if (globalSymbols.contains(sym)) {
+                    // c91 (D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY): the GLOBAL
+                    // twin of the c63 addressable-local arm above — an ARRAY
+                    // rvalue decays to the ADDRESS of its first element
+                    // (C 6.3.2.1p3); an aggregate can never live in a
+                    // register, so a bare Ref to an array-typed GLOBAL must
+                    // NEVER `Load`. Pre-c91 this arm loaded the array's first
+                    // bytes as the "value" — `gp != g0` compared g0's CONTENT
+                    // against gp (always-unequal for a live pointer; EQUAL to
+                    // a null pointer for a zero-filled global — both silent
+                    // wrong-branch miscompiles; the c90r4 global witness).
+                    // Nearly every array rvalue reaches MIR pre-decayed (the
+                    // HIR coerce Cast<Array→Ptr> funnel — comparisons,
+                    // conditions and `!` joined it in c91), but a NO-CAST
+                    // same-type context (a file-scope `va_list` forwarded to
+                    // a `va_list` param — the c63 shape at global scope)
+                    // still lands a bare Array-typed Ref here, and this arm
+                    // keeps any FUTURE consumer gap a correct decay instead
+                    // of a silent content-compare. Same emission as c63: a
+                    // byte-offset-0 `Gep` re-typing the base address to
+                    // `Ptr<elem>` = `&arr[0]`.
+                    if (t.valid() && interner.kind(t) == TypeKind::Array) {
+                        auto const elems = interner.operands(t);
+                        if (elems.empty() || !elems[0].valid()) {
+                            unsupported(node,
+                                "array-typed global Ref has no element type "
+                                "(interner invariant violated)");
+                            return InvalidMirInst;
+                        }
+                        MirInstId const base = mir.addGlobalAddr(
+                            SymbolId{sym}, interner.pointer(t));
+                        std::array<MirInstId, 2> gep{base, constInt(0)};
+                        return mir.addInst(MirOpcode::Gep, gep,
+                                           interner.pointer(elems[0]));
+                    }
                     // Globals: GlobalAddr's result type is pointer(t); a
                     // following Load reads the value. The HIR Ref's typeId
                     // is the global's declared type, not pointer(type).
                     TypeId const ptrTy = interner.pointer(t);
                     MirInstId const addr = mir.addGlobalAddr(SymbolId{sym}, ptrTy);
                     std::array<MirInstId, 1> ops{addr};
-                    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a Ref to a `volatile`
-                    // global — its rvalue Load carries the flag.
+                    // c21/c27: a Ref to a `volatile` global — its rvalue Load
+                    // carries the flag (c21 VolatileAttr OR c27 value-type
+                    // VolatileQual).
                     return mir.addInst(MirOpcode::Load, ops, t, /*payload=*/0,
-                                       volatileFlagFor(node));
+                                       volatileFlagFor(node) | volatileFlagForType(t));
                 }
                 if (functionSymbols.contains(sym)) {
                     return mir.addGlobalAddr(SymbolId{sym}, t);
@@ -664,6 +805,70 @@ struct Lowerer {
                 }
                 return mir.addInst(MirOpcode::IntrinsicCall, ctx.operands, t,
                                    ctx.intrinsicId);
+            }
+            case HirKind::BuiltinCall: {
+                // c103 (D-CSUBSET-INTRINSIC-UMULH): children = [args...]; the payload
+                // is a BuiltinLowering value. Map it to the DEDICATED MirOpcode — the
+                // ONE place MIR names the intrinsic vocabulary (a uniform enum→enum
+                // table, never an arch/name identity branch). Unlike IntrinsicCall (a
+                // generic opaque op dispatched at the encoder), this yields a REAL MIR
+                // op the optimizer + verifier + target-capability lowering understand.
+                auto kids = hir.children(node);
+                std::vector<MirInstId> operands;
+                operands.reserve(kids.size());
+                for (HirNodeId argN : kids) {
+                    MirInstId const arg = lowerExpr(argN);
+                    if (!arg.valid()) return InvalidMirInst;
+                    operands.push_back(arg);
+                }
+                switch (static_cast<BuiltinLowering>(hir.payload(node))) {
+                    case BuiltinLowering::UMulHigh:
+                        return mir.addInst(MirOpcode::UMulH, operands, t);
+                    case BuiltinLowering::AtomicCas: {
+                        // c104: MIR AtomicCas is the UNIVERSAL CAS order
+                        // [ptr, comparand(expected), newval(desired)] — the
+                        // C11 atomic_compare_exchange / LLVM cmpxchg shape a
+                        // future frontend would also target. The WIN32
+                        // intrinsic this builtin binds spells its args
+                        // (dest, EXCHANGE, comparand) — exchange BEFORE
+                        // comparand — so THIS arm (the one place the Win32
+                        // binding is defined) reorders [c0, c2, c1]. Passing
+                        // the args through positionally silently INVERTS the
+                        // CAS (the compare tests the new value, the store
+                        // writes the comparand — the exit-26 corpus catch).
+                        if (operands.size() != 3) {
+                            unsupported(node, "AtomicCas expects exactly 3 args");
+                            return InvalidMirInst;
+                        }
+                        std::array<MirInstId, 3> const casOrder{
+                            operands[0], operands[2], operands[1]};
+                        return mir.addInst(MirOpcode::AtomicCas, casOrder, t);
+                    }
+                    case BuiltinLowering::Barrier:
+                        // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier —
+                        // a 0-operand, void, side-effecting compiler fence
+                        // (`operands` is empty; the builtin declares no params).
+                        // Emits NO runtime instruction; the side-effect flag makes
+                        // the CSE/LICM clobber walk forbid memory motion across it.
+                        // R::None ⇒ InvalidType (the Store convention — supplying
+                        // a result type is a MirBuilder fatal).
+                        return mir.addInst(MirOpcode::CompilerBarrier, operands,
+                                           InvalidType);
+                    case BuiltinLowering::SehExceptionCode:
+                        // c115 SEH: `_exception_code()` — a 0-operand value op
+                        // (u32) reading the dispatch context. Position legality
+                        // (filter expr / handler body only) was proven by
+                        // HirVerifier::checkSehContext before lowering ran.
+                        return mir.addInst(MirOpcode::SehExceptionCode, operands, t);
+                    case BuiltinLowering::SehExceptionInfo:
+                        // c115 SEH: `_exception_info()` — a 0-operand value op
+                        // (void* → EXCEPTION_POINTERS), filter-expression only.
+                        return mir.addInst(MirOpcode::SehExceptionInfo, operands, t);
+                    case BuiltinLowering::None:
+                        break;
+                }
+                unsupported(node, "BuiltinCall carries no valid lowering");
+                return InvalidMirInst;
             }
             case HirKind::Ternary: {
                 // children: [cond, thenExpr, elseExpr]. Lower as a diamond
@@ -857,14 +1062,47 @@ struct Lowerer {
                 // address via the shared lvalue path, then emit `Load`.
                 MirInstId const ptr = lowerLvalueAddress(node);
                 if (!ptr.valid()) return InvalidMirInst;
+                // c91 (D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY): an
+                // ARRAY-typed member/element rvalue (`p->yystk0`,
+                // `s.in.arr`, an `a2d[i]` row) decays to its first
+                // element's ADDRESS (C 6.3.2.1p3) — NEVER a Load (the c63
+                // rule, applied uniformly: there is no aggregate-width
+                // register value). Pre-c91 this arm loaded the array's
+                // first bytes as the "value": sqlite sqlite3ParserFinalize
+                // `pParser->yystack != pParser->yystk0` compared yystack
+                // against yystk0's CONTENT → always unequal → YYFREE'd the
+                // on-stack parser → glibc `free(): invalid pointer` SIGABRT
+                // on EVERY SQL statement (the c91 wall). The HIR decay
+                // funnel (coerce Cast<Array→Ptr>) covers every KNOWN
+                // consumer; this arm keeps a no-Cast same-type context (a
+                // struct-member `va_list` forwarded to a `va_list` param)
+                // and any FUTURE consumer gap a correct decay instead of a
+                // silent content-compare. A bit-field is never array-typed,
+                // so this precedes the bit-field unit-load untouched.
+                if (t.valid() && interner.kind(t) == TypeKind::Array) {
+                    auto const elems = interner.operands(t);
+                    if (elems.empty() || !elems[0].valid()) {
+                        unsupported(node,
+                            "array-typed member/index rvalue has no element "
+                            "type (interner invariant violated)");
+                        return InvalidMirInst;
+                    }
+                    std::array<MirInstId, 2> gep{ptr, constInt(0)};
+                    return mir.addInst(MirOpcode::Gep, gep,
+                                       interner.pointer(elems[0]));
+                }
                 // FC8 D-CSUBSET-BITFIELD: a bit-field read loads the whole
                 // allocation unit (the Gep already targets the unit), then
                 // extracts the field's bits (shift + mask / sign-extend).
-                // c21 (D-CSUBSET-VOLATILE-QUALIFIER): an rvalue read of a
-                // `volatile` struct/union MEMBER (the MemberAccess node carries
-                // the flag; a plain Index / non-volatile member ⇒ None). The unit
-                // Load of a volatile bit-field member is equally volatile.
-                MirInstFlags const vf = volatileFlagFor(node);
+                // c21/c27: an rvalue read of a `volatile` struct/union MEMBER or a
+                // `volatile`-element INDEX is volatile. c21 carries an
+                // object-volatile member via the node's VolatileAttr; c27 carries
+                // a volatile ELEMENT/FIELD type via `t` (the accessed value type —
+                // e.g. `va[i]` where `va`'s element is VolatileQual, or a member
+                // whose field type is top-level VolatileQual). OR both so neither
+                // form is missed (a missed flag = silent miscompile).
+                MirInstFlags const vf =
+                    volatileFlagFor(node) | volatileFlagForType(t);
                 if (BitFieldPlacement const* bf = bitfieldPlacementOf(node)) {
                     std::array<MirInstId, 1> lo{ptr};
                     MirInstId const unit = mir.addInst(MirOpcode::Load, lo, t,
@@ -1068,6 +1306,101 @@ struct Lowerer {
         TypeId const operandType = hir.typeId(kids[0]);
         TypeKind const tk = operandType.valid()
             ? interner.kind(operandType) : TypeKind::Void;
+        // c40 (D-CSUBSET-POINTER-SUBTRACTION) C 6.5.6p9: the HIR tier types
+        // `p - q` (both Ptr<T>) as I64 (ptrdiff_t) while the OPERANDS stay Ptr —
+        // that (op==Sub, operand kind Ptr, RESULT kind I64) is the signal to
+        // lower as a SIGNED element-count difference: PtrToInt both sides, Sub
+        // (the byte difference), then — unless sizeof(pointee)==1 — SDiv by the
+        // element stride. Signed throughout (q>p ⇒ negative). `p ± n` (Ptr
+        // result, deferred c41) is NOT this path — its result kind is Ptr, not I64.
+        if (op == HirOpKind::Sub && tk == TypeKind::Ptr
+            && t.valid() && interner.kind(t) == TypeKind::I64) {
+            TypeId const i64ty = interner.primitive(TypeKind::I64);
+            std::array<MirInstId, 1> la{lhs};
+            std::array<MirInstId, 1> ra{rhs};
+            MirInstId const li = mir.addInst(MirOpcode::PtrToInt, la, i64ty);
+            MirInstId const ri = mir.addInst(MirOpcode::PtrToInt, ra, i64ty);
+            std::array<MirInstId, 2> sa{li, ri};
+            MirInstId const diff = mir.addInst(MirOpcode::Sub, sa, i64ty);
+            TypeId const pointee = interner.operands(operandType)[0];
+            auto const stride = elementStride(pointee);
+            if (!stride.has_value()) {
+                unsupported(node, std::format(
+                    "pointer subtraction: pointee TypeKind {} has no computable "
+                    "element stride (incomplete/void pointee)",
+                    static_cast<unsigned>(interner.kind(pointee))));
+                return InvalidMirInst;
+            }
+            if (*stride <= 1) return diff;   // 1-byte pointee: byte diff == element count
+            MirInstId const sc =
+                constIntOfType(static_cast<std::int64_t>(*stride), i64ty);
+            std::array<MirInstId, 2> da{diff, sc};
+            return mir.addInst(MirOpcode::SDiv, da, i64ty);
+        }
+        // c41 (D-CSUBSET-POINTER-INT-ARITHMETIC) C 6.5.6p8: `p ± n` → a new
+        // pointer at byte offset n*sizeof(*p). cst_to_hir canonicalizes `n + p`
+        // so kids[0] is ALWAYS the Ptr operand. Fires when the RESULT type is Ptr
+        // (NOT I64 — that is c40's p-q) AND kids[0] is Ptr. Add: scale n, Gep(p,
+        // scaled). Sub (p - n): Neg n, scale, Gep(p, -scaled). Reuses F1's
+        // scaleIndexToBytes (the SAME stride machinery p[i]/p++ use → stride 1
+        // emits no Mul, no double-scaling). `n - p` does not reach here (kids[0]
+        // stays Int, not Ptr). void*/fn-ptr pointee → fail loud (no stride).
+        if ((op == HirOpKind::Add || op == HirOpKind::Sub)
+            && t.valid() && interner.kind(t) == TypeKind::Ptr
+            && operandType.valid() && tk == TypeKind::Ptr) {
+            auto const ptOps = interner.operands(operandType);
+            if (ptOps.empty()) {
+                unsupported(node, "pointer-integer arithmetic: Ptr has no pointee");
+                return InvalidMirInst;
+            }
+            TypeId const pointee = ptOps[0];
+            TypeId const indexTy = hir.typeId(kids[1]);
+            if (!indexTy.valid()) {
+                unsupported(node,
+                    "pointer-integer arithmetic: integer operand has no type");
+                return InvalidMirInst;
+            }
+            // Widen the index to POINTER width (I64) BEFORE Neg/scale: x86-64
+            // 32-bit ops zero-extend into the 64-bit register, so a 32-bit
+            // NEGATIVE byte offset (from `p - n`) would become a huge positive
+            // address → access violation. SExt signed / ZExt unsigned (mapCast)
+            // — the SAME widen the Index path (p[i]) already does (the positive
+            // p+n cases worked only because their high bits were 0).
+            TypeId const i64ty = interner.primitive(TypeKind::I64);
+            MirInstId intIdx = rhs;
+            if (interner.kind(indexTy) != TypeKind::I64) {
+                MirOpcode const ext = mapCast(interner.kind(indexTy), TypeKind::I64);
+                // c65: a non-integer index kind (Array/Enum/…) has no widening
+                // cast → mapCast returns Invalid. FAIL LOUD here — passing Invalid
+                // to addInst std::abort()s the whole compiler (the c65 sqlite
+                // crash class: `p - arrayName`, now fixed at the HIR tier by array
+                // decay → ptrSub; an Enum index is the deferred
+                // D-CSUBSET-POINTER-ARITH-ENUM-INDEX). The pre-existing
+                // `.valid()` guard below runs AFTER addInst, i.e. too late.
+                if (ext == MirOpcode::Invalid) {
+                    unsupported(node, std::format(
+                        "pointer arithmetic: index TypeKind {} has no widening "
+                        "cast to a 64-bit offset (an array index must decay to a "
+                        "pointer difference; an enum index is deferred — "
+                        "D-CSUBSET-POINTER-ARITH-ENUM-INDEX)",
+                        static_cast<unsigned>(interner.kind(indexTy))));
+                    return InvalidMirInst;
+                }
+                std::array<MirInstId, 1> eo{rhs};
+                intIdx = mir.addInst(ext, eo, i64ty);
+                if (!intIdx.valid()) return InvalidMirInst;
+            }
+            if (op == HirOpKind::Sub) {
+                std::array<MirInstId, 1> ni{intIdx};
+                intIdx = mir.addInst(MirOpcode::Neg, ni, i64ty);
+                if (!intIdx.valid()) return InvalidMirInst;
+            }
+            MirInstId const byteOff =
+                scaleIndexToBytes(intIdx, pointee, node, i64ty);
+            if (!byteOff.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> gepOps{lhs, byteOff};
+            return mir.addInst(MirOpcode::Gep, gepOps, t);
+        }
         MirOpcode const mop = mapBinaryOp(op, tk);
         if (mop == MirOpcode::Invalid) {
             unsupported(node,
@@ -1082,9 +1415,41 @@ struct Lowerer {
 
     // Deref epilogue (pointer already lowered to `ptr`): `Load(ptr)` typed as
     // the node's (pointee) type.
+    //
+    // c27 (D-CSUBSET-VOLATILE-POINTEE): if the pointee type is `volatile`-
+    // qualified (the pointer was `Ptr<VolatileQual(T)>`, i.e. a `volatile T *`),
+    // the Load is VOLATILE — the optimizer must not elide/cache/reorder it. The
+    // pointee type IS this node's type. OR the type-derived flag with any
+    // symbol-level c21 flag on the deref node (a deref node itself is never a
+    // c21-flagged Ref, but ORing keeps the funnel uniform).
     [[nodiscard]] MirInstId combineDeref(HirNodeId node, MirInstId ptr) {
+        TypeId const pointeeTy = hir.typeId(node);
+        // c91 (D-CSUBSET-ARRAY-DECAY-POINTER-IDENTITY): `*p` where the
+        // pointee is an ARRAY (`p : Ptr<Array<T,N>>`) — the deref VALUE is
+        // an array rvalue, which decays to the address of its first element
+        // (C 6.3.2.1p3): `*p` ≡ `&(*p)[0]` (numerically p itself, re-typed
+        // `Ptr<elem>`). NEVER a Load — the same c63 rule as the Ref /
+        // member / index rvalue arms (there is no aggregate-width register
+        // value; the pre-c91 Load read the array's first bytes as the
+        // "value"). Volatility is a property of the (non-)ACCESS: the decay
+        // performs no memory access, so no volatile flag applies.
+        if (pointeeTy.valid()
+            && interner.kind(pointeeTy) == TypeKind::Array) {
+            auto const elems = interner.operands(pointeeTy);
+            if (elems.empty() || !elems[0].valid()) {
+                unsupported(node,
+                    "array-typed Deref rvalue has no element type "
+                    "(interner invariant violated)");
+                return InvalidMirInst;
+            }
+            std::array<MirInstId, 2> gep{ptr, constInt(0)};
+            return mir.addInst(MirOpcode::Gep, gep,
+                               interner.pointer(elems[0]));
+        }
         std::array<MirInstId, 1> ops{ptr};
-        return mir.addInst(MirOpcode::Load, ops, hir.typeId(node));
+        MirInstFlags const vf =
+            volatileFlagFor(node) | volatileFlagForType(pointeeTy);
+        return mir.addInst(MirOpcode::Load, ops, pointeeTy, /*payload=*/0, vf);
     }
 
     // Scalar-Cast epilogue (operand already lowered): the array→pointer DECAY
@@ -1110,8 +1475,9 @@ struct Lowerer {
                 auto const sc = interner.scalars(ty);
                 return sc.empty() ? kk : static_cast<TypeKind>(sc[0]);
             };
-        MirOpcode const mop = mapCast(enumUnderlying(fromTy, fromK),
-                                      enumUnderlying(t, toK));
+        TypeKind const fromResolved = enumUnderlying(fromTy, fromK);
+        TypeKind const toResolved    = enumUnderlying(t, toK);
+        MirOpcode const mop = mapCast(fromResolved, toResolved);
         if (mop == MirOpcode::Invalid) {
             unsupported(node, std::format(
                 "Cast from TypeKind {} to {} has no MIR opcode",
@@ -1119,7 +1485,32 @@ struct Lowerer {
                 static_cast<unsigned>(toK)));
             return InvalidMirInst;
         }
-        std::array<MirInstId, 1> ops{operand};
+        // D-CSUBSET-INT-TO-F32-CODEGEN / si_to_fp sub-int source (c78): a
+        // sub-int (Char/I8/U8/I16/U16) → float conversion has NO
+        // sub-32-bit int→float instruction form on x86 (CVTSI2SD reads
+        // r32/r64) OR arm64 (SCVTF reads Wn/Xn). gcc integer-PROMOTES the
+        // source to `int` FIRST (`movsx/movzx ecx, cl` then `cvtsi2sd
+        // xmm, ecx`; C 6.3.1.1). Insert the SAME promotion: widen the
+        // source to I32 (SExt signed / ZExt unsigned via mapCast) before
+        // the SIToFP/UIToFP, so the conversion reads a sign/zero-extended
+        // 32-bit source. Non-sub-int sources (I32/I64 already ≥32) skip
+        // this — byte-identical to the prior single-op emit.
+        MirInstId castOperand = operand;
+        if ((mop == MirOpcode::SIToFP || mop == MirOpcode::UIToFP)
+            && isSubIntPromotable(fromResolved)) {
+            MirOpcode const ext = mapCast(fromResolved, TypeKind::I32);
+            if (ext == MirOpcode::Invalid) {
+                unsupported(node, std::format(
+                    "sub-int→float source promotion from TypeKind {} to I32 "
+                    "has no MIR opcode",
+                    static_cast<unsigned>(fromResolved)));
+                return InvalidMirInst;
+            }
+            std::array<MirInstId, 1> extOps{operand};
+            castOperand = mir.addInst(ext, extOps,
+                                      interner.primitive(TypeKind::I32));
+        }
+        std::array<MirInstId, 1> ops{castOperand};
         return mir.addInst(mop, ops, t);
     }
 
@@ -2053,31 +2444,55 @@ struct Lowerer {
     [[nodiscard]] MirInstId
     emitBitfieldExtract(MirInstId unitVal, BitFieldPlacement const& p, TypeId fieldTy) {
         fieldTy = enumReprType(fieldTy);   // enum bit-field → underlying integer
-        std::uint32_t const B = p.unitBytes * 8;
-        // Shift/mask constants MUST be the field/unit type, NOT I32 — a 64-bit-
-        // unit bit-field (`unsigned long long x:40`) with an I32 const operand is
-        // a mixed-width op the verifier doesn't catch (silent miscompile); see
-        // constIntOfType. (Unit widths >64 are rejected at semantic, so the mask
-        // fits in u64.)
+        std::uint32_t const B0 = p.unitBytes * 8;
+        // c73 (D-CSUBSET-32BIT-ALU-FORMS): a SUB-INT (u8/u16/i8/i16/char) allocation
+        // UNIT makes the shift/mask/and ops sub-int-width, which walls at the
+        // target's sub-native ALU gate (sqlite's pervasive `u8 x:1` flag structs).
+        // Compute the extraction at the PROMOTED int width (a bit-field read
+        // promotes to int anyway, C 6.3.1.1), then Trunc the result back to the
+        // field type for the caller's node-type contract. A NATIVE unit (>=32-bit:
+        // u32/i32/u64/… incl. the wide `u64:40` case) keeps computeTy==fieldTy →
+        // the ORIGINAL path (byte-identical, zero regression). The promote-cast's
+        // SExt-vs-ZExt is irrelevant here: the field sits in the low B0 bits and
+        // the shift/mask sequence re-derives its value + sign at width B.
+        bool const promote = B0 < 32;
+        TypeId const computeTy = promote ? interner.primitive(TypeKind::I32) : fieldTy;
+        std::uint32_t const B = promote ? 32u : B0;
+        if (promote) {
+            std::array<MirInstId, 1> pa{unitVal};
+            unitVal = mir.addInst(mapCast(interner.kind(fieldTy), TypeKind::I32),
+                                  pa, computeTy);
+        }
+        // Shift/mask constants MUST match the COMPUTE type (never a stray I32 into a
+        // native u64:40 unit — a mixed-width op the verifier misses; see
+        // constIntOfType). Unit widths >64 are rejected at semantic, so mask fits u64.
         auto shiftBy = [&](MirInstId v, MirOpcode op, std::uint32_t amt) -> MirInstId {
             if (amt == 0) return v;
-            MirInstId const sh = constIntOfType(static_cast<std::int64_t>(amt), fieldTy);
+            MirInstId const sh = constIntOfType(static_cast<std::int64_t>(amt), computeTy);
             std::array<MirInstId, 2> ops{v, sh};
-            return mir.addInst(op, ops, fieldTy);
+            return mir.addInst(op, ops, computeTy);
         };
+        MirInstId result;
         if (bitfieldIsSigned(interner.kind(fieldTy))) {
             MirInstId v = shiftBy(unitVal, MirOpcode::Shl, B - p.bitOffset - p.bitWidth);
-            return shiftBy(v, MirOpcode::AShr, B - p.bitWidth);
+            result = shiftBy(v, MirOpcode::AShr, B - p.bitWidth);
+        } else {
+            MirInstId v = shiftBy(unitVal, MirOpcode::LShr, p.bitOffset);
+            if (p.bitWidth < B) {
+                std::uint64_t const mask =
+                    p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
+                MirInstId const m = constIntOfType(static_cast<std::int64_t>(mask), computeTy);
+                std::array<MirInstId, 2> ops{v, m};
+                v = mir.addInst(MirOpcode::And, ops, computeTy);
+            }
+            result = v;
         }
-        MirInstId v = shiftBy(unitVal, MirOpcode::LShr, p.bitOffset);
-        if (p.bitWidth < B) {
-            std::uint64_t const mask =
-                p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
-            MirInstId const m = constIntOfType(static_cast<std::int64_t>(mask), fieldTy);
-            std::array<MirInstId, 2> ops{v, m};
-            v = mir.addInst(MirOpcode::And, ops, fieldTy);
+        if (promote) {   // Trunc the i32 result back to the field type (caller contract)
+            std::array<MirInstId, 1> ta{result};
+            result = mir.addInst(mapCast(TypeKind::I32, interner.kind(fieldTy)),
+                                 ta, fieldTy);
         }
-        return v;
+        return result;
     }
 
     // FC8 D-CSUBSET-BITFIELD: read-modify-write a bit-field at unit address
@@ -2093,26 +2508,51 @@ struct Lowerer {
         // and the unit Store at the end) carry the flag — the whole RMW is one
         // volatile access of the unit, never elided/reordered.
         fieldTy = enumReprType(fieldTy);   // enum bit-field → underlying integer
+        // c73 (D-CSUBSET-32BIT-ALU-FORMS): mirror emitBitfieldExtract — a SUB-INT
+        // unit computes the read-modify-write at the promoted int width, then
+        // Truncs the merged unit back to the field type for the Store. A native
+        // (>=32-bit) unit keeps computeTy==fieldTy → the original path (unchanged).
+        std::uint32_t const B0 = p.unitBytes * 8;
+        bool const promote = B0 < 32;
+        TypeId const computeTy = promote ? interner.primitive(TypeKind::I32) : fieldTy;
         std::uint64_t const mask =
             p.bitWidth >= 64 ? ~0ull : ((1ull << p.bitWidth) - 1);
         std::uint64_t const fieldMask = mask << p.bitOffset;
         std::array<MirInstId, 1> lo{unitPtr};
-        MirInstId const unit = mir.addInst(MirOpcode::Load, lo, fieldTy,
-                                           /*payload=*/0, vf);
+        MirInstId unit = mir.addInst(MirOpcode::Load, lo, fieldTy,
+                                     /*payload=*/0, vf);
         if (!unit.valid()) return false;
-        MirInstId const clrK = constIntOfType(static_cast<std::int64_t>(~fieldMask), fieldTy);
+        if (promote) {
+            std::array<MirInstId, 1> ua{unit};
+            unit = mir.addInst(mapCast(interner.kind(fieldTy), TypeKind::I32),
+                               ua, computeTy);
+            // Widen the rhs to the compute type so `rhs & mask` is not a mixed-
+            // width op. rhsVal is FIELD-TYPED by the caller contract (the
+            // assignment RHS is HIR-coerced to the field type; the aggregate-init
+            // caller coerces the value to the field type before this call). Only
+            // its low `bitWidth` bits survive the mask.
+            std::array<MirInstId, 1> ra{rhsVal};
+            rhsVal = mir.addInst(mapCast(interner.kind(fieldTy), TypeKind::I32),
+                                 ra, computeTy);
+        }
+        MirInstId const clrK = constIntOfType(static_cast<std::int64_t>(~fieldMask), computeTy);
         std::array<MirInstId, 2> ca{unit, clrK};
-        MirInstId const cleared = mir.addInst(MirOpcode::And, ca, fieldTy);
-        MirInstId const mK = constIntOfType(static_cast<std::int64_t>(mask), fieldTy);
+        MirInstId const cleared = mir.addInst(MirOpcode::And, ca, computeTy);
+        MirInstId const mK = constIntOfType(static_cast<std::int64_t>(mask), computeTy);
         std::array<MirInstId, 2> ma{rhsVal, mK};
-        MirInstId masked = mir.addInst(MirOpcode::And, ma, fieldTy);
+        MirInstId masked = mir.addInst(MirOpcode::And, ma, computeTy);
         if (p.bitOffset != 0) {
-            MirInstId const sh = constIntOfType(static_cast<std::int64_t>(p.bitOffset), fieldTy);
+            MirInstId const sh = constIntOfType(static_cast<std::int64_t>(p.bitOffset), computeTy);
             std::array<MirInstId, 2> sa{masked, sh};
-            masked = mir.addInst(MirOpcode::Shl, sa, fieldTy);
+            masked = mir.addInst(MirOpcode::Shl, sa, computeTy);
         }
         std::array<MirInstId, 2> oa{cleared, masked};
-        MirInstId const merged = mir.addInst(MirOpcode::Or, oa, fieldTy);
+        MirInstId merged = mir.addInst(MirOpcode::Or, oa, computeTy);
+        if (promote) {   // Trunc the merged unit back to the field type for the Store
+            std::array<MirInstId, 1> ta{merged};
+            merged = mir.addInst(mapCast(TypeKind::I32, interner.kind(fieldTy)),
+                                 ta, fieldTy);
+        }
         std::array<MirInstId, 2> st{merged, unitPtr};
         mir.addInst(MirOpcode::Store, st, InvalidType, /*payload=*/0, vf);
         return true;
@@ -2169,7 +2609,17 @@ struct Lowerer {
             return InvalidMirInst;
         }
         std::uint32_t const mirLitIdx = mir.literalPoolAdd(toMirLiteral(src));
-        (void)mir.addGlobal(hir.typeId(litNode), sym, mirLitIdx);
+        // D-CSUBSET-MUTABLE-CHAR-ARRAY-RODATA: the synthetic string-literal-pool
+        // bytes are IMMUTABLE read-only data (a string literal is const however
+        // it is used). Mint the global CONST so the asm section selection routes
+        // it to `.rodata` — `isConst` is the discriminator that lets a NAMED
+        // mutable `char arr[N]="str"` go to writable `.data` while this SYNTHETIC
+        // pool global stays read-only (tryClassifyAsSymbolAddr's string arm
+        // already mints const; this matches it for the function-body literal /
+        // pointer-decay path).
+        (void)mir.addGlobal(hir.typeId(litNode), sym, mirLitIdx, {},
+                            SymbolBinding::Global, SymbolVisibility::Default,
+                            /*isConst=*/true);
         return mir.addGlobalAddr(sym, ptrTy);
     }
 
@@ -2616,7 +3066,10 @@ struct Lowerer {
     // only on the config-driven layout's `bitFields[]` + `fieldOffsets[]`.
     [[nodiscard]] bool lowerBitfieldAggregateInitIntoSlot(HirNodeId aggNode,
                                                           MirInstId allocaPtr,
-                                                          TypeId aggTy) {
+                                                          TypeId aggTy,
+                                                          MirInstFlags vf = MirInstFlags::None) {
+        // c27: `vf` Volatile when the destination aggregate is `volatile` — every
+        // unit-zero, ordinary-field Store, and bit-field RMW carries the flag.
         StructLayout const* layout = cachedLayout(aggTy);
         if (layout == nullptr) {
             unsupported(aggNode, "bit-field aggregate initializer: layout "
@@ -2669,7 +3122,7 @@ struct Lowerer {
             MirInstId const zero = constIntOfType(0, fieldTy);
             if (!zero.valid()) return false;
             std::array<MirInstId, 2> zst{zero, unitPtr};
-            mir.addInst(MirOpcode::Store, zst);
+            mir.addInst(MirOpcode::Store, zst, InvalidType, /*payload=*/0, vf);
         }
         // PASS 2 — write every field. Bit-fields read-modify-write their (now
         // zeroed) unit; ordinary fields store/recurse; zero-width markers carry
@@ -2696,24 +3149,24 @@ struct Lowerer {
                 TypeKind const fk = interner.kind(fieldTy);
                 if (fk == TypeKind::Struct || fk == TypeKind::Union) {
                     if (hir.kind(child) == HirKind::ConstructAggregate) {
-                        if (!lowerAggregateInitIntoSlot(child, fieldPtr, fieldTy))
+                        if (!lowerAggregateInitIntoSlot(child, fieldPtr, fieldTy, vf))
                             return false;
                     } else {
                         MirInstId const srcPtr = lowerLvalueAddress(child);
                         if (!srcPtr.valid()) return false;
-                        if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                        if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy, vf))
                             return false;
                     }
                     continue;
                 }
                 if (fk == TypeKind::Array) {
                     if (hir.kind(child) == HirKind::ConstructAggregate) {
-                        if (!lowerArrayInitIntoSlot(child, fieldPtr, fieldTy))
+                        if (!lowerArrayInitIntoSlot(child, fieldPtr, fieldTy, vf))
                             return false;
                     } else {
                         MirInstId const srcPtr = lowerLvalueAddress(child);
                         if (!srcPtr.valid()) return false;
-                        if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                        if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy, vf))
                             return false;
                     }
                     continue;
@@ -2721,7 +3174,9 @@ struct Lowerer {
                 MirInstId const v = lowerExpr(child);
                 if (!v.valid()) return false;
                 std::array<MirInstId, 2> stOps{v, fieldPtr};
-                mir.addInst(MirOpcode::Store, stOps);
+                // c27: dest-aggregate volatility OR this field's own type volatility.
+                mir.addInst(MirOpcode::Store, stOps, InvalidType, /*payload=*/0,
+                            vf | volatileFlagForType(fieldTy));
                 continue;
             }
             // Bit-field: Gep to the UNIT (already zeroed in pass 1), then RMW the
@@ -2731,9 +3186,22 @@ struct Lowerer {
             MirInstId const unitPtr = mir.addInst(
                 MirOpcode::Gep, gepOps, interner.pointer(fieldTy));
             if (!unitPtr.valid()) return false;
-            MirInstId const v = lowerExpr(child);
+            MirInstId v = lowerExpr(child);
             if (!v.valid()) return false;
-            if (!emitBitfieldInsert(unitPtr, v, layout->bitFields[f], fieldTy))
+            // c73: coerce the init value to the field type (like an assignment RHS)
+            // so emitBitfieldInsert's RMW sees a field-typed rhs — its sub-int
+            // promote path widens FROM the field type. Same-kind → no cast.
+            {
+                TypeKind const ck = interner.kind(hir.typeId(child));
+                if (ck != interner.kind(fieldTy)) {
+                    MirOpcode const cc = mapCast(ck, interner.kind(fieldTy));
+                    if (cc != MirOpcode::Invalid) {
+                        std::array<MirInstId, 1> va{v};
+                        v = mir.addInst(cc, va, fieldTy);
+                    }
+                }
+            }
+            if (!emitBitfieldInsert(unitPtr, v, layout->bitFields[f], fieldTy, vf))
                 return false;
         }
         return true;
@@ -2749,13 +3217,31 @@ struct Lowerer {
     // Returns false (fail-loud already reported) on any failure.
     [[nodiscard]] bool lowerAggregateInitIntoSlot(HirNodeId aggNode,
                                                   MirInstId allocaPtr,
-                                                  TypeId aggTy) {
+                                                  TypeId aggTy,
+                                                  MirInstFlags vf = MirInstFlags::None) {
+        // c27 (D-CSUBSET-VOLATILE-POINTEE): `vf` is Volatile when the DESTINATION
+        // aggregate is `volatile`-qualified (`volatile struct S s = {…}` — C
+        // 6.7.3p5: every member write of a volatile object is a volatile access).
+        // The VarDecl site passes the object's volatility; structural sub-recursion
+        // propagates it to nested fields/elements. A non-volatile init keeps None.
         // FC8 D-CSUBSET-BITFIELD-INIT: a struct/union initializer whose type has
         // bit-fields packs per allocation unit — a plain field-wise Store would
         // write each bit-field full-width into the shared unit, clobbering its
         // co-resident neighbours. Routed to the unit-aware initializer.
         if (hasBitfieldMember(aggTy)) {
-            return lowerBitfieldAggregateInitIntoSlot(aggNode, allocaPtr, aggTy);
+            return lowerBitfieldAggregateInitIntoSlot(aggNode, allocaPtr, aggTy, vf);
+        }
+        // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): brace-initializing an explicit-offset
+        // (overlapping) struct would positionally Store each field, so a later field
+        // silently clobbers an earlier one that shares its bytes — a wrong-but-runs
+        // aggregate. An FFI overlap type (ULARGE_INTEGER) is only ever member-assigned
+        // (overlap-immune, indexed offsets), never brace-inited; refuse LOUD rather
+        // than miscompile. (Materially strip volatile via the interner's own view.)
+        if (interner.hasExplicitOffsets(aggTy)) {
+            unsupported(aggNode, "brace-initialization of an overlapping "
+                                 "explicit-offset struct is unsupported — its members "
+                                 "share bytes; assign the members individually");
+            return false;
         }
         auto kids = hir.children(aggNode);
         for (std::size_t i = 0; i < kids.size(); ++i) {
@@ -2786,7 +3272,7 @@ struct Lowerer {
             TypeKind const fk = interner.kind(fieldTy);
             if (fk == TypeKind::Struct || fk == TypeKind::Union) {
                 if (hir.kind(kids[i]) == HirKind::ConstructAggregate) {
-                    if (!lowerAggregateInitIntoSlot(kids[i], fieldPtr, fieldTy))
+                    if (!lowerAggregateInitIntoSlot(kids[i], fieldPtr, fieldTy, vf))
                         return false;
                     continue;
                 }
@@ -2796,7 +3282,7 @@ struct Lowerer {
                 // address into the field's sub-slot.
                 MirInstId const srcPtr = lowerLvalueAddress(kids[i]);
                 if (!srcPtr.valid()) return false;
-                if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy, vf))
                     return false;
                 continue;
             }
@@ -2807,13 +3293,13 @@ struct Lowerer {
             // wise; an array VALUE copies byte-wise (D-FC7-AGGREGATE-COPY).
             if (fk == TypeKind::Array) {
                 if (hir.kind(kids[i]) == HirKind::ConstructAggregate) {
-                    if (!lowerArrayInitIntoSlot(kids[i], fieldPtr, fieldTy))
+                    if (!lowerArrayInitIntoSlot(kids[i], fieldPtr, fieldTy, vf))
                         return false;
                     continue;
                 }
                 MirInstId const srcPtr = lowerLvalueAddress(kids[i]);
                 if (!srcPtr.valid()) return false;
-                if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy))
+                if (!lowerAggregateCopy(aggNode, srcPtr, fieldPtr, fieldTy, vf))
                     return false;
                 continue;
             }
@@ -2821,7 +3307,11 @@ struct Lowerer {
             MirInstId const v = lowerExpr(kids[i]);
             if (!v.valid()) return false;
             std::array<MirInstId, 2> stOps{v, fieldPtr};
-            mir.addInst(MirOpcode::Store, stOps);
+            // c27: flag if the dest aggregate is volatile (`vf`) OR this FIELD's own
+            // type is volatile (`struct { volatile int m; }` — `m`'s init is a
+            // volatile write even when the container is plain).
+            mir.addInst(MirOpcode::Store, stOps, InvalidType, /*payload=*/0,
+                        vf | volatileFlagForType(fieldTy));
         }
         return true;
     }
@@ -2839,7 +3329,10 @@ struct Lowerer {
     // funnels through this one helper (§A.5 by-construction coverage).
     [[nodiscard]] bool lowerArrayInitIntoSlot(HirNodeId arrNode,
                                               MirInstId basePtr,
-                                              TypeId /*arrTy*/) {
+                                              TypeId /*arrTy*/,
+                                              MirInstFlags vf = MirInstFlags::None) {
+        // c27: `vf` Volatile when the destination array is `volatile`-qualified
+        // (`volatile int va[] = {…}`); propagated to nested element inits.
         auto kids = hir.children(arrNode);
         for (std::size_t j = 0; j < kids.size(); ++j) {
             TypeId const elemTy = hir.typeId(kids[j]);
@@ -2860,25 +3353,25 @@ struct Lowerer {
             TypeKind const ek = interner.kind(elemTy);
             if (ek == TypeKind::Struct || ek == TypeKind::Union) {
                 if (hir.kind(kids[j]) == HirKind::ConstructAggregate) {
-                    if (!lowerAggregateInitIntoSlot(kids[j], elemPtr, elemTy))
+                    if (!lowerAggregateInitIntoSlot(kids[j], elemPtr, elemTy, vf))
                         return false;
                     continue;
                 }
                 MirInstId const srcPtr = lowerLvalueAddress(kids[j]);
                 if (!srcPtr.valid()) return false;
-                if (!lowerAggregateCopy(arrNode, srcPtr, elemPtr, elemTy))
+                if (!lowerAggregateCopy(arrNode, srcPtr, elemPtr, elemTy, vf))
                     return false;
                 continue;
             }
             if (ek == TypeKind::Array) {
                 if (hir.kind(kids[j]) == HirKind::ConstructAggregate) {
-                    if (!lowerArrayInitIntoSlot(kids[j], elemPtr, elemTy))
+                    if (!lowerArrayInitIntoSlot(kids[j], elemPtr, elemTy, vf))
                         return false;
                     continue;
                 }
                 MirInstId const srcPtr = lowerLvalueAddress(kids[j]);
                 if (!srcPtr.valid()) return false;
-                if (!lowerAggregateCopy(arrNode, srcPtr, elemPtr, elemTy))
+                if (!lowerAggregateCopy(arrNode, srcPtr, elemPtr, elemTy, vf))
                     return false;
                 continue;
             }
@@ -2886,7 +3379,12 @@ struct Lowerer {
             MirInstId const v = lowerExpr(kids[j]);
             if (!v.valid()) return false;
             std::array<MirInstId, 2> stOps{v, elemPtr};
-            mir.addInst(MirOpcode::Store, stOps);
+            // c27: flag the store if the dest array is volatile (`vf`) OR the
+            // ELEMENT type is volatile (`volatile int va[]` distributes the
+            // qualifier to the element type `VolatileQual(int)` — the array itself
+            // is NOT top-level-qualified, so `vf` alone would miss it).
+            mir.addInst(MirOpcode::Store, stOps, InvalidType, /*payload=*/0,
+                        vf | volatileFlagForType(elemTy));
         }
         return true;
     }
@@ -2972,8 +3470,15 @@ struct Lowerer {
         TypeKind const aggKind = interner.kind(aggTy);
         if (aggKind == TypeKind::Union)
             return lowerByteWiseCopy(srcPtr, dstPtr, layout->size, vf);
+        // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): a top-level
+        // ARRAY value copy — `char x[7] = "hi";` copies the N-byte rodata global
+        // (zero-padded at the producer) into the stack slot. `layout->size` is the
+        // array's full byte extent (computeLayout sizes any type incl. arrays), so
+        // a byte-wise copy moves exactly N bytes — the array twin of the Union arm.
+        if (aggKind == TypeKind::Array)
+            return lowerByteWiseCopy(srcPtr, dstPtr, layout->size, vf);
         if (aggKind != TypeKind::Struct) {
-            unsupported(atNode, "aggregate copy of a non-struct/union value "
+            unsupported(atNode, "aggregate copy of a non-struct/union/array value "
                                 "is not supported");
             return false;
         }
@@ -3007,7 +3512,11 @@ struct Lowerer {
         if (anyAggregateField)
             return lowerByteWiseCopy(srcPtr, dstPtr, layout->size, vf);
 
-        // Flat scalar struct — field-wise, width-exact.
+        // Flat scalar struct — field-wise, width-exact. c107: an explicit-offset
+        // (overlapping) struct needs NO guard here — unlike brace-init/static-encode
+        // (which write distinct per-field VALUES and would clobber), a by-value COPY
+        // reads one coherent source and re-writes any overlapping byte identically,
+        // so the redundant writes are byte-equal and the copy is correct.
         for (std::size_t i = 0; i < fieldTypes.size(); ++i) {
             MirInstId const offK = constInt(
                 static_cast<std::int64_t>(layout->fieldOffsets[i]));
@@ -3421,7 +3930,16 @@ struct Lowerer {
                                  "layout (target 'aggregateLayout' / complete type)");
             return false;
         }
-        if (!lowerByteWiseCopy(srcAddr, temp, layout->size)) return false;
+        // c27 (D-CSUBSET-VOLATILE-POINTEE): passing a `volatile`-qualified
+        // aggregate BY VALUE reads the whole object (C 6.7.3p5: every member
+        // access of a volatile aggregate is volatile). The source's ACCESSED TYPE
+        // is `VolatileQual(...)` when the container is volatile (a `volatile struct`
+        // local, or a deref of a `volatile struct *`). Flag the source-reading
+        // Loads of the copy; the temp (a fresh private copy) is non-volatile, so
+        // its piece Loads stay plain.
+        MirInstFlags const srcVf =
+            volatileFlagFor(argNode) | volatileFlagForType(hir.typeId(argNode));
+        if (!lowerByteWiseCopy(srcAddr, temp, layout->size, srcVf)) return false;
         if (abi.kind == AbiPassing::Kind::ByReference) {
             operands.push_back(temp);   // a pointer to the callee-owned copy
             return true;
@@ -3730,13 +4248,22 @@ struct Lowerer {
         }
         MirInstId const srcAddr = lowerLvalueAddress(valNode);
         if (!srcAddr.valid()) return false;
+        // c27 (D-CSUBSET-VOLATILE-POINTEE): returning a `volatile`-qualified
+        // aggregate BY VALUE reads the whole returned object (C 6.7.3p5). The
+        // returned value's ACCESSED TYPE is `VolatileQual(...)` when it is a
+        // `volatile struct` lvalue (or a deref of a `volatile struct *`). Flag the
+        // source-reading Loads (the sret-copy halves and the in-register piece
+        // Loads); the sret destination is the CALLER's storage — keeping the
+        // dest-store flag matches the conservative whole-aggregate-copy convention.
+        MirInstFlags const srcVf =
+            volatileFlagFor(valNode) | volatileFlagForType(hir.typeId(valNode));
         if (abi->kind == AbiPassing::Kind::ByReference) {
             if (!sretPtr_.valid()) {
                 unsupported(valNode, "sret return reached without a hidden result "
                                      "pointer (lowerFunction setup invariant)");
                 return false;
             }
-            if (!lowerByteWiseCopy(srcAddr, sretPtr_, layout->size)) return false;
+            if (!lowerByteWiseCopy(srcAddr, sretPtr_, layout->size, srcVf)) return false;
             // SysV/Win64 return the result pointer in the integer return register
             // (rax/rcx). AAPCS64/Apple x8-sret returns VOID — the caller owns x8 and
             // the storage it points at; the callee must NOT also place it in x0.
@@ -3756,7 +4283,7 @@ struct Lowerer {
                 mir.addInst(MirOpcode::Gep, g, interner.pointer(pty));
             if (!gp.valid()) return false;
             std::array<MirInstId, 1> l{gp};
-            MirInstId const v = mir.addInst(MirOpcode::Load, l, pty);
+            MirInstId const v = mir.addInst(MirOpcode::Load, l, pty, /*payload=*/0, srcVf);
             if (!v.valid()) return false;
             pieces.push_back(v);
         }
@@ -3816,9 +4343,56 @@ struct Lowerer {
             if (auto s = refSymOf(target); s.has_value()) {
                 out.insert(*s);
             }
+        } else if (k == HirKind::VaArg || k == HirKind::VaStart
+                   || k == HirKind::VaEnd) {
+            // c63 (D-CSUBSET-VA-LIST-PARAM-SLOT): va_arg/va_start/va_end use the
+            // va_list as an LVALUE — the list is read AND ADVANCED in place — so a
+            // va_list PARAMETER must be slot-backed (a local va_list already is, via
+            // its VarDecl). kids[0] is the apExpr; mark it when it is a bare Ref.
+            // Drives the Win64/Apple `char*` va_list param onto the addressTaken
+            // scalar arm by USAGE (its Ptr<I8> type is indistinguishable from a plain
+            // char*); the SysV Array<__va_list_tag> param is intercepted earlier by a
+            // dedicated reception arm, so this mark is moot for it.
+            auto kids = hir.children(node);
+            if (!kids.empty()) {
+                if (auto s = refSymOf(kids[0]); s.has_value()) out.insert(*s);
+            }
         }
         for (HirNodeId child : hir.children(node)) {
             collectAddressTakenSymbols(child, out);
+        }
+    }
+
+    // c116b H1 (D-WIN64-SEH-FUNCLETS): collect the symbols referenced by any SEH
+    // `__except` FILTER expression in the function body. The filter is extracted into
+    // a separate funclet function that runs at fault time; it can only reach a parent
+    // local through the parent's FRAME (RecoverParentFrameSlot). A parent PARAMETER is
+    // otherwise a pure SSA `Arg` value (not in memory), which the funclet cannot
+    // recover — so every filter-referenced symbol must be forced MEMORY-BACKED
+    // (address-taken) in the parent, exactly like mem2reg is skipped for SEH bodies.
+    // Body locals are already slot-backed via their VarDecl; this closes the PARAM
+    // gap (sqlite's `sehExceptionFilter(pWal, …)` reads the `pWal` parameter). Keyed
+    // on the SEH HIR node (a C-language construct), not arch/format.
+    void collectSehFilterReferencedSymbols(
+        HirNodeId node, std::unordered_set<std::uint32_t>& out) {
+        if (!node.valid()) return;
+        if (hir.kind(node) == HirKind::SehTryExcept) {
+            HirNodeId const filterN = hir.sehTryFilter(node);
+            collectRefSymbols(filterN, out);
+        }
+        for (HirNodeId child : hir.children(node)) {
+            collectSehFilterReferencedSymbols(child, out);
+        }
+    }
+
+    // Collect every `Ref`-node symbol reachable under `node` (any depth). Used by the
+    // SEH-filter escape analysis to force filter-referenced params into memory.
+    void collectRefSymbols(HirNodeId node,
+                           std::unordered_set<std::uint32_t>& out) {
+        if (!node.valid()) return;
+        if (hir.kind(node) == HirKind::Ref) out.insert(hir.payload(node));
+        for (HirNodeId child : hir.children(node)) {
+            collectRefSymbols(child, out);
         }
     }
 
@@ -3834,6 +4408,26 @@ struct Lowerer {
         }
         for (HirNodeId child : hir.children(node)) {
             collectAddressTakenLabels(child, out);
+        }
+    }
+
+    // c69 (D-MIR-ENTRY-BLOCK-ALLOCA-HOIST): collect every body-local `VarDecl`
+    // node, so `lowerFunction` can pre-emit its storage `Alloca` into the ENTRY
+    // block (which dominates every use) BEFORE lowering the body. Without this a
+    // local declared in an ENTRY-UNREACHABLE block — the canonical case is a
+    // declaration before the first `case` of a `switch`, which the c60 switch-
+    // flatten places in a predecessor-less pre-case block — gets its `Alloca`
+    // emitted into that dead block; the mandatory unreachable-prune
+    // (D-MIR-UNREACHABLE-PRUNE-NORMALIZE) then drops the block while a reachable
+    // case body still `Load`s the slot → the MirFunctionRebuilder rewrite-map
+    // completeness abort (D-OPT2-REWRITE-MAP-COMPLETENESS). Walks the whole body
+    // subtree (no nested functions in the C-subset → every VarDecl is a local of
+    // THIS function); includes `for`-init declarations (a child of the `For`).
+    void collectLocalDecls(HirNodeId node, std::vector<HirNodeId>& out) {
+        if (!node.valid()) return;
+        if (hir.kind(node) == HirKind::VarDecl) out.push_back(node);
+        for (HirNodeId child : hir.children(node)) {
+            collectLocalDecls(child, out);
         }
     }
 
@@ -5056,23 +5650,11 @@ struct Lowerer {
         // If: tracks whether any path reaches the join (the recursive
         // `joinReached`). While/For/DoWhile: unused.
         bool flag0{};
-        // Block: index into `blockCtxs` (the child cursor). Switch: index into
-        // `switchData` (the minted arm blocks). Unused (0) by the others.
+        // Block: index into `blockCtxs` (the child cursor). Unused (0) by the
+        // others. (c60: the Switch frame no longer needs a per-arm cursor — its
+        // body lowers as ONE Block via the work-stack — so it carries only `bb0`.)
         std::uint32_t aux{};
-        // Switch only: index into `blockCtxs` (the arm + within-arm cursor).
-        // Block keeps its cursor in `aux`; Switch needs BOTH accumulators, so
-        // its blockCtxs index lives here. Unused (0) by the others.
-        std::uint32_t aux2BlockCtx{};
     };
-
-    // Per-switch state: the minted arm blocks (one per arm, in declaration
-    // order). Lives in a LIFO accumulator (a nested switch pushes its own) —
-    // the owning frame re-addresses `switchData[aux]` by index, never holds a
-    // reference across a sub-statement push.
-    struct SwitchData {
-        std::vector<MirBlockId> armBlocks;
-    };
-    std::vector<SwitchData> switchData;
 
     // LIFO cursor for an unbounded child-statement list (a Block's stmts, or a
     // switch arm's body). Created when the arm starts iterating, popped when it
@@ -5081,14 +5663,8 @@ struct Lowerer {
     // resume (never holds a reference across a sub-statement push).
     struct BlockIterCtx {
         std::uint32_t idx{};   // next child index to lower
-        // Switch only: the current arm index (into the arm list); the inner
-        // `idx` walks that arm's body statements. `armIdx == kNotSwitch` marks a
-        // plain Block ctx.
-        std::uint32_t armIdx{};
     };
     std::vector<BlockIterCtx> blockCtxs;
-    static constexpr std::uint32_t kNotSwitch =
-        (std::numeric_limits<std::uint32_t>::max)();
 
     // The public statement-lowering entry: a driver over an explicit heap
     // work-stack. For each node, `enterStmt` either PUSHES a frame for a
@@ -5162,7 +5738,7 @@ struct Lowerer {
             case StmtFrame::Kind::Block: {
                 if (f.phase == 0) {
                     f.aux = static_cast<std::uint32_t>(blockCtxs.size());
-                    blockCtxs.push_back({.idx = 0, .armIdx = kNotSwitch});
+                    blockCtxs.push_back({.idx = 0});
                     f.phase = 1;
                     // fall into phase 1 below (no sub-request yet)
                 }
@@ -5484,13 +6060,14 @@ struct Lowerer {
                 }
                 break;
             }
-            // ── SwitchStmt: lower discriminant (flat), mint exit + one block
-            // per arm IN ORDER, resolve cases + default, addSwitch, then lower
-            // each arm's body list (falling through to the next arm). The
-            // discriminant + block layout are emitted in phase 0; the per-arm
-            // body iteration is driven across phases via `blockCtxs[aux]`
-            // (arm cursor + within-arm statement cursor). switchData[aux] holds
-            // the minted arm blocks (re-addressed by index, realloc-safe).
+            // ── SwitchStmt (c60, Design I-A): the dispatch arms map each case
+            // value (+ default) to the ordinal of a synthetic LabelStmt marker in
+            // the FLAT body Block. phase 0 lowers the discriminant, getOrCreates the
+            // case markers' label-blocks (the SAME machinery goto/label use), emits
+            // addSwitch targeting them, pushes the break-frame, opens a fresh
+            // pre-case block, and requests the body Block; phase 1 wires the body's
+            // fall-off-the-end to the join. `bb0` = the join/exit block. NO per-arm
+            // blocks — fall-through is straight-line inside the body.
             case StmtFrame::Kind::Switch: {
                 if (f.phase == 0) {
                     HirNodeId const node2 = f.node;
@@ -5500,19 +6077,16 @@ struct Lowerer {
                     if (!disc.valid()) { work.pop_back(); ok = false; break; }
                     MirBlockId const exitBB =
                         mir.createBlock(StructCfMarker::SwitchJoin);
-                    std::vector<MirBlockId> armBlocks;
-                    armBlocks.reserve(arms.size());
-                    for (std::size_t i = 0; i < arms.size(); ++i) {
-                        armBlocks.push_back(
-                            mir.createBlock(StructCfMarker::SwitchCase));
-                    }
-                    // Build (caseValue,target) list and resolve defaultBB.
+                    // Build (caseValue, target-label-block) + resolve defaultBB,
+                    // targeting the case markers' label-blocks (lazy/forward via
+                    // getOrCreateLabelBlock — the body's LabelStmt markers fill them).
                     std::vector<std::pair<MirInstId, MirBlockId>> cases;
                     cases.reserve(arms.size());
                     MirBlockId defaultBB{};
                     bool failed = false;
-                    for (std::size_t i = 0; i < arms.size(); ++i) {
-                        HirNodeId const arm = arms[i];
+                    for (HirNodeId const arm : arms) {
+                        MirBlockId const target =
+                            getOrCreateLabelBlock(hir.caseArmLabelOrdinal(arm));
                         if (hir.caseArmIsDefault(arm)) {
                             if (defaultBB.valid()) {
                                 unsupported(arm, "switch has more than one "
@@ -5520,7 +6094,7 @@ struct Lowerer {
                                                   "should have flagged this)");
                                 failed = true; break;
                             }
-                            defaultBB = armBlocks[i];
+                            defaultBB = target;
                             continue;
                         }
                         auto const valN = hir.caseArmValue(arm);
@@ -5532,95 +6106,41 @@ struct Lowerer {
                         }
                         MirInstId const caseVal = lowerExpr(*valN);
                         if (!caseVal.valid()) { failed = true; break; }
-                        cases.emplace_back(caseVal, armBlocks[i]);
+                        cases.emplace_back(caseVal, target);
                     }
                     if (failed) {
                         sealCreatedAsUnreachable(exitBB);
-                        for (MirBlockId b : armBlocks)
-                            sealCreatedAsUnreachable(b);
                         work.pop_back(); ok = false; break;
                     }
                     if (!defaultBB.valid()) defaultBB = exitBB;
                     mir.addSwitch(disc, cases, defaultBB);
-                    // Push the break-frame ONCE for the whole switch (all arms
-                    // share it) — matches the recursive single push/pop around
-                    // the arm loop.
+                    // Push the break-frame ONCE for the whole switch.
                     branchStack.push_back({MirBlockId{}, exitBB});
-                    f.aux = static_cast<std::uint32_t>(switchData.size());
-                    switchData.push_back({std::move(armBlocks)});
-                    f.bb0 = exitBB;
-                    f.aux2BlockCtx =
-                        static_cast<std::uint32_t>(blockCtxs.size());
-                    blockCtxs.push_back({.idx = 0, .armIdx = 0});
-                    f.phase = 1;
-                    // fall through into phase 1 (begin arm 0).
-                }
-                // phase 1: begin the current arm's block + request its first
-                // body statement (or advance to the next arm / finish).
-                // phase 2: a body statement finished — handle fall-through /
-                // failure, advance the within-arm cursor or the arm cursor.
-                std::uint32_t const ctxIdx = f.aux2BlockCtx;
-                std::uint32_t const dataIdx = f.aux;
-                HirNodeId const node2 = f.node;
-                auto const arms = hir.switchArms(node2);
-                if (f.phase == 2) {
-                    if (!ok) {
-                        // Seal the remaining arm blocks + exit, pop frame.
-                        std::uint32_t const ai = blockCtxs[ctxIdx].armIdx;
-                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
-                        for (std::size_t j = ai + 1u;
-                             j < switchData[dataIdx].armBlocks.size(); ++j) {
-                            sealCreatedAsUnreachable(
-                                switchData[dataIdx].armBlocks[j]);
-                        }
-                        sealCreatedAsUnreachable(f.bb0);
-                        branchStack.pop_back();
-                        blockCtxs.pop_back();
-                        switchData.pop_back();
-                        work.pop_back(); ok = false; break;
+                    // Only a non-label-first body (a jumped-over leading decl) needs a
+                    // fresh predecessor-less block (pruned as unreachable); a case
+                    // marker opens its own label-block (see the recursive form).
+                    if (!switchBodyStartsWithLabel(hir.switchBody(node2))) {
+                        MirBlockId const preCase =
+                            mir.createBlock(StructCfMarker::Linear);
+                        mir.beginBlock(preCase);
                     }
-                    blockCtxs[ctxIdx].idx += 1u;
+                    f.bb0 = exitBB;
                     f.phase = 1;
-                }
-                // phase 1: dispatch within the current arm.
-                std::uint32_t const ai = blockCtxs[ctxIdx].armIdx;
-                if (ai >= arms.size()) {
-                    // All arms lowered. (The per-arm fall-through Br was emitted
-                    // when each arm's body ran out — see below.)
-                    branchStack.pop_back();
-                    mir.beginBlock(f.bb0);
-                    blockCtxs.pop_back();
-                    switchData.pop_back();
-                    work.pop_back(); ok = true;
+                    enterStmt(hir.switchBody(node2));  // lower body — may invalidate `f`
                     break;
                 }
-                {
-                    std::uint32_t const within = blockCtxs[ctxIdx].idx;
-                    HirNodeId const arm = arms[ai];
-                    auto const body = hir.caseArmBody(arm);
-                    if (within == 0u) {
-                        // First entry into this arm: open its block.
-                        mir.beginBlock(switchData[dataIdx].armBlocks[ai]);
-                    }
-                    if (within >= body.size()) {
-                        // Arm body exhausted: fall through to the next arm's
-                        // first block (or exit if this is the last arm).
-                        if (!mir.openBlockHasTerminator()) {
-                            MirBlockId const fall =
-                                (ai + 1u < arms.size())
-                                    ? switchData[dataIdx].armBlocks[ai + 1u]
-                                    : f.bb0;
-                            mir.addBr(fall);
-                        }
-                        blockCtxs[ctxIdx].armIdx = ai + 1u;
-                        blockCtxs[ctxIdx].idx = 0u;
-                        // loop again (no sub-request) — re-enter phase 1.
-                        break;
-                    }
-                    HirNodeId const stmt = body[within];
-                    f.phase = 2;
-                    enterStmt(stmt);   // lower arm-body stmt — may invalidate `f`
+                // phase 1: the body Block finished (`ok`). Wire fall-off-the-end to
+                // the join, pop the break-frame, and continue emitting at the join.
+                if (!ok) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(f.bb0);
+                    branchStack.pop_back();
+                    work.pop_back(); ok = false; break;
                 }
+                if (!mir.openBlockHasTerminator()) mir.addBr(f.bb0);
+                branchStack.pop_back();
+                mir.beginBlock(f.bb0);
+                work.pop_back(); ok = true;
                 break;
             }
             }
@@ -5727,25 +6247,59 @@ struct Lowerer {
                                        "(HIR verifier should have flagged)");
                     return false;
                 }
-                MirInstId const alloca = allocaForLocal(sym, ty, node);
-                if (!alloca.valid()) return false;
+                // c69 (D-MIR-ENTRY-BLOCK-ALLOCA-HOIST): the slot was pre-emitted
+                // into the ENTRY block by lowerFunction's hoist pre-pass (so a
+                // decl in an entry-unreachable block can't strand its slot). Reuse
+                // it; the pre-pass skips only un-sizeable aggregate/array locals,
+                // for which we emit here (the old path, which then fail-louds).
+                MirInstId alloca;
+                if (auto it = addressableLocal.find(sym.v);
+                    it != addressableLocal.end()) {
+                    alloca = it->second;
+                } else {
+                    alloca = allocaForLocal(sym, ty, node);
+                    if (!alloca.valid()) return false;
+                }
                 if (auto initN = hir.varDeclInit(node); initN.has_value()) {
                     // FC7 (D-FC7-MEMBER-ACCESS): a struct/union initializer
                     // (`P p = {3,4}` / `{.y=7}`) lowers ELEMENT-WISE — one
                     // Gep+Store per field into the slot — never as an
                     // aggregate-SSA Store (no LIR aggregate-width Store).
                     TypeKind const initKind = interner.kind(ty);
+                    // c27 (D-CSUBSET-VOLATILE-POINTEE): a `volatile`-qualified
+                    // aggregate's brace-init (`volatile struct S s = {…}`) writes
+                    // every field as a volatile access (C 6.7.3p5). The dest's
+                    // volatility = its declared type's VolatileQual (c27) OR the
+                    // VarDecl object annotation (c21) — flag every init Store.
+                    MirInstFlags const initVf =
+                        volatileFlagFor(node) | volatileFlagForType(ty);
                     if (hir.kind(*initN) == HirKind::ConstructAggregate
                         && (initKind == TypeKind::Struct
                             || initKind == TypeKind::Union)) {
-                        if (!lowerAggregateInitIntoSlot(*initN, alloca, ty))
+                        if (!lowerAggregateInitIntoSlot(*initN, alloca, ty, initVf))
                             return false;
                     } else if (hir.kind(*initN) == HirKind::ConstructAggregate
                                && initKind == TypeKind::Array) {
                         // D-MIR-ARRAY-FIELD-AGGREGATE-INIT (array-LOCAL form):
                         // `int a[3] = {1,2,3}` — element-wise into the slot via
                         // the same helper the array-field recurse-guard uses.
-                        if (!lowerArrayInitIntoSlot(*initN, alloca, ty))
+                        if (!lowerArrayInitIntoSlot(*initN, alloca, ty, initVf))
+                            return false;
+                    } else if (initKind == TypeKind::Array
+                               && hir.kind(*initN) == HirKind::Literal) {
+                        // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL):
+                        // `char x[7] = "hi";` — a STRING LITERAL initializing a CHAR
+                        // ARRAY local. The HIR coerce arm retyped the literal to the
+                        // slot's `char[N]`, so its lvalue address materializes the
+                        // rodata global SIZED at N (string bytes + NUL, zero-padded to
+                        // N by the asm producer); copy those N bytes into the stack
+                        // slot. This is the array-COPY twin of the `int a[3]={…}`
+                        // element-wise arm above and the struct-field string arm —
+                        // the global is N bytes so the N-byte copy never reads OOB
+                        // (the Option-A pad-at-the-producer invariant).
+                        MirInstId const srcPtr = lowerLvalueAddress(*initN);
+                        if (!srcPtr.valid()) return false;
+                        if (!lowerAggregateCopy(*initN, srcPtr, alloca, ty, initVf))
                             return false;
                     } else if (initKind == TypeKind::Struct
                                || initKind == TypeKind::Union) {
@@ -5756,25 +6310,29 @@ struct Lowerer {
                         // register.
                         MirInstId const srcPtr = lowerLvalueAddress(*initN);
                         if (!srcPtr.valid()) return false;
-                        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a WHOLE-VOLATILE
-                        // aggregate copy flags every structural Load/Store. Either
-                        // side being volatile (the dest local `node` OR the source
-                        // `*initN`) makes the copy volatile — OR them so neither
-                        // side's volatility is dropped (safe-conservative: an
-                        // extra flag only forgoes an optimization).
+                        // c21/c27: a WHOLE-VOLATILE aggregate copy flags every
+                        // structural Load/Store. Either side being volatile makes
+                        // the copy volatile: c21 via the object-volatile dest local
+                        // `node` / source `*initN`; c27 via the source's ACCESSED
+                        // TYPE being top-level VolatileQual (a `volatile struct`
+                        // value, or a deref of a `volatile struct *`). OR all so no
+                        // side's volatility is dropped (safe-conservative).
                         MirInstFlags const aggVf =
-                            volatileFlagFor(node) | volatileFlagFor(*initN);
+                            volatileFlagFor(node) | volatileFlagFor(*initN)
+                            | volatileFlagForType(ty)
+                            | volatileFlagForType(hir.typeId(*initN));
                         if (!lowerAggregateCopy(*initN, srcPtr, alloca, ty, aggVf))
                             return false;
                     } else {
                         MirInstId const initVal = lowerExpr(*initN);
                         if (!initVal.valid()) return false;
                         std::array<MirInstId, 2> ops{initVal, alloca};
-                        // c21 (D-CSUBSET-VOLATILE-QUALIFIER): the init store into a
-                        // `volatile` local's slot carries the flag (the VarDecl node
-                        // was annotated from the object's `isVolatile`).
+                        // c21/c27: the init store into a `volatile` local's slot
+                        // carries the flag — via the VarDecl object annotation (c21)
+                        // OR the declared type's VolatileQual (c27, e.g. a `vint x`
+                        // typedef = `volatile int`). OR both so neither is missed.
                         mir.addInst(MirOpcode::Store, ops, InvalidType, /*payload=*/0,
-                                    volatileFlagFor(node));
+                                    volatileFlagFor(node) | volatileFlagForType(ty));
                     }
                 }
                 return true;
@@ -5801,25 +6359,33 @@ struct Lowerer {
                     if (!dstPtr.valid()) return false;
                     MirInstId const srcPtr = lowerLvalueAddress(valueN);
                     if (!srcPtr.valid()) return false;
-                    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a WHOLE-VOLATILE aggregate
-                    // assignment flags every structural Load/Store — either the
-                    // target or the source being volatile makes the copy volatile
-                    // (OR them so neither side's volatility is dropped).
+                    // c21/c27: a WHOLE-VOLATILE aggregate assignment flags every
+                    // structural Load/Store — either the target or source being
+                    // volatile makes the copy volatile. c21 via object-volatile
+                    // target/source; c27 via either side's ACCESSED TYPE being
+                    // top-level VolatileQual (a `volatile struct` lvalue, or a deref
+                    // of a `volatile struct *`). OR all so no side is dropped.
                     MirInstFlags const aggVf =
-                        volatileFlagFor(targetN) | volatileFlagFor(valueN);
+                        volatileFlagFor(targetN) | volatileFlagFor(valueN)
+                        | volatileFlagForType(hir.typeId(targetN))
+                        | volatileFlagForType(hir.typeId(valueN));
                     return lowerAggregateCopy(node, srcPtr, dstPtr, valTy, aggVf);
                 }
                 MirInstId const rhs = lowerExpr(valueN);
                 if (!rhs.valid()) return false;
                 MirInstId const ptr = lowerLvalueAddress(targetN);
                 if (!ptr.valid()) return false;
-                // c21 (D-CSUBSET-VOLATILE-QUALIFIER): the store's volatility is the
-                // TARGET lvalue's — `targetN` is a Ref (volatile object/global) or
-                // a MemberAccess (volatile member), both annotated at CST→HIR. A
-                // Deref target (`*p = x`) carries no flag here BY CONSTRUCTION:
-                // pointer-to-volatile-pointee is rejected upstream, and a volatile
-                // pointer OBJECT's volatility is the load of `p` (the Ref site).
-                MirInstFlags const vf = volatileFlagFor(targetN);
+                // c21/c27: the store's volatility is the TARGET lvalue's. c21:
+                // `targetN` is a Ref (object-volatile) or MemberAccess
+                // (object-volatile member), annotated at CST→HIR. c27: the target's
+                // ACCESSED TYPE is volatile — a Deref target `*p = x` where `p` is
+                // `volatile int *` (targetN's type = the pointee `VolatileQual(int)`),
+                // an Index `va[i] = x` into a volatile element, or a member whose
+                // field type is top-level VolatileQual. OR the type-derived flag so
+                // a volatile-pointee STORE is never dropped (the c21 comment's
+                // "Deref carries no flag" no longer holds — pointees compile now).
+                MirInstFlags const vf =
+                    volatileFlagFor(targetN) | volatileFlagForType(hir.typeId(targetN));
                 // FC8 D-CSUBSET-BITFIELD: a bit-field write is a READ-MODIFY-WRITE
                 // of the allocation unit (the Gep targets the unit) — clear the
                 // field's bits, OR in the new value, store back. A plain Store
@@ -5898,6 +6464,99 @@ struct Lowerer {
                 mir.beginBlock(joinBB);
                 if (!joinReached) {
                     mir.addUnreachable();
+                }
+                return true;
+            }
+            case HirKind::SehTryExcept: {
+                // c115 SEH (D-WIN64-SEH-FUNCLETS) — the region skeleton:
+                //   pre:      SehTryBegin(id), succs [tryBB, filterBB]
+                //   tryBB:    guarded body …; SehTryEnd(id); Br(joinBB)
+                //             (the SINGLE exit — option (C), verifier-enforced
+                //             D-CSUBSET-SEH-EARLY-EXIT; a body sealing itself
+                //             (infinite loop) simply has no End marker)
+                //   filterBB: filter expr …; SehFilterReturn(i32, id) → handlerBB
+                //   handlerBB: handler body …; Br(joinBB)
+                //   joinBB:   the continuation.
+                // All four blocks stamp Linear — the canonical marker derive
+                // (rederiveStructCfMarkers, which OVERWRITES creation stamps
+                // after finish()) classifies them from CFG shape; its if/switch
+                // rules key on CondBr/Switch only, and the verifier's single-
+                // pred rules keep back-edge/loop-exit claims off filter/handler.
+                // Locals stay memory-true: mem2reg skips SEH-containing
+                // functions (fault-time state must be observable), and
+                // SehTryBegin/End/FilterReturn are opcodeClobbersMemory members
+                // so CSE/LICM never move Load/Store across region boundaries.
+                HirNodeId const tryN     = hir.sehTryBody(node);
+                HirNodeId const filterN  = hir.sehTryFilter(node);
+                HirNodeId const handlerN = hir.sehTryHandler(node);
+
+                std::uint32_t const regionId = sehRegionCounter_++;
+                MirBlockId const tryBB     = mir.createBlock(StructCfMarker::Linear);
+                MirBlockId const filterBB  = mir.createBlock(StructCfMarker::Linear);
+                MirBlockId const handlerBB = mir.createBlock(StructCfMarker::Linear);
+                MirBlockId const joinBB    = mir.createBlock(StructCfMarker::Linear);
+                mir.addSehTryBegin(tryBB, filterBB, regionId);
+
+                bool joinReached = false;
+
+                // ── the guarded body ──
+                mir.beginBlock(tryBB);
+                if (!lowerStmt(tryN)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(filterBB);
+                    sealCreatedAsUnreachable(handlerBB);
+                    sealCreatedAsUnreachable(joinBB);
+                    return false;
+                }
+                if (!mir.openBlockHasTerminator()) {
+                    mir.addInst(MirOpcode::SehTryEnd, {}, InvalidType, regionId);
+                    mir.addBr(joinBB);
+                    joinReached = true;
+                }
+
+                // ── the filter expression (i32-coerced: MSVC's filter contract;
+                //    a Bool comparison like `_exception_code()==E` ZExts) ──
+                mir.beginBlock(filterBB);
+                MirInstId fval = lowerExpr(filterN);
+                if (!fval.valid()) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(handlerBB);
+                    sealCreatedAsUnreachable(joinBB);
+                    return false;
+                }
+                TypeId const i32Ty = interner.primitive(TypeKind::I32);
+                TypeId const ft    = hir.typeId(filterN);
+                if (ft.valid() && ft != i32Ty) {
+                    MirOpcode const castOp = mapCast(interner.kind(ft), TypeKind::I32);
+                    if (castOp == MirOpcode::Invalid) {
+                        unsupported(node, "SEH __except filter expression must be "
+                                          "an integer (MSVC: the filter value is "
+                                          "an int)");
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        sealCreatedAsUnreachable(handlerBB);
+                        sealCreatedAsUnreachable(joinBB);
+                        return false;
+                    }
+                    std::array<MirInstId, 1> const castOps{fval};
+                    fval = mir.addInst(castOp, castOps, i32Ty);
+                }
+                mir.addSehFilterReturn(fval, handlerBB, regionId);
+
+                // ── the handler body ──
+                mir.beginBlock(handlerBB);
+                if (!lowerStmt(handlerN)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(joinBB);
+                    return false;
+                }
+                if (!mir.openBlockHasTerminator()) {
+                    mir.addBr(joinBB);
+                    joinReached = true;
+                }
+
+                mir.beginBlock(joinBB);
+                if (!joinReached) {
+                    mir.addUnreachable();   // both paths sealed — pruned centrally
                 }
                 return true;
             }
@@ -6090,25 +6749,29 @@ struct Lowerer {
                 return true;
             }
             case HirKind::ContinueStmt: {
-                std::uint32_t const depth = hir.branchDepth(node);
-                if (depth >= branchStack.size()) {
-                    unsupported(node, std::format(
-                        "ContinueStmt depth {} exceeds enclosing-frame count "
-                        "{} (HIR verifier should have flagged this)",
-                        depth, branchStack.size()));
+                // C 6.8.6.2: `continue` targets the innermost LOOP; switch frames are
+                // TRANSPARENT (a switch frame has continueBB invalid). Skip them — the
+                // depth counts loop frames, matching the verifier's loops-only view
+                // (so a `continue` inside a switch inside a loop reaches the loop).
+                std::uint32_t depth = hir.branchDepth(node);
+                MirBlockId target{};
+                for (std::size_t i = branchStack.size(); i-- > 0;) {
+                    BranchFrame& frame = branchStack[i];
+                    if (!frame.continueBB.valid()) continue;   // skip switch frames
+                    if (depth == 0) {
+                        frame.continueReferenced = true;
+                        target = frame.continueBB;
+                        break;
+                    }
+                    --depth;
+                }
+                if (!target.valid()) {
+                    unsupported(node,
+                        "ContinueStmt resolves to no enclosing loop (HIR "
+                        "verifier should have flagged this)");
                     return false;
                 }
-                BranchFrame& frame =
-                    branchStack[branchStack.size() - 1 - depth];
-                if (!frame.continueBB.valid()) {
-                    unsupported(node, std::format(
-                        "ContinueStmt depth {} resolves to a switch frame "
-                        "which has no continue target (HIR verifier should "
-                        "have flagged this)", depth));
-                    return false;
-                }
-                frame.continueReferenced = true;
-                mir.addBr(frame.continueBB);
+                mir.addBr(target);
                 return true;
             }
             case HirKind::GotoStmt: {
@@ -6164,20 +6827,19 @@ struct Lowerer {
                 return lowerStmt(hir.labelBody(node));
             }
             case HirKind::SwitchStmt: {
-                // C-style switch: each `CaseArm` has an optional match value
-                // and a body span; arms execute in declaration order with
-                // FALL-THROUGH when a body doesn't terminate (no break +
-                // no return). `default:` is the fall-back target. Lower as:
+                // c60 (Design I-A): a FLATTENED switch — the dispatch arms map each
+                // case value (and `default`) to the ordinal of a synthetic LabelStmt
+                // marker in the flat body Block; the body is lowered as ONE statement
+                // sequence with fall-through, exactly like a block. Lower as:
                 //   - lower discriminant
-                //   - createBlock per arm (1+ body blocks) + one exit block
-                //   - emit `Switch(disc, cases…, defaultBB)` where
-                //     defaultBB is the default arm's first block (or `exit`
-                //     if no default arm exists)
-                //   - lower each arm's body in order; fall-through arms
-                //     branch to the NEXT arm's first block; the last arm
-                //     falls through to exit.
-                //   - push `{invalid-continue, exit}` so `break;` targets
-                //     exit (continue inside switch is a HIR verifier error).
+                //   - getOrCreate a label-block per dispatch arm (the SAME label-block
+                //     machinery goto/label use); `default`'s block is `defaultBB`
+                //     (else the exit/join)
+                //   - emit `Switch(disc, cases…, defaultBB)` targeting those blocks
+                //   - push `{invalid-continue, exit}` so `break;` targets the join
+                //   - lower the flat body Block; its case/default LabelStmt markers
+                //     beginBlock their label-blocks (fall-through is straight-line);
+                //     a fall-off-the-end branches to the join.
                 HirNodeId const discN = hir.switchDiscriminant(node);
                 auto       const arms  = hir.switchArms(node);
 
@@ -6185,29 +6847,25 @@ struct Lowerer {
                 if (!disc.valid()) return false;
 
                 MirBlockId const exitBB = mir.createBlock(StructCfMarker::SwitchJoin);
-                // One block per arm, in declaration order.
-                std::vector<MirBlockId> armBlocks;
-                armBlocks.reserve(arms.size());
-                for (std::size_t i = 0; i < arms.size(); ++i) {
-                    armBlocks.push_back(mir.createBlock(StructCfMarker::SwitchCase));
-                }
 
-                // Build (caseValue, target) list and resolve defaultBB.
+                // Build the (caseValue, target-label-block) list + resolve defaultBB,
+                // targeting the case markers' label-blocks (created lazily / forward
+                // by getOrCreateLabelBlock — the body's LabelStmt markers fill them).
                 std::vector<std::pair<MirInstId, MirBlockId>> cases;
                 cases.reserve(arms.size());
                 MirBlockId defaultBB{};
-                for (std::size_t i = 0; i < arms.size(); ++i) {
-                    HirNodeId const arm = arms[i];
+                for (HirNodeId const arm : arms) {
+                    MirBlockId const target =
+                        getOrCreateLabelBlock(hir.caseArmLabelOrdinal(arm));
                     if (hir.caseArmIsDefault(arm)) {
                         if (defaultBB.valid()) {
                             unsupported(arm, "switch has more than one "
                                               "default arm (HIR verifier "
                                               "should have flagged this)");
                             sealCreatedAsUnreachable(exitBB);
-                            for (MirBlockId b : armBlocks) sealCreatedAsUnreachable(b);
                             return false;
                         }
-                        defaultBB = armBlocks[i];
+                        defaultBB = target;
                         continue;
                     }
                     auto const valN = hir.caseArmValue(arm);
@@ -6216,56 +6874,53 @@ struct Lowerer {
                                           "match value (HIR verifier "
                                           "should have flagged this)");
                         sealCreatedAsUnreachable(exitBB);
-                        for (MirBlockId b : armBlocks) sealCreatedAsUnreachable(b);
                         return false;
                     }
                     MirInstId const caseVal = lowerExpr(*valN);
                     if (!caseVal.valid()) {
                         sealCreatedAsUnreachable(exitBB);
-                        for (MirBlockId b : armBlocks) sealCreatedAsUnreachable(b);
                         return false;
                     }
-                    cases.emplace_back(caseVal, armBlocks[i]);
+                    cases.emplace_back(caseVal, target);
                 }
                 if (!defaultBB.valid()) defaultBB = exitBB;
 
                 mir.addSwitch(disc, cases, defaultBB);
 
-                // Lower each arm's body, falling through to the next arm
-                // when not self-terminated. Push the break-frame ONCE for
-                // the whole switch (all arms share it).
+                // The discriminant block is now terminated by the Switch. If the body
+                // starts with a case marker (a LabelStmt — the usual shape), that
+                // marker's lowering opens its own label-block directly. ONLY if the
+                // body starts with a non-label statement (a jumped-over leading decl)
+                // do we need a fresh predecessor-less block for it to lower into (the
+                // unreachable-prune drops it, since the dispatch jumped straight to
+                // the case/default blocks).
                 branchStack.push_back({MirBlockId{}, exitBB});
-                for (std::size_t i = 0; i < arms.size(); ++i) {
-                    mir.beginBlock(armBlocks[i]);
-                    HirNodeId const arm = arms[i];
-                    bool armOk = true;
-                    for (HirNodeId stmt : hir.caseArmBody(arm)) {
-                        if (!lowerStmt(stmt)) { armOk = false; break; }
-                    }
-                    if (!armOk) {
-                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
-                        // Seal the remaining arm blocks + exit so finish()
-                        // doesn't abort on a created-but-unfilled block.
-                        for (std::size_t j = i + 1; j < arms.size(); ++j) {
-                            sealCreatedAsUnreachable(armBlocks[j]);
-                        }
-                        sealCreatedAsUnreachable(exitBB);
-                        branchStack.pop_back();
-                        return false;
-                    }
-                    if (!mir.openBlockHasTerminator()) {
-                        // Fall through: branch to the next arm's first
-                        // block, or to exit if this is the last arm.
-                        MirBlockId const fall = (i + 1 < arms.size())
-                            ? armBlocks[i + 1] : exitBB;
-                        mir.addBr(fall);
-                    }
+                if (!switchBodyStartsWithLabel(hir.switchBody(node))) {
+                    MirBlockId const preCase =
+                        mir.createBlock(StructCfMarker::Linear);
+                    mir.beginBlock(preCase);
                 }
+                bool const bodyOk = lowerStmt(hir.switchBody(node));
+                if (!bodyOk) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    sealCreatedAsUnreachable(exitBB);
+                    branchStack.pop_back();
+                    return false;
+                }
+                // Fall-off-the-end of the body → the join.
+                if (!mir.openBlockHasTerminator()) mir.addBr(exitBB);
                 branchStack.pop_back();
 
                 mir.beginBlock(exitBB);
                 return true;
             }
+            case HirKind::TypeDecl:
+                // c30 (D-CSUBSET-LOCAL-TYPEDEF): a BLOCK-SCOPED typedef lowers to
+                // a statement-position TypeDecl. Exactly like the TOP-LEVEL
+                // TypeDecl (a no-op — "interns a type into the lattice but emits
+                // no code"), it has NO MIR runtime effect: the alias was resolved
+                // at semantic time, so the declaration emits nothing. Skip it.
+                return true;
             default: break;
         }
         unsupported(node,
@@ -6337,6 +6992,13 @@ struct Lowerer {
         HirNodeId const body = hir.functionBody(node);
         std::unordered_set<std::uint32_t> addressTaken;
         collectAddressTakenSymbols(body, addressTaken);
+        // c116b H1 (D-WIN64-SEH-FUNCLETS): also force every SEH `__except` FILTER-
+        // referenced symbol memory-backed. The filter is extracted into a funclet
+        // that recovers parent locals off the establisher frame (RecoverParentFrame
+        // Slot), which only works for a FRAME slot — a bare `Arg` param is otherwise
+        // unrecoverable. Union into the address-taken set so the param-reception loop
+        // below alloca-backs it (sqlite's `sehExceptionFilter(pWal, …)` param).
+        collectSehFilterReferencedSymbols(body, addressTaken);
         // D-CSUBSET-COMPUTED-GOTO: collect the address-taken LABEL ordinals up front
         // (a forward `&&end` must be a known IndirectBr successor regardless of
         // textual order). The blocks are created lazily at first reference.
@@ -6417,6 +7079,27 @@ struct Lowerer {
         // function the per-class GPR ordinal equals the param index (no change); a
         // mixed int/float signature now lands each arg in its own class (fixes
         // D-ML7-2.10). `argCtr` is hoisted above (shared with the sret arg).
+        // c63 (D-CSUBSET-VA-LIST-PARAM-SLOT): is `t` a SysV `va_list` PARAM — an
+        // `__va_list_tag[1]` array (or, defensively, a Ptr<__va_list_tag>) — under the
+        // SysVRegisterSave strategy? Such a param's incoming GPR is a POINTER to the
+        // caller's tag (C 6.7.6.3p7 array-param adjustment); a dedicated arm below
+        // registers that pointer. Win64/Apple (`char*`) + AAPCS64 (`__va_list` struct)
+        // va_list params are NOT this — they ride the addressTaken-scalar / by-value-
+        // struct arms (the former marked address-taken by va_arg usage, since their
+        // Ptr<I8> type is indistinguishable from a plain char*).
+        auto isSysVVaListParam = [&](TypeId t) -> bool {
+            if (!config.vaListLayout.has_value()
+                || config.vaListLayout->strategy
+                       != VaListStrategy::SysVRegisterSave)
+                return false;
+            if (!t.valid()) return false;
+            TypeKind const tk = interner.kind(t);
+            if (tk != TypeKind::Array && tk != TypeKind::Ptr) return false;
+            auto const ops = interner.operands(t);
+            return !ops.empty() && ops[0].valid()
+                && interner.kind(ops[0]) == TypeKind::Struct
+                && interner.name(ops[0]) == "__va_list_tag";
+        };
         for (std::size_t i = 0; i < params.size(); ++i) {
             HirNodeId const p = params[i];
             // A param is a VarDecl whose typeId carries the param's type;
@@ -6459,6 +7142,28 @@ struct Lowerer {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
                 }
+                continue;
+            }
+            // c63 (D-CSUBSET-VA-LIST-PARAM-SLOT): a SysV `va_list` PARAMETER. By C
+            // 6.7.6.3p7 array-param adjustment the caller passes a POINTER to ITS OWN
+            // `__va_list_tag` in one GPR; `va_arg` must advance the CALLER's tag
+            // (forwarding semantics), so register that incoming pointer AS the symbol's
+            // address — NO alloca, NO 24-byte copy (a copy reads a stale tag = a silent
+            // miscompile). Mirrors receiveByValueParam's ByReference precedent ("the
+            // caller's copy is the param"). Consumes ONE GPR ordinal — exactly what the
+            // scalar arm would for this array-decayed pointer — so the remaining params'
+            // ordinals + the fixed-arg count stay correct. (Win64/Apple `char*` va_list
+            // params take the addressTaken-scalar arm below; AAPCS64 `__va_list` struct
+            // params took the by-value-struct arm above.)
+            if (isSysVVaListParam(ty)) {
+                auto const ops = interner.operands(ty);
+                MirInstId const ptr = mir.addArg(argCtr.next(AbiPieceClass::Gpr),
+                                                 interner.pointer(ops[0]));
+                if (!ptr.valid()) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+                addressableLocal[sym.v] = ptr;
                 continue;
             }
             // FC7 (D-FC7-SYSV-STRUCT-ARG-MULTIREG / fixes D-ML7-2.10): a scalar
@@ -6513,6 +7218,43 @@ struct Lowerer {
         currentFnFixedGpr_  = argCtr.gpr;
         currentFnFixedFpr_  = argCtr.fpr;
         currentFnFixedFlat_ = argCtr.flat;
+        // c69 (D-MIR-ENTRY-BLOCK-ALLOCA-HOIST): pre-emit every body-local's
+        // storage `Alloca` into the ENTRY block, which is still the open block
+        // here (the param loop appended Args/param-slots; no terminator yet) and
+        // dominates every use. This is the conventional "all allocas in entry"
+        // discipline: it keeps an ENTRY-UNREACHABLE block (e.g. a switch's
+        // pre-first-case block, c60) free of value-producing instructions so the
+        // mandatory unreachable-prune can drop it without stranding a slot that a
+        // reachable use still references (the c69 MirFunctionRebuilder abort,
+        // D-OPT2-REWRITE-MAP-COMPLETENESS). The init Store stays at the (possibly
+        // dead) decl site. The append-only MirBuilder cannot insert into a sealed
+        // block, so the slots MUST be emitted now, up front; the VarDecl lowering
+        // then reuses the pre-emitted slot. Mem2Reg still promotes/removes the
+        // unused ones. A by-value aggregate PARAM slot is already placed by the
+        // param loop (a distinct symbol); an un-sizeable aggregate/array local is
+        // skipped here and left to the VarDecl site's fail-loud (no behavior
+        // change for that invalid-C edge case).
+        {
+            std::vector<HirNodeId> localDecls;
+            collectLocalDecls(body, localDecls);
+            for (HirNodeId d : localDecls) {
+                TypeId   const dty  = hir.varDeclType(d);
+                SymbolId const dsym = hir.varDeclSymbol(d);
+                if (!dty.valid() || !dsym.valid()) continue;  // VarDecl site fail-louds
+                if (addressableLocal.contains(dsym.v)
+                    || symbolToValue.contains(dsym.v))
+                    continue;  // already slotted (defensive; locals/params are distinct)
+                TypeKind const dtk = interner.kind(dty);
+                if ((dtk == TypeKind::Struct || dtk == TypeKind::Union
+                     || dtk == TypeKind::Array)
+                    && !aggregateByteSize(dty).has_value())
+                    continue;  // un-sizeable here → leave to the VarDecl site (old path)
+                if (!allocaForLocal(dsym, dty, d).valid()) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+            }
+        }
         // Body: a single Block of statements.
         if (!lowerStmt(body)) {
             // Failed mid-body — seal the block so finish() can complete and
@@ -6588,6 +7330,107 @@ struct Lowerer {
         // post-fold review).
         std::unordered_set<std::uint32_t> seenExternSyms;
         for (HirNodeId decl : hir.moduleDecls(moduleNode)) {
+            // c82 (D-LK-EXTERN-DATA-IMPORT): ExternGlobal — an extern DATA
+            // object with no intra-module definition (the same-TU-definition
+            // case never reaches HIR: the semantic merge suppresses the
+            // extern node). Registered EXACTLY like an extern function —
+            // an ExternImport row (flagged isData) + a symbol registration —
+            // except the symbol goes into `globalSymbols`, so a `Ref` lowers
+            // through the SAME GlobalAddr(+Load) path an intra-module global
+            // uses. Cross-TU: the LK11 merge collapses the row onto a
+            // sibling CU's definition (sqlite3.c's `sqlite3_version`) and
+            // drops the import; a TRUE library data import (libc `stdout`)
+            // survives to the link tier, which fail-louds until the
+            // extern-data binding model lands (the c82 §B).
+            if (hir.kind(decl) == HirKind::ExternGlobal) {
+                TypeId const ty = hir.externGlobalType(decl);
+                if (!ty.valid()) {
+                    unsupported(decl, std::format(
+                        "HIR ExternGlobal (id {}) — invalid TypeId; the "
+                        "semantic model failed to resolve this extern "
+                        "object's declared type.", decl.v));
+                    continue;
+                }
+                SymbolId const sym = hir.externGlobalSymbol(decl);
+                if (!sym.valid()) {
+                    unsupported(decl, std::format(
+                        "HIR ExternGlobal (id {}) — missing SymbolId; the "
+                        "semantic model failed to bind a symbol to this "
+                        "extern declaration.", decl.v));
+                    continue;
+                }
+                if (functionSymbols.contains(sym.v)
+                    || globalSymbols.contains(sym.v)) {
+                    unsupported(decl, std::format(
+                        "HIR ExternGlobal (id {}) — SymbolId #{} is already "
+                        "declared as an intra-module function or global. "
+                        "Each SymbolId must belong to exactly one "
+                        "definition surface.", decl.v, sym.v));
+                    continue;
+                }
+                if (!seenExternSyms.insert(sym.v).second) {
+                    unsupported(decl, std::format(
+                        "HIR ExternGlobal (id {}) — SymbolId #{} is already "
+                        "declared by a prior extern in this module.",
+                        decl.v, sym.v));
+                    continue;
+                }
+                FfiMetadata const* meta = (ffiMap != nullptr)
+                    ? ffiMap->tryGet(decl)
+                    : nullptr;
+                // Same fail-loud metadata contract as the function arm
+                // below: no name / no library ⇒ the linker could neither
+                // resolve nor import the symbol — surface it HERE with the
+                // source span.
+                if (meta == nullptr || meta->mangledName.empty()) {
+                    unsupported(decl, std::format(
+                        "HIR ExternGlobal (id {}) — `mangledName` is missing "
+                        "from the HirAttribute<FfiMetadata> side-table. "
+                        "Every extern symbol must carry a non-empty mangled "
+                        "name (the linker's import-table key).", decl.v));
+                    continue;
+                }
+                if (meta->importLibrary.empty()) {
+                    unsupported(decl, std::format(
+                        "HIR ExternGlobal (id {}) — `importLibrary` is "
+                        "missing from the HirAttribute<FfiMetadata> "
+                        "side-table. Every extern symbol must declare the "
+                        "dynamic library that owns it.", decl.v));
+                    continue;
+                }
+                ExternImport row;
+                row.symbol      = sym;
+                row.mangledName = meta->mangledName;
+                row.libraryPath = meta->importLibrary;
+                row.isData      = true;
+                // c84 (D-LK-EXTERN-DATA-IMPORT): derive the imported
+                // OBJECT's byte size + alignment from the declared
+                // type's LAYOUT (the same computeLayout every sizeof /
+                // global-emission consumer uses — a `FILE*` object is
+                // the DataModel's pointer width, never a hardcoded 8).
+                // The ELF copy-relocation emitter reserves a `.bss`
+                // slot of exactly this shape and stamps `st_size`.
+                // An INCOMPLETE declared type (`extern const char
+                // v[];` — no computable layout) legitimately leaves
+                // both 0: legal C for a cross-TU extern the LK11
+                // merge resolves against its defining sibling CU;
+                // a TRUE library import surviving to the walker with
+                // size 0 fails loud THERE (an unsized copy slot
+                // cannot be reserved), keeping the incomplete-array
+                // cross-TU case working.
+                if (config.aggregateLayoutLoaded) {
+                    auto const layout = computeLayout(
+                        ty, interner, config.aggregateLayout,
+                        config.dataModel);
+                    if (layout.has_value()) {
+                        row.dataSizeBytes  = layout->size;
+                        row.dataAlignBytes = layout->align.bytes();
+                    }
+                }
+                externImports.push_back(std::move(row));
+                globalSymbols.insert(sym.v);
+                continue;
+            }
             if (hir.kind(decl) != HirKind::ExternFunction) continue;
             TypeId const sig = hir.externFunctionSignature(decl);
             if (!sig.valid()) {
@@ -6667,7 +7510,15 @@ struct Lowerer {
                     "attribute manually until then.", decl.v));
                 continue;
             }
-            if (meta->importLibrary.empty()) {
+            // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): a
+            // `noLibraryBinding` extern is EXEMPT from the library
+            // requirement — a bare-prototype cross-TU reference carries
+            // an EMPTY libraryPath on purpose. The LK11 merge resolves
+            // it against a sibling TU's definition (row stripped, calls
+            // direct); an unresolved survivor is rejected LOUD at the
+            // link tier as an undefined symbol (K_SymbolUndefined naming
+            // the symbol). Every OTHER producer keeps the hard contract.
+            if (meta->importLibrary.empty() && !meta->noLibraryBinding) {
                 unsupported(decl, std::format(
                     "HIR ExternFunction (id {}) — `importLibrary` "
                     "is missing from the HirAttribute<FfiMetadata> "
@@ -6749,25 +7600,69 @@ struct Lowerer {
     // collect*, so minting here is safe; pushing the rodata PendingGlobal mid-
     // classify is safe (the classify loop walks moduleDecls, not pendingGlobals).
     [[nodiscard]] std::optional<std::pair<SymbolId, std::int64_t>>
-    tryClassifyAsSymbolAddr(HirNodeId initNode) {
+    tryClassifyAsSymbolAddr(HirNodeId initNode, EvalEnvironment const& env,
+                            EvalOptions const& opts) {
         HirKind const k = hir.kind(initNode);
-        if (k == HirKind::AddressOf) {
-            auto kids = hir.children(initNode);
-            if (kids.size() == 1 && hir.kind(kids[0]) == HirKind::Ref) {
-                std::uint32_t const s = hir.payload(kids[0]);
-                if (globalSymbols.contains(s) || functionSymbols.contains(s)) {
+        // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a bare `Ref` to a
+        // FUNCTION symbol is a function designator that has decayed to its
+        // ADDRESS (C 6.3.2.1p4 — the value of a function designator is a
+        // pointer to the function), e.g. the `posixOpen` / `f` member of a
+        // function-pointer table. Its link-time value IS the function's
+        // address. A bare `Ref` to a GLOBAL VARIABLE is excluded: that is an
+        // rvalue LOAD of the variable's contents, not its address (`&global`
+        // arrives as AddressOf(Ref) below). Only the FUNCTION designator
+        // decays designator→address here.
+        if (k == HirKind::Ref) {
+            std::uint32_t const s = hir.payload(initNode);
+            if (functionSymbols.contains(s))
+                return std::make_pair(SymbolId{s}, std::int64_t{0});
+            // c68 (D-CSUBSET-AGGREGATE-GLOBAL-NONSYMBOL-PTR-MEMBER): a bare `Ref`
+            // to a GLOBAL ARRAY variable is an array designator that DECAYS to
+            // `&arr[0]` (C 6.3.2.1p3) — a link-time symbol address, addend 0
+            // (sqlite's `aWindowFuncs[].zName = row_numberName`, a `Ref` to a
+            // `static const char[]` global, wrapped in the decay Cast peeled by
+            // the Cast arm below). A bare `Ref` to a SCALAR global stays excluded
+            // (that is an rvalue LOAD of the variable's contents, NOT its address
+            // — `&global` arrives as AddressOf(Ref)); ONLY the array-to-pointer
+            // designator decay yields an address here.
+            if (globalSymbols.contains(s)) {
+                TypeId const rt = hir.typeId(initNode);
+                if (rt.valid() && interner.kind(rt) == TypeKind::Array)
                     return std::make_pair(SymbolId{s}, std::int64_t{0});
-                }
             }
+            return std::nullopt;
+        }
+        if (k == HirKind::AddressOf) {
+            // c80 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-BASE-INDEX): the operand
+            // is a CONSTANT LVALUE PATH rooted at a global — the bare
+            // `&global` (the original F5 arm: path = a lone Ref), or the
+            // symbol-base element/field address `&arr[K]` / `&s.field`
+            // (AddressOf(Index/MemberAccess chain)) → {rootSym, byteOffset}.
+            // The path resolver owns the constant-address rules; a
+            // non-constant path (a local, a pointer-typed base, a runtime
+            // index) yields nullopt exactly as the old Ref-only arm did.
+            auto kids = hir.children(initNode);
+            if (kids.size() == 1)
+                return tryResolveConstLvaluePath(kids[0], env, opts);
             return std::nullopt;
         }
         if (k == HirKind::Cast) {
             auto kids = hir.children(initNode);
-            if (kids.size() != 1 || hir.kind(kids[0]) != HirKind::Literal)
-                return std::nullopt;
+            if (kids.size() != 1) return std::nullopt;
             TypeId const ct = hir.typeId(initNode);
             if (!ct.valid() || interner.kind(ct) != TypeKind::Ptr)
                 return std::nullopt;
+            // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a POINTER-typed
+            // cast WRAPPING another symbol-address — `(void*)&x`, the
+            // `(sqlite3_syscall_ptr)posixOpen` member of aSyscall, any
+            // pointer-to-pointer reinterpret. A reinterpret between pointer
+            // types preserves the bit pattern, so the cast IS the same
+            // link-time address (+ addend); peel it and recurse. (Also covers
+            // the scalar top-level `void* p = (void*)&x;` form — same anchor.)
+            // The result type is already gated to Ptr above, so a cast that
+            // changes representation — `(long)&x` — never reaches here.
+            if (hir.kind(kids[0]) != HirKind::Literal)
+                return tryClassifyAsSymbolAddr(kids[0], env, opts);
             std::uint32_t const litIdx0 = hir.payload(kids[0]);
             HirLiteralValue const& src = literals.at(litIdx0);
             if (!std::holds_alternative<std::string>(src.value))
@@ -6784,6 +7679,265 @@ struct Lowerer {
         }
         return std::nullopt;
     }
+
+    // c80 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-BASE-INDEX): resolve a CONSTANT
+    // LVALUE PATH rooted at a module global — the operand of a global
+    // initializer's `&…` — to {rootSymbol, byteOffset}. Shapes:
+    //   Ref(global|function)          → {sym, 0}   (the F5/c67 base arm)
+    //   Index(arrayPath, constIdx)    → {sym, off + constIdx * elementStride}
+    //   MemberAccess(recordPath, .f)  → {sym, off + fieldByteOffset(record, f)}
+    // Canonical sqlite shape (sqlite3.c:24077): `const unsigned char
+    // *sqlite3aLTb = &sqlite3UpperToLower[256-OP_Ne];` — an ADDRESS CONSTANT
+    // (C 6.6p9): gcc emits `.quad sqlite3UpperToLower+203` (an abs64 reloc
+    // with an addend), never a runtime store. c67's encoder already threads
+    // the addend, so RECOGNIZING the shape is the whole fix.
+    // ★ CONSERVATIVE (the c65/c68 no-over-fire discipline):
+    //   - an Index base must be ARRAY-typed: indexing THROUGH a pointer-typed
+    //     global (`&ptrGlobal[3]`) reads the pointer's RUNTIME VALUE — not an
+    //     address constant (gcc rejects it as a static initializer too) →
+    //     nullopt (stays fail-loud);
+    //   - a MemberAccess base must be Struct/Union-typed: a `p->f` deref base
+    //     arrives as Deref — no arm matches → nullopt;
+    //   - the index must fold under the SAME const-eval policy the classify
+    //     loop uses (env/opts threaded from it).
+    // Offsets accumulate SIGNED (`&arr[i-j]` with i<j is a negative addend;
+    // the Relocation addend is int64). Nested paths (`&s.arr[K]`,
+    // `&arr[K].field`, `&m[i][j]`) compose by recursion.
+    [[nodiscard]] std::optional<std::pair<SymbolId, std::int64_t>>
+    tryResolveConstLvaluePath(HirNodeId n, EvalEnvironment const& env,
+                              EvalOptions const& opts) {
+        HirKind const k = hir.kind(n);
+        if (k == HirKind::Ref) {
+            std::uint32_t const s = hir.payload(n);
+            if (globalSymbols.contains(s) || functionSymbols.contains(s))
+                return std::make_pair(SymbolId{s}, std::int64_t{0});
+            return std::nullopt;
+        }
+        if (k == HirKind::Index) {
+            auto kids = hir.children(n);
+            if (kids.size() != 2) return std::nullopt;
+            TypeId const baseTy = hir.typeId(kids[0]);
+            if (!baseTy.valid() || interner.kind(baseTy) != TypeKind::Array)
+                return std::nullopt;
+            auto const base = tryResolveConstLvaluePath(kids[0], env, opts);
+            if (!base.has_value()) return std::nullopt;
+            ConstEvalResult const ir =
+                evaluateConstant(hir, interner, literals, kids[1], env, opts);
+            if (!ir.value.has_value()) return std::nullopt;
+            std::int64_t idxVal = 0;
+            if (std::holds_alternative<std::int64_t>(ir.value->value))
+                idxVal = std::get<std::int64_t>(ir.value->value);
+            else if (std::holds_alternative<std::uint64_t>(ir.value->value))
+                idxVal = static_cast<std::int64_t>(
+                    std::get<std::uint64_t>(ir.value->value));
+            else
+                return std::nullopt;
+            // Stride = the element type's layout size (the Index node's own
+            // type IS the element type) — the SAME `elementStride` engine the
+            // runtime Gep path scales with, so the folded address equals the
+            // address the program would compute.
+            auto const stride = elementStride(hir.typeId(n));
+            if (!stride.has_value()) return std::nullopt;
+            return std::make_pair(
+                base->first,
+                base->second + idxVal * static_cast<std::int64_t>(*stride));
+        }
+        if (k == HirKind::MemberAccess) {
+            auto kids = hir.children(n);
+            if (kids.size() != 1) return std::nullopt;
+            TypeId const baseTy = hir.typeId(kids[0]);
+            if (!baseTy.valid()) return std::nullopt;
+            TypeKind const btk = interner.kind(baseTy);
+            if (btk != TypeKind::Struct && btk != TypeKind::Union)
+                return std::nullopt;
+            auto const base = tryResolveConstLvaluePath(kids[0], env, opts);
+            if (!base.has_value()) return std::nullopt;
+            // The FC7 field-offset engine (combineMemberAddr's authority) —
+            // folded field addresses match runtime member access exactly.
+            auto const off = fieldByteOffset(baseTy, hir.payload(n));
+            if (!off.has_value()) return std::nullopt;
+            return std::make_pair(
+                base->first,
+                base->second + static_cast<std::int64_t>(*off));
+        }
+        return std::nullopt;
+    }
+
+    // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): recognize a file-scope
+    // AGGREGATE global whose initializer carries a LINK-TIME-CONSTANT member —
+    // a function address, `&global`, or a string literal nested in a struct /
+    // union / array (canonical: sqlite's `static struct unix_syscall aSyscall[]
+    // = {{"open",(sqlite3_syscall_ptr)posixOpen,0},…}`). const-eval cannot fold
+    // such a member (the address is not known until link), so the whole
+    // aggregate would otherwise fall to runtimeInit and trip the
+    // bitfield-rvalue fail-loud guard. This is the AGGREGATE generalization of
+    // the F5 scalar mechanism (`tryClassifyAsSymbolAddr`, D-CSUBSET-SYMBOL-
+    // ADDRESS-GLOBAL): emit STATIC DATA with abs64 relocations at the member
+    // offsets (the C-correct, gcc-matching placement) instead of a
+    // __module_init__ store-chain.
+    //
+    // Build a `MirAggregateValue` whose `fields` pair 1:1 with the
+    // ConstructAggregate's POSITIONAL children (zero-fills already normalized at
+    // HIR lowering — same discipline the const-eval ConstructAggregate arm and
+    // `encodeAggregateValue` rely on). Each child resolves by trying, in order:
+    //   (a) `tryClassifyAsSymbolAddr` → a reloc-bearing pointer leaf (a string
+    //       member mints + pushes its own rodata PendingGlobal, the F5 path);
+    //   (b) a NESTED `tryClassifyAggregateConst` (recurse — struct-in-struct /
+    //       array-of-struct like aSyscall);
+    //   (c) `evaluateConstant` → an ordinary folded leaf (plain `0`, ints, …).
+    // If ANY member resolves by none → nullopt (the whole aggregate falls back
+    // to runtimeInit — never partially classify). `env`/`opts` are threaded
+    // from the classify loop's locals (the SAME const-eval policy globals use).
+    //   (d) a NULL POINTER CONSTANT in a pointer member — `(void*)0`, the
+    //       trailing `0` of an aSyscall row, `int(*fn)(void) = 0`. const-eval
+    //       leaves a cast-to-pointer un-folded ("pointer targets remain
+    //       non-foldable"), so peel the pointer-typed Cast, fold its INTEGER
+    //       operand, and — iff it is 0 — emit a zero pointer leaf (8 zero bytes,
+    //       NO relocation; the encoder's pre-zeroed slot already holds them).
+    [[nodiscard]] std::optional<MirLiteralValue>
+    tryClassifyAggregateConst(HirNodeId initNode, EvalEnvironment const& env,
+                              EvalOptions const& opts) {
+        if (hir.kind(initNode) != HirKind::ConstructAggregate)
+            return std::nullopt;
+        MirAggregateValue agg;
+        auto kids = hir.children(initNode);
+        agg.fields.reserve(kids.size());
+        for (HirNodeId child : kids) {
+            if (auto sa = tryClassifyAsSymbolAddr(child, env, opts)) {
+                MirLiteralValue leaf;
+                leaf.value = MirSymbolAddrValue{sa->first.v, sa->second};
+                leaf.core  = TypeKind::Ptr;
+                agg.fields.push_back(std::move(leaf));
+                continue;
+            }
+            if (auto nested = tryClassifyAggregateConst(child, env, opts)) {
+                agg.fields.push_back(std::move(*nested));
+                continue;
+            }
+            if (auto np = tryClassifyNullPointerConst(child, env, opts)) {
+                agg.fields.push_back(std::move(*np));
+                continue;
+            }
+            if (auto ip = tryClassifyNullBaseIndexConst(child, env, opts)) {
+                agg.fields.push_back(std::move(*ip));
+                continue;
+            }
+            ConstEvalResult const r =
+                evaluateConstant(hir, interner, literals, child, env, opts);
+            if (!r.value.has_value()) return std::nullopt;  // one un-foldable → bail
+            agg.fields.push_back(toMirLiteral(*r.value));
+        }
+        MirLiteralValue out;
+        out.value = std::move(agg);
+        out.core  = interner.kind(hir.typeId(initNode));  // Struct / Union / Array
+        return out;
+    }
+
+    // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a NULL POINTER CONSTANT
+    // member — an integer constant expression equal to 0 in a POINTER context
+    // (`(void*)0`, `int(*fn)(void) = 0`, the `0` member of an aSyscall row).
+    // const-eval refuses a cast-to-pointer ("pointer/aggregate targets remain
+    // non-foldable", const_eval.cpp), so peel the pointer-typed Cast and fold
+    // its INTEGER operand. iff that operand folds to 0, the member is a null
+    // pointer → a zero pointer leaf (`uint64_t 0`, core=Ptr); the encoder's
+    // scalar-leaf arm writes 8 zero bytes with NO relocation. A non-zero or
+    // non-integer operand (`(void*)0x1000`, a runtime expr) yields nullopt so
+    // the caller's evaluateConstant fallback / whole-aggregate bail still
+    // governs — this arm ONLY recognizes the standard null pointer constant.
+    [[nodiscard]] std::optional<MirLiteralValue>
+    tryClassifyNullPointerConst(HirNodeId node, EvalEnvironment const& env,
+                                EvalOptions const& opts) {
+        TypeId const ty = hir.typeId(node);
+        if (!ty.valid() || interner.kind(ty) != TypeKind::Ptr)
+            return std::nullopt;
+        HirNodeId operand = node;
+        if (hir.kind(node) == HirKind::Cast) {
+            auto kids = hir.children(node);
+            if (kids.size() != 1) return std::nullopt;
+            operand = kids[0];   // fold the integer behind the pointer cast
+        }
+        ConstEvalResult const r =
+            evaluateConstant(hir, interner, literals, operand, env, opts);
+        if (!r.value.has_value()) return std::nullopt;
+        bool isZero = false;
+        if (std::holds_alternative<std::int64_t>(r.value->value))
+            isZero = std::get<std::int64_t>(r.value->value) == 0;
+        else if (std::holds_alternative<std::uint64_t>(r.value->value))
+            isZero = std::get<std::uint64_t>(r.value->value) == 0;
+        if (!isZero) return std::nullopt;
+        MirLiteralValue leaf;
+        leaf.value = std::uint64_t{0};
+        leaf.core  = TypeKind::Ptr;
+        return leaf;
+    }
+
+    // c68 (D-CSUBSET-AGGREGATE-GLOBAL-NONSYMBOL-PTR-MEMBER): a NULL-BASE ARRAY-
+    // ELEMENT address constant — `(T*)&((char*)0)[X]`. This is sqlite's
+    // `SQLITE_INT_TO_PTR(X)` idiom (sqlite3.c: `#define SQLITE_INT_TO_PTR(X)
+    // ((void*)&((char*)0)[X])`): stash a small integer X in a `void*` (read back
+    // via `SQLITE_PTR_TO_INT`), used for the `pUserData` member of the built-in
+    // `FuncDef` tables (`aBuiltinFunc[]`, `aJsonFunc[]`). The address of element
+    // X of a NULL pointer base is `0 + X*sizeof(elem)` — a pointer-valued INTEGER
+    // constant: NO symbol, NO relocation (gcc folds it to the same bytes). This
+    // is the array-element sibling of c43's offsetof MEMBER folding
+    // ([[D-CSUBSET-ADDRESS-CONSTANT-FOLD]]); the CST const-eval deliberately
+    // punted the `&arr[i]` Index form to the global-init lowering ("the HIR
+    // engine", cst_const_eval.cpp Index comment) — this is that handler. Shape:
+    // peel pointer reinterpret cast(s) → AddressOf → Index(base, X).
+    // ★ CONSERVATIVE (no over-fire, the c65 discipline): the base MUST fold to a
+    // NULL pointer (address 0). `&realArray[i]` (a SYMBOL base) is NOT this idiom
+    // — its value is the symbol's address + i*stride (a reloc), NOT the bare
+    // integer — so a non-null base returns nullopt (the member falls through to
+    // the whole-aggregate bail → the fail-loud guard) rather than being silently
+    // mis-folded to an integer.
+    [[nodiscard]] std::optional<MirLiteralValue>
+    tryClassifyNullBaseIndexConst(HirNodeId node, EvalEnvironment const& env,
+                                  EvalOptions const& opts) {
+        // Peel pointer-typed reinterpret cast(s) — the outer `(void*)`.
+        while (hir.kind(node) == HirKind::Cast) {
+            TypeId const ct = hir.typeId(node);
+            if (!ct.valid() || interner.kind(ct) != TypeKind::Ptr)
+                return std::nullopt;
+            auto cKids = hir.children(node);
+            if (cKids.size() != 1) return std::nullopt;
+            node = cKids[0];
+        }
+        if (hir.kind(node) != HirKind::AddressOf) return std::nullopt;
+        auto aoKids = hir.children(node);
+        if (aoKids.size() != 1) return std::nullopt;
+        HirNodeId const idxNode = aoKids[0];
+        if (hir.kind(idxNode) != HirKind::Index) return std::nullopt;
+        auto ixKids = hir.children(idxNode);
+        if (ixKids.size() != 2) return std::nullopt;
+        // The base MUST be a null pointer constant (address 0) — only then is
+        // the element address the bare integer X*stride with no symbol/reloc.
+        if (!tryClassifyNullPointerConst(ixKids[0], env, opts)) return std::nullopt;
+        // Fold the index to an integer.
+        ConstEvalResult const ir =
+            evaluateConstant(hir, interner, literals, ixKids[1], env, opts);
+        if (!ir.value.has_value()) return std::nullopt;
+        std::int64_t idxVal = 0;
+        if (std::holds_alternative<std::int64_t>(ir.value->value))
+            idxVal = std::get<std::int64_t>(ir.value->value);
+        else if (std::holds_alternative<std::uint64_t>(ir.value->value))
+            idxVal = static_cast<std::int64_t>(
+                std::get<std::uint64_t>(ir.value->value));
+        else
+            return std::nullopt;
+        // Stride = sizeof(element). The Index node's type IS the element type
+        // (Subscript: type is the element type).
+        TypeId const elemTy = hir.typeId(idxNode);
+        auto const layout = computeLayout(elemTy, interner,
+                                          config.aggregateLayout, config.dataModel);
+        if (!layout) return std::nullopt;
+        std::uint64_t const value = static_cast<std::uint64_t>(idxVal)
+                                  * static_cast<std::uint64_t>(layout->size);
+        MirLiteralValue leaf;
+        leaf.value = value;
+        leaf.core  = TypeKind::Ptr;
+        return leaf;
+    }
+
 
     // Classify each module-level global into pendingGlobals. Called after
     // `collectGlobals` (so `globalSymbols` is already populated for any
@@ -6857,7 +8011,7 @@ struct Lowerer {
                 // "...";`) is a LINK-TIME constant const-eval cannot fold —
                 // recognize it FIRST (and route to a MirSymbolAddrValue / abs64
                 // reloc) before falling back to const-eval / runtime-init.
-                if (auto sa = tryClassifyAsSymbolAddr(*initN)) {
+                if (auto sa = tryClassifyAsSymbolAddr(*initN, env, opts)) {
                     pg.symbolAddrInit   = sa->first;
                     pg.symbolAddrAddend = sa->second;
                 } else {
@@ -6867,6 +8021,39 @@ struct Lowerer {
                         hir, interner, literals, *initN, env, opts);
                     if (r.value.has_value()) {
                         pg.constInit = toMirLiteral(*r.value);
+                    } else if (auto aggC =
+                                   tryClassifyAggregateConst(*initN, env, opts)) {
+                        // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): an
+                        // aggregate whose initializer has a link-time-constant
+                        // member (a fn/`&global`/string address) — const-eval
+                        // can't fold the address, but the aggregate is still
+                        // STATIC DATA (reloc leaves at the member offsets), NOT
+                        // a runtime store-chain. Routes to constInit (the
+                        // assembler's aggregate arm encodes the relocs) instead
+                        // of runtimeInit. A fully-foldable aggregate already
+                        // folded above; only the address-bearing case reaches
+                        // here.
+                        pg.constInit = std::move(*aggC);
+                    } else if (auto np = tryClassifyNullPointerConst(*initN,
+                                                                    env, opts)) {
+                        // c80: a TOP-LEVEL scalar NULL POINTER CONSTANT —
+                        // `T* g = 0;` (sqlite's `vfsList`/`unixBigLock`/
+                        // `inodeList`/`sqlite3SharedCacheList`/
+                        // `sqlite3_temp_directory`/`sqlite3_data_directory`).
+                        // const-eval refuses a cast-to-pointer ("pointer
+                        // targets remain non-foldable"), and c67 wired the
+                        // null-pointer-constant recognizer only into the
+                        // AGGREGATE member loop — a bare scalar pointer
+                        // global fell to runtimeInit → the asm fail-loud.
+                        // Same classifier, same order as the member loop.
+                        pg.constInit = std::move(*np);
+                    } else if (auto ip = tryClassifyNullBaseIndexConst(*initN,
+                                                                      env, opts)) {
+                        // c80: the TOP-LEVEL scalar sibling of c68's member
+                        // arm — `void* g = SQLITE_INT_TO_PTR(X)` =
+                        // `(void*)&((char*)0)[X]` at file scope: a pointer-
+                        // valued INTEGER constant (no symbol, no reloc).
+                        pg.constInit = std::move(*ip);
                     } else {
                         pg.runtimeInit = *initN;
                     }
@@ -7031,10 +8218,16 @@ struct Lowerer {
                     // D-LK6-6 closure.)
                     break;
                 case HirKind::ExternGlobal:
-                    unsupported(decl, std::format(
-                        "HIR ExternGlobal (id {}) — FFI symbol ingestion is "
-                        "not yet lowered", decl.v));
-                    return;
+                    // c82 (D-LK-EXTERN-DATA-IMPORT): pre-pass
+                    // (`collectExterns`) already registered the SymbolId in
+                    // `globalSymbols` and pushed an `ExternImport` row
+                    // flagged `isData`. No MIR instructions at the decl
+                    // site — a `Ref` lowers through the same
+                    // GlobalAddr(+Load) path an intra-module global uses;
+                    // the LK11 merge resolves sibling-CU-defined ones, and
+                    // the link tier fail-louds on a surviving TRUE library
+                    // data import until the binding model lands (§B).
+                    break;
                 case HirKind::TypeDecl:
                     // TypeDecl is the one structural carrier that genuinely
                     // has no MIR runtime effect — it interns a type into the

@@ -138,6 +138,28 @@ public:
     TypeId reference(TypeId referent);
     TypeId nullable(TypeId inner);
     TypeId optional(TypeId inner);
+
+    // ── volatile qualifier (D-CSUBSET-VOLATILE-POINTEE / c27) ──
+    // `volatile T` — a kind=VolatileQual record, operands=[inner]. DISTINCT
+    // interned identity (volatile int != int — what carries the volatile through
+    // a declaration's type to its access sites), but a TRANSPARENT skin: the
+    // `kind()` / `operands()` / `scalars()` accessors SEE THROUGH it to `inner`,
+    // so every structural consumer dispatches on the material kind with NO
+    // per-site strip (the access-volatility chokepoints query `isVolatileQualified`
+    // instead). Idempotent: `volatileQualified(VolatileQual(T)) == VolatileQual(T)`.
+    // Wrapping an INVALID id returns InvalidType. const is NOT modelled (it never
+    // affects codegen); only volatile is materialized.
+    TypeId volatileQualified(TypeId inner);
+    // The inner type if `id` is a VolatileQual, else `id` unchanged. ONE strip
+    // chokepoint for the rare consumer that must look past the skin where the
+    // transparent accessors are bypassed (e.g. the layout entry's raw incomplete
+    // checks, or building a derived type that must drop the qualifier).
+    [[nodiscard]] TypeId stripVolatile(TypeId id) const;
+    // True iff `id`'s OWN record is a VolatileQual (the access-volatility query).
+    // Reads the RAW record kind (not the transparent `kind()`), so it answers
+    // "is this exact type volatile-qualified?" — used at the deref / member /
+    // index / scalar access sites to set MirInstFlags::Volatile from the type.
+    [[nodiscard]] bool isVolatileQualified(TypeId id) const;
     // array: operands=[element], scalars=[length]. slice: operands=[element].
     TypeId array(TypeId element, std::int64_t length);
     TypeId slice(TypeId element);
@@ -182,7 +204,8 @@ public:
     // complete composite is a caller bug and aborts loud. `id` MUST be a composite
     // minted by `forwardComposite` (else fatal).
     void completeComposite(TypeId id, std::span<TypeId const> fields,
-                           std::span<std::int64_t const> fieldBitWidths = {});
+                           std::span<std::int64_t const> fieldBitWidths = {},
+                           std::span<std::uint64_t const> fieldOffsets = {});
     // True iff `id` is a Struct/Union that was forward-minted but NOT yet completed.
     // An EXPLICIT flag, NOT "operands empty": `struct E {}` is a LEGAL COMPLETE
     // zero-field struct (size 0). A non-composite kind is never incomplete here.
@@ -208,6 +231,28 @@ public:
     // so two structs differing only in a bitfield width are distinct interned types.
     TypeId structType(std::string_view name, std::span<TypeId const> fields,
                       std::span<std::int64_t const> fieldBitWidths);
+    // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): a struct with per-field EXPLICIT byte
+    // offsets — a foreign OVERLAPPING layout (an FFI union modeled as a struct whose
+    // members may share/overlap byte ranges: ULARGE_INTEGER {QuadPart u64@0,
+    // LowPart u32@0, HighPart u32@4}). `fieldOffsets[i]` is field i's byte offset; the
+    // span is ALL-fields-or-EMPTY (a partial offset set is a caller bug). The offsets
+    // are part of the struct's CONTENT identity (they change layout), so an
+    // explicit-offset struct is a DISTINCT interned type from the same field-types
+    // laid out naturally — and both the shipped `structs` entry and the bare typedef's
+    // inline `struct "X" { T @off }` text carry identical offsets so they collapse to
+    // ONE TypeId (the tag/typedef canonicalization the field-scope injection relies on).
+    // Independent of bitfields (offsets need not compose with bit-widths); passing a
+    // non-empty offsets span with bitfields is unsupported (fail loud at layout).
+    TypeId structType(std::string_view name, std::span<TypeId const> fields,
+                      std::span<std::int64_t const> fieldBitWidths,
+                      std::span<std::uint64_t const> fieldOffsets);
+    // True iff `id` is a Struct carrying c107 explicit field offsets (non-empty
+    // `fieldOffsets`). Struct/Union only; false for every naturally-laid-out composite.
+    [[nodiscard]] bool hasExplicitOffsets(TypeId id) const;
+    // Field `i`'s explicit byte offset, or nullopt when the composite derives offsets
+    // from natural alignment (the ordinary path). Mirrors `fieldBitWidth`.
+    [[nodiscard]] std::optional<std::uint64_t> explicitFieldOffset(
+        TypeId id, std::size_t i) const;
     TypeId unionType(std::string_view name, std::span<TypeId const> variants);
     // FC8 bitfields (D-CSUBSET-BITFIELD): a union with per-member bit-field widths
     // (same `kNotBitfield`/width encoding + empty-scalars-when-none rule as the
@@ -236,8 +281,14 @@ public:
                      std::span<std::int64_t const> scalarArgs = {});
 
     // ── accessors ──
+    // NOTE on VolatileQual transparency (c27): `kind()` / `operands()` /
+    // `scalars()` SEE THROUGH a VolatileQual skin to its inner type, so a caller
+    // reading a possibly-volatile-qualified id gets the MATERIAL kind/shape. The
+    // RAW record (incl. a VolatileQual marker) is reachable only via `get()` (used
+    // by reintern / text round-trip, which must preserve the wrapper) and the
+    // dedicated `isVolatileQualified` / `stripVolatile` queries.
     [[nodiscard]] TypeRecord const&  get(TypeId id)      const { return arena_.at(id); }
-    [[nodiscard]] TypeKind           kind(TypeId id)     const { return arena_.at(id).kind; }
+    [[nodiscard]] TypeKind           kind(TypeId id)     const;
     [[nodiscard]] GuardedSpan<TypeId>        operands(TypeId id) const;
     [[nodiscard]] GuardedSpan<std::int64_t> scalars(TypeId id)  const;
     [[nodiscard]] std::string_view           name(TypeId id)     const;
@@ -303,6 +354,14 @@ private:
     TypeId internComposite(TypeKind kind, std::string_view name,
                            std::uint64_t declSiteKey);
 
+    // c27 VolatileQual transparency: the material (non-VolatileQual) TypeId an
+    // id resolves to — `id` itself unless its RAW record kind is VolatileQual, in
+    // which case its single operand (recursively, though idempotency keeps it one
+    // level). The single internal chokepoint `kind()`/`operands()`/`scalars()`
+    // route through so the wrapper is transparent. Reads `arena_` directly (never
+    // the public accessors) to avoid recursion.
+    [[nodiscard]] TypeId materialId_(TypeId id) const;
+
     // Wrap a raw pool view in a GuardedSpan tagged with the current pool
     // generation (debug) — or return it unchanged (release alias). The single
     // chokepoint every accessor routes through.
@@ -329,6 +388,15 @@ private:
         std::vector<TypeId>       fields;            // field/variant TypeIds
         std::vector<std::int64_t> bitWidthScalars;   // (width+1)/0 encoding; EMPTY when
                                                      // no bit-field (cf. structType)
+        // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): per-field EXPLICIT byte offsets, for
+        // a struct whose foreign layout OVERLAPS (an FFI union modeled as an
+        // explicit-offset struct — ULARGE_INTEGER {QuadPart@0, LowPart@0, HighPart@4}).
+        // A SEPARATE channel from `bitWidthScalars` on purpose: the bitfield-presence
+        // test is `!scalars(id).empty()` at three lowering sites, and reintern decodes
+        // scalars as (width+1) — offsets in that pool would route the struct through
+        // the bitfield packer AND reintern as garbage widths. EMPTY = derive offsets
+        // from natural alignment (every existing struct → byte-identical TypeId).
+        std::vector<std::uint64_t> fieldOffsets;
         std::uint64_t             declSiteKey = 0;   // the nominal-identity discriminator
         bool                      complete    = false;
     };

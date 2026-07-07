@@ -2,6 +2,7 @@
 
 #include "core/export.hpp"
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind
+#include "core/types/strong_ids.hpp"               // TypeId (HirAddressValue.pointeeType)
 
 #include <cstdint>
 #include <string>
@@ -48,6 +49,27 @@ struct HirAggregateValue {
     std::vector<HirLiteralValue> fields;
 };
 
+// Address constant (plan p19 c43 — D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A).
+// A compile/link-time constant address = a base symbol (or NULL) plus a byte
+// offset. Produced by the const-eval engines for: a null-relative offsetof chain
+// (`&((T*)0)->M` → base=kNullBase, byteOffset=offsetof), `&global`/`&fn`
+// (base=symbol, byteOffset=0), `&global + N` / `&arr[i]` (base=symbol,
+// byteOffset=N*stride), and string-literal addresses. `base == kNullBase` (0)
+// means a PURE compile-time integer offset — foldable to an int by the final
+// `- (char*)0` / cast-to-int; a non-null base is a RELOCATION only the
+// MIR-globals emitter materializes (cast-to-int of a symbol-based address fails
+// loud — it is not an integer constant). `pointeeType` is FOLD-TRANSIENT metadata
+// (the current pointer's pointee, so member/index arms can size strides) — it is
+// NOT serialized and is invalid on a deserialized value (a pooled address value
+// is only consumed by `toMirLiteral`, which drops it). Mirrors MirSymbolAddrValue
+// {symbol,addend} so `toMirLiteral` maps {base,byteOffset} by a field copy.
+struct HirAddressValue {
+    static constexpr std::uint32_t kNullBase = 0;
+    std::uint32_t base       = kNullBase;
+    std::int64_t  byteOffset = 0;
+    TypeId        pointeeType{};   // fold-transient; not serialized (invalid when parsed)
+};
+
 struct HirLiteralValue {
     // `monostate` = a literal whose value could not be decoded (a malformed
     // token); the lowering still emits the node + a diagnostic so analysis
@@ -80,7 +102,7 @@ struct HirLiteralValue {
     //     lowering time; HIR's positional discipline holds). D5.3.
     //   - `core == Void`: held as `std::monostate` (decode failure).
     std::variant<std::monostate, bool, std::int64_t, std::uint64_t, double, std::string,
-                 HirAggregateValue> value;
+                 HirAggregateValue, HirAddressValue> value;
     TypeKind core = TypeKind::Void;
 };
 

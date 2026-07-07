@@ -113,14 +113,22 @@ TEST(LirLiveness, StraightLineFunctionPinsArgRange) {
 }
 
 TEST(LirLiveness, BranchingFunctionPropagatesAcrossJoin) {
-    // `if (x > 0) y = 1; else y = 2; return y;` — the join block
-    // should have a non-empty liveIn (y flows in from both arms via
-    // phi-resolution moves on predecessor edges).
+    // `if (x > 0) y = 1; else y = 2; return y + x;` — the join block
+    // should have a non-empty liveIn.
+    //
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the cross-join value MUST be a
+    // never-address-taken PARAMETER (`x`, a pure SSA `Arg`), NOT the body local `y`.
+    // `y` is alloca-backed in this no-mem2reg fixture and its address is now
+    // rematerialized at each use (a fresh `lea_frame_slot` in each block), so its
+    // address no longer flows across the join — only the slot does (memory, not a
+    // vreg). `x` is defined at entry and used in the post-join `return y + x`, so it
+    // is genuinely live INTO the join block (and through both arms) — a non-empty
+    // liveIn that is remat-independent.
     auto lowered = lowerCSubsetToLir(
         "int f(int x) {\n"
         "    int y;\n"
         "    if (x > 0) { y = 1; } else { y = 2; }\n"
-        "    return y;\n"
+        "    return y + x;\n"
         "}\n");
     ASSERT_TRUE(lowered.lir.ok);
     LirLiveness const out = analyzeLiveness(lowered.lir.lir);

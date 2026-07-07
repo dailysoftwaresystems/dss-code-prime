@@ -333,11 +333,15 @@ TEST(HirVerifier, WellFormedControlFlowProducesNoArityFailure) {
     TypeId const i32   = ti.primitive(TypeKind::I32);
     TypeId const boolT = ti.primitive(TypeKind::Bool);
 
-    HirNodeId const arm0 = b.makeCaseArm(b.makeLiteral(i32),
-                                         std::array{b.makeExprStmt(b.makeLiteral(i32))});
-    HirNodeId const arm1 = b.makeCaseArm(std::nullopt,
-                                         std::array{b.makeExprStmt(b.makeLiteral(i32))});
-    HirNodeId const sw   = b.makeSwitchStmt(b.makeRef(i32, 1), std::array{arm0, arm1});
+    // c60 (Design I-A): switch = [disc, body Block, dispatch arms]; arms carry the
+    // value + marker ordinal, the body holds the case markers.
+    HirNodeId const swBody = b.makeBlock(std::array{
+        b.makeLabelStmt(0, b.makeExprStmt(b.makeLiteral(i32))),
+        b.makeLabelStmt(1, b.makeExprStmt(b.makeLiteral(i32)))});
+    HirNodeId const arm0 = b.makeCaseArm(b.makeLiteral(i32), /*labelOrdinal=*/0);
+    HirNodeId const arm1 = b.makeCaseArm(std::nullopt, /*labelOrdinal=*/1);
+    HirNodeId const sw   = b.makeSwitchStmt(b.makeRef(i32, 1), swBody,
+                                            std::array{arm0, arm1});
     HirNodeId const f    = b.makeForStmt(b.makeVarDecl(i32, 2, b.makeLiteral(i32)),
                                          b.makeLiteral(boolT), std::nullopt,
                                          b.makeBlock(std::array{sw}));
@@ -400,10 +404,12 @@ TEST(HirVerifier, BreakTargetingSwitchIsValid) {
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
     // switch (x) { default: break; } — break CAN target a switch (unlike continue).
+    // c60 (Design I-A): the break lives in the body Block under the default marker.
     HirNodeId const br   = b.makeBreak(0);
-    HirNodeId const arm  = b.makeCaseArm(std::nullopt, std::array{br});
+    HirNodeId const body = b.makeBlock(std::array{b.makeLabelStmt(0, br)});
+    HirNodeId const arm  = b.makeCaseArm(std::nullopt, /*labelOrdinal=*/0);
     HirNodeId const disc = b.makeRef(i32, 1);
-    HirNodeId const sw   = b.makeSwitchStmt(disc, std::array{arm});
+    HirNodeId const sw   = b.makeSwitchStmt(disc, body, std::array{arm});
     Hir h = std::move(b).finish(sw);
 
     DiagnosticReporter reporter;
@@ -437,10 +443,12 @@ TEST(HirVerifier, ContinueTargetingSwitchFires) {
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
     // switch (x) { default: continue; }  — continue 0 resolves to the switch.
+    // c60 (Design I-A): the continue lives in the body Block under the default marker.
     HirNodeId const co   = b.makeContinue(0);
-    HirNodeId const arm  = b.makeCaseArm(std::nullopt, std::array{co});
+    HirNodeId const body = b.makeBlock(std::array{b.makeLabelStmt(0, co)});
+    HirNodeId const arm  = b.makeCaseArm(std::nullopt, /*labelOrdinal=*/0);
     HirNodeId const disc = b.makeRef(i32, 1);
-    HirNodeId const sw   = b.makeSwitchStmt(disc, std::array{arm});
+    HirNodeId const sw   = b.makeSwitchStmt(disc, body, std::array{arm});
     Hir h = std::move(b).finish(sw);
 
     DiagnosticReporter reporter;
@@ -453,12 +461,17 @@ TEST(HirVerifier, ContinueSkippingSwitchToOuterLoopIsValid) {
     TypeInterner ti = makeInterner();
     TypeId const i32   = ti.primitive(TypeKind::I32);
     TypeId const boolT = ti.primitive(TypeKind::Bool);
-    // while (..) { switch (x) { default: continue 1; } } — index 1 skips the
-    // switch (target 0) and resolves to the while (target 1), a loop: valid.
-    HirNodeId const co   = b.makeContinue(1);
-    HirNodeId const arm  = b.makeCaseArm(std::nullopt, std::array{co});
+    // while (..) { switch (x) { default: continue; } } — a `continue` inside a switch
+    // inside a loop (the c60 Design-I-A switch body: the continue lives under the default
+    // marker). c61 (D-CSUBSET-CONTINUE-SKIPS-SWITCH, C 6.8.6.2): a switch is TRANSPARENT
+    // to continue, so it is dropped from the target list and the while is at index 0 (the
+    // innermost loop). depth 0 resolves to it — this is the real-C form (cst_to_hir emits
+    // makeContinue(0)); the continue is valid.
+    HirNodeId const co   = b.makeContinue(0);
+    HirNodeId const swBody = b.makeBlock(std::array{b.makeLabelStmt(0, co)});
+    HirNodeId const arm  = b.makeCaseArm(std::nullopt, /*labelOrdinal=*/0);
     HirNodeId const disc = b.makeRef(i32, 1);
-    HirNodeId const sw   = b.makeSwitchStmt(disc, std::array{arm});
+    HirNodeId const sw   = b.makeSwitchStmt(disc, swBody, std::array{arm});
     HirNodeId const body = b.makeBlock(std::array{sw});
     HirNodeId const cond = b.makeLiteral(boolT);
     HirNodeId const wh   = b.makeWhileStmt(cond, body);
@@ -1042,14 +1055,19 @@ TEST(HirVerifier, OnlyOneDeadCodeDiagnosticPerBlock) {
 }
 
 TEST(HirVerifier, NonVoidSwitchWithDefaultAllArmsReturnIsClean) {
+    // c60 (Design I-A): a switch terminates iff it has a default AND the flat body
+    // Block terminates. Body = [case marker(return), default marker(return)];
+    // last statement (the default marker) terminates → the switch terminates.
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
     HirBuilder b{"c"};
-    HirNodeId const arm0 = b.makeCaseArm(b.makeLiteral(i32),
-                                         std::array{b.makeReturn(b.makeLiteral(i32))});
-    HirNodeId const armD = b.makeCaseArm(std::nullopt,
-                                         std::array{b.makeReturn(b.makeLiteral(i32))});
-    HirNodeId const sw   = b.makeSwitchStmt(b.makeRef(i32, 1), std::array{arm0, armD});
+    HirNodeId const swBody = b.makeBlock(std::array{
+        b.makeLabelStmt(0, b.makeReturn(b.makeLiteral(i32))),
+        b.makeLabelStmt(1, b.makeReturn(b.makeLiteral(i32)))});
+    HirNodeId const arm0 = b.makeCaseArm(b.makeLiteral(i32), /*labelOrdinal=*/0);
+    HirNodeId const armD = b.makeCaseArm(std::nullopt, /*labelOrdinal=*/1);
+    HirNodeId const sw   = b.makeSwitchStmt(b.makeRef(i32, 1), swBody,
+                                            std::array{arm0, armD});
     Hir h = fnReturning(b, ti, i32, b.makeBlock(std::array{sw}));
     DiagnosticReporter reporter;
     EXPECT_TRUE((HirVerifier{h, nullptr, &ti}.verify(reporter)));
@@ -1057,13 +1075,16 @@ TEST(HirVerifier, NonVoidSwitchWithDefaultAllArmsReturnIsClean) {
 }
 
 TEST(HirVerifier, NonVoidSwitchWithoutDefaultFallsThroughFires) {
+    // c60 (Design I-A): only a valued arm (no default) ⇒ the discriminant can skip
+    // the body to the join, so the switch does NOT terminate on all paths.
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
     HirBuilder b{"c"};
-    // Only a valued arm (returns); no default ⇒ the switch can fall through.
-    HirNodeId const arm0 = b.makeCaseArm(b.makeLiteral(i32),
-                                         std::array{b.makeReturn(b.makeLiteral(i32))});
-    HirNodeId const sw   = b.makeSwitchStmt(b.makeRef(i32, 1), std::array{arm0});
+    HirNodeId const swBody = b.makeBlock(std::array{
+        b.makeLabelStmt(0, b.makeReturn(b.makeLiteral(i32)))});
+    HirNodeId const arm0 = b.makeCaseArm(b.makeLiteral(i32), /*labelOrdinal=*/0);
+    HirNodeId const sw   = b.makeSwitchStmt(b.makeRef(i32, 1), swBody,
+                                            std::array{arm0});
     Hir h = fnReturning(b, ti, i32, b.makeBlock(std::array{sw}));
     DiagnosticReporter reporter;
     EXPECT_FALSE((HirVerifier{h, nullptr, &ti}.verify(reporter)));

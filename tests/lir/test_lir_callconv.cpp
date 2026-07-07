@@ -35,6 +35,7 @@
 #include <array>
 #include <cstdint>
 #include <ios>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -756,19 +757,20 @@ TEST(LirCallconv, LoopFunctionMaterializesWithoutErrors) {
 }
 
 TEST(LirCallconv, SpilledFunctionMaterializesFrameOpsToLoadStore) {
-    // Use the cross-call moderate-pressure pattern from cycle 3b so
-    // there are actual frame_load/frame_store ops to materialize.
+    // Use the cross-call moderate-pressure pattern so there are actual
+    // frame_load/frame_store ops to materialize.
+    //
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): the live-across-call values are
+    // never-address-taken PARAMETERS (pure SSA `Arg`s), NOT body locals — a local's
+    // alloca address is now rematerialized AFTER the call so locals no longer span
+    // it. The 8 params each feed the call argument AND the post-call sum, so each
+    // spans the call; 8 > SysV's 5 callee-saved GPRs → ≥1 cross-call spill (hence
+    // frame_load/frame_store to materialize), remat-independent.
     auto bundle = lowerThroughRewrite(
-        "int g(int a) { return a + 1; }\n"
-        "int f(int x) {\n"
-        "    int a1 = x + 1;\n"
-        "    int a2 = x + 2;\n"
-        "    int a3 = x + 3;\n"
-        "    int a4 = x + 4;\n"
-        "    int a5 = x + 5;\n"
-        "    int a6 = x + 6;\n"
-        "    int r = g(x);\n"
-        "    return a1 + a2 + a3 + a4 + a5 + a6 + r;\n"
+        "int g(int v) { return v + 1; }\n"
+        "int f(int a, int b, int c, int d, int e, int f2, int g2, int h) {\n"
+        "    int r = g(a + b + c + d + e + f2 + g2 + h);\n"
+        "    return a + b + c + d + e + f2 + g2 + h + r;\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.rewritten.ok);
@@ -843,13 +845,15 @@ TEST(LirCallconv, FrameLayoutInvariantsHoldPerFunction) {
     // savedRegAreaSize; savedRegAreaSize == savedRegs.size() * slotSize;
     // spillAreaSize == numSpillSlots * slotSize; totalFrameSize ==
     // alignUp(savedReg + spill, stackAlignment).
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): pressure from never-address-taken
+    // PARAMETERS (pure SSA `Arg`s), not body locals (whose alloca address is now
+    // rematerialized AFTER the call, so they no longer span it). 8 params each span
+    // the call → a non-trivial spill area exercising the frame-layout invariants.
     auto bundle = lowerThroughRewrite(
-        "int g(int a) { return a + 1; }\n"
-        "int f(int x) {\n"
-        "    int a1 = x + 1; int a2 = x + 2; int a3 = x + 3;\n"
-        "    int a4 = x + 4; int a5 = x + 5; int a6 = x + 6;\n"
-        "    int r = g(x);\n"
-        "    return a1 + a2 + a3 + a4 + a5 + a6 + r;\n"
+        "int g(int v) { return v + 1; }\n"
+        "int f(int a, int b, int c, int d, int e, int f2, int g2, int h) {\n"
+        "    int r = g(a + b + c + d + e + f2 + g2 + h);\n"
+        "    return a + b + c + d + e + f2 + g2 + h + r;\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.rewritten.ok);
@@ -930,13 +934,15 @@ TEST(LirCallconv, StackPointerMissingFromSchemaIsValidationError) {
 }
 
 TEST(LirCallconv, FrameSizeAlignedToCcStackAlignment) {
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): pressure from never-address-taken
+    // PARAMETERS (pure SSA `Arg`s), not body locals (whose alloca address is now
+    // rematerialized AFTER the call, so they no longer span it). 8 params each span
+    // the call → a non-trivial spill area exercising the frame-layout invariants.
     auto bundle = lowerThroughRewrite(
-        "int g(int a) { return a + 1; }\n"
-        "int f(int x) {\n"
-        "    int a1 = x + 1; int a2 = x + 2; int a3 = x + 3;\n"
-        "    int a4 = x + 4; int a5 = x + 5; int a6 = x + 6;\n"
-        "    int r = g(x);\n"
-        "    return a1 + a2 + a3 + a4 + a5 + a6 + r;\n"
+        "int g(int v) { return v + 1; }\n"
+        "int f(int a, int b, int c, int d, int e, int f2, int g2, int h) {\n"
+        "    int r = g(a + b + c + d + e + f2 + g2 + h);\n"
+        "    return a + b + c + d + e + f2 + g2 + h + r;\n"
         "}\n");
     ASSERT_TRUE(bundle.lowered.lir.ok);
     ASSERT_TRUE(bundle.rewritten.ok);
@@ -2390,14 +2396,22 @@ TEST(LirCallconvAbi, OrderableChainArgPassingSucceeds) {
     }
 }
 
-TEST(LirCallconvAbi, MoveCycleInArgPassingFailsLoud) {
-    // Construct a LIR call whose arg-passing produces a move cycle:
-    // arg 0 currently lives in `rsi` (= argGprs[1]) and arg 1 lives
-    // in `rdi` (= argGprs[0]). The in-order emit would produce
+TEST(LirCallconvAbi, MoveCycleInArgPassingResolvedViaScratch) {
+    // D-ML7-2.3 (closed): construct a LIR call whose arg-passing is a 2-cycle
+    // (a swap): arg 0 currently lives in `rsi` (= argGprs[1]) and arg 1 lives in
+    // `rdi` (= argGprs[0]). The naive in-order emit would produce
     //   mov rdi, rsi   (clobbers rdi which is arg 1's source)
-    //   mov rsi, rdi   (now reads the clobbered rdi)
-    // — silent miscompile. The detection pass must trip
-    // L_MoveCycleUnsupported citing D-ML7-2.3.
+    //   mov rsi, rdi   (now reads the clobbered rdi)  -- silent miscompile.
+    // The v1 pass FAIL-LOUD-REJECTED this (L_MoveCycleUnsupported). The parallel-
+    // copy resolver now BREAKS the cycle with a caller-saved scratch GPR:
+    //   mov <scratch>, rsi   ; save one source aside
+    //   mov rsi, rdi         ; now safe
+    //   mov rdi, <scratch>   ; complete the swap
+    // So the pass must SUCCEED, emit NO L_MoveCycleUnsupported, and produce
+    // exactly 3 movs (2 arg-passing regs + 1 scratch spill) — never 2 (which
+    // would be the clobbering in-order emit). The scratch must be a caller-saved
+    // GPR outside the swap ({rax,r10,r11} on SysV), drawn from the cc, not
+    // hardcoded.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     TargetSchema const& sch = **target;
@@ -2420,7 +2434,7 @@ TEST(LirCallconvAbi, MoveCycleInArgPassingFailsLoud) {
     b.beginBlock(block);
     // call <sym=g>, rsi, rdi
     //   arg 0 source = rsi  (dest will be argGprs[0]=rdi)
-    //   arg 1 source = rdi  (dest will be argGprs[1]=rsi)
+    //   arg 1 source = rdi  (dest will be argGprs[1]=rsi)  -> a swap cycle
     std::array<LirOperand, 3> callOps{
         LirOperand::makeSymbolRef(7),
         LirOperand::makeReg(rsi),
@@ -2439,22 +2453,335 @@ TEST(LirCallconvAbi, MoveCycleInArgPassingFailsLoud) {
 
     DiagnosticReporter ccRep;
     auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
-    EXPECT_FALSE(result.ok())
-        << "swap-cycle move pattern must trip the loud guard";
-    bool sawCode = false;
-    bool sawAnchor = false;
+    EXPECT_TRUE(result.ok())
+        << "the swap-cycle must be RESOLVED by the parallel-copy resolver, "
+           "not fail-loud rejected";
     for (auto const& d : ccRep.all()) {
-        if (d.code == DiagnosticCode::L_MoveCycleUnsupported) {
-            sawCode = true;
-            if (d.actual.find("D-ML7-2.3") != std::string::npos) {
-                sawAnchor = true;
+        EXPECT_NE(d.code, DiagnosticCode::L_MoveCycleUnsupported)
+            << "a breakable swap-cycle must NOT surface L_MoveCycleUnsupported "
+               "(scratch-mediated resolution supersedes the v1 detector)";
+    }
+    auto const stats = collectInstStats(result.lir, sch);
+    // 3 movs: scratch<-rsi, rsi<-rdi, rdi<-scratch. Two movs would be the
+    // clobbering in-order emit (the silent miscompile the resolver prevents).
+    EXPECT_EQ(stats.movOps, 3u)
+        << "a scratch-broken 2-cycle must emit exactly 3 movs (save + 2 swap "
+           "legs), not 2 (in-order clobber)";
+}
+
+TEST(LirCallconvAbi, ThreeFprCycleResolvedViaFprScratch) {
+    // D-ML7-2.3: a 3-element FP arg cycle (cycle length > 2) must be broken with
+    // an FPR-class scratch (movaps), not a GPR. Args in xmm1, xmm2, xmm0 route to
+    // argFprs[0..2] = xmm0, xmm1, xmm2 -> the rotation
+    //   xmm0 <- xmm1, xmm1 <- xmm2, xmm2 <- xmm0
+    // has every source also a destination (a 3-cycle). The resolver saves one
+    // source into a caller-saved FPR outside {xmm0,xmm1,xmm2} (SysV: xmm8..15),
+    // then drains the now-linear chain. All moves are FPR-class movs. A GPR
+    // scratch here (wrong class) would be a silent value-destroying miscompile.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+    auto const callOp = sch.opcodeByMnemonic("call");
+    auto const retOp  = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(callOp.has_value());
+    ASSERT_TRUE(retOp.has_value());
+
+    auto const x0 = sch.registerByName("xmm0");
+    auto const x1 = sch.registerByName("xmm1");
+    auto const x2 = sch.registerByName("xmm2");
+    ASSERT_TRUE(x0.has_value() && x1.has_value() && x2.has_value());
+    LirReg const xmm0 = makePhysicalReg(*x0, LirRegClass::FPR);
+    LirReg const xmm1 = makePhysicalReg(*x1, LirRegClass::FPR);
+    LirReg const xmm2 = makePhysicalReg(*x2, LirRegClass::FPR);
+
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{77});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    // call <sym>, xmm1, xmm2, xmm0  (arg0<-xmm1, arg1<-xmm2, arg2<-xmm0)
+    std::array<LirOperand, 4> callOps{
+        LirOperand::makeSymbolRef(3),
+        LirOperand::makeReg(xmm1),
+        LirOperand::makeReg(xmm2),
+        LirOperand::makeReg(xmm0),
+    };
+    b.addInst(*callOp, InvalidLirReg, callOps);
+    b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    LirAllocation alloc;
+    alloc.perFunc.emplace_back();
+    alloc.perFunc.back().ok                     = true;
+    alloc.perFunc.back().originalSymbol         = SymbolId{77};
+    alloc.perFunc.back().callingConventionIndex = 0;
+    alloc.perFunc.back().numSpillSlots          = 0;
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
+    EXPECT_TRUE(result.ok())
+        << "a 3-FPR arg cycle must be resolved, not rejected";
+    for (auto const& d : ccRep.all())
+        EXPECT_NE(d.code, DiagnosticCode::L_MoveCycleUnsupported)
+            << "a breakable 3-FPR cycle must not surface L_MoveCycleUnsupported";
+    // Verify the scratch is an FPR OUTSIDE the arg-passing set: scan EVERY inst
+    // (FPR moves are `movaps`, not `mov`) for a dest/src FPR whose ordinal is not
+    // in {0,1,2}. Also assert NO GPR appears in any move here (a GPR scratch for
+    // an FPR cycle would be the wrong-class silent corruption).
+    bool sawFprScratch = false;
+    bool sawGprInMoves = false;
+    auto const movOp    = sch.opcodeByMnemonic("mov");
+    auto const movapsOp = sch.opcodeByMnemonic("movaps");
+    for (std::uint32_t fi = 0; fi < result.lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = result.lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const bb = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < result.lir.blockInstCount(bb); ++ii) {
+                LirInstId const inst = result.lir.blockInstAt(bb, ii);
+                std::uint16_t const op = result.lir.instOpcode(inst);
+                bool const isMove = (movOp.has_value() && op == *movOp)
+                                 || (movapsOp.has_value() && op == *movapsOp);
+                if (!isMove) continue;
+                LirReg const dst = result.lir.instResult(inst);
+                if (dst.valid() && dst.regClass() == LirRegClass::FPR
+                    && dst.id != *x0 && dst.id != *x1 && dst.id != *x2)
+                    sawFprScratch = true;
+                if (dst.valid() && dst.regClass() == LirRegClass::GPR)
+                    sawGprInMoves = true;
+                for (auto const& op2 : result.lir.instOperands(inst)) {
+                    if (op2.kind != LirOperandKind::Reg) continue;
+                    if (op2.reg.regClass() == LirRegClass::FPR
+                        && op2.reg.id != *x0 && op2.reg.id != *x1
+                        && op2.reg.id != *x2)
+                        sawFprScratch = true;
+                    if (op2.reg.regClass() == LirRegClass::GPR)
+                        sawGprInMoves = true;
+                }
             }
         }
     }
-    EXPECT_TRUE(sawCode)
-        << "the swap-cycle must surface L_MoveCycleUnsupported";
-    EXPECT_TRUE(sawAnchor)
-        << "the diagnostic must cite the D-ML7-2.3 anchor for triage";
+    EXPECT_TRUE(sawFprScratch)
+        << "the 3-FPR cycle break must use an FPR-class scratch register "
+           "outside the argFprs[0..2] set";
+    EXPECT_FALSE(sawGprInMoves)
+        << "an FPR-only cycle must not route any value through a GPR "
+           "(wrong-class scratch would silently corrupt the double)";
+}
+
+TEST(LirCallconvAbi, CycleBreakScratchAvoidsCommittedArgDestination) {
+    // D-ML7-2.3 SCRATCH-COLLAPSE fix. A wide arg-passing move set whose SOURCES
+    // overlap the low arg registers: the first six args arrive in HIGH caller-
+    // saved FPRs (xmm8..xmm13) and route to argFprs[0..5] (xmm0..xmm5) as an
+    // orderable chain; the last two args form a 2-swap in argFprs[6],[7]
+    // (xmm6<->xmm7). The progress scan emits the six clean moves FIRST — COMMITTING
+    // xmm0..xmm5 to their final argument values — then breaks the {xmm6,xmm7}
+    // cycle with a scratch.
+    //
+    // THE BUG (pre-fix): pickScratchReg excluded only the registers still present
+    // in the SHRINKING move set. Once the six clean moves were emitted-and-erased,
+    // xmm0..xmm5 dropped out of the exclusion, so the scratch picker (scanning
+    // cc.callerSaved in order) returned the FIRST caller-saved FPR — xmm0 — an
+    // ALREADY-COMMITTED destination holding arg0. The cycle break then clobbered
+    // arg0 (a SILENT SysV miscompile: an 8-FP-arg rotation returned the wrong
+    // value). The fix folds the FULL destination footprint into the scratch
+    // exclusion, so the scratch lands OUTSIDE {xmm0..xmm7}.
+    //
+    // ASSERTION (behavioral, name-agnostic): replay the emitted move sequence as a
+    // register machine — every SOURCE register starts holding a unique token — and
+    // require each arg-destination register to end holding its CORRECT source
+    // token. A scratch that clobbered a committed destination shows up as a wrong
+    // final token. This catches the miscompile directly, independent of WHICH
+    // scratch register the (agnostic) picker chooses.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+    auto const callOp = sch.opcodeByMnemonic("call");
+    auto const retOp  = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(callOp.has_value() && retOp.has_value());
+    auto const* cc = sch.callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    // Need at least 8 FP arg registers (the SysV shape) for this construction.
+    ASSERT_GE(cc->argFprs.size(), 8u);
+
+    // Resolve argFprs[0..7] and six HIGH source FPRs (the first caller-saved FPRs
+    // that are NOT argFprs — SysV xmm8.. — read from the cc, never hardcoded).
+    std::array<std::uint16_t, 8> argOrd{};
+    for (std::size_t k = 0; k < 8; ++k) {
+        auto const o = sch.registerByName(cc->argFprs[k]);
+        ASSERT_TRUE(o.has_value()) << "argFprs[" << k << "] must resolve";
+        argOrd[k] = *o;
+    }
+    std::unordered_set<std::uint16_t> argSet(argOrd.begin(), argOrd.end());
+    std::vector<std::uint16_t> highSrc;  // caller-saved FPRs outside the arg set
+    for (auto const& name : cc->callerSaved) {
+        auto const o = sch.registerByName(name);
+        if (!o.has_value()) continue;
+        auto const* info = sch.registerInfo(*o);
+        if (info == nullptr) continue;
+        if (static_cast<std::uint8_t>(info->regClass)
+            != static_cast<std::uint8_t>(LirRegClass::FPR)) continue;
+        if (argSet.count(*o)) continue;
+        highSrc.push_back(*o);
+    }
+    // 6 non-arg caller-saved FPRs (xmm8..xmm13) for the clean chain + ≥1 left as a
+    // scratch (xmm14/xmm15) that the fix MUST use for the cycle break.
+    ASSERT_GE(highSrc.size(), 7u)
+        << "SysV needs xmm8..15 free; this construction requires ≥6 chain sources "
+           "plus ≥1 scratch";
+
+    auto fpr = [](std::uint16_t o) { return makePhysicalReg(o, LirRegClass::FPR); };
+
+    // Build the call. arg k (k<6) <- highSrc[k]; arg 6 <- argFprs[7]; arg 7 <-
+    // argFprs[6]  (the trailing 2-swap in the top two arg registers).
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{123});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    std::vector<LirOperand> callOps;
+    callOps.push_back(LirOperand::makeSymbolRef(5));
+    for (std::size_t k = 0; k < 6; ++k)
+        callOps.push_back(LirOperand::makeReg(fpr(highSrc[k])));
+    callOps.push_back(LirOperand::makeReg(fpr(argOrd[7])));  // arg6 <- xmm7
+    callOps.push_back(LirOperand::makeReg(fpr(argOrd[6])));  // arg7 <- xmm6
+    b.addInst(*callOp, InvalidLirReg, callOps);
+    b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    LirAllocation alloc;
+    alloc.perFunc.emplace_back();
+    alloc.perFunc.back().ok                     = true;
+    alloc.perFunc.back().originalSymbol         = SymbolId{123};
+    alloc.perFunc.back().callingConventionIndex = 0;
+    alloc.perFunc.back().numSpillSlots          = 0;
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
+    EXPECT_TRUE(result.ok())
+        << "the wide arg cycle must resolve, not fail-loud";
+    for (auto const& d : ccRep.all())
+        EXPECT_NE(d.code, DiagnosticCode::L_MoveCycleUnsupported);
+
+    // Expected final state: argFprs[k] holds highSrc[k]'s token for k<6, arg6
+    // holds xmm7's original token, arg7 holds xmm6's original token.
+    std::unordered_map<std::uint16_t, std::uint16_t> expectedFinal;
+    for (std::size_t k = 0; k < 6; ++k) expectedFinal[argOrd[k]] = highSrc[k];
+    expectedFinal[argOrd[6]] = argOrd[7];
+    expectedFinal[argOrd[7]] = argOrd[6];
+
+    // Register machine: each physical FPR initially holds its OWN ordinal as a
+    // token. Replay every emitted mov/movaps; assert the arg dests end correct.
+    std::unordered_map<std::uint16_t, std::uint16_t> regToken;  // reg ord -> token
+    auto tokenOf = [&](std::uint16_t ord) -> std::uint16_t {
+        auto it = regToken.find(ord);
+        return it == regToken.end() ? ord : it->second;  // untouched holds itself
+    };
+    auto const movOp    = sch.opcodeByMnemonic("mov");
+    auto const movapsOp = sch.opcodeByMnemonic("movaps");
+    for (std::uint32_t fi = 0; fi < result.lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = result.lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const bb = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < result.lir.blockInstCount(bb); ++ii) {
+                LirInstId const inst = result.lir.blockInstAt(bb, ii);
+                std::uint16_t const op = result.lir.instOpcode(inst);
+                bool const isMove = (movOp.has_value() && op == *movOp)
+                                 || (movapsOp.has_value() && op == *movapsOp);
+                if (!isMove) continue;
+                LirReg const dst = result.lir.instResult(inst);
+                auto const ops = result.lir.instOperands(inst);
+                if (!dst.valid() || dst.regClass() != LirRegClass::FPR) continue;
+                if (ops.empty() || ops[0].kind != LirOperandKind::Reg) continue;
+                // mov dst, src : dst's token becomes src's current token.
+                regToken[static_cast<std::uint16_t>(dst.id)] =
+                    tokenOf(static_cast<std::uint16_t>(ops[0].reg.id));
+            }
+        }
+    }
+    for (auto const& [destOrd, wantToken] : expectedFinal) {
+        EXPECT_EQ(tokenOf(destOrd), wantToken)
+            << "arg-destination register ordinal " << destOrd
+            << " ended with token " << tokenOf(destOrd) << " but should hold "
+            << wantToken << " — a cycle-break scratch clobbered a committed "
+               "argument destination (the scratch-collapse miscompile)";
+    }
+}
+
+TEST(LirCallconvAbi, IndependentGprAndFprCyclesBothResolved) {
+    // D-ML7-2.3: one call carrying TWO disjoint cycles of DIFFERENT classes — a
+    // GPR swap (rdi<->rsi) AND an FPR swap (xmm0<->xmm1) — plus they compose in
+    // the same parallel-move set. Each cycle must break with a scratch of ITS OWN
+    // class (a GPR scratch for the int swap, an FPR scratch for the double swap).
+    // Args: rsi, rdi, xmm1, xmm0 -> dests argGprs[0,1]=rdi,rsi and
+    // argFprs[0,1]=xmm0,xmm1: (rdi<-rsi, rsi<-rdi) and (xmm0<-xmm1, xmm1<-xmm0).
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TargetSchema const& sch = **target;
+    auto const callOp = sch.opcodeByMnemonic("call");
+    auto const retOp  = sch.opcodeByMnemonic("ret");
+    ASSERT_TRUE(callOp.has_value() && retOp.has_value());
+
+    auto const rdiOrd = sch.registerByName("rdi");
+    auto const rsiOrd = sch.registerByName("rsi");
+    auto const x0 = sch.registerByName("xmm0");
+    auto const x1 = sch.registerByName("xmm1");
+    ASSERT_TRUE(rdiOrd && rsiOrd && x0 && x1);
+    LirReg const rdi  = makePhysicalReg(*rdiOrd, LirRegClass::GPR);
+    LirReg const rsi  = makePhysicalReg(*rsiOrd, LirRegClass::GPR);
+    LirReg const xmm0 = makePhysicalReg(*x0, LirRegClass::FPR);
+    LirReg const xmm1 = makePhysicalReg(*x1, LirRegClass::FPR);
+
+    LirBuilder b{sch};
+    b.addFunction(SymbolId{55});
+    LirBlockId const block = b.createBlock();
+    b.beginBlock(block);
+    std::array<LirOperand, 5> callOps{
+        LirOperand::makeSymbolRef(9),
+        LirOperand::makeReg(rsi),   // arg0 -> rdi
+        LirOperand::makeReg(rdi),   // arg1 -> rsi   (GPR swap)
+        LirOperand::makeReg(xmm1),  // arg2 -> xmm0
+        LirOperand::makeReg(xmm0),  // arg3 -> xmm1  (FPR swap)
+    };
+    b.addInst(*callOp, InvalidLirReg, callOps);
+    b.addInst(*retOp, InvalidLirReg, std::span<LirOperand const>{});
+    Lir lir = std::move(b).finish();
+
+    LirAllocation alloc;
+    alloc.perFunc.emplace_back();
+    alloc.perFunc.back().ok                     = true;
+    alloc.perFunc.back().originalSymbol         = SymbolId{55};
+    alloc.perFunc.back().callingConventionIndex = 0;
+    alloc.perFunc.back().numSpillSlots          = 0;
+
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(lir, sch, alloc, ccRep);
+    EXPECT_TRUE(result.ok())
+        << "two disjoint same-call cycles (GPR + FPR) must both resolve";
+    for (auto const& d : ccRep.all())
+        EXPECT_NE(d.code, DiagnosticCode::L_MoveCycleUnsupported)
+            << "disjoint breakable cycles must not surface L_MoveCycleUnsupported";
+    // 6 moves total: each 2-cycle breaks into 3 (save + 2 swap legs). The GPR
+    // swap emits `mov` (x3); the FPR swap emits `movaps` (x3). Count BOTH
+    // mnemonics — collectInstStats.movOps only tracks `mov`, so tally movaps
+    // separately and require the sum to be 6 (a class-collapsed resolution would
+    // undercount one class).
+    auto const stats = collectInstStats(result.lir, sch);
+    auto const movapsOp = sch.opcodeByMnemonic("movaps");
+    std::uint32_t movapsCount = 0;
+    for (std::uint32_t fi = 0; fi < result.lir.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = result.lir.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < result.lir.funcBlockCount(fn); ++bi) {
+            LirBlockId const bb = result.lir.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < result.lir.blockInstCount(bb); ++ii) {
+                LirInstId const inst = result.lir.blockInstAt(bb, ii);
+                if (movapsOp.has_value()
+                    && result.lir.instOpcode(inst) == *movapsOp)
+                    ++movapsCount;
+            }
+        }
+    }
+    EXPECT_EQ(stats.movOps, 3u)
+        << "the GPR swap must break into 3 `mov`s";
+    EXPECT_EQ(movapsCount, 3u)
+        << "the FPR swap must break into 3 `movaps`es (its own FPR-class scratch)";
 }
 
 // ── alignedSizeWithBias (D-LK10-ENTRY-TRAMP-PROLOGUE) ──────────────

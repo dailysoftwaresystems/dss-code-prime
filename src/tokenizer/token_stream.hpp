@@ -72,6 +72,15 @@ public:
     [[nodiscard]] std::size_t position() const noexcept { return pos_; }
     [[nodiscard]] std::size_t size()     const noexcept { return tokens_.size(); }
 
+    // c108 (D-PARSE-FLAT-CHAIN-WORK-LINEAR): a monotonic count of every stream
+    // ACCESS (`peek` + `advance`), never reset by `rewind`/`restore`. It is the
+    // DETERMINISTIC proxy for total parse work: a correct parse touches each token
+    // O(1) times → O(N) accesses, while a speculative-backtracking O(N²) re-peeks/
+    // re-advances a growing prefix → super-linear accesses. Pinning its growth
+    // (first difference constant) is the zero-flake replacement for a wall-clock
+    // ratio that flaked on shared CI runners at a sub-ms baseline.
+    [[nodiscard]] std::uint64_t accessCount() const noexcept { return accessCount_; }
+
     // Random-access set position. Out-of-range clamps to size().
     void rewind(std::size_t pos) noexcept;
 
@@ -108,9 +117,13 @@ private:
     // discipline keeps the bookmark contract clean).
     TokenStream(std::vector<Token> tokens, std::uint64_t instanceId) noexcept;
 
-    std::vector<Token> tokens_;
-    std::size_t        pos_         = 0;
-    std::uint64_t      instanceId_  = 0;
+    std::vector<Token>    tokens_;
+    std::size_t           pos_         = 0;
+    std::uint64_t         instanceId_  = 0;
+    // `mutable`: a pure INSTRUMENTATION counter (peek is const) — it is not part of
+    // the stream's logical state, and rewind/restore deliberately do NOT reset it
+    // (the whole point is to count re-scans).
+    mutable std::uint64_t accessCount_ = 0;
 };
 
 } // namespace dss

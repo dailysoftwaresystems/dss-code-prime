@@ -137,6 +137,24 @@ void parseVariantGuard(json const& v, std::size_t opIdx, std::size_t vi,
     };
     parseImmBound("immMin", variant.immMin);
     parseImmBound("immMax", variant.immMax);
+    // D-AS4-ARM64-NEGATIVE-DISP-LEA-NATIVE-SUB: OPTIONAL `negMemoffset` (bool).
+    // Absent ⇒ false (the non-negative magnitude axis — every pre-existing
+    // variant). Present-and-true ⇒ the variant matches only a NEGATIVE
+    // memoffset, keyed by |disp| against [immMin, immMax]. A non-boolean is a
+    // load-time reject (never a silently dropped flag). validate() rejects
+    // negMemoffset on a guard with no `memoffset` operand (nothing to sign-
+    // route) — the same coherence family as immMin/immMax.
+    if (g.contains("negMemoffset")) {
+        auto const& nv = g.at("negMemoffset");
+        if (!nv.is_boolean()) {
+            coll.emit(DiagnosticCode::C_MalformedJson,
+                      std::format("/opcodes/{}/encoding/variants/{}/guard/negMemoffset",
+                                  opIdx, vi),
+                      "'negMemoffset' must be a boolean");
+        } else {
+            variant.negMemoffset = nv.get<bool>();
+        }
+    }
     if (!g.contains("operandKinds")) return;
     auto const& oks = g.at("operandKinds");
     if (!oks.is_array()) {
@@ -1968,9 +1986,20 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
         // count from CL; the MIR→LIR shift lowering pins the count
         // vreg into the role-declared register exactly like the div
         // lowering's "dividend" pin).
-        static constexpr std::array<std::string_view, 4>
+        // c103 (D-CSUBSET-INTRINSIC-UMULH) added the MUL-HIGH projection:
+        // "multiplicand" (the RAX implicit input of x86 `mul r/m64`) plus
+        // "high"/"low" (the RDX/RAX halves of the 128-bit product; the
+        // `__umulh` lowering captures the "high" output-role). arm64's
+        // native `umulh` needs no roles (a 3-address result-bearing op).
+        // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS) added the CAS projection:
+        // "comparand" (the RAX implicit input of x86 `lock cmpxchg`) plus
+        // "old" (RAX out — the observed-original value on BOTH outcomes; the
+        // AtomicCas lowering captures it). arm64's ldaxr/stlxr need no roles
+        // (result-bearing ops; the status rides the stlxr result slot).
+        static constexpr std::array<std::string_view, 9>
             kKnownImplicitRegisterRoles{"dividend", "quotient", "remainder",
-                                        "count"};
+                                        "count", "multiplicand", "high", "low",
+                                        "comparand", "old"};
         auto resolveRoles =
             [&](std::vector<std::pair<std::string, std::string>> const& roles,
                 std::vector<std::pair<std::string, std::uint16_t>>& resolved,

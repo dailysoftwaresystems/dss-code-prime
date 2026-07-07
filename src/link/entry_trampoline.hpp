@@ -24,6 +24,18 @@
 //
 // ── Trampoline shape per mechanism ──────────────────────────────
 //
+// Program-entry argument prefix (D-RUNTIME-MAIN-ARGC-ARGV, c88) —
+// emitted FIRST when the format declares a `processArgs` block,
+// BEFORE the ABI prologue (the stack offsets are defined against
+// the untouched process-entry SP). StackVector arm — 2 LIR ops:
+//   -1a. load argGprs[0], [sp + argcStackOffset] ; argc (machine word)
+//   -1b. lea  argGprs[1], [sp + argvStackOffset] ; the in-place argv
+//                                     vector's ADDRESS (never deref'd)
+// Signature-independent: main(void) simply ignores the registers.
+// No `processArgs` block ⇒ nothing emitted (Mach-O LC_MAIN already
+// receives argc/argv in the arg registers from dyld — pass-through;
+// PE's out-parameter CRT route is anchored D-RUNTIME-PE-MAIN-ARGS).
+//
 // Syscall arm (Linux ELF / Mach-O BSD syscall) — 5 LIR ops:
 //   1. call user_entry              ; intra-image REL32 to user fn
 //   2. mov argGprs[0], returnGprs[0]; status: rax → rdi (SysV) / x0

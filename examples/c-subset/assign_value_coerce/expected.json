@@ -1,0 +1,16 @@
+{
+  "$comment": "c90 (D-CSUBSET-ASSIGN-VALUE-RHS-COERCE, 2026-07-02): a plain assignment used as a VALUE (comma operand / chained / condition / operand) coerces the RHS to the LVALUE's type before the store (C 6.5.16p3). Pre-fix BOTH HIR value-position arms (finishAssign + lowerBinary Assign) stored at the RHS's width (the c74 compound arms coerce; statement/init assigns coerce — exactly plain-`=`-as-value was missed): sub-int->wider left the wider slot's upper bits STALE (the sqlite detonation: estimateTableWidth's `for(i=pTab->nCol, ...)` i16->int comma assign made i=0x008c0005 instead of 5 -> a 3822-element overrun -> the SQL SIGSEGV = the c90 wall); wider->sub-int stored full width CLOBBERING neighbors (real corruption); chains compounded. FIX: one coerce per arm, mirroring the statement path. 7 checks, distinct exits (the exact sqlite struct-walk shape, neighbor-integrity both directions, chains, double->int via a volatile source, the raw stale-upper witness) with dirty() stack-junk pre-fill so zero-luck cannot mask. RED-ON-DISABLE: checks 1/2/3/5/6/7 fail. => 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

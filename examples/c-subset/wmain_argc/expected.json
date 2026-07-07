@@ -1,0 +1,13 @@
+{
+  "$comment": "c111 (D-RUNTIME-PE-MAIN-ARGS): the WIDE program-entry RUN witness (the wmain(int,wchar_t**) counterpart of the narrow main_argc_argv). On the pe64 target the Windows OS entry receives NO C argument vector, so the MIR-tier synthesized pre-main init (synthesizePeStartup) calls the msvcrt WIDE arg-fetch export __wgetmainargs -- chosen over the narrow __getmainargs by the argv ELEMENT width (unsigned short = pe wide-char u16) -- to populate argc/argv and forwards them to wmain. The runner spawns with no extra args -> wmain must see argc==1 + a non-empty WIDE argv[0] (argv[0][0] is its first u16 code unit) + argv[1]==NULL -> exit 42; each failed layer exits a distinct 90..94 (see main.c). pe64-ONLY: wmain+wide-argv is a Windows construct; the ELF stack-vector mechanism hands a NARROW char** vector, a category mismatch for a wide entry, so no ELF target is declared. RED-on-disable: remove `processArgs` from the pe64 shipped exec JSON (runtime-read config) -> the synth never runs -> wmain reads garbage entry-register argc -> exit 90 instead of 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

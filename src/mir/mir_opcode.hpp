@@ -44,6 +44,27 @@ enum class MirOpcode : std::uint16_t {
 
     // ── integer arithmetic ──
     Add, Sub, Mul, SDiv, UDiv, SMod, UMod, Neg,
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): unsigned MUL-HIGH -- the high 64 bits of
+    // the u64*u64 128-bit product. The `__umulh` builtin (sqlite3Multiply128/160)
+    // lowers to this; x86 `mul r/m64` captures RDX, arm64 native `umulh`. Pure +
+    // commutative (high(a*b) == high(b*a)), like Mul.
+    UMulH,
+    // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): atomic compare-and-swap -- operands
+    // [ptr, comparand, newval], result = the ORIGINAL value at *ptr; iff
+    // original==comparand the newval is stored, ATOMICALLY (seq-cst-ish: x86
+    // `lock cmpxchg` is a full barrier; arm64 LDAXR/STLXR is acquire-release --
+    // the correct lowering for Win32 InterlockedCompareExchange semantics).
+    // hasSideEffects=TRUE (a store): DCE keeps it live even when the result is
+    // unused, CSE never dedups two CASes, LICM never hoists one. NOT commutative.
+    AtomicCas,
+    // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier -- an MSVC COMPILER
+    // reordering fence. ZERO operands, produces NO value (R::None), emits NO
+    // runtime instruction; hasSideEffects=TRUE so DCE keeps it and CSE/LICM
+    // never move IT, and it is in the `opcodeClobbersMemory` positive list so
+    // the CSE/LICM clobber walk treats it as a full memory clobber -- no
+    // Load/Store is reordered ACROSS it. A pure compile-time ordering
+    // constraint -- identical on every target/format.
+    CompilerBarrier,
     // ── floating-point arithmetic ──
     FAdd, FSub, FMul, FDiv, FNeg,
     // ── bitwise ──
@@ -162,6 +183,43 @@ enum class MirOpcode : std::uint16_t {
     // the indirect predecessor (MF-1; blockSuccessors is generic, so RPO/preds/
     // dominators/verifier handle it like any variadic-successor terminator).
     IndirectBr,
+    // ── c115 SEH (D-WIN64-SEH-FUNCLETS): MSVC `__try { … } __except (f) { … }`.
+    // The region skeleton in a flat CFG:
+    //   SehTryBegin — a 0-operand TERMINATOR with exactly 2 successors
+    //     [tryEntry, filterEntry]; payload = the per-function SEH region id.
+    //     The filter/handler blocks hang off the CFG here (reachable, dominated);
+    //     the tryEntry edge is the normal path. In the clobber list: fault-time
+    //     memory state must be ordered at the region boundary.
+    //   SehFilterReturn — the filter block's TERMINATOR: operand[0] = the i32
+    //     filter value (EXECUTE_HANDLER 1 / CONTINUE_SEARCH 0 / CONTINUE_EXEC -1),
+    //     1 successor [handlerEntry]; payload = the region id. In the clobber
+    //     list (audit F1): on x64 SEH, INNER termination handlers run BETWEEN
+    //     filter evaluation and handler entry (RtlUnwindEx phase 2), so a load
+    //     may not be CSE'd from filter into handler.
+    //   SehTryEnd — a 0-operand side-effecting MARKER at the guarded body's
+    //     single fall-through exit (option (C): D-CSUBSET-SEH-EARLY-EXIT keeps
+    //     it the ONLY exit); payload = the region id. In the clobber list.
+    //   SehExceptionCode / SehExceptionInfo — 0-operand VALUE ops (u32 / ptr):
+    //     the `_exception_code()` / `_exception_info()` intrinsics, wired to the
+    //     __C_specific_handler dispatch context by the c116 funclet lowering.
+    // Until c116, mir_to_lir FAILS LOUD on all five (every target).
+    SehTryBegin, SehFilterReturn, SehTryEnd, SehExceptionCode, SehExceptionInfo,
+    // ── c116 (D-WIN64-SEH-FUNCLETS, H1): generic frame-slot recovery. ──
+    // `RecoverParentFrameSlot`: operand[0] = an establisher-frame base pointer
+    // (a NORMAL SSA value — e.g. a funclet's establisher-frame parameter, NEVER a
+    // hardcoded register); payload = the 0-based scan-order slot index of a local
+    // in the frame that base points at. Result = a pointer to that frame slot. It
+    // lowers (at callconv) to `lea result, [base + frameSlotOffset(slotIndex)]`,
+    // where `frameSlotOffset` comes from the config-driven FrameLayout of the
+    // frame the base establishes — the SAME localAreaOffset() + slot*slotSize
+    // geometry `alloca` / `lea_frame_slot` resolve against. AGNOSTIC: base is an
+    // operand, the offset is from FrameLayout, and the op names nothing
+    // arch/format/SEH-specific — it is the generic analog of LLVM's
+    // `llvm.localrecover`. The c116 SEH filter funclet is its first consumer
+    // (recovering a parent local the __except filter reads); a fault-time
+    // establisher frame == the parent's post-prologue SP (FrameRegister=0), so
+    // `[base + off]` == the parent's `[SP + off]`.
+    RecoverParentFrameSlot,
     // ── SIMD (reserved post-v1; vocabulary fixed now) ──
     VAdd, VSub, VMul, VShuffle, VExtract, VInsert,
 
@@ -260,6 +318,12 @@ struct MirOpcodeInfo {
         case MirOpcode::Add:  return {2, 2, 0, 0, R::Value, false, false, false, "add"};
         case MirOpcode::Sub:  return {2, 2, 0, 0, R::Value, false, false, false, "sub"};
         case MirOpcode::Mul:  return {2, 2, 0, 0, R::Value, false, false, false, "mul"};
+        case MirOpcode::UMulH: return {2, 2, 0, 0, R::Value, false, false, false, "umulh"};
+        case MirOpcode::AtomicCas: return {3, 3, 0, 0, R::Value, false, true, false, "atomic_cas"};
+        // 0 operands, NO result (R::None), side-effecting (never DCE'd, never
+        // CSE'd/hoisted) + in the opcodeClobbersMemory list (a fence to
+        // Load/Store motion across it). Lowers to ZERO instructions.
+        case MirOpcode::CompilerBarrier: return {0, 0, 0, 0, R::None, false, true, false, "compiler_barrier"};
         case MirOpcode::SDiv: return {2, 2, 0, 0, R::Value, false, false, false, "sdiv"};
         case MirOpcode::UDiv: return {2, 2, 0, 0, R::Value, false, false, false, "udiv"};
         case MirOpcode::SMod: return {2, 2, 0, 0, R::Value, false, false, false, "smod"};
@@ -393,6 +457,26 @@ struct MirOpcodeInfo {
         case MirOpcode::Return:      return {0, N, 0, 0, R::None, true, true, false, "return"};
         case MirOpcode::Unreachable: return {0, 0, 0, 0, R::None, true, true, false, "unreachable"};
 
+        // c115 SEH (D-WIN64-SEH-FUNCLETS). SehTryBegin: terminator, successors
+        // [tryEntry, filterEntry] (the CondBr shape, 0 operands). SehFilterReturn:
+        // terminator, operand [filterValue i32], successor [handlerEntry].
+        // SehTryEnd: the guarded body's fall-through marker (CompilerBarrier's
+        // shape). SehExceptionCode/Info: 0-operand value intrinsics (side-
+        // effecting so DCE keeps and CSE never merges them — their value is
+        // dispatch-context state, not a pure function).
+        case MirOpcode::SehTryBegin:      return {0, 0, 2, 2, R::None, true, true, false, "seh_try_begin"};
+        case MirOpcode::SehFilterReturn:  return {1, 1, 1, 1, R::None, true, true, false, "seh_filter_return"};
+        case MirOpcode::SehTryEnd:        return {0, 0, 0, 0, R::None, false, true, false, "seh_try_end"};
+        case MirOpcode::SehExceptionCode: return {0, 0, 0, 0, R::Value, false, true, false, "seh_exception_code"};
+        case MirOpcode::SehExceptionInfo: return {0, 0, 0, 0, R::Value, false, true, false, "seh_exception_info"};
+        // c116 H1 (D-WIN64-SEH-FUNCLETS): 1 operand (the establisher base pointer),
+        // payload = slot index; result = a pointer to that frame slot. A pure
+        // address computation (like `alloca`/`lea_frame_slot`): NOT side-effecting,
+        // NOT a terminator. Synth appends it in the funclet AFTER the optimizer, and
+        // the pipeline runs no MIR-tier DCE/CSE afterward, so its result-use survives.
+        case MirOpcode::RecoverParentFrameSlot:
+                                          return {1, 1, 0, 0, R::Value, false, false, false, "recover_parent_frame_slot"};
+
         // SIMD (reserved — provisional arities).
         case MirOpcode::VAdd:     return {2, 2, 0, 0, R::Value, false, false, false, "vadd"};
         case MirOpcode::VSub:     return {2, 2, 0, 0, R::Value, false, false, false, "vsub"};
@@ -427,7 +511,7 @@ struct MirOpcodeInfo {
 // (D-OPT1-CSE-NONCOMMUTATIVE-PIN).
 [[nodiscard]] constexpr bool isCommutative(MirOpcode op) noexcept {
     switch (op) {
-        case MirOpcode::Add:    case MirOpcode::Mul:
+        case MirOpcode::Add:    case MirOpcode::Mul:    case MirOpcode::UMulH:
         case MirOpcode::And:    case MirOpcode::Or:    case MirOpcode::Xor:
         case MirOpcode::FAdd:   case MirOpcode::FMul:
         case MirOpcode::ICmpEq: case MirOpcode::ICmpNe:
@@ -444,6 +528,48 @@ struct MirOpcodeInfo {
 }
 [[nodiscard]] constexpr std::string_view mnemonic(MirOpcode op) noexcept {
     return opcodeInfo(op).mnemonic;
+}
+// Memory-CLOBBER classification (c113, D-CSUBSET-INTRINSIC-BARRIER audit-F1
+// + its review correction) — DISTINCT from `hasSideEffects`, which is a
+// DCE-LIVENESS flag ("not removable purely because its result is unused")
+// and is true for many ops that write NO aliasable memory: every
+// terminator (Br/CondBr/Switch/Return/...), Alloca (a FRESH slot cannot
+// alias a pre-existing pointer), the Va*/address-materialization leaves,
+// BlockAddress, ReturnPiece. Conflating the two disables Load motion
+// wholesale (every loop body ends in a terminator — LICM would hoist
+// nothing; the review-caught red). An op CLOBBERS memory iff executing it
+// may WRITE (or fence) memory an independent Load's pointer could alias:
+//   * Store         — writes *operands[1] (callers alias-test it precisely)
+//   * Call /        — an opaque callee may write anything reachable
+//     IntrinsicCall
+//   * AtomicCas     — a store (the CAS write)
+//   * CompilerBarrier — an ordering FENCE: no write, but Load/Store motion
+//     across it is forbidden by contract (_ReadWriteBarrier)
+// Consumed by the Load-motion clobber walk (opt/analysis/mir_alias.hpp,
+// the CSE/LICM shared chokepoint). A future memory-writing op joins THIS
+// list (the `isCommutative` positive-list convention over the closed MIR
+// verb set — never a lang/arch/format identity).
+[[nodiscard]] constexpr bool opcodeClobbersMemory(MirOpcode op) noexcept {
+    switch (op) {
+        case MirOpcode::Store:
+        case MirOpcode::Call:
+        case MirOpcode::IntrinsicCall:
+        case MirOpcode::AtomicCas:
+        case MirOpcode::CompilerBarrier:
+        // c115 SEH region boundaries: memory state must be exactly ordered at
+        // SehTryBegin (the filter/handler observe fault-time memory — pre-try
+        // loads may not be forwarded past it) and SehTryEnd. SehFilterReturn is
+        // in the list per the c115 design-audit F1: on x64 SEH, INNER frames'
+        // termination handlers execute BETWEEN filter evaluation and handler
+        // entry (RtlUnwindEx phase 2), so a load may not be CSE'd from the
+        // filter block into the handler block across it.
+        case MirOpcode::SehTryBegin:
+        case MirOpcode::SehTryEnd:
+        case MirOpcode::SehFilterReturn:
+            return true;
+        default:
+            return false;
+    }
 }
 
 } // namespace dss

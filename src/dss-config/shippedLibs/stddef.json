@@ -1,11 +1,15 @@
 {
-  "$comment": "Neutral shipped <stddef.h> (C89 7.17) — the common typedefs + NULL, as language-NEUTRAL data injected by the semantic phase (see README + limits.json). `size_t`/`ptrdiff_t` are pointer-width = 8 bytes on EVERY current DSS target (all 64-bit; LP64 + LLP64 agree on pointer width) -> u64/i64; an ILP32 target would make them 4-byte (deferred D-FFI-STDINT-PTR-WIDTH-ILP32, shared with stdint). `wchar_t` is i32 (the POSIX/Linux+macOS width; Windows is 16-bit, deferred D-FFI-WCHAR-WIDTH). `NULL` is the integer null-pointer constant 0 (C 6.3.2.3 — the constant 0 in pointer context is the null pointer); the `constants` surface is integer-typed, so it rides as i64 0 and converts to any pointer like a literal 0. `offsetof` is a function-like macro (no descriptor surface for it yet — deferred D-FFI-OFFSETOF-MACRO).",
+  "$comment": "Neutral shipped <stddef.h> (C89 7.17) — the common typedefs + NULL, as language-NEUTRAL data injected by the semantic phase (see README + limits.json). `size_t`/`ptrdiff_t` are pointer-width = 8 bytes on EVERY current DSS target (all 64-bit; LP64 + LLP64 agree on pointer width) -> u64/i64; an ILP32 target would make them 4-byte (deferred D-FFI-STDINT-PTR-WIDTH-ILP32, shared with stdint). `wchar_t` is PER-FORMAT (c106, D-FFI-STDDEF-WCHAR-PE-WIDTH closed): elf/macho i32 (the POSIX width, UNCHANGED) and pe u16 (the Windows UTF-16 code unit) via typedef variants. The pe axis ALSO rides pe-gated duplicate typedefs in stdio/stdlib/io.json (the MSVC corecrt model: every CRT header defines wchar_t; duplication is the size_t 5-descriptor precedent). `NULL` is the integer null-pointer constant 0 (C 6.3.2.3 — the constant 0 in pointer context is the null pointer); the `constants` surface is integer-typed, so it rides as i64 0 and converts to any pointer like a literal 0. `offsetof` is a function-like macro (no descriptor surface for it yet — deferred D-FFI-OFFSETOF-MACRO).",
   "header": "stddef.h",
   "standard": "c89",
   "typedefs": [
     { "name": "size_t",    "type": "u64" },
     { "name": "ptrdiff_t", "type": "i64" },
-    { "name": "wchar_t",   "type": "i32" }
+    { "name": "wchar_t",   "variants": [
+        { "when": { "format": "elf" },   "type": "i32" },
+        { "when": { "format": "macho" }, "type": "i32" },
+        { "when": { "format": "pe" },    "type": "u16" }
+    ] }
   ],
   "constants": [
     { "name": "NULL", "value": 0, "type": "i64" }

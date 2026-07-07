@@ -443,6 +443,16 @@ public:
     // ── terminators (each seals the current block) ──
     MirInstId addBr(MirBlockId target);
     MirInstId addCondBr(MirInstId cond, MirBlockId ifTrue, MirBlockId ifFalse);
+    // c115 SEH (D-WIN64-SEH-FUNCLETS): the region-opening terminator — succ[0]
+    // = the guarded body's entry, succ[1] = the filter block; payload = the
+    // per-function region id (pairs Begin / FilterReturn / End).
+    MirInstId addSehTryBegin(MirBlockId tryEntry, MirBlockId filterEntry,
+                             std::uint32_t regionId);
+    // The filter block's terminator — operand[0] = the i32 filter value,
+    // succ[0] = the handler block (the EXECUTE_HANDLER edge; CONTINUE_SEARCH
+    // unwinds out of the function — no CFG edge).
+    MirInstId addSehFilterReturn(MirInstId filterValue, MirBlockId handlerEntry,
+                                 std::uint32_t regionId);
     // Switch over `discriminant`; each case is a (constant value, target block)
     // pair; `defaultTarget` is taken when no case matches. Successors are recorded
     // as [case targets…, default].

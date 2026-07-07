@@ -1,0 +1,13 @@
+{
+  "$comment": "Neutral shipped <process.h> (Microsoft CRT) — c98 (Windows-host sub-arc, the 3-header F001A batch). sqlite3.c's SQLITE_OS_WIN_THREADS block (#include <process.h> ~35886) spawns worker threads via `_beginthreadex(0,0,sqlite3ThreadProc,p,0,&p->id)` and terminates them via `_endthreadex(0)` — the ONLY two symbols the amalgamation uses; `_beginthread`/`_endthread` ship as the obviously-paired non-ex siblings (same vocabulary, trivial). `availableObjectFormats:[pe]` — a Microsoft-CRT header is meaningless on elf/macho (a reference there fails loud, mirroring windows.json). `library:{pe:msvcrt.dll}` — all four are msvcrt.dll exports (verified via dumpbin /exports C:/Windows/System32/msvcrt.dll: _beginthread ord 198, _beginthreadex 199, _endthread 268, _endthreadex 269), NOT kernel32. SIGNATURES (Microsoft SDK corecrt_startup/process.h, x64): `uintptr_t _beginthreadex(void *security, unsigned stack_size, unsigned (__stdcall *start_address)(void*), void *arglist, unsigned initflag, unsigned *thrdaddr)` — uintptr_t is u64 on x64 (sqlite casts the result to void*, so a 32-bit return would truncate the thread HANDLE); the thread-proc param is `unsigned(__stdcall*)(void*)` and `__stdcall` ERASES on pe (c95, MS x64 has one calling convention), so the fn-ptr type spells plainly as ptr<fn(ptr<void>) -> u32> — exactly the type sqlite3ThreadProc decays to. `void _endthreadex(unsigned retval)`. `uintptr_t _beginthread(void (__cdecl *start_address)(void*), unsigned stack_size, void *arglist)`; `void _endthread(void)`. The `security` param is `void*` per the UCRT prototype (sqlite passes literal 0).",
+  "header": "process.h",
+  "standard": "msvcrt",
+  "availableObjectFormats": ["pe"],
+  "library": { "pe": "msvcrt.dll" },
+  "symbols": [
+    { "name": "_beginthreadex", "signature": "fn(ptr<void>, u32, ptr<fn(ptr<void>) -> u32>, ptr<void>, u32, ptr<u32>) -> u64", "kind": "function", "linkage": "external" },
+    { "name": "_endthreadex",   "signature": "fn(u32) -> void",                                                                "kind": "function", "linkage": "external" },
+    { "name": "_beginthread",   "signature": "fn(ptr<fn(ptr<void>) -> void>, u32, ptr<void>) -> u64",                         "kind": "function", "linkage": "external" },
+    { "name": "_endthread",     "signature": "fn() -> void",                                                                   "kind": "function", "linkage": "external" }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "$comment": "c113 (D-CSUBSET-INTRINSIC-BARRIER): witnesses the pe-gated <intrin.h> include resolution + the _ReadWriteBarrier compiler-barrier intrinsic end-to-end. `_ReadWriteBarrier` is an always-on builtin lowering to a zero-operand side-effecting MirOpcode::CompilerBarrier that emits no instruction; the program stores/loads a global around two barriers and returns 42. A single-threaded binary cannot observe compiler reordering, so 42 witnesses the compile+run chain (include resolves, builtin lowers, binary runs) including under the `release` optimizer pipeline (the barrier survives DCE/CSE/LICM). The ordering contract (no load hoisted across the fence) is pinned in the MIR tests where it is observable. pe64-ONLY: <intrin.h> is gated availableObjectFormats:[pe] (a Microsoft compiler-intrinsic header); elf/macho reject the include with F_ShippedHeaderUnavailableForTarget, so no elf/macho arm is declared. RED-on-disable: drop the _ReadWriteBarrier builtin (S0001 undeclared) or shippedLibs/intrin.json (F_ShippedHeaderNotFound).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

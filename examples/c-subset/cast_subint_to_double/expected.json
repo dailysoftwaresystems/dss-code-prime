@@ -1,0 +1,16 @@
+{
+  "$comment": "c78 (si_to_fp sub-int source, 2026-07-01): (double)(signed char/uchar/short) SExt/ZExt-widens the sub-int source to i32 before the int->float convert (CVTSI2SD has only r32/r64 forms; SCVTF only Wn/Xn). Pre-fix a width-8/16 source hit A_NoMatchingEncodingVariant at the SIToFP. Mirrors gcc's movsx+cvtsi2sd r32. RED-ON-DISABLE: revert the combineCast widen -> A_NoMatchingEncodingVariant si_to_fp width 8. => 100.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 100,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

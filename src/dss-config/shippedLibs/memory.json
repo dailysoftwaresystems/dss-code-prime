@@ -1,0 +1,13 @@
+{
+  "$comment": "Neutral shipped <memory.h> — c81 (the sqlite shell.c CLI route; shell.c:7121 [base85.c] `#include <memory.h>` — UNCONDITIONAL, not !_WIN32-guarded). <memory.h> is the pre-ANSI legacy alias of <string.h> (historically it provided the mem* family; every modern libc ships it as a string.h forwarder — glibc /usr/include/memory.h is literally `#include <string.h>`, MSVC CRT and Darwin ship the same alias). The simplest CORRECT neutral form is a descriptor that MIRRORS string.json's mem* surface byte-for-byte (the descriptor model has no `aliasOf`; an empty descriptor fails loud by design — 'declares nothing'). DOUBLE-INCLUDE IS SAFE BY CONSTRUCTION: shell.c includes BOTH <string.h> (166 etc.) and <memory.h> — the semantic injection dedups symbol names FIRST-WINS across descriptors (semantic_analyzer FF11 `injectedNames`), so exactly ONE memcpy extern is minted per CU regardless of which header (or both) appears; a TU including ONLY <memory.h> still resolves the mem* family. str* names are deliberately NOT mirrored: historical memory.h provided only the mem* family, and shipping less keeps the alias honest (a str* user includes <string.h>). UNGATED (no availableObjectFormats) + the full tri-format library map, exactly like string.json — the header exists on every platform and shell.c's include is unconditional, so a windows-pe shell.c build must resolve it too.",
+  "header": "memory.h",
+  "standard": "c89",
+  "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "symbols": [
+    { "name": "memcpy",  "signature": "fn(ptr<void>, ptr<void>, u64) -> ptr<void>", "kind": "function", "linkage": "external" },
+    { "name": "memmove", "signature": "fn(ptr<void>, ptr<void>, u64) -> ptr<void>", "kind": "function", "linkage": "external" },
+    { "name": "memset",  "signature": "fn(ptr<void>, i32, u64) -> ptr<void>",  "kind": "function", "linkage": "external" },
+    { "name": "memcmp",  "signature": "fn(ptr<void>, ptr<void>, u64) -> i32",  "kind": "function", "linkage": "external" },
+    { "name": "memchr",  "signature": "fn(ptr<void>, i32, u64) -> ptr<void>",  "kind": "function", "linkage": "external" }
+  ]
+}

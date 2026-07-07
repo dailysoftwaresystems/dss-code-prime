@@ -1392,6 +1392,150 @@ TEST(ParserCSubsetSmoke, LongInitializerRidesTheStatementProbeBudget) {
            "DECLARATION";
 }
 
+// ── c25 REPRODUCTION + regression pin: the struct-body speculation budget ──
+//
+// A struct/union/enum BODY specifier is parsed INSIDE the speculative probe
+// that disambiguates body-vs-ref (typedefHead / typeSpecifierForDecl /
+// topLevelCompositeSpec / typeBaseAllowingStruct — lookahead 256 = 4096-token
+// probe budget). The body-vs-ref choice is settled the instant a `{` appears,
+// yet the probe keeps speculating through the WHOLE member list, so a struct
+// whose body exceeds 4096 tokens trips exceededBudget() → the body-form alt
+// fails → the parser mis-recovers to the matching `}` → P0009 at the orphan
+// `};`. This is `struct sqlite3` (sqlite3.c:18907) in minimal form. It is NOT
+// a member-COUNT limit (a 130-member control parses); it is a TOKEN-budget
+// cliff that any large mixed struct (real SQLite) reaches at ~80 members.
+TEST(ParserCSubsetSmoke, LargeStructBodyMustNotHitSpeculationBudget) {
+    auto structOf = [](int n) {
+        std::string s = "struct S {";
+        for (int i = 0; i < n; ++i) s += "int a" + std::to_string(i) + ";";
+        return s + "};";
+    };
+    // Control: 130 members (~390 body tokens) — far under the 4096 budget.
+    {
+        auto h = loadAndTokenize(structOf(130));
+        Parser p{h.src, h.schema, std::move(h.stream)};
+        auto const r = std::move(p).parse();
+        EXPECT_FALSE(r.tree.diagnostics().hasErrors())
+            << "130-member struct (control) must parse clean";
+    }
+    // Regression: 1500 members (~4500 body tokens) — exceeds the 4096 probe
+    // budget. RED pre-c25 (P0009 at the `};`); GREEN once the large struct
+    // body parse is no longer governed by the body-vs-ref speculation budget.
+    {
+        auto h = loadAndTokenize(structOf(1500));
+        Parser p{h.src, h.schema, std::move(h.stream)};
+        auto const r = std::move(p).parse();
+        EXPECT_FALSE(r.tree.diagnostics().hasErrors())
+            << "1500-member struct must parse clean — the body-vs-ref "
+               "speculation must not budget-cap the member list (c25)";
+    }
+}
+
+// c25: the SAME budget cliff for UNION and ENUM bodies — proves the
+// unification (and thus the non-speculative direct descent) covers all
+// three composites, not just struct. RED-on-disable for the union/enum
+// arms: revert `unionSpec`/`enumSpec` back to the speculative
+// `unionSpecifierBody | unionTypeRef` pair and the 1500-member body
+// budget-caps → P0009 at the `};`.
+TEST(ParserCSubsetSmoke, LargeUnionBodyMustNotHitSpeculationBudget) {
+    std::string s = "union U {";
+    for (int i = 0; i < 1500; ++i) s += "int a" + std::to_string(i) + ";";
+    s += "};";
+    auto h = loadAndTokenize(std::move(s));
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto const r = std::move(p).parse();
+    EXPECT_FALSE(r.tree.diagnostics().hasErrors())
+        << "1500-member union must parse clean (c25 unified unionSpec)";
+}
+
+TEST(ParserCSubsetSmoke, LargeEnumBodyMustNotHitSpeculationBudget) {
+    std::string s = "enum E {";
+    for (int i = 0; i < 1500; ++i) s += "A" + std::to_string(i) + ",";
+    s += "};";
+    auto h = loadAndTokenize(std::move(s));
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto const r = std::move(p).parse();
+    EXPECT_FALSE(r.tree.diagnostics().hasErrors())
+        << "1500-enumerator enum must parse clean (c25 unified enumSpec)";
+}
+
+// c25: a MIXED large struct closer to real sqlite3 — nested anonymous
+// struct + nested anonymous union, a function-pointer member, a bit-field,
+// an array member, and a multi-declarator member — REPEATED past the old
+// 4096-token probe budget. Parses clean (no parse diagnostics). The mix
+// exercises the RECURSIVE composite path (each nested body is itself a
+// non-speculative direct descent) at scale, which the flat repro does not.
+TEST(ParserCSubsetSmoke, MixedLargeStructBodyParsesCleanPastOldBudget) {
+    std::string s = "struct Big {";
+    // ~12 tokens per iteration; 500 iterations ≈ 6000 tokens, past 4096.
+    for (int i = 0; i < 500; ++i) {
+        std::string n = std::to_string(i);
+        s += "struct { int sa" + n + "; } sx" + n + ";";   // nested anon struct
+        s += "union { int ua" + n + "; long ub" + n + "; } ux" + n + ";"; // nested anon union
+        s += "int (*fp" + n + ")(int);";                   // fn-pointer member
+        s += "unsigned bf" + n + " : 3;";                  // bit-field
+        s += "int arr" + n + "[4];";                       // array member
+        s += "int ma" + n + ", mb" + n + ";";              // multi-declarator
+    }
+    s += "};";
+    auto h = loadAndTokenize(std::move(s));
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto const r = std::move(p).parse();
+    EXPECT_FALSE(r.tree.diagnostics().hasErrors())
+        << "a large mixed struct (nested aggregates, fn-ptr, bitfield, "
+           "array, multi-declarator) past the old budget must parse clean";
+}
+
+// c25 PARSER-SHAPE pin (the define-vs-reference structural discriminator):
+// `struct S { … }` produces a `structSpec` node that HAS a `structBody`
+// child; `struct S` (a bare reference, here as a pointer-param type) produces
+// a `structSpec` node with NO `structBody` child. This is the exact shape the
+// dual-mode binder keys on (`definesWhenChild: structBody`). RED-on-disable:
+// if the grammar stopped factoring the body into `structBody`, the
+// has-body/lacks-body assertions flip.
+TEST(ParserCSubsetSmoke, StructSpecBodyChildPresenceDiscriminatesDefineVsRef) {
+    // DEFINITION head: a `structBody` child IS present.
+    {
+        auto h = loadAndTokenize("struct S { int x; } v;");
+        Parser p{h.src, h.schema, std::move(h.stream)};
+        auto const r = std::move(p).parse();
+        auto const& t = r.tree;
+        ASSERT_FALSE(t.diagnostics().hasErrors());
+        const NodeId spec = findFirstNodeWithRule(t, "structSpec");
+        ASSERT_NE(spec, NodeId{}) << "a struct definition head is a structSpec";
+        const auto bodyRule = t.schema().rules().find("structBody");
+        ASSERT_TRUE(bodyRule.valid());
+        bool hasBody = false;
+        walkPreOrder(TreeCursor{t, spec, CursorMode::Ast}, [&](TreeCursor const& c) {
+            const auto id = c.current();
+            if (id.v != spec.v && t.kind(id) == NodeKind::Internal
+                && t.rule(id).v == bodyRule.v) hasBody = true;
+        });
+        EXPECT_TRUE(hasBody)
+            << "`struct S { … }` structSpec must HAVE a structBody child";
+    }
+    // REFERENCE head: NO `structBody` child (a bare `struct S` in a decl head).
+    {
+        auto h = loadAndTokenize("struct S v;");
+        Parser p{h.src, h.schema, std::move(h.stream)};
+        auto const r = std::move(p).parse();
+        auto const& t = r.tree;
+        ASSERT_FALSE(t.diagnostics().hasErrors());
+        const NodeId spec = findFirstNodeWithRule(t, "structSpec");
+        ASSERT_NE(spec, NodeId{}) << "a bare `struct S` head is a structSpec";
+        const auto bodyRule = t.schema().rules().find("structBody");
+        ASSERT_TRUE(bodyRule.valid());
+        bool hasBody = false;
+        walkPreOrder(TreeCursor{t, spec, CursorMode::Ast}, [&](TreeCursor const& c) {
+            const auto id = c.current();
+            if (id.v != spec.v && t.kind(id) == NodeKind::Internal
+                && t.rule(id).v == bodyRule.v) hasBody = true;
+        });
+        EXPECT_FALSE(hasBody)
+            << "`struct S` (reference) structSpec must have NO structBody child";
+    }
+}
+
 // ── plan-24 Stage 7: the config-driven expression-depth cap LIFT ────────────
 //
 // Three pins for the single change "`maxExpressionDepth` is config-driven and

@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/types/strong_ids.hpp"
 
+#include <cstdint>
 #include <string>
 
 // Cross-tier extern symbol descriptor (LK6 cycle 2d substrate hoist
@@ -42,6 +43,32 @@ struct DSS_EXPORT ExternImport {
     SymbolId    symbol{};       // matches Relocation::target
     std::string mangledName;    // on-binary symbol name
     std::string libraryPath;    // owning dylib / DLL / SO
+    // c82 (D-LK-EXTERN-DATA-IMPORT): true for an extern DATA object
+    // (HIR ExternGlobal — e.g. libc's `stdout`, or a cross-TU
+    // `extern const char sqlite3_version[];`), false for a function.
+    // A data import that survives to the link tier (the LK11 merge
+    // resolves sibling-CU-defined ones away first) binds per the
+    // format's declared `dataImportBinding` model (c84: the ELF
+    // ET_EXEC R_*_COPY copy-relocation); a format that declares no
+    // model FAILS LOUD at the linker's pre-walker gate — a PLT
+    // stub bound to a data symbol would be a silent miscompile.
+    bool        isData = false;
+    // c84 (D-LK-EXTERN-DATA-IMPORT): the imported DATA object's byte
+    // size + alignment, DERIVED from the declared type's layout at
+    // HIR→MIR (`computeLayout` under the active target's aggregate-
+    // layout params + the format's DataModel — never hardcoded; a
+    // `FILE*` object is the data model's pointer width). Consumed by
+    // the ELF copy-relocation emitter: the exec reserves a `.bss`
+    // slot of exactly this shape, exports the symbol with this
+    // `st_size`, and the loader memcpy's `st_size` bytes from the
+    // library's object. BOTH stay 0 when the declared type is
+    // INCOMPLETE (`extern const char v[];`) — legal C for a cross-TU
+    // extern the LK11 merge resolves against its defining sibling
+    // CU; a TRUE library import that survives to the walker with
+    // size 0 fails loud there (an unsized copy slot cannot be
+    // reserved). Meaningless (0) for function imports.
+    std::uint64_t dataSizeBytes  = 0;
+    std::uint64_t dataAlignBytes = 0;
 };
 
 } // namespace dss

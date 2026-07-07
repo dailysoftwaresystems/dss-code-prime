@@ -2,6 +2,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: build CUs on a large stack
+#include "core/substrate/phase_timers.hpp"      // c97: --time per-phase breakdown
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/object_format_kind.hpp"
@@ -9,8 +10,10 @@
 #include "core/types/target_schema.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"  // TypeLattice (fresh merge host)
 #include "ffi/abi/abi_catalog.hpp"
+#include "ffi/mangling/c_mangle.hpp"  // applyCMangling — the cross-CU merge-key mangling (D-LK-MACHO-CROSSCU-MANGLE-MERGE-KEY)
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergeCuInput, mergeCuMirs (N>1 whole-program merge)
+#include "mir/merge/synth_pe_startup.hpp"  // synthesizePeStartup (c111 D-RUNTIME-PE-MAIN-ARGS)
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
 #include "lsp/thread_pool.hpp"
@@ -342,7 +345,7 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // would re-intern CU0's types into a fresh host (a no-op for correctness, but extra
     // work + a different code path); keep the proven single-CU lowering for byte-identity.
     if (cuMirs.size() == 1) {
-        auto mod = lowerCuMirToAssembly(cuMirs[0], reporter);
+        auto mod = lowerCuMirToAssembly(cuMirs[0], (*formatR)->processArgs(), reporter);
         if (!mod) return false;  // back-half tier failure already reported via `reporter`
         return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},
                             **targetR, **formatR, outPath, reporter);
@@ -355,19 +358,34 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // each CU's `nameOf` (SemanticModel symbol names + extern mangledNames) while cloning,
     // so `cuMirs` must stay alive through `mergeCuMirs` — it does (function-local, no CU's
     // lattice is moved out: the host is FRESH, leaving every SemanticModel intact).
+    // D-LK-MACHO-CROSSCU-MANGLE-MERGE-KEY (c118): the active format's C mangling, applied
+    // to every DEFINITION merge-key (nameOf below) AND the entry-name set, so definitions
+    // match the externs' already-mangled `mangledName` on macho (identity on elf/pe). Both
+    // the def↔extern resolution and the `main` entry match key on this same convention.
+    ObjectFormatKind const fmtKind = (*formatR)->kind();
     std::vector<MergeCuInput> mergeInputs;
     mergeInputs.reserve(cuMirs.size());
     for (auto& cuMir : cuMirs) {
         MergeCuInput in;
         in.mir      = &cuMir.mir;
         in.interner = &cuMir.model.lattice().interner();
-        // nameOf: symbol id → declared name. Covers DEFINITIONS (SemanticModel record)
-        // AND extern IMPORTS (the import's mangledName, when the symbol has no record —
-        // an extern reference's SymbolId is not in the semantic symbol table). The merge
-        // keys cross-CU matching on this name exactly as the linker keys on the on-binary
-        // symbol name. Capturing `&cuMir` is safe — `cuMirs` is done growing.
-        in.nameOf = [cuMirP = &cuMir](SymbolId s) -> std::string {
-            if (SymbolRecord const* r = cuMirP->model.recordFor(s)) return r->name;
+        // nameOf: symbol id → the cross-CU MATCH KEY. Covers DEFINITIONS (SemanticModel
+        // record) AND extern IMPORTS (the import's mangledName, when the symbol has no
+        // record — an extern reference's SymbolId is not in the semantic symbol table).
+        // ★ D-LK-MACHO-CROSSCU-MANGLE-MERGE-KEY (c118): a definition's key is its source
+        // name run through the FORMAT'S C MANGLING (`applyCMangling`), so it matches the
+        // extern's already-mangled `mangledName` — on Mach-O a shell.c reference to
+        // `_sqlite3_libversion` now matches sqlite3.c's definition `sqlite3_libversion`
+        // (mangled to `_sqlite3_libversion`). applyCMangling is config-driven
+        // (`kCManglingRules`): IDENTITY on elf/pe (their cross-CU match is unchanged),
+        // one leading `_` on macho. Safe by construction — every format writer names its
+        // on-binary defined symbols synthetically (`_sym_<id>` / `sym_<id>`), so this key
+        // is a MATCH key only, never the emitted symbol name (no double-mangle). Capturing
+        // `&cuMir` is safe — `cuMirs` is done growing.
+        in.nameOf = [cuMirP = &cuMir, fmtKind](SymbolId s) -> std::string {
+            if (SymbolRecord const* r = cuMirP->model.recordFor(s)) {
+                return dss::ffi::applyCMangling(r->name, fmtKind);
+            }
             for (auto const& e : cuMirP->externImports) {
                 if (e.symbol.v == s.v) return e.mangledName;
             }
@@ -397,7 +415,11 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                 ? decl.implicitReturnZeroForFunctionNames
                                 : decl.entryFunctionNames;
         for (auto const& n : names) {
-            entryNames.push_back(n);
+            // D-LK-MACHO-CROSSCU-MANGLE-MERGE-KEY (c118): mangle the entry name to the same
+            // convention as the merge's DEFINITION keys (nameOf mangles too), so the merged
+            // `userEntrySymbol` scan — `entrySet.count(nameOf(func))` in mergeCuMirs — still
+            // finds `main` on macho (both keyed `_main`). Identity on elf/pe.
+            entryNames.push_back(dss::ffi::applyCMangling(n, fmtKind));
         }
     }
 
@@ -407,6 +429,21 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         std::span<std::string const>{entryNames.data(), entryNames.size()},
         reporter);
     if (!merged) return false;  // merge failure (conflict / verify) already reported.
+
+    // c111 (D-RUNTIME-PE-MAIN-ARGS): when the target format fetches argc/argv via a
+    // CRT out-parameter call (Windows __wgetmainargs/__getmainargs — the PE OS entry
+    // carries no C argument vector), synthesize the pre-main init that makes that call
+    // and forwards (argc, argv) to the user entry, retargeting `userEntrySymbol` to it.
+    // Runs BEFORE optimize so the synth function is DCE-rooted (Global) + optimized +
+    // lowered like any other. A no-op for every other mechanism / a no-arg entry. The
+    // interner is the merged host's (the type space the merged TypeIds index into).
+    if (auto const& pa = (*formatR)->processArgs(); pa.has_value()) {
+        if (!synthesizePeStartup(merged->mir, merged->host.interner(),
+                                 merged->userEntrySymbol, merged->externImports,
+                                 *pa, reporter)) {
+            return false;  // malformed argv parameter type — fail-loud already reported.
+        }
+    }
 
     // Cycle 26 (D-OPT7-1): optimize the WHOLE-PROGRAM merged module with the configured
     // pipeline. The merge made every cross-CU call an intra-module DIRECT call, so the
@@ -430,6 +467,16 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         return false;  // optimize / verify failure already reported via `reporter`
     }
 
+    // c116 (D-WIN64-SEH-FUNCLETS): synthesize the SEH filter funclets + record the
+    // scope ranges on the WHOLE-PROGRAM merged module (post-optimize, mirroring the
+    // single-CU seam). Trigger = presence of SehTryBegin (a fast no-op otherwise).
+    // Appends the __C_specific_handler personality import on demand.
+    std::vector<MirSehScope> sehScopes;
+    if (!synthesizeSehFunclets(merged->mir, merged->host.interner(),
+                               merged->externImports, sehScopes, reporter)) {
+        return false;  // unsupported SEH shape (c116b frontier) — fail-loud reported.
+    }
+
     // D-FFI-EXTERN-CALL-DISPATCH: the merged module compiles to ONE
     // (target, format); pass that format's extern-call shape so MIR→LIR
     // selects the right call-site opcode for any surviving extern import.
@@ -441,6 +488,8 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                      effectiveBitFieldStrategy(**targetR, **formatR),
                                      ccIndex, cuMirs[0].cuId,
                                      (*formatR)->externCallDispatch(),
+                                     (*formatR)->dataImportBinding(),
+                                     std::move(sehScopes),
                                      reporter);
     if (!mod) return false;  // back-half tier failure already reported via `reporter`
     return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},
@@ -592,6 +641,7 @@ int Program::run(int argc, char* argv[]) {
     auto const cfg = buildReporterConfig(args);
     // D-LK10-ENTRY Slice C companion: route emitted binaries.
     setOutputDir(args.outputDir);
+    setUserDefines(args.defines);  // c105: --define NAME[=VALUE] → the CU builds
     // D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG: thread the CLI's
     // `--config=<debug|release>` into the kernel so the right
     // shipped pipeline gets loaded at compile_pipeline step 3.5.
@@ -602,14 +652,46 @@ int Program::run(int argc, char* argv[]) {
     // A zero-arg run never reaches here with time==true (parseCliArgs rejects
     // options without a mode → NoModeSelected), so the destructor only emits a
     // line for a real compile. Universal driver concern — lang/target/format-neutral.
+    //
+    // c97 (compile-time-performance arc): below the total, a per-phase
+    // breakdown from the always-on `substrate::PhaseTimers` accumulators.
+    // EVERY phase prints (zero-run phases included) so the report's shape is
+    // deterministic and pin-able; the `runs` count disambiguates multi-CU /
+    // multi-target accumulation (e.g. `parse ... (2 runs)` for a 2-TU build)
+    // and makes the oracle-reparse multiplier visible as its own row. The
+    // trailing `[other]` row is the wall total minus the attributed sum —
+    // driver/config-load/IO time no phase claims. Phase names are pipeline
+    // verbs (see compilePhaseName) — lang/target/format-neutral.
     struct WallTimeReporter {
         bool const                                  enabled;
         std::chrono::steady_clock::time_point const start;
         ~WallTimeReporter() {
             if (!enabled) return;
-            auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            auto const ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now() - start).count();
+            auto const ms = ns / 1'000'000;
             std::cerr << "dss-code-prime: compile time " << formatWallTime(ms) << "\n";
+            std::uint64_t attributedNs = 0;
+            for (std::size_t i = 0; i < substrate::kCompilePhaseCount; ++i) {
+                auto const p   = static_cast<substrate::CompilePhase>(i);
+                auto const row = substrate::PhaseTimers::read(p);
+                attributedNs += row.nanoseconds;
+                std::cerr << "dss-code-prime:   phase "
+                          << std::format("{:<16}", substrate::compilePhaseName(p))
+                          << std::format("{:>12}", formatWallTime(
+                                 static_cast<long long>(row.nanoseconds / 1'000'000u)))
+                          << std::format("  ({} run{})", row.runs,
+                                         row.runs == 1 ? "" : "s")
+                          << "\n";
+            }
+            auto const otherNs = ns > 0 && static_cast<std::uint64_t>(ns) > attributedNs
+                                     ? static_cast<std::uint64_t>(ns) - attributedNs
+                                     : 0u;
+            std::cerr << "dss-code-prime:   phase "
+                      << std::format("{:<16}", "[other]")
+                      << std::format("{:>12}", formatWallTime(
+                             static_cast<long long>(otherNs / 1'000'000u)))
+                      << "\n";
         }
     } const wallTimeReporter{args.time, std::chrono::steady_clock::now()};
     if (args.projectPath.has_value()) {
@@ -887,6 +969,7 @@ int Program::compileFiles(
                 UnitBuilder builder{grammar};
                 applySystemDirs(builder, *grammar);
                 if (kind) builder.setActiveFormat(*kind);
+                builder.setUserDefines(userDefines());  // c105: --define
                 for (auto const& path : sourceFiles) {
                     builder.addFile(fs::path{path});
                 }
@@ -969,6 +1052,7 @@ int Program::compileUnits(
                     UnitBuilder builder{grammar};
                     applySystemDirs(builder, *grammar);
                     if (kind) builder.setActiveFormat(*kind);
+                    builder.setUserDefines(userDefines());  // c105: --define
                     builder.addFile(fs::path{path});
                     return std::move(builder).finish();
                 }));

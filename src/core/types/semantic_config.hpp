@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -248,6 +249,23 @@ struct DSS_EXPORT DeclaratorConfig {
     SchemaTokenId nameToken{};
     RuleId        fnSuffixRule{};
     std::optional<RuleId> fnSuffixParamsRule;
+    // c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): the OPTIONAL param-list rule that opens a
+    // per-declarator FUNCTION-PROTOTYPE scope (C 6.2.1p4). A param in a
+    // NON-definition declarator — a function-POINTER member/typedef/param, or a
+    // bare prototype — has a scope that terminates at the END of that declarator,
+    // so its name must bind into a THROWAWAY scope rather than the enclosing
+    // struct/file/block scope (else sibling fn-ptr declarators collide on a shared
+    // param name and the names LEAK into the enclosing scope). The semantic
+    // analyzer opens this scope for any node of this rule UNLESS it is a function
+    // DEFINITION's OWN param list (the fnSuffix sits on a NAMED direct declarator
+    // AND the enclosing definition has a body) — those keep binding into the
+    // definition's scope so they reach the body. This is typically the SAME RuleId
+    // as `fnSuffixParamsRule` (the two are distinct ROLES — param-type harvest vs
+    // prototype-scope — not distinct rules; the engine discriminates by the
+    // definition test, not rule identity). `nullopt` ⇒ no per-declarator prototype
+    // scope (the prior behavior: every param binds into the enclosing scope).
+    // Toy/tsql declare no `declarators` block at all, so they are unaffected.
+    std::optional<RuleId> prototypeParamScopeRule;
     RuleId        arraySuffixRule{};
     RuleId        initDeclaratorRule{};
     RuleId        listRule{};
@@ -265,6 +283,17 @@ struct DSS_EXPORT DeclaratorConfig {
     // `declarators` block at all) ⇒ zero behavior change.
     std::optional<RuleId> memberDeclaratorRule;
     std::optional<RuleId> memberListRule;
+    // c26 (D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME): the OPTIONAL abstract twin of
+    // `directRule` — a `direct-abstract-declarator` (C 6.7.7) whose base EXCLUDES
+    // the name token, used in TYPE-NAME position (cast/sizeof/compound/va_arg)
+    // where a name is illegal AND a bare-identifier base would make a parenthesized
+    // multiplication (`(c * c)`) mis-commit as a cast. Its children are the SAME
+    // shared group/fnSuffix/arraySuffix rules, so the semantic `directDeclaredType`
+    // folds it identically to `directRule`, and `declaratorNameNode` treats it like
+    // `directRule` so a NAME nested in its parenDeclarator (`(int (x))`) is still
+    // found and rejected loud. `nullopt` ⇒ no abstract type-name declarator (every
+    // grammar before c26).
+    std::optional<RuleId> directAbstractRule;
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the `...` marker token whose presence
     // in a fnSuffix's param list makes the FnSig C-style variadic. Declarator-level
     // (vs the per-`DeclarationRule` `variadicMarker`) so the SHARED declarator-suffix
@@ -284,11 +313,13 @@ struct DSS_EXPORT DeclaratorConfig {
     std::string   nameTokenName;
     std::string   fnSuffixRuleName;
     std::string   fnSuffixParamsRuleName;
+    std::string   prototypeParamScopeRuleName;   // c32 D-CSUBSET-FNPTR-PARAM-SCOPE
     std::string   arraySuffixRuleName;
     std::string   initDeclaratorRuleName;
     std::string   listRuleName;
     std::string   memberDeclaratorRuleName;   // c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR
     std::string   memberListRuleName;         // c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR
+    std::string   directAbstractRuleName;     // c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME
     std::string   variadicMarkerName;
 };
 
@@ -333,11 +364,11 @@ struct DSS_EXPORT DeclarationRule {
     // lowering to thread `MirInstFlags::Volatile` onto the symbol's Load/Store so
     // the optimizer (DCE/CSE/Mem2Reg/LICM, all already Volatile-aware) cannot
     // elide or reorder a volatile access. `nullopt` ⇒ the language has no volatile
-    // marker for this declaration form. ALSO the per-declarator pointee-volatile
-    // reject (S_VolatilePointeeNotSupported) keys off this token: a head-position
-    // volatile + a star in the declarator forms a pointer-to-volatile-pointee,
-    // which model B cannot express and rejects loud (config-driven, no hardcoded
-    // keyword).
+    // marker for this declaration form. c27 (D-CSUBSET-VOLATILE-POINTEE): this
+    // token ALSO drives the resolver's VolatileQual construction — a head volatile
+    // wraps the base (`volatile int *` => Ptr<VolatileQual(int)>) and an east
+    // ptrQualifier volatile wraps the pointer; the former pointee-volatile reject is
+    // retired (volatile is now a type qualifier). Config-driven, no hardcoded keyword.
     std::optional<SchemaTokenId> volatileMarker;
     // D-LANG-VARIADIC (step 13.4, 2026-06-02): a token kind that, when
     // found anywhere in this declaration's params subtree (the subtree
@@ -432,6 +463,31 @@ struct DSS_EXPORT DeclarationRule {
     // source-agnostic — the engine never hardcodes a rule name. Default false ⇒
     // an ordinary defining declaration (a redeclaration collides as before).
     bool            nonDefiningDeclaration = false;
+    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): when true, a SURVIVING bare
+    // function PROTOTYPE minted by this declaration (`int f(int);` — a proto with
+    // NO in-TU definition: `isProtoDeclaration && !isAbsorbedProto`, external
+    // linkage) synthesizes an ExternFunction HIR node with NO library binding
+    // (C 6.2.2p5 — an undecorated function declaration has external linkage and
+    // refers to a definition SOMEWHERE in the program). Resolution order:
+    //   (1) the whole-program LK11 merge binds it to a sibling-TU DEFINITION
+    //       (sqlite3.c defines what shell.c bare-declares) — import row stripped,
+    //       calls rewired direct;
+    //   (2) a bare re-declaration of a SHIPPED descriptor symbol re-binds to
+    //       that descriptor's library (goal-2 suppressed the descriptor's own
+    //       injection because the user decl claimed the name — the proto's
+    //       synthesized extern carries the descriptor's per-format library map
+    //       instead, so `puts` re-declared over `#include <stdio.h>` still
+    //       imports from libc);
+    //   (3) NEITHER ⇒ the import survives with an empty library and the LINKER
+    //       rejects it LOUD as an undefined symbol (K_SymbolUndefined naming the
+    //       symbol — ld's behavior).
+    // false ⇒ the pre-c86 shape: an unabsorbed proto emits nothing and a call to
+    // it fails loud at HIR→MIR (H0009 Ref to unbound symbol). Per-declaration
+    // opt-in (c-subset's `topLevelDecl` + `varDecl`), source-agnostic — the
+    // engine reads only this flag, never a rule name. Internal-linkage (`static`)
+    // and weak protos never synthesize (their reference must NOT bind another
+    // TU's public symbol); they keep the loud H0009. Default false.
+    bool            prototypeSynthesizesExtern = false;
     // D-LK10-ENTRY-MAIN-IMPLICIT-RETURN: HIR-tier implicit-return
     // insertion rule (source-agnostic). When this declaration is a
     // FUNCTION declaration AND the declared symbol's name appears
@@ -496,12 +552,48 @@ struct DSS_EXPORT DeclarationRule {
     // declares which declaration forms may carry a flexible array; the engine
     // never hard-codes "struct field".
     bool allowFlexibleArray = false;
+    // c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT (C 6.7.6.3p7): when true, a declarator
+    // on this declaration form whose resolved type is 'array of T' — sized OR
+    // unsized — ADJUSTS to 'pointer to T'. The flag both (a) permits the absent
+    // length (`T x[]`), resolving through the SAME incomplete-array path
+    // `allowFlexibleArray` uses, and (b) rewrites the resolved TOP-LEVEL array to
+    // Ptr<element> at both resolution sites (the definitive Pass-1.5 visit that
+    // binds the symbol, and the FnSig param harvest), so the bound symbol, the
+    // FnSig, and every call site agree on the adjusted pointer. Only declaration
+    // forms with C parameter semantics set this (c-subset's `param` row); the
+    // engine never hard-codes "parameter". Inner array dimensions are untouched
+    // (`int a[][5]` → Ptr<Array<int,5>>), and an inner ABSENT dimension still
+    // fails loud via the incomplete-element-in-aggregate guard.
+    bool arrayToPointer = false;
     // D5.1: optional composite-type collection. When set, Pass 1.5 composes the
     // declaration's `kind: type` symbol's TypeId via `interner.structType(name,
     // fieldTypes)` from the field-symbols minted in this declaration's scope.
     // `kind` must be `Type` and the rule must also appear in `scopes`. Generic
     // across record-bearing languages.
     std::optional<FieldChildrenDescriptor> fieldChildren;
+    // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: DUAL-MODE gate. When set, this
+    // declaration row is a DEFINITION site ONLY when the matching node has a
+    // VISIBLE CHILD of this rule; when that child is ABSENT the node is NOT a
+    // definition (it mints nothing, opens no scope, binds no tag) — it is instead
+    // a pure REFERENCE, resolved through a SEPARATE `references[]` row declared on
+    // the SAME grammar rule. This lets ONE grammar rule (C's unified
+    // `struct-or-union-specifier` — c-subset's `structSpec`/`unionSpec`/`enumSpec`,
+    // shaped `Kw {opt tag} {opt body}`) serve BOTH the type-definition form
+    // (`struct P { … }` — a `structBody` child present) and the bare tag-reference
+    // form (`struct P` — absent), so the parser can treat it as the SOLE candidate
+    // for its lead keyword (unique-production direct descent — no body-vs-ref
+    // speculation budget). Generic + agnostic: the engine keys on a CHILD RULE
+    // name (resolved loader-side to this RuleId); no keyword/language is hardcoded.
+    // `nullopt` ⇒ this declaration is ALWAYS a definition (every shipped decl
+    // before c25). The body-present semantics are EXACTLY the row's existing
+    // define path (fieldChildren / scope / tag-bind); the body-absent resolution
+    // is the existing `isTagReference` path on the paired reference row.
+    //
+    // The loader REQUIRES the paired `references[]` row to exist for the SAME rule
+    // when this is set (else a body-absent occurrence would silently resolve to
+    // nothing), and that the named child rule exists.
+    std::optional<RuleId> definesWhenChildRule;
+    std::string           definesWhenChildRuleName;   // source spelling, for diagnostics
     // FC4 c1 (M5): config-driven fail-loud marker gates. At semantic
     // analysis of this declaration (declarator-mode AND legacy rows alike),
     // each entry whose token appears in the decl subtree emits its declared
@@ -559,6 +651,55 @@ struct DSS_EXPORT CallRule {
     std::string   ruleName;
 };
 
+// c103 (D-CSUBSET-INTRINSIC-UMULH): a builtin whose call the engine lowers to a
+// DEDICATED compiler intrinsic (a target instruction) rather than an ordinary
+// call/import. A LEAF enum with NO HIR/MIR dependency (it lives in core so the
+// SemanticConfig + SymbolRecord can carry it): resolved from the config
+// `lowering` string at decode, then each downstream layer maps it into its OWN
+// vocabulary -- the HIR lowering (cst_to_hir) maps it onto a `HirKind::BuiltinCall`
+// payload, and the MIR lowering (hir_to_mir) maps THAT onto the concrete
+// `MirOpcode`. No layer depends upward and no arch/name identity branch appears
+// in shared substrate; the string->enum and enum->enum maps are uniform tables.
+enum class BuiltinLowering : std::uint16_t {
+    None = 0,     // ordinary semantic-only builtin (e.g. tsql COALESCE)
+    UMulHigh,     // __umulh: high 64 bits of the u64*u64 128-bit product
+    // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): InterlockedCompareExchange — the
+    // atomic compare-and-swap. Operands (ptr, comparand, newval) → the ORIGINAL
+    // value at *ptr; iff original==comparand the newval is stored, atomically
+    // (x86 `lock cmpxchg`; arm64 LDAXR/STLXR acquire-release loop).
+    AtomicCas,
+    // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier — an MSVC COMPILER
+    // reordering barrier (NOT a CPU fence). Takes no operands, produces no value,
+    // emits NO runtime instruction; its whole job is to forbid the optimizer from
+    // moving memory accesses (loads OR stores) across it. Realized by a
+    // side-effecting zero-operand MIR op (MirOpcode::CompilerBarrier) that the
+    // CSE/LICM clobber walk treats as a full memory clobber.
+    Barrier,
+    // c115 (SEH arc 2/3, D-WIN64-SEH-FUNCLETS): the two MSVC SEH intrinsics —
+    // excpt.h's `_exception_code()` (→ u32, the exception code) and
+    // `_exception_info()` (→ void*, the EXCEPTION_POINTERS). Legal ONLY inside
+    // an `__except` filter expression (_exception_code also in the handler
+    // body) — HirVerifier::checkSehContext enforces it. Each lowers to a
+    // dedicated zero-operand value MIR op (SehExceptionCode / SehExceptionInfo)
+    // that the c116 funclet lowering wires to the __C_specific_handler dispatch
+    // context; until then mir_to_lir fails loud on them.
+    SehExceptionCode,
+    SehExceptionInfo,
+};
+
+// Resolve the config `lowering` name to its BuiltinLowering. nullopt = an unknown
+// name (rejected with a diagnostic at the decode site) -- distinct from "absent"
+// (an ordinary builtin, which never carries a `lowering` key).
+[[nodiscard]] inline std::optional<BuiltinLowering>
+builtinLoweringFromName(std::string_view name) noexcept {
+    if (name == "umulh")      { return BuiltinLowering::UMulHigh;  }
+    if (name == "atomic_cas") { return BuiltinLowering::AtomicCas; }
+    if (name == "barrier")    { return BuiltinLowering::Barrier;   }
+    if (name == "seh_exception_code") { return BuiltinLowering::SehExceptionCode; }
+    if (name == "seh_exception_info") { return BuiltinLowering::SehExceptionInfo; }
+    return std::nullopt;
+}
+
 // SE6: a built-in function the engine binds into a CU-wide "builtins"
 // scope (visible everywhere, shadow-able by user decls). Interned as a
 // FnSig over `paramCores` → `resultCore`. A `variadic` builtin skips the
@@ -568,6 +709,19 @@ struct DSS_EXPORT BuiltinFunctionMapping {
     std::vector<TypeKind> paramCores;
     TypeKind              resultCore = TypeKind::Void;
     bool                  variadic   = false;
+    // c103: when != None, a call to this builtin lowers to the named compiler
+    // intrinsic (a target instruction) instead of an ordinary call. None (the
+    // default) preserves the pure-semantic builtin behaviour (COALESCE).
+    BuiltinLowering       lowering   = BuiltinLowering::None;
+    // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): OPTIONAL full type-text signature
+    // (the ONE shipped-lib codec, e.g. "fn(ptr<i32>, i32, i32) -> i32") for a
+    // builtin whose parameters need REAL types the scalar `paramCores` axis
+    // cannot express (pointers). Schema decode is interner-free, so the TEXT is
+    // stored here and parsed at the semantic INJECTION site (where the CU's
+    // interner exists) via `parseTypeFromText` — exactly how shipped-lib symbol
+    // signatures decode. Mutually exclusive with params/result (fail-loud at
+    // decode if both are present); must decode to an FnSig (fail-loud else).
+    std::string           signatureText;
 };
 
 // D5.1: a member-access expression rule. When Pass 2 sees a node with this
@@ -676,6 +830,18 @@ struct DSS_EXPORT ReferenceRule {
     // per-language config (c-subset's structTypeRef/unionTypeRef/enumTypeRef),
     // never a hardcoded keyword.
     bool isTagReference = false;
+    // D-CSUBSET-FORWARD-STRUCT-DECLARATION (c35): the composite kind this tag
+    // reference names — read ONLY when `isTagReference` is true. When a tag
+    // reference MISSES (the tag was never bound) and this kind is Struct/Union,
+    // the resolver FORWARD-MINTS an INCOMPLETE composite (`forwardComposite`) and
+    // binds it into the Tag namespace, so an opaque handle (`struct S *` whose S
+    // is never defined — the sqlite3_stmt/sqlite3_blob pattern) resolves to a
+    // sizeable `Ptr<incomplete>` instead of failing S_UnknownType. A VALUE /
+    // by-value member / sizeof of the incomplete type still fails loud through
+    // the unchanged computeLayout incomplete guard. Enum is value-typed (an
+    // opaque enum has no representation), so an Enum tag-miss keeps the
+    // fail-loud path. Default Struct; the loader only honours it on tag rows.
+    CompositeKind compositeKind = CompositeKind::Struct;
 };
 
 // Source built-in type name → lattice type mapping. Used during
@@ -1061,19 +1227,18 @@ struct DSS_EXPORT SemanticConfig {
     // (InvalidSchemaToken) for languages with no pointer declarator. Full C
     // declarators (function pointers, arrays-of-pointers) stay future surface.
     std::optional<SchemaTokenId>    pointerToken;
-    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): the language's `volatile`-class
-    // qualifier token (c-subset: `VolatileKeyword`). Used by the type-position
-    // resolver's CO-LOCATED pointer arm (`typeRefAllowingStruct` / `castTypeRef`,
-    // where the qualifier + stars are siblings of ONE node, NOT split across a
-    // head + declarator) to reject a POINTER-TO-VOLATILE-POINTEE position-aware:
-    // a `volatileMarker` token BEFORE the first `pointerToken` ⇒ pointee-volatile
-    // ⇒ REJECT (S_VolatilePointeeNotSupported); AFTER the last star ⇒ the POINTER
-    // OBJECT is volatile ⇒ ACCEPT. This is the second of the two-site reject
-    // (the per-declarator typing arm covers the head+declarator decl forms via
-    // `DeclarationRule.volatileMarker`); together they make the fail-loud COMPLETE
-    // BY CONSTRUCTION. Absent (InvalidSchemaToken) ⇒ the language has no volatile
-    // qualifier and the arm never rejects. Source-agnostic: the engine reads THIS
-    // instead of hardcoding a token name.
+    // c27 (D-CSUBSET-VOLATILE-POINTEE): the language's `volatile`-class qualifier
+    // token (c-subset: `VolatileKeyword`). Used by the type-position resolver's
+    // CO-LOCATED arm (`typeRefAllowingStruct` / `castTypeRef`, where the qualifier +
+    // stars are siblings of ONE node, AND the split-form head `volatile <base>`) to
+    // BUILD a VolatileQual: a `volatileMarker` token BEFORE the first `pointerToken`
+    // qualifies the base (the innermost pointee) ⇒ wrap base in VolatileQual so
+    // `volatile int *` = Ptr<VolatileQual(int)>; AFTER the last star (east) is the
+    // POINTER OBJECT's volatile, threaded by the declarator's pointer-layer loop as
+    // VolatileQual(Ptr<...>). The former pointee-volatile REJECT is retired (volatile
+    // is now a type qualifier). Absent (InvalidSchemaToken) ⇒ the language has no
+    // volatile qualifier. Source-agnostic: the engine reads THIS, never a hardcoded
+    // token name.
     std::optional<SchemaTokenId>    volatileMarker;
     // FF6 Slice 2 + audit fold (2026-06-02): per-object-format
     // runtime library identity for SOURCE-DECLARED externs. The
@@ -1269,6 +1434,23 @@ struct DSS_EXPORT SemanticConfig {
     // with intCrossSignednessConverts this completes the C integer-conversion matrix
     // (needed for SQLite). Pinned by test_type_rules `IsAssignableAdmitsSameSignednessNarrowingWhenGated`.
     bool intSameSignednessNarrows = false;
+
+    // C 6.3.1.4 / 6.3.1.5 / 6.5.16.1 (D-CSUBSET-INT-FLOAT-CONVERSION): the two
+    // directions of the int↔float implicit ASSIGNMENT conversion, gated
+    // INDEPENDENTLY. `intConvertsToFloat` — an integer rhs flows into a floating
+    // lhs (`double d = 5;`, `f(anInt)` to a `double` param; the sqlite
+    // `kahanBabuskaNeumaierStep(pSum, iBig)` shape feeds an `i64` to a `volatile
+    // double`). `floatConvertsToInt` — a floating rhs flows into an integer lhs
+    // (`int n = aDouble;`, truncating toward zero, UB if out of range). Read by
+    // `isAssignable`'s int↔float arms (init / assignment / call-arg / return). Each
+    // direction's HIR `coerce()` arithmetic-core arm materializes the width-exact
+    // Cast (MIR SIToFP/UIToFP for int→float, FPToSI/FPToUI for float→int), so the
+    // post-coerce verifier (both default false) stays strict. Default false → a
+    // non-C schema (toy/tsql) keeps int and float strictly distinct. Together with
+    // intCrossSignednessConverts + intSameSignednessNarrows this completes the C
+    // arithmetic-conversion matrix (needed for SQLite).
+    bool intConvertsToFloat = false;
+    bool floatConvertsToInt = false;
 
     // Two orthogonal per-language alias-analysis opt-ins, both threaded
     // through `MirLoweringConfig` → `Mir` and read by CSE/LICM Load

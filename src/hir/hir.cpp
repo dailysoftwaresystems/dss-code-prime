@@ -150,20 +150,19 @@ std::optional<HirNodeId> HirBuilder::ifElse(HirNodeId id) const {
          ? std::optional<HirNodeId>{kids[2]} : std::nullopt;
 }
 
+// c60 (Design I-A): SwitchStmt = [disc, body, arms...]. The dispatch arms begin
+// at child 2 (child 1 is the flat body Block).
 std::span<HirNodeId const> HirBuilder::switchArms(HirNodeId id) const {
     auto kids = children(id);
-    return kids.empty() ? kids : kids.subspan(1);
+    return kids.size() <= 2 ? std::span<HirNodeId const>{} : kids.subspan(2);
+}
+HirNodeId HirBuilder::switchBody(HirNodeId id) const {
+    auto kids = children(id);
+    return kids.size() >= 2 ? kids[1] : HirNodeId{};
 }
 
 bool HirBuilder::caseArmIsDefault(HirNodeId id) const {
     return (arena_.at(id).payload & kCaseArmIsDefault) != 0;
-}
-
-std::span<HirNodeId const>
-HirBuilder::caseArmBody(HirNodeId id) const {
-    auto kids = children(id);
-    if (!caseArmIsDefault(id) && !kids.empty()) return kids.subspan(1);
-    return kids;
 }
 
 HirModuleId HirBuilder::nextModuleId() noexcept {
@@ -336,6 +335,12 @@ HirNodeId HirBuilder::makeIntrinsicCall(std::uint32_t intrinsicId,
     return addParent(HirKind::IntrinsicCall, args, type, intrinsicId, flags);
 }
 
+HirNodeId HirBuilder::makeBuiltinCall(std::uint32_t lowering,
+                                      std::span<HirNodeId const> args, TypeId type,
+                                      HirFlags flags) {
+    return addParent(HirKind::BuiltinCall, args, type, lowering, flags);
+}
+
 HirNodeId HirBuilder::makeCast(HirNodeId operand, TypeId type, HirFlags flags) {
     HirNodeId const kids[] = {operand};
     return addParent(HirKind::Cast, kids, type, /*payload=*/0, flags);
@@ -444,6 +449,12 @@ HirNodeId HirBuilder::makeIfStmt(HirNodeId cond, HirNodeId thenStmt,
     return addParent(HirKind::IfStmt, kids, InvalidType, /*payload=*/0, flags);
 }
 
+HirNodeId HirBuilder::makeSehTryExcept(HirNodeId tryBody, HirNodeId filterExpr,
+                                       HirNodeId handlerBody, HirFlags flags) {
+    HirNodeId const kids[] = {tryBody, filterExpr, handlerBody};
+    return addParent(HirKind::SehTryExcept, kids, InvalidType, /*payload=*/0, flags);
+}
+
 HirNodeId HirBuilder::makeWhileStmt(HirNodeId cond, HirNodeId body, HirFlags flags) {
     HirNodeId const kids[] = {cond, body};
     return addParent(HirKind::WhileStmt, kids, InvalidType, /*payload=*/0, flags);
@@ -468,26 +479,31 @@ HirNodeId HirBuilder::makeForStmt(std::optional<HirNodeId> init, std::optional<H
                      static_cast<std::uint32_t>(mask), flags);
 }
 
-HirNodeId HirBuilder::makeSwitchStmt(HirNodeId discriminant, std::span<HirNodeId const> arms,
-                                     HirFlags flags) {
+HirNodeId HirBuilder::makeSwitchStmt(HirNodeId discriminant, HirNodeId body,
+                                     std::span<HirNodeId const> arms, HirFlags flags) {
+    // c60 (Design I-A): children [disc, body Block, dispatch arms...]. The body is
+    // the flat statement sequence (with case/default LabelStmt markers); the arms
+    // are dispatch entries (value + label ordinal) the MIR `addSwitch` targets.
     std::vector<HirNodeId> kids;
-    kids.reserve(arms.size() + 1);
+    kids.reserve(arms.size() + 2);
     kids.push_back(discriminant);
+    kids.push_back(body);
     kids.insert(kids.end(), arms.begin(), arms.end());
     return addParent(HirKind::SwitchStmt, kids, InvalidType, /*payload=*/0, flags);
 }
 
-HirNodeId HirBuilder::makeCaseArm(std::optional<HirNodeId> value, std::span<HirNodeId const> body,
-                                  HirFlags flags) {
+HirNodeId HirBuilder::makeCaseArm(std::optional<HirNodeId> value,
+                                  std::uint32_t labelOrdinal, HirFlags flags) {
+    // c60 (Design I-A): a dispatch entry = [value?]; payload bit0 = default flag,
+    // bits 1.. = the case-label ordinal (the synthetic LabelStmt marker the body
+    // carries for this case). No body child — the body lives on the SwitchStmt.
     std::vector<HirNodeId> kids;
-    kids.reserve(body.size() + 1);
-    std::uint32_t payload = 0;
+    std::uint32_t payload = labelOrdinal << kCaseArmOrdinalShift;
     if (value) {
         kids.push_back(*value);          // valued arm: match value is child 0
     } else {
-        payload = kCaseArmIsDefault;     // default arm: no value child
+        payload |= kCaseArmIsDefault;    // default arm: no value child
     }
-    kids.insert(kids.end(), body.begin(), body.end());
     return addParent(HirKind::CaseArm, kids, InvalidType, payload, flags);
 }
 
@@ -603,6 +619,18 @@ HirNodeId Hir::ifCondition(HirNodeId id) const {
     assert(kind(id) == HirKind::IfStmt);
     return childAt(id, 0);
 }
+HirNodeId Hir::sehTryBody(HirNodeId id) const {
+    assert(kind(id) == HirKind::SehTryExcept);
+    return childAt(id, 0);
+}
+HirNodeId Hir::sehTryFilter(HirNodeId id) const {
+    assert(kind(id) == HirKind::SehTryExcept);
+    return childAt(id, 1);
+}
+HirNodeId Hir::sehTryHandler(HirNodeId id) const {
+    assert(kind(id) == HirKind::SehTryExcept);
+    return childAt(id, 2);
+}
 HirNodeId Hir::ifThen(HirNodeId id) const {
     assert(kind(id) == HirKind::IfStmt);
     return childAt(id, 1);
@@ -662,25 +690,31 @@ HirNodeId Hir::switchDiscriminant(HirNodeId id) const {
     assert(kind(id) == HirKind::SwitchStmt);
     return childAt(id, 0);
 }
+HirNodeId Hir::switchBody(HirNodeId id) const {
+    // c60 (Design I-A): the flat body Block — child 1.
+    assert(kind(id) == HirKind::SwitchStmt);
+    return childAt(id, 1);
+}
 std::span<HirNodeId const> Hir::switchArms(HirNodeId id) const {
+    // c60 (Design I-A): the dispatch entries begin at child 2 (child 1 is the body).
     assert(kind(id) == HirKind::SwitchStmt);
     auto kids = children(id);
-    return kids.empty() ? kids : kids.subspan(1);  // empty only on a malformed switch
+    return kids.size() <= 2 ? std::span<HirNodeId const>{} : kids.subspan(2);
 }
 bool Hir::caseArmIsDefault(HirNodeId id) const {
     assert(kind(id) == HirKind::CaseArm);
     return (payload(id) & kCaseArmIsDefault) != 0;
 }
+std::uint32_t Hir::caseArmLabelOrdinal(HirNodeId id) const {
+    // c60 (Design I-A): the per-function ordinal of this case's synthetic LabelStmt
+    // marker in the switch body — the MIR `addSwitch` target is that label-block.
+    assert(kind(id) == HirKind::CaseArm);
+    return payload(id) >> kCaseArmOrdinalShift;
+}
 std::optional<HirNodeId> Hir::caseArmValue(HirNodeId id) const {
     if (caseArmIsDefault(id)) return std::nullopt;
     auto kids = children(id);
     return kids.empty() ? std::nullopt : std::optional<HirNodeId>{kids[0]};
-}
-std::span<HirNodeId const> Hir::caseArmBody(HirNodeId id) const {
-    auto kids = children(id);
-    // A valued arm's child 0 is the match value; default arms are all body.
-    if (!caseArmIsDefault(id) && !kids.empty()) return kids.subspan(1);
-    return kids;
 }
 
 std::uint32_t Hir::branchDepth(HirNodeId id) const {

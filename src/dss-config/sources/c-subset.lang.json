@@ -46,7 +46,7 @@
     "pasteToken": "HashHashOp",
     "$variadicCommaElisionComment": "FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): opt into the GNU `,##__VA_ARGS__` extension. `sep ## __VA_ARGS__` with an EMPTY variadic part drops the preceding separator (`LOG(\"x\")` -> `f(\"x\")`); non-empty keeps it. Without this flag, standard C placemarker behavior leaves the separator. The separator/__VA_ARGS__ are matched by the config KIND/name above, never hardcoded.",
     "variadicCommaElision": true,
-    "$predefinedMacrosComment": "FC15b (C 6.10.8): the predefined macros. Each entry names the macro IDENTIFIER + a materialization `kind`; the engine keys EVERY behavior off `kind`, never the name. `line`/`file` are OFFSET-derived (resolved through the line-map against the INVOCATION offset -> the invocation line / the presumed file name); `date`/`time` are computed once at preprocess construction (`\"Mmm dd yyyy\"` / `\"hh:mm:ss\"`); `constant` carries a static `value` spelling verbatim. `#define`/`#undef` of any of these is a constraint violation (C 6.10.8.1) -> fail loud. __STDC_VERSION__ = 202311L (C23).",
+    "$predefinedMacrosComment": "FC15b (C 6.10.8): the predefined macros. Each entry names the macro IDENTIFIER + a materialization `kind`; the engine keys EVERY behavior off `kind`, never the name. `line`/`file` are OFFSET-derived (resolved through the line-map against the INVOCATION offset -> the invocation line / the presumed file name); `date`/`time` are computed once at preprocess construction (`\"Mmm dd yyyy\"` / `\"hh:mm:ss\"`); `constant` carries a static `value` spelling verbatim. `#define`/`#undef` of any of these is a constraint violation (C 6.10.8.1) -> fail loud. __STDC_VERSION__ = 202311L (C23). c95 (Windows-host sub-arc): the OPTIONAL `availableObjectFormats` per-entry filter (mirrors the shipped-lib descriptor field; EMPTY = every format, a non-empty set of object-format NAMES restricts the macro to those formats — validated against objectFormatKindFromName at load, an unknown name fails loud) lets the Windows-selection macros be predefined for the `pe` target ONLY: `_WIN32`/`_WIN64` (value 1) make sqlite's amalgamation select os_win.c (SQLITE_OS_WIN); `__stdcall`/`__cdecl`/`__fastcall`/`WINAPI` ERASE to nothing (empty value) since PE64 has a single MS-x64 calling convention and imports are un-decorated (a `__stdcall`-qualified declarator then parses on pe, stays an ordinary identifier off-pe). None leak onto elf/macho. The 7 core C 6.10.8 macros carry NO filter (available everywhere, unchanged).",
     "predefinedMacros": [
       { "name": "__LINE__",            "kind": "line" },
       { "name": "__FILE__",            "kind": "file" },
@@ -54,7 +54,17 @@
       { "name": "__STDC_VERSION__",    "kind": "constant", "value": "202311L" },
       { "name": "__STDC_HOSTED__",     "kind": "constant", "value": "1" },
       { "name": "__DATE__",            "kind": "date" },
-      { "name": "__TIME__",            "kind": "time" }
+      { "name": "__TIME__",            "kind": "time" },
+      { "name": "_WIN32",              "kind": "constant", "value": "1", "availableObjectFormats": ["pe"] },
+      { "name": "_WIN64",              "kind": "constant", "value": "1", "availableObjectFormats": ["pe"] },
+      { "name": "_MSC_VER",            "kind": "constant", "value": "1943", "availableObjectFormats": ["pe"] },
+      { "name": "__int64",             "kind": "constant", "value": "long long", "availableObjectFormats": ["pe"] },
+      { "name": "__forceinline",       "kind": "constant", "value": "", "availableObjectFormats": ["pe"] },
+      { "name": "__declspec",          "kind": "constant", "value": "", "params": ["x"], "availableObjectFormats": ["pe"] },
+      { "name": "__stdcall",           "kind": "constant", "value": "", "availableObjectFormats": ["pe"] },
+      { "name": "__cdecl",             "kind": "constant", "value": "", "availableObjectFormats": ["pe"] },
+      { "name": "__fastcall",          "kind": "constant", "value": "", "availableObjectFormats": ["pe"] },
+      { "name": "WINAPI",              "kind": "constant", "value": "", "availableObjectFormats": ["pe"] }
     ],
     "$fc15cComment": "FC15c. `#pragma` (C 6.10.6): consumed-and-DROPPED (C 6.10.6p2 licenses ignoring an unrecognized pragma; DSS recognizes none). `__has_include` (C23 6.10.1p4): tests header existence with the SAME resolution `#include` uses -- the angle delimiters are matched by TOKEN KIND (`hasIncludeAngleOpenToken`=LtOp / `hasIncludeAngleCloseToken`=GtOp), never the `<`/`>` bytes (agnosticism); the angle form maps `<stem>.json` on the system path (DSS ships JSON descriptors, e.g. `stdio.json`) so `__has_include(<stdio.h>)` agrees with `#include <stdio.h>`. `__has_c_attribute` (C23 6.10.1p4): reports the version int of a known standard attribute or 0; the lookup ignores leading/trailing `__` (so `__deprecated__` matches `deprecated`). The C23 standard attributes are 202311.",
     "pragmaDirective":          "pragma",
@@ -300,19 +310,25 @@
     { "word": "extern",  "kind": "ExternKeyword"  },
 
     { "word": "static",        "kind": "StaticKeyword"    },
-    { "word": "__attribute__", "kind": "AttributeKeyword" }
+    { "word": "__attribute__", "kind": "AttributeKeyword" },
+
+    { "word": "__try",     "kind": "TryKeyword"     },
+    { "word": "__except",  "kind": "ExceptKeyword"  },
+    { "word": "__finally", "kind": "FinallyKeyword" },
+    { "word": "__leave",   "kind": "LeaveKeyword"   }
   ],
 
   "shapes": {
     "root": { "sequence": [ { "repeat": "topLevel" } ] },
 
     "topLevel": {
-      "$comment": "NON-speculative: each alt has a disjoint FIRST. struct/union/enum heads route to topLevelDecl (via topLevelHead's body/ref specifier forms) — the bare top-level structDecl/unionDecl/enumDecl rules were folded into topLevelDecl (optional declarator) so a `struct` lead has ONE owner here and only topLevelHead's single-level speculation runs (the two-level topLevel-speculation path was unsound — D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). Those three now-unreferenced rules (+ their semantics/hirKind/scopes rows) were DELETED in the closing cycle (no dead config); the shared structField/unionField/enumerator helpers stay (the *SpecifierBody forms consume them).",
+      "$comment": "NON-speculative: each alt has a disjoint FIRST. struct/union/enum heads route to topLevelDecl (via topLevelHead's body/ref specifier forms) — the bare top-level structDecl/unionDecl/enumDecl rules were folded into topLevelDecl (optional declarator) so a `struct` lead has ONE owner here and only topLevelHead's single-level speculation runs (the two-level topLevel-speculation path was unsound — D-CSUBSET-STRUCT-BODY-VARDECL-POSITION). Those three now-unreferenced rules (+ their semantics/hirKind/scopes rows) were DELETED in the closing cycle (no dead config); the shared structField/unionField/enumerator helpers stay (the *SpecifierBody forms consume them). c81: `emptyStmt` (a lone `;`) is admitted as an external declaration — sqlite shell.c's `SQLITE_EXTENSION_INIT1;` expands EMPTY in the static-shell build, leaving a stray file-scope semicolon (x2, base64.c/base85.c sections) that gcc/clang accept (-pedantic warns; C 6.9 formally disallows it, but accepting it is the universal implementation posture). REUSES the statement-position `emptyStmt` rule exactly as c30 reuses `typedefDecl` in both positions: FIRST = {EndStatement}, disjoint from every other alt -> unique-production direct descent, still non-speculative; its existing `hirKind: Skip` row lowers it to nothing in BOTH positions (the includeDirective->Skip top-level precedent), so no semantics/scopes row is needed.",
       "alt": [
         "includeDirective",
         "typedefDecl",
         "topLevelDecl",
-        "externDecl"
+        "externDecl",
+        "emptyStmt"
       ]
     },
 
@@ -347,7 +363,22 @@
     },
 
     "structTypeRef": {
+      "$comment": "c25: the REF-ONLY struct specifier, kept for the param/cast positions (declHeadForParam, castTypeBase) where a struct type is a pure tag reference. The DECLARATION-head positions no longer use this pair-with-body form — they route through the UNIFIED `structSpec` (below), which folds body-vs-ref into ONE rule so it is the SOLE candidate for `struct` at those heads → the parser's unique-production direct descent parses the member body NON-speculatively (no probe, no token budget — the c25 fix for `struct sqlite3`).",
       "sequence": [ "StructKeyword", "Identifier" ]
+    },
+
+    "structSpec": {
+      "$comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the UNIFIED struct specifier (C 6.7.2.1 struct-or-union-specifier) — `struct {opt tag} {opt body}`. ONE rule for BOTH the type-DEFINITION form (`struct P { … }` — a `structBody` child is present) and the bare tag-REFERENCE form (`struct P` — absent). Replaces the former `structSpecifierBody | structTypeRef` SPECULATIVE pair in the 4 body-bearing declaration-head alts (topLevelCompositeSpec, typeSpecifierForDecl, typedefHead, typeBaseAllowingStruct). Because it is now the SOLE candidate keyed on StructKeyword in those alts, the parser's LL(k) unique-production DIRECT DESCENT (parser.cpp ~1804-1844) dispatches it NON-speculatively — the member list parses with NO speculation budget, so an arbitrarily large body (`struct sqlite3`) never trips the 4096-token probe cliff. The body-vs-ref split becomes an INTERNAL 1-token (`BlockOpen`) decision via the `{optional structBody}`, also non-speculative. The binder is DUAL-MODE on the SAME node (semantics: `definesWhenChild: structBody`): body present ⇒ the EXACT former `structSpecifierBody` define path (mint type, bind tag, open scope, compose fields from the `structBody` subtree); body absent ⇒ the EXACT former `structTypeRef` tag-reference path (isTagReference). FOLLOW-independent (the rejected D2): no prune of the ref candidate is needed because there IS no separate ref candidate here.",
+      "sequence": [
+        "StructKeyword", { "optional": "Identifier" }, { "optional": "structBody" }
+      ]
+    },
+
+    "structBody": {
+      "$comment": "c25: the brace-delimited struct member list, factored OUT of `structSpec` so its PRESENCE is the define-vs-reference discriminator (the binder's `definesWhenChild`). NOT a scope rule itself: the fields bind into the scope opened by the enclosing `structSpec` (the analyzer's Pass-1.5 field collection walks that scope, not direct children, so the extra nesting level is transparent). Member shape identical to the former `structSpecifierBody` tail.",
+      "sequence": [
+        "BlockOpen", { "repeat": "structField" }, "BlockClose"
+      ]
     },
 
     "unionField": {
@@ -360,7 +391,22 @@
     },
 
     "unionTypeRef": {
+      "$comment": "c25: the REF-ONLY union specifier, kept for the param/cast positions (declHeadForParam, castTypeBase). The declaration-head positions route through the UNIFIED `unionSpec` (below). Mirrors structTypeRef.",
       "sequence": [ "UnionKeyword", "Identifier" ]
+    },
+
+    "unionSpec": {
+      "$comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the UNIFIED union specifier — `union {opt tag} {opt body}`. Mirrors `structSpec`: ONE rule for define (`union U { … }`) and reference (`union U`), the SOLE UnionKeyword candidate in the 4 body-bearing alts → non-speculative direct descent (no member-body probe budget). Dual-mode binder via `definesWhenChild: unionBody`.",
+      "sequence": [
+        "UnionKeyword", { "optional": "Identifier" }, { "optional": "unionBody" }
+      ]
+    },
+
+    "unionBody": {
+      "$comment": "c25: the brace-delimited union member list, factored out of `unionSpec` as the define-vs-reference discriminator. NOT a scope rule (fields bind into the enclosing unionSpec's scope). Member shape identical to the former `unionSpecifierBody` tail.",
+      "sequence": [
+        "BlockOpen", { "repeat": "unionField" }, "BlockClose"
+      ]
     },
 
     "enumerator": {
@@ -371,7 +417,29 @@
     },
 
     "enumTypeRef": {
+      "$comment": "c25: the REF-ONLY enum specifier, kept for the param/cast positions (declHeadForParam, castTypeBase). The declaration-head positions route through the UNIFIED `enumSpec` (below). Mirrors structTypeRef.",
       "sequence": [ "EnumKeyword", "Identifier" ]
+    },
+
+    "enumSpec": {
+      "$comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the UNIFIED enum specifier — `enum {opt tag} {opt body}`. Mirrors `structSpec`: ONE rule for define (`enum E { A, B }`) and reference (`enum E`), the SOLE EnumKeyword candidate in the 4 body-bearing alts → non-speculative direct descent. Dual-mode binder via `definesWhenChild: enumBody`. The enumerator-list (with trailing comma) lives in `enumBody`.",
+      "sequence": [
+        "EnumKeyword", { "optional": "Identifier" }, { "optional": "enumBody" }
+      ]
+    },
+
+    "enumBody": {
+      "$comment": "c25: the brace-delimited enumerator list, factored out of `enumSpec` as the define-vs-reference discriminator. NOT a scope rule (enumerators bind into the enclosing enumSpec's scope, then lift to the enclosing namespace scope per fieldChildren.liftToEnclosingScope). Enumerator-list shape (optional list, trailing comma) identical to the former `enumSpecifierBody` tail.",
+      "sequence": [
+        "BlockOpen",
+        { "optional": {
+            "sequence": [
+              "enumerator",
+              { "repeat": { "sequence": [ "Comma", { "optional": "enumerator" } ] } }
+            ]
+        }},
+        "BlockClose"
+      ]
     },
 
     "memberFollower": {
@@ -393,11 +461,11 @@
     },
 
     "topLevelCompositeSpec": {
-      "$comment": "The struct/union/enum SPECIFIER at a top-level declaration head — body form (`struct P { … }`) OR bare tag reference (`struct P`). SPECULATIVE (mirrors typeSpecifierForDecl / typedefHead): body forms probe FIRST; a ref with no `{` rolls back to the `*TypeRef` form (`struct Tri mkTri(void)` / `struct Q g;`). A NAMED rule (not an inline alt) so the speculation runs at the same depth proven to work for local decls — an inline alt at the top-level-decl depth hits the FC4-c1 depth-0 candidate replay and fails to roll back. The enum body's trailing-comma enumerator-list parses cleanly here now that the schema compiler propagates nested-nullable FOLLOW (recomputeAltExpectedSets).",
+      "$comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the struct/union/enum SPECIFIER at a top-level declaration head — now ONE unified rule per keyword (`structSpec`/`unionSpec`/`enumSpec`), each covering BOTH the body form (`struct P { … }`) AND the bare tag reference (`struct P`) via an internal `{optional body}`. The three candidates have pairwise-DISJOINT 1-token FIRSTs (StructKeyword/UnionKeyword/EnumKeyword), so the predictive prune leaves EXACTLY ONE survivor for any composite lead → the parser's unique-production DIRECT DESCENT (parser.cpp ~1804-1844) dispatches it NON-speculatively. The member body therefore parses with NO speculation budget — the c25 fix for `struct sqlite3`'s large body (the former body-vs-ref probe budget-capped at 4096 tokens). `speculative`/`lookahead` are retained but moot under the unique-survivor direct descent (kept so a future non-disjoint addition still has a probe budget). The enum body's trailing-comma enumerator-list parses cleanly (the schema compiler propagates nested-nullable FOLLOW via recomputeAltExpectedSets).",
       "alt": [
-        "structSpecifierBody", "structTypeRef",
-        "unionSpecifierBody",  "unionTypeRef",
-        "enumSpecifierBody",   "enumTypeRef"
+        "structSpec",
+        "unionSpec",
+        "enumSpec"
       ],
       "speculative": true, "lookahead": 256
     },
@@ -469,6 +537,15 @@
       "sequence": [ "ParenOpen", "declarator", "ParenClose" ]
     },
 
+    "abstractDirectDeclarator": {
+      "$comment": "c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME: the abstract twin of `directDeclarator` for the CAST/sizeof/compound/va_arg type-name tail (C 6.7.7 direct-abstract-declarator). The BASE alt is deliberately ONLY `{fnSuffix, parenDeclarator}` — NOT the full `directDeclarator` base — for two reasons. (1) `Identifier` EXCLUDED: a bare-identifier base would make `(c * c)` (a pervasive multiplication) speculatively commit as a cast `(c *<abstract-decl c>)` — the type child gains >1 leaf so the commit triage's rule-1 'not a lone identifier' fires. (2) `arrayDeclSuffix` EXCLUDED at the BASE (the bare `[N]` form): `(b[0])` (an array-INDEX value expression) would likewise mis-commit as a type-name `b[0]` (base `b` + array suffix). C's direct-abstract-declarator allows a bare `[N]` base, but it collides with the index expression under speculative type-vs-value triage — so the BARE-array type-name (`(int[10])` / `sizeof(int[10])`) is the NAMED LIMITATION D-CSUBSET-ABSTRACT-ARRAY-TYPE-NAME (off the c26 fn-ptr frontier; the `(*)[N]` array-OF-pointer form still works — its base is `parenDeclarator`, the `[N]` rides the suffix repeat). The remaining base forms — `parenDeclarator` (`(*)`/`(*p)` — a nested NAME still parses and is rejected loud at the type-resolve), `fnSuffix` — REUSE the existing declarator sub-rules verbatim, so the SHARED semantic `directDeclaredType` folds it (`(*)(void)`→Ptr<Fn(void)->int>) identically to `directDeclarator`. The suffix repeat KEEPS `arrayDeclSuffix` so `(*)[N]` works. Speculative base (fnSuffix vs parenDeclarator collide on `(`, exactly as directDeclarator).",
+      "sequence": [
+        { "alt": [ "fnSuffix", "parenDeclarator" ],
+          "speculative": true, "lookahead": 64 },
+        { "repeat": { "alt": [ "fnSuffix", "arrayDeclSuffix" ] } }
+      ]
+    },
+
     "fnSuffix": {
       "$comment": "The commit guard fires ONLY when fnSuffix is probed speculatively (the directDeclarator BASE position); the post-base suffix position dispatches non-speculatively on `(` and never consults it. requireKnownType = C 6.7.6.3p11: a lone unknown identifier between the parens rolls back to the parenthesized-declarator reading AND records the ambiguous-type-name candidate for the CU oracle's seeded reparse.",
       "sequence": [ "ParenOpen", { "optional": "paramList" }, "ParenClose" ],
@@ -493,9 +570,9 @@
       "$comment": "KEYWORD/composite-led type specifiers for declaration heads — deliberately NO Identifier arm (the typedef-name head is the ambiguous form, routed through identDeclHead/declOrExprStmt or the committed post-specifier/post-qualifier heads). SPECULATIVE (mirror typedefHead, D-CSUBSET-STRUCT-BODY-VARDECL-POSITION): admits the struct/union/enum BODY forms so a body-defined LOCAL (`struct P { int a; } v;` as a statement) parses; body forms probe FIRST, a ref with no `{` rolls back to the `*TypeRef` form. Single-level.",
       "alt": [
         "typeSpecifierSeq",
-        "structSpecifierBody", "structTypeRef",
-        "unionSpecifierBody",  "unionTypeRef",
-        "enumSpecifierBody",   "enumTypeRef"
+        "structSpec",
+        "unionSpec",
+        "enumSpec"
       ],
       "speculative": true, "lookahead": 256
     },
@@ -538,41 +615,12 @@
       "$comment": "SPECULATIVE: the struct/union/enum BODY forms collide with the ref forms on their lead keyword — body forms probe FIRST (declared order); `typedef struct P MyP;` rolls back to structTypeRef when no `{` follows. lookahead 256 (4096-token budget): a body probe must swallow the whole member list.",
       "alt": [
         "typeSpecifierSeq",
-        "structSpecifierBody", "structTypeRef",
-        "unionSpecifierBody",  "unionTypeRef",
-        "enumSpecifierBody",   "enumTypeRef",
+        "structSpec",
+        "unionSpec",
+        "enumSpec",
         "Identifier"
       ],
       "speculative": true, "lookahead": 256
-    },
-
-    "structSpecifierBody": {
-      "$comment": "The typedef-position struct SPECIFIER (C 6.7.2.1): optional tag + member body. Tagged form also binds the tag (a Type symbol) in the enclosing scope; the anonymous form mints an anonymous composite (semantics row: anonymousNameAllowed).",
-      "sequence": [
-        "StructKeyword", { "optional": "Identifier" },
-        "BlockOpen", { "repeat": "structField" }, "BlockClose"
-      ]
-    },
-
-    "unionSpecifierBody": {
-      "sequence": [
-        "UnionKeyword", { "optional": "Identifier" },
-        "BlockOpen", { "repeat": "unionField" }, "BlockClose"
-      ]
-    },
-
-    "enumSpecifierBody": {
-      "sequence": [
-        "EnumKeyword", { "optional": "Identifier" },
-        "BlockOpen",
-        { "optional": {
-            "sequence": [
-              "enumerator",
-              { "repeat": { "sequence": [ "Comma", { "optional": "enumerator" } ] } }
-            ]
-        }},
-        "BlockClose"
-      ]
     },
 
     "includeDirective": {
@@ -656,9 +704,9 @@
       "$comment": "FC7 D-FC7-NESTED-STRUCT-FIELD: the trailing `Identifier` alt admits a typedef-name (user struct/union type) as a struct/union FIELD type — symmetric with `typeBase` above, which already carries it. A struct/union body has no expression-statement context, so a bare Identifier in field-type position is UNAMBIGUOUSLY a type-name (no binder-sketch guard needed); a non-type name fails loud at semantic scope-lookup. Tried last, so keyword/tag/enum forms keep priority. D-CSUBSET-STRUCT-BODY-VARDECL-POSITION: also admits the struct/union/enum BODY forms (an inline nested definition `struct Inner { int x; } in;` as a field) — SPECULATIVE (mirror typedefHead), body-before-ref. This makes the body-in-head form RECURSIVE: a structSpecifierBody contains structFields, each of which may itself BE a structSpecifierBody (arbitrary nesting), the recursion falling out of the grammar — single-level speculation at each structField, never nested.",
       "alt": [
         "typeSpecifierSeq",
-        "structSpecifierBody", "structTypeRef",
-        "unionSpecifierBody",  "unionTypeRef",
-        "enumSpecifierBody",   "enumTypeRef",
+        "structSpec",
+        "unionSpec",
+        "enumSpec",
         "Identifier"
       ],
       "speculative": true, "lookahead": 256
@@ -674,10 +722,11 @@
     },
 
     "varDecl": {
-      "$comment": "The COMMITTED local declaration statement — its FIRST set has NO Identifier (the bare-typedef-name form lives in declOrExprStmt). Branch 1: storage-class-specifier-led (`register T x;` — the specifier commits the decl, so the head admits the typedef-name arm); branch 2: qualifier-or-keyword-led (`const T x;` / `int x;`). Inline branches keep the children flat: [localDeclSpecifiers?, head, initDeclaratorList, ;] — the row's specifierPrefix strip makes head=0/list=1 stable.",
+      "$comment": "The COMMITTED local declaration statement — its FIRST set has NO Identifier (the bare-typedef-name form lives in declOrExprStmt). Branch 1: storage-class-specifier-led (`register T x;` — the specifier commits the decl, so the head admits the typedef-name arm); branch 2: qualifier-or-keyword-led (`const T x;` / `int x;`). Inline branches keep the children flat: [localDeclSpecifiers?, head, initDeclaratorList?, ;] — the row's specifierPrefix strip makes head=0/list=1 stable.",
+      "$c28Comment": "c28 D-CSUBSET-LOCAL-TYPE-DEFINITION: the `initDeclaratorList` is OPTIONAL — mirroring the top-level `topLevelDecl` (init-declarator-list?). A bare BLOCK-SCOPED struct/union/enum DEFINITION with no declarator (`struct Sublist { int nList; ht_slot *aList; };` as a STATEMENT inside a function — sqlite3.c:68508 walMergesort) routes through the kwDeclHead branch (Struct/Union/EnumKeyword-led → the unified c25 structSpec/unionSpec/enumSpec defines the type via `definesWhenChild`, minting the tag into the ENCLOSING BLOCK scope), takes NO declarator, and ends at EndStatement. A NON-defining no-declarator local (`int;`) parses + types but FAILS LOUD at HIR lowering (S_DeclarationDeclaresNothing) — the SAME tier + diagnostic as the top-level no-declarator path (CST→HIR's lowerVarLikeInto: no named declarator AND no composite specifier in the head ⇒ declares nothing). identVarDecl's list is deliberately NOT made optional (a bare typedef-name `T;` must stay an expression statement, NOT a no-declarator decl); only the keyword/specifier-led varDecl needs it (the struct/union/enum definition is keyword-led).",
       "alt": [
-        { "sequence": [ "localDeclSpecifiers", "declHead", "initDeclaratorList", "EndStatement" ] },
-        { "sequence": [ "kwDeclHead", "initDeclaratorList", "EndStatement" ] }
+        { "sequence": [ "localDeclSpecifiers", "declHead", { "optional": "initDeclaratorList" }, "EndStatement" ] },
+        { "sequence": [ "kwDeclHead", { "optional": "initDeclaratorList" }, "EndStatement" ] }
       ]
     },
 
@@ -700,7 +749,11 @@
     },
     "gotoLabel":    { "sequence": [ "GotoKeyword", "Identifier", "EndStatement" ] },
     "gotoIndirect": { "sequence": [ "GotoKeyword", "StarOp", "expression", "EndStatement" ] },
-    "labelStmt": { "sequence": [ "Identifier", "Colon", "statement" ] },
+    "labelStmt": {
+      "$c31Comment": "D-CSUBSET-LABEL-BUDGET-CLIFF (p19 Cluster G c31): the shape STAYS `Identifier Colon statement` so a label stays correct in every context, incl. a braceless control-flow body (`if(x) L: s;` — `s` IS the if's body). `commitAfterPrefix` is a PEG cut: after `Identifier Colon` no other declOrExprStmt alt (identVarDecl/exprStmt — neither has Colon in 2nd position) can match, so once the rule's fixed leading token-prefix is consumed in the probe (predictivePrefixLen = 3: `Identifier`, `Colon`, plus the first `statement` token — one harmless extra token, still far under budget) the parser COMMITS and parses the (arbitrarily large) `statement` child NON-speculatively, off the lookahead*16 probe budget. Without it a labeled statement >4096 tokens (sqlite3.c:213922 `json_parse_restart:` before a ~900-case switch) exhausts the budget → rollback → exprStmt → P0001 'got :'.",
+      "sequence": [ "Identifier", "Colon", "statement" ],
+      "commitAfterPrefix": true
+    },
     "emptyStmt": { "sequence": [ "EndStatement" ] },
 
     "localDeclSpecifiers": {
@@ -748,8 +801,10 @@
     },
 
     "statement": {
+      "$c30Comment": "c30 D-CSUBSET-LOCAL-TYPEDEF: `typedefDecl` is admitted as a block item (a BLOCK-SCOPED typedef — `typedef void(*LOGFUNC_t)(void*,int,const char*);` inside a function, sqlite3.c:187603). FIRST = TypedefKeyword, DISJOINT from every other statement alt (varDecl is qualifier/type-keyword/storage-class-led; declOrExprStmt is Identifier-led; the rest are their own keywords), so a unique-production DIRECT DESCENT — NO speculation. The whole typedef-name machinery is ALREADY scope-keyed: Pass-1 binds the alias into `current` (= the enclosing block scope) in the Ordinary namespace; the type resolver (`resolveTypeNodeImpl` SE5 arm) and the parse-time oracle (`BinderSketch`) both walk the scope chain, so a block-scoped typedef-name resolves IN the block, SHADOWS an outer same-name typedef, and does NOT leak out (red-on-disable pins enforce the non-leak). HIR→MIR's `lowerStmtNode` lowers a statement-position TypeDecl as a NO-OP (a typedef emits no code; mirrors the TOP-LEVEL TypeDecl). Mirrors c28 (block-scoped struct/union/enum definition).",
       "alt": [
         "varDecl",
+        "typedefDecl",
         "block",
         "ifStmt",
         "whileStmt",
@@ -761,6 +816,8 @@
         "returnStmt",
         "gotoStmt",
         "caseStmt",
+        "sehTryStmt",
+        "sehLeaveStmt",
         "emptyStmt",
         "declOrExprStmt"
       ]
@@ -856,6 +913,39 @@
     },
 
     "caseStmt": { "sequence": [ "caseLabel", "statement" ] },
+
+    "sehTryStmt": {
+      "$comment": "c115 (SEH arc 2/3): MSVC `__try compound-statement (__except '(' expr ')' compound-statement | __finally compound-statement)` — learn.microsoft.com/cpp/cpp/try-except-statement. FIRST = {TryKeyword}, disjoint from every other statement alt -> unique-production direct descent, NON-speculative; the except/finally fork is disambiguated one level down by sehHandler's own disjoint FIRSTs (ExceptKeyword vs FinallyKeyword). Both bodies REUSE the `block` rule — MSVC requires compound statements (braces), so the grammar enforces it by construction. The filter expression is an ordinary `expression`; its special context (where _exception_code()/_exception_info() are legal) is a SEMANTIC property checked at CST->HIR lowering + the HIR verifier, not a grammar one. __finally parses (so the diagnostic is a positioned lowering fail-loud citing D-CSUBSET-SEH-FINALLY, not a raw P0001 cascade) but has NO consumer (sqlite ground-truth: zero uses) — trigger-gated.",
+      "sequence": [
+        "TryKeyword",
+        "block",
+        "sehHandler"
+      ]
+    },
+
+    "sehHandler": {
+      "alt": [ "sehExceptArm", "sehFinallyArm" ]
+    },
+
+    "sehExceptArm": {
+      "sequence": [
+        "ExceptKeyword",
+        "ParenOpen", "expression", "ParenClose",
+        "block"
+      ]
+    },
+
+    "sehFinallyArm": {
+      "sequence": [
+        "FinallyKeyword",
+        "block"
+      ]
+    },
+
+    "sehLeaveStmt": {
+      "$comment": "c115: `__leave ;` parses (FIRST = {LeaveKeyword}, disjoint) so the diagnostic is a positioned lowering fail-loud citing D-CSUBSET-SEH-LEAVE rather than a parse cascade. NO consumer (sqlite: zero uses) — trigger-gated; the lowering rejects it.",
+      "sequence": [ "LeaveKeyword", "EndStatement" ]
+    },
 
 
     "exprStmt": { "sequence": [ "expression", "EndStatement" ] },
@@ -962,12 +1052,13 @@
     },
 
     "castTypeRef": {
-      "$comment": "c11 D-CSUBSET-EAST-CONST-CAST: a cast/sizeof type-name admits const PRE-base (`const char *` — west) AND POST-base before the stars (`char const *` — EAST, the SQLite-pervasive form). In a DECLARATION the `*` lives in the declarator so the head `char const` already parsed; a cast bundles base+stars here, so the post-base const slot is what admits east-const. The const resolver IGNORES const for type identity (a cast yields an rvalue), so all forms intern the same pointer type. The two const slots straddle the REQUIRED base token (no ambiguity); a POST-stars const (`char * const`) is dropped — a useless cast form (const on an rvalue pointer ≡ no const), and a 2nd post-stars optional adjacent to the post-base one across the zero-star case is C_AmbiguousAlternatives.",
+      "$comment": "c27 D-CSUBSET-VOLATILE-POINTEE: the two qualifier slots are `{repeat headQualifier}` (const|volatile, either order) — admitting a volatile-qualified cast type-name `(volatile u32 **)p` (sqlite 67392). The resolver wraps the base in VolatileQual when a volatile precedes the stars, so the cast builds Ptr<Ptr<VolatileQual(u32)>> and a deref of it is volatile; const stays ignored. (Was two `{optional ConstKeyword}` slots pre-c27.) c11 D-CSUBSET-EAST-CONST-CAST: a cast/sizeof type-name admits const PRE-base (`const char *` — west) AND POST-base before the stars (`char const *` — EAST, the SQLite-pervasive form). In a DECLARATION the `*` lives in the declarator so the head `char const` already parsed; a cast bundles base+stars here, so the post-base const slot is what admits east-const. The const resolver IGNORES const for type identity (a cast yields an rvalue), so all forms intern the same pointer type. The two const slots straddle the REQUIRED base token (no ambiguity); a POST-stars qualifier (`char * const` / `u32 * volatile`) RIDES INSIDE the pointer layer (c29 D-CSUBSET-POST-STAR-CAST-QUALIFIER): the leading stars are `{repeat pointerLayer}` (= `StarOp {repeat ptrQualifier}`, c-subset ~500) NOT bare `{repeat StarOp}`, so the post-star const/volatile is present ONLY with a star — NO zero-star adjacency (the c11 ambiguity a separate post-stars optional would have caused). The resolver counts each pointerLayer child as ONE star for ptrDepth and STRIPS its ptrQualifiers: a cast yields an RVALUE with NO top-level cv (C 6.5.4) — `(int * const)p` and `(int *)p` intern the SAME `Ptr<int>`, and a post-star VOLATILE is dropped (no VolatileQual on the cast POINTER) — the c27 PRE-stars-volatile pointee path (`volatile u32 *`→`Ptr<VolatileQual(u32)>`) is SEPARATE and unbroken. c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME: an ABSTRACT direct-declarator (`(*)(void)`/`(*)(int)`/`[N]`/`(*)[N]`) may follow the base+stars — the fn-pointer/array type-name forms (`(int(*)(void))p`, the sqlite osGeteuid cast). It reuses `abstractDirectDeclarator` (the abstract twin of `directDeclarator`, sharing parenDeclarator+fnSuffix+arrayDeclSuffix), so the semantic resolver folds the type via the SHARED `directDeclaredType` (Ptr<Fn(void)->int>) — the SAME machinery a declaration's declarator takes. It is the ABSTRACT twin (Identifier base EXCLUDED) NOT `directDeclarator` because a bare-identifier base would make `(c * c)` (a multiplication) speculatively commit as a bogus cast; and it is NOT the full `declarator` because the leading POINTER STARS are consumed by `{repeat pointerLayer}` above (a star-led declarator's FIRST `pointerLayer` would collide with the repeat — C_AmbiguousAlternatives). OPTIONAL: a star-only cast (`int*`) leaves it empty — none of {fnSuffix,parenDeclarator,arrayDeclSuffix} matches the closing `)`, so `(int*)` stays `castTypeBase`+pointerLayer(StarOp). A NAMED declarator with the name NESTED in parens (`(int (x))expr` / `(int(*p)(void))expr`) parses (via parenDeclarator) but is rejected LOUD at the type-resolve via `S_TypeNameDeclaratorNotAbstract` — never silently parsed as the bare base.",
       "sequence": [
-        { "optional": "ConstKeyword" },
+        { "repeat": "headQualifier" },
         "castTypeBase",
-        { "optional": "ConstKeyword" },
-        { "repeat": "StarOp" }
+        { "repeat": "headQualifier" },
+        { "repeat": "pointerLayer" },
+        { "optional": "abstractDirectDeclarator" }
       ]
     },
 
@@ -1060,10 +1151,12 @@
       "pointerLayerRule":   "pointerLayer",
       "pointerToken":       "StarOp",
       "directRule":         "directDeclarator",
+      "directAbstractRule": "abstractDirectDeclarator",
       "groupRule":          "parenDeclarator",
       "nameToken":          "Identifier",
       "fnSuffixRule":       "fnSuffix",
       "fnSuffixParamsRule": "paramList",
+      "prototypeParamScopeRule": "paramList",
       "variadicMarker":     "EllipsisOp",
       "arraySuffixRule":    "arrayDeclSuffix",
       "initDeclaratorRule": "initDeclarator",
@@ -1078,8 +1171,10 @@
         "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword", "warnIfUnused": true,
         "specifierPrefix": "localDeclSpecifiers",
         "requireNamedDeclarators": true,
+        "$prototypeSynthesizesExternComment": "c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): a BLOCK-scope bare prototype (`int f(int);` inside a body — re-homed onto the file scope per D-CSUBSET-BLOCK-SCOPE-PROTOTYPE, C 6.2.2p4) that survives with no in-TU definition synthesizes the same no-library extern as a file-scope proto (routed to the module decls, mirroring the static-local accumulator). Same three-way resolution as topLevelDecl's flag.",
+        "prototypeSynthesizesExtern": true,
         "$staticStorageComment": "D-CSUBSET-LOCAL-STATIC: a block-scope `static` confers static storage duration (C 6.2.4). CST→HIR's linkageFrom folds {binding:local, staticStorage:true} from the SAME prefix scan and routes the declaration to a hidden module-global (internal linkage). register/auto/attribute specifiers carry no linkage and are ignored (ignoredKinds/ignoredRules) so they never trip the unknown-specifier diagnostic.",
-        "$volatileComment": "c21 (D-CSUBSET-VOLATILE-QUALIFIER): volatileMarker REPLACES the prior S_VolatileNotSupported gatedMarker — `volatile` is now IMPLEMENTED (per-symbol isVolatile threaded to MirInstFlags::Volatile). A pointer-to-volatile-POINTEE (`volatile int *p`) still fails loud (S_VolatilePointeeNotSupported, the per-declarator typing arm) — model B handles the object/member/pointer-object forms.",
+        "$volatileComment": "c27 (D-CSUBSET-VOLATILE-POINTEE): `volatile` is a TYPE qualifier (TypeKind::VolatileQual). The resolver wraps the base in VolatileQual when a volatileMarker precedes the stars (`volatile int *` => Ptr<VolatileQual(int)>) and wraps the pointer for an east ptrQualifier (`int * volatile` => VolatileQual(Ptr<int>)); object-volatility is read off the symbol's top-level VolatileQual type at access lowering, pointee-volatility rides the accessed type at the deref/index/member (MirInstFlags::Volatile). ALL pointee/member/param/typedef forms now compile — the prior S_VolatilePointeeNotSupported reject is retired. const stays ignored (no wrapper).",
         "linkageSpecifiers": { "static": { "binding": "local", "staticStorage": true } },
         "linkageSpecifierIgnoredKinds": ["RegisterKeyword", "AutoKeyword", "AttributeKeyword", "ParenOpen", "ParenClose"],
         "linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr"] },
@@ -1096,10 +1191,14 @@
         "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword", "warnIfUnused": true,
         "requireNamedDeclarators": true },
       { "rule": "param", "head": 0, "declarator": 1, "kind": "variable",
-        "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword" },
+        "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword",
+        "$arrayToPointerComment": "c82 (D-CSUBSET-PARAM-ARRAY-ADJUSTMENT, C 6.7.6.3p7): a parameter declared 'array of T' — sized (`int a[64]`), unsized (`int a[]`), or multi-dim (`int a[][5]` -> ptr to int[5]) — ADJUSTS to 'pointer to T'. The flag (a) permits the absent-length `[]` on the param's OUTERMOST suffix (resolving via the incomplete-array path, like allowFlexibleArray) and (b) rewrites the resolved top-level Array to Ptr<element> at BOTH resolution sites (the definitive Pass-1.5 visit that binds the param symbol — so sizeof(param)==8 and body uses see the pointer — and the FnSig param harvest — so call-site checking matches the decayed argument). An inner-dimension `[]` (`int a[4][]`) still fails loud (S_FlexibleArrayInAggregate via the incomplete-element guard), matching C's ill-formedness.",
+        "arrayToPointer": true },
       { "rule": "topLevelDecl", "head": 0, "declaratorList": 1, "kind": "variable",
         "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword",
         "requireNamedDeclarators": true,
+        "$prototypeSynthesizesExternComment": "c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS, C 6.2.2p5): a file-scope bare prototype with NO in-TU definition (`void sqlite3_free(void*);` — the sqlite3.h splice shape; SQLITE_API expands empty) synthesizes an ExternFunction with NO library binding. The LK11 merge resolves it against a sibling TU's definition (import stripped, calls direct); a bare re-declaration of a SHIPPED descriptor name re-binds to the descriptor's library (goal-2 suppression recorded the map); a survivor with neither fails LOUD at link (K_SymbolUndefined naming the symbol — ld's behavior). `static`/weak protos never synthesize (internal/weak linkage must not bind a sibling TU's public symbol) — they keep the loud H0009. RED-ON-DISABLE: drop this flag -> the shell.c 2-TU probe regresses to H0009 'Ref to unbound symbol' at the first sqlite3_* call.",
+        "prototypeSynthesizesExtern": true,
         "$linkageSpecifiersComment": "D-CSUBSET-LINKAGE-SPECIFIERS: 'static' -> internal (Local) binding; '__attribute__((weak))' -> Weak; FC4 c1 adds the COMPOSITE key 'visibility:hidden' — linkageFrom forms '<identifier>:<decoded-string-body>' when a specifier identifier is immediately followed by a parenthesized string literal (__attribute__((visibility(\"hidden\")))). 'linkageSpecifierIgnoredRules' skips C23 [[...]] stdAttr subtrees wholesale (D14: parsed, ignored).",
         "specifierPrefix": "declSpecifiers",
         "linkageSpecifiers": {
@@ -1118,17 +1217,23 @@
         "$implicitReturnZeroForFunctionNamesComment": "C99 §5.1.2.2.3: when control reaches the closing '}' of main without an explicit return, the semantics are equivalent to 'return 0;'. The HIR lowering appends a synthetic ReturnStmt(IntLiteral(0)) to main's body if it doesn't structurally terminate. SOURCE-AGNOSTIC: this list lives on the per-language semantic config so each language declares its own entry-fn convention (Pascal's 'program', Rust's 'fn main', etc.) without touching shared HIR substrate. Closes D-LK10-ENTRY-MAIN-IMPLICIT-RETURN.",
         "implicitReturnZeroForFunctionNames": ["main"],
         "$entryFunctionNamesComment": "FC5: the program ENTRY-point name(s) — read by the driver's entry-symbol resolution. SEPARATE from implicitReturnZeroForFunctionNames (the C main-style return-0 set); for C both are `main`, but declaring them distinctly de-conflates the two concepts (D-LK10-ENTRY-MAIN-IMPLICIT-RETURN).",
-        "entryFunctionNames": ["main"] },
+        "entryFunctionNames": ["main", "wmain"] },
       { "rule": "typedefDecl", "head": 1, "declarator": 2, "kind": "type",
         "volatileMarker": "VolatileKeyword",
         "requireNamedDeclarators": true },
-      { "rule": "structSpecifierBody", "name": 1, "kind": "type",
+      { "rule": "structSpec", "name": 1, "kind": "type",
+        "$c25Comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the DEFINITION arm of the unified `structSpec`. `definesWhenChild: structBody` makes this row a definition (mint type, bind tag in the Tag namespace, open scope, compose fields) ONLY when a `structBody` child is present (`struct S { … }` / anonymous `struct { … }`); when ABSENT (`struct S v;` / `struct S;`) the node is a pure tag reference, resolved by the paired `structSpec` references-row below (isTagReference). The DEFINE semantics are byte-identical to the former `structSpecifierBody` row — fields now live under the `structBody` child, but Pass-1.5's fieldChildren collection walks the scope this row opens (not direct children), so the extra nesting is transparent. `name: 1` still resolves the tag: structSpec's visible children at definition are [StructKeyword, Identifier, structBody] (tagged) or [StructKeyword, structBody] (anonymous → anonymousNameAllowed synthesizes the name).",
+        "definesWhenChild": "structBody",
         "anonymousNameAllowed": true,
         "fieldChildren": { "rule": "structField", "compositeKind": "struct" } },
-      { "rule": "unionSpecifierBody", "name": 1, "kind": "type",
+      { "rule": "unionSpec", "name": 1, "kind": "type",
+        "$c25Comment": "c25: the DEFINITION arm of the unified `unionSpec` (mirrors structSpec). `definesWhenChild: unionBody`.",
+        "definesWhenChild": "unionBody",
         "anonymousNameAllowed": true,
         "fieldChildren": { "rule": "unionField", "compositeKind": "union" } },
-      { "rule": "enumSpecifierBody", "name": 1, "kind": "type",
+      { "rule": "enumSpec", "name": 1, "kind": "type",
+        "$c25Comment": "c25: the DEFINITION arm of the unified `enumSpec` (mirrors structSpec). `definesWhenChild: enumBody`. The enumerator lift-to-enclosing-scope behavior is unchanged (fieldChildren.liftToEnclosingScope).",
+        "definesWhenChild": "enumBody",
         "anonymousNameAllowed": true,
         "fieldChildren": { "rule": "enumerator", "compositeKind": "enum",
                            "liftToEnclosingScope": true } },
@@ -1151,13 +1256,19 @@
           "paramsPath": [1]
         },
         "variadicMarker": "EllipsisOp",
+        "$allowFlexibleArrayComment": "c82 (D-CSUBSET-EXTERN-INCOMPLETE-ARRAY, C 6.7p7/6.9.2): an extern OBJECT declaration may carry an INCOMPLETE array type — sqlite3.h's `SQLITE_EXTERN const char sqlite3_version[];`. The absent-length `[]` resolves through the SAME incomplete-array path a FAM uses (interner incompleteArray = the Array kind + a length sentinel, so decay/index consumers keep working while sizeof fails loud). The symbol is non-defining: a sibling-TU DEFINITION completes it at the MIR merge (LK11 name resolution drops the import row); a NEVER-defined one survives as an extern-data import, which the link tier fail-louds on until the extern-data import model lands (the c82 §B, D-LK-EXTERN-DATA-IMPORT).",
+        "allowFlexibleArray": true,
         "arraySuffix": { "rule": "arrayDeclSuffix", "lengthChild": 1 } }
     ],
     "references": [
       { "rule": "operand" },
-      { "rule": "structTypeRef", "nameMatch": "lastIdentifier", "isTagReference": true },
-      { "rule": "unionTypeRef",  "nameMatch": "lastIdentifier", "isTagReference": true },
-      { "rule": "enumTypeRef",   "nameMatch": "lastIdentifier", "isTagReference": true }
+      { "rule": "structTypeRef", "nameMatch": "lastIdentifier", "isTagReference": true, "compositeKind": "struct" },
+      { "rule": "unionTypeRef",  "nameMatch": "lastIdentifier", "isTagReference": true, "compositeKind": "union" },
+      { "rule": "enumTypeRef",   "nameMatch": "lastIdentifier", "isTagReference": true, "compositeKind": "enum" },
+      { "$c25Comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the REFERENCE arm of the unified specifiers. A body-ABSENT `structSpec`/`unionSpec`/`enumSpec` (`struct S v;` / `struct S;`) is a TAG reference — these rows resolve its tag in the Tag namespace, exactly as the former `structTypeRef`/etc. did, via the SAME isTagReference path. The DEFINITION arm (body present) is the paired declarations-row above; the engine routes per-node on the body child's presence (`definesWhenChild`), so a definition is never double-processed as a reference. `nameMatch: lastIdentifier` extracts the tag from [Kw, Identifier]. c35 (D-CSUBSET-FORWARD-STRUCT-DECLARATION): `compositeKind` drives the forward-mint of an INCOMPLETE composite on a tag MISS (an opaque `struct S *` / `typedef struct S S;` whose S is never defined — sqlite3_stmt), so the reference resolves to a sizeable Ptr<incomplete> instead of S_UnknownType; a VALUE/by-value-member/sizeof of it still fails loud (computeLayout incomplete guard). `enum` keeps the fail-loud miss (value-typed).",
+        "rule": "structSpec", "nameMatch": "lastIdentifier", "isTagReference": true, "compositeKind": "struct" },
+      { "rule": "unionSpec", "nameMatch": "lastIdentifier", "isTagReference": true, "compositeKind": "union" },
+      { "rule": "enumSpec",  "nameMatch": "lastIdentifier", "isTagReference": true, "compositeKind": "enum" }
     ],
     "memberAccesses": [
       { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,
@@ -1165,9 +1276,9 @@
       { "rule": "postfixExpr", "lhsChild": 0, "nameChild": 2,
         "dereferences": true,  "operatorToken": "ArrowOp" }
     ],
-    "$scopesComment": "FC4 c1: topLevelDecl replaced funcDefTail — a function's params now live INSIDE its declarator's fnSuffix, so the scope that holds them must dominate BOTH the declarator and the block; the topLevelDecl node is that dominator (harmless for variable-kind topLevelDecls — nothing binds into the scope). The three *SpecifierBody rules are fieldChildren composites (typedef-position struct/union/enum bodies).",
+    "$scopesComment": "FC4 c1: topLevelDecl replaced funcDefTail — a function's params now live INSIDE its declarator's fnSuffix, so the scope that holds them must dominate BOTH the declarator and the block; the topLevelDecl node is that dominator (harmless for variable-kind topLevelDecls — nothing binds into the scope). c25: the unified `structSpec`/`unionSpec`/`enumSpec` rules are the fieldChildren composites (they REPLACE the retired *SpecifierBody rules). Each opens a scope ONLY in DEFINITION mode (body present) — Pass 1 gates the pushScope on the `definesWhenChild` body-child presence, so a body-absent tag reference (`struct S v;`) opens no scope. The member-body wrapper rules (structBody/unionBody/enumBody) are deliberately NOT scope rules — their fields bind into the enclosing XxxSpec scope.",
     "scopes": [ "block", "topLevelDecl",
-                "structSpecifierBody", "unionSpecifierBody", "enumSpecifierBody" ],
+                "structSpec", "unionSpec", "enumSpec" ],
     "assignments": [
       { "rule": "binaryExpr", "operatorToken": "AssignOp",       "lhs": 0, "rhs": 2 },
       { "rule": "binaryExpr", "operatorToken": "PlusAssignOp",   "lhs": 0, "rhs": 2 },
@@ -1206,6 +1317,15 @@
     ],
     "loopRules": [ "whileStmt", "forStmt", "doStmt", "switchStmt" ],
     "loopControls": [ { "rule": "breakStmt" }, { "rule": "continueStmt" } ],
+    "$builtinFunctionsComment": "c103 (D-CSUBSET-INTRINSIC-UMULH): compiler intrinsics exposed as builtin functions (SE6 builtins scope, shadow-able by user decls). `__umulh` = the high 64 bits of the u64*u64 128-bit product (the MSVC/sqlite intrinsic used by sqlite3Multiply128/160 on _WIN64). `lowering:umulh` binds the call to a DEDICATED MIR op (x86 `mul r/m64` -> RDX, arm64 `umulh`) rather than an ordinary call/import -- a compiler intrinsic is not a linkable symbol. Available on every target that declares the umulh mnemonic vocabulary (x86_64 + arm64); a target lacking it fails loud at lowering.",
+    "builtinFunctions": [
+      { "name": "__umulh", "params": ["U64", "U64"], "result": "U64", "lowering": "umulh" },
+      { "name": "_InterlockedCompareExchange", "signature": "fn(ptr<i32>, i32, i32) -> i32", "lowering": "atomic_cas" },
+      { "name": "_ReadWriteBarrier", "signature": "fn() -> void", "lowering": "barrier" },
+      { "name": "_exception_code", "signature": "fn() -> u32", "lowering": "seh_exception_code" },
+      { "name": "_exception_info", "signature": "fn() -> ptr<void>", "lowering": "seh_exception_info" }
+    ],
+    "$builtinAtomicCasComment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): `_InterlockedCompareExchange(LONG volatile* dest, LONG exch, LONG comp) -> LONG` -- the MSVC atomic compare-and-swap intrinsic (returns the ORIGINAL *dest; stores exch iff original==comp). Win32 LONG = i32 (LLP64) -> the 32-bit CAS. The UNDERSCORE name is the real intrinsic exactly as the Windows SDK spells it; windows.json's `InterlockedCompareExchange` macro expands to it (the winnt.h convention), so sqlite's `#if defined(InterlockedCompareExchange)` takes the direct-intrinsic path and its calls land here. `signature` (full type-text, c104) instead of scalar params: the dest param is a POINTER. Lowers to x86 `lock cmpxchg` (implicit-RAX comparand/old) / an arm64 LDAXR-STLXR acquire-release loop.",
     "$builtinTypesComment": "FC3 c1: the TEXT-keyed type-name table (typedef-style positions + the load-time fallback for single-word ladder/promotion names). The KEYWORD grammar path resolves through semantics.typeSpecifiers below (the C 6.7.2 multiset table) — both tables declare the SAME widths, and `long` carries the LLP64 override on BOTH so the two paths can never disagree (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH).",
     "builtinTypes": [
       { "name": "int",    "core": "I32"  },
@@ -1266,6 +1386,9 @@
     "intCrossSignednessConverts": true,
     "$intSameSignNarrowComment": "C 6.3.1.3/6.5.16.1 (D-CSUBSET-INT-SAME-SIGN-NARROW): admit the same-signedness integer NARROWING implicit conversion (`short s=anInt;`, `signed char c=anInt;`, `int i=aLong;` across init/assign/call-arg/return) — value-preserving in range, truncating (modular) out of range; needed for SQLite, which narrows everywhere. The isAssignable rank arms admit rank(rhs)>rank(lhs) only when true; WIDENING stays unconditional. coerce()'s arithmetic-core arm materializes the width-exact Cast (MIR Trunc) — the SAME path cross-signedness narrowing already uses, so NO codegen change. Together with intCrossSignednessConverts this completes the C integer-conversion matrix.",
     "intSameSignednessNarrows": true,
+    "$intFloatConvertComment": "C 6.3.1.4/6.3.1.5/6.5.16.1 (D-CSUBSET-INT-FLOAT-CONVERSION): admit the int<->float implicit assignment conversion in BOTH directions, gated independently. intConvertsToFloat -> an integer flows into a float lhs (`double d=5;`, `f(anInt)` to a `double` param; the sqlite kahanBabuskaNeumaierStep(pSum,iBig) shape feeds an i64 to a `volatile double`). floatConvertsToInt -> a float flows into an integer lhs (`int n=aDouble;`, truncating toward zero). coerce()'s arithmetic-core arm materializes the MIR SIToFP/UIToFP (int->float) / FPToSI/FPToUI (float->int). Flipping either to false -> that direction errors S0003 S_TypeMismatch (the int_float_convert corpus is RED-ON-DISABLE). Completes the C arithmetic-conversion matrix alongside intCrossSignednessConverts + intSameSignednessNarrows.",
+    "intConvertsToFloat": true,
+    "floatConvertsToInt": true,
     "$floatLiteralTypingComment": "FC3.5 sweep-c2: C 6.4.4.2 — a floating constant's type is keyed by its SUFFIX alone (unsuffixed -> double, f/F -> float). Type names resolve through typeSpecifiers/builtinTypes at LOAD time like the integer ladder's candidates. The loader cross-checks every numberStyle.floatSuffixes spelling is covered exactly once + an unsuffixed rule exists. C's l/L long-double suffix is NOT declared in floatSuffixes (pre-existing FC1c2 note) — long double lands with its own width story, not here.",
     "floatLiteralTyping": [
       { "suffixes": [],         "type": "double" },
@@ -1325,9 +1448,14 @@
       { "rule": "gotoIndirect", "hirKind": "IndirectGotoStmt" },
       { "rule": "labelStmt",    "hirKind": "LabelStmt"   },
       { "rule": "caseStmt",     "hirKind": "CaseStmt"    },
+      { "rule": "sehTryStmt",   "hirKind": "SehTryExcept" },
+      { "rule": "sehLeaveStmt", "hirKind": "SehLeave"    },
       { "rule": "emptyStmt",    "hirKind": "Skip"        },
       { "rule": "exprStmt",     "hirKind": "ExprStmt"    }
     ],
+
+    "sehExceptArmRule":  "sehExceptArm",
+    "sehFinallyArmRule": "sehFinallyArm",
 
     "binaryExprRule":  "binaryExpr",
     "unaryExprRule":   "unaryExpr",

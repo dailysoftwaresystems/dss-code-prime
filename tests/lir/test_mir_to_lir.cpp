@@ -376,6 +376,74 @@ TEST(MirToLir, UnsignedDivisionLowersToXorPlusDivNotCqoIDiv) {
            "miscompile guard, preserved through 10r split).";
 }
 
+// c117 (D-LK-EXTERN-DATA-IMPORT): a GOT-indirect extern-DATA GlobalAddr
+// materializes the OBJECT's address by lea-of-__got-slot + a DEREF load (the
+// __got slot holds the dyld-bound object address), and the GlobalAddr→Load
+// riprel fold is SUPPRESSED so a C-level load stays a distinct SECOND
+// indirection. A bare lea would yield the __got slot ADDRESS where the object
+// VALUE was wanted — off by one indirection, a silent miscompile. Always-on
+// structural guard for the macho stdout/stderr codegen (runtime witness =
+// the `stdio_stream_objects` macho arm). RED-ON-DISABLE: drop the
+// externDataGotSymbols_ membership (bare lea) → 1 memory access; keep the
+// fold (not suppressed) → the pair folds to ONE riprel load, 0 MemBase.
+TEST(MirToLir, GotIndirectExternDataGlobalAddrEmitsLeaThenDeref) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i8         = interner.primitive(TypeKind::I8);
+    TypeId const filePtr    = interner.pointer(i8);       // FILE* stand-in
+    TypeId const filePtrPtr = interner.pointer(filePtr);  // &stdout : FILE**
+    TypeId const params[]   = {i8};                        // one ignored param
+    TypeId const fnSig      = interner.fnSig(params, filePtr, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    (void)mb.addArg(0, i8);
+    // `return stdout;` — stdout (a data extern) as rvalue = Load(GlobalAddr).
+    SymbolId const dataSym{200};
+    MirInstId const ga        = mb.addGlobalAddr(dataSym, filePtrPtr);  // &stdout
+    MirInstId const loadArgs[] = {ga};
+    MirInstId const val       = mb.addInst(MirOpcode::Load, loadArgs, filePtr);
+    mb.addReturn(val);
+    Mir mir = std::move(mb).finish();
+
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> externs;
+    dss::ExternImport ei;
+    ei.symbol      = dataSym;
+    ei.mangledName = "___stdoutp";
+    ei.libraryPath = "/usr/lib/libSystem.B.dylib";
+    ei.isData      = true;
+    externs.push_back(ei);
+    auto lirR = lowerToLir(mir, **target, interner, rep, externs,
+                           ExternCallDispatch::DirectPlt,
+                           DataImportBinding::GotIndirect);
+    ASSERT_TRUE(lirR.ok);
+    Lir const& lir = lirR.lir;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool sawGotSlotSymbol = false;  // an inst carrying SymbolRef(dataSym)
+    int  memAccesses      = 0;      // insts with a MemBase operand (base-reg loads)
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        auto const ops = lir.instOperands(lir.blockInstAt(bb, i));
+        bool hasSym = false, hasMem = false;
+        for (auto const& op : ops) {
+            if (op.kind == LirOperandKind::SymbolRef && op.symbolV == dataSym.v) {
+                hasSym = true;
+            }
+            if (op.kind == LirOperandKind::MemBase) hasMem = true;
+        }
+        if (hasSym) sawGotSlotSymbol = true;
+        if (hasMem) ++memAccesses;
+    }
+    EXPECT_TRUE(sawGotSlotSymbol)
+        << "the __got-slot lea must carry a SymbolRef to the data extern.";
+    EXPECT_GE(memAccesses, 2)
+        << "a got-indirect data extern needs the __got DEREF load (the object "
+           "address) BEFORE the C-level load (the object value) — two base-reg "
+           "memory accesses; a bare lea gives 1, a folded riprel load gives 0.";
+}
+
 // ─── FC1 (V2-4.X, 2026-06-10): SMod/UMod lowering + the role contract ──────
 
 namespace {
@@ -1381,6 +1449,58 @@ TEST(MirToLir, RequiredLirOpcodeMissingFailsLoud) {
         << "L_RequiredLirOpcodeMissing must fire ONCE per mnemonic, not per inst";
 }
 
+// c115 SEH (D-WIN64-SEH-FUNCLETS): the honest c115 boundary — the SEH region
+// ops fail LOUD at mir_to_lir on EVERY target (the x64 funclet lowering is c116)
+// with the anchor named in the message. RED-on-disable: a `case SehTryBegin:
+// return;` no-op would silently drop the region → the exception is never caught.
+TEST(MirToLir, SehOpcodesFailLoudCitingC116Anchor) {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto const& sch = **target;
+
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const i32   = interner.primitive(::dss::TypeKind::I32);
+    auto const fnSig = interner.fnSig(std::span<::dss::TypeId const>{}, i32, ::dss::CallConv::CcSysV);
+
+    // A minimal region skeleton: entry SehTryBegin(id) -> [try, filter];
+    // try: SehTryEnd + Br(join); filter: SehFilterReturn(v) -> handler;
+    // handler: Br(join); join: return.
+    ::dss::MirBuilder mb;
+    mb.addFunction(fnSig, ::dss::SymbolId{1});
+    ::dss::MirBlockId const entry   = mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    ::dss::MirBlockId const tryBB   = mb.createBlock(::dss::StructCfMarker::Linear);
+    ::dss::MirBlockId const filterBB= mb.createBlock(::dss::StructCfMarker::Linear);
+    ::dss::MirBlockId const handBB  = mb.createBlock(::dss::StructCfMarker::Linear);
+    ::dss::MirBlockId const joinBB  = mb.createBlock(::dss::StructCfMarker::Linear);
+    mb.beginBlock(entry);
+    mb.addSehTryBegin(tryBB, filterBB, /*regionId=*/0);
+    mb.beginBlock(tryBB);
+    mb.addInst(::dss::MirOpcode::SehTryEnd, {}, ::dss::InvalidType, /*payload=*/0);
+    mb.addBr(joinBB);
+    mb.beginBlock(filterBB);
+    ::dss::MirInstId const code = mb.addInst(::dss::MirOpcode::SehExceptionCode, {}, i32);
+    mb.addSehFilterReturn(code, handBB, /*regionId=*/0);
+    mb.beginBlock(handBB);
+    mb.addBr(joinBB);
+    mb.beginBlock(joinBB);
+    ::dss::MirLiteralValue lv; lv.value = static_cast<std::int64_t>(0); lv.core = ::dss::TypeKind::I32;
+    mb.addReturn(mb.addConst(lv, i32));
+    ::dss::Mir m = std::move(mb).finish();
+
+    ::dss::DiagnosticReporter rep;
+    auto const result = ::dss::lowerToLir(m, sch, interner, rep);
+    EXPECT_FALSE(result.ok);
+    bool sawAnchor = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode
+            && d.actual.find("D-WIN64-SEH-FUNCLETS") != std::string::npos) {
+            sawAnchor = true;
+        }
+    }
+    EXPECT_TRUE(sawAnchor)
+        << "a SEH region op must fail loud citing D-WIN64-SEH-FUNCLETS (c116)";
+}
+
 TEST(MirToLir, UnsupportedMirOpcodeFailsLoud) {
     // Cycle 3e lowers Call/IntrinsicCall/GlobalAddr + degenerate
     // ExtractValue/InsertValue. Still-deferred: float comparisons
@@ -1765,43 +1885,61 @@ TEST(MirToLir, EnumPackedFieldMemoryAccessIsWidthExactToUnderlying) {
 }
 
 TEST(MirToLir, AllocaResultIsAddressableViaStore) {
-    // Cycle-3c Alloca lowering: the LIR alloca's result register flows
-    // into the immediately following Store as its `base` operand. This
-    // pins the (Alloca result → Store base) wiring; a regression that
-    // dropped the result-register propagation would surface here.
-    //
-    // Payload semantics on Alloca are ML6/ML7-driven (the size and
-    // alignment encoding co-designs with frame-layout in cycle 3d);
-    // cycle 3c is the pass-through layer.
+    // D-CSUBSET-ALLOCA-ADDRESS-REMATERIALIZE (c69): a body-local's storage
+    // address is REMATERIALIZED at each use — the `alloca` op reserves the slot
+    // (in scan order), and each USE of the address emits a fresh `lea_frame_slot k`
+    // (k = the alloca's 0-based scan-order index) whose result becomes the use's
+    // base register. So the Store writes through a `lea_frame_slot` result, NOT the
+    // `alloca` result directly. This pins the remat wiring (Store base ← a
+    // `lea_frame_slot` re-reference of the local's slot, index 0 for the sole
+    // local); a regression that reverted to caching one entry-spanning alloca
+    // address vreg, or threaded the wrong slot index, surfaces here.
     auto L = lowerCSubsetToLir(
         "int f() { int x; x = 1; return x; }");
     assertUpstreamClean(L);
     ASSERT_TRUE(L.lir.ok);
-    auto const allocaOp = *L.target->opcodeByMnemonic("alloca");
-    auto const storeOp  = *L.target->opcodeByMnemonic("store");
+    auto const allocaOp      = *L.target->opcodeByMnemonic("alloca");
+    auto const storeOp       = *L.target->opcodeByMnemonic("store");
+    auto const leaFrameSlotOp = *L.target->opcodeByMnemonic("lea_frame_slot");
     Lir const& lir = L.lir.lir;
     LirBlockId const entry = lir.funcEntry(lir.funcAt(0));
-    LirReg allocaResult{};
-    bool sawAlloca = false;
+    bool sawAlloca = false, sawStore = false;
     for (std::uint32_t i = 0; i < lir.blockInstCount(entry); ++i) {
         LirInstId const inst = lir.blockInstAt(entry, i);
         if (lir.instOpcode(inst) == allocaOp) {
-            allocaResult = lir.instResult(inst);
             sawAlloca = true;
-            EXPECT_TRUE(allocaResult.valid())
-                << "Alloca must produce a valid result vreg";
+            EXPECT_TRUE(lir.instResult(inst).valid())
+                << "Alloca must produce a valid result vreg (it reserves the slot)";
         }
         if (lir.instOpcode(inst) == storeOp && sawAlloca) {
             auto const ops = lir.instOperands(inst);
             ASSERT_EQ(ops.size(), 4u);
-            // ops[1] is the base register the Store writes through.
+            // ops[1] is the base register the Store writes through — now a
+            // `lea_frame_slot` re-reference's result, not the alloca's.
             EXPECT_EQ(ops[1].kind, LirOperandKind::Reg);
-            EXPECT_EQ(ops[1].reg, allocaResult)
-                << "Store's base operand must reference Alloca's result";
+            LirReg const baseReg = ops[1].reg;
+            // The producer of `baseReg` must be a `lea_frame_slot` whose payload
+            // is the local's slot index (0 — it is the only/first alloca).
+            bool baseFromLeaFrameSlot = false;
+            for (std::uint32_t j = 0; j < lir.blockInstCount(entry); ++j) {
+                LirInstId const def = lir.blockInstAt(entry, j);
+                if (lir.instOpcode(def) == leaFrameSlotOp
+                    && lir.instResult(def) == baseReg) {
+                    baseFromLeaFrameSlot = true;
+                    EXPECT_EQ(lir.instPayload(def), 0u)
+                        << "the sole local's lea_frame_slot must carry slot index 0";
+                    break;
+                }
+            }
+            EXPECT_TRUE(baseFromLeaFrameSlot)
+                << "Store's base must be a lea_frame_slot re-reference of the "
+                   "local's slot (the remat'd address), not the alloca result";
+            sawStore = true;
             break;
         }
     }
     EXPECT_TRUE(sawAlloca);
+    EXPECT_TRUE(sawStore);
 }
 
 TEST(MirToLir, WideLiteralRoutesThroughLiteralPool) {
@@ -1969,7 +2107,11 @@ TEST(MirToLir, FloatArithmeticLowersToFPRClassResults) {
         {::dss::MirOpcode::FSub, "fsub", 2},
         {::dss::MirOpcode::FMul, "fmul", 2},
         {::dss::MirOpcode::FDiv, "fdiv", 2},
-        {::dss::MirOpcode::FNeg, "fneg", 1},
+        // c78 (D-CSUBSET-FLOAT-NEG-ENCODING): x86 has NO native FP-negate, so
+        // FNeg capability-dispatches to `fneg_mask` (xorpd xmm,[rip+signmask]) —
+        // still an FPR-class result. (arm64 keeps the native `fneg` opcode; this
+        // test loads the x86_64 schema, so the realized op here is fneg_mask.)
+        {::dss::MirOpcode::FNeg, "fneg_mask", 1},
     }};
     for (auto const& c : cases) {
         std::vector<::dss::TypeKind> paramKinds(c.arity, ::dss::TypeKind::F64);

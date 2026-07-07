@@ -1,7 +1,12 @@
 {
+  "$comment": "c52 (D-FFI-MATH-INFINITY): ship INFINITY from <math.h> as a FLOAT constant. sqlite uses `(double)INFINITY` at runtime (sqlite3.c:37393/37423) -> S0001 INFINITY undeclared. The integer `constants` surface is integer-only (a float there fails loud F_ShippedLibUnsupportedType); a float-valued macro ships in `floatConstants` instead, injected as an f64-typed named constant whose HIR Ref folds to a +inf float literal. INFINITY is +inf on ALL targets (IEEE-754 f64), so no per-target variant; math.json gates no formats (available everywhere via the all-format `library` map). c87 (D-FFI-MATH-LIBM-DT-NEEDED): the elf library is libm.so.6 — glibc ships every symbol below in libm.so.6, NOT libc.so.6 (the pre-c87 libc.so.6 entry made ld.so stop at `undefined symbol: sqrt` when loading the c86 sqlite3 binary); the ELF walker emits one DT_NEEDED per DISTINCT referenced import library, so a math.h user links libm.so.6 ALONGSIDE libc.so.6 (the CRT exit + stdio surface). ldexp moves too: libc.so.6 also exports it, but libm is a math symbol's honest home and libm.so.6 exports it as well (nm -D libm.so.6: ldexp@@GLIBC_2.2.5, single version, glibc 2.39). pe keeps msvcrt.dll and macho keeps libSystem — single-C-runtime platforms with no separate math library. VERSIONING residual (D-LK-ELF-SYMBOL-VERSIONING): pow/log/exp are dual-versioned in glibc (GLIBC_2.2.5 compat + GLIBC_2.29 default); DSS's unversioned refs bind the 2.2.5 compat wrappers, which route to the SAME __ieee754_* cores (values bit-identical to gcc's 2.29 binding — empirically verified c87) and differ only in SVID matherr/errno edge handling on domain errors.",
   "header": "math.h",
   "standard": "c89",
-  "library": { "pe": "msvcrt.dll", "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "library": { "pe": "msvcrt.dll", "elf": "libm.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "floatConstants": [
+    { "name": "INFINITY", "value": "inf", "type": "f64" },
+    { "name": "HUGE_VAL", "value": "inf", "type": "f64" }
+  ],
   "symbols": [
     { "name": "sqrt",  "signature": "fn(f64) -> f64",      "kind": "function", "linkage": "external" },
     { "name": "pow",   "signature": "fn(f64, f64) -> f64", "kind": "function", "linkage": "external" },

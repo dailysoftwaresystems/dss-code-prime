@@ -143,10 +143,16 @@ TEST(HirText, RoundTripControlFlow) {
     HirNodeId forS = b.makeForStmt(b.makeVarDecl(i32, 2, b.makeLiteral(i32, 0)), cmp(),
                                    std::nullopt, forBody);
 
+    // c60 (Design I-A): switch = [disc, body Block, dispatch arms]. The body holds
+    // the case markers (LabelStmts); each arm maps a value to its marker ordinal.
     HirNodeId armV = b.makeLiteral(i32, 5);
-    HirNodeId arm0 = b.makeCaseArm(armV, std::vector<HirNodeId>{b.makeBreak(0)});
-    HirNodeId armD = b.makeCaseArm(std::nullopt, std::vector<HirNodeId>{b.makeReturn()});
-    HirNodeId sw = b.makeSwitchStmt(b.makeLiteral(i32, 0), std::vector<HirNodeId>{arm0, armD});
+    HirNodeId swBody = b.makeBlock(std::vector<HirNodeId>{
+        b.makeLabelStmt(0, b.makeBreak(0)),
+        b.makeLabelStmt(1, b.makeReturn())});
+    HirNodeId arm0 = b.makeCaseArm(armV, /*labelOrdinal=*/0);
+    HirNodeId armD = b.makeCaseArm(std::nullopt, /*labelOrdinal=*/1);
+    HirNodeId sw = b.makeSwitchStmt(b.makeLiteral(i32, 0), swBody,
+                                    std::vector<HirNodeId>{arm0, armD});
 
     HirNodeId body = b.makeBlock(std::vector<HirNodeId>{whileS, forS, sw, b.makeReturn()});
     HirNodeId fn = b.makeFunction(sig, 1, {}, body);
@@ -159,7 +165,7 @@ TEST(HirText, RoundTripControlFlow) {
     EXPECT_NE(text.find("while ("), std::string::npos);
     EXPECT_NE(text.find("for {"), std::string::npos);
     EXPECT_NE(text.find("switch ("), std::string::npos);
-    EXPECT_NE(text.find("default {"), std::string::npos);
+    EXPECT_NE(text.find("default L1"), std::string::npos);   // c60: dispatch arm form
 }
 
 TEST(HirText, RoundTripLiteralValues) {
@@ -691,4 +697,81 @@ TEST(ParseTypeFromText, MalformedReturnsInvalidAndDiagnoses) {
     TypeId const trailing = parseTypeFromText("i32 i32", interner, reg, rep2);
     EXPECT_FALSE(trailing.valid());
     EXPECT_GE(rep2.errorCount(), 1u);
+}
+
+// c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): the type-text codec carries per-field
+// EXPLICIT offsets (`struct "X" { T @off, ... }`) for an overlapping FFI layout.
+// (1) PARSE: the offsets reach the interner; (2) IDENTITY: an offset-bearing struct
+// is a DISTINCT TypeId from the same field-types with no offsets — the property that
+// keeps the shipped `structs` entry and the bare typedef (both carrying the offsets)
+// collapsed to ONE TypeId while never aliasing a naturally-laid-out struct.
+TEST(ParseTypeFromText, ExplicitFieldOffsetsParseAndForkIdentity) {
+    TypeInterner interner{CompilationUnitId{11}};
+    TypeRegistry reg;
+    DiagnosticReporter rep;
+
+    TypeId const withOff = parseTypeFromText(
+        "struct \"U\" { u64 @0, u32 @0, u32 @4 }", interner, reg, rep);
+    ASSERT_TRUE(withOff.valid());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(interner.kind(withOff), TypeKind::Struct);
+    EXPECT_TRUE(interner.hasExplicitOffsets(withOff));
+    EXPECT_EQ(interner.explicitFieldOffset(withOff, 0), std::optional<std::uint64_t>{0});
+    EXPECT_EQ(interner.explicitFieldOffset(withOff, 1), std::optional<std::uint64_t>{0});
+    EXPECT_EQ(interner.explicitFieldOffset(withOff, 2), std::optional<std::uint64_t>{4});
+
+    // Same name + same field types, NO offsets → a different interned type.
+    TypeId const noOff = parseTypeFromText(
+        "struct \"U\" { u64, u32, u32 }", interner, reg, rep);
+    ASSERT_TRUE(noOff.valid());
+    EXPECT_FALSE(interner.hasExplicitOffsets(noOff));
+    EXPECT_NE(withOff, noOff)
+        << "an explicit-offset struct must not alias its natural-layout twin";
+
+    // Re-parsing the SAME offset text canonicalizes to the SAME TypeId (the
+    // structs-block-vs-typedef collapse the field-scope injection relies on).
+    TypeId const withOff2 = parseTypeFromText(
+        "struct \"U\" { u64 @0, u32 @0, u32 @4 }", interner, reg, rep);
+    EXPECT_EQ(withOff, withOff2);
+
+    // A partial offset set (mix of `@` and none) is malformed, never a half-layout.
+    DiagnosticReporter repBad;
+    TypeId const mixed = parseTypeFromText(
+        "struct \"U\" { u64 @0, u32, u32 @4 }", interner, reg, repBad);
+    EXPECT_FALSE(mixed.valid());
+    EXPECT_GE(repBad.errorCount(), 1u);
+}
+
+// c107: the offset syntax ROUND-TRIPS through emit (a struct-returning fn signature
+// carries the struct text). emit → parse → emit is byte-identical, and the emitted
+// text spells `@4` — so a HIR text round-trip (verify-on-load / reintern) preserves
+// the overlapping layout instead of forking the TypeId.
+TEST(HirText, ExplicitFieldOffsetsRoundTrip) {
+    TypeInterner in{CompilationUnitId{1}};
+    std::array<TypeId, 3> const fields{
+        in.primitive(TypeKind::U64), in.primitive(TypeKind::U32),
+        in.primitive(TypeKind::U32)};
+    std::array<std::int64_t, 0> const noWidths{};
+    std::array<std::uint64_t, 3> const offs{0, 0, 4};
+    TypeId const ov = in.structType("U", fields, noWidths, offs);
+    TypeId const ptrOv = in.pointer(ov);
+    // A VOID fn TAKING ptr<overlap struct> — the struct text appears in the param
+    // list, and a void return lets the body be empty (no fall-through verifier trip).
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 1> const params{ptrOv};
+    TypeId const sig = in.fnSig(params, voidTy, CallConv::CcSysV);
+
+    HirBuilder b{"toy"};
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{});
+    HirNodeId const fn   = b.makeFunction(sig, /*symbol=*/1, {}, body);
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "main"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    DiagnosticReporter r;
+    std::string const text = emitHir(hir, ctx, r);
+    EXPECT_NE(text.find("u64 @0"), std::string::npos) << text;
+    EXPECT_NE(text.find("u32 @4"), std::string::npos) << text;
+    expectRoundTrip(hir, ctx);   // emit→parse→emit byte-identical (parse+emit symmetric)
 }

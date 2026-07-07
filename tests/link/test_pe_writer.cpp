@@ -483,6 +483,417 @@ TEST(PeExecFormatJson, ShippedFileLoadsCleanly) {
     EXPECT_EQ(oh.subsystem, 3u);                       // WINDOWS_CUI
 }
 
+TEST(PeExecFormatJson, ShippedPeExecIsDirectPlt) {
+    // D-FFI-PE-IMPORT-THUNK regression pin: pe64-x86_64-windows-exec was
+    // flipped indirect-slot→direct-plt this cycle. PE now points each
+    // extern symbol's VA at a synthesized `jmp *[IAT slot]` import THUNK
+    // (code, a .text address), so an indirect-slot call site (`FF 15`
+    // deref of the thunk's CODE bytes as a pointer) would be a latent
+    // crash. The shipped exec format MUST declare direct-plt; pin it so a
+    // revert to indirect-slot is caught on EVERY leg — the sqlite
+    // aSyscall[] address-taken-import crash had no non-Windows runtime to
+    // expose it. Mirrors MachOArm64Exit.ShippedX86DarwinExecIsDirectPlt.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.format->externCallDispatch().has_value());
+    EXPECT_TRUE(*loaded.format->externCallDispatch()
+                == ExternCallDispatch::DirectPlt);
+}
+
+TEST(PeExecWriter, AddressTakenImportResolvesToTextThunkNotIdataSlot) {
+    // D-FFI-PE-IMPORT-THUNK host-independent structural pin. The PE exec
+    // walker synthesizes one `FF 25 disp32` import thunk per extern at
+    // the tail of .text (the ELF-PLT / Mach-O-__stubs analog), and an
+    // extern reference resolves to the THUNK (a .text code address), NOT
+    // the .idata IAT data slot. RED-on-disable: drop the pe.cpp thunk
+    // emission (or flip the format back to indirect-slot) → the reference
+    // resolves to .idata and no FF 25 thunk exists → these assertions
+    // fail on EVERY leg (the sqlite 0xC0000005 had no host-independent
+    // guard). Recomputes the two-hop call→thunk→IAT from the emitted
+    // section VAs, so an encoder divergence is loud.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    // main: `E8 <rel32> C3` = call the extern, then ret. The rel32 patch
+    // site is at function offset 1; the reloc targets the extern symbol.
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    fn.relocations.push_back(
+        Relocation{/*offset=*/1, SymbolId{99}, RelocationKind{1},
+                   /*addend=*/0});
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "puts", "msvcrt.dll"});
+
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(img.empty());
+
+    auto const [textRva, textPtr] =
+        findExecSection(img, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+    auto const [idataRva, idataPtr] =
+        findExecSection(img, {'.', 'i', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(textRva, 0u);
+    ASSERT_NE(idataRva, 0u);
+    (void)idataPtr;
+
+    // (1) The thunk sits at the tail of .text, right after the 6-byte
+    //     function body: `FF 25 disp32`.
+    std::size_t const thunkFileOff = static_cast<std::size_t>(textPtr) + 6u;
+    std::uint32_t const thunkRva   = textRva + 6u;
+    ASSERT_LT(thunkFileOff + 6u, img.size());
+    EXPECT_EQ(img[thunkFileOff + 0], 0xFFu) << "import thunk opcode byte 0";
+    EXPECT_EQ(img[thunkFileOff + 1], 0x25u)
+        << "import thunk opcode byte 1 (jmp [rip+disp32])";
+
+    // (2) The thunk jumps THROUGH the extern's IAT slot: its rip-relative
+    //     disp32 target lands in .idata (the loader-patched FirstThunk).
+    auto const thunkDisp =
+        static_cast<std::int32_t>(readU32LE(img, thunkFileOff + 2u));
+    std::int64_t const iatTargetRva =
+        static_cast<std::int64_t>(thunkRva) + 6 + thunkDisp;
+    EXPECT_GE(iatTargetRva, static_cast<std::int64_t>(idataRva))
+        << "import thunk must jump through the .idata IAT slot "
+           "(thunkRva=0x" << std::hex << thunkRva
+        << " disp=" << std::dec << thunkDisp << ")";
+
+    // (3) THE FIX: the extern CALL resolves to the .text THUNK, NOT the
+    //     .idata data slot. `E8 disp32` at function offset 0; target =
+    //     (funcRva + 5) + disp32 must equal the thunk RVA (in .text). A
+    //     revert points it at the .idata IAT slot → `call` into data →
+    //     the sqlite 0xC0000005.
+    auto const callDisp =
+        static_cast<std::int32_t>(readU32LE(img, textPtr + 1u));
+    std::int64_t const callTargetRva =
+        static_cast<std::int64_t>(textRva) + 5 + callDisp;
+    EXPECT_EQ(callTargetRva, static_cast<std::int64_t>(thunkRva))
+        << "extern call must resolve to the .text import thunk (0x"
+        << std::hex << thunkRva << "), not the .idata IAT slot";
+    EXPECT_LT(callTargetRva, static_cast<std::int64_t>(idataRva))
+        << "extern call target must be in .text (< .idata RVA)";
+}
+
+TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
+    // D-WIN64-PDATA-XDATA-UNWIND host-independent structural pin. A pe64
+    // function carrying a FrameUnwindInfo (frame alloc + callee-saves) gets
+    // a .pdata RUNTIME_FUNCTION + a .xdata UNWIND_INFO, and the EXCEPTION
+    // data directory (index 3) points at .pdata. Also pins the c114 FPR
+    // decision: a saved FPR (MS-x64 xmm6..15, spilled low-64 via MOVSD) is
+    // OMITTED from the unwind codes (no matching UWOP; RSP-irrelevant) while
+    // its 8-byte store STILL advances the following GPR saves' CodeOffsets.
+    //
+    // Frame 0x20 (ALLOC_SMALL slots=4) + prologue-order saves
+    // [xmm6@0, rbx@8, rbp@16]; the `mov` cursor starts at allocLen=7 (sub
+    // rsp,imm32) then +8 per store: xmm6→15 (omitted), rbx→23, rbp→31.
+    // RED-on-disable: reverting the FPR-omit to the old fail-loud makes
+    // encode() report an error; mis-passing the DSS ordinal (30) for xmm6
+    // instead of its hwEncoding (6) makes its width 9 → rbx CodeOffset 24,
+    // not 23; dropping the emission entirely removes .pdata/.xdata. Runs on
+    // every leg (pure byte inspection, no execution).
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    // sub rsp, 0x20 (48 81 EC 20 00 00 00) ; ret (C3) — first byte 0x48
+    // satisfies the prologue-shape guard; the rest is opaque to the builder.
+    fn.bytes = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3};
+    FrameUnwindInfo ui;
+    ui.totalFrameSize      = 0x20;
+    ui.usesStackProbe      = false;
+    ui.stackProbePageBytes = 0;
+    ui.savedRegs = {
+        FrameSavedReg{/*regEncoding=*/6, /*isFpr=*/true,  /*saveOffset=*/0},
+        FrameSavedReg{/*regEncoding=*/3, /*isFpr=*/false, /*saveOffset=*/8},
+        FrameSavedReg{/*regEncoding=*/5, /*isFpr=*/false, /*saveOffset=*/16},
+    };
+    fn.unwind = std::move(ui);
+    mod.functions.push_back(std::move(fn));
+
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);   // the FPR save no longer fails loud
+    ASSERT_FALSE(img.empty());
+
+    auto const [textRva, textPtr] =
+        findExecSection(img, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+    auto const [pdataRva, pdataPtr] =
+        findExecSection(img, {'.', 'p', 'd', 'a', 't', 'a', 0, 0});
+    auto const [xdataRva, xdataPtr] =
+        findExecSection(img, {'.', 'x', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(textRva, 0u);
+    ASSERT_NE(pdataRva, 0u) << ".pdata section must exist";
+    ASSERT_NE(xdataRva, 0u) << ".xdata section must exist";
+
+    // (1) The EXCEPTION data directory (index 3 → file 0x108 + 3*8 = 0x120)
+    //     points at .pdata, size = one 12-byte RUNTIME_FUNCTION.
+    EXPECT_EQ(readU32LE(img, 0x120), pdataRva) << "EXCEPTION dir RVA -> .pdata";
+    EXPECT_EQ(readU32LE(img, 0x124), 12u)      << "EXCEPTION dir size = 1 entry";
+
+    // (2) The RUNTIME_FUNCTION covers the function and points at its .xdata.
+    EXPECT_EQ(readU32LE(img, pdataPtr + 0u), textRva)      << "BeginAddress";
+    EXPECT_EQ(readU32LE(img, pdataPtr + 4u), textRva + 8u) << "EndAddress";
+    EXPECT_EQ(readU32LE(img, pdataPtr + 8u), xdataRva)     << "UnwindInfoAddress";
+
+    // (3) The UNWIND_INFO, byte-for-byte. Header: Ver=1/Flags=0, SizeOfProlog
+    //     = 31, CountOfCodes = 5 (2 GPR saves ×2 nodes + 1 ALLOC_SMALL) — NOT
+    //     7 (the xmm6 save contributes NO code), FrameReg/Off = 0. Codes are
+    //     DESCENDING by CodeOffset: rbp(31), rbx(23), then ALLOC(7).
+    std::size_t const u = xdataPtr;
+    EXPECT_EQ(img[u + 0], 0x01u) << "Version=1, Flags=0";
+    EXPECT_EQ(img[u + 1], 31u)   << "SizeOfProlog";
+    EXPECT_EQ(img[u + 2], 5u)    << "CountOfCodes: xmm6 omitted (else 7)";
+    EXPECT_EQ(img[u + 3], 0x00u) << "FrameRegister=0, FrameOffset=0";
+    // rbp: UWOP_SAVE_NONVOL(4) | reg 5<<4 = 0x54, CodeOffset 31, node 16/8=2.
+    EXPECT_EQ(img[u + 4], 31u)   << "rbp CodeOffset";
+    EXPECT_EQ(img[u + 5], 0x54u) << "rbp SAVE_NONVOL | reg=5";
+    EXPECT_EQ(readU16LE(img, u + 6), 2u) << "rbp scaled offset 16/8";
+    // rbx: 0x34, CodeOffset 23 (proves xmm6's store advanced the cursor by
+    // 8, not 9 — hwEncoding 6, not the ordinal 30), node 8/8=1.
+    EXPECT_EQ(img[u + 8], 23u)   << "rbx CodeOffset (xmm6 width was 8)";
+    EXPECT_EQ(img[u + 9], 0x34u) << "rbx SAVE_NONVOL | reg=3";
+    EXPECT_EQ(readU16LE(img, u + 10), 1u) << "rbx scaled offset 8/8";
+    // ALLOC_SMALL(2) | (slots-1=3)<<4 = 0x32, CodeOffset 7 (end of sub rsp).
+    EXPECT_EQ(img[u + 12], 7u)    << "ALLOC CodeOffset";
+    EXPECT_EQ(img[u + 13], 0x32u) << "ALLOC_SMALL | (slots-1)=3";
+}
+
+TEST(PeExecWriter, FunctionUnwindInfoStackProbePrologueUsesFixedAllocLen) {
+    // D-WIN64-PDATA-XDATA-UNWIND + D-WIN64-LARGE-FRAME-STACK-PROBE. A pe64
+    // function whose frame exceeds one guard page emits the inline page-probe
+    // prologue (mov r11d,frame / <28-B runtime loop> / sub rsp,r11), which is a
+    // FIXED 37 bytes — the loop ITERATES at runtime, it is NOT unrolled per
+    // page. The unwind builder's `allocLen` for the probe path must be that
+    // fixed 37 (kStackProbeLoopBytes), so SizeOfProlog + every CodeOffset stay
+    // pinned to the real instruction boundaries.
+    //
+    // RED-on-disable: the c114 audit caught a drifted `9 + 28*pages + 3`
+    // formula here → for this 8192-B frame (pages=2) it computed allocLen 68,
+    // putting SizeOfProlog at 84 and the saves' CodeOffsets at 76/84 — 31 bytes
+    // past the real prologue → a silently-wrong table RtlVirtualUnwind would
+    // mis-read. This test fails on that formula and passes only on the fixed 37.
+    // The prior (small-frame) unwind test exercises only the `sub rsp,imm32`
+    // (allocLen 7) path, so this is the path that was untested.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    // The probe prologue's first byte is 0x41 (mov r11d,imm) — the builder's
+    // prologue-shape guard checks exactly that; the rest of the body is opaque.
+    fn.bytes = {0x41, 0xBB, 0x00, 0x20, 0x00, 0x00, 0xC3, 0x90};
+    FrameUnwindInfo ui;
+    ui.totalFrameSize      = 0x2000;   // 8192 B = 2 guard pages → ALLOC_LARGE
+    ui.usesStackProbe      = true;
+    ui.stackProbePageBytes = 4096;
+    ui.savedRegs = {
+        FrameSavedReg{/*regEncoding=*/3, /*isFpr=*/false, /*saveOffset=*/0},
+        FrameSavedReg{/*regEncoding=*/6, /*isFpr=*/false, /*saveOffset=*/8},
+    };
+    fn.unwind = std::move(ui);
+    mod.functions.push_back(std::move(fn));
+
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    auto const [xdataRva, xdataPtr] =
+        findExecSection(img, {'.', 'x', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(xdataRva, 0u);
+
+    // allocLen = 37 (0x25). Saves ride from there: rbx CodeOffset 37+8=45,
+    // rsi 45+8=53; SizeOfProlog = 53. ALLOC_LARGE (frame>128, slots=1024) →
+    // opinfo 0, one u16 node = 1024. CountOfCodes = 2+2+2 = 6.
+    std::size_t const w = xdataPtr;
+    EXPECT_EQ(img[w + 0], 0x01u) << "Version=1, Flags=0";
+    EXPECT_EQ(img[w + 1], 53u)   << "SizeOfProlog = 37 (fixed probe) + 8 + 8";
+    EXPECT_EQ(img[w + 2], 6u)    << "CountOfCodes: 2 saves*2 + ALLOC_LARGE 2";
+    EXPECT_EQ(img[w + 3], 0x00u) << "FrameRegister=0";
+    // rsi (highest CodeOffset first): SAVE_NONVOL(4) | reg 6<<4 = 0x64, off 53.
+    EXPECT_EQ(img[w + 4], 53u)   << "rsi CodeOffset (probe was 37, not 68)";
+    EXPECT_EQ(img[w + 5], 0x64u) << "rsi SAVE_NONVOL | reg=6";
+    EXPECT_EQ(readU16LE(img, w + 6), 1u);
+    // rbx: 0x34, CodeOffset 45 = 37 + 8.
+    EXPECT_EQ(img[w + 8], 45u)   << "rbx CodeOffset = 37 + 8";
+    EXPECT_EQ(img[w + 9], 0x34u) << "rbx SAVE_NONVOL | reg=3";
+    EXPECT_EQ(readU16LE(img, w + 10), 0u);
+    // ALLOC_LARGE(1) | opinfo 0 = 0x01, CodeOffset 37 (0x25), u16 node = 1024.
+    EXPECT_EQ(img[w + 12], 37u)   << "ALLOC CodeOffset = fixed probe length";
+    EXPECT_EQ(img[w + 13], 0x01u) << "ALLOC_LARGE | opinfo 0";
+    EXPECT_EQ(readU16LE(img, w + 14), 1024u) << "frame/8 = 8192/8";
+}
+
+TEST(PeExecWriter, SehScopeTableEmitsEhandlerFlagAndScopeRecord) {
+    // c116 (D-WIN64-SEH-FUNCLETS) host-independent
+    // structural pin. A function carrying a FrameUnwindInfo with a non-empty
+    // `sehScopes` gets:
+    //   (1) UNW_FLAG_EHANDLER in its UNWIND_INFO byte0 (0x01 → 0x09);
+    //   (2) after the DWORD-aligned unwind codes: a u32 handler RVA (the
+    //       __C_specific_handler THUNK RVA) + a SCOPE_TABLE {u32 Count;
+    //       Record[]{Begin, End, Handler(=filter funclet RVA), JumpTarget}}.
+    // The scope's Begin/End/JumpTarget are the parent function's RVA + the
+    // SehScopeEntry byte offsets; Handler is the filter funclet FUNCTION's RVA;
+    // the handler field is the personality import's thunk RVA (a .text address).
+    //
+    // RED-on-disable: reverting the EHANDLER byte leaves byte0 at 0x01; dropping
+    // the scope-table emission removes the trailing handler RVA + records (the
+    // .xdata blob is then just the codes). A funclet whose symbol has no function
+    // RVA fails loud.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    // Function 0: the PARENT — sub rsp,0x20 (frame) then ret. One SEH scope over
+    // a guarded body at [begin=0x08, end=0x10) with a handler block at 0x18. The
+    // filter is function 1; the personality is the __C_specific_handler extern.
+    AssembledFunction parent;
+    parent.symbol = SymbolId{1};
+    parent.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3,   // 0..7
+                     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,   // 8..15
+                     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,   // 16..23
+                     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xC3};  // 24..31
+    {
+        FrameUnwindInfo ui;
+        ui.totalFrameSize = 0x20;
+        SehScopeEntry sc;
+        sc.beginByteOffset      = 0x08;
+        sc.endByteOffset        = 0x10;
+        sc.jumpTargetByteOffset = 0x18;
+        sc.filterFuncletSymbol  = SymbolId{2};   // function 1
+        sc.personalitySymbol    = SymbolId{3};   // the extern
+        ui.sehScopes.push_back(sc);
+        parent.unwind = std::move(ui);
+    }
+    mod.functions.push_back(std::move(parent));
+    // Function 1: the FILTER FUNCLET — a trivial `xor eax,eax; ret`. It carries a
+    // frame so it gets its own (EHANDLER-less) UNWIND_INFO; the scope table's
+    // Handler points at its function RVA.
+    AssembledFunction funclet;
+    funclet.symbol = SymbolId{2};
+    funclet.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3};
+    {
+        FrameUnwindInfo ui;
+        ui.totalFrameSize = 0x20;
+        funclet.unwind = std::move(ui);
+    }
+    mod.functions.push_back(std::move(funclet));
+    // The __C_specific_handler personality import (SEH-gated — synthesized on
+    // demand, exactly as the SEH pass does). A real msvcrt.dll export.
+    mod.externImports.push_back(
+        ExternImport{SymbolId{3}, "__C_specific_handler", "msvcrt.dll",
+                     /*isData=*/false});
+
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(img.empty());
+
+    auto const [textRva, textPtr] =
+        findExecSection(img, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+    auto const [xdataRva, xdataPtr] =
+        findExecSection(img, {'.', 'x', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(textRva, 0u);
+    ASSERT_NE(xdataRva, 0u) << ".xdata section must exist";
+
+    // The parent (function 0) is first in .text, so its RVA == textRva; its
+    // UNWIND_INFO is the first .xdata blob (xdataPtr). The funclet (function 1)
+    // follows the parent in .text: parent is 32 bytes → funclet RVA = textRva+32.
+    std::uint32_t const parentRva  = textRva;
+    std::uint32_t const funcletRva = textRva + 32u;
+
+    // (1) UNW_FLAG_EHANDLER: byte0 = 0x09 (Version 1 | Flags(1)<<3), NOT 0x01.
+    std::size_t const u = xdataPtr;
+    EXPECT_EQ(img[u + 0], 0x09u) << "UNW_FLAG_EHANDLER set (else 0x01)";
+    EXPECT_EQ(img[u + 1], 7u)    << "SizeOfProlog (sub rsp,imm32)";
+    EXPECT_EQ(img[u + 2], 1u)    << "CountOfCodes: 1 ALLOC_SMALL node";
+    // (2) After the header (4B) + 1 code node (2B), DWORD-aligned → 8 bytes. Then:
+    //     [8]  u32 handler RVA (the __C_specific_handler thunk — a .text address)
+    //     [12] u32 scope Count = 1
+    //     [16] Begin, [20] End, [24] Handler, [28] JumpTarget
+    std::uint32_t const handlerThunkRva = readU32LE(img, u + 8);
+    EXPECT_GE(handlerThunkRva, textRva) << "handler field is a .text thunk RVA";
+    EXPECT_EQ(readU32LE(img, u + 12), 1u) << "scope Count = 1";
+    EXPECT_EQ(readU32LE(img, u + 16), parentRva + 0x08u) << "Begin = parent+0x08";
+    EXPECT_EQ(readU32LE(img, u + 20), parentRva + 0x10u) << "End = parent+0x10";
+    EXPECT_EQ(readU32LE(img, u + 24), funcletRva)        << "Handler = funclet RVA";
+    EXPECT_EQ(readU32LE(img, u + 28), parentRva + 0x18u) << "JumpTarget = parent+0x18";
+}
+
+TEST(PeExecWriter, SehGuardingFunctionSavingNonVolatileXmmFailsLoud) {
+    // c116 (D-WIN64-XMM-UNWIND-RESTORE, the H5 invariant): a __try-guarding
+    // function (non-empty sehScopes) that spills a NON-VOLATILE xmm must FAIL
+    // LOUD, not silently emit an unwind table that omits UWOP_SAVE_XMM128 — the
+    // __except handler resumes in the parent frame and could read an unrestored
+    // xmm. sqlite's WAL SEH functions spill zero non-volatile xmm (the H5 proof),
+    // so this never fires for the shipped corpus; the guard converts that proof
+    // into an ENFORCED invariant. RED-on-disable: drop the guardsSeh arm in
+    // pe.cpp buildFunctionUnwindInfo → the FPR save is silently omitted (as it
+    // legitimately is for a NON-SEH function) → this function encodes cleanly and
+    // ships a broken unwind table. The paired negative (a NON-SEH function with
+    // the same xmm save encodes fine) is the FunctionUnwindInfoEmitsPdata... test
+    // above (xmm6 omitted, no error).
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    // Same parent shape as the scope-table test, but its prologue ALSO saves a
+    // non-volatile xmm (xmm6). sub rsp,0x20 (7B) then movsd [rsp],xmm6 — the
+    // bytes past [0] are opaque to the unwind builder (it reads the FrameUnwindInfo).
+    AssembledFunction parent;
+    parent.symbol = SymbolId{1};
+    parent.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00,          // sub rsp,0x20
+                     0xF2, 0x0F, 0x11, 0x34, 0x24,                      // movsd [rsp],xmm6
+                     0x90, 0x90, 0x90, 0xC3};
+    {
+        FrameUnwindInfo ui;
+        ui.totalFrameSize = 0x20;
+        ui.savedRegs = { FrameSavedReg{/*regEncoding=*/6, /*isFpr=*/true,
+                                       /*saveOffset=*/0} };   // xmm6 — non-volatile
+        SehScopeEntry sc;
+        sc.beginByteOffset      = 0x0C;
+        sc.endByteOffset        = 0x0F;
+        sc.jumpTargetByteOffset = 0x0F;
+        sc.filterFuncletSymbol  = SymbolId{2};
+        sc.personalitySymbol    = SymbolId{3};
+        ui.sehScopes.push_back(sc);
+        parent.unwind = std::move(ui);
+    }
+    mod.functions.push_back(std::move(parent));
+    AssembledFunction funclet;
+    funclet.symbol = SymbolId{2};
+    funclet.bytes  = {0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, 0xC3};
+    { FrameUnwindInfo ui; ui.totalFrameSize = 0x20; funclet.unwind = std::move(ui); }
+    mod.functions.push_back(std::move(funclet));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{3}, "__C_specific_handler", "msvcrt.dll",
+                     /*isData=*/false});
+
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_GT(rep.errorCount(), 0u)
+        << "a SEH-guarding function saving a non-volatile xmm must fail loud "
+           "(D-WIN64-XMM-UNWIND-RESTORE), not silently omit its restore";
+}
+
 TEST(PeExecWriter, DosHeaderMzSignature) {
     auto loaded = loadShippedExec();
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
@@ -976,15 +1387,34 @@ TEST(PeExecWriter, ExternImportProducesIDataSectionAndPatchesReloc) {
         EXPECT_EQ(bytes[idataFileOff + 20 + i], 0u);
     }
 
-    // REL32 patched in .text: value = iatDirRva - 0x1001 - 4.
+    // Under direct-plt (D-FFI-PE-IMPORT-THUNK) the extern call resolves
+    // to the .text import THUNK (right after the 6-byte function body),
+    // NOT the IAT slot directly. `E8 disp32` at text RVA 0x1000; target
+    // = (textRva + 5) + disp32 == the thunk RVA (textRva + 6 = function
+    // end). The thunk (`FF 25 disp32`) then jumps through the IAT slot
+    // (iatDirRva) — the two-hop that makes an address-taken import
+    // callable and retires the sqlite aSyscall[] crash.
     constexpr std::size_t kFirstSecHdr = 0x188;
+    std::uint32_t const textRva =
+        readU32LE(bytes, kFirstSecHdr + 12);
     std::uint32_t const textFileOff =
         readU32LE(bytes, kFirstSecHdr + 20);
-    std::int32_t const expected =
-        static_cast<std::int32_t>(iatDirRva) - 0x1001 - 4;
-    EXPECT_EQ(readU32LE(bytes, textFileOff + 1),
-              static_cast<std::uint32_t>(expected));
+    std::uint32_t const thunkRva = textRva + 6u;
+    auto const callDisp =
+        static_cast<std::int32_t>(readU32LE(bytes, textFileOff + 1));
+    EXPECT_EQ(static_cast<std::int64_t>(textRva) + 5 + callDisp,
+              static_cast<std::int64_t>(thunkRva))
+        << "extern call must resolve to the .text import thunk, not the "
+           "IAT slot";
     EXPECT_EQ(bytes[textFileOff + 5], 0xC3u);
+    // The thunk `FF 25 disp32` jumps through the IAT slot.
+    EXPECT_EQ(bytes[textFileOff + 6], 0xFFu);
+    EXPECT_EQ(bytes[textFileOff + 7], 0x25u);
+    auto const thunkDisp =
+        static_cast<std::int32_t>(readU32LE(bytes, textFileOff + 8));
+    EXPECT_EQ(static_cast<std::int64_t>(thunkRva) + 6 + thunkDisp,
+              static_cast<std::int64_t>(iatDirRva))
+        << "import thunk must jump through the IAT slot";
 }
 
 TEST(PeExecWriter, IDataContainsExitProcessNameAndKernel32DllName) {
@@ -1142,10 +1572,11 @@ TEST(PeExecWriter, MultipleLibrariesEachWithOneExtern) {
 }
 
 TEST(PeExecWriter, MixedExternAndIntraModuleCallInOneFunction) {
-    // test-analyzer #3: one function with TWO relocations — one
-    // to an intra-module function (resolves to .text VA) and one
-    // to an extern (resolves to .idata IAT slot VA). The shared
-    // symbolVa kernel must dispatch both correctly.
+    // test-analyzer #3: one function with TWO relocations — one to an
+    // intra-module function (resolves to its .text VA) and one to an
+    // extern (resolves to the extern's .text import THUNK under direct-
+    // plt, D-FFI-PE-IMPORT-THUNK — the thunk then jumps through the
+    // .idata IAT slot). The shared symbolVa kernel dispatches both.
     auto loaded = loadShippedExec();
     AssembledModule mod;
     mod.expectedFuncCount = 2;
@@ -1179,12 +1610,27 @@ TEST(PeExecWriter, MixedExternAndIntraModuleCallInOneFunction) {
     std::uint32_t const textFileOff =
         readU32LE(bytes, kFirstSecHdr + 20);
     EXPECT_EQ(readU32LE(bytes, textFileOff + 1), 6u);
-    // Extern call: patches to iatDirRva - 0x1006 - 4.
+    // Extern call (direct-plt, D-FFI-PE-IMPORT-THUNK): resolves to the
+    // .text import THUNK — the single extern's thunk sits after BOTH
+    // function bodies (f0 11B + f1 1B = text offset 12). `E8 disp32` at
+    // f0 offset 5; target = (textRva + 10) + disp == thunkRva (textRva +
+    // 12), NOT the IAT slot (a `call` into .idata data → the sqlite
+    // crash). The thunk then jumps through the IAT slot.
+    std::uint32_t const textRva = readU32LE(bytes, kFirstSecHdr + 12);
+    std::uint32_t const thunkRva = textRva + 12u;
+    auto const externDisp =
+        static_cast<std::int32_t>(readU32LE(bytes, textFileOff + 6));
+    EXPECT_EQ(static_cast<std::int64_t>(textRva) + 10 + externDisp,
+              static_cast<std::int64_t>(thunkRva))
+        << "extern call must resolve to the .text import thunk";
     std::uint32_t const iatDirRva = readU32LE(bytes, 0x108 + 12*8);
-    std::int32_t const expectedExtern =
-        static_cast<std::int32_t>(iatDirRva) - 0x1006 - 4;
-    EXPECT_EQ(readU32LE(bytes, textFileOff + 6),
-              static_cast<std::uint32_t>(expectedExtern));
+    EXPECT_EQ(bytes[textFileOff + 12], 0xFFu);
+    EXPECT_EQ(bytes[textFileOff + 13], 0x25u);
+    auto const thunkDisp =
+        static_cast<std::int32_t>(readU32LE(bytes, textFileOff + 14));
+    EXPECT_EQ(static_cast<std::int64_t>(thunkRva) + 6 + thunkDisp,
+              static_cast<std::int64_t>(iatDirRva))
+        << "import thunk must jump through the IAT slot";
 }
 
 TEST(LinkerExternResolution, NeitherDefinedNorExternStillFailsLoud) {
@@ -1231,15 +1677,57 @@ TEST(LinkerExternResolution, EmptyMangledNameRejected) {
     EXPECT_GT(rep.errorCount(), 0u);
 }
 
-TEST(LinkerExternResolution, EmptyLibraryPathRejected) {
+// c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS) UPDATED CONTRACT: an empty
+// libraryPath is no longer an unconditional structural reject — it is the
+// bare-prototype cross-TU reference (no library ON PURPOSE), and the linker
+// applies ld's rule on the post-merge module:
+//   * REFERENCED (a reloc targets it) + unbound ⇒ K_SymbolUndefined NAMING
+//     the symbol, no bytes emitted (the first arm below);
+//   * UNREFERENCED + unbound ⇒ the row is DROPPED and the link proceeds
+//     (the second arm) — a declared-but-never-called prototype is dead
+//     surface, and a leaked row would emit a broken empty-named
+//     IMAGE_IMPORT_DESCRIPTOR.
+// (Pre-c86 both arms hard-failed with an internal "empty libraryPath"
+// wording that never named the symbol.)
+TEST(LinkerExternResolution, EmptyLibraryPathReferencedIsUndefinedSymbol) {
     auto loaded = loadShippedExec();
-    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    // call rel32 through the extern's SymbolId — the extern IS referenced.
+    AssembledModule mod = makeTrivialModule({0xE8,0,0,0,0, 0xC3}, 1);
+    Relocation rel;
+    rel.offset = 1;
+    rel.target = SymbolId{99};
+    rel.kind   = RelocationKind{1};
+    mod.functions[0].relocations.push_back(rel);
     mod.externImports.push_back(
         ExternImport{SymbolId{99}, "ExitProcess", ""});
     DiagnosticReporter rep;
     LinkedImage img = linker::link(mod, *loaded.target, *loaded.format, rep);
     EXPECT_TRUE(img.bytes.empty());
-    EXPECT_GT(rep.errorCount(), 0u);
+    bool sawNamedUndefined = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_SymbolUndefined
+            && d.actual.find("undefined symbol 'ExitProcess'") != std::string::npos) {
+            sawNamedUndefined = true;
+        }
+    }
+    EXPECT_TRUE(sawNamedUndefined)
+        << "a referenced unbound extern must reject LOUD, naming the symbol";
+}
+
+TEST(LinkerExternResolution, EmptyLibraryPathUnreferencedIsDropped) {
+    auto loaded = loadShippedExec();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);  // no relocs — unreferenced
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "ExitProcess", ""});
+    DiagnosticReporter rep;
+    LinkedImage img = linker::link(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "an unreferenced unbound extern must not fail the link";
+    EXPECT_FALSE(img.bytes.empty()) << "the image must still emit";
+    EXPECT_TRUE(img.ok());
+    EXPECT_EQ(std::count(img.externImportNames.begin(), img.externImportNames.end(),
+                         std::string{"ExitProcess"}), 0)
+        << "the dropped row must not reach the emitted import table";
 }
 
 TEST(LinkerExternResolution, DuplicateSymbolIdAcrossFunctionsAndExternsRejected) {

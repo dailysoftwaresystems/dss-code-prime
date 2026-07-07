@@ -497,6 +497,28 @@ private:
             }
             case MirOpcode::Unreachable:
                 break;
+            case MirOpcode::SehTryBegin: {
+                // c115 SEH: `seh_try_begin <region> %b<try> %b<filter>`.
+                auto succs = mir_.blockSuccessors(block);
+                out_ += std::format(" {}", mir_.instPayload(id));
+                if (succs.size() >= 2) {
+                    out_ += std::format(" %b{} %b{}", succs[0].v, succs[1].v);
+                }
+                break;
+            }
+            case MirOpcode::SehFilterReturn: {
+                // `seh_filter_return <region> %v<val> %b<handler>`.
+                auto operands = mir_.instOperands(id);
+                auto succs = mir_.blockSuccessors(block);
+                out_ += std::format(" {}", mir_.instPayload(id));
+                if (!operands.empty()) out_ += std::format(" %v{}", operands[0].v);
+                if (!succs.empty())    out_ += std::format(" %b{}", succs[0].v);
+                break;
+            }
+            case MirOpcode::SehTryEnd:
+                // `seh_try_end <region>` — the payload is the region id.
+                out_ += std::format(" {}", mir_.instPayload(id));
+                break;
             default: {
                 // Generic: render all operands.
                 auto operands = mir_.instOperands(id);
@@ -1397,6 +1419,36 @@ private:
             }
             case MirOpcode::Unreachable: {
                 builder_.addUnreachable();
+                break;
+            }
+            case MirOpcode::SehTryBegin: {
+                // c115 SEH: `seh_try_begin <region> %b<try> %b<filter>`.
+                Tok rTok = lex_.take();
+                std::uint32_t const region = parseNumber<std::uint32_t>(
+                    rTok.text, "seh region id");
+                std::uint32_t const t1 = parsePercentValue();
+                std::uint32_t const t2 = parsePercentValue();
+                builder_.addSehTryBegin(resolveBlockRef(t1), resolveBlockRef(t2),
+                                        region);
+                break;
+            }
+            case MirOpcode::SehFilterReturn: {
+                // `seh_filter_return <region> %v<val> %b<handler>`.
+                Tok rTok = lex_.take();
+                std::uint32_t const region = parseNumber<std::uint32_t>(
+                    rTok.text, "seh region id");
+                std::uint32_t const vSlot = parsePercentValue();
+                std::uint32_t const tgt   = parsePercentValue();
+                builder_.addSehFilterReturn(resolveValue(vSlot),
+                                            resolveBlockRef(tgt), region);
+                break;
+            }
+            case MirOpcode::SehTryEnd: {
+                // `seh_try_end <region>` — a payload-carrying 0-operand marker.
+                Tok rTok = lex_.take();
+                std::uint32_t const region = parseNumber<std::uint32_t>(
+                    rTok.text, "seh region id");
+                builder_.addInst(op, {}, InvalidType, region);
                 break;
             }
             default: {

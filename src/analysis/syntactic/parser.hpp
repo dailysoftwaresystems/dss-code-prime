@@ -35,6 +35,11 @@ struct DSS_EXPORT ParseResult {
     Tree                                    tree;
     std::vector<AmbiguousTypeNameCandidate> typeNameCandidates;
     std::vector<std::string>                globalTypeNames;
+    // c108 (D-PARSE-FLAT-CHAIN-WORK-LINEAR): total token-stream accesses (peek +
+    // advance, incl. speculative re-scans) the parse performed — the DETERMINISTIC
+    // total-work proxy that replaced a flaky wall-clock O(N²) guard. O(N) for a
+    // correct parse; a backtracking blowup makes it super-linear.
+    std::uint64_t                           tokenAccessCount = 0;
 };
 
 // How the dispatch loop's recovery sites behave when they see an

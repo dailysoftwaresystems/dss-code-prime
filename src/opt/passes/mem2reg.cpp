@@ -227,6 +227,27 @@ private:
 void Mem2RegPolicy::analyze(MirFuncId fn) {
     resetPerFunction();
 
+    // c115 SEH (D-WIN64-SEH-FUNCLETS): a function containing a __try region
+    // promotes NO allocas. The filter/handler execute after a FAULT at an
+    // arbitrary point in the guarded body — a promoted local's "current value"
+    // reaching the filter/handler would be an SSA name from the region ENTRY
+    // (the only CFG edge into the filter is at SehTryBegin), silently
+    // resurrecting pre-fault state where MSVC semantics demand the fault-time
+    // MEMORY value. Function-level is a deliberate over-approximation
+    // (correctness-safe; region-precise promotion is a perf refinement noted
+    // on the c116 anchor) — the cost is confined to the ~13 cold sqlite wal.c
+    // recovery functions. Mirrors MSVC, which also constrains optimization in
+    // SEH-containing functions.
+    for (std::uint32_t bi = 0; bi < src_.funcBlockCount(fn); ++bi) {
+        MirBlockId const b = src_.funcBlockAt(fn, bi);
+        std::uint32_t const n = src_.blockInstCount(b);
+        if (n == 0) continue;
+        if (src_.instOpcode(src_.blockInstAt(b, n - 1))
+            == MirOpcode::SehTryBegin) {
+            return;   // promoted_ stays empty → shouldEmit/tryRewrite = identity
+        }
+    }
+
     // CFG reachability: a block unreachable from `entry` cannot
     // contribute to any SSA computation. The rename DFS walks the
     // dom tree (which only spans reachable blocks); analysis must

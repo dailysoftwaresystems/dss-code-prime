@@ -259,6 +259,14 @@ public:
     // distinct object-format. Aborts if called after finish().
     void setActiveFormat(ObjectFormatKind fmt);
 
+    // c105 (D-PP-USER-DEFINE): declare the CLI `--define NAME[=VALUE]` entries
+    // (verbatim). Each lowers to a `#define` line in the preprocessor's
+    // synthetic "<command-line>" prologue — command-line macros are ORDINARY
+    // macros (gcc -D parity: #undef-able; C 6.10.3p2 duplicate policy; loud on
+    // a config-predefine collision). No-op for a language without a preprocess
+    // block. Aborts if called after finish().
+    void setUserDefines(std::vector<std::string> defines);
+
     // Single-use, rvalue-qualified (L6). The `finished_` latch catches the
     // `std::move(b).finish(); std::move(b).finish();` corner case — `std::move`
     // does not consume the lvalue, so a second rvalue-qualified call is
@@ -321,6 +329,7 @@ private:
     std::vector<std::filesystem::path>   includeDirs_;
     std::vector<std::filesystem::path>   systemDirs_;   // FF11 angle-include search path
     std::optional<ObjectFormatKind>      activeFormat_; // c9: per-target __has_include
+    std::vector<std::string>             userDefines_;  // c105: --define NAME[=VALUE]
     std::vector<TreeParseSidecar>        sidecars_;     // FC2; parallel to trees_
     // FC13: the C preprocessor's origin buffers (original main + every spliced
     // header), accumulated across every preprocessed file, handed to the CU as

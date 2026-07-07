@@ -1,0 +1,44 @@
+{
+  "$comment": "Neutral shipped <pwd.h> (POSIX) — c81 (the sqlite shell.c CLI route; shell.c:174 `#include <pwd.h>` under !_WIN32 && !__RTP__ && !_WRS_KERNEL && !SQLITE_WASI). Surface = exactly shell.c's use: `pwent=getpwuid(getuid())` -> `pwent->pw_dir` (~ tilde expansion of the home directory, shell.c:37705). ★ struct passwd is LAYOUT-CRITICAL: libc RETURNS a pointer to ITS OWN struct and the caller reads fields at the glibc offsets — a wrong field list is a silent misread, so the layout is verified against the REAL /usr/include/pwd.h in WSL (x86_64 AND the aarch64 cross headers — IDENTICAL, both LP64): pw_name char* @0, pw_passwd char* @8, pw_uid __uid_t(u32) @16, pw_gid __gid_t(u32) @20, pw_gecos char* @24, pw_dir char* @32, pw_shell char* @40 -> sizeof 48; the layout engine derives exactly these offsets from the field sizes (two adjacent u32s pack 16..24). getpwuid takes uid_t BY VALUE (u32 — sys/types.json's uid_t) and returns the struct pointer as ptr<void> per house style (time.json/localtime precedent: standard C void*->T* coercion keeps the layout out of the signature). uid_t itself is NOT re-shipped here — sys/types.json owns it (one canonical home; shell.c includes <sys/types.h>). ★ c117 (the macho shell.c CLI leg, user §B): the Darwin variant lands — struct passwd DIVERGES (10 fields, sizeof 72; verified against the real macOS SDK pwd.h on arm64-darwin): pw_name char* @0, pw_passwd char* @8, pw_uid uid_t(u32) @16, pw_gid gid_t(u32) @20, pw_change __darwin_time_t(i64) @24, pw_class char* @32, pw_gecos char* @40, pw_dir char* @48, pw_shell char* @56, pw_expire __darwin_time_t(i64) @64 — the pw_change/pw_class insertion after pw_gid pushes the shell.c-read pw_dir to @48 (vs the glibc @32), so a single layout would silently misread the home directory (the c15c same-layout-swap class). getpwuid is a plain libSystem export (the header [elf,macho] gate covers it). libc symbols verified: getpwuid@GLIBC_2.2.5 (libc.so.6) / _getpwuid (libSystem).",
+  "header": "pwd.h",
+  "standard": "posix",
+  "availableObjectFormats": ["elf", "macho"],
+  "library": { "elf": "libc.so.6", "macho": "/usr/lib/libSystem.B.dylib" },
+  "symbols": [
+    { "name": "getpwuid", "signature": "fn(u32) -> ptr<void>", "kind": "function", "linkage": "external" }
+  ],
+  "structs": [
+    {
+      "name": "passwd",
+      "variants": [
+        {
+          "when": { "format": "elf" },
+          "fields": [
+            { "name": "pw_name",   "type": "ptr<char>" },
+            { "name": "pw_passwd", "type": "ptr<char>" },
+            { "name": "pw_uid",    "type": "u32" },
+            { "name": "pw_gid",    "type": "u32" },
+            { "name": "pw_gecos",  "type": "ptr<char>" },
+            { "name": "pw_dir",    "type": "ptr<char>" },
+            { "name": "pw_shell",  "type": "ptr<char>" }
+          ]
+        },
+        {
+          "when": { "format": "macho" },
+          "fields": [
+            { "name": "pw_name",   "type": "ptr<char>" },
+            { "name": "pw_passwd", "type": "ptr<char>" },
+            { "name": "pw_uid",    "type": "u32" },
+            { "name": "pw_gid",    "type": "u32" },
+            { "name": "pw_change", "type": "i64" },
+            { "name": "pw_class",  "type": "ptr<char>" },
+            { "name": "pw_gecos",  "type": "ptr<char>" },
+            { "name": "pw_dir",    "type": "ptr<char>" },
+            { "name": "pw_shell",  "type": "ptr<char>" },
+            { "name": "pw_expire", "type": "i64" }
+          ]
+        }
+      ]
+    }
+  ]
+}

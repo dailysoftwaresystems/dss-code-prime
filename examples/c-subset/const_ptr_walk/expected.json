@@ -1,0 +1,16 @@
+{
+  "$comment": "c36 D-CSUBSET-MUTABLE-POINTER-TO-CONST: a `const int *p` walks an array via `p++` (the sqlite zFormat+=4 / zDate++ shape). The const qualifies the POINTEE, not the pointer OBJECT, so advancing `p` is legal. RED-ON-DISABLE: pre-c36 the coarse whole-decl const scan marked `p` const → `p++` was a spurious S_ConstViolation → this would not COMPILE; compile is the pin, exit 42 confirms the walk derefs the right slots. Uses int (32-bit) ops only (sub-32-bit ALU is a separate deferred gap) and p++ (NOT binary p+n, whose element stride is separately flagged). Release pipeline + all 4 targets.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

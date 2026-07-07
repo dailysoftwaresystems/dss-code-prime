@@ -425,22 +425,15 @@ enum class DiagnosticCode : std::uint16_t {
     // not yet model `const` — anchored as D-CSUBSET-INCDEC-CONST-LVALUE, shared
     // with the same gap on plain assignment.) Positioned at the ++/-- expression.
     S_IncDecNeedsModifiableLvalue = 0xE024,
-    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a type-name that forms a POINTER-TO-
-    // VOLATILE-POINTEE (`volatile int *p` — a head-position volatile qualifier
-    // FOLLOWED by ≥1 pointer star). Model B threads `volatile` as a per-symbol/
-    // member `isVolatile` bool (the access's own Load/Store gets MirInstFlags::
-    // Volatile); it CANNOT express pointee-volatile (the volatility rides the
-    // DEREFERENCED access, which needs type-level cv-tracking — model A, deferred
-    // to D-CSUBSET-VOLATILE-POINTEE / c22). Rejecting at the type-name level — at
-    // BOTH the per-declarator typing arm (head volatile + declarator star) AND the
-    // co-located pointer arm (head volatile BEFORE the first star) — makes the
-    // fail-loud COMPLETE BY CONSTRUCTION: no pointer-to-volatile-pointee TYPE can
-    // be built, so no Deref can silently drop the flag (a silent miscompile). East
-    // `int * volatile p` (the POINTER OBJECT is volatile) is ACCEPTED — that
-    // volatility is the Load of `p` itself at the ref site, which model B threads.
-    // Config-driven: the reject keys off the language's `volatileMarker` +
-    // configured pointer token, never a hardcoded keyword/`*`. Unsuppressable
-    // (silent-miscompile guard).
+    // RETIRED by c27 (D-CSUBSET-VOLATILE-POINTEE, 2026-06-27): formerly the
+    // pointer-to-volatile-POINTEE reject (`volatile int *p`) under c21's model B,
+    // which threaded `volatile` as a per-symbol `isVolatile` bool and could not
+    // express a volatile pointee. c27 makes `volatile` a TYPE qualifier
+    // (TypeKind::VolatileQual): `volatile int *` now builds Ptr<VolatileQual(int)>
+    // and the deref carries MirInstFlags::Volatile from the pointee type — so this
+    // code is NEVER EMITTED anymore (and was removed from kUnsuppressableCodes). The
+    // enum value + name are KEPT for ordinal stability and historical golden
+    // references; do not reuse the ordinal.
     S_VolatilePointeeNotSupported = 0xE025,
     // D-CSUBSET-SELF-REFERENTIAL-STRUCT: a DIRECT (non-pointer) member of an
     // INCOMPLETE composite type — `struct N { struct N n; }` (a struct cannot
@@ -451,6 +444,32 @@ enum class DiagnosticCode : std::uint16_t {
     // Positioned at the offending member. Without it a self-by-value member would
     // silently fold its size to 0 (a silent miscompile).
     S_IncompleteTypeMember        = 0xE026,
+    // c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME: a TYPE-NAME position (a
+    // cast / sizeof / compound-literal / va_arg type — C 6.7.7 type-name) whose
+    // abstract declarator illegally carries a NAME: `(int x)expr`, `sizeof(int
+    // y)`. C type-names are ABSTRACT (declarator without an identifier); a named
+    // one is a constraint violation. The INVERSE of S_DeclarationDeclaresNothing
+    // (which fires when a NAME is required but absent); fired by the type-name
+    // resolver when an abstract declarator (the fn-ptr/array type-name tail)
+    // resolves to a name: the resolver returns InvalidType UNCONDITIONALLY (only
+    // the emit is gated by emitOnMiss; the reject is not), so the name is NEVER
+    // silently dropped and mis-parsed as the bare base type (`(int x)` → `(int)`).
+    S_TypeNameDeclaratorNotAbstract = 0xE027,
+    // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: an OBJECT (a variable / global,
+    // NOT a member) declared with an INCOMPLETE composite type by VALUE —
+    // `struct S v;` where `struct S` is forward-declared but never defined (C
+    // 6.7p7 / 6.2.5: an object shall not have an incomplete type, except as
+    // permitted for a tentative array). c35 made an opaque tag forward-MINT an
+    // incomplete TypeId (so an opaque `struct S *` pointer compiles); the SAME
+    // mint means `struct S v;` now resolves the tag — so the by-VALUE object of
+    // an incomplete type must be REJECTED HERE at the semantic tier (the earliest
+    // point with the full type), rather than only at MIR lowering (the
+    // allocaForLocal computeLayout guard). A POINTER to an incomplete type
+    // (`struct S *p`) is LEGAL and never trips this; an ARRAY of incomplete
+    // element (`struct S a[4]`) does (its element has no size). The sibling of
+    // S_IncompleteTypeMember (the by-value MEMBER case) — together they keep a
+    // by-value use of an incomplete composite from EVER silently folding to size 0.
+    S_IncompleteTypeObject        = 0xE028,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -569,6 +588,12 @@ enum class DiagnosticCode : std::uint16_t {
     //   target/format, or ship the backend that emits it). Remediation-
     //   distinct → distinct code.
     D_ArtifactProfileFormatMismatch = 0xD011,
+    // c105 (D-PP-USER-DEFINE): `--define` was passed but the language declares
+    // no preprocess block — the macros could never be consumed. Silent
+    // acceptance would let a typo'd invocation build something other than what
+    // the user asked for; fail loud instead (a language without a preprocessor
+    // has no -D semantics).
+    D_DefineRequiresPreprocess    = 0xD012,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──
@@ -700,6 +725,30 @@ enum class DiagnosticCode : std::uint16_t {
     //   closed-table): silencing it cannot mask a miscompile.
     H_UnreachableCode             = 0xF00D,
 
+    // ── c115 SEH (D-WIN64-SEH-FUNCLETS) — HirVerifier::checkSehContext ──
+    // H_SehBuiltinContext: `_exception_code()` outside every enclosing __except
+    //   filter-expression/handler-body, or `_exception_info()` outside every
+    //   enclosing filter expression (MSVC: the intrinsics are dispatch-context
+    //   reads; there is no value for them elsewhere).
+    H_SehBuiltinContext           = 0xF00E,
+    // H_SehJumpIntoRegion: a goto whose target label sits inside a part of a
+    //   __try statement (guarded body / handler) that does not lexically enclose
+    //   the goto — entering a guarded PC range sideways would give it a filter
+    //   it must never have (MSVC rejects the construct too).
+    H_SehJumpIntoRegion           = 0xF00F,
+    // H_SehEarlyExit (D-CSUBSET-SEH-EARLY-EXIT, trigger-gated): a return /
+    //   goto-out / break-out / continue-out from INSIDE a __try guarded body.
+    //   Option (C) of the c115 design-audit: the guarded body has exactly ONE
+    //   exit (the fall-through) so c116's scope-table region membership stays
+    //   CFG-derivable; sqlite's ~13 SEH sites have ZERO early exits
+    //   (amalgamation-swept). MSVC-legal — the anchor carries the
+    //   mark-every-exit design for when a real consumer fires the trigger.
+    H_SehEarlyExit                = 0xF010,
+    // H_SehLabelAddress (D-CSUBSET-SEH-LABEL-ADDR, trigger-gated): `&&label`
+    //   naming a label inside any part of a __try statement — a computed goto
+    //   could then enter the guarded range undetectably at compile time.
+    H_SehLabelAddress             = 0xF011,
+
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,
     // dominance-, or type-consistency invariant on the frozen `Mir` module
@@ -766,6 +815,16 @@ enum class DiagnosticCode : std::uint16_t {
     // carry a def whose layout follows the use — the dominance arm owns
     // their semantics). Closes the D-OPT2 layout-contract class.
     I_LayoutUseBeforeDef      = 0xA010,
+    // c115 SEH (D-WIN64-SEH-FUNCLETS): the region-skeleton pairing rules —
+    // a SehTryBegin's filter block (succ[1]) must have exactly one CFG
+    // predecessor and terminate in a SehFilterReturn with the MATCHING payload
+    // (region id); the handler (the filter's succ[0]) must have exactly one
+    // predecessor; every SehTryEnd's payload must name a SehTryBegin region in
+    // the same function; SehExceptionCode/Info may appear only in a function
+    // containing a SehTryBegin. Guards the optimizer contract (SimplifyCfg's
+    // no-touch rule on SEH successors) — a merge/thread that damages the
+    // skeleton reds HERE, at the pass that did it (verify-after-every-pass).
+    I_SehStructure            = 0xA011,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //

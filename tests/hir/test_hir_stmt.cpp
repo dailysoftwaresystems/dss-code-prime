@@ -176,35 +176,41 @@ TEST(HirStmt, ForNoClausesIsBodyOnly) {
     EXPECT_EQ(h.loopBody(f), body);
 }
 
+// c60 (Design I-A): a switch = [discriminant, body Block, dispatch arms...]. The
+// dispatch arm carries the match value + the ordinal of its case marker in the
+// body; the body Block holds the case marker LabelStmts.
 TEST(HirStmt, SwitchWithValuedAndDefaultArms) {
     HirBuilder b{"toy"};
     TypeInterner ti = makeInterner();
     TypeId const i32 = ti.primitive(TypeKind::I32);
     HirNodeId const disc = b.makeRef(i32, 1);
     HirNodeId const caseVal = b.makeLiteral(i32);
+    // Body: LabelStmt(ord 0, exprStmt) ; LabelStmt(ord 1, exprStmt).
     HirNodeId const caseBody = b.makeExprStmt(b.makeLiteral(i32));
-    HirNodeId const arm0 = b.makeCaseArm(caseVal, std::array{caseBody});
+    HirNodeId const caseMarker = b.makeLabelStmt(0, caseBody);
     HirNodeId const defBody = b.makeExprStmt(b.makeLiteral(i32));
-    HirNodeId const arm1 = b.makeCaseArm(std::nullopt, std::array{defBody});
-    HirNodeId const sw = b.makeSwitchStmt(disc, std::array{arm0, arm1});
+    HirNodeId const defMarker = b.makeLabelStmt(1, defBody);
+    HirNodeId const body = b.makeBlock(std::array{caseMarker, defMarker});
+    HirNodeId const arm0 = b.makeCaseArm(caseVal, /*labelOrdinal=*/0);
+    HirNodeId const arm1 = b.makeCaseArm(std::nullopt, /*labelOrdinal=*/1);
+    HirNodeId const sw = b.makeSwitchStmt(disc, body, std::array{arm0, arm1});
     Hir h = std::move(b).finish(sw);
 
     EXPECT_EQ(h.switchDiscriminant(sw), disc);
+    EXPECT_EQ(h.switchBody(sw), body);
     ASSERT_EQ(h.switchArms(sw).size(), 2u);
     EXPECT_EQ(h.switchArms(sw)[0], arm0);
 
-    // Valued arm: not default, value present, body is the rest.
+    // Valued arm: not default, value present, ordinal recorded.
     EXPECT_FALSE(h.caseArmIsDefault(arm0));
     ASSERT_TRUE(h.caseArmValue(arm0).has_value());
     EXPECT_EQ(*h.caseArmValue(arm0), caseVal);
-    ASSERT_EQ(h.caseArmBody(arm0).size(), 1u);
-    EXPECT_EQ(h.caseArmBody(arm0)[0], caseBody);
+    EXPECT_EQ(h.caseArmLabelOrdinal(arm0), 0u);
 
-    // Default arm: flagged default, no value, all children are body.
+    // Default arm: flagged default, no value, its own ordinal.
     EXPECT_TRUE(h.caseArmIsDefault(arm1));
     EXPECT_FALSE(h.caseArmValue(arm1).has_value());
-    ASSERT_EQ(h.caseArmBody(arm1).size(), 1u);
-    EXPECT_EQ(h.caseArmBody(arm1)[0], defBody);
+    EXPECT_EQ(h.caseArmLabelOrdinal(arm1), 1u);
 }
 
 TEST(HirStmt, BreakContinueCarryDepthAsLeaves) {
@@ -296,7 +302,9 @@ TEST(HirStmt, HelpersSatisfyChildAritySpec) {
     nodes.push_back(b.makeWhileStmt(lit(), b.makeBlock({})));
     nodes.push_back(b.makeDoWhileStmt(b.makeBlock({}), lit()));
     nodes.push_back(b.makeForStmt(std::nullopt, lit(), std::nullopt, b.makeBlock({})));
-    nodes.push_back(b.makeSwitchStmt(lit(), {}));
+    nodes.push_back(b.makeSwitchStmt(lit(), b.makeBlock({}), {}));   // c60: [disc, body]
+    nodes.push_back(b.makeCaseArm(lit(), /*labelOrdinal=*/0));        // c60: [value]
+    nodes.push_back(b.makeCaseArm(std::nullopt, /*labelOrdinal=*/1)); // c60: [] (default)
     nodes.push_back(b.makeBreak(0));
     nodes.push_back(b.makeContinue(0));
     nodes.push_back(b.makeReturn());

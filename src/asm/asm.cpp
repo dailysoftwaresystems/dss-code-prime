@@ -274,6 +274,16 @@ AssembledModule assemble(Lir const&                 lir,
             continue;  // skip patch resolution for this function
         }
 
+        // D-OPT-SWITCH-JUMP-TABLE (c70): publish the completed block-byte-offset
+        // table on the AssembledFunction. A dense `switch` lowers to a jump table
+        // whose `.data` slots hold the runtime addresses of the case-target blocks
+        // (abs64 relocations to synthetic per-block symbols). Those block symbols
+        // have no live block-address `lea`, so the BlockSymPatch loop below never
+        // binds them — `compile_pipeline.cpp` binds them directly from THIS map
+        // after assemble() returns. Copied once per function (cheap), only
+        // consumed when a jump-table descriptor names this function.
+        outFn.blockByteOffsets = blockOffsets;
+
         // D-CSUBSET-COMPUTED-GOTO: resolve each pending synthetic-symbol
         // ↔ block binding now that every block's byte offset is known.
         // Each binds a synthetic local symbol (the `&&label` block-address
@@ -611,16 +621,31 @@ decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
 //     field 0 ↔ member 0 at offset 0; the union's remaining bytes stay zero.
 //   * array  — `agg.fields[i]` ↔ element `i` at `base + i*elemStride`; a
 //     short initializer leaves the trailing elements zero.
+//
+// c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a scalar leaf may be a
+// LINK-TIME-CONSTANT symbol address (a fn/`&global`/string member of the
+// aggregate — the F5 / D-CSUBSET-SYMBOL-ADDRESS-GLOBAL mechanism, extended from
+// top-level scalars to aggregate MEMBERS). Such a leaf emits an abs64
+// RELOCATION at its member offset (into `relocs`) over the pre-zeroed 8-byte
+// pointer slot; `absPtrRelocKind` is the target's abs64 tag (nullopt ⇒ the
+// target declares no abs64 reloc ⇒ fail loud, as the F5 scalar arm does).
 [[nodiscard]] bool
 encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
                      TypeInterner const& in, AggregateLayoutParams lp,
                      DataModel dm, std::vector<std::uint8_t>& buf,
-                     std::uint64_t base) {
+                     std::uint64_t base, std::vector<Relocation>& relocs,
+                     std::optional<RelocationKind> absPtrRelocKind) {
     TypeKind const k = in.kind(ty);
 
     if (k == TypeKind::Struct || k == TypeKind::Union) {
         if (!std::holds_alternative<MirAggregateValue>(v.value)) return false;
         auto const& agg = std::get<MirAggregateValue>(v.value);
+        // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): a static initializer of an
+        // explicit-offset (overlapping) struct would positionally write fields whose
+        // byte ranges overlap — a later field silently overwrites an earlier one in
+        // `buf`. An FFI overlap type is only member-accessed at runtime, never
+        // brace-inited; refuse LOUD rather than emit wrong static bytes.
+        if (in.hasExplicitOffsets(ty)) return false;
         auto const  lay = computeLayout(ty, in, lp, dm);
         if (!lay.has_value()) return false;
         auto const ops = in.operands(ty);
@@ -644,7 +669,8 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
                 // touch that neighbour unit. Skip it (its synthetic child is 0).
                 if (in.fieldBitWidth(ty, i).has_value()) continue;
                 if (!encodeAggregateValue(ops[i], agg.fields[i], in, lp, dm, buf,
-                                          base + lay->fieldOffsets[i]))
+                                          base + lay->fieldOffsets[i], relocs,
+                                          absPtrRelocKind))
                     return false;
                 continue;
             }
@@ -667,6 +693,32 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     }
 
     if (k == TypeKind::Array) {
+        // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): a CHAR-ARRAY
+        // field/element initialized by a STRING LITERAL (`char zName[7] = "hour";`
+        // inside a static const aggregate). The const-eval folds the string-literal
+        // leaf to a `std::string` value (NOT a per-char `MirAggregateValue`), so a
+        // char[N] element here carries a string arm. Write the string bytes + the
+        // implicit NUL at `base`; the caller pre-zeroed `buf` to the full layout
+        // size, so the trailing N−(len+1) bytes are already zero (the C 6.7.9p14
+        // zero-fill) — the aggregate twin of the standalone string-literal global's
+        // producer-side padding. Element must be `char`; the NUL+bytes must fit the
+        // array's byte extent (a layout↔value disagreement fails loud). A non-char
+        // array with a string value, or an over-long string, falls through to the
+        // shape-mismatch `false` below.
+        if (std::holds_alternative<std::string>(v.value)
+            && !in.operands(ty).empty()
+            && in.kind(in.operands(ty)[0]) == TypeKind::Char) {
+            auto const& s   = std::get<std::string>(v.value);
+            auto const  lay = computeLayout(ty, in, lp, dm);
+            if (!lay.has_value()) return false;
+            if (base + s.size() + 1 > buf.size()) return false;   // NUL must fit
+            if (s.size() + 1 > lay->size)          return false;   // over-long → loud
+            for (std::size_t j = 0; j < s.size(); ++j)
+                buf[base + j] = static_cast<std::uint8_t>(s[j]);
+            // buf[base + s.size()] (the NUL) and the remaining bytes stay 0
+            // (caller pre-zeroed) — the trailing zero-fill.
+            return true;
+        }
         if (!std::holds_alternative<MirAggregateValue>(v.value)) return false;
         auto const& agg   = std::get<MirAggregateValue>(v.value);
         auto const  ops   = in.operands(ty);
@@ -688,8 +740,26 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
         std::uint64_t const stride = elemLay->align.alignUp(elemLay->size);
         for (std::size_t i = 0; i < agg.fields.size(); ++i)
             if (!encodeAggregateValue(elem, agg.fields[i], in, lp, dm, buf,
-                                      base + i * stride))
+                                      base + i * stride, relocs, absPtrRelocKind))
                 return false;
+        return true;
+    }
+
+    // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a symbol-address pointer
+    // leaf — an aggregate MEMBER that is a fn/`&global`/string-literal address
+    // const-eval could not fold (the F5 scalar arm at lowerMirGlobalsToDataItems,
+    // D-CSUBSET-SYMBOL-ADDRESS-GLOBAL, generalized to a member). The pointer slot
+    // is 8 bytes the caller already pre-zeroed; emit an abs64 relocation at this
+    // member's `base` and leave the slot zero (the linker writes the resolved,
+    // and on a PIE image slid, target VA). No abs64 reloc declared ⇒ fail loud,
+    // exactly as the F5 scalar arm does. MUST precede decodeScalarLiteralBits
+    // (which would reject the MirSymbolAddrValue variant).
+    if (std::holds_alternative<MirSymbolAddrValue>(v.value)) {
+        if (!absPtrRelocKind.has_value()) return false;
+        auto const& sa = std::get<MirSymbolAddrValue>(v.value);
+        relocs.push_back(Relocation{static_cast<std::uint32_t>(base),
+                                    SymbolId{sa.symbol}, *absPtrRelocKind,
+                                    sa.addend});
         return true;
     }
 
@@ -823,9 +893,13 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // a mutable one is written at runtime → writable `.data` (a store into
         // `.rodata` faults — the bug this cycle fixes). Keyed on the config-
         // driven `MirGlobal.isConst` PROPERTY threaded from the source's
-        // const-qualifier, NOT on any target/format identity. The string-
-        // literal arm below OVERRIDES this back to `.rodata` (a string literal
-        // is const data whatever the global's declared mutability).
+        // const-qualifier, NOT on any target/format identity. A string-literal
+        // global's isConst is set at its MINT site (D-CSUBSET-MUTABLE-CHAR-ARRAY-
+        // RODATA): a SYNTHETIC string-pool global — the immutable bytes a
+        // `char *p = "hi"` / a function-body literal points to — is minted const
+        // → `.rodata`; a NAMED `char arr[N] = "str"` honors its declared
+        // const-ness. So the string-literal arm below no longer overrides the
+        // section — `isConst` is the single authority.
         d.section = mir.globalIsConst(gid) ? DataSectionKind::Rodata
                                            : DataSectionKind::Data;
 
@@ -853,15 +927,53 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // break the D-LK4-RODATA-PRODUCER-STRING closure path.
         if (std::holds_alternative<std::string>(v.value)) {
             auto const& s = std::get<std::string>(v.value);
-            // A string-literal-promoted global is read-only CONST data
-            // regardless of the enclosing global's declared mutability — its
-            // bytes live in the literal pool and are never written. Force
-            // `.rodata` (overriding the mutable→`.data` selection above) so a
-            // `char *p = "hi";` (mutable POINTER, const POINTED-TO bytes) keeps
-            // the literal bytes in read-only memory.
-            d.section = DataSectionKind::Rodata;
+            // SECTION (D-CSUBSET-MUTABLE-CHAR-ARRAY-RODATA): the section was
+            // already chosen from `isConst` above — do NOT override it here. A
+            // SYNTHETIC string-literal-pool global (the immutable bytes a
+            // `char *p = "hi"` / a function-body literal points to) was minted
+            // CONST → `.rodata` (read-only, as a string literal must be). A NAMED
+            // user `char arr[N] = "str"` global is the array OBJECT itself (C
+            // 6.7.9 mutable storage) → it honors its declared const-ness:
+            // `const` → `.rodata`, MUTABLE → writable `.data` (a runtime
+            // `arr[0]='J'` must not fault). The former unconditional `.rodata`
+            // override here wrongly forced a mutable named array into read-only
+            // memory (a SIGSEGV on write) — removed.
             d.bytes.assign(s.begin(), s.end());
-            d.bytes.push_back(0);
+            d.bytes.push_back(0);                 // implicit NUL → s.size()+1 bytes
+            // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): when this
+            // string-literal global is the PRODUCER for a `char[N]` initializer (the
+            // HIR coerce retyped the literal node to `char[N]` with N > s.size()+1),
+            // the global's TYPE is `Array<char,N>` — so MATERIALIZE the trailing
+            // N−(s.size()+1) zero-padding bytes HERE (the Option-A "pad at the
+            // producer" choice). A consumer that copies N bytes (the aggregate-copy
+            // of the field / the array-local init) then reads GUARANTEED zeros, never
+            // an OOB read of adjacent rodata. The ORDINARY string-literal global
+            // (`char *p = "hi";`, a bare decayed `"abc"`) has type `Array<char,M>`
+            // with M == s.size()+1, so the type size equals the byte count already
+            // emitted and this padding is a NO-OP (behaviour unchanged). Only GROW
+            // (never shrink): the type size is N >= s.size()+1 by the coerce/semantic
+            // `N >= M` guards; clamp defensively so a hypothetical smaller type can
+            // never truncate the literal bytes.
+            if (interner.kind(ty) == TypeKind::Array) {
+                std::optional<std::uint64_t> typeSize;
+                if (auto const sc = interner.scalars(ty); !sc.empty()) {
+                    // Fast path: char element ⇒ N bytes == the length scalar. Use the
+                    // layout engine when present for a non-trivial element (agnostic
+                    // total size), but a char[N] string global is the only shape that
+                    // reaches here, so the scalar is exact.
+                    if (aggregateLayout.has_value()) {
+                        if (auto const lay = computeLayout(ty, interner,
+                                                           *aggregateLayout, dataModel);
+                            lay.has_value()) {
+                            typeSize = lay->size;
+                        }
+                    }
+                    if (!typeSize.has_value())
+                        typeSize = static_cast<std::uint64_t>(sc[0]);
+                }
+                if (typeSize.has_value() && *typeSize > d.bytes.size())
+                    d.bytes.resize(static_cast<std::size_t>(*typeSize), 0u);
+            }
             d.alignment = Alignment::of<1>();
             out.push_back(std::move(d));
             continue;
@@ -948,27 +1060,45 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // the recursion writes only the provided leaves.
             d.bytes.assign(static_cast<std::size_t>(lay->size), 0u);
             if (!encodeAggregateValue(ty, v, interner, *aggregateLayout,
-                                      dataModel, d.bytes, 0)) {
+                                      dataModel, d.bytes, 0, d.relocations,
+                                      absPtrRelocKind)) {
                 emit(DiagnosticCode::K_NoMatchingObjectFormat,
                      std::format("lowerMirGlobalsToDataItems: global "
                                  "SymbolId={{ {} }} aggregate initializer "
                                  "could not be encoded (a type↔value shape "
                                  "mismatch or an unencodable leaf — e.g. "
-                                 "f16/f128 or an address-relocated pointer) "
+                                 "f16/f128, or an address-relocated leaf when "
+                                 "the target declares no abs64 reloc) "
                                  "(D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL).",
                                  sym.v));
                 continue;
             }
+            // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): an aggregate that
+            // carries load-time relocations (a fn/`&global`/string member) is
+            // INHERENTLY load-writable — the loader patches the resolved (and on
+            // a PIE image slid) target VAs into the member slots. It MUST live in
+            // a writable-at-load section, never read-only rodata, even when the
+            // source global is const: the SAME rationale as the F5 scalar arm at
+            // 951-961 (a Mach-O PIE __TEXT,__const cannot be rebased; ELF/PE
+            // merely tolerate rodata). A reloc-free const aggregate keeps the
+            // section chosen above (.rodata for a const global).
+            if (!d.relocations.empty()) d.section = DataSectionKind::Data;
             d.alignment = lay->align;
             out.push_back(std::move(d));
             continue;
         }
 
-        // Primitive integer arm: encode the variant's u64/i64/
-        // bool value as LE bytes sized by the type. Width is the
-        // type's primitive byte size; HIR/MIR const-eval clamps
-        // the value to the type's range before lowering.
-        auto const widthOpt = primitiveByteSize(k);
+        // Scalar arm: encode the variant's u64/i64/bool value as LE bytes
+        // sized by the type. Width comes from `scalarByteSize` — the SAME
+        // sizing chokepoint the aggregate-member leaf recursion uses (a strict
+        // superset of the former `primitiveByteSize`: it adds the pointer-
+        // class scalars, sized by the target's DataModel). c80: a TOP-LEVEL
+        // POINTER-typed global whose initializer folded to a pointer-valued
+        // integer constant (`T* g = 0;` — sqlite's `vfsList`/
+        // `sqlite3_temp_directory`; `void* g = SQLITE_INT_TO_PTR(X)`) lands
+        // here with TypeKind::Ptr — formerly nullopt → a spurious
+        // "non-primitive" fail-loud on a perfectly encodable 8-byte slot.
+        auto const widthOpt = scalarByteSize(k, dataModel);
         if (!widthOpt.has_value()) {
             emit(DiagnosticCode::K_NoMatchingObjectFormat,
                  std::format("lowerMirGlobalsToDataItems: global "
@@ -1013,12 +1143,13 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             continue;
         }
         appendLE(d.bytes, *bits, *widthOpt);
-        // `primitiveByteSize()` returns ∈ {1,2,4,8,16} — every
-        // value is a power-of-two in [1,256], so the `optional`
-        // unwrap path is dead. Use the runtime-asserting factory
-        // to express the invariant in the type (type-design audit
-        // fold 2026-06-02 — dead `K_NoMatchingObjectFormat` arm
-        // removed; the wrong-domain diagnostic that arm would
+        // `scalarByteSize()` returns ∈ {1,2,4,8,16} (pointer-class
+        // scalars are the model's 4- or 8-byte pointer width) —
+        // every value is a power-of-two in [1,256], so the
+        // `optional` unwrap path is dead. Use the runtime-asserting
+        // factory to express the invariant in the type (type-design
+        // audit fold 2026-06-02 — dead `K_NoMatchingObjectFormat`
+        // arm removed; the wrong-domain diagnostic that arm would
         // emit was a future-reader trap).
         d.alignment = Alignment::ofRuntimePow2(
             static_cast<std::uint32_t>(*widthOpt));

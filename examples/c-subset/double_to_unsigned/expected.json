@@ -1,0 +1,16 @@
+{
+  "$comment": "c78 (fp_to_ui, 2026-07-01): (unsigned)double gains an x86 encoding identical to fp_to_si (F2 REX.W 0F 2C = cvttsd2si) + threads the source float width; a value in [0,2^32) reads exactly into the low 32 bits (byte-identical to gcc's cvttsd2si rax,xmm0). Pre-fix fp_to_ui had NO encoding -> A_NoEncodingDeclared. c92 (2026-07-03): the arm64 legs land — fp_to_ui = FCVTZU Xd,Dn 0x9E790000 / Xd,Sn 0x9E390000 (the exact fp_to_si FCVTZS mirror, opcode 000->001; the SAME source-width axis + fixed-X-dest low-32 convention). Pre-c92 arm64 declared no fp_to_ui -> L_RequiredLirOpcodeMissing (the 2-TU sqlite arm64 wall). NOTE: FCVTZU Xd is NATIVELY full-range u64 — D-CSUBSET-UI-FROM-FP-UNSIGNED-I64 (>2^63 conditional-subtract) is x86-ONLY; this shared witness stays in u32 range so every leg agrees. RED-ON-DISABLE: revert the x86 encoding block -> A_NoEncodingDeclared; remove the arm64 block -> L_RequiredLirOpcodeMissing fp_to_ui. => 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec", "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

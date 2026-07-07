@@ -864,6 +864,37 @@ MirInstId MirBuilder::addCondBr(MirInstId cond, MirBlockId ifTrue, MirBlockId if
     return id;
 }
 
+MirInstId MirBuilder::addSehTryBegin(MirBlockId tryEntry, MirBlockId filterEntry,
+                                     std::uint32_t regionId) {
+    // c115 SEH: the region-opening terminator — succ[0] = the guarded body's
+    // entry (the normal path), succ[1] = the filter block (the exceptional
+    // path); payload = the per-function region id pairing Begin/FilterReturn/End.
+    detail::MirInst pod;
+    pod.opcode  = MirOpcode::SehTryBegin;
+    pod.payload = regionId;
+    MirInstId const id = appendInst_(pod, {}, /*terminates=*/true);
+    MirBlockId const succs[] = {tryEntry, filterEntry};
+    recordSuccessors_(MirOpcode::SehTryBegin, succs);
+    return id;
+}
+
+MirInstId MirBuilder::addSehFilterReturn(MirInstId filterValue,
+                                         MirBlockId handlerEntry,
+                                         std::uint32_t regionId) {
+    // c115 SEH: the filter block's terminator — operand[0] = the i32 filter
+    // value; succ[0] = the handler block (the EXECUTE_HANDLER edge; the
+    // CONTINUE_SEARCH path unwinds out of the function — no CFG edge).
+    checkSameModule_(filterValue.arenaTag, "filter value");
+    detail::MirInst pod;
+    pod.opcode  = MirOpcode::SehFilterReturn;
+    pod.payload = regionId;
+    MirInstId const operands[] = {filterValue};
+    MirInstId const id = appendInst_(pod, operands, /*terminates=*/true);
+    MirBlockId const succs[] = {handlerEntry};
+    recordSuccessors_(MirOpcode::SehFilterReturn, succs);
+    return id;
+}
+
 MirInstId MirBuilder::addSwitch(MirInstId discriminant,
                                 std::span<std::pair<MirInstId, MirBlockId> const> cases,
                                 MirBlockId defaultTarget) {

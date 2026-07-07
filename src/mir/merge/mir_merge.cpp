@@ -401,6 +401,18 @@ private:
                 dst_.addIndirectBr(mapValue(ops[0], id), targets);
                 return;
             }
+            case MirOpcode::SehTryBegin:
+                // c115 SEH (D-WIN64-SEH-FUNCLETS): succs [tryEntry, filterEntry];
+                // the region-id payload clones verbatim (function-scoped ids —
+                // merge clones whole functions, no renumbering).
+                dst_.addSehTryBegin(mapBlock(succ[0]), mapBlock(succ[1]),
+                                    src_.instPayload(id));
+                return;
+            case MirOpcode::SehFilterReturn:
+                // operand [filterValue]; succ [handlerEntry]; payload verbatim.
+                dst_.addSehFilterReturn(mapValue(ops[0], id), mapBlock(succ[0]),
+                                        src_.instPayload(id));
+                return;
             default:
                 std::fprintf(stderr,
                     "dss::mergeCuMirs fatal: CU %u terminator opcode %d marked "

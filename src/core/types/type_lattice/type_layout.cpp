@@ -259,6 +259,15 @@ std::optional<std::uint64_t> scalarByteSize(TypeKind kind, DataModel dm) noexcep
 std::optional<StructLayout>
 computeLayout(TypeId id, TypeInterner const& interner,
               AggregateLayoutParams params, DataModel dm) {
+    // c27 (D-CSUBSET-VOLATILE-POINTEE): a `volatile T` has the SAME layout as T
+    // (C 6.7.3 — a qualifier never changes size/alignment). Strip the VolatileQual
+    // skin ONCE here so the whole engine — incl. the raw-kind incomplete checks
+    // below and the recursive field/element layouts — operates on the material
+    // type. This single strip makes `sizeof(volatile T) == sizeof(T)` hold by
+    // construction and routes a volatile-qualified struct/array/scalar down its
+    // normal arm. (The transparent `kind()`/`operands()` would mostly suffice, but
+    // `isIncompleteComposite`/`isIncompleteArray` read the RAW record kind.)
+    id = interner.stripVolatile(id);
     TypeKind const kind = interner.kind(id);
 
     // D-CSUBSET-SELF-REFERENTIAL-STRUCT: an INCOMPLETE composite (a forward-declared
@@ -302,6 +311,29 @@ computeLayout(TypeId id, TypeInterner const& interner,
             StructLayout out{};
             out.align = Alignment::of<1>();
             out.fieldOffsets.reserve(fields.size());
+            // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): a struct carrying EXPLICIT
+            // per-field byte offsets (an FFI overlapping-union modeled as a struct)
+            // uses those offsets verbatim instead of natural-alignment derivation.
+            // Offsets may OVERLAP (ULARGE_INTEGER {QuadPart@0, LowPart@0, HighPart@4}):
+            // size = the max field extent, align = the max field alignment. This is
+            // a SEPARATE channel from bitfields (offsets are not in scalars — F1), so
+            // an explicit-offset struct never carries bit-fields; a config that pairs
+            // them is rejected here (fail loud) rather than silently mis-laid.
+            if (interner.hasExplicitOffsets(id)) {
+                if (!interner.scalars(id).empty()) return std::nullopt;  // bitfields + offsets: unsupported
+                std::uint64_t extent = 0;
+                for (std::size_t i = 0; i < fields.size(); ++i) {
+                    auto const off = interner.explicitFieldOffset(id, i);
+                    if (!off) return std::nullopt;                 // partial offsets: malformed
+                    auto const fl = computeLayout(fields[i], interner, params, dm);
+                    if (!fl) return std::nullopt;
+                    out.fieldOffsets.push_back(*off);
+                    out.align = maxAlign(out.align, fl->align);
+                    extent = std::max(extent, *off + fl->size);
+                }
+                out.size = out.align.alignUp(extent);
+                return out;
+            }
             // FC8 bitfields (D-CSUBSET-BITFIELD): a bitfield-free struct interns
             // with EMPTY scalars (see TypeInterner::structType), so this O(1) test
             // routes every existing struct down the unchanged byte path below.

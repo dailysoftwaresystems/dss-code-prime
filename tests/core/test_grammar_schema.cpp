@@ -244,6 +244,27 @@ TEST(GrammarSchema, MissingRootShapeReportsCode) {
     }));
 }
 
+// c31 D-CSUBSET-LABEL-BUDGET-CLIFF: the `commitAfterPrefix` PEG-cut facet must be
+// a boolean. A non-boolean is a config typo and is rejected LOUD at load
+// (C_UnknownShape "must be a boolean") — never silently ignored. (The sibling
+// mutual-exclusion with `commitRequiresTypeName` is also fail-loud in the loader;
+// it needs a valid type-position config to exercise and is left to a follow-up.)
+TEST(GrammarSchema, CommitAfterPrefixRejectsNonBoolean) {
+    constexpr std::string_view bad = R"({
+      "dssSchemaVersion": 1,
+      "language": { "name": "X", "version": "0.1.0" },
+      "shapes": {
+        "root": { "sequence": ["Identifier"], "commitAfterPrefix": 5 }
+      }
+    })";
+    auto result = GrammarSchema::loadFromText(bad);
+    ASSERT_FALSE(result.has_value());
+    auto const& diags = result.error();
+    EXPECT_TRUE(std::ranges::any_of(diags, [](auto const& d) {
+        return d.code == DiagnosticCode::C_UnknownShape;
+    }));
+}
+
 // ─── loadShipped + the on-disk toy.lang.json ─────────────────────────────
 
 TEST(GrammarSchema, LoadShippedToy) {
@@ -298,7 +319,15 @@ TEST(GrammarSchema, LoadShippedCSubset) {
                                   "kwDeclHead", "identDeclHead",
                                   "identVarDecl", "declOrExprStmt",
                                   "forDecl", "forIdentDecl", "forInitAmbig",
-                                  "typedefHead", "structSpecifierBody",
+                                  "typedefHead",
+                                  // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER:
+                                  // the unified struct/union/enum specifier rules
+                                  // (REPLACED the retired *SpecifierBody rules) +
+                                  // their factored-out member-body wrapper rules.
+                                  "structSpec", "structBody",
+                                  "unionSpec", "unionBody",
+                                  "enumSpec", "enumBody",
+                                  "structTypeRef", "unionTypeRef", "enumTypeRef",
                                   "stdAttr", "varDecl",
                                   "paramList", "param", "block", "statement",
                                   "ifStmt", "whileStmt", "doStmt", "forStmt",
@@ -311,6 +340,16 @@ TEST(GrammarSchema, LoadShippedCSubset) {
                                   // present in the rule interner.
                                   "binaryExpr", "unaryExpr", "postfixExpr"}) {
         EXPECT_TRUE(schema.rules().find(rule).valid()) << rule;
+    }
+
+    // c25: the former specifier-body rules were RETIRED (folded into the
+    // unified XxxSpec). Pin their ABSENCE so a stray re-introduction (or an
+    // incomplete unification) is visible at load.
+    for (std::string_view retired : {"structSpecifierBody",
+                                     "unionSpecifierBody",
+                                     "enumSpecifierBody"}) {
+        EXPECT_FALSE(schema.rules().find(retired).valid())
+            << "retired rule must not resolve: " << retired;
     }
 
     // BlockOpen opens Block — representative scope token.
@@ -1826,6 +1865,129 @@ TEST(GrammarSchema, SemanticsUnknownDeclKindReportsInvalid) {
     auto r = GrammarSchema::loadFromText(kCfg);
     ASSERT_FALSE(r.has_value());
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// ── c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: dual-mode loader guards ──────
+//
+// `definesWhenChild` makes ONE declaration row dual-mode (a DEFINITION when the
+// named body child is present, else a tag REFERENCE resolved by a paired
+// `references[]` row). Two loader guards keep a misconfigured language config
+// from silently mis-resolving; each gets a red-on-disable negative pin (the
+// guard-needs-a-red-test discipline, cluster lessons c8/c21).
+
+// A `definesWhenChild` row with NO paired `references` row for the same rule →
+// C_InvalidSemantics (a body-absent occurrence would otherwise resolve to nothing).
+TEST(GrammarSchema, SemanticsDefinesWhenChildWithoutReferenceRowReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { "{": [{ "kind": "BlockOpen" }], "}": [{ "kind": "BlockClose" }],
+                  ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root": { "sequence": [ "spec", "Semi" ] },
+        "spec": { "sequence": [ "Identifier", { "optional": "body" } ] },
+        "body": { "sequence": [ "BlockOpen", "BlockClose" ] }
+      },
+      "semantics": {
+        "declarations": [ { "rule": "spec", "name": 0, "kind": "type",
+                            "definesWhenChild": "body" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// A `definesWhenChild` naming a child rule that no shape declares → C_UnknownShape.
+// (The paired references row is present, so this isolates the child-rule guard.)
+TEST(GrammarSchema, SemanticsDefinesWhenChildUnknownChildRuleReportsUnknownShape) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root": { "sequence": [ "spec", "Semi" ] },
+        "spec": { "sequence": [ "Identifier" ] }
+      },
+      "semantics": {
+        "declarations": [ { "rule": "spec", "name": 0, "kind": "type",
+                            "definesWhenChild": "ghostBody" } ],
+        "references": [ { "rule": "spec" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
+}
+
+// ── c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: references[].compositeKind ──────
+//
+// `compositeKind` on a `references[]` row drives the opaque-tag forward-mint
+// (struct/union mint an incomplete tag on a miss; enum keeps the fail-loud miss).
+// It is meaningful ONLY on a tag-reference row, and only for the three composite
+// kinds — each misconfiguration gets a red-on-disable loader pin (the
+// guard-needs-a-red-test discipline).
+
+// `compositeKind` on a NON-tag-reference row → C_InvalidSemantics (it would be a
+// silently-ignored field — a config author would expect it to do something).
+TEST(GrammarSchema, ReferenceCompositeKindOnNonTagRowReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root": { "sequence": [ "ref", "Semi" ] },
+        "ref": { "sequence": [ "Identifier" ] }
+      },
+      "semantics": {
+        "references": [ { "rule": "ref", "compositeKind": "struct" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// An UNKNOWN `compositeKind` string on a tag-reference row → C_InvalidSemantics
+// (a typo must not silently default to Struct and mis-mint a union/enum tag).
+TEST(GrammarSchema, ReferenceCompositeKindUnknownValueReportsInvalid) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root": { "sequence": [ "ref", "Semi" ] },
+        "ref": { "sequence": [ "Identifier" ] }
+      },
+      "semantics": {
+        "references": [ { "rule": "ref", "isTagReference": true,
+                          "compositeKind": "telepathic" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_InvalidSemantics));
+}
+
+// POSITIVE: a tag-reference row WITH a valid `compositeKind` loads clean (the
+// happy path the negatives above bracket).
+TEST(GrammarSchema, ReferenceCompositeKindOnTagRowLoadsClean) {
+    constexpr std::string_view kCfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "X", "version": "0.1.0" },
+      "tokens": { ";": [{ "kind": "Semi" }] },
+      "shapes": {
+        "root": { "sequence": [ "ref", "Semi" ] },
+        "ref": { "sequence": [ "Identifier" ] }
+      },
+      "semantics": {
+        "references": [ { "rule": "ref", "isTagReference": true,
+                          "compositeKind": "union" } ]
+      }
+    })JSON";
+    auto r = GrammarSchema::loadFromText(kCfg);
+    EXPECT_TRUE(r.has_value())
+        << "a tag-reference row with a valid compositeKind must load clean";
 }
 
 // ── D-LK10-ENTRY-MAIN-IMPLICIT-RETURN loader negative tests ───────

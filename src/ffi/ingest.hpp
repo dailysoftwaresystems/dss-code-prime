@@ -94,6 +94,15 @@ struct DSS_EXPORT ExternDeclRef {
     // format is in scope, so FF5 stays target-agnostic. Source-language
     // agnostic — any language whose lowerer populates the map gets routing.
     std::string_view libraryOverride{};
+    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): TRUE ⇒ this extern is a
+    // bare-prototype cross-TU reference that must carry NO import library —
+    // the synthesize stage leaves `FfiMetadata.importLibrary` EMPTY instead of
+    // falling back to the format-level default (that fallback is exactly what
+    // this flag opts out of) and stamps `FfiMetadata.noLibraryBinding` so the
+    // HIR→MIR extern pre-pass admits the empty library. Resolution then
+    // belongs to the link tier: a sibling-TU definition, or a LOUD undefined-
+    // symbol reject. Mutually exclusive with a non-empty `libraryOverride`.
+    bool noLibraryBinding = false;
 };
 
 // ── HirIngestResult ─────────────────────────────────────────────

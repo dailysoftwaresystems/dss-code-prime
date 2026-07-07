@@ -1,0 +1,16 @@
+{
+  "$comment": "c40 D-CSUBSET-POINTER-SUBTRACTION (C 6.5.6p9): p-q yields a SIGNED ptrdiff_t = the ELEMENT count (byte_diff/sizeof(*p)), passable as a numeric function arg (the sqlite fmt-bufpt shape). RED-ON-DISABLE: pre-c40 `take(p4-p1)` did not compile (Ptr-typed arg → S_TypeMismatch) AND an unscaled int* diff = 12 not 3. exit 42 requires int* scaled (3), char* (5), signed negative (p1-p4 == -3): 3*10+5+7. Also the run-green half of the flagged p-q bug. Release pipeline + all 4 targets.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main",     "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main",     "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main",     "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

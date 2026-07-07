@@ -3,6 +3,7 @@
 #include "analysis/semantic/type_rules.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/semantic_config.hpp"   // c115: BuiltinLowering (SEH context)
 #include "core/types/source_span.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
@@ -63,6 +64,7 @@ bool HirVerifier::verify(DiagnosticReporter& reporter) const {
     checkRequiredTypes(reporter);
     checkNodeArity(reporter);
     checkBreakContinueScoping(reporter);
+    checkSehContext(reporter);
     checkDeclarationShape(reporter);
     // HR6 rules.
     checkBlockTermination(reporter);
@@ -179,23 +181,251 @@ void HirVerifier::checkBreakContinueScoping(DiagnosticReporter& reporter) const 
         if (hasError(hir_.flags(id))) continue;
 
         std::uint32_t const depth = hir_.branchDepth(id);
-        std::vector<HirNodeId> const targets = enclosingBranchTargets(hir_, id);
+        std::vector<HirNodeId> targets = enclosingBranchTargets(hir_, id);
         char const* const what = (kind == HirKind::BreakStmt) ? "break" : "continue";
+
+        // C 6.8.6.2: `continue` targets the innermost ITERATION statement; a switch is
+        // TRANSPARENT to continue (it is a `break` target, NOT a `continue` target).
+        // Drop switch frames so the depth indexes loops only — a `continue` inside a
+        // switch (e.g. sqlite3VXPrintf's format loop) correctly reaches the enclosing
+        // loop. `break` keeps the full loops+switches stack (a switch IS a break target).
+        if (kind == HirKind::ContinueStmt) {
+            std::erase_if(targets, [&](HirNodeId t) {
+                return hir_.kind(t) == HirKind::SwitchStmt;
+            });
+        }
 
         if (depth >= targets.size()) {
             reportAt(reporter, DiagnosticCode::H_InvalidBreak, id,
-                     std::format("{} #{} index {} has no enclosing loop/switch at that "
-                                 "depth ({} enclosing)", what, id.v, depth, targets.size()),
+                     std::format("{} #{} index {} has no enclosing {} at that "
+                                 "depth ({} enclosing)", what, id.v, depth,
+                                 kind == HirKind::ContinueStmt ? "loop" : "loop/switch",
+                                 targets.size()),
                      sourceMap_);
             continue;
         }
-        // continue can only target a loop — never a switch.
-        if (kind == HirKind::ContinueStmt
-            && hir_.kind(targets[depth]) == HirKind::SwitchStmt) {
-            reportAt(reporter, DiagnosticCode::H_InvalidBreak, id,
-                     std::format("continue #{} index {} resolves to a switch; continue "
-                                 "can only target a loop", id.v, depth),
-                     sourceMap_);
+    }
+}
+
+// c115 SEH (D-WIN64-SEH-FUNCLETS): the __try/__except context rules. THE
+// chokepoint — runs verify-on-load after EVERY frontend lowering (and on
+// hir_text loads), so no frontend can bypass it. Four rule families:
+//   (1) H_SehBuiltinContext — `_exception_code()` needs an enclosing __except
+//       filter-expression OR handler-body; `_exception_info()` a filter only.
+//   (2) H_SehJumpIntoRegion — a goto may not enter any part of a __try
+//       statement it is not already inside (MSVC rejects it too).
+//   (3) H_SehEarlyExit (D-CSUBSET-SEH-EARLY-EXIT, trigger-gated, option (C) of
+//       the c115 design-audit) — no return / goto-out / break-out /
+//       continue-out / indirect-goto from INSIDE a guarded body: the guarded
+//       body keeps exactly ONE exit (the fall-through) so the c116 scope-table
+//       region membership stays CFG-derivable. sqlite: zero early exits.
+//   (4) H_SehLabelAddress (D-CSUBSET-SEH-LABEL-ADDR, trigger-gated) — `&&label`
+//       naming a label inside any part of a __try statement.
+void HirVerifier::checkSehContext(DiagnosticReporter& reporter) const {
+    std::uint32_t const moduleTag = hir_.id().v;
+
+    // Zero-cost for the non-SEH world: one flat scan for either a SehTryExcept
+    // node OR a SEH intrinsic builtin (`_exception_code`/`_exception_info`),
+    // then bail. The intrinsic must be included so a BARE `_exception_code()`
+    // with no enclosing __try is rejected HERE (H_SehBuiltinContext) rather
+    // than flowing to the mir_to_lir funclet fail-loud.
+    bool anySeh = false;
+    for (std::uint32_t i = 1; i < hir_.nodeCount() && !anySeh; ++i) {
+        HirNodeId const id{i, moduleTag};
+        HirKind const k = hir_.kind(id);
+        if (k == HirKind::SehTryExcept) { anySeh = true; break; }
+        if (k == HirKind::BuiltinCall) {
+            auto const bl = static_cast<BuiltinLowering>(hir_.payload(id));
+            if (bl == BuiltinLowering::SehExceptionCode
+                || bl == BuiltinLowering::SehExceptionInfo) anySeh = true;
+        }
+    }
+    if (!anySeh) return;
+
+    // The (sehNode, childSlot) ancestry of `id`, innermost-first: every
+    // SehTryExcept ancestor + which of its three children the path enters
+    // through (0 = guarded body, 1 = filter expression, 2 = handler body).
+    auto const sehAncestry = [&](HirNodeId id) {
+        std::vector<std::pair<HirNodeId, unsigned>> out;
+        HirNodeId prev = id;
+        for (HirNodeId cur = hir_.parent(id); cur.valid(); cur = hir_.parent(cur)) {
+            if (hir_.kind(cur) == HirKind::SehTryExcept) {
+                auto const kids = hir_.children(cur);
+                unsigned slot = 3;   // 3 = not a direct child (defensive)
+                for (unsigned s = 0; s < kids.size() && s < 3u; ++s)
+                    if (kids[s] == prev) { slot = s; break; }
+                out.emplace_back(cur, slot);
+            }
+            prev = cur;
+        }
+        return out;
+    };
+    auto const contains = [](std::vector<std::pair<HirNodeId, unsigned>> const& anc,
+                             HirNodeId seh, unsigned slot) {
+        for (auto const& [s, sl] : anc)
+            if (s == seh && sl == slot) return true;
+        return false;
+    };
+
+    // Per-function label-ordinal → LabelStmt map (labels are function-scoped;
+    // built lazily since only goto/label-addr rules need it).
+    auto const enclosingFunction = [&](HirNodeId id) {
+        for (HirNodeId cur = hir_.parent(id); cur.valid(); cur = hir_.parent(cur))
+            if (hir_.kind(cur) == HirKind::Function) return cur;
+        return HirNodeId{};
+    };
+    std::unordered_map<std::uint64_t, HirNodeId> labelByFnOrd;
+    for (std::uint32_t i = 1; i < hir_.nodeCount(); ++i) {
+        HirNodeId const id{i, moduleTag};
+        if (hir_.kind(id) != HirKind::LabelStmt) continue;
+        HirNodeId const fn = enclosingFunction(id);
+        if (!fn.valid()) continue;
+        std::uint64_t const key =
+            (static_cast<std::uint64_t>(fn.v) << 32) | hir_.labelOrdinal(id);
+        labelByFnOrd.emplace(key, id);
+    }
+    auto const resolveLabel = [&](HirNodeId from, std::uint32_t ord) {
+        HirNodeId const fn = enclosingFunction(from);
+        if (!fn.valid()) return HirNodeId{};
+        auto const it = labelByFnOrd.find(
+            (static_cast<std::uint64_t>(fn.v) << 32) | ord);
+        return it == labelByFnOrd.end() ? HirNodeId{} : it->second;
+    };
+
+    for (std::uint32_t i = 1; i < hir_.nodeCount(); ++i) {
+        HirNodeId const id{i, moduleTag};
+        if (hasError(hir_.flags(id))) continue;
+        switch (hir_.kind(id)) {
+        case HirKind::BuiltinCall: {
+            auto const bl = static_cast<BuiltinLowering>(hir_.payload(id));
+            if (bl != BuiltinLowering::SehExceptionCode
+                && bl != BuiltinLowering::SehExceptionInfo) break;
+            bool const isInfo = (bl == BuiltinLowering::SehExceptionInfo);
+            bool legal = false;
+            for (auto const& [seh, slot] : sehAncestry(id)) {
+                (void)seh;
+                if (slot == 1u || (!isInfo && slot == 2u)) { legal = true; break; }
+            }
+            if (!legal) {
+                reportAt(reporter, DiagnosticCode::H_SehBuiltinContext, id,
+                         std::format("'{}' is valid only inside an __except {}",
+                                     isInfo ? "_exception_info" : "_exception_code",
+                                     isInfo ? "filter expression"
+                                            : "filter expression or handler body"),
+                         sourceMap_);
+            }
+            break;
+        }
+        case HirKind::ReturnStmt: {
+            for (auto const& [seh, slot] : sehAncestry(id)) {
+                (void)seh;
+                if (slot == 0u) {
+                    reportAt(reporter, DiagnosticCode::H_SehEarlyExit, id,
+                             "'return' inside a __try guarded body is not "
+                             "supported (D-CSUBSET-SEH-EARLY-EXIT: the guarded "
+                             "body keeps a single fall-through exit; "
+                             "trigger-gated — no shipped consumer)",
+                             sourceMap_);
+                    break;
+                }
+            }
+            break;
+        }
+        case HirKind::GotoStmt: {
+            auto const gAnc = sehAncestry(id);
+            HirNodeId const label = resolveLabel(id, hir_.labelOrdinal(id));
+            if (!label.valid()) break;   // unresolved label — not this rule's job
+            auto const lAnc = sehAncestry(label);
+            for (auto const& [seh, slot] : lAnc) {
+                if (!contains(gAnc, seh, slot)) {
+                    reportAt(reporter, DiagnosticCode::H_SehJumpIntoRegion, id,
+                             "goto target label is inside a part of a __try "
+                             "statement that does not enclose the goto (a jump "
+                             "may not enter a guarded region)",
+                             sourceMap_);
+                    break;
+                }
+            }
+            for (auto const& [seh, slot] : gAnc) {
+                if (slot == 0u && !contains(lAnc, seh, 0u)) {
+                    reportAt(reporter, DiagnosticCode::H_SehEarlyExit, id,
+                             "goto out of a __try guarded body is not supported "
+                             "(D-CSUBSET-SEH-EARLY-EXIT: the guarded body keeps "
+                             "a single fall-through exit; trigger-gated — no "
+                             "shipped consumer)",
+                             sourceMap_);
+                    break;
+                }
+            }
+            break;
+        }
+        case HirKind::IndirectGotoStmt: {
+            for (auto const& [seh, slot] : sehAncestry(id)) {
+                (void)seh;
+                if (slot == 0u) {
+                    reportAt(reporter, DiagnosticCode::H_SehEarlyExit, id,
+                             "computed goto inside a __try guarded body is not "
+                             "supported (D-CSUBSET-SEH-EARLY-EXIT: its target "
+                             "set cannot be proven region-internal)",
+                             sourceMap_);
+                    break;
+                }
+            }
+            break;
+        }
+        case HirKind::LabelAddressOf: {
+            HirNodeId const label = resolveLabel(id, hir_.payload(id));
+            if (!label.valid()) break;
+            if (!sehAncestry(label).empty()) {
+                reportAt(reporter, DiagnosticCode::H_SehLabelAddress, id,
+                         "'&&label' naming a label inside a __try statement is "
+                         "not supported (D-CSUBSET-SEH-LABEL-ADDR: a computed "
+                         "goto could enter the guarded range; trigger-gated — "
+                         "no shipped consumer)",
+                         sourceMap_);
+            }
+            break;
+        }
+        case HirKind::BreakStmt:
+        case HirKind::ContinueStmt: {
+            // The break/continue TARGET (loop/switch node) must not sit outside
+            // a guarded body the statement is inside — i.e. walking up from the
+            // statement, a (seh, guarded-body) crossing BEFORE the target frame
+            // is an early exit. Mirrors checkBreakContinueScoping's target
+            // resolution (incl. continue's switch transparency).
+            std::uint32_t const depth = hir_.branchDepth(id);
+            std::vector<HirNodeId> targets = enclosingBranchTargets(hir_, id);
+            if (hir_.kind(id) == HirKind::ContinueStmt) {
+                std::erase_if(targets, [&](HirNodeId t) {
+                    return hir_.kind(t) == HirKind::SwitchStmt;
+                });
+            }
+            if (depth >= targets.size()) break;   // checkBreakContinueScoping owns it
+            HirNodeId const target = targets[depth];
+            HirNodeId prev = id;
+            for (HirNodeId cur = hir_.parent(id); cur.valid();
+                 cur = hir_.parent(cur)) {
+                if (cur == target) break;   // reached the frame first — legal
+                if (hir_.kind(cur) == HirKind::SehTryExcept) {
+                    auto const kids = hir_.children(cur);
+                    if (!kids.empty() && kids[0] == prev) {
+                        reportAt(reporter, DiagnosticCode::H_SehEarlyExit, id,
+                                 std::format(
+                                     "'{}' exiting a __try guarded body is not "
+                                     "supported (D-CSUBSET-SEH-EARLY-EXIT: the "
+                                     "guarded body keeps a single fall-through "
+                                     "exit; trigger-gated — no shipped consumer)",
+                                     hir_.kind(id) == HirKind::BreakStmt
+                                         ? "break" : "continue"),
+                                 sourceMap_);
+                        break;
+                    }
+                }
+                prev = cur;
+            }
+            break;
+        }
+        default: break;
         }
     }
 }

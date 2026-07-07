@@ -3,6 +3,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "analysis/compilation_unit/unit_attribute.hpp"
 #include "core/export.hpp"
+#include "core/substrate/transparent_string_hash.hpp"  // c97: heterogeneous scope-binding lookup
 #include "core/types/data_model.hpp"
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/semantic_config.hpp"
@@ -57,13 +58,16 @@ struct DSS_EXPORT ScopeRecord {
     NodeId   anchor{};   // tree node whose subtree opens this scope (or invalid for root)
     TreeId   tree{};
     // name -> SymbolId, for the ORDINARY namespace. Same-scope redeclaration
-    // is caught here.
-    std::unordered_map<std::string, SymbolId> bindings;
+    // is caught here. (c97: transparent hasher/equality — `ScopeTree::lookup`
+    // walks the parent chain with a `string_view` key, so the per-hop
+    // `std::string` materialization is gone; existing `std::string` callers
+    // are unaffected.)
+    substrate::TransparentStringMap<SymbolId> bindings;
     // C 6.2.3 tag namespace: name -> SymbolId for struct/union/enum TAGS,
     // SEPARATE from `bindings`. A tag and an ordinary symbol of the same name
     // (`typedef struct Pair {…} Pair;`) coexist — one lives here, one in
     // `bindings`. Empty for any scope that declares no tags.
-    std::unordered_map<std::string, SymbolId> tagBindings;
+    substrate::TransparentStringMap<SymbolId> tagBindings;
     std::vector<ScopeId> children;
 };
 
@@ -85,18 +89,23 @@ struct DSS_EXPORT SymbolRecord {
     // found in the type subtree. A reassignment of a const symbol emits
     // S_ConstViolation.
     bool            isConst = false;
-    // c21 (D-CSUBSET-VOLATILE-QUALIFIER): set when the decl's `volatileMarker`
-    // token was found in the type subtree — INDEPENDENT of `isConst` (so `const
-    // volatile` sets both). Read at CST→HIR access lowering (object Ref + struct
-    // MEMBER) and recorded onto the access HIR node via `HirVolatileMap`; HIR→MIR
-    // then stamps `MirInstFlags::Volatile` on that access's Load/Store so the
-    // (already Volatile-aware) optimizer passes cannot elide or reorder it. A
-    // missed access = a silent miscompile, so the threading is exhaustive across
-    // every user Load/Store emit site. Default false ⇒ a plain memory access.
-    bool            isVolatile = false;
+    // c27 (D-CSUBSET-VOLATILE-POINTEE) RETIRED the c21 `isVolatile` bool: volatile
+    // is now a TYPE qualifier (TypeKind::VolatileQual), so OBJECT-volatility is
+    // read directly off a symbol's resolved `type` (top-level VolatileQual) at
+    // CST→HIR access lowering (`recordVolatility`), and POINTEE-volatility rides
+    // the accessed type at the deref/index/member (`volatileFlagForType` in
+    // HIR→MIR). The coarse token-scan the bool fronted could not tell a volatile
+    // OBJECT (`int * volatile p`) from a volatile POINTEE (`volatile int *p`),
+    // which c27's type model now distinguishes. No separate symbol bool remains.
     // SE6: set on a builtin-function symbol declared `variadic` — the
     // call-check skips arg-count enforcement for it.
     bool            variadicBuiltin = false;
+    // c103 (D-CSUBSET-INTRINSIC-UMULH): copied from the builtin's
+    // BuiltinFunctionMapping.lowering at injection. When != None, a CALL to this
+    // builtin symbol lowers (in CST→HIR) to a `HirKind::BuiltinCall` carrying this
+    // lowering, which HIR→MIR maps to the dedicated MirOpcode — NOT an ordinary
+    // Call. None (the default) for every non-lowering symbol.
+    BuiltinLowering builtinLowering = BuiltinLowering::None;
     // SE7/D8: copied from the minting DeclarationRule's `warnIfUnused`. After
     // analysis, a symbol with this flag set AND an empty use-set emits
     // S_UnusedVariable (a WARNING) at `declRuleNode`'s span.
@@ -122,8 +131,11 @@ struct DSS_EXPORT SymbolRecord {
     // missing = previous + 1, C99 §6.7.2.2), OR at descriptor injection for a
     // shipped CONSTANT (`isInjectedConstant`). Carries the int64 BIT-PATTERN —
     // for an unsigned-typed constant the uint64 value reinterpreted; the HIR
-    // fold re-reads it per the type's signedness. Meaningful only when exactly
-    // one of `isEnumerator` / `isInjectedConstant` is set; harmless 0 elsewhere.
+    // fold re-reads it per the type's signedness. c52: a FLOAT-typed injected
+    // constant (`INFINITY`) reuses this int64 carrier to hold the IEEE-754 f64
+    // BIT-PATTERN (std::bit_cast), which the fold bit_casts back to a `double`
+    // when the type is a float kind. Meaningful only when exactly one of
+    // `isEnumerator` / `isInjectedConstant` is set; harmless 0 elsewhere.
     std::int64_t    enumValue = 0;
     // D-CSUBSET-FN-PROTOTYPE: a bare function PROTOTYPE — a function-TYPED object
     // declaration with a function suffix on its NAME and NO body (`int f(int);`).
@@ -150,6 +162,19 @@ struct DSS_EXPORT SymbolRecord {
     // ExternGlobal node suppressed). Two non-defining declarations are idempotent;
     // two definitions still collide (S_RedeclaredSymbol). Default false.
     bool            isExternDeclaration = false;
+    // c33 (D-CSUBSET-TENTATIVE-DEFINITION): TRUE iff this symbol was minted from a
+    // file-scope OBJECT declaration with NO initializer — a TENTATIVE DEFINITION
+    // (C 6.9.2). Like `extern`/proto it is NON-DEFINING for redeclaration-merge
+    // purposes: it merges with a later real (initialized) definition (the def wins
+    // the binding, the tentative is absorbed) and with other tentatives of the same
+    // name (one of them survives and lowers to a single zero-initialized global).
+    // Two REAL definitions (both initialized) still collide (S_RedeclaredSymbol); a
+    // tentative + a real definition of an INCOMPATIBLE type fails loud after Pass 1.5
+    // (S_IncompatibleRedeclaration) via the shared merged-decl type sweep. Read ONLY
+    // by `mergeOrCollideRedeclaration` (folded into its non-defining test); the HIR
+    // lowering keys off `isAbsorbedProto` (set on whichever side is absorbed), so a
+    // SURVIVING tentative emits its zero-init global unchanged. Default false.
+    bool            isTentativeDefinition = false;
     // D-CSUBSET-ENUM-INT-CONVERSION (FC8): TRUE iff this symbol IS an enumerator
     // constant (bound under a `compositeKind:"enum"` decl, where `enumValue` was
     // set). DISTINGUISHES an enumerator from a storage-backed `enum E e;` local —
@@ -157,15 +182,17 @@ struct DSS_EXPORT SymbolRecord {
     // constant value at HIR Ref-lowering; folding a storage-backed local would be
     // a silent miscompile. Default false (every non-enumerator symbol).
     bool            isEnumerator = false;
-    // Item 1 (shipped-header constants): TRUE iff this symbol is a NAMED INTEGER
-    // CONSTANT injected from a neutral shipped-lib descriptor's `constants`
-    // (e.g. `CHAR_BIT` from `limits.json`). Like an enumerator it folds its Ref
-    // to `enumValue` at HIR lowering AND resolves to that value in a constant-
-    // expression context (array dim / case / global init) via the const-eval
-    // engines' direct-value arm — but its `type` is the constant's OWN integer
-    // scalar (NOT an Enum), so the fold derives the literal core from the type
-    // directly. INVARIANT: at most one of `isEnumerator` / `isInjectedConstant`
-    // is true on any symbol (they share `enumValue` but fold via different cores).
+    // Item 1 (shipped-header constants): TRUE iff this symbol is a NAMED CONSTANT
+    // injected from a neutral shipped-lib descriptor's `constants` (integer, e.g.
+    // `CHAR_BIT` from `limits.json`) OR `floatConstants` (float, e.g. `INFINITY`
+    // from `math.json` — c52). Like an enumerator it folds its Ref to `enumValue`
+    // at HIR lowering AND resolves to that value in a constant-expression context
+    // (array dim / case / global init) via the const-eval engines' direct-value
+    // arm — but its `type` is the constant's OWN scalar (NOT an Enum), so the fold
+    // derives the literal core from the type directly (an integer core reads the
+    // int64 carrier; a float core bit_casts it back to a double). INVARIANT: at
+    // most one of `isEnumerator` / `isInjectedConstant` is true on any symbol
+    // (they share `enumValue` but fold via different cores).
     bool            isInjectedConstant = false;
     // D-CSUBSET-BITFIELD (FC8): the declared bit-field width of a struct/union
     // field, or nullopt for an ordinary field. A TRANSIENT carrier — set at the
@@ -223,6 +250,8 @@ public:
                   std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
                   UnitAttribute<bool>                    nullPointerConstantNodes,
                   std::vector<ShippedExternSymbol>       shippedExterns,
+                  std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+                                                         suppressedShippedLibraries,
                   DataModel                              dataModel) noexcept
         : cu_(std::move(cu)),
           lattice_(std::move(lattice)),
@@ -235,6 +264,7 @@ public:
           compositeScopeByType_(std::move(compositeScopeByType)),
           nullPointerConstantNodes_(std::move(nullPointerConstantNodes)),
           shippedExterns_(std::move(shippedExterns)),
+          suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
           dataModel_(dataModel) {}
 
     SemanticModel(SemanticModel const&)            = delete;
@@ -310,6 +340,20 @@ public:
         return shippedExterns_;
     }
 
+    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): the per-format library map of
+    // a shipped descriptor symbol that GOAL-2 SUPPRESSED because a user
+    // declaration claimed the name (shell.c bare-declares `popen` while also
+    // `#include <stdio.h>`). Read by the CST→HIR bare-proto extern synthesis so
+    // the user's prototype re-binds the descriptor's import library instead of
+    // surviving to the linker as an undefined symbol. Availability-gated +
+    // first-wins at record time (exactly mirroring injection). Returns nullptr
+    // when no suppressed descriptor symbol carries this name.
+    [[nodiscard]] std::unordered_map<std::string, std::string> const*
+    suppressedShippedLibraryFor(std::string const& name) const noexcept {
+        auto const it = suppressedShippedLibraries_.find(name);
+        return it == suppressedShippedLibraries_.end() ? nullptr : &it->second;
+    }
+
     // FC3 c1: the data model this analysis ran under (`analyze()`'s
     // parameter — the active format's declared width triple). The HIR
     // lowering reads THIS (never a second parameter), so the two tiers'
@@ -340,6 +384,10 @@ private:
     // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the
     // CST→HIR lowerer.
     std::vector<ShippedExternSymbol>                       shippedExterns_;
+    // c86: name → per-format library map for goal-2-SUPPRESSED shipped
+    // descriptor symbols (see `suppressedShippedLibraryFor`).
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+                                                           suppressedShippedLibraries_;
     // FC3 c1: the analysis-time data model (see `dataModel()`).
     DataModel                                              dataModel_ = DataModel::Lp64;
 };

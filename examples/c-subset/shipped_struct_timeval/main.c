@@ -1,9 +1,12 @@
 /* Cluster G — the struct-body descriptor mechanism (the FIRST named-field struct
  * shipped via a descriptor). `#include <sys/time.h>` resolves to shippedLibs/sys/
  * time.json (the c6 subdir resolver) whose `structs` surface declares
- * `struct timeval { i64 tv_sec; i64 tv_usec; }`. The semantic phase injects the
- * tag (TAG namespace) + a field scope + compositeScopeByType, so by-NAME field
- * access resolves and the layout engine derives the offsets (tv_sec@0, tv_usec@8).
+ * `struct timeval` — since c83 as per-format `variants`: elf {i64 tv_sec; i64
+ * tv_usec}, macho {i64 tv_sec; i32 tv_usec + 4 trailing pad} (Darwin
+ * __darwin_suseconds_t is __int32_t; see shipped_timeval_macho for the width
+ * pins). The semantic phase injects the tag (TAG namespace) + a field scope +
+ * compositeScopeByType, so by-NAME field access resolves and the layout engine
+ * derives the offsets (tv_sec@0, tv_usec@8, sizeof 16 on every unix ABI).
  *
  * exit 42 is the witness that (a) `struct timeval` resolved from the descriptor,
  * (b) tv_sec/tv_usec field access compiles, (c) the read/write lands at the right
