@@ -100,7 +100,10 @@ public:
         return instructionsCsed_;
     }
 
-    void analyze(MirFuncId fn);
+    // `preds` = `mirBuildPredecessors(mir)` for the SAME module, computed ONCE by
+    // runCse and threaded in (invariant across every function in one Cse pass), so
+    // the whole-module predecessor build is not repeated per function / per query.
+    void analyze(MirFuncId fn, std::vector<std::vector<MirBlockId>> const& preds);
 
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
@@ -147,15 +150,17 @@ private:
     std::size_t instructionsCsed_ = 0;
 };
 
-void CsePolicy::analyze(MirFuncId fn) {
+void CsePolicy::analyze(MirFuncId fn,
+                        std::vector<std::vector<MirBlockId>> const& preds) {
     resetPerFunction();
     std::uint32_t const blockCount = src_.funcBlockCount(fn);
     if (blockCount == 0) return;
 
-    // Build the dom tree. CSE only walks reachable blocks (RPO).
+    // Build the dom tree. CSE only walks reachable blocks (RPO). `preds` is the
+    // caller's precomputed whole-module predecessor map (invariant this pass) —
+    // no per-function rebuild here anymore.
     MirBlockId const entry = src_.funcEntry(fn);
     auto const rpo = mirReversePostOrder(src_, entry);
-    auto const preds = mirBuildPredecessors(src_);
     auto const dom = computeMirDomTree(src_, entry, rpo, preds);
     auto const dchild = mirDomTreeChildren(src_, dom);
 
@@ -313,7 +318,7 @@ void CsePolicy::analyze(MirFuncId fn) {
                         }
                         if (admit) {
                             auto const region = mirRegionBetween(
-                                src_, canonicalBlock, B);
+                                src_, canonicalBlock, B, preds);
                             if (mirAnyMayAliasingStoreInRegion(
                                     src_, interner_, loadPtr, region,
                                     strictTbaa_,
@@ -367,9 +372,16 @@ CseResult runCse(Mir& mir, TypeInterner const& interner,
 
     CsePolicy policy{mir, interner};
     std::size_t const nf = mir.moduleFuncCount();
+    // Compute the whole-module predecessor map ONCE for the entire pass — it is
+    // invariant while `mir` is read-only (the rebuild writes a SEPARATE builder,
+    // finalized only after this loop at `mir = ...finish()`). Threading it into
+    // analyze()/mirRegionBetween removes the O(numFunctions × moduleSize) rebuild
+    // + the per-Load-query rebuild that made CSE the release-optimizer tentpole
+    // on SQLite (D-OPT-MEMORYSSA-CLOBBER-WALK's residual O(K²×region) stays gated).
+    auto const preds = mirBuildPredecessors(mir);
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
-        policy.analyze(f);
+        policy.analyze(f, preds);
         MirFunctionRebuilder rb{mir, builder, policy};
         rb.rebuildFunction(f);
     }

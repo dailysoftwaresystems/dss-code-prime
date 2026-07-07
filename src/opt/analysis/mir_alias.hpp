@@ -23,6 +23,7 @@
 #include "mir/mir_dom.hpp"
 #include "mir/mir_opcode.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -233,17 +234,32 @@ namespace detail {
 //
 // Bounded by step-cap = block-count * 4 + 4; fail-loud on overflow
 // (signals a malformed CFG the verifier should have caught).
+// `preds` MUST be `mirBuildPredecessors(mir)` for the SAME module — the caller
+// computes it ONCE (it is invariant for the module's lifetime within a single
+// rebuild pass: the module is `const` until the pass's `finish()`), so threading
+// it in avoids an O(module) predecessor rebuild PER query (the CSE Load-admission
+// hot path — was the tentpole of the release-optimizer cost on SQLite). Sole caller: CSE.
 [[nodiscard]] inline std::vector<MirBlockId>
 mirRegionBetween(
-    Mir const&        mir,
-    MirBlockId        loadBlock,
-    MirBlockId        useBlock)
+    Mir const&                                  mir,
+    MirBlockId                                  loadBlock,
+    MirBlockId                                  useBlock,
+    std::vector<std::vector<MirBlockId>> const& preds)
 {
     std::vector<MirBlockId> result;
     if (!loadBlock.valid() || !useBlock.valid()) return result;
 
     std::uint32_t const blockCount = static_cast<std::uint32_t>(mir.blockCount());
     if (blockCount == 0) return result;
+    // The caller's precomputed whole-module preds must match this module — a
+    // function-local or stale-module preds would silently mis-scope the region.
+    if (preds.size() != mir.blockCount()) {
+        std::fprintf(stderr,
+            "dss::opt::analysis::mirRegionBetween fatal: preds.size()=%zu != "
+            "mir.blockCount()=%zu — caller passed a stale/foreign predecessor map.\n",
+            preds.size(), mir.blockCount());
+        std::abort();
+    }
     std::uint32_t const stepCap = blockCount * 4u + 4u;
 
     // Forward-reachable from `loadBlock`.
@@ -272,8 +288,9 @@ mirRegionBetween(
         }
     }
 
-    // Backward-reachable from `useBlock` (via predecessors).
-    auto const preds = mirBuildPredecessors(mir);
+    // Backward-reachable from `useBlock` (via predecessors — `preds`, computed
+    // ONCE by the caller for this module; invariant across all queries, so no
+    // per-query whole-module rebuild here anymore).
     std::unordered_set<std::uint32_t> bwd;
     {
         std::vector<MirBlockId> work;
@@ -304,14 +321,23 @@ mirRegionBetween(
     // both) and prevents the dead-code-masking-bug class where a
     // useBlock-included region + a redundant head-of-useBlock scan
     // could disagree on which scanner found a clobber.
-    for (std::uint32_t v = 1; v < blockCount; ++v) {
-        if (v == loadBlock.v) continue;
-        if (v == useBlock.v) continue;
-        if (fwd.count(v) && bwd.count(v)) {
+    // Iterate the SMALLER reachability set (both are function-local, typically
+    // tiny) instead of [1, blockCount) — the per-query whole-module scan was the
+    // second half of the CSE hot-path cost. The explicit sort restores the
+    // by-slot postcondition (an unordered_set walk is unordered); the resulting
+    // set + order are byte-identical to the old whole-module loop (same endpoint
+    // exclusions, bounds `1 <= v < blockCount`, and module tag).
+    auto const& smaller = fwd.size() <= bwd.size() ? fwd : bwd;
+    auto const& larger  = fwd.size() <= bwd.size() ? bwd : fwd;
+    for (std::uint32_t const v : smaller) {
+        if (v < 1u || v >= blockCount) continue;
+        if (v == loadBlock.v || v == useBlock.v) continue;
+        if (larger.count(v)) {
             result.push_back(MirBlockId{v, mir.id().v});
         }
     }
-    // result is already sorted by `v` because the loop emits in order.
+    std::sort(result.begin(), result.end(),
+              [](MirBlockId a, MirBlockId b) { return a.v < b.v; });
     return result;
 }
 
