@@ -49,7 +49,8 @@ enum class CompilePhase : std::uint8_t {
     LowerHir,        // CST -> HIR
     SynthesizeFfi,   // FFI metadata synthesis for source-declared externs
     LowerMir,        // HIR -> MIR
-    Optimize,        // MIR optimizer pipeline (incl. the mandatory prune-unreachable)
+    Optimize,        // MIR optimizer pipeline passes (excl. the after-pass verify below)
+    Verify,          // the after-every-pass MirVerifier (D-OPT1-VERIFY-AFTER-EVERY-PASS) — split out to measure its share
     LowerLir,        // MIR -> LIR (+ wide-call arg materialization)
     Regalloc,        // liveness + allocation + rewrite + 2-addr legalize + callconv
     Encode,          // assemble to bytes + globals/jump-table/sign-mask data items

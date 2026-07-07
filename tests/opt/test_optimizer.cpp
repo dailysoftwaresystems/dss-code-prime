@@ -917,9 +917,11 @@ TEST(Optimizer, EffectivenessInliningFiresOnLeafCall) {
 // release.pipeline.json ITSELF (loadShippedPipeline — name/maxIterations/
 // inlineThreshold from the file, zero drift) over each probe's MIR and
 // asserts (a) optimize() ok + (b) the post-pipeline module is verifier-
-// clean (incl. the new I_LayoutUseBeforeDef rule). `optimize` already
-// verifies after every pass, so result.ok implies per-pass cleanliness;
-// the explicit final verify is the belt-and-suspenders MIR-tier capstone.
+// clean (incl. the new I_LayoutUseBeforeDef rule). The release pipeline now
+// verifies ONCE at pipeline end (`verifyEveryPass=false`, the production posture
+// — D-OPT1-VERIFY-FREQUENCY-CONFIG), so result.ok implies the FINAL module is
+// verifier-clean; the explicit final verify below is the belt-and-suspenders
+// MIR-tier capstone.
 // (The CORPUS rows release_pipeline_recursion / release_pipeline_loop
 // carry the runtime exit-42 proof across all four targets; this is the
 // target-blind MIR-tier twin.)

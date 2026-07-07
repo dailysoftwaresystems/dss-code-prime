@@ -8,6 +8,7 @@
 #include "mir/mir_opcode.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -87,6 +88,7 @@ public:
     [[nodiscard]] std::size_t phisInserted()      const noexcept { return phisInserted_; }
     [[nodiscard]] std::size_t loadsReplaced()     const noexcept { return loadsReplaced_; }
     [[nodiscard]] std::size_t storesEliminated()  const noexcept { return storesEliminated_; }
+    [[nodiscard]] std::uint64_t lastLivenessNs()  const noexcept { return lastLivenessNs_; }
 
     // Run the analysis + rename DFS for one function. Records all
     // load replacements + pending phi incomings; the subsequent
@@ -224,6 +226,7 @@ public:
         zeroConstNewIdByType_.clear();
         entryBlock_ = MirBlockId{};
         nextMarker_ = 1;
+        lastLivenessNs_ = 0;
     }
 
 private:
@@ -299,6 +302,7 @@ private:
     std::size_t loadsReplaced_    = 0;
     std::size_t storesEliminated_ = 0;
     std::uint32_t nextMarker_     = 1;
+    std::uint64_t lastLivenessNs_ = 0;  // env-gated timing of the Step-4b liveness fixpoint
 };
 
 void Mem2RegPolicy::analyze(MirFuncId fn) {
@@ -511,6 +515,7 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
         }
     }
     std::unordered_map<std::uint32_t, std::unordered_set<std::uint32_t>> liveIn;
+    auto const livenessT0 = std::chrono::steady_clock::now();
     for (bool changed = true; changed; ) {
         changed = false;
         // Reverse-RPO: visit successors before predecessors so the fixpoint
@@ -530,6 +535,9 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
             if (in != cur) { cur = std::move(in); changed = true; }
         }
     }
+    lastLivenessNs_ = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - livenessT0).count());
 
     // De-promote allocas that WOULD need an undef-as-zero incoming — they are
     // live-in at the ENTRY block (read-before-write on some path) — but whose
@@ -785,12 +793,30 @@ Mem2RegResult runMem2Reg(Mir& mir, TypeInterner const& interner,
     // Per-function: analyze → rebuild → finalize phi incomings.
     Mem2RegPolicy policy{mir, interner};
     std::size_t const nf = mir.moduleFuncCount();
+    bool const trace = std::getenv("DSS_OPT_TRACE") != nullptr;   // env-gated per-function timing
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
+        auto const t0 = trace ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
         policy.analyze(f);
+        auto const tA = trace ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
         MirFunctionRebuilder rb{mir, builder, policy};
         rb.rebuildFunction(f);
         policy.finalizePhiIncomings(builder, rb.blockMap(), rb.rewriteMap());
+        if (trace) {
+            auto const t1 = std::chrono::steady_clock::now();
+            auto const anMs = std::chrono::duration_cast<std::chrono::milliseconds>(tA - t0).count();
+            auto const rbMs = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - tA).count();
+            if (anMs + rbMs > 150) {
+                std::fprintf(stderr,
+                    "mem2reg: func=%u blocks=%u analyze=%lldms rebuild=%lldms liveness=%lldms\n",
+                    f.v, mir.funcBlockCount(f),
+                    static_cast<long long>(anMs), static_cast<long long>(rbMs),
+                    static_cast<long long>(policy.lastLivenessNs() / 1000000));
+                std::fflush(stderr);
+            }
+        }
     }
 
     result.allocasPromoted   = policy.allocasPromoted();

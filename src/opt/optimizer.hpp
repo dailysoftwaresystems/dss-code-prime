@@ -162,6 +162,19 @@ struct OptPipeline {
     // only a 1-instruction callee. The loader rejects 0 (a silent
     // refuse-all trap) and caps at `kMaxInlineThreshold`.
     std::uint32_t       inlineThreshold = kDefaultInlineThreshold;
+    // Verify frequency (D-OPT1-VERIFY-FREQUENCY-CONFIG). `true` (the safe
+    // default) runs `MirVerifier` after EVERY successful pass — the developer
+    // posture (LLVM `opt -verify-each` / GCC `--enable-checking=yes`): it
+    // pinpoints the exact pass that produced invalid MIR. `false` runs the
+    // verifier ONCE after the whole pipeline (before codegen consumes the
+    // module) — the release/production posture (LLVM/GCC trust their tested
+    // passes + verify at boundaries). Per-pass verify over a large module
+    // (SQLite) is ~N-passes × N-iterations full-module verifies — minutes; the
+    // once-at-end verify still catches a structurally-broken optimizer output
+    // before it corrupts LIR/asm. Config-driven per pipeline (NOT a build-mode
+    // branch in the engine), so `release.pipeline.json` can opt into verify-each
+    // on demand when hunting a release-only miscompile.
+    bool                verifyEveryPass = true;
 };
 
 // Substrate bound on `OptPipeline::maxIterations` — the loader
