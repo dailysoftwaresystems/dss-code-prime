@@ -34,7 +34,12 @@ public:
         return blocksMerged_;
     }
 
-    void analyze(MirFuncId fn);
+    // `preds` = `mirBuildPredecessors(mir)` for the SAME module, computed ONCE
+    // by runSimplifyCfg and threaded in (invariant across every function in one
+    // pass — the same argument-identity hoist CSE/LICM received:
+    // D-OPT-CSE-ANALYSIS-HOIST). analyze only VALUE-READS `preds[B.v]` for the
+    // merge-candidate single-predecessor check.
+    void analyze(MirFuncId fn, std::vector<std::vector<MirBlockId>> const& preds);
 
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
@@ -240,7 +245,8 @@ private:
     std::size_t blocksMerged_       = 0;
 };
 
-void SimplifyCfgPolicy::analyze(MirFuncId fn) {
+void SimplifyCfgPolicy::analyze(MirFuncId fn,
+                                std::vector<std::vector<MirBlockId>> const& preds) {
     resetPerFunction();
     MirBlockId const entry = src_.funcEntry(fn);
     auto const rpo = mirReversePostOrder(src_, entry);
@@ -328,7 +334,8 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn) {
     // the post-rebuild canonical re-derivation stamps the merged
     // block's actual structural role (D-OPT4-1-NON-LINEAR-MARKER-
     // MERGE closed). The remaining conditions are pure CFG-legality.
-    auto const preds = mirBuildPredecessors(src_);
+    // `preds` is the caller's precomputed whole-module predecessor map
+    // (invariant this pass) — no per-function rebuild here anymore.
     auto isCandidateForMerge = [&](MirBlockId P, MirBlockId B) -> bool {
         if (B.v == entry.v) return false;
         // D-CSUBSET-COMPUTED-GOTO (MF-B): never MERGE an ADDRESS-TAKEN block B into
@@ -538,9 +545,15 @@ SimplifyCfgResult runSimplifyCfg(Mir& mir, TypeInterner const& /*interner*/,
 
     SimplifyCfgPolicy policy{mir};
     std::size_t const nf = mir.moduleFuncCount();
+    // Compute the whole-module predecessor map ONCE for the entire pass —
+    // invariant while `mir` is read-only (the rebuild writes a SEPARATE
+    // builder, finalized only after this loop). Removes the per-function
+    // whole-module rebuild (the CSE/LICM-audited argument-identity hoist,
+    // D-OPT-CSE-ANALYSIS-HOIST — analyze only value-reads `preds[B.v]`).
+    auto const preds = mirBuildPredecessors(mir);
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
-        policy.analyze(f);
+        policy.analyze(f, preds);
         MirFunctionRebuilder rb{mir, builder, policy};
         rb.rebuildFunction(f);
     }
