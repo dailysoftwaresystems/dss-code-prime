@@ -66,8 +66,17 @@ struct SimplifyCfgResult {
     std::size_t blocksMerged       = 0;
 };
 
+// `maintainMarkers` (default true = the developer/test posture): re-stamp every
+// block's StructCfMarker from the canonical CFG derivation after the rebuild.
+// Markers feed ONLY the verifier (no optimization decision or codegen reads
+// them; pass rebuilds copy them through verbatim), so a pipeline that does NOT
+// verify after every pass (`OptPipeline::verifyEveryPass == false`, the release
+// posture) passes false here and the optimizer re-derives ONCE after the whole
+// pipeline instead — the whole-module derivation (preds + per-fn RPO + dom) was
+// ~78% of this pass's cost on SQLite (the D-OPT1-VERIFY-FREQUENCY-CONFIG
+// posture split, applied to marker maintenance).
 [[nodiscard]] DSS_EXPORT SimplifyCfgResult
 runSimplifyCfg(Mir& mir, TypeInterner const& interner,
-               DiagnosticReporter& reporter);
+               DiagnosticReporter& reporter, bool maintainMarkers = true);
 
 } // namespace dss::opt::passes

@@ -2,6 +2,7 @@
 
 #include "core/substrate/phase_timers.hpp"
 #include "core/types/parse_diagnostic.hpp"
+#include "mir/mir_struct_markers.hpp"
 #include "mir/mir_verifier.hpp"
 
 #include <chrono>
@@ -66,7 +67,12 @@ struct PassRunResult {
             return {r.ok, r.instructionsCsed > 0};
         }
         case PassId::SimplifyCfg: {
-            auto const r = passes::runSimplifyCfg(mir, interner, reporter);
+            // Marker maintenance rides the verify posture: with per-pass verify
+            // OFF nothing reads markers between passes, so the pass skips its
+            // whole-module re-derivation and optimize() re-stamps ONCE after
+            // the pipeline (before the final verify).
+            auto const r = passes::runSimplifyCfg(mir, interner, reporter,
+                                                  pipeline.verifyEveryPass);
             return {r.ok,
                     r.branchesFolded + r.blocksJumpThreaded
                   + r.blocksMerged > 0};
@@ -76,8 +82,10 @@ struct PassRunResult {
             return {r.ok, r.instructionsHoisted > 0};
         }
         case PassId::Inlining: {
+            // Marker maintenance rides the verify posture (see SimplifyCfg).
             auto const r = passes::runInlining(mir, interner, reporter,
-                                               pipeline.inlineThreshold);
+                                               pipeline.inlineThreshold,
+                                               pipeline.verifyEveryPass);
             return {r.ok, r.callsInlined > 0};
         }
     }
@@ -261,6 +269,13 @@ OptResult optimize(Mir& mir,
     // codegen consumes it, but re-verifying the whole module after every pass
     // over a large module (SQLite) is minutes wasted on a tested pipeline.
     if (!pipeline.verifyEveryPass && reporter.errorCount() == entryErrorCount) {
+        // Under this posture the CFG-mutating passes (SimplifyCfg / Inlining)
+        // skipped their per-call whole-module marker re-derivation (markers
+        // feed only the verifier — nothing reads them between passes). Re-stamp
+        // every block ONCE from the FINAL CFG here, so the final verify (and
+        // anything downstream) sees canonical markers. This one call replaces
+        // up to passes × iterations whole-module derivations (~2min on SQLite).
+        rederiveStructCfMarkers(mir);
         substrate::PhaseTimers::Scope verifyScope{substrate::CompilePhase::Verify};
         MirVerifier verifier{mir, &interner};
         if (!verifier.verify(reporter)) {

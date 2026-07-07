@@ -533,7 +533,8 @@ void SimplifyCfgPolicy::analyze(MirFuncId fn,
 } // namespace
 
 SimplifyCfgResult runSimplifyCfg(Mir& mir, TypeInterner const& /*interner*/,
-                                 DiagnosticReporter& reporter) {
+                                 DiagnosticReporter& reporter,
+                                 bool maintainMarkers) {
     SimplifyCfgResult result{};
     MirBuilder builder;
 
@@ -564,8 +565,14 @@ SimplifyCfgResult runSimplifyCfg(Mir& mir, TypeInterner const& /*interner*/,
     mir = std::move(builder).finish();
     // Canonical-marker stamping (D-OPT4-1): SimplifyCfg mutates the CFG
     // (fold/thread/merge), so every surviving block's structural role is
-    // re-derived from the NEW shape — no incremental marker repair.
-    rederiveStructCfMarkers(mir);
+    // re-derived from the NEW shape — no incremental marker repair. Under the
+    // release posture (`maintainMarkers == false` — the pipeline does not
+    // verify per pass, and NOTHING else reads markers mid-pipeline) the
+    // optimizer re-derives ONCE after the whole pipeline instead: this
+    // whole-module derivation was ~78% of the pass's cost on SQLite.
+    if (maintainMarkers) {
+        rederiveStructCfMarkers(mir);
+    }
     result.ok = true;
     return result;
 }

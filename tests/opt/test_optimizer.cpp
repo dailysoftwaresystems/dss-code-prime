@@ -117,6 +117,86 @@ TEST(Optimizer, OptResultIdentityShape) {
     EXPECT_EQ(rep.errorCount(), 0u);
 }
 
+// Release-posture marker canonicality (the D-OPT1-VERIFY-FREQUENCY-CONFIG
+// posture split applied to marker maintenance): with `verifyEveryPass=false`
+// the CFG-mutating passes SKIP their per-call whole-module
+// `rederiveStructCfMarkers` (markers feed only the verifier — nothing reads
+// them between passes), and optimize() re-stamps ONCE from the FINAL CFG
+// before the final verify. PIN: after optimize(), the stored markers are
+// CANONICAL — a second re-derivation changes nothing (idempotence). The shape
+// makes staleness observable: SimplifyCfg folds `CondBr(Const true)` → `Br`,
+// after which the then-arm's copied-through `IfThen` marker is STALE (the
+// canonical derivation of the folded CFG has no CondBr to claim it) — dropping
+// the optimizer's final re-stamp reds this test.
+TEST(Optimizer, ReleasePostureRederivesMarkersOnceAfterPipeline) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const fArm  = mb.createBlock(StructCfMarker::IfElse);
+    MirBlockId const join  = mb.createBlock(StructCfMarker::IfJoin);
+    mb.beginBlock(entry);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cond = mb.addConst(tru, boolT);
+    mb.addCondBr(cond, tArm, fArm);
+    mb.beginBlock(tArm);
+    MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+    MirInstId const c1 = mb.addConst(v1, i32);
+    MirInstId const a1[] = {c1, c1};
+    (void)mb.addInst(MirOpcode::Add, a1, i32);
+    mb.addBr(join);
+    mb.beginBlock(fArm);
+    MirLiteralValue v2; v2.value = std::int64_t{2}; v2.core = TypeKind::I32;
+    MirInstId const c2 = mb.addConst(v2, i32);
+    MirInstId const a2[] = {c2, c2};
+    (void)mb.addInst(MirOpcode::Add, a2, i32);
+    mb.addBr(join);
+    mb.beginBlock(join);
+    MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+    MirInstId const c3 = mb.addConst(v3, i32);
+    MirInstId const a3[] = {c3, c3};
+    MirInstId const r = mb.addInst(MirOpcode::Add, a3, i32);
+    mb.addReturn(r);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    opt::OptPipeline pipeline{"release-shape", {opt::PassId::SimplifyCfg}};
+    pipeline.verifyEveryPass = false;
+    auto const result = opt::optimize(mir, target, interner, pipeline, rep);
+    ASSERT_TRUE(result.ok);
+    ASSERT_GE(result.passesMutated, 1u)
+        << "the CondBr(Const true) fold must fire — the staleness this pin "
+           "guards is only observable after a CFG mutation";
+
+    // Canonicality by idempotence: snapshot → re-derive → identical.
+    std::vector<std::pair<std::uint32_t, StructCfMarker>> snapshot;
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < nf; ++fi) {
+        MirFuncId const f = mir.funcAt(fi);
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(f, bi);
+            snapshot.emplace_back(b.v, mir.blockMarker(b));
+        }
+    }
+    rederiveStructCfMarkers(mir);
+    for (auto const& [slot, marker] : snapshot) {
+        MirBlockId const b{slot, mir.id().v};
+        EXPECT_EQ(static_cast<int>(mir.blockMarker(b)), static_cast<int>(marker))
+            << "block #" << slot << " marker was NOT canonical after "
+               "release-posture optimize() — the final re-stamp in "
+               "optimize() was skipped or incomplete";
+    }
+}
+
 // D-OPT-CONSTFOLD-RERUN-POST-MEM2REG + D-OPT-PASS-METRICS effectiveness
 // pin. Builds the `const_fold_inside_expr` witness in MIR form:
 //     int a = 26;

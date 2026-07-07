@@ -9,7 +9,10 @@
 #include "mir/mir_cfg.hpp"
 #include "mir/mir_opcode.hpp"
 
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <unordered_set>
 #include <vector>
 
@@ -173,6 +176,8 @@ void rederiveStructCfMarkers(Mir& mir, MirFuncId f) {
 }
 
 void rederiveStructCfMarkers(Mir& mir) {
+    static bool const trace = std::getenv("DSS_OPT_TRACE") != nullptr;
+    auto const t0 = std::chrono::steady_clock::now();
     // One predecessor build for the whole module; per-function RPO/dom.
     auto const preds = mirBuildPredecessors(mir);
     std::size_t const nf = mir.moduleFuncCount();
@@ -183,6 +188,12 @@ void rederiveStructCfMarkers(Mir& mir) {
         auto const rpo = mirReversePostOrder(mir, entry);
         MirDomTree const dom = computeMirDomTree(mir, entry, rpo, preds);
         applyDerived(mir, f, deriveStructCfMarkers(mir, f, preds, rpo, dom));
+    }
+    if (trace) {
+        auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "opt:   rederiveStructCfMarkers whole-module %lldms\n",
+                     static_cast<long long>(ms));
     }
 }
 

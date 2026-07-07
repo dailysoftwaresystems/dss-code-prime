@@ -1333,7 +1333,8 @@ planHasMultiBlock(Mir const& src, ModuleAnalysis const& analysis,
 
 InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
                            DiagnosticReporter& reporter,
-                           std::uint32_t inlineThreshold) {
+                           std::uint32_t inlineThreshold,
+                           bool maintainMarkers) {
     InliningResult result{};
     MirBuilder builder;
 
@@ -1403,8 +1404,14 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
     // Canonical-marker stamping (D-OPT4-1): the splice changed the
     // caller's CFG (split blocks, cloned callee bodies). Markers are
     // re-derived from the NEW shape — inlined loop headers re-emerge
-    // as LoopHeader; continuation blocks take their actual role.
-    rederiveStructCfMarkers(mir);
+    // as LoopHeader; continuation blocks take their actual role. Under the
+    // release posture (`maintainMarkers == false` — no per-pass verify, and
+    // NOTHING else reads markers mid-pipeline) the optimizer re-derives ONCE
+    // after the whole pipeline instead: this whole-module derivation was ~91%
+    // of the pass's cost on SQLite.
+    if (maintainMarkers) {
+        rederiveStructCfMarkers(mir);
+    }
     result.ok = true;
     return result;
 }

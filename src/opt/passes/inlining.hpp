@@ -129,8 +129,18 @@ struct InliningResult {
 // rejects 0) but, if constructed programmatically, refuses everything
 // (fail-safe). FAIL-SAFE: a threshold below the smallest callee refuses
 // all inlining; nothing miscompiles.
+// `maintainMarkers` (default true = the developer/test posture): re-stamp every
+// block's StructCfMarker from the canonical CFG derivation after the splice.
+// Markers feed ONLY the verifier (no optimization decision or codegen reads
+// them; pass rebuilds copy them through verbatim), so a pipeline that does NOT
+// verify after every pass (`OptPipeline::verifyEveryPass == false`, the release
+// posture) passes false here and the optimizer re-derives ONCE after the whole
+// pipeline instead — the whole-module derivation was ~91% of this pass's cost
+// on SQLite (the D-OPT1-VERIFY-FREQUENCY-CONFIG posture split, applied to
+// marker maintenance).
 [[nodiscard]] DSS_EXPORT InliningResult
 runInlining(Mir& mir, TypeInterner const& interner,
-            DiagnosticReporter& reporter, std::uint32_t inlineThreshold);
+            DiagnosticReporter& reporter, std::uint32_t inlineThreshold,
+            bool maintainMarkers = true);
 
 } // namespace dss::opt::passes
