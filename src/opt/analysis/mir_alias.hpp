@@ -9,10 +9,12 @@
 // flag from `SemanticConfig.PointerAliasingRules`; that wiring lives in
 // the consumer cycle and is anchored at `D-OPT-LOAD-ALIAS-ANALYSIS`.
 //
-// Long-term substrate: MemorySSA (one walk per function, then ~O(1)
-// clobber queries). Anchored at `D-OPT-MEMORYSSA-CLOBBER-WALK`; built
-// when the region-walk step-cap fires on real input OR a third memory-
-// clobber consumer (DSE) lands.
+// `D-OPT-MEMORYSSA-CLOBBER-WALK` is CLOSED by `mir_memory_clobbers.hpp`
+// (`MirMemoryClobbers` — the pass-wide clobber index + memoized reachability;
+// one build per pass, cheap queries). The region/loop walkers BELOW are kept
+// as the REFERENCE implementation: they define the query semantics, and the
+// differential tests assert the index's answers equal these walkers' answers
+// on every curated shape. Production consumers (CSE, LICM) query the index.
 
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"
@@ -234,11 +236,12 @@ namespace detail {
 //
 // Bounded by step-cap = block-count * 4 + 4; fail-loud on overflow
 // (signals a malformed CFG the verifier should have caught).
-// `preds` MUST be `mirBuildPredecessors(mir)` for the SAME module — the caller
-// computes it ONCE (it is invariant for the module's lifetime within a single
-// rebuild pass: the module is `const` until the pass's `finish()`), so threading
-// it in avoids an O(module) predecessor rebuild PER query (the CSE Load-admission
-// hot path — was the tentpole of the release-optimizer cost on SQLite). Sole caller: CSE.
+// REFERENCE implementation (test oracle since D-OPT-MEMORYSSA-CLOBBER-WALK
+// closed): production CSE queries `MirMemoryClobbers::anyClobberBetween`, whose
+// region semantics are DEFINED by this walker — the differential pins assert
+// equality. `preds` MUST be `mirBuildPredecessors(mir)` for the SAME module —
+// the caller computes it ONCE (it is invariant for the module's lifetime within
+// a single rebuild pass: the module is `const` until the pass's `finish()`).
 [[nodiscard]] inline std::vector<MirBlockId>
 mirRegionBetween(
     Mir const&                                  mir,

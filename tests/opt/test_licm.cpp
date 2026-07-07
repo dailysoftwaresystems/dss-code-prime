@@ -357,6 +357,63 @@ TEST(Licm, InvariantLoadHoisted) {
         << "alias-clean Load must hoist now that alias substrate is wired";
 }
 
+// Multi-function preds-hoist + clobber-index decision-identity pin
+// (D-OPT-MEMORYSSA-CLOBBER-WALK; the LICM analog of CSE's
+// CrossBlockLoadCseDecidedPerFunctionInMultiFunctionModule): `runLicm` now
+// computes the whole-module preds + the clobber index ONCE and threads them
+// into every function's analyze — this pins that the hoist decision stays
+// PER FUNCTION: fn0's loop body carries an aliasing Store (Load hoist
+// refused), fn1's identical loop is clean (Load hoists) → exactly one hoist.
+// A leaked clobber/preds scope across functions would mis-count.
+TEST(Licm, LoopLoadHoistDecidedPerFunctionInMultiFunctionModule) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    for (std::uint32_t fnIdx = 0; fnIdx < 2; ++fnIdx) {
+        mb.addFunction(fnSig, SymbolId{100u + fnIdx});
+        MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+        MirBlockId const body   = mb.createBlock(StructCfMarker::LoopLatch);
+        MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+        mb.beginBlock(entry);
+        MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+        MirLiteralValue v42; v42.value = std::int64_t{42}; v42.core = TypeKind::I32;
+        MirInstId const c = mb.addConst(v42, i32);
+        MirInstId const s[] = {c, slot};
+        (void)mb.addInst(MirOpcode::Store, s, InvalidType);
+        mb.addBr(header);
+        mb.beginBlock(header);
+        MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+        MirInstId const cond = mb.addConst(tru, boolT);
+        mb.addCondBr(cond, body, exitB);
+        mb.beginBlock(body);
+        MirInstId const lops[] = {slot};
+        (void)mb.addInst(MirOpcode::Load, lops, i32);
+        if (fnIdx == 0) {   // aliasing Store in fn0's body ONLY — refuses its hoist
+            MirLiteralValue v99; v99.value = std::int64_t{99}; v99.core = TypeKind::I32;
+            MirInstId const c99 = mb.addConst(v99, i32);
+            MirInstId const s99[] = {c99, slot};
+            (void)mb.addInst(MirOpcode::Store, s99, InvalidType);
+        }
+        mb.addBr(header);
+        mb.beginBlock(exitB);
+        MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+        mb.addReturn(mb.addConst(v0, i32));
+    }
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runLicm(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsHoisted, 1u)
+        << "loop-Load hoist decided per function: fn0's body Store refuses, "
+           "fn1 (clean body) hoists — the pass-wide preds + clobber index "
+           "must not leak across functions";
+}
+
 // Negative pin: a may-aliasing Store inside the loop body blocks
 // Load hoist. The Store writes through the same Alloca the Load
 // reads → Rule 1 (Yes) in body → admission refuses.

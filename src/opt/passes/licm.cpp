@@ -5,6 +5,7 @@
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "opt/analysis/mir_alias.hpp"
+#include "opt/analysis/mir_memory_clobbers.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <cstdint>
@@ -20,7 +21,7 @@ namespace dss::opt::passes {
 namespace {
 
 using dss::opt::analysis::StrictTbaa;
-using dss::opt::analysis::mirAnyMayAliasingStoreInLoop;
+using dss::opt::analysis::MirMemoryClobbers;
 
 // Trap-eligible opcodes: divisions and modulo may raise at runtime
 // (#DE on x86 for IDIV with divisor=0 / quotient overflow; similar
@@ -44,9 +45,11 @@ using dss::opt::analysis::mirAnyMayAliasingStoreInLoop;
     if (isPhi(op)) return false;
     if (opcodeInfo(op).hasSideEffects) return false;
     // Load admission (cycle 10b): Load IS a hoist candidate now. The
-    // analyze() loop additionally gates each Load via
-    // `mirAnyMayAliasingStoreInLoop` — if no may-aliasing Store sits
-    // in the loop body, the Load is loop-invariant in the alias sense.
+    // analyze() loop additionally gates each Load via the pass-wide
+    // clobber index (`MirMemoryClobbers::anyClobberInBlocks`, enumeration-
+    // identical to the reference `mirAnyMayAliasingStoreInLoop` scan) — if
+    // no may-aliasing Store sits in the loop body, the Load is
+    // loop-invariant in the alias sense.
     if (isTrapEligible(op)) return false;     // D-OPT6-LICM-TRAP-SAFE-HOIST
     // Leaf opcodes (zero-operand value origins) have dedicated
     // builders on MirBuilder + carry no runtime computation worth
@@ -72,7 +75,16 @@ public:
         return instructionsHoisted_;
     }
 
-    void analyze(MirFuncId fn, DiagnosticReporter& reporter);
+    // `preds` = `mirBuildPredecessors(mir)` for the SAME module, computed ONCE
+    // by runLicm and threaded in (invariant across every function in one Licm
+    // pass — the same argument-identity hoist CSE received:
+    // D-OPT-CSE-ANALYSIS-HOIST). `clobbers` = the pass-wide memory-clobber
+    // index (D-OPT-MEMORYSSA-CLOBBER-WALK) — the Load hoist-admission gate
+    // queries it instead of re-scanning every loop-body instruction per
+    // candidate per fixed-point iteration.
+    void analyze(MirFuncId fn, DiagnosticReporter& reporter,
+                 std::vector<std::vector<MirBlockId>> const& preds,
+                 MirMemoryClobbers const& clobbers);
 
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
@@ -172,13 +184,16 @@ private:
     std::size_t instructionsHoisted_ = 0;
 };
 
-void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter) {
+void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter,
+                         std::vector<std::vector<MirBlockId>> const& preds,
+                         MirMemoryClobbers const& clobbers) {
     resetPerFunction();
     MirBlockId const entry = src_.funcEntry(fn);
     auto const rpo = mirReversePostOrder(src_, entry);
     if (rpo.empty()) return;
 
-    auto const preds = mirBuildPredecessors(src_);
+    // `preds` is the caller's precomputed whole-module predecessor map
+    // (invariant this pass) — no per-function rebuild here anymore.
     auto const dom   = computeMirDomTree(src_, entry, rpo, preds);
     auto const loops = mirNaturalLoops(src_, dom, preds);
     if (loops.empty()) return;
@@ -312,8 +327,8 @@ void LicmPolicy::analyze(MirFuncId fn, DiagnosticReporter& reporter) {
                                 "violation.\n", id.v);
                             std::abort();
                         }
-                        if (mirAnyMayAliasingStoreInLoop(
-                                src_, interner_, lops[0], loop.body,
+                        if (clobbers.anyClobberInBlocks(
+                                interner_, lops[0], loop.body,
                                 strictTbaa_, charTypesAliasAll_)) {
                             continue;  // clobbered in body
                         }
@@ -348,9 +363,17 @@ LicmResult runLicm(Mir& mir, TypeInterner const& interner,
 
     LicmPolicy policy{mir, interner};
     std::size_t const nf = mir.moduleFuncCount();
+    // Compute the whole-module predecessor map + the memory-clobber index ONCE
+    // for the entire pass — both invariant while `mir` is read-only (the rebuild
+    // writes a SEPARATE builder, finalized only after this loop). Removes the
+    // per-function whole-module preds rebuild (the CSE-audited argument-identity
+    // hoist) + the per-candidate-per-iteration loop-body instruction scans
+    // (D-OPT-MEMORYSSA-CLOBBER-WALK).
+    auto const preds = mirBuildPredecessors(mir);
+    MirMemoryClobbers const clobbers{mir, preds};
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
-        policy.analyze(f, reporter);
+        policy.analyze(f, reporter, preds, clobbers);
         MirFunctionRebuilder rb{mir, builder, policy};
         rb.rebuildFunction(f);
     }

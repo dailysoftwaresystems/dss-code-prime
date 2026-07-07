@@ -5,6 +5,7 @@
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "opt/analysis/mir_alias.hpp"
+#include "opt/analysis/mir_memory_clobbers.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 #include "opt/passes/path_compress.hpp"
 
@@ -21,8 +22,7 @@ namespace dss::opt::passes {
 namespace {
 
 using dss::opt::analysis::StrictTbaa;
-using dss::opt::analysis::mirRegionBetween;
-using dss::opt::analysis::mirAnyMayAliasingStoreInRegion;
+using dss::opt::analysis::MirMemoryClobbers;
 
 // Hash-key for a CSE-candidate instruction. Operands are stored in
 // canonical order (sorted for commutative 2-operand ops) so the two
@@ -71,10 +71,12 @@ struct CseKeyHash {
 // alias-clobber check are consulted at the use site).
 //
 // Load admission (cycle 10b): Load IS a CSE candidate now. The use
-// site additionally walks `mirAnyMayAliasingStoreInRegion` between
-// the canonical Load's block and the current Load's block before
-// admitting the CSE — this is the alias-safety gate that replaces
-// the prior blanket exclusion.
+// site additionally checks the pass-wide `MirMemoryClobbers` index for
+// a may-aliasing clobber between the canonical Load and the current
+// Load (D-OPT-MEMORYSSA-CLOBBER-WALK — enumeration-identical to the
+// reference `mirAnyMayAliasingStoreInRegion` walk) before admitting
+// the CSE — this is the alias-safety gate that replaces the prior
+// blanket exclusion.
 [[nodiscard]] bool isCseCandidateOpcode(MirOpcode op) noexcept {
     if (isTerminator(op)) return false;
     if (isPhi(op)) return false;
@@ -103,7 +105,11 @@ public:
     // `preds` = `mirBuildPredecessors(mir)` for the SAME module, computed ONCE by
     // runCse and threaded in (invariant across every function in one Cse pass), so
     // the whole-module predecessor build is not repeated per function / per query.
-    void analyze(MirFuncId fn, std::vector<std::vector<MirBlockId>> const& preds);
+    // `clobbers` = the pass-wide memory-clobber index (D-OPT-MEMORYSSA-CLOBBER-WALK)
+    // built ONCE beside `preds` — the Load-admission gate queries it instead of
+    // re-walking the CFG + re-scanning every instruction per Load query.
+    void analyze(MirFuncId fn, std::vector<std::vector<MirBlockId>> const& preds,
+                 MirMemoryClobbers const& clobbers);
 
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
@@ -151,7 +157,8 @@ private:
 };
 
 void CsePolicy::analyze(MirFuncId fn,
-                        std::vector<std::vector<MirBlockId>> const& preds) {
+                        std::vector<std::vector<MirBlockId>> const& preds,
+                        MirMemoryClobbers const& clobbers) {
     resetPerFunction();
     std::uint32_t const blockCount = src_.funcBlockCount(fn);
     if (blockCount == 0) return;
@@ -216,7 +223,9 @@ void CsePolicy::analyze(MirFuncId fn,
                 // canonical Load is sound only if no may-aliasing Store
                 // sits anywhere between them. We scan three slices
                 // owned by the caller (this site) plus the strictly-
-                // between region owned by `mirRegionBetween`:
+                // between region owned by the clobber index's
+                // `anyClobberBetween` (same fwd∩bwd region as the
+                // reference `mirRegionBetween`, memoized):
                 //   — canonical's block tail (after canonical, to end)
                 //   — strictly-between blocks (region walker)
                 //   — useBlock's head (start, up to current)
@@ -269,25 +278,21 @@ void CsePolicy::analyze(MirFuncId fn,
                         std::abort();
                     }
 
-                    // c113 (audit-F1): the in-block slices funnel through
-                    // the SAME per-instruction predicate as the region
-                    // walker (`mirInstClobbersLoadPtr` — precise for
-                    // Stores, opaque clobber for the `opcodeClobbersMemory`
-                    // ops: Call / IntrinsicCall / AtomicCas /
-                    // CompilerBarrier), so the two scan sites can never
-                    // disagree on what clobbers.
+                    // c113 (audit-F1): every slice funnels through the SAME
+                    // per-instruction predicate (`mirInstClobbersLoadPtr` —
+                    // precise for Stores, opaque clobber for the
+                    // `opcodeClobbersMemory` ops), called at QUERY time by the
+                    // clobber index — the scan sites can never disagree on
+                    // what clobbers. The index only pre-filters the
+                    // ENUMERATION to actual clobbers (a non-clobber can never
+                    // satisfy the predicate) and memoizes the CFG reachability
+                    // (D-OPT-MEMORYSSA-CLOBBER-WALK).
                     auto storesClobber = [&](MirBlockId blk,
                                              std::uint32_t lo,
                                              std::uint32_t hi) -> bool {
-                        for (std::uint32_t j = lo; j < hi; ++j) {
-                            if (dss::opt::analysis::mirInstClobbersLoadPtr(
-                                    src_, interner_, loadPtr,
-                                    src_.blockInstAt(blk, j),
-                                    strictTbaa_, charTypesAliasAll_)) {
-                                return true;
-                            }
-                        }
-                        return false;
+                        return clobbers.anyClobberInBlockRange(
+                            interner_, loadPtr, blk, lo, hi,
+                            strictTbaa_, charTypesAliasAll_);
                     };
 
                     if (canonicalBlock.v == B.v) {
@@ -316,15 +321,11 @@ void CsePolicy::analyze(MirFuncId fn,
                         if (storesClobber(canonicalBlock, canonicalIdx + 1, cn)) {
                             admit = false;
                         }
-                        if (admit) {
-                            auto const region = mirRegionBetween(
-                                src_, canonicalBlock, B, preds);
-                            if (mirAnyMayAliasingStoreInRegion(
-                                    src_, interner_, loadPtr, region,
-                                    strictTbaa_,
-                                    charTypesAliasAll_)) {
-                                admit = false;
-                            }
+                        if (admit
+                            && clobbers.anyClobberBetween(
+                                   interner_, loadPtr, canonicalBlock, B,
+                                   strictTbaa_, charTypesAliasAll_)) {
+                            admit = false;
                         }
                         if (admit && storesClobber(B, 0, i)) {
                             admit = false;
@@ -372,16 +373,19 @@ CseResult runCse(Mir& mir, TypeInterner const& interner,
 
     CsePolicy policy{mir, interner};
     std::size_t const nf = mir.moduleFuncCount();
-    // Compute the whole-module predecessor map ONCE for the entire pass — it is
-    // invariant while `mir` is read-only (the rebuild writes a SEPARATE builder,
-    // finalized only after this loop at `mir = ...finish()`). Threading it into
-    // analyze()/mirRegionBetween removes the O(numFunctions × moduleSize) rebuild
-    // + the per-Load-query rebuild that made CSE the release-optimizer tentpole
-    // on SQLite (D-OPT-MEMORYSSA-CLOBBER-WALK's residual O(K²×region) stays gated).
+    // Compute the whole-module predecessor map + the memory-clobber index ONCE
+    // for the entire pass — both are invariant while `mir` is read-only (the
+    // rebuild writes a SEPARATE builder, finalized only after this loop at
+    // `mir = ...finish()`). The preds hoist removed the O(numFunctions ×
+    // moduleSize) rebuild (D-OPT-CSE-ANALYSIS-HOIST); the clobber index removes
+    // the per-Load-query CFG re-walk + every-instruction region scans
+    // (D-OPT-MEMORYSSA-CLOBBER-WALK) — the Load-admission alias tests now touch
+    // only actual clobbers via memoized reachability.
     auto const preds = mirBuildPredecessors(mir);
+    MirMemoryClobbers const clobbers{mir, preds};
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
-        policy.analyze(f, preds);
+        policy.analyze(f, preds, clobbers);
         MirFunctionRebuilder rb{mir, builder, policy};
         rb.rebuildFunction(f);
     }
