@@ -126,7 +126,8 @@ public:
     // Typed `payload` readers — each hides the per-opcode encoding (so consumers
     // never decode `payload` by hand) and aborts on a wrong-opcode id. Mirrors
     // HIR's typed payload accessors (varDeclSymbol, branchDepth, …).
-    [[nodiscard]] std::uint32_t argIndex(MirInstId id) const;          // Arg
+    [[nodiscard]] std::uint32_t argIndex(MirInstId id) const;          // Arg — class ordinal
+    [[nodiscard]] std::uint32_t argPosition(MirInstId id) const;       // Arg — flat call-operand position
     [[nodiscard]] std::uint32_t constLiteralIndex(MirInstId id) const; // Const
     [[nodiscard]] SymbolId      globalAddrSymbol(MirInstId id) const;  // GlobalAddr
     [[nodiscard]] MirBlockId    blockAddressTarget(MirInstId id) const;// BlockAddress
@@ -395,7 +396,14 @@ public:
                       MirInstFlags flags = MirInstFlags::None);
 
     // Value-origin conveniences (fused model). Each is a leaf value-producer.
-    MirInstId addArg(std::uint32_t paramIndex, TypeId type, MirInstFlags flags = MirInstFlags::None);
+    // Arg carries a per-ABI-class register `ordinal` AND a flat call-operand
+    // `position` (arg_payload.hpp). The 3-arg convenience defaults position :=
+    // ordinal (correct for single-class signatures); a MIXED int+FP signature
+    // must use the 4-arg overload with the explicit flat position, or the
+    // inliner maps the wrong actual (D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP).
+    MirInstId addArg(std::uint32_t ordinal, TypeId type, MirInstFlags flags = MirInstFlags::None);
+    MirInstId addArg(std::uint32_t ordinal, TypeId type, std::uint32_t position,
+                     MirInstFlags flags = MirInstFlags::None);
     MirInstId addConst(MirLiteralValue value, TypeId type, MirInstFlags flags = MirInstFlags::None);
     MirInstId addGlobalAddr(SymbolId symbol, TypeId type, MirInstFlags flags = MirInstFlags::None);
     // D-CSUBSET-COMPUTED-GOTO: `&&label` — the runtime address of `target` as a

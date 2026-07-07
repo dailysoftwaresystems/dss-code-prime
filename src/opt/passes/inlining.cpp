@@ -351,8 +351,28 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
                 return std::nullopt;
             }
             if (op == MirOpcode::Return) hasReturn = true;
-            if (op == MirOpcode::Arg && mir.argIndex(cid) >= callArgCount) {
-                return std::nullopt;  // arg index out of range → refuse
+            if (op == MirOpcode::Arg) {
+                // Gate on the FLAT call-operand POSITION (arg_payload.hpp), not
+                // the per-class ordinal — the ordinal gate was both mis-keyed
+                // (mixed-class actuals) AND weak (a 1-actual call passes
+                // `fpr#0 < 1`). A position past the actuals is a structural
+                // call/signature mismatch → refuse.
+                std::uint32_t const pos = mir.argPosition(cid);
+                if (pos >= callArgCount) {
+                    return std::nullopt;
+                }
+                // Type-consistency backstop (design-audit F6): the actual at
+                // this position must share the Arg's MIR type. This bug class
+                // ALWAYS crosses GPR/FPR (disjoint MIR type kinds), so a type
+                // mismatch here catches every instance at the gate. Refuse (a
+                // cross-TU mismatched-prototype UB program stays compilable),
+                // matching the gate's conservative-refusal discipline; the
+                // splice keeps an out-of-range abort as the last backstop.
+                MirInstId const actual = callOps[1 + pos];
+                if (mir.instType(cid).valid() && mir.instType(actual).valid()
+                    && mir.instType(cid).v != mir.instType(actual).v) {
+                    return std::nullopt;
+                }
             }
         }
     }
@@ -454,13 +474,18 @@ void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
                     std::unordered_map<std::uint32_t, MirInstId>& local,
                     MirFuncId callee, bool& malformed) {
     if (cop == MirOpcode::Arg) {
-        std::uint32_t const idx = src.argIndex(cid);
-        if (idx >= actualArgs.size()) {
+        // Map by the FLAT call-operand POSITION, not the per-class ordinal —
+        // a mixed int+FP callee has BOTH a gpr#0 and an fpr#0, so the ordinal
+        // is ambiguous and mapping by it splices the wrong actual (the
+        // release-pipeline miscompile: `(int)x` reading the int arg).
+        // D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP.
+        std::uint32_t const pos = src.argPosition(cid);
+        if (pos >= actualArgs.size()) {
             malformed = true;
             if (!actualArgs.empty()) local.emplace(cid.v, actualArgs[0]);
             return;
         }
-        local.emplace(cid.v, actualArgs[idx]);
+        local.emplace(cid.v, actualArgs[pos]);
         return;
     }
     if (cop == MirOpcode::Const) {
@@ -869,8 +894,12 @@ private:
             return;
         }
         if (op == MirOpcode::Arg) {
+            // The MultiBlockInliner's caller-HOST Args (a mixed-class host that
+            // is itself inlined at a later iteration) — thread the flat
+            // position (D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP).
             rewrite_.emplace(id.v,
-                dst_.addArg(src_.argIndex(id), src_.instType(id)));
+                dst_.addArg(src_.argIndex(id), src_.instType(id),
+                            src_.argPosition(id)));
             return;
         }
         if (op == MirOpcode::GlobalAddr) {

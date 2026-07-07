@@ -825,6 +825,13 @@ enum class DiagnosticCode : std::uint16_t {
     // no-touch rule on SEH successors) — a merge/thread that damages the
     // skeleton reds HERE, at the pass that did it (verify-after-every-pass).
     I_SehStructure            = 0xA011,
+    // D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP: two `Arg` instructions in
+    // one function carry the SAME flat call-operand `position` (arg_payload.hpp).
+    // Positions index the caller's actual-argument list, so a duplicate means
+    // a payload wipe (a rebuild/merge site dropping the position → both
+    // defaulting to a colliding ordinal) — the inliner would then map two
+    // callee params to the same actual. Caught at every verify point.
+    I_ArgPositionDuplicate    = 0xA012,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //

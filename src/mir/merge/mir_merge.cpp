@@ -295,9 +295,13 @@ private:
     // through `local_` and `payload`/`flags` copied verbatim.
     void emitValue(MirOpcode op, MirInstId id) {
         if (op == MirOpcode::Arg) {
+            // Thread the flat call-operand position (arg_payload.hpp) — the
+            // 2-TU path optimizes POST-merge, so a position wipe here would
+            // resurface the mixed-class inline miscompile on merged modules
+            // (sqlite is 2-TU). D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP.
             local_.emplace(id.v,
                 dst_.addArg(src_.argIndex(id), reType(src_.instType(id)),
-                            src_.instFlags(id)));
+                            src_.argPosition(id), src_.instFlags(id)));
             return;
         }
         if (op == MirOpcode::Const) {

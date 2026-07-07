@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 70> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 71> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -145,6 +145,7 @@ constexpr std::array<DiagnosticCode, 70> kUnsuppressableCodes{{
     DiagnosticCode::I_NotDominated,
     DiagnosticCode::I_TerminatorTypeMismatch,
     DiagnosticCode::I_ArgIndexOutOfRange,
+    DiagnosticCode::I_ArgPositionDuplicate,
     DiagnosticCode::I_ExtensionTypeInMir,
     DiagnosticCode::I_StructCfMismatch,
     DiagnosticCode::I_UnreachableBlock,

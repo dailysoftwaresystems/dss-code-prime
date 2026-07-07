@@ -1,0 +1,33 @@
+{
+  "$comment": "D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP (2026-07-07): a mixed int+FP-class callee inlined under the shipped `release` pipeline mis-mapped its FP params to integer actuals (the MIR Arg carried only a per-CLASS register ordinal, ambiguous across GPR/FPR — both an fpr#0 and a gpr#0). The Arg now also carries a FLAT call-operand POSITION and the inliner maps actuals by it. WITNESS: isum(2,10.0,3,20.0,43.0)=(int)(73)+2+3=78. RED-ON-DISABLE (release arm, WSL/qemu run legs): pre-fix the release build returned garbage (FP args read integer actuals); debug/gcc=78; ms_x64 immune (slot-aligned CC). The `release` arm loads release.pipeline.json ITSELF (shippedPipeline) so the optimizer x mixed-class-arg composition is witnessed end-to-end. This single root ALSO closed D-OPT-RELEASE-FP-CONSTANT-UNLOADED-XMM.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 78,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

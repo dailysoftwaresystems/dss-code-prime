@@ -1,0 +1,28 @@
+{
+  "$comment": "D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP F1 (2026-07-07): the 2-TU merge witness. A mixed int+FP-class callee `isum` is DEFINED in helper.c and CALLED from main.c; the two CUs merge into one module and the `release` pipeline optimizes POST-merge, so Inlining splices isum into main across the former CU boundary. This exercises the mir_merge.cpp Arg re-encode (which must thread the flat call-operand position) followed by the inline's position-based actual mapping — a path NO single-TU example reaches (sqlite itself is 2-TU: sqlite3.c + shell.c). RED-ON-DISABLE (release arm): drop the argPosition thread at the mir_merge Arg re-encode and either the merged isum mis-maps its FP actuals (wrong result) or the duplicate-position verifier reds. isum(2,10.0,3,20.0,43.0)=(int)73+2+3=78.",
+  "language": "c-subset",
+  "sources": ["main.c", "helper.c"],
+  "exitCode": 78,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

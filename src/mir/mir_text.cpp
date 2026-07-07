@@ -404,7 +404,14 @@ private:
                 break;
             }
             case MirOpcode::Arg: {
-                out_ += std::format(" ({})", mir_.argIndex(id));
+                // Print the class ordinal; append the flat call-operand
+                // position ONLY when it differs (single-class signatures keep
+                // the golden `(N)` form; mixed-class emits `(ord, pos)`) so the
+                // full payload survives a text round-trip (arg_payload.hpp).
+                std::uint32_t const ord = mir_.argIndex(id);
+                std::uint32_t const pos = mir_.argPosition(id);
+                if (pos == ord) out_ += std::format(" ({})", ord);
+                else            out_ += std::format(" ({}, {})", ord, pos);
                 break;
             }
             case MirOpcode::GlobalAddr: {
@@ -1299,9 +1306,17 @@ private:
                 if (!expect(TokKind::LParen)) return;
                 Tok n = lex_.take();
                 std::uint32_t const idx = parseNumber<std::uint32_t>(
-                    n.text, "arg index");
+                    n.text, "arg ordinal");
+                // Optional `, position` (arg_payload.hpp); absent → position
+                // defaults to the ordinal (the single-class golden form).
+                std::uint32_t position = idx;
+                if (lex_.peek().kind == TokKind::Comma) {
+                    (void)lex_.take();
+                    Tok p = lex_.take();
+                    position = parseNumber<std::uint32_t>(p.text, "arg position");
+                }
                 (void)expect(TokKind::RParen);
-                MirInstId const id = builder_.addArg(idx, resultType);
+                MirInstId const id = builder_.addArg(idx, resultType, position);
                 if (resultSlot != 0) valueMap_[resultSlot] = id;
                 break;
             }

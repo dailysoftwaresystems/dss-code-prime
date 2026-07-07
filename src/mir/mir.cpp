@@ -1,6 +1,7 @@
 #include "mir/mir.hpp"
 
 #include "core/substrate/mint_monotonic_id.hpp"
+#include "core/types/arg_payload.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -203,7 +204,20 @@ std::uint32_t payloadForOpcode_(detail::MirInst const& n, MirOpcode expected,
 } // namespace
 
 std::uint32_t Mir::argIndex(MirInstId id) const {
-    return payloadForOpcode_(instArena_.at(id), MirOpcode::Arg, id, "argIndex");
+    // The per-ABI-class register ORDINAL (low 16 of the Arg payload) — what
+    // lir_callconv/regalloc key on. The high 16 is the flat call-operand
+    // POSITION (see argPosition), consumed by the inliner (arg_payload.hpp).
+    return arg_payload::ordinal(
+        payloadForOpcode_(instArena_.at(id), MirOpcode::Arg, id, "argIndex"));
+}
+std::uint32_t Mir::argPosition(MirInstId id) const {
+    // The FLAT index of this parameter's value in the CALL's actual-operand
+    // list (operands[1 + position]). Declaration order == receive order ==
+    // call-site expansion order, so the inliner maps a callee Arg → the
+    // caller's actual argument by this, NOT the class ordinal (ambiguous across
+    // register classes). D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP.
+    return arg_payload::position(
+        payloadForOpcode_(instArena_.at(id), MirOpcode::Arg, id, "argPosition"));
 }
 std::uint32_t Mir::constLiteralIndex(MirInstId id) const {
     return payloadForOpcode_(instArena_.at(id), MirOpcode::Const, id, "constLiteralIndex");
@@ -669,13 +683,29 @@ namespace {
 
 } // namespace
 
-MirInstId MirBuilder::addArg(std::uint32_t paramIndex, TypeId type, MirInstFlags flags) {
+MirInstId MirBuilder::addArg(std::uint32_t ordinal, TypeId type, MirInstFlags flags) {
+    // Single-class convenience: position defaults to the ordinal (correct for
+    // an all-GPR or all-FPR signature, where ordinal == flat position). Mixed-
+    // class signatures MUST use the 4-arg overload with an explicit position.
+    return addArg(ordinal, type, ordinal, flags);
+}
+
+MirInstId MirBuilder::addArg(std::uint32_t ordinal, TypeId type,
+                             std::uint32_t position, MirInstFlags flags) {
     if (!type.valid()) requireValueType_("addArg");
+    if (ordinal > arg_payload::kFieldMax || position > arg_payload::kFieldMax) {
+        std::fprintf(stderr,
+            "dss::MirBuilder fatal: addArg ordinal=%u position=%u — each must "
+            "fit 16 bits (max %u); an argument index this large is a lowering "
+            "invariant violation (arg_payload.hpp).\n",
+            ordinal, position, arg_payload::kFieldMax);
+        std::abort();
+    }
     detail::MirInst pod;
     pod.opcode  = MirOpcode::Arg;
     pod.flags   = flags;
     pod.typeId  = type;
-    pod.payload = paramIndex;
+    pod.payload = arg_payload::encode(ordinal, position);
     return appendInst_(pod, {}, /*terminates=*/false);
 }
 

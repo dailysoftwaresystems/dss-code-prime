@@ -3562,10 +3562,23 @@ struct Lowerer {
     struct ArgOrdinalCounter {
         bool          slotAligned = false;
         std::uint32_t flat = 0, gpr = 0, fpr = 0;
+        // The FLAT call-operand POSITION (arg_payload.hpp) — the index of this
+        // parameter's value in the CALL's actual-argument operand list
+        // (operands[1 + position]). Advances once PER CALL OPERAND: once per
+        // scalar Arg, once per aggregate register PIECE, and — crucially — once
+        // for the two operand shapes that consume a call slot WITHOUT an Arg
+        // (the x8-sret ReadIndirectResult, the straddled-aggregate
+        // RecvByValueStackParam). Declaration/receive order == call-site
+        // operand-expansion order, so `position` is the value the INLINER uses
+        // to map a callee Arg → the caller's actual (the per-class ordinal is
+        // ambiguous across GPR/FPR). INDEPENDENT of the register counters
+        // above (which stay the lir_callconv key).
+        std::uint32_t position = 0;
         [[nodiscard]] std::uint32_t next(AbiPieceClass cls) {
             if (slotAligned) return flat++;
             return (cls == AbiPieceClass::Fpr) ? fpr++ : gpr++;
         }
+        [[nodiscard]] std::uint32_t nextPosition() { return position++; }
     };
 
     // ── Plan 24 (hir_to_mir Call residual) — shared Call-arm pieces ─────────
@@ -4028,8 +4041,10 @@ struct Lowerer {
             if (!config.argSlotAligned && ctr.gpr >= config.argGprCount
                 && !accountFixedStackScalar(anchor))
                 return false;
+            std::uint32_t const pos = ctr.nextPosition();  // one call operand
             MirInstId const ptr =
-                mir.addArg(ctr.next(AbiPieceClass::Gpr), interner.pointer(aggTy));
+                mir.addArg(ctr.next(AbiPieceClass::Gpr), interner.pointer(aggTy),
+                           pos);
             if (!ptr.valid()) return false;
             addressableLocal[sym.v] = ptr;   // the caller's copy is the param
             return true;
@@ -4084,6 +4099,12 @@ struct Lowerer {
             // the first/only overflowed fixed param, guaranteed by the guard above).
             // Byte-copy it into the param's local slot (by-value semantics, the
             // by-reference reception precedent but reading from the stack).
+            // The straddled aggregate rides ONE `ByValueStackArg` carrier
+            // operand on the call side (no Arg here — RecvByValueStackParam) —
+            // advance the flat position past that operand so later params stay
+            // aligned to the operand list (arg_payload.hpp; this callee is
+            // inline-refused, but the positions must stay consistent).
+            (void)ctr.nextPosition();
             MirInstId const src =
                 mir.addInst(MirOpcode::RecvByValueStackParam, {},
                             interner.pointer(aggTy),
@@ -4115,7 +4136,8 @@ struct Lowerer {
         if (!slot.valid()) return false;
         for (AbiPiece const& p : abi.pieces) {
             TypeId const pty = pieceType(p);
-            MirInstId const a = mir.addArg(ctr.next(p.cls), pty);
+            std::uint32_t const pos = ctr.nextPosition();  // one operand per piece
+            MirInstId const a = mir.addArg(ctr.next(p.cls), pty, pos);
             if (!a.valid()) return false;
             MirInstId const offK =
                 constInt(static_cast<std::int64_t>(p.byteOffset));
@@ -7054,9 +7076,16 @@ struct Lowerer {
                     // AAPCS64/Apple x8-sret ⇒ it arrives in the dedicated indirect-
                     // result register via `ReadIndirectResult` and consumes NO arg
                     // ordinal (real args still start at x0). FC7 C3.
+                    // The sret slot is ALWAYS pushed as the first actual
+                    // operand (position 0) — for the hidden-arg CC it is this
+                    // Arg; for x8-sret it is the (Arg-less) slot the
+                    // ReadIndirectResult stands in for. Advance the flat
+                    // position for it in BOTH cases so the real params start at
+                    // position 1, matching the operand list (arg_payload.hpp).
+                    std::uint32_t const sretPos = argCtr.nextPosition();
                     sretPtr_ = config.aggregateSretViaHiddenArg
                         ? mir.addArg(argCtr.next(AbiPieceClass::Gpr),
-                                     interner.pointer(currentFnResult_))
+                                     interner.pointer(currentFnResult_), sretPos)
                         : mir.addReadIndirectResult(
                               interner.pointer(currentFnResult_));
                     if (!sretPtr_.valid()) {
@@ -7157,8 +7186,9 @@ struct Lowerer {
             // params took the by-value-struct arm above.)
             if (isSysVVaListParam(ty)) {
                 auto const ops = interner.operands(ty);
+                std::uint32_t const pos = argCtr.nextPosition();  // one operand
                 MirInstId const ptr = mir.addArg(argCtr.next(AbiPieceClass::Gpr),
-                                                 interner.pointer(ops[0]));
+                                                 interner.pointer(ops[0]), pos);
                 if (!ptr.valid()) {
                     if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                     return false;
@@ -7187,7 +7217,8 @@ struct Lowerer {
                     return false;
                 }
             }
-            MirInstId const arg = mir.addArg(argCtr.next(sCls), ty);
+            std::uint32_t const scalarPos = argCtr.nextPosition();  // one operand
+            MirInstId const arg = mir.addArg(argCtr.next(sCls), ty, scalarPos);
             if (addressTaken.contains(sym.v)) {
                 MirInstId const slot = allocaForLocal(sym, ty, p);
                 if (!slot.valid()) {
