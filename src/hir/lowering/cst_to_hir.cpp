@@ -2180,6 +2180,15 @@ struct Lowerer {
             case WideCharError::MalformedEscape:
                 return {DiagnosticCode::H_WideCharValueUnrepresentable,
                         "the character body has a malformed or unsupported escape"};
+            case WideCharError::InvalidUniversalName:
+                return {DiagnosticCode::H_InvalidUniversalCharacterName,
+                        "a \\u/\\U universal character name is malformed (needs exactly "
+                        "4 / 8 hex digits) or names a surrogate half / a value > U+10FFFF"};
+            case WideCharError::ByteEscapeInWide:
+                return {DiagnosticCode::H_WideByteEscapeUnsupported,
+                        "a \\x hex / octal byte escape in a wide/UTF character constant is "
+                        "not supported (it names a raw code-unit value, not a code point) "
+                        "— use a \\u/\\U universal character name"};
             case WideCharError::ValueUnrepresentable:
                 break;
         }
@@ -2200,10 +2209,21 @@ struct Lowerer {
 
         // Narrow `'x'` — the EXACT pre-CycleB byte path (Char-typed, single byte).
         TypeId const type = interner.primitive(TypeKind::Char);
-        auto cp = decodeCharLiteralBody(body);
+        EscapeDecodeOutcome outcome;
+        auto cp = decodeCharLiteralBody(body, &outcome);
         if (!cp) {
-            unsupported(node, std::format("char literal '{}' is empty, multi-character, "
-                                          "or has an unsupported escape", body));
+            // FF2: a malformed/invalid `\u`/`\U` gets the specific 6.4.3 code (a valid
+            // multi-byte UCN such as `'é'` keeps the generic multi-character
+            // message — outcome.ok() is true, it is simply > 1 narrow byte).
+            if (outcome.error == EscapeDecodeError::InvalidUniversalName) {
+                emitH(DiagnosticCode::H_InvalidUniversalCharacterName, node,
+                      std::format("char literal '{}' has an invalid universal character "
+                                  "name (\\u needs 4 hex digits, \\U needs 8, and it must "
+                                  "not name a surrogate half or a value > U+10FFFF)", body));
+            } else {
+                unsupported(node, std::format("char literal '{}' is empty, multi-character, "
+                                              "or has an unsupported escape", body));
+            }
             return {errorNode(node, type), type};
         }
         HirLiteralValue v;
@@ -2309,6 +2329,7 @@ struct Lowerer {
     // the SHARED encoder the semantic typer used, so both tiers agree on N).
     E lowerStringLiteral(NodeId node) {
         std::string bytes;
+        EscapeDecodeOutcome outcome;
         if (cfg.stringDoubledDelimiter) {
             // SQL `'…''…'`: doubled-delimiter escaping, single body (no phase-6
             // concat in SQL) — never fails (pairs only). Always the narrow Char form.
@@ -2317,33 +2338,57 @@ struct Lowerer {
                 bodyTok.valid() ? tree().text(bodyTok) : std::string_view{};
             bytes = decodeDoubledDelimiterBody(body, cfg.stringDelimiter);
         } else if (auto decoded =
-                       decodeAdjacentStringBodies(tree(), node, cfg.stringBodyToken)) {
+                       decodeAdjacentStringBodies(tree(), node, cfg.stringBodyToken, &outcome)) {
             // C-family: every body child decoded (backslash escapes) then byte-joined
             // — the SAME chokepoint the semantic typer uses, so both tiers agree on N.
             bytes = std::move(*decoded);
         } else {
-            unsupported(node, std::format("string literal {} has an unsupported escape",
-                                          std::string{tree().text(node)}));
+            // FF2: a malformed/invalid `\u`/`\U` (6.4.3) gets the specific code, not
+            // the generic escape error.
+            if (outcome.error == EscapeDecodeError::InvalidUniversalName) {
+                emitH(DiagnosticCode::H_InvalidUniversalCharacterName, node,
+                      std::format("string literal {} has an invalid universal character "
+                                  "name (\\u needs 4 hex digits, \\U needs 8, and it must "
+                                  "not name a surrogate half or a value > U+10FFFF)",
+                                  std::string{tree().text(node)}));
+            } else {
+                unsupported(node, std::format("string literal {} has an unsupported escape",
+                                              std::string{tree().text(node)}));
+            }
             return {errorNode(node), InvalidType};
         }
 
         TypeKind const core = stringElementCoreOf(node);
+        // FF3: a `\x` hex / octal byte escape in a wide/UTF string names a raw
+        // code-unit VALUE, not a code point — assembling it is deferred
+        // (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE), so FAIL LOUD rather than the old
+        // silent UTF-8-collapse (`u"\xC3\xA9"` → one 0x00E9 unit instead of two).
+        // Keyed on the OPENER (format-agnostic) so it fires even when the semantic
+        // tier left the node untyped. Narrow `"…"`/SQL keep `\x`/octal (byte-producing).
+        if (outcome.usedByteEscape && isWideStringOpenerKind(stringOpenerTokenKind(node))) {
+            emitH(DiagnosticCode::H_WideByteEscapeUnsupported, node,
+                  std::format("wide/UTF string literal {} cannot be lowered: a \\x hex / "
+                              "octal byte escape names a raw code-unit value, not a code "
+                              "point — use a \\u/\\U universal character name",
+                              std::string{tree().text(node)}));
+            return {errorNode(node), InvalidType};
+        }
         // A wide opener (`u"`/`U"`/`u8"`/`L"`) whose node the semantic tier left
-        // NARROW or UNTYPED = a type-drop, which happens exactly when the format-
-        // resolved element core could not hold a code point (e.g. an astral cp under
-        // pe-`L"…"` / any `u"…"`). Reading the stamp gave Char, which would silently
-        // route the raw UTF-8 down the narrow byte path — instead FAIL LOUD. (No
-        // format is needed here: the stamp carries the correct wide core whenever the
-        // encode WAS representable, so a narrow stamp under a wide opener is always
+        // NARROW or UNTYPED = a type-drop, which happens exactly when the encode was
+        // not representable — now only ILL-FORMED UTF-8 or a code point past U+10FFFF
+        // (an astral cp under a 16-bit element encodes as a surrogate pair; a byte
+        // escape was already rejected above). Reading the stamp gave Char, which would
+        // silently route the raw UTF-8 down the narrow byte path — instead FAIL LOUD.
+        // (No format is needed here: the stamp carries the correct wide core whenever
+        // the encode WAS representable, so a narrow stamp under a wide opener is always
         // the unrepresentable case.)
         if ((core == TypeKind::Char || core == TypeKind::Byte)
             && isWideStringOpenerKind(stringOpenerTokenKind(node))) {
             emitH(DiagnosticCode::H_WideCharSurrogateUnsupported, node,
-                  std::format("wide/UTF string literal {} cannot be lowered: a code "
-                              "point cannot be represented in the target element "
-                              "width without a surrogate pair (surrogate pairs / "
-                              "astral code points are not yet supported for this "
-                              "element)", std::string{tree().text(node)}));
+                  std::format("wide/UTF string literal {} cannot be lowered: its body is "
+                              "not well-formed UTF-8, or a code point exceeds U+10FFFF "
+                              "(not a Unicode scalar value)",
+                              std::string{tree().text(node)}));
             return {errorNode(node), InvalidType};
         }
         // NARROW (`"`, SQL, u8's byte width is Char-equal — but u8 still routes the
@@ -2383,11 +2428,7 @@ struct Lowerer {
     [[nodiscard]] std::string wideEncodeErrorDetail(WideEncodeError err, TypeKind core,
                                                     NodeId node) {
         char const* what =
-            err == WideEncodeError::SurrogateUnsupported
-                ? "a supplementary-plane code point (> U+FFFF) needs a UTF-16 "
-                  "surrogate pair, which is not yet supported for a 16-bit string "
-                  "element"
-          : err == WideEncodeError::CodepointTooLarge
+            err == WideEncodeError::CodepointTooLarge
                 ? "a code point exceeds U+10FFFF (not a Unicode scalar value)"
                 : "the string body is not well-formed UTF-8";
         return std::format("wide/UTF string literal {} cannot be lowered: {}",

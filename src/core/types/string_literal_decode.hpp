@@ -47,15 +47,27 @@ namespace dss {
 // whose text is empty → decodes to ""). EmptySpace children are skipped; a
 // non-token or wrong-kind child is ignored, so this is robust to interleaved
 // trivia between adjacent pieces.
+//
+// `outcome` (when non-null) receives the AGGREGATE result: the specific error of
+// the first failing segment (so a caller renders H_InvalidUniversalCharacterName
+// vs. a generic escape error) and `usedByteEscape` ORed across every decoded
+// segment (so the wide/UTF path can fail loud on a `\x`/octal escape anywhere in
+// an adjacent-concatenated literal — D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE).
 [[nodiscard]] inline std::optional<std::string>
-decodeAdjacentStringBodies(Tree const& tree, NodeId node, SchemaTokenId bodyTokenKind) {
+decodeAdjacentStringBodies(Tree const& tree, NodeId node, SchemaTokenId bodyTokenKind,
+                           EscapeDecodeOutcome* outcome = nullptr) {
     std::string out;
     for (NodeId c : tree.children(node)) {
         if (tree.kind(c) != NodeKind::Token) continue;
         if (tree.tokenKind(c).v != bodyTokenKind.v) continue;
-        auto seg = decodeStringLiteralBody(tree.text(c));   // phase 5 per segment
-        if (!seg) return std::nullopt;                       // malformed escape — fail loud
-        out += *seg;                                         // phase 6 byte-level join
+        EscapeDecodeOutcome oc;
+        auto seg = decodeStringLiteralBody(tree.text(c), &oc);   // phase 5 per segment
+        if (outcome && oc.usedByteEscape) outcome->usedByteEscape = true;
+        if (!seg) {
+            if (outcome) outcome->error = oc.error;              // first failing segment's reason
+            return std::nullopt;                                 // malformed escape — fail loud
+        }
+        out += *seg;                                             // phase 6 byte-level join
     }
     return out;
 }

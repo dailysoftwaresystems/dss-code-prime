@@ -809,14 +809,15 @@ enum class DiagnosticCode : std::uint16_t {
     //   could then enter the guarded range undetectably at compile time.
     H_SehLabelAddress             = 0xF011,
     // H_WideCharSurrogateUnsupported (C11/C23 6.4.5): a wide/UTF string literal
-    //   whose CST→HIR lowering could not represent a code point in the requested
-    //   element width WITHOUT truncation. Three triggers, all fail-loud (never a
-    //   silent wrong code unit): (1) a supplementary-plane code point (> U+FFFF)
-    //   under a 16-bit element (`u"…"` / pe-`L"…"`) — surrogate pairs are a LATER
-    //   cycle; (2) ill-formed UTF-8 in the (escape-decoded) body bytes; (3) a code
-    //   point past U+10FFFF. The `actual` names the offending code point / reason.
-    //   An `Error` HIR node is emitted as a recovery sentinel and lowering
-    //   continues (collect-all), exactly like H_UnsupportedLoweringForKind.
+    //   whose CST→HIR lowering could not represent its (escape-decoded) body in the
+    //   requested element width. Two live triggers, both fail-loud (never a silent
+    //   wrong code unit): (1) ill-formed UTF-8 in the body bytes; (2) a code point
+    //   past U+10FFFF. A supplementary-plane code point (> U+FFFF) under a 16-bit
+    //   element (`u"…"` / pe-`L"…"`) is NO LONGER a trigger for strings — it now
+    //   encodes as a UTF-16 surrogate PAIR (Cycle C). The `actual` names the
+    //   offending reason. An `Error` HIR node is emitted as a recovery sentinel and
+    //   lowering continues (collect-all), exactly like H_UnsupportedLoweringForKind.
+    //   (The name is retained for ordinal stability; the surrogate trigger is gone.)
     H_WideCharSurrogateUnsupported = 0xF012,
     // H_Utf8CharLiteralOutOfRange (C23 6.4.4.4): a `u8'…'` character constant whose
     //   single code point exceeds U+007F. A char8_t constant must be representable
@@ -834,6 +835,25 @@ enum class DiagnosticCode : std::uint16_t {
     //   UTF-8; or a code point past U+10FFFF. The `actual` names the specific cause.
     //   An `Error` HIR node continues the collect-all lowering.
     H_WideCharValueUnrepresentable = 0xF014,
+    // H_InvalidUniversalCharacterName (C11/C23 6.4.3): a `\u`/`\U` universal
+    //   character name that is MALFORMED (fewer than the required 4 / 8 hex digits,
+    //   or a non-hex digit) or INVALID (names a UTF-16 surrogate half U+D800..U+DFFF
+    //   or a value past U+10FFFF). Fail-loud (never a silently CESU-8 / overlong /
+    //   truncated code unit) — the narrow byte path has no downstream UTF-8 check, so
+    //   an unvalidated UCN would emit wrong bytes. C23 6.4.3 relaxed the <0x00A0
+    //   basic-character restriction for LITERALS, so a sub-0xA0 UCN (`A`) is
+    //   VALID and never trips this. An `Error` HIR node continues the collect-all
+    //   lowering, exactly like H_WideCharValueUnrepresentable.
+    H_InvalidUniversalCharacterName = 0xF015,
+    // H_WideByteEscapeUnsupported (C11/C23 6.4.5, D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE):
+    //   a `\x` hex / `\ooo` octal escape inside a wide/UTF literal (`u"…"`/`U"…"`/
+    //   `u8"…"`/`L"…"` or the char forms). A byte escape names a raw code-unit VALUE,
+    //   not a code point; assembling that value directly is a deferred feature, so it
+    //   FAILS LOUD here rather than the old silent UTF-8-collapse (`u"\xC3\xA9"` once
+    //   became ONE 0x00E9 unit instead of two intended units). Narrow `"…"`/`'…'`
+    //   keep `\x`/octal (byte-producing, correct for a narrow element). Use `\u`/`\U`
+    //   for a code point. An `Error` HIR node continues the collect-all lowering.
+    H_WideByteEscapeUnsupported   = 0xF016,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,

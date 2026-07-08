@@ -8,11 +8,12 @@
 // COUNT for the `Array<core, N+1>` type) and the CST→HIR tier (which needs the
 // encoded BYTES) derive from ONE implementation and can never disagree on N.
 //
-// STRICT + FAIL-LOUD by design (never a silent truncation): ill-formed UTF-8, a
-// code point past U+10FFFF, and a supplementary-plane code point under a 16-bit
-// element (surrogate pairs are a LATER cycle) each stop with a distinct error the
-// caller renders as a diagnostic. The NARROW (`Char`) path does NOT route here —
-// it keeps its existing byte-level `\`-escape decode (raw ≥0x80 passthrough).
+// STRICT + FAIL-LOUD by design (never a silent truncation): ill-formed UTF-8 and
+// a code point past U+10FFFF each stop with a distinct error the caller renders
+// as a diagnostic. A supplementary-plane code point under a 16-bit element now
+// encodes as a UTF-16 SURROGATE PAIR (two code units). The NARROW (`Char`) path
+// does NOT route here — it keeps its existing byte-level `\`-escape decode (raw
+// ≥0x80 passthrough).
 
 #include "core/types/char_decode.hpp"               // decodeEscapedBytes (wide-char body escapes)
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind
@@ -36,7 +37,6 @@ namespace dss {
 enum class WideEncodeError : std::uint8_t {
     IllFormedUtf8,      // the raw body is not valid UTF-8 (truncated / stray continuation)
     CodepointTooLarge,  // a decoded code point exceeds U+10FFFF (not a Unicode scalar value)
-    SurrogateUnsupported, // a supplementary-plane cp (> U+FFFF) under a 16-bit element core
 };
 
 // Decode `bytes` (raw UTF-8, escapes ALREADY resolved by the byte decoder) into
@@ -81,6 +81,8 @@ decodeUtf8ToCodepoints(std::string_view bytes, std::vector<char32_t>& out) {
 // NOT produced on failure (no guessed code unit).
 enum class WideCharError : std::uint8_t {
     MalformedEscape,      // a `\`-escape in the body is malformed / unknown / out of range
+    InvalidUniversalName, // a `\u`/`\U` (6.4.3) with too few hex digits, a surrogate half, or > U+10FFFF
+    ByteEscapeInWide,     // a `\x`/octal escape in a wide/UTF char (escape-value-as-code-unit is deferred)
     IllFormedUtf8,        // the escape-decoded body is not well-formed UTF-8
     NotSingleCodepoint,   // the body decodes to 0 (empty `L''`) or >1 (multi-char `L'ab'`) code points
     Utf8UnitOutOfRange,   // a `u8'…'` code point exceeds U+007F (one UTF-8 code unit = ASCII)
@@ -102,12 +104,14 @@ enum class WideCharError : std::uint8_t {
 // config-map lookup — the semantic tier owns `activeFormat`), so this routine never
 // branches on object format — it is the SHARED decode+validate both tiers run.
 //
-// MINOR #8 (Cycle-C-adjacent, conscious deferral): a non-UTF-8 byte escape such as
-// `L'\xC3'` (a lone UTF-8 lead / continuation byte) decodes here to an ill-formed
-// UTF-8 sequence → IllFormedUtf8 fail-loud, exactly like a raw ill-formed body and
-// consistent with Cycle A strings. Assembling a code point from raw `\x`/octal byte
-// escapes, and the `\u`/`\U` universal-character-name escapes, are Cycle C — until
-// then `decodeEscapedBytes` produces bytes and this UTF-8-validates them.
+// A `\u`/`\U` universal character name (6.4.3) resolves to a code point in the
+// shared byte decoder (canonical UTF-8, surrogate/>U+10FFFF rejected there) and is
+// UTF-8-decoded back here — so `u'é'` works exactly like the raw `u'é'`. A
+// `\x`/octal byte escape names a raw code-unit VALUE, not a code point; assembling
+// that value directly (`u'\xFFFF'` → one 0xFFFF unit) is deferred
+// (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE), so a `\x`/octal in a wide/UTF char now
+// FAILS LOUD (ByteEscapeInWide) rather than the old silent UTF-8-collapse (e.g.
+// `u'\xC3\xA9'` → one wrong 0x00E9 unit). The narrow `'…'` path keeps `\x`/octal.
 [[nodiscard]] inline std::optional<char32_t>
 decodeWideCharCodepoint(std::string_view body, TypeKind elementCore,
                         WideCharError* err = nullptr) {
@@ -116,7 +120,12 @@ decodeWideCharCodepoint(std::string_view body, TypeKind elementCore,
         return std::nullopt;
     };
     std::string escaped;
-    if (!decodeEscapedBytes(body, escaped)) return fail(WideCharError::MalformedEscape);
+    EscapeDecodeOutcome const oc = decodeEscapedBytes(body, escaped);
+    if (!oc.ok())
+        return fail(oc.error == EscapeDecodeError::InvalidUniversalName
+                        ? WideCharError::InvalidUniversalName
+                        : WideCharError::MalformedEscape);
+    if (oc.usedByteEscape) return fail(WideCharError::ByteEscapeInWide);
     std::vector<char32_t> cps;
     if (auto e = decodeUtf8ToCodepoints(escaped, cps)) {
         // A code point past U+10FFFF is an unrepresentable VALUE; every other
@@ -142,10 +151,13 @@ decodeWideCharCodepoint(std::string_view body, TypeKind elementCore,
 
 // Append the code units for `cp` in element width `core` to `out`, growing it by
 // the element's byte width per unit. LE for the multi-byte element cores (DSS
-// targets are little-endian). Returns SurrogateUnsupported when `cp` needs a
-// surrogate pair under a 16-bit core (a LATER cycle), else std::nullopt.
+// targets are little-endian). Always succeeds for a valid Unicode scalar value
+// (`decodeUtf8ToCodepoints` already rejected surrogates + > U+10FFFF); the
+// std::optional return remains only so `encodeWideString` can propagate a decode
+// error uniformly.
 //   U8            → UTF-8 bytes (1..4; BMP is 1..3)
-//   U16           → one 2-byte LE unit for BMP (cp>0xFFFF fails loud)
+//   U16           → one 2-byte LE unit for BMP; a supplementary-plane cp (> U+FFFF)
+//                   → a UTF-16 SURROGATE PAIR (two 2-byte LE units)
 //   U32 / I32     → one 4-byte LE unit (I32 = wchar_t on elf/macho)
 //   Char (narrow) → one truncated low byte (only reached if a caller routes a
 //                   narrow core here; the normal narrow path decodes bytes directly)
@@ -166,7 +178,19 @@ encodeCodepoint(char32_t cp, TypeKind core, std::string& out) {
             return std::nullopt;
         }
         case TypeKind::U16: {
-            if (cp > 0xFFFF) return WideEncodeError::SurrogateUnsupported;
+            // C11/C23 6.4.5: a supplementary-plane code point is TWO UTF-16 code
+            // units — the high surrogate (0xD800 + top 10 bits of cp-0x10000) then
+            // the low surrogate (0xDC00 + bottom 10 bits), each a 2-byte LE unit.
+            // BMP code points are one unit. (The input is already a valid scalar
+            // value, so 0xD800..0xDFFF never reaches here as a lone unit.)
+            if (cp > 0xFFFF) {
+                std::uint32_t const rest = static_cast<std::uint32_t>(cp) - 0x10000u;
+                std::uint32_t const high = 0xD800u + (rest >> 10);
+                std::uint32_t const low  = 0xDC00u + (rest & 0x3FFu);
+                put(high & 0xFF); put((high >> 8) & 0xFF);
+                put(low & 0xFF);  put((low >> 8) & 0xFF);
+                return std::nullopt;
+            }
             put(cp & 0xFF); put((cp >> 8) & 0xFF);
             return std::nullopt;
         }

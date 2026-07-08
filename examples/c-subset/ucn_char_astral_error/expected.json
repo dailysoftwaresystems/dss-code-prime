@@ -1,0 +1,17 @@
+{
+  "$comment": "C11/C23 6.4.4.4 char16_t constraint witness (UCN form): u'\\U0001F600' names U+1F600, a supplementary-plane code point - but ONE char16_t holds ONE code unit (a surrogate PAIR is two). The char path is UNCHANGED by the string surrogate-pair work: it FAILS LOUD with H_WideCharValueUnrepresentable (unsuppressable), the UCN analog of utf16_char_astral_error. Red-on-disable: drop the U16 range check in decodeWideCharCodepoint and this compiles emitting a wrong unit.",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "H_WideCharValueUnrepresentable",
+      "line": 7,
+      "col": 25
+    }
+  ]
+}

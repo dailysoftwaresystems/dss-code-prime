@@ -146,3 +146,113 @@ TEST(CharDecode, CharOctalEscape) {
     EXPECT_EQ(*b, 193u);
     EXPECT_FALSE(decodeCharLiteralBody("\\400").has_value());
 }
+
+// ── universal character names \u / \U (C11/C23 6.4.3) ───────────────────────
+
+TEST(CharDecode, UcnBmpEncodesCanonicalUtf8) {
+    // é (é, U+00E9) → the two UTF-8 bytes C3 A9; A (A) → one ASCII byte;
+    // € (€) → E2 82 AC. A UCN names a CODE POINT → canonical UTF-8, uniform
+    // for narrow + wide.
+    auto e = decodeStringLiteralBody("\\u00e9");
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(*e, std::string({static_cast<char>(0xC3), static_cast<char>(0xA9)}));
+    auto a = decodeStringLiteralBody("\\u0041");
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(*a, "A");
+    auto euro = decodeStringLiteralBody("\\u20AC");
+    ASSERT_TRUE(euro.has_value());
+    EXPECT_EQ(*euro, std::string({static_cast<char>(0xE2), static_cast<char>(0x82),
+                                  static_cast<char>(0xAC)}));
+}
+
+TEST(CharDecode, UcnAstralEncodesFourUtf8Bytes) {
+    // \U0001F600 (😀) → F0 9F 98 80 (the canonical 4-byte UTF-8 for U+1F600).
+    auto r = decodeStringLiteralBody("\\U0001F600");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, std::string({static_cast<char>(0xF0), static_cast<char>(0x9F),
+                               static_cast<char>(0x98), static_cast<char>(0x80)}));
+}
+
+TEST(CharDecode, UcnMaxScalarValueOk) {
+    // \U0010FFFF is the largest Unicode scalar value → valid, 4 UTF-8 bytes
+    // F4 8F BF BF. Boundary of the FF1 > U+10FFFF reject.
+    auto r = decodeStringLiteralBody("\\U0010FFFF");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(*r, std::string({static_cast<char>(0xF4), static_cast<char>(0x8F),
+                               static_cast<char>(0xBF), static_cast<char>(0xBF)}));
+}
+
+TEST(CharDecode, UcnTooFewHexDigitsFails) {
+    // \u needs EXACTLY 4 hex digits, \U EXACTLY 8. Fewer, or a non-hex digit
+    // inside the run, fails loud.
+    EXPECT_FALSE(decodeStringLiteralBody("\\u123").has_value());     // 3 hex
+    EXPECT_FALSE(decodeStringLiteralBody("\\U0001").has_value());    // 4 hex for \U
+    EXPECT_FALSE(decodeStringLiteralBody("\\u12zz").has_value());    // non-hex in run
+    EXPECT_FALSE(decodeStringLiteralBody("\\u").has_value());        // no digits at all
+}
+
+TEST(CharDecode, UcnSurrogateHalfFailsLoud) {
+    // FF1: U+D800..U+DFFF are UTF-16 surrogate halves, not scalar values →
+    // rejected INSIDE the decoder (before any append), so the narrow path never
+    // emits CESU-8. RED-ON-DISABLE for the surrogate guard.
+    EXPECT_FALSE(decodeStringLiteralBody("\\uD800").has_value());
+    EXPECT_FALSE(decodeStringLiteralBody("\\uDC00").has_value());
+    EXPECT_FALSE(decodeStringLiteralBody("\\uDFFF").has_value());
+}
+
+TEST(CharDecode, UcnBeyondUnicodeRangeFailsLoud) {
+    // FF1: > U+10FFFF is not a Unicode scalar value → fail loud.
+    EXPECT_FALSE(decodeStringLiteralBody("\\U00110000").has_value());
+    EXPECT_FALSE(decodeStringLiteralBody("\\UFFFFFFFF").has_value());
+}
+
+TEST(CharDecode, UcnFailureReportsInvalidUniversalName) {
+    // FF2: an invalid/malformed UCN reports the SPECIFIC InvalidUniversalName
+    // error (→ H_InvalidUniversalCharacterName), distinct from a generic
+    // Malformed escape (→ the generic message).
+    std::string out;
+    EXPECT_EQ(decodeEscapedBytes("\\uD800", out).error,
+              EscapeDecodeError::InvalidUniversalName);
+    out.clear();
+    EXPECT_EQ(decodeEscapedBytes("\\U00110000", out).error,
+              EscapeDecodeError::InvalidUniversalName);
+    out.clear();
+    EXPECT_EQ(decodeEscapedBytes("\\u12", out).error,
+              EscapeDecodeError::InvalidUniversalName);
+    out.clear();
+    EXPECT_EQ(decodeEscapedBytes("\\q", out).error, EscapeDecodeError::Malformed);
+}
+
+TEST(CharDecode, ByteEscapeFlagSetForHexAndOctalOnly) {
+    // FF3: the decoder flags a consumed \x / octal byte escape (the wide path
+    // rejects it fail-loud); a UCN, a named escape, and plain text do NOT.
+    std::string out;
+    EXPECT_TRUE(decodeEscapedBytes("\\x41", out).usedByteEscape);
+    out.clear();
+    EXPECT_TRUE(decodeEscapedBytes("\\101", out).usedByteEscape);
+    out.clear();
+    EXPECT_TRUE(decodeEscapedBytes("ok\\x41ok", out).usedByteEscape);  // flag persists across the loop
+    out.clear();
+    EXPECT_FALSE(decodeEscapedBytes("\\U0001F600", out).usedByteEscape);
+    out.clear();
+    EXPECT_FALSE(decodeEscapedBytes("\\n\\t", out).usedByteEscape);
+    out.clear();
+    EXPECT_FALSE(decodeEscapedBytes("plain", out).usedByteEscape);
+}
+
+TEST(CharDecode, CharUcnSingleByteOkMultiByteNotSingleChar) {
+    // A narrow char UCN that fits ONE byte: 'A' → 'A'. A valid UCN that needs
+    // >1 UTF-8 byte ('é' → C3 A9) is not a single narrow char → nullopt, but
+    // the decode is OK (NOT an invalid UCN — the caller shows the multi-char
+    // message, not H_InvalidUniversalCharacterName).
+    auto a = decodeCharLiteralBody("\\u0041");
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(*a, 65u);
+    EscapeDecodeOutcome oc;
+    EXPECT_FALSE(decodeCharLiteralBody("\\u00e9", &oc).has_value());
+    EXPECT_TRUE(oc.ok()) << "a valid multi-byte UCN is OK, just not one narrow char";
+    // An invalid UCN in a char body reports InvalidUniversalName.
+    EscapeDecodeOutcome bad;
+    EXPECT_FALSE(decodeCharLiteralBody("\\uD800", &bad).has_value());
+    EXPECT_EQ(bad.error, EscapeDecodeError::InvalidUniversalName);
+}

@@ -1,0 +1,15 @@
+{
+  "$comment": "C11/C23 6.4.3 / D-FFI-STDDEF-WCHAR-PE-WIDTH: sizeof(L\"\\U0001F600\") = the byte size of the astral UCN as a wchar_t array, FORMAT-keyed. pe → 6 (a UTF-16 surrogate PAIR = 2 units + NUL, × 2 bytes); elf/mach-o → 8 (ONE u32 unit + NUL, × 4 bytes). Per-target exitCode overrides the manifest default: the ONE source witnesses the surrogate-pair count on pe vs. the single unit elsewhere. The release arm returns the same per target.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 8,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"], "exitCode": 6 },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"], "exitCode": 8 },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64", "exitCode": 8 },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "exitCode": 8 }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

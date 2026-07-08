@@ -2471,18 +2471,138 @@ TEST(HirLoweringCSubset, Utf16BmpMultibyteDecodesToOneUnit) {
     EXPECT_EQ(ti.scalars(ty)[0], 2) << "ONE code unit + NUL (NOT 3 bytes + NUL)";
 }
 
-TEST(HirLoweringCSubset, Utf16AstralFailsLoud) {
-    // `u"😀"` — U+1F600 (F0 9F 98 80), a supplementary-plane cp under a 16-bit
-    // element. Surrogate pairs are a LATER cycle: this MUST fail loud
-    // (H_WideCharSurrogateUnsupported), NEVER silently truncate to a wrong unit.
+TEST(HirLoweringCSubset, Utf16AstralEncodesSurrogatePair) {
+    // Cycle C: `u"😀"` — U+1F600 (F0 9F 98 80), a supplementary-plane cp under a
+    // 16-bit element — now encodes as a UTF-16 SURROGATE PAIR: high 0xD83D then
+    // low 0xDE00, i.e. the LE bytes 3D D8 00 DE (TWO code units), NEVER a silent
+    // truncation. The array is Array<U16,3> (2 units + wide NUL). Red-on-disable:
+    // revert the encodeCodepoint U16 astral branch and this fails to compile.
     SemanticModel model = analyzeCSubset("void f() { u\"\xf0\x9f\x98\x80\"; }");
-    // The analyzer leaves the astral literal untyped (no wrong size); HIR emits
-    // the fail-loud diagnostic + an Error node, so lowering is NOT ok.
+    ASSERT_FALSE(model.hasErrors());
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
-    EXPECT_FALSE(res->ok) << "an unrepresentable astral wide-string must fail lowering";
-    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideCharSurrogateUnsupported), 1u)
-        << "exactly the surrogate-unsupported code, never a silent wrong unit";
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U16);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value),
+              std::string({0x3D, static_cast<char>(0xD8), 0x00, static_cast<char>(0xDE)}))
+        << "U+1F600 as a UTF-16 surrogate pair: high 0xD83D then low 0xDE00 (LE)";
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3) << "2 code units (surrogate pair) + wide NUL";
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::U16);
+}
+
+TEST(HirLoweringCSubset, UcnAstralStringEncodesSurrogatePair) {
+    // The `\U` universal-character-name form of the astral case: `u"\U0001F600"`
+    // decodes (in the shared byte decoder) to U+1F600 and encodes to the SAME
+    // surrogate pair 3D D8 00 DE as the raw `u"😀"`. Proves the UCN escape path.
+    SemanticModel model = analyzeCSubset("void f() { u\"\\U0001F600\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U16);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value),
+              std::string({0x3D, static_cast<char>(0xD8), 0x00, static_cast<char>(0xDE)}))
+        << "\\U0001F600 → surrogate pair 0xD83D 0xDE00 (LE)";
+}
+
+TEST(HirLoweringCSubset, UcnBmpU32String) {
+    // `U"é"` — the BMP UCN é (U+00E9) under a 32-bit element → one LE u32
+    // unit 0x000000E9. The array is Array<U32,2> (1 unit + wide NUL).
+    SemanticModel model = analyzeCSubset("void f() { U\"\\u00e9\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U32);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value),
+              std::string({static_cast<char>(0xE9), 0x00, 0x00, 0x00}))
+        << "\\u00e9 → one LE u32 unit 0x000000E9";
+}
+
+TEST(HirLoweringCSubset, UcnSurrogateHalfStringFailsLoud) {
+    // FF1/FF2: `U"\uD800"` names a UTF-16 surrogate half — not a Unicode scalar
+    // value. It fails loud with the dedicated H_InvalidUniversalCharacterName
+    // (6.4.3), NEVER a silent CESU-8 / wrong unit.
+    SemanticModel model = analyzeCSubset("void f() { U\"\\uD800\"; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "a surrogate-half UCN must fail lowering";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_InvalidUniversalCharacterName), 1u);
+}
+
+TEST(HirLoweringCSubset, WideStringByteEscapeFailsLoud) {
+    // FF3: `u"\xC3\xA9"` uses `\x` byte escapes in a wide/UTF string. The old path
+    // silently collapsed the two intended code units into one (0x00E9); Cycle C
+    // fails loud with H_WideByteEscapeUnsupported (a raw code-unit value is not a
+    // code point — the escape-value-as-code-unit feature is deferred). Narrow
+    // `"\xC3\xA9"` is UNCHANGED (byte-producing).
+    SemanticModel model = analyzeCSubset("void f() { u\"\\xC3\\xA9\"; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "a byte escape in a wide string must fail lowering";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideByteEscapeUnsupported), 1u);
+}
+
+TEST(HirLoweringCSubset, WideCharByteEscapeFailsLoud) {
+    // MEDIUM-1 (code-audit): the wide-CHAR byte-escape path is the char twin of
+    // WideStringByteEscapeFailsLoud (FF3). `u'\xC3\xA9'` must fail loud with
+    // H_WideByteEscapeUnsupported (decodeWideCharCodepoint → ByteEscapeInWide), NOT
+    // silently collapse C3 A9 → one char16_t 0x00E9. This is the sole exerciser of the
+    // ByteEscapeInWide enumerator on the char path — a refactor dropping the guard would
+    // reintroduce the collapse miscompile for the char form with nothing red.
+    SemanticModel model = analyzeCSubset("void f() { u'\\xC3\\xA9'; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "a byte escape in a wide char must fail lowering";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideByteEscapeUnsupported), 1u);
+}
+
+TEST(HirLoweringCSubset, WideStringIllFormedUtf8FailsLoud) {
+    // MEDIUM-2 (code-audit): after Cycle C, H_WideCharSurrogateUnsupported's surviving
+    // trigger is a RAW ill-formed UTF-8 byte in a wide string body (astral-under-U16 now
+    // surrogate-encodes; the `\x` route is shadowed by FF3's H_WideByteEscapeUnsupported).
+    // A lone 0x80 (an invalid UTF-8 lead byte) must fail loud, not emit a garbage code
+    // unit — this is the sole red-on-disable for that still-live diagnostic.
+    std::string src = "void f() { u\"";
+    src += static_cast<char>(0x80);
+    src += "\"; }";
+    SemanticModel model = analyzeCSubset(src);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "a raw ill-formed UTF-8 byte in a wide string must fail";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideCharSurrogateUnsupported), 1u);
+}
+
+TEST(HirLoweringCSubset, NarrowStringByteEscapeStillWorks) {
+    // FF3 boundary: the NARROW `"\xC3\xA9"` keeps `\x` escapes (byte-producing) —
+    // Array<Char,3> with the two raw bytes C3 A9. Proves FF3 did not regress the
+    // narrow path.
+    SemanticModel model = analyzeCSubset("void f() { \"\\xC3\\xA9\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::Char);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value),
+              std::string({static_cast<char>(0xC3), static_cast<char>(0xA9)}))
+        << "narrow \\xC3\\xA9 = the two raw bytes, unchanged";
 }
 
 TEST(HirLoweringCSubset, NarrowStringUnchangedUnderPrefixTable) {

@@ -3328,8 +3328,9 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
         if (idx.stringLiteralExprRule.valid()
             && idx.stringLiteralBodyToken.valid()
             && r.v == idx.stringLiteralExprRule.v) {
+            EscapeDecodeOutcome outcome;
             if (auto decoded = decodeAdjacentStringBodies(
-                    tree, c, idx.stringLiteralBodyToken)) {
+                    tree, c, idx.stringLiteralBodyToken, &outcome)) {
                 // C 6.7.9: the length is the code-unit count in the DECLARED
                 // element's width. Narrow (`char buf[]="…"`) → byte count
                 // (unchanged). A wide element (`wchar_t buf[]=L"…"`) re-encodes the
@@ -3341,13 +3342,18 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
                     return interner.array(
                         elem, static_cast<std::int64_t>(decoded->size() + 1));
                 }
-                WideEncodeResult enc;
-                if (!encodeWideString(*decoded, ek, enc)) {
-                    return interner.array(
-                        elem, static_cast<std::int64_t>(enc.codeUnits + 1));
+                // FF3 (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE): a wide element sized
+                // from a `\x`/octal byte escape stays INCOMPLETE (fail loud later),
+                // like a malformed escape — the HIR tier emits the diagnostic.
+                if (!outcome.usedByteEscape) {
+                    WideEncodeResult enc;
+                    if (!encodeWideString(*decoded, ek, enc)) {
+                        return interner.array(
+                            elem, static_cast<std::int64_t>(enc.codeUnits + 1));
+                    }
                 }
             }
-            return declTy;   // malformed escape / wide encode error — stay incomplete
+            return declTy;   // malformed escape / wide encode error / wide byte escape — stay incomplete
         }
         if (idx.braceInitListRule.valid() && idx.initElementRule.valid()
             && r.v == idx.braceInitListRule.v) {
@@ -4486,7 +4492,7 @@ charLiteralWideCoreOf(EngineState const& s, Tree const& tree, NodeId owningNode)
 // the byte length (unchanged path). For a WIDE core (U8/U16/U32/I32) the raw bytes
 // are UTF-8-decoded and re-encoded so N is the ELEMENT-width CODE-UNIT count — the
 // SAME `encodeWideString` the HIR tier runs, so both tiers agree on N. A wide
-// encode error (ill-formed UTF-8 / astral-under-U16 / cp>0x10FFFF) returns
+// encode error (ill-formed UTF-8 / cp>0x10FFFF) returns
 // InvalidType: the node stays untyped, the semantic phase already surfaces the
 // fault at the HIR tier's fail-loud, and a `sizeof` of it fails loud (never a
 // guessed size). Narrow strings never reach the wide path (byte-identical).
@@ -4697,14 +4703,23 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         && s.idx().stringLiteralExprRule.valid()
         && s.idx().stringLiteralBodyToken.valid()
         && tree.rule(node).v == s.idx().stringLiteralExprRule.v) {
+        EscapeDecodeOutcome outcome;
         if (auto decoded = decodeAdjacentStringBodies(
-                tree, node, s.idx().stringLiteralBodyToken)) {
+                tree, node, s.idx().stringLiteralBodyToken, &outcome)) {
             // C11/C23 6.4.5: the element core is keyed by THIS literal's opener
             // (narrow `"` → Char; `u"`/`U"`/`u8"`/`L"` → their core), and the array
             // length is the code-unit count for a wide core (via the shared encoder).
             TypeKind const core = stringLiteralElementCoreOf(s, tree, node);
-            if (TypeId const arr = stringLiteralArrayType(s, *decoded, core); arr.valid()) {
-                s.nodeToType.set(node, arr);
+            // FF3 (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE): a `\x`/octal byte escape
+            // in a WIDE/UTF string names a raw code-unit value, not a code point —
+            // leave the node UNTYPED so a `sizeof` of it fails loud, matching the HIR
+            // tier's fail-loud. Narrow `\x`/octal is byte-producing and stays typed.
+            bool const wideByteEscape = outcome.usedByteEscape
+                && core != TypeKind::Char && core != TypeKind::Byte;
+            if (!wideByteEscape) {
+                if (TypeId const arr = stringLiteralArrayType(s, *decoded, core); arr.valid()) {
+                    s.nodeToType.set(node, arr);
+                }
             }
         }
     }
