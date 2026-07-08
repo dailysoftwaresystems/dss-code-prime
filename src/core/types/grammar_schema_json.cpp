@@ -8773,30 +8773,35 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                    cfg.unicodeStringStartToken);
             }
 
-            // C11/C23 6.4.5: the string-literal opener → element-core table.
-            // Optional array `[{startToken, elementCore}]`. Each row validates:
-            // the token resolves to a declared kind, `elementCore` is a known
+            // C11/C23 6.4.5 (strings) + 6.4.4.4 (chars): the literal-opener →
+            // element-core table(s). Optional array `[{startToken, elementCore,
+            // elementCoreByFormat?}]`. Each row validates: the token resolves to a
+            // declared kind, `elementCore` (and every per-format override) is a known
             // TypeKind name, and no startToken is duplicated across rows. Row 0 is
-            // AUTO-SEEDED from `stringStartToken` (elementCore=Char) when absent,
-            // and `unicodeStringStartToken` folds in as a Char row — so a schema
-            // declaring no explicit prefixes is byte-identical (narrow strings type
-            // exactly as before).
-            {
+            // AUTO-SEEDED from the narrow opener when absent — so a schema declaring
+            // no explicit prefixes is byte-identical. The STRING and CHAR forms share
+            // this ONE validator (identical row/format-map shape; only the field
+            // name, target vector, and the narrow opener's auto-seed core differ) so
+            // the two can never drift.
+            auto parseLiteralPrefixTable =
+                [&](char const* field, std::vector<LiteralPrefixEntry>& target,
+                    SchemaTokenId narrowTok, std::string const& narrowTokName,
+                    TypeKind narrowSeedCore) {
                 auto prefixSeen = [&](SchemaTokenId t) {
-                    for (auto const& p : cfg.stringLiteralPrefixes)
+                    for (auto const& p : target)
                         if (p.startToken.v == t.v) return true;
                     return false;
                 };
-                if (hl.contains("stringLiteralPrefixes")) {
-                    json const& arr = hl.at("stringLiteralPrefixes");
+                if (hl.contains(field)) {
+                    json const& arr = hl.at(field);
                     if (!arr.is_array()) {
                         coll.emit(DiagnosticCode::C_InvalidHirLowering,
-                                  "/hirLowering/stringLiteralPrefixes",
-                                  "'stringLiteralPrefixes' must be an array");
+                                  std::format("/hirLowering/{}", field),
+                                  std::format("'{}' must be an array", field));
                     } else {
                         for (std::size_t i = 0; i < arr.size(); ++i) {
                             auto const path = std::format(
-                                "/hirLowering/stringLiteralPrefixes/{}", i);
+                                "/hirLowering/{}/{}", field, i);
                             json const& entry = arr[i];
                             if (!entry.is_object()
                                 || !entry.contains("startToken")
@@ -8804,8 +8809,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 || !entry.contains("elementCore")
                                 || !entry.at("elementCore").is_string()) {
                                 coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
-                                          "each stringLiteralPrefixes entry needs string "
-                                          "'startToken' and 'elementCore'");
+                                          std::format("each {} entry needs string "
+                                                      "'startToken' and 'elementCore'", field));
                                 continue;
                             }
                             LiteralPrefixEntry row;
@@ -8826,20 +8831,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             if (prefixSeen(row.startToken)) {
                                 coll.emit(DiagnosticCode::C_InvalidHirLowering,
                                           path + "/startToken",
-                                          std::format("duplicate stringLiteralPrefixes "
-                                                      "startToken '{}'", row.startTokenName));
+                                          std::format("duplicate {} startToken '{}'",
+                                                      field, row.startTokenName));
                                 continue;
                             }
                             row.elementCore = *core;
                             // Optional per-format element-core override
                             // (`elementCoreByFormat`), mirroring builtinTypes'
-                            // `coreByDataModel`: this is how `L"…"` (wchar_t) declares
-                            // its FORMAT-keyed width AS CONFIG DATA (elf/macho→I32,
-                            // pe→U16) — no engine tier hardcodes a `format == …`
-                            // branch. Closed keys: every key must resolve to a known
-                            // ObjectFormatKind (the EXISTING object-format-name
-                            // resolver) and every value to a known TypeKind — a typo'd
-                            // format name would otherwise silently never override.
+                            // `coreByDataModel`: this is how `L"…"`/`L'…'` (wchar_t)
+                            // declares its FORMAT-keyed width AS CONFIG DATA
+                            // (elf/macho→I32, pe→U16) — no engine tier hardcodes a
+                            // `format == …` branch. Closed keys: every key must resolve
+                            // to a known ObjectFormatKind (the EXISTING object-format-
+                            // name resolver) and every value to a known TypeKind — a
+                            // typo'd format name would otherwise silently never override.
                             bool formatMapOk = true;
                             if (entry.contains("elementCoreByFormat")) {
                                 auto const& fmtObj = entry.at("elementCoreByFormat");
@@ -8885,24 +8890,35 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 }
                             }
                             if (!formatMapOk) continue;
-                            cfg.stringLiteralPrefixes.push_back(std::move(row));
+                            target.push_back(std::move(row));
                         }
                     }
                 }
-                // Auto-seed the narrow opener (elementCore=Char) so a schema that
-                // declared string literals but no explicit prefixes types exactly
-                // as before — the invariant the existing suite's byte-identity pins.
-                if (cfg.stringStartToken.valid() && !prefixSeen(cfg.stringStartToken)) {
+                // Auto-seed the narrow opener so a schema that declared the literal
+                // form but no explicit prefixes types exactly as before — the
+                // invariant the existing suite's byte-identity pins.
+                if (narrowTok.valid() && !prefixSeen(narrowTok)) {
                     LiteralPrefixEntry row;
-                    row.startToken     = cfg.stringStartToken;
-                    row.startTokenName = cfg.stringStartTokenName;
-                    row.elementCore    = TypeKind::Char;
-                    cfg.stringLiteralPrefixes.push_back(std::move(row));
+                    row.startToken     = narrowTok;
+                    row.startTokenName = narrowTokName;
+                    row.elementCore    = narrowSeedCore;
+                    target.push_back(std::move(row));
                 }
-                // Fold SQL's `N'…'` unicode opener in as a Char row (same body
-                // token + decoder as the narrow form).
+            };
+            // Strings: narrow `"` auto-seeds to Char (a byte array element).
+            parseLiteralPrefixTable("stringLiteralPrefixes", cfg.stringLiteralPrefixes,
+                                    cfg.stringStartToken, cfg.stringStartTokenName,
+                                    TypeKind::Char);
+            // Fold SQL's `N'…'` unicode opener in as a Char string row (same body
+            // token + decoder as the narrow form) — string-only, so it stays here.
+            {
+                auto stringPrefixSeen = [&](SchemaTokenId t) {
+                    for (auto const& p : cfg.stringLiteralPrefixes)
+                        if (p.startToken.v == t.v) return true;
+                    return false;
+                };
                 if (cfg.unicodeStringStartToken.valid()
-                    && !prefixSeen(cfg.unicodeStringStartToken)) {
+                    && !stringPrefixSeen(cfg.unicodeStringStartToken)) {
                     LiteralPrefixEntry row;
                     row.startToken     = cfg.unicodeStringStartToken;
                     row.startTokenName = cfg.unicodeStringStartTokenName;
@@ -8910,6 +8926,12 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     cfg.stringLiteralPrefixes.push_back(std::move(row));
                 }
             }
+            // Chars: narrow `'x'` auto-seeds to I32 (C 6.4.4.4 — an unprefixed
+            // character constant has type `int`); the wide/UTF prefixes carry their
+            // C23 scalar core (`u'`→U16, `U'`→U32, `u8'`→U8, `L'`→format-keyed).
+            parseLiteralPrefixTable("charLiteralPrefixes", cfg.charLiteralPrefixes,
+                                    cfg.charStartToken, cfg.charStartTokenName,
+                                    TypeKind::I32);
             // HR10: string bodies use doubled-delimiter (`''`) escaping (SQL).
             // Derive the delimiter byte from the string opener's StringStyle.endsAt
             // (single source of truth) so the engine's decoder doesn't duplicate it.

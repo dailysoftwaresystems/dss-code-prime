@@ -313,6 +313,119 @@ TEST(SemanticAnalyzerCSubset, WideCharLiteralWidthIsFormatKeyed) {
     }
 }
 
+// ── C11/C23 6.4.4.4: wide / UTF CHARACTER-constant TYPING (scalar core per prefix)
+namespace {
+// The TypeId stamped on the first `CharLiteral` BODY token in `cu`'s tree (a char
+// constant is a SCALAR — the stamp is on the body token, unlike a string's expr
+// node). InvalidType if none / left untyped (the wide type-drop for sizeof safety).
+[[nodiscard]] TypeId firstCharLiteralType(SemanticModel const& model,
+                                          CompilationUnit const& cu) {
+    Tree const& tree = cu.trees()[0];
+    SchemaTokenId const body = tree.schema().schemaTokens().find("CharLiteral");
+    TypeId found{};
+    bool seen = false;
+    walkPreOrder(tree, [&](TreeCursor const& c) {
+        NodeId const n = c.current();
+        if (!seen && tree.kind(n) == NodeKind::Token && body.valid()
+            && tree.tokenKind(n).v == body.v) {
+            found = model.typeAt(n);
+            seen  = true;
+        }
+    });
+    return found;
+}
+} // namespace
+
+// C23 6.4.4.4 — the NEW per-prefix TYPE rule: `'x'`→int (I32, UNCHANGED),
+// `u'A'`→char16_t (U16), `U'A'`→char32_t (U32), `u8'A'`→char8_t (U8). Red-on-disable:
+// without the wide override the prefixed forms all stay I32 (so `sizeof(u'A')`==4).
+TEST(SemanticAnalyzerCSubset, WideCharLiteralScalarCorePerPrefix) {
+    struct Case { char const* src; TypeKind core; };
+    for (auto const& tc : {Case{"void f(){ 'x'; }",   TypeKind::I32},
+                           Case{"void f(){ u'A'; }",  TypeKind::U16},
+                           Case{"void f(){ U'A'; }",  TypeKind::U32},
+                           Case{"void f(){ u8'A'; }", TypeKind::U8}}) {
+        auto cu = buildShippedUnit("c-subset", { tc.src });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        ASSERT_FALSE(model.hasErrors()) << tc.src;
+        auto const& ti = model.lattice().interner();
+        TypeId const ty = firstCharLiteralType(model, *cu);
+        ASSERT_TRUE(ty.valid()) << tc.src;
+        EXPECT_EQ(ti.kind(ty), tc.core) << tc.src;
+    }
+}
+
+// wchar_t (`L'x'`) width is FORMAT-keyed (D-FFI-STDDEF-WCHAR-PE-WIDTH) via the SAME
+// `elementCoreByFormat` axis the wide-STRING row uses — the format-agnostic default
+// resolves to I32 (POSIX), PE to U16. A pure `resolveElementCore` lookup, no
+// hardcoded format branch. This is the char analog of the string test above.
+TEST(SemanticAnalyzerCSubset, WideCharConstantWidthIsFormatKeyed) {
+    // Default (activeFormat=nullopt) → I32.
+    {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ L'x'; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        ASSERT_FALSE(model.hasErrors());
+        auto const& ti = model.lattice().interner();
+        TypeId const ty = firstCharLiteralType(model, *cu);
+        ASSERT_TRUE(ty.valid());
+        EXPECT_EQ(ti.kind(ty), TypeKind::I32) << "wchar_t defaults to the POSIX i32 width";
+    }
+    // PE format → U16.
+    {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ L'x'; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DataModel::Llp64, std::nullopt, std::nullopt,
+                             ObjectFormatKind::Pe);
+        ASSERT_FALSE(model.hasErrors());
+        auto const& ti = model.lattice().interner();
+        TypeId const ty = firstCharLiteralType(model, *cu);
+        ASSERT_TRUE(ty.valid());
+        EXPECT_EQ(ti.kind(ty), TypeKind::U16)
+            << "wchar_t on PE is the u16 Windows UTF-16 code unit";
+    }
+}
+
+// The sizeof-safety pin (MUST-FIX #3a): a wide char whose code point does NOT fit
+// its element (`u8'β'`>U+007F, `u'😀'` astral) leaves the body token UNTYPED so a
+// `sizeof`/`_Alignof` of it fails loud (never a guessed size). Here we assert the
+// body token is left with no valid type (the drop) — plus the format-keyed drop:
+// `L'😀'` is representable under the default I32 but NOT under the pe U16.
+TEST(SemanticAnalyzerCSubset, BadWideCharConstantLeavesBodyTokenUntyped) {
+    // u8'β' — U+03B2 exceeds the single-UTF-8-unit range (0x7F).
+    {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ u8'\xce\xb2'; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        TypeId const ty = firstCharLiteralType(model, *cu);
+        EXPECT_FALSE(ty.valid())
+            << "an out-of-range u8 char must be left untyped so sizeof fails loud";
+    }
+    // L'😀' under PE (U16) → astral, unrepresentable → untyped.
+    {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ L'\xf0\x9f\x98\x80'; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DataModel::Llp64, std::nullopt, std::nullopt,
+                             ObjectFormatKind::Pe);
+        TypeId const ty = firstCharLiteralType(model, *cu);
+        EXPECT_FALSE(ty.valid())
+            << "an astral L' char under pe (u16 wchar_t) must be left untyped";
+    }
+    // L'😀' under the default format (I32 wchar_t) → representable → typed I32.
+    {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ L'\xf0\x9f\x98\x80'; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        ASSERT_FALSE(model.hasErrors());
+        auto const& ti = model.lattice().interner();
+        TypeId const ty = firstCharLiteralType(model, *cu);
+        ASSERT_TRUE(ty.valid())
+            << "an astral L' char under the i32 default wchar_t IS representable";
+        EXPECT_EQ(ti.kind(ty), TypeKind::I32);
+    }
+}
+
 // (5) A `[]` with NO initializer is NOT silently sized — the resolver's
 // S_NonConstantArrayLength still fires (inference is gated on an initializer
 // being present, so a bare `int x[];` is unaffected by c34).

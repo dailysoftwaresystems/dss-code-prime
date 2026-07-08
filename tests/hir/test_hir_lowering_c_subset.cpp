@@ -57,6 +57,20 @@ namespace {
     return analyze(cu);
 }
 
+// As `analyzeCSubset`, but under the PE object format — so `L'…'`/`L"…"` (wchar_t)
+// resolves to the 2-byte Windows UTF-16 unit (U16), not the POSIX I32. Used to
+// witness the FORMAT-keyed wide-char constraint (an astral `L'😀'` is representable
+// under the default I32 but NOT under the pe U16).
+[[nodiscard]] SemanticModel analyzeCSubsetPe(std::string src) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    UnitBuilder builder{*loaded};
+    builder.addInMemory(std::move(src), "<mem>");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    return analyze(cu, DataModel::Llp64, std::nullopt, std::nullopt,
+                   ObjectFormatKind::Pe);
+}
+
 // Drive c-subset → SemanticModel with the parser's expression-depth cap RAISED to
 // `cap` (the default is 256), so a deep-but-legal nesting beyond the cap parses to
 // completion — the DEEP-NEST-RECURSION lowering pins need an input deeper than any
@@ -2114,6 +2128,120 @@ TEST(HirLoweringCSubset, MultiCharCharLiteralFailsLoud) {
     auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok);
     EXPECT_GT(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 0u);
+}
+
+// ── C11/C23 6.4.4.4: wide / UTF CHARACTER constants (L'x'/u'x'/U'x'/u8'x') ───────
+// A prefixed char constant is a SCALAR: its element core is typed by the prefix and
+// its value is the single decoded code point (uint64 arm). The narrow path is
+// UNCHANGED (the four tests above are the byte-identity guard).
+
+TEST(HirLoweringCSubset, WideCharConstantElementAndValue) {
+    // Each prefixed char → its C23 core + the decoded code point. `L'x'` under the
+    // default format is wchar_t = I32 (the POSIX width); value is the code point 120.
+    struct Case { char const* src; TypeKind core; std::uint64_t value; };
+    for (auto const& tc : {Case{"void f() { L'x'; }",  TypeKind::I32, 120},
+                           Case{"void f() { u'A'; }",  TypeKind::U16, 65},
+                           Case{"void f() { U'A'; }",  TypeKind::U32, 65},
+                           Case{"void f() { u8'A'; }", TypeKind::U8,  65}}) {
+        SemanticModel model = analyzeCSubset(tc.src);
+        ASSERT_FALSE(model.hasErrors()) << tc.src;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << tc.src << " : " << (r.all().empty() ? "" : r.all()[0].actual);
+        ASSERT_EQ(res->literalPool.size(), 1u) << tc.src;
+        auto const& v = res->literalPool.at(0);
+        EXPECT_EQ(v.core, tc.core) << tc.src;
+        ASSERT_TRUE(std::holds_alternative<std::uint64_t>(v.value)) << tc.src;
+        EXPECT_EQ(std::get<std::uint64_t>(v.value), tc.value) << tc.src;
+        auto const& ti = model.lattice().interner();
+        HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+        HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+        EXPECT_EQ(ti.kind(res->hir.typeId(lit)), tc.core) << tc.src;
+    }
+}
+
+TEST(HirLoweringCSubset, WideCharBmpMultibyteDecodesToCodepoint) {
+    // `U'€'` — U+20AC, source bytes E2 82 AC — UTF-8-decodes those THREE source
+    // bytes to the SINGLE code point 0x20AC (NOT a byte-passthrough). The witness
+    // that the char body is UTF-8-decoded exactly like a wide string.
+    SemanticModel model = analyzeCSubset("void f() { U'\xe2\x82\xac'; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U32);
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(v.value));
+    EXPECT_EQ(std::get<std::uint64_t>(v.value), 0x20ACu) << "U+20AC is ONE code point";
+}
+
+TEST(HirLoweringCSubset, Utf8CharOutOfRangeFailsLoud) {
+    // `u8'β'` — U+03B2 (CE B2) exceeds the single-UTF-8-code-unit range (0x7F).
+    // C23 char8_t constant constraint → fail loud (H_Utf8CharLiteralOutOfRange),
+    // NEVER a silently truncated low byte.
+    SemanticModel model = analyzeCSubset("void f() { u8'\xce\xb2'; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "an out-of-range u8 char must fail lowering";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_Utf8CharLiteralOutOfRange), 1u)
+        << "exactly the u8-out-of-range code, never a silent truncated byte";
+}
+
+TEST(HirLoweringCSubset, Utf16CharAstralFailsLoud) {
+    // `u'😀'` — U+1F600, a supplementary-plane cp under a 16-bit char16_t. One
+    // char16_t holds ONE code unit; an astral cp needs a surrogate PAIR → fail loud
+    // (H_WideCharValueUnrepresentable), NEVER a silent wrong unit. Format-invariant
+    // (u' is always U16), so the reject is target-independent.
+    SemanticModel model = analyzeCSubset("void f() { u'\xf0\x9f\x98\x80'; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "an astral char16_t constant must fail lowering";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideCharValueUnrepresentable), 1u);
+}
+
+TEST(HirLoweringCSubset, WideCharMultiCharAndEmptyFailLoud) {
+    // A wide/UTF char must denote EXACTLY ONE code point. `L'ab'` (multi) and `L''`
+    // (empty) both fail loud (H_WideCharValueUnrepresentable) — the strict
+    // single-code-point rule the wide path enforces (unlike narrow impl-defined).
+    for (char const* src : {"void f() { L'ab'; }", "void f() { L''; }"}) {
+        SemanticModel model = analyzeCSubset(src);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_FALSE(res->ok) << src;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_WideCharValueUnrepresentable), 1u) << src;
+    }
+}
+
+// SHOULD-FIX #6 — the DEFINITIVE per-format / agnostic witness. `L'😀'` (U+1F600)
+// is a wchar_t constant, and wchar_t is FORMAT-keyed: on pe it is the 16-bit UTF-16
+// unit (U16) → the astral cp is UNREPRESENTABLE → fail loud; on the POSIX default it
+// is I32 → the astral cp fits → lowers to value 0x1F600. ONE source, opposite
+// outcomes, decided purely by the config `elementCoreByFormat` map — no format
+// branch in shared substrate. Red-on-disable of the format-keying flips one arm.
+TEST(HirLoweringCSubset, WideCharAstralIsFormatKeyed) {
+    char const* src = "void f() { L'\xf0\x9f\x98\x80'; }";
+    // PE (u16 wchar_t) → fail loud.
+    {
+        SemanticModel model = analyzeCSubsetPe(src);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_FALSE(res->ok) << "astral L' under pe (u16 wchar_t) must fail loud";
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_WideCharValueUnrepresentable), 1u);
+    }
+    // POSIX default (i32 wchar_t) → the astral cp fits → value 0x1F600.
+    {
+        SemanticModel model = analyzeCSubset(src);
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        ASSERT_EQ(res->literalPool.size(), 1u);
+        auto const& v = res->literalPool.at(0);
+        EXPECT_EQ(v.core, TypeKind::I32);
+        ASSERT_TRUE(std::holds_alternative<std::uint64_t>(v.value));
+        EXPECT_EQ(std::get<std::uint64_t>(v.value), 0x1F600u);
+    }
 }
 
 TEST(HirLoweringCSubset, LoweredSeqExprRoundTrips) {

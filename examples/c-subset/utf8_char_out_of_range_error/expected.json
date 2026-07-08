@@ -1,0 +1,11 @@
+{
+  "$comment": "C23 6.4.4.4 char8_t constraint witness: u8'β' (U+03B2, raw bytes CE B2) exceeds the single-UTF-8-code-unit range (≤ U+007F), so a u8 character constant CANNOT represent it. The CST→HIR lowering FAILS LOUD with H_Utf8CharLiteralOutOfRange (an unsuppressable code) rather than silently truncating to a wrong low byte. u8' is always U8 (format-independent), so the reject is target-independent. Red-on-disable: drop the U8 range check in decodeWideCharCodepoint and this compiles emitting a garbage byte. The load-bearing pin is the CODE + a rejected compile at the literal's position.",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec" }
+  ],
+  "expectDiagnostics": [
+    { "code": "H_Utf8CharLiteralOutOfRange", "line": 1, "col": 25 }
+  ]
+}

@@ -144,6 +144,20 @@ struct SchemaIndexes {
     // format), so this map is the single format-aware resolution point.
     std::unordered_map<std::uint32_t /*opener SchemaTokenId.v*/, TypeKind>
                                                    stringLiteralElementCoreByStart;
+    // C11/C23 6.4.4.4: the CHARACTER-constant body token kind (`CharLiteral`) + the
+    // WIDE openers' format-resolved element cores. `charLiteralBodyToken` gates the
+    // char-typing override (only a char body token is a candidate); the map holds
+    // ONLY the wide/UTF openers (`L'`/`u'`/`U'`/`u8'`) → their C23 scalar core
+    // (WideCharStart format-resolved here, pe→U16 / elf,macho→I32). The NARROW
+    // `CharStart` is DELIBERATELY absent — the unprefixed `'x'` stays `int` via the
+    // flat `literalTypeIds` path (other integer-literal consumers key on that entry),
+    // so a wide opener OVERRIDES the flat int type and the narrow one never does.
+    // Empty ⇒ the language declares no wide char prefixes (byte-identical). Like the
+    // string map, this is the single format-aware resolution point (the HIR tier
+    // reads the resolved core back off the stamped body token; it lacks format).
+    SchemaTokenId                                  charLiteralBodyToken{};
+    std::unordered_map<std::uint32_t /*opener SchemaTokenId.v*/, TypeKind>
+                                                   charLiteralElementCoreByStart;
     // C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): the rule whose
     // subtree is a (possibly adjacent-concatenated) string-literal expression.
     // When valid, the string's `Array<core, N+1>` type is stamped on this RULE
@@ -4446,6 +4460,27 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
     return s.idx().stringLiteralElementCore;
 }
 
+// C11/C23 6.4.4.4: the WIDE/UTF element core of a character constant, keyed by its
+// ACTUAL opener token — but ONLY for the wide openers (`L'`/`u'`/`U'`/`u8'`). The
+// narrow `'x'` opener (`CharStart`) is DELIBERATELY absent from the map, so this
+// returns std::nullopt for it and the caller keeps the flat `int` type (byte-
+// identical). The opener is a DIRECT child token of `owningNode` (the charLiteralExpr
+// rule node; the inline-alt opener pushes it flat), so a single child scan finds it.
+// The core was format-resolved at index-build time (this tier owns `activeFormat`).
+[[nodiscard]] std::optional<TypeKind>
+charLiteralWideCoreOf(EngineState const& s, Tree const& tree, NodeId owningNode) {
+    auto const& byStart = s.idx().charLiteralElementCoreByStart;
+    if (!byStart.empty() && owningNode.valid()
+        && tree.kind(owningNode) == NodeKind::Internal) {
+        for (NodeId c : visibleChildren(tree, owningNode)) {
+            if (tree.kind(c) != NodeKind::Token) continue;
+            auto it = byStart.find(tree.tokenKind(c).v);
+            if (it != byStart.end()) return it->second;
+        }
+    }
+    return std::nullopt;
+}
+
 // C 6.4.5: the `Array<elementCore, N+1>` type of a string literal whose
 // escape-decoded bytes are `decodedBytes`. For the NARROW core (Char/Byte) N is
 // the byte length (unchanged path). For a WIDE core (U8/U16/U32/I32) the raw bytes
@@ -4595,6 +4630,29 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     std::abort();
                 }
                 litTy = s.lattice.interner().primitive(*fk);
+            }
+            // C11/C23 6.4.4.4: a PREFIXED character constant (`L'x'`/`u'x'`/`U'x'`/
+            // `u8'x'`) has the SCALAR type of its prefix (wchar_t/char16_t/char32_t/
+            // char8_t), NOT `int`. The narrow `'x'` keeps its flat `literalTypeIds`
+            // type (`int` / I32) UNTOUCHED — other consumers key on that entry
+            // (`integerLiteralTokenSet`, `isLiteralIntegerZero`). ONLY a wide opener
+            // OVERRIDES: look up the parent charLiteralExpr's opener in the WIDE-ONLY
+            // `charLiteralElementCoreByStart` map (format-resolved at index build). A
+            // wide char whose single code point does NOT fit its element (astral under
+            // char16_t, `u8'`>U+007F, empty/multi-char/ill-formed) leaves the body
+            // token UNTYPED so a `sizeof`/`_Alignof` of it fails loud (never a guessed
+            // size) — the HIR tier emits the specific diagnostic. The decode+validate
+            // is the SHARED `decodeWideCharCodepoint` the HIR tier runs, so both tiers
+            // agree on representability.
+            if (s.idx().charLiteralBodyToken.valid()
+                && tk == s.idx().charLiteralBodyToken) {
+                if (auto wideCore = charLiteralWideCoreOf(s, tree, tree.parent(node))) {
+                    if (decodeWideCharCodepoint(tree.text(node), *wideCore)) {
+                        litTy = s.lattice.interner().primitive(*wideCore);
+                    } else {
+                        return;   // unrepresentable — leave untyped (sizeof fails loud)
+                    }
+                }
             }
             s.nodeToType.set(node, litTy);
         }
@@ -7173,6 +7231,23 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 core = px.resolveElementCore(s.activeFormat);   // config-map lookup
             }
             idx.stringLiteralElementCoreByStart[px.startToken.v] = core;
+        }
+        // C11/C23 6.4.4.4: the WIDE char-opener → format-resolved element-core map
+        // (`L'`/`u'`/`U'`/`u8'`). The narrow `CharStart` is EXCLUDED — the unprefixed
+        // `'x'` stays `int` via the flat `literalTypeIds` path (other integer-literal
+        // consumers key on that entry), so only a wide opener overrides the char
+        // type. Same PURE CONFIG-MAP LOOKUP (`resolveElementCore`) as the string map:
+        // WideCharStart (wchar_t) resolves pe→U16 / elf,macho→I32 AS CONFIG DATA — NO
+        // engine-tier `format == …` branch. The HIR tier reads the core back off the
+        // stamped body token (it lacks format), so this is the format-aware point.
+        SchemaTokenId const narrowChar = sch.hirLowering().charStartToken;
+        idx.charLiteralBodyToken = sch.hirLowering().charBodyToken;
+        for (auto const& px : sch.hirLowering().charLiteralPrefixes) {
+            if (!px.startToken.valid()) continue;
+            if (narrowChar.valid() && px.startToken.v == narrowChar.v)
+                continue;   // narrow `'x'` → flat literalTypeIds int path (untouched)
+            idx.charLiteralElementCoreByStart[px.startToken.v] =
+                px.resolveElementCore(s.activeFormat);
         }
         distinctSchemas.push_back(&sch);
     }

@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 80> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 82> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -136,6 +136,15 @@ constexpr std::array<DiagnosticCode, 80> kUnsuppressableCodes{{
     // — suppressing it would let a wrong/truncated code unit ship green. Emits an
     // Error HIR node + fails the gate via errorCount.
     DiagnosticCode::H_WideCharSurrogateUnsupported,
+    // H_Utf8CharLiteralOutOfRange + H_WideCharValueUnrepresentable (C11/C23 6.4.4.4,
+    // wide/UTF CHARACTER constants): a `u8'…'` code point > U+007F, or a wide/UTF
+    // char that does not denote exactly one representable code unit (astral under a
+    // 16-bit element, empty/multi-character, ill-formed UTF-8, cp > U+10FFFF). Same
+    // silent-miscompile class as H_WideCharSurrogateUnsupported — suppressing either
+    // would let a wrong/truncated code unit ship green. Emits an Error HIR node +
+    // fails the gate via errorCount.
+    DiagnosticCode::H_Utf8CharLiteralOutOfRange,
+    DiagnosticCode::H_WideCharValueUnrepresentable,
 
     // I_* MIR-verifier band — frozen-module invariants. A suppressed
     // violation here would let a miscompile sail past the verifier.

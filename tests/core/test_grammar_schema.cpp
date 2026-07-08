@@ -3783,3 +3783,26 @@ TEST(GrammarSchema, StringPrefixUnknownElementCoreReportsCode) {
         << "an unknown per-format TypeKind must fail the load";
     EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
 }
+
+// C11/C23 6.4.4.4: `charLiteralPrefixes` shares the SAME validator as
+// `stringLiteralPrefixes` (one loader lambda) — this mutates the WIDE-CHAR row's
+// format key to prove the char table is parsed + closed-key-validated too (a typo'd
+// char wchar format would otherwise silently bake the wrong char width).
+TEST(GrammarSchema, CharPrefixUnknownFormatKeyReportsCode) {
+    std::string text = shippedCSubsetTextForPrefixTest();
+    ASSERT_FALSE(text.empty());
+    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
+        << "shipped c-subset must load clean before mutation";
+    // The WideCharStart row's `elementCoreByFormat` (the SECOND such snippet — the
+    // first belongs to WideStringStart).
+    std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
+    auto const first = text.find(needle);
+    ASSERT_NE(first, std::string::npos);
+    auto const pos = text.find(needle, first + needle.size());
+    ASSERT_NE(pos, std::string::npos) << "the WideCharStart elementCoreByFormat row was not found";
+    text.replace(pos, needle.size(), "\"elementCoreByFormat\": { \"windoze\": \"U16\"");
+    auto result = GrammarSchema::loadFromText(text);
+    ASSERT_FALSE(result.has_value())
+        << "an unknown object-format key in charLiteralPrefixes must fail the load";
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
+}

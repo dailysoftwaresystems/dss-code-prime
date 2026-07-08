@@ -818,6 +818,22 @@ enum class DiagnosticCode : std::uint16_t {
     //   An `Error` HIR node is emitted as a recovery sentinel and lowering
     //   continues (collect-all), exactly like H_UnsupportedLoweringForKind.
     H_WideCharSurrogateUnsupported = 0xF012,
+    // H_Utf8CharLiteralOutOfRange (C23 6.4.4.4): a `u8'…'` character constant whose
+    //   single code point exceeds U+007F. A char8_t constant must be representable
+    //   as ONE UTF-8 code unit (the ASCII range) — a multi-byte code point (`u8'β'`,
+    //   `u8'€'`) has no single-unit value and is a constraint violation. Fail-loud
+    //   (never a silently truncated low byte); an `Error` HIR node continues the
+    //   collect-all lowering, exactly like H_WideCharSurrogateUnsupported.
+    H_Utf8CharLiteralOutOfRange   = 0xF013,
+    // H_WideCharValueUnrepresentable (C11/C23 6.4.4.4): a wide/UTF CHARACTER constant
+    //   (`L'…'`/`u'…'`/`U'…'`) that does not denote exactly one code unit of its
+    //   element type. Fail-loud triggers (never a silent wrong/truncated unit): a
+    //   supplementary-plane code point (> U+FFFF) under a 16-bit element (`u'😀'`, or
+    //   pe-`L'😀'`) — one char16_t/wchar_t holds ONE code unit, a surrogate pair is
+    //   two; a body that is empty (`L''`) or multi-character (`L'ab'`); ill-formed
+    //   UTF-8; or a code point past U+10FFFF. The `actual` names the specific cause.
+    //   An `Error` HIR node continues the collect-all lowering.
+    H_WideCharValueUnrepresentable = 0xF014,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,

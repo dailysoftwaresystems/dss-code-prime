@@ -237,6 +237,20 @@ struct DSS_EXPORT HirLoweringConfig {
     // the HIR tier reads the element core back off the semantic-stamped node type.
     std::vector<LiteralPrefixEntry> stringLiteralPrefixes;
 
+    // C11/C23 6.4.4.4: every CHARACTER-constant opener the language admits → the
+    // element core of its scalar value (see `LiteralPrefixEntry`). Mirrors
+    // `stringLiteralPrefixes`, but a char constant is a SCALAR (not an array): the
+    // narrow `'x'` types as `int` (the language's `literalTypes` CharLiteral core),
+    // and the C23 prefixes give `L'x'`→wchar_t, `u'x'`→char16_t (U16), `U'x'`→
+    // char32_t (U32), `u8'x'`→char8_t (U8). Row 0 (the narrow opener) is AUTO-SEEDED
+    // by the loader from `charStartToken` so a narrow-only schema is byte-identical.
+    // WideCharStart (wchar_t) carries the SAME FORMAT-keyed `elementCoreByFormat`
+    // (pe→U16, elf/macho→I32) as the wide-STRING row — one config axis, resolved by
+    // `resolveElementCore`. The semantic tier keys the WIDE openers only (the narrow
+    // row stays in the flat `literalTypeIds` int path); the HIR tier reads the
+    // resolved core back off the semantic-stamped body token.
+    std::vector<LiteralPrefixEntry> charLiteralPrefixes;
+
     // HR10 — extension kinds + flat-expression + NULL literal (SQL et al.):
     // The extension kinds to register before lowering (so a rule mapped to one
     // builds a HirKind::Extension node).

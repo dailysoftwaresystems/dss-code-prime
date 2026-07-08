@@ -163,6 +163,14 @@ public:
         // char constant in `#if` is an INT whose value is the (escape-decoded)
         // single byte (C 6.10.1p4 + 6.4.4.4). Both invalid ⇒ the language has no
         // char-literal form (toy/tsql) and the arm never fires.
+        // CYCLE B (C11/C23 6.4.4.4 wide/UTF chars): ONLY the narrow `'` opener is
+        // recognized here. A WIDE opener (`L'`/`u'`/`U'`/`u8'`) in `#if` is left
+        // UNHANDLED ON PURPOSE — it is not `charOpenKind_`, not an integer, and not a
+        // Word token, so `parsePrimary` falls through to its fail-loud "unexpected
+        // token in #if" (VERIFIED: `#if L'A'` → P_PreprocessorDirective, never a
+        // silent 0). Wide char constants in a `#if` controlling expression (their
+        // int value + the execution-charset mapping) are a later cycle; until then
+        // the honest behavior is a hard error, NOT a silent misevaluation.
         charOpenKind_ = schema_.hirLowering().charStartToken;
         charBodyKind_ = schema_.hirLowering().charBodyToken;
     }

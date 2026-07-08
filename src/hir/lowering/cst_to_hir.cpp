@@ -1889,7 +1889,13 @@ struct Lowerer {
     // is an expression node, so both operand lowerers probe for them before the
     // generic internal-child descent. std::nullopt ⇒ not such a leaf literal.
     [[nodiscard]] std::optional<E> tryLowerLeafLiteral(NodeId node) {
-        if (NodeId chl = bodyLiteralNodeOf(node, cfg.charStartToken); chl.valid())
+        // C11/C23 6.4.4.4: any char opener (`'`/`L'`/`u'`/`U'`/`u8'`) — the sub-rule
+        // whose FIRST child token is a configured char opener. Detecting via the
+        // opener SET (`charLiteralNodeOf`), not just the scalar `charStartToken`, is
+        // what makes the wide forms lower at all: a narrow-only probe sees only `'`,
+        // so every `L'x'`/`u'x'` would mis-fall-through. Mirrors the string opener
+        // set (`stringLiteralNodeOf`).
+        if (NodeId chl = charLiteralNodeOf(node); chl.valid())
             return lowerCharLiteral(chl);
         // C11/C23 6.4.5: any string opener (`"`/`L"`/`u"`/`U"`/`u8"`, and SQL `N'`)
         // — the sub-rule whose FIRST child token is a configured opener. The narrow
@@ -2036,20 +2042,6 @@ struct Lowerer {
         return E{errorNode(node), InvalidType};
     }
 
-    // The child rule node of `operand` whose first visible child is `startTok`
-    // (a `charLiteralExpr` / `stringLiteralExpr` subtree), or invalid.
-    [[nodiscard]] NodeId bodyLiteralNodeOf(NodeId operand, SchemaTokenId startTok) {
-        if (!startTok.valid()) return {};
-        for (NodeId c : visible(operand)) {
-            if (tree().kind(c) != NodeKind::Internal) continue;
-            for (NodeId g : visible(c)) {
-                if (isToken(g) && tree().tokenKind(g).v == startTok.v) return c;
-                break;  // only the FIRST visible child decides
-            }
-        }
-        return {};
-    }
-
     // Is `tok` a configured string opener kind? (Any `stringLiteralPrefixes` row,
     // or the scalar start/unicode tokens for a grammar with no prefix table.)
     [[nodiscard]] bool isStringOpenerKind(SchemaTokenId tok) const {
@@ -2078,6 +2070,33 @@ struct Lowerer {
         return {};
     }
 
+    // Is `tok` a configured CHARACTER opener kind? (Any `charLiteralPrefixes` row —
+    // the narrow `'` plus the wide/UTF `L'`/`u'`/`U'`/`u8'` — or the scalar
+    // `charStartToken` for a grammar with no prefix table.) Mirrors
+    // `isStringOpenerKind`.
+    [[nodiscard]] bool isCharOpenerKind(SchemaTokenId tok) const {
+        if (!tok.valid()) return false;
+        for (auto const& px : cfg.charLiteralPrefixes)
+            if (px.startToken.v == tok.v) return true;
+        return cfg.charStartToken.valid() && tok.v == cfg.charStartToken.v;
+    }
+
+    // The child rule node of `operand` (a `charLiteralExpr` subtree) whose FIRST
+    // visible child token is ANY configured char opener — narrow `'` or the wide/UTF
+    // forms `L'`/`u'`/`U'`/`u8'`. The opener token stays a DIRECT child (the inline-
+    // alt opener pushes it flat), so lowerCharLiteral can recover the specific opener
+    // kind. Invalid ⇒ not a char literal. Mirrors `stringLiteralNodeOf`.
+    [[nodiscard]] NodeId charLiteralNodeOf(NodeId operand) {
+        for (NodeId c : visible(operand)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            for (NodeId g : visible(c)) {
+                if (isToken(g) && isCharOpenerKind(tree().tokenKind(g))) return c;
+                break;  // only the FIRST visible child decides
+            }
+        }
+        return {};
+    }
+
     // The first visible child token of `node` whose kind is `k`, or invalid.
     [[nodiscard]] NodeId childTokenOfKind(NodeId node, SchemaTokenId k) {
         for (NodeId c : visible(node))
@@ -2085,11 +2104,102 @@ struct Lowerer {
         return {};
     }
 
-    // `'a'` / `'\n'` → a Char-typed literal carrying the decoded codepoint.
+    // The FIRST direct child opener token of a `charLiteralExpr` node — the
+    // element-type discriminator (narrow `'` vs a wide `L'`/`u'`/`U'`/`u8'`).
+    // Mirrors `stringOpenerTokenKind`.
+    [[nodiscard]] SchemaTokenId charOpenerTokenKind(NodeId node) const {
+        for (NodeId c : visible(node)) {
+            if (!isToken(c)) continue;
+            SchemaTokenId const tk = tree().tokenKind(c);
+            if (isCharOpenerKind(tk)) return tk;
+        }
+        return {};
+    }
+
+    // Is `tok` a NON-narrow (wide/UTF) char opener — one whose value is typed by its
+    // prefix (`L'`/`u'`/`U'`/`u8'`)? Unlike strings (where the narrow core is Char
+    // and any non-Char core marks a wide opener), the NARROW char core is `int`
+    // (I32) and `L'` on elf/macho is ALSO I32 — so the core cannot discriminate.
+    // The discriminator is the OPENER TOKEN: any declared char opener that is NOT
+    // the narrow `charStartToken`. Format-agnostic (no `activeFormat` needed).
+    [[nodiscard]] bool isWideCharOpenerKind(SchemaTokenId tok) const {
+        if (!tok.valid()) return false;
+        if (cfg.charStartToken.valid() && tok.v == cfg.charStartToken.v) return false;
+        for (auto const& px : cfg.charLiteralPrefixes)
+            if (px.startToken.v == tok.v) return true;
+        return false;
+    }
+
+    // The config BASE element core of a char opener (`elementCore`, before any
+    // per-format override). Used ONLY to CLASSIFY a fail-loud reason when the
+    // semantic tier dropped the stamp: it is format-invariant for `u'`/`U'`/`u8'`
+    // (single core) and the wider I32 for `L'` (so an astral cp the pe-U16 core
+    // rejected still decodes here → falls to the generic "unrepresentable" reason).
+    [[nodiscard]] TypeKind charOpenerBaseCore(SchemaTokenId tok) const {
+        for (auto const& px : cfg.charLiteralPrefixes)
+            if (px.startToken.v == tok.v) return px.elementCore;
+        return TypeKind::I32;
+    }
+
+    // The element CORE stamped on a char body token by the semantic tier (the ONLY
+    // place wchar_t width was format-resolved). Returns `Void` when the token was
+    // left UNTYPED — the semantic tier's type-drop for a wide char it could not
+    // represent — so a wide opener with a `Void` stamp = that drop (fail loud).
+    [[nodiscard]] TypeKind charElementCoreOf(NodeId bodyTok) const {
+        TypeId const t = typeAtOr(bodyTok, InvalidType);
+        if (t.valid()) return interner.kind(t);
+        return TypeKind::Void;
+    }
+
+    // Is `core` a wide/UTF char element core (the semantic tier stamped a valid wide
+    // char)? Any of U8/U16/U32/I32 — I32 is `L'` on elf/macho. `Void` (the drop
+    // sentinel) and the narrow path never reach here.
+    [[nodiscard]] static bool isWideCharCore(TypeKind core) {
+        return core == TypeKind::U8 || core == TypeKind::U16
+            || core == TypeKind::U32 || core == TypeKind::I32;
+    }
+
+    struct WideCharDiag { DiagnosticCode code; char const* why; };
+    // Map a `decodeWideCharCodepoint` failure to its diagnostic code + reason. Only
+    // the `u8'` range failure is a DISTINCT C23 constraint (char8_t = one UTF-8 code
+    // unit); every other cause is "this wide char does not denote one representable
+    // code unit" (H_WideCharValueUnrepresentable).
+    [[nodiscard]] static WideCharDiag wideCharErrorDetail(WideCharError err) {
+        switch (err) {
+            case WideCharError::Utf8UnitOutOfRange:
+                return {DiagnosticCode::H_Utf8CharLiteralOutOfRange,
+                        "a u8'…' character constant must be a single UTF-8 code unit "
+                        "(code point ≤ U+007F); this code point needs multiple bytes"};
+            case WideCharError::NotSingleCodepoint:
+                return {DiagnosticCode::H_WideCharValueUnrepresentable,
+                        "a character constant must denote EXACTLY ONE code point (the "
+                        "body is empty or multi-character)"};
+            case WideCharError::IllFormedUtf8:
+                return {DiagnosticCode::H_WideCharValueUnrepresentable,
+                        "the character body is not well-formed UTF-8"};
+            case WideCharError::MalformedEscape:
+                return {DiagnosticCode::H_WideCharValueUnrepresentable,
+                        "the character body has a malformed or unsupported escape"};
+            case WideCharError::ValueUnrepresentable:
+                break;
+        }
+        return {DiagnosticCode::H_WideCharValueUnrepresentable,
+                "the code point cannot be represented in the target element width "
+                "without a surrogate pair (a supplementary-plane code point > U+FFFF "
+                "under a 16-bit char16_t / wchar_t element)"};
+    }
+
+    // `'a'` / `'\n'` (narrow → `int`-valued, Char-typed literal) OR a WIDE/UTF
+    // constant `L'x'`/`u'x'`/`U'x'`/`u8'x'` (C11/C23 6.4.4.4 — typed by its prefix).
     E lowerCharLiteral(NodeId node) {
-        TypeId const type = interner.primitive(TypeKind::Char);
         NodeId const bodyTok = childTokenOfKind(node, cfg.charBodyToken);
-        std::string_view const body = bodyTok.valid() ? tree().text(bodyTok) : std::string_view{};
+        std::string_view const body =
+            bodyTok.valid() ? tree().text(bodyTok) : std::string_view{};
+        if (isWideCharOpenerKind(charOpenerTokenKind(node)))
+            return lowerWideCharLiteral(node, bodyTok, body);
+
+        // Narrow `'x'` — the EXACT pre-CycleB byte path (Char-typed, single byte).
+        TypeId const type = interner.primitive(TypeKind::Char);
         auto cp = decodeCharLiteralBody(body);
         if (!cp) {
             unsupported(node, std::format("char literal '{}' is empty, multi-character, "
@@ -2100,6 +2210,43 @@ struct Lowerer {
         v.core  = TypeKind::Char;
         v.value = static_cast<std::uint64_t>(*cp);
         return {track(builder.makeLiteral(type, literals.add(std::move(v))), node), type};
+    }
+
+    // A wide/UTF character constant. The format-resolved element core lives on the
+    // SEMANTIC stamp (the char stamp is on the BODY token, unlike a string's expr-
+    // node stamp; the HIR tier lacks `activeFormat`). A VALID wide-core stamp means
+    // the semantic tier accepted the char → re-decode (the SHARED helper) to recover
+    // the code-point value and lower it as that core. A DROPPED stamp = the semantic
+    // type-drop for an unrepresentable char → FAIL LOUD (mirror the string type-drop
+    // guard at lowerStringLiteral), classifying the specific cause off the opener's
+    // config base core (format-invariant for u'/U'/u8'; the wider I32 for L', so an
+    // astral cp the pe-U16 core rejected decodes here and falls to the generic
+    // "unrepresentable" reason — the only L' drop cause is a value the format core
+    // could not hold or a structural one, all H_WideCharValueUnrepresentable).
+    E lowerWideCharLiteral(NodeId node, NodeId bodyTok, std::string_view body) {
+        TypeKind const stampCore       = charElementCoreOf(bodyTok);
+        bool     const semanticOk      = isWideCharCore(stampCore);
+        TypeKind const core            = semanticOk
+                                             ? stampCore
+                                             : charOpenerBaseCore(charOpenerTokenKind(node));
+        WideCharError werr = WideCharError::ValueUnrepresentable;
+        auto cp = decodeWideCharCodepoint(body, core, &werr);
+        if (semanticOk && cp) {
+            TypeId const type = interner.primitive(core);
+            HirLiteralValue v;
+            v.core  = core;
+            v.value = static_cast<std::uint64_t>(*cp);
+            return {track(builder.makeLiteral(type, literals.add(std::move(v))), node), type};
+        }
+        // Type-drop (or the defensive stamp-vs-re-decode mismatch): fail loud with
+        // the specific reason. `werr` keeps its ValueUnrepresentable init when the
+        // base-core re-decode SUCCEEDED but the format core had dropped it (L'-pe
+        // astral) — the honest generic reason.
+        WideCharDiag const d = wideCharErrorDetail(werr);
+        emitH(d.code, node,
+              std::format("wide/UTF character constant {} cannot be lowered: {}",
+                          std::string{tree().text(node)}, d.why));
+        return {errorNode(node), InvalidType};
     }
 
     // The element CORE of a string literal — the kind of `operands(nodeType)[0]`

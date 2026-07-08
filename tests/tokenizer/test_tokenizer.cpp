@@ -1265,6 +1265,57 @@ TEST(Tokenizer, IdentifierStartingWithUIsNotAStringOpener) {
     EXPECT_EQ(textOf(*h.src, result.tokens[0]), "user");
 }
 
+TEST(Tokenizer, WideCharOpenersTokenizeViaLongestMatch) {
+    // C11/C23 6.4.4.4: the wide/UTF CHAR openers `L'`/`u'`/`U'`/`u8'` are multi-char
+    // lexemes that START with an id-start byte. longestMatchInMode must make each
+    // opener beat the bare identifier run — `L'A'` is [WideCharStart, CharLiteral],
+    // NOT [Identifier(L), CharStart, ...]. Each pushes the SAME shared `charBody`
+    // mode as `'` → one coalesced CharLiteral body.
+    struct Case { char const* src; char const* opener; };
+    for (auto const& c : {Case{"L'A'", "WideCharStart"},
+                          Case{"u'A'", "Utf16CharStart"},
+                          Case{"U'A'", "Utf32CharStart"},
+                          Case{"u8'A'", "Utf8CharStart"}}) {
+        auto h      = loadCSubset(c.src);
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 2u) << "opener=" << c.opener;
+        EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find(c.opener))
+            << "the multi-char opener must win over the bare id-run for " << c.src;
+        EXPECT_EQ(result.tokens[1].schemaKind, h.schema->schemaTokens().find("CharLiteral"));
+        EXPECT_EQ(textOf(*h.src, result.tokens[1]), "A");
+    }
+}
+
+TEST(Tokenizer, U8CharOpenerBeatsUCharOpenerAndIdentifier) {
+    // The `u8'` opener (3 bytes) must beat BOTH the `u'` opener (2 bytes) and the
+    // `u8` identifier run. A regression to `u'` would split `u8'x'` as
+    // [Utf16CharStart, "8x"] (wrong). Mirrors the wide-STRING u8" longest-match pin.
+    auto h      = loadCSubset("u8'x'");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 2u);
+    EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find("Utf8CharStart"))
+        << "u8' must win over u' and the u8 identifier";
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "x");
+}
+
+TEST(Tokenizer, CharAndStringOpenersCoexistOnSamePrefixByte) {
+    // Both `u'`/`u"` (and `u8'`/`u8"`) start with `u`. longestMatchInMode must pick
+    // the CHAR opener when a `'` follows and the STRING opener when a `"` follows —
+    // the two literal families coexist without either shadowing the other.
+    {
+        auto h = loadCSubset("u'x'");
+        auto r = lex(h);
+        ASSERT_EQ(r.tokens.size(), 2u);
+        EXPECT_EQ(r.tokens[0].schemaKind, h.schema->schemaTokens().find("Utf16CharStart"));
+    }
+    {
+        auto h = loadCSubset("u\"x\"");
+        auto r = lex(h);
+        ASSERT_EQ(r.tokens.size(), 2u);
+        EXPECT_EQ(r.tokens[0].schemaKind, h.schema->schemaTokens().find("Utf16StringStart"));
+    }
+}
+
 TEST(Tokenizer, TsqlSingleStringDoubledDelimiterEscape) {
     // SQL string with a doubled single-quote — `'a''b'` represents the
     // literal `a'b`. The body mode coalesces (HR10), so the whole body is

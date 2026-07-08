@@ -14,6 +14,7 @@
 // caller renders as a diagnostic. The NARROW (`Char`) path does NOT route here —
 // it keeps its existing byte-level `\`-escape decode (raw ≥0x80 passthrough).
 
+#include "core/types/char_decode.hpp"               // decodeEscapedBytes (wide-char body escapes)
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind
 
 #include <cstdint>
@@ -73,6 +74,70 @@ decodeUtf8ToCodepoints(std::string_view bytes, std::vector<char32_t>& out) {
         i += len;
     }
     return std::nullopt;
+}
+
+// C11/C23 6.4.4.4 — why a wide/UTF CHARACTER constant could not be lowered to a
+// single code unit of its element. Each maps to a caller diagnostic; the value is
+// NOT produced on failure (no guessed code unit).
+enum class WideCharError : std::uint8_t {
+    MalformedEscape,      // a `\`-escape in the body is malformed / unknown / out of range
+    IllFormedUtf8,        // the escape-decoded body is not well-formed UTF-8
+    NotSingleCodepoint,   // the body decodes to 0 (empty `L''`) or >1 (multi-char `L'ab'`) code points
+    Utf8UnitOutOfRange,   // a `u8'…'` code point exceeds U+007F (one UTF-8 code unit = ASCII)
+    ValueUnrepresentable, // the code point does not fit the element core (astral > U+FFFF under U16, or cp > U+10FFFF)
+};
+
+// C11/C23 6.4.4.4: decode a wide/UTF CHARACTER-constant body to the SINGLE code
+// point it denotes, validated against the element core `elementCore` (the
+// format-resolved wchar_t width for `L'…'`, else U16/U32/U8 for `u'`/`U'`/`u8'`).
+// Escapes are resolved FIRST (`decodeEscapedBytes` — the exact byte decoder narrow
+// char / string lowering uses), the bytes are UTF-8-decoded, the result must be
+// EXACTLY one code point, and that code point must fit the element core:
+//   U8            → ≤ U+007F   (C23 char8_t constant = a single UTF-8 code unit)
+//   U16           → ≤ U+FFFF   (char16_t / 16-bit wchar_t = one UTF-16 code unit;
+//                               a supplementary-plane cp needs a surrogate PAIR)
+//   U32 / I32     → ≤ U+10FFFF (any Unicode scalar value; the decoder already bounds)
+// Returns the code point, or std::nullopt with `*err` (when non-null) set to the
+// first reason. Format-AGNOSTIC: `elementCore` is resolved by the CALLER (a pure
+// config-map lookup — the semantic tier owns `activeFormat`), so this routine never
+// branches on object format — it is the SHARED decode+validate both tiers run.
+//
+// MINOR #8 (Cycle-C-adjacent, conscious deferral): a non-UTF-8 byte escape such as
+// `L'\xC3'` (a lone UTF-8 lead / continuation byte) decodes here to an ill-formed
+// UTF-8 sequence → IllFormedUtf8 fail-loud, exactly like a raw ill-formed body and
+// consistent with Cycle A strings. Assembling a code point from raw `\x`/octal byte
+// escapes, and the `\u`/`\U` universal-character-name escapes, are Cycle C — until
+// then `decodeEscapedBytes` produces bytes and this UTF-8-validates them.
+[[nodiscard]] inline std::optional<char32_t>
+decodeWideCharCodepoint(std::string_view body, TypeKind elementCore,
+                        WideCharError* err = nullptr) {
+    auto fail = [&](WideCharError e) -> std::optional<char32_t> {
+        if (err) *err = e;
+        return std::nullopt;
+    };
+    std::string escaped;
+    if (!decodeEscapedBytes(body, escaped)) return fail(WideCharError::MalformedEscape);
+    std::vector<char32_t> cps;
+    if (auto e = decodeUtf8ToCodepoints(escaped, cps)) {
+        // A code point past U+10FFFF is an unrepresentable VALUE; every other
+        // decode failure is ill-formed UTF-8 bytes.
+        return fail(*e == WideEncodeError::CodepointTooLarge
+                        ? WideCharError::ValueUnrepresentable
+                        : WideCharError::IllFormedUtf8);
+    }
+    if (cps.size() != 1) return fail(WideCharError::NotSingleCodepoint);
+    char32_t const cp = cps[0];
+    switch (elementCore) {
+        case TypeKind::U8:
+            if (cp > 0x7F) return fail(WideCharError::Utf8UnitOutOfRange);
+            break;
+        case TypeKind::U16:
+            if (cp > 0xFFFF) return fail(WideCharError::ValueUnrepresentable);
+            break;
+        default:   // U32 / I32 — decodeUtf8ToCodepoints already bounded cp to ≤ U+10FFFF
+            break;
+    }
+    return cp;
 }
 
 // Append the code units for `cp` in element width `core` to `out`, growing it by

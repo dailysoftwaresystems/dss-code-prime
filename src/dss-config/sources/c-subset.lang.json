@@ -189,6 +189,30 @@
       "modeOp": "pushMode", "modeArg": "charBody",
       "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "'" }
     }],
+    "L'": [{
+      "$comment": "C11/C23 6.4.4.4 wide char constant `L'x'` (wchar_t). A multi-char lexeme so the tokenizer's longestMatchInMode beats the bare `L` identifier run; pushes the SAME shared `charBody` mode as `'` (one coalesced CharLiteral body). Its element core (wchar_t) is FORMAT-keyed in semantic (D-FFI-STDDEF-WCHAR-PE-WIDTH), mirroring the wide-STRING `L\"` opener.",
+      "kind": "WideCharStart",
+      "modeOp": "pushMode", "modeArg": "charBody",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "'" }
+    }],
+    "u'": [{
+      "$comment": "C11/C23 6.4.4.4 char16_t constant `u'x'` → one UTF-16 code unit (U16). Same shared `charBody` mode as `'`; longestMatchInMode makes `u'` beat the `u` id-run.",
+      "kind": "Utf16CharStart",
+      "modeOp": "pushMode", "modeArg": "charBody",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "'" }
+    }],
+    "U'": [{
+      "$comment": "C11/C23 6.4.4.4 char32_t constant `U'x'` → one UTF-32 code unit (U32). Same shared `charBody` mode as `'`.",
+      "kind": "Utf32CharStart",
+      "modeOp": "pushMode", "modeArg": "charBody",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "'" }
+    }],
+    "u8'": [{
+      "$comment": "C23 6.4.4.4 char8_t constant `u8'x'` → one UTF-8 code unit (U8, must be ≤ U+007F). longestMatchInMode makes `u8'` (3 bytes) beat both the `u8` id-run and the `u'` opener. Same shared `charBody` mode as `'`.",
+      "kind": "Utf8CharStart",
+      "modeOp": "pushMode", "modeArg": "charBody",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "'" }
+    }],
 
     "=":  [{ "kind": "AssignOp" }],
     "+":  [{ "kind": "PlusOp"   }],
@@ -1206,9 +1230,12 @@
     "designatedField": { "sequence": [ "DotOp", "Identifier" ] },
     "designatedIndex": { "sequence": [ "BracketOpen", "expression", "BracketClose" ] },
 
-    "charLiteralExpr":   { "sequence": [ "CharStart",   "CharLiteral"   ] },
+    "charLiteralExpr":   {
+      "$comment": "C11/C23 6.4.4.4: a character constant is opener + coalesced body. The opener is an INLINE token alt (`'`|`L'`|`u'`|`U'`|`u8'`) — token-leaf alt branches consume EXACTLY one token and push it DIRECTLY (no wrapper node; the stringLiteralExpr precedent), so the opener token stays a DIRECT child of this node and charLiteralNodeOf / the semantic char-typing override find it AND recover its SPECIFIC kind (the C23 element-type discriminator). Unprefixed `'x'` is byte-identical to the pre-CycleB `[CharStart, CharLiteral]` rule.",
+      "sequence": [ { "alt": [ "CharStart", "WideCharStart", "Utf16CharStart", "Utf32CharStart", "Utf8CharStart" ] }, "CharLiteral" ]
+    },
     "stringLiteralExpr": {
-      "$comment": "C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): adjacent string literals concatenate — `\"a\" \"b\"` is `\"ab\"`. The first opener+StringLiteral pair is required; the zero-or-more repeat captures each further pair as FLAT children (sequences inline, no wrapper node), so a lone string yields exactly 2 children, byte-identical to the pre-c20 single-pair rule. The opener is an INLINE token alt (C11/C23 6.4.5: `\"`|`L\"`|`u\"`|`U\"`|`u8\"`) — token-leaf alt branches consume EXACTLY one token and push it DIRECTLY (no wrapper node; the typeSpecifierSeq precedent), so the opener token stays a DIRECT child of this node and bodyLiteralNodeOf / decodeAdjacentStringBodies find it AND recover its SPECIFIC kind (the element-core discriminator). Concatenation is at the DECODED code-unit level (each body decoded FIRST, then joined) via the single chokepoint every body consumer routes through. Safe in every use site: primaryExpr, attr args (terminate at `)`), externFuncTail (terminates at `;`) — none has a string opener in its follow set. Prefix-mixing across adjacent pieces (`u\"a\" L\"b\"`) is a LATER cycle — the element core is taken from the FIRST opener today.",
+      "$comment": "C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): adjacent string literals concatenate — `\"a\" \"b\"` is `\"ab\"`. The first opener+StringLiteral pair is required; the zero-or-more repeat captures each further pair as FLAT children (sequences inline, no wrapper node), so a lone string yields exactly 2 children, byte-identical to the pre-c20 single-pair rule. The opener is an INLINE token alt (C11/C23 6.4.5: `\"`|`L\"`|`u\"`|`U\"`|`u8\"`) — token-leaf alt branches consume EXACTLY one token and push it DIRECTLY (no wrapper node; the typeSpecifierSeq precedent), so the opener token stays a DIRECT child of this node and stringLiteralNodeOf / decodeAdjacentStringBodies find it AND recover its SPECIFIC kind (the element-core discriminator). Concatenation is at the DECODED code-unit level (each body decoded FIRST, then joined) via the single chokepoint every body consumer routes through. Safe in every use site: primaryExpr, attr args (terminate at `)`), externFuncTail (terminates at `;`) — none has a string opener in its follow set. Prefix-mixing across adjacent pieces (`u\"a\" L\"b\"`) is a LATER cycle — the element core is taken from the FIRST opener today.",
       "sequence": [ { "alt": [ "StringStart", "WideStringStart", "Utf16StringStart", "Utf32StringStart", "Utf8StringStart" ] }, "StringLiteral", { "repeat": { "sequence": [ { "alt": [ "StringStart", "WideStringStart", "Utf16StringStart", "Utf32StringStart", "Utf8StringStart" ] }, "StringLiteral" ] } } ]
     },
 
@@ -1672,6 +1699,15 @@
       { "startToken": "Utf32StringStart", "elementCore": "U32"  },
       { "startToken": "Utf8StringStart",  "elementCore": "U8"   },
       { "startToken": "WideStringStart",  "elementCore": "I32", "elementCoreByFormat": { "pe": "U16", "elf": "I32", "macho": "I32" } }
+    ],
+
+    "$charLiteralPrefixesComment": "C11/C23 6.4.4.4 character-constant openers → SCALAR element core (the C23 per-prefix TYPE rule — a char constant's type depends on its prefix). The narrow CharStart row is auto-seeded by the loader (elementCore=I32, the C `int`) but listed here for clarity; the semantic tier keeps it in the flat literalTypeIds int path (other integer-literal consumers depend on it) and OVERRIDES only the wide rows. WideCharStart (wchar_t) declares its FORMAT-keyed width AS CONFIG DATA via the SAME elementCoreByFormat axis the wide-string L\" row uses (elf/macho→I32 the POSIX width, pe→U16 the Windows UTF-16 unit — D-FFI-STDDEF-WCHAR-PE-WIDTH); elementCore=I32 is the format-agnostic default. No engine tier branches on format — the semantic tier resolves via a pure resolveElementCore lookup and the HIR tier reads the resolved core back off the stamped body token. All five openers share the coalesced CharLiteral body token. Unlike a string (an Array), a char constant is a SCALAR value (one code unit) typed by this core.",
+    "charLiteralPrefixes": [
+      { "startToken": "CharStart",      "elementCore": "I32" },
+      { "startToken": "Utf16CharStart", "elementCore": "U16" },
+      { "startToken": "Utf32CharStart", "elementCore": "U32" },
+      { "startToken": "Utf8CharStart",  "elementCore": "U8"  },
+      { "startToken": "WideCharStart",  "elementCore": "I32", "elementCoreByFormat": { "pe": "U16", "elf": "I32", "macho": "I32" } }
     ]
   }
 }
