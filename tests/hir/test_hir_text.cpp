@@ -788,6 +788,80 @@ TEST(ParseTypeFromText, MemberAlignsParseAndForkIdentity) {
     EXPECT_GE(repMix.errorCount(), 1u);
 }
 
+// D-CSUBSET-PACKED: the type-text codec carries the whole-composite `packed` flag
+// (`struct "X" packed { ... }`). (1) PARSE: packed reaches the interner; (2)
+// IDENTITY: a packed struct is a DISTINCT TypeId from the same fields non-packed;
+// (3) packed COMBINES with `~align` markers (a packed struct with an alignas member);
+// (4) packed unions round-trip too.
+TEST(ParseTypeFromText, PackedParseAndForkIdentity) {
+    TypeInterner interner{CompilationUnitId{14}};
+    TypeRegistry reg;
+    DiagnosticReporter rep;
+
+    TypeId const packed = parseTypeFromText(
+        "struct \"S\" packed { i8, i32 }", interner, reg, rep);
+    ASSERT_TRUE(packed.valid());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(interner.kind(packed), TypeKind::Struct);
+    EXPECT_TRUE(interner.isPacked(packed));
+
+    // Same name + same field types, NOT packed → a DISTINCT interned type.
+    TypeId const plain = parseTypeFromText(
+        "struct \"S\" { i8, i32 }", interner, reg, rep);
+    ASSERT_TRUE(plain.valid());
+    EXPECT_FALSE(interner.isPacked(plain));
+    EXPECT_NE(packed, plain)
+        << "a packed struct must not alias its padded twin";
+
+    // Re-parsing the SAME packed text canonicalizes to the SAME TypeId.
+    TypeId const packed2 = parseTypeFromText(
+        "struct \"S\" packed { i8, i32 }", interner, reg, rep);
+    EXPECT_EQ(packed, packed2);
+
+    // packed COMBINES with a member alignas (`~<align>`): both round-trip.
+    TypeId const packedAligned = parseTypeFromText(
+        "struct \"P\" packed { i8 ~1, i32 ~4 }", interner, reg, rep);
+    ASSERT_TRUE(packedAligned.valid());
+    EXPECT_TRUE(interner.isPacked(packedAligned));
+    EXPECT_TRUE(interner.hasExplicitAligns(packedAligned));
+    EXPECT_EQ(interner.explicitFieldAlign(packedAligned, 1), 4u);
+
+    // A packed UNION round-trips its packed flag.
+    TypeId const packedUnion = parseTypeFromText(
+        "union \"U\" packed { i8, i32 }", interner, reg, rep);
+    ASSERT_TRUE(packedUnion.valid());
+    EXPECT_EQ(interner.kind(packedUnion), TypeKind::Union);
+    EXPECT_TRUE(interner.isPacked(packedUnion));
+}
+
+// D-CSUBSET-PACKED: the `packed` marker ROUND-TRIPS through emit — a packed struct
+// in a fn signature emits ` packed` and re-parses packed (emit→parse→emit symmetric),
+// so a HIR text round-trip / reintern never silently drops packed.
+TEST(HirText, PackedFlagRoundTrip) {
+    TypeInterner in{CompilationUnitId{1}};
+    std::array<TypeId, 2> const fields{
+        in.primitive(TypeKind::Char), in.primitive(TypeKind::U32)};
+    TypeId const s = in.forwardComposite(TypeKind::Struct, "S", /*declSiteKey=*/42);
+    in.completeComposite(s, fields, /*packed=*/true);
+    TypeId const ptrS = in.pointer(s);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 1> const params{ptrS};
+    TypeId const sig = in.fnSig(params, voidTy, CallConv::CcSysV);
+
+    HirBuilder b{"toy"};
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{});
+    HirNodeId const fn   = b.makeFunction(sig, /*symbol=*/1, {}, body);
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "main"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    DiagnosticReporter r;
+    std::string const text = emitHir(hir, ctx, r);
+    EXPECT_NE(text.find("struct \"S\" packed"), std::string::npos) << text;
+    expectRoundTrip(hir, ctx);   // emit→parse→emit byte-identical
+}
+
 // c107: the offset syntax ROUND-TRIPS through emit (a struct-returning fn signature
 // carries the struct text). emit → parse → emit is byte-identical, and the emitted
 // text spells `@4` — so a HIR text round-trip (verify-on-load / reintern) preserves

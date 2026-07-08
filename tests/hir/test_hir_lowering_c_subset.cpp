@@ -1256,6 +1256,62 @@ TEST(HirLoweringCSubset, ExternGlobalWithInitializerRejectedLoud) {
     EXPECT_EQ(res->hir.kind(decls[0]), HirKind::Error);
 }
 
+// D-CSUBSET-PACKED (F4): a `packed` spelling in the LEADING declaration-specifier
+// position (`[[gnu::packed]] struct S {…} v;`) is UNHONORED — packed is honored only
+// in the TRAILING composite-attribute slot (`struct S {…} __attribute__((packed))`).
+// The linkage scan skips the ignored `stdAttr` wholesale, which would SILENTLY DROP
+// packed (leaving the struct padded — a miscompile a program could depend on). It
+// fails loud H_UnknownLinkageSpecifier instead, symmetric with the leading
+// `__attribute__((packed))` case. Semantically clean (the attribute is a
+// declSpecifier); the rejection is at lowering.
+TEST(HirLoweringCSubset, LeadingPackedAttributeRejectedLoud) {
+    SemanticModel model = analyzeCSubset(
+        "[[gnu::packed]] struct S { char c; int v; } gv;\n"
+        "int main(void){ return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "test setup: the leading attribute parses + analyzes cleanly; the "
+           "rejection is at lowering, not at parse/semantic";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+        << "leading [[gnu::packed]] must fail loud, never silently drop packed";
+}
+
+// D-CSUBSET-PACKED (F-3): the GNU spelling of the SAME leading form —
+// `__attribute__((packed)) struct S {…} gv;` — is likewise UNHONORED and fails loud.
+// Sibling to LeadingPackedAttributeRejectedLoud (the C23 `[[gnu::packed]]` form):
+// here `attrSpec` is NOT in the linkage-ignored rules, so the leading
+// `__attribute__((packed))` takes the RECOGNIZED-specifier path, `packed` is not a
+// linkage keyword, and lowering fails loud H_UnknownLinkageSpecifier (exactly like a
+// leading `__attribute__((bogus))`). Must NOT be silently honored-or-dropped.
+TEST(HirLoweringCSubset, LeadingGnuPackedAttributeRejectedLoud) {
+    SemanticModel model = analyzeCSubset(
+        "__attribute__((packed)) struct S { char c; int v; } gv;\n"
+        "int main(void){ return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "test setup: the leading GNU attribute parses + analyzes cleanly; the "
+           "rejection is at lowering, not at parse/semantic";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+        << "leading __attribute__((packed)) must fail loud, never silently drop packed";
+}
+
+// CONTRAST: a leading standard-ignorable attribute (`[[deprecated]]`) STAYS silently
+// ignored (C23 6.7.11.1) — ONLY a `packed` spelling fails loud in the leading slot.
+// RED-ON-DISABLE for over-broadening: were the F4 hook to fire on any ignored attr,
+// this would wrongly report H_UnknownLinkageSpecifier.
+TEST(HirLoweringCSubset, LeadingDeprecatedAttributeStillIgnored) {
+    SemanticModel model = analyzeCSubset(
+        "[[deprecated]] int gv;\n"
+        "int main(void){ return 0; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "[[deprecated]] stays standard-ignorable; only packed fails loud";
+}
+
 TEST(HirLoweringCSubset, ExternGlobalWithIdentifierInitializerRejectedLoud) {
     // Post-fold #7 PT1a: pin identifier-init `extern int x = y;`
     // (RHS is an operand-rule referencing a prior decl), not just

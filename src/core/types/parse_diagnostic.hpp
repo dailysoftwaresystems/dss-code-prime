@@ -530,6 +530,23 @@ enum class DiagnosticCode : std::uint16_t {
     // expression. Emitted at the SEMANTIC tier via the SAME `constIntExpr`
     // evaluator static_assert / array-dimension folding uses. Unsuppressable.
     S_AlignasNonConstant          = 0xE030,
+    // FC16 (D-CSUBSET-PACKED): a composite `__attribute__((...))` / `[[...]]`
+    // attribute in a HONORED position (the struct/union tag) whose identifier is not
+    // a recognized composite type-attribute (a typo like `__attribute__((pakced))`,
+    // or an unsupported GNU attribute), OR a recognized `packed` spelling in an
+    // UNHONORED position (a leading `[[gnu::packed]] struct S`, which the linkage
+    // scan would otherwise skip wholesale). Typo protection mirroring
+    // `H_UnknownLinkageSpecifier`: fail loud rather than silently drop an attribute
+    // the program may depend on. The `.actual` names the offending spelling.
+    S_UnknownTypeAttribute        = 0xE031,
+    // FC16 (D-CSUBSET-PACKED / D-CSUBSET-PACKED-BITFIELD-INTERACTION): a `packed`
+    // struct/union that ALSO contains a bit-field member. Bit-granular packed
+    // packing is a distinct algorithm (a named, deferred gap); combining the two is
+    // UNSUPPORTED — fail loud at the SEMANTIC tier rather than silently emit a
+    // NON-packed layout (the layout engine's nullopt belt is the backstop). Emitted
+    // at the composite-completion site; unsuppressable (a suppressed one would ship
+    // the wrong — padded — bytes).
+    S_PackedBitfieldUnsupported   = 0xE032,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

@@ -1206,6 +1206,28 @@ struct DSS_EXPORT SemanticConfig {
     RuleId        alignasSpecRule{};    std::string alignasSpecRuleName;
     std::uint32_t alignasArgChild = 0;
     RuleId        alignasArgTypeRule{}; std::string alignasArgTypeRuleName;
+    // FC16 (D-CSUBSET-PACKED): the composite type-attribute list rule
+    // (`compositeAttrList` = repeated `compositeAttr`, a trailing
+    // `__attribute__((...))` / `[[...]]` after a struct/union body) + the recognized
+    // `packed` attribute-name set. The semantic tier scans a structSpec/unionSpec node
+    // for `compositeAttrListRule` children, extracts each attribute identifier,
+    // dunder-normalizes it (`__packed__` ≡ `packed`, via the shared `stripDunder`),
+    // and marks the composite `packed` when the name is in `packedAttributeNames`; an
+    // UNRECOGNIZED `__attribute__` identifier fails loud (S_UnknownTypeAttribute).
+    // Invalid `compositeAttrListRule` ⇒ the language has no composite-attribute surface
+    // (the scan never runs — toy/tsql). Source-AGNOSTIC: WHICH rule + WHICH names are
+    // both per-language config; the engine never hardcodes the spelling "packed".
+    RuleId                   compositeAttrListRule{};
+    std::string              compositeAttrListRuleName;
+    std::vector<std::string> packedAttributeNames;
+    // FC16 (D-CSUBSET-PACKED): the STRICT composite-attribute rule (the GNU
+    // `__attribute__((...))` form, `attrSpec`). An UNRECOGNIZED attribute in a strict-
+    // form node fails loud (S_UnknownTypeAttribute — typo protection, like
+    // `H_UnknownLinkageSpecifier`); an unrecognized attribute in the NON-strict form
+    // (C23 `[[...]]`, `stdAttr`) is standard-ignorable (the `[[deprecated]]`
+    // precedent). Invalid ⇒ no strict form (every unrecognized attribute ignorable).
+    RuleId                   compositeStrictAttrRule{};
+    std::string              compositeStrictAttrRuleName;
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. `vaArgRule`
     // = the `va_arg(ap,T)` form; pass 2 resolves+stamps its `vaArgTypeChild`
     // castTypeRef (so the HIR lowering recovers the read type T) + stamps the node

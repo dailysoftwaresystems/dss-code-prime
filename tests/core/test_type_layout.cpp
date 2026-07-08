@@ -229,7 +229,7 @@ TEST(TypeLayout, UnionMemberAlignasRaisesAlignAndSize) {
     std::array<std::uint64_t, 0> const noOffs{};
     std::array<std::uint32_t, 2> const aligns{16, 0};   // alignas(16) on the char
     TypeId const u = ti.forwardComposite(TypeKind::Union, "U", /*declSiteKey=*/1);
-    ti.completeComposite(u, members, noWidths, noOffs, aligns);
+    ti.completeComposite(u, members, /*packed=*/false, noWidths, noOffs, aligns);
     EXPECT_TRUE(ti.hasExplicitAligns(u));
     auto const l = layoutOf(u, ti);
     EXPECT_EQ(l.align.bytes(), 16u);   // raised from natural 4 → 16 (the char's alignas)
@@ -237,7 +237,7 @@ TEST(TypeLayout, UnionMemberAlignasRaisesAlignAndSize) {
 
     // The same union with NO override: align 4 (the int), size 4.
     TypeId const nat = ti.forwardComposite(TypeKind::Union, "U", /*declSiteKey=*/2);
-    ti.completeComposite(nat, members);
+    ti.completeComposite(nat, members, /*packed=*/false);
     EXPECT_FALSE(ti.hasExplicitAligns(nat));
     auto const ln = layoutOf(nat, ti);
     EXPECT_EQ(ln.align.bytes(), 4u);
@@ -334,7 +334,7 @@ TEST(TypeLayout, UnionBitFieldMemberAlignasHonored) {
     std::array<std::uint64_t, 0> const noOffs{};
     std::array<std::uint32_t, 2> const aligns{16, 0};   // alignas(16) on the char
     TypeId const u = ti.forwardComposite(TypeKind::Union, "U", /*declSiteKey=*/1);
-    ti.completeComposite(u, members, widths, noOffs, aligns);
+    ti.completeComposite(u, members, /*packed=*/false, widths, noOffs, aligns);
     auto const l = layoutOf(u, ti, kGnu16);
     EXPECT_EQ(l.align.bytes(), 16u);   // the char's alignas raises the union
     EXPECT_EQ(l.size, 16u);            // max member extent 4, rounded up to 16
@@ -363,6 +363,144 @@ TEST(TypeLayout, BitFieldStructFlexibleArrayMemberAlignasHonoredGnu) {
     EXPECT_TRUE(l.hasFlexibleArrayMember);
     EXPECT_EQ(l.align.bytes(), 16u);
     EXPECT_EQ(l.size, 16u);              // FAM adds 0; 2 (b's byte) padded to 16
+}
+
+// ── D-CSUBSET-PACKED: `__attribute__((packed))` layout ──────────────────────
+// A packed struct/union removes ALL inter-field padding and sets the aggregate's
+// natural alignment to 1. Built directly via forwardComposite + completeComposite
+// with packed=true (the semantic analyzer's path; there is no complete-at-once
+// structType overload carrying packed). Each is RED-ON-DISABLE: revert the layout
+// packed baseline and the size/offset assertions revert to the padded values.
+
+[[nodiscard]] TypeId packedStruct(TypeInterner& ti, std::string_view name,
+                                  std::uint64_t key, std::span<TypeId const> fields) {
+    TypeId const s = ti.forwardComposite(TypeKind::Struct, name, key);
+    ti.completeComposite(s, fields, /*packed=*/true);
+    return s;
+}
+
+TEST(TypeLayout, PackedStructRemovesAllPadding) {
+    auto ti = makeInterner(1);
+    // struct S { char c; uint32_t v; } __attribute__((packed));
+    // Unpacked: c@0, pad[1..3], v@4 → size 8, align 4.
+    // Packed:   c@0, v@1 (no padding) → size 5, align 1.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::U32)};
+    TypeId const s = packedStruct(ti, "S", 1, fields);
+    EXPECT_TRUE(ti.isPacked(s));
+    auto const l = layoutOf(s, ti);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);   // c@0
+    EXPECT_EQ(l.fieldOffsets[1], 1u);   // v@1 (NOT @4 — no padding)  RED-ON-DISABLE
+    EXPECT_EQ(l.align.bytes(), 1u);     // natural alignment 1        RED-ON-DISABLE
+    EXPECT_EQ(l.size, 5u);              // 1 + 4, no tail padding     RED-ON-DISABLE
+
+    // The SAME fields UNPACKED are a distinct type with the padded layout.
+    std::array<TypeId, 2> const fields2{ti.primitive(TypeKind::Char),
+                                        ti.primitive(TypeKind::U32)};
+    TypeId const nat = ti.structType("S", fields2);
+    EXPECT_FALSE(ti.isPacked(nat));
+    EXPECT_NE(s.v, nat.v);              // packed enters the content identity
+    auto const ln = layoutOf(nat, ti);
+    EXPECT_EQ(ln.fieldOffsets[1], 4u);
+    EXPECT_EQ(ln.align.bytes(), 4u);
+    EXPECT_EQ(ln.size, 8u);
+}
+
+TEST(TypeLayout, PackedStructAlignasMemberStillRaisesPerField) {
+    auto ti = makeInterner(1);
+    // struct S { char c; alignas(4) int v; } __attribute__((packed));
+    // packed baseline is 1, but the member alignas(4) RAISES v to 4-aligned:
+    // c@0, v@4 (alignas wins per-field even under packed), struct align 4, size 8.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::I32)};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 2> const aligns{0, 4};   // alignas(4) on v
+    TypeId const s = ti.forwardComposite(TypeKind::Struct, "S", 1);
+    ti.completeComposite(s, fields, /*packed=*/true, noWidths, noOffs, aligns);
+    EXPECT_TRUE(ti.isPacked(s));
+    EXPECT_TRUE(ti.hasExplicitAligns(s));
+    auto const l = layoutOf(s, ti);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);
+    EXPECT_EQ(l.fieldOffsets[1], 4u);   // alignas(4) RAISES despite packed  RED-ON-DISABLE
+    EXPECT_EQ(l.align.bytes(), 4u);     // alignas(4) raises the struct align too
+    EXPECT_EQ(l.size, 8u);              // 4 + 4
+
+    // Without the alignas, the SAME packed struct packs v@1 → size 5.
+    std::array<TypeId, 2> const fields2{ti.primitive(TypeKind::Char),
+                                        ti.primitive(TypeKind::I32)};
+    TypeId const noAl = packedStruct(ti, "S", 2, fields2);
+    auto const ln = layoutOf(noAl, ti);
+    EXPECT_EQ(ln.fieldOffsets[1], 1u);
+    EXPECT_EQ(ln.size, 5u);
+}
+
+TEST(TypeLayout, PackedUnionHasAlignmentOne) {
+    auto ti = makeInterner(1);
+    // union U { char c; int i; } __attribute__((packed));
+    // Members at offset 0; packed → union alignment 1 (unpacked would be 4).
+    // size = max member size (4), rounded up to align 1 = 4.
+    std::array<TypeId, 2> const members{ti.primitive(TypeKind::Char),
+                                        ti.primitive(TypeKind::I32)};
+    TypeId const u = ti.forwardComposite(TypeKind::Union, "U", 1);
+    ti.completeComposite(u, members, /*packed=*/true);
+    EXPECT_TRUE(ti.isPacked(u));
+    auto const l = layoutOf(u, ti);
+    EXPECT_EQ(l.align.bytes(), 1u);   // packed → alignment 1  RED-ON-DISABLE
+    EXPECT_EQ(l.size, 4u);            // max member extent (int)
+
+    // Unpacked, the union aligns to 4 (the int).
+    std::array<TypeId, 2> const members2{ti.primitive(TypeKind::Char),
+                                         ti.primitive(TypeKind::I32)};
+    TypeId const nat = ti.unionType("U", members2);
+    EXPECT_EQ(layoutOf(nat, ti).align.bytes(), 4u);
+}
+
+TEST(TypeLayout, PackedStructAsArrayElementStride) {
+    auto ti = makeInterner(1);
+    // A packed {char; uint32_t} has size 5, align 1. An array of 2 → stride 5,
+    // size 10 (a padded element would be size 8 → array size 16).
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::Char),
+                                       ti.primitive(TypeKind::U32)};
+    TypeId const s   = packedStruct(ti, "S", 1, fields);
+    TypeId const arr = ti.array(s, 2);
+    auto const l = layoutOf(arr, ti);
+    EXPECT_EQ(l.align.bytes(), 1u);
+    EXPECT_EQ(l.size, 10u);           // 2 * stride(5)  RED-ON-DISABLE (padded → 16)
+}
+
+TEST(TypeLayout, NestedPackedStructPacksInnerToOffsetOne) {
+    auto ti = makeInterner(1);
+    // struct Inner { char c; uint32_t v; } __attribute__((packed));  // size 5, align 1
+    // struct Outer { char a; struct Inner inner; } __attribute__((packed));
+    // Outer: a@0, inner@1 (packed baseline 1, inner align 1) → size 6, align 1.
+    std::array<TypeId, 2> const innerFields{ti.primitive(TypeKind::Char),
+                                            ti.primitive(TypeKind::U32)};
+    TypeId const inner = packedStruct(ti, "Inner", 1, innerFields);
+    std::array<TypeId, 2> const outerFields{ti.primitive(TypeKind::Char), inner};
+    TypeId const outer = packedStruct(ti, "Outer", 2, outerFields);
+    auto const l = layoutOf(outer, ti);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);
+    EXPECT_EQ(l.fieldOffsets[1], 1u);   // inner packed right after `a`  RED-ON-DISABLE
+    EXPECT_EQ(l.align.bytes(), 1u);
+    EXPECT_EQ(l.size, 6u);              // 1 + 5
+}
+
+TEST(TypeLayout, PackedPlusBitfieldFailsLoud) {
+    auto ti = makeInterner(1);
+    // A packed struct carrying a bit-field is UNSUPPORTED (bit-granular packed
+    // packing is a distinct algorithm) — computeLayout returns nullopt (the F5
+    // belt), the reliable backstop behind the semantic S_PackedBitfieldUnsupported.
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::I32),
+                                       ti.primitive(TypeKind::U32)};
+    std::array<std::int64_t, 2> const widths{-1 /*kNotBitfield*/, 3};
+    TypeId const s = ti.forwardComposite(TypeKind::Struct, "S", 1);
+    ti.completeComposite(s, fields, /*packed=*/true, widths);
+    EXPECT_TRUE(ti.isPacked(s));
+    EXPECT_FALSE(computeLayout(s, ti, kGnu16, DataModel::Lp64).has_value());  // belt
 }
 
 TEST(TypeLayout, StructTailPaddingAndNesting) {
@@ -907,7 +1045,7 @@ TEST(TypeLayout, CompleteEmptyStructLaysOutSizeZero) {
     // EXPLICIT incomplete flag, never "operands empty").
     auto ti = makeInterner(1);
     const TypeId e = ti.forwardComposite(TypeKind::Struct, "E", 2);
-    ti.completeComposite(e, {});
+    ti.completeComposite(e, {}, /*packed=*/false);
     auto const l = computeLayout(e, ti, kNatural16, DataModel::Lp64);
     ASSERT_TRUE(l.has_value());
     EXPECT_EQ(l->size, 0u);
@@ -924,7 +1062,7 @@ TEST(TypeLayout, SelfReferentialStructLaysOutWithPointerField) {
     const TypeId node = ti.forwardComposite(TypeKind::Struct, "Node", 3);
     const TypeId ptrNode = ti.pointer(node);
     std::array<TypeId, 2> const fields{i32, ptrNode};
-    ti.completeComposite(node, fields);
+    ti.completeComposite(node, fields, /*packed=*/false);
     auto const l = layoutOf(node, ti);
     EXPECT_EQ(l.size, 16u);
     EXPECT_EQ(l.align.bytes(), 8u);

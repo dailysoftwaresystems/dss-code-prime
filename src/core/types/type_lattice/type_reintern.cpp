@@ -172,7 +172,13 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
             for (std::size_t i = 0; i < srcFields.size(); ++i)
                 aligns.push_back(src.explicitFieldAlign(srcId, i));
         }
-        dst.completeComposite(fwd, fields, widths, offsets, aligns);
+        // D-CSUBSET-PACKED: carry the whole-composite packed flag across reintern.
+        // Without it a packed struct crossing a CU/round-trip boundary silently
+        // reinterns as UNPACKED — a silent ABI miscompile (the exact reason the
+        // `completeComposite` packed parameter is non-defaulted: this call FAILS TO
+        // COMPILE if packed is forgotten). packed + explicit offsets never coexist
+        // (completeComposite rejects the pair), so `offsets` is empty when packed.
+        dst.completeComposite(fwd, fields, src.isPacked(srcId), widths, offsets, aligns);
         return fwd;
     }
 

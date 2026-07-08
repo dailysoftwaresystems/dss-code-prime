@@ -433,7 +433,8 @@
     "structSpec": {
       "$comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the UNIFIED struct specifier (C 6.7.2.1 struct-or-union-specifier) — `struct {opt tag} {opt body}`. ONE rule for BOTH the type-DEFINITION form (`struct P { … }` — a `structBody` child is present) and the bare tag-REFERENCE form (`struct P` — absent). Replaces the former `structSpecifierBody | structTypeRef` SPECULATIVE pair in the 4 body-bearing declaration-head alts (topLevelCompositeSpec, typeSpecifierForDecl, typedefHead, typeBaseAllowingStruct). Because it is now the SOLE candidate keyed on StructKeyword in those alts, the parser's LL(k) unique-production DIRECT DESCENT (parser.cpp ~1804-1844) dispatches it NON-speculatively — the member list parses with NO speculation budget, so an arbitrarily large body (`struct sqlite3`) never trips the 4096-token probe cliff. The body-vs-ref split becomes an INTERNAL 1-token (`BlockOpen`) decision via the `{optional structBody}`, also non-speculative. The binder is DUAL-MODE on the SAME node (semantics: `definesWhenChild: structBody`): body present ⇒ the EXACT former `structSpecifierBody` define path (mint type, bind tag, open scope, compose fields from the `structBody` subtree); body absent ⇒ the EXACT former `structTypeRef` tag-reference path (isTagReference). FOLLOW-independent (the rejected D2): no prune of the ref candidate is needed because there IS no separate ref candidate here.",
       "sequence": [
-        "StructKeyword", { "optional": "Identifier" }, { "optional": "structBody" }
+        "StructKeyword", { "optional": "Identifier" }, { "optional": "structBody" },
+        { "optional": "compositeAttrList" }
       ]
     },
 
@@ -462,7 +463,8 @@
     "unionSpec": {
       "$comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the UNIFIED union specifier — `union {opt tag} {opt body}`. Mirrors `structSpec`: ONE rule for define (`union U { … }`) and reference (`union U`), the SOLE UnionKeyword candidate in the 4 body-bearing alts → non-speculative direct descent (no member-body probe budget). Dual-mode binder via `definesWhenChild: unionBody`.",
       "sequence": [
-        "UnionKeyword", { "optional": "Identifier" }, { "optional": "unionBody" }
+        "UnionKeyword", { "optional": "Identifier" }, { "optional": "unionBody" },
+        { "optional": "compositeAttrList" }
       ]
     },
 
@@ -572,6 +574,15 @@
         { "optional": { "sequence": [ "ColonColonOp", "Identifier" ] } },
         { "optional": { "sequence": [ "ParenOpen", { "optional": "stringLiteralExpr" }, "ParenClose" ] } }
       ]
+    },
+
+    "compositeAttr": {
+      "$comment": "FC16 (D-CSUBSET-PACKED): ONE composite type-attribute — a GNU `__attribute__((…))` (`attrSpec`) or a C23 `[[…]]` (`stdAttr`), REUSING the existing attribute rules. The trailing struct/union attribute list (`compositeAttrList`) is a repeat of this.",
+      "alt": [ "attrSpec", "stdAttr" ]
+    },
+    "compositeAttrList": {
+      "$comment": "FC16 (D-CSUBSET-PACKED): the trailing composite-attribute list after a struct/union body — one or more `compositeAttr` (`struct S {…} __attribute__((packed))` / `[[gnu::packed]]`). Referenced as a TRAILING `{optional}` on structSpec/unionSpec (after `structBody`, so it never shifts the tag's positional index `name:1`). The semantic tier scans this node (semantics.packed.listRule) for a `packed` spelling. The after-KEYWORD position (`struct __attribute__((packed)) S`) is a SEPARATE deferred slot (D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION) — it stays a parse error (fail-loud), never a silent drop.",
+      "sequence": [ "compositeAttr", { "repeat": "compositeAttr" } ]
     },
 
     "headQualifier": { "alt": [ "ConstKeyword", "VolatileKeyword" ] },
@@ -1440,6 +1451,8 @@
     "alignof": { "typeRule": "alignofType", "typeChild": 2 },
     "$alignasComment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the `_Alignas`/`alignas` alignment specifier. `specRule` = the `alignasSpec` shape = [ { alt: AlignasKeyword | AlignasLegacyKeyword }, '(', alignasArg, ')' ] → `argChild` 2 is the `alignasArg` (the inline keyword-alt matches ONE token at visible-child 0, '(' is child 1 — SAME layout as alignofType). `typeFormRule` = `alignasTypeName` (the guarded TYPE-form wrapper branch): the semantic tier reads alignasArg's committed reading and discriminates the TYPE form (the committed child's rule == alignasTypeName → alignment = _Alignof(T) via computeLayout(...)->align of the castTypeRef INSIDE the wrapper) from the VALUE form (else → const-evaluate the constant-expression via the SAME constIntExpr sizeof/static_assert/array-dims use). The computed alignment is validated (power-of-two → S_AlignasNotPowerOfTwo; ≤256 → S_AlignasExceedsMax; ≥ the declared type's natural align → S_AlignasWeakerThanNatural; non-constant value → S_AlignasNonConstant; on a typedef/function/parameter/bit-field → S_AlignasInvalidContext) and STORED (SymbolRecord.explicitAlignment for a variable; fed into the composite's fieldAligns for a member). `alignas(0)` is an explicit NO-OP (6.7.5p3) — treated as no override, no error. Absent block ⇒ the language has no alignas surface.",
     "alignas": { "specRule": "alignasSpec", "argChild": 2, "typeFormRule": "alignasTypeName" },
+    "$packedComment": "FC16 (D-CSUBSET-PACKED): C/C23 `__attribute__((packed))` / `[[gnu::packed]]` on a struct/union. `listRule` = the `compositeAttrList` shape (the trailing attribute list after a struct/union body). `attributeNames` = the identifiers that mean `packed` (matched dunder-normalized via the shared stripDunder, so `__packed__` ≡ `packed`; `gnu::packed` matches by its final segment `packed`). The semantic tier scans a structSpec/unionSpec node for a `compositeAttrList` child, extracts each `attrSpec`/`stdAttr` identifier, and marks the composite `packed` (→ the interner's completeComposite → computeLayout removes all inter-field padding + sets natural alignment 1). An unrecognized `__attribute__((X))` identifier fails loud S_UnknownTypeAttribute (typo protection like H_UnknownLinkageSpecifier); an unrecognized `[[…]]` is standard-ignorable (the [[deprecated]] precedent). packed + a bit-field member → S_PackedBitfieldUnsupported (D-CSUBSET-PACKED-BITFIELD-INTERACTION). Absent block ⇒ the language has no composite-attribute surface. Source-agnostic: nothing hardcodes the spelling `packed`.",
+    "packed": { "listRule": "compositeAttrList", "attributeNames": ["packed"], "strictAttrRule": "attrSpec" },
     "$variadicComment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. vaArgExpr = [ VaArgKeyword, '(', assignmentExpr(apChild 2), ',', castTypeRef(typeChild 4), ')' ] → pass 2 resolves+stamps the castTypeRef through the SAME resolver casts use (so the HIR lowering recovers the read type T) and stamps the node T; it type-checks `ap` is a va_list. vaStartExpr/vaEndExpr = [ kw, '(', assignmentExpr(apChild 2), ... ] → node stamped `void`; ap type-checked va_list; vaStart also flips the enclosing function's uses-va-start attribute so the LIR prologue spills the arg registers.",
     "variadic": {
       "vaArgRule":   "vaArgExpr",   "vaArgApChild":   2, "vaArgTypeChild": 4,

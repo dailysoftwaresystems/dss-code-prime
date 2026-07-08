@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 85> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 86> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -361,6 +361,17 @@ constexpr std::array<DiagnosticCode, 85> kUnsuppressableCodes{{
     DiagnosticCode::S_AlignasWeakerThanNatural,
     DiagnosticCode::S_AlignasInvalidContext,
     DiagnosticCode::S_AlignasNonConstant,
+    // S_PackedBitfieldUnsupported (FC16, D-CSUBSET-PACKED, 2026-07-08): a `packed`
+    // struct/union that ALSO carries a bit-field member — an UNSUPPORTED combination
+    // (bit-granular packed packing is a distinct, deferred algorithm). Unlike the
+    // S_Alignas* constraint violations above, suppressing THIS would ship WRONG BYTES:
+    // the layout engine's nullopt belt fails the type out on the packed+bitfield path,
+    // so a suppressed diagnostic would leave the composite to be laid out padded (the
+    // wrong ABI). Closed here so a packed bit-field struct is never silently mislaid.
+    // (S_UnknownTypeAttribute is deliberately NOT a member — it mirrors the suppressible
+    // H_UnknownLinkageSpecifier typo diagnostic, and the build still fails via
+    // hasErrors when it fires unsuppressed.)
+    DiagnosticCode::S_PackedBitfieldUnsupported,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

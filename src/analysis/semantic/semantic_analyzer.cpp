@@ -7,6 +7,7 @@
 #include "analysis/semantic/symbol_table.hpp"
 #include "analysis/semantic/type_rules.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: run analyze on a large stack
+#include "core/types/attribute_naming.hpp"   // D-CSUBSET-PACKED: stripDunder (shared with the preprocessor)
 #include "core/types/data_model.hpp"
 #include "core/types/decl_prefix_strip.hpp"   // declRoleChildren / descendVisibleDecl / specifierPrefixChild
 #include "core/types/declarator_walk.hpp"     // FC4: declaratorNameNode / collectDeclarators
@@ -1928,6 +1929,84 @@ evalOneAlignasSpec(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     return static_cast<std::uint32_t>(uv);
 }
 
+// FC16 (D-CSUBSET-PACKED): scan a struct/union specifier node's TRAILING
+// composite-attribute list (`compositeAttrListRule`) for a honored `packed`
+// attribute. Returns true iff a recognized `packed` spelling is present.
+//
+// When `emitDiagnostics` is true (the ONE composition site), an UNRECOGNIZED
+// attribute in the STRICT (GNU `__attribute__`) form fails loud
+// S_UnknownTypeAttribute (typo protection, mirroring H_UnknownLinkageSpecifier —
+// GNU attribute identifiers are all meaningful, so a `__attribute__((pakced))`
+// typo must not silently leave the struct unpacked); an unrecognized C23 `[[...]]`
+// is standard-ignorable (the `[[deprecated]]` precedent). When false (the member-
+// alignas baseline probe, which may run per member), it detects packed WITHOUT
+// emitting, so the diagnostic fires exactly once.
+//
+// Config-driven + source-AGNOSTIC: `compositeAttrListRule` / `packedAttributeNames`
+// / `compositeStrictAttrRule` name the vocabulary; nothing here hardcodes the
+// spelling "packed" or a rule name. Packed detection matches an attribute
+// IDENTIFIER leaf (dunder-normalized via the shared `stripDunder`, so `__packed__`
+// ≡ `packed` and `[[gnu::packed]]`'s final segment `packed` matches) against
+// `packedAttributeNames` — a string ARGUMENT (`section("packed")`) is a
+// string-literal leaf, not an identifier, so it never false-matches.
+[[nodiscard]] bool
+scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                    NodeId specNode, bool emitDiagnostics) {
+    if (!cfg.compositeAttrListRule.valid() || !specNode.valid()) return false;
+    // The `compositeAttrList` is the structSpec/unionSpec's trailing direct child.
+    NodeId listNode{};
+    for (NodeId c : visibleChildren(tree, specNode)) {
+        if (tree.kind(c) == NodeKind::Internal
+            && tree.rule(c).v == cfg.compositeAttrListRule.v) {
+            listNode = c;
+            break;
+        }
+    }
+    if (!listNode.valid()) return false;
+    bool packed = false;
+    // Each visible child of the list is ONE composite attribute (`compositeAttr` ->
+    // attrSpec | stdAttr). For each: does it NAME a packed attribute? and is it the
+    // STRICT (GNU) form (unrecognized -> diagnose) or the ignorable (C23) form?
+    for (NodeId attr : visibleChildren(tree, listNode)) {
+        if (tree.kind(attr) != NodeKind::Internal) continue;
+        bool named  = false;   // this attribute names `packed`
+        bool strict = false;   // this attribute is the GNU `__attribute__` form
+        std::vector<NodeId> stack{attr};
+        for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
+            NodeId const cur = stack.back();
+            stack.pop_back();
+            if (tree.kind(cur) == NodeKind::Internal) {
+                if (cfg.compositeStrictAttrRule.valid()
+                    && tree.rule(cur).v == cfg.compositeStrictAttrRule.v) {
+                    strict = true;
+                }
+                for (NodeId g : visibleChildren(tree, cur)) stack.push_back(g);
+                continue;
+            }
+            if (cfg.identifierToken.valid()
+                && tree.tokenKind(cur) == cfg.identifierToken) {
+                std::string_view const id = stripDunder(tree.text(cur));
+                for (std::string const& nm : cfg.packedAttributeNames) {
+                    if (id == nm) { named = true; break; }
+                }
+            }
+        }
+        if (named) { packed = true; continue; }
+        // Not a recognized packed attribute. A GNU `__attribute__` typo / unsupported
+        // spelling fails loud (typo protection); a C23 `[[...]]` is standard-ignorable.
+        if (strict && emitDiagnostics) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_UnknownTypeAttribute;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(attr);
+            d.actual   = std::string{tree.text(attr)};
+            s.reporter.report(std::move(d));
+        }
+    }
+    return packed;
+}
+
 // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the EFFECTIVE alignment override a
 // declaration's specifier prefix requests — the MAX over every `alignasSpec` in
 // the prefix (C 6.7.5p6: with several alignment specifiers, the strictest — the
@@ -1940,7 +2019,8 @@ evalOneAlignasSpec(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 [[nodiscard]] std::optional<std::uint32_t>
 resolveAlignasOverride(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                        NodeId declNode, DeclarationRule const& decl,
-                       TypeId declType, ScopeId fromScope) {
+                       TypeId declType, ScopeId fromScope,
+                       std::optional<std::uint32_t> naturalBaseline = std::nullopt) {
     if (!cfg.alignasSpecRule.valid()) return std::nullopt;
     NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
     if (!prefix.valid()) return std::nullopt;
@@ -1969,17 +2049,28 @@ resolveAlignasOverride(EngineState& s, SemanticConfig const& cfg, Tree const& tr
     if (declType.valid() && s.aggregateLayout.has_value()) {
         auto const layout = computeLayout(declType, s.lattice.interner(),
                                           *s.aggregateLayout, s.dataModel);
-        if (layout && *best < layout->align.bytes()) {
-            ParseDiagnostic d;
-            d.code     = DiagnosticCode::S_AlignasWeakerThanNatural;
-            d.severity = DiagnosticSeverity::Error;
-            d.buffer   = tree.source().id();
-            d.span     = tree.span(specs.empty() ? declNode : specs.front());
-            d.actual   = std::string{tree.text(specs.empty() ? declNode : specs.front())};
-            s.reporter.report(std::move(d));
-            // Still return the requested override — the layout carrier's MAX(natural,
-            // override) makes a too-weak override a no-op anyway; the diagnostic is
-            // the fail-loud (the build fails via hasErrors regardless).
+        if (layout) {
+            // D-CSUBSET-PACKED: `naturalBaseline` overrides the type's natural
+            // alignment when the enclosing composite is PACKED (baseline 1 — packed
+            // removes the padding requirement), so `alignas(1)` INSIDE a packed struct
+            // is legal (never weaker-than-natural) while `alignas(1)` OUTSIDE (baseline
+            // absent → the type's own align) still fails 6.7.5p4.
+            std::uint64_t const naturalBytes =
+                naturalBaseline.has_value()
+                    ? static_cast<std::uint64_t>(*naturalBaseline)
+                    : static_cast<std::uint64_t>(layout->align.bytes());
+            if (*best < naturalBytes) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_AlignasWeakerThanNatural;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(specs.empty() ? declNode : specs.front());
+                d.actual   = std::string{tree.text(specs.empty() ? declNode : specs.front())};
+                s.reporter.report(std::move(d));
+                // Still return the requested override — the layout carrier's
+                // MAX(natural, override) makes a too-weak override a no-op anyway; the
+                // diagnostic is the fail-loud (the build fails via hasErrors regardless).
+            }
         }
     }
     return best;
@@ -3657,8 +3748,23 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                 // per-slot check below still fires for each bit-field
                                 // declarator (a bit-field never stores an override).
                                 if (!s.symbols.at(sym).bitFieldWidth.has_value()) {
+                                    // D-CSUBSET-PACKED: a member of a PACKED composite
+                                    // has a natural baseline of 1 (packed removes the
+                                    // alignment requirement), so `alignas(1)` in a
+                                    // packed struct is legal (not weaker-than-natural).
+                                    // Resolve the enclosing composite via the field
+                                    // scope's anchor (the structSpec/unionSpec node).
+                                    std::optional<std::uint32_t> naturalBaseline;
+                                    if (here.valid()
+                                        && scanCompositePacked(
+                                               s, cfg, tree,
+                                               s.scopes.scopes()[here.v].anchor,
+                                               /*emitDiagnostics=*/false)) {
+                                        naturalBaseline = 1u;
+                                    }
                                     declAlignOverride = resolveAlignasOverride(
-                                        s, cfg, tree, node, decl, declTy, here);
+                                        s, cfg, tree, node, decl, declTy, here,
+                                        naturalBaseline);
                                 }
                             }
                             if (s.symbols.at(sym).bitFieldWidth.has_value()) {
@@ -4053,6 +4159,47 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                 // FieldChildrenDescriptor::compositeKind.
                                 CompositeKind const ck =
                                     decl.fieldChildren->compositeKind;
+                                // D-CSUBSET-PACKED: scan the composite's TRAILING
+                                // attribute list for a honored `packed` (emitting the
+                                // S_UnknownTypeAttribute typo diagnostic exactly ONCE
+                                // here). packed applies only to struct/union. A packed
+                                // composite that ALSO has a bit-field member is
+                                // UNSUPPORTED (D-CSUBSET-PACKED-BITFIELD-INTERACTION):
+                                // fail loud S_PackedBitfieldUnsupported and complete it
+                                // UNPACKED (so the type still lays out — the build
+                                // fails via the unsuppressable diagnostic; the layout
+                                // nullopt belt is the backstop for interner-direct
+                                // construction that bypasses this scan).
+                                bool composedPacked = false;
+                                NodeId const specNode =
+                                    srec.structScope.valid()
+                                        ? s.scopes.scopes()[srec.structScope.v].anchor
+                                        : NodeId{};
+                                if (ck == CompositeKind::Struct
+                                    || ck == CompositeKind::Union) {
+                                    composedPacked = scanCompositePacked(
+                                        s, cfg, tree, specNode,
+                                        /*emitDiagnostics=*/true);
+                                    if (composedPacked) {
+                                        bool anyBitfieldMember = false;
+                                        for (std::int64_t const w : fieldBitWidths)
+                                            if (w != kNotBitfield) {
+                                                anyBitfieldMember = true;
+                                                break;
+                                            }
+                                        if (anyBitfieldMember) {
+                                            ParseDiagnostic d;
+                                            d.code = DiagnosticCode::S_PackedBitfieldUnsupported;
+                                            d.severity = DiagnosticSeverity::Error;
+                                            d.buffer = tree.source().id();
+                                            d.span = tree.span(
+                                                specNode.valid() ? specNode : resolved.node);
+                                            d.actual = std::string{srec.name};
+                                            s.reporter.report(std::move(d));
+                                            composedPacked = false;   // complete UNPACKED
+                                        }
+                                    }
+                                }
                                 // FC6: flexible-array-member constraints (C99
                                 // §6.7.2.1), positioned at the offending field.
                                 // The not-last / sole-member checks are
@@ -4166,8 +4313,9 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                     // recurse infinitely on the self-by-value cycle.
                                     if (!anyIncompleteMember)
                                         s.lattice.interner().completeComposite(
-                                            compositeTy, fieldTypes, fieldBitWidths,
-                                            /*fieldOffsets=*/{}, fieldAligns);
+                                            compositeTy, fieldTypes, composedPacked,
+                                            fieldBitWidths, /*fieldOffsets=*/{},
+                                            fieldAligns);
                                 } else if (ck == CompositeKind::Enum) {
                                     // D5.5: enum type carries no field-
                                     // operands — only its nominal name +
@@ -4309,8 +4457,9 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                     compositeTy = srec.type;
                                     if (!anyIncompleteMember)
                                         s.lattice.interner().completeComposite(
-                                            compositeTy, fieldTypes, fieldBitWidths,
-                                            /*fieldOffsets=*/{}, fieldAligns);
+                                            compositeTy, fieldTypes, composedPacked,
+                                            fieldBitWidths, /*fieldOffsets=*/{},
+                                            fieldAligns);
                                 }
                                 srec.type = compositeTy;
                                 s.nodeToType.set(resolved.node, compositeTy);

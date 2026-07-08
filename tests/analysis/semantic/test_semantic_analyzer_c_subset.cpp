@@ -1432,6 +1432,216 @@ TEST(SemanticAnalyzerCSubset, AlignasUnionMemberRaisesAlignAndSizeEndToEnd) {
                         DiagnosticCode::S_StaticAssertFailed), 0u);
 }
 
+// ── D-CSUBSET-PACKED: `__attribute__((packed))` / `[[gnu::packed]]` semantics ──
+// End-to-end via `_Static_assert(sizeof/_Alignof)`: the grammar parses the trailing
+// composite-attribute list, the semantic scan marks the composite packed, the
+// interner carries it, and computeLayout removes all padding. Each sizeof pin is
+// RED-ON-DISABLE (a non-honored packed → the padded size → S_StaticAssertFailed).
+
+// GNU spelling: `struct S {char c; int v;} __attribute__((packed));` → sizeof 5,
+// _Alignof 1 (all inter-field padding removed, natural alignment 1).
+TEST(SemanticAnalyzerCSubset, PackedStructGnuRemovesPaddingEndToEnd) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char c; int v; } __attribute__((packed));\n"
+        "_Static_assert(sizeof(struct S) == 5, \"packed size 5\");\n"
+        "_Static_assert(_Alignof(struct S) == 1, \"packed align 1\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "packed must remove padding: sizeof==5 AND _Alignof==1 end-to-end";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u);
+}
+
+// C23 spelling: `[[gnu::packed]]` as a trailing attribute is honored identically.
+TEST(SemanticAnalyzerCSubset, PackedStructC23GnuPackedSpelling) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char c; int v; } [[gnu::packed]];\n"
+        "_Static_assert(sizeof(struct S) == 5, \"packed size 5\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// C23 bare `[[packed]]` spelling (no namespace) is honored too.
+TEST(SemanticAnalyzerCSubset, PackedStructC23BarePackedSpelling) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char c; int v; } [[packed]];\n"
+        "_Static_assert(sizeof(struct S) == 5, \"packed size 5\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// packed + a member `alignas` — alignas WINS per-field even under packed:
+// `struct S {char c; alignas(4) int v;} __attribute__((packed));` → v@4, sizeof 8.
+TEST(SemanticAnalyzerCSubset, PackedStructMemberAlignasStillRaises) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char c; alignas(4) int v; } __attribute__((packed));\n"
+        "_Static_assert(_Alignof(struct S) == 4, \"alignas wins\");\n"
+        "_Static_assert(sizeof(struct S) == 8, \"v raised to offset 4\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "a member alignas raises per-field even inside a packed struct";
+}
+
+// `alignas(1)` INSIDE a packed struct is LEGAL (the member's natural baseline is 1
+// under packed), so NO S_AlignasWeakerThanNatural. Contrast:
+// `AlignasWeakerThanNaturalFailsLoud` — `alignas(1) double d;` OUTSIDE a packed
+// struct still fails. RED-ON-DISABLE: drop the packed naturalBaseline and this fires.
+TEST(SemanticAnalyzerCSubset, AlignasOneInsidePackedStructIsLegal) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char c; alignas(1) int v; } __attribute__((packed));\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasWeakerThanNatural), 0u)
+        << "alignas(1) inside a packed struct is legal (baseline 1)";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// packed UNION: `union U {char c; int i;} __attribute__((packed));` → _Alignof 1.
+TEST(SemanticAnalyzerCSubset, PackedUnionHasAlignmentOneEndToEnd) {
+    auto cu = buildShippedUnit("c-subset", {
+        "union U { char c; int i; } __attribute__((packed));\n"
+        "_Static_assert(_Alignof(union U) == 1, \"packed union align 1\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// A trailing packed attribute does NOT block a following declarator:
+// `struct S {...} __attribute__((packed)) g;` — `g` still parses, S stays packed.
+TEST(SemanticAnalyzerCSubset, PackedStructFollowedByDeclaratorParses) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char c; int v; } __attribute__((packed)) g;\n"
+        "_Static_assert(sizeof(struct S) == 5, \"packed size 5\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+    EXPECT_NE(findSym(model, "g"), nullptr);
+}
+
+// FAIL-LOUD: packed + a bit-field member → S_PackedBitfieldUnsupported (bit-granular
+// packed packing is a distinct, deferred algorithm — D-CSUBSET-PACKED-BITFIELD-
+// INTERACTION). NEVER a silent NON-packed layout.
+TEST(SemanticAnalyzerCSubset, PackedBitfieldFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int a : 3; } __attribute__((packed));\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_PackedBitfieldUnsupported), 1u);
+    EXPECT_TRUE(model.hasErrors());
+}
+
+// FAIL-LOUD: a TYPO in the GNU `__attribute__` packed slot → S_UnknownTypeAttribute
+// (typo protection, like H_UnknownLinkageSpecifier — a `pakced` typo must not
+// silently leave the struct unpacked).
+TEST(SemanticAnalyzerCSubset, UnknownGnuTypeAttributeFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; } __attribute__((pakced));\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+    EXPECT_TRUE(model.hasErrors());
+}
+
+// STANDARD-IGNORABLE: an unrecognized C23 `[[...]]` attribute on a struct is
+// ignored (C23 6.7.11.1 — an unknown attribute is ignored), NO diagnostic. This is
+// the `[[deprecated]]` precedent; only `packed`/`gnu::packed` are honored-or-diagnosed.
+TEST(SemanticAnalyzerCSubset, UnknownC23AttributeIsIgnored) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; } [[deprecated]];\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION (F-1): the AFTER-KEYWORD packed position
+// `struct __attribute__((packed)) S {…}` is DEFERRED — only the TRAILING/suffix form
+// (`struct S {…} __attribute__((packed))`) is honored. That deferral's fail-loud
+// contract REQUIRES the after-keyword form to be LOUDLY REJECTED — NEVER a silent
+// tag-drop / accept-as-unpacked. The grammar admits `compositeAttrList` only as a
+// TRAILING element, so `struct __attribute__((packed))` parses (cleanly, no
+// tree-builder error) as an ANONYMOUS, body-less struct specifier — the attribute is
+// consumed as ITS trailing list — and the tag `S { … }` is then mis-read as a
+// function definition, failing loud S_InvalidFunctionDeclarator at SEMANTIC analysis
+// (verified: this is a semantic, not a parse, error). The pin is PHASE-AGNOSTIC
+// (tree parse-error OR semantic-model error) so a future shift between channels stays
+// green; ONLY a silent accept-as-unpacked — the regression F-1 guards against, an
+// after-keyword slot added WITHOUT fixing the ~6 positional tag readers — turns it
+// red. RED-ON-REGRESSION.
+TEST(SemanticAnalyzerCSubset, PackedAfterKeywordTaggedFailsLoudNotSilent) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct __attribute__((packed)) S { int a; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    bool sawParseError = false;
+    for (auto const& t : cu->trees()) {
+        for (auto const& d : t.diagnostics().all()) {
+            if (d.severity == DiagnosticSeverity::Error) sawParseError = true;
+        }
+    }
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_TRUE(sawParseError || model.hasErrors())
+        << "after-keyword packed (`struct __attribute__((packed)) S {…}`) must fail "
+           "LOUD (parse or semantic) — never a silent tag-drop / accept-as-unpacked "
+           "(the D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION deferral's fail-loud contract)";
+}
+
+// The ANONYMOUS after-keyword variant is likewise LOUDLY REJECTED:
+// `struct __attribute__((packed)) { int a; } v;` — the anonymous, body-less struct
+// specifier consumes the attribute as its trailing list, then `{ int a; } v;` cannot
+// bind and fails loud (S_UnknownType on `v` today). Cheap sibling; same fail-loud
+// boundary, phase-agnostic.
+TEST(SemanticAnalyzerCSubset, PackedAfterKeywordAnonymousFailsLoudNotSilent) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct __attribute__((packed)) { int a; } v;\n"
+        "int main(void){ return 0; }\n",
+    });
+    bool sawParseError = false;
+    for (auto const& t : cu->trees()) {
+        for (auto const& d : t.diagnostics().all()) {
+            if (d.severity == DiagnosticSeverity::Error) sawParseError = true;
+        }
+    }
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_TRUE(sawParseError || model.hasErrors())
+        << "anonymous after-keyword packed must also fail LOUD (parse or semantic), "
+           "never a silent accept-as-unpacked";
+}
+
 // ZERO: `alignas(0) int x;` is a NO-OP (6.7.5p3) — NO diagnostic, NO override.
 TEST(SemanticAnalyzerCSubset, AlignasZeroIsNoOpNoOverride) {
     auto cu = buildShippedUnit("c-subset", { "alignas(0) int x;\n" });

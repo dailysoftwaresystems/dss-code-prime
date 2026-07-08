@@ -7483,6 +7483,79 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── composite type-attributes / packed (FC16, D-CSUBSET-PACKED) ──
+            // `{ listRule, attributeNames }` — the `compositeAttrList` rule (a trailing
+            // `__attribute__((...))` / `[[...]]` after a struct/union body) + the set of
+            // attribute identifiers that mean "packed" (dunder-normalized at the scan).
+            // The semantic tier reads a structSpec/unionSpec's `listRule` children and
+            // marks the composite packed. Mirrors the alignas block's readRule discipline
+            // (a present-but-bad field emits + fails the load; an ABSENT block leaves the
+            // rule invalid → no surface). Source-agnostic: nothing hardcodes "packed".
+            if (sem.contains("packed")) {
+                json const& pk = sem.at("packed");
+                if (!pk.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/packed",
+                              "'semantics.packed' must be an object "
+                              "{ listRule, attributeNames }");
+                } else {
+                    if (!pk.contains("listRule") || !pk.at("listRule").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/packed/listRule",
+                                  "'listRule' is required and must be a string");
+                    } else {
+                        std::string const rn = pk.at("listRule").get<std::string>();
+                        if (!data.rules->contains(rn)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape,
+                                      "/semantics/packed/listRule",
+                                      std::format("'packed.listRule' references unknown "
+                                                  "shape '{}'", rn));
+                        } else {
+                            cfg.compositeAttrListRule     = data.rules->find(rn);
+                            cfg.compositeAttrListRuleName = rn;
+                        }
+                    }
+                    if (!pk.contains("attributeNames")
+                        || !pk.at("attributeNames").is_array()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/packed/attributeNames",
+                                  "'attributeNames' is required and must be an array "
+                                  "of strings");
+                    } else {
+                        for (json const& e : pk.at("attributeNames")) {
+                            if (!e.is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/packed/attributeNames",
+                                          "each 'attributeNames' entry must be a string");
+                                continue;
+                            }
+                            cfg.packedAttributeNames.push_back(e.get<std::string>());
+                        }
+                    }
+                    // OPTIONAL: the STRICT (GNU `__attribute__`) attribute rule, whose
+                    // unrecognized attributes fail loud (S_UnknownTypeAttribute). Absent
+                    // ⇒ every unrecognized composite attribute is standard-ignorable.
+                    if (pk.contains("strictAttrRule")) {
+                        if (!pk.at("strictAttrRule").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/packed/strictAttrRule",
+                                      "'strictAttrRule' must be a string");
+                        } else {
+                            std::string const rn =
+                                pk.at("strictAttrRule").get<std::string>();
+                            if (!data.rules->contains(rn)) {
+                                coll.emit(DiagnosticCode::C_UnknownShape,
+                                          "/semantics/packed/strictAttrRule",
+                                          std::format("'packed.strictAttrRule' references "
+                                                      "unknown shape '{}'", rn));
+                            } else {
+                                cfg.compositeStrictAttrRule     = data.rules->find(rn);
+                                cfg.compositeStrictAttrRuleName = rn;
+                            }
+                        }
+                    }
+                }
+            }
+
             // ── variadic intrinsics (FC12a-core, D-FC12A-VARIADIC-CALLEE) ──
             // `{ vaArgRule, vaArgApChild, vaArgTypeChild, vaStartRule,
             //    vaStartApChild, vaEndRule, vaEndApChild }`. Pass 2 resolves the

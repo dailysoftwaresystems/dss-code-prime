@@ -199,11 +199,19 @@ public:
                             std::uint64_t declSiteKey);
     // Attach `fields` (+ per-field bit-field widths, `kNotBitfield` for ordinary —
     // same encoding as the bitfield-aware structType) to a forward-minted composite.
-    // Idempotent for an IDENTICAL re-completion (same fields + widths) — a benign
-    // re-resolution; a CONFLICTING re-completion (different fields) of an already-
-    // complete composite is a caller bug and aborts loud. `id` MUST be a composite
-    // minted by `forwardComposite` (else fatal).
-    void completeComposite(TypeId id, std::span<TypeId const> fields,
+    // Idempotent for an IDENTICAL re-completion (same fields + widths + packed) — a
+    // benign re-resolution; a CONFLICTING re-completion (different fields) of an
+    // already-complete composite is a caller bug and aborts loud. `id` MUST be a
+    // composite minted by `forwardComposite` (else fatal).
+    //
+    // D-CSUBSET-PACKED: `packed` is the whole-composite packed flag (C/C23
+    // `__attribute__((packed))`) and is DELIBERATELY NON-DEFAULTED — every call site
+    // MUST decide it, so a caller that forgets it FAILS TO COMPILE rather than
+    // silently dropping packed (the reintern / cross-CU channel is the one that
+    // matters: a silently-unpacked round-trip is an ABI miscompile). packed +
+    // non-empty `fieldOffsets` is contradictory (explicit offsets place fields
+    // wholesale, overriding padding entirely) → fail loud here.
+    void completeComposite(TypeId id, std::span<TypeId const> fields, bool packed,
                            std::span<std::int64_t const> fieldBitWidths = {},
                            std::span<std::uint64_t const> fieldOffsets = {},
                            std::span<std::uint32_t const> fieldAligns = {});
@@ -277,6 +285,12 @@ public:
     // that field has no override (use natural alignment). Returns 0 for every field
     // of a composite interned with no aligns. Mirrors `explicitFieldOffset`.
     [[nodiscard]] std::uint32_t explicitFieldAlign(TypeId id, std::size_t i) const;
+    // D-CSUBSET-PACKED: true iff `id` is a Struct/Union declared `packed` (C/C23
+    // `__attribute__((packed))` / `[[gnu::packed]]`) — all inter-field padding
+    // removed, aggregate natural alignment 1. Struct/Union only; false for every
+    // ordinary (padded) composite. Mirrors `hasExplicitAligns`. The layout engine
+    // reads it to seed the per-field baseline alignment to 1.
+    [[nodiscard]] bool isPacked(TypeId id) const;
     TypeId unionType(std::string_view name, std::span<TypeId const> variants);
     // FC8 bitfields (D-CSUBSET-BITFIELD): a union with per-member bit-field widths
     // (same `kNotBitfield`/width encoding + empty-scalars-when-none rule as the
@@ -429,6 +443,17 @@ private:
         // completion if both are set). EMPTY = every field uses natural alignment
         // (each existing composite → byte-identical TypeId, exactly like offsets).
         std::vector<std::uint32_t> fieldAligns;
+        // D-CSUBSET-PACKED (C/C23 `__attribute__((packed))` / `[[gnu::packed]]`): the
+        // WHOLE-COMPOSITE packed flag. When true, `computeLayout` feeds a natural
+        // baseline alignment of 1 into every field (removing ALL inter-field padding)
+        // and the aggregate's own alignment starts at 1 — a member `alignas` still
+        // RAISES per-field via the unchanged MAX-fold (alignas wins per-field). A
+        // SEPARATE channel from `fieldAligns`/`fieldOffsets`: packed is per-COMPOSITE,
+        // the spans are per-FIELD. `false` = ordinary padded layout (every existing
+        // composite → byte-identical TypeId — packed enters `contentDeclSiteKey`
+        // GUARDED on true, exactly like offsets/aligns). packed + explicit offsets is
+        // contradictory (offsets place fields wholesale) → fail loud at completion.
+        bool                      packed      = false;
         std::uint64_t             declSiteKey = 0;   // the nominal-identity discriminator
         bool                      complete    = false;
     };

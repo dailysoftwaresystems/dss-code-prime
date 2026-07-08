@@ -4,6 +4,7 @@
 #include "analysis/semantic/constant_symbol_fold.hpp" // Item 1: shared enum/constant Ref->literal builder
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/type_rules.hpp"      // FC3 c1: usualArithmeticCommonType / resolveArithmeticRules
+#include "core/types/attribute_naming.hpp"       // D-CSUBSET-PACKED (F4): stripDunder
 #include "core/types/data_model.hpp"
 #include "core/types/decl_prefix_strip.hpp"     // declRoleChildren / descendVisibleDecl / specifierPrefixChild
 #include "core/types/declarator_walk.hpp"       // FC4: collectDeclarators / declaratorNameNode
@@ -900,6 +901,32 @@ struct Lowerer {
     // (D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC). Agnostic: BOTH the effect
     // map and the ignored-kind set are per-language config; the engine compares
     // resolved SchemaTokenIds + source text, never a hardcoded kind/identity.
+    // D-CSUBSET-PACKED (F4): does the attribute subtree `n` NAME a `packed` attribute?
+    // A bounded DFS for an identifier leaf matching the language's
+    // `packedAttributeNames`, dunder-normalized via the shared `stripDunder`
+    // (`__packed__` ≡ `packed`; `[[gnu::packed]]`'s final segment matches). Used to
+    // fail loud on a leading (UNHONORED) packed spelling that the linkage scan would
+    // otherwise skip wholesale. Config-driven; nothing hardcodes "packed".
+    [[nodiscard]] bool subtreeNamesPacked(NodeId n) const {
+        if (sem.packedAttributeNames.empty() || !sem.identifierToken.valid())
+            return false;
+        std::vector<NodeId> stack{n};
+        for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
+            NodeId const cur = stack.back();
+            stack.pop_back();
+            if (isToken(cur)) {
+                if (tree().tokenKind(cur).v == sem.identifierToken.v) {
+                    std::string_view const id = stripDunder(tree().text(cur));
+                    for (std::string const& nm : sem.packedAttributeNames)
+                        if (id == nm) return true;
+                }
+                continue;
+            }
+            for (NodeId c : visible(cur)) stack.push_back(c);
+        }
+        return false;
+    }
+
     [[nodiscard]] LinkageAttr linkageFrom(NodeId prefixNode, DeclarationRule const& decl,
                                           bool* staticStorageOut = nullptr) {
         LinkageAttr attr{};
@@ -924,7 +951,28 @@ struct Lowerer {
                 for (RuleId rid : decl.linkageSpecifierIgnoredRules) {
                     if (tree().rule(n).v == rid.v) { skip = true; break; }
                 }
-                if (skip) continue;
+                if (skip) {
+                    // D-CSUBSET-PACKED (F4): a `packed` spelling in the LEADING
+                    // declaration-specifier position (`[[gnu::packed]] struct S …`) is
+                    // UNHONORED — packed is honored only in the TRAILING composite-
+                    // attribute slot (`struct S {…} __attribute__((packed))`). The
+                    // wholesale ignored-rule skip above would silently DROP it, leaving
+                    // the struct PADDED — a program that relies on packing would be
+                    // miscompiled. Fail loud instead, SYMMETRIC with the leading
+                    // `__attribute__((packed))` case (which already resolves to
+                    // H_UnknownLinkageSpecifier via the recognized-specifier path, since
+                    // attrSpec is NOT in the ignored set). ONLY fires on a `packed`
+                    // spelling; every other ignorable attribute (`[[deprecated]]`,
+                    // `[[nodiscard]]`) stays silently ignored (the standard-attribute
+                    // contract). Source-agnostic: the packed names are per-language config.
+                    if (subtreeNamesPacked(n)) {
+                        emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
+                              "'packed' is not honored as a leading attribute here — "
+                              "place __attribute__((packed)) / [[gnu::packed]] AFTER "
+                              "the struct/union body");
+                    }
+                    continue;
+                }
                 auto const kids = visible(n);
                 for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
                     stack.push_back(*it);   // reverse-push → source order

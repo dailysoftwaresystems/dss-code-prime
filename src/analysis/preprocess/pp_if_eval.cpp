@@ -1,5 +1,6 @@
 #include "analysis/preprocess/pp_if_eval.hpp"
 
+#include "core/types/attribute_naming.hpp"   // stripDunder (shared with the packed scan)
 #include "core/types/char_decode.hpp"
 #include "core/types/hir_lowering_config.hpp"
 #include "core/types/number_decode.hpp"
@@ -635,17 +636,10 @@ private:
 
 } // namespace
 
-// FC15c: strip the leading + trailing `__` of a `__name__` dunder spelling
-// (C 6.10.1: the `__has_c_attribute` lookup ignores a surrounding double
-// underscore, so `__deprecated__` matches a declared `deprecated`). A name
-// that is not in `__x__` form is returned unchanged.
-[[nodiscard]] std::string_view stripDunder(std::string_view name) {
-    if (name.size() >= 4 && name.substr(0, 2) == "__"
-        && name.substr(name.size() - 2) == "__") {
-        return name.substr(2, name.size() - 4);
-    }
-    return name;
-}
+// FC15c: `stripDunder` (the `__name__` dunder normalizer) now lives in the shared
+// `core/types/attribute_naming.hpp` so the composite type-attribute scan
+// (D-CSUBSET-PACKED) uses the SAME normalizer — the two can never drift. Behavior
+// is byte-identical to the former local definition.
 
 // FC15c: look up `attr` in the schema's KNOWN-attribute set, trying both the
 // raw spelling and the dunder-stripped form. Returns the reported version int,

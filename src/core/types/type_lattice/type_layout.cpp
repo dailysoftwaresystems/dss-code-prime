@@ -375,10 +375,24 @@ computeLayout(TypeId id, TypeInterner const& interner,
                 out.size = out.align.alignUp(extent);
                 return out;
             }
+            // D-CSUBSET-PACKED: the whole-composite packed flag (C/C23
+            // `__attribute__((packed))`) removes ALL derived inter-field padding —
+            // the per-field baseline alignment becomes 1 — and the aggregate's own
+            // alignment stays 1 (out.align already seeded to 1). Read once; fed into
+            // `effectiveAlign`'s baseline below. An UNPACKED struct leaves `packed`
+            // false and the baseline is the field's natural align (the unchanged path).
+            bool const packed = interner.isPacked(id);
             // FC8 bitfields (D-CSUBSET-BITFIELD): a bitfield-free struct interns
             // with EMPTY scalars (see TypeInterner::structType), so this O(1) test
             // routes every existing struct down the unchanged byte path below.
             bool const anyBitfield = !interner.scalars(id).empty();
+            // D-CSUBSET-PACKED F5 belt (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the
+            // packed baseline is applied ONLY on the non-bit-field path (the
+            // `effectiveAlign` lambda below). A packed struct reaching the bit-field
+            // packer would silently get a NON-packed layout, so fail loud here
+            // (nullopt → positioned diag). The semantic `S_PackedBitfieldUnsupported`
+            // is the good-UX front door; this nullopt is the reliable backstop.
+            if (packed && anyBitfield) return std::nullopt;
             if (!anyBitfield) {
                 // D-CSUBSET-MEMBER-ALIGNAS: a struct may carry per-field `alignas`
                 // overrides. Read them once here; `effectiveAlign` folds field i's
@@ -389,15 +403,21 @@ computeLayout(TypeId id, TypeInterner const& interner,
                 bool const hasAligns = interner.hasExplicitAligns(id);
                 auto effectiveAlign =
                     [&](std::size_t i, Alignment natural) -> std::optional<Alignment> {
-                    if (!hasAligns) return natural;
+                    // D-CSUBSET-PACKED: a packed composite removes all derived padding
+                    // — the per-field BASELINE alignment becomes 1. A member `alignas`
+                    // still RAISES it via the MAX-fold below (alignas wins per-field
+                    // even under packed — `alignas(8) int x;` in a packed struct keeps
+                    // 8-byte alignment).
+                    Alignment const baseline = packed ? Alignment::of<1>() : natural;
+                    if (!hasAligns) return baseline;
                     std::uint32_t const ovr = interner.explicitFieldAlign(id, i);
-                    if (ovr == 0) return natural;   // no override on this field
+                    if (ovr == 0) return baseline;   // no override on this field
                     // A stored override must be a power of two in [1, 256]; a value
                     // outside that is an upstream (alignas-semantics) bug — fail loud
                     // rather than silently mis-pad.
                     auto const a = Alignment::fromBytes(ovr);
                     if (!a) return std::nullopt;
-                    return maxAlign(natural, *a);
+                    return maxAlign(baseline, *a);
                 };
                 std::uint64_t off = 0;
                 for (std::size_t i = 0; i < fields.size(); ++i) {
@@ -467,7 +487,18 @@ computeLayout(TypeId id, TypeInterner const& interner,
             // arm needs only the fail-loud gate (an unrealized/undeclared
             // strategy → nullopt), not a per-strategy dispatch. Empty scalars ⇒
             // no bitfield ⇒ the unchanged byte path.
+            // D-CSUBSET-PACKED: a packed union (`union {…} __attribute__((packed))`)
+            // has natural alignment 1 — the members already sit at offset 0, so packed
+            // only lowers the union's OWN alignment (and thus how it aligns when
+            // embedded). Read once; fed into effectiveAlign's baseline below.
+            bool const packed = interner.isPacked(id);
             bool const anyBitfield = !interner.scalars(id).empty();
+            // D-CSUBSET-PACKED F5 belt (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the
+            // packed baseline is applied ONLY on the non-bit-field path below. A
+            // packed union carrying a bit-field member would silently get a NON-packed
+            // alignment, so fail loud here (the semantic S_PackedBitfieldUnsupported is
+            // the front door; this nullopt is the backstop).
+            if (packed && anyBitfield) return std::nullopt;
             if (anyBitfield) {
                 if (!bitFieldStrategyRealized(params.bitFieldStrategy))
                     return std::nullopt;
@@ -484,12 +515,15 @@ computeLayout(TypeId id, TypeInterner const& interner,
             bool const hasAligns = interner.hasExplicitAligns(id);
             auto effectiveAlign =
                 [&](std::size_t i, Alignment natural) -> std::optional<Alignment> {
-                if (!hasAligns) return natural;
+                // D-CSUBSET-PACKED: a packed union removes the per-member baseline
+                // alignment (→ 1); a member `alignas` still RAISES it via the MAX-fold.
+                Alignment const baseline = packed ? Alignment::of<1>() : natural;
+                if (!hasAligns) return baseline;
                 std::uint32_t const ovr = interner.explicitFieldAlign(id, i);
-                if (ovr == 0) return natural;   // no override on this member
+                if (ovr == 0) return baseline;   // no override on this member
                 auto const a = Alignment::fromBytes(ovr);
                 if (!a) return std::nullopt;    // stored non-pow2/>256 = upstream bug
-                return maxAlign(natural, *a);
+                return maxAlign(baseline, *a);
             };
             std::uint64_t maxSize = 0;
             for (std::size_t i = 0; i < fields.size(); ++i) {

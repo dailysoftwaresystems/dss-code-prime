@@ -146,6 +146,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_AlignasInvalidContext";
         case DiagnosticCode::S_AlignasNonConstant:
             return "S_AlignasNonConstant";
+        case DiagnosticCode::S_UnknownTypeAttribute:
+            return "S_UnknownTypeAttribute";
+        case DiagnosticCode::S_PackedBitfieldUnsupported:
+            return "S_PackedBitfieldUnsupported";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

@@ -4,9 +4,11 @@
 // scalar, name, and extensionKind — recursing bottom-up, memoizing per srcId,
 // and letting the host's hash-consing dedup structurally-identical types.
 
+#include "core/types/data_model.hpp"
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_lattice.hpp"
+#include "core/types/type_lattice/type_layout.hpp"   // D-CSUBSET-PACKED: packed layout survives
 #include "core/types/type_lattice/type_reintern.hpp"
 
 #include <gtest/gtest.h>
@@ -260,7 +262,7 @@ TEST(TypeReintern, SelfReferentialStructTerminatesAndReproduces) {
     const TypeId n   = src.forwardComposite(TypeKind::Struct, "N", /*declSiteKey=*/9);
     const TypeId ptrN = src.pointer(n);
     std::array<TypeId, 2> const fields{ptrN, i32};   // { N* next; int v; }
-    src.completeComposite(n, fields);
+    src.completeComposite(n, fields, /*packed=*/false);
 
     TypeLattice host{CompilationUnitId{2}};
     std::unordered_map<std::uint32_t, TypeId> remap;
@@ -353,4 +355,37 @@ TEST(TypeReintern, MemberAlignsSurviveReintern) {
     EXPECT_EQ(hi.explicitFieldAlign(hs, 0), 16u);
     ASSERT_EQ(hi.operands(hs).size(), 1u);
     EXPECT_EQ(hi.kind(hi.operands(hs)[0]), TypeKind::I32);
+}
+
+// D-CSUBSET-PACKED (F2): the whole-composite packed flag must SURVIVE re-intern —
+// without threading it through the destination completeComposite, a packed struct
+// crossing a CU/round-trip boundary reinterns as UNPACKED (padded), a silent ABI
+// miscompile. RED-ON-DISABLE: drop `src.isPacked(srcId)` from the reintern
+// completeComposite call and `isPacked` on the host is false + the layout re-pads.
+TEST(TypeReintern, PackedFlagSurvivesReintern) {
+    TypeInterner src{CompilationUnitId{1}};
+    // struct S { char c; uint32_t v; } __attribute__((packed));  // size 5, align 1
+    std::array<TypeId, 2> const fields{src.primitive(TypeKind::Char),
+                                       src.primitive(TypeKind::U32)};
+    const TypeId s = src.forwardComposite(TypeKind::Struct, "S", /*declSiteKey=*/7);
+    src.completeComposite(s, fields, /*packed=*/true);
+    ASSERT_TRUE(src.isPacked(s));
+
+    TypeLattice host{CompilationUnitId{2}};
+    auto& hi = host.interner();
+    std::unordered_map<std::uint32_t, TypeId> remap;
+    const TypeId hs = reinternType(src, s, host, remap);
+
+    ASSERT_TRUE(hs.valid());
+    ASSERT_EQ(hi.kind(hs), TypeKind::Struct);
+    EXPECT_TRUE(hi.isPacked(hs))
+        << "the packed flag must NOT be dropped through re-intern (silent ABI drop)";
+    // The packed LAYOUT survives too: char@0, v@1 (no padding) → size 5, align 1.
+    constexpr AggregateLayoutParams params{ScalarAlignmentRule::Natural, 16};
+    auto const l = computeLayout(hs, hi, params, DataModel::Lp64);
+    ASSERT_TRUE(l.has_value());
+    EXPECT_EQ(l->size, 5u);
+    EXPECT_EQ(l->align.bytes(), 1u);
+    ASSERT_EQ(l->fieldOffsets.size(), 2u);
+    EXPECT_EQ(l->fieldOffsets[1], 1u);
 }
