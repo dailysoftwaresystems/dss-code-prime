@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 79> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 80> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -129,6 +129,13 @@ constexpr std::array<DiagnosticCode, 79> kUnsuppressableCodes{{
     DiagnosticCode::H_UnsupportedLoweringForKind,
     DiagnosticCode::H_ExternHasInitializer,
     DiagnosticCode::H_ExternDeclMalformed,
+    // H_WideCharSurrogateUnsupported (C11/C23 6.4.5, wide/UTF string literals):
+    // a code point that cannot be represented in the requested element width
+    // without truncation (astral under a 16-bit element, ill-formed UTF-8, or
+    // cp > U+10FFFF). Same silent-miscompile class as H_UnsupportedLoweringForKind
+    // — suppressing it would let a wrong/truncated code unit ship green. Emits an
+    // Error HIR node + fails the gate via errorCount.
+    DiagnosticCode::H_WideCharSurrogateUnsupported,
 
     // I_* MIR-verifier band — frozen-module invariants. A suppressed
     // violation here would let a miscompile sail past the verifier.

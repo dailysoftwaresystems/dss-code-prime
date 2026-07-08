@@ -174,6 +174,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_SehJumpIntoRegion:        return "H_SehJumpIntoRegion";
         case DiagnosticCode::H_SehEarlyExit:             return "H_SehEarlyExit";
         case DiagnosticCode::H_SehLabelAddress:          return "H_SehLabelAddress";
+        case DiagnosticCode::H_WideCharSurrogateUnsupported: return "H_WideCharSurrogateUnsupported";
         case DiagnosticCode::I_VerifierFailure:          return "I_VerifierFailure";
         case DiagnosticCode::I_NoEntryBlock:             return "I_NoEntryBlock";
         case DiagnosticCode::I_MultipleEntryBlocks:      return "I_MultipleEntryBlocks";

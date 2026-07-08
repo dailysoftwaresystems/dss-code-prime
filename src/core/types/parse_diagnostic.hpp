@@ -808,6 +808,16 @@ enum class DiagnosticCode : std::uint16_t {
     //   naming a label inside any part of a __try statement — a computed goto
     //   could then enter the guarded range undetectably at compile time.
     H_SehLabelAddress             = 0xF011,
+    // H_WideCharSurrogateUnsupported (C11/C23 6.4.5): a wide/UTF string literal
+    //   whose CST→HIR lowering could not represent a code point in the requested
+    //   element width WITHOUT truncation. Three triggers, all fail-loud (never a
+    //   silent wrong code unit): (1) a supplementary-plane code point (> U+FFFF)
+    //   under a 16-bit element (`u"…"` / pe-`L"…"`) — surrogate pairs are a LATER
+    //   cycle; (2) ill-formed UTF-8 in the (escape-decoded) body bytes; (3) a code
+    //   point past U+10FFFF. The `actual` names the offending code point / reason.
+    //   An `Error` HIR node is emitted as a recovery sentinel and lowering
+    //   continues (collect-all), exactly like H_UnsupportedLoweringForKind.
+    H_WideCharSurrogateUnsupported = 0xF012,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,

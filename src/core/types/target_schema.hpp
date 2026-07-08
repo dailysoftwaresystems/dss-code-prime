@@ -3,6 +3,7 @@
 #include "core/export.hpp"
 #include "core/substrate/transparent_string_hash.hpp"
 #include "core/types/aggregate_layout.hpp"  // FC6: AggregateLayoutParams
+#include "core/types/enum_name_table.hpp"  // EnumNameTable (extracted; breaks the leaf-enum cycle)
 #include "core/types/grammar_schema.hpp"   // ConfigDiagnostic + LoadResult
 #include "core/types/strong_ids.hpp"
 #include "core/types/type_lattice/core_type.hpp"  // TypeKind for regClassForCoreType
@@ -52,34 +53,9 @@ namespace dss {
 // sources of truth that must agree (simplifier review's "two ways
 // to parse an enum string").
 //
-// This template gives ONE source of truth (the `kXxxTable` array)
-// and derives both helpers from it. Adding a new enumerator: one
-// row in the table, no helper edits. The `entry == e` lookup is
-// linear but the enums are tiny (<= ~12 entries) and the helpers
-// are constexpr — the cost is one branch per entry, eliminated by
-// the compiler on constant evaluation.
-template <typename E, std::size_t N>
-struct EnumNameTable {
-    std::array<std::pair<E, std::string_view>, N> rows;
-
-    [[nodiscard]] constexpr std::string_view name(E e) const noexcept {
-        for (auto const& r : rows) {
-            if (r.first == e) return r.second;
-        }
-        // Fall-back returns the FIRST row's string — semantically a
-        // sentinel "unknown/invalid". Each enum's `name()` historically
-        // had its own fall-back string; using row 0 means each enum
-        // controls its fall-back by ordering the table.
-        return rows[0].second;
-    }
-
-    [[nodiscard]] constexpr std::optional<E> fromName(std::string_view s) const noexcept {
-        for (auto const& r : rows) {
-            if (r.second == s) return r.first;
-        }
-        return std::nullopt;
-    }
-};
+// `EnumNameTable` now lives in `core/types/enum_name_table.hpp` (extracted so leaf
+// enum headers can use it without the target_schema→grammar_schema include cycle);
+// it is included above and re-exported here for the eight tables below.
 
 // ABI model — selects the lowering shape downstream consumers (ML6
 // regalloc, ML7 calling-convention lowering, AS1 assembler) expect.

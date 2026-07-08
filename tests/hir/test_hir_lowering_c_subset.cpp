@@ -2249,6 +2249,166 @@ TEST(HirLoweringCSubset, AdjacentStringsConcatEscapeBoundary) {
     EXPECT_EQ(ti.scalars(ty)[0], 3) << "\"A1\" (2 bytes) + NUL";
 }
 
+// ── C11/C23 6.4.5: wide / UTF string literals (L"…"/u"…"/U"…"/u8"…") ─────────
+// A prefixed string types as Array<elementCore, codeUnits+1> and its literal pool
+// value carries the element-width-encoded (LE) code units. The narrow path is
+// unchanged; these assert the wide element core, the encoded byte blob, and the
+// astral fail-loud (surrogate pairs are a later cycle).
+
+TEST(HirLoweringCSubset, Utf16StringElementAndBytes) {
+    // `u"AB"` → Array<U16,3>; bytes = 41 00 42 00 (2 LE U16 units), NUL implied.
+    SemanticModel model = analyzeCSubset("void f() { u\"AB\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U16);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value), std::string({0x41, 0x00, 0x42, 0x00}))
+        << "u\"AB\" = two LE 16-bit units 0x0041 0x0042";
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3) << "2 code units + wide NUL";
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::U16);
+}
+
+TEST(HirLoweringCSubset, Utf32StringElementAndBytes) {
+    // `U"AB"` → Array<U32,3>; bytes = 41 00 00 00 42 00 00 00.
+    SemanticModel model = analyzeCSubset("void f() { U\"AB\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U32);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value),
+              std::string({0x41, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00}));
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::U32);
+}
+
+TEST(HirLoweringCSubset, Utf8StringElementAndBytes) {
+    // `u8"AB"` → Array<U8,3> (1 byte/ASCII unit); bytes = 41 42.
+    SemanticModel model = analyzeCSubset("void f() { u8\"AB\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U8);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value), "AB");
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3) << "2 u8 units + NUL";
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::U8);
+}
+
+TEST(HirLoweringCSubset, Utf16BmpMultibyteDecodesToOneUnit) {
+    // `u"€"` — U+20AC, source bytes E2 82 AC — UTF-8-decodes to ONE U16 unit.
+    // THE witness that the tokenizer's raw bytes are UTF-8-decoded (not passed
+    // through byte-for-byte): 3 source bytes → 1 code unit → Array<U16,2>.
+    SemanticModel model = analyzeCSubset("void f() { u\"\xe2\x82\xac\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U16);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value), std::string({static_cast<char>(0xAC), 0x20}))
+        << "U+20AC as one LE 16-bit unit";
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 2) << "ONE code unit + NUL (NOT 3 bytes + NUL)";
+}
+
+TEST(HirLoweringCSubset, Utf16AstralFailsLoud) {
+    // `u"😀"` — U+1F600 (F0 9F 98 80), a supplementary-plane cp under a 16-bit
+    // element. Surrogate pairs are a LATER cycle: this MUST fail loud
+    // (H_WideCharSurrogateUnsupported), NEVER silently truncate to a wrong unit.
+    SemanticModel model = analyzeCSubset("void f() { u\"\xf0\x9f\x98\x80\"; }");
+    // The analyzer leaves the astral literal untyped (no wrong size); HIR emits
+    // the fail-loud diagnostic + an Error node, so lowering is NOT ok.
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "an unrepresentable astral wide-string must fail lowering";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideCharSurrogateUnsupported), 1u)
+        << "exactly the surrogate-unsupported code, never a silent wrong unit";
+}
+
+TEST(HirLoweringCSubset, NarrowStringUnchangedUnderPrefixTable) {
+    // Regression: a bare `"AB"` still types Array<Char,3> with the raw bytes —
+    // the prefix table's auto-seeded narrow row is byte-identical to before.
+    SemanticModel model = analyzeCSubset("void f() { \"AB\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::Char);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value), "AB");
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::Char);
+}
+
+TEST(HirLoweringCSubset, WideStringRoundTripsThroughDsshirText) {
+    // F6: a `u"AB"` literal's element core (U16) must survive the .dsshir
+    // emit→parse round-trip. `literalCoreFor` reads the core off the Array element
+    // (NOT a hardcoded Char), so the re-parsed pool value carries U16, not Char.
+    SemanticModel model = analyzeCSubset("void f() { u\"AB\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    std::vector<std::string> names = symbolNames(model);
+    HirTextContext ctx;
+    ctx.interner    = &model.lattice().interner();
+    ctx.symbolNames = &names;
+    ctx.literalPool = &res->literalPool;
+    DiagnosticReporter er;
+    std::string const out = emitHir(res->hir, ctx, er);
+
+    DiagnosticReporter pr;
+    auto parsed = parseHir(out, CompilationUnitId{1}, pr);
+    std::string diags;
+    for (auto const& d : pr.all())
+        diags += std::string{diagnosticCodeName(d.code)} + ": " + d.actual + "\n";
+    ASSERT_TRUE(parsed->ok) << "u\"AB\" did not round-trip/verify\n" << diags;
+    ASSERT_EQ(parsed->literalPool.size(), 1u);
+    EXPECT_EQ(parsed->literalPool.at(0).core, TypeKind::U16)
+        << "the re-parsed wide-string core must be U16 (read off the Array element, "
+           "NOT hardcoded Char)";
+}
+
 // ── golden ────────────────────────────────────────────────────────────────
 
 namespace {

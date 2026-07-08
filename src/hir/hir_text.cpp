@@ -1288,11 +1288,20 @@ private:
         else malformed(std::format("unknown literal value tag '{}'", tag));
         return v;
     }
-    // The pool `core` for a parsed value: a string literal's element core is
-    // Char (its node type is Array<Char,N+1>); a bool is Bool; monostate is
-    // Void; everything else mirrors the node's resolved type kind.
+    // The pool `core` for a parsed value: a string literal's element core is the
+    // ELEMENT of its `Array<core,N+1>` node type — Char for a narrow `"…"`, but
+    // U16/U32/U8 for a C11/C23 6.4.5 wide/UTF literal (`u"…"`/`U"…"`/`u8"…"`), so it
+    // is read off the array element, NOT hardcoded (a hardcode would re-emit a wide
+    // literal as Char and silently mis-round-trip its width). A bool is Bool;
+    // monostate is Void; everything else mirrors the node's resolved type kind.
     [[nodiscard]] TypeKind literalCoreFor(TypeId t, HirLiteralValue const& v) const {
-        if (std::holds_alternative<std::string>(v.value))   return TypeKind::Char;
+        if (std::holds_alternative<std::string>(v.value)) {
+            if (t.valid() && interner_.kind(t) == TypeKind::Array) {
+                if (auto const ops = interner_.operands(t); !ops.empty() && ops[0].valid())
+                    return interner_.kind(ops[0]);
+            }
+            return TypeKind::Char;   // untyped / non-array fallback (narrow default)
+        }
         if (std::holds_alternative<bool>(v.value))          return TypeKind::Bool;
         if (std::holds_alternative<std::monostate>(v.value)) return TypeKind::Void;
         return t.valid() ? interner_.kind(t) : TypeKind::Void;

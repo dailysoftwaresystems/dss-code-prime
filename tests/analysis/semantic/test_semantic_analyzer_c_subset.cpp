@@ -222,6 +222,97 @@ TEST(SemanticAnalyzerCSubset, ExplicitArraySizeUnchangedByInference) {
         << "an explicit [N] must keep N — inference only fills an empty []";
 }
 
+// ── C11/C23 6.4.5: wide / UTF string-literal TYPING (element core per opener) ──
+namespace {
+// The TypeId stamped on the first `stringLiteralExpr` rule node in `cu`'s tree
+// (the whole, possibly-concatenated literal). InvalidType if none / untyped.
+[[nodiscard]] TypeId firstStringLiteralType(SemanticModel const& model,
+                                            CompilationUnit const& cu) {
+    Tree const& tree = cu.trees()[0];
+    RuleId const slit = tree.schema().rules().find("stringLiteralExpr");
+    TypeId found{};
+    walkPreOrder(tree, [&](TreeCursor const& c) {
+        NodeId const n = c.current();
+        if (tree.kind(n) == NodeKind::Internal && slit.valid()
+            && tree.rule(n).v == slit.v && !found.valid()) {
+            found = model.typeAt(n);
+        }
+    });
+    return found;
+}
+} // namespace
+
+// `u"AB"` → Array<U16,3>; `U"AB"` → Array<U32,3>; `u8"AB"` → Array<U8,3>.
+TEST(SemanticAnalyzerCSubset, WideStringLiteralElementCorePerOpener) {
+    struct Case { char const* src; TypeKind core; std::int64_t len; };
+    for (auto const& tc : {Case{"void f(){ u\"AB\"; }",  TypeKind::U16, 3},
+                           Case{"void f(){ U\"AB\"; }",  TypeKind::U32, 3},
+                           Case{"void f(){ u8\"AB\"; }", TypeKind::U8,  3},
+                           Case{"void f(){ \"AB\"; }",   TypeKind::Char, 3}}) {
+        auto cu = buildShippedUnit("c-subset", { tc.src });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        ASSERT_FALSE(model.hasErrors()) << tc.src;
+        auto const& ti = model.lattice().interner();
+        TypeId const ty = firstStringLiteralType(model, *cu);
+        ASSERT_TRUE(ty.valid()) << tc.src;
+        ASSERT_EQ(ti.kind(ty), TypeKind::Array) << tc.src;
+        EXPECT_EQ(ti.kind(ti.operands(ty)[0]), tc.core) << tc.src;
+        EXPECT_EQ(ti.scalars(ty)[0], tc.len) << tc.src;
+    }
+}
+
+// `u"€"` (source bytes E2 82 AC) → ONE U16 unit → Array<U16,2> (NOT 3 bytes + NUL).
+// The semantic tier UTF-8-decodes the raw bytes for the CODE-UNIT count, the same
+// shared encoder the HIR tier uses — so both agree on N.
+TEST(SemanticAnalyzerCSubset, WideStringBmpMultibyteCodeUnitCount) {
+    auto cu = buildShippedUnit("c-subset", { "void f(){ u\"\xe2\x82\xac\"; }" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    ASSERT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const ty = firstStringLiteralType(model, *cu);
+    ASSERT_TRUE(ty.valid());
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::U16);
+    EXPECT_EQ(ti.scalars(ty)[0], 2) << "U+20AC is ONE code unit + NUL";
+}
+
+// wchar_t (`L"…"`) width is FORMAT-keyed (D-FFI-STDDEF-WCHAR-PE-WIDTH): the
+// format-agnostic default (direct-API) resolves to I32 (POSIX); the PE format
+// resolves to U16 (Windows UTF-16 unit). This is CONFIG-DRIVEN — the
+// `elementCoreByFormat` map on the WideStringStart prefix row decides it via a
+// pure `resolveElementCore` lookup, NOT a hardcoded format branch.
+TEST(SemanticAnalyzerCSubset, WideCharLiteralWidthIsFormatKeyed) {
+    // Default (activeFormat=nullopt) → I32.
+    {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ L\"AB\"; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        ASSERT_FALSE(model.hasErrors());
+        auto const& ti = model.lattice().interner();
+        TypeId const ty = firstStringLiteralType(model, *cu);
+        ASSERT_TRUE(ty.valid());
+        ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+        EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::I32)
+            << "wchar_t defaults to the POSIX i32 width";
+    }
+    // PE format → U16.
+    {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ L\"AB\"; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DataModel::Llp64, std::nullopt, std::nullopt,
+                             ObjectFormatKind::Pe);
+        ASSERT_FALSE(model.hasErrors());
+        auto const& ti = model.lattice().interner();
+        TypeId const ty = firstStringLiteralType(model, *cu);
+        ASSERT_TRUE(ty.valid());
+        ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+        EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::U16)
+            << "wchar_t on PE is the u16 Windows UTF-16 code unit";
+    }
+}
+
 // (5) A `[]` with NO initializer is NOT silently sized — the resolver's
 // S_NonConstantArrayLength still fires (inference is gated on an initializer
 // being present, so a bare `int x[];` is unaffected by c34).

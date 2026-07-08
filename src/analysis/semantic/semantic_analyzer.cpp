@@ -24,6 +24,7 @@
 #include "core/types/type_lattice/type_layout.hpp"  // FC6: computeLayout (sizeof in array dims)
 #include "core/types/char_decode.hpp"  // C 6.4.5: decodeStringLiteralBody (string-literal typing)
 #include "core/types/string_literal_decode.hpp"  // C 5.1.1.2 phase 6: decodeAdjacentStringBodies (THE chokepoint, shared with HIR)
+#include "core/types/wide_string_encode.hpp"  // C 6.4.5: encodeWideString (wide/UTF code-unit count, shared with HIR)
 #include "ffi/shipped_lib_descriptor.hpp"   // FF11 neutral-JSON descriptor reader
 #include "hir/cst_const_eval.hpp"
 #include "hir/hir_text.hpp"   // c104: parseTypeFromText (builtin signatureText decode)
@@ -132,6 +133,17 @@ struct SchemaIndexes {
     // token / Void core) when the language declares no string-array row (toy/tsql).
     SchemaTokenId                                  stringLiteralBodyToken{};
     TypeKind                                       stringLiteralElementCore = TypeKind::Void;
+    // C11/C23 6.4.5: a prefixed string literal (`L"…"`/`u"…"`/`U"…"`/`u8"…"`) types
+    // as `Array<elementCore, N+1>` where the element core is keyed by the literal's
+    // ACTUAL opener token kind. Built from the language's `hirLowering`
+    // `stringLiteralPrefixes` at index-build time; WideStringStart (wchar_t) is
+    // FORMAT-resolved here (pe→U16, elf/macho→I32, D-FFI-STDDEF-WCHAR-PE-WIDTH)
+    // because THIS tier has `activeFormat`. Empty ⇒ the language declares no
+    // prefixes (the scalar `stringLiteralElementCore` narrow default applies). The
+    // HIR tier reads the element core BACK off the stamped node type (it lacks
+    // format), so this map is the single format-aware resolution point.
+    std::unordered_map<std::uint32_t /*opener SchemaTokenId.v*/, TypeKind>
+                                                   stringLiteralElementCoreByStart;
     // C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): the rule whose
     // subtree is a (possibly adjacent-concatenated) string-literal expression.
     // When valid, the string's `Array<core, N+1>` type is stamped on this RULE
@@ -3304,10 +3316,24 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
             && r.v == idx.stringLiteralExprRule.v) {
             if (auto decoded = decodeAdjacentStringBodies(
                     tree, c, idx.stringLiteralBodyToken)) {
-                return interner.array(
-                    elem, static_cast<std::int64_t>(decoded->size() + 1));
+                // C 6.7.9: the length is the code-unit count in the DECLARED
+                // element's width. Narrow (`char buf[]="…"`) → byte count
+                // (unchanged). A wide element (`wchar_t buf[]=L"…"`) re-encodes the
+                // raw bytes so the count is code units — the SAME shared encoder
+                // the literal's own type uses. A wide encode error stays incomplete
+                // (fail loud later), exactly like a malformed escape.
+                TypeKind const ek = interner.kind(elem);
+                if (ek == TypeKind::Char || ek == TypeKind::Byte) {
+                    return interner.array(
+                        elem, static_cast<std::int64_t>(decoded->size() + 1));
+                }
+                WideEncodeResult enc;
+                if (!encodeWideString(*decoded, ek, enc)) {
+                    return interner.array(
+                        elem, static_cast<std::int64_t>(enc.codeUnits + 1));
+                }
             }
-            return declTy;   // malformed escape — stay incomplete, fail loud later
+            return declTy;   // malformed escape / wide encode error — stay incomplete
         }
         if (idx.braceInitListRule.valid() && idx.initElementRule.valid()
             && r.v == idx.braceInitListRule.v) {
@@ -4399,6 +4425,49 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
     return tree.rule(p).v == s.idx().stringLiteralExprRule.v;
 }
 
+// C11/C23 6.4.5: the element core of a string-literal node, keyed by its ACTUAL
+// opener token (the FIRST direct child token whose kind is in the per-opener map).
+// `L"`/`u"`/`U"`/`u8"` map to their declared/format-resolved core; the narrow `"`
+// (and any grammar without a prefix table) falls back to `stringLiteralElementCore`.
+// The opener is a DIRECT child token (the inline-alt opener pushes it flat), so a
+// single child scan finds it — no rule descent. `owningNode` is the
+// stringLiteralExpr rule node (openers are its children) OR a body-token's parent.
+[[nodiscard]] TypeKind stringLiteralElementCoreOf(EngineState const& s, Tree const& tree,
+                                                  NodeId owningNode) {
+    auto const& byStart = s.idx().stringLiteralElementCoreByStart;
+    if (!byStart.empty() && owningNode.valid()
+        && tree.kind(owningNode) == NodeKind::Internal) {
+        for (NodeId c : visibleChildren(tree, owningNode)) {
+            if (tree.kind(c) != NodeKind::Token) continue;
+            auto it = byStart.find(tree.tokenKind(c).v);
+            if (it != byStart.end()) return it->second;
+        }
+    }
+    return s.idx().stringLiteralElementCore;
+}
+
+// C 6.4.5: the `Array<elementCore, N+1>` type of a string literal whose
+// escape-decoded bytes are `decodedBytes`. For the NARROW core (Char/Byte) N is
+// the byte length (unchanged path). For a WIDE core (U8/U16/U32/I32) the raw bytes
+// are UTF-8-decoded and re-encoded so N is the ELEMENT-width CODE-UNIT count — the
+// SAME `encodeWideString` the HIR tier runs, so both tiers agree on N. A wide
+// encode error (ill-formed UTF-8 / astral-under-U16 / cp>0x10FFFF) returns
+// InvalidType: the node stays untyped, the semantic phase already surfaces the
+// fault at the HIR tier's fail-loud, and a `sizeof` of it fails loud (never a
+// guessed size). Narrow strings never reach the wide path (byte-identical).
+[[nodiscard]] TypeId stringLiteralArrayType(EngineState& s, std::string const& decodedBytes,
+                                            TypeKind elementCore) {
+    TypeInterner& interner = s.lattice.interner();
+    if (elementCore == TypeKind::Char || elementCore == TypeKind::Byte) {
+        return interner.array(interner.primitive(elementCore),
+                              static_cast<std::int64_t>(decodedBytes.size() + 1));
+    }
+    WideEncodeResult enc;
+    if (encodeWideString(decodedBytes, elementCore, enc)) return InvalidType;   // fail loud later
+    return interner.array(interner.primitive(elementCore),
+                          static_cast<std::int64_t>(enc.codeUnits + 1));
+}
+
 // C 6.7.9p14 (D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): is the initializer subtree
 // a STRING LITERAL (`= "..."`)? Descends the SINGLE-child wrapper chain from the
 // init node (initValue → expression → operand → … → stringLiteralExpr) — the same
@@ -4543,11 +4612,16 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                  && tk == s.idx().stringLiteralBodyToken
                  && !parentIsStringLiteralExprRule(s, tree, node)) {
             if (auto decoded = decodeStringLiteralBody(tree.text(node))) {
-                TypeId const elem = s.lattice.interner()
-                                        .primitive(s.idx().stringLiteralElementCore);
-                TypeId const arr  = s.lattice.interner().array(
-                    elem, static_cast<std::int64_t>(decoded->size() + 1));
-                s.nodeToType.set(node, arr);
+                // Per-token fallback (grammars with no stringLiteralExpr rule —
+                // toy/tsql, or a body not under it): the opener is the token's
+                // parent. Those grammars declare no prefix map, so the core is the
+                // scalar narrow default and the length is the byte count (byte-
+                // identical). Route through the shared helper so a future prefixed
+                // grammar without the concat rule still types correctly.
+                TypeKind const core = stringLiteralElementCoreOf(s, tree, tree.parent(node));
+                if (TypeId const arr = stringLiteralArrayType(s, *decoded, core); arr.valid()) {
+                    s.nodeToType.set(node, arr);
+                }
             }
         }
     }
@@ -4567,11 +4641,13 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         && tree.rule(node).v == s.idx().stringLiteralExprRule.v) {
         if (auto decoded = decodeAdjacentStringBodies(
                 tree, node, s.idx().stringLiteralBodyToken)) {
-            TypeId const elem = s.lattice.interner()
-                                    .primitive(s.idx().stringLiteralElementCore);
-            TypeId const arr  = s.lattice.interner().array(
-                elem, static_cast<std::int64_t>(decoded->size() + 1));
-            s.nodeToType.set(node, arr);
+            // C11/C23 6.4.5: the element core is keyed by THIS literal's opener
+            // (narrow `"` → Char; `u"`/`U"`/`u8"`/`L"` → their core), and the array
+            // length is the code-unit count for a wide core (via the shared encoder).
+            TypeKind const core = stringLiteralElementCoreOf(s, tree, node);
+            if (TypeId const arr = stringLiteralArrayType(s, *decoded, core); arr.valid()) {
+                s.nodeToType.set(node, arr);
+            }
         }
     }
 
@@ -7069,6 +7145,35 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         idx.braceInitListRule = sch.rules().find("braceInitList");
         idx.initElementRule   = sch.rules().find("initElement");
         buildIndexes(s, idx, sch.semantics());
+        // C11/C23 6.4.5: the per-opener element-core map (`L"`/`u"`/`U"`/`u8"`).
+        // The core is resolved by a PURE CONFIG-MAP LOOKUP — `resolveElementCore`
+        // returns the per-format override (`elementCoreByFormat`, how `L"…"`/wchar_t
+        // declares its pe→U16 / elf/macho→I32 width AS CONFIG DATA, mirroring
+        // builtinTypes' `coreByDataModel`) or the base `elementCore`. NO engine-tier
+        // `format == …` branch — this tier owns `activeFormat` only to KEY the map.
+        // The HIR tier reads the resulting element core back off the stamped node
+        // type. (D-FFI-STDDEF-WCHAR-PE-WIDTH — width is config-declared, not coded.)
+        SchemaTokenId const narrowOpener = sch.hirLowering().stringStartToken;
+        for (auto const& px : sch.hirLowering().stringLiteralPrefixes) {
+            if (!px.startToken.valid()) continue;
+            TypeKind core;
+            if (narrowOpener.valid() && px.startToken.v == narrowOpener.v
+                && px.elementCoreByFormat.empty()
+                && idx.stringLiteralElementCore != TypeKind::Void) {
+                // The NARROW opener's core is the language's declared string-literal
+                // element core (`literalTypes` `core`), NOT the loader's auto-seed
+                // placeholder (Char) — so a grammar whose narrow string core is not
+                // Char stays consistent with the scalar `stringLiteralElementCore`
+                // fallback. (Every shipped grammar's narrow core IS Char, so this is
+                // a no-op today; it forecloses a future non-Char-narrow divergence.
+                // Skipped when the narrow opener declares a per-format map, so an
+                // explicit config override always wins.)
+                core = idx.stringLiteralElementCore;
+            } else {
+                core = px.resolveElementCore(s.activeFormat);   // config-map lookup
+            }
+            idx.stringLiteralElementCoreByStart[px.startToken.v] = core;
+        }
         distinctSchemas.push_back(&sch);
     }
 

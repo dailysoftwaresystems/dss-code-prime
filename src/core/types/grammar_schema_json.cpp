@@ -54,6 +54,32 @@ std::optional<ScopeKind> parseScopeName(std::string_view name) {
     return std::nullopt;
 }
 
+// Core-kind NAME → TypeKind, for the JSON `core` / `elementCore` fields (the
+// scalar subset that names a value's element type — no aggregate/pointer kinds).
+// The single source of truth for the name↔kind mapping in this loader; the
+// `semantics` block's local `parseCore` delegates here so the two never drift.
+std::optional<TypeKind> coreTypeFromName(std::string_view name) {
+    if (name == "Bool")    return TypeKind::Bool;
+    if (name == "I8")      return TypeKind::I8;
+    if (name == "I16")     return TypeKind::I16;
+    if (name == "I32")     return TypeKind::I32;
+    if (name == "I64")     return TypeKind::I64;
+    if (name == "I128")    return TypeKind::I128;
+    if (name == "U8")      return TypeKind::U8;
+    if (name == "U16")     return TypeKind::U16;
+    if (name == "U32")     return TypeKind::U32;
+    if (name == "U64")     return TypeKind::U64;
+    if (name == "U128")    return TypeKind::U128;
+    if (name == "F16")     return TypeKind::F16;
+    if (name == "F32")     return TypeKind::F32;
+    if (name == "F64")     return TypeKind::F64;
+    if (name == "F128")    return TypeKind::F128;
+    if (name == "Char")    return TypeKind::Char;
+    if (name == "Byte")    return TypeKind::Byte;
+    if (name == "Void")    return TypeKind::Void;
+    return std::nullopt;
+}
+
 // Built-in token-kind names — predeclared so shape references like
 // "Identifier" resolve regardless of whether the user re-declared them
 // under tokens/keywords. Mirrors CoreTokenKind on the lexer side.
@@ -4224,25 +4250,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // kinds are NEVER named here — they live in the registry, not on
             // the core lattice.
             auto const parseCore = [](std::string_view name) -> std::optional<TypeKind> {
-                if (name == "Bool")    return TypeKind::Bool;
-                if (name == "I8")      return TypeKind::I8;
-                if (name == "I16")     return TypeKind::I16;
-                if (name == "I32")     return TypeKind::I32;
-                if (name == "I64")     return TypeKind::I64;
-                if (name == "I128")    return TypeKind::I128;
-                if (name == "U8")      return TypeKind::U8;
-                if (name == "U16")     return TypeKind::U16;
-                if (name == "U32")     return TypeKind::U32;
-                if (name == "U64")     return TypeKind::U64;
-                if (name == "U128")    return TypeKind::U128;
-                if (name == "F16")     return TypeKind::F16;
-                if (name == "F32")     return TypeKind::F32;
-                if (name == "F64")     return TypeKind::F64;
-                if (name == "F128")    return TypeKind::F128;
-                if (name == "Char")    return TypeKind::Char;
-                if (name == "Byte")    return TypeKind::Byte;
-                if (name == "Void")    return TypeKind::Void;
-                return std::nullopt;
+                return coreTypeFromName(name);
             };
 
             // FC3 c1: the optional `coreByDataModel` sub-object
@@ -8763,6 +8771,144 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 (void)resolveToken(cfg.unicodeStringStartTokenName,
                                    "/hirLowering/unicodeStringStartToken",
                                    cfg.unicodeStringStartToken);
+            }
+
+            // C11/C23 6.4.5: the string-literal opener → element-core table.
+            // Optional array `[{startToken, elementCore}]`. Each row validates:
+            // the token resolves to a declared kind, `elementCore` is a known
+            // TypeKind name, and no startToken is duplicated across rows. Row 0 is
+            // AUTO-SEEDED from `stringStartToken` (elementCore=Char) when absent,
+            // and `unicodeStringStartToken` folds in as a Char row — so a schema
+            // declaring no explicit prefixes is byte-identical (narrow strings type
+            // exactly as before).
+            {
+                auto prefixSeen = [&](SchemaTokenId t) {
+                    for (auto const& p : cfg.stringLiteralPrefixes)
+                        if (p.startToken.v == t.v) return true;
+                    return false;
+                };
+                if (hl.contains("stringLiteralPrefixes")) {
+                    json const& arr = hl.at("stringLiteralPrefixes");
+                    if (!arr.is_array()) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                  "/hirLowering/stringLiteralPrefixes",
+                                  "'stringLiteralPrefixes' must be an array");
+                    } else {
+                        for (std::size_t i = 0; i < arr.size(); ++i) {
+                            auto const path = std::format(
+                                "/hirLowering/stringLiteralPrefixes/{}", i);
+                            json const& entry = arr[i];
+                            if (!entry.is_object()
+                                || !entry.contains("startToken")
+                                || !entry.at("startToken").is_string()
+                                || !entry.contains("elementCore")
+                                || !entry.at("elementCore").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                          "each stringLiteralPrefixes entry needs string "
+                                          "'startToken' and 'elementCore'");
+                                continue;
+                            }
+                            LiteralPrefixEntry row;
+                            row.startTokenName = entry.at("startToken").get<std::string>();
+                            if (!resolveToken(row.startTokenName, path + "/startToken",
+                                              row.startToken)) {
+                                continue;
+                            }
+                            auto const core =
+                                coreTypeFromName(entry.at("elementCore").get<std::string>());
+                            if (!core) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/elementCore",
+                                          std::format("unknown TypeKind '{}'",
+                                                      entry.at("elementCore").get<std::string>()));
+                                continue;
+                            }
+                            if (prefixSeen(row.startToken)) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/startToken",
+                                          std::format("duplicate stringLiteralPrefixes "
+                                                      "startToken '{}'", row.startTokenName));
+                                continue;
+                            }
+                            row.elementCore = *core;
+                            // Optional per-format element-core override
+                            // (`elementCoreByFormat`), mirroring builtinTypes'
+                            // `coreByDataModel`: this is how `L"…"` (wchar_t) declares
+                            // its FORMAT-keyed width AS CONFIG DATA (elf/macho→I32,
+                            // pe→U16) — no engine tier hardcodes a `format == …`
+                            // branch. Closed keys: every key must resolve to a known
+                            // ObjectFormatKind (the EXISTING object-format-name
+                            // resolver) and every value to a known TypeKind — a typo'd
+                            // format name would otherwise silently never override.
+                            bool formatMapOk = true;
+                            if (entry.contains("elementCoreByFormat")) {
+                                auto const& fmtObj = entry.at("elementCoreByFormat");
+                                if (!fmtObj.is_object()) {
+                                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                              path + "/elementCoreByFormat",
+                                              "'elementCoreByFormat' must be an object "
+                                              "mapping object-format names to TypeKinds");
+                                    formatMapOk = false;
+                                } else {
+                                    for (auto const& [fkey, fval] : fmtObj.items()) {
+                                        auto const fmt = objectFormatKindFromName(fkey);
+                                        if (!fmt) {
+                                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                                      path + "/elementCoreByFormat/" + fkey,
+                                                      std::format("unknown object format "
+                                                                  "'{}' (expected e.g. "
+                                                                  "'elf', 'pe', 'macho')",
+                                                                  fkey));
+                                            formatMapOk = false;
+                                            continue;
+                                        }
+                                        if (!fval.is_string()) {
+                                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                                      path + "/elementCoreByFormat/" + fkey,
+                                                      "per-format element core must be a "
+                                                      "TypeKind name string");
+                                            formatMapOk = false;
+                                            continue;
+                                        }
+                                        auto const fcore =
+                                            coreTypeFromName(fval.get<std::string>());
+                                        if (!fcore) {
+                                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                                      path + "/elementCoreByFormat/" + fkey,
+                                                      std::format("unknown TypeKind '{}'",
+                                                                  fval.get<std::string>()));
+                                            formatMapOk = false;
+                                            continue;
+                                        }
+                                        row.elementCoreByFormat[*fmt] = *fcore;
+                                    }
+                                }
+                            }
+                            if (!formatMapOk) continue;
+                            cfg.stringLiteralPrefixes.push_back(std::move(row));
+                        }
+                    }
+                }
+                // Auto-seed the narrow opener (elementCore=Char) so a schema that
+                // declared string literals but no explicit prefixes types exactly
+                // as before — the invariant the existing suite's byte-identity pins.
+                if (cfg.stringStartToken.valid() && !prefixSeen(cfg.stringStartToken)) {
+                    LiteralPrefixEntry row;
+                    row.startToken     = cfg.stringStartToken;
+                    row.startTokenName = cfg.stringStartTokenName;
+                    row.elementCore    = TypeKind::Char;
+                    cfg.stringLiteralPrefixes.push_back(std::move(row));
+                }
+                // Fold SQL's `N'…'` unicode opener in as a Char row (same body
+                // token + decoder as the narrow form).
+                if (cfg.unicodeStringStartToken.valid()
+                    && !prefixSeen(cfg.unicodeStringStartToken)) {
+                    LiteralPrefixEntry row;
+                    row.startToken     = cfg.unicodeStringStartToken;
+                    row.startTokenName = cfg.unicodeStringStartTokenName;
+                    row.elementCore    = TypeKind::Char;
+                    cfg.stringLiteralPrefixes.push_back(std::move(row));
+                }
             }
             // HR10: string bodies use doubled-delimiter (`''`) escaping (SQL).
             // Derive the delimiter byte from the string opener's StringStyle.endsAt

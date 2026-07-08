@@ -1220,6 +1220,51 @@ TEST(Tokenizer, UnterminatedCoalescedStringEmitsDiagnostic) {
     EXPECT_EQ(result.tokens[1].schemaKind, h.schema->schemaTokens().find("StringLiteral"));
 }
 
+TEST(Tokenizer, WideStringOpenersTokenizeViaLongestMatch) {
+    // C11/C23 6.4.5: the wide/UTF openers `L"`/`u"`/`U"`/`u8"` are multi-char
+    // lexemes that START with an id-start byte. The tokenizer's longestMatchInMode
+    // must make each opener beat the bare identifier run — `L"AB"` is
+    // [WideStringStart, StringLiteral], NOT [Identifier(L), StringStart, ...]. Each
+    // pushes the SAME shared `string` mode → one coalesced StringLiteral body.
+    struct Case { char const* src; char const* opener; };
+    for (auto const& c : {Case{"L\"AB\"", "WideStringStart"},
+                          Case{"u\"AB\"", "Utf16StringStart"},
+                          Case{"U\"AB\"", "Utf32StringStart"},
+                          Case{"u8\"AB\"", "Utf8StringStart"}}) {
+        auto h      = loadCSubset(c.src);
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 2u) << "opener=" << c.opener;
+        EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find(c.opener))
+            << "the multi-char opener must win over the bare id-run for " << c.src;
+        EXPECT_EQ(result.tokens[1].schemaKind, h.schema->schemaTokens().find("StringLiteral"));
+        EXPECT_EQ(textOf(*h.src, result.tokens[1]), "AB");
+    }
+}
+
+TEST(Tokenizer, U8StringOpenerBeatsUOpenerAndIdentifier) {
+    // The `u8"` opener (3 bytes) must beat BOTH the `u"` opener (2 bytes) and the
+    // `u8` identifier run — longestMatchInMode picks the longest lexeme. A
+    // regression to `u"` would split `u8"…"` as [Utf16StringStart, "8…"] (wrong).
+    auto h      = loadCSubset("u8\"x\"");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 2u);
+    EXPECT_EQ(result.tokens[0].schemaKind, h.schema->schemaTokens().find("Utf8StringStart"))
+        << "u8\" must win over u\" and the u8 identifier";
+    EXPECT_EQ(textOf(*h.src, result.tokens[1]), "x");
+}
+
+TEST(Tokenizer, IdentifierStartingWithUIsNotAStringOpener) {
+    // Regression: a bare identifier that merely STARTS with an opener-prefix byte
+    // (`user`, `L_var`) must stay ONE Identifier — the opener only wins when the
+    // quote immediately follows (longestMatch covers the whole `u"` lexeme, but
+    // `user` has no quote so the id-run wins).
+    auto h      = loadCSubset("user");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u) << "`user` must stay ONE identifier, not split at u\"";
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::Word);
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "user");
+}
+
 TEST(Tokenizer, TsqlSingleStringDoubledDelimiterEscape) {
     // SQL string with a doubled single-quote — `'a''b'` represents the
     // literal `a'b`. The body mode coalesces (HR10), so the whole body is

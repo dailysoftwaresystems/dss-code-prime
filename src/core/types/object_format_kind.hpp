@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
-#include "core/types/target_schema.hpp"   // EnumNameTable<E,N>
+#include "core/types/enum_name_table.hpp"   // EnumNameTable<E,N> (leaf header — no target_schema cycle)
 
 #include <cstdint>
 #include <optional>

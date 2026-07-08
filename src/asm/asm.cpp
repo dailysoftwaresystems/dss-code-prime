@@ -960,29 +960,36 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // `arr[0]='J'` must not fault). The former unconditional `.rodata`
             // override here wrongly forced a mutable named array into read-only
             // memory (a SIGSEGV on write) — removed.
+            // The literal `s` already holds the ELEMENT-WIDTH-encoded code units
+            // (narrow `Array<Char,N>` = 1 byte/unit; C11/C23 6.4.5 wide/UTF =
+            // 2/4-byte LE units produced by the HIR wide encoder), so `s.begin()..`
+            // is the exact on-wire byte sequence sans terminator.
             d.bytes.assign(s.begin(), s.end());
-            d.bytes.push_back(0);                 // implicit NUL → s.size()+1 bytes
-            // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): when this
-            // string-literal global is the PRODUCER for a `char[N]` initializer (the
-            // HIR coerce retyped the literal node to `char[N]` with N > s.size()+1),
-            // the global's TYPE is `Array<char,N>` — so MATERIALIZE the trailing
-            // N−(s.size()+1) zero-padding bytes HERE (the Option-A "pad at the
-            // producer" choice). A consumer that copies N bytes (the aggregate-copy
-            // of the field / the array-local init) then reads GUARANTEED zeros, never
-            // an OOB read of adjacent rodata. The ORDINARY string-literal global
-            // (`char *p = "hi";`, a bare decayed `"abc"`) has type `Array<char,M>`
-            // with M == s.size()+1, so the type size equals the byte count already
-            // emitted and this padding is a NO-OP (behaviour unchanged). Only GROW
-            // (never shrink): the type size is N >= s.size()+1 by the coerce/semantic
-            // `N >= M` guards; clamp defensively so a hypothetical smaller type can
-            // never truncate the literal bytes.
+            // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): the global's
+            // TYPE is `Array<elem,N>` — MATERIALIZE the full N*sizeof(elem) bytes here
+            // (the Option-A "pad at the producer" choice). This subsumes the trailing
+            // NUL: an ordinary literal has N == codeUnits+1, so the padding IS the
+            // element-wide terminator (`u"A"` → Array<U16,2> → 4 bytes: `41 00 00 00`);
+            // a `char[N]`/`wchar_t[N]` initializer (the HIR coerce retyped the literal
+            // to N > codeUnits+1) gets the remaining zero elements too. A consumer that
+            // copies N*sizeof(elem) bytes then reads GUARANTEED zeros, never an OOB read
+            // of adjacent rodata. Only GROW (never shrink): N*sizeof(elem) >= s.size()
+            // by construction; clamp defensively so a smaller type can never truncate.
+            // The byte size is ELEMENT-WIDTH-AWARE — a wide element's size is
+            // count*sizeof(elem), NOT the length scalar (which counts UNITS).
+            std::uint64_t elemBytes = 1;   // narrow default; wide = 2/4 (drives align)
             if (interner.kind(ty) == TypeKind::Array) {
+                if (auto const ops = interner.operands(ty);
+                    !ops.empty() && ops[0].valid()) {
+                    if (auto const eb = scalarByteSize(interner.kind(ops[0]), dataModel);
+                        eb.has_value() && *eb > 0) {
+                        elemBytes = *eb;
+                    }
+                }
                 std::optional<std::uint64_t> typeSize;
                 if (auto const sc = interner.scalars(ty); !sc.empty()) {
-                    // Fast path: char element ⇒ N bytes == the length scalar. Use the
-                    // layout engine when present for a non-trivial element (agnostic
-                    // total size), but a char[N] string global is the only shape that
-                    // reaches here, so the scalar is exact.
+                    // The layout engine (when present) computes the agnostic total
+                    // size (count * element stride) for any element width.
                     if (aggregateLayout.has_value()) {
                         if (auto const lay = computeLayout(ty, interner,
                                                            *aggregateLayout, dataModel);
@@ -990,13 +997,26 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                             typeSize = lay->size;
                         }
                     }
+                    // Fallback (no aggregateLayout): count * element byte width. For a
+                    // narrow `Array<Char,N>` the element is 1 byte so this is N (the
+                    // pre-wide behavior); for a wide element it is N*sizeof(elem).
                     if (!typeSize.has_value())
-                        typeSize = static_cast<std::uint64_t>(sc[0]);
+                        typeSize = static_cast<std::uint64_t>(sc[0]) * elemBytes;
                 }
+                // No terminator was appended above — the resize-to-typeSize IS the
+                // terminator (and any char[N] padding). A non-array string literal
+                // (should not occur; strings are always Array-typed) would fall
+                // through with exactly `s` bytes; guard by appending one NUL only in
+                // that defensive case so a bare string is still terminated.
                 if (typeSize.has_value() && *typeSize > d.bytes.size())
                     d.bytes.resize(static_cast<std::size_t>(*typeSize), 0u);
+            } else {
+                d.bytes.push_back(0);   // defensive: non-array string literal (unexpected)
             }
-            d.alignment = raiseToExplicit(Alignment::of<1>());
+            // Align to the element width (narrow=1 → byte-aligned as before; wide
+            // U16=2 / U32=4) so a `(unsigned short*)u"…"` read is naturally aligned
+            // — matters on strict-alignment targets (arm64).
+            d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(elemBytes));
             out.push_back(std::move(d));
             continue;
         }

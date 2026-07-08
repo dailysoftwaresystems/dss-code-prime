@@ -160,6 +160,30 @@
       "modeOp": "pushMode", "modeArg": "string",
       "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "\"" }
     }],
+    "L\"": [{
+      "$comment": "C11/C23 6.4.5 wide string `L\"…\"`. A multi-char lexeme so the tokenizer's longestMatchInMode beats the bare `L` identifier run; pushes the SAME shared `string` mode as `\"` (one coalesced StringLiteral body). Its element core (wchar_t) is FORMAT-keyed in semantic (D-FFI-STDDEF-WCHAR-PE-WIDTH), so hirLowering.stringLiteralPrefixes carries only a placeholder for it.",
+      "kind": "WideStringStart",
+      "modeOp": "pushMode", "modeArg": "string",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "\"" }
+    }],
+    "u\"": [{
+      "$comment": "C11/C23 6.4.5 char16_t string `u\"…\"` → UTF-16 code units (U16). Same shared `string` mode as `\"`; longestMatchInMode makes `u\"` beat the `u` id-run.",
+      "kind": "Utf16StringStart",
+      "modeOp": "pushMode", "modeArg": "string",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "\"" }
+    }],
+    "U\"": [{
+      "$comment": "C11/C23 6.4.5 char32_t string `U\"…\"` → UTF-32 code units (U32). Same shared `string` mode as `\"`.",
+      "kind": "Utf32StringStart",
+      "modeOp": "pushMode", "modeArg": "string",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "\"" }
+    }],
+    "u8\"": [{
+      "$comment": "C11/C23 6.4.5 UTF-8 string `u8\"…\"` → UTF-8 bytes (char8_t=Char-width). longestMatchInMode makes `u8\"` (3 bytes) beat both the `u8` id-run and the `u\"` opener. Same shared `string` mode as `\"`.",
+      "kind": "Utf8StringStart",
+      "modeOp": "pushMode", "modeArg": "string",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "\"" }
+    }],
     "'": [{
       "kind": "CharStart",
       "modeOp": "pushMode", "modeArg": "charBody",
@@ -1184,8 +1208,8 @@
 
     "charLiteralExpr":   { "sequence": [ "CharStart",   "CharLiteral"   ] },
     "stringLiteralExpr": {
-      "$comment": "C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): adjacent string literals concatenate — `\"a\" \"b\"` is `\"ab\"`. The first StringStart+StringLiteral pair is required; the zero-or-more repeat captures each further pair as FLAT children (sequences inline, no wrapper node), so a lone string yields exactly 2 children, byte-identical to the pre-c20 single-pair rule. Concatenation is at the DECODED-byte level (each body decoded by decodeStringLiteralBody FIRST, then the bytes joined) via the single decodeAdjacentStringBodies chokepoint that every body consumer routes through. Safe in every use site: primaryExpr, attr args (terminate at `)`), externFuncTail (terminates at `;`) — none has StringStart in its follow set.",
-      "sequence": [ "StringStart", "StringLiteral", { "repeat": { "sequence": [ "StringStart", "StringLiteral" ] } } ]
+      "$comment": "C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): adjacent string literals concatenate — `\"a\" \"b\"` is `\"ab\"`. The first opener+StringLiteral pair is required; the zero-or-more repeat captures each further pair as FLAT children (sequences inline, no wrapper node), so a lone string yields exactly 2 children, byte-identical to the pre-c20 single-pair rule. The opener is an INLINE token alt (C11/C23 6.4.5: `\"`|`L\"`|`u\"`|`U\"`|`u8\"`) — token-leaf alt branches consume EXACTLY one token and push it DIRECTLY (no wrapper node; the typeSpecifierSeq precedent), so the opener token stays a DIRECT child of this node and bodyLiteralNodeOf / decodeAdjacentStringBodies find it AND recover its SPECIFIC kind (the element-core discriminator). Concatenation is at the DECODED code-unit level (each body decoded FIRST, then joined) via the single chokepoint every body consumer routes through. Safe in every use site: primaryExpr, attr args (terminate at `)`), externFuncTail (terminates at `;`) — none has a string opener in its follow set. Prefix-mixing across adjacent pieces (`u\"a\" L\"b\"`) is a LATER cycle — the element core is taken from the FIRST opener today.",
+      "sequence": [ { "alt": [ "StringStart", "WideStringStart", "Utf16StringStart", "Utf32StringStart", "Utf8StringStart" ] }, "StringLiteral", { "repeat": { "sequence": [ { "alt": [ "StringStart", "WideStringStart", "Utf16StringStart", "Utf32StringStart", "Utf8StringStart" ] }, "StringLiteral" ] } } ]
     },
 
     "argList": {
@@ -1639,6 +1663,15 @@
     "caseDefaultToken":   "DefaultKeyword",
 
     "charLiteral":   { "startToken": "CharStart",   "bodyToken": "CharLiteral"   },
-    "stringLiteral": { "startToken": "StringStart", "bodyToken": "StringLiteral" }
+    "stringLiteral": { "startToken": "StringStart", "bodyToken": "StringLiteral" },
+
+    "$stringLiteralPrefixesComment": "C11/C23 6.4.5 string-literal openers → element core. The narrow StringStart row is auto-seeded by the loader (elementCore=Char) but listed here for clarity. WideStringStart (wchar_t) declares its FORMAT-keyed width AS CONFIG DATA via elementCoreByFormat (elf/macho→I32 the POSIX width, pe→U16 the Windows UTF-16 code unit — D-FFI-STDDEF-WCHAR-PE-WIDTH, the SAME per-format axis stddef.json's wchar_t typedef declares via when.format); elementCore=I32 is the default/fallback for a format-agnostic caller. No engine tier branches on format — the semantic tier resolves the row via a pure config-map lookup (LiteralPrefixEntry::resolveElementCore, mirroring builtinTypes' coreByDataModel) and the HIR tier reads the resolved element core back off the stamped node type. All five openers share the coalesced StringLiteral body token.",
+    "stringLiteralPrefixes": [
+      { "startToken": "StringStart",      "elementCore": "Char" },
+      { "startToken": "Utf16StringStart", "elementCore": "U16"  },
+      { "startToken": "Utf32StringStart", "elementCore": "U32"  },
+      { "startToken": "Utf8StringStart",  "elementCore": "U8"   },
+      { "startToken": "WideStringStart",  "elementCore": "I32", "elementCoreByFormat": { "pe": "U16", "elf": "I32", "macho": "I32" } }
+    ]
   }
 }

@@ -17,6 +17,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/string_literal_decode.hpp" // C 5.1.1.2 phase 6: decodeAdjacentStringBodies (THE string-body chokepoint)
+#include "core/types/wide_string_encode.hpp"     // C 6.4.5: encodeWideString (wide/UTF code units, shared with semantic)
 #include "core/types/tree.hpp"
 #include "core/types/tree_node.hpp"             // isEmptySpace
 #include "core/types/type_lattice/core_type.hpp"
@@ -435,10 +436,15 @@ struct Lowerer {
             auto const toElem   = interner.operands(target);
             auto const fromLen  = interner.scalars(child.type);
             auto const toLen    = interner.scalars(target);
+            // C11/C23 6.4.5: SAME element kind on both sides (was Char-only) so a
+            // wide-string initializer `wchar_t buf[3]=L"hi"` / `char16_t b[3]=u"hi"`
+            // gets the same trailing zero-fill as a narrow `char[N]="…"`. The element
+            // KIND must match (a `char[N]` cannot be inited by a `u"…"` array — the
+            // semantic tier rejects the mismatch); the string bytes are already
+            // element-width-encoded, and the producer pads to N*sizeof(elem).
             if (!fromElem.empty() && !toElem.empty()
                 && !fromLen.empty() && !toLen.empty()
-                && interner.kind(fromElem[0]) == TypeKind::Char
-                && interner.kind(toElem[0]) == TypeKind::Char
+                && interner.kind(fromElem[0]) == interner.kind(toElem[0])
                 && toLen[0] >= fromLen[0]
                 && std::holds_alternative<std::string>(
                        literals.at(builder.payload(child.id)).value)) {
@@ -1885,10 +1891,13 @@ struct Lowerer {
     [[nodiscard]] std::optional<E> tryLowerLeafLiteral(NodeId node) {
         if (NodeId chl = bodyLiteralNodeOf(node, cfg.charStartToken); chl.valid())
             return lowerCharLiteral(chl);
-        if (NodeId sl = bodyLiteralNodeOf(node, cfg.stringStartToken); sl.valid())
+        // C11/C23 6.4.5: any string opener (`"`/`L"`/`u"`/`U"`/`u8"`, and SQL `N'`)
+        // — the sub-rule whose FIRST child token is a configured opener. The narrow
+        // + unicode + wide forms all share lowerStringLiteral (which routes byte vs
+        // code-unit by the STAMPED element core). Falls back to the scalar
+        // start/unicode tokens for a grammar that declared no prefix table.
+        if (NodeId sl = stringLiteralNodeOf(node); sl.valid())
             return lowerStringLiteral(sl);
-        if (NodeId us = bodyLiteralNodeOf(node, cfg.unicodeStringStartToken); us.valid())
-            return lowerStringLiteral(us);   // SQL `N'…'` — same body token + decoder
         if (cfg.nullToken.valid())            // SQL NULL → a typeless extension leaf
             if (NodeId nt = childTokenOfKind(node, cfg.nullToken); nt.valid())
                 return lowerNullLiteral(node);
@@ -2041,6 +2050,34 @@ struct Lowerer {
         return {};
     }
 
+    // Is `tok` a configured string opener kind? (Any `stringLiteralPrefixes` row,
+    // or the scalar start/unicode tokens for a grammar with no prefix table.)
+    [[nodiscard]] bool isStringOpenerKind(SchemaTokenId tok) const {
+        if (!tok.valid()) return false;
+        for (auto const& px : cfg.stringLiteralPrefixes)
+            if (px.startToken.v == tok.v) return true;
+        return (cfg.stringStartToken.valid() && tok.v == cfg.stringStartToken.v)
+            || (cfg.unicodeStringStartToken.valid()
+                && tok.v == cfg.unicodeStringStartToken.v);
+    }
+
+    // The child rule node of `operand` (a `stringLiteralExpr` subtree) whose FIRST
+    // visible child token is ANY configured string opener — narrow `"`, the wide/
+    // UTF forms `L"`/`u"`/`U"`/`u8"`, or SQL `N'`. The opener token stays a DIRECT
+    // child (the inline-alt opener pushes it flat), so lowerStringLiteral can
+    // recover the specific opener kind; the element core comes from the semantic
+    // stamp, so no derivation is needed here. Invalid ⇒ not a string literal.
+    [[nodiscard]] NodeId stringLiteralNodeOf(NodeId operand) {
+        for (NodeId c : visible(operand)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            for (NodeId g : visible(c)) {
+                if (isToken(g) && isStringOpenerKind(tree().tokenKind(g))) return c;
+                break;  // only the FIRST visible child decides
+            }
+        }
+        return {};
+    }
+
     // The first visible child token of `node` whose kind is `k`, or invalid.
     [[nodiscard]] NodeId childTokenOfKind(NodeId node, SchemaTokenId k) {
         for (NodeId c : visible(node))
@@ -2065,14 +2102,69 @@ struct Lowerer {
         return {track(builder.makeLiteral(type, literals.add(std::move(v))), node), type};
     }
 
+    // The element CORE of a string literal — the kind of `operands(nodeType)[0]`
+    // off the SEMANTIC stamp (F2, the ONLY place wchar_t width was format-resolved).
+    // Falls back to Char when the node was not stamped as an array (a malformed
+    // literal, or a grammar whose typing left it untyped) — the narrow default.
+    [[nodiscard]] TypeKind stringElementCoreOf(NodeId node) const {
+        TypeId const t = typeAtOr(node, InvalidType);
+        if (t.valid() && interner.kind(t) == TypeKind::Array) {
+            auto const ops = interner.operands(t);
+            if (!ops.empty() && ops[0].valid()) return interner.kind(ops[0]);
+        }
+        return TypeKind::Char;
+    }
+
+    // A code-unit element core that is NOT the narrow byte form (Char/Byte) — i.e.
+    // one that goes through the UTF-8 decode + re-encode path.
+    [[nodiscard]] static bool isNonNarrowCore(TypeKind core) {
+        return core != TypeKind::Char && core != TypeKind::Byte;
+    }
+
+    // Is `tok` a NON-NARROW string opener — one that requires the UTF-8 code-unit
+    // path (`u"`/`U"`/`u8"`, or `L"` whose per-format core is a wide kind)? True when
+    // ANY of the opener's possible cores (the base `elementCore` OR any
+    // `elementCoreByFormat` value) is non-narrow, so the classification is format-
+    // AGNOSTIC (no `activeFormat` needed here — the HIR tier lacks it). The narrow
+    // `"` (Char base, no format map) and SQL `N'` stay false. Used to DETECT a
+    // semantic type-drop: a wide opener whose node was left narrow/untyped (e.g. an
+    // astral cp the format-resolved core could not hold) — HIR fails loud on that
+    // rather than silently taking the narrow byte path.
+    [[nodiscard]] bool isWideStringOpenerKind(SchemaTokenId tok) const {
+        for (auto const& px : cfg.stringLiteralPrefixes) {
+            if (px.startToken.v != tok.v) continue;
+            if (isNonNarrowCore(px.elementCore)) return true;
+            for (auto const& [fmt, core] : px.elementCoreByFormat) {
+                (void)fmt;
+                if (isNonNarrowCore(core)) return true;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    // The opener token kind of a `stringLiteralExpr` node — its FIRST direct child
+    // token that is a configured string opener (the element-core discriminator).
+    [[nodiscard]] SchemaTokenId stringOpenerTokenKind(NodeId node) const {
+        for (NodeId c : visible(node)) {
+            if (!isToken(c)) continue;
+            SchemaTokenId const tk = tree().tokenKind(c);
+            if (isStringOpenerKind(tk)) return tk;
+        }
+        return {};
+    }
+
     // `"hello"` (or adjacent-concatenated `"hel" "lo"`, C 5.1.1.2 phase 6) → an
-    // Array<Char, N+1> literal carrying the decoded bytes (NUL implied by the +1
-    // length). N is the sum of the per-segment decoded lengths.
+    // `Array<core, N+1>` literal carrying the decoded code units (NUL implied by the
+    // +1). The element core is taken from the semantic stamp: narrow `"` → Char
+    // (byte path, unchanged); the wide/UTF openers `L"`/`u"`/`U"`/`u8"` → their core
+    // (the escape-decoded bytes are UTF-8-decoded and re-encoded to that width via
+    // the SHARED encoder the semantic typer used, so both tiers agree on N).
     E lowerStringLiteral(NodeId node) {
         std::string bytes;
         if (cfg.stringDoubledDelimiter) {
             // SQL `'…''…'`: doubled-delimiter escaping, single body (no phase-6
-            // concat in SQL) — never fails (pairs only).
+            // concat in SQL) — never fails (pairs only). Always the narrow Char form.
             NodeId const bodyTok = childTokenOfKind(node, cfg.stringBodyToken);
             std::string_view const body =
                 bodyTok.valid() ? tree().text(bodyTok) : std::string_view{};
@@ -2087,12 +2179,72 @@ struct Lowerer {
                                           std::string{tree().text(node)}));
             return {errorNode(node), InvalidType};
         }
-        TypeId const type = interner.array(interner.primitive(TypeKind::Char),
-                                           static_cast<std::int64_t>(bytes.size() + 1));
+
+        TypeKind const core = stringElementCoreOf(node);
+        // A wide opener (`u"`/`U"`/`u8"`/`L"`) whose node the semantic tier left
+        // NARROW or UNTYPED = a type-drop, which happens exactly when the format-
+        // resolved element core could not hold a code point (e.g. an astral cp under
+        // pe-`L"…"` / any `u"…"`). Reading the stamp gave Char, which would silently
+        // route the raw UTF-8 down the narrow byte path — instead FAIL LOUD. (No
+        // format is needed here: the stamp carries the correct wide core whenever the
+        // encode WAS representable, so a narrow stamp under a wide opener is always
+        // the unrepresentable case.)
+        if ((core == TypeKind::Char || core == TypeKind::Byte)
+            && isWideStringOpenerKind(stringOpenerTokenKind(node))) {
+            emitH(DiagnosticCode::H_WideCharSurrogateUnsupported, node,
+                  std::format("wide/UTF string literal {} cannot be lowered: a code "
+                              "point cannot be represented in the target element "
+                              "width without a surrogate pair (surrogate pairs / "
+                              "astral code points are not yet supported for this "
+                              "element)", std::string{tree().text(node)}));
+            return {errorNode(node), InvalidType};
+        }
+        // NARROW (`"`, SQL, u8's byte width is Char-equal — but u8 still routes the
+        // wide encoder to VALIDATE the UTF-8, see below). Char/Byte keep the exact
+        // byte path: raw ≥0x80 bytes pass through, length = byte count.
+        if (core == TypeKind::Char || core == TypeKind::Byte) {
+            TypeId const type = interner.array(interner.primitive(core),
+                                               static_cast<std::int64_t>(bytes.size() + 1));
+            HirLiteralValue v;
+            v.core  = core;
+            v.value = std::move(bytes);
+            return {track(builder.makeLiteral(type, literals.add(std::move(v))), node), type};
+        }
+
+        // WIDE / UTF (`u"`→U16, `U"`→U32, `L"`→U16|I32, `u8"`→U8): UTF-8-decode the
+        // (escape-decoded) bytes and re-encode into the element width. Fail LOUD on
+        // a code point that cannot be represented without truncation — never a
+        // silent wrong unit. `u8"` also flows here so its raw UTF-8 is VALIDATED
+        // (an ill-formed `u8"…"` fails loud rather than emitting garbage bytes).
+        WideEncodeResult enc;
+        if (auto err = encodeWideString(bytes, core, enc)) {
+            emitH(DiagnosticCode::H_WideCharSurrogateUnsupported, node,
+                  wideEncodeErrorDetail(*err, core, node));
+            return {errorNode(node), InvalidType};
+        }
+        TypeId const type = interner.array(interner.primitive(core),
+                                           static_cast<std::int64_t>(enc.codeUnits + 1));
         HirLiteralValue v;
-        v.core  = TypeKind::Char;
-        v.value = std::move(bytes);
+        v.core  = core;
+        v.value = std::move(enc.bytes);   // the element-width code units (LE), no NUL
         return {track(builder.makeLiteral(type, literals.add(std::move(v))), node), type};
+    }
+
+    // A human-readable reason for an H_WideCharSurrogateUnsupported diagnostic —
+    // names the first offending code point (re-derived from the body) so the
+    // message is actionable (which char, and why it can't be represented).
+    [[nodiscard]] std::string wideEncodeErrorDetail(WideEncodeError err, TypeKind core,
+                                                    NodeId node) {
+        char const* what =
+            err == WideEncodeError::SurrogateUnsupported
+                ? "a supplementary-plane code point (> U+FFFF) needs a UTF-16 "
+                  "surrogate pair, which is not yet supported for a 16-bit string "
+                  "element"
+          : err == WideEncodeError::CodepointTooLarge
+                ? "a code point exceeds U+10FFFF (not a Unicode scalar value)"
+                : "the string body is not well-formed UTF-8";
+        return std::format("wide/UTF string literal {} cannot be lowered: {}",
+                           std::string{tree().text(node)}, what);
     }
 
     // SQL `NULL` (typeless) → a leaf Extension node of the configured kind.
