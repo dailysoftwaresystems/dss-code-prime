@@ -6604,6 +6604,17 @@ struct Lowerer {
             sym = model.symbolAt(vis[*decl->nameChild]);
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
         }
+        // D-CSUBSET-ANON-TYPEDECL-TYPE-FALLBACK: an ANONYMOUS composite specifier
+        // (tagless `enum {…}` / `struct {…}` / `union {…}`) binds its interned type
+        // on the SPECIFIER node ITSELF (Pass-1.5 stamps `nodeToType[specNode]`), NOT
+        // on the name-child — which for an anon composite is the BODY node, carrying
+        // no symbol. So the name-child probe above leaves `type` invalid there. Fall
+        // back to the type the analyzer already stamped on this node; without it a
+        // standalone anonymous TypeDecl whose enumerator is used in a file-scope
+        // const-expr (`enum { V = 16 }; int arr[V];`) fails H_TypeUnresolved at the
+        // HIR verifier even though the enum type resolved fine (the NAMED form is
+        // clean because vis[nameChild] is the tag Identifier, where the symbol binds).
+        if (!type.valid()) type = model.typeAt(node);
         return track(builder.makeTypeDecl(type, sym.v), node);
     }
 
