@@ -1,0 +1,62 @@
+name: 💡 Feature / capability request
+description: A C language feature, or a new source language, target ISA, or object format.
+title: "[feat]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        DSS Code Prime is **config-driven**: source languages are `.lang.json`, targets are `.target.json`, object formats are schema-described. The strongest requests say what *real code* needs the capability — and, where you know the codebase, how it fits the "vocabulary in config, one agnostic engine" model.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - C language feature (toward full C23)
+        - New source language (.lang.json)
+        - New target ISA (.target.json)
+        - New object format (PE / ELF / Mach-O / WASM / SPIR-V / …)
+        - Optimizer / codegen quality
+        - Diagnostics / error messages
+        - Driver / CLI / tooling
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What should it do, and why?
+      description: The capability and the motivation behind it.
+    validations:
+      required: true
+  - type: textarea
+    id: corpus
+    attributes:
+      label: What real-world code needs this?
+      description: DSS is driven by real corpora — it already builds and runs the full SQLite amalgamation on Windows, Linux and macOS across x86_64 and arm64 — so a concrete program that needs this helps us prioritize.
+    validations:
+      required: false
+  - type: input
+    id: spec
+    attributes:
+      label: Spec reference
+      description: e.g. a C23 clause (6.7.1), an ABI document, an ISA manual section.
+    validations:
+      required: false
+  - type: textarea
+    id: agnostic
+    attributes:
+      label: Config-driven fit (optional)
+      description: If you know the internals — does this belong in config vocabulary, or does it need engine work? Anything that would add an `if (arch/format/lang == …)` branch to the shared substrate is a design smell worth calling out.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and discussions for this.
+          required: true
+        - label: I'm willing to help implement or test it.
+          required: false

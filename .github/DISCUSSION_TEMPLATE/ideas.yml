@@ -1,0 +1,19 @@
+title: "[idea]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        DSS treats a compilation target as *data, not code* — languages, ISAs and object formats are JSON over one agnostic engine. The ideas that land hardest push that frontier: a new target, a new source language, a sharper diagnostic. Half-formed is fine — if it firms up, we'll turn it into a feature request.
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why would it matter?
+      description: Who benefits, and what does it unlock?
+    validations:
+      required: false
