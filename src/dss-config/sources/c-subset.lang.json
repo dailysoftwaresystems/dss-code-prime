@@ -332,6 +332,7 @@
     { "word": "restrict", "kind": "RestrictKeyword" },
     { "word": "register", "kind": "RegisterKeyword" },
     { "word": "auto",     "kind": "AutoKeyword"     },
+    { "word": "_Noreturn", "kind": "NoreturnKeyword" },
     { "word": "typedef", "kind": "TypedefKeyword" },
     { "word": "struct",  "kind": "StructKeyword"  },
     { "word": "union",   "kind": "UnionKeyword"   },
@@ -545,8 +546,8 @@
       "sequence": [ "singleDeclSpecifier", { "repeat": "singleDeclSpecifier" } ]
     },
     "singleDeclSpecifier": {
-      "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): `alignasSpec` (`_Alignas`/`alignas`) joins the top-level declaration-specifier alts. Its FIRST = {AlignasKeyword, AlignasLegacyKeyword} is DISJOINT from StaticKeyword / attrSpec's AttributeKeyword / stdAttr's BracketOpen, so the repeat stays predictively pruned (non-speculative). It is stripped from the positional-child count (specifierPrefix: declSpecifiers on topLevelDecl) and IGNORED by the linkage scan (linkageSpecifierIgnoredRules).",
-      "alt": [ "StaticKeyword", "alignasSpec", "attrSpec", "stdAttr" ]
+      "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): `alignasSpec` (`_Alignas`/`alignas`) joins the top-level declaration-specifier alts. Its FIRST = {AlignasKeyword, AlignasLegacyKeyword} is DISJOINT from StaticKeyword / attrSpec's AttributeKeyword / stdAttr's BracketOpen, so the repeat stays predictively pruned (non-speculative). It is stripped from the positional-child count (specifierPrefix: declSpecifiers on topLevelDecl) and IGNORED by the linkage scan (linkageSpecifierIgnoredRules). FC16 (D-CSUBSET-NORETURN): the bare `_Noreturn` keyword (NoreturnKeyword) likewise joins the alts — FIRST {NoreturnKeyword} disjoint from all the above, so no speculation impact; it is stripped from the child count and IGNORED by the linkage scan (linkageSpecifierIgnoredKinds); the SEMANTIC noreturn scan reads it. The attribute forms (`[[noreturn]]`/`__attribute__((noreturn))`) ride the existing attrSpec/stdAttr alts.",
+      "alt": [ "StaticKeyword", "NoreturnKeyword", "alignasSpec", "attrSpec", "stdAttr" ]
     },
     "attrSpec": {
       "$comment": "FC4 c1: the argument grew the parenthesized-string form `visibility(\"hidden\")` — an Identifier optionally followed by `( string-literal )`. The inline sequences add NO wrapper nodes, so the bare `weak`/`static` tree shapes are byte-identical to pre-FC4. linkageFrom's composite-key lookup (`visibility:hidden`) pairs the identifier with the decoded string body.",
@@ -837,7 +838,7 @@
     },
     "localDeclSpecifier": {
       "$comment": "Local storage-class specifiers + attributes. `static` (D-CSUBSET-LOCAL-STATIC) confers STATIC storage duration (C 6.2.4) — the varDecl row's linkageSpecifiers maps it to {binding:local, staticStorage:true} and CST→HIR routes the declaration to a hidden module-global; register/auto parse and are semantically inert (C: hints/default storage). `static` in a for-init is a C 6.8.5p3 violation, gated loud by the forDecl row. C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): `alignasSpec` joins the local-specifier alts too (a block-scope `alignas(16) int x;` is legal C) — FIRST {AlignasKeyword, AlignasLegacyKeyword} disjoint from the others, so the repeat stays predictively pruned; stripped from the child count (specifierPrefix: localDeclSpecifiers on varDecl) and ignored by the linkage scan.",
-      "alt": [ "StaticKeyword", "RegisterKeyword", "AutoKeyword", "alignasSpec", "attrSpec", "stdAttr" ]
+      "alt": [ "StaticKeyword", "RegisterKeyword", "AutoKeyword", "NoreturnKeyword", "alignasSpec", "attrSpec", "stdAttr" ]
     },
 
     "paramList": {
@@ -1316,7 +1317,8 @@
         "$staticStorageComment": "D-CSUBSET-LOCAL-STATIC: a block-scope `static` confers static storage duration (C 6.2.4). CST→HIR's linkageFrom folds {binding:local, staticStorage:true} from the SAME prefix scan and routes the declaration to a hidden module-global (internal linkage). register/auto/attribute specifiers carry no linkage and are ignored (ignoredKinds/ignoredRules) so they never trip the unknown-specifier diagnostic.",
         "$volatileComment": "c27 (D-CSUBSET-VOLATILE-POINTEE): `volatile` is a TYPE qualifier (TypeKind::VolatileQual). The resolver wraps the base in VolatileQual when a volatileMarker precedes the stars (`volatile int *` => Ptr<VolatileQual(int)>) and wraps the pointer for an east ptrQualifier (`int * volatile` => VolatileQual(Ptr<int>)); object-volatility is read off the symbol's top-level VolatileQual type at access lowering, pointee-volatility rides the accessed type at the deref/index/member (MirInstFlags::Volatile). ALL pointee/member/param/typedef forms now compile — the prior S_VolatilePointeeNotSupported reject is retired. const stays ignored (no wrapper).",
         "linkageSpecifiers": { "static": { "binding": "local", "staticStorage": true } },
-        "linkageSpecifierIgnoredKinds": ["RegisterKeyword", "AutoKeyword", "AttributeKeyword", "ParenOpen", "ParenClose"],
+        "$noreturnIgnoreComment": "FC16 (D-CSUBSET-NORETURN): the bare `_Noreturn` keyword carries NO linkage — ignored by kind (like RegisterKeyword/AutoKeyword). The attribute form `__attribute__((noreturn))` on a LOCAL is already covered by attrSpec ∈ linkageSpecifierIgnoredRules (wholesale). The SEMANTIC noreturn scan reads the keyword/attribute; without this ignore the `_Noreturn` token would fail loud H_UnknownLinkageSpecifier.",
+        "linkageSpecifierIgnoredKinds": ["RegisterKeyword", "AutoKeyword", "NoreturnKeyword", "AttributeKeyword", "ParenOpen", "ParenClose"],
         "$alignasIgnoreComment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an `alignasSpec` in the local specifier prefix (`alignas(16) int x;`) carries NO linkage — its subtree (`_Alignas ( … )`) is skipped WHOLESALE by the linkage scan (exactly like the C23 `stdAttr` `[[…]]`). The alignment is read by the SEMANTIC alignas scan, not here. Without this the `_Alignas` keyword token would fail loud H_UnknownLinkageSpecifier.",
         "linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr", "alignasSpec"] },
       { "rule": "identVarDecl", "head": 0, "declaratorList": 1, "kind": "variable",
@@ -1347,9 +1349,11 @@
           "weak":   { "binding": "weak"  },
           "visibility:hidden": { "visibility": "hidden" }
         },
-        "linkageSpecifierIgnoredKinds": ["AttributeKeyword", "ParenOpen", "ParenClose"],
-        "$alignasIgnoreComment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an `alignasSpec` in a file-scope declaration's specifier prefix (`alignas(32) int g;`) carries NO linkage — skipped wholesale by the linkage scan (like `stdAttr`); the alignment is read by the semantic alignas scan. `attrSpec` is deliberately NOT ignored here (its `__attribute__((weak/visibility))` tokens ARE meaningful linkage).",
+        "linkageSpecifierIgnoredKinds": ["AttributeKeyword", "ParenOpen", "ParenClose", "NoreturnKeyword"],
+        "$alignasIgnoreComment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an `alignasSpec` in a file-scope declaration's specifier prefix (`alignas(32) int g;`) carries NO linkage — skipped wholesale by the linkage scan (like `stdAttr`); the alignment is read by the semantic alignas scan. `attrSpec` is deliberately NOT ignored here (its `__attribute__((weak/visibility))` tokens ARE meaningful linkage). FC16 (D-CSUBSET-NORETURN): the bare `_Noreturn` keyword carries NO linkage → ignored by kind (NoreturnKeyword).",
         "linkageSpecifierIgnoredRules": ["stdAttr", "alignasSpec"],
+        "$noreturnIgnoreNamesComment": "FC16 (D-CSUBSET-NORETURN): the GNU `__attribute__((noreturn))` form shares the `attrSpec` rule with the HONORED linkage attributes (`weak`, `visibility`), so attrSpec CANNOT be ignored wholesale here — the `noreturn` IDENTIFIER is skipped by NAME instead (dunder-normalized, so it also covers `__noreturn__`). A no-op `{binding:...}` linkageSpecifiers entry was REJECTED: it would clobber a co-present `static`/`weak` last-wins (an order-dependent silent linkage miscompile). Any OTHER unknown attribute identifier still fails loud H_UnknownLinkageSpecifier. `[[noreturn]]` rides stdAttr (already wholesale-ignored).",
+        "linkageSpecifierIgnoredNames": ["noreturn"],
         "kindByChild": {
           "$comment": "Post-strip children: [topLevelHead, initDeclaratorList, topLevelDeclTail]. childPath [2,0] = the tail's sole child — a `block` node (function definition) or the EndStatement token (variable; whenRule never matches a token). paramsPath/bodyPath are ABSENT: in declarator mode the params live inside the declarator's fnSuffix and the matched block IS the body.",
           "childPath": [2, 0],
@@ -1453,6 +1457,8 @@
     "alignas": { "specRule": "alignasSpec", "argChild": 2, "typeFormRule": "alignasTypeName" },
     "$packedComment": "FC16 (D-CSUBSET-PACKED): C/C23 `__attribute__((packed))` / `[[gnu::packed]]` on a struct/union. `listRule` = the `compositeAttrList` shape (the trailing attribute list after a struct/union body). `attributeNames` = the identifiers that mean `packed` (matched dunder-normalized via the shared stripDunder, so `__packed__` ≡ `packed`; `gnu::packed` matches by its final segment `packed`). The semantic tier scans a structSpec/unionSpec node for a `compositeAttrList` child, extracts each `attrSpec`/`stdAttr` identifier, and marks the composite `packed` (→ the interner's completeComposite → computeLayout removes all inter-field padding + sets natural alignment 1). An unrecognized `__attribute__((X))` identifier fails loud S_UnknownTypeAttribute (typo protection like H_UnknownLinkageSpecifier); an unrecognized `[[…]]` is standard-ignorable (the [[deprecated]] precedent). packed + a bit-field member → S_PackedBitfieldUnsupported (D-CSUBSET-PACKED-BITFIELD-INTERACTION). Absent block ⇒ the language has no composite-attribute surface. Source-agnostic: nothing hardcodes the spelling `packed`.",
     "packed": { "listRule": "compositeAttrList", "attributeNames": ["packed"], "strictAttrRule": "attrSpec" },
+    "$noreturnComment": "FC16 (D-CSUBSET-NORETURN): the C11/C23 `noreturn` FUNCTION attribute. `keywordToken` = the `_Noreturn` keyword (C11 6.7.4); `attributeNames` = the recognized attribute identifiers (`[[noreturn]]`/`__attribute__((noreturn))`/`[[gnu::noreturn]]`, dunder-normalized at the scan so `__noreturn__` matches). The semantic tier scans a function declaration's specifier prefix (specifierPrefixNamesNoreturn) for EITHER form and marks the symbol isNoreturn; a DIRECT call to such a function is wrapped `Block{ ExprStmt(call), Unreachable }` at HIR lowering (the wrapIfProvablyInfinite precedent). Source-agnostic: nothing hardcodes the spelling.",
+    "noreturn": { "keywordToken": "NoreturnKeyword", "attributeNames": ["noreturn"] },
     "$variadicComment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. vaArgExpr = [ VaArgKeyword, '(', assignmentExpr(apChild 2), ',', castTypeRef(typeChild 4), ')' ] → pass 2 resolves+stamps the castTypeRef through the SAME resolver casts use (so the HIR lowering recovers the read type T) and stamps the node T; it type-checks `ap` is a va_list. vaStartExpr/vaEndExpr = [ kw, '(', assignmentExpr(apChild 2), ... ] → node stamped `void`; ap type-checked va_list; vaStart also flips the enclosing function's uses-va-start attribute so the LIR prologue spills the arg registers.",
     "variadic": {
       "vaArgRule":   "vaArgExpr",   "vaArgApChild":   2, "vaArgTypeChild": 4,

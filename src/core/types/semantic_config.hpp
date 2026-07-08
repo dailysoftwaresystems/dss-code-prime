@@ -423,6 +423,20 @@ struct DSS_EXPORT DeclarationRule {
     // names (unknown → fail-loud); empty ⇒ nothing skipped (the strict
     // default — an unanticipated subtree's tokens are still validated).
     std::vector<RuleId>        linkageSpecifierIgnoredRules;
+    // FC16 (D-CSUBSET-NORETURN): specifier IDENTIFIER spellings the linkage scan
+    // skips as semantic NO-OPs — completing the ignore trio at identifier
+    // granularity (ignoredKinds = token kinds; ignoredRules = whole subtrees;
+    // THIS = identifier texts). Needed for a non-linkage ATTRIBUTE that shares the
+    // GNU `__attribute__((...))` rule with HONORED linkage attributes (`weak`,
+    // `visibility`), so its subtree cannot be ignored wholesale: `noreturn` must
+    // be skipped WITHOUT firing H_UnknownLinkageSpecifier AND without giving it a
+    // spurious linkage EFFECT (a `{binding:global}` no-op entry would clobber a
+    // co-present `static`/`weak` last-wins — an order-dependent silent linkage
+    // miscompile). Matched dunder-normalized (`stripDunder`), so a single
+    // `"noreturn"` entry covers `noreturn` AND `__noreturn__`. An identifier NOT
+    // listed here (and not a recognized linkage specifier) STILL fails loud — the
+    // strict default is preserved. Empty ⇒ nothing skipped by name.
+    std::vector<std::string>   linkageSpecifierIgnoredNames;
     DeclarationKind kind        = DeclarationKind::Variable;
     NameMatchMode   nameMatch   = NameMatchMode::Self;
     // FC4 c1 stage 2a: when true, every declarator under this (declarator-
@@ -1228,6 +1242,21 @@ struct DSS_EXPORT SemanticConfig {
     // precedent). Invalid ⇒ no strict form (every unrecognized attribute ignorable).
     RuleId                   compositeStrictAttrRule{};
     std::string              compositeStrictAttrRuleName;
+    // FC16 (D-CSUBSET-NORETURN): the C11/C23 `noreturn` FUNCTION attribute
+    // vocabulary. `noreturnKeywordToken` is the `_Noreturn` KEYWORD token (C11
+    // 6.7.4); `noreturnAttributeNames` is the recognized ATTRIBUTE-identifier set
+    // (`noreturn` — C23 6.7.12.7 `[[noreturn]]` / GNU `__attribute__((noreturn))`
+    // / `[[gnu::noreturn]]`, dunder-normalized at the scan so `__noreturn__`
+    // matches). The semantic tier scans a function declaration's SPECIFIER PREFIX
+    // for EITHER form (`specifierPrefixNamesNoreturn`) and marks the function
+    // symbol `isNoreturn`; the HIR lowering then wraps a direct call to such a
+    // function as `Block{ ExprStmt(call), Unreachable }` so a noreturn-terminated
+    // path structurally terminates (the `wrapIfProvablyInfinite` precedent).
+    // Both invalid/empty ⇒ the language has no `noreturn` surface (the scan never
+    // runs — toy/tsql). Source-AGNOSTIC: WHICH token + WHICH names are per-language
+    // config; the engine never hardcodes the spelling "noreturn".
+    std::optional<SchemaTokenId> noreturnKeywordToken;
+    std::vector<std::string>     noreturnAttributeNames;
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. `vaArgRule`
     // = the `va_arg(ap,T)` form; pass 2 resolves+stamps its `vaArgTypeChild`
     // castTypeRef (so the HIR lowering recovers the read type T) + stamps the node

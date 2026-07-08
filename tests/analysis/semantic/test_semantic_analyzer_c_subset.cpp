@@ -4869,6 +4869,73 @@ TEST(SemanticAnalyzerCSubset, FnPrototypeForwardCallResolvesSemantically) {
         << "the prototype is upgraded to a callable Function symbol";
 }
 
+// FC16 (D-CSUBSET-NORETURN): the surviving Function symbol named `name` is
+// noreturn (its `isNoreturn` bit). Mirrors `countSurvivingFns` — the `!isAbsorbedProto`
+// filter isolates the single callable record a call resolves to.
+[[nodiscard]] inline bool
+survivingFnIsNoreturn(SemanticModel const& model, std::string_view name) {
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& r = model.symbols()[i];
+        if (r.name == name && r.kind == DeclarationKind::Function
+            && !r.isAbsorbedProto) {
+            return r.isNoreturn;
+        }
+    }
+    return false;
+}
+
+// (f) FC16 (D-CSUBSET-NORETURN): a prototype that spells `_Noreturn` + a
+// definition that does NOT must OR-merge the noreturn attribute INTO the surviving
+// record (the definition — the proto is absorbed). A call resolves to the survivor,
+// so without the merge the call site would not see the attribute. Witnesses the
+// post-1.5 mergedFnDecls OR-merge. RED-ON-DISABLE: drop the OR-merge → detection
+// only marked the absorbed proto, so the survivor's isNoreturn stays false and the
+// EXPECT_TRUE flips.
+TEST(SemanticAnalyzerCSubset, NoreturnProtoMergesIntoDefinition) {
+    auto model = analyzeShipped("c-subset", {
+        "_Noreturn void die(int);\n"
+        "void die(int x){ while(1){} }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a _Noreturn proto + a compatible definition must merge cleanly";
+    EXPECT_EQ(countSurvivingFns(model, "die"), 1u);
+    EXPECT_TRUE(survivingFnIsNoreturn(model, "die"))
+        << "the _Noreturn on the proto must OR-merge into the surviving definition";
+}
+
+// (g) FC16 (D-CSUBSET-NORETURN): a shipped-descriptor symbol declared
+// `"noreturn": true` (the abort/exit shape) threads onto the injected
+// SymbolRecord's isNoreturn — a shipped extern has no user prototype to carry
+// `_Noreturn`. Witnesses ShippedSymbol.noreturn -> SymbolRecord.isNoreturn at the
+// injection site; a sibling symbol without the key stays non-noreturn.
+// RED-ON-DISABLE: drop `rec.isNoreturn = sym.noreturn` at injection -> `boom`
+// stays false.
+TEST(SemanticAnalyzerCSubset, NoreturnShippedDescriptorSymbolIsNoreturn) {
+    dss::test_support::ScratchDir sysDir{
+        dss::test_support::Location::Temp, "nr-desc"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "boom.json",
+        R"({ "header": "boom.h", "library": { "pe": "msvcrt.dll", "elf": "libc.so.6" },
+             "symbols": [ { "name": "boom",  "signature": "fn() -> void", "noreturn": true },
+                          { "name": "plain", "signature": "fn() -> void" } ] })",
+        "#include <boom.h>\nint main() { return 0; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    ASSERT_FALSE(model.hasErrors());
+    bool sawBoom = false, sawPlain = false, boomNr = false, plainNr = false;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& r = model.symbols()[i];
+        if (r.name == "boom")  { sawBoom = true;  boomNr  = r.isNoreturn; }
+        if (r.name == "plain") { sawPlain = true; plainNr = r.isNoreturn; }
+    }
+    ASSERT_TRUE(sawBoom);
+    ASSERT_TRUE(sawPlain);
+    EXPECT_TRUE(boomNr)
+        << "a descriptor `noreturn:true` symbol must inject SymbolRecord.isNoreturn";
+    EXPECT_FALSE(plainNr)
+        << "a descriptor symbol without `noreturn` stays non-noreturn";
+}
+
 // ── D-CSUBSET-BLOCK-SCOPE-PROTOTYPE — a block-scope function prototype REFERS
 //    to (and merges with) the file-scope function (C 6.2.2p4 / 6.7.6.3) ──
 //

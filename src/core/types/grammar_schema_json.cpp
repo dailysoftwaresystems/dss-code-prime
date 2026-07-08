@@ -4935,6 +4935,42 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                         }
 
+                        // FC16 (D-CSUBSET-NORETURN): optional list of specifier
+                        // IDENTIFIER spellings the linkage scan skips as semantic
+                        // NO-OPs (the identifier-granularity sibling of
+                        // linkageSpecifierIgnoredKinds/Rules):
+                        //   "linkageSpecifierIgnoredNames": ["noreturn"]
+                        // For a NON-linkage attribute that shares the GNU
+                        // `__attribute__((...))` rule with honored linkage attrs
+                        // (weak/visibility) — so its subtree can't be ignored
+                        // wholesale. Matched dunder-normalized in linkageFrom
+                        // (`noreturn` covers `__noreturn__`). An identifier NOT
+                        // listed here still fails loud (strict default preserved).
+                        if (entry.contains("linkageSpecifierIgnoredNames")) {
+                            auto const& lin =
+                                entry.at("linkageSpecifierIgnoredNames");
+                            if (!lin.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/linkageSpecifierIgnoredNames",
+                                          std::format("'declarations[{}]."
+                                                      "linkageSpecifierIgnoredNames' must "
+                                                      "be an array of specifier-name "
+                                                      "strings", i));
+                            } else {
+                                for (auto const& elem : lin) {
+                                    if (!elem.is_string()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  path + "/linkageSpecifierIgnoredNames",
+                                                  "each ignored-name entry must be a "
+                                                  "specifier-name string");
+                                        continue;
+                                    }
+                                    rule.linkageSpecifierIgnoredNames.push_back(
+                                        elem.get<std::string>());
+                                }
+                            }
+                        }
+
                         // FC4 c1 (M5): optional config-driven fail-loud
                         // marker gates:
                         //   "gatedMarkers": [ { "token": "VolatileKeyword",
@@ -7551,6 +7587,60 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 cfg.compositeStrictAttrRule     = data.rules->find(rn);
                                 cfg.compositeStrictAttrRuleName = rn;
                             }
+                        }
+                    }
+                }
+            }
+
+            // ── noreturn function attribute (FC16, D-CSUBSET-NORETURN) ──
+            // `{ keywordToken, attributeNames }` — the `_Noreturn` KEYWORD token
+            // (C11 6.7.4) + the recognized `noreturn` ATTRIBUTE-identifier set
+            // (C23 6.7.12.7 `[[noreturn]]` / GNU `__attribute__((noreturn))`,
+            // dunder-normalized at the scan). The semantic tier reads a function
+            // declaration's specifier prefix for EITHER and marks the symbol
+            // `isNoreturn`. `keywordToken` resolves like `volatileMarker` (an
+            // OPTIONAL token; unknown name → C_UnknownToken); `attributeNames`
+            // mirrors packed's `attributeNames`. An ABSENT block leaves both
+            // unset ⇒ no surface. Source-agnostic: nothing hardcodes "noreturn".
+            if (sem.contains("noreturn")) {
+                json const& nr = sem.at("noreturn");
+                if (!nr.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/noreturn",
+                              "'semantics.noreturn' must be an object "
+                              "{ keywordToken, attributeNames }");
+                } else {
+                    if (!nr.contains("keywordToken")
+                        || !nr.at("keywordToken").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/noreturn/keywordToken",
+                                  "'keywordToken' is required and must be a string");
+                    } else {
+                        std::string const tn =
+                            nr.at("keywordToken").get<std::string>();
+                        if (!data.schemaTokens->contains(tn)) {
+                            coll.emit(DiagnosticCode::C_UnknownToken,
+                                      "/semantics/noreturn/keywordToken",
+                                      std::format("'noreturn.keywordToken' references "
+                                                  "unknown token kind '{}'", tn));
+                        } else {
+                            cfg.noreturnKeywordToken = data.schemaTokens->find(tn);
+                        }
+                    }
+                    if (!nr.contains("attributeNames")
+                        || !nr.at("attributeNames").is_array()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/noreturn/attributeNames",
+                                  "'attributeNames' is required and must be an array "
+                                  "of strings");
+                    } else {
+                        for (json const& e : nr.at("attributeNames")) {
+                            if (!e.is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/noreturn/attributeNames",
+                                          "each 'attributeNames' entry must be a string");
+                                continue;
+                            }
+                            cfg.noreturnAttributeNames.push_back(e.get<std::string>());
                         }
                     }
                 }

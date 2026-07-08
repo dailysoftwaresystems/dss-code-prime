@@ -1007,6 +1007,21 @@ struct Lowerer {
                 continue;
             }
             std::string key{tree().text(n)};
+            // FC16 (D-CSUBSET-NORETURN): a specifier IDENTIFIER declared a semantic
+            // NO-OP by NAME (`linkageSpecifierIgnoredNames`) is skipped WITHOUT a
+            // linkage effect and WITHOUT firing H_UnknownLinkageSpecifier — the
+            // identifier-granularity sibling of the kind/rule ignore lists, for a
+            // non-linkage attribute (`noreturn`) that shares the GNU
+            // `__attribute__((...))` rule with honored linkage attrs. Dunder-
+            // normalized so `"noreturn"` covers `__noreturn__`. Any identifier NOT
+            // listed still falls through to the strict lookup below (fail-loud).
+            if (!decl.linkageSpecifierIgnoredNames.empty()) {
+                std::string_view const bare = stripDunder(key);
+                bool ignoredByName = false;
+                for (std::string const& nm : decl.linkageSpecifierIgnoredNames)
+                    if (bare == nm) { ignoredByName = true; break; }
+                if (ignoredByName) continue;
+            }
             // Composite probe: the next non-ignored token opens a string
             // literal → pair this specifier with the decoded body.
             if (strStart.valid() && strBody.valid()) {
@@ -6101,6 +6116,27 @@ struct Lowerer {
         return asStmt(*lv, lvWrite(*lv, value), incDecNode);
     }
 
+    // FC16 (D-CSUBSET-NORETURN): true iff `id` is a DIRECT call to a function
+    // symbol declared noreturn (`_Noreturn`/`[[noreturn]]`/`__attribute__((noreturn))`
+    // — or a shipped `abort`/`exit`). ⚠️ F1 (the miscompile guard): inspect the
+    // lowered Call's CALLEE CHILD directly (`makeCall` pushes the callee first, so
+    // it is `children().front()`) — it must be a `HirKind::Ref` whose bound record
+    // is noreturn. NEVER the `firstNameToken` name-resolver: a noreturn function is
+    // ADDRESS-TAKEABLE, so `(cond ? die : other)(1)` is legal C; firstNameToken
+    // would resolve that to `die` and wrongly wrap it → eliding `other`'s return
+    // path = a MISCOMPILE. A ternary / deref / cast callee lowers to a NON-Ref node
+    // → false (safe, conservative); a function-POINTER object `fp(1)` lowers to
+    // Ref(fp) whose record has isNoreturn==false → false (safe). Only a bare direct
+    // call to a noreturn callee is wrapped.
+    [[nodiscard]] bool isDirectNoreturnCall(HirNodeId id) const {
+        if (builder.kind(id) != HirKind::Call) return false;
+        auto const kids = builder.children(id);
+        if (kids.empty() || builder.kind(kids.front()) != HirKind::Ref) return false;
+        SymbolId const sym{builder.payload(kids.front())};
+        auto const* rec = model.recordFor(sym);
+        return rec != nullptr && rec->isNoreturn;
+    }
+
     // The statement-position dispatch shared by exprStmt and for-init/update:
     // assignment / compound-assignment / inc-dec become statements; anything else
     // is the bare lowered expression (wrapped in ExprStmt when `wrapBare`).
@@ -6146,7 +6182,25 @@ struct Lowerer {
             }
         }
         HirNodeId e = lowerExpr(core).id;
-        return wrapBare ? track(builder.makeExprStmt(e), core) : e;
+        if (!wrapBare) return e;   // for-init/update: the bare expression (untouched)
+        // FC16 (D-CSUBSET-NORETURN): a DIRECT call to a noreturn function
+        // structurally terminates — wrap it `Block{ ExprStmt(call), Unreachable }`
+        // (the Block + terminator leaf both Synthetic; the ExprStmt is the real
+        // relocated statement, non-synthetic) EXACTLY like `wrapIfProvablyInfinite`
+        // wraps a provably-infinite loop, so a noreturn-terminated path satisfies
+        // non-void return completeness. `lowerStmtExprCore` (wrapBare=true) is the
+        // single chokepoint every statement-position body routes through (block-item
+        // + bare if/while/for/label arm), so this covers them all. HIR→MIR spins the
+        // following statement into a dead pruned block via the existing
+        // open-block-has-terminator guard (the infinite-loop wrap precedent).
+        if (isDirectNoreturnCall(e)) {
+            HirNodeId const stmt = track(builder.makeExprStmt(e), core);
+            HirNodeId const unreach = builder.addLeaf(
+                HirKind::Unreachable, InvalidType, /*payload=*/0, HirFlags::Synthetic);
+            HirNodeId const wrapped[] = {stmt, unreach};
+            return track(builder.makeBlock(wrapped, HirFlags::Synthetic), core);
+        }
+        return track(builder.makeExprStmt(e), core);
     }
 
     HirNodeId lowerExprStmt(NodeId node) {

@@ -232,6 +232,19 @@ struct DSS_EXPORT SymbolRecord {
     // codegen is a SEPARATE deferred task (D-CSUBSET-ALIGNAS: this cycle stores it
     // unconsumed for variables — member alignas works end-to-end via the interner).
     std::optional<std::uint32_t> explicitAlignment;
+    // FC16 (D-CSUBSET-NORETURN): TRUE iff this FUNCTION symbol is declared
+    // `noreturn` (C11 6.7.4 `_Noreturn` / C23 6.7.12.7 `[[noreturn]]` / GNU
+    // `__attribute__((noreturn))`). Set at Pass-1.5 declarator resolution when the
+    // function declaration's specifier prefix names the attribute (gated on the
+    // declared type being a FnSig), OR from a shipped-lib descriptor's `noreturn`
+    // (abort/exit). OR-merged across a proto/definition pair (the post-1.5
+    // mergedFnDecls sweep) so a call — which resolves to the definition — sees the
+    // flag even when only the prototype spelled it. Read at HIR lowering: a DIRECT
+    // call to such a function is wrapped `Block{ ExprStmt(call), Unreachable }` so
+    // the path structurally terminates (the `wrapIfProvablyInfinite` precedent). A
+    // DROPPED flag is a safe miss (a spurious H_VerifierFailure — fail-loud), never
+    // a silent miscompile. Default false.
+    bool            isNoreturn = false;
 };
 
 // FF11 neutral-JSON shipped-library descriptor extern

@@ -1839,6 +1839,50 @@ firstAlignasSpecInPrefix(EngineState& s, SemanticConfig const& cfg,
     return {};
 }
 
+// FC16 (D-CSUBSET-NORETURN): true iff a declaration's specifier prefix names the
+// `noreturn` function attribute — in EITHER the `_Noreturn` KEYWORD form (a token
+// of `cfg.noreturnKeywordToken`, C11 6.7.4) OR an ATTRIBUTE form (`[[noreturn]]` /
+// `__attribute__((noreturn))` / `__attribute__((__noreturn__))` / `[[gnu::noreturn]]`,
+// C23 6.7.12.7 / GNU), matched by an attribute IDENTIFIER leaf (dunder-normalized
+// via the shared `stripDunder`, so `__noreturn__` ≡ `noreturn` and `[[gnu::noreturn]]`'s
+// final segment matches) against `cfg.noreturnAttributeNames`. A bounded descendant
+// search over the STRIPPED specifier prefix (the same `specifierPrefixChild` accessor
+// the linkage + alignas scans use).
+//
+// CRITICAL: it matches BOTH forms — the `scanCompositePacked` precedent matches
+// IDENTIFIERS only, which would MISS a bare `_Noreturn` KEYWORD (a distinct token
+// kind, not an identifier). Emits NOTHING: detection that drops a flag is a SAFE
+// miss (a spurious H_VerifierFailure downstream is fail-loud), never a silent
+// miscompile — so no diagnostic surface is needed here.
+[[nodiscard]] bool
+specifierPrefixNamesNoreturn(SemanticConfig const& cfg, Tree const& tree,
+                             NodeId declNode, DeclarationRule const& decl) {
+    bool const haveKeyword = cfg.noreturnKeywordToken.has_value()
+                          && cfg.noreturnKeywordToken->valid();
+    if (!haveKeyword && cfg.noreturnAttributeNames.empty()) return false;
+    NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
+    if (!prefix.valid()) return false;
+    std::vector<NodeId> stack{prefix};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId c = stack.back(); stack.pop_back();
+        if (tree.kind(c) == NodeKind::Internal) {
+            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+            continue;
+        }
+        // (a) the `_Noreturn` KEYWORD token.
+        if (haveKeyword && tree.tokenKind(c).v == cfg.noreturnKeywordToken->v)
+            return true;
+        // (b) an attribute IDENTIFIER naming `noreturn` (dunder-normalized).
+        if (cfg.identifierToken.valid()
+            && tree.tokenKind(c) == cfg.identifierToken) {
+            std::string_view const id = stripDunder(tree.text(c));
+            for (std::string const& nm : cfg.noreturnAttributeNames)
+                if (id == nm) return true;
+        }
+    }
+    return false;
+}
+
 // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): compute + validate the alignment an
 // `alignasSpec` node requests. Reads the `alignasArg` operand (visible-child
 // `alignasArgChild`): a `castTypeRef` (TYPE form) resolves the type + reads its
@@ -3608,6 +3652,13 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                     // shares the head type, so the check is identical for every slot.
                     NodeId const declAlignasSpec =
                         firstAlignasSpecInPrefix(s, cfg, tree, node, decl);
+                    // FC16 (D-CSUBSET-NORETURN): does this declaration's specifier
+                    // prefix name the `noreturn` attribute? Computed ONCE per
+                    // declaration (like `declAlignasSpec`); STORED per-declarator
+                    // below, gated on the declared type being a FnSig (a `_Noreturn`
+                    // on a non-function object is inert — a named safe-miss deferral).
+                    bool const declHasNoreturn =
+                        specifierPrefixNamesNoreturn(cfg, tree, node, decl);
                     bool alignasHandledForDecl = false;
                     bool alignasBitfieldReported = false;
                     bool alignasContextReported = false;
@@ -3790,6 +3841,14 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                         bool const isFnSig = declTy.valid()
                             && s.lattice.interner().kind(declTy)
                                    == TypeKind::FnSig;
+                        // FC16 (D-CSUBSET-NORETURN): mark a FUNCTION symbol whose
+                        // declaration named the attribute. Gated on `isFnSig` so a
+                        // `_Noreturn int x;` (non-function) is INERT (a safe miss —
+                        // the named `_Noreturn`-on-non-function deferral), never a
+                        // wrongly-flagged data object. OR-merged into a proto/def
+                        // survivor by the post-1.5 sweep so a call sees the flag.
+                        if (isFnSig && declHasNoreturn)
+                            s.symbols.at(sym).isNoreturn = true;
                         // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): a VARIABLE's alignas.
                         // Only for a NON-field declaration (`!bitfieldSuffix` — a
                         // field is handled above); a PARAMETER carries its own
@@ -7980,6 +8039,11 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                 ? DeclarationKind::Function
                                 : DeclarationKind::Variable;
                 rec.type  = sym.signature;
+                // FC16 (D-CSUBSET-NORETURN): a descriptor-declared noreturn extern
+                // (stdlib.json's `abort`/`exit`) — externs have no user prototype
+                // to carry `_Noreturn`, so the flag rides the descriptor. A direct
+                // call to one is wrapped at HIR lowering exactly like a user one.
+                rec.isNoreturn = sym.noreturn;
                 SymbolId const id = s.symbols.mint(rec);
                 s.scopes.injectBinding(cuRoot, sym.name, id);
 
@@ -8118,6 +8182,19 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         for (auto const& tree : trees) treeById[tree.id().v] = &tree;
         for (auto const& [survivor, absorbed] : s.mergedFnDecls) {
             if (!survivor.valid() || !absorbed.valid()) continue;
+            // FC16 (D-CSUBSET-NORETURN): OR-merge the noreturn flag across the
+            // proto/def pair BEFORE the type-compat gate below (the flag is
+            // independent of signature compatibility, so it must not be skipped by
+            // the incompatible-redeclaration `continue`). Detection marks whichever
+            // side spelled the attribute (typically the prototype); a call resolves
+            // to the SURVIVOR (definition), so the load-bearing direction is INTO
+            // the survivor. OR-ing BOTH is harmless and covers either merge order.
+            {
+                bool const nr = s.symbols.at(survivor).isNoreturn
+                             || s.symbols.at(absorbed).isNoreturn;
+                s.symbols.at(survivor).isNoreturn = nr;
+                s.symbols.at(absorbed).isNoreturn = nr;
+            }
             auto const& sRec = s.symbols.at(survivor);
             auto const& aRec = s.symbols.at(absorbed);
             if (!sRec.type.valid() || !aRec.type.valid()) continue;

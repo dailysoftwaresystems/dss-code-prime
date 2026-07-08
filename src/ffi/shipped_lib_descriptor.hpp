@@ -134,6 +134,13 @@ struct DSS_EXPORT ShippedSymbol {
     // (undefined name). Keys are the `objectFormatKindFromName` vocabulary; an
     // unknown name fails loud on read. (D-SHIPPED-SYMBOL-PER-TARGET-AVAILABILITY)
     std::vector<std::string> availableObjectFormats;
+    // FC16 (D-CSUBSET-NORETURN): optional — TRUE iff this extern never returns
+    // (C11 `_Noreturn`: `abort`/`exit`). A shipped extern has no user prototype to
+    // carry `_Noreturn`, so the descriptor declares it. The semantic phase threads
+    // it onto the injected `SymbolRecord.isNoreturn`, and a DIRECT call is wrapped
+    // `Block{ ExprStmt(call), Unreachable }` at HIR lowering — the same treatment a
+    // user-declared noreturn function gets. Default false.
+    bool noreturn = false;
 };
 
 // One decoded named CONSTANT — the neutral form of a header's object-like

@@ -1196,6 +1196,86 @@ TEST(MirLoweringCSubsetLinkage, WeakAttributeThreadsToMirBinding) {
         << "__attribute__((weak)) must thread to exactly one MirFunc binding==Weak";
 }
 
+// D-CSUBSET-NORETURN linkage-safety (FC16): a `noreturn` attribute co-present
+// with `static` must NOT clobber the function's internal linkage. `linkageFrom`
+// composes declaration-specifiers LAST-WINS with an UNCONDITIONAL overwrite, and
+// at file scope `static` maps to {binding:local}. `noreturn` is a NON-linkage
+// attribute that shares the GNU `__attribute__((...))` rule with the HONORED
+// linkage attrs (weak / visibility), so it cannot be dropped wholesale by rule;
+// it is skipped by NAME (`linkageSpecifierIgnoredNames:["noreturn"]`) with NO
+// linkage effect — leaving `static`'s Local binding intact. This pins that `f`
+// threads to MirFunc binding==Local in BOTH specifier orders. Order-independence
+// is the point: the REJECTED no-op `linkageSpecifiers:{"noreturn":{binding:...}}`
+// entry would clobber a co-present `static`/`weak` via last-wins, and THAT clobber
+// is order-DEPENDENT — so the reversed-order arm is the direct witness against it.
+//
+// `f`'s body is a self-recursive call `f()` — a DIRECT call to a noreturn callee,
+// wrapped with a synthetic Unreachable in the REACHABLE entry block (the HIR
+// noreturn-wrap shape). This keeps `f` genuinely non-returning AND self-contained:
+// no extern (the callee is `f` itself, a defined module function — no FfiMetadata
+// mangledName needed) and no unreachable loop-exit block (unlike `for(;;){}`, whose
+// trailing implicit-return block orphans → I_UnreachableBlock). The binding-count
+// vehicle mirrors the Weak case above: `f` (static) is the ONLY Local binding and
+// `main` is Global, so localCount==1 asserts f==Local. localCount==0 is the RED
+// signal for BOTH failure modes: `f` dropped, or `f` silently EXTERNALIZED (Global)
+// by a reintroduced clobber.
+//
+// RED-ON-DISABLE: revert the deviation to
+//   "linkageSpecifiers": { ..., "noreturn": { "binding": "global" } }
+// (dropping linkageSpecifierIgnoredNames) and `f`'s Local binding is overwritten
+// Global by last-wins → localCount flips to 0 → RED. A silent linkage
+// externalization of `static __attribute__((noreturn)) void f` is a miscompile.
+TEST(MirLoweringCSubsetLinkage, StaticNoreturnKeepsInternalLinkage) {
+    for (char const* src : {
+             // `static` BEFORE the attribute.
+             "static __attribute__((noreturn)) void f(void){ f(); }\n"
+             "int main(void){ return 0; }\n",
+             // REVERSED specifier order — attribute BEFORE `static`. Proves the
+             // name-skip is order-independent (the clobber it prevents is not).
+             "__attribute__((noreturn)) static void f(void){ f(); }\n"
+             "int main(void){ return 0; }\n"}) {
+        auto L = lowerCSubset(src);
+        ASSERT_FALSE(L.model.hasErrors()) << src << "\n"
+            << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.hir->ok) << src << "\n"
+            << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+        ASSERT_TRUE(L.mir.ok) << src << "\n"
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleFuncCount(), 2u) << src << "\nf + main (pre-DCE)";
+
+        // Exactly one function is Local — that is `f` (from `static`, UNCLOBBERED
+        // by the co-present noreturn); `main` is Global. Anything but 1 means
+        // `static` failed to thread (0), the noreturn attribute externalized `f`
+        // (0), or Local leaked elsewhere (2).
+        int localCount = 0;
+        for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+            if (m.funcBinding(m.funcAt(i)) == SymbolBinding::Local) ++localCount;
+        EXPECT_EQ(localCount, 1) << src << "\n"
+            << "static __attribute__((noreturn)) f must keep internal linkage "
+               "(binding==Local); the co-present noreturn must NOT externalize it";
+    }
+
+    // The name-skip is EXACT — only names in `linkageSpecifierIgnoredNames` skip.
+    // An UNKNOWN attribute co-present with `static` must STILL fail loud
+    // (H_UnknownLinkageSpecifier): `static` must not rescue it and the strict
+    // fail-loud default survives. Extends `UnknownAttributeOnFunctionFailsLoud`
+    // (below) with a co-present `static`. RED-ON-DISABLE: widen the name-skip to a
+    // wholesale attrSpec ignore and `frobnicate` is silently dropped (n==0).
+    {
+        auto L = lowerCSubset(
+            "static __attribute__((frobnicate)) int f(void){ return 0; }\n");
+        EXPECT_FALSE(L.hir->ok)
+            << "an unknown attribute co-present with static must still fail HIR lowering";
+        std::size_t n = 0;
+        for (auto const& d : L.hirReporter.all())
+            if (d.code == DiagnosticCode::H_UnknownLinkageSpecifier) ++n;
+        EXPECT_EQ(n, 1u)
+            << "exactly one H_UnknownLinkageSpecifier for 'frobnicate' "
+               "(a co-present static must not suppress the fail-loud)";
+    }
+}
+
 // D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC (cycle 14): an UNRECOGNIZED
 // specifier inside `__attribute__((...))` — a typo (`bogus`) or an unsupported
 // attribute — FAILS LOUD (H_UnknownLinkageSpecifier), never silently ignored. The

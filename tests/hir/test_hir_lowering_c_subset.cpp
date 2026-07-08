@@ -1791,6 +1791,95 @@ TEST(HirLoweringCSubset, BreakableInfiniteLoopIsNotWrapped) {
         << "the breakable loop must lower to a bare WhileStmt, not a wrapper Block";
 }
 
+// ── FC16 (D-CSUBSET-NORETURN): a direct call to a noreturn function terminates ──
+//
+// A NON-`main` non-void function whose fall-through tail is a DIRECT call to a
+// noreturn function (`_Noreturn void die(int); … die(1);`) is wrapped as
+// `Block{ ExprStmt(call), Synthetic Unreachable }` — the direct structural mirror
+// of the infinite-loop wrap above — so `f` structurally terminates and the
+// verifier is clean. RED-ON-DISABLE (revert detection / the wrap): `f`'s
+// fall-through no longer terminates → H_VerifierFailure count 1.
+TEST(HirLoweringCSubset, NoreturnCallTailWrapsAndVerifies) {
+    SemanticModel model = analyzeCSubset(
+        "_Noreturn void die(int); "
+        "int f(int x){ if(x>0) return x; die(1); } "
+        "int main(){ return f(1); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u)
+        << "the noreturn-call tail must satisfy non-void return completeness";
+    HirNodeId const f = functionNamed(res->hir, model, "f");
+    ASSERT_TRUE(f.valid());
+    EXPECT_TRUE(subtreeHasSyntheticUnreachable(res->hir, res->hir.functionBody(f)))
+        << "a direct call to a noreturn function must be wrapped with a synthetic Unreachable";
+}
+
+// All four `noreturn` spellings compile clean (parse + semantic + verify): the
+// C11 `_Noreturn` keyword, the C23 `[[noreturn]]`, and both GNU
+// `__attribute__((noreturn))` / `__attribute__((__noreturn__))`. Each must wrap
+// the `die(1)` tail (no H_VerifierFailure) AND — critically for the GNU forms on
+// a file-scope declaration — must NOT trip the linkage scan's
+// H_UnknownLinkageSpecifier (the `linkageSpecifierIgnoredNames` / ignoredKinds path).
+TEST(HirLoweringCSubset, NoreturnAllFourSpellingsCompileClean) {
+    for (char const* proto : {
+             "_Noreturn void die(int);",
+             "[[noreturn]] void die(int);",
+             "__attribute__((noreturn)) void die(int);",
+             "__attribute__((__noreturn__)) void die(int);"}) {
+        std::string const src = std::string(proto)
+            + " int f(int x){ if(x>0) return x; die(1); }"
+              " int main(){ return f(1); }";
+        SemanticModel model = analyzeCSubset(src);
+        ASSERT_FALSE(model.hasErrors()) << "spelling: " << proto;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << proto << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u) << proto;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u) << proto;
+        HirNodeId const f = functionNamed(res->hir, model, "f");
+        ASSERT_TRUE(f.valid()) << proto;
+        EXPECT_TRUE(subtreeHasSyntheticUnreachable(res->hir, res->hir.functionBody(f)))
+            << proto;
+    }
+}
+
+// ⚠️ F1 — an INDIRECT / address-takeable callee must NOT be wrapped (the
+// conservative direction), else a real return path is elided = MISCOMPILE. Two
+// witnesses, both of which `firstNameToken` would have MIS-resolved to a noreturn
+// name: (1) a ternary callee `(c ? die : other)(1)` lowers to a NON-Ref node →
+// isDirectNoreturnCall false; `other` can return, so f's fall-through does NOT
+// terminate → H_VerifierFailure STILL fires (the miscompile witness). (2) a
+// function-POINTER object `fp(1)` lowers to Ref(fp) whose record has
+// isNoreturn==false → not wrapped. In BOTH the un-relaxed fall-through keeps the
+// loud verifier failure — proof we did not silently elide the return path.
+TEST(HirLoweringCSubset, NoreturnIndirectCalleeIsNotWrapped) {
+    {   // (1) ternary callee — the address-takeable miscompile vector.
+        SemanticModel model = analyzeCSubset(
+            "_Noreturn void die(int); void other(int); "
+            "int f(int x, int c){ if(x>0) return x; (c ? die : other)(1); } "
+            "int main(){ return f(1,1); }");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 1u)
+            << "an address-takeable ternary callee must NOT be wrapped (F1)";
+    }
+    {   // (2) function-pointer object callee — Ref, but not a noreturn record.
+        SemanticModel model = analyzeCSubset(
+            "_Noreturn void die(int); "
+            "int f(int x){ if(x>0) return x; void (*fp)(int) = die; fp(1); } "
+            "int main(){ return f(1); }");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 1u)
+            << "a call through a function-pointer object must NOT be wrapped (F1)";
+    }
+}
+
 // ── FC5: goto / labels ──────────────────────────────────────────────────────
 
 namespace {
