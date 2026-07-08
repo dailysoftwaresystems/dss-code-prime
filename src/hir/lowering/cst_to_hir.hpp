@@ -88,6 +88,10 @@ struct DSS_EXPORT CstToHirResult {
     HirVolatileMap volatileMap;   // bound to `hir` — per-ACCESS volatility (c21,
                                   // D-CSUBSET-VOLATILE-QUALIFIER); read at HIR→MIR
                                   // to OR MirInstFlags::Volatile onto Load/Store
+    HirAlignmentMap alignmentMap; // bound to `hir` — per-DECLARATION explicit
+                                  // `alignas` (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN);
+                                  // read at HIR→MIR to raise a global's data-item
+                                  // alignment + a local's effective alloca alignment
     HirLiteralPool literalPool;   // decoded literal values, indexed by literalIndex
     // True iff neither lowering nor the verify-on-load pass emitted an
     // Error-severity diagnostic (delta-computed, so prior diagnostics on the
@@ -104,7 +108,8 @@ struct DSS_EXPORT CstToHirResult {
     // `hir` is declared first so the maps bind to the constructed module.
     CstToHirResult(Hir h, HirLiteralPool lp)
         : hir(std::move(h)), sourceMap(hir), linkageMap(hir),
-          mutabilityMap(hir), volatileMap(hir), literalPool(std::move(lp)) {}
+          mutabilityMap(hir), volatileMap(hir), alignmentMap(hir),
+          literalPool(std::move(lp)) {}
 
     CstToHirResult(CstToHirResult const&)            = delete;
     CstToHirResult& operator=(CstToHirResult const&) = delete;

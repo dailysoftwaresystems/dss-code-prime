@@ -302,6 +302,10 @@
     { "word": "continue", "kind": "ContinueKeyword" },
     { "word": "goto",     "kind": "GotoKeyword"     },
     { "word": "sizeof",   "kind": "SizeofKeyword"   },
+    { "word": "_Alignof", "kind": "AlignofKeyword"       },
+    { "word": "alignof",  "kind": "AlignofLegacyKeyword" },
+    { "word": "_Alignas", "kind": "AlignasKeyword"       },
+    { "word": "alignas",  "kind": "AlignasLegacyKeyword" },
 
     { "word": "_Static_assert", "kind": "StaticAssertKeyword"       },
     { "word": "static_assert",  "kind": "StaticAssertLegacyKeyword" },
@@ -338,9 +342,14 @@
       ]
     },
 
+    "structMemberDeclSpecifiers": {
+      "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the OPTIONAL leading alignment-specifier prefix of a struct/union member — one or more `alignasSpec` (`alignas(16) int a;`; C permits several, the strictest wins). A SEQUENCE (first + `{repeat}`) so its tree node is `structMemberDeclSpecifiers`, matched by the DeclarationRule `specifierPrefix` on structField/unionField and STRIPPED by decl_prefix_strip.hpp before positional-child counting — so structField's `head:0, declaratorList:1` indices stay stable whether or not a member carries alignas. FIRST = {AlignasKeyword, AlignasLegacyKeyword}, disjoint from `typeRefAllowingStruct`'s FIRST, so the enclosing `{optional}` is predictively decidable (non-speculative).",
+      "sequence": [ "alignasSpec", { "repeat": "alignasSpec" } ]
+    },
     "structField": {
-      "$comment": "c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR: a struct/union field is a type-specifier HEAD + an OPTIONAL `structMemberDeclaratorList` (a comma-separated list of per-slot declarators sharing the head base type, e.g. `int *a, b[4], *c;` — C 6.7.2.1) + `EndStatement`. SUPERSEDES c10's single `{optional declarator}{optional bitfieldDeclSuffix}`: each slot (`structMemberDeclarator`) now holds its OWN `declarator` AND its OWN `bitfieldDeclSuffix` so `int a:3, b:5;` resolves each width per-slot. Routing the member through the SAME `declarator` every other position uses (params/locals/globals) makes a function-pointer member (`int (*f)(int);`) parse + type-derive identically; the array suffix (`int arr[3];`) lives inside the declarator's OWN directDeclarator suffix chain. The LIST is OPTIONAL to admit the `int ;` declares-nothing form; a single-slot list with absent declarator + present suffix is the anonymous bit-field (`int : 3;` / zero-width `int : 0;`); the over-admitted nameless non-bitfield forms FAIL LOUD at semantic composition (anonymous member must be a bit-field).",
+      "$comment": "c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR: a struct/union field is a type-specifier HEAD + an OPTIONAL `structMemberDeclaratorList` (a comma-separated list of per-slot declarators sharing the head base type, e.g. `int *a, b[4], *c;` — C 6.7.2.1) + `EndStatement`. SUPERSEDES c10's single `{optional declarator}{optional bitfieldDeclSuffix}`: each slot (`structMemberDeclarator`) now holds its OWN `declarator` AND its OWN `bitfieldDeclSuffix` so `int a:3, b:5;` resolves each width per-slot. Routing the member through the SAME `declarator` every other position uses (params/locals/globals) makes a function-pointer member (`int (*f)(int);`) parse + type-derive identically; the array suffix (`int arr[3];`) lives inside the declarator's OWN directDeclarator suffix chain. The LIST is OPTIONAL to admit the `int ;` declares-nothing form; a single-slot list with absent declarator + present suffix is the anonymous bit-field (`int : 3;` / zero-width `int : 0;`); the over-admitted nameless non-bitfield forms FAIL LOUD at semantic composition (anonymous member must be a bit-field). C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an OPTIONAL leading `structMemberDeclSpecifiers` (`alignas(N) …`) precedes the head — declared as the `specifierPrefix` (below) so it is stripped before the head:0/declaratorList:1 count.",
       "sequence": [
+        { "optional": "structMemberDeclSpecifiers" },
         "typeRefAllowingStruct",
         { "optional": "structMemberDeclaratorList" },
         "EndStatement"
@@ -388,8 +397,9 @@
     },
 
     "unionField": {
-      "$comment": "c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR: a union field mirrors `structField` — a type-specifier HEAD + an OPTIONAL `structMemberDeclaratorList` (per-slot declarators sharing the head, e.g. `int *a, b;`) + `EndStatement`. The per-slot `structMemberDeclarator` holds its own declarator (function-pointer-member support: `int (*f)(int);`) AND its own bitfield suffix. The array suffix lives inside the declarator's directDeclarator suffix chain.",
+      "$comment": "c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR: a union field mirrors `structField` — a type-specifier HEAD + an OPTIONAL `structMemberDeclaratorList` (per-slot declarators sharing the head, e.g. `int *a, b;`) + `EndStatement`. The per-slot `structMemberDeclarator` holds its own declarator (function-pointer-member support: `int (*f)(int);`) AND its own bitfield suffix. The array suffix lives inside the declarator's directDeclarator suffix chain. C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an OPTIONAL leading `structMemberDeclSpecifiers` (`alignas(N) …`) precedes the head — the shared member-specifier prefix (same rule + `specifierPrefix` strip as structField).",
       "sequence": [
+        { "optional": "structMemberDeclSpecifiers" },
         "typeRefAllowingStruct",
         { "optional": "structMemberDeclaratorList" },
         "EndStatement"
@@ -485,7 +495,8 @@
       "sequence": [ "singleDeclSpecifier", { "repeat": "singleDeclSpecifier" } ]
     },
     "singleDeclSpecifier": {
-      "alt": [ "StaticKeyword", "attrSpec", "stdAttr" ]
+      "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): `alignasSpec` (`_Alignas`/`alignas`) joins the top-level declaration-specifier alts. Its FIRST = {AlignasKeyword, AlignasLegacyKeyword} is DISJOINT from StaticKeyword / attrSpec's AttributeKeyword / stdAttr's BracketOpen, so the repeat stays predictively pruned (non-speculative). It is stripped from the positional-child count (specifierPrefix: declSpecifiers on topLevelDecl) and IGNORED by the linkage scan (linkageSpecifierIgnoredRules).",
+      "alt": [ "StaticKeyword", "alignasSpec", "attrSpec", "stdAttr" ]
     },
     "attrSpec": {
       "$comment": "FC4 c1: the argument grew the parenthesized-string form `visibility(\"hidden\")` — an Identifier optionally followed by `( string-literal )`. The inline sequences add NO wrapper nodes, so the bare `weak`/`static` tree shapes are byte-identical to pre-FC4. linkageFrom's composite-key lookup (`visibility:hidden`) pairs the identifier with the decoded string body.",
@@ -766,8 +777,8 @@
       "sequence": [ "localDeclSpecifier", { "repeat": "localDeclSpecifier" } ]
     },
     "localDeclSpecifier": {
-      "$comment": "Local storage-class specifiers + attributes. `static` (D-CSUBSET-LOCAL-STATIC) confers STATIC storage duration (C 6.2.4) — the varDecl row's linkageSpecifiers maps it to {binding:local, staticStorage:true} and CST→HIR routes the declaration to a hidden module-global; register/auto parse and are semantically inert (C: hints/default storage). `static` in a for-init is a C 6.8.5p3 violation, gated loud by the forDecl row.",
-      "alt": [ "StaticKeyword", "RegisterKeyword", "AutoKeyword", "attrSpec", "stdAttr" ]
+      "$comment": "Local storage-class specifiers + attributes. `static` (D-CSUBSET-LOCAL-STATIC) confers STATIC storage duration (C 6.2.4) — the varDecl row's linkageSpecifiers maps it to {binding:local, staticStorage:true} and CST→HIR routes the declaration to a hidden module-global; register/auto parse and are semantically inert (C: hints/default storage). `static` in a for-init is a C 6.8.5p3 violation, gated loud by the forDecl row. C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): `alignasSpec` joins the local-specifier alts too (a block-scope `alignas(16) int x;` is legal C) — FIRST {AlignasKeyword, AlignasLegacyKeyword} disjoint from the others, so the repeat stays predictively pruned; stripped from the child count (specifierPrefix: localDeclSpecifiers on varDecl) and ignored by the linkage scan.",
+      "alt": [ "StaticKeyword", "RegisterKeyword", "AutoKeyword", "alignasSpec", "attrSpec", "stdAttr" ]
     },
 
     "paramList": {
@@ -994,6 +1005,7 @@
         "charLiteralExpr",
         "compoundLiteralExpr",
         "sizeofExpr",
+        "alignofType",
         "labelAddressExpr",
         "vaStartExpr",
         "vaArgExpr",
@@ -1031,6 +1043,33 @@
     },
     "sizeofValue": {
       "sequence": [ "SizeofKeyword", "castOperand" ]
+    },
+
+    "alignofType": {
+      "$comment": "C11/C23 6.5.3.4: `_Alignof ( type-name )` / `alignof ( type-name )`. TYPE-NAME FORM ONLY — unlike sizeof there is NO value form (`_Alignof(expr)` is a constraint violation, caught by the type-binder). Reuses FC2's shared castTypeRef + commitRequiresTypeName binder triage (so `_Alignof(int)` / `_Alignof(struct S)` commit the parens as a type; a non-type name fails loud at type-resolve, never silently treated as a value). Single form → NO speculative/lookahead. Result type is size_t (U64); folds to the type's alignment via the type_layout engine, exactly like sizeof reads size.",
+      "sequence": [
+        { "alt": [ "AlignofKeyword", "AlignofLegacyKeyword" ] },
+        "ParenOpen", "castTypeRef", "ParenClose"
+      ],
+      "commitRequiresTypeName": "castTypeRef"
+    },
+
+    "alignasSpec": {
+      "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the `_Alignas ( … )` / `alignas ( … )` alignment SPECIFIER — a DECLARATION-SPECIFIER (NOT an expression operand), so it is a SEQUENCE (its tree node is `alignasSpec`, which the specifier-prefix mechanism matches in singleDeclSpecifier/localDeclSpecifier/structMemberDeclSpecifiers). Two spellings: the reserved `_Alignas` (AlignasKeyword) and the C23 `alignas` (AlignasLegacyKeyword). The parenthesized operand is `alignasArg` — EITHER a type-name (`alignas(int)` contributes _Alignof(int)) OR a constant-expression (`alignas(16)`). SEMANTICS live in the semantic tier (semantics.alignas): the value/type is computed + validated (power-of-two, ≤256, ≥ the declared type's natural alignment) + STORED on the SymbolRecord (variables) / fed into the struct's fieldAligns (members). The specifier is STRIPPED before positional-child counting (decl_prefix_strip.hpp) so name/type indices stay stable, and IGNORED by the linkage scan (linkageSpecifierIgnoredRules) — exactly like `__attribute__`.",
+      "sequence": [
+        { "alt": [ "AlignasKeyword", "AlignasLegacyKeyword" ] },
+        "ParenOpen", "alignasArg", "ParenClose"
+      ]
+    },
+    "alignasArg": {
+      "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the operand of an `alignas` specifier — the TYPE form (`alignasTypeName`, e.g. `alignas(int)` / `alignas(struct S)`) OR the VALUE form (a constant-expression, `assignmentExpr` — the SAME comma-free const-expr rule staticAssertDecl's condition + a bit-field width + an array dimension use, so `alignas(16)` / `alignas(2*8)` / `alignas(ENUM_VAL)` all fold). SPECULATIVE, with the type branch carrying the `commitRequiresTypeName` binder triage: the operand position is genuinely type-vs-value AMBIGUOUS (`alignas(int)` type vs `alignas(ENUM_VAL)` value). The guard lives on the `alignasTypeName` BRANCH (not on this alt) — the parser's triage is keyed off the PROBED branch rule, exactly like `operand`'s `castExpr` branch. The semantic tier discriminates the committed reading by the child rule (alignasTypeName ⇒ type form → _Alignof(T); else value form → const-eval).",
+      "alt": [ "alignasTypeName", "assignmentExpr" ],
+      "speculative": true, "lookahead": 64
+    },
+    "alignasTypeName": {
+      "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the TYPE-form branch of an `alignas` operand — a lone `castTypeRef` wrapped in a SEQUENCE so it can carry `commitRequiresTypeName` (the guard must sit on the speculative BRANCH the parser probes; a bare `castTypeRef` alt-branch would be probed as `castTypeRef` and `typeNameCommitRule(castTypeRef)` is not set → the guard would never fire). POLARITY = `requireKnownType` (NOT the PreferType default): a bare identifier commits the TYPE reading ONLY when it is a KNOWN typedef-name (sketch/oracle Type); an ENUM CONSTANT or any non-type identifier (sketch Unknown) rolls back to the VALUE reading and const-folds — the C 6.7.6.3p11-style disambiguation. Under PreferType a bare enum-constant `alignas(AL)` would wrongly commit as a type (no follower operator) → a spurious S_AlignasNonConstant. A keyword-led type (`alignas(int)`) still commits (triage rule 1).",
+      "sequence": [ "castTypeRef" ],
+      "commitRequiresTypeName": { "rule": "castTypeRef", "polarity": "requireKnownType" }
     },
 
     "labelAddressExpr": {
@@ -1216,7 +1255,8 @@
         "$volatileComment": "c27 (D-CSUBSET-VOLATILE-POINTEE): `volatile` is a TYPE qualifier (TypeKind::VolatileQual). The resolver wraps the base in VolatileQual when a volatileMarker precedes the stars (`volatile int *` => Ptr<VolatileQual(int)>) and wraps the pointer for an east ptrQualifier (`int * volatile` => VolatileQual(Ptr<int>)); object-volatility is read off the symbol's top-level VolatileQual type at access lowering, pointee-volatility rides the accessed type at the deref/index/member (MirInstFlags::Volatile). ALL pointee/member/param/typedef forms now compile — the prior S_VolatilePointeeNotSupported reject is retired. const stays ignored (no wrapper).",
         "linkageSpecifiers": { "static": { "binding": "local", "staticStorage": true } },
         "linkageSpecifierIgnoredKinds": ["RegisterKeyword", "AutoKeyword", "AttributeKeyword", "ParenOpen", "ParenClose"],
-        "linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr"] },
+        "$alignasIgnoreComment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an `alignasSpec` in the local specifier prefix (`alignas(16) int x;`) carries NO linkage — its subtree (`_Alignas ( … )`) is skipped WHOLESALE by the linkage scan (exactly like the C23 `stdAttr` `[[…]]`). The alignment is read by the SEMANTIC alignas scan, not here. Without this the `_Alignas` keyword token would fail loud H_UnknownLinkageSpecifier.",
+        "linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr", "alignasSpec"] },
       { "rule": "identVarDecl", "head": 0, "declaratorList": 1, "kind": "variable",
         "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword", "warnIfUnused": true,
         "requireNamedDeclarators": true },
@@ -1246,7 +1286,8 @@
           "visibility:hidden": { "visibility": "hidden" }
         },
         "linkageSpecifierIgnoredKinds": ["AttributeKeyword", "ParenOpen", "ParenClose"],
-        "linkageSpecifierIgnoredRules": ["stdAttr"],
+        "$alignasIgnoreComment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an `alignasSpec` in a file-scope declaration's specifier prefix (`alignas(32) int g;`) carries NO linkage — skipped wholesale by the linkage scan (like `stdAttr`); the alignment is read by the semantic alignas scan. `attrSpec` is deliberately NOT ignored here (its `__attribute__((weak/visibility))` tokens ARE meaningful linkage).",
+        "linkageSpecifierIgnoredRules": ["stdAttr", "alignasSpec"],
         "kindByChild": {
           "$comment": "Post-strip children: [topLevelHead, initDeclaratorList, topLevelDeclTail]. childPath [2,0] = the tail's sole child — a `block` node (function definition) or the EndStatement token (variable; whenRule never matches a token). paramsPath/bodyPath are ABSENT: in declarator mode the params live inside the declarator's fnSuffix and the matched block IS the body.",
           "childPath": [2, 0],
@@ -1280,11 +1321,14 @@
         "volatileMarker": "VolatileKeyword",
         "bitfieldSuffix": { "rule": "bitfieldDeclSuffix", "widthChild": 1 },
         "anonymousNameAllowed": true,
+        "$alignasComment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the OPTIONAL leading `alignas(N) …` member-specifier prefix. `head:0`/`declaratorList:1` are POST-STRIP indices — decl_prefix_strip.hpp drops a leading `structMemberDeclSpecifiers` child before positional counting, so the head/declaratorList positions are identical whether or not the member carries alignas. The prefix subtree stays reachable via `specifierPrefixChild` for the semantic alignas scan.",
+        "specifierPrefix": "structMemberDeclSpecifiers",
         "allowFlexibleArray": true },
       { "rule": "unionField",  "head": 0, "declaratorList": 1, "kind": "variable",
         "volatileMarker": "VolatileKeyword",
         "bitfieldSuffix": { "rule": "bitfieldDeclSuffix", "widthChild": 1 },
-        "anonymousNameAllowed": true },
+        "anonymousNameAllowed": true,
+        "specifierPrefix": "structMemberDeclSpecifiers" },
       { "rule": "enumerator",  "name": 0, "kind": "variable" },
       { "rule": "externDecl", "name": 2, "type": 1, "kind": "variable",
         "nonDefiningDeclaration": true,
@@ -1341,6 +1385,10 @@
     ],
     "$sizeofComment": "FC6: sizeof typing. sizeofType = [ SizeofKeyword, '(', castTypeRef, ')' ] → typeChild 2 is the castTypeRef (resolved + stamped through the SAME type resolver casts use). sizeofValue = [ SizeofKeyword, castOperand ] (the operand is typed normally). Both forms are stamped size_t (U64).",
     "sizeof": { "typeRule": "sizeofType", "typeChild": 2, "valueRule": "sizeofValue" },
+    "$alignofComment": "C11/C23 6.5.3.4: alignof typing. alignofType = [ { alt: AlignofKeyword | AlignofLegacyKeyword }, '(', castTypeRef, ')' ] → typeChild 2 is the castTypeRef (the inline keyword-alt matches ONE token at visible-child 0, '(' is child 1 — SAME layout as sizeofType, so the same index 2). Pass 2 resolves + stamps the type child through the SAME type resolver sizeof/casts use, and stamps the node size_t (U64). TYPE-NAME FORM ONLY — no valueRule (there is no `_Alignof(expr)` form).",
+    "alignof": { "typeRule": "alignofType", "typeChild": 2 },
+    "$alignasComment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the `_Alignas`/`alignas` alignment specifier. `specRule` = the `alignasSpec` shape = [ { alt: AlignasKeyword | AlignasLegacyKeyword }, '(', alignasArg, ')' ] → `argChild` 2 is the `alignasArg` (the inline keyword-alt matches ONE token at visible-child 0, '(' is child 1 — SAME layout as alignofType). `typeFormRule` = `alignasTypeName` (the guarded TYPE-form wrapper branch): the semantic tier reads alignasArg's committed reading and discriminates the TYPE form (the committed child's rule == alignasTypeName → alignment = _Alignof(T) via computeLayout(...)->align of the castTypeRef INSIDE the wrapper) from the VALUE form (else → const-evaluate the constant-expression via the SAME constIntExpr sizeof/static_assert/array-dims use). The computed alignment is validated (power-of-two → S_AlignasNotPowerOfTwo; ≤256 → S_AlignasExceedsMax; ≥ the declared type's natural align → S_AlignasWeakerThanNatural; non-constant value → S_AlignasNonConstant; on a typedef/function/parameter/bit-field → S_AlignasInvalidContext) and STORED (SymbolRecord.explicitAlignment for a variable; fed into the composite's fieldAligns for a member). `alignas(0)` is an explicit NO-OP (6.7.5p3) — treated as no override, no error. Absent block ⇒ the language has no alignas surface.",
+    "alignas": { "specRule": "alignasSpec", "argChild": 2, "typeFormRule": "alignasTypeName" },
     "$variadicComment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. vaArgExpr = [ VaArgKeyword, '(', assignmentExpr(apChild 2), ',', castTypeRef(typeChild 4), ')' ] → pass 2 resolves+stamps the castTypeRef through the SAME resolver casts use (so the HIR lowering recovers the read type T) and stamps the node T; it type-checks `ap` is a va_list. vaStartExpr/vaEndExpr = [ kw, '(', assignmentExpr(apChild 2), ... ] → node stamped `void`; ap type-checked va_list; vaStart also flips the enclosing function's uses-va-start attribute so the LIR prologue spills the arg registers.",
     "variadic": {
       "vaArgRule":   "vaArgExpr",   "vaArgApChild":   2, "vaArgTypeChild": 4,
@@ -1520,6 +1568,7 @@
     "compoundLiteralRule": "compoundLiteralExpr",
     "castRule":            "castExpr",
     "sizeofRule":          "sizeofExpr",
+    "alignofRule":         "alignofType",
     "labelAddressRule":    "labelAddressExpr",
     "vaStartRule":         "vaStartExpr",
     "vaArgRule":           "vaArgExpr",

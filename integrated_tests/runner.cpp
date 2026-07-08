@@ -174,6 +174,15 @@ struct ExpectedDiagnostic {
     std::string   code;
     std::uint32_t line = 0;
     std::uint32_t col  = 0;
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN (#4): true (default) ⇒ the diagnostic
+    // carries a source span and the CLI's positioned renderer prints `:line:col`
+    // (this harness greps for it). false ⇒ the diagnostic is emitted at a tier
+    // with NO source span (e.g. `L_OverAlignedStackLocal` from the LIR calling-
+    // convention frame layout), so the CLI renders it code-only
+    // (`error[<code>]`) — the HONEST output of a span-less tier; this harness
+    // then greps for that form instead of a fabricated position. Parsed from an
+    // optional `"positioned": false` manifest key.
+    bool          positioned = true;
 };
 
 struct ExampleManifest {
@@ -254,6 +263,15 @@ struct ExampleManifest {
             ed.code = d.at("code").get<std::string>();
             ed.line = d.at("line").get<std::uint32_t>();
             ed.col  = d.at("col").get<std::uint32_t>();
+            // #4: optional — a span-less tier's diagnostic is code-only.
+            if (d.contains("positioned")) {
+                if (!d.at("positioned").is_boolean()) {
+                    std::cerr << "  expectDiagnostics 'positioned' must be a "
+                                 "boolean in " << path.generic_string() << "\n";
+                    return false;
+                }
+                ed.positioned = d.at("positioned").get<bool>();
+            }
             out.expectDiagnostics.push_back(std::move(ed));
         }
     }
@@ -475,12 +493,23 @@ void runErrorExampleViaCli(std::string const& compiler,
     std::string const body((std::istreambuf_iterator<char>(f)),
                            std::istreambuf_iterator<char>());
     for (auto const& e : m.expectDiagnostics) {
-        std::string const posn = ":" + std::to_string(e.line)
-                               + ":" + std::to_string(e.col);
-        check(exampleName + ": CLI emits positioned diagnostic " + e.code
-              + " at " + posn,
-              body.find(posn) != std::string::npos,
-              "cli.log lacks '" + posn + "':\n" + body);
+        if (e.positioned) {
+            std::string const posn = ":" + std::to_string(e.line)
+                                   + ":" + std::to_string(e.col);
+            check(exampleName + ": CLI emits positioned diagnostic " + e.code
+                  + " at " + posn,
+                  body.find(posn) != std::string::npos,
+                  "cli.log lacks '" + posn + "':\n" + body);
+        } else {
+            // #4: a span-less-tier diagnostic renders code-only as
+            // `error[<code>]` (drainDiagnosticsToStderr routes a buffer-less
+            // diagnostic to the code-only one-liner). Assert THAT honest form
+            // rather than a fabricated `:line:col`.
+            std::string const band = "error[" + e.code + "]";
+            check(exampleName + ": CLI emits code-only diagnostic " + band,
+                  body.find(band) != std::string::npos,
+                  "cli.log lacks '" + band + "':\n" + body);
+        }
     }
 }
 

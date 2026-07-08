@@ -7389,6 +7389,92 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── alignof (C11/C23 6.5.3.4) ──
+            // `{ typeRule, typeChild }` — alignof typing (TYPE-NAME FORM ONLY, so
+            // NO valueRule, unlike sizeof). Pass 2 resolves the type form's
+            // castTypeRef child + stamps the node size_t. Mirrors the sizeof
+            // block's readRule discipline (a present-but-bad field emits + fails
+            // the load; an ABSENT block leaves the rule invalid → no surface).
+            if (sem.contains("alignof")) {
+                json const& al = sem.at("alignof");
+                if (!al.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/alignof",
+                              "'semantics.alignof' must be an object "
+                              "{ typeRule, typeChild }");
+                } else {
+                    if (!al.contains("typeRule") || !al.at("typeRule").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/alignof/typeRule",
+                                  "'typeRule' is required and must be a string");
+                    } else {
+                        cfg.alignofTypeRuleName = al.at("typeRule").get<std::string>();
+                        if (!data.rules->contains(cfg.alignofTypeRuleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape,
+                                      "/semantics/alignof/typeRule",
+                                      std::format("'alignof.typeRule' references "
+                                                  "unknown shape '{}'",
+                                                  cfg.alignofTypeRuleName));
+                        } else {
+                            cfg.alignofTypeRule =
+                                data.rules->find(cfg.alignofTypeRuleName);
+                        }
+                    }
+                    // `typeChild` is required — readReqIndex emits its own
+                    // C_MissingField / C_InvalidSemantics into `coll` on a bad
+                    // value (failing the load); the flag just satisfies the
+                    // out-param (mirrors the sizeof block above).
+                    bool alignTypeChildOk = true;
+                    readReqIndex(al, "typeChild", "/semantics/alignof",
+                                 cfg.alignofTypeChild, alignTypeChildOk);
+                    (void)alignTypeChildOk;
+                }
+            }
+
+            // ── alignas (C11/C23 6.7.5, D-CSUBSET-ALIGNAS) ──
+            // `{ specRule, argChild, typeFormRule }` — the `_Alignas`/`alignas`
+            // alignment specifier. The semantic tier reads the `alignasSpec` node,
+            // resolves its `alignasArg` operand (visible-child `argChild`), and
+            // discriminates the type form (committed arg rule == `typeFormRule` =
+            // `alignasTypeName`, the guarded castTypeRef WRAPPER branch ⇒ _Alignof(T))
+            // from the value form (else ⇒ const-eval). Mirrors the alignof block's
+            // readRule discipline (a present-but-bad field emits + fails the load;
+            // an ABSENT block leaves the rule invalid → no surface).
+            if (sem.contains("alignas")) {
+                json const& aa = sem.at("alignas");
+                if (!aa.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/alignas",
+                              "'semantics.alignas' must be an object "
+                              "{ specRule, argChild, typeFormRule }");
+                } else {
+                    auto readRule = [&](char const* key, char const* path,
+                                        RuleId& outRule, std::string& outName) {
+                        if (!aa.contains(key) || !aa.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path,
+                                      std::format("'{}' is required and must be a "
+                                                  "string", key));
+                            return;
+                        }
+                        outName = aa.at(key).get<std::string>();
+                        if (!data.rules->contains(outName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path,
+                                      std::format("'alignas.{}' references unknown "
+                                                  "shape '{}'", key, outName));
+                            outName.clear();
+                            return;
+                        }
+                        outRule = data.rules->find(outName);
+                    };
+                    readRule("specRule", "/semantics/alignas/specRule",
+                             cfg.alignasSpecRule, cfg.alignasSpecRuleName);
+                    readRule("typeFormRule", "/semantics/alignas/typeFormRule",
+                             cfg.alignasArgTypeRule, cfg.alignasArgTypeRuleName);
+                    bool alignasArgChildOk = true;
+                    readReqIndex(aa, "argChild", "/semantics/alignas",
+                                 cfg.alignasArgChild, alignasArgChildOk);
+                    (void)alignasArgChildOk;
+                }
+            }
+
             // ── variadic intrinsics (FC12a-core, D-FC12A-VARIADIC-CALLEE) ──
             // `{ vaArgRule, vaArgApChild, vaArgTypeChild, vaStartRule,
             //    vaStartApChild, vaEndRule, vaEndApChild }`. Pass 2 resolves the
@@ -8431,6 +8517,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readExprRule("castRule",            cfg.castRule,            cfg.castRuleName);
             // FC6: `sizeof(T)` / `sizeof e` → core HirKind::SizeOf.
             readExprRule("sizeofRule",          cfg.sizeofRule,          cfg.sizeofRuleName);
+            // C11/C23 6.5.3.4: `_Alignof(T)` / `alignof(T)` → core HirKind::AlignOf.
+            readExprRule("alignofRule",         cfg.alignofRule,         cfg.alignofRuleName);
             // FC12a-core: variadic intrinsics → core HirKind::VaStart/VaArg/VaEnd.
             readExprRule("vaStartRule",         cfg.vaStartRule,         cfg.vaStartRuleName);
             readExprRule("vaArgRule",           cfg.vaArgRule,           cfg.vaArgRuleName);

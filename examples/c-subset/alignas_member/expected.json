@@ -1,0 +1,33 @@
+{
+  "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): a struct MEMBER alignas(16)/alignas(8) raises the composite alignment + size + a following field's offset, END-TO-END via the interner's fieldAligns → computeLayout. exit = _Alignof(S)16 + sizeof(S)16 + offsetof(T,i)8 + 2 = 42. All values are data-model-independent, so the one exit code holds across all four targets (incl. the shipped release pipeline).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -385,7 +385,10 @@ DceResult runDce(Mir& mir, TypeInterner const& /*interner*/,
         builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
                           newInitIdx, MirFuncId{},
                           mir.globalBinding(g), mir.globalVisibility(g),
-                          mir.globalIsConst(g));
+                          mir.globalIsConst(g),
+                          // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: preserve the
+                          // global's explicit alignment across DCE's rebuild.
+                          mir.globalAlignmentBytes(g));
     }
 
     // Step 3: walk each function. Dead functions are simply NOT

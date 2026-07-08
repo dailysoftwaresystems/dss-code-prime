@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 74> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 79> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -311,6 +311,20 @@ constexpr std::array<DiagnosticCode, 74> kUnsuppressableCodes{{
     // `_Generic` is never silent.
     DiagnosticCode::S_GenericSelectionNoMatch,
     DiagnosticCode::S_GenericSelectionAmbiguous,
+    // S_Alignas* (C11/C23 6.7.5, D-CSUBSET-ALIGNAS, 2026-07-07): the five
+    // `_Alignas`/`alignas` constraint violations — not-power-of-two, exceeds-max,
+    // weaker-than-natural, invalid-context (typedef/function/parameter/bit-field),
+    // and non-constant. Same posture as S_StaticAssertFailed above: each is a
+    // 6.7.5 CONSTRAINT violation; the analyzer's error already fails the build via
+    // `hasErrors()` (no wrong bytes ship — the stored alignment is simply not
+    // applied), but a SUPPRESSED constraint violation would fail the build with
+    // ZERO diagnostics shown, the confusing silent-failure REASON the closed table
+    // forbids. Closed here so an invalid alignas is never silent.
+    DiagnosticCode::S_AlignasNotPowerOfTwo,
+    DiagnosticCode::S_AlignasExceedsMax,
+    DiagnosticCode::S_AlignasWeakerThanNatural,
+    DiagnosticCode::S_AlignasInvalidContext,
+    DiagnosticCode::S_AlignasNonConstant,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

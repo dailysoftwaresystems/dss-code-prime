@@ -338,8 +338,13 @@ private:
         std::vector<MirInstId> newOps;
         newOps.reserve(ops.size());
         for (MirInstId const o : ops) newOps.push_back(mapValue(o, id));
+        // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: carry the secondary payload (the
+        // Alloca's effective alignment) across the cross-CU merge — a generic
+        // copy that dropped it would silently under-align an over-aligned local
+        // in a multi-CU build.
         local_.emplace(id.v, dst_.addInst(op, newOps, reType(src_.instType(id)),
-                                          src_.instPayload(id), src_.instFlags(id)));
+                                          src_.instPayload(id), src_.instFlags(id),
+                                          src_.instPayload2(id)));
     }
 
     // The merged symbol a GlobalAddr should reference. A GlobalAddr naming a
@@ -695,7 +700,11 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
 
             (void)builder.addGlobal(ty, mergedSym, newInitLit, newInitFunc,
                                     m.globalBinding(g), m.globalVisibility(g),
-                                    m.globalIsConst(g));
+                                    m.globalIsConst(g),
+                                    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: carry
+                                    // the global's explicit alignment across the
+                                    // cross-CU merge.
+                                    m.globalAlignmentBytes(g));
         }
     }
 

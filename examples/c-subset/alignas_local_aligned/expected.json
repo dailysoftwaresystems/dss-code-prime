@@ -1,0 +1,33 @@
+{
+  "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): an over-aligned (alignas(16)) stack local in a NON-LEAF function with an ODD stack-overflow-arg count (sink9's 9 args overflow oddly on SysV/Win64/AAPCS64) must be 16-byte aligned at runtime. This is the exact case the frame fix (B2) closes — the local base would otherwise be 8-aligned (≡8 mod 16). A runtime address check (&buf & 15 == 0) gates the exit; exit = 42. Red-on-disable: revert computeFrameLayout's localAreaAlignPad and this returns 1. Data-model-independent, one exit code across all four targets incl. the shipped release pipeline.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

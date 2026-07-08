@@ -76,6 +76,9 @@ struct Lowerer {
     HirVolatileMap const*    volatileMap; // optional — per-ACCESS volatility (c21,
                                            // D-CSUBSET-VOLATILE-QUALIFIER). nullptr /
                                            // no entry ⇒ plain (non-volatile) access.
+    HirAlignmentMap const*   alignmentMap; // optional — per-DECLARATION explicit
+                                           // `alignas` (D-CSUBSET-ALIGNAS-VARIABLE-
+                                           // CODEGEN). nullptr / no entry ⇒ natural.
     MirBuilder               mir;
     // Extern symbols extracted during the pre-pass. Each extern's
     // SymbolId is also inserted into `functionSymbols` so a `Ref`
@@ -605,6 +608,36 @@ struct Lowerer {
                 }
                 MirLiteralValue lit;
                 lit.value = static_cast<std::uint64_t>(layout->size);
+                lit.core  = TypeKind::U64;
+                return mir.addConst(std::move(lit), t);
+            }
+            case HirKind::AlignOf: {
+                // C11/C23 6.5.3.4: fold _Alignof(T) to T's alignment (result type
+                // size_t = U64, = `t`) via the type_layout engine. An ADDITIVE
+                // mirror of the SizeOf case reading `align` instead of `size`. The
+                // TypeRef child carries the queried type. Fail loud — never a
+                // guessed alignment — if the target declared no layout params or
+                // the type is incomplete/un-alignable.
+                if (!config.aggregateLayoutLoaded) {
+                    unsupported(node, "_Alignof requires the target to declare its "
+                                      "'aggregateLayout' params");
+                    return InvalidMirInst;
+                }
+                auto kids = hir.children(node);
+                if (kids.empty()) {
+                    unsupported(node, "AlignOf has no type-ref child");
+                    return InvalidMirInst;
+                }
+                TypeId const queried = hir.typeId(kids.front());
+                auto const layout = computeLayout(queried, interner,
+                                                  config.aggregateLayout,
+                                                  config.dataModel);
+                if (!layout) {
+                    unsupported(node, "_Alignof of an incomplete or un-alignable type");
+                    return InvalidMirInst;
+                }
+                MirLiteralValue lit;
+                lit.value = static_cast<std::uint64_t>(layout->align.bytes());
                 lit.core  = TypeKind::U64;
                 return mir.addConst(std::move(lit), t);
             }
@@ -2343,8 +2376,30 @@ struct Lowerer {
             }
             allocaPayload = static_cast<std::uint32_t>(*sz);
         }
+        // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: the local's EFFECTIVE alignment =
+        // max(natural alignment of `ty`, explicit `alignas`). It rides the
+        // Alloca's secondary payload (the primary is the aggregate byte size);
+        // MIR→LIR aggregates the per-function maximum and feeds it to the frame
+        // layout so the slot lands on the required boundary. The natural part
+        // comes from the type-layout engine (any type — scalar or aggregate);
+        // the explicit part from the declaration-keyed `alignmentMap` (already
+        // validated by the semantic phase). 0 when neither is derivable (no
+        // aggregateLayout config): a safe "no info" sentinel — the frame layout
+        // then leaves the base at its existing alignment (no over-align to honor).
+        std::uint32_t effectiveAlign = 0;
+        if (config.aggregateLayoutLoaded) {
+            if (auto const lay = computeLayout(ty, interner, config.aggregateLayout,
+                                               config.dataModel);
+                lay.has_value())
+                effectiveAlign = lay->align.bytes();
+        }
+        if (alignmentMap != nullptr && anchor.valid())
+            if (auto const* p = alignmentMap->tryGet(anchor);
+                p != nullptr && p->alignmentBytes > effectiveAlign)
+                effectiveAlign = p->alignmentBytes;
         MirInstId const a =
-            mir.addInst(MirOpcode::Alloca, {}, ptrTy, allocaPayload);
+            mir.addInst(MirOpcode::Alloca, {}, ptrTy, allocaPayload,
+                        MirInstFlags::None, /*payload2=*/effectiveAlign);
         addressableLocal[sym.v] = a;
         return a;
     }
@@ -7608,6 +7663,10 @@ struct Lowerer {
         // When set AND the global has a runtime initializer, its load-time init
         // Store carries MirInstFlags::Volatile.
         bool                           isVolatile = false;
+        // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: declared explicit `alignas(N)`
+        // alignment in bytes (0 ⇒ none). Stamped onto MirGlobal.alignment so the
+        // assembler raises the emitted data item's section alignment.
+        std::uint32_t                  explicitAlignment = 0;
         // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): init = the LINK-TIME-CONSTANT
         // address of `symbolAddrInit` (+ addend) — a string-literal rodata global,
         // another global, or a function. Routes to a MirSymbolAddrValue literal
@@ -8012,6 +8071,17 @@ struct Lowerer {
             if (!layout) return std::nullopt;
             return layout->size;
         };
+        // C11/C23 6.5.3.4 (parallel to resolveTypeSize): let a global initializer
+        // `int g = _Alignof(T)` fold through the SAME `computeLayout` engine the
+        // dedicated MIR AlignOf case uses — reading alignment instead of size.
+        // Absent block ⇒ nullopt ⇒ the engine surfaces NotAConstantExpression.
+        env.resolveTypeAlign = [&](TypeId t) -> std::optional<std::uint64_t> {
+            if (!config.aggregateLayoutLoaded) return std::nullopt;
+            auto const layout = computeLayout(t, interner, config.aggregateLayout,
+                                              config.dataModel);
+            if (!layout) return std::nullopt;
+            return layout->align.bytes();
+        };
         EvalOptions opts;
         // MIR-globals matches runtime behaviour: a narrowing initializer
         // wraps modularly (the runtime path would wrap too). Refusing to
@@ -8037,6 +8107,9 @@ struct Lowerer {
                 if (auto const* p = mutabilityMap->tryGet(decl)) pg.isConst = p->isConst;
             if (volatileMap != nullptr)
                 if (auto const* p = volatileMap->tryGet(decl)) pg.isVolatile = p->isVolatile;
+            if (alignmentMap != nullptr)
+                if (auto const* p = alignmentMap->tryGet(decl))
+                    pg.explicitAlignment = p->alignmentBytes;
             if (auto initN = hir.globalInit(decl); initN.has_value()) {
                 // F5: a symbol-ADDRESS initializer (`int* p = &x;`, `char* g =
                 // "...";`) is a LINK-TIME constant const-eval cannot fold —
@@ -8151,20 +8224,20 @@ struct Lowerer {
                 std::uint32_t const idx = mir.literalPoolAdd(std::move(v));
                 mir.addGlobal(pg.type, pg.symbol, idx, {},
                               pg.linkage.binding, pg.linkage.visibility,
-                              pg.isConst);
+                              pg.isConst, pg.explicitAlignment);
             } else if (pg.constInit.has_value()) {
                 std::uint32_t const idx = mir.literalPoolAdd(*pg.constInit);
                 mir.addGlobal(pg.type, pg.symbol, idx, {},
                               pg.linkage.binding, pg.linkage.visibility,
-                              pg.isConst);
+                              pg.isConst, pg.explicitAlignment);
             } else if (pg.runtimeInit.valid()) {
                 mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, moduleInitFunc,
                               pg.linkage.binding, pg.linkage.visibility,
-                              pg.isConst);
+                              pg.isConst, pg.explicitAlignment);
             } else {
                 mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, {},
                               pg.linkage.binding, pg.linkage.visibility,
-                              pg.isConst);
+                              pg.isConst, pg.explicitAlignment);
             }
         }
         // Step 3: fill the init function's body — Store each runtime
@@ -8295,7 +8368,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           HirFfiMap const*         ffiMap,
                           HirLinkageMap const*     linkageMap,
                           HirMutabilityMap const*  mutabilityMap,
-                          HirVolatileMap const*    volatileMap) {
+                          HirVolatileMap const*    volatileMap,
+                          HirAlignmentMap const*   alignmentMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -8312,6 +8386,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .linkageMap = linkageMap,
         .mutabilityMap = mutabilityMap,
         .volatileMap = volatileMap,
+        .alignmentMap = alignmentMap,
         .mir       = MirBuilder{},
     };
     // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING: stamp the module-

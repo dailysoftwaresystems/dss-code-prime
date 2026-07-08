@@ -214,6 +214,17 @@ struct Lowerer {
     // side-table stays sparse; the only unsafe direction is a MISSED volatile
     // access, which the exhaustive threading closes.
     std::vector<std::pair<HirNodeId, VolatileAttr>>& volatileAcc;
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: shared accumulator of (DECLARATION HIR
+    // node → AlignmentAttr) pairs, populated from the bound symbol's
+    // `SymbolRecord.explicitAlignment` at each Global / local VarDecl lowering
+    // site (where the record is in hand). Applied to the result's
+    // HirAlignmentMap AFTER finish() — same frozen-hir discipline as
+    // `mutability` / `volatileAcc`. Only decls with a real (>0) `alignas`
+    // override are recorded (absence ⇒ natural alignment), so the side-table
+    // stays sparse. Keyed on BOTH globals and locals (UNLIKE mutability, which
+    // is global-only): a global's value raises its data-item section alignment;
+    // a local's value raises its alloca's effective (frame-slot) alignment.
+    std::vector<std::pair<HirNodeId, AlignmentAttr>>& alignmentAcc;
 
     // D-CSUBSET-LOCAL-STATIC: the module-level decls accumulator (the SAME
     // vector `lowerTree` appends top-level decls to). A block-scope `static`
@@ -777,10 +788,11 @@ struct Lowerer {
             std::vector<HirExternRecord>& ed,
             std::vector<std::pair<HirNodeId, LinkageAttr>>& lk,
             std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut,
-            std::vector<std::pair<HirNodeId, VolatileAttr>>& vol)
+            std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
+            std::vector<std::pair<HirNodeId, AlignmentAttr>>& aln)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
-          linkage(lk), mutability(mut), volatileAcc(vol) {
+          linkage(lk), mutability(mut), volatileAcc(vol), alignmentAcc(aln) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -1015,6 +1027,20 @@ struct Lowerer {
         auto const* rec = model.recordFor(sym);
         if (rec != nullptr && rec->isConst)
             mutability.push_back({node, MutabilityAttr{/*isConst=*/true}});
+    }
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: record an explicit `alignas` override
+    // for a lowered Global / VarDecl node from its bound symbol's
+    // `SymbolRecord.explicitAlignment` (sparse: only a real (>0) override is
+    // stored; absence ⇒ natural alignment). The semantic phase already
+    // validated the value (power-of-two, ≤256, ≥ natural), so it rides through
+    // unchecked. `sym` must be the declaration's declared symbol.
+    void recordAlignment(HirNodeId node, SymbolId sym) {
+        if (!sym.valid()) return;
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->explicitAlignment.has_value()
+            && *rec->explicitAlignment > 0u)
+            alignmentAcc.push_back(
+                {node, AlignmentAttr{*rec->explicitAlignment}});
     }
     // c21/c27: record an ACCESS HIR node's OBJECT-volatility — true iff the bound
     // symbol's STORAGE is itself volatile, i.e. its resolved type is TOP-LEVEL
@@ -1904,6 +1930,14 @@ struct Lowerer {
             if (cfg.sizeofRule.valid()
              && tree().rule(c).v == cfg.sizeofRule.v) {
                 return lowerSizeof(c);
+            }
+            // C11/C23 6.5.3.4: `_Alignof(T)` / `alignof(T)` — like sizeof, its
+            // castTypeRef child must NOT be lowered as an expression; route it to
+            // the dedicated lowering (config-driven by rule id — a language
+            // without an `_Alignof` surface leaves this invalid and skips it).
+            if (cfg.alignofRule.valid()
+             && tree().rule(c).v == cfg.alignofRule.v) {
+                return lowerAlignof(c);
             }
             // D-CSUBSET-COMPUTED-GOTO: `&&label` — its Identifier child is a RAW
             // label name (the label namespace), NOT a value to resolve, so it
@@ -4695,6 +4729,27 @@ struct Lowerer {
         return {track(builder.makeSizeOf(tref, u64), node), u64};
     }
 
+    // C11/C23 6.5.3.4: `_Alignof ( type-name )` | `alignof ( type-name )` → core
+    // `HirKind::AlignOf`, result type size_t (U64). An ADDITIVE mirror of
+    // `lowerSizeof` reading ALIGNMENT instead of size. TYPE-NAME FORM ONLY (no
+    // value form): the operand is ALWAYS the castTypeRef, whose semantic-stamped
+    // type this recovers via the SAME `resolveStampedTypeBelow` descent sizeof
+    // uses (past any wrapper), then emits the leaf. The operand is UNEVALUATED —
+    // only its type reaches the node; the AlignOf folds to that type's alignment
+    // via the `type_layout` engine at MIR lowering.
+    [[nodiscard]] E lowerAlignof(NodeId node) {
+        TypeId sized = InvalidType;
+        for (NodeId c : visible(node)) {
+            if (TypeId t = resolveStampedTypeBelow(c); t.valid()) { sized = t; break; }
+        }
+        if (!sized.valid()) {
+            return exprError(node, "_Alignof operand did not resolve to a type");
+        }
+        HirNodeId const tref = track(builder.makeTypeRef(sized), node);
+        TypeId const u64 = interner.primitive(TypeKind::U64);
+        return {track(builder.makeAlignOf(tref, u64), node), u64};
+    }
+
     // D-CSUBSET-COMPUTED-GOTO: `&&label` → core `HirKind::LabelAddressOf`. The
     // grammar (`labelAddressExpr = AndAndOp Identifier`) carries the target label
     // as a RAW Identifier token (the label namespace — NOT a value symbol). Resolve
@@ -6421,6 +6476,7 @@ struct Lowerer {
                 HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), d);
                 recordMutability(g, sym);
                 recordVolatility(g, sym);   // c21: volatile static-local global init store
+                recordAlignment(g, sym);    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
                 recordLinkage(g, staticLinkage);  // {Local, Default} — internal
                 moduleDecls_->push_back(g);
                 continue;
@@ -6438,6 +6494,11 @@ struct Lowerer {
             // store into its alloca (HIR→MIR :5712) — record unconditionally on
             // the VarDecl/Global node (UNLIKE mutability, which is global-only).
             recordVolatility(lowered, sym);
+            // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: `alignas` applies to BOTH a
+            // global (raises its data-item section alignment) AND a local
+            // (raises its alloca's effective frame-slot alignment) — record
+            // unconditionally on the VarDecl/Global node, like volatility.
+            recordAlignment(lowered, sym);
             out.push_back(lowered);
         }
     }
@@ -6500,10 +6561,12 @@ struct Lowerer {
             HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
             recordMutability(g, sym);   // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL
             recordVolatility(g, sym);   // c21 (D-CSUBSET-VOLATILE-QUALIFIER)
+            recordAlignment(g, sym);    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
             return g;
         }
         HirNodeId const vd = track(builder.makeVarDecl(type, sym.v, init), node);
         recordVolatility(vd, sym);      // c21: volatile local init store
+        recordAlignment(vd, sym);       // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
         return vd;
     }
 
@@ -6863,6 +6926,7 @@ struct Lowerer {
         HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
         recordLinkage(g, linkAttr);
         recordMutability(g, sym);   // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL
+        recordAlignment(g, sym);    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
         return g;
     }
 
@@ -7373,6 +7437,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared (access node → VolatileAttr)
     // accumulator, moved onto result->volatileMap after finish().
     std::vector<std::pair<HirNodeId, VolatileAttr>> volatileAcc;
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: shared (decl node → AlignmentAttr)
+    // accumulator, moved onto result->alignmentMap after finish().
+    std::vector<std::pair<HirNodeId, AlignmentAttr>> alignmentAcc;
 
     // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
     // to its language's config + the shared output. `Tree::schema()` is the
@@ -7384,7 +7451,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
-            mutability, volatileAcc));
+            mutability, volatileAcc, alignmentAcc));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -7433,6 +7500,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     for (auto& [id, attr] : linkage) result->linkageMap.set(id, attr);
     for (auto& [id, attr] : mutability) result->mutabilityMap.set(id, attr);
     for (auto& [id, attr] : volatileAcc) result->volatileMap.set(id, attr);  // c21
+    for (auto& [id, attr] : alignmentAcc) result->alignmentMap.set(id, attr);  // alignas
     result->externDecls = std::move(externDecls);
 
     // verify-on-load.

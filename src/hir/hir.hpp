@@ -403,6 +403,10 @@ public:
                             HirFlags flags = HirFlags::None);
     // sizeof a type, given as a [TypeRef] child; `type` is the size's type.
     HirNodeId makeSizeOf(HirNodeId typeRef, TypeId type, HirFlags flags = HirFlags::None);
+    // C11/C23 6.5.3.4 `_Alignof`/`alignof` a type, given as a [TypeRef] child
+    // (NEVER value-lowered); `type` is the result's type (size_t). Additive
+    // mirror of makeSizeOf — folds to the type's ALIGNMENT instead of its size.
+    HirNodeId makeAlignOf(HirNodeId typeRef, TypeId type, HirFlags flags = HirFlags::None);
     // FC12a-core variadic intrinsics. `makeVaArg` children are [apExpr, TypeRef]:
     // the `va_list` lvalue (value-lowered to its address) PLUS the read TYPE on a
     // SizeOf-style TypeRef child that is NEVER value-lowered; `type` is that read

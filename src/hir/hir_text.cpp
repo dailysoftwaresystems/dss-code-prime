@@ -39,7 +39,7 @@
 //               | unreachable | ext_node | error
 //   expr       := lit | ref | call | intrinsic | binop | unop | cast | member
 //               | index | swizzle | construct | ternary | logical_and
-//               | logical_or | sizeof | addressof | deref | typeref
+//               | logical_or | sizeof | alignof | addressof | deref | typeref
 //               | ext_node | error
 //   type       := bool|i8..|u8..|f16..|char|byte|void | ptr<T> | ref<T>
 //               | nullable<T> | optional<T> | slice<T> | vec<T,N> | mat<T,R,C>
@@ -224,6 +224,7 @@ namespace {
         case HirKind::Cast: case HirKind::MemberAccess: case HirKind::Index:
         case HirKind::Swizzle: case HirKind::ConstructAggregate: case HirKind::Ternary:
         case HirKind::LogicalAnd: case HirKind::LogicalOr: case HirKind::SizeOf:
+        case HirKind::AlignOf:
         case HirKind::AddressOf: case HirKind::Deref: case HirKind::SeqExpr:
         case HirKind::TypeRef:
             return true;
@@ -389,6 +390,10 @@ private:
                 // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): emit `@<off>` per field for
                 // an explicit-offset struct so the text round-trips (reintern +
                 // canonicalization depend on the offsets surviving serialization).
+                // D-CSUBSET-MEMBER-ALIGNAS: emit `~<align>` per field for a member-
+                // alignas struct (the two channels are mutually exclusive — a struct
+                // carries offsets XOR aligns). The `~` marker never collides with the
+                // offset `@`; both round-trip through parseType below.
                 if (in.hasExplicitOffsets(t)) {
                     auto const ops = in.operands(t);
                     bool first = true;
@@ -397,6 +402,15 @@ private:
                         appendType(ops[i]);
                         auto const off = in.explicitFieldOffset(t, i);
                         out_ += std::format(" @{}", off ? *off : 0);
+                        first = false;
+                    }
+                } else if (in.hasExplicitAligns(t)) {
+                    auto const ops = in.operands(t);
+                    bool first = true;
+                    for (std::size_t i = 0; i < ops.size(); ++i) {
+                        if (!first) out_ += ", ";
+                        appendType(ops[i]);
+                        out_ += std::format(" ~{}", in.explicitFieldAlign(t, i));
                         first = false;
                     }
                 } else {
@@ -816,6 +830,7 @@ private:
             case HirKind::LogicalAnd:         typedCall("logical_and"); return;
             case HirKind::LogicalOr:          typedCall("logical_or"); return;
             case HirKind::SizeOf:             typedCall("sizeof"); return;
+            case HirKind::AlignOf:            typedCall("alignof"); return;
             case HirKind::VaStart:            typedCall("va_start"); return;
             case HirKind::VaArg:              typedCall("va_arg"); return;
             case HirKind::VaEnd:              typedCall("va_end"); return;
@@ -940,7 +955,7 @@ namespace {
 enum class Tk : std::uint8_t {
     Eof, Unknown, Ident, Int, Float, Str,
     LBrace, RBrace, LParen, RParen, LAngle, RAngle, LBrack, RBrack,
-    Colon, Comma, Percent, Hash, Equal, Arrow, Minus, DotDot, Ellipsis, At,
+    Colon, Comma, Percent, Hash, Equal, Arrow, Minus, DotDot, Ellipsis, At, Tilde,
 };
 
 struct Tok {
@@ -989,6 +1004,7 @@ private:
             case '%': cur_.kind = Tk::Percent; return;
             case '#': cur_.kind = Tk::Hash; return;
             case '@': cur_.kind = Tk::At; return;
+            case '~': cur_.kind = Tk::Tilde; return;
             case '=': cur_.kind = Tk::Equal; return;
             case '-':
                 if (p_ < s_.size() && s_[p_] == '>') { ++p_; cur_.kind = Tk::Arrow; }
@@ -1516,6 +1532,7 @@ private:
             || kw == "binop" || kw == "unop" || kw == "cast" || kw == "member"
             || kw == "index" || kw == "swizzle" || kw == "construct" || kw == "ternary"
             || kw == "logical_and" || kw == "logical_or" || kw == "sizeof"
+            || kw == "alignof"
             || kw == "addressof" || kw == "deref" || kw == "seq" || kw == "typeref";
     }
 
@@ -1625,7 +1642,8 @@ private:
             {"cast", HirKind::Cast}, {"index", HirKind::Index},
             {"construct", HirKind::ConstructAggregate}, {"ternary", HirKind::Ternary},
             {"logical_and", HirKind::LogicalAnd}, {"logical_or", HirKind::LogicalOr},
-            {"sizeof", HirKind::SizeOf}, {"addressof", HirKind::AddressOf}, {"deref", HirKind::Deref},
+            {"sizeof", HirKind::SizeOf}, {"alignof", HirKind::AlignOf},
+            {"addressof", HirKind::AddressOf}, {"deref", HirKind::Deref},
             {"va_start", HirKind::VaStart}, {"va_arg", HirKind::VaArg}, {"va_end", HirKind::VaEnd},
         };
         for (auto const& [k, kind] : kTypedExprs)
@@ -1858,26 +1876,50 @@ private:
             return interner_.tuple(ts); }
         if (kw == "struct") { std::string name = takeStr(); expect(Tk::LBrace, "'{'");
             // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): each field is a type optionally
-            // followed by `@<byteOffset>` (an explicit overlapping layout). All-or-
-            // none: a mix is malformed. A field-local loop (NOT parseTypeListUntil)
-            // so the `@` is consumed here, never by node-attribute logic (types are
-            // never parsed where `@`-attributes are also legal, so no ambiguity).
+            // followed by `@<byteOffset>` (an explicit overlapping layout).
+            // D-CSUBSET-MEMBER-ALIGNAS: OR by `~<align>` (a member-alignas override).
+            // Each marker is all-or-none, and the two are MUTUALLY EXCLUSIVE (a struct
+            // carries offsets XOR aligns) — a mix is malformed. A field-local loop
+            // (NOT parseTypeListUntil) so `@`/`~` are consumed here, never by node-
+            // attribute logic (types are never parsed where those tokens are also
+            // legal, so no ambiguity).
             std::vector<TypeId>        ts;
             std::vector<std::uint64_t> offs;
-            std::size_t                nWithOff = 0;
+            std::vector<std::uint32_t> aligns;
+            std::size_t                nWithOff   = 0;
+            std::size_t                nWithAlign = 0;
             while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
                 ts.push_back(parseType());
-                if (accept(Tk::At)) { offs.push_back(takeInt()); ++nWithOff; }
-                else                { offs.push_back(0); }
+                if (accept(Tk::At)) {
+                    offs.push_back(takeInt()); aligns.push_back(0); ++nWithOff;
+                } else if (accept(Tk::Tilde)) {
+                    aligns.push_back(static_cast<std::uint32_t>(takeInt()));
+                    offs.push_back(0); ++nWithAlign;
+                } else {
+                    offs.push_back(0); aligns.push_back(0);
+                }
                 if (!accept(Tk::Comma)) break;
             }
             expect(Tk::RBrace, "'}'");
-            if (nWithOff == 0) return interner_.structType(name, ts);
+            if (nWithOff != 0 && nWithAlign != 0) {
+                malformed("struct fields cannot mix explicit offsets (@) and "
+                          "member aligns (~)");
+                return InvalidType;
+            }
+            if (nWithOff == 0 && nWithAlign == 0) return interner_.structType(name, ts);
+            std::span<std::int64_t const> const noWidths{};
+            if (nWithAlign != 0) {
+                if (nWithAlign != ts.size()) {
+                    malformed("struct member aligns must be all-or-none");
+                    return InvalidType;
+                }
+                std::span<std::uint64_t const> const noOffs{};
+                return interner_.structType(name, ts, noWidths, noOffs, aligns);
+            }
             if (nWithOff != ts.size()) {
                 malformed("struct field offsets must be all-or-none");
                 return InvalidType;
             }
-            std::span<std::int64_t const> const noWidths{};
             return interner_.structType(name, ts, noWidths, offs); }
         if (kw == "union") { std::string name = takeStr(); expect(Tk::LBrace, "'{'");
             auto ts = parseTypeListUntil(Tk::RBrace); expect(Tk::RBrace, "'}'");

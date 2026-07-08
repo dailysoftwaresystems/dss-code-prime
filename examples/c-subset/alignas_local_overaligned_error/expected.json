@@ -1,0 +1,11 @@
+{
+  "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL): an `alignas(32) int loc;` local exceeds the 16-byte stack-alignment bound this static frame layout can guarantee → the callconv frame-layout pass fails loud with L_OverAlignedStackLocal, NOT a silent under-align. The diagnostic is raised at the LIR calling-convention tier (computeFrameLayout), which carries NO source span/buffer, so the CLI renders it CODE-ONLY (`error[L_OverAlignedStackLocal]`) with no `:line:col` — the honest output of a span-less tier. Hence `positioned:false`: the in-process runner matches the CODE (position-independent) and the CLI/integrated harness greps for `error[L_OverAlignedStackLocal]`. The load-bearing pin is the CODE + a rejected compile (EXACT diagnostic-set equality). Red-on-disable: drop the computeFrameLayout `maxLocalAlign > stackAlignment` gate and this compiles (silently under-aligning) instead of erroring, so the runner no longer finds L_OverAlignedStackLocal.",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec" }
+  ],
+  "expectDiagnostics": [
+    { "code": "L_OverAlignedStackLocal", "line": 1, "col": 1, "positioned": false }
+  ]
+}

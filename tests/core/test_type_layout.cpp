@@ -27,6 +27,15 @@ namespace {
 // The shipped-target params (natural alignment, 16-byte ISA cap), LP64.
 constexpr AggregateLayoutParams kNatural16{ScalarAlignmentRule::Natural, 16};
 
+// Bit-field params: identical to kNatural16 but with a REALIZED packing strategy
+// (so only a genuine fail-loud condition — e.g. the c107 offsets+bitfields guard —
+// can reject). Hoisted here so both the member-alignas-on-bitfield tests (#1) and
+// the FC8 bit-field ABI tests below can reference them.
+constexpr AggregateLayoutParams kGnu16{
+    ScalarAlignmentRule::Natural, 16, BitFieldStrategy::GnuPacked};
+constexpr AggregateLayoutParams kMsvc16{
+    ScalarAlignmentRule::Natural, 16, BitFieldStrategy::MsvcStraddle};
+
 [[nodiscard]] StructLayout layoutOf(TypeId id, TypeInterner const& ti,
                                     AggregateLayoutParams p = kNatural16,
                                     DataModel dm = DataModel::Lp64) {
@@ -130,6 +139,230 @@ TEST(TypeLayout, ExplicitOffsetsWithBitfieldsFailsLoud) {
     AggregateLayoutParams p{ScalarAlignmentRule::Natural, 16};
     p.bitFieldStrategy = BitFieldStrategy::GnuPacked;   // realized, so only the c107 guard can reject
     EXPECT_FALSE(computeLayout(bad, ti, p, DataModel::Lp64).has_value());
+}
+
+// D-CSUBSET-MEMBER-ALIGNAS: a member `alignas(16)` RAISES the field's (and thus the
+// struct's) alignment, padding the struct up to 16. `struct{alignas(16) int x;}`:
+// x@0 (int align raised to 16), struct align 16, size rounded up to 16.
+// RED-ON-DISABLE: were the override ignored, align stays 4 and size is 4.
+TEST(TypeLayout, MemberAlignasRaisesStructAlignAndSize) {
+    auto ti = makeInterner(1);
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 1>        const fields{i32};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 1> const aligns{16};
+    TypeId const s = ti.structType("S", fields, noWidths, noOffs, aligns);
+    EXPECT_TRUE(ti.hasExplicitAligns(s));
+    auto const l = layoutOf(s, ti);
+    ASSERT_EQ(l.fieldOffsets.size(), 1u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);   // the int still starts at 0
+    EXPECT_EQ(l.align.bytes(), 16u);    // raised from natural 4 → 16
+    EXPECT_EQ(l.size, 16u);             // padded up to the 16-byte alignment
+
+    // The same field with NO override is the ordinary 4-byte int struct.
+    TypeId const nat = ti.structType("S", fields);
+    EXPECT_FALSE(ti.hasExplicitAligns(nat));
+    auto const ln = layoutOf(nat, ti);
+    EXPECT_EQ(ln.align.bytes(), 4u);
+    EXPECT_EQ(ln.size, 4u);
+}
+
+// D-CSUBSET-MEMBER-ALIGNAS: the override uses MAX semantics — it can only RAISE, never
+// LOWER. `alignas(2)` on an `int` (natural align 4) is a no-op: the effective align
+// stays 4. RED-ON-DISABLE: if the override replaced (rather than max'd) the natural
+// align, the struct would mis-align to 2 and mis-size.
+TEST(TypeLayout, MemberAlignasNeverLowersBelowNatural) {
+    auto ti = makeInterner(1);
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 1>        const fields{i32};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 1> const aligns{2};   // BELOW the int's natural 4
+    TypeId const s = ti.structType("S", fields, noWidths, noOffs, aligns);
+    auto const l = layoutOf(s, ti);
+    EXPECT_EQ(l.align.bytes(), 4u);     // natural 4 wins over the 2 override
+    EXPECT_EQ(l.size, 4u);
+}
+
+// D-CSUBSET-MEMBER-ALIGNAS: a member alignas on a LATER field raises BOTH the struct's
+// alignment AND that field's start boundary. `struct{int i; alignas(16) int j;}`:
+// i@0, j forced to the next 16-aligned offset → j@16 (not the natural 4), struct align
+// 16, size 20→32. RED-ON-DISABLE: were the override ignored, j@4, align 4, size 8.
+TEST(TypeLayout, MemberAlignasRaisesFollowingFieldOffset) {
+    auto ti = makeInterner(1);
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 2>        const fields{i32, i32};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 2> const aligns{0, 16};   // alignas(16) on the 2nd int
+    TypeId const s = ti.structType("S", fields, noWidths, noOffs, aligns);
+    auto const l = layoutOf(s, ti);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);    // i@0
+    EXPECT_EQ(l.fieldOffsets[1], 16u);   // j forced to the 16-byte boundary (not 4)
+    EXPECT_EQ(l.align.bytes(), 16u);     // struct align raised to 16
+    EXPECT_EQ(l.size, 32u);              // 20 rounded up to align 16
+
+    // The same two ints with NO override pack naturally: j@4, align 4, size 8.
+    TypeId const nat = ti.structType("S", fields);
+    auto const ln = layoutOf(nat, ti);
+    EXPECT_EQ(ln.fieldOffsets[1], 4u);
+    EXPECT_EQ(ln.align.bytes(), 4u);
+    EXPECT_EQ(ln.size, 8u);
+}
+
+// D-CSUBSET-ALIGNAS: a UNION member alignas raises the union's alignment (and thus
+// its rounded size) — the computeLayout UNION arm folds `explicitFieldAlign` exactly
+// like the struct arm. `union{ alignas(16) char c; int i; }`: every member at
+// offset 0, natural align max(1,4)=4, but c's alignas(16) raises the union to align
+// 16 → size max(1,4)=4 rounded up to 16. RED-ON-DISABLE (the union-arm fold): were
+// the override ignored, the union would align to 4 and size to 4. The union is built
+// via forwardComposite + completeComposite (the semantic analyzer's path — there is
+// no complete-at-once `unionType` overload carrying aligns).
+TEST(TypeLayout, UnionMemberAlignasRaisesAlignAndSize) {
+    auto ti = makeInterner(1);
+    TypeId const c8  = ti.primitive(TypeKind::Char);
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 2>        const members{c8, i32};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 2> const aligns{16, 0};   // alignas(16) on the char
+    TypeId const u = ti.forwardComposite(TypeKind::Union, "U", /*declSiteKey=*/1);
+    ti.completeComposite(u, members, noWidths, noOffs, aligns);
+    EXPECT_TRUE(ti.hasExplicitAligns(u));
+    auto const l = layoutOf(u, ti);
+    EXPECT_EQ(l.align.bytes(), 16u);   // raised from natural 4 → 16 (the char's alignas)
+    EXPECT_EQ(l.size, 16u);            // max member extent 4, rounded up to align 16
+
+    // The same union with NO override: align 4 (the int), size 4.
+    TypeId const nat = ti.forwardComposite(TypeKind::Union, "U", /*declSiteKey=*/2);
+    ti.completeComposite(nat, members);
+    EXPECT_FALSE(ti.hasExplicitAligns(nat));
+    auto const ln = layoutOf(nat, ti);
+    EXPECT_EQ(ln.align.bytes(), 4u);
+    EXPECT_EQ(ln.size, 4u);
+}
+
+// ── #1: member `alignas` on an ORDINARY field of a BIT-FIELD-bearing struct ──
+// C11/C23 6.7.5: `alignas` on a non-bit-field member is LEGAL even when the
+// struct also has a bit-field, and must be HONORED. The bit-field packers' own
+// ordinary-field arms previously used the bare natural alignment (dropping the
+// override) — this is the cross-seam bug: `anyBitfield` routes AWAY from the
+// non-bitfield `effectiveAlign` path into the packer, whose ordinary arm ignored
+// the override. RED-ON-DISABLE: revert `bitfieldPackerEffectiveAlign` and align
+// falls back to 4 (and size to 8), so the align==16 assertion fails.
+TEST(TypeLayout, BitFieldStructMemberAlignasHonoredGnu) {
+    auto ti = makeInterner(1);
+    // struct S { alignas(16) int a; unsigned b : 3; };
+    std::array<TypeId, 2> const fields{
+        ti.primitive(TypeKind::I32), ti.primitive(TypeKind::U32)};
+    std::array<std::int64_t, 2>  const widths{-1 /*kNotBitfield*/, 3};
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 2> const aligns{16, 0};   // alignas(16) on `a` only
+    TypeId const s = ti.structType("S", fields, widths, noOffs, aligns);
+    EXPECT_TRUE(ti.hasExplicitAligns(s));
+    auto const l = layoutOf(s, ti, kGnu16);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);    // a@0
+    EXPECT_EQ(l.fieldOffsets[1], 4u);    // b's unit at byte 4 (past a's 4 bytes)
+    EXPECT_EQ(l.bitFields[1].bitOffset, 0u);
+    EXPECT_EQ(l.bitFields[1].bitWidth, 3u);
+    EXPECT_EQ(l.align.bytes(), 16u);     // a's alignas(16) RAISES the struct align
+    EXPECT_EQ(l.size, 16u);              // 5 bytes rounded up to align 16
+
+    // Same struct WITHOUT the override: align 4, size 8 (b's unit at byte 4).
+    TypeId const nat = ti.structType("S", fields, widths);
+    EXPECT_FALSE(ti.hasExplicitAligns(nat));
+    auto const ln = layoutOf(nat, ti, kGnu16);
+    EXPECT_EQ(ln.align.bytes(), 4u);
+    EXPECT_EQ(ln.size, 8u);
+}
+
+// #1, MsvcStraddle strategy: the SAME struct through the other packer's ordinary
+// arm. RED-ON-DISABLE identically (the MsvcStraddle ordinary arm also folds the
+// override now). cl.exe lays `struct S { alignas(16) int a; unsigned b:3; }` at
+// align 16 / size 16 / a@0 / b's unit @4.
+TEST(TypeLayout, BitFieldStructMemberAlignasHonoredMsvc) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 2> const fields{
+        ti.primitive(TypeKind::I32), ti.primitive(TypeKind::U32)};
+    std::array<std::int64_t, 2>  const widths{-1, 3};
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 2> const aligns{16, 0};
+    TypeId const s = ti.structType("S", fields, widths, noOffs, aligns);
+    auto const l = layoutOf(s, ti, kMsvc16);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);
+    EXPECT_EQ(l.fieldOffsets[1], 4u);
+    EXPECT_EQ(l.align.bytes(), 16u);
+    EXPECT_EQ(l.size, 16u);
+}
+
+// #1, LATER over-aligned ordinary field after a bit-field: the alignas forces the
+// field's own start boundary past the bit-unit. `struct{ int b:3; alignas(16) int
+// a; }` → b's unit @0, a forced to @16, align 16, size 32. RED-ON-DISABLE: a lands
+// at @4 (byte after the unit), align 4, size 8.
+TEST(TypeLayout, BitFieldThenAlignasOrdinaryFieldGnu) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 2> const fields{
+        ti.primitive(TypeKind::U32), ti.primitive(TypeKind::I32)};
+    std::array<std::int64_t, 2>  const widths{3, -1};
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 2> const aligns{0, 16};   // alignas(16) on `a` (2nd)
+    TypeId const s = ti.structType("S", fields, widths, noOffs, aligns);
+    auto const l = layoutOf(s, ti, kGnu16);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);    // b's unit @0
+    EXPECT_EQ(l.fieldOffsets[1], 16u);   // a forced to the 16-byte boundary
+    EXPECT_EQ(l.align.bytes(), 16u);
+    EXPECT_EQ(l.size, 32u);              // 20 rounded up to align 16
+}
+
+// #1, UNION variant — an ordinary member alignas coexisting with a bit-field
+// member. `union { alignas(16) char c; int i : 3; }`: every member at offset 0,
+// c's alignas(16) raises the union to align 16, i is a 3-bit field of its own
+// 4-byte unit. align 16 / size 16. RED-ON-DISABLE (the union arm already folded
+// the override, so this pins the bit-field+alignas COMBINATION does not regress
+// the union arm): without the fold, align 4 / size 4. Built via forward/complete
+// (there is no complete-at-once unionType overload carrying aligns).
+TEST(TypeLayout, UnionBitFieldMemberAlignasHonored) {
+    auto ti = makeInterner(1);
+    std::array<TypeId, 2> const members{
+        ti.primitive(TypeKind::Char), ti.primitive(TypeKind::I32)};
+    std::array<std::int64_t, 2>  const widths{-1, 3};   // i is a 3-bit field
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 2> const aligns{16, 0};   // alignas(16) on the char
+    TypeId const u = ti.forwardComposite(TypeKind::Union, "U", /*declSiteKey=*/1);
+    ti.completeComposite(u, members, widths, noOffs, aligns);
+    auto const l = layoutOf(u, ti, kGnu16);
+    EXPECT_EQ(l.align.bytes(), 16u);   // the char's alignas raises the union
+    EXPECT_EQ(l.size, 16u);            // max member extent 4, rounded up to 16
+    ASSERT_EQ(l.bitFields.size(), 2u);
+    EXPECT_EQ(l.bitFields[1].bitWidth, 3u);
+}
+
+// #1, FLEXIBLE-ARRAY-MEMBER variant — an `alignas` on the FAM of a bit-field-
+// bearing struct. The packer FAM arm also folds the override now. `struct{ int
+// b:3; alignas(16) int fam[]; }`: b's unit @0, fam forced to @16 (its element
+// align raised from 4 to 16), align 16, FAM contributes 0 to size → size 16.
+// RED-ON-DISABLE: fam lands at @4, align 4, size 4.
+TEST(TypeLayout, BitFieldStructFlexibleArrayMemberAlignasHonoredGnu) {
+    auto ti = makeInterner(1);
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 2> const fields{ti.primitive(TypeKind::U32),
+                                       ti.incompleteArray(i32)};
+    std::array<std::int64_t, 2>  const widths{3, -1};
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 2> const aligns{0, 16};   // alignas(16) on the FAM
+    TypeId const s = ti.structType("S", fields, widths, noOffs, aligns);
+    auto const l = layoutOf(s, ti, kGnu16);
+    ASSERT_EQ(l.fieldOffsets.size(), 2u);
+    EXPECT_EQ(l.fieldOffsets[0], 0u);    // b's unit @0
+    EXPECT_EQ(l.fieldOffsets[1], 16u);   // fam forced to the 16-byte boundary
+    EXPECT_TRUE(l.hasFlexibleArrayMember);
+    EXPECT_EQ(l.align.bytes(), 16u);
+    EXPECT_EQ(l.size, 16u);              // FAM adds 0; 2 (b's byte) padded to 16
 }
 
 TEST(TypeLayout, StructTailPaddingAndNesting) {
@@ -311,11 +544,9 @@ TEST(TypeLayout, OutOfScopeTypesFailLoud) {
 }
 
 // ── FC8 D-CSUBSET-BITFIELD: bit-field packing (gnu_packed, little-endian) ──────
-// The params the shipped targets declare for bit-fields. Identical to kNatural16
-// but with the packing strategy ON. RED-ON-DISABLE for the WHOLE feature: with
-// `BitFieldStrategy::None` a struct that HAS a bit-field computes no layout.
-constexpr AggregateLayoutParams kGnu16{
-    ScalarAlignmentRule::Natural, 16, BitFieldStrategy::GnuPacked};
+// (`kGnu16` is declared at the top of this file alongside `kNatural16`.)
+// RED-ON-DISABLE for the WHOLE feature: with `BitFieldStrategy::None` a struct
+// that HAS a bit-field computes no layout.
 
 // A struct with NO bit-field interns with EMPTY scalars → `bitFields` empty AND
 // the byte path is byte-identical (the anyBitfield gate). This pins that the
@@ -438,9 +669,8 @@ TEST(TypeLayout, InternerFieldBitWidthRoundTripAndIdentity) {
 // compiler where present, so the constants below can never silently drift from the
 // real ABI.
 
-// The MSVC x64 (PE) params: identical to kGnu16 but with the MS straddling rule.
-constexpr AggregateLayoutParams kMsvc16{
-    ScalarAlignmentRule::Natural, 16, BitFieldStrategy::MsvcStraddle};
+// The MSVC x64 (PE) params — identical to kGnu16 but with the MS straddling rule —
+// are declared at the top of this file alongside `kNatural16`/`kGnu16`.
 
 // Struct A = `{int a:1; char b:1;}`. The headline divergence:
 //   gcc  : sizeof 4 — b packs into a's int unit at bit 1.

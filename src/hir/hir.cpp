@@ -396,6 +396,11 @@ HirNodeId HirBuilder::makeSizeOf(HirNodeId typeRef, TypeId type, HirFlags flags)
     return addParent(HirKind::SizeOf, kids, type, /*payload=*/0, flags);
 }
 
+HirNodeId HirBuilder::makeAlignOf(HirNodeId typeRef, TypeId type, HirFlags flags) {
+    HirNodeId const kids[] = {typeRef};
+    return addParent(HirKind::AlignOf, kids, type, /*payload=*/0, flags);
+}
+
 HirNodeId HirBuilder::makeVaStart(HirNodeId apExpr, TypeId type, HirFlags flags) {
     HirNodeId const kids[] = {apExpr};
     return addParent(HirKind::VaStart, kids, type, /*payload=*/0, flags);

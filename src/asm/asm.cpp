@@ -803,6 +803,23 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         std::uint32_t const litIdx = mir.globalInitLiteralIndex(gid);
         MirFuncId const    initFn  = mir.globalInitFunc(gid);
 
+        // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): the source-declared
+        // explicit `alignas(N)` alignment (0 = none), threaded onto MirGlobal. A
+        // data section aligns to any power of two ≤ 256 (no slot-width bound the
+        // way a stack local has), so a global alignment may legitimately EXCEED
+        // the type's natural alignment with no gate. `raiseToExplicit` returns the
+        // STRICTER of the type-derived alignment and this override — applied at
+        // every `.alignment =` assignment below (a plain `alignas(32) int g;` is a
+        // SCALAR, so the override must reach the primitive/scalar arms too, not
+        // only the aggregate `lay->align` arms). The frontend already validated
+        // the value (power-of-two, ≤256), so `ofRuntimePow2` is safe.
+        std::uint32_t const explicitAlignBytes = mir.globalAlignmentBytes(gid);
+        auto const raiseToExplicit = [&](Alignment natural) -> Alignment {
+            return (explicitAlignBytes > natural.bytes())
+                       ? Alignment::ofRuntimePow2(explicitAlignBytes)
+                       : natural;
+        };
+
         // Runtime-init globals: their bytes land via the
         // `__module_init__` synthesized function at module-load
         // time. Today this cycle scope produces NO AssembledData
@@ -870,14 +887,19 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // [1,16]); aggregates carry the layout's align. The walker raises
             // the section alignment to cover the strictest item.
             if (auto const pw = primitiveByteSize(zk); pw.has_value()) {
-                z.alignment = Alignment::ofRuntimePow2(
-                    static_cast<std::uint32_t>(*pw));
+                z.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
+                    static_cast<std::uint32_t>(*pw)));
             } else if (aggregateLayout.has_value()) {
                 if (auto const lay = computeLayout(ty, interner, *aggregateLayout,
                                                    dataModel);
                     lay.has_value()) {
-                    z.alignment = lay->align;
+                    z.alignment = raiseToExplicit(lay->align);
                 }
+            } else {
+                // No primitive size, no aggregateLayout to derive from — a global
+                // whose only alignment signal is the explicit override. Honor it
+                // (raiseToExplicit over the byte-aligned default preserves it).
+                z.alignment = raiseToExplicit(z.alignment);
             }
             out.push_back(std::move(z));
             continue;
@@ -974,7 +996,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                 if (typeSize.has_value() && *typeSize > d.bytes.size())
                     d.bytes.resize(static_cast<std::size_t>(*typeSize), 0u);
             }
-            d.alignment = Alignment::of<1>();
+            d.alignment = raiseToExplicit(Alignment::of<1>());
             out.push_back(std::move(d));
             continue;
         }
@@ -1012,7 +1034,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // agnostic root-cause placement, not a per-format special case.
             d.section = DataSectionKind::Data;
             d.bytes.assign(8, 0);                       // pointer-width zero slot
-            d.alignment = Alignment::ofRuntimePow2(8);
+            d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(8));
             d.relocations.push_back(Relocation{
                 /*offset=*/0u,
                 /*target=*/SymbolId{sa.symbol},
@@ -1083,7 +1105,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // merely tolerate rodata). A reloc-free const aggregate keeps the
             // section chosen above (.rodata for a const global).
             if (!d.relocations.empty()) d.section = DataSectionKind::Data;
-            d.alignment = lay->align;
+            d.alignment = raiseToExplicit(lay->align);
             out.push_back(std::move(d));
             continue;
         }
@@ -1151,8 +1173,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // audit fold 2026-06-02 — dead `K_NoMatchingObjectFormat`
         // arm removed; the wrong-domain diagnostic that arm would
         // emit was a future-reader trap).
-        d.alignment = Alignment::ofRuntimePow2(
-            static_cast<std::uint32_t>(*widthOpt));
+        d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
+            static_cast<std::uint32_t>(*widthOpt)));
         out.push_back(std::move(d));
     }
 

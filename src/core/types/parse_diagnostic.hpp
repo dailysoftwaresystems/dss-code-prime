@@ -495,6 +495,41 @@ enum class DiagnosticCode : std::uint16_t {
     // type. Emitted at the SEMANTIC tier; unsuppressable (an ambiguous selection
     // has no well-defined value).
     S_GenericSelectionAmbiguous   = 0xE02B,
+    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an `_Alignas`/`alignas` alignment
+    // specifier whose operand — the value form `alignas(N)` or the type form
+    // `alignas(T)` (which contributes _Alignof(T)) — is not a POSITIVE POWER OF
+    // TWO. 6.7.5p3 requires the alignment be a valid fundamental/extended
+    // alignment (a power of two). `alignas(0)` is NOT this error — it is an
+    // explicit NO-OP (6.7.5p3 "an alignment specification of zero has no
+    // effect"), handled as "no override" before this check. Emitted at the
+    // SEMANTIC tier (where the operand const-folds / the type's alignment is
+    // computed); unsuppressable (a constraint violation whose suppression would
+    // fail the build with zero diagnostics — the S_StaticAssertFailed precedent).
+    S_AlignasNotPowerOfTwo        = 0xE02C,
+    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS-EXCEEDS-MAX): an `alignas(N)` whose value
+    // exceeds the maximum representable alignment (256 bytes — the `Alignment`
+    // newtype's cap, alignment.hpp; no producer in the pipeline emits > 256).
+    // A distinct code from the power-of-two check so an over-large-but-pow2
+    // value (`alignas(512)`) reports the precise reason. Unsuppressable.
+    S_AlignasExceedsMax           = 0xE02D,
+    // C11/C23 6.7.5p4 (D-CSUBSET-ALIGNAS): an `alignas` specifier weaker than the
+    // declared type's natural alignment. 6.7.5p4: alignas may only STRENGTHEN
+    // (raise) alignment, never weaken it — `alignas(1) double d;` (1 < 8) is a
+    // constraint violation. Compared against the declared type's
+    // `computeLayout(...)->align`. Unsuppressable.
+    S_AlignasWeakerThanNatural    = 0xE02E,
+    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an `alignas` in a context 6.7.5 forbids —
+    // on a typedef, a function, a function PARAMETER, or a bit-field member.
+    // 6.7.5p2: an alignment specifier may appear only in the declaration of an
+    // OBJECT that is not a bit-field, a parameter, or a function/typedef. The
+    // `.actual` text names the specific rejected context. Unsuppressable.
+    S_AlignasInvalidContext       = 0xE02F,
+    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an `alignas(expr)` whose value-form
+    // operand does not fold to an integer constant expression (a non-constant /
+    // float / unresolved expression). 6.7.5p3 requires an integer constant
+    // expression. Emitted at the SEMANTIC tier via the SAME `constIntExpr`
+    // evaluator static_assert / array-dimension folding uses. Unsuppressable.
+    S_AlignasNonConstant          = 0xE030,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -857,6 +892,13 @@ enum class DiagnosticCode : std::uint16_t {
     // defaulting to a colliding ordinal) — the inliner would then map two
     // callee params to the same actual. Caught at every verify point.
     I_ArgPositionDuplicate    = 0xA012,
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: a MIR `Alloca`'s secondary payload
+    // (`payload2` = the local's EFFECTIVE alignment in bytes) is not 0 and not a
+    // power of two ≤ 256. The alignment drives the frame-layout's per-alloca
+    // slot placement; a corrupt/dropped value (a rebuild/merge site zeroing or
+    // garbling payload2) would mis-align the slot — a silent stack miscompile.
+    // Caught at every verify point (verify-after-every-pass in release).
+    I_AllocaAlignmentNotPowerOfTwo = 0xA013,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //
@@ -929,6 +971,17 @@ enum class DiagnosticCode : std::uint16_t {
     L_MoveCycleUnsupported         = 0xB009,
     L_IndirectCallUnsupported      = 0xB00A,
     L_IndirectCalleeClobberedByArgSetup = 0xB00B,
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: `computeFrameLayout` rejected a
+    //   function whose body-local requires MORE alignment than one stack slot
+    //   (a C11/C23 `alignas(32)` / `alignas(64)` local, or an over-aligned
+    //   struct/union used as a local). This static frame layout aligns the
+    //   local area up to at most the slot width; a stricter requirement needs a
+    //   dynamically realigned stack pointer (an AND-mask of RSP + a frame
+    //   pointer to find spills), which is not built. The message reports the
+    //   COMPUTED slot bound (agnostic — never an arch name). ≤ slot-width
+    //   over-alignment (e.g. `alignas(16)`) is HONORED via a local-area pad, not
+    //   this code — so this fires only past the representable bound.
+    L_OverAlignedStackLocal        = 0xB00C,
 
     // ── Register allocator (renders as `R`) ────────────────────────────
     //

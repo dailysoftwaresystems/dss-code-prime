@@ -127,6 +127,36 @@ struct DSS_EXPORT SehScopeDescriptor {
     SymbolId      personalitySymbol{};   // __C_specific_handler extern symbol
 };
 
+// D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: the maximum EFFECTIVE alignment (bytes) of
+// any body-local alloca in a function that has an over-aligned local. Computed at
+// MIR→LIR from each Alloca's effective-alignment channel (`Mir::instPayload2`);
+// keyed by the function's declared SymbolId so it survives the LIR rebuilds
+// (wide-call / regalloc-rewrite / two-address / callconv) that renumber the
+// positional arenas — the SAME SymbolId-keyed metadata discipline
+// `SehFuncletParent` / `SehScopeDescriptor` use. `compile_pipeline.cpp` passes
+// the list to `materializeCallingConvention`, which feeds each function's value
+// to `computeFrameLayout` to align the local area (and fail loud on a local
+// needing MORE than one stack-slot's worth of alignment). SPARSE: only functions
+// with a local whose effective alignment EXCEEDS the frame slot width appear (an
+// ordinary function needs no entry — the slot width already covers every scalar).
+struct DSS_EXPORT FuncLocalAlignment {
+    SymbolId      funcSymbol{};        // the owning function's declared SymbolId
+    std::uint32_t maxLocalAlignBytes = 0;  // max effective alignment over its locals
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN (#2 arm64 per-alloca fix): the EFFECTIVE
+    // alignment (bytes) of EVERY body-local alloca, in MIR scan order — the SAME
+    // order the LIR alloca placement walks (MIR→LIR is block-for-block 1:1 and
+    // never reorders allocas). The callconv frame layout aligns each alloca's
+    // offset up to ITS OWN alignment before placing (needed on arm64, where the
+    // 8-byte slot width is under the 16-byte stack alignment, so a non-first
+    // `alignas(16)` local otherwise lands 8 bytes off). ONE entry per alloca
+    // (incl. word-aligned ones, whose alignUp is a no-op) so the callconv can
+    // index it by the alloca's scan position; length == the function's alloca
+    // count, checked loud at consume. Present only for functions that carry an
+    // over-aligned local (the same `maxLocalAlignBytes > word` sparse gate) —
+    // an ordinary function needs no per-alloca adjustment and gets no entry.
+    std::vector<std::uint32_t> perAllocaAlignBytes;
+};
+
 struct DSS_EXPORT MirToLirResult {
     Lir                    lir;
     std::vector<MirInstId> lirToMir;
@@ -152,6 +182,11 @@ struct DSS_EXPORT MirToLirResult {
     // calls), but the assembler needs them to populate
     // `AssembledModule.externImports`, so we propagate verbatim.
     std::vector<ExternImport> externImports;
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: per-function max local alignment for
+    // functions with an over-aligned local (SPARSE — see FuncLocalAlignment).
+    // Consumed by `compile_pipeline.cpp` → `materializeCallingConvention` →
+    // `computeFrameLayout`. Empty when no function has an over-aligned local.
+    std::vector<FuncLocalAlignment> funcLocalAlignments;
     bool                   ok = true;
 };
 

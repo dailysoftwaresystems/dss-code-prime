@@ -64,6 +64,43 @@ TEST(TypeInterner, StructIsNominalAndStructural) {
     EXPECT_EQ(ti.name(i32), "");          // structural primitives have no name
 }
 
+// D-CSUBSET-MEMBER-ALIGNAS: a member-alignas override enters the struct's CONTENT
+// identity. Zero-churn: the 2-arg overload and the new 5-arg overload with an EMPTY
+// aligns span produce the SAME TypeId (an align-free struct interns byte-identically,
+// exactly like the offsets channel). An aligns={16} version is a DISTINCT TypeId.
+// RED-ON-DISABLE: were the aligns dropped from `contentDeclSiteKey`, the align-bearing
+// struct would alias its natural twin and `hasExplicitAligns` would still be false.
+TEST(TypeInterner, MemberAlignsEnterContentIdentityZeroChurn) {
+    auto ti = makeInterner(1);
+    const TypeId i32 = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 1>        const field{i32};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 0> const noOffs{};
+
+    // 2-arg (no aligns) vs the 5-arg overload with an EMPTY aligns span → SAME TypeId.
+    const TypeId plain = ti.structType("S", field);
+    std::array<std::uint32_t, 0> const noAligns{};
+    const TypeId plainViaNew = ti.structType("S", field, noWidths, noOffs, noAligns);
+    EXPECT_EQ(plain.v, plainViaNew.v)
+        << "an empty aligns span must intern byte-identically to the 2-arg overload";
+    EXPECT_FALSE(ti.hasExplicitAligns(plain));
+
+    // An aligns={16} version is a DISTINCT interned type (identity mix works).
+    std::array<std::uint32_t, 1> const aligns16{16};
+    const TypeId aligned = ti.structType("S", field, noWidths, noOffs, aligns16);
+    EXPECT_NE(aligned.v, plain.v)
+        << "a member-aligned struct must not alias its natural-alignment twin";
+    EXPECT_TRUE(ti.hasExplicitAligns(aligned));
+    EXPECT_EQ(ti.explicitFieldAlign(aligned, 0), 16u);
+
+    // Re-interning the SAME aligns canonicalizes to the SAME TypeId (content dedup).
+    const TypeId aligned2 = ti.structType("S", field, noWidths, noOffs, aligns16);
+    EXPECT_EQ(aligned.v, aligned2.v);
+
+    // A plain struct returns 0 (no override) for every field via explicitFieldAlign.
+    EXPECT_EQ(ti.explicitFieldAlign(plain, 0), 0u);
+}
+
 // ── D-CSUBSET-SELF-REFERENTIAL-STRUCT: nominal composites ───────────────────
 
 TEST(TypeInterner, SelfReferentialStructForwardMintCompletes) {

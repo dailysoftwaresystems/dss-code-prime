@@ -275,6 +275,10 @@ wrapperChild(Tree const& tree, HirLoweringConfig const& cfg, NodeId expr,
     RuleId const rule = tree.rule(expr);
     bool const isDispatched =
         (cfg.sizeofRule.valid()      && rule.v == cfg.sizeofRule.v)      ||
+        // C11/C23 6.5.3.4: `_Alignof(T)` — like sizeof, its ONE meaningful
+        // Internal child is a castTypeRef the peel would wrongly descend into;
+        // keep it for evalNode's alignof arm (mirror sizeof).
+        (cfg.alignofRule.valid()     && rule.v == cfg.alignofRule.v)     ||
         (cfg.binaryExprRule.valid()  && rule.v == cfg.binaryExprRule.v)  ||
         (cfg.unaryExprRule.valid()   && rule.v == cfg.unaryExprRule.v)   ||
         (cfg.ternaryExprRule.valid() && rule.v == cfg.ternaryExprRule.v) ||
@@ -416,6 +420,27 @@ evalNode(NodeId                              expr,
         HirLiteralValue v;
         v.core  = TypeKind::U64;   // size_t
         v.value = static_cast<std::uint64_t>(*sz);
+        return ok(std::move(v));
+    }
+
+    // C11/C23 6.5.3.4: `_Alignof(T)` in a const-expr context (an array dimension
+    // `int a[_Alignof(T)]`, `_Static_assert(_Alignof(T)==N,...)`). Dispatched by
+    // rule-id HERE — ahead of the wrapper-peel — for the SAME reason as sizeof (an
+    // alignof node's one meaningful Internal child is its castTypeRef, which the
+    // peel would descend into and reject). An ADDITIVE mirror of the sizeof
+    // dispatch reading the caller's `resolveAlignof` closure. Absent closure or
+    // un-alignable operand ⇒ NotAConstantExpression (fail loud).
+    if (cfg.alignofRule.valid() && rule.v == cfg.alignofRule.v) {
+        if (!env.resolveAlignof) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        auto const al = env.resolveAlignof(expr);
+        if (!al.has_value()) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        HirLiteralValue v;
+        v.core  = TypeKind::U64;   // size_t
+        v.value = static_cast<std::uint64_t>(*al);
         return ok(std::move(v));
     }
 

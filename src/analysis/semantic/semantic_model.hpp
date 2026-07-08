@@ -219,6 +219,19 @@ struct DSS_EXPORT SymbolRecord {
     // field is only the resolution→composition plumbing (cf. `enumValue`). A
     // zero-width (anonymous `int : 0;`) bit-field stores 0 (distinct from nullopt).
     std::optional<std::uint32_t> bitFieldWidth;
+    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the EXPLICIT `alignas(N)` / `alignas(T)`
+    // alignment override on this declaration (bytes, a power of two), or nullopt
+    // for no override. Set at the declaration's Pass-1 resolution — the value form
+    // const-folds via `constIntExpr`, the type form is `_Alignof(T)` via
+    // `computeLayout`, both validated (power-of-two / ≤256 / ≥ natural align /
+    // context) there. `alignas(0)` is a NO-OP (6.7.5p3) → left nullopt. For a
+    // struct/union MEMBER it is read at the composite's Pass-1 completion to build
+    // the `fieldAligns` span passed to `completeComposite` (the interned TYPE then
+    // owns the raised layout — mirrors `bitFieldWidth`). For a VARIABLE it is
+    // stored here as the authoritative value; threading it to globals/locals
+    // codegen is a SEPARATE deferred task (D-CSUBSET-ALIGNAS: this cycle stores it
+    // unconsumed for variables — member alignas works end-to-end via the interner).
+    std::optional<std::uint32_t> explicitAlignment;
 };
 
 // FF11 neutral-JSON shipped-library descriptor extern

@@ -1493,6 +1493,36 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
             if (!layout) return std::nullopt;
             return layout->size;
         };
+        // C11/C23 6.5.3.4: fold `_Alignof(T)` in a const-expr position (an array
+        // dimension `int a[_Alignof(T)]`, `_Static_assert(_Alignof(T)==N,...)`).
+        // An ADDITIVE mirror of `resolveSizeof` reading ALIGNMENT instead of size.
+        // The engine dispatches the `alignofRule` node here (ahead of its wrapper-
+        // peel); this closure resolves the queried type (the castTypeRef child)
+        // and reads its alignment through the same `computeLayout` engine MIR
+        // uses. Type-name form ONLY (no value form). `nullopt` when un-alignable
+        // or the target declared no layout params → the caller fails loud, never a
+        // guessed alignment.
+        env.resolveAlignof = [&s, &tree, cfg, fromScope](NodeId alignofNode)
+            -> std::optional<std::uint64_t> {
+            if (!s.aggregateLayout.has_value()) return std::nullopt;
+            TypeId queried{};
+            if (cfg->alignofTypeRule.valid()
+                && tree.rule(alignofNode).v == cfg->alignofTypeRule.v) {
+                auto ak = visibleChildren(tree, alignofNode);
+                if (cfg->alignofTypeChild < ak.size())
+                    // emitOnMiss=false: an unknown queried type yields nullopt →
+                    // the caller fails loud with ONE positioned diagnostic (it
+                    // owns it), not a redundant S_UnknownType pair.
+                    queried = resolveTypeNode(s, *cfg, tree,
+                                              ak[cfg->alignofTypeChild], fromScope,
+                                              /*emitOnMiss=*/false);
+            }
+            if (!queried.valid()) return std::nullopt;
+            auto const layout = computeLayout(queried, s.lattice.interner(),
+                                              *s.aggregateLayout, s.dataModel);
+            if (!layout) return std::nullopt;
+            return layout->align.bytes();
+        };
         // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A): classify a cast's
         // TARGET type for the offsetof spine — `(T*)0` (pointer), `(char*)x`
         // (pointer, retype), `(size_t)int` (integer width/signedness). The engine
@@ -1742,6 +1772,180 @@ resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& d
     }
     out.width = static_cast<std::uint32_t>(*w);
     return out;
+}
+
+// C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the FIRST `alignasSpec` node in a
+// declaration's specifier prefix, or InvalidNode when the declaration carries no
+// alignas (or the language declares no alignas surface / prefix rule). Used for
+// PRESENCE detection at a call site that owns the CONTEXT decision (a typedef /
+// function / parameter alignas is a constraint violation the caller emits). The
+// prefix subtree is reached via `specifierPrefixChild` — the same accessor the
+// linkage scan uses — so this sees exactly the STRIPPED specifier prefix
+// (structMemberDeclSpecifiers / declSpecifiers / localDeclSpecifiers).
+[[nodiscard]] NodeId
+firstAlignasSpecInPrefix(EngineState& s, SemanticConfig const& cfg,
+                         Tree const& tree, NodeId declNode,
+                         DeclarationRule const& decl) {
+    if (!cfg.alignasSpecRule.valid()) return {};
+    NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
+    if (!prefix.valid()) return {};
+    // Bounded descendant search for the specifier rule (mirror
+    // resolveBitfieldSuffix's suffix search); the prefix subtree is tiny.
+    std::vector<NodeId> stack{prefix};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId c = stack.back(); stack.pop_back();
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        if (tree.rule(c).v == cfg.alignasSpecRule.v) return c;
+        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+    }
+    return {};
+}
+
+// C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): compute + validate the alignment an
+// `alignasSpec` node requests. Reads the `alignasArg` operand (visible-child
+// `alignasArgChild`): a `castTypeRef` (TYPE form) resolves the type + reads its
+// alignment via `computeLayout(...)->align` (== _Alignof(T)); anything else
+// (VALUE form) const-evaluates the constant-expression via the SAME `constIntExpr`
+// static_assert / array-dimension folding uses. Validates:
+//   • 0 ⇒ nullopt, NO error (6.7.5p3: "an alignment specification of zero has no
+//     effect" — a NO-OP, treated as "no override" by the caller);
+//   • not a power of two ⇒ S_AlignasNotPowerOfTwo, nullopt;
+//   • > 256 ⇒ S_AlignasExceedsMax, nullopt (the `Alignment` newtype cap);
+//   • non-constant value ⇒ S_AlignasNonConstant, nullopt.
+// The WEAKER-than-natural check (6.7.5p4) is the CALLER's (it owns the declared
+// type). Returns the validated alignment in bytes, or nullopt on 0/error.
+[[nodiscard]] std::optional<std::uint32_t>
+evalOneAlignasSpec(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                   NodeId alignasSpecNode, ScopeId fromScope) {
+    auto emit = [&](DiagnosticCode code) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(alignasSpecNode);
+        d.actual   = std::string{tree.text(alignasSpecNode)};
+        s.reporter.report(std::move(d));
+    };
+    auto kids = visibleChildren(tree, alignasSpecNode);
+    if (cfg.alignasArgChild >= kids.size()) return std::nullopt;   // malformed
+    NodeId const argNode = kids[cfg.alignasArgChild];
+    // The `alignasArg` speculative alt commits EITHER the `alignasTypeName` wrapper
+    // (TYPE form) OR a value expression (VALUE form); discriminate by the committed
+    // child's rule. Descend to the sole visible child of the `alignasArg` alt
+    // wrapper (it holds one reading).
+    NodeId inner = argNode;
+    if (tree.kind(argNode) == NodeKind::Internal) {
+        auto argKids = visibleChildren(tree, argNode);
+        if (argKids.size() == 1) inner = argKids.front();
+    }
+    bool const isTypeForm =
+        cfg.alignasArgTypeRule.valid()
+        && tree.kind(inner) == NodeKind::Internal
+        && tree.rule(inner).v == cfg.alignasArgTypeRule.v;
+    std::int64_t value = 0;
+    if (isTypeForm) {
+        // The type form is `alignasTypeName [ castTypeRef ]` — resolve the SOLE
+        // castTypeRef child inside the wrapper (the wrapper exists only to carry
+        // the commitRequiresTypeName guard on the probed branch).
+        NodeId typeChild = inner;
+        {
+            auto wrapKids = visibleChildren(tree, inner);
+            if (!wrapKids.empty()) typeChild = wrapKids.front();
+        }
+        // emitOnMiss=false: an unknown queried type yields nullopt → we fail loud
+        // with ONE positioned diagnostic below (never a redundant S_UnknownType).
+        // This runs BEFORE the layout-params check so `alignas(<not-a-type>)` — a
+        // value that the parser optimistically committed as a type-name — fails
+        // loud (S_AlignasNonConstant) even in a layout-free analysis, NEVER silent.
+        TypeId const queried =
+            resolveTypeNode(s, cfg, tree, typeChild, fromScope, /*emitOnMiss=*/false);
+        if (queried.valid()) s.nodeToType.set(typeChild, queried);
+        if (!queried.valid()) { emit(DiagnosticCode::S_AlignasNonConstant); return std::nullopt; }
+        // A resolvable type whose alignment we cannot compute (no layout params)
+        // is a genuine "cannot determine the alignment" → fail loud, never silent.
+        if (!s.aggregateLayout.has_value()) {
+            emit(DiagnosticCode::S_AlignasNonConstant); return std::nullopt;
+        }
+        auto const layout = computeLayout(queried, s.lattice.interner(),
+                                          *s.aggregateLayout, s.dataModel);
+        if (!layout) { emit(DiagnosticCode::S_AlignasNonConstant); return std::nullopt; }
+        value = static_cast<std::int64_t>(layout->align.bytes());
+    } else {
+        auto folded = constIntExpr(s, tree, inner, fromScope, &cfg);
+        if (!folded.has_value()) { emit(DiagnosticCode::S_AlignasNonConstant); return std::nullopt; }
+        value = *folded;
+    }
+    // 6.7.5p3: `alignas(0)` has NO effect → no override, NO error. This is the
+    // ONLY value the standard makes a defined no-op; it is NOT extended to a
+    // NEGATIVE fold — `alignas(-4)` is a constraint violation (a valid alignment
+    // is a positive power of two), which gcc/clang both reject. Failing it loud
+    // (rather than silently swallowing it as "no alignment") is the fail-loud bar:
+    // a negative is not a power of two, so S_AlignasNotPowerOfTwo names the reason.
+    if (value == 0) return std::nullopt;
+    if (value < 0) { emit(DiagnosticCode::S_AlignasNotPowerOfTwo); return std::nullopt; }
+    // A member alignas may only RAISE alignment (a valid fundamental/extended
+    // alignment is a positive power of two, C 6.7.5p3).
+    std::uint64_t const uv = static_cast<std::uint64_t>(value);
+    if ((uv & (uv - 1u)) != 0u) { emit(DiagnosticCode::S_AlignasNotPowerOfTwo); return std::nullopt; }
+    if (uv > 256u)             { emit(DiagnosticCode::S_AlignasExceedsMax);      return std::nullopt; }
+    return static_cast<std::uint32_t>(uv);
+}
+
+// C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the EFFECTIVE alignment override a
+// declaration's specifier prefix requests — the MAX over every `alignasSpec` in
+// the prefix (C 6.7.5p6: with several alignment specifiers, the strictest — the
+// largest — wins). Each spec is computed + validated by `evalOneAlignasSpec`
+// (which emits pow2/max/non-constant diagnostics). When `declType` is a valid
+// type, the winning alignment is ALSO checked against its natural alignment
+// (6.7.5p4: alignas may not WEAKEN) → S_AlignasWeakerThanNatural. Returns the
+// override in bytes (nullopt = no override / all zero / all errored). A NO-OP
+// (returns nullopt) when the declaration carries no alignas.
+[[nodiscard]] std::optional<std::uint32_t>
+resolveAlignasOverride(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                       NodeId declNode, DeclarationRule const& decl,
+                       TypeId declType, ScopeId fromScope) {
+    if (!cfg.alignasSpecRule.valid()) return std::nullopt;
+    NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
+    if (!prefix.valid()) return std::nullopt;
+    // Collect every alignasSpec node in the prefix (there may be more than one).
+    std::vector<NodeId> specs;
+    {
+        std::vector<NodeId> stack{prefix};
+        for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+            NodeId c = stack.back(); stack.pop_back();
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            if (tree.rule(c).v == cfg.alignasSpecRule.v) { specs.push_back(c); continue; }
+            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+        }
+    }
+    std::optional<std::uint32_t> best;
+    for (NodeId sp : specs) {
+        if (auto a = evalOneAlignasSpec(s, cfg, tree, sp, fromScope)) {
+            if (!best.has_value() || *a > *best) best = a;
+        }
+    }
+    if (!best.has_value()) return std::nullopt;
+    // 6.7.5p4: an alignas that is WEAKER than the type's natural alignment is a
+    // constraint violation (alignas may only strengthen). Compare against the
+    // declared type's computeLayout align. Skip when the type is unresolved (an
+    // upstream error already fired) or there are no layout params.
+    if (declType.valid() && s.aggregateLayout.has_value()) {
+        auto const layout = computeLayout(declType, s.lattice.interner(),
+                                          *s.aggregateLayout, s.dataModel);
+        if (layout && *best < layout->align.bytes()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_AlignasWeakerThanNatural;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(specs.empty() ? declNode : specs.front());
+            d.actual   = std::string{tree.text(specs.empty() ? declNode : specs.front())};
+            s.reporter.report(std::move(d));
+            // Still return the requested override — the layout carrier's MAX(natural,
+            // override) makes a too-weak override a no-op anyway; the diagnostic is
+            // the fail-loud (the build fails via hasErrors regardless).
+        }
+    }
+    return best;
 }
 
 // FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23 §6.7.2.1 ¶13): recursively
@@ -3242,6 +3446,24 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                     // on the c21 symbol-isVolatile path — that volatile is a
                     // `ptrQualifier` INSIDE the declarator (after the star), not a
                     // base qualifier, so the co-located arm excludes it.
+                    //
+                    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the alignas specifier lives
+                    // on the SHARED declaration prefix (`node`), so its VALIDATION +
+                    // DIAGNOSTICS (pow2 / max / non-constant / context) must fire
+                    // EXACTLY ONCE per declaration, not once per declarator — a
+                    // multi-declarator `alignas(3) int a, b;` is one erroneous
+                    // specifier, one diagnostic. These declaration-scoped flags gate
+                    // the emit to the first declarator; the computed override is then
+                    // STORED on every declarator's symbol (each field/object carries
+                    // it). The natural-align (raise-only) check keys on the first
+                    // declarator's type — the dominant `alignas(N) T a, b;` case
+                    // shares the head type, so the check is identical for every slot.
+                    NodeId const declAlignasSpec =
+                        firstAlignasSpecInPrefix(s, cfg, tree, node, decl);
+                    bool alignasHandledForDecl = false;
+                    bool alignasBitfieldReported = false;
+                    bool alignasContextReported = false;
+                    std::optional<std::uint32_t> declAlignOverride;
                     for (NodeId dNode : declarators) {
                         // c34 (D-CSUBSET-ARRAY-SIZE-INFERENCE): a `[]` (empty-bound)
                         // array on a VARIABLE WITH AN INITIALIZER infers its size
@@ -3358,9 +3580,97 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                             if (bf.width.has_value())
                                 s.symbols.at(sym).bitFieldWidth = bf.width;
                         }
+                        // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): a struct/union member's
+                        // `alignas(N)` / `alignas(T)` — read from the SHARED member
+                        // specifier prefix on `node` (the whole structField/unionField;
+                        // a prefix alignas applies to EVERY slot: `alignas(16) int a,b;`).
+                        // Gated on this being a field rule (bitfieldSuffix present ⇒ a
+                        // structField/unionField DeclarationRule). 6.7.5p2: a BIT-FIELD
+                        // may NOT carry an alignment specifier → S_AlignasInvalidContext.
+                        // The validate-and-emit runs ONCE per declaration (the
+                        // `alignasHandledForDecl` gate); the resulting override is then
+                        // STORED on THIS declarator's symbol AND every following one —
+                        // the composite's Pass-1 completion gathers each into
+                        // `fieldAligns`. (Per-slot storage; one diagnostic.)
+                        if (decl.bitfieldSuffix.has_value() && declAlignasSpec.valid()) {
+                            if (!alignasHandledForDecl) {
+                                alignasHandledForDecl = true;
+                                // A bit-field member carrying alignas: the CONTEXT is
+                                // illegal regardless of the value. Emit once; the
+                                // per-slot check below still fires for each bit-field
+                                // declarator (a bit-field never stores an override).
+                                if (!s.symbols.at(sym).bitFieldWidth.has_value()) {
+                                    declAlignOverride = resolveAlignasOverride(
+                                        s, cfg, tree, node, decl, declTy, here);
+                                }
+                            }
+                            if (s.symbols.at(sym).bitFieldWidth.has_value()) {
+                                // A BIT-FIELD declarator may not carry alignas. This is
+                                // per-slot (a mixed `alignas(8) int a:3, b;` — only the
+                                // bit-field slots are illegal), but for the shared
+                                // prefix the standard idiom is all-or-none; report the
+                                // first offending bit-field slot only (the gate below).
+                                if (!alignasBitfieldReported) {
+                                    alignasBitfieldReported = true;
+                                    ParseDiagnostic d;
+                                    d.code     = DiagnosticCode::S_AlignasInvalidContext;
+                                    d.severity = DiagnosticSeverity::Error;
+                                    d.buffer   = tree.source().id();
+                                    d.span     = tree.span(declAlignasSpec);
+                                    d.actual   = "alignas on a bit-field member";
+                                    s.reporter.report(std::move(d));
+                                }
+                            } else if (declAlignOverride.has_value()) {
+                                s.symbols.at(sym).explicitAlignment = declAlignOverride;
+                            }
+                        }
                         bool const isFnSig = declTy.valid()
                             && s.lattice.interner().kind(declTy)
                                    == TypeKind::FnSig;
+                        // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): a VARIABLE's alignas.
+                        // Only for a NON-field declaration (`!bitfieldSuffix` — a
+                        // field is handled above); a PARAMETER carries its own
+                        // `param` DeclarationRule (no specifierPrefix + no alignasSpec
+                        // in the param grammar) so it never reaches here with an
+                        // alignas. 6.7.5p2: an alignas on a FUNCTION (a definition or a
+                        // prototype — FnSig-typed / function-form declarator) or a
+                        // TYPEDEF (kind Type) is a constraint violation →
+                        // S_AlignasInvalidContext. Otherwise store the validated
+                        // override on the object's symbol. The validate-and-emit runs
+                        // ONCE per declaration (the `alignasHandledForDecl` gate); the
+                        // override is stored on THIS declarator's symbol AND every
+                        // following one. Threading the stored value to globals/locals
+                        // codegen is a SEPARATE deferred task (unconsumed for variables).
+                        if (!decl.bitfieldSuffix.has_value() && declAlignasSpec.valid()) {
+                            DeclarationKind const dk = s.symbols.at(sym).kind;
+                            char const* badCtx = nullptr;
+                            if (isFnSig || isFunctionForm
+                                || dk == DeclarationKind::Function)
+                                badCtx = "alignas on a function";
+                            else if (dk == DeclarationKind::Type)
+                                badCtx = "alignas on a typedef";
+                            if (!alignasHandledForDecl) {
+                                alignasHandledForDecl = true;
+                                if (badCtx == nullptr) {
+                                    declAlignOverride = resolveAlignasOverride(
+                                        s, cfg, tree, node, decl, declTy, here);
+                                }
+                            }
+                            if (badCtx != nullptr) {
+                                if (!alignasContextReported) {
+                                    alignasContextReported = true;
+                                    ParseDiagnostic d;
+                                    d.code     = DiagnosticCode::S_AlignasInvalidContext;
+                                    d.severity = DiagnosticSeverity::Error;
+                                    d.buffer   = tree.source().id();
+                                    d.span     = tree.span(declAlignasSpec);
+                                    d.actual   = badCtx;
+                                    s.reporter.report(std::move(d));
+                                }
+                            } else if (declAlignOverride.has_value()) {
+                                s.symbols.at(sym).explicitAlignment = declAlignOverride;
+                            }
+                        }
                         if (isFunctionForm && declarators.size() == 1) {
                             // C 6.9.1 definition constraints, checked LOUD:
                             //  * the named direct-declarator must carry a
@@ -3657,6 +3967,30 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                             ? static_cast<std::int64_t>(*w)
                                             : kNotBitfield);
                                 }
+                                // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): gather each
+                                // field's EXPLICIT alignment override (set at the
+                                // field's Pass-1 resolution from the member specifier
+                                // prefix) into the parallel span passed to
+                                // `completeComposite` — 0 for a field with no override.
+                                // ALL-fields-or-EMPTY: when NO member carries alignas
+                                // the span stays EMPTY (so the composite interns
+                                // byte-identically to a pre-alignas struct — zero TypeId
+                                // churn, mirroring the all-ordinary bitfields rule); the
+                                // interned TYPE is then the authoritative align source
+                                // (computeLayout raises each field's align via max()).
+                                std::vector<std::uint32_t> fieldAligns;
+                                bool anyAlign = false;
+                                for (auto const& fe : fields)
+                                    if (s.symbols.at(fe.sym).explicitAlignment
+                                            .has_value()) { anyAlign = true; break; }
+                                if (anyAlign) {
+                                    fieldAligns.reserve(fields.size());
+                                    for (auto const& fe : fields) {
+                                        auto const& a =
+                                            s.symbols.at(fe.sym).explicitAlignment;
+                                        fieldAligns.push_back(a.value_or(0u));
+                                    }
+                                }
                                 // D5.4 / D5.5: struct vs union vs enum
                                 // dispatch is config-driven via
                                 // FieldChildrenDescriptor::compositeKind.
@@ -3775,7 +4109,8 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                     // recurse infinitely on the self-by-value cycle.
                                     if (!anyIncompleteMember)
                                         s.lattice.interner().completeComposite(
-                                            compositeTy, fieldTypes, fieldBitWidths);
+                                            compositeTy, fieldTypes, fieldBitWidths,
+                                            /*fieldOffsets=*/{}, fieldAligns);
                                 } else if (ck == CompositeKind::Enum) {
                                     // D5.5: enum type carries no field-
                                     // operands — only its nominal name +
@@ -3917,7 +4252,8 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                     compositeTy = srec.type;
                                     if (!anyIncompleteMember)
                                         s.lattice.interner().completeComposite(
-                                            compositeTy, fieldTypes, fieldBitWidths);
+                                            compositeTy, fieldTypes, fieldBitWidths,
+                                            /*fieldOffsets=*/{}, fieldAligns);
                                 }
                                 srec.type = compositeTy;
                                 s.nodeToType.set(resolved.node, compositeTy);
@@ -4423,6 +4759,23 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 TypeId const sized = resolveTypeNode(s, cfg, tree, typeNode, here);
                 if (sized.valid()) s.nodeToType.set(typeNode, sized);
                 // sized invalid ⇒ resolveTypeNode emitted S_UnknownType (fail loud).
+            }
+            s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
+        }
+        // C11/C23 6.5.3.4: `_Alignof(T)` typing — an ADDITIVE mirror of the sizeof
+        // TYPE arm. Resolves + stamps its castTypeRef child through the SAME type
+        // resolver (so the HIR lowering's `resolveStampedTypeBelow` recovers the
+        // queried type) and stamps the node size_t (U64). Type-name form ONLY (no
+        // value arm — `_Alignof(expr)` is a constraint violation the binder
+        // rejects at type-resolve). U64 is correct for LP64 + LLP64; see the
+        // sizeof arm's note on a future ILP32 `size_t`.
+        if (cfg.alignofTypeRule.valid() && rule.v == cfg.alignofTypeRule.v) {
+            auto kids = visibleChildren(tree, node);
+            if (cfg.alignofTypeChild < kids.size()) {
+                NodeId const typeNode = kids[cfg.alignofTypeChild];
+                TypeId const queried = resolveTypeNode(s, cfg, tree, typeNode, here);
+                if (queried.valid()) s.nodeToType.set(typeNode, queried);
+                // queried invalid ⇒ resolveTypeNode emitted S_UnknownType (fail loud).
             }
             s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
         }
@@ -6214,6 +6567,12 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         //    fallthrough would return the PRE-cast type — `sizeof((char)x)` would
         //    fold the wrong size. ──
         if (hirCfg.sizeofRule.valid() && r.v == hirCfg.sizeofRule.v) {
+            result = interner.primitive(TypeKind::U64); return;        // size_t
+        }
+        // C11/C23 6.5.3.4: `_Alignof(T)` is size_t (U64) — an ADDITIVE mirror of
+        // the sizeof arm (a re-typing wrapper whose castTypeRef child must NOT be
+        // read as its pre-alignof type).
+        if (hirCfg.alignofRule.valid() && r.v == hirCfg.alignofRule.v) {
             result = interner.primitive(TypeKind::U64); return;        // size_t
         }
         // D-CSUBSET-COMPUTED-GOTO: `&&label` is `void*` (a dedicated operand rule

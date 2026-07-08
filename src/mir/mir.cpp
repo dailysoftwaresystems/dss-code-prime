@@ -453,7 +453,8 @@ MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
                                   MirFuncId initFunc,
                                   SymbolBinding    binding,
                                   SymbolVisibility visibility,
-                                  bool             isConst) {
+                                  bool             isConst,
+                                  std::uint32_t    alignmentBytes) {
     if (!type.valid()) {
         std::fputs("dss::MirBuilder fatal: addGlobal: type TypeId must be valid\n",
                    stderr);
@@ -482,6 +483,7 @@ MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
     g.binding          = binding;
     g.visibility       = visibility;
     g.isConst          = isConst;
+    g.alignment        = alignmentBytes;
     return globalArena_.addNode(g);
 }
 
@@ -608,7 +610,8 @@ void MirBuilder::recordSuccessors_(MirOpcode terminator, std::span<MirBlockId co
 }
 
 MirInstId MirBuilder::addInst(MirOpcode opcode, std::span<MirInstId const> operands,
-                              TypeId resultType, std::uint32_t payload, MirInstFlags flags) {
+                              TypeId resultType, std::uint32_t payload, MirInstFlags flags,
+                              std::uint32_t payload2) {
     MirOpcodeInfo const info = opcodeInfo(opcode);
     if (info.isTerminator) {
         std::fprintf(stderr,
@@ -667,10 +670,11 @@ MirInstId MirBuilder::addInst(MirOpcode opcode, std::span<MirInstId const> opera
         std::abort();
     }
     detail::MirInst pod;
-    pod.opcode  = opcode;
-    pod.flags   = flags;
-    pod.typeId  = resultType;
-    pod.payload = payload;
+    pod.opcode   = opcode;
+    pod.flags    = flags;
+    pod.typeId   = resultType;
+    pod.payload  = payload;
+    pod.payload2 = payload2;
     return appendInst_(pod, operands, /*terminates=*/false);
 }
 

@@ -742,6 +742,52 @@ TEST(ParseTypeFromText, ExplicitFieldOffsetsParseAndForkIdentity) {
     EXPECT_GE(repBad.errorCount(), 1u);
 }
 
+// D-CSUBSET-MEMBER-ALIGNAS: the type-text codec carries per-field member-alignas
+// overrides (`struct "X" { T ~align, ... }`). (1) PARSE: the aligns reach the
+// interner; (2) IDENTITY: an align-bearing struct is a DISTINCT TypeId from the same
+// field-types with no aligns; (3) the `~` marker never collides with the offset `@`.
+TEST(ParseTypeFromText, MemberAlignsParseAndForkIdentity) {
+    TypeInterner interner{CompilationUnitId{13}};
+    TypeRegistry reg;
+    DiagnosticReporter rep;
+
+    TypeId const withAlign = parseTypeFromText(
+        "struct \"S\" { i32 ~16 }", interner, reg, rep);
+    ASSERT_TRUE(withAlign.valid());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(interner.kind(withAlign), TypeKind::Struct);
+    EXPECT_TRUE(interner.hasExplicitAligns(withAlign));
+    EXPECT_EQ(interner.explicitFieldAlign(withAlign, 0), 16u);
+
+    // Same name + same field types, NO aligns → a different interned type.
+    TypeId const noAlign = parseTypeFromText(
+        "struct \"S\" { i32 }", interner, reg, rep);
+    ASSERT_TRUE(noAlign.valid());
+    EXPECT_FALSE(interner.hasExplicitAligns(noAlign));
+    EXPECT_NE(withAlign, noAlign)
+        << "a member-aligned struct must not alias its natural-alignment twin";
+
+    // Re-parsing the SAME align text canonicalizes to the SAME TypeId.
+    TypeId const withAlign2 = parseTypeFromText(
+        "struct \"S\" { i32 ~16 }", interner, reg, rep);
+    EXPECT_EQ(withAlign, withAlign2);
+
+    // A partial align set (mix of `~` and none) is malformed, never a half-layout.
+    DiagnosticReporter repBad;
+    TypeId const mixed = parseTypeFromText(
+        "struct \"M\" { i32 ~16, i32 }", interner, reg, repBad);
+    EXPECT_FALSE(mixed.valid());
+    EXPECT_GE(repBad.errorCount(), 1u);
+
+    // Mixing `@` offsets and `~` aligns on the SAME struct is malformed (the two
+    // channels are mutually exclusive — offsets override alignment wholesale).
+    DiagnosticReporter repMix;
+    TypeId const both = parseTypeFromText(
+        "struct \"B\" { i32 @0, i32 ~16 }", interner, reg, repMix);
+    EXPECT_FALSE(both.valid());
+    EXPECT_GE(repMix.errorCount(), 1u);
+}
+
 // c107: the offset syntax ROUND-TRIPS through emit (a struct-returning fn signature
 // carries the struct text). emit → parse → emit is byte-identical, and the emitted
 // text spells `@4` — so a HIR text round-trip (verify-on-load / reintern) preserves
@@ -774,4 +820,45 @@ TEST(HirText, ExplicitFieldOffsetsRoundTrip) {
     EXPECT_NE(text.find("u64 @0"), std::string::npos) << text;
     EXPECT_NE(text.find("u32 @4"), std::string::npos) << text;
     expectRoundTrip(hir, ctx);   // emit→parse→emit byte-identical (parse+emit symmetric)
+}
+
+// D-CSUBSET-MEMBER-ALIGNAS: the member-alignas syntax ROUND-TRIPS through emit (a
+// struct-taking fn signature carries the struct text). emit → parse → emit is
+// byte-identical, the emitted text spells `~16`, and — critically — a re-parse of the
+// emitted text preserves align==16 (a lost `~` would fork the TypeId, dropping the
+// declared alignment).
+TEST(HirText, MemberAlignsRoundTrip) {
+    TypeInterner in{CompilationUnitId{1}};
+    std::array<TypeId, 1>        const fields{in.primitive(TypeKind::I32)};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 1> const aligns{16};
+    TypeId const s     = in.structType("S", fields, noWidths, noOffs, aligns);
+    TypeId const ptrS  = in.pointer(s);
+    // A VOID fn TAKING ptr<aligned struct> — the struct text appears in the param
+    // list, and a void return lets the body be empty (no fall-through verifier trip).
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    std::array<TypeId, 1> const params{ptrS};
+    TypeId const sig = in.fnSig(params, voidTy, CallConv::CcSysV);
+
+    HirBuilder b{"toy"};
+    HirNodeId const body = b.makeBlock(std::vector<HirNodeId>{});
+    HirNodeId const fn   = b.makeFunction(sig, /*symbol=*/1, {}, body);
+    HirNodeId const root = b.makeModule(std::vector<HirNodeId>{fn});
+    Hir hir = std::move(b).finish(root);
+
+    std::vector<std::string> names{"", "main"};
+    HirTextContext ctx; ctx.interner = &in; ctx.symbolNames = &names;
+    DiagnosticReporter r;
+    std::string const text = emitHir(hir, ctx, r);
+    EXPECT_NE(text.find("i32 ~16"), std::string::npos) << text;
+    expectRoundTrip(hir, ctx);   // emit→parse→emit byte-identical
+
+    // Re-parse the emitted struct text directly and confirm the align survives.
+    TypeRegistry reg;
+    DiagnosticReporter rep;
+    TypeId const reparsed = parseTypeFromText(
+        "struct \"S\" { i32 ~16 }", in, reg, rep);
+    EXPECT_TRUE(in.hasExplicitAligns(reparsed));
+    EXPECT_EQ(in.explicitFieldAlign(reparsed, 0), 16u);
 }

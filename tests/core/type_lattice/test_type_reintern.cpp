@@ -324,3 +324,33 @@ TEST(TypeReintern, VolatileQualifierSurvivesReintern) {
     EXPECT_TRUE(hi.isVolatileQualified(hi.operands(hpvi32)[0]))
         << "the POINTEE must stay volatile-qualified through re-intern";
 }
+
+// D-CSUBSET-MEMBER-ALIGNAS: member-alignas overrides must SURVIVE re-intern — without
+// threading them, the reinterned composite loses its declared field alignment (falls
+// back to natural) and forks the TypeId that `.member` scope keys on. RED-ON-DISABLE:
+// drop the aligns from the reintern completeComposite call and `hasExplicitAligns` on
+// the host is false / the override reads back 0.
+TEST(TypeReintern, MemberAlignsSurviveReintern) {
+    TypeInterner src{CompilationUnitId{1}};
+    const TypeId i32 = src.primitive(TypeKind::I32);
+    std::array<TypeId, 1>        const fields{i32};
+    std::array<std::int64_t, 0>  const noWidths{};
+    std::array<std::uint64_t, 0> const noOffs{};
+    std::array<std::uint32_t, 1> const aligns{16};
+    const TypeId s = src.structType("S", fields, noWidths, noOffs, aligns);
+    ASSERT_TRUE(src.hasExplicitAligns(s));
+
+    TypeLattice host{CompilationUnitId{2}};
+    auto& hi = host.interner();
+    std::unordered_map<std::uint32_t, TypeId> remap;
+    const TypeId hs = reinternType(src, s, host, remap);
+
+    ASSERT_TRUE(hs.valid());
+    EXPECT_EQ(hs.arenaTag, 2u);                       // host-stamped
+    ASSERT_EQ(hi.kind(hs), TypeKind::Struct);
+    EXPECT_TRUE(hi.hasExplicitAligns(hs))
+        << "the member-alignas override must NOT be dropped through re-intern";
+    EXPECT_EQ(hi.explicitFieldAlign(hs, 0), 16u);
+    ASSERT_EQ(hi.operands(hs).size(), 1u);
+    EXPECT_EQ(hi.kind(hi.operands(hs)[0]), TypeKind::I32);
+}

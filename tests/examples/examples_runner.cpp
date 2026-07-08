@@ -38,6 +38,7 @@
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -174,6 +175,14 @@ struct ExpectedDiagnostic {
     std::string   code;
     std::uint32_t line = 0;
     std::uint32_t col  = 0;
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN (#4): false ⇒ the diagnostic is emitted
+    // at a tier with NO source span (e.g. `L_OverAlignedStackLocal` from the LIR
+    // calling-convention frame layout). Such a diagnostic's default span resolves
+    // to 1:1, but pinning a fabricated coordinate would be dishonest — instead the
+    // set-equality below matches the CODE only for these (position-independent).
+    // Default true = a real positioned diagnostic (every existing expect-error
+    // example). Parsed from an optional `"positioned": false` manifest key.
+    bool          positioned = true;
 };
 
 struct ExampleManifest {
@@ -273,6 +282,15 @@ struct ExampleManifest {
             ed.code = d.at("code").get<std::string>();
             ed.line = d.at("line").get<std::uint32_t>();
             ed.col  = d.at("col").get<std::uint32_t>();
+            // #4: optional — a span-less-tier diagnostic is matched by code only.
+            if (d.contains("positioned")) {
+                if (!d.at("positioned").is_boolean()) {
+                    ADD_FAILURE() << "manifest " << path.generic_string()
+                                  << " expectDiagnostics 'positioned' must be a boolean";
+                    return m;
+                }
+                ed.positioned = d.at("positioned").get<bool>();
+            }
             m.expectDiagnostics.push_back(std::move(ed));
         }
     }
@@ -752,9 +770,17 @@ void runErrorTarget(fs::path const&        exampleDir,
                                std::istreambuf_iterator<char>()};
     auto const srcBuf = SourceBuffer::fromString(srcBytes, srcRel);
 
-    auto const render = [](std::string_view code,
-                           std::uint32_t line, std::uint32_t col) {
+    // #4: codes declared `positioned:false` are emitted at a span-less tier, so
+    // their position is not asserted — both sides render them code-only. Every
+    // other code keeps its precise `code line:col` pin.
+    std::set<std::string> codeOnly;
+    for (auto const& e : m.expectDiagnostics)
+        if (!e.positioned) codeOnly.insert(e.code);
+
+    auto const render = [&codeOnly](std::string_view code,
+                                    std::uint32_t line, std::uint32_t col) {
         std::string s(code);
+        if (codeOnly.count(s) != 0) return s;   // position-independent match
         s += ' ';
         s += std::to_string(line);
         s += ':';

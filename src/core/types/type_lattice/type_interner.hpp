@@ -205,7 +205,8 @@ public:
     // minted by `forwardComposite` (else fatal).
     void completeComposite(TypeId id, std::span<TypeId const> fields,
                            std::span<std::int64_t const> fieldBitWidths = {},
-                           std::span<std::uint64_t const> fieldOffsets = {});
+                           std::span<std::uint64_t const> fieldOffsets = {},
+                           std::span<std::uint32_t const> fieldAligns = {});
     // True iff `id` is a Struct/Union that was forward-minted but NOT yet completed.
     // An EXPLICIT flag, NOT "operands empty": `struct E {}` is a LEGAL COMPLETE
     // zero-field struct (size 0). A non-composite kind is never incomplete here.
@@ -246,6 +247,22 @@ public:
     TypeId structType(std::string_view name, std::span<TypeId const> fields,
                       std::span<std::int64_t const> fieldBitWidths,
                       std::span<std::uint64_t const> fieldOffsets);
+    // C11/C23 `alignas` on a struct member (D-CSUBSET-MEMBER-ALIGNAS): a struct with
+    // per-field EXPLICIT alignment overrides. `fieldAligns[i]` is field i's declared
+    // alignment in bytes (a power of two), or 0 = "no override, use natural
+    // alignment". The span is ALL-fields-or-EMPTY (a partial set is a caller bug) —
+    // an align-free struct passes EMPTY and interns byte-identically to the 2-arg
+    // overload (zero TypeId churn). The aligns are part of the struct's CONTENT
+    // identity (they change layout/size), so `struct{alignas(16) int x;}` is a
+    // DISTINCT interned type from `struct{int x;}`. A member alignas RAISES a field's
+    // alignment (max(natural, override)) at layout; it never lowers it. Mirrors the
+    // explicit-offsets channel but is INDEPENDENT: explicit offsets place fields
+    // wholesale (overriding alignment entirely), so combining aligns WITH offsets on
+    // the same struct is a caller bug (fail loud at completion).
+    TypeId structType(std::string_view name, std::span<TypeId const> fields,
+                      std::span<std::int64_t const> fieldBitWidths,
+                      std::span<std::uint64_t const> fieldOffsets,
+                      std::span<std::uint32_t const> fieldAligns);
     // True iff `id` is a Struct carrying c107 explicit field offsets (non-empty
     // `fieldOffsets`). Struct/Union only; false for every naturally-laid-out composite.
     [[nodiscard]] bool hasExplicitOffsets(TypeId id) const;
@@ -253,6 +270,13 @@ public:
     // from natural alignment (the ordinary path). Mirrors `fieldBitWidth`.
     [[nodiscard]] std::optional<std::uint64_t> explicitFieldOffset(
         TypeId id, std::size_t i) const;
+    // True iff `id` is a Struct/Union carrying member-alignas overrides (non-empty
+    // `fieldAligns`). Struct/Union only; false for every naturally-aligned composite.
+    [[nodiscard]] bool hasExplicitAligns(TypeId id) const;
+    // Field `i`'s explicit alignment override in bytes (a power of two), or 0 when
+    // that field has no override (use natural alignment). Returns 0 for every field
+    // of a composite interned with no aligns. Mirrors `explicitFieldOffset`.
+    [[nodiscard]] std::uint32_t explicitFieldAlign(TypeId id, std::size_t i) const;
     TypeId unionType(std::string_view name, std::span<TypeId const> variants);
     // FC8 bitfields (D-CSUBSET-BITFIELD): a union with per-member bit-field widths
     // (same `kNotBitfield`/width encoding + empty-scalars-when-none rule as the
@@ -397,6 +421,14 @@ private:
         // the bitfield packer AND reintern as garbage widths. EMPTY = derive offsets
         // from natural alignment (every existing struct → byte-identical TypeId).
         std::vector<std::uint64_t> fieldOffsets;
+        // D-CSUBSET-MEMBER-ALIGNAS: per-field EXPLICIT alignment override (bytes,
+        // power of two; 0 = no override), for C11/C23 `alignas` on a struct/union
+        // member. A SEPARATE channel from `fieldOffsets` on purpose: offsets place
+        // fields wholesale (overriding alignment), aligns only RAISE the padding a
+        // naturally-placed field gets — the two never combine (fail loud at
+        // completion if both are set). EMPTY = every field uses natural alignment
+        // (each existing composite → byte-identical TypeId, exactly like offsets).
+        std::vector<std::uint32_t> fieldAligns;
         std::uint64_t             declSiteKey = 0;   // the nominal-identity discriminator
         bool                      complete    = false;
     };

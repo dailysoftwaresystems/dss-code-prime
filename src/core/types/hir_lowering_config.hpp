@@ -245,6 +245,13 @@ struct DSS_EXPORT HirLoweringConfig {
     // language has no `sizeof` surface.
     RuleId      sizeofRule{};          std::string sizeofRuleName;
 
+    // C11/C23 6.5.3.4: the `_Alignof ( type-name )` / `alignof ( type-name )`
+    // operand-alt rule. Routes its CST subtree to `lowerAlignof` (→ core
+    // `HirKind::AlignOf`) — its castTypeRef child carries the semantic-stamped
+    // type whose ALIGNMENT the node folds to (mirroring sizeofRule reading size).
+    // Invalid ⇒ the language has no `_Alignof` surface.
+    RuleId      alignofRule{};         std::string alignofRuleName;
+
     // FC12a-core: the three variadic-intrinsic operand-alt rules. Each routes its
     // CST subtree to its dedicated lowering (`HirKind::VaStart`/`VaArg`/`VaEnd`) —
     // the type child of `va_arg` is recovered from the semantic stamp, NEVER lowered

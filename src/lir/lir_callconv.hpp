@@ -179,6 +179,17 @@ struct DSS_EXPORT FrameLayout {
     // re-scanning the LIR.
     std::uint32_t       localAreaSize     = 0;  // bytes occupied by local-alloca slots
     std::uint32_t       numLocalAllocas   = 0;  // count of `alloca` LIR ops in this function
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: padding bytes inserted BETWEEN the
+    // spill area and the local-alloca area so the local base lands on the
+    // max-local-alignment boundary. Nonzero ONLY when a function has an
+    // over-aligned local (`alignas`, or a naturally >8-aligned type like
+    // `long double`) AND the raw local base (outgoing+saved+spill) does not
+    // already satisfy that alignment — i.e. an ODD outgoing-arg count leaves the
+    // base ≡ 8 (mod 16). Every other frame keeps this 0 → its layout is
+    // byte-identical to before this cycle (the zero-blast-radius invariant).
+    // Folded into `localAreaOffset()` (so alloca offsets shift with it) AND into
+    // `totalFrameSize` (so the prologue grows + RSP stays call-aligned).
+    std::uint32_t       localAreaAlignPad = 0;
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): bytes reserved for the variadic
     // register-save-area — the zone a variadic callee's prologue spills its integer
     // + (al-gated) SSE arg registers into. Nonzero ONLY when this function calls
@@ -248,7 +259,12 @@ struct DSS_EXPORT FrameLayout {
     // `D-AS4-DISP8-ENCODING` cycle).
     [[nodiscard]] constexpr std::uint32_t
     localAreaOffset() const noexcept {
-        return outgoingArgAreaSize + savedRegAreaSize + spillAreaSize;
+        // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: `localAreaAlignPad` (0 for every
+        // non-over-aligned frame) shifts the local base up to its required
+        // boundary. Both the alloca-offset progression and `vaRegSaveAreaOffset`
+        // derive from this, so the whole topmost frame region moves in lockstep.
+        return outgoingArgAreaSize + savedRegAreaSize + spillAreaSize
+             + localAreaAlignPad;
     }
 
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the variadic register-save-area sits
@@ -259,7 +275,13 @@ struct DSS_EXPORT FrameLayout {
     // Zero-width when this function doesn't call va_start.
     [[nodiscard]] constexpr std::uint32_t
     vaRegSaveAreaOffset() const noexcept {
-        return outgoingArgAreaSize + savedRegAreaSize + spillAreaSize + localAreaSize;
+        // Derives from `localAreaOffset()` so the alignas local-area pad
+        // (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN) is included — the va-save area
+        // sits immediately above the (possibly padded) local area. A variadic
+        // function with an over-aligned local would otherwise place its
+        // register-save area `localAreaAlignPad` bytes too low (overlapping the
+        // top local slot). Pad is 0 for every non-over-aligned frame → identical.
+        return localAreaOffset() + localAreaSize;
     }
 };
 
@@ -296,6 +318,25 @@ struct DSS_EXPORT SehFuncletParent {
     SymbolId parentSymbol{};    // the function that guards the __try
 };
 
+// D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: one entry per function that has a body-
+// local whose EFFECTIVE alignment exceeds the target machine word — computed at
+// MIR→LIR (types + the Alloca alignment channel are present there) and keyed by
+// SymbolId so it survives the intervening LIR rebuilds. `computeFrameLayout`
+// looks each function up by symbol and, when present, aligns the local area to
+// the required boundary (or fails loud past the slot-width bound). Empty for a
+// module with no over-aligned local (mirrors `FuncLocalAlignment`).
+struct DSS_EXPORT LirFuncLocalAlignment {
+    SymbolId      funcSymbol{};
+    std::uint32_t maxLocalAlignBytes = 0;
+    // #2 per-alloca fix: the EFFECTIVE alignment (bytes) of every body-local
+    // alloca in scan order (the SAME order the callconv places them). The frame
+    // layout aligns each alloca's offset up to ITS OWN alignment — required on
+    // arm64 (8-byte slot < 16-byte stack alignment). Length == the function's
+    // alloca count (checked loud at consume). 0 in a slot = no over-alignment
+    // (alignUp is a no-op). Mirrors `FuncLocalAlignment::perAllocaAlignBytes`.
+    std::vector<std::uint32_t> perAllocaAlignBytes;
+};
+
 [[nodiscard]] DSS_EXPORT LirCallconvResult
 materializeCallingConvention(Lir const&           src,
                              TargetSchema const&  schema,
@@ -305,6 +346,10 @@ materializeCallingConvention(Lir const&           src,
                              // bindings so a funclet's `recover_parent_frame_slot`
                              // ops resolve against the parent's finalized layout.
                              // Empty for every non-SEH module (the default).
-                             std::span<SehFuncletParent const> sehFuncletParents = {});
+                             std::span<SehFuncletParent const> sehFuncletParents = {},
+                             // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: per-function
+                             // max local alignment (SymbolId-keyed). Empty for a
+                             // module with no over-aligned local.
+                             std::span<LirFuncLocalAlignment const> funcLocalAlignments = {});
 
 } // namespace dss

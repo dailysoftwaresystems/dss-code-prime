@@ -515,7 +515,13 @@ void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
         newOps.push_back(mapCalleeOperand(src, o, local, callee));
     }
     local.emplace(cid.v, dst.addInst(cop, newOps, src.instType(cid),
-                                     src.instPayload(cid), src.instFlags(cid)));
+                                     src.instPayload(cid), src.instFlags(cid),
+                                     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: carry
+                                     // the callee Alloca's effective-alignment
+                                     // channel into the caller — an inlined
+                                     // over-aligned local must keep its alignment
+                                     // (else its slot silently under-aligns).
+                                     src.instPayload2(cid)));
 }
 
 // The single-block-leaf inlining rebuild policy (OPT7 cycle 1). Per-
@@ -913,7 +919,12 @@ private:
         for (MirInstId const o : ops) newOps.push_back(mapCallerValue(o, id));
         rewrite_.emplace(id.v, dst_.addInst(op, newOps, src_.instType(id),
                                             src_.instPayload(id),
-                                            src_.instFlags(id)));
+                                            src_.instFlags(id),
+                                            // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN:
+                                            // preserve the caller's own Alloca
+                                            // alignment channel across the inline
+                                            // host rebuild.
+                                            src_.instPayload2(id)));
     }
 
     // Emit a CALLER terminator into the open block, mapping operands via

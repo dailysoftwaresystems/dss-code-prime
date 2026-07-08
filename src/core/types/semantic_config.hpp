@@ -1181,6 +1181,31 @@ struct DSS_EXPORT SemanticConfig {
     RuleId        sizeofTypeRule{};   std::string sizeofTypeRuleName;
     std::uint32_t sizeofTypeChild = 0;
     RuleId        sizeofValueRule{};  std::string sizeofValueRuleName;
+    // C11/C23 6.5.3.4: `_Alignof`/`alignof` typing. `alignofTypeRule` = the
+    // `_Alignof ( type-name )` form (TYPE-NAME ONLY — no value form, unlike
+    // sizeof); pass 2 resolves + stamps its `alignofTypeChild` castTypeRef child
+    // (so the HIR lowering recovers the type whose ALIGNMENT is read) and stamps
+    // the node size_t (U64). Invalid ⇒ the language has no `_Alignof` surface.
+    RuleId        alignofTypeRule{};  std::string alignofTypeRuleName;
+    std::uint32_t alignofTypeChild = 0;
+    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the `_Alignas`/`alignas` alignment
+    // SPECIFIER. `alignasSpecRule` = the `alignasSpec` shape = [ keyword, '(',
+    // alignasArg, ')' ]; `alignasArgChild` = the visible-child index of the
+    // `alignasArg` operand (2). `alignasArgTypeRule` = the `alignasTypeName` rule id
+    // (the guarded TYPE-form WRAPPER branch of the `alignasArg` alt, whose sole
+    // child is the `castTypeRef` — the wrapper exists so `commitRequiresTypeName`
+    // sits on the probed branch): the semantic tier reads alignasArg's committed
+    // reading and discriminates the TYPE form (committed child's rule == this ⇒
+    // alignment = _Alignof(T) via computeLayout(...)->align of the castTypeRef
+    // inside the wrapper) from the VALUE form (else ⇒ const-evaluate the constant-
+    // expression via the SAME `constIntExpr` sizeof/static_assert/array-dims use).
+    // The result is validated (power-of-two / ≤256 / ≥ natural align / context /
+    // constant) and STORED on `SymbolRecord.explicitAlignment` (variable) or fed
+    // into the composite's `fieldAligns` (member). Invalid `alignasSpecRule` ⇒ the
+    // language has no `alignas` surface (the scan never runs).
+    RuleId        alignasSpecRule{};    std::string alignasSpecRuleName;
+    std::uint32_t alignasArgChild = 0;
+    RuleId        alignasArgTypeRule{}; std::string alignasArgTypeRuleName;
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. `vaArgRule`
     // = the `va_arg(ap,T)` form; pass 2 resolves+stamps its `vaArgTypeChild`
     // castTypeRef (so the HIR lowering recovers the read type T) + stamps the node

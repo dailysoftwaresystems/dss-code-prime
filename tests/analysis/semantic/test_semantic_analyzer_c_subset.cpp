@@ -1020,6 +1020,378 @@ TEST(SemanticAnalyzerCSubset, StaticAssertSizeof1ArgFolds) {
                         DiagnosticCode::S_StaticAssertFailed), 0u);
 }
 
+// ── C11/C23 6.5.3.4 _Alignof — the alignof-folding requirement ───────────────
+//
+// `_Static_assert(_Alignof(T)==N, ...)` const-evaluates the alignof through the
+// SAME `constIntExpr` evaluator that folds sizeof — proving _Alignof is
+// const-evaluable AND yields the EXACT alignment. Mirrors the sizeof pins above:
+// a true alignof passes, a false one fails loud (not a rubber-stamp). Both
+// spellings (`_Alignof`/`alignof`) and a struct type are exercised. The align
+// resolver reads the SAME aggregateLayout params analyze() is given.
+TEST(SemanticAnalyzerCSubset, StaticAssertAlignofIntFoldsTrue) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(_Alignof(int) == 4, \"int aligns 4\");\n"
+        "int main(void){ return 42; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "_Alignof(int)==4 must FOLD true (proves alignof is const-evaluable)";
+}
+
+TEST(SemanticAnalyzerCSubset, StaticAssertAlignofDoubleFoldsTrue) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(_Alignof(double) == 8, \"double aligns 8\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "_Alignof(double)==8 must fold true";
+}
+
+// The C23 `alignof` spelling folds to alignment 1 for char.
+TEST(SemanticAnalyzerCSubset, StaticAssertAlignofCharSpellingFoldsTrue) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(alignof(char) == 1, \"char aligns 1\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "alignof(char)==1 must fold true (the C23 spelling)";
+}
+
+// _Alignof of a STRUCT = the MAX member alignment (not the size): {char; double}
+// is 16 bytes but aligns to 8 (the double). Exercises the aggregateLayout path
+// and proves alignof reads ALIGNMENT, never size.
+TEST(SemanticAnalyzerCSubset, StaticAssertAlignofStructFoldsToMaxMemberAlign) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct CharDouble { char c; double d; };\n"
+        "_Static_assert(_Alignof(struct CharDouble) == 8, \"aligns 8\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "_Alignof(struct{char;double;})==8 (max member align, NOT the size 16)";
+}
+
+TEST(SemanticAnalyzerCSubset, StaticAssertAlignofFoldsFalseFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(_Alignof(double) == 4, \"wrong on purpose\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u)
+        << "_Alignof(double)==4 must FOLD false — the assertion fails loud "
+           "(anti-rubber-stamp: the fold is real, and reads align not size)";
+}
+
+// ── C11/C23 6.7.5 _Alignas/alignas — alignment specifier ─────────────────────
+//
+// The FRONTEND + SEMANTICS: parse both spellings + both operand forms on a
+// variable / struct-member, compute + validate the alignment, and STORE it
+// (SymbolRecord.explicitAlignment for a variable; fed into the struct's
+// fieldAligns for a member → computeLayout raises the layout end-to-end).
+// D-CSUBSET-ALIGNAS. `analyze` is given the SAME aggregateLayout params the
+// _Alignof pins use (Natural, stack-align 16) so member layout is exact.
+namespace {
+constexpr AggregateLayoutParams kAlignasLayout{ScalarAlignmentRule::Natural, 16};
+}  // namespace
+
+// PARSE: a global variable `alignas(16) int x;` (value form) parses cleanly —
+// no parser diagnostics, one variable symbol.
+TEST(SemanticAnalyzerCSubset, AlignasVariableValueFormParses) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(16) int x;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    EXPECT_TRUE(x->type.valid());
+}
+
+// PARSE: the TYPE operand form `alignas(double) int y;` parses (a type-name in
+// the alignas operand contributes _Alignof(double)==8, which is ≥ int's 4, so
+// no weaker-than-natural error).
+TEST(SemanticAnalyzerCSubset, AlignasVariableTypeFormParses) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(double) int y;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasWeakerThanNatural), 0u);
+    SymbolRecord const* y = findSym(model, "y");
+    ASSERT_NE(y, nullptr);
+    // alignas(double) = 8 on an int (natural 4) — a valid RAISE.
+    ASSERT_TRUE(y->explicitAlignment.has_value());
+    EXPECT_EQ(*y->explicitAlignment, 8u);
+}
+
+// PARSE: a struct member `struct S { alignas(16) int a; char b; };` parses.
+TEST(SemanticAnalyzerCSubset, AlignasStructMemberParses) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "struct S { alignas(16) int a; char b; };\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    // No alignas constraint diagnostics at all for a valid raise.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasWeakerThanNatural), 0u);
+}
+
+// VARIABLE STORAGE: `alignas(32) int g;` sets SymbolRecord.explicitAlignment==32.
+// (The stored value is intentionally NOT consumed by variable codegen yet — that
+// is a separate deferred task; here we assert only that the SEMANTIC store works.)
+TEST(SemanticAnalyzerCSubset, AlignasVariableStoresExplicitAlignment) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(32) int g;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    ASSERT_TRUE(g->explicitAlignment.has_value())
+        << "alignas(32) must set SymbolRecord.explicitAlignment";
+    EXPECT_EQ(*g->explicitAlignment, 32u);
+}
+
+// VALUE-EXPR STORAGE: `alignas(2*8) int g;` const-folds the operand to 16.
+TEST(SemanticAnalyzerCSubset, AlignasVariableConstExprOperandFolds) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(2*8) int g;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    ASSERT_TRUE(g->explicitAlignment.has_value());
+    EXPECT_EQ(*g->explicitAlignment, 16u);
+}
+
+// MEMBER LAYOUT END-TO-END (via the interner): `struct S { alignas(16) char c; }`
+// → _Alignof(struct S)==16 AND sizeof(struct S)==16 (the alignas raised BOTH the
+// struct's alignment and its rounded size). Reuses the _Static_assert(_Alignof())
+// fold — RED-ON-DISABLE: without the fieldAligns wiring the struct aligns to 1.
+TEST(SemanticAnalyzerCSubset, AlignasMemberRaisesStructAlignAndSizeEndToEnd) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { alignas(16) char c; };\n"
+        "_Static_assert(_Alignof(struct S) == 16, \"aligns 16\");\n"
+        "_Static_assert(sizeof(struct S) == 16, \"sizes 16\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "alignas(16) on the sole char member must raise the struct to "
+           "_Alignof==16 AND sizeof==16 (end-to-end via fieldAligns)";
+}
+
+// MEMBER LAYOUT — following-field OFFSET: `struct T { char c; alignas(8) int i; }`
+// pushes `i` from its natural offset 4 to 8. Proven via the _Alignof of the
+// struct (max member align == 8) plus its size: char(1)+pad(7)+int(4) rounded to
+// 8 → 16. (The offsetof idiom itself is exercised in the corpus/e2e probe.)
+TEST(SemanticAnalyzerCSubset, AlignasMemberRaisesFollowingFieldLayout) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct T { char c; alignas(8) int i; };\n"
+        "_Static_assert(_Alignof(struct T) == 8, \"aligns 8\");\n"
+        "_Static_assert(sizeof(struct T) == 16, \"sizes 16\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// MEMBER LAYOUT — UNION: `union U { alignas(16) char c; int i; }` raises the
+// union to _Alignof==16 and sizeof==16 (the completed carrier + the union-arm
+// alignas fold in computeLayout).
+TEST(SemanticAnalyzerCSubset, AlignasUnionMemberRaisesAlignAndSizeEndToEnd) {
+    auto cu = buildShippedUnit("c-subset", {
+        "union U { alignas(16) char c; int i; };\n"
+        "_Static_assert(_Alignof(union U) == 16, \"aligns 16\");\n"
+        "_Static_assert(sizeof(union U) == 16, \"sizes 16\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// ZERO: `alignas(0) int x;` is a NO-OP (6.7.5p3) — NO diagnostic, NO override.
+TEST(SemanticAnalyzerCSubset, AlignasZeroIsNoOpNoOverride) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(0) int x;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNotPowerOfTwo), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNonConstant), 0u);
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    EXPECT_FALSE(x->explicitAlignment.has_value())
+        << "alignas(0) has no effect — no override stored";
+}
+
+// CONSTRAINT: a non-power-of-two value → S_AlignasNotPowerOfTwo.
+TEST(SemanticAnalyzerCSubset, AlignasNotPowerOfTwoFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(3) int x;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNotPowerOfTwo), 1u);
+}
+
+// CONSTRAINT: a value over the 256-byte cap → S_AlignasExceedsMax (a distinct
+// code from not-power-of-two — 512 IS a power of two, just too large).
+TEST(SemanticAnalyzerCSubset, AlignasExceedsMaxFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(512) int x;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasExceedsMax), 1u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNotPowerOfTwo), 0u);
+}
+
+// CONSTRAINT: an alignment WEAKER than the declared type's natural alignment →
+// S_AlignasWeakerThanNatural (6.7.5p4: alignas may only strengthen; 1 < 8).
+TEST(SemanticAnalyzerCSubset, AlignasWeakerThanNaturalFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(1) double d;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasWeakerThanNatural), 1u);
+}
+
+// CONSTRAINT: a non-constant value operand → S_AlignasNonConstant.
+TEST(SemanticAnalyzerCSubset, AlignasNonConstantFailsLoud) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "int nc; alignas(nc) int x;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNonConstant), 1u);
+}
+
+// CONSTRAINT: a NEGATIVE value is a constraint violation (NOT the 6.7.5p3 zero
+// no-op) → S_AlignasNotPowerOfTwo. Fail-loud: `alignas(-4)` must NOT be silently
+// swallowed as "no alignment" (a negative is not a valid alignment; gcc/clang
+// both reject it). RED-ON-DISABLE: were `value <= 0` treated as a no-op, this
+// would compile with ZERO diagnostics — a silent constraint violation.
+TEST(SemanticAnalyzerCSubset, AlignasNegativeFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(-4) int x;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNotPowerOfTwo), 1u)
+        << "alignas(-4) is a constraint violation, not a no-op — fail loud";
+}
+
+// EXACTLY-ONE diagnostic across a MULTI-DECLARATOR declaration: the alignas lives
+// on the shared prefix, so `alignas(3) int a, b;` is ONE erroneous specifier →
+// ONE S_AlignasNotPowerOfTwo (not one per declarator). RED-ON-DISABLE for the
+// per-declaration emit gate: without it the diagnostic fires twice.
+TEST(SemanticAnalyzerCSubset, AlignasMultiDeclaratorEmitsExactlyOnce) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(3) int a, b;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNotPowerOfTwo), 1u)
+        << "a shared-prefix alignas error must be reported once, not per declarator";
+}
+
+// MULTI-DECLARATOR STORE: a VALID `alignas(16) int a, b;` stores the override on
+// EVERY declarator's symbol (the prefix applies to all slots).
+TEST(SemanticAnalyzerCSubset, AlignasMultiDeclaratorStoresOnAll) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(16) int a, b;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* a = findSym(model, "a");
+    SymbolRecord const* b = findSym(model, "b");
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    ASSERT_TRUE(a->explicitAlignment.has_value());
+    ASSERT_TRUE(b->explicitAlignment.has_value());
+    EXPECT_EQ(*a->explicitAlignment, 16u);
+    EXPECT_EQ(*b->explicitAlignment, 16u);
+}
+
+// CONSTRAINT: alignas on a FUNCTION declaration → S_AlignasInvalidContext.
+TEST(SemanticAnalyzerCSubset, AlignasOnFunctionFailsLoud) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "alignas(16) int f(void);\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 1u);
+}
+
+// CONSTRAINT: alignas on a BIT-FIELD member → S_AlignasInvalidContext (6.7.5p2).
+TEST(SemanticAnalyzerCSubset, AlignasOnBitFieldMemberFailsLoud) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "struct S { alignas(8) int a : 3; };\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 1u);
+}
+
+// The C11 spelling `_Alignas` works identically to the C23 `alignas`.
+TEST(SemanticAnalyzerCSubset, AlignasC11SpellingStores) {
+    auto cu = buildShippedUnit("c-subset", { "_Alignas(64) int g;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    ASSERT_TRUE(g->explicitAlignment.has_value());
+    EXPECT_EQ(*g->explicitAlignment, 64u);
+}
+
+// VALUE-EXPR with an ENUM CONSTANT operand: `alignas(W)` where `W` is an enum
+// constant folds to 16. RED-ON-DISABLE for the type-vs-value discrimination: a
+// bare non-typedef identifier (`W`) must roll back to the VALUE reading and
+// const-fold (the `requireKnownType` polarity) — under the PreferType default it
+// would wrongly commit as a type-name and emit a spurious S_AlignasNonConstant.
+TEST(SemanticAnalyzerCSubset, AlignasEnumConstantOperandFolds) {
+    auto cu = buildShippedUnit("c-subset", {
+        "enum E { W = 16 };\n"
+        "alignas(W) int g;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNonConstant), 0u)
+        << "an enum-constant alignas operand must roll back to the VALUE reading "
+           "and fold (requireKnownType), not commit as a type-name";
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    ASSERT_TRUE(g->explicitAlignment.has_value());
+    EXPECT_EQ(*g->explicitAlignment, 16u);
+}
+
+// VALUE-EXPR with a sizeof operand: `alignas(sizeof(double))` folds to 8 (the
+// alignas value-form operand runs through the SAME sizeof-folding constIntExpr).
+TEST(SemanticAnalyzerCSubset, AlignasSizeofOperandFolds) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(sizeof(double)) int g;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    ASSERT_TRUE(g->explicitAlignment.has_value());
+    EXPECT_EQ(*g->explicitAlignment, 8u);
+}
+
 // ── FC16 C11/C23 6.5.1.1 _Generic — generic selection ────────────────────────
 //
 // SELECTION is a compile-time SEMANTIC-tier decision (like sizeof folding): the

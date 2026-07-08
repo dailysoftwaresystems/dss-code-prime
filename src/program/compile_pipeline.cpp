@@ -419,7 +419,7 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           model.lattice().interner(), reporter,
                           &hir->sourceMap, mirCfg, &ffiMap,
                           &hir->linkageMap, &hir->mutabilityMap,
-                          &hir->volatileMap);
+                          &hir->volatileMap, &hir->alignmentMap);
     phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;
@@ -579,8 +579,23 @@ lowerMirModuleToAssembly(Mir&                                        mir,
             SehFuncletParent{s.filterFuncletSymbol, s.parentFuncSymbol});
     }
     auto const ccEntry = reporter.errorCount();
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: thread each function's max local
+    // alignment (SymbolId-keyed, from MIR→LIR — it survived the LIR rebuilds)
+    // so `computeFrameLayout` can align the local area for an over-aligned local
+    // and fail loud on one exceeding the stack-slot bound. Translated MIR→LIR's
+    // descriptor to the callconv's (SAME shape, decoupled headers — mirrors the
+    // sehFuncletParents projection above). Empty when no function has an
+    // over-aligned local (the common case).
+    std::vector<LirFuncLocalAlignment> funcLocalAligns;
+    funcLocalAligns.reserve(lir.funcLocalAlignments.size());
+    for (auto const& a : lir.funcLocalAlignments) {
+        funcLocalAligns.push_back(
+            LirFuncLocalAlignment{a.funcSymbol, a.maxLocalAlignBytes,
+                                  a.perAllocaAlignBytes});
+    }
     auto cc = materializeCallingConvention(legal.lir, target, alloc, reporter,
-                                           sehFuncletParents);
+                                           sehFuncletParents,
+                                           funcLocalAligns);
     if (!cc.ok() || !tierClean(reporter, ccEntry)) {
         return std::nullopt;
     }

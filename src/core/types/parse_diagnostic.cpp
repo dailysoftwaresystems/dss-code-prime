@@ -136,6 +136,16 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_GenericSelectionNoMatch";
         case DiagnosticCode::S_GenericSelectionAmbiguous:
             return "S_GenericSelectionAmbiguous";
+        case DiagnosticCode::S_AlignasNotPowerOfTwo:
+            return "S_AlignasNotPowerOfTwo";
+        case DiagnosticCode::S_AlignasExceedsMax:
+            return "S_AlignasExceedsMax";
+        case DiagnosticCode::S_AlignasWeakerThanNatural:
+            return "S_AlignasWeakerThanNatural";
+        case DiagnosticCode::S_AlignasInvalidContext:
+            return "S_AlignasInvalidContext";
+        case DiagnosticCode::S_AlignasNonConstant:
+            return "S_AlignasNonConstant";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
@@ -174,6 +184,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_TerminatorTypeMismatch:   return "I_TerminatorTypeMismatch";
         case DiagnosticCode::I_ArgIndexOutOfRange:       return "I_ArgIndexOutOfRange";
         case DiagnosticCode::I_ArgPositionDuplicate:     return "I_ArgPositionDuplicate";
+        case DiagnosticCode::I_AllocaAlignmentNotPowerOfTwo: return "I_AllocaAlignmentNotPowerOfTwo";
         case DiagnosticCode::I_ExtensionTypeInMir:       return "I_ExtensionTypeInMir";
         case DiagnosticCode::I_StructCfMismatch:         return "I_StructCfMismatch";
         case DiagnosticCode::I_UnreachableBlock:         return "I_UnreachableBlock";
@@ -193,6 +204,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::L_MoveCycleUnsupported:         return "L_MoveCycleUnsupported";
         case DiagnosticCode::L_IndirectCallUnsupported:      return "L_IndirectCallUnsupported";
         case DiagnosticCode::L_IndirectCalleeClobberedByArgSetup: return "L_IndirectCalleeClobberedByArgSetup";
+        case DiagnosticCode::L_OverAlignedStackLocal:        return "L_OverAlignedStackLocal";
         case DiagnosticCode::R_NoCallingConventions:          return "R_NoCallingConventions";
         case DiagnosticCode::R_CallingConventionLookupFailed: return "R_CallingConventionLookupFailed";
         case DiagnosticCode::R_VRegHasNoClass:                return "R_VRegHasNoClass";

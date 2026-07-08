@@ -4039,6 +4039,59 @@ TEST(HirLoweringCSubset, SizeofValueOperandCarriesExpressionType) {
         << "…whose pointee is the Array itself";
 }
 
+// C11/C23 6.5.3.4: `_Alignof(T)` / `alignof(T)` lower to a core HirKind::AlignOf
+// node carrying the QUERIED type on its single [TypeRef] child (mirroring SizeOf).
+// Covers both spellings AND a struct type-name. RED-ON-DISABLE: drop the
+// lowerAlignof dispatch → the operand alt tries to type `_Alignof`/`alignof` as an
+// expression and the front end fails (no AlignOf node reaches the body).
+TEST(HirLoweringCSubset, AlignofLowersToAlignOfNodeCarryingQueriedType) {
+    SemanticModel model = analyzeCSubset(
+        "struct CharDouble { char c; double d; };\n"
+        "unsigned long long f(void) {\n"
+        "    return _Alignof(double) + alignof(char) "
+        "+ _Alignof(struct CharDouble);\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+            : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    ASSERT_TRUE(fn.valid());
+    // Collect every AlignOf in the body, pre-order = source order.
+    std::vector<HirNodeId> alignofs;
+    auto const collect = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::AlignOf) alignofs.push_back(n);
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    collect(collect, res->hir.functionBody(fn));
+    ASSERT_EQ(alignofs.size(), 3u) << "three _Alignof/alignof sites expected";
+    auto const& ti = model.lattice().interner();
+    auto const queriedType = [&](HirNodeId n) -> TypeId {
+        auto const kids = res->hir.children(n);
+        EXPECT_EQ(kids.size(), 1u) << "AlignOf carries exactly [TypeRef]";
+        // The AlignOf node itself is size_t (U64) — its result type.
+        EXPECT_EQ(ti.kind(res->hir.typeId(n)), TypeKind::U64)
+            << "_Alignof yields size_t";
+        return kids.empty() ? TypeId{} : res->hir.typeId(kids.front());
+    };
+    // [0] _Alignof(double): the queried type is the primitive double (F64).
+    TypeId const t0 = queriedType(alignofs[0]);
+    ASSERT_TRUE(t0.valid());
+    EXPECT_EQ(ti.kind(t0), TypeKind::F64) << "_Alignof(double) queries F64";
+    // [1] alignof(char): the C23 spelling, queried type char (TypeKind::Char).
+    TypeId const t1 = queriedType(alignofs[1]);
+    ASSERT_TRUE(t1.valid());
+    EXPECT_EQ(ti.kind(t1), TypeKind::Char) << "alignof(char) queries char";
+    // [2] _Alignof(struct CharDouble): the whole struct type.
+    TypeId const t2 = queriedType(alignofs[2]);
+    ASSERT_TRUE(t2.valid());
+    EXPECT_EQ(ti.kind(t2), TypeKind::Struct)
+        << "_Alignof(struct CharDouble) queries the STRUCT type";
+}
+
 // c90 (D-CSUBSET-ASSIGN-VALUE-RHS-COERCE): a plain `=` used as a VALUE stores
 // the RHS COERCED to the lvalue's type (C 6.5.16p3) — the tier-boundary pin
 // for `finishAssign`'s plain arm (and its `lowerBinary` Assign-arm mirror) at

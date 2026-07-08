@@ -5664,6 +5664,50 @@ struct Lowerer {
         // a scope live in ONE parent function, so their funcIndex agrees; we key on
         // the begin block's owning function.
         buildSehScopeDescriptors();
+        // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: gather each function's max local
+        // alignment. Read once from MIR (types + the Alloca effective-alignment
+        // channel are still present here) and keyed by SymbolId so it survives the
+        // downstream LIR rebuilds. SPARSE: only a function with a local whose
+        // effective alignment EXCEEDS the target's machine WORD (GPR register
+        // width) gets an entry — an alignment ≤ word is always satisfied (every
+        // ABI's post-prologue frame is ≥ word-aligned), so those functions need no
+        // frame-layout attention. The frame layout itself re-decides pad-vs-gate
+        // from the true slot width; this threshold only bounds the list size and
+        // must never MISS a function that could need a pad (hence "> word", the
+        // complete set of alignments the word-aligned base cannot guarantee).
+        std::uint32_t gprWidth = 0;
+        for (auto const& reg : target.registers())
+            if (static_cast<LirRegClass>(reg.regClass) == LirRegClass::GPR
+                && reg.widthBytes > gprWidth)
+                gprWidth = reg.widthBytes;
+        std::vector<FuncLocalAlignment> funcLocalAlignments;
+        for (std::uint32_t fi = 0; fi < fnCount; ++fi) {
+            MirFuncId const mf = mir.funcAt(fi);
+            std::uint32_t maxLocalAlign = 0;
+            // Per-alloca effective alignment in MIR scan order (== the LIR alloca
+            // placement order; MIR→LIR is block-for-block 1:1). Collected for the
+            // #2 per-alloca frame-slot alignment; the callconv indexes it by the
+            // alloca's scan position. 0 = an alloca that recorded no over-alignment
+            // (a scalar whose natural alignment is ≤ word — its alignUp is a no-op).
+            std::vector<std::uint32_t> perAllocaAlign;
+            std::uint32_t const bc = mir.funcBlockCount(mf);
+            for (std::uint32_t bi = 0; bi < bc; ++bi) {
+                MirBlockId const blk = mir.funcBlockAt(mf, bi);
+                std::uint32_t const ic = mir.blockInstCount(blk);
+                for (std::uint32_t ii = 0; ii < ic; ++ii) {
+                    MirInstId const inst = mir.blockInstAt(blk, ii);
+                    if (mir.instOpcode(inst) == MirOpcode::Alloca) {
+                        std::uint32_t const a = mir.instPayload2(inst);
+                        maxLocalAlign = std::max(maxLocalAlign, a);
+                        perAllocaAlign.push_back(a);
+                    }
+                }
+            }
+            if (maxLocalAlign > gprWidth)
+                funcLocalAlignments.push_back(
+                    FuncLocalAlignment{mir.funcSymbol(mf), maxLocalAlign,
+                                       std::move(perAllocaAlign)});
+        }
         Lir frozen = std::move(lir).finish();
         // Ensure lirToMir spans every LIR inst slot (any trailing
         // slots without recorded sources default to InvalidMirInst).
@@ -5681,6 +5725,7 @@ struct Lowerer {
             .signMaskConstants    = std::move(signMaskConstants_),
             .sehScopeDescriptors  = std::move(sehScopeDescriptors_),
             .externImports        = {},
+            .funcLocalAlignments  = std::move(funcLocalAlignments),
             .ok                   = !hadError()
         };
     }

@@ -126,6 +126,22 @@ void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const 
                         idx, mir_.literalPool().size()));
             }
         }
+        if (op == MirOpcode::Alloca) {
+            // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: the Alloca's secondary payload
+            // is the local's EFFECTIVE alignment in bytes (0 = no over-alignment
+            // recorded). A non-zero value MUST be a power of two ≤ 256 (the
+            // `Alignment` newtype cap) — the frame layout places each alloca on
+            // this boundary, so a dropped/garbled value (a rebuild/merge site
+            // zeroing or corrupting payload2) would mis-align the slot. Fail loud
+            // here rather than silently mis-place the stack local.
+            std::uint32_t const a = mir_.instPayload2(id);
+            if (a != 0 && ((a & (a - 1)) != 0 || a > 256)) {
+                reportInst(reporter,
+                    DiagnosticCode::I_AllocaAlignmentNotPowerOfTwo, id,
+                    std::format("alloca alignment payload {} is not a power of "
+                                "two in [1, 256]", a));
+            }
+        }
     });
     // CFG-successor range validation. `mirBuildPredecessors` (the
     // shared dom helper) silently skips out-of-range successor edges

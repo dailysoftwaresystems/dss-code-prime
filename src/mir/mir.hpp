@@ -112,6 +112,10 @@ public:
     [[nodiscard]] MirInstFlags  instFlags(MirInstId id)   const { return instArena_.at(id).flags; }
     [[nodiscard]] TypeId        instType(MirInstId id)    const { return instArena_.at(id).typeId; }
     [[nodiscard]] std::uint32_t instPayload(MirInstId id) const { return instArena_.at(id).payload; }
+    // Secondary per-opcode scalar (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): the
+    // effective alignment of an `Alloca` local in bytes (0 for every other
+    // opcode). MIR→LIR reads it to size each function's max local alignment.
+    [[nodiscard]] std::uint32_t instPayload2(MirInstId id) const { return instArena_.at(id).payload2; }
     // The block that contains this instruction (O(1) reverse lookup, the MIR
     // analog of HIR's parent array — ML3's dominator/liveness passes start from
     // "which block defines value X").
@@ -232,6 +236,13 @@ public:
     // `.data`. Default `false` (mutable) — the conservative writable default.
     [[nodiscard]] bool globalIsConst(MirGlobalId id) const {
         return globalArena_.at(id).isConst;
+    }
+    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): the source-declared
+    // explicit `alignas(N)` alignment in bytes (a power of two ≤ 256), or 0 for
+    // no override. The assembler's data-item emission raises the emitted
+    // symbol's section alignment to `max(natural, this)` when nonzero.
+    [[nodiscard]] std::uint32_t globalAlignmentBytes(MirGlobalId id) const {
+        return globalArena_.at(id).alignment;
     }
 
     // ── module-level iteration ──
@@ -363,12 +374,16 @@ public:
     //     module-init function writes the initial state at module load.
     //   - both unset: zero-init (C-style file-scope default).
     // Aborts on a no-symbol or no-type call; aborts on the both-set combination.
+    // `alignmentBytes` (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): the explicit
+    // `alignas(N)` alignment in bytes (power of two ≤ 256), or 0 (default) for
+    // no override. Stored on `MirGlobal.alignment`; consumed by the assembler.
     MirGlobalId addGlobal(TypeId type, SymbolId symbol,
                           std::uint32_t initLiteralIndex = UINT32_MAX,
                           MirFuncId     initFunc         = {},
                           SymbolBinding    binding       = SymbolBinding::Global,
                           SymbolVisibility visibility    = SymbolVisibility::Default,
-                          bool             isConst       = false);
+                          bool             isConst       = false,
+                          std::uint32_t    alignmentBytes = 0);
 
     // Reserve a basic block in the current function WITHOUT opening it, returning
     // its id so terminators can target it before it is filled (forward branches).
@@ -391,9 +406,13 @@ public:
     // operands and `resultType` are checked against `opcodeInfo(opcode)`
     // (operand count bounds + result-type rule). Returns the instruction id,
     // which IS its SSA value id.
+    // `payload2` (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): a secondary per-opcode
+    // scalar, defaulted 0. Currently set ONLY for `Alloca` (the local's
+    // effective alignment in bytes); ignored for every other opcode.
     MirInstId addInst(MirOpcode opcode, std::span<MirInstId const> operands,
                       TypeId resultType = InvalidType, std::uint32_t payload = 0,
-                      MirInstFlags flags = MirInstFlags::None);
+                      MirInstFlags flags = MirInstFlags::None,
+                      std::uint32_t payload2 = 0);
 
     // Value-origin conveniences (fused model). Each is a leaf value-producer.
     // Arg carries a per-ABI-class register `ordinal` AND a flat call-operand
