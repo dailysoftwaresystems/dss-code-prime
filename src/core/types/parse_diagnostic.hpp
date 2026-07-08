@@ -854,6 +854,22 @@ enum class DiagnosticCode : std::uint16_t {
     //   keep `\x`/octal (byte-producing, correct for a narrow element). Use `\u`/`\U`
     //   for a code point. An `Error` HIR node continues the collect-all lowering.
     H_WideByteEscapeUnsupported   = 0xF016,
+    // H_ConflictingStringLiteralPrefixes (C11/C23 6.4.5p5, Cycle D): a run of
+    //   ADJACENT string literals mixes TWO DIFFERENT non-narrow encoding prefixes
+    //   (`u"a" U"b"`, `u8"a" u"b"`, `L"a" u"b"`, …). 6.4.5p5 leaves "whether
+    //   differently-prefixed [wide] string literals can be concatenated"
+    //   IMPLEMENTATION-DEFINED; this implementation REJECTS it (as gcc/clang do)
+    //   rather than silently resolving to one prefix — a silent resolve MISCOMPILES
+    //   (drops the other prefix's element width / code-unit encoding). A SINGLE
+    //   non-narrow prefix with narrow segments (`"a" L"b"`) is NOT a conflict: the
+    //   narrow segments widen to it (6.4.5p5 "if any of the tokens has an encoding
+    //   prefix, the resulting sequence is treated as having that prefix"). The
+    //   conflict is decided on opener TOKEN KINDS (format-agnostic), NEVER resolved
+    //   cores (`u"`/`L"` both resolve to U16 on pe, so a core-keyed check would
+    //   diverge by target). Both tiers fail loud: the semantic typer leaves the node
+    //   UNTYPED + emits this (so a `sizeof` of it reports the real reason), and HIR
+    //   lowering emits it + an `Error` node, continuing the collect-all lowering.
+    H_ConflictingStringLiteralPrefixes = 0xF017,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,

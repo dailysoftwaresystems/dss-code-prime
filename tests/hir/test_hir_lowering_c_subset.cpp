@@ -2657,6 +2657,179 @@ TEST(HirLoweringCSubset, WideStringRoundTripsThroughDsshirText) {
            "NOT hardcoded Char)";
 }
 
+// ── Cycle D — C11/C23 6.4.5p5: adjacent-concat prefix MIXING ────────────────
+// A run of adjacent string literals takes the SINGLE distinct non-narrow prefix
+// as its effective prefix (narrow segments widen to it, position-independent);
+// TWO DIFFERENT non-narrow prefixes fail loud (impl-defined reject). These pin
+// the two silent defects Cycle A left (mistype + miscompile) and the FF3-mixed hole.
+
+TEST(HirLoweringCSubset, ConcatNarrowWidensLeadingWidePrefix) {
+    // `L"a" "b"` — the L segment leads; the NARROW "b" widens to wchar_t. Under the
+    // POSIX default wchar_t is I32 → Array<I32,3>. The two units are 'a','b'.
+    SemanticModel model = analyzeCSubset("void f() { L\"a\" \"b\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u) << "the two pieces fold into ONE literal";
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::I32) << "the run is wide (wchar_t=I32 on POSIX)";
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3) << "'a' + widened 'b' + wide NUL";
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::I32);
+}
+
+TEST(HirLoweringCSubset, ConcatNarrowWidensTrailingWidePrefix) {
+    // THE defect fix: `"a" L"b"` — the FIRST opener is NARROW, so pre-Cycle-D keyed
+    // the run's core on `"` and DROPPED the `L` → a silent narrow mistype. The run's
+    // effective prefix is L (position-independent), so this is Array<wchar_t,3> and
+    // the narrow "a" widens. RED-ON-DISABLE: revert to first-opener keying → Char.
+    SemanticModel model = analyzeCSubset("void f() { \"a\" L\"b\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::I32)
+        << "`\"a\" L\"b\"` is WIDE — the trailing L prefix wins (was silently dropped)";
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::I32);
+}
+
+TEST(HirLoweringCSubset, ConcatNarrowWidenByteBlobPosixVsPe) {
+    // THE byte-blob pin proving the NARROW segment WIDENED to the run's wide element
+    // width. `"a" L"b"` = {'a','b'} as wchar_t. On POSIX (I32) each unit is 4 LE
+    // bytes → 61 00 00 00 62 00 00 00. On pe (U16) each is 2 LE bytes → 61 00 62 00.
+    // A first-opener-narrow regression would emit the raw bytes `61 62` (Char) — a
+    // different length AND width on BOTH formats.
+    {
+        SemanticModel model = analyzeCSubset("void f() { \"a\" L\"b\"; }");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        ASSERT_EQ(res->literalPool.size(), 1u);
+        auto const& v = res->literalPool.at(0);
+        EXPECT_EQ(v.core, TypeKind::I32);
+        ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+        EXPECT_EQ(std::get<std::string>(v.value),
+                  std::string({0x61, 0x00, 0x00, 0x00, 0x62, 0x00, 0x00, 0x00}))
+            << "POSIX wchar_t=I32: 'a' and widened 'b' as two LE 4-byte units";
+    }
+    {
+        SemanticModel model = analyzeCSubsetPe("void f() { \"a\" L\"b\"; }");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        ASSERT_EQ(res->literalPool.size(), 1u);
+        auto const& v = res->literalPool.at(0);
+        EXPECT_EQ(v.core, TypeKind::U16) << "pe wchar_t is the U16 UTF-16 unit";
+        ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+        EXPECT_EQ(std::get<std::string>(v.value),
+                  std::string({0x61, 0x00, 0x62, 0x00}))
+            << "pe wchar_t=U16: 'a' and widened 'b' as two LE 2-byte units";
+    }
+}
+
+TEST(HirLoweringCSubset, ConcatSamePrefixPreserved) {
+    // `u"a" u"b"` — the SAME non-narrow prefix on both segments is NOT a conflict
+    // (one distinct kind). Array<U16,3>, existing behavior preserved.
+    SemanticModel model = analyzeCSubset("void f() { u\"a\" u\"b\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U16);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value), std::string({0x61, 0x00, 0x62, 0x00}))
+        << "u\"a\" u\"b\" = two LE 16-bit units 0x0061 0x0062";
+}
+
+TEST(HirLoweringCSubset, ConcatConflictingNonNarrowPrefixesFailLoud) {
+    // Each ordered pair of two DIFFERENT non-narrow prefixes is 6.4.5p5's impl-
+    // defined case → fail loud with H_ConflictingStringLiteralPrefixes (NEVER a
+    // silent resolve to one prefix, which drops the other's element width). Also a
+    // 3-segment run with a LEADING NARROW piece, to pin the fold across positions.
+    for (char const* src : {"void f() { u\"a\" U\"b\"; }",     // u16 vs u32
+                            "void f() { u8\"a\" u\"b\"; }",    // char8_t vs char16_t
+                            "void f() { L\"a\" u\"b\"; }",     // wchar_t vs char16_t
+                            "void f() { \"a\" L\"b\" u\"c\"; }"}) {  // leading narrow, then L vs u
+        SemanticModel model = analyzeCSubset(src);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_FALSE(res->ok) << src;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_ConflictingStringLiteralPrefixes), 1u) << src;
+    }
+}
+
+TEST(HirLoweringCSubset, ConcatConflictPlainStatementFailsLoud) {
+    // MF1 (red-on-disable via the SPECIFIC code): a PLAIN statement `u"a" U"b";` re-derives
+    // its type at lowering (the semantic tier left it untyped). The EXPLICIT early conflict
+    // branch reports the RIGHT reason — H_ConflictingStringLiteralPrefixes. Without it the
+    // conflict is NOT silent (the type-drop guard still fires as a backstop: a Char stamp
+    // under a wide effective opener) but with the WRONG reason (H_WideCharSurrogateUnsupported
+    // "not well-formed UTF-8"). So this pins the branch via the EXACT code (countCode below),
+    // and res->ok stays FALSE either way — defense in depth, correct-reason on top.
+    SemanticModel model = analyzeCSubset("void f() { u\"a\" U\"b\"; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok)
+        << "a mixed-prefix concat as a plain statement must fail lowering, not "
+           "silently type Array<Char,3>";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ConflictingStringLiteralPrefixes), 1u);
+    EXPECT_EQ(res->literalPool.size(), 0u) << "no literal is minted on the conflict path";
+}
+
+TEST(HirLoweringCSubset, ConcatFF3MixedNarrowWidePrefixFailsLoud) {
+    // The FF3-mixed hole (now CLOSED): `"a" L"\xC3"` — the run is WIDE (effective
+    // prefix L) but the FIRST opener is narrow. Pre-Cycle-D the FF3 byte-escape guard
+    // keyed on the first opener → narrow → MISS → the old silent UTF-8 collapse. Now
+    // the guard keys on the run's effective prefix, so the `\xC3` byte escape in a
+    // wide run fails loud with H_WideByteEscapeUnsupported.
+    SemanticModel model = analyzeCSubset("void f() { \"a\" L\"\\xC3\"; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "a byte escape in a wide (via a later prefix) run must fail";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideByteEscapeUnsupported), 1u);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ConflictingStringLiteralPrefixes), 0u)
+        << "a SINGLE non-narrow prefix is not a conflict — only the byte escape fires";
+}
+
+TEST(HirLoweringCSubset, ConcatAllNarrowUnchanged) {
+    // RED-ON-DISABLE guard: the effective-prefix change must NOT alter the all-narrow
+    // path. `"a" "b"` stays byte-identical Array<Char,3> with the raw bytes "ab".
+    SemanticModel model = analyzeCSubset("void f() { \"a\" \"b\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::Char);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value), "ab");
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::Char);
+}
+
 // ── golden ────────────────────────────────────────────────────────────────
 
 namespace {

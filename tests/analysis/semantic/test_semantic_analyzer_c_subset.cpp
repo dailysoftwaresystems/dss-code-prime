@@ -2668,6 +2668,92 @@ TEST(SemanticAnalyzerCSubset, AdjacentStringConcatTypesWholeCharArray) {
     EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::Char);
 }
 
+// ── Cycle D — C11/C23 6.4.5p5: adjacent-concat prefix MIXING (semantic typing) ─
+// The run's element core is keyed by its EFFECTIVE prefix (the single distinct
+// non-narrow opener among ALL segments), NOT the first opener. Two DIFFERENT
+// non-narrow prefixes leave the node UNTYPED + emit H_ConflictingStringLiteralPrefixes.
+
+// THE typing defect fix: `"a" L"b"` — first opener narrow, but the run's effective
+// prefix is L (wchar_t) so the WHOLE literal types Array<wchar_t, 3> (I32 on the
+// POSIX default), the narrow "a" widened. RED-ON-DISABLE: first-opener keying stamps
+// Array<Char,3> here — the semantic/HIR mistype the two tiers would AGREE on wrongly.
+TEST(SemanticAnalyzerCSubset, ConcatEffectivePrefixTypesWholeWideArray) {
+    auto cu = buildShippedUnit("c-subset", { "void f(){ \"a\" L\"b\"; }" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    ASSERT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const ty = firstStringLiteralType(model, *cu);
+    ASSERT_TRUE(ty.valid());
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::I32)
+        << "`\"a\" L\"b\"` — the trailing L prefix wins (was silently dropped)";
+    EXPECT_EQ(ti.scalars(ty)[0], 3) << "'a' widened + 'b' + wide NUL";
+}
+
+// Same-prefix `u"a" u"b"` (one distinct non-narrow kind) is NOT a conflict →
+// Array<U16,3>, existing behavior.
+TEST(SemanticAnalyzerCSubset, ConcatSamePrefixTypesU16) {
+    auto cu = buildShippedUnit("c-subset", { "void f(){ u\"a\" u\"b\"; }" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    ASSERT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const ty = firstStringLiteralType(model, *cu);
+    ASSERT_TRUE(ty.valid());
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::U16);
+    EXPECT_EQ(ti.scalars(ty)[0], 3);
+}
+
+// MF1 / N6: a run mixing two DIFFERENT non-narrow prefixes leaves the rule node
+// UNTYPED and emits H_ConflictingStringLiteralPrefixes at the SEMANTIC tier (so a
+// `sizeof` of it reports the real reason, not a bare sizeof-of-untyped cascade).
+TEST(SemanticAnalyzerCSubset, ConcatConflictLeavesNodeUntypedAndEmits) {
+    auto cu = buildShippedUnit("c-subset", { "void f(){ u\"a\" U\"b\"; }" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::H_ConflictingStringLiteralPrefixes), 1u);
+    TypeId const ty = firstStringLiteralType(model, *cu);
+    EXPECT_FALSE(ty.valid())
+        << "a mixed-prefix run is left UNTYPED so a sizeof of it fails loud";
+}
+
+// N6: `sizeof(u"a" U"b")` fails loud with the conflict reason (not a silent fold /
+// bare sizeof-of-untyped). The conflict is emitted once, on the rule node.
+TEST(SemanticAnalyzerCSubset, ConcatConflictSizeofFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "int f(){ return sizeof(u\"a\" U\"b\"); }" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::H_ConflictingStringLiteralPrefixes), 1u);
+}
+
+// MF2 (the AGNOSTICISM witness): the conflict compares opener TOKEN KINDS, never
+// resolved cores. `u"a" L"b"` mixes `u"` (char16_t) and `L"` (wchar_t) — two
+// DIFFERENT non-narrow token kinds → conflict on EVERY target. On pe both resolve
+// to U16 (SAME core), so a core-keyed check would silently ACCEPT it on Windows
+// while rejecting it on Linux (I32 ≠ U16). This asserts the reject on BOTH the
+// default (elf, different cores) AND pe (same core) — RED-ON-DISABLE of a core-keyed
+// classifier flips the pe arm to accept.
+TEST(SemanticAnalyzerCSubset, ConcatConflictIsTokenKindNotCoreEvenOnPe) {
+    for (bool pe : {false, true}) {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ u\"a\" L\"b\"; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = pe ? analyze(cu, DataModel::Llp64, std::nullopt, std::nullopt,
+                                  ObjectFormatKind::Pe)
+                        : analyze(cu);
+        EXPECT_TRUE(model.hasErrors()) << (pe ? "pe" : "default");
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::H_ConflictingStringLiteralPrefixes), 1u)
+            << (pe ? "pe: u\"/L\" both resolve to U16 but the TOKEN KINDS differ"
+                   : "default: u\"→U16 vs L\"→I32");
+    }
+}
+
 // R2: the int→char assignability arm (`charConvertsToArith`, C 6.3.1.1). Typing the
 // char literal `int` would otherwise REGRESS `char x = 'c';` (int → char slot, which
 // DSS's strict lattice rejects without the arm). RED-ON-DISABLE: drop the arm →

@@ -1,0 +1,15 @@
+{
+  "$comment": "Cycle D (C11/C23 6.4.5p5) / D-FFI-STDDEF-WCHAR-PE-WIDTH: sizeof(L\"ab\" \"cd\") — the narrow \"cd\" widens to wchar_t so the run is Array<wchar_t,5>; sizeof = 5 * wchar_t width, which is FORMAT-keyed: pe64 -> 5*2 = 10, elf/mach-o -> 5*4 = 20. The ONE source witnesses BOTH the widen (count 5 includes the narrow segment) and the effective-prefix width across every target. Per-target exitCode overrides the manifest default. The release arm returns the same constant per target.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 20,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"], "exitCode": 10 },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"], "exitCode": 20 },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64", "exitCode": 20 },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "exitCode": 20 }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

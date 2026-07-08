@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 84> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 85> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -153,6 +153,18 @@ constexpr std::array<DiagnosticCode, 84> kUnsuppressableCodes{{
     // node + fail the gate via errorCount.
     DiagnosticCode::H_InvalidUniversalCharacterName,
     DiagnosticCode::H_WideByteEscapeUnsupported,
+    // H_ConflictingStringLiteralPrefixes (C11/C23 6.4.5p5, Cycle D): a run of adjacent
+    // string literals mixing TWO DIFFERENT non-narrow encoding prefixes (`u"a" U"b"`).
+    // It is a silent-failure REASON code (like S_GenericSelectionNoMatch below): on the
+    // conflict path the semantic typer leaves the stringLiteralExpr node UNTYPED and HIR
+    // lowering returns an Error node, so the build already fails via errorCount /
+    // hasErrors regardless of the emit gate — no wrong bytes ship. But a SUPPRESSED
+    // conflict would fail the build with ZERO diagnostics shown (a confusing silent
+    // failure) OR, worse, if a future reader keyed lowering on the semantic untyping
+    // alone, re-open the silent MISCOMPILE the explicit fail-loud closes (a plain
+    // `u"a" U"b";` statement typed Array<Char,3> "ab"). Closed here so a mixed-prefix
+    // concat is never silent.
+    DiagnosticCode::H_ConflictingStringLiteralPrefixes,
 
     // I_* MIR-verifier band — frozen-module invariants. A suppressed
     // violation here would let a miscompile sail past the verifier.

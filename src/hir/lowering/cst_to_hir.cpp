@@ -2358,14 +2358,51 @@ struct Lowerer {
             return {errorNode(node), InvalidType};
         }
 
+        // C11/C23 6.4.5p5 (Cycle D): the run's EFFECTIVE encoding prefix — the single
+        // distinct NON-narrow opener among ALL adjacent segments (a narrow segment
+        // widens to it, position-independent). MF2: the classifier compares opener
+        // TOKEN KINDS via the format-agnostic `isWideStringOpenerKind`, never resolved
+        // cores (`u"`/`L"` both resolve to U16 on pe). The FF3 + type-drop guards below
+        // now key on this RUN prefix (not the first opener), closing the FF3-mixed hole
+        // where `"a" L"\xC3"` (first opener narrow) escaped the byte-escape guard.
+        EffectiveStringPrefix const eff = effectiveStringConcatPrefix(
+            tree(), node,
+            [this](SchemaTokenId tk) { return isWideStringOpenerKind(tk); },
+            stringOpenerTokenKind(node));
+        // MF1 (CRITICAL — closes a silent miscompile): two DIFFERENT non-narrow
+        // prefixes (`u"a" U"b"`) is 6.4.5p5's impl-defined case; we REJECT it. This
+        // MUST be an EXPLICIT EARLY branch: a plain `u"a" U"b";` statement re-derives
+        // its type HERE (the semantic tier left it untyped), and if we fell through to
+        // the wideness-keyed guards below they would BOTH miss (byte-escape false; the
+        // stamp fell back to Char) → `Array<Char,3>` "ab", `ok=true` = a SILENT
+        // MISCOMPILE. Fail loud first, before any guard consumes the effective opener.
+        if (eff.conflict) {
+            emitH(DiagnosticCode::H_ConflictingStringLiteralPrefixes, node,
+                  std::format("string literal {} concatenates two different non-narrow "
+                              "encoding prefixes; whether differently-prefixed wide "
+                              "string literals may be concatenated is implementation-"
+                              "defined (C 6.4.5p5) and this implementation rejects it — "
+                              "use a single encoding prefix for the whole literal",
+                              std::string{tree().text(node)}));
+            return {errorNode(node), InvalidType};
+        }
+
+        // N7 (Cycle D widening consequence): once the run's effective prefix is
+        // non-narrow, EVERY segment — including a NARROW one — widens into the wide
+        // code-unit path, so a narrow segment carrying raw invalid-UTF-8 bytes (or a
+        // `\x`/octal byte escape) now FAILS LOUD here (the FF3 guard below, or the
+        // wide-encode UTF-8 validation) where the SAME bytes in a pure-narrow string
+        // pass through untouched. That is the correct C 6.4.5p5 behavior: the bytes are
+        // no longer a narrow byte sequence but a UTF-8 source that must decode.
         TypeKind const core = stringElementCoreOf(node);
         // FF3: a `\x` hex / octal byte escape in a wide/UTF string names a raw
         // code-unit VALUE, not a code point — assembling it is deferred
         // (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE), so FAIL LOUD rather than the old
         // silent UTF-8-collapse (`u"\xC3\xA9"` → one 0x00E9 unit instead of two).
-        // Keyed on the OPENER (format-agnostic) so it fires even when the semantic
-        // tier left the node untyped. Narrow `"…"`/SQL keep `\x`/octal (byte-producing).
-        if (outcome.usedByteEscape && isWideStringOpenerKind(stringOpenerTokenKind(node))) {
+        // Keyed on the run's EFFECTIVE prefix (format-agnostic) so it fires even when
+        // the semantic tier left the node untyped, AND on a MIXED run `"a" L"\xC3"`
+        // whose first opener is narrow. Narrow `"…"`/SQL keep `\x`/octal (byte-producing).
+        if (outcome.usedByteEscape && isWideStringOpenerKind(eff.effectiveOpener)) {
             emitH(DiagnosticCode::H_WideByteEscapeUnsupported, node,
                   std::format("wide/UTF string literal {} cannot be lowered: a \\x hex / "
                               "octal byte escape names a raw code-unit value, not a code "
@@ -2383,7 +2420,7 @@ struct Lowerer {
         // the encode WAS representable, so a narrow stamp under a wide opener is always
         // the unrepresentable case.)
         if ((core == TypeKind::Char || core == TypeKind::Byte)
-            && isWideStringOpenerKind(stringOpenerTokenKind(node))) {
+            && isWideStringOpenerKind(eff.effectiveOpener)) {
             emitH(DiagnosticCode::H_WideCharSurrogateUnsupported, node,
                   std::format("wide/UTF string literal {} cannot be lowered: its body is "
                               "not well-formed UTF-8, or a code point exceeds U+10FFFF "

@@ -144,6 +144,17 @@ struct SchemaIndexes {
     // format), so this map is the single format-aware resolution point.
     std::unordered_map<std::uint32_t /*opener SchemaTokenId.v*/, TypeKind>
                                                    stringLiteralElementCoreByStart;
+    // C11/C23 6.4.5p5 (Cycle D): the SET of NON-narrow string-opener token kinds
+    // (`u"`/`U"`/`u8"`/`L"`). An opener is non-narrow when its base `elementCore` OR
+    // ANY `elementCoreByFormat` value is non-narrow (not Char/Byte) — a FORMAT-
+    // AGNOSTIC classification keyed on the token KIND, MIRRORING the HIR tier's
+    // `isWideStringOpenerKind`. The adjacent-concat effective-prefix fold uses THIS
+    // (never the format-resolved `byStart` core) to detect a run mixing two DIFFERENT
+    // non-narrow prefixes: on pe `u"`/`L"` both resolve to U16, so a core-keyed
+    // conflict would silently accept `u"a" L"b"` on Windows while rejecting it on
+    // Linux. Empty ⇒ the language declares no wide prefixes.
+    std::unordered_set<std::uint32_t /*opener SchemaTokenId.v*/>
+                                                   nonNarrowStringOpeners;
     // C11/C23 6.4.4.4: the CHARACTER-constant body token kind (`CharLiteral`) + the
     // WIDE openers' format-resolved element cores. `charLiteralBodyToken` gates the
     // char-typing override (only a char body token is a candidate); the map holds
@@ -4445,25 +4456,45 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
     return tree.rule(p).v == s.idx().stringLiteralExprRule.v;
 }
 
-// C11/C23 6.4.5: the element core of a string-literal node, keyed by its ACTUAL
-// opener token (the FIRST direct child token whose kind is in the per-opener map).
-// `L"`/`u"`/`U"`/`u8"` map to their declared/format-resolved core; the narrow `"`
-// (and any grammar without a prefix table) falls back to `stringLiteralElementCore`.
-// The opener is a DIRECT child token (the inline-alt opener pushes it flat), so a
-// single child scan finds it — no rule descent. `owningNode` is the
-// stringLiteralExpr rule node (openers are its children) OR a body-token's parent.
-[[nodiscard]] TypeKind stringLiteralElementCoreOf(EngineState const& s, Tree const& tree,
-                                                  NodeId owningNode) {
+// C11/C23 6.4.5 / 6.4.5p5: the element core of a (possibly adjacent-concatenated)
+// string-literal node, keyed by the run's EFFECTIVE encoding prefix — the single
+// distinct NON-narrow opener among ALL segments (narrow segments widen to it,
+// position-independent), NOT merely the first opener. `L"`/`u"`/`U"`/`u8"` map to
+// their declared/format-resolved core; the narrow `"` (and any grammar without a
+// prefix table) falls back to `stringLiteralElementCore`. `conflict` is set when the
+// run mixes ≥2 DIFFERENT non-narrow prefixes (6.4.5p5's impl-defined case, which
+// this implementation rejects); the caller then fails loud + leaves the node untyped.
+// The scan (SF4, the drift-prone part) is the SHARED `effectiveStringConcatPrefix`
+// chokepoint the HIR tier also uses; MF2: its non-narrow classifier is the
+// token-KIND set `nonNarrowStringOpeners` (format-agnostic), NOT the format-resolved
+// `byStart` core. `owningNode` is the stringLiteralExpr rule node (openers are its
+// children) OR a body-token's parent (the single-opener per-token fallback path).
+struct StringLiteralConcatCore {
+    TypeKind core;
+    bool     conflict;
+};
+[[nodiscard]] StringLiteralConcatCore stringLiteralElementCoreOf(
+        EngineState const& s, Tree const& tree, NodeId owningNode) {
     auto const& byStart = s.idx().stringLiteralElementCoreByStart;
-    if (!byStart.empty() && owningNode.valid()
-        && tree.kind(owningNode) == NodeKind::Internal) {
-        for (NodeId c : visibleChildren(tree, owningNode)) {
-            if (tree.kind(c) != NodeKind::Token) continue;
-            auto it = byStart.find(tree.tokenKind(c).v);
-            if (it != byStart.end()) return it->second;
+    if (byStart.empty() || !owningNode.valid()
+        || tree.kind(owningNode) != NodeKind::Internal) {
+        return { s.idx().stringLiteralElementCore, false };
+    }
+    EffectiveStringPrefix const eff = effectiveStringConcatPrefix(
+        tree, owningNode,
+        [&](SchemaTokenId tk) {
+            return s.idx().nonNarrowStringOpeners.count(tk.v) != 0;
+        },
+        /*narrowFallback=*/SchemaTokenId{});
+    if (eff.conflict) return { s.idx().stringLiteralElementCore, true };
+    if (eff.effectiveOpener.valid()) {
+        if (auto it = byStart.find(eff.effectiveOpener.v); it != byStart.end()) {
+            return { it->second, false };
         }
     }
-    return s.idx().stringLiteralElementCore;
+    // All-narrow run (or an unmapped opener): the narrow default — BYTE-IDENTICAL to
+    // the pre-Cycle-D path (byStart[narrowOpener] is built == stringLiteralElementCore).
+    return { s.idx().stringLiteralElementCore, false };
 }
 
 // C11/C23 6.4.4.4: the WIDE/UTF element core of a character constant, keyed by its
@@ -4682,7 +4713,9 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 // scalar narrow default and the length is the byte count (byte-
                 // identical). Route through the shared helper so a future prefixed
                 // grammar without the concat rule still types correctly.
-                TypeKind const core = stringLiteralElementCoreOf(s, tree, tree.parent(node));
+                // SINGLE-opener path (one body token's parent) → `conflict` is
+                // structurally impossible; take the core.
+                TypeKind const core = stringLiteralElementCoreOf(s, tree, tree.parent(node)).core;
                 if (TypeId const arr = stringLiteralArrayType(s, *decoded, core); arr.valid()) {
                     s.nodeToType.set(node, arr);
                 }
@@ -4706,19 +4739,37 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         EscapeDecodeOutcome outcome;
         if (auto decoded = decodeAdjacentStringBodies(
                 tree, node, s.idx().stringLiteralBodyToken, &outcome)) {
-            // C11/C23 6.4.5: the element core is keyed by THIS literal's opener
-            // (narrow `"` → Char; `u"`/`U"`/`u8"`/`L"` → their core), and the array
-            // length is the code-unit count for a wide core (via the shared encoder).
-            TypeKind const core = stringLiteralElementCoreOf(s, tree, node);
-            // FF3 (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE): a `\x`/octal byte escape
-            // in a WIDE/UTF string names a raw code-unit value, not a code point —
-            // leave the node UNTYPED so a `sizeof` of it fails loud, matching the HIR
-            // tier's fail-loud. Narrow `\x`/octal is byte-producing and stays typed.
-            bool const wideByteEscape = outcome.usedByteEscape
-                && core != TypeKind::Char && core != TypeKind::Byte;
-            if (!wideByteEscape) {
-                if (TypeId const arr = stringLiteralArrayType(s, *decoded, core); arr.valid()) {
-                    s.nodeToType.set(node, arr);
+            // C11/C23 6.4.5 / 6.4.5p5: the element core is keyed by the run's
+            // EFFECTIVE prefix (the single distinct non-narrow opener among ALL
+            // segments; narrow segments widen to it), and the array length is the
+            // code-unit count for a wide core (via the shared encoder).
+            StringLiteralConcatCore const coreInfo = stringLiteralElementCoreOf(s, tree, node);
+            if (coreInfo.conflict) {
+                // MF1 / N6 (6.4.5p5): the run mixes two DIFFERENT non-narrow prefixes
+                // (`u"a" U"b"`) — the impl-defined case this implementation rejects.
+                // Emit the reason HERE (so a `sizeof`/`_Alignof` of it reports the real
+                // conflict, not a bare sizeof-of-untyped cascade) and leave the node
+                // UNTYPED so a `sizeof` of it fails loud. The HIR tier emits the same
+                // code + an Error node when the run is lowered as a value.
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::H_ConflictingStringLiteralPrefixes;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(node);
+                d.actual   = std::string{tree.text(node)};
+                s.reporter.report(std::move(d));
+            } else {
+                TypeKind const core = coreInfo.core;
+                // FF3 (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE): a `\x`/octal byte escape
+                // in a WIDE/UTF string names a raw code-unit value, not a code point —
+                // leave the node UNTYPED so a `sizeof` of it fails loud, matching the
+                // HIR tier. Narrow `\x`/octal is byte-producing and stays typed.
+                bool const wideByteEscape = outcome.usedByteEscape
+                    && core != TypeKind::Char && core != TypeKind::Byte;
+                if (!wideByteEscape) {
+                    if (TypeId const arr = stringLiteralArrayType(s, *decoded, core); arr.valid()) {
+                        s.nodeToType.set(node, arr);
+                    }
                 }
             }
         }
@@ -7246,6 +7297,21 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 core = px.resolveElementCore(s.activeFormat);   // config-map lookup
             }
             idx.stringLiteralElementCoreByStart[px.startToken.v] = core;
+            // C11/C23 6.4.5p5 (Cycle D): classify this opener as NON-narrow keyed on
+            // its TOKEN KIND (format-agnostic) — non-narrow when the base `elementCore`
+            // OR any `elementCoreByFormat` value is not Char/Byte. Mirrors the HIR
+            // tier's `isWideStringOpenerKind` so the adjacent-concat prefix fold agrees
+            // across tiers WITHOUT reading the format-resolved core above (which would
+            // make `u"a" L"b"` accept on pe but reject on elf).
+            auto const isNonNarrowCore = [](TypeKind c) {
+                return c != TypeKind::Char && c != TypeKind::Byte;
+            };
+            bool nonNarrow = isNonNarrowCore(px.elementCore);
+            for (auto const& [fmt, fmtCore] : px.elementCoreByFormat) {
+                (void)fmt;
+                if (isNonNarrowCore(fmtCore)) nonNarrow = true;
+            }
+            if (nonNarrow) idx.nonNarrowStringOpeners.insert(px.startToken.v);
         }
         // C11/C23 6.4.4.4: the WIDE char-opener → format-resolved element-core map
         // (`L'`/`u'`/`U'`/`u8'`). The narrow `CharStart` is EXCLUDED — the unprefixed
