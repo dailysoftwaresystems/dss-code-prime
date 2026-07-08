@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Questions & help
+    url: https://github.com/dailysoftwaresystems/dss-code-prime/discussions/categories/q-a
+    about: Not sure it's a bug? Ask in Discussions — building, using, or understanding DSS.
+  - name: 🔭 Ideas & show-and-tell
+    url: https://github.com/dailysoftwaresystems/dss-code-prime/discussions
+    about: Share what you compiled with DSS, or float an idea before it becomes a formal request.
+  - name: 📫 Contact the maintainer
+    url: https://dailysoftwaresystems.com/
+    about: Reach Rafael Gasperetti — rafaelgasperetti@dailysoftwaresystems.com — for partnerships, sponsorship, or anything else.
+  - name: 🔒 Report a security issue
+    url: https://github.com/dailysoftwaresystems/dss-code-prime/security/advisories/new
+    about: Miscompiles or crashes with security impact — please report these privately.

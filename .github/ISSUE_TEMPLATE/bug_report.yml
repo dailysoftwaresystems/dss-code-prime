@@ -1,0 +1,105 @@
+name: 🐞 Bug report
+description: A miscompile, crash, wrong diagnostic, or build/link failure in DSS Code Prime.
+title: "[bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping harden a from-scratch compiler. The most actionable reports carry a **minimal reproducer** and the **exact target triple** — DSS owns every byte from source to binary, so the ISA × object-format combination matters.
+
+        > If the bug has security impact (a miscompile that could be weaponized, a crash on untrusted input), please use [private vulnerability reporting](https://github.com/dailysoftwaresystems/dss-code-prime/security/advisories/new) instead of a public issue.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind of bug
+      description: What went wrong? The silent classes — miscompile and accepts-invalid — are the highest priority.
+      options:
+        - Miscompile — compiled cleanly but ran with the WRONG result
+        - Crash / internal compiler error (ICE)
+        - Rejects-valid — refused a program that is actually valid
+        - Accepts-invalid — compiled a program that should have been rejected
+        - Wrong or missing diagnostic (bad message, wrong position)
+        - Build / link failure
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproducer
+      description: The smallest self-contained source that triggers it.
+      render: c
+      placeholder: |
+        int main(void) {
+            // ...
+            return 0;
+        }
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command line
+      description: The exact invocation — language, target, and any flags.
+      render: shell
+      placeholder: dss-code-prime --compile main.c --language c-subset --target x86_64:pe64-x86_64-windows-exec --output out
+    validations:
+      required: true
+  - type: dropdown
+    id: targets
+    attributes:
+      label: Target triple(s)
+      description: Which target(s) reproduce it? Select all that apply.
+      multiple: true
+      options:
+        - "x86_64 · PE (Windows)"
+        - "x86_64 · ELF (Linux)"
+        - "x86_64 · Mach-O (macOS)"
+        - "arm64 · PE (Windows)"
+        - "arm64 · ELF (Linux)"
+        - "arm64 · Mach-O (macOS)"
+        - Every target / target-independent
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Paste the diagnostic output and/or the observed exit code.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Output of `dss-code-prime --version`, or the git commit SHA you built from.
+      placeholder: "e.g. 8956b79"
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host environment
+      description: OS + architecture you built and ran DSS on.
+      placeholder: "e.g. Windows 11 x86_64 · Ubuntu 24.04 x86_64 · macOS 15 arm64"
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this isn't a duplicate.
+          required: true
+        - label: The reproducer above is the smallest I could make it.
+          required: true
+        - label: I'm willing to help test a fix.
+          required: false

@@ -1,0 +1,27 @@
+title: "[question]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ask away — how to build DSS, how to target something, why it rejects or accepts a program. If you've confirmed it's a defect, open a **Bug report** issue instead.
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Commands, source, target triple, and any output.
+      render: shell
+    validations:
+      required: false
+  - type: input
+    id: env
+    attributes:
+      label: Version / host (if relevant)
+      placeholder: "commit 8956b79 · Windows x86_64"
+    validations:
+      required: false

@@ -1,0 +1,10 @@
+# Renders the "Sponsor" button on the repository.
+# It links to the Daily Software Systems site, where you can support the project.
+# Docs: https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+
+custom: ["https://dailysoftwaresystems.com/"]
+
+# --- alternatives — uncomment / add as needed ---
+# github: [dailysoftwaresystems]        # requires GitHub Sponsors enabled on the account
+# polar: dailysoftwaresystems
+# open_collective: dss-code-prime

@@ -1,0 +1,26 @@
+title: "[show]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Compiled something real with DSS? It already turns the full SQLite amalgamation into a working database on Windows, Linux and macOS — show us what else it can do. A program, a new `.lang.json`, a target you brought up, a benchmark.
+  - type: input
+    id: what
+    attributes:
+      label: What did you build or compile?
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Source language, target triple, and anything surprising — good or bad.
+    validations:
+      required: false
+  - type: input
+    id: link
+    attributes:
+      label: Link (optional)
+      placeholder: "repo, gist, screenshot, …"
+    validations:
+      required: false

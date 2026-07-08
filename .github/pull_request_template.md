@@ -1,9 +1,9 @@
 ## What changed
 <!-- Brief description of the modifications made in this PR -->
 
-## Azure DevOps Ticket
-<!-- Link to the related work item -->
-https://dev.azure.com/dailysoftwaresystems/DBAS/_workitems/edit/XXXXX
+## Related issue
+<!-- Link the GitHub issue this addresses. Use a closing keyword (Closes / Fixes) so it auto-closes on merge. -->
+Closes #
 
 ## Type of change
 
@@ -16,6 +16,8 @@ https://dev.azure.com/dailysoftwaresystems/DBAS/_workitems/edit/XXXXX
 
 ## Checklist
 
-- [ ] I have built and run the test suite locally (`ctest --output-on-failure`)
+- [ ] **Agnostic** — no `if (arch/format/lang == …)` branch added to the shared substrate (`src/{opt,mir,hir,lir,core,analysis,asm,tokenizer,link}`); target vocabulary stays in config.
+- [ ] **Fails loud** — no path can silently miscompile; disabling a feature turns a test red, not quiet.
+- [ ] I have built and run the test suite locally (`ctest --output-on-failure`), and it covers this change.
 - [ ] No secrets or credentials are committed
 - [ ] `Run Pipes` label is applied so the gated pipeline-pr workflow runs
