@@ -31,8 +31,8 @@ The result is a **hermetic, auditable toolchain**. DSS writes its own machine co
 
 DSS Code Prime already compiles and runs **real, unmodified, production software**:
 
-- **SQLite** — the complete ~270,000-line amalgamation — compiles and runs as a working database on **Windows, Linux, and macOS across both x86_64 and arm64**, with **zero special flags** (runtime-verified on native CI). `sqlite3 --version` → 3.54.0; `SELECT`, and full CRUD, all correct.
-- **Codegen verified against GCC.** Across a broad SQL workload, DSS's generated code is byte-for-byte identical to GCC's — down to the last digit of floating-point text. The compiler also audits itself for **silent miscompiles**, the one failure class this project treats as unacceptable.
+- **SQLite** — the complete ~270,000-line amalgamation — compiles and runs as a working database on **four OS × ISA targets**: Linux (x86_64 + arm64), Windows (x86_64), and macOS (arm64), with **zero special flags**. Verified end-to-end by the in-repo [`real-examples/c/sqlite`](real-examples/c/sqlite) harness — `sqlite3 --version` → 3.54.0 and a `CREATE` / `INSERT` / `SELECT` round-trip returns the correct result.
+- **Cross-checked against GCC where it counts.** DSS's **ABI** — struct and bit-field layout — is verified byte-for-byte against GCC, Clang, and MSVC, and its **preprocessor** output byte-for-byte against `gcc -E`. It runs SQLite to correct results on every target, and continuously audits itself for **silent miscompiles** — the one failure class this project treats as unacceptable.
 - **600+ internal tests, 100% green**, backed by a test corpus nearly as large as the engine itself (~143,000 lines).
 - **The whole pipeline is in-tree and complete**: tokenizer → parser → semantic analysis → three-tier IR (HIR → MIR → LIR) → register allocation → **its own assembler** (x86_64 + arm64 byte encoding with a round-trip oracle) → **its own linker** (ELF / PE / Mach-O, static and dynamic).
 
@@ -42,7 +42,7 @@ DSS Code Prime already compiles and runs **real, unmodified, production software
 | **CPU targets** | `x86_64`, `arm64` — shipped end-to-end (encoder + round-trip oracle) |
 | **Object formats** | ELF, PE, Mach-O — shipped (executables + dynamic linking); WASM, SPIR-V — skeletons |
 | **Real-world corpus** | SQLite — compiles **and runs** on four OS × ISA targets, zero flags |
-| **Codegen fidelity** | byte-identical to GCC on a broad differential workload |
+| **Codegen fidelity** | ABI byte-identical to GCC / Clang / MSVC; preprocessor byte-identical to `gcc -E`; self-audited for silent miscompiles |
 
 > **Honest status.** DSS is in active development toward full C23 conformance — today it clears ~90% of an empirical, end-to-end C-feature battery (compiled *and executed*, not just parsed). It compiles and *runs* SQLite now; passing SQLite's own upstream test suite is a tracked next milestone. See [`.plans/`](.plans/) for the live, per-cycle status.
 
@@ -65,7 +65,7 @@ User Input (project / files / directory)
 └──────────────────────────────────────────────────────────┘
     │
     ▼
-Native executables · libraries · (WASM / SPIR-V — in progress)
+Native executables · libraries · (WASM / SPIR-V — planned)
 ```
 
 The pipeline is **fully config-driven end to end.** A `.lang.json` declares a language's lexer, grammar, semantics, and HIR lowering; a `.target.json` declares a target's opcodes, registers, calling conventions, and encodings; an object-format schema declares the binary container. The shared substrate (`src/{tokenizer,analysis,hir,mir,lir,opt,asm,link,core}`) contains **zero `if (arch/format/language == …)` branches** — that agnosticism is the project's core invariant, enforced on every change.
@@ -77,7 +77,7 @@ Three-tier IR: **HIR** (language-neutral, typed) → **MIR** (SSA over a CFG wit
 DSS Code Prime is one instance of a larger thesis: **one engine, many languages, many targets, every byte owned.** The road ahead:
 
 - **Full C23** — complete conformance, on every target. This is the current arc; most of the language already works end-to-end.
-- **DSS Axis** — a new, first-class systems language of our own design, hosted on the *same* engine as a pure `.lang.json` + lowering. Axis is where "any source language" stops being a demonstration and becomes a language people choose. *(In design.)*
+- **DSS Axis** — a new, first-class systems language of our own design, hosted on the *same* engine as a pure `.lang.json` + lowering. Axis is where "any source language" stops being a demonstration and becomes a language people choose. *(Reserved — design begins once full C ships.)*
 - **Transpilation** — the language-neutral HIR that every front-end already lowers *into* will also be raised back *out* as source, making DSS a universal transpiler as well as a compiler: any input language to any output language through one shared pivot — no per-language-pair translator.
 - **More architectures** — RISC-V next, then the long tail — each a `.target.json`, never an engine fork.
 - **More formats & platforms** — WASM and SPIR-V from skeleton to shipping; a widening real-world corpus beyond SQLite.
@@ -91,7 +91,7 @@ DSS Code Prime is one instance of a larger thesis: **one engine, many languages,
 - **Three-tier IR** — HIR → MIR → LIR, each with its own verifier and round-trippable text form.
 - **Hermetic toolchain** — own every byte from source to binary. No GAS / MASM / llvm-mc / ld / lld. In-tree assembler and linker, both complete.
 - **Fail-loud discipline** — a disabled or unsupported feature raises a real diagnostic; it never silently miscompiles.
-- **Cross-platform** — builds natively on Windows, Linux, and macOS; a Docker image gives reproducible builds.
+- **Cross-platform** — builds natively on Windows, Linux, and macOS.
 
 ## Usage
 
@@ -143,7 +143,7 @@ Targets are JSON-configured (`src/dss-config/targets/*.target.json`); the substr
 | Target | OS / Arch | Status |
 |---|---|---|
 | `x86_64` | Linux / Windows / macOS × x86_64 | **Shipped** — full opcode set, SysV AMD64 + Microsoft x64 calling conventions, byte encoding, round-trip oracle |
-| `arm64` | Linux / Windows / macOS / iOS / Android × ARM64 | **Shipped** — AAPCS64, byte encoding, round-trip oracle (MS-ARM64 calling convention deferred) |
+| `arm64` | Linux / Windows / macOS × arm64 | **Shipped** — AAPCS64, byte encoding, round-trip oracle (MS-ARM64 calling convention deferred) |
 | Object formats | per target | **Shipped** — ELF / PE / Mach-O executables + dynamic linking (PE IAT · ELF GOT+PLT · Mach-O `LC_DYLD_INFO_ONLY`); WASM / SPIR-V skeletons |
 | `wasm` / `riscv` | Web / embedded | **Planned** — each a config drop over the same engine |
 
@@ -174,12 +174,6 @@ src/
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-```
-
-**Docker** (reproducible build):
-
-```bash
-docker compose -f docker/docker-compose.yml up --build
 ```
 
 **Tests:**
