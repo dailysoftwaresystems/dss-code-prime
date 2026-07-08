@@ -1010,4 +1010,188 @@ int main() {
     return r;
 }
 ` },
+
+  // ───────── C23 conformance surface (added 2026-07-08) ─────────
+  // Each probe isolates ONE C23 (or late-C99/C11) semantic the battery
+  // did not previously exercise. A red probe here is a concrete, named
+  // conformance gap — the honest denominator for "full C23".
+  { id: 'c23_nullptr', cat: 'modern', expect: 42, src:
+`int main() {
+    int* p;
+    p = nullptr;
+    if (p == nullptr) { return 42; }
+    return 7;
+}
+` },
+  { id: 'c23_bool_keyword', cat: 'modern', expect: 42, src:
+`int main() {
+    bool t;
+    bool f;
+    t = true;
+    f = false;
+    if (t) { if (!f) { return 42; } }
+    return 7;
+}
+` },
+  { id: 'c23_digit_separators', cat: 'modern', expect: 42, src:
+`int main() { return 1'000'042 - 1'000'000; }
+` },
+  { id: 'c23_typeof', cat: 'modern', expect: 42, src:
+`int main() {
+    int x;
+    typeof(x) y;
+    x = 42;
+    y = x;
+    return y;
+}
+` },
+  { id: 'c23_typeof_unqual', cat: 'modern', expect: 42, src:
+`int main() {
+    const int x = 42;
+    typeof_unqual(x) y;
+    y = x;
+    return y;
+}
+` },
+  { id: 'c23_constexpr', cat: 'modern', expect: 42, src:
+`int main() {
+    constexpr int k = 42;
+    return k;
+}
+` },
+  { id: 'c23_auto_type', cat: 'modern', expect: 42, src:
+`int main() {
+    auto y = 42;
+    return y;
+}
+` },
+  { id: 'c23_bitint', cat: 'modern', expect: 42, src:
+`int main() {
+    _BitInt(32) x;
+    x = 42;
+    return (int)x;
+}
+` },
+  { id: 'c23_alignof', cat: 'modern', expect: 42, src:
+`int main() {
+    if (alignof(int) == 4) { return 42; }
+    return 7;
+}
+` },
+  { id: 'c23_alignas', cat: 'modern', expect: 42, src:
+`int main() {
+    alignas(16) int x;
+    unsigned long long addr;
+    x = 42;
+    addr = (unsigned long long)(&x);
+    if (addr % 16 == 0) { return x; }
+    return 7;
+}
+` },
+  { id: 'c23_u8_char', cat: 'modern', expect: 42, src:
+`int main() {
+    unsigned char c;
+    c = u8'*';
+    return c;
+}
+` },
+  { id: 'c23_enum_fixed_type', cat: 'modern', expect: 42, src:
+`enum E : unsigned char { LO = 40, HI = 2 };
+
+int main() {
+    enum E a;
+    enum E b;
+    a = LO;
+    b = HI;
+    return a + b;
+}
+` },
+  { id: 'c23_attr_nodiscard', cat: 'modern', expect: 42, src:
+`[[nodiscard]] int compute(void) { return 42; }
+
+int main() {
+    int r;
+    r = compute();
+    return r;
+}
+` },
+  { id: 'c23_attr_fallthrough', cat: 'modern', expect: 42, src:
+`int main() {
+    int x;
+    x = 0;
+    switch (1) {
+        case 1: x = x + 10; [[fallthrough]];
+        case 2: x = x + 32; break;
+        default: x = 99;
+    }
+    return x;
+}
+` },
+  { id: 'c23_empty_init', cat: 'modern', expect: 42, src:
+`int main() {
+    int z = {};
+    int v = {42};
+    return z + v;
+}
+` },
+  { id: 'c23_elifdef', cat: 'modern', expect: 42, src:
+`#define FEATURE_B
+#ifdef FEATURE_A
+int pick = 1;
+#elifdef FEATURE_B
+int pick = 42;
+#else
+int pick = 2;
+#endif
+
+int main() { return pick; }
+` },
+  { id: 'c23_has_include', cat: 'modern', expect: 42, src:
+`#if __has_include(<stddef.h>)
+int a = 40;
+#else
+int a = 0;
+#endif
+#if __has_include(<definitely_absent_zzz.h>)
+int b = 100;
+#else
+int b = 2;
+#endif
+
+int main() { return a + b; }
+` },
+  { id: 'c11_thread_local', cat: 'modern', expect: 42, src:
+`thread_local int counter;
+
+int main() {
+    counter = 42;
+    return counter;
+}
+` },
+  { id: 'c99_func_name', cat: 'modern', expect: 42, src:
+`int main() {
+    const char* fn;
+    fn = __func__;
+    if (fn[0] == 'm') { return 42; }
+    return 7;
+}
+` },
+  { id: 'c99_compound_literal', cat: 'modern', expect: 42, src:
+`struct Pt { int x; int y; };
+
+int main() {
+    struct Pt p;
+    p = (struct Pt){ 40, 2 };
+    return p.x + p.y;
+}
+` },
+  { id: 'c99_vla', cat: 'modern', expect: 42, src:
+`int main() {
+    int n;
+    n = 6;
+    int a[n];
+    a[0] = 42;
+    return a[0];
+}
+` },
 ];
