@@ -253,7 +253,11 @@ cheaper than after the diff lands. (This is the gate run on the linkage P1+P2 pl
 - Also run the standing inter-task checks: an **agnosticism verification** pass (no
   hardcoded language/CPU/format in shared substrate) and a **CI-hazard screen** for
   GCC-vs-MSVC portability (gtest `ASSERT_*` in non-void helpers; PCH-masked missing
-  includes; UTF-8 / string-literal portability). Local green ≠ CI green.
+  includes; UTF-8 / string-literal portability; **brace-init narrowing** — `T{expr}`
+  where `expr` is a wider/unsigned type [e.g. `std::int64_t{rng() % 100}`, narrowing
+  `unsigned long`→`int64_t`] is a hard ERROR under clang `-Wc++11-narrowing` but GCC/MSVC
+  accept it, so the local MSVC+gcc gate misses it — use `static_cast<T>(expr)`). Local
+  green ≠ CI green.
 - Fold every FOLD-NOW finding. Then rebuild + re-run the full ctest.
 - **Re-review the fold.** If folding *changed logic* (anything beyond comments / renames /
   formatting), run a **second `/pr-review-toolkit:review-pr` pass scoped to the fold's diff** — a

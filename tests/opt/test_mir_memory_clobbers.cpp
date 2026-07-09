@@ -553,7 +553,7 @@ TEST(MirMemoryClobbers, RandomizedCfgDifferentialSweep) {
                     MirInstId const lops[] = {a};
                     (void)mb.addInst(MirOpcode::Load, lops, i32);
                 } else if (pick == 1) {
-                    MirLiteralValue lv; lv.value = std::int64_t{rng() % 100};
+                    MirLiteralValue lv; lv.value = static_cast<std::int64_t>(rng() % 100);
                     lv.core = TypeKind::I32;
                     MirInstId const cv = mb.addConst(lv, i32);
                     MirInstId const sv[] = {cv, a};
