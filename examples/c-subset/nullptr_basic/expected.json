@@ -1,0 +1,33 @@
+{
+  "$comment": "FC17 D-CSUBSET-NULLPTR: the runtime witness for C23 `nullptr` (§6.4.4.6 / §6.2.5). exitCode 15 = the OR of 4 independent bits, each a distinct nullptr behavior: 1 = init `void *p = nullptr` + `p == nullptr`; 2 = `nullptr ? 0 : 2` — nullptr in a controlling expression is false; 4 = `p = opaque; p != nullptr` with an OPAQUE (volatile-sourced) address so the comparison is a genuine RUNTIME compare the optimizer cannot fold; 8 = reassign-to-null + reversed `nullptr == p`. `nullptr` lowers to the integer-0 null constant at HIR (Fix 1(a)) — it reuses all null-pointer-constant lowering and NEVER reaches MIR as NullptrT (the I_NullptrTypeInMir verifier tripwire would fire otherwise). The `release` arm (shippedPipeline, zero-drift) proves the optimizer preserves nullptr's runtime semantics over the null-const MIR shapes — a broken lowering mis-folds a bit and returns != 15.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 15,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

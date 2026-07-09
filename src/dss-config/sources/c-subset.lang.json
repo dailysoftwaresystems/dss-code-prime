@@ -328,6 +328,7 @@
     { "word": "_Bool",    "kind": "LegacyBoolKeyword" },
     { "word": "true",     "kind": "TrueKeyword"       },
     { "word": "false",    "kind": "FalseKeyword"      },
+    { "word": "nullptr",  "kind": "NullptrKeyword"    },
     { "word": "float",    "kind": "FloatKeyword"      },
     { "word": "double",   "kind": "DoubleKeyword"     },
     { "word": "const",    "kind": "ConstKeyword"    },
@@ -1064,6 +1065,7 @@
         "FloatLiteral",
         "TrueKeyword",
         "FalseKeyword",
+        "NullptrKeyword",
         "stringLiteralExpr",
         "charLiteralExpr",
         "compoundLiteralExpr",
@@ -1282,7 +1284,8 @@
     "pointerConversions": {
       "implicitToVoidPtr":                  true,
       "implicitFromVoidPtr":                true,
-      "nullPointerConstantFromIntegerZero": true
+      "nullPointerConstantFromIntegerZero": true,
+      "nullPointerConstantFromNullptrT":    true
     },
     "$pointerAliasingComment": "Two orthogonal C99-derived alias-analysis opt-ins. `strictAliasingOnDistinctTypes` (C99 §6.5): accessing an object through a pointer of an incompatible type is undefined behavior — lets the MIR optimizer's CSE/LICM Load admission prove Ptr<I32> and Ptr<I64> don't alias (Rule 6 in mirMayAlias). `charTypesAliasAll` (C99 §6.5 ¶7): character-type pointers may alias an object of any type — the canonical strict-aliasing carve-out for serializers/hash-visitors/memcpy. C-family languages declare both true. A Rust frontend or strict-typed DSL would declare `charTypesAliasAll: false` (the type-checker enforces aliasing at a higher tier). See D-OPT-LOAD-ALIAS-ANALYSIS for the substrate's design.",
     "pointerAliasing": {
@@ -1546,6 +1549,7 @@
       { "literal": "FloatLiteral",  "core": "F64" },
       { "literal": "TrueKeyword",   "core": "Bool", "value": 1 },
       { "literal": "FalseKeyword",  "core": "Bool", "value": 0 },
+      { "literal": "NullptrKeyword", "core": "NullptrT", "value": 0 },
       { "literal": "CharLiteral",   "core": "I32" },
       { "literal": "StringLiteral", "core": "Char", "stringArray": true }
     ],

@@ -547,6 +547,17 @@ enum class DiagnosticCode : std::uint16_t {
     // at the composite-completion site; unsuppressable (a suppressed one would ship
     // the wrong — padded — bytes).
     S_PackedBitfieldUnsupported   = 0xE032,
+    // C23 §6.5 (D-CSUBSET-NULLPTR): the predefined constant `nullptr` (type
+    // nullptr_t) used as an operand where nullptr_t is not permitted — any
+    // arithmetic/bitwise/shift binary (`nullptr + 1`), any relational (`nullptr <
+    // p`), unary `-`/`~` (`-nullptr`), or `==`/`!=` against a non-pointer /
+    // non-nullptr peer (`nullptr == 5`). WITHOUT this explicit fail-loud gate the
+    // HIR lowering (nullptr → the integer-0 null constant) would SILENTLY compile
+    // `nullptr + 1` as `0 + 1` — a silent accept of ill-formed code. `nullptr` IS
+    // admissible as an `==`/`!=` operand against a pointer or another nullptr, and
+    // in the pointer/bool CONVERSION contexts (handled by isAssignable). The
+    // `.actual` names the offending operand. Unsuppressable.
+    S_NullptrInvalidOperand       = 0xE033,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -978,6 +989,13 @@ enum class DiagnosticCode : std::uint16_t {
     // garbling payload2) would mis-align the slot — a silent stack miscompile.
     // Caught at every verify point (verify-after-every-pass in release).
     I_AllocaAlignmentNotPowerOfTwo = 0xA013,
+    // C23 nullptr_t (D-CSUBSET-NULLPTR): a MIR instruction result type resolves to
+    // TypeKind::NullptrT. By construction NEVER fires — the `nullptr` literal lowers
+    // to the target-agnostic integer-0 null constant at the HIR tier, so NullptrT is
+    // a SEMANTIC-TIER-ONLY kind that must not reach MIR. A never-fires backstop that
+    // would catch a regression of that keystone invariant (e.g. a future change that
+    // lets a NullptrT-typed Const materialize). Caught at every verify point.
+    I_NullptrTypeInMir             = 0xA014,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //

@@ -575,6 +575,11 @@ void gatherArgExpressions(Tree const& tree, NodeId argsNode,
                           std::vector<NodeId>& out);
 [[nodiscard]] TypeId subtreeType(EngineState const& s, Tree const& tree,
                                  NodeId node, ScopeId scope = {});
+// Core operator NAME → HirOpKind (reverse of opName()); std::nullopt if the
+// `target` string is a special tag (AddressOf/…), not a core op. Defined below;
+// forward-declared so pass2Post's nullptr operator gate (D-CSUBSET-NULLPTR) can
+// classify a binary/unary operator by its shared HIR verb.
+[[nodiscard]] std::optional<HirOpKind> coreOpFromNameSem(std::string_view s);
 
 // R1: the SINGLE source for member-access (`obj.field` / `ptr->field`) field-type
 // resolution, shared by the Pass-2 member arm (which adds diagnostics + symbol
@@ -4788,6 +4793,151 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                NodeId node, ScopeId here, int loopDepth) {
     auto const k = tree.kind(node);
 
+    // C23 §6.5 (D-CSUBSET-NULLPTR): the fail-loud operator gate. `nullptr`
+    // (TypeKind::NullptrT) is a null pointer constant, NOT an arithmetic value;
+    // under the HIR lowering it becomes the integer-0 null constant, so WITHOUT this
+    // explicit gate an invalid operand use (`nullptr + 1`, `nullptr < p`, `-nullptr`,
+    // `nullptr == 5`) would SILENTLY compile as `0 + 1` / `0 < p` / `-0` / `0 == 5`.
+    // nullptr is admissible ONLY as an `==`/`!=` operand against a pointer or another
+    // nullptr; the CONVERSION contexts (assign/init/arg/return via isAssignable, and
+    // `if(nullptr)`/`!nullptr` via the HIR condition lowering to the integer-0 arm)
+    // are handled elsewhere. Detecting a NullptrT operand uses a BOUNDED transparent-
+    // descent — O(1): it follows thin single-Internal-child wrappers/parens to a
+    // nullptr token or an already-stamped NullptrT node — so the common (no-nullptr)
+    // path pays ~nothing, and a peer's full type is computed only once a nullptr
+    // operand is actually present. A NullptrT value arising from a NON-literal
+    // subexpression (`(c?nullptr:nullptr)+1`, astronomically rare) is not caught here
+    // — it degrades to defined 0-arithmetic, never a crash: D-CSUBSET-NULLPTR-
+    // NONLITERAL-OPERAND (trigger: a real program hits it).
+    if (k == NodeKind::Internal
+        && cfg.pointerConversions.nullPointerConstantFromNullptrT) {
+        auto const& hirCfg = tree.schema().hirLowering();
+        std::uint32_t const rule = tree.rule(node).v;
+        bool const isBin = hirCfg.binaryExprRule.valid()
+            && rule == hirCfg.binaryExprRule.v;
+        bool const isUn  = hirCfg.unaryExprRule.valid()
+            && rule == hirCfg.unaryExprRule.v;
+        if (isBin || isUn) {
+            auto& interner = s.lattice.interner();
+            auto const isNullptrOperand = [&](NodeId n) -> bool {
+                for (int guard = 0; n.valid() && guard < 64; ++guard) {
+                    if (TypeId t = s.typeAt(n); t.valid())
+                        return interner.kind(t) == TypeKind::NullptrT;
+                    if (tree.kind(n) == NodeKind::Token) {
+                        auto it = s.idx().literalTypeIds.find(tree.tokenKind(n).v);
+                        return it != s.idx().literalTypeIds.end()
+                            && interner.kind(it->second) == TypeKind::NullptrT;
+                    }
+                    // Descend one transparent layer: the single meaningful child is
+                    // an Internal child (a paren / thin wrapper) if present, else a
+                    // literal token child (an operand node wrapping the `nullptr`
+                    // literal — internals == 0). More than one Internal child (a real
+                    // operator / ternary / comma) is NOT a transparent nullptr operand.
+                    NodeId nextInternal{}, litToken{};
+                    int internals = 0;
+                    for (NodeId c : visibleChildren(tree, n)) {
+                        if (tree.kind(c) == NodeKind::Token) {
+                            if (s.idx().literalTypeIds.find(tree.tokenKind(c).v)
+                                != s.idx().literalTypeIds.end()) {
+                                litToken = c;
+                            }
+                        } else {
+                            ++internals; nextInternal = c;
+                        }
+                    }
+                    if (internals == 1) { n = nextInternal; continue; }
+                    if (internals == 0 && litToken.valid()) { n = litToken; continue; }
+                    return false;
+                }
+                return false;
+            };
+            auto const opEntry =
+                [&](std::vector<HirOperatorEntry> const& ops)
+                -> HirOperatorEntry const* {
+                for (NodeId c : visibleChildren(tree, node)) {
+                    if (tree.kind(c) != NodeKind::Token) continue;
+                    for (auto const& e : ops)
+                        if (e.token.v == tree.tokenKind(c).v) return &e;
+                }
+                return nullptr;
+            };
+            auto const emitInvalid = [&](NodeId at) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_NullptrInvalidOperand;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(at);
+                d.actual   = std::string{tree.text(at)};
+                s.reporter.report(std::move(d));
+            };
+            if (isBin) {
+                NodeId lhsN{}, rhsN{};
+                for (NodeId c : visibleChildren(tree, node)) {
+                    if (tree.kind(c) == NodeKind::Token) continue;
+                    if (!lhsN.valid()) lhsN = c; else if (!rhsN.valid()) rhsN = c;
+                }
+                bool const lNull = lhsN.valid() && isNullptrOperand(lhsN);
+                bool const rNull = rhsN.valid() && isNullptrOperand(rhsN);
+                if (lNull || rNull) {
+                    HirOperatorEntry const* e = opEntry(hirCfg.binaryOps);
+                    std::optional<HirOpKind> const op =
+                        e ? coreOpFromNameSem(e->target) : std::nullopt;
+                    bool ok;
+                    if (!op.has_value()) {
+                        // A special-tag operator (not a core op): plain Assign
+                        // (`p = nullptr`, validated by isAssignable), Comma
+                        // (`(nullptr, x)` discard), and LogicalAnd/LogicalOr
+                        // (nullptr in a boolean context) all ACCEPT nullptr. A
+                        // COMPOUND assignment (`p += nullptr`, compoundBase
+                        // non-empty) is pointer arithmetic → REJECT. A null entry
+                        // (unclassifiable) is left alone (no false positive).
+                        ok = (e == nullptr) || e->compoundBase.empty();
+                    } else if (*op == HirOpKind::Eq || *op == HirOpKind::Ne) {
+                        if (lNull && rNull) {
+                            ok = true;   // nullptr == nullptr (C23-valid)
+                        } else {
+                            // The non-nullptr peer must DECAY to a pointer: an
+                            // object/function pointer (Ptr), a bare function
+                            // designator (FnSig → function pointer, C 6.3.2.1p4),
+                            // or an array name (Array → element pointer, 6.3.2.1p3)
+                            // — `func == nullptr` / `arr == nullptr` are valid C23.
+                            // Mirrors the combineTernary nullptr arm's Ptr/FnSig decay.
+                            NodeId const peer = lNull ? rhsN : lhsN;
+                            TypeId const pt = subtreeType(s, tree, peer, here);
+                            TypeKind const pk =
+                                pt.valid() ? interner.kind(pt) : TypeKind::Void;
+                            ok = (pk == TypeKind::Ptr || pk == TypeKind::FnSig
+                                  || pk == TypeKind::Array);
+                        }
+                    } else {
+                        // A core arithmetic / relational / bitwise / shift op —
+                        // nullptr is not a valid operand.
+                        ok = false;
+                    }
+                    if (!ok) emitInvalid(lNull ? lhsN : rhsN);
+                }
+            } else {  // unary
+                NodeId operandN{};
+                for (NodeId c : visibleChildren(tree, node)) {
+                    if (tree.kind(c) == NodeKind::Token) continue;
+                    operandN = c; break;
+                }
+                if (operandN.valid() && isNullptrOperand(operandN)) {
+                    HirOperatorEntry const* e = opEntry(hirCfg.unaryOps);
+                    std::optional<HirOpKind> const op =
+                        e ? coreOpFromNameSem(e->target) : std::nullopt;
+                    // Reject `-nullptr` (Neg) and `~nullptr` (BitNot). `!nullptr`
+                    // (Not) is VALID (nullptr→false→true); `&nullptr` is caught by
+                    // the existing lvalue check (nullptr is a non-lvalue like 0/true).
+                    if (op.has_value()
+                        && (*op == HirOpKind::Neg || *op == HirOpKind::BitNot)) {
+                        emitInvalid(operandN);
+                    }
+                }
+            }
+        }
+    }
+
     // Literal typing.
     if (k == NodeKind::Token) {
         auto tk = tree.tokenKind(node);
@@ -6233,6 +6383,28 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
             s.reporter.report(std::move(d));
         }
     }
+    // C23 §6.5.2.2 (D-CSUBSET-NULLPTR): `nullptr` passed as a VARIADIC / unprototyped
+    // argument (a position with no declared parameter to convert to) is REJECTED
+    // fail-loud. nullptr_t undergoes no default argument promotion, so what a
+    // matching `va_arg` reads is non-portable; and under the HIR lowering the value
+    // would otherwise silently become a plain integer 0. Fixed-parameter positions
+    // (i < checkCount) were already checked above — they convert via isAssignable's
+    // NullptrT arm. Gated on the same flag; scans only the variadic tail.
+    if (variadic && ptrRules.nullPointerConstantFromNullptrT) {
+        for (std::size_t i = checkCount; i < argNodes.size(); ++i) {
+            TypeId const argTy = subtreeType(s, tree, argNodes[i]);
+            if (argTy.valid()
+                && s.lattice.interner().kind(argTy) == TypeKind::NullptrT) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_NullptrInvalidOperand;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(argNodes[i]);
+                d.actual   = std::string{tree.text(argNodes[i])};
+                s.reporter.report(std::move(d));
+            }
+        }
+    }
 }
 
 void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
@@ -6938,6 +7110,28 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
                     || interner.kind(elseT) == TypeKind::Array)) {
                 return thenD;
             }
+        }
+        // C23 §6.5.15 (D-CSUBSET-NULLPTR): a conditional with ONE arm a pointer (or a
+        // function designator, which decays to a pointer) and the OTHER the predefined
+        // `nullptr` (TypeKind::NullptrT) has the POINTER type — nullptr IS the null
+        // pointer constant, so it takes the other arm's pointer type. The
+        // isLiteralIntegerZero-keyed arms above do NOT fire for nullptr (it is a
+        // keyword, not the literal `0`), so this dedicated arm is required — WITHOUT
+        // it `cond ? nullptr : p` (nullptr first) would fall through to the first-arm
+        // fallback and mistype as NullptrT. The HIR tier lowers nullptr to the
+        // synthetic integer-0 literal, whose combineTernary null arm realizes the
+        // Cast(0→Ptr) on that arm, so the two tiers agree. Gated; handles both orders.
+        if (sem.pointerConversions.nullPointerConstantFromNullptrT) {
+            auto const ptrFromNullptrPair = [&](TypeId a, TypeId b) -> TypeId {
+                // `a` is the candidate pointer/designator arm; `b` must be NullptrT.
+                if (!a.valid() || !b.valid()
+                    || interner.kind(b) != TypeKind::NullptrT) return {};
+                if (interner.kind(a) == TypeKind::Ptr)   return a;
+                if (interner.kind(a) == TypeKind::FnSig) return interner.pointer(a);
+                return {};
+            };
+            if (TypeId r = ptrFromNullptrPair(thenT, elseT); r.valid()) return r;
+            if (TypeId r = ptrFromNullptrPair(elseT, thenT); r.valid()) return r;
         }
         return thenT.valid() ? thenT : elseT;   // non-arith arms (pointers etc.)
     };

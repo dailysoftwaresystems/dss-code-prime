@@ -1504,6 +1504,20 @@ struct DSS_EXPORT SemanticConfig {
         // `Ptr<T>` parameter rejects the literal `0` arg and the user
         // must use the language's typed-null mechanism.
         bool nullPointerConstantFromIntegerZero = false;
+        // C23 §6.3.2.3.4 / §6.2.5 (D-CSUBSET-NULLPTR): the predefined constant
+        // `nullptr` (type nullptr_t, interned TypeKind::NullptrT) converts WITHOUT
+        // cast to any pointer type. TYPE-aware (not value-aware, unlike the integer-0
+        // form), so it lives in the `isAssignable` chokepoint as a ONE-WAY arm
+        // (Ptr←NullptrT) gated on this flag; nothing converts TO nullptr_t (the
+        // one-way constraint enforced by the absence of any NullptrT-as-lhs arm).
+        // Default false → a non-C23 schema (toy/tsql/older-C) keeps NullptrT entirely
+        // inert. Only C23+ declares it true (alongside
+        // `nullPointerConstantFromIntegerZero`, since the `0`-form remains valid in
+        // C23). nullptr→BOOL is DEFERRED (D-CSUBSET-NULLPTR-BOOL-CONVERSION): the
+        // c-subset has no scalar→bool conversion yet; nullptr in a controlling
+        // expression still works via the HIR condition lowering, so nothing real is
+        // lost.
+        bool nullPointerConstantFromNullptrT = false;
     };
     PointerConversionRules pointerConversions;
 

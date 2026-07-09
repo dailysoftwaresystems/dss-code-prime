@@ -545,6 +545,18 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                             "the HIR→MIR boundary)",
                     t.v));
         }
+        // C23 nullptr_t (D-CSUBSET-NULLPTR): a never-fires backstop for the keystone
+        // invariant — the `nullptr` literal lowers to the integer-0 null constant at
+        // the HIR tier (cst_to_hir `lowerLiteral`), so NullptrT is a semantic-tier-
+        // only kind that must not reach MIR. A NullptrT result type here means a
+        // regression let a NullptrT-typed Const materialize.
+        if (interner_->kind(t) == TypeKind::NullptrT) {
+            reportInst(reporter, DiagnosticCode::I_NullptrTypeInMir, id,
+                std::format("typeId {} resolves to TypeKind::NullptrT (C23 nullptr_t "
+                            "is semantic-tier-only — `nullptr` must lower to the "
+                            "integer-0 null constant and never reach MIR)",
+                    t.v));
+        }
     });
     for (std::uint32_t fi = 0; fi < mir_.moduleFuncCount(); ++fi) {
         MirFuncId const f = mir_.funcAt(fi);

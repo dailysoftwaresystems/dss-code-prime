@@ -82,6 +82,7 @@ namespace {
         case TypeKind::F64:  return "f64";  case TypeKind::F128: return "f128";
         case TypeKind::Char: return "char"; case TypeKind::Byte: return "byte";
         case TypeKind::Void: return "void";
+        case TypeKind::NullptrT: return "nullptr_t";  // C23 (debug-dump only)
         default: return {};
     }
 }
@@ -97,6 +98,7 @@ namespace {
     if (s == "f64")  return TypeKind::F64;  if (s == "f128") return TypeKind::F128;
     if (s == "char") return TypeKind::Char; if (s == "byte") return TypeKind::Byte;
     if (s == "void") return TypeKind::Void;
+    if (s == "nullptr_t") return TypeKind::NullptrT;  // C23 (debug-dump only)
     return std::nullopt;
 }
 

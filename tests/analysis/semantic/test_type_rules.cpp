@@ -312,3 +312,53 @@ TEST(TypeRules, UnifyCascadesInvalid) {
     EXPECT_EQ(unify(in, InvalidType, i32).v, i32.v);
     EXPECT_FALSE(unify(in, InvalidType, InvalidType).valid());
 }
+
+// ── C23 nullptr_t (D-CSUBSET-NULLPTR) ─────────────────────────────────────────
+// `nullptr` (TypeKind::NullptrT) is a null pointer constant assignable WITHOUT cast
+// to ANY pointer type, gated on `nullPointerConstantFromNullptrT`. ONE-WAY: nothing
+// converts TO nullptr_t. nullptr → int is a constraint error; nullptr → bool is
+// DEFERRED (D-CSUBSET-NULLPTR-BOOL-CONVERSION), so it is also rejected here.
+TEST(TypeRules, NullptrTAssignsToPointerWhenEnabled) {
+    auto in = makeInterner();
+    TypeId const nptr    = in.primitive(TypeKind::NullptrT);
+    TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+    TypeId const intPtr  = in.pointer(in.primitive(TypeKind::I32));
+    TypeId const boolT   = in.primitive(TypeKind::Bool);
+    TypeId const intT    = in.primitive(TypeKind::I32);
+    SemanticConfig::PointerConversionRules on;
+    on.nullPointerConstantFromNullptrT = true;
+    // nullptr → any pointer (object or, in the shipped surface, function pointer)
+    EXPECT_TRUE(isAssignable(in, voidPtr, nptr, on));
+    EXPECT_TRUE(isAssignable(in, intPtr,  nptr, on));
+    // nullptr → int / bool are NOT admitted
+    EXPECT_FALSE(isAssignable(in, intT,  nptr, on));
+    EXPECT_FALSE(isAssignable(in, boolT, nptr, on));
+    // ONE-WAY: nothing converts TO nullptr_t
+    EXPECT_FALSE(isAssignable(in, nptr, voidPtr, on));
+    EXPECT_FALSE(isAssignable(in, nptr, intT,    on));
+}
+
+// Red-on-disable: with the flag OFF, `p = nullptr` reverts to a type mismatch — the
+// flag genuinely gates the behavior (a non-C23 schema keeps NullptrT inert).
+TEST(TypeRules, NullptrTInertWhenDisabled) {
+    auto in = makeInterner();
+    TypeId const nptr    = in.primitive(TypeKind::NullptrT);
+    TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+    SemanticConfig::PointerConversionRules off;   // flag defaults false
+    EXPECT_FALSE(isAssignable(in, voidPtr, nptr, off));
+}
+
+// Explicit cast: `(T*)nullptr` is castable; `(int)nullptr` / `(bool)nullptr` are
+// NOT, and nothing casts TO nullptr_t (the one-way constraint holds for casts too).
+TEST(TypeRules, NullptrTExplicitCastToPointerOnly) {
+    auto in = makeInterner();
+    TypeId const nptr    = in.primitive(TypeKind::NullptrT);
+    TypeId const voidPtr = in.pointer(in.primitive(TypeKind::Void));
+    TypeId const boolT   = in.primitive(TypeKind::Bool);
+    TypeId const intT    = in.primitive(TypeKind::I32);
+    EXPECT_TRUE(isExplicitCastable(in, voidPtr, nptr));    // (void*)nullptr
+    EXPECT_FALSE(isExplicitCastable(in, intT,  nptr));     // (int)nullptr  — rejected
+    EXPECT_FALSE(isExplicitCastable(in, boolT, nptr));     // (bool)nullptr — deferred
+    EXPECT_FALSE(isExplicitCastable(in, nptr, voidPtr));   // nothing → nullptr_t
+    EXPECT_FALSE(isExplicitCastable(in, nptr, intT));
+}

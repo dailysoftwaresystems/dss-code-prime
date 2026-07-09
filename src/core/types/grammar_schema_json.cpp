@@ -77,6 +77,7 @@ std::optional<TypeKind> coreTypeFromName(std::string_view name) {
     if (name == "Char")    return TypeKind::Char;
     if (name == "Byte")    return TypeKind::Byte;
     if (name == "Void")    return TypeKind::Void;
+    if (name == "NullptrT") return TypeKind::NullptrT;  // C23 nullptr_t (D-CSUBSET-NULLPTR)
     return std::nullopt;
 }
 
@@ -8351,6 +8352,29 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     readBool("nullPointerConstantFromIntegerZero",
                              cfg.pointerConversions
                                  .nullPointerConstantFromIntegerZero);
+                    readBool("nullPointerConstantFromNullptrT",
+                             cfg.pointerConversions
+                                 .nullPointerConstantFromNullptrT);
+                    // D-CSUBSET-NULLPTR: `nullptr` lowers to the integer-0 null
+                    // constant at the HIR tier (Fix 1(a)), so its HIR realization
+                    // (coerce→Ptr / ternary / condition) REUSES the integer-0
+                    // null-pointer-constant machinery — gated on
+                    // `nullPointerConstantFromIntegerZero`. Admitting `nullptr` at the
+                    // semantic tier WITHOUT that machinery would let `p = nullptr` pass
+                    // semantics then fail to coerce at HIR (a store of I32-0 into a Ptr
+                    // slot). Enforce the co-requirement FAIL-LOUD at config load.
+                    if (cfg.pointerConversions.nullPointerConstantFromNullptrT
+                        && !cfg.pointerConversions
+                                 .nullPointerConstantFromIntegerZero) {
+                        coll.emit(
+                            DiagnosticCode::C_InvalidSemantics,
+                            "/semantics/pointerConversions/"
+                            "nullPointerConstantFromNullptrT",
+                            "'nullPointerConstantFromNullptrT' requires "
+                            "'nullPointerConstantFromIntegerZero' to be true — nullptr "
+                            "lowers to the integer-0 null constant and reuses its HIR "
+                            "realization");
+                    }
                     // Typo defense: reject unknown sub-keys with a
                     // fail-loud diagnostic. Pre-guard, an editor typo
                     // like `implictToVoidPtr` (missing 'i') would
@@ -8363,7 +8387,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     for (auto const& [k, _] : obj.items()) {
                         if (k != "implicitToVoidPtr" &&
                             k != "implicitFromVoidPtr" &&
-                            k != "nullPointerConstantFromIntegerZero") {
+                            k != "nullPointerConstantFromIntegerZero" &&
+                            k != "nullPointerConstantFromNullptrT") {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
                                       std::format(
                                           "/semantics/pointerConversions/{}",

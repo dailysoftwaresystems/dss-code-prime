@@ -285,8 +285,12 @@ std::optional<std::uint64_t> scalarByteSize(TypeKind kind, DataModel dm) noexcep
             return 8;
         case TypeKind::I128: case TypeKind::U128: case TypeKind::F128:
             return 16;
-        // Pointer-class scalars take the model's pointer width.
+        // Pointer-class scalars take the model's pointer width. C23 nullptr_t has
+        // the same size/representation as `void*` (§6.2.5), so `sizeof(nullptr)`
+        // is the pointer width — even though the `nullptr` value itself lowers to
+        // the integer-0 null constant and never materializes as a NullptrT value.
         case TypeKind::Ptr: case TypeKind::Ref: case TypeKind::FnPtr:
+        case TypeKind::NullptrT:
             return pointerBytes(dm);
         // Not a sized scalar: aggregates are handled by `computeLayout`; Void and
         // the out-of-scope kinds (FnSig/Slice/Tuple/Vector/Matrix/Nullable/

@@ -150,6 +150,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_UnknownTypeAttribute";
         case DiagnosticCode::S_PackedBitfieldUnsupported:
             return "S_PackedBitfieldUnsupported";
+        case DiagnosticCode::S_NullptrInvalidOperand:
+            return "S_NullptrInvalidOperand";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
@@ -195,6 +197,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_ArgIndexOutOfRange:       return "I_ArgIndexOutOfRange";
         case DiagnosticCode::I_ArgPositionDuplicate:     return "I_ArgPositionDuplicate";
         case DiagnosticCode::I_AllocaAlignmentNotPowerOfTwo: return "I_AllocaAlignmentNotPowerOfTwo";
+        case DiagnosticCode::I_NullptrTypeInMir:         return "I_NullptrTypeInMir";
         case DiagnosticCode::I_ExtensionTypeInMir:       return "I_ExtensionTypeInMir";
         case DiagnosticCode::I_StructCfMismatch:         return "I_StructCfMismatch";
         case DiagnosticCode::I_UnreachableBlock:         return "I_UnreachableBlock";

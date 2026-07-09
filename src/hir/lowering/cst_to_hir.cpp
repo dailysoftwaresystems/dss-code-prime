@@ -2927,6 +2927,26 @@ struct Lowerer {
 
     E lowerLiteral(NodeId operandNode, NodeId tokenNode, SchemaTokenId tk, TypeId type) {
         TypeKind core = litCore_.at(tk.v);
+        // C23 nullptr — D-CSUBSET-NULLPTR / KEYSTONE Fix 1(a). The `nullptr` keyword
+        // is typed NullptrT at the SEMANTIC tier (for the one-way conversion rules +
+        // `_Generic` distinctness), but it LOWERS DIRECTLY to the target-agnostic
+        // integer-0 null constant here — the SAME node `nullPointerConstantLiteral`
+        // materializes for a folded-0 null pointer constant. So `nullptr` == literal
+        // `0` at the HIR/MIR tier, reusing ALL existing null-pointer-constant lowering
+        // (coerce→Ptr, the null comparison, the ternary null-materialization,
+        // `if(nullptr)`→false), and NullptrT NEVER becomes an HIR-literal / MIR-const
+        // type. Keyed on the core kind — a closed-verb lattice rule, not a language
+        // identity. The `I_NullptrTypeInMir` verifier enforces the never-reaches-MIR
+        // invariant this establishes by construction.
+        if (core == TypeKind::NullptrT) {
+            HirLiteralValue v;
+            v.core  = TypeKind::I32;
+            v.value = std::int64_t{0};
+            HirNodeId const zeroLit = builder.makeLiteral(
+                interner.primitive(TypeKind::I32), literals.add(v),
+                HirFlags::Synthetic);
+            return E{track(zeroLit, operandNode), interner.primitive(TypeKind::I32)};
+        }
         std::string_view const text = tree().text(tokenNode);
         HirLiteralValue val;          // value defaults to monostate (= undecodable)
         bool ok = true;

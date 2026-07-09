@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 86> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 88> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -183,6 +183,7 @@ constexpr std::array<DiagnosticCode, 86> kUnsuppressableCodes{{
     DiagnosticCode::I_ArgIndexOutOfRange,
     DiagnosticCode::I_ArgPositionDuplicate,
     DiagnosticCode::I_ExtensionTypeInMir,
+    DiagnosticCode::I_NullptrTypeInMir,
     DiagnosticCode::I_StructCfMismatch,
     DiagnosticCode::I_UnreachableBlock,
 
@@ -372,6 +373,13 @@ constexpr std::array<DiagnosticCode, 86> kUnsuppressableCodes{{
     // H_UnknownLinkageSpecifier typo diagnostic, and the build still fails via
     // hasErrors when it fires unsuppressed.)
     DiagnosticCode::S_PackedBitfieldUnsupported,
+    // S_NullptrInvalidOperand (FC17, D-CSUBSET-NULLPTR): `nullptr` used as an
+    // invalid operator operand (`nullptr + 1`, `nullptr < p`, `-nullptr`). Unlike a
+    // plain type mismatch, suppressing THIS would ship a SILENT MISCOMPILE: the HIR
+    // lowering turns `nullptr` into the integer-0 null constant, so a suppressed
+    // diagnostic would leave `nullptr + 1` compiled as `0 + 1 == 1` — ill-formed C
+    // silently accepted. Closed here so nullptr misuse is never silently lowered.
+    DiagnosticCode::S_NullptrInvalidOperand,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

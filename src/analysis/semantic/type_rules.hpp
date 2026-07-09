@@ -442,6 +442,31 @@ namespace detail::type_rules {
             // below (Ptr<int> → Ptr<float> is NOT implicit).
         }
     }
+    // C23 §6.3.2.3.4 / §6.2.5 (D-CSUBSET-NULLPTR): the predefined constant
+    // `nullptr` (interned TypeKind::NullptrT) is a null pointer constant assignable
+    // WITHOUT cast to ANY pointer type (object OR function pointer — both are
+    // TypeKind::Ptr in the shipped C surface). TYPE-only (unlike the value-aware
+    // integer-0 form), so it lives in this chokepoint — covering init /
+    // positional-init / assign / call-arg / return at once. ONE-WAY: NullptrT never
+    // appears as `lk`, so nothing converts TO nullptr_t (the C23 "only nullptr_t
+    // converts to nullptr_t" constraint, enforced by omission). Gated on the flag
+    // (default false → NullptrT inert). `nullptr` lowers to the integer-0 null const
+    // at HIR, so NO post-coerce verifier surface.
+    //
+    // nullptr → BOOL (C23 §6.3.2.3.2 says nullptr converts to bool, yielding false)
+    // is DEFERRED (D-CSUBSET-NULLPTR-BOOL-CONVERSION): the c-subset has no scalar→bool
+    // conversion at all (`bool b = 0;` is itself S_TypeMismatch), and admitting only
+    // nullptr→bool would be inconsistent AND hit the unrealized Trunc→Bool codegen
+    // form. `nullptr` in a CONTROLLING expression (`if(nullptr)`, `nullptr ? a : b`,
+    // `!nullptr`) does NOT need this arm — it flows through the HIR condition lowering
+    // (nullptr → integer 0 → the arithmetic-condition `Ne(0,0)` → false), so the
+    // deferral costs no real nullptr-in-boolean-context behavior. Closes with the
+    // general scalar→bool conversion (a separate feature).
+    if (ptrRules.nullPointerConstantFromNullptrT
+        && rk == TypeKind::NullptrT
+        && lk == TypeKind::Ptr) {
+        return true;
+    }
     return false;
 }
 
@@ -517,6 +542,16 @@ namespace detail::type_rules {
     if (tk == TypeKind::Ptr && ok == TypeKind::FnSig) return true;
     if (tk == TypeKind::Ptr && isCastableInt(ok))     return true;
     if (isCastableInt(tk) && ok == TypeKind::Ptr)     return true;
+    // C23 (D-CSUBSET-NULLPTR): `nullptr` (a NullptrT operand) casts explicitly to
+    // any POINTER target (`(T*)nullptr`). Restricted to a Ptr target ONLY — a cast
+    // to an arithmetic type (`(int)nullptr`) is NOT sanctioned by C23, and NO arm
+    // admits NullptrT as the cast TARGET (the one-way constraint holds for casts
+    // too). `(bool)nullptr` is DEFERRED with the implicit nullptr→bool conversion
+    // (D-CSUBSET-NULLPTR-BOOL-CONVERSION — the c-subset has no scalar→bool path).
+    // nullptr lowers to the integer-0 null const → the existing null-const path.
+    if (ok == TypeKind::NullptrT && tk == TypeKind::Ptr) {
+        return true;
+    }
     return false;
 }
 

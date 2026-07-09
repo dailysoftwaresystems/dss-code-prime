@@ -6638,3 +6638,149 @@ TEST(SemanticAnalyzerCSubset, UnionContainingFamStructAsUnionMemberIsAccepted) {
     EXPECT_FALSE(model.hasErrors())
         << "the nested-union form is well-typed — the carve-out must not over-reject it";
 }
+
+// ── C23 nullptr (D-CSUBSET-NULLPTR) ───────────────────────────────────────────
+// `void *p = nullptr;` + `p == nullptr` / `p != nullptr` are admitted — nullptr is a
+// null pointer constant assignable to, and comparable with, any pointer. No error.
+TEST(SemanticAnalyzerCSubset, NullptrInitsAndComparesPointer) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(void){ void *p = nullptr; int r = p == nullptr; p = nullptr;"
+        " return r + (nullptr == p); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// `int x = nullptr;` is a constraint violation — nullptr converts only to pointers.
+TEST(SemanticAnalyzerCSubset, NullptrToIntFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "int f(void){ int x = nullptr; return x; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+}
+
+// `bool b = nullptr;` is rejected — nullptr→bool is DEFERRED (the c-subset has no
+// scalar→bool conversion; D-CSUBSET-NULLPTR-BOOL-CONVERSION), so it stays consistent
+// with `bool b = 0;` (also a mismatch) rather than admit-then-fail-at-codegen.
+TEST(SemanticAnalyzerCSubset, NullptrToBoolFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "int f(void){ bool b = nullptr; return 0; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+}
+
+// The fail-loud operator gate: nullptr in arithmetic (`nullptr + 1`) is rejected —
+// WITHOUT the gate the HIR lowering (nullptr → integer 0) would silently accept it.
+TEST(SemanticAnalyzerCSubset, NullptrArithmeticFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "void *f(void){ return nullptr + 1; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u);
+}
+
+// The gate rejects a RELATIONAL comparison (`nullptr < p`) — only `==`/`!=` against a
+// pointer/nullptr peer is admissible.
+TEST(SemanticAnalyzerCSubset, NullptrRelationalFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "int f(void *p){ return nullptr < p; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u);
+}
+
+// `==` against a NON-pointer, NON-nullptr peer (`nullptr == 5`) is rejected.
+TEST(SemanticAnalyzerCSubset, NullptrEqualsIntFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "int f(void){ return nullptr == 5; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u);
+}
+
+// The gate must NOT fire on a plain assignment `p = nullptr` (handled by isAssignable)
+// — the false-positive that the Assign/Comma/compound classification fix closed.
+TEST(SemanticAnalyzerCSubset, NullptrPlainAssignNoFalsePositive) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(void *p){ p = nullptr; return p == nullptr; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// A COMPOUND assignment (`p += nullptr`) IS pointer arithmetic → rejected.
+TEST(SemanticAnalyzerCSubset, NullptrCompoundAssignFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "int f(void *p){ p += nullptr; return 0; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u);
+}
+
+// unary `-nullptr` is rejected (Neg on nullptr is not a valid operand).
+TEST(SemanticAnalyzerCSubset, NullptrUnaryNegFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "void *f(void){ return -nullptr; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u);
+}
+
+// `nullptr` passed as a VARIADIC argument is rejected (no default arg promotion).
+TEST(SemanticAnalyzerCSubset, NullptrVariadicArgFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int g(int n, ...);\n"
+        "int f(void){ return g(1, nullptr); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u);
+}
+
+// A conditional with a nullptr arm (`c ? nullptr : p`, nullptr FIRST) types as the
+// pointer — the combineTernary NullptrT arm; without it the ternary would mistype as
+// NullptrT and a `void*` return would then mismatch.
+TEST(SemanticAnalyzerCSubset, NullptrTernaryTypesAsPointer) {
+    auto cu = buildShippedUnit("c-subset", {
+        "void *f(int c, void *p){ return c ? nullptr : p; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// A bare function designator / array name DECAYS to a pointer, so `nullptr == func`
+// and `nullptr == arr` are valid C23 comparisons — the gate must NOT reject them.
+// Regression pin for the Eq/Ne peer-decay fix (FnSig / Array peers, not just Ptr).
+TEST(SemanticAnalyzerCSubset, NullptrComparedToDesignatorsAdmitted) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int g(void);\n"
+        "int f(void){ int a[4]; if (nullptr == g) return 1;"
+        " if (nullptr == a) return 2; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 0u);
+}
+
+// sizeof(nullptr) folds to the pointer width (C23: sizeof(nullptr_t) == sizeof(void*))
+// via the scalarByteSize NullptrT arm — a regression dropping the arm makes the fold
+// fail (nullopt → error). Pins that it stays well-typed (size_t / U64).
+TEST(SemanticAnalyzerCSubset, NullptrSizeofIsWellTyped) {
+    auto cu = buildShippedUnit("c-subset", {
+        "unsigned long f(void){ return sizeof(nullptr); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+}
