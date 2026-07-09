@@ -1806,6 +1806,130 @@ TEST(SemanticAnalyzerCSubset, AlignasSizeofOperandFolds) {
     EXPECT_EQ(*g->explicitAlignment, 8u);
 }
 
+// ── FC17 C23 6.7.2.5 typeof / typeof_unqual ─────────────────────────────────
+//
+// ★ THE red-on-disable pin for the CRITICAL scan-opacity fix: `typeof_unqual`'s
+// SOLE observable effect is stripping the top-level qualifier. Preservation
+// passes with-or-without the qualifier-scan-leak bug (both leave volatile on),
+// so ONLY the strip case catches a regression — if the coarse base-volatile scan
+// descends into the typeof operand and re-applies the literal `volatile` AFTER
+// the arm stripped it, `v` would come back `volatile int` and this FAILS.
+TEST(SemanticAnalyzerCSubset, TypeofUnqualStripsVolatile) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typeof_unqual(volatile int) v;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* v = findSym(model, "v");
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(v->type.valid());
+    EXPECT_FALSE(ti.isVolatileQualified(v->type))
+        << "typeof_unqual strips the top-level volatile — the coarse volatile "
+           "scan must NOT re-apply the operand's literal `volatile`";
+    EXPECT_EQ(ti.kind(v->type), TypeKind::I32)
+        << "the stripped type is bare int";
+}
+
+// The KEPT side: `typeof` PRESERVES the top-level qualifier (VolatileQual(int)).
+TEST(SemanticAnalyzerCSubset, TypeofPreservesVolatile) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typeof(volatile int) v;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* v = findSym(model, "v");
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(v->type.valid());
+    EXPECT_TRUE(ti.isVolatileQualified(v->type))
+        << "typeof (not typeof_unqual) keeps the top-level volatile";
+}
+
+// Fork-B polarity pin: `typeof(ENUM_CONSTANT)` must ROLL BACK to the VALUE form
+// (requireKnownType) and type as an expression — NOT commit the enum constant as
+// a type-name → a spurious S_UnknownType. Mirrors AlignasEnumConstantOperandFolds.
+TEST(SemanticAnalyzerCSubset, TypeofEnumConstantOperandResolvesAsValue) {
+    auto cu = buildShippedUnit("c-subset", {
+        "enum E { GREEN = 7 };\n"
+        "typeof(GREEN) v;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownType), 0u)
+        << "an enum-constant typeof operand must roll back to the VALUE reading "
+           "(requireKnownType), not commit as a type-name";
+    SymbolRecord const* v = findSym(model, "v");
+    ASSERT_NE(v, nullptr);
+    EXPECT_TRUE(v->type.valid())
+        << "typeof(GREEN) resolves to the enum constant's type";
+}
+
+// EXPRESSION form: `typeof(x)` for a declared `x` resolves to x's type.
+TEST(SemanticAnalyzerCSubset, TypeofExpressionFormResolvesToOperandType) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int x;\n"
+        "typeof(x) y;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* y = findSym(model, "y");
+    ASSERT_NE(y, nullptr);
+    ASSERT_TRUE(y->type.valid());
+    EXPECT_EQ(ti.kind(y->type), TypeKind::I32)
+        << "typeof(x) where x is int must resolve y to int";
+}
+
+// TYPE-NAME form: `typeof(int*)` resolves to Ptr<int> (castTypeRef operand).
+TEST(SemanticAnalyzerCSubset, TypeofTypeNameFormResolvesPointer) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typeof(int*) p;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* p = findSym(model, "p");
+    ASSERT_NE(p, nullptr);
+    ASSERT_TRUE(p->type.valid());
+    ASSERT_EQ(ti.kind(p->type), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(p->type)[0]), TypeKind::I32);
+}
+
+// `sizeof(typeof(unsigned short))` folds to 2 in an array dimension — the typeof
+// resolves inside the SAME sizeof-fold path sizeof(T)/enum/arithmetic use.
+TEST(SemanticAnalyzerCSubset, SizeofTypeofFoldsInArrayDim) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int a[sizeof(typeof(unsigned short))];\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = findSym(model, "a");
+    ASSERT_NE(a, nullptr);
+    ASSERT_TRUE(a->type.valid());
+    ASSERT_EQ(ti.kind(a->type), TypeKind::Array);
+    ASSERT_EQ(ti.scalars(a->type).size(), 1u);
+    EXPECT_EQ(ti.scalars(a->type)[0], 2)
+        << "sizeof(typeof(unsigned short)) folds to 2";
+}
+
+// Bit-field operand → S_TypeofBitfieldOperand (C 6.7.2.5 constraint): a bit-field
+// has no nameable type. RED-on-disable for the bit-field gate.
+TEST(SemanticAnalyzerCSubset, TypeofBitfieldOperandFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { unsigned f : 3; };\n"
+        "struct S s;\n"
+        "typeof(s.f) v;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeofBitfieldOperand), 1u)
+        << "typeof of a bit-field member is a constraint violation";
+}
+
 // ── FC16 C11/C23 6.5.1.1 _Generic — generic selection ────────────────────────
 //
 // SELECTION is a compile-time SEMANTIC-tier decision (like sizeof folding): the

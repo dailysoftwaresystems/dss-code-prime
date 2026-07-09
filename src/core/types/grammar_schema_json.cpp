@@ -7557,6 +7557,76 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── typeof / typeof_unqual (C23 6.7.2.5, D-CSUBSET-TYPEOF) ──
+            // `{ typeRule, valueRule, operandChild, stripQualifiersToken? }` — the
+            // two operand forms (type-name / expression) share the operand
+            // visible-child index. `stripQualifiersToken` is OPTIONAL (the
+            // `typeof_unqual` keyword); ABSENT ⇒ typeof never strips. Mirrors the
+            // sizeof/alignof block's readRule + readReqIndex discipline (a
+            // present-but-bad field emits + fails the load); an ABSENT block leaves
+            // both rules invalid → no surface. `stripQualifiersToken` resolves like
+            // `volatileMarker` / noreturn's keywordToken (unknown name → C_UnknownToken).
+            if (sem.contains("typeof")) {
+                json const& tq = sem.at("typeof");
+                if (!tq.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/typeof",
+                              "'semantics.typeof' must be an object "
+                              "{ typeRule, valueRule, operandChild, "
+                              "stripQualifiersToken? }");
+                } else {
+                    auto readRule = [&](char const* key, RuleId& outRule,
+                                        std::string& outName) {
+                        if (!tq.contains(key) || !tq.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      std::string{"/semantics/typeof/"} + key,
+                                      std::format("'{}' is required and must be a "
+                                                  "string", key));
+                            return;
+                        }
+                        outName = tq.at(key).get<std::string>();
+                        if (!data.rules->contains(outName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape,
+                                      std::string{"/semantics/typeof/"} + key,
+                                      std::format("'typeof.{}' references unknown "
+                                                  "shape '{}'", key, outName));
+                            return;
+                        }
+                        outRule = data.rules->find(outName);
+                    };
+                    readRule("typeRule",  cfg.typeofTypeRule,  cfg.typeofTypeRuleName);
+                    readRule("valueRule", cfg.typeofValueRule, cfg.typeofValueRuleName);
+                    // `operandChild` is required — readReqIndex emits its own
+                    // C_MissingField / C_InvalidSemantics into `coll` on a bad value
+                    // (failing the load); the flag just satisfies the out-param.
+                    bool operandChildOk = true;
+                    readReqIndex(tq, "operandChild", "/semantics/typeof",
+                                 cfg.typeofOperandChild, operandChildOk);
+                    (void)operandChildOk;
+                    // OPTIONAL strip token (the `typeof_unqual` spelling); absent →
+                    // nullopt → the resolver never strips.
+                    if (tq.contains("stripQualifiersToken")) {
+                        if (!tq.at("stripQualifiersToken").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/typeof/stripQualifiersToken",
+                                      "'stripQualifiersToken' must be a string");
+                        } else {
+                            std::string const tn =
+                                tq.at("stripQualifiersToken").get<std::string>();
+                            if (!data.schemaTokens->contains(tn)) {
+                                coll.emit(DiagnosticCode::C_UnknownToken,
+                                          "/semantics/typeof/stripQualifiersToken",
+                                          std::format("'typeof.stripQualifiersToken' "
+                                                      "references unknown token kind "
+                                                      "'{}'", tn));
+                            } else {
+                                cfg.typeofStripQualifiersToken =
+                                    data.schemaTokens->find(tn);
+                            }
+                        }
+                    }
+                }
+            }
+
             // ── alignas (C11/C23 6.7.5, D-CSUBSET-ALIGNAS) ──
             // `{ specRule, argChild, typeFormRule }` — the `_Alignas`/`alignas`
             // alignment specifier. The semantic tier reads the `alignasSpec` node,

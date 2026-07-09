@@ -574,6 +574,14 @@ enum class DiagnosticCode : std::uint16_t {
     // truncated/wrapped into the underlying type silently (a wrong constant value).
     // Only fires for the EXPLICIT-underlying case; a default-int enum is unchanged.
     S_EnumeratorValueOutOfRange   = 0xE035,
+    // C23 §6.7.2.5 (D-CSUBSET-TYPEOF): the operand of a `typeof`/`typeof_unqual`
+    // is a BIT-FIELD member access (`typeof(s.flag)` where `flag` is a bit-field).
+    // A bit-field has no nameable, portable type — its width/representation are
+    // implementation-defined — so C constrains typeof away from it. The `.actual`
+    // names the offending member access. Unsuppressable: without the fail-loud gate
+    // the typeof would silently resolve to the bit-field's DECLARED (widened) type,
+    // masking the constraint and yielding a wrong type in a downstream declaration.
+    S_TypeofBitfieldOperand       = 0xE036,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

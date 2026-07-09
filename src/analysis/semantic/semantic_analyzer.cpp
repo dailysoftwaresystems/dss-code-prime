@@ -679,10 +679,23 @@ resolveMemberAccess(EngineState const& s, SemanticConfig const& cfg,
 // as variadic). Pass `nullptr` ONLY when the scan MUST cross nested
 // declaration-boundaries by design — a deliberate choice, not an
 // oversight or a copy-paste from the legacy unbounded shape.
+//
+// `opaqueRules` (D-CSUBSET-TYPEOF): rule ids whose subtree is OPAQUE to this
+// qualifier scan — descent stops at such a node WITHOUT inspecting it, EVEN when
+// it is the scan ROOT (unlike `declByRule`, which keeps the root in scope). This
+// makes a `typeof`/`typeof_unqual` OPERAND invisible to the coarse volatile/const
+// scans: the typeof arm already resolves the operand's own qualifiers (preserve
+// for typeof, strip for typeof_unqual), so re-finding a literal `volatile`/`const`
+// INSIDE the operand would silently re-apply what typeof_unqual just stripped —
+// the CRITICAL silent-miscompile this opacity closes. Root-inclusive because these
+// scans are frequently rooted DIRECTLY at a typeof node (the typeofSpecifier
+// wrapper's own generic descent scans its `typeofType`/`typeofValue` child as the
+// scan root). Empty span (the default) ⇒ behaviour is EXACTLY the legacy scan.
 [[nodiscard]] bool
 subtreeContainsToken(Tree const& tree, NodeId node, SchemaTokenId kind,
                      std::unordered_map<std::uint32_t, std::size_t> const*
-                         declByRule = nullptr) {
+                         declByRule = nullptr,
+                     std::span<RuleId const> opaqueRules = {}) {
     if (!node.valid() || !kind.valid()) return false;
     std::vector<NodeId> stack{node};
     bool firstPop = true;
@@ -692,14 +705,24 @@ subtreeContainsToken(Tree const& tree, NodeId node, SchemaTokenId kind,
         if (tree.kind(cur) == NodeKind::Token && tree.tokenKind(cur) == kind) {
             return true;
         }
-        // Stop descent at any nested declaration-rule node (the root
-        // itself IS a decl subtree by contract and stays in scope).
-        if (!firstPop && declByRule != nullptr
-            && tree.kind(cur) == NodeKind::Internal
-            && declByRule->contains(tree.rule(cur).v)) {
-            continue;
+        bool stop = false;
+        if (tree.kind(cur) == NodeKind::Internal) {
+            std::uint32_t const rv = tree.rule(cur).v;
+            // Opaque rules (typeof operands) stop descent ALWAYS — even at the
+            // root (firstPop) — so a stripped-then-re-scanned qualifier can never
+            // leak back out of a typeof operand.
+            for (RuleId const& opq : opaqueRules) {
+                if (opq.valid() && opq.v == rv) { stop = true; break; }
+            }
+            // Stop descent at any nested declaration-rule node (the root itself
+            // IS a decl subtree by contract and stays in scope — hence !firstPop).
+            if (!stop && !firstPop && declByRule != nullptr
+                && declByRule->contains(rv)) {
+                stop = true;
+            }
         }
         firstPop = false;
+        if (stop) continue;
         for (auto const& child : tree.children(cur)) {
             if (!isEmptySpace(tree.flags(child))) stack.push_back(child);
         }
@@ -735,7 +758,8 @@ declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
                         DeclaratorConfig const& dc, SchemaTokenId constMarker,
                         std::unordered_map<std::uint32_t, std::size_t> const*
                             declByRule,
-                        NodeId headNode) {
+                        NodeId headNode,
+                        std::span<RuleId const> opaqueRules = {}) {
     // Descend a per-slot wrapper (initDeclarator / memberDeclarator) to the
     // inner declaratorRule — the same descent declaratorDeclaredType uses.
     NodeId inner = dNode;
@@ -761,7 +785,8 @@ declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
         }
     }
     if (lastLayer.valid())
-        return subtreeContainsToken(tree, lastLayer, constMarker, declByRule);
+        return subtreeContainsToken(tree, lastLayer, constMarker, declByRule,
+                                    opaqueRules);
     // c58 (D-CSUBSET-INITIALIZER-CONST-TOKEN-LEAK): a SCALAR object's const comes
     // ONLY from its type-specifier HEAD, never a `const` TOKEN inside its
     // INITIALIZER (e.g. `int r = f((const char*)p)` — the cast's const must NOT mark
@@ -771,7 +796,7 @@ declaratorObjectIsConst(Tree const& tree, NodeId declNode, NodeId dNode,
     // positional path's `kids[*decl.typeChild]` scoping; a genuine `const int r`
     // keeps its const in the head, so it stays correctly rejected.
     return subtreeContainsToken(tree, headNode.valid() ? headNode : declNode,
-                                constMarker, declByRule);
+                                constMarker, declByRule, opaqueRules);
 }
 
 // Extract identifier text + the bound NodeId per the requested matching mode.
@@ -1234,6 +1259,122 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 return InvalidType;
             }
         }
+        // C23 6.7.2.5 (D-CSUBSET-TYPEOF): `typeof(T)` / `typeof(expr)` /
+        // `typeof_unqual(...)` — resolve to the OPERAND's type. Handled ATOMICALLY
+        // here (after the tag-reference block, BEFORE the generic kids-descent) so
+        // the operand's own literal qualifiers are governed by THIS arm — PRESERVED
+        // for `typeof`, STRIPPED for `typeof_unqual` — and never re-applied by the
+        // descent's coarse base-volatile scan (the operand subtree is opaque to that
+        // scan; see subtreeContainsToken's `opaqueRules`). Only VolatileQual is
+        // interned, so "strip top-level qualifiers" == stripVolatile. The result is
+        // STAMPED on the typeof node so the HIR lowering's resolveStampedTypeBelow
+        // recovers the typeof result (not an inner operand's type). Config-driven on
+        // `cfg.typeof*Rule`; never a keyword identity.
+        {
+            bool const isTypeofType =
+                cfg.typeofTypeRule.valid() && rule.v == cfg.typeofTypeRule.v;
+            bool const isTypeofValue =
+                cfg.typeofValueRule.valid() && rule.v == cfg.typeofValueRule.v;
+            if (isTypeofType || isTypeofValue) {
+                auto tkids = visibleChildren(tree, node);
+                if (cfg.typeofOperandChild >= tkids.size()) {
+                    if (emitOnMiss && !specifierDiagnosed) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::S_UnknownType;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.buffer   = tree.source().id();
+                        d.span     = tree.span(node);
+                        d.actual   = std::string{tree.text(node)};
+                        s.reporter.report(std::move(d));
+                        specifierDiagnosed = true;
+                    }
+                    return InvalidType;
+                }
+                NodeId const operandNode = tkids[cfg.typeofOperandChild];
+                // The strip spelling (`typeof_unqual`): child-0 keyword == the
+                // configured strip token. Absent token ⇒ never strips.
+                bool const strip =
+                    cfg.typeofStripQualifiersToken.has_value()
+                    && !tkids.empty()
+                    && tree.kind(tkids[0]) == NodeKind::Token
+                    && tree.tokenKind(tkids[0]) == *cfg.typeofStripQualifiersToken;
+                TypeId raw = InvalidType;
+                if (isTypeofType) {
+                    // TYPE-NAME operand: recurse the SAME type resolver (an
+                    // unknown type-name fails loud S_UnknownType for free).
+                    raw = resolveTypeNodeImpl(s, cfg, tree, operandNode, scope,
+                                              emitOnMiss, specifierDiagnosed);
+                } else {
+                    // EXPRESSION operand (UNEVALUATED, 6.7.2.5p2). C 6.7.2.5
+                    // constraint: a bit-field member has no nameable type. Bounded
+                    // transparent descent to the innermost member-access node
+                    // (mirrors the nullptr operator-gate walk); resolveMemberAccess
+                    // exposes a bit-field field via `bitFieldWidth`.
+                    NodeId probe = operandNode;
+                    for (int guard = 0; probe.valid() && guard < 64; ++guard) {
+                        if (tree.kind(probe) == NodeKind::Internal
+                            && s.idx().memberAccessByRule.contains(
+                                   tree.rule(probe).v)) {
+                            MemberResolution const mr =
+                                resolveMemberAccess(s, cfg, tree, probe, scope);
+                            if (mr.status == MemberResolution::Status::Ok
+                                && mr.fieldSym.valid()
+                                && s.symbols.at(mr.fieldSym)
+                                       .bitFieldWidth.has_value()) {
+                                // UNCONDITIONAL (C 6.7.2.5 constraint): a bit-field
+                                // operand is always ill-formed. Emitted even under
+                                // emitOnMiss=false (a global's head resolves that
+                                // way) so the fail-loud is never silently dropped;
+                                // the reporter's recent-duplicate window collapses a
+                                // Pass-1.5 + Pass-2 double-visit to one diagnostic.
+                                ParseDiagnostic d;
+                                d.code     =
+                                    DiagnosticCode::S_TypeofBitfieldOperand;
+                                d.severity = DiagnosticSeverity::Error;
+                                d.buffer   = tree.source().id();
+                                d.span     = tree.span(operandNode);
+                                d.actual   =
+                                    std::string{tree.text(operandNode)};
+                                s.reporter.report(std::move(d));
+                                specifierDiagnosed = true;
+                                return InvalidType;
+                            }
+                            break;   // resolved (bit-field or not) — stop descent
+                        }
+                        // Descend ONE transparent wrapper (a single Internal child);
+                        // a real operator/comma (≥2 Internal children) is not a
+                        // transparent member operand — stop.
+                        NodeId next{};
+                        int internals = 0;
+                        for (NodeId c : visibleChildren(tree, probe)) {
+                            if (tree.kind(c) == NodeKind::Internal) {
+                                ++internals; next = c;
+                            }
+                        }
+                        if (internals == 1) { probe = next; continue; }
+                        break;
+                    }
+                    // The operand subtree was already typed by the blanket Pass-2
+                    // walk (which emitted any S_Undeclared/S_TypeMismatch); read its
+                    // type on-demand — InvalidType cascades, no double-diagnostic.
+                    raw = subtreeType(s, tree, operandNode, scope);
+                }
+                if (!raw.valid()) {
+                    // The operand did not resolve. The TYPE form's recursion already
+                    // emitted S_UnknownType (and set specifierDiagnosed); the VALUE
+                    // form's operand was diagnosed by the blanket Pass-2 typing
+                    // (S_Undeclared/S_TypeMismatch). Mark specifierDiagnosed so the
+                    // outer generic-descent miss arm does NOT stack a REDUNDANT
+                    // S_UnknownType on the typeof node (design: cascade, no double-diag).
+                    specifierDiagnosed = true;
+                    return InvalidType;
+                }
+                TypeId const result =
+                    strip ? s.lattice.interner().stripVolatile(raw) : raw;
+                s.nodeToType.set(node, result);
+                return result;
+            }
+        }
         auto kids = visibleChildren(tree, node);
         // SE-pointers (G5): count `pointerToken` children at THIS node (C
         // declarator stars: `int *p`, `int **p`) and wrap the resolved base type
@@ -1287,6 +1428,13 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 && tree.kind(child) == NodeKind::Internal
                 && tree.rule(child) == layerRule;   // castTypeRef pointerLayer
         };
+        // D-CSUBSET-TYPEOF: a `typeof(...)` child's operand subtree is OPAQUE to
+        // this base-volatile scan (the typeof arm resolves the operand's own
+        // qualifiers — preserved for typeof, stripped for typeof_unqual — so a
+        // literal `volatile` inside the operand must NOT re-qualify the base here).
+        // Config-driven; empty/invalid for a language without typeof (no effect).
+        std::array<RuleId, 2> const typeofOpaqueRules{cfg.typeofTypeRule,
+                                                      cfg.typeofValueRule};
         bool baseIsVolatile = false;
         if (cfg.volatileMarker.has_value()) {
             for (auto child : kids) {
@@ -1294,7 +1442,7 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     break;   // reached the star run — a later volatile is the pointer object's
                 }
                 if (subtreeContainsToken(tree, child, *cfg.volatileMarker,
-                                         &s.idx().declByRule)) {
+                                         &s.idx().declByRule, typeofOpaqueRules)) {
                     baseIsVolatile = true;
                 }
             }
@@ -3081,13 +3229,21 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             // NOT a coarse whole-decl const scan. See
                             // declaratorObjectIsConst. Falls back to the legacy
                             // scan only if this language has no declarator config.
+                            // D-CSUBSET-TYPEOF: the head's `typeof(...)` operand is
+                            // OPAQUE to the const scan — a literal `const` inside a
+                            // `typeof(const int)` head must NOT mark the object const
+                            // (typeof preserves it in the resolved TYPE; typeof_unqual
+                            // strips it — either way the coarse token must not leak).
+                            std::array<RuleId, 2> const typeofOpaqueRules{
+                                cfg.typeofTypeRule, cfg.typeofValueRule};
                             rec.isConst = cfg.declarators.has_value()
                                 ? declaratorObjectIsConst(
                                       tree, node, dNode, *cfg.declarators,
                                       *decl.constMarker, &s.idx().declByRule,
                                       (decl.headChild.has_value()
                                        && *decl.headChild < kids.size())
-                                          ? kids[*decl.headChild] : NodeId{})
+                                          ? kids[*decl.headChild] : NodeId{},
+                                      typeofOpaqueRules)
                                 : subtreeContainsToken(
                                       tree, node, *decl.constMarker,
                                       &s.idx().declByRule);

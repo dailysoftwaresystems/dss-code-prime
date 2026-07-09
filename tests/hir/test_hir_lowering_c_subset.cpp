@@ -921,6 +921,26 @@ TEST(HirLoweringCSubset, TopLevelDeclaresNothingFailsLoudNoCrash) {
         << "exactly one S_DeclarationDeclaresNothing for the empty `int ;` decl";
 }
 
+// C23 6.7.2.5 (D-CSUBSET-TYPEOF): a bare `typeof(x);` — a typeof type-specifier
+// with NO declarator — declares nothing, exactly like `int ;`. The typeof head is
+// a type-specifier (not a struct/union/enum composite), so the "declares nothing"
+// path fires at HIR lowering (S_DeclarationDeclaresNothing) and must NOT crash on
+// the typeof subtree. Semantic + parse accept it (x is a declared global); the
+// constraint is HIR-tier.
+TEST(HirLoweringCSubset, BareTypeofDeclaresNothingFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int x;\ntypeof(x);\nint main(void) { return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok)
+        << "`typeof(x);` declares nothing — lowering must fail loud, not accept";
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
+        << "exactly one S_DeclarationDeclaresNothing for the bare `typeof(x);` decl";
+}
+
 // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: a body-PRESENT specifier WITH a
 // declarator (`struct S { int x; } v;`) is a definition-introducing global — it
 // lowers cleanly (the `compositeSpecifierIsDefinition` gate admits it because its

@@ -360,6 +360,9 @@
     { "word": "_Alignas", "kind": "AlignasKeyword"       },
     { "word": "alignas",  "kind": "AlignasLegacyKeyword" },
 
+    { "word": "typeof",         "kind": "TypeofKeyword"        },
+    { "word": "typeof_unqual",  "kind": "TypeofUnqualKeyword"  },
+
     { "word": "_Static_assert", "kind": "StaticAssertKeyword"       },
     { "word": "static_assert",  "kind": "StaticAssertLegacyKeyword" },
 
@@ -534,7 +537,7 @@
       "$comment": "Top-level head: a keyword type specifier (`typeSpecifierSeq`, e.g. `int`/`unsigned long`), a struct/union/enum composite specifier (`topLevelCompositeSpec` — the SPECULATIVE body-vs-ref alt), OR a lone Identifier (typedef name). The OUTER alt is NON-speculative: FIRST(typeSpecifierSeq)={type keywords}, FIRST(topLevelCompositeSpec)={struct,union,enum}, FIRST(Identifier)={ident} are pairwise disjoint — so a plain `int x;` routes DIRECTLY to typeSpecifierSeq (NO extra wrapper node, preserving the pre-existing tree shape) and only a struct/union/enum lead enters the single-level speculation that closes D-CSUBSET-STRUCT-BODY-VARDECL-POSITION. topLevel stays non-speculative: `struct` routes unambiguously to topLevelDecl.",
       "sequence": [
         { "repeat": "headQualifier" },
-        { "alt": [ "typeSpecifierSeq", "topLevelCompositeSpec", "Identifier" ] },
+        { "alt": [ "typeSpecifierSeq", "topLevelCompositeSpec", "Identifier", "typeofSpecifier" ] },
         { "repeat": "headQualifier" }
       ]
     },
@@ -656,12 +659,13 @@
     },
 
     "typeSpecifierForDecl": {
-      "$comment": "KEYWORD/composite-led type specifiers for declaration heads — deliberately NO Identifier arm (the typedef-name head is the ambiguous form, routed through identDeclHead/declOrExprStmt or the committed post-specifier/post-qualifier heads). SPECULATIVE (mirror typedefHead, D-CSUBSET-STRUCT-BODY-VARDECL-POSITION): admits the struct/union/enum BODY forms so a body-defined LOCAL (`struct P { int a; } v;` as a statement) parses; body forms probe FIRST, a ref with no `{` rolls back to the `*TypeRef` form. Single-level.",
+      "$comment": "KEYWORD/composite-led type specifiers for declaration heads — deliberately NO Identifier arm (the typedef-name head is the ambiguous form, routed through identDeclHead/declOrExprStmt or the committed post-specifier/post-qualifier heads). SPECULATIVE (mirror typedefHead, D-CSUBSET-STRUCT-BODY-VARDECL-POSITION): admits the struct/union/enum BODY forms so a body-defined LOCAL (`struct P { int a; } v;` as a statement) parses; body forms probe FIRST, a ref with no `{` rolls back to the `*TypeRef` form. Single-level. D-CSUBSET-TYPEOF: `typeofSpecifier` (keyword-led, disjoint FIRST) is admitted here so a `typeof(...)`-headed declaration parses.",
       "alt": [
         "typeSpecifierSeq",
         "structSpec",
         "unionSpec",
-        "enumSpec"
+        "enumSpec",
+        "typeofSpecifier"
       ],
       "speculative": true, "lookahead": 256
     },
@@ -701,13 +705,14 @@
     },
 
     "typedefHead": {
-      "$comment": "SPECULATIVE: the struct/union/enum BODY forms collide with the ref forms on their lead keyword — body forms probe FIRST (declared order); `typedef struct P MyP;` rolls back to structTypeRef when no `{` follows. lookahead 256 (4096-token budget): a body probe must swallow the whole member list.",
+      "$comment": "SPECULATIVE: the struct/union/enum BODY forms collide with the ref forms on their lead keyword — body forms probe FIRST (declared order); `typedef struct P MyP;` rolls back to structTypeRef when no `{` follows. lookahead 256 (4096-token budget): a body probe must swallow the whole member list. D-CSUBSET-TYPEOF: `typeofSpecifier` (keyword-led, disjoint FIRST) admits `typedef typeof(x) T;`.",
       "alt": [
         "typeSpecifierSeq",
         "structSpec",
         "unionSpec",
         "enumSpec",
-        "Identifier"
+        "Identifier",
+        "typeofSpecifier"
       ],
       "speculative": true, "lookahead": 256
     },
@@ -778,7 +783,7 @@
       ]
     },
 
-    "typeBase": { "alt": [ "typeSpecifierSeq", "Identifier" ] },
+    "typeBase": { "alt": [ "typeSpecifierSeq", "Identifier", "typeofSpecifier" ] },
 
     "typeRef": {
       "sequence": [
@@ -796,7 +801,8 @@
         "structSpec",
         "unionSpec",
         "enumSpec",
-        "Identifier"
+        "Identifier",
+        "typeofSpecifier"
       ],
       "speculative": true, "lookahead": 256
     },
@@ -868,7 +874,7 @@
     "declHeadForParam": {
       "sequence": [
         { "repeat": "headQualifier" },
-        { "alt": [ "typeSpecifierSeq", "structTypeRef", "unionTypeRef", "enumTypeRef", "Identifier" ] },
+        { "alt": [ "typeSpecifierSeq", "structTypeRef", "unionTypeRef", "enumTypeRef", "Identifier", "typeofSpecifier" ] },
         { "repeat": "headQualifier" }
       ]
     },
@@ -1127,6 +1133,27 @@
       "commitRequiresTypeName": "castTypeRef"
     },
 
+    "typeofSpecifier": {
+      "$comment": "C23 6.7.2.5 (D-CSUBSET-TYPEOF): `typeof`/`typeof_unqual` — a TYPE-SPECIFIER whose meaning is the operand's type (typeof preserves top-level qualifiers, typeof_unqual strips them). Two operand forms, disambiguated SPECULATIVELY (parallel to sizeofExpr's type-vs-value alt): the TYPE-NAME form (`typeof(int)`/`typeof(volatile char)`/`typeof(int*)`) probes FIRST, and a VALUE operand (`typeof(x)`/`typeof(a.b)`) rolls back to the value form. FIRST-set-safe: the two brand-new disjoint keyword tokens make a `typeof` lead select this specifier unambiguously in every alt-list it is appended to — the inner alt is where the type-vs-value ambiguity lives, so the speculation budget applies only once a `typeof(` is already committed. The wrapper materializes a `typeofSpecifier` node containing the chosen `typeofType`/`typeofValue` (like sizeofExpr); the semantic tier resolves the inner form's operand and the HIR lowering recovers the stamped result via resolveStampedTypeBelow.",
+      "alt": [ "typeofType", "typeofValue" ],
+      "speculative": true, "lookahead": 64
+    },
+    "typeofType": {
+      "$comment": "C23 6.7.2.5 (D-CSUBSET-TYPEOF): the TYPE-NAME operand form — `typeof ( type-name )` / `typeof_unqual ( type-name )`. Reuses FC2's shared `castTypeRef` (so `typeof(int*)` / `typeof(volatile char)` / `typeof(MyTypedef)` all resolve) + the `commitRequiresTypeName` binder triage. POLARITY = `requireKnownType` (NOT sizeofType's PreferType default), mirroring `alignasTypeName`: a bare identifier commits the TYPE reading ONLY when it is a KNOWN typedef-name; an ENUM CONSTANT or other non-type identifier (binder-sketch Unknown) rolls back to `typeofValue` and is typed as an expression — the C 6.7.6.3p11-style disambiguation (under PreferType a bare `typeof(ENUM_CONST)` would wrongly commit as a type → a spurious S_UnknownType). A keyword-led type (`typeof(int)`) still commits (triage rule 1). The inline 2-keyword alt at child 0 mirrors alignofType (no wrapper) — visible-child 2 is the castTypeRef (same layout as sizeofType/alignofType).",
+      "sequence": [
+        { "alt": [ "TypeofKeyword", "TypeofUnqualKeyword" ] },
+        "ParenOpen", "castTypeRef", "ParenClose"
+      ],
+      "commitRequiresTypeName": { "rule": "castTypeRef", "polarity": "requireKnownType" }
+    },
+    "typeofValue": {
+      "$comment": "C23 6.7.2.5 (D-CSUBSET-TYPEOF): the EXPRESSION operand form — `typeof ( expression )` / `typeof_unqual ( expression )` (reached when the type-name reading rolls back). The operand is the full comma-inclusive `expression` (C23-correct — `typeof(a, b)` takes the comma expression's type). UNEVALUATED (6.7.2.5p2): only the operand's TYPE reaches the semantic tier (via subtreeType), which strips top-level volatile for typeof_unqual; a bit-field operand is a constraint violation (S_TypeofBitfieldOperand). visible-child 2 is the expression (same keyword+paren layout as typeofType).",
+      "sequence": [
+        { "alt": [ "TypeofKeyword", "TypeofUnqualKeyword" ] },
+        "ParenOpen", "expression", "ParenClose"
+      ]
+    },
+
     "alignasSpec": {
       "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the `_Alignas ( … )` / `alignas ( … )` alignment SPECIFIER — a DECLARATION-SPECIFIER (NOT an expression operand), so it is a SEQUENCE (its tree node is `alignasSpec`, which the specifier-prefix mechanism matches in singleDeclSpecifier/localDeclSpecifier/structMemberDeclSpecifiers). Two spellings: the reserved `_Alignas` (AlignasKeyword) and the C23 `alignas` (AlignasLegacyKeyword). The parenthesized operand is `alignasArg` — EITHER a type-name (`alignas(int)` contributes _Alignof(int)) OR a constant-expression (`alignas(16)`). SEMANTICS live in the semantic tier (semantics.alignas): the value/type is computed + validated (power-of-two, ≤256, ≥ the declared type's natural alignment) + STORED on the SymbolRecord (variables) / fed into the struct's fieldAligns (members). The specifier is STRIPPED before positional-child counting (decl_prefix_strip.hpp) so name/type indices stay stable, and IGNORED by the linkage scan (linkageSpecifierIgnoredRules) — exactly like `__attribute__`.",
       "sequence": [
@@ -1199,7 +1226,7 @@
     },
 
     "castTypeBase": {
-      "alt": [ "typeSpecifierSeq", "Identifier", "structTypeRef", "unionTypeRef", "enumTypeRef" ]
+      "alt": [ "typeSpecifierSeq", "Identifier", "structTypeRef", "unionTypeRef", "enumTypeRef", "typeofSpecifier" ]
     },
 
     "castTypeRef": {
@@ -1469,6 +1496,8 @@
     "sizeof": { "typeRule": "sizeofType", "typeChild": 2, "valueRule": "sizeofValue" },
     "$alignofComment": "C11/C23 6.5.3.4: alignof typing. alignofType = [ { alt: AlignofKeyword | AlignofLegacyKeyword }, '(', castTypeRef, ')' ] → typeChild 2 is the castTypeRef (the inline keyword-alt matches ONE token at visible-child 0, '(' is child 1 — SAME layout as sizeofType, so the same index 2). Pass 2 resolves + stamps the type child through the SAME type resolver sizeof/casts use, and stamps the node size_t (U64). TYPE-NAME FORM ONLY — no valueRule (there is no `_Alignof(expr)` form).",
     "alignof": { "typeRule": "alignofType", "typeChild": 2 },
+    "$typeofComment": "C23 6.7.2.5 (D-CSUBSET-TYPEOF): typeof typing. `typeRule` = `typeofType` = [ { alt: TypeofKeyword | TypeofUnqualKeyword }, '(', castTypeRef, ')' ] and `valueRule` = `typeofValue` = [ { alt: ... }, '(', expression, ')' ] — `operandChild` 2 is the castTypeRef / expression in BOTH (the inline keyword-alt matches ONE token at visible-child 0, same layout as alignofType/sizeofType). The semantic tier's resolveTypeNodeImpl arm resolves the operand (the type form recurses the SAME type resolver casts/sizeof use; the value form reads the operand's type via subtreeType — UNEVALUATED per 6.7.2.5p2) and, when the leading keyword is `stripQualifiersToken` (`typeof_unqual`), strips top-level qualifiers (only VolatileQual is interned, so strip == stripVolatile; const/restrict are not interned). The result is stamped on the typeof node so HIR's resolveStampedTypeBelow recovers it. CRITICALLY, the typeof operand subtree is made OPAQUE to the coarse volatile/const qualifier scans (subtreeContainsToken / declaratorObjectIsConst) so `typeof_unqual`'s stripped qualifier is never silently re-applied. A bit-field value operand → S_TypeofBitfieldOperand (6.7.2.5 constraint). `stripQualifiersToken` is OPTIONAL — absent ⇒ typeof never strips (a language with only the qualifier-preserving spelling). Absent block ⇒ the language has no typeof surface.",
+    "typeof": { "typeRule": "typeofType", "valueRule": "typeofValue", "operandChild": 2, "stripQualifiersToken": "TypeofUnqualKeyword" },
     "$alignasComment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the `_Alignas`/`alignas` alignment specifier. `specRule` = the `alignasSpec` shape = [ { alt: AlignasKeyword | AlignasLegacyKeyword }, '(', alignasArg, ')' ] → `argChild` 2 is the `alignasArg` (the inline keyword-alt matches ONE token at visible-child 0, '(' is child 1 — SAME layout as alignofType). `typeFormRule` = `alignasTypeName` (the guarded TYPE-form wrapper branch): the semantic tier reads alignasArg's committed reading and discriminates the TYPE form (the committed child's rule == alignasTypeName → alignment = _Alignof(T) via computeLayout(...)->align of the castTypeRef INSIDE the wrapper) from the VALUE form (else → const-evaluate the constant-expression via the SAME constIntExpr sizeof/static_assert/array-dims use). The computed alignment is validated (power-of-two → S_AlignasNotPowerOfTwo; ≤256 → S_AlignasExceedsMax; ≥ the declared type's natural align → S_AlignasWeakerThanNatural; non-constant value → S_AlignasNonConstant; on a typedef/function/parameter/bit-field → S_AlignasInvalidContext) and STORED (SymbolRecord.explicitAlignment for a variable; fed into the composite's fieldAligns for a member). `alignas(0)` is an explicit NO-OP (6.7.5p3) — treated as no override, no error. Absent block ⇒ the language has no alignas surface.",
     "alignas": { "specRule": "alignasSpec", "argChild": 2, "typeFormRule": "alignasTypeName" },
     "$packedComment": "FC16 (D-CSUBSET-PACKED): C/C23 `__attribute__((packed))` / `[[gnu::packed]]` on a struct/union. `listRule` = the `compositeAttrList` shape (the trailing attribute list after a struct/union body). `attributeNames` = the identifiers that mean `packed` (matched dunder-normalized via the shared stripDunder, so `__packed__` ≡ `packed`; `gnu::packed` matches by its final segment `packed`). The semantic tier scans a structSpec/unionSpec node for a `compositeAttrList` child, extracts each `attrSpec`/`stdAttr` identifier, and marks the composite `packed` (→ the interner's completeComposite → computeLayout removes all inter-field padding + sets natural alignment 1). An unrecognized `__attribute__((X))` identifier fails loud S_UnknownTypeAttribute (typo protection like H_UnknownLinkageSpecifier); an unrecognized `[[…]]` is standard-ignorable (the [[deprecated]] precedent). packed + a bit-field member → S_PackedBitfieldUnsupported (D-CSUBSET-PACKED-BITFIELD-INTERACTION). Absent block ⇒ the language has no composite-attribute surface. Source-agnostic: nothing hardcodes the spelling `packed`.",

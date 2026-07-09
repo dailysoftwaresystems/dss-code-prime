@@ -1223,6 +1223,26 @@ struct DSS_EXPORT SemanticConfig {
     // the node size_t (U64). Invalid ⇒ the language has no `_Alignof` surface.
     RuleId        alignofTypeRule{};  std::string alignofTypeRuleName;
     std::uint32_t alignofTypeChild = 0;
+    // C23 6.7.2.5 (D-CSUBSET-TYPEOF): `typeof`/`typeof_unqual` typing. Both are
+    // TYPE-SPECIFIERS resolving to the operand's type. `typeofTypeRule` = the
+    // TYPE-NAME operand form (`typeof ( type-name )`, whose `typeofOperandChild`
+    // is a castTypeRef — resolved through the SAME type resolver casts/sizeof use);
+    // `typeofValueRule` = the EXPRESSION operand form (`typeof ( expression )`,
+    // whose operand type is read via subtreeType — UNEVALUATED). BOTH forms share
+    // the operand visible-child index `typeofOperandChild` (2 — the inline
+    // keyword-alt matches ONE token at child 0, same layout as alignof/sizeof).
+    // `typeofStripQualifiersToken` is the OPTIONAL leading-keyword token that means
+    // "strip top-level qualifiers" (`typeof_unqual`): when the typeof node's child-0
+    // keyword IS this token, the resolved type has its top-level VolatileQual
+    // stripped (only volatile is interned; const/restrict are not). Absent (nullopt)
+    // ⇒ the language's typeof never strips. Both rules invalid ⇒ no typeof surface.
+    // The resolveTypeNodeImpl arm ALSO makes the typeof operand subtree opaque to the
+    // coarse volatile/const qualifier scans so a stripped qualifier is never silently
+    // re-applied. Source-AGNOSTIC: nothing hardcodes "typeof"/"typeof_unqual".
+    RuleId        typeofTypeRule{};   std::string typeofTypeRuleName;
+    RuleId        typeofValueRule{};  std::string typeofValueRuleName;
+    std::uint32_t typeofOperandChild = 0;
+    std::optional<SchemaTokenId> typeofStripQualifiersToken;
     // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the `_Alignas`/`alignas` alignment
     // SPECIFIER. `alignasSpecRule` = the `alignasSpec` shape = [ keyword, '(',
     // alignasArg, ')' ]; `alignasArgChild` = the visible-child index of the

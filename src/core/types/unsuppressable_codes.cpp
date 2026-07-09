@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 90> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 91> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -393,6 +393,15 @@ constexpr std::array<DiagnosticCode, 90> kUnsuppressableCodes{{
     // for existing enums.)
     DiagnosticCode::S_InvalidEnumUnderlyingType,
     DiagnosticCode::S_EnumeratorValueOutOfRange,
+    // S_TypeofBitfieldOperand (FC17, D-CSUBSET-TYPEOF, C23 6.7.2.5): the operand
+    // of a `typeof`/`typeof_unqual` is a bit-field member access. Same
+    // silent-miscompile-guard class as the enum/nullptr entries above: on the
+    // reject path the typeof node resolves to InvalidType, so the build fails via
+    // hasErrors() regardless of the emit gate — but a SUPPRESSED constraint
+    // violation would silently resolve the typeof to the bit-field's declared
+    // (widened) type, a wrong type in the declaration it specifies. Closed here so
+    // a bit-field typeof is never silently mistyped.
+    DiagnosticCode::S_TypeofBitfieldOperand,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the
