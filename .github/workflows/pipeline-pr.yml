@@ -43,7 +43,7 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@v3
         with:
-          client-id: ${{ secrets.DSS_PUBLIC_BOTS_CLIENT_ID }}
+          client-id: ${{ secrets.DSS_PUBLIC_BOTS_APP_ID }}
           private-key: ${{ secrets.DSS_PUBLIC_BOTS_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
 
@@ -138,7 +138,7 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@v3
         with:
-          client-id: ${{ secrets.DSS_PUBLIC_BOTS_CLIENT_ID }}
+          client-id: ${{ secrets.DSS_PUBLIC_BOTS_APP_ID }}
           private-key: ${{ secrets.DSS_PUBLIC_BOTS_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
 
@@ -367,7 +367,7 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@v3
         with:
-          client-id: ${{ secrets.DSS_PUBLIC_BOTS_CLIENT_ID }}
+          client-id: ${{ secrets.DSS_PUBLIC_BOTS_APP_ID }}
           private-key: ${{ secrets.DSS_PUBLIC_BOTS_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
 
