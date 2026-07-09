@@ -38,7 +38,12 @@ using MirValueId = MirInstId;
 //
 // `Synthetic` marks instructions lowering inserted with no source origin (e.g.
 // structured-CF scaffolding). `Volatile` marks a memory access the optimizer
-// must not reorder or elide. Multiple flags may apply.
+// must not reorder or elide. Also: two `Volatile` ops must never be reordered
+// relative to each other, and any future instruction-scheduling / sinking pass
+// MUST treat a `Volatile` op as a scheduling barrier w.r.t. every other
+// `Volatile` or side-effecting op (today guaranteed structurally by the shared
+// rebuild-walk's original-scan-order discipline; pin:
+// TwoVolatileStoresToDifferentGlobalsKeepRelativeOrder). Multiple flags may apply.
 enum class MirInstFlags : std::uint8_t {
     None      = 0,
     Synthetic = 1u << 0,

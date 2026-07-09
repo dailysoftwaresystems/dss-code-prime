@@ -712,6 +712,93 @@ TEST(Licm, VolatileBinaryOpNotHoisted) {
     EXPECT_EQ(r.instructionsHoisted, 0u);
 }
 
+// Load-specific Volatile guard (licm.cpp:326). The sibling
+// `VolatileBinaryOpNotHoisted` exercises only an `Add`, leaving the Load-
+// admission path — which sits AFTER the Volatile `continue` — unpinned. This
+// fixture is byte-identical to `InvariantLoadHoisted` (a clean pointer defined
+// OUTSIDE the loop, empty body, NO aliasing Store → that test hoists the Load,
+// instructionsHoisted == 1) EXCEPT the loop-body Load carries
+// MirInstFlags::Volatile. The single-bit delta isolates the Volatile `continue`
+// at licm.cpp:326, which runs BEFORE the Load alias-admission gate: with it,
+// instructionsHoisted == 0 and the volatile Load stays physically in the body.
+// RED-ON-DISABLE: neutralize the `if (has(...Volatile)) continue;` at
+// licm.cpp:326 → the volatile Load hoists → instructionsHoisted == 1.
+TEST(Licm, VolatileLoadInOtherwiseHoistableLoopNotHoisted) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry  = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const header = mb.createBlock(StructCfMarker::LoopHeader);
+    MirBlockId const body   = mb.createBlock(StructCfMarker::LoopLatch);
+    MirBlockId const exitB  = mb.createBlock(StructCfMarker::LoopExit);
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue v42; v42.value = std::int64_t{42}; v42.core = TypeKind::I32;
+    MirInstId const c = mb.addConst(v42, i32);
+    MirInstId const s[] = {c, slot};
+    (void)mb.addInst(MirOpcode::Store, s, InvalidType);
+    mb.addBr(header);
+    mb.beginBlock(header);
+    MirLiteralValue tru; tru.value = std::int64_t{1}; tru.core = TypeKind::Bool;
+    MirInstId const cond = mb.addConst(tru, boolT);
+    mb.addCondBr(cond, body, exitB);
+    mb.beginBlock(body);
+    // Identical to InvariantLoadHoisted's body Load EXCEPT the Volatile flag —
+    // the pointer `slot` is loop-invariant and no aliasing Store sits in the
+    // body, so ONLY the Volatile bit can stop the hoist.
+    MirInstId const lops[] = {slot};
+    (void)mb.addInst(MirOpcode::Load, lops, i32, /*payload*/0,
+                     MirInstFlags::Volatile);
+    mb.addBr(header);
+    mb.beginBlock(exitB);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runLicm(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsHoisted, 0u)
+        << "a Volatile Load must NOT be hoisted even though its pointer is loop-"
+           "invariant and no aliasing Store sits in the body — licm.cpp:326's "
+           "Volatile `continue` runs before the Load alias-admission gate";
+
+    // The volatile Load must remain PHYSICALLY in the loop-body (LoopLatch)
+    // block; NO Load may have been relocated into the preheader (EntryBlock).
+    // `instructionsHoisted == 0` alone is a counter check; this walk proves the
+    // instruction did not move.
+    std::size_t volLoadsInBody   = 0;
+    std::size_t loadsInPreheader = 0;
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < nf; ++fi) {
+        MirFuncId const f = mir.funcAt(fi);
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const blk = mir.funcBlockAt(f, bi);
+            StructCfMarker const mrk = mir.blockMarker(blk);
+            std::uint32_t const ni = mir.blockInstCount(blk);
+            for (std::uint32_t i2 = 0; i2 < ni; ++i2) {
+                MirInstId const id = mir.blockInstAt(blk, i2);
+                if (mir.instOpcode(id) != MirOpcode::Load) continue;
+                if (mrk == StructCfMarker::LoopLatch &&
+                    has(mir.instFlags(id), MirInstFlags::Volatile)) {
+                    ++volLoadsInBody;
+                }
+                if (mrk == StructCfMarker::EntryBlock) ++loadsInPreheader;
+            }
+        }
+    }
+    EXPECT_EQ(volLoadsInBody, 1u)
+        << "the volatile Load must still live in the loop body (LoopLatch), "
+           "not be moved to the preheader";
+    EXPECT_EQ(loadsInPreheader, 0u)
+        << "no Load may be hoisted into the preheader (EntryBlock)";
+}
+
 // Test-analyzer Critical Gap 1: assert the hoisted inst actually
 // LANDS IN THE PREHEADER. `instructionsHoisted == 1` is satisfied
 // by the policy's counter regardless of which block the clone

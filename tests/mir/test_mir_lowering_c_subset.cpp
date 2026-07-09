@@ -18,6 +18,7 @@
 #include "mir/mir_text.hpp"
 #include "mir/mir_verifier.hpp"
 #include "opt/optimizer.hpp"
+#include "opt/passes/dce.hpp"
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/target_schema.hpp"
 
@@ -7661,6 +7662,123 @@ TEST(MirLoweringCSubsetVolatile, ContainerVolatileIndexThenMember) {
         << (L2.mirReporter.all().empty() ? "" : L2.mirReporter.all()[0].actual);
     EXPECT_EQ(countOpWithVolatile(L2.mir.mir, MirOpcode::Load, /*wantVolatile=*/true), 0u)
         << "a plain `struct S arr[4]` `arr[i].a` must NOT be volatile";
+}
+
+// Pin (future-safety): two volatile stores to DIFFERENT globals keep their
+// relative order across the full shipped release pipeline. The ordering of two
+// `Volatile` ops is a hard contract (mir_node.hpp's `Volatile` doc): a future
+// instruction-scheduling / sinking pass MUST NOT reorder them. Today NO pass
+// reorders instructions within a block — every pass rebuilds through
+// MirFunctionRebuilder in original scan order — so this PASSES structurally; it
+// is NOT red-on-disable against an existing guard, it is a tripwire that reds
+// the day such a pass lands without a Volatile scheduling barrier.
+TEST(MirLoweringCSubsetVolatile, TwoVolatileStoresToDifferentGlobalsKeepRelativeOrder) {
+    auto L = lowerCSubset(
+        "volatile int g1, g2;\n"
+        "void f(void){ g1 = 1; g2 = 2; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    // Resolve a Store's target global symbol: operand[1] is the pointer, which
+    // for a global write is a GlobalAddr carrying the SymbolId.
+    auto storeTargetSym = [](Mir const& m, MirInstId st) -> std::uint32_t {
+        auto const ops = m.instOperands(st);
+        if (ops.size() < 2) return 0u;
+        MirInstId const ptr = ops[1];
+        if (m.instOpcode(ptr) != MirOpcode::GlobalAddr) return 0u;
+        return m.globalAddrSymbol(ptr).v;
+    };
+    // Walk EVERY block of EVERY function in FINAL order; record the target
+    // symbol of each VOLATILE Store, in walk order, into (s0, s1). There are
+    // exactly two: `g1 = 1` then `g2 = 2`.
+    auto orderedVolStoreSyms = [&](Mir const& m, std::uint32_t& s0,
+                                   std::uint32_t& s1, std::uint32_t& count) {
+        s0 = 0u; s1 = 0u; count = 0u;
+        for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+            MirFuncId const fn = m.funcAt(fi);
+            for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+                MirBlockId const bb = m.funcBlockAt(fn, bi);
+                for (std::uint32_t i = 0; i < m.blockInstCount(bb); ++i) {
+                    MirInstId const id = m.blockInstAt(bb, i);
+                    if (m.instOpcode(id) != MirOpcode::Store) continue;
+                    if (!has(m.instFlags(id), MirInstFlags::Volatile)) continue;
+                    std::uint32_t const sym = storeTargetSym(m, id);
+                    if (count == 0u) s0 = sym;
+                    else if (count == 1u) s1 = sym;
+                    ++count;
+                }
+            }
+        }
+    };
+
+    // PRE-optimization: lowering emits the stores in SOURCE order — `g1 = 1`
+    // first, `g2 = 2` second. This DEFINES g1/g2 by the store target symbol
+    // (robust to the module globals-table ordering).
+    std::uint32_t symG1 = 0u, symG2 = 0u, preCount = 0u;
+    orderedVolStoreSyms(L.mir.mir, symG1, symG2, preCount);
+    ASSERT_EQ(preCount, 2u) << "two volatile global stores before optimization";
+    ASSERT_NE(symG1, 0u);
+    ASSERT_NE(symG2, 0u);
+    ASSERT_NE(symG1, symG2) << "g1 and g2 must resolve to distinct globals";
+
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    auto pipelineR = opt::loadShippedPipeline("release");
+    ASSERT_TRUE(pipelineR.has_value());
+    DiagnosticReporter rep;
+    auto const result = opt::optimize(L.mir.mir, **targetR,
+                                      L.model.lattice().interner(),
+                                      *pipelineR, rep);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+
+    // POST-optimization: both volatile stores survive (DCE keeps them) AND the
+    // store to g1 STILL precedes the store to g2 in final walk order.
+    std::uint32_t post0 = 0u, post1 = 0u, postCount = 0u;
+    orderedVolStoreSyms(L.mir.mir, post0, post1, postCount);
+    ASSERT_EQ(postCount, 2u)
+        << "both volatile stores must survive the release pipeline";
+    EXPECT_EQ(post0, symG1)
+        << "g1's volatile store must STILL come first after the release pipeline";
+    EXPECT_EQ(post1, symG2)
+        << "g2's volatile store must STILL come second — no pass may reorder two "
+           "Volatile stores (mir_node.hpp Volatile ordering contract)";
+}
+
+// Pin (future-safety): a volatile Store through a pointer PARAMETER SURVIVES
+// DCE. Source `void f(volatile int *p){ *p = 1; }` lowers to a single volatile
+// Store (`*p = 1` writes through the `volatile int` pointee). NOTE: this
+// survival is CURRENTLY guaranteed by `Store`'s UNCONDITIONAL opcode-level
+// `hasSideEffects` — `isSideEffectRoot` (dce.cpp:50-55) keeps EVERY Store,
+// volatile or not — so it does NOT isolate the Volatile bit today. It is a
+// future-safety regression guard: a future dead-store-elimination (DSE) pass
+// MUST route its elision decision through an `isSideEffectRoot`-equivalent
+// OR-against-`MirInstFlags::Volatile`, exactly as DCE's dce.cpp:50-55 already
+// does — otherwise it would wrongly drop this observable volatile write.
+TEST(MirLoweringCSubsetVolatile, VolatileStoreThroughPointerParamSurvivesDce) {
+    auto L = lowerCSubset(
+        "void f(volatile int *p){ *p = 1; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir& m = L.mir.mir;
+    ASSERT_EQ(countOpWithVolatile(m, MirOpcode::Store, /*wantVolatile=*/true), 1u)
+        << "pre-DCE: the `*p = 1` write through a volatile pointee is a VOLATILE Store";
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runDce(m, L.model.lattice().interner(), rep);
+    ASSERT_TRUE(r.ok);
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    EXPECT_EQ(countOpWithVolatile(m, MirOpcode::Store, /*wantVolatile=*/true), 1u)
+        << "DCE must NOT elide the volatile Store — it survives (today via "
+           "Store's opcode-level hasSideEffects; a future DSE must OR against "
+           "MirInstFlags::Volatile like dce.cpp:50-55)";
 }
 
 // ── c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION — opaque / incomplete struct ──
