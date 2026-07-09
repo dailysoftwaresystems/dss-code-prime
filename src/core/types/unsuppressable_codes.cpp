@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 91> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 96> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -402,6 +402,22 @@ constexpr std::array<DiagnosticCode, 91> kUnsuppressableCodes{{
     // (widened) type, a wrong type in the declaration it specifies. Closed here so
     // a bit-field typeof is never silently mistyped.
     DiagnosticCode::S_TypeofBitfieldOperand,
+    // S_Constexpr* (FC17, D-CSUBSET-CONSTEXPR, C23 6.7.1): the five constexpr
+    // OBJECT constraint violations — non-constant initializer, missing
+    // initializer, unsupported (aggregate) object type, constexpr-on-a-function,
+    // and a volatile-qualified object type. Each is a 6.7.1 constraint whose
+    // SUPPRESSION would silently degrade `constexpr` to plain `const` — the exact
+    // silent-accept the feature's fail-loud contract forbids (a constexpr object
+    // IS its translation-time value; a declaration that cannot deliver that value
+    // must never compile quietly). The function form additionally guards a wrong
+    // INTERNAL linkage (the file-scope constexpr linkage row would apply to a
+    // function the object-only feature never validated). Closed here so an
+    // invalid constexpr is never silent.
+    DiagnosticCode::S_ConstexprNonConstantInitializer,
+    DiagnosticCode::S_ConstexprMissingInitializer,
+    DiagnosticCode::S_ConstexprUnsupportedType,
+    DiagnosticCode::S_ConstexprFunctionNotSupported,
+    DiagnosticCode::S_ConstexprInvalidQualifier,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

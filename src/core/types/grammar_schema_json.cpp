@@ -7799,6 +7799,42 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── constexpr object storage-class (FC17, D-CSUBSET-CONSTEXPR) ──
+            // `{ keywordToken }` — the C23 6.7.1 `constexpr` KEYWORD token. Pass 1
+            // scans a declaration's specifier prefix for it and marks each declared
+            // symbol `isConstexpr`; Pass 2 enforces the 6.7.1 constraints at the
+            // declaration. `keywordToken` resolves like noreturn's (a REQUIRED
+            // string naming a declared token; unknown name → C_UnknownToken,
+            // missing/non-string → C_MissingField — a typo can never silently
+            // disarm the constexpr validation). An ABSENT block leaves the token
+            // unset ⇒ no surface. Source-agnostic: nothing hardcodes "constexpr".
+            if (sem.contains("constexpr")) {
+                json const& cx = sem.at("constexpr");
+                if (!cx.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/constexpr",
+                              "'semantics.constexpr' must be an object "
+                              "{ keywordToken }");
+                } else {
+                    if (!cx.contains("keywordToken")
+                        || !cx.at("keywordToken").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/constexpr/keywordToken",
+                                  "'keywordToken' is required and must be a string");
+                    } else {
+                        std::string const tn =
+                            cx.at("keywordToken").get<std::string>();
+                        if (!data.schemaTokens->contains(tn)) {
+                            coll.emit(DiagnosticCode::C_UnknownToken,
+                                      "/semantics/constexpr/keywordToken",
+                                      std::format("'constexpr.keywordToken' references "
+                                                  "unknown token kind '{}'", tn));
+                        } else {
+                            cfg.constexprKeywordToken = data.schemaTokens->find(tn);
+                        }
+                    }
+                }
+            }
+
             // ── variadic intrinsics (FC12a-core, D-FC12A-VARIADIC-CALLEE) ──
             // `{ vaArgRule, vaArgApChild, vaArgTypeChild, vaStartRule,
             //    vaStartApChild, vaEndRule, vaEndApChild }`. Pass 2 resolves the

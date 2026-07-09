@@ -582,6 +582,53 @@ enum class DiagnosticCode : std::uint16_t {
     // the typeof would silently resolve to the bit-field's DECLARED (widened) type,
     // masking the constraint and yielding a wrong type in a downstream declaration.
     S_TypeofBitfieldOperand       = 0xE036,
+    // C23 §6.7.1 (D-CSUBSET-CONSTEXPR): a `constexpr` object's initializer is NOT
+    // a compile-time constant — an arithmetic-typed initializer that does not fold
+    // through the shared CST const-eval engine (`constexpr int x = argc;`), or a
+    // pointer-typed initializer that is not a null pointer constant
+    // (`constexpr int *p = &g;`; the `(T*)0` cast form is a named loud deferral,
+    // D-CSUBSET-CONSTEXPR-POINTER-CAST-NULL). THE constexpr-vs-const empirical
+    // delta: `const int x = argc;` stays legal (const-ness is initializer-blind;
+    // only an ICE consumer errors lazily), `constexpr` must fail AT ITS OWN
+    // DECLARATION (6.7.1p10 — the value must be computable at translation time).
+    // The `.actual` names the offending initializer. Unsuppressable — a suppressed
+    // violation would silently degrade constexpr to plain const (a later
+    // const-expr consumer would then mis-diagnose, or a runtime init would ship).
+    S_ConstexprNonConstantInitializer = 0xE037,
+    // C23 §6.7.1 (D-CSUBSET-CONSTEXPR): a `constexpr` object declarator carries NO
+    // initializer (`constexpr int x;`, the `b` in `constexpr int a = 1, b;` —
+    // fires per-declarator). 6.7.1p10 requires an initializer (the object IS its
+    // compile-time value). The `.actual` names the uninitialized declarator.
+    // Unsuppressable — a suppressed violation would ship a zero-initialized
+    // "constant" whose reads mean nothing the author wrote.
+    S_ConstexprMissingInitializer = 0xE038,
+    // C23 §6.7.1 (D-CSUBSET-CONSTEXPR / D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE): a
+    // `constexpr` object of ARRAY / STRUCT / UNION type (`constexpr int a[3] =
+    // {1,2,3};`, `constexpr char s[] = "hi";`). Aggregate constexpr semantics
+    // (element-wise compile-time validation) are a NAMED loud deferral — no
+    // CST-tier aggregate evaluator exists; fail loud rather than validate a
+    // guessed subset. A UNIFORM boundary: the char-array-from-string-literal form
+    // is deliberately NOT carved out. Also the catch-all for any other
+    // non-scalar/non-pointer constexpr object type (fail-loud, never silent).
+    // The `.actual` names the declarator. Unsuppressable.
+    S_ConstexprUnsupportedType    = 0xE039,
+    // C23 §6.7.1 (D-CSUBSET-CONSTEXPR): `constexpr` on a FUNCTION — a prototype
+    // (`constexpr int f(void);`) or a definition (`constexpr int f(void) {…}`).
+    // C23 constexpr is the OBJECT storage-class only (C++ constexpr functions do
+    // not exist in C23); 6.7.1p5 restricts constexpr to objects. Fail loud rather
+    // than silently treat the function as ordinary (and — file scope — wrongly
+    // give it internal linkage via the constexpr linkage row). The `.actual`
+    // names the function declarator. Unsuppressable.
+    S_ConstexprFunctionNotSupported = 0xE03A,
+    // C23 §6.7.1p11 (D-CSUBSET-CONSTEXPR): a `constexpr` OBJECT whose type is
+    // volatile-qualified at the TOP level (`constexpr volatile int v = 1;`).
+    // C23 prohibits a constexpr object of volatile-qualified type (its reads
+    // could not be constant-folded without dropping the volatile access). A
+    // volatile POINTEE stays legal (`constexpr volatile int *p = nullptr;` — the
+    // OBJECT is the pointer, not volatile itself). The `.actual` names the
+    // declarator. Unsuppressable — a suppressed violation would either fold away
+    // volatile reads or silently drop the constexpr constant-ness.
+    S_ConstexprInvalidQualifier   = 0xE03B,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

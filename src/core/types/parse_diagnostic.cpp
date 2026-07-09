@@ -158,6 +158,16 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_EnumeratorValueOutOfRange";
         case DiagnosticCode::S_TypeofBitfieldOperand:
             return "S_TypeofBitfieldOperand";
+        case DiagnosticCode::S_ConstexprNonConstantInitializer:
+            return "S_ConstexprNonConstantInitializer";
+        case DiagnosticCode::S_ConstexprMissingInitializer:
+            return "S_ConstexprMissingInitializer";
+        case DiagnosticCode::S_ConstexprUnsupportedType:
+            return "S_ConstexprUnsupportedType";
+        case DiagnosticCode::S_ConstexprFunctionNotSupported:
+            return "S_ConstexprFunctionNotSupported";
+        case DiagnosticCode::S_ConstexprInvalidQualifier:
+            return "S_ConstexprInvalidQualifier";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

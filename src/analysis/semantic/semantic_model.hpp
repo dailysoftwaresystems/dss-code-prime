@@ -245,6 +245,22 @@ struct DSS_EXPORT SymbolRecord {
     // DROPPED flag is a safe miss (a spurious H_VerifierFailure — fail-loud), never
     // a silent miscompile. Default false.
     bool            isNoreturn = false;
+    // FC17 (D-CSUBSET-CONSTEXPR): TRUE iff this symbol was declared with the C23
+    // 6.7.1 `constexpr` OBJECT storage-class. Set at Pass-1 minting when the
+    // declaration's specifier prefix carries the language's
+    // `constexprKeywordToken` (`specifierPrefixHasConstexpr`, the
+    // `specifierPrefixNamesNoreturn` mirror); IMPLIES `isConst` (a constexpr
+    // object is const — the minting site sets both, so every const consumer
+    // [const-violation check, const-symbol init folding] sees it uniformly).
+    // Read by Pass 2's `validateConstexprDeclarator`, which enforces the 6.7.1
+    // constraints AT THE DECLARATION (compile-time-constant initializer /
+    // missing initializer / function / volatile-qualified / aggregate — each a
+    // fail-loud diagnostic, never a silent degrade to plain const). ZERO
+    // codegen reads it: a VALIDATED constexpr object lowers byte-identically to
+    // a const object with a foldable initializer (the file-scope INTERNAL
+    // linkage — C23 6.2.2p3 — rides the declaration row's `linkageSpecifiers`
+    // config, not this flag). Default false.
+    bool            isConstexpr = false;
 };
 
 // FF11 neutral-JSON shipped-library descriptor extern

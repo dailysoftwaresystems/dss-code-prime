@@ -1586,6 +1586,59 @@ integerLiteralTokenSet(EngineState const& s) {
     return out;
 }
 
+// FC17 (D-CSUBSET-CONSTEXPR): the FLOAT sibling of `integerLiteralTokenSet` —
+// this schema's `literalTypeIds` filtered to float cores. Populated ONLY into
+// the float-capable `constExprValue` consumer's context (the constexpr
+// initializer check); every integer-required consumer (array dims / enums /
+// static_assert / alignas / case labels) never passes it, so a float literal
+// stays non-foldable there (`int a[1.5+1.5]` / `_Static_assert(1.5>1.0,"")`
+// keep failing loud — the F3 no-leak wall).
+[[nodiscard]] std::unordered_set<std::uint32_t>
+floatLiteralTokenSet(EngineState const& s) {
+    std::unordered_set<std::uint32_t> out;
+    auto const isFloatKind = [](TypeKind k) noexcept {
+        return k == TypeKind::F16 || k == TypeKind::F32
+            || k == TypeKind::F64 || k == TypeKind::F128;
+    };
+    for (auto const& [tok, ty] : s.idx().literalTypeIds) {
+        if (isFloatKind(s.lattice.interner().kind(ty))) out.insert(tok);
+    }
+    return out;
+}
+
+// FC17 F2 (D-CSUBSET-CONSTEXPR / the pre-existing `_Static_assert(true)` gap):
+// token → ready-made literal for this language's FIXED-VALUE keyword literals —
+// the `literalTypes` rows carrying `value:` (C23 `true` → Bool 1 / `false` →
+// Bool 0), mirroring the CST→HIR tier's `litFixed_` build (grammar-declared
+// value, NEVER a text decode) with the SAME signedness discipline
+// (`unsignedIntRank`-keyed arm selection, the `constantLiteralForSymbol`
+// precedent). Filtered to INTEGER-VALUED cores (bool/char/integer kinds) so a
+// NullptrT-cored row (`nullptr`, value 0) is structurally EXCLUDED — `nullptr`
+// is a null pointer constant, NOT an integer constant expression, and must not
+// fold in `int a[...]` / `_Static_assert(...)` position. Reads the schema's
+// semantics directly (always present on the tree), so consumers with a null
+// `cfg` still fold keyword literals.
+[[nodiscard]] std::unordered_map<std::uint32_t, HirLiteralValue>
+fixedValueTokenMap(Tree const& tree) {
+    std::unordered_map<std::uint32_t, HirLiteralValue> out;
+    for (auto const& lt : tree.schema().semantics().literalTypes) {
+        if (!lt.fixedValue.has_value()) continue;
+        bool const integerValued = lt.core == TypeKind::Bool
+                                || lt.core == TypeKind::Char
+                                || isIntegerKind(lt.core);
+        if (!integerValued) continue;
+        HirLiteralValue v;
+        v.core = lt.core;
+        if (detail::type_rules::unsignedIntRank(lt.core) == 0) {
+            v.value = *lt.fixedValue;
+        } else {
+            v.value = static_cast<std::uint64_t>(*lt.fixedValue);
+        }
+        out.emplace(lt.literal.v, std::move(v));
+    }
+    return out;
+}
+
 // SE-arrays / D5.5-enum / D5.3-designator: evaluate a CST expression to
 // a compile-time integer constant via the shared CST const-eval engine
 // (plan 12.5 §0.2 D6). Replaces the hand-rolled "linear single-child
@@ -1620,12 +1673,27 @@ resolveConstSymbolInit(EngineState const& s, Tree const& tree,
     return CstResolvedSymbol{*initExpr, rec.scope.v};
 }
 
-[[nodiscard]] std::optional<std::int64_t>
-constIntExpr(EngineState& s, Tree const& tree, NodeId node,
-             ScopeId fromScope = {}, SemanticConfig const* cfg = nullptr) {
-    if (!node.valid()) return std::nullopt;
-    auto intLits = integerLiteralTokenSet(s);
-    CstEvalContext ctx{tree, tree.schema(), intLits, s.idx().numberStyle};
+// FC17 (D-CSUBSET-CONSTEXPR): the ONE resolver-environment builder shared by
+// `constIntExpr` (the integer-required consumers) and `constExprValue` (the
+// float-capable constexpr-initializer fold) — extracted VERBATIM from
+// constIntExpr's body so the two evaluators can never drift on what a symbol /
+// sizeof / alignof / cast / member-offset resolves to in const-expr position.
+// THE 3 MUST-KEEP INVARIANTS (audit-pinned):
+//   (1) the `fromScope.valid() && cfg != nullptr` gate — an invalid scope or a
+//       null config yields an EMPTY environment (leaf-only folding), exactly as
+//       before;
+//   (2) the scope-capture ASYMMETRY — resolveSymbolValue / resolveSymbolInit
+//       receive the DYNAMIC current scope (`curScopeOpaque`, threaded by the
+//       engine as it recurses into other symbols' init expressions), while
+//       resolveSizeof / resolveAlignof / resolveCastTarget capture the STATIC
+//       `fromScope` (a sizeof/alignof/cast TYPE resolves in the scope of the
+//       const-expr USE SITE, not of a referenced symbol's declaration);
+//   (3) the returned closures capture `s` / `tree` by reference and
+//       `cfg` / `fromScope` by value — the env is consumed within the caller's
+//       frame (both callers build it, run `evaluateConstantCst`, and return).
+[[nodiscard]] CstEvalEnvironment
+buildConstEvalEnv(EngineState& s, Tree const& tree,
+                  ScopeId fromScope, SemanticConfig const* cfg) {
     CstEvalEnvironment env;
     if (fromScope.valid() && cfg != nullptr) {
         // The resolver receives the CURRENT scope context (initially
@@ -1803,9 +1871,169 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
             return CstFieldResolution{layout->fieldOffsets[idx], frec.type};
         };
     }
+    return env;
+}
+
+[[nodiscard]] std::optional<std::int64_t>
+constIntExpr(EngineState& s, Tree const& tree, NodeId node,
+             ScopeId fromScope = {}, SemanticConfig const* cfg = nullptr) {
+    if (!node.valid()) return std::nullopt;
+    auto intLits = integerLiteralTokenSet(s);
+    // FC17 F2: the fixed-value keyword literals (`true`/`false`) fold in EVERY
+    // integer const-expr context — they are integer constant expressions per
+    // C23 6.6 (closes the pre-existing `_Static_assert(true)` gap alongside the
+    // shared evaluator's narrow-char arm). The map excludes NullptrT rows by
+    // construction. NO float set here — integer-required consumers keep floats
+    // non-foldable (the F3 wall).
+    auto fixedVals = fixedValueTokenMap(tree);
+    CstEvalContext ctx{tree, tree.schema(), intLits, s.idx().numberStyle};
+    ctx.fixedValueTokens = &fixedVals;
+    CstEvalEnvironment env = buildConstEvalEnv(s, tree, fromScope, cfg);
     ConstEvalResult const r = evaluateConstantCst(node, ctx, env, {}, fromScope.v);
     if (!r.value.has_value()) return std::nullopt;
     return asInt64Bridge(*r.value);
+}
+
+// FC17 (D-CSUBSET-CONSTEXPR): the FLOAT-CAPABLE full-value sibling of
+// `constIntExpr` — folds a constexpr object's initializer to its complete
+// compile-time `HirLiteralValue` (int / uint / bool / float arm), or nullopt
+// when it is not a compile-time constant. Differences from constIntExpr,
+// each deliberate:
+//   * `floatLiteralTokens` is populated (float literals fold at the leaf) and
+//     `EvalOptions.allowFloat` is on (float arithmetic folds — the SAME CE5
+//     engine walls the HIR-side evaluator uses), so `constexpr double PI2 =
+//     3.5 * 2;` validates — while every integer-required consumer keeps both
+//     off (the F3 no-leak walls);
+//   * returns the full `HirLiteralValue` (no asInt64Bridge) — the constexpr
+//     check needs "is it a compile-time constant", not an int64;
+//   * shares `buildConstEvalEnv` (the 6 resolvers) VERBATIM with constIntExpr,
+//     so `constexpr int N = M + 1;` resolves M exactly as `int a[M + 1]` does.
+[[nodiscard]] std::optional<HirLiteralValue>
+constExprValue(EngineState& s, Tree const& tree, NodeId node,
+               ScopeId fromScope, SemanticConfig const* cfg) {
+    if (!node.valid()) return std::nullopt;
+    auto intLits   = integerLiteralTokenSet(s);
+    auto floatLits = floatLiteralTokenSet(s);
+    auto fixedVals = fixedValueTokenMap(tree);
+    CstEvalContext ctx{tree, tree.schema(), intLits, s.idx().numberStyle};
+    ctx.floatLiteralTokens = &floatLits;
+    ctx.fixedValueTokens   = &fixedVals;
+    CstEvalEnvironment env = buildConstEvalEnv(s, tree, fromScope, cfg);
+    EvalOptions options;
+    options.allowFloat = true;
+    ConstEvalResult const r =
+        evaluateConstantCst(node, ctx, env, options, fromScope.v);
+    if (!r.value.has_value()) return std::nullopt;
+    return r.value;
+}
+
+// FC17 (D-CSUBSET-CONSTEXPR): enforce the C23 6.7.1 constexpr-object
+// constraints for ONE declarator whose symbol was Pass-1-marked `isConstexpr`.
+// Runs from pass2Post's per-declarator loop — Pass 2, NOT Pass 1.5, because a
+// bare `nullptr` initializer's type is only stamped by Pass 2's literal typing
+// (the NullptrT admission below reads it). THE EMPIRICAL DELTA vs `const`:
+// `const int x = argc;` compiles clean (const-ness is initializer-blind; the
+// fold is lazy — only an ICE consumer errors), while `constexpr int x = argc;`
+// must fail AT ITS OWN DECLARATION — this function IS that check. Every arm
+// fails loud; a constexpr declaration NEVER silently degrades to plain const.
+//   * unresolved declared type   → return (cascade — already diagnosed);
+//   * FnSig / Function symbol    → S_ConstexprFunctionNotSupported (BOTH the
+//     proto and the definition form — C23 constexpr is objects-only, and the
+//     file-scope linkage row must never silently apply to a function);
+//   * volatile-qualified OBJECT  → S_ConstexprInvalidQualifier (6.7.1p11;
+//     checked BEFORE the kind classification because `kind()` sees through
+//     VolatileQual. A volatile POINTEE — `constexpr volatile int *p` — is
+//     Ptr at the top level and correctly stays legal; an east
+//     `int * volatile p` IS a volatile object and is rejected);
+//   * Array / Struct / Union     → S_ConstexprUnsupportedType — the NAMED loud
+//     aggregate deferral (D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE; a UNIFORM
+//     boundary — `constexpr char s[] = "hi"` is deliberately NOT carved out);
+//   * missing initializer        → S_ConstexprMissingInitializer, fired PER
+//     DECLARATOR (`constexpr int a = 1, b;` errors on `b`);
+//   * Ptr                        → the initializer must be a null pointer
+//     constant: the shared `admitsNullPointerConstant` (structural `0` + the
+//     R2 folded integer-0 path, which also MARKS the node for the HIR
+//     literal-0 materialization) OR a Pass-2-stamped NullptrT (`nullptr` —
+//     mirroring the decl-init isAssignable site's admission). Anything else
+//     (`&g`; the `(T*)0` cast form = D-CSUBSET-CONSTEXPR-POINTER-CAST-NULL,
+//     a named loud deferral) → S_ConstexprNonConstantInitializer;
+//   * arithmetic scalar (integer / float / bool / char / Enum — F5: an
+//     enumerator initializer folds via the shared resolveSymbolValue arm) →
+//     the initializer must fold through `constExprValue` (float-capable,
+//     full-value) → else S_ConstexprNonConstantInitializer;
+//   * any OTHER kind             → S_ConstexprUnsupportedType (the fail-loud
+//     catch-all — never silent).
+void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
+                                 Tree const& tree, NodeId dNode,
+                                 NodeId nameNode, SymbolId sym, ScopeId here) {
+    SymbolRecord const& rec = s.symbols.at(sym);
+    TypeId const declTy = rec.type;
+    auto const emit = [&](DiagnosticCode code, NodeId at) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(at);
+        d.actual   = std::string{tree.text(at)};
+        s.reporter.report(std::move(d));
+    };
+    if (!declTy.valid()) return;   // cascade — the type failure already reported
+    TypeInterner const& in = s.lattice.interner();
+    if (in.kind(declTy) == TypeKind::FnSig
+        || rec.kind == DeclarationKind::Function) {
+        emit(DiagnosticCode::S_ConstexprFunctionNotSupported, nameNode);
+        return;
+    }
+    if (in.isVolatileQualified(declTy)) {
+        emit(DiagnosticCode::S_ConstexprInvalidQualifier, nameNode);
+        return;
+    }
+    TypeKind const k = in.kind(declTy);
+    if (k == TypeKind::Array || k == TypeKind::Struct || k == TypeKind::Union) {
+        emit(DiagnosticCode::S_ConstexprUnsupportedType, nameNode);
+        return;
+    }
+    // The initializer subtree — the Internal child of the init-declarator that
+    // is NOT the declarator (`[declarator, '=', initValue]`; the loop's own
+    // discovery pattern). A bare declarator (rule != initDeclaratorRule — the
+    // very carriers the F1 hook-hoist exists for) has no init slot at all.
+    NodeId initNode{};
+    if (cfg.declarators.has_value()
+        && tree.rule(dNode) == cfg.declarators->initDeclaratorRule) {
+        for (NodeId c : visibleChildren(tree, dNode)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            if (tree.rule(c) == cfg.declarators->declaratorRule) continue;
+            initNode = c;
+            break;
+        }
+    }
+    if (!initNode.valid()) {
+        emit(DiagnosticCode::S_ConstexprMissingInitializer, nameNode);
+        return;
+    }
+    if (k == TypeKind::Ptr) {
+        if (admitsNullPointerConstant(s, tree, declTy, initNode,
+                                      tree.schema().semantics()
+                                          .pointerConversions,
+                                      here, cfg)) {
+            return;
+        }
+        TypeId const initTy = subtreeType(s, tree, initNode, here);
+        if (initTy.valid() && in.kind(initTy) == TypeKind::NullptrT) return;
+        emit(DiagnosticCode::S_ConstexprNonConstantInitializer, initNode);
+        return;
+    }
+    bool const arithmetic =
+        k == TypeKind::Bool || k == TypeKind::Char || k == TypeKind::Byte
+        || isIntegerKind(k) || k == TypeKind::Enum
+        || k == TypeKind::F16 || k == TypeKind::F32 || k == TypeKind::F64
+        || k == TypeKind::F128;
+    if (arithmetic) {
+        if (constExprValue(s, tree, initNode, here, &cfg).has_value()) return;
+        emit(DiagnosticCode::S_ConstexprNonConstantInitializer, initNode);
+        return;
+    }
+    emit(DiagnosticCode::S_ConstexprUnsupportedType, nameNode);
 }
 
 // SE-arrays: if `decl` configures an array declarator suffix and a node of that
@@ -2049,6 +2277,37 @@ specifierPrefixNamesNoreturn(SemanticConfig const& cfg, Tree const& tree,
             for (std::string const& nm : cfg.noreturnAttributeNames)
                 if (id == nm) return true;
         }
+    }
+    return false;
+}
+
+// FC17 (D-CSUBSET-CONSTEXPR): true iff a declaration's specifier prefix carries
+// the C23 6.7.1 `constexpr` KEYWORD (a token of `cfg.constexprKeywordToken`).
+// The `specifierPrefixNamesNoreturn` mirror, KEYWORD-form only (constexpr has
+// no attribute spelling): a bounded descendant search over the STRIPPED
+// specifier prefix (the same `specifierPrefixChild` accessor the linkage /
+// alignas / noreturn scans use), matching by token-kind equality. No
+// typeof/alignas operand-opacity hazard — the keyword cannot parse inside
+// those operands (it is a declaration specifier, not an expression or
+// type-name token), so a prefix hit is always a REAL constexpr declaration.
+// Emits NOTHING: Pass 2's validateConstexprDeclarator owns every diagnostic.
+[[nodiscard]] bool
+specifierPrefixHasConstexpr(SemanticConfig const& cfg, Tree const& tree,
+                            NodeId declNode, DeclarationRule const& decl) {
+    if (!cfg.constexprKeywordToken.has_value()
+        || !cfg.constexprKeywordToken->valid()) {
+        return false;
+    }
+    NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
+    if (!prefix.valid()) return false;
+    std::vector<NodeId> stack{prefix};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId c = stack.back(); stack.pop_back();
+        if (tree.kind(c) == NodeKind::Internal) {
+            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+            continue;
+        }
+        if (tree.tokenKind(c).v == cfg.constexprKeywordToken->v) return true;
     }
     return false;
 }
@@ -3254,6 +3513,20 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // `isVolatile` token-scan is RETIRED here (it mis-fired for a
                         // pointer-to-volatile-POINTEE, marking the pointer OBJECT
                         // volatile when only the pointee is). `isConst` keeps its scan.
+                        // FC17 (D-CSUBSET-CONSTEXPR): a `constexpr` specifier in the
+                        // declaration's prefix marks EVERY declarator's symbol
+                        // (C23 6.7.1 applies the storage-class to each declared
+                        // object) and IMPLIES const (6.7.1p10 — a constexpr object
+                        // is not assignable; setting isConst here routes it through
+                        // the existing const-violation check + const-symbol init
+                        // folding uniformly). No typeof/alignas opacity hazard: the
+                        // keyword cannot parse inside those operands, so the prefix
+                        // scan (`specifierPrefixHasConstexpr`) never false-hits.
+                        // Pass 2's validateConstexprDeclarator enforces 6.7.1.
+                        if (specifierPrefixHasConstexpr(cfg, tree, node, decl)) {
+                            rec.isConstexpr = true;
+                            rec.isConst     = true;
+                        }
                         rec.isProtoDeclaration = isProto;
                         // D-CSUBSET-EXTERN-DEFINITION-MERGE: a non-defining
                         // declaration (c-subset's `extern`) — config-driven, no
@@ -5857,6 +6130,33 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     collectDeclarators(tree, kids[*carrierIdx],
                                        *cfg.declarators, declarators);
                     for (NodeId dNode : declarators) {
+                        // FC17 (D-CSUBSET-CONSTEXPR) — F1: the constexpr
+                        // enforcement hook sits ABOVE the initDeclaratorRule
+                        // gate below, because collectDeclarators admits BARE
+                        // declarator carriers (rule == declaratorRule — a
+                        // missing-initializer `constexpr int x;`, a function
+                        // declarator `constexpr int f(void) {…}`) that the
+                        // gate `continue`s past — a post-gate hook would
+                        // silently skip EXACTLY the declarators the
+                        // missing-init / function constraints exist for
+                        // (incl. wrongly giving `constexpr int f` the
+                        // file-scope internal linkage). Symbol discovery is
+                        // the loop's own idiom (declaratorNameNode +
+                        // symbolAtOr); gated on the language declaring a
+                        // constexpr surface, then on the Pass-1 mark.
+                        if (cfg.constexprKeywordToken.has_value()) {
+                            NodeId const cxName = declaratorNameNode(
+                                tree, dNode, *cfg.declarators);
+                            if (cxName.valid()) {
+                                SymbolId const cxSym = s.symbolAtOr(cxName);
+                                if (cxSym.valid()
+                                    && s.symbols.at(cxSym).isConstexpr) {
+                                    validateConstexprDeclarator(
+                                        s, cfg, tree, dNode, cxName, cxSym,
+                                        here);
+                                }
+                            }
+                        }
                         if (tree.rule(dNode)
                                 != cfg.declarators->initDeclaratorRule) {
                             continue;   // no init slot on a bare declarator

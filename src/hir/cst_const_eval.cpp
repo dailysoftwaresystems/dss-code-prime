@@ -1,5 +1,6 @@
 #include "hir/cst_const_eval.hpp"
 
+#include "core/types/char_decode.hpp"         // FC17 F2: shared narrow char-literal decode
 #include "core/types/decl_prefix_strip.hpp"   // declRoleChildren (shared specifier-prefix strip)
 #include "core/types/declarator_walk.hpp"     // FC4: collectDeclarators / declaratorNameNode
 #include "core/types/grammar_schema.hpp"
@@ -337,6 +338,21 @@ evalNode(NodeId                              expr,
     // ── Token leaves ────────────────────────────────────────────────
     if (tree.kind(expr) == NodeKind::Token) {
         SchemaTokenId const tk = tree.tokenKind(expr);
+        // FC17 F2 (D-CSUBSET-CONSTEXPR): a FIXED-VALUE keyword literal
+        // (`true`/`false` — `literalTypes` `value:` rows) carries its
+        // config-declared value; its TEXT must never be decoded as a number
+        // (mirrors the CST→HIR `litFixed_` discipline, and is checked FIRST
+        // for the same reason — `decodeInteger("true")` has no digits and
+        // would fail where the config declares a real value). The caller
+        // built the map filtered to INTEGER-VALUED cores, so a NullptrT
+        // `nullptr` row is structurally absent — `nullptr` stays
+        // non-foldable (loud) in every integer const-expr context.
+        if (ctx.fixedValueTokens != nullptr) {
+            if (auto it = ctx.fixedValueTokens->find(tk.v);
+                it != ctx.fixedValueTokens->end()) {
+                return ok(HirLiteralValue{it->second});
+            }
+        }
         if (ctx.integerLiteralTokens.contains(tk.v)) {
             auto iv = decodeInteger(tree.text(expr), ctx.numberStyle);
             if (!iv.has_value()) {
@@ -351,6 +367,28 @@ evalNode(NodeId                              expr,
                                        // suffices for the int64-arm value;
                                        // consumers use `.value`, not `.core`.
             lv.value = static_cast<std::int64_t>(*iv);
+            return ok(std::move(lv));
+        }
+        // FC17 (D-CSUBSET-CONSTEXPR): a FLOAT literal leaf — ONLY when the
+        // caller opted in by populating `floatLiteralTokens` (the float-capable
+        // constexpr-initializer consumer). Every integer-required consumer
+        // (array dims / enums / static_assert / designators) leaves the set
+        // null, so this arm is structurally unreachable there — `int a[1.5+1.5]`
+        // / `_Static_assert(1.5>1.0,"")` keep failing loud. Decodes via the
+        // SAME config-aware `decodeFloat` the CST→HIR literal lowering uses
+        // (suffix strip per numberStyle; a malformed/undecodable text fails
+        // loud, never a silent zero).
+        if (ctx.floatLiteralTokens != nullptr
+            && ctx.floatLiteralTokens->contains(tk.v)) {
+            bool decodeOk = true;
+            double const d = decodeFloat(tree.text(expr), ctx.numberStyle, decodeOk);
+            if (!decodeOk) {
+                return fail(ConstEvalFailure::NotAConstantExpression, expr);
+            }
+            HirLiteralValue lv;
+            lv.core  = TypeKind::F64;  // the fold-arithmetic core; consumers
+                                       // read `.value` (see the I32 note above)
+            lv.value = d;
             return ok(std::move(lv));
         }
         // Item 1 DIRECT-VALUE path: a named constant whose value is carried
@@ -681,6 +719,42 @@ evalNode(NodeId                              expr,
         }
         NodeId const selected = *condTrueOpt ? thenN : elseN;
         return evalImpl(selected, ctx, env, options, currentScopeOpaque, visitedInitNodes);
+    }
+
+    // FC17 F2 (D-CSUBSET-CONSTEXPR / the pre-existing `_Static_assert('a'==97)`
+    // gap): a NARROW character constant (`'a'`, `'\n'`, `'\xFF'`) in const-expr
+    // position — C 6.4.4.4 makes it an integer constant expression. SHAPE-keyed,
+    // not rule-keyed (the [opener, body] pair is the tokenizer contract): exactly
+    // two visible tokens, the first the NARROW `charStartToken`, the second the
+    // `charBodyToken` — a shape the generic wrapper-peel below cannot descend
+    // (two tokens, zero internals ⇒ it would fail NotAConstantExpression).
+    // Gated on the body token being INTEGER-cored in this consumer's set (C's
+    // `'x'` is int-typed via `literalTypes`; a language whose char constants are
+    // not integers never folds them here). Decodes via the SHARED
+    // `decodeCharLiteralBody` — the EXACT decode the CST→HIR narrow value path
+    // (`lowerCharLiteral`) runs, so const-expr and value positions can never
+    // disagree; empty / multi-char / malformed-escape bodies fail loud. A
+    // WIDE/UTF opener (`L'`/`u'`/`U'`/`u8'`) deliberately does NOT match: its
+    // element core is FORMAT-keyed and semantic-stamped (pe wchar_t = u16), and
+    // its `\x`-escape surface is a named deferral — folding it here would
+    // silently accept what the value tier fails loud on. It falls through to
+    // the generic fail below (loud, as today).
+    if (cfg.charStartToken.valid() && cfg.charBodyToken.valid()
+        && kids.size() == 2
+        && tree.kind(kids[0]) == NodeKind::Token
+        && tree.kind(kids[1]) == NodeKind::Token
+        && tree.tokenKind(kids[0]).v == cfg.charStartToken.v
+        && tree.tokenKind(kids[1]).v == cfg.charBodyToken.v
+        && ctx.integerLiteralTokens.contains(cfg.charBodyToken.v)) {
+        auto const cp = decodeCharLiteralBody(tree.text(kids[1]));
+        if (!cp.has_value()) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        HirLiteralValue lv;
+        lv.core  = TypeKind::I32;  // C 6.4.4.4: a char constant has type `int`;
+                                   // consumers read `.value` (the leaf-arm note)
+        lv.value = static_cast<std::int64_t>(*cp);
+        return ok(std::move(lv));
     }
 
     // Wrapper rule: any internal node with exactly one meaningful child

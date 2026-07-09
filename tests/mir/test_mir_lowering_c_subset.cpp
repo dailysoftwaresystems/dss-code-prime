@@ -1277,6 +1277,46 @@ TEST(MirLoweringCSubsetLinkage, StaticNoreturnKeepsInternalLinkage) {
     }
 }
 
+// FC17 (D-CSUBSET-CONSTEXPR) linkage: C23 6.2.2p3 (N3096) gives a FILE-scope
+// object declared `constexpr` INTERNAL linkage — constexpr joins `static` in
+// the 6.2.2p3 list. The config carrier is topLevelDecl's
+// `linkageSpecifiers["constexpr"] = {binding:local}` (the keyword TEXT keys the
+// map, like "static"); a co-present explicit `static` composes IDEMPOTENTLY
+// (both entries map to local — last-wins is a no-op, NOT the noreturn
+// {binding:global}-clobber hazard). The plain-`const` contrast arm pins that
+// the internal linkage comes from CONSTEXPR, not from const-ness.
+// RED-ON-DISABLE: drop the "constexpr" linkageSpecifiers entry from
+// c-subset.lang.json and the bare-constexpr arm's binding flips Global → RED.
+TEST(MirLoweringCSubsetLinkage, FileScopeConstexprGetsInternalLinkage) {
+    struct Arm { char const* src; SymbolBinding want; char const* why; };
+    for (Arm const& arm : {
+             Arm{"constexpr int M = 3;\n"
+                 "int main(void){ return M; }\n",
+                 SymbolBinding::Local,
+                 "bare file-scope constexpr must bind Local (C23 6.2.2p3)"},
+             Arm{"static constexpr int M = 3;\n"
+                 "int main(void){ return M; }\n",
+                 SymbolBinding::Local,
+                 "static + constexpr compose idempotently to Local"},
+             Arm{"const int M = 3;\n"
+                 "int main(void){ return M; }\n",
+                 SymbolBinding::Global,
+                 "plain const keeps EXTERNAL linkage — the contrast arm"}}) {
+        auto L = lowerCSubset(arm.src);
+        ASSERT_FALSE(L.model.hasErrors()) << arm.src << "\n"
+            << (L.model.diagnostics().all().empty()
+                    ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.hir->ok) << arm.src << "\n"
+            << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+        ASSERT_TRUE(L.mir.ok) << arm.src << "\n"
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleGlobalCount(), 1u) << arm.src;
+        EXPECT_EQ(m.globalBinding(m.globalAt(0)), arm.want)
+            << arm.src << "\n" << arm.why;
+    }
+}
+
 // D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC (cycle 14): an UNRECOGNIZED
 // specifier inside `__attribute__((...))` — a typo (`bogus`) or an unsupported
 // attribute — FAILS LOUD (H_UnknownLinkageSpecifier), never silently ignored. The

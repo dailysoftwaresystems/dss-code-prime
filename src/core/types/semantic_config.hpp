@@ -1298,6 +1298,20 @@ struct DSS_EXPORT SemanticConfig {
     // config; the engine never hardcodes the spelling "noreturn".
     std::optional<SchemaTokenId> noreturnKeywordToken;
     std::vector<std::string>     noreturnAttributeNames;
+    // FC17 (D-CSUBSET-CONSTEXPR): the C23 6.7.1 `constexpr` OBJECT storage-class
+    // KEYWORD token. Pass 1 scans a declaration's specifier prefix for it
+    // (`specifierPrefixHasConstexpr`, the `specifierPrefixNamesNoreturn` mirror)
+    // and marks each declared symbol `isConstexpr` (implies `isConst`); Pass 2's
+    // `validateConstexprDeclarator` then enforces the 6.7.1 constraints AT THE
+    // DECLARATION (compile-time-constant initializer / no missing initializer /
+    // no function declarator / no volatile-qualified object / aggregate types a
+    // named loud deferral). Unset ⇒ the language has no `constexpr` surface (the
+    // scan never runs — toy/tsql). Source-AGNOSTIC: WHICH token is per-language
+    // config; the engine never hardcodes the spelling "constexpr". Linkage is a
+    // SEPARATE, ALSO config-driven axis: the C23 6.2.2p3 file-scope INTERNAL
+    // linkage rides the declaration row's `linkageSpecifiers` map (keyword text →
+    // {binding:local}), not this token.
+    std::optional<SchemaTokenId> constexprKeywordToken;
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. `vaArgRule`
     // = the `va_arg(ap,T)` form; pass 2 resolves+stamps its `vaArgTypeChild`
     // castTypeRef (so the HIR lowering recovers the read type T) + stamps the node

@@ -7098,3 +7098,326 @@ TEST(SemanticAnalyzerCSubset, EnumUnderlyingBareIdentifierWidthRollsBackToBitfie
                         DiagnosticCode::S_InvalidEnumUnderlyingType), 0u)
         << "`: W3` (a value) must NOT be treated as an underlying type";
 }
+
+// ── FC17 (D-CSUBSET-CONSTEXPR): C23 6.7.1 `constexpr` OBJECT storage-class ──
+//
+// THE EMPIRICAL DELTA vs `const` (the feature's reason to exist): `const` is
+// initializer-blind — `const int x = argc;` compiles clean and only an ICE
+// consumer errors lazily — while `constexpr` must fail AT ITS OWN DECLARATION
+// when the initializer is not a compile-time constant (6.7.1p10). The pair
+// below pins BOTH sides so the delta can never silently collapse.
+// RED-ON-DISABLE: bypass the Pass-2 validateConstexprDeclarator hook and the
+// constexpr arm goes green-on-argc (0 diagnostics) → the EXPECT_EQ(…, 1u) reds.
+TEST(SemanticAnalyzerCSubset, ConstexprDeltaVsConst) {
+    auto constModel = analyzeShipped("c-subset", {
+        "int main(int argc, char **argv) { const int x = argc; return x; }\n",
+    });
+    EXPECT_FALSE(constModel.hasErrors())
+        << "`const int x = argc;` is legal C — const is initializer-blind";
+    auto cxModel = analyzeShipped("c-subset", {
+        "int main(int argc, char **argv) { constexpr int x = argc; return x; }\n",
+    });
+    EXPECT_EQ(countCode(cxModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
+        << "`constexpr int x = argc;` must fail AT THE DECLARATION";
+}
+
+// A folding constexpr is accepted AND usable in constant-expression position:
+// `constexpr int N = 5;` dimensions `int a[N]` exactly as a const would — plus
+// the symbol carries BOTH Pass-1 marks (isConstexpr + the implied isConst).
+// RED-ON-DISABLE: drop the `specifierPrefixHasConstexpr` minting and the flag
+// EXPECTs red (and every enforcement test in this block stops firing).
+TEST(SemanticAnalyzerCSubset, ConstexprFoldsAndMarksSymbol) {
+    auto model = analyzeShipped("c-subset", {
+        "constexpr int N = 5;\n"
+        "int main(void) { int a[N]; return sizeof(a); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* nRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == "N") nRec = &model.symbols()[i];
+    }
+    ASSERT_NE(nRec, nullptr);
+    EXPECT_TRUE(nRec->isConstexpr) << "Pass 1 must mark the symbol constexpr";
+    EXPECT_TRUE(nRec->isConst) << "constexpr implies const (6.7.1p10)";
+    // The array dimensioned through the constexpr constant.
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    }
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_TRUE(aRec->type.valid());
+    auto const& ti = model.lattice().interner();
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 5);
+}
+
+// F2 (the shared-evaluator char/bool leaf arms): a constexpr char / bool object
+// folds its keyword/char-constant initializer. RED-ON-DISABLE: remove the
+// evaluator's fixed-value / narrow-char arms and both go S0037-red.
+TEST(SemanticAnalyzerCSubset, ConstexprCharAndBoolFold) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { constexpr char c = 'a'; constexpr bool b = true; "
+        "return c + b; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "'a' and true are integer constant expressions (C23 6.6)";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 0u);
+}
+
+// F2 flip — the pre-existing static_assert gaps the shared-evaluator leaf arms
+// close: `_Static_assert('a'==97)` and `_Static_assert(true)` FAILED S0029 at
+// HEAD (empirically confirmed pre-change) because the CST evaluator's leaf only
+// decoded integer-set tokens. Both now fold. RED-ON-DISABLE: remove either leaf
+// arm and its assert reds.
+TEST(SemanticAnalyzerCSubset, StaticAssertCharLiteralConditionFolds) {
+    auto model = analyzeShipped("c-subset", {
+        "_Static_assert('a' == 97, \"char folds\");\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "'a' is an integer character constant (value 97) — must fold";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+TEST(SemanticAnalyzerCSubset, StaticAssertTrueKeywordConditionFolds) {
+    auto model = analyzeShipped("c-subset", {
+        "_Static_assert(true, \"true folds\");\n"
+        "_Static_assert(!false, \"false folds\");\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "true/false are config-declared fixed-value keyword literals";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// F3 no-leak walls: the float capability added FOR constexpr must NOT leak into
+// integer-required consumers — a float in a static_assert condition / an array
+// dimension stays non-constant. RED-ON-DISABLE: populate floatLiteralTokens (or
+// flip allowFloat) in constIntExpr's context and both EXPECTs red.
+TEST(SemanticAnalyzerCSubset, FloatDoesNotLeakIntoIntegerConstExprConsumers) {
+    auto saModel = analyzeShipped("c-subset", {
+        "_Static_assert(1.5 > 1.0, \"floats are not ICEs\");\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(saModel.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u)
+        << "a float condition is NOT an integer constant expression (C 6.7.10)";
+    auto dimModel = analyzeShipped("c-subset", {
+        "int main(void) { int a[1.5 + 1.5]; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(dimModel.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 1u)
+        << "a float array dimension must stay S_NonConstantArrayLength";
+}
+
+// The fixed-value map excludes NullptrT rows BY CONSTRUCTION: `nullptr`
+// (literalTypes value 0, core NullptrT) is a null pointer constant, NOT an
+// integer constant expression — it must not fold in integer const-expr
+// position. RED-ON-DISABLE: drop the integer-valued-core filter in
+// fixedValueTokenMap and both EXPECTs red (nullptr would fold to 0).
+TEST(SemanticAnalyzerCSubset, NullptrStaysNonFoldableInIntegerConstExpr) {
+    auto dimModel = analyzeShipped("c-subset", {
+        "int main(void) { int a[nullptr]; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(dimModel.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 1u);
+    auto saModel = analyzeShipped("c-subset", {
+        "_Static_assert(nullptr, \"nullptr is not an ICE\");\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(saModel.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u);
+}
+
+// F4 — constexpr is the OBJECT storage-class: BOTH function forms fail loud.
+// The DEFINITION form is the F1 hook-hoist witness: a function definition's
+// declarator is a BARE declarator carrier (no init slot), which the loop's
+// `rule != initDeclaratorRule` gate skips — a post-gate hook would silently
+// accept it (and the file-scope linkage row would wrongly give it INTERNAL
+// linkage). RED-ON-DISABLE: move the hook below the gate and the definition
+// arm reds while the proto arm stays green.
+TEST(SemanticAnalyzerCSubset, ConstexprFunctionFormsFailLoud) {
+    auto protoModel = analyzeShipped("c-subset", {
+        "constexpr int f(void);\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(protoModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprFunctionNotSupported), 1u)
+        << "a constexpr function PROTOTYPE must fail loud";
+    auto defModel = analyzeShipped("c-subset", {
+        "constexpr int f(void) { return 1; }\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(defModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprFunctionNotSupported), 1u)
+        << "a constexpr function DEFINITION must fail loud (the F1 hoist "
+           "witness — its declarator is a bare carrier the init gate skips)";
+}
+
+// F4 — missing initializer fires PER DECLARATOR: `a` folds fine, `b` has no
+// init slot at all (a bare declarator in the list).
+TEST(SemanticAnalyzerCSubset, ConstexprMissingInitializerFiresPerDeclarator) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { constexpr int a = 1, b; return a; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstexprMissingInitializer), 1u)
+        << "exactly one missing-init — on `b`, not `a`";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 0u)
+        << "`a = 1` folds — no false non-constant on the initialized slot";
+}
+
+// F4 — `for (constexpr int i = 0; ...)` is VALID C23 (6.8.5p3 admits
+// auto/register/constexpr in a for-init; forDecl reuses localDeclSpecifiers so
+// it parses, and forDecl has NO linkageSpecifiers so linkageFrom's empty-map
+// early-return keeps it linkage-silent).
+TEST(SemanticAnalyzerCSubset, ConstexprInForInitAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { for (constexpr int i = 0;;) { return i; } }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "C23 6.8.5p3 explicitly admits constexpr in a for-init declaration";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticStorageInForInit), 0u)
+        << "the for-init static gate must NOT fire on constexpr";
+}
+
+// F4 — the volatile pair (C23 6.7.1p11): a volatile-qualified OBJECT type is
+// rejected; a volatile POINTEE stays legal (the object is the pointer). The
+// east-volatile form (`int * volatile p`) IS a volatile object — rejected.
+TEST(SemanticAnalyzerCSubset, ConstexprVolatileObjectRejectedPointeeLegal) {
+    auto badModel = analyzeShipped("c-subset", {
+        "int main(void) { constexpr volatile int v = 1; return v; }\n",
+    });
+    EXPECT_EQ(countCode(badModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprInvalidQualifier), 1u)
+        << "a volatile-qualified constexpr OBJECT violates 6.7.1p11";
+    auto okModel = analyzeShipped("c-subset", {
+        "int main(void) { constexpr volatile int *p = nullptr; "
+        "return p == 0 ? 0 : 1; }\n",
+    });
+    EXPECT_EQ(countCode(okModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprInvalidQualifier), 0u)
+        << "a volatile POINTEE is legal — the constexpr object is the pointer";
+    EXPECT_FALSE(okModel.hasErrors());
+    auto eastModel = analyzeShipped("c-subset", {
+        "int main(void) { constexpr int * volatile p = nullptr; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(eastModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprInvalidQualifier), 1u)
+        << "east `int * volatile p` IS a volatile-qualified object — rejected";
+}
+
+// F5 — an ENUM-typed constexpr is admitted as arithmetic: the enumerator
+// initializer folds through the shared resolveSymbolValue direct-value arm.
+TEST(SemanticAnalyzerCSubset, ConstexprEnumTypedAdmitted) {
+    auto model = analyzeShipped("c-subset", {
+        "enum Color { RED = 3, GREEN };\n"
+        "int main(void) { constexpr enum Color c = GREEN; return c; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "an enumerator is a compile-time constant — enum constexpr folds";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 0u);
+}
+
+// Float-capable folding (the constExprValue arm): a float constexpr with a
+// folding arithmetic initializer validates, including combined with `static`.
+// RED-ON-DISABLE: revert the floatLiteralTokens population in constExprValue
+// and this reds S0037 (the leaf would refuse the float literal).
+TEST(SemanticAnalyzerCSubset, ConstexprFloatFolds) {
+    auto model = analyzeShipped("c-subset", {
+        "static constexpr double PI2 = 3.5 * 2;\n"
+        "int main(void) { return (int)PI2; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "3.5 * 2 folds under allowFloat — the float-capable constexpr arm";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 0u);
+}
+
+// Pointer arm: nullptr and the folded integer-0 forms are null pointer
+// constants (accepted); an address-of initializer is not a compile-time
+// constant here (fail loud). The `(T*)0` cast form is the named loud deferral
+// D-CSUBSET-CONSTEXPR-POINTER-CAST-NULL (falls into the same fail-loud arm).
+TEST(SemanticAnalyzerCSubset, ConstexprPointerNullFormsAcceptedAddressRejected) {
+    auto okModel = analyzeShipped("c-subset", {
+        "constexpr int *p1 = nullptr;\n"
+        "constexpr int *p2 = 0;\n"
+        "int main(void) { return p1 == p2 ? 0 : 1; }\n",
+    });
+    EXPECT_FALSE(okModel.hasErrors())
+        << "nullptr and integer-0 are null pointer constants (C 6.3.2.3p3)";
+    auto badModel = analyzeShipped("c-subset", {
+        "int g;\n"
+        "constexpr int *p = &g;\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(badModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
+        << "&g is an address constant, not a supported constexpr pointer init";
+}
+
+// Aggregate deferral (D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE): array/struct/union
+// constexpr objects fail loud — a UNIFORM boundary (the char-array string form
+// is deliberately not carved out).
+TEST(SemanticAnalyzerCSubset, ConstexprAggregateTypesFailLoud) {
+    auto arrModel = analyzeShipped("c-subset", {
+        "constexpr int a[3] = {1, 2, 3};\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(arrModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprUnsupportedType), 1u);
+    auto strModel = analyzeShipped("c-subset", {
+        "constexpr char s[] = \"hi\";\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(strModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprUnsupportedType), 1u)
+        << "the char-array-from-string form keeps the UNIFORM boundary";
+    auto structModel = analyzeShipped("c-subset", {
+        "struct S { int x; };\n"
+        "struct S s0;\n"
+        "int main(void) { constexpr struct S s = s0; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(structModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprUnsupportedType), 1u);
+}
+
+// isConstexpr IMPLIES isConst end-to-end: assigning to a constexpr object is
+// rejected by the EXISTING const-violation machinery (code-audit MEDIUM-3 pin —
+// the flag pin alone doesn't prove the assignment path fires).
+TEST(SemanticAnalyzerCSubset, ConstexprAssignmentRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { constexpr int x = 5; x = 6; return x; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstViolation), 1u)
+        << "a constexpr object is implicitly const — assignment must reject";
+}
+
+// ACCEPTING-PIN (D-CSUBSET-CONSTEXPR-EXACT-REPRESENTABILITY, code-audit
+// MEDIUM-1): C23 6.7.1p10 requires the initializer's value be EXACTLY
+// representable in the declared type — `constexpr int x = 1.5;` and
+// `constexpr unsigned u = -1;` are constraint violations under GCC/Clang.
+// DSS currently ACCEPTS both (the fold succeeds; the stored value matches the
+// plain-const equivalent — a silent-accept of invalid C23, NOT a miscompile).
+// This pin DOCUMENTS the boundary; when the deferral closes, it flips red and
+// is updated deliberately (the gated-deferral discipline).
+TEST(SemanticAnalyzerCSubset, ConstexprExactRepresentabilityCurrentlyUnenforced) {
+    auto fracModel = analyzeShipped("c-subset", {
+        "int main(void) { constexpr int x = 1.5; return x; }\n",
+    });
+    EXPECT_FALSE(fracModel.hasErrors())
+        << "documents the OPEN 6.7.1p10 boundary — update when the deferral closes";
+    auto negModel = analyzeShipped("c-subset", {
+        "int main(void) { constexpr unsigned int u = -1; return 0; }\n",
+    });
+    EXPECT_FALSE(negModel.hasErrors())
+        << "documents the OPEN 6.7.1p10 boundary — update when the deferral closes";
+}
