@@ -559,7 +559,7 @@ heap-allocated `std::vector` and reset it AFTER `finish()` (see
 - Seven typed views + `well_known_names.hpp`.
 - End-to-end integration test exercising the full stack against `toy.lang.json`.
 - Onboarding docs (`docs/tree-model.md`, `docs/language-config-spec.md`).
-- **531 ctest cases across 26 suites, 100% pass.** (v1 T0–T12 baseline + v2 PR0–PR8 + SH1–SH4.)
+- **531 ctest cases across 26 suites, 100% pass.** (v1 T0–T12 baseline + v2 PR0–PR8 + SH1–SH4.) (historical v1/v2 baseline; the current suite is 604 — see plan-00 §0.)
 - **Schema-expressiveness v2 (PR0–PR8): done.** Operator precedence + arity (`OperatorTable`),
   contextual keywords + `reservedWordPolicy`, `scopeRequire` (anyOf/forbid/topMustBe/outermost),
   `TreeBuilder::Checkpoint` + speculative-alt loader plumbing, `lexerModes` + `LexerModeStack` +
