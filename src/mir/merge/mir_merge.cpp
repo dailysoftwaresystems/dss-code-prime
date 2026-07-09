@@ -295,9 +295,13 @@ private:
     // through `local_` and `payload`/`flags` copied verbatim.
     void emitValue(MirOpcode op, MirInstId id) {
         if (op == MirOpcode::Arg) {
+            // Thread the flat call-operand position (arg_payload.hpp) — the
+            // 2-TU path optimizes POST-merge, so a position wipe here would
+            // resurface the mixed-class inline miscompile on merged modules
+            // (sqlite is 2-TU). D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP.
             local_.emplace(id.v,
                 dst_.addArg(src_.argIndex(id), reType(src_.instType(id)),
-                            src_.instFlags(id)));
+                            src_.argPosition(id), src_.instFlags(id)));
             return;
         }
         if (op == MirOpcode::Const) {
@@ -334,8 +338,13 @@ private:
         std::vector<MirInstId> newOps;
         newOps.reserve(ops.size());
         for (MirInstId const o : ops) newOps.push_back(mapValue(o, id));
+        // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: carry the secondary payload (the
+        // Alloca's effective alignment) across the cross-CU merge — a generic
+        // copy that dropped it would silently under-align an over-aligned local
+        // in a multi-CU build.
         local_.emplace(id.v, dst_.addInst(op, newOps, reType(src_.instType(id)),
-                                          src_.instPayload(id), src_.instFlags(id)));
+                                          src_.instPayload(id), src_.instFlags(id),
+                                          src_.instPayload2(id)));
     }
 
     // The merged symbol a GlobalAddr should reference. A GlobalAddr naming a
@@ -691,7 +700,11 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
 
             (void)builder.addGlobal(ty, mergedSym, newInitLit, newInitFunc,
                                     m.globalBinding(g), m.globalVisibility(g),
-                                    m.globalIsConst(g));
+                                    m.globalIsConst(g),
+                                    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: carry
+                                    // the global's explicit alignment across the
+                                    // cross-CU merge.
+                                    m.globalAlignmentBytes(g));
         }
     }
 

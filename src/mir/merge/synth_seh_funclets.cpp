@@ -404,7 +404,12 @@ parentAllocaSlotIds(Mir const& mir, MirFuncId fn) {
                     newOps.push_back(*m);
                 }
                 map[oldId.v] = builder.addInst(op, newOps, mir.instType(oldId),
-                                               mir.instPayload(oldId));
+                                               mir.instPayload(oldId),
+                                               mir.instFlags(oldId),
+                                               // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN:
+                                               // carry the Alloca alignment channel
+                                               // if the filter body declares a local.
+                                               mir.instPayload2(oldId));
                 break;
             }
         }

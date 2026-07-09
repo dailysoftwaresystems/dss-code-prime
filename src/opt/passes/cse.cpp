@@ -5,10 +5,12 @@
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
 #include "opt/analysis/mir_alias.hpp"
+#include "opt/analysis/mir_memory_clobbers.hpp"
 #include "opt/passes/mir_rebuild_helper.hpp"
 #include "opt/passes/path_compress.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -21,8 +23,7 @@ namespace dss::opt::passes {
 namespace {
 
 using dss::opt::analysis::StrictTbaa;
-using dss::opt::analysis::mirRegionBetween;
-using dss::opt::analysis::mirAnyMayAliasingStoreInRegion;
+using dss::opt::analysis::MirMemoryClobbers;
 
 // Hash-key for a CSE-candidate instruction. Operands are stored in
 // canonical order (sorted for commutative 2-operand ops) so the two
@@ -71,10 +72,12 @@ struct CseKeyHash {
 // alias-clobber check are consulted at the use site).
 //
 // Load admission (cycle 10b): Load IS a CSE candidate now. The use
-// site additionally walks `mirAnyMayAliasingStoreInRegion` between
-// the canonical Load's block and the current Load's block before
-// admitting the CSE — this is the alias-safety gate that replaces
-// the prior blanket exclusion.
+// site additionally checks the pass-wide `MirMemoryClobbers` index for
+// a may-aliasing clobber between the canonical Load and the current
+// Load (D-OPT-MEMORYSSA-CLOBBER-WALK — enumeration-identical to the
+// reference `mirAnyMayAliasingStoreInRegion` walk) before admitting
+// the CSE — this is the alias-safety gate that replaces the prior
+// blanket exclusion.
 [[nodiscard]] bool isCseCandidateOpcode(MirOpcode op) noexcept {
     if (isTerminator(op)) return false;
     if (isPhi(op)) return false;
@@ -100,7 +103,17 @@ public:
         return instructionsCsed_;
     }
 
-    void analyze(MirFuncId fn);
+    // `preds` = `mirBuildPredecessors(mir)` for the SAME module, computed ONCE by
+    // runCse and threaded in (invariant across every function in one Cse pass), so
+    // the whole-module predecessor build is not repeated per function / per query.
+    // `clobbers` = the pass-wide memory-clobber index (D-OPT-MEMORYSSA-CLOBBER-WALK)
+    // built ONCE beside `preds` — the Load-admission gate queries it instead of
+    // re-walking the CFG + re-scanning every instruction per Load query.
+    // `domScratch` = the pass-wide reusable dominator scratch
+    // (D-OPT-DOMTREE-SCRATCH-REUSE) — byte-identical dom trees without the
+    // per-function whole-module allocation storm.
+    void analyze(MirFuncId fn, std::vector<std::vector<MirBlockId>> const& preds,
+                 MirMemoryClobbers const& clobbers, MirDomScratch& domScratch);
 
     [[nodiscard]] std::vector<MirBlockId>
     selectBlocks(Mir const& src, MirFuncId fn) override {
@@ -145,19 +158,38 @@ private:
     // with a scoped value-numbering table; path-compressed after.
     std::unordered_map<MirInstId, MirInstId> cseMap_;
     std::size_t instructionsCsed_ = 0;
+
+public:
+    // Env-gated DSS_OPT_TRACE sub-timing accumulators (read by runCse's
+    // one-line-per-pass-call trace; zero-cost when the trace is off).
+    std::uint64_t traceDomNs = 0;
 };
 
-void CsePolicy::analyze(MirFuncId fn) {
+void CsePolicy::analyze(MirFuncId fn,
+                        std::vector<std::vector<MirBlockId>> const& preds,
+                        MirMemoryClobbers const& clobbers,
+                        MirDomScratch& domScratch) {
     resetPerFunction();
     std::uint32_t const blockCount = src_.funcBlockCount(fn);
     if (blockCount == 0) return;
 
-    // Build the dom tree. CSE only walks reachable blocks (RPO).
+    // Build the dom tree. CSE only walks reachable blocks (RPO). `preds` is the
+    // caller's precomputed whole-module predecessor map (invariant this pass);
+    // the scratch-backed dom/children are byte-identical to the fresh path and
+    // valid until the NEXT analyze() call (function-local use only — const&
+    // binding, per the D-OPT-DOMTREE-SCRATCH-REUSE contract).
     MirBlockId const entry = src_.funcEntry(fn);
+    static bool const trace = std::getenv("DSS_OPT_TRACE") != nullptr;
+    auto const tDom0 = trace ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
     auto const rpo = mirReversePostOrder(src_, entry);
-    auto const preds = mirBuildPredecessors(src_);
-    auto const dom = computeMirDomTree(src_, entry, rpo, preds);
-    auto const dchild = mirDomTreeChildren(src_, dom);
+    auto const& dom = computeMirDomTree(src_, entry, rpo, preds, domScratch);
+    auto const& dchild = mirDomTreeChildren(src_, dom, domScratch);
+    if (trace) {
+        traceDomNs += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tDom0).count());
+    }
 
     // Iterative dom-tree DFS with Visit/Leave frame stack. Scoped
     // value-numbering table: entries added during a block's Visit are
@@ -211,7 +243,9 @@ void CsePolicy::analyze(MirFuncId fn) {
                 // canonical Load is sound only if no may-aliasing Store
                 // sits anywhere between them. We scan three slices
                 // owned by the caller (this site) plus the strictly-
-                // between region owned by `mirRegionBetween`:
+                // between region owned by the clobber index's
+                // `anyClobberBetween` (same fwd∩bwd region as the
+                // reference `mirRegionBetween`, memoized):
                 //   — canonical's block tail (after canonical, to end)
                 //   — strictly-between blocks (region walker)
                 //   — useBlock's head (start, up to current)
@@ -264,25 +298,21 @@ void CsePolicy::analyze(MirFuncId fn) {
                         std::abort();
                     }
 
-                    // c113 (audit-F1): the in-block slices funnel through
-                    // the SAME per-instruction predicate as the region
-                    // walker (`mirInstClobbersLoadPtr` — precise for
-                    // Stores, opaque clobber for the `opcodeClobbersMemory`
-                    // ops: Call / IntrinsicCall / AtomicCas /
-                    // CompilerBarrier), so the two scan sites can never
-                    // disagree on what clobbers.
+                    // c113 (audit-F1): every slice funnels through the SAME
+                    // per-instruction predicate (`mirInstClobbersLoadPtr` —
+                    // precise for Stores, opaque clobber for the
+                    // `opcodeClobbersMemory` ops), called at QUERY time by the
+                    // clobber index — the scan sites can never disagree on
+                    // what clobbers. The index only pre-filters the
+                    // ENUMERATION to actual clobbers (a non-clobber can never
+                    // satisfy the predicate) and memoizes the CFG reachability
+                    // (D-OPT-MEMORYSSA-CLOBBER-WALK).
                     auto storesClobber = [&](MirBlockId blk,
                                              std::uint32_t lo,
                                              std::uint32_t hi) -> bool {
-                        for (std::uint32_t j = lo; j < hi; ++j) {
-                            if (dss::opt::analysis::mirInstClobbersLoadPtr(
-                                    src_, interner_, loadPtr,
-                                    src_.blockInstAt(blk, j),
-                                    strictTbaa_, charTypesAliasAll_)) {
-                                return true;
-                            }
-                        }
-                        return false;
+                        return clobbers.anyClobberInBlockRange(
+                            interner_, loadPtr, blk, lo, hi,
+                            strictTbaa_, charTypesAliasAll_);
                     };
 
                     if (canonicalBlock.v == B.v) {
@@ -311,15 +341,11 @@ void CsePolicy::analyze(MirFuncId fn) {
                         if (storesClobber(canonicalBlock, canonicalIdx + 1, cn)) {
                             admit = false;
                         }
-                        if (admit) {
-                            auto const region = mirRegionBetween(
-                                src_, canonicalBlock, B);
-                            if (mirAnyMayAliasingStoreInRegion(
-                                    src_, interner_, loadPtr, region,
-                                    strictTbaa_,
-                                    charTypesAliasAll_)) {
-                                admit = false;
-                            }
+                        if (admit
+                            && clobbers.anyClobberBetween(
+                                   interner_, loadPtr, canonicalBlock, B,
+                                   strictTbaa_, charTypesAliasAll_)) {
+                            admit = false;
                         }
                         if (admit && storesClobber(B, 0, i)) {
                             admit = false;
@@ -367,11 +393,55 @@ CseResult runCse(Mir& mir, TypeInterner const& interner,
 
     CsePolicy policy{mir, interner};
     std::size_t const nf = mir.moduleFuncCount();
+    // Compute the whole-module predecessor map + the memory-clobber index ONCE
+    // for the entire pass — both are invariant while `mir` is read-only (the
+    // rebuild writes a SEPARATE builder, finalized only after this loop at
+    // `mir = ...finish()`). The preds hoist removed the O(numFunctions ×
+    // moduleSize) rebuild (D-OPT-CSE-ANALYSIS-HOIST); the clobber index removes
+    // the per-Load-query CFG re-walk + every-instruction region scans
+    // (D-OPT-MEMORYSSA-CLOBBER-WALK) — the Load-admission alias tests now touch
+    // only actual clobbers via memoized reachability.
+    static bool const trace = std::getenv("DSS_OPT_TRACE") != nullptr;
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto msSince = [](std::chrono::steady_clock::time_point t0) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - t0).count();
+    };
+    auto const tSetup = now();
+    auto const preds = mirBuildPredecessors(mir);
+    MirMemoryClobbers const clobbers{mir, preds};
+    MirDomScratch domScratch;   // one per pass call (D-OPT-DOMTREE-SCRATCH-REUSE)
+    long long const setupMs = trace ? msSince(tSetup) : 0;
+    std::uint64_t analyzeNs = 0, rebuildNs = 0;
     for (std::uint32_t i = 0; i < nf; ++i) {
         MirFuncId const f = mir.funcAt(i);
-        policy.analyze(f);
-        MirFunctionRebuilder rb{mir, builder, policy};
-        rb.rebuildFunction(f);
+        auto const tA = trace ? now() : std::chrono::steady_clock::time_point{};
+        policy.analyze(f, preds, clobbers, domScratch);
+        if (trace) {
+            auto const tR = now();
+            analyzeNs += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(tR - tA)
+                    .count());
+            MirFunctionRebuilder rb{mir, builder, policy};
+            rb.rebuildFunction(f);
+            rebuildNs += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now() - tR)
+                    .count());
+        } else {
+            MirFunctionRebuilder rb{mir, builder, policy};
+            rb.rebuildFunction(f);
+        }
+    }
+    if (trace) {
+        std::fprintf(stderr,
+            "opt:   Cse sub: preds+index=%lldms analyze=%llums (dom=%llums "
+            "vn=%llums) rebuild=%llums\n",
+            setupMs,
+            static_cast<unsigned long long>(analyzeNs / 1000000u),
+            static_cast<unsigned long long>(policy.traceDomNs / 1000000u),
+            static_cast<unsigned long long>(
+                (analyzeNs - std::min(analyzeNs, policy.traceDomNs)) / 1000000u),
+            static_cast<unsigned long long>(rebuildNs / 1000000u));
     }
 
     result.instructionsCsed = policy.instructionsCsed();

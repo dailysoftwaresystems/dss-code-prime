@@ -351,8 +351,28 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
                 return std::nullopt;
             }
             if (op == MirOpcode::Return) hasReturn = true;
-            if (op == MirOpcode::Arg && mir.argIndex(cid) >= callArgCount) {
-                return std::nullopt;  // arg index out of range → refuse
+            if (op == MirOpcode::Arg) {
+                // Gate on the FLAT call-operand POSITION (arg_payload.hpp), not
+                // the per-class ordinal — the ordinal gate was both mis-keyed
+                // (mixed-class actuals) AND weak (a 1-actual call passes
+                // `fpr#0 < 1`). A position past the actuals is a structural
+                // call/signature mismatch → refuse.
+                std::uint32_t const pos = mir.argPosition(cid);
+                if (pos >= callArgCount) {
+                    return std::nullopt;
+                }
+                // Type-consistency backstop (design-audit F6): the actual at
+                // this position must share the Arg's MIR type. This bug class
+                // ALWAYS crosses GPR/FPR (disjoint MIR type kinds), so a type
+                // mismatch here catches every instance at the gate. Refuse (a
+                // cross-TU mismatched-prototype UB program stays compilable),
+                // matching the gate's conservative-refusal discipline; the
+                // splice keeps an out-of-range abort as the last backstop.
+                MirInstId const actual = callOps[1 + pos];
+                if (mir.instType(cid).valid() && mir.instType(actual).valid()
+                    && mir.instType(cid).v != mir.instType(actual).v) {
+                    return std::nullopt;
+                }
             }
         }
     }
@@ -454,13 +474,18 @@ void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
                     std::unordered_map<std::uint32_t, MirInstId>& local,
                     MirFuncId callee, bool& malformed) {
     if (cop == MirOpcode::Arg) {
-        std::uint32_t const idx = src.argIndex(cid);
-        if (idx >= actualArgs.size()) {
+        // Map by the FLAT call-operand POSITION, not the per-class ordinal —
+        // a mixed int+FP callee has BOTH a gpr#0 and an fpr#0, so the ordinal
+        // is ambiguous and mapping by it splices the wrong actual (the
+        // release-pipeline miscompile: `(int)x` reading the int arg).
+        // D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP.
+        std::uint32_t const pos = src.argPosition(cid);
+        if (pos >= actualArgs.size()) {
             malformed = true;
             if (!actualArgs.empty()) local.emplace(cid.v, actualArgs[0]);
             return;
         }
-        local.emplace(cid.v, actualArgs[idx]);
+        local.emplace(cid.v, actualArgs[pos]);
         return;
     }
     if (cop == MirOpcode::Const) {
@@ -490,7 +515,13 @@ void emitCalleeInst(Mir const& src, MirInstId cid, MirOpcode cop,
         newOps.push_back(mapCalleeOperand(src, o, local, callee));
     }
     local.emplace(cid.v, dst.addInst(cop, newOps, src.instType(cid),
-                                     src.instPayload(cid), src.instFlags(cid)));
+                                     src.instPayload(cid), src.instFlags(cid),
+                                     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: carry
+                                     // the callee Alloca's effective-alignment
+                                     // channel into the caller — an inlined
+                                     // over-aligned local must keep its alignment
+                                     // (else its slot silently under-aligns).
+                                     src.instPayload2(cid)));
 }
 
 // The single-block-leaf inlining rebuild policy (OPT7 cycle 1). Per-
@@ -869,8 +900,12 @@ private:
             return;
         }
         if (op == MirOpcode::Arg) {
+            // The MultiBlockInliner's caller-HOST Args (a mixed-class host that
+            // is itself inlined at a later iteration) — thread the flat
+            // position (D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP).
             rewrite_.emplace(id.v,
-                dst_.addArg(src_.argIndex(id), src_.instType(id)));
+                dst_.addArg(src_.argIndex(id), src_.instType(id),
+                            src_.argPosition(id)));
             return;
         }
         if (op == MirOpcode::GlobalAddr) {
@@ -884,7 +919,12 @@ private:
         for (MirInstId const o : ops) newOps.push_back(mapCallerValue(o, id));
         rewrite_.emplace(id.v, dst_.addInst(op, newOps, src_.instType(id),
                                             src_.instPayload(id),
-                                            src_.instFlags(id)));
+                                            src_.instFlags(id),
+                                            // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN:
+                                            // preserve the caller's own Alloca
+                                            // alignment channel across the inline
+                                            // host rebuild.
+                                            src_.instPayload2(id)));
     }
 
     // Emit a CALLER terminator into the open block, mapping operands via
@@ -1333,7 +1373,8 @@ planHasMultiBlock(Mir const& src, ModuleAnalysis const& analysis,
 
 InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
                            DiagnosticReporter& reporter,
-                           std::uint32_t inlineThreshold) {
+                           std::uint32_t inlineThreshold,
+                           bool maintainMarkers) {
     InliningResult result{};
     MirBuilder builder;
 
@@ -1403,8 +1444,14 @@ InliningResult runInlining(Mir& mir, TypeInterner const& /*interner*/,
     // Canonical-marker stamping (D-OPT4-1): the splice changed the
     // caller's CFG (split blocks, cloned callee bodies). Markers are
     // re-derived from the NEW shape — inlined loop headers re-emerge
-    // as LoopHeader; continuation blocks take their actual role.
-    rederiveStructCfMarkers(mir);
+    // as LoopHeader; continuation blocks take their actual role. Under the
+    // release posture (`maintainMarkers == false` — no per-pass verify, and
+    // NOTHING else reads markers mid-pipeline) the optimizer re-derives ONCE
+    // after the whole pipeline instead: this whole-module derivation was ~91%
+    // of the pass's cost on SQLite.
+    if (maintainMarkers) {
+        rederiveStructCfMarkers(mir);
+    }
     result.ok = true;
     return result;
 }

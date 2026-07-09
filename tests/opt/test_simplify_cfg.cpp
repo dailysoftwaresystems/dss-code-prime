@@ -331,6 +331,80 @@ TEST(SimplifyCfg, LinearChainBlockMerged) {
     EXPECT_LT(totalBlockCount(mir), blocksBefore);
 }
 
+// Preds-hoist decision-identity pin (the SimplifyCfg analog of CSE's
+// CrossBlockLoadCseDecidedPerFunctionInMultiFunctionModule): `runSimplifyCfg`
+// now computes the whole-module preds ONCE and threads it into every
+// function's analyze — this pins that the MERGE decision (the
+// `preds[B.v].size() == 1` single-predecessor gate) stays PER FUNCTION in a
+// multi-function module: fn0 carries a mergeable linear (entry, mid) pair;
+// fn1's mid has TWO predecessors (a diamond) → refused. Exactly one merge.
+TEST(SimplifyCfg, BlockMergeDecidedPerFunctionInMultiFunctionModule) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+
+    // fn0 — mergeable (entry, mid): mid single-pred with real content.
+    mb.addFunction(fnSig, SymbolId{100});
+    {
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const mid   = mb.createBlock(StructCfMarker::Linear);
+        mb.beginBlock(entry);
+        MirLiteralValue v3; v3.value = std::int64_t{3}; v3.core = TypeKind::I32;
+        MirInstId const a = mb.addConst(v3, i32);
+        MirInstId const addOps[] = {a, a};
+        (void)mb.addInst(MirOpcode::Add, addOps, i32);
+        mb.addBr(mid);
+        mb.beginBlock(mid);
+        MirLiteralValue v7; v7.value = std::int64_t{7}; v7.core = TypeKind::I32;
+        MirInstId const c7 = mb.addConst(v7, i32);
+        MirInstId const add2[] = {c7, c7};
+        MirInstId const r2 = mb.addInst(MirOpcode::Add, add2, i32);
+        mb.addReturn(r2);
+    }
+
+    // fn1 — a diamond whose join has TWO preds: never merged.
+    mb.addFunction(fnSig, SymbolId{101});
+    {
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
+        MirBlockId const fArm  = mb.createBlock(StructCfMarker::IfElse);
+        MirBlockId const join  = mb.createBlock(StructCfMarker::IfJoin);
+        mb.beginBlock(entry);
+        MirInstId const cond = mb.addArg(0, boolT);
+        mb.addCondBr(cond, tArm, fArm);
+        mb.beginBlock(tArm);
+        MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+        MirInstId const c1 = mb.addConst(v1, i32);
+        MirInstId const add1[] = {c1, c1};
+        (void)mb.addInst(MirOpcode::Add, add1, i32);
+        mb.addBr(join);
+        mb.beginBlock(fArm);
+        MirLiteralValue v2; v2.value = std::int64_t{2}; v2.core = TypeKind::I32;
+        MirInstId const c2 = mb.addConst(v2, i32);
+        MirInstId const add2[] = {c2, c2};
+        (void)mb.addInst(MirOpcode::Add, add2, i32);
+        mb.addBr(join);
+        mb.beginBlock(join);
+        MirLiteralValue v9; v9.value = std::int64_t{9}; v9.core = TypeKind::I32;
+        MirInstId const c9 = mb.addConst(v9, i32);
+        MirInstId const add3[] = {c9, c9};
+        MirInstId const r3 = mb.addInst(MirOpcode::Add, add3, i32);
+        mb.addReturn(r3);
+    }
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runSimplifyCfg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.blocksMerged, 1u)
+        << "block merge decided per function: fn0's linear pair merges, fn1's "
+           "two-pred join refuses — the pass-wide preds must not leak across "
+           "functions";
+}
+
 // D-OPT4-1-NON-LINEAR-MARKER-MERGE — CLOSED. Non-Linear markers on
 // BOTH sides of a (P, B) pair no longer block the merge: admission is
 // pure CFG-legality, and the post-rebuild canonical re-derivation

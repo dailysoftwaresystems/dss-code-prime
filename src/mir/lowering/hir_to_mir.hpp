@@ -214,6 +214,14 @@ lowerToMir(Hir const&               hir,
            // MirInstFlags::Volatile onto the access's Load/Store so the optimizer's
            // Volatile-aware passes (DCE/CSE/Mem2Reg/LICM) cannot elide / cache /
            // reorder a volatile access.
-           HirVolatileMap const*    volatileMap = nullptr);
+           HirVolatileMap const*    volatileMap = nullptr,
+           // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: per-DECLARATION explicit
+           // `alignas` side-table, populated by the CST→HIR lowerer from each
+           // declaration's bound symbol `SymbolRecord.explicitAlignment`.
+           // Optional: nullptr (or a decl with no entry) ⇒ natural alignment.
+           // Read here to stamp MirGlobal.alignment (globals — the assembler
+           // raises the data-item alignment) and the MIR Alloca's effective-
+           // alignment channel (locals — MIR→LIR feeds it to the frame layout).
+           HirAlignmentMap const*   alignmentMap = nullptr);
 
 } // namespace dss

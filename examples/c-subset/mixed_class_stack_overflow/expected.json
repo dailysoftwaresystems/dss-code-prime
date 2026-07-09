@@ -1,5 +1,5 @@
 {
-  "$comment": "c76 (D-FF3-SYSV-MIXED-CLASS-STACK-OVERFLOW-OFFSET, folded into c76; 2026-07-01): on x86-64 SysV a callee with BOTH GPR-class params overflowing past 6 GPR arg regs AND FP-class params overflowing past 8 FP arg regs must read the overflowed GPR stack arg and the overflowed FP stack arg from DISTINCT monotonic incoming-stack offsets. Pre-fix, the per-class overflow counters each restart the cursor at 0 so the FP overflow reads the INT overflow slot (garbage double). WITNESS: int probe(int i1..i7, double d0..d8) -> isum(28) + (int)dsum(45) = 73. RED-ON-DISABLE (WITNESSED on build-rel): revert the D-FF3 offset fix -> SysV returns 64 not 73; AAPCS64/Win64 slot-align so they are 73 regardless. NOTE: this example intentionally OMITS `optimizedPipelines` (the documented corpus carve-out). Even with runtime (volatile-sourced) FP args, this canonical repro's PLAIN unweighted double sum (d0+d1+...+d8) trips the SEPARATE pre-existing bug D-OPT-RELEASE-FP-CONSTANT-UNLOADED-XMM (c77) under the `release` shipped pipeline on the WSL/qemu run legs (returns 33/31 not 73) — the un-loaded-xmm miscompile after inlining, which is NOT a c76 defect and out of scope here. The D-FF3 invariant retains a release-arm witness via the sibling `mixed_class_stack_overflow_interleaved` (whose weighted sum sidesteps the FP-constant bug and passes release on all 3 legs). => 73.",
+  "$comment": "c76 (D-FF3-SYSV-MIXED-CLASS-STACK-OVERFLOW-OFFSET, folded into c76; 2026-07-01): on x86-64 SysV a callee with BOTH GPR-class params overflowing past 6 GPR arg regs AND FP-class params overflowing past 8 FP arg regs must read the overflowed GPR stack arg and the overflowed FP stack arg from DISTINCT monotonic incoming-stack offsets. Pre-fix, the per-class overflow counters each restart the cursor at 0 so the FP overflow reads the INT overflow slot (garbage double). WITNESS: int probe(int i1..i7, double d0..d8) -> isum(28) + (int)dsum(45) = 73. RED-ON-DISABLE (WITNESSED on build-rel): revert the D-FF3 offset fix -> SysV returns 64 not 73; AAPCS64/Win64 slot-align so they are 73 regardless. RE-ARMED with the `release` optimizedPipelines arm 2026-07-07: the FP-constant-un-loaded-xmm bug that formerly forced this to omit the release arm (D-OPT-RELEASE-FP-CONSTANT-UNLOADED-XMM) shared ONE root with the mixed-class inline arg-drop and was fixed by D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP (the MIR Arg now carries a flat call-operand position so the inliner maps the FP actuals correctly); the release build now returns 73 on all 3 run legs. This is BOTH the D-FF3 stack-offset witness AND a release-composition witness for the arg-position fix.",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 73,
@@ -26,5 +26,8 @@
       "runOn": ["darwin"],
       "emulator": ""
     }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
   ]
 }

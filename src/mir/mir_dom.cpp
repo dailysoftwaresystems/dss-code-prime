@@ -34,23 +34,31 @@ namespace {
 // `order` are unreachable from the root and keep `kUnsetSlot`.
 constexpr std::uint32_t kUnsetSlot = static_cast<std::uint32_t>(-1);
 
-struct ChkResult {
-    std::vector<std::uint32_t> idom;    // slot → idom slot; kUnsetSlot = unresolved
-    std::vector<std::uint8_t>  gaveUp;
-};
+// Slot projection for the templated core: the forward-dominator path passes
+// the caller's `preds` (MirBlockId elements) DIRECTLY — the former per-call
+// whole-module `predSlots` copy was ~95% of CSE/LICM's cost on SQLite
+// (D-OPT-DOMTREE-SCRATCH-REUSE) — while the post-dominator path passes its
+// per-function uint32 reverse graph. ONE core, two element shapes.
+[[nodiscard]] inline std::uint32_t chkSlotOf(std::uint32_t s) noexcept { return s; }
+[[nodiscard]] inline std::uint32_t chkSlotOf(MirBlockId b) noexcept { return b.v; }
 
-ChkResult runChkCore(std::size_t nodeCount, std::uint32_t entrySlot,
-                     std::vector<std::uint32_t> const& order,
-                     std::vector<std::vector<std::uint32_t>> const& preds) {
-    ChkResult st;
-    st.idom.assign(nodeCount, kUnsetSlot);
-    st.gaveUp.assign(nodeCount, 0);
-    auto& idom = st.idom;
-    std::vector<std::uint32_t> rpoIndex(nodeCount, kUnsetSlot);
+// The CHK fixpoint over CALLER-PROVIDED arrays (sized `nodeCount`, pre-set to
+// kUnsetSlot/kUnsetSlot/0 for every slot this call may touch — fresh
+// allocation and the scratch's touched-slot reset both satisfy that). The
+// arrays MUST stay module-sized: the intersect step-cap derives from
+// `idom.size()`, so compressing to function-local sizing would change when
+// pathological chains give up (a behavior change). Writes touch ONLY
+// `order ∪ {entry}` — the invariant the scratch's partial reset relies on.
+template <typename OrderVec, typename PredsVec>
+void runChkCoreInto(std::size_t nodeCount, std::uint32_t entrySlot,
+                    OrderVec const& order, PredsVec const& preds,
+                    std::vector<std::uint32_t>& idom,
+                    std::vector<std::uint8_t>&  gaveUp,
+                    std::vector<std::uint32_t>& rpoIndex) {
     for (std::uint32_t i = 0; i < order.size(); ++i) {
-        rpoIndex[order[i]] = i;
+        rpoIndex[chkSlotOf(order[i])] = i;
     }
-    if (entrySlot >= nodeCount) return st;
+    if (entrySlot >= nodeCount) return;
     idom[entrySlot] = entrySlot;
     std::uint32_t const stepCap = static_cast<std::uint32_t>(idom.size() * 2 + 4);
     auto intersect = [&](std::uint32_t b1, std::uint32_t b2) {
@@ -86,20 +94,28 @@ ChkResult runChkCore(std::size_t nodeCount, std::uint32_t entrySlot,
     while (changed) {
         changed = false;
         for (std::size_t i = 1; i < order.size(); ++i) {
-            std::uint32_t const b = order[i];
+            std::uint32_t const b = chkSlotOf(order[i]);
             std::uint32_t newIdom = kUnsetSlot;
-            for (std::uint32_t const p : preds[b]) {
-                if (rpoIndex[p] == kUnsetSlot) continue;
-                if (idom[p] == kUnsetSlot) continue;
-                if (newIdom == kUnsetSlot) {
-                    newIdom = p;
-                } else {
-                    std::uint32_t const interSlot = intersect(newIdom, p);
-                    if (interSlot == kUnsetSlot) {
-                        st.gaveUp[b] = true;
-                        continue;
+            // Legacy size-tolerance preserved: the former predSlots copy was
+            // sized nodeCount with a `i < preds.size()` copy guard, so a
+            // too-small preds map read as "no predecessors" — keep that
+            // byte-identical (the scratch overload separately fail-louds a
+            // size mismatch at its entry, where it is a caller bug).
+            if (b < preds.size()) {
+                for (auto const pe : preds[b]) {
+                    std::uint32_t const p = chkSlotOf(pe);
+                    if (rpoIndex[p] == kUnsetSlot) continue;
+                    if (idom[p] == kUnsetSlot) continue;
+                    if (newIdom == kUnsetSlot) {
+                        newIdom = p;
+                    } else {
+                        std::uint32_t const interSlot = intersect(newIdom, p);
+                        if (interSlot == kUnsetSlot) {
+                            gaveUp[b] = true;
+                            continue;
+                        }
+                        newIdom = interSlot;
                     }
-                    newIdom = interSlot;
                 }
             }
             if (newIdom != kUnsetSlot && idom[b] != newIdom) {
@@ -108,7 +124,6 @@ ChkResult runChkCore(std::size_t nodeCount, std::uint32_t entrySlot,
             }
         }
     }
-    return st;
 }
 
 } // namespace
@@ -136,23 +151,108 @@ computeMirDomTree(Mir const&                                  mir,
     st.idom.resize(mir.blockCount());
     st.gaveUp.resize(mir.blockCount(), false);
     if (!entry.valid()) return st;
-    // Adapt the strong-id graph to the slot-parameterized shared core.
-    std::vector<std::uint32_t> orderSlots;
-    orderSlots.reserve(order.size());
-    for (MirBlockId const b : order) orderSlots.push_back(b.v);
-    std::vector<std::vector<std::uint32_t>> predSlots(mir.blockCount());
-    for (std::size_t i = 0; i < preds.size() && i < predSlots.size(); ++i) {
-        predSlots[i].reserve(preds[i].size());
-        for (MirBlockId const p : preds[i]) predSlots[i].push_back(p.v);
+    // Fresh whole-module core arrays; the templated core reads the caller's
+    // `preds`/`order` directly (the former predSlots/orderSlots re-copies are
+    // gone — same values, same iteration order).
+    std::vector<std::uint32_t> coreIdom(mir.blockCount(), kUnsetSlot);
+    std::vector<std::uint8_t>  coreGaveUp(mir.blockCount(), 0);
+    std::vector<std::uint32_t> rpoIndex(mir.blockCount(), kUnsetSlot);
+    runChkCoreInto(mir.blockCount(), entry.v, order, preds,
+                   coreIdom, coreGaveUp, rpoIndex);
+    for (std::size_t i = 0; i < coreGaveUp.size(); ++i) {
+        st.gaveUp[i] = coreGaveUp[i];
     }
-    ChkResult core = runChkCore(mir.blockCount(), entry.v, orderSlots, predSlots);
-    st.gaveUp = std::move(core.gaveUp);
-    for (std::size_t i = 0; i < core.idom.size(); ++i) {
-        st.idom[i] = (core.idom[i] == kUnsetSlot)
+    for (std::size_t i = 0; i < coreIdom.size(); ++i) {
+        st.idom[i] = (coreIdom[i] == kUnsetSlot)
             ? MirBlockId{}
-            : MirBlockId{core.idom[i], mir.id().v};
+            : MirBlockId{coreIdom[i], mir.id().v};
     }
     return st;
+}
+
+MirDomTree const&
+computeMirDomTree(Mir const&                                  mir,
+                  MirBlockId                                  entry,
+                  std::vector<MirBlockId> const&              order,
+                  std::vector<std::vector<MirBlockId>> const& preds,
+                  MirDomScratch&                              scratch) {
+    // Bind-or-verify (the MirMemoryClobbers stale-guard pattern): the
+    // optimizer mints a fresh MirModuleId per rebuild, so a scratch reused
+    // across a rebuild fails loud here instead of silently mixing modules.
+    std::uint32_t const bc = static_cast<std::uint32_t>(mir.blockCount());
+    if (scratch.blockCount == 0 && scratch.moduleIdV == 0) {
+        scratch.moduleIdV  = mir.id().v;
+        scratch.blockCount = bc;
+        scratch.coreIdom.assign(bc, kUnsetSlot);
+        scratch.coreGaveUp.assign(bc, 0);
+        scratch.rpoIndex.assign(bc, kUnsetSlot);
+        scratch.tree.idom.assign(bc, MirBlockId{});
+        scratch.tree.gaveUp.assign(bc, false);
+        scratch.children.assign(bc, {});
+    } else if (scratch.moduleIdV != mir.id().v || scratch.blockCount != bc) {
+        std::fprintf(stderr,
+            "dss::computeMirDomTree fatal: MirDomScratch bound to module "
+            "id=%u blocks=%u used with module id=%u blocks=%u — stale scratch "
+            "across a rebuild (D-OPT-DOMTREE-SCRATCH-REUSE contract).\n",
+            scratch.moduleIdV, scratch.blockCount, mir.id().v, bc);
+        std::abort();
+    }
+    if (preds.size() != mir.blockCount()) {
+        std::fprintf(stderr,
+            "dss::computeMirDomTree fatal: preds.size()=%zu != "
+            "mir.blockCount()=%zu — the scratch overload requires the pass's "
+            "hoisted whole-module predecessor map.\n",
+            preds.size(), mir.blockCount());
+        std::abort();
+    }
+
+    // Reset-at-entry from the PREVIOUS call's self-recorded write set — the
+    // caller's `order` from that call may be long gone (dangling), which is
+    // why the touched list is copied into the scratch, never re-derived.
+    for (std::uint32_t const slot : scratch.touched) {
+        scratch.coreIdom[slot]   = kUnsetSlot;
+        scratch.coreGaveUp[slot] = 0;
+        scratch.rpoIndex[slot]   = kUnsetSlot;
+        scratch.tree.idom[slot]  = MirBlockId{};
+        scratch.tree.gaveUp[slot] = false;
+        scratch.children[slot].clear();   // parents ⊆ touched (idom values ∈ order)
+    }
+    scratch.touched.clear();
+
+    // Record THIS call's write set: order ∪ {entry} (the proven-complete
+    // write set of the core + the conversion below). The entry slot is
+    // bounds-guarded — an out-of-range entry is a reachable silent input the
+    // core's own early-return tolerates (never written, never recorded).
+    scratch.touched.reserve(order.size() + 1);
+    for (MirBlockId const b : order) scratch.touched.push_back(b.v);
+    if (entry.valid() && entry.v < bc) scratch.touched.push_back(entry.v);
+
+    if (entry.valid()) {
+        runChkCoreInto(mir.blockCount(), entry.v, order, preds,
+                       scratch.coreIdom, scratch.coreGaveUp, scratch.rpoIndex);
+        // Conversion restricted to the write set — untouched slots already
+        // hold the fresh-allocation defaults (MirBlockId{} / false) by reset.
+        for (std::uint32_t const slot : scratch.touched) {
+            scratch.tree.gaveUp[slot] = scratch.coreGaveUp[slot];
+            scratch.tree.idom[slot] =
+                (scratch.coreIdom[slot] == kUnsetSlot)
+                    ? MirBlockId{}
+                    : MirBlockId{scratch.coreIdom[slot], mir.id().v};
+        }
+    }
+
+    // Ascending-sorted UNIQUE copy for the children fill: the fresh
+    // mirDomTreeChildren iterates slots ascending and visits each ONCE — the
+    // touched list may hold the entry slot twice (order[0] == entry), so
+    // dedup here or the fill would emit duplicate children. The CSE dom-DFS
+    // traversal order depends on this order — keep it identical.
+    scratch.touchedSorted.assign(scratch.touched.begin(), scratch.touched.end());
+    std::sort(scratch.touchedSorted.begin(), scratch.touchedSorted.end());
+    scratch.touchedSorted.erase(
+        std::unique(scratch.touchedSorted.begin(), scratch.touchedSorted.end()),
+        scratch.touchedSorted.end());
+    scratch.childrenFilled = false;
+    return scratch.tree;
 }
 
 MirPostDomTree
@@ -224,16 +324,24 @@ computeMirPostDomTree(Mir const& mir, MirFuncId f) {
         std::reverse(order.begin(), order.end());
     }
 
-    ChkResult core = runChkCore(n + 1, virtualSlot, order, revPreds);
-    st.gaveUp = std::move(core.gaveUp);
+    // Same templated core as the forward tree (uint32 slot elements here);
+    // fresh arrays per call — post-dom is only on the (now-3×/compile)
+    // rederive path, its scratch treatment is the gated
+    // D-OPT-POSTDOM-SCRATCH-REUSE follow-up.
+    std::vector<std::uint32_t> coreIdom(n + 1, kUnsetSlot);
+    std::vector<std::uint8_t>  coreGaveUp(n + 1, 0);
+    std::vector<std::uint32_t> rpoIndex(n + 1, kUnsetSlot);
+    runChkCoreInto(n + 1, virtualSlot, order, revPreds,
+                   coreIdom, coreGaveUp, rpoIndex);
+    st.gaveUp = std::move(coreGaveUp);
     for (std::size_t i = 0; i <= n; ++i) {
         // Three-valued mapping (see MirPostDomTree): kUnsetSlot →
         // INVALID (reverse-unreachable: no path to any exit); the
         // virtual slot maps to a SYNTHETIC id callers must compare,
         // never dereference.
-        st.ipdom[i] = (core.idom[i] == kUnsetSlot)
+        st.ipdom[i] = (coreIdom[i] == kUnsetSlot)
             ? MirBlockId{}
-            : MirBlockId{core.idom[i], mir.id().v};
+            : MirBlockId{coreIdom[i], mir.id().v};
     }
     return st;
 }
@@ -333,6 +441,43 @@ mirDomTreeChildren(Mir const& mir, MirDomTree const& dom) {
         children[parent.v].push_back(b);
     }
     return children;
+}
+
+std::vector<std::vector<MirBlockId>> const&
+mirDomTreeChildren(Mir const& mir, MirDomTree const& dom,
+                   MirDomScratch& scratch) {
+    // The touched bookkeeping is what makes the partial children reset
+    // complete — this overload is only sound for the tree the SAME scratch's
+    // compute call just produced. Fail loud on any other tree.
+    if (&dom != &scratch.tree) {
+        std::fprintf(stderr,
+            "dss::mirDomTreeChildren fatal: scratch-children called with a "
+            "tree that is NOT this scratch's own (the touched-slot reset "
+            "contract only covers scratch.tree — "
+            "D-OPT-DOMTREE-SCRATCH-REUSE).\n");
+        std::abort();
+    }
+    // Idempotent per compute call (the fresh overload returns identical
+    // content on repeat calls; refilling here would duplicate entries).
+    if (scratch.childrenFilled) return scratch.children;
+    scratch.childrenFilled = true;
+    // Ascending-slot iteration over the touched set — the same order and the
+    // same per-slot body as the fresh overload's `i = 1..blockCount` scan
+    // (untouched slots contribute nothing there: their idom is invalid).
+    // Contributing parents are inside the touched set (every stored idom
+    // value is in `order`), so the reset cleared exactly the lists this
+    // fill repopulates.
+    for (std::uint32_t const i : scratch.touchedSorted) {
+        if (i < 1u) continue;   // parity: the fresh loop starts at slot 1
+        if (i < dom.gaveUp.size() && dom.gaveUp[i]) continue;
+        if (i >= dom.idom.size()) continue;
+        MirBlockId const parent = dom.idom[i];
+        if (!parent.valid()) continue;
+        if (parent.v == i) continue;  // skip the entry's self-loop
+        MirBlockId const b{i, mir.id().v};
+        scratch.children[parent.v].push_back(b);
+    }
+    return scratch.children;
 }
 
 std::vector<MirNaturalLoop>

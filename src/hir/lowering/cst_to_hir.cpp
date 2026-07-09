@@ -4,6 +4,7 @@
 #include "analysis/semantic/constant_symbol_fold.hpp" // Item 1: shared enum/constant Ref->literal builder
 #include "analysis/semantic/semantic_model.hpp"
 #include "analysis/semantic/type_rules.hpp"      // FC3 c1: usualArithmeticCommonType / resolveArithmeticRules
+#include "core/types/attribute_naming.hpp"       // D-CSUBSET-PACKED (F4): stripDunder
 #include "core/types/data_model.hpp"
 #include "core/types/decl_prefix_strip.hpp"     // declRoleChildren / descendVisibleDecl / specifierPrefixChild
 #include "core/types/declarator_walk.hpp"       // FC4: collectDeclarators / declaratorNameNode
@@ -17,6 +18,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/semantic_config.hpp"
 #include "core/types/string_literal_decode.hpp" // C 5.1.1.2 phase 6: decodeAdjacentStringBodies (THE string-body chokepoint)
+#include "core/types/wide_string_encode.hpp"     // C 6.4.5: encodeWideString (wide/UTF code units, shared with semantic)
 #include "core/types/tree.hpp"
 #include "core/types/tree_node.hpp"             // isEmptySpace
 #include "core/types/type_lattice/core_type.hpp"
@@ -214,6 +216,17 @@ struct Lowerer {
     // side-table stays sparse; the only unsafe direction is a MISSED volatile
     // access, which the exhaustive threading closes.
     std::vector<std::pair<HirNodeId, VolatileAttr>>& volatileAcc;
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: shared accumulator of (DECLARATION HIR
+    // node → AlignmentAttr) pairs, populated from the bound symbol's
+    // `SymbolRecord.explicitAlignment` at each Global / local VarDecl lowering
+    // site (where the record is in hand). Applied to the result's
+    // HirAlignmentMap AFTER finish() — same frozen-hir discipline as
+    // `mutability` / `volatileAcc`. Only decls with a real (>0) `alignas`
+    // override are recorded (absence ⇒ natural alignment), so the side-table
+    // stays sparse. Keyed on BOTH globals and locals (UNLIKE mutability, which
+    // is global-only): a global's value raises its data-item section alignment;
+    // a local's value raises its alloca's effective (frame-slot) alignment.
+    std::vector<std::pair<HirNodeId, AlignmentAttr>>& alignmentAcc;
 
     // D-CSUBSET-LOCAL-STATIC: the module-level decls accumulator (the SAME
     // vector `lowerTree` appends top-level decls to). A block-scope `static`
@@ -424,10 +437,15 @@ struct Lowerer {
             auto const toElem   = interner.operands(target);
             auto const fromLen  = interner.scalars(child.type);
             auto const toLen    = interner.scalars(target);
+            // C11/C23 6.4.5: SAME element kind on both sides (was Char-only) so a
+            // wide-string initializer `wchar_t buf[3]=L"hi"` / `char16_t b[3]=u"hi"`
+            // gets the same trailing zero-fill as a narrow `char[N]="…"`. The element
+            // KIND must match (a `char[N]` cannot be inited by a `u"…"` array — the
+            // semantic tier rejects the mismatch); the string bytes are already
+            // element-width-encoded, and the producer pads to N*sizeof(elem).
             if (!fromElem.empty() && !toElem.empty()
                 && !fromLen.empty() && !toLen.empty()
-                && interner.kind(fromElem[0]) == TypeKind::Char
-                && interner.kind(toElem[0]) == TypeKind::Char
+                && interner.kind(fromElem[0]) == interner.kind(toElem[0])
                 && toLen[0] >= fromLen[0]
                 && std::holds_alternative<std::string>(
                        literals.at(builder.payload(child.id)).value)) {
@@ -777,10 +795,11 @@ struct Lowerer {
             std::vector<HirExternRecord>& ed,
             std::vector<std::pair<HirNodeId, LinkageAttr>>& lk,
             std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut,
-            std::vector<std::pair<HirNodeId, VolatileAttr>>& vol)
+            std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
+            std::vector<std::pair<HirNodeId, AlignmentAttr>>& aln)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
-          linkage(lk), mutability(mut), volatileAcc(vol) {
+          linkage(lk), mutability(mut), volatileAcc(vol), alignmentAcc(aln) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -882,6 +901,32 @@ struct Lowerer {
     // (D-CSUBSET-LINKAGE-UNKNOWN-SPECIFIER-DIAGNOSTIC). Agnostic: BOTH the effect
     // map and the ignored-kind set are per-language config; the engine compares
     // resolved SchemaTokenIds + source text, never a hardcoded kind/identity.
+    // D-CSUBSET-PACKED (F4): does the attribute subtree `n` NAME a `packed` attribute?
+    // A bounded DFS for an identifier leaf matching the language's
+    // `packedAttributeNames`, dunder-normalized via the shared `stripDunder`
+    // (`__packed__` ≡ `packed`; `[[gnu::packed]]`'s final segment matches). Used to
+    // fail loud on a leading (UNHONORED) packed spelling that the linkage scan would
+    // otherwise skip wholesale. Config-driven; nothing hardcodes "packed".
+    [[nodiscard]] bool subtreeNamesPacked(NodeId n) const {
+        if (sem.packedAttributeNames.empty() || !sem.identifierToken.valid())
+            return false;
+        std::vector<NodeId> stack{n};
+        for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
+            NodeId const cur = stack.back();
+            stack.pop_back();
+            if (isToken(cur)) {
+                if (tree().tokenKind(cur).v == sem.identifierToken.v) {
+                    std::string_view const id = stripDunder(tree().text(cur));
+                    for (std::string const& nm : sem.packedAttributeNames)
+                        if (id == nm) return true;
+                }
+                continue;
+            }
+            for (NodeId c : visible(cur)) stack.push_back(c);
+        }
+        return false;
+    }
+
     [[nodiscard]] LinkageAttr linkageFrom(NodeId prefixNode, DeclarationRule const& decl,
                                           bool* staticStorageOut = nullptr) {
         LinkageAttr attr{};
@@ -906,7 +951,28 @@ struct Lowerer {
                 for (RuleId rid : decl.linkageSpecifierIgnoredRules) {
                     if (tree().rule(n).v == rid.v) { skip = true; break; }
                 }
-                if (skip) continue;
+                if (skip) {
+                    // D-CSUBSET-PACKED (F4): a `packed` spelling in the LEADING
+                    // declaration-specifier position (`[[gnu::packed]] struct S …`) is
+                    // UNHONORED — packed is honored only in the TRAILING composite-
+                    // attribute slot (`struct S {…} __attribute__((packed))`). The
+                    // wholesale ignored-rule skip above would silently DROP it, leaving
+                    // the struct PADDED — a program that relies on packing would be
+                    // miscompiled. Fail loud instead, SYMMETRIC with the leading
+                    // `__attribute__((packed))` case (which already resolves to
+                    // H_UnknownLinkageSpecifier via the recognized-specifier path, since
+                    // attrSpec is NOT in the ignored set). ONLY fires on a `packed`
+                    // spelling; every other ignorable attribute (`[[deprecated]]`,
+                    // `[[nodiscard]]`) stays silently ignored (the standard-attribute
+                    // contract). Source-agnostic: the packed names are per-language config.
+                    if (subtreeNamesPacked(n)) {
+                        emitH(DiagnosticCode::H_UnknownLinkageSpecifier, n,
+                              "'packed' is not honored as a leading attribute here — "
+                              "place __attribute__((packed)) / [[gnu::packed]] AFTER "
+                              "the struct/union body");
+                    }
+                    continue;
+                }
                 auto const kids = visible(n);
                 for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
                     stack.push_back(*it);   // reverse-push → source order
@@ -941,6 +1007,21 @@ struct Lowerer {
                 continue;
             }
             std::string key{tree().text(n)};
+            // FC16 (D-CSUBSET-NORETURN): a specifier IDENTIFIER declared a semantic
+            // NO-OP by NAME (`linkageSpecifierIgnoredNames`) is skipped WITHOUT a
+            // linkage effect and WITHOUT firing H_UnknownLinkageSpecifier — the
+            // identifier-granularity sibling of the kind/rule ignore lists, for a
+            // non-linkage attribute (`noreturn`) that shares the GNU
+            // `__attribute__((...))` rule with honored linkage attrs. Dunder-
+            // normalized so `"noreturn"` covers `__noreturn__`. Any identifier NOT
+            // listed still falls through to the strict lookup below (fail-loud).
+            if (!decl.linkageSpecifierIgnoredNames.empty()) {
+                std::string_view const bare = stripDunder(key);
+                bool ignoredByName = false;
+                for (std::string const& nm : decl.linkageSpecifierIgnoredNames)
+                    if (bare == nm) { ignoredByName = true; break; }
+                if (ignoredByName) continue;
+            }
             // Composite probe: the next non-ignored token opens a string
             // literal → pair this specifier with the decoded body.
             if (strStart.valid() && strBody.valid()) {
@@ -1015,6 +1096,20 @@ struct Lowerer {
         auto const* rec = model.recordFor(sym);
         if (rec != nullptr && rec->isConst)
             mutability.push_back({node, MutabilityAttr{/*isConst=*/true}});
+    }
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: record an explicit `alignas` override
+    // for a lowered Global / VarDecl node from its bound symbol's
+    // `SymbolRecord.explicitAlignment` (sparse: only a real (>0) override is
+    // stored; absence ⇒ natural alignment). The semantic phase already
+    // validated the value (power-of-two, ≤256, ≥ natural), so it rides through
+    // unchecked. `sym` must be the declaration's declared symbol.
+    void recordAlignment(HirNodeId node, SymbolId sym) {
+        if (!sym.valid()) return;
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->explicitAlignment.has_value()
+            && *rec->explicitAlignment > 0u)
+            alignmentAcc.push_back(
+                {node, AlignmentAttr{*rec->explicitAlignment}});
     }
     // c21/c27: record an ACCESS HIR node's OBJECT-volatility — true iff the bound
     // symbol's STORAGE is itself volatile, i.e. its resolved type is TOP-LEVEL
@@ -1857,12 +1952,21 @@ struct Lowerer {
     // is an expression node, so both operand lowerers probe for them before the
     // generic internal-child descent. std::nullopt ⇒ not such a leaf literal.
     [[nodiscard]] std::optional<E> tryLowerLeafLiteral(NodeId node) {
-        if (NodeId chl = bodyLiteralNodeOf(node, cfg.charStartToken); chl.valid())
+        // C11/C23 6.4.4.4: any char opener (`'`/`L'`/`u'`/`U'`/`u8'`) — the sub-rule
+        // whose FIRST child token is a configured char opener. Detecting via the
+        // opener SET (`charLiteralNodeOf`), not just the scalar `charStartToken`, is
+        // what makes the wide forms lower at all: a narrow-only probe sees only `'`,
+        // so every `L'x'`/`u'x'` would mis-fall-through. Mirrors the string opener
+        // set (`stringLiteralNodeOf`).
+        if (NodeId chl = charLiteralNodeOf(node); chl.valid())
             return lowerCharLiteral(chl);
-        if (NodeId sl = bodyLiteralNodeOf(node, cfg.stringStartToken); sl.valid())
+        // C11/C23 6.4.5: any string opener (`"`/`L"`/`u"`/`U"`/`u8"`, and SQL `N'`)
+        // — the sub-rule whose FIRST child token is a configured opener. The narrow
+        // + unicode + wide forms all share lowerStringLiteral (which routes byte vs
+        // code-unit by the STAMPED element core). Falls back to the scalar
+        // start/unicode tokens for a grammar that declared no prefix table.
+        if (NodeId sl = stringLiteralNodeOf(node); sl.valid())
             return lowerStringLiteral(sl);
-        if (NodeId us = bodyLiteralNodeOf(node, cfg.unicodeStringStartToken); us.valid())
-            return lowerStringLiteral(us);   // SQL `N'…'` — same body token + decoder
         if (cfg.nullToken.valid())            // SQL NULL → a typeless extension leaf
             if (NodeId nt = childTokenOfKind(node, cfg.nullToken); nt.valid())
                 return lowerNullLiteral(node);
@@ -1905,6 +2009,14 @@ struct Lowerer {
              && tree().rule(c).v == cfg.sizeofRule.v) {
                 return lowerSizeof(c);
             }
+            // C11/C23 6.5.3.4: `_Alignof(T)` / `alignof(T)` — like sizeof, its
+            // castTypeRef child must NOT be lowered as an expression; route it to
+            // the dedicated lowering (config-driven by rule id — a language
+            // without an `_Alignof` surface leaves this invalid and skips it).
+            if (cfg.alignofRule.valid()
+             && tree().rule(c).v == cfg.alignofRule.v) {
+                return lowerAlignof(c);
+            }
             // D-CSUBSET-COMPUTED-GOTO: `&&label` — its Identifier child is a RAW
             // label name (the label namespace), NOT a value to resolve, so it
             // routes to a dedicated lowering (the sizeof precedent) before any
@@ -1928,6 +2040,16 @@ struct Lowerer {
             if (cfg.vaEndRule.valid()
              && tree().rule(c).v == cfg.vaEndRule.v) {
                 return lowerVaEnd(c);
+            }
+            // FC16: `_Generic(...)` routes to its dedicated lowering, which lowers
+            // ONLY the association the SEMANTIC tier selected (the non-selected
+            // sub-expressions must NOT be lowered — they are unevaluated). Like
+            // sizeof/cast, its children (the type-names) must never be lowered as
+            // expressions. Config-driven by rule id — a language without a
+            // `_Generic` surface leaves this invalid and skips it.
+            if (cfg.genericRule.valid()
+             && tree().rule(c).v == cfg.genericRule.v) {
+                return lowerGeneric(c);
             }
         }
         for (NodeId c : visible(node)) {
@@ -1983,14 +2105,55 @@ struct Lowerer {
         return E{errorNode(node), InvalidType};
     }
 
-    // The child rule node of `operand` whose first visible child is `startTok`
-    // (a `charLiteralExpr` / `stringLiteralExpr` subtree), or invalid.
-    [[nodiscard]] NodeId bodyLiteralNodeOf(NodeId operand, SchemaTokenId startTok) {
-        if (!startTok.valid()) return {};
+    // Is `tok` a configured string opener kind? (Any `stringLiteralPrefixes` row,
+    // or the scalar start/unicode tokens for a grammar with no prefix table.)
+    [[nodiscard]] bool isStringOpenerKind(SchemaTokenId tok) const {
+        if (!tok.valid()) return false;
+        for (auto const& px : cfg.stringLiteralPrefixes)
+            if (px.startToken.v == tok.v) return true;
+        return (cfg.stringStartToken.valid() && tok.v == cfg.stringStartToken.v)
+            || (cfg.unicodeStringStartToken.valid()
+                && tok.v == cfg.unicodeStringStartToken.v);
+    }
+
+    // The child rule node of `operand` (a `stringLiteralExpr` subtree) whose FIRST
+    // visible child token is ANY configured string opener — narrow `"`, the wide/
+    // UTF forms `L"`/`u"`/`U"`/`u8"`, or SQL `N'`. The opener token stays a DIRECT
+    // child (the inline-alt opener pushes it flat), so lowerStringLiteral can
+    // recover the specific opener kind; the element core comes from the semantic
+    // stamp, so no derivation is needed here. Invalid ⇒ not a string literal.
+    [[nodiscard]] NodeId stringLiteralNodeOf(NodeId operand) {
         for (NodeId c : visible(operand)) {
             if (tree().kind(c) != NodeKind::Internal) continue;
             for (NodeId g : visible(c)) {
-                if (isToken(g) && tree().tokenKind(g).v == startTok.v) return c;
+                if (isToken(g) && isStringOpenerKind(tree().tokenKind(g))) return c;
+                break;  // only the FIRST visible child decides
+            }
+        }
+        return {};
+    }
+
+    // Is `tok` a configured CHARACTER opener kind? (Any `charLiteralPrefixes` row —
+    // the narrow `'` plus the wide/UTF `L'`/`u'`/`U'`/`u8'` — or the scalar
+    // `charStartToken` for a grammar with no prefix table.) Mirrors
+    // `isStringOpenerKind`.
+    [[nodiscard]] bool isCharOpenerKind(SchemaTokenId tok) const {
+        if (!tok.valid()) return false;
+        for (auto const& px : cfg.charLiteralPrefixes)
+            if (px.startToken.v == tok.v) return true;
+        return cfg.charStartToken.valid() && tok.v == cfg.charStartToken.v;
+    }
+
+    // The child rule node of `operand` (a `charLiteralExpr` subtree) whose FIRST
+    // visible child token is ANY configured char opener — narrow `'` or the wide/UTF
+    // forms `L'`/`u'`/`U'`/`u8'`. The opener token stays a DIRECT child (the inline-
+    // alt opener pushes it flat), so lowerCharLiteral can recover the specific opener
+    // kind. Invalid ⇒ not a char literal. Mirrors `stringLiteralNodeOf`.
+    [[nodiscard]] NodeId charLiteralNodeOf(NodeId operand) {
+        for (NodeId c : visible(operand)) {
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            for (NodeId g : visible(c)) {
+                if (isToken(g) && isCharOpenerKind(tree().tokenKind(g))) return c;
                 break;  // only the FIRST visible child decides
             }
         }
@@ -2004,15 +2167,126 @@ struct Lowerer {
         return {};
     }
 
-    // `'a'` / `'\n'` → a Char-typed literal carrying the decoded codepoint.
+    // The FIRST direct child opener token of a `charLiteralExpr` node — the
+    // element-type discriminator (narrow `'` vs a wide `L'`/`u'`/`U'`/`u8'`).
+    // Mirrors `stringOpenerTokenKind`.
+    [[nodiscard]] SchemaTokenId charOpenerTokenKind(NodeId node) const {
+        for (NodeId c : visible(node)) {
+            if (!isToken(c)) continue;
+            SchemaTokenId const tk = tree().tokenKind(c);
+            if (isCharOpenerKind(tk)) return tk;
+        }
+        return {};
+    }
+
+    // Is `tok` a NON-narrow (wide/UTF) char opener — one whose value is typed by its
+    // prefix (`L'`/`u'`/`U'`/`u8'`)? Unlike strings (where the narrow core is Char
+    // and any non-Char core marks a wide opener), the NARROW char core is `int`
+    // (I32) and `L'` on elf/macho is ALSO I32 — so the core cannot discriminate.
+    // The discriminator is the OPENER TOKEN: any declared char opener that is NOT
+    // the narrow `charStartToken`. Format-agnostic (no `activeFormat` needed).
+    [[nodiscard]] bool isWideCharOpenerKind(SchemaTokenId tok) const {
+        if (!tok.valid()) return false;
+        if (cfg.charStartToken.valid() && tok.v == cfg.charStartToken.v) return false;
+        for (auto const& px : cfg.charLiteralPrefixes)
+            if (px.startToken.v == tok.v) return true;
+        return false;
+    }
+
+    // The config BASE element core of a char opener (`elementCore`, before any
+    // per-format override). Used ONLY to CLASSIFY a fail-loud reason when the
+    // semantic tier dropped the stamp: it is format-invariant for `u'`/`U'`/`u8'`
+    // (single core) and the wider I32 for `L'` (so an astral cp the pe-U16 core
+    // rejected still decodes here → falls to the generic "unrepresentable" reason).
+    [[nodiscard]] TypeKind charOpenerBaseCore(SchemaTokenId tok) const {
+        for (auto const& px : cfg.charLiteralPrefixes)
+            if (px.startToken.v == tok.v) return px.elementCore;
+        return TypeKind::I32;
+    }
+
+    // The element CORE stamped on a char body token by the semantic tier (the ONLY
+    // place wchar_t width was format-resolved). Returns `Void` when the token was
+    // left UNTYPED — the semantic tier's type-drop for a wide char it could not
+    // represent — so a wide opener with a `Void` stamp = that drop (fail loud).
+    [[nodiscard]] TypeKind charElementCoreOf(NodeId bodyTok) const {
+        TypeId const t = typeAtOr(bodyTok, InvalidType);
+        if (t.valid()) return interner.kind(t);
+        return TypeKind::Void;
+    }
+
+    // Is `core` a wide/UTF char element core (the semantic tier stamped a valid wide
+    // char)? Any of U8/U16/U32/I32 — I32 is `L'` on elf/macho. `Void` (the drop
+    // sentinel) and the narrow path never reach here.
+    [[nodiscard]] static bool isWideCharCore(TypeKind core) {
+        return core == TypeKind::U8 || core == TypeKind::U16
+            || core == TypeKind::U32 || core == TypeKind::I32;
+    }
+
+    struct WideCharDiag { DiagnosticCode code; char const* why; };
+    // Map a `decodeWideCharCodepoint` failure to its diagnostic code + reason. Only
+    // the `u8'` range failure is a DISTINCT C23 constraint (char8_t = one UTF-8 code
+    // unit); every other cause is "this wide char does not denote one representable
+    // code unit" (H_WideCharValueUnrepresentable).
+    [[nodiscard]] static WideCharDiag wideCharErrorDetail(WideCharError err) {
+        switch (err) {
+            case WideCharError::Utf8UnitOutOfRange:
+                return {DiagnosticCode::H_Utf8CharLiteralOutOfRange,
+                        "a u8'…' character constant must be a single UTF-8 code unit "
+                        "(code point ≤ U+007F); this code point needs multiple bytes"};
+            case WideCharError::NotSingleCodepoint:
+                return {DiagnosticCode::H_WideCharValueUnrepresentable,
+                        "a character constant must denote EXACTLY ONE code point (the "
+                        "body is empty or multi-character)"};
+            case WideCharError::IllFormedUtf8:
+                return {DiagnosticCode::H_WideCharValueUnrepresentable,
+                        "the character body is not well-formed UTF-8"};
+            case WideCharError::MalformedEscape:
+                return {DiagnosticCode::H_WideCharValueUnrepresentable,
+                        "the character body has a malformed or unsupported escape"};
+            case WideCharError::InvalidUniversalName:
+                return {DiagnosticCode::H_InvalidUniversalCharacterName,
+                        "a \\u/\\U universal character name is malformed (needs exactly "
+                        "4 / 8 hex digits) or names a surrogate half / a value > U+10FFFF"};
+            case WideCharError::ByteEscapeInWide:
+                return {DiagnosticCode::H_WideByteEscapeUnsupported,
+                        "a \\x hex / octal byte escape in a wide/UTF character constant is "
+                        "not supported (it names a raw code-unit value, not a code point) "
+                        "— use a \\u/\\U universal character name"};
+            case WideCharError::ValueUnrepresentable:
+                break;
+        }
+        return {DiagnosticCode::H_WideCharValueUnrepresentable,
+                "the code point cannot be represented in the target element width "
+                "without a surrogate pair (a supplementary-plane code point > U+FFFF "
+                "under a 16-bit char16_t / wchar_t element)"};
+    }
+
+    // `'a'` / `'\n'` (narrow → `int`-valued, Char-typed literal) OR a WIDE/UTF
+    // constant `L'x'`/`u'x'`/`U'x'`/`u8'x'` (C11/C23 6.4.4.4 — typed by its prefix).
     E lowerCharLiteral(NodeId node) {
-        TypeId const type = interner.primitive(TypeKind::Char);
         NodeId const bodyTok = childTokenOfKind(node, cfg.charBodyToken);
-        std::string_view const body = bodyTok.valid() ? tree().text(bodyTok) : std::string_view{};
-        auto cp = decodeCharLiteralBody(body);
+        std::string_view const body =
+            bodyTok.valid() ? tree().text(bodyTok) : std::string_view{};
+        if (isWideCharOpenerKind(charOpenerTokenKind(node)))
+            return lowerWideCharLiteral(node, bodyTok, body);
+
+        // Narrow `'x'` — the EXACT pre-CycleB byte path (Char-typed, single byte).
+        TypeId const type = interner.primitive(TypeKind::Char);
+        EscapeDecodeOutcome outcome;
+        auto cp = decodeCharLiteralBody(body, &outcome);
         if (!cp) {
-            unsupported(node, std::format("char literal '{}' is empty, multi-character, "
-                                          "or has an unsupported escape", body));
+            // FF2: a malformed/invalid `\u`/`\U` gets the specific 6.4.3 code (a valid
+            // multi-byte UCN such as `'é'` keeps the generic multi-character
+            // message — outcome.ok() is true, it is simply > 1 narrow byte).
+            if (outcome.error == EscapeDecodeError::InvalidUniversalName) {
+                emitH(DiagnosticCode::H_InvalidUniversalCharacterName, node,
+                      std::format("char literal '{}' has an invalid universal character "
+                                  "name (\\u needs 4 hex digits, \\U needs 8, and it must "
+                                  "not name a surrogate half or a value > U+10FFFF)", body));
+            } else {
+                unsupported(node, std::format("char literal '{}' is empty, multi-character, "
+                                              "or has an unsupported escape", body));
+            }
             return {errorNode(node, type), type};
         }
         HirLiteralValue v;
@@ -2021,34 +2295,244 @@ struct Lowerer {
         return {track(builder.makeLiteral(type, literals.add(std::move(v))), node), type};
     }
 
+    // A wide/UTF character constant. The format-resolved element core lives on the
+    // SEMANTIC stamp (the char stamp is on the BODY token, unlike a string's expr-
+    // node stamp; the HIR tier lacks `activeFormat`). A VALID wide-core stamp means
+    // the semantic tier accepted the char → re-decode (the SHARED helper) to recover
+    // the code-point value and lower it as that core. A DROPPED stamp = the semantic
+    // type-drop for an unrepresentable char → FAIL LOUD (mirror the string type-drop
+    // guard at lowerStringLiteral), classifying the specific cause off the opener's
+    // config base core (format-invariant for u'/U'/u8'; the wider I32 for L', so an
+    // astral cp the pe-U16 core rejected decodes here and falls to the generic
+    // "unrepresentable" reason — the only L' drop cause is a value the format core
+    // could not hold or a structural one, all H_WideCharValueUnrepresentable).
+    E lowerWideCharLiteral(NodeId node, NodeId bodyTok, std::string_view body) {
+        TypeKind const stampCore       = charElementCoreOf(bodyTok);
+        bool     const semanticOk      = isWideCharCore(stampCore);
+        TypeKind const core            = semanticOk
+                                             ? stampCore
+                                             : charOpenerBaseCore(charOpenerTokenKind(node));
+        WideCharError werr = WideCharError::ValueUnrepresentable;
+        auto cp = decodeWideCharCodepoint(body, core, &werr);
+        if (semanticOk && cp) {
+            TypeId const type = interner.primitive(core);
+            HirLiteralValue v;
+            v.core  = core;
+            v.value = static_cast<std::uint64_t>(*cp);
+            return {track(builder.makeLiteral(type, literals.add(std::move(v))), node), type};
+        }
+        // Type-drop (or the defensive stamp-vs-re-decode mismatch): fail loud with
+        // the specific reason. `werr` keeps its ValueUnrepresentable init when the
+        // base-core re-decode SUCCEEDED but the format core had dropped it (L'-pe
+        // astral) — the honest generic reason.
+        WideCharDiag const d = wideCharErrorDetail(werr);
+        emitH(d.code, node,
+              std::format("wide/UTF character constant {} cannot be lowered: {}",
+                          std::string{tree().text(node)}, d.why));
+        return {errorNode(node), InvalidType};
+    }
+
+    // The element CORE of a string literal — the kind of `operands(nodeType)[0]`
+    // off the SEMANTIC stamp (F2, the ONLY place wchar_t width was format-resolved).
+    // Falls back to Char when the node was not stamped as an array (a malformed
+    // literal, or a grammar whose typing left it untyped) — the narrow default.
+    [[nodiscard]] TypeKind stringElementCoreOf(NodeId node) const {
+        TypeId const t = typeAtOr(node, InvalidType);
+        if (t.valid() && interner.kind(t) == TypeKind::Array) {
+            auto const ops = interner.operands(t);
+            if (!ops.empty() && ops[0].valid()) return interner.kind(ops[0]);
+        }
+        return TypeKind::Char;
+    }
+
+    // A code-unit element core that is NOT the narrow byte form (Char/Byte) — i.e.
+    // one that goes through the UTF-8 decode + re-encode path.
+    [[nodiscard]] static bool isNonNarrowCore(TypeKind core) {
+        return core != TypeKind::Char && core != TypeKind::Byte;
+    }
+
+    // Is `tok` a NON-NARROW string opener — one that requires the UTF-8 code-unit
+    // path (`u"`/`U"`/`u8"`, or `L"` whose per-format core is a wide kind)? True when
+    // ANY of the opener's possible cores (the base `elementCore` OR any
+    // `elementCoreByFormat` value) is non-narrow, so the classification is format-
+    // AGNOSTIC (no `activeFormat` needed here — the HIR tier lacks it). The narrow
+    // `"` (Char base, no format map) and SQL `N'` stay false. Used to DETECT a
+    // semantic type-drop: a wide opener whose node was left narrow/untyped (e.g. an
+    // astral cp the format-resolved core could not hold) — HIR fails loud on that
+    // rather than silently taking the narrow byte path.
+    [[nodiscard]] bool isWideStringOpenerKind(SchemaTokenId tok) const {
+        for (auto const& px : cfg.stringLiteralPrefixes) {
+            if (px.startToken.v != tok.v) continue;
+            if (isNonNarrowCore(px.elementCore)) return true;
+            for (auto const& [fmt, core] : px.elementCoreByFormat) {
+                (void)fmt;
+                if (isNonNarrowCore(core)) return true;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    // The opener token kind of a `stringLiteralExpr` node — its FIRST direct child
+    // token that is a configured string opener (the element-core discriminator).
+    [[nodiscard]] SchemaTokenId stringOpenerTokenKind(NodeId node) const {
+        for (NodeId c : visible(node)) {
+            if (!isToken(c)) continue;
+            SchemaTokenId const tk = tree().tokenKind(c);
+            if (isStringOpenerKind(tk)) return tk;
+        }
+        return {};
+    }
+
     // `"hello"` (or adjacent-concatenated `"hel" "lo"`, C 5.1.1.2 phase 6) → an
-    // Array<Char, N+1> literal carrying the decoded bytes (NUL implied by the +1
-    // length). N is the sum of the per-segment decoded lengths.
+    // `Array<core, N+1>` literal carrying the decoded code units (NUL implied by the
+    // +1). The element core is taken from the semantic stamp: narrow `"` → Char
+    // (byte path, unchanged); the wide/UTF openers `L"`/`u"`/`U"`/`u8"` → their core
+    // (the escape-decoded bytes are UTF-8-decoded and re-encoded to that width via
+    // the SHARED encoder the semantic typer used, so both tiers agree on N).
     E lowerStringLiteral(NodeId node) {
         std::string bytes;
+        EscapeDecodeOutcome outcome;
         if (cfg.stringDoubledDelimiter) {
             // SQL `'…''…'`: doubled-delimiter escaping, single body (no phase-6
-            // concat in SQL) — never fails (pairs only).
+            // concat in SQL) — never fails (pairs only). Always the narrow Char form.
             NodeId const bodyTok = childTokenOfKind(node, cfg.stringBodyToken);
             std::string_view const body =
                 bodyTok.valid() ? tree().text(bodyTok) : std::string_view{};
             bytes = decodeDoubledDelimiterBody(body, cfg.stringDelimiter);
         } else if (auto decoded =
-                       decodeAdjacentStringBodies(tree(), node, cfg.stringBodyToken)) {
+                       decodeAdjacentStringBodies(tree(), node, cfg.stringBodyToken, &outcome)) {
             // C-family: every body child decoded (backslash escapes) then byte-joined
             // — the SAME chokepoint the semantic typer uses, so both tiers agree on N.
             bytes = std::move(*decoded);
         } else {
-            unsupported(node, std::format("string literal {} has an unsupported escape",
-                                          std::string{tree().text(node)}));
+            // FF2: a malformed/invalid `\u`/`\U` (6.4.3) gets the specific code, not
+            // the generic escape error.
+            if (outcome.error == EscapeDecodeError::InvalidUniversalName) {
+                emitH(DiagnosticCode::H_InvalidUniversalCharacterName, node,
+                      std::format("string literal {} has an invalid universal character "
+                                  "name (\\u needs 4 hex digits, \\U needs 8, and it must "
+                                  "not name a surrogate half or a value > U+10FFFF)",
+                                  std::string{tree().text(node)}));
+            } else {
+                unsupported(node, std::format("string literal {} has an unsupported escape",
+                                              std::string{tree().text(node)}));
+            }
             return {errorNode(node), InvalidType};
         }
-        TypeId const type = interner.array(interner.primitive(TypeKind::Char),
-                                           static_cast<std::int64_t>(bytes.size() + 1));
+
+        // C11/C23 6.4.5p5 (Cycle D): the run's EFFECTIVE encoding prefix — the single
+        // distinct NON-narrow opener among ALL adjacent segments (a narrow segment
+        // widens to it, position-independent). MF2: the classifier compares opener
+        // TOKEN KINDS via the format-agnostic `isWideStringOpenerKind`, never resolved
+        // cores (`u"`/`L"` both resolve to U16 on pe). The FF3 + type-drop guards below
+        // now key on this RUN prefix (not the first opener), closing the FF3-mixed hole
+        // where `"a" L"\xC3"` (first opener narrow) escaped the byte-escape guard.
+        EffectiveStringPrefix const eff = effectiveStringConcatPrefix(
+            tree(), node,
+            [this](SchemaTokenId tk) { return isWideStringOpenerKind(tk); },
+            stringOpenerTokenKind(node));
+        // MF1 (CRITICAL — closes a silent miscompile): two DIFFERENT non-narrow
+        // prefixes (`u"a" U"b"`) is 6.4.5p5's impl-defined case; we REJECT it. This
+        // MUST be an EXPLICIT EARLY branch: a plain `u"a" U"b";` statement re-derives
+        // its type HERE (the semantic tier left it untyped), and if we fell through to
+        // the wideness-keyed guards below they would BOTH miss (byte-escape false; the
+        // stamp fell back to Char) → `Array<Char,3>` "ab", `ok=true` = a SILENT
+        // MISCOMPILE. Fail loud first, before any guard consumes the effective opener.
+        if (eff.conflict) {
+            emitH(DiagnosticCode::H_ConflictingStringLiteralPrefixes, node,
+                  std::format("string literal {} concatenates two different non-narrow "
+                              "encoding prefixes; whether differently-prefixed wide "
+                              "string literals may be concatenated is implementation-"
+                              "defined (C 6.4.5p5) and this implementation rejects it — "
+                              "use a single encoding prefix for the whole literal",
+                              std::string{tree().text(node)}));
+            return {errorNode(node), InvalidType};
+        }
+
+        // N7 (Cycle D widening consequence): once the run's effective prefix is
+        // non-narrow, EVERY segment — including a NARROW one — widens into the wide
+        // code-unit path, so a narrow segment carrying raw invalid-UTF-8 bytes (or a
+        // `\x`/octal byte escape) now FAILS LOUD here (the FF3 guard below, or the
+        // wide-encode UTF-8 validation) where the SAME bytes in a pure-narrow string
+        // pass through untouched. That is the correct C 6.4.5p5 behavior: the bytes are
+        // no longer a narrow byte sequence but a UTF-8 source that must decode.
+        TypeKind const core = stringElementCoreOf(node);
+        // FF3: a `\x` hex / octal byte escape in a wide/UTF string names a raw
+        // code-unit VALUE, not a code point — assembling it is deferred
+        // (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE), so FAIL LOUD rather than the old
+        // silent UTF-8-collapse (`u"\xC3\xA9"` → one 0x00E9 unit instead of two).
+        // Keyed on the run's EFFECTIVE prefix (format-agnostic) so it fires even when
+        // the semantic tier left the node untyped, AND on a MIXED run `"a" L"\xC3"`
+        // whose first opener is narrow. Narrow `"…"`/SQL keep `\x`/octal (byte-producing).
+        if (outcome.usedByteEscape && isWideStringOpenerKind(eff.effectiveOpener)) {
+            emitH(DiagnosticCode::H_WideByteEscapeUnsupported, node,
+                  std::format("wide/UTF string literal {} cannot be lowered: a \\x hex / "
+                              "octal byte escape names a raw code-unit value, not a code "
+                              "point — use a \\u/\\U universal character name",
+                              std::string{tree().text(node)}));
+            return {errorNode(node), InvalidType};
+        }
+        // A wide opener (`u"`/`U"`/`u8"`/`L"`) whose node the semantic tier left
+        // NARROW or UNTYPED = a type-drop, which happens exactly when the encode was
+        // not representable — now only ILL-FORMED UTF-8 or a code point past U+10FFFF
+        // (an astral cp under a 16-bit element encodes as a surrogate pair; a byte
+        // escape was already rejected above). Reading the stamp gave Char, which would
+        // silently route the raw UTF-8 down the narrow byte path — instead FAIL LOUD.
+        // (No format is needed here: the stamp carries the correct wide core whenever
+        // the encode WAS representable, so a narrow stamp under a wide opener is always
+        // the unrepresentable case.)
+        if ((core == TypeKind::Char || core == TypeKind::Byte)
+            && isWideStringOpenerKind(eff.effectiveOpener)) {
+            emitH(DiagnosticCode::H_WideCharSurrogateUnsupported, node,
+                  std::format("wide/UTF string literal {} cannot be lowered: its body is "
+                              "not well-formed UTF-8, or a code point exceeds U+10FFFF "
+                              "(not a Unicode scalar value)",
+                              std::string{tree().text(node)}));
+            return {errorNode(node), InvalidType};
+        }
+        // NARROW (`"`, SQL, u8's byte width is Char-equal — but u8 still routes the
+        // wide encoder to VALIDATE the UTF-8, see below). Char/Byte keep the exact
+        // byte path: raw ≥0x80 bytes pass through, length = byte count.
+        if (core == TypeKind::Char || core == TypeKind::Byte) {
+            TypeId const type = interner.array(interner.primitive(core),
+                                               static_cast<std::int64_t>(bytes.size() + 1));
+            HirLiteralValue v;
+            v.core  = core;
+            v.value = std::move(bytes);
+            return {track(builder.makeLiteral(type, literals.add(std::move(v))), node), type};
+        }
+
+        // WIDE / UTF (`u"`→U16, `U"`→U32, `L"`→U16|I32, `u8"`→U8): UTF-8-decode the
+        // (escape-decoded) bytes and re-encode into the element width. Fail LOUD on
+        // a code point that cannot be represented without truncation — never a
+        // silent wrong unit. `u8"` also flows here so its raw UTF-8 is VALIDATED
+        // (an ill-formed `u8"…"` fails loud rather than emitting garbage bytes).
+        WideEncodeResult enc;
+        if (auto err = encodeWideString(bytes, core, enc)) {
+            emitH(DiagnosticCode::H_WideCharSurrogateUnsupported, node,
+                  wideEncodeErrorDetail(*err, core, node));
+            return {errorNode(node), InvalidType};
+        }
+        TypeId const type = interner.array(interner.primitive(core),
+                                           static_cast<std::int64_t>(enc.codeUnits + 1));
         HirLiteralValue v;
-        v.core  = TypeKind::Char;
-        v.value = std::move(bytes);
+        v.core  = core;
+        v.value = std::move(enc.bytes);   // the element-width code units (LE), no NUL
         return {track(builder.makeLiteral(type, literals.add(std::move(v))), node), type};
+    }
+
+    // A human-readable reason for an H_WideCharSurrogateUnsupported diagnostic —
+    // names the first offending code point (re-derived from the body) so the
+    // message is actionable (which char, and why it can't be represented).
+    [[nodiscard]] std::string wideEncodeErrorDetail(WideEncodeError err, TypeKind core,
+                                                    NodeId node) {
+        char const* what =
+            err == WideEncodeError::CodepointTooLarge
+                ? "a code point exceeds U+10FFFF (not a Unicode scalar value)"
+                : "the string body is not well-formed UTF-8";
+        return std::format("wide/UTF string literal {} cannot be lowered: {}",
+                           std::string{tree().text(node)}, what);
     }
 
     // SQL `NULL` (typeless) → a leaf Extension node of the configured kind.
@@ -3490,6 +3974,34 @@ struct Lowerer {
                                                  HirFlags::Synthetic), node);
                 containerType = pointeeType;
             }
+            // FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23 §6.7.2.1 ¶13): a
+            // field reachable ONLY through one or more ANONYMOUS struct/union
+            // members carries an `anonAncestorPath` (outermost→innermost) that
+            // Pass 1.5 recorded. Synthesize ONE intermediate MemberAccess hop
+            // per ancestor BEFORE the final field access — exactly the HIR a
+            // hand-written `s.anon.field` chain lowers to (each hop selects the
+            // anon composite member of its container, then the final access
+            // selects `field` within the innermost anon composite). We thread
+            // `object` + `containerType` forward so the arrow's Deref and any
+            // container-volatility propagate through the chain unchanged.
+            if (!frec->anonAncestorPath.empty()) {
+                for (SymbolId ancestorSym : frec->anonAncestorPath) {
+                    auto const* arec = model.recordFor(ancestorSym);
+                    if (arec == nullptr) {
+                        return exprError(node, "anonymous-member ancestor "
+                                               "SymbolId has no record");
+                    }
+                    TypeId const hopType =
+                        volatileQualifiedAccess(arec->type, containerType);
+                    object = track(builder.makeMemberAccess(
+                                       object, arec->fieldIndex, hopType,
+                                       HirFlags::Synthetic),
+                                   node);
+                    // The next hop's (and the final field's) immediate container
+                    // is this anon composite.
+                    containerType = hopType;
+                }
+            }
             // c27 (D-CSUBSET-VOLATILE-POINTEE): if the CONTAINER is volatile, the
             // member's TYPE is volatile-qualified (C 6.5.2.3) — this is what flags
             // the access at the MIR site AND propagates through nested chains (see
@@ -4657,6 +5169,27 @@ struct Lowerer {
         return {track(builder.makeSizeOf(tref, u64), node), u64};
     }
 
+    // C11/C23 6.5.3.4: `_Alignof ( type-name )` | `alignof ( type-name )` → core
+    // `HirKind::AlignOf`, result type size_t (U64). An ADDITIVE mirror of
+    // `lowerSizeof` reading ALIGNMENT instead of size. TYPE-NAME FORM ONLY (no
+    // value form): the operand is ALWAYS the castTypeRef, whose semantic-stamped
+    // type this recovers via the SAME `resolveStampedTypeBelow` descent sizeof
+    // uses (past any wrapper), then emits the leaf. The operand is UNEVALUATED —
+    // only its type reaches the node; the AlignOf folds to that type's alignment
+    // via the `type_layout` engine at MIR lowering.
+    [[nodiscard]] E lowerAlignof(NodeId node) {
+        TypeId sized = InvalidType;
+        for (NodeId c : visible(node)) {
+            if (TypeId t = resolveStampedTypeBelow(c); t.valid()) { sized = t; break; }
+        }
+        if (!sized.valid()) {
+            return exprError(node, "_Alignof operand did not resolve to a type");
+        }
+        HirNodeId const tref = track(builder.makeTypeRef(sized), node);
+        TypeId const u64 = interner.primitive(TypeKind::U64);
+        return {track(builder.makeAlignOf(tref, u64), node), u64};
+    }
+
     // D-CSUBSET-COMPUTED-GOTO: `&&label` → core `HirKind::LabelAddressOf`. The
     // grammar (`labelAddressExpr = AndAndOp Identifier`) carries the target label
     // as a RAW Identifier token (the label namespace — NOT a value symbol). Resolve
@@ -4748,6 +5281,39 @@ struct Lowerer {
         if (!ap.type.valid()) return ap;   // diagnostic already emitted
         HirNodeId const tref = track(builder.makeTypeRef(argTy), node);
         return {track(builder.makeVaArg(ap.id, tref, argTy), node), argTy};
+    }
+
+    // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): `_Generic ( ctrl ,
+    // assoc-list )` → the SELECTED association's result-expression, unchanged.
+    // 6.5.1.1p3: "the result has the type and value of the selected assignment
+    // expression" — so this lowers ONLY that one sub-expression (no conversion is
+    // applied; its type IS the result type) and NONE of the others (they are
+    // unevaluated). The SEMANTIC tier already did the compile-time type match and
+    // recorded the winner's NodeId (`model.selectedGenericExpr`); a `_Generic`
+    // that could NOT select (no match + no default, or ambiguous, or an
+    // un-typeable controlling expression) has NO recorded selection AND the
+    // analyzer already errored — fail loud here (never a silent mis-lower). The
+    // NON-selected associations' expressions are discarded WITHOUT being lowered,
+    // so a non-selected branch imposes no lowering-tier constraint (6.5.1.1p3).
+    [[nodiscard]] E lowerGeneric(NodeId node) {
+        NodeId const selected = model.selectedGenericExpr(node);
+        if (!selected.valid()) {
+            // The analyzer left this `_Generic` unselected (a constraint violation
+            // it already reported — S_GenericSelectionNoMatch / Ambiguous — or a
+            // cascade from an un-typeable controlling expression). Emit a loud HIR
+            // error so the failure is never silent even if the semantic diagnostic
+            // were suppressed; both selection-failure codes are unsuppressable.
+            return exprError(node,
+                "_Generic did not select an association (no matching type and no "
+                "default, an ambiguous match, or an un-typeable controlling "
+                "expression)");
+        }
+        // Lower ONLY the selected association's assignment-expression; its result
+        // (id + type) IS the generic selection's result. `track` re-anchors the
+        // lowered node to the `_Generic` CST node for provenance/diagnostics.
+        E const chosen = lowerExpr(selected);
+        if (!chosen.type.valid()) return chosen;   // diagnostic already emitted
+        return {track(chosen.id, node), chosen.type};
     }
 
     // FC2: explicit cast `(T)expr` (`hirLowering.castRule`). The grammar
@@ -5550,6 +6116,27 @@ struct Lowerer {
         return asStmt(*lv, lvWrite(*lv, value), incDecNode);
     }
 
+    // FC16 (D-CSUBSET-NORETURN): true iff `id` is a DIRECT call to a function
+    // symbol declared noreturn (`_Noreturn`/`[[noreturn]]`/`__attribute__((noreturn))`
+    // — or a shipped `abort`/`exit`). ⚠️ F1 (the miscompile guard): inspect the
+    // lowered Call's CALLEE CHILD directly (`makeCall` pushes the callee first, so
+    // it is `children().front()`) — it must be a `HirKind::Ref` whose bound record
+    // is noreturn. NEVER the `firstNameToken` name-resolver: a noreturn function is
+    // ADDRESS-TAKEABLE, so `(cond ? die : other)(1)` is legal C; firstNameToken
+    // would resolve that to `die` and wrongly wrap it → eliding `other`'s return
+    // path = a MISCOMPILE. A ternary / deref / cast callee lowers to a NON-Ref node
+    // → false (safe, conservative); a function-POINTER object `fp(1)` lowers to
+    // Ref(fp) whose record has isNoreturn==false → false (safe). Only a bare direct
+    // call to a noreturn callee is wrapped.
+    [[nodiscard]] bool isDirectNoreturnCall(HirNodeId id) const {
+        if (builder.kind(id) != HirKind::Call) return false;
+        auto const kids = builder.children(id);
+        if (kids.empty() || builder.kind(kids.front()) != HirKind::Ref) return false;
+        SymbolId const sym{builder.payload(kids.front())};
+        auto const* rec = model.recordFor(sym);
+        return rec != nullptr && rec->isNoreturn;
+    }
+
     // The statement-position dispatch shared by exprStmt and for-init/update:
     // assignment / compound-assignment / inc-dec become statements; anything else
     // is the bare lowered expression (wrapped in ExprStmt when `wrapBare`).
@@ -5595,7 +6182,25 @@ struct Lowerer {
             }
         }
         HirNodeId e = lowerExpr(core).id;
-        return wrapBare ? track(builder.makeExprStmt(e), core) : e;
+        if (!wrapBare) return e;   // for-init/update: the bare expression (untouched)
+        // FC16 (D-CSUBSET-NORETURN): a DIRECT call to a noreturn function
+        // structurally terminates — wrap it `Block{ ExprStmt(call), Unreachable }`
+        // (the Block + terminator leaf both Synthetic; the ExprStmt is the real
+        // relocated statement, non-synthetic) EXACTLY like `wrapIfProvablyInfinite`
+        // wraps a provably-infinite loop, so a noreturn-terminated path satisfies
+        // non-void return completeness. `lowerStmtExprCore` (wrapBare=true) is the
+        // single chokepoint every statement-position body routes through (block-item
+        // + bare if/while/for/label arm), so this covers them all. HIR→MIR spins the
+        // following statement into a dead pruned block via the existing
+        // open-block-has-terminator guard (the infinite-loop wrap precedent).
+        if (isDirectNoreturnCall(e)) {
+            HirNodeId const stmt = track(builder.makeExprStmt(e), core);
+            HirNodeId const unreach = builder.addLeaf(
+                HirKind::Unreachable, InvalidType, /*payload=*/0, HirFlags::Synthetic);
+            HirNodeId const wrapped[] = {stmt, unreach};
+            return track(builder.makeBlock(wrapped, HirFlags::Synthetic), core);
+        }
+        return track(builder.makeExprStmt(e), core);
     }
 
     HirNodeId lowerExprStmt(NodeId node) {
@@ -6350,6 +6955,7 @@ struct Lowerer {
                 HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), d);
                 recordMutability(g, sym);
                 recordVolatility(g, sym);   // c21: volatile static-local global init store
+                recordAlignment(g, sym);    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
                 recordLinkage(g, staticLinkage);  // {Local, Default} — internal
                 moduleDecls_->push_back(g);
                 continue;
@@ -6367,6 +6973,11 @@ struct Lowerer {
             // store into its alloca (HIR→MIR :5712) — record unconditionally on
             // the VarDecl/Global node (UNLIKE mutability, which is global-only).
             recordVolatility(lowered, sym);
+            // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: `alignas` applies to BOTH a
+            // global (raises its data-item section alignment) AND a local
+            // (raises its alloca's effective frame-slot alignment) — record
+            // unconditionally on the VarDecl/Global node, like volatility.
+            recordAlignment(lowered, sym);
             out.push_back(lowered);
         }
     }
@@ -6429,10 +7040,12 @@ struct Lowerer {
             HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
             recordMutability(g, sym);   // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL
             recordVolatility(g, sym);   // c21 (D-CSUBSET-VOLATILE-QUALIFIER)
+            recordAlignment(g, sym);    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
             return g;
         }
         HirNodeId const vd = track(builder.makeVarDecl(type, sym.v, init), node);
         recordVolatility(vd, sym);      // c21: volatile local init store
+        recordAlignment(vd, sym);       // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
         return vd;
     }
 
@@ -6470,6 +7083,17 @@ struct Lowerer {
             sym = model.symbolAt(vis[*decl->nameChild]);
             if (auto const* rec = model.recordFor(sym)) type = rec->type;
         }
+        // D-CSUBSET-ANON-TYPEDECL-TYPE-FALLBACK: an ANONYMOUS composite specifier
+        // (tagless `enum {…}` / `struct {…}` / `union {…}`) binds its interned type
+        // on the SPECIFIER node ITSELF (Pass-1.5 stamps `nodeToType[specNode]`), NOT
+        // on the name-child — which for an anon composite is the BODY node, carrying
+        // no symbol. So the name-child probe above leaves `type` invalid there. Fall
+        // back to the type the analyzer already stamped on this node; without it a
+        // standalone anonymous TypeDecl whose enumerator is used in a file-scope
+        // const-expr (`enum { V = 16 }; int arr[V];`) fails H_TypeUnresolved at the
+        // HIR verifier even though the enum type resolved fine (the NAMED form is
+        // clean because vis[nameChild] is the tag Identifier, where the symbol binds).
+        if (!type.valid()) type = model.typeAt(node);
         return track(builder.makeTypeDecl(type, sym.v), node);
     }
 
@@ -6792,6 +7416,7 @@ struct Lowerer {
         HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
         recordLinkage(g, linkAttr);
         recordMutability(g, sym);   // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL
+        recordAlignment(g, sym);    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
         return g;
     }
 
@@ -7302,6 +7927,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared (access node → VolatileAttr)
     // accumulator, moved onto result->volatileMap after finish().
     std::vector<std::pair<HirNodeId, VolatileAttr>> volatileAcc;
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: shared (decl node → AlignmentAttr)
+    // accumulator, moved onto result->alignmentMap after finish().
+    std::vector<std::pair<HirNodeId, AlignmentAttr>> alignmentAcc;
 
     // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
     // to its language's config + the shared output. `Tree::schema()` is the
@@ -7313,7 +7941,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
-            mutability, volatileAcc));
+            mutability, volatileAcc, alignmentAcc));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -7362,6 +7990,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     for (auto& [id, attr] : linkage) result->linkageMap.set(id, attr);
     for (auto& [id, attr] : mutability) result->mutabilityMap.set(id, attr);
     for (auto& [id, attr] : volatileAcc) result->volatileMap.set(id, attr);  // c21
+    for (auto& [id, attr] : alignmentAcc) result->alignmentMap.set(id, attr);  // alignas
     result->externDecls = std::move(externDecls);
 
     // verify-on-load.

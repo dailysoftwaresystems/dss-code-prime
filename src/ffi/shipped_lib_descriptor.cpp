@@ -863,6 +863,19 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             linkage = *l;
         }
 
+        // FC16 (D-CSUBSET-NORETURN): optional `noreturn` bool (default false) —
+        // TRUE for abort/exit. Threaded onto the injected symbol's isNoreturn so a
+        // direct call is wrapped `Block{ ExprStmt(call), Unreachable }` at HIR.
+        bool noreturn = false;
+        if (sym.contains("noreturn")) {
+            if (!sym.at("noreturn").is_boolean()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": 'noreturn' must be a boolean");
+                continue;
+            }
+            noreturn = sym.at("noreturn").get<bool>();
+        }
+
         // Optional per-SYMBOL `availableObjectFormats` — which object-formats this
         // symbol EXISTS on (errno's __error is ["macho"], __errno_location ["elf"];
         // the Linux-only fdatasync/fallocate/mremap are ["elf"]). EMPTY/absent =
@@ -935,7 +948,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         // Reject unknown per-symbol keys (closed key set).
         (void)rejectUnknownKeys(reporter, sym, "symbols[" + std::to_string(idx - 1) + "]",
                                 {"name", "signature", "signatureByDataModel",
-                                 "kind", "linkage", "availableObjectFormats"});
+                                 "kind", "linkage", "availableObjectFormats",
+                                 "noreturn"});
 
         // Decode the signature via the ONE type-text decoder. A decode failure
         // is the CRITICAL fail-loud: F_ShippedLibUnsupportedType, and the
@@ -962,7 +976,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         }
 
         out.symbols.push_back(
-            ShippedSymbol{std::move(name), sig, kind, linkage, std::move(symAvail)});
+            ShippedSymbol{std::move(name), sig, kind, linkage, std::move(symAvail),
+                          noreturn});
     }
 
     // (5) Optional `constants` array — the neutral form of a header's object-

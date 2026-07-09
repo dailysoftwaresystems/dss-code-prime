@@ -226,6 +226,137 @@ TEST(Inlining, GlobalLeafCalleeIsInlined) {
         << "the inlined module must pass the MIR verifier";
 }
 
+// D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP: the mixed-class inline
+// operand-identity pin (MIR tier). A callee `g(int a, double x)` whose body is
+// `(int)x` (FPToSI over the FP param) — inlined into `main(int p, double q)`
+// calling `g(p, q)` — MUST splice the FPToSI over main's DOUBLE arg `q`, not the
+// int arg `p`. On a SysV CC the Arg ordinals COLLIDE (a=gpr#0, x=fpr#0, both
+// ordinal 0); only the flat call-operand POSITION (a=0, x=1) disambiguates.
+// RED-ON-DISABLE: revert emitCalleeInst's mapping to `argIndex` (the ordinal)
+// and the FPToSI splices over `p` (an I32) — the F64 type assert below fails
+// (and codegen would then read the int bits as a double: the release miscompile
+// that returned 0 for `g(1, 47.0)`).
+TEST(Inlining, MixedClassCalleeSplicesFpArgByPositionNotOrdinal) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32 = interner.primitive(TypeKind::I32);
+    TypeId const f64 = interner.primitive(TypeKind::F64);
+    TypeId const params[] = {i32, f64};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    // g(int a, double x) { return (int)x; }  — a=gpr#0/pos0, x=fpr#0/pos1.
+    mb.addFunction(fnSig, SymbolId{200}, SymbolBinding::Global,
+                   SymbolVisibility::Default);
+    MirBlockId const gEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(gEntry);
+    (void)mb.addArg(0, i32, 0);                  // a: ordinal 0, position 0
+    MirInstId const gx = mb.addArg(0, f64, 1);   // x: ordinal 0, position 1
+    MirInstId const gxOps[] = {gx};
+    MirInstId const conv = mb.addInst(MirOpcode::FPToSI, gxOps, i32);
+    mb.addReturn(conv);
+
+    // main(int p, double q) { return g(p, q); }
+    mb.addFunction(fnSig, SymbolId{201});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const p = mb.addArg(0, i32, 0);
+    MirInstId const q = mb.addArg(0, f64, 1);
+    MirInstId const gAddr = mb.addGlobalAddr(SymbolId{200}, fnSig);
+    MirInstId const callOps[] = {gAddr, p, q};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+    mb.addReturn(call);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 1u) << "the mixed-class leaf callee must inline";
+
+    // The spliced FPToSI's operand must be the DOUBLE actual — provable by its
+    // F64 type. Under the ordinal bug it would be the I32 `p`.
+    bool foundConv = false;
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t fi = 0; fi < nf; ++fi) {
+        MirFuncId const f = mir.funcAt(fi);
+        if (mir.funcSymbol(f).v != 201u) continue;   // main
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(f, bi);
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t i = 0; i < ni; ++i) {
+                MirInstId const id = mir.blockInstAt(b, i);
+                if (mir.instOpcode(id) != MirOpcode::FPToSI) continue;
+                foundConv = true;
+                auto const ops = mir.instOperands(id);
+                ASSERT_EQ(ops.size(), 1u);
+                EXPECT_EQ(static_cast<int>(interner.kind(mir.instType(ops[0]))),
+                          static_cast<int>(TypeKind::F64))
+                    << "the spliced FPToSI must consume main's DOUBLE arg q "
+                       "(mapped by flat position), not the int p (the colliding "
+                       "per-class ordinal)";
+            }
+        }
+    }
+    EXPECT_TRUE(foundConv) << "the callee's FPToSI must be spliced into main";
+
+    MirVerifier verifier{mir, &interner};
+    EXPECT_TRUE(verifier.verify(rep)) << "inlined module must verify";
+}
+
+// D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP F1: the flat Arg `position`
+// survives a MirFunctionRebuilder round-trip (every pass drives the rebuilder;
+// Identity is the FIRST release pass, so a position wipe here would kill the
+// fix before Inlining runs). Optimize with [Identity] and assert positions are
+// intact. RED-ON-DISABLE: drop the argPosition thread at
+// mir_rebuild_helper.cpp's Arg re-encode and the mixed-class positions collapse
+// to their ordinals → the duplicate-position verifier reds (result.ok=false).
+TEST(Inlining, ArgPositionSurvivesRebuildRoundTrip) {
+    auto targetR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(targetR.has_value());
+    TargetSchema const& target = **targetR;
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32 = interner.primitive(TypeKind::I32);
+    TypeId const f64 = interner.primitive(TypeKind::F64);
+    TypeId const params[] = {i32, f64, i32};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{300});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    (void)mb.addArg(0, i32, 0);   // ordinal gpr#0, position 0
+    (void)mb.addArg(0, f64, 1);   // ordinal fpr#0, position 1 (COLLIDES on ord)
+    MirInstId const c = mb.addArg(1, i32, 2);   // ordinal gpr#1, position 2
+    mb.addReturn(c);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    opt::OptPipeline pipeline{"identity", {opt::PassId::Identity}};
+    auto const result = opt::optimize(mir, target, interner, pipeline, rep);
+    EXPECT_TRUE(result.ok)
+        << "Identity round-trip must preserve distinct Arg positions "
+           "(a wipe collapses the mixed-class Args to colliding ordinals and "
+           "reds the duplicate-position verifier check)";
+
+    // Positions {0,1,2} survive verbatim.
+    std::vector<std::uint32_t> positions;
+    MirFuncId const f = mir.funcAt(0);
+    std::uint32_t const nb = mir.funcBlockCount(f);
+    for (std::uint32_t bi = 0; bi < nb; ++bi) {
+        MirBlockId const b = mir.funcBlockAt(f, bi);
+        std::uint32_t const ni = mir.blockInstCount(b);
+        for (std::uint32_t i = 0; i < ni; ++i) {
+            MirInstId const id = mir.blockInstAt(b, i);
+            if (mir.instOpcode(id) == MirOpcode::Arg)
+                positions.push_back(mir.argPosition(id));
+        }
+    }
+    std::sort(positions.begin(), positions.end());
+    EXPECT_EQ(positions, (std::vector<std::uint32_t>{0u, 1u, 2u}))
+        << "the three distinct flat positions must survive the rebuild";
+}
+
 // ── FC7 C1c/C3: frame/ABI-sensitive callees are REFUSED at the gate ──
 // (D-FC7-INLINE-MULTI-PIECE-RETURN — closed via the legality-gate refusal.)
 // A callee that returns a struct IN REGISTERS lowers to a MULTI-piece

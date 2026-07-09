@@ -161,7 +161,24 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
             for (std::size_t i = 0; i < srcFields.size(); ++i)
                 offsets.push_back(src.explicitFieldOffset(srcId, i).value_or(0));
         }
-        dst.completeComposite(fwd, fields, widths, offsets);
+        // D-CSUBSET-MEMBER-ALIGNAS: carry member-alignas overrides across reintern —
+        // without this the reinterned composite loses its declared field alignment
+        // (falls back to natural) and forks the TypeId. Empty when the source aligns
+        // naturally. A source struct can carry offsets OR aligns but not both
+        // (completeComposite rejects the pair), so exactly one span is non-empty.
+        std::vector<std::uint32_t> aligns;
+        if (src.hasExplicitAligns(srcId)) {
+            aligns.reserve(srcFields.size());
+            for (std::size_t i = 0; i < srcFields.size(); ++i)
+                aligns.push_back(src.explicitFieldAlign(srcId, i));
+        }
+        // D-CSUBSET-PACKED: carry the whole-composite packed flag across reintern.
+        // Without it a packed struct crossing a CU/round-trip boundary silently
+        // reinterns as UNPACKED — a silent ABI miscompile (the exact reason the
+        // `completeComposite` packed parameter is non-defaulted: this call FAILS TO
+        // COMPILE if packed is forgotten). packed + explicit offsets never coexist
+        // (completeComposite rejects the pair), so `offsets` is empty when packed.
+        dst.completeComposite(fwd, fields, src.isPacked(srcId), widths, offsets, aligns);
         return fwd;
     }
 

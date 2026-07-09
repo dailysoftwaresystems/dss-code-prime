@@ -36,6 +36,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>  // std::istreambuf_iterator (do not rely on a transitive include)
+#include <optional>  // std::optional (per-target exitCode override)
 #include <string>
 #include <vector>
 
@@ -165,6 +166,11 @@ struct ExampleTarget {
     // used when the target arch differs from the host arch. Empty ⇒
     // native execution only (the pre-V2-1 default).
     std::string              emulator;
+    // C11/C23 6.4.5 (wchar_platform_width): optional PER-TARGET exit-code override
+    // for a source whose return value is platform-divergent (e.g. sizeof(wchar_t)
+    // is 2 on pe64, 4 on elf/mach-o). Absent ⇒ the manifest `exitCode` applies.
+    // Mirrors the in-process examples_runner so BOTH corpus harnesses agree.
+    std::optional<std::int64_t> exitCodeOverride;
 };
 
 // V2-4 Part C (D-DIAG-CLI-POSITION-RENDER-AND-ASSERT): one declared
@@ -174,6 +180,15 @@ struct ExpectedDiagnostic {
     std::string   code;
     std::uint32_t line = 0;
     std::uint32_t col  = 0;
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN (#4): true (default) ⇒ the diagnostic
+    // carries a source span and the CLI's positioned renderer prints `:line:col`
+    // (this harness greps for it). false ⇒ the diagnostic is emitted at a tier
+    // with NO source span (e.g. `L_OverAlignedStackLocal` from the LIR calling-
+    // convention frame layout), so the CLI renders it code-only
+    // (`error[<code>]`) — the HONEST output of a span-less tier; this harness
+    // then greps for that form instead of a fabricated position. Parsed from an
+    // optional `"positioned": false` manifest key.
+    bool          positioned = true;
 };
 
 struct ExampleManifest {
@@ -254,6 +269,15 @@ struct ExampleManifest {
             ed.code = d.at("code").get<std::string>();
             ed.line = d.at("line").get<std::uint32_t>();
             ed.col  = d.at("col").get<std::uint32_t>();
+            // #4: optional — a span-less tier's diagnostic is code-only.
+            if (d.contains("positioned")) {
+                if (!d.at("positioned").is_boolean()) {
+                    std::cerr << "  expectDiagnostics 'positioned' must be a "
+                                 "boolean in " << path.generic_string() << "\n";
+                    return false;
+                }
+                ed.positioned = d.at("positioned").get<bool>();
+            }
             out.expectDiagnostics.push_back(std::move(ed));
         }
     }
@@ -284,6 +308,15 @@ struct ExampleManifest {
             for (auto const& s : t.at("runOn")) {
                 if (s.is_string()) et.runOn.push_back(s.get<std::string>());
             }
+        }
+        // C11/C23 6.4.5: optional per-target exit-code override.
+        if (t.contains("exitCode")) {
+            if (!t.at("exitCode").is_number_integer()) {
+                std::cerr << "  target 'exitCode' must be an integer in "
+                          << path.generic_string() << "\n";
+                return false;
+            }
+            et.exitCodeOverride = t.at("exitCode").get<std::int64_t>();
         }
         out.targets.push_back(std::move(et));
     }
@@ -417,10 +450,14 @@ void runExampleViaCli(std::string const& compiler,
     check(exampleName + ": no timeout", !result.timedOut);
     if (result.timedOut) return;
 
+    // C11/C23 6.4.5: the per-target override (when present) is the authority for
+    // THIS target's exit code; otherwise the manifest-level `exitCode`.
+    std::int64_t const expectedExit =
+        target->exitCodeOverride.has_value() ? *target->exitCodeOverride : m.exitCode;
     bool const exitMatches =
-        static_cast<std::int64_t>(result.exitCode) == m.exitCode;
+        static_cast<std::int64_t>(result.exitCode) == expectedExit;
     check(exampleName + ": OS exit code == "
-          + std::to_string(m.exitCode)
+          + std::to_string(expectedExit)
           + " (got " + std::to_string(result.exitCode) + ")",
           exitMatches);
 }
@@ -475,12 +512,23 @@ void runErrorExampleViaCli(std::string const& compiler,
     std::string const body((std::istreambuf_iterator<char>(f)),
                            std::istreambuf_iterator<char>());
     for (auto const& e : m.expectDiagnostics) {
-        std::string const posn = ":" + std::to_string(e.line)
-                               + ":" + std::to_string(e.col);
-        check(exampleName + ": CLI emits positioned diagnostic " + e.code
-              + " at " + posn,
-              body.find(posn) != std::string::npos,
-              "cli.log lacks '" + posn + "':\n" + body);
+        if (e.positioned) {
+            std::string const posn = ":" + std::to_string(e.line)
+                                   + ":" + std::to_string(e.col);
+            check(exampleName + ": CLI emits positioned diagnostic " + e.code
+                  + " at " + posn,
+                  body.find(posn) != std::string::npos,
+                  "cli.log lacks '" + posn + "':\n" + body);
+        } else {
+            // #4: a span-less-tier diagnostic renders code-only as
+            // `error[<code>]` (drainDiagnosticsToStderr routes a buffer-less
+            // diagnostic to the code-only one-liner). Assert THAT honest form
+            // rather than a fabricated `:line:col`.
+            std::string const band = "error[" + e.code + "]";
+            check(exampleName + ": CLI emits code-only diagnostic " + band,
+                  body.find(band) != std::string::npos,
+                  "cli.log lacks '" + band + "':\n" + body);
+        }
     }
 }
 

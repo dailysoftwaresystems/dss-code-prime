@@ -287,7 +287,9 @@ encodeFieldBitWidths(std::size_t fieldCount,
 [[nodiscard]] std::uint64_t
 contentDeclSiteKey(std::span<TypeId const> fields,
                    std::span<std::int64_t const> bitWidthScalars,
-                   std::span<std::uint64_t const> fieldOffsets = {}) {
+                   std::span<std::uint64_t const> fieldOffsets = {},
+                   std::span<std::uint32_t const> fieldAligns = {},
+                   bool packed = false) {
     std::uint64_t h = kFnvOffset;
     h = fnvMix(h, fields.size());
     for (TypeId f : fields) h = fnvMix(h, f.v);
@@ -297,6 +299,23 @@ contentDeclSiteKey(std::span<TypeId const> fields,
         h = fnvMix(h, fieldOffsets.size());
         for (std::uint64_t o : fieldOffsets) h = fnvMix(h, o);
     }
+    // D-CSUBSET-MEMBER-ALIGNAS: member-alignas overrides enter the content identity
+    // so an align-bearing struct is DISTINCT from the same fields laid out with
+    // natural alignment. GUARDED on non-empty (exactly like offsets above) so an
+    // align-free struct hashes byte-identically to the pre-alignas function — every
+    // existing composite keeps its EXACT declSiteKey (no churn); only an align-
+    // bearing struct gets the extra mix.
+    if (!fieldAligns.empty()) {
+        h = fnvMix(h, fieldAligns.size());
+        for (std::uint32_t a : fieldAligns) h = fnvMix(h, a);
+    }
+    // D-CSUBSET-PACKED: the whole-composite packed flag enters the content identity
+    // so a packed struct is DISTINCT from the same fields laid out padded. GUARDED on
+    // TRUE (mirrors the offsets/aligns guards) so an UNPACKED composite hashes
+    // byte-identically to the pre-packed function — every existing composite keeps
+    // its EXACT declSiteKey (zero churn / round-trip + goldens unaffected); only a
+    // packed struct gets the extra mix.
+    if (packed) h = fnvMix(h, std::uint64_t{1});
     return h | (std::uint64_t{1} << 63);
 }
 } // namespace
@@ -351,8 +370,10 @@ TypeId TypeInterner::forwardComposite(TypeKind kind, std::string_view name,
 }
 
 void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
+                                     bool packed,
                                      std::span<std::int64_t const> fieldBitWidths,
-                                     std::span<std::uint64_t const> fieldOffsets) {
+                                     std::span<std::uint64_t const> fieldOffsets,
+                                     std::span<std::uint32_t const> fieldAligns) {
     TypeRecord const& rec = arena_.at(id);
     if (rec.kind != TypeKind::Struct && rec.kind != TypeKind::Union) {
         latticeFatal("completeComposite: TypeId is not a Struct/Union");
@@ -367,19 +388,48 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
         latticeFatal("completeComposite: explicit field offsets must cover every "
                      "field (all-or-none)");
     }
+    // D-CSUBSET-MEMBER-ALIGNAS: member-alignas overrides are ALL-fields-or-NONE too
+    // (mirrors the offsets rule — a partial set is a caller bug).
+    if (!fieldAligns.empty() && fieldAligns.size() != fields.size()) {
+        latticeFatal("completeComposite: explicit field aligns must cover every "
+                     "field (all-or-none)");
+    }
+    // D-CSUBSET-MEMBER-ALIGNAS: explicit offsets place fields wholesale (overriding
+    // alignment entirely), so combining member-alignas WITH explicit offsets on the
+    // same struct is contradictory — a caller bug. Fail loud rather than silently
+    // let one channel win (mirrors the offsets-vs-bitfields rejection at layout).
+    if (!fieldAligns.empty() && !fieldOffsets.empty()) {
+        latticeFatal("completeComposite: a struct cannot carry BOTH member-alignas "
+                     "overrides and explicit field offsets (offsets override "
+                     "alignment wholesale)");
+    }
+    // D-CSUBSET-PACKED: explicit offsets ALSO place fields wholesale, so `packed`
+    // (which removes derived padding) is contradictory with an explicit-offset
+    // struct — a caller bug. Fail loud (mirrors the aligns-vs-offsets guard above).
+    // packed + member-alignas is LEGAL (alignas raises per-field via the layout
+    // MAX-fold even under a packed baseline), so no guard against that pair.
+    if (packed && !fieldOffsets.empty()) {
+        latticeFatal("completeComposite: a struct cannot be BOTH packed and carry "
+                     "explicit field offsets (offsets place fields wholesale, "
+                     "overriding padding)");
+    }
     if (it->second.complete) {
         // Idempotent for an IDENTICAL re-completion (a benign re-resolution); a
         // CONFLICTING re-completion is a caller bug — fail loud rather than
         // silently keep stale fields or corrupt a shared TypeId.
         bool same = it->second.fields.size() == fields.size()
                  && it->second.bitWidthScalars.size() == sc.size()
-                 && it->second.fieldOffsets.size() == fieldOffsets.size();
+                 && it->second.fieldOffsets.size() == fieldOffsets.size()
+                 && it->second.fieldAligns.size() == fieldAligns.size()
+                 && it->second.packed == packed;
         for (std::size_t i = 0; same && i < fields.size(); ++i)
             if (it->second.fields[i].v != fields[i].v) same = false;
         for (std::size_t i = 0; same && i < sc.size(); ++i)
             if (it->second.bitWidthScalars[i] != sc[i]) same = false;
         for (std::size_t i = 0; same && i < fieldOffsets.size(); ++i)
             if (it->second.fieldOffsets[i] != fieldOffsets[i]) same = false;
+        for (std::size_t i = 0; same && i < fieldAligns.size(); ++i)
+            if (it->second.fieldAligns[i] != fieldAligns[i]) same = false;
         if (!same) {
             latticeFatal("completeComposite: composite re-completed with different "
                          "fields (double-complete / tag redecl)");
@@ -389,6 +439,8 @@ void TypeInterner::completeComposite(TypeId id, std::span<TypeId const> fields,
     it->second.fields.assign(fields.begin(), fields.end());
     it->second.bitWidthScalars = std::move(sc);
     it->second.fieldOffsets.assign(fieldOffsets.begin(), fieldOffsets.end());
+    it->second.fieldAligns.assign(fieldAligns.begin(), fieldAligns.end());
+    it->second.packed = packed;
     it->second.complete = true;
     ++poolGen_;   // the field view changed — invalidate any pre-completion span
 }
@@ -410,7 +462,7 @@ TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> f
     std::span<std::int64_t const> const noWidths{};
     TypeId const id = internComposite(TypeKind::Struct, name,
                                       contentDeclSiteKey(fields, noWidths));
-    completeComposite(id, fields, {});
+    completeComposite(id, fields, /*packed=*/false);
     return id;
 }
 
@@ -419,7 +471,7 @@ TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> f
     auto const sc = encodeFieldBitWidths(fields.size(), fieldBitWidths);
     TypeId const id = internComposite(TypeKind::Struct, name,
                                       contentDeclSiteKey(fields, sc));
-    completeComposite(id, fields, fieldBitWidths);
+    completeComposite(id, fields, /*packed=*/false, fieldBitWidths);
     return id;
 }
 
@@ -433,7 +485,25 @@ TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> f
     auto const sc = encodeFieldBitWidths(fields.size(), fieldBitWidths);
     TypeId const id = internComposite(TypeKind::Struct, name,
                                       contentDeclSiteKey(fields, sc, fieldOffsets));
-    completeComposite(id, fields, fieldBitWidths, fieldOffsets);
+    completeComposite(id, fields, /*packed=*/false, fieldBitWidths, fieldOffsets);
+    return id;
+}
+
+TypeId TypeInterner::structType(std::string_view name, std::span<TypeId const> fields,
+                                std::span<std::int64_t const> fieldBitWidths,
+                                std::span<std::uint64_t const> fieldOffsets,
+                                std::span<std::uint32_t const> fieldAligns) {
+    // D-CSUBSET-MEMBER-ALIGNAS: the member-alignas overrides enter the content
+    // identity (contentDeclSiteKey) so an align-bearing struct is DISTINCT from the
+    // same field-types aligned naturally, AND two align-bearing structs with
+    // identical (name, fields, widths, offsets, aligns) collapse to one TypeId. An
+    // empty aligns span routes exactly like the 4-arg overload (byte-identical).
+    auto const sc = encodeFieldBitWidths(fields.size(), fieldBitWidths);
+    TypeId const id = internComposite(
+        TypeKind::Struct, name,
+        contentDeclSiteKey(fields, sc, fieldOffsets, fieldAligns));
+    completeComposite(id, fields, /*packed=*/false, fieldBitWidths, fieldOffsets,
+                      fieldAligns);
     return id;
 }
 
@@ -455,11 +525,36 @@ TypeInterner::explicitFieldOffset(TypeId id, std::size_t i) const {
     return it->second.fieldOffsets[i];
 }
 
+bool TypeInterner::hasExplicitAligns(TypeId id) const {
+    id = materialId_(id);
+    TypeKind const k = arena_.at(id).kind;
+    if (k != TypeKind::Struct && k != TypeKind::Union) return false;
+    auto it = compositeFields_.find(id.v);
+    return it != compositeFields_.end() && !it->second.fieldAligns.empty();
+}
+
+std::uint32_t TypeInterner::explicitFieldAlign(TypeId id, std::size_t i) const {
+    id = materialId_(id);
+    auto it = compositeFields_.find(id.v);
+    if (it == compositeFields_.end() || i >= it->second.fieldAligns.size()) {
+        return 0;   // no override → natural alignment (the ordinary path)
+    }
+    return it->second.fieldAligns[i];
+}
+
+bool TypeInterner::isPacked(TypeId id) const {
+    id = materialId_(id);
+    TypeKind const k = arena_.at(id).kind;
+    if (k != TypeKind::Struct && k != TypeKind::Union) return false;
+    auto it = compositeFields_.find(id.v);
+    return it != compositeFields_.end() && it->second.packed;
+}
+
 TypeId TypeInterner::unionType(std::string_view name, std::span<TypeId const> variants) {
     std::span<std::int64_t const> const noWidths{};
     TypeId const id = internComposite(TypeKind::Union, name,
                                       contentDeclSiteKey(variants, noWidths));
-    completeComposite(id, variants, {});
+    completeComposite(id, variants, /*packed=*/false);
     return id;
 }
 
@@ -468,7 +563,7 @@ TypeId TypeInterner::unionType(std::string_view name, std::span<TypeId const> va
     auto const sc = encodeFieldBitWidths(variants.size(), fieldBitWidths);
     TypeId const id = internComposite(TypeKind::Union, name,
                                       contentDeclSiteKey(variants, sc));
-    completeComposite(id, variants, fieldBitWidths);
+    completeComposite(id, variants, /*packed=*/false, fieldBitWidths);
     return id;
 }
 

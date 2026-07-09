@@ -1,0 +1,15 @@
+{
+  "$comment": "C11/C23 6.4.4.4 / D-FFI-STDDEF-WCHAR-PE-WIDTH: sizeof(L'x') = the wchar_t width, FORMAT-keyed — pe64 → 2 (UTF-16 unit), elf/mach-o → 4 (POSIX). Per-target exitCode overrides the manifest default: the ONE source witnesses the single wchar core resolution across every target. This is the char analog of wchar_platform_width (the string form). The release arm returns the same per target.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 4,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"], "exitCode": 2 },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"], "exitCode": 4 },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64", "exitCode": 4 },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "exitCode": 4 }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

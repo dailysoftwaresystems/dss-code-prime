@@ -1,0 +1,17 @@
+{
+  "$comment": "C11/C23 6.4.5 (FF3, D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE) fail-loud witness: u\"\\xC3\\xA9\" uses \\x byte escapes in a char16_t string. The old path SILENTLY collapsed the two intended code units into one (0x00E9); Cycle C FAILS LOUD with H_WideByteEscapeUnsupported (unsuppressable) - a raw code-unit value is not a code point. Narrow \"\\xC3\\xA9\" is unchanged (byte-producing). The load-bearing pin is the CODE + a rejected compile at the literal position.",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "H_WideByteEscapeUnsupported",
+      "line": 7,
+      "col": 43
+    }
+  ]
+}

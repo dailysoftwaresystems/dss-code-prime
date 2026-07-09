@@ -1,0 +1,33 @@
+{
+  "$comment": "FC16 (D-CSUBSET-GENERIC-SELECTION): C11/C23 6.5.1.1 generic selection. tc(x) = _Generic((x), int:1, char:2, double:3, default:0); tc(int)=1, tc(double)=3 -> 1*10+3 = 13. The controlling type drives a COMPILE-TIME selection (in the semantic tier); the CST->HIR lowering lowers ONLY the selected association's expression. Data-model-independent types (int=4, double=8 on LP64+LLP64). The `release` arm loads the shipped release pipeline so the selection witnesses end-to-end under real optimization across all four targets.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 13,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

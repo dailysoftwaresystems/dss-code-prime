@@ -33,6 +33,7 @@ std::string_view compilePhaseName(CompilePhase p) noexcept {
         case CompilePhase::SynthesizeFfi:  return "synthesize-ffi";
         case CompilePhase::LowerMir:       return "lower-mir";
         case CompilePhase::Optimize:       return "optimize";
+        case CompilePhase::Verify:         return "opt-verify";
         case CompilePhase::LowerLir:       return "lower-lir";
         case CompilePhase::Regalloc:       return "regalloc";
         case CompilePhase::Encode:         return "encode";

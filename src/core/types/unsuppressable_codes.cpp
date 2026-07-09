@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 70> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 86> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -129,6 +129,42 @@ constexpr std::array<DiagnosticCode, 70> kUnsuppressableCodes{{
     DiagnosticCode::H_UnsupportedLoweringForKind,
     DiagnosticCode::H_ExternHasInitializer,
     DiagnosticCode::H_ExternDeclMalformed,
+    // H_WideCharSurrogateUnsupported (C11/C23 6.4.5, wide/UTF string literals):
+    // a code point that cannot be represented in the requested element width
+    // without truncation (astral under a 16-bit element, ill-formed UTF-8, or
+    // cp > U+10FFFF). Same silent-miscompile class as H_UnsupportedLoweringForKind
+    // — suppressing it would let a wrong/truncated code unit ship green. Emits an
+    // Error HIR node + fails the gate via errorCount.
+    DiagnosticCode::H_WideCharSurrogateUnsupported,
+    // H_Utf8CharLiteralOutOfRange + H_WideCharValueUnrepresentable (C11/C23 6.4.4.4,
+    // wide/UTF CHARACTER constants): a `u8'…'` code point > U+007F, or a wide/UTF
+    // char that does not denote exactly one representable code unit (astral under a
+    // 16-bit element, empty/multi-character, ill-formed UTF-8, cp > U+10FFFF). Same
+    // silent-miscompile class as H_WideCharSurrogateUnsupported — suppressing either
+    // would let a wrong/truncated code unit ship green. Emits an Error HIR node +
+    // fails the gate via errorCount.
+    DiagnosticCode::H_Utf8CharLiteralOutOfRange,
+    DiagnosticCode::H_WideCharValueUnrepresentable,
+    // H_InvalidUniversalCharacterName (C11/C23 6.4.3, Cycle C) + H_WideByteEscapeUnsupported
+    // (6.4.5, D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE): a malformed/invalid `\u`/`\U`
+    // universal character name, and a `\x`/octal byte escape in a wide/UTF literal.
+    // Same silent-miscompile class as the wide/UTF codes above — suppressing either
+    // would let a wrong/CESU-8/collapsed code unit ship green. Both emit an Error HIR
+    // node + fail the gate via errorCount.
+    DiagnosticCode::H_InvalidUniversalCharacterName,
+    DiagnosticCode::H_WideByteEscapeUnsupported,
+    // H_ConflictingStringLiteralPrefixes (C11/C23 6.4.5p5, Cycle D): a run of adjacent
+    // string literals mixing TWO DIFFERENT non-narrow encoding prefixes (`u"a" U"b"`).
+    // It is a silent-failure REASON code (like S_GenericSelectionNoMatch below): on the
+    // conflict path the semantic typer leaves the stringLiteralExpr node UNTYPED and HIR
+    // lowering returns an Error node, so the build already fails via errorCount /
+    // hasErrors regardless of the emit gate — no wrong bytes ship. But a SUPPRESSED
+    // conflict would fail the build with ZERO diagnostics shown (a confusing silent
+    // failure) OR, worse, if a future reader keyed lowering on the semantic untyping
+    // alone, re-open the silent MISCOMPILE the explicit fail-loud closes (a plain
+    // `u"a" U"b";` statement typed Array<Char,3> "ab"). Closed here so a mixed-prefix
+    // concat is never silent.
+    DiagnosticCode::H_ConflictingStringLiteralPrefixes,
 
     // I_* MIR-verifier band — frozen-module invariants. A suppressed
     // violation here would let a miscompile sail past the verifier.
@@ -145,6 +181,7 @@ constexpr std::array<DiagnosticCode, 70> kUnsuppressableCodes{{
     DiagnosticCode::I_NotDominated,
     DiagnosticCode::I_TerminatorTypeMismatch,
     DiagnosticCode::I_ArgIndexOutOfRange,
+    DiagnosticCode::I_ArgPositionDuplicate,
     DiagnosticCode::I_ExtensionTypeInMir,
     DiagnosticCode::I_StructCfMismatch,
     DiagnosticCode::I_UnreachableBlock,
@@ -289,6 +326,52 @@ constexpr std::array<DiagnosticCode, 70> kUnsuppressableCodes{{
     // constraint violation would otherwise fail the build with zero diagnostics
     // shown (a confusing silent failure REASON), which the closed table forbids.
     DiagnosticCode::S_TypeNameDeclaratorNotAbstract,
+    // S_StaticAssertFailed (FC16, D-CSUBSET-STATIC-ASSERT, 2026-07-07): a
+    // `_Static_assert(cond[, "msg"]);` whose condition is non-constant or folds
+    // to zero. Same posture as S_TypeNameDeclaratorNotAbstract above —
+    // suppressing it ships NO wrong bytes (the analyzer's error still fails the
+    // build via `hasErrors()`), but a suppressed constraint violation would
+    // fail the build with ZERO diagnostics shown — a confusing silent failure
+    // REASON the closed table forbids. Closed here so a false static_assert is
+    // never silent.
+    DiagnosticCode::S_StaticAssertFailed,
+    // S_GenericSelectionNoMatch / S_GenericSelectionAmbiguous (FC16,
+    // D-CSUBSET-GENERIC-SELECTION, 2026-07-07): a `_Generic` whose controlling
+    // type matched no typed association (and had no `default`), or matched more
+    // than one. Same posture as S_StaticAssertFailed / S_TypeNameDeclaratorNot-
+    // Abstract above: on the no-match/ambiguous path the genericExpr node is left
+    // UNTYPED (InvalidType), so the build fails via `hasErrors()` regardless of
+    // the emit gate — no wrong bytes ship — but a suppressed constraint violation
+    // would fail the build with ZERO diagnostics shown, a confusing silent
+    // failure REASON the closed table forbids. Closed here so an unselectable
+    // `_Generic` is never silent.
+    DiagnosticCode::S_GenericSelectionNoMatch,
+    DiagnosticCode::S_GenericSelectionAmbiguous,
+    // S_Alignas* (C11/C23 6.7.5, D-CSUBSET-ALIGNAS, 2026-07-07): the five
+    // `_Alignas`/`alignas` constraint violations — not-power-of-two, exceeds-max,
+    // weaker-than-natural, invalid-context (typedef/function/parameter/bit-field),
+    // and non-constant. Same posture as S_StaticAssertFailed above: each is a
+    // 6.7.5 CONSTRAINT violation; the analyzer's error already fails the build via
+    // `hasErrors()` (no wrong bytes ship — the stored alignment is simply not
+    // applied), but a SUPPRESSED constraint violation would fail the build with
+    // ZERO diagnostics shown, the confusing silent-failure REASON the closed table
+    // forbids. Closed here so an invalid alignas is never silent.
+    DiagnosticCode::S_AlignasNotPowerOfTwo,
+    DiagnosticCode::S_AlignasExceedsMax,
+    DiagnosticCode::S_AlignasWeakerThanNatural,
+    DiagnosticCode::S_AlignasInvalidContext,
+    DiagnosticCode::S_AlignasNonConstant,
+    // S_PackedBitfieldUnsupported (FC16, D-CSUBSET-PACKED, 2026-07-08): a `packed`
+    // struct/union that ALSO carries a bit-field member — an UNSUPPORTED combination
+    // (bit-granular packed packing is a distinct, deferred algorithm). Unlike the
+    // S_Alignas* constraint violations above, suppressing THIS would ship WRONG BYTES:
+    // the layout engine's nullopt belt fails the type out on the packed+bitfield path,
+    // so a suppressed diagnostic would leave the composite to be laid out padded (the
+    // wrong ABI). Closed here so a packed bit-field struct is never silently mislaid.
+    // (S_UnknownTypeAttribute is deliberately NOT a member — it mirrors the suppressible
+    // H_UnknownLinkageSpecifier typo diagnostic, and the build still fails via
+    // hasErrors when it fires unsuppressed.)
+    DiagnosticCode::S_PackedBitfieldUnsupported,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

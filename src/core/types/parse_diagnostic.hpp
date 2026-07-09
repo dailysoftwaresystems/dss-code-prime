@@ -471,6 +471,83 @@ enum class DiagnosticCode : std::uint16_t {
     // by-value use of an incomplete composite from EVER silently folding to size 0.
     S_IncompleteTypeObject        = 0xE028,
 
+    // C11/C23 6.7.10: a `_Static_assert`/`static_assert` whose constant-expression
+    // condition evaluated to ZERO (the assertion FAILED) OR could not be folded to
+    // an integer constant expression (a non-constant / float / unresolved condition
+    // — C requires an integer constant expression). ONE code for both: the message
+    // (`.actual`) discriminates "assertion failed: <string-literal>" from
+    // "condition is not an integer constant expression". Emitted at the SEMANTIC
+    // tier (the point with sizeof/enum folding), so a passed assertion produces no
+    // HIR and the program runs; a failed one fails loud here.
+    S_StaticAssertFailed          = 0xE029,
+    // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): a `_Generic` generic
+    // selection whose controlling expression's type matched NONE of the typed
+    // associations and there was NO `default` association (a constraint
+    // violation — C requires exactly one match or the default). Emitted at the
+    // SEMANTIC tier (the point with the resolved controlling type + resolved
+    // association types); a silent no-selection would leave the `_Generic` node
+    // untyped and mis-lower, so this is unsuppressable.
+    S_GenericSelectionNoMatch     = 0xE02A,
+    // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): a `_Generic` whose
+    // controlling type matched MORE THAN ONE typed association (a constraint
+    // violation — 6.5.1.1p2 forbids two associations naming compatible types).
+    // With interned TypeId equality this means two associations named the SAME
+    // type. Emitted at the SEMANTIC tier; unsuppressable (an ambiguous selection
+    // has no well-defined value).
+    S_GenericSelectionAmbiguous   = 0xE02B,
+    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an `_Alignas`/`alignas` alignment
+    // specifier whose operand — the value form `alignas(N)` or the type form
+    // `alignas(T)` (which contributes _Alignof(T)) — is not a POSITIVE POWER OF
+    // TWO. 6.7.5p3 requires the alignment be a valid fundamental/extended
+    // alignment (a power of two). `alignas(0)` is NOT this error — it is an
+    // explicit NO-OP (6.7.5p3 "an alignment specification of zero has no
+    // effect"), handled as "no override" before this check. Emitted at the
+    // SEMANTIC tier (where the operand const-folds / the type's alignment is
+    // computed); unsuppressable (a constraint violation whose suppression would
+    // fail the build with zero diagnostics — the S_StaticAssertFailed precedent).
+    S_AlignasNotPowerOfTwo        = 0xE02C,
+    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS-EXCEEDS-MAX): an `alignas(N)` whose value
+    // exceeds the maximum representable alignment (256 bytes — the `Alignment`
+    // newtype's cap, alignment.hpp; no producer in the pipeline emits > 256).
+    // A distinct code from the power-of-two check so an over-large-but-pow2
+    // value (`alignas(512)`) reports the precise reason. Unsuppressable.
+    S_AlignasExceedsMax           = 0xE02D,
+    // C11/C23 6.7.5p4 (D-CSUBSET-ALIGNAS): an `alignas` specifier weaker than the
+    // declared type's natural alignment. 6.7.5p4: alignas may only STRENGTHEN
+    // (raise) alignment, never weaken it — `alignas(1) double d;` (1 < 8) is a
+    // constraint violation. Compared against the declared type's
+    // `computeLayout(...)->align`. Unsuppressable.
+    S_AlignasWeakerThanNatural    = 0xE02E,
+    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an `alignas` in a context 6.7.5 forbids —
+    // on a typedef, a function, a function PARAMETER, or a bit-field member.
+    // 6.7.5p2: an alignment specifier may appear only in the declaration of an
+    // OBJECT that is not a bit-field, a parameter, or a function/typedef. The
+    // `.actual` text names the specific rejected context. Unsuppressable.
+    S_AlignasInvalidContext       = 0xE02F,
+    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an `alignas(expr)` whose value-form
+    // operand does not fold to an integer constant expression (a non-constant /
+    // float / unresolved expression). 6.7.5p3 requires an integer constant
+    // expression. Emitted at the SEMANTIC tier via the SAME `constIntExpr`
+    // evaluator static_assert / array-dimension folding uses. Unsuppressable.
+    S_AlignasNonConstant          = 0xE030,
+    // FC16 (D-CSUBSET-PACKED): a composite `__attribute__((...))` / `[[...]]`
+    // attribute in a HONORED position (the struct/union tag) whose identifier is not
+    // a recognized composite type-attribute (a typo like `__attribute__((pakced))`,
+    // or an unsupported GNU attribute), OR a recognized `packed` spelling in an
+    // UNHONORED position (a leading `[[gnu::packed]] struct S`, which the linkage
+    // scan would otherwise skip wholesale). Typo protection mirroring
+    // `H_UnknownLinkageSpecifier`: fail loud rather than silently drop an attribute
+    // the program may depend on. The `.actual` names the offending spelling.
+    S_UnknownTypeAttribute        = 0xE031,
+    // FC16 (D-CSUBSET-PACKED / D-CSUBSET-PACKED-BITFIELD-INTERACTION): a `packed`
+    // struct/union that ALSO contains a bit-field member. Bit-granular packed
+    // packing is a distinct algorithm (a named, deferred gap); combining the two is
+    // UNSUPPORTED — fail loud at the SEMANTIC tier rather than silently emit a
+    // NON-packed layout (the layout engine's nullopt belt is the backstop). Emitted
+    // at the composite-completion site; unsuppressable (a suppressed one would ship
+    // the wrong — padded — bytes).
+    S_PackedBitfieldUnsupported   = 0xE032,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-
@@ -748,6 +825,68 @@ enum class DiagnosticCode : std::uint16_t {
     //   naming a label inside any part of a __try statement — a computed goto
     //   could then enter the guarded range undetectably at compile time.
     H_SehLabelAddress             = 0xF011,
+    // H_WideCharSurrogateUnsupported (C11/C23 6.4.5): a wide/UTF string literal
+    //   whose CST→HIR lowering could not represent its (escape-decoded) body in the
+    //   requested element width. Two live triggers, both fail-loud (never a silent
+    //   wrong code unit): (1) ill-formed UTF-8 in the body bytes; (2) a code point
+    //   past U+10FFFF. A supplementary-plane code point (> U+FFFF) under a 16-bit
+    //   element (`u"…"` / pe-`L"…"`) is NO LONGER a trigger for strings — it now
+    //   encodes as a UTF-16 surrogate PAIR (Cycle C). The `actual` names the
+    //   offending reason. An `Error` HIR node is emitted as a recovery sentinel and
+    //   lowering continues (collect-all), exactly like H_UnsupportedLoweringForKind.
+    //   (The name is retained for ordinal stability; the surrogate trigger is gone.)
+    H_WideCharSurrogateUnsupported = 0xF012,
+    // H_Utf8CharLiteralOutOfRange (C23 6.4.4.4): a `u8'…'` character constant whose
+    //   single code point exceeds U+007F. A char8_t constant must be representable
+    //   as ONE UTF-8 code unit (the ASCII range) — a multi-byte code point (`u8'β'`,
+    //   `u8'€'`) has no single-unit value and is a constraint violation. Fail-loud
+    //   (never a silently truncated low byte); an `Error` HIR node continues the
+    //   collect-all lowering, exactly like H_WideCharSurrogateUnsupported.
+    H_Utf8CharLiteralOutOfRange   = 0xF013,
+    // H_WideCharValueUnrepresentable (C11/C23 6.4.4.4): a wide/UTF CHARACTER constant
+    //   (`L'…'`/`u'…'`/`U'…'`) that does not denote exactly one code unit of its
+    //   element type. Fail-loud triggers (never a silent wrong/truncated unit): a
+    //   supplementary-plane code point (> U+FFFF) under a 16-bit element (`u'😀'`, or
+    //   pe-`L'😀'`) — one char16_t/wchar_t holds ONE code unit, a surrogate pair is
+    //   two; a body that is empty (`L''`) or multi-character (`L'ab'`); ill-formed
+    //   UTF-8; or a code point past U+10FFFF. The `actual` names the specific cause.
+    //   An `Error` HIR node continues the collect-all lowering.
+    H_WideCharValueUnrepresentable = 0xF014,
+    // H_InvalidUniversalCharacterName (C11/C23 6.4.3): a `\u`/`\U` universal
+    //   character name that is MALFORMED (fewer than the required 4 / 8 hex digits,
+    //   or a non-hex digit) or INVALID (names a UTF-16 surrogate half U+D800..U+DFFF
+    //   or a value past U+10FFFF). Fail-loud (never a silently CESU-8 / overlong /
+    //   truncated code unit) — the narrow byte path has no downstream UTF-8 check, so
+    //   an unvalidated UCN would emit wrong bytes. C23 6.4.3 relaxed the <0x00A0
+    //   basic-character restriction for LITERALS, so a sub-0xA0 UCN (`A`) is
+    //   VALID and never trips this. An `Error` HIR node continues the collect-all
+    //   lowering, exactly like H_WideCharValueUnrepresentable.
+    H_InvalidUniversalCharacterName = 0xF015,
+    // H_WideByteEscapeUnsupported (C11/C23 6.4.5, D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE):
+    //   a `\x` hex / `\ooo` octal escape inside a wide/UTF literal (`u"…"`/`U"…"`/
+    //   `u8"…"`/`L"…"` or the char forms). A byte escape names a raw code-unit VALUE,
+    //   not a code point; assembling that value directly is a deferred feature, so it
+    //   FAILS LOUD here rather than the old silent UTF-8-collapse (`u"\xC3\xA9"` once
+    //   became ONE 0x00E9 unit instead of two intended units). Narrow `"…"`/`'…'`
+    //   keep `\x`/octal (byte-producing, correct for a narrow element). Use `\u`/`\U`
+    //   for a code point. An `Error` HIR node continues the collect-all lowering.
+    H_WideByteEscapeUnsupported   = 0xF016,
+    // H_ConflictingStringLiteralPrefixes (C11/C23 6.4.5p5, Cycle D): a run of
+    //   ADJACENT string literals mixes TWO DIFFERENT non-narrow encoding prefixes
+    //   (`u"a" U"b"`, `u8"a" u"b"`, `L"a" u"b"`, …). 6.4.5p5 leaves "whether
+    //   differently-prefixed [wide] string literals can be concatenated"
+    //   IMPLEMENTATION-DEFINED; this implementation REJECTS it (as gcc/clang do)
+    //   rather than silently resolving to one prefix — a silent resolve MISCOMPILES
+    //   (drops the other prefix's element width / code-unit encoding). A SINGLE
+    //   non-narrow prefix with narrow segments (`"a" L"b"`) is NOT a conflict: the
+    //   narrow segments widen to it (6.4.5p5 "if any of the tokens has an encoding
+    //   prefix, the resulting sequence is treated as having that prefix"). The
+    //   conflict is decided on opener TOKEN KINDS (format-agnostic), NEVER resolved
+    //   cores (`u"`/`L"` both resolve to U16 on pe, so a core-keyed check would
+    //   diverge by target). Both tiers fail loud: the semantic typer leaves the node
+    //   UNTYPED + emits this (so a `sizeof` of it reports the real reason), and HIR
+    //   lowering emits it + an `Error` node, continuing the collect-all lowering.
+    H_ConflictingStringLiteralPrefixes = 0xF017,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,
@@ -825,6 +964,20 @@ enum class DiagnosticCode : std::uint16_t {
     // no-touch rule on SEH successors) — a merge/thread that damages the
     // skeleton reds HERE, at the pass that did it (verify-after-every-pass).
     I_SehStructure            = 0xA011,
+    // D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP: two `Arg` instructions in
+    // one function carry the SAME flat call-operand `position` (arg_payload.hpp).
+    // Positions index the caller's actual-argument list, so a duplicate means
+    // a payload wipe (a rebuild/merge site dropping the position → both
+    // defaulting to a colliding ordinal) — the inliner would then map two
+    // callee params to the same actual. Caught at every verify point.
+    I_ArgPositionDuplicate    = 0xA012,
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: a MIR `Alloca`'s secondary payload
+    // (`payload2` = the local's EFFECTIVE alignment in bytes) is not 0 and not a
+    // power of two ≤ 256. The alignment drives the frame-layout's per-alloca
+    // slot placement; a corrupt/dropped value (a rebuild/merge site zeroing or
+    // garbling payload2) would mis-align the slot — a silent stack miscompile.
+    // Caught at every verify point (verify-after-every-pass in release).
+    I_AllocaAlignmentNotPowerOfTwo = 0xA013,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //
@@ -897,6 +1050,17 @@ enum class DiagnosticCode : std::uint16_t {
     L_MoveCycleUnsupported         = 0xB009,
     L_IndirectCallUnsupported      = 0xB00A,
     L_IndirectCalleeClobberedByArgSetup = 0xB00B,
+    // D-CSUBSET-ALIGNAS-OVERALIGNED-STACK-LOCAL: `computeFrameLayout` rejected a
+    //   function whose body-local requires MORE alignment than one stack slot
+    //   (a C11/C23 `alignas(32)` / `alignas(64)` local, or an over-aligned
+    //   struct/union used as a local). This static frame layout aligns the
+    //   local area up to at most the slot width; a stricter requirement needs a
+    //   dynamically realigned stack pointer (an AND-mask of RSP + a frame
+    //   pointer to find spills), which is not built. The message reports the
+    //   COMPUTED slot bound (agnostic — never an arch name). ≤ slot-width
+    //   over-alignment (e.g. `alignas(16)`) is HONORED via a local-area pad, not
+    //   this code — so this fires only past the representable bound.
+    L_OverAlignedStackLocal        = 0xB00C,
 
     // ── Register allocator (renders as `R`) ────────────────────────────
     //

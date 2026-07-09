@@ -126,6 +126,22 @@ void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const 
                         idx, mir_.literalPool().size()));
             }
         }
+        if (op == MirOpcode::Alloca) {
+            // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: the Alloca's secondary payload
+            // is the local's EFFECTIVE alignment in bytes (0 = no over-alignment
+            // recorded). A non-zero value MUST be a power of two ≤ 256 (the
+            // `Alignment` newtype cap) — the frame layout places each alloca on
+            // this boundary, so a dropped/garbled value (a rebuild/merge site
+            // zeroing or corrupting payload2) would mis-align the slot. Fail loud
+            // here rather than silently mis-place the stack local.
+            std::uint32_t const a = mir_.instPayload2(id);
+            if (a != 0 && ((a & (a - 1)) != 0 || a > 256)) {
+                reportInst(reporter,
+                    DiagnosticCode::I_AllocaAlignmentNotPowerOfTwo, id,
+                    std::format("alloca alignment payload {} is not a power of "
+                                "two in [1, 256]", a));
+            }
+        }
     });
     // CFG-successor range validation. `mirBuildPredecessors` (the
     // shared dom helper) silently skips out-of-range successor edges
@@ -575,6 +591,14 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                     hasIndirectResultRead = true;
             }
         }
+        // D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-ARG-DROP: no two Args may share a
+        // flat call-operand `position` (arg_payload.hpp). A duplicate is the
+        // signature of a payload wipe at a rebuild/merge site (both defaulting
+        // to a colliding ordinal), which would make the inliner map two callee
+        // params to the same actual. NOT a `position < argCount` check: the
+        // x8-sret slot / straddle carrier legitimately consume positions with
+        // no Arg, so positions can exceed the Arg count.
+        std::unordered_set<std::uint32_t> seenArgPositions;
         for (std::uint32_t bi = 0; bi < nBlocks; ++bi) {
             MirBlockId const b = mir_.funcBlockAt(f, bi);
             std::uint32_t const n = mir_.blockInstCount(b);
@@ -588,6 +612,16 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                             std::format("argIndex {} >= physical-arg count {} "
                                         "for func #{}",
                                 idx, argCount, f.v));
+                    }
+                    std::uint32_t const pos = mir_.argPosition(id);
+                    if (!seenArgPositions.insert(pos).second) {
+                        reportInst(reporter, DiagnosticCode::I_ArgPositionDuplicate, id,
+                            std::format("two Args share flat call-operand "
+                                        "position {} in func #{} — a payload "
+                                        "wipe at a rebuild/merge site "
+                                        "(D-OPT-RELEASE-SYSV-MIXED-CLASS-REG-"
+                                        "ARG-DROP)",
+                                pos, f.v));
                     }
                 } else if (op == MirOpcode::CondBr) {
                     auto condOps = mir_.instOperands(id);

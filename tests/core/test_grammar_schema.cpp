@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -3725,4 +3727,82 @@ TEST(GrammarSchema, ParserMaxExpressionDepthWrongTypeReportsCode) {
     ASSERT_FALSE(result.has_value())
         << "a non-integer cap must fail loud, not silently default";
     EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_ConflictingField));
+}
+
+// C11/C23 6.4.5: the shipped c-subset text with `stringLiteralPrefixes`, for
+// mutation-based validation of the `elementCoreByFormat` per-format core map.
+namespace {
+[[nodiscard]] std::string shippedCSubsetTextForPrefixTest() {
+    namespace fs = std::filesystem;
+    fs::path dir = fs::current_path();
+    for (int i = 0; i < 12; ++i) {
+        fs::path const cand =
+            dir / "src" / "dss-config" / "sources" / "c-subset.lang.json";
+        if (fs::exists(cand)) {
+            std::ifstream in{cand, std::ios::binary};
+            std::stringstream ss; ss << in.rdbuf();
+            return ss.str();
+        }
+        if (!dir.has_parent_path() || dir.parent_path() == dir) break;
+        dir = dir.parent_path();
+    }
+    ADD_FAILURE() << "could not locate shipped c-subset.lang.json above cwd";
+    return {};
+}
+} // namespace
+
+TEST(GrammarSchema, StringPrefixUnknownFormatKeyReportsCode) {
+    // An unknown object-format key in `elementCoreByFormat` must FAIL LOUD (a typo'd
+    // format would otherwise silently never override, baking the wrong wchar width).
+    std::string text = shippedCSubsetTextForPrefixTest();
+    ASSERT_FALSE(text.empty());
+    // Baseline: the unmutated shipped config loads clean.
+    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
+        << "shipped c-subset must load clean before mutation";
+    // Swap the WideStringStart row's valid `"pe"` key for a bogus format name.
+    std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
+    auto const pos = text.find(needle);
+    ASSERT_NE(pos, std::string::npos) << "elementCoreByFormat pe-key not found in shipped config";
+    text.replace(pos, needle.size(), "\"elementCoreByFormat\": { \"windoze\": \"U16\"");
+    auto result = GrammarSchema::loadFromText(text);
+    ASSERT_FALSE(result.has_value())
+        << "an unknown object-format key must fail the load, not silently ignore";
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
+}
+
+TEST(GrammarSchema, StringPrefixUnknownElementCoreReportsCode) {
+    // A per-format value that is not a known TypeKind must FAIL LOUD.
+    std::string text = shippedCSubsetTextForPrefixTest();
+    ASSERT_FALSE(text.empty());
+    std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
+    auto const pos = text.find(needle);
+    ASSERT_NE(pos, std::string::npos);
+    text.replace(pos, needle.size(), "\"elementCoreByFormat\": { \"pe\": \"U17\"");
+    auto result = GrammarSchema::loadFromText(text);
+    ASSERT_FALSE(result.has_value())
+        << "an unknown per-format TypeKind must fail the load";
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
+}
+
+// C11/C23 6.4.4.4: `charLiteralPrefixes` shares the SAME validator as
+// `stringLiteralPrefixes` (one loader lambda) — this mutates the WIDE-CHAR row's
+// format key to prove the char table is parsed + closed-key-validated too (a typo'd
+// char wchar format would otherwise silently bake the wrong char width).
+TEST(GrammarSchema, CharPrefixUnknownFormatKeyReportsCode) {
+    std::string text = shippedCSubsetTextForPrefixTest();
+    ASSERT_FALSE(text.empty());
+    ASSERT_TRUE(GrammarSchema::loadFromText(text).has_value())
+        << "shipped c-subset must load clean before mutation";
+    // The WideCharStart row's `elementCoreByFormat` (the SECOND such snippet — the
+    // first belongs to WideStringStart).
+    std::string const needle = "\"elementCoreByFormat\": { \"pe\": \"U16\"";
+    auto const first = text.find(needle);
+    ASSERT_NE(first, std::string::npos);
+    auto const pos = text.find(needle, first + needle.size());
+    ASSERT_NE(pos, std::string::npos) << "the WideCharStart elementCoreByFormat row was not found";
+    text.replace(pos, needle.size(), "\"elementCoreByFormat\": { \"windoze\": \"U16\"");
+    auto result = GrammarSchema::loadFromText(text);
+    ASSERT_FALSE(result.has_value())
+        << "an unknown object-format key in charLiteralPrefixes must fail the load";
+    EXPECT_TRUE(hasDiagCode(result.error(), DiagnosticCode::C_InvalidHirLowering));
 }

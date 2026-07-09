@@ -222,6 +222,210 @@ TEST(SemanticAnalyzerCSubset, ExplicitArraySizeUnchangedByInference) {
         << "an explicit [N] must keep N — inference only fills an empty []";
 }
 
+// ── C11/C23 6.4.5: wide / UTF string-literal TYPING (element core per opener) ──
+namespace {
+// The TypeId stamped on the first `stringLiteralExpr` rule node in `cu`'s tree
+// (the whole, possibly-concatenated literal). InvalidType if none / untyped.
+[[nodiscard]] TypeId firstStringLiteralType(SemanticModel const& model,
+                                            CompilationUnit const& cu) {
+    Tree const& tree = cu.trees()[0];
+    RuleId const slit = tree.schema().rules().find("stringLiteralExpr");
+    TypeId found{};
+    walkPreOrder(tree, [&](TreeCursor const& c) {
+        NodeId const n = c.current();
+        if (tree.kind(n) == NodeKind::Internal && slit.valid()
+            && tree.rule(n).v == slit.v && !found.valid()) {
+            found = model.typeAt(n);
+        }
+    });
+    return found;
+}
+} // namespace
+
+// `u"AB"` → Array<U16,3>; `U"AB"` → Array<U32,3>; `u8"AB"` → Array<U8,3>.
+TEST(SemanticAnalyzerCSubset, WideStringLiteralElementCorePerOpener) {
+    struct Case { char const* src; TypeKind core; std::int64_t len; };
+    for (auto const& tc : {Case{"void f(){ u\"AB\"; }",  TypeKind::U16, 3},
+                           Case{"void f(){ U\"AB\"; }",  TypeKind::U32, 3},
+                           Case{"void f(){ u8\"AB\"; }", TypeKind::U8,  3},
+                           Case{"void f(){ \"AB\"; }",   TypeKind::Char, 3}}) {
+        auto cu = buildShippedUnit("c-subset", { tc.src });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        ASSERT_FALSE(model.hasErrors()) << tc.src;
+        auto const& ti = model.lattice().interner();
+        TypeId const ty = firstStringLiteralType(model, *cu);
+        ASSERT_TRUE(ty.valid()) << tc.src;
+        ASSERT_EQ(ti.kind(ty), TypeKind::Array) << tc.src;
+        EXPECT_EQ(ti.kind(ti.operands(ty)[0]), tc.core) << tc.src;
+        EXPECT_EQ(ti.scalars(ty)[0], tc.len) << tc.src;
+    }
+}
+
+// `u"€"` (source bytes E2 82 AC) → ONE U16 unit → Array<U16,2> (NOT 3 bytes + NUL).
+// The semantic tier UTF-8-decodes the raw bytes for the CODE-UNIT count, the same
+// shared encoder the HIR tier uses — so both agree on N.
+TEST(SemanticAnalyzerCSubset, WideStringBmpMultibyteCodeUnitCount) {
+    auto cu = buildShippedUnit("c-subset", { "void f(){ u\"\xe2\x82\xac\"; }" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    ASSERT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const ty = firstStringLiteralType(model, *cu);
+    ASSERT_TRUE(ty.valid());
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::U16);
+    EXPECT_EQ(ti.scalars(ty)[0], 2) << "U+20AC is ONE code unit + NUL";
+}
+
+// wchar_t (`L"…"`) width is FORMAT-keyed (D-FFI-STDDEF-WCHAR-PE-WIDTH): the
+// format-agnostic default (direct-API) resolves to I32 (POSIX); the PE format
+// resolves to U16 (Windows UTF-16 unit). This is CONFIG-DRIVEN — the
+// `elementCoreByFormat` map on the WideStringStart prefix row decides it via a
+// pure `resolveElementCore` lookup, NOT a hardcoded format branch.
+TEST(SemanticAnalyzerCSubset, WideCharLiteralWidthIsFormatKeyed) {
+    // Default (activeFormat=nullopt) → I32.
+    {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ L\"AB\"; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        ASSERT_FALSE(model.hasErrors());
+        auto const& ti = model.lattice().interner();
+        TypeId const ty = firstStringLiteralType(model, *cu);
+        ASSERT_TRUE(ty.valid());
+        ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+        EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::I32)
+            << "wchar_t defaults to the POSIX i32 width";
+    }
+    // PE format → U16.
+    {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ L\"AB\"; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DataModel::Llp64, std::nullopt, std::nullopt,
+                             ObjectFormatKind::Pe);
+        ASSERT_FALSE(model.hasErrors());
+        auto const& ti = model.lattice().interner();
+        TypeId const ty = firstStringLiteralType(model, *cu);
+        ASSERT_TRUE(ty.valid());
+        ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+        EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::U16)
+            << "wchar_t on PE is the u16 Windows UTF-16 code unit";
+    }
+}
+
+// ── C11/C23 6.4.4.4: wide / UTF CHARACTER-constant TYPING (scalar core per prefix)
+namespace {
+// The TypeId stamped on the first `CharLiteral` BODY token in `cu`'s tree (a char
+// constant is a SCALAR — the stamp is on the body token, unlike a string's expr
+// node). InvalidType if none / left untyped (the wide type-drop for sizeof safety).
+[[nodiscard]] TypeId firstCharLiteralType(SemanticModel const& model,
+                                          CompilationUnit const& cu) {
+    Tree const& tree = cu.trees()[0];
+    SchemaTokenId const body = tree.schema().schemaTokens().find("CharLiteral");
+    TypeId found{};
+    bool seen = false;
+    walkPreOrder(tree, [&](TreeCursor const& c) {
+        NodeId const n = c.current();
+        if (!seen && tree.kind(n) == NodeKind::Token && body.valid()
+            && tree.tokenKind(n).v == body.v) {
+            found = model.typeAt(n);
+            seen  = true;
+        }
+    });
+    return found;
+}
+} // namespace
+
+// C23 6.4.4.4 — the NEW per-prefix TYPE rule: `'x'`→int (I32, UNCHANGED),
+// `u'A'`→char16_t (U16), `U'A'`→char32_t (U32), `u8'A'`→char8_t (U8). Red-on-disable:
+// without the wide override the prefixed forms all stay I32 (so `sizeof(u'A')`==4).
+TEST(SemanticAnalyzerCSubset, WideCharLiteralScalarCorePerPrefix) {
+    struct Case { char const* src; TypeKind core; };
+    for (auto const& tc : {Case{"void f(){ 'x'; }",   TypeKind::I32},
+                           Case{"void f(){ u'A'; }",  TypeKind::U16},
+                           Case{"void f(){ U'A'; }",  TypeKind::U32},
+                           Case{"void f(){ u8'A'; }", TypeKind::U8}}) {
+        auto cu = buildShippedUnit("c-subset", { tc.src });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        ASSERT_FALSE(model.hasErrors()) << tc.src;
+        auto const& ti = model.lattice().interner();
+        TypeId const ty = firstCharLiteralType(model, *cu);
+        ASSERT_TRUE(ty.valid()) << tc.src;
+        EXPECT_EQ(ti.kind(ty), tc.core) << tc.src;
+    }
+}
+
+// wchar_t (`L'x'`) width is FORMAT-keyed (D-FFI-STDDEF-WCHAR-PE-WIDTH) via the SAME
+// `elementCoreByFormat` axis the wide-STRING row uses — the format-agnostic default
+// resolves to I32 (POSIX), PE to U16. A pure `resolveElementCore` lookup, no
+// hardcoded format branch. This is the char analog of the string test above.
+TEST(SemanticAnalyzerCSubset, WideCharConstantWidthIsFormatKeyed) {
+    // Default (activeFormat=nullopt) → I32.
+    {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ L'x'; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        ASSERT_FALSE(model.hasErrors());
+        auto const& ti = model.lattice().interner();
+        TypeId const ty = firstCharLiteralType(model, *cu);
+        ASSERT_TRUE(ty.valid());
+        EXPECT_EQ(ti.kind(ty), TypeKind::I32) << "wchar_t defaults to the POSIX i32 width";
+    }
+    // PE format → U16.
+    {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ L'x'; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DataModel::Llp64, std::nullopt, std::nullopt,
+                             ObjectFormatKind::Pe);
+        ASSERT_FALSE(model.hasErrors());
+        auto const& ti = model.lattice().interner();
+        TypeId const ty = firstCharLiteralType(model, *cu);
+        ASSERT_TRUE(ty.valid());
+        EXPECT_EQ(ti.kind(ty), TypeKind::U16)
+            << "wchar_t on PE is the u16 Windows UTF-16 code unit";
+    }
+}
+
+// The sizeof-safety pin (MUST-FIX #3a): a wide char whose code point does NOT fit
+// its element (`u8'β'`>U+007F, `u'😀'` astral) leaves the body token UNTYPED so a
+// `sizeof`/`_Alignof` of it fails loud (never a guessed size). Here we assert the
+// body token is left with no valid type (the drop) — plus the format-keyed drop:
+// `L'😀'` is representable under the default I32 but NOT under the pe U16.
+TEST(SemanticAnalyzerCSubset, BadWideCharConstantLeavesBodyTokenUntyped) {
+    // u8'β' — U+03B2 exceeds the single-UTF-8-unit range (0x7F).
+    {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ u8'\xce\xb2'; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        TypeId const ty = firstCharLiteralType(model, *cu);
+        EXPECT_FALSE(ty.valid())
+            << "an out-of-range u8 char must be left untyped so sizeof fails loud";
+    }
+    // L'😀' under PE (U16) → astral, unrepresentable → untyped.
+    {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ L'\xf0\x9f\x98\x80'; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu, DataModel::Llp64, std::nullopt, std::nullopt,
+                             ObjectFormatKind::Pe);
+        TypeId const ty = firstCharLiteralType(model, *cu);
+        EXPECT_FALSE(ty.valid())
+            << "an astral L' char under pe (u16 wchar_t) must be left untyped";
+    }
+    // L'😀' under the default format (I32 wchar_t) → representable → typed I32.
+    {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ L'\xf0\x9f\x98\x80'; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = analyze(cu);
+        ASSERT_FALSE(model.hasErrors());
+        auto const& ti = model.lattice().interner();
+        TypeId const ty = firstCharLiteralType(model, *cu);
+        ASSERT_TRUE(ty.valid())
+            << "an astral L' char under the i32 default wchar_t IS representable";
+        EXPECT_EQ(ti.kind(ty), TypeKind::I32);
+    }
+}
+
 // (5) A `[]` with NO initializer is NOT silently sized — the resolver's
 // S_NonConstantArrayLength still fires (inference is gated on an initializer
 // being present, so a bare `int x[];` is unaffected by c34).
@@ -951,6 +1155,784 @@ TEST(SemanticAnalyzerCSubset, MemberAccessSizeofResolvesArrayDimension) {
     ASSERT_EQ(ti.scalars(aRec->type).size(), 1u);
     EXPECT_EQ(ti.scalars(aRec->type)[0], 4)
         << "dimension = sizeof(int) = 4 (member s.y resolved to int)";
+}
+
+// ── C11/C23 6.7.10 static_assert — the sizeof-folding requirement ────────────
+//
+// `_Static_assert(sizeof(int)==4, ...)` is the single most common idiom. The
+// condition is const-evaluated by the SAME `constIntExpr` evaluator that folds
+// `sizeof` in an array dimension — so it folds ONLY when analyze() is given the
+// target's aggregateLayout (nullopt ⇒ deliberate fail-loud, the direct-API
+// default). These pins pass AggregateLayoutParams, exactly like the array-dim
+// sizeof pins above, and prove the fold is REAL (a true sizeof passes; a false
+// sizeof fails loud — not a rubber-stamp).
+
+TEST(SemanticAnalyzerCSubset, StaticAssertSizeofConditionFoldsTrue) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(sizeof(int) == 4, \"int is 4\");\n"
+        "int main(void){ return 42; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "sizeof(int)==4 must FOLD true in the static_assert condition";
+}
+
+TEST(SemanticAnalyzerCSubset, StaticAssertSizeofConditionFoldsFalseFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(sizeof(int) == 99, \"int is not 99\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u)
+        << "sizeof(int)==99 must FOLD false — the assertion fails loud";
+}
+
+// sizeof-of-a-STRUCT in the condition folds (exercises the aggregateLayout path,
+// not just the scalar width). `struct S{int a; int b;}` = 8 bytes under natural
+// alignment → the assertion passes; the wrong size fails loud.
+TEST(SemanticAnalyzerCSubset, StaticAssertSizeofStructConditionFolds) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int a; int b; };\n"
+        "_Static_assert(sizeof(struct S) == 8, \"S is 8\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "sizeof(struct S)==8 must fold through the aggregateLayout engine";
+}
+
+// The C23 1-ARG form with a sizeof condition (message-less) still folds — pins
+// that the peel/parse of the 1-arg form does not disturb the sizeof fold.
+TEST(SemanticAnalyzerCSubset, StaticAssertSizeof1ArgFolds) {
+    auto cu = buildShippedUnit("c-subset", {
+        "static_assert(sizeof(int) == 4);\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// ── C11/C23 6.5.3.4 _Alignof — the alignof-folding requirement ───────────────
+//
+// `_Static_assert(_Alignof(T)==N, ...)` const-evaluates the alignof through the
+// SAME `constIntExpr` evaluator that folds sizeof — proving _Alignof is
+// const-evaluable AND yields the EXACT alignment. Mirrors the sizeof pins above:
+// a true alignof passes, a false one fails loud (not a rubber-stamp). Both
+// spellings (`_Alignof`/`alignof`) and a struct type are exercised. The align
+// resolver reads the SAME aggregateLayout params analyze() is given.
+TEST(SemanticAnalyzerCSubset, StaticAssertAlignofIntFoldsTrue) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(_Alignof(int) == 4, \"int aligns 4\");\n"
+        "int main(void){ return 42; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "_Alignof(int)==4 must FOLD true (proves alignof is const-evaluable)";
+}
+
+TEST(SemanticAnalyzerCSubset, StaticAssertAlignofDoubleFoldsTrue) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(_Alignof(double) == 8, \"double aligns 8\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "_Alignof(double)==8 must fold true";
+}
+
+// The C23 `alignof` spelling folds to alignment 1 for char.
+TEST(SemanticAnalyzerCSubset, StaticAssertAlignofCharSpellingFoldsTrue) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(alignof(char) == 1, \"char aligns 1\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "alignof(char)==1 must fold true (the C23 spelling)";
+}
+
+// _Alignof of a STRUCT = the MAX member alignment (not the size): {char; double}
+// is 16 bytes but aligns to 8 (the double). Exercises the aggregateLayout path
+// and proves alignof reads ALIGNMENT, never size.
+TEST(SemanticAnalyzerCSubset, StaticAssertAlignofStructFoldsToMaxMemberAlign) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct CharDouble { char c; double d; };\n"
+        "_Static_assert(_Alignof(struct CharDouble) == 8, \"aligns 8\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "_Alignof(struct{char;double;})==8 (max member align, NOT the size 16)";
+}
+
+TEST(SemanticAnalyzerCSubset, StaticAssertAlignofFoldsFalseFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Static_assert(_Alignof(double) == 4, \"wrong on purpose\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u)
+        << "_Alignof(double)==4 must FOLD false — the assertion fails loud "
+           "(anti-rubber-stamp: the fold is real, and reads align not size)";
+}
+
+// ── C11/C23 6.7.5 _Alignas/alignas — alignment specifier ─────────────────────
+//
+// The FRONTEND + SEMANTICS: parse both spellings + both operand forms on a
+// variable / struct-member, compute + validate the alignment, and STORE it
+// (SymbolRecord.explicitAlignment for a variable; fed into the struct's
+// fieldAligns for a member → computeLayout raises the layout end-to-end).
+// D-CSUBSET-ALIGNAS. `analyze` is given the SAME aggregateLayout params the
+// _Alignof pins use (Natural, stack-align 16) so member layout is exact.
+namespace {
+constexpr AggregateLayoutParams kAlignasLayout{ScalarAlignmentRule::Natural, 16};
+}  // namespace
+
+// PARSE: a global variable `alignas(16) int x;` (value form) parses cleanly —
+// no parser diagnostics, one variable symbol.
+TEST(SemanticAnalyzerCSubset, AlignasVariableValueFormParses) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(16) int x;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    EXPECT_TRUE(x->type.valid());
+}
+
+// PARSE: the TYPE operand form `alignas(double) int y;` parses (a type-name in
+// the alignas operand contributes _Alignof(double)==8, which is ≥ int's 4, so
+// no weaker-than-natural error).
+TEST(SemanticAnalyzerCSubset, AlignasVariableTypeFormParses) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(double) int y;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasWeakerThanNatural), 0u);
+    SymbolRecord const* y = findSym(model, "y");
+    ASSERT_NE(y, nullptr);
+    // alignas(double) = 8 on an int (natural 4) — a valid RAISE.
+    ASSERT_TRUE(y->explicitAlignment.has_value());
+    EXPECT_EQ(*y->explicitAlignment, 8u);
+}
+
+// PARSE: a struct member `struct S { alignas(16) int a; char b; };` parses.
+TEST(SemanticAnalyzerCSubset, AlignasStructMemberParses) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "struct S { alignas(16) int a; char b; };\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    // No alignas constraint diagnostics at all for a valid raise.
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasWeakerThanNatural), 0u);
+}
+
+// VARIABLE STORAGE: `alignas(32) int g;` sets SymbolRecord.explicitAlignment==32.
+// (The stored value is intentionally NOT consumed by variable codegen yet — that
+// is a separate deferred task; here we assert only that the SEMANTIC store works.)
+TEST(SemanticAnalyzerCSubset, AlignasVariableStoresExplicitAlignment) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(32) int g;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    ASSERT_TRUE(g->explicitAlignment.has_value())
+        << "alignas(32) must set SymbolRecord.explicitAlignment";
+    EXPECT_EQ(*g->explicitAlignment, 32u);
+}
+
+// VALUE-EXPR STORAGE: `alignas(2*8) int g;` const-folds the operand to 16.
+TEST(SemanticAnalyzerCSubset, AlignasVariableConstExprOperandFolds) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(2*8) int g;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    ASSERT_TRUE(g->explicitAlignment.has_value());
+    EXPECT_EQ(*g->explicitAlignment, 16u);
+}
+
+// MEMBER LAYOUT END-TO-END (via the interner): `struct S { alignas(16) char c; }`
+// → _Alignof(struct S)==16 AND sizeof(struct S)==16 (the alignas raised BOTH the
+// struct's alignment and its rounded size). Reuses the _Static_assert(_Alignof())
+// fold — RED-ON-DISABLE: without the fieldAligns wiring the struct aligns to 1.
+TEST(SemanticAnalyzerCSubset, AlignasMemberRaisesStructAlignAndSizeEndToEnd) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { alignas(16) char c; };\n"
+        "_Static_assert(_Alignof(struct S) == 16, \"aligns 16\");\n"
+        "_Static_assert(sizeof(struct S) == 16, \"sizes 16\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "alignas(16) on the sole char member must raise the struct to "
+           "_Alignof==16 AND sizeof==16 (end-to-end via fieldAligns)";
+}
+
+// MEMBER LAYOUT — following-field OFFSET: `struct T { char c; alignas(8) int i; }`
+// pushes `i` from its natural offset 4 to 8. Proven via the _Alignof of the
+// struct (max member align == 8) plus its size: char(1)+pad(7)+int(4) rounded to
+// 8 → 16. (The offsetof idiom itself is exercised in the corpus/e2e probe.)
+TEST(SemanticAnalyzerCSubset, AlignasMemberRaisesFollowingFieldLayout) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct T { char c; alignas(8) int i; };\n"
+        "_Static_assert(_Alignof(struct T) == 8, \"aligns 8\");\n"
+        "_Static_assert(sizeof(struct T) == 16, \"sizes 16\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// MEMBER LAYOUT — UNION: `union U { alignas(16) char c; int i; }` raises the
+// union to _Alignof==16 and sizeof==16 (the completed carrier + the union-arm
+// alignas fold in computeLayout).
+TEST(SemanticAnalyzerCSubset, AlignasUnionMemberRaisesAlignAndSizeEndToEnd) {
+    auto cu = buildShippedUnit("c-subset", {
+        "union U { alignas(16) char c; int i; };\n"
+        "_Static_assert(_Alignof(union U) == 16, \"aligns 16\");\n"
+        "_Static_assert(sizeof(union U) == 16, \"sizes 16\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// ── D-CSUBSET-PACKED: `__attribute__((packed))` / `[[gnu::packed]]` semantics ──
+// End-to-end via `_Static_assert(sizeof/_Alignof)`: the grammar parses the trailing
+// composite-attribute list, the semantic scan marks the composite packed, the
+// interner carries it, and computeLayout removes all padding. Each sizeof pin is
+// RED-ON-DISABLE (a non-honored packed → the padded size → S_StaticAssertFailed).
+
+// GNU spelling: `struct S {char c; int v;} __attribute__((packed));` → sizeof 5,
+// _Alignof 1 (all inter-field padding removed, natural alignment 1).
+TEST(SemanticAnalyzerCSubset, PackedStructGnuRemovesPaddingEndToEnd) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char c; int v; } __attribute__((packed));\n"
+        "_Static_assert(sizeof(struct S) == 5, \"packed size 5\");\n"
+        "_Static_assert(_Alignof(struct S) == 1, \"packed align 1\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "packed must remove padding: sizeof==5 AND _Alignof==1 end-to-end";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u);
+}
+
+// C23 spelling: `[[gnu::packed]]` as a trailing attribute is honored identically.
+TEST(SemanticAnalyzerCSubset, PackedStructC23GnuPackedSpelling) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char c; int v; } [[gnu::packed]];\n"
+        "_Static_assert(sizeof(struct S) == 5, \"packed size 5\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// C23 bare `[[packed]]` spelling (no namespace) is honored too.
+TEST(SemanticAnalyzerCSubset, PackedStructC23BarePackedSpelling) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char c; int v; } [[packed]];\n"
+        "_Static_assert(sizeof(struct S) == 5, \"packed size 5\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// packed + a member `alignas` — alignas WINS per-field even under packed:
+// `struct S {char c; alignas(4) int v;} __attribute__((packed));` → v@4, sizeof 8.
+TEST(SemanticAnalyzerCSubset, PackedStructMemberAlignasStillRaises) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char c; alignas(4) int v; } __attribute__((packed));\n"
+        "_Static_assert(_Alignof(struct S) == 4, \"alignas wins\");\n"
+        "_Static_assert(sizeof(struct S) == 8, \"v raised to offset 4\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "a member alignas raises per-field even inside a packed struct";
+}
+
+// `alignas(1)` INSIDE a packed struct is LEGAL (the member's natural baseline is 1
+// under packed), so NO S_AlignasWeakerThanNatural. Contrast:
+// `AlignasWeakerThanNaturalFailsLoud` — `alignas(1) double d;` OUTSIDE a packed
+// struct still fails. RED-ON-DISABLE: drop the packed naturalBaseline and this fires.
+TEST(SemanticAnalyzerCSubset, AlignasOneInsidePackedStructIsLegal) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char c; alignas(1) int v; } __attribute__((packed));\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasWeakerThanNatural), 0u)
+        << "alignas(1) inside a packed struct is legal (baseline 1)";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// packed UNION: `union U {char c; int i;} __attribute__((packed));` → _Alignof 1.
+TEST(SemanticAnalyzerCSubset, PackedUnionHasAlignmentOneEndToEnd) {
+    auto cu = buildShippedUnit("c-subset", {
+        "union U { char c; int i; } __attribute__((packed));\n"
+        "_Static_assert(_Alignof(union U) == 1, \"packed union align 1\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+}
+
+// A trailing packed attribute does NOT block a following declarator:
+// `struct S {...} __attribute__((packed)) g;` — `g` still parses, S stays packed.
+TEST(SemanticAnalyzerCSubset, PackedStructFollowedByDeclaratorParses) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { char c; int v; } __attribute__((packed)) g;\n"
+        "_Static_assert(sizeof(struct S) == 5, \"packed size 5\");\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u);
+    EXPECT_NE(findSym(model, "g"), nullptr);
+}
+
+// FAIL-LOUD: packed + a bit-field member → S_PackedBitfieldUnsupported (bit-granular
+// packed packing is a distinct, deferred algorithm — D-CSUBSET-PACKED-BITFIELD-
+// INTERACTION). NEVER a silent NON-packed layout.
+TEST(SemanticAnalyzerCSubset, PackedBitfieldFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int a : 3; } __attribute__((packed));\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_PackedBitfieldUnsupported), 1u);
+    EXPECT_TRUE(model.hasErrors());
+}
+
+// FAIL-LOUD: a TYPO in the GNU `__attribute__` packed slot → S_UnknownTypeAttribute
+// (typo protection, like H_UnknownLinkageSpecifier — a `pakced` typo must not
+// silently leave the struct unpacked).
+TEST(SemanticAnalyzerCSubset, UnknownGnuTypeAttributeFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; } __attribute__((pakced));\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 1u);
+    EXPECT_TRUE(model.hasErrors());
+}
+
+// STANDARD-IGNORABLE: an unrecognized C23 `[[...]]` attribute on a struct is
+// ignored (C23 6.7.11.1 — an unknown attribute is ignored), NO diagnostic. This is
+// the `[[deprecated]]` precedent; only `packed`/`gnu::packed` are honored-or-diagnosed.
+TEST(SemanticAnalyzerCSubset, UnknownC23AttributeIsIgnored) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int x; } [[deprecated]];\n"
+        "int main(void){ return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownTypeAttribute), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION (F-1): the AFTER-KEYWORD packed position
+// `struct __attribute__((packed)) S {…}` is DEFERRED — only the TRAILING/suffix form
+// (`struct S {…} __attribute__((packed))`) is honored. That deferral's fail-loud
+// contract REQUIRES the after-keyword form to be LOUDLY REJECTED — NEVER a silent
+// tag-drop / accept-as-unpacked. The grammar admits `compositeAttrList` only as a
+// TRAILING element, so `struct __attribute__((packed))` parses (cleanly, no
+// tree-builder error) as an ANONYMOUS, body-less struct specifier — the attribute is
+// consumed as ITS trailing list — and the tag `S { … }` is then mis-read as a
+// function definition, failing loud S_InvalidFunctionDeclarator at SEMANTIC analysis
+// (verified: this is a semantic, not a parse, error). The pin is PHASE-AGNOSTIC
+// (tree parse-error OR semantic-model error) so a future shift between channels stays
+// green; ONLY a silent accept-as-unpacked — the regression F-1 guards against, an
+// after-keyword slot added WITHOUT fixing the ~6 positional tag readers — turns it
+// red. RED-ON-REGRESSION.
+TEST(SemanticAnalyzerCSubset, PackedAfterKeywordTaggedFailsLoudNotSilent) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct __attribute__((packed)) S { int a; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    bool sawParseError = false;
+    for (auto const& t : cu->trees()) {
+        for (auto const& d : t.diagnostics().all()) {
+            if (d.severity == DiagnosticSeverity::Error) sawParseError = true;
+        }
+    }
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_TRUE(sawParseError || model.hasErrors())
+        << "after-keyword packed (`struct __attribute__((packed)) S {…}`) must fail "
+           "LOUD (parse or semantic) — never a silent tag-drop / accept-as-unpacked "
+           "(the D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION deferral's fail-loud contract)";
+}
+
+// The ANONYMOUS after-keyword variant is likewise LOUDLY REJECTED:
+// `struct __attribute__((packed)) { int a; } v;` — the anonymous, body-less struct
+// specifier consumes the attribute as its trailing list, then `{ int a; } v;` cannot
+// bind and fails loud (S_UnknownType on `v` today). Cheap sibling; same fail-loud
+// boundary, phase-agnostic.
+TEST(SemanticAnalyzerCSubset, PackedAfterKeywordAnonymousFailsLoudNotSilent) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct __attribute__((packed)) { int a; } v;\n"
+        "int main(void){ return 0; }\n",
+    });
+    bool sawParseError = false;
+    for (auto const& t : cu->trees()) {
+        for (auto const& d : t.diagnostics().all()) {
+            if (d.severity == DiagnosticSeverity::Error) sawParseError = true;
+        }
+    }
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_TRUE(sawParseError || model.hasErrors())
+        << "anonymous after-keyword packed must also fail LOUD (parse or semantic), "
+           "never a silent accept-as-unpacked";
+}
+
+// ZERO: `alignas(0) int x;` is a NO-OP (6.7.5p3) — NO diagnostic, NO override.
+TEST(SemanticAnalyzerCSubset, AlignasZeroIsNoOpNoOverride) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(0) int x;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNotPowerOfTwo), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNonConstant), 0u);
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    EXPECT_FALSE(x->explicitAlignment.has_value())
+        << "alignas(0) has no effect — no override stored";
+}
+
+// CONSTRAINT: a non-power-of-two value → S_AlignasNotPowerOfTwo.
+TEST(SemanticAnalyzerCSubset, AlignasNotPowerOfTwoFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(3) int x;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNotPowerOfTwo), 1u);
+}
+
+// CONSTRAINT: a value over the 256-byte cap → S_AlignasExceedsMax (a distinct
+// code from not-power-of-two — 512 IS a power of two, just too large).
+TEST(SemanticAnalyzerCSubset, AlignasExceedsMaxFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(512) int x;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasExceedsMax), 1u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNotPowerOfTwo), 0u);
+}
+
+// CONSTRAINT: an alignment WEAKER than the declared type's natural alignment →
+// S_AlignasWeakerThanNatural (6.7.5p4: alignas may only strengthen; 1 < 8).
+TEST(SemanticAnalyzerCSubset, AlignasWeakerThanNaturalFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(1) double d;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasWeakerThanNatural), 1u);
+}
+
+// CONSTRAINT: a non-constant value operand → S_AlignasNonConstant.
+TEST(SemanticAnalyzerCSubset, AlignasNonConstantFailsLoud) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "int nc; alignas(nc) int x;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNonConstant), 1u);
+}
+
+// CONSTRAINT: a NEGATIVE value is a constraint violation (NOT the 6.7.5p3 zero
+// no-op) → S_AlignasNotPowerOfTwo. Fail-loud: `alignas(-4)` must NOT be silently
+// swallowed as "no alignment" (a negative is not a valid alignment; gcc/clang
+// both reject it). RED-ON-DISABLE: were `value <= 0` treated as a no-op, this
+// would compile with ZERO diagnostics — a silent constraint violation.
+TEST(SemanticAnalyzerCSubset, AlignasNegativeFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(-4) int x;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNotPowerOfTwo), 1u)
+        << "alignas(-4) is a constraint violation, not a no-op — fail loud";
+}
+
+// EXACTLY-ONE diagnostic across a MULTI-DECLARATOR declaration: the alignas lives
+// on the shared prefix, so `alignas(3) int a, b;` is ONE erroneous specifier →
+// ONE S_AlignasNotPowerOfTwo (not one per declarator). RED-ON-DISABLE for the
+// per-declaration emit gate: without it the diagnostic fires twice.
+TEST(SemanticAnalyzerCSubset, AlignasMultiDeclaratorEmitsExactlyOnce) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(3) int a, b;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNotPowerOfTwo), 1u)
+        << "a shared-prefix alignas error must be reported once, not per declarator";
+}
+
+// MULTI-DECLARATOR STORE: a VALID `alignas(16) int a, b;` stores the override on
+// EVERY declarator's symbol (the prefix applies to all slots).
+TEST(SemanticAnalyzerCSubset, AlignasMultiDeclaratorStoresOnAll) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(16) int a, b;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* a = findSym(model, "a");
+    SymbolRecord const* b = findSym(model, "b");
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    ASSERT_TRUE(a->explicitAlignment.has_value());
+    ASSERT_TRUE(b->explicitAlignment.has_value());
+    EXPECT_EQ(*a->explicitAlignment, 16u);
+    EXPECT_EQ(*b->explicitAlignment, 16u);
+}
+
+// CONSTRAINT: alignas on a FUNCTION declaration → S_AlignasInvalidContext.
+TEST(SemanticAnalyzerCSubset, AlignasOnFunctionFailsLoud) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "alignas(16) int f(void);\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 1u);
+}
+
+// CONSTRAINT: alignas on a BIT-FIELD member → S_AlignasInvalidContext (6.7.5p2).
+TEST(SemanticAnalyzerCSubset, AlignasOnBitFieldMemberFailsLoud) {
+    auto cu = buildShippedUnit("c-subset",
+                               { "struct S { alignas(8) int a : 3; };\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasInvalidContext), 1u);
+}
+
+// The C11 spelling `_Alignas` works identically to the C23 `alignas`.
+TEST(SemanticAnalyzerCSubset, AlignasC11SpellingStores) {
+    auto cu = buildShippedUnit("c-subset", { "_Alignas(64) int g;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    ASSERT_TRUE(g->explicitAlignment.has_value());
+    EXPECT_EQ(*g->explicitAlignment, 64u);
+}
+
+// VALUE-EXPR with an ENUM CONSTANT operand: `alignas(W)` where `W` is an enum
+// constant folds to 16. RED-ON-DISABLE for the type-vs-value discrimination: a
+// bare non-typedef identifier (`W`) must roll back to the VALUE reading and
+// const-fold (the `requireKnownType` polarity) — under the PreferType default it
+// would wrongly commit as a type-name and emit a spurious S_AlignasNonConstant.
+TEST(SemanticAnalyzerCSubset, AlignasEnumConstantOperandFolds) {
+    auto cu = buildShippedUnit("c-subset", {
+        "enum E { W = 16 };\n"
+        "alignas(W) int g;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AlignasNonConstant), 0u)
+        << "an enum-constant alignas operand must roll back to the VALUE reading "
+           "and fold (requireKnownType), not commit as a type-name";
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    ASSERT_TRUE(g->explicitAlignment.has_value());
+    EXPECT_EQ(*g->explicitAlignment, 16u);
+}
+
+// VALUE-EXPR with a sizeof operand: `alignas(sizeof(double))` folds to 8 (the
+// alignas value-form operand runs through the SAME sizeof-folding constIntExpr).
+TEST(SemanticAnalyzerCSubset, AlignasSizeofOperandFolds) {
+    auto cu = buildShippedUnit("c-subset", { "alignas(sizeof(double)) int g;\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    SymbolRecord const* g = findSym(model, "g");
+    ASSERT_NE(g, nullptr);
+    ASSERT_TRUE(g->explicitAlignment.has_value());
+    EXPECT_EQ(*g->explicitAlignment, 8u);
+}
+
+// ── FC16 C11/C23 6.5.1.1 _Generic — generic selection ────────────────────────
+//
+// SELECTION is a compile-time SEMANTIC-tier decision (like sizeof folding): the
+// controlling expression's type is matched against each association's resolved
+// type-name; the WINNER's result type is stamped on the genericExpr node (so the
+// enclosing expression types), and a no-match/ambiguous/value-in-type failure is
+// fail-loud. These pins prove the selection is REAL (the RESULT TYPE follows the
+// SELECTED association — an int-controlled `_Generic` picking an `int:` branch
+// that yields a `double` types the node `double`, not `int`).
+namespace {
+// The first genericExpr node across the CU's trees (the whole `_Generic (...)`
+// primary expression), for the RESULT-TYPE stamp checks.
+[[nodiscard]] std::pair<TreeId, NodeId> firstGenericNode(CompilationUnit const& cu) {
+    for (auto const& t : cu.trees()) {
+        auto const rid = t.schema().rules().find("genericExpr");
+        if (!rid.valid()) continue;
+        for (std::uint32_t i = 1; i < t.nodeCount(); ++i) {
+            NodeId const n{i};
+            if (t.kind(n) == NodeKind::Internal && t.rule(n).v == rid.v)
+                return {t.id(), n};
+        }
+    }
+    return {TreeId{}, NodeId{}};
+}
+} // namespace
+
+// The selected association's TYPE is the `_Generic` node's result type. `i` is
+// `int`, so the `int:` association wins; its result expression is a `double`
+// literal — so the genericExpr node types `double` (F64), NOT `int`. This is the
+// load-bearing behavior: the result type follows the SELECTED branch's value.
+TEST(SemanticAnalyzerCSubset, GenericSelectedBranchTypeIsResultType) {
+    auto cu = buildShippedUnit("c-subset", {
+        "double f(void){ int i = 0; return _Generic(i, int: 1.5, "
+        "long: 2, default: 0); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    auto [tid, gen] = firstGenericNode(*cu);
+    ASSERT_TRUE(gen.valid()) << "a genericExpr node must exist";
+    TypeId const genTy = model.typeAt(gen);
+    ASSERT_TRUE(genTy.valid()) << "the _Generic node must be typed (selection ok)";
+    EXPECT_EQ(ti.kind(genTy), TypeKind::F64)
+        << "the result type is the SELECTED int-branch's double value (F64)";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionNoMatch), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionAmbiguous), 0u);
+}
+
+// A controlling type matching NO typed association AND no default fails loud
+// (S_GenericSelectionNoMatch) — `double` vs {int, char}.
+TEST(SemanticAnalyzerCSubset, GenericNoMatchNoDefaultFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ double d = 0; return _Generic(d, int: 1, char: 2); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionNoMatch), 1u)
+        << "no typed match and no default is a constraint violation";
+}
+
+// The `default` fallback is selected when no typed association matches — `char*`
+// vs {int, double} → default. No no-match error; the node types the default's
+// result type.
+TEST(SemanticAnalyzerCSubset, GenericDefaultFallbackSelected) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ char c = 0; char* p = &c; "
+        "return _Generic(p, int: 1, double: 2, default: 7); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionNoMatch), 0u)
+        << "the default association must satisfy an otherwise-no-match selection";
+    auto [tid, gen] = firstGenericNode(*cu);
+    ASSERT_TRUE(gen.valid());
+    EXPECT_TRUE(model.typeAt(gen).valid())
+        << "the default-selected _Generic node must be typed";
+}
+
+// A VALUE in an association's type position fails loud at the type-resolve — the
+// castTypeRef `commitRequiresTypeName` triage routes a value-identifier to
+// S_UnknownType (never silently treated as a type).
+TEST(SemanticAnalyzerCSubset, GenericValueInTypePositionFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ int i = 0; int notAType = 5; "
+        "return _Generic(i, notAType: 1, default: 0); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownType), 1u)
+        << "a value identifier in an association type position must fail loud";
+}
+
+// Two associations naming the SAME type (compatible types — 6.5.1.1p2 forbids it)
+// is ambiguous → S_GenericSelectionAmbiguous.
+TEST(SemanticAnalyzerCSubset, GenericAmbiguousMatchFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ int i = 0; "
+        "return _Generic(i, int: 1, int: 2, default: 0); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionAmbiguous), 1u)
+        << "two associations of the same type is a constraint violation";
+}
+
+// A typedef name in an association type position resolves through the alias and
+// matches the underlying type (`MyInt` ≡ `int` → the MyInt-branch wins for an
+// `int` controlling expression).
+TEST(SemanticAnalyzerCSubset, GenericTypedefAssociationMatches) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typedef int MyInt;\n"
+        "int main(void){ int i = 0; "
+        "return _Generic(i, MyInt: 42, double: 3, default: 0); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionNoMatch), 0u)
+        << "a typedef alias in type position must match the underlying type";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_GenericSelectionAmbiguous), 0u);
 }
 
 // R1: the GENUINE forward-reference case (`int a[sizeof(b)]; int b;` — b used
@@ -1894,6 +2876,92 @@ TEST(SemanticAnalyzerCSubset, AdjacentStringConcatTypesWholeCharArray) {
            "(reading only the first piece would give 6)";
     ASSERT_EQ(ti.operands(ty).size(), 1u);
     EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::Char);
+}
+
+// ── Cycle D — C11/C23 6.4.5p5: adjacent-concat prefix MIXING (semantic typing) ─
+// The run's element core is keyed by its EFFECTIVE prefix (the single distinct
+// non-narrow opener among ALL segments), NOT the first opener. Two DIFFERENT
+// non-narrow prefixes leave the node UNTYPED + emit H_ConflictingStringLiteralPrefixes.
+
+// THE typing defect fix: `"a" L"b"` — first opener narrow, but the run's effective
+// prefix is L (wchar_t) so the WHOLE literal types Array<wchar_t, 3> (I32 on the
+// POSIX default), the narrow "a" widened. RED-ON-DISABLE: first-opener keying stamps
+// Array<Char,3> here — the semantic/HIR mistype the two tiers would AGREE on wrongly.
+TEST(SemanticAnalyzerCSubset, ConcatEffectivePrefixTypesWholeWideArray) {
+    auto cu = buildShippedUnit("c-subset", { "void f(){ \"a\" L\"b\"; }" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    ASSERT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const ty = firstStringLiteralType(model, *cu);
+    ASSERT_TRUE(ty.valid());
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::I32)
+        << "`\"a\" L\"b\"` — the trailing L prefix wins (was silently dropped)";
+    EXPECT_EQ(ti.scalars(ty)[0], 3) << "'a' widened + 'b' + wide NUL";
+}
+
+// Same-prefix `u"a" u"b"` (one distinct non-narrow kind) is NOT a conflict →
+// Array<U16,3>, existing behavior.
+TEST(SemanticAnalyzerCSubset, ConcatSamePrefixTypesU16) {
+    auto cu = buildShippedUnit("c-subset", { "void f(){ u\"a\" u\"b\"; }" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    ASSERT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId const ty = firstStringLiteralType(model, *cu);
+    ASSERT_TRUE(ty.valid());
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::U16);
+    EXPECT_EQ(ti.scalars(ty)[0], 3);
+}
+
+// MF1 / N6: a run mixing two DIFFERENT non-narrow prefixes leaves the rule node
+// UNTYPED and emits H_ConflictingStringLiteralPrefixes at the SEMANTIC tier (so a
+// `sizeof` of it reports the real reason, not a bare sizeof-of-untyped cascade).
+TEST(SemanticAnalyzerCSubset, ConcatConflictLeavesNodeUntypedAndEmits) {
+    auto cu = buildShippedUnit("c-subset", { "void f(){ u\"a\" U\"b\"; }" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::H_ConflictingStringLiteralPrefixes), 1u);
+    TypeId const ty = firstStringLiteralType(model, *cu);
+    EXPECT_FALSE(ty.valid())
+        << "a mixed-prefix run is left UNTYPED so a sizeof of it fails loud";
+}
+
+// N6: `sizeof(u"a" U"b")` fails loud with the conflict reason (not a silent fold /
+// bare sizeof-of-untyped). The conflict is emitted once, on the rule node.
+TEST(SemanticAnalyzerCSubset, ConcatConflictSizeofFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "int f(){ return sizeof(u\"a\" U\"b\"); }" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::H_ConflictingStringLiteralPrefixes), 1u);
+}
+
+// MF2 (the AGNOSTICISM witness): the conflict compares opener TOKEN KINDS, never
+// resolved cores. `u"a" L"b"` mixes `u"` (char16_t) and `L"` (wchar_t) — two
+// DIFFERENT non-narrow token kinds → conflict on EVERY target. On pe both resolve
+// to U16 (SAME core), so a core-keyed check would silently ACCEPT it on Windows
+// while rejecting it on Linux (I32 ≠ U16). This asserts the reject on BOTH the
+// default (elf, different cores) AND pe (same core) — RED-ON-DISABLE of a core-keyed
+// classifier flips the pe arm to accept.
+TEST(SemanticAnalyzerCSubset, ConcatConflictIsTokenKindNotCoreEvenOnPe) {
+    for (bool pe : {false, true}) {
+        auto cu = buildShippedUnit("c-subset", { "void f(){ u\"a\" L\"b\"; }" });
+        assertNoBuilderErrors(*cu);
+        auto model = pe ? analyze(cu, DataModel::Llp64, std::nullopt, std::nullopt,
+                                  ObjectFormatKind::Pe)
+                        : analyze(cu);
+        EXPECT_TRUE(model.hasErrors()) << (pe ? "pe" : "default");
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::H_ConflictingStringLiteralPrefixes), 1u)
+            << (pe ? "pe: u\"/L\" both resolve to U16 but the TOKEN KINDS differ"
+                   : "default: u\"→U16 vs L\"→I32");
+    }
 }
 
 // R2: the int→char assignability arm (`charConvertsToArith`, C 6.3.1.1). Typing the
@@ -3801,6 +4869,73 @@ TEST(SemanticAnalyzerCSubset, FnPrototypeForwardCallResolvesSemantically) {
         << "the prototype is upgraded to a callable Function symbol";
 }
 
+// FC16 (D-CSUBSET-NORETURN): the surviving Function symbol named `name` is
+// noreturn (its `isNoreturn` bit). Mirrors `countSurvivingFns` — the `!isAbsorbedProto`
+// filter isolates the single callable record a call resolves to.
+[[nodiscard]] inline bool
+survivingFnIsNoreturn(SemanticModel const& model, std::string_view name) {
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& r = model.symbols()[i];
+        if (r.name == name && r.kind == DeclarationKind::Function
+            && !r.isAbsorbedProto) {
+            return r.isNoreturn;
+        }
+    }
+    return false;
+}
+
+// (f) FC16 (D-CSUBSET-NORETURN): a prototype that spells `_Noreturn` + a
+// definition that does NOT must OR-merge the noreturn attribute INTO the surviving
+// record (the definition — the proto is absorbed). A call resolves to the survivor,
+// so without the merge the call site would not see the attribute. Witnesses the
+// post-1.5 mergedFnDecls OR-merge. RED-ON-DISABLE: drop the OR-merge → detection
+// only marked the absorbed proto, so the survivor's isNoreturn stays false and the
+// EXPECT_TRUE flips.
+TEST(SemanticAnalyzerCSubset, NoreturnProtoMergesIntoDefinition) {
+    auto model = analyzeShipped("c-subset", {
+        "_Noreturn void die(int);\n"
+        "void die(int x){ while(1){} }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a _Noreturn proto + a compatible definition must merge cleanly";
+    EXPECT_EQ(countSurvivingFns(model, "die"), 1u);
+    EXPECT_TRUE(survivingFnIsNoreturn(model, "die"))
+        << "the _Noreturn on the proto must OR-merge into the surviving definition";
+}
+
+// (g) FC16 (D-CSUBSET-NORETURN): a shipped-descriptor symbol declared
+// `"noreturn": true` (the abort/exit shape) threads onto the injected
+// SymbolRecord's isNoreturn — a shipped extern has no user prototype to carry
+// `_Noreturn`. Witnesses ShippedSymbol.noreturn -> SymbolRecord.isNoreturn at the
+// injection site; a sibling symbol without the key stays non-noreturn.
+// RED-ON-DISABLE: drop `rec.isNoreturn = sym.noreturn` at injection -> `boom`
+// stays false.
+TEST(SemanticAnalyzerCSubset, NoreturnShippedDescriptorSymbolIsNoreturn) {
+    dss::test_support::ScratchDir sysDir{
+        dss::test_support::Location::Temp, "nr-desc"};
+    auto cu = buildAngleDescriptorUnit(
+        sysDir, "boom.json",
+        R"({ "header": "boom.h", "library": { "pe": "msvcrt.dll", "elf": "libc.so.6" },
+             "symbols": [ { "name": "boom",  "signature": "fn() -> void", "noreturn": true },
+                          { "name": "plain", "signature": "fn() -> void" } ] })",
+        "#include <boom.h>\nint main() { return 0; }\n");
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    ASSERT_FALSE(model.hasErrors());
+    bool sawBoom = false, sawPlain = false, boomNr = false, plainNr = false;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& r = model.symbols()[i];
+        if (r.name == "boom")  { sawBoom = true;  boomNr  = r.isNoreturn; }
+        if (r.name == "plain") { sawPlain = true; plainNr = r.isNoreturn; }
+    }
+    ASSERT_TRUE(sawBoom);
+    ASSERT_TRUE(sawPlain);
+    EXPECT_TRUE(boomNr)
+        << "a descriptor `noreturn:true` symbol must inject SymbolRecord.isNoreturn";
+    EXPECT_FALSE(plainNr)
+        << "a descriptor symbol without `noreturn` stays non-noreturn";
+}
+
 // ── D-CSUBSET-BLOCK-SCOPE-PROTOTYPE — a block-scope function prototype REFERS
 //    to (and merges with) the file-scope function (C 6.2.2p4 / 6.7.6.3) ──
 //
@@ -4569,6 +5704,147 @@ TEST(SemanticAnalyzerCSubset, MultiMemberDeclaresNothingStillLoud) {
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
         << "`int ;` declares nothing -- must stay loud (anonymous non-bitfield)";
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23 §6.7.2.1 ¶13): the members of
+// an anonymous struct/union member are PROMOTED into the enclosing composite's
+// member namespace. `struct S { union { int a; int b; }; } s; s.a` resolves `a`
+// as if a direct member. Pins: promotion resolves clean (no S0017), member
+// access types through the anon composite, a DIRECT-member collision fails
+// loud, and an AMBIGUOUS sibling-anon name fails loud.
+// ─────────────────────────────────────────────────────────────────────────
+
+// (a) The exact S0017 probe from the feature request now resolves clean: an
+// anonymous union member whose fields are read as direct members of S.
+TEST(SemanticAnalyzerCSubset, AnonUnionMemberPromotesAndResolves) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { union { int a; int b; }; };\n"
+        "int main() { struct S s; s.a = 42; return s.a; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "s.a / s.b promoted from the anonymous union must resolve clean";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeclarationDeclaresNothing), 0u)
+        << "an anonymous COMPOSITE member is not a declares-nothing form";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "s.a must resolve through the anonymous union, not be undeclared";
+    // The promoted field `a` carries an anonAncestorPath (reached via the anon
+    // union member) and types as I32.
+    SymbolRecord const* a = fieldSym(model, "a");
+    ASSERT_NE(a, nullptr);
+    EXPECT_FALSE(a->anonAncestorPath.empty())
+        << "a is reachable only through the anonymous union member";
+    ASSERT_TRUE(a->type.valid());
+    EXPECT_EQ(model.lattice().interner().kind(a->type), TypeKind::I32);
+}
+
+// (b) A NAMED direct member alongside an anonymous union: both resolve, and the
+// anon member itself is flagged isAnonymousMember.
+TEST(SemanticAnalyzerCSubset, AnonUnionMemberBesideNamedMember) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int tag; union { int i; int j; }; };\n"
+        "int main() { struct S s; s.tag = 1; s.i = 41; return s.j; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    // The synthetic anon field is present and flagged.
+    bool sawAnon = false;
+    for (std::size_t k = 1; k < model.symbols().size(); ++k)
+        if (model.symbols()[k].isAnonymousMember) sawAnon = true;
+    EXPECT_TRUE(sawAnon) << "the anon union member must be flagged isAnonymousMember";
+}
+
+// (c) A nested anonymous struct inside an anonymous union — two-level promotion.
+TEST(SemanticAnalyzerCSubset, NestedAnonMemberPromotes) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { union { struct { int x; int y; }; int packed; }; };\n"
+        "int main() { struct S s; s.x = 40; s.y = 2; return s.x + s.y; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "x/y promoted through anon-struct-in-anon-union must resolve clean";
+    SymbolRecord const* x = fieldSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    // Reached through TWO anonymous members (union then struct).
+    EXPECT_EQ(x->anonAncestorPath.size(), 2u)
+        << "x is two anonymous levels deep";
+}
+
+// (d) A promoted name colliding with a DIRECT member fails loud (C 6.7.2.1 ¶13).
+TEST(SemanticAnalyzerCSubset, AnonMemberCollisionWithDirectFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int x; union { int x; int y; }; };\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a promoted member `x` colliding with the direct member `x` must fail loud";
+}
+
+// (d2) The collision check must be scoped to the enclosing COMPOSITE's own
+// field members — NOT the parent scope chain. C 6.2.1 gives each struct/union a
+// SEPARATE member name space disjoint from ordinary identifiers, so a promoted
+// member sharing a name with an outer GLOBAL / TYPEDEF / function is LEGAL and
+// must NOT false-error. Regression guard for the parent-walk `lookup` bug.
+TEST(SemanticAnalyzerCSubset, AnonMemberNameMayShadowOuterIdentifier) {
+    auto globalModel = analyzeShipped("c-subset", {
+        "int a;\n"
+        "struct S { struct { int a; int b; }; };\n"
+        "int main() { struct S s; s.a = 40; s.b = 2; return s.a + s.b; }\n",
+    });
+    EXPECT_FALSE(globalModel.hasErrors())
+        << "a promoted member `a` sharing a name with a global `a` is legal (C 6.2.1)";
+    EXPECT_EQ(countCode(globalModel.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "no false S_RedeclaredSymbol against an enclosing-scope identifier";
+    // A typedef in the enclosing scope must likewise not false-collide.
+    auto typedefModel = analyzeShipped("c-subset", {
+        "typedef int a;\n"
+        "struct S { struct { int a; int b; }; };\n"
+        "int main() { struct S s; s.a = 1; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(typedefModel.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 0u)
+        << "no false S_RedeclaredSymbol against an enclosing typedef";
+}
+
+// (e) An AMBIGUOUS name shared by two sibling anonymous members fails loud on
+// ACCESS (the promotion itself is fine — the ambiguity is a use-site error).
+TEST(SemanticAnalyzerCSubset, AnonMemberAmbiguousSiblingFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { union { int a; }; union { int a; }; };\n"
+        "int main() { struct S s; return s.a; }\n",
+    });
+    EXPECT_TRUE(model.hasErrors());
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "s.a matching two sibling anonymous unions is ambiguous — fail loud";
+}
+
+// (f) A BIT-FIELD inside an anonymous composite must NOT trigger a false
+// S_BitFieldNonIntegerType. Regression guard: the Pass-1.5 anon-composite arm
+// must NOT run resolveBitfieldSuffix on the composite field node (its bounded
+// descendant search would find the INNER `: W` suffix and validate that width
+// against the composite HEAD type — a non-integer — falsely). The inner
+// bit-field is resolved by the anon composite's own visit; promotion resolves
+// its members clean.
+TEST(SemanticAnalyzerCSubset, AnonUnionWithInnerBitfieldNoFalseError) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { union { int a : 4; int b; }; };\n"
+        "int main() { struct S s; s.b = 42; return s.a; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a bit-field inside an anonymous union must not false-error";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_BitFieldNonIntegerType), 0u)
+        << "no false S_BitFieldNonIntegerType from the anon-composite arm";
+    // Both members promote and resolve; the bit-field width is recorded on `a`.
+    SymbolRecord const* a = fieldSym(model, "a");
+    ASSERT_NE(a, nullptr);
+    EXPECT_FALSE(a->anonAncestorPath.empty());
+    ASSERT_TRUE(a->bitFieldWidth.has_value())
+        << "the inner bit-field width is still resolved by the union's own visit";
+    EXPECT_EQ(*a->bitFieldWidth, 4u);
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -31,11 +31,14 @@
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
+#include "mir/mir_verifier.hpp"
 #include "opt/passes/mem2reg.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <optional>
+#include <variant>
 #include <vector>
 
 using namespace dss;
@@ -70,6 +73,50 @@ std::vector<StructCfMarker> snapshotMarkers(Mir const& mir) {
         }
     }
     return out;
+}
+
+// If `id` is an integer `Const`, its int64 literal value; else nullopt.
+std::optional<std::int64_t> constIntValue(Mir const& mir, MirInstId id) {
+    if (mir.instOpcode(id) != MirOpcode::Const) return std::nullopt;
+    MirLiteralValue const& lv = mir.literalValue(mir.instPayload(id));
+    if (auto const* p = std::get_if<std::int64_t>(&lv.value)) return *p;
+    return std::nullopt;
+}
+
+// Count integer `Const`s in the module whose value equals `want`.
+std::size_t countConstIntInModule(Mir const& mir, std::int64_t want) {
+    std::size_t n = 0;
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        std::uint32_t const nb = mir.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(f, bi);
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t i2 = 0; i2 < ni; ++i2) {
+                auto const v = constIntValue(mir, mir.blockInstAt(b, i2));
+                if (v && *v == want) ++n;
+            }
+        }
+    }
+    return n;
+}
+
+template <class F>
+void forEachPhi(Mir const& mir, F&& f) {
+    std::size_t const nf = mir.moduleFuncCount();
+    for (std::uint32_t i = 0; i < nf; ++i) {
+        MirFuncId const fn = mir.funcAt(i);
+        std::uint32_t const nb = mir.funcBlockCount(fn);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = mir.funcBlockAt(fn, bi);
+            std::uint32_t const ni = mir.blockInstCount(b);
+            for (std::uint32_t i2 = 0; i2 < ni; ++i2) {
+                MirInstId const id = mir.blockInstAt(b, i2);
+                if (mir.instOpcode(id) == MirOpcode::Phi) f(id);
+            }
+        }
+    }
 }
 
 } // namespace
@@ -193,6 +240,167 @@ TEST(Mem2Reg, DiamondConditionalStoreInsertsPhi) {
         }
     }
     EXPECT_TRUE(foundPhi);
+}
+
+// D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF — a LIVE conditionally-initialized local:
+// `if (c) x = 1; return x + c;` stores x on ONLY ONE arm. The merge Phi's else-edge
+// (entry → join) has no reaching store; Mem2Reg must materialize undef-as-zero (an
+// entry-block Const 0) rather than std::abort() the release compile — valid C that
+// gcc/SQLite rely on. i32 is GPR-Const-zeroable, so the alloca stays PROMOTED.
+// RED-on-disable: revert the zero materialization → the rename walk std::abort()s.
+TEST(Mem2Reg, ConditionallyInitializedLiveAllocaZeroFillsUndefEdge) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const join  = mb.createBlock(StructCfMarker::IfJoin);
+
+    mb.beginBlock(entry);
+    MirInstId const cond = mb.addArg(0, boolT);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    mb.addCondBr(cond, tArm, join);   // else edge → join directly: NO store to x
+
+    mb.beginBlock(tArm);
+    MirLiteralValue one; one.value = std::int64_t{1}; one.core = TypeKind::I32;
+    MirInstId const c1 = mb.addConst(one, i32);
+    MirInstId const s1[] = {c1, slot};
+    (void)mb.addInst(MirOpcode::Store, s1, InvalidType);
+    mb.addBr(join);
+
+    mb.beginBlock(join);
+    MirInstId const loadOps[] = {slot};
+    MirInstId const ld = mb.addInst(MirOpcode::Load, loadOps, i32);
+    mb.addReturn(ld);
+
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runMem2Reg(mir, interner, rep);
+    ASSERT_TRUE(r.ok) << "a conditional-init live local must compile, not abort";
+    EXPECT_EQ(r.allocasPromoted,  1u) << "i32 is Const-zeroable → stays promoted";
+    EXPECT_EQ(r.phisInserted,     1u);
+    EXPECT_EQ(r.loadsReplaced,    1u);
+    EXPECT_EQ(r.storesEliminated, 1u);   // only the one arm stored
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Alloca), 0u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Load),   0u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi),    1u);
+
+    // The join Phi has 2 incomings: the then-arm's Const 1 and the materialized
+    // undef-as-zero Const 0 on the else edge.
+    std::size_t incCount = 0;
+    bool sawZero = false, sawOne = false;
+    forEachPhi(mir, [&](MirInstId phi) {
+        auto const incs = mir.phiIncomings(phi);
+        incCount = incs.size();
+        for (auto const& inc : incs) {
+            auto const v = constIntValue(mir, inc.value);
+            if (v && *v == 0) sawZero = true;
+            if (v && *v == 1) sawOne  = true;
+        }
+    });
+    EXPECT_EQ(incCount, 2u);
+    EXPECT_TRUE(sawZero) << "the undef else edge must be a Const 0";
+    EXPECT_TRUE(sawOne)  << "the then arm keeps its Const 1";
+
+    // The entry-block Const 0 must dominate the join predecessor — proven by a full
+    // structural/dominance verify of the rebuilt module (the fix's load-bearing claim).
+    DiagnosticReporter vrep;
+    EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep))
+        << "the undef-as-zero incoming must be dominance-legal";
+}
+
+// D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF — the Load empty-stack site: `int x; return x;`
+// is a direct uninitialized read (UB, but valid to compile). The Load resolves to
+// undef-as-zero rather than abort. RED-on-disable: the pre-fix Load-empty-stack
+// std::abort() fires.
+TEST(Mem2Reg, ConditionallyInitializedLoadZeroFillsUninitPath) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirInstId const loadOps[] = {slot};
+    MirInstId const ld = mb.addInst(MirOpcode::Load, loadOps, i32);
+    mb.addReturn(ld);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runMem2Reg(mir, interner, rep);
+    ASSERT_TRUE(r.ok) << "an uninitialized read must compile, not abort";
+    EXPECT_EQ(r.allocasPromoted, 1u);
+    EXPECT_EQ(r.loadsReplaced,   1u);
+    EXPECT_EQ(r.phisInserted,    0u);   // single block — no joins
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Load),   0u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Alloca), 0u);
+    EXPECT_GE(countConstIntInModule(mir, 0), 1u) << "the read resolves to a Const 0";
+    DiagnosticReporter vrep;
+    EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep));
+}
+
+// D-OPT-MEM2REG-CONDITIONAL-INIT-UNDEF (FPR arm) — a conditionally-initialized DOUBLE
+// has no directly-lowerable zero Const (register machines have no float-immediate),
+// so Mem2Reg DE-PROMOTES it (leaves the alloca/store/load as memory — always correct)
+// rather than emit an unlowerable float Const. The store value is a real double ARG
+// (not a synthetic float Const), matching how HIR→MIR shapes floats. RED-on-disable:
+// remove the de-promotion → the pass tries a float Const 0 and hits the non-zeroable
+// assert (abort). A fully-initialized float (both arms store) still promotes — only
+// the conditional-init case de-promotes.
+TEST(Mem2Reg, ConditionallyInitializedFloatAllocaIsDepromoted) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const f64   = interner.primitive(TypeKind::F64);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const ptr   = interner.pointer(f64);
+    TypeId const params[] = {boolT, f64};
+    TypeId const fnSig = interner.fnSig(params, f64, CallConv::CcSysV);
+
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
+    MirBlockId const join  = mb.createBlock(StructCfMarker::IfJoin);
+
+    mb.beginBlock(entry);
+    MirInstId const cond = mb.addArg(0, boolT);
+    MirInstId const val  = mb.addArg(1, f64);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    mb.addCondBr(cond, tArm, join);   // else edge → join: NO store to x
+
+    mb.beginBlock(tArm);
+    MirInstId const s1[] = {val, slot};
+    (void)mb.addInst(MirOpcode::Store, s1, InvalidType);
+    mb.addBr(join);
+
+    mb.beginBlock(join);
+    MirInstId const loadOps[] = {slot};
+    MirInstId const ld = mb.addInst(MirOpcode::Load, loadOps, f64);
+    mb.addReturn(ld);
+
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runMem2Reg(mir, interner, rep);
+    ASSERT_TRUE(r.ok) << "a conditional-init float must compile (de-promoted), not abort";
+    EXPECT_EQ(r.allocasPromoted, 0u) << "FPR conditional-init is de-promoted, not zeroed";
+    EXPECT_EQ(r.phisInserted,    0u);
+    // The alloca / store / load stay as MEMORY (unpromoted).
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Alloca), 1u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Store),  1u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Load),   1u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Phi),    0u);
+    DiagnosticReporter vrep;
+    EXPECT_TRUE(MirVerifier(mir, &interner).verify(vrep));
 }
 
 // RISK PIN #1 — the promotability gate.

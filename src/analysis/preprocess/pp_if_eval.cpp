@@ -1,5 +1,6 @@
 #include "analysis/preprocess/pp_if_eval.hpp"
 
+#include "core/types/attribute_naming.hpp"   // stripDunder (shared with the packed scan)
 #include "core/types/char_decode.hpp"
 #include "core/types/hir_lowering_config.hpp"
 #include "core/types/number_decode.hpp"
@@ -163,6 +164,14 @@ public:
         // char constant in `#if` is an INT whose value is the (escape-decoded)
         // single byte (C 6.10.1p4 + 6.4.4.4). Both invalid ⇒ the language has no
         // char-literal form (toy/tsql) and the arm never fires.
+        // CYCLE B (C11/C23 6.4.4.4 wide/UTF chars): ONLY the narrow `'` opener is
+        // recognized here. A WIDE opener (`L'`/`u'`/`U'`/`u8'`) in `#if` is left
+        // UNHANDLED ON PURPOSE — it is not `charOpenKind_`, not an integer, and not a
+        // Word token, so `parsePrimary` falls through to its fail-loud "unexpected
+        // token in #if" (VERIFIED: `#if L'A'` → P_PreprocessorDirective, never a
+        // silent 0). Wide char constants in a `#if` controlling expression (their
+        // int value + the execution-charset mapping) are a later cycle; until then
+        // the honest behavior is a hard error, NOT a silent misevaluation.
         charOpenKind_ = schema_.hirLowering().charStartToken;
         charBodyKind_ = schema_.hirLowering().charBodyToken;
     }
@@ -627,17 +636,10 @@ private:
 
 } // namespace
 
-// FC15c: strip the leading + trailing `__` of a `__name__` dunder spelling
-// (C 6.10.1: the `__has_c_attribute` lookup ignores a surrounding double
-// underscore, so `__deprecated__` matches a declared `deprecated`). A name
-// that is not in `__x__` form is returned unchanged.
-[[nodiscard]] std::string_view stripDunder(std::string_view name) {
-    if (name.size() >= 4 && name.substr(0, 2) == "__"
-        && name.substr(name.size() - 2) == "__") {
-        return name.substr(2, name.size() - 4);
-    }
-    return name;
-}
+// FC15c: `stripDunder` (the `__name__` dunder normalizer) now lives in the shared
+// `core/types/attribute_naming.hpp` so the composite type-attribute scan
+// (D-CSUBSET-PACKED) uses the SAME normalizer — the two can never drift. Behavior
+// is byte-identical to the former local definition.
 
 // FC15c: look up `attr` in the schema's KNOWN-attribute set, trying both the
 // raw spelling and the dunder-stripped form. Returns the reported version int,

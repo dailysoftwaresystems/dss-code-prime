@@ -691,6 +691,72 @@ TEST(Cse, DominanceScopingEntryDefAvailableInChild) {
         << "entry's Add dominates then-arm — the duplicate must CSE";
 }
 
+// Perf-hoist decision-identity pin (the CSE analysis-recomputation fix): the
+// cross-block Load-CSE region walker `mirRegionBetween` now receives the caller's
+// ONCE-computed whole-module predecessor map and scopes its block-intersection to
+// the function-local reachable set (was a per-query whole-module rebuild + scan).
+// This pins that the ADMIT/REFUSE decision stays byte-identical PER FUNCTION in a
+// MULTI-function module: fn0 has an in-region Store clobber (CSE refused), fn1 has
+// none (CSE admitted) → exactly one CSE. A broken scope (leaking another function's
+// blocks/preds, or mis-sizing the whole-module preds) would mis-count. Both Loads
+// are cross-block (canonical in entry, candidate in join), so both functions
+// exercise the rewritten region walker.
+TEST(Cse, CrossBlockLoadCseDecidedPerFunctionInMultiFunctionModule) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const boolT = interner.primitive(TypeKind::Bool);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const params[] = {boolT};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    for (std::uint32_t fnIdx = 0; fnIdx < 2; ++fnIdx) {
+        mb.addFunction(fnSig, SymbolId{100u + fnIdx});
+        MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+        MirBlockId const tArm  = mb.createBlock(StructCfMarker::IfThen);
+        MirBlockId const fArm  = mb.createBlock(StructCfMarker::IfElse);
+        MirBlockId const join  = mb.createBlock(StructCfMarker::IfJoin);
+
+        mb.beginBlock(entry);
+        MirInstId const cond = mb.addArg(0, boolT);
+        MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+        MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+        MirInstId const c0 = mb.addConst(v0, i32);
+        MirInstId const st0[] = {c0, slot};
+        (void)mb.addInst(MirOpcode::Store, st0, InvalidType);
+        MirInstId const lops[] = {slot};
+        MirInstId const ld1 = mb.addInst(MirOpcode::Load, lops, i32);
+        mb.addCondBr(cond, tArm, fArm);
+
+        mb.beginBlock(tArm);
+        if (fnIdx == 0) {   // in-region aliasing clobber — function 0 only
+            MirLiteralValue v1; v1.value = std::int64_t{1}; v1.core = TypeKind::I32;
+            MirInstId const c1 = mb.addConst(v1, i32);
+            MirInstId const st1[] = {c1, slot};
+            (void)mb.addInst(MirOpcode::Store, st1, InvalidType);
+        }
+        mb.addBr(join);
+
+        mb.beginBlock(fArm);
+        mb.addBr(join);
+
+        mb.beginBlock(join);
+        MirInstId const ld2 = mb.addInst(MirOpcode::Load, lops, i32);
+        MirInstId const sum[] = {ld1, ld2};
+        MirInstId const r = mb.addInst(MirOpcode::Add, sum, i32);
+        mb.addReturn(r);
+    }
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const res = opt::passes::runCse(mir, interner, rep);
+    EXPECT_TRUE(res.ok);
+    EXPECT_EQ(res.instructionsCsed, 1u)
+        << "cross-block Load-CSE decided per function: fn0's in-region clobber "
+           "refuses, fn1 (clean region) admits — the hoisted whole-module preds "
+           "+ function-scoped region walker must not leak across functions";
+}
+
 // Multi-function: per-function reset of the cseMap.
 TEST(Cse, MultiFunctionModuleEachCsedIndependently) {
     TypeInterner interner{CompilationUnitId{1}};

@@ -120,6 +120,21 @@ struct DSS_EXPORT SymbolRecord {
     // SymbolRecord precedent for kind-specific fields (`isConst`,
     // `warnIfUnused`, `variadicBuiltin`).
     std::uint32_t   fieldIndex = 0;
+    // FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23 §6.7.2.1 ¶13): true iff this
+    // is a synthetic anonymous-member field symbol (`<anon:…>`) WHOSE resolved
+    // type is a Struct/Union — i.e. a genuine anonymous struct/union whose
+    // members are PROMOTED into the enclosing composite's member namespace (NOT
+    // a bare `int : 3;` bit-field or a rejected `int ;`). Set at Pass 1.5 once
+    // the head type resolves. Member-access resolution recurses through such
+    // members' own field scopes; HIR lowering synthesizes one intermediate
+    // MemberAccess hop per promotion level. Harmless false for every other symbol.
+    bool            isAnonymousMember = false;
+    // FC16 D-CSUBSET-ANON-MEMBER-PROMOTION: for a field reachable ONLY through
+    // one or more anonymous-member promotions, the ordered chain of anonymous-
+    // member SymbolIds (outermost→innermost) that must be traversed to reach it.
+    // EMPTY for every direct field (zero overhead). HIR lowering emits one
+    // synthetic MemberAccess per entry before the final field access.
+    std::vector<SymbolId> anonAncestorPath;
     // D5.1: the inner scope holding this symbol's fields, set by Pass 1 on a
     // Type-kind symbol minted from a declaration with `fieldChildren`. Pass 2's
     // member-access resolution reads this to look up `field` in `obj.field`:
@@ -204,6 +219,32 @@ struct DSS_EXPORT SymbolRecord {
     // field is only the resolution→composition plumbing (cf. `enumValue`). A
     // zero-width (anonymous `int : 0;`) bit-field stores 0 (distinct from nullopt).
     std::optional<std::uint32_t> bitFieldWidth;
+    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the EXPLICIT `alignas(N)` / `alignas(T)`
+    // alignment override on this declaration (bytes, a power of two), or nullopt
+    // for no override. Set at the declaration's Pass-1 resolution — the value form
+    // const-folds via `constIntExpr`, the type form is `_Alignof(T)` via
+    // `computeLayout`, both validated (power-of-two / ≤256 / ≥ natural align /
+    // context) there. `alignas(0)` is a NO-OP (6.7.5p3) → left nullopt. For a
+    // struct/union MEMBER it is read at the composite's Pass-1 completion to build
+    // the `fieldAligns` span passed to `completeComposite` (the interned TYPE then
+    // owns the raised layout — mirrors `bitFieldWidth`). For a VARIABLE it is
+    // stored here as the authoritative value; threading it to globals/locals
+    // codegen is a SEPARATE deferred task (D-CSUBSET-ALIGNAS: this cycle stores it
+    // unconsumed for variables — member alignas works end-to-end via the interner).
+    std::optional<std::uint32_t> explicitAlignment;
+    // FC16 (D-CSUBSET-NORETURN): TRUE iff this FUNCTION symbol is declared
+    // `noreturn` (C11 6.7.4 `_Noreturn` / C23 6.7.12.7 `[[noreturn]]` / GNU
+    // `__attribute__((noreturn))`). Set at Pass-1.5 declarator resolution when the
+    // function declaration's specifier prefix names the attribute (gated on the
+    // declared type being a FnSig), OR from a shipped-lib descriptor's `noreturn`
+    // (abort/exit). OR-merged across a proto/definition pair (the post-1.5
+    // mergedFnDecls sweep) so a call — which resolves to the definition — sees the
+    // flag even when only the prototype spelled it. Read at HIR lowering: a DIRECT
+    // call to such a function is wrapped `Block{ ExprStmt(call), Unreachable }` so
+    // the path structurally terminates (the `wrapIfProvablyInfinite` precedent). A
+    // DROPPED flag is a safe miss (a spurious H_VerifierFailure — fail-loud), never
+    // a silent miscompile. Default false.
+    bool            isNoreturn = false;
 };
 
 // FF11 neutral-JSON shipped-library descriptor extern
@@ -245,6 +286,7 @@ public:
                   std::vector<SymbolRecord>              symbols,
                   UnitAttribute<SymbolId>                nodeToSymbol,
                   UnitAttribute<TypeId>                  nodeToType,
+                  UnitAttribute<NodeId>                  nodeToSelectedExpr,
                   DiagnosticReporter                     diagnostics,
                   std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol,
                   std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
@@ -259,6 +301,7 @@ public:
           symbols_(std::move(symbols)),
           nodeToSymbol_(std::move(nodeToSymbol)),
           nodeToType_(std::move(nodeToType)),
+          nodeToSelectedExpr_(std::move(nodeToSelectedExpr)),
           diagnostics_(std::move(diagnostics)),
           usesBySymbol_(std::move(usesBySymbol)),
           compositeScopeByType_(std::move(compositeScopeByType)),
@@ -300,6 +343,14 @@ public:
     // tree in this CU.
     [[nodiscard]] SymbolId symbolAt(NodeId id) const;
     [[nodiscard]] TypeId   typeAt(NodeId id)   const;
+
+    // FC16 (D-CSUBSET-GENERIC-SELECTION): for a `_Generic` node, the NodeId of
+    // the selected association's result-expression (the compile-time type-match
+    // winner Pass 2 recorded). Returns InvalidNode for any node that is not a
+    // successfully-selected `_Generic` (incl. a no-match/ambiguous one, which the
+    // analyzer left untyped + errored). The CST→HIR `lowerGeneric` reads this to
+    // lower ONLY the selected sub-expression.
+    [[nodiscard]] NodeId   selectedGenericExpr(NodeId id) const;
 
     // Reverse use-index (SE7): every NodeId that resolved to `symbol`
     // during Pass 2 (the symbol's USE sites — NOT its declaration name
@@ -367,6 +418,9 @@ private:
     std::vector<SymbolRecord>              symbols_;
     UnitAttribute<SymbolId>                nodeToSymbol_;
     UnitAttribute<TypeId>                  nodeToType_;
+    // FC16 (D-CSUBSET-GENERIC-SELECTION): `_Generic` node → selected assoc's
+    // result-expression NodeId. See `selectedGenericExpr`.
+    UnitAttribute<NodeId>                  nodeToSelectedExpr_;
     DiagnosticReporter                     diagnostics_;
     // SymbolId.v → its USE-site NodeIds. Built once during analyze().
     std::unordered_map<std::uint32_t, std::vector<NodeId>> usesBySymbol_;

@@ -1352,6 +1352,43 @@ TEST(ConstEval, SizeOfFoldsOnlyWithTypeSizeResolver) {
     }
 }
 
+// C11/C23 6.5.3.4: `_Alignof(T)` folds to T's alignment ONLY when the
+// `resolveTypeAlign` hook is supplied — the hook is load-bearing (mirrors the
+// SizeOf/resolveTypeSize pin). Without it the engine surfaces
+// NotAConstantExpression, so a regression that drops the hook goes RED.
+TEST(ConstEval, AlignOfFoldsOnlyWithTypeAlignResolver) {
+    Rig r;
+    // _Alignof of an 8-byte primitive (I64) → alignment 8. The TypeRef child
+    // carries the queried type.
+    TypeId const queried  = r.i64T();
+    HirNodeId const tref   = r.builder.makeTypeRef(queried);
+    HirNodeId const alignOf =
+        r.builder.makeAlignOf(tref, r.interner.primitive(TypeKind::U64));
+    Hir hir = r.finishWith(alignOf);
+
+    // No resolver → NotAConstantExpression (load-bearing red-on-disable).
+    {
+        auto res = evaluateConstant(hir, r.interner, r.literals, alignOf);
+        EXPECT_FALSE(res.value.has_value());
+    }
+    // With the REAL computeLayout resolver → folds to size_t(8), core U64.
+    {
+        EvalEnvironment env;
+        env.resolveTypeAlign = [&](TypeId t) -> std::optional<std::uint64_t> {
+            auto const l = computeLayout(
+                t, r.interner,
+                AggregateLayoutParams{ScalarAlignmentRule::Natural, 16},
+                DataModel::Lp64);
+            if (!l) return std::nullopt;
+            return l->align.bytes();
+        };
+        auto res = evaluateConstant(hir, r.interner, r.literals, alignOf, env);
+        ASSERT_TRUE(res.value.has_value());
+        EXPECT_EQ(std::get<std::uint64_t>(res.value->value), 8u);
+        EXPECT_EQ(res.value->core, TypeKind::U64);
+    }
+}
+
 // ── Plan 24 Stage 6 — deep const-fold flatten pins (SF-4) ──────────────────
 // `evaluateConstant` (src/hir/const_eval.cpp) is now an explicit WORK-STACK
 // DRIVER for the deep STRAIGHT-LINE arms (BinaryOp / UnaryOp / Cast — the arms

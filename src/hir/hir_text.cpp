@@ -39,7 +39,7 @@
 //               | unreachable | ext_node | error
 //   expr       := lit | ref | call | intrinsic | binop | unop | cast | member
 //               | index | swizzle | construct | ternary | logical_and
-//               | logical_or | sizeof | addressof | deref | typeref
+//               | logical_or | sizeof | alignof | addressof | deref | typeref
 //               | ext_node | error
 //   type       := bool|i8..|u8..|f16..|char|byte|void | ptr<T> | ref<T>
 //               | nullable<T> | optional<T> | slice<T> | vec<T,N> | mat<T,R,C>
@@ -224,6 +224,7 @@ namespace {
         case HirKind::Cast: case HirKind::MemberAccess: case HirKind::Index:
         case HirKind::Swizzle: case HirKind::ConstructAggregate: case HirKind::Ternary:
         case HirKind::LogicalAnd: case HirKind::LogicalOr: case HirKind::SizeOf:
+        case HirKind::AlignOf:
         case HirKind::AddressOf: case HirKind::Deref: case HirKind::SeqExpr:
         case HirKind::TypeRef:
             return true;
@@ -385,10 +386,21 @@ private:
                 out_ += std::format(", {}>", in.scalars(t)[0]); return;
             case TypeKind::Tuple:  out_ += "tuple<"; args(in.operands(t)); out_ += '>'; return;
             case TypeKind::Struct: {
-                out_ += "struct "; out_ += quote(in.name(t)); out_ += " {";
+                out_ += "struct "; out_ += quote(in.name(t));
+                // D-CSUBSET-PACKED: emit a ` packed` marker for a packed struct so the
+                // whole-composite packed flag round-trips (else it would reintern
+                // UNPACKED — a silent ABI drop across the text boundary). May combine
+                // with the `~<align>` per-field markers (a packed struct with an
+                // alignas member); never with `@<off>` (packed excludes explicit offsets).
+                if (in.isPacked(t)) out_ += " packed";
+                out_ += " {";
                 // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): emit `@<off>` per field for
                 // an explicit-offset struct so the text round-trips (reintern +
                 // canonicalization depend on the offsets surviving serialization).
+                // D-CSUBSET-MEMBER-ALIGNAS: emit `~<align>` per field for a member-
+                // alignas struct (the two channels are mutually exclusive — a struct
+                // carries offsets XOR aligns). The `~` marker never collides with the
+                // offset `@`; both round-trip through parseType below.
                 if (in.hasExplicitOffsets(t)) {
                     auto const ops = in.operands(t);
                     bool first = true;
@@ -399,12 +411,25 @@ private:
                         out_ += std::format(" @{}", off ? *off : 0);
                         first = false;
                     }
+                } else if (in.hasExplicitAligns(t)) {
+                    auto const ops = in.operands(t);
+                    bool first = true;
+                    for (std::size_t i = 0; i < ops.size(); ++i) {
+                        if (!first) out_ += ", ";
+                        appendType(ops[i]);
+                        out_ += std::format(" ~{}", in.explicitFieldAlign(t, i));
+                        first = false;
+                    }
                 } else {
                     args(in.operands(t));
                 }
                 out_ += '}'; return;
             }
-            case TypeKind::Union:  out_ += "union ";  out_ += quote(in.name(t)); out_ += " {"; args(in.operands(t)); out_ += '}'; return;
+            case TypeKind::Union: {
+                out_ += "union ";  out_ += quote(in.name(t));
+                if (in.isPacked(t)) out_ += " packed";   // D-CSUBSET-PACKED (see struct)
+                out_ += " {"; args(in.operands(t)); out_ += '}'; return;
+            }
             // D5.5: enum is nominal-by-name; underlying TypeKind lives in
             // scalars[0]. Round-trip the underlying explicitly when it
             // diverges from the default I32 (`enum "E" : kindOrdinal`);
@@ -816,6 +841,7 @@ private:
             case HirKind::LogicalAnd:         typedCall("logical_and"); return;
             case HirKind::LogicalOr:          typedCall("logical_or"); return;
             case HirKind::SizeOf:             typedCall("sizeof"); return;
+            case HirKind::AlignOf:            typedCall("alignof"); return;
             case HirKind::VaStart:            typedCall("va_start"); return;
             case HirKind::VaArg:              typedCall("va_arg"); return;
             case HirKind::VaEnd:              typedCall("va_end"); return;
@@ -940,7 +966,7 @@ namespace {
 enum class Tk : std::uint8_t {
     Eof, Unknown, Ident, Int, Float, Str,
     LBrace, RBrace, LParen, RParen, LAngle, RAngle, LBrack, RBrack,
-    Colon, Comma, Percent, Hash, Equal, Arrow, Minus, DotDot, Ellipsis, At,
+    Colon, Comma, Percent, Hash, Equal, Arrow, Minus, DotDot, Ellipsis, At, Tilde,
 };
 
 struct Tok {
@@ -989,6 +1015,7 @@ private:
             case '%': cur_.kind = Tk::Percent; return;
             case '#': cur_.kind = Tk::Hash; return;
             case '@': cur_.kind = Tk::At; return;
+            case '~': cur_.kind = Tk::Tilde; return;
             case '=': cur_.kind = Tk::Equal; return;
             case '-':
                 if (p_ < s_.size() && s_[p_] == '>') { ++p_; cur_.kind = Tk::Arrow; }
@@ -1272,11 +1299,20 @@ private:
         else malformed(std::format("unknown literal value tag '{}'", tag));
         return v;
     }
-    // The pool `core` for a parsed value: a string literal's element core is
-    // Char (its node type is Array<Char,N+1>); a bool is Bool; monostate is
-    // Void; everything else mirrors the node's resolved type kind.
+    // The pool `core` for a parsed value: a string literal's element core is the
+    // ELEMENT of its `Array<core,N+1>` node type — Char for a narrow `"…"`, but
+    // U16/U32/U8 for a C11/C23 6.4.5 wide/UTF literal (`u"…"`/`U"…"`/`u8"…"`), so it
+    // is read off the array element, NOT hardcoded (a hardcode would re-emit a wide
+    // literal as Char and silently mis-round-trip its width). A bool is Bool;
+    // monostate is Void; everything else mirrors the node's resolved type kind.
     [[nodiscard]] TypeKind literalCoreFor(TypeId t, HirLiteralValue const& v) const {
-        if (std::holds_alternative<std::string>(v.value))   return TypeKind::Char;
+        if (std::holds_alternative<std::string>(v.value)) {
+            if (t.valid() && interner_.kind(t) == TypeKind::Array) {
+                if (auto const ops = interner_.operands(t); !ops.empty() && ops[0].valid())
+                    return interner_.kind(ops[0]);
+            }
+            return TypeKind::Char;   // untyped / non-array fallback (narrow default)
+        }
         if (std::holds_alternative<bool>(v.value))          return TypeKind::Bool;
         if (std::holds_alternative<std::monostate>(v.value)) return TypeKind::Void;
         return t.valid() ? interner_.kind(t) : TypeKind::Void;
@@ -1516,6 +1552,7 @@ private:
             || kw == "binop" || kw == "unop" || kw == "cast" || kw == "member"
             || kw == "index" || kw == "swizzle" || kw == "construct" || kw == "ternary"
             || kw == "logical_and" || kw == "logical_or" || kw == "sizeof"
+            || kw == "alignof"
             || kw == "addressof" || kw == "deref" || kw == "seq" || kw == "typeref";
     }
 
@@ -1625,7 +1662,8 @@ private:
             {"cast", HirKind::Cast}, {"index", HirKind::Index},
             {"construct", HirKind::ConstructAggregate}, {"ternary", HirKind::Ternary},
             {"logical_and", HirKind::LogicalAnd}, {"logical_or", HirKind::LogicalOr},
-            {"sizeof", HirKind::SizeOf}, {"addressof", HirKind::AddressOf}, {"deref", HirKind::Deref},
+            {"sizeof", HirKind::SizeOf}, {"alignof", HirKind::AlignOf},
+            {"addressof", HirKind::AddressOf}, {"deref", HirKind::Deref},
             {"va_start", HirKind::VaStart}, {"va_arg", HirKind::VaArg}, {"va_end", HirKind::VaEnd},
         };
         for (auto const& [k, kind] : kTypedExprs)
@@ -1856,32 +1894,106 @@ private:
             return interner_.array(e, n); }
         if (kw == "tuple") { expect(Tk::LAngle, "'<'"); auto ts = parseTypeListUntil(Tk::RAngle); expect(Tk::RAngle, "'>'");
             return interner_.tuple(ts); }
-        if (kw == "struct") { std::string name = takeStr(); expect(Tk::LBrace, "'{'");
+        if (kw == "struct") { std::string name = takeStr();
+            // D-CSUBSET-PACKED: an optional ` packed` marker after the name (before the
+            // `{`) round-trips the whole-composite packed flag. Routed through
+            // forwardComposite + completeComposite below (the structType convenience
+            // overloads don't carry packed).
+            bool const packed = acceptKeyword("packed");
+            expect(Tk::LBrace, "'{'");
             // c107 (D-FFI-DESCRIPTOR-UNION-OVERLAY): each field is a type optionally
-            // followed by `@<byteOffset>` (an explicit overlapping layout). All-or-
-            // none: a mix is malformed. A field-local loop (NOT parseTypeListUntil)
-            // so the `@` is consumed here, never by node-attribute logic (types are
-            // never parsed where `@`-attributes are also legal, so no ambiguity).
+            // followed by `@<byteOffset>` (an explicit overlapping layout).
+            // D-CSUBSET-MEMBER-ALIGNAS: OR by `~<align>` (a member-alignas override).
+            // Each marker is all-or-none, and the two are MUTUALLY EXCLUSIVE (a struct
+            // carries offsets XOR aligns) — a mix is malformed. A field-local loop
+            // (NOT parseTypeListUntil) so `@`/`~` are consumed here, never by node-
+            // attribute logic (types are never parsed where those tokens are also
+            // legal, so no ambiguity).
             std::vector<TypeId>        ts;
             std::vector<std::uint64_t> offs;
-            std::size_t                nWithOff = 0;
+            std::vector<std::uint32_t> aligns;
+            std::size_t                nWithOff   = 0;
+            std::size_t                nWithAlign = 0;
             while (!peekIs(Tk::RBrace) && !peekIs(Tk::Eof)) {
                 ts.push_back(parseType());
-                if (accept(Tk::At)) { offs.push_back(takeInt()); ++nWithOff; }
-                else                { offs.push_back(0); }
+                if (accept(Tk::At)) {
+                    offs.push_back(takeInt()); aligns.push_back(0); ++nWithOff;
+                } else if (accept(Tk::Tilde)) {
+                    aligns.push_back(static_cast<std::uint32_t>(takeInt()));
+                    offs.push_back(0); ++nWithAlign;
+                } else {
+                    offs.push_back(0); aligns.push_back(0);
+                }
                 if (!accept(Tk::Comma)) break;
             }
             expect(Tk::RBrace, "'}'");
-            if (nWithOff == 0) return interner_.structType(name, ts);
+            if (nWithOff != 0 && nWithAlign != 0) {
+                malformed("struct fields cannot mix explicit offsets (@) and "
+                          "member aligns (~)");
+                return InvalidType;
+            }
+            std::span<std::int64_t const> const noWidths{};
+            // D-CSUBSET-PACKED: a packed struct routes through forwardComposite +
+            // completeComposite (structType doesn't carry packed). A content-derived
+            // declSiteKey keeps identical packed spellings canonical; bit 62 marks the
+            // packed hir-text key space (distinct from contentDeclSiteKey's bit 63) so a
+            // packed `S` and a non-packed `S` never collapse. packed + explicit offsets
+            // is impossible (completeComposite rejects the pair) → malformed here.
+            auto internPacked = [&](std::span<std::uint32_t const> al) -> TypeId {
+                std::uint64_t key = 1469598103934665603ull;
+                for (char ch : name)
+                    key = (key ^ static_cast<std::uint8_t>(ch)) * 1099511628211ull;
+                for (TypeId f : ts) key = (key ^ f.v) * 1099511628211ull;
+                // F-4 symmetry: fold the member aligns into the forward key,
+                // mirroring contentDeclSiteKey (type_lattice.cpp) which includes
+                // fieldAligns. An empty span (internPacked({})) → empty loop → key
+                // BYTE-IDENTICAL to before (zero churn for align-free packed structs);
+                // two same-name+fields packed structs differing ONLY in member aligns
+                // now get DISTINCT forward keys instead of colliding on the forward id.
+                for (std::uint32_t a : al) key = (key ^ a) * 1099511628211ull;
+                key |= (std::uint64_t{1} << 62);
+                TypeId const fwd =
+                    interner_.forwardComposite(TypeKind::Struct, name, key);
+                std::span<std::uint64_t const> const noOffs{};
+                interner_.completeComposite(fwd, ts, /*packed=*/true, noWidths,
+                                            noOffs, al);
+                return fwd;
+            };
+            if (nWithOff == 0 && nWithAlign == 0) {
+                if (packed) return internPacked({});
+                return interner_.structType(name, ts);
+            }
+            if (nWithAlign != 0) {
+                if (nWithAlign != ts.size()) {
+                    malformed("struct member aligns must be all-or-none");
+                    return InvalidType;
+                }
+                if (packed) return internPacked(aligns);
+                std::span<std::uint64_t const> const noOffs{};
+                return interner_.structType(name, ts, noWidths, noOffs, aligns);
+            }
+            if (packed) {
+                malformed("a packed struct cannot carry explicit field offsets (@)");
+                return InvalidType;
+            }
             if (nWithOff != ts.size()) {
                 malformed("struct field offsets must be all-or-none");
                 return InvalidType;
             }
-            std::span<std::int64_t const> const noWidths{};
             return interner_.structType(name, ts, noWidths, offs); }
-        if (kw == "union") { std::string name = takeStr(); expect(Tk::LBrace, "'{'");
+        if (kw == "union") { std::string name = takeStr();
+            bool const packed = acceptKeyword("packed");   // D-CSUBSET-PACKED
+            expect(Tk::LBrace, "'{'");
             auto ts = parseTypeListUntil(Tk::RBrace); expect(Tk::RBrace, "'}'");
-            return interner_.unionType(name, ts); }
+            if (!packed) return interner_.unionType(name, ts);
+            std::uint64_t key = 1469598103934665603ull;
+            for (char ch : name)
+                key = (key ^ static_cast<std::uint8_t>(ch)) * 1099511628211ull;
+            for (TypeId f : ts) key = (key ^ f.v) * 1099511628211ull;
+            key |= (std::uint64_t{1} << 62);
+            TypeId const fwd = interner_.forwardComposite(TypeKind::Union, name, key);
+            interner_.completeComposite(fwd, ts, /*packed=*/true);
+            return fwd; }
         // D5.5: `enum "Name"` with optional `: <underlyingOrdinal>`. Enumerator
         // names live in the SemanticModel symbol table, not the type record;
         // only the nominal name + underlying TypeKind round-trip here.

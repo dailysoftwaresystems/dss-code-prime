@@ -423,6 +423,20 @@ struct DSS_EXPORT DeclarationRule {
     // names (unknown → fail-loud); empty ⇒ nothing skipped (the strict
     // default — an unanticipated subtree's tokens are still validated).
     std::vector<RuleId>        linkageSpecifierIgnoredRules;
+    // FC16 (D-CSUBSET-NORETURN): specifier IDENTIFIER spellings the linkage scan
+    // skips as semantic NO-OPs — completing the ignore trio at identifier
+    // granularity (ignoredKinds = token kinds; ignoredRules = whole subtrees;
+    // THIS = identifier texts). Needed for a non-linkage ATTRIBUTE that shares the
+    // GNU `__attribute__((...))` rule with HONORED linkage attributes (`weak`,
+    // `visibility`), so its subtree cannot be ignored wholesale: `noreturn` must
+    // be skipped WITHOUT firing H_UnknownLinkageSpecifier AND without giving it a
+    // spurious linkage EFFECT (a `{binding:global}` no-op entry would clobber a
+    // co-present `static`/`weak` last-wins — an order-dependent silent linkage
+    // miscompile). Matched dunder-normalized (`stripDunder`), so a single
+    // `"noreturn"` entry covers `noreturn` AND `__noreturn__`. An identifier NOT
+    // listed here (and not a recognized linkage specifier) STILL fails loud — the
+    // strict default is preserved. Empty ⇒ nothing skipped by name.
+    std::vector<std::string>   linkageSpecifierIgnoredNames;
     DeclarationKind kind        = DeclarationKind::Variable;
     NameMatchMode   nameMatch   = NameMatchMode::Self;
     // FC4 c1 stage 2a: when true, every declarator under this (declarator-
@@ -1181,6 +1195,68 @@ struct DSS_EXPORT SemanticConfig {
     RuleId        sizeofTypeRule{};   std::string sizeofTypeRuleName;
     std::uint32_t sizeofTypeChild = 0;
     RuleId        sizeofValueRule{};  std::string sizeofValueRuleName;
+    // C11/C23 6.5.3.4: `_Alignof`/`alignof` typing. `alignofTypeRule` = the
+    // `_Alignof ( type-name )` form (TYPE-NAME ONLY — no value form, unlike
+    // sizeof); pass 2 resolves + stamps its `alignofTypeChild` castTypeRef child
+    // (so the HIR lowering recovers the type whose ALIGNMENT is read) and stamps
+    // the node size_t (U64). Invalid ⇒ the language has no `_Alignof` surface.
+    RuleId        alignofTypeRule{};  std::string alignofTypeRuleName;
+    std::uint32_t alignofTypeChild = 0;
+    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the `_Alignas`/`alignas` alignment
+    // SPECIFIER. `alignasSpecRule` = the `alignasSpec` shape = [ keyword, '(',
+    // alignasArg, ')' ]; `alignasArgChild` = the visible-child index of the
+    // `alignasArg` operand (2). `alignasArgTypeRule` = the `alignasTypeName` rule id
+    // (the guarded TYPE-form WRAPPER branch of the `alignasArg` alt, whose sole
+    // child is the `castTypeRef` — the wrapper exists so `commitRequiresTypeName`
+    // sits on the probed branch): the semantic tier reads alignasArg's committed
+    // reading and discriminates the TYPE form (committed child's rule == this ⇒
+    // alignment = _Alignof(T) via computeLayout(...)->align of the castTypeRef
+    // inside the wrapper) from the VALUE form (else ⇒ const-evaluate the constant-
+    // expression via the SAME `constIntExpr` sizeof/static_assert/array-dims use).
+    // The result is validated (power-of-two / ≤256 / ≥ natural align / context /
+    // constant) and STORED on `SymbolRecord.explicitAlignment` (variable) or fed
+    // into the composite's `fieldAligns` (member). Invalid `alignasSpecRule` ⇒ the
+    // language has no `alignas` surface (the scan never runs).
+    RuleId        alignasSpecRule{};    std::string alignasSpecRuleName;
+    std::uint32_t alignasArgChild = 0;
+    RuleId        alignasArgTypeRule{}; std::string alignasArgTypeRuleName;
+    // FC16 (D-CSUBSET-PACKED): the composite type-attribute list rule
+    // (`compositeAttrList` = repeated `compositeAttr`, a trailing
+    // `__attribute__((...))` / `[[...]]` after a struct/union body) + the recognized
+    // `packed` attribute-name set. The semantic tier scans a structSpec/unionSpec node
+    // for `compositeAttrListRule` children, extracts each attribute identifier,
+    // dunder-normalizes it (`__packed__` ≡ `packed`, via the shared `stripDunder`),
+    // and marks the composite `packed` when the name is in `packedAttributeNames`; an
+    // UNRECOGNIZED `__attribute__` identifier fails loud (S_UnknownTypeAttribute).
+    // Invalid `compositeAttrListRule` ⇒ the language has no composite-attribute surface
+    // (the scan never runs — toy/tsql). Source-AGNOSTIC: WHICH rule + WHICH names are
+    // both per-language config; the engine never hardcodes the spelling "packed".
+    RuleId                   compositeAttrListRule{};
+    std::string              compositeAttrListRuleName;
+    std::vector<std::string> packedAttributeNames;
+    // FC16 (D-CSUBSET-PACKED): the STRICT composite-attribute rule (the GNU
+    // `__attribute__((...))` form, `attrSpec`). An UNRECOGNIZED attribute in a strict-
+    // form node fails loud (S_UnknownTypeAttribute — typo protection, like
+    // `H_UnknownLinkageSpecifier`); an unrecognized attribute in the NON-strict form
+    // (C23 `[[...]]`, `stdAttr`) is standard-ignorable (the `[[deprecated]]`
+    // precedent). Invalid ⇒ no strict form (every unrecognized attribute ignorable).
+    RuleId                   compositeStrictAttrRule{};
+    std::string              compositeStrictAttrRuleName;
+    // FC16 (D-CSUBSET-NORETURN): the C11/C23 `noreturn` FUNCTION attribute
+    // vocabulary. `noreturnKeywordToken` is the `_Noreturn` KEYWORD token (C11
+    // 6.7.4); `noreturnAttributeNames` is the recognized ATTRIBUTE-identifier set
+    // (`noreturn` — C23 6.7.12.7 `[[noreturn]]` / GNU `__attribute__((noreturn))`
+    // / `[[gnu::noreturn]]`, dunder-normalized at the scan so `__noreturn__`
+    // matches). The semantic tier scans a function declaration's SPECIFIER PREFIX
+    // for EITHER form (`specifierPrefixNamesNoreturn`) and marks the function
+    // symbol `isNoreturn`; the HIR lowering then wraps a direct call to such a
+    // function as `Block{ ExprStmt(call), Unreachable }` so a noreturn-terminated
+    // path structurally terminates (the `wrapIfProvablyInfinite` precedent).
+    // Both invalid/empty ⇒ the language has no `noreturn` surface (the scan never
+    // runs — toy/tsql). Source-AGNOSTIC: WHICH token + WHICH names are per-language
+    // config; the engine never hardcodes the spelling "noreturn".
+    std::optional<SchemaTokenId> noreturnKeywordToken;
+    std::vector<std::string>     noreturnAttributeNames;
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. `vaArgRule`
     // = the `va_arg(ap,T)` form; pass 2 resolves+stamps its `vaArgTypeChild`
     // castTypeRef (so the HIR lowering recovers the read type T) + stamps the node
@@ -1196,6 +1272,43 @@ struct DSS_EXPORT SemanticConfig {
     std::uint32_t vaStartApChild = 0;
     RuleId        vaEndRule{};        std::string vaEndRuleName;
     std::uint32_t vaEndApChild   = 0;
+    // C11/C23 6.7.10 (D-CSUBSET-STATIC-ASSERT): the `_Static_assert`/`static_assert`
+    // static-assertion DECLARATION rule. When Pass 2 visits a node of this rule it
+    // const-evaluates the FIRST meaningful child (the condition — the `assignmentExpr`
+    // after the keyword + `(`) via the SAME `constIntExpr` evaluator that folds
+    // sizeof(T)/enum/arithmetic in an array dimension: a fold to ZERO emits
+    // S_StaticAssertFailed (message = the OPTIONAL trailing string-literal child); a
+    // condition that does not fold to an integer constant expression (non-const /
+    // float / unresolved) ALSO emits S_StaticAssertFailed (C requires an ICE); a
+    // NONZERO fold produces nothing. The construct itself lowers to nothing (its
+    // hirLowering row maps to Skip). Invalid ⇒ the language has no static-assertion
+    // surface (toy/tsql — the check never runs).
+    RuleId        staticAssertRule{}; std::string staticAssertRuleName;
+    // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): `_Generic` generic
+    // selection. `genericRule` = the `genericExpr` shape; `genericControlChild` =
+    // the visible-child index of the controlling `assignmentExpr`. When Pass 2
+    // visits a node of `genericRule` it (1) reads the controlling expression's
+    // resolved type and lvalue-converts it (strips a top-level VolatileQual, the
+    // `isAssignable` precedent); (2) walks the node's children, and for each
+    // `genericTypedAssocRule` child resolves its FIRST child (a `castTypeRef`)
+    // through the SAME type resolver casts/sizeof/va_arg use — a VALUE in type
+    // position fails loud (S_UnknownType) — and its LAST child is the result
+    // expression; a `genericDefaultAssocRule` child is the `default` fallback;
+    // (3) matches the controlling type against each typed assoc's resolved type
+    // for COMPATIBILITY (interned TypeId equality via `sameType`), requiring
+    // EXACTLY ONE typed match (>1 ⇒ S_GenericSelectionAmbiguous) OR the default
+    // (none-and-no-default ⇒ S_GenericSelectionNoMatch); (4) stamps the
+    // genericExpr node with the winner's RESULT type and records the winning
+    // association's result-expression NodeId (the `nodeToSelectedExpr` side-table)
+    // so the HIR lowering lowers ONLY that sub-expression. `genericAssocRule` is
+    // the umbrella alt (genericTypedAssoc | genericDefaultAssoc) — retained for
+    // loader validation. All invalid ⇒ the language has no generic-selection
+    // surface (toy/tsql — the check never runs).
+    RuleId        genericRule{};            std::string genericRuleName;
+    std::uint32_t genericControlChild = 0;
+    RuleId        genericAssocRule{};       std::string genericAssocRuleName;
+    RuleId        genericTypedAssocRule{};  std::string genericTypedAssocRuleName;
+    RuleId        genericDefaultAssocRule{}; std::string genericDefaultAssocRuleName;
     // FC3.5 sweep-c3: compound-literal type-position stamping rules
     // (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF). See CompoundLiteralRule.
     std::vector<CompoundLiteralRule> compoundLiteralRules;

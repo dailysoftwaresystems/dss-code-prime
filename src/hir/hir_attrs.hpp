@@ -2,6 +2,7 @@
 
 #include "hir/hir.hpp"   // HirAttribute<T>
 
+#include "hir/attributes/alignment_attr.hpp"
 #include "hir/attributes/diagnostic_info.hpp"
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/attributes/linkage_attr.hpp"
@@ -48,6 +49,15 @@ using HirLinkageMap = HirAttribute<LinkageAttr>;
 // — the input the assembler's section selection consults to route an
 // initialized global to read-only `.rodata` (const) vs writable `.data`.
 using HirMutabilityMap = HirAttribute<MutabilityAttr>;
+
+// C11/C23 6.7.5 (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): explicit `alignas(N)` /
+// `alignas(T)` alignment for a Global or VarDecl that carried the specifier.
+// Populated by CST→HIR lowering from the bound symbol's
+// `SymbolRecord.explicitAlignment` (already validated by the semantic phase);
+// read at HIR→MIR lowering to raise a global's data-item section alignment and
+// a local's effective alloca alignment. Keyed on the DECLARATION node (like
+// mutability, unlike the access-keyed volatile map).
+using HirAlignmentMap = HirAttribute<AlignmentAttr>;
 
 // c21 (D-CSUBSET-VOLATILE-QUALIFIER): per-ACCESS volatility for object Refs,
 // struct/union MemberAccesses, and VarDecl/Global init stores whose object

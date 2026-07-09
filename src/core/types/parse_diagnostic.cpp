@@ -130,6 +130,26 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_TypeNameDeclaratorNotAbstract";
         case DiagnosticCode::S_IncompleteTypeObject:
             return "S_IncompleteTypeObject";
+        case DiagnosticCode::S_StaticAssertFailed:
+            return "S_StaticAssertFailed";
+        case DiagnosticCode::S_GenericSelectionNoMatch:
+            return "S_GenericSelectionNoMatch";
+        case DiagnosticCode::S_GenericSelectionAmbiguous:
+            return "S_GenericSelectionAmbiguous";
+        case DiagnosticCode::S_AlignasNotPowerOfTwo:
+            return "S_AlignasNotPowerOfTwo";
+        case DiagnosticCode::S_AlignasExceedsMax:
+            return "S_AlignasExceedsMax";
+        case DiagnosticCode::S_AlignasWeakerThanNatural:
+            return "S_AlignasWeakerThanNatural";
+        case DiagnosticCode::S_AlignasInvalidContext:
+            return "S_AlignasInvalidContext";
+        case DiagnosticCode::S_AlignasNonConstant:
+            return "S_AlignasNonConstant";
+        case DiagnosticCode::S_UnknownTypeAttribute:
+            return "S_UnknownTypeAttribute";
+        case DiagnosticCode::S_PackedBitfieldUnsupported:
+            return "S_PackedBitfieldUnsupported";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
@@ -158,6 +178,12 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_SehJumpIntoRegion:        return "H_SehJumpIntoRegion";
         case DiagnosticCode::H_SehEarlyExit:             return "H_SehEarlyExit";
         case DiagnosticCode::H_SehLabelAddress:          return "H_SehLabelAddress";
+        case DiagnosticCode::H_WideCharSurrogateUnsupported: return "H_WideCharSurrogateUnsupported";
+        case DiagnosticCode::H_Utf8CharLiteralOutOfRange: return "H_Utf8CharLiteralOutOfRange";
+        case DiagnosticCode::H_WideCharValueUnrepresentable: return "H_WideCharValueUnrepresentable";
+        case DiagnosticCode::H_InvalidUniversalCharacterName: return "H_InvalidUniversalCharacterName";
+        case DiagnosticCode::H_WideByteEscapeUnsupported: return "H_WideByteEscapeUnsupported";
+        case DiagnosticCode::H_ConflictingStringLiteralPrefixes: return "H_ConflictingStringLiteralPrefixes";
         case DiagnosticCode::I_VerifierFailure:          return "I_VerifierFailure";
         case DiagnosticCode::I_NoEntryBlock:             return "I_NoEntryBlock";
         case DiagnosticCode::I_MultipleEntryBlocks:      return "I_MultipleEntryBlocks";
@@ -167,6 +193,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_NotDominated:             return "I_NotDominated";
         case DiagnosticCode::I_TerminatorTypeMismatch:   return "I_TerminatorTypeMismatch";
         case DiagnosticCode::I_ArgIndexOutOfRange:       return "I_ArgIndexOutOfRange";
+        case DiagnosticCode::I_ArgPositionDuplicate:     return "I_ArgPositionDuplicate";
+        case DiagnosticCode::I_AllocaAlignmentNotPowerOfTwo: return "I_AllocaAlignmentNotPowerOfTwo";
         case DiagnosticCode::I_ExtensionTypeInMir:       return "I_ExtensionTypeInMir";
         case DiagnosticCode::I_StructCfMismatch:         return "I_StructCfMismatch";
         case DiagnosticCode::I_UnreachableBlock:         return "I_UnreachableBlock";
@@ -186,6 +214,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::L_MoveCycleUnsupported:         return "L_MoveCycleUnsupported";
         case DiagnosticCode::L_IndirectCallUnsupported:      return "L_IndirectCallUnsupported";
         case DiagnosticCode::L_IndirectCalleeClobberedByArgSetup: return "L_IndirectCalleeClobberedByArgSetup";
+        case DiagnosticCode::L_OverAlignedStackLocal:        return "L_OverAlignedStackLocal";
         case DiagnosticCode::R_NoCallingConventions:          return "R_NoCallingConventions";
         case DiagnosticCode::R_CallingConventionLookupFailed: return "R_CallingConventionLookupFailed";
         case DiagnosticCode::R_VRegHasNoClass:                return "R_VRegHasNoClass";

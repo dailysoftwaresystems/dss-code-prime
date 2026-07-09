@@ -38,6 +38,7 @@
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -138,6 +139,13 @@ struct ExampleTarget {
     // "hello\r\n" via Windows msvcrt CRLF translation but "hello\n" on
     // linux/macos). Absent ⇒ the manifest-level pin applies (existing behavior).
     std::optional<std::string>   expectedStdoutOverride;
+    // C11/C23 6.4.5 (wchar_platform_width): optional PER-TARGET expected exit code.
+    // When present it OVERRIDES the manifest-level `exitCode` for THIS target only —
+    // needed when one source returns a platform-divergent value (e.g.
+    // `sizeof(wchar_t)` is 2 on pe64 but 4 on elf/mach-o). Absent ⇒ the manifest
+    // `exitCode` applies (existing behavior). The differential (optimized) arm still
+    // compares to the baseline, so it follows this per-target choice for free.
+    std::optional<std::int64_t>  exitCodeOverride;
 };
 
 // D-OPT1-DIFFERENTIAL-VERIFY-RUNNER (OPT2 cycle 1): a per-manifest
@@ -174,6 +182,14 @@ struct ExpectedDiagnostic {
     std::string   code;
     std::uint32_t line = 0;
     std::uint32_t col  = 0;
+    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN (#4): false ⇒ the diagnostic is emitted
+    // at a tier with NO source span (e.g. `L_OverAlignedStackLocal` from the LIR
+    // calling-convention frame layout). Such a diagnostic's default span resolves
+    // to 1:1, but pinning a fabricated coordinate would be dishonest — instead the
+    // set-equality below matches the CODE only for these (position-independent).
+    // Default true = a real positioned diagnostic (every existing expect-error
+    // example). Parsed from an optional `"positioned": false` manifest key.
+    bool          positioned = true;
 };
 
 struct ExampleManifest {
@@ -273,6 +289,15 @@ struct ExampleManifest {
             ed.code = d.at("code").get<std::string>();
             ed.line = d.at("line").get<std::uint32_t>();
             ed.col  = d.at("col").get<std::uint32_t>();
+            // #4: optional — a span-less-tier diagnostic is matched by code only.
+            if (d.contains("positioned")) {
+                if (!d.at("positioned").is_boolean()) {
+                    ADD_FAILURE() << "manifest " << path.generic_string()
+                                  << " expectDiagnostics 'positioned' must be a boolean";
+                    return m;
+                }
+                ed.positioned = d.at("positioned").get<bool>();
+            }
             m.expectDiagnostics.push_back(std::move(ed));
         }
     }
@@ -323,6 +348,16 @@ struct ExampleManifest {
                 return m;
             }
             et.expectedStdoutOverride = t.at("expectedStdout").get<std::string>();
+        }
+        // C11/C23 6.4.5: optional per-target exit-code override (an integer) — a
+        // source whose return value is platform-divergent (e.g. sizeof(wchar_t)).
+        if (t.contains("exitCode")) {
+            if (!t.at("exitCode").is_number_integer()) {
+                ADD_FAILURE() << "manifest " << path.generic_string()
+                              << " target 'exitCode' must be an integer";
+                return m;
+            }
+            et.exitCodeOverride = t.at("exitCode").get<std::int64_t>();
         }
         m.targets.push_back(std::move(et));
     }
@@ -662,10 +697,16 @@ void runOneTarget(fs::path const&        exampleDir,
     std::optional<std::string> const effectiveStdout =
         t.expectedStdoutOverride.has_value() ? t.expectedStdoutOverride
                                              : m.expectedStdout;
+    // The per-target exit-code override (when present) is the authority for THIS
+    // target; otherwise the manifest-level `exitCode`. The differential arm below
+    // compares the optimized arm to the BASELINE exit code, so it follows this
+    // choice for free.
+    std::int64_t const effectiveExit =
+        t.exitCodeOverride.has_value() ? *t.exitCodeOverride : m.exitCode;
 
-    // Baseline strict pins against the manifest.
-    ASSERT_EQ(static_cast<std::int64_t>(baseline.exitCode), m.exitCode)
-        << "baseline exit-code mismatch (manifest=" << m.exitCode
+    // Baseline strict pins against the manifest (per-target override applied).
+    ASSERT_EQ(static_cast<std::int64_t>(baseline.exitCode), effectiveExit)
+        << "baseline exit-code mismatch (expected=" << effectiveExit
         << "; OS=" << baseline.exitCode << ")";
     if (effectiveStdout.has_value()) {
         ASSERT_EQ(baseline.capturedStdout, *effectiveStdout)
@@ -752,9 +793,17 @@ void runErrorTarget(fs::path const&        exampleDir,
                                std::istreambuf_iterator<char>()};
     auto const srcBuf = SourceBuffer::fromString(srcBytes, srcRel);
 
-    auto const render = [](std::string_view code,
-                           std::uint32_t line, std::uint32_t col) {
+    // #4: codes declared `positioned:false` are emitted at a span-less tier, so
+    // their position is not asserted — both sides render them code-only. Every
+    // other code keeps its precise `code line:col` pin.
+    std::set<std::string> codeOnly;
+    for (auto const& e : m.expectDiagnostics)
+        if (!e.positioned) codeOnly.insert(e.code);
+
+    auto const render = [&codeOnly](std::string_view code,
+                                    std::uint32_t line, std::uint32_t col) {
         std::string s(code);
+        if (codeOnly.count(s) != 0) return s;   // position-independent match
         s += ' ';
         s += std::to_string(line);
         s += ':';

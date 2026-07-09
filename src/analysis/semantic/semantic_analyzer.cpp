@@ -7,6 +7,7 @@
 #include "analysis/semantic/symbol_table.hpp"
 #include "analysis/semantic/type_rules.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: run analyze on a large stack
+#include "core/types/attribute_naming.hpp"   // D-CSUBSET-PACKED: stripDunder (shared with the preprocessor)
 #include "core/types/data_model.hpp"
 #include "core/types/decl_prefix_strip.hpp"   // declRoleChildren / descendVisibleDecl / specifierPrefixChild
 #include "core/types/declarator_walk.hpp"     // FC4: declaratorNameNode / collectDeclarators
@@ -24,6 +25,7 @@
 #include "core/types/type_lattice/type_layout.hpp"  // FC6: computeLayout (sizeof in array dims)
 #include "core/types/char_decode.hpp"  // C 6.4.5: decodeStringLiteralBody (string-literal typing)
 #include "core/types/string_literal_decode.hpp"  // C 5.1.1.2 phase 6: decodeAdjacentStringBodies (THE chokepoint, shared with HIR)
+#include "core/types/wide_string_encode.hpp"  // C 6.4.5: encodeWideString (wide/UTF code-unit count, shared with HIR)
 #include "ffi/shipped_lib_descriptor.hpp"   // FF11 neutral-JSON descriptor reader
 #include "hir/cst_const_eval.hpp"
 #include "hir/hir_text.hpp"   // c104: parseTypeFromText (builtin signatureText decode)
@@ -115,6 +117,10 @@ struct SchemaIndexes {
     std::unordered_map<std::uint32_t, std::size_t> returnByRule;   // GAP A
     std::unordered_map<std::uint32_t, bool>        loopByRule;      // GAP C loop contexts
     std::unordered_map<std::uint32_t, bool>        loopControlByRule; // GAP C break/continue
+    // C11/C23 6.7.10 (D-CSUBSET-STATIC-ASSERT): true for the static-assertion
+    // declaration rule. Pass 2 (`pass2Post`) const-evaluates its condition + emits
+    // S_StaticAssertFailed on a zero / non-constant fold. Empty ⇒ no surface.
+    std::unordered_map<std::uint32_t, bool>        staticAssertByRule;
     // Built-in type name → TypeId (interned once per schema, into the CU
     // lattice; FC3 c1 — the per-row `coreByDataModel` override for the
     // ACTIVE data model is applied here, so every consumer below sees
@@ -128,6 +134,42 @@ struct SchemaIndexes {
     // token / Void core) when the language declares no string-array row (toy/tsql).
     SchemaTokenId                                  stringLiteralBodyToken{};
     TypeKind                                       stringLiteralElementCore = TypeKind::Void;
+    // C11/C23 6.4.5: a prefixed string literal (`L"…"`/`u"…"`/`U"…"`/`u8"…"`) types
+    // as `Array<elementCore, N+1>` where the element core is keyed by the literal's
+    // ACTUAL opener token kind. Built from the language's `hirLowering`
+    // `stringLiteralPrefixes` at index-build time; WideStringStart (wchar_t) is
+    // FORMAT-resolved here (pe→U16, elf/macho→I32, D-FFI-STDDEF-WCHAR-PE-WIDTH)
+    // because THIS tier has `activeFormat`. Empty ⇒ the language declares no
+    // prefixes (the scalar `stringLiteralElementCore` narrow default applies). The
+    // HIR tier reads the element core BACK off the stamped node type (it lacks
+    // format), so this map is the single format-aware resolution point.
+    std::unordered_map<std::uint32_t /*opener SchemaTokenId.v*/, TypeKind>
+                                                   stringLiteralElementCoreByStart;
+    // C11/C23 6.4.5p5 (Cycle D): the SET of NON-narrow string-opener token kinds
+    // (`u"`/`U"`/`u8"`/`L"`). An opener is non-narrow when its base `elementCore` OR
+    // ANY `elementCoreByFormat` value is non-narrow (not Char/Byte) — a FORMAT-
+    // AGNOSTIC classification keyed on the token KIND, MIRRORING the HIR tier's
+    // `isWideStringOpenerKind`. The adjacent-concat effective-prefix fold uses THIS
+    // (never the format-resolved `byStart` core) to detect a run mixing two DIFFERENT
+    // non-narrow prefixes: on pe `u"`/`L"` both resolve to U16, so a core-keyed
+    // conflict would silently accept `u"a" L"b"` on Windows while rejecting it on
+    // Linux. Empty ⇒ the language declares no wide prefixes.
+    std::unordered_set<std::uint32_t /*opener SchemaTokenId.v*/>
+                                                   nonNarrowStringOpeners;
+    // C11/C23 6.4.4.4: the CHARACTER-constant body token kind (`CharLiteral`) + the
+    // WIDE openers' format-resolved element cores. `charLiteralBodyToken` gates the
+    // char-typing override (only a char body token is a candidate); the map holds
+    // ONLY the wide/UTF openers (`L'`/`u'`/`U'`/`u8'`) → their C23 scalar core
+    // (WideCharStart format-resolved here, pe→U16 / elf,macho→I32). The NARROW
+    // `CharStart` is DELIBERATELY absent — the unprefixed `'x'` stays `int` via the
+    // flat `literalTypeIds` path (other integer-literal consumers key on that entry),
+    // so a wide opener OVERRIDES the flat int type and the narrow one never does.
+    // Empty ⇒ the language declares no wide char prefixes (byte-identical). Like the
+    // string map, this is the single format-aware resolution point (the HIR tier
+    // reads the resolved core back off the stamped body token; it lacks format).
+    SchemaTokenId                                  charLiteralBodyToken{};
+    std::unordered_map<std::uint32_t /*opener SchemaTokenId.v*/, TypeKind>
+                                                   charLiteralElementCoreByStart;
     // C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): the rule whose
     // subtree is a (possibly adjacent-concatenated) string-literal expression.
     // When valid, the string's `Array<core, N+1>` type is stamped on this RULE
@@ -164,6 +206,7 @@ struct EngineState {
         : lattice{cu.id(), cu.compositeSourceLanguage()},
           nodeToSymbol{cu},
           nodeToType{cu},
+          nodeToSelectedExpr{cu},
           nullPointerConstantNodes{cu} {}
 
     DiagnosticReporter         reporter;
@@ -172,6 +215,15 @@ struct EngineState {
     SymbolTable                symbols;
     UnitAttribute<SymbolId>    nodeToSymbol;
     UnitAttribute<TypeId>      nodeToType;
+    // FC16 (D-CSUBSET-GENERIC-SELECTION): for each `_Generic` node, the NodeId of
+    // the SELECTED association's result-expression (the winner of the compile-time
+    // type match). Written by Pass 2's generic-selection arm; read by the CST→HIR
+    // `lowerGeneric`, which lowers ONLY that recorded sub-expression (its type +
+    // value), discarding the non-selected associations (UNEVALUATED per 6.5.1.1p3).
+    // MUST be a TREE-KEYED UnitAttribute (NOT a flat NodeId.v map): NodeId is tree-
+    // LOCAL, so a multi-source CU restarts numbering per tree — a flat map would
+    // alias node K across files. Routes per-tree exactly like nodeToType/nodeToSymbol.
+    UnitAttribute<NodeId>      nodeToSelectedExpr;
     // R2 (D-SEMANTIC-NULL-CONSTANT-FOLDING): source nodes admitted as a null-
     // pointer constant via the FOLDED path — a non-literal integer constant
     // expression that folds to 0 (`1-1`, `-0`). The HIR lowerer materializes a
@@ -541,6 +593,7 @@ struct MemberResolution {
         NotAComposite,    // effective type has no struct scope
         BadNameNode,      // nameChild did not resolve to an identifier leaf
         UndeclaredField,  // field name not found in the struct scope
+        AmbiguousField,   // FC16: name matches ≥2 sibling anonymous members (C 6.7.2.1 ¶13) — fail loud
         Ok,               // field binding found (fieldType may still be invalid if the field's own type is unresolved)
     };
     Status      status        = Status::NotMemberAccess;
@@ -833,6 +886,7 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
     }
     for (auto const& lr : cfg.loopRules)    idx.loopByRule[lr.rule.v] = true;
     for (auto const& lc : cfg.loopControls) idx.loopControlByRule[lc.rule.v] = true;
+    if (cfg.staticAssertRule.valid()) idx.staticAssertByRule[cfg.staticAssertRule.v] = true;
     for (auto const& bt : cfg.builtinTypes) {
         if (bt.extension.has_value()) {
             // The mapping names a registered type-extension (e.g. T-SQL's
@@ -1477,6 +1531,36 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
             if (!layout) return std::nullopt;
             return layout->size;
         };
+        // C11/C23 6.5.3.4: fold `_Alignof(T)` in a const-expr position (an array
+        // dimension `int a[_Alignof(T)]`, `_Static_assert(_Alignof(T)==N,...)`).
+        // An ADDITIVE mirror of `resolveSizeof` reading ALIGNMENT instead of size.
+        // The engine dispatches the `alignofRule` node here (ahead of its wrapper-
+        // peel); this closure resolves the queried type (the castTypeRef child)
+        // and reads its alignment through the same `computeLayout` engine MIR
+        // uses. Type-name form ONLY (no value form). `nullopt` when un-alignable
+        // or the target declared no layout params → the caller fails loud, never a
+        // guessed alignment.
+        env.resolveAlignof = [&s, &tree, cfg, fromScope](NodeId alignofNode)
+            -> std::optional<std::uint64_t> {
+            if (!s.aggregateLayout.has_value()) return std::nullopt;
+            TypeId queried{};
+            if (cfg->alignofTypeRule.valid()
+                && tree.rule(alignofNode).v == cfg->alignofTypeRule.v) {
+                auto ak = visibleChildren(tree, alignofNode);
+                if (cfg->alignofTypeChild < ak.size())
+                    // emitOnMiss=false: an unknown queried type yields nullopt →
+                    // the caller fails loud with ONE positioned diagnostic (it
+                    // owns it), not a redundant S_UnknownType pair.
+                    queried = resolveTypeNode(s, *cfg, tree,
+                                              ak[cfg->alignofTypeChild], fromScope,
+                                              /*emitOnMiss=*/false);
+            }
+            if (!queried.valid()) return std::nullopt;
+            auto const layout = computeLayout(queried, s.lattice.interner(),
+                                              *s.aggregateLayout, s.dataModel);
+            if (!layout) return std::nullopt;
+            return layout->align.bytes();
+        };
         // c43 (D-CSUBSET-ADDRESS-CONSTANT-FOLD / Option A): classify a cast's
         // TARGET type for the offsetof spine — `(T*)0` (pointer), `(char*)x`
         // (pointer, retype), `(size_t)int` (integer width/signedness). The engine
@@ -1726,6 +1810,399 @@ resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& d
     }
     out.width = static_cast<std::uint32_t>(*w);
     return out;
+}
+
+// C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the FIRST `alignasSpec` node in a
+// declaration's specifier prefix, or InvalidNode when the declaration carries no
+// alignas (or the language declares no alignas surface / prefix rule). Used for
+// PRESENCE detection at a call site that owns the CONTEXT decision (a typedef /
+// function / parameter alignas is a constraint violation the caller emits). The
+// prefix subtree is reached via `specifierPrefixChild` — the same accessor the
+// linkage scan uses — so this sees exactly the STRIPPED specifier prefix
+// (structMemberDeclSpecifiers / declSpecifiers / localDeclSpecifiers).
+[[nodiscard]] NodeId
+firstAlignasSpecInPrefix(EngineState& s, SemanticConfig const& cfg,
+                         Tree const& tree, NodeId declNode,
+                         DeclarationRule const& decl) {
+    if (!cfg.alignasSpecRule.valid()) return {};
+    NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
+    if (!prefix.valid()) return {};
+    // Bounded descendant search for the specifier rule (mirror
+    // resolveBitfieldSuffix's suffix search); the prefix subtree is tiny.
+    std::vector<NodeId> stack{prefix};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId c = stack.back(); stack.pop_back();
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        if (tree.rule(c).v == cfg.alignasSpecRule.v) return c;
+        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+    }
+    return {};
+}
+
+// FC16 (D-CSUBSET-NORETURN): true iff a declaration's specifier prefix names the
+// `noreturn` function attribute — in EITHER the `_Noreturn` KEYWORD form (a token
+// of `cfg.noreturnKeywordToken`, C11 6.7.4) OR an ATTRIBUTE form (`[[noreturn]]` /
+// `__attribute__((noreturn))` / `__attribute__((__noreturn__))` / `[[gnu::noreturn]]`,
+// C23 6.7.12.7 / GNU), matched by an attribute IDENTIFIER leaf (dunder-normalized
+// via the shared `stripDunder`, so `__noreturn__` ≡ `noreturn` and `[[gnu::noreturn]]`'s
+// final segment matches) against `cfg.noreturnAttributeNames`. A bounded descendant
+// search over the STRIPPED specifier prefix (the same `specifierPrefixChild` accessor
+// the linkage + alignas scans use).
+//
+// CRITICAL: it matches BOTH forms — the `scanCompositePacked` precedent matches
+// IDENTIFIERS only, which would MISS a bare `_Noreturn` KEYWORD (a distinct token
+// kind, not an identifier). Emits NOTHING: detection that drops a flag is a SAFE
+// miss (a spurious H_VerifierFailure downstream is fail-loud), never a silent
+// miscompile — so no diagnostic surface is needed here.
+[[nodiscard]] bool
+specifierPrefixNamesNoreturn(SemanticConfig const& cfg, Tree const& tree,
+                             NodeId declNode, DeclarationRule const& decl) {
+    bool const haveKeyword = cfg.noreturnKeywordToken.has_value()
+                          && cfg.noreturnKeywordToken->valid();
+    if (!haveKeyword && cfg.noreturnAttributeNames.empty()) return false;
+    NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
+    if (!prefix.valid()) return false;
+    std::vector<NodeId> stack{prefix};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId c = stack.back(); stack.pop_back();
+        if (tree.kind(c) == NodeKind::Internal) {
+            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+            continue;
+        }
+        // (a) the `_Noreturn` KEYWORD token.
+        if (haveKeyword && tree.tokenKind(c).v == cfg.noreturnKeywordToken->v)
+            return true;
+        // (b) an attribute IDENTIFIER naming `noreturn` (dunder-normalized).
+        if (cfg.identifierToken.valid()
+            && tree.tokenKind(c) == cfg.identifierToken) {
+            std::string_view const id = stripDunder(tree.text(c));
+            for (std::string const& nm : cfg.noreturnAttributeNames)
+                if (id == nm) return true;
+        }
+    }
+    return false;
+}
+
+// C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): compute + validate the alignment an
+// `alignasSpec` node requests. Reads the `alignasArg` operand (visible-child
+// `alignasArgChild`): a `castTypeRef` (TYPE form) resolves the type + reads its
+// alignment via `computeLayout(...)->align` (== _Alignof(T)); anything else
+// (VALUE form) const-evaluates the constant-expression via the SAME `constIntExpr`
+// static_assert / array-dimension folding uses. Validates:
+//   • 0 ⇒ nullopt, NO error (6.7.5p3: "an alignment specification of zero has no
+//     effect" — a NO-OP, treated as "no override" by the caller);
+//   • not a power of two ⇒ S_AlignasNotPowerOfTwo, nullopt;
+//   • > 256 ⇒ S_AlignasExceedsMax, nullopt (the `Alignment` newtype cap);
+//   • non-constant value ⇒ S_AlignasNonConstant, nullopt.
+// The WEAKER-than-natural check (6.7.5p4) is the CALLER's (it owns the declared
+// type). Returns the validated alignment in bytes, or nullopt on 0/error.
+[[nodiscard]] std::optional<std::uint32_t>
+evalOneAlignasSpec(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                   NodeId alignasSpecNode, ScopeId fromScope) {
+    auto emit = [&](DiagnosticCode code) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(alignasSpecNode);
+        d.actual   = std::string{tree.text(alignasSpecNode)};
+        s.reporter.report(std::move(d));
+    };
+    auto kids = visibleChildren(tree, alignasSpecNode);
+    if (cfg.alignasArgChild >= kids.size()) return std::nullopt;   // malformed
+    NodeId const argNode = kids[cfg.alignasArgChild];
+    // The `alignasArg` speculative alt commits EITHER the `alignasTypeName` wrapper
+    // (TYPE form) OR a value expression (VALUE form); discriminate by the committed
+    // child's rule. Descend to the sole visible child of the `alignasArg` alt
+    // wrapper (it holds one reading).
+    NodeId inner = argNode;
+    if (tree.kind(argNode) == NodeKind::Internal) {
+        auto argKids = visibleChildren(tree, argNode);
+        if (argKids.size() == 1) inner = argKids.front();
+    }
+    bool const isTypeForm =
+        cfg.alignasArgTypeRule.valid()
+        && tree.kind(inner) == NodeKind::Internal
+        && tree.rule(inner).v == cfg.alignasArgTypeRule.v;
+    std::int64_t value = 0;
+    if (isTypeForm) {
+        // The type form is `alignasTypeName [ castTypeRef ]` — resolve the SOLE
+        // castTypeRef child inside the wrapper (the wrapper exists only to carry
+        // the commitRequiresTypeName guard on the probed branch).
+        NodeId typeChild = inner;
+        {
+            auto wrapKids = visibleChildren(tree, inner);
+            if (!wrapKids.empty()) typeChild = wrapKids.front();
+        }
+        // emitOnMiss=false: an unknown queried type yields nullopt → we fail loud
+        // with ONE positioned diagnostic below (never a redundant S_UnknownType).
+        // This runs BEFORE the layout-params check so `alignas(<not-a-type>)` — a
+        // value that the parser optimistically committed as a type-name — fails
+        // loud (S_AlignasNonConstant) even in a layout-free analysis, NEVER silent.
+        TypeId const queried =
+            resolveTypeNode(s, cfg, tree, typeChild, fromScope, /*emitOnMiss=*/false);
+        if (queried.valid()) s.nodeToType.set(typeChild, queried);
+        if (!queried.valid()) { emit(DiagnosticCode::S_AlignasNonConstant); return std::nullopt; }
+        // A resolvable type whose alignment we cannot compute (no layout params)
+        // is a genuine "cannot determine the alignment" → fail loud, never silent.
+        if (!s.aggregateLayout.has_value()) {
+            emit(DiagnosticCode::S_AlignasNonConstant); return std::nullopt;
+        }
+        auto const layout = computeLayout(queried, s.lattice.interner(),
+                                          *s.aggregateLayout, s.dataModel);
+        if (!layout) { emit(DiagnosticCode::S_AlignasNonConstant); return std::nullopt; }
+        value = static_cast<std::int64_t>(layout->align.bytes());
+    } else {
+        auto folded = constIntExpr(s, tree, inner, fromScope, &cfg);
+        if (!folded.has_value()) { emit(DiagnosticCode::S_AlignasNonConstant); return std::nullopt; }
+        value = *folded;
+    }
+    // 6.7.5p3: `alignas(0)` has NO effect → no override, NO error. This is the
+    // ONLY value the standard makes a defined no-op; it is NOT extended to a
+    // NEGATIVE fold — `alignas(-4)` is a constraint violation (a valid alignment
+    // is a positive power of two), which gcc/clang both reject. Failing it loud
+    // (rather than silently swallowing it as "no alignment") is the fail-loud bar:
+    // a negative is not a power of two, so S_AlignasNotPowerOfTwo names the reason.
+    if (value == 0) return std::nullopt;
+    if (value < 0) { emit(DiagnosticCode::S_AlignasNotPowerOfTwo); return std::nullopt; }
+    // A member alignas may only RAISE alignment (a valid fundamental/extended
+    // alignment is a positive power of two, C 6.7.5p3).
+    std::uint64_t const uv = static_cast<std::uint64_t>(value);
+    if ((uv & (uv - 1u)) != 0u) { emit(DiagnosticCode::S_AlignasNotPowerOfTwo); return std::nullopt; }
+    if (uv > 256u)             { emit(DiagnosticCode::S_AlignasExceedsMax);      return std::nullopt; }
+    return static_cast<std::uint32_t>(uv);
+}
+
+// FC16 (D-CSUBSET-PACKED): scan a struct/union specifier node's TRAILING
+// composite-attribute list (`compositeAttrListRule`) for a honored `packed`
+// attribute. Returns true iff a recognized `packed` spelling is present.
+//
+// When `emitDiagnostics` is true (the ONE composition site), an UNRECOGNIZED
+// attribute in the STRICT (GNU `__attribute__`) form fails loud
+// S_UnknownTypeAttribute (typo protection, mirroring H_UnknownLinkageSpecifier —
+// GNU attribute identifiers are all meaningful, so a `__attribute__((pakced))`
+// typo must not silently leave the struct unpacked); an unrecognized C23 `[[...]]`
+// is standard-ignorable (the `[[deprecated]]` precedent). When false (the member-
+// alignas baseline probe, which may run per member), it detects packed WITHOUT
+// emitting, so the diagnostic fires exactly once.
+//
+// Config-driven + source-AGNOSTIC: `compositeAttrListRule` / `packedAttributeNames`
+// / `compositeStrictAttrRule` name the vocabulary; nothing here hardcodes the
+// spelling "packed" or a rule name. Packed detection matches an attribute
+// IDENTIFIER leaf (dunder-normalized via the shared `stripDunder`, so `__packed__`
+// ≡ `packed` and `[[gnu::packed]]`'s final segment `packed` matches) against
+// `packedAttributeNames` — a string ARGUMENT (`section("packed")`) is a
+// string-literal leaf, not an identifier, so it never false-matches.
+[[nodiscard]] bool
+scanCompositePacked(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                    NodeId specNode, bool emitDiagnostics) {
+    if (!cfg.compositeAttrListRule.valid() || !specNode.valid()) return false;
+    // The `compositeAttrList` is the structSpec/unionSpec's trailing direct child.
+    NodeId listNode{};
+    for (NodeId c : visibleChildren(tree, specNode)) {
+        if (tree.kind(c) == NodeKind::Internal
+            && tree.rule(c).v == cfg.compositeAttrListRule.v) {
+            listNode = c;
+            break;
+        }
+    }
+    if (!listNode.valid()) return false;
+    bool packed = false;
+    // Each visible child of the list is ONE composite attribute (`compositeAttr` ->
+    // attrSpec | stdAttr). For each: does it NAME a packed attribute? and is it the
+    // STRICT (GNU) form (unrecognized -> diagnose) or the ignorable (C23) form?
+    for (NodeId attr : visibleChildren(tree, listNode)) {
+        if (tree.kind(attr) != NodeKind::Internal) continue;
+        bool named  = false;   // this attribute names `packed`
+        bool strict = false;   // this attribute is the GNU `__attribute__` form
+        std::vector<NodeId> stack{attr};
+        for (int guard = 0; guard < 4096 && !stack.empty(); ++guard) {
+            NodeId const cur = stack.back();
+            stack.pop_back();
+            if (tree.kind(cur) == NodeKind::Internal) {
+                if (cfg.compositeStrictAttrRule.valid()
+                    && tree.rule(cur).v == cfg.compositeStrictAttrRule.v) {
+                    strict = true;
+                }
+                for (NodeId g : visibleChildren(tree, cur)) stack.push_back(g);
+                continue;
+            }
+            if (cfg.identifierToken.valid()
+                && tree.tokenKind(cur) == cfg.identifierToken) {
+                std::string_view const id = stripDunder(tree.text(cur));
+                for (std::string const& nm : cfg.packedAttributeNames) {
+                    if (id == nm) { named = true; break; }
+                }
+            }
+        }
+        if (named) { packed = true; continue; }
+        // Not a recognized packed attribute. A GNU `__attribute__` typo / unsupported
+        // spelling fails loud (typo protection); a C23 `[[...]]` is standard-ignorable.
+        if (strict && emitDiagnostics) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_UnknownTypeAttribute;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(attr);
+            d.actual   = std::string{tree.text(attr)};
+            s.reporter.report(std::move(d));
+        }
+    }
+    return packed;
+}
+
+// C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the EFFECTIVE alignment override a
+// declaration's specifier prefix requests — the MAX over every `alignasSpec` in
+// the prefix (C 6.7.5p6: with several alignment specifiers, the strictest — the
+// largest — wins). Each spec is computed + validated by `evalOneAlignasSpec`
+// (which emits pow2/max/non-constant diagnostics). When `declType` is a valid
+// type, the winning alignment is ALSO checked against its natural alignment
+// (6.7.5p4: alignas may not WEAKEN) → S_AlignasWeakerThanNatural. Returns the
+// override in bytes (nullopt = no override / all zero / all errored). A NO-OP
+// (returns nullopt) when the declaration carries no alignas.
+[[nodiscard]] std::optional<std::uint32_t>
+resolveAlignasOverride(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                       NodeId declNode, DeclarationRule const& decl,
+                       TypeId declType, ScopeId fromScope,
+                       std::optional<std::uint32_t> naturalBaseline = std::nullopt) {
+    if (!cfg.alignasSpecRule.valid()) return std::nullopt;
+    NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
+    if (!prefix.valid()) return std::nullopt;
+    // Collect every alignasSpec node in the prefix (there may be more than one).
+    std::vector<NodeId> specs;
+    {
+        std::vector<NodeId> stack{prefix};
+        for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+            NodeId c = stack.back(); stack.pop_back();
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            if (tree.rule(c).v == cfg.alignasSpecRule.v) { specs.push_back(c); continue; }
+            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+        }
+    }
+    std::optional<std::uint32_t> best;
+    for (NodeId sp : specs) {
+        if (auto a = evalOneAlignasSpec(s, cfg, tree, sp, fromScope)) {
+            if (!best.has_value() || *a > *best) best = a;
+        }
+    }
+    if (!best.has_value()) return std::nullopt;
+    // 6.7.5p4: an alignas that is WEAKER than the type's natural alignment is a
+    // constraint violation (alignas may only strengthen). Compare against the
+    // declared type's computeLayout align. Skip when the type is unresolved (an
+    // upstream error already fired) or there are no layout params.
+    if (declType.valid() && s.aggregateLayout.has_value()) {
+        auto const layout = computeLayout(declType, s.lattice.interner(),
+                                          *s.aggregateLayout, s.dataModel);
+        if (layout) {
+            // D-CSUBSET-PACKED: `naturalBaseline` overrides the type's natural
+            // alignment when the enclosing composite is PACKED (baseline 1 — packed
+            // removes the padding requirement), so `alignas(1)` INSIDE a packed struct
+            // is legal (never weaker-than-natural) while `alignas(1)` OUTSIDE (baseline
+            // absent → the type's own align) still fails 6.7.5p4.
+            std::uint64_t const naturalBytes =
+                naturalBaseline.has_value()
+                    ? static_cast<std::uint64_t>(*naturalBaseline)
+                    : static_cast<std::uint64_t>(layout->align.bytes());
+            if (*best < naturalBytes) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_AlignasWeakerThanNatural;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(specs.empty() ? declNode : specs.front());
+                d.actual   = std::string{tree.text(specs.empty() ? declNode : specs.front())};
+                s.reporter.report(std::move(d));
+                // Still return the requested override — the layout carrier's
+                // MAX(natural, override) makes a too-weak override a no-op anyway; the
+                // diagnostic is the fail-loud (the build fails via hasErrors regardless).
+            }
+        }
+    }
+    return best;
+}
+
+// FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23 §6.7.2.1 ¶13): recursively
+// PROMOTE the members of an anonymous struct/union member into the enclosing
+// composite's member namespace. `anonSym` is the synthetic `<anon:…>` field
+// symbol whose resolved type `anonTy` is a Struct/Union; `path` is the ordered
+// chain of anonymous-member SymbolIds (outermost→innermost) already traversed
+// to reach it; `enclosingScope` is the FIELD SCOPE of the OUTERMOST enclosing
+// composite (where the direct members were bound in Pass 1 and where a
+// promoted name must not collide). For each NAMED member of the anon composite
+// we record its `anonAncestorPath` (so member-access lookup + HIR lowering can
+// synthesize the intermediate hops); a named member that collides with a
+// DIRECT member of the enclosing composite fails loud (S_RedeclaredSymbol). A
+// nested anonymous member recurses (its own synthetic name is NOT promoted).
+//
+// Iteration order is DETERMINISTIC (by `fieldIndex`) — `bindingsOf` order is
+// unspecified, and a stable order keeps a sibling-collision diagnostic and the
+// recorded paths reproducible. Only the Ordinary namespace is promoted (a
+// nested tag stays in its own namespace).
+void promoteAnonMembers(EngineState& s, Tree const& tree, SymbolId anonSym,
+                        TypeId anonTy, std::vector<SymbolId> path,
+                        ScopeId enclosingScope) {
+    path.push_back(anonSym);
+    auto const scopeIt = s.compositeScopeByType.find(anonTy.v);
+    if (scopeIt == s.compositeScopeByType.end()) return;   // unresolved anon body
+    ScopeId const anonScope = scopeIt->second;
+    // Snapshot + sort the Ordinary bindings by declaration-order fieldIndex.
+    std::vector<SymbolId> ordered;
+    for (auto const& [name, ns, fsym] : s.scopes.bindingsOf(anonScope)) {
+        (void)name;
+        if (ns != SymbolNamespace::Ordinary) continue;
+        if (fsym.valid()) ordered.push_back(fsym);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [&](SymbolId a, SymbolId b) {
+                  return s.symbols.at(a).fieldIndex < s.symbols.at(b).fieldIndex;
+              });
+    for (SymbolId fsym : ordered) {
+        SymbolRecord& frec = s.symbols.at(fsym);
+        if (frec.isAnonymousMember) {
+            // A NESTED anonymous member — recurse to promote ITS members. The
+            // synthetic anon name itself is never promoted into the enclosing
+            // scope (it carries no user-visible name).
+            promoteAnonMembers(s, tree, fsym, frec.type, path, enclosingScope);
+            continue;
+        }
+        // A named member: it becomes visible as a member of the enclosing
+        // composite. Collision-check ONLY against a DIRECT member of the
+        // enclosing composite's OWN field scope — NOT `scopes.lookup`, which
+        // walks the parent chain and would falsely flag a member that legally
+        // shares a name with an ordinary identifier in an enclosing lexical
+        // scope (a global/typedef/function — C 6.2.1 gives each struct/union a
+        // SEPARATE member name space disjoint from ordinary identifiers). We
+        // read the field scope's `bindings` (the Ordinary namespace) directly,
+        // exactly as `resolveMemberAccess`'s direct-member lookup does. Fail
+        // loud only on a genuine same-composite duplicate.
+        std::string const memberName{s.symbols.at(fsym).name};
+        SymbolId direct{};
+        if (enclosingScope.valid()
+            && enclosingScope.v < s.scopes.scopes().size()) {
+            auto const& encBindings =
+                s.scopes.scopes()[enclosingScope.v].bindings;
+            auto const encIt = encBindings.find(memberName);
+            if (encIt != encBindings.end()) direct = encIt->second;
+        }
+        if (direct.valid()) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_RedeclaredSymbol;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(s.symbols.at(fsym).declNode);
+            d.actual   = memberName;
+            auto const& dirRec = s.symbols.at(direct);
+            if (dirRec.declNode.valid() && dirRec.tree.v == tree.id().v) {
+                d.related.push_back(RelatedLocation{
+                    tree.source().id(),
+                    tree.span(dirRec.declNode),
+                    "conflicts with this direct member",
+                });
+            }
+            s.reporter.report(std::move(d));
+            continue;   // do not record a path for the colliding name
+        }
+        frec.anonAncestorPath = path;
+    }
 }
 
 // ── FC4 c1: the declarator-inversion engine (M3) ────────────────────────────
@@ -2997,12 +3474,32 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
         if (idx.stringLiteralExprRule.valid()
             && idx.stringLiteralBodyToken.valid()
             && r.v == idx.stringLiteralExprRule.v) {
+            EscapeDecodeOutcome outcome;
             if (auto decoded = decodeAdjacentStringBodies(
-                    tree, c, idx.stringLiteralBodyToken)) {
-                return interner.array(
-                    elem, static_cast<std::int64_t>(decoded->size() + 1));
+                    tree, c, idx.stringLiteralBodyToken, &outcome)) {
+                // C 6.7.9: the length is the code-unit count in the DECLARED
+                // element's width. Narrow (`char buf[]="…"`) → byte count
+                // (unchanged). A wide element (`wchar_t buf[]=L"…"`) re-encodes the
+                // raw bytes so the count is code units — the SAME shared encoder
+                // the literal's own type uses. A wide encode error stays incomplete
+                // (fail loud later), exactly like a malformed escape.
+                TypeKind const ek = interner.kind(elem);
+                if (ek == TypeKind::Char || ek == TypeKind::Byte) {
+                    return interner.array(
+                        elem, static_cast<std::int64_t>(decoded->size() + 1));
+                }
+                // FF3 (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE): a wide element sized
+                // from a `\x`/octal byte escape stays INCOMPLETE (fail loud later),
+                // like a malformed escape — the HIR tier emits the diagnostic.
+                if (!outcome.usedByteEscape) {
+                    WideEncodeResult enc;
+                    if (!encodeWideString(*decoded, ek, enc)) {
+                        return interner.array(
+                            elem, static_cast<std::int64_t>(enc.codeUnits + 1));
+                    }
+                }
             }
-            return declTy;   // malformed escape — stay incomplete, fail loud later
+            return declTy;   // malformed escape / wide encode error / wide byte escape — stay incomplete
         }
         if (idx.braceInitListRule.valid() && idx.initElementRule.valid()
             && r.v == idx.braceInitListRule.v) {
@@ -3141,6 +3638,31 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                     // on the c21 symbol-isVolatile path — that volatile is a
                     // `ptrQualifier` INSIDE the declarator (after the star), not a
                     // base qualifier, so the co-located arm excludes it.
+                    //
+                    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the alignas specifier lives
+                    // on the SHARED declaration prefix (`node`), so its VALIDATION +
+                    // DIAGNOSTICS (pow2 / max / non-constant / context) must fire
+                    // EXACTLY ONCE per declaration, not once per declarator — a
+                    // multi-declarator `alignas(3) int a, b;` is one erroneous
+                    // specifier, one diagnostic. These declaration-scoped flags gate
+                    // the emit to the first declarator; the computed override is then
+                    // STORED on every declarator's symbol (each field/object carries
+                    // it). The natural-align (raise-only) check keys on the first
+                    // declarator's type — the dominant `alignas(N) T a, b;` case
+                    // shares the head type, so the check is identical for every slot.
+                    NodeId const declAlignasSpec =
+                        firstAlignasSpecInPrefix(s, cfg, tree, node, decl);
+                    // FC16 (D-CSUBSET-NORETURN): does this declaration's specifier
+                    // prefix name the `noreturn` attribute? Computed ONCE per
+                    // declaration (like `declAlignasSpec`); STORED per-declarator
+                    // below, gated on the declared type being a FnSig (a `_Noreturn`
+                    // on a non-function object is inert — a named safe-miss deferral).
+                    bool const declHasNoreturn =
+                        specifierPrefixNamesNoreturn(cfg, tree, node, decl);
+                    bool alignasHandledForDecl = false;
+                    bool alignasBitfieldReported = false;
+                    bool alignasContextReported = false;
+                    std::optional<std::uint32_t> declAlignOverride;
                     for (NodeId dNode : declarators) {
                         // c34 (D-CSUBSET-ARRAY-SIZE-INFERENCE): a `[]` (empty-bound)
                         // array on a VARIABLE WITH AN INITIALIZER infers its size
@@ -3257,9 +3779,120 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                             if (bf.width.has_value())
                                 s.symbols.at(sym).bitFieldWidth = bf.width;
                         }
+                        // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): a struct/union member's
+                        // `alignas(N)` / `alignas(T)` — read from the SHARED member
+                        // specifier prefix on `node` (the whole structField/unionField;
+                        // a prefix alignas applies to EVERY slot: `alignas(16) int a,b;`).
+                        // Gated on this being a field rule (bitfieldSuffix present ⇒ a
+                        // structField/unionField DeclarationRule). 6.7.5p2: a BIT-FIELD
+                        // may NOT carry an alignment specifier → S_AlignasInvalidContext.
+                        // The validate-and-emit runs ONCE per declaration (the
+                        // `alignasHandledForDecl` gate); the resulting override is then
+                        // STORED on THIS declarator's symbol AND every following one —
+                        // the composite's Pass-1 completion gathers each into
+                        // `fieldAligns`. (Per-slot storage; one diagnostic.)
+                        if (decl.bitfieldSuffix.has_value() && declAlignasSpec.valid()) {
+                            if (!alignasHandledForDecl) {
+                                alignasHandledForDecl = true;
+                                // A bit-field member carrying alignas: the CONTEXT is
+                                // illegal regardless of the value. Emit once; the
+                                // per-slot check below still fires for each bit-field
+                                // declarator (a bit-field never stores an override).
+                                if (!s.symbols.at(sym).bitFieldWidth.has_value()) {
+                                    // D-CSUBSET-PACKED: a member of a PACKED composite
+                                    // has a natural baseline of 1 (packed removes the
+                                    // alignment requirement), so `alignas(1)` in a
+                                    // packed struct is legal (not weaker-than-natural).
+                                    // Resolve the enclosing composite via the field
+                                    // scope's anchor (the structSpec/unionSpec node).
+                                    std::optional<std::uint32_t> naturalBaseline;
+                                    if (here.valid()
+                                        && scanCompositePacked(
+                                               s, cfg, tree,
+                                               s.scopes.scopes()[here.v].anchor,
+                                               /*emitDiagnostics=*/false)) {
+                                        naturalBaseline = 1u;
+                                    }
+                                    declAlignOverride = resolveAlignasOverride(
+                                        s, cfg, tree, node, decl, declTy, here,
+                                        naturalBaseline);
+                                }
+                            }
+                            if (s.symbols.at(sym).bitFieldWidth.has_value()) {
+                                // A BIT-FIELD declarator may not carry alignas. This is
+                                // per-slot (a mixed `alignas(8) int a:3, b;` — only the
+                                // bit-field slots are illegal), but for the shared
+                                // prefix the standard idiom is all-or-none; report the
+                                // first offending bit-field slot only (the gate below).
+                                if (!alignasBitfieldReported) {
+                                    alignasBitfieldReported = true;
+                                    ParseDiagnostic d;
+                                    d.code     = DiagnosticCode::S_AlignasInvalidContext;
+                                    d.severity = DiagnosticSeverity::Error;
+                                    d.buffer   = tree.source().id();
+                                    d.span     = tree.span(declAlignasSpec);
+                                    d.actual   = "alignas on a bit-field member";
+                                    s.reporter.report(std::move(d));
+                                }
+                            } else if (declAlignOverride.has_value()) {
+                                s.symbols.at(sym).explicitAlignment = declAlignOverride;
+                            }
+                        }
                         bool const isFnSig = declTy.valid()
                             && s.lattice.interner().kind(declTy)
                                    == TypeKind::FnSig;
+                        // FC16 (D-CSUBSET-NORETURN): mark a FUNCTION symbol whose
+                        // declaration named the attribute. Gated on `isFnSig` so a
+                        // `_Noreturn int x;` (non-function) is INERT (a safe miss —
+                        // the named `_Noreturn`-on-non-function deferral), never a
+                        // wrongly-flagged data object. OR-merged into a proto/def
+                        // survivor by the post-1.5 sweep so a call sees the flag.
+                        if (isFnSig && declHasNoreturn)
+                            s.symbols.at(sym).isNoreturn = true;
+                        // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): a VARIABLE's alignas.
+                        // Only for a NON-field declaration (`!bitfieldSuffix` — a
+                        // field is handled above); a PARAMETER carries its own
+                        // `param` DeclarationRule (no specifierPrefix + no alignasSpec
+                        // in the param grammar) so it never reaches here with an
+                        // alignas. 6.7.5p2: an alignas on a FUNCTION (a definition or a
+                        // prototype — FnSig-typed / function-form declarator) or a
+                        // TYPEDEF (kind Type) is a constraint violation →
+                        // S_AlignasInvalidContext. Otherwise store the validated
+                        // override on the object's symbol. The validate-and-emit runs
+                        // ONCE per declaration (the `alignasHandledForDecl` gate); the
+                        // override is stored on THIS declarator's symbol AND every
+                        // following one. Threading the stored value to globals/locals
+                        // codegen is a SEPARATE deferred task (unconsumed for variables).
+                        if (!decl.bitfieldSuffix.has_value() && declAlignasSpec.valid()) {
+                            DeclarationKind const dk = s.symbols.at(sym).kind;
+                            char const* badCtx = nullptr;
+                            if (isFnSig || isFunctionForm
+                                || dk == DeclarationKind::Function)
+                                badCtx = "alignas on a function";
+                            else if (dk == DeclarationKind::Type)
+                                badCtx = "alignas on a typedef";
+                            if (!alignasHandledForDecl) {
+                                alignasHandledForDecl = true;
+                                if (badCtx == nullptr) {
+                                    declAlignOverride = resolveAlignasOverride(
+                                        s, cfg, tree, node, decl, declTy, here);
+                                }
+                            }
+                            if (badCtx != nullptr) {
+                                if (!alignasContextReported) {
+                                    alignasContextReported = true;
+                                    ParseDiagnostic d;
+                                    d.code     = DiagnosticCode::S_AlignasInvalidContext;
+                                    d.severity = DiagnosticSeverity::Error;
+                                    d.buffer   = tree.source().id();
+                                    d.span     = tree.span(declAlignasSpec);
+                                    d.actual   = badCtx;
+                                    s.reporter.report(std::move(d));
+                                }
+                            } else if (declAlignOverride.has_value()) {
+                                s.symbols.at(sym).explicitAlignment = declAlignOverride;
+                            }
+                        }
                         if (isFunctionForm && declarators.size() == 1) {
                             // C 6.9.1 definition constraints, checked LOUD:
                             //  * the named direct-declarator must carry a
@@ -3330,34 +3963,65 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                     }
                     // c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR (anonymous fields):
                     // an ANONYMOUS field bound no named symbol — resolve its
-                    // anonymous symbol (Pass 1 minted it on `node`). Mirrors the
-                    // legacy positional anonymous-field Pass 1.5 (`fieldHasName=
-                    // false`): stamp the head as its type, resolve a `: W`
-                    // bit-field width, and — since an anonymous member is legal
-                    // ONLY as a bit-field (C 6.7.2.1) — fail loud with
-                    // S_DeclarationDeclaresNothing on `node` for an anonymous
-                    // NON-bit-field (`int ;` / `int *;`). Gated on
-                    // `bitfieldSuffix` so it fires only for a field form.
-                    if (!resolvedNamed && decl.anonymousNameAllowed
-                        && decl.bitfieldSuffix.has_value()) {
+                    // anonymous symbol (Pass 1 minted it on `node`). Stamp the
+                    // head as its type, then a THREE-way decision on the head:
+                    //   (1) a `: W` bit-field (`int : 5;`) — the c10 packing-slot
+                    //       behavior, byte-identical.
+                    //   (2) FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23
+                    //       §6.7.2.1 ¶13): a non-bit-field whose head is an
+                    //       anonymous Struct/Union — its members are PROMOTED
+                    //       into the enclosing composite's member namespace
+                    //       (`promoteAnonMembers`).
+                    //   (3) else — an anonymous NON-bit-field of a scalar type
+                    //       (`int ;` / `int *;`) declares nothing; fail loud with
+                    //       S_DeclarationDeclaresNothing on `node` (C 6.7.2.1).
+                    // The outer gate is `anonymousNameAllowed` (a field form);
+                    // `resolveBitfieldSuffix` is safe for a non-bit-field field
+                    // (returns `present=false`), and an anon composite member
+                    // carries no bit-field suffix so it falls to arm (2)/(3).
+                    if (!resolvedNamed && decl.anonymousNameAllowed) {
                         SymbolId const sym = s.symbolAtOr(node);
                         if (sym.valid() && headTy.valid()) {
                             s.symbols.at(sym).type = headTy;
                             s.nodeToType.set(node, headTy);
                         }
-                        BitfieldResolution const bf = resolveBitfieldSuffix(
-                            s, tree, decl, node, headTy, /*hasName=*/false, here,
-                            &cfg);
-                        if (sym.valid() && bf.width.has_value())
-                            s.symbols.at(sym).bitFieldWidth = bf.width;
-                        if (!bf.present) {
-                            ParseDiagnostic d;
-                            d.code     = DiagnosticCode::S_DeclarationDeclaresNothing;
-                            d.severity = DiagnosticSeverity::Error;
-                            d.buffer   = tree.source().id();
-                            d.span     = tree.span(node);
-                            d.actual   = std::string{tree.text(node)};
-                            s.reporter.report(std::move(d));
+                        bool const anonComposite =
+                            headTy.valid()
+                            && (s.lattice.interner().kind(headTy)
+                                    == TypeKind::Struct
+                                || s.lattice.interner().kind(headTy)
+                                       == TypeKind::Union);
+                        if (sym.valid() && anonComposite) {
+                            // (2) anonymous struct/union — promote its members.
+                            // An anon COMPOSITE field is never itself a bit-field,
+                            // so we DELIBERATELY do NOT call resolveBitfieldSuffix
+                            // here: its bounded descendant search from `node`
+                            // would find an INNER member's `: W` suffix (`union {
+                            // int a : 4; };`) and mis-validate that width against
+                            // the composite head type (a false
+                            // S_BitFieldNonIntegerType). Each inner bit-field is
+                            // resolved by the anon composite's OWN Pass-1.5 visit.
+                            s.symbols.at(sym).isAnonymousMember = true;
+                            promoteAnonMembers(s, tree, sym, headTy, {},
+                                               s.symbols.at(sym).scope);
+                        } else {
+                            BitfieldResolution const bf = resolveBitfieldSuffix(
+                                s, tree, decl, node, headTy, /*hasName=*/false,
+                                here, &cfg);
+                            if (bf.present) {
+                                // (1) anonymous bit-field packing slot.
+                                if (sym.valid() && bf.width.has_value())
+                                    s.symbols.at(sym).bitFieldWidth = bf.width;
+                            } else {
+                                // (3) declares nothing — loud.
+                                ParseDiagnostic d;
+                                d.code     = DiagnosticCode::S_DeclarationDeclaresNothing;
+                                d.severity = DiagnosticSeverity::Error;
+                                d.buffer   = tree.source().id();
+                                d.span     = tree.span(node);
+                                d.actual   = std::string{tree.text(node)};
+                                s.reporter.report(std::move(d));
+                            }
                         }
                     }
                 }
@@ -3525,11 +4189,76 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                             ? static_cast<std::int64_t>(*w)
                                             : kNotBitfield);
                                 }
+                                // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): gather each
+                                // field's EXPLICIT alignment override (set at the
+                                // field's Pass-1 resolution from the member specifier
+                                // prefix) into the parallel span passed to
+                                // `completeComposite` — 0 for a field with no override.
+                                // ALL-fields-or-EMPTY: when NO member carries alignas
+                                // the span stays EMPTY (so the composite interns
+                                // byte-identically to a pre-alignas struct — zero TypeId
+                                // churn, mirroring the all-ordinary bitfields rule); the
+                                // interned TYPE is then the authoritative align source
+                                // (computeLayout raises each field's align via max()).
+                                std::vector<std::uint32_t> fieldAligns;
+                                bool anyAlign = false;
+                                for (auto const& fe : fields)
+                                    if (s.symbols.at(fe.sym).explicitAlignment
+                                            .has_value()) { anyAlign = true; break; }
+                                if (anyAlign) {
+                                    fieldAligns.reserve(fields.size());
+                                    for (auto const& fe : fields) {
+                                        auto const& a =
+                                            s.symbols.at(fe.sym).explicitAlignment;
+                                        fieldAligns.push_back(a.value_or(0u));
+                                    }
+                                }
                                 // D5.4 / D5.5: struct vs union vs enum
                                 // dispatch is config-driven via
                                 // FieldChildrenDescriptor::compositeKind.
                                 CompositeKind const ck =
                                     decl.fieldChildren->compositeKind;
+                                // D-CSUBSET-PACKED: scan the composite's TRAILING
+                                // attribute list for a honored `packed` (emitting the
+                                // S_UnknownTypeAttribute typo diagnostic exactly ONCE
+                                // here). packed applies only to struct/union. A packed
+                                // composite that ALSO has a bit-field member is
+                                // UNSUPPORTED (D-CSUBSET-PACKED-BITFIELD-INTERACTION):
+                                // fail loud S_PackedBitfieldUnsupported and complete it
+                                // UNPACKED (so the type still lays out — the build
+                                // fails via the unsuppressable diagnostic; the layout
+                                // nullopt belt is the backstop for interner-direct
+                                // construction that bypasses this scan).
+                                bool composedPacked = false;
+                                NodeId const specNode =
+                                    srec.structScope.valid()
+                                        ? s.scopes.scopes()[srec.structScope.v].anchor
+                                        : NodeId{};
+                                if (ck == CompositeKind::Struct
+                                    || ck == CompositeKind::Union) {
+                                    composedPacked = scanCompositePacked(
+                                        s, cfg, tree, specNode,
+                                        /*emitDiagnostics=*/true);
+                                    if (composedPacked) {
+                                        bool anyBitfieldMember = false;
+                                        for (std::int64_t const w : fieldBitWidths)
+                                            if (w != kNotBitfield) {
+                                                anyBitfieldMember = true;
+                                                break;
+                                            }
+                                        if (anyBitfieldMember) {
+                                            ParseDiagnostic d;
+                                            d.code = DiagnosticCode::S_PackedBitfieldUnsupported;
+                                            d.severity = DiagnosticSeverity::Error;
+                                            d.buffer = tree.source().id();
+                                            d.span = tree.span(
+                                                specNode.valid() ? specNode : resolved.node);
+                                            d.actual = std::string{srec.name};
+                                            s.reporter.report(std::move(d));
+                                            composedPacked = false;   // complete UNPACKED
+                                        }
+                                    }
+                                }
                                 // FC6: flexible-array-member constraints (C99
                                 // §6.7.2.1), positioned at the offending field.
                                 // The not-last / sole-member checks are
@@ -3643,7 +4372,9 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                     // recurse infinitely on the self-by-value cycle.
                                     if (!anyIncompleteMember)
                                         s.lattice.interner().completeComposite(
-                                            compositeTy, fieldTypes, fieldBitWidths);
+                                            compositeTy, fieldTypes, composedPacked,
+                                            fieldBitWidths, /*fieldOffsets=*/{},
+                                            fieldAligns);
                                 } else if (ck == CompositeKind::Enum) {
                                     // D5.5: enum type carries no field-
                                     // operands — only its nominal name +
@@ -3785,7 +4516,9 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                     compositeTy = srec.type;
                                     if (!anyIncompleteMember)
                                         s.lattice.interner().completeComposite(
-                                            compositeTy, fieldTypes, fieldBitWidths);
+                                            compositeTy, fieldTypes, composedPacked,
+                                            fieldBitWidths, /*fieldOffsets=*/{},
+                                            fieldAligns);
                                 }
                                 srec.type = compositeTy;
                                 s.nodeToType.set(resolved.node, compositeTy);
@@ -3931,6 +4664,90 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
     return tree.rule(p).v == s.idx().stringLiteralExprRule.v;
 }
 
+// C11/C23 6.4.5 / 6.4.5p5: the element core of a (possibly adjacent-concatenated)
+// string-literal node, keyed by the run's EFFECTIVE encoding prefix — the single
+// distinct NON-narrow opener among ALL segments (narrow segments widen to it,
+// position-independent), NOT merely the first opener. `L"`/`u"`/`U"`/`u8"` map to
+// their declared/format-resolved core; the narrow `"` (and any grammar without a
+// prefix table) falls back to `stringLiteralElementCore`. `conflict` is set when the
+// run mixes ≥2 DIFFERENT non-narrow prefixes (6.4.5p5's impl-defined case, which
+// this implementation rejects); the caller then fails loud + leaves the node untyped.
+// The scan (SF4, the drift-prone part) is the SHARED `effectiveStringConcatPrefix`
+// chokepoint the HIR tier also uses; MF2: its non-narrow classifier is the
+// token-KIND set `nonNarrowStringOpeners` (format-agnostic), NOT the format-resolved
+// `byStart` core. `owningNode` is the stringLiteralExpr rule node (openers are its
+// children) OR a body-token's parent (the single-opener per-token fallback path).
+struct StringLiteralConcatCore {
+    TypeKind core;
+    bool     conflict;
+};
+[[nodiscard]] StringLiteralConcatCore stringLiteralElementCoreOf(
+        EngineState const& s, Tree const& tree, NodeId owningNode) {
+    auto const& byStart = s.idx().stringLiteralElementCoreByStart;
+    if (byStart.empty() || !owningNode.valid()
+        || tree.kind(owningNode) != NodeKind::Internal) {
+        return { s.idx().stringLiteralElementCore, false };
+    }
+    EffectiveStringPrefix const eff = effectiveStringConcatPrefix(
+        tree, owningNode,
+        [&](SchemaTokenId tk) {
+            return s.idx().nonNarrowStringOpeners.count(tk.v) != 0;
+        },
+        /*narrowFallback=*/SchemaTokenId{});
+    if (eff.conflict) return { s.idx().stringLiteralElementCore, true };
+    if (eff.effectiveOpener.valid()) {
+        if (auto it = byStart.find(eff.effectiveOpener.v); it != byStart.end()) {
+            return { it->second, false };
+        }
+    }
+    // All-narrow run (or an unmapped opener): the narrow default — BYTE-IDENTICAL to
+    // the pre-Cycle-D path (byStart[narrowOpener] is built == stringLiteralElementCore).
+    return { s.idx().stringLiteralElementCore, false };
+}
+
+// C11/C23 6.4.4.4: the WIDE/UTF element core of a character constant, keyed by its
+// ACTUAL opener token — but ONLY for the wide openers (`L'`/`u'`/`U'`/`u8'`). The
+// narrow `'x'` opener (`CharStart`) is DELIBERATELY absent from the map, so this
+// returns std::nullopt for it and the caller keeps the flat `int` type (byte-
+// identical). The opener is a DIRECT child token of `owningNode` (the charLiteralExpr
+// rule node; the inline-alt opener pushes it flat), so a single child scan finds it.
+// The core was format-resolved at index-build time (this tier owns `activeFormat`).
+[[nodiscard]] std::optional<TypeKind>
+charLiteralWideCoreOf(EngineState const& s, Tree const& tree, NodeId owningNode) {
+    auto const& byStart = s.idx().charLiteralElementCoreByStart;
+    if (!byStart.empty() && owningNode.valid()
+        && tree.kind(owningNode) == NodeKind::Internal) {
+        for (NodeId c : visibleChildren(tree, owningNode)) {
+            if (tree.kind(c) != NodeKind::Token) continue;
+            auto it = byStart.find(tree.tokenKind(c).v);
+            if (it != byStart.end()) return it->second;
+        }
+    }
+    return std::nullopt;
+}
+
+// C 6.4.5: the `Array<elementCore, N+1>` type of a string literal whose
+// escape-decoded bytes are `decodedBytes`. For the NARROW core (Char/Byte) N is
+// the byte length (unchanged path). For a WIDE core (U8/U16/U32/I32) the raw bytes
+// are UTF-8-decoded and re-encoded so N is the ELEMENT-width CODE-UNIT count — the
+// SAME `encodeWideString` the HIR tier runs, so both tiers agree on N. A wide
+// encode error (ill-formed UTF-8 / cp>0x10FFFF) returns
+// InvalidType: the node stays untyped, the semantic phase already surfaces the
+// fault at the HIR tier's fail-loud, and a `sizeof` of it fails loud (never a
+// guessed size). Narrow strings never reach the wide path (byte-identical).
+[[nodiscard]] TypeId stringLiteralArrayType(EngineState& s, std::string const& decodedBytes,
+                                            TypeKind elementCore) {
+    TypeInterner& interner = s.lattice.interner();
+    if (elementCore == TypeKind::Char || elementCore == TypeKind::Byte) {
+        return interner.array(interner.primitive(elementCore),
+                              static_cast<std::int64_t>(decodedBytes.size() + 1));
+    }
+    WideEncodeResult enc;
+    if (encodeWideString(decodedBytes, elementCore, enc)) return InvalidType;   // fail loud later
+    return interner.array(interner.primitive(elementCore),
+                          static_cast<std::int64_t>(enc.codeUnits + 1));
+}
+
 // C 6.7.9p14 (D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): is the initializer subtree
 // a STRING LITERAL (`= "..."`)? Descends the SINGLE-child wrapper chain from the
 // init node (initValue → expression → operand → … → stringLiteralExpr) — the same
@@ -4059,6 +4876,29 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 }
                 litTy = s.lattice.interner().primitive(*fk);
             }
+            // C11/C23 6.4.4.4: a PREFIXED character constant (`L'x'`/`u'x'`/`U'x'`/
+            // `u8'x'`) has the SCALAR type of its prefix (wchar_t/char16_t/char32_t/
+            // char8_t), NOT `int`. The narrow `'x'` keeps its flat `literalTypeIds`
+            // type (`int` / I32) UNTOUCHED — other consumers key on that entry
+            // (`integerLiteralTokenSet`, `isLiteralIntegerZero`). ONLY a wide opener
+            // OVERRIDES: look up the parent charLiteralExpr's opener in the WIDE-ONLY
+            // `charLiteralElementCoreByStart` map (format-resolved at index build). A
+            // wide char whose single code point does NOT fit its element (astral under
+            // char16_t, `u8'`>U+007F, empty/multi-char/ill-formed) leaves the body
+            // token UNTYPED so a `sizeof`/`_Alignof` of it fails loud (never a guessed
+            // size) — the HIR tier emits the specific diagnostic. The decode+validate
+            // is the SHARED `decodeWideCharCodepoint` the HIR tier runs, so both tiers
+            // agree on representability.
+            if (s.idx().charLiteralBodyToken.valid()
+                && tk == s.idx().charLiteralBodyToken) {
+                if (auto wideCore = charLiteralWideCoreOf(s, tree, tree.parent(node))) {
+                    if (decodeWideCharCodepoint(tree.text(node), *wideCore)) {
+                        litTy = s.lattice.interner().primitive(*wideCore);
+                    } else {
+                        return;   // unrepresentable — leave untyped (sizeof fails loud)
+                    }
+                }
+            }
             s.nodeToType.set(node, litTy);
         }
         // C 6.4.5: a string literal has type `Array<elementCore, N+1>` (N = decoded
@@ -4075,11 +4915,18 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                  && tk == s.idx().stringLiteralBodyToken
                  && !parentIsStringLiteralExprRule(s, tree, node)) {
             if (auto decoded = decodeStringLiteralBody(tree.text(node))) {
-                TypeId const elem = s.lattice.interner()
-                                        .primitive(s.idx().stringLiteralElementCore);
-                TypeId const arr  = s.lattice.interner().array(
-                    elem, static_cast<std::int64_t>(decoded->size() + 1));
-                s.nodeToType.set(node, arr);
+                // Per-token fallback (grammars with no stringLiteralExpr rule —
+                // toy/tsql, or a body not under it): the opener is the token's
+                // parent. Those grammars declare no prefix map, so the core is the
+                // scalar narrow default and the length is the byte count (byte-
+                // identical). Route through the shared helper so a future prefixed
+                // grammar without the concat rule still types correctly.
+                // SINGLE-opener path (one body token's parent) → `conflict` is
+                // structurally impossible; take the core.
+                TypeKind const core = stringLiteralElementCoreOf(s, tree, tree.parent(node)).core;
+                if (TypeId const arr = stringLiteralArrayType(s, *decoded, core); arr.valid()) {
+                    s.nodeToType.set(node, arr);
+                }
             }
         }
     }
@@ -4097,13 +4944,42 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         && s.idx().stringLiteralExprRule.valid()
         && s.idx().stringLiteralBodyToken.valid()
         && tree.rule(node).v == s.idx().stringLiteralExprRule.v) {
+        EscapeDecodeOutcome outcome;
         if (auto decoded = decodeAdjacentStringBodies(
-                tree, node, s.idx().stringLiteralBodyToken)) {
-            TypeId const elem = s.lattice.interner()
-                                    .primitive(s.idx().stringLiteralElementCore);
-            TypeId const arr  = s.lattice.interner().array(
-                elem, static_cast<std::int64_t>(decoded->size() + 1));
-            s.nodeToType.set(node, arr);
+                tree, node, s.idx().stringLiteralBodyToken, &outcome)) {
+            // C11/C23 6.4.5 / 6.4.5p5: the element core is keyed by the run's
+            // EFFECTIVE prefix (the single distinct non-narrow opener among ALL
+            // segments; narrow segments widen to it), and the array length is the
+            // code-unit count for a wide core (via the shared encoder).
+            StringLiteralConcatCore const coreInfo = stringLiteralElementCoreOf(s, tree, node);
+            if (coreInfo.conflict) {
+                // MF1 / N6 (6.4.5p5): the run mixes two DIFFERENT non-narrow prefixes
+                // (`u"a" U"b"`) — the impl-defined case this implementation rejects.
+                // Emit the reason HERE (so a `sizeof`/`_Alignof` of it reports the real
+                // conflict, not a bare sizeof-of-untyped cascade) and leave the node
+                // UNTYPED so a `sizeof` of it fails loud. The HIR tier emits the same
+                // code + an Error node when the run is lowered as a value.
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::H_ConflictingStringLiteralPrefixes;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(node);
+                d.actual   = std::string{tree.text(node)};
+                s.reporter.report(std::move(d));
+            } else {
+                TypeKind const core = coreInfo.core;
+                // FF3 (D-CSUBSET-WIDE-HEX-OCTAL-ESCAPE-VALUE): a `\x`/octal byte escape
+                // in a WIDE/UTF string names a raw code-unit value, not a code point —
+                // leave the node UNTYPED so a `sizeof` of it fails loud, matching the
+                // HIR tier. Narrow `\x`/octal is byte-producing and stays typed.
+                bool const wideByteEscape = outcome.usedByteEscape
+                    && core != TypeKind::Char && core != TypeKind::Byte;
+                if (!wideByteEscape) {
+                    if (TypeId const arr = stringLiteralArrayType(s, *decoded, core); arr.valid()) {
+                        s.nodeToType.set(node, arr);
+                    }
+                }
+            }
         }
     }
 
@@ -4291,6 +5167,23 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 TypeId const sized = resolveTypeNode(s, cfg, tree, typeNode, here);
                 if (sized.valid()) s.nodeToType.set(typeNode, sized);
                 // sized invalid ⇒ resolveTypeNode emitted S_UnknownType (fail loud).
+            }
+            s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
+        }
+        // C11/C23 6.5.3.4: `_Alignof(T)` typing — an ADDITIVE mirror of the sizeof
+        // TYPE arm. Resolves + stamps its castTypeRef child through the SAME type
+        // resolver (so the HIR lowering's `resolveStampedTypeBelow` recovers the
+        // queried type) and stamps the node size_t (U64). Type-name form ONLY (no
+        // value arm — `_Alignof(expr)` is a constraint violation the binder
+        // rejects at type-resolve). U64 is correct for LP64 + LLP64; see the
+        // sizeof arm's note on a future ILP32 `size_t`.
+        if (cfg.alignofTypeRule.valid() && rule.v == cfg.alignofTypeRule.v) {
+            auto kids = visibleChildren(tree, node);
+            if (cfg.alignofTypeChild < kids.size()) {
+                NodeId const typeNode = kids[cfg.alignofTypeChild];
+                TypeId const queried = resolveTypeNode(s, cfg, tree, typeNode, here);
+                if (queried.valid()) s.nodeToType.set(typeNode, queried);
+                // queried invalid ⇒ resolveTypeNode emitted S_UnknownType (fail loud).
             }
             s.nodeToType.set(node, s.lattice.interner().primitive(TypeKind::U64));
         }
@@ -4496,6 +5389,19 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 case St::UndeclaredField: {
                     ParseDiagnostic d;
                     d.code     = DiagnosticCode::S_UndeclaredIdentifier;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(mr.nameNode);
+                    d.actual   = mr.fieldName;
+                    s.reporter.report(std::move(d));
+                    break;
+                }
+                case St::AmbiguousField: {
+                    // FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C 6.7.2.1 ¶13): the
+                    // member name is promoted from ≥2 sibling anonymous members
+                    // — ambiguous, fail loud rather than silently picking one.
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_RedeclaredSymbol;
                     d.severity = DiagnosticSeverity::Error;
                     d.buffer   = tree.source().id();
                     d.span     = tree.span(mr.nameNode);
@@ -4812,6 +5718,221 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         d.span     = tree.span(node);
         d.actual   = std::string{tree.text(node)};
         s.reporter.report(std::move(d));
+    }
+
+    // C11/C23 6.7.10 (D-CSUBSET-STATIC-ASSERT): a `_Static_assert`/`static_assert`
+    // static-assertion declaration. The construct is valid at BOTH file and block
+    // scope; `pass2Post` visits it in both because it walks EVERY node (the check
+    // is node-based, not symbol-based — the declaration mints no symbol). The
+    // condition is const-evaluated through the SAME `constIntExpr` evaluator that
+    // folds `sizeof(T)` / enum constants / arithmetic in an array dimension (it
+    // wires `resolveSizeof` off `s.aggregateLayout`), so `sizeof(int)==4` folds
+    // here exactly as `int a[sizeof(int)]` does. A fold to ZERO — OR a condition
+    // that does not fold to an integer constant expression (non-const / float /
+    // unresolved; C 6.7.10 requires an ICE) — fails loud with S_StaticAssertFailed.
+    // A NONZERO fold produces nothing (the construct also lowers to nothing: its
+    // hirLowering row maps to Skip). The child roles are POSITIONAL, matching the
+    // grammar `keyword '(' condition [ ',' message ] ')' ';'`: the FIRST meaningful
+    // (Internal) child is the condition; a SECOND, when present, is the message
+    // string-literal expression.
+    if (k == NodeKind::Internal
+        && s.idx().staticAssertByRule.contains(tree.rule(node).v)) {
+        NodeId condNode{};
+        NodeId msgNode{};
+        for (NodeId c : visibleChildren(tree, node)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;   // skip kw / ( ) ; ,
+            if (!condNode.valid())      condNode = c;
+            else if (!msgNode.valid())  msgNode  = c;
+        }
+        // Decode the message (an adjacent-string-concat literal) via the SHARED
+        // chokepoint — the exact bytes the string appears as in source. Absent (the
+        // C23 1-arg form) or a malformed escape ⇒ no message text; the diagnostic
+        // still fires (an assertion with an unreadable message is still an
+        // assertion). The message is decoration only — never the pass/fail input.
+        std::string message;
+        if (msgNode.valid() && s.idx().stringLiteralBodyToken.valid()) {
+            if (auto decoded = decodeAdjacentStringBodies(
+                    tree, msgNode, s.idx().stringLiteralBodyToken)) {
+                message = std::move(*decoded);
+            }
+        }
+        std::optional<std::int64_t> folded;
+        if (condNode.valid()) folded = constIntExpr(s, tree, condNode, here, &cfg);
+        bool const failed = !folded.has_value() || *folded == 0;
+        if (failed) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_StaticAssertFailed;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(node);
+            // The message discriminates the two failure modes on ONE code: a
+            // FALSE assertion carries the author's string; a NON-CONSTANT
+            // condition says so (C requires an integer constant expression).
+            if (!folded.has_value()) {
+                d.actual = "static assertion condition is not an integer constant "
+                           "expression";
+                if (!message.empty())
+                    d.actual += ": \"" + message + "\"";
+            } else {
+                d.actual = message.empty()
+                               ? std::string{"static assertion failed"}
+                               : "static assertion failed: \"" + message + "\"";
+            }
+            s.reporter.report(std::move(d));
+        }
+    }
+
+    // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): a `_Generic ( ctrl ,
+    // assoc-list )` generic selection. The SELECTION is a compile-time decision
+    // made here (the point with the resolved controlling type + the machinery to
+    // resolve each association's type-name), mirroring how `va_arg` resolves its
+    // type child and `static_assert` const-evaluates its condition. Post-order
+    // means the controlling expression is already typed; each typed association's
+    // castTypeRef is resolved through the SAME resolver casts/sizeof/va_arg use
+    // (a VALUE in type position fails loud S_UnknownType). The controlling type
+    // is lvalue-converted (top-level volatile stripped — the isAssignable
+    // precedent; C 6.3.2.1 also drops the qualifiers, and c-subset does not
+    // materialize const). A typed association MATCHES when its resolved type is
+    // COMPATIBLE with the controlling type — interned TypeId equality (`sameType`)
+    // after stripping each association type's own top-level volatile. C 6.5.1.1p2
+    // requires EXACTLY ONE match or the `default`: zero-and-no-default is
+    // S_GenericSelectionNoMatch, two-or-more is S_GenericSelectionAmbiguous (with
+    // interned equality, two matches means two associations named the same type).
+    // On success the genericExpr node is stamped the WINNER's result type (so the
+    // enclosing expression types + the HIR lowering's `typeAt` probe find it) and
+    // the winning association's result-expression NodeId is recorded in
+    // `nodeToSelectedExpr` (so `lowerGeneric` lowers ONLY that sub-expression).
+    // The NON-selected associations are UNEVALUATED (6.5.1.1p3) — they are parsed
+    // and their type-names resolved (a value in type position of ANY association
+    // is still a constraint violation), but their result EXPRESSIONS impose no
+    // constraints and are never lowered; see the pinned deferral in the plan.
+    if (k == NodeKind::Internal
+        && cfg.genericRule.valid()
+        && tree.rule(node).v == cfg.genericRule.v) {
+        auto& in = s.lattice.interner();
+        auto kids = visibleChildren(tree, node);
+
+        // (1) The controlling expression's type, lvalue-converted.
+        TypeId ctrlTy = InvalidType;
+        if (cfg.genericControlChild < kids.size()) {
+            ctrlTy = subtreeType(s, tree, kids[cfg.genericControlChild], here);
+        }
+        TypeId const ctrlConv = ctrlTy.valid() ? in.stripVolatile(ctrlTy)
+                                               : InvalidType;
+
+        // (2) Walk the associations. Each association child is a `genericAssoc`
+        // UMBRELLA node (an `alt` rule) wrapping either a `genericTypedAssoc`
+        // ([castTypeRef, ':', assignmentExpr]) or a `genericDefaultAssoc`
+        // ([default, ':', assignmentExpr]) — the parser keeps the alt wrapper, so
+        // descend through it to the inner alternative to classify. (A grammar that
+        // referenced the two alternatives directly would skip the wrapper; the
+        // descent handles BOTH shapes, so it is robust to that grammar choice.)
+        NodeId matchedExpr = InvalidNode;   // the winning typed assoc's result expr
+        int    matchCount  = 0;             // typed matches (for the ambiguity check)
+        NodeId defaultExpr = InvalidNode;   // the `default:` result expr, if present
+        bool   anyBadType  = false;         // a value-in-type-position was rejected
+
+        // Resolve an association child to its inner typed/default node: descend
+        // through the `genericAssoc` umbrella (its sole internal child is the
+        // chosen alternative), else the child IS already a typed/default node.
+        auto innerAssoc = [&](NodeId assoc) -> NodeId {
+            RuleId const r = tree.rule(assoc);
+            bool const isInner =
+                (cfg.genericTypedAssocRule.valid()
+                 && r.v == cfg.genericTypedAssocRule.v)
+                || (cfg.genericDefaultAssocRule.valid()
+                    && r.v == cfg.genericDefaultAssocRule.v);
+            if (isInner) return assoc;
+            if (cfg.genericAssocRule.valid() && r.v == cfg.genericAssocRule.v) {
+                for (NodeId c : visibleChildren(tree, assoc)) {
+                    if (tree.kind(c) == NodeKind::Internal) return c;
+                }
+            }
+            return InvalidNode;
+        };
+
+        for (NodeId assocChild : kids) {
+            if (tree.kind(assocChild) != NodeKind::Internal) continue;
+            NodeId const assoc = innerAssoc(assocChild);
+            if (!assoc.valid()) continue;   // not an association child
+            RuleId const assocRule = tree.rule(assoc);
+            bool const isTyped =
+                cfg.genericTypedAssocRule.valid()
+                && assocRule.v == cfg.genericTypedAssocRule.v;
+            bool const isDefault =
+                cfg.genericDefaultAssocRule.valid()
+                && assocRule.v == cfg.genericDefaultAssocRule.v;
+            if (!isTyped && !isDefault) continue;
+
+            // The result expression is the LAST internal child (the assignmentExpr
+            // after the ':'); the typed form's FIRST internal child is the type.
+            NodeId typeNode{}, exprNode{};
+            for (NodeId c : visibleChildren(tree, assoc)) {
+                if (tree.kind(c) != NodeKind::Internal) continue;
+                if (isTyped && !typeNode.valid()) { typeNode = c; continue; }
+                exprNode = c;   // keep last internal child as the result expr
+            }
+
+            if (isDefault) {
+                // Two `default`s are a constraint violation (6.5.1.1p2); the
+                // exactly-one-default enforcement is pinned as a deferral — keep
+                // the FIRST default's expression here.
+                if (!defaultExpr.valid()) defaultExpr = exprNode;
+                continue;
+            }
+
+            // Typed association: resolve + stamp its castTypeRef (fail loud on a
+            // value in type position — S_UnknownType), then match.
+            TypeId assocTy = InvalidType;
+            if (typeNode.valid()) {
+                assocTy = resolveTypeNode(s, cfg, tree, typeNode, here);
+                if (assocTy.valid()) s.nodeToType.set(typeNode, assocTy);
+                else                 anyBadType = true;   // diagnostic already emitted
+            }
+            if (assocTy.valid() && ctrlConv.valid()
+                && sameType(in.stripVolatile(assocTy), ctrlConv)) {
+                ++matchCount;
+                if (!matchedExpr.valid()) matchedExpr = exprNode;
+            }
+        }
+
+        // (3) Resolve the selection + stamp / fail loud. A bad controlling type or
+        // a rejected association type-name already emitted its own diagnostic; only
+        // CASCADE-SUPPRESS the no-match report in that case (never a double error),
+        // exactly like the va_arg invalid-type path.
+        NodeId selected = matchCount == 1 ? matchedExpr
+                        : matchCount == 0 ? defaultExpr
+                        : InvalidNode;   // >1 typed match: ambiguous (handled below)
+
+        if (matchCount > 1) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_GenericSelectionAmbiguous;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(node);
+            d.actual   = "_Generic controlling type matches more than one "
+                         "association";
+            s.reporter.report(std::move(d));
+        } else if (!selected.valid() && ctrlConv.valid() && !anyBadType) {
+            // No typed match AND no default — and the failure is NOT a cascade
+            // from an unresolved controlling type / bad association type-name.
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_GenericSelectionNoMatch;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(node);
+            d.actual   = "_Generic controlling type matches no association and "
+                         "there is no default";
+            s.reporter.report(std::move(d));
+        }
+
+        if (selected.valid()) {
+            // The genericExpr's RESULT type is the selected association's result-
+            // expression type; record the selected node for the HIR lowering.
+            TypeId const resultTy = subtreeType(s, tree, selected, here);
+            if (resultTy.valid()) s.nodeToType.set(node, resultTy);
+            s.nodeToSelectedExpr.set(node, selected);
+        }
     }
 }
 
@@ -5856,6 +6977,12 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
         if (hirCfg.sizeofRule.valid() && r.v == hirCfg.sizeofRule.v) {
             result = interner.primitive(TypeKind::U64); return;        // size_t
         }
+        // C11/C23 6.5.3.4: `_Alignof(T)` is size_t (U64) — an ADDITIVE mirror of
+        // the sizeof arm (a re-typing wrapper whose castTypeRef child must NOT be
+        // read as its pre-alignof type).
+        if (hirCfg.alignofRule.valid() && r.v == hirCfg.alignofRule.v) {
+            result = interner.primitive(TypeKind::U64); return;        // size_t
+        }
         // D-CSUBSET-COMPUTED-GOTO: `&&label` is `void*` (a dedicated operand rule
         // whose Identifier child is a LABEL name, never typed as an expression).
         if (hirCfg.labelAddressRule.valid() && r.v == hirCfg.labelAddressRule.v) {
@@ -6002,6 +7129,56 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     return result;
 }
 
+// FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23 §6.7.2.1 ¶13): search the
+// ANONYMOUS members of the field scope `fieldScope` for a member spelled
+// `name`, recursing through nested anonymous members. A direct member of
+// `fieldScope` is NOT searched here (the caller already tried the direct
+// lookup); only names reachable THROUGH an anonymous struct/union member are.
+// Returns the SINGLE matching promoted field symbol (whose `anonAncestorPath`
+// Pass 1.5 recorded). If the name matches ≥2 distinct fields across sibling
+// anonymous members (`struct { union{int x;}; union{int x;}; }`), `ambiguous`
+// is set and no symbol is returned (the caller fails loud, C forbids it). NO
+// side effects — read-only over the frozen Pass-1.5 symbol/scope state.
+[[nodiscard]] std::optional<SymbolId>
+findPromotedField(EngineState const& s, ScopeId fieldScope,
+                  std::string_view name, bool& ambiguous) {
+    ambiguous = false;
+    std::optional<SymbolId> found;
+    // Recursive walk implemented iteratively over a worklist of scopes to
+    // search; each anonymous member contributes its own composite scope. We
+    // collect ALL matches (across sibling anon members) so an ambiguous name is
+    // detected rather than silently resolving to the first sibling.
+    std::vector<ScopeId> worklist{fieldScope};
+    for (std::size_t wi = 0; wi < worklist.size(); ++wi) {
+        ScopeId const cur = worklist[wi];
+        for (auto const& [bindName, ns, fsym] : s.scopes.bindingsOf(cur)) {
+            (void)bindName;
+            if (ns != SymbolNamespace::Ordinary) continue;
+            if (!fsym.valid()) continue;
+            if (!s.symbols.at(fsym).isAnonymousMember) continue;
+            TypeId const anonTy = s.symbols.at(fsym).type;
+            auto const anonScopeIt = s.compositeScopeByType.find(anonTy.v);
+            if (anonScopeIt == s.compositeScopeByType.end()) continue;
+            ScopeId const anonScope = anonScopeIt->second;
+            // Direct hit inside THIS anonymous member's scope?
+            for (auto const& [mName, mNs, mSym] : s.scopes.bindingsOf(anonScope)) {
+                if (mNs != SymbolNamespace::Ordinary) continue;
+                if (!mSym.valid()) continue;
+                if (s.symbols.at(mSym).isAnonymousMember) continue;   // a nested anon name — not a member spelling
+                if (mName != name) continue;
+                if (found.has_value() && found->v != mSym.v) {
+                    ambiguous = true;
+                    return std::nullopt;
+                }
+                found = mSym;
+            }
+            // Recurse into THIS anonymous member (nested anon).
+            worklist.push_back(anonScope);
+        }
+    }
+    return found;
+}
+
 // R1: shared member-access resolver (declared after subtreeType's forward decl).
 // Walks `obj.field` / `ptr->field` → the field's declared type, reporting the
 // outcome. NO side effects (no diagnostics, no symbol binding) — the Pass-2 arm
@@ -6098,7 +7275,24 @@ resolveMemberAccess(EngineState const& s, SemanticConfig const& cfg,
     auto const& sc = s.scopes.scopes()[fieldScope.v];
     auto bindIt = sc.bindings.find(fnRes.name);
     if (bindIt == sc.bindings.end()) {
-        out.status = MemberResolution::Status::UndeclaredField; return out;
+        // FC16 D-CSUBSET-ANON-MEMBER-PROMOTION (C11/C23 §6.7.2.1 ¶13): a direct
+        // member miss — recursively search the composite's ANONYMOUS members.
+        // `struct S { union { int a; }; } s; s.a` resolves `a` through the anon
+        // union member (its `anonAncestorPath` was recorded at Pass 1.5). An
+        // AMBIGUOUS name (matching two sibling anon members) fails loud.
+        bool ambiguous = false;
+        auto const promoted =
+            findPromotedField(s, fieldScope, fnRes.name, ambiguous);
+        if (ambiguous) {
+            out.status = MemberResolution::Status::AmbiguousField; return out;
+        }
+        if (!promoted.has_value()) {
+            out.status = MemberResolution::Status::UndeclaredField; return out;
+        }
+        out.fieldSym  = *promoted;
+        out.fieldType = s.symbols.at(out.fieldSym).type;
+        out.status    = MemberResolution::Status::Ok;
+        return out;
     }
     out.fieldSym  = bindIt->second;
     out.fieldType = s.symbols.at(out.fieldSym).type;   // may be invalid ⇒ still Ok (binding found)
@@ -6283,6 +7477,67 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         idx.braceInitListRule = sch.rules().find("braceInitList");
         idx.initElementRule   = sch.rules().find("initElement");
         buildIndexes(s, idx, sch.semantics());
+        // C11/C23 6.4.5: the per-opener element-core map (`L"`/`u"`/`U"`/`u8"`).
+        // The core is resolved by a PURE CONFIG-MAP LOOKUP — `resolveElementCore`
+        // returns the per-format override (`elementCoreByFormat`, how `L"…"`/wchar_t
+        // declares its pe→U16 / elf/macho→I32 width AS CONFIG DATA, mirroring
+        // builtinTypes' `coreByDataModel`) or the base `elementCore`. NO engine-tier
+        // `format == …` branch — this tier owns `activeFormat` only to KEY the map.
+        // The HIR tier reads the resulting element core back off the stamped node
+        // type. (D-FFI-STDDEF-WCHAR-PE-WIDTH — width is config-declared, not coded.)
+        SchemaTokenId const narrowOpener = sch.hirLowering().stringStartToken;
+        for (auto const& px : sch.hirLowering().stringLiteralPrefixes) {
+            if (!px.startToken.valid()) continue;
+            TypeKind core;
+            if (narrowOpener.valid() && px.startToken.v == narrowOpener.v
+                && px.elementCoreByFormat.empty()
+                && idx.stringLiteralElementCore != TypeKind::Void) {
+                // The NARROW opener's core is the language's declared string-literal
+                // element core (`literalTypes` `core`), NOT the loader's auto-seed
+                // placeholder (Char) — so a grammar whose narrow string core is not
+                // Char stays consistent with the scalar `stringLiteralElementCore`
+                // fallback. (Every shipped grammar's narrow core IS Char, so this is
+                // a no-op today; it forecloses a future non-Char-narrow divergence.
+                // Skipped when the narrow opener declares a per-format map, so an
+                // explicit config override always wins.)
+                core = idx.stringLiteralElementCore;
+            } else {
+                core = px.resolveElementCore(s.activeFormat);   // config-map lookup
+            }
+            idx.stringLiteralElementCoreByStart[px.startToken.v] = core;
+            // C11/C23 6.4.5p5 (Cycle D): classify this opener as NON-narrow keyed on
+            // its TOKEN KIND (format-agnostic) — non-narrow when the base `elementCore`
+            // OR any `elementCoreByFormat` value is not Char/Byte. Mirrors the HIR
+            // tier's `isWideStringOpenerKind` so the adjacent-concat prefix fold agrees
+            // across tiers WITHOUT reading the format-resolved core above (which would
+            // make `u"a" L"b"` accept on pe but reject on elf).
+            auto const isNonNarrowCore = [](TypeKind c) {
+                return c != TypeKind::Char && c != TypeKind::Byte;
+            };
+            bool nonNarrow = isNonNarrowCore(px.elementCore);
+            for (auto const& [fmt, fmtCore] : px.elementCoreByFormat) {
+                (void)fmt;
+                if (isNonNarrowCore(fmtCore)) nonNarrow = true;
+            }
+            if (nonNarrow) idx.nonNarrowStringOpeners.insert(px.startToken.v);
+        }
+        // C11/C23 6.4.4.4: the WIDE char-opener → format-resolved element-core map
+        // (`L'`/`u'`/`U'`/`u8'`). The narrow `CharStart` is EXCLUDED — the unprefixed
+        // `'x'` stays `int` via the flat `literalTypeIds` path (other integer-literal
+        // consumers key on that entry), so only a wide opener overrides the char
+        // type. Same PURE CONFIG-MAP LOOKUP (`resolveElementCore`) as the string map:
+        // WideCharStart (wchar_t) resolves pe→U16 / elf,macho→I32 AS CONFIG DATA — NO
+        // engine-tier `format == …` branch. The HIR tier reads the core back off the
+        // stamped body token (it lacks format), so this is the format-aware point.
+        SchemaTokenId const narrowChar = sch.hirLowering().charStartToken;
+        idx.charLiteralBodyToken = sch.hirLowering().charBodyToken;
+        for (auto const& px : sch.hirLowering().charLiteralPrefixes) {
+            if (!px.startToken.valid()) continue;
+            if (narrowChar.valid() && px.startToken.v == narrowChar.v)
+                continue;   // narrow `'x'` → flat literalTypeIds int path (untouched)
+            idx.charLiteralElementCoreByStart[px.startToken.v] =
+                px.resolveElementCore(s.activeFormat);
+        }
         distinctSchemas.push_back(&sch);
     }
 
@@ -6784,6 +8039,11 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                 ? DeclarationKind::Function
                                 : DeclarationKind::Variable;
                 rec.type  = sym.signature;
+                // FC16 (D-CSUBSET-NORETURN): a descriptor-declared noreturn extern
+                // (stdlib.json's `abort`/`exit`) — externs have no user prototype
+                // to carry `_Noreturn`, so the flag rides the descriptor. A direct
+                // call to one is wrapped at HIR lowering exactly like a user one.
+                rec.isNoreturn = sym.noreturn;
                 SymbolId const id = s.symbols.mint(rec);
                 s.scopes.injectBinding(cuRoot, sym.name, id);
 
@@ -6922,6 +8182,19 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         for (auto const& tree : trees) treeById[tree.id().v] = &tree;
         for (auto const& [survivor, absorbed] : s.mergedFnDecls) {
             if (!survivor.valid() || !absorbed.valid()) continue;
+            // FC16 (D-CSUBSET-NORETURN): OR-merge the noreturn flag across the
+            // proto/def pair BEFORE the type-compat gate below (the flag is
+            // independent of signature compatibility, so it must not be skipped by
+            // the incompatible-redeclaration `continue`). Detection marks whichever
+            // side spelled the attribute (typically the prototype); a call resolves
+            // to the SURVIVOR (definition), so the load-bearing direction is INTO
+            // the survivor. OR-ing BOTH is harmless and covers either merge order.
+            {
+                bool const nr = s.symbols.at(survivor).isNoreturn
+                             || s.symbols.at(absorbed).isNoreturn;
+                s.symbols.at(survivor).isNoreturn = nr;
+                s.symbols.at(absorbed).isNoreturn = nr;
+            }
             auto const& sRec = s.symbols.at(survivor);
             auto const& aRec = s.symbols.at(absorbed);
             if (!sRec.type.valid() || !aRec.type.valid()) continue;
@@ -7000,6 +8273,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::move(s.symbols).release(),
         std::move(s.nodeToSymbol),
         std::move(s.nodeToType),
+        std::move(s.nodeToSelectedExpr),
         std::move(s.reporter),
         std::move(s.usesBySymbol),
         std::move(s.compositeScopeByType),

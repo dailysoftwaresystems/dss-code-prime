@@ -1,10 +1,14 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/object_format_kind.hpp"        // ObjectFormatKind (per-format element core)
 #include "core/types/strong_ids.hpp"
+#include "core/types/type_lattice/core_type.hpp"   // TypeKind (LiteralPrefixEntry.elementCore)
 
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // Per-language CST→HIR lowering config (schema v4 `hirLowering` block; plan 09
@@ -85,6 +89,44 @@ struct DSS_EXPORT ExtensionKindEntry {
     // `::` prefix (e.g. name "TSQL::Select" but lang "TsqlSubset"), so it is NOT
     // derivable from the prefix.
     std::string lang;
+};
+
+// C11/C23 6.4.5 wide/UTF string-literal opener → element core. One row per
+// string-opener token the language admits (the narrow `"`, plus `L"`/`u"`/`U"`/
+// `u8"`). `startToken` is the opener token kind (StringStart / WideStringStart /
+// Utf16StringStart / …); `elementCore` is the TypeKind of ONE code unit of the
+// resulting array (Char for narrow + u8, U16 for `u"`, U32 for `U"`). The engine
+// keys the per-opener element core by the LITERAL's actual opener token, so a
+// prefixed string types as `Array<elementCore, codeUnitCount+1>` and lowers each
+// code point into that element width.
+//
+// `elementCoreByFormat` is the per-object-format OVERRIDE of `elementCore`,
+// mirroring `BuiltinTypeMapping::coreByDataModel` exactly: `elementCore` is the
+// BASE/default, and a key for the ACTIVE format replaces it. This is how `L"…"`
+// (wchar_t) declares its FORMAT-keyed width AS CONFIG DATA (elf/macho→I32, pe→U16 —
+// D-FFI-STDDEF-WCHAR-PE-WIDTH, the SAME per-format axis the shipped stddef.json
+// wchar_t typedef declares via its `when.format` variants), so no engine tier ever
+// hardcodes a `format == …` branch. Empty ⇒ the opener's core is format-invariant
+// (the narrow `"` and the u"/U"/u8" forms). The loader AUTO-SEEDS row 0 from
+// `stringStartToken` (elementCore=Char, no format map) when absent, so a narrow-only
+// schema is byte-identical.
+struct DSS_EXPORT LiteralPrefixEntry {
+    SchemaTokenId startToken{};
+    std::string   startTokenName;   // source-text token name, for diagnostics
+    TypeKind      elementCore = TypeKind::Char;
+    std::unordered_map<ObjectFormatKind, TypeKind> elementCoreByFormat;
+    // The opener's effective element core under the active object format: the
+    // per-format override if declared, else the base `elementCore`. A pure config-
+    // map lookup — NO hardcoded format identity. `nullopt` (direct-API / format-
+    // agnostic caller) falls back to the base `elementCore`.
+    [[nodiscard]] TypeKind resolveElementCore(std::optional<ObjectFormatKind> fmt) const {
+        if (fmt) {
+            if (auto it = elementCoreByFormat.find(*fmt); it != elementCoreByFormat.end()) {
+                return it->second;
+            }
+        }
+        return elementCore;
+    }
 };
 
 // One operator-token → HIR target. Used for the three Pratt wrapper rules
@@ -186,6 +228,29 @@ struct DSS_EXPORT HirLoweringConfig {
     bool stringDoubledDelimiter = false;
     char stringDelimiter = '\0';
 
+    // C11/C23 6.4.5: every string-literal opener the language admits → the
+    // element core of its resulting array (see `LiteralPrefixEntry`). Row 0 is
+    // AUTO-SEEDED from `stringStartToken` (elementCore=Char) by the loader when no
+    // explicit row for it exists, and `unicodeStringStartToken` (SQL N') folds in
+    // as a Char row — so a narrow-only schema is byte-identical. The semantic tier
+    // builds a `startToken → elementCore` map from this to type a prefixed string;
+    // the HIR tier reads the element core back off the semantic-stamped node type.
+    std::vector<LiteralPrefixEntry> stringLiteralPrefixes;
+
+    // C11/C23 6.4.4.4: every CHARACTER-constant opener the language admits → the
+    // element core of its scalar value (see `LiteralPrefixEntry`). Mirrors
+    // `stringLiteralPrefixes`, but a char constant is a SCALAR (not an array): the
+    // narrow `'x'` types as `int` (the language's `literalTypes` CharLiteral core),
+    // and the C23 prefixes give `L'x'`→wchar_t, `u'x'`→char16_t (U16), `U'x'`→
+    // char32_t (U32), `u8'x'`→char8_t (U8). Row 0 (the narrow opener) is AUTO-SEEDED
+    // by the loader from `charStartToken` so a narrow-only schema is byte-identical.
+    // WideCharStart (wchar_t) carries the SAME FORMAT-keyed `elementCoreByFormat`
+    // (pe→U16, elf/macho→I32) as the wide-STRING row — one config axis, resolved by
+    // `resolveElementCore`. The semantic tier keys the WIDE openers only (the narrow
+    // row stays in the flat `literalTypeIds` int path); the HIR tier reads the
+    // resolved core back off the semantic-stamped body token.
+    std::vector<LiteralPrefixEntry> charLiteralPrefixes;
+
     // HR10 — extension kinds + flat-expression + NULL literal (SQL et al.):
     // The extension kinds to register before lowering (so a rule mapped to one
     // builds a HirKind::Extension node).
@@ -245,6 +310,13 @@ struct DSS_EXPORT HirLoweringConfig {
     // language has no `sizeof` surface.
     RuleId      sizeofRule{};          std::string sizeofRuleName;
 
+    // C11/C23 6.5.3.4: the `_Alignof ( type-name )` / `alignof ( type-name )`
+    // operand-alt rule. Routes its CST subtree to `lowerAlignof` (→ core
+    // `HirKind::AlignOf`) — its castTypeRef child carries the semantic-stamped
+    // type whose ALIGNMENT the node folds to (mirroring sizeofRule reading size).
+    // Invalid ⇒ the language has no `_Alignof` surface.
+    RuleId      alignofRule{};         std::string alignofRuleName;
+
     // FC12a-core: the three variadic-intrinsic operand-alt rules. Each routes its
     // CST subtree to its dedicated lowering (`HirKind::VaStart`/`VaArg`/`VaEnd`) —
     // the type child of `va_arg` is recovered from the semantic stamp, NEVER lowered
@@ -253,6 +325,17 @@ struct DSS_EXPORT HirLoweringConfig {
     RuleId      vaStartRule{};         std::string vaStartRuleName;
     RuleId      vaArgRule{};           std::string vaArgRuleName;
     RuleId      vaEndRule{};           std::string vaEndRuleName;
+
+    // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): the `_Generic` generic
+    // selection operand rule (`genericExpr`). A dedicated operand alt (the SizeOf
+    // precedent): the SELECTION is a compile-time decision made in the SEMANTIC
+    // tier (which stamps the winner's result type on the node + records the
+    // winning association's result-expression NodeId in the `nodeToSelectedExpr`
+    // side-table); the CST→HIR lowering (`lowerGeneric`) reads that recorded node
+    // and lowers ONLY that sub-expression (its type + value), discarding the rest
+    // (the non-selected expressions are UNEVALUATED per 6.5.1.1p3). Invalid ⇒ the
+    // language has no generic-selection surface (unset; the dispatch skips it).
+    RuleId      genericRule{};          std::string genericRuleName;
 
     // D-CSUBSET-COMPUTED-GOTO: the GNU `&&label` label-address operand rule
     // (`labelAddressExpr`). A dedicated operand alt (the SizeOf precedent) — its

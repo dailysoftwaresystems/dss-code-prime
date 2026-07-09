@@ -1,0 +1,33 @@
+{
+  "$comment": "FC16 (D-CSUBSET-GENERIC-SELECTION): the C11/C23 6.5.1.1 `default` fallback. pick(x) = _Generic((x), int:1, double:3, default:7); the controlling type `char *` matches no typed association, so `default` is selected -> 7. Exercises the default-only selection path (no typed match) across all four targets under the shipped release pipeline.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 7,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

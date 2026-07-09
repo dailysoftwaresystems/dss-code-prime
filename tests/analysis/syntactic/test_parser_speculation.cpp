@@ -562,10 +562,12 @@ TEST(ParserSpeculation, CSubsetOperandAltBranchesAreInDeclaredOrder) {
         "charLiteralExpr",
         "compoundLiteralExpr",
         "sizeofExpr",            // FC6
+        "alignofType",           // C11/C23 6.5.3.4 (`_Alignof`/`alignof`)
         "labelAddressExpr",      // D-CSUBSET-COMPUTED-GOTO (`&&label`)
         "vaStartExpr",           // FC12a-core (D-FC12A-VARIADIC-CALLEE)
         "vaArgExpr",             // FC12a-core
         "vaEndExpr",             // FC12a-core
+        "genericExpr",           // FC16 (D-CSUBSET-GENERIC-SELECTION, `_Generic`)
         "castExpr",
         "parenExpr",
     };

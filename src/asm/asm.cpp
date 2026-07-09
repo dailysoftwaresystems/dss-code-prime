@@ -803,6 +803,23 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         std::uint32_t const litIdx = mir.globalInitLiteralIndex(gid);
         MirFuncId const    initFn  = mir.globalInitFunc(gid);
 
+        // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): the source-declared
+        // explicit `alignas(N)` alignment (0 = none), threaded onto MirGlobal. A
+        // data section aligns to any power of two ≤ 256 (no slot-width bound the
+        // way a stack local has), so a global alignment may legitimately EXCEED
+        // the type's natural alignment with no gate. `raiseToExplicit` returns the
+        // STRICTER of the type-derived alignment and this override — applied at
+        // every `.alignment =` assignment below (a plain `alignas(32) int g;` is a
+        // SCALAR, so the override must reach the primitive/scalar arms too, not
+        // only the aggregate `lay->align` arms). The frontend already validated
+        // the value (power-of-two, ≤256), so `ofRuntimePow2` is safe.
+        std::uint32_t const explicitAlignBytes = mir.globalAlignmentBytes(gid);
+        auto const raiseToExplicit = [&](Alignment natural) -> Alignment {
+            return (explicitAlignBytes > natural.bytes())
+                       ? Alignment::ofRuntimePow2(explicitAlignBytes)
+                       : natural;
+        };
+
         // Runtime-init globals: their bytes land via the
         // `__module_init__` synthesized function at module-load
         // time. Today this cycle scope produces NO AssembledData
@@ -870,14 +887,19 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // [1,16]); aggregates carry the layout's align. The walker raises
             // the section alignment to cover the strictest item.
             if (auto const pw = primitiveByteSize(zk); pw.has_value()) {
-                z.alignment = Alignment::ofRuntimePow2(
-                    static_cast<std::uint32_t>(*pw));
+                z.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
+                    static_cast<std::uint32_t>(*pw)));
             } else if (aggregateLayout.has_value()) {
                 if (auto const lay = computeLayout(ty, interner, *aggregateLayout,
                                                    dataModel);
                     lay.has_value()) {
-                    z.alignment = lay->align;
+                    z.alignment = raiseToExplicit(lay->align);
                 }
+            } else {
+                // No primitive size, no aggregateLayout to derive from — a global
+                // whose only alignment signal is the explicit override. Honor it
+                // (raiseToExplicit over the byte-aligned default preserves it).
+                z.alignment = raiseToExplicit(z.alignment);
             }
             out.push_back(std::move(z));
             continue;
@@ -938,29 +960,36 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // `arr[0]='J'` must not fault). The former unconditional `.rodata`
             // override here wrongly forced a mutable named array into read-only
             // memory (a SIGSEGV on write) — removed.
+            // The literal `s` already holds the ELEMENT-WIDTH-encoded code units
+            // (narrow `Array<Char,N>` = 1 byte/unit; C11/C23 6.4.5 wide/UTF =
+            // 2/4-byte LE units produced by the HIR wide encoder), so `s.begin()..`
+            // is the exact on-wire byte sequence sans terminator.
             d.bytes.assign(s.begin(), s.end());
-            d.bytes.push_back(0);                 // implicit NUL → s.size()+1 bytes
-            // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): when this
-            // string-literal global is the PRODUCER for a `char[N]` initializer (the
-            // HIR coerce retyped the literal node to `char[N]` with N > s.size()+1),
-            // the global's TYPE is `Array<char,N>` — so MATERIALIZE the trailing
-            // N−(s.size()+1) zero-padding bytes HERE (the Option-A "pad at the
-            // producer" choice). A consumer that copies N bytes (the aggregate-copy
-            // of the field / the array-local init) then reads GUARANTEED zeros, never
-            // an OOB read of adjacent rodata. The ORDINARY string-literal global
-            // (`char *p = "hi";`, a bare decayed `"abc"`) has type `Array<char,M>`
-            // with M == s.size()+1, so the type size equals the byte count already
-            // emitted and this padding is a NO-OP (behaviour unchanged). Only GROW
-            // (never shrink): the type size is N >= s.size()+1 by the coerce/semantic
-            // `N >= M` guards; clamp defensively so a hypothetical smaller type can
-            // never truncate the literal bytes.
+            // c62 (C 6.7.9p14, D-CSUBSET-STRING-LITERAL-ARRAY-ZERO-FILL): the global's
+            // TYPE is `Array<elem,N>` — MATERIALIZE the full N*sizeof(elem) bytes here
+            // (the Option-A "pad at the producer" choice). This subsumes the trailing
+            // NUL: an ordinary literal has N == codeUnits+1, so the padding IS the
+            // element-wide terminator (`u"A"` → Array<U16,2> → 4 bytes: `41 00 00 00`);
+            // a `char[N]`/`wchar_t[N]` initializer (the HIR coerce retyped the literal
+            // to N > codeUnits+1) gets the remaining zero elements too. A consumer that
+            // copies N*sizeof(elem) bytes then reads GUARANTEED zeros, never an OOB read
+            // of adjacent rodata. Only GROW (never shrink): N*sizeof(elem) >= s.size()
+            // by construction; clamp defensively so a smaller type can never truncate.
+            // The byte size is ELEMENT-WIDTH-AWARE — a wide element's size is
+            // count*sizeof(elem), NOT the length scalar (which counts UNITS).
+            std::uint64_t elemBytes = 1;   // narrow default; wide = 2/4 (drives align)
             if (interner.kind(ty) == TypeKind::Array) {
+                if (auto const ops = interner.operands(ty);
+                    !ops.empty() && ops[0].valid()) {
+                    if (auto const eb = scalarByteSize(interner.kind(ops[0]), dataModel);
+                        eb.has_value() && *eb > 0) {
+                        elemBytes = *eb;
+                    }
+                }
                 std::optional<std::uint64_t> typeSize;
                 if (auto const sc = interner.scalars(ty); !sc.empty()) {
-                    // Fast path: char element ⇒ N bytes == the length scalar. Use the
-                    // layout engine when present for a non-trivial element (agnostic
-                    // total size), but a char[N] string global is the only shape that
-                    // reaches here, so the scalar is exact.
+                    // The layout engine (when present) computes the agnostic total
+                    // size (count * element stride) for any element width.
                     if (aggregateLayout.has_value()) {
                         if (auto const lay = computeLayout(ty, interner,
                                                            *aggregateLayout, dataModel);
@@ -968,13 +997,26 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                             typeSize = lay->size;
                         }
                     }
+                    // Fallback (no aggregateLayout): count * element byte width. For a
+                    // narrow `Array<Char,N>` the element is 1 byte so this is N (the
+                    // pre-wide behavior); for a wide element it is N*sizeof(elem).
                     if (!typeSize.has_value())
-                        typeSize = static_cast<std::uint64_t>(sc[0]);
+                        typeSize = static_cast<std::uint64_t>(sc[0]) * elemBytes;
                 }
+                // No terminator was appended above — the resize-to-typeSize IS the
+                // terminator (and any char[N] padding). A non-array string literal
+                // (should not occur; strings are always Array-typed) would fall
+                // through with exactly `s` bytes; guard by appending one NUL only in
+                // that defensive case so a bare string is still terminated.
                 if (typeSize.has_value() && *typeSize > d.bytes.size())
                     d.bytes.resize(static_cast<std::size_t>(*typeSize), 0u);
+            } else {
+                d.bytes.push_back(0);   // defensive: non-array string literal (unexpected)
             }
-            d.alignment = Alignment::of<1>();
+            // Align to the element width (narrow=1 → byte-aligned as before; wide
+            // U16=2 / U32=4) so a `(unsigned short*)u"…"` read is naturally aligned
+            // — matters on strict-alignment targets (arm64).
+            d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(elemBytes));
             out.push_back(std::move(d));
             continue;
         }
@@ -1012,7 +1054,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // agnostic root-cause placement, not a per-format special case.
             d.section = DataSectionKind::Data;
             d.bytes.assign(8, 0);                       // pointer-width zero slot
-            d.alignment = Alignment::ofRuntimePow2(8);
+            d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(8));
             d.relocations.push_back(Relocation{
                 /*offset=*/0u,
                 /*target=*/SymbolId{sa.symbol},
@@ -1083,7 +1125,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // merely tolerate rodata). A reloc-free const aggregate keeps the
             // section chosen above (.rodata for a const global).
             if (!d.relocations.empty()) d.section = DataSectionKind::Data;
-            d.alignment = lay->align;
+            d.alignment = raiseToExplicit(lay->align);
             out.push_back(std::move(d));
             continue;
         }
@@ -1151,8 +1193,8 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // audit fold 2026-06-02 — dead `K_NoMatchingObjectFormat`
         // arm removed; the wrong-domain diagnostic that arm would
         // emit was a future-reader trap).
-        d.alignment = Alignment::ofRuntimePow2(
-            static_cast<std::uint32_t>(*widthOpt));
+        d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(
+            static_cast<std::uint32_t>(*widthOpt)));
         out.push_back(std::move(d));
     }
 

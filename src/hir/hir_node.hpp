@@ -73,7 +73,13 @@ enum class HirKind : std::uint16_t {
     BuiltinCall,
     BinaryOp, UnaryOp, Cast, MemberAccess,
     Index, Swizzle, ConstructAggregate, Ternary, LogicalAnd, LogicalOr,
-    SizeOf, AddressOf, Deref, SeqExpr,
+    SizeOf,
+    // ── C11/C23 6.5.3.4 `_Alignof`/`alignof` — an ADDITIVE node MIRRORING
+    //    SizeOf: carries the queried type on a [TypeRef] child it NEVER
+    //    value-lowers, and folds to that type's ALIGNMENT (vs SizeOf's byte
+    //    size), result type size_t (U64). Type-name form only (no value form).
+    AlignOf,
+    AddressOf, Deref, SeqExpr,
     // ── GNU label-address (D-CSUBSET-COMPUTED-GOTO): `&&label` yields a `void*`
     //    holding a basic block's runtime address. A LEAF expression node whose
     //    payload is the target label's per-function ordinal (same namespace as
@@ -137,6 +143,7 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
         case HirKind::Cast: case HirKind::MemberAccess: case HirKind::Index:
         case HirKind::Swizzle: case HirKind::ConstructAggregate: case HirKind::Ternary:
         case HirKind::LogicalAnd: case HirKind::LogicalOr: case HirKind::SizeOf:
+        case HirKind::AlignOf:
         case HirKind::AddressOf: case HirKind::Deref: case HirKind::SeqExpr:
         // D-CSUBSET-COMPUTED-GOTO: `&&label` is an expression yielding `void*`.
         case HirKind::LabelAddressOf:
@@ -252,7 +259,8 @@ struct ChildArity {
         case HirKind::BuiltinCall:        return {0, kUnboundedArity};  // c103: [args...]
         case HirKind::ConstructAggregate: return {0, kUnboundedArity};  // [fields...]
         case HirKind::UnaryOp: case HirKind::Cast: case HirKind::MemberAccess:
-        case HirKind::Swizzle: case HirKind::SizeOf: case HirKind::AddressOf:
+        case HirKind::Swizzle: case HirKind::SizeOf: case HirKind::AlignOf:
+        case HirKind::AddressOf:
         case HirKind::Deref:
         // FC12a-core: VaStart/VaEnd = [apExpr] — one child (the va_list lvalue).
         case HirKind::VaStart: case HirKind::VaEnd:

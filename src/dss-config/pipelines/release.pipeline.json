@@ -4,7 +4,8 @@
         "name": "release",
         "passes": ["Identity", "Inlining", "ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"],
         "maxIterations": 4,
-        "inlineThreshold": 50
+        "inlineThreshold": 50,
+        "verifyEveryPass": false
     }
 }
 

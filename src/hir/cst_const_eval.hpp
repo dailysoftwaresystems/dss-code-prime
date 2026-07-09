@@ -85,6 +85,19 @@ using CstSymbolInitResolver =
 using CstSizeofResolver =
     std::function<std::optional<std::uint64_t>(NodeId)>;
 
+// C11/C23 6.5.3.4: AlignOf-folding resolver for a const-expr context (an array
+// dimension `int a[_Alignof(T)]`, a `_Static_assert(_Alignof(T)==N,...)`). Given
+// the `alignofRule` CST node, return its type's ALIGNMENT, or `nullopt` when
+// un-alignable / the target declared no layout params. An ADDITIVE mirror of
+// CstSizeofResolver — same shape, reads alignment instead of size. The closure
+// (supplied by the semantic engine) owns the type resolver + the target's layout
+// params, kept OUT of this CST engine. Absent closure ⇒ AlignOf is non-constant.
+// The engine dispatches it by rule-id BEFORE the wrapper-peel (the alignof node's
+// single meaningful child is its castTypeRef, which the peel would otherwise
+// descend into and reject).
+using CstAlignofResolver =
+    std::function<std::optional<std::uint64_t>(NodeId)>;
+
 // Item 1 (shipped-header constants / enum array-dim): DIRECT-VALUE resolver for
 // a named INTEGER CONSTANT whose value is carried inline on its symbol rather
 // than in a defining init-expression CST — an enum enumerator or a shipped-
@@ -130,6 +143,7 @@ struct CstEvalEnvironment {
     CstSymbolInitResolver  resolveSymbolInit{};
     CstSymbolValueResolver resolveSymbolValue{};  // Item 1 — direct inline constant value
     CstSizeofResolver      resolveSizeof{};   // FC6 — sizeof in a const-expr context
+    CstAlignofResolver     resolveAlignof{};  // 6.5.3.4 — _Alignof in a const-expr context
     CstCastTargetResolver  resolveCastTarget{};   // c43 — (T*)0 / (char*)x / (size_t)int
     CstFieldOffsetResolver resolveFieldOffset{};  // c43 — &((T*)0)->M offsets
 };

@@ -62,3 +62,8 @@ dss_add_test(NAME core/test_aggregate_abi              SOURCES test_aggregate_ab
 # asserts dss's computeLayout (host-ABI strategy) is byte-identical. Skips when no
 # toolchain. (The macOS leg is the only runtime witness for Apple-arm64.)
 dss_add_test(NAME core/test_bitfield_abi_conformance   SOURCES test_bitfield_abi_conformance.cpp)
+# D-CSUBSET-PACKED: the packed-struct cross-compile-COMPARE witness — builds the
+# packed battery with the host's NATIVE C compiler (cl.exe `#pragma pack(1)` /
+# gcc/clang `__attribute__((packed))`) and asserts dss's computeLayout(packed) is
+# byte-identical (sizeof + per-field offsetof). Skips when no toolchain.
+dss_add_test(NAME core/test_packed_abi_conformance     SOURCES test_packed_abi_conformance.cpp)

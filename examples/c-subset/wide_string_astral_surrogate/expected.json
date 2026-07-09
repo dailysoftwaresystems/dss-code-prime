@@ -1,0 +1,43 @@
+{
+  "$comment": "C11/C23 6.4.5 (Cycle C) surrogate-pair witness: the RAW astral u\"😀\" (U+1F600, bytes F0 9F 98 80) under char16_t now encodes as the UTF-16 surrogate pair 0xD83D 0xDE00 (was H_WideCharSurrogateUnsupported before this cycle). p[0]==0xD83D && p[1]==0xDE00 && p[2]==0 ? 42 : 1. Red-on-disable: revert the encodeCodepoint U16 astral branch and this stops compiling. Runs on all 4 targets + the release arm.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": [
+        "windows"
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": [
+        "darwin"
+      ]
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

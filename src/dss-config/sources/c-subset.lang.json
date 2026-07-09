@@ -160,8 +160,56 @@
       "modeOp": "pushMode", "modeArg": "string",
       "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "\"" }
     }],
+    "L\"": [{
+      "$comment": "C11/C23 6.4.5 wide string `L\"…\"`. A multi-char lexeme so the tokenizer's longestMatchInMode beats the bare `L` identifier run; pushes the SAME shared `string` mode as `\"` (one coalesced StringLiteral body). Its element core (wchar_t) is FORMAT-keyed in semantic (D-FFI-STDDEF-WCHAR-PE-WIDTH), so hirLowering.stringLiteralPrefixes carries only a placeholder for it.",
+      "kind": "WideStringStart",
+      "modeOp": "pushMode", "modeArg": "string",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "\"" }
+    }],
+    "u\"": [{
+      "$comment": "C11/C23 6.4.5 char16_t string `u\"…\"` → UTF-16 code units (U16). Same shared `string` mode as `\"`; longestMatchInMode makes `u\"` beat the `u` id-run.",
+      "kind": "Utf16StringStart",
+      "modeOp": "pushMode", "modeArg": "string",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "\"" }
+    }],
+    "U\"": [{
+      "$comment": "C11/C23 6.4.5 char32_t string `U\"…\"` → UTF-32 code units (U32). Same shared `string` mode as `\"`.",
+      "kind": "Utf32StringStart",
+      "modeOp": "pushMode", "modeArg": "string",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "\"" }
+    }],
+    "u8\"": [{
+      "$comment": "C11/C23 6.4.5 UTF-8 string `u8\"…\"` → UTF-8 bytes (char8_t=Char-width). longestMatchInMode makes `u8\"` (3 bytes) beat both the `u8` id-run and the `u\"` opener. Same shared `string` mode as `\"`.",
+      "kind": "Utf8StringStart",
+      "modeOp": "pushMode", "modeArg": "string",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "\"" }
+    }],
     "'": [{
       "kind": "CharStart",
+      "modeOp": "pushMode", "modeArg": "charBody",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "'" }
+    }],
+    "L'": [{
+      "$comment": "C11/C23 6.4.4.4 wide char constant `L'x'` (wchar_t). A multi-char lexeme so the tokenizer's longestMatchInMode beats the bare `L` identifier run; pushes the SAME shared `charBody` mode as `'` (one coalesced CharLiteral body). Its element core (wchar_t) is FORMAT-keyed in semantic (D-FFI-STDDEF-WCHAR-PE-WIDTH), mirroring the wide-STRING `L\"` opener.",
+      "kind": "WideCharStart",
+      "modeOp": "pushMode", "modeArg": "charBody",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "'" }
+    }],
+    "u'": [{
+      "$comment": "C11/C23 6.4.4.4 char16_t constant `u'x'` → one UTF-16 code unit (U16). Same shared `charBody` mode as `'`; longestMatchInMode makes `u'` beat the `u` id-run.",
+      "kind": "Utf16CharStart",
+      "modeOp": "pushMode", "modeArg": "charBody",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "'" }
+    }],
+    "U'": [{
+      "$comment": "C11/C23 6.4.4.4 char32_t constant `U'x'` → one UTF-32 code unit (U32). Same shared `charBody` mode as `'`.",
+      "kind": "Utf32CharStart",
+      "modeOp": "pushMode", "modeArg": "charBody",
+      "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "'" }
+    }],
+    "u8'": [{
+      "$comment": "C23 6.4.4.4 char8_t constant `u8'x'` → one UTF-8 code unit (U8, must be ≤ U+007F). longestMatchInMode makes `u8'` (3 bytes) beat both the `u8` id-run and the `u'` opener. Same shared `charBody` mode as `'`.",
+      "kind": "Utf8CharStart",
       "modeOp": "pushMode", "modeArg": "charBody",
       "stringStyle": { "escapeKind": "char", "escapeChar": "\\", "endsAt": "'" }
     }],
@@ -284,6 +332,7 @@
     { "word": "restrict", "kind": "RestrictKeyword" },
     { "word": "register", "kind": "RegisterKeyword" },
     { "word": "auto",     "kind": "AutoKeyword"     },
+    { "word": "_Noreturn", "kind": "NoreturnKeyword" },
     { "word": "typedef", "kind": "TypedefKeyword" },
     { "word": "struct",  "kind": "StructKeyword"  },
     { "word": "union",   "kind": "UnionKeyword"   },
@@ -302,10 +351,19 @@
     { "word": "continue", "kind": "ContinueKeyword" },
     { "word": "goto",     "kind": "GotoKeyword"     },
     { "word": "sizeof",   "kind": "SizeofKeyword"   },
+    { "word": "_Alignof", "kind": "AlignofKeyword"       },
+    { "word": "alignof",  "kind": "AlignofLegacyKeyword" },
+    { "word": "_Alignas", "kind": "AlignasKeyword"       },
+    { "word": "alignas",  "kind": "AlignasLegacyKeyword" },
+
+    { "word": "_Static_assert", "kind": "StaticAssertKeyword"       },
+    { "word": "static_assert",  "kind": "StaticAssertLegacyKeyword" },
 
     { "word": "va_start", "kind": "VaStartKeyword" },
     { "word": "va_arg",   "kind": "VaArgKeyword"   },
     { "word": "va_end",   "kind": "VaEndKeyword"   },
+
+    { "word": "_Generic", "kind": "GenericKeyword" },
 
     { "word": "extern",  "kind": "ExternKeyword"  },
 
@@ -326,15 +384,21 @@
       "alt": [
         "includeDirective",
         "typedefDecl",
+        "staticAssertDecl",
         "topLevelDecl",
         "externDecl",
         "emptyStmt"
       ]
     },
 
+    "structMemberDeclSpecifiers": {
+      "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the OPTIONAL leading alignment-specifier prefix of a struct/union member — one or more `alignasSpec` (`alignas(16) int a;`; C permits several, the strictest wins). A SEQUENCE (first + `{repeat}`) so its tree node is `structMemberDeclSpecifiers`, matched by the DeclarationRule `specifierPrefix` on structField/unionField and STRIPPED by decl_prefix_strip.hpp before positional-child counting — so structField's `head:0, declaratorList:1` indices stay stable whether or not a member carries alignas. FIRST = {AlignasKeyword, AlignasLegacyKeyword}, disjoint from `typeRefAllowingStruct`'s FIRST, so the enclosing `{optional}` is predictively decidable (non-speculative).",
+      "sequence": [ "alignasSpec", { "repeat": "alignasSpec" } ]
+    },
     "structField": {
-      "$comment": "c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR: a struct/union field is a type-specifier HEAD + an OPTIONAL `structMemberDeclaratorList` (a comma-separated list of per-slot declarators sharing the head base type, e.g. `int *a, b[4], *c;` — C 6.7.2.1) + `EndStatement`. SUPERSEDES c10's single `{optional declarator}{optional bitfieldDeclSuffix}`: each slot (`structMemberDeclarator`) now holds its OWN `declarator` AND its OWN `bitfieldDeclSuffix` so `int a:3, b:5;` resolves each width per-slot. Routing the member through the SAME `declarator` every other position uses (params/locals/globals) makes a function-pointer member (`int (*f)(int);`) parse + type-derive identically; the array suffix (`int arr[3];`) lives inside the declarator's OWN directDeclarator suffix chain. The LIST is OPTIONAL to admit the `int ;` declares-nothing form; a single-slot list with absent declarator + present suffix is the anonymous bit-field (`int : 3;` / zero-width `int : 0;`); the over-admitted nameless non-bitfield forms FAIL LOUD at semantic composition (anonymous member must be a bit-field).",
+      "$comment": "c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR: a struct/union field is a type-specifier HEAD + an OPTIONAL `structMemberDeclaratorList` (a comma-separated list of per-slot declarators sharing the head base type, e.g. `int *a, b[4], *c;` — C 6.7.2.1) + `EndStatement`. SUPERSEDES c10's single `{optional declarator}{optional bitfieldDeclSuffix}`: each slot (`structMemberDeclarator`) now holds its OWN `declarator` AND its OWN `bitfieldDeclSuffix` so `int a:3, b:5;` resolves each width per-slot. Routing the member through the SAME `declarator` every other position uses (params/locals/globals) makes a function-pointer member (`int (*f)(int);`) parse + type-derive identically; the array suffix (`int arr[3];`) lives inside the declarator's OWN directDeclarator suffix chain. The LIST is OPTIONAL to admit the `int ;` declares-nothing form; a single-slot list with absent declarator + present suffix is the anonymous bit-field (`int : 3;` / zero-width `int : 0;`); the over-admitted nameless non-bitfield forms FAIL LOUD at semantic composition (anonymous member must be a bit-field). C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an OPTIONAL leading `structMemberDeclSpecifiers` (`alignas(N) …`) precedes the head — declared as the `specifierPrefix` (below) so it is stripped before the head:0/declaratorList:1 count.",
       "sequence": [
+        { "optional": "structMemberDeclSpecifiers" },
         "typeRefAllowingStruct",
         { "optional": "structMemberDeclaratorList" },
         "EndStatement"
@@ -370,7 +434,8 @@
     "structSpec": {
       "$comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the UNIFIED struct specifier (C 6.7.2.1 struct-or-union-specifier) — `struct {opt tag} {opt body}`. ONE rule for BOTH the type-DEFINITION form (`struct P { … }` — a `structBody` child is present) and the bare tag-REFERENCE form (`struct P` — absent). Replaces the former `structSpecifierBody | structTypeRef` SPECULATIVE pair in the 4 body-bearing declaration-head alts (topLevelCompositeSpec, typeSpecifierForDecl, typedefHead, typeBaseAllowingStruct). Because it is now the SOLE candidate keyed on StructKeyword in those alts, the parser's LL(k) unique-production DIRECT DESCENT (parser.cpp ~1804-1844) dispatches it NON-speculatively — the member list parses with NO speculation budget, so an arbitrarily large body (`struct sqlite3`) never trips the 4096-token probe cliff. The body-vs-ref split becomes an INTERNAL 1-token (`BlockOpen`) decision via the `{optional structBody}`, also non-speculative. The binder is DUAL-MODE on the SAME node (semantics: `definesWhenChild: structBody`): body present ⇒ the EXACT former `structSpecifierBody` define path (mint type, bind tag, open scope, compose fields from the `structBody` subtree); body absent ⇒ the EXACT former `structTypeRef` tag-reference path (isTagReference). FOLLOW-independent (the rejected D2): no prune of the ref candidate is needed because there IS no separate ref candidate here.",
       "sequence": [
-        "StructKeyword", { "optional": "Identifier" }, { "optional": "structBody" }
+        "StructKeyword", { "optional": "Identifier" }, { "optional": "structBody" },
+        { "optional": "compositeAttrList" }
       ]
     },
 
@@ -382,8 +447,9 @@
     },
 
     "unionField": {
-      "$comment": "c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR: a union field mirrors `structField` — a type-specifier HEAD + an OPTIONAL `structMemberDeclaratorList` (per-slot declarators sharing the head, e.g. `int *a, b;`) + `EndStatement`. The per-slot `structMemberDeclarator` holds its own declarator (function-pointer-member support: `int (*f)(int);`) AND its own bitfield suffix. The array suffix lives inside the declarator's directDeclarator suffix chain.",
+      "$comment": "c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR: a union field mirrors `structField` — a type-specifier HEAD + an OPTIONAL `structMemberDeclaratorList` (per-slot declarators sharing the head, e.g. `int *a, b;`) + `EndStatement`. The per-slot `structMemberDeclarator` holds its own declarator (function-pointer-member support: `int (*f)(int);`) AND its own bitfield suffix. The array suffix lives inside the declarator's directDeclarator suffix chain. C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an OPTIONAL leading `structMemberDeclSpecifiers` (`alignas(N) …`) precedes the head — the shared member-specifier prefix (same rule + `specifierPrefix` strip as structField).",
       "sequence": [
+        { "optional": "structMemberDeclSpecifiers" },
         "typeRefAllowingStruct",
         { "optional": "structMemberDeclaratorList" },
         "EndStatement"
@@ -398,7 +464,8 @@
     "unionSpec": {
       "$comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the UNIFIED union specifier — `union {opt tag} {opt body}`. Mirrors `structSpec`: ONE rule for define (`union U { … }`) and reference (`union U`), the SOLE UnionKeyword candidate in the 4 body-bearing alts → non-speculative direct descent (no member-body probe budget). Dual-mode binder via `definesWhenChild: unionBody`.",
       "sequence": [
-        "UnionKeyword", { "optional": "Identifier" }, { "optional": "unionBody" }
+        "UnionKeyword", { "optional": "Identifier" }, { "optional": "unionBody" },
+        { "optional": "compositeAttrList" }
       ]
     },
 
@@ -479,7 +546,8 @@
       "sequence": [ "singleDeclSpecifier", { "repeat": "singleDeclSpecifier" } ]
     },
     "singleDeclSpecifier": {
-      "alt": [ "StaticKeyword", "attrSpec", "stdAttr" ]
+      "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): `alignasSpec` (`_Alignas`/`alignas`) joins the top-level declaration-specifier alts. Its FIRST = {AlignasKeyword, AlignasLegacyKeyword} is DISJOINT from StaticKeyword / attrSpec's AttributeKeyword / stdAttr's BracketOpen, so the repeat stays predictively pruned (non-speculative). It is stripped from the positional-child count (specifierPrefix: declSpecifiers on topLevelDecl) and IGNORED by the linkage scan (linkageSpecifierIgnoredRules). FC16 (D-CSUBSET-NORETURN): the bare `_Noreturn` keyword (NoreturnKeyword) likewise joins the alts — FIRST {NoreturnKeyword} disjoint from all the above, so no speculation impact; it is stripped from the child count and IGNORED by the linkage scan (linkageSpecifierIgnoredKinds); the SEMANTIC noreturn scan reads it. The attribute forms (`[[noreturn]]`/`__attribute__((noreturn))`) ride the existing attrSpec/stdAttr alts.",
+      "alt": [ "StaticKeyword", "NoreturnKeyword", "alignasSpec", "attrSpec", "stdAttr" ]
     },
     "attrSpec": {
       "$comment": "FC4 c1: the argument grew the parenthesized-string form `visibility(\"hidden\")` — an Identifier optionally followed by `( string-literal )`. The inline sequences add NO wrapper nodes, so the bare `weak`/`static` tree shapes are byte-identical to pre-FC4. linkageFrom's composite-key lookup (`visibility:hidden`) pairs the identifier with the decoded string body.",
@@ -507,6 +575,15 @@
         { "optional": { "sequence": [ "ColonColonOp", "Identifier" ] } },
         { "optional": { "sequence": [ "ParenOpen", { "optional": "stringLiteralExpr" }, "ParenClose" ] } }
       ]
+    },
+
+    "compositeAttr": {
+      "$comment": "FC16 (D-CSUBSET-PACKED): ONE composite type-attribute — a GNU `__attribute__((…))` (`attrSpec`) or a C23 `[[…]]` (`stdAttr`), REUSING the existing attribute rules. The trailing struct/union attribute list (`compositeAttrList`) is a repeat of this.",
+      "alt": [ "attrSpec", "stdAttr" ]
+    },
+    "compositeAttrList": {
+      "$comment": "FC16 (D-CSUBSET-PACKED): the trailing composite-attribute list after a struct/union body — one or more `compositeAttr` (`struct S {…} __attribute__((packed))` / `[[gnu::packed]]`). Referenced as a TRAILING `{optional}` on structSpec/unionSpec (after `structBody`, so it never shifts the tag's positional index `name:1`). The semantic tier scans this node (semantics.packed.listRule) for a `packed` spelling. The after-KEYWORD position (`struct __attribute__((packed)) S`) is a SEPARATE deferred slot (D-CSUBSET-PACKED-AFTER-KEYWORD-POSITION) — it stays a parse error (fail-loud), never a silent drop.",
+      "sequence": [ "compositeAttr", { "repeat": "compositeAttr" } ]
     },
 
     "headQualifier": { "alt": [ "ConstKeyword", "VolatileKeyword" ] },
@@ -760,8 +837,8 @@
       "sequence": [ "localDeclSpecifier", { "repeat": "localDeclSpecifier" } ]
     },
     "localDeclSpecifier": {
-      "$comment": "Local storage-class specifiers + attributes. `static` (D-CSUBSET-LOCAL-STATIC) confers STATIC storage duration (C 6.2.4) — the varDecl row's linkageSpecifiers maps it to {binding:local, staticStorage:true} and CST→HIR routes the declaration to a hidden module-global; register/auto parse and are semantically inert (C: hints/default storage). `static` in a for-init is a C 6.8.5p3 violation, gated loud by the forDecl row.",
-      "alt": [ "StaticKeyword", "RegisterKeyword", "AutoKeyword", "attrSpec", "stdAttr" ]
+      "$comment": "Local storage-class specifiers + attributes. `static` (D-CSUBSET-LOCAL-STATIC) confers STATIC storage duration (C 6.2.4) — the varDecl row's linkageSpecifiers maps it to {binding:local, staticStorage:true} and CST→HIR routes the declaration to a hidden module-global; register/auto parse and are semantically inert (C: hints/default storage). `static` in a for-init is a C 6.8.5p3 violation, gated loud by the forDecl row. C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): `alignasSpec` joins the local-specifier alts too (a block-scope `alignas(16) int x;` is legal C) — FIRST {AlignasKeyword, AlignasLegacyKeyword} disjoint from the others, so the repeat stays predictively pruned; stripped from the child count (specifierPrefix: localDeclSpecifiers on varDecl) and ignored by the linkage scan.",
+      "alt": [ "StaticKeyword", "RegisterKeyword", "AutoKeyword", "NoreturnKeyword", "alignasSpec", "attrSpec", "stdAttr" ]
     },
 
     "paramList": {
@@ -805,6 +882,7 @@
       "alt": [
         "varDecl",
         "typedefDecl",
+        "staticAssertDecl",
         "block",
         "ifStmt",
         "whileStmt",
@@ -987,10 +1065,12 @@
         "charLiteralExpr",
         "compoundLiteralExpr",
         "sizeofExpr",
+        "alignofType",
         "labelAddressExpr",
         "vaStartExpr",
         "vaArgExpr",
         "vaEndExpr",
+        "genericExpr",
         "castExpr",
         "parenExpr"
       ],
@@ -1025,6 +1105,33 @@
       "sequence": [ "SizeofKeyword", "castOperand" ]
     },
 
+    "alignofType": {
+      "$comment": "C11/C23 6.5.3.4: `_Alignof ( type-name )` / `alignof ( type-name )`. TYPE-NAME FORM ONLY — unlike sizeof there is NO value form (`_Alignof(expr)` is a constraint violation, caught by the type-binder). Reuses FC2's shared castTypeRef + commitRequiresTypeName binder triage (so `_Alignof(int)` / `_Alignof(struct S)` commit the parens as a type; a non-type name fails loud at type-resolve, never silently treated as a value). Single form → NO speculative/lookahead. Result type is size_t (U64); folds to the type's alignment via the type_layout engine, exactly like sizeof reads size.",
+      "sequence": [
+        { "alt": [ "AlignofKeyword", "AlignofLegacyKeyword" ] },
+        "ParenOpen", "castTypeRef", "ParenClose"
+      ],
+      "commitRequiresTypeName": "castTypeRef"
+    },
+
+    "alignasSpec": {
+      "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the `_Alignas ( … )` / `alignas ( … )` alignment SPECIFIER — a DECLARATION-SPECIFIER (NOT an expression operand), so it is a SEQUENCE (its tree node is `alignasSpec`, which the specifier-prefix mechanism matches in singleDeclSpecifier/localDeclSpecifier/structMemberDeclSpecifiers). Two spellings: the reserved `_Alignas` (AlignasKeyword) and the C23 `alignas` (AlignasLegacyKeyword). The parenthesized operand is `alignasArg` — EITHER a type-name (`alignas(int)` contributes _Alignof(int)) OR a constant-expression (`alignas(16)`). SEMANTICS live in the semantic tier (semantics.alignas): the value/type is computed + validated (power-of-two, ≤256, ≥ the declared type's natural alignment) + STORED on the SymbolRecord (variables) / fed into the struct's fieldAligns (members). The specifier is STRIPPED before positional-child counting (decl_prefix_strip.hpp) so name/type indices stay stable, and IGNORED by the linkage scan (linkageSpecifierIgnoredRules) — exactly like `__attribute__`.",
+      "sequence": [
+        { "alt": [ "AlignasKeyword", "AlignasLegacyKeyword" ] },
+        "ParenOpen", "alignasArg", "ParenClose"
+      ]
+    },
+    "alignasArg": {
+      "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the operand of an `alignas` specifier — the TYPE form (`alignasTypeName`, e.g. `alignas(int)` / `alignas(struct S)`) OR the VALUE form (a constant-expression, `assignmentExpr` — the SAME comma-free const-expr rule staticAssertDecl's condition + a bit-field width + an array dimension use, so `alignas(16)` / `alignas(2*8)` / `alignas(ENUM_VAL)` all fold). SPECULATIVE, with the type branch carrying the `commitRequiresTypeName` binder triage: the operand position is genuinely type-vs-value AMBIGUOUS (`alignas(int)` type vs `alignas(ENUM_VAL)` value). The guard lives on the `alignasTypeName` BRANCH (not on this alt) — the parser's triage is keyed off the PROBED branch rule, exactly like `operand`'s `castExpr` branch. The semantic tier discriminates the committed reading by the child rule (alignasTypeName ⇒ type form → _Alignof(T); else value form → const-eval).",
+      "alt": [ "alignasTypeName", "assignmentExpr" ],
+      "speculative": true, "lookahead": 64
+    },
+    "alignasTypeName": {
+      "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the TYPE-form branch of an `alignas` operand — a lone `castTypeRef` wrapped in a SEQUENCE so it can carry `commitRequiresTypeName` (the guard must sit on the speculative BRANCH the parser probes; a bare `castTypeRef` alt-branch would be probed as `castTypeRef` and `typeNameCommitRule(castTypeRef)` is not set → the guard would never fire). POLARITY = `requireKnownType` (NOT the PreferType default): a bare identifier commits the TYPE reading ONLY when it is a KNOWN typedef-name (sketch/oracle Type); an ENUM CONSTANT or any non-type identifier (sketch Unknown) rolls back to the VALUE reading and const-folds — the C 6.7.6.3p11-style disambiguation. Under PreferType a bare enum-constant `alignas(AL)` would wrongly commit as a type (no follower operator) → a spurious S_AlignasNonConstant. A keyword-led type (`alignas(int)`) still commits (triage rule 1).",
+      "sequence": [ "castTypeRef" ],
+      "commitRequiresTypeName": { "rule": "castTypeRef", "polarity": "requireKnownType" }
+    },
+
     "labelAddressExpr": {
       "$comment": "D-CSUBSET-COMPUTED-GOTO: the GNU `&&label` label-address expression. A DEDICATED operand rule (parallel to sizeofExpr) — NOT the prec-90 prefix `&` doubled — because its operand is a LABEL name in the label namespace, NOT a value: routing it through the ordinary identifier-operand path would resolve `label` as an (undefined) variable and fail to parse. The `Identifier` here is a RAW token (like labelStmt's), recovered by the CST→HIR lowering which resolves it to the label's per-function ordinal and stamps the result `void*`. The leading `&&` is the single AndAndOp token (no lexer change).",
       "sequence": [ "AndAndOp", "Identifier" ]
@@ -1045,6 +1152,37 @@
     "vaEndExpr": {
       "$comment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): `va_end(ap)`. Takes the `va_list` lvalue; a no-op teardown in the SysV model.",
       "sequence": [ "VaEndKeyword", "ParenOpen", "assignmentExpr", "ParenClose" ]
+    },
+
+    "genericExpr": {
+      "$comment": "FC16 (D-CSUBSET-GENERIC-SELECTION): C11/C23 6.5.1.1 `_Generic ( controlling-expression , generic-assoc-list )` — a PRIMARY EXPRESSION whose value+type IS the selected association's expression. A leaf in the operand alternative list (parallel to vaArgExpr). The controlling expression is `assignmentExpr` (comma-free — a `,` here separates associations, so the comma-operator form must not swallow it, exactly like vaArgExpr's ap arg). The assoc-list is a NON-EMPTY comma-separated list of `type-name : assignment-expression` (genericAssoc) or `default : assignment-expression` (genericDefaultAssoc); the list shape (first + `{repeat {, item}}`) mirrors initDeclaratorList. Each genericAssoc's type position is `castTypeRef` + the SAME `commitRequiresTypeName` binder triage va_arg/casts use, so `int:`/`MyTypedef:` commit as a TYPE and a VALUE in type position fails loud at the type-resolve (S_UnknownType). SELECTION is compile-time in the SEMANTIC tier (semantics.generic): the controlling expr's type (after lvalue conversion — top-level volatile stripped) is matched against each association's resolved type for COMPATIBILITY (interned TypeId equality); EXACTLY ONE must match, else the `default` — a no-match-no-default is S_GenericSelectionNoMatch and >1 match is S_GenericSelectionAmbiguous (both unsuppressable constraint violations). Pass 2 stamps the genericExpr node with the WINNER's result type + records the winning association's expression node; the dedicated HIR lowering (hirLowering.genericRule → lowerGeneric) lowers ONLY that sub-expression (its type + value), discarding the rest (the non-selected expressions are UNEVALUATED per 6.5.1.1p3, imposing no constraints beyond being syntactically valid).",
+      "sequence": [
+        "GenericKeyword", "ParenOpen", "assignmentExpr",
+        "Comma", "genericAssoc",
+        { "repeat": { "sequence": [ "Comma", "genericAssoc" ] } },
+        "ParenClose"
+      ]
+    },
+    "genericAssoc": {
+      "$comment": "FC16 (D-CSUBSET-GENERIC-SELECTION): ONE `type-name : assignment-expression` OR `default : assignment-expression` association of a `_Generic`. The `default` form is a distinct alt (genericDefaultAssoc) so the DefaultKeyword lead is unambiguous; otherwise the type position is `castTypeRef` (typedef-admitting, with the shared `commitRequiresTypeName` triage — a value in type position fails loud). The two alts share the `: assignmentExpr` tail shape; the semantic tier discriminates default-vs-typed by the DefaultKeyword child.",
+      "alt": [ "genericDefaultAssoc", "genericTypedAssoc" ]
+    },
+    "genericTypedAssoc": {
+      "sequence": [ "castTypeRef", "Colon", "assignmentExpr" ],
+      "commitRequiresTypeName": "castTypeRef"
+    },
+    "genericDefaultAssoc": {
+      "sequence": [ "DefaultKeyword", "Colon", "assignmentExpr" ]
+    },
+
+    "staticAssertDecl": {
+      "$comment": "C11/C23 6.7.10 `_Static_assert(constant-expression, string-literal);` and the C23 1-arg `_Static_assert(constant-expression);` — a static-assertion DECLARATION valid at BOTH file scope (topLevel alt) AND block scope (statement alt). Two spellings: the reserved `_Static_assert` and the C23 `static_assert` (both keywords). The condition is `assignmentExpr` (comma-free — a `,` here separates the optional message, so the comma-operator form must not swallow it, exactly like vaStartExpr's ap arg). The message is an OPTIONAL adjacent-string-concat literal (the vaStartExpr optional-second-arg pattern; ABSENT = the C23 1-arg form). SEMANTICS live in the semantic tier (semantics.staticAssertRule): the condition is const-evaluated by the SAME evaluator that folds `sizeof(T)`/enum/arithmetic in an array dimension — ZERO ⇒ S_StaticAssertFailed (message = the string literal), NONZERO ⇒ nothing. The `hirKind: Skip` row lowers a PASSED assertion to nothing in BOTH positions (the emptyStmt/includeDirective Skip precedent), and — because it is a MAPPED rule — makes peelToCore STOP here (never descending into the sole condition child of the 1-arg form).",
+      "sequence": [
+        { "alt": [ "StaticAssertKeyword", "StaticAssertLegacyKeyword" ] },
+        "ParenOpen", "assignmentExpr",
+        { "optional": { "sequence": [ "Comma", "stringLiteralExpr" ] } },
+        "ParenClose", "EndStatement"
+      ]
     },
 
     "castTypeBase": {
@@ -1104,10 +1242,13 @@
     "designatedField": { "sequence": [ "DotOp", "Identifier" ] },
     "designatedIndex": { "sequence": [ "BracketOpen", "expression", "BracketClose" ] },
 
-    "charLiteralExpr":   { "sequence": [ "CharStart",   "CharLiteral"   ] },
+    "charLiteralExpr":   {
+      "$comment": "C11/C23 6.4.4.4: a character constant is opener + coalesced body. The opener is an INLINE token alt (`'`|`L'`|`u'`|`U'`|`u8'`) — token-leaf alt branches consume EXACTLY one token and push it DIRECTLY (no wrapper node; the stringLiteralExpr precedent), so the opener token stays a DIRECT child of this node and charLiteralNodeOf / the semantic char-typing override find it AND recover its SPECIFIC kind (the C23 element-type discriminator). Unprefixed `'x'` is byte-identical to the pre-CycleB `[CharStart, CharLiteral]` rule.",
+      "sequence": [ { "alt": [ "CharStart", "WideCharStart", "Utf16CharStart", "Utf32CharStart", "Utf8CharStart" ] }, "CharLiteral" ]
+    },
     "stringLiteralExpr": {
-      "$comment": "C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): adjacent string literals concatenate — `\"a\" \"b\"` is `\"ab\"`. The first StringStart+StringLiteral pair is required; the zero-or-more repeat captures each further pair as FLAT children (sequences inline, no wrapper node), so a lone string yields exactly 2 children, byte-identical to the pre-c20 single-pair rule. Concatenation is at the DECODED-byte level (each body decoded by decodeStringLiteralBody FIRST, then the bytes joined) via the single decodeAdjacentStringBodies chokepoint that every body consumer routes through. Safe in every use site: primaryExpr, attr args (terminate at `)`), externFuncTail (terminates at `;`) — none has StringStart in its follow set.",
-      "sequence": [ "StringStart", "StringLiteral", { "repeat": { "sequence": [ "StringStart", "StringLiteral" ] } } ]
+      "$comment": "C 5.1.1.2 phase 6 (D-CSUBSET-ADJACENT-STRING-CONCAT): adjacent string literals concatenate — `\"a\" \"b\"` is `\"ab\"`. The first opener+StringLiteral pair is required; the zero-or-more repeat captures each further pair as FLAT children (sequences inline, no wrapper node), so a lone string yields exactly 2 children, byte-identical to the pre-c20 single-pair rule. The opener is an INLINE token alt (C11/C23 6.4.5: `\"`|`L\"`|`u\"`|`U\"`|`u8\"`) — token-leaf alt branches consume EXACTLY one token and push it DIRECTLY (no wrapper node; the typeSpecifierSeq precedent), so the opener token stays a DIRECT child of this node and stringLiteralNodeOf / decodeAdjacentStringBodies find it AND recover its SPECIFIC kind (the element-core discriminator). Concatenation is at the DECODED code-unit level (each body decoded FIRST, then joined) via the single chokepoint every body consumer routes through. Safe in every use site: primaryExpr, attr args (terminate at `)`), externFuncTail (terminates at `;`) — none has a string opener in its follow set. Prefix-mixing across adjacent pieces (`u\"a\" L\"b\"`) is a LATER cycle — the element core is taken from the FIRST opener today.",
+      "sequence": [ { "alt": [ "StringStart", "WideStringStart", "Utf16StringStart", "Utf32StringStart", "Utf8StringStart" ] }, "StringLiteral", { "repeat": { "sequence": [ { "alt": [ "StringStart", "WideStringStart", "Utf16StringStart", "Utf32StringStart", "Utf8StringStart" ] }, "StringLiteral" ] } } ]
     },
 
     "argList": {
@@ -1176,8 +1317,10 @@
         "$staticStorageComment": "D-CSUBSET-LOCAL-STATIC: a block-scope `static` confers static storage duration (C 6.2.4). CST→HIR's linkageFrom folds {binding:local, staticStorage:true} from the SAME prefix scan and routes the declaration to a hidden module-global (internal linkage). register/auto/attribute specifiers carry no linkage and are ignored (ignoredKinds/ignoredRules) so they never trip the unknown-specifier diagnostic.",
         "$volatileComment": "c27 (D-CSUBSET-VOLATILE-POINTEE): `volatile` is a TYPE qualifier (TypeKind::VolatileQual). The resolver wraps the base in VolatileQual when a volatileMarker precedes the stars (`volatile int *` => Ptr<VolatileQual(int)>) and wraps the pointer for an east ptrQualifier (`int * volatile` => VolatileQual(Ptr<int>)); object-volatility is read off the symbol's top-level VolatileQual type at access lowering, pointee-volatility rides the accessed type at the deref/index/member (MirInstFlags::Volatile). ALL pointee/member/param/typedef forms now compile — the prior S_VolatilePointeeNotSupported reject is retired. const stays ignored (no wrapper).",
         "linkageSpecifiers": { "static": { "binding": "local", "staticStorage": true } },
-        "linkageSpecifierIgnoredKinds": ["RegisterKeyword", "AutoKeyword", "AttributeKeyword", "ParenOpen", "ParenClose"],
-        "linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr"] },
+        "$noreturnIgnoreComment": "FC16 (D-CSUBSET-NORETURN): the bare `_Noreturn` keyword carries NO linkage — ignored by kind (like RegisterKeyword/AutoKeyword). The attribute form `__attribute__((noreturn))` on a LOCAL is already covered by attrSpec ∈ linkageSpecifierIgnoredRules (wholesale). The SEMANTIC noreturn scan reads the keyword/attribute; without this ignore the `_Noreturn` token would fail loud H_UnknownLinkageSpecifier.",
+        "linkageSpecifierIgnoredKinds": ["RegisterKeyword", "AutoKeyword", "NoreturnKeyword", "AttributeKeyword", "ParenOpen", "ParenClose"],
+        "$alignasIgnoreComment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an `alignasSpec` in the local specifier prefix (`alignas(16) int x;`) carries NO linkage — its subtree (`_Alignas ( … )`) is skipped WHOLESALE by the linkage scan (exactly like the C23 `stdAttr` `[[…]]`). The alignment is read by the SEMANTIC alignas scan, not here. Without this the `_Alignas` keyword token would fail loud H_UnknownLinkageSpecifier.",
+        "linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr", "alignasSpec"] },
       { "rule": "identVarDecl", "head": 0, "declaratorList": 1, "kind": "variable",
         "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword", "warnIfUnused": true,
         "requireNamedDeclarators": true },
@@ -1206,8 +1349,11 @@
           "weak":   { "binding": "weak"  },
           "visibility:hidden": { "visibility": "hidden" }
         },
-        "linkageSpecifierIgnoredKinds": ["AttributeKeyword", "ParenOpen", "ParenClose"],
-        "linkageSpecifierIgnoredRules": ["stdAttr"],
+        "linkageSpecifierIgnoredKinds": ["AttributeKeyword", "ParenOpen", "ParenClose", "NoreturnKeyword"],
+        "$alignasIgnoreComment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an `alignasSpec` in a file-scope declaration's specifier prefix (`alignas(32) int g;`) carries NO linkage — skipped wholesale by the linkage scan (like `stdAttr`); the alignment is read by the semantic alignas scan. `attrSpec` is deliberately NOT ignored here (its `__attribute__((weak/visibility))` tokens ARE meaningful linkage). FC16 (D-CSUBSET-NORETURN): the bare `_Noreturn` keyword carries NO linkage → ignored by kind (NoreturnKeyword).",
+        "linkageSpecifierIgnoredRules": ["stdAttr", "alignasSpec"],
+        "$noreturnIgnoreNamesComment": "FC16 (D-CSUBSET-NORETURN): the GNU `__attribute__((noreturn))` form shares the `attrSpec` rule with the HONORED linkage attributes (`weak`, `visibility`), so attrSpec CANNOT be ignored wholesale here — the `noreturn` IDENTIFIER is skipped by NAME instead (dunder-normalized, so it also covers `__noreturn__`). A no-op `{binding:...}` linkageSpecifiers entry was REJECTED: it would clobber a co-present `static`/`weak` last-wins (an order-dependent silent linkage miscompile). Any OTHER unknown attribute identifier still fails loud H_UnknownLinkageSpecifier. `[[noreturn]]` rides stdAttr (already wholesale-ignored).",
+        "linkageSpecifierIgnoredNames": ["noreturn"],
         "kindByChild": {
           "$comment": "Post-strip children: [topLevelHead, initDeclaratorList, topLevelDeclTail]. childPath [2,0] = the tail's sole child — a `block` node (function definition) or the EndStatement token (variable; whenRule never matches a token). paramsPath/bodyPath are ABSENT: in declarator mode the params live inside the declarator's fnSuffix and the matched block IS the body.",
           "childPath": [2, 0],
@@ -1241,11 +1387,14 @@
         "volatileMarker": "VolatileKeyword",
         "bitfieldSuffix": { "rule": "bitfieldDeclSuffix", "widthChild": 1 },
         "anonymousNameAllowed": true,
+        "$alignasComment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the OPTIONAL leading `alignas(N) …` member-specifier prefix. `head:0`/`declaratorList:1` are POST-STRIP indices — decl_prefix_strip.hpp drops a leading `structMemberDeclSpecifiers` child before positional counting, so the head/declaratorList positions are identical whether or not the member carries alignas. The prefix subtree stays reachable via `specifierPrefixChild` for the semantic alignas scan.",
+        "specifierPrefix": "structMemberDeclSpecifiers",
         "allowFlexibleArray": true },
       { "rule": "unionField",  "head": 0, "declaratorList": 1, "kind": "variable",
         "volatileMarker": "VolatileKeyword",
         "bitfieldSuffix": { "rule": "bitfieldDeclSuffix", "widthChild": 1 },
-        "anonymousNameAllowed": true },
+        "anonymousNameAllowed": true,
+        "specifierPrefix": "structMemberDeclSpecifiers" },
       { "rule": "enumerator",  "name": 0, "kind": "variable" },
       { "rule": "externDecl", "name": 2, "type": 1, "kind": "variable",
         "nonDefiningDeclaration": true,
@@ -1302,11 +1451,29 @@
     ],
     "$sizeofComment": "FC6: sizeof typing. sizeofType = [ SizeofKeyword, '(', castTypeRef, ')' ] → typeChild 2 is the castTypeRef (resolved + stamped through the SAME type resolver casts use). sizeofValue = [ SizeofKeyword, castOperand ] (the operand is typed normally). Both forms are stamped size_t (U64).",
     "sizeof": { "typeRule": "sizeofType", "typeChild": 2, "valueRule": "sizeofValue" },
+    "$alignofComment": "C11/C23 6.5.3.4: alignof typing. alignofType = [ { alt: AlignofKeyword | AlignofLegacyKeyword }, '(', castTypeRef, ')' ] → typeChild 2 is the castTypeRef (the inline keyword-alt matches ONE token at visible-child 0, '(' is child 1 — SAME layout as sizeofType, so the same index 2). Pass 2 resolves + stamps the type child through the SAME type resolver sizeof/casts use, and stamps the node size_t (U64). TYPE-NAME FORM ONLY — no valueRule (there is no `_Alignof(expr)` form).",
+    "alignof": { "typeRule": "alignofType", "typeChild": 2 },
+    "$alignasComment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the `_Alignas`/`alignas` alignment specifier. `specRule` = the `alignasSpec` shape = [ { alt: AlignasKeyword | AlignasLegacyKeyword }, '(', alignasArg, ')' ] → `argChild` 2 is the `alignasArg` (the inline keyword-alt matches ONE token at visible-child 0, '(' is child 1 — SAME layout as alignofType). `typeFormRule` = `alignasTypeName` (the guarded TYPE-form wrapper branch): the semantic tier reads alignasArg's committed reading and discriminates the TYPE form (the committed child's rule == alignasTypeName → alignment = _Alignof(T) via computeLayout(...)->align of the castTypeRef INSIDE the wrapper) from the VALUE form (else → const-evaluate the constant-expression via the SAME constIntExpr sizeof/static_assert/array-dims use). The computed alignment is validated (power-of-two → S_AlignasNotPowerOfTwo; ≤256 → S_AlignasExceedsMax; ≥ the declared type's natural align → S_AlignasWeakerThanNatural; non-constant value → S_AlignasNonConstant; on a typedef/function/parameter/bit-field → S_AlignasInvalidContext) and STORED (SymbolRecord.explicitAlignment for a variable; fed into the composite's fieldAligns for a member). `alignas(0)` is an explicit NO-OP (6.7.5p3) — treated as no override, no error. Absent block ⇒ the language has no alignas surface.",
+    "alignas": { "specRule": "alignasSpec", "argChild": 2, "typeFormRule": "alignasTypeName" },
+    "$packedComment": "FC16 (D-CSUBSET-PACKED): C/C23 `__attribute__((packed))` / `[[gnu::packed]]` on a struct/union. `listRule` = the `compositeAttrList` shape (the trailing attribute list after a struct/union body). `attributeNames` = the identifiers that mean `packed` (matched dunder-normalized via the shared stripDunder, so `__packed__` ≡ `packed`; `gnu::packed` matches by its final segment `packed`). The semantic tier scans a structSpec/unionSpec node for a `compositeAttrList` child, extracts each `attrSpec`/`stdAttr` identifier, and marks the composite `packed` (→ the interner's completeComposite → computeLayout removes all inter-field padding + sets natural alignment 1). An unrecognized `__attribute__((X))` identifier fails loud S_UnknownTypeAttribute (typo protection like H_UnknownLinkageSpecifier); an unrecognized `[[…]]` is standard-ignorable (the [[deprecated]] precedent). packed + a bit-field member → S_PackedBitfieldUnsupported (D-CSUBSET-PACKED-BITFIELD-INTERACTION). Absent block ⇒ the language has no composite-attribute surface. Source-agnostic: nothing hardcodes the spelling `packed`.",
+    "packed": { "listRule": "compositeAttrList", "attributeNames": ["packed"], "strictAttrRule": "attrSpec" },
+    "$noreturnComment": "FC16 (D-CSUBSET-NORETURN): the C11/C23 `noreturn` FUNCTION attribute. `keywordToken` = the `_Noreturn` keyword (C11 6.7.4); `attributeNames` = the recognized attribute identifiers (`[[noreturn]]`/`__attribute__((noreturn))`/`[[gnu::noreturn]]`, dunder-normalized at the scan so `__noreturn__` matches). The semantic tier scans a function declaration's specifier prefix (specifierPrefixNamesNoreturn) for EITHER form and marks the symbol isNoreturn; a DIRECT call to such a function is wrapped `Block{ ExprStmt(call), Unreachable }` at HIR lowering (the wrapIfProvablyInfinite precedent). Source-agnostic: nothing hardcodes the spelling.",
+    "noreturn": { "keywordToken": "NoreturnKeyword", "attributeNames": ["noreturn"] },
     "$variadicComment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. vaArgExpr = [ VaArgKeyword, '(', assignmentExpr(apChild 2), ',', castTypeRef(typeChild 4), ')' ] → pass 2 resolves+stamps the castTypeRef through the SAME resolver casts use (so the HIR lowering recovers the read type T) and stamps the node T; it type-checks `ap` is a va_list. vaStartExpr/vaEndExpr = [ kw, '(', assignmentExpr(apChild 2), ... ] → node stamped `void`; ap type-checked va_list; vaStart also flips the enclosing function's uses-va-start attribute so the LIR prologue spills the arg registers.",
     "variadic": {
       "vaArgRule":   "vaArgExpr",   "vaArgApChild":   2, "vaArgTypeChild": 4,
       "vaStartRule": "vaStartExpr", "vaStartApChild": 2,
       "vaEndRule":   "vaEndExpr",   "vaEndApChild":   2
+    },
+    "$staticAssertComment": "C11/C23 6.7.10: the `_Static_assert`/`static_assert` DECLARATION rule. Pass 2 const-evaluates the condition child (visible-child 1 — the assignmentExpr after the keyword+'(') through the SAME evaluator that folds sizeof(T)/enum/arithmetic in an array dimension; ZERO ⇒ S_StaticAssertFailed (message = the OPTIONAL trailing string-literal child), NONZERO ⇒ nothing. The construct lowers to nothing (hirLowering staticAssertDecl → Skip).",
+    "staticAssertRule": "staticAssertDecl",
+    "$genericComment": "FC16 (D-CSUBSET-GENERIC-SELECTION): C11/C23 6.5.1.1 generic selection. `rule` = the genericExpr shape; `controlChild` = the visible-child index of the controlling `assignmentExpr` (child 2 — after the GenericKeyword + '('). `assocRule`/`typedAssocRule`/`defaultAssocRule` name the association shapes so Pass 2 discriminates each `_Generic` child: a genericTypedAssoc's FIRST child is a castTypeRef (resolved+stamped through the SAME type resolver casts/sizeof/va_arg use — a VALUE in type position fails loud S_UnknownType) and its LAST is the result expression; a genericDefaultAssoc is the `default:` fallback (no type). Pass 2 lvalue-converts the controlling type (strips top-level volatile, the isAssignable precedent), matches it against each typed assoc's resolved type for COMPATIBILITY (interned TypeId equality via sameType), enforces EXACTLY ONE typed match (S_GenericSelectionAmbiguous on >1) OR the default (S_GenericSelectionNoMatch on none-and-no-default), stamps the genericExpr node with the winner's RESULT type, and records the winning association's result-expression node (nodeToSelectedExpr side-table). The dedicated HIR lowering (hirLowering.genericRule) lowers ONLY that recorded sub-expression.",
+    "generic": {
+      "rule": "genericExpr",
+      "controlChild": 2,
+      "assocRule": "genericAssoc",
+      "typedAssocRule": "genericTypedAssoc",
+      "defaultAssocRule": "genericDefaultAssoc"
     },
     "$compoundLiteralsComment": "FC3.5 sweep-c3 (D-CSUBSET-COMPOUND-LITERAL-TYPEDEF): the compound-literal type position resolves + stamps through the SAME type-position resolver casts use (typedefs included). typeChild is the visible-child index into compoundLiteralExpr = [ '(' , castTypeRef , ')' , braceInitList ]. NO operandChild / cast-matrix validation — a compound literal is C 6.5.2.5 postfix syntax, not a conversion.",
     "compoundLiterals": [
@@ -1434,6 +1601,7 @@
       { "rule": "forIdentDecl", "hirKind": "VarDecl"     },
       { "rule": "param",        "hirKind": "VarDecl"     },
       { "rule": "typedefDecl",  "hirKind": "TypeDecl"    },
+      { "rule": "staticAssertDecl", "hirKind": "Skip"    },
       { "rule": "externDecl",   "hirKind": "ExternDecl"  },
       { "rule": "block",        "hirKind": "Block"       },
       { "rule": "ifStmt",       "hirKind": "IfStmt"      },
@@ -1470,10 +1638,12 @@
     "compoundLiteralRule": "compoundLiteralExpr",
     "castRule":            "castExpr",
     "sizeofRule":          "sizeofExpr",
+    "alignofRule":         "alignofType",
     "labelAddressRule":    "labelAddressExpr",
     "vaStartRule":         "vaStartExpr",
     "vaArgRule":           "vaArgExpr",
     "vaEndRule":           "vaEndExpr",
+    "genericRule":         "genericExpr",
 
     "globalsConstEval": { "allowFloat": true },
 
@@ -1539,6 +1709,24 @@
     "caseDefaultToken":   "DefaultKeyword",
 
     "charLiteral":   { "startToken": "CharStart",   "bodyToken": "CharLiteral"   },
-    "stringLiteral": { "startToken": "StringStart", "bodyToken": "StringLiteral" }
+    "stringLiteral": { "startToken": "StringStart", "bodyToken": "StringLiteral" },
+
+    "$stringLiteralPrefixesComment": "C11/C23 6.4.5 string-literal openers → element core. The narrow StringStart row is auto-seeded by the loader (elementCore=Char) but listed here for clarity. WideStringStart (wchar_t) declares its FORMAT-keyed width AS CONFIG DATA via elementCoreByFormat (elf/macho→I32 the POSIX width, pe→U16 the Windows UTF-16 code unit — D-FFI-STDDEF-WCHAR-PE-WIDTH, the SAME per-format axis stddef.json's wchar_t typedef declares via when.format); elementCore=I32 is the default/fallback for a format-agnostic caller. No engine tier branches on format — the semantic tier resolves the row via a pure config-map lookup (LiteralPrefixEntry::resolveElementCore, mirroring builtinTypes' coreByDataModel) and the HIR tier reads the resolved element core back off the stamped node type. All five openers share the coalesced StringLiteral body token.",
+    "stringLiteralPrefixes": [
+      { "startToken": "StringStart",      "elementCore": "Char" },
+      { "startToken": "Utf16StringStart", "elementCore": "U16"  },
+      { "startToken": "Utf32StringStart", "elementCore": "U32"  },
+      { "startToken": "Utf8StringStart",  "elementCore": "U8"   },
+      { "startToken": "WideStringStart",  "elementCore": "I32", "elementCoreByFormat": { "pe": "U16", "elf": "I32", "macho": "I32" } }
+    ],
+
+    "$charLiteralPrefixesComment": "C11/C23 6.4.4.4 character-constant openers → SCALAR element core (the C23 per-prefix TYPE rule — a char constant's type depends on its prefix). The narrow CharStart row is auto-seeded by the loader (elementCore=I32, the C `int`) but listed here for clarity; the semantic tier keeps it in the flat literalTypeIds int path (other integer-literal consumers depend on it) and OVERRIDES only the wide rows. WideCharStart (wchar_t) declares its FORMAT-keyed width AS CONFIG DATA via the SAME elementCoreByFormat axis the wide-string L\" row uses (elf/macho→I32 the POSIX width, pe→U16 the Windows UTF-16 unit — D-FFI-STDDEF-WCHAR-PE-WIDTH); elementCore=I32 is the format-agnostic default. No engine tier branches on format — the semantic tier resolves via a pure resolveElementCore lookup and the HIR tier reads the resolved core back off the stamped body token. All five openers share the coalesced CharLiteral body token. Unlike a string (an Array), a char constant is a SCALAR value (one code unit) typed by this core.",
+    "charLiteralPrefixes": [
+      { "startToken": "CharStart",      "elementCore": "I32" },
+      { "startToken": "Utf16CharStart", "elementCore": "U16" },
+      { "startToken": "Utf32CharStart", "elementCore": "U32" },
+      { "startToken": "Utf8CharStart",  "elementCore": "U8"  },
+      { "startToken": "WideCharStart",  "elementCore": "I32", "elementCoreByFormat": { "pe": "U16", "elf": "I32", "macho": "I32" } }
+    ]
   }
 }

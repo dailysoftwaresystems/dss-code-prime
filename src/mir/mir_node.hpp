@@ -38,7 +38,12 @@ using MirValueId = MirInstId;
 //
 // `Synthetic` marks instructions lowering inserted with no source origin (e.g.
 // structured-CF scaffolding). `Volatile` marks a memory access the optimizer
-// must not reorder or elide. Multiple flags may apply.
+// must not reorder or elide. Also: two `Volatile` ops must never be reordered
+// relative to each other, and any future instruction-scheduling / sinking pass
+// MUST treat a `Volatile` op as a scheduling barrier w.r.t. every other
+// `Volatile` or side-effecting op (today guaranteed structurally by the shared
+// rebuild-walk's original-scan-order discipline; pin:
+// TwoVolatileStoresToDifferentGlobalsKeepRelativeOrder). Multiple flags may apply.
 enum class MirInstFlags : std::uint8_t {
     None      = 0,
     Synthetic = 1u << 0,
@@ -138,6 +143,15 @@ struct MirInst {
     std::uint32_t operandStart = 0;                   // 4  — into operand pool (or phi pool if Phi)
     std::uint32_t operandCount = 0;                   // 4
     std::uint32_t payload      = 0;                   // 4  — per-opcode scalar
+    // Secondary per-opcode scalar. Currently used ONLY by `Alloca`
+    // (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): `payload` carries the aggregate
+    // byte size (frame-slot sizing), so the local's EFFECTIVE alignment
+    // (max of natural + `alignas`) rides here — MIR→LIR reads it to compute
+    // each function's max local alignment (fed to the frame layout). 0 for
+    // every other opcode + a scalar alloca that recorded no over-alignment
+    // (its natural alignment is derivable, so 0 is a safe "no info" sentinel).
+    // Grows MirInst 24→28 bytes — the static_assert below still holds.
+    std::uint32_t payload2     = 0;                   // 4  — secondary per-opcode scalar
 };
 static_assert(sizeof(MirInst) <= 32, "detail::MirInst grew unexpectedly — review layout");
 static_assert(std::is_trivially_copyable_v<MirInst>);
@@ -230,6 +244,15 @@ struct MirGlobal {
     // growth (the static_assert below still holds).
     bool             isConst    = false;                    // 1
     std::uint8_t     _pad       = 0;                         // 1  — explicit padding
+    // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): the EXPLICIT
+    // `alignas(N)` alignment in bytes (a power of two ≤ 256), or 0 for no
+    // override. Read by the assembler's data-item emission
+    // (`lowerMirGlobalsToDataItems`), which raises the emitted symbol's section
+    // alignment to `max(natural, this)` when nonzero. Threaded from the source's
+    // `alignas` via the declaration-keyed `HirAlignmentMap` at HIR→MIR lowering.
+    // Consumes the former 4-byte tail padding → zero size growth (28→32 bytes,
+    // the static_assert below still holds).
+    std::uint32_t    alignment  = 0;                         // 4
 };
 static_assert(sizeof(MirGlobal) <= 32, "detail::MirGlobal grew unexpectedly — review layout");
 static_assert(std::is_trivially_copyable_v<MirGlobal>);

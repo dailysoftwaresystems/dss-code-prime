@@ -1,0 +1,17 @@
+{
+  "$comment": "C11/C23 6.4.3 (FF1/FF2) surrogate-half witness: U\"\\uD800\" names a UTF-16 surrogate half - not a Unicode scalar value - so the compile FAILS LOUD with the dedicated H_InvalidUniversalCharacterName (unsuppressable), never a silent CESU-8 / wrong unit. Red-on-disable: drop the FF1 surrogate reject in decodeEscapedBytes and this compiles. The load-bearing pin is the CODE + a rejected compile at the literal position.",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec"
+    }
+  ],
+  "expectDiagnostics": [
+    {
+      "code": "H_InvalidUniversalCharacterName",
+      "line": 7,
+      "col": 39
+    }
+  ]
+}

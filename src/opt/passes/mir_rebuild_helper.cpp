@@ -51,7 +51,10 @@ cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
         builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
                           newInitIdx, MirFuncId{},
                           mir.globalBinding(g), mir.globalVisibility(g),
-                          mir.globalIsConst(g));
+                          mir.globalIsConst(g),
+                          // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: preserve the
+                          // global's explicit alignment across the rebuild.
+                          mir.globalAlignmentBytes(g));
     }
     return GlobalClonePrelude::Cloned;
 }
@@ -93,7 +96,10 @@ void cloneGlobalsVerbatim(Mir const& mir, MirBuilder& builder) {
         builder.addGlobal(mir.globalType(g), mir.globalSymbol(g),
                           newInitIdx, newInitFunc,
                           mir.globalBinding(g), mir.globalVisibility(g),
-                          mir.globalIsConst(g));
+                          mir.globalIsConst(g),
+                          // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: preserve the
+                          // global's explicit alignment across the rebuild.
+                          mir.globalAlignmentBytes(g));
     }
 }
 
@@ -265,8 +271,16 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
         return;
     }
     if (op == MirOpcode::Arg) {
+        // Carry BOTH the class ordinal AND the flat call-operand position —
+        // Arg has a dedicated builder (addInst refuses it), so this re-encode
+        // must thread the position or it silently defaults to the ordinal and
+        // the inliner mis-maps mixed-class actuals. Every pass drives this
+        // rebuilder (Identity is the FIRST release pass), so a wipe here kills
+        // the position before Inlining runs (D-OPT-RELEASE-SYSV-MIXED-CLASS-
+        // REG-ARG-DROP).
         MirInstId const newId = dst_.addArg(src_.argIndex(oldId),
-                                            src_.instType(oldId));
+                                            src_.instType(oldId),
+                                            src_.argPosition(oldId));
         rewrite_.emplace(oldId.v, newId);
         return;
     }
@@ -320,7 +334,13 @@ void MirFunctionRebuilder::emitValue(MirOpcode op, MirInstId oldId) {
     }
     MirInstId const newId = dst_.addInst(op, newOps, src_.instType(oldId),
                                          src_.instPayload(oldId),
-                                         src_.instFlags(oldId));
+                                         src_.instFlags(oldId),
+                                         // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN:
+                                         // preserve the Alloca's effective-
+                                         // alignment channel across every MIR
+                                         // rebuild (else a release pipeline drops
+                                         // the over-alignment → silent under-align).
+                                         src_.instPayload2(oldId));
     rewrite_.emplace(oldId.v, newId);
 }
 

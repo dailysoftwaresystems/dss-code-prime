@@ -57,6 +57,20 @@ namespace {
     return analyze(cu);
 }
 
+// As `analyzeCSubset`, but under the PE object format — so `L'…'`/`L"…"` (wchar_t)
+// resolves to the 2-byte Windows UTF-16 unit (U16), not the POSIX I32. Used to
+// witness the FORMAT-keyed wide-char constraint (an astral `L'😀'` is representable
+// under the default I32 but NOT under the pe U16).
+[[nodiscard]] SemanticModel analyzeCSubsetPe(std::string src) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    UnitBuilder builder{*loaded};
+    builder.addInMemory(std::move(src), "<mem>");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    return analyze(cu, DataModel::Llp64, std::nullopt, std::nullopt,
+                   ObjectFormatKind::Pe);
+}
+
 // Drive c-subset → SemanticModel with the parser's expression-depth cap RAISED to
 // `cap` (the default is 256), so a deep-but-legal nesting beyond the cap parses to
 // completion — the DEEP-NEST-RECURSION lowering pins need an input deeper than any
@@ -210,6 +224,59 @@ TEST(HirLoweringCSubset, ReturnLiteralPopulatesPool) {
     ASSERT_TRUE(std::holds_alternative<std::int64_t>(v.value));
     EXPECT_EQ(std::get<std::int64_t>(v.value), 42);
     EXPECT_EQ(v.core, TypeKind::I32);
+}
+
+// FC16 C11/C23 6.5.1.1: `_Generic` lowers to the SELECTED association's
+// expression — its type + value. `i` is `int`, so the `int:` branch is selected
+// and its Literal 5 IS the returned value (result type I32).
+TEST(HirLoweringCSubset, GenericLowersSelectedBranchValue) {
+    SemanticModel model = analyzeCSubset(
+        "int f() { int i = 0; return _Generic(i, int: 5, double: 3, "
+        "default: 0); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    HirNodeId const body = res->hir.functionBody(fn);
+    // The return value is the selected int-branch's Literal 5 (I32).
+    HirNodeId const lit =
+        findFirstByKind(res->hir, body, HirKind::Literal);
+    ASSERT_TRUE(lit.valid()) << "the selected branch's literal must be lowered";
+    EXPECT_EQ(res->hir.kind(lit), HirKind::Literal);
+    EXPECT_EQ(model.lattice().interner().kind(res->hir.typeId(lit)),
+              TypeKind::I32)
+        << "the selected int-branch's value types I32";
+}
+
+// FC16 6.5.1.1p3: the NON-selected association expressions are NOT evaluated —
+// they must NOT be lowered. The non-selected `double: 999.0` branch's distinctive
+// literal 999 must NOT reach the literal pool (only the selected `int: 5` does).
+TEST(HirLoweringCSubset, GenericNonSelectedBranchNotLowered) {
+    SemanticModel model = analyzeCSubset(
+        "int f() { int i = 0; return _Generic(i, int: 5, "
+        "double: 999, default: 777); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    // ONLY the selected branch's Literal 5 is lowered; 999 and 777 (the
+    // non-selected + default branches) must be absent from the pool.
+    bool has5 = false, has999 = false, has777 = false;
+    for (std::size_t i = 0; i < res->literalPool.size(); ++i) {
+        auto const& v = res->literalPool.at(i);
+        if (std::holds_alternative<std::int64_t>(v.value)) {
+            auto const iv = std::get<std::int64_t>(v.value);
+            if (iv == 5)   has5 = true;
+            if (iv == 999) has999 = true;
+            if (iv == 777) has777 = true;
+        }
+    }
+    EXPECT_TRUE(has5)    << "the selected int-branch literal 5 must be lowered";
+    EXPECT_FALSE(has999) << "the non-selected double-branch literal 999 must NOT "
+                            "be lowered (6.5.1.1p3: unevaluated)";
+    EXPECT_FALSE(has777) << "the unselected default-branch literal 777 must NOT "
+                            "be lowered";
 }
 
 TEST(HirLoweringCSubset, ArithmeticAndParams) {
@@ -1189,6 +1256,62 @@ TEST(HirLoweringCSubset, ExternGlobalWithInitializerRejectedLoud) {
     EXPECT_EQ(res->hir.kind(decls[0]), HirKind::Error);
 }
 
+// D-CSUBSET-PACKED (F4): a `packed` spelling in the LEADING declaration-specifier
+// position (`[[gnu::packed]] struct S {…} v;`) is UNHONORED — packed is honored only
+// in the TRAILING composite-attribute slot (`struct S {…} __attribute__((packed))`).
+// The linkage scan skips the ignored `stdAttr` wholesale, which would SILENTLY DROP
+// packed (leaving the struct padded — a miscompile a program could depend on). It
+// fails loud H_UnknownLinkageSpecifier instead, symmetric with the leading
+// `__attribute__((packed))` case. Semantically clean (the attribute is a
+// declSpecifier); the rejection is at lowering.
+TEST(HirLoweringCSubset, LeadingPackedAttributeRejectedLoud) {
+    SemanticModel model = analyzeCSubset(
+        "[[gnu::packed]] struct S { char c; int v; } gv;\n"
+        "int main(void){ return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "test setup: the leading attribute parses + analyzes cleanly; the "
+           "rejection is at lowering, not at parse/semantic";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+        << "leading [[gnu::packed]] must fail loud, never silently drop packed";
+}
+
+// D-CSUBSET-PACKED (F-3): the GNU spelling of the SAME leading form —
+// `__attribute__((packed)) struct S {…} gv;` — is likewise UNHONORED and fails loud.
+// Sibling to LeadingPackedAttributeRejectedLoud (the C23 `[[gnu::packed]]` form):
+// here `attrSpec` is NOT in the linkage-ignored rules, so the leading
+// `__attribute__((packed))` takes the RECOGNIZED-specifier path, `packed` is not a
+// linkage keyword, and lowering fails loud H_UnknownLinkageSpecifier (exactly like a
+// leading `__attribute__((bogus))`). Must NOT be silently honored-or-dropped.
+TEST(HirLoweringCSubset, LeadingGnuPackedAttributeRejectedLoud) {
+    SemanticModel model = analyzeCSubset(
+        "__attribute__((packed)) struct S { char c; int v; } gv;\n"
+        "int main(void){ return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "test setup: the leading GNU attribute parses + analyzes cleanly; the "
+           "rejection is at lowering, not at parse/semantic";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+        << "leading __attribute__((packed)) must fail loud, never silently drop packed";
+}
+
+// CONTRAST: a leading standard-ignorable attribute (`[[deprecated]]`) STAYS silently
+// ignored (C23 6.7.11.1) — ONLY a `packed` spelling fails loud in the leading slot.
+// RED-ON-DISABLE for over-broadening: were the F4 hook to fire on any ignored attr,
+// this would wrongly report H_UnknownLinkageSpecifier.
+TEST(HirLoweringCSubset, LeadingDeprecatedAttributeStillIgnored) {
+    SemanticModel model = analyzeCSubset(
+        "[[deprecated]] int gv;\n"
+        "int main(void){ return 0; }\n");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+        << "[[deprecated]] stays standard-ignorable; only packed fails loud";
+}
+
 TEST(HirLoweringCSubset, ExternGlobalWithIdentifierInitializerRejectedLoud) {
     // Post-fold #7 PT1a: pin identifier-init `extern int x = y;`
     // (RHS is an operand-rule referencing a prior decl), not just
@@ -1668,6 +1791,95 @@ TEST(HirLoweringCSubset, BreakableInfiniteLoopIsNotWrapped) {
         << "the breakable loop must lower to a bare WhileStmt, not a wrapper Block";
 }
 
+// ── FC16 (D-CSUBSET-NORETURN): a direct call to a noreturn function terminates ──
+//
+// A NON-`main` non-void function whose fall-through tail is a DIRECT call to a
+// noreturn function (`_Noreturn void die(int); … die(1);`) is wrapped as
+// `Block{ ExprStmt(call), Synthetic Unreachable }` — the direct structural mirror
+// of the infinite-loop wrap above — so `f` structurally terminates and the
+// verifier is clean. RED-ON-DISABLE (revert detection / the wrap): `f`'s
+// fall-through no longer terminates → H_VerifierFailure count 1.
+TEST(HirLoweringCSubset, NoreturnCallTailWrapsAndVerifies) {
+    SemanticModel model = analyzeCSubset(
+        "_Noreturn void die(int); "
+        "int f(int x){ if(x>0) return x; die(1); } "
+        "int main(){ return f(1); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u)
+        << "the noreturn-call tail must satisfy non-void return completeness";
+    HirNodeId const f = functionNamed(res->hir, model, "f");
+    ASSERT_TRUE(f.valid());
+    EXPECT_TRUE(subtreeHasSyntheticUnreachable(res->hir, res->hir.functionBody(f)))
+        << "a direct call to a noreturn function must be wrapped with a synthetic Unreachable";
+}
+
+// All four `noreturn` spellings compile clean (parse + semantic + verify): the
+// C11 `_Noreturn` keyword, the C23 `[[noreturn]]`, and both GNU
+// `__attribute__((noreturn))` / `__attribute__((__noreturn__))`. Each must wrap
+// the `die(1)` tail (no H_VerifierFailure) AND — critically for the GNU forms on
+// a file-scope declaration — must NOT trip the linkage scan's
+// H_UnknownLinkageSpecifier (the `linkageSpecifierIgnoredNames` / ignoredKinds path).
+TEST(HirLoweringCSubset, NoreturnAllFourSpellingsCompileClean) {
+    for (char const* proto : {
+             "_Noreturn void die(int);",
+             "[[noreturn]] void die(int);",
+             "__attribute__((noreturn)) void die(int);",
+             "__attribute__((__noreturn__)) void die(int);"}) {
+        std::string const src = std::string(proto)
+            + " int f(int x){ if(x>0) return x; die(1); }"
+              " int main(){ return f(1); }";
+        SemanticModel model = analyzeCSubset(src);
+        ASSERT_FALSE(model.hasErrors()) << "spelling: " << proto;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << proto << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u) << proto;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u) << proto;
+        HirNodeId const f = functionNamed(res->hir, model, "f");
+        ASSERT_TRUE(f.valid()) << proto;
+        EXPECT_TRUE(subtreeHasSyntheticUnreachable(res->hir, res->hir.functionBody(f)))
+            << proto;
+    }
+}
+
+// ⚠️ F1 — an INDIRECT / address-takeable callee must NOT be wrapped (the
+// conservative direction), else a real return path is elided = MISCOMPILE. Two
+// witnesses, both of which `firstNameToken` would have MIS-resolved to a noreturn
+// name: (1) a ternary callee `(c ? die : other)(1)` lowers to a NON-Ref node →
+// isDirectNoreturnCall false; `other` can return, so f's fall-through does NOT
+// terminate → H_VerifierFailure STILL fires (the miscompile witness). (2) a
+// function-POINTER object `fp(1)` lowers to Ref(fp) whose record has
+// isNoreturn==false → not wrapped. In BOTH the un-relaxed fall-through keeps the
+// loud verifier failure — proof we did not silently elide the return path.
+TEST(HirLoweringCSubset, NoreturnIndirectCalleeIsNotWrapped) {
+    {   // (1) ternary callee — the address-takeable miscompile vector.
+        SemanticModel model = analyzeCSubset(
+            "_Noreturn void die(int); void other(int); "
+            "int f(int x, int c){ if(x>0) return x; (c ? die : other)(1); } "
+            "int main(){ return f(1,1); }");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 1u)
+            << "an address-takeable ternary callee must NOT be wrapped (F1)";
+    }
+    {   // (2) function-pointer object callee — Ref, but not a noreturn record.
+        SemanticModel model = analyzeCSubset(
+            "_Noreturn void die(int); "
+            "int f(int x){ if(x>0) return x; void (*fp)(int) = die; fp(1); } "
+            "int main(){ return f(1); }");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 1u)
+            << "a call through a function-pointer object must NOT be wrapped (F1)";
+    }
+}
+
 // ── FC5: goto / labels ──────────────────────────────────────────────────────
 
 namespace {
@@ -2063,6 +2275,120 @@ TEST(HirLoweringCSubset, MultiCharCharLiteralFailsLoud) {
     EXPECT_GT(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 0u);
 }
 
+// ── C11/C23 6.4.4.4: wide / UTF CHARACTER constants (L'x'/u'x'/U'x'/u8'x') ───────
+// A prefixed char constant is a SCALAR: its element core is typed by the prefix and
+// its value is the single decoded code point (uint64 arm). The narrow path is
+// UNCHANGED (the four tests above are the byte-identity guard).
+
+TEST(HirLoweringCSubset, WideCharConstantElementAndValue) {
+    // Each prefixed char → its C23 core + the decoded code point. `L'x'` under the
+    // default format is wchar_t = I32 (the POSIX width); value is the code point 120.
+    struct Case { char const* src; TypeKind core; std::uint64_t value; };
+    for (auto const& tc : {Case{"void f() { L'x'; }",  TypeKind::I32, 120},
+                           Case{"void f() { u'A'; }",  TypeKind::U16, 65},
+                           Case{"void f() { U'A'; }",  TypeKind::U32, 65},
+                           Case{"void f() { u8'A'; }", TypeKind::U8,  65}}) {
+        SemanticModel model = analyzeCSubset(tc.src);
+        ASSERT_FALSE(model.hasErrors()) << tc.src;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << tc.src << " : " << (r.all().empty() ? "" : r.all()[0].actual);
+        ASSERT_EQ(res->literalPool.size(), 1u) << tc.src;
+        auto const& v = res->literalPool.at(0);
+        EXPECT_EQ(v.core, tc.core) << tc.src;
+        ASSERT_TRUE(std::holds_alternative<std::uint64_t>(v.value)) << tc.src;
+        EXPECT_EQ(std::get<std::uint64_t>(v.value), tc.value) << tc.src;
+        auto const& ti = model.lattice().interner();
+        HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+        HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+        EXPECT_EQ(ti.kind(res->hir.typeId(lit)), tc.core) << tc.src;
+    }
+}
+
+TEST(HirLoweringCSubset, WideCharBmpMultibyteDecodesToCodepoint) {
+    // `U'€'` — U+20AC, source bytes E2 82 AC — UTF-8-decodes those THREE source
+    // bytes to the SINGLE code point 0x20AC (NOT a byte-passthrough). The witness
+    // that the char body is UTF-8-decoded exactly like a wide string.
+    SemanticModel model = analyzeCSubset("void f() { U'\xe2\x82\xac'; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U32);
+    ASSERT_TRUE(std::holds_alternative<std::uint64_t>(v.value));
+    EXPECT_EQ(std::get<std::uint64_t>(v.value), 0x20ACu) << "U+20AC is ONE code point";
+}
+
+TEST(HirLoweringCSubset, Utf8CharOutOfRangeFailsLoud) {
+    // `u8'β'` — U+03B2 (CE B2) exceeds the single-UTF-8-code-unit range (0x7F).
+    // C23 char8_t constant constraint → fail loud (H_Utf8CharLiteralOutOfRange),
+    // NEVER a silently truncated low byte.
+    SemanticModel model = analyzeCSubset("void f() { u8'\xce\xb2'; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "an out-of-range u8 char must fail lowering";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_Utf8CharLiteralOutOfRange), 1u)
+        << "exactly the u8-out-of-range code, never a silent truncated byte";
+}
+
+TEST(HirLoweringCSubset, Utf16CharAstralFailsLoud) {
+    // `u'😀'` — U+1F600, a supplementary-plane cp under a 16-bit char16_t. One
+    // char16_t holds ONE code unit; an astral cp needs a surrogate PAIR → fail loud
+    // (H_WideCharValueUnrepresentable), NEVER a silent wrong unit. Format-invariant
+    // (u' is always U16), so the reject is target-independent.
+    SemanticModel model = analyzeCSubset("void f() { u'\xf0\x9f\x98\x80'; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "an astral char16_t constant must fail lowering";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideCharValueUnrepresentable), 1u);
+}
+
+TEST(HirLoweringCSubset, WideCharMultiCharAndEmptyFailLoud) {
+    // A wide/UTF char must denote EXACTLY ONE code point. `L'ab'` (multi) and `L''`
+    // (empty) both fail loud (H_WideCharValueUnrepresentable) — the strict
+    // single-code-point rule the wide path enforces (unlike narrow impl-defined).
+    for (char const* src : {"void f() { L'ab'; }", "void f() { L''; }"}) {
+        SemanticModel model = analyzeCSubset(src);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_FALSE(res->ok) << src;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_WideCharValueUnrepresentable), 1u) << src;
+    }
+}
+
+// SHOULD-FIX #6 — the DEFINITIVE per-format / agnostic witness. `L'😀'` (U+1F600)
+// is a wchar_t constant, and wchar_t is FORMAT-keyed: on pe it is the 16-bit UTF-16
+// unit (U16) → the astral cp is UNREPRESENTABLE → fail loud; on the POSIX default it
+// is I32 → the astral cp fits → lowers to value 0x1F600. ONE source, opposite
+// outcomes, decided purely by the config `elementCoreByFormat` map — no format
+// branch in shared substrate. Red-on-disable of the format-keying flips one arm.
+TEST(HirLoweringCSubset, WideCharAstralIsFormatKeyed) {
+    char const* src = "void f() { L'\xf0\x9f\x98\x80'; }";
+    // PE (u16 wchar_t) → fail loud.
+    {
+        SemanticModel model = analyzeCSubsetPe(src);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_FALSE(res->ok) << "astral L' under pe (u16 wchar_t) must fail loud";
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_WideCharValueUnrepresentable), 1u);
+    }
+    // POSIX default (i32 wchar_t) → the astral cp fits → value 0x1F600.
+    {
+        SemanticModel model = analyzeCSubset(src);
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        ASSERT_EQ(res->literalPool.size(), 1u);
+        auto const& v = res->literalPool.at(0);
+        EXPECT_EQ(v.core, TypeKind::I32);
+        ASSERT_TRUE(std::holds_alternative<std::uint64_t>(v.value));
+        EXPECT_EQ(std::get<std::uint64_t>(v.value), 0x1F600u);
+    }
+}
+
 TEST(HirLoweringCSubset, LoweredSeqExprRoundTrips) {
     // A REAL lowering-produced SeqExpr (from `x++` in value position) must
     // survive the .dsshir emit→parse→verify round-trip — the seam where the
@@ -2194,6 +2520,459 @@ TEST(HirLoweringCSubset, AdjacentStringsConcatEscapeBoundary) {
     TypeId const ty = res->hir.typeId(lit);
     ASSERT_EQ(ti.kind(ty), TypeKind::Array);
     EXPECT_EQ(ti.scalars(ty)[0], 3) << "\"A1\" (2 bytes) + NUL";
+}
+
+// ── C11/C23 6.4.5: wide / UTF string literals (L"…"/u"…"/U"…"/u8"…") ─────────
+// A prefixed string types as Array<elementCore, codeUnits+1> and its literal pool
+// value carries the element-width-encoded (LE) code units. The narrow path is
+// unchanged; these assert the wide element core, the encoded byte blob, and the
+// astral fail-loud (surrogate pairs are a later cycle).
+
+TEST(HirLoweringCSubset, Utf16StringElementAndBytes) {
+    // `u"AB"` → Array<U16,3>; bytes = 41 00 42 00 (2 LE U16 units), NUL implied.
+    SemanticModel model = analyzeCSubset("void f() { u\"AB\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U16);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value), std::string({0x41, 0x00, 0x42, 0x00}))
+        << "u\"AB\" = two LE 16-bit units 0x0041 0x0042";
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3) << "2 code units + wide NUL";
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::U16);
+}
+
+TEST(HirLoweringCSubset, Utf32StringElementAndBytes) {
+    // `U"AB"` → Array<U32,3>; bytes = 41 00 00 00 42 00 00 00.
+    SemanticModel model = analyzeCSubset("void f() { U\"AB\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U32);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value),
+              std::string({0x41, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00}));
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::U32);
+}
+
+TEST(HirLoweringCSubset, Utf8StringElementAndBytes) {
+    // `u8"AB"` → Array<U8,3> (1 byte/ASCII unit); bytes = 41 42.
+    SemanticModel model = analyzeCSubset("void f() { u8\"AB\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U8);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value), "AB");
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3) << "2 u8 units + NUL";
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::U8);
+}
+
+TEST(HirLoweringCSubset, Utf16BmpMultibyteDecodesToOneUnit) {
+    // `u"€"` — U+20AC, source bytes E2 82 AC — UTF-8-decodes to ONE U16 unit.
+    // THE witness that the tokenizer's raw bytes are UTF-8-decoded (not passed
+    // through byte-for-byte): 3 source bytes → 1 code unit → Array<U16,2>.
+    SemanticModel model = analyzeCSubset("void f() { u\"\xe2\x82\xac\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U16);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value), std::string({static_cast<char>(0xAC), 0x20}))
+        << "U+20AC as one LE 16-bit unit";
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 2) << "ONE code unit + NUL (NOT 3 bytes + NUL)";
+}
+
+TEST(HirLoweringCSubset, Utf16AstralEncodesSurrogatePair) {
+    // Cycle C: `u"😀"` — U+1F600 (F0 9F 98 80), a supplementary-plane cp under a
+    // 16-bit element — now encodes as a UTF-16 SURROGATE PAIR: high 0xD83D then
+    // low 0xDE00, i.e. the LE bytes 3D D8 00 DE (TWO code units), NEVER a silent
+    // truncation. The array is Array<U16,3> (2 units + wide NUL). Red-on-disable:
+    // revert the encodeCodepoint U16 astral branch and this fails to compile.
+    SemanticModel model = analyzeCSubset("void f() { u\"\xf0\x9f\x98\x80\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U16);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value),
+              std::string({0x3D, static_cast<char>(0xD8), 0x00, static_cast<char>(0xDE)}))
+        << "U+1F600 as a UTF-16 surrogate pair: high 0xD83D then low 0xDE00 (LE)";
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3) << "2 code units (surrogate pair) + wide NUL";
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::U16);
+}
+
+TEST(HirLoweringCSubset, UcnAstralStringEncodesSurrogatePair) {
+    // The `\U` universal-character-name form of the astral case: `u"\U0001F600"`
+    // decodes (in the shared byte decoder) to U+1F600 and encodes to the SAME
+    // surrogate pair 3D D8 00 DE as the raw `u"😀"`. Proves the UCN escape path.
+    SemanticModel model = analyzeCSubset("void f() { u\"\\U0001F600\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U16);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value),
+              std::string({0x3D, static_cast<char>(0xD8), 0x00, static_cast<char>(0xDE)}))
+        << "\\U0001F600 → surrogate pair 0xD83D 0xDE00 (LE)";
+}
+
+TEST(HirLoweringCSubset, UcnBmpU32String) {
+    // `U"é"` — the BMP UCN é (U+00E9) under a 32-bit element → one LE u32
+    // unit 0x000000E9. The array is Array<U32,2> (1 unit + wide NUL).
+    SemanticModel model = analyzeCSubset("void f() { U\"\\u00e9\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U32);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value),
+              std::string({static_cast<char>(0xE9), 0x00, 0x00, 0x00}))
+        << "\\u00e9 → one LE u32 unit 0x000000E9";
+}
+
+TEST(HirLoweringCSubset, UcnSurrogateHalfStringFailsLoud) {
+    // FF1/FF2: `U"\uD800"` names a UTF-16 surrogate half — not a Unicode scalar
+    // value. It fails loud with the dedicated H_InvalidUniversalCharacterName
+    // (6.4.3), NEVER a silent CESU-8 / wrong unit.
+    SemanticModel model = analyzeCSubset("void f() { U\"\\uD800\"; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "a surrogate-half UCN must fail lowering";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_InvalidUniversalCharacterName), 1u);
+}
+
+TEST(HirLoweringCSubset, WideStringByteEscapeFailsLoud) {
+    // FF3: `u"\xC3\xA9"` uses `\x` byte escapes in a wide/UTF string. The old path
+    // silently collapsed the two intended code units into one (0x00E9); Cycle C
+    // fails loud with H_WideByteEscapeUnsupported (a raw code-unit value is not a
+    // code point — the escape-value-as-code-unit feature is deferred). Narrow
+    // `"\xC3\xA9"` is UNCHANGED (byte-producing).
+    SemanticModel model = analyzeCSubset("void f() { u\"\\xC3\\xA9\"; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "a byte escape in a wide string must fail lowering";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideByteEscapeUnsupported), 1u);
+}
+
+TEST(HirLoweringCSubset, WideCharByteEscapeFailsLoud) {
+    // MEDIUM-1 (code-audit): the wide-CHAR byte-escape path is the char twin of
+    // WideStringByteEscapeFailsLoud (FF3). `u'\xC3\xA9'` must fail loud with
+    // H_WideByteEscapeUnsupported (decodeWideCharCodepoint → ByteEscapeInWide), NOT
+    // silently collapse C3 A9 → one char16_t 0x00E9. This is the sole exerciser of the
+    // ByteEscapeInWide enumerator on the char path — a refactor dropping the guard would
+    // reintroduce the collapse miscompile for the char form with nothing red.
+    SemanticModel model = analyzeCSubset("void f() { u'\\xC3\\xA9'; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "a byte escape in a wide char must fail lowering";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideByteEscapeUnsupported), 1u);
+}
+
+TEST(HirLoweringCSubset, WideStringIllFormedUtf8FailsLoud) {
+    // MEDIUM-2 (code-audit): after Cycle C, H_WideCharSurrogateUnsupported's surviving
+    // trigger is a RAW ill-formed UTF-8 byte in a wide string body (astral-under-U16 now
+    // surrogate-encodes; the `\x` route is shadowed by FF3's H_WideByteEscapeUnsupported).
+    // A lone 0x80 (an invalid UTF-8 lead byte) must fail loud, not emit a garbage code
+    // unit — this is the sole red-on-disable for that still-live diagnostic.
+    std::string src = "void f() { u\"";
+    src += static_cast<char>(0x80);
+    src += "\"; }";
+    SemanticModel model = analyzeCSubset(src);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "a raw ill-formed UTF-8 byte in a wide string must fail";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideCharSurrogateUnsupported), 1u);
+}
+
+TEST(HirLoweringCSubset, NarrowStringByteEscapeStillWorks) {
+    // FF3 boundary: the NARROW `"\xC3\xA9"` keeps `\x` escapes (byte-producing) —
+    // Array<Char,3> with the two raw bytes C3 A9. Proves FF3 did not regress the
+    // narrow path.
+    SemanticModel model = analyzeCSubset("void f() { \"\\xC3\\xA9\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::Char);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value),
+              std::string({static_cast<char>(0xC3), static_cast<char>(0xA9)}))
+        << "narrow \\xC3\\xA9 = the two raw bytes, unchanged";
+}
+
+TEST(HirLoweringCSubset, NarrowStringUnchangedUnderPrefixTable) {
+    // Regression: a bare `"AB"` still types Array<Char,3> with the raw bytes —
+    // the prefix table's auto-seeded narrow row is byte-identical to before.
+    SemanticModel model = analyzeCSubset("void f() { \"AB\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::Char);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value), "AB");
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::Char);
+}
+
+TEST(HirLoweringCSubset, WideStringRoundTripsThroughDsshirText) {
+    // F6: a `u"AB"` literal's element core (U16) must survive the .dsshir
+    // emit→parse round-trip. `literalCoreFor` reads the core off the Array element
+    // (NOT a hardcoded Char), so the re-parsed pool value carries U16, not Char.
+    SemanticModel model = analyzeCSubset("void f() { u\"AB\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+
+    std::vector<std::string> names = symbolNames(model);
+    HirTextContext ctx;
+    ctx.interner    = &model.lattice().interner();
+    ctx.symbolNames = &names;
+    ctx.literalPool = &res->literalPool;
+    DiagnosticReporter er;
+    std::string const out = emitHir(res->hir, ctx, er);
+
+    DiagnosticReporter pr;
+    auto parsed = parseHir(out, CompilationUnitId{1}, pr);
+    std::string diags;
+    for (auto const& d : pr.all())
+        diags += std::string{diagnosticCodeName(d.code)} + ": " + d.actual + "\n";
+    ASSERT_TRUE(parsed->ok) << "u\"AB\" did not round-trip/verify\n" << diags;
+    ASSERT_EQ(parsed->literalPool.size(), 1u);
+    EXPECT_EQ(parsed->literalPool.at(0).core, TypeKind::U16)
+        << "the re-parsed wide-string core must be U16 (read off the Array element, "
+           "NOT hardcoded Char)";
+}
+
+// ── Cycle D — C11/C23 6.4.5p5: adjacent-concat prefix MIXING ────────────────
+// A run of adjacent string literals takes the SINGLE distinct non-narrow prefix
+// as its effective prefix (narrow segments widen to it, position-independent);
+// TWO DIFFERENT non-narrow prefixes fail loud (impl-defined reject). These pin
+// the two silent defects Cycle A left (mistype + miscompile) and the FF3-mixed hole.
+
+TEST(HirLoweringCSubset, ConcatNarrowWidensLeadingWidePrefix) {
+    // `L"a" "b"` — the L segment leads; the NARROW "b" widens to wchar_t. Under the
+    // POSIX default wchar_t is I32 → Array<I32,3>. The two units are 'a','b'.
+    SemanticModel model = analyzeCSubset("void f() { L\"a\" \"b\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u) << "the two pieces fold into ONE literal";
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::I32) << "the run is wide (wchar_t=I32 on POSIX)";
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3) << "'a' + widened 'b' + wide NUL";
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::I32);
+}
+
+TEST(HirLoweringCSubset, ConcatNarrowWidensTrailingWidePrefix) {
+    // THE defect fix: `"a" L"b"` — the FIRST opener is NARROW, so pre-Cycle-D keyed
+    // the run's core on `"` and DROPPED the `L` → a silent narrow mistype. The run's
+    // effective prefix is L (position-independent), so this is Array<wchar_t,3> and
+    // the narrow "a" widens. RED-ON-DISABLE: revert to first-opener keying → Char.
+    SemanticModel model = analyzeCSubset("void f() { \"a\" L\"b\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::I32)
+        << "`\"a\" L\"b\"` is WIDE — the trailing L prefix wins (was silently dropped)";
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::I32);
+}
+
+TEST(HirLoweringCSubset, ConcatNarrowWidenByteBlobPosixVsPe) {
+    // THE byte-blob pin proving the NARROW segment WIDENED to the run's wide element
+    // width. `"a" L"b"` = {'a','b'} as wchar_t. On POSIX (I32) each unit is 4 LE
+    // bytes → 61 00 00 00 62 00 00 00. On pe (U16) each is 2 LE bytes → 61 00 62 00.
+    // A first-opener-narrow regression would emit the raw bytes `61 62` (Char) — a
+    // different length AND width on BOTH formats.
+    {
+        SemanticModel model = analyzeCSubset("void f() { \"a\" L\"b\"; }");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        ASSERT_EQ(res->literalPool.size(), 1u);
+        auto const& v = res->literalPool.at(0);
+        EXPECT_EQ(v.core, TypeKind::I32);
+        ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+        EXPECT_EQ(std::get<std::string>(v.value),
+                  std::string({0x61, 0x00, 0x00, 0x00, 0x62, 0x00, 0x00, 0x00}))
+            << "POSIX wchar_t=I32: 'a' and widened 'b' as two LE 4-byte units";
+    }
+    {
+        SemanticModel model = analyzeCSubsetPe("void f() { \"a\" L\"b\"; }");
+        ASSERT_FALSE(model.hasErrors());
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+        ASSERT_EQ(res->literalPool.size(), 1u);
+        auto const& v = res->literalPool.at(0);
+        EXPECT_EQ(v.core, TypeKind::U16) << "pe wchar_t is the U16 UTF-16 unit";
+        ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+        EXPECT_EQ(std::get<std::string>(v.value),
+                  std::string({0x61, 0x00, 0x62, 0x00}))
+            << "pe wchar_t=U16: 'a' and widened 'b' as two LE 2-byte units";
+    }
+}
+
+TEST(HirLoweringCSubset, ConcatSamePrefixPreserved) {
+    // `u"a" u"b"` — the SAME non-narrow prefix on both segments is NOT a conflict
+    // (one distinct kind). Array<U16,3>, existing behavior preserved.
+    SemanticModel model = analyzeCSubset("void f() { u\"a\" u\"b\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::U16);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value), std::string({0x61, 0x00, 0x62, 0x00}))
+        << "u\"a\" u\"b\" = two LE 16-bit units 0x0061 0x0062";
+}
+
+TEST(HirLoweringCSubset, ConcatConflictingNonNarrowPrefixesFailLoud) {
+    // Each ordered pair of two DIFFERENT non-narrow prefixes is 6.4.5p5's impl-
+    // defined case → fail loud with H_ConflictingStringLiteralPrefixes (NEVER a
+    // silent resolve to one prefix, which drops the other's element width). Also a
+    // 3-segment run with a LEADING NARROW piece, to pin the fold across positions.
+    for (char const* src : {"void f() { u\"a\" U\"b\"; }",     // u16 vs u32
+                            "void f() { u8\"a\" u\"b\"; }",    // char8_t vs char16_t
+                            "void f() { L\"a\" u\"b\"; }",     // wchar_t vs char16_t
+                            "void f() { \"a\" L\"b\" u\"c\"; }"}) {  // leading narrow, then L vs u
+        SemanticModel model = analyzeCSubset(src);
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_FALSE(res->ok) << src;
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_ConflictingStringLiteralPrefixes), 1u) << src;
+    }
+}
+
+TEST(HirLoweringCSubset, ConcatConflictPlainStatementFailsLoud) {
+    // MF1 (red-on-disable via the SPECIFIC code): a PLAIN statement `u"a" U"b";` re-derives
+    // its type at lowering (the semantic tier left it untyped). The EXPLICIT early conflict
+    // branch reports the RIGHT reason — H_ConflictingStringLiteralPrefixes. Without it the
+    // conflict is NOT silent (the type-drop guard still fires as a backstop: a Char stamp
+    // under a wide effective opener) but with the WRONG reason (H_WideCharSurrogateUnsupported
+    // "not well-formed UTF-8"). So this pins the branch via the EXACT code (countCode below),
+    // and res->ok stays FALSE either way — defense in depth, correct-reason on top.
+    SemanticModel model = analyzeCSubset("void f() { u\"a\" U\"b\"; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok)
+        << "a mixed-prefix concat as a plain statement must fail lowering, not "
+           "silently type Array<Char,3>";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ConflictingStringLiteralPrefixes), 1u);
+    EXPECT_EQ(res->literalPool.size(), 0u) << "no literal is minted on the conflict path";
+}
+
+TEST(HirLoweringCSubset, ConcatFF3MixedNarrowWidePrefixFailsLoud) {
+    // The FF3-mixed hole (now CLOSED): `"a" L"\xC3"` — the run is WIDE (effective
+    // prefix L) but the FIRST opener is narrow. Pre-Cycle-D the FF3 byte-escape guard
+    // keyed on the first opener → narrow → MISS → the old silent UTF-8 collapse. Now
+    // the guard keys on the run's effective prefix, so the `\xC3` byte escape in a
+    // wide run fails loud with H_WideByteEscapeUnsupported.
+    SemanticModel model = analyzeCSubset("void f() { \"a\" L\"\\xC3\"; }");
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "a byte escape in a wide (via a later prefix) run must fail";
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_WideByteEscapeUnsupported), 1u);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_ConflictingStringLiteralPrefixes), 0u)
+        << "a SINGLE non-narrow prefix is not a conflict — only the byte escape fires";
+}
+
+TEST(HirLoweringCSubset, ConcatAllNarrowUnchanged) {
+    // RED-ON-DISABLE guard: the effective-prefix change must NOT alter the all-narrow
+    // path. `"a" "b"` stays byte-identical Array<Char,3> with the raw bytes "ab".
+    SemanticModel model = analyzeCSubset("void f() { \"a\" \"b\"; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    ASSERT_EQ(res->literalPool.size(), 1u);
+    auto const& v = res->literalPool.at(0);
+    EXPECT_EQ(v.core, TypeKind::Char);
+    ASSERT_TRUE(std::holds_alternative<std::string>(v.value));
+    EXPECT_EQ(std::get<std::string>(v.value), "ab");
+    auto const& ti = model.lattice().interner();
+    HirNodeId body = res->hir.functionBody(res->hir.moduleDecls(res->hir.root())[0]);
+    HirNodeId lit  = res->hir.exprStmtExpr(res->hir.children(body)[0]);
+    TypeId const ty = res->hir.typeId(lit);
+    ASSERT_EQ(ti.kind(ty), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(ty)[0], 3);
+    EXPECT_EQ(ti.kind(ti.operands(ty)[0]), TypeKind::Char);
 }
 
 // ── golden ────────────────────────────────────────────────────────────────
@@ -3986,6 +4765,59 @@ TEST(HirLoweringCSubset, SizeofValueOperandCarriesExpressionType) {
         << "…whose pointee is the Array itself";
 }
 
+// C11/C23 6.5.3.4: `_Alignof(T)` / `alignof(T)` lower to a core HirKind::AlignOf
+// node carrying the QUERIED type on its single [TypeRef] child (mirroring SizeOf).
+// Covers both spellings AND a struct type-name. RED-ON-DISABLE: drop the
+// lowerAlignof dispatch → the operand alt tries to type `_Alignof`/`alignof` as an
+// expression and the front end fails (no AlignOf node reaches the body).
+TEST(HirLoweringCSubset, AlignofLowersToAlignOfNodeCarryingQueriedType) {
+    SemanticModel model = analyzeCSubset(
+        "struct CharDouble { char c; double d; };\n"
+        "unsigned long long f(void) {\n"
+        "    return _Alignof(double) + alignof(char) "
+        "+ _Alignof(struct CharDouble);\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? std::string{}
+            : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    HirNodeId const fn = firstFunction(res->hir);
+    ASSERT_TRUE(fn.valid());
+    // Collect every AlignOf in the body, pre-order = source order.
+    std::vector<HirNodeId> alignofs;
+    auto const collect = [&](auto&& self, HirNodeId n) -> void {
+        if (!n.valid()) return;
+        if (res->hir.kind(n) == HirKind::AlignOf) alignofs.push_back(n);
+        for (HirNodeId c : res->hir.children(n)) self(self, c);
+    };
+    collect(collect, res->hir.functionBody(fn));
+    ASSERT_EQ(alignofs.size(), 3u) << "three _Alignof/alignof sites expected";
+    auto const& ti = model.lattice().interner();
+    auto const queriedType = [&](HirNodeId n) -> TypeId {
+        auto const kids = res->hir.children(n);
+        EXPECT_EQ(kids.size(), 1u) << "AlignOf carries exactly [TypeRef]";
+        // The AlignOf node itself is size_t (U64) — its result type.
+        EXPECT_EQ(ti.kind(res->hir.typeId(n)), TypeKind::U64)
+            << "_Alignof yields size_t";
+        return kids.empty() ? TypeId{} : res->hir.typeId(kids.front());
+    };
+    // [0] _Alignof(double): the queried type is the primitive double (F64).
+    TypeId const t0 = queriedType(alignofs[0]);
+    ASSERT_TRUE(t0.valid());
+    EXPECT_EQ(ti.kind(t0), TypeKind::F64) << "_Alignof(double) queries F64";
+    // [1] alignof(char): the C23 spelling, queried type char (TypeKind::Char).
+    TypeId const t1 = queriedType(alignofs[1]);
+    ASSERT_TRUE(t1.valid());
+    EXPECT_EQ(ti.kind(t1), TypeKind::Char) << "alignof(char) queries char";
+    // [2] _Alignof(struct CharDouble): the whole struct type.
+    TypeId const t2 = queriedType(alignofs[2]);
+    ASSERT_TRUE(t2.valid());
+    EXPECT_EQ(ti.kind(t2), TypeKind::Struct)
+        << "_Alignof(struct CharDouble) queries the STRUCT type";
+}
+
 // c90 (D-CSUBSET-ASSIGN-VALUE-RHS-COERCE): a plain `=` used as a VALUE stores
 // the RHS COERCED to the lvalue's type (C 6.5.16p3) — the tier-boundary pin
 // for `finishAssign`'s plain arm (and its `lowerBinary` Assign-arm mirror) at
@@ -4287,4 +5119,146 @@ TEST(HirLoweringCSubset, SehLeaveFailsLoud) {
     auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok);
     EXPECT_EQ(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 1u);
+}
+
+// ── C11/C23 6.7.10 static_assert (D-CSUBSET-STATIC-ASSERT) ──────────────────
+//
+// The condition is const-evaluated at the SEMANTIC tier (the point that folds
+// sizeof / enum / arithmetic); a zero / non-constant fold fails loud with
+// S_StaticAssertFailed. A passing assertion produces NO HIR (lowers to nothing —
+// its hirLowering row maps to Skip) and the module is left with just its real
+// declarations.
+
+// Count the top-level Function decls in a lowered module — the witness that a
+// passing static_assert added nothing at module scope.
+[[nodiscard]] std::size_t moduleFunctionCount(Hir const& hir) {
+    std::size_t n = 0;
+    for (HirNodeId d : hir.moduleDecls(hir.root()))
+        if (hir.kind(d) == HirKind::Function) ++n;
+    return n;
+}
+
+// NOTE on sizeof: an array-dim / static_assert `sizeof` folds ONLY when
+// `analyze()` is given the target's aggregateLayout. The direct-API
+// `analyzeCSubset` helper here passes nullopt (the documented direct-API
+// default), so the sizeof-in-condition FOLDING pins live in
+// test_semantic_analyzer_c_subset.cpp (which passes AggregateLayoutParams) and
+// end-to-end in examples/c-subset/static_assert_true. The pins BELOW exercise
+// the parse / peel / 1-arg / spelling / block-scope / enum / non-const paths,
+// which need no layout.
+
+// POSITIVE — the canonical passing idiom: an arithmetic condition FOLDS true,
+// the assertion passes, and NOTHING is emitted for it.
+TEST(HirLoweringCSubset, StaticAssertArithmeticTrueCompilesToNothing) {
+    SemanticModel model = analyzeCSubset(
+        "_Static_assert(2 + 2 == 4, \"math works\");\n"
+        "int main(void){ return 42; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "2+2==4 must FOLD true in the static_assert condition";
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    // The assertion contributed no module node — only `main` survives.
+    EXPECT_EQ(moduleFunctionCount(res->hir), 1u);
+}
+
+// NEGATIVE — a false arithmetic condition fails loud.
+TEST(HirLoweringCSubset, StaticAssertArithmeticFalseFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "_Static_assert(1 == 2, \"one is not two\");\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u);
+}
+
+// C23 1-ARG PASSING — `_Static_assert(1);` (no message) compiles to nothing. The
+// critical peelToCore case: the 1-arg node has a SINGLE meaningful child, so a
+// naive peel would descend past it → H0009; the Skip-mapped rule stops the peel.
+TEST(HirLoweringCSubset, StaticAssert1ArgTrueCompilesToNothing) {
+    SemanticModel model = analyzeCSubset(
+        "_Static_assert(1);\n"
+        "int main(void){ return 42; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u);
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    // No H0009 (Ref-to-unbound / unsupported lowering) — the 1-arg form must NOT
+    // fall through the wrapper peel into its condition child.
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnsupportedLoweringForKind), 0u);
+    EXPECT_EQ(moduleFunctionCount(res->hir), 1u);
+}
+
+// C23 1-ARG FAILING — `_Static_assert(0);` fails loud with S_StaticAssertFailed
+// (NOT H0009). Pins that the 1-arg form is reached by the semantic check.
+TEST(HirLoweringCSubset, StaticAssert1ArgFalseFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "_Static_assert(0);\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::P_NoAlternativeMatched), 0u)
+        << "the 1-arg form must PARSE (no parse fallthrough)";
+}
+
+// C23 `static_assert` SPELLING — behaves identically to `_Static_assert`.
+TEST(HirLoweringCSubset, StaticAssertC23SpellingTrue) {
+    SemanticModel model = analyzeCSubset(
+        "static_assert(1 + 1 == 2, \"addition works\");\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+TEST(HirLoweringCSubset, StaticAssertC23SpellingFalseFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "static_assert(0, \"nope\");\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u);
+}
+
+// BLOCK SCOPE — a static_assert is a valid statement-level declaration. Both a
+// passing and a failing one are checked at the same tier.
+TEST(HirLoweringCSubset, StaticAssertBlockScopeTrueCompilesToNothing) {
+    SemanticModel model = analyzeCSubset(
+        "int main(void){ _Static_assert(3 > 1, \"three beats one\"); return 42; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u);
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+TEST(HirLoweringCSubset, StaticAssertBlockScopeFalseFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int main(void){ _Static_assert(1 == 0, \"impossible\"); return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u);
+}
+
+// BLOCK SCOPE 1-ARG — the message-less form at statement scope (both the parse
+// and the peel must handle the single-child node here too).
+TEST(HirLoweringCSubset, StaticAssertBlockScope1ArgFalseFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int main(void){ static_assert(1 > 2); return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u);
+}
+
+// ENUM CONSTANT in the condition folds (same evaluator that folds enum constants
+// in an array dimension).
+TEST(HirLoweringCSubset, StaticAssertEnumConstantFolds) {
+    SemanticModel model = analyzeCSubset(
+        "enum { KVAL = 7 };\n"
+        "_Static_assert(KVAL == 7, \"kval is 7\");\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// NON-CONSTANT condition (a float — not an integer constant expression) fails
+// loud. C 6.7.10 requires an integer constant expression; a float condition
+// cannot fold in `constIntExpr` → S_StaticAssertFailed.
+TEST(HirLoweringCSubset, StaticAssertFloatConditionFailsAsNonConstant) {
+    SemanticModel model = analyzeCSubset(
+        "_Static_assert(3.5, \"float is not an ICE\");\n"
+        "int main(void){ return 0; }\n");
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_StaticAssertFailed), 1u);
 }

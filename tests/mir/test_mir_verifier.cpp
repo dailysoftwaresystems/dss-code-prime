@@ -418,6 +418,59 @@ TEST(MirVerifier, ArgIndexOutOfRange) {
     EXPECT_GE(countCode(r, DiagnosticCode::I_ArgIndexOutOfRange), 1u);
 }
 
+// #3 (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): an Alloca whose secondary payload
+// (its effective alignment) is not a power of two ≤ 256 is rejected with
+// I_AllocaAlignmentNotPowerOfTwo. Guards a rebuild/merge site that drops or
+// corrupts the alignment — the value drives per-alloca frame-slot placement, so a
+// garbage value would mis-align the stack local. Here 3 (not a power of two).
+TEST(MirVerifier, AllocaNonPowerOfTwoAlignmentRejected) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const fnSig = interner.fnSig({}, interner.primitive(TypeKind::Void),
+                                        CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    // Alloca: payload = byte size (0 = scalar), payload2 = alignment = 3 (BAD).
+    b.addInst(MirOpcode::Alloca, {}, ptr, /*payload=*/0,
+              MirInstFlags::None, /*payload2=*/3);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &interner};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_AllocaAlignmentNotPowerOfTwo), 1u);
+}
+
+// #3: a well-formed Alloca alignment (16, a power of two ≤ 256) — and the 0
+// "no over-alignment recorded" sentinel — pass the verifier cleanly. Pins that
+// the check does NOT false-positive on a legal value.
+TEST(MirVerifier, AllocaPowerOfTwoAlignmentAndZeroPass) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const fnSig = interner.fnSig({}, interner.primitive(TypeKind::Void),
+                                        CallConv::CcSysV);
+
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    b.addInst(MirOpcode::Alloca, {}, ptr, 0, MirInstFlags::None, /*align=*/16);
+    b.addInst(MirOpcode::Alloca, {}, ptr, 0, MirInstFlags::None, /*align=*/0);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &interner};
+    EXPECT_TRUE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_AllocaAlignmentNotPowerOfTwo), 0u);
+}
+
 // Return value type that doesn't match FnSig's return type emits
 // I_TerminatorTypeMismatch.
 TEST(MirVerifier, ReturnTypeMismatch) {

@@ -70,6 +70,28 @@ bitFieldStrategyRealized(BitFieldStrategy s) noexcept {
 // zero-width break) + `out.fieldOffsets` (one byte offset per field) + the
 // running `out.align` + the final `out.size`.
 
+// D-CSUBSET-MEMBER-ALIGNAS: fold field `i`'s explicit `alignas` override into its
+// natural alignment with MAX semantics — the SAME rule the non-bitfield struct/union
+// arm's `effectiveAlign` lambda applies, hoisted here so BOTH bit-field packers honor
+// a member `alignas` on their ORDINARY (non-bit-field) fields (a bit-field FIELD itself
+// can't carry alignas — the semantic phase rejects it). `alignas` on a non-bit-field
+// member of a bit-field-bearing struct is legal C11 6.7.5 and RAISES that field's (and
+// thus the struct's) alignment — it must never be silently dropped. Returns the natural
+// alignment unchanged when the struct carries no aligns or this field has no override;
+// `nullopt` when a stored override is not a power of two in [1, 256] (an upstream
+// alignas-semantics bug — fail loud rather than silently mis-pad, mirroring the
+// non-bit-field path's `Alignment::fromBytes` reject).
+[[nodiscard]] std::optional<Alignment>
+bitfieldPackerEffectiveAlign(TypeInterner const& interner, TypeId id,
+                             std::size_t i, Alignment natural) {
+    if (!interner.hasExplicitAligns(id)) return natural;
+    std::uint32_t const ovr = interner.explicitFieldAlign(id, i);
+    if (ovr == 0) return natural;   // no override on this field
+    auto const a = Alignment::fromBytes(ovr);
+    if (!a) return std::nullopt;
+    return maxAlign(natural, *a);
+}
+
 // GnuPacked: SysV/Itanium/GNU/AAPCS64/Apple little-endian. Bits flow LSB-first
 // through a single absolute `bitCursor`; a field's allocation unit is its
 // declared-type size; a straddle bumps to the next unit of that type; a
@@ -95,19 +117,28 @@ layoutStructBitfieldsGnuPacked(TypeId id, std::span<TypeId const> fields,
                 if (fops.empty()) return std::nullopt;
                 auto const elem = computeLayout(fops[0], interner, params, dm);
                 if (!elem) return std::nullopt;
-                std::uint64_t const fo =
-                    elem->align.alignUp((bitCursor + 7) / 8);
+                // A FAM can carry `alignas` (`alignas(16) int fam[];`): raise its
+                // effective alignment exactly as the non-bit-field path does.
+                auto const ea =
+                    bitfieldPackerEffectiveAlign(interner, id, i, elem->align);
+                if (!ea) return std::nullopt;
+                std::uint64_t const fo = ea->alignUp((bitCursor + 7) / 8);
                 out.fieldOffsets.push_back(fo);
-                out.align = maxAlign(out.align, elem->align);
+                out.align = maxAlign(out.align, *ea);
                 out.hasFlexibleArrayMember = true;
                 bitCursor = fo * 8;   // no size contribution
                 continue;
             }
             auto const fl = computeLayout(f, interner, params, dm);
             if (!fl) return std::nullopt;
-            std::uint64_t const fo = fl->align.alignUp((bitCursor + 7) / 8);
+            // Fold a member `alignas` override into the ordinary field's alignment
+            // (D-CSUBSET-MEMBER-ALIGNAS) — a bit-field-bearing struct's non-bit-field
+            // member may be over-aligned; the offset AND the struct align must honor it.
+            auto const ea = bitfieldPackerEffectiveAlign(interner, id, i, fl->align);
+            if (!ea) return std::nullopt;
+            std::uint64_t const fo = ea->alignUp((bitCursor + 7) / 8);
             out.fieldOffsets.push_back(fo);
-            out.align = maxAlign(out.align, fl->align);
+            out.align = maxAlign(out.align, *ea);
             bitCursor = (fo + fl->size) * 8;
             continue;
         }
@@ -174,18 +205,28 @@ layoutStructBitfieldsMsvcStraddle(TypeId id, std::span<TypeId const> fields,
                 if (fops.empty()) return std::nullopt;
                 auto const elem = computeLayout(fops[0], interner, params, dm);
                 if (!elem) return std::nullopt;
-                std::uint64_t const fo = elem->align.alignUp(highWaterByte);
+                // A FAM can carry `alignas`: raise its effective alignment
+                // (D-CSUBSET-MEMBER-ALIGNAS), mirroring the non-bit-field path.
+                auto const ea =
+                    bitfieldPackerEffectiveAlign(interner, id, i, elem->align);
+                if (!ea) return std::nullopt;
+                std::uint64_t const fo = ea->alignUp(highWaterByte);
                 out.fieldOffsets.push_back(fo);
-                out.align = maxAlign(out.align, elem->align);
+                out.align = maxAlign(out.align, *ea);
                 out.hasFlexibleArrayMember = true;
                 highWaterByte = fo;   // no size contribution
                 continue;
             }
             auto const fl = computeLayout(f, interner, params, dm);
             if (!fl) return std::nullopt;
-            std::uint64_t const fo = fl->align.alignUp(highWaterByte);
+            // Fold a member `alignas` override into the ordinary field's alignment
+            // (D-CSUBSET-MEMBER-ALIGNAS) — legal on a non-bit-field member of a
+            // bit-field-bearing struct; the offset AND struct align must honor it.
+            auto const ea = bitfieldPackerEffectiveAlign(interner, id, i, fl->align);
+            if (!ea) return std::nullopt;
+            std::uint64_t const fo = ea->alignUp(highWaterByte);
             out.fieldOffsets.push_back(fo);
-            out.align = maxAlign(out.align, fl->align);
+            out.align = maxAlign(out.align, *ea);
             highWaterByte = fo + fl->size;
             continue;
         }
@@ -334,11 +375,50 @@ computeLayout(TypeId id, TypeInterner const& interner,
                 out.size = out.align.alignUp(extent);
                 return out;
             }
+            // D-CSUBSET-PACKED: the whole-composite packed flag (C/C23
+            // `__attribute__((packed))`) removes ALL derived inter-field padding —
+            // the per-field baseline alignment becomes 1 — and the aggregate's own
+            // alignment stays 1 (out.align already seeded to 1). Read once; fed into
+            // `effectiveAlign`'s baseline below. An UNPACKED struct leaves `packed`
+            // false and the baseline is the field's natural align (the unchanged path).
+            bool const packed = interner.isPacked(id);
             // FC8 bitfields (D-CSUBSET-BITFIELD): a bitfield-free struct interns
             // with EMPTY scalars (see TypeInterner::structType), so this O(1) test
             // routes every existing struct down the unchanged byte path below.
             bool const anyBitfield = !interner.scalars(id).empty();
+            // D-CSUBSET-PACKED F5 belt (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the
+            // packed baseline is applied ONLY on the non-bit-field path (the
+            // `effectiveAlign` lambda below). A packed struct reaching the bit-field
+            // packer would silently get a NON-packed layout, so fail loud here
+            // (nullopt → positioned diag). The semantic `S_PackedBitfieldUnsupported`
+            // is the good-UX front door; this nullopt is the reliable backstop.
+            if (packed && anyBitfield) return std::nullopt;
             if (!anyBitfield) {
+                // D-CSUBSET-MEMBER-ALIGNAS: a struct may carry per-field `alignas`
+                // overrides. Read them once here; `effectiveAlign` folds field i's
+                // override (when non-zero) into its natural alignment with MAX
+                // semantics — a member alignas RAISES a field's alignment, never
+                // lowers it. An align-free struct (the common case) leaves
+                // `hasAligns` false and this collapses to the unchanged path below.
+                bool const hasAligns = interner.hasExplicitAligns(id);
+                auto effectiveAlign =
+                    [&](std::size_t i, Alignment natural) -> std::optional<Alignment> {
+                    // D-CSUBSET-PACKED: a packed composite removes all derived padding
+                    // — the per-field BASELINE alignment becomes 1. A member `alignas`
+                    // still RAISES it via the MAX-fold below (alignas wins per-field
+                    // even under packed — `alignas(8) int x;` in a packed struct keeps
+                    // 8-byte alignment).
+                    Alignment const baseline = packed ? Alignment::of<1>() : natural;
+                    if (!hasAligns) return baseline;
+                    std::uint32_t const ovr = interner.explicitFieldAlign(id, i);
+                    if (ovr == 0) return baseline;   // no override on this field
+                    // A stored override must be a power of two in [1, 256]; a value
+                    // outside that is an upstream (alignas-semantics) bug — fail loud
+                    // rather than silently mis-pad.
+                    auto const a = Alignment::fromBytes(ovr);
+                    if (!a) return std::nullopt;
+                    return maxAlign(baseline, *a);
+                };
                 std::uint64_t off = 0;
                 for (std::size_t i = 0; i < fields.size(); ++i) {
                     TypeId const f = fields[i];
@@ -353,18 +433,24 @@ computeLayout(TypeId id, TypeInterner const& interner,
                         if (fops.empty()) return std::nullopt;
                         auto const elem = computeLayout(fops[0], interner, params, dm);
                         if (!elem) return std::nullopt;
-                        off = elem->align.alignUp(off);
+                        // A FAM can carry alignas (`alignas(16) int fam[];`): raise
+                        // its effective alignment the same way as an ordinary field.
+                        auto const ea = effectiveAlign(i, elem->align);
+                        if (!ea) return std::nullopt;
+                        off = ea->alignUp(off);
                         out.fieldOffsets.push_back(off);
-                        out.align = maxAlign(out.align, elem->align);
+                        out.align = maxAlign(out.align, *ea);
                         out.hasFlexibleArrayMember = true;
                         continue;  // no size contribution
                     }
                     auto const fl = computeLayout(f, interner, params, dm);
                     if (!fl) return std::nullopt;   // out-of-scope field type → fail loud
-                    off = fl->align.alignUp(off);
+                    auto const ea = effectiveAlign(i, fl->align);
+                    if (!ea) return std::nullopt;
+                    off = ea->alignUp(off);
                     out.fieldOffsets.push_back(off);
                     off += fl->size;
-                    out.align = maxAlign(out.align, fl->align);
+                    out.align = maxAlign(out.align, *ea);
                 }
                 out.size = out.align.alignUp(off);
                 return out;
@@ -401,17 +487,51 @@ computeLayout(TypeId id, TypeInterner const& interner,
             // arm needs only the fail-loud gate (an unrealized/undeclared
             // strategy → nullopt), not a per-strategy dispatch. Empty scalars ⇒
             // no bitfield ⇒ the unchanged byte path.
+            // D-CSUBSET-PACKED: a packed union (`union {…} __attribute__((packed))`)
+            // has natural alignment 1 — the members already sit at offset 0, so packed
+            // only lowers the union's OWN alignment (and thus how it aligns when
+            // embedded). Read once; fed into effectiveAlign's baseline below.
+            bool const packed = interner.isPacked(id);
             bool const anyBitfield = !interner.scalars(id).empty();
+            // D-CSUBSET-PACKED F5 belt (D-CSUBSET-PACKED-BITFIELD-INTERACTION): the
+            // packed baseline is applied ONLY on the non-bit-field path below. A
+            // packed union carrying a bit-field member would silently get a NON-packed
+            // alignment, so fail loud here (the semantic S_PackedBitfieldUnsupported is
+            // the front door; this nullopt is the backstop).
+            if (packed && anyBitfield) return std::nullopt;
             if (anyBitfield) {
                 if (!bitFieldStrategyRealized(params.bitFieldStrategy))
                     return std::nullopt;
                 out.bitFields.assign(fields.size(), BitFieldPlacement{});
             }
+            // D-CSUBSET-MEMBER-ALIGNAS: a union member may carry an `alignas`
+            // override too (`union { alignas(16) char c; int i; }`). Fold it into
+            // the member's natural alignment with MAX semantics — identical to the
+            // struct arm; an align-free union leaves `hasAligns` false and this
+            // collapses to the unchanged `fl->align` path. (A union places every
+            // member at offset 0, so a member alignas only ever RAISES the union's
+            // overall alignment — and thus its size, rounded up — never a field's
+            // offset.)
+            bool const hasAligns = interner.hasExplicitAligns(id);
+            auto effectiveAlign =
+                [&](std::size_t i, Alignment natural) -> std::optional<Alignment> {
+                // D-CSUBSET-PACKED: a packed union removes the per-member baseline
+                // alignment (→ 1); a member `alignas` still RAISES it via the MAX-fold.
+                Alignment const baseline = packed ? Alignment::of<1>() : natural;
+                if (!hasAligns) return baseline;
+                std::uint32_t const ovr = interner.explicitFieldAlign(id, i);
+                if (ovr == 0) return baseline;   // no override on this member
+                auto const a = Alignment::fromBytes(ovr);
+                if (!a) return std::nullopt;    // stored non-pow2/>256 = upstream bug
+                return maxAlign(baseline, *a);
+            };
             std::uint64_t maxSize = 0;
             for (std::size_t i = 0; i < fields.size(); ++i) {
                 auto const fl = computeLayout(fields[i], interner, params, dm);
                 if (!fl) return std::nullopt;
-                out.align = maxAlign(out.align, fl->align);
+                auto const ea = effectiveAlign(i, fl->align);
+                if (!ea) return std::nullopt;
+                out.align = maxAlign(out.align, *ea);
                 if (anyBitfield) {
                     auto const bw = interner.fieldBitWidth(id, i);
                     if (bw.has_value() && *bw > 0) {

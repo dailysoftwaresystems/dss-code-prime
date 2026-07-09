@@ -1,19 +1,119 @@
 name: Package
 
-# Calls the reusable C++ app pkg workflow in DSS.DevOps.
-# See: https://github.com/dailysoftwaresystems/DSS.DevOps/blob/v2/.github/workflows/cpp-app-pkg.yml
-#
-# Fires on every push to release/{beta,stable}. The deploy workflow
-# performs the branch merge that triggers this — so a successful
-# `workflow_dispatch` Deploy run results in a tag + GH release here.
+# Package pipeline for this C++ application. Inlined from the DSS.DevOps reusable
+# `cpp-app-pkg.yml@v2` (a public repo cannot call the private/internal reusable).
+# Keep in sync with dailysoftwaresystems/DSS.DevOps.
 
 on:
   push:
     branches: ["release/beta", "release/stable"]
 
+concurrency:
+  group: pkg-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
 jobs:
-  pkg:
-    uses: dailysoftwaresystems/DSS.DevOps/.github/workflows/cpp-app-pkg.yml@v2
+  release:
+    runs-on: ${{ 'ubuntu-latest' }}
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      channel: ${{ steps.v.outputs.channel }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.DSS_PUBLIC_BOTS_APP_ID }}
+          private-key: ${{ secrets.DSS_PUBLIC_BOTS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Resolve version + channel
+        id: v
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION_FILE: ${{ 'VERSION' }}
+          TAG_PREFIX: ${{ 'v' }}
+        working-directory: ${{ '.' }}
+        run: |
+          if [ ! -f "$VERSION_FILE" ]; then
+            echo "::error::$VERSION_FILE not found"
+            exit 1
+          fi
+
+          raw=$(tr -d "[:space:]\r\"'" < "$VERSION_FILE")
+          if ! [[ "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::$VERSION_FILE value '$raw' is not Major.Minor.Patch"
+            exit 1
+          fi
+
+          branch="${GITHUB_REF##*/}"
+          channel="${branch#release/}"
+          case "$channel" in
+            beta|stable) ;;
+            *) echo "::error::Unsupported branch '$branch'. Expected release/{beta,stable}."; exit 1 ;;
+          esac
+
+          if [ "$channel" = "stable" ]; then
+            tag="${TAG_PREFIX}${raw}"
+          else
+            tag="${TAG_PREFIX}${raw}-${channel}"
+          fi
+
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "::error::Release $tag already exists. Bump $VERSION_FILE before re-running."
+            exit 1
+          fi
+
+          {
+            echo "version=$raw"
+            echo "channel=$channel"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Resolved: tag=$tag channel=$channel version=$raw"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.v.outputs.tag }}
+          CHANNEL: ${{ steps.v.outputs.channel }}
+          VERSION: ${{ steps.v.outputs.version }}
+        # `--generate-notes` asks GitHub to compose release notes from
+        # commits/PRs between the last tag and HEAD. The fallback to a
+        # static `--notes` body only fires for the first-ever release
+        # (no previous tag to diff against) — generate-notes returns an
+        # empty body in that case, which is fine; we replace it via the
+        # `--notes` arg if needed.
+        run: |
+          prerelease=""
+          if [ "$CHANNEL" != "stable" ]; then
+            prerelease="--prerelease"
+          fi
+
+          gh release create "$TAG" \
+            --title "Release $TAG" \
+            --generate-notes \
+            $prerelease
+
+          # Verify the body landed; some first-tag scenarios produce an
+          # empty notes body. We must distinguish "body is genuinely
+          # empty" from "fetch failed" — the old `2>/dev/null || true`
+          # mask treated transient API errors and rate limits the same as
+          # "first release", silently clobbering --generate-notes output
+          # with the minimal stub on every transient failure.
+          if ! body=$(gh release view "$TAG" --json body --jq .body 2>&1); then
+            echo "::warning::Could not read release body to verify --generate-notes output: $body"
+            echo "::warning::Skipping notes-fallback to avoid clobbering generated notes on a transient failure."
+          elif [ -z "$body" ]; then
+            gh release edit "$TAG" \
+              --notes "Channel: $CHANNEL"$'\n'"Version: $VERSION"
+          fi

@@ -1,0 +1,11 @@
+{
+  "$comment": "C11/C23 6.4.4.4 char16_t constraint witness: u'😀' (U+1F600, a raw astral character with no universal-character-name escape) is a supplementary-plane code point that needs a UTF-16 surrogate PAIR — but ONE char16_t holds ONE code unit. The CST→HIR lowering FAILS LOUD with H_WideCharValueUnrepresentable (an unsuppressable code) rather than silently truncating to a wrong 16-bit unit. u'…' is always U16 (format-independent), so the reject is target-independent. Red-on-disable: drop the U16 range check in decodeWideCharCodepoint and this compiles emitting a wrong unit. The load-bearing pin is the CODE + a rejected compile at the literal's position.",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec" }
+  ],
+  "expectDiagnostics": [
+    { "code": "H_WideCharValueUnrepresentable", "line": 1, "col": 25 }
+  ]
+}

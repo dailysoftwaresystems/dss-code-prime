@@ -38,6 +38,11 @@ TypeId SemanticModel::typeAt(NodeId id) const {
     return p ? *p : InvalidType;
 }
 
+NodeId SemanticModel::selectedGenericExpr(NodeId id) const {
+    auto const* p = nodeToSelectedExpr_.tryGet(id);
+    return p ? *p : InvalidNode;
+}
+
 std::span<NodeId const> SemanticModel::usesOf(SymbolId symbol) const noexcept {
     auto it = usesBySymbol_.find(symbol.v);
     if (it == usesBySymbol_.end()) return {};

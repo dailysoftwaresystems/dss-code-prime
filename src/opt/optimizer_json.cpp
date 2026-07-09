@@ -186,8 +186,25 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
         }
     }
 
+    // Verify frequency (D-OPT1-VERIFY-FREQUENCY-CONFIG). Optional bool; default
+    // true = verify after EVERY pass (the developer posture: LLVM `-verify-each`
+    // / GCC `--enable-checking=yes` — pinpoints the offending pass). false =
+    // verify ONCE at pipeline end (the release/production posture — trust tested
+    // passes, verify before codegen). Non-bool → X_PipelineMalformed.
+    bool verifyEveryPass = true;
+    if (pipe.contains("verifyEveryPass")) {
+        if (!pipe.at("verifyEveryPass").is_boolean()) {
+            emitMalformed(coll,
+                          std::string{sourceLabel} + "/pipeline/verifyEveryPass",
+                          "must be a boolean");
+        } else {
+            verifyEveryPass = pipe.at("verifyEveryPass").get<bool>();
+        }
+    }
+
     rejectUnknownKeys(coll, pipe, std::string{sourceLabel} + "/pipeline",
-                      {"name", "passes", "maxIterations", "inlineThreshold"});
+                      {"name", "passes", "maxIterations", "inlineThreshold",
+                       "verifyEveryPass"});
 
     // Empty pipeline = silent no-op at the optimizer engine. Reject
     // at load-time so a stray `"passes": []` doesn't ship a build
@@ -201,7 +218,7 @@ parsePipelineDoc(json const& doc, std::string_view sourceLabel) {
         return std::unexpected(std::move(coll).release());
     }
     return OptPipeline{std::move(name), std::move(passes), maxIterations,
-                       inlineThreshold};
+                       inlineThreshold, verifyEveryPass};
 }
 
 } // namespace

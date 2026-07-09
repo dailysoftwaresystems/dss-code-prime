@@ -54,6 +54,32 @@ std::optional<ScopeKind> parseScopeName(std::string_view name) {
     return std::nullopt;
 }
 
+// Core-kind NAME → TypeKind, for the JSON `core` / `elementCore` fields (the
+// scalar subset that names a value's element type — no aggregate/pointer kinds).
+// The single source of truth for the name↔kind mapping in this loader; the
+// `semantics` block's local `parseCore` delegates here so the two never drift.
+std::optional<TypeKind> coreTypeFromName(std::string_view name) {
+    if (name == "Bool")    return TypeKind::Bool;
+    if (name == "I8")      return TypeKind::I8;
+    if (name == "I16")     return TypeKind::I16;
+    if (name == "I32")     return TypeKind::I32;
+    if (name == "I64")     return TypeKind::I64;
+    if (name == "I128")    return TypeKind::I128;
+    if (name == "U8")      return TypeKind::U8;
+    if (name == "U16")     return TypeKind::U16;
+    if (name == "U32")     return TypeKind::U32;
+    if (name == "U64")     return TypeKind::U64;
+    if (name == "U128")    return TypeKind::U128;
+    if (name == "F16")     return TypeKind::F16;
+    if (name == "F32")     return TypeKind::F32;
+    if (name == "F64")     return TypeKind::F64;
+    if (name == "F128")    return TypeKind::F128;
+    if (name == "Char")    return TypeKind::Char;
+    if (name == "Byte")    return TypeKind::Byte;
+    if (name == "Void")    return TypeKind::Void;
+    return std::nullopt;
+}
+
 // Built-in token-kind names — predeclared so shape references like
 // "Identifier" resolve regardless of whether the user re-declared them
 // under tokens/keywords. Mirrors CoreTokenKind on the lexer side.
@@ -4224,25 +4250,7 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // kinds are NEVER named here — they live in the registry, not on
             // the core lattice.
             auto const parseCore = [](std::string_view name) -> std::optional<TypeKind> {
-                if (name == "Bool")    return TypeKind::Bool;
-                if (name == "I8")      return TypeKind::I8;
-                if (name == "I16")     return TypeKind::I16;
-                if (name == "I32")     return TypeKind::I32;
-                if (name == "I64")     return TypeKind::I64;
-                if (name == "I128")    return TypeKind::I128;
-                if (name == "U8")      return TypeKind::U8;
-                if (name == "U16")     return TypeKind::U16;
-                if (name == "U32")     return TypeKind::U32;
-                if (name == "U64")     return TypeKind::U64;
-                if (name == "U128")    return TypeKind::U128;
-                if (name == "F16")     return TypeKind::F16;
-                if (name == "F32")     return TypeKind::F32;
-                if (name == "F64")     return TypeKind::F64;
-                if (name == "F128")    return TypeKind::F128;
-                if (name == "Char")    return TypeKind::Char;
-                if (name == "Byte")    return TypeKind::Byte;
-                if (name == "Void")    return TypeKind::Void;
-                return std::nullopt;
+                return coreTypeFromName(name);
             };
 
             // FC3 c1: the optional `coreByDataModel` sub-object
@@ -4923,6 +4931,42 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     }
                                     rule.linkageSpecifierIgnoredKinds.push_back(
                                         data.schemaTokens->find(kn));
+                                }
+                            }
+                        }
+
+                        // FC16 (D-CSUBSET-NORETURN): optional list of specifier
+                        // IDENTIFIER spellings the linkage scan skips as semantic
+                        // NO-OPs (the identifier-granularity sibling of
+                        // linkageSpecifierIgnoredKinds/Rules):
+                        //   "linkageSpecifierIgnoredNames": ["noreturn"]
+                        // For a NON-linkage attribute that shares the GNU
+                        // `__attribute__((...))` rule with honored linkage attrs
+                        // (weak/visibility) — so its subtree can't be ignored
+                        // wholesale. Matched dunder-normalized in linkageFrom
+                        // (`noreturn` covers `__noreturn__`). An identifier NOT
+                        // listed here still fails loud (strict default preserved).
+                        if (entry.contains("linkageSpecifierIgnoredNames")) {
+                            auto const& lin =
+                                entry.at("linkageSpecifierIgnoredNames");
+                            if (!lin.is_array()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/linkageSpecifierIgnoredNames",
+                                          std::format("'declarations[{}]."
+                                                      "linkageSpecifierIgnoredNames' must "
+                                                      "be an array of specifier-name "
+                                                      "strings", i));
+                            } else {
+                                for (auto const& elem : lin) {
+                                    if (!elem.is_string()) {
+                                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                  path + "/linkageSpecifierIgnoredNames",
+                                                  "each ignored-name entry must be a "
+                                                  "specifier-name string");
+                                        continue;
+                                    }
+                                    rule.linkageSpecifierIgnoredNames.push_back(
+                                        elem.get<std::string>());
                                 }
                             }
                         }
@@ -7389,6 +7433,219 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── alignof (C11/C23 6.5.3.4) ──
+            // `{ typeRule, typeChild }` — alignof typing (TYPE-NAME FORM ONLY, so
+            // NO valueRule, unlike sizeof). Pass 2 resolves the type form's
+            // castTypeRef child + stamps the node size_t. Mirrors the sizeof
+            // block's readRule discipline (a present-but-bad field emits + fails
+            // the load; an ABSENT block leaves the rule invalid → no surface).
+            if (sem.contains("alignof")) {
+                json const& al = sem.at("alignof");
+                if (!al.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/alignof",
+                              "'semantics.alignof' must be an object "
+                              "{ typeRule, typeChild }");
+                } else {
+                    if (!al.contains("typeRule") || !al.at("typeRule").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/alignof/typeRule",
+                                  "'typeRule' is required and must be a string");
+                    } else {
+                        cfg.alignofTypeRuleName = al.at("typeRule").get<std::string>();
+                        if (!data.rules->contains(cfg.alignofTypeRuleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape,
+                                      "/semantics/alignof/typeRule",
+                                      std::format("'alignof.typeRule' references "
+                                                  "unknown shape '{}'",
+                                                  cfg.alignofTypeRuleName));
+                        } else {
+                            cfg.alignofTypeRule =
+                                data.rules->find(cfg.alignofTypeRuleName);
+                        }
+                    }
+                    // `typeChild` is required — readReqIndex emits its own
+                    // C_MissingField / C_InvalidSemantics into `coll` on a bad
+                    // value (failing the load); the flag just satisfies the
+                    // out-param (mirrors the sizeof block above).
+                    bool alignTypeChildOk = true;
+                    readReqIndex(al, "typeChild", "/semantics/alignof",
+                                 cfg.alignofTypeChild, alignTypeChildOk);
+                    (void)alignTypeChildOk;
+                }
+            }
+
+            // ── alignas (C11/C23 6.7.5, D-CSUBSET-ALIGNAS) ──
+            // `{ specRule, argChild, typeFormRule }` — the `_Alignas`/`alignas`
+            // alignment specifier. The semantic tier reads the `alignasSpec` node,
+            // resolves its `alignasArg` operand (visible-child `argChild`), and
+            // discriminates the type form (committed arg rule == `typeFormRule` =
+            // `alignasTypeName`, the guarded castTypeRef WRAPPER branch ⇒ _Alignof(T))
+            // from the value form (else ⇒ const-eval). Mirrors the alignof block's
+            // readRule discipline (a present-but-bad field emits + fails the load;
+            // an ABSENT block leaves the rule invalid → no surface).
+            if (sem.contains("alignas")) {
+                json const& aa = sem.at("alignas");
+                if (!aa.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/alignas",
+                              "'semantics.alignas' must be an object "
+                              "{ specRule, argChild, typeFormRule }");
+                } else {
+                    auto readRule = [&](char const* key, char const* path,
+                                        RuleId& outRule, std::string& outName) {
+                        if (!aa.contains(key) || !aa.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path,
+                                      std::format("'{}' is required and must be a "
+                                                  "string", key));
+                            return;
+                        }
+                        outName = aa.at(key).get<std::string>();
+                        if (!data.rules->contains(outName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path,
+                                      std::format("'alignas.{}' references unknown "
+                                                  "shape '{}'", key, outName));
+                            outName.clear();
+                            return;
+                        }
+                        outRule = data.rules->find(outName);
+                    };
+                    readRule("specRule", "/semantics/alignas/specRule",
+                             cfg.alignasSpecRule, cfg.alignasSpecRuleName);
+                    readRule("typeFormRule", "/semantics/alignas/typeFormRule",
+                             cfg.alignasArgTypeRule, cfg.alignasArgTypeRuleName);
+                    bool alignasArgChildOk = true;
+                    readReqIndex(aa, "argChild", "/semantics/alignas",
+                                 cfg.alignasArgChild, alignasArgChildOk);
+                    (void)alignasArgChildOk;
+                }
+            }
+
+            // ── composite type-attributes / packed (FC16, D-CSUBSET-PACKED) ──
+            // `{ listRule, attributeNames }` — the `compositeAttrList` rule (a trailing
+            // `__attribute__((...))` / `[[...]]` after a struct/union body) + the set of
+            // attribute identifiers that mean "packed" (dunder-normalized at the scan).
+            // The semantic tier reads a structSpec/unionSpec's `listRule` children and
+            // marks the composite packed. Mirrors the alignas block's readRule discipline
+            // (a present-but-bad field emits + fails the load; an ABSENT block leaves the
+            // rule invalid → no surface). Source-agnostic: nothing hardcodes "packed".
+            if (sem.contains("packed")) {
+                json const& pk = sem.at("packed");
+                if (!pk.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/packed",
+                              "'semantics.packed' must be an object "
+                              "{ listRule, attributeNames }");
+                } else {
+                    if (!pk.contains("listRule") || !pk.at("listRule").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/packed/listRule",
+                                  "'listRule' is required and must be a string");
+                    } else {
+                        std::string const rn = pk.at("listRule").get<std::string>();
+                        if (!data.rules->contains(rn)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape,
+                                      "/semantics/packed/listRule",
+                                      std::format("'packed.listRule' references unknown "
+                                                  "shape '{}'", rn));
+                        } else {
+                            cfg.compositeAttrListRule     = data.rules->find(rn);
+                            cfg.compositeAttrListRuleName = rn;
+                        }
+                    }
+                    if (!pk.contains("attributeNames")
+                        || !pk.at("attributeNames").is_array()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/packed/attributeNames",
+                                  "'attributeNames' is required and must be an array "
+                                  "of strings");
+                    } else {
+                        for (json const& e : pk.at("attributeNames")) {
+                            if (!e.is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/packed/attributeNames",
+                                          "each 'attributeNames' entry must be a string");
+                                continue;
+                            }
+                            cfg.packedAttributeNames.push_back(e.get<std::string>());
+                        }
+                    }
+                    // OPTIONAL: the STRICT (GNU `__attribute__`) attribute rule, whose
+                    // unrecognized attributes fail loud (S_UnknownTypeAttribute). Absent
+                    // ⇒ every unrecognized composite attribute is standard-ignorable.
+                    if (pk.contains("strictAttrRule")) {
+                        if (!pk.at("strictAttrRule").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/packed/strictAttrRule",
+                                      "'strictAttrRule' must be a string");
+                        } else {
+                            std::string const rn =
+                                pk.at("strictAttrRule").get<std::string>();
+                            if (!data.rules->contains(rn)) {
+                                coll.emit(DiagnosticCode::C_UnknownShape,
+                                          "/semantics/packed/strictAttrRule",
+                                          std::format("'packed.strictAttrRule' references "
+                                                      "unknown shape '{}'", rn));
+                            } else {
+                                cfg.compositeStrictAttrRule     = data.rules->find(rn);
+                                cfg.compositeStrictAttrRuleName = rn;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── noreturn function attribute (FC16, D-CSUBSET-NORETURN) ──
+            // `{ keywordToken, attributeNames }` — the `_Noreturn` KEYWORD token
+            // (C11 6.7.4) + the recognized `noreturn` ATTRIBUTE-identifier set
+            // (C23 6.7.12.7 `[[noreturn]]` / GNU `__attribute__((noreturn))`,
+            // dunder-normalized at the scan). The semantic tier reads a function
+            // declaration's specifier prefix for EITHER and marks the symbol
+            // `isNoreturn`. `keywordToken` resolves like `volatileMarker` (an
+            // OPTIONAL token; unknown name → C_UnknownToken); `attributeNames`
+            // mirrors packed's `attributeNames`. An ABSENT block leaves both
+            // unset ⇒ no surface. Source-agnostic: nothing hardcodes "noreturn".
+            if (sem.contains("noreturn")) {
+                json const& nr = sem.at("noreturn");
+                if (!nr.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/noreturn",
+                              "'semantics.noreturn' must be an object "
+                              "{ keywordToken, attributeNames }");
+                } else {
+                    if (!nr.contains("keywordToken")
+                        || !nr.at("keywordToken").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/noreturn/keywordToken",
+                                  "'keywordToken' is required and must be a string");
+                    } else {
+                        std::string const tn =
+                            nr.at("keywordToken").get<std::string>();
+                        if (!data.schemaTokens->contains(tn)) {
+                            coll.emit(DiagnosticCode::C_UnknownToken,
+                                      "/semantics/noreturn/keywordToken",
+                                      std::format("'noreturn.keywordToken' references "
+                                                  "unknown token kind '{}'", tn));
+                        } else {
+                            cfg.noreturnKeywordToken = data.schemaTokens->find(tn);
+                        }
+                    }
+                    if (!nr.contains("attributeNames")
+                        || !nr.at("attributeNames").is_array()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/noreturn/attributeNames",
+                                  "'attributeNames' is required and must be an array "
+                                  "of strings");
+                    } else {
+                        for (json const& e : nr.at("attributeNames")) {
+                            if (!e.is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/noreturn/attributeNames",
+                                          "each 'attributeNames' entry must be a string");
+                                continue;
+                            }
+                            cfg.noreturnAttributeNames.push_back(e.get<std::string>());
+                        }
+                    }
+                }
+            }
+
             // ── variadic intrinsics (FC12a-core, D-FC12A-VARIADIC-CALLEE) ──
             // `{ vaArgRule, vaArgApChild, vaArgTypeChild, vaStartRule,
             //    vaStartApChild, vaEndRule, vaEndApChild }`. Pass 2 resolves the
@@ -7434,6 +7691,87 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     readReqIndex(va, "vaEndApChild",   "/semantics/variadic",
                                  cfg.vaEndApChild,   idxOk);
                     (void)idxOk;
+                }
+            }
+
+            // ── staticAssertRule (C11/C23 6.7.10, D-CSUBSET-STATIC-ASSERT) ──
+            // A single OPTIONAL top-level rule reference: the
+            // `_Static_assert`/`static_assert` declaration shape. Pass 2
+            // const-evaluates its condition child + emits S_StaticAssertFailed on
+            // a zero / non-constant fold. Absent ⇒ the language has no
+            // static-assertion surface (the check never runs). A present-but-bad
+            // value (not a string, or an unknown shape) emits + fails the load —
+            // a typo can never silently disarm the assertion check.
+            if (sem.contains("staticAssertRule")) {
+                if (!sem.at("staticAssertRule").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/staticAssertRule",
+                              "'semantics.staticAssertRule' must be a string");
+                } else {
+                    cfg.staticAssertRuleName =
+                        sem.at("staticAssertRule").get<std::string>();
+                    if (!data.rules->contains(cfg.staticAssertRuleName)) {
+                        coll.emit(DiagnosticCode::C_UnknownShape,
+                                  "/semantics/staticAssertRule",
+                                  std::format("'staticAssertRule' references unknown "
+                                              "shape '{}'", cfg.staticAssertRuleName));
+                        cfg.staticAssertRuleName.clear();
+                    } else {
+                        cfg.staticAssertRule =
+                            data.rules->find(cfg.staticAssertRuleName);
+                    }
+                }
+            }
+
+            // ── generic (FC16 C11/C23 6.5.1.1, D-CSUBSET-GENERIC-SELECTION) ──
+            // `{ rule, controlChild, assocRule, typedAssocRule, defaultAssocRule }`
+            // — `_Generic` generic selection. Pass 2 resolves the controlling
+            // expression's type (child `controlChild`), matches it against each
+            // `typedAssocRule` child's resolved castTypeRef type + records the
+            // winning association's result-expression node. Absent ⇒ the language
+            // has no generic-selection surface (the check never runs). A
+            // present-but-bad value (non-object, or an unknown shape) emits +
+            // fails the load — a typo can never silently disarm the selection.
+            if (sem.contains("generic")) {
+                json const& gen = sem.at("generic");
+                if (!gen.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/generic",
+                              "'semantics.generic' must be an object "
+                              "{ rule, controlChild, assocRule, typedAssocRule, "
+                              "defaultAssocRule }");
+                } else {
+                    auto readRule = [&](char const* key, RuleId& outRule,
+                                        std::string& outName) {
+                        if (!gen.contains(key) || !gen.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      std::string{"/semantics/generic/"} + key,
+                                      std::format("'{}' is required and must be a "
+                                                  "string", key));
+                            return;
+                        }
+                        outName = gen.at(key).get<std::string>();
+                        if (!data.rules->contains(outName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape,
+                                      std::string{"/semantics/generic/"} + key,
+                                      std::format("'generic.{}' references unknown "
+                                                  "shape '{}'", key, outName));
+                            outName.clear();
+                            return;
+                        }
+                        outRule = data.rules->find(outName);
+                    };
+                    readRule("rule", cfg.genericRule, cfg.genericRuleName);
+                    readRule("assocRule", cfg.genericAssocRule,
+                             cfg.genericAssocRuleName);
+                    readRule("typedAssocRule", cfg.genericTypedAssocRule,
+                             cfg.genericTypedAssocRuleName);
+                    readRule("defaultAssocRule", cfg.genericDefaultAssocRule,
+                             cfg.genericDefaultAssocRuleName);
+                    bool controlOk = true;
+                    readReqIndex(gen, "controlChild", "/semantics/generic",
+                                 cfg.genericControlChild, controlOk);
+                    (void)controlOk;
                 }
             }
 
@@ -8350,10 +8688,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             readExprRule("castRule",            cfg.castRule,            cfg.castRuleName);
             // FC6: `sizeof(T)` / `sizeof e` → core HirKind::SizeOf.
             readExprRule("sizeofRule",          cfg.sizeofRule,          cfg.sizeofRuleName);
+            // C11/C23 6.5.3.4: `_Alignof(T)` / `alignof(T)` → core HirKind::AlignOf.
+            readExprRule("alignofRule",         cfg.alignofRule,         cfg.alignofRuleName);
             // FC12a-core: variadic intrinsics → core HirKind::VaStart/VaArg/VaEnd.
             readExprRule("vaStartRule",         cfg.vaStartRule,         cfg.vaStartRuleName);
             readExprRule("vaArgRule",           cfg.vaArgRule,           cfg.vaArgRuleName);
             readExprRule("vaEndRule",           cfg.vaEndRule,           cfg.vaEndRuleName);
+            // FC16 C11/C23 6.5.1.1: `_Generic(...)` → the selected association's
+            // sub-expression (its type + value); lowerGeneric reads the semantic
+            // tier's recorded winner and lowers ONLY that child.
+            readExprRule("genericRule",         cfg.genericRule,         cfg.genericRuleName);
             // D-CSUBSET-COMPUTED-GOTO: `&&label` → core HirKind::LabelAddressOf.
             readExprRule("labelAddressRule",    cfg.labelAddressRule,    cfg.labelAddressRuleName);
 
@@ -8591,6 +8935,166 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                    "/hirLowering/unicodeStringStartToken",
                                    cfg.unicodeStringStartToken);
             }
+
+            // C11/C23 6.4.5 (strings) + 6.4.4.4 (chars): the literal-opener →
+            // element-core table(s). Optional array `[{startToken, elementCore,
+            // elementCoreByFormat?}]`. Each row validates: the token resolves to a
+            // declared kind, `elementCore` (and every per-format override) is a known
+            // TypeKind name, and no startToken is duplicated across rows. Row 0 is
+            // AUTO-SEEDED from the narrow opener when absent — so a schema declaring
+            // no explicit prefixes is byte-identical. The STRING and CHAR forms share
+            // this ONE validator (identical row/format-map shape; only the field
+            // name, target vector, and the narrow opener's auto-seed core differ) so
+            // the two can never drift.
+            auto parseLiteralPrefixTable =
+                [&](char const* field, std::vector<LiteralPrefixEntry>& target,
+                    SchemaTokenId narrowTok, std::string const& narrowTokName,
+                    TypeKind narrowSeedCore) {
+                auto prefixSeen = [&](SchemaTokenId t) {
+                    for (auto const& p : target)
+                        if (p.startToken.v == t.v) return true;
+                    return false;
+                };
+                if (hl.contains(field)) {
+                    json const& arr = hl.at(field);
+                    if (!arr.is_array()) {
+                        coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                  std::format("/hirLowering/{}", field),
+                                  std::format("'{}' must be an array", field));
+                    } else {
+                        for (std::size_t i = 0; i < arr.size(); ++i) {
+                            auto const path = std::format(
+                                "/hirLowering/{}/{}", field, i);
+                            json const& entry = arr[i];
+                            if (!entry.is_object()
+                                || !entry.contains("startToken")
+                                || !entry.at("startToken").is_string()
+                                || !entry.contains("elementCore")
+                                || !entry.at("elementCore").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering, path,
+                                          std::format("each {} entry needs string "
+                                                      "'startToken' and 'elementCore'", field));
+                                continue;
+                            }
+                            LiteralPrefixEntry row;
+                            row.startTokenName = entry.at("startToken").get<std::string>();
+                            if (!resolveToken(row.startTokenName, path + "/startToken",
+                                              row.startToken)) {
+                                continue;
+                            }
+                            auto const core =
+                                coreTypeFromName(entry.at("elementCore").get<std::string>());
+                            if (!core) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/elementCore",
+                                          std::format("unknown TypeKind '{}'",
+                                                      entry.at("elementCore").get<std::string>()));
+                                continue;
+                            }
+                            if (prefixSeen(row.startToken)) {
+                                coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                          path + "/startToken",
+                                          std::format("duplicate {} startToken '{}'",
+                                                      field, row.startTokenName));
+                                continue;
+                            }
+                            row.elementCore = *core;
+                            // Optional per-format element-core override
+                            // (`elementCoreByFormat`), mirroring builtinTypes'
+                            // `coreByDataModel`: this is how `L"…"`/`L'…'` (wchar_t)
+                            // declares its FORMAT-keyed width AS CONFIG DATA
+                            // (elf/macho→I32, pe→U16) — no engine tier hardcodes a
+                            // `format == …` branch. Closed keys: every key must resolve
+                            // to a known ObjectFormatKind (the EXISTING object-format-
+                            // name resolver) and every value to a known TypeKind — a
+                            // typo'd format name would otherwise silently never override.
+                            bool formatMapOk = true;
+                            if (entry.contains("elementCoreByFormat")) {
+                                auto const& fmtObj = entry.at("elementCoreByFormat");
+                                if (!fmtObj.is_object()) {
+                                    coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                              path + "/elementCoreByFormat",
+                                              "'elementCoreByFormat' must be an object "
+                                              "mapping object-format names to TypeKinds");
+                                    formatMapOk = false;
+                                } else {
+                                    for (auto const& [fkey, fval] : fmtObj.items()) {
+                                        auto const fmt = objectFormatKindFromName(fkey);
+                                        if (!fmt) {
+                                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                                      path + "/elementCoreByFormat/" + fkey,
+                                                      std::format("unknown object format "
+                                                                  "'{}' (expected e.g. "
+                                                                  "'elf', 'pe', 'macho')",
+                                                                  fkey));
+                                            formatMapOk = false;
+                                            continue;
+                                        }
+                                        if (!fval.is_string()) {
+                                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                                      path + "/elementCoreByFormat/" + fkey,
+                                                      "per-format element core must be a "
+                                                      "TypeKind name string");
+                                            formatMapOk = false;
+                                            continue;
+                                        }
+                                        auto const fcore =
+                                            coreTypeFromName(fval.get<std::string>());
+                                        if (!fcore) {
+                                            coll.emit(DiagnosticCode::C_InvalidHirLowering,
+                                                      path + "/elementCoreByFormat/" + fkey,
+                                                      std::format("unknown TypeKind '{}'",
+                                                                  fval.get<std::string>()));
+                                            formatMapOk = false;
+                                            continue;
+                                        }
+                                        row.elementCoreByFormat[*fmt] = *fcore;
+                                    }
+                                }
+                            }
+                            if (!formatMapOk) continue;
+                            target.push_back(std::move(row));
+                        }
+                    }
+                }
+                // Auto-seed the narrow opener so a schema that declared the literal
+                // form but no explicit prefixes types exactly as before — the
+                // invariant the existing suite's byte-identity pins.
+                if (narrowTok.valid() && !prefixSeen(narrowTok)) {
+                    LiteralPrefixEntry row;
+                    row.startToken     = narrowTok;
+                    row.startTokenName = narrowTokName;
+                    row.elementCore    = narrowSeedCore;
+                    target.push_back(std::move(row));
+                }
+            };
+            // Strings: narrow `"` auto-seeds to Char (a byte array element).
+            parseLiteralPrefixTable("stringLiteralPrefixes", cfg.stringLiteralPrefixes,
+                                    cfg.stringStartToken, cfg.stringStartTokenName,
+                                    TypeKind::Char);
+            // Fold SQL's `N'…'` unicode opener in as a Char string row (same body
+            // token + decoder as the narrow form) — string-only, so it stays here.
+            {
+                auto stringPrefixSeen = [&](SchemaTokenId t) {
+                    for (auto const& p : cfg.stringLiteralPrefixes)
+                        if (p.startToken.v == t.v) return true;
+                    return false;
+                };
+                if (cfg.unicodeStringStartToken.valid()
+                    && !stringPrefixSeen(cfg.unicodeStringStartToken)) {
+                    LiteralPrefixEntry row;
+                    row.startToken     = cfg.unicodeStringStartToken;
+                    row.startTokenName = cfg.unicodeStringStartTokenName;
+                    row.elementCore    = TypeKind::Char;
+                    cfg.stringLiteralPrefixes.push_back(std::move(row));
+                }
+            }
+            // Chars: narrow `'x'` auto-seeds to I32 (C 6.4.4.4 — an unprefixed
+            // character constant has type `int`); the wide/UTF prefixes carry their
+            // C23 scalar core (`u'`→U16, `U'`→U32, `u8'`→U8, `L'`→format-keyed).
+            parseLiteralPrefixTable("charLiteralPrefixes", cfg.charLiteralPrefixes,
+                                    cfg.charStartToken, cfg.charStartTokenName,
+                                    TypeKind::I32);
             // HR10: string bodies use doubled-delimiter (`''`) escaping (SQL).
             // Derive the delimiter byte from the string opener's StringStyle.endsAt
             // (single source of truth) so the engine's decoder doesn't duplicate it.

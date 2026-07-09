@@ -1,0 +1,15 @@
+{
+  "$comment": "C11/C23 6.4.4.4: end-to-end wide/UTF character-constant value + width witness. Each prefixed char's value is the decoded code point and its sizeof is the prefix's element width (char16_t=2, char32_t=4, char8_t=1); narrow 'x' stays int (value 120, sizeof 4). Returns 42 only when every form lowered to the right core + value. Red-on-disable: dropping the wide char-typing override flips sizeof(u'A') to 4 → returns 6. Runs on all 4 targets + the release arm.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

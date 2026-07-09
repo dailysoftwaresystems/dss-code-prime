@@ -1,0 +1,33 @@
+{
+  "$comment": "D-CSUBSET-ANON-TYPEDECL-TYPE-FALLBACK: a file-scope anonymous enum whose enumerator is used in a file-scope const-expr (array dim) must COMPILE and RUN like the named form. Was error[H0001] (H_TypeUnresolved) on the anon enum's TypeDecl; the fix falls back to the type the analyzer stamped on the specifier node. sizeof(int[V=16]) == 64. Red-on-disable: revert lowerTypeDecl's model.typeAt(node) fallback and the compile fails H0001. One exit code across all four targets incl. the shipped release pipeline.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 64,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

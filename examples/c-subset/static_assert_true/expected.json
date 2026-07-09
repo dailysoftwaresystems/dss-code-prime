@@ -1,0 +1,33 @@
+{
+  "$comment": "C11/C23 6.7.10 (D-CSUBSET-STATIC-ASSERT): a file-scope `_Static_assert(sizeof(int)==4, \"...\")` whose condition FOLDS (via the same evaluator that folds sizeof in an array dimension) to a true value → the declaration produces nothing and the program runs (exit 42). Pins the sizeof-folding requirement end-to-end across all four targets, including the shipped release pipeline.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

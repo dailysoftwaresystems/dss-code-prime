@@ -578,6 +578,25 @@ evalNode(Hir const& hir, TypeInterner& interner, HirLiteralPool const& literals,
         v.value = static_cast<std::uint64_t>(*sz);
         return ok(std::move(v));
     }
+    if (k == HirKind::AlignOf) {
+        // C11/C23 6.5.3.4: fold `_Alignof(T)` to T's alignment (result `size_t` =
+        // U64), an ADDITIVE mirror of the SizeOf fold above reading the align
+        // resolver instead of the size resolver. The TypeRef child carries the
+        // queried type. Absent resolver (verifier consumers) or an incomplete /
+        // un-alignable type ⇒ `NotAConstantExpression` — never a guessed align.
+        if (!env.resolveTypeAlign) {
+            return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        }
+        auto kids = hir.children(expr);
+        if (kids.empty()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        TypeId const queried = hir.typeId(kids.front());
+        auto const al = env.resolveTypeAlign(queried);
+        if (!al) return fail(ConstEvalFailure::NotAConstantExpression, expr);
+        HirLiteralValue v;
+        v.core  = TypeKind::U64;
+        v.value = static_cast<std::uint64_t>(*al);
+        return ok(std::move(v));
+    }
     return fail(ConstEvalFailure::NotAConstantExpression, expr);
 }
 

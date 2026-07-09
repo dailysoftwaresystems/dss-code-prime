@@ -123,6 +123,58 @@ computeMirDomTree(Mir const&                                  mir,
                   std::vector<MirBlockId> const&              order,
                   std::vector<std::vector<MirBlockId>> const& preds);
 
+// Reusable dominator-computation scratch (D-OPT-DOMTREE-SCRATCH-REUSE): the
+// fresh-allocation `computeMirDomTree` above allocates SIX whole-module-sized
+// buffers per call — including a full copy of the caller's predecessor map —
+// for ONE function's CHK walk; on a large module that allocation storm is
+// ~95% of CSE's and LICM's per-pass cost (measured: ~94s of the sqlite
+// release optimize). The scratch owns those buffers ONCE per pass call and
+// resets, at the ENTRY of each call, ONLY the slots the PREVIOUS call wrote
+// (its self-recorded touched list = that call's `order` ∪ {entry} — the
+// proven-complete write set), restoring exactly the fresh-allocation
+// defaults. Same inputs → byte-identical dom trees (the differential pins in
+// test_mir_dom.cpp compare v AND arenaTag over the FULL module-sized arrays
+// after every call in adversarial sequences).
+//
+// Contract: one scratch per (pass call × module). The scratch binds to the
+// first module it sees ({module id, blockCount} — a later call with a
+// DIFFERENT module fails loud, the MirMemoryClobbers stale-guard pattern).
+// The returned tree/children references are valid ONLY until the next
+// compute call with the same scratch. Bind results as `auto const&`.
+struct MirDomScratch {
+    std::uint32_t moduleIdV  = 0;
+    std::uint32_t blockCount = 0;   // 0 = not yet bound to a module
+    // CHK core buffers (module-sized; kUnsetSlot / 0 outside touched slots).
+    // Module-sized ON PURPOSE: the core's intersect step-cap derives from the
+    // idom array SIZE — compressing to function-local sizing would change
+    // when pathological chains give up (a behavior change). Do not compress.
+    std::vector<std::uint32_t> coreIdom;
+    std::vector<std::uint8_t>  coreGaveUp;
+    std::vector<std::uint32_t> rpoIndex;
+    // Result buffers (module-sized; MirBlockId{} / 0 outside touched slots).
+    MirDomTree tree;
+    std::vector<std::vector<MirBlockId>> children;
+    // The previous call's write set (reset at the next call's entry) + the
+    // current call's ascending-sorted copy (children fill iterates it SORTED
+    // so the children lists keep the fresh path's ascending-slot order — the
+    // CSE dom-DFS traversal order depends on it).
+    std::vector<std::uint32_t> touched;
+    std::vector<std::uint32_t> touchedSorted;
+    bool childrenFilled = false;   // children fill is once-per-compute-call
+};
+
+// Scratch-backed dominator computation — byte-identical results to the
+// fresh-allocation overload above (same core, same values), O(|order|) per
+// call instead of O(module). `preds` MUST be `mirBuildPredecessors(mir)` for
+// the SAME module (fail-loud size check). The returned reference lives in
+// `scratch` and is invalidated by the next call with that scratch.
+[[nodiscard]] DSS_EXPORT MirDomTree const&
+computeMirDomTree(Mir const&                                  mir,
+                  MirBlockId                                  entry,
+                  std::vector<MirBlockId> const&              order,
+                  std::vector<std::vector<MirBlockId>> const& preds,
+                  MirDomScratch&                              scratch);
+
 // Does `a` dominate `b`? Tri-state — `GaveUp` on iteration-cap overflow.
 [[nodiscard]] DSS_EXPORT MirDomResult
 mirDominatesBlock(MirBlockId a, MirBlockId b, MirDomTree const& dom);
@@ -172,6 +224,16 @@ mirDominanceFrontier(Mir const& mir,
 // "no parent" as "do not promote / hoist through this block").
 [[nodiscard]] DSS_EXPORT std::vector<std::vector<MirBlockId>>
 mirDomTreeChildren(Mir const& mir, MirDomTree const& dom);
+
+// Scratch-backed children inversion (D-OPT-DOMTREE-SCRATCH-REUSE) — byte-
+// identical to the fresh overload above (ascending-slot iteration over the
+// scratch's sorted touched set; contributing parents are always inside the
+// touched set because every stored idom value is in `order`). `dom` MUST be
+// the tree the SAME scratch's compute call just produced (fail-loud identity
+// check) — the touched bookkeeping is what makes the partial reset complete.
+[[nodiscard]] DSS_EXPORT std::vector<std::vector<MirBlockId>> const&
+mirDomTreeChildren(Mir const& mir, MirDomTree const& dom,
+                   MirDomScratch& scratch);
 
 // Natural-loop forest computation. See `MirNaturalLoop` for shape.
 [[nodiscard]] DSS_EXPORT std::vector<MirNaturalLoop>

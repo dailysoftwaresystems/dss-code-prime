@@ -1,17 +1,21 @@
 name: Pipeline
 
-# Calls the reusable C++ app PR workflow in DSS.DevOps.
-# See: https://github.com/dailysoftwaresystems/DSS.DevOps/blob/v2/.github/workflows/cpp-app-pr.yml
+# CI for this C++ application. Inlined from the DSS.DevOps reusable
+# `cpp-app-pr.yml@v2`: a PUBLIC repository cannot call a reusable workflow that
+# lives in a private/internal repository, so the logic is vendored here. Keep in
+# sync with dailysoftwaresystems/DSS.DevOps. Settings baked from the former caller
+# inputs: run-macos + run-linux-arm64 ON, cache-pch-on = windows-msvc-release,
+# cmake-version = latest.
 
 on:
   pull_request:
     branches: ["main"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
-# Reusable workflows inherit the caller's GITHUB_TOKEN scope. Without
-# `statuses: write` granted here, the rollup `ci-check` job inside the
-# reusable can't post the "Pipeline / ci-check result" commit status,
-# which leaves branch protection stuck in "Expected — Waiting" forever.
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}-${{ github.workflow }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: read
@@ -19,59 +23,403 @@ permissions:
   statuses: write
 
 jobs:
-  pipeline-pr:
-    uses: dailysoftwaresystems/DSS.DevOps/.github/workflows/cpp-app-pr.yml@v2
-    with:
-      cmake-version: "latest"
-      # Apple Clang lags upstream on C++23 stdlib; the reusable workflow
-      # installs Homebrew LLVM on macos-latest to recover C++23 coverage.
-      # See .plans/03-substrate-hardening-plan - ok.md SH2.
-      run-macos: true
-      # v0.0.2 V2-1 (D-LK10-ENTRY-ARM64): opt into the reusable workflow's
-      # optional NATIVE arm64 Linux leg (ubuntu-24.04-arm) so CI builds the
-      # compiler on arm64 AND runs its emitted AArch64 binaries. The compiler
-      # is a cross-compiler; on the native arm64 runner the `arm64_exit` corpus
-      # runs its ELF DIRECTLY (host arch == target arch → no emulator). The
-      # harness's qemu-aarch64 path is only for running aarch64 binaries on an
-      # x86_64 host (e.g. local dev) — CI does not use QEMU. Native arm64
-      # execution-verifies the whole ARM64 backend end-to-end.
-      run-linux-arm64: true
-      # The Windows/MSVC PCH is not byte-reproducible (a memory image with
-      # ASLR/GC-randomized embedded addresses), so a freshly-built PCH each run
-      # busts ccache — the PCH is hashed into every dependent TU's key, leaving
-      # the windows-msvc leg at ~7% hits / ~40 min every run while Linux GCC
-      # (reproducible .gch) sits at ~99.7%. Opt that ONE leg into the reusable
-      # workflow's PCH-binary cache: it caches + restores the byte-identical PCH
-      # across runs so the key stays stable -> warm runs hit, with PCH still ON
-      # for fast cold builds (no D-CI-WINDOWS-MSVC-BUILD-TIME-CEILING regression).
-      # macOS already hits via the committed -Xclang -fno-pch-timestamp fix, so
-      # only the MSVC leg is listed.
-      cache-pch-on: "windows-msvc-release"
-    secrets:
-      DSS_BOTS_CLIENT_ID: ${{ secrets.DSS_BOTS_CLIENT_ID }}
-      DSS_BOTS_APP_PRIVATE_KEY: ${{ secrets.DSS_BOTS_APP_PRIVATE_KEY }}
+  label-check:
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'Run Pipes') }}
+    runs-on: ${{ 'ubuntu-latest' }}
+    steps:
+      - name: Fail when required label is missing
+        run: |
+          echo "Missing '${{ 'Run Pipes' }}' label. Merge is blocked."
+          exit 1
 
-  # Catches the recurring "missing commit hash in landing log" bug class
-  # by regenerating the hash anchors from `git log` and failing if they
-  # drift from what's checked in. See .plans/03-substrate-hardening-plan - ok.md
-  # SH1 (the tool) and SH4a (this job). Intentionally ungated by the
-  # `Run Pipes` label — plan-doc hygiene matters on every PR.
+  format-check:
+    if: ${{ contains(github.event.pull_request.labels.*.name, 'Run Pipes') && true }}
+    runs-on: ${{ 'ubuntu-latest' }}
+    defaults:
+      run:
+        working-directory: ${{ '.' }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.DSS_PUBLIC_BOTS_APP_ID }}
+          private-key: ${{ secrets.DSS_PUBLIC_BOTS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Probe for .clang-format
+        id: probe
+        run: |
+          if [ -f .clang-format ] || [ -f _clang-format ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No .clang-format at repo root — skipping format check."
+          fi
+
+      - name: clang-format dry-run
+        if: ${{ steps.probe.outputs.present == 'true' }}
+        # Run against the diff vs the PR base. `--relative` makes git
+        # emit paths relative to the working-directory; without it,
+        # paths come back repo-root-relative and clang-format (which
+        # also runs in working-directory) cannot find them.
+        # `--Werror` surfaces the offending file:line in the Actions
+        # log without needing an extra reviewer step.
+        run: |
+          set -e
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          if ! diff_out=$(git diff --name-only --relative --diff-filter=ACMRTUXB "$BASE_SHA"...HEAD 2>&1); then
+            echo "::error::git diff against base $BASE_SHA failed: $diff_out"
+            exit 1
+          fi
+          mapfile -t CHANGED < <(printf '%s\n' "$diff_out" | grep -E '\.(c|h|cc|cpp|cxx|hpp|hxx)$' || true)
+          if [ ${#CHANGED[@]} -eq 0 ]; then
+            echo "No C/C++ files changed."
+            exit 0
+          fi
+          printf '  %s\n' "${CHANGED[@]}"
+          clang-format --dry-run --Werror "${CHANGED[@]}"
+
+  build-matrix:
+    if: ${{ contains(github.event.pull_request.labels.*.name, 'Run Pipes') }}
+    runs-on: ${{ 'ubuntu-latest' }}
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      empty: ${{ steps.set.outputs.empty }}
+    steps:
+      - id: set
+        # Build the matrix `include` list from the boolean inputs. Only
+        # legs whose `run-*` input is true land in the matrix, so no
+        # runner is allocated for disabled legs (no more skipped-on-
+        # startup macOS runs billed at premium rate).
+        run: |
+          legs='[]'
+          if [ "${{ true }}" = "true" ]; then
+            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-gcc-release","os":"ubuntu-latest","cc":"gcc-13","cxx":"g++-13","build_type":"Release","sanitizers":""}]')
+          fi
+          if [ "${{ true }}" = "true" ]; then
+            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-clang-asan","os":"ubuntu-latest","cc":"clang-19","cxx":"clang++-19","build_type":"Debug","sanitizers":"address,undefined"}]')
+          fi
+          if [ "${{ true }}" = "true" ]; then
+            legs=$(echo "$legs" | jq -c '. + [{"name":"windows-msvc-release","os":"windows-latest","cc":"","cxx":"","build_type":"Release","sanitizers":""}]')
+          fi
+          if [ "${{ true }}" = "true" ]; then
+            legs=$(echo "$legs" | jq -c '. + [{"name":"macos-clang-release","os":"macos-latest","cc":"","cxx":"","build_type":"Release","sanitizers":""}]')
+          fi
+          if [ "${{ true }}" = "true" ]; then
+            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-arm64-gcc-release","os":"ubuntu-24.04-arm","cc":"gcc-13","cxx":"g++-13","build_type":"Release","sanitizers":""}]')
+          fi
+          echo "matrix={\"include\":$legs}" >> "$GITHUB_OUTPUT"
+          if [ "$legs" = "[]" ]; then
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::All run-tests legs are disabled. No build/test will run."
+          else
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  run-tests:
+    needs: build-matrix
+    if: ${{ needs.build-matrix.outputs.empty == 'false' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.build-matrix.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: ${{ '.' }}
+        shell: bash
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.DSS_PUBLIC_BOTS_APP_ID }}
+          private-key: ${{ secrets.DSS_PUBLIC_BOTS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Configure Git for private dependencies
+        run: git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/".insteadOf "git@github.com:"
+
+      - name: Install Linux toolchain
+        # Ubuntu 24.04 ships GCC 13 by default, with full C++23 stdlib
+        # (std::expected, std::format) — that's the GCC release leg.
+        # We also install lld + llvm-symbolizer so sanitizer stack traces
+        # are symbolicated automatically (without llvm-symbolizer on PATH,
+        # ASan output is a wall of `??:?` and triage is much harder).
+        #
+        # Clang leg uses clang-19 (from noble-updates/universe), NOT the
+        # image default clang-18. Reason: clang-18 sets __cpp_concepts to
+        # 201907L, but libstdc++-13's <expected> is gated on
+        # __cpp_concepts >= 202002L, so `std::expected` silently vanishes
+        # ("no template named 'expected' in namespace 'std'"). clang-19
+        # sets __cpp_concepts = 202002L and the header opens up.
+        # clang-tools-19 carries clang-scan-deps-19 which CMake needs for
+        # C++20 modules dependency scanning; libclang-rt-19-dev carries
+        # the ASan/UBSan runtime libs for clang-19.
+        # This keeps the ASan leg on libstdc++-13 — same stdlib as the
+        # GCC release leg, so tests exercise the production stdlib rather
+        # than libc++ (which has its own LLVM-18 alloc-dealloc ABI bug).
+        if: ${{ startsWith(matrix.os, 'ubuntu') }}
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
+          NEEDRESTART_SUSPEND: '1'
+        run: |
+          set -e
+          PKGS=(ninja-build llvm lld "${{ matrix.cc }}" "${{ matrix.cxx }}")
+          case "${{ matrix.cc }}" in
+            clang-*)
+              VER="${{ matrix.cc }}"; VER="${VER#clang-}"
+              PKGS+=("clang-tools-${VER}" "libclang-rt-${VER}-dev")
+              ;;
+          esac
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends "${PKGS[@]}"
+        timeout-minutes: 10
+
+      - name: Setup MSVC environment
+        # `ilammy/msvc-dev-cmd` exports the full vcvars64 environment to
+        # the runner, so subsequent `bash` steps see cl.exe + Windows SDK
+        # without juggling Developer Command Prompt vs PowerShell. Pinning
+        # the version explicitly avoids surprises when GitHub updates the
+        # Windows image's default VS edition.
+        if: ${{ startsWith(matrix.os, 'windows') }}
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup macOS toolchain
+        if: ${{ startsWith(matrix.os, 'macos') }}
+        run: |
+          brew install ninja llvm
+          # Prefer Homebrew's clang for C++23 stdlib coverage.
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Ninja (Linux)
+        if: ${{ startsWith(matrix.os, 'ubuntu') }}
+        run: ninja --version
+
+      - name: Setup Ninja (Windows)
+        if: ${{ startsWith(matrix.os, 'windows') }}
+        uses: seanmiddleditch/gha-setup-ninja@v6
+
+      - name: Setup CMake
+        # Action pinned to a specific release tag — lukka/get-cmake
+        # publishes versioned release tags (e.g. v4.3.3) rather than a
+        # floating `v<major>`, so `@latest` is the only alternative to
+        # explicit pinning. The CMake binary version is caller-controlled
+        # via the `cmakeVersion` input; the action itself is pinned for
+        # predictability (parity with the rhysd/actionlint:1.7.12 pin
+        # in validate.yml).
+        uses: lukka/get-cmake@v4.3.3
+        with:
+          cmakeVersion: ${{ 'latest' }}
+
+      - name: Cache FetchContent dependencies
+        # FetchContent downloads (nlohmann_json, googletest, etc.) live under
+        # build/_deps/<name>-{src,subbuild}. Keying on the CMakeLists hash
+        # invalidates the cache when versions change, so we never serve a
+        # stale tarball but still benefit on every PR push that doesn't
+        # touch the dep set.
+        uses: actions/cache@v5
+        with:
+          path: ${{ '.' }}/${{ 'build' }}/_deps
+          key: cpp-deps-${{ matrix.name }}-${{ hashFiles(format('{0}/**/CMakeLists.txt', '.')) }}
+          restore-keys: |
+            cpp-deps-${{ matrix.name }}-
+
+      - name: Setup ccache
+        # Content-addressed compiler cache. ccache keys each object on a hash
+        # of the preprocessed source + compiler identity + flags, so a changed
+        # source (production OR test) always misses and recompiles — a stale
+        # binary can never be served. The actions/cache key below only affects
+        # hit RATE, not correctness, so it carries no source hash. PCH-using
+        # compiles are "uncacheable" to ccache unless `ccache-sloppiness` opts
+        # in (applied as CCACHE_SLOPPINESS on Build); it relaxes only date/time
+        # and PCH-define hashing, never source-driven output. `verbose: 1` puts
+        # the per-call cacheable/uncacheable reason in the post-step stats.
+        if: ${{ true }}
+        uses: hendrikmuhs/ccache-action@v1.2.23
+        with:
+          key: cpp-${{ matrix.name }}
+          variant: ccache
+          max-size: ${{ '1G' }}
+          verbose: 1
+
+      - name: Compose sanitizer flags
+        if: ${{ matrix.sanitizers != '' }}
+        id: san
+        run: |
+          # Sanitizer flags go on the same compile + link line. Each leg
+          # selects which sanitizers to enable via `matrix.sanitizers`
+          # (comma-separated list, e.g. "address,undefined"). The compiler
+          # accepts -fsanitize=address,undefined directly.
+          flags="-fsanitize=${{ matrix.sanitizers }} -fno-omit-frame-pointer -g"
+          echo "cflags=$flags" >> "$GITHUB_OUTPUT"
+          echo "ldflags=$flags" >> "$GITHUB_OUTPUT"
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+          CFLAGS: ${{ steps.san.outputs.cflags }}
+          CXXFLAGS: ${{ steps.san.outputs.cflags }}
+          LDFLAGS: ${{ steps.san.outputs.ldflags }}
+        run: |
+          # Route compilation through ccache when enabled. Setting the launcher
+          # at configure time bakes `ccache <compiler>` into the Ninja rules.
+          # Works for GCC/Clang/AppleClang and for MSVC cl.exe (the Windows leg
+          # builds Release, so there's no separate PDB for ccache to miss).
+          # Disabled -> compilers run directly.
+          CACHE_ARGS=()
+          if [ "${{ true }}" = "true" ]; then
+            CACHE_ARGS=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+          fi
+          cmake -S . -B "${{ 'build' }}" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE="${{ matrix.build_type }}" \
+            -DDSS_BUILD_TESTS=ON \
+            "${CACHE_ARGS[@]}" \
+            ${{ '' }}
+        timeout-minutes: 15
+
+      # Cache the precompiled-header BINARY for legs named in `cache-pch-on`.
+      # See that input: a non-byte-reproducible PCH (MSVC / MinGW on Windows)
+      # rebuilt every run busts ccache because the PCH is hashed into every
+      # dependent TU's key. Restoring the byte-identical PCH keeps that key
+      # stable -> warm ccache hits, with PCH still ON for fast cold builds.
+      # Runs AFTER Configure (which generates cmake_pch.* + the build rules)
+      # and BEFORE Build (which would otherwise build the PCH). The key carries
+      # the runner image (toolchain/SDK) + CMakeLists hash so a change rebuilds.
+      - name: Cache precompiled headers
+        if: ${{ contains('windows-msvc-release', matrix.name) }}
+        id: pch-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ${{ '.' }}/${{ 'build' }}/**/cmake_pch.pch
+            ${{ '.' }}/${{ 'build' }}/**/cmake_pch.cxx.obj
+            ${{ '.' }}/${{ 'build' }}/**/cmake_pch.hxx.gch
+          key: cpp-pch-${{ matrix.name }}-${{ env.ImageOS }}-${{ env.ImageVersion }}-${{ hashFiles(format('{0}/**/CMakeLists.txt', '.')) }}
+
+      # A restored PCH carries its archived (older) mtime, so Ninja would
+      # rebuild it (non-reproducibly, re-busting ccache). Make the generated
+      # PCH SOURCES old and the restored PCH BINARIES new, so Ninja treats the
+      # byte-identical restored PCH as up-to-date and the PCH-using TUs keep a
+      # stable ccache key. Only on a cache hit (nothing to reuse on a miss).
+      - name: Reuse restored PCH (skip rebuild)
+        if: ${{ contains('windows-msvc-release', matrix.name) && steps.pch-cache.outputs.cache-hit == 'true' }}
+        shell: bash
+        run: |
+          root="${{ '.' }}/${{ 'build' }}"
+          find "$root" \( -name 'cmake_pch.cxx' -o -name 'cmake_pch.hxx' \) -exec touch -d '2000-01-01' {} +
+          find "$root" \( -name 'cmake_pch.pch' -o -name 'cmake_pch.cxx.obj' -o -name 'cmake_pch.hxx.gch' \) -exec touch {} +
+
+      - name: Build
+        # CCACHE_SLOPPINESS makes ccache cache precompiled-header compiles
+        # (no-op when caching is off or the input is empty). Without it, every
+        # PCH-using TU is "uncacheable" and the cache silently does nothing.
+        env:
+          CCACHE_SLOPPINESS: ${{ 'pch_defines,time_macros' }}
+        run: cmake --build "${{ 'build' }}" --parallel
+        timeout-minutes: 45
+
+      - name: Test
+        working-directory: ${{ '.' }}/${{ 'build' }}
+        env:
+          # `abort_on_error=1` makes the test exe exit non-zero on first
+          # sanitizer hit instead of continuing. `halt_on_error` is the
+          # UBSan-side equivalent. Without these, leaks/UAF reports
+          # surface in stdout but ctest still reports success.
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest ${{ '--output-on-failure --no-tests=error' }}
+        timeout-minutes: 30
+
+      - name: Upload test logs on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-logs-${{ matrix.name }}
+          path: |
+            ${{ '.' }}/${{ 'build' }}/Testing/Temporary/LastTest.log
+            ${{ '.' }}/${{ 'build' }}/Testing/Temporary/LastTestsFailed.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  ci-check:
+    name: ci-check
+    runs-on: ${{ 'ubuntu-latest' }}
+    needs: [run-tests, label-check, format-check, build-matrix]
+    if: ${{ always() }}
+    steps:
+      - name: Generate GitHub App token
+        if: ${{ github.event_name == 'pull_request' }}
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.DSS_PUBLIC_BOTS_APP_ID }}
+          private-key: ${{ secrets.DSS_PUBLIC_BOTS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Report status result
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -e
+          FAIL=0
+          [ "${{ needs.label-check.result }}" = "success" ] || [ "${{ needs.label-check.result }}" = "skipped" ] || FAIL=1
+
+          if [ "${{ contains(github.event.pull_request.labels.*.name, 'Run Pipes') }}" = "true" ]; then
+            # run-tests is "skipped" only when build-matrix produced an
+            # empty matrix (all legs disabled). That state is a config
+            # error, not a pass — flag it via build-matrix.outputs.empty.
+            if [ "${{ needs.build-matrix.outputs.empty }}" = "true" ]; then
+              FAIL=1
+            else
+              [ "${{ needs.run-tests.result }}" = "success" ] || FAIL=1
+            fi
+            # format-check is skipped when label missing OR when probe finds no .clang-format.
+            # "skipped" is a pass; only an outright failure should block.
+            [ "${{ needs.format-check.result }}" = "success" ] || [ "${{ needs.format-check.result }}" = "skipped" ] || FAIL=1
+          fi
+
+          if [ "$FAIL" = "0" ]; then
+            STATE="success"
+            DESC="CI check passed"
+          else
+            STATE="failure"
+            DESC="CI check failed"
+          fi
+
+          curl -s --fail-with-body -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }} \
+            -d "{\"state\":\"$STATE\",\"context\":\"Pipeline / ci-check result\",\"description\":\"$DESC\"}"
+
+  # Regenerate the landing-log hash anchors from git log and fail on drift.
+  # Ungated by the Run Pipes label — plan-doc hygiene matters on every PR.
   landing-log-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
-          # `tools/refresh_landing_log.py` shells `git log` to find PR
-          # commits; shallow clones return only HEAD and silently miss
-          # every prior landing, producing a false drift signal.
           fetch-depth: 0
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-
       - name: Run unit tests
         run: python tools/test_refresh_landing_log.py
-
       - name: Check landing-log hash anchors
         run: python tools/refresh_landing_log.py --check

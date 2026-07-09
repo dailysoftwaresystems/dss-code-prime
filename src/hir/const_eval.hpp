@@ -143,6 +143,11 @@ using TypeSizeResolver =
 struct EvalEnvironment {
     ConstSymbolResolver resolveConstSymbol{};   // CE2
     TypeSizeResolver    resolveTypeSize{};      // FC6 — SizeOf folding
+    // C11/C23 6.5.3.4 — AlignOf folding. Same closure shape as resolveTypeSize
+    // (the closure owns computeLayout + the target's layout params, kept OUT of
+    // const_eval) but returns the type's ALIGNMENT. Absent closure ⇒ AlignOf is
+    // non-constant, exactly as SizeOf is without resolveTypeSize.
+    TypeSizeResolver    resolveTypeAlign{};     // 6.5.3.4 — AlignOf folding
 };
 
 // Caller-controlled policy. Pure bool knobs — no closures, no environment.
