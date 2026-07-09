@@ -1,0 +1,34 @@
+{
+  "$comment": "D-PP-ELIFDEF-ELIFNDEF (C23 6.10.1) runtime witness -- the #elifdef/#elifndef chain. FEATURE_B defined, FEATURE_A/FEATURE_C undefined. `#elifdef FEATURE_B` is TAKEN (pick=42); the later `#elifndef FEATURE_C` has a TRUE condition (!defined(C)) but MUST stay dead by the taken-once latch. `pick` is a pre-declared var REASSIGNED per arm (never redeclared): a both-arms-fire latch regression yields a distinct exit 3 (last assignment wins), NOT a redeclaration compile error that would mask it. THE PRE-FIX SILENT MISCOMPILE: with #elifdef/#elifndef unrecognized, both are silently consumed inside the dead #ifdef group and control falls to #else -> pick=3 -> exit 3, NO compile/link error. correct -> pick=42 -> exit 42. pick reaches identity() as a function argument (fold-resistance); the release arm runs the shipped pipeline over the same source.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

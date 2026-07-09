@@ -4115,6 +4115,15 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // absent).
             readOptWord("hasIncludeOperator",    cfg.hasIncludeOperator);
             readOptWord("hasCAttributeOperator", cfg.hasCAttributeOperator);
+            // C23 (D-PP-ELIFDEF-ELIFNDEF; C 6.10.1): the `#elifdef` / `#elifndef`
+            // directive WORDS. OPTIONAL (matched by lexeme TEXT, like the
+            // required conditional words) -- absent leaves both empty so the
+            // directive falls through to the unsupported-directive fail-loud
+            // (never a silent branch skip). `#elifdef X` == `#elif defined(X)`;
+            // `#elifndef X` == `#elif !defined(X)` -- routed through the SAME
+            // conditional-group state machine with the direct definedness path.
+            readOptWord("elifdefDirective",       cfg.elifdefDirective);
+            readOptWord("elifndefDirective",      cfg.elifndefDirective);
             // FC15c (make-or-break agnosticism): the angle-delimiter token KINDS
             // for `__has_include(<h>)`. OPTIONAL token-name fields (validated like
             // `stringizeToken`). The make-or-break SELF-CONSISTENCY rule: a
