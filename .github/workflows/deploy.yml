@@ -1,13 +1,8 @@
 name: Deploy
 
-# Calls the reusable C++ app deploy workflow in DSS.DevOps.
-# See: https://github.com/dailysoftwaresystems/DSS.DevOps/blob/v2/.github/workflows/cpp-app-deploy.yml
-#
-# Two channels:
-#   - beta:   main → release/beta. Bumps VERSION (minor++ by default,
-#             or use the explicit `version` input).
-#   - stable: release/beta → release/stable. No bump — same version
-#             ships from beta to stable.
+# Deploy pipeline for this C++ application. Inlined from the DSS.DevOps reusable
+# `cpp-app-deploy.yml@v2` (a public repo cannot call the private/internal reusable).
+# Keep in sync with dailysoftwaresystems/DSS.DevOps.
 
 on:
   workflow_dispatch:
@@ -24,15 +19,135 @@ on:
         required: false
         type: string
 
+# One deploy per consumer repo at a time — version bumps and branch
+# merges race against each other if two channels run concurrently.
+# `cancel-in-progress: false` queues the second run rather than killing
+# the first mid-flight.
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
 jobs:
   deploy:
-    uses: dailysoftwaresystems/DSS.DevOps/.github/workflows/cpp-app-deploy.yml@v2
-    with:
-      channel: ${{ inputs.channel }}
-      version: ${{ inputs.version }}
-    secrets:
-      DSS_BOTS_CLIENT_ID: ${{ secrets.DSS_BOTS_CLIENT_ID }}
-      DSS_BOTS_APP_PRIVATE_KEY: ${{ secrets.DSS_BOTS_APP_PRIVATE_KEY }}
+    runs-on: ${{ 'ubuntu-latest' }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.DSS_BOTS_CLIENT_ID }}
+          private-key: ${{ secrets.DSS_BOTS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump VERSION on main (beta only)
+        if: inputs.channel == 'beta'
+        working-directory: ${{ '.' }}
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          MAIN_BRANCH: ${{ 'main' }}
+          VERSION_FILE: ${{ 'VERSION' }}
+        run: |
+          if [ "$(git branch --show-current)" != "$MAIN_BRANCH" ]; then
+            echo "::error::Beta deploy must be triggered from the $MAIN_BRANCH branch"
+            exit 1
+          fi
+
+          if [ ! -f "$VERSION_FILE" ]; then
+            echo "::error::$VERSION_FILE not found"
+            exit 1
+          fi
+
+          current=$(tr -d "[:space:]\r\"'" < "$VERSION_FILE")
+          if [ -z "$current" ]; then
+            echo "::error::$VERSION_FILE is empty"
+            exit 1
+          fi
+          if ! [[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Current version '$current' is not Major.Minor.Patch."
+            exit 1
+          fi
+          echo "Current version: $current"
+
+          if [ -n "$INPUT_VERSION" ]; then
+            if ! [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Invalid version format '$INPUT_VERSION'. Expected Major.Minor.Patch."
+              exit 1
+            fi
+            if [ "$INPUT_VERSION" = "$current" ]; then
+              echo "::error::Provided version ($INPUT_VERSION) equals the current version. Bump it before re-running."
+              exit 1
+            fi
+            new_version="$INPUT_VERSION"
+          else
+            IFS='.' read -r major minor patch <<< "$current"
+            patch=$((patch + 1))
+            new_version="${major}.${minor}.${patch}"
+          fi
+          echo "New version: $new_version"
+
+          printf '%s\n' "$new_version" > "$VERSION_FILE"
+          git add "$VERSION_FILE"
+          git commit -m "v${new_version}"
+
+          # Another commit could land on $MAIN_BRANCH between checkout
+          # and push. Rebase first so the plain push doesn't fail
+          # non-fast-forward and abort the deploy mid-flight. If the
+          # rebase itself conflicts, fail loudly — manual intervention
+          # is required and silently continuing would push a broken tree.
+          if ! git pull --rebase origin "$MAIN_BRANCH"; then
+            echo "::error::Rebase onto origin/$MAIN_BRANCH failed. Resolve manually and re-run."
+            git rebase --abort || true
+            exit 1
+          fi
+          git push
+
+      - name: Merge and push to release branch
+        env:
+          MAIN_BRANCH: ${{ 'main' }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          case "$CHANNEL" in
+            beta)   source="$MAIN_BRANCH"; target="release/beta"   ;;
+            stable) source="release/beta"; target="release/stable" ;;
+            *)      echo "::error::Unknown channel '$CHANNEL' (expected beta|stable)"; exit 1 ;;
+          esac
+
+          git fetch origin
+          if git show-ref --verify --quiet "refs/remotes/origin/$target"; then
+            # Pre-check: if $source has no new commits relative to
+            # $target there is nothing to ship. Consumers wire
+            # cpp-app-pkg.yml to fire on `push: release/*`, so a no-op
+            # merge here would produce no push, no tag, and no release
+            # while still reporting a green check.
+            # Capture rev-list's own exit so a ref-resolution failure
+            # surfaces here instead of falling through to merge.
+            count=$(git rev-list --count "refs/remotes/origin/$target..refs/remotes/origin/$source") || {
+              echo "::error::git rev-list failed (source=$source, target=$target)."
+              exit 1
+            }
+            if [ "$count" = "0" ]; then
+              echo "::error::No new commits in $source relative to $target. Nothing to deploy — cut a new beta first."
+              exit 1
+            fi
+            git checkout "$target"
+            git merge "origin/$source" -m "Merge $source into $target"
+          else
+            # First run for this channel — bootstrap from source.
+            echo "::notice::release branch '$target' does not exist on origin — creating from '$source'"
+            git checkout -b "$target" "origin/$source"
+          fi
+
+          git push --set-upstream origin "$target"
