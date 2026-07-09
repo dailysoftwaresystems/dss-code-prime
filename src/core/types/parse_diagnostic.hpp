@@ -558,6 +558,22 @@ enum class DiagnosticCode : std::uint16_t {
     // in the pointer/bool CONVERSION contexts (handled by isAssignable). The
     // `.actual` names the offending operand. Unsuppressable.
     S_NullptrInvalidOperand       = 0xE033,
+    // C23 §6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE): the type-specifier in an enum's
+    // explicit underlying-type clause (`enum E : T { … }`) is NOT an integer type
+    // (`enum E : float`, `enum E : struct S`). C23 requires the underlying type to be
+    // an integer type; a non-integer is a constraint violation. The `.actual` names
+    // the enum (or the offending type). Unsuppressable — without the fail-loud gate
+    // the enum would silently fall back to the default int and lay out at the wrong
+    // width/signedness.
+    S_InvalidEnumUnderlyingType   = 0xE034,
+    // C23 §6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE): an enumerator's value does NOT
+    // fit the enum's EXPLICIT underlying type (`enum E : unsigned char { A = 256 }`,
+    // `enum E : unsigned char { A = -1 }`). C23 requires every enumerator to be
+    // representable in the underlying type. The `.actual` names the enumerator.
+    // Unsuppressable — a suppressed diagnostic would let the out-of-range value be
+    // truncated/wrapped into the underlying type silently (a wrong constant value).
+    // Only fires for the EXPLICIT-underlying case; a default-int enum is unchanged.
+    S_EnumeratorValueOutOfRange   = 0xE035,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

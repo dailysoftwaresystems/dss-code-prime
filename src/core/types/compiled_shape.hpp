@@ -152,6 +152,16 @@ public:
         return altBranchRules_;
     }
 
+    // D-PARSE-SPECULATIVE-OPTIONAL: for an AltChoice built from the
+    // `{"optional": X}` sugar, `hasSkipBranch()` is true and `skipBranch()`
+    // is the position-id of the SECOND branch — the skip/continuation
+    // (`cont`) the optional falls through to when X is absent. It is NOT one
+    // of the optional's own alternatives, so a SPECULATIVE optional excludes
+    // it from candidate enumeration (see `collectAltBranchRules`). Unset
+    // (false / 0) for `"alt"`/`"repeat"`-built AltChoices and every leaf.
+    [[nodiscard]] bool          hasSkipBranch() const noexcept { return hasSkipBranch_; }
+    [[nodiscard]] std::uint32_t skipBranch()    const noexcept { return skipBranch_; }
+
     // Speculative-alt attributes (only meaningful on AltChoice slots
     // built from an `"alt"` shape carrying `"speculative": true`). The
     // loader populates these; the cursor walker does NOT act on them.
@@ -182,6 +192,13 @@ public:
         speculative_ = spec;
         lookahead_   = lookahead;
     }
+    // D-PARSE-SPECULATIVE-OPTIONAL: record the optional sugar's skip/
+    // continuation branch (`cont`, the second branch). Set by the
+    // `"optional"` builder in `PositionBuilder::build`.
+    void setSkipBranch(std::uint32_t pos) noexcept {
+        skipBranch_    = pos;
+        hasSkipBranch_ = true;
+    }
 
     // c97 sealing-pass writers (GrammarSchema ctor only): derive the O(1)
     // membership bits / the precomputed alt-branch list from the FINAL
@@ -203,8 +220,10 @@ private:
     std::vector<SchemaTokenId> expectedSet_;
     std::vector<std::uint64_t> expectedBits_;    // c97: sealed bitset of expectedSet_
     std::vector<RuleId>        altBranchRules_;  // c97: sealed AltChoice DFS result
+    std::uint32_t   skipBranch_   = 0;      // D-PARSE-SPECULATIVE-OPTIONAL: cont branch pos-id
     bool            nullableTail_ = false;
     bool            speculative_  = false;
+    bool            hasSkipBranch_ = false; // D-PARSE-SPECULATIVE-OPTIONAL: skipBranch_ is set
     std::uint16_t   lookahead_    = 0;
 };
 

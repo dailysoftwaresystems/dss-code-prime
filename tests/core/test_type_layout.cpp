@@ -560,6 +560,17 @@ TEST(TypeLayout, EnumFollowsUnderlying) {
     EXPECT_EQ(l.align.bytes(), 4u);
 }
 
+// FC17 (D-CSUBSET-ENUM-UNDERLYING-TYPE, C23 6.7.2.2): an enum with an EXPLICIT
+// unsigned-char underlying lays out at the underlying's width/align (1/1), not
+// the default int's 4/4 — the layout engine sizes purely by scalars[0], so the
+// C23 explicit-underlying feature needs ZERO layout-engine change.
+TEST(TypeLayout, EnumFollowsExplicitU8Underlying) {
+    auto ti = makeInterner(1);
+    auto const l = layoutOf(ti.enumType("E", TypeKind::U8), ti);
+    EXPECT_EQ(l.size, 1u)  << "an unsigned-char-underlying enum is 1 byte";
+    EXPECT_EQ(l.align.bytes(), 1u);
+}
+
 // ── flexible array member (FAM) ─────────────────────────────────────────────
 
 TEST(TypeLayout, FlexibleArrayMemberContributesOffsetNotSize) {

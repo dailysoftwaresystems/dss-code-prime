@@ -847,6 +847,56 @@ struct PositionBuilder {
         return static_cast<std::uint32_t>(positions.size() - 1);
     }
 
+    // Read the `speculative` / `lookahead` metadata off a shape body and
+    // stamp it onto an already-emplaced AltChoice at `posId`. Shared by the
+    // `"alt"` and `"optional"` builders so a `{"optional": X, "speculative":
+    // true}` clause gets the SAME backtracking semantics as a speculative
+    // alt (D-PARSE-SPECULATIVE-OPTIONAL). A body WITHOUT the `speculative`
+    // key leaves the position BYTE-IDENTICAL — the bit is set only when the
+    // key is present and true, so plain optionals/alts are unaffected.
+    void applySpeculativeFlags(json const& body, std::uint32_t posId) {
+        constexpr std::uint16_t kDefaultLookahead = 8;
+        bool speculative = false;
+        std::uint16_t lookahead = kDefaultLookahead;
+        if (body.contains("speculative")) {
+            json const& sv = body.at("speculative");
+            if (!sv.is_boolean()) {
+                coll.emit(DiagnosticCode::C_ConflictingField,
+                          std::format("{}/speculative", shapePath),
+                          "'speculative' must be a boolean");
+            } else {
+                speculative = sv.get<bool>();
+            }
+        }
+        if (body.contains("lookahead")) {
+            json const& lv = body.at("lookahead");
+            if (!lv.is_number_integer()) {
+                coll.emit(DiagnosticCode::C_ConflictingField,
+                          std::format("{}/lookahead", shapePath),
+                          "'lookahead' must be a positive integer");
+            } else {
+                const auto raw = lv.get<std::int64_t>();
+                if (raw <= 0 ||
+                    raw > std::numeric_limits<std::uint16_t>::max()) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/lookahead", shapePath),
+                              std::format("'lookahead' value {} is out of "
+                                          "range (must be 1..{})",
+                                          raw, std::numeric_limits<std::uint16_t>::max()));
+                } else {
+                    lookahead = static_cast<std::uint16_t>(raw);
+                }
+            }
+            if (!speculative) {
+                coll.emit(DiagnosticCode::C_RedundantField,
+                          std::format("{}/lookahead", shapePath),
+                          "'lookahead' has no effect without 'speculative: true'",
+                          DiagnosticSeverity::Warning);
+            }
+        }
+        if (speculative) positions[posId].setSpeculative(true, lookahead);
+    }
+
     // `cont` is the position-id the built body falls through to when it
     // completes. Threaded right-to-left through sequence children so each
     // child's `nextPos` points at its actual successor.
@@ -884,46 +934,7 @@ struct PositionBuilder {
             const auto id = emplace(detail::Position::makeAltChoice(
                 std::move(branches), std::move(ex)));
             // Speculative-alt metadata stored for the parser to consume.
-            constexpr std::uint16_t kDefaultLookahead = 8;
-            bool speculative = false;
-            std::uint16_t lookahead = kDefaultLookahead;
-            if (body.contains("speculative")) {
-                json const& sv = body.at("speculative");
-                if (!sv.is_boolean()) {
-                    coll.emit(DiagnosticCode::C_ConflictingField,
-                              std::format("{}/speculative", shapePath),
-                              "'speculative' must be a boolean");
-                } else {
-                    speculative = sv.get<bool>();
-                }
-            }
-            if (body.contains("lookahead")) {
-                json const& lv = body.at("lookahead");
-                if (!lv.is_number_integer()) {
-                    coll.emit(DiagnosticCode::C_ConflictingField,
-                              std::format("{}/lookahead", shapePath),
-                              "'lookahead' must be a positive integer");
-                } else {
-                    const auto raw = lv.get<std::int64_t>();
-                    if (raw <= 0 ||
-                        raw > std::numeric_limits<std::uint16_t>::max()) {
-                        coll.emit(DiagnosticCode::C_ConflictingField,
-                                  std::format("{}/lookahead", shapePath),
-                                  std::format("'lookahead' value {} is out of "
-                                              "range (must be 1..{})",
-                                              raw, std::numeric_limits<std::uint16_t>::max()));
-                    } else {
-                        lookahead = static_cast<std::uint16_t>(raw);
-                    }
-                }
-                if (!speculative) {
-                    coll.emit(DiagnosticCode::C_RedundantField,
-                              std::format("{}/lookahead", shapePath),
-                              "'lookahead' has no effect without 'speculative: true'",
-                              DiagnosticSeverity::Warning);
-                }
-            }
-            if (speculative) positions[id].setSpeculative(true, lookahead);
+            applySpeculativeFlags(body, id);
             return id;
         }
         if (body.contains("optional")) {
@@ -931,7 +942,18 @@ struct PositionBuilder {
             std::vector<SchemaTokenId> ex;
             mergeSorted(ex, positions[innerStart].expectedSet());
             mergeSorted(ex, positions[cont].expectedSet());
-            return emplace(detail::Position::makeAltChoice({innerStart, cont}, std::move(ex)));
+            const auto id = emplace(detail::Position::makeAltChoice(
+                {innerStart, cont}, std::move(ex)));
+            // D-PARSE-SPECULATIVE-OPTIONAL: the second branch (`cont`) is the
+            // skip/continuation, not one of the optional's own alternatives.
+            // Mark it so a SPECULATIVE optional excludes it from candidate
+            // enumeration (collectAltBranchRules). Inert for a plain optional
+            // (the marker is read only under `speculative()`).
+            positions[id].setSkipBranch(cont);
+            // Honor `speculative`/`lookahead` on the optional sugar so
+            // `{"optional": X, "speculative": true}` backtracks like an alt.
+            applySpeculativeFlags(body, id);
+            return id;
         }
         if (body.contains("repeat")) {
             // Tie-the-knot: reserve a slot for the loop entry first, build
@@ -5187,6 +5209,57 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                         }
                                     }
                                     rule.bitfieldSuffix = std::move(suffix);
+                                }
+                            }
+                        }
+
+                        // C23 6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE, FC17):
+                        // optional `enumUnderlyingType` —
+                        //   "enumUnderlyingType": { "rule": "enumTypeSpecifier",
+                        //                           "typeChild": 1 }
+                        // `rule` names the underlying-type clause shape; `typeChild`
+                        // is the visible-child index of the type-name node inside
+                        // it. Mirrors `bitfieldSuffix`; an unknown rule is
+                        // C_UnknownShape (the decl stays usable, sans explicit
+                        // underlying type).
+                        if (entry.contains("enumUnderlyingType")) {
+                            json const& eu = entry.at("enumUnderlyingType");
+                            if (!eu.is_object()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/enumUnderlyingType",
+                                          "'enumUnderlyingType' must be an object");
+                            } else if (!eu.contains("rule") || !eu.at("rule").is_string()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/enumUnderlyingType/rule",
+                                          "'enumUnderlyingType.rule' is required and must be a "
+                                          "rule-name string");
+                            } else {
+                                auto const rn = eu.at("rule").get<std::string>();
+                                if (!data.rules->contains(rn)) {
+                                    coll.emit(DiagnosticCode::C_UnknownShape,
+                                              path + "/enumUnderlyingType/rule",
+                                              std::format("'enumUnderlyingType.rule' references "
+                                                          "unknown shape '{}'", rn));
+                                } else {
+                                    EnumUnderlyingTypeSpec spec;
+                                    spec.rule     = data.rules->find(rn);
+                                    spec.ruleName = rn;
+                                    if (eu.contains("typeChild")) {
+                                        auto const& tc = eu.at("typeChild");
+                                        if (!tc.is_number_integer()
+                                            || tc.get<std::int64_t>() < 0
+                                            || tc.get<std::int64_t>()
+                                                   > std::numeric_limits<std::int32_t>::max()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      path + "/enumUnderlyingType/typeChild",
+                                                      "'typeChild' must be a non-negative "
+                                                      "integer");
+                                        } else {
+                                            spec.typeChild =
+                                                static_cast<std::uint32_t>(tc.get<std::int64_t>());
+                                        }
+                                    }
+                                    rule.enumUnderlyingType = std::move(spec);
                                 }
                             }
                         }

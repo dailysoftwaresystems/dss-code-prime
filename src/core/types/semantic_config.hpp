@@ -125,6 +125,22 @@ struct DSS_EXPORT BitfieldSuffix {
     std::optional<std::uint32_t> widthChild;    // visible-child index of the width expr
 };
 
+// C23 6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE, FC17): an enum's OPTIONAL explicit
+// underlying-type clause (`enum E : unsigned char { … }`). When a declaration
+// configures one and a node of `rule` appears in the composite's subtree, the
+// enum's underlying scalar TypeKind is the integer type at that node's visible
+// child `typeChild` (resolved via the shared type-position resolver) instead of
+// the default int; each enumerator's value is then range-checked against it. A
+// non-integer underlying fails loud (S_InvalidEnumUnderlyingType); an out-of-range
+// enumerator fails loud (S_EnumeratorValueOutOfRange). Config-driven (the language
+// names the clause rule + type-child index); the engine never hard-codes
+// "enumTypeSpecifier". Sibling shape to BitfieldSuffix.
+struct DSS_EXPORT EnumUnderlyingTypeSpec {
+    RuleId                       rule{};        // the underlying-type clause rule
+    std::string                  ruleName;      // source spelling, for diagnostics
+    std::optional<std::uint32_t> typeChild;     // visible-child index of the type-name node
+};
+
 // D5.1 / D5.4: a composite-type-introducing declaration. When a declaration
 // carries `fieldChildren`, Pass 1.5 walks the scope it opened, collects every
 // minted symbol whose declaring rule == `rule` (in declaration order, via each
@@ -557,6 +573,11 @@ struct DSS_EXPORT DeclarationRule {
     // Matched by rule within the field subtree (a sibling of the name, like
     // arraySuffix). `nullopt` ⇒ this declaration form has no bit-field syntax.
     std::optional<BitfieldSuffix> bitfieldSuffix;
+    // C23 6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE, FC17): optional explicit enum
+    // underlying-type clause (`enum E : unsigned char { … }`). Matched by rule
+    // within the composite subtree. `nullopt` ⇒ this declaration form has no
+    // explicit-underlying-type syntax (the enum defaults to int).
+    std::optional<EnumUnderlyingTypeSpec> enumUnderlyingType;
     // FC6 (FAM): when true, an ABSENT array length on this declaration form
     // (`T x[]`) resolves to an INCOMPLETE array type (C99 §6.7.2.1 flexible
     // array member) instead of the `S_NonConstantArrayLength` error. Only

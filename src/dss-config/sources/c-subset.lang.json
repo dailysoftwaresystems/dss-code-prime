@@ -492,10 +492,18 @@
       "sequence": [ "EnumKeyword", "Identifier" ]
     },
 
+    "enumTypeSpecifier": {
+      "$comment": "C23 6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE, FC17): the OPTIONAL `: <integer-type>` clause that fixes an enum's underlying type — `enum E : unsigned char { A }`. A SEQUENCE `[Colon, castTypeBase]` (castTypeBase is the qualifier-free/pointer-free base type-name — `unsigned char`, `int`, a typedef, NOT `int *`). It carries `commitRequiresTypeName` with `requireKnownType` polarity (MIRRORS `alignasTypeName`): the enum-underlying `:` collides with the pre-existing anonymous enum-typed struct bit-field `enum Color : 4;`, so the parser SPECULATIVELY tries this clause after the `:` and the binder triage commits ONLY on a real type (keyword/tag-led base → Rule 1; a KNOWN typedef → Rule 2); a bit-field WIDTH (an int-constant `4`, or a value/unknown identifier `enum Tag : SOME_WIDTH`) ROLLS BACK, leaving the `:` for the member-level bit-field grammar. SEMANTICS live in the semantic tier (DeclarationRule.enumUnderlyingType): the resolved integer TypeKind becomes the enum's underlying scalar (scalars[0]) and each enumerator's value is range-checked against it (fail-loud S_InvalidEnumUnderlyingType on a non-integer, S_EnumeratorValueOutOfRange on overflow).",
+      "sequence": [ "Colon", "castTypeBase" ],
+      "commitRequiresTypeName": { "rule": "castTypeBase", "polarity": "requireKnownType" }
+    },
+
     "enumSpec": {
-      "$comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the UNIFIED enum specifier — `enum {opt tag} {opt body}`. Mirrors `structSpec`: ONE rule for define (`enum E { A, B }`) and reference (`enum E`), the SOLE EnumKeyword candidate in the 4 body-bearing alts → non-speculative direct descent. Dual-mode binder via `definesWhenChild: enumBody`. The enumerator-list (with trailing comma) lives in `enumBody`.",
+      "$comment": "c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: the UNIFIED enum specifier — `enum {opt tag} {opt underlying-type} {opt body}`. Mirrors `structSpec`: ONE rule for define (`enum E { A, B }`) and reference (`enum E`), the SOLE EnumKeyword candidate in the 4 body-bearing alts → non-speculative direct descent. Dual-mode binder via `definesWhenChild: enumBody`. The enumerator-list (with trailing comma) lives in `enumBody`. FC17 (D-CSUBSET-ENUM-UNDERLYING-TYPE / D-PARSE-SPECULATIVE-OPTIONAL): the optional C23 `: <integer-type>` clause (`enumTypeSpecifier`) sits between the tag and the body as a SPECULATIVE optional so `enum E : unsigned char { A }` fixes the underlying type while the pre-existing anonymous enum-typed bit-field `enum Color : 4;` still parses (the clause is TRIED after the `:` and ROLLS BACK to the bit-field reading when a type doesn't follow — the whole point of the speculative-optional engine capability).",
       "sequence": [
-        "EnumKeyword", { "optional": "Identifier" }, { "optional": "enumBody" }
+        "EnumKeyword", { "optional": "Identifier" },
+        { "optional": "enumTypeSpecifier", "speculative": true, "lookahead": 8 },
+        { "optional": "enumBody" }
       ]
     },
 
@@ -1387,6 +1395,8 @@
         "$c25Comment": "c25: the DEFINITION arm of the unified `enumSpec` (mirrors structSpec). `definesWhenChild: enumBody`. The enumerator lift-to-enclosing-scope behavior is unchanged (fieldChildren.liftToEnclosingScope).",
         "definesWhenChild": "enumBody",
         "anonymousNameAllowed": true,
+        "$fc17Comment": "C23 6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE): the OPTIONAL explicit underlying-type clause. When an `enumTypeSpecifier` child is present, the semantic tier resolves its `typeChild` (index 1 = castTypeBase) to an integer TypeKind and uses it as the enum's underlying scalar (scalars[0]) instead of the default I32, AND range-checks each enumerator against it. Mirrors `bitfieldSuffix`'s rule+child-index shape.",
+        "enumUnderlyingType": { "rule": "enumTypeSpecifier", "typeChild": 1 },
         "fieldChildren": { "rule": "enumerator", "compositeKind": "enum",
                            "liftToEnclosingScope": true } },
       { "rule": "structField", "head": 0, "declaratorList": 1, "kind": "variable",

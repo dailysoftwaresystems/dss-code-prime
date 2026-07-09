@@ -1043,7 +1043,7 @@ struct Lowerer {
                     "integer encodings compute 64- or 32-bit-wide, which "
                     "would silently violate the type's defined wraparound/"
                     "comparison semantics (D-CSUBSET-32BIT-ALU-FORMS)",
-                    what, static_cast<unsigned>(interner.kind(ty)),
+                    what, static_cast<unsigned>(reprKind(ty)),
                     target.name()));
             poisonValue(id);
             return false;
@@ -1060,11 +1060,20 @@ struct Lowerer {
                     "form on target '{}' this cycle — only {} is realized; "
                     "first-match would otherwise pick a wrong-width "
                     "encoding (D-CSUBSET-32BIT-ALU-FORMS)",
-                    what, static_cast<unsigned>(interner.kind(ty)),
+                    what, static_cast<unsigned>(reprKind(ty)),
                     target.name(), realized));
             poisonValue(id);
             return false;
         };
+        // D-CSUBSET-ENUM-UNDERLYING-TYPE (FC17): every kind test in this gate
+        // reads through `reprKind` (enum → underlying scalar), NOT the raw
+        // `interner.kind`. An enum behaves AS its underlying integer at the
+        // width tier (the SAME projection `widthFlagsForType`/`registerOp-
+        // WidthFlags` already apply), so a `enum E : unsigned char` conversion
+        // routes through the realized U8 form instead of tripping this gate on
+        // the Enum kind (ordinal 23, which has no encoded conversion form).
+        // `reprKind` is identity for every NON-enum kind, so this changes
+        // nothing for plain integer/pointer/float operands.
         switch (op) {
             case MirOpcode::Add: case MirOpcode::Sub: case MirOpcode::Mul:
             case MirOpcode::SDiv: case MirOpcode::UDiv:
@@ -1075,8 +1084,8 @@ struct Lowerer {
                 TypeId const ty = mir.instType(id);
                 // Bool ALU compute is gated too (unreachable post-
                 // promotion; reaching it = sub-int compute).
-                if (ty.valid() && (gatedKind(interner.kind(ty))
-                                   || interner.kind(ty) == TypeKind::Bool)) {
+                if (ty.valid() && (gatedKind(reprKind(ty))
+                                   || reprKind(ty) == TypeKind::Bool)) {
                     return fail(ty, mirOpcodeName(op));
                 }
                 return true;
@@ -1088,7 +1097,7 @@ struct Lowerer {
             case MirOpcode::ICmpUgt: case MirOpcode::ICmpUge: {
                 for (MirInstId const operand : mir.instOperands(id)) {
                     TypeId const ty = mir.instType(operand);
-                    if (ty.valid() && gatedKind(interner.kind(ty))) {
+                    if (ty.valid() && gatedKind(reprKind(ty))) {
                         return fail(ty, "ICmp operand");
                     }
                 }
@@ -1109,7 +1118,7 @@ struct Lowerer {
                 // narrowing story this cycle — fail loud, never a silent narrow).
                 TypeId const ty = mir.instType(id);
                 if (ty.valid()) {
-                    TypeKind const k = interner.kind(ty);
+                    TypeKind const k = reprKind(ty);
                     // D-CSUBSET-SUBNATIVE-ALU-FORMS: a sub-native Trunc result
                     // (I8/U8/I16/U16, joining Char) routes through
                     // registerOpWidthFlags → the promoted width-32 `mov` (low bits
@@ -1137,10 +1146,10 @@ struct Lowerer {
                     // source → movsx r/m16 / SXTH; an I8 source → the byte form
                     // (movsx r/m8 / SXTB, shared with Char). I32 → movsxd / SXTW.
                     if (ty.valid()
-                        && interner.kind(ty) != TypeKind::I32
-                        && interner.kind(ty) != TypeKind::Char
-                        && interner.kind(ty) != TypeKind::I8
-                        && interner.kind(ty) != TypeKind::I16) {
+                        && reprKind(ty) != TypeKind::I32
+                        && reprKind(ty) != TypeKind::Char
+                        && reprKind(ty) != TypeKind::I8
+                        && reprKind(ty) != TypeKind::I16) {
                         return failConv(ty, "SExt source",
                                         "the I32-, I16-, and byte-source forms");
                     }
@@ -1171,10 +1180,10 @@ struct Lowerer {
                     // source → movzx r/m16 / UXTH; a U8 source → movzx r/m8 / UXTB.
                     // Bool/U32 keep their existing widener forms.
                     if (ty.valid()
-                        && interner.kind(ty) != TypeKind::Bool
-                        && interner.kind(ty) != TypeKind::U32
-                        && interner.kind(ty) != TypeKind::U8
-                        && interner.kind(ty) != TypeKind::U16) {
+                        && reprKind(ty) != TypeKind::Bool
+                        && reprKind(ty) != TypeKind::U32
+                        && reprKind(ty) != TypeKind::U8
+                        && reprKind(ty) != TypeKind::U16) {
                         return failConv(ty, "ZExt source",
                                         "the Bool-, U32-, U16-, and U8-source forms");
                     }

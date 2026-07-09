@@ -152,6 +152,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_PackedBitfieldUnsupported";
         case DiagnosticCode::S_NullptrInvalidOperand:
             return "S_NullptrInvalidOperand";
+        case DiagnosticCode::S_InvalidEnumUnderlyingType:
+            return "S_InvalidEnumUnderlyingType";
+        case DiagnosticCode::S_EnumeratorValueOutOfRange:
+            return "S_EnumeratorValueOutOfRange";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

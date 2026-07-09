@@ -724,6 +724,39 @@ enumUnderlyingOrSelf(TypeInterner& interner, TypeId t) {
     return sc.empty() ? t : interner.primitive(static_cast<TypeKind>(sc[0]));
 }
 
+// C23 6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE): the bit-width of a core integer
+// kind — 8/16/32/64/128 for I8..I128 / U8..U128. Returns 0 for a non-integer
+// kind (the caller gates the enum-underlying validity on this being non-zero).
+[[nodiscard]] inline constexpr int intKindBits(TypeKind k) noexcept {
+    int const rank = detail::type_rules::intWidthRank(k);   // 1..5 → 8..128
+    return rank == 0 ? 0 : (8 << (rank - 1));
+}
+
+// C23 6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE): does the (already computed)
+// enumerator VALUE fit the enum's EXPLICIT underlying integer type? A signed
+// kind admits [-2^(b-1), 2^(b-1)-1]; an unsigned kind admits [0, 2^b - 1].
+// Enumerator values are carried as int64, so a 64+-bit signed underlying always
+// fits, a NON-NEGATIVE value always fits a 64+-bit unsigned underlying, and a
+// negative value never fits ANY unsigned underlying. Returns false for a
+// non-integer kind (bits == 0) — but the caller diagnoses that as
+// S_InvalidEnumUnderlyingType before ever range-checking.
+[[nodiscard]] inline bool
+enumeratorValueFitsUnderlying(std::int64_t value, TypeKind underlying) noexcept {
+    int const bits = intKindBits(underlying);
+    if (bits == 0) return false;
+    bool const isSigned = detail::type_rules::signedIntRank(underlying) != 0;
+    if (isSigned) {
+        if (bits >= 64) return true;                        // any int64 fits I64/I128
+        std::int64_t const lo = -(std::int64_t{1} << (bits - 1));
+        std::int64_t const hi =  (std::int64_t{1} << (bits - 1)) - 1;
+        return value >= lo && value <= hi;
+    }
+    if (value < 0) return false;                            // negative never fits unsigned
+    if (bits >= 64) return true;                            // any non-negative int64 fits U64/U128
+    std::uint64_t const hi = (std::uint64_t{1} << bits) - 1;
+    return static_cast<std::uint64_t>(value) <= hi;
+}
+
 // The C 6.3.1.8 common type of two operands under the language's
 // declared rules — the config-driven sibling of
 // `TypeInterner::commonType` (which keeps serving block-less languages

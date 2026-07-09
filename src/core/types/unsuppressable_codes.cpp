@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 88> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 90> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -380,6 +380,19 @@ constexpr std::array<DiagnosticCode, 88> kUnsuppressableCodes{{
     // diagnostic would leave `nullptr + 1` compiled as `0 + 1 == 1` — ill-formed C
     // silently accepted. Closed here so nullptr misuse is never silently lowered.
     DiagnosticCode::S_NullptrInvalidOperand,
+    // S_InvalidEnumUnderlyingType / S_EnumeratorValueOutOfRange (FC17,
+    // D-CSUBSET-ENUM-UNDERLYING-TYPE, C23 6.7.2.2): the explicit enum
+    // underlying-type constraint violations — a non-integer underlying type
+    // (`enum E : float`) and an enumerator value out of the underlying's range
+    // (`enum E : unsigned char { A = 256 }`). Both ship WRONG BYTES if suppressed:
+    // a suppressed invalid-underlying would silently lay the enum out at the default
+    // int width/signedness instead of failing, and a suppressed out-of-range value
+    // would be truncated/wrapped into the underlying type — a wrong constant. Same
+    // silent-miscompile-guard class as S_PackedBitfieldUnsupported above. (The
+    // default-int enum path never emits either, so unsuppressing changes nothing
+    // for existing enums.)
+    DiagnosticCode::S_InvalidEnumUnderlyingType,
+    DiagnosticCode::S_EnumeratorValueOutOfRange,
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

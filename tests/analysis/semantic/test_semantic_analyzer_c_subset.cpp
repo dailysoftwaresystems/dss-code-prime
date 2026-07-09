@@ -6784,3 +6784,193 @@ TEST(SemanticAnalyzerCSubset, NullptrSizeofIsWellTyped) {
     auto model = analyze(cu);
     EXPECT_FALSE(model.hasErrors());
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// FC17 (D-CSUBSET-ENUM-UNDERLYING-TYPE, C23 6.7.2.2): the explicit enum
+// underlying-type clause `enum E : T { … }`, riding the speculative-optional
+// parser capability (D-PARSE-SPECULATIVE-OPTIONAL). The `enum <tag> :` prefix
+// collides with the pre-existing anonymous enum-typed struct bit-field
+// `enum Color : 4;`; the clause is TRIED after the `:` and ROLLS BACK to the
+// bit-field reading when a type does not follow.
+// ─────────────────────────────────────────────────────────────────────────
+
+TEST(SemanticAnalyzerCSubset, EnumExplicitUnderlyingTypeSetsScalars) {
+    auto cu = buildShippedUnit("c-subset", {
+        "enum E : unsigned char { A, B };\n"
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "an explicit unsigned-char underlying enum must analyze clean";
+    auto const& ti = model.lattice().interner();
+    // The enumerator A carries the enum TypeId (erec.type = compositeTy).
+    TypeId enumTy{};
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "A") enumTy = model.symbols()[i].type;
+    ASSERT_TRUE(enumTy.valid()) << "enumerator A must be typed as the enum";
+    EXPECT_EQ(ti.kind(enumTy), TypeKind::Enum);
+    ASSERT_EQ(ti.scalars(enumTy).size(), 1u);
+    // RED-on-disable: revert the grammar (parse fails, no clean enum) OR the
+    // semantic threading (falls back to default I32) and this drops to I32.
+    EXPECT_EQ(ti.scalars(enumTy)[0], static_cast<std::int64_t>(TypeKind::U8))
+        << "the enum underlying scalar must be U8, not the default I32";
+}
+
+TEST(SemanticAnalyzerCSubset, EnumUnderlyingTypeDistinctFromDefault) {
+    auto cu = buildShippedUnit("c-subset", {
+        "enum Wide { WA };\n"                     // default int
+        "enum Narrow : unsigned char { NA };\n"   // explicit u8
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId wide{}, narrow{};
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& n = model.symbols()[i].name;
+        if (n == "WA") wide   = model.symbols()[i].type;
+        if (n == "NA") narrow = model.symbols()[i].type;
+    }
+    ASSERT_TRUE(wide.valid() && narrow.valid());
+    EXPECT_NE(wide.v, narrow.v)
+        << "a different underlying type interns a DISTINCT enum TypeId";
+    EXPECT_EQ(ti.scalars(wide)[0],   static_cast<std::int64_t>(TypeKind::I32));
+    EXPECT_EQ(ti.scalars(narrow)[0], static_cast<std::int64_t>(TypeKind::U8));
+}
+
+TEST(SemanticAnalyzerCSubset, EnumAnonymousWithExplicitUnderlying) {
+    auto cu = buildShippedUnit("c-subset", {
+        "enum : unsigned char { AX, AY };\n"      // anonymous + explicit underlying
+        "int main(void) { return AY; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "an anonymous enum with an explicit underlying type must be clean";
+    auto const& ti = model.lattice().interner();
+    TypeId enumTy{};
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "AX") enumTy = model.symbols()[i].type;
+    ASSERT_TRUE(enumTy.valid());
+    EXPECT_EQ(ti.scalars(enumTy)[0], static_cast<std::int64_t>(TypeKind::U8));
+}
+
+TEST(SemanticAnalyzerCSubset, EnumUnderlyingNonIntegerFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "enum E : float { A };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidEnumUnderlyingType), 1u)
+        << "a float underlying type must fail loud S_InvalidEnumUnderlyingType";
+}
+
+TEST(SemanticAnalyzerCSubset, EnumUnderlyingStructFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Foo { int x; };\n"
+        "enum E : struct Foo { A };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidEnumUnderlyingType), 1u)
+        << "a struct underlying type must fail loud S_InvalidEnumUnderlyingType";
+}
+
+TEST(SemanticAnalyzerCSubset, EnumeratorValueOutOfRangeFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "enum E : unsigned char { A = 256 };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_EnumeratorValueOutOfRange), 1u)
+        << "256 does not fit unsigned char (max 255) — must fail loud";
+}
+
+TEST(SemanticAnalyzerCSubset, EnumeratorValueAtBoundaryClean) {
+    auto model = analyzeShipped("c-subset", {
+        "enum E : unsigned char { A = 255 };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_EnumeratorValueOutOfRange), 0u)
+        << "255 is exactly the unsigned-char max — in range, no error";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+TEST(SemanticAnalyzerCSubset, EnumDefaultUnderlyingRangeCheckNeverFires) {
+    // A default-int enum is NEVER range-checked (hasExplicitUnderlying == false),
+    // so a value that would overflow a narrow type but fits int is clean — the
+    // C-classic behavior is unchanged.
+    auto model = analyzeShipped("c-subset", {
+        "enum E { A = 256, B = 70000 };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_EnumeratorValueOutOfRange), 0u)
+        << "a default-int enum range check must NEVER fire";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+TEST(SemanticAnalyzerCSubset, EnumBitfieldWidthValidatesAgainstExplicitUnderlying) {
+    // A bit-field of an enum with an EXPLICIT unsigned-char underlying validates
+    // its width against 8 bits (the existing bit-field check reads the enum
+    // underlying via enumUnderlyingOrSelf, scalars[0] = U8): width 9 exceeds it
+    // and fails loud; width 8 is exactly in range.
+    auto bad = analyzeShipped("c-subset", {
+        "enum E : unsigned char { A };\n"
+        "struct S { enum E f : 9; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(bad.diagnostics(),
+                        DiagnosticCode::S_BitFieldWidthOutOfRange), 1u)
+        << "width 9 > the U8 underlying 8 bits must fail loud";
+    auto ok = analyzeShipped("c-subset", {
+        "enum E : unsigned char { A };\n"
+        "struct S { enum E f : 8; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(ok.diagnostics(),
+                        DiagnosticCode::S_BitFieldWidthOutOfRange), 0u)
+        << "width 8 == the U8 underlying 8 bits is exactly in range";
+}
+
+TEST(SemanticAnalyzerCSubset, EnumAnonymousBitfieldColonSurvivesSpeculativeOptional) {
+    // THE FORK PIN (Option B): the pre-existing anonymous enum-typed struct
+    // bit-field `enum Color : 3;` must STILL parse after adding the speculative
+    // underlying-type clause — the speculative optional TRIES `: <type>` and
+    // ROLLS BACK to the bit-field reading when an int-constant (not a type)
+    // follows the colon. A plain non-speculative optional (Option A) would break
+    // this with a loud parse error.
+    auto model = analyzeShipped("c-subset", {
+        "enum Color { RED, GREEN };\n"
+        "struct S { int a; enum Color : 3; int b; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "`enum Color : 3;` (anonymous bit-field) must survive the speculative "
+           "underlying-type optional";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::P_NoAlternativeMatched), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidEnumUnderlyingType), 0u)
+        << "`: 3` must be a bit-field width, NOT a (failed) underlying type";
+}
+
+TEST(SemanticAnalyzerCSubset, EnumUnderlyingBareIdentifierWidthRollsBackToBitfield) {
+    // The requireKnownType triage pin: `enum Color : W3` where W3 is a VALUE
+    // identifier (an enum constant, NOT a type) rolls the speculative
+    // underlying-type clause back so `: W3` is the anonymous bit-field width.
+    auto model = analyzeShipped("c-subset", {
+        "enum Widths { W3 = 3 };\n"
+        "enum Color { RED, GREEN };\n"
+        "struct S { int a; enum Color : W3; int b; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a value width identifier must roll back to the bit-field reading";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidEnumUnderlyingType), 0u)
+        << "`: W3` (a value) must NOT be treated as an underlying type";
+}

@@ -39,7 +39,23 @@ namespace {
             return;
         }
         if (p.slotKind() == SlotKind::AltChoice) {
-            for (auto bid : p.branches()) self(self, bid);
+            for (auto bid : p.branches()) {
+                // D-PARSE-SPECULATIVE-OPTIONAL: when enumerating a SPECULATIVE
+                // optional's OWN candidate set (posId == startPos), its
+                // skip/continuation branch is NOT one of its alternatives —
+                // those rule-leaves belong to the enclosing sequence tail.
+                // Excluding it makes a peek that matches only the continuation
+                // yield candidates=[] so the parser's nullable skip fires and
+                // the tail parses non-speculatively. Gated to the walk ROOT so
+                // an ENCLOSING non-speculative optional still reaches those
+                // rules through its own (deeper) traversal — the non-
+                // speculative `altRuleBranches` route stays byte-identical.
+                if (posId == startPos && p.speculative() && p.hasSkipBranch()
+                    && bid == p.skipBranch()) {
+                    continue;
+                }
+                self(self, bid);
+            }
         }
         // TokenLeaf / End: not a rule branch — token routing goes
         // through `advance`.

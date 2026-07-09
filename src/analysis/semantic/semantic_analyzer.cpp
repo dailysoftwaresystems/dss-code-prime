@@ -353,6 +353,23 @@ nodeHasVisibleChildOfRule(Tree const& tree, NodeId node, RuleId childRule) {
     return false;
 }
 
+// FC17 (D-CSUBSET-ENUM-UNDERLYING-TYPE): the FIRST visible child of `node` whose
+// rule is `childRule`, or an invalid NodeId if none. The value-returning sibling
+// of `nodeHasVisibleChildOfRule` — used to locate the enum underlying-type clause
+// (`enumTypeSpecifier`) inside an enum specifier so the semantic tier can resolve
+// its type child. Generic + agnostic: keyed on a config-resolved RuleId, never a
+// keyword. Direct-children only (the clause is always a direct child).
+[[nodiscard]] NodeId
+findVisibleChildOfRule(Tree const& tree, NodeId node, RuleId childRule) {
+    if (!childRule.valid()) return NodeId{};
+    for (NodeId c : visibleChildren(tree, node)) {
+        if (tree.kind(c) == NodeKind::Internal && tree.rule(c) == childRule) {
+            return c;
+        }
+    }
+    return NodeId{};
+}
+
 // c25: is the declaration `decl` a DEFINITION at THIS node? A row without the
 // dual-mode gate is ALWAYS a definition (every shipped decl before c25). A gated
 // row (`definesWhenChildRule`, the unified composite specifier) is a definition
@@ -4383,7 +4400,8 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                 } else if (ck == CompositeKind::Enum) {
                                     // D5.5: enum type carries no field-
                                     // operands — only its nominal name +
-                                    // underlying TypeKind (I32 in v1).
+                                    // underlying TypeKind (I32 by default;
+                                    // C23 6.7.2.2 explicit underlying below).
                                     // Pass 1 created each enumerator's
                                     // SymbolRecord with type still invalid;
                                     // we now SET each enumerator's type to
@@ -4396,8 +4414,70 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                     // binding stays in the inner scope; this
                                     // is a republication) so C-classic
                                     // `enum E { A } ... A` works.
+                                    //
+                                    // C23 6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE,
+                                    // FC17): resolve the OPTIONAL explicit
+                                    // underlying-type clause (`enum E : T`). The
+                                    // default stays int (I32) — unchanged for
+                                    // EVERY enum without the clause. A non-integer
+                                    // underlying fails loud
+                                    // (S_InvalidEnumUnderlyingType) and falls back
+                                    // to int so the enum still lays out; its
+                                    // enumerators are then NOT range-checked (only
+                                    // an explicit, valid underlying enables the
+                                    // per-enumerator range check below).
+                                    TypeKind underlyingKind = TypeKind::I32;
+                                    bool hasExplicitUnderlying = false;
+                                    if (decl.enumUnderlyingType.has_value()
+                                        && specNode.valid()) {
+                                        NodeId const clauseNode =
+                                            findVisibleChildOfRule(
+                                                tree, specNode,
+                                                decl.enumUnderlyingType->rule);
+                                        if (clauseNode.valid()
+                                            && decl.enumUnderlyingType->typeChild
+                                                   .has_value()) {
+                                            auto const clauseKids =
+                                                visibleChildren(tree, clauseNode);
+                                            std::uint32_t const tci =
+                                                *decl.enumUnderlyingType->typeChild;
+                                            if (tci < clauseKids.size()) {
+                                                ScopeId const uScope =
+                                                    s.scopes.scopes()
+                                                        [srec.structScope.v].parent;
+                                                TypeId const uTy = resolveTypeNode(
+                                                    s, cfg, tree, clauseKids[tci],
+                                                    uScope, /*emitOnMiss=*/true);
+                                                if (uTy.valid()) {
+                                                    TypeKind const k =
+                                                        s.lattice.interner().kind(uTy);
+                                                    if (isIntegerKind(k)) {
+                                                        underlyingKind = k;
+                                                        hasExplicitUnderlying = true;
+                                                    } else {
+                                                        ParseDiagnostic d;
+                                                        d.code = DiagnosticCode::
+                                                            S_InvalidEnumUnderlyingType;
+                                                        d.severity =
+                                                            DiagnosticSeverity::Error;
+                                                        d.buffer =
+                                                            tree.source().id();
+                                                        d.span =
+                                                            tree.span(clauseNode);
+                                                        d.actual =
+                                                            std::string{srec.name};
+                                                        s.reporter.report(
+                                                            std::move(d));
+                                                    }
+                                                }
+                                                // uTy invalid ⇒ resolveTypeNode
+                                                // already emitted S_UnknownType
+                                                // (fail loud on a typo'd type).
+                                            }
+                                        }
+                                    }
                                     compositeTy = s.lattice.interner().enumType(
-                                        srec.name, TypeKind::I32);
+                                        srec.name, underlyingKind);
                                     if (srec.structScope.valid()) {
                                         // Republish enumerators into the SAME
                                         // namespace scope the enum TAG floats to
@@ -4488,6 +4568,32 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                                             }
                                             erec.enumValue = value;
                                             erec.isEnumerator = true;
+                                            // C23 6.7.2.2 (D-CSUBSET-ENUM-
+                                            // UNDERLYING-TYPE): with an EXPLICIT
+                                            // underlying type every enumerator
+                                            // must be representable in it — fail
+                                            // loud (S_EnumeratorValueOutOfRange)
+                                            // on overflow (`enum E : unsigned char
+                                            // { A = 256 }` / `{ A = -1 }`).
+                                            // Default-int enums have
+                                            // hasExplicitUnderlying == false, so
+                                            // this check NEVER fires for them (the
+                                            // C classic wrap-around behavior is
+                                            // unchanged).
+                                            if (hasExplicitUnderlying
+                                                && !enumeratorValueFitsUnderlying(
+                                                       value, underlyingKind)) {
+                                                ParseDiagnostic d3;
+                                                d3.code = DiagnosticCode::
+                                                    S_EnumeratorValueOutOfRange;
+                                                d3.severity =
+                                                    DiagnosticSeverity::Error;
+                                                d3.buffer = tree.source().id();
+                                                d3.span =
+                                                    tree.span(erec.declRuleNode);
+                                                d3.actual = erec.name;
+                                                s.reporter.report(std::move(d3));
+                                            }
                                             nextValue = value + 1;
                                             // D5.5-FU2: only also-bind to the
                                             // enclosing scope when the config
