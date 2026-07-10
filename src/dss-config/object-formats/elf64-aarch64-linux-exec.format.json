@@ -22,8 +22,15 @@
   "$dataImportBindingComment": "c84 (D-LK-EXTERN-DATA-IMPORT): extern library DATA objects (libc stdout/stderr/stdin) bind via ELF COPY RELOCATIONS — the standard glibc non-PIE ET_EXEC mechanism: the exec reserves a correctly-sized+aligned .bss slot per imported object, exports the symbol as a DEFINED OBJECT (st_size = the layout-derived object size) at that slot, and emits one R_AARCH64_COPY (1024) in .rela.dyn; ld-linux-aarch64 memcpy's the library's object into the slot before entry and ALL images (incl. libc itself, by interposition) reference the exec's copy. Zero new instruction encodings — module code reaches the object through the normal GlobalAddr path. Same shared elf.cpp walker as the x86_64 exec format; arch differs only via the per-machine reloc constant. A format WITHOUT this field rejects data imports loud at the linker's pre-walker gate.",
   "dataImportBinding": "copy-relocation",
 
-  "$supportedDataSectionsComment": "D-LK1-ELF-EXEC-DATA-SECTIONS (rodata) + D-LK4-DATA-PRODUCER (writable `.data` + zero-fill `.bss`): the ELF ET_EXEC walker emits `.rodata`/`.data`/`.bss` from `AssembledModule.dataItems` per item `section`. Same field + same shared `elf.cpp` code path as the x86_64-ELF exec format; arch differs only via config (pageAlign/machine). Cross-format agnosticism: zero format-name branches in the gate.",
-  "supportedDataSections": ["rodata", "data", "bss"],
+  "$supportedDataSectionsComment": "D-LK1-ELF-EXEC-DATA-SECTIONS (rodata) + D-LK4-DATA-PRODUCER (writable `.data` + zero-fill `.bss`) + D-CSUBSET-THREAD-LOCAL (thread-local `.tdata`/`.tbss`, TLS C2): the ELF ET_EXEC walker emits `.rodata`/`.data`/`.bss` plus `.tdata` (initialized thread-local template, opens the R+W PT_LOAD, covered by PT_TLS) and `.tbss` (zero-fill thread-local extent, NOBITS, PT_TLS memsz only — NO file/segment footprint) from `AssembledModule.dataItems` per item `section`. Same field + same shared `elf.cpp` code path as the x86_64-ELF exec format (which opted in at TLS C1); arch differs only via config (pageAlign/machine/tls variant). Cross-format agnosticism: zero format-name branches in the gate. pe64 opts in at TLS C3, Mach-O at C4; until then their walkers carry the K_FormatLacksThreadLocalSupport belt.",
+  "supportedDataSections": ["rodata", "data", "bss", "tdata", "tbss"],
+
+  "$tlsAccessComment": "TLS C2 (D-CSUBSET-THREAD-LOCAL): how code reaches a thread-local object's per-thread copy on this leg. local-exec = the ELF static-TLS model for a non-PIE executable: glibc's ld.so processes PT_TLS for every thread (the CSU runs before main on this ALWAYS-dynamic arm) and sets TPIDR_EL0 to the thread block's TCB head (AArch64 Variant I — the block FOLLOWS tp), so `MRS Xd, TPIDR_EL0` reads tp directly and a symbol's address is tp + tpoff(sym) with tpoff a POSITIVE link-time constant (the tls-tprel-hi12/lo12 ADD/ADD pair). MIR→LIR keys the ACCESS SHAPE off the target's tlsbase variant vocabulary (the arm64 row is the 0-operand MRS form), so segmentPrefixByte/baseDisplacement — x86 `mov r64, seg:[disp32]` template values consumed ONLY by encoders whose templates request them (payloadBytePrefix / the absdisp32.mem slot) — are declared 0 here and NEVER read on this leg. A format WITHOUT this block fails loud K_FormatLacksThreadLocalSupport on the first thread-local access (pe64/macho omit it until their TLS cycles).",
+  "tlsAccess": {
+    "model": "local-exec",
+    "segmentPrefixByte": 0,
+    "baseDisplacement": 0
+  },
   "$artifactProfilesComment": "Profiles this format SERVES (plan 06 AP3) — a runnable console executable ⇒ cli (the format-side twin of the language's artifactProfiles[]; driver fails loud D_ArtifactProfileFormatMismatch on a profile not in this set).",
   "artifactProfiles": ["cli"],
 
@@ -100,6 +107,26 @@
       "virtualAddress": 0
     },
     {
+      "$comment": "Initialized THREAD-LOCAL template data (`thread_local int g = 7;` — D-CSUBSET-THREAD-LOCAL, TLS C2). sh_type=SHT_PROGBITS(1); sh_flags=SHF_WRITE|SHF_ALLOC|SHF_TLS(0x403=1027) — the TLS bit is what tells inspectors (readelf/lldb) these bytes are a per-thread TEMPLATE, not process data. The shared elf.cpp walker places it as the FIRST file-backed member of the R+W PT_LOAD #2 and points PT_TLS at it (p_offset/p_vaddr=here, p_filesz=this section, p_memsz=+tbss); glibc's ld.so copies the template into every thread's static TLS block. sh_addralign floor 1 — MEMBER-DRIVEN (the walker raises to the strictest member alignment, which also becomes PT_TLS p_align and feeds the Variant-I tpoff formula alignUp(tcbHeaderBytes, p_align) + templateOffset); a gratuitous floor would inflate every thread's block + diverge from the gcc-witnessed offsets. Byte-for-byte the C1 x86_64 row — the walker is machine-neutral. virtualAddress=0 — computed.",
+      "kind": "tdata",
+      "name": ".tdata",
+      "type": 1,
+      "flags": 1027,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Zero-fill THREAD-LOCAL template extent (`thread_local int g;` — D-CSUBSET-THREAD-LOCAL, TLS C2). sh_type=SHT_NOBITS(8); sh_flags=SHF_WRITE|SHF_ALLOC|SHF_TLS(0x403=1027). Unlike `.bss` it occupies NO file bytes AND NO PT_LOAD memory — its span lives ONLY in PT_TLS p_memsz (the loader allocates + zeroes it per thread); sh_addr/sh_offset are the nominal just-past-.tdata values (the gcc overlap convention for NOBITS TLS). sh_addralign floor 1 — member-driven, same rationale as .tdata. virtualAddress=0 — computed.",
+      "kind": "tbss",
+      "name": ".tbss",
+      "type": 8,
+      "flags": 1027,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
       "$comment": "Symbol table — conventional for debugger support. sh_type = SHT_SYMTAB (2); sh_addralign = 8; sh_entsize = 24 (Elf64_Sym).",
       "kind": "symtab",
       "name": ".symtab",
@@ -151,6 +178,17 @@
       "name": "R_AARCH64_ABS64",
       "kind": 4,
       "nativeId": 257
+    },
+    {
+      "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C2): the local-exec thread-pointer-offset ADD/ADD pair — the imm12 fixups of `ADD Xd, Xn, #:tprel_hi12:sym, LSL #12` + `ADD Xd, Xd, #:tprel_lo12_nc:sym`. kinds 5/6 match the target schema's tls-tprel-hi12/lo12 rows (Aarch64TprelAddHi12 range-gated / Aarch64AddAbsLo12 magnitude-free, both tls:true); the walker patches the words from its tpoff-valued symbolVa entries, so the exec image carries NO runtime reloc for them (link-time constants). nativeIds = R_AARCH64_TLSLE_ADD_TPREL_HI12 (549 = 0x225) and R_AARCH64_TLSLE_ADD_TPREL_LO12_NC (551 = 0x227) — the *_NC lo12 id is chosen (over the checked 550) because DSS's lo12 formula is the psABI's 'no overflow check' semantic: a magnitude-free (S+A)&0xFFF whose range is guaranteed by the PAIRED hi12 arm's full-value gate [0, 0xFFFFFF] — exactly the pairing gcc/binutils emit for -ftls-model=local-exec. Only meaningful for a future ET_REL emission of these kinds; in-place exec patching consumes the KIND, but the rows' existence is what satisfies the linker's pre-walker cross-reference unifier.",
+      "name": "R_AARCH64_TLSLE_ADD_TPREL_HI12",
+      "kind": 5,
+      "nativeId": 549
+    },
+    {
+      "name": "R_AARCH64_TLSLE_ADD_TPREL_LO12_NC",
+      "kind": 6,
+      "nativeId": 551
     }
   ]
 }

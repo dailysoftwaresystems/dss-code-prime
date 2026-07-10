@@ -2967,28 +2967,94 @@ struct Lowerer {
                                 "MIR GlobalAddr (thread-local)");
             return;
         }
-        // The tp-slot displacement rides a SIGNED disp32 operand; the
-        // loader caps the config at INT32_MAX, so this cast is exact
-        // (re-checked here so a hand-built TlsAccessInfo can never
-        // flip sign silently).
-        if (tlsAccess_->baseDisplacement
-            > static_cast<std::uint32_t>(
-                  std::numeric_limits<std::int32_t>::max())) {
-            reportTlsFormatReject(std::format(
-                "tlsAccess baseDisplacement {} exceeds the signed disp32 "
-                "range (D-CSUBSET-THREAD-LOCAL)",
-                tlsAccess_->baseDisplacement));
+        // ── TLS C2 (D-CSUBSET-THREAD-LOCAL): the tlsbase LIR SHAPE is
+        // the TARGET's declaration, probed from its `tlsbase` variant
+        // vocabulary (the SANCTIONED capability-probe pattern —
+        // targetHasMovImm64 / globalAddrRiprelFoldsIntoLoad; never
+        // `if (arch == ...)`). The two tp-read primitives genuinely
+        // differ in OPERAND SHAPE, not just bytes:
+        //   * `[memoffset]` — a memory read of the tp slot
+        //     (x86 `mov r64, seg:[disp32]`): the segment byte rides
+        //     the LIR payload (template payloadBytePrefix) and the
+        //     slot displacement a MemOffset operand — BOTH values are
+        //     per-format config (tlsAccess.segmentPrefixByte /
+        //     .baseDisplacement).
+        //   * `[]` — a self-contained system-register read
+        //     (arm64 `MRS Xd, TPIDR_EL0`, one fixed word): NO memory
+        //     operand, NO prefix byte; the format's segment/
+        //     displacement values are x86-machinery this shape never
+        //     consumes (declared 0 in the arm64-ELF JSON, inert).
+        // Emitting the shape the target declares keeps each row
+        // HONEST (no phantom zero-validated operand on the MRS form)
+        // and this lowering target-blind. First recognized variant in
+        // DECLARED ORDER wins (the encoder's own first-match
+        // discipline); a tlsbase row declaring NEITHER shape fails
+        // loud below — never a silently mis-shaped inst that the
+        // encoder would reject with a less actionable message.
+        bool tpUsesMemOffsetShape = false;
+        bool tpShapeKnown         = false;
+        if (auto const* tbInfo = target.opcodeInfo(*tlsBaseOp)) {
+            for (auto const& v : tbInfo->encoding.variants) {
+                if (v.operandKinds.empty()) {
+                    tpUsesMemOffsetShape = false;
+                    tpShapeKnown         = true;
+                    break;
+                }
+                if (v.operandKinds.size() == 1
+                    && v.operandKinds[0] == OperandKindFilter::MemOffset) {
+                    tpUsesMemOffsetShape = true;
+                    tpShapeKnown         = true;
+                    break;
+                }
+            }
+        }
+        if (!tpShapeKnown) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_RequiredLirOpcodeMissing;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "target '{}' declares a 'tlsbase' opcode but none of its "
+                "encoding variants has a recognized thread-pointer-read "
+                "shape — expected operandKinds [] (self-contained system-"
+                "register read, e.g. MRS) or [\"memoffset\"] (tp-slot "
+                "memory read, e.g. mov r64, seg:[disp32]) "
+                "(D-CSUBSET-THREAD-LOCAL)",
+                target.name());
+            reporter.report(std::move(d));
             return;
         }
-        // tlsbase %tp — payload carries the segment-override byte.
         LirReg const tpReg = lir.newVReg(LirRegClass::GPR);
-        std::array<LirOperand, 1> tpOps{LirOperand::makeMemOffset(
-            static_cast<std::int32_t>(tlsAccess_->baseDisplacement))};
-        emitInst(*tlsBaseOp, tpReg, tpOps,
-                 /*payload=*/tlsAccess_->segmentPrefixByte);
-        // lea %addr, [%tp + tpoff32(sym)] — the 2-op [Reg, SymbolRef]
-        // lea variant; the encoder records the tls-tpoff32 relocation
-        // at the memory-displacement position.
+        if (tpUsesMemOffsetShape) {
+            // The tp-slot displacement rides a SIGNED disp32 operand; the
+            // loader caps the config at INT32_MAX, so this cast is exact
+            // (re-checked here so a hand-built TlsAccessInfo can never
+            // flip sign silently).
+            if (tlsAccess_->baseDisplacement
+                > static_cast<std::uint32_t>(
+                      std::numeric_limits<std::int32_t>::max())) {
+                reportTlsFormatReject(std::format(
+                    "tlsAccess baseDisplacement {} exceeds the signed disp32 "
+                    "range (D-CSUBSET-THREAD-LOCAL)",
+                    tlsAccess_->baseDisplacement));
+                return;
+            }
+            // tlsbase %tp — payload carries the segment-override byte.
+            std::array<LirOperand, 1> tpOps{LirOperand::makeMemOffset(
+                static_cast<std::int32_t>(tlsAccess_->baseDisplacement))};
+            emitInst(*tlsBaseOp, tpReg, tpOps,
+                     /*payload=*/tlsAccess_->segmentPrefixByte);
+        } else {
+            // tlsbase %tp — bare: the target's tp read is self-contained
+            // (MRS); no operand, no payload (a fixed32 template consumes
+            // neither).
+            emitInst(*tlsBaseOp, tpReg, std::span<LirOperand const>{});
+        }
+        // lea %addr, [%tp + tpoff(sym)] — the 2-op [Reg, SymbolRef]
+        // lea variant, SHARED by both tp-read shapes; the target's own
+        // encoding records the tls-flagged relocation(s): x86 ONE
+        // tls-tpoff32 at the memory-displacement position, arm64 the
+        // tls-tprel-hi12/lo12 PAIR at word offsets 0/4 of its ADD/ADD
+        // macro (TLS C2).
         LirReg const addrReg = lir.newVReg(LirRegClass::GPR);
         std::array<LirOperand, 2> leaOps{
             LirOperand::makeReg(tpReg),

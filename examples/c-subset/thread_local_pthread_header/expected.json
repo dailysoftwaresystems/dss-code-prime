@@ -1,5 +1,5 @@
 {
-  "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C1, user-requested): the REAL-INCLUDE form of the per-thread discriminator — `#include <pthread.h>` through the shipped neutral descriptor (shippedLibs/pthread.json), composed with an actual mutex: a file-scope `static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;` (the per-format elf {0} macro variant initializing the opaque arr<i64,6> typedef) guards a shared `sum` while `thread_local counter` does the per-thread part. Two workers each observe counter==105 (template 5 + 100) -> sum==210 and main's copy stays 6; a process-shared alias yields 312/torn and main==206. pthread_create's shipped 3rd param is ptr<void> -> the fn name passes via an explicit (void *)worker cast (bare fn->void* does not implicitly convert in the c-subset). The raw-extern twin thread_local_pthread stays and pins the default-binding mechanism; this one pins the shipped-header path + mutex composition + TLS. The release arm re-proves it under the full optimizer. x86_64-linux ONLY until TLS C2 (arm64) / C3 (pe64) / C4 (Mach-O). Exit 42.",
+  "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C1, user-requested): the REAL-INCLUDE form of the per-thread discriminator — `#include <pthread.h>` through the shipped neutral descriptor (shippedLibs/pthread.json), composed with an actual mutex: a file-scope `static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;` (the per-format elf {0} macro variant initializing the opaque arr<i64,6> typedef) guards a shared `sum` while `thread_local counter` does the per-thread part. Two workers each observe counter==105 (template 5 + 100) -> sum==210 and main's copy stays 6; a process-shared alias yields 312/torn and main==206. pthread_create's shipped 3rd param is ptr<void> -> the fn name passes via an explicit (void *)worker cast (bare fn->void* does not implicitly convert in the c-subset). The raw-extern twin thread_local_pthread stays and pins the default-binding mechanism; this one pins the shipped-header path + mutex composition + TLS. The release arm re-proves it under the full optimizer. The arm64 arm (TLS C2) re-proves the shipped-header + mutex + TLS composition through MRS TPIDR_EL0 + ADD/ADD Variant-I under qemu-aarch64. pe64 until C3 / Mach-O until C4. Exit 42.",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,
@@ -8,6 +8,12 @@
       "spec": "x86_64:elf64-x86_64-linux-exec",
       "artifact": "main",
       "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
     }
   ],
   "optimizedPipelines": [

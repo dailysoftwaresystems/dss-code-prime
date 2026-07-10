@@ -1416,6 +1416,172 @@ TEST(Program_CompileFiles, ThreadLocalEmitsPtTlsAndFsAccessSequence) {
         << "the local-exec fs-read sequence must be present";
 }
 
+TEST(Program_CompileFiles, Arm64ThreadLocalEmitsPtTlsAndMrsAccessSequence) {
+    // TLS C2 (D-CSUBSET-THREAD-LOCAL): the arm64 E2E twin — the SAME
+    // source through the FULL driver for arm64:elf64-aarch64-linux-exec.
+    // Pins the Variant-I physics IN THE IMAGE: PT_TLS {filesz 4,
+    // memsz 4, align 4} + the MRS TPIDR_EL0 word in .text + the
+    // ADD/ADD hi12/lo12 pair PATCHED to tpoff 16 =
+    // alignUp(tcbHeaderBytes 16, p_align 4) + templateOffset 0 — the
+    // walker's addTlsSymbolOffsets Variant-1 arm made VISIBLE in the
+    // bytes. A clean compile ALSO proves both tls reloc kinds were
+    // consumed (an unconsumed/mismatched kind fails the CRIT-1
+    // cross-check loud). Red-on-disable: routing thread_local through
+    // Data/Bss keeps single-thread runtime green while every
+    // assertion here flips.
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "tls_e2e_a64.c",
+        "thread_local int g = 7;\n"
+        "int main(void) { g = g + 35; return g; }\n");
+    scratch.useAsCwd();
+
+    Program prog;
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset",
+        {"arm64:elf64-aarch64-linux-exec"});
+    ASSERT_EQ(rc, 0) << "thread_local must compile clean end-to-end on "
+                        "arm64 (D-CSUBSET-THREAD-LOCAL, TLS C2)";
+
+    auto const out = scratch.path() / "target" / "elf64-aarch64-linux-exec"
+                   / "tls_e2e_a64";
+    ASSERT_TRUE(fs::exists(out));
+    auto const bytes = readAllBytes(out);
+    ASSERT_GT(bytes.size(), 64u);
+
+    // e_machine = EM_AARCH64 (183); e_phnum == 6 (the PT_TLS slot).
+    EXPECT_EQ(rdU16(bytes, 18), 183u);
+    EXPECT_EQ(rdU16(bytes, 56), 6u);
+    std::size_t const tlsPh = findPtTls(bytes);
+    ASSERT_NE(tlsPh, 0u) << "PT_TLS program header must be present";
+    std::uint64_t const pOff    = rdU64(bytes, tlsPh + 8);
+    std::uint64_t const pFilesz = rdU64(bytes, tlsPh + 32);
+    std::uint64_t const pMemsz  = rdU64(bytes, tlsPh + 40);
+    std::uint64_t const pAlign  = rdU64(bytes, tlsPh + 48);
+    EXPECT_EQ(pFilesz, 4u);
+    EXPECT_EQ(pMemsz, 4u);
+    EXPECT_EQ(pAlign, 4u);
+    EXPECT_EQ(bytes[static_cast<std::size_t>(pOff)], 7u)
+        << "the .tdata template must carry g's initial value";
+
+    // Scan the image words for the access sequence: at least one
+    // `MRS Xd, TPIDR_EL0` (0xD53BD040 | Rd — Rd is regalloc's pick,
+    // masked) and at least one PATCHED ADD/ADD hi12/lo12 pair
+    // decoding to tpoff 16 (hi12 0, lo12 16) — the Variant-I value
+    // for the sole 4-byte-aligned int at template offset 0.
+    auto const rdU32 = [&](std::size_t off) {
+        return  static_cast<std::uint32_t>(bytes[off])
+             | (static_cast<std::uint32_t>(bytes[off + 1]) << 8)
+             | (static_cast<std::uint32_t>(bytes[off + 2]) << 16)
+             | (static_cast<std::uint32_t>(bytes[off + 3]) << 24);
+    };
+    std::size_t mrsCount = 0;
+    std::size_t tpoff16Pairs = 0;
+    for (std::size_t i = 0; i + 8 <= bytes.size(); i += 4) {
+        std::uint32_t const w = rdU32(i);
+        if ((w & 0xFFFFFFE0u) == 0xD53BD040u) ++mrsCount;
+        // ADD Xd, Xn, #imm12, LSL #12 (0x91400000 opcode bits) whose
+        // imm12 == 0 (hi12 of tpoff 16), followed by ADD Xd, Xn,
+        // #imm12 (0x91000000, sh=0) whose imm12 == 16 (lo12).
+        if ((w & 0xFFC00000u) == 0x91400000u
+            && ((w >> 10) & 0xFFFu) == 0u) {
+            std::uint32_t const w2 = rdU32(i + 4);
+            if ((w2 & 0xFFC00000u) == 0x91000000u
+                && ((w2 >> 10) & 0xFFFu) == 16u) {
+                ++tpoff16Pairs;
+            }
+        }
+    }
+    EXPECT_GE(mrsCount, 1u)
+        << "the MRS TPIDR_EL0 thread-pointer read must be present";
+    EXPECT_GE(tpoff16Pairs, 1u)
+        << "the ADD/ADD pair must be patched to the Variant-I tpoff "
+           "16 = alignUp(tcbHeaderBytes 16, p_align 4) + 0";
+}
+
+TEST(Program_CompileFiles, Arm64ThreadLocalHi12NonZeroPairPatchedE2E) {
+    // ★ TLS C2 (audit fold): the sh=1-template × hi12-PATCH
+    // composition — every other in-repo image pin has tpoff < 4096 so
+    // the hi12 field stays 0 and only the formula UNIT tests exercise
+    // a non-zero hi12; this belt witnesses it in a REAL image. Layout
+    // hand-derivation: `pad` must be INITIALIZED so both items share
+    // .tdata with pad FIRST (an uninitialized pad would go to .tbss,
+    // which sits AFTER .tdata in the block — leaving v's tpoff at 16
+    // and hi12 at 0):
+    //   .tdata: pad @ 0 (align 1, 5000 bytes), v @ alignUp(5000,4)
+    //           = 5000 (align 4) → filesz/memsz 5004, p_align 4;
+    //   tpoff(v) = alignUp(tcbHeaderBytes 16, p_align 4)
+    //            + templateOffset 5000 = 5016 = 0x1398
+    //   → hi12 = 5016 >> 12 = 1, lo12 = 5016 & 0xFFF = 0x398 (920).
+    // Pure image-byte assertions — no emulator required.
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "tls_hi12_a64.c",
+        "thread_local char pad[5000] = {1};\n"
+        "thread_local int v = 7;\n"
+        "int main(void) {\n"
+        "    pad[0] = pad[0] + 1;\n"
+        "    v = v + 33;\n"
+        "    return v + pad[0];\n"
+        "}\n");
+    scratch.useAsCwd();
+
+    Program prog;
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset",
+        {"arm64:elf64-aarch64-linux-exec"});
+    ASSERT_EQ(rc, 0) << "the >4096-byte TLS layout must compile clean "
+                        "(D-CSUBSET-THREAD-LOCAL, TLS C2)";
+
+    auto const out = scratch.path() / "target" / "elf64-aarch64-linux-exec"
+                   / "tls_hi12_a64";
+    ASSERT_TRUE(fs::exists(out));
+    auto const bytes = readAllBytes(out);
+    ASSERT_GT(bytes.size(), 64u);
+
+    // PT_TLS spans the 5004-byte template at p_align 4; template[0]
+    // = pad's 1, template[5000..5003] = v's 07 00 00 00.
+    std::size_t const tlsPh = findPtTls(bytes);
+    ASSERT_NE(tlsPh, 0u);
+    std::uint64_t const pOff    = rdU64(bytes, tlsPh + 8);
+    std::uint64_t const pFilesz = rdU64(bytes, tlsPh + 32);
+    std::uint64_t const pMemsz  = rdU64(bytes, tlsPh + 40);
+    std::uint64_t const pAlign  = rdU64(bytes, tlsPh + 48);
+    EXPECT_EQ(pFilesz, 5004u);
+    EXPECT_EQ(pMemsz, 5004u);
+    EXPECT_EQ(pAlign, 4u);
+    EXPECT_EQ(bytes[static_cast<std::size_t>(pOff)], 1u)
+        << "template[0] must carry pad[0]'s initial value";
+    EXPECT_EQ(bytes[static_cast<std::size_t>(pOff) + 5000], 7u)
+        << "template[5000] must carry v's initial value";
+
+    // At least one PATCHED pair decodes to v's tpoff 5016: word0 =
+    // ADD sh=1 with hi12 == 1, word1 = ADD sh=0 with lo12 == 920.
+    auto const rdU32 = [&](std::size_t off) {
+        return  static_cast<std::uint32_t>(bytes[off])
+             | (static_cast<std::uint32_t>(bytes[off + 1]) << 8)
+             | (static_cast<std::uint32_t>(bytes[off + 2]) << 16)
+             | (static_cast<std::uint32_t>(bytes[off + 3]) << 24);
+    };
+    std::size_t hi12OnePairs = 0;
+    for (std::size_t i = 0; i + 8 <= bytes.size(); i += 4) {
+        std::uint32_t const w = rdU32(i);
+        if ((w & 0xFFC00000u) == 0x91400000u
+            && ((w >> 10) & 0xFFFu) == 1u) {
+            std::uint32_t const w2 = rdU32(i + 4);
+            if ((w2 & 0xFFC00000u) == 0x91000000u
+                && ((w2 >> 10) & 0xFFFu) == 920u) {
+                ++hi12OnePairs;
+            }
+        }
+    }
+    EXPECT_GE(hi12OnePairs, 1u)
+        << "v's accesses must carry the ADD/ADD pair patched to tpoff "
+           "5016 = 0x1398 (hi12 1, lo12 920) — the hi12-nonzero "
+           "composition the formula unit tests alone cannot witness "
+           "in an image";
+}
+
 TEST(Program_CompileFiles, NoThreadLocalControlHasNoTlsTrace) {
     // The byte-identity control: the SAME program with an ordinary
     // global shows ZERO TLS machinery — 5 phdrs, no PT_TLS, no

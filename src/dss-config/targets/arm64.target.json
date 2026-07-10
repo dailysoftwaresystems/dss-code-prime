@@ -9,6 +9,8 @@
   },
   "$aggregateLayoutComment": "FC6 (D-FF3-1): per-ABI layout params. `natural` (scalar align = byte size, capped) is the AAPCS64 + Apple arm64 rule; maxAlignment 16 = the AArch64 max fundamental alignment (128-bit vector / __int128 / long double).",
   "aggregateLayout": { "scalarAlignment": "natural", "maxAlignment": 16, "bitFieldStrategy": "gnu_packed" },
+  "$tlsComment": "TLS C2 (D-CSUBSET-THREAD-LOCAL): the CPU's static-TLS layout convention — psABI-per-CPU data (AArch64 is Variant I under EVERY OS, so it lives on the TARGET, not the format; the x86_64 twin declares variant2). variant1 = the thread pointer (TPIDR_EL0) points AT the TCB head and the TLS block FOLLOWS it; a symbol's link-time thread-pointer offset is POSITIVE: tpoff = alignUp(tcbHeaderBytes, p_align) + templateOffset. tcbHeaderBytes = 16 — the AArch64 TCB header is two pointers (the psABI/glibc `tcbhead_t` prefix: dtv pointer + private). Consumed ONLY by the walker's tpoff helper (addTlsSymbolOffsets) when the format's tlsAccess.model is local-exec — a config-keyed formula selector, never a machine-identity branch.",
+  "tls": { "variant": "variant1", "tcbHeaderBytes": 16 },
   "opcodes": [
     {
       "$comment": "Slot 0 = the Invalid sentinel — same discipline as x86_64. Substrate's addInst guard rejects opcode 0 loudly.",
@@ -1250,6 +1252,26 @@
       }
     },
     {
+      "$comment": "TLS C2 (D-CSUBSET-THREAD-LOCAL): materialize the current thread's TLS base pointer (tp) into a GPR — the AArch64 form is `MRS Xd, TPIDR_EL0`, ONE self-contained fixed word 0xD53BD040 (3577466944 = MRS with op0=3 op1=3 CRn=13 CRm=0 op2=2, the EL0 software thread-ID register) | Rd at bits 0..4 (the standard `rd` slot — zero new slot vocabulary). ZERO-OPERAND shape, deliberately DIFFERENT from x86's 1-op `[memoffset]` row: the system-register read consumes NO memory operand and NO prefix byte, so the lowering's capability probe (lowerThreadLocalGlobalAddr) sees the `[]` variant and emits a bare `tlsbase %tp` — the format tlsAccess block's segmentPrefixByte/baseDisplacement are x86-template machinery this shape never reads (the arm64-ELF JSON declares them 0, inert). Pure read (no side effects); never a terminator. The paired tpoff ADD/ADD macro is the `lea` [reg, symbol] TLS variant below.",
+      "mnemonic":      "tlsbase",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   0,
+      "maxOperands":   0,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": [] },
+            "template":   { "fixedWord": 3577466944 },
+            "resultSlot": "rd"
+          }
+        ]
+      }
+    },
+    {
       "$comment": "Load-effective-address — AArch64 ADRP+ADD pair (D-AS4-3 multi-instruction macro-op materializing a module symbol's address into Xd). Mirrors x86_64's 1-operand RIP-relative `lea reg, [rip+sym]` so `lowerGlobalAddr` is target-blind: ONE SymbolRef operand wired into BOTH words. word0 = ADRP Xd, sym@PG (0x90000000=2415919104): Rd at bits 0..4; immlo[30:29]+immhi[23:5] left ZERO — the adr_prel_pg_hi21 reloc patches the ±4 GiB page delta. word1 = ADD Xd, Xd, #:lo12:sym (0x91000000=2432696320, the ADD-imm base shared with `add`'s imm variant): Rd at 0..4 AND Rn at 5..9 (BOTH = the result reg via extraResultSlots — ADD reads its own dest as the source base); imm12[21:10] left ZERO — the add_abs_lo12_nc reloc patches. Both relocs target the SAME symbol at byte offsets base+0 and base+4. The two `sym.patch` wires write NO immediate bits (the linker owns them); they carry only relocationKind + wordIndex.",
       "mnemonic":      "lea",
       "result":        "value",
@@ -1382,6 +1404,21 @@
               { "index": 1, "slotKind": "rm"              },
               { "index": 2, "slotKind": "membase.noscale" },
               { "index": 3, "slotKind": "memoffset.zero"  }
+            ]
+          },
+          {
+            "$comment": "TLS C2 (D-CSUBSET-THREAD-LOCAL): 2-op thread-pointer-offset form — `lea Xd, [tp + tpoff(sym)]` = the AArch64 local-exec ADD/ADD hi12/lo12 word-pair (gcc -ftls-model=local-exec parity): word0 = `ADD Xd, Xn(tp), #hi12, LSL #12` (0x91400000 = ADD-imm sh=1, imm12 field ZERO — reloc tls-tprel-hi12 patches (S+A)>>12 in, range-checked [0, 0xFFFFFF]), word1 = `ADD Xd, Xd, #lo12` (0x91000000 = ADD-imm sh=0, imm12 ZERO — reloc tls-tprel-lo12 patches (S+A)&0xFFF in, magnitude-free). S = the POSITIVE Variant-I tpoff the walker bit-cast into symbolVa (addTlsSymbolOffsets). SCRATCH-FREE via the SAME extraResultSlots threading the ADRP+ADD [symbol] variant above uses: word1 reads its own dest (Xd → word1.Rd AND word1.Rn). Operand 0 (the `tlsbase`-produced tp reg) → word0.Rn; operand 1 (the SymbolRef) emits BOTH relocations through the generic sym.patch marker — at word offsets 0 and 4 of the macro, both against the same symbol. Distinct guard [reg, symbol] — no other lea variant carries that shape. The x86 twin is the [reg, symbol] memreloc.disp32 lea in x86_64.target.json; the LIR the lowering emits is IDENTICAL (tlsbase reg + lea [reg, sym]) — only the declared encodings differ.",
+            "guard":      { "operandKinds": ["reg", "symbol"] },
+            "template":   { "fixedWords": [2436890624, 2432696320] },
+            "resultSlot": "rd",
+            "extraResultSlots": [
+              { "slotKind": "rd", "wordIndex": 1 },
+              { "slotKind": "rn", "wordIndex": 1 }
+            ],
+            "wires": [
+              { "index": 0, "slotKind": "rn",        "wordIndex": 0 },
+              { "index": 1, "slotKind": "sym.patch", "wordIndex": 0, "relocationKind": "tls-tprel-hi12" },
+              { "index": 1, "slotKind": "sym.patch", "wordIndex": 1, "relocationKind": "tls-tprel-lo12" }
             ]
           }
         ]
@@ -2141,6 +2178,9 @@
     { "name": "call26",            "kind": 1, "formula": "aarch64_call26"          },
     { "name": "adr_prel_pg_hi21",  "kind": 2, "formula": "aarch64_adr_prel_pg_hi21" },
     { "name": "add_abs_lo12_nc",   "kind": 3, "formula": "aarch64_add_abs_lo12"     },
-    { "name": "abs64",             "kind": 4, "formula": "linear", "pcRelative": false, "addendBias": 0, "widthBytes": 8 }
+    { "name": "abs64",             "kind": 4, "formula": "linear", "pcRelative": false, "addendBias": 0, "widthBytes": 8 },
+    { "$comment": "TLS C2 (D-CSUBSET-THREAD-LOCAL): the local-exec thread-pointer-offset pair — the imm12 fields of the `lea` [reg, symbol] ADD/ADD macro. S = the SIGNED tpoff the walker bit-casts into symbolVa (arm64 Variant I ⇒ POSITIVE: alignUp(tcbHeaderBytes 16, p_align) + templateOffset). hi12 = (S+A)>>12 via the NEW Aarch64TprelAddHi12 formula — the pair's RANGE GATE ([0, 0xFFFFFF]; a silent wrap would address the wrong per-thread slot, audit LOW-d). lo12 = (S+A)&0xFFF — the SAME Aarch64AddAbsLo12 formula as add_abs_lo12_nc but a DISTINCT tls-flagged KIND row: the walker's CRIT-1 cross-check keys (target ∈ tlsSymbols) XOR (kind.tls) both directions, so reusing kind 3 for a tpoff patch would either reject loud (tls symbol under a non-tls kind) or — with the flag moved — mis-admit VA patches as tpoffs. `tls: true` is what marks the patched value a tpoff, not a VA.",
+      "name": "tls-tprel-hi12",    "kind": 5, "formula": "aarch64_tprel_add_hi12", "tls": true },
+    { "name": "tls-tprel-lo12",    "kind": 6, "formula": "aarch64_add_abs_lo12",   "tls": true }
   ]
 }

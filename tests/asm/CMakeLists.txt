@@ -20,6 +20,10 @@ dss_add_test(NAME asm/test_asm_width_axis     SOURCES test_asm_width_axis.cpp)
 # TLS C1 (D-CSUBSET-THREAD-LOCAL): tlsbase / tls-lea byte pins + the
 # tls identity + tlsAccess schema pins + loader/validate fail-louds.
 dss_add_test(NAME asm/test_asm_x86_tls        SOURCES test_asm_x86_tls.cpp)
+# TLS C2 (D-CSUBSET-THREAD-LOCAL): the arm64 twin — MRS TPIDR_EL0 +
+# ADD/ADD hi12/lo12 word pins + the Variant-I identity / tprel-row /
+# tlsAccess / TLSLE-native-id schema pins.
+dss_add_test(NAME asm/test_asm_arm64_tls      SOURCES test_asm_arm64_tls.cpp)
 
 # Tests under tests/asm/ share `asm_test_support.hpp` via this
 # include path. test_asm_substrate additionally reuses the LIR
@@ -27,7 +31,8 @@ dss_add_test(NAME asm/test_asm_x86_tls        SOURCES test_asm_x86_tls.cpp)
 foreach(t test_asm_substrate test_asm_x86_variable test_asm_x86_binaryops
           test_asm_x86_sse test_asm_x86_relocs test_asm_arm64
           test_asm_arm64_binops test_lir_2addr_legalize test_asm_roundtrip
-          test_asm_pipeline test_asm_width_axis test_asm_x86_tls)
+          test_asm_pipeline test_asm_width_axis test_asm_x86_tls
+          test_asm_arm64_tls)
     target_include_directories(dss_asm_${t}
         PRIVATE ${CMAKE_SOURCE_DIR}/tests/asm)
 endforeach()

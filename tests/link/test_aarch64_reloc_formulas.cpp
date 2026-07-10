@@ -114,11 +114,13 @@ TEST(RelocFormulaKind, NameRoundTrip) {
     EXPECT_EQ(relocFormulaName(RelocFormulaKind::Aarch64Call26),        "aarch64_call26");
     EXPECT_EQ(relocFormulaName(RelocFormulaKind::Aarch64AdrPrelPgHi21), "aarch64_adr_prel_pg_hi21");
     EXPECT_EQ(relocFormulaName(RelocFormulaKind::Aarch64AddAbsLo12),    "aarch64_add_abs_lo12");
+    EXPECT_EQ(relocFormulaName(RelocFormulaKind::Aarch64TprelAddHi12),  "aarch64_tprel_add_hi12");
 
     EXPECT_EQ(parseRelocFormulaKind("linear"),                   RelocFormulaKind::Linear);
     EXPECT_EQ(parseRelocFormulaKind("aarch64_call26"),           RelocFormulaKind::Aarch64Call26);
     EXPECT_EQ(parseRelocFormulaKind("aarch64_adr_prel_pg_hi21"), RelocFormulaKind::Aarch64AdrPrelPgHi21);
     EXPECT_EQ(parseRelocFormulaKind("aarch64_add_abs_lo12"),     RelocFormulaKind::Aarch64AddAbsLo12);
+    EXPECT_EQ(parseRelocFormulaKind("aarch64_tprel_add_hi12"),   RelocFormulaKind::Aarch64TprelAddHi12);
     EXPECT_EQ(parseRelocFormulaKind("nonsense"),                 std::nullopt);
     EXPECT_EQ(parseRelocFormulaKind(""),                         std::nullopt);
 }
@@ -446,6 +448,127 @@ TEST(Aarch64AddAbsLo12, RejectsNegativeSplusA) {
     EXPECT_FALSE(p.ok);
 }
 
+// ── Aarch64TprelAddHi12 (TLS C2, D-CSUBSET-THREAD-LOCAL) ─────────────
+//
+// value = (S+A) >> 12 into ADD imm12 [21:10], where S is the SIGNED
+// Variant-I tpoff bit-cast into symbolVa (POSITIVE for a well-formed
+// arm64 tpoff). RANGE-GATED [0, 0xFFFFFF] — the hi12/lo12 pair's
+// unsigned-12-bit reach (audit LOW-d: a silent wrap would address the
+// WRONG per-thread slot). The base word is `ADD Xd, Xn, #0, LSL #12`
+// (0x91400000) — the sh=1 bit lives in the base pattern, imm12 zero.
+// The paired lo12 word reuses Aarch64AddAbsLo12; the lo12 pins for
+// POSITIVE-tpoff values sit alongside below (the negative reject
+// above is inert for Variant-I tpoffs — the formula-level guarantee).
+
+TEST(Aarch64TprelAddHi12, SmallTpoffPatchesHi12Zero) {
+    auto tgt = loadOneRelocTarget("aarch64_tprel_add_hi12");
+    ASSERT_NE(tgt, nullptr);
+    // tpoff 16 (the arm64 `thread_local int g` first-slot value:
+    // alignUp(tcbHeaderBytes 16, p_align 4) + 0) → hi12 = 16>>12 = 0:
+    // the patched word is the base word unchanged. Hand-derived.
+    auto p = applyOneReloc(tgt, 0x91400000u,
+                            /*symbolVa*/ 16,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    ASSERT_TRUE(p.ok);
+    EXPECT_EQ(readInst(p.text, 0), 0x91400000u);
+}
+
+TEST(Aarch64TprelAddHi12, TpoffCrossing4KPatchesHi12One) {
+    auto tgt = loadOneRelocTarget("aarch64_tprel_add_hi12");
+    ASSERT_NE(tgt, nullptr);
+    // tpoff 0x1010 → hi12 = 1 (imm12 field bits [21:10]); the paired
+    // lo12 word would carry 0x10. Hand-derived.
+    auto p = applyOneReloc(tgt, 0x91400000u,
+                            /*symbolVa*/ 0x1010,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    ASSERT_TRUE(p.ok);
+    EXPECT_EQ(readInst(p.text, 0), 0x91400000u | (1u << 10));
+}
+
+TEST(Aarch64TprelAddHi12, MaxTpoffAtCapPatchesHi12AllOnes) {
+    auto tgt = loadOneRelocTarget("aarch64_tprel_add_hi12");
+    ASSERT_NE(tgt, nullptr);
+    // tpoff 0xFFFFFF (the cap) → hi12 = 0xFFF — the last address the
+    // pair can reach.
+    auto p = applyOneReloc(tgt, 0x91400000u,
+                            /*symbolVa*/ 0xFFFFFF,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    ASSERT_TRUE(p.ok);
+    EXPECT_EQ(readInst(p.text, 0), 0x91400000u | (0xFFFu << 10));
+}
+
+TEST(Aarch64TprelAddHi12, RejectsTpoffAbove16MiB) {
+    auto tgt = loadOneRelocTarget("aarch64_tprel_add_hi12");
+    ASSERT_NE(tgt, nullptr);
+    // 0x1000000 (16 MiB) exceeds the unsigned-12-bit shifted reach —
+    // MUST fail loud (red pin for the range gate: removing the cap
+    // would silently wrap hi12 to 0 and address the wrong slot).
+    auto p = applyOneReloc(tgt, 0x91400000u,
+                            /*symbolVa*/ 0x1000000,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    EXPECT_FALSE(p.ok);
+}
+
+TEST(Aarch64TprelAddHi12, RejectsNegativeSplusA) {
+    auto tgt = loadOneRelocTarget("aarch64_tprel_add_hi12");
+    ASSERT_NE(tgt, nullptr);
+    // A NEGATIVE tpoff reaching the Variant-I formula = a Variant-II
+    // value mis-fed (or a raw VA past the CRIT-1 cross-check) — fail
+    // loud, never `(uint32)negative >> 12` garbage.
+    auto p = applyOneReloc(tgt, 0x91400000u,
+                            /*symbolVa*/ static_cast<std::uint64_t>(-8),
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    EXPECT_FALSE(p.ok);
+}
+
+TEST(Aarch64TprelAddHi12, RejectsBaseInstWithDirtyImm12) {
+    auto tgt = loadOneRelocTarget("aarch64_tprel_add_hi12");
+    ASSERT_NE(tgt, nullptr);
+    // Base word with a pre-set imm12 bit — the linker ORs, so a dirty
+    // field would silently corrupt the patch. Reject.
+    auto p = applyOneReloc(tgt, 0x91400000u | (1u << 10),
+                            /*symbolVa*/ 16,
+                            /*addend*/   0,
+                            /*patchSectionVa*/ 0,
+                            /*funcOffset*/ 0);
+    EXPECT_FALSE(p.ok);
+}
+
+// The PAIRED lo12 arm under Variant-I tpoff values (TLS C2 reads the
+// audit note "the AddAbsLo12 S+A<0 guard is inert for positive
+// tpoffs" — these pin the POSITIVE-domain behavior the TLS pair
+// actually exercises; RejectsNegativeSplusA above pins the guard).
+TEST(Aarch64AddAbsLo12, PositiveTpoffPatchesLow12Exactly) {
+    auto tgt = loadOneRelocTarget("aarch64_add_abs_lo12");
+    ASSERT_NE(tgt, nullptr);
+    // tpoff 16 → lo12 = 16.
+    auto p16 = applyOneReloc(tgt, 0x91000000u,
+                             /*symbolVa*/ 16,
+                             /*addend*/   0,
+                             /*patchSectionVa*/ 0,
+                             /*funcOffset*/ 0);
+    ASSERT_TRUE(p16.ok);
+    EXPECT_EQ(readInst(p16.text, 0), 0x91000000u | (16u << 10));
+    // tpoff 0x1010 → lo12 = 0x10 (the hi12 twin carries the 1).
+    auto p10 = applyOneReloc(tgt, 0x91000000u,
+                             /*symbolVa*/ 0x1010,
+                             /*addend*/   0,
+                             /*patchSectionVa*/ 0,
+                             /*funcOffset*/ 0);
+    ASSERT_TRUE(p10.ok);
+    EXPECT_EQ(readInst(p10.text, 0), 0x91000000u | (0x10u << 10));
+}
+
 // silent-failure H1 post-fold #1: parseRelocFormulaKind case-insensitive.
 TEST(RelocFormulaKind, ParseAcceptsAllCapsAndMixedCase) {
     EXPECT_EQ(parseRelocFormulaKind("LINEAR"),                   RelocFormulaKind::Linear);
@@ -473,6 +596,7 @@ TEST(RelocFormulaKind, AcceptedListContainsAllVariants) {
     EXPECT_NE(list.find("'aarch64_call26'"),           std::string::npos);
     EXPECT_NE(list.find("'aarch64_adr_prel_pg_hi21'"), std::string::npos);
     EXPECT_NE(list.find("'aarch64_add_abs_lo12'"),     std::string::npos);
+    EXPECT_NE(list.find("'aarch64_tprel_add_hi12'"),   std::string::npos);
 }
 
 // ── Post-fold #2 (second 7-agent audit) ──────────────────────
@@ -483,7 +607,8 @@ TEST(RelocFormulaKind, AcceptedListContainsAllVariants) {
 TEST(RelocFormulaKind, AcceptedListIsCommaSpaceQuotedExactly) {
     EXPECT_EQ(acceptedRelocFormulaList(),
               "'linear', 'aarch64_call26', "
-              "'aarch64_adr_prel_pg_hi21', 'aarch64_add_abs_lo12'");
+              "'aarch64_adr_prel_pg_hi21', 'aarch64_add_abs_lo12', "
+              "'aarch64_tprel_add_hi12'");
 }
 
 // pr-test-analyzer Rating 7: whitespace tolerance pinned as reject
@@ -609,7 +734,7 @@ TEST(ByteEmit, WriteU32LEAtPlacesLittleEndianBytes) {
 
 // ── Shipped arm64.target.json loads cleanly ──────────────────
 
-TEST(ShippedArm64Target, LoadsAllFourRelocKinds) {
+TEST(ShippedArm64Target, LoadsAllSixRelocKinds) {
     auto r = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(r.has_value());
     auto const& tgt = **r;
@@ -626,9 +751,27 @@ TEST(ShippedArm64Target, LoadsAllFourRelocKinds) {
     auto const* add = tgt.relocationByName("add_abs_lo12_nc");
     ASSERT_NE(add, nullptr);
     EXPECT_EQ(add->formulaKind, RelocFormulaKind::Aarch64AddAbsLo12);
+    EXPECT_FALSE(add->tls);
 
     auto const* abs64 = tgt.relocationByName("abs64");
     ASSERT_NE(abs64, nullptr);
     EXPECT_EQ(abs64->formulaKind, RelocFormulaKind::Linear);
     EXPECT_EQ(abs64->widthBytes, 8);
+
+    // TLS C2 (D-CSUBSET-THREAD-LOCAL): the tprel pair — hi12 on the
+    // NEW formula, lo12 on the REUSED AddAbsLo12 formula but a
+    // DISTINCT tls-flagged kind (the CRIT-1 cross-check keys the
+    // flag, so the tpoff patch must never share the plain lo12 kind).
+    auto const* hi = tgt.relocationByName("tls-tprel-hi12");
+    ASSERT_NE(hi, nullptr);
+    EXPECT_EQ(hi->formulaKind, RelocFormulaKind::Aarch64TprelAddHi12);
+    EXPECT_EQ(hi->widthBytes, 4);
+    EXPECT_TRUE(hi->tls);
+
+    auto const* lo = tgt.relocationByName("tls-tprel-lo12");
+    ASSERT_NE(lo, nullptr);
+    EXPECT_EQ(lo->formulaKind, RelocFormulaKind::Aarch64AddAbsLo12);
+    EXPECT_EQ(lo->widthBytes, 4);
+    EXPECT_TRUE(lo->tls);
+    EXPECT_NE(lo->kind, add->kind);
 }

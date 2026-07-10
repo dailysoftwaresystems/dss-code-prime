@@ -307,21 +307,26 @@ TEST(X86Tls, ShippedX64DeclaresTlsIdentityVariant2AndTpoffRelocRow) {
     EXPECT_FALSE(rel32->tls);
 }
 
-TEST(X86Tls, ShippedArm64DeclaresNoTlsRowsUntilC2) {
-    // arm64's TLS leg is the C2 cycle: NO tls identity, NO tlsbase
-    // opcode, NO tpoff reloc row — the MIR→LIR gate fails loud
-    // (L_RequiredLirOpcodeMissing) on a thread-local access there.
+TEST(X86Tls, ShippedArm64DeclaresTlsRowsSinceC2) {
+    // TLS C2 LANDED (this pin's C1-era predecessor asserted absence):
+    // arm64 now declares its Variant-I identity + the tlsbase MRS
+    // opcode + the tprel reloc pair. The x86-NAMED tls-tpoff32 kind
+    // stays arm64-absent — each target names its own tpoff kinds
+    // (the detailed arm64 pins live in test_asm_arm64_tls.cpp).
     auto schema = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(schema.has_value());
-    EXPECT_FALSE((*schema)->tlsIdentity().has_value());
-    EXPECT_FALSE((*schema)->opcodeByMnemonic("tlsbase").has_value());
+    EXPECT_TRUE((*schema)->tlsIdentity().has_value());
+    EXPECT_TRUE((*schema)->opcodeByMnemonic("tlsbase").has_value());
+    EXPECT_NE((*schema)->relocationByName("tls-tprel-hi12"), nullptr);
+    EXPECT_NE((*schema)->relocationByName("tls-tprel-lo12"), nullptr);
     EXPECT_EQ((*schema)->relocationByName("tls-tpoff32"), nullptr);
 }
 
 TEST(X86Tls, ShippedFormatsTlsAccessPresenceMatchesLandedLegs) {
-    // ELF-Linux x86_64 exec: local-exec {fs=0x64, disp 0}. pe64 +
-    // arm64-ELF: ABSENT — absence IS the K_FormatLacksThreadLocalSupport
-    // gate for the un-landed legs.
+    // ELF-Linux x86_64 exec (C1): local-exec {fs=0x64, disp 0}.
+    // arm64-ELF (C2): local-exec {0, 0} — the MRS shape consumes
+    // neither x86 template value. pe64: ABSENT — absence IS the
+    // K_FormatLacksThreadLocalSupport gate for the un-landed legs.
     auto elf = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
     ASSERT_TRUE(elf.has_value());
     auto const ta = (*elf)->tlsAccess();
@@ -337,8 +342,12 @@ TEST(X86Tls, ShippedFormatsTlsAccessPresenceMatchesLandedLegs) {
 
     auto arm = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
     ASSERT_TRUE(arm.has_value());
-    EXPECT_FALSE((*arm)->tlsAccess().has_value())
-        << "arm64-ELF must NOT declare tlsAccess until TLS C2";
+    auto const taArm = (*arm)->tlsAccess();
+    ASSERT_TRUE(taArm.has_value())
+        << "arm64-ELF declares tlsAccess since TLS C2";
+    EXPECT_EQ(taArm->model, TlsAccessModel::LocalExec);
+    EXPECT_EQ(taArm->segmentPrefixByte, 0u);
+    EXPECT_EQ(taArm->baseDisplacement, 0u);
 }
 
 // ── loader / validate() fail-louds ───────────────────────────────────

@@ -4438,41 +4438,77 @@ TEST(MirToLirTls, X64ThreadLocalUnderShippedPe64FormatFailsLoud0x8015) {
     EXPECT_TRUE(sawAnchor(rep, "D-CSUBSET-THREAD-LOCAL"));
 }
 
-TEST(MirToLirTls, Arm64ThreadLocalUnderShippedFormatFailsLoud0x8015First) {
-    // PRODUCTION arm64 order pin: the shipped elf64-aarch64-linux-exec
-    // declares no tlsAccess, so the FORMAT gate (0x8015) fires FIRST —
-    // before the target's missing-tlsbase-opcode gate is ever
-    // consulted. Deterministic: the format check precedes the opcode
-    // probes in lowerThreadLocalGlobalAddr.
+TEST(MirToLirTls, Arm64ThreadLocalLowersToBareTlsBasePlusSymbolLea) {
+    // TLS C2 (D-CSUBSET-THREAD-LOCAL): the arm64 SHAPE pin — the
+    // OTHER arm of the capability probe. The shipped arm64 target's
+    // `tlsbase` row declares the 0-operand MRS shape, so the lowering
+    // must emit a BARE `tlsbase %tp` (NO MemOffset operand, NO
+    // payload — the format's segmentPrefixByte/baseDisplacement are
+    // x86 template values the MRS never consumes) followed by the
+    // 2-op [Reg, SymbolRef] lea — the SAME LIR shape as x86 after the
+    // tp read. (This test replaced the C1-era 0x8015-first pin: the
+    // shipped aarch64 format now DECLARES tlsAccess.)
     auto fmt = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
     ASSERT_TRUE(fmt.has_value());
-    ASSERT_FALSE((*fmt)->tlsAccess().has_value())
-        << "precondition: arm64-ELF must not declare tlsAccess until C2";
+    ASSERT_TRUE((*fmt)->tlsAccess().has_value())
+        << "precondition: arm64-ELF declares tlsAccess since C2";
     auto m = buildTlsPlusControlModule();
     auto target = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
     auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
                            std::nullopt, std::nullopt, (*fmt)->tlsAccess());
-    EXPECT_FALSE(lirR.ok);
-    EXPECT_TRUE(sawDiagnosticCode(
-        rep, DiagnosticCode::K_FormatLacksThreadLocalSupport));
-    EXPECT_FALSE(sawDiagnosticCode(
-        rep, DiagnosticCode::L_RequiredLirOpcodeMissing))
-        << "the format gate must fire BEFORE (instead of) the opcode "
-           "gate on the production arm64 leg";
+    ASSERT_TRUE(lirR.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = lirR.lir;
+
+    auto const tlsbaseOp = (*target)->opcodeByMnemonic("tlsbase");
+    auto const leaOp     = (*target)->opcodeByMnemonic("lea");
+    ASSERT_TRUE(tlsbaseOp.has_value() && leaOp.has_value());
+
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    std::optional<LirReg> tpReg;
+    bool sawTlsLea = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        LirInstId const inst = lir.blockInstAt(bb, i);
+        auto const op = lir.instOpcode(inst);
+        if (op == *tlsbaseOp) {
+            EXPECT_FALSE(tpReg.has_value())
+                << "exactly one tlsbase for the single TLS access";
+            // The BARE shape: zero operands, zero payload.
+            EXPECT_EQ(lir.instPayload(inst), 0u);
+            EXPECT_EQ(lir.instOperands(inst).size(), 0u);
+            tpReg = lir.instResult(inst);
+        }
+        if (op == *leaOp) {
+            auto const ops = lir.instOperands(inst);
+            if (ops.size() == 2 && ops[0].kind == LirOperandKind::Reg
+                && ops[1].kind == LirOperandKind::SymbolRef
+                && ops[1].symbolV == 500u) {
+                sawTlsLea = true;
+                ASSERT_TRUE(tpReg.has_value())
+                    << "the tpoff lea must FOLLOW its tlsbase";
+                EXPECT_EQ(ops[0].reg, *tpReg)
+                    << "the lea's base must be the tlsbase-produced tp";
+            }
+        }
+    }
+    EXPECT_TRUE(tpReg.has_value()) << "the tlsbase op must be emitted";
+    EXPECT_TRUE(sawTlsLea)
+        << "the 2-op [Reg, SymbolRef(500)] tpoff lea must be emitted";
 }
 
-TEST(MirToLirTls, Arm64LocalExecConfigFailsLoudMissingTlsBaseOpcode) {
-    // The OPCODE gate: hand a local-exec config to the arm64 target
-    // (which declares NO tlsbase row until TLS C2) — the lowering must
-    // fail EXACTLY L_RequiredLirOpcodeMissing naming tlsbase, the
-    // generic un-landed-target-leg gate.
+TEST(MirToLirTls, Arm64WithoutTlsBaseOpcodeFailsLoudMissingOpcode) {
+    // The OPCODE gate (rewritten at C2 — the shipped arm64 now HAS
+    // tlsbase, so the un-landed-leg posture is synthesized by
+    // stripping the row in memory; the mutate_target_schema.hpp
+    // discipline): local-exec + no tlsbase row must fail EXACTLY
+    // L_RequiredLirOpcodeMissing naming tlsbase — the generic
+    // un-landed-target-leg gate every future target hits first.
     auto m = buildTlsPlusControlModule();
-    auto target = TargetSchema::loadShipped("arm64");
+    auto target = ::dss::test_support::mutateShippedTargetSchemaJson(
+        "arm64", {"tlsbase"});
     ASSERT_TRUE(target.has_value());
-    ASSERT_FALSE((*target)->opcodeByMnemonic("tlsbase").has_value())
-        << "precondition: arm64 must not declare tlsbase until C2";
+    ASSERT_FALSE((*target)->opcodeByMnemonic("tlsbase").has_value());
     DiagnosticReporter rep;
     auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
                            std::nullopt, std::nullopt, elfLocalExecTls());
@@ -4485,8 +4521,84 @@ TEST(MirToLirTls, Arm64LocalExecConfigFailsLoudMissingTlsBaseOpcode) {
         }
     }
     EXPECT_TRUE(sawTlsBaseMissing)
-        << "arm64 + local-exec must fail loud on the missing 'tlsbase' "
-           "opcode row (L_RequiredLirOpcodeMissing)";
+        << "local-exec without a 'tlsbase' opcode row must fail loud "
+           "(L_RequiredLirOpcodeMissing)";
+}
+
+TEST(MirToLirTls, DoublyUnlandedLegFormatGateFiresBeforeOpcodeGate) {
+    // ★ The diagnostic-ORDERING pin (restored at TLS C2 over the
+    // stripped-target substrate — its C1 predecessor rode the shipped
+    // arm64's then-real absences, which C2 ended): when BOTH gates'
+    // conditions hold — no tlsAccess block (the FORMAT lacks TLS
+    // machinery) AND no tlsbase opcode row (the TARGET lacks it) —
+    // the FORMAT gate (K_FormatLacksThreadLocalSupport, 0x8015) must
+    // fire and the TARGET gate (L_RequiredLirOpcodeMissing) must NOT.
+    // 0x8015 blames the format; L_RequiredLirOpcodeMissing blames the
+    // target — a future doubly-unlanded leg must get the format-first
+    // diagnostic (the check order in lowerThreadLocalGlobalAddr).
+    // RED-ON-SWAP: exchanging the two checks keeps every other test
+    // green while this one flips.
+    auto m = buildTlsPlusControlModule();
+    auto target = ::dss::test_support::mutateShippedTargetSchemaJson(
+        "arm64", {"tlsbase"});
+    ASSERT_TRUE(target.has_value());
+    ASSERT_FALSE((*target)->opcodeByMnemonic("tlsbase").has_value());
+    DiagnosticReporter rep;
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+                           std::nullopt, std::nullopt,
+                           /*tlsAccess=*/std::nullopt);
+    EXPECT_FALSE(lirR.ok);
+    EXPECT_TRUE(sawDiagnosticCode(
+        rep, DiagnosticCode::K_FormatLacksThreadLocalSupport))
+        << "the format gate (0x8015) must fire on the doubly-unlanded leg";
+    EXPECT_FALSE(sawDiagnosticCode(
+        rep, DiagnosticCode::L_RequiredLirOpcodeMissing))
+        << "the format gate must fire BEFORE (instead of) the opcode "
+           "gate — a doubly-unlanded leg must be blamed on the FORMAT, "
+           "not the target";
+}
+
+TEST(MirToLirTls, TlsBaseRowWithUnrecognizedShapeFailsLoud) {
+    // TLS C2: the capability probe's OWN fail-loud (red pin for the
+    // shape probe — disabling the probe would emit a mis-shaped inst
+    // the encoder rejects with a less actionable message, or worse,
+    // an x86-shaped inst against a row that means something else).
+    // A tlsbase row declaring NEITHER the [] nor the ["memoffset"]
+    // shape must be rejected AT THE LOWERING with the opcode-gate
+    // code naming the recognized shapes.
+    auto m = buildTlsPlusControlModule();
+    auto target = ::dss::test_support::mutateShippedTargetSchemaDoc(
+        "arm64", [](nlohmann::json& doc) {
+            for (auto& op : doc.at("opcodes")) {
+                if (op.value("mnemonic", "") != "tlsbase") continue;
+                // Re-shape the row: 1 reg operand wired to rn — a
+                // VALID schema (loads clean) that is NOT a
+                // recognized thread-pointer-read shape.
+                op["minOperands"] = 1;
+                op["maxOperands"] = 1;
+                auto& v = op.at("encoding").at("variants").at(0);
+                v.at("guard")["operandKinds"] = {"reg"};
+                v["wires"] = nlohmann::json::array(
+                    {{{"index", 0}, {"slotKind", "rn"}}});
+            }
+        });
+    ASSERT_TRUE(target.has_value());
+    ASSERT_TRUE((*target)->opcodeByMnemonic("tlsbase").has_value());
+    DiagnosticReporter rep;
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+                           std::nullopt, std::nullopt, elfLocalExecTls());
+    EXPECT_FALSE(lirR.ok);
+    bool sawShapeReject = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_RequiredLirOpcodeMissing
+            && d.actual.find("recognized thread-pointer-read shape")
+                   != std::string::npos) {
+            sawShapeReject = true;
+        }
+    }
+    EXPECT_TRUE(sawShapeReject)
+        << "a tlsbase row with neither the [] nor the [\"memoffset\"] "
+           "variant shape must fail loud at the lowering probe";
 }
 
 TEST(MirToLirTls, PeIndexedModelDeclaredButUnlandedFailsLoud) {

@@ -1804,6 +1804,23 @@ enum class RelocFormulaKind : std::uint8_t {
     //   compute pages within the 32-bit space without an additional
     //   high-bit reloc); OR (value << 10) into ADD imm12 [21:10].
     Aarch64AddAbsLo12     = 3,
+    // ARM64 R_AARCH64_TLSLE_ADD_TPREL_HI12 (TLS C2,
+    // D-CSUBSET-THREAD-LOCAL): the local-exec thread-pointer-offset
+    // HIGH half —
+    //   value = (S + A) >> 12
+    //   where S is the SIGNED tpoff the walker bit-cast into
+    //   symbolVa[sym] (arm64 Variant I ⇒ POSITIVE). OR (value << 10)
+    //   into ADD imm12 [21:10] (the `ADD Xd, Xn, #hi12, LSL #12`
+    //   word; its sh bit lives in the assembler-emitted base
+    //   pattern, not here). RANGE-CHECKED, unlike the magnitude-free
+    //   lo12 arm: the hi12 field is an UNSIGNED 12-bit value, so the
+    //   addressable tpoff span is [0, 0xFFFFFF] (16 MiB − 1). A
+    //   negative S+A (a Variant-II tpoff mis-fed to this formula) or
+    //   one above the cap FAILS LOUD — a silent `& 0xFFF` wrap would
+    //   address the WRONG per-thread slot (audit LOW-d). The paired
+    //   lo12 word reuses Aarch64AddAbsLo12 verbatim (same formula,
+    //   distinct tls-flagged KIND row on the target).
+    Aarch64TprelAddHi12   = 4,
 };
 
 // Single source of truth — `relocFormulaName` + `parseRelocFormulaKind`
@@ -1812,11 +1829,12 @@ enum class RelocFormulaKind : std::uint8_t {
 // on size catches forgetting one half. (architect + type-design
 // 4-agent convergence at post-fold #2 — was previously 3 independent
 // hand-rolled enumerations, DRY hazard waiting for the 5th variant.)
-inline constexpr EnumNameTable<RelocFormulaKind, 4> kRelocFormulaTable{{{
+inline constexpr EnumNameTable<RelocFormulaKind, 5> kRelocFormulaTable{{{
     { RelocFormulaKind::Linear,               "linear" },
     { RelocFormulaKind::Aarch64Call26,        "aarch64_call26" },
     { RelocFormulaKind::Aarch64AdrPrelPgHi21, "aarch64_adr_prel_pg_hi21" },
     { RelocFormulaKind::Aarch64AddAbsLo12,    "aarch64_add_abs_lo12" },
+    { RelocFormulaKind::Aarch64TprelAddHi12,  "aarch64_tprel_add_hi12" },
 }}};
 
 [[nodiscard]] DSS_EXPORT std::string_view
