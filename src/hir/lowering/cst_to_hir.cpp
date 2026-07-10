@@ -2085,6 +2085,39 @@ struct Lowerer {
                 // from the symbol's type (enum underlying / the constant's own
                 // scalar).
                 if (auto const* erec = model.recordFor(sym)) {
+                    // FC17.5 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER, C99
+                    // 6.4.2.2): a read of a predefined function-name symbol
+                    // (`__func__` / a configured alias) FOLDS to a string-
+                    // literal-shaped constant — BYTE-IDENTICAL to
+                    // lowerStringLiteral's narrow arm (core = the record's
+                    // Array element core, value = the function-name bytes
+                    // WITHOUT the trailing NUL, type = the record's
+                    // Array<core, len+1>) — so every existing string-literal
+                    // consumer (rodata materialization, array→pointer decay,
+                    // `__func__[i]` lvalue indexing, sizeof via the semantic
+                    // stamp, &__func__ via the Literal-lvalue arm) rides
+                    // unchanged. The record's type is minted at the Pass-1
+                    // bind; a malformed one (not a sized element-typed Array)
+                    // can only mean a corrupted mint — fail loud, never a
+                    // guessed literal.
+                    if (erec->isPredefinedFunctionName) {
+                        TypeId const litTy = erec->type;
+                        if (!litTy.valid()
+                            || interner.kind(litTy) != TypeKind::Array
+                            || interner.operands(litTy).empty()) {
+                            unsupported(node,
+                                "predefined function-name identifier carries "
+                                "a malformed type (expected Array<core, N+1>)");
+                            return E{errorNode(node), InvalidType};
+                        }
+                        HirLiteralValue v;
+                        v.core  = interner.kind(interner.operands(litTy)[0]);
+                        v.value = erec->predefinedFunctionNameText;
+                        return E{track(builder.makeLiteral(
+                                          litTy, literals.add(std::move(v))),
+                                       node),
+                                 litTy};
+                    }
                     if (auto lv = constantLiteralForSymbol(*erec, interner)) {
                         return E{track(builder.makeLiteral(
                                           type, literals.add(std::move(*lv))), node),
@@ -4786,8 +4819,41 @@ struct Lowerer {
             return std::nullopt;
         for (NodeId c : visible(core)) {
             if (isToken(c) && sem.identifierToken.valid()
-                && tree().tokenKind(c).v == sem.identifierToken.v)
-                return std::pair{model.symbolAt(c), typeAtOr(core, InvalidType)};
+                && tree().tokenKind(c).v == sem.identifierToken.v) {
+                // FC17.5 F1 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER, C99
+                // 6.4.2.2): a predefined function-name identifier
+                // (`__func__`) is NOT a modifiable lvalue — its reads FOLD to
+                // a string-literal constant (there is no storage slot), so a
+                // ++/--/compound-assign classifier building a simple-lvalue
+                // write-back here would dead-end at MIR with an engine-level
+                // "no storage slot" failure. This is the ONE chokepoint both
+                // lvalue classifiers (classifyIncDecLvalue, classifyLvalue)
+                // share — emit the REAL diagnostic and return {sym,
+                // InvalidType}: both callers treat an invalid type as "not a
+                // simple lvalue" and bail (classifyIncDecLvalue diagnostic-
+                // free; classifyLvalue's assign-arm callers may add a generic
+                // exprError after this one — both loud, 0xE040 first). Plain
+                // reads never pass through here (lowerExpr
+                // folds them) and `&__func__` rides the operator-table
+                // AddressOf path — both stay legal. Simple `=` / `+=` are
+                // already stopped at SEMANTIC by the symbol's isConst
+                // (S_ConstViolation), so this guard is the inc/dec class's
+                // fail-loud gate. `__func__[0] = 'x'` is the pre-existing
+                // rodata-write class (D-CSUBSET-INCDEC-CONST-LVALUE family).
+                SymbolId const sym = model.symbolAt(c);
+                if (auto const* rec = model.recordFor(sym);
+                    rec != nullptr && rec->isPredefinedFunctionName) {
+                    emitH(DiagnosticCode::S_PredefinedIdentifierNotAddressable,
+                          c,
+                          std::format(
+                              "'{}' is a predefined identifier (C99 6.4.2.2) "
+                              "— it is const, has no modifiable storage, and "
+                              "cannot be the target of ++/--/assignment",
+                              rec->name));
+                    return std::pair{sym, InvalidType};
+                }
+                return std::pair{sym, typeAtOr(core, InvalidType)};
+            }
         }
         return std::nullopt;
     }
@@ -5726,6 +5792,118 @@ struct Lowerer {
                                               HirFlags::Synthetic);
     }
 
+    // FC17.5 (D-CSUBSET-EMPTY-INITIALIZER, C23 6.7.10): the CLOSED allowlist
+    // (design-audit F4) of scalar TypeKinds a brace initializer may target.
+    // Exactly the kinds `synthZeroOrError`'s scalar/Enum arms mint a typed
+    // zero for: Bool, the integer cores I8..U128, the float cores F16..F128,
+    // Char/Byte, Enum (zero-as-underlying, enum-typed), and Ptr (the null
+    // pointer — incl. Ptr<FnSig>, runtime-proven by the aggregate zero-fill).
+    // DELIBERATELY excluded: Void/FnSig/NullptrT (an Extension kind)/Vector/
+    // Matrix/… — `(void){}` admitted here would mint a Void-typed literal and
+    // corrupt the type system; those context types keep the aggregate gate's
+    // fail-loud reject. A VolatileQual skin never reaches this switch —
+    // `interner.kind()` sees through it to the material kind.
+    [[nodiscard]] static bool isScalarBraceInitKind(TypeKind k) {
+        switch (k) {
+            case TypeKind::Bool:
+            case TypeKind::I8:  case TypeKind::I16: case TypeKind::I32:
+            case TypeKind::I64: case TypeKind::I128:
+            case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
+            case TypeKind::U64: case TypeKind::U128:
+            case TypeKind::F16: case TypeKind::F32: case TypeKind::F64:
+            case TypeKind::F128:
+            case TypeKind::Char:
+            case TypeKind::Byte:
+            case TypeKind::Enum:
+            case TypeKind::Ptr:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // FC17.5 (D-CSUBSET-EMPTY-INITIALIZER, C23 6.7.10): brace initializer for
+    // a SCALAR context type, reached from the SAME single `lowerBraceInit`
+    // funnel every brace-init route uses (decl init / return / assign-RHS /
+    // call-arg / compound literal / nested designated slot):
+    //   • `{}` (zero initElements)   → `synthZeroOrError(contextType)` — the
+    //     C23 6.7.10p11 empty initializer zero-initializes; the shared helper
+    //     already covers every allowlisted core + Enum + Ptr;
+    //   • `{ expr }` (exactly one, undesignated, NON-brace) → the expression
+    //     lowers + coerces through `lowerExprOrBraceInit` — byte-identical to
+    //     the plain `= expr` init path (6.7.10p12: the object's value is that
+    //     of the expression);
+    //   • anything else — >1 elements, a designator (`{.x=1}` / `{[0]=1}` on
+    //     a scalar), or a NESTED brace list `{{42}}` (audit N2: 6.7.10p12
+    //     requires a SINGLE expression; a brace list is not one) —
+    //     → S_InvalidScalarInitializer (0xE03F), never a silent guess.
+    [[nodiscard]] HirNodeId lowerScalarBraceInit(NodeId braceInitListNode,
+                                                 TypeId contextType) {
+        // Collect the initElement children — the SAME rule filter the
+        // aggregate loop below uses (tokens `{`/`}`/`,` skip; a grammar
+        // without initElement configured has no brace-init surface at all).
+        std::vector<NodeId> elems;
+        for (NodeId elem : visible(braceInitListNode)) {
+            if (isToken(elem)) continue;
+            if (tree().kind(elem) != NodeKind::Internal) continue;
+            if (!cfg.initElementRule.valid()
+             || tree().rule(elem).v != cfg.initElementRule.v) continue;
+            elems.push_back(elem);
+        }
+        if (elems.empty()) {
+            return synthZeroOrError(braceInitListNode, contextType);
+        }
+        if (elems.size() > 1) {
+            emitH(DiagnosticCode::S_InvalidScalarInitializer,
+                  braceInitListNode,
+                  "a scalar brace initializer takes at most ONE expression "
+                  "(C23 6.7.10p12) — excess elements");
+            return errorNode(braceInitListNode, contextType);
+        }
+        // Exactly one initElement: it must be a bare (undesignated) value.
+        // Mirror the aggregate loop's designator discrimination so `{.x=1}` /
+        // `{[0]=1}` on a scalar is the constraint violation C makes it.
+        NodeId valueExprCst{};
+        for (NodeId c : visible(elems[0])) {
+            if (isToken(c)) continue;
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            auto const [designatorCore, r] = peelToDesignatorLeaf(c);
+            (void)designatorCore;
+            bool const isDesignator =
+                (cfg.designatedFieldRule.valid()
+                 && r == cfg.designatedFieldRule.v)
+                || (cfg.designatedIndexRule.valid()
+                    && r == cfg.designatedIndexRule.v);
+            if (isDesignator) {
+                emitH(DiagnosticCode::S_InvalidScalarInitializer, c,
+                      "a designator is not valid in a SCALAR brace "
+                      "initializer (C23 6.7.10p12)");
+                return errorNode(braceInitListNode, contextType);
+            }
+            valueExprCst = c;   // the value expression (last non-designator)
+        }
+        if (!valueExprCst.valid()) {
+            // An initElement with no expression child is a malformed parse —
+            // fail loud rather than silently zero-fill (`{,}` cannot parse,
+            // so this is recovery-tree territory).
+            return reportedError(braceInitListNode,
+                "scalar brace initializer element carries no expression");
+        }
+        // Audit N2: `{{42}}` — the single element is itself a brace list.
+        // C23 6.7.10p12 requires a SINGLE EXPRESSION; a nested brace list is
+        // a constraint violation for a scalar target (only aggregates recurse).
+        if (isBraceInitList(peelToBraceInitOrCore(valueExprCst))) {
+            emitH(DiagnosticCode::S_InvalidScalarInitializer, valueExprCst,
+                  "a scalar brace initializer must contain a single "
+                  "EXPRESSION, not a nested brace list (C23 6.7.10p12)");
+            return errorNode(braceInitListNode, contextType);
+        }
+        // The single-expression form — lower + coerce exactly like `= expr`
+        // (the shared funnel; the brace-list arm inside it is unreachable
+        // after the N2 gate above).
+        return lowerExprOrBraceInit(valueExprCst, contextType);
+    }
+
     // D5.3 brace-init lowering. Takes a `braceInitList` CST node and a
     // CONTEXT TYPE (the resolved type the brace-init must produce — a
     // struct or array). Produces a positional `HirKind::ConstructAggregate`
@@ -5758,12 +5936,25 @@ struct Lowerer {
                 "brace-init requires a known context type");
         }
         TypeKind const containerKind = interner.kind(contextType);
+        // FC17.5 (D-CSUBSET-EMPTY-INITIALIZER, C23 6.7.10): a SCALAR context
+        // type takes the dedicated scalar arm — `{}` zero-initializes
+        // (6.7.10p11), `{ expr }` initializes with the single expression
+        // (6.7.10p12). The CLOSED allowlist (F4) admits exactly the scalar
+        // kinds `synthZeroOrError` can mint a zero for; everything else
+        // (Void/FnSig/NullptrT/Vector/…) falls through to the aggregate gate's
+        // fail-loud reject — `(void){}` admitted here would corrupt the type
+        // system with a Void-typed literal.
+        if (isScalarBraceInitKind(containerKind)) {
+            return lowerScalarBraceInit(braceInitListNode, contextType);
+        }
         bool const isArray  = (containerKind == TypeKind::Array);
         bool const isStruct = (containerKind == TypeKind::Struct);
         bool const isUnion  = (containerKind == TypeKind::Union);
         if (!isArray && !isStruct && !isUnion) {
             return reportedError(braceInitListNode,
-                "brace-init target type must be struct, union, or array");
+                "brace-init target type must be a scalar, struct, union, or "
+                "array (Void / function / other non-object types stay loud "
+                "by the closed scalar allowlist)");
         }
         // D5.4: union brace-init has distinct semantics from struct —
         // at most ONE element, initializing exactly one variant.

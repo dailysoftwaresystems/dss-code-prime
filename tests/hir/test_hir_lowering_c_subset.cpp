@@ -818,14 +818,13 @@ TEST(HirLoweringCSubset, TypedefStructCompoundLiteralLowersTyped) {
         << (r.all().empty() ? "" : r.all()[0].actual);
 }
 
-// SCALAR compound literals — `(int){42}`, valid C 6.5.2.5p9 — now
-// resolve their TYPE (the semantic stamping admits them) but the HIR
-// brace-init lowering is aggregate-only by design: the scalar shape
-// stays a deliberate FAIL-LOUD ("brace-init target type must be
-// struct, union, or array"), never a silent misparse. Lifting the
-// scalar restriction is brace-init-lowering work, distinct from this
-// anchor's typedef-admission scope.
-TEST(HirLoweringCSubset, ScalarCompoundLiteralStaysAggregateOnlyFailLoud) {
+// FC17.5 (D-CSUBSET-EMPTY-INITIALIZER, C23 6.7.10): SCALAR compound
+// literals — `(int){42}`, valid C 6.5.2.5p9 — now lower through the HIR
+// scalar brace-init arm (the FLIP of the pre-FC17.5
+// `ScalarCompoundLiteralStaysAggregateOnlyFailLoud` pin, which
+// anticipated exactly this lift). The single-expression form is
+// byte-identical to a plain `= 42` init after the arm's coerce.
+TEST(HirLoweringCSubset, ScalarCompoundLiteralLowersViaScalarBraceInit) {
     SemanticModel model = analyzeCSubset(
         "int main() { int x = (int){42}; return x; }\n");
     ASSERT_FALSE(model.hasErrors())
@@ -833,10 +832,127 @@ TEST(HirLoweringCSubset, ScalarCompoundLiteralStaysAggregateOnlyFailLoud) {
            "literal (the stamp resolves)";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok)
+        << "the FC17.5 scalar brace-init arm must lower `(int){42}` "
+           "cleanly: "
+        << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// FC17.5 (D-CSUBSET-EMPTY-INITIALIZER, C23 6.7.10p11): the EMPTY
+// initializer `{}` zero-initializes a scalar / a pointer, and the
+// single-expression form `{42}` initializes with the expression —
+// every route funnels through the ONE lowerBraceInit chokepoint.
+TEST(HirLoweringCSubset, ScalarEmptyAndSingleBraceInitLower) {
+    SemanticModel model = analyzeCSubset(
+        "int main() {\n"
+        "    int z = {};\n"
+        "    int v = {42};\n"
+        "    int *p = {};\n"
+        "    return z + v + (p == 0 ? 0 : 1);\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// FC17.5 (S_InvalidScalarInitializer 0xE03F): the three malformed scalar
+// brace shapes stay LOUD — excess elements (`{1,2}`), a designator on a
+// scalar (`{.x=1}`), and the audit-N2 nested brace list (`{{42}}` — C23
+// 6.7.10p12 requires a SINGLE expression). Each is a distinct arm of the
+// scalar lowering's reject path; a silent guess would ship wrong bytes.
+TEST(HirLoweringCSubset, ScalarBraceInitMalformedShapesFailLoud) {
+    struct Arm { char const* src; char const* what; };
+    Arm const arms[] = {
+        {"int main() { int v = {1, 2}; return v; }\n",   "excess elements"},
+        {"int main() { int v = {.x = 1}; return v; }\n", "designator on scalar"},
+        {"int main() { int v = {{42}}; return v; }\n",   "nested brace list (N2)"},
+    };
+    for (auto const& arm : arms) {
+        SemanticModel model = analyzeCSubset(arm.src);
+        ASSERT_FALSE(model.hasErrors())
+            << arm.what << ": the semantic tier admits the parse (the "
+                            "constraint is enforced at HIR lowering)";
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_FALSE(res->ok)
+            << arm.what << " must fail loud at the scalar brace-init arm";
+        bool sawCode = false;
+        for (auto const& d : r.all()) {
+            if (d.code == DiagnosticCode::S_InvalidScalarInitializer)
+                sawCode = true;
+        }
+        EXPECT_TRUE(sawCode)
+            << arm.what << " must report S_InvalidScalarInitializer (0xE03F)";
+    }
+}
+
+// FC17.5 F4 (the CLOSED allowlist): `(void){}` stays LOUD — Void is not
+// an allowlisted scalar brace-init target (admitting it would mint a
+// Void-typed literal and corrupt the type system). The aggregate gate's
+// fail-loud reject is the backstop for every non-allowlisted kind.
+TEST(HirLoweringCSubset, VoidCompoundLiteralStaysFailLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int main() { (void){}; return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "the semantic tier stamps the void compound literal; the HIR "
+           "gate is the enforcement point";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok)
-        << "scalar compound literals are aggregate-gated at the HIR "
-           "brace-init lowering today — this must stay LOUD until the "
-           "scalar arm lands";
+        << "`(void){}` must stay fail-loud (F4 closed allowlist)";
+}
+
+// FC17.5 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER, C99 6.4.2.2): a read of
+// `__func__` FOLDS to a string-literal-shaped constant and every string
+// consumer (decay to `const char*`, indexing, address-of) rides the
+// existing paths — the whole program lowers cleanly through HIR.
+TEST(HirLoweringCSubset, FuncNameReadsLowerThroughStringLiteralPaths) {
+    SemanticModel model = analyzeCSubset(
+        "int helper(void) { return __func__[0] == 'h' ? 1 : 0; }\n"
+        "int main() {\n"
+        "    const char *fn = __func__;\n"
+        "    int a = fn[0] == 'm' ? 1 : 0;\n"
+        "    int b = (&__func__ != 0) ? 1 : 0;\n"
+        "    int c = (__func__ == __func__) ? 1 : 0;\n"
+        "    int d = (int)sizeof __func__;\n"
+        "    return a + b + c + d + helper();\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// FC17.5 F1 (S_PredefinedIdentifierNotAddressable 0xE040): `++__func__`
+// reaches the HIR inc/dec classifier (SE4's const check does not model
+// inc/dec — the pre-existing D-CSUBSET-INCDEC-CONST-LVALUE class), where
+// the simpleLvalue chokepoint now rejects the predefined identifier with
+// a REAL diagnostic instead of the engine-level "no storage slot" MIR
+// failure it would otherwise dead-end at. Covers `--__func__` and the
+// postfix forms by construction (all three ++/-- sites share the
+// classifier, and the classifier's simple-lvalue probe IS the guard).
+TEST(HirLoweringCSubset, FuncNameIncDecFailsLoudWithRealDiagnostic) {
+    SemanticModel model = analyzeCSubset(
+        "int main() { ++__func__; return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "inc/dec const-ness is not modelled at semantic — the HIR "
+           "guard is the enforcement point";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "++__func__ must fail loud";
+    bool sawCode = false;
+    for (auto const& d : r.all()) {
+        if (d.code == DiagnosticCode::S_PredefinedIdentifierNotAddressable)
+            sawCode = true;
+    }
+    EXPECT_TRUE(sawCode)
+        << "++__func__ must report S_PredefinedIdentifierNotAddressable "
+           "(0xE040), not an engine-level unsupported-lowering error";
 }
 
 // D-CSUBSET-CAST-VOID-DISCARD (FC3.5 sweep-c3): `(void)f()` lowers as

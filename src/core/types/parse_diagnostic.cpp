@@ -174,6 +174,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_DeprecatedSymbolUsed";
         case DiagnosticCode::S_NodiscardResultDiscarded:
             return "S_NodiscardResultDiscarded";
+        case DiagnosticCode::S_InvalidScalarInitializer:
+            return "S_InvalidScalarInitializer";
+        case DiagnosticCode::S_PredefinedIdentifierNotAddressable:
+            return "S_PredefinedIdentifierNotAddressable";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

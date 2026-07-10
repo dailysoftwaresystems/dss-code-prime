@@ -44,11 +44,14 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     // CU-wide builtins scope): c103 `__umulh` (D-CSUBSET-INTRINSIC-UMULH) + c104
     // `_InterlockedCompareExchange` (D-CSUBSET-INTRINSIC-ATOMIC-CAS) + c113
     // `_ReadWriteBarrier` (D-CSUBSET-INTRINSIC-BARRIER) + c115 `_exception_code`
-    // + `_exception_info` (D-WIN64-SEH-FUNCLETS SEH intrinsics).
-    ASSERT_EQ(model.symbols().size() - 1, 9u)
+    // + `_exception_info` (D-WIN64-SEH-FUNCLETS SEH intrinsics) + the 2 FC17.5
+    // predefined function-name symbols (`__func__` + `__FUNCTION__`, C99
+    // 6.4.2.2 — one per configured spelling per function DEFINITION, bound into
+    // main's own scope; D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
+    ASSERT_EQ(model.symbols().size() - 1, 11u)
         << "main + x + __va_list_tag + va_list + __umulh + "
            "_InterlockedCompareExchange + _ReadWriteBarrier + "
-           "_exception_code + _exception_info";
+           "_exception_code + _exception_info + __func__ + __FUNCTION__";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xRec = &model.symbols()[i];
@@ -2246,8 +2249,10 @@ TEST(SemanticAnalyzerCSubset, NestedBlocksShadowWithoutRedecl) {
     // main (function) + two distinct `x` symbols (one per block scope) + the 2
     // FC12a-core builtin TYPES (__va_list_tag + va_list) + the 5 intrinsic
     // builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
-    // _ReadWriteBarrier + c115 _exception_code + _exception_info).
-    EXPECT_EQ(model.symbols().size() - 1, 10u);
+    // _ReadWriteBarrier + c115 _exception_code + _exception_info) + the 2
+    // FC17.5 predefined function-name symbols (__func__ + __FUNCTION__, per
+    // function definition — D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
+    EXPECT_EQ(model.symbols().size() - 1, 12u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -2265,8 +2270,9 @@ TEST(SemanticAnalyzerCSubset, ForwardReferenceWithinBlock) {
     // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
     // (__va_list_tag + va_list) + the 5 intrinsic builtins (c103 __umulh +
     // c104 _InterlockedCompareExchange + c113 _ReadWriteBarrier + c115
-    // _exception_code + _exception_info). Find x by name.
-    ASSERT_EQ(model.symbols().size() - 1, 9u);
+    // _exception_code + _exception_info) + the 2 FC17.5 predefined
+    // function-name symbols (__func__ + __FUNCTION__). Find x by name.
+    ASSERT_EQ(model.symbols().size() - 1, 11u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -4585,11 +4591,12 @@ TEST(SemanticAnalyzerCSubset, ValueStarValueStaysExpressionStatement) {
     EXPECT_FALSE(model.hasErrors());
     // main + a + b + the 2 FC12a-core builtin TYPES (__va_list_tag + va_list) + the
     // 5 intrinsic builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
-    // _ReadWriteBarrier + c115 _exception_code + _exception_info) — the
+    // _ReadWriteBarrier + c115 _exception_code + _exception_info) + the 2 FC17.5
+    // predefined function-name symbols (__func__ + __FUNCTION__) — the
     // multiplication must mint NO symbol.
-    EXPECT_EQ(model.symbols().size() - 1, 10u)
-        << "main + a + b + __va_list_tag + va_list + the 5 intrinsic builtins — "
-           "the multiplication mints none";
+    EXPECT_EQ(model.symbols().size() - 1, 12u)
+        << "main + a + b + __va_list_tag + va_list + the 5 intrinsic builtins + "
+           "__func__ + __FUNCTION__ — the multiplication mints none";
 }
 
 // UNKNOWN `u * v;` (no `u` anywhere, single file) — the oracle-candidate
@@ -7420,6 +7427,102 @@ TEST(SemanticAnalyzerCSubset, ConstexprExactRepresentabilityCurrentlyUnenforced)
     });
     EXPECT_FALSE(negModel.hasErrors())
         << "documents the OPEN 6.7.1p10 boundary — update when the deferral closes";
+}
+
+// ── FC17.5 (D-CSUBSET-EMPTY-INITIALIZER + D-CSUBSET-FUNC-PREDEFINED-
+//    IDENTIFIER): C23 {} empty/scalar brace-init × constexpr, and the C99
+//    6.4.2.2 `__func__` predefined identifier ────────────────────────────────
+
+// F3 (C23 6.7.10p11 × 6.7.1): an EMPTY brace initializer zero-initializes —
+// zero is a valid compile-time value for every scalar constexpr object,
+// including the pointer arm (zero = the null pointer constant). Without the
+// F3 empty-brace arm, `constExprValue` cannot fold `{}` (it is not an
+// expression) and both declarations would false-fire
+// S_ConstexprNonConstantInitializer.
+TEST(SemanticAnalyzerCSubset, ConstexprEmptyBraceInitializerValid) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    constexpr int x = {};\n"
+        "    constexpr int *p = {};\n"
+        "    return x + (p == 0 ? 0 : 1);\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+}
+
+// The now-green DELTA pin: `constexpr int x = {5};` passes semantic — the
+// single-element brace list folds through the normal single-child descent
+// (the HIR scalar brace-init lift makes the whole program compile; this pin
+// holds the SEMANTIC half green).
+TEST(SemanticAnalyzerCSubset, ConstexprSingleBraceInitializerValid) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { constexpr int x = {5}; return x; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+}
+
+// F1 (C99 6.4.2.2): the synthetic `__func__` symbol is `isConst`, so SE4's
+// const check rejects simple assignment — the isConst flag is the ONLY guard
+// on this path (pin it; without it `__func__ = x` would reach HIR lowering
+// and dead-end as a rodata write).
+TEST(SemanticAnalyzerCSubset, FuncNameAssignmentIsConstViolation) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    const char *x;\n"
+        "    x = __func__;\n"
+        "    __func__ = x;\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstViolation), 1u)
+        << "__func__ = x must reject via the synthetic symbol's isConst";
+}
+
+// F1: compound assignment takes the SAME SE4 const chokepoint (the
+// operator-gated assignment entries share the rule) — `__func__ += 1` is a
+// distinct classifier path from plain `=`, so pin it separately.
+TEST(SemanticAnalyzerCSubset, FuncNameCompoundAssignIsConstViolation) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { __func__ += 1; return 0; }\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstViolation), 1u)
+        << "__func__ += 1 must reject via the synthetic symbol's isConst";
+}
+
+// N4: the synthetic binds BEFORE the params (Pass 1 binds it when the
+// function's scope is pushed; the params bind as the driver walks the
+// children AFTER), so a param named `__func__` collides at ITS OWN bind —
+// a positioned S_RedeclaredSymbol, never a crash or a silent shadow.
+TEST(SemanticAnalyzerCSubset, ParamNamedFuncNameRedeclares) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int __func__) { return __func__; }\n"
+        "int main(void) { return f(42); }\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a param named __func__ must collide with the earlier synthetic "
+           "bind (N4: bind-before-params)";
+}
+
+// The binding is FUNCTION-scoped (C99 6.4.2.2 declares __func__ inside each
+// function definition): at FILE scope there is no enclosing function and the
+// name resolves to NOTHING — a use fails loud as an ordinary undeclared
+// identifier, never a guessed global.
+TEST(SemanticAnalyzerCSubset, FuncNameOutsideFunctionIsUndeclared) {
+    auto model = analyzeShipped("c-subset", {
+        "int x = __func__[0];\n"
+        "int main(void) { return x; }\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UndeclaredIdentifier), 1u)
+        << "__func__ at file scope must be undeclared (the binding is "
+           "per-function-definition)";
 }
 
 // ── FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): standard-attribute

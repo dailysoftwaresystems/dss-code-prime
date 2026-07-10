@@ -1973,6 +1973,34 @@ TEST(Preprocessor, FC15bStdcConstants) {
     }
 }
 
+// FC17.5 (D-CSUBSET-VLA): `__STDC_NO_VLA__` is DEFINED (= 1). C11 6.10.8.3 /
+// C23 6.10.9.3 REQUIRE an implementation without variable-length-array support
+// to define it — DSS has no VLA support (a runtime array bound fails loud,
+// S_NonConstantArrayLength), so declaring the macro is the conformance-honest
+// line: a conforming program's `#ifdef __STDC_NO_VLA__` now selects its
+// fixed-size fallback instead of tripping the fail-loud gate. RED-ON-DISABLE:
+// drop the predefinedMacros row → `#ifdef` selects the else arm.
+TEST(Preprocessor, FC175StdcNoVlaDefined) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#ifdef __STDC_NO_VLA__\nint no_vla;\n#else\nint has_vla;\n#endif\n",
+            r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u)
+            << "__STDC_NO_VLA__ must be defined -> the no_vla arm";
+        EXPECT_EQ(lexs[1], "no_vla");
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("int v = __STDC_NO_VLA__;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 5u);
+        EXPECT_EQ(lexs[3], "1")
+            << "__STDC_NO_VLA__ materializes its config value 1";
+    }
+}
+
 // `__STDC_VERSION__` works in a `#if` controlling expression (it expands via the
 // SAME engine, then the ICE evaluator folds it): `#if __STDC_VERSION__ >= 201112L`
 // is true under C23. RED-ON-DISABLE: without the predefined hook the identifier
@@ -2200,11 +2228,12 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     auto c = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(c.has_value());
     auto const& pms = (*c)->preprocess().predefinedMacros;
-    // 7 ungated (C 6.10.8) + 10 pe-gated = 17: the c95 Windows selection
-    // (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the c105
-    // MSVC-profile flip (_MSC_VER/__int64/__forceinline/__declspec).
-    EXPECT_EQ(pms.size(), 17u)
-        << "c-subset declares 7 C 6.10.8 + 10 pe-gated Windows predefined macros";
+    // 8 ungated (the 7 C 6.10.8 core + the FC17.5 `__STDC_NO_VLA__`
+    // conformance line, D-CSUBSET-VLA) + 10 pe-gated = 18: the c95 Windows
+    // selection (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the
+    // c105 MSVC-profile flip (_MSC_VER/__int64/__forceinline/__declspec).
+    EXPECT_EQ(pms.size(), 18u)
+        << "c-subset declares 8 un-gated + 10 pe-gated Windows predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     for (auto const& pm : pms) {
@@ -2218,8 +2247,9 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
                 << pm.name << " should be pe-gated (Windows selection)";
         }
     }
-    EXPECT_EQ(ungated, 7u)
-        << "the 7 C 6.10.8 macros are un-gated (available on every format)";
+    EXPECT_EQ(ungated, 8u)
+        << "the 7 C 6.10.8 macros + __STDC_NO_VLA__ (FC17.5) are un-gated "
+           "(available on every format)";
     EXPECT_EQ(peGated, 10u)
         << "_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI (c95) + "
            "_MSC_VER/__int64/__forceinline/__declspec (c105) are pe-gated";

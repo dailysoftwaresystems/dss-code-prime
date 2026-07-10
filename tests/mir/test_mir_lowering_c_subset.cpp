@@ -3393,9 +3393,11 @@ TEST(MirLoweringCSubset, BodyF64LiteralPromotesToAnonymousGlobalPlusLoad) {
     Mir const& m = L.mir.mir;
     auto const& interner = L.model.lattice().interner();
 
-    // TWO promoted globals (one per literal occurrence — the string-
-    // literal convention: per-occurrence, no dedup), each typed F64
-    // with a constant-init double literal carrying the exact value.
+    // TWO promoted globals (one per literal occurrence; DISTINCT values —
+    // 1.7 vs 2.5 — so the FC17.5 F2 STRING byte-content memo, which only
+    // dedups identical STRING literals, is irrelevant here: float
+    // promotion keeps per-occurrence minting), each typed F64 with a
+    // constant-init double literal carrying the exact value.
     ASSERT_EQ(m.moduleGlobalCount(), 2u)
         << "each body F64 literal must mint one anonymous rodata global";
     bool saw17 = false, saw25 = false;
@@ -3443,6 +3445,89 @@ TEST(MirLoweringCSubset, BodyF64LiteralPromotesToAnonymousGlobalPlusLoad) {
     EXPECT_EQ(nGlobalAddr, 2u);
     EXPECT_EQ(nF64Load, 2u);
     EXPECT_EQ(nFAdd, 1u);
+}
+
+// FC17.5 F2 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER): IDENTICAL body string
+// literals share ONE rodata global — the byte-content memo in
+// `materializeStringLiteralGlobal` (keyed on (array TypeId, exact bytes)).
+// C 6.4.5p7 permits the sharing for all strings; C99 6.4.2.2 REQUIRES it
+// for `__func__` (one static array per function — two folded reads must
+// decay to EQUAL pointers, see the sibling __func__ pin). RED-ON-DISABLE:
+// drop the `stringGlobalMemo_` lookup in materializeStringLiteralGlobal →
+// two occurrences mint two globals → the count assertion fails.
+TEST(MirLoweringCSubset, IdenticalStringLiteralsShareOneRodataGlobal) {
+    auto L = lowerCSubset(
+        "int f() {\n"
+        "    const char *a;\n"
+        "    const char *b;\n"
+        "    a = \"hi\";\n"
+        "    b = \"hi\";\n"
+        "    return a == b ? 1 : 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u)
+        << "two identical \"hi\" literals must share ONE memoized rodata "
+           "global (two means the F2 byte-content memo is disabled)";
+    EXPECT_TRUE(m.globalIsConst(m.globalAt(0)))
+        << "the shared string global must stay read-only rodata";
+}
+
+// FC17.5 F2 — the `__func__ == __func__` identity substrate at MIR: the
+// two folded `__func__` reads decay through the SAME memoized rodata
+// global, so the comparison is GlobalAddr(sym) == GlobalAddr(sym) (true
+// by construction, as C99 6.4.2.2's one-static-array semantics require).
+// RED-ON-DISABLE: without the memo the two reads mint TWO globals and the
+// count assertion fails (and the runtime example would return the wrong
+// exit).
+TEST(MirLoweringCSubset, FuncNameReadsShareOneRodataGlobal) {
+    auto L = lowerCSubset(
+        "int main() { return (__func__ == __func__) ? 1 : 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u)
+        << "the two __func__ reads must materialize ONE shared rodata "
+           "global — C99 6.4.2.2 declares ONE static array per function";
+}
+
+// FC17.5 F2, the code-audit MEDIUM-1 closure: the identity must hold ACROSS
+// producer positions — a `static const char *p = __func__;` INITIALIZER
+// (classified by tryClassifyAsSymbolAddr's Cast-of-string-Literal arm) and a
+// BODY read of `__func__` (materializeStringLiteralGlobal) must reference the
+// SAME rodata global, or `p == __func__` is silently false (wrong value, no
+// diagnostic). Both producers now route through the ONE shared
+// `internStringLiteralGlobal` core. Expected globals: the hidden static `p`
+// (D-CSUBSET-LOCAL-STATIC module global) + ONE shared string global = 2.
+// RED-ON-DISABLE: revert the classify arm to its own PendingGlobal mint → the
+// initializer and the body read mint TWO string globals → count 3 → red.
+TEST(MirLoweringCSubset, FuncNameStaticInitializerSharesTheBodyReadGlobal) {
+    auto L = lowerCSubset(
+        "int main() {\n"
+        "    static const char *p = __func__;\n"
+        "    return (p == __func__) ? 1 : 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 2u)
+        << "expected the hidden static `p` + ONE shared __func__ string "
+           "global; 3 means the static-initializer path minted its own "
+           "un-memoized string global (the audit's MEDIUM-1 identity leak)";
+    // Exactly one of the two globals is the const rodata string.
+    int constGlobals = 0;
+    for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i) {
+        if (m.globalIsConst(m.globalAt(i))) ++constGlobals;
+    }
+    EXPECT_EQ(constGlobals, 1)
+        << "exactly ONE const rodata string global must back both positions";
 }
 
 // ── FC3 c1: UAC materialization pins (plan 23) ──────────────────────────

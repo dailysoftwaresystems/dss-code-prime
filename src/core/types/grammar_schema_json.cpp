@@ -7835,6 +7835,44 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── predefined function-name identifiers (FC17.5,
+            //    D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER, C99 6.4.2.2) ──
+            // `{ identifiers }` — the predefined function-name spellings
+            // (`__func__` + the GNU `__FUNCTION__` alias for c-subset). Pass 1
+            // binds one synthetic const Array<char-core, len+1> symbol per
+            // spelling into each function definition's own scope; HIR folds a
+            // read to a string-literal constant. `identifiers` is REQUIRED when
+            // the block is present and each entry must be a string (a typo'd
+            // shape can never silently disarm the feature). An ABSENT block
+            // leaves the list empty ⇒ no surface. Source-agnostic: nothing
+            // hardcodes "__func__".
+            if (sem.contains("predefinedFunctionNames")) {
+                json const& pf = sem.at("predefinedFunctionNames");
+                if (!pf.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/predefinedFunctionNames",
+                              "'semantics.predefinedFunctionNames' must be an "
+                              "object { identifiers }");
+                } else if (!pf.contains("identifiers")
+                           || !pf.at("identifiers").is_array()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              "/semantics/predefinedFunctionNames/identifiers",
+                              "'identifiers' is required and must be an array "
+                              "of strings");
+                } else {
+                    for (json const& e : pf.at("identifiers")) {
+                        if (!e.is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/predefinedFunctionNames/identifiers",
+                                      "each 'identifiers' entry must be a string");
+                            continue;
+                        }
+                        cfg.predefinedFunctionNameIdentifiers.push_back(
+                            e.get<std::string>());
+                    }
+                }
+            }
+
             // ── standard-attribute semantics (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS) ──
             // `{ attrSpecRule, stdAttrRule, bareStatementRule, effects }` — the
             // C23 6.7.13 standard-attribute semantics TABLE. The three rule refs

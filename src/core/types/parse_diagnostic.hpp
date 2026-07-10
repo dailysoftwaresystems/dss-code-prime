@@ -654,6 +654,31 @@ enum class DiagnosticCode : std::uint16_t {
     // — discarding a nodiscard result is diagnosable advice per C23, not a
     // constraint violation. The `.actual` is the callee name, or `name: msg`.
     S_NodiscardResultDiscarded    = 0xE03E,
+    // C23 §6.7.10 (D-CSUBSET-EMPTY-INITIALIZER): a brace initializer for a
+    // SCALAR object that is not one of the two valid scalar forms — `{}` (empty,
+    // zero-initializes) or `{ expr }` (exactly one non-brace, non-designated
+    // expression, C 6.7.10p12). Fires on excess elements (`int v = {1, 2};`), a
+    // designator (`int v = {.x = 1};`), or a nested brace list (`int v =
+    // {{42}};` — 6.7.10p12's "shall be a single expression"). A plain Error
+    // (constraint violation); the lowering returns an Error node either way, so
+    // a suppressed diagnostic can never silently accept the malformed
+    // initializer (no wrong-bytes path — deliberately NOT in the
+    // unsuppressable table).
+    S_InvalidScalarInitializer    = 0xE03F,
+    // C99 §6.4.2.2 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER): a predefined
+    // function-name identifier (`__func__` / the configured aliases) used as a
+    // MODIFIABLE lvalue — the ++/--/compound-assign classifiers would otherwise
+    // synthesize a write-back to a symbol with no storage slot (`__func__` reads
+    // FOLD to a string-literal constant; there is no object to read-modify-
+    // write), which today surfaces as an engine-level "no storage slot" failure
+    // at MIR. This is the REAL diagnostic for that misuse. Plain reads,
+    // `&__func__` (legal C99 — the fold's rodata global provides the address),
+    // and indexing are unaffected. Simple assignment / `+=` are caught EARLIER
+    // by SE4's const check (the synthetic symbol is `isConst`) →
+    // S_ConstViolation; this code covers the inc/dec class the const check does
+    // not model. A plain Error; the classifiers bail to an Error path either
+    // way (NOT in the unsuppressable table — no silent-accept route).
+    S_PredefinedIdentifierNotAddressable = 0xE040,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

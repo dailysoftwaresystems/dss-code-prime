@@ -13,6 +13,7 @@
 #include <array>
 #include <format>
 #include <limits>
+#include <map>       // FC17.5 F2: the string-global byte-content memo
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -103,6 +104,18 @@ struct Lowerer {
     // `fieldByteOffset` (member-access offset resolution) and
     // `aggregateByteSize` (aggregate-local Alloca sizing).
     std::unordered_map<std::uint32_t, StructLayout> layoutCache_;
+    // FC17.5 F2 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER): per-MODULE byte-content
+    // memo for `materializeStringLiteralGlobal` — (interned array TypeId.v,
+    // exact byte content) → the already-minted rodata global's SymbolId. C
+    // 6.4.5p7 PERMITS identical string literals to share one array; `__func__`
+    // REQUIRES it (C99 6.4.2.2 declares ONE static array per function — two
+    // reads folded to two literals must compare EQUAL after decay, so both
+    // must materialize to the SAME global). Keying on the TypeId keeps
+    // same-bytes-different-element-width literals (narrow "ab" vs u"ab"'s
+    // code units) distinct by construction. Never cleared — rodata globals
+    // are module-level (the layoutCache_ precedent). Also a size win: sqlite's
+    // repeated literals collapse to one rodata object each.
+    std::map<std::pair<std::uint32_t, std::string>, SymbolId> stringGlobalMemo_;
     // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): per-function by-value return
     // state, reset at the top of each `lowerFunction`. `currentFnResult_` is the
     // enclosing function's result type — a `ReturnStmt` needs it to classify a
@@ -2637,13 +2650,54 @@ struct Lowerer {
     // epilogues the frames do (one source of truth) and are unreachable through
     // the driver — kept as the recursive fallback.
 
-    // D-LK4-RODATA-PRODUCER-STRING: materialize a STRING LITERAL into a fresh
+    // D-LK4-RODATA-PRODUCER-STRING: materialize a STRING LITERAL into a
     // synthetic rodata MirGlobal and return a `GlobalAddr` (typed `ptrTy`) to its
     // first byte. The SINGLE producer, shared by the array→pointer DECAY Cast arm
     // (value position) and the lvalue-address `HirKind::Literal` arm (`"abc"[i]`
     // — F5 agg_string_index). A non-string literal / SymbolId-space exhaustion
-    // fails loud (no silent miscompile). Each occurrence mints its own global
-    // (no cross-occurrence dedup — existing behavior).
+    // fails loud (no silent miscompile).
+    //
+    // FC17.5 F2 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER): occurrences are
+    // MEMOIZED by (array TypeId, byte content) — identical literals share ONE
+    // rodata global (C 6.4.5p7 permits it for all strings; C99 6.4.2.2
+    // REQUIRES it for `__func__`, whose two folded reads must decay to EQUAL
+    // pointers). Each USE still gets its own GlobalAddr instruction; only the
+    // backing global dedups.
+    // The memo-aware minting CORE, shared by BOTH string-global producers —
+    // `materializeStringLiteralGlobal` (function-body literals / decay / index)
+    // AND `tryClassifyAsSymbolAddr`'s Cast-of-string-Literal constant-initializer
+    // arm (`static const char *p = "s";` / `= __func__;`). ONE producer core is
+    // what makes the C99 6.4.2.2 `__func__` identity hold ACROSS positions: a
+    // body read and a static-initializer reference of the same function's
+    // `__func__` must decay to EQUAL pointers (the code-audit's MEDIUM-1 — two
+    // independent minters broke it). Precondition: the literal's pool entry IS a
+    // string (callers check). Invalid on SymbolId exhaustion — each caller keeps
+    // its own failure posture (loud vs classify-fallback).
+    [[nodiscard]] SymbolId internStringLiteralGlobal(HirNodeId litNode) {
+        std::uint32_t const litIdx0 = hir.payload(litNode);
+        HirLiteralValue const& src = literals.at(litIdx0);
+        auto memoKey = std::pair{hir.typeId(litNode).v,
+                                 std::get<std::string>(src.value)};
+        if (auto it = stringGlobalMemo_.find(memoKey);
+            it != stringGlobalMemo_.end()) {
+            return it->second;
+        }
+        SymbolId const sym = mintSyntheticGlobalSymbol();
+        if (!sym.valid()) return sym;
+        std::uint32_t const mirLitIdx = mir.literalPoolAdd(toMirLiteral(src));
+        // D-CSUBSET-MUTABLE-CHAR-ARRAY-RODATA: the synthetic string-literal-pool
+        // bytes are IMMUTABLE read-only data (a string literal is const however
+        // it is used). Mint the global CONST so the asm section selection routes
+        // it to `.rodata` — `isConst` is the discriminator that lets a NAMED
+        // mutable `char arr[N]="str"` go to writable `.data` while this SYNTHETIC
+        // pool global stays read-only.
+        (void)mir.addGlobal(hir.typeId(litNode), sym, mirLitIdx, {},
+                            SymbolBinding::Global, SymbolVisibility::Default,
+                            /*isConst=*/true);
+        stringGlobalMemo_.emplace(std::move(memoKey), sym);
+        return sym;
+    }
+
     [[nodiscard]] MirInstId materializeStringLiteralGlobal(HirNodeId litNode,
                                                            TypeId ptrTy) {
         std::uint32_t const litIdx0 = hir.payload(litNode);
@@ -2655,7 +2709,7 @@ struct Lowerer {
                 "D-LK4-RODATA-PRODUCER-NONSTRING-ARRAY-LITERAL-DECAY)");
             return InvalidMirInst;
         }
-        SymbolId const sym = mintSyntheticGlobalSymbol();
+        SymbolId const sym = internStringLiteralGlobal(litNode);
         if (!sym.valid()) {
             unsupported(litNode,
                 "string-literal promotion failed: synthetic SymbolId space "
@@ -2663,18 +2717,6 @@ struct Lowerer {
                 "D-LK4-RODATA-PRODUCER-STRING space-exhaustion pin.");
             return InvalidMirInst;
         }
-        std::uint32_t const mirLitIdx = mir.literalPoolAdd(toMirLiteral(src));
-        // D-CSUBSET-MUTABLE-CHAR-ARRAY-RODATA: the synthetic string-literal-pool
-        // bytes are IMMUTABLE read-only data (a string literal is const however
-        // it is used). Mint the global CONST so the asm section selection routes
-        // it to `.rodata` — `isConst` is the discriminator that lets a NAMED
-        // mutable `char arr[N]="str"` go to writable `.data` while this SYNTHETIC
-        // pool global stays read-only (tryClassifyAsSymbolAddr's string arm
-        // already mints const; this matches it for the function-body literal /
-        // pointer-decay path).
-        (void)mir.addGlobal(hir.typeId(litNode), sym, mirLitIdx, {},
-                            SymbolBinding::Global, SymbolVisibility::Default,
-                            /*isConst=*/true);
         return mir.addGlobalAddr(sym, ptrTy);
     }
 
@@ -7757,14 +7799,14 @@ struct Lowerer {
             HirLiteralValue const& src = literals.at(litIdx0);
             if (!std::holds_alternative<std::string>(src.value))
                 return std::nullopt;
-            SymbolId const rodataSym = mintSyntheticGlobalSymbol();
+            // FC17.5 F2 (code-audit MEDIUM-1): route through the SHARED memoized
+            // producer core — a `static const char *p = __func__;` initializer and
+            // a body read of `__func__` must reference the SAME rodata global
+            // (C99 6.4.2.2 identity), and identical plain string literals dedup
+            // here too (C 6.4.5p7 permits sharing). The prior per-occurrence
+            // PendingGlobal mint broke the identity across positions.
+            SymbolId const rodataSym = internStringLiteralGlobal(kids[0]);
             if (!rodataSym.valid()) return std::nullopt;  // exhausted → fall back
-            PendingGlobal rg;
-            rg.symbol    = rodataSym;
-            rg.type      = hir.typeId(kids[0]);   // Array<Char,N+1>
-            rg.constInit = toMirLiteral(src);
-            rg.isConst   = true;                  // string literal bytes → .rodata
-            pendingGlobals.push_back(std::move(rg));
             return std::make_pair(rodataSym, std::int64_t{0});
         }
         return std::nullopt;

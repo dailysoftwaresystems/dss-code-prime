@@ -290,6 +290,25 @@ struct DSS_EXPORT SymbolRecord {
     // across a proto/def pair like isDeprecated; message first-non-empty-wins.
     bool            isNodiscard = false;
     std::string     nodiscardMessage;
+    // FC17.5 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER, C99 6.4.2.2): TRUE iff this
+    // is a SYNTHETIC predefined function-name symbol (`__func__` / a configured
+    // alias) that Pass 1 bound into a function DEFINITION's own scope, BEFORE
+    // the params (so a param of the same name collides → S_RedeclaredSymbol at
+    // its own span). Such a symbol is `isConst` (SE4 catches assignment /
+    // compound-assign → S_ConstViolation) and carries `type` =
+    // Array<narrow-string-core, len+1> minted AT THE BIND (there is no CST
+    // declarator to resolve at Pass 1.5). HIR lowering FOLDS a read to a
+    // string-literal-shaped constant (`predefinedFunctionNameText` supplies the
+    // bytes) — byte-identical to a real string literal, so rodata/decay/
+    // indexing ride unchanged; the ++/--/compound-assign lvalue classifiers
+    // reject it (S_PredefinedIdentifierNotAddressable — there is no storage
+    // slot to write back to). Default false.
+    bool            isPredefinedFunctionName = false;
+    // The enclosing FUNCTION's name — the bytes a `__func__` read folds to
+    // (WITHOUT the trailing NUL; the Array type's +1 carries it, exactly like a
+    // string literal's pool entry). Meaningful only when
+    // `isPredefinedFunctionName` is set; empty otherwise.
+    std::string     predefinedFunctionNameText;
 };
 
 // FF11 neutral-JSON shipped-library descriptor extern

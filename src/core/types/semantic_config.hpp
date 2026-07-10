@@ -1343,6 +1343,22 @@ struct DSS_EXPORT SemanticConfig {
     // linkage rides the declaration row's `linkageSpecifiers` map (keyword text →
     // {binding:local}), not this token.
     std::optional<SchemaTokenId> constexprKeywordToken;
+    // FC17.5 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER): the C99 6.4.2.2 predefined
+    // function-name identifier spellings (`__func__` + the GNU `__FUNCTION__`
+    // alias for c-subset). Pass 1 binds, for EACH spelling, one synthetic
+    // SymbolRecord into a function DEFINITION's own (param/body) scope BEFORE
+    // the params are visited: kind=Variable, isConst=true (SE4's const check
+    // then catches `__func__ = x` / `+=` → S_ConstViolation),
+    // type=Array<narrow-string-core, len+1> (the element core is the language's
+    // config-declared string-literal core — the SAME source string literals
+    // type from — never a hardcoded Char), isPredefinedFunctionName=true +
+    // predefinedFunctionNameText=the function's name. HIR lowering FOLDS a read
+    // of such a symbol to a string-literal-shaped constant (byte-identical to a
+    // real string literal, so rodata/decay/indexing ride unchanged). EMPTY ⇒
+    // the language has no predefined function-name surface (the bind never
+    // runs — toy/tsql). Source-AGNOSTIC: WHICH spellings are per-language
+    // config; the engine never hardcodes "__func__".
+    std::vector<std::string>     predefinedFunctionNameIdentifiers;
     // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute
     // semantics table (see AttributeSemanticsRow). `attrSpecRule`/`stdAttrRule`
     // name the GNU `__attribute__((...))` / C23 `[[...]]` attribute-specifier

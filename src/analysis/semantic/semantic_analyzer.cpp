@@ -2011,6 +2011,50 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
         emit(DiagnosticCode::S_ConstexprMissingInitializer, nameNode);
         return;
     }
+    // FC17.5 F3 (D-CSUBSET-EMPTY-INITIALIZER, C23 6.7.10): an EMPTY brace
+    // initializer `constexpr int x = {};` / `constexpr int *p = {};` IS a
+    // compile-time constant — it zero-initializes (6.7.10p11), and zero is a
+    // valid value for every scalar constexpr object (incl. the pointer arm:
+    // zero = the null pointer constant). `constExprValue` cannot fold a brace
+    // list (it is not an expression), so without this arm the HIR-side scalar
+    // `{}` lift would stay S_ConstexprNonConstantInitializer-rejected under
+    // constexpr. ONLY the truly-empty list is admitted here; `{5}` folds via
+    // the normal single-child-descent path below, and a malformed multi-element
+    // `{1,2}` falls through to the arithmetic/pointer arms' loud rejection
+    // (the HIR lowering also rejects it — S_InvalidScalarInitializer). The
+    // descent skips TOKEN children (`{`/`}` are the brace list's own tokens)
+    // and stops at the first node with 0 or 2+ Internal children, so a
+    // compound literal `(int){}` (two Internal children) is NOT admitted — a
+    // compound literal is not a C constant expression.
+    if (s.idx().braceInitListRule.valid()) {
+        NodeId walk = initNode;
+        for (int guard = 0; guard < 64 && walk.valid(); ++guard) {
+            if (tree.kind(walk) != NodeKind::Internal) { walk = NodeId{}; break; }
+            if (tree.rule(walk).v == s.idx().braceInitListRule.v) break;
+            NodeId sole{};
+            bool   multiple = false;
+            for (NodeId c : visibleChildren(tree, walk)) {
+                if (tree.kind(c) != NodeKind::Internal) continue;
+                if (sole.valid()) { multiple = true; break; }
+                sole = c;
+            }
+            if (multiple || !sole.valid()) { walk = NodeId{}; break; }
+            walk = sole;
+        }
+        if (walk.valid()
+            && tree.rule(walk).v == s.idx().braceInitListRule.v) {
+            bool anyElement = false;
+            for (NodeId c : visibleChildren(tree, walk)) {
+                if (tree.kind(c) != NodeKind::Internal) continue;
+                if (!s.idx().initElementRule.valid()
+                    || tree.rule(c).v == s.idx().initElementRule.v) {
+                    anyElement = true;
+                    break;
+                }
+            }
+            if (!anyElement) return;   // `= {}` — zero, a valid constexpr value
+        }
+    }
     if (k == TypeKind::Ptr) {
         if (admitsNullPointerConstant(s, tree, declTy, initNode,
                                       tree.schema().semantics()
@@ -3697,6 +3741,61 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                               || isTentativeDefinition);
                         } else {
                             s.nodeToSymbol.set(nameNode, newId);
+                        }
+                        // FC17.5 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER, C99
+                        // 6.4.2.2): a function DEFINITION (Function-kind, its
+                        // decl opened the param/body scope `here`) binds one
+                        // synthetic predefined function-name symbol per
+                        // configured spelling (`__func__`, `__FUNCTION__`) into
+                        // `here` — BEFORE the driver walks the children, so the
+                        // params bind AFTER it and a param named `__func__`
+                        // collides at its OWN bind (S_RedeclaredSymbol at the
+                        // param's span, "previously declared here" = the
+                        // function's name). Kind=Variable + isConst (SE4's
+                        // const check catches `__func__ = x` / `+=` →
+                        // S_ConstViolation); type = Array<narrow-string-core,
+                        // len+1> minted HERE (no CST declarator exists for
+                        // Pass 1.5 to resolve) with the element core from the
+                        // language's config-declared string-literal core (the
+                        // SAME source string literals type from — a language
+                        // with NO string-literal core configured skips the
+                        // bind, and a `__func__` use then fails loud as an
+                        // ordinary unresolved identifier, never a guessed
+                        // type). NO nodeToSymbol entry — the function's name
+                        // node keeps ITS binding; uses resolve via the normal
+                        // Pass-2 scope lookup. A prototype (Variable-kind,
+                        // no body) never reaches here: effectiveKind gates it.
+                        if (effectiveKind == DeclarationKind::Function
+                            && here.v != current.v
+                            && !cfg.predefinedFunctionNameIdentifiers.empty()) {
+                            TypeKind const fnNameCore =
+                                s.idx().stringLiteralElementCore;
+                            if (fnNameCore != TypeKind::Void) {
+                                auto& in = s.lattice.interner();
+                                TypeId const fnNameArrTy = in.array(
+                                    in.primitive(fnNameCore),
+                                    static_cast<std::int64_t>(name.size() + 1));
+                                for (std::string const& spelling :
+                                     cfg.predefinedFunctionNameIdentifiers) {
+                                    SymbolRecord frec;
+                                    frec.name         = spelling;
+                                    frec.scope        = here;
+                                    frec.declNode     = nameNode;
+                                    frec.declRuleNode = node;
+                                    frec.tree         = tree.id();
+                                    frec.kind         = DeclarationKind::Variable;
+                                    frec.type         = fnNameArrTy;
+                                    frec.isConst      = true;   // F1: SE4 catches writes
+                                    frec.isPredefinedFunctionName    = true;
+                                    frec.predefinedFunctionNameText  = name;
+                                    SymbolId const fid = s.symbols.mint(frec);
+                                    // The scope was pushed by THIS node — the
+                                    // only earlier binds are other spellings of
+                                    // this same loop; config duplicates are
+                                    // harmless (first bind wins).
+                                    (void)s.scopes.bind(here, spelling, fid);
+                                }
+                            }
                         }
                     }
                     // c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR: an ANONYMOUS field
