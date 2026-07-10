@@ -4703,6 +4703,58 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         readIndex("declaratorList", rule.declaratorListChild);
                         readIndex("declarator",     rule.declaratorChild);
 
+                        // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): the
+                        // initializer-inference opt-in. A boolean; when true
+                        // the declarator-mode consistency check below WAIVES
+                        // the `head` requirement (the type derives from the
+                        // sole declarator's initializer at Pass 1.5) and
+                        // REJECTS a co-present `head` (C_ConflictingField —
+                        // two competing type sources).
+                        if (entry.contains("inferTypeFromInitializer")) {
+                            json const& iv = entry.at("inferTypeFromInitializer");
+                            if (!iv.is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/inferTypeFromInitializer",
+                                          "'inferTypeFromInitializer' must be "
+                                          "a boolean");
+                            } else {
+                                rule.inferTypeFromInitializer = iv.get<bool>();
+                            }
+                        }
+
+                        // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): the
+                        // inference-marker presence gate — a token kind that
+                        // must appear in the declaration's specifier prefix
+                        // (C23 6.7.9p1's `auto`). The constMarker idiom:
+                        // loader-resolved from a token-kind NAME so the
+                        // engine never names a keyword. A bad token name is
+                        // C_UnknownToken and the ROW IS DROPPED (unlike the
+                        // marker fields, a missing gate would silently accept
+                        // C89 implicit-int shapes — fail loud at load).
+                        if (entry.contains("requiredSpecifierToken")) {
+                            if (!entry.at("requiredSpecifierToken").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/requiredSpecifierToken",
+                                          "'requiredSpecifierToken' must be a "
+                                          "token-kind name string");
+                                continue;
+                            }
+                            auto const rs = entry.at("requiredSpecifierToken")
+                                                .get<std::string>();
+                            if (!data.schemaTokens->contains(rs)) {
+                                coll.emit(DiagnosticCode::C_UnknownToken,
+                                          path + "/requiredSpecifierToken",
+                                          std::format(
+                                              "'declarations[{}]."
+                                              "requiredSpecifierToken' "
+                                              "references unknown token kind "
+                                              "'{}'", i, rs));
+                                continue;
+                            }
+                            rule.requiredSpecifierToken =
+                                data.schemaTokens->find(rs);
+                        }
+
                         // SE4: optional const-marker token. A bad token
                         // name is C_UnknownToken; the symbol is still
                         // minted (just never marked const).
@@ -5881,13 +5933,36 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                       "not both", i));
                                 modeOk = false;
                             }
-                            if (!rule.headChild.has_value()) {
+                            // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): an
+                            // `inferTypeFromInitializer` row derives its type
+                            // from the initializer — it has NO head by design,
+                            // so the head requirement is waived for it (and
+                            // ONLY for it: every other declarator-mode row
+                            // keeps the mandatory head, byte-identical). A row
+                            // that sets BOTH is contradictory — two competing
+                            // type sources — and is rejected, not resolved by
+                            // precedence (a silent winner would hide a config
+                            // authoring error).
+                            if (!rule.headChild.has_value()
+                                && !rule.inferTypeFromInitializer) {
                                 coll.emit(DiagnosticCode::C_MissingField,
                                           path + "/head",
                                           std::format("'declarations[{}]' is in "
                                                       "declarator mode but sets "
                                                       "no 'head' (the type-"
                                                       "specifier head index)", i));
+                                modeOk = false;
+                            }
+                            if (rule.headChild.has_value()
+                                && rule.inferTypeFromInitializer) {
+                                coll.emit(DiagnosticCode::C_ConflictingField,
+                                          path,
+                                          std::format(
+                                              "'declarations[{}]' sets both "
+                                              "'head' and "
+                                              "'inferTypeFromInitializer' — "
+                                              "a declaration's type comes from "
+                                              "one source, not both", i));
                                 modeOk = false;
                             }
                             if (rule.declaratorListChild.has_value()
@@ -5911,6 +5986,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 modeOk = false;
                             }
                             if (!modeOk) continue;   // drop the inconsistent row
+                        } else if (rule.inferTypeFromInitializer) {
+                            // FC17.5: the inference flag is a DECLARATOR-mode
+                            // capability (the initializer lives on an
+                            // init-declarator). On a legacy positional row it
+                            // would be silently inert — reject loud instead.
+                            coll.emit(DiagnosticCode::C_ConflictingField, path,
+                                      std::format(
+                                          "'declarations[{}]' sets "
+                                          "'inferTypeFromInitializer' without "
+                                          "declarator-mode fields — the "
+                                          "inference reads the declarator's "
+                                          "initializer", i));
+                            continue;   // drop the inconsistent row
                         }
 
                         cfg.declarations.push_back(std::move(rule));

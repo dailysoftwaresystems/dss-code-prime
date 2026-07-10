@@ -178,6 +178,14 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_InvalidScalarInitializer";
         case DiagnosticCode::S_PredefinedIdentifierNotAddressable:
             return "S_PredefinedIdentifierNotAddressable";
+        case DiagnosticCode::S_AutoRequiresSingleDeclarator:
+            return "S_AutoRequiresSingleDeclarator";
+        case DiagnosticCode::S_AutoRequiresPlainIdentifier:
+            return "S_AutoRequiresPlainIdentifier";
+        case DiagnosticCode::S_AutoRequiresInitializer:
+            return "S_AutoRequiresInitializer";
+        case DiagnosticCode::S_AutoInferenceInvalid:
+            return "S_AutoInferenceInvalid";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

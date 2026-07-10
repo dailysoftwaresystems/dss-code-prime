@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 96> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 100> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -418,6 +418,23 @@ constexpr std::array<DiagnosticCode, 96> kUnsuppressableCodes{{
     DiagnosticCode::S_ConstexprUnsupportedType,
     DiagnosticCode::S_ConstexprFunctionNotSupported,
     DiagnosticCode::S_ConstexprInvalidQualifier,
+    // S_Auto* (FC17.5, D-CSUBSET-AUTO-TYPE-INFERENCE, C23 6.7.9): the four
+    // initializer-inference constraint violations — multi-declarator, a
+    // derived (non-plain-identifier) declarator, a missing initializer, and
+    // an invalid inference (missing required `auto` specifier / void /
+    // nullptr_t / unresolvable-self-referential initializer). Suppressing ANY
+    // of them re-opens a SILENT-MISCOMPILE seam: the inference arm is the
+    // only tier that types these symbols at Pass 1.5, and Pass 2's decl arm
+    // BACKFILLS `rec.type = initializer-type` for any still-unresolved
+    // declarator-mode symbol — so a suppressed violation would silently
+    // adopt the initializer's type and compile the very form the constraint
+    // forbids (`static x = 5;` as implicit-int, `auto a = 1, b = 2;`
+    // per-declarator, a NullptrT-typed object headed for the 0xA014 MIR
+    // tripwire). Closed here so a rejected inference never compiles quietly.
+    DiagnosticCode::S_AutoRequiresSingleDeclarator,
+    DiagnosticCode::S_AutoRequiresPlainIdentifier,
+    DiagnosticCode::S_AutoRequiresInitializer,
+    DiagnosticCode::S_AutoInferenceInvalid,
     // S_UnknownAttribute / S_DeprecatedSymbolUsed / S_NodiscardResultDiscarded
     // (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13) are deliberately NOT
     // members — the same suppressible posture as S_UnknownTypeAttribute above.

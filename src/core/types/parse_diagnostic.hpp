@@ -679,6 +679,54 @@ enum class DiagnosticCode : std::uint16_t {
     // not model. A plain Error; the classifiers bail to an Error path either
     // way (NOT in the unsuppressable table — no silent-accept route).
     S_PredefinedIdentifierNotAddressable = 0xE040,
+    // C23 §6.7.9 (D-CSUBSET-AUTO-TYPE-INFERENCE): an initializer-inferred
+    // declaration (`auto x = expr;`) declares MORE THAN ONE declarator
+    // (`auto a = 1, b = 2;` — 6.7.9p2: "shall contain ... a single
+    // declarator"). The `.actual` names the declaration. UNSUPPRESSABLE —
+    // the inference arm is the ONLY tier that types these symbols at Pass
+    // 1.5; a suppressed violation would fall through to Pass 2's
+    // initializer-type backfill and silently adopt each initializer's type
+    // (the exact multi-declarator form the constraint forbids).
+    S_AutoRequiresSingleDeclarator = 0xE041,
+    // C23 §6.7.9 (D-CSUBSET-AUTO-TYPE-INFERENCE): an initializer-inferred
+    // declaration whose declarator is NOT a plain identifier — a pointer
+    // (`auto *p = …`), array (`auto a[] = …`), or function (`auto f(void);`)
+    // declarator (6.7.9p2: "the declarator shall be ... an identifier"; the
+    // derived-declarator forms are a WG14 v2-paper extension — the named
+    // deferral D-CSUBSET-AUTO-DERIVED-DECLARATOR). The `.actual` names the
+    // declarator. UNSUPPRESSABLE — same backfill seam as 0xE041: suppressed,
+    // the symbol would silently adopt the initializer's un-derived type.
+    S_AutoRequiresPlainIdentifier = 0xE042,
+    // C23 §6.7.9 (D-CSUBSET-AUTO-TYPE-INFERENCE): an initializer-inferred
+    // declaration with NO initializer (`auto x;` / `auto T;` — there is
+    // nothing to infer from; 6.7.9p2 requires the `= assignment-expression`
+    // form). The `.actual` names the declarator. UNSUPPRESSABLE — suppressed,
+    // the symbol would stay untyped and surface as a cascade H_TypeUnresolved
+    // with the REAL reason hidden (a confusing silent-failure REASON).
+    S_AutoRequiresInitializer = 0xE043,
+    // C23 §6.7.9 (D-CSUBSET-AUTO-TYPE-INFERENCE): the inference itself is
+    // INVALID — one code, distinct `.actual` messages (generic
+    // "initializer-inferred declaration ..." wording, never a keyword
+    // identity):
+    //   • the declaration's specifier prefix lacks the language's REQUIRED
+    //     inference specifier (`requiredSpecifierToken` — C23 6.7.9p1's
+    //     `auto`): `static x = 5;` / `register y = 2;` / `alignas(4) z = 9;`
+    //     / `[[maybe_unused]] w = 3;` all parse into the headless rule and
+    //     must STAY the errors they were (C89 implicit-int is not C23);
+    //   • the initializer's type is VOID (`auto v = voidFn();` — no object
+    //     type to declare);
+    //   • the initializer is the bare null-pointer keyword (`auto p =
+    //     nullptr;` — nullptr_t is a semantic-tier-only type that must never
+    //     reach MIR; folded into D-CSUBSET-NULLPTR-T-DECLARABLE);
+    //   • the initializer's type cannot be resolved at the declaration's own
+    //     Pass-1.5 visit (incl. the self-reference `auto x = x;` — the name
+    //     resolves to the symbol being declared, whose type is exactly what
+    //     is being inferred).
+    // UNSUPPRESSABLE — the C3 backfill seam: Pass 2's decl arm backfills
+    // `rec.type = initializer-type` for ANY unresolved declarator-mode
+    // symbol, so a suppressed rejection would silently compile the void/
+    // nullptr_t/self-referential form with a wrong or tripwire-tripping type.
+    S_AutoInferenceInvalid = 0xE044,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

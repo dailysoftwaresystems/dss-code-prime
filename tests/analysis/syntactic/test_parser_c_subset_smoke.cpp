@@ -1333,29 +1333,44 @@ TEST(ParserCSubsetSmoke, UnknownStarUnknownRollsBackToExpression) {
 }
 
 // C23 `auto x = 1;` type INFERENCE is NOT supported — `auto` is a
-// storage-class specifier only, so the head consumes `x` as the type
-// name and the missing declarator fails LOUD at the `=`:
-// P_NoAlternativeMatched, positioned. Layout:
-//   "int main() { auto x = 1; }"
-//    0123456789012345678901234
-// the `=` sits at offset 20. Pinned residue:
-// D-CSUBSET-C23-AUTO-INFERENCE (registry).
-TEST(ParserCSubsetSmoke, AutoInferenceFormIsALoudParseError) {
+// storage-class specifier only, so the head consumed `x` as the type name
+// and the missing declarator failed LOUD at the `=` (the
+// D-CSUBSET-C23-AUTO-INFERENCE residue). FC17.5
+// (D-CSUBSET-AUTO-TYPE-INFERENCE) — THE ANTICIPATED PIN FLIP: the C23
+// 6.7.9 inference feature landed the HEAD-LESS `autoInferredVarDecl` rule
+// (probed FIRST in declOrAttrStmt), so the form now PARSES into it. The
+// flip asserts the new truth: a clean parse whose CST carries the
+// inference rule (NOT varDecl — the statement must not have been absorbed
+// by some other reading).
+TEST(ParserCSubsetSmoke, AutoInferenceFormParsesIntoInferenceRule) {
     auto h = loadAndTokenize("int main() { auto x = 1; }");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto const result = std::move(p).parse();
     auto const& t = result.tree;
-    EXPECT_TRUE(t.diagnostics().hasErrors())
-        << "C23 auto-inference must fail LOUD (never silently mistype)";
-    bool sawPositionedMiss = false;
-    for (auto const& d : t.diagnostics().all()) {
-        if (d.code == DiagnosticCode::P_NoAlternativeMatched
-            && d.span.start() == 20u) {
-            sawPositionedMiss = true;
-        }
-    }
-    EXPECT_TRUE(sawPositionedMiss)
-        << "expected P_NoAlternativeMatched at the `=` (offset 20)";
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "C23 `auto x = 1;` must parse (D-CSUBSET-AUTO-TYPE-INFERENCE)";
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "autoInferredVarDecl"))
+        << "the statement must parse into the HEAD-LESS inference rule";
+    EXPECT_FALSE(hasInternalNodeWithRule(t, "varDecl"))
+        << "the C89-style varDecl reading must not have won (the head "
+           "would have consumed `x` as a type name)";
+}
+
+// The C89 companion: `auto int x;` (auto as a plain storage-class with a
+// real type head) still parses via varDecl — the inference rule fast-fails
+// on `int` (not a declarator) and the probe rolls back. RED if the
+// inference-first branch order ever swallows the C89 form.
+TEST(ParserCSubsetSmoke, AutoWithTypeHeadStaysVarDecl) {
+    auto h = loadAndTokenize("int main() { auto int x; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto const result = std::move(p).parse();
+    auto const& t = result.tree;
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "C89 `auto int x;` must keep parsing";
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "varDecl"))
+        << "the real-typed form must take the committed varDecl reading";
+    EXPECT_FALSE(hasInternalNodeWithRule(t, "autoInferredVarDecl"))
+        << "the inference rule must have rolled back on the `int` head";
 }
 
 // ── FC4 c1 stage 2b: the speculative-probe BUDGET guard ─────────────────

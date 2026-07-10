@@ -368,6 +368,31 @@ struct DSS_EXPORT DeclarationRule {
     // it). `nullopt` for non-function declarations.
     std::optional<std::uint32_t> paramsChild;
     std::optional<std::uint32_t> bodyChild;
+    // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE, C23 6.7.9): when true, this
+    // declarator-mode row has NO type-specifier head — the declared type is
+    // INFERRED from the sole declarator's initializer at Pass 1.5 (the
+    // definitive resolveDeclTypes visit, so the inferred type is visible to
+    // later same-pass consumers like sizeof-in-array-dims). A generic opt-in
+    // engine capability ("the type derives from the initializer"): the loader
+    // relaxes the declarator-mode `head` requirement for rows carrying it and
+    // rejects a row that sets BOTH (C_ConflictingField — the two type sources
+    // would compete). The inference itself is the config-driven Pass-1.5 arm
+    // (single plain named declarator, initializer required, array/function
+    // decay, loud rejects for uninferable initializers). Default false — every
+    // pre-existing row keeps the mandatory head, byte-identical.
+    bool inferTypeFromInitializer = false;
+    // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): a token kind that MUST appear in
+    // this declaration's specifier prefix for the row to be semantically valid
+    // — the inference-marker presence gate (C23 6.7.9p1: type inference
+    // happens only under the `auto` storage-class specifier). WITHOUT this
+    // gate a headless row would silently accept C89 implicit-int shapes
+    // (`static x = 5;` / `register y = 2;` parse structurally identical to an
+    // inference declaration). Checked FIRST in the Pass-1.5 inference arm;
+    // absent token ⇒ loud error, never a silently-adopted initializer type.
+    // Loader-resolved from a token-kind NAME (the constMarker idiom — the
+    // engine never names a keyword). `nullopt` ⇒ no presence gate (a language
+    // whose inference form is structurally unambiguous).
+    std::optional<SchemaTokenId> requiredSpecifierToken;
     // SE4 const-correctness: a token kind that, when found anywhere in the
     // `typeChild` subtree (or the whole declaration subtree when no
     // `typeChild` is set), marks the minted symbol const. `nullopt` ⇒ the

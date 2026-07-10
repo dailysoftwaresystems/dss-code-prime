@@ -7848,3 +7848,401 @@ TEST(SemanticAnalyzerCSubset, UnknownBareStatementAttrWarnsSuppressibly) {
     EXPECT_FALSE(model.hasErrors());
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownAttribute), 1u);
 }
+
+// ── FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): C23 6.7.9 `auto` type inference ──
+//
+// The feature: `auto x = expr;` — a HEAD-LESS declaration whose type is
+// INFERRED from the initializer at the declaration's own Pass-1.5 visit.
+// The block pins the three design-audit CRITICALs: ★C1 the auto-presence
+// gate (C89 implicit-int shapes stay errors), ★C2 the branch order (the
+// >4096-token committed-replay pin below), ★C3 the full inference
+// normalization (decay / loud rejects / stripVolatile / Pass-1.5 stamps).
+
+namespace {
+// Find the FIRST symbol spelled `name`, or nullptr.
+[[nodiscard]] SymbolRecord const*
+findSymbolNamed(SemanticModel const& model, std::string_view name) {
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == name) return &model.symbols()[i];
+    }
+    return nullptr;
+}
+} // namespace
+
+// THE Pass-1.5-VISIBILITY pin (★C3): the inferred type must be written at
+// the declaration's OWN Pass-1.5 visit, not backfilled from the initializer
+// at Pass 2. The discriminator is a FOLLOWING `typeof(x) y;` declaration:
+// typeof's expression operand resolves at y's own Pass-1.5 visit by reading
+// x's SYMBOL TYPE (subtreeType's scope-lookup leaf), and y carries NO
+// initializer, so the Pass-2 backfill can never type it. Under a
+// backfill-only implementation x is untyped when y resolves → y stays
+// untyped → the y->type assert reds. RED-ON-ARM-DISABLE verified.
+// (The `int arr[sizeof(x)]` form of this pin lives in the RUNNABLE example
+// `auto_type_inference` — the raw-analyze fixture has a PRE-EXISTING
+// sizeof-of-LOCAL-in-array-dim limitation pinned by the
+// `sizeof_value_in_array_dim` corpus golden [S_NonConstantArrayLength even
+// for `const int x = 7;`], which the full CLI pipeline does not share; the
+// example compiles + runs 42 through the real driver on debug AND release.)
+TEST(SemanticAnalyzerCSubset, AutoInfersIntPass15Visible) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    auto x = 42;\n"
+        "    typeof(x) y;\n"
+        "    y = 1;\n"
+        "    return y + x;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "the inferred type must be Pass-1.5-visible (typeof(x) in the "
+           "next declaration)";
+    auto const* x = findSymbolNamed(model, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->type.valid());
+    EXPECT_EQ(model.lattice().interner().kind(x->type), TypeKind::I32);
+    auto const* y = findSymbolNamed(model, "y");
+    ASSERT_NE(y, nullptr);
+    ASSERT_TRUE(y->type.valid())
+        << "typeof(x) at the NEXT declaration's Pass-1.5 visit must see the "
+           "inferred type (y has no initializer — the backfill cannot type it)";
+    EXPECT_EQ(model.lattice().interner().kind(y->type), TypeKind::I32);
+}
+
+// ★C1 — the auto-presence gate: all four specifier-led C89 implicit-int
+// shapes PARSE into the headless rule and MUST stay errors
+// (S_AutoInferenceInvalid, one per declaration). RED-ON-DISABLE: drop the
+// row's requiredSpecifierToken (or the arm's gate) and each silently
+// becomes an initializer-typed declaration.
+TEST(SemanticAnalyzerCSubset, AutoPresenceGateKeepsImplicitIntErrors) {
+    char const* const forms[] = {
+        "int main(void) { static x = 5; return x; }\n",
+        "int main(void) { register y = 2; return y; }\n",
+        "int main(void) { alignas(4) z = 9; return z; }\n",
+        "int main(void) { [[maybe_unused]] w = 3; return w; }\n",
+    };
+    for (auto const* src : forms) {
+        auto model = analyzeShipped("c-subset", {std::string{src}});
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_AutoInferenceInvalid), 1u)
+            << "C89 implicit-int must stay an error for: " << src;
+    }
+}
+
+// ★C3 decay — a string-literal initializer infers char* (NOT Array<Char,4>):
+// the un-decayed array would give sizeof(s)==4 and a wrong-typed object.
+TEST(SemanticAnalyzerCSubset, AutoStringLiteralDecaysToCharPointer) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { auto s = \"str\"; return s[0] == 's' ? 0 : 1; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* s = findSymbolNamed(model, "s");
+    ASSERT_NE(s, nullptr);
+    ASSERT_TRUE(s->type.valid());
+    auto const& in = model.lattice().interner();
+    ASSERT_EQ(in.kind(s->type), TypeKind::Ptr) << "array-to-pointer decay";
+    EXPECT_EQ(in.kind(in.operands(s->type)[0]), TypeKind::Char);
+}
+
+// ★C3 decay — an array VARIABLE initializer decays to pointer-to-element.
+TEST(SemanticAnalyzerCSubset, AutoArrayVariableDecaysToElementPointer) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    int a[3];\n"
+        "    a[1] = 7;\n"
+        "    auto p = a;\n"
+        "    return p[1];\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* p = findSymbolNamed(model, "p");
+    ASSERT_NE(p, nullptr);
+    ASSERT_TRUE(p->type.valid());
+    auto const& in = model.lattice().interner();
+    ASSERT_EQ(in.kind(p->type), TypeKind::Ptr);
+    EXPECT_EQ(in.kind(in.operands(p->type)[0]), TypeKind::I32);
+}
+
+// ★C3 decay — a function-name initializer decays to pointer-to-function
+// (the c56 fn-designator precedent), and the object is callable.
+TEST(SemanticAnalyzerCSubset, AutoFunctionNameDecaysToFunctionPointer) {
+    auto model = analyzeShipped("c-subset", {
+        "static int twice(int v) { return v + v; }\n"
+        "int main(void) { auto f = twice; return f(21); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* f = findSymbolNamed(model, "f");
+    ASSERT_NE(f, nullptr);
+    ASSERT_TRUE(f->type.valid());
+    auto const& in = model.lattice().interner();
+    ASSERT_EQ(in.kind(f->type), TypeKind::Ptr) << "function-to-pointer decay";
+    EXPECT_EQ(in.kind(in.operands(f->type)[0]), TypeKind::FnSig);
+}
+
+// C23 6.7.9p2 — exactly ONE declarator.
+TEST(SemanticAnalyzerCSubset, AutoMultiDeclaratorRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { auto a = 1, b = 2; return a + b; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AutoRequiresSingleDeclarator), 1u);
+}
+
+// C23 6.7.9p2 — a PLAIN IDENTIFIER declarator. `auto *p = 0;` (a derived
+// declarator — D-CSUBSET-AUTO-DERIVED-DECLARATOR) and the diagnostic-SHAPE
+// pin `auto f(void);` (parses into the headless rule; must be THIS code,
+// never a silent prototype) both reject S_AutoRequiresPlainIdentifier.
+TEST(SemanticAnalyzerCSubset, AutoDerivedDeclaratorRejected) {
+    auto ptrModel = analyzeShipped("c-subset", {
+        "int main(void) { auto *p = 0; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(ptrModel.diagnostics(),
+                        DiagnosticCode::S_AutoRequiresPlainIdentifier), 1u);
+    auto fnModel = analyzeShipped("c-subset", {
+        "int main(void) { auto f(void); return 0; }\n",
+    });
+    EXPECT_EQ(countCode(fnModel.diagnostics(),
+                        DiagnosticCode::S_AutoRequiresPlainIdentifier), 1u);
+}
+
+// C23 6.7.9p2 — an initializer is REQUIRED. `auto T;` is the second
+// diagnostic-SHAPE pin (the one dual-parse shape `<specifiers> Ident ;`
+// must surface as THIS inference-tier code).
+TEST(SemanticAnalyzerCSubset, AutoMissingInitializerRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { auto T; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AutoRequiresInitializer), 1u);
+}
+
+// ★C3 rejects — void call / bare nullptr / self-reference each fail loud
+// S_AutoInferenceInvalid (RED-ON-DISABLE: without the arm's rejects, Pass
+// 2's initializer backfill silently adopts Void / NullptrT / nothing).
+TEST(SemanticAnalyzerCSubset, AutoUninferableInitializersRejected) {
+    auto voidModel = analyzeShipped("c-subset", {
+        "void vf(void) { }\n"
+        "int main(void) { auto v = vf(); return 0; }\n",
+    });
+    EXPECT_EQ(countCode(voidModel.diagnostics(),
+                        DiagnosticCode::S_AutoInferenceInvalid), 1u)
+        << "auto from a void call must reject";
+    auto nullModel = analyzeShipped("c-subset", {
+        "int main(void) { auto p = nullptr; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(nullModel.diagnostics(),
+                        DiagnosticCode::S_AutoInferenceInvalid), 1u)
+        << "auto from bare nullptr must reject (nullptr_t not declarable)";
+    auto selfModel = analyzeShipped("c-subset", {
+        "int main(void) { auto x = x; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(selfModel.diagnostics(),
+                        DiagnosticCode::S_AutoInferenceInvalid), 1u)
+        << "self-referential initializer must reject loud";
+}
+
+// C23 6.7.9p2 via 6.7.10p12 — the braced SINGLE form infers; the empty and
+// multi-element forms reject via the shared scalar-brace constraint code.
+TEST(SemanticAnalyzerCSubset, AutoBracedSingleInfersAndMalformedRejects) {
+    auto okModel = analyzeShipped("c-subset", {
+        "int main(void) { auto x = {5}; return x - 5; }\n",
+    });
+    EXPECT_FALSE(okModel.hasErrors());
+    auto const* x = findSymbolNamed(okModel, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->type.valid());
+    EXPECT_EQ(okModel.lattice().interner().kind(x->type), TypeKind::I32);
+    auto multiModel = analyzeShipped("c-subset", {
+        "int main(void) { auto y = {1, 2}; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(multiModel.diagnostics(),
+                        DiagnosticCode::S_InvalidScalarInitializer), 1u);
+    auto emptyModel = analyzeShipped("c-subset", {
+        "int main(void) { auto z = {}; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(emptyModel.diagnostics(),
+                        DiagnosticCode::S_InvalidScalarInitializer), 1u)
+        << "`auto z = {};` has no expression to infer from";
+}
+
+// The C89 REGRESSION pin: `auto int x;` (auto as a plain storage-class with
+// a real type head) must keep parsing via varDecl on rollback — the
+// inference rule fast-fails on the `int` and the committed path types x int.
+TEST(SemanticAnalyzerCSubset, AutoC89StorageClassFormUnchanged) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { auto int x; x = 42; return x; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* x = findSymbolNamed(model, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->type.valid());
+    EXPECT_EQ(model.lattice().interner().kind(x->type), TypeKind::I32);
+}
+
+// ★C3 stripVolatile — a volatile-typed initializer infers the UNQUALIFIED
+// type (C23 6.7.9p2 drops top-level qualifiers; the typeof_unqual strip).
+TEST(SemanticAnalyzerCSubset, AutoTopLevelVolatileStripped) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    volatile int v;\n"
+        "    v = 1;\n"
+        "    auto x = v;\n"
+        "    x = 2;\n"
+        "    return x + v;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* x = findSymbolNamed(model, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->type.valid());
+    EXPECT_EQ(model.lattice().interner().kind(x->type), TypeKind::I32)
+        << "the inferred type must be the STRIPPED I32, not VolatileQual(I32)";
+}
+
+// constexpr composes with the inference (P1 prefix scan -> P1.5 infer ->
+// P2 constexpr validation reads the INFERRED type): the object folds as an
+// integer constant expression and carries both Pass-1 marks.
+TEST(SemanticAnalyzerCSubset, AutoConstexprComposes) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { constexpr auto k = 6; int a[k]; a[0] = 1; "
+        "return a[0]; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* k = findSymbolNamed(model, "k");
+    ASSERT_NE(k, nullptr);
+    EXPECT_TRUE(k->isConstexpr);
+    EXPECT_TRUE(k->isConst);
+    auto const* a = findSymbolNamed(model, "a");
+    ASSERT_NE(a, nullptr);
+    ASSERT_TRUE(a->type.valid());
+    auto const& in = model.lattice().interner();
+    ASSERT_EQ(in.kind(a->type), TypeKind::Array);
+    EXPECT_EQ(in.scalars(a->type)[0], 6);
+}
+
+// ★C2 — THE BRANCH-ORDER pin: a >4096-token block-scope `static const int
+// big[] = {…}` must still compile. With autoInferredVarDecl declared FIRST,
+// varDecl is the declared-LAST structural candidate for a specifier-led
+// statement, so when every speculative probe fails (autoInferred fast-fails
+// at `const`; varDecl exhausts the 4096-token probe budget on the huge
+// initializer) the parser's all-fail REPLAY re-parses varDecl
+// NON-speculatively with no budget — a genuine committed parse.
+// RED-ON-REORDER (empirically verified at implement time): with
+// [varDecl, autoInferredVarDecl, …] the replay target is the inference rule,
+// which cannot parse `const` → P0009. sqlite3.c's largest block-scope static
+// init is 3918 tokens = 96% of the budget, so the sqlite gate can NOT catch
+// this cliff — only this pin does.
+TEST(SemanticAnalyzerCSubset, AutoHugeStaticInitParsesViaCommittedReplay) {
+    std::string src = "int main(void) {\n    static const int big[] = {";
+    for (int i = 0; i < 2200; ++i) {          // ~4400 tokens inside the braces
+        if (i > 0) src += ',';
+        src += std::to_string(i % 97);
+    }
+    src += "};\n    return big[3];\n}\n";
+    auto model = analyzeShipped("c-subset", {src});
+    EXPECT_FALSE(model.hasErrors())
+        << "a >4096-token static initializer must parse via the committed "
+           "replay of the declared-LAST varDecl branch";
+    auto const* big = findSymbolNamed(model, "big");
+    ASSERT_NE(big, nullptr);
+    ASSERT_TRUE(big->type.valid());
+    auto const& in = model.lattice().interner();
+    ASSERT_EQ(in.kind(big->type), TypeKind::Array);
+    EXPECT_EQ(in.scalars(big->type)[0], 2200);
+}
+
+// The for-init mirror: `for (auto i = 0; …)` infers (C23 6.8.5p3 admits
+// auto in a for-init) and `for (static auto i = 0;;)` stays gated loud
+// (the copied forDecl StaticKeyword gatedMarker — C 6.8.5p3 violation).
+TEST(SemanticAnalyzerCSubset, AutoForInitInfersAndStaticStaysGated) {
+    auto okModel = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    int acc = 0;\n"
+        "    for (auto i = 0; i < 7; i = i + 1) acc = acc + i;\n"
+        "    return acc;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(okModel.hasErrors());
+    auto const* i = findSymbolNamed(okModel, "i");
+    ASSERT_NE(i, nullptr);
+    ASSERT_TRUE(i->type.valid());
+    EXPECT_EQ(okModel.lattice().interner().kind(i->type), TypeKind::I32);
+    auto gatedModel = analyzeShipped("c-subset", {
+        "int main(void) { for (static auto i = 0; i < 3; i = i + 1) { } "
+        "return 0; }\n",
+    });
+    EXPECT_EQ(countCode(gatedModel.diagnostics(),
+                        DiagnosticCode::S_StaticStorageInForInit), 1u);
+}
+
+// The two NAMED loud parse boundaries stay loud (never silent):
+// file-scope `auto g = 42;` (C23 ALLOWS it — D-CSUBSET-AUTO-FILE-SCOPE is
+// the named deferral; DSS keeps the pre-existing loud parse reject) and the
+// qualified forms `const auto` / `auto const` (D-CSUBSET-AUTO-QUALIFIED).
+TEST(SemanticAnalyzerCSubset, AutoFileScopeAndQualifiedStayLoudParseErrors) {
+    char const* const rejects[] = {
+        "auto g = 42;\nint main(void) { return g; }\n",
+        "int main(void) { const auto x = 5; return x; }\n",
+        "int main(void) { auto const x = 5; return x; }\n",
+    };
+    for (auto const* src : rejects) {
+        auto cu = buildShippedUnit("c-subset", {std::string{src}});
+        bool anyParseError = false;
+        for (auto const& t : cu->trees()) {
+            for (auto const& d : t.diagnostics().all()) {
+                if (d.severity == DiagnosticSeverity::Error) {
+                    anyParseError = true;
+                }
+            }
+        }
+        EXPECT_TRUE(anyParseError)
+            << "must stay a loud parse error (named deferral): " << src;
+    }
+}
+
+// Positive inference-KIND breadth (code-audit fold): the inferred type is
+// pinned EXACTLY for each non-decaying initializer class the arm passes
+// through unchanged — a struct variable (aggregates infer by value, no
+// decay), an enumerator (the enum TYPE, not its underlying int), a
+// comparison (Bool — promoteComparisons), a char variable (Char, not the
+// promoted int), and an unsuffixed float literal (F64 per C 6.4.4.2). All
+// in ONE unit so the block also witnesses the inferred objects USED
+// together (member access through the inferred struct, arithmetic across
+// the rest).
+TEST(SemanticAnalyzerCSubset, AutoInfersExactKindsAcrossValueClasses) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int x; };\n"
+        "enum E { A };\n"
+        "int main(void) {\n"
+        "    struct S sv;\n"
+        "    sv.x = 1;\n"
+        "    auto s2 = sv;\n"
+        "    auto e = A;\n"
+        "    auto b = (1 < 2);\n"
+        "    char cv = 'a';\n"
+        "    auto c = cv;\n"
+        "    auto f = 2.5;\n"
+        "    return s2.x + e + b + c + (int)f;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const& in = model.lattice().interner();
+    auto const kindOf = [&](char const* name) -> TypeKind {
+        auto const* rec = findSymbolNamed(model, name);
+        if (rec == nullptr || !rec->type.valid()) {
+            ADD_FAILURE() << "symbol '" << name << "' missing or untyped";
+            return TypeKind::Void;
+        }
+        return in.kind(rec->type);
+    };
+    EXPECT_EQ(kindOf("s2"), TypeKind::Struct)
+        << "a struct variable infers the struct type BY VALUE (no decay)";
+    EXPECT_EQ(kindOf("e"), TypeKind::Enum)
+        << "an enumerator infers the ENUM type (enumConvertsToArith covers "
+           "its uses; the type itself stays Enum)";
+    EXPECT_EQ(kindOf("b"), TypeKind::Bool)
+        << "a comparison infers Bool (promoteComparisons)";
+    EXPECT_EQ(kindOf("c"), TypeKind::Char)
+        << "a char VARIABLE infers Char (the symbol's type, not the "
+           "promoted int)";
+    EXPECT_EQ(kindOf("f"), TypeKind::F64)
+        << "an unsuffixed float literal infers double (C 6.4.4.2)";
+}

@@ -592,6 +592,13 @@ void gatherArgExpressions(Tree const& tree, NodeId argsNode,
                           std::vector<NodeId>& out);
 [[nodiscard]] TypeId subtreeType(EngineState const& s, Tree const& tree,
                                  NodeId node, ScopeId scope = {});
+// FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): the ONE literal-typing chokepoint
+// (extracted from pass2Post — defined alongside it below), forward-declared so
+// the Pass-1.5 inference arm can PRE-STAMP an initializer's literal leaves
+// before `subtreeType` reads them (subtreeType types identifier leaves by
+// scope lookup but literal leaves only via the typeAt stamps Pass 2 writes).
+void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
+                      Tree const& tree, NodeId node);
 // Core operator NAME → HirOpKind (reverse of opName()); std::nullopt if the
 // `target` string is a special tag (AddressOf/…), not a core op. Defined below;
 // forward-declared so pass2Post's nullptr operator gate (D-CSUBSET-NULLPTR) can
@@ -4209,6 +4216,322 @@ completeIncompleteArrayFromInit(EngineState& s, SchemaIndexes const& idx,
     return failUnsized();   // no string/brace initializer found — fail loud, no hang
 }
 
+// ── FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE, C23 6.7.9): the Pass-1.5
+//    initializer-inference arm ────────────────────────────────────────────────
+// Computes the INFERRED declared type for an `inferTypeFromInitializer`
+// declaration row (`auto x = expr;`) at the row's own DEFINITIVE Pass-1.5
+// visit — so the inferred type is visible to later same-pass consumers
+// (`auto x = 42; int arr[sizeof(x)];` dimensions at Pass 1.5; the Pass-2
+// initializer BACKFILL alone would false-fail S_NonConstantArrayLength — the
+// red-on-disable visibility pin). Returns the inferred type on success — the
+// caller then runs the ORDINARY declarator fold with it as the head type, so
+// every standard per-declarator behavior (symbol/type write + nodeToType
+// stamps, alignas, attribute facts, incomplete-object check) rides the proven
+// path unchanged. Returns InvalidType after emitting the specific
+// UNSUPPRESSABLE diagnostic on every reject — the caller must then SKIP the
+// fold (no type is written; the unsuppressable posture is load-bearing
+// because Pass 2's decl arm backfills `rec.type = initializer-type` for any
+// still-unresolved declarator-mode symbol, so a suppressed reject would
+// silently adopt the initializer's type).
+//
+// The gate/normalization ladder (the design-audit's ★C1 + ★C3, in order):
+//   1. ★C1 the specifier PRESENCE gate (`decl.requiredSpecifierToken`, C23
+//      6.7.9p1's `auto`) — checked FIRST: `static x = 5;` / `register y = 2;`
+//      / `alignas(4) z = 9;` / `[[maybe_unused]] w = 3;` all PARSE into the
+//      headless rule and must stay errors (C89 implicit-int is not C23);
+//   2. exactly ONE declarator (6.7.9p2) — S_AutoRequiresSingleDeclarator;
+//   3. a PLAIN IDENTIFIER declarator (no pointer/array/function/group
+//      structure; the derived forms are the WG14 v2-paper extension —
+//      D-CSUBSET-AUTO-DERIVED-DECLARATOR) — S_AutoRequiresPlainIdentifier;
+//   4. an initializer present — S_AutoRequiresInitializer;
+//   5. the C23 braced SINGLE non-designated scalar form `auto x = {5};`
+//      unwraps; `{}` / `{1,2}` / `{.x=1}` / `{{5}}` reject via the shared
+//      S_InvalidScalarInitializer (0xE03F; even suppressed, the symbol stays
+//      untyped → H_TypeUnresolved, never a silent accept);
+//   6. PRE-STAMP the initializer's literal leaves through the shared
+//      `typeLiteralIfAny` chokepoint (see its comment — at Pass 1.5 the
+//      Pass-2 blanket stamps don't exist yet), then `subtreeType`;
+//   7. ★C3 normalize: Array→Ptr<element> + FnSig→Ptr<FnSig> DECAY (C
+//      6.3.2.1p3/p4 — `auto s = "str"` is char*, `auto f = fn` is a function
+//      pointer); REJECT LOUD Void (no object type) / NullptrT (semantic-tier
+//      -only — D-CSUBSET-NULLPTR-T-DECLARABLE) / invalid (incl. the
+//      self-reference `auto x = x;`, whose name resolves to the symbol being
+//      declared) — S_AutoInferenceInvalid; then stripVolatile (C23 6.7.9p2
+//      drops top-level qualifiers; const never rides the type here — the row
+//      declares no constMarker, see its $comment).
+[[nodiscard]] TypeId
+resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
+                               Tree const& tree, NodeId node,
+                               DeclarationRule const& decl,
+                               std::vector<NodeId> const& kids, ScopeId here) {
+    auto const emit = [&](DiagnosticCode code, NodeId at, std::string what) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(at.valid() ? at : node);
+        d.actual   = std::move(what);
+        s.reporter.report(std::move(d));
+    };
+    auto const snippet = [&](NodeId at) {
+        return std::string{tree.text(at.valid() ? at : node)};
+    };
+
+    // (1) ★C1 — the required-specifier presence gate. A bounded descendant
+    // scan over the STRIPPED specifier prefix (the specifierPrefixHasConstexpr
+    // idiom; the token kind comes from the ROW, never a hardcoded keyword).
+    // The prefix is the only place the specifier can parse, so prefix-scoped
+    // matching is exact — an initializer cannot contain the keyword.
+    if (decl.requiredSpecifierToken.has_value()) {
+        bool found = false;
+        NodeId const prefix = specifierPrefixChild(tree, node, decl);
+        if (prefix.valid()) {
+            std::vector<NodeId> stack{prefix};
+            for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+                NodeId c = stack.back(); stack.pop_back();
+                if (tree.kind(c) == NodeKind::Internal) {
+                    for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+                    continue;
+                }
+                if (tree.tokenKind(c).v == decl.requiredSpecifierToken->v) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            emit(DiagnosticCode::S_AutoInferenceInvalid, node,
+                 "initializer-inferred declaration requires the language's "
+                 "type-inference specifier in its declaration specifiers "
+                 "(a declaration with no type specifier is not implicit-int): "
+                     + snippet(node));
+            return InvalidType;
+        }
+    }
+    if (!cfg.declarators.has_value()) return InvalidType;   // loader invariant
+    DeclaratorConfig const& dc = *cfg.declarators;
+
+    // (2) exactly ONE declarator (C23 6.7.9p2).
+    auto const carrierIdx = decl.declaratorListChild.has_value()
+                                ? decl.declaratorListChild
+                                : decl.declaratorChild;
+    std::vector<NodeId> declarators;
+    if (carrierIdx.has_value() && *carrierIdx < kids.size()) {
+        collectDeclarators(tree, kids[*carrierIdx], dc, declarators);
+    }
+    if (declarators.size() != 1) {
+        emit(DiagnosticCode::S_AutoRequiresSingleDeclarator,
+             declarators.size() > 1 ? declarators[1] : node,
+             "initializer-inferred declaration declares "
+                 + std::to_string(declarators.size())
+                 + " declarators — exactly one is required (C23 6.7.9p2)");
+        return InvalidType;
+    }
+    NodeId const dNode = declarators[0];
+
+    // (3) a PLAIN IDENTIFIER declarator: the (init)declarator's inner
+    // `declarator` must carry NO pointerLayer, and its `directDeclarator`
+    // must be a bare name token — no fnSuffix / arrayDeclSuffix /
+    // parenDeclarator (all Internal children). Structure per the config
+    // roles only, never rule-name identities.
+    NodeId const declNode =
+        (tree.kind(dNode) == NodeKind::Internal
+         && tree.rule(dNode) == dc.declaratorRule)
+            ? dNode
+            : declarator_walk_detail::firstChildOfRule(
+                  TreeDeclaratorView{tree}, dNode, dc.declaratorRule);
+    bool plain = declNode.valid();
+    NodeId direct{};
+    if (plain) {
+        for (NodeId c : visibleChildren(tree, declNode)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            if (tree.rule(c) == dc.directRule && !direct.valid()) {
+                direct = c;
+                continue;
+            }
+            plain = false;   // a pointerLayer (or any non-direct structure)
+            break;
+        }
+        if (!direct.valid()) plain = false;
+    }
+    if (plain) {
+        bool haveName = false;
+        for (NodeId c : visibleChildren(tree, direct)) {
+            if (tree.kind(c) == NodeKind::Internal) {
+                plain = false;   // fnSuffix / arrayDeclSuffix / parenDeclarator
+                break;
+            }
+            if (tree.tokenKind(c) == dc.nameToken) haveName = true;
+        }
+        plain = plain && haveName;
+    }
+    if (!plain) {
+        emit(DiagnosticCode::S_AutoRequiresPlainIdentifier, dNode,
+             "initializer-inferred declaration requires a plain identifier "
+             "declarator (pointer/array/function declarators are the "
+             "derived-declarator extension): " + snippet(dNode));
+        return InvalidType;
+    }
+
+    // (4) an initializer present — the init subtree is the Internal child of
+    // the init-declarator that is NOT the declarator (the Pass-2 loop's own
+    // discovery idiom, `[declarator, '=', initValue]`).
+    NodeId initNode{};
+    if (tree.rule(dNode) == dc.initDeclaratorRule) {
+        for (NodeId c : visibleChildren(tree, dNode)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            if (tree.rule(c) == dc.declaratorRule) continue;
+            initNode = c;
+            break;
+        }
+    }
+    if (!initNode.valid()) {
+        emit(DiagnosticCode::S_AutoRequiresInitializer, dNode,
+             "initializer-inferred declaration requires an initializer "
+             "(there is no type to infer from): " + snippet(dNode));
+        return InvalidType;
+    }
+
+    // (5) the C23 braced SINGLE non-designated scalar form (`auto x = {5};`,
+    // 6.7.9p2 via 6.7.10p12). Bounded single-Internal-child descent to a
+    // braceInitList (the validateConstexprDeclarator F3 pattern); inside it,
+    // exactly ONE initElement whose sole Internal child is the value (≥2 ⇒ a
+    // designated form) and whose value is not itself a nested brace list.
+    NodeId valueNode = initNode;
+    if (s.idx().braceInitListRule.valid()) {
+        auto const descendToBrace = [&](NodeId from) -> NodeId {
+            NodeId walk = from;
+            for (int guard = 0; guard < 64 && walk.valid(); ++guard) {
+                if (tree.kind(walk) != NodeKind::Internal) return NodeId{};
+                if (tree.rule(walk).v == s.idx().braceInitListRule.v)
+                    return walk;
+                NodeId sole{};
+                bool   multiple = false;
+                for (NodeId c : visibleChildren(tree, walk)) {
+                    if (tree.kind(c) != NodeKind::Internal) continue;
+                    if (sole.valid()) { multiple = true; break; }
+                    sole = c;
+                }
+                if (multiple || !sole.valid()) return NodeId{};
+                walk = sole;
+            }
+            return NodeId{};
+        };
+        if (NodeId const brace = descendToBrace(initNode); brace.valid()) {
+            std::vector<NodeId> elems;
+            for (NodeId c : visibleChildren(tree, brace)) {
+                if (tree.kind(c) != NodeKind::Internal) continue;
+                if (!s.idx().initElementRule.valid()
+                    || tree.rule(c).v == s.idx().initElementRule.v) {
+                    elems.push_back(c);
+                }
+            }
+            NodeId inner{};
+            bool   braceOk = elems.size() == 1;
+            if (braceOk) {
+                int internals = 0;
+                for (NodeId c : visibleChildren(tree, elems[0])) {
+                    if (tree.kind(c) != NodeKind::Internal) continue;
+                    ++internals;
+                    inner = c;
+                }
+                braceOk = internals == 1;   // ≥2 ⇒ designator(s) + value
+            }
+            if (braceOk && descendToBrace(inner).valid()) {
+                braceOk = false;   // nested `{{5}}` — not a single expression
+            }
+            if (!braceOk) {
+                // The shared scalar-brace constraint code (0xE03F). Even
+                // suppressed there is no silent accept: the arm returns
+                // InvalidType, the symbol stays untyped (the Pass-2 backfill
+                // cannot type a multi-element brace list), and HIR fails loud
+                // H_TypeUnresolved.
+                emit(DiagnosticCode::S_InvalidScalarInitializer, brace,
+                     "initializer-inferred declaration takes exactly ONE "
+                     "non-designated, non-nested braced expression "
+                     "(C23 6.7.10p12): " + snippet(brace));
+                return InvalidType;
+            }
+            valueNode = inner;
+        }
+    }
+
+    // (6) PRE-STAMP the initializer subtree's literal leaves (bounded walk
+    // through the ONE shared literal-typing chokepoint — see typeLiteralIfAny;
+    // idempotent, and identical to what the Pass-2 blanket walk will stamp).
+    // A subtree beyond the guard leaves some literals unstamped → the
+    // inference below fails LOUD (never a silently-wrong type).
+    {
+        std::vector<NodeId> stack{valueNode};
+        for (int guard = 0; guard < 65536 && !stack.empty(); ++guard) {
+            NodeId c = stack.back(); stack.pop_back();
+            if (s.typeAt(c).valid()) continue;   // already stamped
+            typeLiteralIfAny(s, cfg, tree, c);
+            if (tree.kind(c) != NodeKind::Internal) continue;
+            // A rule-node stamp (the adjacent-string form) closes the subtree
+            // — mirror subtreeType's typeAt short-circuit, don't descend.
+            if (s.typeAt(c).valid()) continue;
+            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+        }
+    }
+    TypeId inferred = subtreeType(s, tree, valueNode, here);
+
+    // (7) ★C3 — normalize.
+    TypeInterner& in = s.lattice.interner();
+    if (!inferred.valid()) {
+        emit(DiagnosticCode::S_AutoInferenceInvalid, initNode,
+             "initializer-inferred declaration: the initializer's type "
+             "cannot be resolved at the declaration itself (a "
+             "self-referential or unresolvable initializer): "
+                 + snippet(initNode));
+        return InvalidType;
+    }
+    switch (in.kind(inferred)) {
+        case TypeKind::Void:
+            emit(DiagnosticCode::S_AutoInferenceInvalid, initNode,
+                 "initializer-inferred declaration: the initializer has "
+                 "void type — there is no object type to declare: "
+                     + snippet(initNode));
+            return InvalidType;
+        case TypeKind::NullptrT:
+            // The predefined null-pointer constant's type is semantic-tier
+            // -only (it must never reach MIR — the 0xA014 tripwire); an
+            // object OF that type is the named deferral
+            // D-CSUBSET-NULLPTR-T-DECLARABLE.
+            emit(DiagnosticCode::S_AutoInferenceInvalid, initNode,
+                 "initializer-inferred declaration: the null-pointer "
+                 "constant's type is not a declarable object type here "
+                 "(initialize a concrete pointer type instead): "
+                     + snippet(initNode));
+            return InvalidType;
+        case TypeKind::Array: {
+            // C 6.3.2.1p3 array-to-pointer decay: `auto s = "str";` is
+            // char* (the ternary decayArray pattern).
+            auto const elems = in.operands(inferred);
+            if (elems.empty() || !elems[0].valid()) {
+                emit(DiagnosticCode::S_AutoInferenceInvalid, initNode,
+                     "initializer-inferred declaration: the initializer's "
+                     "array type has no element type (interner invariant): "
+                         + snippet(initNode));
+                return InvalidType;
+            }
+            inferred = in.pointer(elems[0]);
+            break;
+        }
+        case TypeKind::FnSig:
+            // C 6.3.2.1p4 function-to-pointer decay: `auto f = fn;` is a
+            // pointer-to-function (the c56 precedent).
+            inferred = in.pointer(inferred);
+            break;
+        default:
+            break;
+    }
+    // C23 6.7.9p2: the declared type drops top-level qualifiers (the
+    // typeof_unqual strip; only VolatileQual is interned — const is
+    // symbol-level and never set here, the row declares no constMarker).
+    return in.stripVolatile(inferred);
+}
+
 // ── Pass 1.5: post-order — resolve declaration types + FnSigs ──────────────
 void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                       NodeId node, ScopeId current) {
@@ -4253,6 +4576,23 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                     headTy = resolveTypeNode(
                         s, cfg, tree, kids[*decl.headChild], here);
                 }
+                // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): an
+                // `inferTypeFromInitializer` row has NO head — the declared
+                // type is INFERRED from the sole declarator's initializer
+                // (see resolveAutoInferredDeclaration above). On success the
+                // inferred type plays the head's role and the ORDINARY fold
+                // below applies it (type write + stamps + alignas +
+                // attribute facts + incomplete-object check — one proven
+                // path, no parallel write site). On a reject the fold is
+                // SKIPPED: no type is written (the emitted diagnostics are
+                // unsuppressable, so the Pass-2 initializer backfill can
+                // never silently resurrect the declaration).
+                bool inferenceRejected = false;
+                if (decl.inferTypeFromInitializer) {
+                    headTy = resolveAutoInferredDeclaration(
+                        s, cfg, tree, node, decl, kids, here);
+                    inferenceRejected = !headTy.valid();
+                }
                 // kindByChild discriminator (mirrors the legacy arm): a
                 // matched Function discriminator makes this a function
                 // DEFINITION — the body is the matched node itself when
@@ -4287,7 +4627,8 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                     && headTy.valid()) {
                     s.nodeToType.set(node, headTy);
                 }
-                if (carrierIdx.has_value() && *carrierIdx < kids.size()) {
+                if (!inferenceRejected
+                    && carrierIdx.has_value() && *carrierIdx < kids.size()) {
                     std::vector<NodeId> declarators;
                     collectDeclarators(tree, kids[*carrierIdx],
                                        *cfg.declarators, declarators);
@@ -5589,165 +5930,31 @@ charLiteralWideCoreOf(EngineState const& s, Tree const& tree, NodeId owningNode)
     return false;
 }
 
-// ── Pass 2: post-order — resolve uses + literal/init typing + checks ───────
-// `loopDepth` (GAP C) is the count of enclosing `loopRules` subtrees the
-// walk is currently inside; a `loopControls` node at depth 0 is outside
-// any loop and emits S_ControlOutsideLoop.
-// pass2 POST-CHILD work for ONE node — extracted for the iterative driver below
-// (D-PARSE-DEEP-NEST-RECURSION-MEMORY plan 24 Stage 2). Runs AFTER all
-// descendants are walked; `here` is this node's OWN resolved scope and
-// `loopDepth` its OWN enclosing-loop depth (both threaded by the driver). A
-// `return;` here ends THIS node's post-work and the driver loop continues —
-// exactly as the recursive `return;` did. The body is byte-identical to the
-// prior post-child portion of `pass2`.
-void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-               NodeId node, ScopeId here, int loopDepth) {
+// ── literal typing (the ONE chokepoint) ────────────────────────────────────
+// Types ONE node if it is a literal: a literal TOKEN (the integer ladder /
+// float suffix / wide-char override / bool-keyword / nullptr rows of
+// `literalTypeIds`, plus the per-token string fallback) or a
+// `stringLiteralExpr` RULE node (the adjacent-concat form). Non-literal nodes
+// are untouched. EXTRACTED from pass2Post (byte-identical body — the
+// buildConstEvalEnv extraction precedent) so TWO tiers share it:
+//   • Pass 2 (pass2Post) — the blanket post-order walk, exactly as before;
+//   • FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): the Pass-1.5 inference arm's
+//     initializer PRE-STAMP. `subtreeType` types identifier leaves by scope
+//     lookup but relies on `typeAt` stamps for literal leaves (Pass-2-stamped
+//     on the blanket walk) — so at Pass 1.5 a literal initializer
+//     (`auto x = 42;`) would resolve to InvalidType (probe-confirmed: the
+//     typeof-of-literal analog `typeof(42) a = 7; int arr[sizeof(a)];` fails
+//     S_NonConstantArrayLength at HEAD — p1 passes only via the Pass-2
+//     initializer backfill). The arm walks the initializer subtree through
+//     THIS chokepoint first, so both tiers type literals identically by
+//     construction. Idempotent (re-stamping computes the same TypeId); the
+//     one diagnostic inside (S_IntegerLiteralTooLarge) leaves the node
+//     untyped on BOTH tiers, and its Pass-1.5 + Pass-2 double-visit
+//     collapses in the reporter's recent-duplicate window (suppressible
+//     code — the dedup applies; the typeof bit-field gate precedent).
+void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
+                      Tree const& tree, NodeId node) {
     auto const k = tree.kind(node);
-
-    // C23 §6.5 (D-CSUBSET-NULLPTR): the fail-loud operator gate. `nullptr`
-    // (TypeKind::NullptrT) is a null pointer constant, NOT an arithmetic value;
-    // under the HIR lowering it becomes the integer-0 null constant, so WITHOUT this
-    // explicit gate an invalid operand use (`nullptr + 1`, `nullptr < p`, `-nullptr`,
-    // `nullptr == 5`) would SILENTLY compile as `0 + 1` / `0 < p` / `-0` / `0 == 5`.
-    // nullptr is admissible ONLY as an `==`/`!=` operand against a pointer or another
-    // nullptr; the CONVERSION contexts (assign/init/arg/return via isAssignable, and
-    // `if(nullptr)`/`!nullptr` via the HIR condition lowering to the integer-0 arm)
-    // are handled elsewhere. Detecting a NullptrT operand uses a BOUNDED transparent-
-    // descent — O(1): it follows thin single-Internal-child wrappers/parens to a
-    // nullptr token or an already-stamped NullptrT node — so the common (no-nullptr)
-    // path pays ~nothing, and a peer's full type is computed only once a nullptr
-    // operand is actually present. A NullptrT value arising from a NON-literal
-    // subexpression (`(c?nullptr:nullptr)+1`, astronomically rare) is not caught here
-    // — it degrades to defined 0-arithmetic, never a crash: D-CSUBSET-NULLPTR-
-    // NONLITERAL-OPERAND (trigger: a real program hits it).
-    if (k == NodeKind::Internal
-        && cfg.pointerConversions.nullPointerConstantFromNullptrT) {
-        auto const& hirCfg = tree.schema().hirLowering();
-        std::uint32_t const rule = tree.rule(node).v;
-        bool const isBin = hirCfg.binaryExprRule.valid()
-            && rule == hirCfg.binaryExprRule.v;
-        bool const isUn  = hirCfg.unaryExprRule.valid()
-            && rule == hirCfg.unaryExprRule.v;
-        if (isBin || isUn) {
-            auto& interner = s.lattice.interner();
-            auto const isNullptrOperand = [&](NodeId n) -> bool {
-                for (int guard = 0; n.valid() && guard < 64; ++guard) {
-                    if (TypeId t = s.typeAt(n); t.valid())
-                        return interner.kind(t) == TypeKind::NullptrT;
-                    if (tree.kind(n) == NodeKind::Token) {
-                        auto it = s.idx().literalTypeIds.find(tree.tokenKind(n).v);
-                        return it != s.idx().literalTypeIds.end()
-                            && interner.kind(it->second) == TypeKind::NullptrT;
-                    }
-                    // Descend one transparent layer: the single meaningful child is
-                    // an Internal child (a paren / thin wrapper) if present, else a
-                    // literal token child (an operand node wrapping the `nullptr`
-                    // literal — internals == 0). More than one Internal child (a real
-                    // operator / ternary / comma) is NOT a transparent nullptr operand.
-                    NodeId nextInternal{}, litToken{};
-                    int internals = 0;
-                    for (NodeId c : visibleChildren(tree, n)) {
-                        if (tree.kind(c) == NodeKind::Token) {
-                            if (s.idx().literalTypeIds.find(tree.tokenKind(c).v)
-                                != s.idx().literalTypeIds.end()) {
-                                litToken = c;
-                            }
-                        } else {
-                            ++internals; nextInternal = c;
-                        }
-                    }
-                    if (internals == 1) { n = nextInternal; continue; }
-                    if (internals == 0 && litToken.valid()) { n = litToken; continue; }
-                    return false;
-                }
-                return false;
-            };
-            auto const opEntry =
-                [&](std::vector<HirOperatorEntry> const& ops)
-                -> HirOperatorEntry const* {
-                for (NodeId c : visibleChildren(tree, node)) {
-                    if (tree.kind(c) != NodeKind::Token) continue;
-                    for (auto const& e : ops)
-                        if (e.token.v == tree.tokenKind(c).v) return &e;
-                }
-                return nullptr;
-            };
-            auto const emitInvalid = [&](NodeId at) {
-                ParseDiagnostic d;
-                d.code     = DiagnosticCode::S_NullptrInvalidOperand;
-                d.severity = DiagnosticSeverity::Error;
-                d.buffer   = tree.source().id();
-                d.span     = tree.span(at);
-                d.actual   = std::string{tree.text(at)};
-                s.reporter.report(std::move(d));
-            };
-            if (isBin) {
-                NodeId lhsN{}, rhsN{};
-                for (NodeId c : visibleChildren(tree, node)) {
-                    if (tree.kind(c) == NodeKind::Token) continue;
-                    if (!lhsN.valid()) lhsN = c; else if (!rhsN.valid()) rhsN = c;
-                }
-                bool const lNull = lhsN.valid() && isNullptrOperand(lhsN);
-                bool const rNull = rhsN.valid() && isNullptrOperand(rhsN);
-                if (lNull || rNull) {
-                    HirOperatorEntry const* e = opEntry(hirCfg.binaryOps);
-                    std::optional<HirOpKind> const op =
-                        e ? coreOpFromNameSem(e->target) : std::nullopt;
-                    bool ok;
-                    if (!op.has_value()) {
-                        // A special-tag operator (not a core op): plain Assign
-                        // (`p = nullptr`, validated by isAssignable), Comma
-                        // (`(nullptr, x)` discard), and LogicalAnd/LogicalOr
-                        // (nullptr in a boolean context) all ACCEPT nullptr. A
-                        // COMPOUND assignment (`p += nullptr`, compoundBase
-                        // non-empty) is pointer arithmetic → REJECT. A null entry
-                        // (unclassifiable) is left alone (no false positive).
-                        ok = (e == nullptr) || e->compoundBase.empty();
-                    } else if (*op == HirOpKind::Eq || *op == HirOpKind::Ne) {
-                        if (lNull && rNull) {
-                            ok = true;   // nullptr == nullptr (C23-valid)
-                        } else {
-                            // The non-nullptr peer must DECAY to a pointer: an
-                            // object/function pointer (Ptr), a bare function
-                            // designator (FnSig → function pointer, C 6.3.2.1p4),
-                            // or an array name (Array → element pointer, 6.3.2.1p3)
-                            // — `func == nullptr` / `arr == nullptr` are valid C23.
-                            // Mirrors the combineTernary nullptr arm's Ptr/FnSig decay.
-                            NodeId const peer = lNull ? rhsN : lhsN;
-                            TypeId const pt = subtreeType(s, tree, peer, here);
-                            TypeKind const pk =
-                                pt.valid() ? interner.kind(pt) : TypeKind::Void;
-                            ok = (pk == TypeKind::Ptr || pk == TypeKind::FnSig
-                                  || pk == TypeKind::Array);
-                        }
-                    } else {
-                        // A core arithmetic / relational / bitwise / shift op —
-                        // nullptr is not a valid operand.
-                        ok = false;
-                    }
-                    if (!ok) emitInvalid(lNull ? lhsN : rhsN);
-                }
-            } else {  // unary
-                NodeId operandN{};
-                for (NodeId c : visibleChildren(tree, node)) {
-                    if (tree.kind(c) == NodeKind::Token) continue;
-                    operandN = c; break;
-                }
-                if (operandN.valid() && isNullptrOperand(operandN)) {
-                    HirOperatorEntry const* e = opEntry(hirCfg.unaryOps);
-                    std::optional<HirOpKind> const op =
-                        e ? coreOpFromNameSem(e->target) : std::nullopt;
-                    // Reject `-nullptr` (Neg) and `~nullptr` (BitNot). `!nullptr`
-                    // (Not) is VALID (nullptr→false→true); `&nullptr` is caught by
-                    // the existing lvalue check (nullptr is a non-lvalue like 0/true).
-                    if (op.has_value()
-                        && (*op == HirOpKind::Neg || *op == HirOpKind::BitNot)) {
-                        emitInvalid(operandN);
-                    }
-                }
-            }
-        }
-    }
 
     // Literal typing.
     if (k == NodeKind::Token) {
@@ -5943,6 +6150,172 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             }
         }
     }
+}
+
+// ── Pass 2: post-order — resolve uses + literal/init typing + checks ───────
+// `loopDepth` (GAP C) is the count of enclosing `loopRules` subtrees the
+// walk is currently inside; a `loopControls` node at depth 0 is outside
+// any loop and emits S_ControlOutsideLoop.
+// pass2 POST-CHILD work for ONE node — extracted for the iterative driver below
+// (D-PARSE-DEEP-NEST-RECURSION-MEMORY plan 24 Stage 2). Runs AFTER all
+// descendants are walked; `here` is this node's OWN resolved scope and
+// `loopDepth` its OWN enclosing-loop depth (both threaded by the driver). A
+// `return;` here ends THIS node's post-work and the driver loop continues —
+// exactly as the recursive `return;` did. The body is byte-identical to the
+// prior post-child portion of `pass2`.
+void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+               NodeId node, ScopeId here, int loopDepth) {
+    auto const k = tree.kind(node);
+
+    // C23 §6.5 (D-CSUBSET-NULLPTR): the fail-loud operator gate. `nullptr`
+    // (TypeKind::NullptrT) is a null pointer constant, NOT an arithmetic value;
+    // under the HIR lowering it becomes the integer-0 null constant, so WITHOUT this
+    // explicit gate an invalid operand use (`nullptr + 1`, `nullptr < p`, `-nullptr`,
+    // `nullptr == 5`) would SILENTLY compile as `0 + 1` / `0 < p` / `-0` / `0 == 5`.
+    // nullptr is admissible ONLY as an `==`/`!=` operand against a pointer or another
+    // nullptr; the CONVERSION contexts (assign/init/arg/return via isAssignable, and
+    // `if(nullptr)`/`!nullptr` via the HIR condition lowering to the integer-0 arm)
+    // are handled elsewhere. Detecting a NullptrT operand uses a BOUNDED transparent-
+    // descent — O(1): it follows thin single-Internal-child wrappers/parens to a
+    // nullptr token or an already-stamped NullptrT node — so the common (no-nullptr)
+    // path pays ~nothing, and a peer's full type is computed only once a nullptr
+    // operand is actually present. A NullptrT value arising from a NON-literal
+    // subexpression (`(c?nullptr:nullptr)+1`, astronomically rare) is not caught here
+    // — it degrades to defined 0-arithmetic, never a crash: D-CSUBSET-NULLPTR-
+    // NONLITERAL-OPERAND (trigger: a real program hits it).
+    if (k == NodeKind::Internal
+        && cfg.pointerConversions.nullPointerConstantFromNullptrT) {
+        auto const& hirCfg = tree.schema().hirLowering();
+        std::uint32_t const rule = tree.rule(node).v;
+        bool const isBin = hirCfg.binaryExprRule.valid()
+            && rule == hirCfg.binaryExprRule.v;
+        bool const isUn  = hirCfg.unaryExprRule.valid()
+            && rule == hirCfg.unaryExprRule.v;
+        if (isBin || isUn) {
+            auto& interner = s.lattice.interner();
+            auto const isNullptrOperand = [&](NodeId n) -> bool {
+                for (int guard = 0; n.valid() && guard < 64; ++guard) {
+                    if (TypeId t = s.typeAt(n); t.valid())
+                        return interner.kind(t) == TypeKind::NullptrT;
+                    if (tree.kind(n) == NodeKind::Token) {
+                        auto it = s.idx().literalTypeIds.find(tree.tokenKind(n).v);
+                        return it != s.idx().literalTypeIds.end()
+                            && interner.kind(it->second) == TypeKind::NullptrT;
+                    }
+                    // Descend one transparent layer: the single meaningful child is
+                    // an Internal child (a paren / thin wrapper) if present, else a
+                    // literal token child (an operand node wrapping the `nullptr`
+                    // literal — internals == 0). More than one Internal child (a real
+                    // operator / ternary / comma) is NOT a transparent nullptr operand.
+                    NodeId nextInternal{}, litToken{};
+                    int internals = 0;
+                    for (NodeId c : visibleChildren(tree, n)) {
+                        if (tree.kind(c) == NodeKind::Token) {
+                            if (s.idx().literalTypeIds.find(tree.tokenKind(c).v)
+                                != s.idx().literalTypeIds.end()) {
+                                litToken = c;
+                            }
+                        } else {
+                            ++internals; nextInternal = c;
+                        }
+                    }
+                    if (internals == 1) { n = nextInternal; continue; }
+                    if (internals == 0 && litToken.valid()) { n = litToken; continue; }
+                    return false;
+                }
+                return false;
+            };
+            auto const opEntry =
+                [&](std::vector<HirOperatorEntry> const& ops)
+                -> HirOperatorEntry const* {
+                for (NodeId c : visibleChildren(tree, node)) {
+                    if (tree.kind(c) != NodeKind::Token) continue;
+                    for (auto const& e : ops)
+                        if (e.token.v == tree.tokenKind(c).v) return &e;
+                }
+                return nullptr;
+            };
+            auto const emitInvalid = [&](NodeId at) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_NullptrInvalidOperand;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(at);
+                d.actual   = std::string{tree.text(at)};
+                s.reporter.report(std::move(d));
+            };
+            if (isBin) {
+                NodeId lhsN{}, rhsN{};
+                for (NodeId c : visibleChildren(tree, node)) {
+                    if (tree.kind(c) == NodeKind::Token) continue;
+                    if (!lhsN.valid()) lhsN = c; else if (!rhsN.valid()) rhsN = c;
+                }
+                bool const lNull = lhsN.valid() && isNullptrOperand(lhsN);
+                bool const rNull = rhsN.valid() && isNullptrOperand(rhsN);
+                if (lNull || rNull) {
+                    HirOperatorEntry const* e = opEntry(hirCfg.binaryOps);
+                    std::optional<HirOpKind> const op =
+                        e ? coreOpFromNameSem(e->target) : std::nullopt;
+                    bool ok;
+                    if (!op.has_value()) {
+                        // A special-tag operator (not a core op): plain Assign
+                        // (`p = nullptr`, validated by isAssignable), Comma
+                        // (`(nullptr, x)` discard), and LogicalAnd/LogicalOr
+                        // (nullptr in a boolean context) all ACCEPT nullptr. A
+                        // COMPOUND assignment (`p += nullptr`, compoundBase
+                        // non-empty) is pointer arithmetic → REJECT. A null entry
+                        // (unclassifiable) is left alone (no false positive).
+                        ok = (e == nullptr) || e->compoundBase.empty();
+                    } else if (*op == HirOpKind::Eq || *op == HirOpKind::Ne) {
+                        if (lNull && rNull) {
+                            ok = true;   // nullptr == nullptr (C23-valid)
+                        } else {
+                            // The non-nullptr peer must DECAY to a pointer: an
+                            // object/function pointer (Ptr), a bare function
+                            // designator (FnSig → function pointer, C 6.3.2.1p4),
+                            // or an array name (Array → element pointer, 6.3.2.1p3)
+                            // — `func == nullptr` / `arr == nullptr` are valid C23.
+                            // Mirrors the combineTernary nullptr arm's Ptr/FnSig decay.
+                            NodeId const peer = lNull ? rhsN : lhsN;
+                            TypeId const pt = subtreeType(s, tree, peer, here);
+                            TypeKind const pk =
+                                pt.valid() ? interner.kind(pt) : TypeKind::Void;
+                            ok = (pk == TypeKind::Ptr || pk == TypeKind::FnSig
+                                  || pk == TypeKind::Array);
+                        }
+                    } else {
+                        // A core arithmetic / relational / bitwise / shift op —
+                        // nullptr is not a valid operand.
+                        ok = false;
+                    }
+                    if (!ok) emitInvalid(lNull ? lhsN : rhsN);
+                }
+            } else {  // unary
+                NodeId operandN{};
+                for (NodeId c : visibleChildren(tree, node)) {
+                    if (tree.kind(c) == NodeKind::Token) continue;
+                    operandN = c; break;
+                }
+                if (operandN.valid() && isNullptrOperand(operandN)) {
+                    HirOperatorEntry const* e = opEntry(hirCfg.unaryOps);
+                    std::optional<HirOpKind> const op =
+                        e ? coreOpFromNameSem(e->target) : std::nullopt;
+                    // Reject `-nullptr` (Neg) and `~nullptr` (BitNot). `!nullptr`
+                    // (Not) is VALID (nullptr→false→true); `&nullptr` is caught by
+                    // the existing lvalue check (nullptr is a non-lvalue like 0/true).
+                    if (op.has_value()
+                        && (*op == HirOpKind::Neg || *op == HirOpKind::BitNot)) {
+                        emitInvalid(operandN);
+                    }
+                }
+            }
+        }
+    }
+
+    // Literal typing — the extracted shared chokepoint (see typeLiteralIfAny
+    // above; FC17.5 D-CSUBSET-AUTO-TYPE-INFERENCE made it two-tier). This
+    // call IS the pre-extraction block, byte-identical behavior.
+    typeLiteralIfAny(s, cfg, tree, node);
 
     // Reference resolution. Skip if the node is a declaration's own name
     // slot (declaration and reference shapes can structurally overlap).

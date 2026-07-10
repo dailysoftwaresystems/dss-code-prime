@@ -827,6 +827,16 @@
       ]
     },
 
+    "autoInferredVarDecl": {
+      "$comment": "FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE, C23 6.7.9): the HEAD-LESS initializer-inferred declaration statement (`auto y = 42;`). NO declHead — the pre-existing varDecl path can never parse this form (declHead's bare-Identifier alt greedily reads `y` as a TYPE name → P0009). The specifier prefix is REQUIRED (localDeclSpecifiers is non-nullable) and semantically GATED: the declaration row's `requiredSpecifierToken: AutoKeyword` makes the Pass-1.5 inference arm fail LOUD when no `auto` is present, so C89 implicit-int shapes (`static x = 5;` / `register y = 2;` / `alignas(4) z = 9;` / `[[maybe_unused]] w = 3;`) that parse into this rule STAY errors — pinned. Probed FIRST in declOrAttrStmt (see its $fc175Comment for the C2 order rationale): it fast-fails (≤3 tokens) on every real-typed declaration (`static int x` — `int` is not a declarator), so ordinary decls pay one cheap probe only when specifier-led.",
+      "sequence": [ "localDeclSpecifiers", "initDeclaratorList", "EndStatement" ]
+    },
+
+    "autoInferredForDecl": {
+      "$comment": "FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): the for-init mirror of autoInferredVarDecl — same shape MINUS the `;` (the for grammar owns it), exactly as forDecl mirrors varDecl. `for (auto i = 0; …)` is VALID C23 (6.8.5p3 admits auto in a for-init). Its declaration row copies forDecl's StaticKeyword gatedMarker so `for (static auto i = 0;;)` stays gated loud (6.8.5p3 violation).",
+      "sequence": [ "localDeclSpecifiers", "initDeclaratorList" ]
+    },
+
     "identVarDecl": {
       "$comment": "The bare-typedef-name declaration statement (`T x, *p;`). The PreferType commit guard (bare-string form — the FC2 triage): sketch-known Type commits, known Value rolls back (`a * b;` stays a multiplication), unknown runs the follower-operator test (`T x;` commits — `x` continues no value reading; `a * b;` rolls back — `*` does) and records the cross-file-oracle candidate on rollback.",
       "sequence": [ "identDeclHead", "initDeclaratorList", "EndStatement" ],
@@ -858,8 +868,9 @@
       "sequence": [ "compositeAttrList", "EndStatement" ]
     },
     "declOrAttrStmt": {
-      "$comment": "FC17 (D-CSUBSET-ATTRIBUTE-STATEMENT): the varDecl-vs-attributeDeclaration ambiguity site. A statement led by `[[` (stdAttr) or `__attribute__` (attrSpec) is EITHER an attributed declaration (`[[maybe_unused]] int x = 5;` — the attribute rides varDecl's localDeclSpecifiers prefix) OR a bare attribute-declaration statement (`[[fallthrough]];`) — genuinely colliding FIRSTs, so the alt is SPECULATIVE with varDecl probed FIRST (declared order authoritative, the declOrExprStmt precedent); the bare form rolls back on the immediate `;`. lookahead 256 (= the 4096-token probe budget declOrExprStmt uses): the varDecl probe must swallow an entire declaration incl. initializers. HOT PATH (design-audit confirmed): every OTHER statement lead (`int`/`static`/`const`/typedef-name/...) — where varDecl's FIRST is the SOLE survivor — takes the parser's unique-production DIRECT DESCENT (no probe, no checkpoint), so the wrapper adds zero speculation to non-attribute statements. The wrapper MATERIALIZES a CST node (named alt rules do — the declOrExprStmt golden precedent): the statement>declOrAttrStmt>varDecl shape is pinned + the 2 consumers are transparent BY MECHANISM (HIR's unmapped-statement soleMeaningfulChild PassThrough peels it; semantic passes are rule-KEYED full-tree walks).",
-      "alt": [ "varDecl", "attributeDeclaration" ],
+      "$comment": "FC17 (D-CSUBSET-ATTRIBUTE-STATEMENT): the varDecl-vs-attributeDeclaration ambiguity site. A statement led by `[[` (stdAttr) or `__attribute__` (attrSpec) is EITHER an attributed declaration (`[[maybe_unused]] int x = 5;` — the attribute rides varDecl's localDeclSpecifiers prefix) OR a bare attribute-declaration statement (`[[fallthrough]];`) — genuinely colliding FIRSTs, so the alt is SPECULATIVE (declared order authoritative, the declOrExprStmt precedent); the bare form rolls back on the immediate `;`. lookahead 256 (= the 4096-token probe budget declOrExprStmt uses): a decl probe must swallow an entire declaration incl. initializers. HOT PATH (design-audit confirmed): every statement lead in EXACTLY ONE branch's FIRST (`int`/`const`/typedef-name/... — varDecl the sole survivor) takes the parser's unique-production DIRECT DESCENT (no probe, no checkpoint), so the wrapper adds zero speculation to ordinary statements. The wrapper MATERIALIZES a CST node (named alt rules do — the declOrExprStmt golden precedent): the statement>declOrAttrStmt>varDecl shape is pinned + the 2 consumers are transparent BY MECHANISM (HIR's unmapped-statement soleMeaningfulChild PassThrough peels it; semantic passes are rule-KEYED full-tree walks).",
+      "$fc175Comment": "FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): `autoInferredVarDecl` joins the alt — ★ DECLARED FIRST (the design-audit's C2 MANDATORY order, NOT varDecl-first). Rationale: both decl rules' predictive prefix is 1 token, so a storage-class-led statement (`static …`) keeps 2 survivors and MUST probe; autoInferredVarDecl fast-fails within ~3 tokens on every real-typed declaration (after the specifier run, a type keyword is not a declarator), while a varDecl-FIRST order would probe varDecl under the 4096-token speculation budget and BUDGET-CLIFF existing valid `static const int big[] = {…>4096 tokens…}` declarations (sqlite3.c's largest block-scope static init is 3918 tokens = 96% of the budget — the sqlite gate would NOT catch the cliff). With autoInferred first, varDecl is the declared-LAST structural candidate for a specifier-led statement, so the parser's all-fail REPLAY (parser.cpp ~:1984) re-parses it NON-speculatively with NO budget — a genuine committed parse. Red-on-reorder pin: the >4096-token block-scope static-init test. The only dual-match shape `<specifiers> Ident ;` is invalid C either way — the diagnostic-shape pins (`auto T;` → initializer-required, `auto f(void);` → plain-identifier) hold the boundary. `auto int x;` (C89) still parses via varDecl on rollback — pinned.",
+      "alt": [ "autoInferredVarDecl", "varDecl", "attributeDeclaration" ],
       "speculative": true, "lookahead": 256
     },
 
@@ -960,11 +971,12 @@
     },
 
     "forStmt": {
-      "$comment": "FC4 c1: the init clause mirrors the statement-level decl split — committed keyword/qualifier/specifier-led forDecl (non-speculative) vs the identifier-led forInitAmbig probe. Both are semicolon-LESS (the for grammar owns the `;`).",
+      "$comment": "FC4 c1: the init clause mirrors the statement-level decl split — committed keyword/qualifier/specifier-led forDecl vs the identifier-led forInitAmbig probe. Both are semicolon-LESS (the for grammar owns the `;`).",
+      "$fc175Comment": "FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): `autoInferredForDecl` joins the init alt — declared FIRST, the SAME C2 audit order as declOrAttrStmt (see its $fc175Comment; the >4096-token budget-cliff rationale applies identically to a for-init). The speculative/lookahead flags ride the OPTIONAL (the D-PARSE-SPECULATIVE-OPTIONAL shape — the enumTypeSpecifier precedent): the optional's own AltChoice is the DECISION POINT (its candidate enumeration flattens the inner alt's rules and EXCLUDES the skip branch), so flags on the inner alt object would never be consulted — empirically, `for (constexpr int i = 0;;)` first-match-committed the inference rule and P0001'd on `int` until the flags moved out here (the ConstexprInForInitAccepted pin caught it). No named wrapper, so the CST shape is UNCHANGED: forStmt's init child is still the forDecl/autoInferredForDecl/forInitAmbig node directly. Ordinary for-inits keep cheap decisions (`for (int i…` — `int` is in forDecl's FIRST only → its probe is the sole survivor; `for (i…` — Identifier → forInitAmbig), the multi-survivor probe fires only on a specifier-led init (`for (auto i…` / `for (static …` / `for (constexpr …`). An ABSENT init (`for (;;)`) rides the speculative optional's nullable-skip arm (parser.cpp ~:1941) exactly as before.",
       "sequence": [
         "ForKeyword",
         "ParenOpen",
-        { "optional": { "alt": [ "forDecl", "forInitAmbig" ] } },
+        { "optional": { "alt": [ "autoInferredForDecl", "forDecl", "forInitAmbig" ], "speculative": true, "lookahead": 256 }, "speculative": true, "lookahead": 256 },
         "EndStatement",
         { "optional": "expression" },
         "EndStatement",
@@ -1388,6 +1400,24 @@
       { "rule": "forIdentDecl", "head": 0, "declaratorList": 1, "kind": "variable",
         "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword", "warnIfUnused": true,
         "requireNamedDeclarators": true },
+      { "rule": "autoInferredVarDecl", "declaratorList": 0, "kind": "variable",
+        "$comment": "FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE, C23 6.7.9): the HEAD-LESS initializer-inferred declaration. NO `head` — `inferTypeFromInitializer` waives the loader's declarator-mode head requirement and routes typing through the Pass-1.5 inference arm (single plain named declarator → initializer required → braced-single unwrap → infer → array/function DECAY → loud rejects for void/nullptr_t/unresolvable → stripVolatile → write). `declaratorList: 0` — post-strip children are [initDeclaratorList, EndStatement] (the specifierPrefix strip removes the REQUIRED localDeclSpecifiers prefix before positional counting; varDecl's is 1 because a declHead precedes its list). `requiredSpecifierToken: AutoKeyword` is the ★C1 presence gate — checked FIRST in the arm; without it `static x = 5;` (which PARSES into this rule) would silently become C89 implicit-int. ★M1: NO constMarker/volatileMarker — with no head, the const/volatile fallback scans span the WHOLE declaration INCLUDING THE INITIALIZER (the c58 initializer-const-leak: `auto p = (const char*)s;` would false-mark p const); C23 6.7.9 constrains auto to unqualified plain declarators anyway (`const auto x` is a loud parse error — D-CSUBSET-AUTO-QUALIFIED). NO prototypeSynthesizesExtern (a headless decl can never be a prototype; the plain-identifier gate rejects `auto f(void);` loud). linkage/ignored entries mirror varDecl so `static auto s = 1;` routes to a hidden module-global and `constexpr auto k = 5;` validates through the constexpr hook against the INFERRED type (P1 prefix scan → P1.5 infer → P2 validator ordering, audit-verified).",
+        "inferTypeFromInitializer": true,
+        "requiredSpecifierToken": "AutoKeyword",
+        "warnIfUnused": true,
+        "specifierPrefix": "localDeclSpecifiers",
+        "requireNamedDeclarators": true,
+        "linkageSpecifiers": { "static": { "binding": "local", "staticStorage": true } },
+        "linkageSpecifierIgnoredKinds": ["RegisterKeyword", "AutoKeyword", "ConstexprKeyword", "NoreturnKeyword", "AttributeKeyword", "ParenOpen", "ParenClose"],
+        "linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr", "alignasSpec"] },
+      { "rule": "autoInferredForDecl", "declaratorList": 0, "kind": "variable",
+        "$comment": "FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): the for-init mirror — same inference row as autoInferredVarDecl, but like forDecl it carries NO linkageSpecifiers (a static for-init must ERROR, not route to a hidden global) and COPIES forDecl's StaticKeyword gatedMarker so `for (static auto i = 0;;)` fails loud S_StaticStorageInForInit (C 6.8.5p3).",
+        "inferTypeFromInitializer": true,
+        "requiredSpecifierToken": "AutoKeyword",
+        "warnIfUnused": true,
+        "specifierPrefix": "localDeclSpecifiers",
+        "requireNamedDeclarators": true,
+        "gatedMarkers": [ { "token": "StaticKeyword", "code": "S_StaticStorageInForInit" } ] },
       { "rule": "param", "head": 0, "declarator": 1, "kind": "variable",
         "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword",
         "$arrayToPointerComment": "c82 (D-CSUBSET-PARAM-ARRAY-ADJUSTMENT, C 6.7.6.3p7): a parameter declared 'array of T' — sized (`int a[64]`), unsized (`int a[]`), or multi-dim (`int a[][5]` -> ptr to int[5]) — ADJUSTS to 'pointer to T'. The flag (a) permits the absent-length `[]` on the param's OUTERMOST suffix (resolving via the incomplete-array path, like allowFlexibleArray) and (b) rewrites the resolved top-level Array to Ptr<element> at BOTH resolution sites (the definitive Pass-1.5 visit that binds the param symbol — so sizeof(param)==8 and body uses see the pointer — and the FnSig param harvest — so call-site checking matches the decayed argument). An inner-dimension `[]` (`int a[4][]`) still fails loud (S_FlexibleArrayInAggregate via the incomplete-element guard), matching C's ill-formedness.",
@@ -1680,6 +1710,9 @@
       { "rule": "identVarDecl", "hirKind": "VarDecl"     },
       { "rule": "forDecl",      "hirKind": "VarDecl"     },
       { "rule": "forIdentDecl", "hirKind": "VarDecl"     },
+      { "rule": "autoInferredVarDecl", "hirKind": "VarDecl",
+        "$comment": "FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): ZERO HIR changes — lowerVarLikeInto reads the declared type off the SYMBOL (rec->type, which Pass 1.5's inference arm wrote), never re-derives it from a head, so the headless rule lowers through the same VarDecl row as varDecl." },
+      { "rule": "autoInferredForDecl", "hirKind": "VarDecl" },
       { "rule": "param",        "hirKind": "VarDecl"     },
       { "rule": "typedefDecl",  "hirKind": "TypeDecl"    },
       { "rule": "staticAssertDecl", "hirKind": "Skip"    },
