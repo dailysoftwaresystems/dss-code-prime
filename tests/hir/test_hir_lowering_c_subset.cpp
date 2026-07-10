@@ -1900,6 +1900,76 @@ TEST(HirLoweringCSubset, NoreturnIndirectCalleeIsNotWrapped) {
     }
 }
 
+// ── FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): the GNU semantic-attribute spellings
+//    at FILE scope ride the linkage scan's by-NAME skip end-to-end ────────────
+
+// The FIVE by-name-ignored semantic-attribute spellings (deprecated /
+// maybe_unused / unused / nodiscard / warn_unused_result — incl. a
+// string-argument form and a dunder form) must lower a FILE-scope declaration
+// with ZERO H_UnknownLinkageSpecifier: without the
+// `linkageSpecifierIgnoredNames` extension every one hard-fails H000C
+// (probe-confirmed at the pre-change HEAD). RED-ON-DISABLE: drop a name from
+// the topLevelDecl ignore list → that spelling's H000C count flips to 1.
+TEST(HirLoweringCSubset, GnuSemanticAttributeSpellingsFileScopeLowerClean) {
+    for (char const* proto : {
+             "__attribute__((deprecated)) int f(void) { return 1; }",
+             "__attribute__((deprecated(\"use g\"))) int f(void) { return 1; }",
+             "__attribute__((__deprecated__)) int f(void) { return 1; }",
+             "__attribute__((warn_unused_result)) int f(void) { return 1; }",
+             "__attribute__((nodiscard)) int f(void) { return 1; }",
+             "__attribute__((unused)) int f(void) { return 1; }",
+             "__attribute__((maybe_unused)) int f(void) { return 1; }"}) {
+        std::string const src = std::string(proto)
+            + " int main(){ return f() - 1; }";
+        SemanticModel model = analyzeCSubset(src);
+        ASSERT_FALSE(model.hasErrors()) << "spelling: " << proto;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << proto << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+            << proto << " — the by-name linkage skip must cover this spelling";
+    }
+}
+
+// The Fork-2 BOUNDARY regression guard: an UNKNOWN GNU attribute at file scope
+// STILL fails loud H_UnknownLinkageSpecifier (the by-name skip covers ONLY the
+// declared semantic-attribute names — it must not become a wholesale ignore).
+TEST(HirLoweringCSubset, GnuUnknownAttributeFileScopeStillFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "__attribute__((frobnicate)) int f(void) { return 1; } "
+        "int main(){ return f() - 1; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    (void)res;
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+        << "an unknown GNU attribute must keep the loud typo-protection gate";
+}
+
+// (The `static __attribute__((deprecated))` no-clobber pin — the co-present
+// `static` keeping its INTERNAL binding — lives at the MIR tier where the
+// binding is observable: MirLoweringCSubsetLinkage
+// .GnuDeprecatedDoesNotClobberStaticLinkage.)
+
+// The bare attribute-declaration statement lowers to NOTHING observable: the
+// `[[fallthrough]];` item maps to Skip (an empty Block) and the enclosing
+// declOrAttrStmt wrapper is peeled by the unmapped-statement PassThrough —
+// zero H diagnostics, verifier clean.
+TEST(HirLoweringCSubset, FallthroughStatementLowersToSkip) {
+    SemanticModel model = analyzeCSubset(
+        "int main(){ int x = 1; int acc = 0; "
+        "switch (x) { case 1: acc += 1; [[fallthrough]]; "
+        "case 2: acc += 10; break; default: acc = 99; break; } "
+        "return acc - 11; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
+}
+
 // ── FC5: goto / labels ──────────────────────────────────────────────────────
 
 namespace {

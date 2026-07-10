@@ -7835,6 +7835,154 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── standard-attribute semantics (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS) ──
+            // `{ attrSpecRule, stdAttrRule, bareStatementRule, effects }` — the
+            // C23 6.7.13 standard-attribute semantics TABLE. The three rule refs
+            // resolve like alignas's readRule (present-but-bad emits + fails the
+            // load; an ABSENT block leaves everything invalid → no surface).
+            // `effects` is an array of `{ names: [...], effect: <verb> }` rows;
+            // the effect VERB is validated against the CLOSED set
+            // {suppressUnused, warnOnUse, warnOnDiscard, none} — an unknown verb
+            // is C_InvalidSemantics (a typo can never silently disarm a row).
+            // Source-agnostic: nothing hardcodes a rule name or attribute name.
+            if (sem.contains("attributeSemantics")) {
+                json const& as = sem.at("attributeSemantics");
+                if (!as.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/attributeSemantics",
+                              "'semantics.attributeSemantics' must be an object "
+                              "{ attrSpecRule, stdAttrRule, bareStatementRule, "
+                              "effects }");
+                } else {
+                    auto readRule = [&](char const* key, char const* path,
+                                        RuleId& outRule, std::string& outName) {
+                        if (!as.contains(key) || !as.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path,
+                                      std::format("'{}' is required and must be a "
+                                                  "string", key));
+                            return;
+                        }
+                        outName = as.at(key).get<std::string>();
+                        if (!data.rules->contains(outName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path,
+                                      std::format("'attributeSemantics.{}' references "
+                                                  "unknown shape '{}'", key, outName));
+                            outName.clear();
+                            return;
+                        }
+                        outRule = data.rules->find(outName);
+                    };
+                    readRule("attrSpecRule",
+                             "/semantics/attributeSemantics/attrSpecRule",
+                             cfg.attrSpecRule, cfg.attrSpecRuleName);
+                    readRule("stdAttrRule",
+                             "/semantics/attributeSemantics/stdAttrRule",
+                             cfg.stdAttrRule, cfg.stdAttrRuleName);
+                    readRule("bareStatementRule",
+                             "/semantics/attributeSemantics/bareStatementRule",
+                             cfg.attrBareStatementRule,
+                             cfg.attrBareStatementRuleName);
+                    if (!as.contains("effects") || !as.at("effects").is_array()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/attributeSemantics/effects",
+                                  "'effects' is required and must be an array of "
+                                  "{ names, effect } rows");
+                    } else {
+                        for (json const& row : as.at("effects")) {
+                            if (!row.is_object() || !row.contains("names")
+                                || !row.at("names").is_array()
+                                || !row.contains("effect")
+                                || !row.at("effect").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/attributeSemantics/effects",
+                                          "each 'effects' row must be an object "
+                                          "{ names: [strings], effect: string }");
+                                continue;
+                            }
+                            AttributeSemanticsRow out;
+                            for (json const& nm : row.at("names")) {
+                                if (!nm.is_string()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidSemantics,
+                                        "/semantics/attributeSemantics/effects",
+                                        "each 'names' entry must be a string");
+                                    continue;
+                                }
+                                out.names.push_back(nm.get<std::string>());
+                            }
+                            std::string const verb =
+                                row.at("effect").get<std::string>();
+                            if (verb == "suppressUnused") {
+                                out.effect = AttributeEffect::SuppressUnused;
+                            } else if (verb == "warnOnUse") {
+                                out.effect = AttributeEffect::WarnOnUse;
+                            } else if (verb == "warnOnDiscard") {
+                                out.effect = AttributeEffect::WarnOnDiscard;
+                            } else if (verb == "none") {
+                                out.effect = AttributeEffect::None;
+                            } else {
+                                // CLOSED verb set — an unknown verb fails the
+                                // load loud; silently defaulting it would
+                                // disarm the row (e.g. a suppressUnused typo
+                                // would re-enable the unused warning).
+                                coll.emit(
+                                    DiagnosticCode::C_InvalidSemantics,
+                                    "/semantics/attributeSemantics/effects",
+                                    std::format("unknown attribute effect '{}' — "
+                                                "the closed set is suppressUnused"
+                                                " | warnOnUse | warnOnDiscard | "
+                                                "none", verb));
+                                continue;
+                            }
+                            cfg.attributeEffects.push_back(std::move(out));
+                        }
+                    }
+                }
+            }
+
+            // ── nodiscard discard-context (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS) ──
+            // `{ discardStatementRule, expressionRule }` — the TWO-hop discard
+            // shape for the warnOnDiscard effect (design-audit F1): a call's
+            // result is discarded iff parent(call)==expressionRule AND
+            // parent(parent(call))==discardStatementRule. Both resolve like
+            // alignas's readRule. Absent block ⇒ warnOnDiscard never fires.
+            if (sem.contains("nodiscard")) {
+                json const& nd = sem.at("nodiscard");
+                if (!nd.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/nodiscard",
+                              "'semantics.nodiscard' must be an object "
+                              "{ discardStatementRule, expressionRule }");
+                } else {
+                    auto readRule = [&](char const* key, char const* path,
+                                        RuleId& outRule, std::string& outName) {
+                        if (!nd.contains(key) || !nd.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path,
+                                      std::format("'{}' is required and must be a "
+                                                  "string", key));
+                            return;
+                        }
+                        outName = nd.at(key).get<std::string>();
+                        if (!data.rules->contains(outName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path,
+                                      std::format("'nodiscard.{}' references "
+                                                  "unknown shape '{}'", key, outName));
+                            outName.clear();
+                            return;
+                        }
+                        outRule = data.rules->find(outName);
+                    };
+                    readRule("discardStatementRule",
+                             "/semantics/nodiscard/discardStatementRule",
+                             cfg.nodiscardDiscardStatementRule,
+                             cfg.nodiscardDiscardStatementRuleName);
+                    readRule("expressionRule",
+                             "/semantics/nodiscard/expressionRule",
+                             cfg.nodiscardExpressionRule,
+                             cfg.nodiscardExpressionRuleName);
+                }
+            }
+
             // ── variadic intrinsics (FC12a-core, D-FC12A-VARIADIC-CALLEE) ──
             // `{ vaArgRule, vaArgApChild, vaArgTypeChild, vaStartRule,
             //    vaStartApChild, vaEndRule, vaEndApChild }`. Pass 2 resolves the

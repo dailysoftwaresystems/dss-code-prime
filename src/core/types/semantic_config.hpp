@@ -1129,6 +1129,37 @@ struct DSS_EXPORT LoopControlRule {
     std::string ruleName;
 };
 
+// FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): ONE row of the standard-
+// attribute semantics TABLE — a set of attribute NAMES (matched dunder-
+// normalized against the clause's last-::-segment, so `__deprecated__` ≡
+// `deprecated` and `gnu::packed` matches by `packed`) mapped to ONE effect of
+// the CLOSED verb set:
+//   • SuppressUnused — the declared symbol never warns S_UnusedVariable
+//     (`[[maybe_unused]]` / GNU `unused`);
+//   • WarnOnUse      — every use-site of the declared symbol warns
+//     S_DeprecatedSymbolUsed (`[[deprecated["msg"]]]`);
+//   • WarnOnDiscard  — a call to the declared function whose result is
+//     discarded as a bare expression statement warns
+//     S_NodiscardResultDiscarded (`[[nodiscard]]` / GNU `warn_unused_result`);
+//   • None           — KNOWN vocabulary, no effect HERE (either consumed by a
+//     dedicated scan — noreturn/packed — or deliberately inert — fallthrough/
+//     likely/unlikely/reproducible/unsequenced). Listed so the UNKNOWN-
+//     attribute warning never false-fires on a name the language knows.
+// A name matching NO row in the C23 `[[...]]` form warns S_UnknownAttribute
+// (suppressible — C23 forbids fatal unknown standard attributes). The loader
+// validates the effect verb against the closed set (C_InvalidSemantics on an
+// unknown verb — a typo can never silently disarm a row).
+enum class AttributeEffect : std::uint8_t {
+    SuppressUnused,
+    WarnOnUse,
+    WarnOnDiscard,
+    None,
+};
+struct DSS_EXPORT AttributeSemanticsRow {
+    std::vector<std::string> names;                        // dunder-normalized match set
+    AttributeEffect          effect = AttributeEffect::None;
+};
+
 // Literal token-kind → core TypeKind. Pass 2 reads the token-kind of a
 // matched literal leaf and assigns the corresponding lattice type via
 // `TypeInterner::primitive(core)`.
@@ -1312,6 +1343,34 @@ struct DSS_EXPORT SemanticConfig {
     // linkage rides the declaration row's `linkageSpecifiers` map (keyword text →
     // {binding:local}), not this token.
     std::optional<SchemaTokenId> constexprKeywordToken;
+    // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute
+    // semantics table (see AttributeSemanticsRow). `attrSpecRule`/`stdAttrRule`
+    // name the GNU `__attribute__((...))` / C23 `[[...]]` attribute-specifier
+    // shapes — the scan's bounded descent STOPS AT each such node and extracts
+    // its clause(s) (an attrSpec is ONE clause; a stdAttr's Internal children
+    // are one clause each). `attrBareStatementRule` is the bare attribute-
+    // declaration STATEMENT (`[[fallthrough]];`) — pass2Post runs the scan on
+    // it for the unknown-name warning only (no symbol). `attributeEffects` is
+    // the name→effect table. All invalid/empty ⇒ the language has no standard-
+    // attribute semantics (the scan never runs — toy/tsql). Source-AGNOSTIC:
+    // WHICH rules + WHICH names are per-language config; the engine walks the
+    // closed AttributeEffect verb set only.
+    RuleId attrSpecRule{};          std::string attrSpecRuleName;
+    RuleId stdAttrRule{};           std::string stdAttrRuleName;
+    RuleId attrBareStatementRule{}; std::string attrBareStatementRuleName;
+    std::vector<AttributeSemanticsRow> attributeEffects;
+    // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): the nodiscard DISCARD-CONTEXT rule
+    // ids (the `semantics.nodiscard` block). A WarnOnDiscard-flagged call's
+    // result counts as discarded iff the call node's PARENT is
+    // `nodiscardExpressionRule` AND its GRANDPARENT is
+    // `nodiscardDiscardStatementRule` — the TWO-hop shape (design-audit F1: the
+    // expression-engine materializes an `expression` node between the call and
+    // the expression statement, so a one-hop parent==exprStmt check would
+    // NEVER fire). The two-hop-exact match makes `(void)f();` (castExpr
+    // interposes) and `x=f()`/`g(f())`/`return f()` no-fire by construction.
+    // Either invalid ⇒ WarnOnDiscard rows never fire.
+    RuleId nodiscardDiscardStatementRule{}; std::string nodiscardDiscardStatementRuleName;
+    RuleId nodiscardExpressionRule{};       std::string nodiscardExpressionRuleName;
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. `vaArgRule`
     // = the `va_arg(ap,T)` form; pass 2 resolves+stamps its `vaArgTypeChild`
     // castTypeRef (so the HIR lowering recovers the read type T) + stamps the node

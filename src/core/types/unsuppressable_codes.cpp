@@ -418,6 +418,16 @@ constexpr std::array<DiagnosticCode, 96> kUnsuppressableCodes{{
     DiagnosticCode::S_ConstexprUnsupportedType,
     DiagnosticCode::S_ConstexprFunctionNotSupported,
     DiagnosticCode::S_ConstexprInvalidQualifier,
+    // S_UnknownAttribute / S_DeprecatedSymbolUsed / S_NodiscardResultDiscarded
+    // (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13) are deliberately NOT
+    // members — the same suppressible posture as S_UnknownTypeAttribute above.
+    // All three are WARNINGS on conforming programs: C23 forbids treating an
+    // unknown standard attribute as fatal (an unknown `[[frobnicate]]` is
+    // ignorable by definition), and deprecated/nodiscard are lint-tier advice
+    // whose suppression ships no wrong bytes and hides no build failure
+    // (hasErrors() is untouched by a warning). Forcing any of them
+    // unsuppressable would make `--suppress` unable to silence exactly the
+    // class of diagnostic the standard defines as ignorable.
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

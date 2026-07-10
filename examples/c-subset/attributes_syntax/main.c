@@ -3,8 +3,15 @@
 // error):
 //
 //   * C23 [[...]] standard attributes (`[[deprecated]]`,
-//     `[[nodiscard("why")]]`) — parsed and semantically IGNORED
-//     (stdAttr rides linkageSpecifierIgnoredRules; D14).
+//     `[[nodiscard("why")]]`) — FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS)
+//     made these MEAN: the `f(...)` call below now emits the
+//     SUPPRESSIBLE S_DeprecatedSymbolUsed warning (the runner checks
+//     exit codes, not warnings, so this example stays green — the
+//     warning firing IS the feature working). `nodiscard` does NOT
+//     fire here: the call sits in `return` position, which CONSUMES
+//     the result (only a bare `f();` expression statement discards).
+//     The linkage scan still skips both wholesale (stdAttr rides
+//     linkageSpecifierIgnoredRules).
 //   * `__attribute__((visibility("hidden")))` on an UNUSED helper —
 //     the composite linkage key `visibility:hidden` threads
 //     SymbolVisibility::Hidden into MIR, which makes the helper

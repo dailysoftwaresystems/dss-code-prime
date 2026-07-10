@@ -629,6 +629,31 @@ enum class DiagnosticCode : std::uint16_t {
     // declarator. Unsuppressable — a suppressed violation would either fold away
     // volatile reads or silently drop the constexpr constant-ness.
     S_ConstexprInvalidQualifier   = 0xE03B,
+    // C23 §6.7.13 (D-CSUBSET-ATTRIBUTE-SEMANTICS): a C23 `[[...]]` standard
+    // attribute whose name matches NO row of the language's attribute-semantics
+    // table (`[[frobnicate]] int x;`). A WARNING and SUPPRESSIBLE — C23 (and the
+    // WG21 P2552 posture) forbids treating an unknown standard attribute as
+    // fatal: the program is conforming, the attribute is simply ignored. The
+    // GNU `__attribute__((...))` form keeps its own PRE-EXISTING loud gates
+    // (file-scope H_UnknownLinkageSpecifier / composite S_UnknownTypeAttribute)
+    // — this code is the stdAttr-form-only vocabulary warning. The `.actual`
+    // names the unrecognized attribute clause.
+    S_UnknownAttribute            = 0xE03C,
+    // C23 §6.7.13.3 (D-CSUBSET-ATTRIBUTE-SEMANTICS): a use of a symbol declared
+    // `[[deprecated]]` / `[[deprecated("msg")]]` / GNU `__attribute__((deprecated))`
+    // (fires once per use site, incl. a call's callee). A WARNING and
+    // SUPPRESSIBLE — deprecation is lint-tier advice, not a constraint
+    // violation; the program's semantics are unchanged. The `.actual` is the
+    // symbol name, or `name: msg` when the attribute carried a message.
+    S_DeprecatedSymbolUsed        = 0xE03D,
+    // C23 §6.7.13.2 (D-CSUBSET-ATTRIBUTE-SEMANTICS): a call to a function
+    // declared `[[nodiscard]]` / GNU `__attribute__((warn_unused_result))` whose
+    // result is DISCARDED — the call is the entire expression of an expression
+    // statement (`f();`). The `(void)f();` cast idiom and any value use
+    // (`x=f()`, `g(f())`, `return f()`) do NOT fire. A WARNING and SUPPRESSIBLE
+    // — discarding a nodiscard result is diagnosable advice per C23, not a
+    // constraint violation. The `.actual` is the callee name, or `name: msg`.
+    S_NodiscardResultDiscarded    = 0xE03E,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

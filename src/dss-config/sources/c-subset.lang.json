@@ -852,6 +852,16 @@
     },
     "emptyStmt": { "sequence": [ "EndStatement" ] },
 
+    "attributeDeclaration": {
+      "$comment": "FC17 (D-CSUBSET-ATTRIBUTE-STATEMENT, C23 6.8.1): the BARE attribute-declaration statement — `[[fallthrough]];` / `__attribute__((fallthrough));` — one-or-more attribute specifiers followed by `;`. REUSES `compositeAttrList` verbatim (audit-verified side-effect-free: `scanCompositePacked` runs ONLY from a structSpec/unionSpec node, never from a statement). SEMANTICS: the construct is a no-op at runtime — its hirLowering row maps to Skip (the emptyStmt precedent, zero C++); the semantic tier (pass2Post's bareStatementRule arm) runs the attribute scan over it for the UNKNOWN-standard-attribute warning only (facts discarded — no symbol to mark). DSS emits no fallthrough-placement warning to suppress, so `[[fallthrough]]` is semantics-neutral by construction (design note F7).",
+      "sequence": [ "compositeAttrList", "EndStatement" ]
+    },
+    "declOrAttrStmt": {
+      "$comment": "FC17 (D-CSUBSET-ATTRIBUTE-STATEMENT): the varDecl-vs-attributeDeclaration ambiguity site. A statement led by `[[` (stdAttr) or `__attribute__` (attrSpec) is EITHER an attributed declaration (`[[maybe_unused]] int x = 5;` — the attribute rides varDecl's localDeclSpecifiers prefix) OR a bare attribute-declaration statement (`[[fallthrough]];`) — genuinely colliding FIRSTs, so the alt is SPECULATIVE with varDecl probed FIRST (declared order authoritative, the declOrExprStmt precedent); the bare form rolls back on the immediate `;`. lookahead 256 (= the 4096-token probe budget declOrExprStmt uses): the varDecl probe must swallow an entire declaration incl. initializers. HOT PATH (design-audit confirmed): every OTHER statement lead (`int`/`static`/`const`/typedef-name/...) — where varDecl's FIRST is the SOLE survivor — takes the parser's unique-production DIRECT DESCENT (no probe, no checkpoint), so the wrapper adds zero speculation to non-attribute statements. The wrapper MATERIALIZES a CST node (named alt rules do — the declOrExprStmt golden precedent): the statement>declOrAttrStmt>varDecl shape is pinned + the 2 consumers are transparent BY MECHANISM (HIR's unmapped-statement soleMeaningfulChild PassThrough peels it; semantic passes are rule-KEYED full-tree walks).",
+      "alt": [ "varDecl", "attributeDeclaration" ],
+      "speculative": true, "lookahead": 256
+    },
+
     "localDeclSpecifiers": {
       "sequence": [ "localDeclSpecifier", { "repeat": "localDeclSpecifier" } ]
     },
@@ -898,8 +908,9 @@
 
     "statement": {
       "$c30Comment": "c30 D-CSUBSET-LOCAL-TYPEDEF: `typedefDecl` is admitted as a block item (a BLOCK-SCOPED typedef — `typedef void(*LOGFUNC_t)(void*,int,const char*);` inside a function, sqlite3.c:187603). FIRST = TypedefKeyword, DISJOINT from every other statement alt (varDecl is qualifier/type-keyword/storage-class-led; declOrExprStmt is Identifier-led; the rest are their own keywords), so a unique-production DIRECT DESCENT — NO speculation. The whole typedef-name machinery is ALREADY scope-keyed: Pass-1 binds the alias into `current` (= the enclosing block scope) in the Ordinary namespace; the type resolver (`resolveTypeNodeImpl` SE5 arm) and the parse-time oracle (`BinderSketch`) both walk the scope chain, so a block-scoped typedef-name resolves IN the block, SHADOWS an outer same-name typedef, and does NOT leak out (red-on-disable pins enforce the non-leak). HIR→MIR's `lowerStmtNode` lowers a statement-position TypeDecl as a NO-OP (a typedef emits no code; mirrors the TOP-LEVEL TypeDecl). Mirrors c28 (block-scoped struct/union/enum definition).",
+      "$fc17Comment": "FC17 (D-CSUBSET-ATTRIBUTE-STATEMENT): `varDecl` is REPLACED by `declOrAttrStmt` (= alt{varDecl, attributeDeclaration}) — the ONLY varDecl-as-alt-branch site — so a `[[fallthrough]];` statement parses. A DIRECT statement-alt addition of attributeDeclaration was REFUTED: varDecl's FIRST already carries BracketOpen/AttributeKeyword (via localDeclSpecifiers' stdAttr/attrSpec), so the two branches collide → C_AmbiguousAlternatives at load. Every non-attribute-led statement still direct-descends (see declOrAttrStmt's hot-path note).",
       "alt": [
-        "varDecl",
+        "declOrAttrStmt",
         "typedefDecl",
         "staticAssertDecl",
         "block",
@@ -1398,7 +1409,8 @@
         "$alignasIgnoreComment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): an `alignasSpec` in a file-scope declaration's specifier prefix (`alignas(32) int g;`) carries NO linkage — skipped wholesale by the linkage scan (like `stdAttr`); the alignment is read by the semantic alignas scan. `attrSpec` is deliberately NOT ignored here (its `__attribute__((weak/visibility))` tokens ARE meaningful linkage). FC16 (D-CSUBSET-NORETURN): the bare `_Noreturn` keyword carries NO linkage → ignored by kind (NoreturnKeyword).",
         "linkageSpecifierIgnoredRules": ["stdAttr", "alignasSpec"],
         "$noreturnIgnoreNamesComment": "FC16 (D-CSUBSET-NORETURN): the GNU `__attribute__((noreturn))` form shares the `attrSpec` rule with the HONORED linkage attributes (`weak`, `visibility`), so attrSpec CANNOT be ignored wholesale here — the `noreturn` IDENTIFIER is skipped by NAME instead (dunder-normalized, so it also covers `__noreturn__`). A no-op `{binding:...}` linkageSpecifiers entry was REJECTED: it would clobber a co-present `static`/`weak` last-wins (an order-dependent silent linkage miscompile). Any OTHER unknown attribute identifier still fails loud H_UnknownLinkageSpecifier. `[[noreturn]]` rides stdAttr (already wholesale-ignored).",
-        "linkageSpecifierIgnoredNames": ["noreturn"],
+        "$attrIgnoreNamesComment": "FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): the GNU spellings of the SEMANTIC standard attributes — `__attribute__((deprecated[(\"m\")]))` / `((unused))` / `((warn_unused_result))` and the `[[...]]`-vocabulary names when spelled GNU — carry NO linkage; each joins the by-NAME skip (dunder-normalized; a parenthesized string argument is independently skipped by the string-token guard, so `deprecated(\"msg\")` passes whole). WITHOUT these the file-scope GNU spellings hard-fail H_UnknownLinkageSpecifier (probe-confirmed at HEAD). The SEMANTIC meaning is read by the semantic tier's attribute scan (semantics.attributeSemantics), not here. No collision with the honored keys (static/constexpr/weak/visibility:hidden).",
+        "linkageSpecifierIgnoredNames": ["noreturn", "deprecated", "maybe_unused", "unused", "nodiscard", "warn_unused_result"],
         "kindByChild": {
           "$comment": "Post-strip children: [topLevelHead, initDeclaratorList, topLevelDeclTail]. childPath [2,0] = the tail's sole child — a `block` node (function definition) or the EndStatement token (variable; whenRule never matches a token). paramsPath/bodyPath are ABSENT: in declarator mode the params live inside the declarator's fnSuffix and the matched block IS the body.",
           "childPath": [2, 0],
@@ -1510,6 +1522,20 @@
     "noreturn": { "keywordToken": "NoreturnKeyword", "attributeNames": ["noreturn"] },
     "$constexprComment": "FC17 (D-CSUBSET-CONSTEXPR): the C23 6.7.1 `constexpr` OBJECT storage-class specifier. `keywordToken` = the `constexpr` keyword. Pass 1 scans a declaration's specifier prefix (specifierPrefixHasConstexpr, the specifierPrefixNamesNoreturn mirror) and marks each declared symbol isConstexpr (implies isConst); Pass 2's validateConstexprDeclarator then enforces the 6.7.1 constraints AT THE DECLARATION: the initializer must be a compile-time constant (arithmetic scalars fold via the shared CST const-eval engine with floats admitted; a pointer initializer must be a null pointer constant), a missing initializer / a function declarator / a volatile-qualified object type fail loud, and array/struct/union constexpr is a NAMED loud deferral (D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE). ZERO codegen: a validated constexpr object lowers byte-identically to a const object with a foldable initializer. Source-agnostic: WHICH token is per-language config; the engine never hardcodes the spelling.",
     "constexpr": { "keywordToken": "ConstexprKeyword" },
+    "$attributeSemanticsComment": "FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute semantics TABLE — a closed verb set over per-name rows (all rows structurally identical; ONE unknown-name source of truth). `attrSpecRule`/`stdAttrRule` name the two attribute-specifier shapes (GNU `__attribute__((...))` / C23 `[[...]]`); `bareStatementRule` is the bare attribute-declaration statement (`[[fallthrough]];`). The semantic tier's `scanAttributeSemantics` walks a declaration's specifier prefix (or a bare statement), stops AT each attribute node, extracts each clause's name (last-::-segment, dunder-normalized) + optional string message (the shared decodeAdjacentStringBodies chokepoint), and folds the matched row's EFFECT: `suppressUnused` (the D8 unused-variable warning is suppressed — [[maybe_unused]]/GNU unused), `warnOnUse` (each use-site of the symbol warns S_DeprecatedSymbolUsed — [[deprecated]]), `warnOnDiscard` (a call whose result is discarded as a bare expression-statement warns S_NodiscardResultDiscarded — [[nodiscard]]/GNU warn_unused_result), `none` (KNOWN vocabulary consumed elsewhere or deliberately inert — fallthrough/likely/unlikely/reproducible/unsequenced per C23, noreturn [the FC16 scan owns it], packed [the trailing-composite scan owns it; the leading position fails loud at the HIR linkage tier] — listed so the unknown warning NEVER false-fires on them, design fix F4). An UNMATCHED name in the C23 `[[...]]` form warns S_UnknownAttribute (suppressible — C23 forbids fatal unknown standard attributes); the GNU form keeps its pre-existing loud gates (file-scope H_UnknownLinkageSpecifier; block-scope wholesale-ignore = D-CSUBSET-ATTRIBUTE-GNU-BLOCK-SCOPE-UNKNOWN-NAME). Absent block ⇒ the language has no standard-attribute semantics (toy/tsql — the scan never runs). Source-AGNOSTIC: every rule id + name is per-language config; the engine walks the closed effect-verb set only.",
+    "attributeSemantics": {
+      "attrSpecRule": "attrSpec",
+      "stdAttrRule": "stdAttr",
+      "bareStatementRule": "attributeDeclaration",
+      "effects": [
+        { "names": ["maybe_unused", "unused"],           "effect": "suppressUnused" },
+        { "names": ["deprecated"],                       "effect": "warnOnUse"      },
+        { "names": ["nodiscard", "warn_unused_result"],  "effect": "warnOnDiscard"  },
+        { "names": ["fallthrough", "likely", "unlikely", "reproducible", "unsequenced", "noreturn", "packed"], "effect": "none" }
+      ]
+    },
+    "$nodiscardComment": "FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): the nodiscard DISCARD-CONTEXT rule ids for the warnOnDiscard effect. A call's result is 'discarded' when the call is the ENTIRE expression of an expression STATEMENT — structurally, the call node's parent is `expressionRule` AND the grandparent is `discardStatementRule` (the TWO-hop check, design-audit fix F1: the call's parent is the materialized `expression` node, so a one-hop parent==exprStmt check would NEVER fire). This shape makes the `(void)f();` discard idiom SUPPRESS by construction (the castExpr interposes → parent≠expression-under-exprStmt) and `x=f()`/`g(f())`/`return f()` correctly no-fire. Comma/paren-wrapped discards (`(f());`, `f(),g();`) are the named deferral D-CSUBSET-NODISCARD-INDIRECT-DISCARD-CONTEXT (warning-only miss). Absent block ⇒ warnOnDiscard rows never fire.",
+    "nodiscard": { "discardStatementRule": "exprStmt", "expressionRule": "expression" },
     "$variadicComment": "FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. vaArgExpr = [ VaArgKeyword, '(', assignmentExpr(apChild 2), ',', castTypeRef(typeChild 4), ')' ] → pass 2 resolves+stamps the castTypeRef through the SAME resolver casts use (so the HIR lowering recovers the read type T) and stamps the node T; it type-checks `ap` is a va_list. vaStartExpr/vaEndExpr = [ kw, '(', assignmentExpr(apChild 2), ... ] → node stamped `void`; ap type-checked va_list; vaStart also flips the enclosing function's uses-va-start attribute so the LIR prologue spills the arg registers.",
     "variadic": {
       "vaArgRule":   "vaArgExpr",   "vaArgApChild":   2, "vaArgTypeChild": 4,
@@ -1671,6 +1697,8 @@
       { "rule": "sehTryStmt",   "hirKind": "SehTryExcept" },
       { "rule": "sehLeaveStmt", "hirKind": "SehLeave"    },
       { "rule": "emptyStmt",    "hirKind": "Skip"        },
+      { "rule": "attributeDeclaration", "hirKind": "Skip",
+        "$comment": "FC17 (D-CSUBSET-ATTRIBUTE-STATEMENT): a bare attribute-declaration statement (`[[fallthrough]];`) lowers to NOTHING — the emptyStmt Skip precedent, zero C++. The enclosing `declOrAttrStmt` wrapper is deliberately UNMAPPED: the unmapped-statement soleMeaningfulChild PassThrough peels it (for BOTH branches — a varDecl statement reaches its VarDecl row through the same peel)." },
       { "rule": "exprStmt",     "hirKind": "ExprStmt"    }
     ],
 

@@ -7421,3 +7421,327 @@ TEST(SemanticAnalyzerCSubset, ConstexprExactRepresentabilityCurrentlyUnenforced)
     EXPECT_FALSE(negModel.hasErrors())
         << "documents the OPEN 6.7.1p10 boundary — update when the deferral closes";
 }
+
+// ── FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): standard-attribute
+//    semantics — maybe_unused / deprecated / nodiscard / fallthrough /
+//    unknown-attribute policy ─────────────────────────────────────────────────
+
+// C23 6.7.13.4: `[[maybe_unused]]` suppresses the D8 unused-variable warning.
+// The SAME-shape unflagged sibling `y` still warns — the paired control makes
+// this red-on-disable by construction (drop the D8 `isMaybeUnused` skip → the
+// count becomes 2; drop the scan/mint → 2; break the D8 gate itself → 0 and
+// the control flips).
+TEST(SemanticAnalyzerCSubset, MaybeUnusedSuppressesUnusedWarning) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    [[maybe_unused]] int x = 5;\n"
+        "    int y = 6;\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 1u)
+        << "exactly the unflagged sibling warns";
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_UnusedVariable)
+            EXPECT_EQ(diag.actual, "y")
+                << "the [[maybe_unused]] x must not be the warning subject";
+    }
+}
+
+// The GNU spelling `__attribute__((unused))` maps to the SAME suppressUnused
+// row (dunder-normalized, so `__unused__` also matches). Block scope: the
+// attrSpec rides varDecl's localDeclSpecifiers.
+TEST(SemanticAnalyzerCSubset, GnuUnusedSpellingSuppresses) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    __attribute__((unused)) int x = 5;\n"
+        "    __attribute__((__unused__)) int w = 7;\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u)
+        << "both GNU unused spellings must suppress the warning";
+}
+
+// C23 6.7.13: an attribute in the declaration specifiers appertains to EACH
+// declared entity — `[[maybe_unused]] int a, b;` suppresses for BOTH
+// declarators (the facts are folded once per declaration, applied per
+// declarator — the alignas/noreturn shared-prefix precedent).
+TEST(SemanticAnalyzerCSubset, MaybeUnusedMultiDeclaratorAppliesAll) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    [[maybe_unused]] int a, b;\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u)
+        << "the shared specifier prefix must flag every declarator";
+}
+
+// C23 6.7.13.3: each USE of a `[[deprecated]]` function warns — per call site
+// (2 calls → 2 warnings, distinct spans), as a WARNING, naming the symbol. A
+// non-deprecated sibling `h` never warns (the control).
+TEST(SemanticAnalyzerCSubset, DeprecatedWarnsAtEachCallSite) {
+    auto model = analyzeShipped("c-subset", {
+        "[[deprecated]] int g(void) { return 1; }\n"
+        "int h(void) { return 2; }\n"
+        "int main(void) { return g() + h() + g(); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 2u)
+        << "one warning per use site — two calls to g, none for h";
+    std::vector<std::uint32_t> starts;
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code != DiagnosticCode::S_DeprecatedSymbolUsed) continue;
+        EXPECT_EQ(diag.severity, DiagnosticSeverity::Warning);
+        EXPECT_EQ(diag.actual, "g");
+        starts.push_back(diag.span.start());
+    }
+    ASSERT_EQ(starts.size(), 2u);
+    EXPECT_NE(starts[0], starts[1])
+        << "the two warnings must anchor at the two DISTINCT use sites";
+}
+
+// `[[deprecated("use h instead")]]` — the decoded string argument rides the
+// warning as `name: msg` (the shared decodeAdjacentStringBodies chokepoint).
+TEST(SemanticAnalyzerCSubset, DeprecatedMessageIncluded) {
+    auto model = analyzeShipped("c-subset", {
+        "[[deprecated(\"use h instead\")]] int g(void) { return 1; }\n"
+        "int main(void) { return g(); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u);
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed)
+            EXPECT_EQ(diag.actual, "g: use h instead");
+    }
+}
+
+// A `[[deprecated]]` PROTOTYPE + an unflagged definition: the flag OR-merges
+// into the surviving definition (the isNoreturn mergedFnDecls precedent), so a
+// call — which resolves to the survivor — still warns. RED-ON-DISABLE for the
+// merge: drop the OR-merge block → detection marked only the absorbed proto,
+// the survivor stays unflagged, the count drops to 0.
+TEST(SemanticAnalyzerCSubset, DeprecatedProtoOrMergesIntoDefinition) {
+    auto model = analyzeShipped("c-subset", {
+        "[[deprecated(\"legacy\")]] int g(void);\n"
+        "int g(void) { return 1; }\n"
+        "int main(void) { return g(); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u)
+        << "the proto's deprecated flag must OR-merge into the definition";
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed)
+            EXPECT_EQ(diag.actual, "g: legacy")
+                << "the message must merge too (first-non-empty-wins)";
+    }
+}
+
+// A deprecated OBJECT (not just functions): each use of the global warns via
+// the same reference-resolution chokepoint.
+TEST(SemanticAnalyzerCSubset, DeprecatedObjectUseWarns) {
+    auto model = analyzeShipped("c-subset", {
+        "[[deprecated]] int legacy_flag;\n"
+        "int main(void) { return legacy_flag; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u)
+        << "a deprecated object's use site must warn like a function's";
+}
+
+// C23 6.7.13.2: a `[[nodiscard]]` call whose result is DISCARDED — the call is
+// the entire expression of an expression statement — warns (Warning severity,
+// naming the callee).
+TEST(SemanticAnalyzerCSubset, NodiscardDiscardedWarns) {
+    auto model = analyzeShipped("c-subset", {
+        "[[nodiscard]] int f(void) { return 1; }\n"
+        "int main(void) { f(); return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NodiscardResultDiscarded), 1u);
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_NodiscardResultDiscarded) {
+            EXPECT_EQ(diag.severity, DiagnosticSeverity::Warning);
+            EXPECT_EQ(diag.actual, "f");
+        }
+    }
+}
+
+// ★ THE F1 red-on-disable pin: `(void)f();` must NOT warn. The discard check
+// is TWO-hop-exact (parent(call)==expression AND grandparent==exprStmt) at the
+// SEMANTIC tier where the cast still exists structurally (a castExpr
+// interposes → parent≠expression-under-exprStmt). This pin goes red if the
+// check ever moves post-HIR (where the (void) cast is elided) OR if the hop
+// count is wrong (a THREE-hop / suffix-blind check would fire here; the
+// original ONE-hop design bug would fire NOWHERE — caught by
+// NodiscardDiscardedWarns above going red instead).
+TEST(SemanticAnalyzerCSubset, NodiscardVoidCastSuppresses) {
+    auto model = analyzeShipped("c-subset", {
+        "[[nodiscard]] int f(void) { return 1; }\n"
+        "int main(void) { (void)f(); return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NodiscardResultDiscarded), 0u)
+        << "the (void) cast is the C idiom for a deliberate discard — no warning";
+}
+
+// A nodiscard result that IS consumed never warns: initializer, argument, and
+// return-value positions (each has the wrong parent/grandparent shape).
+TEST(SemanticAnalyzerCSubset, NodiscardUsedInExpressionNoWarn) {
+    auto model = analyzeShipped("c-subset", {
+        "[[nodiscard]] int f(void) { return 1; }\n"
+        "int g(int v) { return v; }\n"
+        "int main(void) {\n"
+        "    int r = f();\n"
+        "    int s = g(f());\n"
+        "    if (r + s == 3) { return f(); }\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NodiscardResultDiscarded), 0u)
+        << "init / argument / return positions all consume the result";
+}
+
+// `[[nodiscard("reason")]]` — the message rides the warning as `name: msg`.
+TEST(SemanticAnalyzerCSubset, NodiscardMessageIncluded) {
+    auto model = analyzeShipped("c-subset", {
+        "[[nodiscard(\"check the error code\")]] int f(void) { return 1; }\n"
+        "int main(void) { f(); return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NodiscardResultDiscarded), 1u);
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_NodiscardResultDiscarded)
+            EXPECT_EQ(diag.actual, "f: check the error code");
+    }
+}
+
+// The GNU spelling `__attribute__((warn_unused_result))` maps to the SAME
+// warnOnDiscard row; a proto-only spelling OR-merges into the definition
+// (message-less → `.actual` is the bare name).
+TEST(SemanticAnalyzerCSubset, GnuWarnUnusedResultWarnsAndMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "__attribute__((warn_unused_result)) int f(void);\n"
+        "int f(void) { return 1; }\n"
+        "int main(void) { f(); return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NodiscardResultDiscarded), 1u)
+        << "the GNU spelling + the proto-to-definition OR-merge must both work";
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_NodiscardResultDiscarded)
+            EXPECT_EQ(diag.actual, "f");
+    }
+}
+
+// C23 6.7.13p3 posture: an UNKNOWN `[[...]]` standard attribute warns
+// SUPPRESSIBLY and the program still compiles (hasErrors()==false) — C23
+// forbids treating it as fatal. Exactly ONE warning even for a
+// multi-declarator declaration (the once-per-declaration scan site).
+TEST(SemanticAnalyzerCSubset, UnknownStdAttrWarnsSuppressibly) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    [[frobnicate]] int x = 1, y = 2;\n"
+        "    return x + y - 3;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "an unknown standard attribute must never fail the build";
+    ASSERT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownAttribute), 1u)
+        << "once per declaration, not per declarator";
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_UnknownAttribute) {
+            EXPECT_EQ(diag.severity, DiagnosticSeverity::Warning);
+            EXPECT_EQ(diag.actual, "frobnicate");
+        }
+    }
+}
+
+// ★ THE F4 pin: names the language KNOWS — consumed by a dedicated scan
+// (noreturn) or deliberately inert per C23 (fallthrough/likely/unlikely/
+// reproducible/unsequenced) — must NOT trip the unknown-attribute warning.
+// Without the effect-table `none` rows, `[[noreturn]] int f(void);` would
+// false-fire S_UnknownAttribute.
+TEST(SemanticAnalyzerCSubset, KnownC23NoOpAttributesDontWarn) {
+    auto model = analyzeShipped("c-subset", {
+        "[[noreturn]] void die(void);\n"
+        "void die(void) { while (1) { } }\n"
+        "[[reproducible]] int f(void) { return 1; }\n"
+        "int main(void) {\n"
+        "    [[likely]] int a = f();\n"
+        "    [[unlikely]] int b = 2;\n"
+        "    [[unsequenced]] int c = 3;\n"
+        "    return a + b + c - 6;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownAttribute), 0u)
+        << "known C23 vocabulary must never warn unknown (F4)";
+}
+
+// C23 6.8.1: the bare attribute-declaration STATEMENT `[[fallthrough]];`
+// parses + analyzes clean inside a switch (both spellings). The runtime
+// witness (1+10=11 through the marked fallthrough) is the
+// examples/c-subset/switch_fallthrough_attribute corpus entry.
+TEST(SemanticAnalyzerCSubset, FallthroughStatementParsesInSwitch) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    int x = 1; int acc = 0;\n"
+        "    switch (x) {\n"
+        "        case 1: acc += 1; [[fallthrough]];\n"
+        "        case 2: acc += 10; break;\n"
+        "        default: acc = 99; break;\n"
+        "    }\n"
+        "    return acc - 11;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "[[fallthrough]]; must parse + analyze clean as a switch body item";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownAttribute), 0u);
+}
+
+// The GNU statement spelling `__attribute__((fallthrough));` rides the SAME
+// attributeDeclaration rule (compositeAttrList admits attrSpec | stdAttr).
+TEST(SemanticAnalyzerCSubset, GnuFallthroughSpellingParses) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    int x = 1; int acc = 0;\n"
+        "    switch (x) {\n"
+        "        case 1: acc += 1; __attribute__((fallthrough));\n"
+        "        case 2: acc += 10; break;\n"
+        "        default: acc = 99; break;\n"
+        "    }\n"
+        "    return acc - 11;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "__attribute__((fallthrough)); must parse as a statement";
+}
+
+// A bare statement with an UNKNOWN standard attribute (`[[frobnicate]];`)
+// warns suppressibly through the pass2Post bareStatementRule arm — same
+// policy as the declaration position, still no error.
+TEST(SemanticAnalyzerCSubset, UnknownBareStatementAttrWarnsSuppressibly) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    [[frobnicate]];\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownAttribute), 1u);
+}

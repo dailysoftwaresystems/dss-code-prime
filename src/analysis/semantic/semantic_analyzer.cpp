@@ -2312,6 +2312,147 @@ specifierPrefixHasConstexpr(SemanticConfig const& cfg, Tree const& tree,
     return false;
 }
 
+// FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute
+// facts folded from ONE declaration's specifier prefix (or one bare attribute-
+// declaration statement) by `scanAttributeSemantics` below. Computed once per
+// declaration (the declAlignasSpec/declHasNoreturn precedent) and applied to
+// every named declarator's SymbolRecord. Messages merge first-non-empty-wins
+// across clauses/specifiers (design note F7).
+struct AttributeSemanticsFacts {
+    bool        maybeUnused = false;   // suppressUnused row matched
+    bool        deprecated  = false;   // warnOnUse row matched
+    std::string deprecatedMessage;
+    bool        nodiscard   = false;   // warnOnDiscard row matched
+    std::string nodiscardMessage;
+};
+
+// FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): extract ONE attribute clause from a
+// clause node — a whole `attrSpec` (`__attribute__((deprecated("m")))` is ONE
+// clause) or one `stdAttrItem` (`deprecated("m")` / `gnu::packed` inside a
+// `[[...]]`). The NAME is the LAST identifier among the node's DIRECT visible
+// children (the `::`-namespaced form's final segment — `gnu::packed` → `packed`;
+// both shapes inline their sequences, so the identifier(s) land flat),
+// dunder-normalized via the shared `stripDunder`. The OPTIONAL string argument
+// is the sole Internal direct child (a `stringLiteralExpr`), decoded via the
+// SHARED `decodeAdjacentStringBodies` chokepoint (the static_assert message
+// precedent — escapes + adjacent concat decode identically everywhere). A
+// clause with no identifier (an empty `__attribute__(())`) yields nullopt.
+struct AttributeClause {
+    std::string_view name;      // dunder-normalized final name segment
+    std::string      message;   // decoded string argument ("" = none/undecodable)
+};
+[[nodiscard]] std::optional<AttributeClause>
+extractOneAttrClause(EngineState& s, SemanticConfig const& cfg,
+                     Tree const& tree, NodeId clauseNode) {
+    NodeId nameTok{};
+    NodeId msgNode{};
+    for (NodeId c : visibleChildren(tree, clauseNode)) {
+        if (tree.kind(c) == NodeKind::Token) {
+            if (cfg.identifierToken.valid()
+                && tree.tokenKind(c) == cfg.identifierToken) {
+                nameTok = c;   // LAST identifier wins → the ::-final segment
+            }
+            continue;
+        }
+        // The only Internal child either shape admits is the parenthesized
+        // string-literal argument (`stringLiteralExpr`).
+        if (!msgNode.valid()) msgNode = c;
+    }
+    if (!nameTok.valid()) return std::nullopt;
+    AttributeClause out;
+    out.name = stripDunder(tree.text(nameTok));
+    if (msgNode.valid() && s.idx().stringLiteralBodyToken.valid()) {
+        if (auto decoded = decodeAdjacentStringBodies(
+                tree, msgNode, s.idx().stringLiteralBodyToken)) {
+            out.message = std::move(*decoded);
+        }
+    }
+    return out;
+}
+
+// FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): fold the attribute-semantics effects
+// over every attribute specifier in `startNode`'s subtree (a declaration's
+// STRIPPED specifier prefix, or a bare attribute-declaration statement). A
+// bounded descent that STOPS AT each attribute node: a `stdAttrRule` node
+// (C23 `[[...]]`) contributes one clause per Internal child (`stdAttrItem` —
+// `[[a, b]]` is two clauses); an `attrSpecRule` node (GNU `__attribute__`) is
+// ONE clause. Each clause's name is matched (dunder-normalized) against the
+// config's `attributeEffects` rows and the matched row's effect folds into
+// `out` (messages first-non-empty-wins).
+//
+// UNKNOWN names: a C23 `[[...]]` clause matching NO row emits the SUPPRESSIBLE
+// Warning S_UnknownAttribute — but ONLY when `emitUnknown` (the once-per-
+// declaration Pass-1.5 site + the bare-statement Pass-2 arm; a re-scan must
+// not double-fire). The GNU form NEVER warns here: its unknown names keep the
+// pre-existing loud gates (file-scope H_UnknownLinkageSpecifier at the HIR
+// linkage scan; the block-scope wholesale-ignore is the named deferral
+// D-CSUBSET-ATTRIBUTE-GNU-BLOCK-SCOPE-UNKNOWN-NAME).
+void scanAttributeSemantics(EngineState& s, SemanticConfig const& cfg,
+                            Tree const& tree, NodeId startNode,
+                            bool emitUnknown, AttributeSemanticsFacts& out) {
+    if (!startNode.valid()) return;
+    if (cfg.attributeEffects.empty()) return;
+    if (!cfg.attrSpecRule.valid() && !cfg.stdAttrRule.valid()) return;
+    auto const foldClause = [&](NodeId clauseNode, bool fromStdForm) {
+        auto clause = extractOneAttrClause(s, cfg, tree, clauseNode);
+        if (!clause.has_value()) return;
+        AttributeSemanticsRow const* row = nullptr;
+        for (auto const& r : cfg.attributeEffects) {
+            for (auto const& nm : r.names) {
+                if (clause->name == nm) { row = &r; break; }
+            }
+            if (row != nullptr) break;
+        }
+        if (row == nullptr) {
+            if (fromStdForm && emitUnknown) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_UnknownAttribute;
+                d.severity = DiagnosticSeverity::Warning;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(clauseNode);
+                d.actual   = std::string{tree.text(clauseNode)};
+                s.reporter.report(std::move(d));
+            }
+            return;
+        }
+        switch (row->effect) {
+            case AttributeEffect::SuppressUnused:
+                out.maybeUnused = true;
+                break;
+            case AttributeEffect::WarnOnUse:
+                out.deprecated = true;
+                if (out.deprecatedMessage.empty())
+                    out.deprecatedMessage = std::move(clause->message);
+                break;
+            case AttributeEffect::WarnOnDiscard:
+                out.nodiscard = true;
+                if (out.nodiscardMessage.empty())
+                    out.nodiscardMessage = std::move(clause->message);
+                break;
+            case AttributeEffect::None:
+                break;   // known vocabulary, consumed elsewhere / inert
+        }
+    };
+    std::vector<NodeId> stack{startNode};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId c = stack.back(); stack.pop_back();
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        RuleId const r = tree.rule(c);
+        if (cfg.stdAttrRule.valid() && r.v == cfg.stdAttrRule.v) {
+            for (NodeId item : visibleChildren(tree, c)) {
+                if (tree.kind(item) == NodeKind::Internal)
+                    foldClause(item, /*fromStdForm=*/true);
+            }
+            continue;   // stop AT the attribute node
+        }
+        if (cfg.attrSpecRule.valid() && r.v == cfg.attrSpecRule.v) {
+            foldClause(c, /*fromStdForm=*/false);
+            continue;   // stop AT the attribute node
+        }
+        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+    }
+}
+
 // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): compute + validate the alignment an
 // `alignasSpec` node requests. Reads the `alignasArg` operand (visible-child
 // `alignasArgChild`): a `castTypeRef` (TYPE form) resolves the type + reads its
@@ -4110,6 +4251,17 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                     // on a non-function object is inert — a named safe-miss deferral).
                     bool const declHasNoreturn =
                         specifierPrefixNamesNoreturn(cfg, tree, node, decl);
+                    // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): fold the standard-
+                    // attribute effects from this declaration's specifier
+                    // prefix ONCE (like `declAlignasSpec`/`declHasNoreturn`);
+                    // applied to EVERY named declarator below, so
+                    // `[[maybe_unused]] int a, b;` flags both. emitUnknown=true
+                    // — this is the once-per-declaration site, so an unknown
+                    // `[[frobnicate]]` warns exactly once even multi-declarator.
+                    AttributeSemanticsFacts declAttrFacts;
+                    scanAttributeSemantics(
+                        s, cfg, tree, specifierPrefixChild(tree, node, decl),
+                        /*emitUnknown=*/true, declAttrFacts);
                     bool alignasHandledForDecl = false;
                     bool alignasBitfieldReported = false;
                     bool alignasContextReported = false;
@@ -4300,6 +4452,31 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                         // survivor by the post-1.5 sweep so a call sees the flag.
                         if (isFnSig && declHasNoreturn)
                             s.symbols.at(sym).isNoreturn = true;
+                        // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): apply the
+                        // declaration's folded attribute facts to THIS
+                        // declarator's symbol (C23 6.7.13: an attribute in the
+                        // declaration specifiers appertains to each declared
+                        // entity). No type gate — maybe_unused is read only by
+                        // the D8 object check, nodiscard only by checkCall's
+                        // function arm, deprecated by any use — an
+                        // inapplicable-kind flag is inert, never wrong bytes.
+                        // Messages first-non-empty-wins (F7).
+                        if (declAttrFacts.maybeUnused)
+                            s.symbols.at(sym).isMaybeUnused = true;
+                        if (declAttrFacts.deprecated) {
+                            auto& atRec = s.symbols.at(sym);
+                            atRec.isDeprecated = true;
+                            if (atRec.deprecatedMessage.empty())
+                                atRec.deprecatedMessage =
+                                    declAttrFacts.deprecatedMessage;
+                        }
+                        if (declAttrFacts.nodiscard) {
+                            auto& atRec = s.symbols.at(sym);
+                            atRec.isNodiscard = true;
+                            if (atRec.nodiscardMessage.empty())
+                                atRec.nodiscardMessage =
+                                    declAttrFacts.nodiscardMessage;
+                        }
                         // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): a VARIABLE's alignas.
                         // Only for a NON-field declaration (`!bitfieldSuffix` — a
                         // field is handled above); a PARAMETER carries its own
@@ -5747,6 +5924,27 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         s.nodeToSymbol.set(resolved.node, found);
                         s.usesBySymbol[found.v].push_back(resolved.node);
                         auto const& rec = s.symbols.at(found);
+                        // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13.3):
+                        // a USE of a `[[deprecated]]` symbol warns HERE — the
+                        // single reference-resolution chokepoint, so every use
+                        // site fires once (incl. a call's callee, which is an
+                        // operand-rule reference). Decl sites never reach this
+                        // arm (the isDeclSite gate above). Suppressible
+                        // Warning; `.actual` = name or "name: msg". Deprecated
+                        // TYPES (tags/typedefs resolve via type resolution, not
+                        // here) are the named deferral
+                        // D-CSUBSET-ATTRIBUTE-DEPRECATED-TYPES.
+                        if (rec.isDeprecated) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_DeprecatedSymbolUsed;
+                            d.severity = DiagnosticSeverity::Warning;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(resolved.node);
+                            d.actual   = rec.deprecatedMessage.empty()
+                                ? resolved.name
+                                : resolved.name + ": " + rec.deprecatedMessage;
+                            s.reporter.report(std::move(d));
+                        }
                         if (rec.type.valid()) {
                             s.nodeToType.set(resolved.node, rec.type);
                             s.nodeToType.set(node, rec.type);
@@ -6492,6 +6690,21 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             }
             s.reporter.report(std::move(d));
         }
+    }
+
+    // FC17 (D-CSUBSET-ATTRIBUTE-STATEMENT, C23 6.8.1): a BARE attribute-
+    // declaration statement (`[[fallthrough]];` / `__attribute__((...));`).
+    // No symbol to mark — the scan runs for its UNKNOWN-standard-attribute
+    // warning only (`[[frobnicate]];` warns suppressibly; the folded facts are
+    // discarded). The construct lowers to nothing (hirLowering row → Skip);
+    // DSS emits no fallthrough-placement warning to suppress, so
+    // `[[fallthrough]]` is semantics-neutral by construction (design note F7).
+    if (k == NodeKind::Internal
+        && cfg.attrBareStatementRule.valid()
+        && tree.rule(node).v == cfg.attrBareStatementRule.v) {
+        AttributeSemanticsFacts discardedFacts;
+        scanAttributeSemantics(s, cfg, tree, node, /*emitUnknown=*/true,
+                               discardedFacts);
     }
 
     // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): a `_Generic ( ctrl ,
@@ -7243,6 +7456,42 @@ void checkCall(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         return;
     }
 
+    // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13.2): the nodiscard
+    // discarded-result warning, in the DIRECT-symbol tail (calleeSym in scope;
+    // fn-pointer / expression callees are the named deferral
+    // D-CSUBSET-NODISCARD-INDIRECT-CALLEE — the isDirectNoreturnCall scope
+    // precedent). The discard context is the TWO-hop shape (design-audit F1):
+    // the expression engine materializes an `expression` node between the call
+    // and its statement, so the call's result is discarded iff
+    // parent(call)==expressionRule AND grandparent(call)==discardStatementRule.
+    // By construction this makes `(void)f();` silent (a castExpr interposes)
+    // and `x=f()` / `g(f())` / `return f()` no-fire (wrong parent/grandparent).
+    // Comma/paren-wrapped discards (`(f());`, `f(), g();`) are the named
+    // deferral D-CSUBSET-NODISCARD-INDIRECT-DISCARD-CONTEXT (warning-only
+    // miss, never wrong bytes). Suppressible Warning; `.actual` = name or
+    // "name: msg".
+    if (s.symbols.at(calleeSym).isNodiscard
+        && cfg.nodiscardExpressionRule.valid()
+        && cfg.nodiscardDiscardStatementRule.valid()) {
+        NodeId const p1 = tree.parent(node);
+        if (p1.valid() && tree.kind(p1) == NodeKind::Internal
+            && tree.rule(p1).v == cfg.nodiscardExpressionRule.v) {
+            NodeId const p2 = tree.parent(p1);
+            if (p2.valid() && tree.kind(p2) == NodeKind::Internal
+                && tree.rule(p2).v == cfg.nodiscardDiscardStatementRule.v) {
+                auto const& ndRec = s.symbols.at(calleeSym);
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_NodiscardResultDiscarded;
+                d.severity = DiagnosticSeverity::Warning;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(node);
+                d.actual   = ndRec.nodiscardMessage.empty()
+                    ? resolved.name
+                    : resolved.name + ": " + ndRec.nodiscardMessage;
+                s.reporter.report(std::move(d));
+            }
+        }
+    }
     // Direct symbol call: the shared tail does the result-type stamp,
     // the variadic-aware arity check, and per-arg assignability. The
     // symbol arm threads its own `variadicBuiltin` flag (e.g. tsql
@@ -8951,6 +9200,34 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 s.symbols.at(survivor).isNoreturn = nr;
                 s.symbols.at(absorbed).isNoreturn = nr;
             }
+            // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): OR-merge deprecated /
+            // nodiscard across the proto/def pair, the isNoreturn precedent —
+            // a use/call resolves to the SURVIVOR (definition), so a flag
+            // spelled only on the prototype must merge INTO it (OR-ing both
+            // covers either merge order). Messages first-non-empty-wins,
+            // survivor-preferred (F7). `isMaybeUnused` is deliberately NOT
+            // merged — it is consulted only at the declarator's own D8 check.
+            {
+                bool const dep = s.symbols.at(survivor).isDeprecated
+                              || s.symbols.at(absorbed).isDeprecated;
+                bool const nd  = s.symbols.at(survivor).isNodiscard
+                              || s.symbols.at(absorbed).isNodiscard;
+                std::string const depMsg =
+                    !s.symbols.at(survivor).deprecatedMessage.empty()
+                        ? s.symbols.at(survivor).deprecatedMessage
+                        : s.symbols.at(absorbed).deprecatedMessage;
+                std::string const ndMsg =
+                    !s.symbols.at(survivor).nodiscardMessage.empty()
+                        ? s.symbols.at(survivor).nodiscardMessage
+                        : s.symbols.at(absorbed).nodiscardMessage;
+                for (SymbolId const side : {survivor, absorbed}) {
+                    auto& rec = s.symbols.at(side);
+                    rec.isDeprecated      = dep;
+                    rec.isNodiscard       = nd;
+                    rec.deprecatedMessage = depMsg;
+                    rec.nodiscardMessage  = ndMsg;
+                }
+            }
             auto const& sRec = s.symbols.at(survivor);
             auto const& aRec = s.symbols.at(absorbed);
             if (!sRec.type.valid() || !aRec.type.valid()) continue;
@@ -8999,6 +9276,11 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         for (std::size_t i = 1; i < records.size(); ++i) {
             auto const& rec = records[i];
             if (!rec.warnIfUnused) continue;
+            // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13.4): a declaration
+            // flagged `[[maybe_unused]]` / GNU `__attribute__((unused))` opts
+            // its symbols OUT of the unused warning — the whole point of the
+            // attribute. Same engine, same empty use-set, no warning.
+            if (rec.isMaybeUnused) continue;
             auto useIt = s.usesBySymbol.find(static_cast<std::uint32_t>(i));
             if (useIt != s.usesBySymbol.end() && !useIt->second.empty()) continue;
             auto treeIt = treeById.find(rec.tree.v);

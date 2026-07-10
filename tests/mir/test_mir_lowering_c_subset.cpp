@@ -1277,6 +1277,36 @@ TEST(MirLoweringCSubsetLinkage, StaticNoreturnKeepsInternalLinkage) {
     }
 }
 
+// FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): `static __attribute__((deprecated))
+// int f(void)` keeps its INTERNAL linkage — the by-NAME linkage skip
+// (`linkageSpecifierIgnoredNames` += the semantic-attribute spellings) has NO
+// linkage effect, so it cannot clobber a co-present `static` (the exact
+// last-wins {binding:global} hazard the noreturn cycle's design rejected; this
+// extends that pin to the FC17 names). RED-ON-DISABLE: replace the by-name
+// skip with a linkageSpecifiers {binding:global} row for "deprecated" →
+// last-wins clobbers the static → localCount drops to 0.
+TEST(MirLoweringCSubsetLinkage, GnuDeprecatedDoesNotClobberStaticLinkage) {
+    auto L = lowerCSubset(
+        "static __attribute__((deprecated)) int f(void){ return 0; }\n"
+        "int main(void){ return f(); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u) << "f + main (pre-DCE)";
+    int localCount = 0;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        if (m.funcBinding(m.funcAt(i)) == SymbolBinding::Local) ++localCount;
+    EXPECT_EQ(localCount, 1)
+        << "static __attribute__((deprecated)) f must keep internal linkage "
+           "(binding==Local); the by-name-ignored attribute must NOT "
+           "externalize it";
+}
+
 // FC17 (D-CSUBSET-CONSTEXPR) linkage: C23 6.2.2p3 (N3096) gives a FILE-scope
 // object declared `constexpr` INTERNAL linkage — constexpr joins `static` in
 // the 6.2.2p3 list. The config carrier is topLevelDecl's

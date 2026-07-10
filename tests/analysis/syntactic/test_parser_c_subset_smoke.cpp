@@ -1725,3 +1725,63 @@ TEST(ParserCSubsetSmoke, ThreeAdjacentStringsHaveSixChildren) {
     EXPECT_EQ(visibleTokenChildCount(t, sle), 6u)
         << "\"a\" \"b\" \"c\" → 6 flat token children (repeat fires twice)";
 }
+
+// ── FC17 (D-CSUBSET-ATTRIBUTE-STATEMENT, C23 6.8.1): the attribute-declaration
+//    statement + the declOrAttrStmt wrapper shape ─────────────────────────────
+
+// ★ The F2 wrapper-shape pin: a statement-position declaration now parses as
+// `statement > declOrAttrStmt > varDecl` — the named alt rule MATERIALIZES a
+// CST node (the declOrExprStmt precedent). Both consumers are transparent BY
+// MECHANISM (HIR's unmapped-statement soleMeaningfulChild PassThrough peels
+// it; semantic passes are rule-keyed full-tree walks), so the SHAPE is the
+// contract this pin owns: if the wrapper is ever removed (or doubled), the
+// corpus .tree golden AND this pin flip together — deliberately.
+TEST(ParserCSubsetSmoke, StatementVarDeclRidesTheDeclOrAttrStmtWrapper) {
+    Tree t = parseCSubset("int main() { int x; return x; }");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    NodeId const wrapper = findFirstNodeWithRule(t, "declOrAttrStmt");
+    ASSERT_TRUE(wrapper.valid())
+        << "a local declaration statement must ride the declOrAttrStmt wrapper";
+    // The wrapper's sole child is the committed varDecl branch.
+    NodeId const stmt = t.parent(wrapper);
+    ASSERT_TRUE(stmt.valid());
+    EXPECT_EQ(t.rules().name(t.rule(stmt)), std::string_view{"statement"})
+        << "the wrapper's parent is the statement alt node";
+    NodeId const decl = findFirstNodeWithRule(t, "varDecl");
+    ASSERT_TRUE(decl.valid());
+    EXPECT_EQ(t.parent(decl).v, wrapper.v)
+        << "statement > declOrAttrStmt > varDecl — the varDecl is the "
+           "wrapper's direct child";
+}
+
+// `[[fallthrough]];` parses as `statement > declOrAttrStmt >
+// attributeDeclaration` (the varDecl probe rolls back on the immediate `;`).
+TEST(ParserCSubsetSmoke, FallthroughStatementParsesAsAttributeDeclaration) {
+    Tree t = parseCSubset(
+        "int main() { int x = 1; switch (x) { case 1: x = 2; [[fallthrough]]; "
+        "case 2: x = 3; break; } return x; }");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "[[fallthrough]]; must parse as a statement";
+    NodeId const attrStmt = findFirstNodeWithRule(t, "attributeDeclaration");
+    ASSERT_TRUE(attrStmt.valid());
+    NodeId const wrapper = t.parent(attrStmt);
+    ASSERT_TRUE(wrapper.valid());
+    EXPECT_EQ(t.rules().name(t.rule(wrapper)), std::string_view{"declOrAttrStmt"})
+        << "the bare attribute statement rides the same wrapper alt";
+}
+
+// An ATTRIBUTED declaration statement (`[[maybe_unused]] int x = 5;`) still
+// commits the varDecl branch — the attribute rides varDecl's
+// localDeclSpecifiers prefix, NOT the attributeDeclaration reading (declared
+// probe order: varDecl first).
+TEST(ParserCSubsetSmoke, AttributedLocalDeclCommitsVarDeclBranch) {
+    Tree t = parseCSubset("int main() { [[maybe_unused]] int x = 5; return 0; }");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "varDecl"))
+        << "the attributed declaration must commit the varDecl reading";
+    EXPECT_FALSE(hasInternalNodeWithRule(t, "attributeDeclaration"))
+        << "the attributeDeclaration branch must NOT win for a declaration";
+}

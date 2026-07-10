@@ -261,6 +261,35 @@ struct DSS_EXPORT SymbolRecord {
     // linkage — C23 6.2.2p3 — rides the declaration row's `linkageSpecifiers`
     // config, not this flag). Default false.
     bool            isConstexpr = false;
+    // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute
+    // facts folded from the declaration's specifier prefix by
+    // `scanAttributeSemantics` (Pass-1.5 declarator resolution — the
+    // alignas/noreturn shared-prefix precedent; computed once per declaration,
+    // applied to EVERY declarator, so `[[maybe_unused]] int a, b;` flags both).
+    //
+    // `isMaybeUnused` (C23 6.7.13.4 / GNU `unused`): the D8 unused-variable
+    // check skips this symbol. Deliberately NOT proto/def-merged — it is
+    // consulted only at the declarator's OWN D8 check (each declaration
+    // suppresses its own warning). A dropped flag is a spurious WARNING, never
+    // a miscompile.
+    bool            isMaybeUnused = false;
+    // `isDeprecated` (C23 6.7.13.3): every USE of this symbol warns
+    // S_DeprecatedSymbolUsed at the Pass-2 reference-resolution chokepoint
+    // (per use site, incl. a call's callee). OR-merged across a proto/def pair
+    // (the isNoreturn mergedFnDecls precedent — a call resolves to the
+    // survivor); `deprecatedMessage` merges first-non-empty-wins. Warning-only:
+    // a dropped flag misses advice, never bytes. Types (struct/union/enum tags,
+    // typedefs) are the named deferral D-CSUBSET-ATTRIBUTE-DEPRECATED-TYPES
+    // (they resolve via type resolution, not this chokepoint — silently inert).
+    bool            isDeprecated = false;
+    std::string     deprecatedMessage;
+    // `isNodiscard` (C23 6.7.13.2 / GNU `warn_unused_result`): a DIRECT call to
+    // this function whose result is discarded as a bare expression statement
+    // warns S_NodiscardResultDiscarded (checkCall's two-hop discard-context
+    // check; the `(void)f()` cast idiom suppresses by construction). OR-merged
+    // across a proto/def pair like isDeprecated; message first-non-empty-wins.
+    bool            isNodiscard = false;
+    std::string     nodiscardMessage;
 };
 
 // FF11 neutral-JSON shipped-library descriptor extern
