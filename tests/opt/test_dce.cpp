@@ -314,7 +314,9 @@ TEST(Dce, RuntimeInitGlobalsModuleEmitsXOptPassSkippedInfo) {
     mb.beginBlock(initEntry);
     mb.addReturn();
     // Global with runtime-init referencing the function above.
-    mb.addGlobal(i32, SymbolId{201}, /*initLiteralIndex*/ UINT32_MAX, initFn);
+    mb.addGlobal(i32, SymbolId{201}, /*initLiteralIndex*/ UINT32_MAX, initFn,
+                 SymbolBinding::Global, SymbolVisibility::Default,
+                 /*isConst=*/false, MirThreadStorage::Shared);
     Mir mir = std::move(mb).finish();
 
     DiagnosticReporter rep;
@@ -352,9 +354,11 @@ TEST(Dce, PreservesGlobalConstness) {
     MirLiteralValue v7; v7.value = std::int64_t{7}; v7.core = TypeKind::I32;
     // gc CONST (→ .rodata); gm MUTABLE (→ .data). Both external roots.
     mb.addGlobal(i32, SymbolId{300}, mb.literalPoolAdd(v5), MirFuncId{},
-                 SymbolBinding::Global, SymbolVisibility::Default, /*isConst=*/true);
+                 SymbolBinding::Global, SymbolVisibility::Default,
+                 /*isConst=*/true, MirThreadStorage::Shared);
     mb.addGlobal(i32, SymbolId{301}, mb.literalPoolAdd(v7), MirFuncId{},
-                 SymbolBinding::Global, SymbolVisibility::Default, /*isConst=*/false);
+                 SymbolBinding::Global, SymbolVisibility::Default,
+                 /*isConst=*/false, MirThreadStorage::Shared);
     // A trivial root function so DCE runs its full rebuild path (not a carve-out).
     mb.addFunction(sig, SymbolId{100});
     MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
@@ -376,4 +380,54 @@ TEST(Dce, PreservesGlobalConstness) {
         << "the CONST global must survive DCE as const (else it lands in a "
            "writable .data section)";
     EXPECT_EQ(mutCount, 1) << "the mutable global must survive DCE as mutable";
+}
+
+// TLS C1 (D-CSUBSET-THREAD-LOCAL, ★CRIT-3): thread-storage preservation
+// across DCE's STANDALONE global-clone loop — the 4th flag-drop clone site
+// (the audit named merge + the two rebuild-helper fns; DCE clones globals
+// itself at dce.cpp rather than through the shared prelude). A dropped flag
+// under DCE silently demotes a per-thread object to process-shared in every
+// optimized build. The PreservesGlobalConstness shape mirrored — exact
+// per-global assertions. RED-ON-DISABLE: drop the
+// `mir.globalIsThreadLocal(g)` argument at DCE's addGlobal (pass
+// MirThreadStorage::Shared) →
+// the TLS global comes back process-shared and `tlsCount == 1` fails.
+TEST(Dce, PreservesGlobalThreadLocal) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32 = interner.primitive(TypeKind::I32);
+    TypeId const sig = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    MirLiteralValue v5; v5.value = std::int64_t{5}; v5.core = TypeKind::I32;
+    MirLiteralValue v7; v7.value = std::int64_t{7}; v7.core = TypeKind::I32;
+    // gt THREAD-LOCAL; gp plain. Both external roots (liveness-kept).
+    mb.addGlobal(i32, SymbolId{300}, mb.literalPoolAdd(v5), MirFuncId{},
+                 SymbolBinding::Global, SymbolVisibility::Default,
+                 /*isConst=*/false, MirThreadStorage::PerThread);
+    mb.addGlobal(i32, SymbolId{301}, mb.literalPoolAdd(v7), MirFuncId{},
+                 SymbolBinding::Global, SymbolVisibility::Default,
+                 /*isConst=*/false, MirThreadStorage::Shared);
+    // A trivial root function so DCE runs its full rebuild path (not a carve-out).
+    mb.addFunction(sig, SymbolId{100});
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
+    MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(v0, i32));
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runDce(mir, interner, rep);
+    ASSERT_TRUE(r.ok);
+    ASSERT_EQ(mir.moduleGlobalCount(), 2u)
+        << "both externally-visible globals are liveness roots — DCE keeps them";
+    int tlsCount = 0, plainCount = 0;
+    for (std::uint32_t i = 0; i < mir.moduleGlobalCount(); ++i) {
+        if (mir.globalIsThreadLocal(mir.globalAt(i))) ++tlsCount;
+        else ++plainCount;
+    }
+    EXPECT_EQ(tlsCount, 1)
+        << "the THREAD-LOCAL global must survive DCE thread-local (else it "
+           "silently becomes process-shared under optimization)";
+    EXPECT_EQ(plainCount, 1)
+        << "the plain global must survive DCE process-shared";
 }

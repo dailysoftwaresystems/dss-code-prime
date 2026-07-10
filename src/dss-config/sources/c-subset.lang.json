@@ -49,7 +49,7 @@
     "pasteToken": "HashHashOp",
     "$variadicCommaElisionComment": "FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): opt into the GNU `,##__VA_ARGS__` extension. `sep ## __VA_ARGS__` with an EMPTY variadic part drops the preceding separator (`LOG(\"x\")` -> `f(\"x\")`); non-empty keeps it. Without this flag, standard C placemarker behavior leaves the separator. The separator/__VA_ARGS__ are matched by the config KIND/name above, never hardcoded.",
     "variadicCommaElision": true,
-    "$predefinedMacrosComment": "FC15b (C 6.10.8): the predefined macros. Each entry names the macro IDENTIFIER + a materialization `kind`; the engine keys EVERY behavior off `kind`, never the name. `line`/`file` are OFFSET-derived (resolved through the line-map against the INVOCATION offset -> the invocation line / the presumed file name); `date`/`time` are computed once at preprocess construction (`\"Mmm dd yyyy\"` / `\"hh:mm:ss\"`); `constant` carries a static `value` spelling verbatim. `#define`/`#undef` of any of these is a constraint violation (C 6.10.8.1) -> fail loud. __STDC_VERSION__ = 202311L (C23). __STDC_NO_VLA__ = 1 (FC17.5, D-CSUBSET-VLA): C11 6.10.8.3 / C23 6.10.9.3 REQUIRE an implementation without variable-length-array support to define it -- DSS has no VLA support (S_NonConstantArrayLength fails loud on a runtime array bound), so declaring the macro is the CONFORMANCE-HONEST line (a conforming program can now #ifdef-select its fixed-size fallback instead of tripping the fail-loud gate). c95 (Windows-host sub-arc): the OPTIONAL `availableObjectFormats` per-entry filter (mirrors the shipped-lib descriptor field; EMPTY = every format, a non-empty set of object-format NAMES restricts the macro to those formats — validated against objectFormatKindFromName at load, an unknown name fails loud) lets the Windows-selection macros be predefined for the `pe` target ONLY: `_WIN32`/`_WIN64` (value 1) make sqlite's amalgamation select os_win.c (SQLITE_OS_WIN); `__stdcall`/`__cdecl`/`__fastcall`/`WINAPI` ERASE to nothing (empty value) since PE64 has a single MS-x64 calling convention and imports are un-decorated (a `__stdcall`-qualified declarator then parses on pe, stays an ordinary identifier off-pe). None leak onto elf/macho. The 8 unfiltered macros (the 7 core C 6.10.8 set + the CONDITIONAL __STDC_NO_VLA__, C11 6.10.8.3/C23 6.10.9.3) carry NO availableObjectFormats filter (available everywhere).",
+    "$predefinedMacrosComment": "FC15b (C 6.10.8): the predefined macros. Each entry names the macro IDENTIFIER + a materialization `kind`; the engine keys EVERY behavior off `kind`, never the name. `line`/`file` are OFFSET-derived (resolved through the line-map against the INVOCATION offset -> the invocation line / the presumed file name); `date`/`time` are computed once at preprocess construction (`\"Mmm dd yyyy\"` / `\"hh:mm:ss\"`); `constant` carries a static `value` spelling verbatim. `#define`/`#undef` of any of these is a constraint violation (C 6.10.8.1) -> fail loud. __STDC_VERSION__ = 202311L (C23). __STDC_NO_VLA__ = 1 (FC17.5, D-CSUBSET-VLA): C11 6.10.8.3 / C23 6.10.9.3 REQUIRE an implementation without variable-length-array support to define it -- DSS has no VLA support (S_NonConstantArrayLength fails loud on a runtime array bound), so declaring the macro is the CONFORMANCE-HONEST line (a conforming program can now #ifdef-select its fixed-size fallback instead of tripping the fail-loud gate). __STDC_NO_THREADS__ = 1 (TLS C1, D-CSUBSET-THREAD-LOCAL — the __STDC_NO_VLA__ precedent): C11 6.10.8.3 / C23 6.10.9.3 make the macro the conforming announcement that <threads.h> is NOT provided — DSS ships no threads.h descriptor and never will this arc (thread CREATION rides pthread FFI; only the `thread_local` STORAGE CLASS is implemented, which the macro deliberately does NOT disclaim). c95 (Windows-host sub-arc): the OPTIONAL `availableObjectFormats` per-entry filter (mirrors the shipped-lib descriptor field; EMPTY = every format, a non-empty set of object-format NAMES restricts the macro to those formats — validated against objectFormatKindFromName at load, an unknown name fails loud) lets the Windows-selection macros be predefined for the `pe` target ONLY: `_WIN32`/`_WIN64` (value 1) make sqlite's amalgamation select os_win.c (SQLITE_OS_WIN); `__stdcall`/`__cdecl`/`__fastcall`/`WINAPI` ERASE to nothing (empty value) since PE64 has a single MS-x64 calling convention and imports are un-decorated (a `__stdcall`-qualified declarator then parses on pe, stays an ordinary identifier off-pe). None leak onto elf/macho. The 9 unfiltered macros (the 7 core C 6.10.8 set + the CONDITIONAL __STDC_NO_VLA__ and __STDC_NO_THREADS__, C11 6.10.8.3/C23 6.10.9.3) carry NO availableObjectFormats filter (available everywhere).",
     "predefinedMacros": [
       { "name": "__LINE__",            "kind": "line" },
       { "name": "__FILE__",            "kind": "file" },
@@ -59,6 +59,7 @@
       { "name": "__DATE__",            "kind": "date" },
       { "name": "__TIME__",            "kind": "time" },
       { "name": "__STDC_NO_VLA__",     "kind": "constant", "value": "1" },
+      { "name": "__STDC_NO_THREADS__", "kind": "constant", "value": "1" },
       { "name": "_WIN32",              "kind": "constant", "value": "1", "availableObjectFormats": ["pe"] },
       { "name": "_WIN64",              "kind": "constant", "value": "1", "availableObjectFormats": ["pe"] },
       { "name": "_MSC_VER",            "kind": "constant", "value": "1943", "availableObjectFormats": ["pe"] },
@@ -334,6 +335,8 @@
     { "word": "double",   "kind": "DoubleKeyword"     },
     { "word": "const",    "kind": "ConstKeyword"    },
     { "word": "constexpr", "kind": "ConstexprKeyword" },
+    { "word": "_Thread_local", "kind": "ThreadLocalKeyword"    },
+    { "word": "thread_local",  "kind": "ThreadLocalC23Keyword" },
     { "word": "volatile", "kind": "VolatileKeyword" },
     { "word": "restrict", "kind": "RestrictKeyword" },
     { "word": "register", "kind": "RegisterKeyword" },
@@ -564,7 +567,8 @@
     },
     "singleDeclSpecifier": {
       "$comment": "C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): `alignasSpec` (`_Alignas`/`alignas`) joins the top-level declaration-specifier alts. Its FIRST = {AlignasKeyword, AlignasLegacyKeyword} is DISJOINT from StaticKeyword / attrSpec's AttributeKeyword / stdAttr's BracketOpen, so the repeat stays predictively pruned (non-speculative). It is stripped from the positional-child count (specifierPrefix: declSpecifiers on topLevelDecl) and IGNORED by the linkage scan (linkageSpecifierIgnoredRules). FC16 (D-CSUBSET-NORETURN): the bare `_Noreturn` keyword (NoreturnKeyword) likewise joins the alts — FIRST {NoreturnKeyword} disjoint from all the above, so no speculation impact; it is stripped from the child count and IGNORED by the linkage scan (linkageSpecifierIgnoredKinds); the SEMANTIC noreturn scan reads it. The attribute forms (`[[noreturn]]`/`__attribute__((noreturn))`) ride the existing attrSpec/stdAttr alts. FC17 (D-CSUBSET-CONSTEXPR, C23 6.7.1): the `constexpr` storage-class specifier (ConstexprKeyword) joins the alts — FIRST {ConstexprKeyword} disjoint from all the above (a distinct exact-match keyword; `const` is a headQualifier, not a specifier, so no prefix collision), stripped from the child count like the others. At FILE scope it IS a linkage specifier: C23 6.2.2p3 gives a file-scope constexpr object INTERNAL linkage, so topLevelDecl's linkageSpecifiers maps the keyword text to {binding:local} (it is deliberately NOT in that row's linkageSpecifierIgnoredKinds). The SEMANTIC constexpr validation (Pass 2 validateConstexprDeclarator) reads it via semantics.constexpr.keywordToken.",
-      "alt": [ "StaticKeyword", "ConstexprKeyword", "NoreturnKeyword", "alignasSpec", "attrSpec", "stdAttr" ]
+      "$threadLocalComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL, C11/C23 6.7.1): the `_Thread_local`/`thread_local` twin keywords (the _Alignof/alignof spelling precedent) join the alts — FIRST {ThreadLocalKeyword, ThreadLocalC23Keyword} disjoint from every other branch (distinct exact-match keywords), stripped from the child count like the others. The repeat admits both orders with `static` (`static thread_local` / `thread_local static`). NOT a linkage-changing specifier: the topLevelDecl row maps both spellings to {threadStorage:true} — a file-scope thread_local object keeps EXTERNAL linkage (6.2.2 untouched); Pass 1's specifier scan marks the symbol isThreadLocal and Pass 2's validateThreadLocalDeclarator enforces 6.7.1.",
+      "alt": [ "StaticKeyword", "ConstexprKeyword", "ThreadLocalKeyword", "ThreadLocalC23Keyword", "NoreturnKeyword", "alignasSpec", "attrSpec", "stdAttr" ]
     },
     "attrSpec": {
       "$comment": "FC4 c1: the argument grew the parenthesized-string form `visibility(\"hidden\")` — an Identifier optionally followed by `( string-literal )`. The inline sequences add NO wrapper nodes, so the bare `weak`/`static` tree shapes are byte-identical to pre-FC4. linkageFrom's composite-key lookup (`visibility:hidden`) pairs the identifier with the decoded string body.",
@@ -734,11 +738,20 @@
     },
 
     "externDecl": {
+      "$threadLocalComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): the former bare `ExternKeyword` child 0 is now the `externSpecifiers` HEAD WRAPPER (`extern` + an optional thread-storage specifier run) so `extern thread_local int e;` parses (C11 6.7.1p3 — extern IS one of the two specifiers thread_local may pair with; the cross-TU TLS declaration form). The wrapper occupies exactly the ONE child slot the keyword did AND is the row's `specifierPrefix`, so the shared first-child strip (decl_prefix_strip.hpp / the parser sketch's strip) renumbers the role children to [typeRef, Identifier, externTail] = name 1 / type 0 / kindByChild [2,0] REGARDLESS of specifier presence — no index shift, no new engine mechanism. FIRST(externDecl) stays {ExternKeyword}. The REVERSE order `thread_local extern` stays a loud parse error (topLevelDecl's head never matches `extern`), matching the `extern constexpr` posture.",
       "sequence": [
-        "ExternKeyword",
+        "externSpecifiers",
         "typeRef",
         "Identifier",
         "externTail"
+      ]
+    },
+
+    "externSpecifiers": {
+      "$comment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): `extern` plus an optional storage-specifier run — today only the thread-storage twins (`extern thread_local` / `extern _Thread_local`). FIRST(repeat) = {ThreadLocalKeyword, ThreadLocalC23Keyword}, DISJOINT from FIRST(typeRef) (type keywords / Identifier / typeof) → predictively pruned, non-speculative. As externDecl's specifierPrefix this subtree is scanned by linkageFrom: the row maps both thread-local spellings to {threadStorage:true} and ignores ExternKeyword by kind (the extern-ness is the RULE's identity — externDecl mints a non-defining declaration — not a linkage entry).",
+      "sequence": [
+        "ExternKeyword",
+        { "repeat": { "alt": [ "ThreadLocalKeyword", "ThreadLocalC23Keyword" ] } }
       ]
     },
 
@@ -879,7 +892,8 @@
     },
     "localDeclSpecifier": {
       "$comment": "Local storage-class specifiers + attributes. `static` (D-CSUBSET-LOCAL-STATIC) confers STATIC storage duration (C 6.2.4) — the varDecl row's linkageSpecifiers maps it to {binding:local, staticStorage:true} and CST→HIR routes the declaration to a hidden module-global; register/auto parse and are semantically inert (C: hints/default storage). `static` in a for-init is a C 6.8.5p3 violation, gated loud by the forDecl row. C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): `alignasSpec` joins the local-specifier alts too (a block-scope `alignas(16) int x;` is legal C) — FIRST {AlignasKeyword, AlignasLegacyKeyword} disjoint from the others, so the repeat stays predictively pruned; stripped from the child count (specifierPrefix: localDeclSpecifiers on varDecl) and ignored by the linkage scan. FC17 (D-CSUBSET-CONSTEXPR, C23 6.7.1): `constexpr` (ConstexprKeyword) joins the local alts too (a block-scope `constexpr int x = 5;` is legal C23, and forDecl reuses this prefix so `for (constexpr int i = 0; ...)` parses — VALID per C23 6.8.5p3, which admits auto/register/constexpr in a for-init) — FIRST {ConstexprKeyword} disjoint; a block-scope constexpr carries NO linkage (an automatic-storage constant), so the varDecl row IGNORES the keyword by kind (linkageSpecifierIgnoredKinds); the SEMANTIC constexpr validation reads it via semantics.constexpr.keywordToken.",
-      "alt": [ "StaticKeyword", "RegisterKeyword", "AutoKeyword", "ConstexprKeyword", "NoreturnKeyword", "alignasSpec", "attrSpec", "stdAttr" ]
+      "$threadLocalComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL, C11 6.7.1p3): the `_Thread_local`/`thread_local` twin keywords join the LOCAL alts too — a block-scope `static thread_local int x;` is legal C (thread storage + static storage). FIRST disjoint (distinct exact-match keywords). The varDecl/autoInferredVarDecl rows map both spellings to {threadStorage:true} (Pass 1 marks isThreadLocal); a block-scope thread_local WITHOUT static/extern is the 6.7.1p3 constraint violation Pass 2 rejects (S_ThreadLocalRequiresStaticOrExtern). forDecl/autoInferredForDecl share this prefix, so `for (thread_local int i…)` PARSES — those rows gate the tokens loud (gatedMarkers → S_ThreadLocalRequiresStaticOrExtern; a for-init admits neither static nor extern, so the pairing can never be satisfied there).",
+      "alt": [ "StaticKeyword", "RegisterKeyword", "AutoKeyword", "ConstexprKeyword", "ThreadLocalKeyword", "ThreadLocalC23Keyword", "NoreturnKeyword", "alignasSpec", "attrSpec", "stdAttr" ]
     },
 
     "paramList": {
@@ -1382,7 +1396,12 @@
         "prototypeSynthesizesExtern": true,
         "$staticStorageComment": "D-CSUBSET-LOCAL-STATIC: a block-scope `static` confers static storage duration (C 6.2.4). CST→HIR's linkageFrom folds {binding:local, staticStorage:true} from the SAME prefix scan and routes the declaration to a hidden module-global (internal linkage). register/auto/attribute specifiers carry no linkage and are ignored (ignoredKinds/ignoredRules) so they never trip the unknown-specifier diagnostic.",
         "$volatileComment": "c27 (D-CSUBSET-VOLATILE-POINTEE): `volatile` is a TYPE qualifier (TypeKind::VolatileQual). The resolver wraps the base in VolatileQual when a volatileMarker precedes the stars (`volatile int *` => Ptr<VolatileQual(int)>) and wraps the pointer for an east ptrQualifier (`int * volatile` => VolatileQual(Ptr<int>)); object-volatility is read off the symbol's top-level VolatileQual type at access lowering, pointee-volatility rides the accessed type at the deref/index/member (MirInstFlags::Volatile). ALL pointee/member/param/typedef forms now compile — the prior S_VolatilePointeeNotSupported reject is retired. const stays ignored (no wrapper).",
-        "linkageSpecifiers": { "static": { "binding": "local", "staticStorage": true } },
+        "$threadLocalLinkageComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL, C11 6.7.1p3): both thread-storage spellings map to {threadStorage:true} so the LEGAL block-scope form `static thread_local int x;` resolves cleanly (without these entries the tokens would fail loud H_UnknownLinkageSpecifier on legal C). threadStorage does NOT itself confer static routing — a bare block-scope `thread_local int x;` is rejected by Pass 2 (S_ThreadLocalRequiresStaticOrExtern) before lowering.",
+        "linkageSpecifiers": {
+          "static": { "binding": "local", "staticStorage": true },
+          "_Thread_local": { "threadStorage": true },
+          "thread_local":  { "threadStorage": true }
+        },
         "$noreturnIgnoreComment": "FC16 (D-CSUBSET-NORETURN): the bare `_Noreturn` keyword carries NO linkage — ignored by kind (like RegisterKeyword/AutoKeyword). The attribute form `__attribute__((noreturn))` on a LOCAL is already covered by attrSpec ∈ linkageSpecifierIgnoredRules (wholesale). The SEMANTIC noreturn scan reads the keyword/attribute; without this ignore the `_Noreturn` token would fail loud H_UnknownLinkageSpecifier.",
         "$constexprIgnoreComment": "FC17 (D-CSUBSET-CONSTEXPR, C23 6.7.1): a BLOCK-scope `constexpr` carries NO linkage (it declares an automatic-storage constant object; only the FILE-scope form has C23 6.2.2p3 internal linkage — see topLevelDecl's linkageSpecifiers) — ignored by kind like RegisterKeyword/AutoKeyword. The SEMANTIC constexpr validation (semantics.constexpr.keywordToken) reads it; without this ignore the `constexpr` token would fail loud H_UnknownLinkageSpecifier at block scope.",
         "linkageSpecifierIgnoredKinds": ["RegisterKeyword", "AutoKeyword", "ConstexprKeyword", "NoreturnKeyword", "AttributeKeyword", "ParenOpen", "ParenClose"],
@@ -1395,8 +1414,10 @@
         "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword", "warnIfUnused": true,
         "specifierPrefix": "localDeclSpecifiers",
         "requireNamedDeclarators": true,
-        "$forStaticComment": "D-CSUBSET-LOCAL-STATIC (MF-2): `static` parses in the shared localDeclSpecifiers prefix, but a static (or any non-auto/register) storage class in a for-statement init-declaration is a C 6.8.5p3 constraint violation — gate it LOUD (never silently lower as an automatic loop variable). NO linkageSpecifiers here: a static for-init must error, not route to a hidden global. The StaticKeyword gatedMarker stays; only the S_VolatileNotSupported gate is removed (volatile is implemented — c21).",
-        "gatedMarkers": [ { "token": "StaticKeyword", "code": "S_StaticStorageInForInit" } ] },
+        "$forStaticComment": "D-CSUBSET-LOCAL-STATIC (MF-2): `static` parses in the shared localDeclSpecifiers prefix, but a static (or any non-auto/register) storage class in a for-statement init-declaration is a C 6.8.5p3 constraint violation — gate it LOUD (never silently lower as an automatic loop variable). NO linkageSpecifiers here: a static for-init must error, not route to a hidden global. The StaticKeyword gatedMarker stays; only the S_VolatileNotSupported gate is removed (volatile is implemented — c21). TLS C1 (D-CSUBSET-THREAD-LOCAL): both thread-storage spellings parse in the shared prefix too — gated loud with S_ThreadLocalRequiresStaticOrExtern (C11 6.7.1p3: thread_local needs static/extern, and a for-init admits neither, so the requirement is unsatisfiable there; WITHOUT the gate `for (thread_local int i…)` would silently lower as a plain automatic — the row has no linkageSpecifiers, so the Pass-1 threadStorage scan finds no entry).",
+        "gatedMarkers": [ { "token": "StaticKeyword", "code": "S_StaticStorageInForInit" },
+                          { "token": "ThreadLocalKeyword", "code": "S_ThreadLocalRequiresStaticOrExtern" },
+                          { "token": "ThreadLocalC23Keyword", "code": "S_ThreadLocalRequiresStaticOrExtern" } ] },
       { "rule": "forIdentDecl", "head": 0, "declaratorList": 1, "kind": "variable",
         "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword", "warnIfUnused": true,
         "requireNamedDeclarators": true },
@@ -1407,17 +1428,24 @@
         "warnIfUnused": true,
         "specifierPrefix": "localDeclSpecifiers",
         "requireNamedDeclarators": true,
-        "linkageSpecifiers": { "static": { "binding": "local", "staticStorage": true } },
+        "$threadLocalLinkageComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): mirror of varDecl's thread-storage entries — C23 6.7.1 admits `auto` beside thread_local, so `static thread_local auto s = 1;` is legal and must resolve; a bare `thread_local auto x = 5;` (no static) is Pass 2's S_ThreadLocalRequiresStaticOrExtern.",
+        "linkageSpecifiers": {
+          "static": { "binding": "local", "staticStorage": true },
+          "_Thread_local": { "threadStorage": true },
+          "thread_local":  { "threadStorage": true }
+        },
         "linkageSpecifierIgnoredKinds": ["RegisterKeyword", "AutoKeyword", "ConstexprKeyword", "NoreturnKeyword", "AttributeKeyword", "ParenOpen", "ParenClose"],
         "linkageSpecifierIgnoredRules": ["attrSpec", "stdAttr", "alignasSpec"] },
       { "rule": "autoInferredForDecl", "declaratorList": 0, "kind": "variable",
-        "$comment": "FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): the for-init mirror — same inference row as autoInferredVarDecl, but like forDecl it carries NO linkageSpecifiers (a static for-init must ERROR, not route to a hidden global) and COPIES forDecl's StaticKeyword gatedMarker so `for (static auto i = 0;;)` fails loud S_StaticStorageInForInit (C 6.8.5p3).",
+        "$comment": "FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): the for-init mirror — same inference row as autoInferredVarDecl, but like forDecl it carries NO linkageSpecifiers (a static for-init must ERROR, not route to a hidden global) and COPIES forDecl's StaticKeyword gatedMarker so `for (static auto i = 0;;)` fails loud S_StaticStorageInForInit (C 6.8.5p3). TLS C1 (D-CSUBSET-THREAD-LOCAL): copies forDecl's thread-storage gatedMarkers too — `for (thread_local auto i = 0;;)` fails loud S_ThreadLocalRequiresStaticOrExtern (6.7.1p3 is unsatisfiable in a for-init).",
         "inferTypeFromInitializer": true,
         "requiredSpecifierToken": "AutoKeyword",
         "warnIfUnused": true,
         "specifierPrefix": "localDeclSpecifiers",
         "requireNamedDeclarators": true,
-        "gatedMarkers": [ { "token": "StaticKeyword", "code": "S_StaticStorageInForInit" } ] },
+        "gatedMarkers": [ { "token": "StaticKeyword", "code": "S_StaticStorageInForInit" },
+                          { "token": "ThreadLocalKeyword", "code": "S_ThreadLocalRequiresStaticOrExtern" },
+                          { "token": "ThreadLocalC23Keyword", "code": "S_ThreadLocalRequiresStaticOrExtern" } ] },
       { "rule": "param", "head": 0, "declarator": 1, "kind": "variable",
         "constMarker": "ConstKeyword", "volatileMarker": "VolatileKeyword",
         "$arrayToPointerComment": "c82 (D-CSUBSET-PARAM-ARRAY-ADJUSTMENT, C 6.7.6.3p7): a parameter declared 'array of T' — sized (`int a[64]`), unsized (`int a[]`), or multi-dim (`int a[][5]` -> ptr to int[5]) — ADJUSTS to 'pointer to T'. The flag (a) permits the absent-length `[]` on the param's OUTERMOST suffix (resolving via the incomplete-array path, like allowFlexibleArray) and (b) rewrites the resolved top-level Array to Ptr<element> at BOTH resolution sites (the definitive Pass-1.5 visit that binds the param symbol — so sizeof(param)==8 and body uses see the pointer — and the FnSig param harvest — so call-site checking matches the decayed argument). An inner-dimension `[]` (`int a[4][]`) still fails loud (S_FlexibleArrayInAggregate via the incomplete-element guard), matching C's ill-formedness.",
@@ -1429,10 +1457,13 @@
         "prototypeSynthesizesExtern": true,
         "$linkageSpecifiersComment": "D-CSUBSET-LINKAGE-SPECIFIERS: 'static' -> internal (Local) binding; '__attribute__((weak))' -> Weak; FC4 c1 adds the COMPOSITE key 'visibility:hidden' — linkageFrom forms '<identifier>:<decoded-string-body>' when a specifier identifier is immediately followed by a parenthesized string literal (__attribute__((visibility(\"hidden\")))). 'linkageSpecifierIgnoredRules' skips C23 [[...]] stdAttr subtrees wholesale (D14: parsed, ignored).",
         "specifierPrefix": "declSpecifiers",
-        "$constexprLinkageComment": "FC17 (D-CSUBSET-CONSTEXPR): C23 6.2.2p3 (N3096) — a FILE-scope object declared `constexpr` has INTERNAL linkage (constexpr joins static in the 6.2.2p3 list). The keyword text maps to {binding:local}; it COMPOSES with an explicit co-present `static` idempotently (both map to local; last-wins is a no-op). This is NOT the noreturn {binding:global}-clobber hazard — that was a no-op default entry overwriting a co-present static's INTERNAL binding; here both entries agree. `extern constexpr` is a parse error in both orders (externDecl's fixed shape has no specifier prefix) — loud, C23-conformant (6.7.1p... extern with constexpr is a constraint violation). RED-ON-DISABLE: drop this entry -> the mir_lowering file-scope-constexpr Local-binding pin goes red.",
+        "$constexprLinkageComment": "FC17 (D-CSUBSET-CONSTEXPR): C23 6.2.2p3 (N3096) — a FILE-scope object declared `constexpr` has INTERNAL linkage (constexpr joins static in the 6.2.2p3 list). The keyword text maps to {binding:local}; it COMPOSES with an explicit co-present `static` idempotently (both map to local; last-wins is a no-op). This is NOT the noreturn {binding:global}-clobber hazard — that was a no-op default entry overwriting a co-present static's INTERNAL binding; here both entries agree. `extern constexpr` is a parse error in both orders (externSpecifiers admits only the thread-storage twins after `extern` — TLS C1; before that externDecl had no specifier slot at all) — loud, C23-conformant (6.7.1p... extern with constexpr is a constraint violation). RED-ON-DISABLE: drop this entry -> the mir_lowering file-scope-constexpr Local-binding pin goes red.",
+        "$threadLocalLinkageComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): both thread-storage spellings map to {threadStorage:true} — the 4th ORTHOGONAL effect axis. A file-scope `thread_local int g;` keeps EXTERNAL linkage (C11 6.2.2 is untouched by 6.7.1p3 — deliberately NO binding entry, so a co-present `static`'s {binding:local} composes without clobber in either order). Pass 1's specifier scan reads threadStorage → SymbolRecord.isThreadLocal; Pass 2 validates.",
         "linkageSpecifiers": {
           "static": { "binding": "local" },
           "constexpr": { "binding": "local" },
+          "_Thread_local": { "threadStorage": true },
+          "thread_local":  { "threadStorage": true },
           "weak":   { "binding": "weak"  },
           "visibility:hidden": { "visibility": "hidden" }
         },
@@ -1486,10 +1517,17 @@
         "anonymousNameAllowed": true,
         "specifierPrefix": "structMemberDeclSpecifiers" },
       { "rule": "enumerator",  "name": 0, "kind": "variable" },
-      { "rule": "externDecl", "name": 2, "type": 1, "kind": "variable",
+      { "rule": "externDecl", "name": 1, "type": 0, "kind": "variable",
         "nonDefiningDeclaration": true,
+        "$threadLocalComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): child 0 is now the `externSpecifiers` head wrapper (`extern` + optional thread-storage run) and is this row's specifierPrefix — the shared first-child strip renumbers the role children to [typeRef, Identifier, externTail], so name/type/kindByChild are 1/0/[2,0] (they were 2/1/[3,0] against the raw shape) and stay STABLE whether or not a specifier is present. The linkage scan resolves both thread-storage spellings to {threadStorage:true} (`extern thread_local int e;` — the cross-TU TLS declaration, C11 6.7.1p3) and ignores ExternKeyword by kind (extern-ness IS the rule's identity: nonDefiningDeclaration mints the record; a binding entry would be the noreturn clobber hazard).",
+        "specifierPrefix": "externSpecifiers",
+        "linkageSpecifiers": {
+          "_Thread_local": { "threadStorage": true },
+          "thread_local":  { "threadStorage": true }
+        },
+        "linkageSpecifierIgnoredKinds": ["ExternKeyword"],
         "kindByChild": {
-          "childPath": [3, 0],
+          "childPath": [2, 0],
           "whenRule": "externFuncTail",
           "whenKind": "function",
           "paramsPath": [1]
@@ -1553,6 +1591,8 @@
     "noreturn": { "keywordToken": "NoreturnKeyword", "attributeNames": ["noreturn"] },
     "$constexprComment": "FC17 (D-CSUBSET-CONSTEXPR): the C23 6.7.1 `constexpr` OBJECT storage-class specifier. `keywordToken` = the `constexpr` keyword. Pass 1 scans a declaration's specifier prefix (specifierPrefixHasConstexpr, the specifierPrefixNamesNoreturn mirror) and marks each declared symbol isConstexpr (implies isConst); Pass 2's validateConstexprDeclarator then enforces the 6.7.1 constraints AT THE DECLARATION: the initializer must be a compile-time constant (arithmetic scalars fold via the shared CST const-eval engine with floats admitted; a pointer initializer must be a null pointer constant), a missing initializer / a function declarator / a volatile-qualified object type fail loud, and array/struct/union constexpr is a NAMED loud deferral (D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE). ZERO codegen: a validated constexpr object lowers byte-identically to a const object with a foldable initializer. Source-agnostic: WHICH token is per-language config; the engine never hardcodes the spelling.",
     "constexpr": { "keywordToken": "ConstexprKeyword" },
+    "$threadLocalComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): the C11/C23 6.7.1p2 forbidden-combination set for the thread-storage specifiers. `register` parses as an inert storage-class specifier in the c-subset (localDeclSpecifiers), so `register thread_local int x;` must reject S_ThreadLocalInvalidCombination rather than silently drop one specifier (6.7.1p2 admits ONLY static/extern beside thread_local; C23 additionally admits auto — the c-subset's auto is the C23 inference specifier and is deliberately NOT listed). `typedef` cannot co-occur grammatically (typedefDecl has no storage-specifier prefix — a loud parse error) and `constexpr` co-presence is detected via the Pass-1 isConstexpr mark, so neither is listed here. WHICH tokens confer thread storage rides the declaration rows' linkageSpecifiers ({\"threadStorage\": true}) — this block only names the forbidden pairings.",
+    "threadLocal": { "incompatibleSpecifierTokens": ["RegisterKeyword"] },
     "$predefinedFunctionNamesComment": "FC17.5 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER): the C99 6.4.2.2 predefined identifier `__func__` (+ the GNU `__FUNCTION__` alias). Pass 1 binds, for EACH spelling, one synthetic symbol into a function DEFINITION's own (param/body) scope BEFORE the params — kind=Variable, isConst (SE4's const check catches `__func__ = x` / `+=` -> S_ConstViolation), type = Array<narrow-string-core, len+1> (the element core is the language's declared string-literal core — the SAME config source string literals type from, never a hardcoded Char). A param named `__func__` collides at its own bind (S_RedeclaredSymbol). HIR lowering FOLDS a read to a string-literal-shaped constant (byte-identical to a real string literal, so rodata materialization / array->pointer decay / `__func__[i]` indexing / sizeof / `&__func__` all ride the existing string-literal paths); identical folded literals share ONE rodata global (the F2 byte-content memo — C99 requires `__func__ == __func__`). ++/--/compound-assign on it -> S_PredefinedIdentifierNotAddressable (no storage slot to write back). Source-agnostic: WHICH spellings are per-language config; the engine never hardcodes `__func__`.",
     "predefinedFunctionNames": { "identifiers": ["__func__", "__FUNCTION__"] },
     "$attributeSemanticsComment": "FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute semantics TABLE — a closed verb set over per-name rows (all rows structurally identical; ONE unknown-name source of truth). `attrSpecRule`/`stdAttrRule` name the two attribute-specifier shapes (GNU `__attribute__((...))` / C23 `[[...]]`); `bareStatementRule` is the bare attribute-declaration statement (`[[fallthrough]];`). The semantic tier's `scanAttributeSemantics` walks a declaration's specifier prefix (or a bare statement), stops AT each attribute node, extracts each clause's name (last-::-segment, dunder-normalized) + optional string message (the shared decodeAdjacentStringBodies chokepoint), and folds the matched row's EFFECT: `suppressUnused` (the D8 unused-variable warning is suppressed — [[maybe_unused]]/GNU unused), `warnOnUse` (each use-site of the symbol warns S_DeprecatedSymbolUsed — [[deprecated]]), `warnOnDiscard` (a call whose result is discarded as a bare expression-statement warns S_NodiscardResultDiscarded — [[nodiscard]]/GNU warn_unused_result), `none` (KNOWN vocabulary consumed elsewhere or deliberately inert — fallthrough/likely/unlikely/reproducible/unsequenced per C23, noreturn [the FC16 scan owns it], packed [the trailing-composite scan owns it; the leading position fails loud at the HIR linkage tier] — listed so the unknown warning NEVER false-fires on them, design fix F4). An UNMATCHED name in the C23 `[[...]]` form warns S_UnknownAttribute (suppressible — C23 forbids fatal unknown standard attributes); the GNU form keeps its pre-existing loud gates (file-scope H_UnknownLinkageSpecifier; block-scope wholesale-ignore = D-CSUBSET-ATTRIBUTE-GNU-BLOCK-SCOPE-UNKNOWN-NAME). Absent block ⇒ the language has no standard-attribute semantics (toy/tsql — the scan never runs). Source-AGNOSTIC: every rule id + name is per-language config; the engine walks the closed effect-verb set only.",

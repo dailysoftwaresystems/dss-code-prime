@@ -2363,6 +2363,74 @@ specifierPrefixHasConstexpr(SemanticConfig const& cfg, Tree const& tree,
     return false;
 }
 
+// TLS C1 (D-CSUBSET-THREAD-LOCAL): the storage-duration facts folded from ONE
+// declaration's specifier prefix. Keyed on the SAME per-row `linkageSpecifiers`
+// facet CST→HIR's `linkageFrom` folds (token SOURCE TEXT → effect), so the
+// semantic mark and the HIR linkage fold can never disagree on WHICH tokens
+// confer thread/static storage — one config facet, two consumers. Skips
+// `linkageSpecifierIgnoredRules` subtrees wholesale (the linkageFrom skip
+// mirrored: a `[[...]]`/alignas identifier that happens to spell a specifier
+// text must not mark the record when the linkage scan would not fold it). A
+// row with NO linkageSpecifiers (forDecl — deliberately, so a for-init static
+// errors instead of routing) yields all-false; the row's gatedMarkers own the
+// loud reject there. Emits NOTHING: Pass 2's validateThreadLocalDeclarator
+// and the D-CSUBSET-LOCAL-STATIC lowering own the consequences.
+struct SpecifierStorageFacts {
+    bool threadStorage = false;   // a {threadStorage:true} entry matched
+    bool staticStorage = false;   // a {staticStorage:true} entry matched
+};
+[[nodiscard]] SpecifierStorageFacts
+scanSpecifierPrefixStorage(Tree const& tree, NodeId declNode,
+                           DeclarationRule const& decl) {
+    SpecifierStorageFacts out;
+    if (decl.linkageSpecifiers.empty()) return out;
+    NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
+    if (!prefix.valid()) return out;
+    std::vector<NodeId> stack{prefix};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId c = stack.back(); stack.pop_back();
+        if (tree.kind(c) == NodeKind::Internal) {
+            bool skip = false;
+            for (RuleId rid : decl.linkageSpecifierIgnoredRules) {
+                if (tree.rule(c).v == rid.v) { skip = true; break; }
+            }
+            if (skip) continue;
+            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+            continue;
+        }
+        auto it = decl.linkageSpecifiers.find(std::string{tree.text(c)});
+        if (it == decl.linkageSpecifiers.end()) continue;
+        if (it->second.threadStorage) out.threadStorage = true;
+        if (it->second.staticStorage) out.staticStorage = true;
+    }
+    return out;
+}
+
+// TLS C1 (D-CSUBSET-THREAD-LOCAL): the first specifier-prefix TOKEN whose kind
+// is in `kinds` (the language's `threadLocal.incompatibleSpecifierTokens` —
+// c-subset: RegisterKeyword), or InvalidNode. Anchors the
+// S_ThreadLocalInvalidCombination diagnostic at the offending specifier.
+[[nodiscard]] NodeId
+firstPrefixTokenOfKinds(Tree const& tree, NodeId declNode,
+                        DeclarationRule const& decl,
+                        std::vector<SchemaTokenId> const& kinds) {
+    if (kinds.empty()) return {};
+    NodeId const prefix = specifierPrefixChild(tree, declNode, decl);
+    if (!prefix.valid()) return {};
+    std::vector<NodeId> stack{prefix};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId c = stack.back(); stack.pop_back();
+        if (tree.kind(c) == NodeKind::Internal) {
+            for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+            continue;
+        }
+        for (SchemaTokenId k : kinds) {
+            if (tree.tokenKind(c).v == k.v) return c;
+        }
+    }
+    return {};
+}
+
 // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute
 // facts folded from ONE declaration's specifier prefix (or one bare attribute-
 // declaration statement) by `scanAttributeSemantics` below. Computed once per
@@ -3356,6 +3424,87 @@ ScopeId floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
     return false;
 }
 
+// TLS C1 (D-CSUBSET-THREAD-LOCAL): enforce the C11/C23 6.7.1 thread-storage
+// constraints for ONE declared name whose symbol was Pass-1-marked
+// `isThreadLocal` (the validateConstexprDeclarator model — same hook
+// discipline: Pass 2, after Pass 1.5 resolved the declared type, so the FnSig
+// test sees the real signature). Runs from BOTH pass2Post declaration paths —
+// the declarator-mode per-declarator loop (topLevelDecl / varDecl /
+// autoInferred*) and the positional-name arm (c-subset's externDecl). Every
+// arm fails loud; a thread_local declaration NEVER silently degrades to a
+// plain (process-shared or automatic) object:
+//   * unresolved declared type    → return (cascade — already diagnosed);
+//   * FnSig / Function symbol     → S_ThreadLocalOnFunction (6.7.1p4 —
+//     objects only; covers protos, definitions, and `extern thread_local`
+//     function declarations);
+//   * co-present `constexpr`      → S_ThreadLocalInvalidCombination (C23
+//     6.7.1: constexpr pairs only with auto/register/static — read off the
+//     Pass-1 isConstexpr mark, so both specifier orders are caught);
+//   * a `threadLocal.incompatibleSpecifierTokens` token in the prefix
+//     (c-subset: `register`)      → S_ThreadLocalInvalidCombination
+//     (6.7.1p2 admits only static/extern beside thread_local), anchored at
+//     the offending specifier token;
+//   * BLOCK scope without `static`(-storage specifier) or `extern`
+//     (6.7.1p3)                   → S_ThreadLocalRequiresStaticOrExtern.
+//     The static test reads the SAME linkageSpecifiers staticStorage facet
+//     the lowering routes on (scanSpecifierPrefixStorage), so the check and
+//     the routing cannot disagree; the extern test is the record's
+//     isExternDeclaration (block-scope extern objects do not parse in the
+//     c-subset grammar today — the file-scope externDecl form is the only
+//     extern surface — but the record test keeps the validator correct for
+//     any grammar that admits them). File scope returns clean (static
+//     storage is implicit — 6.2.4p3).
+// (`typedef thread_local` cannot co-occur grammatically — typedefDecl has no
+// storage-specifier prefix — so no Type-kind arm exists here; the parse
+// error is the loud surface.)
+void validateThreadLocalDeclarator(EngineState& s, SemanticConfig const& cfg,
+                                   Tree const& tree, NodeId declNode,
+                                   DeclarationRule const& decl,
+                                   NodeId nameNode, SymbolId sym) {
+    SymbolRecord const& rec = s.symbols.at(sym);
+    TypeId const declTy = rec.type;
+    auto const emit = [&](DiagnosticCode code, NodeId at, std::string what) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(at);
+        d.actual   = what.empty() ? std::string{tree.text(at)} : std::move(what);
+        s.reporter.report(std::move(d));
+    };
+    if (!declTy.valid()) return;   // cascade — the type failure already reported
+    TypeInterner const& in = s.lattice.interner();
+    if (in.kind(declTy) == TypeKind::FnSig
+        || rec.kind == DeclarationKind::Function) {
+        emit(DiagnosticCode::S_ThreadLocalOnFunction, nameNode,
+             std::format("'{}' — thread storage duration applies to objects "
+                         "only, never functions (C 6.7.1p4)", rec.name));
+        return;
+    }
+    if (rec.isConstexpr) {
+        emit(DiagnosticCode::S_ThreadLocalInvalidCombination, nameNode,
+             std::format("'{}' — a thread-storage specifier may not be "
+                         "combined with 'constexpr' (C23 6.7.1)", rec.name));
+        return;
+    }
+    if (NodeId const bad = firstPrefixTokenOfKinds(
+            tree, declNode, decl, cfg.threadLocalIncompatibleTokens);
+        bad.valid()) {
+        emit(DiagnosticCode::S_ThreadLocalInvalidCombination, bad,
+             std::format("'{}' may not be combined with a thread-storage "
+                         "specifier (C 6.7.1p2 admits only 'static' or "
+                         "'extern')", tree.text(bad)));
+        return;
+    }
+    if (rec.isExternDeclaration) return;   // extern satisfies 6.7.1p3
+    if (rec.scope.v == fileScopeOf(s, tree, rec.scope).v) return;  // file scope
+    if (!scanSpecifierPrefixStorage(tree, declNode, decl).staticStorage) {
+        emit(DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern, nameNode,
+             std::format("'{}' — a block-scope thread_local object requires "
+                         "'static' or 'extern' (C 6.7.1p3)", rec.name));
+    }
+}
+
 // D-CSUBSET-FN-PROTOTYPE + D-CSUBSET-EXTERN-DEFINITION-MERGE + c33
 // D-CSUBSET-TENTATIVE-DEFINITION: resolve a same-scope REDECLARATION (`prior`
 // already bound `name` in `bindScope`; `newId` is the new symbol). A redeclaration
@@ -3419,6 +3568,39 @@ void mergeOrCollideRedeclaration(EngineState& s, Tree const& tree,
     bool const sameCategory = category(priorRec) == category(s.symbols.at(newId));
     bool const bothDefinitions = !priorNonDef && !newNonDef;
     if (sameCategory && !bothDefinitions) {
+        // TLS C1 (D-CSUBSET-THREAD-LOCAL, C11 6.7.1p3): a thread-storage
+        // specifier "shall be present in the declaration of every declared
+        // name with thread storage duration" — an OBJECT merge pair that
+        // DISAGREES on isThreadLocal (`extern int g;` then `thread_local int
+        // g = 5;`, or the reverse) fails loud in BOTH directions. Objects
+        // only: protos map to Function via category() and functions are
+        // rejected upstream (S_ThreadLocalOnFunction); Type/Table records
+        // can never carry the flag (their rules have no storage-specifier
+        // prefix). The merge still proceeds below — the error already gates
+        // compilation, and keeping the binding intact avoids diagnostic
+        // cascades on later uses.
+        if (category(priorRec) == DeclarationKind::Variable
+            && priorRec.isThreadLocal != s.symbols.at(newId).isThreadLocal) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_ThreadLocalRedeclarationMismatch;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(nameNode);
+            d.actual   = std::format(
+                "'{}' — this declaration {} thread_local but a prior "
+                "declaration of the same name {} (C 6.7.1p3 requires the "
+                "specifier on every declaration)", name,
+                s.symbols.at(newId).isThreadLocal ? "is" : "is NOT",
+                priorRec.isThreadLocal ? "is" : "is not");
+            if (priorRec.tree.v == tree.id().v) {
+                d.related.push_back(RelatedLocation{
+                    tree.source().id(),
+                    tree.span(priorRec.declNode),
+                    "previously declared here",
+                });
+            }
+            s.reporter.report(std::move(d));
+        }
         if (priorNonDef && !newNonDef) {
             // nonDefining → definition: the DEFINITION wins the binding; the prior
             // non-defining decl is absorbed (a proto/extern declarator emits no HIR
@@ -3719,6 +3901,18 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             rec.isConstexpr = true;
                             rec.isConst     = true;
                         }
+                        // TLS C1 (D-CSUBSET-THREAD-LOCAL): a thread-storage
+                        // specifier in the prefix (a linkageSpecifiers entry
+                        // with {threadStorage:true} — the SAME facet the HIR
+                        // linkage fold walks) marks EVERY declarator's symbol
+                        // (C 6.7.1 applies the storage-class to each declared
+                        // object). Pass 2's validateThreadLocalDeclarator
+                        // enforces the 6.7.1 constraints; the redeclaration
+                        // merge rejects a same-TU mismatch (6.7.1p3).
+                        if (scanSpecifierPrefixStorage(tree, node, decl)
+                                .threadStorage) {
+                            rec.isThreadLocal = true;
+                        }
                         rec.isProtoDeclaration = isProto;
                         // D-CSUBSET-EXTERN-DEFINITION-MERGE: a non-defining
                         // declaration (c-subset's `extern`) — config-driven, no
@@ -3983,6 +4177,14 @@ pass1Node(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     // non-defining so it merges with an in-TU definition of the same
                     // name (handled below via the shared mergeOrCollideRedeclaration).
                     rec.isExternDeclaration = decl.nonDefiningDeclaration;
+                    // TLS C1 (D-CSUBSET-THREAD-LOCAL): the positional-path mirror
+                    // of the declarator-mode thread-storage mint — c-subset's
+                    // `extern thread_local int e;` mints HERE (externDecl's
+                    // externSpecifiers prefix carries the specifier). Same facet,
+                    // same scan; Pass 2 + the merge own the consequences.
+                    if (scanSpecifierPrefixStorage(tree, node, decl).threadStorage) {
+                        rec.isThreadLocal = true;
+                    }
 
                     SymbolId const newId = s.symbols.mint(rec);
                     // C 6.2.3 tag namespace: a composite-type declaration
@@ -6786,6 +6988,21 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         if (declIt != s.idx().declByRule.end()) {
             auto const& decl = cfg.declarations[declIt->second];
             auto kids = declRoleChildren(tree, node, decl);
+            // TLS C1 (D-CSUBSET-THREAD-LOCAL): the POSITIONAL-name mirror of
+            // the declarator-loop thread-storage hook below — c-subset's
+            // externDecl declares a positional `name`, never a declarator
+            // list, so its `extern thread_local int e;` / the 6.7.1p4 reject
+            // `extern thread_local int f(void);` (S_ThreadLocalOnFunction)
+            // validate HERE. Gated on the Pass-1 isThreadLocal mark alone.
+            if (!decl.isDeclaratorMode() && decl.nameChild.has_value()
+                && *decl.nameChild < kids.size()) {
+                NodeId const nm = kids[*decl.nameChild];
+                SymbolId const nmSym = s.symbolAtOr(nm);
+                if (nmSym.valid() && s.symbols.at(nmSym).isThreadLocal) {
+                    validateThreadLocalDeclarator(s, cfg, tree, node, decl,
+                                                  nm, nmSym);
+                }
+            }
             // FC4 c1: declarator-mode rows — each init-declarator carries
             // its OWN optional initializer (`int x = 1, *p = q;`); check
             // every (declared type, init type) pair with the SAME
@@ -6814,16 +7031,33 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         // the loop's own idiom (declaratorNameNode +
                         // symbolAtOr); gated on the language declaring a
                         // constexpr surface, then on the Pass-1 mark.
-                        if (cfg.constexprKeywordToken.has_value()) {
-                            NodeId const cxName = declaratorNameNode(
+                        // TLS C1 (D-CSUBSET-THREAD-LOCAL): the thread-storage
+                        // hook shares the SAME pre-gate placement (a bare
+                        // `static thread_local int x;` declarator and a
+                        // `thread_local int f(void)` function declarator are
+                        // exactly the carriers the gate skips) and the same
+                        // discovered symbol; gated on the Pass-1 isThreadLocal
+                        // mark alone (the mark can only exist when the
+                        // language declares a threadStorage row). BOTH
+                        // validators may fire on one declarator (`constexpr
+                        // thread_local int x = argc;`) — each owns its own
+                        // diagnostics, errors accumulate.
+                        {
+                            NodeId const vName = declaratorNameNode(
                                 tree, dNode, *cfg.declarators);
-                            if (cxName.valid()) {
-                                SymbolId const cxSym = s.symbolAtOr(cxName);
-                                if (cxSym.valid()
-                                    && s.symbols.at(cxSym).isConstexpr) {
+                            SymbolId const vSym = vName.valid()
+                                ? s.symbolAtOr(vName) : SymbolId{};
+                            if (vSym.valid()) {
+                                if (cfg.constexprKeywordToken.has_value()
+                                    && s.symbols.at(vSym).isConstexpr) {
                                     validateConstexprDeclarator(
-                                        s, cfg, tree, dNode, cxName, cxSym,
+                                        s, cfg, tree, dNode, vName, vSym,
                                         here);
+                                }
+                                if (s.symbols.at(vSym).isThreadLocal) {
+                                    validateThreadLocalDeclarator(
+                                        s, cfg, tree, node, decl, vName,
+                                        vSym);
                                 }
                             }
                         }

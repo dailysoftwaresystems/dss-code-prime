@@ -256,6 +256,17 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                      "fixed32 has no legacy-prefix bytes",
                                      o.mnemonic, vi));
                 }
+                // TLS C1 (D-CSUBSET-THREAD-LOCAL): the payload-byte
+                // prefix is likewise an x86-variable-only concept
+                // (prefix group 2 segment override); a fixed-word ISA
+                // has no prefix bytes.
+                if (v.tmpl.payloadBytePrefix) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/template/payloadBytePrefix", i, vi),
+                         std::format("opcode '{}' variant {}: 'payloadBytePrefix' "
+                                     "declared on a fixed32 variant — "
+                                     "fixed32 has no prefix bytes",
+                                     o.mnemonic, vi));
+                }
             }
             if (v.tmpl.modrmRegExt.has_value() && *v.tmpl.modrmRegExt > 7) {
                 fail(std::format("/opcodes/{}/encoding/variants/{}/template/modrmRegExt", i, vi),
@@ -472,6 +483,76 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
                                          "dropped from the encoding)",
                                          o.mnemonic, vi, gi,
                                          operandKindFilterName(v.operandKinds[gi])));
+                    }
+                }
+            }
+
+            // ── TLS C1 (D-CSUBSET-THREAD-LOCAL): memory-displacement
+            // single-ownership. A `[base + disp32]` memory operand has
+            // exactly ONE displacement field; a variant wiring BOTH a
+            // literal `disp32.mem` AND a relocated `memreloc.disp32`
+            // would double-emit at encode time (8 bytes where the CPU
+            // decodes 4 — a silent instruction-stream corruption). And
+            // the absolute-SIB form (`absdisp32.mem`) owns the WHOLE
+            // memory operand (no base register, index, or second
+            // displacement) — co-wiring it with any other memory-
+            // operand slot is contradictory. Reject both at load; the
+            // encoder re-checks defensively at emit.
+            {
+                bool hasDisp32Mem = false, hasMemReloc = false;
+                bool hasAbsDisp   = false, hasOtherMem = false;
+                for (auto const& w : v.wires) {
+                    if (w.slotKind == EncodingSlotKind::Disp32Mem)         hasDisp32Mem = true;
+                    if (w.slotKind == EncodingSlotKind::MemRelocDisp32)    hasMemReloc  = true;
+                    if (w.slotKind == EncodingSlotKind::AbsoluteDisp32Mem) hasAbsDisp   = true;
+                    if (w.slotKind == EncodingSlotKind::ModRmRmMem
+                        || w.slotKind == EncodingSlotKind::SibIndex
+                        || w.slotKind == EncodingSlotKind::MemBaseScale) {
+                        hasOtherMem = true;
+                    }
+                }
+                if (hasDisp32Mem && hasMemReloc) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi),
+                         std::format("opcode '{}' variant {}: wires BOTH a "
+                                     "literal 'disp32.mem' AND a relocated "
+                                     "'memreloc.disp32' — a memory operand "
+                                     "has exactly one displacement field; "
+                                     "the double emission would corrupt the "
+                                     "instruction stream",
+                                     o.mnemonic, vi));
+                }
+                if (hasAbsDisp && (hasDisp32Mem || hasMemReloc || hasOtherMem)) {
+                    fail(std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi),
+                         std::format("opcode '{}' variant {}: 'absdisp32.mem' "
+                                     "(the base-register-less absolute-SIB "
+                                     "form) cannot be co-wired with any other "
+                                     "memory-operand slot (modrm.rm.mem / "
+                                     "sib.index / membase.scale / disp32.mem "
+                                     "/ memreloc.disp32) — the absolute form "
+                                     "owns the whole memory operand",
+                                     o.mnemonic, vi));
+                }
+                // The relocated displacement REQUIRES a ModRmRmMem base
+                // wire (it is the disp32 OF a `[base + disp32]` memory
+                // operand) — without one, no memory ModR/M state exists
+                // and the relocation would silently never be recorded.
+                if (hasMemReloc) {
+                    bool hasMemBase = false;
+                    for (auto const& w : v.wires) {
+                        if (w.slotKind == EncodingSlotKind::ModRmRmMem) {
+                            hasMemBase = true;
+                            break;
+                        }
+                    }
+                    if (!hasMemBase) {
+                        fail(std::format("/opcodes/{}/encoding/variants/{}/wires", i, vi),
+                             std::format("opcode '{}' variant {}: "
+                                         "'memreloc.disp32' requires a "
+                                         "paired 'modrm.rm.mem' base wire "
+                                         "(the relocated displacement is "
+                                         "the disp32 of a [base + disp32] "
+                                         "memory operand)",
+                                         o.mnemonic, vi));
                     }
                 }
             }

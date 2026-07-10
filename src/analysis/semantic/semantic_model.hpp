@@ -261,6 +261,24 @@ struct DSS_EXPORT SymbolRecord {
     // linkage — C23 6.2.2p3 — rides the declaration row's `linkageSpecifiers`
     // config, not this flag). Default false.
     bool            isConstexpr = false;
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): TRUE iff this OBJECT symbol was declared
+    // with C11/C23 6.7.1 thread storage duration (`_Thread_local` /
+    // `thread_local`). Set at Pass-1 minting when the declaration's specifier
+    // prefix carries a token whose row `linkageSpecifiers` entry declares
+    // `{threadStorage: true}` (`specifierPrefixHasThreadStorage` — the
+    // specifierPrefixHasConstexpr mirror, keyed on the SAME config facet the
+    // linkage scan folds, so the two tiers can never disagree on the
+    // vocabulary). Read by Pass 2's `validateThreadLocalDeclarator` (6.7.1
+    // constraints: objects only / block scope needs static-or-extern /
+    // forbidden combinations) and by the redeclaration merge (a same-TU
+    // mismatch on this flag is S_ThreadLocalRedeclarationMismatch — 6.7.1p3
+    // requires the specifier on EVERY declaration of the name). CST→HIR's
+    // `recordThreadLocal` projects it onto the HirThreadLocalMap side-table
+    // (the recordMutability/isConst precedent) → PendingGlobal.isThreadLocal
+    // → MirGlobal.isThreadLocal → the asm/walker TLS section tiers (slices
+    // B/C). Orthogonal to binding/visibility (a file-scope thread_local
+    // keeps external linkage). Default false.
+    bool            isThreadLocal = false;
     // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute
     // facts folded from the declaration's specifier prefix by
     // `scanAttributeSemantics` (Pass-1.5 declarator resolution — the

@@ -1561,6 +1561,27 @@ encodeExecDynamic(AssembledModule const&    module,
         fmt.sectionByKind(SectionKind::Data);
     ObjectFormatSectionInfo const* secBss =
         fmt.sectionByKind(SectionKind::Bss);
+    // D-CSUBSET-THREAD-LOCAL (audit fold LOW-b): the Mach-O walker has no
+    // TLV machinery yet — no __thread_vars descriptors, no _tlv_bootstrap
+    // import, no S_THREAD_LOCAL_REGULAR/_ZEROFILL section types (all land
+    // at TLS cycle C4). Emitting a Tdata/Tbss item as ordinary __DATA
+    // would silently produce ONE process-shared object — the storage-
+    // duration miscompile. The linker's acceptsDataSection gate fires
+    // first for the shipped Mach-O JSONs (no tdata/tbss advertised); this
+    // in-walker belt catches a format JSON opting in before C4 lands.
+    for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+        auto const s = module.dataItems[i].section;
+        if (s != DataSectionKind::Tdata && s != DataSectionKind::Tbss)
+            continue;
+        emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+             std::format("macho::encodeExecDynamic: AssembledData item "
+                         "#{} is thread-local ({}) but the Mach-O TLV "
+                         "arm (__thread_vars descriptors + _tlv_bootstrap "
+                         "+ S_THREAD_LOCAL_* sections) has not landed — "
+                         "TLS cycle C4 (D-CSUBSET-THREAD-LOCAL).",
+                         i, dataSectionKindName(s)));
+        return {};
+    }
     // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): allowItemRelocations=true — symbol-
     // address global pointers carry abs64 data→data relocs patched in place below
     // (after symbolVa). MUTABLE layouts so applyDataItemRelocations fixes the bytes.

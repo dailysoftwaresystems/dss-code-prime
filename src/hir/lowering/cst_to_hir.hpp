@@ -85,6 +85,10 @@ struct DSS_EXPORT CstToHirResult {
     HirMutabilityMap mutabilityMap; // bound to `hir` — native-global const-ness
                                   // (D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL); read at
                                   // HIR→MIR to pick `.rodata` vs writable `.data`
+    HirThreadLocalMap threadLocalMap; // bound to `hir` — declaration thread-storage
+                                  // duration (TLS C1, D-CSUBSET-THREAD-LOCAL); read
+                                  // at HIR→MIR to stamp MirGlobal.isThreadLocal /
+                                  // ExternImport.isThreadLocal (→ .tdata/.tbss)
     HirVolatileMap volatileMap;   // bound to `hir` — per-ACCESS volatility (c21,
                                   // D-CSUBSET-VOLATILE-QUALIFIER); read at HIR→MIR
                                   // to OR MirInstFlags::Volatile onto Load/Store
@@ -108,8 +112,8 @@ struct DSS_EXPORT CstToHirResult {
     // `hir` is declared first so the maps bind to the constructed module.
     CstToHirResult(Hir h, HirLiteralPool lp)
         : hir(std::move(h)), sourceMap(hir), linkageMap(hir),
-          mutabilityMap(hir), volatileMap(hir), alignmentMap(hir),
-          literalPool(std::move(lp)) {}
+          mutabilityMap(hir), threadLocalMap(hir), volatileMap(hir),
+          alignmentMap(hir), literalPool(std::move(lp)) {}
 
     CstToHirResult(CstToHirResult const&)            = delete;
     CstToHirResult& operator=(CstToHirResult const&) = delete;

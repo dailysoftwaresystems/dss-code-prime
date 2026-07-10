@@ -211,6 +211,19 @@ struct DSS_EXPORT LinkageSpecifierEffect {
     // static (module-global) storage, not an automatic stack slot. Folded by
     // CST→HIR to route the local declaration down the global-emission path.
     bool                            staticStorage = false;
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): THREAD storage duration (C11/C23
+    // 6.2.4 / 6.7.1 `_Thread_local` / `thread_local`) — the 4th ORTHOGONAL
+    // axis. Thread storage does NOT change binding/visibility (a file-scope
+    // `thread_local int g;` keeps EXTERNAL linkage — 6.2.2 is untouched by
+    // 6.7.1p3) and does NOT itself confer block-scope static routing (the
+    // standard REQUIRES a co-present `static`/`extern` at block scope —
+    // Pass 2's validateThreadLocalDeclarator enforces it). Consumed by the
+    // semantic Pass-1 specifier scan (→ SymbolRecord.isThreadLocal, the
+    // per-symbol source of truth every later tier reads). OR-only across a
+    // prefix — a `{threadStorage:true}` entry can never clobber a
+    // co-present static's binding/staticStorage (the noreturn
+    // linkage-clobber lesson: each axis folds independently).
+    bool                            threadStorage = false;
 };
 
 // FC4 c1 (M5): a config-driven fail-loud gate on a declaration form. When the
@@ -1368,6 +1381,22 @@ struct DSS_EXPORT SemanticConfig {
     // linkage rides the declaration row's `linkageSpecifiers` map (keyword text →
     // {binding:local}), not this token.
     std::optional<SchemaTokenId> constexprKeywordToken;
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): storage-class specifier TOKENS that may
+    // NOT be combined with a thread-storage specifier in one declaration
+    // (C11/C23 6.7.1p2 admits only `static`/`extern` beside `thread_local`;
+    // c-subset lists `RegisterKeyword` — `register` parses as an inert
+    // storage-class specifier, so `register thread_local int x;` must reject
+    // rather than silently drop one specifier). Pass 2's
+    // `validateThreadLocalDeclarator` scans the declaration's specifier
+    // prefix for these kinds on a thread-local-marked symbol →
+    // S_ThreadLocalInvalidCombination. EMPTY ⇒ no forbidden-combination scan
+    // (a language whose grammar already excludes the pairings). NOTE the
+    // thread-storage vocabulary itself is NOT declared here: which tokens
+    // confer thread storage rides the declaration rows' `linkageSpecifiers`
+    // map ({"threadStorage": true}) — one facet, one scan, per-language.
+    // Source-AGNOSTIC: WHICH kinds are per-language config; the engine never
+    // hardcodes the spelling "register".
+    std::vector<SchemaTokenId>   threadLocalIncompatibleTokens;
     // FC17.5 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER): the C99 6.4.2.2 predefined
     // function-name identifier spellings (`__func__` + the GNU `__FUNCTION__`
     // alias for c-subset). Pass 1 binds, for EACH spelling, one synthetic

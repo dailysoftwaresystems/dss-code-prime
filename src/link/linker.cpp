@@ -561,6 +561,42 @@ LinkedImage link(std::span<AssembledModule const> modules,
         }
     }
 
+    // D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC (TLS C1): a SURVIVING thread-
+    // local extern import — an `extern thread_local` whose definition no
+    // sibling CU supplied, i.e. a TRUE LIBRARY thread-local (glibc
+    // `errno`-class objects). NO shipped binding model can carry it:
+    //   * copy-relocation copies into ONE process-shared exec slot — the
+    //     antithesis of thread storage (every thread would alias one copy);
+    //   * the local-exec model this arc ships computes LINK-TIME tpoffs
+    //     against the exec's OWN PT_TLS block — a library's TLS block has
+    //     a loader-assigned module offset, unknowable at link time.
+    // A library thread-local needs the INITIAL-EXEC model (a GOT slot the
+    // loader fills with the tpoff — R_*_TPOFF64-class dynamic relocs),
+    // deferred until a consumer exists. An INTRA-program `extern
+    // thread_local` never reaches this gate: the LK11 cross-CU merge
+    // strips the import row when a sibling CU defines it. Unconditional
+    // (before any per-format walker) — this is storage-model capability,
+    // not format capability, so it lives at the agnostic tier.
+    for (auto const& ext : inputModule.externImports) {
+        if (!ext.isThreadLocal) continue;
+        report(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+               DiagnosticSeverity::Error,
+               std::string{"linker: extern THREAD-LOCAL import '"}
+                   + ext.mangledName + "' (from '" + ext.libraryPath
+                   + "') cannot be bound — a library thread-local needs "
+                     "the initial-exec TLS model (a loader-filled tpoff "
+                     "GOT slot), which is not implemented "
+                     "(D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC). The shipped "
+                     "local-exec model covers only THIS executable's own "
+                     "thread-locals; copy-relocation cannot apply (one "
+                     "process-shared copy slot would defeat the declared "
+                     "thread storage duration). An intra-program `extern "
+                     "thread_local` resolves by compiling it with its "
+                     "defining translation unit.");
+        image.resolvedFuncCount = 0;
+        return image;
+    }
+
     // D-LK10-ENTRY Slice C (plan 14 §2.13): when the format declares
     // a `processExit` block + `entryCallingConvention` (validated by
     // Slice B's cross-field rule), synthesize a `_start` trampoline

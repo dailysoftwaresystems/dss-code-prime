@@ -186,6 +186,16 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_AutoRequiresInitializer";
         case DiagnosticCode::S_AutoInferenceInvalid:
             return "S_AutoInferenceInvalid";
+        case DiagnosticCode::S_ThreadLocalOnFunction:
+            return "S_ThreadLocalOnFunction";
+        case DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern:
+            return "S_ThreadLocalRequiresStaticOrExtern";
+        case DiagnosticCode::S_ThreadLocalRedeclarationMismatch:
+            return "S_ThreadLocalRedeclarationMismatch";
+        case DiagnosticCode::S_ThreadLocalAddressNotConstant:
+            return "S_ThreadLocalAddressNotConstant";
+        case DiagnosticCode::S_ThreadLocalInvalidCombination:
+            return "S_ThreadLocalInvalidCombination";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
@@ -336,6 +346,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::A_FunctionEncodeAborted:        return "A_FunctionEncodeAborted";
         case DiagnosticCode::K_AbsolutePointerRelocMissing:  return "K_AbsolutePointerRelocMissing";
         case DiagnosticCode::K_ImageExecBitFailed:           return "K_ImageExecBitFailed";
+        case DiagnosticCode::K_FormatLacksThreadLocalSupport:
+            return "K_FormatLacksThreadLocalSupport";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";

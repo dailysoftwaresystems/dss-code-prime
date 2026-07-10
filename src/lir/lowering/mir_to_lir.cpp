@@ -265,6 +265,15 @@ enum class MnemonicSlot : std::uint8_t {
     // and the PARENT's FrameLayout). Declared in every register-machine schema that
     // supports SEH funclets; materialized away (never encoded).
     RecoverParentFrameSlot,
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): materialize the current thread's
+    // TLS base pointer (tp) into a GPR. x86_64 = `mov r64, seg:[disp32]`
+    // (the segment-override byte rides the PAYLOAD — per-format config
+    // `tlsAccess.segmentPrefixByte`; the disp32 rides a MemOffset operand
+    // = `tlsAccess.baseDisplacement`); arm64 will bind `MRS Xd, TPIDR_EL0`
+    // (TLS C2). A target WITHOUT the row (arm64 until C2) fails loud
+    // L_RequiredLirOpcodeMissing at the thread-local GlobalAddr — the
+    // per-target un-landed-leg gate.
+    TlsBase,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -366,6 +375,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::LeaFrameSlot,       "lea_frame_slot"},
     {MnemonicSlot::FNegMask,           "fneg_mask"},
     {MnemonicSlot::RecoverParentFrameSlot, "recover_parent_frame_slot"},
+    {MnemonicSlot::TlsBase,            "tlsbase"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -599,6 +609,24 @@ struct Lowerer {
     std::optional<DataImportBinding> dataImportBinding_;
     std::unordered_set<std::uint32_t> externDataGotSymbols_;
 
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): the ACTIVE format's thread-local
+    // access block + the ctor-populated set of THREAD-LOCAL SymbolIds
+    // (module globals with `MirGlobal.isThreadLocal` + extern imports
+    // with `ExternImport.isThreadLocal`). A GlobalAddr of such a symbol
+    // must NOT take the ordinary lea path — its symbolVa resolves to a
+    // signed thread-pointer OFFSET (bit-cast into the map by the
+    // walker), not a VA; the local-exec arm reads the tp register then
+    // adds the linker-patched tpoff. The set is ALSO consulted at every
+    // riprel-fold site (audit M-5): a folded `[rip+sym]` access of a
+    // TLS symbol would resolve S=tpoff as if it were an address — a
+    // silent wrong-address access. Mirrors `externDataGotSymbols_`.
+    std::optional<TlsAccessInfo>      tlsAccess_;
+    std::unordered_set<std::uint32_t> threadLocalSymbols_;
+    // One-shot dedup for the K_FormatLacksThreadLocalSupport reject
+    // (mirrors MnemonicCache::missingReported — a module with N
+    // thread-local accesses reports the missing format capability once).
+    bool tlsFormatRejectReported_ = false;
+
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbol minting for `&&label`
     // block-address materialization. A block whose address is taken gets ONE local
     // symbol (deduped by MIR block id within the module). `nextBlockSym_` is seeded
@@ -608,6 +636,14 @@ struct Lowerer {
     // block id (stable for the duration of THIS lowering — the LIR-pass block
     // renumbering happens AFTER, and the BlockRef operand carried on the emitted
     // `lea` is what survives those passes via remapBlockRef).
+    //
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL, audit M-5 survey): every symbol this
+    // minter produces (block-address `lea`s via lowerBlockAddress, jump-table
+    // symbols via mintJumpTableSymbol, fneg sign-mask symbols via
+    // mintSignMaskSymbol) is minted PAST the module's function/global/extern
+    // high-water mark, so it can NEVER collide with a `threadLocalSymbols_`
+    // entry — those riprel/symbol-relative emissions need no TLS exclusion
+    // (unreachable for a TLS symbol by construction).
     std::optional<std::uint32_t>                  nextBlockSym_;
     std::unordered_map<std::uint32_t, SymbolId>   blockToSym_;
     [[nodiscard]] SymbolId mintBlockSymbol(MirBlockId block) {
@@ -711,11 +747,13 @@ struct Lowerer {
             std::span<ExternImport const> externImports,
             std::optional<ExternCallDispatch> externCallDispatch,
             std::optional<DataImportBinding> dataImportBinding,
+            std::optional<TlsAccessInfo> tlsAccess,
             std::span<MirSehScope const> sehScopes)
         : mir(m), target(t), interner(i), reporter(r), lir(t),
           valueToReg(m), mirBlockToLirBlock(m.blockArena()),
           externCallDispatch_(externCallDispatch),
-          dataImportBinding_(dataImportBinding), sehScopesIn_(sehScopes) {
+          dataImportBinding_(dataImportBinding),
+          tlsAccess_(tlsAccess), sehScopesIn_(sehScopes) {
         baselineErrors = reporter.errorCount();
         externSymbols.reserve(externImports.size());
         for (auto const& e : externImports) {
@@ -732,6 +770,23 @@ struct Lowerer {
             for (auto const& e : externImports) {
                 if (e.isData) externDataGotSymbols_.insert(e.symbol.v);
             }
+        }
+        // TLS C1 (D-CSUBSET-THREAD-LOCAL): collect every THREAD-LOCAL
+        // symbol — module globals flagged isThreadLocal + extern imports
+        // flagged isThreadLocal — so `lowerGlobalAddr` routes them to the
+        // TLS access sequence and EVERY riprel-fold site excludes them
+        // (audit M-5). Populated unconditionally (not gated on
+        // `tlsAccess_`): a thread-local access under a tlsAccess-less
+        // format must still be RECOGNIZED so it can fail loud rather
+        // than take the ordinary (process-shared, silently-wrong) path.
+        for (std::uint32_t gi = 0; gi < mir.moduleGlobalCount(); ++gi) {
+            MirGlobalId const g = mir.globalAt(gi);
+            if (mir.globalIsThreadLocal(g)) {
+                threadLocalSymbols_.insert(mir.globalSymbol(g).v);
+            }
+        }
+        for (auto const& e : externImports) {
+            if (e.isThreadLocal) threadLocalSymbols_.insert(e.symbol.v);
         }
         // Mnemonics in MnemonicSlot enum-declaration order. The
         // `static_assert` below closes the silent-drift hazard 4
@@ -2808,6 +2863,18 @@ struct Lowerer {
         if (externDataGotSymbols_.contains(mir.globalAddrSymbol(gaId).v)) {
             return false;
         }
+        // TLS C1 (D-CSUBSET-THREAD-LOCAL, audit M-5): a THREAD-LOCAL
+        // symbol is NEVER foldable. Its address is tp + tpoff(sym) — the
+        // walker stores the SIGNED tpoff (bit-cast) into symbolVa[sym],
+        // so a folded riprel load `mov r, [rip + sym]` would resolve
+        // S = tpoff as if it were a VA and read a garbage absolute
+        // address — a SILENT wrong-address access. The TLS arm of
+        // `lowerGlobalAddr` (tlsbase + lea) is the only lawful
+        // materialization; the C-level Load stays a distinct [base]
+        // deref of that address.
+        if (threadLocalSymbols_.contains(mir.globalAddrSymbol(gaId).v)) {
+            return false;
+        }
         auto const it = mirValueUses_.find(gaId.v);
         if (it == mirValueUses_.end() || it->second.count != 1) {
             return false;  // zero or multiple users — keep the lea
@@ -2842,7 +2909,123 @@ struct Lowerer {
         return false;
     }
 
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): the thread-local GlobalAddr arm.
+    // A thread-local symbol's "address" is per-thread: tp + tpoff(sym),
+    // where tp is the thread-pointer register and tpoff is a LINK-TIME
+    // constant the walker resolves (the `tls-tpoff32`-class relocation
+    // over the tpoff-poisoned symbolVa). Under `local-exec` this emits
+    // EXACTLY:
+    //     tlsbase %tp                    ; mov tp, seg:[baseDisplacement]
+    //                                    ;   payload = segmentPrefixByte
+    //     lea %addr, [%tp + tpoff32(sym)]; 2-op [Reg, SymbolRef] lea —
+    //                                    ;   Relocation{tls-tpoff32, sym}
+    //                                    ;   at the disp32 position
+    // Every value here is CONFIG: the segment byte + slot displacement
+    // from the FORMAT's tlsAccess block (fs 0x64/[0] on ELF; gs
+    // 0x65/[0x58] on PE later), the instruction SHAPES from the
+    // TARGET's opcode rows. Closed-verb dispatch on the model — never
+    // a format/CPU identity branch. Fail-loud ladder:
+    //   * no tlsAccess block   → K_FormatLacksThreadLocalSupport
+    //     (0x8015 — the format leg has no TLS machinery yet; lowering
+    //     through the ordinary global path would silently produce ONE
+    //     process-shared copy);
+    //   * pe-indexed/macho-tlv → same code, "declared but lowering
+    //     lands with that format's TLS cycle" (closed-verb arms);
+    //   * local-exec on a target without `tlsbase`/`lea` rows (arm64
+    //     until TLS C2) → L_RequiredLirOpcodeMissing.
+    void lowerThreadLocalGlobalAddr(MirInstId id, SymbolId sym) {
+        if (!tlsAccess_.has_value()) {
+            reportTlsFormatReject(
+                "object format declares no tlsAccess block — thread-local "
+                "storage is not supported for this target/format leg yet "
+                "(D-CSUBSET-THREAD-LOCAL)");
+            return;  // value left undefined; the pipeline aborts on the error
+        }
+        switch (tlsAccess_->model) {
+            case TlsAccessModel::LocalExec:
+                break;
+            case TlsAccessModel::PeIndexed:
+            case TlsAccessModel::MachoTlv:
+                // Declared vocabulary whose LOWERING has not landed —
+                // fail loud, never a silently-wrong local-exec sequence
+                // (the models disagree on every byte after the tp read).
+                reportTlsFormatReject(std::format(
+                    "tlsAccess model '{}' is declared but its lowering "
+                    "lands with the PE/Mach-O TLS cycle "
+                    "(D-CSUBSET-THREAD-LOCAL)",
+                    tlsAccessModelName(tlsAccess_->model)));
+                return;
+        }
+        auto const tlsBaseOp = opcode(MnemonicSlot::TlsBase);
+        if (!tlsBaseOp.has_value()) {
+            reportMissingOpcode(MnemonicSlot::TlsBase,
+                                "MIR GlobalAddr (thread-local)");
+            return;
+        }
+        if (!opcode(MnemonicSlot::Lea).has_value()) {
+            reportMissingOpcode(MnemonicSlot::Lea,
+                                "MIR GlobalAddr (thread-local)");
+            return;
+        }
+        // The tp-slot displacement rides a SIGNED disp32 operand; the
+        // loader caps the config at INT32_MAX, so this cast is exact
+        // (re-checked here so a hand-built TlsAccessInfo can never
+        // flip sign silently).
+        if (tlsAccess_->baseDisplacement
+            > static_cast<std::uint32_t>(
+                  std::numeric_limits<std::int32_t>::max())) {
+            reportTlsFormatReject(std::format(
+                "tlsAccess baseDisplacement {} exceeds the signed disp32 "
+                "range (D-CSUBSET-THREAD-LOCAL)",
+                tlsAccess_->baseDisplacement));
+            return;
+        }
+        // tlsbase %tp — payload carries the segment-override byte.
+        LirReg const tpReg = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> tpOps{LirOperand::makeMemOffset(
+            static_cast<std::int32_t>(tlsAccess_->baseDisplacement))};
+        emitInst(*tlsBaseOp, tpReg, tpOps,
+                 /*payload=*/tlsAccess_->segmentPrefixByte);
+        // lea %addr, [%tp + tpoff32(sym)] — the 2-op [Reg, SymbolRef]
+        // lea variant; the encoder records the tls-tpoff32 relocation
+        // at the memory-displacement position.
+        LirReg const addrReg = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 2> leaOps{
+            LirOperand::makeReg(tpReg),
+            LirOperand::makeSymbolRef(sym.v)};
+        emitInst(*opcode(MnemonicSlot::Lea), addrReg, leaOps);
+        defineValue(id, addrReg);
+    }
+
+    // TLS C1: the once-per-module K_FormatLacksThreadLocalSupport
+    // reject (the reportMissingOpcode one-shot dedup pattern).
+    void reportTlsFormatReject(std::string_view detail) {
+        if (tlsFormatRejectReported_) return;
+        tlsFormatRejectReported_ = true;
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_FormatLacksThreadLocalSupport;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "MIR→LIR: module accesses a thread-local symbol but {}", detail);
+        reporter.report(std::move(d));
+    }
+
     void lowerGlobalAddr(MirInstId id) {
+        // TLS C1 (D-CSUBSET-THREAD-LOCAL): the thread-local arm runs
+        // FIRST — before the riprel fold AND before the GOT-indirect
+        // extern-data arm. A thread-local symbol's symbolVa is a
+        // bit-cast tpoff, so EVERY VA-shaped materialization below
+        // (folded riprel load, GOT-slot lea, plain lea) would be a
+        // silent wrong-address access for it. (The fold predicate
+        // ALSO excludes TLS symbols — audit M-5 — so this ordering is
+        // belt + braces, not the sole guard.)
+        {
+            SymbolId const sym = mir.globalAddrSymbol(id);
+            if (threadLocalSymbols_.contains(sym.v)) {
+                lowerThreadLocalGlobalAddr(id, sym);
+                return;
+            }
+        }
         // D-LIR-GLOBALADDR-LOAD-RIPREL-FOLD: when the sole consumer is
         // a load whose mnemonic declares the symbol-relative variant,
         // emit NO lea here — `lowerLoad` folds the symbol straight
@@ -3059,6 +3242,16 @@ struct Lowerer {
         // callconv pass materializes it as `call <reg>` against the
         // schema's `["reg"]` encoding variant (x86 FF /2, arm64 BLR
         // — FC4 c2, D-CSUBSET-FNPTR-INDIRECT-CALL closed).
+        // TLS C1 (D-CSUBSET-THREAD-LOCAL, audit M-5 survey): this
+        // direct-callee fold routes a GlobalAddr's SymbolId into the
+        // call's SymbolRef operand WITHOUT consulting
+        // `threadLocalSymbols_` — deliberately. A TLS symbol can never
+        // be a callee: thread storage duration on a function is
+        // rejected upstream (S_ThreadLocalOnFunction, 0xE045,
+        // unsuppressable), and `threadLocalSymbols_` is built from
+        // DATA globals + isThreadLocal DATA externs only, which are
+        // disjoint from function symbols by construction. No exclusion
+        // needed here.
         MirInstId const calleeMir = operands[0];
         bool const calleeIsGlobalAddr =
             mir.instOpcode(calleeMir) == MirOpcode::GlobalAddr;
@@ -5780,6 +5973,7 @@ MirToLirResult lowerToLir(Mir const&          mir,
                           std::vector<ExternImport> externImports,
                           std::optional<ExternCallDispatch> externCallDispatch,
                           std::optional<DataImportBinding> dataImportBinding,
+                          std::optional<TlsAccessInfo> tlsAccess,
                           std::span<MirSehScope const> sehScopes) {
     // D-LK10-ENTRY-ML7-FRAME-BIAS-UNIFY post-fold (2026-06-02): pass
     // the externImports vector to the Lowerer so it can distinguish
@@ -5789,8 +5983,12 @@ MirToLirResult lowerToLir(Mir const&          mir,
     // (indirect-slot: PE/Mach-O IAT/__got) vs the plain `call`
     // (direct-plt: ELF PLT stub) from it. nullopt + extern imports =
     // fail-loud (no silent default to either shape).
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): also pass the format's
+    // thread-local access block — `lowerGlobalAddr`'s TLS arm reads it;
+    // nullopt + a thread-local access = fail-loud
+    // (K_FormatLacksThreadLocalSupport, no silent process-shared alias).
     Lowerer L{mir, target, interner, reporter, externImports,
-              externCallDispatch, dataImportBinding, sehScopes};
+              externCallDispatch, dataImportBinding, tlsAccess, sehScopes};
     MirToLirResult result = std::move(L).run();
     // Append (not overwrite) so any future LIR-tier extern synthesis
     // — e.g. runtime-helper imports like `__chkstk` / `__divti3` /

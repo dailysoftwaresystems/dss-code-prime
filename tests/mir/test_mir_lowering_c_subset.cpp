@@ -113,11 +113,17 @@ struct Lowered {
     // c21 (D-CSUBSET-VOLATILE-QUALIFIER): thread the per-access volatility
     // side-table exactly as compile_pipeline.cpp does, so a `volatile` object/
     // member/global access carries MirInstFlags::Volatile on its Load/Store.
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): thread the thread-storage side-table
+    // too (positional — the intervening alignmentMap is passed as the same
+    // nullptr it previously defaulted to; no fixture in this binary uses
+    // alignas), so `thread_local` source stamps MirGlobal.isThreadLocal and
+    // the CRIT-1 `&tls` initializer screen fires — both pinned below.
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
                                     &hir->linkageMap, &hir->mutabilityMap,
-                                    &hir->volatileMap);
+                                    &hir->volatileMap, /*alignmentMap=*/nullptr,
+                                    &hir->threadLocalMap);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -1344,6 +1350,144 @@ TEST(MirLoweringCSubsetLinkage, FileScopeConstexprGetsInternalLinkage) {
         ASSERT_EQ(m.moduleGlobalCount(), 1u) << arm.src;
         EXPECT_EQ(m.globalBinding(m.globalAt(0)), arm.want)
             << arm.src << "\n" << arm.why;
+    }
+}
+
+// ── TLS C1 (D-CSUBSET-THREAD-LOCAL): the HIR→MIR thread-storage pins ────────
+
+// The end-to-end flag path: SymbolRecord.isThreadLocal → recordThreadLocal →
+// HirThreadLocalMap → PendingGlobal.isThreadLocal → MirGlobal.isThreadLocal.
+// Exact PER-GLOBAL assertions — the thread_local global carries the flag AND
+// the plain sibling in the SAME module does not (a scan that stamped every
+// global would red on `h`). RED-ON-DISABLE: drop any hop of the plumbing
+// (the recordThreadLocal call, the threadLocalMap read, the addGlobal
+// argument) and the `g` EXPECT reds.
+TEST(MirLoweringCSubsetThreadLocal, ThreadLocalGlobalLowersWithFlag) {
+    auto L = lowerCSubset(
+        "thread_local int g = 7;\n"
+        "int h = 7;\n"
+        "int main(void){ return g + h; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 2u) << "g + h, source order";
+    EXPECT_TRUE(m.globalIsThreadLocal(m.globalAt(0)))
+        << "`thread_local int g` must lower with MirGlobal.isThreadLocal";
+    EXPECT_FALSE(m.globalIsThreadLocal(m.globalAt(1)))
+        << "the plain `int h` in the same module must stay process-shared";
+    // Slice-A posture: apart from the flag, the TLS global lowers as an
+    // ordinary constant-init global (codegen TLS is slices B/C).
+    EXPECT_NE(m.globalInitLiteralIndex(m.globalAt(0)), UINT32_MAX);
+}
+
+// C11 6.2.2 is untouched by 6.7.1: a file-scope thread_local keeps EXTERNAL
+// linkage, and a co-present `static` keeps INTERNAL linkage in EITHER order
+// (the {threadStorage:true} entries deliberately carry NO binding axis — the
+// noreturn linkage-clobber lesson). A block-scope `static thread_local`
+// routes to the hidden module-global WITH the flag AND internal binding.
+// RED-ON-DISABLE: give the thread_local linkage entries a binding → the
+// bare arm flips Local; drop the staticStorage routing's recordThreadLocal →
+// the block-scope arm's flag EXPECT reds.
+TEST(MirLoweringCSubsetThreadLocal, ThreadLocalLinkageAndStaticComposition) {
+    struct Arm {
+        char const*   src;
+        SymbolBinding wantBinding;
+        bool          wantTls;
+        char const*   why;
+    };
+    for (Arm const& arm : {
+             Arm{"thread_local int g = 7;\n"
+                 "int main(void){ return g; }\n",
+                 SymbolBinding::Global, true,
+                 "file-scope thread_local keeps EXTERNAL linkage (6.2.2)"},
+             Arm{"static thread_local int s = 1;\n"
+                 "int main(void){ return s; }\n",
+                 SymbolBinding::Local, true,
+                 "static thread_local composes: internal + per-thread"},
+             Arm{"thread_local static int s = 1;\n"
+                 "int main(void){ return s; }\n",
+                 SymbolBinding::Local, true,
+                 "the reverse order must compose identically (no clobber)"},
+             Arm{"int main(void){ static thread_local int ls = 4; "
+                 "return ls; }\n",
+                 SymbolBinding::Local, true,
+                 "a block-scope static thread_local routes to the hidden "
+                 "module-global WITH the flag"}}) {
+        auto L = lowerCSubset(arm.src);
+        ASSERT_FALSE(L.model.hasErrors()) << arm.src << "\n"
+            << (L.model.diagnostics().all().empty()
+                    ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.hir->ok) << arm.src << "\n"
+            << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+        ASSERT_TRUE(L.mir.ok) << arm.src << "\n"
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleGlobalCount(), 1u) << arm.src;
+        EXPECT_EQ(m.globalBinding(m.globalAt(0)), arm.wantBinding)
+            << arm.src << "\n" << arm.why;
+        EXPECT_EQ(m.globalIsThreadLocal(m.globalAt(0)), arm.wantTls)
+            << arm.src << "\n" << arm.why;
+    }
+}
+
+// ★CRIT-1 (C11 6.6p9): the ADDRESS of a thread-local object is NOT an
+// address constant — every static-storage initializer shape naming one must
+// fail loud S_ThreadLocalAddressNotConstant AT THE LOWERING TIER (the
+// semantic model is clean; the reject lives where MirSymbolAddrValue would
+// otherwise be minted). Scalar, aggregate-member, and block-scope-static
+// forms — the three mint paths. RED-ON-DISABLE: drop the
+// tryClassifyAsSymbolAddr screen and all three lower green with an abs64
+// whose resolved value would be the link-time tpoff bit-cast into a data
+// slot (the silent garbage pointer this diagnostic exists to prevent).
+TEST(MirLoweringCSubsetThreadLocal, TlsAddressInStaticInitializerFailsLoud) {
+    for (char const* src : {
+             // scalar file-scope pointer
+             "thread_local int t;\n"
+             "int *p = &t;\n"
+             "int main(void){ return 0; }\n",
+             // aggregate member
+             "thread_local int t;\n"
+             "int *arr[1] = {&t};\n"
+             "int main(void){ return 0; }\n",
+             // block-scope static (routes through the same PendingGlobal
+             // classification as a file-scope global)
+             "thread_local int t;\n"
+             "int main(void){ static int *q = &t; return 0; }\n"}) {
+        auto L = lowerCSubset(src);
+        ASSERT_FALSE(L.model.hasErrors()) << src;
+        ASSERT_TRUE(L.hir->ok) << src;
+        EXPECT_FALSE(L.mir.ok)
+            << src << "\na TLS address must not classify as an address constant";
+        std::size_t n = 0;
+        for (auto const& d : L.mirReporter.all())
+            if (d.code == DiagnosticCode::S_ThreadLocalAddressNotConstant) ++n;
+        EXPECT_EQ(n, 1u)
+            << src << "\nexactly one S_ThreadLocalAddressNotConstant";
+    }
+    // The LEGAL polarity pins: (a) a pointer INSIDE a thread_local aggregate
+    // targeting a NON-TLS symbol is an ordinary address constant; (b) taking
+    // a TLS address AT RUNTIME (function body) is legal — the reject is
+    // static-initializer-scoped, never a blanket address-of ban.
+    for (char const* legal : {
+             "int g = 4;\n"
+             "thread_local int *arr[1] = {&g};\n"
+             "int main(void){ return 0; }\n",
+             "thread_local int t = 3;\n"
+             "int main(void){ int *p = &t; return *p; }\n"}) {
+        auto L = lowerCSubset(legal);
+        ASSERT_FALSE(L.model.hasErrors()) << legal;
+        ASSERT_TRUE(L.hir->ok) << legal;
+        EXPECT_TRUE(L.mir.ok) << legal << "\n"
+            << (L.mirReporter.all().empty() ? ""
+                                            : L.mirReporter.all()[0].actual);
+        for (auto const& d : L.mirReporter.all())
+            EXPECT_NE(d.code, DiagnosticCode::S_ThreadLocalAddressNotConstant)
+                << legal;
     }
 }
 

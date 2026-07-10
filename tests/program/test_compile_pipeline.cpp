@@ -1027,6 +1027,7 @@ TEST(Program_WholeProgramMerge, CrossCuCallIsDirectNoThunkSlot) {
                                      cuMirs[0].cuId,
                                      /*externCallDispatch=*/std::nullopt,
                                      /*dataImportBinding=*/std::nullopt,
+                                     /*tlsAccess=*/std::nullopt,
                                      /*sehScopes=*/{}, rep);
     ASSERT_TRUE(mod.has_value()) << "errorCount=" << rep.errorCount();
 
@@ -1306,4 +1307,357 @@ TEST(Program_ShippedLibModel3, MapValueIsAuthoritativeOverFormatDefault) {
     // fold genuinely reads the descriptor's per-format library map.
     EXPECT_EQ(resolvedPutsLibraryFor(descCustom, "x86_64", "elf64-x86_64-linux-exec"),
               "libcustom.so.9");
+}
+
+// ═════════════════════════════════════════════════════════════════
+// D-CSUBSET-THREAD-LOCAL (TLS C1): end-to-end pipeline pins — real
+// c-subset source through the FULL driver (grammar -> semantics ->
+// HIR/MIR flags -> asm section-select -> the ELF dynamic walker).
+//
+// ★ RED-ON-DISABLE POSTURE: single-thread RUNTIME cannot distinguish
+// real TLS from a process-shared static alias — these STRUCTURAL pins
+// (PT_TLS present, the fs-segment access sequence in .text, the
+// phdr-count delta vs the control TU) are the discriminator: routing
+// thread_local through Data/Bss keeps the runtime witnesses green
+// while every assertion below flips red. The runnable per-thread
+// discriminator is examples/c-subset/thread_local_pthread.
+// ═════════════════════════════════════════════════════════════════
+
+namespace {
+
+[[nodiscard]] std::vector<std::uint8_t> readAllBytes(fs::path const& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::vector<std::uint8_t>(std::istreambuf_iterator<char>(in),
+                                     std::istreambuf_iterator<char>());
+}
+
+[[nodiscard]] std::uint16_t rdU16(std::vector<std::uint8_t> const& b,
+                                  std::size_t off) {
+    return static_cast<std::uint16_t>(b[off])
+         | static_cast<std::uint16_t>(b[off + 1]) << 8;
+}
+[[nodiscard]] std::uint64_t rdU64(std::vector<std::uint8_t> const& b,
+                                  std::size_t off) {
+    std::uint64_t v = 0;
+    for (int i = 0; i < 8; ++i)
+        v |= static_cast<std::uint64_t>(b[off + i]) << (i * 8);
+    return v;
+}
+
+// Count the local-exec thread-pointer reads in the image: the fs
+// segment override + REX.W mov + ModRM(mod=00, rm=100) + SIB 0x25 +
+// disp32 0 — `mov r64, fs:[0]`. Register-allocation picks the
+// destination register, so the REX.R bit and the ModRM reg field are
+// masked, not pinned.
+[[nodiscard]] std::size_t countTlsBaseSeq(std::vector<std::uint8_t> const& b) {
+    std::size_t n = 0;
+    for (std::size_t i = 0; i + 9 <= b.size(); ++i) {
+        if (b[i] == 0x64 && (b[i + 1] & 0xF8u) == 0x48u
+            && b[i + 2] == 0x8B && (b[i + 3] & 0xC7u) == 0x04u
+            && b[i + 4] == 0x25 && b[i + 5] == 0 && b[i + 6] == 0
+            && b[i + 7] == 0 && b[i + 8] == 0) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+// Find PT_TLS (p_type 7); returns the phdr's file offset or 0.
+[[nodiscard]] std::size_t findPtTls(std::vector<std::uint8_t> const& b) {
+    std::uint64_t const phoff = rdU64(b, 32);
+    std::uint16_t const phnum = rdU16(b, 56);
+    for (std::uint16_t i = 0; i < phnum; ++i) {
+        std::size_t const o = static_cast<std::size_t>(phoff) + i * 56u;
+        if (b[o] == 7 && b[o + 1] == 0 && b[o + 2] == 0 && b[o + 3] == 0)
+            return o;
+    }
+    return 0;
+}
+
+} // namespace
+
+TEST(Program_CompileFiles, ThreadLocalEmitsPtTlsAndFsAccessSequence) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "tls_e2e.c",
+        "thread_local int g = 7;\n"
+        "int main(void) { g = g + 35; return g; }\n");
+    scratch.useAsCwd();
+
+    Program prog;
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset",
+        {"x86_64:elf64-x86_64-linux-exec"});
+    ASSERT_EQ(rc, 0) << "thread_local must compile clean end-to-end "
+                        "(D-CSUBSET-THREAD-LOCAL)";
+
+    auto const out =
+        scratch.path() / "target" / "elf64-x86_64-linux-exec" / "tls_e2e";
+    ASSERT_TRUE(fs::exists(out));
+    auto const bytes = readAllBytes(out);
+    ASSERT_GT(bytes.size(), 64u);
+
+    // e_phnum == 6 (the PT_TLS slot) and PT_TLS covers the 4-byte
+    // template with the initial value 7.
+    EXPECT_EQ(rdU16(bytes, 56), 6u);
+    std::size_t const tlsPh = findPtTls(bytes);
+    ASSERT_NE(tlsPh, 0u) << "PT_TLS program header must be present";
+    std::uint64_t const pOff    = rdU64(bytes, tlsPh + 8);
+    std::uint64_t const pFilesz = rdU64(bytes, tlsPh + 32);
+    std::uint64_t const pMemsz  = rdU64(bytes, tlsPh + 40);
+    EXPECT_EQ(pFilesz, 4u);
+    EXPECT_EQ(pMemsz, 4u);
+    EXPECT_EQ(bytes[static_cast<std::size_t>(pOff)], 7u)
+        << "the .tdata template must carry g's initial value";
+
+    // The access sequence: at least one `mov r64, fs:[0]` thread-
+    // pointer read (the tlsbase lowering) in the image.
+    EXPECT_GE(countTlsBaseSeq(bytes), 1u)
+        << "the local-exec fs-read sequence must be present";
+}
+
+TEST(Program_CompileFiles, NoThreadLocalControlHasNoTlsTrace) {
+    // The byte-identity control: the SAME program with an ordinary
+    // global shows ZERO TLS machinery — 5 phdrs, no PT_TLS, no
+    // fs-read sequence. (The sqlite-dormant guarantee rides this:
+    // every TLS emission is hasTls-gated.)
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "tls_ctl.c",
+        "int g = 7;\n"
+        "int main(void) { g = g + 35; return g; }\n");
+    scratch.useAsCwd();
+
+    Program prog;
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset",
+        {"x86_64:elf64-x86_64-linux-exec"});
+    ASSERT_EQ(rc, 0);
+
+    auto const out =
+        scratch.path() / "target" / "elf64-x86_64-linux-exec" / "tls_ctl";
+    ASSERT_TRUE(fs::exists(out));
+    auto const bytes = readAllBytes(out);
+    ASSERT_GT(bytes.size(), 64u);
+
+    EXPECT_EQ(rdU16(bytes, 56), 5u) << "no PT_TLS slot without thread_local";
+    EXPECT_EQ(findPtTls(bytes), 0u);
+    EXPECT_EQ(countTlsBaseSeq(bytes), 0u)
+        << "no fs-read sequence may appear without thread_local";
+}
+
+TEST(Program_CompileFiles, ConstThreadLocalLandsInsidePtTlsSpan) {
+    // CRIT-2 / section-order pin: `thread_local const` has THREAD
+    // storage duration — its bytes must live inside the PT_TLS
+    // template span (per-thread address), NOT in .rodata (one shared
+    // address). The isThreadLocal-FIRST section select is what routes
+    // it; an isConst-first regression parks k in .rodata and empties
+    // the PT_TLS span, flipping this red.
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "tls_const.c",
+        "thread_local const int k = 3;\n"
+        "int main(void) { return k + 39; }\n");
+    scratch.useAsCwd();
+
+    Program prog;
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset",
+        {"x86_64:elf64-x86_64-linux-exec"});
+    ASSERT_EQ(rc, 0);
+
+    auto const out =
+        scratch.path() / "target" / "elf64-x86_64-linux-exec" / "tls_const";
+    ASSERT_TRUE(fs::exists(out));
+    auto const bytes = readAllBytes(out);
+
+    std::size_t const tlsPh = findPtTls(bytes);
+    ASSERT_NE(tlsPh, 0u) << "const thread_local must still produce PT_TLS";
+    std::uint64_t const pOff    = rdU64(bytes, tlsPh + 8);
+    std::uint64_t const pFilesz = rdU64(bytes, tlsPh + 32);
+    ASSERT_EQ(pFilesz, 4u) << "k's 4 bytes are the whole template";
+    EXPECT_EQ(bytes[static_cast<std::size_t>(pOff)], 3u)
+        << "k's initial value lives INSIDE the PT_TLS span (.tdata), "
+           "not .rodata";
+    EXPECT_GE(countTlsBaseSeq(bytes), 1u)
+        << "k must be read tp-relative";
+}
+
+// ── D-CSUBSET-THREAD-LOCAL: code-audit LOW-3 driver-tier pins ──────
+// The walker-tier tests pin these mechanisms on hand-built modules;
+// these three re-pin them through the FULL driver (grammar ->
+// semantics -> HIR/MIR flags -> asm section-select -> merge -> the
+// ELF dynamic walker) so a plumbing regression BETWEEN tiers cannot
+// slip while both tiers' own tests stay green.
+
+TEST(Program_CompileFiles, ThreadLocalPointerTemplateSlotDereferencesE2E) {
+    // LOW-3(a) — the CRIT-2 shape end-to-end: `thread_local char *msg
+    // = "hi";` — the .tdata TEMPLATE slot must hold, at LINK time, a
+    // VA that (1) lies inside a mapped FILE-BACKED region and (2)
+    // dereferences (via the phdr file<->VA congruence) to the "hi\0"
+    // rodata bytes. A demoted-to-.data slot empties PT_TLS; an
+    // unpatched slot holds 0; a tpoff-poisoned patch (the CRIT-1
+    // class) holds a huge bit-cast negative — all three flip this red.
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "tls_ptr.c",
+        "thread_local char *msg = \"hi\";\n"
+        "int main(void) {\n"
+        "    return (msg[0] == 'h' && msg[1] == 'i' && msg[2] == 0)\n"
+        "               ? 42 : 1;\n"
+        "}\n");
+    scratch.useAsCwd();
+
+    Program prog;
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset",
+        {"x86_64:elf64-x86_64-linux-exec"});
+    ASSERT_EQ(rc, 0);
+
+    auto const out =
+        scratch.path() / "target" / "elf64-x86_64-linux-exec" / "tls_ptr";
+    ASSERT_TRUE(fs::exists(out));
+    auto const bytes = readAllBytes(out);
+
+    std::size_t const tlsPh = findPtTls(bytes);
+    ASSERT_NE(tlsPh, 0u);
+    std::uint64_t const pOff    = rdU64(bytes, tlsPh + 8);
+    std::uint64_t const pFilesz = rdU64(bytes, tlsPh + 32);
+    ASSERT_EQ(pFilesz, 8u) << "the pointer slot is the whole template";
+
+    // The slot's 8 template bytes = the link-time-patched target VA.
+    std::uint64_t const slotVa = rdU64(bytes, static_cast<std::size_t>(pOff));
+    ASSERT_NE(slotVa, 0u) << "template slot must be PATCHED, not zero";
+
+    // Map slotVa -> file offset through the PT_LOADs (p_type 1): it
+    // must fall inside a FILE-BACKED span (offset < p_filesz — the
+    // .rodata region), never in a memsz-only tail.
+    std::uint64_t const phoff = rdU64(bytes, 32);
+    std::uint16_t const phnum = rdU16(bytes, 56);
+    std::uint64_t fileOff = 0;
+    bool mapped = false;
+    for (std::uint16_t i = 0; i < phnum; ++i) {
+        std::size_t const o = static_cast<std::size_t>(phoff) + i * 56u;
+        if (bytes[o] != 1 || bytes[o + 1] != 0) continue;   // PT_LOAD
+        std::uint64_t const lOff = rdU64(bytes, o + 8);
+        std::uint64_t const lVa  = rdU64(bytes, o + 16);
+        std::uint64_t const lFsz = rdU64(bytes, o + 32);
+        if (slotVa >= lVa && slotVa < lVa + lFsz) {
+            fileOff = slotVa - lVa + lOff;
+            mapped = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(mapped)
+        << "the patched VA must lie inside a mapped file-backed "
+           "PT_LOAD span (a bit-cast tpoff or garbage VA maps nowhere)";
+    // Dereference: exactly 'h','i',0.
+    ASSERT_GE(bytes.size(), fileOff + 3u);
+    EXPECT_EQ(bytes[static_cast<std::size_t>(fileOff) + 0], 'h');
+    EXPECT_EQ(bytes[static_cast<std::size_t>(fileOff) + 1], 'i');
+    EXPECT_EQ(bytes[static_cast<std::size_t>(fileOff) + 2], 0u);
+}
+
+TEST(Program_CompileFiles, CrossCuExternThreadLocalMergesAndAccessesTpRelativeE2E) {
+    // LOW-3(b) — the 2-CU shape: CU1 DEFINES `thread_local int g` and
+    // mutates it; CU2 declares `extern thread_local int g` and reads
+    // it, compiled as TWO translation units via `compileUnits` — the
+    // CU6/LK11 shape the CLI routes every multi-source invocation to
+    // (`routesToMultiUnit`), where the MIR merge's definedNames strip
+    // unifies CU2's extern row onto CU1's definition (CRIT-3's
+    // thread-storage carry included). A surviving TLS extern would
+    // fail loud at the linker's initial-exec gate — pinned by
+    // Linker.SurvivingThreadLocalExternImportRejectsLoud. PT_TLS must
+    // be present, and BOTH CUs' accesses must go tp-relative: >= 2
+    // `mov r64, fs:[0]` thread-pointer reads in the merged image (a
+    // per-CU split where one CU silently fell back to an absolute
+    // .data access would leave only one).
+    //
+    // Deliberately NOT `compileFiles`: with N>1 sources that API
+    // builds ONE multi-FILE CU5 unit, whose extern-data resolution is
+    // a different (API-only) surface — today it mints a surviving
+    // import row for a sibling-FILE definition, which the TLS gate
+    // then correctly rejects loud (observed while writing this pin;
+    // flagged to the plan tier — not this test's subject).
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src1 = writeCSubsetSource(
+        scratch.path(), "tls_cu1.c",
+        "thread_local int g = 5;\n"
+        "int bump(void) { g = g + 1; return g; }\n");
+    auto const src2 = writeCSubsetSource(
+        scratch.path(), "tls_cu2.c",
+        "extern int bump(void);\n"
+        "extern thread_local int g;\n"
+        "int main(void) {\n"
+        "    if (g != 5) return 1;\n"
+        "    int r = bump();\n"
+        "    if (r != 6) return 2;\n"
+        "    if (g != 6) return 3;\n"
+        "    return 42;\n"
+        "}\n");
+    scratch.useAsCwd();
+
+    Program prog;
+    int const rc = prog.compileUnits(
+        {src1.generic_string(), src2.generic_string()}, "c-subset",
+        {"x86_64:elf64-x86_64-linux-exec"});
+    ASSERT_EQ(rc, 0) << "extern thread_local must resolve across the "
+                        "cross-CU merge (never survive to the "
+                        "initial-exec linker gate)";
+
+    auto const out =
+        scratch.path() / "target" / "elf64-x86_64-linux-exec" / "tls_cu1";
+    ASSERT_TRUE(fs::exists(out));
+    auto const bytes = readAllBytes(out);
+
+    std::size_t const tlsPh = findPtTls(bytes);
+    ASSERT_NE(tlsPh, 0u);
+    EXPECT_EQ(rdU64(bytes, tlsPh + 32), 4u);   // p_filesz — one int
+    EXPECT_EQ(rdU64(bytes, tlsPh + 40), 4u);   // p_memsz
+    EXPECT_GE(countTlsBaseSeq(bytes), 2u)
+        << "both CUs' g accesses must read the thread pointer "
+           "(fs:[0]) — a single occurrence means one CU bypassed TLS";
+}
+
+TEST(Program_CompileFiles, Alignas32ThreadLocalPAlignAndLayoutE2E) {
+    // LOW-3(c) — the HIGH-1 _Alignas physics through the WHOLE driver.
+    // Hand-derivation (declaration order = item order):
+    //   big   {09 00 00 00} align 32 -> template offset 0
+    //   small {07 00 00 00} align 4  -> alignUp(4,4) = 4, span 8
+    //   tlsAlign = 32 -> PT_TLS p_align == 32
+    //   p_filesz = p_memsz = 8 (no tbss part)
+    //   (alignedBlockSize = alignUp(8,32) = 32 -> tpoffs big=-32,
+    //   small=-28 — byte-pinned at the walker tier; here the phdr
+    //   fields pin the same formula's inputs end-to-end.)
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "tls_align.c",
+        "_Alignas(32) thread_local int big = 9;\n"
+        "thread_local int small = 7;\n"
+        "int main(void) { return big + small + 26; }\n");   // 9+7+26 = 42
+    scratch.useAsCwd();
+
+    Program prog;
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset",
+        {"x86_64:elf64-x86_64-linux-exec"});
+    ASSERT_EQ(rc, 0);
+
+    auto const out =
+        scratch.path() / "target" / "elf64-x86_64-linux-exec" / "tls_align";
+    ASSERT_TRUE(fs::exists(out));
+    auto const bytes = readAllBytes(out);
+
+    std::size_t const tlsPh = findPtTls(bytes);
+    ASSERT_NE(tlsPh, 0u);
+    std::uint64_t const pOff = rdU64(bytes, tlsPh + 8);
+    EXPECT_EQ(rdU64(bytes, tlsPh + 32), 8u);   // p_filesz
+    EXPECT_EQ(rdU64(bytes, tlsPh + 40), 8u);   // p_memsz
+    EXPECT_EQ(rdU64(bytes, tlsPh + 48), 32u)   // p_align — THE pin
+        << "the _Alignas(32) member must drive PT_TLS p_align (the "
+           "tpoff formula divides by it — HIGH-1)";
+    // Template bytes: big at 0, small at 4.
+    std::size_t const t = static_cast<std::size_t>(pOff);
+    EXPECT_EQ(bytes[t + 0], 9u);
+    EXPECT_EQ(bytes[t + 4], 7u);
 }

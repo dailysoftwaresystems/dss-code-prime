@@ -1,7 +1,8 @@
 rule:root
   rule:topLevel
     rule:externDecl
-      tok:"extern"
+      rule:externSpecifiers
+        tok:"extern"
       rule:typeRef
         rule:typeBase
           rule:typeSpecifierSeq

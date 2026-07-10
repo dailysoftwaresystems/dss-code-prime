@@ -9,6 +9,8 @@
   },
   "$aggregateLayoutComment": "FC6 (D-FF3-1): per-ABI struct/union/array layout params the generic type_layout engine reads. `natural` = scalar alignment equals its byte size (capped at maxAlignment) — the rule all four current C ABIs (SysV/Win64/AAPCS64/Apple) share; the format's dataModel supplies the OS-dependent pointer width. maxAlignment 16 = the x86_64 max fundamental alignment (__int128/long double/max_align_t). D-CSUBSET-BITFIELD-ABI-EXACT: `bitFieldStrategy` here is the BACK-COMPAT FALLBACK only — C bit-field packing is OS/format-determined (this CPU serves BOTH ELF-SysV gnu_packed AND PE-MS msvc_straddle), so the ACTIVE strategy is resolved from the object FORMAT (effectiveBitFieldStrategy). The fallback is used only by direct-API / test callers with no format in scope.",
   "aggregateLayout": { "scalarAlignment": "natural", "maxAlignment": 16, "bitFieldStrategy": "gnu_packed" },
+  "$tlsComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): the CPU's static-TLS layout convention — psABI-per-CPU data (x86_64 is Variant II under EVERY OS, so it lives on the TARGET, not the format). variant2 = the thread pointer points ONE PAST the TLS block's end (fs:[0] holds tp itself); a symbol's link-time thread-pointer offset is NEGATIVE: tpoff = templateOffset − alignUp(blockSize, p_align). tcbHeaderBytes = 0 (a Variant-I-only input — arm64 declares 16 with its own block at TLS C2). Consumed ONLY by the walker's tpoff helper when the format's tlsAccess.model is local-exec — a config-keyed formula selector, never a machine-identity branch.",
+  "tls": { "variant": "variant2", "tcbHeaderBytes": 0 },
   "opcodes": [
     {
       "$comment": "Slot 0 = the Invalid sentinel. Every target must declare it as the first opcode so the substrate's `opcode == 0` check (in LirBuilder::addInst) catches default-constructed insts loudly.",
@@ -952,7 +954,31 @@
       }
     },
     {
-      "$comment": "Load-effective-address. Operands: [base_reg, MemBase(scale), MemOffset(disp)] OR [base_reg, index_reg, MemBase(scale), MemOffset(disp)] OR [SymbolRef] (RIP-relative form, D-LK4-RODATA-PRODUCER 2026-06-02). AS1 emits x86_64 `lea reg, [base + index*scale + disp]` / `lea reg, [rip + sym]`. Cycle 3c uses the 3-operand form for MIR Gep without an index; index-arm via 4-operand form; RIP-relative arm materializes a module-level global's address into a register for downstream loads/stores or function-pointer calls. Encoding: REX.W 0x8D /r ModR/M [SIB?] disp32. Opcode 0x8D is the `lea` mnemonic; the modes differ only in ModR/M.mod (10 for [base+disp], 00 for [rip+disp]).",
+      "$comment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): materialize the current thread's TLS base pointer (tp) into a GPR — x86 form `mov r64, seg:[disp32]` = <segByte> 48 8B ModRM(00,reg,100) SIB(0x25) disp32. EVERY format-specific VALUE is config, threaded by the lowering: the segment-override byte (0x64 fs on ELF-Linux / 0x65 gs on PE) rides the LIR PAYLOAD via the template's payloadBytePrefix (emitted as the instruction's FIRST byte — prefix group 2 precedes REX); the tp-slot displacement (fs:[0] on ELF; the TEB gs:[0x58] on PE) rides the MemOffset operand into the absdisp32.mem slot (mod=00 rm=100 + SIB index=none base=101 disp32-only — the 64-bit absolute-addressing form; a bare mod=00 rm=101 would be [rip+disp32]). This ONE row therefore serves ELF and PE with config-only differences — the target JSON stays format-blind. Opcode 0x8B = MOV r64, r/m64 (register form of the load); result rides ModR/M.reg. Pure read (no side effects); never a terminator.",
+      "mnemonic":      "tlsbase",
+      "result":        "value",
+      "hasSideEffects": false,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "$comment": "1-op absolute-SIB form: `mov r64, seg:[disp32]`. Byte layout: payload(seg) + REX.W(0x48|R) + 0x8B + ModRM(mod=00 reg=dest rm=100) + SIB(0x25 = scale0 index-none base-disp32) + disp32 LE. The MemOffset operand supplies the literal disp32 (format config's tlsAccess.baseDisplacement).",
+            "guard":      { "operandKinds": ["memoffset"] },
+            "resultSlot": "modrm.reg",
+            "template":   { "payloadBytePrefix": true, "rexW": true, "opcode": [139] },
+            "wires":      [
+              { "index": 0, "slotKind": "absdisp32.mem" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "Load-effective-address. Operands: [base_reg, MemBase(scale), MemOffset(disp)] OR [base_reg, index_reg, MemBase(scale), MemOffset(disp)] OR [SymbolRef] (RIP-relative form, D-LK4-RODATA-PRODUCER 2026-06-02) OR [base_reg, SymbolRef] (TLS relocated-displacement form, D-CSUBSET-THREAD-LOCAL). AS1 emits x86_64 `lea reg, [base + index*scale + disp]` / `lea reg, [rip + sym]` / `lea reg, [base + tpoff32(sym)]`. Cycle 3c uses the 3-operand form for MIR Gep without an index; index-arm via 4-operand form; RIP-relative arm materializes a module-level global's address into a register for downstream loads/stores or function-pointer calls; the TLS arm adds the linker-patched thread-pointer offset to the tp register. Encoding: REX.W 0x8D /r ModR/M [SIB?] disp32. Opcode 0x8D is the `lea` mnemonic; the modes differ only in ModR/M.mod (10 for [base+disp], 00 for [rip+disp]).",
       "mnemonic":      "lea",
       "result":        "value",
       "hasSideEffects": false,
@@ -1002,6 +1028,16 @@
             "template":   { "rexW": true, "opcode": [141] },
             "wires":      [
               { "index": 0, "slotKind": "riprel.disp32", "relocationKind": "rel32" }
+            ]
+          },
+          {
+            "$comment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): 2-op relocated-displacement form: `lea reg, [base + tpoff32(sym)]` — REX.W 0x8D ModRM(mod=10 reg=dest rm=base) [SIB when base.lo3=100] + a 4-byte RELOC PLACEHOLDER at the memory-displacement position (Relocation{tls-tpoff32, sym}; the linker patches the SIGNED thread-pointer offset in). The base is the tp register `tlsbase` produced; the sum IS the thread-local object's per-thread address. Distinct guard [reg, symbol] — no other lea variant carries that shape.",
+            "guard":      { "operandKinds": ["reg", "symbol"] },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [141] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem" },
+              { "index": 1, "slotKind": "memreloc.disp32", "relocationKind": "tls-tpoff32" }
             ]
           }
         ]
@@ -1989,6 +2025,8 @@
   "relocations": [
     { "name": "rel32", "kind": 1, "formula": "linear", "pcRelative": true,  "addendBias": -4, "widthBytes": 4 },
     { "name": "abs64", "kind": 2, "formula": "linear", "pcRelative": false, "addendBias":  0, "widthBytes": 8 },
-    { "name": "abs32", "kind": 3, "formula": "linear", "pcRelative": false, "addendBias":  0, "widthBytes": 4 }
+    { "name": "abs32", "kind": 3, "formula": "linear", "pcRelative": false, "addendBias":  0, "widthBytes": 4 },
+    { "$comment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): the local-exec thread-pointer-offset patch — value = S + A, written 4 LE bytes, where S is the SIGNED tpoff the walker bit-casts into symbolVa[sym] (Variant II: templateOffset − alignedBlockSize, negative) — the SAME Linear formula as abs32, ZERO new RelocFormulaKind. `tls: true` marks the kind thread-local-offset-bearing for the walker's TLS symbol ⟺ tls-kind cross-check (a non-TLS reloc against a TLS symbol would write the bit-cast tpoff as a VA — the CRIT-1 garbage-pointer class; a tls reloc against a non-TLS symbol would write a VA as a tpoff). Emitted by the 2-op [reg, symbol] `lea` variant at the memory-displacement position (memreloc.disp32).",
+      "name": "tls-tpoff32", "kind": 4, "formula": "linear", "pcRelative": false, "addendBias": 0, "widthBytes": 4, "tls": true }
   ]
 }

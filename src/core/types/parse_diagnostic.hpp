@@ -727,6 +727,57 @@ enum class DiagnosticCode : std::uint16_t {
     // symbol, so a suppressed rejection would silently compile the void/
     // nullptr_t/self-referential form with a wrong or tripwire-tripping type.
     S_AutoInferenceInvalid = 0xE044,
+    // C11 §6.7.1 / C23 §6.7.1 (D-CSUBSET-THREAD-LOCAL): `_Thread_local` /
+    // `thread_local` on a FUNCTION declarator (`thread_local int f(void);` —
+    // prototype or definition, intra-module or extern). Thread storage
+    // duration applies to OBJECTS only (6.7.1p4: "_Thread_local shall not
+    // appear in the declaration specifiers of a function declaration").
+    // UNSUPPRESSABLE — suppressed, the function would silently compile with
+    // the specifier dropped (and a file-scope declaration would carry a
+    // storage-class the codegen tiers never validated).
+    S_ThreadLocalOnFunction = 0xE045,
+    // C11 §6.7.1p3 (D-CSUBSET-THREAD-LOCAL): a BLOCK-scope object declared
+    // `thread_local` without `static` or `extern` in the same declaration
+    // (`void f(void) { thread_local int x; }` — the standard REQUIRES one of
+    // the two; a for-init `for (thread_local int i…)` is the same violation
+    // via the row's gated marker, since a for-init admits neither).
+    // UNSUPPRESSABLE — suppressed, the object would silently lower as a
+    // plain AUTOMATIC (a per-CALL stack slot: aliasing per-thread semantics
+    // with per-invocation storage — a silent miscompile of the storage
+    // duration the program declared).
+    S_ThreadLocalRequiresStaticOrExtern = 0xE046,
+    // C11 §6.7.1p3 (D-CSUBSET-THREAD-LOCAL): a same-TU REDECLARATION pair
+    // disagrees on thread storage — one declaration names the object
+    // `thread_local` and the other does not (`extern int g; thread_local int
+    // g = 5;` — 6.7.1p3: "it shall be present in the declaration of every
+    // declared name with thread storage duration"; BOTH directions).
+    // UNSUPPRESSABLE — suppressed, the merge would keep ONE record's flag
+    // and half the program's accesses would silently target the wrong
+    // storage (process-shared vs per-thread).
+    S_ThreadLocalRedeclarationMismatch = 0xE047,
+    // C11 §6.6p9 (D-CSUBSET-THREAD-LOCAL): the ADDRESS of a thread-local
+    // object used in a STATIC-storage-duration initializer (`thread_local
+    // int t; int *p = &t;` — scalar, aggregate member, or a block-scope
+    // `static int *q = &t;`). A thread-local object's address is NOT an
+    // address constant: it differs per thread and is only computable at
+    // runtime against the executing thread's TLS block. UNSUPPRESSABLE —
+    // suppressed, the emitted data item would carry an abs64 relocation
+    // whose resolved value is the link-time tpoff bit-cast to a pointer (a
+    // silent garbage pointer in .data — the exact CRIT-1 miscompile).
+    S_ThreadLocalAddressNotConstant = 0xE048,
+    // C11 §6.7.1p2 + C23 §6.7.1 (D-CSUBSET-THREAD-LOCAL): `thread_local`
+    // combined with a storage-class specifier the standard forbids — ONE
+    // code, distinct `.actual` messages:
+    //   • with `constexpr` (C23 6.7.1: constexpr may pair only with auto /
+    //     register / static — never thread_local);
+    //   • with `register` (6.7.1p2 admits only static / extern beside
+    //     thread_local; the c-subset parses `register` as an inert
+    //     storage-class specifier, so the pairing must reject here).
+    // (`typedef thread_local` cannot co-occur grammatically — typedefDecl
+    // has no storage-specifier prefix — so it stays a loud parse error.)
+    // UNSUPPRESSABLE — suppressed, the declaration would silently drop
+    // whichever specifier the downstream tiers don't model.
+    S_ThreadLocalInvalidCombination = 0xE049,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -1581,7 +1632,18 @@ enum class DiagnosticCode : std::uint16_t {
     //   the artifact is valid, the exec bit a best-effort convenience
     //   (D-OUTPUT-EXEC-BIT). No-op on Windows (PE ignores Unix modes).
     K_ImageExecBitFailed           = 0x8014,
-    // K-NEXT-SLOT: 0x8015 — grep this marker before adding a K_* code.
+    // K_FormatLacksThreadLocalSupport (D-CSUBSET-THREAD-LOCAL): a format
+    //   walker received a thread-local data item (a `.tdata`/`.tbss`-kind
+    //   section) but has NO TLS image machinery for it (ELF PT_TLS / the PE
+    //   TLS directory / Mach-O __thread_vars). The anti-static-alias
+    //   backstop: a format JSON that prematurely opts its data-section list
+    //   into "tdata"/"tbss" without walker support would otherwise lay the
+    //   template out as ORDINARY data — every thread silently sharing one
+    //   copy (a miscompile of the declared storage duration). Declared with
+    //   the C1 semantic tier so the C1/C2/C3 walker slices share one code;
+    //   fires from the walker tiers (slices B/C).
+    K_FormatLacksThreadLocalSupport = 0x8015,
+    // K-NEXT-SLOT: 0x8016 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

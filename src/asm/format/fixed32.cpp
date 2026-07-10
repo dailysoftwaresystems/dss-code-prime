@@ -146,6 +146,11 @@ windowFor(EncodingSlotKind s) noexcept {
         // fixed32 bit-window.
         case EncodingSlotKind::OpcodePlusReg:
         case EncodingSlotKind::Imm64:
+        // TLS C1 (D-CSUBSET-THREAD-LOCAL): the absolute-SIB disp32 +
+        // the relocated memory displacement are ModR/M-byte constructs
+        // — x86-variable only, no fixed32 bit-window.
+        case EncodingSlotKind::AbsoluteDisp32Mem:
+        case EncodingSlotKind::MemRelocDisp32:
             return std::nullopt;
     }
     // Unreachable for any in-range EncodingSlotKind — the switch above

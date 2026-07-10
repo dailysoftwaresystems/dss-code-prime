@@ -172,6 +172,80 @@ dataImportBindingFromName(std::string_view s) noexcept {
     return kDataImportBindingTable.fromName(s);
 }
 
+// ── Thread-local access model (D-CSUBSET-THREAD-LOCAL, TLS C1) ─────
+//
+// HOW code reaches a thread-local object's per-thread copy — a property
+// of the OBJECT FORMAT's TLS runtime contract (who sets the thread
+// pointer up, what it points at), exactly like `ExternCallDispatch` /
+// `DataImportBinding` above. Keyed by the format because the SAME CPU
+// target uses different access sequences under different formats
+// (x86_64-ELF reads `fs:[0]`; x86_64-PE reads the TEB slot `gs:[0x58]`
+// and indexes a per-module slot array), so it cannot live on the target
+// schema. The VALUES (segment-override byte, base displacement) are
+// per-format config; the SHAPES (which instructions) come from the
+// target schema's opcode rows — the lowering branches only on this
+// closed verb set, never on a format/CPU identity.
+//
+//   * `local-exec` (ELF static TLS, C1): the thread pointer register
+//     is read via ONE dereference of `segmentPrefixByte:[baseDisplacement]`
+//     (x86_64 Linux: `mov r, fs:[0]` — fs:[0] holds the tcbhead's own
+//     address = tp), then the object's address is `tp + tpoff(sym)`
+//     where tpoff is a LINK-TIME constant (the `tls-tpoff32`-class
+//     relocation the walker resolves via the target's TlsIdentity
+//     variant formula). Correct for a statically-merged executable
+//     (module 1 is always tp-adjacent).
+//   * `pe-indexed` (Windows, C3): `gs:[0x58]` = the TEB's
+//     ThreadLocalStoragePointer slot array; the module's slot index is
+//     loaded from `_tls_index` and the object sits at
+//     `slots[_tls_index] + offset`. Declared now as vocabulary; its
+//     LOWERING lands with the PE TLS cycle — the MIR→LIR arm fails
+//     LOUD (never a silently-wrong local-exec sequence) until then.
+//   * `macho-tlv` (Mach-O, C4): access is a CALL through the object's
+//     `__thread_vars` TLV descriptor (`_tlv_bootstrap`). Declared as
+//     vocabulary; fails loud at lowering until the Mach-O TLS cycle.
+//
+// A format that declares NO `tlsAccess` block cannot lower a
+// thread-local access at all: MIR→LIR fails loud
+// (`K_FormatLacksThreadLocalSupport`) on the first thread-local
+// GlobalAddr — never a silent process-shared alias.
+enum class TlsAccessModel : std::uint8_t {
+    LocalExec = 1,  // ELF static TLS: tp-register + link-time tpoff
+    PeIndexed = 2,  // PE TEB slot-array via _tls_index (lowering: PE TLS cycle)
+    MachoTlv  = 3,  // Mach-O TLV descriptor call (lowering: Mach-O TLS cycle)
+};
+
+inline constexpr EnumNameTable<TlsAccessModel, 3> kTlsAccessModelTable{{{
+    { TlsAccessModel::LocalExec, "local-exec" },
+    { TlsAccessModel::PeIndexed, "pe-indexed" },
+    { TlsAccessModel::MachoTlv,  "macho-tlv"  },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+tlsAccessModelName(TlsAccessModel m) noexcept {
+    return kTlsAccessModelTable.name(m);
+}
+[[nodiscard]] constexpr std::optional<TlsAccessModel>
+tlsAccessModelFromName(std::string_view s) noexcept {
+    return kTlsAccessModelTable.fromName(s);
+}
+
+// The format's TLS access block (`"tlsAccess"` in `.format.json`).
+// `segmentPrefixByte` is the x86 segment-override prefix byte the
+// `tlsbase` instruction emits as its FIRST byte (0x64 = fs on
+// ELF-Linux; 0x65 = gs on PE) — threaded to the encoder via the LIR
+// instruction's payload so the x86_64 TARGET JSON stays format-blind
+// (the same `tlsbase` opcode row serves ELF and PE with config-only
+// differences). `baseDisplacement` is the literal disp32 of the
+// thread-pointer slot (`fs:[0]` on ELF; the TEB's `gs:[0x58]` on PE).
+// Non-x86 targets ignore `segmentPrefixByte` (their tp read is a
+// dedicated register, e.g. arm64 MRS TPIDR_EL0 — the opcode row
+// carries the shape; this block still selects the MODEL).
+struct DSS_EXPORT TlsAccessInfo {
+    TlsAccessModel model             = TlsAccessModel::LocalExec;
+    std::uint8_t   segmentPrefixByte = 0;  // x86 segment-override byte (0x64 fs / 0x65 gs)
+    std::uint32_t  baseDisplacement  = 0;  // disp32 of the tp slot (ELF fs:[0] → 0)
+};
+
 // THE single source of truth for the extern-call-site SHAPE selection
 // (D-FFI-EXTERN-CALL-DISPATCH). `true`  → the call site DEREFERENCES a
 // pointer slot (x86_64 `FF 15 disp32` = `call [RIP+disp]`); the LIR

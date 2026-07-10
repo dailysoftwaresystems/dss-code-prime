@@ -80,6 +80,10 @@ struct Lowerer {
     HirAlignmentMap const*   alignmentMap; // optional — per-DECLARATION explicit
                                            // `alignas` (D-CSUBSET-ALIGNAS-VARIABLE-
                                            // CODEGEN). nullptr / no entry ⇒ natural.
+    HirThreadLocalMap const* threadLocalMap; // optional — per-DECLARATION thread
+                                           // storage duration (TLS C1,
+                                           // D-CSUBSET-THREAD-LOCAL). nullptr / no
+                                           // entry ⇒ ordinary process-shared.
     MirBuilder               mir;
     // Extern symbols extracted during the pre-pass. Each extern's
     // SymbolId is also inserted into `functionSymbols` so a `Ref`
@@ -137,6 +141,18 @@ struct Lowerer {
     // pointer operand of `Store` for writes). The MIR's `addGlobal` records
     // the storage; codegen later wires the symbol to that arena entry.
     std::unordered_set<std::uint32_t> globalSymbols;
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL, ★CRIT-1): the module's THREAD-LOCAL
+    // symbols (intra-module globals + extern data), populated by
+    // `collectGlobals`/`collectExterns` from the HirThreadLocalMap — i.e.
+    // COMPLETE before `classifyGlobals` runs. Consulted by the
+    // symbol-address initializer classification: the ADDRESS of a
+    // thread-local object is NOT an address constant (C11 6.6p9 — it
+    // differs per thread, computable only at runtime against the executing
+    // thread's TLS block), so a static-storage initializer naming one fails
+    // loud S_ThreadLocalAddressNotConstant instead of minting a
+    // MirSymbolAddrValue whose resolved abs64 would be the link-time tpoff
+    // bit-cast into a data slot (a silent garbage pointer).
+    std::unordered_set<std::uint32_t> threadLocalTargetSymbols;
     // The synthesized module-init function — created lazily when the first
     // non-constant initializer needs runtime evaluation. Each subsequent
     // non-constant init appends a Store-into-global into this function's
@@ -587,7 +603,11 @@ struct Lowerer {
                     }
                     std::uint32_t const mirLitIdx =
                         mir.literalPoolAdd(toMirLiteral(src));
-                    (void)mir.addGlobal(t, sym, mirLitIdx);
+                    (void)mir.addGlobal(t, sym, mirLitIdx, MirFuncId{},
+                                        SymbolBinding::Global,
+                                        SymbolVisibility::Default,
+                                        /*isConst=*/false,
+                                        MirThreadStorage::Shared);
                     TypeId const ptrTy = interner.pointer(t);
                     MirInstId const addr = mir.addGlobalAddr(sym, ptrTy);
                     std::array<MirInstId, 1> ops{addr};
@@ -2693,7 +2713,7 @@ struct Lowerer {
         // pool global stays read-only.
         (void)mir.addGlobal(hir.typeId(litNode), sym, mirLitIdx, {},
                             SymbolBinding::Global, SymbolVisibility::Default,
-                            /*isConst=*/true);
+                            /*isConst=*/true, MirThreadStorage::Shared);
         stringGlobalMemo_.emplace(std::move(memoKey), sym);
         return sym;
     }
@@ -7531,6 +7551,20 @@ struct Lowerer {
                 row.mangledName = meta->mangledName;
                 row.libraryPath = meta->importLibrary;
                 row.isData      = true;
+                // TLS C1 (D-CSUBSET-THREAD-LOCAL): `extern thread_local int
+                // e;` — carry the declaration's thread-storage duration on
+                // the import row (mir_merge's survivingExterns copies the
+                // whole row, so the flag rides the LK11 merge for free) and
+                // register the symbol as a TLS address-constant reject
+                // target (★CRIT-1 — `int *p = &e;` at file scope is as
+                // ill-formed for an extern TLS object as for a local one).
+                if (threadLocalMap != nullptr) {
+                    if (auto const* p = threadLocalMap->tryGet(decl);
+                        p != nullptr && p->isThreadLocal) {
+                        row.isThreadLocal = true;
+                        threadLocalTargetSymbols.insert(sym.v);
+                    }
+                }
                 // c84 (D-LK-EXTERN-DATA-IMPORT): derive the imported
                 // OBJECT's byte size + alignment from the declared
                 // type's LAYOUT (the same computeLayout every sizeof /
@@ -7680,6 +7714,16 @@ struct Lowerer {
             SymbolId const sym = hir.globalSymbol(decl);
             if (!sym.valid()) continue;
             globalSymbols.insert(sym.v);
+            // TLS C1 (★CRIT-1): register thread-local globals BEFORE
+            // `classifyGlobals` walks any initializer, so the
+            // symbol-address classification can reject `&tls` as a
+            // static initializer regardless of declaration order.
+            if (threadLocalMap != nullptr) {
+                if (auto const* p = threadLocalMap->tryGet(decl);
+                    p != nullptr && p->isThreadLocal) {
+                    threadLocalTargetSymbols.insert(sym.v);
+                }
+            }
         }
     }
 
@@ -7705,6 +7749,12 @@ struct Lowerer {
         // When set AND the global has a runtime initializer, its load-time init
         // Store carries MirInstFlags::Volatile.
         bool                           isVolatile = false;
+        // TLS C1 (D-CSUBSET-THREAD-LOCAL): declared thread storage duration
+        // (default false ⇒ ordinary process-shared). Stamped onto
+        // MirGlobal.isThreadLocal so the assembler routes the item to the
+        // thread-template sections (`.tdata`/`.tbss`) — checked BEFORE
+        // isConst there (a `const thread_local` is per-thread first).
+        bool                           isThreadLocal = false;
         // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: declared explicit `alignas(N)`
         // alignment in bytes (0 ⇒ none). Stamped onto MirGlobal.alignment so the
         // assembler raises the emitted data item's section alignment.
@@ -7731,9 +7781,16 @@ struct Lowerer {
     // const-eval / runtime-init). mintSyntheticGlobalSymbol is lazy-seeded after
     // collect*, so minting here is safe; pushing the rodata PendingGlobal mid-
     // classify is safe (the classify loop walks moduleDecls, not pendingGlobals).
+    //
+    // TLS C1 (★CRIT-1, D-CSUBSET-THREAD-LOCAL): callers use the
+    // `tryClassifyAsSymbolAddr` WRAPPER below — it screens every classified
+    // target against `threadLocalTargetSymbols` (C11 6.6p9: a thread-local
+    // object's address is NOT an address constant) so no MirSymbolAddrValue
+    // targeting TLS is ever minted silently. This Impl recurses to ITSELF
+    // (the Cast-peel arm) so one initializer emits at most ONE diagnostic.
     [[nodiscard]] std::optional<std::pair<SymbolId, std::int64_t>>
-    tryClassifyAsSymbolAddr(HirNodeId initNode, EvalEnvironment const& env,
-                            EvalOptions const& opts) {
+    tryClassifyAsSymbolAddrImpl(HirNodeId initNode, EvalEnvironment const& env,
+                                EvalOptions const& opts) {
         HirKind const k = hir.kind(initNode);
         // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): a bare `Ref` to a
         // FUNCTION symbol is a function designator that has decayed to its
@@ -7794,7 +7851,7 @@ struct Lowerer {
             // The result type is already gated to Ptr above, so a cast that
             // changes representation — `(long)&x` — never reaches here.
             if (hir.kind(kids[0]) != HirKind::Literal)
-                return tryClassifyAsSymbolAddr(kids[0], env, opts);
+                return tryClassifyAsSymbolAddrImpl(kids[0], env, opts);
             std::uint32_t const litIdx0 = hir.payload(kids[0]);
             HirLiteralValue const& src = literals.at(litIdx0);
             if (!std::holds_alternative<std::string>(src.value))
@@ -7810,6 +7867,67 @@ struct Lowerer {
             return std::make_pair(rodataSym, std::int64_t{0});
         }
         return std::nullopt;
+    }
+
+    // TLS C1 (★CRIT-1, D-CSUBSET-THREAD-LOCAL): fail loud when a
+    // STATIC-storage-duration initializer names a thread-local object's
+    // address (C11 6.6p9 — thread storage ≠ static storage, so `&tls` is not
+    // an address constant). Without this, the classified target would mint a
+    // MirSymbolAddrValue whose abs64 relocation the walker resolves through
+    // the SAME symbol-VA map the TLS layout poisons with signed tpoffs — a
+    // silent garbage pointer in `.data`. A pointer INSIDE a thread_local
+    // aggregate targeting a NON-TLS symbol is legal and never fires here
+    // (the screen keys on the TARGET, not the initialized global).
+    void rejectThreadLocalAddressTarget(SymbolId target, HirNodeId at) {
+        if (!threadLocalTargetSymbols.contains(target.v)) return;
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::S_ThreadLocalAddressNotConstant;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = "the address of a thread-local object is not an address "
+                     "constant (C 6.6p9) — a static-storage initializer cannot "
+                     "name it; initialize the pointer at runtime instead";
+        if (sourceMap != nullptr) {
+            if (auto const* loc = sourceMap->tryGet(at); loc != nullptr) {
+                d.buffer = loc->buffer;
+                d.span   = loc->span;
+            }
+        }
+        reporter.report(std::move(d));
+    }
+
+    // TLS C1 (★CRIT-1): the screened entry point EVERY symbol-address
+    // classification consumer calls — the scalar classify loop and the
+    // aggregate member loop both mint MirSymbolAddrValue from this result,
+    // so the screen here covers every mint site by construction. The
+    // classification is still RETURNED on a reject (the module stays
+    // walkable — the Error gates the compile), matching the
+    // abort-resilience discipline emitGlobals_ documents.
+    [[nodiscard]] std::optional<std::pair<SymbolId, std::int64_t>>
+    tryClassifyAsSymbolAddr(HirNodeId initNode, EvalEnvironment const& env,
+                            EvalOptions const& opts) {
+        auto const r = tryClassifyAsSymbolAddrImpl(initNode, env, opts);
+        if (r.has_value()) rejectThreadLocalAddressTarget(r->first, initNode);
+        return r;
+    }
+
+    // TLS C1 (★CRIT-1, belt over the fold path): screen a CONST-EVAL-FOLDED
+    // literal for symbol-address leaves targeting a thread-local object —
+    // the third producer of MirSymbolAddrValue (toMirLiteral's
+    // HirAddressValue arm, fed by evaluateConstant's c43 address folds)
+    // bypasses tryClassifyAsSymbolAddr entirely. Called on the two fold
+    // outputs that become static data (the scalar constInit fold and the
+    // aggregate member fold). Recursive over aggregate arms; scalar leaves
+    // are O(1).
+    void rejectTlsAddressesInFoldedLiteral(MirLiteralValue const& v,
+                                           HirNodeId at) {
+        if (auto const* sa = std::get_if<MirSymbolAddrValue>(&v.value)) {
+            rejectThreadLocalAddressTarget(SymbolId{sa->symbol}, at);
+            return;
+        }
+        if (auto const* agg = std::get_if<MirAggregateValue>(&v.value)) {
+            for (auto const& f : agg->fields)
+                rejectTlsAddressesInFoldedLiteral(f, at);
+        }
     }
 
     // c80 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-BASE-INDEX): resolve a CONSTANT
@@ -7957,7 +8075,12 @@ struct Lowerer {
             ConstEvalResult const r =
                 evaluateConstant(hir, interner, literals, child, env, opts);
             if (!r.value.has_value()) return std::nullopt;  // one un-foldable → bail
-            agg.fields.push_back(toMirLiteral(*r.value));
+            MirLiteralValue folded = toMirLiteral(*r.value);
+            // TLS C1 (★CRIT-1): the fold path can carry a c43 address
+            // constant — screen it for TLS targets before it becomes a
+            // static-data leaf.
+            rejectTlsAddressesInFoldedLiteral(folded, child);
+            agg.fields.push_back(std::move(folded));
         }
         MirLiteralValue out;
         out.value = std::move(agg);
@@ -8147,6 +8270,9 @@ struct Lowerer {
                 if (auto const* p = linkageMap->tryGet(decl)) pg.linkage = *p;
             if (mutabilityMap != nullptr)
                 if (auto const* p = mutabilityMap->tryGet(decl)) pg.isConst = p->isConst;
+            if (threadLocalMap != nullptr)   // TLS C1 — the isConst mirror
+                if (auto const* p = threadLocalMap->tryGet(decl))
+                    pg.isThreadLocal = p->isThreadLocal;
             if (volatileMap != nullptr)
                 if (auto const* p = volatileMap->tryGet(decl)) pg.isVolatile = p->isVolatile;
             if (alignmentMap != nullptr)
@@ -8167,6 +8293,11 @@ struct Lowerer {
                         hir, interner, literals, *initN, env, opts);
                     if (r.value.has_value()) {
                         pg.constInit = toMirLiteral(*r.value);
+                        // TLS C1 (★CRIT-1): screen the c43 address-fold arm
+                        // — the one MirSymbolAddrValue producer that never
+                        // passes through tryClassifyAsSymbolAddr.
+                        rejectTlsAddressesInFoldedLiteral(*pg.constInit,
+                                                          *initN);
                     } else if (auto aggC =
                                    tryClassifyAggregateConst(*initN, env, opts)) {
                         // c67 (D-CSUBSET-AGGREGATE-GLOBAL-SYMBOL-ADDRESS): an
@@ -8266,20 +8397,24 @@ struct Lowerer {
                 std::uint32_t const idx = mir.literalPoolAdd(std::move(v));
                 mir.addGlobal(pg.type, pg.symbol, idx, {},
                               pg.linkage.binding, pg.linkage.visibility,
-                              pg.isConst, pg.explicitAlignment);
+                              pg.isConst, mirThreadStorageOf(pg.isThreadLocal),
+                              pg.explicitAlignment);
             } else if (pg.constInit.has_value()) {
                 std::uint32_t const idx = mir.literalPoolAdd(*pg.constInit);
                 mir.addGlobal(pg.type, pg.symbol, idx, {},
                               pg.linkage.binding, pg.linkage.visibility,
-                              pg.isConst, pg.explicitAlignment);
+                              pg.isConst, mirThreadStorageOf(pg.isThreadLocal),
+                              pg.explicitAlignment);
             } else if (pg.runtimeInit.valid()) {
                 mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, moduleInitFunc,
                               pg.linkage.binding, pg.linkage.visibility,
-                              pg.isConst, pg.explicitAlignment);
+                              pg.isConst, mirThreadStorageOf(pg.isThreadLocal),
+                              pg.explicitAlignment);
             } else {
                 mir.addGlobal(pg.type, pg.symbol, UINT32_MAX, {},
                               pg.linkage.binding, pg.linkage.visibility,
-                              pg.isConst, pg.explicitAlignment);
+                              pg.isConst, mirThreadStorageOf(pg.isThreadLocal),
+                              pg.explicitAlignment);
             }
         }
         // Step 3: fill the init function's body — Store each runtime
@@ -8411,7 +8546,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           HirLinkageMap const*     linkageMap,
                           HirMutabilityMap const*  mutabilityMap,
                           HirVolatileMap const*    volatileMap,
-                          HirAlignmentMap const*   alignmentMap) {
+                          HirAlignmentMap const*   alignmentMap,
+                          HirThreadLocalMap const* threadLocalMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -8429,6 +8565,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .mutabilityMap = mutabilityMap,
         .volatileMap = volatileMap,
         .alignmentMap = alignmentMap,
+        .threadLocalMap = threadLocalMap,
         .mir       = MirBuilder{},
     };
     // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING: stamp the module-

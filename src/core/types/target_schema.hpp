@@ -1168,11 +1168,44 @@ enum class EncodingSlotKind : std::uint8_t {
     // justified the same way XZR=31/sp=31 already are (a config-baked
     // architectural register).
     Imm32MovzMovk = 28,
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): the x86 ABSOLUTE-SIB memory form —
+    // ModR/M(mod=00, rm=100 "SIB follows") + SIB 0x25 (index=100 no-index,
+    // base=101 "disp32-only, no base register") + a 4-byte LITERAL disp32
+    // sourced from the wired MemOffset operand. This is the 64-bit-mode
+    // encoding of `[seg:disp32]` absolute addressing — the ONLY way to
+    // address a flat 32-bit displacement without a base register (mod=00
+    // rm=101 alone means [rip+disp32] in 64-bit mode; the SIB base=101
+    // no-index form restores the absolute meaning). First consumer: the
+    // `tlsbase` opcode's `mov r64, fs:[0]` thread-pointer read (the
+    // segment override rides the template's `payloadBytePrefix`; the
+    // displacement value comes from the format config's
+    // `tlsAccess.baseDisplacement` via the lowering's MemOffset operand).
+    // Not symbol-bearing — the disp32 is a literal config value, never
+    // relocated. Generic: any x86 absolute-addressed slot (a future
+    // gs-based TEB read) reuses it.
+    AbsoluteDisp32Mem = 29,
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): the SYMBOL-BEARING memory
+    // displacement — the disp32 of a `[base + disp32]` (mod=10) memory
+    // operand emitted as a 4-byte RELOCATION PLACEHOLDER at the memory-
+    // displacement position (right after ModR/M + SIB), NOT the trailing
+    // step-8 position `Disp32` uses. Wired from a SymbolRef operand and
+    // REQUIRES `relocationKind` (isSymbolBearingSlot). Pairs with a
+    // `ModRmRmMem` base-register wire (the base supplies mod=10 + rm).
+    // First consumer: the TLS local-exec `lea r, [tp + tpoff32(sym)]` —
+    // the linker patches the 4 bytes with the symbol's link-time
+    // thread-pointer offset (the `tls-tpoff32` row's Linear formula over
+    // the walker's tpoff-poisoned symbolVa). Distinct from `Disp32Mem`
+    // (a literal immediate displacement) and from `RipRelDisp32` (which
+    // forces the RIP-relative ModR/M state); this slot leaves the
+    // ModR/M state to the base wire and only owns the displacement
+    // bytes + relocation. Generic: PE's C3 final
+    // `lea rax, [slot + tlsOffset(sym)]` reuses it verbatim.
+    MemRelocDisp32 = 30,
     // Future fixed32 slots (paired with their consumer cycle):
     //   Sf-flag / etc.
 };
 
-inline constexpr EnumNameTable<EncodingSlotKind, 29> kEncodingSlotKindTable{{{
+inline constexpr EnumNameTable<EncodingSlotKind, 31> kEncodingSlotKindTable{{{
     { EncodingSlotKind::ModRmReg,     "modrm.reg"     },
     { EncodingSlotKind::ModRmRm,      "modrm.rm"      },
     { EncodingSlotKind::Imm32,        "imm32"         },
@@ -1202,6 +1235,8 @@ inline constexpr EnumNameTable<EncodingSlotKind, 29> kEncodingSlotKindTable{{{
     { EncodingSlotKind::Imm12Scaled,   "imm12.scaled"   },
     { EncodingSlotKind::Imm12HiLo24,   "imm12.hilo24"   },
     { EncodingSlotKind::Imm32MovzMovk, "imm32.movzmovk" },
+    { EncodingSlotKind::AbsoluteDisp32Mem, "absdisp32.mem" },
+    { EncodingSlotKind::MemRelocDisp32,    "memreloc.disp32" },
 }}};
 
 // Centralised count — promoted from per-translation-unit local
@@ -1220,7 +1255,7 @@ inline constexpr std::size_t kEncodingSlotKindCount =
 // (Each enumerator gets exactly one row; ordinals are
 // contiguous 0..N-1; both invariants are validated by the
 // table's `name()`/`fromName()` semantics.)
-static_assert(kEncodingSlotKindCount == 29,
+static_assert(kEncodingSlotKindCount == 31,
               "EncodingSlotKind enum / kEncodingSlotKindTable drift — "
               "add a row to the table or remove the enumerator");
 
@@ -1251,6 +1286,12 @@ slotShapeFor(EncodingSlotKind s) noexcept {
         // x86-variable form — opcode-byte register + 8-byte immediate.
         case EncodingSlotKind::OpcodePlusReg:
         case EncodingSlotKind::Imm64:
+        // TLS C1 (D-CSUBSET-THREAD-LOCAL): the absolute-SIB literal
+        // disp32 (`mov r64, seg:[disp32]`) and the relocated memory
+        // displacement (`lea r, [base + tpoff32(sym)]`) are both
+        // ModR/M-byte constructs — x86-variable only.
+        case EncodingSlotKind::AbsoluteDisp32Mem:
+        case EncodingSlotKind::MemRelocDisp32:
             return TargetEncodingShape::X86Variable;
         case EncodingSlotKind::Rd:
         case EncodingSlotKind::Rn:
@@ -1305,15 +1346,36 @@ struct DSS_EXPORT TargetEncodingTemplate {
     // meaningful for the `x86-variable` shape.
     bool rexW = false;
 
-    // FC2 Part B (SSE float backend): mandatory legacy-prefix bytes
-    // emitted BEFORE the REX prefix (the x86 decode contract: a
-    // mandatory prefix like F2/F3/66 that selects an SSE opcode
-    // form must precede REX, or the prefix is not part of the
-    // opcode selection). Empty = no prefix (every pre-FC2 opcode).
-    // Only meaningful for the `x86-variable` shape — validate()
-    // rejects it on a fixed32 variant (mirrors the opcodeBytes /
-    // modrmRegExt fixed32 rejection).
+    // FC2 Part B: mandatory legacy-prefix bytes emitted BEFORE the REX
+    // prefix (the x86 decode contract: a legacy prefix that
+    // participates in opcode selection must precede REX, or it is not
+    // part of the opcode selection). First consumers were the SSE
+    // opcode-form selectors (F2/F3/66); the field is GENERIC over any
+    // fixed template-declared legacy prefix — TLS C1's `tlsbase` pairs
+    // it with `payloadBytePrefix` below (a per-INSTRUCTION prefix from
+    // the LIR payload, emitted before even these bytes — x86 prefix
+    // group 2 segment overrides precede everything). Empty = no prefix
+    // (every pre-FC2 opcode). Only meaningful for the `x86-variable`
+    // shape — validate() rejects it on a fixed32 variant (mirrors the
+    // opcodeBytes / modrmRegExt fixed32 rejection).
     std::vector<std::uint8_t> mandatoryPrefix;
+
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): when true, the instruction's
+    // LIR `payload` LOW BYTE is emitted as the FIRST byte of the
+    // instruction — before `mandatoryPrefix` and before REX (x86
+    // prefix group 2, the segment-override group, precedes all other
+    // prefixes per the SDM decode order). First consumer: `tlsbase`'s
+    // segment-override byte (0x64 fs on ELF / 0x65 gs on PE), which
+    // is PER-FORMAT config (`tlsAccess.segmentPrefixByte`) threaded
+    // through the LOWERING's payload — keeping the shared x86_64
+    // TARGET JSON free of any format-specific value. The encoder
+    // FAILS LOUD when this is set but the instruction carries payload
+    // low-byte 0 (a zero prefix byte is never a valid segment
+    // override — catches a lowering that forgot to set the payload).
+    // Only meaningful for the `x86-variable` shape — validate()
+    // rejects it on a fixed32 variant (a fixed-word ISA has no prefix
+    // bytes, like mandatoryPrefix).
+    bool payloadBytePrefix = false;
 
     // Fixed opcode bytes (e.g. `[0x03]` for `add r64, r/m64`; `[0x0F,
     // 0xAF]` for `imul r64, r/m64`). Non-empty for any non-`None`
@@ -1441,6 +1503,11 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         // the walker emits a Relocation (per the wire's relocationKind)
         // and writes no immediate bits; the linker patches the field.
         case EncodingSlotKind::SymbolPatchMarker:
+        // TLS C1 (D-CSUBSET-THREAD-LOCAL): the relocated memory
+        // displacement — a 4-byte placeholder at the memory-disp
+        // position, patched by the linker per the wire's
+        // relocationKind (tls-tpoff32 first). REQUIRES relocationKind.
+        case EncodingSlotKind::MemRelocDisp32:
             return true;
         case EncodingSlotKind::ModRmReg:
         case EncodingSlotKind::ModRmRm:
@@ -1473,6 +1540,10 @@ isSymbolBearingSlot(EncodingSlotKind s) noexcept {
         case EncodingSlotKind::ModRmRmMem:
         case EncodingSlotKind::MemBaseScale:
         case EncodingSlotKind::Disp32Mem:
+        // TLS C1 (D-CSUBSET-THREAD-LOCAL): the absolute-SIB disp32 is a
+        // LITERAL config value (the tp slot's displacement), never a
+        // relocated symbol reference — no relocationKind.
+        case EncodingSlotKind::AbsoluteDisp32Mem:
         case EncodingSlotKind::SibIndex:
         case EncodingSlotKind::CondCodeNibble:
         case EncodingSlotKind::BlockRel32:
@@ -1962,6 +2033,54 @@ struct DSS_EXPORT ProcessArgs {
     std::string crtLibraryPath;   // "msvcrt.dll"
 };
 
+// ── TLS identity (D-CSUBSET-THREAD-LOCAL, TLS C1) ──────────────────
+//
+// The CPU's static-TLS layout convention — which side of the thread
+// pointer the TLS block sits on, and how the link-time thread-pointer
+// offset (tpoff) of a symbol is computed from its template offset.
+// This is TARGET (psABI-per-CPU) data, not format data: x86_64 is
+// Variant II under EVERY OS; arm64 is Variant I likewise. Consumed
+// ONLY by the walker's tpoff helper (slice C's `addTlsSymbolOffsets`)
+// when the format's `tlsAccess.model == local-exec` — a config-keyed
+// FORMULA selector, never a machine-identity branch:
+//
+//   * Variant I  (arm64, riscv): tp points AT the TCB head; the TLS
+//     block follows it. tpoff = alignUp(tcbHeaderBytes, p_align)
+//     + templateOffset — always POSITIVE.
+//   * Variant II (x86_64, sparc): tp points ONE PAST the block end
+//     (fs:[0] holds tp itself). tpoff = templateOffset
+//     − alignUp(blockSize, p_align) — always NEGATIVE.
+//
+// A target that declares NO `tls` block cannot compute a tpoff; the
+// walker fails loud on a TLS symbol under such a target (belt +
+// braces past the `tlsbase`-opcode-missing gate at MIR→LIR).
+enum class TlsVariant : std::uint8_t {
+    Variant1 = 1,  // tp at TCB head; positive tpoff (arm64 — TLS C2)
+    Variant2 = 2,  // tp past block end; negative tpoff (x86_64 — TLS C1)
+};
+
+inline constexpr EnumNameTable<TlsVariant, 2> kTlsVariantTable{{{
+    { TlsVariant::Variant1, "variant1" },
+    { TlsVariant::Variant2, "variant2" },
+}}};
+
+[[nodiscard]] constexpr std::string_view tlsVariantName(TlsVariant v) noexcept {
+    return kTlsVariantTable.name(v);
+}
+[[nodiscard]] constexpr std::optional<TlsVariant>
+tlsVariantFromName(std::string_view s) noexcept {
+    return kTlsVariantTable.fromName(s);
+}
+
+// The target's `"tls"` identity block. `tcbHeaderBytes` is the
+// Variant-I TCB header size the block is placed after (arm64: 16 —
+// two pointers); 0 on Variant-II targets (the formula never reads it
+// there, but the field is validated-load config, not a guess).
+struct DSS_EXPORT TlsIdentity {
+    TlsVariant    variant        = TlsVariant::Variant2;
+    std::uint32_t tcbHeaderBytes = 0;
+};
+
 [[nodiscard]] DSS_EXPORT std::optional<RelocFormulaKind>
     parseRelocFormulaKind(std::string_view s) noexcept;
 
@@ -1990,6 +2109,16 @@ struct DSS_EXPORT TargetRelocationInfo {
                                        // Non-Linear: always 4 (ARM64
                                        // instruction word; auto-defaulted
                                        // by the JSON loader if absent).
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): true iff this relocation kind
+    // carries a THREAD-LOCAL-OFFSET value (`"tls": true` in the JSON
+    // row — x86_64 `tls-tpoff32`, arm64's future tprel pair). The
+    // walker's TLS cross-check consumes it BOTH directions: a
+    // relocation of a tls-flagged kind must target a TLS symbol
+    // (its patched value is a tpoff, not a VA), and a TLS symbol must
+    // only be reached through tls-flagged kinds (a non-TLS reloc
+    // against a TLS symbol would write the bit-cast tpoff as if it
+    // were an address — the CRIT-1 silent-garbage-pointer class).
+    bool         tls         = false;
 };
 
 // Discriminates the FIVE concrete terminator shapes a target's opcode
@@ -2319,6 +2448,15 @@ struct DSS_EXPORT TargetSchemaData {
     AggregateLayoutParams aggregateLayout{};
     bool                  aggregateLayoutLoaded = false;
 
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): the target's static-TLS layout
+    // convention (`"tls"` block — variant + tcbHeaderBytes). OPTIONAL:
+    // a target without it (arm64 until TLS C2) cannot lay out a TLS
+    // block — the walker's tpoff helper fails loud on a TLS symbol
+    // (the lowering-tier `tlsbase`-opcode gate fires first anyway).
+    // nullopt-vs-engaged mirrors `vaListLayout` / `processExit`:
+    // absence IS the capability signal, never a zero-filled default.
+    std::optional<TlsIdentity> tls;
+
     // Relocation taxonomy (plan 13 AS1 §2.6 — the bucket-1 reloc
     // facet). Each row declares one relocation kind: a canonical text
     // name (for the linker's `*.format.json` cross-reference per plan
@@ -2540,6 +2678,15 @@ public:
     }
     [[nodiscard]] bool aggregateLayoutLoaded() const noexcept {
         return d_.aggregateLayoutLoaded;
+    }
+
+    // ── TLS identity (TLS C1, D-CSUBSET-THREAD-LOCAL) ─────────────
+    // The target's static-TLS layout convention (Variant I/II +
+    // tcbHeaderBytes), or nullopt if the target declared no `tls`
+    // block (the walker's tpoff helper then fails loud on any TLS
+    // symbol — absence is the capability signal).
+    [[nodiscard]] std::optional<TlsIdentity> const& tlsIdentity() const noexcept {
+        return d_.tls;
     }
 
     // ── Relocations (AS1) ────────────────────────────────────────

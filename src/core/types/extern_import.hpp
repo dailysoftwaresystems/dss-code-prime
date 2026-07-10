@@ -53,6 +53,18 @@ struct DSS_EXPORT ExternImport {
     // model FAILS LOUD at the linker's pre-walker gate — a PLT
     // stub bound to a data symbol would be a silent miscompile.
     bool        isData = false;
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): true for an extern DATA object
+    // declared with thread storage duration (`extern thread_local int e;`).
+    // Set at the HIR→MIR extern pre-pass from the declaration's
+    // HirThreadLocalMap entry; carried through the LK11 merge's
+    // survivingExterns copy. A same-program sibling-CU definition resolves
+    // the row away like any extern data (the definition's own
+    // MirGlobal.isThreadLocal drives layout); a TRUE library TLS import
+    // surviving to the link tier is the initial-exec/GOT-indirect model —
+    // NOT implemented (D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC) — and the
+    // walker tier rejects it loud (slice C). Meaningless (false) for
+    // function imports (S_ThreadLocalOnFunction rejects those upstream).
+    bool        isThreadLocal = false;
     // c84 (D-LK-EXTERN-DATA-IMPORT): the imported DATA object's byte
     // size + alignment, DERIVED from the declared type's layout at
     // HIR→MIR (`computeLayout` under the active target's aggregate-

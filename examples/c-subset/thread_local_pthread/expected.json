@@ -1,0 +1,16 @@
+{
+  "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C1): the TRUE per-thread-storage discriminator — main mutates its thread_local copy 5->6; two pthread_create'd workers each do counter+=100 and BOTH must observe 105 (each thread's copy starts from the .tdata TEMPLATE), while main's copy stays 6. A process-shared static alias yields 106/206 (or a torn interleave) and a wrong main-side value — this witness fails on ANY non-per-thread implementation, which no single-thread test can. pthread_create/pthread_join bind via the ordinary raw-extern default-library mechanism (glibc>=2.34 ships them IN libc.so.6 — zero pthread-specific config; WSL leg = glibc 2.39). local-exec stays correct for these worker threads: the exec's PT_TLS block is part of glibc's static TLS set allocated for every thread at pthread_create (no dlopen in play). The release arm re-proves it under the full optimizer. x86_64-linux ONLY until TLS C2 (arm64) / C3 (pe64) / C4 (Mach-O). Exit 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

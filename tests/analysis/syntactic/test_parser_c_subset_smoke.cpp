@@ -802,9 +802,14 @@ TEST(ParserCSubsetSmoke, ExternFunctionPrototypeParses) {
     // FC4 c1: `param` is now declarator-shaped — `declHeadForParam` carries
     // the base type and the (optional) `declarator` carries the name. The
     // externDecl spine itself stays legacy (typeRef + Identifier).
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): child 0 is the `externSpecifiers`
+    // HEAD WRAPPER (`extern` + an optional thread-storage run) — the row's
+    // specifierPrefix, stripped before positional counting so name/type
+    // indices stay stable whether or not `extern thread_local` is spelled.
     constexpr std::string_view kExpected =
         "rule:externDecl\n"
-        "  tok:\"extern\"\n"
+        "  rule:externSpecifiers\n"
+        "    tok:\"extern\"\n"
         "  rule:typeRef\n"
         "    rule:typeBase\n"
         "      rule:typeSpecifierSeq\n"

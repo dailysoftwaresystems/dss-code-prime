@@ -4963,12 +4963,31 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                             eff.at("staticStorage").get<bool>();
                                         if (effect.staticStorage) any = true;
                                     }
+                                    // TLS C1 (D-CSUBSET-THREAD-LOCAL): the THREAD
+                                    // storage-duration axis — `_Thread_local` /
+                                    // `thread_local` marks each declared symbol
+                                    // isThreadLocal (Pass-1 specifier scan) without
+                                    // touching binding/visibility/staticStorage.
+                                    // Optional bool, the staticStorage mirror.
+                                    if (eff.contains("threadStorage")) {
+                                        if (!eff.at("threadStorage").is_boolean()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'threadStorage' must be a "
+                                                      "boolean");
+                                            continue;
+                                        }
+                                        effect.threadStorage =
+                                            eff.at("threadStorage").get<bool>();
+                                        if (effect.threadStorage) any = true;
+                                    }
                                     if (!any) {
                                         coll.emit(DiagnosticCode::C_InvalidSemantics,
                                                   effPath,
                                                   "linkage effect must set at least "
-                                                  "one of 'binding', 'visibility', or "
-                                                  "'staticStorage'");
+                                                  "one of 'binding', 'visibility', "
+                                                  "'staticStorage', or "
+                                                  "'threadStorage'");
                                         continue;
                                     }
                                     rule.linkageSpecifiers.emplace(specText, effect);
@@ -7919,6 +7938,57 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         } else {
                             cfg.constexprKeywordToken = data.schemaTokens->find(tn);
                         }
+                    }
+                }
+            }
+
+            // ── thread-local storage class (TLS C1, D-CSUBSET-THREAD-LOCAL) ──
+            // `{ incompatibleSpecifierTokens }` — storage-class specifier TOKEN
+            // kinds that may not pair with a thread-storage specifier (C11/C23
+            // 6.7.1p2 — c-subset lists `RegisterKeyword`). Each entry resolves
+            // like a gatedMarker token (unknown name → C_UnknownToken — a typo
+            // can never silently disarm the combination reject). The
+            // thread-storage vocabulary itself rides the declaration rows'
+            // `linkageSpecifiers` maps (`{"threadStorage": true}`), NOT this
+            // block. An ABSENT block leaves the list empty ⇒ no
+            // forbidden-combination scan. Source-agnostic: nothing hardcodes
+            // "register" or "thread_local".
+            if (sem.contains("threadLocal")) {
+                json const& tl = sem.at("threadLocal");
+                if (!tl.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/threadLocal",
+                              "'semantics.threadLocal' must be an object "
+                              "{ incompatibleSpecifierTokens }");
+                } else if (!tl.contains("incompatibleSpecifierTokens")
+                           || !tl.at("incompatibleSpecifierTokens").is_array()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              "/semantics/threadLocal/incompatibleSpecifierTokens",
+                              "'incompatibleSpecifierTokens' is required and "
+                              "must be an array of token-kind names");
+                } else {
+                    for (json const& e : tl.at("incompatibleSpecifierTokens")) {
+                        if (!e.is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/threadLocal/"
+                                      "incompatibleSpecifierTokens",
+                                      "each 'incompatibleSpecifierTokens' entry "
+                                      "must be a token-kind name string");
+                            continue;
+                        }
+                        std::string const tn = e.get<std::string>();
+                        if (!data.schemaTokens->contains(tn)) {
+                            coll.emit(DiagnosticCode::C_UnknownToken,
+                                      "/semantics/threadLocal/"
+                                      "incompatibleSpecifierTokens",
+                                      std::format("'threadLocal."
+                                                  "incompatibleSpecifierTokens' "
+                                                  "references unknown token kind "
+                                                  "'{}'", tn));
+                            continue;
+                        }
+                        cfg.threadLocalIncompatibleTokens.push_back(
+                            data.schemaTokens->find(tn));
                     }
                 }
             }

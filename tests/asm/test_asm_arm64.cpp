@@ -3102,7 +3102,10 @@ TEST(Arm64Fpr, FullPipelineDoublePlusRodataConstEncodesLeaFldurFadd) {
     MirLiteralValue quarter; quarter.value = 0.25;
     quarter.core = TypeKind::F64;
     mb.addFunction(sig, SymbolId{1});
-    (void)mb.addGlobal(f64, SymbolId{500}, mb.literalPoolAdd(quarter));
+    (void)mb.addGlobal(f64, SymbolId{500}, mb.literalPoolAdd(quarter),
+                       MirFuncId{}, SymbolBinding::Global,
+                       SymbolVisibility::Default, /*isConst=*/false,
+                       MirThreadStorage::Shared);
     MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
     MirInstId const a = mb.addArg(0, f64);

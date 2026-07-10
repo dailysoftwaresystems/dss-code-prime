@@ -251,6 +251,23 @@ lowerToLir(Mir const&          mir,
            // byte-identical. Defaults to nullopt.
            std::optional<DataImportBinding> dataImportBinding =
                std::nullopt,
+           // TLS C1 (D-CSUBSET-THREAD-LOCAL): the ACTIVE OBJECT FORMAT's
+           // thread-local access block, read from `ObjectFormatSchema::
+           // tlsAccess()`. Selects how a GlobalAddr of a THREAD-LOCAL
+           // symbol materializes the per-thread copy's address:
+           // `local-exec` → `tlsbase` (read the thread pointer from the
+           // config's seg:[disp] slot) + `lea addr, [tp + tpoff32(sym)]`
+           // (the linker patches the tpoff). `std::nullopt` = the format
+           // declared none: lowering a thread-local access then fails
+           // loud (`K_FormatLacksThreadLocalSupport` — NO silent
+           // default; the ordinary global path would produce ONE
+           // process-shared copy, a miscompile of the declared storage
+           // duration). The `pe-indexed` / `macho-tlv` models are
+           // declared vocabulary whose lowering lands with their format
+           // cycles — they fail loud here meanwhile. Threaded exactly
+           // like `dataImportBinding` above (captured from the format
+           // schema at build time; the LOWER half sees only the value).
+           std::optional<TlsAccessInfo> tlsAccess = std::nullopt,
            // c116 (D-WIN64-SEH-FUNCLETS): the SEH scope records produced by
            // `synthesizeSehFunclets` (keyed by the REBUILT module's parent MIR
            // block ids). Each is translated to LIR block ids + emitted as a

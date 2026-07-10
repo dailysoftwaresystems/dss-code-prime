@@ -9,6 +9,7 @@
 #include "hir/attributes/mutability_attr.hpp"
 #include "hir/attributes/shader_intrinsic.hpp"
 #include "hir/attributes/source_span.hpp"
+#include "hir/attributes/thread_local_attr.hpp"
 #include "hir/attributes/transpile_hints.hpp"
 #include "hir/attributes/volatile_attr.hpp"
 
@@ -49,6 +50,17 @@ using HirLinkageMap = HirAttribute<LinkageAttr>;
 // — the input the assembler's section selection consults to route an
 // initialized global to read-only `.rodata` (const) vs writable `.data`.
 using HirMutabilityMap = HirAttribute<MutabilityAttr>;
+
+// TLS C1 (D-CSUBSET-THREAD-LOCAL): declaration thread-storage duration for
+// globals / extern data that carried a source `_Thread_local`/`thread_local`
+// specifier. Populated by CST→HIR lowering from the bound symbol's
+// `SymbolRecord.isThreadLocal`; read by HIR→MIR lowering to stamp
+// `MirGlobal.isThreadLocal` / `ExternImport.isThreadLocal` — the input the
+// assembler's section selection consults (BEFORE isConst — a `const
+// thread_local` is per-thread first, read-only second) to route the item to
+// the thread-template sections. Keyed on the DECLARATION node (the
+// mutability-map discipline).
+using HirThreadLocalMap = HirAttribute<ThreadLocalAttr>;
 
 // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): explicit `alignas(N)` /
 // `alignas(T)` alignment for a Global or VarDecl that carried the specifier.

@@ -2228,12 +2228,14 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     auto c = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(c.has_value());
     auto const& pms = (*c)->preprocess().predefinedMacros;
-    // 8 ungated (the 7 C 6.10.8 core + the FC17.5 `__STDC_NO_VLA__`
-    // conformance line, D-CSUBSET-VLA) + 10 pe-gated = 18: the c95 Windows
-    // selection (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the
-    // c105 MSVC-profile flip (_MSC_VER/__int64/__forceinline/__declspec).
-    EXPECT_EQ(pms.size(), 18u)
-        << "c-subset declares 8 un-gated + 10 pe-gated Windows predefined macros";
+    // 9 ungated (the 7 C 6.10.8 core + the FC17.5 `__STDC_NO_VLA__`
+    // conformance line, D-CSUBSET-VLA, + the TLS C1 `__STDC_NO_THREADS__`
+    // line, D-CSUBSET-THREAD-LOCAL — <threads.h> is never shipped) + 10
+    // pe-gated = 19: the c95 Windows selection
+    // (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the c105
+    // MSVC-profile flip (_MSC_VER/__int64/__forceinline/__declspec).
+    EXPECT_EQ(pms.size(), 19u)
+        << "c-subset declares 9 un-gated + 10 pe-gated Windows predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     for (auto const& pm : pms) {
@@ -2247,8 +2249,9 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
                 << pm.name << " should be pe-gated (Windows selection)";
         }
     }
-    EXPECT_EQ(ungated, 8u)
-        << "the 7 C 6.10.8 macros + __STDC_NO_VLA__ (FC17.5) are un-gated "
+    EXPECT_EQ(ungated, 9u)
+        << "the 7 C 6.10.8 macros + __STDC_NO_VLA__ (FC17.5) + "
+           "__STDC_NO_THREADS__ (TLS C1) are un-gated "
            "(available on every format)";
     EXPECT_EQ(peGated, 10u)
         << "_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI (c95) + "

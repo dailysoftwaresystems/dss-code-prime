@@ -17,6 +17,7 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "hir/hir.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+#include "link/object_format_schema.hpp"  // TLS C1: the shipped-format tlsAccess reject pins
 #include "lir/lir.hpp"
 #include "lir/lir_verifier.hpp"
 #include "lir/lowering/mir_to_lir.hpp"
@@ -945,7 +946,10 @@ TEST(MirToLir, Arm64GlobalAddrLoadKeepsLeaPlusBaseFormLoad) {
     MirLiteralValue quarter; quarter.value = 0.25;
     quarter.core = TypeKind::F64;
     mb.addFunction(sig, SymbolId{1});
-    (void)mb.addGlobal(f64, SymbolId{500}, mb.literalPoolAdd(quarter));
+    (void)mb.addGlobal(f64, SymbolId{500}, mb.literalPoolAdd(quarter),
+                       MirFuncId{}, SymbolBinding::Global,
+                       SymbolVisibility::Default, /*isConst=*/false,
+                       MirThreadStorage::Shared);
     MirBlockId const bb = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(bb);
     MirInstId const addr = mb.addGlobalAddr(SymbolId{500}, ptrF64);
@@ -2427,8 +2431,14 @@ TEST(MirToLir, PhiResolutionUsesFprClassForFloatPhi) {
     auto const ptrF64 = interner.pointer(f64);
     ::dss::MirLiteralValue lvOne;  lvOne.value  = 1.0;  lvOne.core  = ::dss::TypeKind::F64;
     ::dss::MirLiteralValue lvTwo;  lvTwo.value  = 2.0;  lvTwo.core  = ::dss::TypeKind::F64;
-    (void)mb.addGlobal(f64, ::dss::SymbolId{500}, mb.literalPoolAdd(lvOne));
-    (void)mb.addGlobal(f64, ::dss::SymbolId{501}, mb.literalPoolAdd(lvTwo));
+    (void)mb.addGlobal(f64, ::dss::SymbolId{500}, mb.literalPoolAdd(lvOne),
+                       ::dss::MirFuncId{}, ::dss::SymbolBinding::Global,
+                       ::dss::SymbolVisibility::Default, /*isConst=*/false,
+                       MirThreadStorage::Shared);
+    (void)mb.addGlobal(f64, ::dss::SymbolId{501}, mb.literalPoolAdd(lvTwo),
+                       ::dss::MirFuncId{}, ::dss::SymbolBinding::Global,
+                       ::dss::SymbolVisibility::Default, /*isConst=*/false,
+                       MirThreadStorage::Shared);
     mb.beginBlock(thenB);
     ::dss::MirInstId const addrOne = mb.addGlobalAddr(::dss::SymbolId{500}, ptrF64);
     std::array<::dss::MirInstId, 1> loadOneOps{addrOne};
@@ -4198,4 +4208,306 @@ TEST(MirToLir, F32AddLowersAndExoticFloatWidthsStayWalled) {
                                      ::dss::MirOpcode::FDiv);
     EXPECT_FALSE(probe128.ok);
     EXPECT_TRUE(sawAnchor(probe128.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+}
+
+// ══ TLS C1 (D-CSUBSET-THREAD-LOCAL): the thread-local GlobalAddr arm ══
+//
+// A THREAD-LOCAL symbol's "address" is per-thread — tp + tpoff(sym),
+// tpoff a link-time constant the walker resolves by bit-casting the
+// SIGNED offset into symbolVa. EVERY VA-shaped materialization (the
+// plain lea, the riprel fold) is therefore a silent wrong-address
+// access for it. These pins fix the lowering shape (tlsbase + the
+// 2-op tpoff lea), the M-5 fold exclusion (a TLS GlobalAddr+Load that
+// WOULD fold if the symbol were ordinary must NOT, while an identical
+// non-TLS control DOES), and the fail-loud ladder for the un-landed
+// legs (no tlsAccess block → K_FormatLacksThreadLocalSupport 0x8015;
+// local-exec on a target without the tlsbase row → the arm64
+// L_RequiredLirOpcodeMissing gate; pe-indexed/macho-tlv → 0x8015
+// until their cycles land).
+
+namespace {
+
+// Module: thread-local F64 global (symbol 500) + an IDENTICAL non-TLS
+// control global (symbol 501); one function loading BOTH through
+// single-use GlobalAddrs. F64 deliberately: the x86_64 FPR load
+// (movsd_load) DECLARES the [symbol] riprel variant, so the control's
+// GlobalAddr+Load pair FOLDS — which makes the thread-local twin the
+// exact "would fold if the symbol were non-TLS" shape M-5 pins.
+struct TlsLoweredModule {
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    ::dss::Mir          mir;
+};
+
+[[nodiscard]] TlsLoweredModule buildTlsPlusControlModule() {
+    TlsLoweredModule out;
+    auto& interner = out.interner;
+    auto const f64    = interner.primitive(::dss::TypeKind::F64);
+    auto const ptrF64 = interner.pointer(f64);
+    auto const sig = interner.fnSig(std::span<::dss::TypeId const>{}, f64,
+                                    ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    ::dss::MirLiteralValue quarter; quarter.value = 0.25;
+    quarter.core = ::dss::TypeKind::F64;
+    ::dss::MirLiteralValue half; half.value = 0.5;
+    half.core = ::dss::TypeKind::F64;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    (void)mb.addGlobal(f64, ::dss::SymbolId{500}, mb.literalPoolAdd(quarter),
+                       ::dss::MirFuncId{}, ::dss::SymbolBinding::Global,
+                       ::dss::SymbolVisibility::Default, /*isConst=*/false,
+                       MirThreadStorage::PerThread);
+    (void)mb.addGlobal(f64, ::dss::SymbolId{501}, mb.literalPoolAdd(half),
+                       ::dss::MirFuncId{}, ::dss::SymbolBinding::Global,
+                       ::dss::SymbolVisibility::Default, /*isConst=*/false,
+                       MirThreadStorage::Shared);
+    ::dss::MirBlockId const bb =
+        mb.createBlock(::dss::StructCfMarker::EntryBlock);
+    mb.beginBlock(bb);
+    ::dss::MirInstId const tlsAddr =
+        mb.addGlobalAddr(::dss::SymbolId{500}, ptrF64);
+    ::dss::MirInstId const tlsLoadOps[] = {tlsAddr};
+    ::dss::MirInstId const tlsVal =
+        mb.addInst(::dss::MirOpcode::Load, tlsLoadOps, f64);
+    ::dss::MirInstId const ctlAddr =
+        mb.addGlobalAddr(::dss::SymbolId{501}, ptrF64);
+    ::dss::MirInstId const ctlLoadOps[] = {ctlAddr};
+    ::dss::MirInstId const ctlVal =
+        mb.addInst(::dss::MirOpcode::Load, ctlLoadOps, f64);
+    ::dss::MirInstId const addOps[] = {tlsVal, ctlVal};
+    ::dss::MirInstId const sum =
+        mb.addInst(::dss::MirOpcode::FAdd, addOps, f64);
+    mb.addReturn(sum);
+    out.mir = std::move(mb).finish();
+    return out;
+}
+
+// The ELF-Linux local-exec config (the shipped elf64-x86_64-linux-exec
+// values) as a hand-held struct for direct lowerToLir invocations.
+[[nodiscard]] ::dss::TlsAccessInfo elfLocalExecTls() {
+    ::dss::TlsAccessInfo info{};
+    info.model             = ::dss::TlsAccessModel::LocalExec;
+    info.segmentPrefixByte = 0x64;  // fs
+    info.baseDisplacement  = 0;     // fs:[0]
+    return info;
+}
+
+[[nodiscard]] bool sawDiagnosticCode(::dss::DiagnosticReporter const& rep,
+                                     ::dss::DiagnosticCode code) {
+    for (auto const& d : rep.all()) {
+        if (d.code == code) return true;
+    }
+    return false;
+}
+
+} // namespace
+
+TEST(MirToLirTls, X64ThreadLocalLowersToTlsBasePlusTpoffLea) {
+    auto m = buildTlsPlusControlModule();
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+                           std::nullopt, std::nullopt, elfLocalExecTls());
+    ASSERT_TRUE(lirR.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = lirR.lir;
+
+    auto const tlsbaseOp = (*target)->opcodeByMnemonic("tlsbase");
+    auto const leaOp     = (*target)->opcodeByMnemonic("lea");
+    ASSERT_TRUE(tlsbaseOp.has_value() && leaOp.has_value());
+
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    std::optional<LirReg> tpReg;
+    std::optional<LirReg> tlsAddrReg;
+    bool sawTlsLea = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        LirInstId const inst = lir.blockInstAt(bb, i);
+        auto const op = lir.instOpcode(inst);
+        if (op == *tlsbaseOp) {
+            // tlsbase %tp — payload carries the CONFIG segment byte
+            // (0x64 fs), the MemOffset operand the CONFIG tp-slot
+            // displacement (0 = fs:[0]).
+            EXPECT_FALSE(tpReg.has_value())
+                << "exactly one tlsbase for the single TLS access";
+            EXPECT_EQ(lir.instPayload(inst), 0x64u);
+            auto const ops = lir.instOperands(inst);
+            ASSERT_EQ(ops.size(), 1u);
+            ASSERT_EQ(ops[0].kind, LirOperandKind::MemOffset);
+            EXPECT_EQ(ops[0].offset, 0);
+            tpReg = lir.instResult(inst);
+        }
+        if (op == *leaOp) {
+            auto const ops = lir.instOperands(inst);
+            if (ops.size() == 2 && ops[0].kind == LirOperandKind::Reg
+                && ops[1].kind == LirOperandKind::SymbolRef
+                && ops[1].symbolV == 500u) {
+                sawTlsLea = true;
+                ASSERT_TRUE(tpReg.has_value())
+                    << "the tpoff lea must FOLLOW its tlsbase";
+                EXPECT_EQ(ops[0].reg, *tpReg)
+                    << "the lea's base must be the tlsbase-produced tp";
+                tlsAddrReg = lir.instResult(inst);
+            }
+        }
+    }
+    EXPECT_TRUE(tpReg.has_value()) << "the tlsbase op must be emitted";
+    EXPECT_TRUE(sawTlsLea)
+        << "the 2-op [Reg, SymbolRef(500)] tpoff lea must be emitted";
+
+    // The C-level load of the TLS value reads THROUGH the computed
+    // address register — never a symbol-form load of 500.
+    auto const fldOp = (*target)->regClassOpOpcode(TargetRegClass::FPR,
+                                                   RegClassOp::Load);
+    ASSERT_TRUE(fldOp.has_value());
+    bool sawTlsBaseFormLoad = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        LirInstId const inst = lir.blockInstAt(bb, i);
+        if (lir.instOpcode(inst) != *fldOp) continue;
+        auto const ops = lir.instOperands(inst);
+        if (!ops.empty() && ops[0].kind == LirOperandKind::Reg
+            && tlsAddrReg.has_value() && ops[0].reg == *tlsAddrReg) {
+            sawTlsBaseFormLoad = true;
+        }
+    }
+    EXPECT_TRUE(sawTlsBaseFormLoad)
+        << "the TLS value load must be the [base] form reading the "
+           "tlsbase+lea address";
+}
+
+TEST(MirToLirTls, X64ThreadLocalNeverRiprelFoldsWhileControlDoes) {
+    // ★ audit M-5, red-on-disable: symbol 500 (thread-local) and 501
+    // (control) have IDENTICAL single-use GlobalAddr+Load shapes; the
+    // control MUST fold to ONE [symbol] riprel load, the TLS twin MUST
+    // NOT (its symbolVa is a bit-cast tpoff — a folded riprel load
+    // would read a garbage absolute address). Disabling the
+    // thread-local routing/exclusion in lowerGlobalAddr /
+    // globalAddrRiprelFoldsIntoLoad folds 500 too → the
+    // no-symbol-form-load-of-500 assertion goes RED.
+    auto m = buildTlsPlusControlModule();
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+                           std::nullopt, std::nullopt, elfLocalExecTls());
+    ASSERT_TRUE(lirR.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = lirR.lir;
+
+    auto const fldOp = (*target)->regClassOpOpcode(TargetRegClass::FPR,
+                                                   RegClassOp::Load);
+    ASSERT_TRUE(fldOp.has_value());
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    bool controlFolded  = false;
+    bool tlsSymbolLoad  = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        LirInstId const inst = lir.blockInstAt(bb, i);
+        if (lir.instOpcode(inst) != *fldOp) continue;
+        auto const ops = lir.instOperands(inst);
+        if (ops.size() == 1 && ops[0].kind == LirOperandKind::SymbolRef) {
+            if (ops[0].symbolV == 501u) controlFolded = true;
+            if (ops[0].symbolV == 500u) tlsSymbolLoad = true;
+        }
+    }
+    EXPECT_TRUE(controlFolded)
+        << "the NON-TLS control must riprel-fold (proves the fold is "
+           "live — without this, the TLS assertion below could pass "
+           "vacuously because the fold itself regressed)";
+    EXPECT_FALSE(tlsSymbolLoad)
+        << "the THREAD-LOCAL twin must NEVER riprel-fold — a folded "
+           "[rip+sym] load would resolve the bit-cast tpoff as a VA "
+           "(audit M-5 silent wrong-address class)";
+}
+
+TEST(MirToLirTls, X64ThreadLocalUnderShippedPe64FormatFailsLoud0x8015) {
+    // The REAL shipped pe64 format declares no tlsAccess (its TLS
+    // machinery is the PE TLS cycle) — a thread-local access under it
+    // must fail EXACTLY K_FormatLacksThreadLocalSupport (0x8015),
+    // never lower through the ordinary (process-shared) global path.
+    auto pe = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(pe.has_value());
+    ASSERT_FALSE((*pe)->tlsAccess().has_value())
+        << "precondition: pe64 must not declare tlsAccess yet";
+    auto m = buildTlsPlusControlModule();
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+                           std::nullopt, std::nullopt, (*pe)->tlsAccess());
+    EXPECT_FALSE(lirR.ok);
+    EXPECT_TRUE(sawDiagnosticCode(
+        rep, DiagnosticCode::K_FormatLacksThreadLocalSupport))
+        << "a thread-local access under a tlsAccess-less format must "
+           "fire K_FormatLacksThreadLocalSupport (0x8015)";
+    EXPECT_TRUE(sawAnchor(rep, "D-CSUBSET-THREAD-LOCAL"));
+}
+
+TEST(MirToLirTls, Arm64ThreadLocalUnderShippedFormatFailsLoud0x8015First) {
+    // PRODUCTION arm64 order pin: the shipped elf64-aarch64-linux-exec
+    // declares no tlsAccess, so the FORMAT gate (0x8015) fires FIRST —
+    // before the target's missing-tlsbase-opcode gate is ever
+    // consulted. Deterministic: the format check precedes the opcode
+    // probes in lowerThreadLocalGlobalAddr.
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
+    ASSERT_TRUE(fmt.has_value());
+    ASSERT_FALSE((*fmt)->tlsAccess().has_value())
+        << "precondition: arm64-ELF must not declare tlsAccess until C2";
+    auto m = buildTlsPlusControlModule();
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+                           std::nullopt, std::nullopt, (*fmt)->tlsAccess());
+    EXPECT_FALSE(lirR.ok);
+    EXPECT_TRUE(sawDiagnosticCode(
+        rep, DiagnosticCode::K_FormatLacksThreadLocalSupport));
+    EXPECT_FALSE(sawDiagnosticCode(
+        rep, DiagnosticCode::L_RequiredLirOpcodeMissing))
+        << "the format gate must fire BEFORE (instead of) the opcode "
+           "gate on the production arm64 leg";
+}
+
+TEST(MirToLirTls, Arm64LocalExecConfigFailsLoudMissingTlsBaseOpcode) {
+    // The OPCODE gate: hand a local-exec config to the arm64 target
+    // (which declares NO tlsbase row until TLS C2) — the lowering must
+    // fail EXACTLY L_RequiredLirOpcodeMissing naming tlsbase, the
+    // generic un-landed-target-leg gate.
+    auto m = buildTlsPlusControlModule();
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    ASSERT_FALSE((*target)->opcodeByMnemonic("tlsbase").has_value())
+        << "precondition: arm64 must not declare tlsbase until C2";
+    DiagnosticReporter rep;
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+                           std::nullopt, std::nullopt, elfLocalExecTls());
+    EXPECT_FALSE(lirR.ok);
+    bool sawTlsBaseMissing = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_RequiredLirOpcodeMissing
+            && d.actual.find("tlsbase") != std::string::npos) {
+            sawTlsBaseMissing = true;
+        }
+    }
+    EXPECT_TRUE(sawTlsBaseMissing)
+        << "arm64 + local-exec must fail loud on the missing 'tlsbase' "
+           "opcode row (L_RequiredLirOpcodeMissing)";
+}
+
+TEST(MirToLirTls, PeIndexedModelDeclaredButUnlandedFailsLoud) {
+    // Closed-verb arm: `pe-indexed` is declared vocabulary whose
+    // LOWERING lands with the PE TLS cycle — until then it must fail
+    // loud (0x8015-class), never emit a silently-wrong local-exec
+    // sequence (the two models disagree on every byte after the tp
+    // read).
+    auto m = buildTlsPlusControlModule();
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    ::dss::TlsAccessInfo pe{};
+    pe.model             = ::dss::TlsAccessModel::PeIndexed;
+    pe.segmentPrefixByte = 0x65;
+    pe.baseDisplacement  = 0x58;
+    DiagnosticReporter rep;
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+                           std::nullopt, std::nullopt, pe);
+    EXPECT_FALSE(lirR.ok);
+    EXPECT_TRUE(sawDiagnosticCode(
+        rep, DiagnosticCode::K_FormatLacksThreadLocalSupport));
+    EXPECT_TRUE(sawAnchor(rep, "pe-indexed"))
+        << "the reject must name the declared-but-unlanded model";
 }

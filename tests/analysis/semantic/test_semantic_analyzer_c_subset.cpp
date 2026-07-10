@@ -8246,3 +8246,189 @@ TEST(SemanticAnalyzerCSubset, AutoInfersExactKindsAcrossValueClasses) {
     EXPECT_EQ(kindOf("f"), TypeKind::F64)
         << "an unsuffixed float literal infers double (C 6.4.4.2)";
 }
+
+// ── TLS C1 (D-CSUBSET-THREAD-LOCAL): C11/C23 6.7.1 thread storage duration ──
+//
+// The ACCEPT matrix: every legal spelling/placement parses AND marks the
+// symbol record. RED-ON-DISABLE: drop the Pass-1 `scanSpecifierPrefixStorage`
+// mint (or the linkageSpecifiers `{threadStorage:true}` config entries) and
+// every isThreadLocal EXPECT below reds — and with it every enforcement test
+// in this block stops firing (the validator gates on the mark).
+TEST(SemanticAnalyzerCSubset, ThreadLocalAcceptsAndMarksSymbols) {
+    auto model = analyzeShipped("c-subset", {
+        "_Thread_local int g = 5;\n"                     // C11 spelling
+        "thread_local int h;\n"                          // C23 spelling, tentative
+        "static thread_local int s = 2;\n"               // static first
+        "thread_local static int s2 = 3;\n"              // thread_local first
+        "extern thread_local int e;\n"                   // the cross-TU form
+        "int plain = 9;\n"                               // control: unmarked
+        "int main(void) {\n"
+        "    static thread_local int ls = 4;\n"          // block-scope static
+        "    return g + h + s + s2 + ls + plain;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "every accept-matrix form is legal C11/C23";
+    for (char const* nm : {"g", "h", "s", "s2", "e", "ls"}) {
+        auto const* rec = findSymbolNamed(model, nm);
+        ASSERT_NE(rec, nullptr) << nm;
+        EXPECT_TRUE(rec->isThreadLocal)
+            << nm << " must carry the Pass-1 thread-storage mark";
+    }
+    auto const* plainRec = findSymbolNamed(model, "plain");
+    ASSERT_NE(plainRec, nullptr);
+    EXPECT_FALSE(plainRec->isThreadLocal)
+        << "an unmarked global must stay process-shared";
+}
+
+// thread_local does NOT change linkage (C11 6.2.2 untouched by 6.7.1): the
+// file-scope form keeps EXTERNAL linkage, and a co-present `static` keeps its
+// INTERNAL binding in EITHER order (the noreturn linkage-clobber lesson — a
+// threadStorage row must never last-wins-overwrite a static's binding).
+// What the ANALYZER must guarantee is that both orders survive to the HIR
+// tier error-free with the thread mark intact on both symbols (the binding
+// axis itself is stamped at HIR lowering by linkageFrom, pinned in the MIR
+// lowering tests).
+TEST(SemanticAnalyzerCSubset, ThreadLocalDoesNotClobberStaticBinding) {
+    auto model = analyzeShipped("c-subset", {
+        "static thread_local int a = 1;\n"
+        "thread_local static int b = 2;\n"
+        "int main(void) { return a + b; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    for (char const* nm : {"a", "b"}) {
+        auto const* rec = findSymbolNamed(model, nm);
+        ASSERT_NE(rec, nullptr) << nm;
+        EXPECT_TRUE(rec->isThreadLocal) << nm;
+    }
+}
+
+// 6.7.1p4 — objects only. A thread_local FUNCTION (prototype and definition
+// forms) fails loud S_ThreadLocalOnFunction. RED-ON-DISABLE: drop the
+// validator's FnSig arm and both go green (silently compiling the specifier
+// away).
+TEST(SemanticAnalyzerCSubset, ThreadLocalOnFunctionFailsLoud) {
+    auto proto = analyzeShipped("c-subset", {
+        "thread_local int f(void);\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(proto.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalOnFunction), 1u)
+        << "a thread_local prototype is a 6.7.1p4 constraint violation";
+    auto def = analyzeShipped("c-subset", {
+        "_Thread_local int f(void) { return 1; }\n"
+        "int main(void) { return f(); }\n",
+    });
+    EXPECT_EQ(countCode(def.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalOnFunction), 1u)
+        << "a thread_local function DEFINITION violates the same constraint";
+}
+
+// 6.7.1p3 — a BLOCK-scope thread_local object requires static or extern.
+// The plain block form and the for-init form (where the requirement is
+// unsatisfiable — a for-init admits neither) both fail loud
+// S_ThreadLocalRequiresStaticOrExtern; the C23 auto-inferred block form is
+// caught too (the mark rides the autoInferredVarDecl row's config).
+// RED-ON-DISABLE: drop the validator's block-scope arm → the plain form goes
+// green as a silent AUTOMATIC (the exact storage-duration miscompile the
+// code exists to prevent); drop the forDecl gatedMarkers → the for-init form
+// goes green.
+TEST(SemanticAnalyzerCSubset, ThreadLocalBlockScopeRequiresStaticOrExtern) {
+    auto plain = analyzeShipped("c-subset", {
+        "int main(void) { thread_local int x = 1; return x; }\n",
+    });
+    EXPECT_EQ(countCode(plain.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern),
+              1u);
+    auto forInit = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    for (thread_local int i = 0; i < 2; i = i + 1) {}\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(forInit.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern),
+              1u)
+        << "a for-init thread_local can never satisfy 6.7.1p3 (gatedMarkers)";
+    auto autoForm = analyzeShipped("c-subset", {
+        "int main(void) { thread_local auto x = 5; return x; }\n",
+    });
+    EXPECT_EQ(countCode(autoForm.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern),
+              1u)
+        << "the C23 auto-inferred block decl is caught by the same check";
+    // The LEGAL counterpart pins the check polarity: static satisfies p3.
+    auto legal = analyzeShipped("c-subset", {
+        "int main(void) { static thread_local auto s = 1; return s; }\n",
+    });
+    EXPECT_EQ(countCode(legal.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern),
+              0u)
+        << "C23 admits auto beside thread_local; static satisfies 6.7.1p3";
+}
+
+// 6.7.1p3 "shall be present in the declaration of every declared name with
+// thread storage duration" — a same-TU redeclaration pair disagreeing on the
+// specifier fails loud S_ThreadLocalRedeclarationMismatch in BOTH directions.
+// RED-ON-DISABLE: drop the merge-site check and both silently merge (half
+// the accesses would bind the wrong storage).
+TEST(SemanticAnalyzerCSubset, ThreadLocalRedeclarationMismatchBothDirections) {
+    auto gained = analyzeShipped("c-subset", {
+        "extern int g;\n"
+        "thread_local int g = 5;\n"
+        "int main(void) { return g; }\n",
+    });
+    EXPECT_EQ(countCode(gained.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRedeclarationMismatch),
+              1u)
+        << "plain extern then thread_local definition must mismatch";
+    auto lost = analyzeShipped("c-subset", {
+        "extern thread_local int g;\n"
+        "int g = 5;\n"
+        "int main(void) { return g; }\n",
+    });
+    EXPECT_EQ(countCode(lost.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRedeclarationMismatch),
+              1u)
+        << "extern thread_local then plain definition must mismatch too";
+    // The MATCHED pair is legal — pins the check polarity.
+    auto matched = analyzeShipped("c-subset", {
+        "extern thread_local int g;\n"
+        "thread_local int g = 5;\n"
+        "int main(void) { return g; }\n",
+    });
+    EXPECT_EQ(countCode(matched.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRedeclarationMismatch),
+              0u);
+    EXPECT_FALSE(matched.hasErrors());
+}
+
+// 6.7.1p2 + C23 constexpr rules — forbidden storage-class combinations fail
+// loud S_ThreadLocalInvalidCombination: `constexpr thread_local` (both
+// orders — the check reads the Pass-1 isConstexpr mark, not token order) and
+// `register thread_local` (the config-driven incompatibleSpecifierTokens
+// scan). `typedef thread_local` cannot co-occur grammatically (typedefDecl
+// has no storage-specifier prefix — a loud parse error, not a semantic
+// code). RED-ON-DISABLE: drop the validator's combination arms and all three
+// compile silently with one specifier dropped.
+TEST(SemanticAnalyzerCSubset, ThreadLocalInvalidCombinationsFailLoud) {
+    auto cxFirst = analyzeShipped("c-subset", {
+        "constexpr thread_local int c = 5;\n"
+        "int main(void) { return c; }\n",
+    });
+    EXPECT_EQ(countCode(cxFirst.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalInvalidCombination), 1u);
+    auto cxSecond = analyzeShipped("c-subset", {
+        "thread_local constexpr int c = 5;\n"
+        "int main(void) { return c; }\n",
+    });
+    EXPECT_EQ(countCode(cxSecond.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalInvalidCombination), 1u)
+        << "specifier order must not matter (the mark-based check)";
+    auto reg = analyzeShipped("c-subset", {
+        "int main(void) { register thread_local int r = 1; return r; }\n",
+    });
+    EXPECT_EQ(countCode(reg.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalInvalidCombination), 1u)
+        << "register may not pair with thread_local (6.7.1p2)";
+}

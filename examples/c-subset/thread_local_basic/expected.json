@@ -1,0 +1,16 @@
+{
+  "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C1): single-thread thread_local witness — .tdata template copy visible before any write (g==7), mutation sticks, static thread_local (.tbss) accumulates from 0, thread_local const rides the same tp-relative access. The release arm runs the full optimizer over the tlsbase+lea access sequence (the M-5 riprel-fold exclusions must hold under CSE/mem2reg). x86_64-linux ONLY: arm64-elf rejects loud (K_FormatLacksThreadLocalSupport 0x8015) until TLS C2 lands its MRS/ADD sequence + format opt-in; pe64/Mach-O until C3/C4. The per-thread discriminator lives in thread_local_pthread; this example's job is the loader-copies-template + mutation semantics. Exit 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

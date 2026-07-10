@@ -678,7 +678,8 @@ TEST(MirMerge, MergeRemapsGlobalInitFunc) {
         // global g (symbol 300): initialized by __init__ at load.
         (void)mb.addGlobal(i32, SymbolId{300}, /*initLiteralIndex=*/UINT32_MAX,
                            srcInitFunc, SymbolBinding::Global,
-                           SymbolVisibility::Default);
+                           SymbolVisibility::Default, /*isConst=*/false,
+                           MirThreadStorage::Shared);
         mir0 = std::move(mb).finish();
     }
 
@@ -743,13 +744,15 @@ TEST(MirMerge, MergeRemapsSymbolAddressGlobalTarget) {
         MirBuilder mb;
         (void)mb.addGlobal(i32_1, SymbolId{300}, mb.literalPoolAdd(i32Lit(42)),
                            MirFuncId{}, SymbolBinding::Global,
-                           SymbolVisibility::Default);
+                           SymbolVisibility::Default, /*isConst=*/false,
+                           MirThreadStorage::Shared);
         MirLiteralValue saLit;
         saLit.value = MirSymbolAddrValue{/*symbol=*/300u, /*addend=*/0};
         saLit.core  = TypeKind::Ptr;
         (void)mb.addGlobal(p32_1, SymbolId{400}, mb.literalPoolAdd(saLit),
                            MirFuncId{}, SymbolBinding::Global,
-                           SymbolVisibility::Default);
+                           SymbolVisibility::Default, /*isConst=*/false,
+                           MirThreadStorage::Shared);
         mir1 = std::move(mb).finish();
     }
 
@@ -819,10 +822,12 @@ TEST(MirMerge, MergePreservesGlobalConstness) {
         // gc (sym 300) CONST init 5 → .rodata; gm (sym 301) MUTABLE init 7 → .data
         (void)mb.addGlobal(i32, SymbolId{300}, mb.literalPoolAdd(i32Lit(5)),
                            MirFuncId{}, SymbolBinding::Global,
-                           SymbolVisibility::Default, /*isConst=*/true);
+                           SymbolVisibility::Default, /*isConst=*/true,
+                           MirThreadStorage::Shared);
         (void)mb.addGlobal(i32, SymbolId{301}, mb.literalPoolAdd(i32Lit(7)),
                            MirFuncId{}, SymbolBinding::Global,
-                           SymbolVisibility::Default, /*isConst=*/false);
+                           SymbolVisibility::Default, /*isConst=*/false,
+                           MirThreadStorage::Shared);
         mir0 = std::move(mb).finish();
     }
     std::vector<MergeCuInput> cus = {
@@ -843,6 +848,55 @@ TEST(MirMerge, MergePreservesGlobalConstness) {
         << "the CONST global must survive cross-CU merge as const (else it lands "
            "in a writable .data section)";
     EXPECT_EQ(mutCount, 1) << "the mutable global must survive merge as mutable";
+}
+
+// TLS C1 (D-CSUBSET-THREAD-LOCAL, ★CRIT-3): thread-storage preservation
+// across the cross-CU merge global-clone site — the FIRST of the audit's
+// flag-drop clone sites. `MirGlobal.isThreadLocal` drives the emitted data
+// section (`.tdata`/`.tbss` vs `.data`); a merge that drops it silently
+// demotes a per-thread object to PROCESS-SHARED in every N>1 build (every
+// thread reads/writes one copy — the exact miscompile the non-defaulted
+// addGlobal parameter exists to prevent). Exact per-global assertions.
+// RED-ON-DISABLE: drop the `m.globalIsThreadLocal(g)` argument at the
+// mir_merge.cpp addGlobal (pass MirThreadStorage::Shared) → the TLS
+// global comes back
+// process-shared and the EXPECT_TRUE fails.
+TEST(MirMerge, MergePreservesGlobalThreadLocal) {
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32 = in0.primitive(TypeKind::I32);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        // gt (sym 300) THREAD-LOCAL init 5; gp (sym 301) plain init 7.
+        (void)mb.addGlobal(i32, SymbolId{300}, mb.literalPoolAdd(i32Lit(5)),
+                           MirFuncId{}, SymbolBinding::Global,
+                           SymbolVisibility::Default, /*isConst=*/false,
+                           MirThreadStorage::PerThread);
+        (void)mb.addGlobal(i32, SymbolId{301}, mb.literalPoolAdd(i32Lit(7)),
+                           MirFuncId{}, SymbolBinding::Global,
+                           SymbolVisibility::Default, /*isConst=*/false,
+                           MirThreadStorage::Shared);
+        mir0 = std::move(mb).finish();
+    }
+    std::vector<MergeCuInput> cus = {
+        MergeCuInput{&mir0, &in0, namerOf({{300, "gt"}, {301, "gp"}}), {}},
+    };
+    std::vector<std::string> const entries = {"main"};
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{55}}, entries, rep);
+    ASSERT_TRUE(merged.has_value()) << "errorCount=" << rep.errorCount();
+
+    Mir const& mm = merged->mir;
+    ASSERT_EQ(mm.moduleGlobalCount(), 2u);
+    int tlsCount = 0, plainCount = 0;
+    for (std::uint32_t i = 0; i < mm.moduleGlobalCount(); ++i) {
+        if (mm.globalIsThreadLocal(mm.globalAt(i))) ++tlsCount; else ++plainCount;
+    }
+    EXPECT_EQ(tlsCount, 1)
+        << "the THREAD-LOCAL global must survive the cross-CU merge "
+           "thread-local (else it silently becomes process-shared)";
+    EXPECT_EQ(plainCount, 1)
+        << "the plain global must survive the merge process-shared";
 }
 
 // ── Two strong definitions report a conflict ───────────────────────

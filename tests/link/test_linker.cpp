@@ -1030,3 +1030,109 @@ TEST(Linker, UnknownRelocationKindEmitsMismatch) {
     EXPECT_EQ(image.resolvedFuncCount, 0u);
     EXPECT_EQ(countCode(rep, DiagnosticCode::K_RelocationKindMismatch), 1u);
 }
+
+// ═════════════════════════════════════════════════════════════════
+// D-CSUBSET-THREAD-LOCAL (TLS C1): linker-tier gates.
+// ═════════════════════════════════════════════════════════════════
+
+TEST(Linker, SurvivingThreadLocalExternImportRejectsLoud) {
+    // D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC: a thread-local extern that
+    // SURVIVED the cross-CU merge is a true LIBRARY thread-local
+    // (glibc-errno-class). No shipped binding model can carry it —
+    // copy-relocation would collapse it to ONE process-shared slot,
+    // and local-exec tpoffs only cover THIS exec's own PT_TLS block.
+    // The gate is UNCONDITIONAL and format-agnostic (it sits before
+    // any walker dispatch): storage-model capability, not format
+    // capability. An INTRA-program `extern thread_local` never gets
+    // here (the LK11 merge strips the row when a sibling CU defines
+    // it — the ordinary extern-resolution path).
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(fmt.has_value());
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    ExternImport tlsImp;
+    tlsImp.symbol        = SymbolId{77};
+    tlsImp.mangledName   = "lib_tls_object";
+    tlsImp.libraryPath   = "libc.so.6";
+    tlsImp.isData        = true;
+    tlsImp.dataSizeBytes = 4;
+    tlsImp.dataAlignBytes = 4;
+    tlsImp.isThreadLocal = true;
+    mod.externImports.push_back(std::move(tlsImp));
+
+    DiagnosticReporter rep;
+    auto image = linker::link(mod, **target, **fmt, rep);
+    EXPECT_FALSE(image.ok());
+    bool saw = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_FormatLacksThreadLocalSupport
+            && d.actual.find("D-CSUBSET-THREAD-LOCAL-INITIAL-EXEC")
+                   != std::string::npos) {
+            saw = true;
+        }
+    }
+    EXPECT_TRUE(saw)
+        << "a surviving thread-local extern import must fail loud "
+           "citing the initial-exec deferral, never bind through "
+           "copy-relocation";
+}
+
+TEST(Linker, TdataItemOnNonOptedInFormatsRejectsAtAcceptsGate) {
+    // Layering pin (audit LOW-b): for formats whose JSON does NOT
+    // advertise tdata/tbss (pe64 until TLS C3, Mach-O until C4), the
+    // GENERIC schema-declared acceptsDataSection gate fires FIRST —
+    // K_NoMatchingObjectFormat naming the section — before any walker
+    // runs. The walkers' own K_FormatLacksThreadLocalSupport (0x8015)
+    // belts sit BEHIND this gate and fire only on a direct walker call
+    // or a format JSON opting in prematurely (pinned in the per-walker
+    // test files). Zero format-name branches: the same set-membership
+    // check serves every format.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    for (char const* fmtName :
+         {"pe64-x86_64-windows-exec", "macho64-x86_64-darwin-exec"}) {
+        auto fmt = ObjectFormatSchema::loadShipped(fmtName);
+        ASSERT_TRUE(fmt.has_value()) << fmtName;
+        ASSERT_FALSE((*fmt)->acceptsDataSection(DataSectionKind::Tdata))
+            << fmtName << " must not opt into tdata before its TLS "
+                          "cycle lands";
+        ASSERT_FALSE((*fmt)->acceptsDataSection(DataSectionKind::Tbss))
+            << fmtName;
+
+        AssembledModule mod;
+        mod.expectedFuncCount = 1;
+        AssembledFunction fn;
+        fn.symbol = SymbolId{1};
+        fn.bytes  = {0xC3};
+        mod.functions.push_back(std::move(fn));
+        AssembledData d;
+        d.symbol    = SymbolId{42};
+        d.section   = DataSectionKind::Tdata;
+        d.bytes     = {7, 0, 0, 0};
+        d.alignment = Alignment::of<4>();
+        mod.dataItems.push_back(std::move(d));
+
+        DiagnosticReporter rep;
+        auto image = linker::link(mod, **target, **fmt, rep);
+        EXPECT_FALSE(image.ok()) << fmtName;
+        bool saw = false;
+        for (auto const& diag : rep.all()) {
+            if (diag.code == DiagnosticCode::K_NoMatchingObjectFormat
+                && diag.actual.find("tdata") != std::string::npos
+                && diag.actual.find("supportedDataSections")
+                       != std::string::npos) {
+                saw = true;
+            }
+        }
+        EXPECT_TRUE(saw)
+            << fmtName << ": the schema-declared acceptsDataSection "
+                          "gate must reject a tdata item loud";
+    }
+}

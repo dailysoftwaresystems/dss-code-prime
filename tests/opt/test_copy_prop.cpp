@@ -360,7 +360,9 @@ TEST(CopyProp, RuntimeInitGlobalsModuleEmitsXOptPassSkippedInfo) {
     mb.beginBlock(initEntry);
     mb.addReturn();
     // The runtime-init global referencing initFn.
-    mb.addGlobal(i32, SymbolId{200}, /*initLiteralIndex*/UINT32_MAX, initFn);
+    mb.addGlobal(i32, SymbolId{200}, /*initLiteralIndex*/UINT32_MAX, initFn,
+                 SymbolBinding::Global, SymbolVisibility::Default,
+                 /*isConst=*/false, MirThreadStorage::Shared);
     Mir mir = std::move(mb).finish();
 
     DiagnosticReporter rep;

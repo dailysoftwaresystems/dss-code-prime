@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 100> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 105> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -435,6 +435,23 @@ constexpr std::array<DiagnosticCode, 100> kUnsuppressableCodes{{
     DiagnosticCode::S_AutoRequiresPlainIdentifier,
     DiagnosticCode::S_AutoRequiresInitializer,
     DiagnosticCode::S_AutoInferenceInvalid,
+    // S_ThreadLocal* (TLS C1, D-CSUBSET-THREAD-LOCAL, C11/C23 6.7.1 + 6.6p9):
+    // the five thread-storage constraint violations — thread_local on a
+    // function, a block-scope object without static/extern, a same-TU
+    // redeclaration mismatch, a thread-local address in a static initializer,
+    // and a forbidden storage-class combination (constexpr / register).
+    // Suppressing ANY of them ships wrong STORAGE bytes, not just a missed
+    // lint: the block-scope form would lower as a per-call automatic, the
+    // redeclaration mismatch would bind half the accesses to the wrong
+    // storage, and the address-constant form would emit an abs64 relocation
+    // whose resolved value is a link-time tpoff bit-cast into a data slot (a
+    // silent garbage pointer — the arc's CRIT-1). Closed here so an invalid
+    // thread_local never compiles quietly.
+    DiagnosticCode::S_ThreadLocalOnFunction,
+    DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern,
+    DiagnosticCode::S_ThreadLocalRedeclarationMismatch,
+    DiagnosticCode::S_ThreadLocalAddressNotConstant,
+    DiagnosticCode::S_ThreadLocalInvalidCombination,
     // S_UnknownAttribute / S_DeprecatedSymbolUsed / S_NodiscardResultDiscarded
     // (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13) are deliberately NOT
     // members — the same suppressible posture as S_UnknownTypeAttribute above.

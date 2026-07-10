@@ -93,6 +93,12 @@ exits 0 since 2026-06-12 — the `ptr_swap_through` miscompile is FIXED, see bel
   `-L /usr/aarch64-linux-gnu`; without qemu or that sysroot in WSL the leg reports
   `skipped (wsl-qemu runner unavailable)` — install qemu-user + an aarch64 sysroot
   (`gcc-aarch64-linux-gnu` provides it) to light it up.
+- **Per-format features flip green per HOST (TLS arc example).** The battery compiles probes
+  for the HOST-NATIVE target — pe64 on Windows, elf64 on Linux. A feature landed per-format
+  (thread_local: ELF x86_64 in TLS C1; PE lands C3; Mach-O C4) therefore shows
+  `c11_thread_local` GREEN on a Linux host but 0x8015-RED on the Windows host until its C3
+  leg lands — the red is CORRECT (fail-loud on the un-landed leg), not a regression. Judge
+  such probes on the leg that owns them.
 - **Git velocity is squash-blind**: PRs squash to one main commit, hiding per-cycle commits.
   The plan board is the primary velocity source; the `^v0.0.2` commit count is shown only as
   a floor.

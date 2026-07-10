@@ -206,6 +206,14 @@ struct Lowerer {
     // side-table stays sparse and a wrongly-defaulted global fails SAFE (writable
     // never re-introduces the read-only-store crash).
     std::vector<std::pair<HirNodeId, MutabilityAttr>>& mutability;
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared accumulator of (decl HIR node →
+    // ThreadLocalAttr) pairs, populated from the bound symbol's
+    // `SymbolRecord.isThreadLocal` at each Global lowering site AND the
+    // extern-data arm (where the record is in hand) — the exact `mutability`
+    // discipline. Applied to the result's HirThreadLocalMap AFTER finish().
+    // Only THREAD-LOCAL decls are recorded (absence ⇒ ordinary process-shared
+    // storage), so the side-table stays sparse.
+    std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& threadLocalAcc;
     // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared accumulator of (ACCESS HIR node
     // → VolatileAttr) pairs, populated from the bound symbol's / field's
     // `SymbolRecord.isVolatile` at each USER-access lowering site (object Ref,
@@ -795,11 +803,13 @@ struct Lowerer {
             std::vector<HirExternRecord>& ed,
             std::vector<std::pair<HirNodeId, LinkageAttr>>& lk,
             std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut,
+            std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& tls,
             std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
             std::vector<std::pair<HirNodeId, AlignmentAttr>>& aln)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
-          linkage(lk), mutability(mut), volatileAcc(vol), alignmentAcc(aln) {
+          linkage(lk), mutability(mut), threadLocalAcc(tls), volatileAcc(vol),
+          alignmentAcc(aln) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -1096,6 +1106,19 @@ struct Lowerer {
         auto const* rec = model.recordFor(sym);
         if (rec != nullptr && rec->isConst)
             mutability.push_back({node, MutabilityAttr{/*isConst=*/true}});
+    }
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): record thread-storage duration for a
+    // lowered Global / ExternGlobal node from its bound symbol's
+    // `SymbolRecord.isThreadLocal` (sparse: only thread-local decls are
+    // stored; absence ⇒ ordinary process-shared storage). Called at every
+    // Global-producing site alongside `recordMutability` (the two axes are
+    // orthogonal — `const thread_local` records BOTH) plus the extern-data
+    // arm. `sym` must be the declaration's declared symbol.
+    void recordThreadLocal(HirNodeId node, SymbolId sym) {
+        if (!sym.valid()) return;
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->isThreadLocal)
+            threadLocalAcc.push_back({node, ThreadLocalAttr{/*isThreadLocal=*/true}});
     }
     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: record an explicit `alignas` override
     // for a lowered Global / VarDecl node from its bound symbol's
@@ -7165,6 +7188,7 @@ struct Lowerer {
                 }
                 HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), d);
                 recordMutability(g, sym);
+                recordThreadLocal(g, sym);  // TLS C1: `static thread_local` local
                 recordVolatility(g, sym);   // c21: volatile static-local global init store
                 recordAlignment(g, sym);    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
                 recordLinkage(g, staticLinkage);  // {Local, Default} — internal
@@ -7178,7 +7202,13 @@ struct Lowerer {
             // HIR→MIR can route a const-init global to read-only `.rodata` and a
             // mutable one to writable `.data` (D-LK4-DATA-PRODUCER-MUTABLE-
             // GLOBAL). Locals are stack slots — mutability is irrelevant there.
-            if (asGlobal) recordMutability(lowered, sym);
+            // TLS C1: thread-storage duration rides the same global-only
+            // discipline (a block-scope thread_local WITHOUT static already
+            // failed loud in Pass 2 — no automatic can reach here marked).
+            if (asGlobal) {
+                recordMutability(lowered, sym);
+                recordThreadLocal(lowered, sym);
+            }
             // c21 (D-CSUBSET-VOLATILE-QUALIFIER): volatility applies to BOTH a
             // global's load-time init store (HIR→MIR :6886) AND a local's init
             // store into its alloca (HIR→MIR :5712) — record unconditionally on
@@ -7250,6 +7280,7 @@ struct Lowerer {
         if (asGlobal) {
             HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
             recordMutability(g, sym);   // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL
+            recordThreadLocal(g, sym);  // TLS C1 (D-CSUBSET-THREAD-LOCAL)
             recordVolatility(g, sym);   // c21 (D-CSUBSET-VOLATILE-QUALIFIER)
             recordAlignment(g, sym);    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
             return g;
@@ -7627,6 +7658,7 @@ struct Lowerer {
         HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
         recordLinkage(g, linkAttr);
         recordMutability(g, sym);   // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL
+        recordThreadLocal(g, sym);  // TLS C1 (D-CSUBSET-THREAD-LOCAL)
         recordAlignment(g, sym);    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
         return g;
     }
@@ -7961,6 +7993,11 @@ struct Lowerer {
         }
         HirNodeId const g = track(builder.makeExternGlobal(type, sym.v), node);
         recordExtern(g);
+        // TLS C1 (D-CSUBSET-THREAD-LOCAL): `extern thread_local int e;` — the
+        // record's flag rides the same side-table as intra-module globals so
+        // HIR→MIR's extern-data pre-pass stamps ExternImport.isThreadLocal
+        // (the linker-side surviving-extern handling is slice C).
+        recordThreadLocal(g, sym);
         return g;
     }
 
@@ -8135,6 +8172,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: shared (Global node → MutabilityAttr)
     // accumulator, moved onto result->mutabilityMap after finish().
     std::vector<std::pair<HirNodeId, MutabilityAttr>> mutability;
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared (decl node → ThreadLocalAttr)
+    // accumulator, moved onto result->threadLocalMap after finish().
+    std::vector<std::pair<HirNodeId, ThreadLocalAttr>> threadLocalAcc;
     // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared (access node → VolatileAttr)
     // accumulator, moved onto result->volatileMap after finish().
     std::vector<std::pair<HirNodeId, VolatileAttr>> volatileAcc;
@@ -8152,7 +8192,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
-            mutability, volatileAcc, alignmentAcc));
+            mutability, threadLocalAcc, volatileAcc, alignmentAcc));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -8200,6 +8240,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     for (auto& [id, loc] : spans) result->sourceMap.set(id, loc);
     for (auto& [id, attr] : linkage) result->linkageMap.set(id, attr);
     for (auto& [id, attr] : mutability) result->mutabilityMap.set(id, attr);
+    for (auto& [id, attr] : threadLocalAcc)
+        result->threadLocalMap.set(id, attr);   // TLS C1
     for (auto& [id, attr] : volatileAcc) result->volatileMap.set(id, attr);  // c21
     for (auto& [id, attr] : alignmentAcc) result->alignmentMap.set(id, attr);  // alignas
     result->externDecls = std::move(externDecls);

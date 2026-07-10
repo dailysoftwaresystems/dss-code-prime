@@ -222,6 +222,16 @@ lowerToMir(Hir const&               hir,
            // Read here to stamp MirGlobal.alignment (globals — the assembler
            // raises the data-item alignment) and the MIR Alloca's effective-
            // alignment channel (locals — MIR→LIR feeds it to the frame layout).
-           HirAlignmentMap const*   alignmentMap = nullptr);
+           HirAlignmentMap const*   alignmentMap = nullptr,
+           // TLS C1 (D-CSUBSET-THREAD-LOCAL): per-DECLARATION thread-storage
+           // side-table, populated by the CST→HIR lowerer from each global's /
+           // extern-data decl's bound symbol `SymbolRecord.isThreadLocal`.
+           // Optional: nullptr (or a decl with no entry) ⇒ ordinary
+           // process-shared storage. Read here to stamp
+           // MirGlobal.isThreadLocal / ExternImport.isThreadLocal (the
+           // assembler's `.tdata`/`.tbss` routing input) AND to screen
+           // static-storage initializers for `&tls` address constants
+           // (S_ThreadLocalAddressNotConstant — C11 6.6p9, the arc's CRIT-1).
+           HirThreadLocalMap const* threadLocalMap = nullptr);
 
 } // namespace dss

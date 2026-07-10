@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Shared exec-image DATA-SECTION substrate for the format walkers — the
@@ -105,15 +106,21 @@ struct ExecDataSectionLayout {
     // strictest matching member alignment.
     layout.maxAlign = std::max<std::uint64_t>(1, sectionAlignFloor);
 
-    bool const isBss = (kind == DataSectionKind::Bss);
+    // TLS C1 audit fold M-3 (D-CSUBSET-THREAD-LOCAL): the zero-fill
+    // discrimination routes through the ONE shared `isZeroFill` predicate
+    // (section_kind.hpp) — Bss AND Tbss reserve extent without file bytes.
+    // The former exact `== DataSectionKind::Bss` test would have silently
+    // laid a Tbss item out as file-backed (0 bytes where reservedSize was
+    // the real per-thread span).
+    bool const zeroFill = isZeroFill(kind);
 
     for (std::size_t i = 0; i < dataItems.size(); ++i) {
         auto const& d = dataItems[i];
         if (d.section != kind) continue;     // belongs to another section
         // A data item carrying its OWN relocations (data->data references —
         // a vtable / cross-CU thunk slot). The writers that don't patch them
-        // (ELF / Mach-O) reject loud; PE (`allowItemRelocations`) patches them
-        // post-layout using the offsets this function records.
+        // (Mach-O) reject loud; PE + ELF-dynamic (`allowItemRelocations`)
+        // patch them post-layout using the offsets this function records.
         if (!d.relocations.empty() && !allowItemRelocations) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                  std::format("{}: {} data item #{} (SymbolId={{ {} }}) carries "
@@ -125,31 +132,33 @@ struct ExecDataSectionLayout {
                              d.symbol.v, d.relocations.size()));
             return std::nullopt;
         }
-        // Defense in depth (validateAssembledData ran first): a Bss item must
-        // carry NO file bytes — it is zero-fill, so its span comes from
+        // Defense in depth (validateAssembledData ran first): a zero-fill
+        // (Bss/Tbss) item must carry NO file bytes — its span comes from
         // reservedSize, never from stored bytes (sizeInSection() reads
-        // reservedSize for Bss and bytes.size() otherwise).
-        if (isBss && !d.bytes.empty()) {
+        // reservedSize for zero-fill kinds and bytes.size() otherwise).
+        if (zeroFill && !d.bytes.empty()) {
             emit(reporter, DiagnosticCode::K_BssDataHasBytes,
-                 std::format("{}: Bss data item #{} (SymbolId={{ {} }}) carries "
-                             "{} file byte(s) — Bss is zero-fill and must reserve "
+                 std::format("{}: {} data item #{} (SymbolId={{ {} }}) carries "
+                             "{} file byte(s) — a zero-fill section reserves "
                              "size without storing bytes.",
-                             writerName, i, d.symbol.v, d.bytes.size()));
+                             writerName, dataSectionKindName(kind), i,
+                             d.symbol.v, d.bytes.size()));
             return std::nullopt;
         }
 
         std::uint64_t const itemSize = d.sizeInSection();
         // Lay each item at its alignment within the section span; record the
-        // section-relative start + the original index (for symbolVa). For Bss
-        // the span is virtual (no bytes appended) but offsets advance the same.
+        // section-relative start + the original index (for symbolVa). For a
+        // zero-fill kind the span is virtual (no bytes appended) but offsets
+        // advance the same.
         std::uint64_t const aligned = d.alignment.alignUp(layout.spanSize);
-        if (!isBss) {
+        if (!zeroFill) {
             while (layout.bytes.size() < aligned) layout.bytes.push_back(0);
         }
         layout.spanSize = aligned;
         layout.itemOffsets.push_back(layout.spanSize);
         layout.itemIndices.push_back(i);
-        if (!isBss) {
+        if (!zeroFill) {
             layout.bytes.insert(layout.bytes.end(),
                                 d.bytes.begin(), d.bytes.end());
         }
@@ -195,6 +204,93 @@ struct ExecDataSectionLayout {
                              writerName, di.symbol.v));
             return false;
         }
+    }
+    return true;
+}
+
+// D-CSUBSET-THREAD-LOCAL (TLS C1): register each NAMED thread-local data
+// item's THREAD-POINTER OFFSET (tpoff) into the caller's `symbolVa` map, and
+// its SymbolId into `tlsSymbols`.
+//
+// THE SYMBOLVA-REUSE TRICK (arc discovery D3): the shared
+// `applyExecRelocations` kernel's `Linear` formula reads `S` from `symbolVa`
+// and computes `int64(S) + A (+bias)` with a signed-fit check before a
+// width-truncating LE write (exec_reloc_apply.hpp) — so storing the SIGNED
+// tpoff BIT-CAST to u64 here makes a `tls-tpoff32` relocation patch the
+// correct (possibly negative) 32-bit offset with ZERO kernel changes. The
+// map's value is therefore NOT a VA for these symbols — which is exactly why
+// the caller MUST (a) keep TLS items OUT of `addDataSymbolVas` (one entry per
+// symbol, the tpoff) and (b) run the CRIT-1 cross-check (a non-tls
+// relocation against a `tlsSymbols` member would embed the bit-cast tpoff as
+// an address; a tls relocation against a non-member would embed a VA as a
+// tpoff — both silent-garbage classes).
+//
+// The tpoff FORMULA is keyed on the TARGET's declared `TlsVariant` (config,
+// never a machine-identity branch) — audit fold HIGH-1's exact physics,
+// gcc-witnessed:
+//   * Variant II (x86_64): tp points ONE PAST the aligned block end →
+//         tpoff = int64(templateOffset) − int64(alignedBlockSize)
+//     where alignedBlockSize = alignUp(block memsz, p_align)  (NEGATIVE).
+//   * Variant I (arm64): the block follows the TCB header, itself rounded
+//     up to the block alignment →
+//         tpoff = int64(alignUp(tcbHeaderBytes, tlsAlignment))
+//               + int64(templateOffset)                        (POSITIVE).
+// Both arms land NOW, config-keyed — TLS C2 only supplies arm64's `tls`
+// identity block, zero code here.
+//
+// `templateOffset` = `blockBaseOffset + layout.itemOffsets[j]`:
+// `blockBaseOffset` is 0 for the .tdata call and the tbss block base
+// (`alignUp(tdataSpan, tbss maxAlign)`) for the .tbss call, so both
+// sections' items index ONE contiguous per-thread block. Anonymous
+// `SymbolId{}` items are skipped (M1 mirror); a duplicate NAMED symbol
+// fails loud (`K_DuplicateDataSymbol`), mirroring `addDataSymbolVas`.
+[[nodiscard]] inline bool addTlsSymbolOffsets(
+    std::vector<AssembledData> const&            dataItems,
+    ExecDataSectionLayout const&                 layout,
+    std::uint64_t                                blockBaseOffset,
+    std::uint64_t                                alignedBlockSize,
+    std::uint64_t                                tlsAlignment,
+    TlsIdentity const&                           tlsIdentity,
+    std::unordered_map<SymbolId, std::uint64_t>& symbolVa,
+    std::unordered_set<SymbolId>&                tlsSymbols,
+    std::string_view                             writerName,
+    DiagnosticReporter&                          reporter) {
+    using ::dss::link::format::detail::emit;
+    auto const alignUp64 = [](std::uint64_t v, std::uint64_t a) noexcept {
+        return a <= 1 ? v : ((v + a - 1) / a) * a;
+    };
+    for (std::size_t j = 0; j < layout.itemIndices.size(); ++j) {
+        auto const& di = dataItems[layout.itemIndices[j]];
+        // M1 mirror — anonymous items are offset-referenced, never reloc
+        // targets, and must NOT join symbolVa / tlsSymbols.
+        if (di.symbol == SymbolId{}) continue;
+        std::uint64_t const templateOffset =
+            blockBaseOffset + layout.itemOffsets[j];
+        std::int64_t tpoff = 0;
+        switch (tlsIdentity.variant) {
+            case TlsVariant::Variant2:
+                tpoff = static_cast<std::int64_t>(templateOffset)
+                      - static_cast<std::int64_t>(alignedBlockSize);
+                break;
+            case TlsVariant::Variant1:
+                tpoff = static_cast<std::int64_t>(
+                            alignUp64(tlsIdentity.tcbHeaderBytes,
+                                      tlsAlignment))
+                      + static_cast<std::int64_t>(templateOffset);
+                break;
+        }
+        if (!symbolVa.emplace(di.symbol,
+                              static_cast<std::uint64_t>(tpoff)).second) {
+            emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
+                 std::format("{}: thread-local data SymbolId={{ {} }} "
+                             "collides with another symbol — caller must "
+                             "give each data item a unique SymbolId "
+                             "distinct from function ids "
+                             "(D-CSUBSET-THREAD-LOCAL).",
+                             writerName, di.symbol.v));
+            return false;
+        }
+        tlsSymbols.insert(di.symbol);
     }
     return true;
 }

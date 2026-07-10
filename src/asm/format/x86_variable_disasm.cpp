@@ -392,6 +392,15 @@ disassemble(TargetSchema const&            schema,
                 case EncodingSlotKind::RipRelDisp32:
                 case EncodingSlotKind::CondCodeNibble:
                 case EncodingSlotKind::BlockRel32:
+                // TLS C1 (D-CSUBSET-THREAD-LOCAL): the absolute-SIB
+                // literal disp32 + the relocated memory displacement
+                // are valid x86 slots the round-trip oracle does not
+                // decode yet (the same disasm-completeness gap as the
+                // memory-addressing group above — D-AS5-MULTIWORD-
+                // DISASM); nullopt means "value undefined here", not
+                // a cross-shape violation.
+                case EncodingSlotKind::AbsoluteDisp32Mem:
+                case EncodingSlotKind::MemRelocDisp32:
                     return std::nullopt;
             }
             // Unreachable for any in-range EncodingSlotKind (the switch is

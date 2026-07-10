@@ -2268,3 +2268,42 @@ TEST(PeExecWriter, CertTableFileOffsetShiftsPastRdataAndIdata) {
         << "cert table must sit past the last section's raw end";
 }
 
+
+// ═════════════════════════════════════════════════════════════════
+// D-CSUBSET-THREAD-LOCAL (TLS C1, audit LOW-b): the PE walker's
+// anti-static-alias belt. The shipped pe64 JSONs do not advertise
+// tdata/tbss, so the LINKER's acceptsDataSection gate fires first on
+// the real pipeline (K_NoMatchingObjectFormat — pinned in
+// test_linker.cpp). THIS pin calls pe::encode DIRECTLY — bypassing
+// the linker — so the in-walker 0x8015 belt is what fires: the guard
+// a future format JSON opting in BEFORE the TLS C3 walker arm would
+// hit instead of silently emitting a process-shared alias.
+// ═════════════════════════════════════════════════════════════════
+TEST(PeWriter, TdataItemRejectsLoudUntilTlsC3) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Tdata;
+    d.bytes     = {7, 0, 0, 0};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool saw = false;
+    for (auto const& diag : rep.all()) {
+        if (diag.code == DiagnosticCode::K_FormatLacksThreadLocalSupport
+            && diag.actual.find("TLS cycle C3") != std::string::npos) {
+            saw = true;
+        }
+    }
+    EXPECT_TRUE(saw)
+        << "a thread-local data item through pe::encode must fail "
+           "K_FormatLacksThreadLocalSupport (0x8015) until the C3 "
+           ".tls/IMAGE_TLS_DIRECTORY64 arm lands";
+}

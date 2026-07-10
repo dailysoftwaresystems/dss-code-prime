@@ -1038,6 +1038,27 @@ encodeExec(AssembledModule const&    module,
     // bytes, the loader zero-fills VirtualSize bytes). Section VA/file RVAs
     // chain text → rdata → data → bss → idata → reloc.
     using link::format::detail::alignUp;
+    // D-CSUBSET-THREAD-LOCAL (audit fold LOW-b): the PE walker has no TLS
+    // emission yet — no `.tls` section, no IMAGE_DIRECTORY_ENTRY_TLS
+    // directory, no `_tls_index` slot (all land at TLS cycle C3). Laying a
+    // Tdata/Tbss item out as ordinary data would silently produce ONE
+    // process-shared object — the storage-duration miscompile. The linker's
+    // acceptsDataSection gate fires first for the shipped pe64 JSON (it
+    // does not advertise tdata/tbss); this in-walker belt catches a future
+    // format JSON opting in before the C3 walker arm lands.
+    for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+        auto const s = module.dataItems[i].section;
+        if (s != DataSectionKind::Tdata && s != DataSectionKind::Tbss)
+            continue;
+        emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+             std::format("pe::encodeExec: AssembledData item #{} is "
+                         "thread-local ({}) but the PE walker's TLS arm "
+                         "(.tls section + IMAGE_TLS_DIRECTORY64 + "
+                         "_tls_index) has not landed — TLS cycle C3 "
+                         "(D-CSUBSET-THREAD-LOCAL).",
+                         i, dataSectionKindName(s)));
+        return {};
+    }
     // `allowItemRelocations=true`: PE patches data-item (data→data) relocations
     // — its cross-CU thunk-slot feature — into the laid-out bytes below.
     auto const rdataLayoutOpt = link::format::buildExecDataSection(
