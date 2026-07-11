@@ -4670,6 +4670,94 @@ TEST(HirLoweringCSubset, DeepNestedSwitchLowersFlatOnNormalStack) {
         << "exactly one nested SwitchStmt per source `switch`";
 }
 
+// The SEMANTIC-ANALYSIS companion to the lowering pins above, and the host- AND
+// sanitizer-INDEPENDENT witness that Pass 1.5's declaration-type walk
+// (`resolveDeclTypes`) is FLAT: an explicit heap work-stack, O(1) host stack per
+// nesting level (D-PARSE-DEEP-NEST-RECURSION-MEMORY plan-24 Stage 2, the
+// resolveDeclTypes MISSED SITE). It analyzes a deeply-NESTED switch on a
+// deliberately BOUNDED analysis-worker reserve and asserts the analysis completes
+// cleanly.
+//
+// WHY A RESERVE PARAMETER (not the test's own stack): unlike `lowerToHir` — which
+// the pins above call directly on the test's main stack — the semantic analysis
+// is reachable ONLY through `analyze()`, which runs `analyzeImpl` on a dedicated
+// worker (D-PARSE-DEEP-FRONTEND-STACK). Production uses a 64 MiB reserve; there,
+// the recursive form overflowed ONLY under ASan's inflated frames (that is the
+// existing `...LowersFlatOnNormalStack` CI failure). To pin the flatness WITHOUT
+// depending on a sanitizer, this drives that worker at a small, FIXED reserve via
+// `analyze()`'s `deepRecursionReserveBytes` parameter: the FLAT walk uses O(1)
+// host frames (one `resolveDeclTypesPost` frame at a time) and fits; a per-level
+// RECURSION does not.
+//
+// RED-ON-DISABLE (every leg, no sanitizer needed): restore the recursive
+// `resolveDeclTypes` (one host frame PER switch level) → analyzing kDepth levels
+// overflows the kAnalyzeReserveBytes reserve and hard-crashes the worker. The
+// margins are large on both sides at the gate's Debug frame sizes: the flat walk's
+// O(1) peak (~0.5 MiB even under ASan — the analyzeImpl → driver →
+// resolveDeclTypesPost chain, NOT multiplied by depth) sits ~4x under the 2 MiB
+// reserve, while kDepth (1500) recursive frames of the (huge) resolveDeclTypes
+// function (≥ ~8 KiB each in Debug ⇒ ≥ 12 MiB) sit ~6x over it.
+//
+// The deep tree's PARSE + teardown run on the standard 64 MiB worker — they are
+// ORTHOGONAL deep recursions (the parser's residual paren arm; the tree teardown)
+// and must not themselves overflow — so ONLY the analysis runs on the bounded
+// reserve. maxExpressionDepth is raised above kDepth so the (statement) nesting is
+// admitted without a P_ExpressionTooDeep. (Depth is kept moderate because the
+// front end is ~quadratic in nesting depth; the reserve, not the depth, is what
+// makes the recursion overflow — so a modest depth on a small reserve is a strict
+// pin that still runs fast.)
+TEST(HirLoweringCSubset, DeepNestedSwitchAnalyzesFlatOnNormalStack) {
+    constexpr int kDepth = 1500;   // switch-in-case-body nesting levels
+    // Bounded analysis reserve: ample for the FLAT walk's O(1) host frames (even
+    // under ASan), far too small for kDepth RECURSIVE frames of the (huge)
+    // resolveDeclTypes function.
+    constexpr std::size_t kAnalyzeReserveBytes = std::size_t{2} * 1024 * 1024;
+
+    // `int main(void){ int x=0; switch(x){case 1: … return 0; … default: break;} }`
+    // — each level is a switch whose `case 1:` body is the next-inner switch; the
+    // innermost returns. Every level also has a `default: break;` (a real multi-arm
+    // switch, matching the lowering pin's shape).
+    std::string src = "int main(void){ int x=0; ";
+    for (int i = 0; i < kDepth; ++i) src += "switch(x){ case 1: ";
+    src += "return 0;";
+    for (int i = 0; i < kDepth; ++i) src += " default: break; }";
+    src += " return 0; }";
+
+    // Parse + build the CU on the 64 MiB worker (orthogonal deep recursion kept
+    // off the bounded reserve), then ANALYZE on the bounded reserve — the flatness
+    // witness. A bare `int main(){…}` program parses via Tokenizer+Parser directly
+    // (no PP) and is ingested via addTree — exactly as analyzeCSubsetRaisedCap does.
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    auto cu = dss::substrate::callOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes,
+        [&]() -> std::shared_ptr<CompilationUnit const> {
+            auto srcBuf = SourceBuffer::fromString(std::move(src), "<deepanalyze>");
+            Tokenizer tk{srcBuf, schema};
+            auto [stream, lexDiags] = std::move(tk).tokenize();
+            ParserConfig pcfg;
+            pcfg.maxExpressionDepth = static_cast<std::size_t>(kDepth) + 1000;
+            Parser p{srcBuf, schema, std::move(stream), std::move(pcfg),
+                     std::move(lexDiags)};
+            ParseResult result = std::move(p).parse();
+            if (result.tree.diagnostics().hasErrors())
+                ADD_FAILURE() << "deep nested-switch parse produced errors";
+            UnitBuilder builder{schema};
+            builder.addTree(std::move(result.tree));
+            return std::make_shared<CompilationUnit>(std::move(builder).finish());
+        });
+
+    // Pre-fix (recursive resolveDeclTypes): overflows the bounded reserve at kDepth
+    // → crash. Post-fix (flat driver): O(1) host stack → clean, error-free model.
+    SemanticModel model =
+        analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt, std::nullopt,
+                std::nullopt, /*deepRecursionReserveBytes=*/kAnalyzeReserveBytes);
+    EXPECT_FALSE(model.hasErrors())
+        << "deep nested-switch analysis must complete cleanly on a bounded stack "
+           "— Pass 1.5 resolveDeclTypes is a flat heap work-stack, not recursion";
+}
+
 // ─────────────────────────── FC-F1: ++/-- (Cluster F item F1) ───────────────
 // Prefix `++`/`--` (pre + post, integer + pointer). Postfix-int already worked
 // (IncrementInStatementPositionLowers / ValueYieldingIncrementLowersToSeqExpr);

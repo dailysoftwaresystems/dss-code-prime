@@ -4735,23 +4735,17 @@ resolveAutoInferredDeclaration(EngineState& s, SemanticConfig const& cfg,
 }
 
 // ── Pass 1.5: post-order — resolve declaration types + FnSigs ──────────────
-void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
-                      NodeId node, ScopeId current) {
-    if (!node.valid()) return;
-    if (isEmptySpace(tree.flags(node))) return;
-
-    // c32 D-CSUBSET-FNPTR-PARAM-SCOPE: re-derive the child scope via the SAME
-    // `nodeOpensChildScope` predicate Pass 1 used (anchor lookup finds whatever
-    // Pass 1 pushed — `current` when none), so the three passes never diverge.
-    ScopeId here = current;
-    if (nodeOpensChildScope(s, cfg, tree, node)) {
-        here = childScopeFor(s, tree, node, current);
-    }
-
-    for (auto const& child : tree.children(node)) {
-        resolveDeclTypes(s, cfg, tree, child, here);
-    }
-
+// D-PARSE-DEEP-NEST-RECURSION-MEMORY (plan 24 Stage 2, missed site): the POST-
+// CHILD work for ONE node — extracted for the iterative `resolveDeclTypes` driver
+// below (mirrors the pass2 / pass2Post split). Runs AFTER all descendants are
+// walked; `here` is this node's OWN resolved child scope (threaded by the driver,
+// identical to what the recursion passed each child). A `return;` here ends THIS
+// node's post-work and the driver loop continues — exactly as the recursive
+// `return;` did. The body is byte-identical to the prior post-child portion of
+// resolveDeclTypes; it reads only `here`/`node`/`s`/`cfg`/`tree` (never the
+// pre-part's `current`, which the recursion consumed ONLY to derive `here`).
+void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                          NodeId node, ScopeId here) {
     if (tree.kind(node) == NodeKind::Internal) {
         auto const rule = tree.rule(node);
         auto declIt = s.idx().declByRule.find(rule.v);
@@ -6006,6 +6000,63 @@ void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tre
                     }
                 }
             }
+        }
+    }
+}
+
+// ── Pass 1.5 driver: iterative whole-tree POST-ORDER walk ──────────────────
+// D-PARSE-DEEP-NEST-RECURSION-MEMORY (plan 24 Stage 2, missed site): an explicit
+// heap work-stack replaces host recursion so a deeply-nested tree (e.g. a
+// 1200-deep nested switch) carries flat O(N) host-stack cost instead of one host
+// frame per level — the recursive form overflowed the analysis worker's stack
+// under ASan's inflated frames (a `stack-use-after-scope` / `stack-overflow`).
+// Two phases per node — phase 0 resolves its child scope `here` + pushes its
+// children in SOURCE order; phase 1 runs `resolveDeclTypesPost` (the prior post-
+// child handling). OUTPUT-IDENTICAL to the recursion: same pre-order scope
+// resolution, same left-to-right child order, same post-order node handling. A
+// faithful mirror of `pass2` (which proved this exact transform) modulo
+// loopDepth, of which Pass 1.5 has none.
+void resolveDeclTypes(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
+                      NodeId rootNode, ScopeId rootCurrent) {
+    struct Frame {
+        NodeId       node;
+        ScopeId      current;
+        ScopeId      here;       // resolved at phase 0, consumed at phase 1
+        std::uint8_t phase;
+    };
+    std::vector<Frame> stack;
+    stack.push_back(Frame{rootNode, rootCurrent, {}, 0});
+    while (!stack.empty()) {
+        // Copy out the fields we need BEFORE any push_back (which can realloc
+        // and dangle a reference into `stack`).
+        Frame const f = stack.back();
+        if (f.phase == 0) {
+            if (!f.node.valid() || isEmptySpace(tree.flags(f.node))) {
+                stack.pop_back();
+                continue;
+            }
+            // c32 D-CSUBSET-FNPTR-PARAM-SCOPE: re-derive the child scope via the
+            // SAME `nodeOpensChildScope` predicate Pass 1 used (anchor lookup
+            // finds whatever Pass 1 pushed — `current` when none), so the three
+            // passes never diverge.
+            ScopeId here = f.current;
+            if (nodeOpensChildScope(s, cfg, tree, f.node)) {
+                here = childScopeFor(s, tree, f.node, f.current);
+            }
+            // Record `here` + advance to the post phase BEFORE pushing children.
+            stack.back().here  = here;
+            stack.back().phase = 1;
+            // Push children so they POP in source (left-to-right) order: a LIFO
+            // stack needs reverse insertion. Each child inherits `here` as its
+            // `current`, exactly as the recursive `resolveDeclTypes(child, here)`
+            // passed.
+            std::span<NodeId const> const kids = tree.children(f.node);
+            for (std::size_t i = kids.size(); i-- > 0;) {
+                stack.push_back(Frame{kids[i], here, {}, 0});
+            }
+        } else {
+            stack.pop_back();
+            resolveDeclTypesPost(s, cfg, tree, f.node, f.here);
         }
     }
 }
@@ -9108,7 +9159,8 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       std::optional<AggregateLayoutParams> aggregateLayout,
                       std::optional<VaListStrategy> vaListStrategy,
                       std::optional<ObjectFormatKind> activeFormat,
-                      std::optional<std::string_view> activeTarget) {
+                      std::optional<std::string_view> activeTarget,
+                      std::size_t deepRecursionReserveBytes) {
     // Run the recursive analysis on a dedicated large-stack worker thread
     // (JOIN-synchronous — no concurrency) so a deeply-nested-but-legal
     // expression tree does not overflow the host's ~1 MB main thread stack.
@@ -9117,8 +9169,17 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
     // artifact (`D-PARSE-DEEP-FRONTEND-STACK`). The null-CU + every other contract
     // check lives in `analyzeImpl`, which runs on the worker; any exception
     // it throws is re-thrown here by `callOnLargeStack`.
-    return dss::substrate::callOnLargeStack(
-        dss::substrate::kDeepRecursionStackBytes, [&] {
+    //
+    // The reserve is the standard 64 MiB (`kDeepRecursionStackBytes`) unless the
+    // caller passes a smaller, BOUNDED reserve (the `0` sentinel ⇒ default) —
+    // the deep-nest regression pins do so to witness that the Pass-1.5/Pass-2
+    // walks are FLAT (explicit heap work-stacks, O(1) host stack per level): the
+    // analysis completes on the bounded reserve where a would-be per-level
+    // recursion would overflow it.
+    std::size_t const reserveBytes =
+        deepRecursionReserveBytes != 0 ? deepRecursionReserveBytes
+                                       : dss::substrate::kDeepRecursionStackBytes;
+    return dss::substrate::callOnLargeStack(reserveBytes, [&] {
             return analyzeImpl(std::move(cu), dataModel, std::move(aggregateLayout),
                                std::move(vaListStrategy), std::move(activeFormat),
                                std::move(activeTarget));
