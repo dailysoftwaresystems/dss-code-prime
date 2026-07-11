@@ -489,6 +489,9 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                      ccIndex, cuMirs[0].cuId,
                                      (*formatR)->externCallDispatch(),
                                      (*formatR)->dataImportBinding(),
+                                     // TLS C1 (D-CSUBSET-THREAD-LOCAL): the
+                                     // format's thread-local access block.
+                                     (*formatR)->tlsAccess(),
                                      std::move(sehScopes),
                                      reporter);
     if (!mod) return false;  // back-half tier failure already reported via `reporter`

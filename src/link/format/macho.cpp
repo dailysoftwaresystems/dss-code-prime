@@ -160,6 +160,50 @@ constexpr std::uint32_t S_NON_LAZY_SYMBOL_POINTERS = 0x6;
 constexpr std::uint32_t S_SYMBOL_STUBS             = 0x8;
 constexpr std::uint32_t S_ATTR_SOME_INSTRUCTIONS   = 0x00000400u;
 constexpr std::uint32_t S_ATTR_PURE_INSTRUCTIONS   = 0x80000000u;
+// D-CSUBSET-THREAD-LOCAL (TLS C4): the thread-local section TYPES
+// (<mach-o/loader.h>). dyld recognizes a thread-local template by these
+// exact section_64.flags values: S_THREAD_LOCAL_REGULAR marks the
+// initialized template it COPIES per thread, S_THREAD_LOCAL_ZEROFILL the
+// zero-fill tail (calloc'd), S_THREAD_LOCAL_VARIABLES the descriptor array
+// it walks to fill each thunk/key. The __thread_data/__thread_bss/
+// __thread_vars section ROWS in the format JSON carry these as their
+// `type`; the writer cross-checks the config values against these
+// constants (fail loud on drift — a wrong flag makes dyld ignore the TLV
+// setup, an unrunnable-on-Mac miscompile this host cannot catch at run
+// time).
+constexpr std::uint32_t S_THREAD_LOCAL_REGULAR     = 0x11;
+constexpr std::uint32_t S_THREAD_LOCAL_ZEROFILL    = 0x12;
+constexpr std::uint32_t S_THREAD_LOCAL_VARIABLES   = 0x13;
+// D-CSUBSET-THREAD-LOCAL (TLS C4 runtime-closure): the mach_header_64.flags bit
+// dyld ALSO gates TLV setup on. The correct S_THREAD_LOCAL_* section types (above)
+// are necessary but NOT sufficient — dyld only walks __thread_vars and rewrites
+// each descriptor's word0 thunk to the real tlv_get_addr when the image header
+// advertises MH_HAS_TLV_DESCRIPTORS. WITHOUT it, dyld leaves every word0 bound to
+// __tlv_bootstrap, whose thunk aborts the instant a thread_local is accessed —
+// perfect section flags + descriptor binds, yet a runtime SIGABRT (the exact
+// gap the arm64 witness caught: byte-pins green on a non-Mac host, dyld
+// `_tlv_bootstrap_error`→abort on native execution). clang sets this bit iff the
+// image has thread-locals; this writer ORs it into the header flags when hasTls.
+constexpr std::uint32_t MH_HAS_TLV_DESCRIPTORS     = 0x00800000u;
+// Each `tlv_descriptor` is 3 native words (thunk / key / offset).
+constexpr std::uint64_t kTlvDescriptorSize         = 24;
+// The on-disk symbol every TLV descriptor's word0 binds to: the libSystem
+// bootstrap thunk. Apple's runtime declares the C function `_tlv_bootstrap`
+// (one leading underscore, a reserved-namespace runtime name); the Apple C
+// ABI prepends ONE more underscore for the on-disk symbol, so the linked
+// image references `__tlv_bootstrap` (TWO underscores) — exactly as this
+// format's `_exit` import is the on-disk name of C `exit`. dyld overwrites
+// each bound word0 with its real tlv_get_addr at load; the bootstrap itself
+// aborts if ever called (it never is). Verified against Apple's
+// threadLocalVariables.c (`void _tlv_bootstrap(){ abort(); }`) + the
+// leading-underscore C-ABI rule this format already encodes for `_exit`.
+constexpr std::string_view kTlvBootstrapSymbol = "__tlv_bootstrap";
+// The dylib that exports `__tlv_bootstrap`: libSystem (every macOS process
+// links it; it is also this format's `_exit` home + the sole loadDylib). The
+// writer looks up its bind ORDINAL via `dylibOrdinal` and fails loud if the
+// image does not declare it in loadDylibs (a config that dropped libSystem).
+constexpr std::string_view kTlvBootstrapLibrary =
+    "/usr/lib/libSystem.B.dylib";
 
 // dyld bind opcodes (<mach-o/loader.h>) — consumed by the dynamic
 // arm's bind-stream emitter.
@@ -1561,6 +1605,165 @@ encodeExecDynamic(AssembledModule const&    module,
         fmt.sectionByKind(SectionKind::Data);
     ObjectFormatSectionInfo const* secBss =
         fmt.sectionByKind(SectionKind::Bss);
+    // ── D-CSUBSET-THREAD-LOCAL (TLS C4): the Mach-O TLV template + descriptors.
+    //
+    // A thread-local object is reached on macOS by CALLING THROUGH its
+    // `tlv_descriptor` (there is NO tp-relative TLS). This walker lays out
+    // THREE __DATA sections + mints one descriptor per thread-local:
+    //   __thread_data (S_THREAD_LOCAL_REGULAR)  — the initialized template
+    //                                             dyld copies per thread;
+    //   __thread_bss  (S_THREAD_LOCAL_ZEROFILL) — the zero-init tail (dyld
+    //                                             calloc's the block),
+    //                                             CONTIGUOUS after
+    //                                             __thread_data so the
+    //                                             per-thread block is ONE span;
+    //   __thread_vars (S_THREAD_LOCAL_VARIABLES)— the 24-byte descriptors
+    //                                             { thunk / key / offset }.
+    // The access lea (mir_to_lir macho-tlv arm) references the thread-local
+    // SYMBOL via an ORDINARY reloc; the writer binds symbolVa[sym] to that
+    // symbol's DESCRIPTOR VA (F3), so the adrp/add resolves to the descriptor.
+    // word0 is bound to the undefined libSystem `__tlv_bootstrap` (CRIT-3);
+    // word2 is the variable's 0-based offset into the [__thread_data,
+    // __thread_bss] block (CRIT-2). The whole arm is gated on `hasTls` — an
+    // empty thread-local set leaves the output byte-identical to the pre-TLS
+    // image (the sqlite-dormant control).
+    ObjectFormatSectionInfo const* secTdata =
+        fmt.sectionByKind(SectionKind::ThreadData);
+    ObjectFormatSectionInfo const* secTbss =
+        fmt.sectionByKind(SectionKind::ThreadBss);
+    ObjectFormatSectionInfo const* secTvars =
+        fmt.sectionByKind(SectionKind::ThreadVars);
+    // The tdata template: `allowItemRelocations=false` — a reloc-bearing
+    // template item (`thread_local char *msg = "hi";`) is DEFERRED on macho
+    // (PIE-rebasing a per-thread template pointer is unverifiable without a
+    // Mac; buildExecDataSection fails loud on such an item — its existing
+    // D-LK1-ELF-RODATA-DATAITEM-RELOC reject — rather than ship a silently-
+    // unbiased pointer; a Mac-verified path would re-open it under
+    // D-CSUBSET-THREAD-LOCAL).
+    auto const tdataLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Tdata,
+        secTdata != nullptr ? secTdata->addrAlign : 1,
+        "macho::encodeExecDynamic", reporter, /*allowItemRelocations=*/false);
+    if (!tdataLayoutOpt.has_value()) return {};
+    auto const& tdataLayout = *tdataLayoutOpt;
+    auto const tbssLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Tbss,
+        secTbss != nullptr ? secTbss->addrAlign : 1,
+        "macho::encodeExecDynamic", reporter);
+    if (!tbssLayoutOpt.has_value()) return {};
+    auto const& tbssLayout = *tbssLayoutOpt;
+    bool const hasTdata = !tdataLayout.empty();
+    bool const hasTbss  = !tbssLayout.empty();
+    bool const hasTls   = hasTdata || hasTbss;
+    // Each present section's schema row is MANDATORY (the format opted into
+    // tdata/tbss via supportedDataSections; a missing row is a config bug),
+    // the tlsAccess model must be macho-tlv, and each section type MUST be the
+    // exact S_THREAD_LOCAL_* dyld recognizes — cross-check the config against
+    // the spec constants (a wrong flag makes dyld skip the TLV setup, an
+    // on-Mac-only miscompile this host cannot catch at run time).
+    if (hasTls) {
+        // The __tlv_bootstrap descriptor binds are emitted in the LEGACY
+        // LC_DYLD_INFO_ONLY stream (below). The chained-fixups path encodes
+        // binds as inline DYLD_CHAINED_PTR_64 bitfields — a different
+        // mechanism this writer does not emit for descriptors. The shipped
+        // darwin formats use the legacy path (useChainedFixups=false); fail
+        // loud rather than drop the descriptor binds silently if enabled.
+        if (im.useChainedFixups) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 "macho::encodeExecDynamic: thread-local storage requires the "
+                 "legacy LC_DYLD_INFO_ONLY bind stream for its __tlv_bootstrap "
+                 "descriptor binds, but image.useChainedFixups=true — set it "
+                 "false for a TLS-bearing module (D-CSUBSET-THREAD-LOCAL).");
+            return {};
+        }
+        if (secTdata == nullptr || secTvars == nullptr
+            || (hasTbss && secTbss == nullptr)) {
+            emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+                 "macho::encodeExecDynamic: module carries thread-local items "
+                 "but the format is missing a __thread_data / __thread_bss / "
+                 "__thread_vars section row (D-CSUBSET-THREAD-LOCAL).");
+            return {};
+        }
+        if (!fmt.tlsAccess().has_value()
+            || fmt.tlsAccess()->model != TlsAccessModel::MachoTlv) {
+            emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+                 "macho::encodeExecDynamic: module carries thread-local items "
+                 "but the format declares no tlsAccess{model:\"macho-tlv\"} — "
+                 "the writer cannot mint TLV descriptors "
+                 "(D-CSUBSET-THREAD-LOCAL).");
+            return {};
+        }
+        if (secTdata->type != S_THREAD_LOCAL_REGULAR
+            || secTvars->type != S_THREAD_LOCAL_VARIABLES
+            || (hasTbss && secTbss->type != S_THREAD_LOCAL_ZEROFILL)) {
+            emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+                 std::format(
+                     "macho::encodeExecDynamic: a __thread_* section row "
+                     "declares the wrong section type — expected "
+                     "S_THREAD_LOCAL_REGULAR(0x11)/_ZEROFILL(0x12)/"
+                     "_VARIABLES(0x13); got tdata=0x{:x} tbss=0x{:x} "
+                     "tvars=0x{:x}. dyld keys the TLV template on these exact "
+                     "flags (D-CSUBSET-THREAD-LOCAL).",
+                     secTdata->type, hasTbss ? secTbss->type : 0u,
+                     secTvars->type));
+            return {};
+        }
+    }
+    // ── M-3 (D-CSUBSET-THREAD-LOCAL-MACHO-OVERALIGN): FAIL LOUD on a
+    // thread-local requiring > 16-byte alignment. Reuses the format-generic
+    // K_ThreadLocalOveralignedForFormat (0x8016, C3). Mach-O CAN express a
+    // section align, but whether dyld over-aligns the per-thread TLV block
+    // base beyond malloc's 16 is UNVERIFIABLE without a Mac — conservative +
+    // consistent with the PE leg, never a silent under-align. A normal
+    // scalar/pointer/small aggregate (incl. _Alignas(16)) passes.
+    constexpr std::uint64_t kMachoTlvBlockBaseAlign = 16;
+    std::uint64_t tlsMaxAlign = 1;
+    if (hasTdata) tlsMaxAlign = std::max(tlsMaxAlign, tdataLayout.maxAlign);
+    if (hasTbss)  tlsMaxAlign = std::max(tlsMaxAlign, tbssLayout.maxAlign);
+    if (hasTls && tlsMaxAlign > kMachoTlvBlockBaseAlign) {
+        emit(reporter, DiagnosticCode::K_ThreadLocalOveralignedForFormat,
+             std::format(
+                 "macho::encodeExecDynamic: a thread-local object requires "
+                 "{}-byte alignment, but this leg guarantees only {}-byte "
+                 "per-thread TLV block-base alignment (dyld's malloc'd block) "
+                 "and does not over-align it — the per-thread copy would be "
+                 "silently under-aligned "
+                 "(D-CSUBSET-THREAD-LOCAL-MACHO-OVERALIGN).",
+                 tlsMaxAlign, kMachoTlvBlockBaseAlign));
+        return {};
+    }
+    // Per-thread block geometry (CRIT-2): the initialized template
+    // (`tdataSpan` bytes) then the zero-fill tail at its aligned base. A
+    // descriptor's word2 (offset) is measured from block byte 0.
+    std::uint64_t const tdataSpan = tdataLayout.spanSize;   // 0 if none
+    std::uint64_t const tbssBlockBase =
+        alignUp(tdataSpan,
+                std::max<std::uint64_t>(1, hasTbss ? tbssLayout.maxAlign : 1));
+    std::uint64_t const tlsBlockMemsz =
+        hasTbss ? tbssBlockBase + tbssLayout.spanSize : tdataSpan;
+    // One descriptor per NAMED thread-local (anonymous SymbolId{} items are
+    // offset-referenced, never accessed by symbol — M1 mirror). Count now so
+    // __thread_vars can be SIZED in the early-VA layout below; the descriptor
+    // VAs + word2 + binds are minted there (once tvarsVa is known).
+    std::uint64_t numTlsDescriptors = 0;
+    for (std::size_t j = 0; j < tdataLayout.itemIndices.size(); ++j)
+        if (module.dataItems[tdataLayout.itemIndices[j]].symbol != SymbolId{})
+            ++numTlsDescriptors;
+    for (std::size_t j = 0; j < tbssLayout.itemIndices.size(); ++j)
+        if (module.dataItems[tbssLayout.itemIndices[j]].symbol != SymbolId{})
+            ++numTlsDescriptors;
+    bool const hasTvars = numTlsDescriptors > 0;
+    std::uint64_t const tvarsSize = numTlsDescriptors * kTlvDescriptorSize;
+    // ── TLS C4 (M-2 / audit FOLD-1): the segment index the __tlv_bootstrap
+    // descriptor binds target. __DATA is the 4th LC_SEGMENT_64 (index 3) —
+    // __PAGEZERO(0)/__TEXT(1)/__DATA_CONST(2) are UNCONDITIONAL, then __DATA
+    // (present because hasTls ⇒ hasDataSeg). Correct-by-invariant, but macho
+    // CANNOT be runtime-tested on this host — a future segment-layout change
+    // would SILENTLY bind the descriptors to the wrong segment (a Mac crash
+    // invisible to every local pin). The segment-emission loop below
+    // CROSS-CHECKS the ACTUAL emitted __DATA index against THIS value and fails
+    // loud on any mismatch (never a silent wrong-segment bind).
+    constexpr std::uint32_t kTlvDescriptorBindSegIndex = 3;
     // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): allowItemRelocations=true — symbol-
     // address global pointers carry abs64 data→data relocs patched in place below
     // (after symbolVa). MUTABLE layouts so applyDataItemRelocations fixes the bytes.
@@ -1585,7 +1788,9 @@ encodeExecDynamic(AssembledModule const&    module,
     bool const hasConst = !constLayout.empty();
     bool const hasData  = !dataLayout.empty();
     bool const hasBss   = !bssLayout.empty();
-    bool const hasDataSeg = hasData || hasBss;   // needs a __DATA segment
+    // TLS C4: the three __thread_* sections also live in __DATA, so any
+    // thread-local forces the writable segment even with no ordinary globals.
+    bool const hasDataSeg = hasData || hasBss || hasTls;   // needs __DATA
     std::uint64_t const constSize = constLayout.spanSize;
     // Each present section's schema row is MANDATORY — fail loud (the format
     // JSON must declare it). The rows feed the section_64 records below.
@@ -1669,13 +1874,36 @@ encodeExecDynamic(AssembledModule const&    module,
     }
     std::uint64_t const dataSegVaEarly =
         hasDataSeg ? alignUp(dataConstEndVaEarly, kPageSize) : 0;
+    // __DATA section VA chain (D-LK4-DATA-PRODUCER + TLS C4). Order:
+    //   __data (file) → __thread_vars (file, descriptors) → __thread_data
+    //   (file, template START) → __thread_bss (zero-fill) → __bss (zero-fill).
+    // The two zero-fill sections tail the segment (no file bytes). __thread_data
+    // and __thread_bss are CONTIGUOUS (nothing between them) so dyld's
+    // per-thread template region is one span; __thread_data is aligned to the
+    // strictest thread-local alignment so a tbss var's block offset is exactly
+    // tbssBlockBase + itemOffset (CRIT-2). Every VA derives from a running
+    // cursor; the LATE layout recomputes each via file-offset deltas + asserts
+    // congruence.
+    std::uint64_t dataCursor = dataSegVaEarly;
     std::uint64_t const dataSecVa =
-        hasData ? alignUp(dataSegVaEarly, dataLayout.maxAlign) : 0;
+        hasData ? alignUp(dataCursor, dataLayout.maxAlign) : 0;
+    if (hasData) dataCursor = dataSecVa + dataLayout.spanSize;
+    std::uint64_t const tvarsVa =
+        hasTvars ? alignUp(dataCursor,
+                           std::max<std::uint64_t>(1, secTvars->addrAlign))
+                 : 0;
+    if (hasTvars) dataCursor = tvarsVa + tvarsSize;
+    std::uint64_t const tdataVa =
+        hasTdata ? alignUp(dataCursor, std::max<std::uint64_t>(1, tlsMaxAlign))
+                 : 0;
+    if (hasTdata) dataCursor = tdataVa + tdataSpan;
+    std::uint64_t const tbssVa =
+        hasTbss ? alignUp(dataCursor,
+                          std::max<std::uint64_t>(1, tbssLayout.maxAlign))
+                : 0;
+    if (hasTbss) dataCursor = tbssVa + tbssLayout.spanSize;
     std::uint64_t const bssSecVa =
-        hasBss ? alignUp((hasData ? dataSecVa + dataLayout.spanSize
-                                  : dataSegVaEarly),
-                         bssLayout.maxAlign)
-               : 0;
+        hasBss ? alignUp(dataCursor, bssLayout.maxAlign) : 0;
     if (hasData
         && !link::format::addDataSymbolVas(
                module.dataItems, dataLayout, dataSecVa,
@@ -1687,6 +1915,85 @@ encodeExecDynamic(AssembledModule const&    module,
                module.dataItems, bssLayout, bssSecVa,
                symbolVa, "macho::encodeExecDynamic", reporter)) {
         return {};
+    }
+    // ── TLS C4: mint one descriptor per NAMED thread-local. HERE symbolVa[sym]
+    // becomes the DESCRIPTOR VA (F3 — NOT the storage VA: addDataSymbolVas is
+    // deliberately NOT called for the tdata/tbss layouts; the template BYTES
+    // are addressed only through the descriptor at run time). word2 is the
+    // var's 0-based block offset (CRIT-2); `tlsDataSymbols` records the
+    // thread-local symbols for the CRIT-1 arm-(a) backstop. Descriptors are
+    // ordered: named tdata items, then named tbss items — the SAME order the
+    // bind stream + the __thread_vars body emit.
+    if (hasTbss && hasTdata && tbssVa != tdataVa + tbssBlockBase) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("macho::encodeExecDynamic: TLV block congruence "
+                         "broken — tbssVa(0x{:x}) != tdataVa(0x{:x}) + "
+                         "tbssBlockBase(0x{:x}); a tbss var's descriptor "
+                         "offset would not be block-relative "
+                         "(D-CSUBSET-THREAD-LOCAL, CRIT-2).",
+                         tbssVa, tdataVa, tbssBlockBase));
+        return {};
+    }
+    std::vector<std::uint64_t> descriptorWord2;   // parallel to descriptor index
+    descriptorWord2.reserve(static_cast<std::size_t>(numTlsDescriptors));
+    std::unordered_set<SymbolId> tlsDataSymbols;
+    {
+        std::uint64_t descIdx = 0;
+        auto mintDescriptors =
+            [&](auto const& layout, std::uint64_t blockBaseOffset) -> bool {
+            for (std::size_t j = 0; j < layout.itemIndices.size(); ++j) {
+                auto const& di = module.dataItems[layout.itemIndices[j]];
+                if (di.symbol == SymbolId{}) continue;   // M1 mirror
+                std::uint64_t const descriptorVa =
+                    tvarsVa + descIdx * kTlvDescriptorSize;
+                std::uint64_t const word2 =
+                    blockBaseOffset + layout.itemOffsets[j];
+                if (!symbolVa.emplace(di.symbol, descriptorVa).second) {
+                    emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
+                         std::format("macho::encodeExecDynamic: thread-local "
+                                     "data SymbolId={{ {} }} collides with "
+                                     "another symbol (D-CSUBSET-THREAD-LOCAL).",
+                                     di.symbol.v));
+                    return false;
+                }
+                tlsDataSymbols.insert(di.symbol);
+                descriptorWord2.push_back(word2);
+                ++descIdx;
+            }
+            return true;
+        };
+        if (!mintDescriptors(tdataLayout, 0)) return {};
+        if (!mintDescriptors(tbssLayout, tbssBlockBase)) return {};
+    }
+    // ── ★ CRIT-1 arm-(a) backstop (D-CSUBSET-THREAD-LOCAL): symbolVa[tls sym]
+    // is now a DESCRIPTOR VA read by the ORDINARY access reloc. Unlike ELF/PE,
+    // macho does NOT register these in a `tlsSymbols` set and does NOT run the
+    // reloc-kind XOR (arm b) — that would FALSE-REJECT the legitimate ordinary
+    // access reloc (kinds 2/3 adr_prel_pg_hi21/add_abs_lo12_nc against a TLS
+    // sym). But a DATA-ITEM reloc targeting a thread-local (`int *p = &t;`) must
+    // STILL be rejected: it would embed the descriptor VA as `p`'s value — a
+    // process-shared pointer, NOT the per-thread address (C11 6.6p9; the
+    // semantic tier rejects `&t` as 0xE048). Police every data-item reloc BEFORE
+    // applyDataItemRelocations patches it.
+    if (!tlsDataSymbols.empty()) {
+        for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+            for (auto const& rel : module.dataItems[i].relocations) {
+                if (tlsDataSymbols.contains(rel.target)) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format(
+                             "macho::encodeExecDynamic: data item #{} "
+                             "(SymbolId={{ {} }}) carries a relocation targeting "
+                             "THREAD-LOCAL symbol #{} — the address of a "
+                             "thread-local object is not a link-time constant "
+                             "(C11 6.6p9; the semantic tier rejects this as "
+                             "0xE048). Patching it would embed the descriptor VA "
+                             "as a process-shared pointer "
+                             "(D-CSUBSET-THREAD-LOCAL, CRIT-1).",
+                             i, module.dataItems[i].symbol.v, rel.target.v));
+                    return {};
+                }
+            }
+        }
     }
 
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols get their
@@ -1931,6 +2238,56 @@ encodeExecDynamic(AssembledModule const&    module,
                 static_cast<std::uint64_t>(i) * kGotSlotSize);
             dyldBindBlob.push_back(BIND_OPCODE_DO_BIND);
         }
+        // ── ★ TLS C4 (D-CSUBSET-THREAD-LOCAL, CRIT-3): bind each TLV
+        // descriptor's word0 to the undefined libSystem `__tlv_bootstrap`
+        // thunk. Unlike the extern binds above (which target __got slots in
+        // __DATA_CONST), these target the __thread_vars descriptors in __DATA
+        // (segment index 3 — __PAGEZERO=0/__TEXT=1/__DATA_CONST=2/__DATA=3,
+        // present because hasTls ⇒ hasDataSeg; the SAME index the F5 rebase
+        // stream uses — M-2: derived from the fixed emission order). All
+        // descriptors share one symbol + dylib, so set ordinal+symbol+type
+        // ONCE, then per descriptor SET_SEGMENT_AND_OFFSET + DO_BIND. word0 is
+        // at descriptor offset 0, so the bind offset within __DATA =
+        // (tvarsVa − dataSegVmaddr) + descIdx*24. dyld overwrites each bound
+        // word0 with its real tlv_get_addr at load; the access `blr`s through
+        // it. A wrong/missing bind = a `blr` through garbage = a Mac crash
+        // invisible to any non-bind-decoding pin, so a test decodes this stream.
+        if (hasTvars) {
+            std::uint32_t const tlvOrd =
+                dylibOrdinal(std::string{kTlvBootstrapLibrary});
+            if (tlvOrd == 0) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::format("macho::encodeExecDynamic: the TLV bootstrap "
+                                 "library '{}' is not in image.loadDylibs — "
+                                 "cannot bind __tlv_bootstrap "
+                                 "(D-CSUBSET-THREAD-LOCAL).",
+                                 kTlvBootstrapLibrary));
+                return {};
+            }
+            std::uint64_t const tvarsOffsetInSeg = tvarsVa - dataSegVaEarly;
+            if (tlvOrd <= 0x0F) {
+                dyldBindBlob.push_back(static_cast<std::uint8_t>(
+                    BIND_OPCODE_SET_DYLIB_ORDINAL_IMM |
+                    static_cast<std::uint8_t>(tlvOrd & 0x0F)));
+            } else {
+                dyldBindBlob.push_back(BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB);
+                appendULEB128(dyldBindBlob, tlvOrd);
+            }
+            dyldBindBlob.push_back(static_cast<std::uint8_t>(
+                BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | 0));
+            for (char c : kTlvBootstrapSymbol)
+                dyldBindBlob.push_back(static_cast<std::uint8_t>(c));
+            dyldBindBlob.push_back(0);  // NUL terminator
+            dyldBindBlob.push_back(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
+            for (std::uint64_t d = 0; d < numTlsDescriptors; ++d) {
+                dyldBindBlob.push_back(static_cast<std::uint8_t>(
+                    BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
+                    | (kTlvDescriptorBindSegIndex & 0x0Fu)));
+                appendULEB128(dyldBindBlob,
+                              tvarsOffsetInSeg + d * kTlvDescriptorSize);
+                dyldBindBlob.push_back(BIND_OPCODE_DO_BIND);
+            }
+        }
         dyldBindBlob.push_back(BIND_OPCODE_DONE);
         // dyld parses the bind stream byte-by-byte; pad to 8 for
         // load-command alignment downstream.
@@ -2016,11 +2373,14 @@ encodeExecDynamic(AssembledModule const&    module,
         kSegmentCommand64Size + kSection64Size * (hasConst ? 3u : 2u);
     constexpr std::size_t kSegCmdDataConstSize =
         kSegmentCommand64Size + kSection64Size;      // __got
-    // __DATA segment (D-LK4-DATA-PRODUCER) — one LC_SEGMENT_64 + a section_64
-    // per present writable section (__data and/or __bss). Absent when the module
-    // has no writable globals (byte-identical to the pre-data image).
+    // __DATA segment (D-LK4-DATA-PRODUCER + TLS C4) — one LC_SEGMENT_64 + a
+    // section_64 per present writable section: __data, __thread_vars,
+    // __thread_data, __thread_bss, __bss (the three TLS sections are added by
+    // hasTvars/hasTdata/hasTbss). Absent when the module has none (byte-
+    // identical to the pre-data image).
     std::uint32_t const dataSegNsects =
-        (hasData ? 1u : 0u) + (hasBss ? 1u : 0u);
+        (hasData ? 1u : 0u) + (hasTvars ? 1u : 0u) + (hasTdata ? 1u : 0u)
+        + (hasTbss ? 1u : 0u) + (hasBss ? 1u : 0u);
     std::size_t const kSegCmdDataSize =
         hasDataSeg
             ? kSegmentCommand64Size + kSection64Size * dataSegNsects
@@ -2149,38 +2509,80 @@ encodeExecDynamic(AssembledModule const&    module,
     // above must match — asserted fail-loud below.
     std::uint64_t const dataSegFileOff =
         hasDataSeg ? alignUp(gotFileOff + gotFileSize, kPageSize) : 0;
+    // ── __DATA section LATE layout (D-LK4-DATA-PRODUCER + TLS C4). File-backed
+    // chain: __data → __thread_vars → __thread_data; then the zero-fill tail
+    // __thread_bss → __bss (VM only). File-backed VAs use the sectionVa+(off−
+    // textFileOff) identity (valid because NO zero-fill precedes them in
+    // __DATA); the zero-fill VAs chain in VM. Each equals its EARLY counterpart
+    // (asserted below) so a `.text`/descriptor reloc resolved against the early
+    // VA lands on the right bytes.
+    std::uint64_t fileCursor = dataSegFileOff;
     std::uint64_t const dataSecFileOff =
-        hasData ? alignUp(dataSegFileOff, dataLayout.maxAlign) : 0;
+        hasData ? alignUp(fileCursor, dataLayout.maxAlign) : 0;
     std::uint64_t const dataSecFileSize = dataLayout.spanSize;
+    if (hasData) fileCursor = dataSecFileOff + dataSecFileSize;
+    std::uint64_t const tvarsFileOff =
+        hasTvars ? alignUp(fileCursor,
+                           std::max<std::uint64_t>(1, secTvars->addrAlign))
+                 : 0;
+    if (hasTvars) fileCursor = tvarsFileOff + tvarsSize;
+    std::uint64_t const tdataFileOff =
+        hasTdata ? alignUp(fileCursor, std::max<std::uint64_t>(1, tlsMaxAlign))
+                 : 0;
+    if (hasTdata) fileCursor = tdataFileOff + tdataSpan;
+    std::uint64_t const dataSegLastFileEnd = fileCursor;  // end of file-backed
     std::uint64_t const dataSecVaLate =
         hasData ? sectionVa + (dataSecFileOff - textFileOff) : 0;
-    // __bss VA follows __data in VM (zero-fill — no file bytes consumed).
+    std::uint64_t const tvarsVaLate =
+        hasTvars ? sectionVa + (tvarsFileOff - textFileOff) : 0;
+    std::uint64_t const tdataVaLate =
+        hasTdata ? sectionVa + (tdataFileOff - textFileOff) : 0;
+    // Zero-fill VM chain: after the last file-backed section, __thread_bss then
+    // __bss consume VM only (no file bytes).
+    std::uint64_t vmCursor =
+        hasTdata   ? tdataVaLate + tdataSpan
+        : hasTvars ? tvarsVaLate + tvarsSize
+        : hasData  ? dataSecVaLate + dataSecFileSize
+                   : sectionVa + (dataSegFileOff - textFileOff);
+    std::uint64_t const tbssVaLate =
+        hasTbss ? alignUp(vmCursor,
+                          std::max<std::uint64_t>(1, tbssLayout.maxAlign))
+                : 0;
+    if (hasTbss) vmCursor = tbssVaLate + tbssLayout.spanSize;
     std::uint64_t const bssSecVaLate =
-        hasBss ? alignUp((hasData ? dataSecVaLate + dataSecFileSize
-                                  : sectionVa + (dataSegFileOff - textFileOff)),
-                         bssLayout.maxAlign)
-               : 0;
-    std::uint64_t const bssSecSize = bssLayout.spanSize;
-    // Congruence self-check: the EARLY VAs (used for reloc resolution) MUST
-    // equal the LATE layout VAs (used in the section_64 records). A mismatch
-    // would silently place a global's bytes at a different VA than the address
-    // a `.text` reloc was resolved to → wrong runtime value. Fail loud.
-    if ((hasData && dataSecVa != dataSecVaLate)
-        || (hasBss && bssSecVa != bssSecVaLate)) {
+        hasBss ? alignUp(vmCursor, bssLayout.maxAlign) : 0;
+    if (hasBss) vmCursor = bssSecVaLate + bssLayout.spanSize;
+    std::uint64_t const bssSecSize  = bssLayout.spanSize;
+    std::uint64_t const tbssSecSize = tbssLayout.spanSize;
+    // Congruence self-check: EARLY (reloc/descriptor-time) VAs == LATE
+    // (section-record) VAs. A mismatch would place a global's / template's
+    // bytes at a different VA than the address a reloc resolved to. Fail loud.
+    if ((hasData   && dataSecVa != dataSecVaLate)
+        || (hasBss   && bssSecVa  != bssSecVaLate)
+        || (hasTvars && tvarsVa   != tvarsVaLate)
+        || (hasTdata && tdataVa   != tdataVaLate)
+        || (hasTbss  && tbssVa    != tbssVaLate)) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
              std::format("macho::encodeExecDynamic: __DATA VA congruence "
-                         "broken — early/late mismatch (data early=0x{:x} "
-                         "late=0x{:x}; bss early=0x{:x} late=0x{:x}). The "
-                         "reloc-time and section-record VAs must agree "
-                         "(D-LK4-DATA-PRODUCER).",
-                         dataSecVa, dataSecVaLate, bssSecVa, bssSecVaLate));
+                         "broken — early/late mismatch (data 0x{:x}/0x{:x} "
+                         "bss 0x{:x}/0x{:x} tvars 0x{:x}/0x{:x} tdata "
+                         "0x{:x}/0x{:x} tbss 0x{:x}/0x{:x}). The reloc-time and "
+                         "section-record VAs must agree (D-LK4-DATA-PRODUCER / "
+                         "D-CSUBSET-THREAD-LOCAL).",
+                         dataSecVa, dataSecVaLate, bssSecVa, bssSecVaLate,
+                         tvarsVa, tvarsVaLate, tdataVa, tdataVaLate,
+                         tbssVa, tbssVaLate));
         return {};
     }
-    // __DATA segment VM/file extents. filesize covers __data only (__bss adds
-    // none); vmsize covers __data + __bss, page-rounded.
+    // __DATA segment VM/file extents. filesize covers the file-backed sections
+    // (__data + __thread_vars + __thread_data); vmsize covers all incl. the
+    // zero-fill tail, page-rounded (below).
     std::uint64_t const dataSegVmaddr =
         hasDataSeg ? sectionVa + (dataSegFileOff - textFileOff) : 0;
-    std::uint64_t const dataSegFileSize = hasData ? dataSecFileSize : 0;
+    bool const hasDataSegFile = hasData || hasTvars || hasTdata;
+    std::uint64_t const dataSegFileSize =
+        hasDataSegFile ? (dataSegLastFileEnd - dataSegFileOff) : 0;
+    std::uint64_t const dataSegVmEnd = hasDataSeg ? vmCursor : 0;
 
     // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): the LC_DYLD_INFO_ONLY REBASE opcode
     // stream for the __DATA abs64 pointer sites collected after symbolVa was
@@ -2222,9 +2624,7 @@ encodeExecDynamic(AssembledModule const&    module,
         while (dyldRebaseBlob.size() % kLoadCmdAlign != 0)
             dyldRebaseBlob.push_back(0);
     }
-    std::uint64_t const dataSegVmEnd =
-        hasBss ? (bssSecVaLate + bssSecSize)
-               : (hasData ? dataSecVaLate + dataSecFileSize : dataSegVmaddr);
+    // (dataSegVmEnd was computed above with the TLS-aware VM cursor.)
     std::uint64_t const dataSegVmsize =
         hasDataSeg ? alignUp(dataSegVmEnd - dataSegVmaddr, kPageSize) : 0;
 
@@ -2342,17 +2742,18 @@ encodeExecDynamic(AssembledModule const&    module,
         }
     }
 
-    // __LINKEDIT contents — page-aligned after the last FILE-BACKED segment:
-    // __data (when present, D-LK4-DATA-PRODUCER) else __DATA_CONST (the GOT).
-    // ★ Gate on `hasData`, NOT `hasDataSeg`: a __DATA segment that holds ONLY
-    // __bss (S_ZEROFILL) consumes NO file bytes (`dataSecFileOff`/`dataSecFileSize`
-    // are both 0 when `!hasData`), so __LINKEDIT must follow the GOT's file end,
-    // not `dataSecFileOff + dataSecFileSize` (= 0 for a bss-only __DATA, which
-    // would put __LINKEDIT at file offset 0 — over the mach header — and produce
-    // an unspawnable binary). __bss adds VM extent only, never file extent.
+    // __LINKEDIT contents — page-aligned after the last FILE-BACKED segment.
+    // ★ Gate on `hasDataSegFile` (__data OR __thread_vars OR __thread_data),
+    // NOT `hasDataSeg`: a __DATA segment holding ONLY zero-fill sections
+    // (__bss / __thread_bss) consumes NO file bytes, so __LINKEDIT must follow
+    // the GOT's file end, not the (0-length) file-backed extent — else it lands
+    // at file offset 0 over the mach header (an unspawnable binary). When any
+    // file-backed __DATA section exists, __LINKEDIT follows its end
+    // (`dataSegLastFileEnd`, the TLS-aware cursor). Zero-fill sections add VM
+    // extent only, never file extent.
     std::uint64_t const linkeditFileOff =
-        hasData
-            ? alignUp(dataSecFileOff + dataSecFileSize, kPageSize)
+        hasDataSegFile
+            ? alignUp(dataSegLastFileEnd, kPageSize)
             : alignUp(gotFileOff + gotFileSize, kPageSize);
     // F5: the REBASE stream leads __LINKEDIT (rebase, then bind, then the rest),
     // matching dyld's LC_DYLD_INFO field order. bindOff (and every offset below)
@@ -2471,8 +2872,20 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, static_cast<std::uint32_t>(id.filetype));
     appendU32LE(bytes, ncmds);
     appendU32LE(bytes, static_cast<std::uint32_t>(sizeofcmds));
-    appendU32LE(bytes, id.flags);
+    // TLS C4 runtime-closure: advertise MH_HAS_TLV_DESCRIPTORS iff this module
+    // carries thread-locals, so dyld runs the TLV setup that rewrites each
+    // descriptor word0 to tlv_get_addr (matches clang, which sets the bit only
+    // for TLS-bearing images). The base flags come from the format JSON; the
+    // per-module TLV bit is content-derived (hasTls), never a format identity.
+    appendU32LE(bytes, id.flags | (hasTls ? MH_HAS_TLV_DESCRIPTORS : 0u));
     appendU32LE(bytes, 0);
+
+    // TLS C4 (audit FOLD-1): count the segments emitted BEFORE __DATA so the
+    // descriptor-bind segment index can be cross-checked against the ACTUAL
+    // emission (see the __DATA emission below). __PAGEZERO/__TEXT/__DATA_CONST
+    // each ++ this as they complete; a reorder or an inserted/removed segment
+    // makes the count diverge from kTlvDescriptorBindSegIndex → fail loud.
+    std::uint32_t machoSegmentsBeforeData = 0;
 
     // LC_SEGMENT_64 __PAGEZERO
     appendU32LE(bytes, LC_SEGMENT_64);
@@ -2486,6 +2899,8 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, 0);
     appendU32LE(bytes, 0);
     appendU32LE(bytes, 0);
+
+    ++machoSegmentsBeforeData;  // __PAGEZERO emitted (index 0)
 
     // LC_SEGMENT_64 __TEXT (__text + __stubs, plus __const when data
     // globals are present — D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror).
@@ -2553,6 +2968,8 @@ encodeExecDynamic(AssembledModule const&    module,
         appendU32LE(bytes, 0);                 // reserved3
     }
 
+    ++machoSegmentsBeforeData;  // __TEXT emitted (index 1)
+
     // LC_SEGMENT_64 __DATA_CONST (1 section: __got)
     constexpr std::int32_t kVmProtRw = 3;
     appendU32LE(bytes, LC_SEGMENT_64);
@@ -2588,6 +3005,25 @@ encodeExecDynamic(AssembledModule const&    module,
     // S_ZEROFILL) — never hardcoded, keeping the writer agnostic. filesize
     // covers __data only (__bss is zero-fill); vmsize covers both.
     if (hasDataSeg) {
+        ++machoSegmentsBeforeData;  // __DATA_CONST emitted (index 2)
+        // TLS C4 (audit FOLD-1): __DATA is the NEXT segment; its index ==
+        // machoSegmentsBeforeData. Cross-check it matches the value the
+        // __tlv_bootstrap descriptor binds used — a divergence means the
+        // segment layout changed and the binds now resolve against the WRONG
+        // segment (a Mac crash invisible to every local pin). Fail loud rather
+        // than ship a silently mis-bound image.
+        if (hasTvars
+            && machoSegmentsBeforeData != kTlvDescriptorBindSegIndex) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format(
+                     "macho::encodeExecDynamic: __DATA is emitted at segment "
+                     "index {} but the __tlv_bootstrap descriptor binds target "
+                     "index {} — the segment layout changed and the TLV binds "
+                     "would resolve against the wrong segment "
+                     "(D-CSUBSET-THREAD-LOCAL, M-2/FOLD-1).",
+                     machoSegmentsBeforeData, kTlvDescriptorBindSegIndex));
+            return {};
+        }
         appendU32LE(bytes, LC_SEGMENT_64);
         appendU32LE(bytes, static_cast<std::uint32_t>(kSegCmdDataSize));
         appendName16(bytes,
@@ -2596,7 +3032,7 @@ encodeExecDynamic(AssembledModule const&    module,
                                           : std::string{"__DATA"}));
         appendU64LE(bytes, dataSegVmaddr);
         appendU64LE(bytes, dataSegVmsize);
-        appendU64LE(bytes, hasData ? dataSecFileOff : linkeditFileOff);
+        appendU64LE(bytes, hasDataSegFile ? dataSegFileOff : linkeditFileOff);
         appendU64LE(bytes, dataSegFileSize);
         appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRw));
         appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRw));
@@ -2614,6 +3050,58 @@ encodeExecDynamic(AssembledModule const&    module,
             appendU32LE(bytes, 0);                 // reloff
             appendU32LE(bytes, 0);                 // nreloc
             appendU32LE(bytes, secData->type);     // flags (S_REGULAR) from schema
+            appendU32LE(bytes, 0);                 // reserved1
+            appendU32LE(bytes, 0);                 // reserved2
+            appendU32LE(bytes, 0);                 // reserved3
+        }
+        // ── TLS C4 section records (D-CSUBSET-THREAD-LOCAL), in layout order:
+        // __thread_vars (file, descriptors) → __thread_data (file, template
+        // START) → __thread_bss (zero-fill). flags come from the SCHEMA ROW
+        // (S_THREAD_LOCAL_VARIABLES/_REGULAR/_ZEROFILL). __thread_data is
+        // placed at `tlsMaxAlign` (so __thread_bss is contiguous at the block-
+        // relative offset); its align field reports that placement. __thread_bss
+        // is zero-fill (offset 0, no file bytes) and precedes __bss.
+        if (hasTvars) {
+            appendName16(bytes, secTvars->name);
+            appendName16(bytes, secTvars->segment);
+            appendU64LE(bytes, tvarsVaLate);
+            appendU64LE(bytes, tvarsSize);
+            appendU32LE(bytes, static_cast<std::uint32_t>(tvarsFileOff));
+            appendU32LE(bytes, static_cast<std::uint32_t>(std::countr_zero(
+                                   std::max<std::uint64_t>(1, secTvars->addrAlign))));
+            appendU32LE(bytes, 0);                 // reloff
+            appendU32LE(bytes, 0);                 // nreloc
+            appendU32LE(bytes, secTvars->type);    // S_THREAD_LOCAL_VARIABLES
+            appendU32LE(bytes, 0);                 // reserved1
+            appendU32LE(bytes, 0);                 // reserved2
+            appendU32LE(bytes, 0);                 // reserved3
+        }
+        if (hasTdata) {
+            appendName16(bytes, secTdata->name);
+            appendName16(bytes, secTdata->segment);
+            appendU64LE(bytes, tdataVaLate);
+            appendU64LE(bytes, tdataSpan);
+            appendU32LE(bytes, static_cast<std::uint32_t>(tdataFileOff));
+            appendU32LE(bytes, static_cast<std::uint32_t>(std::countr_zero(
+                                   std::max<std::uint64_t>(1, tlsMaxAlign))));
+            appendU32LE(bytes, 0);                 // reloff
+            appendU32LE(bytes, 0);                 // nreloc
+            appendU32LE(bytes, secTdata->type);    // S_THREAD_LOCAL_REGULAR
+            appendU32LE(bytes, 0);                 // reserved1
+            appendU32LE(bytes, 0);                 // reserved2
+            appendU32LE(bytes, 0);                 // reserved3
+        }
+        if (hasTbss) {
+            appendName16(bytes, secTbss->name);
+            appendName16(bytes, secTbss->segment);
+            appendU64LE(bytes, tbssVaLate);
+            appendU64LE(bytes, tbssSecSize);
+            appendU32LE(bytes, 0);                 // offset = 0 (zero-fill)
+            appendU32LE(bytes, static_cast<std::uint32_t>(std::countr_zero(
+                                   std::max<std::uint64_t>(1, tbssLayout.maxAlign))));
+            appendU32LE(bytes, 0);                 // reloff
+            appendU32LE(bytes, 0);                 // nreloc
+            appendU32LE(bytes, secTbss->type);     // S_THREAD_LOCAL_ZEROFILL
             appendU32LE(bytes, 0);                 // reserved1
             appendU32LE(bytes, 0);                 // reserved2
             appendU32LE(bytes, 0);                 // reserved3
@@ -2818,6 +3306,26 @@ encodeExecDynamic(AssembledModule const&    module,
         while (bytes.size() < dataSecFileOff) bytes.push_back(0);
         bytes.insert(bytes.end(), dataLayout.bytes.begin(),
                      dataLayout.bytes.end());
+    }
+
+    // ── TLS C4 (D-CSUBSET-THREAD-LOCAL): __thread_vars descriptors then the
+    // __thread_data template. __thread_bss / __bss are zero-fill (no file
+    // bytes). Each 24-byte descriptor is { word0=0 (dyld binds __tlv_bootstrap
+    // into it), word1=0 (key, dyld fills), word2=the var's 0-based block
+    // offset }. The template bytes are the tdata layout — dyld copies them into
+    // every thread's TLV block.
+    if (hasTvars) {
+        while (bytes.size() < tvarsFileOff) bytes.push_back(0);
+        for (std::uint64_t const w2 : descriptorWord2) {
+            appendU64LE(bytes, 0);    // word0 thunk — bound to __tlv_bootstrap
+            appendU64LE(bytes, 0);    // word1 key   — dyld fills at load
+            appendU64LE(bytes, w2);   // word2 offset into the per-thread block
+        }
+    }
+    if (hasTdata) {
+        while (bytes.size() < tdataFileOff) bytes.push_back(0);
+        bytes.insert(bytes.end(), tdataLayout.bytes.begin(),
+                     tdataLayout.bytes.end());
     }
 
     // Pad to linkeditFileOff

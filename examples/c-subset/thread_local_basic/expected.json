@@ -1,0 +1,33 @@
+{
+  "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C1 x86_64 + C2 arm64 + C3 pe64 + C4 macho): single-thread thread_local witness — .tdata template copy visible before any write (g==7), mutation sticks, static thread_local (.tbss) accumulates from 0, thread_local const rides the same per-thread access. The release arm runs the full optimizer over the access sequence (the M-5 riprel-fold exclusions must hold under CSE/mem2reg). The arm64-ELF arm (TLS C2) runs the SAME source through the MRS TPIDR_EL0 + ADD/ADD hi12/lo12 Variant-I sequence under qemu-aarch64. The pe64 arm (TLS C3, runOn windows — LOCAL Windows ctest, no emulator) runs the SAME source through the gs:[0x58] TEB TLS-array + _tls_index + secrel sequence; pe64 embeds the whole per-thread block (incl. the .tbss zero region) in the .tls template because the Windows loader does not reliably zero SizeOfZeroFill for the main thread's early static TLS. The arm64-macho arm (TLS C4, runOn darwin) runs the SAME source through the __thread_vars descriptor + __tlv_bootstrap call sequence (adrp/add the descriptor -> ldr its thunk -> blr -> x0 = &var); the host CANNOT execute Mach-O, so this arm runs ONLY on the macos-latest CI leg / the user's Apple-Silicon Mac (structural pins in tests/link/test_macho_writer.cpp are the local guard). The per-thread discriminator lives in thread_local_pthread; this example's job is the loader-copies-template + mutation semantics. Exit 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

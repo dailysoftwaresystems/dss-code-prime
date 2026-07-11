@@ -818,14 +818,13 @@ TEST(HirLoweringCSubset, TypedefStructCompoundLiteralLowersTyped) {
         << (r.all().empty() ? "" : r.all()[0].actual);
 }
 
-// SCALAR compound literals — `(int){42}`, valid C 6.5.2.5p9 — now
-// resolve their TYPE (the semantic stamping admits them) but the HIR
-// brace-init lowering is aggregate-only by design: the scalar shape
-// stays a deliberate FAIL-LOUD ("brace-init target type must be
-// struct, union, or array"), never a silent misparse. Lifting the
-// scalar restriction is brace-init-lowering work, distinct from this
-// anchor's typedef-admission scope.
-TEST(HirLoweringCSubset, ScalarCompoundLiteralStaysAggregateOnlyFailLoud) {
+// FC17.5 (D-CSUBSET-EMPTY-INITIALIZER, C23 6.7.10): SCALAR compound
+// literals — `(int){42}`, valid C 6.5.2.5p9 — now lower through the HIR
+// scalar brace-init arm (the FLIP of the pre-FC17.5
+// `ScalarCompoundLiteralStaysAggregateOnlyFailLoud` pin, which
+// anticipated exactly this lift). The single-expression form is
+// byte-identical to a plain `= 42` init after the arm's coerce.
+TEST(HirLoweringCSubset, ScalarCompoundLiteralLowersViaScalarBraceInit) {
     SemanticModel model = analyzeCSubset(
         "int main() { int x = (int){42}; return x; }\n");
     ASSERT_FALSE(model.hasErrors())
@@ -833,10 +832,127 @@ TEST(HirLoweringCSubset, ScalarCompoundLiteralStaysAggregateOnlyFailLoud) {
            "literal (the stamp resolves)";
     DiagnosticReporter r;
     auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok)
+        << "the FC17.5 scalar brace-init arm must lower `(int){42}` "
+           "cleanly: "
+        << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// FC17.5 (D-CSUBSET-EMPTY-INITIALIZER, C23 6.7.10p11): the EMPTY
+// initializer `{}` zero-initializes a scalar / a pointer, and the
+// single-expression form `{42}` initializes with the expression —
+// every route funnels through the ONE lowerBraceInit chokepoint.
+TEST(HirLoweringCSubset, ScalarEmptyAndSingleBraceInitLower) {
+    SemanticModel model = analyzeCSubset(
+        "int main() {\n"
+        "    int z = {};\n"
+        "    int v = {42};\n"
+        "    int *p = {};\n"
+        "    return z + v + (p == 0 ? 0 : 1);\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// FC17.5 (S_InvalidScalarInitializer 0xE03F): the three malformed scalar
+// brace shapes stay LOUD — excess elements (`{1,2}`), a designator on a
+// scalar (`{.x=1}`), and the audit-N2 nested brace list (`{{42}}` — C23
+// 6.7.10p12 requires a SINGLE expression). Each is a distinct arm of the
+// scalar lowering's reject path; a silent guess would ship wrong bytes.
+TEST(HirLoweringCSubset, ScalarBraceInitMalformedShapesFailLoud) {
+    struct Arm { char const* src; char const* what; };
+    Arm const arms[] = {
+        {"int main() { int v = {1, 2}; return v; }\n",   "excess elements"},
+        {"int main() { int v = {.x = 1}; return v; }\n", "designator on scalar"},
+        {"int main() { int v = {{42}}; return v; }\n",   "nested brace list (N2)"},
+    };
+    for (auto const& arm : arms) {
+        SemanticModel model = analyzeCSubset(arm.src);
+        ASSERT_FALSE(model.hasErrors())
+            << arm.what << ": the semantic tier admits the parse (the "
+                            "constraint is enforced at HIR lowering)";
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_FALSE(res->ok)
+            << arm.what << " must fail loud at the scalar brace-init arm";
+        bool sawCode = false;
+        for (auto const& d : r.all()) {
+            if (d.code == DiagnosticCode::S_InvalidScalarInitializer)
+                sawCode = true;
+        }
+        EXPECT_TRUE(sawCode)
+            << arm.what << " must report S_InvalidScalarInitializer (0xE03F)";
+    }
+}
+
+// FC17.5 F4 (the CLOSED allowlist): `(void){}` stays LOUD — Void is not
+// an allowlisted scalar brace-init target (admitting it would mint a
+// Void-typed literal and corrupt the type system). The aggregate gate's
+// fail-loud reject is the backstop for every non-allowlisted kind.
+TEST(HirLoweringCSubset, VoidCompoundLiteralStaysFailLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int main() { (void){}; return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "the semantic tier stamps the void compound literal; the HIR "
+           "gate is the enforcement point";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
     EXPECT_FALSE(res->ok)
-        << "scalar compound literals are aggregate-gated at the HIR "
-           "brace-init lowering today — this must stay LOUD until the "
-           "scalar arm lands";
+        << "`(void){}` must stay fail-loud (F4 closed allowlist)";
+}
+
+// FC17.5 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER, C99 6.4.2.2): a read of
+// `__func__` FOLDS to a string-literal-shaped constant and every string
+// consumer (decay to `const char*`, indexing, address-of) rides the
+// existing paths — the whole program lowers cleanly through HIR.
+TEST(HirLoweringCSubset, FuncNameReadsLowerThroughStringLiteralPaths) {
+    SemanticModel model = analyzeCSubset(
+        "int helper(void) { return __func__[0] == 'h' ? 1 : 0; }\n"
+        "int main() {\n"
+        "    const char *fn = __func__;\n"
+        "    int a = fn[0] == 'm' ? 1 : 0;\n"
+        "    int b = (&__func__ != 0) ? 1 : 0;\n"
+        "    int c = (__func__ == __func__) ? 1 : 0;\n"
+        "    int d = (int)sizeof __func__;\n"
+        "    return a + b + c + d + helper();\n"
+        "}\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+}
+
+// FC17.5 F1 (S_PredefinedIdentifierNotAddressable 0xE040): `++__func__`
+// reaches the HIR inc/dec classifier (SE4's const check does not model
+// inc/dec — the pre-existing D-CSUBSET-INCDEC-CONST-LVALUE class), where
+// the simpleLvalue chokepoint now rejects the predefined identifier with
+// a REAL diagnostic instead of the engine-level "no storage slot" MIR
+// failure it would otherwise dead-end at. Covers `--__func__` and the
+// postfix forms by construction (all three ++/-- sites share the
+// classifier, and the classifier's simple-lvalue probe IS the guard).
+TEST(HirLoweringCSubset, FuncNameIncDecFailsLoudWithRealDiagnostic) {
+    SemanticModel model = analyzeCSubset(
+        "int main() { ++__func__; return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << "inc/dec const-ness is not modelled at semantic — the HIR "
+           "guard is the enforcement point";
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok) << "++__func__ must fail loud";
+    bool sawCode = false;
+    for (auto const& d : r.all()) {
+        if (d.code == DiagnosticCode::S_PredefinedIdentifierNotAddressable)
+            sawCode = true;
+    }
+    EXPECT_TRUE(sawCode)
+        << "++__func__ must report S_PredefinedIdentifierNotAddressable "
+           "(0xE040), not an engine-level unsupported-lowering error";
 }
 
 // D-CSUBSET-CAST-VOID-DISCARD (FC3.5 sweep-c3): `(void)f()` lowers as
@@ -919,6 +1035,26 @@ TEST(HirLoweringCSubset, TopLevelDeclaresNothingFailsLoudNoCrash) {
         << "`int ;` declares nothing — lowering must fail loud, not accept";
     EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
         << "exactly one S_DeclarationDeclaresNothing for the empty `int ;` decl";
+}
+
+// C23 6.7.2.5 (D-CSUBSET-TYPEOF): a bare `typeof(x);` — a typeof type-specifier
+// with NO declarator — declares nothing, exactly like `int ;`. The typeof head is
+// a type-specifier (not a struct/union/enum composite), so the "declares nothing"
+// path fires at HIR lowering (S_DeclarationDeclaresNothing) and must NOT crash on
+// the typeof subtree. Semantic + parse accept it (x is a declared global); the
+// constraint is HIR-tier.
+TEST(HirLoweringCSubset, BareTypeofDeclaresNothingFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int x;\ntypeof(x);\nint main(void) { return 0; }\n");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok)
+        << "`typeof(x);` declares nothing — lowering must fail loud, not accept";
+    EXPECT_EQ(countCode(r, DiagnosticCode::S_DeclarationDeclaresNothing), 1u)
+        << "exactly one S_DeclarationDeclaresNothing for the bare `typeof(x);` decl";
 }
 
 // c25 D-CSUBSET-UNIFIED-COMPOSITE-SPECIFIER: a body-PRESENT specifier WITH a
@@ -1878,6 +2014,76 @@ TEST(HirLoweringCSubset, NoreturnIndirectCalleeIsNotWrapped) {
         EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 1u)
             << "a call through a function-pointer object must NOT be wrapped (F1)";
     }
+}
+
+// ── FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): the GNU semantic-attribute spellings
+//    at FILE scope ride the linkage scan's by-NAME skip end-to-end ────────────
+
+// The FIVE by-name-ignored semantic-attribute spellings (deprecated /
+// maybe_unused / unused / nodiscard / warn_unused_result — incl. a
+// string-argument form and a dunder form) must lower a FILE-scope declaration
+// with ZERO H_UnknownLinkageSpecifier: without the
+// `linkageSpecifierIgnoredNames` extension every one hard-fails H000C
+// (probe-confirmed at the pre-change HEAD). RED-ON-DISABLE: drop a name from
+// the topLevelDecl ignore list → that spelling's H000C count flips to 1.
+TEST(HirLoweringCSubset, GnuSemanticAttributeSpellingsFileScopeLowerClean) {
+    for (char const* proto : {
+             "__attribute__((deprecated)) int f(void) { return 1; }",
+             "__attribute__((deprecated(\"use g\"))) int f(void) { return 1; }",
+             "__attribute__((__deprecated__)) int f(void) { return 1; }",
+             "__attribute__((warn_unused_result)) int f(void) { return 1; }",
+             "__attribute__((nodiscard)) int f(void) { return 1; }",
+             "__attribute__((unused)) int f(void) { return 1; }",
+             "__attribute__((maybe_unused)) int f(void) { return 1; }"}) {
+        std::string const src = std::string(proto)
+            + " int main(){ return f() - 1; }";
+        SemanticModel model = analyzeCSubset(src);
+        ASSERT_FALSE(model.hasErrors()) << "spelling: " << proto;
+        DiagnosticReporter r;
+        auto res = lowerToHir(model, r);
+        EXPECT_TRUE(res->ok) << proto << ": "
+                             << (r.all().empty() ? "" : r.all()[0].actual);
+        EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u)
+            << proto << " — the by-name linkage skip must cover this spelling";
+    }
+}
+
+// The Fork-2 BOUNDARY regression guard: an UNKNOWN GNU attribute at file scope
+// STILL fails loud H_UnknownLinkageSpecifier (the by-name skip covers ONLY the
+// declared semantic-attribute names — it must not become a wholesale ignore).
+TEST(HirLoweringCSubset, GnuUnknownAttributeFileScopeStillFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "__attribute__((frobnicate)) int f(void) { return 1; } "
+        "int main(){ return f() - 1; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    (void)res;
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 1u)
+        << "an unknown GNU attribute must keep the loud typo-protection gate";
+}
+
+// (The `static __attribute__((deprecated))` no-clobber pin — the co-present
+// `static` keeping its INTERNAL binding — lives at the MIR tier where the
+// binding is observable: MirLoweringCSubsetLinkage
+// .GnuDeprecatedDoesNotClobberStaticLinkage.)
+
+// The bare attribute-declaration statement lowers to NOTHING observable: the
+// `[[fallthrough]];` item maps to Skip (an empty Block) and the enclosing
+// declOrAttrStmt wrapper is peeled by the unmapped-statement PassThrough —
+// zero H diagnostics, verifier clean.
+TEST(HirLoweringCSubset, FallthroughStatementLowersToSkip) {
+    SemanticModel model = analyzeCSubset(
+        "int main(){ int x = 1; int acc = 0; "
+        "switch (x) { case 1: acc += 1; [[fallthrough]]; "
+        "case 2: acc += 10; break; default: acc = 99; break; } "
+        "return acc - 11; }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_VerifierFailure), 0u);
+    EXPECT_EQ(countCode(r, DiagnosticCode::H_UnknownLinkageSpecifier), 0u);
 }
 
 // ── FC5: goto / labels ──────────────────────────────────────────────────────
@@ -4462,6 +4668,94 @@ TEST(HirLoweringCSubset, DeepNestedSwitchLowersFlatOnNormalStack) {
     EXPECT_EQ(res->hir.kind(cur), HirKind::ReturnStmt);
     EXPECT_EQ(switchLevels, kDepth)
         << "exactly one nested SwitchStmt per source `switch`";
+}
+
+// The SEMANTIC-ANALYSIS companion to the lowering pins above, and the host- AND
+// sanitizer-INDEPENDENT witness that Pass 1.5's declaration-type walk
+// (`resolveDeclTypes`) is FLAT: an explicit heap work-stack, O(1) host stack per
+// nesting level (D-PARSE-DEEP-NEST-RECURSION-MEMORY plan-24 Stage 2, the
+// resolveDeclTypes MISSED SITE). It analyzes a deeply-NESTED switch on a
+// deliberately BOUNDED analysis-worker reserve and asserts the analysis completes
+// cleanly.
+//
+// WHY A RESERVE PARAMETER (not the test's own stack): unlike `lowerToHir` — which
+// the pins above call directly on the test's main stack — the semantic analysis
+// is reachable ONLY through `analyze()`, which runs `analyzeImpl` on a dedicated
+// worker (D-PARSE-DEEP-FRONTEND-STACK). Production uses a 64 MiB reserve; there,
+// the recursive form overflowed ONLY under ASan's inflated frames (that is the
+// existing `...LowersFlatOnNormalStack` CI failure). To pin the flatness WITHOUT
+// depending on a sanitizer, this drives that worker at a small, FIXED reserve via
+// `analyze()`'s `deepRecursionReserveBytes` parameter: the FLAT walk uses O(1)
+// host frames (one `resolveDeclTypesPost` frame at a time) and fits; a per-level
+// RECURSION does not.
+//
+// RED-ON-DISABLE (every leg, no sanitizer needed): restore the recursive
+// `resolveDeclTypes` (one host frame PER switch level) → analyzing kDepth levels
+// overflows the kAnalyzeReserveBytes reserve and hard-crashes the worker. The
+// margins are large on both sides at the gate's Debug frame sizes: the flat walk's
+// O(1) peak (~0.5 MiB even under ASan — the analyzeImpl → driver →
+// resolveDeclTypesPost chain, NOT multiplied by depth) sits ~4x under the 2 MiB
+// reserve, while kDepth (1500) recursive frames of the (huge) resolveDeclTypes
+// function (≥ ~8 KiB each in Debug ⇒ ≥ 12 MiB) sit ~6x over it.
+//
+// The deep tree's PARSE + teardown run on the standard 64 MiB worker — they are
+// ORTHOGONAL deep recursions (the parser's residual paren arm; the tree teardown)
+// and must not themselves overflow — so ONLY the analysis runs on the bounded
+// reserve. maxExpressionDepth is raised above kDepth so the (statement) nesting is
+// admitted without a P_ExpressionTooDeep. (Depth is kept moderate because the
+// front end is ~quadratic in nesting depth; the reserve, not the depth, is what
+// makes the recursion overflow — so a modest depth on a small reserve is a strict
+// pin that still runs fast.)
+TEST(HirLoweringCSubset, DeepNestedSwitchAnalyzesFlatOnNormalStack) {
+    constexpr int kDepth = 1500;   // switch-in-case-body nesting levels
+    // Bounded analysis reserve: ample for the FLAT walk's O(1) host frames (even
+    // under ASan), far too small for kDepth RECURSIVE frames of the (huge)
+    // resolveDeclTypes function.
+    constexpr std::size_t kAnalyzeReserveBytes = std::size_t{2} * 1024 * 1024;
+
+    // `int main(void){ int x=0; switch(x){case 1: … return 0; … default: break;} }`
+    // — each level is a switch whose `case 1:` body is the next-inner switch; the
+    // innermost returns. Every level also has a `default: break;` (a real multi-arm
+    // switch, matching the lowering pin's shape).
+    std::string src = "int main(void){ int x=0; ";
+    for (int i = 0; i < kDepth; ++i) src += "switch(x){ case 1: ";
+    src += "return 0;";
+    for (int i = 0; i < kDepth; ++i) src += " default: break; }";
+    src += " return 0; }";
+
+    // Parse + build the CU on the 64 MiB worker (orthogonal deep recursion kept
+    // off the bounded reserve), then ANALYZE on the bounded reserve — the flatness
+    // witness. A bare `int main(){…}` program parses via Tokenizer+Parser directly
+    // (no PP) and is ingested via addTree — exactly as analyzeCSubsetRaisedCap does.
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    std::shared_ptr<GrammarSchema const> schema = *loaded;
+    auto cu = dss::substrate::callOnLargeStack(
+        dss::substrate::kDeepRecursionStackBytes,
+        [&]() -> std::shared_ptr<CompilationUnit const> {
+            auto srcBuf = SourceBuffer::fromString(std::move(src), "<deepanalyze>");
+            Tokenizer tk{srcBuf, schema};
+            auto [stream, lexDiags] = std::move(tk).tokenize();
+            ParserConfig pcfg;
+            pcfg.maxExpressionDepth = static_cast<std::size_t>(kDepth) + 1000;
+            Parser p{srcBuf, schema, std::move(stream), std::move(pcfg),
+                     std::move(lexDiags)};
+            ParseResult result = std::move(p).parse();
+            if (result.tree.diagnostics().hasErrors())
+                ADD_FAILURE() << "deep nested-switch parse produced errors";
+            UnitBuilder builder{schema};
+            builder.addTree(std::move(result.tree));
+            return std::make_shared<CompilationUnit>(std::move(builder).finish());
+        });
+
+    // Pre-fix (recursive resolveDeclTypes): overflows the bounded reserve at kDepth
+    // → crash. Post-fix (flat driver): O(1) host stack → clean, error-free model.
+    SemanticModel model =
+        analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt, std::nullopt,
+                std::nullopt, /*deepRecursionReserveBytes=*/kAnalyzeReserveBytes);
+    EXPECT_FALSE(model.hasErrors())
+        << "deep nested-switch analysis must complete cleanly on a bounded stack "
+           "— Pass 1.5 resolveDeclTypes is a flat heap work-stack, not recursion";
 }
 
 // ─────────────────────────── FC-F1: ++/-- (Cluster F item F1) ───────────────

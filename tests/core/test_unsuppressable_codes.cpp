@@ -124,6 +124,43 @@ TEST(UnsuppressableCodes, RegularDiagnosticsRemainSuppressable) {
     EXPECT_FALSE(isUnsuppressable(DiagnosticCode::P_AmbiguousToken));
 }
 
+TEST(UnsuppressableCodes, AutoInferenceRejectsAreUnsuppressable) {
+    // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE, C23 6.7.9): the ★C3 backfill
+    // seam — the inference arm is the ONLY tier that types these symbols at
+    // Pass 1.5, and Pass 2's decl arm BACKFILLS `rec.type =
+    // initializer-type` for any still-unresolved declarator-mode symbol. A
+    // SUPPRESSED rejection would therefore silently adopt the initializer's
+    // type and compile the very form the constraint forbids (`static x=5;`
+    // as implicit-int, multi-declarator auto, a NullptrT-typed object headed
+    // for the 0xA014 MIR tripwire). Named per-code pins (ListSelfConsistent
+    // would still pass if any member were dropped from the table).
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_AutoRequiresSingleDeclarator));
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_AutoRequiresPlainIdentifier));
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_AutoRequiresInitializer));
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_AutoInferenceInvalid));
+}
+
+TEST(UnsuppressableCodes, ThreadLocalRejectsAreUnsuppressable) {
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL, C11/C23 6.7.1 + 6.6p9): every
+    // thread-storage constraint violation ships wrong STORAGE bytes when
+    // suppressed, not a missed lint — the block-scope form would lower as a
+    // per-call automatic, the redeclaration mismatch would bind half the
+    // accesses to the wrong storage, and the address-constant form would
+    // emit an abs64 whose resolved value is a link-time tpoff bit-cast into
+    // a data slot (the arc's CRIT-1 silent garbage pointer). Named per-code
+    // pins (ListSelfConsistent would still pass if any member were dropped
+    // from the table).
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_ThreadLocalOnFunction));
+    EXPECT_TRUE(isUnsuppressable(
+        DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern));
+    EXPECT_TRUE(isUnsuppressable(
+        DiagnosticCode::S_ThreadLocalRedeclarationMismatch));
+    EXPECT_TRUE(isUnsuppressable(
+        DiagnosticCode::S_ThreadLocalAddressNotConstant));
+    EXPECT_TRUE(isUnsuppressable(
+        DiagnosticCode::S_ThreadLocalInvalidCombination));
+}
+
 TEST(UnsuppressableCodes, ListSelfConsistent) {
     // Every member of the public closed-table view must report
     // unsuppressable; no member duplicated; every entry must be a

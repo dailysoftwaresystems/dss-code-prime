@@ -406,6 +406,54 @@ TEST(MirLoweringExtern, MultipleExternsAcrossTwoLibrariesPropagateInOrder) {
               "/usr/lib/libobjc.A.dylib");
 }
 
+// TLS C1 (D-CSUBSET-THREAD-LOCAL): an ExternGlobal whose declaration carries
+// the HirThreadLocalMap attribute mints its ExternImport row with
+// isThreadLocal=true — the `extern thread_local int e;` cross-TU carrier
+// (the LK11 merge's survivingExterns copies the WHOLE row, so the flag rides
+// the merge by construction; the linker-side surviving-import handling is
+// slice C). The unmarked sibling in the SAME module stays false — exact
+// per-row assertions. RED-ON-DISABLE: drop the threadLocalMap read at the
+// collectExterns ExternGlobal arm and the marked row's EXPECT reds.
+TEST(MirLoweringExtern, ExternGlobalThreadLocalFlagReachesImportRow) {
+    TypeInterner ti = makeInterner();
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    HirBuilder b{"c-subset"};
+    constexpr std::uint32_t kTlsSym   = 41;
+    constexpr std::uint32_t kPlainSym = 42;
+    HirNodeId const tlsEg   = b.makeExternGlobal(i32, kTlsSym);
+    HirNodeId const plainEg = b.makeExternGlobal(i32, kPlainSym);
+    HirNodeId const root = b.makeModule(std::array{tlsEg, plainEg});
+    Hir hir = std::move(b).finish(root);
+
+    HirFfiMap ffi{hir};
+    FfiMetadata mTls;
+    mTls.mangledName = "e";  mTls.importLibrary = "libc.so.6";
+    ffi.set(tlsEg, mTls);
+    FfiMetadata mPlain;
+    mPlain.mangledName = "g"; mPlain.importLibrary = "libc.so.6";
+    ffi.set(plainEg, mPlain);
+    HirThreadLocalMap tls{hir};
+    tls.set(tlsEg, ThreadLocalAttr{/*isThreadLocal=*/true});
+
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    auto result = lowerToMir(hir, pool, ti, rep,
+                             /*sourceMap=*/nullptr, MirLoweringConfig{},
+                             &ffi, /*linkageMap=*/nullptr,
+                             /*mutabilityMap=*/nullptr,
+                             /*volatileMap=*/nullptr,
+                             /*alignmentMap=*/nullptr, &tls);
+    ASSERT_TRUE(result.ok)
+        << (rep.all().empty() ? "" : rep.all()[0].actual);
+    ASSERT_EQ(result.externImports.size(), 2u);
+    EXPECT_TRUE(result.externImports[0].isData);
+    EXPECT_TRUE(result.externImports[0].isThreadLocal)
+        << "the marked extern-data row must carry thread storage duration";
+    EXPECT_TRUE(result.externImports[1].isData);
+    EXPECT_FALSE(result.externImports[1].isThreadLocal)
+        << "the unmarked sibling must stay process-shared";
+}
+
 TEST(MirLoweringExtern, ExternGlobalCurrentlyFailsLoudPendingFeatureWork) {
     // D-FF2-5 audit pin (2026-06-01): `extern int x;` (and the
     // array form `extern int x[10];` post-fold #11) lowers to a

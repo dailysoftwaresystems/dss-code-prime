@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 86> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 105> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -183,6 +183,7 @@ constexpr std::array<DiagnosticCode, 86> kUnsuppressableCodes{{
     DiagnosticCode::I_ArgIndexOutOfRange,
     DiagnosticCode::I_ArgPositionDuplicate,
     DiagnosticCode::I_ExtensionTypeInMir,
+    DiagnosticCode::I_NullptrTypeInMir,
     DiagnosticCode::I_StructCfMismatch,
     DiagnosticCode::I_UnreachableBlock,
 
@@ -372,6 +373,95 @@ constexpr std::array<DiagnosticCode, 86> kUnsuppressableCodes{{
     // H_UnknownLinkageSpecifier typo diagnostic, and the build still fails via
     // hasErrors when it fires unsuppressed.)
     DiagnosticCode::S_PackedBitfieldUnsupported,
+    // S_NullptrInvalidOperand (FC17, D-CSUBSET-NULLPTR): `nullptr` used as an
+    // invalid operator operand (`nullptr + 1`, `nullptr < p`, `-nullptr`). Unlike a
+    // plain type mismatch, suppressing THIS would ship a SILENT MISCOMPILE: the HIR
+    // lowering turns `nullptr` into the integer-0 null constant, so a suppressed
+    // diagnostic would leave `nullptr + 1` compiled as `0 + 1 == 1` — ill-formed C
+    // silently accepted. Closed here so nullptr misuse is never silently lowered.
+    DiagnosticCode::S_NullptrInvalidOperand,
+    // S_InvalidEnumUnderlyingType / S_EnumeratorValueOutOfRange (FC17,
+    // D-CSUBSET-ENUM-UNDERLYING-TYPE, C23 6.7.2.2): the explicit enum
+    // underlying-type constraint violations — a non-integer underlying type
+    // (`enum E : float`) and an enumerator value out of the underlying's range
+    // (`enum E : unsigned char { A = 256 }`). Both ship WRONG BYTES if suppressed:
+    // a suppressed invalid-underlying would silently lay the enum out at the default
+    // int width/signedness instead of failing, and a suppressed out-of-range value
+    // would be truncated/wrapped into the underlying type — a wrong constant. Same
+    // silent-miscompile-guard class as S_PackedBitfieldUnsupported above. (The
+    // default-int enum path never emits either, so unsuppressing changes nothing
+    // for existing enums.)
+    DiagnosticCode::S_InvalidEnumUnderlyingType,
+    DiagnosticCode::S_EnumeratorValueOutOfRange,
+    // S_TypeofBitfieldOperand (FC17, D-CSUBSET-TYPEOF, C23 6.7.2.5): the operand
+    // of a `typeof`/`typeof_unqual` is a bit-field member access. Same
+    // silent-miscompile-guard class as the enum/nullptr entries above: on the
+    // reject path the typeof node resolves to InvalidType, so the build fails via
+    // hasErrors() regardless of the emit gate — but a SUPPRESSED constraint
+    // violation would silently resolve the typeof to the bit-field's declared
+    // (widened) type, a wrong type in the declaration it specifies. Closed here so
+    // a bit-field typeof is never silently mistyped.
+    DiagnosticCode::S_TypeofBitfieldOperand,
+    // S_Constexpr* (FC17, D-CSUBSET-CONSTEXPR, C23 6.7.1): the five constexpr
+    // OBJECT constraint violations — non-constant initializer, missing
+    // initializer, unsupported (aggregate) object type, constexpr-on-a-function,
+    // and a volatile-qualified object type. Each is a 6.7.1 constraint whose
+    // SUPPRESSION would silently degrade `constexpr` to plain `const` — the exact
+    // silent-accept the feature's fail-loud contract forbids (a constexpr object
+    // IS its translation-time value; a declaration that cannot deliver that value
+    // must never compile quietly). The function form additionally guards a wrong
+    // INTERNAL linkage (the file-scope constexpr linkage row would apply to a
+    // function the object-only feature never validated). Closed here so an
+    // invalid constexpr is never silent.
+    DiagnosticCode::S_ConstexprNonConstantInitializer,
+    DiagnosticCode::S_ConstexprMissingInitializer,
+    DiagnosticCode::S_ConstexprUnsupportedType,
+    DiagnosticCode::S_ConstexprFunctionNotSupported,
+    DiagnosticCode::S_ConstexprInvalidQualifier,
+    // S_Auto* (FC17.5, D-CSUBSET-AUTO-TYPE-INFERENCE, C23 6.7.9): the four
+    // initializer-inference constraint violations — multi-declarator, a
+    // derived (non-plain-identifier) declarator, a missing initializer, and
+    // an invalid inference (missing required `auto` specifier / void /
+    // nullptr_t / unresolvable-self-referential initializer). Suppressing ANY
+    // of them re-opens a SILENT-MISCOMPILE seam: the inference arm is the
+    // only tier that types these symbols at Pass 1.5, and Pass 2's decl arm
+    // BACKFILLS `rec.type = initializer-type` for any still-unresolved
+    // declarator-mode symbol — so a suppressed violation would silently
+    // adopt the initializer's type and compile the very form the constraint
+    // forbids (`static x = 5;` as implicit-int, `auto a = 1, b = 2;`
+    // per-declarator, a NullptrT-typed object headed for the 0xA014 MIR
+    // tripwire). Closed here so a rejected inference never compiles quietly.
+    DiagnosticCode::S_AutoRequiresSingleDeclarator,
+    DiagnosticCode::S_AutoRequiresPlainIdentifier,
+    DiagnosticCode::S_AutoRequiresInitializer,
+    DiagnosticCode::S_AutoInferenceInvalid,
+    // S_ThreadLocal* (TLS C1, D-CSUBSET-THREAD-LOCAL, C11/C23 6.7.1 + 6.6p9):
+    // the five thread-storage constraint violations — thread_local on a
+    // function, a block-scope object without static/extern, a same-TU
+    // redeclaration mismatch, a thread-local address in a static initializer,
+    // and a forbidden storage-class combination (constexpr / register).
+    // Suppressing ANY of them ships wrong STORAGE bytes, not just a missed
+    // lint: the block-scope form would lower as a per-call automatic, the
+    // redeclaration mismatch would bind half the accesses to the wrong
+    // storage, and the address-constant form would emit an abs64 relocation
+    // whose resolved value is a link-time tpoff bit-cast into a data slot (a
+    // silent garbage pointer — the arc's CRIT-1). Closed here so an invalid
+    // thread_local never compiles quietly.
+    DiagnosticCode::S_ThreadLocalOnFunction,
+    DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern,
+    DiagnosticCode::S_ThreadLocalRedeclarationMismatch,
+    DiagnosticCode::S_ThreadLocalAddressNotConstant,
+    DiagnosticCode::S_ThreadLocalInvalidCombination,
+    // S_UnknownAttribute / S_DeprecatedSymbolUsed / S_NodiscardResultDiscarded
+    // (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13) are deliberately NOT
+    // members — the same suppressible posture as S_UnknownTypeAttribute above.
+    // All three are WARNINGS on conforming programs: C23 forbids treating an
+    // unknown standard attribute as fatal (an unknown `[[frobnicate]]` is
+    // ignorable by definition), and deprecated/nodiscard are lint-tier advice
+    // whose suppression ships no wrong bytes and hides no build failure
+    // (hasErrors() is untouched by a warning). Forcing any of them
+    // unsuppressable would make `--suppress` unable to silence exactly the
+    // class of diagnostic the standard defines as ignorable.
 }};
 
 // Post-fold #11 code-review F1: consteval uniqueness pin matches the

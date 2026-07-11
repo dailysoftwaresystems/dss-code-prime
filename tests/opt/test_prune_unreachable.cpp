@@ -388,7 +388,11 @@ TEST(PruneUnreachable, RuntimeInitGlobalStillPrunedNotCarvedOut) {
 
     // The runtime-init global, referencing initFn.
     MirGlobalId const g = mb.addGlobal(i32, SymbolId{202},
-                                       /*initLiteralIndex=*/UINT32_MAX, initFn);
+                                       /*initLiteralIndex=*/UINT32_MAX, initFn,
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default,
+                                       /*isConst=*/false,
+                                       MirThreadStorage::Shared);
     Mir mir = std::move(mb).finish();
     (void)g;
 

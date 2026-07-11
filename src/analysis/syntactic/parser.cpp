@@ -1925,6 +1925,25 @@ struct Parser::Impl {
                     }
                 }
 
+                // D-PARSE-SPECULATIVE-OPTIONAL: a speculative OPTIONAL whose
+                // inner clause did not match — every candidate pruned (the
+                // peek belongs to the continuation) or every probe failed —
+                // must be SKIPPED, not diagnosed. The skip/continuation
+                // branch is nullable-tailed and its rules were excluded from
+                // the candidate set (collectAltBranchRules), so control
+                // reaches here with the candidate set exhausted. Take the
+                // nullable skip so the continuation parses non-speculatively.
+                // `skipWouldAbandonToken` preserves the fail-loud contract at
+                // end-of-root; mirrors the non-speculative optional skip
+                // (~:1993) and the !inUnion speculative skip (~:1837). Every
+                // SHIPPED speculative alt is non-nullable-tailed, so
+                // `nullableTail()` is false for them and this is inert.
+                if (walker.nullableTail()
+                    && !skipWouldAbandonToken(peek)
+                    && walker.takeNullableBranch()) {
+                    return StepOutcome::Continue;
+                }
+
                 // FC4 c1: every candidate failed. At the OUTERMOST level,
                 // REPLAY the declared-LAST candidate non-speculatively so
                 // its precise diagnostics land where the user can act on

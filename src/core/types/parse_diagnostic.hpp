@@ -547,6 +547,237 @@ enum class DiagnosticCode : std::uint16_t {
     // at the composite-completion site; unsuppressable (a suppressed one would ship
     // the wrong — padded — bytes).
     S_PackedBitfieldUnsupported   = 0xE032,
+    // C23 §6.5 (D-CSUBSET-NULLPTR): the predefined constant `nullptr` (type
+    // nullptr_t) used as an operand where nullptr_t is not permitted — any
+    // arithmetic/bitwise/shift binary (`nullptr + 1`), any relational (`nullptr <
+    // p`), unary `-`/`~` (`-nullptr`), or `==`/`!=` against a non-pointer /
+    // non-nullptr peer (`nullptr == 5`). WITHOUT this explicit fail-loud gate the
+    // HIR lowering (nullptr → the integer-0 null constant) would SILENTLY compile
+    // `nullptr + 1` as `0 + 1` — a silent accept of ill-formed code. `nullptr` IS
+    // admissible as an `==`/`!=` operand against a pointer or another nullptr, and
+    // in the pointer/bool CONVERSION contexts (handled by isAssignable). The
+    // `.actual` names the offending operand. Unsuppressable.
+    S_NullptrInvalidOperand       = 0xE033,
+    // C23 §6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE): the type-specifier in an enum's
+    // explicit underlying-type clause (`enum E : T { … }`) is NOT an integer type
+    // (`enum E : float`, `enum E : struct S`). C23 requires the underlying type to be
+    // an integer type; a non-integer is a constraint violation. The `.actual` names
+    // the enum (or the offending type). Unsuppressable — without the fail-loud gate
+    // the enum would silently fall back to the default int and lay out at the wrong
+    // width/signedness.
+    S_InvalidEnumUnderlyingType   = 0xE034,
+    // C23 §6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE): an enumerator's value does NOT
+    // fit the enum's EXPLICIT underlying type (`enum E : unsigned char { A = 256 }`,
+    // `enum E : unsigned char { A = -1 }`). C23 requires every enumerator to be
+    // representable in the underlying type. The `.actual` names the enumerator.
+    // Unsuppressable — a suppressed diagnostic would let the out-of-range value be
+    // truncated/wrapped into the underlying type silently (a wrong constant value).
+    // Only fires for the EXPLICIT-underlying case; a default-int enum is unchanged.
+    S_EnumeratorValueOutOfRange   = 0xE035,
+    // C23 §6.7.2.5 (D-CSUBSET-TYPEOF): the operand of a `typeof`/`typeof_unqual`
+    // is a BIT-FIELD member access (`typeof(s.flag)` where `flag` is a bit-field).
+    // A bit-field has no nameable, portable type — its width/representation are
+    // implementation-defined — so C constrains typeof away from it. The `.actual`
+    // names the offending member access. Unsuppressable: without the fail-loud gate
+    // the typeof would silently resolve to the bit-field's DECLARED (widened) type,
+    // masking the constraint and yielding a wrong type in a downstream declaration.
+    S_TypeofBitfieldOperand       = 0xE036,
+    // C23 §6.7.1 (D-CSUBSET-CONSTEXPR): a `constexpr` object's initializer is NOT
+    // a compile-time constant — an arithmetic-typed initializer that does not fold
+    // through the shared CST const-eval engine (`constexpr int x = argc;`), or a
+    // pointer-typed initializer that is not a null pointer constant
+    // (`constexpr int *p = &g;`; the `(T*)0` cast form is a named loud deferral,
+    // D-CSUBSET-CONSTEXPR-POINTER-CAST-NULL). THE constexpr-vs-const empirical
+    // delta: `const int x = argc;` stays legal (const-ness is initializer-blind;
+    // only an ICE consumer errors lazily), `constexpr` must fail AT ITS OWN
+    // DECLARATION (6.7.1p10 — the value must be computable at translation time).
+    // The `.actual` names the offending initializer. Unsuppressable — a suppressed
+    // violation would silently degrade constexpr to plain const (a later
+    // const-expr consumer would then mis-diagnose, or a runtime init would ship).
+    S_ConstexprNonConstantInitializer = 0xE037,
+    // C23 §6.7.1 (D-CSUBSET-CONSTEXPR): a `constexpr` object declarator carries NO
+    // initializer (`constexpr int x;`, the `b` in `constexpr int a = 1, b;` —
+    // fires per-declarator). 6.7.1p10 requires an initializer (the object IS its
+    // compile-time value). The `.actual` names the uninitialized declarator.
+    // Unsuppressable — a suppressed violation would ship a zero-initialized
+    // "constant" whose reads mean nothing the author wrote.
+    S_ConstexprMissingInitializer = 0xE038,
+    // C23 §6.7.1 (D-CSUBSET-CONSTEXPR / D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE): a
+    // `constexpr` object of ARRAY / STRUCT / UNION type (`constexpr int a[3] =
+    // {1,2,3};`, `constexpr char s[] = "hi";`). Aggregate constexpr semantics
+    // (element-wise compile-time validation) are a NAMED loud deferral — no
+    // CST-tier aggregate evaluator exists; fail loud rather than validate a
+    // guessed subset. A UNIFORM boundary: the char-array-from-string-literal form
+    // is deliberately NOT carved out. Also the catch-all for any other
+    // non-scalar/non-pointer constexpr object type (fail-loud, never silent).
+    // The `.actual` names the declarator. Unsuppressable.
+    S_ConstexprUnsupportedType    = 0xE039,
+    // C23 §6.7.1 (D-CSUBSET-CONSTEXPR): `constexpr` on a FUNCTION — a prototype
+    // (`constexpr int f(void);`) or a definition (`constexpr int f(void) {…}`).
+    // C23 constexpr is the OBJECT storage-class only (C++ constexpr functions do
+    // not exist in C23); 6.7.1p5 restricts constexpr to objects. Fail loud rather
+    // than silently treat the function as ordinary (and — file scope — wrongly
+    // give it internal linkage via the constexpr linkage row). The `.actual`
+    // names the function declarator. Unsuppressable.
+    S_ConstexprFunctionNotSupported = 0xE03A,
+    // C23 §6.7.1p11 (D-CSUBSET-CONSTEXPR): a `constexpr` OBJECT whose type is
+    // volatile-qualified at the TOP level (`constexpr volatile int v = 1;`).
+    // C23 prohibits a constexpr object of volatile-qualified type (its reads
+    // could not be constant-folded without dropping the volatile access). A
+    // volatile POINTEE stays legal (`constexpr volatile int *p = nullptr;` — the
+    // OBJECT is the pointer, not volatile itself). The `.actual` names the
+    // declarator. Unsuppressable — a suppressed violation would either fold away
+    // volatile reads or silently drop the constexpr constant-ness.
+    S_ConstexprInvalidQualifier   = 0xE03B,
+    // C23 §6.7.13 (D-CSUBSET-ATTRIBUTE-SEMANTICS): a C23 `[[...]]` standard
+    // attribute whose name matches NO row of the language's attribute-semantics
+    // table (`[[frobnicate]] int x;`). A WARNING and SUPPRESSIBLE — C23 (and the
+    // WG21 P2552 posture) forbids treating an unknown standard attribute as
+    // fatal: the program is conforming, the attribute is simply ignored. The
+    // GNU `__attribute__((...))` form keeps its own PRE-EXISTING loud gates
+    // (file-scope H_UnknownLinkageSpecifier / composite S_UnknownTypeAttribute)
+    // — this code is the stdAttr-form-only vocabulary warning. The `.actual`
+    // names the unrecognized attribute clause.
+    S_UnknownAttribute            = 0xE03C,
+    // C23 §6.7.13.3 (D-CSUBSET-ATTRIBUTE-SEMANTICS): a use of a symbol declared
+    // `[[deprecated]]` / `[[deprecated("msg")]]` / GNU `__attribute__((deprecated))`
+    // (fires once per use site, incl. a call's callee). A WARNING and
+    // SUPPRESSIBLE — deprecation is lint-tier advice, not a constraint
+    // violation; the program's semantics are unchanged. The `.actual` is the
+    // symbol name, or `name: msg` when the attribute carried a message.
+    S_DeprecatedSymbolUsed        = 0xE03D,
+    // C23 §6.7.13.2 (D-CSUBSET-ATTRIBUTE-SEMANTICS): a call to a function
+    // declared `[[nodiscard]]` / GNU `__attribute__((warn_unused_result))` whose
+    // result is DISCARDED — the call is the entire expression of an expression
+    // statement (`f();`). The `(void)f();` cast idiom and any value use
+    // (`x=f()`, `g(f())`, `return f()`) do NOT fire. A WARNING and SUPPRESSIBLE
+    // — discarding a nodiscard result is diagnosable advice per C23, not a
+    // constraint violation. The `.actual` is the callee name, or `name: msg`.
+    S_NodiscardResultDiscarded    = 0xE03E,
+    // C23 §6.7.10 (D-CSUBSET-EMPTY-INITIALIZER): a brace initializer for a
+    // SCALAR object that is not one of the two valid scalar forms — `{}` (empty,
+    // zero-initializes) or `{ expr }` (exactly one non-brace, non-designated
+    // expression, C 6.7.10p12). Fires on excess elements (`int v = {1, 2};`), a
+    // designator (`int v = {.x = 1};`), or a nested brace list (`int v =
+    // {{42}};` — 6.7.10p12's "shall be a single expression"). A plain Error
+    // (constraint violation); the lowering returns an Error node either way, so
+    // a suppressed diagnostic can never silently accept the malformed
+    // initializer (no wrong-bytes path — deliberately NOT in the
+    // unsuppressable table).
+    S_InvalidScalarInitializer    = 0xE03F,
+    // C99 §6.4.2.2 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER): a predefined
+    // function-name identifier (`__func__` / the configured aliases) used as a
+    // MODIFIABLE lvalue — the ++/--/compound-assign classifiers would otherwise
+    // synthesize a write-back to a symbol with no storage slot (`__func__` reads
+    // FOLD to a string-literal constant; there is no object to read-modify-
+    // write), which today surfaces as an engine-level "no storage slot" failure
+    // at MIR. This is the REAL diagnostic for that misuse. Plain reads,
+    // `&__func__` (legal C99 — the fold's rodata global provides the address),
+    // and indexing are unaffected. Simple assignment / `+=` are caught EARLIER
+    // by SE4's const check (the synthetic symbol is `isConst`) →
+    // S_ConstViolation; this code covers the inc/dec class the const check does
+    // not model. A plain Error; the classifiers bail to an Error path either
+    // way (NOT in the unsuppressable table — no silent-accept route).
+    S_PredefinedIdentifierNotAddressable = 0xE040,
+    // C23 §6.7.9 (D-CSUBSET-AUTO-TYPE-INFERENCE): an initializer-inferred
+    // declaration (`auto x = expr;`) declares MORE THAN ONE declarator
+    // (`auto a = 1, b = 2;` — 6.7.9p2: "shall contain ... a single
+    // declarator"). The `.actual` names the declaration. UNSUPPRESSABLE —
+    // the inference arm is the ONLY tier that types these symbols at Pass
+    // 1.5; a suppressed violation would fall through to Pass 2's
+    // initializer-type backfill and silently adopt each initializer's type
+    // (the exact multi-declarator form the constraint forbids).
+    S_AutoRequiresSingleDeclarator = 0xE041,
+    // C23 §6.7.9 (D-CSUBSET-AUTO-TYPE-INFERENCE): an initializer-inferred
+    // declaration whose declarator is NOT a plain identifier — a pointer
+    // (`auto *p = …`), array (`auto a[] = …`), or function (`auto f(void);`)
+    // declarator (6.7.9p2: "the declarator shall be ... an identifier"; the
+    // derived-declarator forms are a WG14 v2-paper extension — the named
+    // deferral D-CSUBSET-AUTO-DERIVED-DECLARATOR). The `.actual` names the
+    // declarator. UNSUPPRESSABLE — same backfill seam as 0xE041: suppressed,
+    // the symbol would silently adopt the initializer's un-derived type.
+    S_AutoRequiresPlainIdentifier = 0xE042,
+    // C23 §6.7.9 (D-CSUBSET-AUTO-TYPE-INFERENCE): an initializer-inferred
+    // declaration with NO initializer (`auto x;` / `auto T;` — there is
+    // nothing to infer from; 6.7.9p2 requires the `= assignment-expression`
+    // form). The `.actual` names the declarator. UNSUPPRESSABLE — suppressed,
+    // the symbol would stay untyped and surface as a cascade H_TypeUnresolved
+    // with the REAL reason hidden (a confusing silent-failure REASON).
+    S_AutoRequiresInitializer = 0xE043,
+    // C23 §6.7.9 (D-CSUBSET-AUTO-TYPE-INFERENCE): the inference itself is
+    // INVALID — one code, distinct `.actual` messages (generic
+    // "initializer-inferred declaration ..." wording, never a keyword
+    // identity):
+    //   • the declaration's specifier prefix lacks the language's REQUIRED
+    //     inference specifier (`requiredSpecifierToken` — C23 6.7.9p1's
+    //     `auto`): `static x = 5;` / `register y = 2;` / `alignas(4) z = 9;`
+    //     / `[[maybe_unused]] w = 3;` all parse into the headless rule and
+    //     must STAY the errors they were (C89 implicit-int is not C23);
+    //   • the initializer's type is VOID (`auto v = voidFn();` — no object
+    //     type to declare);
+    //   • the initializer is the bare null-pointer keyword (`auto p =
+    //     nullptr;` — nullptr_t is a semantic-tier-only type that must never
+    //     reach MIR; folded into D-CSUBSET-NULLPTR-T-DECLARABLE);
+    //   • the initializer's type cannot be resolved at the declaration's own
+    //     Pass-1.5 visit (incl. the self-reference `auto x = x;` — the name
+    //     resolves to the symbol being declared, whose type is exactly what
+    //     is being inferred).
+    // UNSUPPRESSABLE — the C3 backfill seam: Pass 2's decl arm backfills
+    // `rec.type = initializer-type` for ANY unresolved declarator-mode
+    // symbol, so a suppressed rejection would silently compile the void/
+    // nullptr_t/self-referential form with a wrong or tripwire-tripping type.
+    S_AutoInferenceInvalid = 0xE044,
+    // C11 §6.7.1 / C23 §6.7.1 (D-CSUBSET-THREAD-LOCAL): `_Thread_local` /
+    // `thread_local` on a FUNCTION declarator (`thread_local int f(void);` —
+    // prototype or definition, intra-module or extern). Thread storage
+    // duration applies to OBJECTS only (6.7.1p4: "_Thread_local shall not
+    // appear in the declaration specifiers of a function declaration").
+    // UNSUPPRESSABLE — suppressed, the function would silently compile with
+    // the specifier dropped (and a file-scope declaration would carry a
+    // storage-class the codegen tiers never validated).
+    S_ThreadLocalOnFunction = 0xE045,
+    // C11 §6.7.1p3 (D-CSUBSET-THREAD-LOCAL): a BLOCK-scope object declared
+    // `thread_local` without `static` or `extern` in the same declaration
+    // (`void f(void) { thread_local int x; }` — the standard REQUIRES one of
+    // the two; a for-init `for (thread_local int i…)` is the same violation
+    // via the row's gated marker, since a for-init admits neither).
+    // UNSUPPRESSABLE — suppressed, the object would silently lower as a
+    // plain AUTOMATIC (a per-CALL stack slot: aliasing per-thread semantics
+    // with per-invocation storage — a silent miscompile of the storage
+    // duration the program declared).
+    S_ThreadLocalRequiresStaticOrExtern = 0xE046,
+    // C11 §6.7.1p3 (D-CSUBSET-THREAD-LOCAL): a same-TU REDECLARATION pair
+    // disagrees on thread storage — one declaration names the object
+    // `thread_local` and the other does not (`extern int g; thread_local int
+    // g = 5;` — 6.7.1p3: "it shall be present in the declaration of every
+    // declared name with thread storage duration"; BOTH directions).
+    // UNSUPPRESSABLE — suppressed, the merge would keep ONE record's flag
+    // and half the program's accesses would silently target the wrong
+    // storage (process-shared vs per-thread).
+    S_ThreadLocalRedeclarationMismatch = 0xE047,
+    // C11 §6.6p9 (D-CSUBSET-THREAD-LOCAL): the ADDRESS of a thread-local
+    // object used in a STATIC-storage-duration initializer (`thread_local
+    // int t; int *p = &t;` — scalar, aggregate member, or a block-scope
+    // `static int *q = &t;`). A thread-local object's address is NOT an
+    // address constant: it differs per thread and is only computable at
+    // runtime against the executing thread's TLS block. UNSUPPRESSABLE —
+    // suppressed, the emitted data item would carry an abs64 relocation
+    // whose resolved value is the link-time tpoff bit-cast to a pointer (a
+    // silent garbage pointer in .data — the exact CRIT-1 miscompile).
+    S_ThreadLocalAddressNotConstant = 0xE048,
+    // C11 §6.7.1p2 + C23 §6.7.1 (D-CSUBSET-THREAD-LOCAL): `thread_local`
+    // combined with a storage-class specifier the standard forbids — ONE
+    // code, distinct `.actual` messages:
+    //   • with `constexpr` (C23 6.7.1: constexpr may pair only with auto /
+    //     register / static — never thread_local);
+    //   • with `register` (6.7.1p2 admits only static / extern beside
+    //     thread_local; the c-subset parses `register` as an inert
+    //     storage-class specifier, so the pairing must reject here).
+    // (`typedef thread_local` cannot co-occur grammatically — typedefDecl
+    // has no storage-specifier prefix — so it stays a loud parse error.)
+    // UNSUPPRESSABLE — suppressed, the declaration would silently drop
+    // whichever specifier the downstream tiers don't model.
+    S_ThreadLocalInvalidCombination = 0xE049,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -978,6 +1209,13 @@ enum class DiagnosticCode : std::uint16_t {
     // garbling payload2) would mis-align the slot — a silent stack miscompile.
     // Caught at every verify point (verify-after-every-pass in release).
     I_AllocaAlignmentNotPowerOfTwo = 0xA013,
+    // C23 nullptr_t (D-CSUBSET-NULLPTR): a MIR instruction result type resolves to
+    // TypeKind::NullptrT. By construction NEVER fires — the `nullptr` literal lowers
+    // to the target-agnostic integer-0 null constant at the HIR tier, so NullptrT is
+    // a SEMANTIC-TIER-ONLY kind that must not reach MIR. A never-fires backstop that
+    // would catch a regression of that keystone invariant (e.g. a future change that
+    // lets a NullptrT-typed Const materialize). Caught at every verify point.
+    I_NullptrTypeInMir             = 0xA014,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //
@@ -1394,7 +1632,31 @@ enum class DiagnosticCode : std::uint16_t {
     //   the artifact is valid, the exec bit a best-effort convenience
     //   (D-OUTPUT-EXEC-BIT). No-op on Windows (PE ignores Unix modes).
     K_ImageExecBitFailed           = 0x8014,
-    // K-NEXT-SLOT: 0x8015 — grep this marker before adding a K_* code.
+    // K_FormatLacksThreadLocalSupport (D-CSUBSET-THREAD-LOCAL): a format
+    //   walker received a thread-local data item (a `.tdata`/`.tbss`-kind
+    //   section) but has NO TLS image machinery for it (ELF PT_TLS / the PE
+    //   TLS directory / Mach-O __thread_vars). The anti-static-alias
+    //   backstop: a format JSON that prematurely opts its data-section list
+    //   into "tdata"/"tbss" without walker support would otherwise lay the
+    //   template out as ORDINARY data — every thread silently sharing one
+    //   copy (a miscompile of the declared storage duration). Declared with
+    //   the C1 semantic tier so the C1/C2/C3 walker slices share one code;
+    //   fires from the walker tiers (slices B/C).
+    K_FormatLacksThreadLocalSupport = 0x8015,
+    // K_ThreadLocalOveralignedForFormat (D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN):
+    //   a thread-local object requires an alignment the OUTPUT FORMAT's
+    //   per-thread TLS block cannot guarantee. On PE/x64 the loader allocates
+    //   each thread's static-TLS block at only MEMORY_ALLOCATION_ALIGNMENT
+    //   (16 bytes), and IMAGE_TLS_DIRECTORY64 carries NO block-base-alignment
+    //   field to request more — so an `_Alignas(32) thread_local` var would be
+    //   SILENTLY under-aligned (a SIMD/atomic thread_local relying on it is
+    //   UB). ELF has no such limit (PT_TLS p_align honors any alignment), so
+    //   this is a PE-format-LOCAL fail-loud gate (the format plugin's own
+    //   knowledge — never a shared-substrate branch); the alignment axis is
+    //   otherwise fully honored. Fires from the PE walker (pe.cpp) when the
+    //   max TLS-block var alignment exceeds the format's guaranteed 16.
+    K_ThreadLocalOveralignedForFormat = 0x8016,
+    // K-NEXT-SLOT: 0x8017 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

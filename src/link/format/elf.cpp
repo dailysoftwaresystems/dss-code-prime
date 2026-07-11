@@ -16,6 +16,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -83,6 +84,12 @@ constexpr std::uint32_t PT_LOAD    = 1;
 constexpr std::uint32_t PT_DYNAMIC = 2;
 constexpr std::uint32_t PT_INTERP  = 3;
 constexpr std::uint32_t PT_PHDR    = 6;
+// D-CSUBSET-THREAD-LOCAL (TLS C1): the thread-local template segment.
+// glibc's ld.so records it as the main module's static-TLS block and
+// copies p_filesz bytes + zeroes (p_memsz − p_filesz) more for EVERY
+// thread (the main thread included — the CSU runs before main on
+// DSS's always-dynamic ELF arm, so no DSS-side arch_prctl is needed).
+constexpr std::uint32_t PT_TLS     = 7;
 constexpr std::uint32_t PF_X = 1;
 constexpr std::uint32_t PF_W = 2;
 constexpr std::uint32_t PF_R = 4;
@@ -558,9 +565,43 @@ encodeElfExecDynamic(
         "elf::encodeElfExecDynamic", reporter);
     if (!bssDynLayoutOpt.has_value()) return {};
     auto const& bssDynLayout = *bssDynLayoutOpt;
+    // D-CSUBSET-THREAD-LOCAL (TLS C1): the thread-local template pair —
+    // `.tdata` (initialized per-thread template bytes, file-backed) +
+    // `.tbss` (zero-fill per-thread extent). Laid out by the SAME shared
+    // kind-parameterized helper as every other data section. `.tdata`
+    // takes allowItemRelocations=true (CRIT-2's second half: a
+    // `thread_local char *msg = "hi";` template slot is patched IN PLACE
+    // with the target's absolute VA below — sound for this fixed-base
+    // ET_EXEC: every thread's copy starts from the patched template);
+    // `.tbss` is zero-fill and can carry none.
+    ObjectFormatSectionInfo const* secTdataDyn =
+        fmt.sectionByKind(SectionKind::ThreadData);
+    ObjectFormatSectionInfo const* secTbssDyn =
+        fmt.sectionByKind(SectionKind::ThreadBss);
+    std::uint64_t const tdataDynAlignFloor =
+        secTdataDyn != nullptr ? secTdataDyn->addrAlign : 1;
+    std::uint64_t const tbssDynAlignFloor =
+        secTbssDyn != nullptr ? secTbssDyn->addrAlign : 1;
+    auto tdataDynLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Tdata, tdataDynAlignFloor,
+        "elf::encodeElfExecDynamic", reporter, /*allowItemRelocations=*/true);
+    if (!tdataDynLayoutOpt.has_value()) return {};
+    auto& tdataDynLayout = *tdataDynLayoutOpt;
+    auto const tbssDynLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Tbss, tbssDynAlignFloor,
+        "elf::encodeElfExecDynamic", reporter);
+    if (!tbssDynLayoutOpt.has_value()) return {};
+    auto const& tbssDynLayout = *tbssDynLayoutOpt;
     bool const hasRodataDyn = !rodataDynLayout.empty();
     bool const hasDataDyn   = !dataDynLayout.empty();
     bool const hasBssDyn    = !bssDynLayout.empty();
+    bool const hasTdataDyn  = !tdataDynLayout.empty();
+    bool const hasTbssDyn   = !tbssDynLayout.empty();
+    // hasTls gates EVERY TLS-side emission below (PT_TLS, the phdr-count
+    // bump, the layout shift, the section headers) so a no-TLS module's
+    // image stays BYTE-IDENTICAL to the pre-TLS walker (the sqlite-dormant
+    // guarantee — pinned by NoTlsModuleByteIdenticalToPreTlsShape).
+    bool const hasTls = hasTdataDyn || hasTbssDyn;
     // Each present section's schema row is MANDATORY (the format JSON must
     // declare it — fail loud rather than emit an unnamed section header).
     if (hasRodataDyn && secRodataDyn == nullptr) {
@@ -579,6 +620,36 @@ encodeElfExecDynamic(
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
              "elf::encodeElfExecDynamic: module carries Bss items but the "
              "format declares no 'bss' section row (D-LK4-DATA-PRODUCER).");
+        return {};
+    }
+    if (hasTdataDyn && secTdataDyn == nullptr) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "elf::encodeElfExecDynamic: module carries Tdata (thread-local "
+             "template) items but the format declares no 'tdata' section row "
+             "(D-CSUBSET-THREAD-LOCAL).");
+        return {};
+    }
+    if (hasTbssDyn && secTbssDyn == nullptr) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "elf::encodeElfExecDynamic: module carries Tbss (zero-fill "
+             "thread-local) items but the format declares no 'tbss' section "
+             "row (D-CSUBSET-THREAD-LOCAL).");
+        return {};
+    }
+    // D-CSUBSET-THREAD-LOCAL: the TARGET must declare its static-TLS layout
+    // convention (`"tls"` identity block — Variant I/II + tcbHeaderBytes)
+    // before any tpoff can be computed. Absence is the capability signal
+    // (belt over the MIR→LIR `tlsbase`-opcode gate, which fires first on
+    // the real pipeline); a hand-built module reaching this walker under a
+    // TLS-less target fails loud here, never guesses a variant.
+    if (hasTls && !targetSchema.tlsIdentity().has_value()) {
+        emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+             std::string{"elf::encodeElfExecDynamic: module carries "
+                         "thread-local data items but target schema '"}
+                 + std::string{targetSchema.name()}
+                 + "' declares no 'tls' identity block (variant + "
+                   "tcbHeaderBytes) — cannot compute thread-pointer "
+                   "offsets (D-CSUBSET-THREAD-LOCAL).");
         return {};
     }
     std::vector<std::uint8_t> const& rodataDyn = rodataDynLayout.bytes;
@@ -802,9 +873,14 @@ encodeElfExecDynamic(
     // ── (i) Layout: compute file offsets + VAs ─────────────────
     constexpr std::uint64_t kEhdrSize = 64;
     constexpr std::uint64_t kPhdrSize = 56;
-    constexpr std::uint32_t kNumPhdrs = 5;  // PHDR + INTERP + LOAD×2 + DYNAMIC
+    // PHDR + INTERP + LOAD×2 + DYNAMIC, plus PT_TLS ONLY when the module
+    // carries thread-local items (D-CSUBSET-THREAD-LOCAL, audit fold
+    // HIGH-2): the conditional count keeps every no-TLS image — sqlite
+    // included — BYTE-IDENTICAL to the pre-TLS walker (phtSize/interpOff/
+    // every downstream offset shifts ONLY when TLS is present).
+    std::uint32_t const numPhdrs = hasTls ? 6u : 5u;
     std::uint64_t const phtOff = kEhdrSize;
-    std::uint64_t const phtSize = kNumPhdrs * kPhdrSize;
+    std::uint64_t const phtSize = numPhdrs * kPhdrSize;
     std::uint64_t const interpOff = phtOff + phtSize;
     std::uint64_t const interpVa  = baseImageVa + interpOff;
 
@@ -857,11 +933,71 @@ encodeElfExecDynamic(
     // without skewing any file-backed section's VA↔offset congruence.
     std::uint64_t const ptLoad2Start = alignUp(ptLoad1End, pageAlign);
     std::uint64_t const ptLoad2VaStart = baseImageVa + ptLoad2Start;
-    // `.data` at the start of PT_LOAD #2, aligned to its layout max.
+
+    // ── D-CSUBSET-THREAD-LOCAL (TLS C1, audit folds HIGH-1/HIGH-2) ──
+    // `.tdata` is the FIRST file-backed member of PT_LOAD #2 (before
+    // `.data`), and PT_TLS points at it: p_offset/p_vaddr = tdata,
+    // p_filesz = tdata span, p_memsz = tdata + tbss block. `.tbss`
+    // occupies NO file bytes AND NO PT_LOAD memory — unlike `.bss`, the
+    // per-thread copies are LOADER-allocated (one per thread, sized by
+    // PT_TLS p_memsz); nothing lives at its nominal VA in the process
+    // image, so extending PT_LOAD #2's p_memsz over it would reserve
+    // dead process-shared memory and desync the loader's TLS block from
+    // the segment map.
+    //
+    // p_align (tlsAlign) = max of the present TLS sections' member
+    // alignments (each layout.maxAlign already folds its schema floor).
+    // HIGH-1(b): glibc computes each thread's block base as an
+    // alignUp(..., p_align)-adjusted address — the link-time tpoffs
+    // below are only valid when tdataVa ≡ 0 (mod tlsAlign). tdataOff is
+    // alignUp(page-aligned ptLoad2Start, tlsAlign), so that holds
+    // whenever tlsAlign ≤ pageAlign; a stricter-than-page TLS alignment
+    // has no shipped producer (alignas caps at 256) but would silently
+    // break the congruence — fail loud instead.
+    std::uint64_t tlsAlignAcc = 1;
+    if (hasTdataDyn) tlsAlignAcc = std::max(tlsAlignAcc, tdataDynLayout.maxAlign);
+    if (hasTbssDyn)  tlsAlignAcc = std::max(tlsAlignAcc, tbssDynLayout.maxAlign);
+    std::uint64_t const tlsAlign = tlsAlignAcc;
+    if (hasTls && tlsAlign > pageAlign) {
+        emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+             std::format("elf::encodeElfExecDynamic: TLS block alignment "
+                         "{} exceeds the page alignment {} — .tdata's VA "
+                         "(alignUp of a page-aligned segment start) would "
+                         "no longer be congruent to 0 mod p_align, and "
+                         "glibc's per-thread block placement would shift "
+                         "every link-time tpoff. No shipped producer emits "
+                         "this; refusing to emit a silently-misaligned TLS "
+                         "block (D-CSUBSET-THREAD-LOCAL).",
+                         tlsAlign, pageAlign));
+        return {};
+    }
+    std::uint64_t const tdataOff =
+        hasTls ? alignUp(ptLoad2Start, tlsAlign) : ptLoad2Start;
+    std::uint64_t const tdataVa   = baseImageVa + tdataOff;
+    std::uint64_t const tdataSpan = tdataDynLayout.spanSize;  // 0 if none
+    // The per-thread block: tdata template bytes, then the tbss zero-fill
+    // part at its OWN alignment within the block (HIGH-1(a)).
+    std::uint64_t const tbssBlockBase =
+        alignUp(tdataSpan,
+                std::max<std::uint64_t>(1, hasTbssDyn ? tbssDynLayout.maxAlign
+                                                      : 1));
+    std::uint64_t const tlsBlockMemsz =
+        hasTbssDyn ? tbssBlockBase + tbssDynLayout.spanSize : tdataSpan;
+    // HIGH-1(a) — the gcc-witnessed physics: the thread pointer sits at
+    // the alignUp(memsz, p_align) boundary (Variant II), NOT at raw
+    // memsz. An _Alignas(32) member makes the two differ (memsz 0x10 →
+    // aligned 0x20; tpoff = 4 − 0x20 = −28, not 4 − 0x10).
+    std::uint64_t const alignedTlsBlockSize = alignUp(tlsBlockMemsz, tlsAlign);
+
+    // `.data` at the start of PT_LOAD #2 — shifted past `.tdata`'s file
+    // bytes when TLS is present (formula unchanged otherwise: the no-TLS
+    // byte-identity guarantee).
+    std::uint64_t const rwFileCursor =
+        hasTls ? tdataOff + tdataSpan : ptLoad2Start;
     std::uint64_t const dataAlignDyn =
         hasDataDyn ? dataDynLayout.maxAlign : 1;
     std::uint64_t const dataOff =
-        hasDataDyn ? alignUp(ptLoad2Start, dataAlignDyn) : ptLoad2Start;
+        hasDataDyn ? alignUp(rwFileCursor, dataAlignDyn) : rwFileCursor;
     std::uint64_t const dataVa  = baseImageVa + dataOff;
     std::uint64_t const dataSz  = dataDynLayout.spanSize;
 
@@ -1039,6 +1175,17 @@ encodeElfExecDynamic(
         secDataDyn != nullptr ? std::string{secDataDyn->name} : std::string{".data"});
     auto const shsBss      = shstrtab.add(
         secBssDyn != nullptr ? std::string{secBssDyn->name} : std::string{".bss"});
+    // `.tdata` / `.tbss` names (D-CSUBSET-THREAD-LOCAL) — added ONLY when
+    // present, unlike the unconditional .data/.bss adds above: those
+    // predate this cycle and are baked into the no-data baseline, while a
+    // new unconditional add would grow .shstrtab on EVERY image and break
+    // the no-TLS byte-identity guarantee (the sqlite-dormant claim).
+    // secTdataDyn/secTbssDyn are non-null here (the mandatory row guards
+    // above failed loud otherwise).
+    std::uint32_t const shsTdata =
+        hasTdataDyn ? shstrtab.add(std::string{secTdataDyn->name}) : 0u;
+    std::uint32_t const shsTbss =
+        hasTbssDyn ? shstrtab.add(std::string{secTbssDyn->name}) : 0u;
     auto const shsPlt      = shstrtab.add(".plt");
     auto const shsDynsym   = shstrtab.add(".dynsym");
     auto const shsDynstr   = shstrtab.add(".dynstr");
@@ -1084,6 +1231,11 @@ encodeElfExecDynamic(
     // with an intra-module function symbol fails loud (silent-
     // failure C2 convergence — same defect exists in PE walker
     // and is anchored for parallel fold).
+    // symbolVa holds one entry per function / extern / data item — an
+    // ABSOLUTE VA for everything EXCEPT thread-local items, whose entry is
+    // the SIGNED thread-pointer offset bit-cast to u64 (the symbolVa-reuse
+    // trick — see addTlsSymbolOffsets; `tlsSymbols` records which entries
+    // are tpoffs so the CRIT-1 cross-check below can police every use).
     std::unordered_map<SymbolId, std::uint64_t> symbolVa;
     symbolVa.reserve(module.functions.size() + numExterns
                      + module.dataItems.size());
@@ -1114,6 +1266,28 @@ encodeElfExecDynamic(
         && !link::format::addDataSymbolVas(
                module.dataItems, bssDynLayout, bssVa,
                symbolVa, "elf::encodeElfExecDynamic", reporter)) {
+        return {};
+    }
+    // D-CSUBSET-THREAD-LOCAL (TLS C1): thread-local items join symbolVa
+    // with their VARIANT-KEYED tpoff (NOT a VA) via addTlsSymbolOffsets —
+    // they must NEVER also pass through addDataSymbolVas (one entry per
+    // symbol; the tls-tpoff32 Linear patch reads THIS value). The .tbss
+    // call adds tbssBlockBase so both sections index one contiguous
+    // per-thread block. tlsIdentity() is engaged here (the hasTls guard
+    // above failed loud otherwise).
+    std::unordered_set<SymbolId> tlsSymbols;
+    if (hasTdataDyn
+        && !link::format::addTlsSymbolOffsets(
+               module.dataItems, tdataDynLayout, /*blockBaseOffset=*/0,
+               alignedTlsBlockSize, tlsAlign, *targetSchema.tlsIdentity(),
+               symbolVa, tlsSymbols, "elf::encodeElfExecDynamic", reporter)) {
+        return {};
+    }
+    if (hasTbssDyn
+        && !link::format::addTlsSymbolOffsets(
+               module.dataItems, tbssDynLayout, tbssBlockBase,
+               alignedTlsBlockSize, tlsAlign, *targetSchema.tlsIdentity(),
+               symbolVa, tlsSymbols, "elf::encodeElfExecDynamic", reporter)) {
         return {};
     }
     for (std::size_t i = 0; i < numExterns; ++i) {
@@ -1151,6 +1325,85 @@ encodeElfExecDynamic(
             "elf::encodeElfExecDynamic", reporter)) {
         return {};
     }
+
+    // ── ★ D-CSUBSET-THREAD-LOCAL walker backstop (audit fold CRIT-1) ──
+    // symbolVa is now tpoff-poisoned for `tlsSymbols` members: their
+    // entries are SIGNED thread-pointer offsets bit-cast to u64, only
+    // meaningful under a tls-flagged relocation kind. Police EVERY use
+    // BEFORE any patch is written:
+    //
+    // (a) NO data-item relocation may target a TLS symbol. A data slot
+    //     holds a link-time-constant ADDRESS; a thread-local object has
+    //     no such address (its address is tp-relative, one per thread) —
+    //     C11 6.6p9 excludes thread storage duration from address
+    //     constants. The semantic tier already rejects `&tls_var` in a
+    //     static initializer (S_ThreadLocalAddressNotConstant, 0xE048);
+    //     this is the walker-tier belt: without it,
+    //     applyDataItemRelocations would write the bit-cast NEGATIVE
+    //     tpoff verbatim as an abs64 "address" — a silent garbage
+    //     pointer.
+    //
+    // (b) Function relocations must agree with the target row's `tls`
+    //     flag BOTH ways: a non-tls kind against a TLS symbol would
+    //     embed the bit-cast tpoff as an address; a tls kind against a
+    //     non-TLS symbol would embed a VA as a tpoff. Either direction
+    //     is the silent-garbage class; both fail loud.
+    //
+    // Diagnostic code: K_RelocationKindMismatch — the walker's
+    // established "this relocation cannot be applied as declared" code;
+    // the defect is a reloc-kind↔target-storage-class disagreement, not
+    // a missing format capability (0x8015 would mis-blame the format,
+    // which DOES support TLS here).
+    if (!tlsSymbols.empty()) {
+        for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+            for (auto const& rel : module.dataItems[i].relocations) {
+                if (tlsSymbols.contains(rel.target)) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format(
+                             "elf::encodeElfExecDynamic: data item #{} "
+                             "(SymbolId={{ {} }}) carries a relocation "
+                             "targeting THREAD-LOCAL symbol #{} — the "
+                             "address of a thread-local object is not a "
+                             "link-time constant (C11 6.6p9; the semantic "
+                             "tier rejects this as 0xE048 "
+                             "S_ThreadLocalAddressNotConstant). Patching "
+                             "it would embed the bit-cast thread-pointer "
+                             "offset as a garbage pointer "
+                             "(D-CSUBSET-THREAD-LOCAL, CRIT-1).",
+                             i, module.dataItems[i].symbol.v,
+                             rel.target.v));
+                    return {};
+                }
+            }
+        }
+    }
+    for (auto const& fn : module.functions) {
+        for (auto const& rel : fn.relocations) {
+            auto const* tri = targetSchema.relocationInfo(rel.kind);
+            bool const relocIsTls = tri != nullptr && tri->tls;
+            bool const targetIsTls = tlsSymbols.contains(rel.target);
+            if (relocIsTls != targetIsTls) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format(
+                         "elf::encodeElfExecDynamic: function SymbolId={{ "
+                         "{} }} relocation (kind {}{}) {} symbol #{} — a "
+                         "tls-flagged relocation carries a thread-pointer "
+                         "OFFSET and a non-tls one an ADDRESS; mixing "
+                         "them embeds the wrong value class silently "
+                         "(D-CSUBSET-THREAD-LOCAL, CRIT-1).",
+                         fn.symbol.v, rel.kind.v,
+                         tri != nullptr
+                             ? std::format(" '{}'", tri->name)
+                             : std::string{},
+                         targetIsTls
+                             ? "is not tls-flagged but targets THREAD-LOCAL"
+                             : "is tls-flagged but targets NON-thread-local",
+                         rel.target.v));
+                return {};
+            }
+        }
+    }
+
     // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): patch each MUTABLE symbol-address
     // global pointer's abs64 data→data reloc IN PLACE with the target's resolved
     // VA (symbolVa is fully built now). ELF exec is in-place — no `.rela` for an
@@ -1165,6 +1418,18 @@ encodeElfExecDynamic(
     if (hasDataDyn
         && !link::format::applyDataItemRelocations(
                dataDynLayout.bytes, module.dataItems, dataDynLayout, dataVa,
+               symbolVa, targetSchema, "elf::encodeElfExecDynamic", reporter)) {
+        return {};
+    }
+    // D-CSUBSET-THREAD-LOCAL (CRIT-2 second half): patch `.tdata` TEMPLATE
+    // slots the same way — a `thread_local char *msg = "hi";` template slot
+    // gets the rodata target's ABSOLUTE VA (fixed-base ET_EXEC: the VA is
+    // final; every thread's copy starts from the patched template). The
+    // CRIT-1 scan above already rejected any TLS-TARGETING reloc, so every
+    // reloc reaching this call resolves to a genuine VA.
+    if (hasTdataDyn
+        && !link::format::applyDataItemRelocations(
+               tdataDynLayout.bytes, module.dataItems, tdataDynLayout, tdataVa,
                symbolVa, targetSchema, "elf::encodeElfExecDynamic", reporter)) {
         return {};
     }
@@ -1183,8 +1448,11 @@ encodeElfExecDynamic(
     // because the dynsym patch below needs IDX_BSS (a data extern's
     // st_shndx) BEFORE the dynsym body is appended. Emit order:
     //   0 NULL, 1 .interp, 2 .text, [.rodata], .plt, .dynsym,
-    //   .dynstr, .hash, .rela.dyn, [.data], .got, .dynamic, [.bss],
-    //   .symtab, .strtab, .shstrtab
+    //   .dynstr, .hash, .rela.dyn, [.tdata], [.tbss], [.data], .got,
+    //   .dynamic, [.bss], .symtab, .strtab, .shstrtab
+    // (D-CSUBSET-THREAD-LOCAL: `.tdata` right before `.data` matches the
+    // file layout — its bytes physically open PT_LOAD #2; `.tbss` (NOBITS,
+    // no file bytes) sits beside its template, the gcc pairing.)
     std::uint16_t idxCursor = 0;
     auto nextIdx = [&]() { return idxCursor++; };
     std::uint16_t const IDX_NULL   = nextIdx();  (void)IDX_NULL;
@@ -1197,6 +1465,10 @@ encodeElfExecDynamic(
     std::uint16_t const IDX_DYNSTR = nextIdx();
     std::uint16_t const IDX_HASH   = nextIdx();  (void)IDX_HASH;
     std::uint16_t const IDX_RELADYN = nextIdx(); (void)IDX_RELADYN;
+    std::uint16_t const IDX_TDATA  = hasTdataDyn ? nextIdx() : std::uint16_t{0};
+    (void)IDX_TDATA;
+    std::uint16_t const IDX_TBSS   = hasTbssDyn ? nextIdx() : std::uint16_t{0};
+    (void)IDX_TBSS;
     std::uint16_t const IDX_DATA   = hasDataDyn ? nextIdx() : std::uint16_t{0};
     (void)IDX_DATA;
     std::uint16_t const IDX_GOT    = nextIdx();  (void)IDX_GOT;
@@ -1263,14 +1535,29 @@ encodeElfExecDynamic(
     //                  + .dynstr + .hash + .rela.dyn
     appendPhdrEntry(PT_LOAD,    PF_X | PF_R, 0,            baseImageVa,
                     ptLoad1End,    ptLoad1End,    pageAlign);
-    // PT_LOAD #2 R+W — [.data] + .got + .dynamic + [.bss]. p_filesz covers
-    // the file-backed sections; p_memsz additionally covers `.bss` (zero-fill,
-    // no file bytes) so the loader reserves + zeroes the bss span at load.
-    // D-LK4-DATA-PRODUCER.
+    // PT_LOAD #2 R+W — [.tdata] + [.data] + .got + .dynamic + [.bss].
+    // p_filesz covers the file-backed sections (INCLUDING the `.tdata`
+    // template bytes at the segment head — they must be mapped for the
+    // loader to copy them per-thread); p_memsz additionally covers `.bss`
+    // (zero-fill, no file bytes) so the loader reserves + zeroes the bss
+    // span at load. `.tbss` contributes to NEITHER (D-CSUBSET-THREAD-
+    // LOCAL: the per-thread copies live in loader-allocated TLS blocks
+    // sized by PT_TLS p_memsz, not in this segment). D-LK4-DATA-PRODUCER.
     appendPhdrEntry(PT_LOAD,    PF_W | PF_R, ptLoad2Start, ptLoad2VaStart,
                     ptLoad2FileSize, ptLoad2MemSize, pageAlign);
     appendPhdrEntry(PT_DYNAMIC, PF_W | PF_R, dynamicOff,   dynamicVa,
                     dynamicSz,     dynamicSz,     8);
+    // PT_TLS (D-CSUBSET-THREAD-LOCAL, audit fold HIGH-2) — present ONLY
+    // when the module carries thread-local items (numPhdrs bumped to 6
+    // above; every no-TLS image stays byte-identical). Points at the
+    // `.tdata` template inside PT_LOAD #2: p_filesz = the initialized
+    // template bytes, p_memsz = template + tbss block (the loader
+    // allocates p_memsz per thread, copies p_filesz, zeroes the rest),
+    // p_align = the TLS block alignment the tpoff formulas above assumed.
+    if (hasTls) {
+        appendPhdrEntry(PT_TLS, PF_R, tdataOff, tdataVa,
+                        tdataSpan, tlsBlockMemsz, tlsAlign);
+    }
 
     // Section bodies: pad-to-offset + append per section (simplifier
     // #1 + #4 fold using local padToOffset / appendBytes helpers).
@@ -1283,7 +1570,11 @@ encodeElfExecDynamic(
     padToOffset(bytes, hashOff);      appendBytes(bytes, hashSec);
     padToOffset(bytes, relaDynOff);   appendBytes(bytes, relaDyn);
     padToOffset(bytes, ptLoad2Start);                                // PT_LOAD #2 boundary
-    // `.data` (mutable initialized globals) at the start of PT_LOAD #2.
+    // `.tdata` (thread-local template) opens PT_LOAD #2 (D-CSUBSET-THREAD-
+    // LOCAL) — its (possibly reloc-patched) bytes precede `.data`'s.
+    // `.tbss` emits NO file bytes (zero-fill template extent).
+    if (hasTdataDyn) { padToOffset(bytes, tdataOff); appendBytes(bytes, tdataDynLayout.bytes); }
+    // `.data` (mutable initialized globals) follows.
     // `.bss` emits NO file bytes (zero-fill) so it is absent from this body
     // pass — its size lives only in the section header + p_memsz.
     if (hasDataDyn) { padToOffset(bytes, dataOff); appendBytes(bytes, dataDynBytes); }
@@ -1350,6 +1641,32 @@ encodeElfExecDynamic(
         .name_offset = shsRelaDyn, .type = SHT_RELA, .flags = SHF_ALLOC,
         .addr = relaDynVa, .offset = relaDynOff, .size = relaDynSz,
         .link = IDX_DYNSYM, .addr_align = 8, .entry_size = 24});
+    // `.tdata` / `.tbss` (D-CSUBSET-THREAD-LOCAL): sh_type / sh_flags read
+    // from the SCHEMA ROWS (SHT_PROGBITS / SHT_NOBITS, both
+    // SHF_WRITE|SHF_ALLOC|SHF_TLS = 0x403), never hardcoded. `.tbss`'s
+    // sh_addr = tdataVa + tdataSpan is NOMINAL — the gcc overlap
+    // convention: a NOBITS TLS section occupies no process-image memory
+    // (the loader materializes per-thread copies from PT_TLS), so its
+    // "address" merely documents the template ordering and may overlap
+    // whatever follows; sh_offset likewise points just past the template
+    // bytes without consuming file space.
+    if (hasTdataDyn) {
+        writeSectionHeader(bytes, SectionHeader{
+            .name_offset = shsTdata,
+            .type = secTdataDyn->type,
+            .flags = secTdataDyn->flags,
+            .addr = tdataVa, .offset = tdataOff, .size = tdataSpan,
+            .addr_align = tdataDynLayout.maxAlign});
+    }
+    if (hasTbssDyn) {
+        writeSectionHeader(bytes, SectionHeader{
+            .name_offset = shsTbss,
+            .type = secTbssDyn->type,
+            .flags = secTbssDyn->flags,
+            .addr = tdataVa + tdataSpan, .offset = tdataOff + tdataSpan,
+            .size = tbssDynLayout.spanSize,
+            .addr_align = tbssDynLayout.maxAlign});
+    }
     // `.data` (SHF_ALLOC | SHF_WRITE) — mutable initialized globals, file-
     // backed, in the R+W PT_LOAD #2. sh_type / sh_flags / sh_addralign come
     // from the SCHEMA ROW (NOT hardcoded — `secDataDyn->type` = SHT_PROGBITS,
@@ -1431,7 +1748,7 @@ encodeElfExecDynamic(
     appendU32LE(ehdr, 0);  // e_flags
     appendU16LE(ehdr, static_cast<std::uint16_t>(kEhdrSize));
     appendU16LE(ehdr, static_cast<std::uint16_t>(kPhdrSize));
-    appendU16LE(ehdr, static_cast<std::uint16_t>(kNumPhdrs));
+    appendU16LE(ehdr, static_cast<std::uint16_t>(numPhdrs));
     appendU16LE(ehdr, 64);  // sizeof(Elf64_Shdr)
     appendU16LE(ehdr, kNumSections);
     appendU16LE(ehdr, IDX_SHSTRTAB);
@@ -1578,6 +1895,32 @@ encode(AssembledModule const&    module,
     // D-LK1-ELF-EXEC-DATA-SECTIONS.
     std::string const elfDataWriterName =
         isExec ? "elf::encode (ET_EXEC)" : "elf::encode (ET_REL)";
+    // D-CSUBSET-THREAD-LOCAL (audit fold LOW-b): thread-local items are
+    // handled ONLY by the DYNAMIC walker arm (encodeElfExecDynamic — PT_TLS
+    // + tpoff symbolVa). This static ET_EXEC / ET_REL arm has no TLS block
+    // emission; laying a Tdata/Tbss item out here would silently produce a
+    // process-shared alias (and no PT_TLS for the loader). Unreachable via
+    // the shipped pipeline (DSS ELF exes always import libc `exit` → the
+    // dynamic arm; the linker's acceptsDataSection gate fires first for
+    // non-opted-in formats) — this is the anti-static-alias belt for a
+    // hand-built module or a future format JSON opting in prematurely.
+    // A freestanding no-libc profile would land TLS here (the thread_local
+    // arc design's fork C: it needs DSS-side arch_prctl synthesis, since
+    // no ld.so runs to process PT_TLS).
+    for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+        auto const  s = module.dataItems[i].section;
+        if (s != DataSectionKind::Tdata && s != DataSectionKind::Tbss)
+            continue;
+        emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+             std::format("{}: AssembledData item #{} is thread-local ({}) "
+                         "but the static ELF arm emits no PT_TLS/TLS "
+                         "block — thread-locals are supported only on the "
+                         "ELF DYNAMIC arm (D-CSUBSET-THREAD-LOCAL; a "
+                         "no-libc static-exec profile is a future fork of "
+                         "that arc).",
+                         elfDataWriterName, i, dataSectionKindName(s)));
+        return {};
+    }
     // Floor = the schema's section addrAlign when the row exists (peeked
     // WITHOUT a diagnostic; the mandatory fail-loud `requireSection` on the
     // exec path below is what enforces the row).

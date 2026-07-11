@@ -237,6 +237,15 @@ public:
     [[nodiscard]] bool globalIsConst(MirGlobalId id) const {
         return globalArena_.at(id).isConst;
     }
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): true iff the source declared this
+    // global with thread storage duration. The assembler's section selection
+    // consults it BEFORE isConst (a `const thread_local` is per-thread
+    // first, read-only second → `.tdata`, never `.rodata`); every MIR clone
+    // surface (merge / optimizer rebuild / DCE) propagates it via the
+    // non-defaulted addGlobal parameter.
+    [[nodiscard]] bool globalIsThreadLocal(MirGlobalId id) const {
+        return globalArena_.at(id).isThreadLocal;
+    }
     // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): the source-declared
     // explicit `alignas(N)` alignment in bytes (a power of two ≤ 256), or 0 for
     // no override. The assembler's data-item emission raises the emitted
@@ -377,12 +386,27 @@ public:
     // `alignmentBytes` (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): the explicit
     // `alignas(N)` alignment in bytes (power of two ≤ 256), or 0 (default) for
     // no override. Stored on `MirGlobal.alignment`; consumed by the assembler.
+    // `threadStorage` (TLS C1, D-CSUBSET-THREAD-LOCAL): thread storage
+    // duration — deliberately NON-DEFAULTED (and everything before it lost
+    // its default per the C++ trailing-default rule) so EVERY caller —
+    // lowering, the cross-CU merge, the optimizer rebuilds, DCE, mir_text,
+    // tests — must CHOOSE a value: the arc's CRIT-3 finding was three
+    // positional clone sites silently dropping the flag through a defaulted
+    // parameter, turning a per-thread object into a process-shared one on
+    // every release compile. A new clone site now fails to COMPILE until it
+    // decides. A STRONG ENUM, not a bool (code-audit LOW-1): a bool here
+    // was transposable with the adjacent `isConst` and fillable by an
+    // integer under the historical 8-arg call shape `addGlobal(…, isConst,
+    // alignmentBytes)` — `MirThreadStorage` admits neither conversion, so
+    // both mistakes are compile errors (see the enum's doc in mir_node.hpp;
+    // propagation sites bridge via `mirThreadStorageOf(bool)`).
     MirGlobalId addGlobal(TypeId type, SymbolId symbol,
-                          std::uint32_t initLiteralIndex = UINT32_MAX,
-                          MirFuncId     initFunc         = {},
-                          SymbolBinding    binding       = SymbolBinding::Global,
-                          SymbolVisibility visibility    = SymbolVisibility::Default,
-                          bool             isConst       = false,
+                          std::uint32_t initLiteralIndex,
+                          MirFuncId     initFunc,
+                          SymbolBinding    binding,
+                          SymbolVisibility visibility,
+                          bool             isConst,
+                          MirThreadStorage threadStorage,
                           std::uint32_t    alignmentBytes = 0);
 
     // Reserve a basic block in the current function WITHOUT opening it, returning

@@ -1047,7 +1047,9 @@ struct LoweredAgg {
         std::optional<AggregateLayoutParams> lp, DataModel dm) {
     MirBuilder b;
     std::uint32_t const lit = b.literalPoolAdd(std::move(init));
-    b.addGlobal(type, SymbolId{1}, lit);
+    b.addGlobal(type, SymbolId{1}, lit, MirFuncId{}, SymbolBinding::Global,
+                SymbolVisibility::Default, /*isConst=*/false,
+                MirThreadStorage::Shared);
     Mir const m = std::move(b).finish();
     DiagnosticReporter rep;
     auto items = lowerMirGlobalsToDataItems(m, ti, lp, dm, rep);
@@ -1094,10 +1096,12 @@ struct LoweredScalar {
         v.core  = TypeKind::I32;
         std::uint32_t const lit = b.literalPoolAdd(std::move(v));
         b.addGlobal(i32, SymbolId{1}, lit, {},
-                    SymbolBinding::Global, SymbolVisibility::Default, isConst);
+                    SymbolBinding::Global, SymbolVisibility::Default, isConst,
+                    MirThreadStorage::Shared);
     } else {
         b.addGlobal(i32, SymbolId{1}, UINT32_MAX, {},
-                    SymbolBinding::Global, SymbolVisibility::Default, isConst);
+                    SymbolBinding::Global, SymbolVisibility::Default, isConst,
+                    MirThreadStorage::Shared);
     }
     Mir const m = std::move(b).finish();
     DiagnosticReporter rep;

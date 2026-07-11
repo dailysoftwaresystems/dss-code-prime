@@ -105,6 +105,10 @@ windowFor(EncodingSlotKind s) noexcept {
         // disasm-completeness gap as Imm19/MemOffsetZero — anchored
         // D-AS5-MULTIWORD-DISASM).
         case EncodingSlotKind::Imm32MovzMovk:
+        // TLS C1 (D-CSUBSET-THREAD-LOCAL): x86-variable ModR/M-byte
+        // slots — never on a fixed32 variant.
+        case EncodingSlotKind::AbsoluteDisp32Mem:
+        case EncodingSlotKind::MemRelocDisp32:
             return std::nullopt;
     }
     // Unreachable for any in-range EncodingSlotKind (the switch is

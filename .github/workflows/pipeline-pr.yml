@@ -342,7 +342,13 @@ jobs:
           # surface in stdout but ctest still reports success.
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: ctest ${{ '--output-on-failure --no-tests=error' }}
+        # `--parallel 4` runs the 620-case suite concurrently (the build step is
+        # already parallel). Verified parallel-safe (isolated per-test temp dirs)
+        # + 620/620 at -j4; cuts the wall time ~4x, which keeps the instrumented
+        # ASan+UBSan leg (previously ~35-40 min single-threaded) well under the
+        # 30-min budget. `4` is portable across the Linux/Windows/macOS matrix
+        # (unlike a shell `$(nproc)`).
+        run: ctest ${{ '--output-on-failure --no-tests=error --parallel 4' }}
         timeout-minutes: 30
 
       - name: Upload test logs on failure

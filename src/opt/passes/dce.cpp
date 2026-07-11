@@ -386,6 +386,11 @@ DceResult runDce(Mir& mir, TypeInterner const& /*interner*/,
                           newInitIdx, MirFuncId{},
                           mir.globalBinding(g), mir.globalVisibility(g),
                           mir.globalIsConst(g),
+                          // TLS C1 (D-CSUBSET-THREAD-LOCAL, CRIT-3): preserve
+                          // thread storage duration across DCE's rebuild — the
+                          // 4th clone site (the audit named merge + the two
+                          // rebuild-helper prologs; DCE clones globals itself).
+                          mirThreadStorageOf(mir.globalIsThreadLocal(g)),
                           // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: preserve the
                           // global's explicit alignment across DCE's rebuild.
                           mir.globalAlignmentBytes(g));

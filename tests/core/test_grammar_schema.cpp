@@ -1922,6 +1922,141 @@ TEST(GrammarSchema, SemanticsDefinesWhenChildUnknownChildRuleReportsUnknownShape
     EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownShape));
 }
 
+// ── FC17.5 D-CSUBSET-AUTO-TYPE-INFERENCE: inference-row loader cross-checks ──
+//
+// `inferTypeFromInitializer` waives the declarator-mode `head` requirement
+// (the type derives from the sole declarator's initializer at Pass 1.5) and
+// `requiredSpecifierToken` is the loader-resolved presence-gate token. Four
+// pins hold the cross-check lattice: the head∧infer conflict, the positive
+// headless load, the unknown gate-token reject (row DROPPED — a half-wired
+// gate would silently accept C89 implicit-int), and the PRE-EXISTING
+// no-head-no-infer C_MissingField gate staying intact (the relaxation must
+// not have widened it). Each uses the minimal synthetic declarator language
+// (the test_declarator_engine shapes, trimmed) so the pins are independent
+// of the shipped c-subset config.
+
+namespace {
+// The shared skeleton: tokens + declarator shapes + the `declarators` role
+// block; each test splices its own `declarations` row into %DECLS%.
+[[nodiscard]] std::string inferSchemaWithDeclRow(std::string_view declRow) {
+    std::string cfg = R"JSON({
+      "dssSchemaVersion": 4,
+      "language": { "name": "InferSynth", "version": "0.0.1" },
+      "tokens": {
+        " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+        "*":  [{ "kind": "Star" }],
+        ",":  [{ "kind": "Comma" }],
+        ";":  [{ "kind": "Semi" }],
+        "=":  [{ "kind": "Eq" }],
+        "(":  [{ "kind": "ParenOpen" }],
+        ")":  [{ "kind": "ParenClose" }],
+        "[":  [{ "kind": "BracketOpen" }],
+        "]":  [{ "kind": "BracketClose" }]
+      },
+      "numberStyle": { "decimal": true, "emitKind": { "integer": "IntLiteral" } },
+      "keywords": [
+        { "word": "base", "kind": "BaseKw" },
+        { "word": "inf",  "kind": "InfKw" }
+      ],
+      "shapes": {
+        "root":    { "sequence": [ { "repeat": "vdecl" } ] },
+        "vdecl":   { "sequence": [ "heads", "dlist", "Semi" ] },
+        "heads":   { "sequence": [ { "optional": "InfKw" }, "BaseKw" ] },
+        "dlist":   { "sequence": [ "idecl", { "repeat": { "sequence": [ "Comma", "idecl" ] } } ] },
+        "idecl":   { "sequence": [ "dtor", { "optional": { "sequence": [ "Eq", "IntLiteral" ] } } ] },
+        "dtor":    { "sequence": [ { "repeat": "player" }, "ddirect" ] },
+        "player":  { "sequence": [ "Star" ] },
+        "ddirect": { "sequence": [ { "alt": [ "Identifier", "dgroup" ] },
+                                   { "repeat": { "alt": [ "fsuf", "asuf" ] } } ] },
+        "dgroup":  { "sequence": [ "ParenOpen", "dtor", "ParenClose" ] },
+        "fsuf":    { "sequence": [ "ParenOpen", "ParenClose" ] },
+        "asuf":    { "sequence": [ "BracketOpen", "IntLiteral", "BracketClose" ] }
+      },
+      "semantics": {
+        "identifierToken": "Identifier",
+        "declarators": {
+          "declaratorRule":     "dtor",
+          "pointerLayerRule":   "player",
+          "pointerToken":       "Star",
+          "directRule":         "ddirect",
+          "groupRule":          "dgroup",
+          "nameToken":          "Identifier",
+          "fnSuffixRule":       "fsuf",
+          "arraySuffixRule":    "asuf",
+          "initDeclaratorRule": "idecl",
+          "listRule":           "dlist"
+        },
+        "declarations": [ %DECLS% ],
+        "builtinTypes": [ { "name": "base", "core": "I32" } ],
+        "literalTypes": [ { "literal": "IntLiteral", "core": "I32" } ]
+      }
+    })JSON";
+    auto const pos = cfg.find("%DECLS%");
+    cfg.replace(pos, 7, declRow);
+    return cfg;
+}
+} // namespace
+
+// (a) A row setting BOTH `head` and `inferTypeFromInitializer` — two
+// competing type sources — must reject C_ConflictingField, never resolve by
+// precedence (a silent winner would hide a config authoring error).
+TEST(GrammarSchema, InferTypeRowWithHeadReportsConflictingField) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "head": 0, "declaratorList": 1,
+             "kind": "variable", "inferTypeFromInitializer": true })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_ConflictingField));
+}
+
+// (b) The POSITIVE load: an inference row with NO head and a declaratorList
+// loads cleanly, with all three fields resolved on the row (the loader's
+// head-requirement waiver — RED if the relaxation is dropped).
+TEST(GrammarSchema, InferTypeRowWithoutHeadLoadsCleanly) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "declaratorList": 1, "kind": "variable",
+             "inferTypeFromInitializer": true,
+             "requiredSpecifierToken": "InfKw" })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_TRUE(r.has_value())
+        << (r.error().empty() ? "<no diagnostics>" : r.error()[0].message);
+    auto const& sem = (*r)->semantics();
+    ASSERT_EQ(sem.declarations.size(), 1u);
+    auto const& row = sem.declarations[0];
+    EXPECT_TRUE(row.inferTypeFromInitializer);
+    EXPECT_FALSE(row.headChild.has_value());
+    ASSERT_TRUE(row.declaratorListChild.has_value());
+    EXPECT_EQ(*row.declaratorListChild, 1u);
+    ASSERT_TRUE(row.requiredSpecifierToken.has_value());
+    EXPECT_TRUE(row.requiredSpecifierToken->valid());
+    EXPECT_TRUE(row.isDeclaratorMode())
+        << "a declaratorList-only inference row is still declarator-mode";
+}
+
+// (c) An UNKNOWN `requiredSpecifierToken` name must reject C_UnknownToken
+// AND drop the row — a half-wired presence gate would silently accept the
+// C89 implicit-int shapes the gate exists to keep loud.
+TEST(GrammarSchema, InferTypeRowUnknownRequiredSpecifierTokenRejects) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "declaratorList": 1, "kind": "variable",
+             "inferTypeFromInitializer": true,
+             "requiredSpecifierToken": "NoSuchKw" })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_UnknownToken));
+}
+
+// (d) The PRE-EXISTING gate is un-widened: a declarator-mode row with
+// NEITHER `head` NOR `inferTypeFromInitializer` still reports
+// C_MissingField (the relaxation waives the head for inference rows ONLY).
+TEST(GrammarSchema, DeclaratorModeRowWithoutHeadStillReportsMissingField) {
+    auto const cfg = inferSchemaWithDeclRow(
+        R"({ "rule": "vdecl", "declaratorList": 1, "kind": "variable" })");
+    auto r = GrammarSchema::loadFromText(cfg);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_TRUE(hasDiagCode(r.error(), DiagnosticCode::C_MissingField));
+}
+
 // ── c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: references[].compositeKind ──────
 //
 // `compositeKind` on a `references[]` row drives the opaque-tag forward-mint

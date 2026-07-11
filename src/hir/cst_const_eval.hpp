@@ -9,6 +9,7 @@
 #include <functional>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 
 // CST-side const-eval engine (plan 12.5 §0.2 D6). Companion to the HIR-
@@ -34,6 +35,17 @@
 //   - Ternary (cfg.ternaryExprRule when present)
 //   - identifier Ref (when `resolveSymbolInit` is supplied — recurses
 //     into the symbol's CST init expression with cycle detection)
+// FC17 (D-CSUBSET-CONSTEXPR) additions — all config-gated, null/absent ⇒ off:
+//   - FIXED-VALUE keyword literal token (`true`/`false` — `literalTypes`
+//     `value:` rows via `CstEvalContext::fixedValueTokens`; integer-valued
+//     cores only, so a NullptrT `nullptr` row never folds as an integer)
+//   - float literal token (decoded via the config-aware `decodeFloat`;
+//     `CstEvalContext::floatLiteralTokens`, populated ONLY by the
+//     float-capable constexpr-initializer consumer)
+//   - NARROW character constant (`'a'` — the [charStartToken, charBodyToken]
+//     shape via the SHARED `decodeCharLiteralBody`, gated on the body token
+//     being integer-cored; wide/UTF openers stay non-foldable/loud — their
+//     element core is format-keyed and semantic-stamped, not derivable here)
 
 namespace dss {
 
@@ -164,6 +176,27 @@ struct CstEvalContext {
     // schema without a configured numeric-literal style still parses
     // bare digit strings.
     NumberStyle const*                       numberStyle = nullptr;
+    // FC17 (D-CSUBSET-CONSTEXPR): tokens that decode as FLOAT literals
+    // (`decodeFloat`-eligible), built by the caller from
+    // `SemanticConfig::literalTypes` filtered to float cores. NULLABLE and
+    // null by default — a null set keeps the engine integer-only at the leaf
+    // (today's behavior); ONLY the float-capable `constExprValue` consumer
+    // populates it (the array-dimension / enum / static_assert / designator
+    // consumers stay null so a float can never leak into an integer-required
+    // context through the leaf — their walls: this null, combineBinary/
+    // UnaryCst's !allowFloat refusal, and asInt64Bridge rejecting doubles).
+    std::unordered_set<std::uint32_t> const* floatLiteralTokens = nullptr;
+    // FC17 F2 (D-CSUBSET-CONSTEXPR / the pre-existing `_Static_assert(true)`
+    // gap): token → the config-declared FIXED literal value of a KEYWORD
+    // literal (`literalTypes` rows with `value:` — C23 `true`→Bool 1 /
+    // `false`→Bool 0), mirroring the CST→HIR tier's `litFixed_` ("the engine
+    // never decodes their text as a number"). The caller builds the map
+    // filtered to INTEGER-VALUED cores only (bool/char/integer kinds) — a
+    // NullptrT-cored row (`nullptr`, value 0) is EXCLUDED by construction so
+    // `nullptr` never folds as an integer constant (`int a[nullptr]` /
+    // `_Static_assert(nullptr,"")` stay loud). NULLABLE and null by default.
+    std::unordered_map<std::uint32_t, HirLiteralValue> const* fixedValueTokens
+        = nullptr;
 };
 
 // Evaluate `expr` to a compile-time `HirLiteralValue`. Pure function;

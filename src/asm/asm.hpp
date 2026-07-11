@@ -261,20 +261,26 @@ struct DSS_EXPORT AssembledData {
     std::vector<std::uint8_t> bytes;
     Alignment                 alignment;  // default = 1-byte
     std::vector<Relocation>   relocations;
-    // `reservedSize` — the in-memory byte size for a `Bss` (zero-fill) item,
-    // where `bytes` is EMPTY by invariant (the wire format reserves the size in
-    // the section header without storing file bytes). For `Rodata`/`Data` items
-    // the on-disk + in-memory size is `bytes.size()` and this field is unused
-    // (0). A tentative global `int g;` produces a `Bss` item with `bytes.empty()`
-    // and `reservedSize == sizeof(int)`. D-LK4-DATA-PRODUCER (BSS arm).
+    // `reservedSize` — the in-memory byte size for a ZERO-FILL item
+    // (`Bss` / `Tbss` — `isZeroFill(section)`), where `bytes` is EMPTY by
+    // invariant (the wire format reserves the size in the section header
+    // without storing file bytes). For file-backed items (`Rodata`/`Data`/
+    // `Tdata`) the on-disk + in-memory size is `bytes.size()` and this field
+    // is unused (0). A tentative global `int g;` produces a `Bss` item with
+    // `bytes.empty()` and `reservedSize == sizeof(int)`; a `thread_local
+    // int g;` produces the same shape with section=Tbss. D-LK4-DATA-PRODUCER
+    // (BSS arm) + D-CSUBSET-THREAD-LOCAL (Tbss arm).
     std::uint64_t             reservedSize = 0;
 
     // The number of bytes this item occupies in its section / VA span — the
-    // file-backed `bytes.size()` for Rodata/Data, the zero-fill `reservedSize`
-    // for Bss. The single chokepoint every walker uses to advance section
-    // layout offsets so the Bss/non-Bss split lives in ONE place.
+    // file-backed `bytes.size()` for Rodata/Data/Tdata, the zero-fill
+    // `reservedSize` for Bss/Tbss. The single chokepoint every walker uses to
+    // advance section layout offsets; the zero-fill/file-backed split lives
+    // in the ONE shared `isZeroFill` predicate (section_kind.hpp — TLS C1
+    // audit fold M-3: an exact `== Bss` test here would have silently sized
+    // every Tbss item at bytes.size()==0).
     [[nodiscard]] std::uint64_t sizeInSection() const noexcept {
-        return section == DataSectionKind::Bss
+        return isZeroFill(section)
                    ? reservedSize
                    : static_cast<std::uint64_t>(bytes.size());
     }

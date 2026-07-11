@@ -471,6 +471,34 @@ TEST(MirVerifier, AllocaPowerOfTwoAlignmentAndZeroPass) {
     EXPECT_EQ(countCode(r, DiagnosticCode::I_AllocaAlignmentNotPowerOfTwo), 0u);
 }
 
+// C23 nullptr_t (D-CSUBSET-NULLPTR): the I_NullptrTypeInMir tripwire — a never-fires
+// backstop for the keystone invariant. `nullptr` lowers to the integer-0 null
+// constant at the HIR tier, so NullptrT is a SEMANTIC-TIER-ONLY kind that must never
+// reach MIR. This constructs the FORBIDDEN state directly (a Const whose result type
+// is NullptrT) and asserts the verifier catches it — the red-on-disable proof
+// (remove the verifier arm → this const passes → a keystone regression ships silently).
+TEST(MirVerifier, NullptrTResultTypeRejected) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const nptr  = interner.primitive(TypeKind::NullptrT);
+    TypeId const fnSig = interner.fnSig({}, interner.primitive(TypeKind::Void),
+                                        CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirLiteralValue lv;
+    lv.value = static_cast<std::int64_t>(0);
+    lv.core  = TypeKind::NullptrT;
+    (void)b.addConst(lv, nptr);   // a Const whose RESULT type is NullptrT — forbidden
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &interner};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_NullptrTypeInMir), 1u);
+}
+
 // Return value type that doesn't match FnSig's return type emits
 // I_TerminatorTypeMismatch.
 TEST(MirVerifier, ReturnTypeMismatch) {

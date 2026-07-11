@@ -22,6 +22,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/target_schema.hpp"
 #include "link/format/elf.hpp"
+#include "link/format/exec_data_section.hpp"   // TLS C1: addTlsSymbolOffsets pin
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 
@@ -31,6 +32,8 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -2213,4 +2216,546 @@ TEST(ElfExecWriter, ElfExecAnonymousRodataItemsDoNotCollide) {
     ASSERT_GE(bytes.size(), roFileOff + 8u);
     EXPECT_EQ(bytes[roFileOff + 0], 0xAAu);
     EXPECT_EQ(bytes[roFileOff + 4], 0x11u);
+}
+
+// ═════════════════════════════════════════════════════════════════
+// D-CSUBSET-THREAD-LOCAL (TLS C1): the ELF dynamic walker's PT_TLS /
+// .tdata / .tbss / tpoff structural pins.
+//
+// ★ RED-ON-DISABLE POSTURE (the arc's test-methodology insight): a
+// SINGLE-THREAD runtime witness cannot distinguish real TLS from a
+// process-shared static alias — both pass "init visible + mutation
+// sticks". THESE STRUCTURAL PINS ARE THE DISCRIMINATOR: rerouting
+// isThreadLocal globals through Data/Bss (the alias miscompile) keeps
+// the single-thread examples green while PT_TLS disappears, the
+// SHF_TLS headers vanish, and the patched disp32s become VAs instead
+// of the hand-derived tpoffs — turning every EXPECT below red. The
+// runnable 2-thread discriminator is examples/c-subset/
+// thread_local_pthread (each worker must observe the TEMPLATE value).
+// ═════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Dynamic-arm scaffolding: 1 function + 1 extern (the dynamic walker
+// requires a non-empty externImports). The function body is a rel32
+// call at offset 1 (-> the extern's PLT stub) followed by `nSlots`
+// 5-byte "90 + 4 zero bytes" groups whose zero-byte windows host the
+// tls-tpoff32 relocs the tests place, then C3 (ret).
+[[nodiscard]] AssembledModule makeTlsDynModule(std::size_t nSlots) {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0};
+    for (std::size_t i = 0; i < nSlots; ++i) {
+        fn.bytes.push_back(0x90);
+        for (int b = 0; b < 4; ++b) fn.bytes.push_back(0);
+    }
+    fn.bytes.push_back(0xC3);
+    Relocation call;
+    call.offset = 1; call.target = SymbolId{99};
+    call.kind = RelocationKind{1};                   // rel32
+    fn.relocations.push_back(call);
+    mod.functions.push_back(std::move(fn));
+    ExternImport imp;
+    imp.symbol      = SymbolId{99};
+    imp.mangledName = "exit";
+    imp.libraryPath = "libc.so.6";
+    mod.externImports.push_back(std::move(imp));
+    return mod;
+}
+
+// The text offset of tls slot `i`'s 4-byte disp window (the zero bytes
+// after the i-th 0x90): 5 (call) + i*5 + 1.
+[[nodiscard]] constexpr std::uint64_t tlsSlotOff(std::size_t i) {
+    return 5u + static_cast<std::uint64_t>(i) * 5u + 1u;
+}
+
+[[nodiscard]] AssembledData makeTdataItem(std::uint32_t sym,
+                                          std::vector<std::uint8_t> bytes,
+                                          std::uint32_t align) {
+    AssembledData d;
+    d.symbol    = SymbolId{sym};
+    d.section   = DataSectionKind::Tdata;
+    d.bytes     = std::move(bytes);
+    d.alignment = Alignment::ofRuntimePow2(align);
+    return d;
+}
+
+[[nodiscard]] AssembledData makeTbssItem(std::uint32_t sym,
+                                         std::uint64_t size,
+                                         std::uint32_t align) {
+    AssembledData d;
+    d.symbol       = SymbolId{sym};
+    d.section      = DataSectionKind::Tbss;
+    d.reservedSize = size;
+    d.alignment    = Alignment::ofRuntimePow2(align);
+    return d;
+}
+
+struct PhdrView {
+    std::uint32_t type = 0, flags = 0;
+    std::uint64_t off = 0, va = 0, filesz = 0, memsz = 0, align = 0;
+};
+
+[[nodiscard]] std::vector<PhdrView> readPhdrs(
+        std::span<std::uint8_t const> b) {
+    std::vector<PhdrView> out;
+    std::uint64_t const phoff = readU64LE(b, 32);
+    std::uint16_t const phnum = readU16LE(b, 56);
+    for (std::uint16_t i = 0; i < phnum; ++i) {
+        std::size_t const o = static_cast<std::size_t>(phoff) + i * 56u;
+        PhdrView p;
+        p.type   = readU32LE(b, o + 0);
+        p.flags  = readU32LE(b, o + 4);
+        p.off    = readU64LE(b, o + 8);
+        p.va     = readU64LE(b, o + 16);
+        p.filesz = readU64LE(b, o + 32);
+        p.memsz  = readU64LE(b, o + 40);
+        p.align  = readU64LE(b, o + 48);
+        out.push_back(p);
+    }
+    return out;
+}
+
+// Find the FIRST section header whose sh_type+sh_flags match. Returns
+// the header's file offset, or 0 when absent.
+[[nodiscard]] std::size_t findShdrByTypeFlags(
+        std::span<std::uint8_t const> b,
+        std::uint32_t type, std::uint64_t flags) {
+    std::uint64_t const shoff = readU64LE(b, 40);
+    std::uint16_t const shnum = readU16LE(b, 60);
+    for (std::uint16_t i = 1; i < shnum; ++i) {
+        std::size_t const off = static_cast<std::size_t>(shoff)
+                              + static_cast<std::size_t>(i) * kShdrSize;
+        if (readU32LE(b, off + 4) == type
+            && readU64LE(b, off + 8) == flags) {
+            return off;
+        }
+    }
+    return 0;
+}
+
+constexpr std::uint64_t kShfTls   = 0x400;
+constexpr std::uint64_t kTlsFlags = 0x403;   // WRITE|ALLOC|TLS
+
+} // namespace
+
+TEST(ElfExecTls, TwoVarLayoutEmitsPtTlsWithExactVariant2Tpoffs) {
+    // The audit HIGH-1/HIGH-2 layout, hand-derived (shipped schema
+    // floors: .tdata/.tbss addrAlign 1 — member-driven, gcc parity):
+    //   tdata: g {07 00 00 00} align 4 -> offset 0, span 4, maxAlign 4
+    //   tbss:  h 4 bytes align 4       -> offset 0, span 4, maxAlign 4
+    //   tlsAlign = 4; tbssBlockBase = alignUp(4,4) = 4
+    //   blockMemsz = 4+4 = 8; alignedBlockSize = alignUp(8,4) = 8
+    //   Variant II tpoffs: g = 0-8 = -8 (F8 FF FF FF LE)
+    //                      h = 4-8 = -4 (FC FF FF FF LE)
+    //   PT_TLS: filesz=4 (template), memsz=8 (+tbss), align=4
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTlsDynModule(2);
+    Relocation r0; r0.offset = tlsSlotOff(0); r0.target = SymbolId{42};
+    r0.kind = RelocationKind{4};                    // tls-tpoff32
+    Relocation r1; r1.offset = tlsSlotOff(1); r1.target = SymbolId{43};
+    r1.kind = RelocationKind{4};
+    mod.functions[0].relocations.push_back(r0);
+    mod.functions[0].relocations.push_back(r1);
+    mod.dataItems.push_back(makeTdataItem(42, {7, 0, 0, 0}, 4));
+    mod.dataItems.push_back(makeTbssItem(43, 4, 4));
+    // Control non-TLS mutable global: proves .data still lays out
+    // AFTER .tdata with its own correct VA.
+    AssembledData ctl;
+    ctl.symbol = SymbolId{44}; ctl.section = DataSectionKind::Data;
+    ctl.bytes = {9, 0, 0, 0}; ctl.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(ctl));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    // e_phnum == 6 (PHDR/INTERP/LOAD/LOAD/DYNAMIC + PT_TLS).
+    EXPECT_EQ(readU16LE(bytes, 56), 6u);
+    auto const phdrs = readPhdrs(bytes);
+    ASSERT_EQ(phdrs.size(), 6u);
+    // The header block shifted by exactly one phdr: PT_INTERP body now
+    // starts at 64 + 6*56 = 400 (the no-TLS control pins 344).
+    ASSERT_EQ(phdrs[1].type, 3u /*PT_INTERP*/);
+    EXPECT_EQ(phdrs[1].off, 400u);
+
+    PhdrView const* tls = nullptr;
+    PhdrView const* load2 = nullptr;
+    for (auto const& p : phdrs) {
+        if (p.type == 7u) tls = &p;
+        if (p.type == 1u && (p.flags & 0x2u)) load2 = &p;   // R+W LOAD
+    }
+    ASSERT_NE(tls, nullptr) << "PT_TLS must be present";
+    ASSERT_NE(load2, nullptr);
+    // .tdata opens PT_LOAD #2 (audit HIGH-2): PT_TLS points at the
+    // segment head.
+    EXPECT_EQ(tls->off, load2->off);
+    EXPECT_EQ(tls->va, load2->va);
+    EXPECT_EQ(tls->flags, 4u /*PF_R*/);
+    EXPECT_EQ(tls->filesz, 4u);
+    EXPECT_EQ(tls->memsz, 8u);
+    EXPECT_EQ(tls->align, 4u);
+    // ★ .tbss occupies NO PT_LOAD memory: with no .bss present the R+W
+    // segment's p_memsz equals its p_filesz exactly (a Bss-style tail
+    // for tbss would break this).
+    EXPECT_EQ(load2->memsz, load2->filesz)
+        << ".tbss must not extend PT_LOAD #2 p_memsz — per-thread "
+           "copies are loader-allocated from PT_TLS, not mapped here";
+
+    // .tdata section header: schema-driven SHT_PROGBITS + 0x403.
+    std::size_t const tdOff = findShdrByTypeFlags(bytes, 1u, kTlsFlags);
+    ASSERT_NE(tdOff, 0u) << ".tdata (PROGBITS, WRITE|ALLOC|TLS) missing";
+    EXPECT_EQ(readU64LE(bytes, tdOff + 16), tls->va);       // sh_addr
+    EXPECT_EQ(readU64LE(bytes, tdOff + 24), tls->off);      // sh_offset
+    EXPECT_EQ(readU64LE(bytes, tdOff + 32), 4u);            // sh_size
+    // template bytes == 07 00 00 00.
+    std::size_t const tdFile =
+        static_cast<std::size_t>(readU64LE(bytes, tdOff + 24));
+    EXPECT_EQ(bytes[tdFile + 0], 7u);
+    EXPECT_EQ(bytes[tdFile + 1], 0u);
+    EXPECT_EQ(bytes[tdFile + 2], 0u);
+    EXPECT_EQ(bytes[tdFile + 3], 0u);
+
+    // .tbss: SHT_NOBITS + 0x403; nominal overlap convention
+    // sh_addr = tdataVa + tdataSpan; sh_offset = tdata end; sh_size 4.
+    std::size_t const tbOff = findShdrByTypeFlags(bytes, 8u, kTlsFlags);
+    ASSERT_NE(tbOff, 0u) << ".tbss (NOBITS, WRITE|ALLOC|TLS) missing";
+    EXPECT_EQ(readU64LE(bytes, tbOff + 16), tls->va + 4u);
+    EXPECT_EQ(readU64LE(bytes, tbOff + 24), tls->off + 4u);
+    EXPECT_EQ(readU64LE(bytes, tbOff + 32), 4u);
+
+    // ★ The tpoff pins (HIGH-1 physics, Variant II): the patched
+    // disp32s are the hand-derived NEGATIVE offsets, byte-exact.
+    std::uint64_t const textFile = 0x1000;   // pageAlign
+    std::size_t const g0 = static_cast<std::size_t>(textFile + tlsSlotOff(0));
+    EXPECT_EQ(bytes[g0 + 0], 0xF8u);  // -8 LE
+    EXPECT_EQ(bytes[g0 + 1], 0xFFu);
+    EXPECT_EQ(bytes[g0 + 2], 0xFFu);
+    EXPECT_EQ(bytes[g0 + 3], 0xFFu);
+    std::size_t const h0 = static_cast<std::size_t>(textFile + tlsSlotOff(1));
+    EXPECT_EQ(bytes[h0 + 0], 0xFCu);  // -4 LE
+    EXPECT_EQ(bytes[h0 + 1], 0xFFu);
+    EXPECT_EQ(bytes[h0 + 2], 0xFFu);
+    EXPECT_EQ(bytes[h0 + 3], 0xFFu);
+
+    // The non-TLS control global still lands in a writable .data AFTER
+    // the template: dataVa = alignUp(tdataVa + 4, 8) = tdataVa + 8, and
+    // its byte is the 9 we stored.
+    std::size_t const daOff = findShdrByTypeFlags(bytes, 1u, 0x3u);
+    ASSERT_NE(daOff, 0u) << ".data (PROGBITS, WRITE|ALLOC) missing";
+    EXPECT_EQ(readU64LE(bytes, daOff + 16), tls->va + 8u);
+    std::size_t const daFile =
+        static_cast<std::size_t>(readU64LE(bytes, daOff + 24));
+    EXPECT_EQ(bytes[daFile], 9u);
+}
+
+TEST(ElfExecTls, Alignas32MemberRecomputesTpoffsAndPAlign) {
+    // ★ The audit HIGH-1 _Alignas(32) pin — the case that catches the
+    // naive "tpoff = offset - memsz" formula (gcc-witnessed: the tp
+    // sits at alignUp(memsz, p_align), NOT at raw memsz):
+    //   tdata: g {07..} align 4  -> offset 0
+    //          a32 {01..} align 32 -> offset alignUp(4,32)=32, span 36
+    //          maxAlign 32
+    //   tbss:  h 4 bytes align 4 -> tbssBlockBase = alignUp(36,4) = 36
+    //   blockMemsz = 36+4 = 40; tlsAlign = 32
+    //   alignedBlockSize = alignUp(40,32) = 64        <- THE crux
+    //   tpoffs: g = 0-64 = -64 (C0 FF FF FF)
+    //           a32 = 32-64 = -32 (E0 FF FF FF)
+    //           h = 36-64 = -28 (E4 FF FF FF)
+    //   PT_TLS: filesz=36, memsz=40, align=32
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTlsDynModule(3);
+    struct Slot { std::size_t i; std::uint32_t sym; };
+    for (Slot s : {Slot{0, 42}, Slot{1, 45}, Slot{2, 43}}) {
+        Relocation r;
+        r.offset = static_cast<std::uint32_t>(tlsSlotOff(s.i));
+        r.target = SymbolId{s.sym};
+        r.kind   = RelocationKind{4};
+        mod.functions[0].relocations.push_back(r);
+    }
+    mod.dataItems.push_back(makeTdataItem(42, {7, 0, 0, 0}, 4));
+    mod.dataItems.push_back(makeTdataItem(45, {1, 0, 0, 0}, 32));
+    mod.dataItems.push_back(makeTbssItem(43, 4, 4));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    auto const phdrs = readPhdrs(bytes);
+    PhdrView const* tls = nullptr;
+    for (auto const& p : phdrs) if (p.type == 7u) tls = &p;
+    ASSERT_NE(tls, nullptr);
+    EXPECT_EQ(tls->filesz, 36u);
+    EXPECT_EQ(tls->memsz, 40u);
+    EXPECT_EQ(tls->align, 32u);
+
+    std::uint64_t const textFile = 0x1000;
+    auto expect4 = [&](std::size_t slot, std::uint8_t b0, std::uint8_t b1,
+                       std::uint8_t b2, std::uint8_t b3) {
+        std::size_t const o =
+            static_cast<std::size_t>(textFile + tlsSlotOff(slot));
+        EXPECT_EQ(bytes[o + 0], b0) << "slot " << slot;
+        EXPECT_EQ(bytes[o + 1], b1) << "slot " << slot;
+        EXPECT_EQ(bytes[o + 2], b2) << "slot " << slot;
+        EXPECT_EQ(bytes[o + 3], b3) << "slot " << slot;
+    };
+    expect4(0, 0xC0, 0xFF, 0xFF, 0xFF);   // g   = -64
+    expect4(1, 0xE0, 0xFF, 0xFF, 0xFF);   // a32 = -32
+    expect4(2, 0xE4, 0xFF, 0xFF, 0xFF);   // h   = -28
+}
+
+TEST(ElfExecTls, NoTlsModuleByteIdenticalToPreTlsShape) {
+    // ★ The byte-identity control (HIGH-2 / sqlite-dormant guarantee):
+    // the SAME module minus the TLS items must show ZERO trace of the
+    // TLS machinery — 5 phdrs (PT_INTERP body back at 64+5*56=344), no
+    // PT_TLS, no SHF_TLS section header. Every TLS emission is gated on
+    // hasTls, so a no-TLS image is byte-identical to the pre-TLS
+    // walker's output (sqlite's images must not move).
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTlsDynModule(0);
+    AssembledData ctl;
+    ctl.symbol = SymbolId{44}; ctl.section = DataSectionKind::Data;
+    ctl.bytes = {9, 0, 0, 0}; ctl.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(ctl));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    EXPECT_EQ(readU16LE(bytes, 56), 5u) << "no PT_TLS slot without TLS items";
+    auto const phdrs = readPhdrs(bytes);
+    ASSERT_EQ(phdrs[1].type, 3u);
+    EXPECT_EQ(phdrs[1].off, 344u) << "layout must NOT shift without TLS";
+    for (auto const& p : phdrs) EXPECT_NE(p.type, 7u);
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    std::uint16_t const shnum = readU16LE(bytes, 60);
+    for (std::uint16_t i = 1; i < shnum; ++i) {
+        std::size_t const off = static_cast<std::size_t>(shoff)
+                              + static_cast<std::size_t>(i) * kShdrSize;
+        EXPECT_EQ(readU64LE(bytes, off + 8) & kShfTls, 0u)
+            << "no SHF_TLS section may exist in a no-TLS image";
+    }
+}
+
+TEST(ElfExecTls, Crit1DataRelocTargetingTlsSymbolFailsLoud) {
+    // ★ CRIT-1(a): `int *p = &tls_var;` at the walker tier — a data
+    // slot cannot hold a thread-local "address" (C11 6.6p9; the
+    // semantic tier's 0xE048 sibling). Without the backstop the abs64
+    // patch would embed the bit-cast NEGATIVE tpoff as a pointer.
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTlsDynModule(1);
+    Relocation r0; r0.offset = static_cast<std::uint32_t>(tlsSlotOff(0));
+    r0.target = SymbolId{42};
+    r0.kind = RelocationKind{4};
+    mod.functions[0].relocations.push_back(r0);
+    mod.dataItems.push_back(makeTdataItem(42, {7, 0, 0, 0}, 4));
+    AssembledData p;
+    p.symbol = SymbolId{50}; p.section = DataSectionKind::Data;
+    p.bytes.assign(8, 0); p.alignment = Alignment::of<8>();
+    Relocation pr; pr.offset = 0; pr.target = SymbolId{42};
+    pr.kind = RelocationKind{2};                     // abs64
+    p.relocations.push_back(pr);
+    mod.dataItems.push_back(std::move(p));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool saw = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_RelocationKindMismatch
+            && d.actual.find("CRIT-1") != std::string::npos
+            && d.actual.find("THREAD-LOCAL") != std::string::npos) {
+            saw = true;
+        }
+    }
+    EXPECT_TRUE(saw) << "a data reloc against a TLS symbol must fail "
+                        "loud, never patch a garbage pointer";
+}
+
+TEST(ElfExecTls, Crit1NonTlsFunctionRelocTargetingTlsSymbolFailsLoud) {
+    // ★ CRIT-1(b) direction 1: a NON-tls-flagged function reloc (rel32)
+    // against a TLS symbol would embed the bit-cast tpoff as an address.
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTlsDynModule(1);
+    Relocation r0; r0.offset = static_cast<std::uint32_t>(tlsSlotOff(0));
+    r0.target = SymbolId{42};
+    r0.kind = RelocationKind{1};                     // rel32 — WRONG class
+    mod.functions[0].relocations.push_back(r0);
+    mod.dataItems.push_back(makeTdataItem(42, {7, 0, 0, 0}, 4));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool saw = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_RelocationKindMismatch
+            && d.actual.find("CRIT-1") != std::string::npos) {
+            saw = true;
+        }
+    }
+    EXPECT_TRUE(saw);
+}
+
+TEST(ElfExecTls, Crit1TlsRelocTargetingNonTlsSymbolFailsLoud) {
+    // ★ CRIT-1(b) direction 2: a tls-tpoff32 reloc against a NON-TLS
+    // symbol would embed an absolute VA as a thread-pointer offset.
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTlsDynModule(1);
+    Relocation r0; r0.offset = static_cast<std::uint32_t>(tlsSlotOff(0));
+    r0.target = SymbolId{44};
+    r0.kind = RelocationKind{4};                     // tls kind, non-TLS target
+    mod.functions[0].relocations.push_back(r0);
+    mod.dataItems.push_back(makeTdataItem(42, {7, 0, 0, 0}, 4));
+    AssembledData ctl;
+    ctl.symbol = SymbolId{44}; ctl.section = DataSectionKind::Data;
+    ctl.bytes = {9, 0, 0, 0}; ctl.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(ctl));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool saw = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_RelocationKindMismatch
+            && d.actual.find("CRIT-1") != std::string::npos) {
+            saw = true;
+        }
+    }
+    EXPECT_TRUE(saw);
+}
+
+TEST(ElfExecTls, TdataTemplateSlotPatchedWithRodataTargetVa) {
+    // ★ CRIT-2 witness: `thread_local char *msg = "hi";` — the .tdata
+    // TEMPLATE slot is patched at link time with the rodata target's
+    // ABSOLUTE VA (sound for fixed-base ET_EXEC: every thread's copy
+    // starts from the patched template). A demotion to .data (the
+    // pre-fold behavior) or an unpatched slot flips this red.
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTlsDynModule(0);
+    AssembledData ro;
+    ro.symbol = SymbolId{60}; ro.section = DataSectionKind::Rodata;
+    ro.bytes = {0x68, 0x69, 0}; ro.alignment = Alignment::of<1>();   // "hi"
+    mod.dataItems.push_back(std::move(ro));
+    AssembledData slot;
+    slot.symbol = SymbolId{61}; slot.section = DataSectionKind::Tdata;
+    slot.bytes.assign(8, 0); slot.alignment = Alignment::of<8>();
+    Relocation sr; sr.offset = 0; sr.target = SymbolId{60};
+    sr.kind = RelocationKind{2};                     // abs64
+    slot.relocations.push_back(sr);
+    mod.dataItems.push_back(std::move(slot));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "a reloc-bearing .tdata template must ENCODE (CRIT-2), not "
+           "reject or demote";
+    ASSERT_FALSE(bytes.empty());
+
+    // rodata VA from its header — PROGBITS + SHF_ALLOC + sh_size 3
+    // (the "hi\0" bytes). The size discriminant matters: `.interp` is
+    // ALSO PROGBITS + SHF_ALLOC, so a type+flags-only scan finds it
+    // first (0x40xxxx — the initial red run of this pin caught that).
+    std::uint64_t roVa = 0;
+    {
+        std::uint64_t const shoff = readU64LE(bytes, 40);
+        std::uint16_t const shnum = readU16LE(bytes, 60);
+        for (std::uint16_t i = 1; i < shnum; ++i) {
+            std::size_t const off = static_cast<std::size_t>(shoff)
+                                  + static_cast<std::size_t>(i) * kShdrSize;
+            if (readU32LE(bytes, off + 4) == 1u
+                && readU64LE(bytes, off + 8) == 0x2u
+                && readU64LE(bytes, off + 32) == 3u) {
+                roVa = readU64LE(bytes, off + 16);
+                break;
+            }
+        }
+    }
+    ASSERT_NE(roVa, 0u) << ".rodata (PROGBITS, ALLOC, 3 bytes) missing";
+    // .tdata header + its 8 template bytes == the rodata VA.
+    std::size_t const tdOff = findShdrByTypeFlags(bytes, 1u, kTlsFlags);
+    ASSERT_NE(tdOff, 0u) << "the slot must stay in .tdata (thread-local "
+                            "identity preserved), never demoted to .data";
+    std::size_t const tdFile =
+        static_cast<std::size_t>(readU64LE(bytes, tdOff + 24));
+    EXPECT_EQ(readU64LE(bytes, tdFile), roVa)
+        << "template slot must hold the patched target VA";
+}
+
+TEST(ElfExecTls, AddTlsSymbolOffsetsVariant1FormulaPinnedNow) {
+    // ★ The Variant-I (arm64) formula arm, config-keyed and pinned NOW
+    // (TLS C2 only supplies the arm64 `tls` identity block — zero code):
+    //   tpoff = alignUp(tcbHeaderBytes, tlsAlignment) + templateOffset
+    // gcc-witnessed HIGH-1(c): alignUp(16, 32) = 32, NOT the naive 16.
+    std::vector<AssembledData> items;
+    items.push_back(makeTdataItem(42, {7, 0, 0, 0}, 4));
+    DiagnosticReporter rep;
+    auto layoutOpt = link::format::buildExecDataSection(
+        items, DataSectionKind::Tdata, /*floor=*/1, "tls-test", rep);
+    ASSERT_TRUE(layoutOpt.has_value());
+
+    TlsIdentity v1{TlsVariant::Variant1, /*tcbHeaderBytes=*/16};
+    {
+        std::unordered_map<SymbolId, std::uint64_t> symbolVa;
+        std::unordered_set<SymbolId> tlsSymbols;
+        ASSERT_TRUE(link::format::addTlsSymbolOffsets(
+            items, *layoutOpt, /*blockBaseOffset=*/0,
+            /*alignedBlockSize=*/4, /*tlsAlignment=*/4, v1,
+            symbolVa, tlsSymbols, "tls-test", rep));
+        ASSERT_TRUE(symbolVa.contains(SymbolId{42}));
+        EXPECT_EQ(symbolVa[SymbolId{42}], 16u)
+            << "Variant1 @align4: alignUp(16,4)+0 == 16";
+        EXPECT_TRUE(tlsSymbols.contains(SymbolId{42}));
+    }
+    {
+        std::unordered_map<SymbolId, std::uint64_t> symbolVa;
+        std::unordered_set<SymbolId> tlsSymbols;
+        ASSERT_TRUE(link::format::addTlsSymbolOffsets(
+            items, *layoutOpt, 0, /*alignedBlockSize=*/64,
+            /*tlsAlignment=*/32, v1, symbolVa, tlsSymbols,
+            "tls-test", rep));
+        EXPECT_EQ(symbolVa[SymbolId{42}], 32u)
+            << "Variant1 @align32: alignUp(16,32)+0 == 32 (HIGH-1(c) — "
+               "the naive 16+offset is WRONG under a 32-aligned block)";
+    }
+    {
+        // Variant II bit-cast exactness: u64(-64) round-trips.
+        TlsIdentity v2{TlsVariant::Variant2, 0};
+        std::unordered_map<SymbolId, std::uint64_t> symbolVa;
+        std::unordered_set<SymbolId> tlsSymbols;
+        ASSERT_TRUE(link::format::addTlsSymbolOffsets(
+            items, *layoutOpt, 0, /*alignedBlockSize=*/64,
+            /*tlsAlignment=*/32, v2, symbolVa, tlsSymbols,
+            "tls-test", rep));
+        EXPECT_EQ(symbolVa[SymbolId{42}], 0xFFFFFFFFFFFFFFC0ull)
+            << "Variant2: int64(0-64) bit-cast to u64";
+    }
+}
+
+TEST(ElfExecTls, StaticElfArmRejectsTlsItemsLoud) {
+    // Audit LOW-b: the STATIC (externless) ELF arm has no PT_TLS
+    // emission — a Tdata item reaching it must fail 0x8015, never lay
+    // out as a process-shared alias. (Unreachable via the shipped
+    // pipeline — every DSS ELF exe imports libc exit and routes to the
+    // dynamic arm — this is the hand-built/premature-opt-in belt.)
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);   // NO externs
+    mod.dataItems.push_back(makeTdataItem(42, {7, 0, 0, 0}, 4));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool saw = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_FormatLacksThreadLocalSupport
+            && d.actual.find("static ELF arm") != std::string::npos) {
+            saw = true;
+        }
+    }
+    EXPECT_TRUE(saw) << "static-arm TLS items must reject "
+                        "K_FormatLacksThreadLocalSupport (0x8015)";
 }

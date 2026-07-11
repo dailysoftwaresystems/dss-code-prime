@@ -125,6 +125,22 @@ struct DSS_EXPORT BitfieldSuffix {
     std::optional<std::uint32_t> widthChild;    // visible-child index of the width expr
 };
 
+// C23 6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE, FC17): an enum's OPTIONAL explicit
+// underlying-type clause (`enum E : unsigned char { … }`). When a declaration
+// configures one and a node of `rule` appears in the composite's subtree, the
+// enum's underlying scalar TypeKind is the integer type at that node's visible
+// child `typeChild` (resolved via the shared type-position resolver) instead of
+// the default int; each enumerator's value is then range-checked against it. A
+// non-integer underlying fails loud (S_InvalidEnumUnderlyingType); an out-of-range
+// enumerator fails loud (S_EnumeratorValueOutOfRange). Config-driven (the language
+// names the clause rule + type-child index); the engine never hard-codes
+// "enumTypeSpecifier". Sibling shape to BitfieldSuffix.
+struct DSS_EXPORT EnumUnderlyingTypeSpec {
+    RuleId                       rule{};        // the underlying-type clause rule
+    std::string                  ruleName;      // source spelling, for diagnostics
+    std::optional<std::uint32_t> typeChild;     // visible-child index of the type-name node
+};
+
 // D5.1 / D5.4: a composite-type-introducing declaration. When a declaration
 // carries `fieldChildren`, Pass 1.5 walks the scope it opened, collects every
 // minted symbol whose declaring rule == `rule` (in declaration order, via each
@@ -195,6 +211,19 @@ struct DSS_EXPORT LinkageSpecifierEffect {
     // static (module-global) storage, not an automatic stack slot. Folded by
     // CST→HIR to route the local declaration down the global-emission path.
     bool                            staticStorage = false;
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): THREAD storage duration (C11/C23
+    // 6.2.4 / 6.7.1 `_Thread_local` / `thread_local`) — the 4th ORTHOGONAL
+    // axis. Thread storage does NOT change binding/visibility (a file-scope
+    // `thread_local int g;` keeps EXTERNAL linkage — 6.2.2 is untouched by
+    // 6.7.1p3) and does NOT itself confer block-scope static routing (the
+    // standard REQUIRES a co-present `static`/`extern` at block scope —
+    // Pass 2's validateThreadLocalDeclarator enforces it). Consumed by the
+    // semantic Pass-1 specifier scan (→ SymbolRecord.isThreadLocal, the
+    // per-symbol source of truth every later tier reads). OR-only across a
+    // prefix — a `{threadStorage:true}` entry can never clobber a
+    // co-present static's binding/staticStorage (the noreturn
+    // linkage-clobber lesson: each axis folds independently).
+    bool                            threadStorage = false;
 };
 
 // FC4 c1 (M5): a config-driven fail-loud gate on a declaration form. When the
@@ -352,6 +381,31 @@ struct DSS_EXPORT DeclarationRule {
     // it). `nullopt` for non-function declarations.
     std::optional<std::uint32_t> paramsChild;
     std::optional<std::uint32_t> bodyChild;
+    // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE, C23 6.7.9): when true, this
+    // declarator-mode row has NO type-specifier head — the declared type is
+    // INFERRED from the sole declarator's initializer at Pass 1.5 (the
+    // definitive resolveDeclTypes visit, so the inferred type is visible to
+    // later same-pass consumers like sizeof-in-array-dims). A generic opt-in
+    // engine capability ("the type derives from the initializer"): the loader
+    // relaxes the declarator-mode `head` requirement for rows carrying it and
+    // rejects a row that sets BOTH (C_ConflictingField — the two type sources
+    // would compete). The inference itself is the config-driven Pass-1.5 arm
+    // (single plain named declarator, initializer required, array/function
+    // decay, loud rejects for uninferable initializers). Default false — every
+    // pre-existing row keeps the mandatory head, byte-identical.
+    bool inferTypeFromInitializer = false;
+    // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): a token kind that MUST appear in
+    // this declaration's specifier prefix for the row to be semantically valid
+    // — the inference-marker presence gate (C23 6.7.9p1: type inference
+    // happens only under the `auto` storage-class specifier). WITHOUT this
+    // gate a headless row would silently accept C89 implicit-int shapes
+    // (`static x = 5;` / `register y = 2;` parse structurally identical to an
+    // inference declaration). Checked FIRST in the Pass-1.5 inference arm;
+    // absent token ⇒ loud error, never a silently-adopted initializer type.
+    // Loader-resolved from a token-kind NAME (the constMarker idiom — the
+    // engine never names a keyword). `nullopt` ⇒ no presence gate (a language
+    // whose inference form is structurally unambiguous).
+    std::optional<SchemaTokenId> requiredSpecifierToken;
     // SE4 const-correctness: a token kind that, when found anywhere in the
     // `typeChild` subtree (or the whole declaration subtree when no
     // `typeChild` is set), marks the minted symbol const. `nullopt` ⇒ the
@@ -557,6 +611,11 @@ struct DSS_EXPORT DeclarationRule {
     // Matched by rule within the field subtree (a sibling of the name, like
     // arraySuffix). `nullopt` ⇒ this declaration form has no bit-field syntax.
     std::optional<BitfieldSuffix> bitfieldSuffix;
+    // C23 6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE, FC17): optional explicit enum
+    // underlying-type clause (`enum E : unsigned char { … }`). Matched by rule
+    // within the composite subtree. `nullopt` ⇒ this declaration form has no
+    // explicit-underlying-type syntax (the enum defaults to int).
+    std::optional<EnumUnderlyingTypeSpec> enumUnderlyingType;
     // FC6 (FAM): when true, an ABSENT array length on this declaration form
     // (`T x[]`) resolves to an INCOMPLETE array type (C99 §6.7.2.1 flexible
     // array member) instead of the `S_NonConstantArrayLength` error. Only
@@ -1108,6 +1167,37 @@ struct DSS_EXPORT LoopControlRule {
     std::string ruleName;
 };
 
+// FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): ONE row of the standard-
+// attribute semantics TABLE — a set of attribute NAMES (matched dunder-
+// normalized against the clause's last-::-segment, so `__deprecated__` ≡
+// `deprecated` and `gnu::packed` matches by `packed`) mapped to ONE effect of
+// the CLOSED verb set:
+//   • SuppressUnused — the declared symbol never warns S_UnusedVariable
+//     (`[[maybe_unused]]` / GNU `unused`);
+//   • WarnOnUse      — every use-site of the declared symbol warns
+//     S_DeprecatedSymbolUsed (`[[deprecated["msg"]]]`);
+//   • WarnOnDiscard  — a call to the declared function whose result is
+//     discarded as a bare expression statement warns
+//     S_NodiscardResultDiscarded (`[[nodiscard]]` / GNU `warn_unused_result`);
+//   • None           — KNOWN vocabulary, no effect HERE (either consumed by a
+//     dedicated scan — noreturn/packed — or deliberately inert — fallthrough/
+//     likely/unlikely/reproducible/unsequenced). Listed so the UNKNOWN-
+//     attribute warning never false-fires on a name the language knows.
+// A name matching NO row in the C23 `[[...]]` form warns S_UnknownAttribute
+// (suppressible — C23 forbids fatal unknown standard attributes). The loader
+// validates the effect verb against the closed set (C_InvalidSemantics on an
+// unknown verb — a typo can never silently disarm a row).
+enum class AttributeEffect : std::uint8_t {
+    SuppressUnused,
+    WarnOnUse,
+    WarnOnDiscard,
+    None,
+};
+struct DSS_EXPORT AttributeSemanticsRow {
+    std::vector<std::string> names;                        // dunder-normalized match set
+    AttributeEffect          effect = AttributeEffect::None;
+};
+
 // Literal token-kind → core TypeKind. Pass 2 reads the token-kind of a
 // matched literal leaf and assigns the corresponding lattice type via
 // `TypeInterner::primitive(core)`.
@@ -1202,6 +1292,26 @@ struct DSS_EXPORT SemanticConfig {
     // the node size_t (U64). Invalid ⇒ the language has no `_Alignof` surface.
     RuleId        alignofTypeRule{};  std::string alignofTypeRuleName;
     std::uint32_t alignofTypeChild = 0;
+    // C23 6.7.2.5 (D-CSUBSET-TYPEOF): `typeof`/`typeof_unqual` typing. Both are
+    // TYPE-SPECIFIERS resolving to the operand's type. `typeofTypeRule` = the
+    // TYPE-NAME operand form (`typeof ( type-name )`, whose `typeofOperandChild`
+    // is a castTypeRef — resolved through the SAME type resolver casts/sizeof use);
+    // `typeofValueRule` = the EXPRESSION operand form (`typeof ( expression )`,
+    // whose operand type is read via subtreeType — UNEVALUATED). BOTH forms share
+    // the operand visible-child index `typeofOperandChild` (2 — the inline
+    // keyword-alt matches ONE token at child 0, same layout as alignof/sizeof).
+    // `typeofStripQualifiersToken` is the OPTIONAL leading-keyword token that means
+    // "strip top-level qualifiers" (`typeof_unqual`): when the typeof node's child-0
+    // keyword IS this token, the resolved type has its top-level VolatileQual
+    // stripped (only volatile is interned; const/restrict are not). Absent (nullopt)
+    // ⇒ the language's typeof never strips. Both rules invalid ⇒ no typeof surface.
+    // The resolveTypeNodeImpl arm ALSO makes the typeof operand subtree opaque to the
+    // coarse volatile/const qualifier scans so a stripped qualifier is never silently
+    // re-applied. Source-AGNOSTIC: nothing hardcodes "typeof"/"typeof_unqual".
+    RuleId        typeofTypeRule{};   std::string typeofTypeRuleName;
+    RuleId        typeofValueRule{};  std::string typeofValueRuleName;
+    std::uint32_t typeofOperandChild = 0;
+    std::optional<SchemaTokenId> typeofStripQualifiersToken;
     // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the `_Alignas`/`alignas` alignment
     // SPECIFIER. `alignasSpecRule` = the `alignasSpec` shape = [ keyword, '(',
     // alignasArg, ')' ]; `alignasArgChild` = the visible-child index of the
@@ -1257,6 +1367,80 @@ struct DSS_EXPORT SemanticConfig {
     // config; the engine never hardcodes the spelling "noreturn".
     std::optional<SchemaTokenId> noreturnKeywordToken;
     std::vector<std::string>     noreturnAttributeNames;
+    // FC17 (D-CSUBSET-CONSTEXPR): the C23 6.7.1 `constexpr` OBJECT storage-class
+    // KEYWORD token. Pass 1 scans a declaration's specifier prefix for it
+    // (`specifierPrefixHasConstexpr`, the `specifierPrefixNamesNoreturn` mirror)
+    // and marks each declared symbol `isConstexpr` (implies `isConst`); Pass 2's
+    // `validateConstexprDeclarator` then enforces the 6.7.1 constraints AT THE
+    // DECLARATION (compile-time-constant initializer / no missing initializer /
+    // no function declarator / no volatile-qualified object / aggregate types a
+    // named loud deferral). Unset ⇒ the language has no `constexpr` surface (the
+    // scan never runs — toy/tsql). Source-AGNOSTIC: WHICH token is per-language
+    // config; the engine never hardcodes the spelling "constexpr". Linkage is a
+    // SEPARATE, ALSO config-driven axis: the C23 6.2.2p3 file-scope INTERNAL
+    // linkage rides the declaration row's `linkageSpecifiers` map (keyword text →
+    // {binding:local}), not this token.
+    std::optional<SchemaTokenId> constexprKeywordToken;
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): storage-class specifier TOKENS that may
+    // NOT be combined with a thread-storage specifier in one declaration
+    // (C11/C23 6.7.1p2 admits only `static`/`extern` beside `thread_local`;
+    // c-subset lists `RegisterKeyword` — `register` parses as an inert
+    // storage-class specifier, so `register thread_local int x;` must reject
+    // rather than silently drop one specifier). Pass 2's
+    // `validateThreadLocalDeclarator` scans the declaration's specifier
+    // prefix for these kinds on a thread-local-marked symbol →
+    // S_ThreadLocalInvalidCombination. EMPTY ⇒ no forbidden-combination scan
+    // (a language whose grammar already excludes the pairings). NOTE the
+    // thread-storage vocabulary itself is NOT declared here: which tokens
+    // confer thread storage rides the declaration rows' `linkageSpecifiers`
+    // map ({"threadStorage": true}) — one facet, one scan, per-language.
+    // Source-AGNOSTIC: WHICH kinds are per-language config; the engine never
+    // hardcodes the spelling "register".
+    std::vector<SchemaTokenId>   threadLocalIncompatibleTokens;
+    // FC17.5 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER): the C99 6.4.2.2 predefined
+    // function-name identifier spellings (`__func__` + the GNU `__FUNCTION__`
+    // alias for c-subset). Pass 1 binds, for EACH spelling, one synthetic
+    // SymbolRecord into a function DEFINITION's own (param/body) scope BEFORE
+    // the params are visited: kind=Variable, isConst=true (SE4's const check
+    // then catches `__func__ = x` / `+=` → S_ConstViolation),
+    // type=Array<narrow-string-core, len+1> (the element core is the language's
+    // config-declared string-literal core — the SAME source string literals
+    // type from — never a hardcoded Char), isPredefinedFunctionName=true +
+    // predefinedFunctionNameText=the function's name. HIR lowering FOLDS a read
+    // of such a symbol to a string-literal-shaped constant (byte-identical to a
+    // real string literal, so rodata/decay/indexing ride unchanged). EMPTY ⇒
+    // the language has no predefined function-name surface (the bind never
+    // runs — toy/tsql). Source-AGNOSTIC: WHICH spellings are per-language
+    // config; the engine never hardcodes "__func__".
+    std::vector<std::string>     predefinedFunctionNameIdentifiers;
+    // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute
+    // semantics table (see AttributeSemanticsRow). `attrSpecRule`/`stdAttrRule`
+    // name the GNU `__attribute__((...))` / C23 `[[...]]` attribute-specifier
+    // shapes — the scan's bounded descent STOPS AT each such node and extracts
+    // its clause(s) (an attrSpec is ONE clause; a stdAttr's Internal children
+    // are one clause each). `attrBareStatementRule` is the bare attribute-
+    // declaration STATEMENT (`[[fallthrough]];`) — pass2Post runs the scan on
+    // it for the unknown-name warning only (no symbol). `attributeEffects` is
+    // the name→effect table. All invalid/empty ⇒ the language has no standard-
+    // attribute semantics (the scan never runs — toy/tsql). Source-AGNOSTIC:
+    // WHICH rules + WHICH names are per-language config; the engine walks the
+    // closed AttributeEffect verb set only.
+    RuleId attrSpecRule{};          std::string attrSpecRuleName;
+    RuleId stdAttrRule{};           std::string stdAttrRuleName;
+    RuleId attrBareStatementRule{}; std::string attrBareStatementRuleName;
+    std::vector<AttributeSemanticsRow> attributeEffects;
+    // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): the nodiscard DISCARD-CONTEXT rule
+    // ids (the `semantics.nodiscard` block). A WarnOnDiscard-flagged call's
+    // result counts as discarded iff the call node's PARENT is
+    // `nodiscardExpressionRule` AND its GRANDPARENT is
+    // `nodiscardDiscardStatementRule` — the TWO-hop shape (design-audit F1: the
+    // expression-engine materializes an `expression` node between the call and
+    // the expression statement, so a one-hop parent==exprStmt check would
+    // NEVER fire). The two-hop-exact match makes `(void)f();` (castExpr
+    // interposes) and `x=f()`/`g(f())`/`return f()` no-fire by construction.
+    // Either invalid ⇒ WarnOnDiscard rows never fire.
+    RuleId nodiscardDiscardStatementRule{}; std::string nodiscardDiscardStatementRuleName;
+    RuleId nodiscardExpressionRule{};       std::string nodiscardExpressionRuleName;
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): variadic-intrinsic typing. `vaArgRule`
     // = the `va_arg(ap,T)` form; pass 2 resolves+stamps its `vaArgTypeChild`
     // castTypeRef (so the HIR lowering recovers the read type T) + stamps the node
@@ -1504,6 +1688,20 @@ struct DSS_EXPORT SemanticConfig {
         // `Ptr<T>` parameter rejects the literal `0` arg and the user
         // must use the language's typed-null mechanism.
         bool nullPointerConstantFromIntegerZero = false;
+        // C23 §6.3.2.3.4 / §6.2.5 (D-CSUBSET-NULLPTR): the predefined constant
+        // `nullptr` (type nullptr_t, interned TypeKind::NullptrT) converts WITHOUT
+        // cast to any pointer type. TYPE-aware (not value-aware, unlike the integer-0
+        // form), so it lives in the `isAssignable` chokepoint as a ONE-WAY arm
+        // (Ptr←NullptrT) gated on this flag; nothing converts TO nullptr_t (the
+        // one-way constraint enforced by the absence of any NullptrT-as-lhs arm).
+        // Default false → a non-C23 schema (toy/tsql/older-C) keeps NullptrT entirely
+        // inert. Only C23+ declares it true (alongside
+        // `nullPointerConstantFromIntegerZero`, since the `0`-form remains valid in
+        // C23). nullptr→BOOL is DEFERRED (D-CSUBSET-NULLPTR-BOOL-CONVERSION): the
+        // c-subset has no scalar→bool conversion yet; nullptr in a controlling
+        // expression still works via the HIR condition lowering, so nothing real is
+        // lost.
+        bool nullPointerConstantFromNullptrT = false;
     };
     PointerConversionRules pointerConversions;
 

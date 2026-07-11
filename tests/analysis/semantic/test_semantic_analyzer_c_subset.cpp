@@ -44,11 +44,14 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     // CU-wide builtins scope): c103 `__umulh` (D-CSUBSET-INTRINSIC-UMULH) + c104
     // `_InterlockedCompareExchange` (D-CSUBSET-INTRINSIC-ATOMIC-CAS) + c113
     // `_ReadWriteBarrier` (D-CSUBSET-INTRINSIC-BARRIER) + c115 `_exception_code`
-    // + `_exception_info` (D-WIN64-SEH-FUNCLETS SEH intrinsics).
-    ASSERT_EQ(model.symbols().size() - 1, 9u)
+    // + `_exception_info` (D-WIN64-SEH-FUNCLETS SEH intrinsics) + the 2 FC17.5
+    // predefined function-name symbols (`__func__` + `__FUNCTION__`, C99
+    // 6.4.2.2 — one per configured spelling per function DEFINITION, bound into
+    // main's own scope; D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
+    ASSERT_EQ(model.symbols().size() - 1, 11u)
         << "main + x + __va_list_tag + va_list + __umulh + "
            "_InterlockedCompareExchange + _ReadWriteBarrier + "
-           "_exception_code + _exception_info";
+           "_exception_code + _exception_info + __func__ + __FUNCTION__";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xRec = &model.symbols()[i];
@@ -1806,6 +1809,130 @@ TEST(SemanticAnalyzerCSubset, AlignasSizeofOperandFolds) {
     EXPECT_EQ(*g->explicitAlignment, 8u);
 }
 
+// ── FC17 C23 6.7.2.5 typeof / typeof_unqual ─────────────────────────────────
+//
+// ★ THE red-on-disable pin for the CRITICAL scan-opacity fix: `typeof_unqual`'s
+// SOLE observable effect is stripping the top-level qualifier. Preservation
+// passes with-or-without the qualifier-scan-leak bug (both leave volatile on),
+// so ONLY the strip case catches a regression — if the coarse base-volatile scan
+// descends into the typeof operand and re-applies the literal `volatile` AFTER
+// the arm stripped it, `v` would come back `volatile int` and this FAILS.
+TEST(SemanticAnalyzerCSubset, TypeofUnqualStripsVolatile) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typeof_unqual(volatile int) v;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* v = findSym(model, "v");
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(v->type.valid());
+    EXPECT_FALSE(ti.isVolatileQualified(v->type))
+        << "typeof_unqual strips the top-level volatile — the coarse volatile "
+           "scan must NOT re-apply the operand's literal `volatile`";
+    EXPECT_EQ(ti.kind(v->type), TypeKind::I32)
+        << "the stripped type is bare int";
+}
+
+// The KEPT side: `typeof` PRESERVES the top-level qualifier (VolatileQual(int)).
+TEST(SemanticAnalyzerCSubset, TypeofPreservesVolatile) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typeof(volatile int) v;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* v = findSym(model, "v");
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(v->type.valid());
+    EXPECT_TRUE(ti.isVolatileQualified(v->type))
+        << "typeof (not typeof_unqual) keeps the top-level volatile";
+}
+
+// Fork-B polarity pin: `typeof(ENUM_CONSTANT)` must ROLL BACK to the VALUE form
+// (requireKnownType) and type as an expression — NOT commit the enum constant as
+// a type-name → a spurious S_UnknownType. Mirrors AlignasEnumConstantOperandFolds.
+TEST(SemanticAnalyzerCSubset, TypeofEnumConstantOperandResolvesAsValue) {
+    auto cu = buildShippedUnit("c-subset", {
+        "enum E { GREEN = 7 };\n"
+        "typeof(GREEN) v;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UnknownType), 0u)
+        << "an enum-constant typeof operand must roll back to the VALUE reading "
+           "(requireKnownType), not commit as a type-name";
+    SymbolRecord const* v = findSym(model, "v");
+    ASSERT_NE(v, nullptr);
+    EXPECT_TRUE(v->type.valid())
+        << "typeof(GREEN) resolves to the enum constant's type";
+}
+
+// EXPRESSION form: `typeof(x)` for a declared `x` resolves to x's type.
+TEST(SemanticAnalyzerCSubset, TypeofExpressionFormResolvesToOperandType) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int x;\n"
+        "typeof(x) y;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* y = findSym(model, "y");
+    ASSERT_NE(y, nullptr);
+    ASSERT_TRUE(y->type.valid());
+    EXPECT_EQ(ti.kind(y->type), TypeKind::I32)
+        << "typeof(x) where x is int must resolve y to int";
+}
+
+// TYPE-NAME form: `typeof(int*)` resolves to Ptr<int> (castTypeRef operand).
+TEST(SemanticAnalyzerCSubset, TypeofTypeNameFormResolvesPointer) {
+    auto cu = buildShippedUnit("c-subset", {
+        "typeof(int*) p;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* p = findSym(model, "p");
+    ASSERT_NE(p, nullptr);
+    ASSERT_TRUE(p->type.valid());
+    ASSERT_EQ(ti.kind(p->type), TypeKind::Ptr);
+    EXPECT_EQ(ti.kind(ti.operands(p->type)[0]), TypeKind::I32);
+}
+
+// `sizeof(typeof(unsigned short))` folds to 2 in an array dimension — the typeof
+// resolves inside the SAME sizeof-fold path sizeof(T)/enum/arithmetic use.
+TEST(SemanticAnalyzerCSubset, SizeofTypeofFoldsInArrayDim) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int a[sizeof(typeof(unsigned short))];\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64, kAlignasLayout);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = findSym(model, "a");
+    ASSERT_NE(a, nullptr);
+    ASSERT_TRUE(a->type.valid());
+    ASSERT_EQ(ti.kind(a->type), TypeKind::Array);
+    ASSERT_EQ(ti.scalars(a->type).size(), 1u);
+    EXPECT_EQ(ti.scalars(a->type)[0], 2)
+        << "sizeof(typeof(unsigned short)) folds to 2";
+}
+
+// Bit-field operand → S_TypeofBitfieldOperand (C 6.7.2.5 constraint): a bit-field
+// has no nameable type. RED-on-disable for the bit-field gate.
+TEST(SemanticAnalyzerCSubset, TypeofBitfieldOperandFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { unsigned f : 3; };\n"
+        "struct S s;\n"
+        "typeof(s.f) v;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_TypeofBitfieldOperand), 1u)
+        << "typeof of a bit-field member is a constraint violation";
+}
+
 // ── FC16 C11/C23 6.5.1.1 _Generic — generic selection ────────────────────────
 //
 // SELECTION is a compile-time SEMANTIC-tier decision (like sizeof folding): the
@@ -2122,8 +2249,10 @@ TEST(SemanticAnalyzerCSubset, NestedBlocksShadowWithoutRedecl) {
     // main (function) + two distinct `x` symbols (one per block scope) + the 2
     // FC12a-core builtin TYPES (__va_list_tag + va_list) + the 5 intrinsic
     // builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
-    // _ReadWriteBarrier + c115 _exception_code + _exception_info).
-    EXPECT_EQ(model.symbols().size() - 1, 10u);
+    // _ReadWriteBarrier + c115 _exception_code + _exception_info) + the 2
+    // FC17.5 predefined function-name symbols (__func__ + __FUNCTION__, per
+    // function definition — D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
+    EXPECT_EQ(model.symbols().size() - 1, 12u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -2141,8 +2270,9 @@ TEST(SemanticAnalyzerCSubset, ForwardReferenceWithinBlock) {
     // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
     // (__va_list_tag + va_list) + the 5 intrinsic builtins (c103 __umulh +
     // c104 _InterlockedCompareExchange + c113 _ReadWriteBarrier + c115
-    // _exception_code + _exception_info). Find x by name.
-    ASSERT_EQ(model.symbols().size() - 1, 9u);
+    // _exception_code + _exception_info) + the 2 FC17.5 predefined
+    // function-name symbols (__func__ + __FUNCTION__). Find x by name.
+    ASSERT_EQ(model.symbols().size() - 1, 11u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -4461,11 +4591,12 @@ TEST(SemanticAnalyzerCSubset, ValueStarValueStaysExpressionStatement) {
     EXPECT_FALSE(model.hasErrors());
     // main + a + b + the 2 FC12a-core builtin TYPES (__va_list_tag + va_list) + the
     // 5 intrinsic builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
-    // _ReadWriteBarrier + c115 _exception_code + _exception_info) — the
+    // _ReadWriteBarrier + c115 _exception_code + _exception_info) + the 2 FC17.5
+    // predefined function-name symbols (__func__ + __FUNCTION__) — the
     // multiplication must mint NO symbol.
-    EXPECT_EQ(model.symbols().size() - 1, 10u)
-        << "main + a + b + __va_list_tag + va_list + the 5 intrinsic builtins — "
-           "the multiplication mints none";
+    EXPECT_EQ(model.symbols().size() - 1, 12u)
+        << "main + a + b + __va_list_tag + va_list + the 5 intrinsic builtins + "
+           "__func__ + __FUNCTION__ — the multiplication mints none";
 }
 
 // UNKNOWN `u * v;` (no `u` anywhere, single file) — the oracle-candidate
@@ -6637,4 +6768,1667 @@ TEST(SemanticAnalyzerCSubset, UnionContainingFamStructAsUnionMemberIsAccepted) {
         << "a union member that is a union containing a FAM-struct is p18-legal (gcc/clang accept)";
     EXPECT_FALSE(model.hasErrors())
         << "the nested-union form is well-typed — the carve-out must not over-reject it";
+}
+
+// ── C23 nullptr (D-CSUBSET-NULLPTR) ───────────────────────────────────────────
+// `void *p = nullptr;` + `p == nullptr` / `p != nullptr` are admitted — nullptr is a
+// null pointer constant assignable to, and comparable with, any pointer. No error.
+TEST(SemanticAnalyzerCSubset, NullptrInitsAndComparesPointer) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(void){ void *p = nullptr; int r = p == nullptr; p = nullptr;"
+        " return r + (nullptr == p); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// `int x = nullptr;` is a constraint violation — nullptr converts only to pointers.
+TEST(SemanticAnalyzerCSubset, NullptrToIntFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "int f(void){ int x = nullptr; return x; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+}
+
+// `bool b = nullptr;` is rejected — nullptr→bool is DEFERRED (the c-subset has no
+// scalar→bool conversion; D-CSUBSET-NULLPTR-BOOL-CONVERSION), so it stays consistent
+// with `bool b = 0;` (also a mismatch) rather than admit-then-fail-at-codegen.
+TEST(SemanticAnalyzerCSubset, NullptrToBoolFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "int f(void){ bool b = nullptr; return 0; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u);
+}
+
+// The fail-loud operator gate: nullptr in arithmetic (`nullptr + 1`) is rejected —
+// WITHOUT the gate the HIR lowering (nullptr → integer 0) would silently accept it.
+TEST(SemanticAnalyzerCSubset, NullptrArithmeticFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "void *f(void){ return nullptr + 1; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u);
+}
+
+// The gate rejects a RELATIONAL comparison (`nullptr < p`) — only `==`/`!=` against a
+// pointer/nullptr peer is admissible.
+TEST(SemanticAnalyzerCSubset, NullptrRelationalFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "int f(void *p){ return nullptr < p; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u);
+}
+
+// `==` against a NON-pointer, NON-nullptr peer (`nullptr == 5`) is rejected.
+TEST(SemanticAnalyzerCSubset, NullptrEqualsIntFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "int f(void){ return nullptr == 5; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u);
+}
+
+// The gate must NOT fire on a plain assignment `p = nullptr` (handled by isAssignable)
+// — the false-positive that the Assign/Comma/compound classification fix closed.
+TEST(SemanticAnalyzerCSubset, NullptrPlainAssignNoFalsePositive) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int f(void *p){ p = nullptr; return p == nullptr; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// A COMPOUND assignment (`p += nullptr`) IS pointer arithmetic → rejected.
+TEST(SemanticAnalyzerCSubset, NullptrCompoundAssignFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "int f(void *p){ p += nullptr; return 0; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u);
+}
+
+// unary `-nullptr` is rejected (Neg on nullptr is not a valid operand).
+TEST(SemanticAnalyzerCSubset, NullptrUnaryNegFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", { "void *f(void){ return -nullptr; }\n" });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u);
+}
+
+// `nullptr` passed as a VARIADIC argument is rejected (no default arg promotion).
+TEST(SemanticAnalyzerCSubset, NullptrVariadicArgFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int g(int n, ...);\n"
+        "int f(void){ return g(1, nullptr); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 1u);
+}
+
+// A conditional with a nullptr arm (`c ? nullptr : p`, nullptr FIRST) types as the
+// pointer — the combineTernary NullptrT arm; without it the ternary would mistype as
+// NullptrT and a `void*` return would then mismatch.
+TEST(SemanticAnalyzerCSubset, NullptrTernaryTypesAsPointer) {
+    auto cu = buildShippedUnit("c-subset", {
+        "void *f(int c, void *p){ return c ? nullptr : p; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 0u);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// A bare function designator / array name DECAYS to a pointer, so `nullptr == func`
+// and `nullptr == arr` are valid C23 comparisons — the gate must NOT reject them.
+// Regression pin for the Eq/Ne peer-decay fix (FnSig / Array peers, not just Ptr).
+TEST(SemanticAnalyzerCSubset, NullptrComparedToDesignatorsAdmitted) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int g(void);\n"
+        "int f(void){ int a[4]; if (nullptr == g) return 1;"
+        " if (nullptr == a) return 2; return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NullptrInvalidOperand), 0u);
+}
+
+// sizeof(nullptr) folds to the pointer width (C23: sizeof(nullptr_t) == sizeof(void*))
+// via the scalarByteSize NullptrT arm — a regression dropping the arm makes the fold
+// fail (nullopt → error). Pins that it stays well-typed (size_t / U64).
+TEST(SemanticAnalyzerCSubset, NullptrSizeofIsWellTyped) {
+    auto cu = buildShippedUnit("c-subset", {
+        "unsigned long f(void){ return sizeof(nullptr); }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FC17 (D-CSUBSET-ENUM-UNDERLYING-TYPE, C23 6.7.2.2): the explicit enum
+// underlying-type clause `enum E : T { … }`, riding the speculative-optional
+// parser capability (D-PARSE-SPECULATIVE-OPTIONAL). The `enum <tag> :` prefix
+// collides with the pre-existing anonymous enum-typed struct bit-field
+// `enum Color : 4;`; the clause is TRIED after the `:` and ROLLS BACK to the
+// bit-field reading when a type does not follow.
+// ─────────────────────────────────────────────────────────────────────────
+
+TEST(SemanticAnalyzerCSubset, EnumExplicitUnderlyingTypeSetsScalars) {
+    auto cu = buildShippedUnit("c-subset", {
+        "enum E : unsigned char { A, B };\n"
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "an explicit unsigned-char underlying enum must analyze clean";
+    auto const& ti = model.lattice().interner();
+    // The enumerator A carries the enum TypeId (erec.type = compositeTy).
+    TypeId enumTy{};
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "A") enumTy = model.symbols()[i].type;
+    ASSERT_TRUE(enumTy.valid()) << "enumerator A must be typed as the enum";
+    EXPECT_EQ(ti.kind(enumTy), TypeKind::Enum);
+    ASSERT_EQ(ti.scalars(enumTy).size(), 1u);
+    // RED-on-disable: revert the grammar (parse fails, no clean enum) OR the
+    // semantic threading (falls back to default I32) and this drops to I32.
+    EXPECT_EQ(ti.scalars(enumTy)[0], static_cast<std::int64_t>(TypeKind::U8))
+        << "the enum underlying scalar must be U8, not the default I32";
+}
+
+TEST(SemanticAnalyzerCSubset, EnumUnderlyingTypeDistinctFromDefault) {
+    auto cu = buildShippedUnit("c-subset", {
+        "enum Wide { WA };\n"                     // default int
+        "enum Narrow : unsigned char { NA };\n"   // explicit u8
+        "int main(void) { return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors());
+    auto const& ti = model.lattice().interner();
+    TypeId wide{}, narrow{};
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        auto const& n = model.symbols()[i].name;
+        if (n == "WA") wide   = model.symbols()[i].type;
+        if (n == "NA") narrow = model.symbols()[i].type;
+    }
+    ASSERT_TRUE(wide.valid() && narrow.valid());
+    EXPECT_NE(wide.v, narrow.v)
+        << "a different underlying type interns a DISTINCT enum TypeId";
+    EXPECT_EQ(ti.scalars(wide)[0],   static_cast<std::int64_t>(TypeKind::I32));
+    EXPECT_EQ(ti.scalars(narrow)[0], static_cast<std::int64_t>(TypeKind::U8));
+}
+
+TEST(SemanticAnalyzerCSubset, EnumAnonymousWithExplicitUnderlying) {
+    auto cu = buildShippedUnit("c-subset", {
+        "enum : unsigned char { AX, AY };\n"      // anonymous + explicit underlying
+        "int main(void) { return AY; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_FALSE(model.hasErrors())
+        << "an anonymous enum with an explicit underlying type must be clean";
+    auto const& ti = model.lattice().interner();
+    TypeId enumTy{};
+    for (std::size_t i = 1; i < model.symbols().size(); ++i)
+        if (model.symbols()[i].name == "AX") enumTy = model.symbols()[i].type;
+    ASSERT_TRUE(enumTy.valid());
+    EXPECT_EQ(ti.scalars(enumTy)[0], static_cast<std::int64_t>(TypeKind::U8));
+}
+
+TEST(SemanticAnalyzerCSubset, EnumUnderlyingNonIntegerFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "enum E : float { A };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidEnumUnderlyingType), 1u)
+        << "a float underlying type must fail loud S_InvalidEnumUnderlyingType";
+}
+
+TEST(SemanticAnalyzerCSubset, EnumUnderlyingStructFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct Foo { int x; };\n"
+        "enum E : struct Foo { A };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidEnumUnderlyingType), 1u)
+        << "a struct underlying type must fail loud S_InvalidEnumUnderlyingType";
+}
+
+TEST(SemanticAnalyzerCSubset, EnumeratorValueOutOfRangeFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "enum E : unsigned char { A = 256 };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_EnumeratorValueOutOfRange), 1u)
+        << "256 does not fit unsigned char (max 255) — must fail loud";
+}
+
+TEST(SemanticAnalyzerCSubset, EnumeratorValueAtBoundaryClean) {
+    auto model = analyzeShipped("c-subset", {
+        "enum E : unsigned char { A = 255 };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_EnumeratorValueOutOfRange), 0u)
+        << "255 is exactly the unsigned-char max — in range, no error";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+TEST(SemanticAnalyzerCSubset, EnumDefaultUnderlyingRangeCheckNeverFires) {
+    // A default-int enum is NEVER range-checked (hasExplicitUnderlying == false),
+    // so a value that would overflow a narrow type but fits int is clean — the
+    // C-classic behavior is unchanged.
+    auto model = analyzeShipped("c-subset", {
+        "enum E { A = 256, B = 70000 };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_EnumeratorValueOutOfRange), 0u)
+        << "a default-int enum range check must NEVER fire";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+TEST(SemanticAnalyzerCSubset, EnumBitfieldWidthValidatesAgainstExplicitUnderlying) {
+    // A bit-field of an enum with an EXPLICIT unsigned-char underlying validates
+    // its width against 8 bits (the existing bit-field check reads the enum
+    // underlying via enumUnderlyingOrSelf, scalars[0] = U8): width 9 exceeds it
+    // and fails loud; width 8 is exactly in range.
+    auto bad = analyzeShipped("c-subset", {
+        "enum E : unsigned char { A };\n"
+        "struct S { enum E f : 9; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(bad.diagnostics(),
+                        DiagnosticCode::S_BitFieldWidthOutOfRange), 1u)
+        << "width 9 > the U8 underlying 8 bits must fail loud";
+    auto ok = analyzeShipped("c-subset", {
+        "enum E : unsigned char { A };\n"
+        "struct S { enum E f : 8; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_EQ(countCode(ok.diagnostics(),
+                        DiagnosticCode::S_BitFieldWidthOutOfRange), 0u)
+        << "width 8 == the U8 underlying 8 bits is exactly in range";
+}
+
+TEST(SemanticAnalyzerCSubset, EnumAnonymousBitfieldColonSurvivesSpeculativeOptional) {
+    // THE FORK PIN (Option B): the pre-existing anonymous enum-typed struct
+    // bit-field `enum Color : 3;` must STILL parse after adding the speculative
+    // underlying-type clause — the speculative optional TRIES `: <type>` and
+    // ROLLS BACK to the bit-field reading when an int-constant (not a type)
+    // follows the colon. A plain non-speculative optional (Option A) would break
+    // this with a loud parse error.
+    auto model = analyzeShipped("c-subset", {
+        "enum Color { RED, GREEN };\n"
+        "struct S { int a; enum Color : 3; int b; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "`enum Color : 3;` (anonymous bit-field) must survive the speculative "
+           "underlying-type optional";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::P_NoAlternativeMatched), 0u);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidEnumUnderlyingType), 0u)
+        << "`: 3` must be a bit-field width, NOT a (failed) underlying type";
+}
+
+TEST(SemanticAnalyzerCSubset, EnumUnderlyingBareIdentifierWidthRollsBackToBitfield) {
+    // The requireKnownType triage pin: `enum Color : W3` where W3 is a VALUE
+    // identifier (an enum constant, NOT a type) rolls the speculative
+    // underlying-type clause back so `: W3` is the anonymous bit-field width.
+    auto model = analyzeShipped("c-subset", {
+        "enum Widths { W3 = 3 };\n"
+        "enum Color { RED, GREEN };\n"
+        "struct S { int a; enum Color : W3; int b; };\n"
+        "int main(void){ return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a value width identifier must roll back to the bit-field reading";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidEnumUnderlyingType), 0u)
+        << "`: W3` (a value) must NOT be treated as an underlying type";
+}
+
+// ── FC17 (D-CSUBSET-CONSTEXPR): C23 6.7.1 `constexpr` OBJECT storage-class ──
+//
+// THE EMPIRICAL DELTA vs `const` (the feature's reason to exist): `const` is
+// initializer-blind — `const int x = argc;` compiles clean and only an ICE
+// consumer errors lazily — while `constexpr` must fail AT ITS OWN DECLARATION
+// when the initializer is not a compile-time constant (6.7.1p10). The pair
+// below pins BOTH sides so the delta can never silently collapse.
+// RED-ON-DISABLE: bypass the Pass-2 validateConstexprDeclarator hook and the
+// constexpr arm goes green-on-argc (0 diagnostics) → the EXPECT_EQ(…, 1u) reds.
+TEST(SemanticAnalyzerCSubset, ConstexprDeltaVsConst) {
+    auto constModel = analyzeShipped("c-subset", {
+        "int main(int argc, char **argv) { const int x = argc; return x; }\n",
+    });
+    EXPECT_FALSE(constModel.hasErrors())
+        << "`const int x = argc;` is legal C — const is initializer-blind";
+    auto cxModel = analyzeShipped("c-subset", {
+        "int main(int argc, char **argv) { constexpr int x = argc; return x; }\n",
+    });
+    EXPECT_EQ(countCode(cxModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
+        << "`constexpr int x = argc;` must fail AT THE DECLARATION";
+}
+
+// A folding constexpr is accepted AND usable in constant-expression position:
+// `constexpr int N = 5;` dimensions `int a[N]` exactly as a const would — plus
+// the symbol carries BOTH Pass-1 marks (isConstexpr + the implied isConst).
+// RED-ON-DISABLE: drop the `specifierPrefixHasConstexpr` minting and the flag
+// EXPECTs red (and every enforcement test in this block stops firing).
+TEST(SemanticAnalyzerCSubset, ConstexprFoldsAndMarksSymbol) {
+    auto model = analyzeShipped("c-subset", {
+        "constexpr int N = 5;\n"
+        "int main(void) { int a[N]; return sizeof(a); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    SymbolRecord const* nRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == "N") nRec = &model.symbols()[i];
+    }
+    ASSERT_NE(nRec, nullptr);
+    EXPECT_TRUE(nRec->isConstexpr) << "Pass 1 must mark the symbol constexpr";
+    EXPECT_TRUE(nRec->isConst) << "constexpr implies const (6.7.1p10)";
+    // The array dimensioned through the constexpr constant.
+    SymbolRecord const* aRec = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == "a") aRec = &model.symbols()[i];
+    }
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_TRUE(aRec->type.valid());
+    auto const& ti = model.lattice().interner();
+    ASSERT_EQ(ti.kind(aRec->type), TypeKind::Array);
+    EXPECT_EQ(ti.scalars(aRec->type)[0], 5);
+}
+
+// F2 (the shared-evaluator char/bool leaf arms): a constexpr char / bool object
+// folds its keyword/char-constant initializer. RED-ON-DISABLE: remove the
+// evaluator's fixed-value / narrow-char arms and both go S0037-red.
+TEST(SemanticAnalyzerCSubset, ConstexprCharAndBoolFold) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { constexpr char c = 'a'; constexpr bool b = true; "
+        "return c + b; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "'a' and true are integer constant expressions (C23 6.6)";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 0u);
+}
+
+// F2 flip — the pre-existing static_assert gaps the shared-evaluator leaf arms
+// close: `_Static_assert('a'==97)` and `_Static_assert(true)` FAILED S0029 at
+// HEAD (empirically confirmed pre-change) because the CST evaluator's leaf only
+// decoded integer-set tokens. Both now fold. RED-ON-DISABLE: remove either leaf
+// arm and its assert reds.
+TEST(SemanticAnalyzerCSubset, StaticAssertCharLiteralConditionFolds) {
+    auto model = analyzeShipped("c-subset", {
+        "_Static_assert('a' == 97, \"char folds\");\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "'a' is an integer character constant (value 97) — must fold";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+TEST(SemanticAnalyzerCSubset, StaticAssertTrueKeywordConditionFolds) {
+    auto model = analyzeShipped("c-subset", {
+        "_Static_assert(true, \"true folds\");\n"
+        "_Static_assert(!false, \"false folds\");\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 0u)
+        << "true/false are config-declared fixed-value keyword literals";
+    EXPECT_FALSE(model.hasErrors());
+}
+
+// F3 no-leak walls: the float capability added FOR constexpr must NOT leak into
+// integer-required consumers — a float in a static_assert condition / an array
+// dimension stays non-constant. RED-ON-DISABLE: populate floatLiteralTokens (or
+// flip allowFloat) in constIntExpr's context and both EXPECTs red.
+TEST(SemanticAnalyzerCSubset, FloatDoesNotLeakIntoIntegerConstExprConsumers) {
+    auto saModel = analyzeShipped("c-subset", {
+        "_Static_assert(1.5 > 1.0, \"floats are not ICEs\");\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(saModel.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u)
+        << "a float condition is NOT an integer constant expression (C 6.7.10)";
+    auto dimModel = analyzeShipped("c-subset", {
+        "int main(void) { int a[1.5 + 1.5]; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(dimModel.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 1u)
+        << "a float array dimension must stay S_NonConstantArrayLength";
+}
+
+// The fixed-value map excludes NullptrT rows BY CONSTRUCTION: `nullptr`
+// (literalTypes value 0, core NullptrT) is a null pointer constant, NOT an
+// integer constant expression — it must not fold in integer const-expr
+// position. RED-ON-DISABLE: drop the integer-valued-core filter in
+// fixedValueTokenMap and both EXPECTs red (nullptr would fold to 0).
+TEST(SemanticAnalyzerCSubset, NullptrStaysNonFoldableInIntegerConstExpr) {
+    auto dimModel = analyzeShipped("c-subset", {
+        "int main(void) { int a[nullptr]; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(dimModel.diagnostics(),
+                        DiagnosticCode::S_NonConstantArrayLength), 1u);
+    auto saModel = analyzeShipped("c-subset", {
+        "_Static_assert(nullptr, \"nullptr is not an ICE\");\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(saModel.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u);
+}
+
+// F4 — constexpr is the OBJECT storage-class: BOTH function forms fail loud.
+// The DEFINITION form is the F1 hook-hoist witness: a function definition's
+// declarator is a BARE declarator carrier (no init slot), which the loop's
+// `rule != initDeclaratorRule` gate skips — a post-gate hook would silently
+// accept it (and the file-scope linkage row would wrongly give it INTERNAL
+// linkage). RED-ON-DISABLE: move the hook below the gate and the definition
+// arm reds while the proto arm stays green.
+TEST(SemanticAnalyzerCSubset, ConstexprFunctionFormsFailLoud) {
+    auto protoModel = analyzeShipped("c-subset", {
+        "constexpr int f(void);\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(protoModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprFunctionNotSupported), 1u)
+        << "a constexpr function PROTOTYPE must fail loud";
+    auto defModel = analyzeShipped("c-subset", {
+        "constexpr int f(void) { return 1; }\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(defModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprFunctionNotSupported), 1u)
+        << "a constexpr function DEFINITION must fail loud (the F1 hoist "
+           "witness — its declarator is a bare carrier the init gate skips)";
+}
+
+// F4 — missing initializer fires PER DECLARATOR: `a` folds fine, `b` has no
+// init slot at all (a bare declarator in the list).
+TEST(SemanticAnalyzerCSubset, ConstexprMissingInitializerFiresPerDeclarator) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { constexpr int a = 1, b; return a; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstexprMissingInitializer), 1u)
+        << "exactly one missing-init — on `b`, not `a`";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 0u)
+        << "`a = 1` folds — no false non-constant on the initialized slot";
+}
+
+// F4 — `for (constexpr int i = 0; ...)` is VALID C23 (6.8.5p3 admits
+// auto/register/constexpr in a for-init; forDecl reuses localDeclSpecifiers so
+// it parses, and forDecl has NO linkageSpecifiers so linkageFrom's empty-map
+// early-return keeps it linkage-silent).
+TEST(SemanticAnalyzerCSubset, ConstexprInForInitAccepted) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { for (constexpr int i = 0;;) { return i; } }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "C23 6.8.5p3 explicitly admits constexpr in a for-init declaration";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticStorageInForInit), 0u)
+        << "the for-init static gate must NOT fire on constexpr";
+}
+
+// F4 — the volatile pair (C23 6.7.1p11): a volatile-qualified OBJECT type is
+// rejected; a volatile POINTEE stays legal (the object is the pointer). The
+// east-volatile form (`int * volatile p`) IS a volatile object — rejected.
+TEST(SemanticAnalyzerCSubset, ConstexprVolatileObjectRejectedPointeeLegal) {
+    auto badModel = analyzeShipped("c-subset", {
+        "int main(void) { constexpr volatile int v = 1; return v; }\n",
+    });
+    EXPECT_EQ(countCode(badModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprInvalidQualifier), 1u)
+        << "a volatile-qualified constexpr OBJECT violates 6.7.1p11";
+    auto okModel = analyzeShipped("c-subset", {
+        "int main(void) { constexpr volatile int *p = nullptr; "
+        "return p == 0 ? 0 : 1; }\n",
+    });
+    EXPECT_EQ(countCode(okModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprInvalidQualifier), 0u)
+        << "a volatile POINTEE is legal — the constexpr object is the pointer";
+    EXPECT_FALSE(okModel.hasErrors());
+    auto eastModel = analyzeShipped("c-subset", {
+        "int main(void) { constexpr int * volatile p = nullptr; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(eastModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprInvalidQualifier), 1u)
+        << "east `int * volatile p` IS a volatile-qualified object — rejected";
+}
+
+// F5 — an ENUM-typed constexpr is admitted as arithmetic: the enumerator
+// initializer folds through the shared resolveSymbolValue direct-value arm.
+TEST(SemanticAnalyzerCSubset, ConstexprEnumTypedAdmitted) {
+    auto model = analyzeShipped("c-subset", {
+        "enum Color { RED = 3, GREEN };\n"
+        "int main(void) { constexpr enum Color c = GREEN; return c; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "an enumerator is a compile-time constant — enum constexpr folds";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 0u);
+}
+
+// Float-capable folding (the constExprValue arm): a float constexpr with a
+// folding arithmetic initializer validates, including combined with `static`.
+// RED-ON-DISABLE: revert the floatLiteralTokens population in constExprValue
+// and this reds S0037 (the leaf would refuse the float literal).
+TEST(SemanticAnalyzerCSubset, ConstexprFloatFolds) {
+    auto model = analyzeShipped("c-subset", {
+        "static constexpr double PI2 = 3.5 * 2;\n"
+        "int main(void) { return (int)PI2; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "3.5 * 2 folds under allowFloat — the float-capable constexpr arm";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 0u);
+}
+
+// Pointer arm: nullptr and the folded integer-0 forms are null pointer
+// constants (accepted); an address-of initializer is not a compile-time
+// constant here (fail loud). The `(T*)0` cast form is the named loud deferral
+// D-CSUBSET-CONSTEXPR-POINTER-CAST-NULL (falls into the same fail-loud arm).
+TEST(SemanticAnalyzerCSubset, ConstexprPointerNullFormsAcceptedAddressRejected) {
+    auto okModel = analyzeShipped("c-subset", {
+        "constexpr int *p1 = nullptr;\n"
+        "constexpr int *p2 = 0;\n"
+        "int main(void) { return p1 == p2 ? 0 : 1; }\n",
+    });
+    EXPECT_FALSE(okModel.hasErrors())
+        << "nullptr and integer-0 are null pointer constants (C 6.3.2.3p3)";
+    auto badModel = analyzeShipped("c-subset", {
+        "int g;\n"
+        "constexpr int *p = &g;\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(badModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
+        << "&g is an address constant, not a supported constexpr pointer init";
+}
+
+// Aggregate deferral (D-CSUBSET-CONSTEXPR-AGGREGATE-TYPE): array/struct/union
+// constexpr objects fail loud — a UNIFORM boundary (the char-array string form
+// is deliberately not carved out).
+TEST(SemanticAnalyzerCSubset, ConstexprAggregateTypesFailLoud) {
+    auto arrModel = analyzeShipped("c-subset", {
+        "constexpr int a[3] = {1, 2, 3};\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(arrModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprUnsupportedType), 1u);
+    auto strModel = analyzeShipped("c-subset", {
+        "constexpr char s[] = \"hi\";\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(strModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprUnsupportedType), 1u)
+        << "the char-array-from-string form keeps the UNIFORM boundary";
+    auto structModel = analyzeShipped("c-subset", {
+        "struct S { int x; };\n"
+        "struct S s0;\n"
+        "int main(void) { constexpr struct S s = s0; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(structModel.diagnostics(),
+                        DiagnosticCode::S_ConstexprUnsupportedType), 1u);
+}
+
+// isConstexpr IMPLIES isConst end-to-end: assigning to a constexpr object is
+// rejected by the EXISTING const-violation machinery (code-audit MEDIUM-3 pin —
+// the flag pin alone doesn't prove the assignment path fires).
+TEST(SemanticAnalyzerCSubset, ConstexprAssignmentRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { constexpr int x = 5; x = 6; return x; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstViolation), 1u)
+        << "a constexpr object is implicitly const — assignment must reject";
+}
+
+// ACCEPTING-PIN (D-CSUBSET-CONSTEXPR-EXACT-REPRESENTABILITY, code-audit
+// MEDIUM-1): C23 6.7.1p10 requires the initializer's value be EXACTLY
+// representable in the declared type — `constexpr int x = 1.5;` and
+// `constexpr unsigned u = -1;` are constraint violations under GCC/Clang.
+// DSS currently ACCEPTS both (the fold succeeds; the stored value matches the
+// plain-const equivalent — a silent-accept of invalid C23, NOT a miscompile).
+// This pin DOCUMENTS the boundary; when the deferral closes, it flips red and
+// is updated deliberately (the gated-deferral discipline).
+TEST(SemanticAnalyzerCSubset, ConstexprExactRepresentabilityCurrentlyUnenforced) {
+    auto fracModel = analyzeShipped("c-subset", {
+        "int main(void) { constexpr int x = 1.5; return x; }\n",
+    });
+    EXPECT_FALSE(fracModel.hasErrors())
+        << "documents the OPEN 6.7.1p10 boundary — update when the deferral closes";
+    auto negModel = analyzeShipped("c-subset", {
+        "int main(void) { constexpr unsigned int u = -1; return 0; }\n",
+    });
+    EXPECT_FALSE(negModel.hasErrors())
+        << "documents the OPEN 6.7.1p10 boundary — update when the deferral closes";
+}
+
+// ── FC17.5 (D-CSUBSET-EMPTY-INITIALIZER + D-CSUBSET-FUNC-PREDEFINED-
+//    IDENTIFIER): C23 {} empty/scalar brace-init × constexpr, and the C99
+//    6.4.2.2 `__func__` predefined identifier ────────────────────────────────
+
+// F3 (C23 6.7.10p11 × 6.7.1): an EMPTY brace initializer zero-initializes —
+// zero is a valid compile-time value for every scalar constexpr object,
+// including the pointer arm (zero = the null pointer constant). Without the
+// F3 empty-brace arm, `constExprValue` cannot fold `{}` (it is not an
+// expression) and both declarations would false-fire
+// S_ConstexprNonConstantInitializer.
+TEST(SemanticAnalyzerCSubset, ConstexprEmptyBraceInitializerValid) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    constexpr int x = {};\n"
+        "    constexpr int *p = {};\n"
+        "    return x + (p == 0 ? 0 : 1);\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+}
+
+// The now-green DELTA pin: `constexpr int x = {5};` passes semantic — the
+// single-element brace list folds through the normal single-child descent
+// (the HIR scalar brace-init lift makes the whole program compile; this pin
+// holds the SEMANTIC half green).
+TEST(SemanticAnalyzerCSubset, ConstexprSingleBraceInitializerValid) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { constexpr int x = {5}; return x; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+              ? "" : model.diagnostics().all()[0].actual);
+}
+
+// F1 (C99 6.4.2.2): the synthetic `__func__` symbol is `isConst`, so SE4's
+// const check rejects simple assignment — the isConst flag is the ONLY guard
+// on this path (pin it; without it `__func__ = x` would reach HIR lowering
+// and dead-end as a rodata write).
+TEST(SemanticAnalyzerCSubset, FuncNameAssignmentIsConstViolation) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    const char *x;\n"
+        "    x = __func__;\n"
+        "    __func__ = x;\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstViolation), 1u)
+        << "__func__ = x must reject via the synthetic symbol's isConst";
+}
+
+// F1: compound assignment takes the SAME SE4 const chokepoint (the
+// operator-gated assignment entries share the rule) — `__func__ += 1` is a
+// distinct classifier path from plain `=`, so pin it separately.
+TEST(SemanticAnalyzerCSubset, FuncNameCompoundAssignIsConstViolation) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { __func__ += 1; return 0; }\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ConstViolation), 1u)
+        << "__func__ += 1 must reject via the synthetic symbol's isConst";
+}
+
+// N4: the synthetic binds BEFORE the params (Pass 1 binds it when the
+// function's scope is pushed; the params bind as the driver walks the
+// children AFTER), so a param named `__func__` collides at ITS OWN bind —
+// a positioned S_RedeclaredSymbol, never a crash or a silent shadow.
+TEST(SemanticAnalyzerCSubset, ParamNamedFuncNameRedeclares) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int __func__) { return __func__; }\n"
+        "int main(void) { return f(42); }\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_RedeclaredSymbol), 1u)
+        << "a param named __func__ must collide with the earlier synthetic "
+           "bind (N4: bind-before-params)";
+}
+
+// The binding is FUNCTION-scoped (C99 6.4.2.2 declares __func__ inside each
+// function definition): at FILE scope there is no enclosing function and the
+// name resolves to NOTHING — a use fails loud as an ordinary undeclared
+// identifier, never a guessed global.
+TEST(SemanticAnalyzerCSubset, FuncNameOutsideFunctionIsUndeclared) {
+    auto model = analyzeShipped("c-subset", {
+        "int x = __func__[0];\n"
+        "int main(void) { return x; }\n",
+    });
+    EXPECT_GE(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UndeclaredIdentifier), 1u)
+        << "__func__ at file scope must be undeclared (the binding is "
+           "per-function-definition)";
+}
+
+// ── FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): standard-attribute
+//    semantics — maybe_unused / deprecated / nodiscard / fallthrough /
+//    unknown-attribute policy ─────────────────────────────────────────────────
+
+// C23 6.7.13.4: `[[maybe_unused]]` suppresses the D8 unused-variable warning.
+// The SAME-shape unflagged sibling `y` still warns — the paired control makes
+// this red-on-disable by construction (drop the D8 `isMaybeUnused` skip → the
+// count becomes 2; drop the scan/mint → 2; break the D8 gate itself → 0 and
+// the control flips).
+TEST(SemanticAnalyzerCSubset, MaybeUnusedSuppressesUnusedWarning) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    [[maybe_unused]] int x = 5;\n"
+        "    int y = 6;\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 1u)
+        << "exactly the unflagged sibling warns";
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_UnusedVariable)
+            EXPECT_EQ(diag.actual, "y")
+                << "the [[maybe_unused]] x must not be the warning subject";
+    }
+}
+
+// The GNU spelling `__attribute__((unused))` maps to the SAME suppressUnused
+// row (dunder-normalized, so `__unused__` also matches). Block scope: the
+// attrSpec rides varDecl's localDeclSpecifiers.
+TEST(SemanticAnalyzerCSubset, GnuUnusedSpellingSuppresses) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    __attribute__((unused)) int x = 5;\n"
+        "    __attribute__((__unused__)) int w = 7;\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u)
+        << "both GNU unused spellings must suppress the warning";
+}
+
+// C23 6.7.13: an attribute in the declaration specifiers appertains to EACH
+// declared entity — `[[maybe_unused]] int a, b;` suppresses for BOTH
+// declarators (the facts are folded once per declaration, applied per
+// declarator — the alignas/noreturn shared-prefix precedent).
+TEST(SemanticAnalyzerCSubset, MaybeUnusedMultiDeclaratorAppliesAll) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    [[maybe_unused]] int a, b;\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u)
+        << "the shared specifier prefix must flag every declarator";
+}
+
+// C23 6.7.13.3: each USE of a `[[deprecated]]` function warns — per call site
+// (2 calls → 2 warnings, distinct spans), as a WARNING, naming the symbol. A
+// non-deprecated sibling `h` never warns (the control).
+TEST(SemanticAnalyzerCSubset, DeprecatedWarnsAtEachCallSite) {
+    auto model = analyzeShipped("c-subset", {
+        "[[deprecated]] int g(void) { return 1; }\n"
+        "int h(void) { return 2; }\n"
+        "int main(void) { return g() + h() + g(); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 2u)
+        << "one warning per use site — two calls to g, none for h";
+    std::vector<std::uint32_t> starts;
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code != DiagnosticCode::S_DeprecatedSymbolUsed) continue;
+        EXPECT_EQ(diag.severity, DiagnosticSeverity::Warning);
+        EXPECT_EQ(diag.actual, "g");
+        starts.push_back(diag.span.start());
+    }
+    ASSERT_EQ(starts.size(), 2u);
+    EXPECT_NE(starts[0], starts[1])
+        << "the two warnings must anchor at the two DISTINCT use sites";
+}
+
+// `[[deprecated("use h instead")]]` — the decoded string argument rides the
+// warning as `name: msg` (the shared decodeAdjacentStringBodies chokepoint).
+TEST(SemanticAnalyzerCSubset, DeprecatedMessageIncluded) {
+    auto model = analyzeShipped("c-subset", {
+        "[[deprecated(\"use h instead\")]] int g(void) { return 1; }\n"
+        "int main(void) { return g(); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u);
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed)
+            EXPECT_EQ(diag.actual, "g: use h instead");
+    }
+}
+
+// A `[[deprecated]]` PROTOTYPE + an unflagged definition: the flag OR-merges
+// into the surviving definition (the isNoreturn mergedFnDecls precedent), so a
+// call — which resolves to the survivor — still warns. RED-ON-DISABLE for the
+// merge: drop the OR-merge block → detection marked only the absorbed proto,
+// the survivor stays unflagged, the count drops to 0.
+TEST(SemanticAnalyzerCSubset, DeprecatedProtoOrMergesIntoDefinition) {
+    auto model = analyzeShipped("c-subset", {
+        "[[deprecated(\"legacy\")]] int g(void);\n"
+        "int g(void) { return 1; }\n"
+        "int main(void) { return g(); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u)
+        << "the proto's deprecated flag must OR-merge into the definition";
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_DeprecatedSymbolUsed)
+            EXPECT_EQ(diag.actual, "g: legacy")
+                << "the message must merge too (first-non-empty-wins)";
+    }
+}
+
+// A deprecated OBJECT (not just functions): each use of the global warns via
+// the same reference-resolution chokepoint.
+TEST(SemanticAnalyzerCSubset, DeprecatedObjectUseWarns) {
+    auto model = analyzeShipped("c-subset", {
+        "[[deprecated]] int legacy_flag;\n"
+        "int main(void) { return legacy_flag; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_DeprecatedSymbolUsed), 1u)
+        << "a deprecated object's use site must warn like a function's";
+}
+
+// C23 6.7.13.2: a `[[nodiscard]]` call whose result is DISCARDED — the call is
+// the entire expression of an expression statement — warns (Warning severity,
+// naming the callee).
+TEST(SemanticAnalyzerCSubset, NodiscardDiscardedWarns) {
+    auto model = analyzeShipped("c-subset", {
+        "[[nodiscard]] int f(void) { return 1; }\n"
+        "int main(void) { f(); return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NodiscardResultDiscarded), 1u);
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_NodiscardResultDiscarded) {
+            EXPECT_EQ(diag.severity, DiagnosticSeverity::Warning);
+            EXPECT_EQ(diag.actual, "f");
+        }
+    }
+}
+
+// ★ THE F1 red-on-disable pin: `(void)f();` must NOT warn. The discard check
+// is TWO-hop-exact (parent(call)==expression AND grandparent==exprStmt) at the
+// SEMANTIC tier where the cast still exists structurally (a castExpr
+// interposes → parent≠expression-under-exprStmt). This pin goes red if the
+// check ever moves post-HIR (where the (void) cast is elided) OR if the hop
+// count is wrong (a THREE-hop / suffix-blind check would fire here; the
+// original ONE-hop design bug would fire NOWHERE — caught by
+// NodiscardDiscardedWarns above going red instead).
+TEST(SemanticAnalyzerCSubset, NodiscardVoidCastSuppresses) {
+    auto model = analyzeShipped("c-subset", {
+        "[[nodiscard]] int f(void) { return 1; }\n"
+        "int main(void) { (void)f(); return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NodiscardResultDiscarded), 0u)
+        << "the (void) cast is the C idiom for a deliberate discard — no warning";
+}
+
+// A nodiscard result that IS consumed never warns: initializer, argument, and
+// return-value positions (each has the wrong parent/grandparent shape).
+TEST(SemanticAnalyzerCSubset, NodiscardUsedInExpressionNoWarn) {
+    auto model = analyzeShipped("c-subset", {
+        "[[nodiscard]] int f(void) { return 1; }\n"
+        "int g(int v) { return v; }\n"
+        "int main(void) {\n"
+        "    int r = f();\n"
+        "    int s = g(f());\n"
+        "    if (r + s == 3) { return f(); }\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NodiscardResultDiscarded), 0u)
+        << "init / argument / return positions all consume the result";
+}
+
+// `[[nodiscard("reason")]]` — the message rides the warning as `name: msg`.
+TEST(SemanticAnalyzerCSubset, NodiscardMessageIncluded) {
+    auto model = analyzeShipped("c-subset", {
+        "[[nodiscard(\"check the error code\")]] int f(void) { return 1; }\n"
+        "int main(void) { f(); return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NodiscardResultDiscarded), 1u);
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_NodiscardResultDiscarded)
+            EXPECT_EQ(diag.actual, "f: check the error code");
+    }
+}
+
+// The GNU spelling `__attribute__((warn_unused_result))` maps to the SAME
+// warnOnDiscard row; a proto-only spelling OR-merges into the definition
+// (message-less → `.actual` is the bare name).
+TEST(SemanticAnalyzerCSubset, GnuWarnUnusedResultWarnsAndMerges) {
+    auto model = analyzeShipped("c-subset", {
+        "__attribute__((warn_unused_result)) int f(void);\n"
+        "int f(void) { return 1; }\n"
+        "int main(void) { f(); return 0; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    ASSERT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_NodiscardResultDiscarded), 1u)
+        << "the GNU spelling + the proto-to-definition OR-merge must both work";
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_NodiscardResultDiscarded)
+            EXPECT_EQ(diag.actual, "f");
+    }
+}
+
+// C23 6.7.13p3 posture: an UNKNOWN `[[...]]` standard attribute warns
+// SUPPRESSIBLY and the program still compiles (hasErrors()==false) — C23
+// forbids treating it as fatal. Exactly ONE warning even for a
+// multi-declarator declaration (the once-per-declaration scan site).
+TEST(SemanticAnalyzerCSubset, UnknownStdAttrWarnsSuppressibly) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    [[frobnicate]] int x = 1, y = 2;\n"
+        "    return x + y - 3;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "an unknown standard attribute must never fail the build";
+    ASSERT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownAttribute), 1u)
+        << "once per declaration, not per declarator";
+    for (auto const& diag : model.diagnostics().all()) {
+        if (diag.code == DiagnosticCode::S_UnknownAttribute) {
+            EXPECT_EQ(diag.severity, DiagnosticSeverity::Warning);
+            EXPECT_EQ(diag.actual, "frobnicate");
+        }
+    }
+}
+
+// ★ THE F4 pin: names the language KNOWS — consumed by a dedicated scan
+// (noreturn) or deliberately inert per C23 (fallthrough/likely/unlikely/
+// reproducible/unsequenced) — must NOT trip the unknown-attribute warning.
+// Without the effect-table `none` rows, `[[noreturn]] int f(void);` would
+// false-fire S_UnknownAttribute.
+TEST(SemanticAnalyzerCSubset, KnownC23NoOpAttributesDontWarn) {
+    auto model = analyzeShipped("c-subset", {
+        "[[noreturn]] void die(void);\n"
+        "void die(void) { while (1) { } }\n"
+        "[[reproducible]] int f(void) { return 1; }\n"
+        "int main(void) {\n"
+        "    [[likely]] int a = f();\n"
+        "    [[unlikely]] int b = 2;\n"
+        "    [[unsequenced]] int c = 3;\n"
+        "    return a + b + c - 6;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownAttribute), 0u)
+        << "known C23 vocabulary must never warn unknown (F4)";
+}
+
+// C23 6.8.1: the bare attribute-declaration STATEMENT `[[fallthrough]];`
+// parses + analyzes clean inside a switch (both spellings). The runtime
+// witness (1+10=11 through the marked fallthrough) is the
+// examples/c-subset/switch_fallthrough_attribute corpus entry.
+TEST(SemanticAnalyzerCSubset, FallthroughStatementParsesInSwitch) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    int x = 1; int acc = 0;\n"
+        "    switch (x) {\n"
+        "        case 1: acc += 1; [[fallthrough]];\n"
+        "        case 2: acc += 10; break;\n"
+        "        default: acc = 99; break;\n"
+        "    }\n"
+        "    return acc - 11;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "[[fallthrough]]; must parse + analyze clean as a switch body item";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownAttribute), 0u);
+}
+
+// The GNU statement spelling `__attribute__((fallthrough));` rides the SAME
+// attributeDeclaration rule (compositeAttrList admits attrSpec | stdAttr).
+TEST(SemanticAnalyzerCSubset, GnuFallthroughSpellingParses) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    int x = 1; int acc = 0;\n"
+        "    switch (x) {\n"
+        "        case 1: acc += 1; __attribute__((fallthrough));\n"
+        "        case 2: acc += 10; break;\n"
+        "        default: acc = 99; break;\n"
+        "    }\n"
+        "    return acc - 11;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "__attribute__((fallthrough)); must parse as a statement";
+}
+
+// A bare statement with an UNKNOWN standard attribute (`[[frobnicate]];`)
+// warns suppressibly through the pass2Post bareStatementRule arm — same
+// policy as the declaration position, still no error.
+TEST(SemanticAnalyzerCSubset, UnknownBareStatementAttrWarnsSuppressibly) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    [[frobnicate]];\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnknownAttribute), 1u);
+}
+
+// ── FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): C23 6.7.9 `auto` type inference ──
+//
+// The feature: `auto x = expr;` — a HEAD-LESS declaration whose type is
+// INFERRED from the initializer at the declaration's own Pass-1.5 visit.
+// The block pins the three design-audit CRITICALs: ★C1 the auto-presence
+// gate (C89 implicit-int shapes stay errors), ★C2 the branch order (the
+// >4096-token committed-replay pin below), ★C3 the full inference
+// normalization (decay / loud rejects / stripVolatile / Pass-1.5 stamps).
+
+namespace {
+// Find the FIRST symbol spelled `name`, or nullptr.
+[[nodiscard]] SymbolRecord const*
+findSymbolNamed(SemanticModel const& model, std::string_view name) {
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == name) return &model.symbols()[i];
+    }
+    return nullptr;
+}
+} // namespace
+
+// THE Pass-1.5-VISIBILITY pin (★C3): the inferred type must be written at
+// the declaration's OWN Pass-1.5 visit, not backfilled from the initializer
+// at Pass 2. The discriminator is a FOLLOWING `typeof(x) y;` declaration:
+// typeof's expression operand resolves at y's own Pass-1.5 visit by reading
+// x's SYMBOL TYPE (subtreeType's scope-lookup leaf), and y carries NO
+// initializer, so the Pass-2 backfill can never type it. Under a
+// backfill-only implementation x is untyped when y resolves → y stays
+// untyped → the y->type assert reds. RED-ON-ARM-DISABLE verified.
+// (The `int arr[sizeof(x)]` form of this pin lives in the RUNNABLE example
+// `auto_type_inference` — the raw-analyze fixture has a PRE-EXISTING
+// sizeof-of-LOCAL-in-array-dim limitation pinned by the
+// `sizeof_value_in_array_dim` corpus golden [S_NonConstantArrayLength even
+// for `const int x = 7;`], which the full CLI pipeline does not share; the
+// example compiles + runs 42 through the real driver on debug AND release.)
+TEST(SemanticAnalyzerCSubset, AutoInfersIntPass15Visible) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    auto x = 42;\n"
+        "    typeof(x) y;\n"
+        "    y = 1;\n"
+        "    return y + x;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "the inferred type must be Pass-1.5-visible (typeof(x) in the "
+           "next declaration)";
+    auto const* x = findSymbolNamed(model, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->type.valid());
+    EXPECT_EQ(model.lattice().interner().kind(x->type), TypeKind::I32);
+    auto const* y = findSymbolNamed(model, "y");
+    ASSERT_NE(y, nullptr);
+    ASSERT_TRUE(y->type.valid())
+        << "typeof(x) at the NEXT declaration's Pass-1.5 visit must see the "
+           "inferred type (y has no initializer — the backfill cannot type it)";
+    EXPECT_EQ(model.lattice().interner().kind(y->type), TypeKind::I32);
+}
+
+// ★C1 — the auto-presence gate: all four specifier-led C89 implicit-int
+// shapes PARSE into the headless rule and MUST stay errors
+// (S_AutoInferenceInvalid, one per declaration). RED-ON-DISABLE: drop the
+// row's requiredSpecifierToken (or the arm's gate) and each silently
+// becomes an initializer-typed declaration.
+TEST(SemanticAnalyzerCSubset, AutoPresenceGateKeepsImplicitIntErrors) {
+    char const* const forms[] = {
+        "int main(void) { static x = 5; return x; }\n",
+        "int main(void) { register y = 2; return y; }\n",
+        "int main(void) { alignas(4) z = 9; return z; }\n",
+        "int main(void) { [[maybe_unused]] w = 3; return w; }\n",
+    };
+    for (auto const* src : forms) {
+        auto model = analyzeShipped("c-subset", {std::string{src}});
+        EXPECT_EQ(countCode(model.diagnostics(),
+                            DiagnosticCode::S_AutoInferenceInvalid), 1u)
+            << "C89 implicit-int must stay an error for: " << src;
+    }
+}
+
+// ★C3 decay — a string-literal initializer infers char* (NOT Array<Char,4>):
+// the un-decayed array would give sizeof(s)==4 and a wrong-typed object.
+TEST(SemanticAnalyzerCSubset, AutoStringLiteralDecaysToCharPointer) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { auto s = \"str\"; return s[0] == 's' ? 0 : 1; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* s = findSymbolNamed(model, "s");
+    ASSERT_NE(s, nullptr);
+    ASSERT_TRUE(s->type.valid());
+    auto const& in = model.lattice().interner();
+    ASSERT_EQ(in.kind(s->type), TypeKind::Ptr) << "array-to-pointer decay";
+    EXPECT_EQ(in.kind(in.operands(s->type)[0]), TypeKind::Char);
+}
+
+// ★C3 decay — an array VARIABLE initializer decays to pointer-to-element.
+TEST(SemanticAnalyzerCSubset, AutoArrayVariableDecaysToElementPointer) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    int a[3];\n"
+        "    a[1] = 7;\n"
+        "    auto p = a;\n"
+        "    return p[1];\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* p = findSymbolNamed(model, "p");
+    ASSERT_NE(p, nullptr);
+    ASSERT_TRUE(p->type.valid());
+    auto const& in = model.lattice().interner();
+    ASSERT_EQ(in.kind(p->type), TypeKind::Ptr);
+    EXPECT_EQ(in.kind(in.operands(p->type)[0]), TypeKind::I32);
+}
+
+// ★C3 decay — a function-name initializer decays to pointer-to-function
+// (the c56 fn-designator precedent), and the object is callable.
+TEST(SemanticAnalyzerCSubset, AutoFunctionNameDecaysToFunctionPointer) {
+    auto model = analyzeShipped("c-subset", {
+        "static int twice(int v) { return v + v; }\n"
+        "int main(void) { auto f = twice; return f(21); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* f = findSymbolNamed(model, "f");
+    ASSERT_NE(f, nullptr);
+    ASSERT_TRUE(f->type.valid());
+    auto const& in = model.lattice().interner();
+    ASSERT_EQ(in.kind(f->type), TypeKind::Ptr) << "function-to-pointer decay";
+    EXPECT_EQ(in.kind(in.operands(f->type)[0]), TypeKind::FnSig);
+}
+
+// C23 6.7.9p2 — exactly ONE declarator.
+TEST(SemanticAnalyzerCSubset, AutoMultiDeclaratorRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { auto a = 1, b = 2; return a + b; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AutoRequiresSingleDeclarator), 1u);
+}
+
+// C23 6.7.9p2 — a PLAIN IDENTIFIER declarator. `auto *p = 0;` (a derived
+// declarator — D-CSUBSET-AUTO-DERIVED-DECLARATOR) and the diagnostic-SHAPE
+// pin `auto f(void);` (parses into the headless rule; must be THIS code,
+// never a silent prototype) both reject S_AutoRequiresPlainIdentifier.
+TEST(SemanticAnalyzerCSubset, AutoDerivedDeclaratorRejected) {
+    auto ptrModel = analyzeShipped("c-subset", {
+        "int main(void) { auto *p = 0; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(ptrModel.diagnostics(),
+                        DiagnosticCode::S_AutoRequiresPlainIdentifier), 1u);
+    auto fnModel = analyzeShipped("c-subset", {
+        "int main(void) { auto f(void); return 0; }\n",
+    });
+    EXPECT_EQ(countCode(fnModel.diagnostics(),
+                        DiagnosticCode::S_AutoRequiresPlainIdentifier), 1u);
+}
+
+// C23 6.7.9p2 — an initializer is REQUIRED. `auto T;` is the second
+// diagnostic-SHAPE pin (the one dual-parse shape `<specifiers> Ident ;`
+// must surface as THIS inference-tier code).
+TEST(SemanticAnalyzerCSubset, AutoMissingInitializerRejected) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { auto T; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AutoRequiresInitializer), 1u);
+}
+
+// ★C3 rejects — void call / bare nullptr / self-reference each fail loud
+// S_AutoInferenceInvalid (RED-ON-DISABLE: without the arm's rejects, Pass
+// 2's initializer backfill silently adopts Void / NullptrT / nothing).
+TEST(SemanticAnalyzerCSubset, AutoUninferableInitializersRejected) {
+    auto voidModel = analyzeShipped("c-subset", {
+        "void vf(void) { }\n"
+        "int main(void) { auto v = vf(); return 0; }\n",
+    });
+    EXPECT_EQ(countCode(voidModel.diagnostics(),
+                        DiagnosticCode::S_AutoInferenceInvalid), 1u)
+        << "auto from a void call must reject";
+    auto nullModel = analyzeShipped("c-subset", {
+        "int main(void) { auto p = nullptr; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(nullModel.diagnostics(),
+                        DiagnosticCode::S_AutoInferenceInvalid), 1u)
+        << "auto from bare nullptr must reject (nullptr_t not declarable)";
+    auto selfModel = analyzeShipped("c-subset", {
+        "int main(void) { auto x = x; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(selfModel.diagnostics(),
+                        DiagnosticCode::S_AutoInferenceInvalid), 1u)
+        << "self-referential initializer must reject loud";
+}
+
+// C23 6.7.9p2 via 6.7.10p12 — the braced SINGLE form infers; the empty and
+// multi-element forms reject via the shared scalar-brace constraint code.
+TEST(SemanticAnalyzerCSubset, AutoBracedSingleInfersAndMalformedRejects) {
+    auto okModel = analyzeShipped("c-subset", {
+        "int main(void) { auto x = {5}; return x - 5; }\n",
+    });
+    EXPECT_FALSE(okModel.hasErrors());
+    auto const* x = findSymbolNamed(okModel, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->type.valid());
+    EXPECT_EQ(okModel.lattice().interner().kind(x->type), TypeKind::I32);
+    auto multiModel = analyzeShipped("c-subset", {
+        "int main(void) { auto y = {1, 2}; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(multiModel.diagnostics(),
+                        DiagnosticCode::S_InvalidScalarInitializer), 1u);
+    auto emptyModel = analyzeShipped("c-subset", {
+        "int main(void) { auto z = {}; return 0; }\n",
+    });
+    EXPECT_EQ(countCode(emptyModel.diagnostics(),
+                        DiagnosticCode::S_InvalidScalarInitializer), 1u)
+        << "`auto z = {};` has no expression to infer from";
+}
+
+// The C89 REGRESSION pin: `auto int x;` (auto as a plain storage-class with
+// a real type head) must keep parsing via varDecl on rollback — the
+// inference rule fast-fails on the `int` and the committed path types x int.
+TEST(SemanticAnalyzerCSubset, AutoC89StorageClassFormUnchanged) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { auto int x; x = 42; return x; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* x = findSymbolNamed(model, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->type.valid());
+    EXPECT_EQ(model.lattice().interner().kind(x->type), TypeKind::I32);
+}
+
+// ★C3 stripVolatile — a volatile-typed initializer infers the UNQUALIFIED
+// type (C23 6.7.9p2 drops top-level qualifiers; the typeof_unqual strip).
+TEST(SemanticAnalyzerCSubset, AutoTopLevelVolatileStripped) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    volatile int v;\n"
+        "    v = 1;\n"
+        "    auto x = v;\n"
+        "    x = 2;\n"
+        "    return x + v;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* x = findSymbolNamed(model, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->type.valid());
+    EXPECT_EQ(model.lattice().interner().kind(x->type), TypeKind::I32)
+        << "the inferred type must be the STRIPPED I32, not VolatileQual(I32)";
+}
+
+// constexpr composes with the inference (P1 prefix scan -> P1.5 infer ->
+// P2 constexpr validation reads the INFERRED type): the object folds as an
+// integer constant expression and carries both Pass-1 marks.
+TEST(SemanticAnalyzerCSubset, AutoConstexprComposes) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { constexpr auto k = 6; int a[k]; a[0] = 1; "
+        "return a[0]; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const* k = findSymbolNamed(model, "k");
+    ASSERT_NE(k, nullptr);
+    EXPECT_TRUE(k->isConstexpr);
+    EXPECT_TRUE(k->isConst);
+    auto const* a = findSymbolNamed(model, "a");
+    ASSERT_NE(a, nullptr);
+    ASSERT_TRUE(a->type.valid());
+    auto const& in = model.lattice().interner();
+    ASSERT_EQ(in.kind(a->type), TypeKind::Array);
+    EXPECT_EQ(in.scalars(a->type)[0], 6);
+}
+
+// ★C2 — THE BRANCH-ORDER pin: a >4096-token block-scope `static const int
+// big[] = {…}` must still compile. With autoInferredVarDecl declared FIRST,
+// varDecl is the declared-LAST structural candidate for a specifier-led
+// statement, so when every speculative probe fails (autoInferred fast-fails
+// at `const`; varDecl exhausts the 4096-token probe budget on the huge
+// initializer) the parser's all-fail REPLAY re-parses varDecl
+// NON-speculatively with no budget — a genuine committed parse.
+// RED-ON-REORDER (empirically verified at implement time): with
+// [varDecl, autoInferredVarDecl, …] the replay target is the inference rule,
+// which cannot parse `const` → P0009. sqlite3.c's largest block-scope static
+// init is 3918 tokens = 96% of the budget, so the sqlite gate can NOT catch
+// this cliff — only this pin does.
+TEST(SemanticAnalyzerCSubset, AutoHugeStaticInitParsesViaCommittedReplay) {
+    std::string src = "int main(void) {\n    static const int big[] = {";
+    for (int i = 0; i < 2200; ++i) {          // ~4400 tokens inside the braces
+        if (i > 0) src += ',';
+        src += std::to_string(i % 97);
+    }
+    src += "};\n    return big[3];\n}\n";
+    auto model = analyzeShipped("c-subset", {src});
+    EXPECT_FALSE(model.hasErrors())
+        << "a >4096-token static initializer must parse via the committed "
+           "replay of the declared-LAST varDecl branch";
+    auto const* big = findSymbolNamed(model, "big");
+    ASSERT_NE(big, nullptr);
+    ASSERT_TRUE(big->type.valid());
+    auto const& in = model.lattice().interner();
+    ASSERT_EQ(in.kind(big->type), TypeKind::Array);
+    EXPECT_EQ(in.scalars(big->type)[0], 2200);
+}
+
+// The for-init mirror: `for (auto i = 0; …)` infers (C23 6.8.5p3 admits
+// auto in a for-init) and `for (static auto i = 0;;)` stays gated loud
+// (the copied forDecl StaticKeyword gatedMarker — C 6.8.5p3 violation).
+TEST(SemanticAnalyzerCSubset, AutoForInitInfersAndStaticStaysGated) {
+    auto okModel = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    int acc = 0;\n"
+        "    for (auto i = 0; i < 7; i = i + 1) acc = acc + i;\n"
+        "    return acc;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(okModel.hasErrors());
+    auto const* i = findSymbolNamed(okModel, "i");
+    ASSERT_NE(i, nullptr);
+    ASSERT_TRUE(i->type.valid());
+    EXPECT_EQ(okModel.lattice().interner().kind(i->type), TypeKind::I32);
+    auto gatedModel = analyzeShipped("c-subset", {
+        "int main(void) { for (static auto i = 0; i < 3; i = i + 1) { } "
+        "return 0; }\n",
+    });
+    EXPECT_EQ(countCode(gatedModel.diagnostics(),
+                        DiagnosticCode::S_StaticStorageInForInit), 1u);
+}
+
+// The two NAMED loud parse boundaries stay loud (never silent):
+// file-scope `auto g = 42;` (C23 ALLOWS it — D-CSUBSET-AUTO-FILE-SCOPE is
+// the named deferral; DSS keeps the pre-existing loud parse reject) and the
+// qualified forms `const auto` / `auto const` (D-CSUBSET-AUTO-QUALIFIED).
+TEST(SemanticAnalyzerCSubset, AutoFileScopeAndQualifiedStayLoudParseErrors) {
+    char const* const rejects[] = {
+        "auto g = 42;\nint main(void) { return g; }\n",
+        "int main(void) { const auto x = 5; return x; }\n",
+        "int main(void) { auto const x = 5; return x; }\n",
+    };
+    for (auto const* src : rejects) {
+        auto cu = buildShippedUnit("c-subset", {std::string{src}});
+        bool anyParseError = false;
+        for (auto const& t : cu->trees()) {
+            for (auto const& d : t.diagnostics().all()) {
+                if (d.severity == DiagnosticSeverity::Error) {
+                    anyParseError = true;
+                }
+            }
+        }
+        EXPECT_TRUE(anyParseError)
+            << "must stay a loud parse error (named deferral): " << src;
+    }
+}
+
+// Positive inference-KIND breadth (code-audit fold): the inferred type is
+// pinned EXACTLY for each non-decaying initializer class the arm passes
+// through unchanged — a struct variable (aggregates infer by value, no
+// decay), an enumerator (the enum TYPE, not its underlying int), a
+// comparison (Bool — promoteComparisons), a char variable (Char, not the
+// promoted int), and an unsuffixed float literal (F64 per C 6.4.4.2). All
+// in ONE unit so the block also witnesses the inferred objects USED
+// together (member access through the inferred struct, arithmetic across
+// the rest).
+TEST(SemanticAnalyzerCSubset, AutoInfersExactKindsAcrossValueClasses) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int x; };\n"
+        "enum E { A };\n"
+        "int main(void) {\n"
+        "    struct S sv;\n"
+        "    sv.x = 1;\n"
+        "    auto s2 = sv;\n"
+        "    auto e = A;\n"
+        "    auto b = (1 < 2);\n"
+        "    char cv = 'a';\n"
+        "    auto c = cv;\n"
+        "    auto f = 2.5;\n"
+        "    return s2.x + e + b + c + (int)f;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    auto const& in = model.lattice().interner();
+    auto const kindOf = [&](char const* name) -> TypeKind {
+        auto const* rec = findSymbolNamed(model, name);
+        if (rec == nullptr || !rec->type.valid()) {
+            ADD_FAILURE() << "symbol '" << name << "' missing or untyped";
+            return TypeKind::Void;
+        }
+        return in.kind(rec->type);
+    };
+    EXPECT_EQ(kindOf("s2"), TypeKind::Struct)
+        << "a struct variable infers the struct type BY VALUE (no decay)";
+    EXPECT_EQ(kindOf("e"), TypeKind::Enum)
+        << "an enumerator infers the ENUM type (enumConvertsToArith covers "
+           "its uses; the type itself stays Enum)";
+    EXPECT_EQ(kindOf("b"), TypeKind::Bool)
+        << "a comparison infers Bool (promoteComparisons)";
+    EXPECT_EQ(kindOf("c"), TypeKind::Char)
+        << "a char VARIABLE infers Char (the symbol's type, not the "
+           "promoted int)";
+    EXPECT_EQ(kindOf("f"), TypeKind::F64)
+        << "an unsuffixed float literal infers double (C 6.4.4.2)";
+}
+
+// ── TLS C1 (D-CSUBSET-THREAD-LOCAL): C11/C23 6.7.1 thread storage duration ──
+//
+// The ACCEPT matrix: every legal spelling/placement parses AND marks the
+// symbol record. RED-ON-DISABLE: drop the Pass-1 `scanSpecifierPrefixStorage`
+// mint (or the linkageSpecifiers `{threadStorage:true}` config entries) and
+// every isThreadLocal EXPECT below reds — and with it every enforcement test
+// in this block stops firing (the validator gates on the mark).
+TEST(SemanticAnalyzerCSubset, ThreadLocalAcceptsAndMarksSymbols) {
+    auto model = analyzeShipped("c-subset", {
+        "_Thread_local int g = 5;\n"                     // C11 spelling
+        "thread_local int h;\n"                          // C23 spelling, tentative
+        "static thread_local int s = 2;\n"               // static first
+        "thread_local static int s2 = 3;\n"              // thread_local first
+        "extern thread_local int e;\n"                   // the cross-TU form
+        "int plain = 9;\n"                               // control: unmarked
+        "int main(void) {\n"
+        "    static thread_local int ls = 4;\n"          // block-scope static
+        "    return g + h + s + s2 + ls + plain;\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "every accept-matrix form is legal C11/C23";
+    for (char const* nm : {"g", "h", "s", "s2", "e", "ls"}) {
+        auto const* rec = findSymbolNamed(model, nm);
+        ASSERT_NE(rec, nullptr) << nm;
+        EXPECT_TRUE(rec->isThreadLocal)
+            << nm << " must carry the Pass-1 thread-storage mark";
+    }
+    auto const* plainRec = findSymbolNamed(model, "plain");
+    ASSERT_NE(plainRec, nullptr);
+    EXPECT_FALSE(plainRec->isThreadLocal)
+        << "an unmarked global must stay process-shared";
+}
+
+// thread_local does NOT change linkage (C11 6.2.2 untouched by 6.7.1): the
+// file-scope form keeps EXTERNAL linkage, and a co-present `static` keeps its
+// INTERNAL binding in EITHER order (the noreturn linkage-clobber lesson — a
+// threadStorage row must never last-wins-overwrite a static's binding).
+// What the ANALYZER must guarantee is that both orders survive to the HIR
+// tier error-free with the thread mark intact on both symbols (the binding
+// axis itself is stamped at HIR lowering by linkageFrom, pinned in the MIR
+// lowering tests).
+TEST(SemanticAnalyzerCSubset, ThreadLocalDoesNotClobberStaticBinding) {
+    auto model = analyzeShipped("c-subset", {
+        "static thread_local int a = 1;\n"
+        "thread_local static int b = 2;\n"
+        "int main(void) { return a + b; }\n",
+    });
+    EXPECT_FALSE(model.hasErrors());
+    for (char const* nm : {"a", "b"}) {
+        auto const* rec = findSymbolNamed(model, nm);
+        ASSERT_NE(rec, nullptr) << nm;
+        EXPECT_TRUE(rec->isThreadLocal) << nm;
+    }
+}
+
+// 6.7.1p4 — objects only. A thread_local FUNCTION (prototype and definition
+// forms) fails loud S_ThreadLocalOnFunction. RED-ON-DISABLE: drop the
+// validator's FnSig arm and both go green (silently compiling the specifier
+// away).
+TEST(SemanticAnalyzerCSubset, ThreadLocalOnFunctionFailsLoud) {
+    auto proto = analyzeShipped("c-subset", {
+        "thread_local int f(void);\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(proto.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalOnFunction), 1u)
+        << "a thread_local prototype is a 6.7.1p4 constraint violation";
+    auto def = analyzeShipped("c-subset", {
+        "_Thread_local int f(void) { return 1; }\n"
+        "int main(void) { return f(); }\n",
+    });
+    EXPECT_EQ(countCode(def.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalOnFunction), 1u)
+        << "a thread_local function DEFINITION violates the same constraint";
+}
+
+// 6.7.1p3 — a BLOCK-scope thread_local object requires static or extern.
+// The plain block form and the for-init form (where the requirement is
+// unsatisfiable — a for-init admits neither) both fail loud
+// S_ThreadLocalRequiresStaticOrExtern; the C23 auto-inferred block form is
+// caught too (the mark rides the autoInferredVarDecl row's config).
+// RED-ON-DISABLE: drop the validator's block-scope arm → the plain form goes
+// green as a silent AUTOMATIC (the exact storage-duration miscompile the
+// code exists to prevent); drop the forDecl gatedMarkers → the for-init form
+// goes green.
+TEST(SemanticAnalyzerCSubset, ThreadLocalBlockScopeRequiresStaticOrExtern) {
+    auto plain = analyzeShipped("c-subset", {
+        "int main(void) { thread_local int x = 1; return x; }\n",
+    });
+    EXPECT_EQ(countCode(plain.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern),
+              1u);
+    auto forInit = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "    for (thread_local int i = 0; i < 2; i = i + 1) {}\n"
+        "    return 0;\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(forInit.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern),
+              1u)
+        << "a for-init thread_local can never satisfy 6.7.1p3 (gatedMarkers)";
+    auto autoForm = analyzeShipped("c-subset", {
+        "int main(void) { thread_local auto x = 5; return x; }\n",
+    });
+    EXPECT_EQ(countCode(autoForm.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern),
+              1u)
+        << "the C23 auto-inferred block decl is caught by the same check";
+    // The LEGAL counterpart pins the check polarity: static satisfies p3.
+    auto legal = analyzeShipped("c-subset", {
+        "int main(void) { static thread_local auto s = 1; return s; }\n",
+    });
+    EXPECT_EQ(countCode(legal.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern),
+              0u)
+        << "C23 admits auto beside thread_local; static satisfies 6.7.1p3";
+}
+
+// 6.7.1p3 "shall be present in the declaration of every declared name with
+// thread storage duration" — a same-TU redeclaration pair disagreeing on the
+// specifier fails loud S_ThreadLocalRedeclarationMismatch in BOTH directions.
+// RED-ON-DISABLE: drop the merge-site check and both silently merge (half
+// the accesses would bind the wrong storage).
+TEST(SemanticAnalyzerCSubset, ThreadLocalRedeclarationMismatchBothDirections) {
+    auto gained = analyzeShipped("c-subset", {
+        "extern int g;\n"
+        "thread_local int g = 5;\n"
+        "int main(void) { return g; }\n",
+    });
+    EXPECT_EQ(countCode(gained.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRedeclarationMismatch),
+              1u)
+        << "plain extern then thread_local definition must mismatch";
+    auto lost = analyzeShipped("c-subset", {
+        "extern thread_local int g;\n"
+        "int g = 5;\n"
+        "int main(void) { return g; }\n",
+    });
+    EXPECT_EQ(countCode(lost.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRedeclarationMismatch),
+              1u)
+        << "extern thread_local then plain definition must mismatch too";
+    // The MATCHED pair is legal — pins the check polarity.
+    auto matched = analyzeShipped("c-subset", {
+        "extern thread_local int g;\n"
+        "thread_local int g = 5;\n"
+        "int main(void) { return g; }\n",
+    });
+    EXPECT_EQ(countCode(matched.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalRedeclarationMismatch),
+              0u);
+    EXPECT_FALSE(matched.hasErrors());
+}
+
+// 6.7.1p2 + C23 constexpr rules — forbidden storage-class combinations fail
+// loud S_ThreadLocalInvalidCombination: `constexpr thread_local` (both
+// orders — the check reads the Pass-1 isConstexpr mark, not token order) and
+// `register thread_local` (the config-driven incompatibleSpecifierTokens
+// scan). `typedef thread_local` cannot co-occur grammatically (typedefDecl
+// has no storage-specifier prefix — a loud parse error, not a semantic
+// code). RED-ON-DISABLE: drop the validator's combination arms and all three
+// compile silently with one specifier dropped.
+TEST(SemanticAnalyzerCSubset, ThreadLocalInvalidCombinationsFailLoud) {
+    auto cxFirst = analyzeShipped("c-subset", {
+        "constexpr thread_local int c = 5;\n"
+        "int main(void) { return c; }\n",
+    });
+    EXPECT_EQ(countCode(cxFirst.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalInvalidCombination), 1u);
+    auto cxSecond = analyzeShipped("c-subset", {
+        "thread_local constexpr int c = 5;\n"
+        "int main(void) { return c; }\n",
+    });
+    EXPECT_EQ(countCode(cxSecond.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalInvalidCombination), 1u)
+        << "specifier order must not matter (the mark-based check)";
+    auto reg = analyzeShipped("c-subset", {
+        "int main(void) { register thread_local int r = 1; return r; }\n",
+    });
+    EXPECT_EQ(countCode(reg.diagnostics(),
+                        DiagnosticCode::S_ThreadLocalInvalidCombination), 1u)
+        << "register may not pair with thread_local (6.7.1p2)";
 }

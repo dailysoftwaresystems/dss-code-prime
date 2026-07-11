@@ -52,6 +52,10 @@ cloneGlobalsOrCarveOut(Mir const& mir, MirBuilder& builder,
                           newInitIdx, MirFuncId{},
                           mir.globalBinding(g), mir.globalVisibility(g),
                           mir.globalIsConst(g),
+                          // TLS C1 (D-CSUBSET-THREAD-LOCAL, CRIT-3): preserve
+                          // thread storage duration across the pass rebuild —
+                          // EVERY optimized compile clones through here.
+                          mirThreadStorageOf(mir.globalIsThreadLocal(g)),
                           // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: preserve the
                           // global's explicit alignment across the rebuild.
                           mir.globalAlignmentBytes(g));
@@ -97,6 +101,9 @@ void cloneGlobalsVerbatim(Mir const& mir, MirBuilder& builder) {
                           newInitIdx, newInitFunc,
                           mir.globalBinding(g), mir.globalVisibility(g),
                           mir.globalIsConst(g),
+                          // TLS C1 (D-CSUBSET-THREAD-LOCAL, CRIT-3): preserve
+                          // thread storage duration across the verbatim clone.
+                          mirThreadStorageOf(mir.globalIsThreadLocal(g)),
                           // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: preserve the
                           // global's explicit alignment across the rebuild.
                           mir.globalAlignmentBytes(g));

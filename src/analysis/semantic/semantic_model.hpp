@@ -245,6 +245,88 @@ struct DSS_EXPORT SymbolRecord {
     // DROPPED flag is a safe miss (a spurious H_VerifierFailure — fail-loud), never
     // a silent miscompile. Default false.
     bool            isNoreturn = false;
+    // FC17 (D-CSUBSET-CONSTEXPR): TRUE iff this symbol was declared with the C23
+    // 6.7.1 `constexpr` OBJECT storage-class. Set at Pass-1 minting when the
+    // declaration's specifier prefix carries the language's
+    // `constexprKeywordToken` (`specifierPrefixHasConstexpr`, the
+    // `specifierPrefixNamesNoreturn` mirror); IMPLIES `isConst` (a constexpr
+    // object is const — the minting site sets both, so every const consumer
+    // [const-violation check, const-symbol init folding] sees it uniformly).
+    // Read by Pass 2's `validateConstexprDeclarator`, which enforces the 6.7.1
+    // constraints AT THE DECLARATION (compile-time-constant initializer /
+    // missing initializer / function / volatile-qualified / aggregate — each a
+    // fail-loud diagnostic, never a silent degrade to plain const). ZERO
+    // codegen reads it: a VALIDATED constexpr object lowers byte-identically to
+    // a const object with a foldable initializer (the file-scope INTERNAL
+    // linkage — C23 6.2.2p3 — rides the declaration row's `linkageSpecifiers`
+    // config, not this flag). Default false.
+    bool            isConstexpr = false;
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): TRUE iff this OBJECT symbol was declared
+    // with C11/C23 6.7.1 thread storage duration (`_Thread_local` /
+    // `thread_local`). Set at Pass-1 minting when the declaration's specifier
+    // prefix carries a token whose row `linkageSpecifiers` entry declares
+    // `{threadStorage: true}` (`specifierPrefixHasThreadStorage` — the
+    // specifierPrefixHasConstexpr mirror, keyed on the SAME config facet the
+    // linkage scan folds, so the two tiers can never disagree on the
+    // vocabulary). Read by Pass 2's `validateThreadLocalDeclarator` (6.7.1
+    // constraints: objects only / block scope needs static-or-extern /
+    // forbidden combinations) and by the redeclaration merge (a same-TU
+    // mismatch on this flag is S_ThreadLocalRedeclarationMismatch — 6.7.1p3
+    // requires the specifier on EVERY declaration of the name). CST→HIR's
+    // `recordThreadLocal` projects it onto the HirThreadLocalMap side-table
+    // (the recordMutability/isConst precedent) → PendingGlobal.isThreadLocal
+    // → MirGlobal.isThreadLocal → the asm/walker TLS section tiers (slices
+    // B/C). Orthogonal to binding/visibility (a file-scope thread_local
+    // keeps external linkage). Default false.
+    bool            isThreadLocal = false;
+    // FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13): the standard-attribute
+    // facts folded from the declaration's specifier prefix by
+    // `scanAttributeSemantics` (Pass-1.5 declarator resolution — the
+    // alignas/noreturn shared-prefix precedent; computed once per declaration,
+    // applied to EVERY declarator, so `[[maybe_unused]] int a, b;` flags both).
+    //
+    // `isMaybeUnused` (C23 6.7.13.4 / GNU `unused`): the D8 unused-variable
+    // check skips this symbol. Deliberately NOT proto/def-merged — it is
+    // consulted only at the declarator's OWN D8 check (each declaration
+    // suppresses its own warning). A dropped flag is a spurious WARNING, never
+    // a miscompile.
+    bool            isMaybeUnused = false;
+    // `isDeprecated` (C23 6.7.13.3): every USE of this symbol warns
+    // S_DeprecatedSymbolUsed at the Pass-2 reference-resolution chokepoint
+    // (per use site, incl. a call's callee). OR-merged across a proto/def pair
+    // (the isNoreturn mergedFnDecls precedent — a call resolves to the
+    // survivor); `deprecatedMessage` merges first-non-empty-wins. Warning-only:
+    // a dropped flag misses advice, never bytes. Types (struct/union/enum tags,
+    // typedefs) are the named deferral D-CSUBSET-ATTRIBUTE-DEPRECATED-TYPES
+    // (they resolve via type resolution, not this chokepoint — silently inert).
+    bool            isDeprecated = false;
+    std::string     deprecatedMessage;
+    // `isNodiscard` (C23 6.7.13.2 / GNU `warn_unused_result`): a DIRECT call to
+    // this function whose result is discarded as a bare expression statement
+    // warns S_NodiscardResultDiscarded (checkCall's two-hop discard-context
+    // check; the `(void)f()` cast idiom suppresses by construction). OR-merged
+    // across a proto/def pair like isDeprecated; message first-non-empty-wins.
+    bool            isNodiscard = false;
+    std::string     nodiscardMessage;
+    // FC17.5 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER, C99 6.4.2.2): TRUE iff this
+    // is a SYNTHETIC predefined function-name symbol (`__func__` / a configured
+    // alias) that Pass 1 bound into a function DEFINITION's own scope, BEFORE
+    // the params (so a param of the same name collides → S_RedeclaredSymbol at
+    // its own span). Such a symbol is `isConst` (SE4 catches assignment /
+    // compound-assign → S_ConstViolation) and carries `type` =
+    // Array<narrow-string-core, len+1> minted AT THE BIND (there is no CST
+    // declarator to resolve at Pass 1.5). HIR lowering FOLDS a read to a
+    // string-literal-shaped constant (`predefinedFunctionNameText` supplies the
+    // bytes) — byte-identical to a real string literal, so rodata/decay/
+    // indexing ride unchanged; the ++/--/compound-assign lvalue classifiers
+    // reject it (S_PredefinedIdentifierNotAddressable — there is no storage
+    // slot to write back to). Default false.
+    bool            isPredefinedFunctionName = false;
+    // The enclosing FUNCTION's name — the bytes a `__func__` read folds to
+    // (WITHOUT the trailing NUL; the Array type's +1 carries it, exactly like a
+    // string literal's pool entry). Meaningful only when
+    // `isPredefinedFunctionName` is set; empty otherwise.
+    std::string     predefinedFunctionNameText;
 };
 
 // FF11 neutral-JSON shipped-library descriptor extern

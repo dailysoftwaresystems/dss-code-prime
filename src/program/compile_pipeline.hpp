@@ -237,6 +237,14 @@ struct DSS_EXPORT CuMirModule {
     // stdout) materializes its address (got-indirect → lea-of-slot + deref).
     // nullopt iff the format declared none (data imports fail loud at link).
     std::optional<DataImportBinding> dataImportBinding;
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): the active object format's
+    // thread-local access block, captured here for the SAME reason as
+    // `dataImportBinding` — the LOWER half's MIR→LIR GlobalAddr lowering
+    // selects the TLS access sequence (local-exec → tlsbase + tpoff lea)
+    // from it. nullopt iff the format declared none (a thread-local access
+    // then fails loud K_FormatLacksThreadLocalSupport — never a silent
+    // process-shared alias).
+    std::optional<TlsAccessInfo> tlsAccess;
     // D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL: the active format's data model
     // (pointer width), captured here for the SAME reason as `externCallDispatch`
     // — the LOWER half sees only this struct, and the aggregate-global rodata
@@ -321,6 +329,11 @@ lowerMergedToAssembly(MergedMirModule&    merged,
                       CompilationUnitId    cuId,
                       std::optional<ExternCallDispatch> externCallDispatch,
                       std::optional<DataImportBinding> dataImportBinding,
+                      // TLS C1 (D-CSUBSET-THREAD-LOCAL): the format's
+                      // thread-local access block (nullopt = this leg has
+                      // no TLS machinery — MIR→LIR fails loud on a
+                      // thread-local access).
+                      std::optional<TlsAccessInfo> tlsAccess,
                       // c116 (D-WIN64-SEH-FUNCLETS): SEH scope records from
                       // `synthesizeSehFunclets` (empty for a non-SEH program).
                       std::vector<MirSehScope> sehScopes,

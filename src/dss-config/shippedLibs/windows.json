@@ -227,6 +227,9 @@
     { "name": "LeaveCriticalSection",       "signature": "fn(ptr<void>) -> void",          "kind": "function", "linkage": "external" },
     { "name": "TryEnterCriticalSection",    "signature": "fn(ptr<void>) -> i32",           "kind": "function", "linkage": "external" },
 
+    { "name": "CreateThread",               "signature": "fn(ptr<void>, u64, ptr<void>, ptr<void>, u32, ptr<void>) -> ptr<void>", "kind": "function", "linkage": "external" },
+    { "name": "CloseHandle",                "signature": "fn(ptr<void>) -> i32",           "kind": "function", "linkage": "external" },
+
     { "name": "CreateFileW",             "signature": "fn(ptr<u16>, u32, u32, ptr<void>, u32, u32, ptr<void>) -> ptr<void>", "kind": "function", "linkage": "external" },
     { "name": "DeleteFileW",             "signature": "fn(ptr<u16>) -> i32",                             "kind": "function", "linkage": "external" },
     { "name": "ReadFile",                "signature": "fn(ptr<void>, ptr<void>, u32, ptr<u32>, ptr<void>) -> i32", "kind": "function", "linkage": "external" },

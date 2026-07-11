@@ -7,6 +7,7 @@
 #include "core/types/data_model.hpp"
 #include "core/types/object_format_kind.hpp"   // ObjectFormatKind (per-target availability gate)
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -72,6 +73,17 @@ analyze(std::shared_ptr<CompilationUnit const> cu,
         // (direct-API / LSP / test callers, no target in scope) ⇒ NO variant
         // selection (a flat-`fields` struct decodes as before; a variants-only
         // struct is not injected). (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH)
-        std::optional<std::string_view> activeTarget = std::nullopt);
+        std::optional<std::string_view> activeTarget = std::nullopt,
+        // The worker-thread stack RESERVE for the deep-recursion analysis stage
+        // (`analyze` runs `analyzeImpl` on a dedicated large stack so a deeply-
+        // nested-but-legal tree does not overflow the host's ~1 MB main stack —
+        // D-PARSE-DEEP-FRONTEND-STACK). `0` (the default) ⇒ the standard
+        // `kDeepRecursionStackBytes` (64 MiB). A caller may pass a SMALLER,
+        // BOUNDED reserve to witness the frontend's FLAT-walk guarantee: the
+        // Pass-1.5/Pass-2 tree walks are explicit heap work-stacks (O(1) host
+        // stack per nesting level), so they complete on a bounded reserve where
+        // a would-be per-level RECURSION would overflow it (the deep-nest
+        // regression pins do exactly this).
+        std::size_t deepRecursionReserveBytes = 0);
 
 } // namespace dss

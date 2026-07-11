@@ -802,9 +802,14 @@ TEST(ParserCSubsetSmoke, ExternFunctionPrototypeParses) {
     // FC4 c1: `param` is now declarator-shaped — `declHeadForParam` carries
     // the base type and the (optional) `declarator` carries the name. The
     // externDecl spine itself stays legacy (typeRef + Identifier).
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): child 0 is the `externSpecifiers`
+    // HEAD WRAPPER (`extern` + an optional thread-storage run) — the row's
+    // specifierPrefix, stripped before positional counting so name/type
+    // indices stay stable whether or not `extern thread_local` is spelled.
     constexpr std::string_view kExpected =
         "rule:externDecl\n"
-        "  tok:\"extern\"\n"
+        "  rule:externSpecifiers\n"
+        "    tok:\"extern\"\n"
         "  rule:typeRef\n"
         "    rule:typeBase\n"
         "      rule:typeSpecifierSeq\n"
@@ -1333,29 +1338,44 @@ TEST(ParserCSubsetSmoke, UnknownStarUnknownRollsBackToExpression) {
 }
 
 // C23 `auto x = 1;` type INFERENCE is NOT supported — `auto` is a
-// storage-class specifier only, so the head consumes `x` as the type
-// name and the missing declarator fails LOUD at the `=`:
-// P_NoAlternativeMatched, positioned. Layout:
-//   "int main() { auto x = 1; }"
-//    0123456789012345678901234
-// the `=` sits at offset 20. Pinned residue:
-// D-CSUBSET-C23-AUTO-INFERENCE (registry).
-TEST(ParserCSubsetSmoke, AutoInferenceFormIsALoudParseError) {
+// storage-class specifier only, so the head consumed `x` as the type name
+// and the missing declarator failed LOUD at the `=` (the
+// D-CSUBSET-C23-AUTO-INFERENCE residue). FC17.5
+// (D-CSUBSET-AUTO-TYPE-INFERENCE) — THE ANTICIPATED PIN FLIP: the C23
+// 6.7.9 inference feature landed the HEAD-LESS `autoInferredVarDecl` rule
+// (probed FIRST in declOrAttrStmt), so the form now PARSES into it. The
+// flip asserts the new truth: a clean parse whose CST carries the
+// inference rule (NOT varDecl — the statement must not have been absorbed
+// by some other reading).
+TEST(ParserCSubsetSmoke, AutoInferenceFormParsesIntoInferenceRule) {
     auto h = loadAndTokenize("int main() { auto x = 1; }");
     Parser p{h.src, h.schema, std::move(h.stream)};
     auto const result = std::move(p).parse();
     auto const& t = result.tree;
-    EXPECT_TRUE(t.diagnostics().hasErrors())
-        << "C23 auto-inference must fail LOUD (never silently mistype)";
-    bool sawPositionedMiss = false;
-    for (auto const& d : t.diagnostics().all()) {
-        if (d.code == DiagnosticCode::P_NoAlternativeMatched
-            && d.span.start() == 20u) {
-            sawPositionedMiss = true;
-        }
-    }
-    EXPECT_TRUE(sawPositionedMiss)
-        << "expected P_NoAlternativeMatched at the `=` (offset 20)";
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "C23 `auto x = 1;` must parse (D-CSUBSET-AUTO-TYPE-INFERENCE)";
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "autoInferredVarDecl"))
+        << "the statement must parse into the HEAD-LESS inference rule";
+    EXPECT_FALSE(hasInternalNodeWithRule(t, "varDecl"))
+        << "the C89-style varDecl reading must not have won (the head "
+           "would have consumed `x` as a type name)";
+}
+
+// The C89 companion: `auto int x;` (auto as a plain storage-class with a
+// real type head) still parses via varDecl — the inference rule fast-fails
+// on `int` (not a declarator) and the probe rolls back. RED if the
+// inference-first branch order ever swallows the C89 form.
+TEST(ParserCSubsetSmoke, AutoWithTypeHeadStaysVarDecl) {
+    auto h = loadAndTokenize("int main() { auto int x; }");
+    Parser p{h.src, h.schema, std::move(h.stream)};
+    auto const result = std::move(p).parse();
+    auto const& t = result.tree;
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "C89 `auto int x;` must keep parsing";
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "varDecl"))
+        << "the real-typed form must take the committed varDecl reading";
+    EXPECT_FALSE(hasInternalNodeWithRule(t, "autoInferredVarDecl"))
+        << "the inference rule must have rolled back on the `int` head";
 }
 
 // ── FC4 c1 stage 2b: the speculative-probe BUDGET guard ─────────────────
@@ -1724,4 +1744,64 @@ TEST(ParserCSubsetSmoke, ThreeAdjacentStringsHaveSixChildren) {
     ASSERT_TRUE(sle.valid());
     EXPECT_EQ(visibleTokenChildCount(t, sle), 6u)
         << "\"a\" \"b\" \"c\" → 6 flat token children (repeat fires twice)";
+}
+
+// ── FC17 (D-CSUBSET-ATTRIBUTE-STATEMENT, C23 6.8.1): the attribute-declaration
+//    statement + the declOrAttrStmt wrapper shape ─────────────────────────────
+
+// ★ The F2 wrapper-shape pin: a statement-position declaration now parses as
+// `statement > declOrAttrStmt > varDecl` — the named alt rule MATERIALIZES a
+// CST node (the declOrExprStmt precedent). Both consumers are transparent BY
+// MECHANISM (HIR's unmapped-statement soleMeaningfulChild PassThrough peels
+// it; semantic passes are rule-keyed full-tree walks), so the SHAPE is the
+// contract this pin owns: if the wrapper is ever removed (or doubled), the
+// corpus .tree golden AND this pin flip together — deliberately.
+TEST(ParserCSubsetSmoke, StatementVarDeclRidesTheDeclOrAttrStmtWrapper) {
+    Tree t = parseCSubset("int main() { int x; return x; }");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    NodeId const wrapper = findFirstNodeWithRule(t, "declOrAttrStmt");
+    ASSERT_TRUE(wrapper.valid())
+        << "a local declaration statement must ride the declOrAttrStmt wrapper";
+    // The wrapper's sole child is the committed varDecl branch.
+    NodeId const stmt = t.parent(wrapper);
+    ASSERT_TRUE(stmt.valid());
+    EXPECT_EQ(t.rules().name(t.rule(stmt)), std::string_view{"statement"})
+        << "the wrapper's parent is the statement alt node";
+    NodeId const decl = findFirstNodeWithRule(t, "varDecl");
+    ASSERT_TRUE(decl.valid());
+    EXPECT_EQ(t.parent(decl).v, wrapper.v)
+        << "statement > declOrAttrStmt > varDecl — the varDecl is the "
+           "wrapper's direct child";
+}
+
+// `[[fallthrough]];` parses as `statement > declOrAttrStmt >
+// attributeDeclaration` (the varDecl probe rolls back on the immediate `;`).
+TEST(ParserCSubsetSmoke, FallthroughStatementParsesAsAttributeDeclaration) {
+    Tree t = parseCSubset(
+        "int main() { int x = 1; switch (x) { case 1: x = 2; [[fallthrough]]; "
+        "case 2: x = 3; break; } return x; }");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "[[fallthrough]]; must parse as a statement";
+    NodeId const attrStmt = findFirstNodeWithRule(t, "attributeDeclaration");
+    ASSERT_TRUE(attrStmt.valid());
+    NodeId const wrapper = t.parent(attrStmt);
+    ASSERT_TRUE(wrapper.valid());
+    EXPECT_EQ(t.rules().name(t.rule(wrapper)), std::string_view{"declOrAttrStmt"})
+        << "the bare attribute statement rides the same wrapper alt";
+}
+
+// An ATTRIBUTED declaration statement (`[[maybe_unused]] int x = 5;`) still
+// commits the varDecl branch — the attribute rides varDecl's
+// localDeclSpecifiers prefix, NOT the attributeDeclaration reading (declared
+// probe order: varDecl first).
+TEST(ParserCSubsetSmoke, AttributedLocalDeclCommitsVarDeclBranch) {
+    Tree t = parseCSubset("int main() { [[maybe_unused]] int x = 5; return 0; }");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors());
+    EXPECT_TRUE(hasInternalNodeWithRule(t, "varDecl"))
+        << "the attributed declaration must commit the varDecl reading";
+    EXPECT_FALSE(hasInternalNodeWithRule(t, "attributeDeclaration"))
+        << "the attributeDeclaration branch must NOT win for a declaration";
 }

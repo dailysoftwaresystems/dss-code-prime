@@ -121,6 +121,23 @@ struct EncodingState {
     // `optional` = the written-bit (a second writer fails loud).
     std::optional<std::uint8_t>   opcodePlusReg3;
     std::optional<PendingRelocSlot> disp32;      // symbol-relative 32-bit slot (cycle 4)
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): the ABSOLUTE-SIB literal disp32
+    // (`AbsoluteDisp32Mem` — mov r64, seg:[disp32]). When set, the
+    // ModR/M emits mod=00 rm=100 (SIB-follows) and the SIB byte is
+    // FORCED to index=100 (no-index) base=101 (disp32-only, no base
+    // register) = 0x25; the 4 literal bytes follow. `optional` is the
+    // written-bit (a second writer / a co-wired base register fails
+    // loud — the absolute form owns the whole memory operand).
+    std::optional<std::int32_t> absSibDisp32;
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): the RELOCATED memory
+    // displacement (`MemRelocDisp32` — lea r, [base + tpoff32(sym)]).
+    // Emitted at the MEMORY-DISPLACEMENT position (right after
+    // ModR/M + SIB, where `disp32Mem` literals go), NOT the trailing
+    // step-8 `disp32` position. Distinct storage from `disp32` so the
+    // two can never double-emit; distinct from `disp32Mem` so a
+    // literal + a reloc in one variant fails loud (validate() rejects
+    // the schema; the emit-time check is the defense-in-depth half).
+    std::optional<PendingRelocSlot> memRelocDisp32;
     // D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1): pending
     // intra-function block-relative branch targets. Each entry
     // emits its `prefixBytes` then 4 zero placeholder bytes,
@@ -267,6 +284,12 @@ wireSlot(EncodingState& st, EncodingSlotKind slot,
         // never a register hwEnc.
         case EncodingSlotKind::Imm64:
         case EncodingSlotKind::Disp32Mem:
+        // TLS C1 (D-CSUBSET-THREAD-LOCAL): the absolute-SIB literal
+        // disp32 is filled from a MemOffset operand (wireAbsSibDisp32)
+        // and the relocated memory displacement from a SymbolRef
+        // operand — never a register hwEnc.
+        case EncodingSlotKind::AbsoluteDisp32Mem:
+        case EncodingSlotKind::MemRelocDisp32:
         case EncodingSlotKind::RipRelDisp32:
         case EncodingSlotKind::CondCodeNibble:
         case EncodingSlotKind::BlockRel32:
@@ -451,6 +474,44 @@ wireMemBaseScale(EncodingState& st, EncodingSlotKind slot,
         return false;
     }
     st.sibScaleExp = scaleExp;
+    return true;
+}
+
+// TLS C1 (D-CSUBSET-THREAD-LOCAL): stash a MemOffset operand's literal
+// disp32 for the ABSOLUTE-SIB form (`mov r64, seg:[disp32]` — ModR/M
+// mod=00 rm=100, SIB 0x25). The absolute form owns the WHOLE memory
+// operand: a co-wired base register (ModRmRmMem — wroteModRmRm), index
+// (SibIndex), or second displacement (Disp32Mem) is a malformed schema
+// — validate() rejects it at load; these are the defense-in-depth
+// re-checks (the wire loop runs in declaration order, so the co-wire
+// checks here catch earlier writers; the emit-phase coherence check
+// catches later ones).
+[[nodiscard]] bool
+wireAbsSibDisp32(EncodingState& st, std::int32_t v,
+                 std::string_view mnemonic, DiagnosticReporter& reporter) {
+    if (st.absSibDisp32.has_value()) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': second writer to the "
+                           "absolute-SIB disp32 slot — only one absolute "
+                           "memory operand per instruction",
+                           mnemonic));
+        return false;
+    }
+    if (st.wroteModRmRm || st.sibIndex3.has_value()
+        || st.disp32Mem.has_value()) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': absolute-SIB disp32 co-wired "
+                           "with a base register / SIB index / memory "
+                           "displacement — the absolute form has no base "
+                           "register (validate() should have rejected "
+                           "the schema)",
+                           mnemonic));
+        return false;
+    }
+    st.hasModRm     = true;
+    st.absSibDisp32 = v;
     return true;
 }
 
@@ -747,10 +808,18 @@ bool encode(Lir const&                  lir,
                 return false;
             }
         } else if (srcOp.kind == LirOperandKind::MemOffset) {
-            // D-AS4-1 memory-addressing: MemOffset carries the signed
-            // 32-bit displacement for [base + disp32] addressing.
-            if (!wireDisp32Mem(st, wire.slotKind, srcOp.offset,
-                                info->mnemonic, reporter)) {
+            // TLS C1 (D-CSUBSET-THREAD-LOCAL): a MemOffset wired to the
+            // absolute-SIB slot is the base-register-less
+            // `seg:[disp32]` form (tlsbase's thread-pointer read).
+            // Every other MemOffset wire is the D-AS4-1 signed 32-bit
+            // displacement of [base + disp32] addressing (Disp32Mem).
+            if (wire.slotKind == EncodingSlotKind::AbsoluteDisp32Mem) {
+                if (!wireAbsSibDisp32(st, srcOp.offset,
+                                      info->mnemonic, reporter)) {
+                    return false;
+                }
+            } else if (!wireDisp32Mem(st, wire.slotKind, srcOp.offset,
+                                      info->mnemonic, reporter)) {
                 return false;
             }
         } else if (srcOp.kind == LirOperandKind::BlockRef) {
@@ -774,27 +843,37 @@ bool encode(Lir const&                  lir,
                 wire.prefixOpcodeBytes, srcOp.blockSlot});
         } else if (srcOp.kind == LirOperandKind::SymbolRef) {
             // Plan 13 AS4 — symbol-bearing wire emits a Relocation.
-            // Two symbol-bearing slots today:
-            //   * Disp32       — pure 4-byte rel32 placeholder (e.g.
-            //                    `call rel32`, `jmp rel32`); no ModR/M
-            //                    involvement.
-            //   * RipRelDisp32 — RIP-relative addressing form (e.g.
-            //                    `lea r64, [rip + sym]`); the encoder
-            //                    additionally forces ModR/M.mod=00 +
-            //                    ModR/M.rm=101 below. D-LK4-RODATA-
-            //                    PRODUCER (2026-06-02).
-            // validate() pairs both with a non-empty `wire.relocationKind`;
+            // Three symbol-bearing slots today:
+            //   * Disp32         — pure 4-byte rel32 placeholder (e.g.
+            //                      `call rel32`, `jmp rel32`); no ModR/M
+            //                      involvement; TRAILING byte position.
+            //   * RipRelDisp32   — RIP-relative addressing form (e.g.
+            //                      `lea r64, [rip + sym]`); the encoder
+            //                      additionally forces ModR/M.mod=00 +
+            //                      ModR/M.rm=101 below. D-LK4-RODATA-
+            //                      PRODUCER (2026-06-02).
+            //   * MemRelocDisp32 — TLS C1 (D-CSUBSET-THREAD-LOCAL):
+            //                      the relocated displacement of a
+            //                      `[base + disp32]` memory operand
+            //                      (`lea r, [tp + tpoff32(sym)]`);
+            //                      emitted at the MEMORY-DISPLACEMENT
+            //                      position (step 6), pairs with a
+            //                      ModRmRmMem base wire.
+            // validate() pairs each with a non-empty `wire.relocationKind`;
             // we re-check defensively in case a malformed Lir bypassed
             // validate.
             bool const isDisp32       = wire.slotKind == EncodingSlotKind::Disp32;
             bool const isRipRelDisp32 = wire.slotKind == EncodingSlotKind::RipRelDisp32;
-            if (!isDisp32 && !isRipRelDisp32) {
+            bool const isMemRelocDisp32 =
+                wire.slotKind == EncodingSlotKind::MemRelocDisp32;
+            if (!isDisp32 && !isRipRelDisp32 && !isMemRelocDisp32) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                        DiagnosticSeverity::Error,
                        std::format("opcode '{}': SymbolRef operand wired "
                                    "to non-symbol slot '{}' — x86-variable "
                                    "scope supports symbol references only "
-                                   "on Disp32 or RipRelDisp32 slots",
+                                   "on Disp32, RipRelDisp32, or "
+                                   "MemRelocDisp32 slots",
                                    info->mnemonic,
                                    encodingSlotKindName(wire.slotKind)));
                 return false;
@@ -807,6 +886,29 @@ bool encode(Lir const&                  lir,
                                    "should have rejected this schema",
                                    info->mnemonic));
                 return false;
+            }
+            if (isMemRelocDisp32) {
+                // TLS C1: the memory-displacement relocation. SEPARATE
+                // storage from the trailing `disp32` slot (distinct
+                // byte positions — the two could theoretically coexist
+                // on a future instruction; today no variant carries
+                // both). Double-write within the slot fails loud.
+                if (st.memRelocDisp32.has_value()) {
+                    report(reporter,
+                           DiagnosticCode::A_NoMatchingEncodingVariant,
+                           DiagnosticSeverity::Error,
+                           std::format("opcode '{}': second writer to the "
+                                       "relocated memory-displacement slot "
+                                       "— a memory operand has exactly one "
+                                       "displacement field",
+                                       info->mnemonic));
+                    return false;
+                }
+                st.memRelocDisp32 = PendingRelocSlot{
+                    *wire.relocationKind,
+                    SymbolId{srcOp.symbolV}
+                };
+                continue;
             }
             if (st.disp32.has_value()) {
                 report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
@@ -889,12 +991,41 @@ bool encode(Lir const&                  lir,
     }
 
     // ── Emit bytes in canonical x86 order ─────────────────────────
+    // 0) TLS C1 (D-CSUBSET-THREAD-LOCAL): the payload-byte prefix —
+    //    the instruction's LIR payload low byte emitted as the FIRST
+    //    byte (x86 prefix group 2, segment override, precedes every
+    //    other prefix per the SDM decode order). The VALUE flows from
+    //    format config (`tlsAccess.segmentPrefixByte`) through the
+    //    lowering's payload; the target JSON only declares the SHAPE.
+    //    A zero low byte is never a valid segment override — fail
+    //    LOUD (a lowering that forgot to set the payload would
+    //    otherwise emit a 0x00 byte that decodes as `add [rax], al`,
+    //    silently corrupting the instruction stream).
+    if (selected->tmpl.payloadBytePrefix) {
+        std::uint8_t const prefixByte =
+            static_cast<std::uint8_t>(lir.instPayload(inst) & 0xFFu);
+        if (prefixByte == 0u) {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': template declares "
+                               "payloadBytePrefix but the instruction's "
+                               "payload low byte is 0 — a zero prefix "
+                               "byte is never a valid segment override; "
+                               "the lowering must thread the format's "
+                               "segment-prefix byte through the payload",
+                               info->mnemonic));
+            return false;
+        }
+        out.push_back(prefixByte);
+    }
     // 1) Legacy prefixes: the variant's declared mandatory-prefix
-    //    bytes (FC2 Part B — SSE F2/F3/66 opcode-form selectors).
-    //    MUST precede the REX prefix: x86 decode treats a mandatory
-    //    prefix after REX as a plain legacy prefix that does NOT
-    //    select the SSE opcode form (the instruction would decode
-    //    as a different opcode). Empty for every non-SSE template.
+    //    bytes (FC2 Part B — the SSE F2/F3/66 opcode-form selectors
+    //    were the first consumers; generic over any fixed template-
+    //    declared legacy prefix). MUST precede the REX prefix: x86
+    //    decode treats a mandatory prefix after REX as a plain legacy
+    //    prefix that does NOT select the SSE opcode form (the
+    //    instruction would decode as a different opcode). Empty for
+    //    most templates.
     for (auto b : selected->tmpl.mandatoryPrefix) {
         out.push_back(b);
     }
@@ -1019,10 +1150,38 @@ bool encode(Lir const&                  lir,
         (st.modMode != EncodingState::ModMode::RegDirect)
         && (st.modRmRm3 == 0b100u);
     bool const hasIndex = st.sibIndex3.has_value();
-    bool const sibFollows = memModeNeedsSibForce || hasIndex;
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): the absolute-SIB form ALWAYS
+    // emits a SIB byte — mod=00 rm=100 is the only 64-bit encoding of
+    // `[seg:disp32]` (SIB index=100 no-index, base=101 disp32-only).
+    bool const absSib = st.absSibDisp32.has_value();
+    bool const sibFollows = memModeNeedsSibForce || hasIndex || absSib;
+    // TLS C1 coherence (emit-phase half of the wireAbsSibDisp32
+    // guards — catches a base/index/displacement writer that fired
+    // AFTER the absolute wire in declaration order): the absolute
+    // form owns the whole memory operand. validate() rejects such
+    // schemas at load; this is defense-in-depth against a malformed
+    // Lir / bypassed validate.
+    if (absSib
+        && (st.wroteModRmRm || hasIndex || st.disp32Mem.has_value()
+            || st.memRelocDisp32.has_value()
+            || st.modMode != EncodingState::ModMode::RegDirect)) {
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': absolute-SIB disp32 co-wired "
+                           "with a base register / SIB index / second "
+                           "displacement — the absolute form has no base "
+                           "register; schema is malformed",
+                           info->mnemonic));
+        return false;
+    }
     if (st.hasModRm || selected->tmpl.modrmRegExt.has_value()) {
-        std::uint8_t const modField =
-            static_cast<std::uint8_t>(st.modMode);
+        // TLS C1: the absolute-SIB form's mod field is 00 (no
+        // displacement-after-base semantics — the SIB base=101 itself
+        // says "disp32 follows"); every other path keeps the modMode
+        // contract (the enum value IS the mod field).
+        std::uint8_t const modField = absSib
+            ? static_cast<std::uint8_t>(0b00u)
+            : static_cast<std::uint8_t>(st.modMode);
         std::uint8_t const regField =
             selected->tmpl.modrmRegExt.has_value()
                 ? static_cast<std::uint8_t>(*selected->tmpl.modrmRegExt & 0x7u)
@@ -1085,6 +1244,11 @@ bool encode(Lir const&                  lir,
     //    in st.rexX by the SibIndex wire above; emitted in the REX
     //    prefix step earlier).
     // (Re-use `sibFollows` computed above for the ModR/M.rm encoding.)
+    //
+    //    (c) TLS C1 absolute-SIB (`AbsoluteDisp32Mem`): SIB encodes
+    //        `[disp32]` with index=4 (no-index marker), scale=0, and
+    //        base=101 — the "no base register, disp32 follows" form
+    //        (with mod=00). Bytes: SIB = 00_100_101 = 0x25.
     if (sibFollows) {
         std::uint8_t const sibIndex = hasIndex
             ? *st.sibIndex3
@@ -1092,28 +1256,59 @@ bool encode(Lir const&                  lir,
         std::uint8_t const sibScale = hasIndex
             ? st.sibScaleExp.value_or(0u)
             : static_cast<std::uint8_t>(0u);
+        std::uint8_t const sibBase = absSib
+            ? static_cast<std::uint8_t>(0b101u)   // disp32-only, no base
+            : st.modRmRm3;
         std::uint8_t const sib = static_cast<std::uint8_t>(
-            (sibScale << 6) | (sibIndex << 3) | st.modRmRm3);
+            (sibScale << 6) | (sibIndex << 3) | sibBase);
         out.push_back(sib);
     }
 
-    // 6) Memory displacement (D-AS4-1). When modMode == MemDisp32,
-    //    emit the 4-byte LE displacement from the Disp32Mem slot.
+    // 6) Memory displacement (D-AS4-1 + TLS C1). Three exclusive
+    //    sources for the 4 bytes that follow ModR/M (+ SIB):
+    //      (a) the absolute-SIB LITERAL disp32 (`AbsoluteDisp32Mem` —
+    //          tlsbase's tp-slot displacement; mutual exclusion with
+    //          every other memory slot enforced above);
+    //      (b) mem-mode (mod=10) with a RELOCATED displacement
+    //          (`MemRelocDisp32` — the TLS lea's tpoff32 placeholder:
+    //          record the Relocation at THIS byte position + 4 zero
+    //          bytes; the linker patches them);
+    //      (c) mem-mode with a LITERAL displacement (`Disp32Mem`).
     //    Missing displacement in mem-mode is fail-loud (a schema
-    //    that wires ModRmRmMem without a paired Disp32Mem is a
+    //    that wires ModRmRmMem without a paired displacement is a
     //    malformed variant — surfacing here rather than silently
-    //    emitting zero).
+    //    emitting zero); so is a both-literal-and-reloc variant
+    //    (validate() rejects it at load; re-checked here).
+    if (st.absSibDisp32.has_value()) {
+        asm_byte_emit::appendImm32LE(out, *st.absSibDisp32);
+    }
     if (st.modMode == EncodingState::ModMode::MemDisp32) {
-        if (!st.disp32Mem.has_value()) {
+        if (st.disp32Mem.has_value() && st.memRelocDisp32.has_value()) {
             report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
                    DiagnosticSeverity::Error,
-                   std::format("opcode '{}': variant uses ModRmRmMem "
-                               "(memory addressing) but no Disp32Mem "
-                               "wire — schema is malformed",
+                   std::format("opcode '{}': variant wires BOTH a literal "
+                               "Disp32Mem AND a relocated MemRelocDisp32 "
+                               "— a memory operand has exactly one "
+                               "displacement field; schema is malformed",
                                info->mnemonic));
             return false;
         }
-        asm_byte_emit::appendImm32LE(out, *st.disp32Mem);
+        if (st.memRelocDisp32.has_value()) {
+            walker_util::appendPendingReloc(relocs, out, *st.memRelocDisp32);
+            // 4 placeholder bytes at the memory-displacement position
+            // (the linker patches these with the tpoff).
+            asm_byte_emit::appendU32LE(out, 0u);
+        } else if (st.disp32Mem.has_value()) {
+            asm_byte_emit::appendImm32LE(out, *st.disp32Mem);
+        } else {
+            report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+                   DiagnosticSeverity::Error,
+                   std::format("opcode '{}': variant uses ModRmRmMem "
+                               "(memory addressing) but no Disp32Mem / "
+                               "MemRelocDisp32 wire — schema is malformed",
+                               info->mnemonic));
+            return false;
+        }
     } else if (st.disp32Mem.has_value()) {
         // Symmetric guard (silent-failure-hunter F1 post-fold): a
         // schema that wires `Disp32Mem` but uses `ModRmRm` (register-
@@ -1128,6 +1323,21 @@ bool encode(Lir const&                  lir,
                            "uses register-direct ModR/M mode (no "
                            "ModRmRmMem wire) — the displacement would "
                            "be silently dropped; schema is malformed",
+                           info->mnemonic));
+        return false;
+    } else if (st.memRelocDisp32.has_value()) {
+        // TLS C1: the same inverse guard for the relocated form — a
+        // MemRelocDisp32 wire without a ModRmRmMem base wire has no
+        // memory operand to displace; the relocation would silently
+        // never be recorded. Fail loud (validate() rejects the
+        // pairing hole at load; defense-in-depth here).
+        report(reporter, DiagnosticCode::A_NoMatchingEncodingVariant,
+               DiagnosticSeverity::Error,
+               std::format("opcode '{}': variant wires MemRelocDisp32 but "
+                           "uses register-direct ModR/M mode (no "
+                           "ModRmRmMem base wire) — the relocated "
+                           "displacement has no memory operand; schema "
+                           "is malformed",
                            info->mnemonic));
         return false;
     }

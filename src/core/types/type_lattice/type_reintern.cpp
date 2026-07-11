@@ -52,6 +52,7 @@ namespace {
         case TypeKind::Bind:      return "Bind";
         case TypeKind::Extension: return "Extension";
         case TypeKind::VolatileQual: return "VolatileQual";
+        case TypeKind::NullptrT:  return "NullptrT";
         case TypeKind::Count_:    return "Count_";
     }
     return "<unknown>";
@@ -78,6 +79,9 @@ namespace {
         case TypeKind::F16: case TypeKind::F32: case TypeKind::F64:
         case TypeKind::F128:
         case TypeKind::Char: case TypeKind::Byte: case TypeKind::Void:
+        // C23 nullptr_t: an operand-less scalar kind — reinterns via the
+        // `dst.primitive(kind)` arm (mirrored in the rebuild switch below).
+        case TypeKind::NullptrT:
             return true;
         default:
             return false;
@@ -211,6 +215,7 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
         case TypeKind::F16: case TypeKind::F32: case TypeKind::F64:
         case TypeKind::F128:
         case TypeKind::Char: case TypeKind::Byte: case TypeKind::Void:
+        case TypeKind::NullptrT:   // C23 nullptr_t: operand-less primitive scalar
             result = dst.primitive(kind);
             break;
 

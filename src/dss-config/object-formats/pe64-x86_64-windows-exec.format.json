@@ -38,8 +38,16 @@
   "$entryCallingConventionComment": "MS x64 calling convention — status (user fn return value in rax) is moved into argGprs[0] = rcx before the indirect ExitProcess call. Read via `target.callingConventionByName(\"ms_x64\")` at trampoline-build time.",
   "entryCallingConvention": "ms_x64",
 
-  "$supportedDataSectionsComment": "D-LK2-RODATA (`.rdata`) + D-LK4-DATA-PRODUCER (writable `.data` + uninitialized `.bss`): the PE-Exec walker emits `.rdata` (read-only), `.data` (mutable initialized globals, MEM_WRITE), and `.bss` (zero-init globals, CNT_UNINITIALIZED_DATA — SizeOfRawData=0) from `AssembledModule.dataItems` per the item's `section`. The linker's pre-walker gate (linker.cpp) consults this set per-item. Cross-format agnosticism: this is the SAME field ELF/Mach-O exec formats declare; zero linker source changes.",
-  "supportedDataSections": ["rodata", "data", "bss"],
+  "$supportedDataSectionsComment": "D-LK2-RODATA (`.rdata`) + D-LK4-DATA-PRODUCER (writable `.data` + uninitialized `.bss`) + D-CSUBSET-THREAD-LOCAL (thread-local `tdata`/`tbss`, TLS C3): the PE-Exec walker emits `.rdata` (read-only), `.data` (mutable initialized globals, MEM_WRITE), `.bss` (zero-init globals, CNT_UNINITIALIZED_DATA — SizeOfRawData=0), and `.tls` (the thread-local TEMPLATE) from `AssembledModule.dataItems` per the item's `section`. BOTH `tdata` (initialized `thread_local int g = 7;`) AND `tbss` (zero-init `thread_local int g;`) are advertised: PE folds a `tbss` item into the ONE `.tls` section's IMAGE_TLS_DIRECTORY64 `SizeOfZeroFill` tail (no separate `.tbss` section) — but a bare `thread_local int g;` IS a `tbss` item, so omitting `tbss` from this set would make the linker's pre-walker gate reject a valid program (M-1). The linker's gate consults this set per-item. Cross-format agnosticism: this is the SAME field ELF/Mach-O exec formats declare; zero linker source changes.",
+  "supportedDataSections": ["rodata", "data", "bss", "tdata", "tbss"],
+
+  "$tlsAccessComment": "TLS C3 (D-CSUBSET-THREAD-LOCAL): how code reaches a thread-local object's per-thread copy on Windows x86_64 — the SAME x86 primitive ELF uses, config-only differences (model + segment + displacement). pe-indexed = the Windows TEB-slot-array model: `mov rax, gs:[0x58]` (segmentPrefixByte 101 = 0x65 gs-override, baseDisplacement 88 = 0x58 = TEB.ThreadLocalStoragePointer) reads the per-thread array of module TLS-block pointers; `mov ecx, [__dss_tls_index]` (the writer-minted module TLS index singleton — tlsIndexSlotName; a 32-BIT read, the loader fills the slot with this module's index) selects THIS module's block; `mov rax, [rax + rcx*8]` loads the block base; `lea rax, [rax + secrel32(sym)]` adds the variable's POSITIVE section-relative offset within the `.tls` template (the tls-tpoff32 reloc, kind 4 = IMAGE_REL_AMD64_SECREL here). The Windows loader processes IMAGE_DIRECTORY_ENTRY_TLS for the main thread BEFORE the entry point AND allocates+copies a fresh block per CreateThread — so per-thread storage is real. The SAME `tlsbase` opcode row serves ELF (fs) and PE (gs); a format WITHOUT this block fails loud K_FormatLacksThreadLocalSupport on the first thread-local access.",
+  "tlsAccess": {
+    "model": "pe-indexed",
+    "segmentPrefixByte": 101,
+    "baseDisplacement": 88,
+    "tlsIndexSlotName": "__dss_tls_index"
+  },
   "$artifactProfilesComment": "Profiles this format SERVES (plan 06 AP3) — a runnable console executable ⇒ cli (the format-side twin of the language's artifactProfiles[]; driver fails loud D_ArtifactProfileFormatMismatch on a profile not in this set). A `gui` profile (IMAGE_SUBSYSTEM_WINDOWS_GUI) would be added when gui codegen lands — same format, profile-selected subsystem/entry, zero gate-code change.",
   "artifactProfiles": ["cli"],
 
@@ -108,12 +116,22 @@
       "addrAlign": 0,
       "entrySize": 0,
       "virtualAddress": 0
+    },
+    {
+      "$comment": "Thread-local TEMPLATE section (`thread_local` — D-CSUBSET-THREAD-LOCAL, TLS C3). ONE `.tls` section carries the INITIALIZED per-thread template bytes (the `tdata` items); a zero-init `thread_local int g;` (`tbss`) item contributes NO file bytes — it is folded into the IMAGE_TLS_DIRECTORY64 `SizeOfZeroFill` tail, so there is NO separate `.tbss` section (this `kind: tdata` row is looked up by the walker for the SECTION NAME + Characteristics; the tbss span rides the directory). The walker also lays the 40-byte IMAGE_TLS_DIRECTORY64 + the 4-byte `_tls_index` slot at the tail of THIS section (both past the template span [StartAddressOfRawData, EndAddressOfRawData) so they are never per-thread-copied); a writable section is a valid home for the loader-read directory AND the loader-written index. Characteristics (`type`) = IMAGE_SCN_CNT_INITIALIZED_DATA (0x40) | IMAGE_SCN_MEM_READ (0x40000000) | IMAGE_SCN_MEM_WRITE (0x80000000) = 0xC0000040 = 3221225536 — the loader applies base relocations into the template + directory VA fields (requires MEM_WRITE) and each thread's copy is writable. virtualAddress=0 — walker-computed (contiguous after the prior data section).",
+      "kind": "tdata",
+      "name": ".tls",
+      "type": 3221225536,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0,
+      "virtualAddress": 0
     }
   ],
 
   "relocations": [
     {
-      "$comment": "PE32+ image-side relocations: same kinds as the .obj schema. cycle-2 walker applies intra-module relocs in-place via the LK6 cycle 1 structured-formula triple (closes D-LK1-3-equivalent for PE). REL32 is PC-relative 32-bit; ADDR64/ADDR32 are absolute. PE32+ doesn't emit the .reloc base relocation section unless the image is rebased; ASLR-aware images that don't need rebase ship without it (cycle scope).",
+      "$comment": "PE32+ image-side relocations: same kinds as the .obj schema. cycle-2 walker applies intra-module relocs in-place via the LK6 cycle 1 structured-formula triple (closes D-LK1-3-equivalent for PE). REL32 is PC-relative 32-bit; ADDR64/ADDR32 are absolute. The image is ASLR-aware (dllCharacteristics carries DYNAMIC_BASE), so the walker DOES emit a `.reloc` base-relocation section carrying an IMAGE_REL_BASED_DIR64 entry per 8-byte absolute fixup: the cross-CU thunk slots + F5 symbol-address global pointers + (TLS C3) the 3 IMAGE_TLS_DIRECTORY64 VA fields.",
       "name": "IMAGE_REL_AMD64_REL32",
       "kind": 1,
       "nativeId": 4
@@ -127,6 +145,12 @@
       "name": "IMAGE_REL_AMD64_ADDR32",
       "kind": 3,
       "nativeId": 2
+    },
+    {
+      "$comment": "TLS C3 (D-CSUBSET-THREAD-LOCAL): the thread-local SECTION-RELATIVE fixup — the disp32 of `lea rax, [rax + secrel32(sym)]`, the FINAL instruction of the pe-indexed access sequence. kind=4 is the SHARED target-schema `tls-tpoff32` row (Linear, width 4, absolute, tls:true) — x86_64 serves BOTH ELF and PE from ONE `[reg, symbol]` lea variant, so the ELF↔PE split lives HERE at the FORMAT level (this row) not on the target (mirrors elf64's kind-4 `R_X86_64_TPOFF32`). The walker patches the 4 bytes from its POSITIVE templateOffset-valued symbolVa entry (the variable's byte offset within the `.tls` template — NOT the ELF NEGATIVE tpoff), so `blockBase + templateOffset` = the per-thread address; the image carries NO runtime reloc for this disp32 (it is an ASLR-invariant relative offset, a link-time constant). nativeId = IMAGE_REL_AMD64_SECREL (11) — meaningful only for a future .obj emission of this kind; the row's existence satisfies the linker's pre-walker cross-reference unifier + the walker's in-arm tls-kind check (the CRIT-1 XOR backstop).",
+      "name": "IMAGE_REL_AMD64_SECREL",
+      "kind": 4,
+      "nativeId": 11
     }
   ]
 }

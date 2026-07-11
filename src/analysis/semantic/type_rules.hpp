@@ -442,6 +442,31 @@ namespace detail::type_rules {
             // below (Ptr<int> → Ptr<float> is NOT implicit).
         }
     }
+    // C23 §6.3.2.3.4 / §6.2.5 (D-CSUBSET-NULLPTR): the predefined constant
+    // `nullptr` (interned TypeKind::NullptrT) is a null pointer constant assignable
+    // WITHOUT cast to ANY pointer type (object OR function pointer — both are
+    // TypeKind::Ptr in the shipped C surface). TYPE-only (unlike the value-aware
+    // integer-0 form), so it lives in this chokepoint — covering init /
+    // positional-init / assign / call-arg / return at once. ONE-WAY: NullptrT never
+    // appears as `lk`, so nothing converts TO nullptr_t (the C23 "only nullptr_t
+    // converts to nullptr_t" constraint, enforced by omission). Gated on the flag
+    // (default false → NullptrT inert). `nullptr` lowers to the integer-0 null const
+    // at HIR, so NO post-coerce verifier surface.
+    //
+    // nullptr → BOOL (C23 §6.3.2.3.2 says nullptr converts to bool, yielding false)
+    // is DEFERRED (D-CSUBSET-NULLPTR-BOOL-CONVERSION): the c-subset has no scalar→bool
+    // conversion at all (`bool b = 0;` is itself S_TypeMismatch), and admitting only
+    // nullptr→bool would be inconsistent AND hit the unrealized Trunc→Bool codegen
+    // form. `nullptr` in a CONTROLLING expression (`if(nullptr)`, `nullptr ? a : b`,
+    // `!nullptr`) does NOT need this arm — it flows through the HIR condition lowering
+    // (nullptr → integer 0 → the arithmetic-condition `Ne(0,0)` → false), so the
+    // deferral costs no real nullptr-in-boolean-context behavior. Closes with the
+    // general scalar→bool conversion (a separate feature).
+    if (ptrRules.nullPointerConstantFromNullptrT
+        && rk == TypeKind::NullptrT
+        && lk == TypeKind::Ptr) {
+        return true;
+    }
     return false;
 }
 
@@ -517,6 +542,16 @@ namespace detail::type_rules {
     if (tk == TypeKind::Ptr && ok == TypeKind::FnSig) return true;
     if (tk == TypeKind::Ptr && isCastableInt(ok))     return true;
     if (isCastableInt(tk) && ok == TypeKind::Ptr)     return true;
+    // C23 (D-CSUBSET-NULLPTR): `nullptr` (a NullptrT operand) casts explicitly to
+    // any POINTER target (`(T*)nullptr`). Restricted to a Ptr target ONLY — a cast
+    // to an arithmetic type (`(int)nullptr`) is NOT sanctioned by C23, and NO arm
+    // admits NullptrT as the cast TARGET (the one-way constraint holds for casts
+    // too). `(bool)nullptr` is DEFERRED with the implicit nullptr→bool conversion
+    // (D-CSUBSET-NULLPTR-BOOL-CONVERSION — the c-subset has no scalar→bool path).
+    // nullptr lowers to the integer-0 null const → the existing null-const path.
+    if (ok == TypeKind::NullptrT && tk == TypeKind::Ptr) {
+        return true;
+    }
     return false;
 }
 
@@ -687,6 +722,39 @@ enumUnderlyingOrSelf(TypeInterner& interner, TypeId t) {
     if (!t.valid() || interner.kind(t) != TypeKind::Enum) return t;
     auto const sc = interner.scalars(t);
     return sc.empty() ? t : interner.primitive(static_cast<TypeKind>(sc[0]));
+}
+
+// C23 6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE): the bit-width of a core integer
+// kind — 8/16/32/64/128 for I8..I128 / U8..U128. Returns 0 for a non-integer
+// kind (the caller gates the enum-underlying validity on this being non-zero).
+[[nodiscard]] inline constexpr int intKindBits(TypeKind k) noexcept {
+    int const rank = detail::type_rules::intWidthRank(k);   // 1..5 → 8..128
+    return rank == 0 ? 0 : (8 << (rank - 1));
+}
+
+// C23 6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE): does the (already computed)
+// enumerator VALUE fit the enum's EXPLICIT underlying integer type? A signed
+// kind admits [-2^(b-1), 2^(b-1)-1]; an unsigned kind admits [0, 2^b - 1].
+// Enumerator values are carried as int64, so a 64+-bit signed underlying always
+// fits, a NON-NEGATIVE value always fits a 64+-bit unsigned underlying, and a
+// negative value never fits ANY unsigned underlying. Returns false for a
+// non-integer kind (bits == 0) — but the caller diagnoses that as
+// S_InvalidEnumUnderlyingType before ever range-checking.
+[[nodiscard]] inline bool
+enumeratorValueFitsUnderlying(std::int64_t value, TypeKind underlying) noexcept {
+    int const bits = intKindBits(underlying);
+    if (bits == 0) return false;
+    bool const isSigned = detail::type_rules::signedIntRank(underlying) != 0;
+    if (isSigned) {
+        if (bits >= 64) return true;                        // any int64 fits I64/I128
+        std::int64_t const lo = -(std::int64_t{1} << (bits - 1));
+        std::int64_t const hi =  (std::int64_t{1} << (bits - 1)) - 1;
+        return value >= lo && value <= hi;
+    }
+    if (value < 0) return false;                            // negative never fits unsigned
+    if (bits >= 64) return true;                            // any non-negative int64 fits U64/U128
+    std::uint64_t const hi = (std::uint64_t{1} << bits) - 1;
+    return static_cast<std::uint64_t>(value) <= hi;
 }
 
 // The C 6.3.1.8 common type of two operands under the language's

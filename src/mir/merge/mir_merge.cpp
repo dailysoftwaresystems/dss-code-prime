@@ -701,6 +701,12 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             (void)builder.addGlobal(ty, mergedSym, newInitLit, newInitFunc,
                                     m.globalBinding(g), m.globalVisibility(g),
                                     m.globalIsConst(g),
+                                    // TLS C1 (D-CSUBSET-THREAD-LOCAL, CRIT-3):
+                                    // carry thread storage duration across the
+                                    // cross-CU merge — dropping it here would
+                                    // silently demote a per-thread object to
+                                    // process-shared in every N>1 build.
+                                    mirThreadStorageOf(m.globalIsThreadLocal(g)),
                                     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: carry
                                     // the global's explicit alignment across the
                                     // cross-CU merge.

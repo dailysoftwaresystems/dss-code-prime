@@ -246,7 +246,9 @@ TEST(MirRebuildHelper, IdentityRoundTripPreservesGlobalAddrLoadStoreReturn) {
     MirBuilder mb;
     MirLiteralValue v0; v0.value = std::int64_t{0}; v0.core = TypeKind::I32;
     std::uint32_t const initIdx = mb.literalPoolAdd(v0);
-    (void)mb.addGlobal(i32, SymbolId{200}, initIdx);
+    (void)mb.addGlobal(i32, SymbolId{200}, initIdx, MirFuncId{},
+                       SymbolBinding::Global, SymbolVisibility::Default,
+                       /*isConst=*/false, MirThreadStorage::Shared);
 
     mb.addFunction(fnSig, SymbolId{201});
     MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
@@ -315,10 +317,10 @@ TEST(MirRebuildHelper, CloneGlobalsPreservesConstness) {
     // global #0 CONST (→ .rodata); global #1 MUTABLE (→ .data).
     (void)mb.addGlobal(i32, SymbolId{1}, lit, MirFuncId{},
                        SymbolBinding::Global, SymbolVisibility::Default,
-                       /*isConst=*/true);
+                       /*isConst=*/true, MirThreadStorage::Shared);
     (void)mb.addGlobal(i32, SymbolId{2}, lit, MirFuncId{},
                        SymbolBinding::Global, SymbolVisibility::Default,
-                       /*isConst=*/false);
+                       /*isConst=*/false, MirThreadStorage::Shared);
     Mir src = std::move(mb).finish();
     ASSERT_EQ(src.moduleGlobalCount(), 2u);
     ASSERT_TRUE(src.globalIsConst(src.globalAt(0)));
@@ -347,5 +349,63 @@ TEST(MirRebuildHelper, CloneGlobalsPreservesConstness) {
         EXPECT_TRUE(out.globalIsConst(out.globalAt(0)))
             << "cloneGlobalsOrCarveOut must preserve const-ness";
         EXPECT_FALSE(out.globalIsConst(out.globalAt(1)));
+    }
+}
+
+// TLS C1 (D-CSUBSET-THREAD-LOCAL, ★CRIT-3): thread-storage preservation
+// across the two SHARED rebuild global-clone fns — the audit's flag-drop
+// clone sites #2 and #3 (`cloneGlobalsOrCarveOut` runs on EVERY rebuild
+// pass of EVERY optimized compile; `cloneGlobalsVerbatim` on every prune/
+// normalize). A dropped flag silently demotes a per-thread object to
+// process-shared under optimization — release builds only, the worst kind
+// of divergence. Exact per-global assertions; the CloneGlobalsPreservesConstness
+// shape mirrored so the two flag classes stay pinned side by side.
+// RED-ON-DISABLE: drop the `…globalIsThreadLocal(g)` argument at
+// mir_rebuild_helper.cpp (pass MirThreadStorage::Shared) → the TLS
+// global's flag flips and the
+// EXPECT_TRUE fails.
+TEST(MirRebuildHelper, CloneGlobalsPreservesThreadLocal) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32 = interner.primitive(TypeKind::I32);
+
+    MirBuilder mb;
+    MirLiteralValue v; v.value = std::int64_t{5}; v.core = TypeKind::I32;
+    std::uint32_t const lit = mb.literalPoolAdd(v);
+    // global #0 THREAD-LOCAL; global #1 plain.
+    (void)mb.addGlobal(i32, SymbolId{1}, lit, MirFuncId{},
+                       SymbolBinding::Global, SymbolVisibility::Default,
+                       /*isConst=*/false, MirThreadStorage::PerThread);
+    (void)mb.addGlobal(i32, SymbolId{2}, lit, MirFuncId{},
+                       SymbolBinding::Global, SymbolVisibility::Default,
+                       /*isConst=*/false, MirThreadStorage::Shared);
+    Mir src = std::move(mb).finish();
+    ASSERT_EQ(src.moduleGlobalCount(), 2u);
+    ASSERT_TRUE(src.globalIsThreadLocal(src.globalAt(0)));
+    ASSERT_FALSE(src.globalIsThreadLocal(src.globalAt(1)));
+
+    // (a) cloneGlobalsVerbatim — the prune/normalize chokepoint.
+    {
+        MirBuilder dst;
+        cloneGlobalsVerbatim(src, dst);
+        Mir out = std::move(dst).finish();
+        ASSERT_EQ(out.moduleGlobalCount(), 2u);
+        EXPECT_TRUE(out.globalIsThreadLocal(out.globalAt(0)))
+            << "cloneGlobalsVerbatim must preserve thread storage duration "
+               "(else a per-thread object silently becomes process-shared "
+               "under a rebuild pass)";
+        EXPECT_FALSE(out.globalIsThreadLocal(out.globalAt(1)))
+            << "a plain global must stay process-shared";
+    }
+    // (b) cloneGlobalsOrCarveOut — the rebuild-pass prelude.
+    {
+        MirBuilder dst;
+        DiagnosticReporter rep;
+        auto const r = cloneGlobalsOrCarveOut(src, dst, rep, "ThreadLocalTest");
+        ASSERT_EQ(r, GlobalClonePrelude::Cloned);
+        Mir out = std::move(dst).finish();
+        ASSERT_EQ(out.moduleGlobalCount(), 2u);
+        EXPECT_TRUE(out.globalIsThreadLocal(out.globalAt(0)))
+            << "cloneGlobalsOrCarveOut must preserve thread storage duration";
+        EXPECT_FALSE(out.globalIsThreadLocal(out.globalAt(1)));
     }
 }

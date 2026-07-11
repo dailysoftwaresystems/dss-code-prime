@@ -798,6 +798,26 @@ struct DSS_EXPORT ObjectFormatData {
     // (the closed-enum check — a typo never falls back).
     std::optional<DataImportBinding> dataImportBinding;
 
+    // ── D-CSUBSET-THREAD-LOCAL (TLS C1): thread-local access block ──
+    //
+    // HOW code reaches a thread-local object's per-thread copy under
+    // THIS format (`"tlsAccess"` in the JSON): the closed access MODEL
+    // (`local-exec` / `pe-indexed` / `macho-tlv`) + the per-format
+    // VALUES the x86 access sequence needs (segment-override prefix
+    // byte, thread-pointer slot displacement). See `TlsAccessInfo`
+    // (core/types/object_format_kind.hpp) for the full rationale.
+    //
+    // `std::nullopt` = the format declared no TLS access model — NOT a
+    // silent default: MIR→LIR fails loud (`K_FormatLacksThreadLocalSupport`)
+    // on the first thread-local GlobalAddr under a nullopt-tlsAccess
+    // format (lowering a thread-local through the ordinary global path
+    // would silently produce ONE process-shared copy — a miscompile of
+    // the declared storage duration). ELF-Linux exec formats declare
+    // `local-exec {0x64, 0}`; PE / Mach-O omit it until their TLS
+    // cycles land (their absence IS the fail-loud gate). An unknown
+    // VALUE still fails loud at load (the closed-enum check).
+    std::optional<TlsAccessInfo> tlsAccess;
+
     // ── D-LK2-RODATA closure: producer-data-section capability set ──
     //
     // Schema-declared set of `DataSectionKind` values the format's
@@ -1000,6 +1020,18 @@ public:
     [[nodiscard]] std::optional<DataImportBinding>
     dataImportBinding() const noexcept {
         return d_.dataImportBinding;
+    }
+
+    // ── D-CSUBSET-THREAD-LOCAL accessor (TLS C1) ─────────────────
+    // The format's thread-local access block (model + x86 segment
+    // prefix + tp-slot displacement), or nullopt if the format
+    // declared none. MIR→LIR reads this to lower a thread-local
+    // GlobalAddr; a nullopt under a module touching a thread-local
+    // is a fail-loud (K_FormatLacksThreadLocalSupport) — never a
+    // silent process-shared alias.
+    [[nodiscard]] std::optional<TlsAccessInfo>
+    tlsAccess() const noexcept {
+        return d_.tlsAccess;
     }
 
     // ── D-LK2-RODATA producer-data-section capability gate ─────

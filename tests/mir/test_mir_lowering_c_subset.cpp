@@ -113,11 +113,17 @@ struct Lowered {
     // c21 (D-CSUBSET-VOLATILE-QUALIFIER): thread the per-access volatility
     // side-table exactly as compile_pipeline.cpp does, so a `volatile` object/
     // member/global access carries MirInstFlags::Volatile on its Load/Store.
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): thread the thread-storage side-table
+    // too (positional — the intervening alignmentMap is passed as the same
+    // nullptr it previously defaulted to; no fixture in this binary uses
+    // alignas), so `thread_local` source stamps MirGlobal.isThreadLocal and
+    // the CRIT-1 `&tls` initializer screen fires — both pinned below.
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
                                     &hir->linkageMap, &hir->mutabilityMap,
-                                    &hir->volatileMap);
+                                    &hir->volatileMap, /*alignmentMap=*/nullptr,
+                                    &hir->threadLocalMap);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -1274,6 +1280,214 @@ TEST(MirLoweringCSubsetLinkage, StaticNoreturnKeepsInternalLinkage) {
         EXPECT_EQ(n, 1u)
             << "exactly one H_UnknownLinkageSpecifier for 'frobnicate' "
                "(a co-present static must not suppress the fail-loud)";
+    }
+}
+
+// FC17 (D-CSUBSET-ATTRIBUTE-SEMANTICS): `static __attribute__((deprecated))
+// int f(void)` keeps its INTERNAL linkage — the by-NAME linkage skip
+// (`linkageSpecifierIgnoredNames` += the semantic-attribute spellings) has NO
+// linkage effect, so it cannot clobber a co-present `static` (the exact
+// last-wins {binding:global} hazard the noreturn cycle's design rejected; this
+// extends that pin to the FC17 names). RED-ON-DISABLE: replace the by-name
+// skip with a linkageSpecifiers {binding:global} row for "deprecated" →
+// last-wins clobbers the static → localCount drops to 0.
+TEST(MirLoweringCSubsetLinkage, GnuDeprecatedDoesNotClobberStaticLinkage) {
+    auto L = lowerCSubset(
+        "static __attribute__((deprecated)) int f(void){ return 0; }\n"
+        "int main(void){ return f(); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 2u) << "f + main (pre-DCE)";
+    int localCount = 0;
+    for (std::uint32_t i = 0; i < m.moduleFuncCount(); ++i)
+        if (m.funcBinding(m.funcAt(i)) == SymbolBinding::Local) ++localCount;
+    EXPECT_EQ(localCount, 1)
+        << "static __attribute__((deprecated)) f must keep internal linkage "
+           "(binding==Local); the by-name-ignored attribute must NOT "
+           "externalize it";
+}
+
+// FC17 (D-CSUBSET-CONSTEXPR) linkage: C23 6.2.2p3 (N3096) gives a FILE-scope
+// object declared `constexpr` INTERNAL linkage — constexpr joins `static` in
+// the 6.2.2p3 list. The config carrier is topLevelDecl's
+// `linkageSpecifiers["constexpr"] = {binding:local}` (the keyword TEXT keys the
+// map, like "static"); a co-present explicit `static` composes IDEMPOTENTLY
+// (both entries map to local — last-wins is a no-op, NOT the noreturn
+// {binding:global}-clobber hazard). The plain-`const` contrast arm pins that
+// the internal linkage comes from CONSTEXPR, not from const-ness.
+// RED-ON-DISABLE: drop the "constexpr" linkageSpecifiers entry from
+// c-subset.lang.json and the bare-constexpr arm's binding flips Global → RED.
+TEST(MirLoweringCSubsetLinkage, FileScopeConstexprGetsInternalLinkage) {
+    struct Arm { char const* src; SymbolBinding want; char const* why; };
+    for (Arm const& arm : {
+             Arm{"constexpr int M = 3;\n"
+                 "int main(void){ return M; }\n",
+                 SymbolBinding::Local,
+                 "bare file-scope constexpr must bind Local (C23 6.2.2p3)"},
+             Arm{"static constexpr int M = 3;\n"
+                 "int main(void){ return M; }\n",
+                 SymbolBinding::Local,
+                 "static + constexpr compose idempotently to Local"},
+             Arm{"const int M = 3;\n"
+                 "int main(void){ return M; }\n",
+                 SymbolBinding::Global,
+                 "plain const keeps EXTERNAL linkage — the contrast arm"}}) {
+        auto L = lowerCSubset(arm.src);
+        ASSERT_FALSE(L.model.hasErrors()) << arm.src << "\n"
+            << (L.model.diagnostics().all().empty()
+                    ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.hir->ok) << arm.src << "\n"
+            << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+        ASSERT_TRUE(L.mir.ok) << arm.src << "\n"
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleGlobalCount(), 1u) << arm.src;
+        EXPECT_EQ(m.globalBinding(m.globalAt(0)), arm.want)
+            << arm.src << "\n" << arm.why;
+    }
+}
+
+// ── TLS C1 (D-CSUBSET-THREAD-LOCAL): the HIR→MIR thread-storage pins ────────
+
+// The end-to-end flag path: SymbolRecord.isThreadLocal → recordThreadLocal →
+// HirThreadLocalMap → PendingGlobal.isThreadLocal → MirGlobal.isThreadLocal.
+// Exact PER-GLOBAL assertions — the thread_local global carries the flag AND
+// the plain sibling in the SAME module does not (a scan that stamped every
+// global would red on `h`). RED-ON-DISABLE: drop any hop of the plumbing
+// (the recordThreadLocal call, the threadLocalMap read, the addGlobal
+// argument) and the `g` EXPECT reds.
+TEST(MirLoweringCSubsetThreadLocal, ThreadLocalGlobalLowersWithFlag) {
+    auto L = lowerCSubset(
+        "thread_local int g = 7;\n"
+        "int h = 7;\n"
+        "int main(void){ return g + h; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 2u) << "g + h, source order";
+    EXPECT_TRUE(m.globalIsThreadLocal(m.globalAt(0)))
+        << "`thread_local int g` must lower with MirGlobal.isThreadLocal";
+    EXPECT_FALSE(m.globalIsThreadLocal(m.globalAt(1)))
+        << "the plain `int h` in the same module must stay process-shared";
+    // Slice-A posture: apart from the flag, the TLS global lowers as an
+    // ordinary constant-init global (codegen TLS is slices B/C).
+    EXPECT_NE(m.globalInitLiteralIndex(m.globalAt(0)), UINT32_MAX);
+}
+
+// C11 6.2.2 is untouched by 6.7.1: a file-scope thread_local keeps EXTERNAL
+// linkage, and a co-present `static` keeps INTERNAL linkage in EITHER order
+// (the {threadStorage:true} entries deliberately carry NO binding axis — the
+// noreturn linkage-clobber lesson). A block-scope `static thread_local`
+// routes to the hidden module-global WITH the flag AND internal binding.
+// RED-ON-DISABLE: give the thread_local linkage entries a binding → the
+// bare arm flips Local; drop the staticStorage routing's recordThreadLocal →
+// the block-scope arm's flag EXPECT reds.
+TEST(MirLoweringCSubsetThreadLocal, ThreadLocalLinkageAndStaticComposition) {
+    struct Arm {
+        char const*   src;
+        SymbolBinding wantBinding;
+        bool          wantTls;
+        char const*   why;
+    };
+    for (Arm const& arm : {
+             Arm{"thread_local int g = 7;\n"
+                 "int main(void){ return g; }\n",
+                 SymbolBinding::Global, true,
+                 "file-scope thread_local keeps EXTERNAL linkage (6.2.2)"},
+             Arm{"static thread_local int s = 1;\n"
+                 "int main(void){ return s; }\n",
+                 SymbolBinding::Local, true,
+                 "static thread_local composes: internal + per-thread"},
+             Arm{"thread_local static int s = 1;\n"
+                 "int main(void){ return s; }\n",
+                 SymbolBinding::Local, true,
+                 "the reverse order must compose identically (no clobber)"},
+             Arm{"int main(void){ static thread_local int ls = 4; "
+                 "return ls; }\n",
+                 SymbolBinding::Local, true,
+                 "a block-scope static thread_local routes to the hidden "
+                 "module-global WITH the flag"}}) {
+        auto L = lowerCSubset(arm.src);
+        ASSERT_FALSE(L.model.hasErrors()) << arm.src << "\n"
+            << (L.model.diagnostics().all().empty()
+                    ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.hir->ok) << arm.src << "\n"
+            << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+        ASSERT_TRUE(L.mir.ok) << arm.src << "\n"
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        ASSERT_EQ(m.moduleGlobalCount(), 1u) << arm.src;
+        EXPECT_EQ(m.globalBinding(m.globalAt(0)), arm.wantBinding)
+            << arm.src << "\n" << arm.why;
+        EXPECT_EQ(m.globalIsThreadLocal(m.globalAt(0)), arm.wantTls)
+            << arm.src << "\n" << arm.why;
+    }
+}
+
+// ★CRIT-1 (C11 6.6p9): the ADDRESS of a thread-local object is NOT an
+// address constant — every static-storage initializer shape naming one must
+// fail loud S_ThreadLocalAddressNotConstant AT THE LOWERING TIER (the
+// semantic model is clean; the reject lives where MirSymbolAddrValue would
+// otherwise be minted). Scalar, aggregate-member, and block-scope-static
+// forms — the three mint paths. RED-ON-DISABLE: drop the
+// tryClassifyAsSymbolAddr screen and all three lower green with an abs64
+// whose resolved value would be the link-time tpoff bit-cast into a data
+// slot (the silent garbage pointer this diagnostic exists to prevent).
+TEST(MirLoweringCSubsetThreadLocal, TlsAddressInStaticInitializerFailsLoud) {
+    for (char const* src : {
+             // scalar file-scope pointer
+             "thread_local int t;\n"
+             "int *p = &t;\n"
+             "int main(void){ return 0; }\n",
+             // aggregate member
+             "thread_local int t;\n"
+             "int *arr[1] = {&t};\n"
+             "int main(void){ return 0; }\n",
+             // block-scope static (routes through the same PendingGlobal
+             // classification as a file-scope global)
+             "thread_local int t;\n"
+             "int main(void){ static int *q = &t; return 0; }\n"}) {
+        auto L = lowerCSubset(src);
+        ASSERT_FALSE(L.model.hasErrors()) << src;
+        ASSERT_TRUE(L.hir->ok) << src;
+        EXPECT_FALSE(L.mir.ok)
+            << src << "\na TLS address must not classify as an address constant";
+        std::size_t n = 0;
+        for (auto const& d : L.mirReporter.all())
+            if (d.code == DiagnosticCode::S_ThreadLocalAddressNotConstant) ++n;
+        EXPECT_EQ(n, 1u)
+            << src << "\nexactly one S_ThreadLocalAddressNotConstant";
+    }
+    // The LEGAL polarity pins: (a) a pointer INSIDE a thread_local aggregate
+    // targeting a NON-TLS symbol is an ordinary address constant; (b) taking
+    // a TLS address AT RUNTIME (function body) is legal — the reject is
+    // static-initializer-scoped, never a blanket address-of ban.
+    for (char const* legal : {
+             "int g = 4;\n"
+             "thread_local int *arr[1] = {&g};\n"
+             "int main(void){ return 0; }\n",
+             "thread_local int t = 3;\n"
+             "int main(void){ int *p = &t; return *p; }\n"}) {
+        auto L = lowerCSubset(legal);
+        ASSERT_FALSE(L.model.hasErrors()) << legal;
+        ASSERT_TRUE(L.hir->ok) << legal;
+        EXPECT_TRUE(L.mir.ok) << legal << "\n"
+            << (L.mirReporter.all().empty() ? ""
+                                            : L.mirReporter.all()[0].actual);
+        for (auto const& d : L.mirReporter.all())
+            EXPECT_NE(d.code, DiagnosticCode::S_ThreadLocalAddressNotConstant)
+                << legal;
     }
 }
 
@@ -3323,9 +3537,11 @@ TEST(MirLoweringCSubset, BodyF64LiteralPromotesToAnonymousGlobalPlusLoad) {
     Mir const& m = L.mir.mir;
     auto const& interner = L.model.lattice().interner();
 
-    // TWO promoted globals (one per literal occurrence — the string-
-    // literal convention: per-occurrence, no dedup), each typed F64
-    // with a constant-init double literal carrying the exact value.
+    // TWO promoted globals (one per literal occurrence; DISTINCT values —
+    // 1.7 vs 2.5 — so the FC17.5 F2 STRING byte-content memo, which only
+    // dedups identical STRING literals, is irrelevant here: float
+    // promotion keeps per-occurrence minting), each typed F64 with a
+    // constant-init double literal carrying the exact value.
     ASSERT_EQ(m.moduleGlobalCount(), 2u)
         << "each body F64 literal must mint one anonymous rodata global";
     bool saw17 = false, saw25 = false;
@@ -3373,6 +3589,89 @@ TEST(MirLoweringCSubset, BodyF64LiteralPromotesToAnonymousGlobalPlusLoad) {
     EXPECT_EQ(nGlobalAddr, 2u);
     EXPECT_EQ(nF64Load, 2u);
     EXPECT_EQ(nFAdd, 1u);
+}
+
+// FC17.5 F2 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER): IDENTICAL body string
+// literals share ONE rodata global — the byte-content memo in
+// `materializeStringLiteralGlobal` (keyed on (array TypeId, exact bytes)).
+// C 6.4.5p7 permits the sharing for all strings; C99 6.4.2.2 REQUIRES it
+// for `__func__` (one static array per function — two folded reads must
+// decay to EQUAL pointers, see the sibling __func__ pin). RED-ON-DISABLE:
+// drop the `stringGlobalMemo_` lookup in materializeStringLiteralGlobal →
+// two occurrences mint two globals → the count assertion fails.
+TEST(MirLoweringCSubset, IdenticalStringLiteralsShareOneRodataGlobal) {
+    auto L = lowerCSubset(
+        "int f() {\n"
+        "    const char *a;\n"
+        "    const char *b;\n"
+        "    a = \"hi\";\n"
+        "    b = \"hi\";\n"
+        "    return a == b ? 1 : 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u)
+        << "two identical \"hi\" literals must share ONE memoized rodata "
+           "global (two means the F2 byte-content memo is disabled)";
+    EXPECT_TRUE(m.globalIsConst(m.globalAt(0)))
+        << "the shared string global must stay read-only rodata";
+}
+
+// FC17.5 F2 — the `__func__ == __func__` identity substrate at MIR: the
+// two folded `__func__` reads decay through the SAME memoized rodata
+// global, so the comparison is GlobalAddr(sym) == GlobalAddr(sym) (true
+// by construction, as C99 6.4.2.2's one-static-array semantics require).
+// RED-ON-DISABLE: without the memo the two reads mint TWO globals and the
+// count assertion fails (and the runtime example would return the wrong
+// exit).
+TEST(MirLoweringCSubset, FuncNameReadsShareOneRodataGlobal) {
+    auto L = lowerCSubset(
+        "int main() { return (__func__ == __func__) ? 1 : 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 1u)
+        << "the two __func__ reads must materialize ONE shared rodata "
+           "global — C99 6.4.2.2 declares ONE static array per function";
+}
+
+// FC17.5 F2, the code-audit MEDIUM-1 closure: the identity must hold ACROSS
+// producer positions — a `static const char *p = __func__;` INITIALIZER
+// (classified by tryClassifyAsSymbolAddr's Cast-of-string-Literal arm) and a
+// BODY read of `__func__` (materializeStringLiteralGlobal) must reference the
+// SAME rodata global, or `p == __func__` is silently false (wrong value, no
+// diagnostic). Both producers now route through the ONE shared
+// `internStringLiteralGlobal` core. Expected globals: the hidden static `p`
+// (D-CSUBSET-LOCAL-STATIC module global) + ONE shared string global = 2.
+// RED-ON-DISABLE: revert the classify arm to its own PendingGlobal mint → the
+// initializer and the body read mint TWO string globals → count 3 → red.
+TEST(MirLoweringCSubset, FuncNameStaticInitializerSharesTheBodyReadGlobal) {
+    auto L = lowerCSubset(
+        "int main() {\n"
+        "    static const char *p = __func__;\n"
+        "    return (p == __func__) ? 1 : 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleGlobalCount(), 2u)
+        << "expected the hidden static `p` + ONE shared __func__ string "
+           "global; 3 means the static-initializer path minted its own "
+           "un-memoized string global (the audit's MEDIUM-1 identity leak)";
+    // Exactly one of the two globals is the const rodata string.
+    int constGlobals = 0;
+    for (std::uint32_t i = 0; i < m.moduleGlobalCount(); ++i) {
+        if (m.globalIsConst(m.globalAt(i))) ++constGlobals;
+    }
+    EXPECT_EQ(constGlobals, 1)
+        << "exactly ONE const rodata string global must back both positions";
 }
 
 // ── FC3 c1: UAC materialization pins (plan 23) ──────────────────────────

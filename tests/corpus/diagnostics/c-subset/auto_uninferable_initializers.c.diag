@@ -1,0 +1,5 @@
+S_AutoInferenceInvalid 13:14-13:22
+S_AutoInferenceInvalid 14:14-14:21
+S_AutoInferenceInvalid 15:14-15:15
+S_UnusedVariable 13:5-13:23
+S_UnusedVariable 14:5-14:22

@@ -1038,6 +1038,100 @@ encodeExec(AssembledModule const&    module,
     // bytes, the loader zero-fills VirtualSize bytes). Section VA/file RVAs
     // chain text → rdata → data → bss → idata → reloc.
     using link::format::detail::alignUp;
+    // ── D-CSUBSET-THREAD-LOCAL (TLS C3): lay out the thread-local TEMPLATE.
+    // `tdata` (initialized `thread_local int g = 7;`) becomes the ONE `.tls`
+    // section's file bytes; `tbss` (zero-init `thread_local int g;`)
+    // contributes NO file bytes — its span folds into the
+    // IMAGE_TLS_DIRECTORY64 `SizeOfZeroFill` tail (there is no separate
+    // `.tbss` section on PE). `allowItemRelocations=true` on the tdata call:
+    // a `thread_local char *msg = "hi";` template item carries an abs64
+    // data->data reloc to the rodata string, patched below (and given a
+    // DIR64 base-reloc site) so each thread's copy holds the rebased pointer.
+    auto const tdataLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Tdata,
+        /*alignFloor=*/1, "pe::encodeExec", reporter,
+        /*allowItemRelocations=*/true);
+    if (!tdataLayoutOpt.has_value()) return {};
+    auto const& tdataLayout = *tdataLayoutOpt;
+    auto const tbssLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Tbss,
+        /*alignFloor=*/1, "pe::encodeExec", reporter,
+        /*allowItemRelocations=*/false);   // zero-fill has no on-disk site
+    if (!tbssLayoutOpt.has_value()) return {};
+    auto const& tbssLayout = *tbssLayoutOpt;
+    bool const hasTdata = !tdataLayout.empty();
+    bool const hasTbss  = !tbssLayout.empty();
+    bool const hasTls   = hasTdata || hasTbss;
+    // The `.tls` section row (name + Characteristics) — looked up by the
+    // ThreadData kind. A module carrying TLS items but a format that
+    // declares no `.tls` row is a fail-loud misconfiguration (the
+    // supportedDataSections gate advertised tdata/tbss but the row was
+    // omitted). The anti-static-alias backstop: never lay a thread-local
+    // item out as ordinary data (that is the storage-duration miscompile).
+    ObjectFormatSectionInfo const* secTls =
+        fmt.sectionByKind(SectionKind::ThreadData);
+    if (hasTls && secTls == nullptr) {
+        emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+             "pe::encodeExec: module carries thread-local items but the "
+             "format declares no ThreadData ('.tls') section row "
+             "(D-CSUBSET-THREAD-LOCAL).");
+        return {};
+    }
+    // The format must declare a tlsAccess block naming the `_tls_index`
+    // singleton (the writer binds the reserved id to the slot's VA + wires
+    // IMAGE_TLS_DIRECTORY64.AddressOfIndex to it). A module with TLS but no
+    // such block cannot be given a working access sequence.
+    if (hasTls && (!fmt.tlsAccess().has_value()
+                   || fmt.tlsAccess()->tlsIndexSlotName.empty())) {
+        emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+             "pe::encodeExec: module carries thread-local items but the "
+             "format declares no tlsAccess.tlsIndexSlotName — the writer "
+             "cannot bind the module TLS-index slot "
+             "(D-CSUBSET-THREAD-LOCAL).");
+        return {};
+    }
+    // Per-thread block geometry (mirrors the ELF walker's PT_TLS math): the
+    // initialized template (`tdataSpan` bytes), then the tbss zero-fill
+    // starting at its aligned base. `SizeOfZeroFill` = the block memsz beyond
+    // the template. A tbss item's secrel (registered below) is
+    // `tbssBlockBase + itemOffset`, landing in that zero-fill tail.
+    // ── D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN (audit FOLD-1): fail loud on an
+    // OVER-ALIGNED thread-local. The Windows x64 loader allocates each
+    // thread's static-TLS block at only MEMORY_ALLOCATION_ALIGNMENT (16 bytes
+    // = 2*sizeof(void*)), and IMAGE_TLS_DIRECTORY64 carries NO block-base-
+    // alignment field to request more — so a var whose alignment exceeds 16
+    // would be SILENTLY under-aligned in every thread's copy (a SIMD / atomic
+    // thread_local relying on it is UB). ELF's PT_TLS p_align honors any
+    // alignment (the C1/C2 `_Alignas(32) thread_local` witnesses run green),
+    // so this gate is PE-format-LOCAL — the format writer's own ABI knowledge,
+    // never a shared-substrate branch. Alignments <= 16 (every normal scalar /
+    // pointer / small aggregate, incl. `_Alignas(16)`) pass; the gate bites
+    // ONLY explicit over-alignment.
+    constexpr std::uint64_t kPeX64TlsBlockBaseAlign = 16;  // MEMORY_ALLOCATION_ALIGNMENT
+    std::uint64_t tlsMaxAlign = 1;
+    if (hasTdata) tlsMaxAlign = std::max(tlsMaxAlign, tdataLayout.maxAlign);
+    if (hasTbss)  tlsMaxAlign = std::max(tlsMaxAlign, tbssLayout.maxAlign);
+    if (hasTls && tlsMaxAlign > kPeX64TlsBlockBaseAlign) {
+        emit(reporter, DiagnosticCode::K_ThreadLocalOveralignedForFormat,
+             std::format(
+                 "pe::encodeExec: a thread-local object requires {}-byte "
+                 "alignment, but the Windows x64 loader guarantees only "
+                 "{}-byte (MEMORY_ALLOCATION_ALIGNMENT) static-TLS block-base "
+                 "alignment and IMAGE_TLS_DIRECTORY64 has no field to request "
+                 "more — the per-thread copy would be silently under-aligned "
+                 "(D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN).",
+                 tlsMaxAlign, kPeX64TlsBlockBaseAlign));
+        return {};
+    }
+    std::uint64_t const tdataSpan = tdataLayout.spanSize;   // 0 if none
+    std::uint64_t const tbssBlockBase =
+        alignUp(tdataSpan,
+                std::max<std::uint64_t>(1, hasTbss ? tbssLayout.maxAlign : 1));
+    std::uint64_t const tlsBlockMemsz =
+        hasTbss ? tbssBlockBase + tbssLayout.spanSize : tdataSpan;
+    std::uint64_t const tlsZeroFill = tlsBlockMemsz - tdataSpan;
+    // The u32-wire-limit guard for these spans rides the SAME `checkU32Span`
+    // call the rdata/data/bss spans use (below, once the lambda is defined).
     // `allowItemRelocations=true`: PE patches data-item (data→data) relocations
     // — its cross-CU thunk-slot feature — into the laid-out bytes below.
     auto const rdataLayoutOpt = link::format::buildExecDataSection(
@@ -1078,7 +1172,9 @@ encodeExec(AssembledModule const&    module,
     };
     if (!checkU32Span("rdata", rdataDataLayout.spanSize)
         || !checkU32Span("data", dataDataLayout.spanSize)
-        || !checkU32Span("bss", bssDataLayout.spanSize)) {
+        || !checkU32Span("bss", bssDataLayout.spanSize)
+        || !checkU32Span("tls-template", tdataSpan)      // TLS C3
+        || !checkU32Span("tls-zerofill", tlsZeroFill)) { // TLS C3
         return {};
     }
     // `.rdata` AND `.data` bytes are MUTABLE here because PE patches data-item
@@ -1105,6 +1201,17 @@ encodeExec(AssembledModule const&    module,
         dataOffsetByIndex.emplace(dataDataLayout.itemIndices[j],
                                   dataDataLayout.itemOffsets[j]);
     }
+    // TLS C3 (D-CSUBSET-THREAD-LOCAL): the SAME index→section-offset map for
+    // `.tls` TEMPLATE (tdata) items, so a reloc-bearing template item
+    // (`thread_local char *msg = "hi";`) is patched into `tlsBytes` by the
+    // data-item reloc loop + given its DIR64 base-reloc site (the template
+    // opens the `.tls` section at offset 0, so the tls offset IS the tdata
+    // layout offset). Tbss items are zero-fill (no file bytes, no reloc site).
+    std::unordered_map<std::size_t, std::uint64_t> tlsOffsetByIndex;
+    for (std::size_t j = 0; j < tdataLayout.itemIndices.size(); ++j) {
+        tlsOffsetByIndex.emplace(tdataLayout.itemIndices[j],
+                                 tdataLayout.itemOffsets[j]);
+    }
     ObjectFormatSectionInfo const* secRodata = nullptr;
     ObjectFormatSectionInfo const* secData   = nullptr;
     ObjectFormatSectionInfo const* secBss    = nullptr;
@@ -1129,6 +1236,7 @@ encodeExec(AssembledModule const&    module,
     std::optional<DataSectionLayout> rdata;
     std::optional<DataSectionLayout> data;
     std::optional<DataSectionLayout> bss;
+    std::optional<DataSectionLayout> tls;   // TLS C3 (.tls template + dir + index)
     std::uint32_t dataChainRva =
         static_cast<std::uint32_t>(secText.virtualAddress) + textVirtualSizeE;
     if (hasRdata) {
@@ -1154,6 +1262,52 @@ encodeExec(AssembledModule const&    module,
             alignUp(bssDataLayout.spanSize, sectionAlignE));
         bss = layout;
         dataChainRva += layout.virtualSize;
+    }
+    // ── D-CSUBSET-THREAD-LOCAL (TLS C3): the `.tls` section — laid out AFTER
+    // `.bss` in the VA chain. Its file bytes are
+    //   [ FULL per-thread block | pad→8 | IMAGE_TLS_DIRECTORY64 (40) |
+    //     _tls_index (4) ].
+    // ★ The template span [0, tlsBlockMemsz) covers the ENTIRE per-thread
+    // block — the initialized `tdata` bytes THEN the zero-init `tbss` region
+    // as literal ZERO bytes in the raw data — and SizeOfZeroFill is 0. This is
+    // deliberate (and what MSVC does): the Windows loader does NOT reliably
+    // zero the directory's SizeOfZeroFill region for the MAIN thread's static
+    // TLS (set up very early in process init), so a `static thread_local int
+    // c;` left to SizeOfZeroFill reads garbage — EMPIRICALLY CONFIRMED (embed
+    // → c reads 0; SizeOfZeroFill → c reads garbage). Embedding the whole
+    // block as raw template bytes makes the loader's template COPY zero it.
+    // (A future large zero-init TLS could re-introduce SizeOfZeroFill to avoid
+    // file bloat once a loader-honoring path is verified — deferral.) The 40-
+    // byte directory + 4-byte index sit PAST End so they are never per-thread-
+    // copied (a writable `.tls` is a valid home for the loader-read directory
+    // AND the loader-written index, and keeping all TLS structures here avoids
+    // entangling the delicate .rdata/.data span arithmetic). The 3 directory
+    // VA fields + any template pointer bytes get IMAGE_REL_BASED_DIR64 base-
+    // reloc sites (collected before the .reloc builder); AddressOfCallBacks=0
+    // gets NONE (a reloc on 0 → the loader adds the slide → a non-null garbage
+    // callback pointer).
+    std::vector<std::uint8_t> tlsBytes;
+    std::uint64_t const tlsDirOffset = alignUp(tlsBlockMemsz, 8);  // dir past block
+    std::uint64_t const tlsIndexOffset = tlsDirOffset + 40;     // dir is 40 B
+    std::uint64_t const tlsFileSize = tlsIndexOffset + 4;       // + 4-byte index
+    std::uint32_t tlsRva = 0;
+    if (hasTls) {
+        DataSectionLayout layout;
+        layout.rva = dataChainRva;
+        layout.virtualSize = static_cast<std::uint32_t>(
+            alignUp(tlsFileSize, sectionAlignE));
+        tls = layout;
+        tlsRva = layout.rva;
+        dataChainRva += layout.virtualSize;
+        // Build the section's file bytes: the tdata template bytes (mutable —
+        // a reloc-bearing `thread_local char*` item is patched in the data-
+        // item loop below), then ZERO-FILLED up to tlsFileSize — which zeroes
+        // the tbss region of the block [tdataSpan, tlsBlockMemsz), the pad to
+        // the 8-aligned directory offset, the 40-byte directory (VA fields
+        // patched once symbolVa is built), and the 4-byte index (stays 0 for
+        // the loader to fill).
+        tlsBytes = tdataLayout.bytes;
+        while (tlsBytes.size() < tlsFileSize) tlsBytes.push_back(0);
     }
     std::size_t const rdataSize = rdataDataLayout.spanSize;
     std::size_t const dataSize  = dataDataLayout.spanSize;
@@ -1491,6 +1645,105 @@ encodeExec(AssembledModule const&    module,
                symbolVa, "pe::encodeExec", reporter)) {
         return {};
     }
+    // ── D-CSUBSET-THREAD-LOCAL (TLS C3): register each thread-local item's
+    // POSITIVE section-relative TEMPLATE OFFSET (the `.tls` model — NOT the
+    // ELF negative Variant-II tpoff; mechanism 6) into `symbolVa`, and mint
+    // the `_tls_index` singleton the access sequence reads. The tdata call
+    // uses blockBase 0 (the template opens the block); the tbss call uses
+    // `tbssBlockBase` so both index ONE contiguous per-thread block.
+    std::unordered_set<SymbolId> tlsSymbols;
+    if (hasTdata
+        && !link::format::addTlsTemplateOffsets(
+               module.dataItems, tdataLayout, /*blockBaseOffset=*/0,
+               symbolVa, tlsSymbols, "pe::encodeExec", reporter)) {
+        return {};
+    }
+    if (hasTbss
+        && !link::format::addTlsTemplateOffsets(
+               module.dataItems, tbssLayout, tbssBlockBase,
+               symbolVa, tlsSymbols, "pe::encodeExec", reporter)) {
+        return {};
+    }
+    // The writer-minted `_tls_index` singleton: a RESERVED well-known
+    // SymbolId (a high sentinel dense ids never reach) the pe-indexed
+    // lowering's riprel read targets. Bind it to the 4-byte slot's VA (the
+    // slot lives at the tail of `.tls`). `.emplace` FAILS if a real symbol
+    // already holds the reserved id — the collision-safety assertion the
+    // sentinel design requires (a dense id equal to it would be a
+    // catastrophic overlap; the sentinel is chosen so this can never fire).
+    if (hasTls) {
+        SymbolId const reservedIdxId{kTlsIndexReservedSymbolIdValue};
+        std::uint64_t const idxSlotVa =
+            oh.imageBase + tlsRva + tlsIndexOffset;
+        if (!symbolVa.emplace(reservedIdxId, idxSlotVa).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"pe::encodeExec: the reserved _tls_index "
+                             "SymbolId #"}
+                 + std::to_string(kTlsIndexReservedSymbolIdValue)
+                 + " collides with a real module symbol — the high "
+                   "sentinel invariant (dense ids never reach it) was "
+                   "breached (D-CSUBSET-THREAD-LOCAL).");
+            return {};
+        }
+    }
+    // ── ★ D-CSUBSET-THREAD-LOCAL backstop (audit CRIT-2): `symbolVa` is now
+    // secrel-poisoned for `tlsSymbols` members (their entries are template
+    // OFFSETS, not VAs). Police EVERY reloc BEFORE any patch — the exact
+    // replica of the ELF walker's CRIT-1 backstop (the same silent-garbage
+    // class exists identically on PE). (a) NO data-item reloc may target a
+    // TLS symbol (a thread-local object has no link-time address — C11
+    // 6.6p9; the semantic tier already rejects `&tls` as 0xE048). (b) A
+    // function reloc's `tls` flag must AGREE with its target's storage class
+    // BOTH ways (a non-tls kind against a TLS symbol embeds the offset as an
+    // address; a tls kind against a non-TLS symbol embeds a VA as an offset).
+    // The `.tls` template + directory span VAs written DIRECTLY (below) are
+    // NOT tls-symbol relocs, so this backstop never false-rejects them.
+    if (!tlsSymbols.empty()) {
+        for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+            for (auto const& rel : module.dataItems[i].relocations) {
+                if (tlsSymbols.contains(rel.target)) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format(
+                             "pe::encodeExec: data item #{} (SymbolId={{ {} "
+                             "}}) carries a relocation targeting THREAD-LOCAL "
+                             "symbol #{} — the address of a thread-local "
+                             "object is not a link-time constant (C11 6.6p9; "
+                             "the semantic tier rejects this as 0xE048 "
+                             "S_ThreadLocalAddressNotConstant). Patching it "
+                             "would embed the section-relative template "
+                             "offset as a garbage pointer "
+                             "(D-CSUBSET-THREAD-LOCAL, CRIT-2).",
+                             i, module.dataItems[i].symbol.v, rel.target.v));
+                    return {};
+                }
+            }
+        }
+    }
+    for (auto const& fn : module.functions) {
+        for (auto const& rel : fn.relocations) {
+            auto const* tri = targetSchema.relocationInfo(rel.kind);
+            bool const relocIsTls  = tri != nullptr && tri->tls;
+            bool const targetIsTls = tlsSymbols.contains(rel.target);
+            if (relocIsTls != targetIsTls) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format(
+                         "pe::encodeExec: function SymbolId={{ {} }} "
+                         "relocation (kind {}{}) {} symbol #{} — a "
+                         "tls-flagged relocation carries a section-relative "
+                         "template OFFSET and a non-tls one an ADDRESS; "
+                         "mixing them embeds the wrong value class silently "
+                         "(D-CSUBSET-THREAD-LOCAL, CRIT-2).",
+                         fn.symbol.v, rel.kind.v,
+                         tri != nullptr ? std::format(" '{}'", tri->name)
+                                        : std::string{},
+                         targetIsTls
+                             ? "is not tls-flagged but targets THREAD-LOCAL"
+                             : "is tls-flagged but targets NON-thread-local",
+                         rel.target.v));
+                return {};
+            }
+        }
+    }
     // D-CSUBSET-COMPUTED-GOTO: synthetic per-block symbols get their
     // interior-block VAs before relocation resolution — sectionVa is the
     // SAME base (`imageBase + secText.virtualAddress`) used for the
@@ -1549,11 +1802,23 @@ encodeExec(AssembledModule const&    module,
             patchBuf    = &dataBytes;
             itemBaseOff = static_cast<std::size_t>(it->second);
             itemSecRva  = data->rva;
+        } else if (auto it = tlsOffsetByIndex.find(i);
+                   it != tlsOffsetByIndex.end()) {
+            // TLS C3 (D-CSUBSET-THREAD-LOCAL, seam-ii): a reloc-bearing `.tls`
+            // TEMPLATE item (`thread_local char *msg = "hi";`) — the C1
+            // shared-asm CRIT-2 fix keeps it in Tdata, so it rides THIS loop:
+            // its pointer bytes are patched to the target's VA (+ given a
+            // DIR64 base-reloc site below) so each per-thread copy holds the
+            // rebased pointer. The reloc targets a NON-tls symbol (the rodata
+            // string), so the backstop above did not reject it.
+            patchBuf    = &tlsBytes;
+            itemBaseOff = static_cast<std::size_t>(it->second);
+            itemSecRva  = tlsRva;
         } else {
             emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                  std::string{"pe::encodeExec: data-item SymbolId #"}
                  + std::to_string(di.symbol.v)
-                 + " carries relocations but is neither a .rdata nor .data item "
+                 + " carries relocations but is not a .rdata / .data / .tls item "
                    "(a .bss / zero-init item has no on-disk patch site).");
             return {};
         }
@@ -1622,6 +1887,53 @@ encodeExec(AssembledModule const&    module,
             baseRelocSiteRvas.push_back(
                 itemSecRva + static_cast<std::uint32_t>(patchOff));
         }
+    }
+
+    // ── D-CSUBSET-THREAD-LOCAL (TLS C3): patch the IMAGE_TLS_DIRECTORY64 (40
+    // bytes) at the tail of `.tls` + collect its base-reloc sites. The
+    // directory lives at [tlsDirOffset, +40) inside `tlsBytes`; the
+    // `_tls_index` slot at [tlsIndexOffset, +4) stays zero (the loader fills
+    // it). MUST run BEFORE the `.reloc` builder below consumes
+    // `baseRelocSiteRvas` (audit M-2).
+    //
+    // ★ Seam-(i): the 3 VA fields (Start/End/AddressOfIndex) are SECTION-SPAN
+    // / slot VAs written DIRECTLY here (imageBase + tlsRva + offset), pushed
+    // straight to `baseRelocSiteRvas` — they are NOT tls-symbol relocations,
+    // so the CRIT-2 backstop never false-rejects them. AddressOfCallBacks
+    // stays 0 and gets NO base-reloc entry (EXACTLY 3 DIR64 entries): a reloc
+    // on 0 → the loader adds the slide → a non-null garbage callback pointer.
+    if (hasTls) {
+        auto putTlsU64 = [&](std::size_t off, std::uint64_t v) {
+            for (int b = 0; b < 8; ++b)
+                tlsBytes[off + b] =
+                    static_cast<std::uint8_t>((v >> (b * 8)) & 0xFFu);
+        };
+        auto putTlsU32 = [&](std::size_t off, std::uint32_t v) {
+            for (int b = 0; b < 4; ++b)
+                tlsBytes[off + b] =
+                    static_cast<std::uint8_t>((v >> (b * 8)) & 0xFFu);
+        };
+        std::size_t const dirOff = static_cast<std::size_t>(tlsDirOffset);
+        std::uint64_t const startVa = oh.imageBase + tlsRva + 0u;
+        // End brackets the FULL per-thread block (tdata + embedded tbss zeros)
+        // — the loader copies [Start, End) into every thread; SizeOfZeroFill=0
+        // (the tbss zeros are IN the template, see the layout note above).
+        std::uint64_t const endVa   =
+            oh.imageBase + tlsRva + static_cast<std::uint32_t>(tlsBlockMemsz);
+        std::uint64_t const idxVa   =
+            oh.imageBase + tlsRva + static_cast<std::uint32_t>(tlsIndexOffset);
+        putTlsU64(dirOff +  0, startVa);                   // StartAddressOfRawData
+        putTlsU64(dirOff +  8, endVa);                     // EndAddressOfRawData
+        putTlsU64(dirOff + 16, idxVa);                     // AddressOfIndex
+        putTlsU64(dirOff + 24, 0);                         // AddressOfCallBacks = 0
+        putTlsU32(dirOff + 32, 0);                         // SizeOfZeroFill = 0
+        putTlsU32(dirOff + 36, 0);                         // Characteristics = 0
+        // The 3 VA-field SITE RVAs (Start/End/AddressOfIndex) — NOT callbacks.
+        std::uint32_t const dirRvaBase =
+            tlsRva + static_cast<std::uint32_t>(tlsDirOffset);
+        baseRelocSiteRvas.push_back(dirRvaBase +  0u);
+        baseRelocSiteRvas.push_back(dirRvaBase +  8u);
+        baseRelocSiteRvas.push_back(dirRvaBase + 16u);
     }
 
     // ── Build the .reloc (base relocation) section bytes ──────────
@@ -1781,6 +2093,27 @@ encodeExec(AssembledModule const&    module,
         bss->headerIndex = sectionHeaders.size();
         sectionHeaders.push_back(hBss);
     }
+    // .tls section header (D-CSUBSET-THREAD-LOCAL, TLS C3) — the thread-local
+    // template + IMAGE_TLS_DIRECTORY64 + `_tls_index`. File-backed, writable
+    // (Characteristics from the schema row = 0xC0000040 — the loader applies
+    // base relocations into the template + directory VA fields, requiring
+    // MEM_WRITE). virtualSize = the file bytes (template + dir + index); the
+    // per-thread zero-fill is NOT in this section (it rides the directory's
+    // SizeOfZeroFill, allocated per thread). Placed after .bss, before .xdata.
+    if (tls.has_value()) {
+        PeSectionHeader hTls{};
+        hTls.name                  = encodeSectionName(secTls->name, 0);
+        hTls.virtualSize           = static_cast<std::uint32_t>(tlsFileSize);
+        hTls.virtualAddress        = tls->rva;
+        // sizeOfRawData / pointerToRawData filled below (file-backed).
+        hTls.pointerToRelocations  = 0;
+        hTls.pointerToLinenumbers  = 0;
+        hTls.numberOfRelocations   = 0;
+        hTls.numberOfLinenumbers   = 0;
+        hTls.characteristics       = secTls->type;
+        tls->headerIndex = sectionHeaders.size();
+        sectionHeaders.push_back(hTls);
+    }
     // .xdata + .pdata section headers (D-WIN64-PDATA-XDATA-UNWIND) — read-only
     // initialized data (0x40000040, like .rdata), placed after .bss and before
     // .idata. sizeOfRawData / pointerToRawData filled below.
@@ -1903,6 +2236,17 @@ encodeExec(AssembledModule const&    module,
     }
     // .bss is NOBITS: sizeOfRawData / pointerToRawData stay 0 (set at header
     // construction); it consumes no file bytes, so `nextRawPointer` is unchanged.
+    // .tls (D-CSUBSET-THREAD-LOCAL, TLS C3): file-backed (template + directory
+    // + index), placed after .data/.bss in file order (matching its section-
+    // header order after .bss).
+    if (tls.has_value()) {
+        tls->rawSize = static_cast<std::uint32_t>(
+            alignUp(tlsFileSize, fileAlign));
+        tls->rawPointer = nextRawPointer;
+        sectionHeaders[tls->headerIndex].sizeOfRawData = tls->rawSize;
+        sectionHeaders[tls->headerIndex].pointerToRawData = tls->rawPointer;
+        nextRawPointer += tls->rawSize;
+    }
     if (xdata.has_value()) {
         xdata->rawSize = static_cast<std::uint32_t>(
             alignUp(xdataBytes.size(), fileAlign));
@@ -1956,6 +2300,9 @@ encodeExec(AssembledModule const&    module,
         // .bss contributes to the image's MEMORY extent (VirtualSize) even
         // though it has zero file footprint — the loader reserves it.
         lastSectionVaEnd = bss->rva + bss->virtualSize;
+    }
+    if (tls.has_value()) {   // TLS C3 — .tls RVA is after .bss in the chain
+        lastSectionVaEnd = tls->rva + tls->virtualSize;
     }
     if (xdata.has_value()) {
         lastSectionVaEnd = xdata->rva + xdata->virtualSize;
@@ -2027,6 +2374,7 @@ encodeExec(AssembledModule const&    module,
     std::uint32_t const sizeOfInitializedData =
         (rdata.has_value() ? rdata->rawSize : 0u)
         + (data.has_value() ? data->rawSize : 0u)
+        + (tls.has_value() ? tls->rawSize : 0u)   // TLS C3 — CNT_INITIALIZED_DATA
         + (idata.has_value() ? idata->rawSize : 0u)
         + (reloc.has_value() ? reloc->rawSize : 0u);
     std::uint32_t const sizeOfUninitializedData =
@@ -2116,6 +2464,14 @@ encodeExec(AssembledModule const&    module,
             static_cast<std::uint64_t>(data->rawPointer)
             + data->rawSize;
     }
+    // .tls (TLS C3) is file-backed, after .data in file order. (When TLS is
+    // present so is .reloc — the directory VA base-relocs — which lands last
+    // and overwrites this; kept for completeness / a future no-reloc TLS case.)
+    if (tls.has_value()) {
+        sectionsEndFileOff =
+            static_cast<std::uint64_t>(tls->rawPointer)
+            + tls->rawSize;
+    }
     if (idata.has_value()) {
         sectionsEndFileOff =
             static_cast<std::uint64_t>(idata->rawPointer)
@@ -2162,6 +2518,16 @@ encodeExec(AssembledModule const&    module,
     std::uint32_t const pdataDirRva  = pdata.has_value() ? pdata->rva : 0u;
     std::uint32_t const pdataDirSize =
         pdata.has_value() ? static_cast<std::uint32_t>(pdataBytes.size()) : 0u;
+    // IMAGE_DIRECTORY_ENTRY_TLS (index 9, D-CSUBSET-THREAD-LOCAL TLS C3): RVA +
+    // byte size (40 = the IMAGE_TLS_DIRECTORY64) of the TLS directory the
+    // loader reads to set up each thread's block. The directory lives at the
+    // tail of `.tls` (tlsRva + tlsDirOffset). A no-TLS image leaves this entry
+    // zero (byte-identical to a pre-C3 image).
+    std::uint32_t const tlsDirRva =
+        tls.has_value()
+            ? tlsRva + static_cast<std::uint32_t>(tlsDirOffset)
+            : 0u;
+    std::uint32_t const tlsDirSize = tls.has_value() ? 40u : 0u;
     for (std::size_t i = 0; i < kNumberOfRvaAndSizes; ++i) {
         if (i == 1u) {
             appendU32LE(bytes, importDirRva);
@@ -2177,6 +2543,10 @@ encodeExec(AssembledModule const&    module,
             // IMAGE_DIRECTORY_ENTRY_BASERELOC.
             appendU32LE(bytes, baseRelocDirRva);
             appendU32LE(bytes, baseRelocDirSize);
+        } else if (i == 9u) {
+            // IMAGE_DIRECTORY_ENTRY_TLS.
+            appendU32LE(bytes, tlsDirRva);
+            appendU32LE(bytes, tlsDirSize);
         } else if (i == 12u) {
             appendU32LE(bytes, iatDirRva);
             appendU32LE(bytes, iatDirSize);
@@ -2222,6 +2592,18 @@ encodeExec(AssembledModule const&    module,
         while (bytes.size()
                 < static_cast<std::size_t>(data->rawPointer)
                     + data->rawSize) {
+            bytes.push_back(0);
+        }
+    }
+
+    // .tls body (D-CSUBSET-THREAD-LOCAL, TLS C3) — the thread-local template +
+    // patched IMAGE_TLS_DIRECTORY64 + zero `_tls_index` slot, file-aligned.
+    // Emitted after .data/.bss and before .xdata (matching its file-pointer
+    // order); the preceding section padded bytes.size() up to tls->rawPointer.
+    if (tls.has_value()) {
+        bytes.insert(bytes.end(), tlsBytes.begin(), tlsBytes.end());
+        while (bytes.size()
+                < static_cast<std::size_t>(tls->rawPointer) + tls->rawSize) {
             bytes.push_back(0);
         }
     }

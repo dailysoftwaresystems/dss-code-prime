@@ -137,6 +137,23 @@ struct DSS_EXPORT PreprocessConfig {
     // non-empty when the block is present.
     std::string definedOperator;   // "defined"
 
+    // C23 (D-PP-ELIFDEF-ELIFNDEF; C 6.10.1): the `#elifdef` / `#elifndef`
+    // directive WORDS. `#elifdef X` is exactly `#elif defined(X)` and
+    // `#elifndef X` is exactly `#elif !defined(X)` (C 6.10.1p5), so the engine
+    // routes them through the SAME conditional-group state machine as
+    // `#elif`, evaluating the operand with the DIRECT `#ifdef`-style definedness
+    // lookup (never the `#if` expression evaluator -- the operand is a bare
+    // macro name, NOT expanded). Matched by lexeme TEXT against the token after
+    // `#`, exactly like the required conditional words (which lex as plain
+    // Identifier). OPTIONAL -- empty means the language declares NO C23
+    // elifdef/elifndef form, so such a directive falls through to the generic
+    // unsupported-directive fail-loud (never a silent branch skip). A language
+    // that predates C23 (or a stripped config) leaves both empty and every
+    // consumer site is provably, uniformly inert (mirrors the `pragmaDirective`
+    // opt-in). The engine matches THESE strings, never a hard-coded spelling.
+    std::string elifdefDirective;  // "elifdef"
+    std::string elifndefDirective; // "elifndef"
+
     // The token kind that opens a QUOTE include target (`#include "h"` ->
     // "StringStart"). Resolved relative to the including file's directory +
     // include dirs; the PP splices the (recursively preprocessed) header

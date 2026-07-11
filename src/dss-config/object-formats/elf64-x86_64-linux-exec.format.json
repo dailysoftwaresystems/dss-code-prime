@@ -22,8 +22,15 @@
   "$dataImportBindingComment": "c84 (D-LK-EXTERN-DATA-IMPORT): extern library DATA objects (libc stdout/stderr/stdin) bind via ELF COPY RELOCATIONS — the standard glibc non-PIE ET_EXEC mechanism: the exec reserves a correctly-sized+aligned .bss slot per imported object, exports the symbol as a DEFINED OBJECT (st_size = the layout-derived object size) at that slot, and emits one R_X86_64_COPY (5) in .rela.dyn; ld-linux memcpy's the library's object into the slot before entry and ALL images (incl. libc itself, by interposition) reference the exec's copy. Zero new instruction encodings — module code reaches the object through the normal GlobalAddr path. A format WITHOUT this field rejects data imports loud at the linker's pre-walker gate (a data symbol bound through the function-import machinery would read jump-stub bytes as the object's value). The PIE-forward GOT-indirect model is a future member.",
   "dataImportBinding": "copy-relocation",
 
-  "$supportedDataSectionsComment": "D-LK1-ELF-EXEC-DATA-SECTIONS (rodata) + D-LK4-DATA-PRODUCER (writable `.data` + zero-fill `.bss`): the ELF ET_EXEC walker emits `.rodata` (read-only, R+X PT_LOAD), `.data` (mutable initialized globals, R+W PT_LOAD), and `.bss` (zero-init globals, R+W PT_LOAD, NOBITS) from `AssembledModule.dataItems` per the item's `section`. The linker's pre-walker gate (linker.cpp) consults this set per-item. Cross-format agnosticism: this is the SAME field PE/Mach-O exec formats declare; the gate has zero format-name branches.",
-  "supportedDataSections": ["rodata", "data", "bss"],
+  "$supportedDataSectionsComment": "D-LK1-ELF-EXEC-DATA-SECTIONS (rodata) + D-LK4-DATA-PRODUCER (writable `.data` + zero-fill `.bss`) + D-CSUBSET-THREAD-LOCAL (thread-local `.tdata`/`.tbss`, TLS C1): the ELF ET_EXEC walker emits `.rodata` (read-only, R+X PT_LOAD), `.data` (mutable initialized globals, R+W PT_LOAD), `.bss` (zero-init globals, R+W PT_LOAD, NOBITS), `.tdata` (initialized thread-local template, opens the R+W PT_LOAD, covered by PT_TLS), and `.tbss` (zero-fill thread-local extent, NOBITS, PT_TLS memsz only — NO file/segment footprint) from `AssembledModule.dataItems` per the item's `section`. The linker's pre-walker gate (linker.cpp) consults this set per-item. Cross-format agnosticism: this is the SAME field PE/Mach-O exec formats declare; the gate has zero format-name branches. tdata/tbss here is THE x86_64-linux opt-in — arm64-linux opts in at TLS C2, pe64 at C3, Mach-O at C4; until then their walkers ALSO carry a K_FormatLacksThreadLocalSupport belt.",
+  "supportedDataSections": ["rodata", "data", "bss", "tdata", "tbss"],
+
+  "$tlsAccessComment": "TLS C1 (D-CSUBSET-THREAD-LOCAL): how code reaches a thread-local object's per-thread copy on this leg. local-exec = the ELF static-TLS model for a non-PIE executable: glibc's ld.so processes PT_TLS for every thread (the CSU runs before main on this ALWAYS-dynamic arm), sets fs.base, and stores the thread pointer's own address at fs:[0] (the tcbhead self-pointer) — so `mov r, fs:[0]` (segmentPrefixByte 100 = 0x64 fs-override, baseDisplacement 0) reads tp, and a symbol's address is tp + tpoff(sym) with tpoff a LINK-TIME constant (the tls-tpoff32 reloc; x86_64 Variant II ⇒ negative). MIR→LIR reads this block to emit the tlsbase + lea pair; a format WITHOUT the block fails loud K_FormatLacksThreadLocalSupport on the first thread-local access (pe64/macho omit it until their TLS cycles). PE later declares the SAME x86 primitive with config-only differences: model pe-indexed, 101 = 0x65 gs, baseDisplacement 0x58 (the TEB ThreadLocalStoragePointer).",
+  "tlsAccess": {
+    "model": "local-exec",
+    "segmentPrefixByte": 100,
+    "baseDisplacement": 0
+  },
   "$artifactProfilesComment": "Profiles this format SERVES (plan 06 AP3) — a runnable console executable ⇒ cli. The format-side twin of the language's artifactProfiles[] (AP1): the driver fails loud (D_ArtifactProfileFormatMismatch) if a project's profile isn't in this set. A future shared-library format would declare [\"lib\"] with ZERO gate-code change — the gate is a generic set-membership, never a format-name branch.",
   "artifactProfiles": ["cli"],
 
@@ -100,6 +107,26 @@
       "virtualAddress": 0
     },
     {
+      "$comment": "Initialized THREAD-LOCAL template data (`thread_local int g = 7;` — D-CSUBSET-THREAD-LOCAL, TLS C1). sh_type=SHT_PROGBITS(1); sh_flags=SHF_WRITE|SHF_ALLOC|SHF_TLS(0x403=1027) — the TLS bit is what tells inspectors (readelf/lldb) these bytes are a per-thread TEMPLATE, not process data. The walker places it as the FIRST file-backed member of the R+W PT_LOAD #2 and points PT_TLS at it (p_offset/p_vaddr=here, p_filesz=this section, p_memsz=+tbss); glibc's ld.so copies the template into every thread's static TLS block (main thread included — the CSU runs before main on the always-dynamic ELF arm). sh_addralign floor 1 — MEMBER-DRIVEN (the walker raises to the strictest member alignment, which also becomes PT_TLS p_align). Deliberately NOT the .data-style floor 8: PT_TLS p_align feeds the tpoff formulas (tpoff = offset - alignUp(memsz, p_align) on Variant II) and glibc's per-thread block placement, so a gratuitous floor would inflate every thread's block + diverge from the gcc-witnessed offsets (gcc: thread_local int -> sh_addralign 4, p_align 4). virtualAddress=0 — computed.",
+      "kind": "tdata",
+      "name": ".tdata",
+      "type": 1,
+      "flags": 1027,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Zero-fill THREAD-LOCAL template extent (`thread_local int g;` — D-CSUBSET-THREAD-LOCAL, TLS C1). sh_type=SHT_NOBITS(8); sh_flags=SHF_WRITE|SHF_ALLOC|SHF_TLS(0x403=1027). Unlike `.bss` it occupies NO file bytes AND NO PT_LOAD memory — its span lives ONLY in PT_TLS p_memsz (the loader allocates + zeroes it per thread); sh_addr/sh_offset are the nominal just-past-.tdata values (the gcc overlap convention for NOBITS TLS). sh_addralign floor 1 — member-driven, same rationale as .tdata. virtualAddress=0 — computed.",
+      "kind": "tbss",
+      "name": ".tbss",
+      "type": 8,
+      "flags": 1027,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
       "$comment": "Symbol table — even in ET_EXEC files, .symtab is conventional for debugger support. sh_type = SHT_SYMTAB (2); sh_addralign = 8; sh_entsize = 24 (Elf64_Sym).",
       "kind": "symtab",
       "name": ".symtab",
@@ -147,6 +174,12 @@
       "name": "R_X86_64_32",
       "kind": 3,
       "nativeId": 10
+    },
+    {
+      "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C1): the local-exec thread-pointer-offset fixup — the disp32 of `lea r, [tp + tpoff32(sym)]`. kind=4 matches the target schema's `tls-tpoff32` row (Linear, width 4, absolute, tls:true); the walker patches the 4 bytes from its tpoff-valued symbolVa entry, so the exec image carries NO runtime reloc for it (link-time constant). nativeId = R_X86_64_TPOFF32 (23) — only meaningful for a future ET_REL emission of this kind, but the row's existence is what satisfies the linker's pre-walker cross-reference unifier + the walker's in-arm kind check.",
+      "name": "R_X86_64_TPOFF32",
+      "kind": 4,
+      "nativeId": 23
     }
   ]
 }

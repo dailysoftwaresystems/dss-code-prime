@@ -62,6 +62,17 @@ enum class TypeKind : std::uint16_t {
     // and cached/round-tripped TypeIds; renumbering would silently shift them.
     VolatileQual,
 
+    // ── C23 nullptr_t (D-CSUBSET-NULLPTR / C23 §6.2.5, §6.4.4.6) ──
+    // The type of the predefined constant `nullptr`. A SEMANTIC-TIER-ONLY kind: it
+    // exists so the conversion rules can be ONE-WAY (nullptr_t → any pointer / bool,
+    // but nothing converts TO nullptr_t) and so `_Generic(nullptr, ...)` sees a
+    // distinct type — but the `nullptr` literal LOWERS to the target-agnostic null
+    // constant at the HIR tier (exactly like an integer-0 null pointer constant), so
+    // NullptrT NEVER reaches MIR (the `I_NullptrTypeInMir` verifier tripwire enforces
+    // the invariant). Appended AFTER VolatileQual (before Count_) so every
+    // pre-existing kind keeps its integer value — see the VolatileQual note above.
+    NullptrT,
+
     Count_  // keep last — counts the core members
 };
 

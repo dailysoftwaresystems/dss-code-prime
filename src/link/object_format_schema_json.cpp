@@ -195,6 +195,12 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // model (copy relocations) is likewise an ELF/PE/Mach-O
             // dynamic-import notion — dead data on WASM/SPIR-V.
             "dataImportBinding",
+            // D-CSUBSET-THREAD-LOCAL (TLS C1): the thread-local access
+            // model (segment-register / TEB / TLV descriptor) is an
+            // ELF/PE/Mach-O native-image notion — dead data on
+            // WASM/SPIR-V (their thread-local story is format-native
+            // vocabulary when it lands).
+            "tlsAccess",
         };
         for (auto const* field : universalFields) {
             if (doc.contains(field)) {
@@ -389,6 +395,130 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             } else {
                 data.dataImportBinding = *b;
             }
+        }
+    }
+
+    // D-CSUBSET-THREAD-LOCAL (TLS C1): `tlsAccess` block — the format's
+    // thread-local access model + the x86 access-sequence values.
+    // Optional in the JSON (a format whose TLS machinery has not landed
+    // — PE / Mach-O / every relocatable flavor — omits it; MIR→LIR then
+    // fails loud K_FormatLacksThreadLocalSupport on the first
+    // thread-local access instead of silently lowering a process-shared
+    // alias). A PRESENT block is strict — closed verb set + range
+    // checks; a typo must NOT silently degrade to "no TLS support" (the
+    // externCallDispatch discipline).
+    if (doc.contains("tlsAccess")) {
+        auto const& ta = doc.at("tlsAccess");
+        if (!ta.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/tlsAccess",
+                      "'tlsAccess' must be an object { \"model\": "
+                      "\"local-exec\"|\"pe-indexed\"|\"macho-tlv\", "
+                      "\"segmentPrefixByte\": N, \"baseDisplacement\": N }");
+        } else {
+            TlsAccessInfo info{};
+            bool ok = true;
+            if (!ta.contains("model") || !ta.at("model").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField, "/tlsAccess/model",
+                          "'tlsAccess.model' is required and must be a "
+                          "string — accepted: \"local-exec\" (ELF static "
+                          "TLS), \"pe-indexed\" (PE TEB slot array), "
+                          "\"macho-tlv\" (Mach-O TLV descriptor)");
+                ok = false;
+            } else {
+                auto const s = ta.at("model").get<std::string>();
+                auto const m = tlsAccessModelFromName(s);
+                if (!m.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/tlsAccess/model",
+                              std::format("unknown tlsAccess model '{}' — "
+                                          "accepted: \"local-exec\", "
+                                          "\"pe-indexed\", \"macho-tlv\"",
+                                          s));
+                    ok = false;
+                } else {
+                    info.model = *m;
+                }
+            }
+            if (ta.contains("segmentPrefixByte")) {
+                if (!ta.at("segmentPrefixByte").is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/tlsAccess/segmentPrefixByte",
+                              "'segmentPrefixByte' must be an integer in "
+                              "[0, 255]");
+                    ok = false;
+                } else {
+                    std::int64_t const b =
+                        ta.at("segmentPrefixByte").get<std::int64_t>();
+                    if (b < 0 || b > 255) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/tlsAccess/segmentPrefixByte",
+                                  std::format("'segmentPrefixByte' ({}) out "
+                                              "of range [0, 255]", b));
+                        ok = false;
+                    } else {
+                        info.segmentPrefixByte = static_cast<std::uint8_t>(b);
+                    }
+                }
+            }
+            if (ta.contains("baseDisplacement")) {
+                if (!ta.at("baseDisplacement").is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/tlsAccess/baseDisplacement",
+                              "'baseDisplacement' must be a non-negative "
+                              "integer (the tp slot's disp32)");
+                    ok = false;
+                } else {
+                    std::int64_t const d =
+                        ta.at("baseDisplacement").get<std::int64_t>();
+                    // The value rides an x86 SIGNED disp32 at encode time;
+                    // cap at INT32_MAX so the u32→i32 handoff can never
+                    // flip sign silently.
+                    if (d < 0 || d > 0x7FFFFFFFLL) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/tlsAccess/baseDisplacement",
+                                  std::format("'baseDisplacement' ({}) out "
+                                              "of range [0, 2^31-1] (it is "
+                                              "emitted as a signed disp32)",
+                                              d));
+                        ok = false;
+                    } else {
+                        info.baseDisplacement = static_cast<std::uint32_t>(d);
+                    }
+                }
+            }
+            // TLS C3 (D-CSUBSET-THREAD-LOCAL): the `_tls_index` slot NAME —
+            // the writer-minted module-TLS-index singleton the `pe-indexed`
+            // access sequence's riprel read targets. A string when present;
+            // REQUIRED (non-empty) for the pe-indexed model below so a
+            // pe-indexed format can never silently ship WITHOUT the slot its
+            // access sequence indexes (the same closed-verb strictness the
+            // model/segment/displacement fields hold). Ignored for
+            // local-exec / macho-tlv (their tp reads index no module array).
+            if (ta.contains("tlsIndexSlotName")) {
+                if (!ta.at("tlsIndexSlotName").is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/tlsAccess/tlsIndexSlotName",
+                              "'tlsIndexSlotName' must be a string (the name "
+                              "of the module TLS-index slot the pe-indexed "
+                              "access sequence reads)");
+                    ok = false;
+                } else {
+                    info.tlsIndexSlotName =
+                        ta.at("tlsIndexSlotName").get<std::string>();
+                }
+            }
+            if (ok && info.model == TlsAccessModel::PeIndexed
+                && info.tlsIndexSlotName.empty()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/tlsAccess/tlsIndexSlotName",
+                          "'tlsIndexSlotName' is REQUIRED for the "
+                          "'pe-indexed' TLS model — its access sequence "
+                          "reads a named module TLS-index singleton "
+                          "(`mov ecx, [_tls_index]`); a pe-indexed block "
+                          "without it cannot lower a thread-local access");
+                ok = false;
+            }
+            if (ok) data.tlsAccess = info;
         }
     }
 
@@ -629,7 +759,8 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
 
     // D-LK2-RODATA closure — `supportedDataSections`. Optional
     // top-level array of `DataSectionKind` names ("rodata" / "data" /
-    // "bss") the format's walker accepts on `AssembledModule.
+    // "bss" / "tdata" / "tbss" — the last two per D-CSUBSET-THREAD-
+    // LOCAL) the format's walker accepts on `AssembledModule.
     // dataItems`. Absent / empty = walker rejects all producer-data-
     // section items (the format-side validate() rule below also
     // gates this on isImageFlavor — relocatable .obj cannot declare
@@ -644,7 +775,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                       "/supportedDataSections",
                       "'supportedDataSections' must be an array of "
                       "DataSectionKind names (\"rodata\" / \"data\" / "
-                      "\"bss\")");
+                      "\"bss\" / \"tdata\" / \"tbss\")");
         } else {
             auto const& arr = doc.at("supportedDataSections");
             std::size_t i = 0;
@@ -661,7 +792,8 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                         coll.emit(DiagnosticCode::C_MalformedJson, path,
                                   std::format("unknown DataSectionKind "
                                               "'{}' (expected 'rodata' "
-                                              "/ 'data' / 'bss')",
+                                              "/ 'data' / 'bss' / "
+                                              "'tdata' / 'tbss')",
                                               name));
                     } else {
                         bool dup = false;

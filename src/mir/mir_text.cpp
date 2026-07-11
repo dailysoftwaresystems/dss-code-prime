@@ -1093,6 +1093,13 @@ private:
         return lv;
     }
 
+    // NOTE the `.dssmir` text format does not carry the per-global FLAG CLASS
+    // — binding/visibility, isConst, isThreadLocal (TLS C1), alignment — so a
+    // text round-trip re-mints every global with the defaults (Global/Default,
+    // mutable, process-shared, natural alignment). Precedent-consistent: the
+    // format is a test/debug surface for CFG + literal shapes, never a
+    // codegen input; a future flag-preserving text syntax would extend the
+    // grammar here AND the printer symmetrically.
     void parseGlobal() {
         std::uint32_t const sym = parsePercentValue();
         if (!expect(TokKind::Colon)) return;
@@ -1101,7 +1108,9 @@ private:
         Tok pk = lex_.peek();
         if (pk.kind == TokKind::Ident && pk.text == "zero") {
             lex_.take();
-            builder_.addGlobal(ty, SymbolId{sym});
+            builder_.addGlobal(ty, SymbolId{sym}, UINT32_MAX, MirFuncId{},
+                               SymbolBinding::Global, SymbolVisibility::Default,
+                               /*isConst=*/false, MirThreadStorage::Shared);
         } else if (pk.kind == TokKind::Ident && pk.text == "initfunc") {
             lex_.take();
             std::uint32_t const fnSlot = parsePercentValue();
@@ -1110,14 +1119,19 @@ private:
             // appear later in the text.
             auto it = funcMap_.find(fnSlot);
             if (it != funcMap_.end()) {
-                builder_.addGlobal(ty, SymbolId{sym}, UINT32_MAX, it->second);
+                builder_.addGlobal(ty, SymbolId{sym}, UINT32_MAX, it->second,
+                                   SymbolBinding::Global,
+                                   SymbolVisibility::Default,
+                                   /*isConst=*/false, MirThreadStorage::Shared);
             } else {
                 pendingInitFuncGlobals_.push_back({ty, SymbolId{sym}, fnSlot});
             }
         } else {
             MirLiteralValue lv = parseLiteral();
             std::uint32_t const litIdx = builder_.literalPoolAdd(std::move(lv));
-            builder_.addGlobal(ty, SymbolId{sym}, litIdx);
+            builder_.addGlobal(ty, SymbolId{sym}, litIdx, MirFuncId{},
+                               SymbolBinding::Global, SymbolVisibility::Default,
+                               /*isConst=*/false, MirThreadStorage::Shared);
         }
     }
 
@@ -1505,7 +1519,9 @@ private:
                     pg.sym.v, pg.initFuncSlot));
                 continue;
             }
-            builder_.addGlobal(pg.ty, pg.sym, UINT32_MAX, it->second);
+            builder_.addGlobal(pg.ty, pg.sym, UINT32_MAX, it->second,
+                               SymbolBinding::Global, SymbolVisibility::Default,
+                               /*isConst=*/false, MirThreadStorage::Shared);
         }
         // Resolve phi incomings now that all blocks + values are known.
         for (auto& pp : pendingPhis_) {

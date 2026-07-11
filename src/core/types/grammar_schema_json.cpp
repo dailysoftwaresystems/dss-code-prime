@@ -77,6 +77,7 @@ std::optional<TypeKind> coreTypeFromName(std::string_view name) {
     if (name == "Char")    return TypeKind::Char;
     if (name == "Byte")    return TypeKind::Byte;
     if (name == "Void")    return TypeKind::Void;
+    if (name == "NullptrT") return TypeKind::NullptrT;  // C23 nullptr_t (D-CSUBSET-NULLPTR)
     return std::nullopt;
 }
 
@@ -846,6 +847,56 @@ struct PositionBuilder {
         return static_cast<std::uint32_t>(positions.size() - 1);
     }
 
+    // Read the `speculative` / `lookahead` metadata off a shape body and
+    // stamp it onto an already-emplaced AltChoice at `posId`. Shared by the
+    // `"alt"` and `"optional"` builders so a `{"optional": X, "speculative":
+    // true}` clause gets the SAME backtracking semantics as a speculative
+    // alt (D-PARSE-SPECULATIVE-OPTIONAL). A body WITHOUT the `speculative`
+    // key leaves the position BYTE-IDENTICAL — the bit is set only when the
+    // key is present and true, so plain optionals/alts are unaffected.
+    void applySpeculativeFlags(json const& body, std::uint32_t posId) {
+        constexpr std::uint16_t kDefaultLookahead = 8;
+        bool speculative = false;
+        std::uint16_t lookahead = kDefaultLookahead;
+        if (body.contains("speculative")) {
+            json const& sv = body.at("speculative");
+            if (!sv.is_boolean()) {
+                coll.emit(DiagnosticCode::C_ConflictingField,
+                          std::format("{}/speculative", shapePath),
+                          "'speculative' must be a boolean");
+            } else {
+                speculative = sv.get<bool>();
+            }
+        }
+        if (body.contains("lookahead")) {
+            json const& lv = body.at("lookahead");
+            if (!lv.is_number_integer()) {
+                coll.emit(DiagnosticCode::C_ConflictingField,
+                          std::format("{}/lookahead", shapePath),
+                          "'lookahead' must be a positive integer");
+            } else {
+                const auto raw = lv.get<std::int64_t>();
+                if (raw <= 0 ||
+                    raw > std::numeric_limits<std::uint16_t>::max()) {
+                    coll.emit(DiagnosticCode::C_ConflictingField,
+                              std::format("{}/lookahead", shapePath),
+                              std::format("'lookahead' value {} is out of "
+                                          "range (must be 1..{})",
+                                          raw, std::numeric_limits<std::uint16_t>::max()));
+                } else {
+                    lookahead = static_cast<std::uint16_t>(raw);
+                }
+            }
+            if (!speculative) {
+                coll.emit(DiagnosticCode::C_RedundantField,
+                          std::format("{}/lookahead", shapePath),
+                          "'lookahead' has no effect without 'speculative: true'",
+                          DiagnosticSeverity::Warning);
+            }
+        }
+        if (speculative) positions[posId].setSpeculative(true, lookahead);
+    }
+
     // `cont` is the position-id the built body falls through to when it
     // completes. Threaded right-to-left through sequence children so each
     // child's `nextPos` points at its actual successor.
@@ -883,46 +934,7 @@ struct PositionBuilder {
             const auto id = emplace(detail::Position::makeAltChoice(
                 std::move(branches), std::move(ex)));
             // Speculative-alt metadata stored for the parser to consume.
-            constexpr std::uint16_t kDefaultLookahead = 8;
-            bool speculative = false;
-            std::uint16_t lookahead = kDefaultLookahead;
-            if (body.contains("speculative")) {
-                json const& sv = body.at("speculative");
-                if (!sv.is_boolean()) {
-                    coll.emit(DiagnosticCode::C_ConflictingField,
-                              std::format("{}/speculative", shapePath),
-                              "'speculative' must be a boolean");
-                } else {
-                    speculative = sv.get<bool>();
-                }
-            }
-            if (body.contains("lookahead")) {
-                json const& lv = body.at("lookahead");
-                if (!lv.is_number_integer()) {
-                    coll.emit(DiagnosticCode::C_ConflictingField,
-                              std::format("{}/lookahead", shapePath),
-                              "'lookahead' must be a positive integer");
-                } else {
-                    const auto raw = lv.get<std::int64_t>();
-                    if (raw <= 0 ||
-                        raw > std::numeric_limits<std::uint16_t>::max()) {
-                        coll.emit(DiagnosticCode::C_ConflictingField,
-                                  std::format("{}/lookahead", shapePath),
-                                  std::format("'lookahead' value {} is out of "
-                                              "range (must be 1..{})",
-                                              raw, std::numeric_limits<std::uint16_t>::max()));
-                    } else {
-                        lookahead = static_cast<std::uint16_t>(raw);
-                    }
-                }
-                if (!speculative) {
-                    coll.emit(DiagnosticCode::C_RedundantField,
-                              std::format("{}/lookahead", shapePath),
-                              "'lookahead' has no effect without 'speculative: true'",
-                              DiagnosticSeverity::Warning);
-                }
-            }
-            if (speculative) positions[id].setSpeculative(true, lookahead);
+            applySpeculativeFlags(body, id);
             return id;
         }
         if (body.contains("optional")) {
@@ -930,7 +942,18 @@ struct PositionBuilder {
             std::vector<SchemaTokenId> ex;
             mergeSorted(ex, positions[innerStart].expectedSet());
             mergeSorted(ex, positions[cont].expectedSet());
-            return emplace(detail::Position::makeAltChoice({innerStart, cont}, std::move(ex)));
+            const auto id = emplace(detail::Position::makeAltChoice(
+                {innerStart, cont}, std::move(ex)));
+            // D-PARSE-SPECULATIVE-OPTIONAL: the second branch (`cont`) is the
+            // skip/continuation, not one of the optional's own alternatives.
+            // Mark it so a SPECULATIVE optional excludes it from candidate
+            // enumeration (collectAltBranchRules). Inert for a plain optional
+            // (the marker is read only under `speculative()`).
+            positions[id].setSkipBranch(cont);
+            // Honor `speculative`/`lookahead` on the optional sugar so
+            // `{"optional": X, "speculative": true}` backtracks like an alt.
+            applySpeculativeFlags(body, id);
+            return id;
         }
         if (body.contains("repeat")) {
             // Tie-the-knot: reserve a slot for the loop entry first, build
@@ -4115,6 +4138,15 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // absent).
             readOptWord("hasIncludeOperator",    cfg.hasIncludeOperator);
             readOptWord("hasCAttributeOperator", cfg.hasCAttributeOperator);
+            // C23 (D-PP-ELIFDEF-ELIFNDEF; C 6.10.1): the `#elifdef` / `#elifndef`
+            // directive WORDS. OPTIONAL (matched by lexeme TEXT, like the
+            // required conditional words) -- absent leaves both empty so the
+            // directive falls through to the unsupported-directive fail-loud
+            // (never a silent branch skip). `#elifdef X` == `#elif defined(X)`;
+            // `#elifndef X` == `#elif !defined(X)` -- routed through the SAME
+            // conditional-group state machine with the direct definedness path.
+            readOptWord("elifdefDirective",       cfg.elifdefDirective);
+            readOptWord("elifndefDirective",      cfg.elifndefDirective);
             // FC15c (make-or-break agnosticism): the angle-delimiter token KINDS
             // for `__has_include(<h>)`. OPTIONAL token-name fields (validated like
             // `stringizeToken`). The make-or-break SELF-CONSISTENCY rule: a
@@ -4671,6 +4703,58 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         readIndex("declaratorList", rule.declaratorListChild);
                         readIndex("declarator",     rule.declaratorChild);
 
+                        // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): the
+                        // initializer-inference opt-in. A boolean; when true
+                        // the declarator-mode consistency check below WAIVES
+                        // the `head` requirement (the type derives from the
+                        // sole declarator's initializer at Pass 1.5) and
+                        // REJECTS a co-present `head` (C_ConflictingField —
+                        // two competing type sources).
+                        if (entry.contains("inferTypeFromInitializer")) {
+                            json const& iv = entry.at("inferTypeFromInitializer");
+                            if (!iv.is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/inferTypeFromInitializer",
+                                          "'inferTypeFromInitializer' must be "
+                                          "a boolean");
+                            } else {
+                                rule.inferTypeFromInitializer = iv.get<bool>();
+                            }
+                        }
+
+                        // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): the
+                        // inference-marker presence gate — a token kind that
+                        // must appear in the declaration's specifier prefix
+                        // (C23 6.7.9p1's `auto`). The constMarker idiom:
+                        // loader-resolved from a token-kind NAME so the
+                        // engine never names a keyword. A bad token name is
+                        // C_UnknownToken and the ROW IS DROPPED (unlike the
+                        // marker fields, a missing gate would silently accept
+                        // C89 implicit-int shapes — fail loud at load).
+                        if (entry.contains("requiredSpecifierToken")) {
+                            if (!entry.at("requiredSpecifierToken").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/requiredSpecifierToken",
+                                          "'requiredSpecifierToken' must be a "
+                                          "token-kind name string");
+                                continue;
+                            }
+                            auto const rs = entry.at("requiredSpecifierToken")
+                                                .get<std::string>();
+                            if (!data.schemaTokens->contains(rs)) {
+                                coll.emit(DiagnosticCode::C_UnknownToken,
+                                          path + "/requiredSpecifierToken",
+                                          std::format(
+                                              "'declarations[{}]."
+                                              "requiredSpecifierToken' "
+                                              "references unknown token kind "
+                                              "'{}'", i, rs));
+                                continue;
+                            }
+                            rule.requiredSpecifierToken =
+                                data.schemaTokens->find(rs);
+                        }
+
                         // SE4: optional const-marker token. A bad token
                         // name is C_UnknownToken; the symbol is still
                         // minted (just never marked const).
@@ -4879,12 +4963,31 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                             eff.at("staticStorage").get<bool>();
                                         if (effect.staticStorage) any = true;
                                     }
+                                    // TLS C1 (D-CSUBSET-THREAD-LOCAL): the THREAD
+                                    // storage-duration axis — `_Thread_local` /
+                                    // `thread_local` marks each declared symbol
+                                    // isThreadLocal (Pass-1 specifier scan) without
+                                    // touching binding/visibility/staticStorage.
+                                    // Optional bool, the staticStorage mirror.
+                                    if (eff.contains("threadStorage")) {
+                                        if (!eff.at("threadStorage").is_boolean()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      effPath,
+                                                      "'threadStorage' must be a "
+                                                      "boolean");
+                                            continue;
+                                        }
+                                        effect.threadStorage =
+                                            eff.at("threadStorage").get<bool>();
+                                        if (effect.threadStorage) any = true;
+                                    }
                                     if (!any) {
                                         coll.emit(DiagnosticCode::C_InvalidSemantics,
                                                   effPath,
                                                   "linkage effect must set at least "
-                                                  "one of 'binding', 'visibility', or "
-                                                  "'staticStorage'");
+                                                  "one of 'binding', 'visibility', "
+                                                  "'staticStorage', or "
+                                                  "'threadStorage'");
                                         continue;
                                     }
                                     rule.linkageSpecifiers.emplace(specText, effect);
@@ -5177,6 +5280,57 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                         }
                                     }
                                     rule.bitfieldSuffix = std::move(suffix);
+                                }
+                            }
+                        }
+
+                        // C23 6.7.2.2 (D-CSUBSET-ENUM-UNDERLYING-TYPE, FC17):
+                        // optional `enumUnderlyingType` —
+                        //   "enumUnderlyingType": { "rule": "enumTypeSpecifier",
+                        //                           "typeChild": 1 }
+                        // `rule` names the underlying-type clause shape; `typeChild`
+                        // is the visible-child index of the type-name node inside
+                        // it. Mirrors `bitfieldSuffix`; an unknown rule is
+                        // C_UnknownShape (the decl stays usable, sans explicit
+                        // underlying type).
+                        if (entry.contains("enumUnderlyingType")) {
+                            json const& eu = entry.at("enumUnderlyingType");
+                            if (!eu.is_object()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/enumUnderlyingType",
+                                          "'enumUnderlyingType' must be an object");
+                            } else if (!eu.contains("rule") || !eu.at("rule").is_string()) {
+                                coll.emit(DiagnosticCode::C_MissingField,
+                                          path + "/enumUnderlyingType/rule",
+                                          "'enumUnderlyingType.rule' is required and must be a "
+                                          "rule-name string");
+                            } else {
+                                auto const rn = eu.at("rule").get<std::string>();
+                                if (!data.rules->contains(rn)) {
+                                    coll.emit(DiagnosticCode::C_UnknownShape,
+                                              path + "/enumUnderlyingType/rule",
+                                              std::format("'enumUnderlyingType.rule' references "
+                                                          "unknown shape '{}'", rn));
+                                } else {
+                                    EnumUnderlyingTypeSpec spec;
+                                    spec.rule     = data.rules->find(rn);
+                                    spec.ruleName = rn;
+                                    if (eu.contains("typeChild")) {
+                                        auto const& tc = eu.at("typeChild");
+                                        if (!tc.is_number_integer()
+                                            || tc.get<std::int64_t>() < 0
+                                            || tc.get<std::int64_t>()
+                                                   > std::numeric_limits<std::int32_t>::max()) {
+                                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                                      path + "/enumUnderlyingType/typeChild",
+                                                      "'typeChild' must be a non-negative "
+                                                      "integer");
+                                        } else {
+                                            spec.typeChild =
+                                                static_cast<std::uint32_t>(tc.get<std::int64_t>());
+                                        }
+                                    }
+                                    rule.enumUnderlyingType = std::move(spec);
                                 }
                             }
                         }
@@ -5798,13 +5952,36 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                                       "not both", i));
                                 modeOk = false;
                             }
-                            if (!rule.headChild.has_value()) {
+                            // FC17.5 (D-CSUBSET-AUTO-TYPE-INFERENCE): an
+                            // `inferTypeFromInitializer` row derives its type
+                            // from the initializer — it has NO head by design,
+                            // so the head requirement is waived for it (and
+                            // ONLY for it: every other declarator-mode row
+                            // keeps the mandatory head, byte-identical). A row
+                            // that sets BOTH is contradictory — two competing
+                            // type sources — and is rejected, not resolved by
+                            // precedence (a silent winner would hide a config
+                            // authoring error).
+                            if (!rule.headChild.has_value()
+                                && !rule.inferTypeFromInitializer) {
                                 coll.emit(DiagnosticCode::C_MissingField,
                                           path + "/head",
                                           std::format("'declarations[{}]' is in "
                                                       "declarator mode but sets "
                                                       "no 'head' (the type-"
                                                       "specifier head index)", i));
+                                modeOk = false;
+                            }
+                            if (rule.headChild.has_value()
+                                && rule.inferTypeFromInitializer) {
+                                coll.emit(DiagnosticCode::C_ConflictingField,
+                                          path,
+                                          std::format(
+                                              "'declarations[{}]' sets both "
+                                              "'head' and "
+                                              "'inferTypeFromInitializer' — "
+                                              "a declaration's type comes from "
+                                              "one source, not both", i));
                                 modeOk = false;
                             }
                             if (rule.declaratorListChild.has_value()
@@ -5828,6 +6005,19 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                 modeOk = false;
                             }
                             if (!modeOk) continue;   // drop the inconsistent row
+                        } else if (rule.inferTypeFromInitializer) {
+                            // FC17.5: the inference flag is a DECLARATOR-mode
+                            // capability (the initializer lives on an
+                            // init-declarator). On a legacy positional row it
+                            // would be silently inert — reject loud instead.
+                            coll.emit(DiagnosticCode::C_ConflictingField, path,
+                                      std::format(
+                                          "'declarations[{}]' sets "
+                                          "'inferTypeFromInitializer' without "
+                                          "declarator-mode fields — the "
+                                          "inference reads the declarator's "
+                                          "initializer", i));
+                            continue;   // drop the inconsistent row
                         }
 
                         cfg.declarations.push_back(std::move(rule));
@@ -7474,6 +7664,76 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── typeof / typeof_unqual (C23 6.7.2.5, D-CSUBSET-TYPEOF) ──
+            // `{ typeRule, valueRule, operandChild, stripQualifiersToken? }` — the
+            // two operand forms (type-name / expression) share the operand
+            // visible-child index. `stripQualifiersToken` is OPTIONAL (the
+            // `typeof_unqual` keyword); ABSENT ⇒ typeof never strips. Mirrors the
+            // sizeof/alignof block's readRule + readReqIndex discipline (a
+            // present-but-bad field emits + fails the load); an ABSENT block leaves
+            // both rules invalid → no surface. `stripQualifiersToken` resolves like
+            // `volatileMarker` / noreturn's keywordToken (unknown name → C_UnknownToken).
+            if (sem.contains("typeof")) {
+                json const& tq = sem.at("typeof");
+                if (!tq.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/typeof",
+                              "'semantics.typeof' must be an object "
+                              "{ typeRule, valueRule, operandChild, "
+                              "stripQualifiersToken? }");
+                } else {
+                    auto readRule = [&](char const* key, RuleId& outRule,
+                                        std::string& outName) {
+                        if (!tq.contains(key) || !tq.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      std::string{"/semantics/typeof/"} + key,
+                                      std::format("'{}' is required and must be a "
+                                                  "string", key));
+                            return;
+                        }
+                        outName = tq.at(key).get<std::string>();
+                        if (!data.rules->contains(outName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape,
+                                      std::string{"/semantics/typeof/"} + key,
+                                      std::format("'typeof.{}' references unknown "
+                                                  "shape '{}'", key, outName));
+                            return;
+                        }
+                        outRule = data.rules->find(outName);
+                    };
+                    readRule("typeRule",  cfg.typeofTypeRule,  cfg.typeofTypeRuleName);
+                    readRule("valueRule", cfg.typeofValueRule, cfg.typeofValueRuleName);
+                    // `operandChild` is required — readReqIndex emits its own
+                    // C_MissingField / C_InvalidSemantics into `coll` on a bad value
+                    // (failing the load); the flag just satisfies the out-param.
+                    bool operandChildOk = true;
+                    readReqIndex(tq, "operandChild", "/semantics/typeof",
+                                 cfg.typeofOperandChild, operandChildOk);
+                    (void)operandChildOk;
+                    // OPTIONAL strip token (the `typeof_unqual` spelling); absent →
+                    // nullopt → the resolver never strips.
+                    if (tq.contains("stripQualifiersToken")) {
+                        if (!tq.at("stripQualifiersToken").is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/typeof/stripQualifiersToken",
+                                      "'stripQualifiersToken' must be a string");
+                        } else {
+                            std::string const tn =
+                                tq.at("stripQualifiersToken").get<std::string>();
+                            if (!data.schemaTokens->contains(tn)) {
+                                coll.emit(DiagnosticCode::C_UnknownToken,
+                                          "/semantics/typeof/stripQualifiersToken",
+                                          std::format("'typeof.stripQualifiersToken' "
+                                                      "references unknown token kind "
+                                                      "'{}'", tn));
+                            } else {
+                                cfg.typeofStripQualifiersToken =
+                                    data.schemaTokens->find(tn);
+                            }
+                        }
+                    }
+                }
+            }
+
             // ── alignas (C11/C23 6.7.5, D-CSUBSET-ALIGNAS) ──
             // `{ specRule, argChild, typeFormRule }` — the `_Alignas`/`alignas`
             // alignment specifier. The semantic tier reads the `alignasSpec` node,
@@ -7643,6 +7903,279 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             cfg.noreturnAttributeNames.push_back(e.get<std::string>());
                         }
                     }
+                }
+            }
+
+            // ── constexpr object storage-class (FC17, D-CSUBSET-CONSTEXPR) ──
+            // `{ keywordToken }` — the C23 6.7.1 `constexpr` KEYWORD token. Pass 1
+            // scans a declaration's specifier prefix for it and marks each declared
+            // symbol `isConstexpr`; Pass 2 enforces the 6.7.1 constraints at the
+            // declaration. `keywordToken` resolves like noreturn's (a REQUIRED
+            // string naming a declared token; unknown name → C_UnknownToken,
+            // missing/non-string → C_MissingField — a typo can never silently
+            // disarm the constexpr validation). An ABSENT block leaves the token
+            // unset ⇒ no surface. Source-agnostic: nothing hardcodes "constexpr".
+            if (sem.contains("constexpr")) {
+                json const& cx = sem.at("constexpr");
+                if (!cx.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/constexpr",
+                              "'semantics.constexpr' must be an object "
+                              "{ keywordToken }");
+                } else {
+                    if (!cx.contains("keywordToken")
+                        || !cx.at("keywordToken").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/constexpr/keywordToken",
+                                  "'keywordToken' is required and must be a string");
+                    } else {
+                        std::string const tn =
+                            cx.at("keywordToken").get<std::string>();
+                        if (!data.schemaTokens->contains(tn)) {
+                            coll.emit(DiagnosticCode::C_UnknownToken,
+                                      "/semantics/constexpr/keywordToken",
+                                      std::format("'constexpr.keywordToken' references "
+                                                  "unknown token kind '{}'", tn));
+                        } else {
+                            cfg.constexprKeywordToken = data.schemaTokens->find(tn);
+                        }
+                    }
+                }
+            }
+
+            // ── thread-local storage class (TLS C1, D-CSUBSET-THREAD-LOCAL) ──
+            // `{ incompatibleSpecifierTokens }` — storage-class specifier TOKEN
+            // kinds that may not pair with a thread-storage specifier (C11/C23
+            // 6.7.1p2 — c-subset lists `RegisterKeyword`). Each entry resolves
+            // like a gatedMarker token (unknown name → C_UnknownToken — a typo
+            // can never silently disarm the combination reject). The
+            // thread-storage vocabulary itself rides the declaration rows'
+            // `linkageSpecifiers` maps (`{"threadStorage": true}`), NOT this
+            // block. An ABSENT block leaves the list empty ⇒ no
+            // forbidden-combination scan. Source-agnostic: nothing hardcodes
+            // "register" or "thread_local".
+            if (sem.contains("threadLocal")) {
+                json const& tl = sem.at("threadLocal");
+                if (!tl.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/threadLocal",
+                              "'semantics.threadLocal' must be an object "
+                              "{ incompatibleSpecifierTokens }");
+                } else if (!tl.contains("incompatibleSpecifierTokens")
+                           || !tl.at("incompatibleSpecifierTokens").is_array()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              "/semantics/threadLocal/incompatibleSpecifierTokens",
+                              "'incompatibleSpecifierTokens' is required and "
+                              "must be an array of token-kind names");
+                } else {
+                    for (json const& e : tl.at("incompatibleSpecifierTokens")) {
+                        if (!e.is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/threadLocal/"
+                                      "incompatibleSpecifierTokens",
+                                      "each 'incompatibleSpecifierTokens' entry "
+                                      "must be a token-kind name string");
+                            continue;
+                        }
+                        std::string const tn = e.get<std::string>();
+                        if (!data.schemaTokens->contains(tn)) {
+                            coll.emit(DiagnosticCode::C_UnknownToken,
+                                      "/semantics/threadLocal/"
+                                      "incompatibleSpecifierTokens",
+                                      std::format("'threadLocal."
+                                                  "incompatibleSpecifierTokens' "
+                                                  "references unknown token kind "
+                                                  "'{}'", tn));
+                            continue;
+                        }
+                        cfg.threadLocalIncompatibleTokens.push_back(
+                            data.schemaTokens->find(tn));
+                    }
+                }
+            }
+
+            // ── predefined function-name identifiers (FC17.5,
+            //    D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER, C99 6.4.2.2) ──
+            // `{ identifiers }` — the predefined function-name spellings
+            // (`__func__` + the GNU `__FUNCTION__` alias for c-subset). Pass 1
+            // binds one synthetic const Array<char-core, len+1> symbol per
+            // spelling into each function definition's own scope; HIR folds a
+            // read to a string-literal constant. `identifiers` is REQUIRED when
+            // the block is present and each entry must be a string (a typo'd
+            // shape can never silently disarm the feature). An ABSENT block
+            // leaves the list empty ⇒ no surface. Source-agnostic: nothing
+            // hardcodes "__func__".
+            if (sem.contains("predefinedFunctionNames")) {
+                json const& pf = sem.at("predefinedFunctionNames");
+                if (!pf.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/predefinedFunctionNames",
+                              "'semantics.predefinedFunctionNames' must be an "
+                              "object { identifiers }");
+                } else if (!pf.contains("identifiers")
+                           || !pf.at("identifiers").is_array()) {
+                    coll.emit(DiagnosticCode::C_MissingField,
+                              "/semantics/predefinedFunctionNames/identifiers",
+                              "'identifiers' is required and must be an array "
+                              "of strings");
+                } else {
+                    for (json const& e : pf.at("identifiers")) {
+                        if (!e.is_string()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      "/semantics/predefinedFunctionNames/identifiers",
+                                      "each 'identifiers' entry must be a string");
+                            continue;
+                        }
+                        cfg.predefinedFunctionNameIdentifiers.push_back(
+                            e.get<std::string>());
+                    }
+                }
+            }
+
+            // ── standard-attribute semantics (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS) ──
+            // `{ attrSpecRule, stdAttrRule, bareStatementRule, effects }` — the
+            // C23 6.7.13 standard-attribute semantics TABLE. The three rule refs
+            // resolve like alignas's readRule (present-but-bad emits + fails the
+            // load; an ABSENT block leaves everything invalid → no surface).
+            // `effects` is an array of `{ names: [...], effect: <verb> }` rows;
+            // the effect VERB is validated against the CLOSED set
+            // {suppressUnused, warnOnUse, warnOnDiscard, none} — an unknown verb
+            // is C_InvalidSemantics (a typo can never silently disarm a row).
+            // Source-agnostic: nothing hardcodes a rule name or attribute name.
+            if (sem.contains("attributeSemantics")) {
+                json const& as = sem.at("attributeSemantics");
+                if (!as.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/attributeSemantics",
+                              "'semantics.attributeSemantics' must be an object "
+                              "{ attrSpecRule, stdAttrRule, bareStatementRule, "
+                              "effects }");
+                } else {
+                    auto readRule = [&](char const* key, char const* path,
+                                        RuleId& outRule, std::string& outName) {
+                        if (!as.contains(key) || !as.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path,
+                                      std::format("'{}' is required and must be a "
+                                                  "string", key));
+                            return;
+                        }
+                        outName = as.at(key).get<std::string>();
+                        if (!data.rules->contains(outName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path,
+                                      std::format("'attributeSemantics.{}' references "
+                                                  "unknown shape '{}'", key, outName));
+                            outName.clear();
+                            return;
+                        }
+                        outRule = data.rules->find(outName);
+                    };
+                    readRule("attrSpecRule",
+                             "/semantics/attributeSemantics/attrSpecRule",
+                             cfg.attrSpecRule, cfg.attrSpecRuleName);
+                    readRule("stdAttrRule",
+                             "/semantics/attributeSemantics/stdAttrRule",
+                             cfg.stdAttrRule, cfg.stdAttrRuleName);
+                    readRule("bareStatementRule",
+                             "/semantics/attributeSemantics/bareStatementRule",
+                             cfg.attrBareStatementRule,
+                             cfg.attrBareStatementRuleName);
+                    if (!as.contains("effects") || !as.at("effects").is_array()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/attributeSemantics/effects",
+                                  "'effects' is required and must be an array of "
+                                  "{ names, effect } rows");
+                    } else {
+                        for (json const& row : as.at("effects")) {
+                            if (!row.is_object() || !row.contains("names")
+                                || !row.at("names").is_array()
+                                || !row.contains("effect")
+                                || !row.at("effect").is_string()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          "/semantics/attributeSemantics/effects",
+                                          "each 'effects' row must be an object "
+                                          "{ names: [strings], effect: string }");
+                                continue;
+                            }
+                            AttributeSemanticsRow out;
+                            for (json const& nm : row.at("names")) {
+                                if (!nm.is_string()) {
+                                    coll.emit(
+                                        DiagnosticCode::C_InvalidSemantics,
+                                        "/semantics/attributeSemantics/effects",
+                                        "each 'names' entry must be a string");
+                                    continue;
+                                }
+                                out.names.push_back(nm.get<std::string>());
+                            }
+                            std::string const verb =
+                                row.at("effect").get<std::string>();
+                            if (verb == "suppressUnused") {
+                                out.effect = AttributeEffect::SuppressUnused;
+                            } else if (verb == "warnOnUse") {
+                                out.effect = AttributeEffect::WarnOnUse;
+                            } else if (verb == "warnOnDiscard") {
+                                out.effect = AttributeEffect::WarnOnDiscard;
+                            } else if (verb == "none") {
+                                out.effect = AttributeEffect::None;
+                            } else {
+                                // CLOSED verb set — an unknown verb fails the
+                                // load loud; silently defaulting it would
+                                // disarm the row (e.g. a suppressUnused typo
+                                // would re-enable the unused warning).
+                                coll.emit(
+                                    DiagnosticCode::C_InvalidSemantics,
+                                    "/semantics/attributeSemantics/effects",
+                                    std::format("unknown attribute effect '{}' — "
+                                                "the closed set is suppressUnused"
+                                                " | warnOnUse | warnOnDiscard | "
+                                                "none", verb));
+                                continue;
+                            }
+                            cfg.attributeEffects.push_back(std::move(out));
+                        }
+                    }
+                }
+            }
+
+            // ── nodiscard discard-context (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS) ──
+            // `{ discardStatementRule, expressionRule }` — the TWO-hop discard
+            // shape for the warnOnDiscard effect (design-audit F1): a call's
+            // result is discarded iff parent(call)==expressionRule AND
+            // parent(parent(call))==discardStatementRule. Both resolve like
+            // alignas's readRule. Absent block ⇒ warnOnDiscard never fires.
+            if (sem.contains("nodiscard")) {
+                json const& nd = sem.at("nodiscard");
+                if (!nd.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/nodiscard",
+                              "'semantics.nodiscard' must be an object "
+                              "{ discardStatementRule, expressionRule }");
+                } else {
+                    auto readRule = [&](char const* key, char const* path,
+                                        RuleId& outRule, std::string& outName) {
+                        if (!nd.contains(key) || !nd.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField, path,
+                                      std::format("'{}' is required and must be a "
+                                                  "string", key));
+                            return;
+                        }
+                        outName = nd.at(key).get<std::string>();
+                        if (!data.rules->contains(outName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape, path,
+                                      std::format("'nodiscard.{}' references "
+                                                  "unknown shape '{}'", key, outName));
+                            outName.clear();
+                            return;
+                        }
+                        outRule = data.rules->find(outName);
+                    };
+                    readRule("discardStatementRule",
+                             "/semantics/nodiscard/discardStatementRule",
+                             cfg.nodiscardDiscardStatementRule,
+                             cfg.nodiscardDiscardStatementRuleName);
+                    readRule("expressionRule",
+                             "/semantics/nodiscard/expressionRule",
+                             cfg.nodiscardExpressionRule,
+                             cfg.nodiscardExpressionRuleName);
                 }
             }
 
@@ -8342,6 +8875,29 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     readBool("nullPointerConstantFromIntegerZero",
                              cfg.pointerConversions
                                  .nullPointerConstantFromIntegerZero);
+                    readBool("nullPointerConstantFromNullptrT",
+                             cfg.pointerConversions
+                                 .nullPointerConstantFromNullptrT);
+                    // D-CSUBSET-NULLPTR: `nullptr` lowers to the integer-0 null
+                    // constant at the HIR tier (Fix 1(a)), so its HIR realization
+                    // (coerce→Ptr / ternary / condition) REUSES the integer-0
+                    // null-pointer-constant machinery — gated on
+                    // `nullPointerConstantFromIntegerZero`. Admitting `nullptr` at the
+                    // semantic tier WITHOUT that machinery would let `p = nullptr` pass
+                    // semantics then fail to coerce at HIR (a store of I32-0 into a Ptr
+                    // slot). Enforce the co-requirement FAIL-LOUD at config load.
+                    if (cfg.pointerConversions.nullPointerConstantFromNullptrT
+                        && !cfg.pointerConversions
+                                 .nullPointerConstantFromIntegerZero) {
+                        coll.emit(
+                            DiagnosticCode::C_InvalidSemantics,
+                            "/semantics/pointerConversions/"
+                            "nullPointerConstantFromNullptrT",
+                            "'nullPointerConstantFromNullptrT' requires "
+                            "'nullPointerConstantFromIntegerZero' to be true — nullptr "
+                            "lowers to the integer-0 null constant and reuses its HIR "
+                            "realization");
+                    }
                     // Typo defense: reject unknown sub-keys with a
                     // fail-loud diagnostic. Pre-guard, an editor typo
                     // like `implictToVoidPtr` (missing 'i') would
@@ -8354,7 +8910,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     for (auto const& [k, _] : obj.items()) {
                         if (k != "implicitToVoidPtr" &&
                             k != "implicitFromVoidPtr" &&
-                            k != "nullPointerConstantFromIntegerZero") {
+                            k != "nullPointerConstantFromIntegerZero" &&
+                            k != "nullPointerConstantFromNullptrT") {
                             coll.emit(DiagnosticCode::C_InvalidSemantics,
                                       std::format(
                                           "/semantics/pointerConversions/{}",

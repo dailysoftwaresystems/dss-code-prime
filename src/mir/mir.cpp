@@ -454,6 +454,7 @@ MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
                                   SymbolBinding    binding,
                                   SymbolVisibility visibility,
                                   bool             isConst,
+                                  MirThreadStorage threadStorage,
                                   std::uint32_t    alignmentBytes) {
     if (!type.valid()) {
         std::fputs("dss::MirBuilder fatal: addGlobal: type TypeId must be valid\n",
@@ -483,6 +484,7 @@ MirGlobalId MirBuilder::addGlobal(TypeId type, SymbolId symbol,
     g.binding          = binding;
     g.visibility       = visibility;
     g.isConst          = isConst;
+    g.isThreadLocal    = (threadStorage == MirThreadStorage::PerThread);
     g.alignment        = alignmentBytes;
     return globalArena_.addNode(g);
 }

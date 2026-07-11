@@ -1160,7 +1160,9 @@ TEST(SimplifyCfg, RuntimeInitGlobalsModuleEmitsXOptPassSkippedInfo) {
     MirBlockId const initEntry = mb.createBlock(StructCfMarker::EntryBlock);
     mb.beginBlock(initEntry);
     mb.addReturn();
-    mb.addGlobal(i32, SymbolId{200}, UINT32_MAX, initFn);
+    mb.addGlobal(i32, SymbolId{200}, UINT32_MAX, initFn,
+                 SymbolBinding::Global, SymbolVisibility::Default,
+                 /*isConst=*/false, MirThreadStorage::Shared);
     Mir mir = std::move(mb).finish();
 
     DiagnosticReporter rep;

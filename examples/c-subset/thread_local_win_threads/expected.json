@@ -1,0 +1,9 @@
+{
+  "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C3): the TRUE per-thread-storage runtime discriminator on Windows — the pe64 analog of the ELF thread_local_pthread witness. Exercises BOTH the .tls tdata TEMPLATE copy AND the tbss EMBEDDED-ZERO per-thread init on a SPAWNED thread. main seeds counter=6 (tdata) and leaves z=0 (tbss); two kernel32 CreateThread workers each assert z==0 in their OWN copy (proving the embedded-zero region initialized on this thread, not just main), then z->7 and counter template-5->105, folding both into *out = 112. exit 42 iff v1==112 && v2==112 && counter==6 && z==0 (real per-thread storage for BOTH tdata + tbss); a process-shared alias makes the 2nd worker see z!=0 -> *out=-1, or gives divergent counter values -> return 5/6/7/8. The OS calls the worker with ms_x64 (rcx=param), the SAME convention DSS emits every pe64 function with. pe64-ONLY (windows.json availableObjectFormats:[pe]); the local Windows ctest runs it natively. RED-on-disable: route isThreadLocal -> ordinary .data and the workers share one object -> not 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ]
+}

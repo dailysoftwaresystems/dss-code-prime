@@ -150,6 +150,52 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_UnknownTypeAttribute";
         case DiagnosticCode::S_PackedBitfieldUnsupported:
             return "S_PackedBitfieldUnsupported";
+        case DiagnosticCode::S_NullptrInvalidOperand:
+            return "S_NullptrInvalidOperand";
+        case DiagnosticCode::S_InvalidEnumUnderlyingType:
+            return "S_InvalidEnumUnderlyingType";
+        case DiagnosticCode::S_EnumeratorValueOutOfRange:
+            return "S_EnumeratorValueOutOfRange";
+        case DiagnosticCode::S_TypeofBitfieldOperand:
+            return "S_TypeofBitfieldOperand";
+        case DiagnosticCode::S_ConstexprNonConstantInitializer:
+            return "S_ConstexprNonConstantInitializer";
+        case DiagnosticCode::S_ConstexprMissingInitializer:
+            return "S_ConstexprMissingInitializer";
+        case DiagnosticCode::S_ConstexprUnsupportedType:
+            return "S_ConstexprUnsupportedType";
+        case DiagnosticCode::S_ConstexprFunctionNotSupported:
+            return "S_ConstexprFunctionNotSupported";
+        case DiagnosticCode::S_ConstexprInvalidQualifier:
+            return "S_ConstexprInvalidQualifier";
+        case DiagnosticCode::S_UnknownAttribute:
+            return "S_UnknownAttribute";
+        case DiagnosticCode::S_DeprecatedSymbolUsed:
+            return "S_DeprecatedSymbolUsed";
+        case DiagnosticCode::S_NodiscardResultDiscarded:
+            return "S_NodiscardResultDiscarded";
+        case DiagnosticCode::S_InvalidScalarInitializer:
+            return "S_InvalidScalarInitializer";
+        case DiagnosticCode::S_PredefinedIdentifierNotAddressable:
+            return "S_PredefinedIdentifierNotAddressable";
+        case DiagnosticCode::S_AutoRequiresSingleDeclarator:
+            return "S_AutoRequiresSingleDeclarator";
+        case DiagnosticCode::S_AutoRequiresPlainIdentifier:
+            return "S_AutoRequiresPlainIdentifier";
+        case DiagnosticCode::S_AutoRequiresInitializer:
+            return "S_AutoRequiresInitializer";
+        case DiagnosticCode::S_AutoInferenceInvalid:
+            return "S_AutoInferenceInvalid";
+        case DiagnosticCode::S_ThreadLocalOnFunction:
+            return "S_ThreadLocalOnFunction";
+        case DiagnosticCode::S_ThreadLocalRequiresStaticOrExtern:
+            return "S_ThreadLocalRequiresStaticOrExtern";
+        case DiagnosticCode::S_ThreadLocalRedeclarationMismatch:
+            return "S_ThreadLocalRedeclarationMismatch";
+        case DiagnosticCode::S_ThreadLocalAddressNotConstant:
+            return "S_ThreadLocalAddressNotConstant";
+        case DiagnosticCode::S_ThreadLocalInvalidCombination:
+            return "S_ThreadLocalInvalidCombination";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
@@ -195,6 +241,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_ArgIndexOutOfRange:       return "I_ArgIndexOutOfRange";
         case DiagnosticCode::I_ArgPositionDuplicate:     return "I_ArgPositionDuplicate";
         case DiagnosticCode::I_AllocaAlignmentNotPowerOfTwo: return "I_AllocaAlignmentNotPowerOfTwo";
+        case DiagnosticCode::I_NullptrTypeInMir:         return "I_NullptrTypeInMir";
         case DiagnosticCode::I_ExtensionTypeInMir:       return "I_ExtensionTypeInMir";
         case DiagnosticCode::I_StructCfMismatch:         return "I_StructCfMismatch";
         case DiagnosticCode::I_UnreachableBlock:         return "I_UnreachableBlock";
@@ -299,6 +346,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::A_FunctionEncodeAborted:        return "A_FunctionEncodeAborted";
         case DiagnosticCode::K_AbsolutePointerRelocMissing:  return "K_AbsolutePointerRelocMissing";
         case DiagnosticCode::K_ImageExecBitFailed:           return "K_ImageExecBitFailed";
+        case DiagnosticCode::K_FormatLacksThreadLocalSupport:
+            return "K_FormatLacksThreadLocalSupport";
+        case DiagnosticCode::K_ThreadLocalOveralignedForFormat:
+            return "K_ThreadLocalOveralignedForFormat";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";

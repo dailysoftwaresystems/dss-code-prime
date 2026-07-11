@@ -480,18 +480,22 @@ bool validateAssembledData(std::span<AssembledData const> items,
 
     bool ok = true;
 
-    // Invariant 1: Bss items must have empty bytes.
+    // Invariant 1: zero-fill (Bss/Tbss) items must have empty bytes.
+    // TLS C1 audit fold M-3 (D-CSUBSET-THREAD-LOCAL): routed through the
+    // ONE shared `isZeroFill` predicate — the former exact `== Bss` test
+    // would have let a byte-carrying Tbss item slip past this invariant.
     for (std::size_t i = 0; i < items.size(); ++i) {
         auto const& d = items[i];
-        if (d.section == DataSectionKind::Bss && !d.bytes.empty()) {
+        if (isZeroFill(d.section) && !d.bytes.empty()) {
             emit(DiagnosticCode::K_BssDataHasBytes,
-                 std::format("AssembledData[{}] has section=Bss "
+                 std::format("AssembledData[{}] has section={} "
                              "but bytes is non-empty ({} bytes). "
-                             "Bss is zero-fill — the wire format "
+                             "A zero-fill section — the wire format "
                              "reserves the size without storing "
                              "bytes. Substrate-shape violation "
                              "(D-LK4-RODATA-BSS-INVARIANT).",
-                             i, d.bytes.size()));
+                             i, dataSectionKindName(d.section),
+                             d.bytes.size()));
             ok = false;
         }
     }
@@ -820,6 +824,17 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                        : natural;
         };
 
+        // D-CSUBSET-THREAD-LOCAL (TLS C1): a `thread_local` global routes to
+        // the thread-local section pair (Tdata/Tbss) — its storage is the
+        // PER-THREAD template the loader copies for every thread, never the
+        // process-shared Data/Bss/Rodata. Read ONCE here; consulted FIRST at
+        // every section decision below (including the F5/c67 overrides —
+        // audit fold CRIT-2). String-POOL globals are minted
+        // isThreadLocal=false at their HIR mint site (the pooled bytes are
+        // process-shared rodata; only the named thread_local OBJECT is
+        // per-thread), so this flag is exactly the declared storage class.
+        bool const isThreadLocal = mir.globalIsThreadLocal(gid);
+
         // Runtime-init globals: their bytes land via the
         // `__module_init__` synthesized function at module-load
         // time. Today this cycle scope produces NO AssembledData
@@ -881,8 +896,13 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             }
             AssembledData z;
             z.symbol       = sym;
-            z.section      = DataSectionKind::Bss;
-            z.reservedSize = *sizeOpt;        // bytes stays EMPTY (Bss invariant)
+            // D-CSUBSET-THREAD-LOCAL: a zero-init `thread_local int g;` is the
+            // ZERO-FILL THREAD-LOCAL TEMPLATE extent → Tbss (each thread's copy
+            // is loader-zeroed; a Bss slot would be ONE process-shared object —
+            // the silent-miscompile of the declared storage duration).
+            z.section      = isThreadLocal ? DataSectionKind::Tbss
+                                           : DataSectionKind::Bss;
+            z.reservedSize = *sizeOpt;   // bytes stays EMPTY (zero-fill invariant)
             // Alignment: primitives align to their size (power-of-two in
             // [1,16]); aggregates carry the layout's align. The walker raises
             // the section alignment to cover the strictest item.
@@ -922,8 +942,21 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // → `.rodata`; a NAMED `char arr[N] = "str"` honors its declared
         // const-ness. So the string-literal arm below no longer overrides the
         // section — `isConst` is the single authority.
-        d.section = mir.globalIsConst(gid) ? DataSectionKind::Rodata
-                                           : DataSectionKind::Data;
+        //
+        // D-CSUBSET-THREAD-LOCAL (TLS C1): the isThreadLocal check runs FIRST,
+        // BEFORE isConst — a `const thread_local int k = 3;` MUST go to .tdata,
+        // NOT .rodata: C11 6.7.1 gives it THREAD storage duration, so its
+        // ADDRESS (tp + tpoff) differs per thread; parking it at one shared
+        // .rodata VA would collapse every thread onto one object (and the
+        // access codegen — tlsbase + lea — would then read a garbage tpoff
+        // against a non-TLS symbol). The per-thread copy is never written
+        // through this `const` object, but per-thread IDENTITY requires the
+        // TLS template section. Initialized thread_local → Tdata (the
+        // template bytes each thread's copy starts from).
+        d.section = isThreadLocal
+                        ? DataSectionKind::Tdata
+                        : (mir.globalIsConst(gid) ? DataSectionKind::Rodata
+                                                  : DataSectionKind::Data);
 
         // String-literal arm: bytes are the literal's std::string
         // contents. The HIR convention is Array<Char,N+1> where
@@ -1052,7 +1085,17 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // rodata; a Mach-O PIE image cannot rebase the sealed __TEXT,__const.
             // Overriding the section-above choice to .data on every format is the
             // agnostic root-cause placement, not a per-format special case.
-            d.section = DataSectionKind::Data;
+            //
+            // ★ TLS C1 audit fold CRIT-2 (D-CSUBSET-THREAD-LOCAL): the override
+            // must PRESERVE thread-locality. A `thread_local char *msg = "hi";`
+            // is a per-thread POINTER OBJECT whose initial VALUE is patched into
+            // the .tdata TEMPLATE at link time (sound for the fixed-base ET_EXEC
+            // this cycle ships — the target VA is final; every thread's copy
+            // starts from the patched template). Demoting it to .data would
+            // silently make the pointer ONE process-shared slot — the exact
+            // storage-duration miscompile the section-select guards against.
+            d.section = isThreadLocal ? DataSectionKind::Tdata
+                                      : DataSectionKind::Data;
             d.bytes.assign(8, 0);                       // pointer-width zero slot
             d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(8));
             d.relocations.push_back(Relocation{
@@ -1124,7 +1167,18 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // 951-961 (a Mach-O PIE __TEXT,__const cannot be rebased; ELF/PE
             // merely tolerate rodata). A reloc-free const aggregate keeps the
             // section chosen above (.rodata for a const global).
-            if (!d.relocations.empty()) d.section = DataSectionKind::Data;
+            //
+            // ★ TLS C1 audit fold CRIT-2 (D-CSUBSET-THREAD-LOCAL): PRESERVE
+            // thread-locality — a reloc-bearing `thread_local` aggregate (e.g.
+            // `thread_local char *tbl[2] = {"a","b"};`) keeps its member slots
+            // in the .tdata TEMPLATE, patched at link time (fixed-base ET_EXEC),
+            // NOT demoted to a process-shared .data slot. A reloc-free
+            // thread_local aggregate already sits in Tdata from the initial
+            // selection and is untouched by this override.
+            if (!d.relocations.empty()) {
+                d.section = isThreadLocal ? DataSectionKind::Tdata
+                                          : DataSectionKind::Data;
+            }
             d.alignment = raiseToExplicit(lay->align);
             out.push_back(std::move(d));
             continue;

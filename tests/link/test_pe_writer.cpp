@@ -1072,6 +1072,279 @@ TEST(PeExecWriter, Abs64RodataSlotEmitsDir64BaseRelocation) {
         << "odd DIR64 entry count → one ABSOLUTE(0) u16 pad to 4-byte alignment";
 }
 
+// ── D-CSUBSET-THREAD-LOCAL (TLS C3): the PE writer's .tls / directory /
+// _tls_index / secrel / backstop structural pins. Host-independent (pure
+// in-memory encode + parse), so Linux CI catches a regression the Windows-
+// only runtime example cannot. RED-on-disable: reverting the pe.cpp TLS arm
+// makes the .tls section + IMAGE_TLS_DIRECTORY64 + DataDirectory[9] vanish —
+// EVERY assertion below turns red, while a single-thread runtime example
+// (which a static alias also passes) would still exit 42. Structure, not
+// behavior, is the PE discriminator (Windows has no pthread — see
+// thread_local_win_threads for the CreateThread 2-thread runtime witness).
+namespace {
+[[nodiscard]] AssembledData makeTdataItem(std::uint32_t sym,
+                                          std::vector<std::uint8_t> bytes,
+                                          std::uint32_t align) {
+    AssembledData d;
+    d.symbol    = SymbolId{sym};
+    d.section   = DataSectionKind::Tdata;
+    d.bytes     = std::move(bytes);
+    d.alignment = Alignment::ofRuntimePow2(align);
+    return d;
+}
+[[nodiscard]] AssembledData makeTbssItem(std::uint32_t sym,
+                                         std::uint64_t size,
+                                         std::uint32_t align) {
+    AssembledData d;
+    d.symbol       = SymbolId{sym};
+    d.section      = DataSectionKind::Tbss;
+    d.reservedSize = size;
+    d.alignment    = Alignment::ofRuntimePow2(align);
+    return d;
+}
+} // namespace
+
+TEST(PeExecTls, ThreadLocalEmitsTlsDirectorySectionAndIndex) {
+    // g {07 00 00 00} tdata align 4 -> offset 0; counter tbss 4 bytes
+    // align 4 -> tbssBlockBase alignUp(4,4)=4 -> blockMemsz 8. The WHOLE
+    // block (tdata + the tbss zero region) is EMBEDDED in the .tls
+    // template (SizeOfZeroFill=0) — the Windows loader does not reliably
+    // zero SizeOfZeroFill for the main thread's early static TLS.
+    //   .tls bytes: [ 8-byte block | pad→8=0 | dir(40) | index(4) ]
+    //   dirOffset = alignUp(8,8) = 8 ; indexOffset = 48 ; fileSize = 52
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};                    // ret — first .text fn @ RVA 0x1000
+    mod.functions.push_back(std::move(fn));
+    mod.dataItems.push_back(makeTdataItem(42, {7, 0, 0, 0}, 4));
+    mod.dataItems.push_back(makeTbssItem(43, 4, 4));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    constexpr std::uint64_t kImageBase = 0x140000000ull;
+    auto const tls   = findExecSection(bytes, {'.', 't', 'l', 's', 0, 0, 0, 0});
+    auto const reloc = findExecSection(bytes, {'.', 'r', 'e', 'l', 'o', 'c', 0, 0});
+    ASSERT_NE(tls.first, 0u)   << ".tls section must exist";
+    ASSERT_NE(reloc.first, 0u) << ".reloc must exist (3 directory VA fixups)";
+    std::uint32_t const tlsRva = tls.first;
+    std::size_t const   tlsOff = tls.second;
+
+    // DataDirectory[9] (IMAGE_DIRECTORY_ENTRY_TLS): RVA @ 0x150, Size @ 0x154
+    // (optional header at 0x98; DataDirectory begins at 0x108; entry 9 = +0x48).
+    EXPECT_EQ(readU32LE(bytes, 0x150), tlsRva + 8u)
+        << "DataDir[9] RVA == the directory's RVA (.tls + dirOffset 8)";
+    EXPECT_EQ(readU32LE(bytes, 0x154), 40u)
+        << "DataDir[9] size == sizeof(IMAGE_TLS_DIRECTORY64)";
+
+    // IMAGE_TLS_DIRECTORY64 (40 bytes) at .tls file offset + dirOffset(8):
+    std::size_t const d = tlsOff + 8;
+    EXPECT_EQ(readU64LE(bytes, d + 0), kImageBase + tlsRva + 0u)   // Start
+        << "StartAddressOfRawData = .tls base VA";
+    EXPECT_EQ(readU64LE(bytes, d + 8), kImageBase + tlsRva + 8u)   // End
+        << "EndAddressOfRawData = Start + full block (tdata 4 + tbss 4)";
+    EXPECT_EQ(readU64LE(bytes, d + 16), kImageBase + tlsRva + 48u) // Index
+        << "AddressOfIndex = the _tls_index slot VA (.tls + 48)";
+    EXPECT_EQ(readU64LE(bytes, d + 24), 0u) << "AddressOfCallBacks = 0";
+    EXPECT_EQ(readU32LE(bytes, d + 32), 0u)
+        << "SizeOfZeroFill = 0 (the tbss zero region is EMBEDDED in the template)";
+    EXPECT_EQ(readU32LE(bytes, d + 36), 0u) << "Characteristics = 0";
+
+    // The template: g == 7, then the tbss counter's 4 zero bytes.
+    EXPECT_EQ(readU32LE(bytes, tlsOff + 0), 7u) << "g's template value";
+    EXPECT_EQ(readU32LE(bytes, tlsOff + 4), 0u) << "counter's embedded zero";
+    // The _tls_index slot: 4 writable zero bytes for the loader to fill.
+    EXPECT_EQ(readU32LE(bytes, tlsOff + 48), 0u) << "_tls_index starts 0";
+
+    // ★ EXACTLY 3 IMAGE_REL_BASED_DIR64 entries (Start/End/AddressOfIndex) —
+    // NOT AddressOfCallBacks (a reloc on 0 → slide → non-null garbage). The
+    // .tls template pointer count is 0 (g is a plain int), so 3 total.
+    std::size_t o = reloc.second;
+    int dir64 = 0;
+    std::vector<std::uint32_t> siteRvas;
+    // Walk the base-reloc blocks in the section's virtual size.
+    std::uint32_t const relocSize = readU32LE(bytes, 0x134);  // DataDir[5] size
+    std::size_t const end = reloc.second + relocSize;
+    while (o + 8 <= end) {
+        std::uint32_t const page = readU32LE(bytes, o + 0);
+        std::uint32_t const bsz  = readU32LE(bytes, o + 4);
+        if (bsz < 8) break;
+        std::size_t const entries = (bsz - 8) / 2;
+        for (std::size_t k = 0; k < entries; ++k) {
+            std::uint16_t const e = readU16LE(bytes, o + 8 + k * 2);
+            if ((e >> 12) == 10u) {   // IMAGE_REL_BASED_DIR64
+                ++dir64;
+                siteRvas.push_back(page + (e & 0x0FFFu));
+            }
+        }
+        o += bsz;
+    }
+    EXPECT_EQ(dir64, 3) << "exactly 3 DIR64 base relocs (Start/End/Index)";
+    // The 3 sites are the directory's 3 VA fields (dir RVA + {0,8,16}).
+    std::vector<std::uint32_t> expect{tlsRva + 8u, tlsRva + 16u, tlsRva + 24u};
+    std::sort(siteRvas.begin(), siteRvas.end());
+    std::sort(expect.begin(), expect.end());
+    EXPECT_EQ(siteRvas, expect)
+        << "the DIR64 sites are the directory Start/End/AddressOfIndex VAs";
+}
+
+TEST(PeExecTls, SecrelPatchedIntoFunctionRelocIsPositiveTemplateOffset) {
+    // A function `lea rax, [rax + secrel32(counter)]` carrying a kind-4
+    // (tls) reloc against the tbss `counter` gets its disp32 patched to
+    // counter's POSITIVE template offset (tbssBlockBase = 4) — NOT a VA and
+    // NOT the ELF negative tpoff. `[block + 4]` is the per-thread address.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    // REX.W 8D 80 <disp32> = lea rax, [rax + disp32]; patch site at offset 3.
+    fn.bytes  = {0x48, 0x8D, 0x80, 0, 0, 0, 0, 0xC3};
+    Relocation r; r.offset = 3; r.target = SymbolId{43};
+    r.kind = RelocationKind{4}; r.addend = 0;   // tls-tpoff32 (PE: SECREL)
+    fn.relocations.push_back(r);
+    mod.functions.push_back(std::move(fn));
+    mod.dataItems.push_back(makeTdataItem(42, {7, 0, 0, 0}, 4)); // g @ 0
+    mod.dataItems.push_back(makeTbssItem(43, 4, 4));             // counter @ 4
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    auto const text = findExecSection(bytes, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+    ASSERT_NE(text.first, 0u);
+    // disp32 at .text file offset + 3 == counter's template offset (4).
+    EXPECT_EQ(readU32LE(bytes, text.second + 3), 4u)
+        << "the SECREL disp32 is counter's POSITIVE template offset "
+           "(tbssBlockBase), not a VA / not the ELF negative tpoff";
+}
+
+TEST(PeExecTls, DataItemRelocTargetingTlsSymbolFailsLoud) {
+    // ★ Seam-(i) / CRIT-2 backstop: a DATA item carrying a relocation that
+    // targets a THREAD-LOCAL symbol must FAIL LOUD — a thread-local object
+    // has no link-time address (C11 6.6p9; the semantic tier rejects
+    // `&tls` as 0xE048). Without the backstop the writer would embed the
+    // section-relative template offset as a garbage abs64 pointer.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    mod.dataItems.push_back(makeTdataItem(42, {7, 0, 0, 0}, 4));
+    // A .data pointer whose abs64 reloc targets the thread-local g (#42).
+    AssembledData p;
+    p.symbol = SymbolId{50}; p.section = DataSectionKind::Data;
+    p.bytes.assign(8, 0); p.alignment = Alignment::ofRuntimePow2(8);
+    Relocation r; r.offset = 0; r.target = SymbolId{42};
+    r.kind = RelocationKind{2}; r.addend = 0;    // abs64 (non-tls) vs TLS target
+    p.relocations.push_back(r);
+    mod.dataItems.push_back(std::move(p));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool saw = false;
+    for (auto const& diag : rep.all())
+        if (diag.code == DiagnosticCode::K_RelocationKindMismatch) saw = true;
+    EXPECT_TRUE(saw) << "a data reloc targeting a TLS symbol must fail loud";
+}
+
+TEST(PeExecTls, FunctionTlsKindRelocTargetingNonTlsSymbolFailsLoud) {
+    // ★ CRIT-2 backstop, the OTHER XOR arm: a tls-flagged (kind-4)
+    // relocation against a NON-thread-local symbol must fail loud — it
+    // would embed a VA where a section-relative offset belongs.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x48, 0x8D, 0x80, 0, 0, 0, 0, 0xC3};
+    Relocation r; r.offset = 3; r.target = SymbolId{60};  // a plain .rdata item
+    r.kind = RelocationKind{4}; r.addend = 0;             // tls kind vs non-tls
+    fn.relocations.push_back(r);
+    mod.functions.push_back(std::move(fn));
+    AssembledData rd;
+    rd.symbol = SymbolId{60}; rd.section = DataSectionKind::Rodata;
+    rd.bytes = {1, 2, 3, 4}; rd.alignment = Alignment::ofRuntimePow2(4);
+    mod.dataItems.push_back(std::move(rd));
+    // Also carry a real TLS item so tlsSymbols is non-empty (the writer
+    // runs the tls arm) but #60 is NOT in it.
+    mod.dataItems.push_back(makeTdataItem(42, {7, 0, 0, 0}, 4));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool saw = false;
+    for (auto const& diag : rep.all())
+        if (diag.code == DiagnosticCode::K_RelocationKindMismatch) saw = true;
+    EXPECT_TRUE(saw) << "a tls-kind reloc against a non-tls symbol fails loud";
+}
+
+TEST(PeExecTls, OveralignedThreadLocalFailsLoud) {
+    // ★ D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN (audit FOLD-1), RED-on-disable:
+    // an `_Alignas(32) thread_local` var can't be honored on PE/x64 — the
+    // Windows loader guarantees only 16-byte (MEMORY_ALLOCATION_ALIGNMENT)
+    // static-TLS block-base alignment and IMAGE_TLS_DIRECTORY64 has no field
+    // to request more. The writer MUST fail loud
+    // (K_ThreadLocalOveralignedForFormat 0x8016) rather than silently
+    // under-align every thread's copy. Disable the pe.cpp gate → this
+    // compiles clean = the silent miscompile (the red).
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    mod.dataItems.push_back(makeTdataItem(42, {1, 0, 0, 0}, 32));  // _Alignas(32)
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool saw = false;
+    for (auto const& diag : rep.all())
+        if (diag.code == DiagnosticCode::K_ThreadLocalOveralignedForFormat)
+            saw = true;
+    EXPECT_TRUE(saw)
+        << "an over-aligned (>16) thread-local must fail loud on pe64 — "
+           "the loader cannot guarantee the per-thread block alignment";
+}
+
+TEST(PeExecTls, SixteenByteAlignedThreadLocalCompilesClean) {
+    // Boundary pin: alignment EXACTLY 16 (== the loader's guarantee) is the
+    // largest that passes — the gate is `> 16`, not `>= 16`. Every normal
+    // scalar / pointer / small aggregate thread_local (align <= 16) stays
+    // green; only explicit over-alignment bites.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    mod.dataItems.push_back(makeTdataItem(42, {1, 0, 0, 0}, 16));  // _Alignas(16)
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "16-byte alignment == the PE x64 TLS block-base guarantee — clean";
+    EXPECT_FALSE(bytes.empty());
+    auto const tls = findExecSection(bytes, {'.', 't', 'l', 's', 0, 0, 0, 0});
+    EXPECT_NE(tls.first, 0u) << ".tls still emitted for the 16-aligned var";
+}
+
 TEST(PeExecWriter, ExternTargetFailsLoudAsUndefined) {
     auto loaded = loadShippedExec();
     AssembledModule mod;
@@ -2268,3 +2541,17 @@ TEST(PeExecWriter, CertTableFileOffsetShiftsPastRdataAndIdata) {
         << "cert table must sit past the last section's raw end";
 }
 
+
+// ═════════════════════════════════════════════════════════════════
+// D-CSUBSET-THREAD-LOCAL (TLS C1, audit LOW-b): the PE walker's
+// anti-static-alias belt. The shipped pe64 JSONs do not advertise
+// tdata/tbss, so the LINKER's acceptsDataSection gate fires first on
+// the real pipeline (K_NoMatchingObjectFormat — pinned in
+// test_linker.cpp). THIS pin calls pe::encode DIRECTLY — bypassing
+// the linker — so the in-walker 0x8015 belt is what fires: the guard
+// a future format JSON opting in BEFORE the TLS C3 walker arm would
+// hit instead of silently emitting a process-shared alias.
+// ═════════════════════════════════════════════════════════════════
+// (PeWriter.TdataItemRejectsLoudUntilTlsC3 removed — TLS C3 LANDED: a pe64
+// thread-local item now EMITS the .tls section + IMAGE_TLS_DIRECTORY64 +
+// _tls_index. The landed behavior is pinned by the PeExecTls.* suite above.)

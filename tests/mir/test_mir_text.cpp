@@ -138,7 +138,9 @@ TEST(MirText, GlobalWithLiteralInitRoundTrips) {
     MirBuilder b2;
     // Need a literal pool entry for the constant-init global.
     std::uint32_t const litIdx = b.literalPoolAdd(intLit(42, TypeKind::I32));
-    b.addGlobal(i32, SymbolId{10}, litIdx);
+    b.addGlobal(i32, SymbolId{10}, litIdx, MirFuncId{}, SymbolBinding::Global,
+                SymbolVisibility::Default, /*isConst=*/false,
+                MirThreadStorage::Shared);
     Mir m = std::move(b).finish();
 
     std::vector<std::string> names{"", "", "", "", "", "", "", "", "", "", "g"};

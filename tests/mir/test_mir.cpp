@@ -58,9 +58,17 @@ TEST(Mir, BuildsAndReadsModuleGlobals) {
     b.beginBlock(ie);
     b.addReturn();
     // Function-init global referencing `init`.
-    MirGlobalId const g1 = b.addGlobal(kI32, SymbolId{10}, UINT32_MAX, init);
+    MirGlobalId const g1 = b.addGlobal(kI32, SymbolId{10}, UINT32_MAX, init,
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default,
+                                       /*isConst=*/false,
+                                       MirThreadStorage::Shared);
     // Zero-init global (no literal, no init func).
-    MirGlobalId const g2 = b.addGlobal(kI32, SymbolId{11});
+    MirGlobalId const g2 = b.addGlobal(kI32, SymbolId{11}, UINT32_MAX,
+                                       MirFuncId{}, SymbolBinding::Global,
+                                       SymbolVisibility::Default,
+                                       /*isConst=*/false,
+                                       MirThreadStorage::Shared);
     EXPECT_NE(g1, g2);
 
     Mir m = std::move(b).finish();
@@ -85,7 +93,11 @@ TEST(MirDeathTest, AddGlobalRejectsBothInitShapes) {
     MirBlockId const ie  = b.createBlock(StructCfMarker::EntryBlock);
     b.beginBlock(ie);
     b.addReturn();
-    EXPECT_DEATH({ (void)b.addGlobal(kI32, SymbolId{2}, /*lit=*/0, /*func=*/init); },
+    EXPECT_DEATH({ (void)b.addGlobal(kI32, SymbolId{2}, /*lit=*/0, /*func=*/init,
+                                     SymbolBinding::Global,
+                                     SymbolVisibility::Default,
+                                     /*isConst=*/false,
+                                     MirThreadStorage::Shared); },
                  "mutually exclusive");
 }
 
@@ -94,7 +106,12 @@ TEST(MirDeathTest, AddGlobalRejectsBothInitShapes) {
 TEST(MirDeathTest, AddGlobalRejectsInvalidSymbol) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     MirBuilder b;
-    EXPECT_DEATH({ (void)b.addGlobal(kI32, SymbolId{}); }, "symbol must be valid");
+    EXPECT_DEATH({ (void)b.addGlobal(kI32, SymbolId{}, UINT32_MAX, MirFuncId{},
+                                     SymbolBinding::Global,
+                                     SymbolVisibility::Default,
+                                     /*isConst=*/false,
+                                     MirThreadStorage::Shared); },
+                 "symbol must be valid");
 }
 
 namespace {
@@ -108,7 +125,9 @@ namespace {
     b.beginBlock(e);
     b.addReturn();
     MirFuncId const dangling{99, b.id().v};   // slot 99 — past the arena
-    (void)b.addGlobal(kI32, SymbolId{5}, UINT32_MAX, dangling);
+    (void)b.addGlobal(kI32, SymbolId{5}, UINT32_MAX, dangling,
+                      SymbolBinding::Global, SymbolVisibility::Default,
+                      /*isConst=*/false, MirThreadStorage::Shared);
     (void)std::move(b).finish();
     std::abort();   // unreached — finish() aborts first
 }
@@ -119,7 +138,9 @@ namespace {
     MirBlockId const e = b.createBlock(StructCfMarker::EntryBlock);
     b.beginBlock(e);
     b.addReturn();
-    (void)b.addGlobal(kI32, SymbolId{5}, /*lit=*/12345, /*func=*/{});
+    (void)b.addGlobal(kI32, SymbolId{5}, /*lit=*/12345, /*func=*/{},
+                      SymbolBinding::Global, SymbolVisibility::Default,
+                      /*isConst=*/false, MirThreadStorage::Shared);
     (void)std::move(b).finish();
     std::abort();
 }

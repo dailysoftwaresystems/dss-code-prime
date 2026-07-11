@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
 
 // Canonical object-format taxonomy — the closed-enum vocabulary the
@@ -171,6 +172,121 @@ dataImportBindingName(DataImportBinding b) noexcept {
 dataImportBindingFromName(std::string_view s) noexcept {
     return kDataImportBindingTable.fromName(s);
 }
+
+// ── Thread-local access model (D-CSUBSET-THREAD-LOCAL, TLS C1) ─────
+//
+// HOW code reaches a thread-local object's per-thread copy — a property
+// of the OBJECT FORMAT's TLS runtime contract (who sets the thread
+// pointer up, what it points at), exactly like `ExternCallDispatch` /
+// `DataImportBinding` above. Keyed by the format because the SAME CPU
+// target uses different access sequences under different formats
+// (x86_64-ELF reads `fs:[0]`; x86_64-PE reads the TEB slot `gs:[0x58]`
+// and indexes a per-module slot array), so it cannot live on the target
+// schema. The VALUES (segment-override byte, base displacement) are
+// per-format config; the SHAPES (which instructions) come from the
+// target schema's opcode rows — the lowering branches only on this
+// closed verb set, never on a format/CPU identity.
+//
+//   * `local-exec` (ELF static TLS, C1): the thread pointer register
+//     is read via ONE dereference of `segmentPrefixByte:[baseDisplacement]`
+//     (x86_64 Linux: `mov r, fs:[0]` — fs:[0] holds the tcbhead's own
+//     address = tp), then the object's address is `tp + tpoff(sym)`
+//     where tpoff is a LINK-TIME constant (the `tls-tpoff32`-class
+//     relocation the walker resolves via the target's TlsIdentity
+//     variant formula). Correct for a statically-merged executable
+//     (module 1 is always tp-adjacent).
+//   * `pe-indexed` (Windows, C3): `gs:[0x58]` = the TEB's
+//     ThreadLocalStoragePointer slot array; the module's slot index is
+//     loaded from `_tls_index` and the object sits at
+//     `slots[_tls_index] + offset`. Declared now as vocabulary; its
+//     LOWERING lands with the PE TLS cycle — the MIR→LIR arm fails
+//     LOUD (never a silently-wrong local-exec sequence) until then.
+//   * `macho-tlv` (Mach-O, C4): access is a CALL through the object's
+//     `__thread_vars` TLV descriptor (`_tlv_bootstrap`). Declared as
+//     vocabulary; fails loud at lowering until the Mach-O TLS cycle.
+//
+// A format that declares NO `tlsAccess` block cannot lower a
+// thread-local access at all: MIR→LIR fails loud
+// (`K_FormatLacksThreadLocalSupport`) on the first thread-local
+// GlobalAddr — never a silent process-shared alias.
+enum class TlsAccessModel : std::uint8_t {
+    LocalExec = 1,  // ELF static TLS: tp-register + link-time tpoff
+    PeIndexed = 2,  // PE TEB slot-array via _tls_index (lowering: PE TLS cycle)
+    MachoTlv  = 3,  // Mach-O TLV descriptor call (lowering: Mach-O TLS cycle)
+};
+
+inline constexpr EnumNameTable<TlsAccessModel, 3> kTlsAccessModelTable{{{
+    { TlsAccessModel::LocalExec, "local-exec" },
+    { TlsAccessModel::PeIndexed, "pe-indexed" },
+    { TlsAccessModel::MachoTlv,  "macho-tlv"  },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+tlsAccessModelName(TlsAccessModel m) noexcept {
+    return kTlsAccessModelTable.name(m);
+}
+[[nodiscard]] constexpr std::optional<TlsAccessModel>
+tlsAccessModelFromName(std::string_view s) noexcept {
+    return kTlsAccessModelTable.fromName(s);
+}
+
+// D-CSUBSET-THREAD-LOCAL (TLS C3): the reserved well-known SymbolId VALUE
+// that names the PE `_tls_index` slot — a LINK-TIER writer-minted SINGLETON
+// (never a MIR symbol) that the `pe-indexed` access sequence's riprel read
+// targets AND the PE writer binds. It is a HIGH sentinel a DENSE per-CU
+// SymbolId (minted upward from 1) can never reach, so on the single-CU
+// emission path (the only path a thread-local access + definition co-reside
+// on today) it survives from MIR→LIR lowering to `pe.cpp` UNREMAPPED and the
+// writer binds `symbolVa[reserved] = _tls_index VA` unambiguously. On a
+// multi-CU merge the retarget would remap it to a fresh dense id → the riprel
+// reloc resolves against no `symbolVa` entry → FAIL-LOUD undefined (multi-file
+// extern-`thread_local` is the deferred `D-PIPELINE-CU5-MULTIFILE-EXTERN-DATA`
+// surface; never a silent wrong-address). Both `mir_to_lir.cpp` (the lowering)
+// and `pe.cpp` (the writer) read this ONE constant — a plain `std::uint32_t`
+// so this leaf header stays free of the `strong_ids.hpp` dependency; each side
+// wraps it in `SymbolId{...}` at use.
+inline constexpr std::uint32_t kTlsIndexReservedSymbolIdValue = 0xFFFF'FF01u;
+
+// Is `v` a writer-minted LINK-TIER reserved SymbolId VALUE — one the FORMAT
+// WRITER (not the module) defines into its `symbolVa` map? Today the sole
+// member is the PE `_tls_index` singleton above. The linker's pre-writer
+// cross-reference unifier EXEMPTS these from its undefined-symbol check —
+// exactly as it exempts extern imports (which the import-table writer
+// resolves) — because the writer binds them (or fails loud if the format has
+// no TLS machinery, e.g. an ELF module that somehow carried the id). Keeps the
+// linker free of any format-name branch: it asks "is this a writer-reserved
+// id", not "is this PE".
+[[nodiscard]] constexpr bool
+isWriterReservedSymbolIdValue(std::uint32_t v) noexcept {
+    return v == kTlsIndexReservedSymbolIdValue;
+}
+
+// The format's TLS access block (`"tlsAccess"` in `.format.json`).
+// `segmentPrefixByte` is the x86 segment-override prefix byte the
+// `tlsbase` instruction emits as its FIRST byte (0x64 = fs on
+// ELF-Linux; 0x65 = gs on PE) — threaded to the encoder via the LIR
+// instruction's payload so the x86_64 TARGET JSON stays format-blind
+// (the same `tlsbase` opcode row serves ELF and PE with config-only
+// differences). `baseDisplacement` is the literal disp32 of the
+// thread-pointer slot (`fs:[0]` on ELF; the TEB's `gs:[0x58]` on PE).
+// Non-x86 targets ignore `segmentPrefixByte` (their tp read is a
+// dedicated register, e.g. arm64 MRS TPIDR_EL0 — the opcode row
+// carries the shape; this block still selects the MODEL).
+struct DSS_EXPORT TlsAccessInfo {
+    TlsAccessModel model             = TlsAccessModel::LocalExec;
+    std::uint8_t   segmentPrefixByte = 0;  // x86 segment-override byte (0x64 fs / 0x65 gs)
+    std::uint32_t  baseDisplacement  = 0;  // disp32 of the tp slot (ELF fs:[0] → 0)
+    // D-CSUBSET-THREAD-LOCAL (TLS C3): the NAME of the writer-minted
+    // `_tls_index` singleton the `pe-indexed` access sequence reads (PE:
+    // "__dss_tls_index"). REQUIRED for `pe-indexed` (the loader validates
+    // it non-empty — a pe-indexed model without a named index slot cannot
+    // lower); ignored (and empty) for `local-exec`/`macho-tlv`, whose
+    // access shapes do not index a module TLS array. The NUMERIC id both
+    // sides agree on is `kTlsIndexReservedSymbolIdValue` above; this string
+    // is the human-readable anchor (diagnostics + the loader's presence
+    // gate) so the config stays self-describing.
+    std::string    tlsIndexSlotName;
+};
 
 // THE single source of truth for the extern-call-site SHAPE selection
 // (D-FFI-EXTERN-CALL-DISPATCH). `true`  → the call site DEREFERENCES a

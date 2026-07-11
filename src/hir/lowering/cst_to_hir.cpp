@@ -206,6 +206,14 @@ struct Lowerer {
     // side-table stays sparse and a wrongly-defaulted global fails SAFE (writable
     // never re-introduces the read-only-store crash).
     std::vector<std::pair<HirNodeId, MutabilityAttr>>& mutability;
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared accumulator of (decl HIR node →
+    // ThreadLocalAttr) pairs, populated from the bound symbol's
+    // `SymbolRecord.isThreadLocal` at each Global lowering site AND the
+    // extern-data arm (where the record is in hand) — the exact `mutability`
+    // discipline. Applied to the result's HirThreadLocalMap AFTER finish().
+    // Only THREAD-LOCAL decls are recorded (absence ⇒ ordinary process-shared
+    // storage), so the side-table stays sparse.
+    std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& threadLocalAcc;
     // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared accumulator of (ACCESS HIR node
     // → VolatileAttr) pairs, populated from the bound symbol's / field's
     // `SymbolRecord.isVolatile` at each USER-access lowering site (object Ref,
@@ -795,11 +803,13 @@ struct Lowerer {
             std::vector<HirExternRecord>& ed,
             std::vector<std::pair<HirNodeId, LinkageAttr>>& lk,
             std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut,
+            std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& tls,
             std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
             std::vector<std::pair<HirNodeId, AlignmentAttr>>& aln)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
-          linkage(lk), mutability(mut), volatileAcc(vol), alignmentAcc(aln) {
+          linkage(lk), mutability(mut), threadLocalAcc(tls), volatileAcc(vol),
+          alignmentAcc(aln) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -1096,6 +1106,19 @@ struct Lowerer {
         auto const* rec = model.recordFor(sym);
         if (rec != nullptr && rec->isConst)
             mutability.push_back({node, MutabilityAttr{/*isConst=*/true}});
+    }
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): record thread-storage duration for a
+    // lowered Global / ExternGlobal node from its bound symbol's
+    // `SymbolRecord.isThreadLocal` (sparse: only thread-local decls are
+    // stored; absence ⇒ ordinary process-shared storage). Called at every
+    // Global-producing site alongside `recordMutability` (the two axes are
+    // orthogonal — `const thread_local` records BOTH) plus the extern-data
+    // arm. `sym` must be the declaration's declared symbol.
+    void recordThreadLocal(HirNodeId node, SymbolId sym) {
+        if (!sym.valid()) return;
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->isThreadLocal)
+            threadLocalAcc.push_back({node, ThreadLocalAttr{/*isThreadLocal=*/true}});
     }
     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: record an explicit `alignas` override
     // for a lowered Global / VarDecl node from its bound symbol's
@@ -2085,6 +2108,39 @@ struct Lowerer {
                 // from the symbol's type (enum underlying / the constant's own
                 // scalar).
                 if (auto const* erec = model.recordFor(sym)) {
+                    // FC17.5 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER, C99
+                    // 6.4.2.2): a read of a predefined function-name symbol
+                    // (`__func__` / a configured alias) FOLDS to a string-
+                    // literal-shaped constant — BYTE-IDENTICAL to
+                    // lowerStringLiteral's narrow arm (core = the record's
+                    // Array element core, value = the function-name bytes
+                    // WITHOUT the trailing NUL, type = the record's
+                    // Array<core, len+1>) — so every existing string-literal
+                    // consumer (rodata materialization, array→pointer decay,
+                    // `__func__[i]` lvalue indexing, sizeof via the semantic
+                    // stamp, &__func__ via the Literal-lvalue arm) rides
+                    // unchanged. The record's type is minted at the Pass-1
+                    // bind; a malformed one (not a sized element-typed Array)
+                    // can only mean a corrupted mint — fail loud, never a
+                    // guessed literal.
+                    if (erec->isPredefinedFunctionName) {
+                        TypeId const litTy = erec->type;
+                        if (!litTy.valid()
+                            || interner.kind(litTy) != TypeKind::Array
+                            || interner.operands(litTy).empty()) {
+                            unsupported(node,
+                                "predefined function-name identifier carries "
+                                "a malformed type (expected Array<core, N+1>)");
+                            return E{errorNode(node), InvalidType};
+                        }
+                        HirLiteralValue v;
+                        v.core  = interner.kind(interner.operands(litTy)[0]);
+                        v.value = erec->predefinedFunctionNameText;
+                        return E{track(builder.makeLiteral(
+                                          litTy, literals.add(std::move(v))),
+                                       node),
+                                 litTy};
+                    }
                     if (auto lv = constantLiteralForSymbol(*erec, interner)) {
                         return E{track(builder.makeLiteral(
                                           type, literals.add(std::move(*lv))), node),
@@ -2927,6 +2983,26 @@ struct Lowerer {
 
     E lowerLiteral(NodeId operandNode, NodeId tokenNode, SchemaTokenId tk, TypeId type) {
         TypeKind core = litCore_.at(tk.v);
+        // C23 nullptr — D-CSUBSET-NULLPTR / KEYSTONE Fix 1(a). The `nullptr` keyword
+        // is typed NullptrT at the SEMANTIC tier (for the one-way conversion rules +
+        // `_Generic` distinctness), but it LOWERS DIRECTLY to the target-agnostic
+        // integer-0 null constant here — the SAME node `nullPointerConstantLiteral`
+        // materializes for a folded-0 null pointer constant. So `nullptr` == literal
+        // `0` at the HIR/MIR tier, reusing ALL existing null-pointer-constant lowering
+        // (coerce→Ptr, the null comparison, the ternary null-materialization,
+        // `if(nullptr)`→false), and NullptrT NEVER becomes an HIR-literal / MIR-const
+        // type. Keyed on the core kind — a closed-verb lattice rule, not a language
+        // identity. The `I_NullptrTypeInMir` verifier enforces the never-reaches-MIR
+        // invariant this establishes by construction.
+        if (core == TypeKind::NullptrT) {
+            HirLiteralValue v;
+            v.core  = TypeKind::I32;
+            v.value = std::int64_t{0};
+            HirNodeId const zeroLit = builder.makeLiteral(
+                interner.primitive(TypeKind::I32), literals.add(v),
+                HirFlags::Synthetic);
+            return E{track(zeroLit, operandNode), interner.primitive(TypeKind::I32)};
+        }
         std::string_view const text = tree().text(tokenNode);
         HirLiteralValue val;          // value defaults to monostate (= undecodable)
         bool ok = true;
@@ -4766,8 +4842,41 @@ struct Lowerer {
             return std::nullopt;
         for (NodeId c : visible(core)) {
             if (isToken(c) && sem.identifierToken.valid()
-                && tree().tokenKind(c).v == sem.identifierToken.v)
-                return std::pair{model.symbolAt(c), typeAtOr(core, InvalidType)};
+                && tree().tokenKind(c).v == sem.identifierToken.v) {
+                // FC17.5 F1 (D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER, C99
+                // 6.4.2.2): a predefined function-name identifier
+                // (`__func__`) is NOT a modifiable lvalue — its reads FOLD to
+                // a string-literal constant (there is no storage slot), so a
+                // ++/--/compound-assign classifier building a simple-lvalue
+                // write-back here would dead-end at MIR with an engine-level
+                // "no storage slot" failure. This is the ONE chokepoint both
+                // lvalue classifiers (classifyIncDecLvalue, classifyLvalue)
+                // share — emit the REAL diagnostic and return {sym,
+                // InvalidType}: both callers treat an invalid type as "not a
+                // simple lvalue" and bail (classifyIncDecLvalue diagnostic-
+                // free; classifyLvalue's assign-arm callers may add a generic
+                // exprError after this one — both loud, 0xE040 first). Plain
+                // reads never pass through here (lowerExpr
+                // folds them) and `&__func__` rides the operator-table
+                // AddressOf path — both stay legal. Simple `=` / `+=` are
+                // already stopped at SEMANTIC by the symbol's isConst
+                // (S_ConstViolation), so this guard is the inc/dec class's
+                // fail-loud gate. `__func__[0] = 'x'` is the pre-existing
+                // rodata-write class (D-CSUBSET-INCDEC-CONST-LVALUE family).
+                SymbolId const sym = model.symbolAt(c);
+                if (auto const* rec = model.recordFor(sym);
+                    rec != nullptr && rec->isPredefinedFunctionName) {
+                    emitH(DiagnosticCode::S_PredefinedIdentifierNotAddressable,
+                          c,
+                          std::format(
+                              "'{}' is a predefined identifier (C99 6.4.2.2) "
+                              "— it is const, has no modifiable storage, and "
+                              "cannot be the target of ++/--/assignment",
+                              rec->name));
+                    return std::pair{sym, InvalidType};
+                }
+                return std::pair{sym, typeAtOr(core, InvalidType)};
+            }
         }
         return std::nullopt;
     }
@@ -5706,6 +5815,118 @@ struct Lowerer {
                                               HirFlags::Synthetic);
     }
 
+    // FC17.5 (D-CSUBSET-EMPTY-INITIALIZER, C23 6.7.10): the CLOSED allowlist
+    // (design-audit F4) of scalar TypeKinds a brace initializer may target.
+    // Exactly the kinds `synthZeroOrError`'s scalar/Enum arms mint a typed
+    // zero for: Bool, the integer cores I8..U128, the float cores F16..F128,
+    // Char/Byte, Enum (zero-as-underlying, enum-typed), and Ptr (the null
+    // pointer — incl. Ptr<FnSig>, runtime-proven by the aggregate zero-fill).
+    // DELIBERATELY excluded: Void/FnSig/NullptrT (an Extension kind)/Vector/
+    // Matrix/… — `(void){}` admitted here would mint a Void-typed literal and
+    // corrupt the type system; those context types keep the aggregate gate's
+    // fail-loud reject. A VolatileQual skin never reaches this switch —
+    // `interner.kind()` sees through it to the material kind.
+    [[nodiscard]] static bool isScalarBraceInitKind(TypeKind k) {
+        switch (k) {
+            case TypeKind::Bool:
+            case TypeKind::I8:  case TypeKind::I16: case TypeKind::I32:
+            case TypeKind::I64: case TypeKind::I128:
+            case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
+            case TypeKind::U64: case TypeKind::U128:
+            case TypeKind::F16: case TypeKind::F32: case TypeKind::F64:
+            case TypeKind::F128:
+            case TypeKind::Char:
+            case TypeKind::Byte:
+            case TypeKind::Enum:
+            case TypeKind::Ptr:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // FC17.5 (D-CSUBSET-EMPTY-INITIALIZER, C23 6.7.10): brace initializer for
+    // a SCALAR context type, reached from the SAME single `lowerBraceInit`
+    // funnel every brace-init route uses (decl init / return / assign-RHS /
+    // call-arg / compound literal / nested designated slot):
+    //   • `{}` (zero initElements)   → `synthZeroOrError(contextType)` — the
+    //     C23 6.7.10p11 empty initializer zero-initializes; the shared helper
+    //     already covers every allowlisted core + Enum + Ptr;
+    //   • `{ expr }` (exactly one, undesignated, NON-brace) → the expression
+    //     lowers + coerces through `lowerExprOrBraceInit` — byte-identical to
+    //     the plain `= expr` init path (6.7.10p12: the object's value is that
+    //     of the expression);
+    //   • anything else — >1 elements, a designator (`{.x=1}` / `{[0]=1}` on
+    //     a scalar), or a NESTED brace list `{{42}}` (audit N2: 6.7.10p12
+    //     requires a SINGLE expression; a brace list is not one) —
+    //     → S_InvalidScalarInitializer (0xE03F), never a silent guess.
+    [[nodiscard]] HirNodeId lowerScalarBraceInit(NodeId braceInitListNode,
+                                                 TypeId contextType) {
+        // Collect the initElement children — the SAME rule filter the
+        // aggregate loop below uses (tokens `{`/`}`/`,` skip; a grammar
+        // without initElement configured has no brace-init surface at all).
+        std::vector<NodeId> elems;
+        for (NodeId elem : visible(braceInitListNode)) {
+            if (isToken(elem)) continue;
+            if (tree().kind(elem) != NodeKind::Internal) continue;
+            if (!cfg.initElementRule.valid()
+             || tree().rule(elem).v != cfg.initElementRule.v) continue;
+            elems.push_back(elem);
+        }
+        if (elems.empty()) {
+            return synthZeroOrError(braceInitListNode, contextType);
+        }
+        if (elems.size() > 1) {
+            emitH(DiagnosticCode::S_InvalidScalarInitializer,
+                  braceInitListNode,
+                  "a scalar brace initializer takes at most ONE expression "
+                  "(C23 6.7.10p12) — excess elements");
+            return errorNode(braceInitListNode, contextType);
+        }
+        // Exactly one initElement: it must be a bare (undesignated) value.
+        // Mirror the aggregate loop's designator discrimination so `{.x=1}` /
+        // `{[0]=1}` on a scalar is the constraint violation C makes it.
+        NodeId valueExprCst{};
+        for (NodeId c : visible(elems[0])) {
+            if (isToken(c)) continue;
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            auto const [designatorCore, r] = peelToDesignatorLeaf(c);
+            (void)designatorCore;
+            bool const isDesignator =
+                (cfg.designatedFieldRule.valid()
+                 && r == cfg.designatedFieldRule.v)
+                || (cfg.designatedIndexRule.valid()
+                    && r == cfg.designatedIndexRule.v);
+            if (isDesignator) {
+                emitH(DiagnosticCode::S_InvalidScalarInitializer, c,
+                      "a designator is not valid in a SCALAR brace "
+                      "initializer (C23 6.7.10p12)");
+                return errorNode(braceInitListNode, contextType);
+            }
+            valueExprCst = c;   // the value expression (last non-designator)
+        }
+        if (!valueExprCst.valid()) {
+            // An initElement with no expression child is a malformed parse —
+            // fail loud rather than silently zero-fill (`{,}` cannot parse,
+            // so this is recovery-tree territory).
+            return reportedError(braceInitListNode,
+                "scalar brace initializer element carries no expression");
+        }
+        // Audit N2: `{{42}}` — the single element is itself a brace list.
+        // C23 6.7.10p12 requires a SINGLE EXPRESSION; a nested brace list is
+        // a constraint violation for a scalar target (only aggregates recurse).
+        if (isBraceInitList(peelToBraceInitOrCore(valueExprCst))) {
+            emitH(DiagnosticCode::S_InvalidScalarInitializer, valueExprCst,
+                  "a scalar brace initializer must contain a single "
+                  "EXPRESSION, not a nested brace list (C23 6.7.10p12)");
+            return errorNode(braceInitListNode, contextType);
+        }
+        // The single-expression form — lower + coerce exactly like `= expr`
+        // (the shared funnel; the brace-list arm inside it is unreachable
+        // after the N2 gate above).
+        return lowerExprOrBraceInit(valueExprCst, contextType);
+    }
+
     // D5.3 brace-init lowering. Takes a `braceInitList` CST node and a
     // CONTEXT TYPE (the resolved type the brace-init must produce — a
     // struct or array). Produces a positional `HirKind::ConstructAggregate`
@@ -5738,12 +5959,25 @@ struct Lowerer {
                 "brace-init requires a known context type");
         }
         TypeKind const containerKind = interner.kind(contextType);
+        // FC17.5 (D-CSUBSET-EMPTY-INITIALIZER, C23 6.7.10): a SCALAR context
+        // type takes the dedicated scalar arm — `{}` zero-initializes
+        // (6.7.10p11), `{ expr }` initializes with the single expression
+        // (6.7.10p12). The CLOSED allowlist (F4) admits exactly the scalar
+        // kinds `synthZeroOrError` can mint a zero for; everything else
+        // (Void/FnSig/NullptrT/Vector/…) falls through to the aggregate gate's
+        // fail-loud reject — `(void){}` admitted here would corrupt the type
+        // system with a Void-typed literal.
+        if (isScalarBraceInitKind(containerKind)) {
+            return lowerScalarBraceInit(braceInitListNode, contextType);
+        }
         bool const isArray  = (containerKind == TypeKind::Array);
         bool const isStruct = (containerKind == TypeKind::Struct);
         bool const isUnion  = (containerKind == TypeKind::Union);
         if (!isArray && !isStruct && !isUnion) {
             return reportedError(braceInitListNode,
-                "brace-init target type must be struct, union, or array");
+                "brace-init target type must be a scalar, struct, union, or "
+                "array (Void / function / other non-object types stay loud "
+                "by the closed scalar allowlist)");
         }
         // D5.4: union brace-init has distinct semantics from struct —
         // at most ONE element, initializing exactly one variant.
@@ -6954,6 +7188,7 @@ struct Lowerer {
                 }
                 HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), d);
                 recordMutability(g, sym);
+                recordThreadLocal(g, sym);  // TLS C1: `static thread_local` local
                 recordVolatility(g, sym);   // c21: volatile static-local global init store
                 recordAlignment(g, sym);    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
                 recordLinkage(g, staticLinkage);  // {Local, Default} — internal
@@ -6967,7 +7202,13 @@ struct Lowerer {
             // HIR→MIR can route a const-init global to read-only `.rodata` and a
             // mutable one to writable `.data` (D-LK4-DATA-PRODUCER-MUTABLE-
             // GLOBAL). Locals are stack slots — mutability is irrelevant there.
-            if (asGlobal) recordMutability(lowered, sym);
+            // TLS C1: thread-storage duration rides the same global-only
+            // discipline (a block-scope thread_local WITHOUT static already
+            // failed loud in Pass 2 — no automatic can reach here marked).
+            if (asGlobal) {
+                recordMutability(lowered, sym);
+                recordThreadLocal(lowered, sym);
+            }
             // c21 (D-CSUBSET-VOLATILE-QUALIFIER): volatility applies to BOTH a
             // global's load-time init store (HIR→MIR :6886) AND a local's init
             // store into its alloca (HIR→MIR :5712) — record unconditionally on
@@ -7039,6 +7280,7 @@ struct Lowerer {
         if (asGlobal) {
             HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
             recordMutability(g, sym);   // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL
+            recordThreadLocal(g, sym);  // TLS C1 (D-CSUBSET-THREAD-LOCAL)
             recordVolatility(g, sym);   // c21 (D-CSUBSET-VOLATILE-QUALIFIER)
             recordAlignment(g, sym);    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
             return g;
@@ -7416,6 +7658,7 @@ struct Lowerer {
         HirNodeId const g = track(builder.makeGlobal(type, sym.v, init), node);
         recordLinkage(g, linkAttr);
         recordMutability(g, sym);   // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL
+        recordThreadLocal(g, sym);  // TLS C1 (D-CSUBSET-THREAD-LOCAL)
         recordAlignment(g, sym);    // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN
         return g;
     }
@@ -7750,6 +7993,11 @@ struct Lowerer {
         }
         HirNodeId const g = track(builder.makeExternGlobal(type, sym.v), node);
         recordExtern(g);
+        // TLS C1 (D-CSUBSET-THREAD-LOCAL): `extern thread_local int e;` — the
+        // record's flag rides the same side-table as intra-module globals so
+        // HIR→MIR's extern-data pre-pass stamps ExternImport.isThreadLocal
+        // (the linker-side surviving-extern handling is slice C).
+        recordThreadLocal(g, sym);
         return g;
     }
 
@@ -7924,6 +8172,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: shared (Global node → MutabilityAttr)
     // accumulator, moved onto result->mutabilityMap after finish().
     std::vector<std::pair<HirNodeId, MutabilityAttr>> mutability;
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): shared (decl node → ThreadLocalAttr)
+    // accumulator, moved onto result->threadLocalMap after finish().
+    std::vector<std::pair<HirNodeId, ThreadLocalAttr>> threadLocalAcc;
     // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared (access node → VolatileAttr)
     // accumulator, moved onto result->volatileMap after finish().
     std::vector<std::pair<HirNodeId, VolatileAttr>> volatileAcc;
@@ -7941,7 +8192,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
-            mutability, volatileAcc, alignmentAcc));
+            mutability, threadLocalAcc, volatileAcc, alignmentAcc));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -7989,6 +8240,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     for (auto& [id, loc] : spans) result->sourceMap.set(id, loc);
     for (auto& [id, attr] : linkage) result->linkageMap.set(id, attr);
     for (auto& [id, attr] : mutability) result->mutabilityMap.set(id, attr);
+    for (auto& [id, attr] : threadLocalAcc)
+        result->threadLocalMap.set(id, attr);   // TLS C1
     for (auto& [id, attr] : volatileAcc) result->volatileMap.set(id, attr);  // c21
     for (auto& [id, attr] : alignmentAcc) result->alignmentMap.set(id, attr);  // alignas
     result->externDecls = std::move(externDecls);

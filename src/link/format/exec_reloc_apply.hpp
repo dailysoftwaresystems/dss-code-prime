@@ -66,6 +66,10 @@
 //                            bits[20:2]→immhi[23:5].
 //   * Aarch64AddAbsLo12:     value = (S + A) & 0xFFF;
 //                            OR (value << 10) into ADD imm12 [21:10].
+//   * Aarch64TprelAddHi12:   value = (S + A) >> 12; UNSIGNED 12-bit
+//                            (S+A must sit in [0, 0xFFFFFF] — fail
+//                            loud outside); OR (value << 10) into ADD
+//                            imm12 [21:10]. TLS C2 local-exec hi12.
 //
 // where S = `symbolVa[target]`, A = `Relocation::addend`,
 // P = `patchSectionVa + funcStart + Relocation::offset`.
@@ -331,6 +335,58 @@ namespace dss::link::format {
                         return false;
                     }
                     auto const v = static_cast<std::uint32_t>(SA) & 0xFFFu;
+                    std::uint32_t const bits = v << 10;
+                    std::uint32_t const mask = 0xFFFu << 10;
+                    auto const inst = readInst32();
+                    if (rejectIfBitfieldDirty(inst, mask)) return false;
+                    writeInst32(inst | bits);
+                    break;
+                }
+                case RelocFormulaKind::Aarch64TprelAddHi12: {
+                    // TLS C2 (D-CSUBSET-THREAD-LOCAL): the local-exec
+                    // thread-pointer-offset HIGH half —
+                    //   value = (S + A) >> 12, into ADD imm12 [21:10]
+                    // of the `ADD Xd, Xn, #hi12, LSL #12` word (the
+                    // sh=1 bit is part of the assembler-emitted base
+                    // pattern; this arm only owns the imm12 field).
+                    // S is the SIGNED tpoff the walker bit-cast into
+                    // symbolVa[target] (addTlsSymbolOffsets) — arm64
+                    // is Variant I, so a well-formed tpoff is
+                    // POSITIVE: alignUp(tcbHeaderBytes, p_align) +
+                    // templateOffset.
+                    //
+                    // RANGE (audit LOW-d — mandatory, unlike the
+                    // magnitude-free lo12 arm): hi12 is an UNSIGNED
+                    // 12-bit field, so the hi12/lo12 pair addresses
+                    // tpoffs in [0, 0xFFFFFF] (16 MiB − 1) only.
+                    //   * SA < 0 — a Variant-II (negative) tpoff
+                    //     mis-fed to the Variant-I formula, or a
+                    //     non-TLS VA reaching a tls kind past the
+                    //     CRIT-1 cross-check; `(uint32)negative >> 12`
+                    //     would silently address the wrong slot.
+                    //   * SA > 0xFFFFFF — a >16 MiB TLS block; the
+                    //     `& 0xFFF` wrap would silently drop bit 24+
+                    //     and address the WRONG per-thread slot.
+                    // Both fail LOUD.
+                    std::int64_t const SA = static_cast<std::int64_t>(S) + A;
+                    if (SA < 0 || SA > 0xFFFFFF) {
+                        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                             prefixStr + ": relocation '" + tri->name
+                                 + "' got S+A=" + std::to_string(SA)
+                                 + " — the local-exec ADD_TPREL_HI12/LO12 "
+                                   "pair addresses thread-pointer offsets "
+                                   "in [0, 16777215] only (unsigned-12-bit "
+                                   "hi12 field, ~16 MiB static-TLS block); "
+                                   "a negative value indicates a Variant "
+                                   "mismatch and an over-cap one a TLS "
+                                   "block this sequence cannot reach — "
+                                   "either would silently address the "
+                                   "wrong per-thread slot "
+                                   "(D-CSUBSET-THREAD-LOCAL).");
+                        return false;
+                    }
+                    auto const v =
+                        (static_cast<std::uint32_t>(SA) >> 12) & 0xFFFu;
                     std::uint32_t const bits = v << 10;
                     std::uint32_t const mask = 0xFFFu << 10;
                     auto const inst = readInst32();

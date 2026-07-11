@@ -313,6 +313,22 @@ void parseVariantTemplate(json const& v, std::size_t opIdx, std::size_t vi,
             tmpl.condInvert = t.at("condInvert").get<bool>();
         }
     }
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): `payloadBytePrefix` — emit the
+    // instruction's LIR payload low byte as the FIRST byte (x86 prefix
+    // group 2 segment override, before mandatoryPrefix + REX). Used by
+    // `tlsbase`; the byte VALUE flows from format config through the
+    // lowering's payload, keeping the shared target JSON format-blind.
+    // The encoder fails loud on payload low-byte 0 (never a valid
+    // segment override).
+    if (t.contains("payloadBytePrefix")) {
+        auto const path = std::format("/opcodes/{}/encoding/variants/{}/template/payloadBytePrefix", opIdx, vi);
+        if (!t.at("payloadBytePrefix").is_boolean()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, path,
+                      "'payloadBytePrefix' must be a boolean");
+        } else {
+            tmpl.payloadBytePrefix = t.at("payloadBytePrefix").get<bool>();
+        }
+    }
     // D-LIR-SETCC-WIDTH-CONTRACT (step 13.5 cycle 1 post-fold): force a
     // REX prefix even when no REX bit is set — required by x86 byte-
     // register-bearing opcodes (setcc) to access the spl/bpl/sil/dil
@@ -847,6 +863,19 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
                 }
                 info.addendBias = static_cast<std::int32_t>(ab);
             }
+            // TLS C1 (D-CSUBSET-THREAD-LOCAL): `tls` — marks the kind
+            // as thread-local-offset-bearing (its patched value is a
+            // tpoff, not a VA). Consumed by the walker's TLS symbol ⟺
+            // tls-kind cross-check (both directions).
+            if (r.contains("tls")) {
+                if (!r.at("tls").is_boolean()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/tls", i),
+                           "'tls' must be a boolean");
+                    return false;
+                }
+                info.tls = r.at("tls").get<bool>();
+            }
             // Non-Linear coherence + default widthBytes=4 (ARM64
             // instruction word).
             if (info.formulaKind != RelocFormulaKind::Linear) {
@@ -1069,6 +1098,71 @@ LoadResult<std::shared_ptr<TargetSchema>> TargetSchema::loadFromText(
     // layout/sizeof site asserts `aggregateLayoutLoaded()` and emits a loud
     // diagnostic if a target is asked to lay out an aggregate without declaring
     // its params — a silent wrong-layout is thereby still impossible.
+
+    // ── tls identity (TLS C1, D-CSUBSET-THREAD-LOCAL — optional) ──
+    // The target's static-TLS layout convention: `"tls": { "variant":
+    // "variant1"|"variant2", "tcbHeaderBytes": N }`. OPTIONAL like
+    // `aggregateLayout` — absence IS the capability signal (the walker's
+    // tpoff helper fails loud on a TLS symbol under a tls-less target).
+    // A PRESENT block is strict: `variant` is REQUIRED closed-enum
+    // (an unknown spelling must never silently pick a variant — the
+    // two variants produce opposite-signed tpoffs, a silent-miscompile
+    // axis); `tcbHeaderBytes` is optional (default 0, the Variant-II
+    // value) but must be a non-negative integer when present.
+    if (doc.contains("tls")) {
+        auto const& tb = doc.at("tls");
+        if (!tb.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/tls",
+                      "'tls' must be an object { \"variant\": "
+                      "\"variant1\"|\"variant2\", \"tcbHeaderBytes\": N }");
+        } else {
+            TlsIdentity tlsId{};
+            bool ok = true;
+            if (!tb.contains("variant") || !tb.at("variant").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField, "/tls/variant",
+                          "'tls.variant' is required and must be a string "
+                          "(\"variant1\" = tp-at-TCB-head positive tpoff "
+                          "[arm64]; \"variant2\" = tp-past-block-end "
+                          "negative tpoff [x86_64]) — the two produce "
+                          "opposite-signed offsets, so no default is safe");
+                ok = false;
+            } else {
+                auto const name = tb.at("variant").get<std::string>();
+                auto const v = tlsVariantFromName(name);
+                if (!v.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson, "/tls/variant",
+                              std::format("unknown tls variant '{}' — "
+                                          "accepted: \"variant1\", "
+                                          "\"variant2\"", name));
+                    ok = false;
+                } else {
+                    tlsId.variant = *v;
+                }
+            }
+            if (tb.contains("tcbHeaderBytes")) {
+                if (!tb.at("tcbHeaderBytes").is_number_integer()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/tls/tcbHeaderBytes",
+                              "'tcbHeaderBytes' must be a non-negative "
+                              "integer");
+                    ok = false;
+                } else {
+                    std::int64_t const n =
+                        tb.at("tcbHeaderBytes").get<std::int64_t>();
+                    if (n < 0 || n > 0xFFFFFFFFLL) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/tls/tcbHeaderBytes",
+                                  std::format("'tcbHeaderBytes' ({}) must "
+                                              "fit a non-negative u32", n));
+                        ok = false;
+                    } else {
+                        tlsId.tcbHeaderBytes = static_cast<std::uint32_t>(n);
+                    }
+                }
+            }
+            if (ok) data.tls = tlsId;
+        }
+    }
 
     // ── opcodes ──
     if (!doc.contains("opcodes") || !doc.at("opcodes").is_array()) {

@@ -204,6 +204,39 @@ enum class SbIfKind { Expr, Ifdef, Ifndef };
     return true;
 }
 
+// The bare-macro-name definedness test shared by the `#ifdef`/`#ifndef` OPEN
+// (`sbHandleIf`) AND the C23 `#elifdef`/`#elifndef` continuation
+// (`sbHandleElif`): `#ifdef X` / `#elifdef X` == `defined(X)`, `#ifndef X` /
+// `#elifndef X` == `!defined(X)` (C 6.10.1). Extract the single bare `Word`
+// operand from `[p, end)` (skipping leading non-newline trivia) and return its
+// definedness via `isDefinedCb` -- a DIRECT lookup, NO macro expansion of the
+// operand (C 6.10.1p1: the name is the operand of `defined`, not expanded);
+// `negate` inverts the sense for the `ndef` forms. A malformed operand (no name
+// / not a `Word`) fails LOUD (`P_PreprocessorDirective`) and returns false (the
+// branch is treated as not-taken, mirroring the pre-existing `#ifdef` handling).
+// `directiveWord` is the ACTUAL directive spelling for the malformed message
+// (so `#elifdef` with no name says "#elifdef requires a macro name", never
+// "#ifdef ..."). Routing the elif-family definedness through here -- NOT
+// `evalExprCb` -- is load-bearing: the `#if` expression evaluator would fold a
+// bare name to its VALUE (C 6.10.1p4), NOT test its definedness.
+[[nodiscard]] bool sbEvalDefinedName(
+    std::vector<Token> const& in, std::size_t p, std::size_t end, bool negate,
+    char const* directiveWord,
+    std::function<std::string_view(Token const&)> const& textOf,
+    std::function<bool(std::string_view)> const& isDefinedCb,
+    DiagnosticReporter& rep, BufferId diagBuffer) {
+    std::size_t q = p;
+    while (q < end && isTrivia(in[q]) && !isNewline(in[q])) ++q;
+    if (q >= end || isNewline(in[q]) || in[q].coreKind != CoreTokenKind::Word) {
+        emitPP(rep, DiagnosticCode::P_PreprocessorDirective, diagBuffer,
+               (q < end ? in[q].span : SourceSpan::empty(0)),
+               std::string{"#"} + directiveWord + " requires a macro name");
+        return false;
+    }
+    bool const def = isDefinedCb(textOf(in[q]));
+    return negate ? !def : def;
+}
+
 // `#if EXPR` / `#ifdef NAME` / `#ifndef NAME`: push a new frame onto `stack`.
 // The branch is live iff the enclosing context is active AND the condition
 // holds. The operand is evaluated ONLY when the enclosing context is active (a
@@ -228,23 +261,15 @@ void sbHandleIf(std::vector<CondFrame>& stack, std::vector<Token> const& in,
             cond = evalExprCb(in, p, end);
         } else {
             // `#ifdef`/`#ifndef NAME`: the operand is a single macro name.
-            std::size_t q = p;
-            while (q < end && isTrivia(in[q]) && !isNewline(in[q])) ++q;
-            if (q >= end || isNewline(in[q])
-                || in[q].coreKind != CoreTokenKind::Word) {
-                emitPP(rep, DiagnosticCode::P_PreprocessorDirective, diagBuffer,
-                       (q < end ? in[q].span : SourceSpan::empty(0)),
-                       std::string{"#"}
-                           + std::string{kind == SbIfKind::Ifdef ? "ifdef"
-                                                                 : "ifndef"}
-                           + " requires a macro name");
-                // Treat a malformed #ifdef as a false (inactive) branch, but
-                // STILL push a frame so the matching #endif balances.
-                cond = false;
-            } else {
-                bool const def = isDefinedCb(textOf(in[q]));
-                cond = (kind == SbIfKind::Ifdef) ? def : !def;
-            }
+            // SHARED with the C23 `#elifdef`/`#elifndef` continuation via
+            // `sbEvalDefinedName` -- a malformed operand fails loud there and
+            // returns false, so a malformed `#ifdef` is still a false (inactive)
+            // branch and the frame is STILL pushed below so the matching #endif
+            // balances (byte-identical to the pre-refactor inline logic).
+            cond = sbEvalDefinedName(in, p, end, kind == SbIfKind::Ifndef,
+                                     kind == SbIfKind::Ifdef ? "ifdef"
+                                                             : "ifndef",
+                                     textOf, isDefinedCb, rep, diagBuffer);
         }
     }
     stack.push_back(CondFrame{
@@ -254,32 +279,59 @@ void sbHandleIf(std::vector<CondFrame>& stack, std::vector<Token> const& in,
         /*seenElse=*/false});
 }
 
-// `#elif EXPR`: on the TOP frame, take this branch iff the enclosing context is
-// active, NO prior branch of this group was taken, AND the expression holds. The
-// operand is evaluated ONLY when it could be taken (C 6.10.1p6) -- so a dead
-// `#elif`'s operand (e.g. `1/0`) is not evaluated. `atSpan` positions the
-// orphan-directive diagnostics.
+// `#elif EXPR` / `#elifdef NAME` / `#elifndef NAME` (C23 6.10.1): on the TOP
+// frame, take this branch iff the enclosing context is active, NO prior branch
+// of this group was taken, AND the controlling condition holds. The `kind`
+// selects the condition SOURCE only: `Expr` reads `evalExprCb` (the `#if`
+// expression evaluator); `Ifdef`/`Ifndef` read the DIRECT bare-name definedness
+// via `sbEvalDefinedName` (C 6.10.1p5: `#elifdef X` == `#elif defined(X)`,
+// `#elifndef X` == `#elif !defined(X)` -- the operand is NOT run through the
+// expression evaluator, which would fold a bare name to its VALUE). The operand
+// is evaluated ONLY when it could be taken (C 6.10.1p6) -- so a dead branch's
+// operand (a `#elif 1/0`, or a malformed `#elifdef` with no name) is not
+// evaluated + emits no diagnostic. `atSpan` positions the orphan-directive
+// diagnostics, which name the actual C directive spelling for `kind`.
 void sbHandleElif(std::vector<CondFrame>& stack, std::vector<Token> const& in,
-                  std::size_t p, std::size_t end, SourceSpan atSpan,
+                  std::size_t p, std::size_t end, SbIfKind kind,
+                  SourceSpan atSpan,
+                  std::function<std::string_view(Token const&)> const& textOf,
+                  std::function<bool(std::string_view)> const& isDefinedCb,
                   std::function<bool(std::vector<Token> const&, std::size_t,
                                      std::size_t)> const& evalExprCb,
                   DiagnosticReporter& rep, BufferId diagBuffer) {
+    // The canonical C spelling of THIS elif-family directive, for the orphan /
+    // after-#else / malformed-name diagnostics (mirrors sbHandleIf's literal
+    // "ifdef"/"ifndef" -- the message names the C directive, not the config
+    // lexeme). For a plain `#elif` this is "elif", byte-identical to before.
+    char const* const word = kind == SbIfKind::Ifdef    ? "elifdef"
+                             : kind == SbIfKind::Ifndef  ? "elifndef"
+                                                         : "elif";
     if (stack.empty()) {
         emitPP(rep, DiagnosticCode::P_PreprocessorDirective, diagBuffer, atSpan,
-               "#elif without a matching #if");
+               std::string{"#"} + word + " without a matching #if");
         return;
     }
     CondFrame& f = stack.back();
     if (f.seenElse) {
         emitPP(rep, DiagnosticCode::P_PreprocessorDirective, diagBuffer, atSpan,
-               "#elif after #else");
+               std::string{"#"} + word + " after #else");
         return;
     }
-    // A prior active branch latches `anyBranchTaken`.
+    // PRESERVE the update ORDER: latch a prior active branch FIRST, then compute
+    // mayTake, THEN evaluate the (possibly-taken) operand, THEN set + re-latch.
+    // Moving the latch after mayTake would re-open a taken-once miscompile.
     f.anyBranchTaken = f.anyBranchTaken || f.thisBranchActive;
     bool const mayTake = f.enclosingActive && !f.anyBranchTaken;
     bool cond = false;
-    if (mayTake) cond = evalExprCb(in, p, end);
+    if (mayTake) {
+        // SWAP only the condition SOURCE by kind -- the frame-transition logic
+        // is identical for `#elif` and the C23 defined-forms.
+        cond = (kind == SbIfKind::Expr)
+                   ? evalExprCb(in, p, end)
+                   : sbEvalDefinedName(in, p, end, kind == SbIfKind::Ifndef,
+                                       word, textOf, isDefinedCb, rep,
+                                       diagBuffer);
+    }
     f.thisBranchActive = mayTake && cond;
     f.anyBranchTaken   = f.anyBranchTaken || f.thisBranchActive;
 }
@@ -723,16 +775,22 @@ struct SynthBuilder {
             if (j >= toks.size()) break;
             std::string_view const dirWord = toks[j].text;
 
-            // ── c17: the SIX conditional-compilation directives drive
-            // `sbCondStack` (so the include gate agrees with the authoritative
-            // macro pass on which quote-includes are live), then skip the rest of
-            // the directive LINE (its operand must not be re-scanned as include
-            // syntax). The handler logic is the SHARED `sbHandle*` free functions
-            // (the macro pass drives the same ones). ──
+            // ── c17: the conditional-compilation directives drive `sbCondStack`
+            // (so the include gate agrees with the authoritative macro pass on
+            // which quote-includes are live), then skip the rest of the directive
+            // LINE (its operand must not be re-scanned as include syntax). The
+            // handler logic is the SHARED `sbHandle*` free functions (the macro
+            // pass drives the same ones). The C23 `#elifdef`/`#elifndef` words are
+            // OPTIONAL (guarded `.empty()` so a stripped/pre-C23 config is inert,
+            // mirroring the handleDirective + pragma opt-in). ──
             bool const isCond = (dirWord == cfg().ifDirective)
                 || (dirWord == cfg().ifdefDirective)
                 || (dirWord == cfg().ifndefDirective)
                 || (dirWord == cfg().elifDirective)
+                || (!cfg().elifdefDirective.empty()
+                    && dirWord == cfg().elifdefDirective)
+                || (!cfg().elifndefDirective.empty()
+                    && dirWord == cfg().elifndefDirective)
                 || (dirWord == cfg().elseDirective)
                 || (dirWord == cfg().endifDirective);
             if (isCond) {
@@ -785,19 +843,40 @@ struct SynthBuilder {
                         && kind == SbIfKind::Expr;
                     sbFrameUncertain.push_back(
                         (evaluated && sbEvalUncertain) ? 1 : 0);
-                } else if (dirWord == cfg().elifDirective) {
+                } else if (dirWord == cfg().elifDirective
+                           || (!cfg().elifdefDirective.empty()
+                               && dirWord == cfg().elifdefDirective)
+                           || (!cfg().elifndefDirective.empty()
+                               && dirWord == cfg().elifndefDirective)) {
+                    // C23 `#elifdef`/`#elifndef` route through the SAME
+                    // `sbHandleElif` with the DIRECT definedness path (kind); a
+                    // plain `#elif` stays Expr. The word match is guarded by
+                    // `.empty()` so a stripped/pre-C23 config never treats the
+                    // word as a conditional here.
+                    SbIfKind const kind =
+                        (!cfg().elifdefDirective.empty()
+                         && dirWord == cfg().elifdefDirective)
+                            ? SbIfKind::Ifdef
+                        : (!cfg().elifndefDirective.empty()
+                           && dirWord == cfg().elifndefDirective)
+                            ? SbIfKind::Ifndef
+                            : SbIfKind::Expr;
                     SourceSpan const at =
                         (opStart <= opEnd && opStart > 0
                              ? lineToks[opStart - 1].span
                              : SourceSpan::empty(0));
                     bool const beforeActive = sbStackActive(sbCondStack);
-                    sbHandleElif(sbCondStack, lineToks, opStart, opEnd, at,
-                                 evalExprTok, scratch, scanBuf->id());
+                    sbHandleElif(sbCondStack, lineToks, opStart, opEnd, kind, at,
+                                 textOfTok, isDefinedTok, evalExprTok, scratch,
+                                 scanBuf->id());
                     // OR uncertainty into the TOP frame (a group is uncertain if
-                    // ANY of its branches' guards was uncertain). The elif
+                    // ANY of its branches' guards was uncertain) -- ONLY for the
+                    // Expr form. The defined path (elifdef/elifndef) is always
+                    // CONFIDENT (a name is defined or not), so it never marks the
+                    // frame uncertain (mirrors the #ifdef/#ifndef open). The elif
                     // operand is evaluated only when the group may still take.
-                    if (!sbFrameUncertain.empty() && beforeActive
-                        && sbEvalUncertain) {
+                    if (kind == SbIfKind::Expr && !sbFrameUncertain.empty()
+                        && beforeActive && sbEvalUncertain) {
                         sbFrameUncertain.back() = 1;
                     }
                 } else if (dirWord == cfg().elseDirective) {
@@ -1440,11 +1519,16 @@ private:
         if (p >= end || isNewline(in[p])) return end;
         const std::string_view word = text(in[p]);
 
-        // FC14 (MF-3): the SIX conditional-compilation directives are dispatched
+        // FC14 (MF-3): the conditional-compilation directives are dispatched
         // UNCONDITIONALLY -- they must always update `condStack_` so nesting is
         // tracked correctly even inside a dead branch (an `#if` nested in an
         // elided `#if 0` still needs its matching `#endif` to balance). Their
         // operand is evaluated ONLY when the branch should be (handled inside).
+        // ★ This UNCONDITIONAL dispatch (BEFORE the `stackActive()` gate below)
+        // is what closes the C23 `#elifdef`/`#elifndef` silent miscompile: an
+        // unrecognized `#elifdef` would otherwise never update the frame, its
+        // true branch would be skipped, and control would silently fall to
+        // `#else` (D-PP-ELIFDEF-ELIFNDEF).
         if (word == cfg().ifDirective) {
             handleIf(in, p + 1, end, /*kind=*/IfKind::Expr);
             return end;
@@ -1458,7 +1542,21 @@ private:
             return end;
         }
         if (word == cfg().elifDirective) {
-            handleElif(in, p + 1, end);
+            handleElif(in, p + 1, end, IfKind::Expr);
+            return end;
+        }
+        // C23 (D-PP-ELIFDEF-ELIFNDEF; C 6.10.1p5): `#elifdef X` == `#elif
+        // defined(X)`, `#elifndef X` == `#elif !defined(X)` -- routed to the same
+        // `handleElif` with the DIRECT definedness kind. OPTIONAL words, guarded
+        // by `.empty()` so a stripped/pre-C23 config leaves the directive to the
+        // unsupported-directive fail-loud below (never a silent branch skip).
+        if (!cfg().elifdefDirective.empty() && word == cfg().elifdefDirective) {
+            handleElif(in, p + 1, end, IfKind::Ifdef);
+            return end;
+        }
+        if (!cfg().elifndefDirective.empty()
+            && word == cfg().elifndefDirective) {
+            handleElif(in, p + 1, end, IfKind::Ifndef);
             return end;
         }
         if (word == cfg().elseDirective) {
@@ -1569,10 +1667,14 @@ private:
                    evalExprCb(), rep_, synth_->id());
     }
     void handleElif(std::vector<Token> const& in, std::size_t p,
-                    std::size_t end) {
-        sbHandleElif(condStack_, in, p, end,
+                    std::size_t end, IfKind kind) {
+        // `kind` selects the condition source: Expr -> the `#if` evaluator;
+        // Ifdef/Ifndef -> the DIRECT bare-name definedness (C23 elifdef/elifndef,
+        // C 6.10.1p5). The definedness callbacks are the SAME ones handleIf binds
+        // for `#ifdef`/`#ifndef`, so the two agree on what "defined" means.
+        sbHandleElif(condStack_, in, p, end, kind,
                      (p <= end && p > 0 ? in[p - 1].span : SourceSpan::empty(0)),
-                     evalExprCb(), rep_, synth_->id());
+                     textOfCb(), isDefinedCb(), evalExprCb(), rep_, synth_->id());
     }
     void handleElse(SourceSpan at) {
         sbHandleElse(condStack_, at, rep_, synth_->id());

@@ -122,6 +122,28 @@ struct MirPhiIncoming {
 };
 static_assert(std::is_trivially_copyable_v<MirPhiIncoming>);
 
+// TLS C1 (D-CSUBSET-THREAD-LOCAL, code-audit LOW-1): the `addGlobal`
+// PARAMETER type for a global's storage duration — a strong enum so
+// thread-storage is un-transposable with the adjacent `isConst` bool and
+// un-fillable by an integer (the historical pre-cycle 8-arg call shape
+// `addGlobal(…, isConst, alignmentBytes)` would otherwise compile silently
+// with alignmentBytes converting to isThreadLocal=true). The DivSlotPair
+// type-level-invariant precedent. The `MirGlobal` FIELD stays `bool
+// isThreadLocal` (POD layout untouched); `addGlobal` translates.
+enum class MirThreadStorage : std::uint8_t {
+    Shared,     // ordinary process-shared storage (the default duration)
+    PerThread,  // C11/C23 6.2.4 thread storage duration → .tdata/.tbss
+};
+
+// The bool→enum bridge for PROPAGATION sites (merge / optimizer rebuilds /
+// DCE), which read `Mir::globalIsThreadLocal(g)` and must re-state the
+// value: `mirThreadStorageOf(m.globalIsThreadLocal(g))`.
+[[nodiscard]] constexpr MirThreadStorage
+mirThreadStorageOf(bool isThreadLocal) noexcept {
+    return isThreadLocal ? MirThreadStorage::PerThread
+                         : MirThreadStorage::Shared;
+}
+
 namespace detail {
 
 // ── instruction POD ───────────────────────────────────────────────────────────
@@ -243,7 +265,19 @@ struct MirGlobal {
     // only-store crash). Consumes one byte of the former 2-byte pad → zero size
     // growth (the static_assert below still holds).
     bool             isConst    = false;                    // 1
-    std::uint8_t     _pad       = 0;                         // 1  — explicit padding
+    // TLS C1 (D-CSUBSET-THREAD-LOCAL): true iff the source declared this
+    // global `_Thread_local`/`thread_local` (C11/C23 6.2.4 thread storage
+    // duration — one object PER THREAD). Read by the assembler's section
+    // selection BEFORE isConst (a `const thread_local` goes to the
+    // thread-template `.tdata`, never `.rodata` — its address varies per
+    // thread), routing initialized → `.tdata` / zero-init → `.tbss`; the
+    // format walkers lay the template out as the per-thread image (PT_TLS /
+    // the PE TLS directory — slices B/C). Threaded from the source via the
+    // declaration-keyed `HirThreadLocalMap` at HIR→MIR lowering (the isConst
+    // precedent). Consumes the former 1-byte explicit pad → zero size growth
+    // (the static_assert below still holds). Default `false` — ordinary
+    // process-shared storage.
+    bool             isThreadLocal = false;                  // 1
     // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN): the EXPLICIT
     // `alignas(N)` alignment in bytes (a power of two ≤ 256), or 0 for no
     // override. Read by the assembler's data-item emission

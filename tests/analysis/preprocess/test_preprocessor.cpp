@@ -1973,6 +1973,34 @@ TEST(Preprocessor, FC15bStdcConstants) {
     }
 }
 
+// FC17.5 (D-CSUBSET-VLA): `__STDC_NO_VLA__` is DEFINED (= 1). C11 6.10.8.3 /
+// C23 6.10.9.3 REQUIRE an implementation without variable-length-array support
+// to define it — DSS has no VLA support (a runtime array bound fails loud,
+// S_NonConstantArrayLength), so declaring the macro is the conformance-honest
+// line: a conforming program's `#ifdef __STDC_NO_VLA__` now selects its
+// fixed-size fallback instead of tripping the fail-loud gate. RED-ON-DISABLE:
+// drop the predefinedMacros row → `#ifdef` selects the else arm.
+TEST(Preprocessor, FC175StdcNoVlaDefined) {
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes(
+            "#ifdef __STDC_NO_VLA__\nint no_vla;\n#else\nint has_vla;\n#endif\n",
+            r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u)
+            << "__STDC_NO_VLA__ must be defined -> the no_vla arm";
+        EXPECT_EQ(lexs[1], "no_vla");
+    }
+    {
+        PreprocessResult r;
+        auto lexs = ppLexemes("int v = __STDC_NO_VLA__;\n", r);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 5u);
+        EXPECT_EQ(lexs[3], "1")
+            << "__STDC_NO_VLA__ materializes its config value 1";
+    }
+}
+
 // `__STDC_VERSION__` works in a `#if` controlling expression (it expands via the
 // SAME engine, then the ICE evaluator folds it): `#if __STDC_VERSION__ >= 201112L`
 // is true under C23. RED-ON-DISABLE: without the predefined hook the identifier
@@ -2200,11 +2228,14 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     auto c = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(c.has_value());
     auto const& pms = (*c)->preprocess().predefinedMacros;
-    // 7 ungated (C 6.10.8) + 10 pe-gated = 17: the c95 Windows selection
+    // 9 ungated (the 7 C 6.10.8 core + the FC17.5 `__STDC_NO_VLA__`
+    // conformance line, D-CSUBSET-VLA, + the TLS C1 `__STDC_NO_THREADS__`
+    // line, D-CSUBSET-THREAD-LOCAL — <threads.h> is never shipped) + 10
+    // pe-gated = 19: the c95 Windows selection
     // (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the c105
     // MSVC-profile flip (_MSC_VER/__int64/__forceinline/__declspec).
-    EXPECT_EQ(pms.size(), 17u)
-        << "c-subset declares 7 C 6.10.8 + 10 pe-gated Windows predefined macros";
+    EXPECT_EQ(pms.size(), 19u)
+        << "c-subset declares 9 un-gated + 10 pe-gated Windows predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     for (auto const& pm : pms) {
@@ -2218,8 +2249,10 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
                 << pm.name << " should be pe-gated (Windows selection)";
         }
     }
-    EXPECT_EQ(ungated, 7u)
-        << "the 7 C 6.10.8 macros are un-gated (available on every format)";
+    EXPECT_EQ(ungated, 9u)
+        << "the 7 C 6.10.8 macros + __STDC_NO_VLA__ (FC17.5) + "
+           "__STDC_NO_THREADS__ (TLS C1) are un-gated "
+           "(available on every format)";
     EXPECT_EQ(peGated, 10u)
         << "_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI (c95) + "
            "_MSC_VER/__int64/__forceinline/__declspec (c105) are pe-gated";
@@ -3471,4 +3504,322 @@ TEST(Preprocessor, Int64PredefineExpandsToLongLongOnPe) {
     std::vector<std::string> const expect{
         "typedef", "unsigned", "long", "long", "dss_u64_t", ";"};
     EXPECT_EQ(lexs, expect);
+}
+
+// ============================================================================
+// C23 (D-PP-ELIFDEF-ELIFNDEF; C 6.10.1): `#elifdef`/`#elifndef`. `#elifdef X`
+// == `#elif defined(X)`, `#elifndef X` == `#elif !defined(X)` -- routed through
+// the SAME #elif conditional-group state machine with the DIRECT #ifdef-style
+// definedness path (never the #if expression evaluator). Before the fix, an
+// unrecognized `#elifdef` was silently consumed inside a dead group -> a true
+// #elifdef branch was skipped and control fell to #else (a SILENT MISCOMPILE).
+// Every assertion is RED-ON-DISABLE (reverting the handleDirective dispatch arms
+// makes the elifdef branch fall through wrongly / the directive fail loud).
+// ============================================================================
+namespace {
+// Extract non-trivia lexemes from a PreprocessResult produced with a CUSTOM
+// (rebound/stripped) schema -- the config-driven tests below can't use
+// `ppLexemes` (which loads the shipped c-subset).
+[[nodiscard]] std::vector<std::string> lexemesOf(PreprocessResult const& r) {
+    std::vector<std::string> lexs;
+    for (Token const& t : r.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{r.synthBuffer->slice(t.span)});
+    }
+    return lexs;
+}
+// The message of the FIRST diagnostic carrying `code` ("" if none) -- lets a
+// test pin that a malformed `#elifdef` names "elifdef", not "ifdef".
+[[nodiscard]] std::string firstMessageWithCode(PreprocessResult const& r,
+                                               DiagnosticCode code) {
+    for (auto const& d : r.diagnostics->all()) {
+        if (d.code == code) return d.actual;
+    }
+    return {};
+}
+} // namespace
+
+// `#elifdef X` takes its branch when X IS defined and an earlier arm did not.
+// THE SILENT-MISCOMPILE CORE: the enclosing `#ifdef A` is false (dead), so a
+// pre-fix `#elifdef` was silently consumed and #else was wrongly taken (int c).
+TEST(Preprocessor, ElifdefTakesBranchWhenDefined) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define B\n#ifdef A\nint a;\n#elifdef B\nint b;\n#else\nint c;\n#endif\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "#elifdef B (B defined) is taken: int b ;";
+    EXPECT_EQ(lexs[1], "b")
+        << "the #elifdef branch must win, NOT fall through to #else (int c)";
+}
+
+// `#elifndef X` takes its branch when X is NOT defined and an earlier arm did
+// not: `#ifdef A` false, C undefined -> !defined(C) true -> int b.
+TEST(Preprocessor, ElifndefTakesBranchWhenNotDefined) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#ifdef A\nint a;\n#elifndef C\nint b;\n#else\nint c;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "#elifndef C (C undefined) is taken: int b ;";
+    EXPECT_EQ(lexs[1], "b");
+}
+
+// Completeness (no OVER-take): `#elifdef B` with neither A nor B defined falls
+// through to #else (int c).
+TEST(Preprocessor, ElifdefFallsThroughToElseWhenNeitherDefined) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#ifdef A\nint a;\n#elifdef B\nint b;\n#else\nint c;\n#endif\n", r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "neither A nor B defined -> #else: int c ;";
+    EXPECT_EQ(lexs[1], "c");
+}
+
+// Completeness (no OVER-take): `#elifndef C` with C DEFINED is false, so control
+// falls through to #else (int c).
+TEST(Preprocessor, ElifndefFallsThroughToElseWhenDefined) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define C\n#ifdef A\nint a;\n#elifndef C\nint b;\n#else\nint c;\n"
+        "#endif\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u) << "C defined -> #elifndef C false -> #else: int c ;";
+    EXPECT_EQ(lexs[1], "c");
+}
+
+// THE TAKEN-ONCE KEYSTONE: even though B IS defined, `#elifdef B` must NOT be
+// taken because the earlier `#ifdef A` (A defined) already won. Proves the
+// elifdef path respects `anyBranchTaken` (the preserved update order).
+TEST(Preprocessor, ElifdefSkippedWhenEarlierArmAlreadyTaken) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define A\n#define B\n#ifdef A\nint a;\n#elifdef B\nint b;\n#else\n"
+        "int c;\n#endif\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "#elifdef must be recognized (not the unknown-directive fail-loud)";
+    ASSERT_EQ(lexs.size(), 3u) << "the FIRST true arm wins: int a ;";
+    EXPECT_EQ(lexs[1], "a")
+        << "a taken-once group must NOT re-take the true #elifdef (no int b)";
+}
+
+// C 6.10.1p6: a DEAD `#elifdef` (an earlier arm already took) is NOT evaluated,
+// so a malformed (name-less) `#elifdef` in a dead position emits NO diagnostic.
+TEST(Preprocessor, DeadElifdefMissingNameIsNotEvaluated) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define B\n#ifdef B\nint a;\n#elifdef\nint b;\n#else\nint c;\n#endif\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a dead (name-less) #elifdef must not be evaluated -> no error";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+        << "the operand of a dead #elifdef is not evaluated (C 6.10.1p6)";
+    ASSERT_EQ(lexs.size(), 3u) << "the taken #ifdef B arm survives: int a ;";
+    EXPECT_EQ(lexs[1], "a");
+}
+
+// A LIVE malformed `#elifdef` (no macro name) fails LOUD -- and the message
+// names "#elifdef", NOT "#ifdef" (Finding 1: the directive spelling is threaded
+// through, not hard-coded to the #ifdef family).
+TEST(Preprocessor, ElifdefMissingNameFailsLoudWhenLive) {
+    PreprocessResult r;
+    (void)ppLexemes(
+        "#ifdef A\nint a;\n#elifdef\nint b;\n#else\nint c;\n#endif\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+        << "a LIVE #elifdef with no macro name must fail loud";
+    std::string const msg =
+        firstMessageWithCode(r, DiagnosticCode::P_PreprocessorDirective);
+    EXPECT_NE(msg.find("#elifdef"), std::string::npos)
+        << "the malformed message must name '#elifdef', not '#ifdef' (got: "
+        << msg << ")";
+}
+
+// Sibling parity for the ndef spelling (Finding 1): a LIVE malformed `#elifndef`
+// names "#elifndef", not "#ifndef" or "#elifdef" (same word-selection path, pinned
+// so a future regression that special-cases one spelling can't slip through).
+TEST(Preprocessor, ElifndefMissingNameFailsLoudWhenLive) {
+    PreprocessResult r;
+    (void)ppLexemes(
+        "#ifdef A\nint a;\n#elifndef\nint b;\n#else\nint c;\n#endif\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+        << "a LIVE #elifndef with no macro name must fail loud";
+    std::string const msg2 =
+        firstMessageWithCode(r, DiagnosticCode::P_PreprocessorDirective);
+    EXPECT_NE(msg2.find("#elifndef"), std::string::npos)
+        << "the malformed message must name '#elifndef' (got: " << msg2 << ")";
+}
+
+// `#elifdef` AFTER `#else` fails loud (C 6.10.1p4) -- naming "#elifdef".
+TEST(Preprocessor, ElifdefAfterElseFailsLoud) {
+    PreprocessResult r;
+    (void)ppLexemes(
+        "#ifdef A\nint a;\n#else\nint b;\n#elifdef B\nint c;\n#endif\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+        << "a #elifdef after a #else must fail loud";
+    EXPECT_NE(firstMessageWithCode(r, DiagnosticCode::P_PreprocessorDirective)
+                  .find("#elifdef"),
+              std::string::npos)
+        << "the after-#else message must name '#elifdef'";
+}
+
+// A bare `#elifdef` with NO matching `#if` fails loud AS AN ORPHAN (the
+// conditional-directive diagnostic), NOT as an unknown directive -- proving the
+// dispatch recognizes it before the unsupported-directive fall-through.
+TEST(Preprocessor, BareElifdefWithNoMatchingIfFailsLoudAsOrphan) {
+    PreprocessResult r;
+    (void)ppLexemes("int x;\n#elifdef B\nint y;\n", r);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorDirective))
+        << "a #elifdef with no matching #if must fail loud as an orphan";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "an orphan #elifdef is a recognized conditional, NOT an unknown "
+           "directive";
+    EXPECT_NE(firstMessageWithCode(r, DiagnosticCode::P_PreprocessorDirective)
+                  .find("#elifdef"),
+              std::string::npos)
+        << "the orphan message must name '#elifdef'";
+}
+
+// C 6.10.1p1: the `#elifdef` operand is NOT macro-expanded. `#define A B` then
+// `#elifdef A` tests whether "A" is defined (yes -> taken, int q), NOT whether
+// its expansion "B" is defined (no -> would fall to #else, int r).
+TEST(Preprocessor, ElifdefOperandIsNotMacroExpanded) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define A B\n#ifdef X\nint p;\n#elifdef A\nint q;\n#else\nint r;\n"
+        "#endif\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    ASSERT_EQ(lexs.size(), 3u)
+        << "defined(A) is true (A is a macro) -> int q ; (NOT the expansion B)";
+    EXPECT_EQ(lexs[1], "q")
+        << "the operand names A directly; it must not expand A->B and test "
+           "defined(B)";
+}
+
+// The `#elifdef` word is CONFIG-DRIVEN: rebind it to `elifwhendef`. (1) the new
+// spelling conditionalizes; (2) the OLD `#elifdef` (in a live context) is now an
+// UNKNOWN directive -- proving the word is read from config, not hard-coded.
+TEST(Preprocessor, ElifdefWordIsConfigDrivenNotHardcoded) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    auto schema = reboundCSubset("\"elifdefDirective\":    \"elifdef\",",
+                                 "\"elifdefDirective\":    \"elifwhendef\",",
+                                 "<rebound-elifdef>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_EQ(schema->preprocess().elifdefDirective, "elifwhendef");
+    // (1) `#elifwhendef B` now takes its branch (B defined, #ifdef A false).
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"#define B\n#ifdef A\nint a;\n#elifwhendef B\nint b;\n"
+                        "#else\nint c;\n#endif\n"},
+            "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        auto lexs = lexemesOf(r);
+        ASSERT_EQ(lexs.size(), 3u) << "#elifwhendef B is taken: int b ;";
+        EXPECT_EQ(lexs[1], "b");
+    }
+    // (2) The OLD `#elifdef` (in a LIVE #ifdef A branch) is now unknown -> fails
+    // loud as unsupported (it no longer conditionalizes).
+    {
+        auto buf = SourceBuffer::fromString(
+            std::string{"#define A\n#ifdef A\nint a;\n#elifdef B\nint b;\n"
+                        "#endif\n"},
+            "main.c");
+        PreprocessResult r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+            << "with elifdef rebound, a literal #elifdef in a live branch is an "
+               "unknown directive -- proving the word is read from config";
+    }
+}
+
+// When the `elifdefDirective` field is STRIPPED (absent), the config declares no
+// `#elifdef` -> a `#elifdef` in a LIVE branch falls through to the generic
+// unsupported-directive fail-loud (never a silent branch skip). Mirrors the
+// pragma opt-out pin (Finding 3: absent config is provably inert).
+TEST(Preprocessor, ElifdefIsConfigDrivenFailsLoudWhenStripped) {
+    namespace fs = std::filesystem;
+    auto schema = reboundCSubset("\"elifdefDirective\":    \"elifdef\",", "",
+                                 "<no-elifdef-c-subset>");
+    ASSERT_NE(schema, nullptr);
+    ASSERT_TRUE(schema->preprocess().elifdefDirective.empty())
+        << "the rebound schema must declare no elifdef directive";
+    auto buf = SourceBuffer::fromString(
+        std::string{"#define A\n#ifdef A\nint a;\n#elifdef B\nint b;\n#endif\n"},
+        "main.c");
+    std::vector<fs::path> noDirs;
+    PreprocessResult r = preprocess(buf, schema, noDirs);
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+        << "with `elifdefDirective` stripped, `#elifdef` must fail loud as an "
+           "unsupported directive -- proving the directive word is read from "
+           "config, not hard-coded";
+}
+
+// SynthBuilder PARITY (live arm): a quote-`#include` inside a LIVE `#elifdef`
+// arm is resolved + spliced by the pre-scan (so the include gate agrees with the
+// authoritative macro pass). RED-ON-DISABLE: without the SynthBuilder elifdef
+// arm the pre-scan leaves the frame in its stale (dead #ifdef) state -> the
+// live include is never spliced -> `included_by_elifdef` is missing.
+TEST(Preprocessor, ElifdefLiveArmResolvesNestedQuoteInclude) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "dss_elifdef_live_inc";
+    fs::create_directories(dir);
+    { std::ofstream(dir / "elifdef_live.h", std::ios::binary)
+          << "int included_by_elifdef;\n"; }
+    PreprocessResult r;
+    auto lexs = ppLexemesWithDirs(
+        "#define FEATURE_B\n"
+        "#ifdef FEATURE_A\n"
+        "int from_a;\n"
+        "#elifdef FEATURE_B\n"
+        "#include \"elifdef_live.h\"\n"
+        "#else\n"
+        "int from_else;\n"
+        "#endif\n",
+        r, {dir}, {});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    bool hasIncluded = false, hasElse = false, hasFromA = false;
+    for (auto const& l : lexs) {
+        if (l == "included_by_elifdef") hasIncluded = true;
+        if (l == "from_else") hasElse = true;
+        if (l == "from_a") hasFromA = true;
+    }
+    EXPECT_TRUE(hasIncluded)
+        << "the LIVE #elifdef arm's quote-#include must be spliced by the "
+           "SynthBuilder pre-scan (elifdef parity)";
+    EXPECT_FALSE(hasElse) << "the #else arm must be elided";
+    EXPECT_FALSE(hasFromA) << "the dead #ifdef arm must be elided";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// SynthBuilder PARITY (dead arm): a quote-`#include` of a MISSING header inside a
+// DEAD `#elifdef` arm (an earlier arm already took) must NOT be resolved -> no
+// include error. RED-ON-DISABLE: without the SynthBuilder elifdef arm the
+// pre-scan keeps the frame ACTIVE (stale) -> it wrongly resolves the dead-arm
+// include -> the missing header errors.
+TEST(Preprocessor, DeadElifdefArmSkipsNestedQuoteInclude) {
+    PreprocessResult r;
+    auto lexs = ppLexemes(
+        "#define FEATURE_A\n"
+        "#ifdef FEATURE_A\n"
+        "int from_a;\n"
+        "#elifdef FEATURE_B\n"
+        "#include \"no_such_elifdef_header.h\"\n"
+        "#else\n"
+        "int from_else;\n"
+        "#endif\n",
+        r);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "a quote-#include in a DEAD #elifdef arm must NOT be resolved";
+    EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorIncludeError))
+        << "the dead-#elifdef-branch include must not emit an include error";
+    bool hasFromA = false;
+    for (auto const& l : lexs)
+        if (l == "from_a") hasFromA = true;
+    EXPECT_TRUE(hasFromA) << "the taken #ifdef arm survives: int from_a ;";
 }

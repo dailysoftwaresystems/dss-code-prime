@@ -964,3 +964,127 @@ TEST(ParserSpeculation, FlatChainParseWorkIsLinear) {
         << " a1000=" << m1000.tokenAccessCount
         << " a1500=" << m1500.tokenAccessCount;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// D-PARSE-SPECULATIVE-OPTIONAL (FC17): a `{"optional": X, "speculative":
+// true}` clause. The engine TRIES the inner clause after the shared prefix
+// and BACKTRACKS to the sibling continuation when the clause doesn't match —
+// the generic capability the C23 `enum E : T { … }` feature rides (the `enum
+// <tag> :` prefix is shared with the anonymous enum-typed bit-field `enum C :
+// 4;`). This synthetic schema pins the substrate in isolation from c-subset.
+//
+//   stmt        = widgetDecl Semi                (the `;`-terminated wrapper,
+//                                                 mirroring enumSpec inside a
+//                                                 terminated declaration)
+//   widgetDecl  = WidgetKw Ident {opt typeClause, spec} {opt bodyOrWidth}
+//   typeClause  = Colon TypeKw                   (the "underlying type" analog)
+//   bodyOrWidth = alt[ body, widthClause ]
+//   body        = LBrace {repeat Num} RBrace
+//   widthClause = Colon Num                      (the "bit-field width" analog)
+//
+// widgetDecl itself ends in optionals, so the speculative optional is nullable-
+// tailed — exactly like `enumSpec` ends in {opt enumBody}. The `Semi` lives in
+// the ENCLOSING `stmt` (like the `;` after a C enum declaration), so the
+// speculative optional's nullable tail is genuine yet the repeat is delimited.
+constexpr std::string_view kSpecOptionalSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "SpecOptional", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "W":  [{ "kind": "WidgetKw" }],
+    "T":  [{ "kind": "TypeKw" }],
+    "X":  [{ "kind": "Ident" }],
+    "Y":  [{ "kind": "Ident" }],
+    ":":  [{ "kind": "Colon" }],
+    "{":  [{ "kind": "LBrace" }],
+    "}":  [{ "kind": "RBrace" }],
+    "N":  [{ "kind": "Num" }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "shapes": {
+    "root":        { "sequence": [{ "repeat": "stmt" }] },
+    "stmt":        { "sequence": ["widgetDecl", "Semi"] },
+    "widgetDecl":  {
+      "sequence": [
+        "WidgetKw", "Ident",
+        { "optional": "typeClause", "speculative": true, "lookahead": 8 },
+        { "optional": "bodyOrWidth" }
+      ]
+    },
+    "typeClause":  { "sequence": ["Colon", "TypeKw"] },
+    "bodyOrWidth": { "alt": ["body", "widthClause"] },
+    "body":        { "sequence": ["LBrace", { "repeat": "Num" }, "RBrace"] },
+    "widthClause": { "sequence": ["Colon", "Num"] }
+  }
+})JSON";
+
+[[nodiscard]] Tree parseSpecOptional(std::string source) {
+    auto loaded = GrammarSchema::loadFromText(kSpecOptionalSchema);
+    EXPECT_TRUE(loaded.has_value())
+        << (loaded.has_value() ? "" : loaded.error()[0].message);
+    auto src = SourceBuffer::fromString(std::move(source), "<specopt>");
+    Tokenizer tk{src, *loaded};
+    auto [stream, _] = std::move(tk).tokenize();
+    Parser p{src, *loaded, std::move(stream)};
+    return std::move(p).parse().tree;
+}
+
+TEST(ParserSpeculation, SpeculativeOptionalClauseMatchesThenBody) {
+    // `W X : T { N } ;` — the speculative optional's inner clause (typeClause)
+    // MATCHES after the `:` (a TypeKw follows), committing; the body then
+    // parses via the sibling `{opt bodyOrWidth}`. Both must materialize.
+    Tree t = parseSpecOptional("W X : T { N } ;");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "the matching speculative-optional clause + body must parse clean";
+    EXPECT_EQ(countNodesByRule(t, "typeClause"), 1u)
+        << "the `: T` underlying-type clause must commit";
+    EXPECT_EQ(countNodesByRule(t, "body"), 1u)
+        << "the `{ N }` body must parse via the sibling optional";
+    EXPECT_EQ(countNodesByRule(t, "widthClause"), 0u);
+}
+
+TEST(ParserSpeculation, SpeculativeOptionalBacktracksToSiblingWidth) {
+    // `W X : N ;` — the speculative optional is TRIED on the `:` but backtracks
+    // (a Num, not a TypeKw, follows the colon → typeClause pruned); the `: N` is
+    // then consumed by the SIBLING `widthClause` reached through the optional's
+    // skip/continuation. THE load-bearing red-on-disable case: without the
+    // speculative-optional nullable fallback the engine replays `typeClause`
+    // non-speculatively and errors on `Colon TypeKw` against `Colon Num`.
+    Tree t = parseSpecOptional("W X : N ;");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "the `: N` must backtrack to the sibling width, not error";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BacktrackFailed), 0u);
+    EXPECT_EQ(countNodesByRule(t, "typeClause"), 0u)
+        << "the underlying-type clause must NOT commit on `: N`";
+    EXPECT_EQ(countNodesByRule(t, "widthClause"), 1u)
+        << "the `: N` must parse as the sibling width clause";
+}
+
+TEST(ParserSpeculation, SpeculativeOptionalBodyExceedsBudgetParsesNonSpeculatively) {
+    // AUDIT Finding-2 pin (body-larger-than-the-speculative-budget). A bodied
+    // form whose body has FAR MORE tokens than the speculative probe budget
+    // (lookahead 8 × 16 = 128) must STILL parse cleanly — because the body is
+    // reached through the optional's skip/continuation and parses NON-
+    // speculatively (its rules are excluded from the speculative candidate set
+    // by collectAltBranchRules). If a regression let a bodied form be
+    // SPECULATED, this >128-token body would bust the probe budget and fail
+    // loud. The trailing `W Y : T ;` also confirms the repeat re-enters cleanly
+    // after the large body.
+    std::string manyNums;                  // 150 space-separated Num tokens
+    for (int i = 0; i < 150; ++i) manyNums += "N ";
+    Tree t = parseSpecOptional("W X { " + manyNums + "} ; W Y : T ;");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "an over-budget body must parse non-speculatively; the trailing "
+           "widget must parse cleanly after it";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BacktrackFailed), 0u);
+    EXPECT_EQ(countNodesByRule(t, "body"), 1u)
+        << "the large body must materialize once";
+    EXPECT_EQ(countNodesByRule(t, "typeClause"), 1u)
+        << "the trailing `W Y : T` underlying-type clause must parse";
+}
