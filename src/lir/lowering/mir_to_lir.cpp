@@ -2941,17 +2941,109 @@ struct Lowerer {
                 "(D-CSUBSET-THREAD-LOCAL)");
             return;  // value left undefined; the pipeline aborts on the error
         }
-        // TLS C3 (D-CSUBSET-THREAD-LOCAL): LocalExec (ELF, C1) and
-        // PeIndexed (PE, this cycle) both proceed; only MachoTlv (C4)
-        // remains declared-but-unlowered → fail loud, never a
-        // silently-wrong sequence (the models disagree on every byte
-        // after the tp read).
+        // ── TLS C4 (D-CSUBSET-THREAD-LOCAL): the macho-tlv access
+        // sequence. macOS has NO tp-relative TLS — a thread-local
+        // object is reached by CALLING THROUGH its `tlv_descriptor` (a
+        // 3-word record the writer mints in __DATA,__thread_vars). This
+        // arm runs BEFORE the tp-read machinery below: macho-tlv reads
+        // NO thread pointer at the access site (the tlv thunk reads
+        // TPIDR itself), so a `tlsbase` opcode is neither required nor
+        // used. The sequence (arm64):
+        //     lea  %desc, [sym]        ; ADRP+ADD → &descriptor. The
+        //                              ;   ORDINARY 1-op [SymbolRef] lea
+        //                              ;   (non-tls relocs kinds 2/3);
+        //                              ;   the writer binds
+        //                              ;   symbolVa[sym]=descriptorVA so
+        //                              ;   this resolves to the
+        //                              ;   descriptor (F3) — NOT a tpoff.
+        //     ldr  %callee, [%desc]    ; word0 = the thunk pointer dyld
+        //                              ;   bound to the undefined
+        //                              ;   libSystem `__tlv_bootstrap`.
+        //     blr  %callee (x0=%desc)  ; the tlv thunk: x0 in = &desc,
+        //                              ;   x0 out = &var. Emitted as the
+        //                              ;   abstract indirect `call`
+        //                              ;   ([reg] variant → BLR); the
+        //                              ;   callconv pass materializes
+        //                              ;   %desc→x0 (arg0) and the
+        //                              ;   result→x0 (aapcs64: the thunk
+        //                              ;   IS `void*(void*)`), and keeps
+        //                              ;   caller-saved-clobber by
+        //                              ;   construction (conservative —
+        //                              ;   the real thunk preserves more,
+        //                              ;   so over-spilling is safe).
+        //     → %var
+        // ZERO new encoder rows (lea/ldr/blr all exist). Every value is
+        // config: the MODEL from tlsAccess, the SHAPES from the target's
+        // opcode rows. Closed-verb dispatch — never a format/CPU branch.
         if (tlsAccess_->model == TlsAccessModel::MachoTlv) {
-            reportTlsFormatReject(std::format(
-                "tlsAccess model '{}' is declared but its lowering "
-                "lands with the Mach-O TLS cycle (C4) "
-                "(D-CSUBSET-THREAD-LOCAL)",
-                tlsAccessModelName(tlsAccess_->model)));
+            if (!opcode(MnemonicSlot::Lea).has_value()) {
+                reportMissingOpcode(MnemonicSlot::Lea,
+                                    "MIR GlobalAddr (thread-local, macho-tlv)");
+                return;
+            }
+            auto const machoLoadOp =
+                classOp(LirRegClass::GPR, RegClassOp::Load);
+            if (!machoLoadOp.has_value()) {
+                reportMissingClassOp(LirRegClass::GPR, RegClassOp::Load,
+                                     "MIR GlobalAddr (thread-local, macho-tlv)");
+                return;
+            }
+            if (!opcode(MnemonicSlot::Call).has_value()) {
+                reportMissingOpcode(MnemonicSlot::Call,
+                                    "MIR GlobalAddr (thread-local, macho-tlv)");
+                return;
+            }
+            // Step 1 — lea the descriptor's address. The SAME ordinary
+            // 1-op [SymbolRef] lea `lowerGlobalAddr` emits for a plain
+            // global (ADRP+ADD on arm64), so the reloc it plants is the
+            // NON-tls adr_prel_pg_hi21/add_abs_lo12_nc pair — resolved
+            // against symbolVa[sym]=descriptorVA. (macho intentionally
+            // does NOT register `sym` in the walker's tlsSymbols set, so
+            // this non-tls reloc trips no XOR backstop — CRIT-1.)
+            LirReg const descReg = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 1> leaOps{LirOperand::makeSymbolRef(sym.v)};
+            emitInst(*opcode(MnemonicSlot::Lea), descReg, leaOps);
+            // Step 2 — load word0 (the thunk pointer) from the
+            // descriptor. Width-default 64-bit (a code pointer); base =
+            // descReg, disp 0.
+            LirReg const calleeReg = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 3> thunkLoadOps{
+                LirOperand::makeReg(descReg),
+                LirOperand::makeMemBase(1),
+                LirOperand::makeMemOffset(0)};
+            emitInst(*machoLoadOp, calleeReg, thunkLoadOps,
+                     /*payload=*/0, /*flags=*/0);
+            // Step 3 — call the thunk with the descriptor as arg0. The
+            // abstract indirect-call form: ops[0]=callee reg (→ BLR),
+            // ops[1]=the sole arg. payload 0 (non-variadic). The result
+            // vreg is the returned per-thread &var. NOT routed through
+            // `lowerCall` (no extern-dispatch / by-value / GlobalAddr
+            // folding applies) — the operand shape is hand-built, the
+            // physical x0-in/x0-out constraints come from the callconv
+            // pass over the standard aapcs64 the thunk obeys (M-1).
+            //
+            // ★ FP-CHAIN NOTE (audit LOW-1, BY DESIGN — not a bug): this
+            // `blr` clobbers x29 (the frame pointer) like any call, because
+            // x29 is an ALLOCATABLE callee-saved register in the DSS arm64
+            // backend — the codegen may hold the descriptor / other values in
+            // x29 across the access. This is NON-crashing: the DSS arm64
+            // epilogue reloads x29/x30 from FIXED stack slots and NEVER walks
+            // the FP chain, and the standard call-clobber model this `call`
+            // rides (which every call test covers) guarantees no caller-saved
+            // vreg is left live across the `blr` (the real tlv thunk preserves
+            // x19–x28, so cross-call live values there survive too). The only
+            // consequence is COSMETIC: a debugger / crash-reporter backtrace
+            // that unwinds via the FP chain THROUGH a TLS-accessing frame is
+            // corrupt for the duration of the access. Do NOT "fix" this by
+            // pinning x29 — it would only cost a register for a cosmetic gain
+            // the epilogue does not need.
+            LirReg const addrReg = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 2> callOps{
+                LirOperand::makeReg(calleeReg),
+                LirOperand::makeReg(descReg)};
+            emitInst(*opcode(MnemonicSlot::Call), addrReg, callOps,
+                     /*payload=*/0);
+            defineValue(id, addrReg);
             return;
         }
         auto const tlsBaseOp = opcode(MnemonicSlot::TlsBase);

@@ -2388,3 +2388,321 @@ TEST(MachOExecWriter, UndeclaredDylibInExternImportFailsLoud) {
     EXPECT_TRUE(bytes.empty());
     ASSERT_GE(rep.errorCount(), 1u);
 }
+
+// ── D-CSUBSET-THREAD-LOCAL (TLS C4): Mach-O TLV structural pins ──────────
+//
+// THE HOST CANNOT EXECUTE MACH-O, so these byte-level structural pins are the
+// SOLE automated guard on the TLV writer (the runtime witness is the user's
+// Apple-Silicon Mac + the macos-latest CI leg). They decode a produced
+// arm64-macho-exec image and assert the descriptor ABI (word0 bind / word1 key
+// / word2 block offset), the 3 __thread_* sections + flags, the
+// __tlv_bootstrap bind-per-descriptor, and the CRIT-1/M-3 fail-loud gates —
+// each RED-ON-DISABLE (routing thread-locals through ordinary data, or dropping
+// the bind, makes a pin fail while a single-thread runtime would still pass).
+namespace {
+
+struct MachoSecInfo {
+    std::string name;
+    std::uint64_t addr = 0, size = 0;
+    std::uint32_t off = 0, flags = 0, segidx = 0;
+};
+struct MachoBind { std::string sym; std::uint32_t seg = 0; std::uint64_t off = 0; };
+struct MachoDecoded {
+    std::vector<std::uint64_t> segVmaddr;
+    std::vector<MachoSecInfo>  sections;
+    std::vector<MachoBind>     binds;
+    [[nodiscard]] MachoSecInfo const* sec(std::string_view n) const {
+        for (auto const& s : sections) if (s.name == n) return &s;
+        return nullptr;
+    }
+};
+
+[[nodiscard]] std::uint64_t readUleb(std::vector<std::uint8_t> const& b,
+                                     std::size_t& i) {
+    std::uint64_t r = 0; int s = 0;
+    while (i < b.size()) {
+        std::uint8_t c = b[i++]; r |= std::uint64_t(c & 0x7f) << s;
+        if (!(c & 0x80)) break; s += 7;
+    }
+    return r;
+}
+
+[[nodiscard]] MachoDecoded decodeMacho(std::vector<std::uint8_t> const& d) {
+    MachoDecoded out;
+    std::uint32_t const ncmds = readU32LE(d, 16);
+    std::size_t off = 32;
+    for (std::uint32_t c = 0; c < ncmds; ++c) {
+        std::uint32_t const cmd = readU32LE(d, off);
+        std::uint32_t const cmdsize = readU32LE(d, off + 4);
+        if (cmdsize == 0) break;
+        if (cmd == 0x19u) {  // LC_SEGMENT_64
+            std::uint64_t const vmaddr = readU64LE(d, off + 24);
+            std::uint32_t const nsects = readU32LE(d, off + 64);
+            std::uint32_t const segidx =
+                static_cast<std::uint32_t>(out.segVmaddr.size());
+            out.segVmaddr.push_back(vmaddr);
+            std::size_t so = off + 72;
+            for (std::uint32_t s = 0; s < nsects; ++s) {
+                MachoSecInfo si;
+                char nm[17] = {0};
+                std::memcpy(nm, d.data() + so, 16);
+                si.name = nm;
+                si.addr = readU64LE(d, so + 32);
+                si.size = readU64LE(d, so + 40);
+                si.off = readU32LE(d, so + 48);
+                si.flags = readU32LE(d, so + 64);
+                si.segidx = segidx;
+                out.sections.push_back(std::move(si));
+                so += 80;
+            }
+        } else if (cmd == 0x80000022u) {  // LC_DYLD_INFO_ONLY
+            // dyld_info_command: cmd/cmdsize/rebase(8,12)/bind_off(16)/bind_size(20).
+            std::uint32_t const bindOff = readU32LE(d, off + 16);
+            std::uint32_t const bindSize = readU32LE(d, off + 20);
+            std::size_t i = bindOff;
+            std::string sym; std::uint32_t seg = 0; std::uint64_t o = 0;
+            while (i < std::size_t(bindOff) + bindSize) {
+                std::uint8_t const op = d[i++]; std::uint8_t const hi = op & 0xF0u;
+                if (hi == 0x10u) { /* ORD_IMM */ }
+                else if (hi == 0x20u) { (void)readUleb(d, i); }
+                else if (hi == 0x40u) {
+                    sym.clear();
+                    while (i < d.size() && d[i] != 0) sym.push_back(char(d[i++]));
+                    ++i;  // NUL
+                } else if (hi == 0x50u) { /* SET_TYPE */ }
+                else if (hi == 0x70u) { seg = op & 0x0Fu; o = readUleb(d, i); }
+                else if (hi == 0x90u) { out.binds.push_back({sym, seg, o}); }
+                else if (op == 0x00u) { /* DONE / pad */ }
+            }
+        }
+        off += cmdsize;
+    }
+    return out;
+}
+
+// Extern (_exit) forces encodeExecDynamic (the only __DATA/TLV path). Optional
+// tbss int + a configurable tdata alignment for the M-3 over-align pin.
+[[nodiscard]] AssembledModule buildMachoTlvModule(bool withTbss,
+                                                  std::uint64_t tdataAlign = 4) {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes = {0x00, 0x00, 0x00, 0x94, 0xC0, 0x03, 0x5F, 0xD6};  // BL _exit ; RET
+    fn.relocations.push_back(Relocation{0u, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_exit", "/usr/lib/libSystem.B.dylib"});
+    AssembledData g;  // thread_local int g = 7;  → tdata, word2 = 0
+    g.symbol = SymbolId{50};
+    g.section = DataSectionKind::Tdata;
+    g.bytes = {7, 0, 0, 0};
+    g.alignment = Alignment::ofRuntimePow2(tdataAlign);
+    mod.dataItems.push_back(std::move(g));
+    if (withTbss) {
+        AssembledData c;  // static thread_local int c; → tbss, word2 = tbssBlockBase
+        c.symbol = SymbolId{51};
+        c.section = DataSectionKind::Tbss;
+        c.reservedSize = 4;
+        c.alignment = Alignment::ofRuntimePow2(4);
+        mod.dataItems.push_back(std::move(c));
+    }
+    return mod;
+}
+
+struct MachoTlvLoaded {
+    std::shared_ptr<TargetSchema>       target;
+    std::shared_ptr<ObjectFormatSchema> format;
+};
+[[nodiscard]] MachoTlvLoaded loadArm64MachoExec() {
+    MachoTlvLoaded out;
+    auto t = TargetSchema::loadShipped("arm64");
+    if (t.has_value()) out.target = std::move(t).value(); else ADD_FAILURE();
+    auto f = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-exec");
+    if (f.has_value()) out.format = std::move(f).value(); else ADD_FAILURE();
+    return out;
+}
+
+[[nodiscard]] bool sawDiag(DiagnosticReporter const& rep, DiagnosticCode code) {
+    for (auto const& d : rep.all()) if (d.code == code) return true;
+    return false;
+}
+
+}  // namespace
+
+TEST(MachOTlvWriter, ThreeThreadSectionsCarryStdThreadLocalFlags) {
+    auto L = loadArm64MachoExec();
+    ASSERT_TRUE(L.target && L.format);
+    auto mod = buildMachoTlvModule(/*withTbss=*/true);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    auto dec = decodeMacho(bytes);
+    auto const* tv = dec.sec("__thread_vars");
+    auto const* td = dec.sec("__thread_data");
+    auto const* tb = dec.sec("__thread_bss");
+    ASSERT_NE(tv, nullptr); ASSERT_NE(td, nullptr); ASSERT_NE(tb, nullptr);
+    // dyld keys the TLV template on these EXACT section types.
+    EXPECT_EQ(tv->flags & 0xffu, 0x13u);  // S_THREAD_LOCAL_VARIABLES
+    EXPECT_EQ(td->flags & 0xffu, 0x11u);  // S_THREAD_LOCAL_REGULAR
+    EXPECT_EQ(tb->flags & 0xffu, 0x12u);  // S_THREAD_LOCAL_ZEROFILL
+    EXPECT_EQ(tb->off, 0u) << "__thread_bss is zero-fill: no file bytes";
+    // __thread_data and __thread_bss must be CONTIGUOUS (one dyld TLV region).
+    EXPECT_LE(td->addr + td->size, tb->addr);
+    EXPECT_EQ(tb->addr, td->addr + 4u)
+        << "tbss must sit at tdataVA + tbssBlockBase (CRIT-2 contiguity)";
+}
+
+TEST(MachOTlvWriter, DescriptorWord2IsZeroBasedBlockOffset) {
+    // ★ CRIT-2 byte pin: a 2-var block (tdata int @0 + tbss int @4). word0/word1
+    // are 0 (dyld binds/fills them); word2 is the 0-BASED block offset — NOT the
+    // arm64-ELF Variant-I 16+off (which would put every word2 at +16 → garbage).
+    auto L = loadArm64MachoExec();
+    ASSERT_TRUE(L.target && L.format);
+    auto mod = buildMachoTlvModule(/*withTbss=*/true);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    auto dec = decodeMacho(bytes);
+    auto const* tv = dec.sec("__thread_vars");
+    ASSERT_NE(tv, nullptr);
+    ASSERT_EQ(tv->size, 2u * 24u) << "2 descriptors × 24 bytes";
+    // desc[0] = tdata g → word2 0; desc[1] = tbss c → word2 4 (tbssBlockBase).
+    for (int i = 0; i < 2; ++i) {
+        std::uint64_t const w0 = readU64LE(bytes, tv->off + std::size_t(i) * 24 + 0);
+        std::uint64_t const w1 = readU64LE(bytes, tv->off + std::size_t(i) * 24 + 8);
+        EXPECT_EQ(w0, 0u) << "desc[" << i << "].word0 must be 0 (dyld binds thunk)";
+        EXPECT_EQ(w1, 0u) << "desc[" << i << "].word1 must be 0 (key)";
+    }
+    std::uint64_t const w2a = readU64LE(bytes, tv->off + 16);
+    std::uint64_t const w2b = readU64LE(bytes, tv->off + 24 + 16);
+    EXPECT_EQ(w2a, 0u) << "tdata var's block offset is 0";
+    EXPECT_EQ(w2b, 4u) << "tbss var's block offset is tbssBlockBase=4, not 16+off";
+}
+
+TEST(MachOTlvWriter, BootstrapBindPerDescriptorTargetsWord0) {
+    // ★ CRIT-3: exactly one bind of `__tlv_bootstrap` (TWO underscores — the
+    // on-disk libSystem symbol) per descriptor, at that descriptor's word0
+    // (offset i*24 in the __thread_vars-bearing __DATA segment). A missing bind
+    // = a `blr` through garbage on the Mac. The `bind.seg == __thread_vars
+    // segment index` check below is the TEST-side guard on the segment index;
+    // the writer ALSO fails loud (audit FOLD-1: it cross-checks the ACTUAL
+    // emitted __DATA index against the value the binds use) so a segment-layout
+    // change can never SILENTLY bind to the wrong segment on this
+    // can't-run-macho host.
+    auto L = loadArm64MachoExec();
+    ASSERT_TRUE(L.target && L.format);
+    auto mod = buildMachoTlvModule(/*withTbss=*/true);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    auto dec = decodeMacho(bytes);
+    auto const* tv = dec.sec("__thread_vars");
+    ASSERT_NE(tv, nullptr);
+    std::vector<MachoBind> tlv;
+    for (auto const& b : dec.binds)
+        if (b.sym == "__tlv_bootstrap") tlv.push_back(b);
+    ASSERT_EQ(tlv.size(), 2u) << "one __tlv_bootstrap bind per descriptor";
+    std::uint64_t const segVa = dec.segVmaddr[tv->segidx];
+    std::uint64_t const tvOffInSeg = tv->addr - segVa;
+    for (std::size_t i = 0; i < tlv.size(); ++i) {
+        EXPECT_EQ(tlv[i].seg, tv->segidx)
+            << "bind targets the __thread_vars-bearing segment";
+        EXPECT_EQ(tlv[i].off, tvOffInSeg + i * 24u)
+            << "bind offset is descriptor i's word0 (i*24)";
+    }
+}
+
+TEST(MachOTlvWriter, AddressOfThreadLocalInDataItemFailsLoudCrit1) {
+    // ★ CRIT-1 arm-(a) red-on-disable: a DATA-item reloc targeting a thread-local
+    // symbol embeds the descriptor VA as a process-shared pointer. The macho
+    // walker backstop rejects it (the semantic tier's 0xE048 is the front line;
+    // this is the writer belt). Disabling the tlsDataSymbols backstop makes this
+    // link clean with a garbage pointer.
+    auto L = loadArm64MachoExec();
+    ASSERT_TRUE(L.target && L.format);
+    auto mod = buildMachoTlvModule(/*withTbss=*/false);
+    RelocationKind abs64{0}; bool found = false;
+    for (auto const& r : L.target->relocations())
+        if (r.widthBytes == 8 && !r.pcRelative) { abs64 = r.kind; found = true; break; }
+    ASSERT_TRUE(found);
+    // `int *p = &g;` — a __data pointer with an abs64 reloc → the tls sym 50.
+    AssembledData p;
+    p.symbol = SymbolId{60};
+    p.section = DataSectionKind::Data;
+    p.bytes.assign(8, 0);
+    p.alignment = Alignment::ofRuntimePow2(8);
+    p.relocations.push_back(Relocation{0u, SymbolId{50}, abs64, 0});
+    mod.dataItems.push_back(std::move(p));
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    EXPECT_TRUE(sawDiag(rep, DiagnosticCode::K_RelocationKindMismatch))
+        << "a data-item reloc targeting a thread-local must fail loud (CRIT-1)";
+}
+
+TEST(MachOTlvWriter, PlainThreadLocalLinksCleanCrit1Positive) {
+    // ★ CRIT-1 positive: the ordinary access reloc (adrp/add vs a TLS sym, kinds
+    // 2/3) must NOT trip the backstop — a plain thread_local links clean. macho
+    // does NOT register tls syms in a tlsSymbols set / run the reloc-XOR arm (b);
+    // if it did, this legitimate access reloc would be false-rejected.
+    auto L = loadArm64MachoExec();
+    ASSERT_TRUE(L.target && L.format);
+    auto mod = buildMachoTlvModule(/*withTbss=*/true);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_FALSE(bytes.empty());
+}
+
+TEST(MachOTlvWriter, OverAlignedThreadLocalFailsLoudM3) {
+    // ★ M-3 red-on-disable: a thread-local needing > 16-byte alignment cannot be
+    // guaranteed by dyld's malloc'd TLV block base; fail loud
+    // (K_ThreadLocalOveralignedForFormat) rather than silently under-align.
+    auto L = loadArm64MachoExec();
+    ASSERT_TRUE(L.target && L.format);
+    auto mod = buildMachoTlvModule(/*withTbss=*/false, /*tdataAlign=*/32);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    EXPECT_TRUE(sawDiag(rep, DiagnosticCode::K_ThreadLocalOveralignedForFormat));
+}
+
+TEST(MachOTlvWriter, SixteenByteAlignedThreadLocalLinksCleanM3) {
+    // _Alignas(16) (== the block-base guarantee) must PASS — the gate bites only
+    // strictly-over-16 alignment.
+    auto L = loadArm64MachoExec();
+    ASSERT_TRUE(L.target && L.format);
+    auto mod = buildMachoTlvModule(/*withTbss=*/false, /*tdataAlign=*/16);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_FALSE(bytes.empty());
+}
+
+TEST(MachOTlvWriter, NoThreadLocalEmitsNoThreadSectionsSqliteDormant) {
+    // The disable-and-red control: a module with NO thread-local items emits
+    // ZERO __thread_* sections + ZERO __tlv_bootstrap binds — the pre-TLS image
+    // is byte-untouched (sqlite / ordinary output unaffected).
+    auto L = loadArm64MachoExec();
+    ASSERT_TRUE(L.target && L.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes = {0x00, 0x00, 0x00, 0x94, 0xC0, 0x03, 0x5F, 0xD6};
+    fn.relocations.push_back(Relocation{0u, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_exit", "/usr/lib/libSystem.B.dylib"});
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    auto dec = decodeMacho(bytes);
+    EXPECT_EQ(dec.sec("__thread_vars"), nullptr);
+    EXPECT_EQ(dec.sec("__thread_data"), nullptr);
+    EXPECT_EQ(dec.sec("__thread_bss"), nullptr);
+    for (auto const& b : dec.binds)
+        EXPECT_NE(b.sym, "__tlv_bootstrap");
+}

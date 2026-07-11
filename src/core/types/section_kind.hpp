@@ -55,9 +55,21 @@ enum class SectionKind : std::uint8_t {
     // `__DATA,__thread_data`/`__thread_bss`).
     ThreadData = 12, // initialised thread-local TEMPLATE data (.tdata)
     ThreadBss  = 13, // zero-fill thread-local TEMPLATE extent (.tbss)
+    // D-CSUBSET-THREAD-LOCAL (TLS C4, Mach-O TLV): the thread-local
+    // VARIABLE-DESCRIPTOR section. Mach-O uniquely reaches a thread-local
+    // object through a per-variable 3-word `tlv_descriptor` in
+    // `__DATA,__thread_vars` (S_THREAD_LOCAL_VARIABLES) — the descriptors
+    // are WRITER-synthesized (never `AssembledData` producer output), so
+    // this kind is NOT a `DataSectionKind` (`dataSectionKindOf` returns
+    // nullopt for it). ELF/PE reach TLS with a tp-relative offset and
+    // declare no such section. It exists only so the Mach-O format JSON
+    // can name the section + its S_THREAD_LOCAL_VARIABLES flag config-side
+    // (like the tdata/tbss rows), keeping the writer free of a hardcoded
+    // section flag.
+    ThreadVars = 14, // thread-local variable descriptors (Mach-O __thread_vars)
 };
 
-inline constexpr EnumNameTable<SectionKind, 14> kSectionKindTable{{{
+inline constexpr EnumNameTable<SectionKind, 15> kSectionKindTable{{{
     { SectionKind::Text,       "text"       },
     { SectionKind::Rodata,     "rodata"     },
     { SectionKind::Data,       "data"       },
@@ -72,6 +84,7 @@ inline constexpr EnumNameTable<SectionKind, 14> kSectionKindTable{{{
     { SectionKind::Custom,     "custom"     },
     { SectionKind::ThreadData, "tdata"      },
     { SectionKind::ThreadBss,  "tbss"       },
+    { SectionKind::ThreadVars, "tvars"      },
 }}};
 
 [[nodiscard]] constexpr std::string_view

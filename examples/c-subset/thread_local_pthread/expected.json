@@ -1,5 +1,5 @@
 {
-  "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C1): the TRUE per-thread-storage discriminator — main mutates its thread_local copy 5->6; two pthread_create'd workers each do counter+=100 and BOTH must observe 105 (each thread's copy starts from the .tdata TEMPLATE), while main's copy stays 6. A process-shared static alias yields 106/206 (or a torn interleave) and a wrong main-side value — this witness fails on ANY non-per-thread implementation, which no single-thread test can. pthread_create/pthread_join bind via the ordinary raw-extern default-library mechanism (glibc>=2.34 ships them IN libc.so.6 — zero pthread-specific config; WSL leg = glibc 2.39). local-exec stays correct for these worker threads: the exec's PT_TLS block is part of glibc's static TLS set allocated for every thread at pthread_create (no dlopen in play). The release arm re-proves it under the full optimizer. The arm64 arm (TLS C2) re-proves the SAME discriminator through MRS TPIDR_EL0 + ADD/ADD Variant-I under qemu-aarch64 (pthread_create rides NPTL over qemu-user's emulated clone; the aarch64 sysroot glibc>=2.34 ships pthread in libc.so.6). pe64 until C3 / Mach-O until C4. Exit 42.",
+  "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C1): the TRUE per-thread-storage discriminator — main mutates its thread_local copy 5->6; two pthread_create'd workers each do counter+=100 and BOTH must observe 105 (each thread's copy starts from the .tdata TEMPLATE), while main's copy stays 6. A process-shared static alias yields 106/206 (or a torn interleave) and a wrong main-side value — this witness fails on ANY non-per-thread implementation, which no single-thread test can. pthread_create/pthread_join bind via the ordinary raw-extern default-library mechanism (glibc>=2.34 ships them IN libc.so.6 — zero pthread-specific config; WSL leg = glibc 2.39). local-exec stays correct for these worker threads: the exec's PT_TLS block is part of glibc's static TLS set allocated for every thread at pthread_create (no dlopen in play). The release arm re-proves it under the full optimizer. The arm64 arm (TLS C2) re-proves the SAME discriminator through MRS TPIDR_EL0 + ADD/ADD Variant-I under qemu-aarch64 (pthread_create rides NPTL over qemu-user's emulated clone; the aarch64 sysroot glibc>=2.34 ships pthread in libc.so.6). The arm64-macho arm (TLS C4, runOn darwin) re-proves the SAME per-thread discriminator through the __thread_vars descriptor + __tlv_bootstrap call sequence, with pthread_create/pthread_join binding through libSystem (externLibraryByFormat.macho); the host cannot execute Mach-O, so this arm runs only on the macos-latest CI leg / the user's Mac. pe64 has no pthread (a Windows CreateThread analog lives in thread_local_win_threads). Exit 42.",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,
@@ -14,6 +14,12 @@
       "artifact": "main",
       "runOn": ["linux"],
       "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
     }
   ],
   "optimizedPipelines": [

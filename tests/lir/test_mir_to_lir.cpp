@@ -4525,21 +4525,19 @@ TEST(MirToLirTls, X64PeIndexedThreadLocalLowersToTebIndexedSequence) {
 }
 
 TEST(MirToLirTls, NoTlsAccessFormatFailsLoud0x8015) {
-    // A format that declares NO tlsAccess (macho until C4) must fail
-    // EXACTLY K_FormatLacksThreadLocalSupport (0x8015) on the first
-    // thread-local access — never lower through the ordinary (process-
-    // shared) global path. This is the C1-era 0x8015-first pin, repointed
-    // to macho now that pe64 (C3) + aarch64-ELF (C2) declare tlsAccess.
-    auto macho = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-exec");
-    ASSERT_TRUE(macho.has_value());
-    ASSERT_FALSE((*macho)->tlsAccess().has_value())
-        << "precondition: macho declares no tlsAccess until C4";
+    // A format that declares NO tlsAccess block must fail EXACTLY
+    // K_FormatLacksThreadLocalSupport (0x8015) on the first thread-local
+    // access — never lower through the ordinary (process-shared) global path.
+    // Every shipped EXEC format now declares tlsAccess (elf x86 C1, arm64 C2,
+    // pe C3, macho C4), so this pins the no-tlsAccess arm with an explicit
+    // nullopt (the shape a .o / macho-x86_64 / wasm format still presents).
     auto m = buildTlsPlusControlModule();
     auto target = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
     auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
-                           std::nullopt, std::nullopt, (*macho)->tlsAccess());
+                           std::nullopt, std::nullopt,
+                           std::optional<::dss::TlsAccessInfo>{});
     EXPECT_FALSE(lirR.ok);
     EXPECT_TRUE(sawDiagnosticCode(
         rep, DiagnosticCode::K_FormatLacksThreadLocalSupport))
@@ -4548,23 +4546,74 @@ TEST(MirToLirTls, NoTlsAccessFormatFailsLoud0x8015) {
     EXPECT_TRUE(sawAnchor(rep, "D-CSUBSET-THREAD-LOCAL"));
 }
 
-TEST(MirToLirTls, MachoTlvModelDeclaredButUnloweredFailsLoud) {
-    // TLS C3 belt: a format declaring the macho-tlv MODEL (vocabulary
-    // whose LOWERING lands with C4) must fail loud — never a silently-
-    // wrong pe-indexed/local-exec sequence (the models disagree on every
-    // byte after the tp read). Hand-built TlsAccessInfo (no shipped format
-    // declares macho-tlv yet).
-    ::dss::TlsAccessInfo tlv{};
-    tlv.model = ::dss::TlsAccessModel::MachoTlv;
+TEST(MirToLirTls, Arm64MachoTlvLowersToDescriptorCallSequence) {
+    // TLS C4 (D-CSUBSET-THREAD-LOCAL): the macho-tlv SHAPE pin. macOS has NO
+    // tp-relative TLS — a thread-local access is a CALL THROUGH the descriptor.
+    // The shipped arm64-macho-exec format now declares tlsAccess{macho-tlv}, so
+    // a thread-local access lowers to (NO tlsbase read at the access site — the
+    // tlv thunk reads TPIDR itself):
+    //   1. lea %desc, [sym]      ; ORDINARY 1-op [SymbolRef] lea (ADRP+ADD),
+    //                            ;   the writer binds symbolVa[sym]=descriptorVA
+    //   2. load %callee, [%desc] ; word0 = the dyld-bound __tlv_bootstrap thunk
+    //   3. call %callee(%desc)   ; the indirect [reg] call → BLR; x0=desc→&var
+    auto fmt = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-exec");
+    ASSERT_TRUE(fmt.has_value());
+    ASSERT_TRUE((*fmt)->tlsAccess().has_value())
+        << "precondition: arm64-macho declares tlsAccess since C4";
+    EXPECT_EQ((*fmt)->tlsAccess()->model, ::dss::TlsAccessModel::MachoTlv);
     auto m = buildTlsPlusControlModule();
-    auto target = TargetSchema::loadShipped("x86_64");
+    auto target = TargetSchema::loadShipped("arm64");
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
     auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
-                           std::nullopt, std::nullopt, tlv);
-    EXPECT_FALSE(lirR.ok);
-    EXPECT_TRUE(sawDiagnosticCode(
-        rep, DiagnosticCode::K_FormatLacksThreadLocalSupport));
+                           std::nullopt, std::nullopt, (*fmt)->tlsAccess());
+    ASSERT_TRUE(lirR.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = lirR.lir;
+
+    auto const leaOp  = (*target)->opcodeByMnemonic("lea");
+    auto const callOp = (*target)->opcodeByMnemonic("call");
+    auto const loadOp =
+        (*target)->regClassOpOpcode(TargetRegClass::GPR, RegClassOp::Load);
+    auto const tlsbaseOp = (*target)->opcodeByMnemonic("tlsbase");
+    ASSERT_TRUE(leaOp.has_value() && callOp.has_value() && loadOp.has_value());
+
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    std::optional<LirReg> descReg, calleeReg;
+    bool sawDescLea = false, sawThunkLoad = false, sawThunkCall = false,
+         sawTlsbase = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        LirInstId const inst = lir.blockInstAt(bb, i);
+        auto const op  = lir.instOpcode(inst);
+        auto const ops = lir.instOperands(inst);
+        if (tlsbaseOp.has_value() && op == *tlsbaseOp) sawTlsbase = true;
+        if (op == *leaOp && ops.size() == 1
+            && ops[0].kind == LirOperandKind::SymbolRef
+            && ops[0].symbolV == 500u) {
+            sawDescLea = true;
+            descReg = lir.instResult(inst);
+        } else if (op == *loadOp && ops.size() == 3 && descReg.has_value()
+                   && ops[0].kind == LirOperandKind::Reg
+                   && ops[0].reg == *descReg
+                   && ops[1].kind == LirOperandKind::MemBase
+                   && ops[2].kind == LirOperandKind::MemOffset
+                   && ops[2].offset == 0) {
+            sawThunkLoad = true;
+            calleeReg = lir.instResult(inst);
+        } else if (op == *callOp && calleeReg.has_value() && descReg.has_value()
+                   && ops.size() == 2
+                   && ops[0].kind == LirOperandKind::Reg
+                   && ops[0].reg == *calleeReg
+                   && ops[1].kind == LirOperandKind::Reg
+                   && ops[1].reg == *descReg) {
+            sawThunkCall = true;
+        }
+    }
+    EXPECT_TRUE(sawDescLea)   << "step 1 ordinary [SymbolRef(500)] descriptor lea";
+    EXPECT_TRUE(sawThunkLoad) << "step 2 [desc] word0 thunk load";
+    EXPECT_TRUE(sawThunkCall) << "step 3 indirect call(callee, desc) → BLR";
+    EXPECT_FALSE(sawTlsbase)
+        << "macho-tlv reads NO thread pointer at the access site (the thunk "
+           "does) — a tlsbase op here is the wrong model";
 }
 
 TEST(MirToLirTls, Arm64ThreadLocalLowersToBareTlsBasePlusSymbolLea) {

@@ -23,7 +23,11 @@
   "dataImportBinding": "got-indirect",
 
   "$supportedDataSectionsComment": "the exec read-only data-section arm, mirrors ELF D-LK1-ELF-EXEC-DATA-SECTIONS (rodata-only scope): the Mach-O MH_EXECUTE walker emits a loadable `__TEXT,__const` from `AssembledModule.dataItems` items with `section=Rodata` (the parallel of the ELF `.rodata` arm, commit 8040410). The linker's pre-walker gate (linker.cpp) consults this set per-item — `Data`/`Bss` remain anchored under D-LK4-RODATA-PRODUCER. Cross-format agnosticism: this is the SAME field ELF + PE exec formats declare; the gate has ZERO format-name branches, and the validation+layout reuses the shared `exec_data_section.hpp` substrate (`buildExecRodata`/`addDataSymbolVas`) used by elf.cpp. macho64-x86_64-darwin-exec deliberately does NOT declare it yet (no macOS-x86_64 CI leg to runtime-prove it).",
-  "supportedDataSections": ["rodata", "data", "bss"],
+  "supportedDataSections": ["rodata", "data", "bss", "tdata", "tbss"],
+  "$tlsAccessComment": "D-CSUBSET-THREAD-LOCAL (TLS C4, Mach-O TLV): macOS has NO local-exec / tp-relative TLS — a thread-local object is reached by CALLING THROUGH its `tlv_descriptor` (a 3-word record in `__DATA,__thread_vars`). The `macho-tlv` model tells MIR->LIR to emit the descriptor-call access sequence (arm64: `adrp/add` the descriptor, `ldr` its word0 thunk, `blr` it -> x0 = &var); the writer (macho.cpp) mints one descriptor per thread-local, binds word0 to the undefined libSystem thunk `__tlv_bootstrap`, and stores `symbolVa[sym] = descriptorVA` so the ORDINARY adrp/add reloc resolves to the descriptor (F3). Unlike `local-exec`/`pe-indexed`, macho-tlv reads NO segment/displacement and NO module TLS-index array — segmentPrefixByte/baseDisplacement/tlsIndexSlotName are all absent (the loader validates tlsIndexSlotName is required only for pe-indexed). Keyed by the FORMAT because the SAME arm64 target uses tp-relative access under ELF (local-exec) and the TLV call under Mach-O.",
+  "tlsAccess": {
+    "model": "macho-tlv"
+  },
   "$artifactProfilesComment": "Profiles this format SERVES (plan 06 AP3) — a runnable console executable ⇒ cli (the format-side twin of the language's artifactProfiles[]; driver fails loud D_ArtifactProfileFormatMismatch on a profile not in this set). macho64-x86_64-darwin-exec deliberately does NOT declare it (its processExit / exit spine is deferred → it cannot emit a runnable cli yet).",
   "artifactProfiles": ["cli"],
 
@@ -107,6 +111,39 @@
       "name": "__bss",
       "segment": "__DATA",
       "type": 1,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C4): __thread_data within __DATA — the INITIALIZED thread-local TEMPLATE (`thread_local int g = 7;`). `type` (section_64.flags) = S_THREAD_LOCAL_REGULAR = 0x11 = 17: dyld COPIES this section's bytes into every thread's freshly-allocated TLS block (the per-thread initial image). File-backed (contributes __DATA file bytes). It is the LOW address of the per-thread TLV template region [__thread_data, __thread_bss-end); each descriptor's word2 (offset) is measured from here (CRIT-2, 0-based). addrAlign=1 is the FLOOR (member-driven, gcc/ld64 parity — a larger floor would inflate every thread's block); the walker H1-raises it to the strictest thread-local's alignment (capped at 16 by the over-align gate). virtualAddress=0 — walker-computed after __data.",
+      "kind": "tdata",
+      "name": "__thread_data",
+      "segment": "__DATA",
+      "type": 17,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C4): __thread_bss within __DATA — the ZERO-INIT thread-local TEMPLATE extent (`static thread_local int c;`). `type` (section_64.flags) = S_THREAD_LOCAL_ZEROFILL = 0x12 = 18: like S_ZEROFILL it occupies VM but stores NO file bytes (section_64.offset=0; excluded from __DATA.filesize) and MUST follow __thread_data CONTIGUOUSLY so the TLV region is one span (dyld calloc's the block, so the zero-fill tail reads 0 in every thread). addrAlign=1 FLOOR (H1-raised, <=16). virtualAddress=0 — walker places it at __thread_data-VA + alignUp(tdataSpan, tbssAlign) so a tbss var's descriptor offset is block-relative. reuses the shared isZeroFill predicate.",
+      "kind": "tbss",
+      "name": "__thread_bss",
+      "segment": "__DATA",
+      "type": 18,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C4): __thread_vars within __DATA — the thread-local variable DESCRIPTORS. `type` (section_64.flags) = S_THREAD_LOCAL_VARIABLES = 0x13 = 19. Each 24-byte `tlv_descriptor` = { word0 thunk (a bind to the undefined libSystem `__tlv_bootstrap`; dyld overwrites it with its tlv_get_addr at load), word1 key (0; dyld fills the pthread key), word2 offset (the variable's 0-based offset into the [__thread_data,__thread_bss] block) }. WRITER-synthesized (not AssembledData) — the writer mints one per thread-local and stores symbolVa[sym]=descriptorVA so the access adrp/add resolves here (F3). File-backed. addrAlign=8 (three u64 words). entrySize could be 24 but the writer emits it as 0 (matching __got's table convention). virtualAddress=0 — walker-computed; the descriptors are NOT part of the per-thread copied template.",
+      "kind": "tvars",
+      "name": "__thread_vars",
+      "segment": "__DATA",
+      "type": 19,
       "flags": 0,
       "addrAlign": 8,
       "entrySize": 0,
