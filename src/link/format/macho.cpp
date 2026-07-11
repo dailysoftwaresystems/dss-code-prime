@@ -174,6 +174,17 @@ constexpr std::uint32_t S_ATTR_PURE_INSTRUCTIONS   = 0x80000000u;
 constexpr std::uint32_t S_THREAD_LOCAL_REGULAR     = 0x11;
 constexpr std::uint32_t S_THREAD_LOCAL_ZEROFILL    = 0x12;
 constexpr std::uint32_t S_THREAD_LOCAL_VARIABLES   = 0x13;
+// D-CSUBSET-THREAD-LOCAL (TLS C4 runtime-closure): the mach_header_64.flags bit
+// dyld ALSO gates TLV setup on. The correct S_THREAD_LOCAL_* section types (above)
+// are necessary but NOT sufficient — dyld only walks __thread_vars and rewrites
+// each descriptor's word0 thunk to the real tlv_get_addr when the image header
+// advertises MH_HAS_TLV_DESCRIPTORS. WITHOUT it, dyld leaves every word0 bound to
+// __tlv_bootstrap, whose thunk aborts the instant a thread_local is accessed —
+// perfect section flags + descriptor binds, yet a runtime SIGABRT (the exact
+// gap the arm64 witness caught: byte-pins green on a non-Mac host, dyld
+// `_tlv_bootstrap_error`→abort on native execution). clang sets this bit iff the
+// image has thread-locals; this writer ORs it into the header flags when hasTls.
+constexpr std::uint32_t MH_HAS_TLV_DESCRIPTORS     = 0x00800000u;
 // Each `tlv_descriptor` is 3 native words (thunk / key / offset).
 constexpr std::uint64_t kTlvDescriptorSize         = 24;
 // The on-disk symbol every TLV descriptor's word0 binds to: the libSystem
@@ -2861,7 +2872,12 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, static_cast<std::uint32_t>(id.filetype));
     appendU32LE(bytes, ncmds);
     appendU32LE(bytes, static_cast<std::uint32_t>(sizeofcmds));
-    appendU32LE(bytes, id.flags);
+    // TLS C4 runtime-closure: advertise MH_HAS_TLV_DESCRIPTORS iff this module
+    // carries thread-locals, so dyld runs the TLV setup that rewrites each
+    // descriptor word0 to tlv_get_addr (matches clang, which sets the bit only
+    // for TLS-bearing images). The base flags come from the format JSON; the
+    // per-module TLV bit is content-derived (hasTls), never a format identity.
+    appendU32LE(bytes, id.flags | (hasTls ? MH_HAS_TLV_DESCRIPTORS : 0u));
     appendU32LE(bytes, 0);
 
     // TLS C4 (audit FOLD-1): count the segments emitted BEFORE __DATA so the

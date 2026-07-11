@@ -2614,6 +2614,36 @@ TEST(MachOTlvWriter, BootstrapBindPerDescriptorTargetsWord0) {
     }
 }
 
+TEST(MachOTlvWriter, TlsImageHeaderAdvertisesTlvDescriptorsFlagRuntimeClosure) {
+    // ★ TLS C4 runtime-closure red-on-disable (the host-independent guard for the
+    // gap the arm64 witness caught): a TLS-bearing image's mach_header_64.flags
+    // MUST carry MH_HAS_TLV_DESCRIPTORS (0x00800000). The correct S_THREAD_LOCAL_*
+    // section types + per-descriptor __tlv_bootstrap binds (pinned above) are
+    // NECESSARY BUT NOT SUFFICIENT — dyld runs the TLV setup that rewrites each
+    // descriptor's word0 thunk to the real tlv_get_addr ONLY when the HEADER
+    // advertises this bit. Without it, dyld leaves word0 = __tlv_bootstrap, whose
+    // thunk aborts the instant a thread_local is read → runtime SIGABRT
+    // (`_tlv_bootstrap_error`). That is invisible to a byte-pin over sections/binds
+    // and to any non-Mac host; this pin fails on EVERY leg if the writer drops the
+    // flag, so the regression can never re-hide behind green byte-pins again.
+    auto L = loadArm64MachoExec();
+    ASSERT_TRUE(L.target && L.format);
+    auto mod = buildMachoTlvModule(/*withTbss=*/true);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *L.target, *L.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 28u);
+    // mach_header_64.flags @ +24 (magic/cputype/cpusubtype/filetype/ncmds/sizeofcmds).
+    std::uint32_t const flags = readU32LE(bytes, 24);
+    EXPECT_NE(flags & 0x00800000u, 0u)
+        << "TLS image must set MH_HAS_TLV_DESCRIPTORS or dyld skips TLV setup "
+           "→ runtime SIGABRT via _tlv_bootstrap_error on native execution";
+    // The base format flags (NOUNDEFS|DYLDLINK|TWOLEVEL|PIE = 0x200085) survive —
+    // the TLV bit is ADDED to them, never replaces them.
+    EXPECT_EQ(flags & 0x00200085u, 0x00200085u)
+        << "base MH flags preserved alongside the TLV bit";
+}
+
 TEST(MachOTlvWriter, AddressOfThreadLocalInDataItemFailsLoudCrit1) {
     // ★ CRIT-1 arm-(a) red-on-disable: a DATA-item reloc targeting a thread-local
     // symbol embeds the descriptor VA as a process-shared pointer. The macho
@@ -2705,4 +2735,10 @@ TEST(MachOTlvWriter, NoThreadLocalEmitsNoThreadSectionsSqliteDormant) {
     EXPECT_EQ(dec.sec("__thread_bss"), nullptr);
     for (auto const& b : dec.binds)
         EXPECT_NE(b.sym, "__tlv_bootstrap");
+    // MH_HAS_TLV_DESCRIPTORS is content-conditional (set iff the module carries
+    // thread-locals — clang's rule), NOT a blanket format-JSON flag: a no-TLS
+    // image must NOT advertise it. This is the negative twin of the runtime-
+    // closure pin — it goes red if the TLV bit is ever made unconditional.
+    EXPECT_EQ(readU32LE(bytes, 24) & 0x00800000u, 0u)
+        << "no-TLS image must NOT set MH_HAS_TLV_DESCRIPTORS";
 }
