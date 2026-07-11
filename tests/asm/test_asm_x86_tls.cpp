@@ -325,8 +325,9 @@ TEST(X86Tls, ShippedArm64DeclaresTlsRowsSinceC2) {
 TEST(X86Tls, ShippedFormatsTlsAccessPresenceMatchesLandedLegs) {
     // ELF-Linux x86_64 exec (C1): local-exec {fs=0x64, disp 0}.
     // arm64-ELF (C2): local-exec {0, 0} — the MRS shape consumes
-    // neither x86 template value. pe64: ABSENT — absence IS the
-    // K_FormatLacksThreadLocalSupport gate for the un-landed legs.
+    // neither x86 template value. pe64 (C3): pe-indexed {gs=0x65,
+    // disp 0x58, __dss_tls_index}. Mach-O remains ABSENT until C4 —
+    // absence IS the K_FormatLacksThreadLocalSupport gate for it.
     auto elf = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
     ASSERT_TRUE(elf.has_value());
     auto const ta = (*elf)->tlsAccess();
@@ -337,8 +338,13 @@ TEST(X86Tls, ShippedFormatsTlsAccessPresenceMatchesLandedLegs) {
 
     auto pe = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
     ASSERT_TRUE(pe.has_value());
-    EXPECT_FALSE((*pe)->tlsAccess().has_value())
-        << "pe64 must NOT declare tlsAccess until the PE TLS cycle";
+    auto const taPe = (*pe)->tlsAccess();
+    ASSERT_TRUE(taPe.has_value())
+        << "pe64 declares tlsAccess since TLS C3";
+    EXPECT_EQ(taPe->model, TlsAccessModel::PeIndexed);
+    EXPECT_EQ(taPe->segmentPrefixByte, 0x65u);       // gs
+    EXPECT_EQ(taPe->baseDisplacement, 0x58u);        // TEB TLS array
+    EXPECT_EQ(taPe->tlsIndexSlotName, "__dss_tls_index");
 
     auto arm = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-exec");
     ASSERT_TRUE(arm.has_value());

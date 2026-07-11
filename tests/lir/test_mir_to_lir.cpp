@@ -4415,27 +4415,156 @@ TEST(MirToLirTls, X64ThreadLocalNeverRiprelFoldsWhileControlDoes) {
            "(audit M-5 silent wrong-address class)";
 }
 
-TEST(MirToLirTls, X64ThreadLocalUnderShippedPe64FormatFailsLoud0x8015) {
-    // The REAL shipped pe64 format declares no tlsAccess (its TLS
-    // machinery is the PE TLS cycle) — a thread-local access under it
-    // must fail EXACTLY K_FormatLacksThreadLocalSupport (0x8015),
-    // never lower through the ordinary (process-shared) global path.
+TEST(MirToLirTls, X64PeIndexedThreadLocalLowersToTebIndexedSequence) {
+    // TLS C3 (D-CSUBSET-THREAD-LOCAL): the pe-indexed SHAPE pin — the
+    // shipped pe64 format now DECLARES tlsAccess {pe-indexed, gs 0x65,
+    // 0x58, __dss_tls_index}, so a thread-local access lowers to the
+    // 5-LIR-instruction TEB-array sequence (replacing the C1-era
+    // 0x8015-first pin, exactly as C2 did for arm64):
+    //   1. tlsbase %tp        ; mov rax, gs:[0x58]  (payload 0x65, MemOffset 0x58)
+    //   2. lea %ia, [reserved] ; lea rcxaddr, [rip+__dss_tls_index]  (1-op SymbolRef)
+    //   3. load %i, [%ia]      ; mov ecx, [rcxaddr]  ★ WIDTH 32 (CRIT-3)
+    //   4. load %blk, [%tp+%i*8]; mov rax, [rax+rcx*8] (scale-8 SIB, width 64)
+    //   5. lea %addr, [%blk+sym]; lea rax, [rax + secrel(500)]  (2-op [Reg,Sym])
     auto pe = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
     ASSERT_TRUE(pe.has_value());
-    ASSERT_FALSE((*pe)->tlsAccess().has_value())
-        << "precondition: pe64 must not declare tlsAccess yet";
+    ASSERT_TRUE((*pe)->tlsAccess().has_value())
+        << "precondition: pe64 declares tlsAccess since C3";
+    EXPECT_EQ((*pe)->tlsAccess()->model, ::dss::TlsAccessModel::PeIndexed);
+    EXPECT_EQ((*pe)->tlsAccess()->segmentPrefixByte, 0x65u);      // gs
+    EXPECT_EQ((*pe)->tlsAccess()->baseDisplacement, 0x58u);       // TEB slot
+    EXPECT_EQ((*pe)->tlsAccess()->tlsIndexSlotName, "__dss_tls_index");
+
     auto m = buildTlsPlusControlModule();
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     DiagnosticReporter rep;
     auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
                            std::nullopt, std::nullopt, (*pe)->tlsAccess());
+    ASSERT_TRUE(lirR.ok) << (rep.all().empty() ? "" : rep.all()[0].actual);
+    Lir const& lir = lirR.lir;
+
+    auto const tlsbaseOp = (*target)->opcodeByMnemonic("tlsbase");
+    auto const leaOp     = (*target)->opcodeByMnemonic("lea");
+    auto const loadOp    =
+        (*target)->regClassOpOpcode(TargetRegClass::GPR, RegClassOp::Load);
+    ASSERT_TRUE(tlsbaseOp.has_value() && leaOp.has_value()
+                && loadOp.has_value());
+
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    std::optional<LirReg> tpReg, idxAddrReg, idxReg, blockReg;
+    bool sawIdxAddrLea = false, sawIdxLoad = false, sawBlockLoad = false,
+         sawFinalLea   = false;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        LirInstId const inst = lir.blockInstAt(bb, i);
+        auto const op  = lir.instOpcode(inst);
+        auto const ops = lir.instOperands(inst);
+        if (op == *tlsbaseOp) {
+            // Step 1: mov rax, gs:[0x58] — the SAME memoffset shape ELF
+            // uses, config values from the pe64 tlsAccess block.
+            EXPECT_EQ(lir.instPayload(inst), 0x65u) << "gs segment byte";
+            ASSERT_EQ(ops.size(), 1u);
+            ASSERT_EQ(ops[0].kind, LirOperandKind::MemOffset);
+            EXPECT_EQ(ops[0].offset, 0x58) << "TEB ThreadLocalStoragePointer";
+            tpReg = lir.instResult(inst);
+        } else if (op == *leaOp && ops.size() == 1
+                   && ops[0].kind == LirOperandKind::SymbolRef) {
+            // Step 2: lea idxAddr, [rip + reserved _tls_index singleton].
+            EXPECT_EQ(ops[0].symbolV, ::dss::kTlsIndexReservedSymbolIdValue)
+                << "the index read targets the reserved writer-minted id";
+            sawIdxAddrLea = true;
+            idxAddrReg = lir.instResult(inst);
+        } else if (op == *loadOp && ops.size() == 3 && idxAddrReg.has_value()
+                   && ops[0].kind == LirOperandKind::Reg
+                   && ops[0].reg == *idxAddrReg) {
+            // Step 3: mov ecx, [idxAddr] — ★ CRIT-3: WIDTH 32 (no REX.W).
+            // A 64-bit index read would pull 4 adjacent bytes into bits
+            // 63:32 → a garbage index → every PE TLS access wrong.
+            EXPECT_EQ(lirInstWidthBits(lir.instFlags(inst)), 32u)
+                << "★ CRIT-3: the _tls_index load MUST be 32-bit "
+                   "(kLirInstFlagWidth32) — a 64-bit load is the "
+                   "garbage-index silent miscompile";
+            ASSERT_EQ(ops[1].kind, LirOperandKind::MemBase);
+            EXPECT_EQ(ops[1].scale, 1u);
+            ASSERT_EQ(ops[2].kind, LirOperandKind::MemOffset);
+            EXPECT_EQ(ops[2].offset, 0);
+            sawIdxLoad = true;
+            idxReg = lir.instResult(inst);
+        } else if (op == *loadOp && ops.size() == 4 && tpReg.has_value()
+                   && idxReg.has_value()
+                   && ops[0].kind == LirOperandKind::Reg
+                   && ops[0].reg == *tpReg
+                   && ops[1].kind == LirOperandKind::Reg
+                   && ops[1].reg == *idxReg) {
+            // Step 4: mov rax, [rax + rcx*8] — scale-8 SIB indexed load,
+            // width 64 (the module TLS-block pointer).
+            EXPECT_EQ(lirInstWidthBits(lir.instFlags(inst)), 64u)
+                << "the block-pointer load is a full 64-bit pointer read";
+            ASSERT_EQ(ops[2].kind, LirOperandKind::MemBase);
+            EXPECT_EQ(ops[2].scale, 8u) << "scale 8 = sizeof(void*)";
+            ASSERT_EQ(ops[3].kind, LirOperandKind::MemOffset);
+            EXPECT_EQ(ops[3].offset, 0);
+            sawBlockLoad = true;
+            blockReg = lir.instResult(inst);
+        } else if (op == *leaOp && ops.size() == 2 && blockReg.has_value()
+                   && ops[0].kind == LirOperandKind::Reg
+                   && ops[0].reg == *blockReg
+                   && ops[1].kind == LirOperandKind::SymbolRef
+                   && ops[1].symbolV == 500u) {
+            // Step 5: lea addr, [block + secrel(500)] — VERBATIM the C1
+            // [Reg, SymbolRef] lea (its tls-tpoff32/kind-4 reloc becomes
+            // the PE SECREL at the format tier).
+            sawFinalLea = true;
+        }
+    }
+    EXPECT_TRUE(tpReg.has_value())    << "step 1 tlsbase (gs:[0x58])";
+    EXPECT_TRUE(sawIdxAddrLea)        << "step 2 lea [reserved _tls_index]";
+    EXPECT_TRUE(sawIdxLoad)           << "step 3 32-bit index load";
+    EXPECT_TRUE(sawBlockLoad)         << "step 4 scale-8 block load";
+    EXPECT_TRUE(sawFinalLea)          << "step 5 [Reg, SymbolRef(500)] lea";
+}
+
+TEST(MirToLirTls, NoTlsAccessFormatFailsLoud0x8015) {
+    // A format that declares NO tlsAccess (macho until C4) must fail
+    // EXACTLY K_FormatLacksThreadLocalSupport (0x8015) on the first
+    // thread-local access — never lower through the ordinary (process-
+    // shared) global path. This is the C1-era 0x8015-first pin, repointed
+    // to macho now that pe64 (C3) + aarch64-ELF (C2) declare tlsAccess.
+    auto macho = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-exec");
+    ASSERT_TRUE(macho.has_value());
+    ASSERT_FALSE((*macho)->tlsAccess().has_value())
+        << "precondition: macho declares no tlsAccess until C4";
+    auto m = buildTlsPlusControlModule();
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+                           std::nullopt, std::nullopt, (*macho)->tlsAccess());
     EXPECT_FALSE(lirR.ok);
     EXPECT_TRUE(sawDiagnosticCode(
         rep, DiagnosticCode::K_FormatLacksThreadLocalSupport))
         << "a thread-local access under a tlsAccess-less format must "
            "fire K_FormatLacksThreadLocalSupport (0x8015)";
     EXPECT_TRUE(sawAnchor(rep, "D-CSUBSET-THREAD-LOCAL"));
+}
+
+TEST(MirToLirTls, MachoTlvModelDeclaredButUnloweredFailsLoud) {
+    // TLS C3 belt: a format declaring the macho-tlv MODEL (vocabulary
+    // whose LOWERING lands with C4) must fail loud — never a silently-
+    // wrong pe-indexed/local-exec sequence (the models disagree on every
+    // byte after the tp read). Hand-built TlsAccessInfo (no shipped format
+    // declares macho-tlv yet).
+    ::dss::TlsAccessInfo tlv{};
+    tlv.model = ::dss::TlsAccessModel::MachoTlv;
+    auto m = buildTlsPlusControlModule();
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    DiagnosticReporter rep;
+    auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
+                           std::nullopt, std::nullopt, tlv);
+    EXPECT_FALSE(lirR.ok);
+    EXPECT_TRUE(sawDiagnosticCode(
+        rep, DiagnosticCode::K_FormatLacksThreadLocalSupport));
 }
 
 TEST(MirToLirTls, Arm64ThreadLocalLowersToBareTlsBasePlusSymbolLea) {
@@ -4601,12 +4730,13 @@ TEST(MirToLirTls, TlsBaseRowWithUnrecognizedShapeFailsLoud) {
            "variant shape must fail loud at the lowering probe";
 }
 
-TEST(MirToLirTls, PeIndexedModelDeclaredButUnlandedFailsLoud) {
-    // Closed-verb arm: `pe-indexed` is declared vocabulary whose
-    // LOWERING lands with the PE TLS cycle — until then it must fail
-    // loud (0x8015-class), never emit a silently-wrong local-exec
-    // sequence (the two models disagree on every byte after the tp
-    // read).
+TEST(MirToLirTls, PeIndexedWithoutTlsIndexSlotNameFailsLoud) {
+    // TLS C3 belt (repurposed from the C1/C2-era "pe-indexed unlanded"
+    // pin — pe-indexed LANDED this cycle): the pe-indexed access sequence
+    // reads a NAMED module TLS-index singleton, so a pe-indexed
+    // TlsAccessInfo with an EMPTY tlsIndexSlotName cannot lower and must
+    // fail loud (the shipped loader REQUIRES the name for pe-indexed; this
+    // is the defense-in-depth for a hand-built / programmatic block).
     auto m = buildTlsPlusControlModule();
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
@@ -4614,6 +4744,7 @@ TEST(MirToLirTls, PeIndexedModelDeclaredButUnlandedFailsLoud) {
     pe.model             = ::dss::TlsAccessModel::PeIndexed;
     pe.segmentPrefixByte = 0x65;
     pe.baseDisplacement  = 0x58;
+    // tlsIndexSlotName left EMPTY on purpose.
     DiagnosticReporter rep;
     auto lirR = lowerToLir(m.mir, **target, m.interner, rep, {},
                            std::nullopt, std::nullopt, pe);
@@ -4621,5 +4752,5 @@ TEST(MirToLirTls, PeIndexedModelDeclaredButUnlandedFailsLoud) {
     EXPECT_TRUE(sawDiagnosticCode(
         rep, DiagnosticCode::K_FormatLacksThreadLocalSupport));
     EXPECT_TRUE(sawAnchor(rep, "pe-indexed"))
-        << "the reject must name the declared-but-unlanded model";
+        << "the reject must name the pe-indexed model + the missing slot name";
 }

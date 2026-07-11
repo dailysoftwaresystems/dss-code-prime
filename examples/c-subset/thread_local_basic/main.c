@@ -17,8 +17,9 @@
  * tests/link/test_elf_exec_writer.cpp) and the 2-thread
  * thread_local_pthread example are the discriminators.
  *
- * x86_64-linux only until TLS C2 (arm64) / C3 (pe64) / C4 (Mach-O) land.
- * Exit 42. No stdout (the only extern is the trampoline's libc exit).
+ * Runs on x86_64-linux (C1), arm64-linux (C2), AND Windows pe64 (C3);
+ * Mach-O (C4) still rejects loud. Exit 42. No stdout (the only extern is
+ * the trampoline's process-exit import).
  */
 thread_local int g = 7;
 thread_local const int k = 3;

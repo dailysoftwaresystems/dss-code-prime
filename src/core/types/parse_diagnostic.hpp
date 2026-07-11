@@ -1643,7 +1643,20 @@ enum class DiagnosticCode : std::uint16_t {
     //   the C1 semantic tier so the C1/C2/C3 walker slices share one code;
     //   fires from the walker tiers (slices B/C).
     K_FormatLacksThreadLocalSupport = 0x8015,
-    // K-NEXT-SLOT: 0x8016 — grep this marker before adding a K_* code.
+    // K_ThreadLocalOveralignedForFormat (D-CSUBSET-THREAD-LOCAL-PE-OVERALIGN):
+    //   a thread-local object requires an alignment the OUTPUT FORMAT's
+    //   per-thread TLS block cannot guarantee. On PE/x64 the loader allocates
+    //   each thread's static-TLS block at only MEMORY_ALLOCATION_ALIGNMENT
+    //   (16 bytes), and IMAGE_TLS_DIRECTORY64 carries NO block-base-alignment
+    //   field to request more — so an `_Alignas(32) thread_local` var would be
+    //   SILENTLY under-aligned (a SIMD/atomic thread_local relying on it is
+    //   UB). ELF has no such limit (PT_TLS p_align honors any alignment), so
+    //   this is a PE-format-LOCAL fail-loud gate (the format plugin's own
+    //   knowledge — never a shared-substrate branch); the alignment axis is
+    //   otherwise fully honored. Fires from the PE walker (pe.cpp) when the
+    //   max TLS-block var alignment exceeds the format's guaranteed 16.
+    K_ThreadLocalOveralignedForFormat = 0x8016,
+    // K-NEXT-SLOT: 0x8017 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

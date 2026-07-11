@@ -486,6 +486,38 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     }
                 }
             }
+            // TLS C3 (D-CSUBSET-THREAD-LOCAL): the `_tls_index` slot NAME —
+            // the writer-minted module-TLS-index singleton the `pe-indexed`
+            // access sequence's riprel read targets. A string when present;
+            // REQUIRED (non-empty) for the pe-indexed model below so a
+            // pe-indexed format can never silently ship WITHOUT the slot its
+            // access sequence indexes (the same closed-verb strictness the
+            // model/segment/displacement fields hold). Ignored for
+            // local-exec / macho-tlv (their tp reads index no module array).
+            if (ta.contains("tlsIndexSlotName")) {
+                if (!ta.at("tlsIndexSlotName").is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/tlsAccess/tlsIndexSlotName",
+                              "'tlsIndexSlotName' must be a string (the name "
+                              "of the module TLS-index slot the pe-indexed "
+                              "access sequence reads)");
+                    ok = false;
+                } else {
+                    info.tlsIndexSlotName =
+                        ta.at("tlsIndexSlotName").get<std::string>();
+                }
+            }
+            if (ok && info.model == TlsAccessModel::PeIndexed
+                && info.tlsIndexSlotName.empty()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/tlsAccess/tlsIndexSlotName",
+                          "'tlsIndexSlotName' is REQUIRED for the "
+                          "'pe-indexed' TLS model — its access sequence "
+                          "reads a named module TLS-index singleton "
+                          "(`mov ecx, [_tls_index]`); a pe-indexed block "
+                          "without it cannot lower a thread-local access");
+                ok = false;
+            }
             if (ok) data.tlsAccess = info;
         }
     }

@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
 
 // Canonical object-format taxonomy — the closed-enum vocabulary the
@@ -229,6 +230,37 @@ tlsAccessModelFromName(std::string_view s) noexcept {
     return kTlsAccessModelTable.fromName(s);
 }
 
+// D-CSUBSET-THREAD-LOCAL (TLS C3): the reserved well-known SymbolId VALUE
+// that names the PE `_tls_index` slot — a LINK-TIER writer-minted SINGLETON
+// (never a MIR symbol) that the `pe-indexed` access sequence's riprel read
+// targets AND the PE writer binds. It is a HIGH sentinel a DENSE per-CU
+// SymbolId (minted upward from 1) can never reach, so on the single-CU
+// emission path (the only path a thread-local access + definition co-reside
+// on today) it survives from MIR→LIR lowering to `pe.cpp` UNREMAPPED and the
+// writer binds `symbolVa[reserved] = _tls_index VA` unambiguously. On a
+// multi-CU merge the retarget would remap it to a fresh dense id → the riprel
+// reloc resolves against no `symbolVa` entry → FAIL-LOUD undefined (multi-file
+// extern-`thread_local` is the deferred `D-PIPELINE-CU5-MULTIFILE-EXTERN-DATA`
+// surface; never a silent wrong-address). Both `mir_to_lir.cpp` (the lowering)
+// and `pe.cpp` (the writer) read this ONE constant — a plain `std::uint32_t`
+// so this leaf header stays free of the `strong_ids.hpp` dependency; each side
+// wraps it in `SymbolId{...}` at use.
+inline constexpr std::uint32_t kTlsIndexReservedSymbolIdValue = 0xFFFF'FF01u;
+
+// Is `v` a writer-minted LINK-TIER reserved SymbolId VALUE — one the FORMAT
+// WRITER (not the module) defines into its `symbolVa` map? Today the sole
+// member is the PE `_tls_index` singleton above. The linker's pre-writer
+// cross-reference unifier EXEMPTS these from its undefined-symbol check —
+// exactly as it exempts extern imports (which the import-table writer
+// resolves) — because the writer binds them (or fails loud if the format has
+// no TLS machinery, e.g. an ELF module that somehow carried the id). Keeps the
+// linker free of any format-name branch: it asks "is this a writer-reserved
+// id", not "is this PE".
+[[nodiscard]] constexpr bool
+isWriterReservedSymbolIdValue(std::uint32_t v) noexcept {
+    return v == kTlsIndexReservedSymbolIdValue;
+}
+
 // The format's TLS access block (`"tlsAccess"` in `.format.json`).
 // `segmentPrefixByte` is the x86 segment-override prefix byte the
 // `tlsbase` instruction emits as its FIRST byte (0x64 = fs on
@@ -244,6 +276,16 @@ struct DSS_EXPORT TlsAccessInfo {
     TlsAccessModel model             = TlsAccessModel::LocalExec;
     std::uint8_t   segmentPrefixByte = 0;  // x86 segment-override byte (0x64 fs / 0x65 gs)
     std::uint32_t  baseDisplacement  = 0;  // disp32 of the tp slot (ELF fs:[0] → 0)
+    // D-CSUBSET-THREAD-LOCAL (TLS C3): the NAME of the writer-minted
+    // `_tls_index` singleton the `pe-indexed` access sequence reads (PE:
+    // "__dss_tls_index"). REQUIRED for `pe-indexed` (the loader validates
+    // it non-empty — a pe-indexed model without a named index slot cannot
+    // lower); ignored (and empty) for `local-exec`/`macho-tlv`, whose
+    // access shapes do not index a module TLS array. The NUMERIC id both
+    // sides agree on is `kTlsIndexReservedSymbolIdValue` above; this string
+    // is the human-readable anchor (diagnostics + the loader's presence
+    // gate) so the config stays self-describing.
+    std::string    tlsIndexSlotName;
 };
 
 // THE single source of truth for the extern-call-site SHAPE selection

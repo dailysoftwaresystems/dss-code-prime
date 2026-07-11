@@ -710,9 +710,14 @@ LinkedImage link(std::span<AssembledModule const> modules,
             //   (c) it names a module-level data item — rodata global,
             //       string literal global, etc. (D-LK4-RODATA-PRODUCER
             //       2026-06-02 — the per-format walker merges these
-            //       into its symbolVa map at section-relative offsets).
+            //       into its symbolVa map at section-relative offsets), OR
+            //   (d) it is a WRITER-RESERVED singleton id (D-CSUBSET-THREAD-
+            //       LOCAL TLS C3 — the PE `_tls_index` slot the format writer
+            //       mints + binds; the writer defines it into symbolVa or
+            //       fails loud, exactly like an extern import in (b)).
             // Anything else is a hard undefined.
-            if (!symbolIndex.contains(LinkedSymbolKey{module.cuId, reloc.target})) {
+            if (!symbolIndex.contains(LinkedSymbolKey{module.cuId, reloc.target})
+                && !isWriterReservedSymbolIdValue(reloc.target.v)) {
                 std::string msg = "relocation in symbol #";
                 msg += std::to_string(fn.symbol.v);
                 msg += " references undefined symbol #";

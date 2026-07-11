@@ -295,6 +295,57 @@ struct ExecDataSectionLayout {
     return true;
 }
 
+// D-CSUBSET-THREAD-LOCAL (TLS C3, mechanism 6): register each NAMED
+// thread-local data item's POSITIVE TEMPLATE OFFSET (the section-relative
+// byte offset within the per-thread block) into `symbolVa`, and its
+// SymbolId into `tlsSymbols`. This is the PE (`pe-indexed`) analog of
+// `addTlsSymbolOffsets` above — but DELIBERATELY DISTINCT: PE's access
+// sequence computes `blockBase + secrel(sym)` where `blockBase` is looked
+// up at RUNTIME from the module's TLS array, so `sym`'s stored value is its
+// FORWARD offset in the template (Start-relative), NOT the ELF NEGATIVE
+// Variant-II tpoff (which is relative to a tp register that points PAST the
+// block). The shared `applyExecRelocations` `Linear` kernel then patches the
+// `lea`'s disp32 = `int64(templateOffset) + addend` — an ASLR-invariant
+// link-time constant (no base relocation: it is a RELATIVE displacement, not
+// an address). `templateOffset = blockBaseOffset + itemOffsets[j]`:
+// `blockBaseOffset` is 0 for the `.tls` (tdata template) call and the tbss
+// block base (`alignUp(tdataSpan, tbssAlign)`) for the tbss call, so both
+// index ONE contiguous per-thread block (a tbss var's offset lands in the
+// SizeOfZeroFill tail). Anonymous `SymbolId{}` items are skipped (M1 mirror);
+// a duplicate NAMED symbol fails loud (`K_DuplicateDataSymbol`). The CRIT-1
+// cross-check the caller runs is IDENTICAL (a tls-flagged reloc must target a
+// `tlsSymbols` member and vice versa) — the value class stored here is a
+// section-relative offset, still not a VA, so a non-tls reloc against a
+// member would embed it as an address.
+[[nodiscard]] inline bool addTlsTemplateOffsets(
+    std::vector<AssembledData> const&            dataItems,
+    ExecDataSectionLayout const&                 layout,
+    std::uint64_t                                blockBaseOffset,
+    std::unordered_map<SymbolId, std::uint64_t>& symbolVa,
+    std::unordered_set<SymbolId>&                tlsSymbols,
+    std::string_view                             writerName,
+    DiagnosticReporter&                          reporter) {
+    using ::dss::link::format::detail::emit;
+    for (std::size_t j = 0; j < layout.itemIndices.size(); ++j) {
+        auto const& di = dataItems[layout.itemIndices[j]];
+        if (di.symbol == SymbolId{}) continue;   // M1 mirror — anonymous
+        std::uint64_t const templateOffset =
+            blockBaseOffset + layout.itemOffsets[j];
+        if (!symbolVa.emplace(di.symbol, templateOffset).second) {
+            emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
+                 std::format("{}: thread-local data SymbolId={{ {} }} "
+                             "collides with another symbol — caller must "
+                             "give each data item a unique SymbolId "
+                             "distinct from function ids "
+                             "(D-CSUBSET-THREAD-LOCAL).",
+                             writerName, di.symbol.v));
+            return false;
+        }
+        tlsSymbols.insert(di.symbol);
+    }
+    return true;
+}
+
 // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): patch each reloc-bearing data item's bytes
 // IN PLACE with its target symbol's absolute VA. Shared by the exec writers
 // (PE/ELF/Mach-O): an exec image has resolved VAs, so an abs64 data fixup is

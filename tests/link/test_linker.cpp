@@ -1086,18 +1086,18 @@ TEST(Linker, SurvivingThreadLocalExternImportRejectsLoud) {
 
 TEST(Linker, TdataItemOnNonOptedInFormatsRejectsAtAcceptsGate) {
     // Layering pin (audit LOW-b): for formats whose JSON does NOT
-    // advertise tdata/tbss (pe64 until TLS C3, Mach-O until C4), the
-    // GENERIC schema-declared acceptsDataSection gate fires FIRST —
-    // K_NoMatchingObjectFormat naming the section — before any walker
-    // runs. The walkers' own K_FormatLacksThreadLocalSupport (0x8015)
-    // belts sit BEHIND this gate and fire only on a direct walker call
-    // or a format JSON opting in prematurely (pinned in the per-walker
-    // test files). Zero format-name branches: the same set-membership
-    // check serves every format.
+    // advertise tdata/tbss (Mach-O until C4 — pe64 opted in at TLS C3,
+    // aarch64-ELF at C2, x86_64-ELF at C1), the GENERIC schema-declared
+    // acceptsDataSection gate fires FIRST — K_NoMatchingObjectFormat
+    // naming the section — before any walker runs. The walkers' own
+    // K_FormatLacksThreadLocalSupport (0x8015) belts sit BEHIND this
+    // gate and fire only on a direct walker call or a format JSON opting
+    // in prematurely (pinned in the per-walker test files). Zero format-
+    // name branches: the same set-membership check serves every format.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     for (char const* fmtName :
-         {"pe64-x86_64-windows-exec", "macho64-x86_64-darwin-exec"}) {
+         {"macho64-x86_64-darwin-exec"}) {
         auto fmt = ObjectFormatSchema::loadShipped(fmtName);
         ASSERT_TRUE(fmt.has_value()) << fmtName;
         ASSERT_FALSE((*fmt)->acceptsDataSection(DataSectionKind::Tdata))

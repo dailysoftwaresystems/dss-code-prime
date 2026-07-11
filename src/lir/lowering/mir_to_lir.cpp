@@ -2941,20 +2941,18 @@ struct Lowerer {
                 "(D-CSUBSET-THREAD-LOCAL)");
             return;  // value left undefined; the pipeline aborts on the error
         }
-        switch (tlsAccess_->model) {
-            case TlsAccessModel::LocalExec:
-                break;
-            case TlsAccessModel::PeIndexed:
-            case TlsAccessModel::MachoTlv:
-                // Declared vocabulary whose LOWERING has not landed —
-                // fail loud, never a silently-wrong local-exec sequence
-                // (the models disagree on every byte after the tp read).
-                reportTlsFormatReject(std::format(
-                    "tlsAccess model '{}' is declared but its lowering "
-                    "lands with the PE/Mach-O TLS cycle "
-                    "(D-CSUBSET-THREAD-LOCAL)",
-                    tlsAccessModelName(tlsAccess_->model)));
-                return;
+        // TLS C3 (D-CSUBSET-THREAD-LOCAL): LocalExec (ELF, C1) and
+        // PeIndexed (PE, this cycle) both proceed; only MachoTlv (C4)
+        // remains declared-but-unlowered → fail loud, never a
+        // silently-wrong sequence (the models disagree on every byte
+        // after the tp read).
+        if (tlsAccess_->model == TlsAccessModel::MachoTlv) {
+            reportTlsFormatReject(std::format(
+                "tlsAccess model '{}' is declared but its lowering "
+                "lands with the Mach-O TLS cycle (C4) "
+                "(D-CSUBSET-THREAD-LOCAL)",
+                tlsAccessModelName(tlsAccess_->model)));
+            return;
         }
         auto const tlsBaseOp = opcode(MnemonicSlot::TlsBase);
         if (!tlsBaseOp.has_value()) {
@@ -3049,17 +3047,113 @@ struct Lowerer {
             // neither).
             emitInst(*tlsBaseOp, tpReg, std::span<LirOperand const>{});
         }
-        // lea %addr, [%tp + tpoff(sym)] — the 2-op [Reg, SymbolRef]
-        // lea variant, SHARED by both tp-read shapes; the target's own
-        // encoding records the tls-flagged relocation(s): x86 ONE
-        // tls-tpoff32 at the memory-displacement position, arm64 the
-        // tls-tprel-hi12/lo12 PAIR at word offsets 0/4 of its ADD/ADD
-        // macro (TLS C2).
+        // ── The tp register is in hand (%tpReg). What follows is
+        // MODEL-specific closed-verb dispatch (never a format/CPU
+        // identity branch — the model came from the format's tlsAccess
+        // block, the instruction SHAPES from the target's opcode rows):
+        std::uint16_t const leaOp = *opcode(MnemonicSlot::Lea);
+        if (tlsAccess_->model == TlsAccessModel::LocalExec) {
+            // local-exec (ELF, C1): the object's address is tp +
+            // tpoff(sym) — the 2-op [Reg, SymbolRef] lea variant, its
+            // target-recorded tls-flagged relocation(s) at the
+            // displacement (x86 ONE tls-tpoff32; arm64 the tls-tprel-
+            // hi12/lo12 PAIR of its ADD/ADD macro, TLS C2).
+            LirReg const addrReg = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 2> leaOps{
+                LirOperand::makeReg(tpReg),
+                LirOperand::makeSymbolRef(sym.v)};
+            emitInst(leaOp, addrReg, leaOps);
+            defineValue(id, addrReg);
+            return;
+        }
+        // ── TLS C3 (D-CSUBSET-THREAD-LOCAL): the pe-indexed access
+        // sequence. The tp read gave the TEB ThreadLocalStoragePointer
+        // ARRAY base (gs:[0x58]); the object lives in THIS module's TLS
+        // block, selected by the module's `_tls_index`, at a POSITIVE
+        // section-relative offset in the `.tls` template:
+        //     mov ecx, [rip + __dss_tls_index] ; 32-bit index read
+        //     mov rax, [tp + rcx*8]            ; this module's block base
+        //     lea rax, [block + secrel32(sym)] ; the object's address
+        // The FIRST two ("read the module index; index the block array")
+        // are the pe-indexed model's essence; the final lea is the SAME
+        // [Reg, SymbolRef] lea local-exec uses, its tls-flagged reloc
+        // (kind 4) now the PE format's IMAGE_REL_AMD64_SECREL (the
+        // walker patches the positive templateOffset in). EVERY value is
+        // config: the index-slot name from tlsAccess.tlsIndexSlotName
+        // (the reserved singleton id both this lowering and the PE
+        // writer agree on), the shapes from the target's opcode rows.
+        //
+        // pe-indexed is inherently the x86 TEB access → it REQUIRES the
+        // memory-slot (gs) tp read shape; a target whose tlsbase is the
+        // self-contained MRS shape cannot serve it (nonsensical config)
+        // — fail loud rather than emit a mis-shaped block read.
+        if (!tpUsesMemOffsetShape) {
+            reportTlsFormatReject(
+                "tlsAccess model 'pe-indexed' requires a memory-slot "
+                "thread-pointer read (mov r64, seg:[disp32]) but the "
+                "target's 'tlsbase' declares the self-contained "
+                "system-register shape — the pe-indexed block-array "
+                "index cannot be built from it (D-CSUBSET-THREAD-LOCAL)");
+            return;
+        }
+        auto const loadOp = opcode(MnemonicSlot::Load);
+        if (!loadOp.has_value()) {
+            reportMissingOpcode(MnemonicSlot::Load,
+                                "MIR GlobalAddr (thread-local, pe-indexed)");
+            return;
+        }
+        // Config sanity (the loader already REQUIRES a non-empty
+        // tlsIndexSlotName for pe-indexed — this is belt): a pe-indexed
+        // block with no named index slot cannot lower the index read.
+        if (tlsAccess_->tlsIndexSlotName.empty()) {
+            reportTlsFormatReject(
+                "tlsAccess model 'pe-indexed' declares no tlsIndexSlotName "
+                "— the module TLS-index read has no target "
+                "(D-CSUBSET-THREAD-LOCAL)");
+            return;
+        }
+        // Step 2 — read the module's `_tls_index` (32-bit). This is the
+        // ORDINARY riprel global read (zero new mechanism): materialize
+        // the slot's address with the 1-op [SymbolRef] lea (a rel32 to
+        // the reserved singleton the PE writer binds to the 4-byte
+        // slot's VA), then a WIDTH-32 load of it. The 32-bit width is
+        // LOAD-BEARING (audit CRIT-3): a 64-bit load would pull 4
+        // adjacent bytes into bits 63:32 → a garbage index → every PE
+        // TLS access would hit the wrong module block. A 32-bit register
+        // write zero-extends bits 63:32 (Intel SDM MOV), so the index
+        // lands clean in the full register for the scaled index below.
+        LirReg const idxAddrReg = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> idxAddrOps{
+            LirOperand::makeSymbolRef(kTlsIndexReservedSymbolIdValue)};
+        emitInst(leaOp, idxAddrReg, idxAddrOps);
+        LirReg const idxReg = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 3> idxLoadOps{
+            LirOperand::makeReg(idxAddrReg),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0)};
+        emitInst(*loadOp, idxReg, idxLoadOps,
+                 /*payload=*/0, /*flags=*/kLirInstFlagWidth32);
+        // Step 3 — load THIS module's TLS block base: [tp + index*8].
+        // The existing scale-8 SIB indexed-load form (D-AS4-5); width 64
+        // (a pointer). tp is the array base, index the module ordinal,
+        // scale 8 = sizeof(void*).
+        LirReg const blockReg = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 4> blockLoadOps{
+            LirOperand::makeReg(tpReg),
+            LirOperand::makeReg(idxReg),
+            LirOperand::makeMemBase(8),
+            LirOperand::makeMemOffset(0)};
+        emitInst(*loadOp, blockReg, blockLoadOps, /*payload=*/0, /*flags=*/0);
+        // Step 4 — the object's per-thread address: block + secrel(sym).
+        // VERBATIM the [Reg, SymbolRef] lea local-exec uses; its
+        // tls-flagged reloc (kind 4) is the PE format's SECREL, and the
+        // walker stores sym's POSITIVE templateOffset into symbolVa, so
+        // the patched disp32 + block base = the per-thread address.
         LirReg const addrReg = lir.newVReg(LirRegClass::GPR);
         std::array<LirOperand, 2> leaOps{
-            LirOperand::makeReg(tpReg),
+            LirOperand::makeReg(blockReg),
             LirOperand::makeSymbolRef(sym.v)};
-        emitInst(*opcode(MnemonicSlot::Lea), addrReg, leaOps);
+        emitInst(leaOp, addrReg, leaOps);
         defineValue(id, addrReg);
     }
 

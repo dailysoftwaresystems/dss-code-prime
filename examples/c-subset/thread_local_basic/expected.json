@@ -1,5 +1,5 @@
 {
-  "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C1 x86_64 + C2 arm64): single-thread thread_local witness — .tdata template copy visible before any write (g==7), mutation sticks, static thread_local (.tbss) accumulates from 0, thread_local const rides the same tp-relative access. The release arm runs the full optimizer over the tlsbase+lea access sequence (the M-5 riprel-fold exclusions must hold under CSE/mem2reg). The arm64 arm (TLS C2) runs the SAME source through the MRS TPIDR_EL0 + ADD/ADD hi12/lo12 Variant-I sequence under qemu-aarch64. pe64/Mach-O reject loud (K_FormatLacksThreadLocalSupport 0x8015) until C3/C4. The per-thread discriminator lives in thread_local_pthread; this example's job is the loader-copies-template + mutation semantics. Exit 42.",
+  "$comment": "D-CSUBSET-THREAD-LOCAL (TLS C1 x86_64 + C2 arm64 + C3 pe64): single-thread thread_local witness — .tdata template copy visible before any write (g==7), mutation sticks, static thread_local (.tbss) accumulates from 0, thread_local const rides the same tp-relative access. The release arm runs the full optimizer over the tlsbase+lea access sequence (the M-5 riprel-fold exclusions must hold under CSE/mem2reg). The arm64 arm (TLS C2) runs the SAME source through the MRS TPIDR_EL0 + ADD/ADD hi12/lo12 Variant-I sequence under qemu-aarch64. The pe64 arm (TLS C3, runOn windows — LOCAL Windows ctest, no emulator) runs the SAME source through the gs:[0x58] TEB TLS-array + _tls_index + secrel sequence (the cross-format witness); pe64 embeds the whole per-thread block (incl. the .tbss zero region) in the .tls template because the Windows loader does not reliably zero SizeOfZeroFill for the main thread's early static TLS. Mach-O rejects loud (K_FormatLacksThreadLocalSupport 0x8015) until C4. The per-thread discriminator lives in thread_local_pthread (elf-only; pthread is POSIX); this example's job is the loader-copies-template + mutation semantics. Exit 42.",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,
@@ -14,6 +14,11 @@
       "artifact": "main",
       "runOn": ["linux"],
       "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
     }
   ],
   "optimizedPipelines": [

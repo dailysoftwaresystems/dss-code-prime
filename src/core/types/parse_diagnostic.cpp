@@ -348,6 +348,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::K_ImageExecBitFailed:           return "K_ImageExecBitFailed";
         case DiagnosticCode::K_FormatLacksThreadLocalSupport:
             return "K_FormatLacksThreadLocalSupport";
+        case DiagnosticCode::K_ThreadLocalOveralignedForFormat:
+            return "K_ThreadLocalOveralignedForFormat";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";
