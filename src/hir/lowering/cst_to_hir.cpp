@@ -93,13 +93,20 @@ namespace {
 // early-outed there before this is consulted). A SHAPE predicate over
 // TypeKind — never language identity.
 [[nodiscard]] bool isArithmeticCore(TypeKind k) noexcept {
+    // C23 6.2.5 (D-CSUBSET-BITINT): a `_BitInt(N)` is an arithmetic (integer) type,
+    // so `coerce` materializes a Cast on a `_BitInt`↔int / `_BitInt`↔`_BitInt`
+    // mismatch (which `hir_to_mir` masks to N — CRIT-1). Ungated shape admission:
+    // BitInt only ever appears in the `_BitInt`-declaring schema, so this is inert
+    // elsewhere (no BitInt TypeKind flows through a non-C lowering). A missed
+    // admission would leave the conversion UN-cast → a spurious loud reject (M-8).
     return k == TypeKind::Bool || k == TypeKind::Char || k == TypeKind::Byte
         || k == TypeKind::I8   || k == TypeKind::I16  || k == TypeKind::I32
         || k == TypeKind::I64  || k == TypeKind::I128
         || k == TypeKind::U8   || k == TypeKind::U16  || k == TypeKind::U32
         || k == TypeKind::U64  || k == TypeKind::U128
         || k == TypeKind::F16  || k == TypeKind::F32
-        || k == TypeKind::F64  || k == TypeKind::F128;
+        || k == TypeKind::F64  || k == TypeKind::F128
+        || k == TypeKind::BitInt;
 }
 
 // Full-width-integer return predicate for D-LK10-ENTRY-MAIN-IMPLICIT-
@@ -831,6 +838,10 @@ struct Lowerer {
         dataModel_ = m.dataModel();
         if (sem.arithmeticConversions.has_value()) {
             arith_ = resolveArithmeticRules(*sem.arithmeticConversions, dataModel_);
+            // D-CSUBSET-BITINT: `_BitInt` participation in the usual arithmetic
+            // conversions is a SEPARATE top-level flag (keeps ArithmeticConversions'
+            // JSON unchanged) — inject it into the resolved rules here.
+            arith_->bitIntConversions = sem.bitIntConversions;
         }
         for (RuleId r : cfg.deferredRules) deferred_.emplace(r.v, true);
         // HR10: register every declared extension kind up front, so a rule mapped

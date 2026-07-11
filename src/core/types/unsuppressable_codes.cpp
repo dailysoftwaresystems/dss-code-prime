@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 105> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 110> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -452,6 +452,15 @@ constexpr std::array<DiagnosticCode, 105> kUnsuppressableCodes{{
     DiagnosticCode::S_ThreadLocalRedeclarationMismatch,
     DiagnosticCode::S_ThreadLocalAddressNotConstant,
     DiagnosticCode::S_ThreadLocalInvalidCombination,
+    // S_BitInt* (D-CSUBSET-BITINT, C23 6.2.5/6.7.2): the `_BitInt(N)` width gates.
+    // UNSUPPRESSABLE — a suppressed width violation would leave the type with no
+    // computable / representable width and the masking + layout would silently pick
+    // a garbage N (or reach codegen with no multi-limb lowering for the N>64 gate).
+    DiagnosticCode::S_BitIntWidthNotConstant,
+    DiagnosticCode::S_BitIntWidthNotPositive,
+    DiagnosticCode::S_BitIntSignedWidthTooSmall,
+    DiagnosticCode::S_BitIntWidthExceedsMax,
+    DiagnosticCode::S_BitIntWidthAboveC1Limit,
     // S_UnknownAttribute / S_DeprecatedSymbolUsed / S_NodiscardResultDiscarded
     // (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13) are deliberately NOT
     // members — the same suppressible posture as S_UnknownTypeAttribute above.

@@ -533,6 +533,152 @@ struct Lowerer {
         return MirOpcode::Invalid;
     }
 
+    // ── C23 _BitInt(N) codegen — the mod-2^N wrap (D-CSUBSET-BITINT) ──────────
+    //
+    // A `_BitInt(N≤64)` value lives in its native CONTAINER (I8/I16/I32/I64 by
+    // size + signedness — `reprKind` at the LIR tier); its arithmetic COMPUTES at a
+    // native ALU width B (32 for N≤32, 64 for N≤64) and MASKS the result back to
+    // exactly N bits, reusing the bit-field extract/insert shift+mask primitive
+    // (signed: Shl(B-N)+AShr(B-N); unsigned: And((1<<N)-1)). A SUB-32 container
+    // (N≤16) computes PROMOTED to I32 then Truncs back — the `emitBitfieldExtract`
+    // `promote = B0 < 32` precedent — so a `_BitInt(4)` never trips the sub-native
+    // ALU gate. N≥17's container IS the compute width, so it computes at the BitInt
+    // type directly (reprKind → I32/I64 passes the gate). Comparisons promote their
+    // operands and emit an ICmp at the compute width.
+
+    // The plain compute integer kind for a `_BitInt(N)`: I32/U32 (N≤32) or I64/U64
+    // (N≤64), by signedness. Where the ALU op + mask are computed for a sub-32
+    // container (N≤16); IS the container kind for N≥17.
+    [[nodiscard]] TypeKind bitIntComputeKind(TypeId bitIntTy) const {
+        std::int64_t const n = interner.bitIntWidth(bitIntTy);
+        bool const s = interner.bitIntIsSigned(bitIntTy);
+        if (n <= 32) return s ? TypeKind::I32 : TypeKind::U32;
+        return s ? TypeKind::I64 : TypeKind::U64;
+    }
+
+    // Materialize a `_BitInt(N)` operand at its compute width: a no-op for N≥17
+    // (the container IS the compute kind), else SExt/ZExt the sub-32 container up
+    // to I32/U32 (`mapCast(container, compute)`).
+    [[nodiscard]] MirInstId bitIntToCompute(MirInstId v, TypeId bitIntTy) {
+        TypeKind const container = interner.bitIntContainerKind(bitIntTy);
+        TypeKind const compute   = bitIntComputeKind(bitIntTy);
+        if (container == compute) return v;
+        std::array<MirInstId, 1> a{v};
+        return mir.addInst(mapCast(container, compute), a,
+                           interner.primitive(compute));
+    }
+
+    // Mask `raw` (typed `ty`, whose compute width is B bits) to the low N bits: the
+    // signed sign-extend (Shl(B-N) then arithmetic AShr(B-N)) or the unsigned
+    // zero-extend (And with (1<<N)-1). A no-op when N==B (a _BitInt(32)/_BitInt(64)
+    // whose native op already wraps at the full width). Reuses the bit-field
+    // primitive's exact shift+mask sequence.
+    [[nodiscard]] MirInstId
+    bitIntMask(MirInstId raw, std::int64_t n, bool signd, int B, TypeId ty) {
+        if (n >= B) return raw;
+        if (signd) {
+            MirInstId const s1 = constIntOfType(B - n, ty);
+            std::array<MirInstId, 2> a1{raw, s1};
+            MirInstId const shl = mir.addInst(MirOpcode::Shl, a1, ty);
+            MirInstId const s2 = constIntOfType(B - n, ty);
+            std::array<MirInstId, 2> a2{shl, s2};
+            return mir.addInst(MirOpcode::AShr, a2, ty);
+        }
+        std::uint64_t const mask = (n >= 64) ? ~0ull : ((1ull << n) - 1);
+        MirInstId const m = constIntOfType(static_cast<std::int64_t>(mask), ty);
+        std::array<MirInstId, 2> a{raw, m};
+        return mir.addInst(MirOpcode::And, a, ty);
+    }
+
+    // ★ CRIT-2 — the ONE by-construction WRAP CHOKEPOINT. Emit `op` over `operands`
+    // producing a `_BitInt(N)`-typed value, masked to N iff `needsMask`. Every
+    // producer of a BitInt value (Add/Sub/Mul/Neg/Shl + the compound-assign/++/--
+    // that desugar to them; the no-mask Div/Mod/And/Or/Xor/right-shift pass
+    // `needsMask=false`) routes through here. N≥17 computes at the BitInt type
+    // directly; N≤16 promotes to I32, computes, masks, and Truncs to the container.
+    [[nodiscard]] MirInstId
+    emitBitIntOp(MirOpcode op, std::span<MirInstId const> operands, TypeId bitIntTy,
+                 bool needsMask) {
+        std::int64_t const n = interner.bitIntWidth(bitIntTy);
+        bool const signd     = interner.bitIntIsSigned(bitIntTy);
+        bool const sub32     = n <= 16;   // container < 32 bits → promote to I32
+        int const B          = (n <= 32) ? 32 : 64;
+        if (!sub32) {
+            // Compute at the BitInt type (reprKind → I32/I64 → passes the ALU gate).
+            MirInstId const raw = mir.addInst(op, operands, bitIntTy);
+            if (!raw.valid()) return InvalidMirInst;
+            return needsMask ? bitIntMask(raw, n, signd, B, bitIntTy) : raw;
+        }
+        // Sub-32 container: promote operands to I32/U32, compute, mask, Trunc back.
+        TypeKind const compute   = bitIntComputeKind(bitIntTy);
+        TypeId   const computeTy = interner.primitive(compute);
+        TypeKind const container = interner.bitIntContainerKind(bitIntTy);
+        // A SHIFT's count (operand[1]) is NOT a `_BitInt` — it keeps its own integer
+        // type (C 6.5.7: a shift's operands are NOT converted to a common type). Only
+        // the shifted VALUE (operand[0]) promotes; the count passes through so a
+        // sub-32 `_BitInt(4) << n` never mis-widens `n` through the container decode.
+        bool const isShift = op == MirOpcode::Shl || op == MirOpcode::LShr
+                          || op == MirOpcode::AShr;
+        std::array<MirInstId, 2> promoted{};
+        for (std::size_t i = 0; i < operands.size() && i < 2; ++i)
+            promoted[i] = (isShift && i == 1)
+                              ? operands[i]
+                              : bitIntToCompute(operands[i], bitIntTy);
+        MirInstId raw = mir.addInst(
+            op, std::span<MirInstId const>{promoted.data(), operands.size()},
+            computeTy);
+        if (!raw.valid()) return InvalidMirInst;
+        if (needsMask) raw = bitIntMask(raw, n, signd, B, computeTy);
+        std::array<MirInstId, 1> ta{raw};
+        return mir.addInst(mapCast(compute, container), ta, bitIntTy);   // Trunc → N
+    }
+
+    // ★ CRIT-1 — a conversion TO `_BitInt(N)` masks UNCONDITIONALLY (incl. the
+    // same-container case: `int→_BitInt(17)` shares the i32 container, so a plain
+    // Bitcast would leave bits 17-31 DIRTY). `srcK` is the source's already-resolved
+    // plain integer kind (enum→underlying / BitInt→container / else its kind). Emits
+    // the container conversion (Trunc/SExt/ZExt/Bitcast) THEN the mask-to-N, then
+    // (sub-32) the Trunc to the container.
+    [[nodiscard]] MirInstId
+    emitCastToBitInt(MirInstId src, TypeKind srcK, TypeId bitIntTy) {
+        std::int64_t const n = interner.bitIntWidth(bitIntTy);
+        bool const signd     = interner.bitIntIsSigned(bitIntTy);
+        bool const sub32     = n <= 16;
+        int const B          = (n <= 32) ? 32 : 64;
+        TypeKind const compute   = bitIntComputeKind(bitIntTy);
+        TypeId   const computeTy = interner.primitive(compute);
+        TypeKind const container = interner.bitIntContainerKind(bitIntTy);
+        // 1. Convert the source to the compute kind (no-op when it already IS it).
+        MirInstId inCompute = src;
+        if (srcK != compute) {
+            MirOpcode const conv = mapCast(srcK, compute);
+            if (conv == MirOpcode::Invalid) return InvalidMirInst;
+            std::array<MirInstId, 1> ca{src};
+            inCompute = mir.addInst(conv, ca, computeTy);
+            if (!inCompute.valid()) return InvalidMirInst;
+        }
+        // 2. Mask to N (UNCONDITIONAL — the CRIT-1 dirty-bits fix), at compute width.
+        MirInstId const masked = bitIntMask(inCompute, n, signd, B, computeTy);
+        // 3. Re-type to the BitInt container: Trunc (sub-32) or a same-width Bitcast.
+        std::array<MirInstId, 1> ta{masked};
+        return mir.addInst(sub32 ? mapCast(compute, container) : MirOpcode::Bitcast,
+                           ta, bitIntTy);
+    }
+
+    // A `_BitInt` opcode is an integer comparison (result Bool, operands promoted).
+    [[nodiscard]] static bool isIntCompareOpcode(MirOpcode op) noexcept {
+        switch (op) {
+            case MirOpcode::ICmpEq:  case MirOpcode::ICmpNe:
+            case MirOpcode::ICmpSlt: case MirOpcode::ICmpSle:
+            case MirOpcode::ICmpSgt: case MirOpcode::ICmpSge:
+            case MirOpcode::ICmpUlt: case MirOpcode::ICmpUle:
+            case MirOpcode::ICmpUgt: case MirOpcode::ICmpUge:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     // Lower ONE HIR expression node in the currently-open MIR block, given
     // that its child sub-expressions are lowered by RE-ENTERING `lowerExpr`
     // (the driver below). Returns the MirInstId that produces the value
@@ -1329,6 +1475,41 @@ struct Lowerer {
         TypeId const operandType = hir.typeId(kids[0]);
         TypeKind const tk = operandType.valid()
             ? interner.kind(operandType) : TypeKind::Void;
+        // C23 _BitInt(N) (D-CSUBSET-BITINT, CRIT-2): a unary op on a `_BitInt`.
+        if (tk == TypeKind::BitInt) {
+            switch (op) {
+                case HirOpKind::Neg: {
+                    std::array<MirInstId, 1> a{operand};
+                    return emitBitIntOp(MirOpcode::Neg, a, operandType,
+                                        /*needsMask=*/true);
+                }
+                case HirOpKind::BitNot: {
+                    // ~ flips the high (zero/sign) bits → unsigned needs re-masking;
+                    // the mask is a no-op-safe belt for signed (sign-ext preserved).
+                    std::array<MirInstId, 1> a{operand};
+                    return emitBitIntOp(MirOpcode::Not, a, operandType,
+                                        /*needsMask=*/true);
+                }
+                case HirOpKind::Not: {
+                    // logical `!bitInt` ≡ `bitInt == 0`: promote to the compute width,
+                    // compare against a compute-width zero (result Bool).
+                    MirInstId const v = bitIntToCompute(operand, operandType);
+                    if (!v.valid()) return InvalidMirInst;
+                    TypeId const computeTy =
+                        interner.primitive(bitIntComputeKind(operandType));
+                    MirLiteralValue zero;
+                    zero.value = std::int64_t{0};
+                    zero.core  = interner.kind(computeTy);
+                    MirInstId const z = mir.addConst(std::move(zero), computeTy);
+                    std::array<MirInstId, 2> ops{v, z};
+                    return mir.addInst(MirOpcode::ICmpEq, ops, t);   // t is Bool
+                }
+                default:
+                    unsupported(node, std::format(
+                        "UnaryOp '{}' on _BitInt not yet supported", opName(op)));
+                    return InvalidMirInst;
+            }
+        }
         bool const isFloat = (tk == TypeKind::F16 || tk == TypeKind::F32
                            || tk == TypeKind::F64 || tk == TypeKind::F128);
         MirOpcode mop = MirOpcode::Invalid;
@@ -1467,6 +1648,34 @@ struct Lowerer {
             std::array<MirInstId, 2> gepOps{lhs, byteOff};
             return mir.addInst(MirOpcode::Gep, gepOps, t);
         }
+        // C23 _BitInt(N) (D-CSUBSET-BITINT, CRIT-2): both operands are `_BitInt(N)`
+        // (a `_BitInt op int` was coerced to a standard int by the UAC, so it never
+        // reaches here with a BitInt operand). Route through the wrap chokepoint: the
+        // container kind picks the signed/unsigned opcode (SDiv/UDiv/AShr/LShr), a
+        // comparison promotes its operands + emits the ICmp typed Bool, and an
+        // arithmetic op masks its result to N (Add/Sub/Mul/Shl) or not (Div/Mod/And/
+        // Or/Xor/right-shift — clean-N-extension-preserving).
+        if (tk == TypeKind::BitInt) {
+            TypeKind const container = interner.bitIntContainerKind(operandType);
+            MirOpcode const bop = mapBinaryOp(op, container);
+            if (bop == MirOpcode::Invalid) {
+                unsupported(node, std::format(
+                    "BinaryOp '{}' on _BitInt not yet supported", opName(op)));
+                return InvalidMirInst;
+            }
+            if (isIntCompareOpcode(bop)) {
+                MirInstId const l = bitIntToCompute(lhs, operandType);
+                MirInstId const r = bitIntToCompute(rhs, operandType);
+                if (!l.valid() || !r.valid()) return InvalidMirInst;
+                std::array<MirInstId, 2> cops{l, r};
+                return mir.addInst(bop, cops, t);   // t is Bool
+            }
+            bool const needsMask =
+                bop == MirOpcode::Add || bop == MirOpcode::Sub
+                || bop == MirOpcode::Mul || bop == MirOpcode::Shl;
+            std::array<MirInstId, 2> bops{lhs, rhs};
+            return emitBitIntOp(bop, bops, t, needsMask);
+        }
         MirOpcode const mop = mapBinaryOp(op, tk);
         if (mop == MirOpcode::Invalid) {
             unsupported(node,
@@ -1541,7 +1750,30 @@ struct Lowerer {
                 auto const sc = interner.scalars(ty);
                 return sc.empty() ? kk : static_cast<TypeKind>(sc[0]);
             };
-        TypeKind const fromResolved = enumUnderlying(fromTy, fromK);
+        // C23 _BitInt(N) (D-CSUBSET-BITINT): a BitInt SOURCE casts AS its native
+        // container (I8/I16/I32/I64 — the enum→underlying twin), so a `_BitInt→int`
+        // is the ordinary container→target `mapCast`.
+        auto const resolveScalarKind =
+            [&](TypeId ty, TypeKind kk) -> TypeKind {
+                if (kk == TypeKind::BitInt && ty.valid())
+                    return interner.bitIntContainerKind(ty);
+                return enumUnderlying(ty, kk);
+            };
+        TypeKind const fromResolved = resolveScalarKind(fromTy, fromK);
+        // ★ CRIT-1: a cast TO `_BitInt(N)` masks UNCONDITIONALLY (even the same-
+        // container `int→_BitInt(17)` case — a plain Bitcast would leave bits 17-31
+        // dirty). Route through the dedicated masking path; `mapCast` stays
+        // BYTE-IDENTICAL for its non-BitInt callers (M-7).
+        if (toK == TypeKind::BitInt) {
+            MirInstId const r = emitCastToBitInt(operand, fromResolved, t);
+            if (!r.valid()) {
+                unsupported(node, std::format(
+                    "Cast from TypeKind {} to _BitInt has no MIR opcode",
+                    static_cast<unsigned>(fromK)));
+                return InvalidMirInst;
+            }
+            return r;
+        }
         TypeKind const toResolved    = enumUnderlying(t, toK);
         MirOpcode const mop = mapCast(fromResolved, toResolved);
         if (mop == MirOpcode::Invalid) {
@@ -3094,6 +3326,12 @@ struct Lowerer {
         // This is the single chokepoint that also widths the enum-bit-field
         // init zero-store (D-CSUBSET-ENUM-BITFIELD).
         ty = enumReprType(ty);
+        // D-CSUBSET-BITINT: a `_BitInt(N)`-typed constant IS its container integer
+        // value — `interner.primitive(BitInt)` has no width scalar (the enum twin),
+        // so resolve BitInt → its native container kind (I8/I16/I32/I64) before
+        // materializing. Reached by the mask/shift-amount consts of an N≥17 wrap.
+        if (ty.valid() && interner.kind(ty) == TypeKind::BitInt)
+            ty = interner.primitive(interner.bitIntContainerKind(ty));
         TypeKind const k = ty.valid() ? interner.kind(ty) : TypeKind::I32;
         MirLiteralValue lit;
         lit.value = v;

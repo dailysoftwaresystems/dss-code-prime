@@ -72,6 +72,17 @@ using TypeLayoutTable = substrate::ArenaAttribute<TypeInterner, StructLayout>;
 [[nodiscard]] DSS_EXPORT std::optional<std::uint64_t>
 scalarByteSize(TypeKind kind, DataModel dm) noexcept;
 
+// C23 _BitInt(N) (D-CSUBSET-BITINT): the TypeId-aware companion to
+// `scalarByteSize`. A `_BitInt(N)`'s size cannot be derived from its KIND alone
+// (the width N lives in the interned record's scalars), so a caller that has a
+// TypeId — a data-global leaf, an aggregate-ABI leaf — routes through here: it
+// returns the `_BitInt(N)` CONTAINER byte size (N≤64 → {1,2,4,8}; N>64 →
+// ceil(N/64) eightbytes, the C2 multi-limb layout) and, for every OTHER kind,
+// exactly `scalarByteSize(kind, dm)`. nullopt for a non-sized kind (aggregate /
+// Void / FnSig / …) — the caller's fail-loud signal, same as `scalarByteSize`.
+[[nodiscard]] DSS_EXPORT std::optional<std::uint64_t>
+sizeOfScalarOrBitInt(TypeInterner const& interner, TypeId id, DataModel dm) noexcept;
+
 // Compute the full layout of a COMPLETE type. Recursive (nested aggregates) and
 // PURE (no caching — the caller memoizes via `TypeLayoutTable`). Returns nullopt
 // — the fail-loud signal, never a guessed size — when the type is INCOMPLETE

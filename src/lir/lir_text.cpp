@@ -71,6 +71,7 @@ typeKindFromName(std::string_view s) noexcept;
         case TypeKind::Param:     return "Param";
         case TypeKind::Bind:      return "Bind";
         case TypeKind::Extension: return "Extension";
+        case TypeKind::BitInt:    return "BitInt";
         case TypeKind::Count_:    break;
     }
     return "?";

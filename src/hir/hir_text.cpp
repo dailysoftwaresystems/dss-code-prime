@@ -477,6 +477,13 @@ private:
                 }
                 return;
             }
+            case TypeKind::BitInt: {  // C23 _BitInt(N) (D-CSUBSET-BITINT) — debug dump
+                if (!in.bitIntIsSigned(t)) out_ += "unsigned ";
+                out_ += "_BitInt(";
+                out_ += std::to_string(in.bitIntWidth(t));
+                out_ += ')';
+                return;
+            }
             default: { // primitives (and any unexpected kind)
                 std::string_view const p = primName(in.kind(t));
                 if (!p.empty()) out_ += p; else { report("unprintable type kind"); out_ += '?'; }

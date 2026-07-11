@@ -1294,6 +1294,16 @@ struct Lowerer {
             auto const sc = interner.scalars(ty);
             if (!sc.empty()) return static_cast<TypeKind>(sc[0]);
         }
+        // C23 _BitInt(N) (D-CSUBSET-BITINT, M-4): project to the signed/unsigned
+        // native CONTAINER kind (N≤8→I8/U8, ≤16→I16/U16, ≤32→I32/U32, ≤64→I64/U64)
+        // — the enum→underlying precedent above. This is what makes every width-tier
+        // consumer (`widthFlagsForType`, `memAccessWidthFlags`, and via them
+        // `registerOpWidthFlags`) see a NATIVE kind for a `_BitInt` value, so a
+        // `_BitInt(4)` stores/loads byte-exact and register-plumbs promoted-to-32
+        // (the char/short story). N>64 cannot reach here — the C1 semantic gate
+        // rejects it before MIR — so `bitIntContainerKind`'s Void sentinel never
+        // surfaces. `reprKind` is identity for every non-enum/non-BitInt kind.
+        if (k == TypeKind::BitInt) return interner.bitIntContainerKind(ty);
         return k;
     }
 

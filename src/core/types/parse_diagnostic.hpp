@@ -778,6 +778,32 @@ enum class DiagnosticCode : std::uint16_t {
     // UNSUPPRESSABLE — suppressed, the declaration would silently drop
     // whichever specifier the downstream tiers don't model.
     S_ThreadLocalInvalidCombination = 0xE049,
+    // C23 §6.2.5/§6.7.2 (D-CSUBSET-BITINT): the `_BitInt(N)` width constant-
+    // expression is NOT an integer constant expression (`_BitInt(n)` with a runtime
+    // `n`, `_BitInt(x+y)` over non-constants). C23 requires N to be an ICE.
+    // UNSUPPRESSABLE — suppressed, the type would have no computable width and the
+    // masking/layout would silently pick a garbage N.
+    S_BitIntWidthNotConstant = 0xE04A,
+    // C23 §6.2.5 (D-CSUBSET-BITINT): `_BitInt(N)` with N ≤ 0 (`_BitInt(0)`,
+    // `_BitInt(-3)`). A bit-precise integer must have a positive width.
+    // UNSUPPRESSABLE — a non-positive width has no representation.
+    S_BitIntWidthNotPositive = 0xE04B,
+    // C23 §6.2.5 (D-CSUBSET-BITINT): a SIGNED `_BitInt(1)` — a signed bit-precise
+    // integer needs at least 1 sign bit + 1 value bit, so the minimum signed width
+    // is 2 (`unsigned _BitInt(1)` IS legal — one value bit). UNSUPPRESSABLE — a
+    // 1-bit signed integer has no value range.
+    S_BitIntSignedWidthTooSmall = 0xE04C,
+    // C23 §6.2.5 (D-CSUBSET-BITINT): `_BitInt(N)` with N > __BITINT_MAXWIDTH__
+    // (8388608). The width exceeds the implementation's maximum bit-precise width.
+    // UNSUPPRESSABLE — an over-max width is a hard constraint violation.
+    S_BitIntWidthExceedsMax = 0xE04D,
+    // D-CSUBSET-BITINT — the C1 cycle boundary: `_BitInt(N)` with N > 64. C1 ships
+    // the single-native-container implementation (N≤64, masked); N>64 is multi-limb
+    // storage/arithmetic, landed in C2/C3. A dedicated diagnostic (NOT the incidental
+    // i128 ALU wall — N>64 is multi-limb MEMORY in C2, never an i128 scalar) so the
+    // boundary is explicit and RELAXES cleanly in C2. UNSUPPRESSABLE — suppressed,
+    // the type would reach codegen with no multi-limb lowering and silently miscompile.
+    S_BitIntWidthAboveC1Limit = 0xE04E,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -1216,6 +1242,13 @@ enum class DiagnosticCode : std::uint16_t {
     // would catch a regression of that keystone invariant (e.g. a future change that
     // lets a NullptrT-typed Const materialize). Caught at every verify point.
     I_NullptrTypeInMir             = 0xA014,
+    // C23 _BitInt(N) (D-CSUBSET-BITINT): a MIR value typed `_BitInt(N)` whose
+    // producers disagree on the width — a tripwire for the by-construction wrap
+    // chokepoint (CRIT-2). A `_BitInt(N)` value must always be N-significant-bits
+    // (masked/sign-extended at materialization); a producer emitting a differently-
+    // masked value would silently miscompile the wrap. Never fires under the
+    // chokepoint discipline; the backstop that catches a regression of it.
+    I_BitIntWidthInconsistent      = 0xA015,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //

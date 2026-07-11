@@ -115,6 +115,16 @@ combineBinary(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     if (!b.value.has_value()) return b;
     HirOpKind const op = decodeCoreOp(hir.payload(expr));
     auto kids = hir.children(expr);
+    // D-CSUBSET-BITINT (CRIT-3): a bit-precise operand or result — const-eval has no
+    // mod-2^N wrap (`interner.commonType` returns InvalidType for a BitInt, so the
+    // fold would keep an UN-wrapped int64 value). FAIL LOUD rather than silently
+    // mis-fold (the combineCast twin). Wrap-aware bignum const-fold is C4.
+    if (interner.kind(hir.typeId(expr)) == TypeKind::BitInt
+        || (kids.size() == 2
+            && (interner.kind(hir.typeId(kids[0])) == TypeKind::BitInt
+                || interner.kind(hir.typeId(kids[1])) == TypeKind::BitInt))) {
+        return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+    }
     // CE5: float promotion. Per C99 UAC, if either operand is float
     // the other promotes to float and the op runs in IEEE 754. Without
     // the `allowFloat` knob, refuse with `UnsupportedTypeKind` — the
@@ -213,6 +223,22 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     TypeId const targetTy = hir.typeId(expr);
     if (!targetTy.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
     TypeKind const toK = interner.kind(targetTy);
+    // D-CSUBSET-BITINT (CRIT-3): const-eval does NOT model the mod-2^N wrap of a
+    // bit-precise integer. Folding a cast TO `_BitInt(N)` via int64 would leave the
+    // value UN-wrapped — `_Static_assert((_BitInt(4))15+1==0)` would spuriously FAIL
+    // (16 != 0) and `!=0` would silently accept an invalid program. FAIL LOUD on any
+    // BitInt-typed cast (target OR a BitInt source) for C1–C3; wrap-aware bignum
+    // const-fold is C4. A real diagnostic (UnsupportedTypeKind) in ICE contexts.
+    if (toK == TypeKind::BitInt) {
+        return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+    }
+    {
+        auto const castKids = hir.children(expr);
+        if (castKids.size() == 1
+            && interner.kind(hir.typeId(castKids[0])) == TypeKind::BitInt) {
+            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        }
+    }
     bool const targetFloat = isFloatKind(toK);
     bool const sourceFloat = isFloatValue(*inner.value);
 

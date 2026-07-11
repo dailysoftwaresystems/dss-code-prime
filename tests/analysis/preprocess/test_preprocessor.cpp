@@ -2228,14 +2228,15 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     auto c = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(c.has_value());
     auto const& pms = (*c)->preprocess().predefinedMacros;
-    // 9 ungated (the 7 C 6.10.8 core + the FC17.5 `__STDC_NO_VLA__`
+    // 10 ungated (the 7 C 6.10.8 core + the FC17.5 `__STDC_NO_VLA__`
     // conformance line, D-CSUBSET-VLA, + the TLS C1 `__STDC_NO_THREADS__`
-    // line, D-CSUBSET-THREAD-LOCAL — <threads.h> is never shipped) + 10
-    // pe-gated = 19: the c95 Windows selection
-    // (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the c105
-    // MSVC-profile flip (_MSC_VER/__int64/__forceinline/__declspec).
-    EXPECT_EQ(pms.size(), 19u)
-        << "c-subset declares 9 un-gated + 10 pe-gated Windows predefined macros";
+    // line, D-CSUBSET-THREAD-LOCAL — <threads.h> is never shipped, + the
+    // `_BitInt` C1 `__BITINT_MAXWIDTH__` line, D-CSUBSET-BITINT — C23 6.2.5,
+    // the mandatory bit-precise max width 8388608) + 10 pe-gated = 20: the
+    // c95 Windows selection (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI)
+    // + the c105 MSVC-profile flip (_MSC_VER/__int64/__forceinline/__declspec).
+    EXPECT_EQ(pms.size(), 20u)
+        << "c-subset declares 10 un-gated + 10 pe-gated Windows predefined macros";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     for (auto const& pm : pms) {
@@ -2249,10 +2250,10 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
                 << pm.name << " should be pe-gated (Windows selection)";
         }
     }
-    EXPECT_EQ(ungated, 9u)
+    EXPECT_EQ(ungated, 10u)
         << "the 7 C 6.10.8 macros + __STDC_NO_VLA__ (FC17.5) + "
-           "__STDC_NO_THREADS__ (TLS C1) are un-gated "
-           "(available on every format)";
+           "__STDC_NO_THREADS__ (TLS C1) + __BITINT_MAXWIDTH__ (_BitInt C1) "
+           "are un-gated (available on every format)";
     EXPECT_EQ(peGated, 10u)
         << "_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI (c95) + "
            "_MSC_VER/__int64/__forceinline/__declspec (c105) are pe-gated";

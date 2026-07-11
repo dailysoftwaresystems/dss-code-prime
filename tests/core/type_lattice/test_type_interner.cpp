@@ -542,3 +542,27 @@ TEST(TypeInternerVolatile, OperandsAndScalarsSeeThroughToComposite) {
     EXPECT_EQ(ops[0].v, i32.v);
     EXPECT_EQ(ops[1].v, f32.v);
 }
+
+// ── C23 _BitInt(N) (D-CSUBSET-BITINT) ─────────────────────────────────────────
+
+// bitInt(N, signed) interns on the {N, signed} scalar pair; accessors decode it,
+// and reprKind's `bitIntContainerKind` projects N<=64 to a native container.
+TEST(TypeInterner, BitIntBuilderAccessorsAndDedup) {
+    TypeInterner ti{CompilationUnitId{80}};
+    auto b17s = ti.bitInt(17, /*signed=*/true);
+    EXPECT_EQ(ti.kind(b17s), TypeKind::BitInt);
+    EXPECT_EQ(ti.bitIntWidth(b17s), 17);
+    EXPECT_TRUE(ti.bitIntIsSigned(b17s));
+    // dedup: same (N, signed) → one TypeId; a different N or sign → distinct.
+    EXPECT_EQ(ti.bitInt(17, true).v, b17s.v);
+    EXPECT_NE(ti.bitInt(17, false).v, b17s.v);
+    EXPECT_NE(ti.bitInt(18, true).v,  b17s.v);
+    // container projection (M-4): smallest signed/unsigned native holding N bits.
+    EXPECT_EQ(ti.bitIntContainerKind(ti.bitInt(4,  true)),  TypeKind::I8);
+    EXPECT_EQ(ti.bitIntContainerKind(ti.bitInt(8,  false)), TypeKind::U8);
+    EXPECT_EQ(ti.bitIntContainerKind(ti.bitInt(16, true)),  TypeKind::I16);
+    EXPECT_EQ(ti.bitIntContainerKind(ti.bitInt(17, true)),  TypeKind::I32);
+    EXPECT_EQ(ti.bitIntContainerKind(ti.bitInt(32, false)), TypeKind::U32);
+    EXPECT_EQ(ti.bitIntContainerKind(ti.bitInt(40, false)), TypeKind::U64);
+    EXPECT_EQ(ti.bitIntContainerKind(ti.bitInt(64, true)),  TypeKind::I64);
+}

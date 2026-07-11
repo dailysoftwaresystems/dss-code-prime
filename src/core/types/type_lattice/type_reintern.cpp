@@ -53,6 +53,7 @@ namespace {
         case TypeKind::Extension: return "Extension";
         case TypeKind::VolatileQual: return "VolatileQual";
         case TypeKind::NullptrT:  return "NullptrT";
+        case TypeKind::BitInt:    return "BitInt";
         case TypeKind::Count_:    return "Count_";
     }
     return "<unknown>";
@@ -237,6 +238,14 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
         // ── array: operands=[element], scalars=[length] ──
         case TypeKind::Array:
             result = dst.array(ops[0], srcScalar[0]);
+            break;
+
+        // ── C23 _BitInt(N): NO operands; scalars=[N, signed] (D-CSUBSET-BITINT).
+        //    Rebuild via the width+signedness builder so a `_BitInt(N)` crossing a
+        //    CU / text round-trip keeps its EXACT width and signedness (a dropped
+        //    signedness would silently flip the wrap/compare semantics). ──
+        case TypeKind::BitInt:
+            result = dst.bitInt(srcScalar[0], srcScalar.size() > 1 && srcScalar[1] != 0);
             break;
 
         // ── tuple: operands=[elements...] ──

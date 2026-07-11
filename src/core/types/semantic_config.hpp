@@ -1312,6 +1312,21 @@ struct DSS_EXPORT SemanticConfig {
     RuleId        typeofValueRule{};  std::string typeofValueRuleName;
     std::uint32_t typeofOperandChild = 0;
     std::optional<SchemaTokenId> typeofStripQualifiersToken;
+    // C23 6.2.5/6.7.2 (D-CSUBSET-BITINT): the `_BitInt(N)` bit-precise integer
+    // type-specifier. `bitIntSpecRule` = the `bitIntSpecifier` shape = [ keyword,
+    // '(', const-expr, ')' ]; `bitIntWidthChild` = the visible-child index of the
+    // width constant-expression (2). `bitIntUnsignedToken`/`bitIntSignedToken` name
+    // the C 6.7.2 signedness keywords the resolveTypeNodeImpl bitInt arm scans for
+    // among a specifier RUN's sibling tokens (a `_BitInt` inside a `typeSpecifierSeq`
+    // composes with `unsigned`/`signed`, order-independently; DEFAULT signed when
+    // neither is present). The arm const-folds + validates N (S_BitIntWidthNot*
+    // 0xE04A–0xE04D + the C1 N>64 gate S_BitIntWidthAboveC1Limit) and interns
+    // `bitInt(N, signed)`. Invalid `bitIntSpecRule` ⇒ the language has no _BitInt
+    // surface (the arm never fires). Source-AGNOSTIC: nothing hardcodes "_BitInt".
+    RuleId        bitIntSpecRule{};   std::string bitIntSpecRuleName;
+    std::uint32_t bitIntWidthChild = 0;
+    std::optional<SchemaTokenId> bitIntUnsignedToken;
+    std::optional<SchemaTokenId> bitIntSignedToken;
     // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the `_Alignas`/`alignas` alignment
     // SPECIFIER. `alignasSpecRule` = the `alignasSpec` shape = [ keyword, '(',
     // alignasArg, ')' ]; `alignasArgChild` = the visible-child index of the
@@ -1711,6 +1726,16 @@ struct DSS_EXPORT SemanticConfig {
     // SExt). Default false → a non-C schema (toy/tsql) keeps `Char` strictly distinct
     // from the integer ranks. Required by the char-literal typing AND char value use.
     bool charConvertsToArith = false;
+
+    // C23 6.3.1.3/6.3.1.8 (D-CSUBSET-BITINT): admit `_BitInt(N)` into the implicit
+    // integer conversions. Read by `isAssignable`'s BitInt arm (BitInt↔BitInt and
+    // BitInt↔standard-integer, either direction) AND injected into the resolved
+    // `usualArithmeticCommonType` rules at the two `resolveArithmeticRules` call
+    // sites (so a `_BitInt` participates in the usual arithmetic conversions without
+    // promoting). Default false → a non-C schema keeps `_BitInt` inert (and it has
+    // no `_BitInt` types anyway). Mirrors the charConvertsToArith / enumConvertsToArith
+    // gate. Set true alongside the `semantics.bitInt` surface.
+    bool bitIntConversions = false;
 
     // C 6.7.2.2 / 6.3.1.1: an enum is an integer type with an underlying integer
     // (DSS interns it as `TypeKind::Enum`, the underlying kind in `scalars[0]`).

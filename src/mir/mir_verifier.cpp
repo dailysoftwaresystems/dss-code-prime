@@ -557,6 +557,49 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                             "integer-0 null constant and never reach MIR)",
                     t.v));
         }
+        // C23 _BitInt(N) (D-CSUBSET-BITINT): the by-construction WRAP-CHOKEPOINT
+        // tripwire (CRIT-2). Only the ARITHMETIC opcodes the wrap chokepoint PRODUCES
+        // carry the single-width-operand invariant: their `_BitInt(N)` result computes
+        // at width N, so each `_BitInt`-typed VALUE operand must ALSO be width N. This
+        // is an ALLOWLIST, NOT a `!conversion` denylist — the denylist wrongly admitted
+        //   • Phi — `instOperands` ABORTS on a Phi (mir.cpp), and a `_BitInt` ternary /
+        //     a `for (_BitInt i; …)` induction var (mem2reg) legitimately materialize a
+        //     `_BitInt(N)` Phi that MERGES same-N arms (already width N);
+        //   • Call — its result width is its RETURN type, UNRELATED to argument widths
+        //     (`unsigned _BitInt(4) f(unsigned _BitInt(40))` is a valid mixed-width call);
+        //   • Load / Const / GEP / conversions — no width-N-operand invariant either.
+        // A shift's COUNT (operand 1 of Shl/LShr/AShr) is NOT width-constrained (C 6.5.7)
+        // and is exempt; a non-`_BitInt` operand (an int count, a container mask const)
+        // is skipped. Never fires under the chokepoint; catches a mixed-width arith op.
+        if (interner_->kind(t) == TypeKind::BitInt) {
+            MirOpcode const op = mir_.instOpcode(id);
+            bool const isBitIntArith =
+                op == MirOpcode::Add  || op == MirOpcode::Sub  || op == MirOpcode::Mul
+             || op == MirOpcode::SDiv || op == MirOpcode::UDiv
+             || op == MirOpcode::SMod || op == MirOpcode::UMod
+             || op == MirOpcode::And  || op == MirOpcode::Or   || op == MirOpcode::Xor
+             || op == MirOpcode::Shl  || op == MirOpcode::LShr || op == MirOpcode::AShr
+             || op == MirOpcode::Neg  || op == MirOpcode::Not;
+            if (isBitIntArith) {
+                bool const isShift = op == MirOpcode::Shl || op == MirOpcode::LShr
+                                  || op == MirOpcode::AShr;
+                std::int64_t const n = interner_->bitIntWidth(t);
+                auto const ops = mir_.instOperands(id);
+                for (std::size_t i = 0; i < ops.size(); ++i) {
+                    if (isShift && i == 1) continue;   // shift count — width-free (6.5.7)
+                    TypeId const ot = mir_.instType(ops[i]);
+                    if (ot.valid() && interner_->kind(ot) == TypeKind::BitInt
+                        && interner_->bitIntWidth(ot) != n) {
+                        reportInst(reporter, DiagnosticCode::I_BitIntWidthInconsistent,
+                            id, std::format(
+                                "_BitInt({}) arithmetic result has a _BitInt({}) operand "
+                                "(#{}) — a bit-precise op must compute at ONE width; the "
+                                "wrap chokepoint coerces operands to the common width "
+                                "first", n, interner_->bitIntWidth(ot), ops[i].v));
+                    }
+                }
+            }
+        }
     });
     for (std::uint32_t fi = 0; fi < mir_.moduleFuncCount(); ++fi) {
         MirFuncId const f = mir_.funcAt(fi);

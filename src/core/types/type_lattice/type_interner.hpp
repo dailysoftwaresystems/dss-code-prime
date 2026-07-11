@@ -303,6 +303,26 @@ public:
     // with the enum TypeId; the enum type itself is int-compatible).
     TypeId enumType(std::string_view name,
                     TypeKind underlying = TypeKind::I32);
+    // C23 _BitInt(N) (D-CSUBSET-BITINT / C23 §6.2.5): a bit-precise integer of
+    // EXACT width `widthBits`, signed iff `isSigned`. scalars=[widthBits, signed?1:0];
+    // no operands, no name (structural identity — two `_BitInt(N)` of the same width
+    // + signedness collapse to one TypeId, like every other scalar-parameterized
+    // kind). The interner dedups on the scalar pair for free.
+    TypeId bitInt(std::int64_t widthBits, bool isSigned);
+    // The declared bit-width N of a `_BitInt(N)` (scalars[0]). Aborts if `id` is not
+    // a BitInt (a caller bug — every consumer gates on `kind(id)==BitInt` first).
+    [[nodiscard]] std::int64_t bitIntWidth(TypeId id) const;
+    // True iff `id` is a SIGNED `_BitInt(N)` (scalars[1]==1). Aborts if not a BitInt.
+    [[nodiscard]] bool bitIntIsSigned(TypeId id) const;
+    // The native signed/unsigned CONTAINER kind a `_BitInt(N≤64)` projects to at the
+    // width tier — N≤8→I8/U8, ≤16→I16/U16, ≤32→I32/U32, ≤64→I64/U64 by signedness
+    // (the smallest native integer holding N bits). The enum→underlying `reprKind`
+    // precedent: it makes `requireNativeIntWidth`/`widthFlagsForType`/`memAccess-
+    // WidthFlags` see a native kind, and it IS the ABI container (`computeLayout`
+    // sizes a `_BitInt(N)` as this kind). N>64 (a C2 multi-limb width) returns
+    // `TypeKind::Void` — the fail-loud sentinel; the C1 semantic gate rejects N>64
+    // before any consumer queries this. Aborts if `id` is not a BitInt.
+    [[nodiscard]] TypeKind bitIntContainerKind(TypeId id) const;
     // fnSig: operands=[result, params...], scalars=[(int)cc, isVariadic].
     // D-LANG-VARIADIC (step 13.4): variadic flips the second scalar slot;
     // non-variadic encodings remain 1-slot for cache stability against

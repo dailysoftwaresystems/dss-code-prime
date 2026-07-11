@@ -7733,6 +7733,61 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                     }
                 }
             }
+            // C23 6.2.5/6.7.2 (D-CSUBSET-BITINT): `{ specRule, widthChild,
+            // unsignedToken, signedToken }`. `specRule` names the `_BitInt(N)`
+            // specifier shape; `widthChild` is the visible-child index of the width
+            // const-expr; the two tokens name the C 6.7.2 signedness keywords the
+            // resolver scans for among the specifier run (DEFAULT signed). Absent
+            // block → the language has no `_BitInt` surface.
+            if (sem.contains("bitInt")) {
+                json const& bi = sem.at("bitInt");
+                if (!bi.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics, "/semantics/bitInt",
+                              "'semantics.bitInt' must be an object "
+                              "{ specRule, widthChild, unsignedToken, signedToken }");
+                } else {
+                    if (!bi.contains("specRule") || !bi.at("specRule").is_string()) {
+                        coll.emit(DiagnosticCode::C_MissingField,
+                                  "/semantics/bitInt/specRule",
+                                  "'specRule' is required and must be a string");
+                    } else {
+                        cfg.bitIntSpecRuleName = bi.at("specRule").get<std::string>();
+                        if (!data.rules->contains(cfg.bitIntSpecRuleName)) {
+                            coll.emit(DiagnosticCode::C_UnknownShape,
+                                      "/semantics/bitInt/specRule",
+                                      std::format("'bitInt.specRule' references unknown "
+                                                  "shape '{}'", cfg.bitIntSpecRuleName));
+                        } else {
+                            cfg.bitIntSpecRule = data.rules->find(cfg.bitIntSpecRuleName);
+                        }
+                    }
+                    bool widthOk = true;
+                    readReqIndex(bi, "widthChild", "/semantics/bitInt",
+                                 cfg.bitIntWidthChild, widthOk);
+                    (void)widthOk;
+                    auto readReqToken =
+                        [&](char const* key, std::optional<SchemaTokenId>& out) {
+                        if (!bi.contains(key) || !bi.at(key).is_string()) {
+                            coll.emit(DiagnosticCode::C_MissingField,
+                                      std::string{"/semantics/bitInt/"} + key,
+                                      std::format("'{}' is required and must be a "
+                                                  "string", key));
+                            return;
+                        }
+                        std::string const tn = bi.at(key).get<std::string>();
+                        if (!data.schemaTokens->contains(tn)) {
+                            coll.emit(DiagnosticCode::C_UnknownToken,
+                                      std::string{"/semantics/bitInt/"} + key,
+                                      std::format("'bitInt.{}' references unknown token "
+                                                  "kind '{}'", key, tn));
+                            return;
+                        }
+                        out = data.schemaTokens->find(tn);
+                    };
+                    readReqToken("unsignedToken", cfg.bitIntUnsignedToken);
+                    readReqToken("signedToken",   cfg.bitIntSignedToken);
+                }
+            }
 
             // ── alignas (C11/C23 6.7.5, D-CSUBSET-ALIGNAS) ──
             // `{ specRule, argChild, typeFormRule }` — the `_Alignas`/`alignas`
@@ -8939,6 +8994,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'charConvertsToArith' must be a boolean");
                 } else {
                     cfg.charConvertsToArith = v.get<bool>();
+                }
+            }
+
+            // C23 6.3.1.3/6.3.1.8 (D-CSUBSET-BITINT): admit `_BitInt(N)` into the
+            // implicit integer conversions (isAssignable's BitInt arm + the injected
+            // usualArithmeticCommonType rules). Opt-in (default false).
+            if (sem.contains("bitIntConversions")) {
+                auto const& v = sem.at("bitIntConversions");
+                if (!v.is_boolean()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/bitIntConversions",
+                              "'bitIntConversions' must be a boolean");
+                } else {
+                    cfg.bitIntConversions = v.get<bool>();
                 }
             }
 

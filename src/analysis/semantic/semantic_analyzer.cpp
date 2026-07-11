@@ -1018,6 +1018,14 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
                       Tree const& tree, ScopeId scope);
 
+// D-CSUBSET-BITINT: `resolveTypeNodeImpl` (below) folds a `_BitInt(N)` width
+// through `constIntExpr`, which is DEFINED later in this TU — forward-declare it
+// here (no default args; the definition supplies them). Same const-expr evaluator
+// the array-dimension / alignas / static_assert consumers use.
+[[nodiscard]] std::optional<std::int64_t>
+constIntExpr(EngineState& s, Tree const& tree, NodeId node, ScopeId fromScope,
+             SemanticConfig const* cfg);
+
 // Resolve a type-position subtree to a TypeId. Walks `typeShapes`
 // recursively (e.g. pointerType[innerType] → Ptr<innerType>) and looks
 // the leaf up in `builtinTypes`. A leaf that is not a built-in type but
@@ -1112,6 +1120,128 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     if (rec.type.valid()) return rec.type;
                 }
                 return InvalidType;
+            }
+        }
+        // C23 6.2.5/6.7.2 (D-CSUBSET-BITINT): `_BitInt(N)` — a bit-precise integer
+        // type-specifier. Handled BEFORE the multiset arm (a run containing a
+        // `bitIntSpecifier` node is NOT all-tokens, so that arm skips it). Two
+        // shapes: `node` IS the bitIntSpecifier (a bare `_BitInt(N)` reached
+        // directly), OR `node` is a `typeSpecifierSeq` run holding the
+        // bitIntSpecifier NODE plus sibling `unsigned`/`signed` TOKENS (order-
+        // independent; DEFAULT signed). The arm resolves the width const-expr and
+        // fail-loud-gates it. Fires only for a language declaring `semantics.bitInt`
+        // (never a keyword identity).
+        if (cfg.bitIntSpecRule.valid()) {
+            NodeId bitSpec{};
+            bool sawUnsigned = false;
+            bool sawSigned   = false;
+            bool sawOther    = false;   // any specifier other than signedness → invalid
+            if (rule.v == cfg.bitIntSpecRule.v) {
+                bitSpec = node;   // bare `_BitInt(N)` — default signed, no siblings
+            } else {
+                for (NodeId c : visibleChildren(tree, node)) {
+                    if (tree.kind(c) == NodeKind::Internal
+                        && tree.rule(c).v == cfg.bitIntSpecRule.v) {
+                        if (bitSpec.valid()) sawOther = true;   // two `_BitInt` → invalid
+                        else bitSpec = c;
+                    } else if (tree.kind(c) == NodeKind::Token) {
+                        auto const ck = tree.tokenKind(c);
+                        if (cfg.bitIntUnsignedToken && ck == *cfg.bitIntUnsignedToken)
+                            sawUnsigned = true;
+                        else if (cfg.bitIntSignedToken && ck == *cfg.bitIntSignedToken)
+                            sawSigned = true;
+                        else
+                            sawOther = true;   // int/long/short/… mixed with `_BitInt`
+                    } else {
+                        sawOther = true;
+                    }
+                }
+            }
+            if (bitSpec.valid()) {
+                // `unsigned _BitInt` → unsigned; `signed _BitInt` / bare → signed.
+                bool const isSigned = !sawUnsigned;
+                if (sawUnsigned && sawSigned) sawOther = true;   // contradictory pair
+                if (sawOther) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_InvalidTypeSpecifierCombination;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(node);
+                    d.actual   = std::string{tree.text(node)};
+                    s.reporter.report(std::move(d));
+                    specifierDiagnosed = true;
+                    return InvalidType;
+                }
+                auto bitKids = visibleChildren(tree, bitSpec);
+                if (cfg.bitIntWidthChild >= bitKids.size()) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_UnknownType;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(bitSpec);
+                    d.actual   = std::string{tree.text(bitSpec)};
+                    s.reporter.report(std::move(d));
+                    specifierDiagnosed = true;
+                    return InvalidType;
+                }
+                // The width is a shared-CST const-expr (the array-dim / alignas /
+                // static_assert evaluator). A width diagnostic is UNSUPPRESSABLE and
+                // is emitted regardless of `emitOnMiss` (a global's head resolves
+                // that way) so the fail-loud is never silently dropped; the reporter's
+                // recent-duplicate window collapses a Pass-1.5 + Pass-2 double-visit.
+                auto const emitWidth = [&](DiagnosticCode code, std::string msg) {
+                    ParseDiagnostic d;
+                    d.code     = code;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(bitSpec);
+                    d.actual   = std::move(msg);
+                    s.reporter.report(std::move(d));
+                    specifierDiagnosed = true;
+                };
+                auto const width =
+                    constIntExpr(s, tree, bitKids[cfg.bitIntWidthChild], scope, &cfg);
+                if (!width.has_value()) {
+                    emitWidth(DiagnosticCode::S_BitIntWidthNotConstant,
+                              "`_BitInt(N)` requires an integer constant-expression "
+                              "width: " + std::string{tree.text(bitSpec)});
+                    return InvalidType;
+                }
+                std::int64_t const n = *width;
+                if (n <= 0) {
+                    emitWidth(DiagnosticCode::S_BitIntWidthNotPositive,
+                              std::format("`_BitInt` width must be positive (got {})",
+                                          n));
+                    return InvalidType;
+                }
+                if (isSigned && n < 2) {
+                    emitWidth(DiagnosticCode::S_BitIntSignedWidthTooSmall,
+                              "a signed `_BitInt` needs at least 2 bits (1 sign + 1 "
+                              "value bit); use `unsigned _BitInt(1)` for a 1-bit type");
+                    return InvalidType;
+                }
+                // __BITINT_MAXWIDTH__ (C23 6.2.5) — the same 8388608 the predefined
+                // macro carries; the two encode ONE ABI constant.
+                constexpr std::int64_t kBitIntMaxWidth = 8388608;
+                if (n > kBitIntMaxWidth) {
+                    emitWidth(DiagnosticCode::S_BitIntWidthExceedsMax,
+                              std::format("`_BitInt` width {} exceeds "
+                                          "__BITINT_MAXWIDTH__ ({})",
+                                          n, kBitIntMaxWidth));
+                    return InvalidType;
+                }
+                // D-CSUBSET-BITINT C1 cycle boundary: N>64 is multi-limb (C2/C3).
+                if (n > 64) {
+                    emitWidth(DiagnosticCode::S_BitIntWidthAboveC1Limit,
+                              std::format("`_BitInt({})` exceeds the width supported "
+                                          "this cycle (N<=64); wider bit-precise "
+                                          "integers land in a later cycle", n));
+                    return InvalidType;
+                }
+                TypeId const result = s.lattice.interner().bitInt(n, isSigned);
+                s.nodeToType.set(node, result);
+                if (bitSpec.v != node.v) s.nodeToType.set(bitSpec, result);
+                return result;
             }
         }
         // FC3 c1: type-specifier keyword run (C 6.7.2 — `unsigned long
@@ -1849,6 +1979,15 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
                 case TypeKind::U32:  t.isInteger=true; t.intBits=32; t.intSigned=false; break;
                 case TypeKind::I64:  t.isInteger=true; t.intBits=64; t.intSigned=true;  break;
                 case TypeKind::U64:  t.isInteger=true; t.intBits=64; t.intSigned=false; break;
+                // D-CSUBSET-BITINT (CRIT-3): a cast TO `_BitInt(N)` is NON-foldable in
+                // const-eval — the CST evaluator has no mod-2^N wrap, so folding
+                // `(_BitInt(4))15` via `narrowIntToBits` would give a HALF-modeled
+                // value (correct for N≤64 by luck, but the design keeps const-eval
+                // BitInt-free until the C4 bignum fold for uniform behavior). Explicit
+                // nullopt (the `default` already covers it — this pins the intent):
+                // the cast arm fail-louds NotAConstantExpression → `_Static_assert
+                // ((_BitInt(4))15+1==0)` is a diagnostic, never a silent pass/fail.
+                case TypeKind::BitInt: return std::nullopt;
                 default: return std::nullopt;   // float / aggregate — non-foldable cast
             }
             return t;
@@ -7162,7 +7301,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode))
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions)
                                    && !admitsNullPointerConstant(
                                           s, tree, rec.type, initNode,
                                           tree.schema().semantics()
@@ -7210,7 +7349,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode))
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions)
                                    // D-LANG-NULL-POINTER-CONSTANT (step
                                    // 13.3): admit `T* p = 0;` initializer
                                    // per C §6.3.2.3.3.
@@ -7333,7 +7472,9 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                              /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts,
                                              /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows,
                                              /*intConvertsToFloat=*/cfg.intConvertsToFloat,
-                                             /*floatConvertsToInt=*/cfg.floatConvertsToInt)
+                                             /*floatConvertsToInt=*/cfg.floatConvertsToInt,
+                                             /*charArrayFromStringLiteralInit=*/false,
+                                             /*bitIntConversions=*/cfg.bitIntConversions)
                             && !admitsNullPointerConstant(
                                    s, tree, lhsTy, rhsN, ptrRules, here, cfg)) {
                             ParseDiagnostic d;
@@ -7897,7 +8038,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         if (!argTy.valid()) continue;  // unknown arg type — suppress cascade
         if (!isAssignable(s.lattice.interner(), params[i], argTy, ptrRules,
                           /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt)) {
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions)) {
             // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit literal-0
             // → Ptr<*> as null pointer constant per C §6.3.2.3.3. The
             // check lives here (NOT in isAssignable) because it is
@@ -8452,6 +8593,10 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     std::optional<ResolvedArithmeticRules> arith;
     if (sem.arithmeticConversions.has_value()) {
         arith = resolveArithmeticRules(*sem.arithmeticConversions, s.dataModel);
+        // D-CSUBSET-BITINT: inject the `_BitInt`-conversions flag (a separate
+        // top-level flag, mirroring the cst_to_hir resolve site) so the semantic-
+        // tier expression typer agrees with the HIR lowering on a BitInt common type.
+        arith->bitIntConversions = sem.bitIntConversions;
     }
     auto const commonArithType = [&](TypeId a, TypeId b) -> TypeId {
         if (arith.has_value()) {
@@ -9128,7 +9273,7 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     auto const& ptrRules = tree.schema().semantics().pointerConversions;
     if (!isAssignable(s.lattice.interner(), fnResult, exprTy, ptrRules,
                       /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt)) {
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions)) {
         // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit `return 0;`
         // from a Ptr<*>-returning function per C §6.3.2.3.3.
         if (admitsNullPointerConstant(s, tree, fnResult,

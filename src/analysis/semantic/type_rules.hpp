@@ -64,7 +64,12 @@ namespace detail::type_rules {
 [[nodiscard]] inline bool isArithmetic(TypeInterner const& interner, TypeId t) noexcept {
     if (!t.valid()) return false;
     auto const k = interner.kind(t);
-    return detail::type_rules::signedIntRank(k)   != 0
+    // C23 6.2.5 (D-CSUBSET-BITINT): a `_BitInt(N)` IS an arithmetic (integer) type.
+    // Ungated shape admission — a `_BitInt` type only ever appears in a schema that
+    // declares the `_BitInt` surface (the C schema), so this is inert for every
+    // other language (no `_BitInt` syntax → no BitInt TypeId → the arm never fires).
+    return k == TypeKind::BitInt
+        || detail::type_rules::signedIntRank(k)   != 0
         || detail::type_rules::unsignedIntRank(k) != 0
         || detail::type_rules::floatRank(k)       != 0;
 }
@@ -169,7 +174,8 @@ namespace detail::type_rules {
     bool                                               intSameSignednessNarrows = false,
     bool                                               intConvertsToFloat = false,
     bool                                               floatConvertsToInt = false,
-    bool                                               charArrayFromStringLiteralInit = false) noexcept {
+    bool                                               charArrayFromStringLiteralInit = false,
+    bool                                               bitIntConversions = false) noexcept {
     if (!lhs.valid() || !rhs.valid()) return true;
     // c27 (D-CSUBSET-VOLATILE-POINTEE): volatile is IGNORED for assignment
     // compatibility — C 6.5.16.1 compares the UNQUALIFIED versions of compatible
@@ -188,6 +194,24 @@ namespace detail::type_rules {
     auto const lk = interner.kind(lhs);
     auto const rk = interner.kind(rhs);
     using namespace detail::type_rules;
+    // C23 6.3.1.3 (D-CSUBSET-BITINT): a `_BitInt(N)` is an integer type — implicitly
+    // convertible to AND from any OTHER `_BitInt(M)` and any standard integer rank in
+    // an assignment context (value-preserving in range, modular/truncating out of
+    // range). The HIR `coerce()` arithmetic-core arm materializes the width-exact
+    // Cast (MIR masks the result to N — CRIT-1/CRIT-2), so the post-coerce verifier
+    // (gate default false) stays strict. Gated on `bitIntConversions` (a non-C schema
+    // has no `_BitInt` types, so this is doubly inert). SCOPE: BitInt↔BitInt and
+    // BitInt↔standard-integer-rank; BitInt↔float/Char/Enum are NOT admitted here this
+    // cycle (a loud reject — safe, incomplete; a future-cycle deferral tracked under
+    // D-CSUBSET-BITINT). The same-type (identical N + signedness) case already
+    // returned via `sameType` above.
+    if (bitIntConversions) {
+        bool const lBit = lk == TypeKind::BitInt;
+        bool const rBit = rk == TypeKind::BitInt;
+        if (lBit && rBit) return true;   // any width/signedness, either direction
+        if (lBit && (signedIntRank(rk) != 0 || unsignedIntRank(rk) != 0)) return true;
+        if (rBit && (signedIntRank(lk) != 0 || unsignedIntRank(lk) != 0)) return true;
+    }
     if (signedIntRank(lk) != 0 && signedIntRank(rk) != 0) {
         if (signedIntRank(rk) <= signedIntRank(lk)) return true;  // widening: always
         return intSameSignednessNarrows;          // narrowing: C 6.3.1.3, gated
@@ -518,9 +542,14 @@ namespace detail::type_rules {
     // casts between (incl. Bool/Char/Byte — C casts these freely).
     auto const isCastableInt = [](TypeKind k) noexcept {
         using namespace detail::type_rules;
+        // C23 6.2.5 (D-CSUBSET-BITINT): a `_BitInt(N)` is an integer type — an
+        // explicit `(int)b` / `(_BitInt(N))x` / `(_BitInt(N))(_BitInt(M))` cast is
+        // legal. hir_to_mir routes the BitInt cast through the masking path
+        // (emitCastToBitInt) / the container decode; `mapCast` stays untouched.
         return signedIntRank(k) != 0 || unsignedIntRank(k) != 0
             || k == TypeKind::Char || k == TypeKind::Byte
-            || k == TypeKind::Bool || k == TypeKind::Enum;
+            || k == TypeKind::Bool || k == TypeKind::Enum
+            || k == TypeKind::BitInt;
     };
     auto const isCastableScalar = [&](TypeKind k) noexcept {
         return isCastableInt(k) || detail::type_rules::floatRank(k) != 0;
@@ -583,6 +612,33 @@ namespace detail::type_rules {
     auto const ak = interner.kind(a);
     auto const bk = interner.kind(b);
     using namespace detail::type_rules;
+    // C23 6.3.1.8 (D-CSUBSET-BITINT): the legacy widening-top for bit-precise
+    // integers (the config-less fallback path — the C schema uses the fuller
+    // `usualArithmeticCommonType`; this keeps `unify` self-consistent). Two BitInts
+    // → the wider N (equal N → unsigned wins); a BitInt vs a standard integer → the
+    // wider by bit-width (a BitInt of width == a standard width yields the standard,
+    // matching C23's rank ordering). Ungated — inert for every non-`_BitInt` schema
+    // (no BitInt TypeId ever occurs there).
+    if (ak == TypeKind::BitInt || bk == TypeKind::BitInt) {
+        bool const aBit = ak == TypeKind::BitInt;
+        bool const bBit = bk == TypeKind::BitInt;
+        if (aBit && bBit) {
+            int const na = static_cast<int>(interner.bitIntWidth(a));
+            int const nb = static_cast<int>(interner.bitIntWidth(b));
+            if (na != nb) return na > nb ? a : b;
+            return interner.bitIntIsSigned(a) ? b : a;   // equal N → unsigned
+        }
+        TypeId   const bit  = aBit ? a  : b;
+        TypeKind const stdK = aBit ? bk : ak;
+        int      const n    = static_cast<int>(interner.bitIntWidth(bit));
+        // Standard integer bit-width from its rank (1..5 → 8..128); `intKindBits`
+        // is declared LATER in this header, so derive it inline here.
+        int const rank = signedIntRank(stdK) != 0 ? signedIntRank(stdK)
+                                                   : unsignedIntRank(stdK);
+        int const w    = rank == 0 ? 0 : (8 << (rank - 1));
+        if (w == 0) return InvalidType;   // non-integer other operand
+        return n > w ? bit : (aBit ? b : a);
+    }
     if (signedIntRank(ak) != 0 && signedIntRank(bk) != 0) {
         return signedIntRank(ak) >= signedIntRank(bk) ? a : b;
     }
@@ -655,6 +711,14 @@ struct ResolvedArithmeticRules {
     MixedSignednessRule   mixedSignedness = MixedSignednessRule::RankPreferUnsigned;
     bool                  promoteComparisons = true;
     ShiftResultRule       shiftResult = ShiftResultRule::PromotedLeft;  // C 6.5.7
+    // C23 6.3.1.8 (D-CSUBSET-BITINT): admit `_BitInt(N)` into the usual arithmetic
+    // conversions (a `_BitInt` does NOT integer-promote — its rank sits between the
+    // adjacent standard widths — so it participates as ITSELF). Injected from the
+    // top-level `SemanticConfig.bitIntConversions` at the two resolve sites (NOT
+    // read from `ArithmeticConversions`, keeping that struct's JSON unchanged);
+    // default false ⇒ a language without the flag keeps `usualArithmeticCommonType`
+    // returning InvalidType for any BitInt pair (no accidental promotion).
+    bool                  bitIntConversions = false;
 };
 
 [[nodiscard]] inline ResolvedArithmeticRules
@@ -785,6 +849,9 @@ usualArithmeticCommonType(TypeInterner& interner, TypeId a, TypeId b,
     TypeKind const kb = interner.kind(b);
     auto const isArith = [&](TypeKind k) noexcept {
         if (floatRank(k) != 0 || intWidthRank(k) != 0) return true;
+        // C23 6.2.5 (D-CSUBSET-BITINT): a `_BitInt(N)` is arithmetic (so a BitInt-vs-
+        // float pair below resolves to the float, NOT InvalidType). Gated.
+        if (rules.bitIntConversions && k == TypeKind::BitInt) return true;
         for (TypeKind p : rules.alsoPromote) {
             if (p == k) return true;
         }
@@ -796,6 +863,35 @@ usualArithmeticCommonType(TypeInterner& interner, TypeId a, TypeId b,
         if (!isArith(ka) || !isArith(kb)) return InvalidType;
         if (fa != 0 && fb != 0) return fa >= fb ? a : b;
         return fa != 0 ? a : b;
+    }
+    // C23 6.3.1.8 (D-CSUBSET-BITINT): bit-precise integers in the usual arithmetic
+    // conversions (reached only for a NON-float pair — a BitInt-vs-float returned
+    // above). A `_BitInt` does NOT integer-promote; a standard operand promotes
+    // FIRST (step 1). Two BitInts → the WIDER N (equal N → unsigned wins). A BitInt
+    // vs a promoted-standard of width W → N>W ? the BitInt : the standard (C23: a
+    // standard integer out-ranks a bit-precise one of equal-or-lesser width). Gated
+    // on `bitIntConversions`; without it `intWidthRank(BitInt)==0` → the `ra==0`
+    // guard below returns InvalidType (no accidental promotion).
+    if (rules.bitIntConversions
+        && (ka == TypeKind::BitInt || kb == TypeKind::BitInt)) {
+        bool const aBit = ka == TypeKind::BitInt;
+        bool const bBit = kb == TypeKind::BitInt;
+        if (aBit && bBit) {
+            int const na = static_cast<int>(interner.bitIntWidth(a));
+            int const nb = static_cast<int>(interner.bitIntWidth(b));
+            if (na != nb) return na > nb ? a : b;               // wider N wins
+            bool const sa = interner.bitIntIsSigned(a);
+            bool const sb = interner.bitIntIsSigned(b);
+            if (sa == sb) return a;                             // identical TypeId
+            return sa ? b : a;                                  // equal N → unsigned
+        }
+        TypeId   const bit  = aBit ? a  : b;
+        TypeKind const stdK = aBit ? kb : ka;
+        int      const n    = static_cast<int>(interner.bitIntWidth(bit));
+        TypeKind const pStd = promoteIntegerKind(stdK, rules);
+        int      const w    = intKindBits(pStd);
+        if (w == 0) return InvalidType;   // the other operand is not an integer
+        return n > w ? bit : interner.primitive(pStd);
     }
     TypeKind const pa = promoteIntegerKind(ka, rules);
     TypeKind const pb = promoteIntegerKind(kb, rules);

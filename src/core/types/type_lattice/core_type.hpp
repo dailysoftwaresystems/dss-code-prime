@@ -73,6 +73,23 @@ enum class TypeKind : std::uint16_t {
     // pre-existing kind keeps its integer value — see the VolatileQual note above.
     NullptrT,
 
+    // ── C23 _BitInt(N) bit-precise integer (D-CSUBSET-BITINT / C23 §6.2.5) ──
+    // A bit-precise signed/unsigned integer of an EXACT programmer-chosen width N.
+    // Carries `scalars=[N, signed]` (N in bits; signed = 1 for `_BitInt`/`signed
+    // _BitInt`, 0 for `unsigned _BitInt`) — NOT a distinct kind per signedness
+    // (signedness never lives in the kind for any integer). Distinct from the
+    // standard I*/U* ranks: `_BitInt(N)` does NOT integer-PROMOTE (C23 §6.3.1.1 —
+    // its rank sits between adjacent standard widths), so `_BitInt(4)+_BitInt(4)`
+    // is `_BitInt(4)`, and arithmetic WRAPS mod-2^N (masked by construction at the
+    // MIR value-materialization boundary). The width tier projects a `_BitInt(N≤64)`
+    // to its signed/unsigned native CONTAINER kind (I8/I16/I32/I64 by size) via
+    // `reprKind`/`bitIntContainerKind` — the enum→underlying projection precedent —
+    // so `requireNativeIntWidth`/`widthFlagsForType` see a native kind and the
+    // masking reuses the bit-field extract/insert shift+mask primitive. Appended
+    // AFTER NullptrT (before Count_) so every pre-existing kind keeps its integer
+    // value — the VolatileQual/NullptrT placement precedent.
+    BitInt,
+
     Count_  // keep last — counts the core members
 };
 

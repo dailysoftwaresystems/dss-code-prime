@@ -575,6 +575,43 @@ TypeId TypeInterner::enumType(std::string_view name, TypeKind underlying) {
     return internContent(TypeKind::Enum, {}, {}, sc, names_.intern(name));
 }
 
+TypeId TypeInterner::bitInt(std::int64_t widthBits, bool isSigned) {
+    // scalars=[widthBits, signed?1:0]; no operands, no name. The interner dedups
+    // on the scalar pair, so `_BitInt(N)` / `unsigned _BitInt(N)` each intern once.
+    std::array<std::int64_t, 2> const sc{widthBits, isSigned ? std::int64_t{1}
+                                                             : std::int64_t{0}};
+    return internContent(TypeKind::BitInt, {}, {}, sc, {});
+}
+
+std::int64_t TypeInterner::bitIntWidth(TypeId id) const {
+    if (kind(id) != TypeKind::BitInt) latticeFatal("bitIntWidth: TypeId is not a BitInt");
+    auto const sc = scalars(id);
+    if (sc.empty()) latticeFatal("bitIntWidth: BitInt has no width scalar");
+    return sc[0];
+}
+
+bool TypeInterner::bitIntIsSigned(TypeId id) const {
+    if (kind(id) != TypeKind::BitInt) latticeFatal("bitIntIsSigned: TypeId is not a BitInt");
+    auto const sc = scalars(id);
+    // scalars[1] is the signedness flag; a 1-scalar BitInt (shouldn't occur via the
+    // builder) is treated as signed (the C default).
+    return sc.size() < 2 || sc[1] != 0;
+}
+
+TypeKind TypeInterner::bitIntContainerKind(TypeId id) const {
+    if (kind(id) != TypeKind::BitInt)
+        latticeFatal("bitIntContainerKind: TypeId is not a BitInt");
+    std::int64_t const n = bitIntWidth(id);
+    bool const s = bitIntIsSigned(id);
+    // Smallest native integer container holding N bits (N>64 → Void = fail-loud
+    // sentinel; the C1 semantic gate rejects N>64 before any width consumer runs).
+    if (n <= 8)  return s ? TypeKind::I8  : TypeKind::U8;
+    if (n <= 16) return s ? TypeKind::I16 : TypeKind::U16;
+    if (n <= 32) return s ? TypeKind::I32 : TypeKind::U32;
+    if (n <= 64) return s ? TypeKind::I64 : TypeKind::U64;
+    return TypeKind::Void;
+}
+
 TypeId TypeInterner::fnSig(std::span<TypeId const> params, TypeId result, CallConv cc) {
     // 3-arg backward-compat path: non-variadic. Delegates to the 4-arg
     // overload with isVariadic=false. Pre-13.4 callers (30+ sites)
