@@ -8388,28 +8388,62 @@ TEST(MirLoweringCSubset, SehInsideLoopStaysVerifierGreen) {
         << (rep.all().empty() ? "" : rep.all()[0].actual);
 }
 
-// D-CSUBSET-BITINT-C2-WIDE: the C3 boundary — `* / %` on a wide `_BitInt(N>64)` is not
-// yet lowered; each fails LOUD at MIR with the dedicated unsuppressable
-// S_BitIntWideMulDivUnsupported (0xE04F), never a silent scalar op. The op TYPE-checks
-// (a wide `a*b` is a valid expression) — only the multi-limb CODEGEN defers. RED-ON-
-// DISABLE: drop the diagnoseCode in materializeWideBinaryOp and a wide `*` silently
-// truncates to its low limb (mir.ok flips true with no diagnostic).
-TEST(MirLoweringCSubset, WideBitIntMulDivModFailLoudAtC3Boundary) {
-    for (char const* op : {"*", "/", "%"}) {
+// Collect EVERY MIR opcode across all blocks of all functions (the wide ops emit
+// multi-block loops, so an entry-only scan would miss the loop-body opcodes).
+namespace {
+[[nodiscard]] std::vector<MirOpcode> allOpcodes(Mir const& m) {
+    std::vector<MirOpcode> out;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        std::uint32_t const nb = m.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            std::uint32_t const n = m.blockInstCount(b);
+            for (std::uint32_t ii = 0; ii < n; ++ii)
+                out.push_back(m.instOpcode(m.blockInstAt(b, ii)));
+        }
+    }
+    return out;
+}
+} // namespace
+
+// D-CSUBSET-BITINT-C3-MULDIV: `* / %` on a wide `_BitInt(N>64)` now LOWER to the multi-
+// limb path (C3) — the C2 S_BitIntWideMulDivUnsupported (0xE04F) boundary is RETIRED for
+// these ops. This pins the SHAPE, not just "ok": a wide `*` emits the 64x64->128 `UMulH`
+// primitive (schoolbook multiply) and no div-by-zero trap; a wide `/`/`%` emits the
+// div-by-zero `Unreachable` hard-trap (binary long division, no UMulH). The op still
+// type-checks (a wide `a*b` is a valid expression); only the CODEGEN changed. RED-ON-
+// DISABLE: revert the dispatch and mir.ok flips false with a 0xE04F diagnostic; swap the
+// multiply's carry to OR and the value example (c23_bitint_wide_muldiv) breaks, but the
+// UMulH shape here still pins the primitive is used.
+TEST(MirLoweringCSubset, WideBitIntMulDivModLowersAtC3) {
+    struct Case { char const* op; bool wantUMulH; bool wantTrap; };
+    for (Case const& c : {Case{"*", true, false},
+                          Case{"/", false, true},
+                          Case{"%", false, true}}) {
         std::string const src =
             std::string("int main(void){ _BitInt(200) a = 3, b = 5;\n"
-                        "  _BitInt(200) c = a ") + op + " b;\n"
-            "  return (int)c; }\n";
+                        "  _BitInt(200) cc = a ") + c.op + " b;\n"
+            "  return (int)cc; }\n";
         auto L = lowerCSubset(src);
-        ASSERT_FALSE(L.model.hasErrors()) << src;   // it type-checks; only codegen defers
+        ASSERT_FALSE(L.model.hasErrors()) << src;
         ASSERT_TRUE(L.hir->ok) << src;
-        EXPECT_FALSE(L.mir.ok) << src
-            << "\na wide _BitInt '" << op << "' must fail loud at the C3 boundary";
-        std::size_t n = 0;
+        EXPECT_TRUE(L.mir.ok) << src
+            << "\na wide _BitInt '" << c.op << "' must LOWER at C3"
+            << "\n" << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        std::size_t nDiag = 0;
         for (auto const& d : L.mirReporter.all())
-            if (d.code == DiagnosticCode::S_BitIntWideMulDivUnsupported) ++n;
-        EXPECT_EQ(n, 1u) << src
-            << "\nexactly one S_BitIntWideMulDivUnsupported (0xE04F)";
+            if (d.code == DiagnosticCode::S_BitIntWideMulDivUnsupported) ++nDiag;
+        EXPECT_EQ(nDiag, 0u) << src
+            << "\nthe retired 0xE04F boundary must NOT fire for a lowered wide '"
+            << c.op << "'";
+        auto const ops = allOpcodes(L.mir.mir);
+        EXPECT_EQ(countOpcode(ops, MirOpcode::UMulH) > 0, c.wantUMulH) << src
+            << "\nwide '" << c.op << "': UMulH presence pins the schoolbook multiply "
+               "primitive (mul uses it; long division does not)";
+        EXPECT_EQ(countOpcode(ops, MirOpcode::Unreachable) > 0, c.wantTrap) << src
+            << "\nwide '" << c.op << "': the div-by-zero Unreachable hard-trap is emitted "
+               "for divide/modulo (narrow idiv #DE parity), never for multiply";
     }
 }
 

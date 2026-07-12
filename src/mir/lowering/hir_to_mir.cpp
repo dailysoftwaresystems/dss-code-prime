@@ -358,8 +358,10 @@ struct Lowerer {
 
     // Emit a SPECIFIC-code positioned error from the MIR-lowering tier (the twin of
     // `unsupported`, which uses the generic H_UnsupportedLoweringForKind). Used for the
-    // C3-boundary S_BitIntWideMulDivUnsupported (D-CSUBSET-BITINT-C2-WIDE) — a real,
-    // unsuppressable diagnostic, never a silent scalar op.
+    // still-deferred wide-`_BitInt` gaps (e.g. S_BitIntWideFloatConvUnsupported,
+    // D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV) — a real, unsuppressable diagnostic, never a
+    // silent scalar op. (The C2 `* / %` boundary code S_BitIntWideMulDivUnsupported is
+    // retired as of C3 — those ops now lower to the multi-limb path.)
     void diagnoseCode(HirNodeId node, DiagnosticCode code, std::string what) {
         ParseDiagnostic d;
         d.code     = code;
@@ -826,6 +828,46 @@ struct Lowerer {
         return true;
     }
 
+    // The RUNTIME-count sibling of `emitLimbLoop`: `for (i64 i=0; i<countVal; ++i)
+    // body(i)` where `countVal` is an i64 SSA VALUE (not a compile-time constant). Same
+    // LoopHeader/Linear/LoopExit shape; the guard is `ICmpSlt(ctr, countVal)` so a
+    // count<=0 runs the body zero times (no compile-time special-case needed). Used by
+    // the wide-multiply inner loop whose bound `limbCount - i` is only known at run time.
+    // `countVal` must dominate the header (it does: the caller computes it in the
+    // enclosing block, and it is loop-invariant across the back-edge).
+    template <class BodyFn>
+    [[nodiscard]] bool emitLimbLoopN(MirInstId countVal, BodyFn&& body) {
+        if (!countVal.valid()) return false;
+        MirInstId const ctr = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
+        if (!ctr.valid()) return false;
+        storeLimb(ci64(0), ctr);
+        MirBlockId const header = mir.createBlock(StructCfMarker::LoopHeader);
+        MirBlockId const bodyBB = mir.createBlock(StructCfMarker::Linear);
+        MirBlockId const exitBB = mir.createBlock(StructCfMarker::LoopExit);
+        mir.addBr(header);
+        mir.beginBlock(header);
+        std::array<MirInstId, 2> c{loadLimb(ctr), countVal};
+        MirInstId const cond =
+            mir.addInst(MirOpcode::ICmpSlt, c, interner.primitive(TypeKind::Bool));
+        if (!cond.valid()) {
+            sealCreatedAsUnreachable(bodyBB);
+            sealCreatedAsUnreachable(exitBB);
+            return false;
+        }
+        mir.addCondBr(cond, bodyBB, exitBB);
+        mir.beginBlock(bodyBB);
+        MirInstId const iv = loadLimb(ctr);
+        if (!body(iv)) {
+            if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+            sealCreatedAsUnreachable(exitBB);
+            return false;
+        }
+        storeLimb(i64bin(MirOpcode::Add, iv, ci64(1)), ctr);
+        mir.addBr(header);
+        mir.beginBlock(exitBB);
+        return true;
+    }
+
     // dst[i] = a[i] <op> b[i], limb-parallel (& | ^). NO mask — a bitwise op of two
     // clean-N operands yields a clean-N result (the high bits are a uniform function
     // of the two sign/zero fills, i.e. the result's own fill).
@@ -1127,6 +1169,228 @@ struct Lowerer {
         return mir.addInst(cmp, c, boolTy);
     }
 
+    // ══ C23 _BitInt(N>64) — the multi-limb HARD arithmetic (C3, D-CSUBSET-BITINT-C3-
+    // MULDIV): `*` schoolbook via UMulH, `/`·`%` binary long division. Builds ENTIRELY
+    // on the C2 substrate + the small limb helpers below. Sign handling: multiply's low
+    // N bits are two's-complement sign-AGNOSTIC (one path, signedness enters only at the
+    // final maskTopLimb); divide operates on magnitudes with a C99 trunc-toward-zero sign
+    // fixup. Fully agnostic generic MIR — no source/target/format identity. ══
+
+    // dst[i] = 0 for all limbs (a RUNTIME loop — O(1) code at any width; freshAggregate-
+    // Temp allocas are NOT zero-initialized).
+    [[nodiscard]] bool zeroWide(MirInstId dst, std::int64_t limbCount) {
+        return emitLimbLoop(limbCount, [&](MirInstId i) {
+            storeLimb(ci64(0), limbAddrRuntime(dst, i));
+            return true;
+        });
+    }
+    // dst[i] = src[i] for all limbs (limb-wise copy; src/dst distinct).
+    [[nodiscard]] bool copyWide(MirInstId dst, MirInstId src, std::int64_t limbCount) {
+        return emitLimbLoop(limbCount, [&](MirInstId i) {
+            storeLimb(loadLimb(limbAddrRuntime(src, i)), limbAddrRuntime(dst, i));
+            return true;
+        });
+    }
+    // Bit N-1 (the sign bit) of the wide value at `addr`, as an i64 0/1. N-1 is a
+    // COMPILE-TIME position → a const limb index + shift.
+    [[nodiscard]] MirInstId signBitI64(MirInstId addr, TypeId bitIntTy) {
+        std::int64_t const n = interner.bitIntWidth(bitIntTy);
+        MirInstId const top = loadLimb(limbAddrConst(addr, (n - 1) / 64));
+        return i64bin(MirOpcode::And,
+                      i64bin(MirOpcode::LShr, top, ci64((n - 1) % 64)), ci64(1));
+    }
+
+    // dst = `signBit ? (-src mod 2^N) : src`, BRANCHLESS (a 0/~0 select mask). Used for
+    // the divide's operand magnitudes and its result sign-fixup. `emitWideNeg` masks the
+    // scratch to `uType`; the caller re-masks dst to the SIGNED result type afterwards
+    // when it wants sign-extension. src/dst/scratch are distinct slots. `signBit` is an
+    // i64 0/1.
+    [[nodiscard]] bool emitWideCondNeg(MirInstId dst, MirInstId srcAddr,
+                                       MirInstId signBit, TypeId uType) {
+        std::int64_t const limbCount = wideLimbCount(uType);
+        MirInstId const scratch = freshAggregateTemp(uType);
+        if (!scratch.valid()) return false;
+        if (!emitWideNeg(scratch, srcAddr, uType)) return false;   // scratch = -src mod 2^N
+        MirInstId const mask = i64un(MirOpcode::Neg, signBit);      // 0 or ~0
+        MirInstId const notMask = i64un(MirOpcode::Not, mask);
+        return emitLimbLoop(limbCount, [&](MirInstId i) {
+            MirInstId const ni = loadLimb(limbAddrRuntime(scratch, i));
+            MirInstId const si = loadLimb(limbAddrRuntime(srcAddr, i));
+            MirInstId const sel = i64bin(MirOpcode::Or,
+                                         i64bin(MirOpcode::And, ni, mask),
+                                         i64bin(MirOpcode::And, si, notMask));
+            if (!sel.valid()) return false;
+            storeLimb(sel, limbAddrRuntime(dst, i));
+            return true;
+        });
+    }
+
+    // IN-PLACE `slot = (slot << 1) | carryIn0` over `limbCount` limbs (the divide's
+    // per-bit shift, with the next dividend bit injected at position 0). In-place-safe:
+    // each iteration reads then writes ONLY limb i and threads the shifted-out top bit
+    // forward through a scalar carry slot (unlike the cross-limb `emitWideShift`, which
+    // is NOT in-place-safe and masks away the bit that long division must inspect). The
+    // top limb's final carry-out is DROPPED; by the divide's loop invariant (rem <
+    // divisor ≤ 2^N-1 entering each shift), the shifted-out bit is provably 0, so nothing
+    // is lost (the caller then maskTopLimbs the result to the N-bit window).
+    [[nodiscard]] bool emitWideShl1InPlace(MirInstId slot, MirInstId carryIn0,
+                                           std::int64_t limbCount) {
+        MirInstId const carry = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
+        if (!carry.valid()) return false;
+        storeLimb(carryIn0, carry);
+        return emitLimbLoop(limbCount, [&](MirInstId i) {
+            MirInstId const v    = loadLimb(limbAddrRuntime(slot, i));
+            MirInstId const cin  = loadLimb(carry);
+            MirInstId const newv = i64bin(MirOpcode::Or,
+                                          i64bin(MirOpcode::Shl, v, ci64(1)), cin);
+            MirInstId const cout = i64bin(MirOpcode::LShr, v, ci64(63)); // bit leaving limb i
+            if (!newv.valid() || !cout.valid()) return false;
+            storeLimb(newv, limbAddrRuntime(slot, i));
+            storeLimb(cout, carry);
+            return true;
+        });
+    }
+
+    // dst = (a * b) mod 2^N — schoolbook multiply of the LOW `limbCount` limbs via the
+    // 64×64→128 UMulH primitive. The low N bits are two's-complement sign-agnostic, so
+    // this ONE path serves signed AND unsigned; signedness enters only via the final
+    // maskTopLimb. dst must be DISTINCT from a/b (it is a freshAggregateTemp). Products
+    // a[i]*b[j] with i+j >= limbCount contribute only to bits >= limbCount*64 → dropped
+    // (they wrap away mod 2^N); the inner bound is therefore `limbCount - i` (runtime).
+    [[nodiscard]] bool emitWideMul(MirInstId dst, MirInstId aAddr, MirInstId bAddr,
+                                   TypeId bitIntTy) {
+        std::int64_t const limbCount = wideLimbCount(bitIntTy);
+        if (!zeroWide(dst, limbCount)) return false;
+        MirInstId const carry = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
+        if (!carry.valid()) return false;
+        bool const ok = emitLimbLoop(limbCount, [&](MirInstId i) {   // outer: a[i]
+            storeLimb(ci64(0), carry);                               // carry := 0 per i
+            MirInstId const ai = loadLimb(limbAddrRuntime(aAddr, i));
+            MirInstId const innerCount = i64bin(MirOpcode::Sub, ci64(limbCount), i);
+            return emitLimbLoopN(innerCount, [&](MirInstId j) {      // inner: b[j], j<limbCount-i
+                MirInstId const bj = loadLimb(limbAddrRuntime(bAddr, j));
+                MirInstId const lo = i64bin(MirOpcode::Mul,   ai, bj);
+                MirInstId const hi = i64bin(MirOpcode::UMulH, ai, bj);   // high 64 of a[i]*b[j]
+                MirInstId const dAddr = limbAddrRuntime(dst, i64bin(MirOpcode::Add, i, j));
+                MirInstId const dij = loadLimb(dAddr);
+                MirInstId const cin = loadLimb(carry);
+                MirInstId const s1 = i64bin(MirOpcode::Add, dij, lo);
+                MirInstId const c1 = zextCmp(MirOpcode::ICmpUlt, s1, lo);  // s1<lo ⇒ carry
+                MirInstId const s2 = i64bin(MirOpcode::Add, s1, cin);
+                MirInstId const c2 = zextCmp(MirOpcode::ICmpUlt, s2, cin); // s2<cin ⇒ carry
+                // ★ CRIT-A: the column carry-out is `hi + c1 + c2` via INTEGER Add —
+                // NEVER Or(c1,c2). A multiply column can carry out 2 (c1+c2==2); OR would
+                // silently drop 2^64. Fits u64 by the aggregate invariant
+                // dst+a·b+carry ≤ (B-1)+(B-1)²+(B-1) = B²-1 ⟹ new carry ≤ B-1.
+                MirInstId const newCarry =
+                    i64bin(MirOpcode::Add, i64bin(MirOpcode::Add, hi, c1), c2);
+                if (!s2.valid() || !newCarry.valid()) return false;
+                storeLimb(s2, dAddr);
+                storeLimb(newCarry, carry);
+                return true;
+            });
+        });
+        return ok && maskTopLimb(dst, bitIntTy);
+    }
+
+    // dst = a / b (wantRem=false) or a % b (wantRem=true), bit-precise wrap. Binary long
+    // division of the operand MAGNITUDES (unsigned) with a C99 trunc-toward-zero sign
+    // fixup. ★ CRIT-B: every magnitude/rem/quotient temp is driven by an UNSIGNED
+    // `_BitInt(N)` type — the reused helpers bake signedness into their tail (emitWideNeg
+    // sign-extends, emitWideOrder's top-limb compare goes signed), which would corrupt a
+    // magnitude ≥ 2^(N-1); under the unsigned type they are correct and every internal
+    // maskTopLimb stays a no-op. Only the FINAL sign fixup + mask use the SIGNED type.
+    // Div-by-zero → a hard trap (Unreachable ⇒ ud2 / BRK #0), narrow-idiv #DE parity.
+    [[nodiscard]] bool emitWideDivMod(MirInstId dst, MirInstId aAddr, MirInstId bAddr,
+                                      TypeId resultTy, bool wantRem) {
+        std::int64_t const n = interner.bitIntWidth(resultTy);
+        std::int64_t const limbCount = wideLimbCount(resultTy);
+        bool const signd = interner.bitIntIsSigned(resultTy);
+        TypeId const uType = interner.bitInt(n, /*isSigned=*/false);   // CRIT-B
+
+        // ── divide-by-zero → hard trap (narrow idiv #DE / SIGFPE parity) ──
+        MirInstId const isZero = emitBoolFromWide(bAddr, resultTy, /*zeroIsTrue=*/true);
+        if (!isZero.valid()) return false;
+        MirBlockId const trapBB = mir.createBlock(StructCfMarker::IfThen);
+        MirBlockId const okBB   = mir.createBlock(StructCfMarker::IfElse);
+        mir.addCondBr(isZero, trapBB, okBB);
+        mir.beginBlock(trapBB);
+        mir.addUnreachable();   // ud2 (x86_64) / BRK #0 (arm64) — a real hardware fault
+        mir.beginBlock(okBB);
+
+        // ── operand magnitudes (signed: |a|,|b| in unsigned temps; unsigned: direct) ──
+        MirInstId divA = aAddr, divB = bAddr;
+        MirInstId sa = InvalidMirInst, sb = InvalidMirInst;
+        if (signd) {
+            MirInstId const ua = freshAggregateTemp(uType);
+            MirInstId const ub = freshAggregateTemp(uType);
+            if (!ua.valid() || !ub.valid()) return false;
+            sa = signBitI64(aAddr, resultTy);
+            sb = signBitI64(bAddr, resultTy);
+            if (!emitWideCondNeg(ua, aAddr, sa, uType)) return false;   // ua = |a|
+            if (!emitWideCondNeg(ub, bAddr, sb, uType)) return false;   // ub = |b|
+            divA = ua; divB = ub;
+        }
+
+        // ── unsigned binary long division: divA / divB → rem (remainder), uq (quotient) ──
+        MirInstId const rem = freshAggregateTemp(uType);
+        MirInstId const uq  = wantRem ? InvalidMirInst : freshAggregateTemp(uType);
+        if (!rem.valid() || (!wantRem && !uq.valid())) return false;
+        if (!zeroWide(rem, limbCount)) return false;
+        if (!wantRem && !zeroWide(uq, limbCount)) return false;
+        bool const ok = emitLimbLoop(n, [&](MirInstId iv) {   // iv=0..N-1 ; bit k=N-1-iv
+            MirInstId const k     = i64bin(MirOpcode::Sub, ci64(n - 1), iv);
+            MirInstId const kLimb = i64bin(MirOpcode::LShr, k, ci64(6));   // k/64
+            MirInstId const kBit  = i64bin(MirOpcode::And,  k, ci64(63));  // k%64
+            MirInstId const dv    = loadLimb(limbAddrRuntime(divA, kLimb));
+            MirInstId const bitk  = i64bin(MirOpcode::And,
+                                       i64bin(MirOpcode::LShr, dv, kBit), ci64(1));
+            // rem = ((rem << 1) | bitk) mod 2^N.
+            if (!emitWideShl1InPlace(rem, bitk, limbCount)) return false;
+            if (!maskTopLimb(rem, uType)) return false;
+            // doSub = (rem >=u divisor). No captured "overflow bit N" is needed: by the
+            // loop invariant rem < divisor ≤ 2^N-1 entering each shift (a divisor >
+            // 2^(N-1) forces quotient ≤ 1 ⇒ no mid-stream subtract keeps rem small), the
+            // shifted rem is always < 2^N — the shifted-out top bit is provably 0. This is
+            // the design-audit's original sizing, verified exhaustively by the C3
+            // code-audit (a captured bit N fired on 0 of hundreds of thousands of trials).
+            MirInstId const doSub = emitWideOrder(HirOpKind::Ge, rem, divB, uType);
+            if (!doSub.valid()) return false;
+            // ★ N-1: the conditional subtract is a CondBr diamond inside the loop body —
+            // it MUST converge to a SINGLE open block (contBB) before the body returns,
+            // so emitLimbLoop's ctr++/back-edge form off it.
+            MirBlockId const subBB  = mir.createBlock(StructCfMarker::IfThen);
+            MirBlockId const contBB = mir.createBlock(StructCfMarker::IfJoin);
+            mir.addCondBr(doSub, subBB, contBB);
+            mir.beginBlock(subBB);
+            if (!emitWideAddSub(/*isSub=*/true, rem, rem, divB, uType)) {   // rem -= divisor
+                if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                sealCreatedAsUnreachable(contBB);
+                return false;
+            }
+            if (!wantRem) {   // set quotient bit k: uq[kLimb] |= (1 << kBit)
+                MirInstId const qAddr = limbAddrRuntime(uq, kLimb);
+                MirInstId const qbit  = i64bin(MirOpcode::Shl, ci64(1), kBit);
+                storeLimb(i64bin(MirOpcode::Or, loadLimb(qAddr), qbit), qAddr);
+            }
+            mir.addBr(contBB);
+            mir.beginBlock(contBB);
+            return true;
+        });
+        if (!ok) return false;
+
+        // ── select the magnitude, apply the sign, mask to the result type ──
+        MirInstId const mag = wantRem ? rem : uq;
+        if (!signd) {
+            if (!copyWide(dst, mag, limbCount)) return false;
+            return maskTopLimb(dst, resultTy);
+        }
+        // C99 trunc-toward-zero: q takes sign (sa^sb); r takes the DIVIDEND's sign (sa).
+        MirInstId const flip = wantRem ? sa : i64bin(MirOpcode::Xor, sa, sb);
+        if (!emitWideCondNeg(dst, mag, flip, uType)) return false;   // dst = flip ? -mag : mag
+        return maskTopLimb(dst, resultTy);                          // re-mask SIGNED (sign-ext)
+    }
+
     // The plain integer kind a scalar SOURCE projects to (enum→underlying, narrow
     // `_BitInt`→container, else its own kind) — the scalar feeding a wide conversion
     // or a shift count. A WIDE `_BitInt` source is handled separately by the caller
@@ -1177,18 +1441,9 @@ struct Lowerer {
             unsupported(node, "malformed wide _BitInt BinaryOp (expect 2 children)");
             return InvalidMirInst;
         }
-        // C3 boundary (L2): * / % on a wide `_BitInt` is not yet lowered — fail LOUD
-        // HERE (the by-address producer), a positioned unsuppressable diagnostic, never
-        // a silent scalar op.
-        if (op == HirOpKind::Mul || op == HirOpKind::Div || op == HirOpKind::Rem) {
-            diagnoseCode(node, DiagnosticCode::S_BitIntWideMulDivUnsupported, std::format(
-                "the {} operator on a wide _BitInt(N>64) is not supported yet — "
-                "multi-limb multiply / divide / modulo lands in a later cycle (C3); the "
-                "easy ops (+ - & | ^ ~ << >> compare convert) run this cycle",
-                op == HirOpKind::Mul ? "multiply '*'"
-                    : op == HirOpKind::Div ? "divide '/'" : "modulo '%'"));
-            return InvalidMirInst;
-        }
+        // C3 (D-CSUBSET-BITINT-C3-MULDIV): * / % on a wide `_BitInt` now LOWER to the
+        // multi-limb `emitWideMul` / `emitWideDivMod` below — the C2 fail-loud
+        // (S_BitIntWideMulDivUnsupported) is retired for these ops.
         MirInstId const aAddr = lowerLvalueAddress(kids[0]);
         if (!aAddr.valid()) return InvalidMirInst;
         MirInstId const dst = freshAggregateTemp(t);
@@ -1218,6 +1473,12 @@ struct Lowerer {
                     ok = emitWideAddSub(false, dst, aAddr, bAddr, t); break;
                 case HirOpKind::Sub:
                     ok = emitWideAddSub(true,  dst, aAddr, bAddr, t); break;
+                case HirOpKind::Mul:
+                    ok = emitWideMul(dst, aAddr, bAddr, t); break;
+                case HirOpKind::Div:
+                    ok = emitWideDivMod(dst, aAddr, bAddr, t, /*wantRem=*/false); break;
+                case HirOpKind::Rem:
+                    ok = emitWideDivMod(dst, aAddr, bAddr, t, /*wantRem=*/true); break;
                 default:
                     unsupported(node, std::format(
                         "BinaryOp '{}' producing a wide _BitInt is not supported",

@@ -1233,9 +1233,10 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 // D-CSUBSET-BITINT-C2-WIDE: N>64 is now a runnable MULTI-LIMB type
                 // (ceil(N/64) i64 limbs) — the C1 `S_BitIntWidthAboveC1Limit` cycle
                 // gate is RETIRED here. `bitInt(n, ...)` mints any width; the wrap /
-                // storage / ABI / ops for N>64 live in the MIR-lowering tier. The
-                // one still-unimplemented wide operation — `* / %` (C3) — fails loud
-                // at MIR (`S_BitIntWideMulDivUnsupported`), never a silent scalar op.
+                // storage / ABI / ops for N>64 live in the MIR-lowering tier. As of C3
+                // (D-CSUBSET-BITINT-C3-MULDIV) `* / %` also lower (multi-limb multiply
+                // + binary long division); the remaining wide gaps are float<->wide
+                // conversion and wide literals, which fail loud at their own sites.
                 TypeId const result = s.lattice.interner().bitInt(n, isSigned);
                 s.nodeToType.set(node, result);
                 if (bitSpec.v != node.v) s.nodeToType.set(bitSpec, result);

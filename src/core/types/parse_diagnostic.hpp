@@ -809,7 +809,10 @@ enum class DiagnosticCode : std::uint16_t {
     // dedicated positioned diagnostic emitted at the MIR by-address wide-BinaryOp arm
     // (a wide `a*b` result is materialized by address) — NOT a silent scalar op / the
     // incidental i128 ALU wall. UNSUPPRESSABLE — suppressed, the op would reach codegen
-    // with no multi-limb lowering and silently miscompile. Relaxes cleanly in C3.
+    // with no multi-limb lowering and silently miscompile. ★ RETIRED C3 (2026-07-12): wide
+    // `* / %` now LOWER (multi-limb schoolbook mul + long-division) — this code is no longer
+    // emitted; kept append-only (stable-id), pinned unreachable by the flipped
+    // WideBitIntMulDivModLowersAtC3 unit test (asserts nDiag(0xE04F)==0).
     S_BitIntWideMulDivUnsupported = 0xE04F,
     // D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV — conversion between a FLOATING type and a
     // WIDE `_BitInt(N>64)` (`(_BitInt(128))1.5`, `(double)wide`). C2 ships integer<->wide
