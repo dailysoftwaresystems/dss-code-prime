@@ -1230,14 +1230,12 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                           n, kBitIntMaxWidth));
                     return InvalidType;
                 }
-                // D-CSUBSET-BITINT C1 cycle boundary: N>64 is multi-limb (C2/C3).
-                if (n > 64) {
-                    emitWidth(DiagnosticCode::S_BitIntWidthAboveC1Limit,
-                              std::format("`_BitInt({})` exceeds the width supported "
-                                          "this cycle (N<=64); wider bit-precise "
-                                          "integers land in a later cycle", n));
-                    return InvalidType;
-                }
+                // D-CSUBSET-BITINT-C2-WIDE: N>64 is now a runnable MULTI-LIMB type
+                // (ceil(N/64) i64 limbs) — the C1 `S_BitIntWidthAboveC1Limit` cycle
+                // gate is RETIRED here. `bitInt(n, ...)` mints any width; the wrap /
+                // storage / ABI / ops for N>64 live in the MIR-lowering tier. The
+                // one still-unimplemented wide operation — `* / %` (C3) — fails loud
+                // at MIR (`S_BitIntWideMulDivUnsupported`), never a silent scalar op.
                 TypeId const result = s.lattice.interner().bitInt(n, isSigned);
                 s.nodeToType.set(node, result);
                 if (bitSpec.v != node.v) s.nodeToType.set(bitSpec, result);

@@ -392,3 +392,40 @@ TEST(AggregateAbiSysV, VaArgDouble_ClassifiesFpr) {
         << "va_arg(ap,double) must read the SSE (fp_offset) save-area half — NOT "
            "the GPR half (the silent-miscompile this pins)";
 }
+
+// D-CSUBSET-BITINT-C2-WIDE: a RAW wide `_BitInt(N>64)` classifies BY VALUE exactly
+// like a fieldless aggregate of its byte size (collectLeaves emits ONE leaf for the
+// whole width). A wrong classification silently passes the multi-limb value in the
+// wrong registers, so these pin the (kind, piece) truth on all three shipped ABIs.
+TEST(AggregateAbiBitInt, WideBitInt128AndBitInt200AllStrategies) {
+    auto ti = makeInterner(9);
+    TypeId const b128 = ti.bitInt(128, true);   // 16 bytes = two eightbytes
+    TypeId const b200 = ti.bitInt(200, false);  // 32 bytes  > 16
+
+    // SysV: 128b → two INTEGER eightbytes (2 GPRs); 200b → MEMORY (by reference).
+    {
+        auto r = classifySysV(b128, ti);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->kind, AbiPassing::Kind::InRegisters);
+        ASSERT_EQ(r->pieces.size(), 2u);
+        EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Gpr);
+        EXPECT_EQ(r->pieces[1].cls, AbiPieceClass::Gpr);
+        EXPECT_EQ(r->pieces[1].byteOffset, 8u);
+        EXPECT_EQ(classifySysV(b200, ti)->kind, AbiPassing::Kind::ByReference);
+    }
+    // Win64: a 16-byte value is NOT a power-of-two ≤ 8 → by reference; 200b likewise.
+    {
+        EXPECT_EQ(classifyWin64(b128, ti)->kind, AbiPassing::Kind::ByReference);
+        EXPECT_EQ(classifyWin64(b200, ti)->kind, AbiPassing::Kind::ByReference);
+    }
+    // AAPCS64: 128b is a non-HFA ≤16B → two GPRs; 200b >16B → by reference.
+    {
+        auto r = classifyAapcs64(b128, ti);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->kind, AbiPassing::Kind::InRegisters);
+        ASSERT_EQ(r->pieces.size(), 2u);
+        EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Gpr);
+        EXPECT_EQ(r->pieces[1].cls, AbiPieceClass::Gpr);
+        EXPECT_EQ(classifyAapcs64(b200, ti)->kind, AbiPassing::Kind::ByReference);
+    }
+}

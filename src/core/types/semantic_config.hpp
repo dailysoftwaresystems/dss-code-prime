@@ -1319,9 +1319,10 @@ struct DSS_EXPORT SemanticConfig {
     // the C 6.7.2 signedness keywords the resolveTypeNodeImpl bitInt arm scans for
     // among a specifier RUN's sibling tokens (a `_BitInt` inside a `typeSpecifierSeq`
     // composes with `unsigned`/`signed`, order-independently; DEFAULT signed when
-    // neither is present). The arm const-folds + validates N (S_BitIntWidthNot*
-    // 0xE04A–0xE04D + the C1 N>64 gate S_BitIntWidthAboveC1Limit) and interns
-    // `bitInt(N, signed)`. Invalid `bitIntSpecRule` ⇒ the language has no _BitInt
+    // neither is present). The arm const-folds + validates N (the S_BitIntWidthNot*
+    // width gates 0xE04A–0xE04D) and interns `bitInt(N, signed)` for ANY valid width —
+    // N>64 is a runnable multi-limb type (the C1 `S_BitIntWidthAboveC1Limit` N>64 gate
+    // is RETIRED in C2). Invalid `bitIntSpecRule` ⇒ the language has no _BitInt
     // surface (the arm never fires). Source-AGNOSTIC: nothing hardcodes "_BitInt".
     RuleId        bitIntSpecRule{};   std::string bitIntSpecRuleName;
     std::uint32_t bitIntWidthChild = 0;

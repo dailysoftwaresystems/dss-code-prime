@@ -319,6 +319,38 @@ sizeOfScalarOrBitInt(TypeInterner const& interner, TypeId id, DataModel dm) noex
     return ((bits + 63) / 64) * 8;
 }
 
+bool isWideBitInt(TypeInterner const& interner, TypeId id) noexcept {
+    return id.valid() && interner.kind(id) == TypeKind::BitInt
+        && interner.bitIntWidth(id) > 64;
+}
+
+bool isMemoryResidentType(TypeInterner const& interner, TypeId id) noexcept {
+    if (!id.valid()) return false;
+    switch (interner.kind(id)) {
+        case TypeKind::Struct:
+        case TypeKind::Union:
+        case TypeKind::Array:
+            return true;
+        case TypeKind::BitInt:
+            return interner.bitIntWidth(id) > 64;   // wide _BitInt is multi-limb
+        default:
+            return false;
+    }
+}
+
+bool isByValueClass(TypeInterner const& interner, TypeId id) noexcept {
+    if (!id.valid()) return false;
+    switch (interner.kind(id)) {
+        case TypeKind::Struct:
+        case TypeKind::Union:
+            return true;
+        case TypeKind::BitInt:
+            return interner.bitIntWidth(id) > 64;   // ARRAY excluded (it decays)
+        default:
+            return false;
+    }
+}
+
 std::optional<StructLayout>
 computeLayout(TypeId id, TypeInterner const& interner,
               AggregateLayoutParams params, DataModel dm) {

@@ -797,13 +797,30 @@ enum class DiagnosticCode : std::uint16_t {
     // (8388608). The width exceeds the implementation's maximum bit-precise width.
     // UNSUPPRESSABLE — an over-max width is a hard constraint violation.
     S_BitIntWidthExceedsMax = 0xE04D,
-    // D-CSUBSET-BITINT — the C1 cycle boundary: `_BitInt(N)` with N > 64. C1 ships
-    // the single-native-container implementation (N≤64, masked); N>64 is multi-limb
-    // storage/arithmetic, landed in C2/C3. A dedicated diagnostic (NOT the incidental
-    // i128 ALU wall — N>64 is multi-limb MEMORY in C2, never an i128 scalar) so the
-    // boundary is explicit and RELAXES cleanly in C2. UNSUPPRESSABLE — suppressed,
-    // the type would reach codegen with no multi-limb lowering and silently miscompile.
+    // D-CSUBSET-BITINT — the C1 cycle boundary: `_BitInt(N)` with N > 64. RETIRED in
+    // C2 (N>64 is now a runnable multi-limb type — the semantic gate no longer emits
+    // this). The code + its span slot are KEPT (never renumber — the append-only
+    // discipline; still on the unsuppressable list) so every historical 0xE04E golden
+    // stays stable; no live site references it after the C2 gate relaxation.
     S_BitIntWidthAboveC1Limit = 0xE04E,
+    // D-CSUBSET-BITINT-C2-WIDE — the C3 cycle boundary: `* / %` on a WIDE `_BitInt(N>64)`.
+    // C2 ships the multi-limb storage + the EASY ops (+ - & | ^ ~ << >> compare convert);
+    // wide MULTIPLY / DIVIDE / MODULO (schoolbook UMulH / long-division) land in C3. A
+    // dedicated positioned diagnostic emitted at the MIR by-address wide-BinaryOp arm
+    // (a wide `a*b` result is materialized by address) — NOT a silent scalar op / the
+    // incidental i128 ALU wall. UNSUPPRESSABLE — suppressed, the op would reach codegen
+    // with no multi-limb lowering and silently miscompile. Relaxes cleanly in C3.
+    S_BitIntWideMulDivUnsupported = 0xE04F,
+    // D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV — conversion between a FLOATING type and a
+    // WIDE `_BitInt(N>64)` (`(_BitInt(128))1.5`, `(double)wide`). C2 ships integer<->wide
+    // and wide<->wide; a correct multi-limb float<->wide conversion (the full FP
+    // significand<->limbs path) is genuinely hard and lands in a later cycle. The naive
+    // scalar path keys signedness off the source and touches only limb 0 — wrong sign,
+    // wrong value, dropped upper limbs — so a wide float conversion FAILS LOUD at the MIR
+    // cast site (materializeWideCast for a wide TARGET, combineCast's wide-SOURCE arm for
+    // a wide SOURCE) rather than silently miscompiling. NARROW (N<=64) float<->`_BitInt`
+    // is unaffected (it rides the native container, C1). UNSUPPRESSABLE.
+    S_BitIntWideFloatConvUnsupported = 0xE050,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

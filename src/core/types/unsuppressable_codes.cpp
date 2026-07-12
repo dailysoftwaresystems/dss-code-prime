@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 110> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 112> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -461,6 +461,15 @@ constexpr std::array<DiagnosticCode, 110> kUnsuppressableCodes{{
     DiagnosticCode::S_BitIntSignedWidthTooSmall,
     DiagnosticCode::S_BitIntWidthExceedsMax,
     DiagnosticCode::S_BitIntWidthAboveC1Limit,
+    // D-CSUBSET-BITINT-C2-WIDE (C3 boundary): `* / %` on a wide `_BitInt(N>64)` — the
+    // still-unimplemented multi-limb op. UNSUPPRESSABLE: suppressed, a wide multiply/
+    // divide would reach codegen with no lowering and silently miscompile.
+    DiagnosticCode::S_BitIntWideMulDivUnsupported,
+    // D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV: float<->wide `_BitInt(N>64)` conversion —
+    // deferred (a correct multi-limb FP<->limbs path is a later cycle). UNSUPPRESSABLE:
+    // suppressed, the naive scalar path emits the wrong sign + drops the upper limbs
+    // (a wide `(_BitInt(128))1.5` / `(double)wide`) and silently miscompiles.
+    DiagnosticCode::S_BitIntWideFloatConvUnsupported,
     // S_UnknownAttribute / S_DeprecatedSymbolUsed / S_NodiscardResultDiscarded
     // (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13) are deliberately NOT
     // members — the same suppressible posture as S_UnknownTypeAttribute above.

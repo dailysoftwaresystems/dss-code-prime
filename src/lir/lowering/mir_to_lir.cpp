@@ -1300,9 +1300,11 @@ struct Lowerer {
         // consumer (`widthFlagsForType`, `memAccessWidthFlags`, and via them
         // `registerOpWidthFlags`) see a NATIVE kind for a `_BitInt` value, so a
         // `_BitInt(4)` stores/loads byte-exact and register-plumbs promoted-to-32
-        // (the char/short story). N>64 cannot reach here — the C1 semantic gate
-        // rejects it before MIR — so `bitIntContainerKind`'s Void sentinel never
-        // surfaces. `reprKind` is identity for every non-enum/non-BitInt kind.
+        // (the char/short story). N>64 (D-CSUBSET-BITINT-C2-WIDE) cannot reach here:
+        // a wide `_BitInt` is MULTI-LIMB memory — every value the LIR tier sees is an
+        // i64 LIMB or a pointer, never the whole wide type as a scalar. If a wide value
+        // leaked to the scalar path, `bitIntContainerKind` FAILS LOUD (M1) rather than
+        // returning a garbage width. `reprKind` is identity for every other kind.
         if (k == TypeKind::BitInt) return interner.bitIntContainerKind(ty);
         return k;
     }

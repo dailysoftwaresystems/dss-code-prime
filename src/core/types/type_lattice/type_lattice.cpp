@@ -603,13 +603,20 @@ TypeKind TypeInterner::bitIntContainerKind(TypeId id) const {
         latticeFatal("bitIntContainerKind: TypeId is not a BitInt");
     std::int64_t const n = bitIntWidth(id);
     bool const s = bitIntIsSigned(id);
-    // Smallest native integer container holding N bits (N>64 → Void = fail-loud
-    // sentinel; the C1 semantic gate rejects N>64 before any width consumer runs).
+    // Smallest native integer container holding N bits.
     if (n <= 8)  return s ? TypeKind::I8  : TypeKind::U8;
     if (n <= 16) return s ? TypeKind::I16 : TypeKind::U16;
     if (n <= 32) return s ? TypeKind::I32 : TypeKind::U32;
     if (n <= 64) return s ? TypeKind::I64 : TypeKind::U64;
-    return TypeKind::Void;
+    // D-CSUBSET-BITINT-C2-WIDE (M1): N>64 has NO single native container — it is a
+    // MULTI-LIMB memory value. A "container kind" query for a wide `_BitInt` is a
+    // scalar-path LEAK: every wide consumer works on i64 LIMBS (never the whole type as
+    // a scalar), so reaching here means a wide value slipped into the scalar path. FAIL
+    // LOUD (a crash), never the old silent `Void` sentinel that would flow to codegen
+    // as a garbage-width op. The C2 by-address diverts keep this unreachable for wide.
+    latticeFatal("bitIntContainerKind: _BitInt(N>64) has no native container — a wide "
+                 "_BitInt is multi-limb (memory), reached by ADDRESS, never as a scalar "
+                 "value; this query is a scalar-path leak (D-CSUBSET-BITINT-C2-WIDE)");
 }
 
 TypeId TypeInterner::fnSig(std::span<TypeId const> params, TypeId result, CallConv cc) {

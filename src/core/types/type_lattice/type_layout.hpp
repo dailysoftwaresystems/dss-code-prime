@@ -83,6 +83,32 @@ scalarByteSize(TypeKind kind, DataModel dm) noexcept;
 [[nodiscard]] DSS_EXPORT std::optional<std::uint64_t>
 sizeOfScalarOrBitInt(TypeInterner const& interner, TypeId id, DataModel dm) noexcept;
 
+// C23 _BitInt(N) (D-CSUBSET-BITINT-C2-WIDE): a `_BitInt(N)` whose width EXCEEDS 64
+// bits — a C2 MULTI-LIMB value (ceil(N/64) little-endian i64 limbs). A pure
+// type-shape query (no target/format/arch identity): `true` iff `id` is a BitInt
+// with width > 64. A `_BitInt(N≤64)` stays a single native container (C1) — false.
+[[nodiscard]] DSS_EXPORT bool
+isWideBitInt(TypeInterner const& interner, TypeId id) noexcept;
+
+// C23 _BitInt(N>64) (D-CSUBSET-BITINT-C2-WIDE): the by-construction STORAGE/GUARD
+// predicate. A wide `_BitInt` is MEMORY-RESIDENT — like an aggregate it has NO SSA
+// register value and is always reached by ADDRESS. `true` for Struct/Union/Array
+// AND a wide `_BitInt(N>64)`. The alloca-sizing site + the anti-resurrection guards
+// (an aggregate/wide-BitInt reaching a bare-SSA position) funnel through here so
+// coverage is BY CONSTRUCTION (§A.5), not by enumerating edits. A pure type-shape
+// query — no target/format/language identity (the agnostic bar).
+[[nodiscard]] DSS_EXPORT bool
+isMemoryResidentType(TypeInterner const& interner, TypeId id) noexcept;
+
+// C23 _BitInt(N>64) (D-CSUBSET-BITINT-C2-WIDE): the by-VALUE-CLASS twin of
+// `isMemoryResidentType` with ARRAY EXCLUDED — `true` for Struct/Union AND a wide
+// `_BitInt(N>64)`, but NOT Array (an array is never passed / returned / copy-
+// assigned BY VALUE in C — it decays to a pointer). The calling-convention gates
+// (call arg/return, param reception, ReturnStmt, the call-consumer arm) + the
+// aggregate copy-init/assign sites funnel here. A pure type-shape query.
+[[nodiscard]] DSS_EXPORT bool
+isByValueClass(TypeInterner const& interner, TypeId id) noexcept;
+
 // Compute the full layout of a COMPLETE type. Recursive (nested aggregates) and
 // PURE (no caching — the caller memoizes via `TypeLayoutTable`). Returns nullopt
 // — the fail-loud signal, never a guessed size — when the type is INCOMPLETE

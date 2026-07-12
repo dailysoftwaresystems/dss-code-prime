@@ -8387,3 +8387,106 @@ TEST(MirLoweringCSubset, SehInsideLoopStaysVerifierGreen) {
     EXPECT_TRUE(result.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
 }
+
+// D-CSUBSET-BITINT-C2-WIDE: the C3 boundary — `* / %` on a wide `_BitInt(N>64)` is not
+// yet lowered; each fails LOUD at MIR with the dedicated unsuppressable
+// S_BitIntWideMulDivUnsupported (0xE04F), never a silent scalar op. The op TYPE-checks
+// (a wide `a*b` is a valid expression) — only the multi-limb CODEGEN defers. RED-ON-
+// DISABLE: drop the diagnoseCode in materializeWideBinaryOp and a wide `*` silently
+// truncates to its low limb (mir.ok flips true with no diagnostic).
+TEST(MirLoweringCSubset, WideBitIntMulDivModFailLoudAtC3Boundary) {
+    for (char const* op : {"*", "/", "%"}) {
+        std::string const src =
+            std::string("int main(void){ _BitInt(200) a = 3, b = 5;\n"
+                        "  _BitInt(200) c = a ") + op + " b;\n"
+            "  return (int)c; }\n";
+        auto L = lowerCSubset(src);
+        ASSERT_FALSE(L.model.hasErrors()) << src;   // it type-checks; only codegen defers
+        ASSERT_TRUE(L.hir->ok) << src;
+        EXPECT_FALSE(L.mir.ok) << src
+            << "\na wide _BitInt '" << op << "' must fail loud at the C3 boundary";
+        std::size_t n = 0;
+        for (auto const& d : L.mirReporter.all())
+            if (d.code == DiagnosticCode::S_BitIntWideMulDivUnsupported) ++n;
+        EXPECT_EQ(n, 1u) << src
+            << "\nexactly one S_BitIntWideMulDivUnsupported (0xE04F)";
+    }
+}
+
+// D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV: a conversion between a FLOATING type and a wide
+// `_BitInt(N>64)` is not yet supported (the multi-limb FP<->limbs path is a later cycle);
+// EACH direction fails LOUD at the MIR cast site with the dedicated unsuppressable
+// S_BitIntWideFloatConvUnsupported (0xE050), never a silent scalar path. The naive path
+// keys signedness off the source + touches only limb 0 (wrong sign, wrong value, dropped
+// upper limbs). RED-ON-DISABLE: drop the guard in materializeWideCast (wide TARGET) or
+// combineCast's wide-SOURCE arm and a wide `(_BitInt(128))f` / `(double)wide` silently
+// miscompiles (mir.ok flips true with no diagnostic). NARROW (N<=64) float<->_BitInt is
+// unaffected — it rides the native container (asserted green just below).
+TEST(MirLoweringCSubset, WideBitIntFloatConversionFailsLoud) {
+    struct Case { char const* src; char const* what; };
+    Case const cases[] = {
+        {"int main(void){ double f = 1.5; _BitInt(128) a = (_BitInt(128))f;\n"
+         "  return (int)a; }\n",                         "float -> wide _BitInt"},
+        {"int main(void){ _BitInt(128) x = 3; double d = (double)x;\n"
+         "  return (int)d; }\n",                         "wide _BitInt -> float"},
+    };
+    for (auto const& c : cases) {
+        auto L = lowerCSubset(c.src);
+        ASSERT_FALSE(L.model.hasErrors()) << c.what << ": " << c.src;  // it type-checks
+        ASSERT_TRUE(L.hir->ok) << c.what << ": " << c.src;
+        EXPECT_FALSE(L.mir.ok) << c.what << ": " << c.src
+            << "\na float<->wide _BitInt conversion must fail loud at the MIR cast site";
+        std::size_t n = 0;
+        for (auto const& d : L.mirReporter.all())
+            if (d.code == DiagnosticCode::S_BitIntWideFloatConvUnsupported) ++n;
+        EXPECT_EQ(n, 1u) << c.what << ": " << c.src
+            << "\nexactly one S_BitIntWideFloatConvUnsupported (0xE050)";
+    }
+}
+
+// D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV: the NARROW (N<=64) float<->_BitInt conversions
+// are UNAFFECTED by the wide fail-loud — they ride the native container (C1) and lower
+// CLEANLY. Pins that the wide guard is scoped to N>64 only (never a regression on C1).
+TEST(MirLoweringCSubset, NarrowBitIntFloatConversionLowersGreen) {
+    for (char const* src : {
+        "int main(void){ double f = 1.5; _BitInt(40) a = (_BitInt(40))f;\n"
+        "  return (int)a; }\n",
+        "int main(void){ _BitInt(40) x = 3; double d = (double)x;\n"
+        "  return (int)d; }\n"}) {
+        auto L = lowerCSubset(src);
+        ASSERT_FALSE(L.model.hasErrors()) << src;
+        ASSERT_TRUE(L.hir->ok) << src;
+        EXPECT_TRUE(L.mir.ok) << src
+            << "\nnarrow (N<=64) float<->_BitInt must lower green (C1 container path)"
+            << "\n" << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    }
+}
+
+// D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt(N>64)` local + the EASY ops lower CLEANLY
+// (the C1 N>64 semantic gate is retired). Pins add/sub/and/or/xor/shift/compare +
+// int<->wide conversions + a BY-VALUE wide arg+return + a wide TERNARY all reaching
+// MIR green — the anti-resurrection guards admit a wide `_BitInt` by construction.
+TEST(MirLoweringCSubset, WideBitIntEasyOpsLowerGreen) {
+    auto L = lowerCSubset(
+        "_BitInt(200) triple(_BitInt(200) x){ return x + x + x; }\n"
+        "int main(void){\n"
+        "  _BitInt(200) a = 10, b = 3;\n"
+        "  _BitInt(200) s = a + b;\n"
+        "  _BitInt(200) d = a - b;\n"
+        "  unsigned _BitInt(200) u = 12, v = 10;\n"
+        "  unsigned _BitInt(200) w = (u & v) | (u ^ v);\n"
+        "  unsigned _BitInt(200) sh = u << 65;\n"
+        "  _BitInt(200) t = (a < b) ? a : triple(b);\n"
+        "  a += b; a -= 1; a <<= 2;\n"   // compound-assign desugars to the wide ops
+        "  _BitInt(200) c = 4; c++; ++c; c--;\n"  // ++/-- synth a wide _BitInt(200) `1`
+        "  int r = (int)s + (int)d + (int)w + (int)sh + (int)t + (int)a + (int)c\n"
+        "        + (a == b);\n"
+        "  return r;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    EXPECT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+}
