@@ -3773,13 +3773,24 @@ struct Lowerer {
         return sc.empty() ? t : interner.primitive(static_cast<TypeKind>(sc[0]));
     }
 
+    // D-CSUBSET-BITINT-BITFIELD: a `_BitInt(N<=64)` bit-field's allocation unit runs
+    // at its native container (I8/U8..I64/U64 by width+signedness), the same
+    // Enum→underlying trick (the reprKind precedent). Resolving here means
+    // bitfieldIsSigned / the shift-mask constants / mapCast all see a plain primitive,
+    // never BitInt. Wide (N>64) BitInt bit-fields are rejected at the semantic tier
+    // (the >64 allocation-unit cap) and never reach codegen.
+    [[nodiscard]] TypeId bitIntReprType(TypeId t) {
+        if (!t.valid() || interner.kind(t) != TypeKind::BitInt) return t;
+        return interner.primitive(interner.bitIntContainerKind(t));
+    }
+
     // FC8 D-CSUBSET-BITFIELD: extract a bit-field value from a loaded allocation
     // unit. Unsigned: `(unit >> bitOffset) & ((1<<W)-1)`. Signed: sign-extend via
     // `(unit << (B - bitOffset - W)) >>arith (B - W)` (B = unit bits). All ops are
     // computed at the field's (unit) type — reuses the existing MIR shift/and ops.
     [[nodiscard]] MirInstId
     emitBitfieldExtract(MirInstId unitVal, BitFieldPlacement const& p, TypeId fieldTy) {
-        fieldTy = enumReprType(fieldTy);   // enum bit-field → underlying integer
+        fieldTy = bitIntReprType(enumReprType(fieldTy));   // enum/BitInt → container
         std::uint32_t const B0 = p.unitBytes * 8;
         // c73 (D-CSUBSET-32BIT-ALU-FORMS): a SUB-INT (u8/u16/i8/i16/char) allocation
         // UNIT makes the shift/mask/and ops sub-int-width, which walls at the
@@ -3843,7 +3854,7 @@ struct Lowerer {
         // `volatile`, BOTH halves of the read-modify-write (the unit Load below
         // and the unit Store at the end) carry the flag — the whole RMW is one
         // volatile access of the unit, never elided/reordered.
-        fieldTy = enumReprType(fieldTy);   // enum bit-field → underlying integer
+        fieldTy = bitIntReprType(enumReprType(fieldTy));   // enum/BitInt → container
         // c73 (D-CSUBSET-32BIT-ALU-FORMS): mirror emitBitfieldExtract — a SUB-INT
         // unit computes the read-modify-write at the promoted int width, then
         // Truncs the merged unit back to the field type for the Store. A native

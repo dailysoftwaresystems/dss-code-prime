@@ -2370,7 +2370,15 @@ resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& d
             default:                                  return 0;
         }
     };
-    std::uint32_t const typeBits = intBits(k);
+    // D-CSUBSET-BITINT-BITFIELD (C23 6.7.2.1): a `_BitInt(N)` bit-field's base
+    // bit-size is N (reprType is the BitInt itself — enumUnderlyingOrSelf passes a
+    // non-enum through). The >64 cap below then excludes wide (N>64) BitInt
+    // bit-fields for free (same as I128/U128 — no >64 allocation-unit codegen), and
+    // the `M <= typeBits` check enforces M <= N with no extra code.
+    std::uint32_t const typeBits =
+        (k == TypeKind::BitInt)
+            ? static_cast<std::uint32_t>(s.lattice.interner().bitIntWidth(reprType))
+            : intBits(k);
     if (typeBits == 0) { emit(DiagnosticCode::S_BitFieldNonIntegerType); return out; }
     // A bit-field on a >32-bit base (`long`/`long long`/I64/U64) needs a 64-bit
     // allocation-unit access. D-CSUBSET-BITFIELD-WIDE-UNIT (v0.0.2 FC8) closed the
