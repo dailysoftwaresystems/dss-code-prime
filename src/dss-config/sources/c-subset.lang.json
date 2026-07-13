@@ -1565,7 +1565,7 @@
         "dereferences": true,  "operatorToken": "ArrowOp" }
     ],
     "$scopesComment": "FC4 c1: topLevelDecl replaced funcDefTail — a function's params now live INSIDE its declarator's fnSuffix, so the scope that holds them must dominate BOTH the declarator and the block; the topLevelDecl node is that dominator (harmless for variable-kind topLevelDecls — nothing binds into the scope). c25: the unified `structSpec`/`unionSpec`/`enumSpec` rules are the fieldChildren composites (they REPLACE the retired *SpecifierBody rules). Each opens a scope ONLY in DEFINITION mode (body present) — Pass 1 gates the pushScope on the `definesWhenChild` body-child presence, so a body-absent tag reference (`struct S v;`) opens no scope. The member-body wrapper rules (structBody/unionBody/enumBody) are deliberately NOT scope rules — their fields bind into the enclosing XxxSpec scope.",
-    "scopes": [ "block", "topLevelDecl",
+    "scopes": [ "block", "forStmt", "topLevelDecl",
                 "structSpec", "unionSpec", "enumSpec" ],
     "assignments": [
       { "rule": "binaryExpr", "operatorToken": "AssignOp",       "lhs": 0, "rhs": 2 },

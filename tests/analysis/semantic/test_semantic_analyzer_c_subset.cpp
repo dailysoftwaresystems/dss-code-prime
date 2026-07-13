@@ -2466,6 +2466,44 @@ TEST(SemanticAnalyzerCSubset, CompoundShlAssignToConstEmitsConstViolation) {
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u);
 }
 
+// D-CSUBSET-FOR-INIT-SCOPE (C99 6.8.5.3): each `for`-statement's init clause has its
+// OWN scope, so two SIBLING `for (int i = ...)` loops in one block re-declaring the same
+// loop name are BOTH valid — the second `i` is a distinct object in a distinct scope,
+// not a redeclaration of the first. Before the fix (`forStmt` absent from the config
+// `scopes` list) the for-init leaked into the enclosing block, so the second `for(int i)`
+// mis-resolved: its uses reported undeclared AND its decl reported unused. Red-on-disable:
+// revert the `scopes` add and BOTH diagnostics fire on the second loop.
+TEST(SemanticAnalyzerCSubset, SiblingForInitSameNameHaveDistinctScopes) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){\n"
+        "  int s = 0;\n"
+        "  for (int i = 0; i < 2; i++) s = s + i;\n"
+        "  for (int i = 0; i < 2; i++) s = s + i;\n"   // same name — a distinct for-scope
+        "  return s;\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "the second for(int i)'s uses must resolve to its own for-scoped i";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u)
+        << "the second for(int i)'s decl must not be orphaned as unused";
+}
+
+// D-CSUBSET-FOR-INIT-SCOPE control: the for-init variable is OUT of scope AFTER the
+// for-statement (it is a real for-scope, not a leak into the enclosing block). Using `i`
+// after the loop must fail loud (S_UndeclaredIdentifier) — this is what proves the fix is
+// a correct scope, and it stays a fail-loud reject, never a silent resolve to a stale i.
+TEST(SemanticAnalyzerCSubset, ForInitVariableOutOfScopeAfterForRejects) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ for (int i = 0; i < 2; i++) {} return i; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
+        << "`i` is scoped to the for-statement — a use after the loop must fail loud";
+}
+
 // D2: a NON-const variable compound-assigned (`y <<= 2;`) → zero
 // S_ConstViolation. Proves the compound-assign entries gate on const-ness,
 // not on the operator alone.
