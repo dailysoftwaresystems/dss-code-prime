@@ -9,6 +9,7 @@
 #include "lir/lir_reg.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <variant>
 #include <vector>
 
@@ -125,6 +126,16 @@ struct DSS_EXPORT LirFuncAllocation {
     // every function's allocation here unless callers also re-pin by
     // name.
     std::uint16_t                 callingConventionIndex = 0;
+
+    // D-CSUBSET-VLA (C1b): the register-table ordinal of the frame pointer this
+    // function RESERVES as its fixed-frame base (set iff the function contains a VLA
+    // `sub_sp_reg`). Held out of the allocatable pool (`buildFreeLists`) AND the
+    // rewriter's spill-reload SCRATCH pool (`pickScratchRegs`) — both consult the
+    // cc's allocatable set, which still lists rbp/x29 (they are ordinary callee-
+    // saved GPRs for a NON-VLA function). Without excluding it from the scratch pool
+    // too, the rewriter would harvest the reserved-but-unassigned frame pointer as a
+    // spill scratch and clobber the frame base. std::nullopt for a non-VLA function.
+    std::optional<std::uint16_t>  reservedFramePointer;
 
     // Find the assignment for the given vreg id, or nullptr if none.
     [[nodiscard]] LirRegAssignment const*

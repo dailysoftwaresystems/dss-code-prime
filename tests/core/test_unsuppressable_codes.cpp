@@ -170,6 +170,7 @@ TEST(UnsuppressableCodes, ThreadLocalRejectsAreUnsuppressable) {
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_VlaSizeNotInteger));
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::I_VlaAllocaOperandInvalid));
     EXPECT_TRUE(isUnsuppressable(DiagnosticCode::L_VlaDynamicAllocaUnsupported));
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::L_VlaNonLeafFrameUnsupported));
 }
 
 TEST(UnsuppressableCodes, ListSelfConsistent) {

@@ -386,6 +386,52 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-VLA (C1b): `sub_sp_reg sp, <sizeReg>` — subtract a RUNTIME byte count (in a register) from the stack pointer (the dynamic-alloca core, `int a[n]` => `sub sp, alignUp(n*4,16)`). ★ THE XZR-VS-SP TRAP: a shifted-register SUB (0xCB000000) encodes reg 31 as XZR, so `sub sp, sp, Xm` there would compute `sp - 0` and SILENTLY discard the size. The CORRECT form is the EXTENDED-register SUB (option=011 UXTX, bit 21 set), where reg 31 in Rd/Rn IS the stack pointer: fixedWord 0xCB2063FF (= the 0xCB3063FF precedent baked into the >16MiB sp-adjust macro, with Rm CLEARED to 0). Rd=Rn=sp=31 are BAKED; operand1(size) wires into Rm (bits 16..20). operand0(sp) wires into Rn (bits 5..9) — sp's hwEncoding IS 31, so this is IDEMPOTENT with the baked Rn=31 (the per-position wire check requires every operand wired). Sanity: 0xCB2063FF | (16<<16) == 0xCB3063FF (the `SUB sp,sp,x16` word). result:none (SP mutates in place); hasSideEffects=true so no pass drops/reorders it vs the sp_copy that captures the moved SP. Emitted by MIR->LIR with the physical stack-pointer operand; callconv passes it through.",
+      "mnemonic":      "sub_sp_reg",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 3407897599 },
+            "wires":      [
+              { "index": 0, "slotKind": "rn" },
+              { "index": 1, "slotKind": "rm" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-VLA (C1b): `sp_copy dst, src` = `add dst, src, #0` (the ADD-IMMEDIATE form, fixedWord 0x91000000, imm12=0 baked) — used for the three frame-pointer plumbing roles a VLA function needs: prologue FP<-SP, epilogue SP<-FP, and the VLA-base capture base<-SP. ★ Like sub_sp_reg this uses the SP-capable form: the add-immediate encoding treats reg 31 as the STACK POINTER (not XZR), so `add sp, x29, #0` / `add x29, sp, #0` / `add base, sp, #0` all move the real SP — a register-register ORR (`mov`, where reg 31 = XZR) would read/write XZR instead. resultSlot rd = dst; operand0=src -> rn. A DISTINCT mnemonic from `add`/`mov` so it can be hasSideEffects=true (reads/writes the physical SP; no pass may drop or reorder it across the sub_sp_reg).",
+      "mnemonic":      "sp_copy",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 2432696320 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "MUL Xd, Xn, Xm = MADD Xd, Xn, Xm, XZR. Base = 0x9B000000 | (XZR=31 << 10) = 0x9B007C00. Slots: Rd, Rn, Rm (Ra=XZR baked into fixedWord).",
       "mnemonic":      "mul",
       "result":        "value",
@@ -2116,6 +2162,8 @@
                            "d8","d9","d10","d11","d12","d13","d14","d15"],
       "linkRegister":     "x30",
       "stackPointer":     "sp",
+      "$framePointerComment": "D-CSUBSET-VLA (C1b): x29 is the AAPCS64 frame-pointer register a VLA function reserves as a stable fixed-frame base (captured at the fixed-frame bottom via `sp_copy`, then every fixed-frame ref switches SP->x29 so it survives the runtime `sub sp,<vlaSize>`). A NON-VLA function never reserves it — x29 stays an ordinary callee-saved allocatable GPR (byte-identical frames). Consumed by lir_regalloc (pool exclusion) + lir_callconv (force-save + prologue capture + epilogue restore).",
+      "framePointer":     "x29",
       "stackAlignment":   16,
       "shadowSpaceBytes": 0,
       "redZoneBytes":     0,
@@ -2159,6 +2207,8 @@
                            "d8","d9","d10","d11","d12","d13","d14","d15"],
       "linkRegister":     "x30",
       "stackPointer":     "sp",
+      "$framePointerComment": "D-CSUBSET-VLA (C1b): x29 is the AAPCS64 frame-pointer register a VLA function reserves as a stable fixed-frame base (captured at the fixed-frame bottom via `sp_copy`, then every fixed-frame ref switches SP->x29 so it survives the runtime `sub sp,<vlaSize>`). A NON-VLA function never reserves it — x29 stays an ordinary callee-saved allocatable GPR (byte-identical frames). Consumed by lir_regalloc (pool exclusion) + lir_callconv (force-save + prologue capture + epilogue restore).",
+      "framePointer":     "x29",
       "stackAlignment":   16,
       "shadowSpaceBytes": 0,
       "redZoneBytes":     0,

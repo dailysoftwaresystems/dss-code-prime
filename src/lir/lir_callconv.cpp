@@ -449,6 +449,30 @@ functionUsesVaStart(Lir const& src, LirFuncId fn,
     return false;
 }
 
+// D-CSUBSET-VLA (C1b): does function `fn` contain a variable-length array — i.e.
+// a `sub_sp_reg` op (the dynamic-stack descent MIR->LIR emits for `int a[n]`)?
+// This is the callconv "has-VLA" signal: a true answer switches the function to
+// the conditional frame-pointer frame model (reserve + save the frame pointer,
+// capture it at the fixed-frame bottom, and address every fixed-frame ref off it
+// so the fixed frame survives the runtime SP move). `subSpRegOp == 0` (a target
+// without the VLA substrate) never matches → false uniformly. The SAME opcode-
+// match predicate shape as `functionHasCalls`/`functionUsesVaStart`; the regalloc
+// pass runs the identical scan (`functionContainsOpcode`) so the two agree on
+// which functions reserve the frame pointer.
+[[nodiscard]] bool
+functionHasVla(Lir const& src, LirFuncId fn, std::uint16_t subSpRegOp) noexcept {
+    if (subSpRegOp == 0) return false;
+    std::uint32_t const blockCount = src.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+        LirBlockId const blk = src.funcBlockAt(fn, bi);
+        std::uint32_t const instN = src.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < instN; ++i) {
+            if (src.instOpcode(src.blockInstAt(blk, i)) == subSpRegOp) return true;
+        }
+    }
+    return false;
+}
+
 // D-CSUBSET-LOCAL-INT-CODEGEN (step 13.3b, 2026-06-02): count the
 // `alloca` virtual ops in `fn`. Each becomes one local-area frame
 // slot of `slotSize` bytes; the materialize pass rewrites it to
@@ -703,6 +727,17 @@ void emitSpAdjust(LirBuilder& b, std::uint16_t op, LirReg sp,
     b.addInst(op, sp, ops);
 }
 
+// D-CSUBSET-VLA (C1b): emit `sp_copy dst, src` — the SP register move the
+// conditional frame-pointer model uses for its three roles: prologue FP<-SP
+// (capture the fixed-frame base), epilogue SP<-FP (discard the VLA + restore SP to
+// the fixed-frame base), and (at MIR->LIR) the VLA-base capture base<-SP. `dst` is
+// the result, `src` the single source operand. The op is hasSideEffects=true (it
+// reads/writes the physical SP) so no pass drops or reorders it.
+void emitSpCopy(LirBuilder& b, std::uint16_t op, LirReg dst, LirReg src) {
+    std::array<LirOperand, 1> ops{LirOperand::makeReg(src)};
+    b.addInst(op, dst, ops);
+}
+
 // D-WIN64-LARGE-FRAME-STACK-PROBE: emit the `stack_probe` virtual op —
 // the prologue's guard-page-safe replacement for a single `sub SP, F`
 // when the frame exceeds the OS guard-page size. Operands:
@@ -860,6 +895,14 @@ struct OpcodeHandles {
     // payload*outgoingSlotSize]` — byte-identical to the placement loop's
     // stack store. Optional (only a target declaring the opcode emits it).
     std::uint16_t storeOutgoingArg;
+    // D-CSUBSET-VLA (C1b): the two dynamic-stack ops emitted by MIR->LIR for a
+    // variable-length array. `subSpReg` (`sub sp, <sizeReg>`) is ALSO the callconv
+    // "has-VLA" signal (its presence in a function triggers the conditional frame-
+    // pointer model); `spCopy` is the SP register move the prologue FP-capture +
+    // epilogue SP-restore emit. Optional — a target without the VLA substrate leaves
+    // them 0 and no function is treated as having a VLA.
+    std::uint16_t subSpReg;
+    std::uint16_t spCopy;
     // ML7 cycle 2: virtual-op handles materialized by the callconv pass.
     std::uint16_t arg;
     // FC7 C1c: the caller-side struct-return piece read (mirror of `arg`).
@@ -1727,7 +1770,7 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         std::string_view mnem;
         bool optional;
     };
-    std::array<Entry, 26> const table{{
+    std::array<Entry, 28> const table{{
         {&OpcodeHandles::mov,        "mov",        false},
         {&OpcodeHandles::add,        "add",        false},
         {&OpcodeHandles::sub,        "sub",        false},
@@ -1809,6 +1852,12 @@ resolveOpcodes(TargetSchema const& schema, DiagnosticReporter& reporter) {
         // field 0; `op == h.storeOutgoingArg` never matches (the pass would
         // also have fail-louded at its own resolve if it ran without it).
         {&OpcodeHandles::storeOutgoingArg,  "store_outgoing_arg",   true},
+        // D-CSUBSET-VLA (C1b): optional — a target with the dynamic-stack VLA
+        // substrate declares both. Absent ⇒ field 0; `functionHasVla` answers false
+        // uniformly (a `sub_sp_reg` opcode of 0 never matches a real input op), so a
+        // non-VLA target/module takes the SP-relative fixed-frame path unchanged.
+        {&OpcodeHandles::subSpReg,          "sub_sp_reg",           true},
+        {&OpcodeHandles::spCopy,            "sp_copy",              true},
     }};
     for (auto const& [field, mnem, optional] : table) {
         auto const op = schema.opcodeByMnemonic(mnem);
@@ -1861,6 +1910,12 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                    // with no over-aligned local; its length MUST equal the
                    // function's alloca count (checked loud below).
                    std::span<std::uint32_t const> perAllocaAligns,
+                   // D-CSUBSET-VLA-WIN64-UNWIND (C1b): is THIS function a SEH parent
+                   // (it guards a `__try`, so it emits `.pdata`/`.xdata` unwind info)?
+                   // A VLA function's dynamic frame is NOT describable by the static
+                   // unwind info, so a VLA + SEH function fails loud (never mis-unwind).
+                   // Only ever true on PE (SEH is Windows-only), so no format branch.
+                   bool isSehParent,
                    DiagnosticReporter& reporter) {
     if (!cc.stackPointer.has_value()) {
         report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
@@ -1874,6 +1929,50 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
 
     std::vector<LirReg> usedSaved = collectUsedCalleeSaved(src, fn, schema, cc);
     bool const hasCalls = functionHasCalls(src, fn, schema);
+    // D-CSUBSET-VLA (C1b): a function containing a `sub_sp_reg` (a runtime `sub sp,
+    // <size>` for `int a[n]`) uses the CONDITIONAL frame-pointer frame model. The
+    // frame pointer (rbp/x29) becomes a STABLE base captured at the fixed-frame
+    // bottom, so every fixed-frame reference survives the runtime SP move. A
+    // NON-VLA function keeps `frameBase == sp` → its frame stays SP-relative and
+    // byte-identical (zero blast radius).
+    bool const hasVla = functionHasVla(src, fn, h.subSpReg);
+    // The substrate REQUIRES a frame-pointer register. MIR->LIR already gated on it
+    // (cc[0].framePointer) before emitting `sub_sp_reg`; re-check here (this cc)
+    // and fail loud rather than build a base-less VLA frame.
+    if (hasVla && !cc.framePointer.has_value()) {
+        report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+               DiagnosticSeverity::Error,
+               std::format("calling convention '{}' declares no framePointer "
+                           "register — cannot build the variable-length-array "
+                           "frame (D-CSUBSET-VLA)", cc.name));
+        return false;
+    }
+    LirReg const fp = (hasVla && cc.framePointer.has_value())
+        ? makePhysicalReg(cc.framePointer->ordinal, LirRegClass::GPR)
+        : InvalidLirReg;
+    // The base every FIXED-FRAME reference (spill reload/store, fixed-local `lea`,
+    // incoming stack-arg read) addresses off. In a VLA function this is the frame
+    // pointer (captured == SP-at-fixed-frame-bottom, so the OFFSET is UNCHANGED:
+    // [sp+off] -> [fp+off], SAME off). In a non-VLA function it is SP (unchanged).
+    // The prologue/epilogue saved-reg stores/loads DELIBERATELY keep `sp` (SP == FB
+    // at both points), so they are NOT switched — see emitPrologue/emitEpilogue.
+    LirReg const frameBase = hasVla ? fp : sp;
+    // D-CSUBSET-VLA-NONLEAF-CALL-FRAME (C1b LEAF gate): after `sub sp,<vlaSize>` the
+    // outgoing-args area (call args) sits INSIDE the VLA and the `call` runs at the
+    // moved SP — no base addresses it correctly. C1b is LEAF-scope only; a VLA
+    // function that ALSO makes a call fails loud (the non-leaf frame model is a
+    // separate designed cycle). `usesVaStart` (the same structural incompatibility
+    // — SP-relative va-area leas) is gated below once it is computed.
+    if (hasVla && hasCalls) {
+        report(reporter, DiagnosticCode::L_VlaNonLeafFrameUnsupported,
+               DiagnosticSeverity::Error,
+               std::format("a variable-length-array function (calling convention "
+                           "'{}') ALSO makes a call — the non-leaf VLA frame model "
+                           "(outgoing-args placement under a runtime-moved stack "
+                           "pointer) is not built; C1b supports a LEAF VLA only "
+                           "(D-CSUBSET-VLA-NONLEAF-CALL-FRAME)", cc.name));
+        return false;
+    }
     // D-LK10-ENTRY-ARM64-NONLEAF-LINK-REGISTER (2026-06-08): a calling
     // convention that carries the return address in a LINK REGISTER
     // (AAPCS64 -> x30) instead of pushing it on the stack at the call
@@ -1901,6 +2000,21 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
             }
         }
         if (!alreadySaved) usedSaved.push_back(lr);
+    }
+    // D-CSUBSET-VLA CRITICAL-2 (C1b): FORCE-ADD the frame pointer to the saved set.
+    // `collectUsedCalleeSaved` never sees it — regalloc RESERVED it out of the pool
+    // (it appears nowhere as a vreg result/operand), so the prologue would not store
+    // the caller's rbp/x29 before `FP<-SP` clobbers it (corrupting the caller's
+    // frame). Force it into `savedRegs` (dedup) so the prologue saves + the epilogue
+    // reloads it — the EXACT link-register fold precedent above. REQUIRED alongside
+    // the regalloc pool-exclusion; neither alone suffices. Leaf-only reach: a VLA
+    // function with calls already failed loud above.
+    if (hasVla && cc.framePointer.has_value()) {
+        bool alreadySaved = false;
+        for (LirReg const& r : usedSaved) {
+            if (r.isPhysical != 0 && r.id == fp.id) { alreadySaved = true; break; }
+        }
+        if (!alreadySaved) usedSaved.push_back(fp);
     }
     // D-ML7-2.2: pre-scan call sites for the maximum stack-arg
     // overflow across all calls. The prologue reserves enough
@@ -1949,6 +2063,38 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
         functionUsesVaStart(src, fn, h.vaRegSaveArea, h.vaHomeArgArea,
                             h.vaOverflowArgArea)
         && cc.vaListLayout.has_value();
+    // D-CSUBSET-VLA-NONLEAF-CALL-FRAME (C1b LEAF gate, va-arm): a VLA function that
+    // ALSO calls va_start is non-leaf-shaped — its va-area address leas are SP-
+    // relative body references that the runtime `sub sp,<vlaSize>` invalidates (and
+    // the frame-pointer switch does not cover the va-overflow area, which lives ABOVE
+    // the entry SP). Fail loud (same deferral family as the call case above).
+    if (hasVla && usesVaStart) {
+        report(reporter, DiagnosticCode::L_VlaNonLeafFrameUnsupported,
+               DiagnosticSeverity::Error,
+               std::format("a variable-length-array function (calling convention "
+                           "'{}') ALSO calls va_start — the VLA + variadic frame "
+                           "model is not built; C1b supports a LEAF non-variadic VLA "
+                           "only (D-CSUBSET-VLA-NONLEAF-CALL-FRAME)", cc.name));
+        return false;
+    }
+    // D-CSUBSET-VLA-WIN64-UNWIND (C1b): a VLA function that ALSO guards a `__try`
+    // (SEH parent) emits `.pdata`/`.xdata` unwind info describing a STATIC frame — but
+    // a VLA frame's SP moved a runtime amount, so an exception unwinding through it
+    // would mis-walk the stack. hasCalls is NOT a sufficient proxy (a `__try` around a
+    // TRAPPING NON-CALL op — e.g. an integer div-by-zero #DE — has no call yet still
+    // dispatches through the OS unwinder). Fail loud (never mis-unwind). PE-only in
+    // practice (SEH is Windows-only ⇒ isSehParent is only ever true there), no format
+    // branch. The SEH-through-VLA frame model is a separate designed cycle.
+    if (hasVla && isSehParent) {
+        report(reporter, DiagnosticCode::L_VlaNonLeafFrameUnsupported,
+               DiagnosticSeverity::Error,
+               std::format("a variable-length-array function (calling convention "
+                           "'{}') ALSO guards a __try (SEH) — its dynamic frame is not "
+                           "describable by the static .pdata/.xdata unwind info, so an "
+                           "exception would mis-unwind; the SEH-through-VLA frame model "
+                           "is not built (D-CSUBSET-VLA-WIN64-UNWIND)", cc.name));
+        return false;
+    }
     // FC12b/c: a callee-local register-save-area zone is reserved by the strategies
     // that SPILL arg registers into a callee frame zone — SysVRegisterSave (6 GP + 8
     // SSE) AND Aapcs64DualCursor (8 GR + 8 VR = 192B). Win64 + Apple arm64
@@ -2070,6 +2216,23 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                               h.vaVrSpillStore, h.add,
                                               h.store, h.storeU, reporter))
                 return false;
+            // D-CSUBSET-VLA CRITICAL-3 (C1b): the frame-pointer setup goes AFTER the
+            // prologue's `sub sp,F` + saved-reg stores (incl. the caller's rbp/x29
+            // via CRITICAL-2). At THIS point SP == the fixed-frame base FB (no VLA
+            // `sub_sp_reg` has run yet — those are body ops), so `FP<-SP` captures
+            // FB exactly. Every subsequent fixed-frame ref uses FP with the SAME
+            // offset [sp+off]->[fp+off]; the runtime VLA sub then moves SP freely.
+            if (hasVla) {
+                if (h.spCopy == 0) {
+                    report(reporter, DiagnosticCode::L_RequiredLirOpcodeMissing,
+                           DiagnosticSeverity::Error,
+                           "callconv: a variable-length-array function needs the "
+                           "'sp_copy' opcode for the frame-pointer setup, but the "
+                           "target schema declares none (D-CSUBSET-VLA)");
+                    return false;
+                }
+                emitSpCopy(b, h.spCopy, fp, sp);   // FP <- SP  (capture FB)
+            }
         }
 
         std::uint32_t const instN = src.blockInstCount(srcBlock);
@@ -2212,7 +2375,10 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     // the emitFrameLoad CHOKEPOINT (selectFrameMemOp), so this
                     // site — like every other frame load — just passes the GPR
                     // load identity + its scaled twin and the chokepoint picks.
-                    emitFrameLoad(b, *argLoad, result, sp, offset,
+                    // D-CSUBSET-VLA (C1b): a FIXED-FRAME ref → `frameBase` (== FP in a
+                    // VLA function, captured at FB where SP == the entry SP - F, so
+                    // the offset is UNCHANGED). `frameBase == sp` for a non-VLA fn.
+                    emitFrameLoad(b, *argLoad, result, frameBase, offset,
                                   h.load, h.loadU);
                 }
                 continue;
@@ -2336,7 +2502,12 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 localAllocaByteOffset +=
                     allocaSlotCount(payload, outLayout.slotSize)
                     * outLayout.slotSize;
-                emitFrameAddr(b, h.lea, result, sp, offset);
+                // D-CSUBSET-VLA (C1b): a FIXED local's address → `frameBase` (FP in a
+                // VLA function; the fixed local sits in the fixed frame that the
+                // runtime VLA sub does not move — same offset off FB). The VLA array
+                // itself is NOT here (it lowered to sub_sp_reg + sp_copy, its base a
+                // captured reg); this arm is the ordinary compile-time-sized `alloca`.
+                emitFrameAddr(b, h.lea, result, frameBase, offset);
                 continue;
             }
 
@@ -2403,7 +2574,9 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                                        inst.v, combinedOffset));
                     return false;
                 }
-                emitFrameAddr(b, h.lea, result, sp,
+                // D-CSUBSET-VLA (C1b): a `lea_frame_slot` re-reference of a fixed
+                // local's address → `frameBase` (FP in a VLA function; same offset).
+                emitFrameAddr(b, h.lea, result, frameBase,
                               static_cast<std::int32_t>(combinedOffset));
                 continue;
             }
@@ -2541,7 +2714,16 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                     + static_cast<std::uint32_t>(cc.callPushBytes)
                     + static_cast<std::uint32_t>(cc.shadowSpaceBytes)
                     + payload);
-                emitFrameAddr(b, h.lea, result, sp, recvOffset);
+                // D-CSUBSET-VLA CRITICAL-A (C1b): the address of a by-value aggregate
+                // param received WHOLLY on the incoming stack is a FIXED-FRAME ref ->
+                // `frameBase` (FP in a VLA function). REACHABLE in LEAF scope: a leaf
+                // VLA function taking a >16-byte struct by value (SysV memory-class
+                // param) sizes its VLA off `s.field`. Byte-identical geometry to the
+                // incoming stack-arg read above, which is switched for the same reason;
+                // omitting it here would fire the completeness verifier on an actually-
+                // leaf case (a misleading fail-loud), not run. `frameBase == sp` for a
+                // non-VLA function (byte-identical).
+                emitFrameAddr(b, h.lea, result, frameBase, recvOffset);
                 continue;
             }
             // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-1): the Win64
@@ -3213,8 +3395,13 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // uses (spillAreaOffset + (slot.v-1)*slotSize). GPR load + its scaled
                 // twin feed the emitFrameLoad chokepoint (the per-move load op is
                 // class-resolved from the arg register's class).
+                // D-CSUBSET-VLA CRITICAL-1 (C1b): the spilled call-arg reload is a
+                // FIXED-FRAME ref → `frameBase`. Moot in practice (a VLA function with
+                // a call already failed loud at the leaf gate), but kept consistent
+                // with the other spill sites so no fixed-frame ref encodes SP as base
+                // in a VLA function. `frameBase == sp` for a non-VLA fn (byte-identical).
                 MemSrcLoadCtx const argMemCtx{
-                    /*valid=*/true, sp, outLayout.spillAreaOffset(),
+                    /*valid=*/true, frameBase, outLayout.spillAreaOffset(),
                     outLayout.slotSize, h.load, h.loadU};
                 if (!emitParallelRegMoves(
                         b, schema, cc, std::move(argRegMoves),
@@ -3415,7 +3602,12 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 // chokepoint swaps a GPR reload to load_u (the primary gap
                 // D-ASM-AARCH64-FRAME-OFFSET-BEYOND-IMM12 closes). An FPR spill
                 // reload keeps its fldur form (selectFrameMemOp gate).
-                emitFrameLoad(b, *spillLoad, result, sp, offset,
+                // D-CSUBSET-VLA CRITICAL-1 (C1b): spills are FIXED-FRAME refs → use
+                // `frameBase` (FP in a VLA function). A spill lands in a LEAF function
+                // and can be reloaded AFTER the runtime `sub sp,<vlaSize>` moved SP —
+                // an SP-relative reload would then read garbage below the VLA (the #1
+                // silent miscompile this switch closes). Offset unchanged (FP == FB).
+                emitFrameLoad(b, *spillLoad, result, frameBase, offset,
                               h.load, h.loadU);
                 continue;
             }
@@ -3436,7 +3628,10 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                 if (!spillStore.has_value()) return false;
                 // Mirror of the spill reload: a high spill slot's store swaps
                 // to store_u via the chokepoint (FPR spill keeps fstur).
-                emitFrameStore(b, *spillStore, ops[0].reg, sp, offset,
+                // D-CSUBSET-VLA CRITICAL-1 (C1b): spill store is a FIXED-FRAME ref →
+                // `frameBase` (FP in a VLA function), for the same reason as the
+                // reload above. Offset unchanged (FP captured at FB).
+                emitFrameStore(b, *spillStore, ops[0].reg, frameBase, offset,
                                h.store, h.storeU);
                 continue;
             }
@@ -3533,6 +3728,17 @@ materializeOneFunc(Lir const& src, LirFuncId fn,
                         // the cc's return registers.
                         newOps.clear();
                     }
+                    // D-CSUBSET-VLA (C1b): PREPEND `SP<-FP` before the epilogue. FP
+                    // holds the fixed-frame base FB (== SP right after `sub sp,F`),
+                    // so this discards the runtime VLA region (SP may sit anywhere
+                    // below FB after `sub_sp_reg`) and restores SP to FB. The epilogue
+                    // then runs VERBATIM: it reloads the saved regs off SP (== FB now,
+                    // correct) and `add sp,F` reaches the entry SP. Do NOT switch the
+                    // epilogue's saved-reg loads to FP — after this move SP == FB is
+                    // the right base, AND the frame pointer is itself reloaded there.
+                    if (hasVla) {
+                        emitSpCopy(b, h.spCopy, sp, fp);   // SP <- FP  (discard VLA)
+                    }
                     // Emit epilogue BEFORE the return.
                     bool epilogueOk = false;
                     emitEpilogue(b, outLayout, schema, sp, h.add,
@@ -3613,6 +3819,12 @@ materializeCallingConvention(Lir const&           src,
             funcletIdxToParentIdx[fIt->second] = pIt->second;
         }
     }
+    // D-CSUBSET-VLA-WIN64-UNWIND (C1b): the set of PARENT symbols — functions that
+    // guard a `__try` and therefore emit SEH `.pdata`/`.xdata` unwind info. A VLA
+    // function among them fails loud (its dynamic frame is not statically unwindable).
+    // Empty for a non-SEH module (every function passes the gate).
+    std::unordered_set<std::uint32_t> sehParentSymbols;
+    for (auto const& fp : sehFuncletParents) sehParentSymbols.insert(fp.parentSymbol.v);
 
     LirBuilder b{schema};
     // D-CSUBSET-BITFIELD-WIDE-UNIT: carry the wide-literal pool across
@@ -3702,15 +3914,82 @@ materializeCallingConvention(Lir const&           src,
             it != symToPerAllocaAligns.end()) {
             perAllocaAligns = it->second;
         }
+        bool const isSehParent = sehParentSymbols.contains(rewrittenSymbol);
         if (!materializeOneFunc(src, fn, schema, *cc, funcAlloc, b, *opcodes,
                                 layout, out.perFunc, parentLayoutIndex,
-                                maxLocalAlign, perAllocaAligns, reporter)) {
+                                maxLocalAlign, perAllocaAligns, isSehParent,
+                                reporter)) {
             return LirCallconvResult{};
         }
         out.perFunc.push_back(std::move(layout));
     }
 
     out.lir = std::move(b).finish();
+    // D-CSUBSET-VLA CRITICAL-1 completeness VERIFIER (C1b): in a function with a VLA
+    // (a surviving `sub_sp_reg`), EVERY fixed-frame reference must address off the
+    // frame pointer, not SP — after the runtime `sub_sp_reg` moved SP, an SP-based
+    // fixed ref reads/writes the wrong location (the #1 silent-miscompile class). The
+    // base-switch routes every fixed ref to `frameBase` (== FP); this post-pass is
+    // the RED-ON-DISABLE guard that a FUTURE fixed-frame emit site did not forget the
+    // switch. A memory op carries a `MemBase` operand preceded by its base register;
+    // a base == SP is a fixed-frame ref UNLESS its offset lands in the saved-reg area
+    // (the prologue/epilogue saved-reg stores/loads legitimately use SP, which == the
+    // fixed-frame base FB at those two points — the only sanctioned SP frame refs in
+    // a VLA function). Any OTHER SP-based frame ref is a missed switch — fail loud.
+    if (opcodes->subSpReg != 0) {
+        std::size_t const outFnCount = out.lir.moduleFuncCount();
+        for (std::uint32_t i = 0;
+             i < outFnCount && i < out.perFunc.size() && i < alloc.perFunc.size();
+             ++i) {
+            LirFuncId const fn = out.lir.funcAt(i);
+            if (!functionHasVla(out.lir, fn, opcodes->subSpReg)) continue;
+            auto const* cc =
+                schema.callingConvention(alloc.perFunc[i].callingConventionIndex);
+            if (cc == nullptr || !cc->stackPointer.has_value()) continue;
+            std::uint16_t const spOrd = cc->stackPointer->ordinal;
+            FrameLayout const& L = out.perFunc[i];
+            std::int64_t const savedLo =
+                static_cast<std::int64_t>(L.savedRegAreaOffset());
+            std::int64_t const savedHi =
+                savedLo + static_cast<std::int64_t>(L.savedRegAreaSize);
+            std::uint32_t const bc = out.lir.funcBlockCount(fn);
+            for (std::uint32_t bi = 0; bi < bc; ++bi) {
+                LirBlockId const blk = out.lir.funcBlockAt(fn, bi);
+                std::uint32_t const n = out.lir.blockInstCount(blk);
+                for (std::uint32_t k = 0; k < n; ++k) {
+                    LirInstId const inst = out.lir.blockInstAt(blk, k);
+                    auto const ops = out.lir.instOperands(inst);
+                    for (std::size_t oi = 1; oi < ops.size(); ++oi) {
+                        if (ops[oi].kind != LirOperandKind::MemBase) continue;
+                        LirOperand const& base = ops[oi - 1];
+                        if (base.kind != LirOperandKind::Reg
+                            || base.reg.isPhysical == 0
+                            || static_cast<std::uint16_t>(base.reg.id) != spOrd) {
+                            continue;  // not an SP-based memory ref
+                        }
+                        std::int64_t off = 0;
+                        if (oi + 1 < ops.size()
+                            && ops[oi + 1].kind == LirOperandKind::MemOffset) {
+                            off = ops[oi + 1].offset;
+                        }
+                        if (off >= savedLo && off < savedHi) continue;  // saved-reg
+                        report(reporter,
+                               DiagnosticCode::L_VlaNonLeafFrameUnsupported,
+                               DiagnosticSeverity::Error,
+                               std::format(
+                                   "callconv VLA frame-base verifier: function #{} "
+                                   "(inst {}) addresses a fixed-frame slot at [SP+{}] "
+                                   "— a VLA function must address every fixed-frame "
+                                   "reference off the frame pointer (the runtime `sub "
+                                   "sp` moved SP); a missed SP->FP switch is a silent "
+                                   "stack miscompile (D-CSUBSET-VLA CRITICAL-1)",
+                                   i, inst.v, off));
+                        return LirCallconvResult{};
+                    }
+                }
+            }
+        }
+    }
     // `ok()` is derived from output shape — no stored bool to drift.
     return out;
 }

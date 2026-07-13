@@ -82,7 +82,8 @@ struct Lowered {
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
                                     /*linkageMap=*/nullptr, /*mutabilityMap=*/nullptr,
-                                    /*volatileMap=*/nullptr, /*alignmentMap=*/nullptr,
+                                    /*volatileMap=*/nullptr,
+                                    &hir->alignmentMap,    // VLA C1b over-align gate
                                     /*threadLocalMap=*/nullptr,
                                     &hir->vlaSizeExprBySymbol);   // VLA C1a
     DiagnosticReporter lirReporter;
@@ -4814,36 +4815,82 @@ TEST(MirToLirTls, PeIndexedWithoutTlsIndexSlotNameFailsLoud) {
         << "the reject must name the pe-indexed model + the missing slot name";
 }
 
-// VLA C1a -> C1b boundary (D-CSUBSET-VLA): a block-scope `int a[n]` lowers cleanly
-// to a runtime-operand MIR Alloca, then FAILS LOUD at MIR->LIR with
-// L_VlaDynamicAllocaUnsupported (the dynamic sub-sp + frame pointer is the named
-// C1b cycle). RED-ON-DISABLE: remove the lowerAlloca guard -> the runtime-operand
-// alloca falls through to the fixed-slot path, silently reserving a 1-slot scalar
-// (dropping the size) with NO diagnostic (MINOR-3) -> this pin goes red.
-TEST(MirToLir, VlaRuntimeOperandAllocaFailsLoudAtLirBoundary) {
+// VLA C1b (D-CSUBSET-VLA): a block-scope `int a[n]` lowers cleanly to a runtime-
+// operand MIR Alloca, which MIR->LIR now lowers to the DYNAMIC-STACK sequence:
+// alignUp(size) (`add` + `and`) -> `sub_sp_reg SP, size` -> `base = sp_copy SP`.
+// RED-ON-DISABLE: revert lowerVlaAlloca to the fail-loud boundary (or the fixed-slot
+// path) -> `sub_sp_reg`/`sp_copy` vanish + L.lir.ok flips -> this pin goes red. The
+// runtime witnesses (examples/c-subset/c99_vla{,_spill}) prove the sequence RUNS;
+// this pin proves the OPS are emitted (the boundary is closed, not a silent stub).
+TEST(MirToLir, VlaRuntimeOperandAllocaLowersToDynamicStackSequence) {
     auto L = lowerCSubsetToLir(
         "int f(int n) {\n"
         "  int a[n];\n"
-        "  return 0;\n"
+        "  return a[0];\n"
         "}\n");
     ASSERT_FALSE(L.model.hasErrors())
         << "semantic accepts an automatic VLA: "
         << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
     ASSERT_TRUE(L.hir->ok);
     ASSERT_TRUE(L.mir.ok)
-        << "the VLA lowers to MIR (runtime-operand Alloca) BEFORE the LIR boundary: "
+        << "the VLA lowers to MIR (runtime-operand Alloca): "
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
 
-    EXPECT_FALSE(L.lir.ok)
-        << "a runtime-sized VLA alloca must fail the LIR lowering (C1b boundary)";
-    bool sawVlaBoundary = false;
+    ASSERT_TRUE(L.lir.ok)
+        << "a runtime-sized VLA alloca must lower to the dynamic-stack sequence "
+           "(no longer a fail-loud boundary): "
+        << (L.lirReporter.all().empty() ? "" : L.lirReporter.all()[0].actual);
+
+    // The fail-loud boundary is CLOSED — no L_VlaDynamicAllocaUnsupported.
     for (auto const& d : L.lirReporter.all()) {
-        if (d.code == DiagnosticCode::L_VlaDynamicAllocaUnsupported) {
-            sawVlaBoundary = true;
-            break;
+        EXPECT_NE(d.code, DiagnosticCode::L_VlaDynamicAllocaUnsupported)
+            << "C1b lowers the VLA; the C1a fail-loud must no longer fire";
+    }
+
+    // The dynamic-stack ops are present: `sub_sp_reg` (descend SP) + `sp_copy`
+    // (capture the VLA base). Scan every inst of the single function.
+    Lir const& lir = L.lir.lir;
+    ASSERT_EQ(lir.moduleFuncCount(), 1u);
+    auto const& sch = *L.target;
+    std::uint16_t const subSpReg = *sch.opcodeByMnemonic("sub_sp_reg");
+    std::uint16_t const spCopy   = *sch.opcodeByMnemonic("sp_copy");
+    bool sawSub = false, sawCopy = false;
+    LirFuncId const fn = lir.funcAt(0);
+    std::uint32_t const bc = lir.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < bc; ++bi) {
+        LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        std::uint32_t const n = lir.blockInstCount(blk);
+        for (std::uint32_t k = 0; k < n; ++k) {
+            std::uint16_t const op = lir.instOpcode(lir.blockInstAt(blk, k));
+            if (op == subSpReg) sawSub = true;
+            if (op == spCopy)   sawCopy = true;
         }
     }
-    EXPECT_TRUE(sawVlaBoundary)
-        << "the runtime-operand Alloca must surface L_VlaDynamicAllocaUnsupported, "
-           "not a silent fixed-slot lowering";
+    EXPECT_TRUE(sawSub)
+        << "the VLA must emit `sub_sp_reg` (the runtime `sub sp, <size>`)";
+    EXPECT_TRUE(sawCopy)
+        << "the VLA must emit `sp_copy` (capture the post-sub SP as the VLA base)";
+}
+
+// VLA C1b (D-CSUBSET-VLA): a VLA whose ELEMENT is over-aligned beyond the stack
+// alignment the dynamic `sub sp` can guarantee FAILS LOUD (L_OverAlignedStackLocal)
+// at MIR->LIR — the base a `sub sp` leaves is only stack-aligned, so a 32-aligned
+// element would land under-aligned. RED-ON-DISABLE: drop the elemAlign gate in
+// lowerVlaAlloca -> the VLA would silently under-align its elements.
+TEST(MirToLir, VlaOverAlignedElementFailsLoud) {
+    auto L = lowerCSubsetToLir(
+        "int f(int n) {\n"
+        "  _Alignas(32) int a[n];\n"
+        "  return a[0];\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.mir.ok);
+    EXPECT_FALSE(L.lir.ok)
+        << "an over-aligned VLA element must fail the LIR lowering";
+    bool sawOverAlign = false;
+    for (auto const& d : L.lirReporter.all()) {
+        if (d.code == DiagnosticCode::L_OverAlignedStackLocal) sawOverAlign = true;
+    }
+    EXPECT_TRUE(sawOverAlign)
+        << "an over-aligned VLA element must surface L_OverAlignedStackLocal";
 }

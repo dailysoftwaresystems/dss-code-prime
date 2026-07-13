@@ -275,6 +275,185 @@ TEST(LirCallconv, StraightLineFunctionGetsPrologueEpilogueAndZeroFrameOps) {
     }
 }
 
+// D-CSUBSET-VLA (C1b): a LEAF function with a variable-length array materializes
+// the conditional frame-pointer model — the callconv pass emits `sp_copy` (the
+// prologue FP<-SP capture, the VLA-base capture, and the epilogue SP<-FP restore)
+// and FORCE-SAVES the frame pointer (CRITICAL-2). RED-ON-DISABLE: without the
+// conditional frame model these ops vanish + the frame pointer is unsaved.
+TEST(LirCallconv, VlaLeafFunctionMaterializesFramePointerModel) {
+    auto bundle = lowerThroughRewrite("int f(int n) { int a[n]; return a[0]; }");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok())
+        << "a LEAF VLA must materialize: "
+        << (ccRep.all().empty() ? "" : ccRep.all()[0].actual);
+    ASSERT_EQ(result.perFunc.size(), 1u);
+    auto const* cc = bundle.lowered.target->callingConvention(0);
+    ASSERT_NE(cc, nullptr);
+    ASSERT_TRUE(cc->framePointer.has_value());
+    // CRITICAL-2: the frame pointer is force-saved (regalloc reserved it, so
+    // collectUsedCalleeSaved never saw it — the fold must add it).
+    EXPECT_TRUE(savedRegsContain(result.perFunc[0], cc->framePointer->ordinal))
+        << "a VLA function must save the caller's frame pointer";
+    // The `sp_copy` op (FP-setup / VLA-base capture / SP-restore) is present.
+    auto const spCopy = bundle.lowered.target->opcodeByMnemonic("sp_copy");
+    ASSERT_TRUE(spCopy.has_value());
+    Lir const& dst = result.lir;
+    bool sawSpCopy = false;
+    for (std::uint32_t fi = 0; fi < dst.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = dst.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < dst.funcBlockCount(fn); ++bi) {
+            LirBlockId const b = dst.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < dst.blockInstCount(b); ++i) {
+                if (dst.instOpcode(dst.blockInstAt(b, i)) == *spCopy)
+                    sawSpCopy = true;
+            }
+        }
+    }
+    EXPECT_TRUE(sawSpCopy)
+        << "a VLA function must emit sp_copy (FP capture/restore)";
+}
+
+// D-CSUBSET-VLA-NONLEAF-CALL-FRAME (C1b LEAF gate): a VLA function that ALSO makes
+// a call FAILS LOUD — the non-leaf VLA frame model (outgoing args under a moved SP)
+// is not built. RED-ON-DISABLE: drop the leaf gate -> a non-leaf VLA silently emits
+// call args INSIDE the VLA region (an ABI break).
+TEST(LirCallconv, VlaNonLeafFunctionWithCallFailsLoud) {
+    auto bundle = lowerThroughRewrite(
+        "int g(int x) { return x * 2; }\n"
+        "int f(int n) { int a[n]; return g(n) + a[0]; }\n");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    EXPECT_FALSE(result.ok())
+        << "a VLA function that makes a call must fail the callconv pass";
+    bool sawNonLeaf = false;
+    for (auto const& d : ccRep.all()) {
+        if (d.code == DiagnosticCode::L_VlaNonLeafFrameUnsupported)
+            sawNonLeaf = true;
+    }
+    EXPECT_TRUE(sawNonLeaf)
+        << "a non-leaf VLA must surface L_VlaNonLeafFrameUnsupported";
+}
+
+// D-CSUBSET-VLA-NONLEAF-CALL-FRAME (C1b LEAF gate, va-arm): a VLA function that ALSO
+// calls va_start FAILS LOUD — its va-area address leas are SP-relative body refs the
+// runtime `sub sp` invalidates (and the va-overflow area lives ABOVE the entry SP,
+// outside the frame-pointer switch). RED-ON-DISABLE for the `usesVaStart` gate (a
+// refactor could silently drop the va-arm, which is separate from the call-arm).
+TEST(LirCallconv, VlaVariadicFunctionWithVaStartFailsLoud) {
+    auto bundle = lowerThroughRewrite(
+        "int f(int n, ...) {\n"
+        "  int a[n];\n"
+        "  va_list ap;\n"
+        "  va_start(ap, n);\n"
+        "  va_end(ap);\n"
+        "  return a[0];\n"
+        "}\n");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    EXPECT_FALSE(result.ok())
+        << "a VLA function that calls va_start must fail the callconv pass";
+    bool sawNonLeaf = false;
+    for (auto const& d : ccRep.all()) {
+        if (d.code == DiagnosticCode::L_VlaNonLeafFrameUnsupported)
+            sawNonLeaf = true;
+    }
+    EXPECT_TRUE(sawNonLeaf)
+        << "a VLA + va_start function must surface L_VlaNonLeafFrameUnsupported";
+}
+
+// D-CSUBSET-VLA-WIN64-UNWIND (C1b): a VLA function that is a SEH PARENT (guards a
+// __try, so it emits `.pdata`/`.xdata` unwind info) FAILS LOUD — its runtime-moved
+// frame is not describable by the static unwind info, so an exception unwinding
+// through it (even from a trapping NON-CALL op, which leaves hasCalls=false) would
+// mis-walk the stack. Synthesize the SEH binding by naming the VLA function as a
+// __try parent in the sehFuncletParents span. RED-ON-DISABLE for the SEH gate.
+TEST(LirCallconv, VlaSehParentFunctionFailsLoud) {
+    // VLA function FIRST so it is the lower-indexed "parent" (the funclet-after-parent
+    // module-order invariant the sehFuncletParents resolution assumes).
+    auto bundle = lowerThroughRewrite(
+        "int f(int n) { int a[n]; return a[0]; }\n"
+        "int g(void) { return 0; }\n");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    Lir const& rw = bundle.rewritten.lir;
+    ASSERT_EQ(rw.moduleFuncCount(), 2u);
+    // Find the VLA function (the one containing sub_sp_reg) — bind IT as the __try
+    // parent, the other as its funclet (order-independent, no source-order assumption).
+    auto const subSpReg = bundle.lowered.target->opcodeByMnemonic("sub_sp_reg");
+    ASSERT_TRUE(subSpReg.has_value());
+    auto containsSubSp = [&](LirFuncId fn) {
+        for (std::uint32_t bi = 0; bi < rw.funcBlockCount(fn); ++bi) {
+            LirBlockId const b = rw.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < rw.blockInstCount(b); ++i)
+                if (rw.instOpcode(rw.blockInstAt(b, i)) == *subSpReg) return true;
+        }
+        return false;
+    };
+    LirFuncId const f0 = rw.funcAt(0), f1 = rw.funcAt(1);
+    bool const zeroIsVla = containsSubSp(f0);
+    ASSERT_NE(zeroIsVla, containsSubSp(f1)) << "exactly one function has the VLA";
+    SymbolId const vlaSym{rw.funcArena().at(zeroIsVla ? f0 : f1).symbol};
+    SymbolId const otherSym{rw.funcArena().at(zeroIsVla ? f1 : f0).symbol};
+    std::array<SehFuncletParent, 1> const seh{
+        SehFuncletParent{otherSym, vlaSym}};   // funclet=other, parent=the VLA fn
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(rw, *bundle.lowered.target,
+                                               bundle.alloc, ccRep, seh);
+    EXPECT_FALSE(result.ok())
+        << "a VLA function that is a SEH parent must fail the callconv pass";
+    bool sawUnwind = false;
+    for (auto const& d : ccRep.all())
+        if (d.code == DiagnosticCode::L_VlaNonLeafFrameUnsupported) sawUnwind = true;
+    EXPECT_TRUE(sawUnwind)
+        << "a VLA + SEH function must surface L_VlaNonLeafFrameUnsupported "
+           "(D-CSUBSET-VLA-WIN64-UNWIND)";
+}
+
+// D-CSUBSET-VLA (C1b) zero-blast-radius pin: a NON-VLA function must NOT gain any
+// frame-pointer machinery — its frame stays SP-relative + byte-identical. RED-ON-
+// DISABLE: if the conditional frame model ever fires unconditionally, a plain
+// function grows an `sp_copy` and this pin goes red.
+TEST(LirCallconv, NonVlaFunctionEmitsNoFramePointerOps) {
+    auto bundle = lowerThroughRewrite("int f(int x) { int a[4]; a[0] = x; return a[0]; }");
+    ASSERT_TRUE(bundle.lowered.lir.ok);
+    ASSERT_TRUE(bundle.rewritten.ok);
+    DiagnosticReporter ccRep;
+    auto result = materializeCallingConvention(bundle.rewritten.lir,
+                                               *bundle.lowered.target,
+                                               bundle.alloc, ccRep);
+    ASSERT_TRUE(result.ok());
+    auto const spCopy   = bundle.lowered.target->opcodeByMnemonic("sp_copy");
+    auto const subSpReg = bundle.lowered.target->opcodeByMnemonic("sub_sp_reg");
+    ASSERT_TRUE(spCopy.has_value() && subSpReg.has_value());
+    Lir const& dst = result.lir;
+    for (std::uint32_t fi = 0; fi < dst.moduleFuncCount(); ++fi) {
+        LirFuncId const fn = dst.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < dst.funcBlockCount(fn); ++bi) {
+            LirBlockId const b = dst.funcBlockAt(fn, bi);
+            for (std::uint32_t i = 0; i < dst.blockInstCount(b); ++i) {
+                std::uint16_t const op = dst.instOpcode(dst.blockInstAt(b, i));
+                EXPECT_NE(op, *spCopy)
+                    << "a non-VLA function must not emit sp_copy (zero blast radius)";
+                EXPECT_NE(op, *subSpReg)
+                    << "a non-VLA function must not emit sub_sp_reg";
+            }
+        }
+    }
+}
+
 // D-LK10-ENTRY-ARM64-NONLEAF-LINK-REGISTER (2026-06-08): a NON-LEAF function
 // under a calling convention with a LINK REGISTER (AAPCS64 -> x30) MUST spill
 // + reload that register in its frame, because every `bl`/`call` clobbers it.

@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-VLA C1b CRITICAL-A: a LEAF VLA function whose length comes from a >16-byte by-value struct PARAMETER received on the incoming stack. Proves the last fixed-frame base-switch site (`recv_by_value_stack_param`) addresses off the frame pointer, not the moved SP — and is RED-ON-DISABLE for both that switch and the completeness verifier (reverting the site to SP makes the verifier reject this at compile time). The arm64 leg witnesses the struct-param frame path under the real extended-register SUB-sp on qemu. exitCode 42 = a[5]=35 + a[1]=7.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

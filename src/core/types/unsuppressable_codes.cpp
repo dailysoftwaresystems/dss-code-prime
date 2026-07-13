@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 117> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 118> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -271,6 +271,11 @@ constexpr std::array<DiagnosticCode, 117> kUnsuppressableCodes{{
     // slot path and silently emit a `lea` of a 1-slot scalar for the whole VLA — a
     // stack miscompile (MINOR-3). Same load-bearing-boundary class as the L_ band.
     DiagnosticCode::L_VlaDynamicAllocaUnsupported,
+    // L_VlaNonLeafFrameUnsupported (VLA C1b LEAF gate, D-CSUBSET-VLA-NONLEAF-CALL-FRAME):
+    // a VLA function that ALSO calls / uses va_start. A member: suppressed, a non-leaf
+    // VLA would place outgoing call args INSIDE the VLA region under the moved SP (an
+    // ABI break — a silent stack miscompile). Same load-bearing-boundary class.
+    DiagnosticCode::L_VlaNonLeafFrameUnsupported,
 
     // R_* regalloc band — calling-convention / class invariants.
     // R_SpilledDueToPressure + R_SpilledDueToCrossCallExhaustion

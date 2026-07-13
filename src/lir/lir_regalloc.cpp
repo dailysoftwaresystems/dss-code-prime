@@ -74,7 +74,13 @@ popReg(std::vector<std::uint16_t>& regs) {
 buildFreeLists(TargetSchema const&            schema,
                TargetCallingConvention const& cc,
                std::array<std::uint16_t, kLirRegClassCount> const&
-                   reloadReserve) {
+                   reloadReserve,
+               // D-CSUBSET-VLA (C1b): the frame-pointer ordinal to RESERVE (hold out
+               // of every allocatable pool) for a function that contains a VLA — it
+               // becomes the fixed-frame base. std::nullopt for a non-VLA function
+               // (rbp/x29 stays an ordinary allocatable callee-saved GPR → byte-
+               // identical frames, the zero-blast-radius invariant).
+               std::optional<std::uint16_t> reservedFramePointer = std::nullopt) {
     FreeListsByClass out{};
 
     std::unordered_set<std::string_view> allocatable;
@@ -98,6 +104,10 @@ buildFreeLists(TargetSchema const&            schema,
         if (info.regClass == TargetRegClass::None) continue;
         if (!info.subOf.empty()) continue;
         if (!allocatable.contains(info.name)) continue;  // reserved (rsp / rflags / …)
+        // D-CSUBSET-VLA (C1b): in a VLA function the frame pointer is reserved as the
+        // fixed-frame base — hold it out of the allocatable pool (mirrors the rsp/
+        // rflags reservation above). No-op for a non-VLA function (nullopt).
+        if (reservedFramePointer.has_value() && i == *reservedFramePointer) continue;
         std::size_t const classIdx = static_cast<std::size_t>(info.regClass);
         if (classIdx >= out.size()) {
             regallocFatal("buildFreeLists: TargetRegClass out of range — "
@@ -755,6 +765,23 @@ LirFuncAllocation const* LirAllocation::forFunc(LirFuncId fn) const noexcept {
 
 namespace {
 
+// D-CSUBSET-VLA (C1b): does function `fn` contain any inst with opcode `op`?
+// Used to detect the `sub_sp_reg` VLA marker so the frame pointer is reserved
+// out of the allocatable pool. Source/target-agnostic — a plain opcode-match
+// scan (the `functionHasCalls`/`functionUsesVaStart` predicate shape).
+[[nodiscard]] bool
+functionContainsOpcode(Lir const& lir, LirFuncId fn, std::uint16_t op) noexcept {
+    std::uint32_t const blockCount = lir.funcBlockCount(fn);
+    for (std::uint32_t bi = 0; bi < blockCount; ++bi) {
+        LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        std::uint32_t const n = lir.blockInstCount(blk);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            if (lir.instOpcode(lir.blockInstAt(blk, i)) == op) return true;
+        }
+    }
+    return false;
+}
+
 // Per-function core. Wraps the linear-scan loop with `ok` derivation
 // via reporter delta + emits the per-function spill summary at the
 // end. `schemaOk` is the pre-checked schema-wide validity (≥1 cc) —
@@ -797,8 +824,25 @@ LirFuncAllocation allocateOneFunc(Lir const& lir,
         return out;
     }
 
+    // D-CSUBSET-VLA (C1b): a function that contains a `sub_sp_reg` op (a dynamic
+    // VLA stack allocation) reserves the frame pointer as its fixed-frame base —
+    // exclude it from the allocatable pool so it is never handed to a vreg. The
+    // callconv pass force-saves it in the prologue + captures it as the base. A
+    // target/module without VLA (no `sub_sp_reg` opcode, or none in this function)
+    // takes the nullopt path — rbp/x29 stays allocatable (byte-identical frames).
+    std::optional<std::uint16_t> reservedFramePointer;
+    if (auto const subSpReg = schema.opcodeByMnemonic("sub_sp_reg");
+        subSpReg.has_value() && cc->framePointer.has_value()
+        && functionContainsOpcode(lir, flow.fn, *subSpReg)) {
+        reservedFramePointer = cc->framePointer->ordinal;
+    }
+    // Publish the reservation so the rewriter's scratch-pool build
+    // (pickScratchRegs) also holds the frame pointer out — otherwise it would
+    // harvest the reserved-but-unassigned register as a spill scratch.
+    out.reservedFramePointer = reservedFramePointer;
     FreeListsByClass free =
-        buildFreeLists(schema, *cc, computeReloadReserve(lir, schema, flow));
+        buildFreeLists(schema, *cc, computeReloadReserve(lir, schema, flow),
+                       reservedFramePointer);
     std::vector<std::uint32_t> const callPositions =
         collectCallPositions(lir, schema, flow);
     // Cycle 10q closure of 10p substrate: per-opcode implicit

@@ -1403,6 +1403,17 @@ enum class DiagnosticCode : std::uint16_t {
     //   fixed-slot path and silently lose the runtime size (a `lea` of a 1-slot
     //   scalar for the whole array — a stack miscompile).
     L_VlaDynamicAllocaUnsupported  = 0xB00D,
+    // VLA C1b LEAF-scope gate (D-CSUBSET-VLA-NONLEAF-CALL-FRAME): a function with a
+    //   variable-length array ALSO makes a call OR calls `va_start`. C1b builds the
+    //   dynamic-stack frame model for a LEAF function only: after `sub sp,<vlaSize>`
+    //   the outgoing-args area (call args) and the va-area leas are SP-relative, and
+    //   under the moved SP NO base (neither SP nor the frame pointer) addresses them
+    //   correctly while the `call`/va-walk runs at the moved SP. The non-leaf VLA
+    //   frame model (outgoing-args placement under a runtime-moved SP) is a separate
+    //   designed cycle. Fails loud (never a silent outgoing-arg/va miscompile).
+    //   UNSUPPRESSABLE — suppressed, a non-leaf VLA would emit call args INSIDE the
+    //   VLA region (an ABI break). Red-on-disable via the non-leaf fail-loud pins.
+    L_VlaNonLeafFrameUnsupported   = 0xB00E,
 
     // ── Register allocator (renders as `R`) ────────────────────────────
     //

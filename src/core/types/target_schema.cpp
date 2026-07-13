@@ -1328,6 +1328,12 @@ std::vector<ConfigDiagnostic> TargetSchemaData::validate() const {
             std::span<std::string const> spRefs{&cc.stackPointer->name, 1};
             checkRefs(i, "stackPointer", spRefs, TargetRegClass::GPR);
         }
+        // D-CSUBSET-VLA (C1b): the frame-pointer register (rbp / x29), when
+        // declared, must resolve to a GPR (it becomes a fixed frame base).
+        if (cc.framePointer.has_value()) {
+            std::span<std::string const> fpRefs{&cc.framePointer->name, 1};
+            checkRefs(i, "framePointer", fpRefs, TargetRegClass::GPR);
+        }
         // FC7 (D-FC7-STRUCT-BY-VALUE-ARG-RETURN): the sret indirect-result
         // register (AAPCS64 x8), when declared, must resolve to a GPR.
         if (cc.indirectResultRegister.has_value()) {
