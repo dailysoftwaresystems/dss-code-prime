@@ -243,6 +243,13 @@ struct Lowerer {
     // is global-only): a global's value raises its data-item section alignment;
     // a local's value raises its alloca's effective (frame-slot) alignment.
     std::vector<std::pair<HirNodeId, AlignmentAttr>>& alignmentAcc;
+    // VLA C1a (D-CSUBSET-VLA): shared accumulator of (declared local SymbolId.v →
+    // the LOWERED size-expression HIR node) pairs. Populated at the local VarDecl
+    // site when the declared type `isVlaArray` — the array suffix (normally SKIPPED
+    // at CST→HIR) is un-skipped and its length expr lowered. Moved onto the result's
+    // `vlaSizeExprBySymbol` map AFTER finish() (same frozen-hir discipline as the
+    // attribute accumulators). Sparse: only VLA locals are recorded.
+    std::vector<std::pair<std::uint32_t, HirNodeId>>& vlaSizeAcc;
 
     // D-CSUBSET-LOCAL-STATIC: the module-level decls accumulator (the SAME
     // vector `lowerTree` appends top-level decls to). A block-scope `static`
@@ -813,11 +820,12 @@ struct Lowerer {
             std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut,
             std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& tls,
             std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
-            std::vector<std::pair<HirNodeId, AlignmentAttr>>& aln)
+            std::vector<std::pair<HirNodeId, AlignmentAttr>>& aln,
+            std::vector<std::pair<std::uint32_t, HirNodeId>>& vlaSz)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
           linkage(lk), mutability(mut), threadLocalAcc(tls), volatileAcc(vol),
-          alignmentAcc(aln) {
+          alignmentAcc(aln), vlaSizeAcc(vlaSz) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -1145,6 +1153,59 @@ struct Lowerer {
             && *rec->explicitAlignment > 0u)
             alignmentAcc.push_back(
                 {node, AlignmentAttr{*rec->explicitAlignment}});
+    }
+    // VLA C1a (D-CSUBSET-VLA): lower a block-scope variable-length array local's
+    // SIZE expression and record it in the out-of-band side-table keyed by the
+    // local's SymbolId. The array suffix is normally SKIPPED at CST→HIR (a fixed
+    // length is consumed at the semantic tier + never lowered); a VLA's RUNTIME
+    // bound must reach HIR→MIR to size its alloca, so here we un-skip it. Called
+    // only for a NON-global local whose resolved type `isVlaArray` (the semantic
+    // scope gate guarantees that shape). `declaratorNode` is the declarator CST
+    // node; `sym` its declared symbol. The lowered size node is FLOATING (valid in
+    // the arena, reachable only via the side-table — no statement parents it).
+    void captureVlaSize(NodeId declaratorNode, SymbolId sym) {
+        if (!sem.declarators.has_value() || !sym.valid()) return;
+        DeclaratorConfig const& dc = *sem.declarators;
+        // Bounded descendant scan for the array-suffix rule (mirrors the semantic
+        // `applyArraySuffix` scan). C1a is 1-D — a multi-dimensional VLA is rejected
+        // at the semantic tier (S_VlaMultiDimUnsupported), so a type that reached
+        // here as `isVlaArray` has exactly ONE runtime-bound array suffix.
+        NodeId suffix{};
+        std::vector<NodeId> stack{declaratorNode};
+        for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+            NodeId c = stack.back(); stack.pop_back();
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (tree().rule(c).v == dc.arraySuffixRule.v) { suffix = c; break; }
+            for (NodeId g : visible(c)) stack.push_back(g);
+        }
+        if (!suffix.valid()) {
+            // The type is a VLA but no suffix was located — an internal desync, not
+            // a user error. Fail loud rather than silently drop the runtime size (an
+            // unsized VLA alloca downstream).
+            (void)reportedError(declaratorNode,
+                "internal: variable-length array declarator carries no array "
+                "suffix to lower its runtime size from");
+            return;
+        }
+        // The length is the suffix's child BETWEEN the bracket delimiters
+        // (`arrayDeclSuffix = [ BracketOpen, expr, BracketClose ]`; the twin finds it
+        // by const-folding each child — here the length is runtime, so we LOWER the
+        // first non-delimiter child directly via `lowerExpr`, which handles every
+        // expression form incl. a bare identifier a rule-set filter would miss). A
+        // VLA's length is present + a single expression, so the first middle child IS
+        // the bound. The delimiters are the FIRST + LAST visible children.
+        std::vector<NodeId> kids;
+        for (NodeId c : visible(suffix)) kids.push_back(c);
+        for (std::size_t i = 0; i < kids.size(); ++i) {
+            if (i == 0 || i + 1 == kids.size()) continue;   // skip `[` and `]`
+            E const sizeE = lowerExpr(kids[i]);
+            if (sizeE.id.valid()) { vlaSizeAcc.emplace_back(sym.v, sizeE.id); return; }
+        }
+        // No lowerable length child — an internal desync (the semantic tier built a
+        // vlaArray, so a bound WAS present). Fail loud, never a silently unsized VLA.
+        (void)reportedError(declaratorNode,
+            "internal: variable-length array declarator's runtime size expression "
+            "could not be lowered");
     }
     // c21/c27: record an ACCESS HIR node's OBJECT-volatility — true iff the bound
     // symbol's STORAGE is itself volatile, i.e. its resolved type is TOP-LEVEL
@@ -7265,6 +7326,14 @@ struct Lowerer {
             // (raises its alloca's effective frame-slot alignment) — record
             // unconditionally on the VarDecl/Global node, like volatility.
             recordAlignment(lowered, sym);
+            // VLA C1a (D-CSUBSET-VLA): a block-scope variable-length array local —
+            // lower + record its runtime size expr (the semantic scope gate already
+            // guaranteed the vlaArray shape only at block scope; a static/extern VLA
+            // was rejected loud, and never reaches this automatic-local branch). A
+            // global array is never a VLA (file-scope non-constant length stays
+            // S_NonConstantArrayLength), so the `!asGlobal` guard is exact.
+            if (!asGlobal && interner.isVlaArray(type))
+                captureVlaSize(d, sym);
             out.push_back(lowered);
         }
     }
@@ -8227,6 +8296,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: shared (decl node → AlignmentAttr)
     // accumulator, moved onto result->alignmentMap after finish().
     std::vector<std::pair<HirNodeId, AlignmentAttr>> alignmentAcc;
+    // VLA C1a (D-CSUBSET-VLA): shared (local SymbolId.v → size-expr HIR node)
+    // accumulator, moved onto result->vlaSizeExprBySymbol after finish().
+    std::vector<std::pair<std::uint32_t, HirNodeId>> vlaSizeAcc;
 
     // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
     // to its language's config + the shared output. `Tree::schema()` is the
@@ -8238,7 +8310,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
-            mutability, threadLocalAcc, volatileAcc, alignmentAcc));
+            mutability, threadLocalAcc, volatileAcc, alignmentAcc, vlaSizeAcc));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -8290,6 +8362,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         result->threadLocalMap.set(id, attr);   // TLS C1
     for (auto& [id, attr] : volatileAcc) result->volatileMap.set(id, attr);  // c21
     for (auto& [id, attr] : alignmentAcc) result->alignmentMap.set(id, attr);  // alignas
+    for (auto& [symV, sizeNode] : vlaSizeAcc)   // VLA C1a (D-CSUBSET-VLA)
+        result->vlaSizeExprBySymbol.emplace(symV, sizeNode);
     result->externDecls = std::move(externDecls);
 
     // verify-on-load.

@@ -12,7 +12,9 @@
 #include "hir/hir_literal_pool.hpp"
 #include "mir/mir.hpp"
 
+#include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 // HIR → MIR lowering (plan 12 / ML2). Public entry: takes a frozen HIR
@@ -232,6 +234,13 @@ lowerToMir(Hir const&               hir,
            // assembler's `.tdata`/`.tbss` routing input) AND to screen
            // static-storage initializers for `&tls` address constants
            // (S_ThreadLocalAddressNotConstant — C11 6.6p9, the arc's CRIT-1).
-           HirThreadLocalMap const* threadLocalMap = nullptr);
+           HirThreadLocalMap const* threadLocalMap = nullptr,
+           // VLA C1a (D-CSUBSET-VLA): per-LOCAL variable-length-array size-expression
+           // side-table, populated by the CST→HIR lowerer (SymbolId.v → the lowered
+           // size HIR node). Optional: nullptr (or a local with no entry) ⇒ not a
+           // VLA. Read in `allocaForLocal` to lower the runtime bound into the
+           // Alloca's total-byte-size operand at the declaration point.
+           std::unordered_map<std::uint32_t, HirNodeId> const* vlaSizeMap
+               = nullptr);
 
 } // namespace dss

@@ -237,7 +237,30 @@ bool TypeInterner::isIncompleteArray(TypeId id) const {
     id = materialId_(id);
     if (arena_.at(id).kind != TypeKind::Array) return false;
     auto const sc = scalars(id);
+    // Exactly -1 — a VLA's -2 sentinel is a DISTINCT, complete type (isVlaArray),
+    // so FAM logic (layout contribution, `sizeof` ill-formedness) never matches it.
     return !sc.empty() && sc[0] == kIncompleteArrayLength;
+}
+
+TypeId TypeInterner::vlaArray(TypeId element) {
+    // VLA C1a (D-CSUBSET-VLA): the exact incompleteArray mirror — a kind=Array with
+    // the `kVlaLength` (-2) sentinel. Dedups by content, so every `int` VLA shares
+    // one TypeId; the per-declaration runtime bound is held out-of-band.
+    return array(element, kVlaLength);
+}
+
+bool TypeInterner::isVlaArray(TypeId id) const {
+    // Robust to an INVALID id: this predicate is called on symbol/declared types
+    // that may be `InvalidType` (a declarator whose type failed to resolve — e.g. a
+    // rejected multi-dim VLA), so an unguarded `arena_.at(invalid)` would abort
+    // ("TypeId out of range"). An invalid type is not a VLA.
+    if (!id.valid()) return false;
+    // Strip a `volatile`-qualifier skin first (mirror isIncompleteArray) so a
+    // `volatile`-qualified VLA still reads as Array on the raw kind.
+    id = materialId_(id);
+    if (arena_.at(id).kind != TypeKind::Array) return false;
+    auto const sc = scalars(id);
+    return !sc.empty() && sc[0] == kVlaLength;
 }
 
 TypeId TypeInterner::tuple(std::span<TypeId const> elements) {

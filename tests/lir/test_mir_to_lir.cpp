@@ -70,11 +70,21 @@ struct Lowered {
     DiagnosticReporter mirReporter;
     MirLoweringConfig mirCfg;
     mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
-    HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
-                                    model.lattice().interner(), mirReporter,
-                                    &hir->sourceMap, mirCfg);
+    // VLA C1a (D-CSUBSET-VLA): thread the target's aggregate-layout params so a VLA
+    // alloca's element STRIDE (sizeof(int)) resolves at MIR (cachedLayout gates on
+    // aggregateLayoutLoaded — even a scalar element needs it). Harmless for the
+    // existing scalar-only pins. Load the target here (also reused below).
     auto target = TargetSchema::loadShipped("x86_64");
     if (!target) { ADD_FAILURE() << "loadShipped(x86_64) failed"; std::abort(); }
+    mirCfg.aggregateLayout       = (*target)->aggregateLayout();
+    mirCfg.aggregateLayoutLoaded = (*target)->aggregateLayoutLoaded();
+    HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
+                                    model.lattice().interner(), mirReporter,
+                                    &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
+                                    /*linkageMap=*/nullptr, /*mutabilityMap=*/nullptr,
+                                    /*volatileMap=*/nullptr, /*alignmentMap=*/nullptr,
+                                    /*threadLocalMap=*/nullptr,
+                                    &hir->vlaSizeExprBySymbol);   // VLA C1a
     DiagnosticReporter lirReporter;
     auto lir = lowerToLir(mir.mir, **target, model.lattice().interner(), lirReporter);
     return Lowered{
@@ -4802,4 +4812,38 @@ TEST(MirToLirTls, PeIndexedWithoutTlsIndexSlotNameFailsLoud) {
         rep, DiagnosticCode::K_FormatLacksThreadLocalSupport));
     EXPECT_TRUE(sawAnchor(rep, "pe-indexed"))
         << "the reject must name the pe-indexed model + the missing slot name";
+}
+
+// VLA C1a -> C1b boundary (D-CSUBSET-VLA): a block-scope `int a[n]` lowers cleanly
+// to a runtime-operand MIR Alloca, then FAILS LOUD at MIR->LIR with
+// L_VlaDynamicAllocaUnsupported (the dynamic sub-sp + frame pointer is the named
+// C1b cycle). RED-ON-DISABLE: remove the lowerAlloca guard -> the runtime-operand
+// alloca falls through to the fixed-slot path, silently reserving a 1-slot scalar
+// (dropping the size) with NO diagnostic (MINOR-3) -> this pin goes red.
+TEST(MirToLir, VlaRuntimeOperandAllocaFailsLoudAtLirBoundary) {
+    auto L = lowerCSubsetToLir(
+        "int f(int n) {\n"
+        "  int a[n];\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "semantic accepts an automatic VLA: "
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "the VLA lowers to MIR (runtime-operand Alloca) BEFORE the LIR boundary: "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    EXPECT_FALSE(L.lir.ok)
+        << "a runtime-sized VLA alloca must fail the LIR lowering (C1b boundary)";
+    bool sawVlaBoundary = false;
+    for (auto const& d : L.lirReporter.all()) {
+        if (d.code == DiagnosticCode::L_VlaDynamicAllocaUnsupported) {
+            sawVlaBoundary = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawVlaBoundary)
+        << "the runtime-operand Alloca must surface L_VlaDynamicAllocaUnsupported, "
+           "not a silent fixed-slot lowering";
 }

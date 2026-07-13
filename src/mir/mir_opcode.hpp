@@ -372,10 +372,12 @@ struct MirOpcodeInfo {
         case MirOpcode::FCmpUgt: return {2, 2, 0, 0, R::Value, false, false, false, "fcmp.ugt"};
         case MirOpcode::FCmpUge: return {2, 2, 0, 0, R::Value, false, false, false, "fcmp.uge"};
 
-        // memory. Alloca yields a pointer; an optional operand is the element
-        // count (array alloca). It is flagged side-effecting so DCE cannot drop a
-        // stack slot whose address escaped (via Store/Call) even when the SSA
-        // result looks unused. Store writes [value, ptr] and yields no value.
+        // memory. Alloca yields a pointer; an optional operand is the TOTAL RUNTIME
+        // BYTE SIZE of a variable-length array (VLA C1a, D-CSUBSET-VLA — with a ZERO
+        // primary payload, the runtime-sized sentinel; a FIXED alloca carries its
+        // byte size in the payload and NO operand). It is flagged side-effecting so
+        // DCE cannot drop a stack slot whose address escaped (via Store/Call) even
+        // when the SSA result looks unused. Store writes [value, ptr], yields nothing.
         case MirOpcode::Alloca: return {0, 1, 0, 0, R::Value, false, true,  false, "alloca"};
         case MirOpcode::Load:   return {1, 1, 0, 0, R::Value, false, false, false, "load"};
         case MirOpcode::Store:  return {2, 2, 0, 0, R::None,  false, true,  false, "store"};

@@ -821,3 +821,88 @@ TEST(MirVerifier, LoopBackEdgePhiIncomingIsExemptFromLayoutRule) {
     EXPECT_EQ(countCode(r, DiagnosticCode::I_LayoutUseBeforeDef), 0u)
         << "the layout rule must not fire on a Phi back-edge incoming";
 }
+
+// ── VLA C1a (D-CSUBSET-VLA): the runtime-sized-Alloca operand<->payload invariant ──
+//
+// A VLA-typed alloca (pointee isVlaArray) MUST carry exactly ONE operand (the total
+// runtime byte size) + a ZERO primary payload; a fixed (non-VLA) alloca MUST carry
+// NO operand. Positive: both well-formed shapes pass.
+TEST(MirVerifier, VlaAndFixedAllocaWellFormedPass) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const i64    = interner.primitive(TypeKind::I64);
+    TypeId const ptrI32 = interner.pointer(i32);                    // fixed alloca ptr
+    TypeId const ptrVla = interner.pointer(interner.vlaArray(i32)); // VLA alloca ptr
+    TypeId const fnSig  = interner.fnSig({}, interner.primitive(TypeKind::Void),
+                                         CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    // Fixed alloca: byte size in the payload, NO operand.
+    b.addInst(MirOpcode::Alloca, {}, ptrI32, /*payload=*/4, MirInstFlags::None,
+              /*align=*/4);
+    // VLA alloca: ONE runtime size operand, ZERO payload.
+    MirInstId const sz = b.addConst(intLit(16), i64);
+    std::array<MirInstId, 1> const vlaOps{sz};
+    b.addInst(MirOpcode::Alloca, vlaOps, ptrVla, /*payload=*/0, MirInstFlags::None,
+              /*align=*/4);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &interner};
+    EXPECT_TRUE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_VlaAllocaOperandInvalid), 0u);
+}
+
+// Negative (red-on-disable): a VLA-typed alloca that LOST its size operand (→ a
+// 0-sized fixed slot) is caught loud.
+TEST(MirVerifier, VlaAllocaWithoutSizeOperandRejected) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const ptrVla = interner.pointer(interner.vlaArray(i32));
+    TypeId const fnSig  = interner.fnSig({}, interner.primitive(TypeKind::Void),
+                                         CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    // A VLA alloca with NO operand — the forbidden state (size dropped).
+    b.addInst(MirOpcode::Alloca, {}, ptrVla, /*payload=*/0, MirInstFlags::None,
+              /*align=*/4);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &interner};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_VlaAllocaOperandInvalid), 1u);
+}
+
+// Negative (red-on-disable): a FIXED (non-VLA) alloca that grew a spurious runtime
+// operand is caught loud.
+TEST(MirVerifier, FixedAllocaWithSpuriousOperandRejected) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32    = interner.primitive(TypeKind::I32);
+    TypeId const i64    = interner.primitive(TypeKind::I64);
+    TypeId const ptrI32 = interner.pointer(i32);
+    TypeId const fnSig  = interner.fnSig({}, interner.primitive(TypeKind::Void),
+                                         CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const sz = b.addConst(intLit(16), i64);
+    std::array<MirInstId, 1> const ops{sz};
+    // A fixed (ptr<i32>) alloca WITH a runtime operand — forbidden.
+    b.addInst(MirOpcode::Alloca, ops, ptrI32, /*payload=*/0, MirInstFlags::None,
+              /*align=*/4);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &interner};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_VlaAllocaOperandInvalid), 1u);
+}

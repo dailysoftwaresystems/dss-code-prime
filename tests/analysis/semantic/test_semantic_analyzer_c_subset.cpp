@@ -85,12 +85,17 @@ TEST(SemanticAnalyzerCSubset, ArrayDeclaratorTypedAsArray) {
     EXPECT_EQ(ti.kind(ti.operands(aRec->type)[0]), TypeKind::I32);
 }
 
-// SE-arrays: a non-constant length (`int a[n]`) must fail loud rather than
+// SE-arrays: a non-constant length at FILE scope must fail loud rather than
 // guess. The engine emits S_NonConstantArrayLength and leaves the type
-// unresolved (no silent pointer decay, no assumed length).
+// unresolved (no silent pointer decay, no assumed length). VLA C1a
+// (D-CSUBSET-VLA): a BLOCK-scope `int a[n]` is now a variable-length array
+// (accepted at semantic, fails loud at the MIR->LIR C1b boundary — see the
+// mir/lir pins); a FILE-scope non-constant length is NOT a VLA (a VLA needs
+// automatic storage) and stays S_NonConstantArrayLength.
 TEST(SemanticAnalyzerCSubset, NonConstantArrayLengthEmitsDiagnostic) {
     auto cu = buildShippedUnit("c-subset", {
-        "int main(int n) { int a[n]; }\n",
+        "int n;\n"
+        "int g[n];\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
@@ -2066,9 +2071,13 @@ TEST(SemanticAnalyzerCSubset, GenericTypedefAssociationMatches) {
 // before its declaration's type resolves) STAYS correct fail-loud (invalid C:
 // declare-before-use). This is NOT the closed member-access case — it pins the
 // reclassified anchor: forward-ref rejected, member-access-at-Pass-1.5 closed.
+// VLA C1a (D-CSUBSET-VLA): pinned at FILE scope so a non-foldable sizeof operand
+// stays S_NonConstantArrayLength (a file-scope array needs a constant bound — it is
+// NOT a VLA). Block-scope `int a[sizeof(b)]` would be a VLA (accepted at semantic,
+// fails at the LIR C1b boundary); the const-eval-refusal intent is preserved here.
 TEST(SemanticAnalyzerCSubset, ForwardRefSizeofArrayDimensionStillRejected) {
     auto cu = buildShippedUnit("c-subset", {
-        "int main() { int a[sizeof(b)]; int b; return 0; }\n",
+        "int a[sizeof(b)]; int b;\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DataModel::Lp64,
@@ -2078,9 +2087,11 @@ TEST(SemanticAnalyzerCSubset, ForwardRefSizeofArrayDimensionStillRejected) {
         << "a forward-referenced sizeof operand must fail loud, never fold";
 }
 
-// R1: a non-existent field in the Pass-1.5 const context fails loud (the helper's
-// UndeclaredField → the dim cannot fold). Guards against the member arm admitting
-// a phantom field and folding a guessed size.
+// R1: a non-existent field in the sizeof operand fails loud. VLA C1a
+// (D-CSUBSET-VLA): the array dim is now a block-scope VLA (accepted), but the
+// UNDERLYING bad-field access `s.nope` fails loud on its own
+// (S_UndeclaredIdentifier) — the build still fails, never a silently-folded guessed
+// size. Guards against the member arm admitting a phantom field.
 TEST(SemanticAnalyzerCSubset, BadFieldSizeofArrayDimensionRejected) {
     auto cu = buildShippedUnit("c-subset", {
         "struct S { int x; int y; };\n"
@@ -2089,9 +2100,11 @@ TEST(SemanticAnalyzerCSubset, BadFieldSizeofArrayDimensionRejected) {
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
-    EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_NonConstantArrayLength), 1u)
+    EXPECT_TRUE(model.hasErrors())
         << "sizeof(s.nope) — no such field — must fail loud, never fold a guess";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UndeclaredIdentifier), 1u)
+        << "the phantom field `nope` fails loud independently of the array dim";
 }
 
 // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-2) sizeof(va_list) pin: the injected
@@ -7213,8 +7226,12 @@ TEST(SemanticAnalyzerCSubset, FloatDoesNotLeakIntoIntegerConstExprConsumers) {
     EXPECT_EQ(countCode(saModel.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 1u)
         << "a float condition is NOT an integer constant expression (C 6.7.10)";
+    // VLA C1a (D-CSUBSET-VLA): pinned at FILE scope — a float bound is not an
+    // integer constant, so the file-scope array stays S_NonConstantArrayLength (it
+    // is not a VLA; a VLA needs automatic storage). A block-scope float bound would
+    // become a VLA (fails at the LIR C1b boundary); the no-leak intent holds here.
     auto dimModel = analyzeShipped("c-subset", {
-        "int main(void) { int a[1.5 + 1.5]; return 0; }\n",
+        "int a[1.5 + 1.5];\n",
     });
     EXPECT_EQ(countCode(dimModel.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 1u)
@@ -7227,8 +7244,10 @@ TEST(SemanticAnalyzerCSubset, FloatDoesNotLeakIntoIntegerConstExprConsumers) {
 // position. RED-ON-DISABLE: drop the integer-valued-core filter in
 // fixedValueTokenMap and both EXPECTs red (nullptr would fold to 0).
 TEST(SemanticAnalyzerCSubset, NullptrStaysNonFoldableInIntegerConstExpr) {
+    // VLA C1a (D-CSUBSET-VLA): pinned at FILE scope — `nullptr` is not an integer
+    // constant, so the file-scope array stays S_NonConstantArrayLength (not a VLA).
     auto dimModel = analyzeShipped("c-subset", {
-        "int main(void) { int a[nullptr]; return 0; }\n",
+        "int a[nullptr];\n",
     });
     EXPECT_EQ(countCode(dimModel.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 1u);

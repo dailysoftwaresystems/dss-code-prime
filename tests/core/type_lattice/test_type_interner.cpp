@@ -566,3 +566,41 @@ TEST(TypeInterner, BitIntBuilderAccessorsAndDedup) {
     EXPECT_EQ(ti.bitIntContainerKind(ti.bitInt(40, false)), TypeKind::U64);
     EXPECT_EQ(ti.bitIntContainerKind(ti.bitInt(64, true)),  TypeKind::I64);
 }
+
+// VLA C1a (D-CSUBSET-VLA): the vlaArray/isVlaArray sentinel type mirrors the
+// incompleteArray precedent — a kind=Array with the kVlaLength (-2) sentinel,
+// DISTINCT from an incomplete array (-1) and dedup'd by element.
+TEST(TypeInterner, VlaArrayIsDistinctSentinelAndDedups) {
+    auto ti = makeInterner(1);
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    TypeId const vla = ti.vlaArray(i32);
+
+    // Positive: reads as a VLA, its element is int.
+    EXPECT_TRUE(ti.isVlaArray(vla));
+    EXPECT_EQ(ti.kind(vla), TypeKind::Array);
+    auto const ops = ti.operands(vla);
+    ASSERT_EQ(ops.size(), 1u);
+    EXPECT_EQ(ops[0], i32);
+
+    // A VLA (-2) is NOT an incomplete array (-1) and vice versa — the two
+    // sentinels never alias (FAM logic must not fire on a VLA).
+    EXPECT_FALSE(ti.isIncompleteArray(vla));
+    TypeId const inc = ti.incompleteArray(i32);
+    EXPECT_FALSE(ti.isVlaArray(inc));
+    EXPECT_TRUE(ti.isIncompleteArray(inc));
+    EXPECT_NE(vla, inc);   // distinct TypeIds
+
+    // A fixed-length array is neither.
+    TypeId const fixed = ti.array(i32, 4);
+    EXPECT_FALSE(ti.isVlaArray(fixed));
+    EXPECT_FALSE(ti.isIncompleteArray(fixed));
+
+    // Dedup: all int VLAs share one TypeId (the per-decl runtime bound is
+    // out-of-band, NOT on the type).
+    EXPECT_EQ(ti.vlaArray(i32), vla);
+    std::size_t const before = ti.size();
+    (void)ti.vlaArray(i32);
+    EXPECT_EQ(ti.size(), before);   // no growth on re-intern
+    // A different element is a different VLA TypeId.
+    EXPECT_NE(ti.vlaArray(ti.primitive(TypeKind::I64)), vla);
+}

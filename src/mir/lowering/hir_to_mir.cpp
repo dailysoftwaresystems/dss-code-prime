@@ -91,6 +91,11 @@ struct Lowerer {
                                            // storage duration (TLS C1,
                                            // D-CSUBSET-THREAD-LOCAL). nullptr / no
                                            // entry ⇒ ordinary process-shared.
+    // VLA C1a (D-CSUBSET-VLA): optional — a block-scope variable-length array
+    // local's SIZE-expression HIR node, keyed by SymbolId.v. nullptr / no entry ⇒
+    // the local is not a VLA. Read in `allocaForLocal` to lower the runtime bound
+    // into the Alloca's size operand at the DECL point.
+    std::unordered_map<std::uint32_t, HirNodeId> const* vlaSizeMap = nullptr;
     MirBuilder               mir;
     // Extern symbols extracted during the pre-pass. Each extern's
     // SymbolId is also inserted into `functionSymbols` so a `Ref`
@@ -3676,6 +3681,18 @@ struct Lowerer {
             return InvalidMirInst;
         }
         TypeId const ptrTy = interner.pointer(ty);
+        // VLA C1a (D-CSUBSET-VLA): a VARIABLE-LENGTH array local reserves a RUNTIME-
+        // sized slot — the Alloca carries a size OPERAND, not a compile-time payload.
+        // This arm runs BEFORE the isMemoryResidentType byte-size path below (which
+        // nullopts + fails loud on a VLA — its layout has no static size). The size
+        // expr is evaluated HERE, at the DECL point (§6.7.6.2p2: once when the
+        // declaration is reached) — a VLA is emitted at its VarDecl site, never the
+        // entry-block hoist (the collectLocalDecls hoist SKIPS un-sizeable arrays; the
+        // load-bearing dependency that keeps `int a[f()]` evaluating in program
+        // order). C1a fails loud at MIR→LIR; C1b builds the dynamic-alloca codegen.
+        if (interner.isVlaArray(ty)) {
+            return vlaAllocaForLocal(sym, ty, ptrTy, anchor);
+        }
         // FC7 (D-FC7-MEMBER-ACCESS): a struct/union/ARRAY local reserves its
         // FULL layout size in the frame, not one scalar slot. Encode the byte
         // size in the Alloca payload (the channel ML6 anticipated; the LIR
@@ -3728,6 +3745,111 @@ struct Lowerer {
                 effectiveAlign = p->alignmentBytes;
         MirInstId const a =
             mir.addInst(MirOpcode::Alloca, {}, ptrTy, allocaPayload,
+                        MirInstFlags::None, /*payload2=*/effectiveAlign);
+        addressableLocal[sym.v] = a;
+        return a;
+    }
+
+    // VLA C1a (D-CSUBSET-VLA): materialize a variable-length array local's
+    // RUNTIME-sized `Alloca`. The caller (`allocaForLocal`) already ran the
+    // duplicate-binding guard; this only runs for `isVlaArray(ty)`. Shape: operand[0]
+    // = the total runtime BYTE size (count * elementStride, an i64 `Mul`), payload =
+    // 0 (the "runtime-sized" sentinel, DISTINCT from a fixed alloca's non-zero byte
+    // payload), payload2 = the effective alignment. C1a fails loud downstream at
+    // MIR→LIR; C1b consumes this operand for the dynamic `sub rsp,<size>`.
+    [[nodiscard]] MirInstId vlaAllocaForLocal(SymbolId sym, TypeId ty, TypeId ptrTy,
+                                              HirNodeId anchor) {
+        // The runtime size expr was captured by CST→HIR (un-skipping the array
+        // suffix) keyed by SymbolId. Absent ⇒ an internal side-table desync (a VLA
+        // type with no recorded bound) — fail loud, never a 0-sized / fixed slot.
+        HirNodeId sizeNode{};
+        if (vlaSizeMap != nullptr)
+            if (auto it = vlaSizeMap->find(sym.v); it != vlaSizeMap->end())
+                sizeNode = it->second;
+        if (!sizeNode.valid()) {
+            unsupported(anchor, "variable-length array local has no captured runtime "
+                                "size expression (internal side-table desync)");
+            return InvalidMirInst;
+        }
+        // Evaluate the bound at the decl point, then WIDEN to i64 (the byte-count
+        // width — mirrors the pointer-index widening idiom): a signed `int n` → Sext,
+        // an unsigned → Zext (both C-consistent: `(size_t)(int)-1` == SIZE_MAX ==
+        // sext(-1)).
+        MirInstId const sizeVal = lowerExpr(sizeNode);
+        if (!sizeVal.valid()) return InvalidMirInst;
+        TypeId const i64ty  = i64Ty();
+        TypeId const sizeTy = hir.typeId(sizeNode);
+        // Defense-in-depth (D-CSUBSET-VLA): a non-integer VLA size is a C 6.7.6.2p1
+        // constraint violation the SEMANTIC tier already rejects (S_VlaSizeNotInteger).
+        // A FLOAT that slipped past would silently `FPToSI`-TRUNCATE through mapCast
+        // (F64→I64 is FPToSI, NOT Invalid) — a garbage element count — so fail loud
+        // here rather than miscompile. (A nullptr bound is I32 0 by MIR, so ONLY the
+        // semantic check catches it; this is the float belt.)
+        if (sizeTy.valid() && isFloatingKind(interner.kind(sizeTy))) {
+            unsupported(anchor, "variable-length array size expression has floating "
+                                "type — must be integer (C 6.7.6.2p1; a semantic-tier "
+                                "constraint that should already have fired)");
+            return InvalidMirInst;
+        }
+        // A WIDE `_BitInt(N>64)` bound is a legal integer VLA size, but the multi-limb
+        // → i64 narrow is a later cycle — fail loud CLEANLY (D-CSUBSET-VLA), never the
+        // fatal `bitIntContainerKind`-on-wide path.
+        if (sizeTy.valid() && interner.kind(sizeTy) == TypeKind::BitInt
+            && interner.bitIntWidth(sizeTy) > 64) {
+            unsupported(anchor, "a wide _BitInt(N>64) variable-length array bound is "
+                                "not yet lowered (deferred — D-CSUBSET-VLA)");
+            return InvalidMirInst;
+        }
+        MirInstId count = sizeVal;
+        // Project the SOURCE kind: enum→underlying, narrow `_BitInt`→native container,
+        // else its own kind (so `_BitInt`/enum bounds widen, not just standard ints).
+        TypeKind const fromK =
+            sizeTy.valid() ? resolveScalarIntKind(sizeTy) : TypeKind::I32;
+        if (fromK != TypeKind::I64) {
+            MirOpcode const ext = mapCast(fromK, TypeKind::I64);
+            if (ext == MirOpcode::Invalid) {
+                unsupported(anchor, "variable-length array size expression has a "
+                                    "non-integer type with no widening to a 64-bit "
+                                    "byte count");
+                return InvalidMirInst;
+            }
+            std::array<MirInstId, 1> eo{sizeVal};
+            count = mir.addInst(ext, eo, i64ty);
+            if (!count.valid()) return InvalidMirInst;
+        }
+        // elementStride = the VLA element's byte size — a COMPILE-TIME constant for a
+        // 1-D VLA of a fixed element (multi-dim runtime stride is C3). nullopt / 0 →
+        // fail loud (an incomplete / empty-aggregate element), never `Mul(count, 0)`.
+        auto const elemOps = interner.operands(ty);
+        TypeId const elemTy = elemOps.empty() ? InvalidType : elemOps[0];
+        std::optional<std::uint64_t> const stride =
+            elemTy.valid() ? elementStride(elemTy) : std::nullopt;
+        if (!stride.has_value() || *stride == 0) {
+            unsupported(anchor, "variable-length array element type has no computable "
+                                "non-zero size (incomplete element or no "
+                                "aggregateLayout)");
+            return InvalidMirInst;
+        }
+        std::array<MirInstId, 2> mulOps{count, ci64(static_cast<std::int64_t>(*stride))};
+        MirInstId const bytes = mir.addInst(MirOpcode::Mul, mulOps, i64ty);
+        if (!bytes.valid()) return InvalidMirInst;
+        // Effective alignment from the ELEMENT (the VLA type has no static layout) +
+        // any `alignas` override on the decl. 0 = "no info". Mirrors the fixed path's
+        // payload2 channel; the PRIMARY payload stays 0 (the runtime-sized sentinel).
+        std::uint32_t effectiveAlign = 0;
+        if (config.aggregateLayoutLoaded && elemTy.valid())
+            if (auto const lay = computeLayout(elemTy, interner,
+                                               config.aggregateLayout,
+                                               config.dataModel);
+                lay.has_value())
+                effectiveAlign = lay->align.bytes();
+        if (alignmentMap != nullptr && anchor.valid())
+            if (auto const* p = alignmentMap->tryGet(anchor);
+                p != nullptr && p->alignmentBytes > effectiveAlign)
+                effectiveAlign = p->alignmentBytes;
+        std::array<MirInstId, 1> aops{bytes};
+        MirInstId const a =
+            mir.addInst(MirOpcode::Alloca, aops, ptrTy, /*payload=*/0,
                         MirInstFlags::None, /*payload2=*/effectiveAlign);
         addressableLocal[sym.v] = a;
         return a;
@@ -8766,6 +8888,13 @@ struct Lowerer {
                     || symbolToValue.contains(dsym.v))
                     continue;  // already slotted (defensive; locals/params are distinct)
                 TypeKind const dtk = interner.kind(dty);
+                // VLA C1a (D-CSUBSET-VLA) — LOAD-BEARING: a variable-length array
+                // (kind==Array, `aggregateByteSize` nullopt because computeLayout
+                // nullopts on the -2 length) matches this skip, so its Alloca is NOT
+                // hoisted to the entry block — it emits at the VarDecl site in program
+                // order, AFTER the runtime bound (`n` / a side-effecting `f()`) has
+                // been evaluated. Hoisting it would read an uninitialized bound. The
+                // MIR-tier ORDERING pin (IMPORTANT-3) guards this implicit dependency.
                 if ((dtk == TypeKind::Struct || dtk == TypeKind::Union
                      || dtk == TypeKind::Array)
                     && !aggregateByteSize(dty).has_value())
@@ -9920,7 +10049,9 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           HirMutabilityMap const*  mutabilityMap,
                           HirVolatileMap const*    volatileMap,
                           HirAlignmentMap const*   alignmentMap,
-                          HirThreadLocalMap const* threadLocalMap) {
+                          HirThreadLocalMap const* threadLocalMap,
+                          std::unordered_map<std::uint32_t, HirNodeId> const*
+                                                   vlaSizeMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -9939,6 +10070,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .volatileMap = volatileMap,
         .alignmentMap = alignmentMap,
         .threadLocalMap = threadLocalMap,
+        .vlaSizeMap = vlaSizeMap,
         .mir       = MirBuilder{},
     };
     // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING: stamp the module-

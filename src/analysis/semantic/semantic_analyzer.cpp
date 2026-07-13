@@ -1027,6 +1027,13 @@ floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
 constIntExpr(EngineState& s, Tree const& tree, NodeId node, ScopeId fromScope,
              SemanticConfig const* cfg);
 
+// VLA C1a (D-CSUBSET-VLA): the two array-suffix arms (`applyArraySuffix`,
+// `applyDeclaratorSuffix` — both DEFINED above the definition below) gate the VLA
+// accept on BLOCK scope via `fileScopeOf` (the agnostic scope-chain walk the
+// thread_local validator uses). Forward-declare it here so those arms can call it.
+[[nodiscard]] ScopeId fileScopeOf(EngineState const& s, Tree const& tree,
+                                  ScopeId scope);
+
 // Resolve a type-position subtree to a TypeId. Walks `typeShapes`
 // recursively (e.g. pointerType[innerType] → Ptr<innerType>) and looks
 // the leaf up in `builtinTypes`. A leaf that is not a built-in type but
@@ -2310,7 +2317,32 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         return s.lattice.interner().incompleteArray(base);
     }
     auto len = constIntExpr(s, tree, lenNode, fromScope, cfg);
-    if (!len.has_value()) { emit(DiagnosticCode::S_NonConstantArrayLength); return InvalidType; }
+    if (!len.has_value()) {
+        // VLA C1a (D-CSUBSET-VLA): the legacy-facet twin of the declarator-mode VLA
+        // arm — a PRESENT-but-non-constant length on a NON-FAM, NON-param declarator
+        // is a variable-length array. Build the vlaArray here; the block-vs-file +
+        // automatic-storage constraints are enforced by the Pass-2
+        // `validateVlaDeclarator` (reading the symbol's binding scope), NOT by the
+        // type-construction `fromScope` (a descendant of the file scope even for a
+        // file-scope decl). Params (`arrayToPointer`) + struct fields
+        // (`allowFlexibleArray`) already took their absent-length paths above.
+        // `visibleChildren(suffix).size() > 2` mirrors the twin's `hasPresentLength`:
+        // a PRESENT length (`[ expr ]`, 3 children) is a VLA; an ABSENT one (`[]`, 2)
+        // stays S_NonConstantArrayLength (defense-in-depth — the only legacy array-
+        // suffix row today is `externDecl`/allowFlexibleArray, skipped above).
+        if (!decl.allowFlexibleArray && !decl.arrayToPointer
+            && visibleChildren(tree, suffix).size() > 2) {
+            TypeInterner& in = s.lattice.interner();
+            // C1a is 1-D only (MINOR-2): reject any array/VLA element (the C3 boundary).
+            if (in.isVlaArray(base) || in.kind(base) == TypeKind::Array) {
+                emit(DiagnosticCode::S_VlaMultiDimUnsupported);
+                return InvalidType;
+            }
+            return in.vlaArray(base);
+        }
+        emit(DiagnosticCode::S_NonConstantArrayLength);
+        return InvalidType;
+    }
     // C99 §6.7.5.2: array length is a positive integer constant
     // expression. Negative folds (e.g. `int a[-1]`) and zero are
     // out-of-range; fail loud rather than wrap to a giant unsigned.
@@ -2324,6 +2356,13 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
     // ELEMENT is rejected. Mirrors the struct-composition in-aggregate check.
     if (typeContainsFlexibleArray(s.lattice.interner(), base)) {
         emit(DiagnosticCode::S_FlexibleArrayInAggregate);
+        return InvalidType;
+    }
+    // VLA C1a (IMPORTANT-2): a constant bound over a VLA element (`int a[5][n]`) —
+    // the -2 sentinel escapes the FAM guard above (which checks -1); fail loud
+    // rather than silently build `array(vlaArray, N)`. The C3 boundary.
+    if (s.lattice.interner().isVlaArray(base)) {
+        emit(DiagnosticCode::S_VlaMultiDimUnsupported);
         return InvalidType;
     }
     return s.lattice.interner().array(base, *len);
@@ -3295,6 +3334,35 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             // into the group recursion).
             if (allowFlexibleArray)
                 return s.lattice.interner().incompleteArray(inner);
+            // VLA C1a (D-CSUBSET-VLA): a PRESENT-but-non-constant length on a NON-FAM
+            // declarator (`!allowFlexibleArray` — params decay via the FAM branch
+            // above, struct fields take it too) is a VARIABLE-LENGTH array
+            // (C99/C11 §6.7.6.2 `int a[n]`). Build the vlaArray HERE regardless of
+            // scope/storage: the block-vs-file + automatic-storage constraints are
+            // enforced by the Pass-2 `validateVlaDeclarator`, which reads the SYMBOL's
+            // binding scope (`rec.scope`) — the type-construction `scope` here is a
+            // descendant of, NOT equal to, the file scope even for a file-scope decl,
+            // so `fileScopeOf(scope)` cannot discriminate file from block at this tier.
+            //
+            // CRITICAL — distinguish an ABSENT length (`T x[]`, an incomplete-array
+            // local — still `S_NonConstantArrayLength`) from a PRESENT non-constant
+            // length (`T x[n]`, a VLA): BOTH fold to nullopt, so the discriminator is
+            // a length CHILD between the brackets. `arrayDeclSuffix = [ BracketOpen,
+            // {optional expr}, BracketClose ]` → 3 visible children when present, 2
+            // when absent. Only a PRESENT length is a VLA.
+            bool const hasPresentLength =
+                visibleChildren(tree, suffix).size() > 2;
+            if (hasPresentLength) {
+                TypeInterner& in = s.lattice.interner();
+                // C1a is 1-D only (MINOR-2): a VLA whose ELEMENT is itself an array or
+                // a VLA (`int a[n][m]`, `int a[n][5]`) needs a runtime STRIDE — the C3
+                // boundary. Fail loud, never a silent nested-VLA.
+                if (in.isVlaArray(inner) || in.kind(inner) == TypeKind::Array) {
+                    emit(DiagnosticCode::S_VlaMultiDimUnsupported);
+                    return InvalidType;
+                }
+                return in.vlaArray(inner);
+            }
             emit(DiagnosticCode::S_NonConstantArrayLength);
             return InvalidType;
         }
@@ -3307,6 +3375,16 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
         // check — both array-forming sites reject it, by construction).
         if (typeContainsFlexibleArray(s.lattice.interner(), inner)) {
             emit(DiagnosticCode::S_FlexibleArrayInAggregate);
+            return InvalidType;
+        }
+        // VLA C1a (IMPORTANT-2): a CONSTANT outer bound over a VLA element
+        // (`int a[5][n]` — the `[n]` folded first into vlaArray, now `[5]` folds
+        // over it) is a multi-dimensional VLA. `typeContainsFlexibleArray` /
+        // `isIncompleteArray` check the -1 sentinel and do NOT catch the -2 VLA
+        // element, so this would otherwise silently build `array(vlaArray, 5)`.
+        // Fail loud — the C3 boundary, adjacent to the FAM guard by construction.
+        if (s.lattice.interner().isVlaArray(inner)) {
+            emit(DiagnosticCode::S_VlaMultiDimUnsupported);
             return InvalidType;
         }
         return s.lattice.interner().array(inner, *len);
@@ -3672,6 +3750,121 @@ void validateThreadLocalDeclarator(EngineState& s, SemanticConfig const& cfg,
              std::format("'{}' — a block-scope thread_local object requires "
                          "'static' or 'extern' (C 6.7.1p3)", rec.name));
     }
+}
+
+// VLA C1a (D-CSUBSET-VLA, C11 §6.7.6.2p1): kinds a VLA SIZE expression may have —
+// integer type (the standard integers, Bool, Char, Byte, Enum, and `_BitInt`; a
+// `_BitInt(N)` bound is a legal VLA size). A float / nullptr_t / pointer / any other
+// kind is rejected (S_VlaSizeNotInteger). Mirrors mapCast's integer set + Enum +
+// BitInt (both integer-compatible at array-index / arithmetic sites).
+[[nodiscard]] constexpr bool isVlaSizeIntegerType(TypeKind k) noexcept {
+    switch (k) {
+        case TypeKind::Bool:
+        case TypeKind::I8:  case TypeKind::I16: case TypeKind::I32:
+        case TypeKind::I64: case TypeKind::I128:
+        case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
+        case TypeKind::U64: case TypeKind::U128:
+        case TypeKind::Char: case TypeKind::Byte:
+        case TypeKind::Enum: case TypeKind::BitInt:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// VLA C1a (D-CSUBSET-VLA): the SIZE-expression CST node of a variable-length array
+// declarator — the child BETWEEN the array suffix's bracket delimiters
+// (`arrayDeclSuffix = [ BracketOpen, expr, BracketClose ]`). Bounded descendant scan
+// for the array-suffix rule (mirrors applyDeclaratorSuffix + captureVlaSize), then
+// the first non-delimiter (middle) child. InvalidNode if none (an absent length or a
+// missing suffix — the caller then skips the type check).
+[[nodiscard]] NodeId vlaLengthNode(Tree const& tree, NodeId declaratorNode,
+                                   DeclaratorConfig const& dc) {
+    NodeId suffix{};
+    std::vector<NodeId> stack{declaratorNode};
+    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
+        NodeId c = stack.back(); stack.pop_back();
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        if (tree.rule(c).v == dc.arraySuffixRule.v) { suffix = c; break; }
+        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+    }
+    if (!suffix.valid()) return {};
+    auto const kids = visibleChildren(tree, suffix);
+    for (std::size_t i = 0; i < kids.size(); ++i) {
+        if (i == 0 || i + 1 == kids.size()) continue;   // skip `[` and `]`
+        return kids[i];
+    }
+    return {};
+}
+
+// VLA C1a (D-CSUBSET-VLA, C99/C11 §6.7.6.2): the Pass-2 VLA constraint validator
+// (the validateThreadLocalDeclarator model — `declNode` + `declaratorNode` + `decl`
+// + `rec` in hand, runs AFTER expression typing). The type arm (applyDeclarator-
+// Suffix / applyArraySuffix) builds the `vlaArray` REGARDLESS of scope/storage/size-
+// type — the specifier prefix + the length's resolved type are not in hand at pure
+// type-construction time — so THIS validator owns all three constraints, in order:
+//   * FILE scope (`rec.scope` == file scope) → S_NonConstantArrayLength (a VLA needs
+//     AUTOMATIC storage; the type-construction scope is a descendant of the file
+//     scope even for a file-scope decl, so only `rec.scope` discriminates reliably —
+//     the SAME test the thread_local validator uses);
+//   * non-integer SIZE type (C 6.7.6.2p1) → S_VlaSizeNotInteger — a float / nullptr /
+//     pointer bound. THIS is the ONLY tier that can catch `nullptr` (it lowers to an
+//     I32 0 by MIR, so a MIR-tier integer check sees an integer);
+//   * BLOCK scope with non-automatic storage (`static`/`extern`) → S_VlaWithStatic-
+//     Storage (IMPORTANT-1; the static test reads the SAME staticStorage facet the
+//     D-CSUBSET-LOCAL-STATIC lowering routes on; the extern test is the record flag).
+// The caller gates on `isVlaArray(rec.type)` — only a RESOLVED VLA reaches here.
+void validateVlaDeclarator(EngineState& s, SemanticConfig const& cfg,
+                           Tree const& tree, NodeId declNode, NodeId declaratorNode,
+                           DeclarationRule const& decl, NodeId nameNode,
+                           SymbolId sym) {
+    SymbolRecord const& rec = s.symbols.at(sym);
+    auto const emit = [&](DiagnosticCode code, std::string what) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(nameNode);
+        d.actual   = std::move(what);
+        s.reporter.report(std::move(d));
+    };
+    // FILE scope — a file-scope array requires a CONSTANT bound (S_NonConstantArray-
+    // Length — the file-scope twin of the pre-VLA behavior). See the header comment.
+    if (rec.scope.v == fileScopeOf(s, tree, rec.scope).v) {
+        emit(DiagnosticCode::S_NonConstantArrayLength,
+             std::format("'{}' — a file-scope array requires a constant length; a "
+                         "variable-length array has automatic storage duration only "
+                         "(C 6.7.6.2p2)", rec.name));
+        return;
+    }
+    // NON-INTEGER size (C 6.7.6.2p1) — locate the length expr under THIS declarator +
+    // query its RESOLVED type (available now, post-typing). A float / nullptr_t /
+    // pointer bound is illegal C. `nullptr` is caught HERE (semantic-tier NullptrT)
+    // and nowhere downstream (it is I32 0 by MIR). An unresolved length type (the
+    // length itself already failed loud) skips this — no cascade.
+    if (cfg.declarators.has_value()) {
+        NodeId const lenNode =
+            vlaLengthNode(tree, declaratorNode, *cfg.declarators);
+        if (lenNode.valid()) {
+            TypeId const lenTy = subtreeType(s, tree, lenNode, rec.scope);
+            if (lenTy.valid()
+                && !isVlaSizeIntegerType(s.lattice.interner().kind(lenTy))) {
+                emit(DiagnosticCode::S_VlaSizeNotInteger,
+                     std::format("'{}' — a variable-length array size must have "
+                                 "integer type (C 6.7.6.2p1)", rec.name));
+                return;
+            }
+        }
+    }
+    // BLOCK scope but non-automatic storage (`static`/`extern`) — IMPORTANT-1.
+    bool const isExtern = rec.isExternDeclaration;
+    bool const isStatic =
+        scanSpecifierPrefixStorage(tree, declNode, decl).staticStorage;
+    if (!isExtern && !isStatic) return;   // automatic storage — a legal VLA
+    emit(DiagnosticCode::S_VlaWithStaticStorage,
+         std::format("'{}' — a variable-length array requires automatic storage "
+                     "duration; it may not be declared '{}' (C 6.7.6.2p2)",
+                     rec.name, isExtern ? "extern" : "static"));
 }
 
 // D-CSUBSET-FN-PROTOTYPE + D-CSUBSET-EXTERN-DEFINITION-MERGE + c33
@@ -7308,6 +7501,24 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                     validateThreadLocalDeclarator(
                                         s, cfg, tree, node, decl, vName,
                                         vSym);
+                                }
+                                // VLA C1a (D-CSUBSET-VLA): the type arm builds a
+                                // vlaArray REGARDLESS of scope/storage/size-type, so
+                                // this Pass-2 validator owns ALL the VLA constraints —
+                                // a FILE-scope VLA (`int g[n]`, whose vlaArray the arm
+                                // DID build) is rejected here by its rec.scope
+                                // file-scope branch (S_NonConstantArrayLength), a
+                                // non-integer size by S_VlaSizeNotInteger, and a
+                                // block-scope static/extern by S_VlaWithStaticStorage.
+                                // `dNode` is THIS declarator (the length-node scan
+                                // needs it). The positional-name externDecl mirror
+                                // below needs no VLA hook (it is declarator-mode-free
+                                // and file-scope — but even a positional VLA would be
+                                // caught by the file-scope branch if one existed).
+                                if (s.lattice.interner().isVlaArray(
+                                        s.symbols.at(vSym).type)) {
+                                    validateVlaDeclarator(s, cfg, tree, node, dNode,
+                                                          decl, vName, vSym);
                                 }
                             }
                         }

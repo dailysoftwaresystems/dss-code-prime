@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 112> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 117> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -186,6 +186,11 @@ constexpr std::array<DiagnosticCode, 112> kUnsuppressableCodes{{
     DiagnosticCode::I_NullptrTypeInMir,
     DiagnosticCode::I_StructCfMismatch,
     DiagnosticCode::I_UnreachableBlock,
+    // I_VlaAllocaOperandInvalid (VLA C1a, D-CSUBSET-VLA): the runtime-sized-Alloca
+    // operand↔payload invariant (a VLA alloca carries exactly one size operand +
+    // zero payload; a fixed alloca carries none). A member like every I_* verifier
+    // invariant — a suppressed violation would let a mis-sized stack slot sail past.
+    DiagnosticCode::I_VlaAllocaOperandInvalid,
 
     // K_* linker band — image refused / undefined extern + the LK10
     // image-write contract codes. Suppressing any K_ImageWrite* code
@@ -260,6 +265,12 @@ constexpr std::array<DiagnosticCode, 112> kUnsuppressableCodes{{
     DiagnosticCode::L_IndirectCalleeClobberedByArgSetup,
     DiagnosticCode::L_StackPassedArgUnsupported,
     DiagnosticCode::L_CcRegLookupFailed,
+    // L_VlaDynamicAllocaUnsupported (VLA C1a→C1b boundary, D-CSUBSET-VLA): a runtime-
+    // sized `Alloca` reached `lowerAlloca` (the dynamic `sub rsp,<size>` is the named
+    // C1b cycle). A member: suppressed, the alloca would fall through to the fixed-
+    // slot path and silently emit a `lea` of a 1-slot scalar for the whole VLA — a
+    // stack miscompile (MINOR-3). Same load-bearing-boundary class as the L_ band.
+    DiagnosticCode::L_VlaDynamicAllocaUnsupported,
 
     // R_* regalloc band — calling-convention / class invariants.
     // R_SpilledDueToPressure + R_SpilledDueToCrossCallExhaustion
@@ -470,6 +481,22 @@ constexpr std::array<DiagnosticCode, 112> kUnsuppressableCodes{{
     // suppressed, the naive scalar path emits the wrong sign + drops the upper limbs
     // (a wide `(_BitInt(128))1.5` / `(double)wide`) and silently miscompiles.
     DiagnosticCode::S_BitIntWideFloatConvUnsupported,
+    // S_Vla* (VLA C1a, D-CSUBSET-VLA, C99/C11 §6.7.6.2): the two variable-length-array
+    // constraint/boundary violations — a block-scope static/extern VLA (a VLA needs
+    // automatic storage) and a multi-dimensional VLA (the C3 boundary). Both ship a
+    // WRONG type if suppressed: the static form would carry a runtime-sized `vlaArray`
+    // into the static-local→hidden-global lowering (whose layout has no static size),
+    // and the multi-dim form would build a nested array-of-VLA / VLA-of-array type no
+    // lowering tier handles. Same silent-miscompile-guard class as the S_BitInt* /
+    // S_Alignas* constraint entries above. Closed here so an invalid VLA never
+    // compiles quietly.
+    DiagnosticCode::S_VlaWithStaticStorage,
+    DiagnosticCode::S_VlaMultiDimUnsupported,
+    // S_VlaSizeNotInteger (C11 §6.7.6.2p1): a non-integer VLA size (float / nullptr /
+    // pointer). Suppressed, it ships a bogus VLA — a float bound FPToSI-truncates to
+    // a garbage element count, a nullptr bound is a silent 0-byte array. Same
+    // silent-miscompile-guard class as the S_Vla* siblings above.
+    DiagnosticCode::S_VlaSizeNotInteger,
     // S_UnknownAttribute / S_DeprecatedSymbolUsed / S_NodiscardResultDiscarded
     // (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13) are deliberately NOT
     // members — the same suppressible posture as S_UnknownTypeAttribute above.

@@ -123,7 +123,8 @@ struct Lowered {
                                     &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
                                     &hir->linkageMap, &hir->mutabilityMap,
                                     &hir->volatileMap, /*alignmentMap=*/nullptr,
-                                    &hir->threadLocalMap);
+                                    &hir->threadLocalMap,
+                                    &hir->vlaSizeExprBySymbol);   // VLA C1a
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -8523,4 +8524,100 @@ TEST(MirLoweringCSubset, WideBitIntEasyOpsLowerGreen) {
         << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
     EXPECT_TRUE(L.mir.ok)
         << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+}
+
+// ── VLA C1a (D-CSUBSET-VLA): the front-end + IR pin ──────────────────────────
+//
+// A block-scope `int a[n]` lowers to a `vlaArray(int)`-typed local whose MIR
+// `Alloca` carries a RUNTIME size OPERAND = Mul(widened(load n), sizeof(int)),
+// primary payload 0 — emitted AT THE DECL POINT, AFTER the store to `n` and NOT
+// hoisted to the entry-block top (IMPORTANT-3). C1a proves this at the MIR tier;
+// the runnable dynamic-alloca codegen is C1b (this alloca fails loud at MIR->LIR).
+// RED-ON-DISABLE: revert the semantic VLA arm -> `int a[n]` is S_NonConstantArray-
+// Length (no MIR); revert the MIR arm -> the aggregateByteSize fail-loud.
+TEST(MirLoweringCSubset, VlaLocalLowersToRuntimeOperandAllocaAtDeclPoint) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 4;\n"
+        "  int a[n];\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "a valid automatic VLA must lower cleanly to MIR (the fail-loud is at "
+           "MIR->LIR, not here): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& in = L.model.lattice().interner();
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // Find THE runtime-operand Alloca (the VLA `a`) + the Store to `n`'s slot.
+    int vlaIdx = -1, storeIdx = -1;
+    MirInstId vlaAlloca{};
+    int allocaWithOperandCount = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        MirOpcode const op = m.instOpcode(id);
+        if (op == MirOpcode::Alloca && !m.instOperands(id).empty()) {
+            ++allocaWithOperandCount;
+            vlaIdx    = static_cast<int>(i);
+            vlaAlloca = id;
+        }
+        if (op == MirOpcode::Store && storeIdx < 0) storeIdx = static_cast<int>(i);
+    }
+    ASSERT_EQ(allocaWithOperandCount, 1)
+        << "exactly one runtime-operand (VLA) Alloca must be emitted";
+    ASSERT_GE(storeIdx, 0) << "`n = 4` must emit a Store to n's slot";
+
+    // (1) TYPE: the alloca result is ptr<vlaArray(int)> (the -2 sentinel), elem I32.
+    TypeId const allocaTy = m.instType(vlaAlloca);
+    ASSERT_TRUE(allocaTy.valid());
+    ASSERT_EQ(in.kind(allocaTy), TypeKind::Ptr);
+    auto const ptrOps = in.operands(allocaTy);
+    ASSERT_EQ(ptrOps.size(), 1u);
+    TypeId const pointee = ptrOps[0];
+    EXPECT_TRUE(in.isVlaArray(pointee))
+        << "the VLA local's type must be a vlaArray (kVlaLength=-2 sentinel)";
+    EXPECT_FALSE(in.isIncompleteArray(pointee))
+        << "a VLA (-2) must NOT read as an incomplete array (-1)";
+    auto const elemOps = in.operands(pointee);
+    ASSERT_EQ(elemOps.size(), 1u);
+    EXPECT_EQ(in.kind(elemOps[0]), TypeKind::I32) << "element type is int";
+
+    // (2) OPERAND SHAPE: operand[0] = Mul(SExt(Load n), Const 4), primary payload 0.
+    EXPECT_EQ(m.instPayload(vlaAlloca), 0u)
+        << "a runtime-sized VLA alloca carries a ZERO primary payload (the size is "
+           "the OPERAND, not the payload)";
+    auto const aOps = m.instOperands(vlaAlloca);
+    ASSERT_EQ(aOps.size(), 1u);
+    MirInstId const bytes = aOps[0];
+    ASSERT_EQ(m.instOpcode(bytes), MirOpcode::Mul);
+    auto const mulOps = m.instOperands(bytes);
+    ASSERT_EQ(mulOps.size(), 2u);
+    // op1 = the element stride constant (sizeof(int) == 4).
+    ASSERT_EQ(m.instOpcode(mulOps[1]), MirOpcode::Const);
+    auto const& strideLit = m.literalValue(m.constLiteralIndex(mulOps[1]));
+    auto const* strideVal = std::get_if<std::int64_t>(&strideLit.value);
+    ASSERT_NE(strideVal, nullptr);
+    EXPECT_EQ(*strideVal, 4) << "byte size = count * sizeof(int)";
+    // op0 = the widened count: SExt(Load n) (signed int n -> i64).
+    ASSERT_EQ(m.instOpcode(mulOps[0]), MirOpcode::SExt);
+    auto const sextOps = m.instOperands(mulOps[0]);
+    ASSERT_EQ(sextOps.size(), 1u);
+    EXPECT_EQ(m.instOpcode(sextOps[0]), MirOpcode::Load)
+        << "the runtime bound is the LOAD of the local `n` (proves the size expr "
+           "was un-skipped + lowered at the decl point)";
+
+    // (3) ORDERING (IMPORTANT-3): emitted at the DECL point — AFTER the store to
+    // `n`, NOT at the entry-block top (index 0 is the hoisted scalar `n` alloca).
+    EXPECT_GT(vlaIdx, storeIdx)
+        << "the VLA alloca must follow the store to its runtime bound `n`";
+    EXPECT_NE(vlaIdx, 0)
+        << "the VLA alloca must NOT be hoisted to the entry-block top";
 }

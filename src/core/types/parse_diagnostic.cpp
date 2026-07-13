@@ -210,6 +210,9 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_BitIntWideMulDivUnsupported";
         case DiagnosticCode::S_BitIntWideFloatConvUnsupported:
             return "S_BitIntWideFloatConvUnsupported";
+        case DiagnosticCode::S_VlaWithStaticStorage:     return "S_VlaWithStaticStorage";
+        case DiagnosticCode::S_VlaMultiDimUnsupported:   return "S_VlaMultiDimUnsupported";
+        case DiagnosticCode::S_VlaSizeNotInteger:        return "S_VlaSizeNotInteger";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
@@ -257,6 +260,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_AllocaAlignmentNotPowerOfTwo: return "I_AllocaAlignmentNotPowerOfTwo";
         case DiagnosticCode::I_NullptrTypeInMir:         return "I_NullptrTypeInMir";
         case DiagnosticCode::I_BitIntWidthInconsistent:  return "I_BitIntWidthInconsistent";
+        case DiagnosticCode::I_VlaAllocaOperandInvalid:  return "I_VlaAllocaOperandInvalid";
         case DiagnosticCode::I_ExtensionTypeInMir:       return "I_ExtensionTypeInMir";
         case DiagnosticCode::I_StructCfMismatch:         return "I_StructCfMismatch";
         case DiagnosticCode::I_UnreachableBlock:         return "I_UnreachableBlock";
@@ -277,6 +281,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::L_IndirectCallUnsupported:      return "L_IndirectCallUnsupported";
         case DiagnosticCode::L_IndirectCalleeClobberedByArgSetup: return "L_IndirectCalleeClobberedByArgSetup";
         case DiagnosticCode::L_OverAlignedStackLocal:        return "L_OverAlignedStackLocal";
+        case DiagnosticCode::L_VlaDynamicAllocaUnsupported:  return "L_VlaDynamicAllocaUnsupported";
         case DiagnosticCode::R_NoCallingConventions:          return "R_NoCallingConventions";
         case DiagnosticCode::R_CallingConventionLookupFailed: return "R_CallingConventionLookupFailed";
         case DiagnosticCode::R_VRegHasNoClass:                return "R_VRegHasNoClass";

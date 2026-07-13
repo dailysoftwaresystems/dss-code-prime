@@ -1419,6 +1419,23 @@ struct Lowerer {
         reporter.report(std::move(d));
     }
 
+    // VLA C1a → C1b boundary (D-CSUBSET-VLA): a runtime-sized `Alloca` (a
+    // variable-length array `int a[n]`, carrying a size operand) reached the LIR
+    // lowering. The static frame model + `lea_frame_slot` rematerialization assume a
+    // fixed compile-time slot; a dynamic `sub rsp,<size>` + frame-pointer addressing
+    // is the NAMED C1b cycle. Fails loud (never a silent fixed-slot miscompile).
+    void reportVlaDynamicAlloca(MirInstId at) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::L_VlaDynamicAllocaUnsupported;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "variable-length array requires a dynamic stack allocation (runtime "
+            "sub-sp + frame pointer), not yet lowered to target '{}' (MIR inst {}) "
+            "— D-CSUBSET-VLA C1b",
+            target.name(), at.v);
+        reporter.report(std::move(d));
+    }
+
     void reportDoubleDef(MirInstId at) {
         ParseDiagnostic d;
         d.code     = DiagnosticCode::L_UnsupportedLoweringForOpcode;
@@ -2359,6 +2376,22 @@ struct Lowerer {
     void lowerAlloca(MirInstId id) {
         if (!opcode(MnemonicSlot::Alloca).has_value()) {
             reportMissingOpcode(MnemonicSlot::Alloca, "MIR Alloca");
+            return;
+        }
+        // VLA C1a → C1b boundary (D-CSUBSET-VLA, MINOR-3): a runtime-sized Alloca
+        // carries a size OPERAND (a VLA `int a[n]`); this lowering reads ONLY the
+        // payload and would otherwise SILENTLY reserve a fixed 1-slot scalar, drop
+        // the runtime size, and `lea` that slot for the whole array. Fail loud AND
+        // `return` BEFORE emitInst — so `functionLocalAllocaPayloads` never records a
+        // bogus slot and no wrong-sized `lea` is emitted. C1b builds the dynamic
+        // alloca (sub-sp + frame pointer). This is the genuinely red-on-disable guard.
+        if (!mir.instOperands(id).empty()) {
+            reportVlaDynamicAlloca(id);
+            // Poison the alloca RESULT so downstream address uses (`a[i]`) resolve to
+            // a placeholder vreg instead of cascading "used before definition" — one
+            // clean fail-loud. No alloca op is emitted + no frame slot is recorded
+            // (MINOR-3): `functionLocalAllocaPayloads` never sees it.
+            poisonValue(id);
             return;
         }
         std::uint32_t const payload = mir.instPayload(id);

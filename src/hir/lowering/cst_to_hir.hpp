@@ -96,6 +96,16 @@ struct DSS_EXPORT CstToHirResult {
                                   // `alignas` (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN);
                                   // read at HIR→MIR to raise a global's data-item
                                   // alignment + a local's effective alloca alignment
+    // VLA C1a (D-CSUBSET-VLA, Fork A out-of-band size side-table): a block-scope
+    // variable-length array's LOWERED size-expression HIR node, keyed by the
+    // declared local's SymbolId (`.v`). The array suffix is normally SKIPPED at
+    // CST→HIR; for a VLA declarator it is un-skipped and its length expr lowered to
+    // this floating HIR node (valid in `hir`, reachable only via this map — the
+    // arena keeps it; no pass walks to it). HIR→MIR's `allocaForLocal` looks it up
+    // by symbol, re-lowers it to a runtime MIR value at the DECL point, and scales
+    // it to a total byte size for the Alloca's runtime operand. Empty for every
+    // non-VLA translation unit.
+    std::unordered_map<std::uint32_t, HirNodeId> vlaSizeExprBySymbol;
     HirLiteralPool literalPool;   // decoded literal values, indexed by literalIndex
     // True iff neither lowering nor the verify-on-load pass emitted an
     // Error-severity diagnostic (delta-computed, so prior diagnostics on the

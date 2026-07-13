@@ -107,6 +107,18 @@ inline constexpr std::uint32_t kFirstExtensionKind = 256;
 // can never collide with a user-written array length).
 inline constexpr std::int64_t kIncompleteArrayLength = -1;
 
+// VLA C1a (D-CSUBSET-VLA): the length-scalar sentinel marking a kind=Array as a
+// VARIABLE-LENGTH array (C99/C11 §6.7.6.2 `int a[n]` with a runtime bound).
+// DISTINCT from `kIncompleteArrayLength` (-1, a FAM) — a VLA has a real (runtime)
+// size that is NOT known at compile time, so it carries no static layout
+// (`computeLayout` already nullopts on any negative length scalar) but is a
+// COMPLETE object type. All VLAs of the same element dedup to one TypeId (the
+// per-declaration runtime bound lives OUT-OF-BAND in a size side-table, NOT on the
+// type — the incomplete-array precedent, Fork A1). Like -1 it can never collide
+// with a user-written length (the semantic phase rejects 0/negative declared
+// constant lengths).
+inline constexpr std::int64_t kVlaLength = -2;
+
 // FC8 bitfields (D-CSUBSET-BITFIELD): the per-field bitfield-width sentinel
 // marking an ORDINARY (non-bitfield) struct field in `structType`'s
 // `fieldBitWidths` argument. A bitfield passes its declared width in [0, 64]

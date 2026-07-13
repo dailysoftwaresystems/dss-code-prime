@@ -824,6 +824,37 @@ enum class DiagnosticCode : std::uint16_t {
     // a wide SOURCE) rather than silently miscompiling. NARROW (N<=64) float<->`_BitInt`
     // is unaffected (it rides the native container, C1). UNSUPPRESSABLE.
     S_BitIntWideFloatConvUnsupported = 0xE050,
+    // VLA C1a (D-CSUBSET-VLA, C99/C11 §6.7.6.2p2): a block-scope variable-length
+    // array declared with STATIC or EXTERN storage (`static int a[n];`). A VLA
+    // requires AUTOMATIC storage duration — a static/thread/extern object may not
+    // have a variably modified type. Emitted by the Pass-2 `validateVlaDeclarator`
+    // (the thread_local-validator model): the type arm builds the `vlaArray` at
+    // block scope regardless of storage; this validator rejects the non-automatic
+    // ones. UNSUPPRESSABLE — a suppressed static VLA would carry a runtime-sized
+    // type into the static-local→hidden-global lowering, whose layout has no static
+    // size (a wrong-storage miscompile). (File-scope `int g[n]` never becomes a VLA
+    // — the scope gate leaves it S_NonConstantArrayLength.)
+    S_VlaWithStaticStorage = 0xE051,
+    // VLA C1a (D-CSUBSET-VLA) — the C3 multi-dimensional boundary: a VLA whose
+    // ELEMENT is itself an array or a VLA (`int a[n][m]`, `int a[5][n]`,
+    // `int a[n][5]`). C1a ships 1-D VLAs only; a runtime STRIDE through index/GEP
+    // for a multi-dimensional VLA lands in C3. Rejected on BOTH the VLA arm (any
+    // array/VLA element) AND the constant arms (a VLA element — `typeContains-
+    // FlexibleArray`/`isIncompleteArray` check -1, so they would silently build
+    // `array(vlaArray)`). UNSUPPRESSABLE — a suppressed multi-dim VLA would build a
+    // nested array-of-VLA / VLA-of-array type that no lowering tier handles.
+    S_VlaMultiDimUnsupported = 0xE052,
+    // VLA C1a (D-CSUBSET-VLA, C11 §6.7.6.2p1): a variable-length array whose size
+    // expression does NOT have integer type (`int a[1.5]` — float; `int a[nullptr]` —
+    // nullptr_t; a pointer; etc.). C requires the VLA size to have integer type.
+    // Enforced at the SEMANTIC tier (Pass-2 `validateVlaDeclarator`, after expression
+    // typing) because a MIR-tier integer check CANNOT catch `nullptr` — it lowers to
+    // an I32 0 by MIR (NullptrT is semantic-tier-only). UNSUPPRESSABLE — a suppressed
+    // non-integer length would reach codegen as a bogus VLA: a float bound
+    // `FPToSI`-truncates to a garbage element count, a nullptr bound is a silent
+    // 0-byte array. Integer kinds ACCEPTED: the standard integers, Bool, Char, Byte,
+    // Enum, and `_BitInt` (a `_BitInt(N)` bound is a legal VLA size).
+    S_VlaSizeNotInteger = 0xE053,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -1269,6 +1300,17 @@ enum class DiagnosticCode : std::uint16_t {
     // masked value would silently miscompile the wrap. Never fires under the
     // chokepoint discipline; the backstop that catches a regression of it.
     I_BitIntWidthInconsistent      = 0xA015,
+    // VLA C1a (D-CSUBSET-VLA): a MIR `Alloca` whose operand/payload shape breaks the
+    // runtime-sized invariant. A VLA-typed alloca (its pointee `isVlaArray`) MUST
+    // carry exactly ONE operand (the total runtime byte size) and a ZERO primary
+    // payload (the "runtime-sized" sentinel, distinct from a fixed alloca's non-zero
+    // byte-size payload); a NON-VLA (fixed) alloca MUST carry NO operand. A mismatch
+    // (a VLA alloca that lost its size operand → a silently under-sized fixed slot,
+    // or a fixed alloca that grew a spurious runtime operand) is a by-construction
+    // break of the PIECE-4 lowering. Interner-gated (needs `isVlaArray`); the
+    // operand↔payload consistency half also runs interner-free. Caught at every
+    // verify point.
+    I_VlaAllocaOperandInvalid      = 0xA016,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //
@@ -1352,6 +1394,15 @@ enum class DiagnosticCode : std::uint16_t {
     //   over-alignment (e.g. `alignas(16)`) is HONORED via a local-area pad, not
     //   this code — so this fires only past the representable bound.
     L_OverAlignedStackLocal        = 0xB00C,
+    // VLA C1a → C1b boundary (D-CSUBSET-VLA): `lowerAlloca` reached a MIR `Alloca`
+    //   carrying a RUNTIME size operand (a variable-length array `int a[n]`). The
+    //   static frame model + `lea_frame_slot` rematerialization assume a fixed
+    //   compile-time slot; a dynamic `sub rsp,<size>` + frame-pointer addressing is
+    //   the NAMED C1b cycle. Fails loud BEFORE `emitInst` so no bogus fixed slot is
+    //   recorded. UNSUPPRESSABLE — suppressed, the alloca would fall through to the
+    //   fixed-slot path and silently lose the runtime size (a `lea` of a 1-slot
+    //   scalar for the whole array — a stack miscompile).
+    L_VlaDynamicAllocaUnsupported  = 0xB00D,
 
     // ── Register allocator (renders as `R`) ────────────────────────────
     //

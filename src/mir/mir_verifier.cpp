@@ -141,6 +141,45 @@ void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const 
                     std::format("alloca alignment payload {} is not a power of "
                                 "two in [1, 256]", a));
             }
+            // VLA C1a (D-CSUBSET-VLA): the runtime-sized-Alloca invariant. A VLA
+            // alloca (its pointee `isVlaArray`) MUST carry exactly ONE operand (the
+            // total runtime byte size) and a ZERO primary payload (the runtime-sized
+            // sentinel); a FIXED (non-VLA) alloca MUST carry NO operand. Ties operand
+            // presence to the type so a regression that drops the size operand (→ a
+            // 0-sized fixed slot) or bolts one onto a fixed alloca is caught loud.
+            std::size_t const allocaOperands = mir_.instOperands(id).size();
+            std::uint32_t const primaryPayload = mir_.instPayload(id);
+            // Interner-free half: an operand present ⇒ the byte payload MUST be 0
+            // (exactly one channel encodes the size).
+            if (allocaOperands >= 1 && primaryPayload != 0) {
+                reportInst(reporter,
+                    DiagnosticCode::I_VlaAllocaOperandInvalid, id,
+                    std::format("runtime-sized (VLA) alloca carries a size operand "
+                                "AND a non-zero byte payload {} — exactly one must "
+                                "encode the size", primaryPayload));
+            }
+            // Interner-gated half: tie operand-presence to VLA-ness of the pointee.
+            if (interner_ != nullptr) {
+                TypeId const resTy = mir_.instType(id);   // ptr<allocated>
+                TypeId pointee{};
+                if (resTy.valid() && interner_->kind(resTy) == TypeKind::Ptr) {
+                    auto const ops = interner_->operands(resTy);
+                    if (!ops.empty()) pointee = ops[0];
+                }
+                bool const isVla =
+                    pointee.valid() && interner_->isVlaArray(pointee);
+                if (isVla && allocaOperands != 1) {
+                    reportInst(reporter,
+                        DiagnosticCode::I_VlaAllocaOperandInvalid, id,
+                        std::format("VLA-typed alloca must carry exactly one runtime "
+                                    "size operand, found {}", allocaOperands));
+                } else if (!isVla && allocaOperands != 0) {
+                    reportInst(reporter,
+                        DiagnosticCode::I_VlaAllocaOperandInvalid, id,
+                        std::format("fixed (non-VLA) alloca must carry no runtime "
+                                    "size operand, found {}", allocaOperands));
+                }
+            }
         }
     });
     // CFG-successor range validation. `mirBuildPredecessors` (the

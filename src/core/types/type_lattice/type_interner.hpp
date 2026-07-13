@@ -172,6 +172,16 @@ public:
     // check `isIncompleteArray`.
     TypeId incompleteArray(TypeId element);
     [[nodiscard]] bool isIncompleteArray(TypeId id) const;
+    // VLA C1a (D-CSUBSET-VLA): a VARIABLE-LENGTH array (`int a[n]`) — a kind=Array
+    // type whose length scalar is the `kVlaLength` (-2) sentinel. DISTINCT from an
+    // incomplete array (-1): a VLA is a COMPLETE object type with a runtime size,
+    // but that size lives OUT-OF-BAND (a decl-keyed size side-table), NOT on the
+    // type — so all VLAs of one element dedup to a single TypeId (the incomplete-
+    // array precedent, Fork A1). No new TypeKind, so every Array consumer keeps
+    // working; only runtime-size-bearing consumers (alloca, later sizeof) check
+    // `isVlaArray`. `computeLayout` already nullopts on the negative length scalar.
+    TypeId vlaArray(TypeId element);
+    [[nodiscard]] bool isVlaArray(TypeId id) const;
     // tuple: operands=[elements...].
     TypeId tuple(std::span<TypeId const> elements);
 
