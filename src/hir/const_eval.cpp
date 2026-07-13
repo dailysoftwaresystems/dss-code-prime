@@ -70,6 +70,13 @@ combineUnary(Hir const& hir, HirNodeId expr, EvalOptions const& options,
              ConstEvalResult inner) {
     if (!inner.value.has_value()) return inner;
     HirOpKind const op = decodeCoreOp(hir.payload(expr));
+    // C4b (I2 go-live gate): a unary op on a `_BitInt` operand (`-5wb`, `~x`) folds
+    // via the bignum — BEFORE the `asInt64`+`applyUnaryInt` path below, which would
+    // negate a NARROW `_BitInt` via un-wrapped int64 arithmetic (a silent miscompile).
+    if (auto uf = detail::foldBitIntUnary(op, *inner.value); uf.applies) {
+        if (uf.ok) return ok(std::move(uf.value));
+        return fail(uf.failure, expr);
+    }
     // Float operand routes through the float path (CE5) only when
     // `allowFloat` is opted in by the caller. Without the knob, a
     // float-typed UnaryOp refuses with `UnsupportedTypeKind` —
@@ -115,14 +122,19 @@ combineBinary(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     if (!b.value.has_value()) return b;
     HirOpKind const op = decodeCoreOp(hir.payload(expr));
     auto kids = hir.children(expr);
-    // D-CSUBSET-BITINT (CRIT-3): a bit-precise operand or result — const-eval has no
-    // mod-2^N wrap (`interner.commonType` returns InvalidType for a BitInt, so the
-    // fold would keep an UN-wrapped int64 value). FAIL LOUD rather than silently
-    // mis-fold (the combineCast twin). Wrap-aware bignum const-fold is C4.
-    if (interner.kind(hir.typeId(expr)) == TypeKind::BitInt
-        || (kids.size() == 2
-            && (interner.kind(hir.typeId(kids[0])) == TypeKind::BitInt
-                || interner.kind(hir.typeId(kids[1])) == TypeKind::BitInt))) {
+    // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a `_BitInt`-involving binary op folds
+    // via the shared wrap-aware bignum at the TRUE C23 UAC result width (mod-2^N).
+    // The fold sets its OWN result core (BitInt for a bit-precise result, or the
+    // standard kind for an int-outranked BitInt) and returns HERE — bypassing the
+    // `interner.commonType` retag below, which returns InvalidType for a BitInt (I2).
+    if (auto bf = detail::foldBitIntBinary(op, *a.value, *b.value); bf.applies) {
+        if (bf.ok) return ok(std::move(bf.value));
+        return fail(bf.failure, expr);
+    }
+    // CRIT-3 belt-and-suspenders: a BitInt-typed RESULT whose operand values did NOT
+    // fold to bit-precise (a shape C's typing rules never produce) must NEVER take the
+    // un-wrapped int64 path — fail loud rather than silently mis-fold.
+    if (interner.kind(hir.typeId(expr)) == TypeKind::BitInt) {
         return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
     }
     // CE5: float promotion. Per C99 UAC, if either operand is float
@@ -223,21 +235,21 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     TypeId const targetTy = hir.typeId(expr);
     if (!targetTy.valid()) return fail(ConstEvalFailure::NotAConstantExpression, expr);
     TypeKind const toK = interner.kind(targetTy);
-    // D-CSUBSET-BITINT (CRIT-3): const-eval does NOT model the mod-2^N wrap of a
-    // bit-precise integer. Folding a cast TO `_BitInt(N)` via int64 would leave the
-    // value UN-wrapped — `_Static_assert((_BitInt(4))15+1==0)` would spuriously FAIL
-    // (16 != 0) and `!=0` would silently accept an invalid program. FAIL LOUD on any
-    // BitInt-typed cast (target OR a BitInt source) for C1–C3; wrap-aware bignum
-    // const-fold is C4. A real diagnostic (UnsupportedTypeKind) in ICE contexts.
+    // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a cast TO `_BitInt(N)` folds via the
+    // wrap-aware bignum `convertTo(N, signed)` (mod-2^N) — narrow AND wide — so
+    // `_Static_assert((_BitInt(4))15 + 1 == 0)` and `(_BitInt(40))2000000 * …` fold
+    // correctly. A cast FROM a `_BitInt` to a standard type flows through the ordinary
+    // Int→Int / Int→Float / Int→Bool paths below (a NARROW `_BitInt` source bridges to
+    // int64 via `asInt64`; a WIDE source nullopt-fails there — a documented boundary).
     if (toK == TypeKind::BitInt) {
-        return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-    }
-    {
-        auto const castKids = hir.children(expr);
-        if (castKids.size() == 1
-            && interner.kind(hir.typeId(castKids[0])) == TypeKind::BitInt) {
-            return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
-        }
+        auto bv = detail::asBitIntValue(*inner.value);
+        if (!bv.has_value()) return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+        bv->convertTo(static_cast<std::uint32_t>(interner.bitIntWidth(targetTy)),
+                      interner.bitIntIsSigned(targetTy));
+        HirLiteralValue v;
+        v.core  = TypeKind::BitInt;
+        v.value = std::move(*bv);
+        return ok(std::move(v));
     }
     bool const targetFloat = isFloatKind(toK);
     bool const sourceFloat = isFloatValue(*inner.value);

@@ -48,6 +48,13 @@ namespace {
             // const-eval engines collapse it to an integer before pooling); if one
             // did, the asm emitter's symbol-address arm would fail loud on symbol 0.
             dst.value = MirSymbolAddrValue{arm.base, arm.byteOffset};
+        } else if constexpr (std::is_same_v<T, BitIntValue>) {
+            // C4b (D-CSUBSET-BITINT-WIDE-LITERAL / I1+C2): the `_BitInt` bit-precise
+            // value is the SAME host type in both pools — copy it directly (NEVER
+            // degrade to monostate, which would silently drop the value). The narrow-
+            // literal MIR lowering extracts the container int from this arm; the
+            // wide path fills limbs; the globals emitter fails loud on it.
+            dst.value = arm;
         } else {
             dst.value = arm;
         }
@@ -1529,19 +1536,38 @@ struct Lowerer {
     [[nodiscard]] MirInstId materializeWideLiteral(HirNodeId node) {
         TypeId const t = hir.typeId(node);
         HirLiteralValue const& src = literals.at(hir.payload(node));
-        if (!std::holds_alternative<std::int64_t>(src.value)) {
-            unsupported(node, "a wide _BitInt literal must be an integer constant that "
-                              "fits in 64 bits this cycle (arbitrary-magnitude wb/uwb "
-                              "literals are D-CSUBSET-BITINT-WIDE-LITERAL, a later cycle)");
-            return InvalidMirInst;
-        }
         MirInstId const dst = freshAggregateTemp(t);
         if (!dst.valid()) {
             unsupported(node, "wide _BitInt literal requires a sizeable layout");
             return InvalidMirInst;
         }
-        // Extend per the DECLARED signedness: an unsigned wide literal zero-fills, a
-        // signed one sign-fills (a negative value's 2's-complement high limbs).
+        // C4b (D-CSUBSET-BITINT-WIDE-LITERAL): an arbitrary-magnitude `wb`/`uwb`
+        // literal lives in the `BitIntValue` pool arm. Fill the ceil(N/64) Model-A
+        // limbs DIRECTLY from the host value (converted to the node's exact
+        // (width, signed) so the limb count + top-limb wrap match the slot) — a
+        // COMPILE-TIME limb fill, no runtime FROM-scalar sign/zero-extension.
+        if (auto const* bv = std::get_if<BitIntValue>(&src.value)) {
+            std::uint32_t const n   = static_cast<std::uint32_t>(interner.bitIntWidth(t));
+            bool const          sgn = interner.bitIntIsSigned(t);
+            BitIntValue const   conv = bv->withType(n, sgn);
+            auto const&         limbs = conv.limbs();
+            std::int64_t const  count = wideLimbCount(t);
+            for (std::int64_t i = 0; i < count; ++i) {
+                std::uint64_t const limbVal =
+                    (static_cast<std::size_t>(i) < limbs.size()) ? limbs[i] : 0ull;
+                storeLimb(ci64(static_cast<std::int64_t>(limbVal)), limbAddrConst(dst, i));
+            }
+            return dst;
+        }
+        // Legacy path: the synthetic `1` that ++/-- desugars to (a `_BitInt(N)`-typed
+        // one) is a plain int64-arm literal. Extend per the DECLARED signedness: an
+        // unsigned wide literal zero-fills, a signed one sign-fills (a negative
+        // value's 2's-complement high limbs).
+        if (!std::holds_alternative<std::int64_t>(src.value)) {
+            unsupported(node, "a wide _BitInt literal must be a bit-precise value or a "
+                              "64-bit integer constant");
+            return InvalidMirInst;
+        }
         TypeKind const srcK =
             interner.bitIntIsSigned(t) ? TypeKind::I64 : TypeKind::U64;
         return emitWideFromScalar(dst, ci64(std::get<std::int64_t>(src.value)), srcK, t)
@@ -1680,6 +1706,28 @@ struct Lowerer {
                     MirInstId const addr = mir.addGlobalAddr(sym, ptrTy);
                     std::array<MirInstId, 1> ops{addr};
                     return mir.addInst(MirOpcode::Load, ops, t);
+                }
+                // C4b (D-CSUBSET-BITINT-WIDE-LITERAL): a `wb`/`uwb` literal's value
+                // lives in the `BitIntValue` pool arm. A NARROW (N≤64) one
+                // materializes into its C1 container: emit a container-int Const
+                // typed as the `_BitInt` (reprKind projects it to the native
+                // container at LIR). The value is already mod-2^N wrapped and a
+                // literal is a non-negative magnitude, so its low bits ARE the
+                // container value. A WIDE (N>64) literal is memory-resident (reached
+                // by address via materializeWideLiteral) — never a scalar value.
+                if (auto const* bv = std::get_if<BitIntValue>(&src.value)) {
+                    if (t.valid() && interner.kind(t) == TypeKind::BitInt
+                        && interner.bitIntWidth(t) <= 64) {
+                        MirLiteralValue lit;
+                        lit.core = TypeKind::BitInt;
+                        if (interner.bitIntIsSigned(t)) lit.value = bv->asI64();
+                        else                            lit.value = bv->low64();
+                        return mir.addConst(std::move(lit), t);
+                    }
+                    unsupported(node,
+                        "a wide _BitInt(N>64) literal cannot be produced as a scalar "
+                        "value (it is memory-resident, reached by address)");
+                    return InvalidMirInst;
                 }
                 return mir.addConst(toMirLiteral(src), t);
             }

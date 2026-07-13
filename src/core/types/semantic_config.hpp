@@ -1031,6 +1031,17 @@ struct DSS_EXPORT IntegerLiteralTypingRule {
     std::vector<std::string>      suffixes;   // exact spellings; empty = unsuffixed
     std::vector<DataModelTypeRef> decimal;
     std::vector<DataModelTypeRef> nondecimal;
+    // C23 6.4.4.1 (D-CSUBSET-BITINT-WIDE-LITERAL / Fork-1b): a `wb`/`uwb`
+    // bit-precise suffix rule. When true, `decimal`/`nondecimal` are EMPTY (the
+    // type is not a fixed core — it is `[unsigned] _BitInt(N)` with N derived from
+    // the literal's decoded MAGNITUDE, magnitude-derived at the two typing call
+    // sites via `BitIntValue::fromLiteralMagnitude`); `bitPreciseSigned` selects
+    // `wb` (signed) vs `uwb` (unsigned). This keeps wb/uwb typing INSIDE the one
+    // `integerLiteralTyping` mechanism, so the loader's suffix-coverage cross-check
+    // is satisfied natively (a bit-precise rule IS coverage). A schema without any
+    // bit-precise rule never mints a `_BitInt` from a literal.
+    bool                          bitPrecise       = false;
+    bool                          bitPreciseSigned = false;
 };
 
 // ── FC3.5 sweep-c2: float-literal typing (`semantics.floatLiteralTyping`) ──

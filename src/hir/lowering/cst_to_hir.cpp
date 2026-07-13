@@ -12,6 +12,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/char_decode.hpp"
 #include "core/types/hir_lowering_config.hpp"
+#include "core/types/bit_int_value.hpp"          // C4b: host bignum for wb/uwb literals
 #include "core/types/integer_literal_ladder.hpp" // FC3 c1: the C 6.4.4.1 ladder (shared with the semantic tier)
 #include "core/types/object_format_kind.hpp"     // kObjectFormatKindTable (per-format library-map keys)
 #include "core/types/number_decode.hpp"
@@ -3049,6 +3050,36 @@ struct Lowerer {
                 double const d = decodeFloat(text, numberStyle, ok);
                 if (ok) val.value = d;
             }
+        } else if (std::optional<bool> const bpSigned =
+                       (!sem.integerLiteralTyping.empty() && numberStyle != nullptr
+                        && numberStyle->emitKind.integer.valid()
+                        && tk == numberStyle->emitKind.integer)
+                           ? bitPreciseLiteralSignedness(text, numberStyle,
+                                                         sem.integerLiteralTyping)
+                           : std::nullopt) {
+            // C23 6.4.4.1 (D-CSUBSET-BITINT-WIDE-LITERAL / Fork-1b): a `wb`/`uwb`
+            // bit-precise literal. Its value may exceed u64 (`...688uwb`), so it
+            // decodes through the ARBITRARY-MAGNITUDE `decodeBigInteger` sibling;
+            // its type is `[unsigned] _BitInt(N)` with N the magnitude-derived
+            // minimal width (`BitIntValue::fromLiteralMagnitude`). The value lives
+            // in the `BitIntValue` pool arm for EVERY N (narrow + wide) — never the
+            // int64 arm (I1: an int64 arm would fold via the un-wrapped int64
+            // helpers = silent miscompile). I4: a derived N above __BITINT_MAXWIDTH__
+            // is a constraint violation — fail loud, never a truncated type.
+            if (auto mag = decodeBigInteger(text, numberStyle)) {
+                BitIntValue bv = BitIntValue::fromLiteralMagnitude(*mag, *bpSigned);
+                if (bv.width() > kBitIntMaxWidth) {
+                    unsupported(tokenNode, std::format(
+                        "`_BitInt` literal width {} exceeds __BITINT_MAXWIDTH__ ({})",
+                        bv.width(), kBitIntMaxWidth));
+                    return {errorNode(operandNode), InvalidType};
+                }
+                core = TypeKind::BitInt;
+                type = interner.bitInt(static_cast<std::int64_t>(bv.width()), *bpSigned);
+                val.value = std::move(bv);
+            } else {
+                ok = false;   // no base-valid digits (malformed) — fail loud below
+            }
         } else if (auto iv = decodeInteger(text, numberStyle)) {
             // FC3 c1: the integer-literal ladder (C 6.4.4.1) — the SAME
             // shared algorithm the semantic tier ran in pass 2 (plan-lock
@@ -5552,6 +5583,10 @@ struct Lowerer {
             if (!isFloatCore(kind)) intLits.insert(tok);
         }
         CstEvalContext ctx{tree(), tree().schema(), intLits, numberStyle};
+        // C4b (Fork-2c): let a `wb`/`uwb` bit-precise index designator fold too, and
+        // stamp standard literals' true data-model core for the BitInt UAC width.
+        ctx.integerLiteralTyping = sem.integerLiteralTyping;
+        ctx.dataModel = dataModel_;
         // Ref resolution: name → symbol via `symbolAt(identTok)` →
         // SymbolRecord. Only `isConst` symbols are foldable. The
         // shared `findInitExprInDecl` helper (in the engine library)

@@ -13,6 +13,7 @@
 #include "core/types/declarator_walk.hpp"     // FC4: declaratorNameNode / collectDeclarators
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/bit_int_value.hpp"
 #include "core/types/integer_literal_ladder.hpp"
 #include "core/types/number_decode.hpp"
 #include "core/types/operator_table.hpp"
@@ -1806,7 +1807,18 @@ resolveConstSymbolInit(EngineState const& s, Tree const& tree,
     // its init expression in the scope where the symbol was declared
     // — not the original use-site scope. This is what makes shadowing
     // work correctly across const ref chains.
-    return CstResolvedSymbol{*initExpr, rec.scope.v};
+    CstResolvedSymbol out{*initExpr, rec.scope.v, std::nullopt};
+    // C4b (I1): a const `_BitInt(N)` symbol's value is its initializer CONVERTED
+    // to `_BitInt(N)` (C 6.7.9 / 6.3.1.3). Hand the engine the declared (width,
+    // signed) so it applies the mod-2^N wrap — else `const _BitInt(4) k = 20wb;
+    // k` folds to 20 (the initializer's `_BitInt(6)` value) instead of 4.
+    auto const& in = s.lattice.interner();
+    if (rec.type.valid() && in.kind(rec.type) == TypeKind::BitInt) {
+        out.declaredBitPrecise = CstBitPreciseDeclType{
+            static_cast<std::uint32_t>(in.bitIntWidth(rec.type)),
+            in.bitIntIsSigned(rec.type)};
+    }
+    return out;
 }
 
 // FC17 (D-CSUBSET-CONSTEXPR): the ONE resolver-environment builder shared by
@@ -1978,15 +1990,17 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
                 case TypeKind::U32:  t.isInteger=true; t.intBits=32; t.intSigned=false; break;
                 case TypeKind::I64:  t.isInteger=true; t.intBits=64; t.intSigned=true;  break;
                 case TypeKind::U64:  t.isInteger=true; t.intBits=64; t.intSigned=false; break;
-                // D-CSUBSET-BITINT (CRIT-3): a cast TO `_BitInt(N)` is NON-foldable in
-                // const-eval — the CST evaluator has no mod-2^N wrap, so folding
-                // `(_BitInt(4))15` via `narrowIntToBits` would give a HALF-modeled
-                // value (correct for N≤64 by luck, but the design keeps const-eval
-                // BitInt-free until the C4 bignum fold for uniform behavior). Explicit
-                // nullopt (the `default` already covers it — this pins the intent):
-                // the cast arm fail-louds NotAConstantExpression → `_Static_assert
-                // ((_BitInt(4))15+1==0)` is a diagnostic, never a silent pass/fail.
-                case TypeKind::BitInt: return std::nullopt;
+                // C23 6.3.1.3 (D-CSUBSET-BITINT-CONSTFOLD-LARGE, C4b): a cast TO
+                // `_BitInt(N)` folds via the wrap-aware bignum at width N (mod-2^N),
+                // for ANY N (narrow AND wide) — `(_BitInt(4))15 + 1 == 0` /
+                // `(_BitInt(40))2000000 * ...`. Carried as the bit-precise descriptor
+                // (NOT `isInteger`, whose `intBits` maxes at 64 and whose narrow
+                // fold cannot express a wide `_BitInt`).
+                case TypeKind::BitInt:
+                    t.isBitPrecise = true;
+                    t.bitWidth = static_cast<std::uint32_t>(in.bitIntWidth(ty));
+                    t.bitSigned = in.bitIntIsSigned(ty);
+                    return t;
                 default: return std::nullopt;   // float / aggregate — non-foldable cast
             }
             return t;
@@ -2033,6 +2047,11 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
     auto fixedVals = fixedValueTokenMap(tree);
     CstEvalContext ctx{tree, tree.schema(), intLits, s.idx().numberStyle};
     ctx.fixedValueTokens = &fixedVals;
+    // C4b (Fork-2c): supply the `integerLiteralTyping` rules so a `wb`/`uwb`
+    // bit-precise literal folds to a BitIntValue leaf (`_Static_assert(15wb+1==16)`,
+    // an ICE `_BitInt` array dim). Absent cfg ⇒ empty ⇒ off (unchanged behavior).
+    if (cfg != nullptr) ctx.integerLiteralTyping = cfg->integerLiteralTyping;
+    ctx.dataModel = s.dataModel;
     CstEvalEnvironment env = buildConstEvalEnv(s, tree, fromScope, cfg);
     ConstEvalResult const r = evaluateConstantCst(node, ctx, env, {}, fromScope.v);
     if (!r.value.has_value()) return std::nullopt;
@@ -2063,6 +2082,10 @@ constExprValue(EngineState& s, Tree const& tree, NodeId node,
     CstEvalContext ctx{tree, tree.schema(), intLits, s.idx().numberStyle};
     ctx.floatLiteralTokens = &floatLits;
     ctx.fixedValueTokens   = &fixedVals;
+    // C4b (Fork-2c): a `wb`/`uwb` bit-precise constexpr initializer folds to a
+    // BitIntValue (`constexpr _BitInt(8) k = 15wb;`).
+    if (cfg != nullptr) ctx.integerLiteralTyping = cfg->integerLiteralTyping;
+    ctx.dataModel = s.dataModel;
     CstEvalEnvironment env = buildConstEvalEnv(s, tree, fromScope, cfg);
     EvalOptions options;
     options.allowFloat = true;
@@ -6374,6 +6397,36 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                 && s.idx().numberStyle->emitKind.integer.valid()
                 && tk == s.idx().numberStyle->emitKind.integer) {
                 auto const text = tree.text(node);
+                // C23 6.4.4.1 (D-CSUBSET-BITINT-WIDE-LITERAL / Fork-1b): a `wb`/`uwb`
+                // bit-precise literal is typed `[unsigned] _BitInt(N)` with N derived
+                // from its ARBITRARY-MAGNITUDE value (`decodeBigInteger`, which the u64
+                // ladder cannot hold). Checked BEFORE the magnitude ladder so a `>u64`
+                // uwb literal is not mis-diagnosed S_IntegerLiteralTooLarge. I4: an N
+                // above __BITINT_MAXWIDTH__ reuses the specifier's over-width path.
+                if (auto const bpSigned = bitPreciseLiteralSignedness(
+                        text, s.idx().numberStyle, cfg.integerLiteralTyping)) {
+                    if (auto mag = decodeBigInteger(text, s.idx().numberStyle)) {
+                        BitIntValue const bv =
+                            BitIntValue::fromLiteralMagnitude(*mag, *bpSigned);
+                        if (bv.width() > kBitIntMaxWidth) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_BitIntWidthExceedsMax;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(node);
+                            d.actual   = std::format("`_BitInt` literal width {} exceeds "
+                                                     "__BITINT_MAXWIDTH__ ({})",
+                                                     bv.width(), kBitIntMaxWidth);
+                            s.reporter.report(std::move(d));
+                            return;   // leave untyped (cascade-suppress)
+                        }
+                        s.nodeToType.set(node, s.lattice.interner().bitInt(
+                            static_cast<std::int64_t>(bv.width()), *bpSigned));
+                        return;   // fully typed as _BitInt(N); skip the ladder
+                    }
+                    // A bit-precise suffix with no base-valid digits is malformed —
+                    // fall through to the standard ladder's fail-loud below.
+                }
                 auto const magnitude = decodeInteger(text, s.idx().numberStyle);
                 bool fits = magnitude.has_value();
                 if (fits) {

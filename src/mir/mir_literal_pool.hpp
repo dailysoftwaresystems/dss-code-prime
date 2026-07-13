@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/bit_int_value.hpp"            // BitIntValue (C23 _BitInt const-fold arm)
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind
 
 #include <cstdint>
@@ -49,9 +50,13 @@ struct MirLiteralValue {
     // pool-level inspection without consulting the interner; the Const
     // instruction's typeId is the authority — disambiguate char vs string by the
     // VARIANT ARM (uint64 vs string), never by `core`. D5.3 adds the
-    // `MirAggregateValue` arm for `core` ∈ {Struct, Union, Array}.
+    // `MirAggregateValue` arm for `core` ∈ {Struct, Union, Array}. C4b adds the
+    // `BitIntValue` arm (`core == BitInt`) — the SAME host bit-precise value type
+    // the HIR pool carries (D-CSUBSET-BITINT-WIDE-LITERAL): a narrow literal's
+    // container value + a wide literal's limbs both flow through it; the globals
+    // byte-emitter fails loud on it (wide `_BitInt` data-globals are deferred).
     std::variant<std::monostate, bool, std::int64_t, std::uint64_t, double, std::string,
-                 MirAggregateValue, MirSymbolAddrValue> value;
+                 MirAggregateValue, MirSymbolAddrValue, BitIntValue> value;
     TypeKind core = TypeKind::Void;
 };
 

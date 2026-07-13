@@ -1,0 +1,34 @@
+{
+  "$comment": "C23 arbitrary-magnitude _BitInt wb/uwb LITERALS (D-CSUBSET-BITINT-WIDE-LITERAL, C4b). `633825300114114700748351602688uwb` is 2^99 → unsigned _BitInt(100) (2 limbs) whose HIGH limb carries 2^35; it decodes through a compile-time bignum and fills the multi-limb value. RED-ON-DISABLE: 2^99>>93==64 and 2^99&1023==0 so 64+0-22==42 — a low-limb-only materialization drops the 2^99, giving big==0 → 0>>93==0 → exit != 42. A `volatile` seed keeps `big` runtime-live so the {shippedPipeline:release} arm still exits 42 (the wide value is realized by address; mem2reg/const-fold preserve the limb fill + shift/mask). Also exercises a NARROW uwb literal (1023uwb → unsigned _BitInt(10)) and int<->wide casts.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

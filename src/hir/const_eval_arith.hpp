@@ -16,6 +16,7 @@
 // `evaluateConstantCst` (CST), both of which return a `ConstEvalResult`
 // with policy applied.
 
+#include "core/types/bit_int_value.hpp"
 #include "core/types/type_lattice/core_type.hpp"
 #include "hir/const_eval.hpp"
 #include "hir/hir_literal_pool.hpp"
@@ -65,6 +66,14 @@ asInt64(HirLiteralValue const& v) noexcept {
         return static_cast<std::int64_t>(*p);
     }
     if (auto p = std::get_if<bool>(&v.value)) return *p ? std::int64_t{1} : std::int64_t{0};
+    // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a NARROW (N≤64) `_BitInt` const value
+    // bridges to int64 (a `_BitInt` is an integer type, admissible in an ICE — e.g.
+    // `int a[(_BitInt(8))30]`). A WIDE (N>64) value cannot fit → nullopt (the caller
+    // surfaces "not a constant integer"); a wide compare/asBool routes via isZero.
+    if (auto p = std::get_if<BitIntValue>(&v.value)) {
+        if (p->width() <= 64) return p->asI64();
+        return std::nullopt;
+    }
     return std::nullopt;
 }
 
@@ -94,6 +103,10 @@ asBool(HirLiteralValue const& v, bool allowFloat) noexcept {
         if (!allowFloat) return std::nullopt;
         return *asDouble(v) != 0.0;
     }
+    // C4b: a `_BitInt` truthiness folds via `isZero` for EVERY N — never through
+    // `asInt64`, which nullopt-fails for a WIDE value (a wide `_BitInt` condition in
+    // `&&`/`||`/`?:` would then spuriously fail the whole fold).
+    if (auto p = std::get_if<BitIntValue>(&v.value)) return !p->isZero();
     auto iv = asInt64(v);
     if (!iv.has_value()) return std::nullopt;
     return *iv != 0;
@@ -454,6 +467,227 @@ struct IntKindInfo {
         if ((masked & signBit) != 0) masked |= ~mask;
     }
     return static_cast<std::int64_t>(masked);
+}
+
+// ── C23 _BitInt(N) wrap-aware const-fold (C4b, D-CSUBSET-BITINT-CONSTFOLD-LARGE) ──
+//
+// The shared bignum fold both const-eval walkers (`const_eval.cpp` /
+// `cst_const_eval.cpp`) route through when at least ONE operand is a `_BitInt`
+// value (the `BitIntValue` pool arm). It mirrors the TYPED side's usual-
+// arithmetic-conversion (type_rules.hpp usualArithmeticCommonType, lines
+// 626-633/880-895) to compute the TRUE C23 result (width, signed) and wraps the
+// bignum fold AT THAT width — NOT naively at an operand width (which miscompiles
+// `15wb + 1`, whose int-outranked-BitInt result is a plain `int`, no wrap → 16).
+
+// A `_BitInt`-UAC operand descriptor. A standard integer arm's (width, signed)
+// come from its `core` via `intKindInfo` (the CST leaf tags integer literals I32;
+// sizeof → U64; a cast → its target). nullopt for a non-integer arm.
+struct BitIntOperandType { std::uint32_t width; bool isSigned; bool isBitPrecise; };
+
+[[nodiscard]] inline std::optional<BitIntOperandType>
+bitIntOperandType(HirLiteralValue const& v) noexcept {
+    if (auto const* bv = std::get_if<BitIntValue>(&v.value)) {
+        return BitIntOperandType{bv->width(), bv->isSigned(), true};
+    }
+    if (std::holds_alternative<std::int64_t>(v.value)
+        || std::holds_alternative<std::uint64_t>(v.value)
+        || std::holds_alternative<bool>(v.value)) {
+        if (auto ik = intKindInfo(v.core); ik.has_value()) {
+            return BitIntOperandType{static_cast<std::uint32_t>(ik->bits),
+                                     ik->isSigned, false};
+        }
+    }
+    return std::nullopt;
+}
+
+// The operand as a `BitIntValue` at its OWN (width, signed) — a bignum arm passes
+// through; a standard arm converts at its `core` width. nullopt for a non-integer.
+[[nodiscard]] inline std::optional<BitIntValue>
+asBitIntValue(HirLiteralValue const& v) noexcept {
+    if (auto const* bv = std::get_if<BitIntValue>(&v.value)) return *bv;
+    auto ot = bitIntOperandType(v);
+    if (!ot.has_value()) return std::nullopt;
+    if (auto const* i = std::get_if<std::int64_t>(&v.value))
+        return BitIntValue::fromI64(*i, ot->width, ot->isSigned);
+    if (auto const* u = std::get_if<std::uint64_t>(&v.value))
+        return BitIntValue::fromU64(*u, ot->width, ot->isSigned);
+    if (auto const* b = std::get_if<bool>(&v.value))
+        return BitIntValue::fromU64(*b ? 1u : 0u, ot->width, ot->isSigned);
+    return std::nullopt;
+}
+
+// C 6.3.1.8 integer promotion of a STANDARD operand (a `_BitInt` does NOT promote):
+// a standard width below int's rank (32) promotes to `int` (32, signed).
+[[nodiscard]] inline BitIntOperandType promoteBitIntOperand(BitIntOperandType t) noexcept {
+    if (!t.isBitPrecise && t.width < 32) return {32, true, false};
+    return t;
+}
+
+// The C23 usual-arithmetic-conversion RESULT type for a BitInt-involved pair —
+// MIRRORS type_rules.hpp usualArithmeticCommonType (880-895): two BitInts → the
+// wider N (equal N → unsigned); a BitInt vs a promoted standard of width W →
+// N>W ? the BitInt : the standard (a standard integer out-ranks a bit-precise one
+// of equal-or-lesser width); two standards → wider rank, mixed sign → unsigned
+// (rank-prefer-unsigned). `isBitPrecise` marks whether the result is a `_BitInt`.
+[[nodiscard]] inline BitIntOperandType
+bitIntUac(BitIntOperandType a, BitIntOperandType b) noexcept {
+    a = promoteBitIntOperand(a);
+    b = promoteBitIntOperand(b);
+    if (a.isBitPrecise && b.isBitPrecise) {
+        if (a.width != b.width) return a.width > b.width ? a : b;
+        return {a.width, a.isSigned && b.isSigned, true};   // equal N → unsigned wins
+    }
+    if (a.isBitPrecise != b.isBitPrecise) {
+        BitIntOperandType const bit = a.isBitPrecise ? a : b;
+        BitIntOperandType const std = a.isBitPrecise ? b : a;
+        if (bit.width > std.width) return bit;
+        return {std.width, std.isSigned, false};
+    }
+    // Both standard (dead in practice — the bignum path needs ≥1 BitInt — but kept
+    // for a total function): wider rank; equal rank + mixed sign → unsigned.
+    if (a.width != b.width) return a.width > b.width ? a : b;
+    return {a.width, a.isSigned && b.isSigned, false};
+}
+
+// The core TypeKind for a standard (non-bit-precise) result (width ∈ {8,16,32,64}).
+[[nodiscard]] inline TypeKind intKindFromWidth(std::uint32_t width, bool isSigned) noexcept {
+    switch (width) {
+        case 8:  return isSigned ? TypeKind::I8  : TypeKind::U8;
+        case 16: return isSigned ? TypeKind::I16 : TypeKind::U16;
+        case 32: return isSigned ? TypeKind::I32 : TypeKind::U32;
+        default: return isSigned ? TypeKind::I64 : TypeKind::U64;   // 64 (and any residue)
+    }
+}
+
+// Package a folded `BitIntValue` into a HirLiteralValue: a bit-precise result
+// keeps the `BitIntValue` arm (`core == BitInt`); a standard result (width ≤ 64)
+// extracts to the int64/uint64 arm with its `core` kind (so downstream int64
+// bridges + the narrow-cast paths see a plain integer, exactly as the typed side
+// produces a standard type for an int-outranked BitInt).
+[[nodiscard]] inline HirLiteralValue
+packBitIntResult(BitIntValue const& r, BitIntOperandType rt) {
+    HirLiteralValue out;
+    if (rt.isBitPrecise) {
+        out.core  = TypeKind::BitInt;
+        out.value = r;
+        return out;
+    }
+    out.core = intKindFromWidth(rt.width, rt.isSigned);
+    if (rt.isSigned) out.value = r.asI64();
+    else             out.value = r.low64();
+    return out;
+}
+
+// Fold a binary op with ≥1 `_BitInt` operand. `applies=false` ⇒ neither operand is
+// bit-precise (caller uses the standard int64/float path). On `applies`, `ok`
+// carries the folded value or `failure` the reason (div-by-zero, non-integer
+// operand). Comparisons yield a Bool value; every other op yields the UAC result.
+struct BitIntBinaryFold {
+    bool             applies = false;
+    bool             ok      = false;
+    HirLiteralValue  value;
+    ConstEvalFailure failure = ConstEvalFailure::None;
+};
+[[nodiscard]] inline BitIntBinaryFold
+foldBitIntBinary(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b) {
+    bool const aBit = std::holds_alternative<BitIntValue>(a.value);
+    bool const bBit = std::holds_alternative<BitIntValue>(b.value);
+    BitIntBinaryFold r;
+    if (!aBit && !bBit) return r;    // not a BitInt fold — caller's normal path
+    r.applies = true;
+    auto at = bitIntOperandType(a);
+    auto bt = bitIntOperandType(b);
+    auto av = asBitIntValue(a);
+    auto bv = asBitIntValue(b);
+    if (!at || !bt || !av || !bv) {
+        r.failure = ConstEvalFailure::UnsupportedTypeKind;   // a non-integer operand
+        return r;
+    }
+    // Comparison: fold over the common type, yield Bool.
+    if (isComparison(op)) {
+        BitIntOperandType const ct = bitIntUac(*at, *bt);
+        int const c = BitIntValue::compare(*av, *bv, ct.width, ct.isSigned);
+        bool res = false;
+        switch (op) {
+            case HirOpKind::Eq: res = (c == 0); break;
+            case HirOpKind::Ne: res = (c != 0); break;
+            case HirOpKind::Lt: res = (c <  0); break;
+            case HirOpKind::Le: res = (c <= 0); break;
+            case HirOpKind::Gt: res = (c >  0); break;
+            case HirOpKind::Ge: res = (c >= 0); break;
+            default: r.failure = ConstEvalFailure::UnsupportedOperator; return r;
+        }
+        r.value = makeBoolLiteral(res ? 1 : 0);
+        r.ok = true;
+        return r;
+    }
+    // Shifts: C 6.5.7 — the result type is the (promoted) LEFT operand's type; a
+    // `_BitInt` does NOT promote. The count is the right operand's integer value.
+    if (op == HirOpKind::Shl || op == HirOpKind::Shr) {
+        BitIntOperandType const rt = promoteBitIntOperand(*at);
+        std::uint64_t count = 0;
+        if (auto ic = asInt64(b); ic.has_value() && *ic >= 0)
+            count = static_cast<std::uint64_t>(*ic);
+        else if (bBit) count = bv->low64();
+        BitIntValue const res = (op == HirOpKind::Shl)
+            ? BitIntValue::shiftLeft(*av, count, rt.width, rt.isSigned)
+            : BitIntValue::shiftRight(*av, count, rt.width, rt.isSigned);
+        r.value = packBitIntResult(res, rt);
+        r.ok = true;
+        return r;
+    }
+    BitIntOperandType const rt = bitIntUac(*at, *bt);
+    switch (op) {
+        case HirOpKind::Add: r.value = packBitIntResult(BitIntValue::add(*av,*bv,rt.width,rt.isSigned), rt); r.ok = true; return r;
+        case HirOpKind::Sub: r.value = packBitIntResult(BitIntValue::sub(*av,*bv,rt.width,rt.isSigned), rt); r.ok = true; return r;
+        case HirOpKind::Mul: r.value = packBitIntResult(BitIntValue::mul(*av,*bv,rt.width,rt.isSigned), rt); r.ok = true; return r;
+        case HirOpKind::BitAnd: r.value = packBitIntResult(BitIntValue::bitAnd(*av,*bv,rt.width,rt.isSigned), rt); r.ok = true; return r;
+        case HirOpKind::BitOr:  r.value = packBitIntResult(BitIntValue::bitOr(*av,*bv,rt.width,rt.isSigned), rt); r.ok = true; return r;
+        case HirOpKind::BitXor: r.value = packBitIntResult(BitIntValue::bitXor(*av,*bv,rt.width,rt.isSigned), rt); r.ok = true; return r;
+        case HirOpKind::Div: {
+            auto q = BitIntValue::divide(*av, *bv, rt.width, rt.isSigned);
+            if (!q.has_value()) { r.failure = ConstEvalFailure::DivisionByZero; return r; }
+            r.value = packBitIntResult(*q, rt); r.ok = true; return r;
+        }
+        case HirOpKind::Rem: {
+            auto rem = BitIntValue::remainder(*av, *bv, rt.width, rt.isSigned);
+            if (!rem.has_value()) { r.failure = ConstEvalFailure::DivisionByZero; return r; }
+            r.value = packBitIntResult(*rem, rt); r.ok = true; return r;
+        }
+        default: r.failure = ConstEvalFailure::UnsupportedOperator; return r;
+    }
+}
+
+// Fold a unary op on a `_BitInt` operand (the caller gates on the operand holding
+// a `BitIntValue` arm). Neg/BitNot yield the operand's own `_BitInt` type; `Not`
+// (logical negation) yields Bool (isZero).
+struct BitIntUnaryFold {
+    bool             applies = false;
+    bool             ok      = false;
+    HirLiteralValue  value;
+    ConstEvalFailure failure = ConstEvalFailure::None;
+};
+[[nodiscard]] inline BitIntUnaryFold
+foldBitIntUnary(HirOpKind op, HirLiteralValue const& inner) {
+    BitIntUnaryFold r;
+    auto const* bv = std::get_if<BitIntValue>(&inner.value);
+    if (bv == nullptr) return r;    // not a BitInt operand — caller's normal path
+    r.applies = true;
+    std::uint32_t const w = bv->width();
+    bool const s = bv->isSigned();
+    switch (op) {
+        case HirOpKind::Neg:
+            r.value = packBitIntResult(BitIntValue::neg(*bv, w, s), {w, s, true});
+            r.ok = true; return r;
+        case HirOpKind::BitNot:
+            r.value = packBitIntResult(BitIntValue::bitNot(*bv, w, s), {w, s, true});
+            r.ok = true; return r;
+        case HirOpKind::Not:
+            r.value = makeBoolLiteral(bv->isZero() ? 1 : 0);
+            r.ok = true; return r;
+        default:
+            r.failure = ConstEvalFailure::UnsupportedOperator; return r;
+    }
 }
 
 } // namespace dss::detail

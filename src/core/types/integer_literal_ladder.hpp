@@ -133,6 +133,33 @@ typeIntegerLiteral(std::string_view rawText,
     return {IntegerLadderStatus::TooLarge, TypeKind::Void};
 }
 
+// ── C23 6.4.4.1 (D-CSUBSET-BITINT-WIDE-LITERAL / Fork-1b): wb/uwb detection ──
+//
+// If the literal's declared suffix belongs to a `bitPrecise` integerLiteralTyping
+// rule (a `wb`/`uwb` suffix), return that rule's signedness (`wb` → true, `uwb` →
+// false); else nullopt. Both typing call sites (`cst_to_hir` lowerLiteral +
+// `semantic_analyzer` typeLiteralIfAny) consult this FIRST: a bit-precise literal
+// is typed `[unsigned] _BitInt(N)` with N derived from its (arbitrary-magnitude)
+// value via `decodeBigInteger` + `BitIntValue::fromLiteralMagnitude`, NOT through
+// the u64 magnitude ladder (which nullopt-overflows a `>u64` literal). The
+// typing thus lives INSIDE the `integerLiteralTyping` engine (a config rule mode),
+// so the loader's suffix-coverage cross-check is satisfied natively. A schema
+// with no bit-precise rule never returns a signedness here (→ standard ladder).
+[[nodiscard]] inline std::optional<bool>
+bitPreciseLiteralSignedness(std::string_view rawText,
+                            NumberStyle const* ns,
+                            std::span<IntegerLiteralTypingRule const> rules) {
+    std::string_view const suffix = matchIntegerSuffix(rawText, ns);
+    if (suffix.empty()) return std::nullopt;
+    for (auto const& r : rules) {
+        if (!r.bitPrecise) continue;
+        for (auto const& s : r.suffixes) {
+            if (s == suffix) return r.bitPreciseSigned;
+        }
+    }
+    return std::nullopt;
+}
+
 // ── FC3.5 sweep-c2: the float-literal typing rule (C 6.4.4.2) ────────────
 //
 // The float sibling of `typeIntegerLiteral`, shared by the SAME two

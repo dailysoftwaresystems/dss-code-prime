@@ -6854,12 +6854,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         for (auto const& [key, _] : entry.items()) {
                             if (key != "suffixes" && key != "decimal"
                                 && key != "nondecimal"
+                                && key != "bitPrecise" && key != "signed"
                                 && key.rfind("$", 0) != 0) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           path + "/" + key,
                                           std::format("unknown 'integerLiteralTyping' "
                                                       "field '{}' — expected 'suffixes', "
-                                                      "'decimal', or 'nondecimal'", key));
+                                                      "'decimal', 'nondecimal', "
+                                                      "'bitPrecise', or 'signed'", key));
                                 rowsOk = false;
                             }
                         }
@@ -6886,6 +6888,54 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             rule.suffixes.push_back(s.get<std::string>());
                         }
                         if (!entryOk) { rowsOk = false; continue; }
+                        // C23 6.4.4.1 (D-CSUBSET-BITINT-WIDE-LITERAL / Fork-1b): a
+                        // `wb`/`uwb` bit-precise rule. Its type is magnitude-derived
+                        // (`_BitInt(N)`), so it carries NO `decimal`/`nondecimal`
+                        // candidate lists; `signed` picks `wb` (signed) vs `uwb`
+                        // (unsigned). A malformed bit-precise rule (non-bool fields, or
+                        // a stray candidate list) fails loud at load.
+                        if (entry.contains("bitPrecise")) {
+                            if (!entry.at("bitPrecise").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/bitPrecise",
+                                          "'bitPrecise' must be a boolean");
+                                rowsOk = false; continue;
+                            }
+                            rule.bitPrecise = entry.at("bitPrecise").get<bool>();
+                        }
+                        if (rule.bitPrecise) {
+                            if (entry.contains("signed")) {
+                                if (!entry.at("signed").is_boolean()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              path + "/signed",
+                                              "'signed' must be a boolean");
+                                    rowsOk = false; continue;
+                                }
+                                rule.bitPreciseSigned = entry.at("signed").get<bool>();
+                            }
+                            if (entry.contains("decimal") || entry.contains("nondecimal")) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                          "a 'bitPrecise' rule derives its type from the "
+                                          "literal magnitude and must NOT declare "
+                                          "'decimal'/'nondecimal' candidates");
+                                rowsOk = false; continue;
+                            }
+                            if (rule.suffixes.empty()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics, path,
+                                          "a 'bitPrecise' rule must declare its "
+                                          "'suffixes' (the unsuffixed rule is never "
+                                          "bit-precise)");
+                                rowsOk = false; continue;
+                            }
+                            cfg.integerLiteralTyping.push_back(std::move(rule));
+                            continue;
+                        }
+                        if (entry.contains("signed")) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      path + "/signed",
+                                      "'signed' is only valid on a 'bitPrecise' rule");
+                            rowsOk = false; continue;
+                        }
                         auto const readCandidates =
                             [&](char const* key,
                                 std::vector<DataModelTypeRef>& out) -> bool {

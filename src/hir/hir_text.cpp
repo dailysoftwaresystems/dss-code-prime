@@ -908,6 +908,15 @@ private:
             // fold-transient and not round-tripped — invalid on the parsed value).
             out_ += std::format("addr {} {}", a->base, a->byteOffset); return;
         }
+        if (auto const* bi = std::get_if<BitIntValue>(&v.value)) {
+            // C4b (I5) `_BitInt` value: `bitint <width> <signed 0|1> <nLimbs> <limb…>`
+            // (little-endian decimal limbs) — a lossless round-trip of the host
+            // bit-precise value through the `.dsshir`/`.dssir` text format.
+            out_ += std::format("bitint {} {} {}", bi->width(),
+                                bi->isSigned() ? 1 : 0, bi->limbs().size());
+            for (std::uint64_t l : bi->limbs()) out_ += std::format(" {}", l);
+            return;
+        }
     }
 
     void appendOpName(std::uint32_t payload) {
@@ -1304,6 +1313,18 @@ private:
             a.byteOffset = n ? static_cast<std::int64_t>(0u - off)
                              : static_cast<std::int64_t>(off);
             v.value = std::move(a);
+        }
+        else if (tag == "bitint") {
+            // C4b (I5): `bitint <width> <signed 0|1> <nLimbs> <limb…>` — the inverse
+            // of appendLiteralValue's serialization (the BitIntValue ctor re-wraps).
+            std::uint64_t const width  = takeInt();
+            std::uint64_t const sgn    = takeInt();
+            std::uint64_t const nLimbs = takeInt();
+            std::vector<std::uint64_t> limbs;
+            limbs.reserve(static_cast<std::size_t>(nLimbs));
+            for (std::uint64_t i = 0; i < nLimbs; ++i) limbs.push_back(takeInt());
+            v.value = BitIntValue(std::move(limbs),
+                                  static_cast<std::uint32_t>(width), sgn != 0);
         }
         else malformed(std::format("unknown literal value tag '{}'", tag));
         return v;
