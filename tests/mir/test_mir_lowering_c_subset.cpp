@@ -8725,3 +8725,167 @@ TEST(MirLoweringCSubset, SizeofOfCompositeVlaOperandFailsLoud) {
         << "sizeof of a composite (comma) operand yielding a VLA must fail loud (its C "
            "value decays to a pointer), never silently load the VLA's frozen size";
 }
+
+// ── VLA C3 (D-CSUBSET-VLA): multi-dimensional VLAs (runtime row stride) ───────
+namespace {
+// Count the hidden fixed 8-byte U64 size/stride slots (no-operand Alloca, payload 8):
+// a multi-dim VLA freezes ONE per runtime-sized level (the whole object + each VLA row).
+[[nodiscard]] int countVlaSizeSlots(Mir const& m, MirBlockId entry) {
+    int n = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) == MirOpcode::Alloca && m.instOperands(id).empty()
+            && m.instPayload(id) == 8u)
+            ++n;
+    }
+    return n;
+}
+// True iff some Mul is fed by a Load of an 8-byte size slot — the RUNTIME-stride
+// index signature (a VLA row stepped by a decl-frozen stride slot Load, CRITICAL-1),
+// as opposed to a compile-time Const stride. Robust: a fixed array's index Mul scales
+// by a Const and never Loads a payload-8 slot (its own index Load reads a payload-4
+// int slot, not a payload-8 stride slot).
+[[nodiscard]] bool hasRuntimeStrideIndexLoad(Mir const& m, MirBlockId entry) {
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Mul) continue;
+        for (MirInstId const op : m.instOperands(id)) {
+            if (m.instOpcode(op) != MirOpcode::Load) continue;
+            auto const lops = m.instOperands(op);
+            if (lops.size() == 1 && m.instOpcode(lops[0]) == MirOpcode::Alloca
+                && m.instPayload(lops[0]) == 8u)
+                return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+// A block-scope `int a[n][m]` lowers to a runtime-operand Alloca (total = n*m*4) AND
+// TWO decl-frozen size slots (the whole object + the `int[m]` row), and a subscript of
+// the OUTER dim scales the index by a RUNTIME stride LOADED from the row slot — never a
+// compile-time Const stride (CRITICAL-1). This is the whole C3 mechanism in one pin.
+// Red-on-disable: revert the semantic lift → `int a[n][m]` is S_VlaMultiDimUnsupported
+// (no MIR); revert the MIR stride path → the row index fails loud / uses a bogus stride.
+TEST(MirLoweringCSubset, MultiDimVlaLowersWithRuntimeStrideSlots) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 3, vm = 5;\n"
+        "  int n = vn, m = vm;\n"
+        "  int a[n][m];\n"
+        "  a[1][0] = 7;\n"           // OUTER index a[1] scales by the runtime row stride
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)   // red-on-disable: reverting C3 fails loud here
+        << "a multi-dimensional VLA must lower cleanly to MIR (runtime row stride): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // (1) exactly ONE runtime-operand (VLA) Alloca — the object `a`; its size operand
+    // is the total-bytes Mul (n*m*4). (The scalar n/m/seed slots carry no operand.)
+    int runtimeAllocas = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) == MirOpcode::Alloca && !m.instOperands(id).empty())
+            ++runtimeAllocas;
+    }
+    EXPECT_EQ(runtimeAllocas, 1) << "one runtime-sized VLA object alloca";
+
+    // (2) TWO decl-frozen size slots: the whole object (sizeof a) + the int[m] row
+    // (sizeof a[0] / the a[i] stride). A 1-D VLA would have exactly ONE.
+    EXPECT_EQ(countVlaSizeSlots(m, entry), 2)
+        << "int a[n][m] freezes a size slot per runtime level: the whole + the row";
+
+    // (3) the OUTER subscript scales by a RUNTIME stride LOADED from the row slot,
+    // never a compile-time Const stride.
+    EXPECT_TRUE(hasRuntimeStrideIndexLoad(m, entry))
+        << "the a[i] row index must scale by a Load of the decl-frozen row-stride slot "
+           "(a runtime stride), NOT a compile-time Const";
+}
+
+// CRITICAL-2 no-over-fire: a FULLY-FIXED multi-dim array `int b[5][5]` must NOT route
+// to any VLA path (typeContainsVla == false). Observable at MIR: it takes the fixed
+// aggregate path — a single fixed-size (100-byte) Alloca, NO runtime-operand alloca, NO
+// size slots, NO runtime-stride index Load (every stride is a compile-time Const).
+TEST(MirLoweringCSubset, FixedMultiDimArrayDoesNotRouteToVlaPath) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int b[5][5];\n"
+        "  b[1][0] = 7;\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    auto& in = L.model.lattice().interner();   // mutable: constructs the pin types
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // Direct interner pin: neither the fixed 2-D array nor its element is a VLA
+    // container (the ops[0] walk finds no -2 sentinel at any level).
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const fixed2d = in.array(in.array(i32, 5), 5);
+    EXPECT_FALSE(in.typeContainsVla(fixed2d))
+        << "int[5][5] must NOT read as a VLA container (no over-fire)";
+    EXPECT_TRUE(in.typeContainsVla(in.vlaArray(in.vlaArray(i32))))
+        << "vlaArray(vlaArray(int)) IS a VLA container (sanity of the predicate)";
+
+    // Observable MIR consequence: the fixed path was taken.
+    int runtimeAllocas = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) == MirOpcode::Alloca && !m.instOperands(id).empty())
+            ++runtimeAllocas;
+    }
+    EXPECT_EQ(runtimeAllocas, 0) << "a fixed 2-D array uses NO runtime-operand alloca";
+    EXPECT_EQ(countVlaSizeSlots(m, entry), 0) << "a fixed array freezes NO size slots";
+    EXPECT_FALSE(hasRuntimeStrideIndexLoad(m, entry))
+        << "a fixed array scales every subscript by a compile-time Const stride";
+}
+
+// `sizeof a[0]` of a multi-dim VLA is the ROW size (m*4) — a RUNTIME value LOADED from
+// the SAME decl-frozen row-stride slot the a[i] index uses (Piece 5), never a static
+// fold. Red-on-disable: revert Piece 5 → `sizeof a[0]` (a VLA row) fails loud (H0009).
+TEST(MirLoweringCSubset, RowSizeofOfMultiDimVlaLoadsStrideSlot) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 3, vm = 5;\n"
+        "  int n = vn, m = vm;\n"
+        "  int a[n][m];\n"
+        "  return (int)sizeof a[0];\n"   // ROW sizeof == m*4, a runtime Load
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)   // red-on-disable: reverting Piece 5 fails loud here
+        << "sizeof of a VLA ROW must lower cleanly to a runtime Load (not H0009): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& in = L.model.lattice().interner();
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // A U64 Load whose address is an 8-byte size slot (the row stride) — this IS
+    // `sizeof a[0]`, the SAME slot family the index path Loads.
+    bool sawRowSizeofLoad = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Load) continue;
+        auto const ops = m.instOperands(id);
+        if (ops.size() == 1 && m.instOpcode(ops[0]) == MirOpcode::Alloca
+            && m.instPayload(ops[0]) == 8u
+            && in.kind(m.instType(id)) == TypeKind::U64)
+            sawRowSizeofLoad = true;
+    }
+    EXPECT_TRUE(sawRowSizeofLoad)
+        << "`sizeof a[0]` must lower to a U64 Load of the decl-frozen row-stride slot, "
+           "never a static Const fold (a VLA row sizeof is not a constant expression)";
+}

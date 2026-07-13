@@ -2333,11 +2333,10 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         if (!decl.allowFlexibleArray && !decl.arrayToPointer
             && visibleChildren(tree, suffix).size() > 2) {
             TypeInterner& in = s.lattice.interner();
-            // C1a is 1-D only (MINOR-2): reject any array/VLA element (the C3 boundary).
-            if (in.isVlaArray(base) || in.kind(base) == TypeKind::Array) {
-                emit(DiagnosticCode::S_VlaMultiDimUnsupported);
-                return InvalidType;
-            }
+            // VLA C3 (D-CSUBSET-VLA): a VLA whose element is itself an array or a VLA
+            // (`int a[n][m]`, `int a[n][5]`) is a MULTI-DIMENSIONAL VLA — build the
+            // nested `vlaArray(element)`; HIR→MIR sizes the runtime row stride. The
+            // right-to-left suffix fold already produced `base` as the inner type.
             return in.vlaArray(base);
         }
         emit(DiagnosticCode::S_NonConstantArrayLength);
@@ -2358,13 +2357,12 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         emit(DiagnosticCode::S_FlexibleArrayInAggregate);
         return InvalidType;
     }
-    // VLA C1a (IMPORTANT-2): a constant bound over a VLA element (`int a[5][n]`) —
-    // the -2 sentinel escapes the FAM guard above (which checks -1); fail loud
-    // rather than silently build `array(vlaArray, N)`. The C3 boundary.
-    if (s.lattice.interner().isVlaArray(base)) {
-        emit(DiagnosticCode::S_VlaMultiDimUnsupported);
-        return InvalidType;
-    }
+    // VLA C3 (D-CSUBSET-VLA): a CONSTANT outer bound over a VLA element (`int a[5][n]`
+    // — the `[n]` folded first into a vlaArray, now `[5]` folds over it) is a fixed-
+    // outer multi-dimensional VLA. Build `array(vlaArray, N)`; the transitive
+    // `typeContainsVla` routes it to the runtime alloca/stride paths downstream. The
+    // FAM guard above still rejects an incomplete (-1) element; only the -2 VLA
+    // element flows through here.
     return s.lattice.interner().array(base, *len);
 }
 
@@ -3354,13 +3352,10 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                 visibleChildren(tree, suffix).size() > 2;
             if (hasPresentLength) {
                 TypeInterner& in = s.lattice.interner();
-                // C1a is 1-D only (MINOR-2): a VLA whose ELEMENT is itself an array or
-                // a VLA (`int a[n][m]`, `int a[n][5]`) needs a runtime STRIDE — the C3
-                // boundary. Fail loud, never a silent nested-VLA.
-                if (in.isVlaArray(inner) || in.kind(inner) == TypeKind::Array) {
-                    emit(DiagnosticCode::S_VlaMultiDimUnsupported);
-                    return InvalidType;
-                }
+                // VLA C3 (D-CSUBSET-VLA): a VLA whose ELEMENT is itself an array or a
+                // VLA (`int a[n][m]`, `int a[n][5]`) is a MULTI-DIMENSIONAL VLA — build
+                // the nested `vlaArray(inner)`; HIR→MIR sizes the runtime row stride.
+                // The right-to-left suffix fold already produced `inner` as the element.
                 return in.vlaArray(inner);
             }
             emit(DiagnosticCode::S_NonConstantArrayLength);
@@ -3377,16 +3372,12 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             emit(DiagnosticCode::S_FlexibleArrayInAggregate);
             return InvalidType;
         }
-        // VLA C1a (IMPORTANT-2): a CONSTANT outer bound over a VLA element
-        // (`int a[5][n]` — the `[n]` folded first into vlaArray, now `[5]` folds
-        // over it) is a multi-dimensional VLA. `typeContainsFlexibleArray` /
-        // `isIncompleteArray` check the -1 sentinel and do NOT catch the -2 VLA
-        // element, so this would otherwise silently build `array(vlaArray, 5)`.
-        // Fail loud — the C3 boundary, adjacent to the FAM guard by construction.
-        if (s.lattice.interner().isVlaArray(inner)) {
-            emit(DiagnosticCode::S_VlaMultiDimUnsupported);
-            return InvalidType;
-        }
+        // VLA C3 (D-CSUBSET-VLA): a CONSTANT outer bound over a VLA element
+        // (`int a[5][n]` — the `[n]` folded first into a vlaArray, now `[5]` folds
+        // over it) is a fixed-outer multi-dimensional VLA. Build `array(vlaArray, 5)`;
+        // the transitive `typeContainsVla` routes it to the runtime alloca/stride/
+        // sizeof paths downstream. The FAM guard above still rejects an incomplete
+        // (-1) element; only the -2 VLA element flows through here.
         return s.lattice.interner().array(inner, *len);
     }
     return InvalidType;   // caller filters to the two suffix roles
@@ -3772,29 +3763,37 @@ void validateThreadLocalDeclarator(EngineState& s, SemanticConfig const& cfg,
     }
 }
 
-// VLA C1a (D-CSUBSET-VLA): the SIZE-expression CST node of a variable-length array
-// declarator — the child BETWEEN the array suffix's bracket delimiters
-// (`arrayDeclSuffix = [ BracketOpen, expr, BracketClose ]`). Bounded descendant scan
-// for the array-suffix rule (mirrors applyDeclaratorSuffix + captureVlaSize), then
-// the first non-delimiter (middle) child. InvalidNode if none (an absent length or a
-// missing suffix — the caller then skips the type check).
-[[nodiscard]] NodeId vlaLengthNode(Tree const& tree, NodeId declaratorNode,
-                                   DeclaratorConfig const& dc) {
-    NodeId suffix{};
+// VLA C1a/C3 (D-CSUBSET-VLA): the SIZE-expression CST node of EVERY array suffix of a
+// (possibly multi-dimensional) variable-length array declarator — each is the child
+// BETWEEN that suffix's bracket delimiters (`arrayDeclSuffix = [ BracketOpen, expr,
+// BracketClose ]`). Ordered pre-order scan (children left-to-right = SOURCE order =
+// outer→inner) collecting one middle child per array-suffix node; a suffix node is
+// NOT descended into (its only children are `[`, the expr, `]`). Empty if none. C3
+// returns MULTIPLE nodes (`int a[n][m]` → [n, m]) so the validator can check each
+// dim's bound type independently; a 1-D VLA returns exactly one.
+[[nodiscard]] std::vector<NodeId>
+vlaLengthNodes(Tree const& tree, NodeId declaratorNode, DeclaratorConfig const& dc) {
+    std::vector<NodeId> out;
+    auto middleOf = [&](NodeId suffix) -> NodeId {
+        auto const kids = visibleChildren(tree, suffix);
+        for (std::size_t i = 0; i < kids.size(); ++i) {
+            if (i == 0 || i + 1 == kids.size()) continue;   // skip `[` and `]`
+            return kids[i];
+        }
+        return {};
+    };
+    // Explicit work-stack pre-order that preserves sibling SOURCE order: push
+    // children in REVERSE so they pop left-to-right. An array-suffix node is
+    // recorded (its middle child) and NOT descended into.
     std::vector<NodeId> stack{declaratorNode};
-    for (int guard = 0; guard < 8192 && !stack.empty(); ++guard) {
-        NodeId c = stack.back(); stack.pop_back();
+    for (int guard = 0; guard < 16384 && !stack.empty(); ++guard) {
+        NodeId const c = stack.back(); stack.pop_back();
         if (tree.kind(c) != NodeKind::Internal) continue;
-        if (tree.rule(c).v == dc.arraySuffixRule.v) { suffix = c; break; }
-        for (NodeId g : visibleChildren(tree, c)) stack.push_back(g);
+        if (tree.rule(c).v == dc.arraySuffixRule.v) { out.push_back(middleOf(c)); continue; }
+        auto const kids = visibleChildren(tree, c);
+        for (std::size_t i = kids.size(); i-- > 0;) stack.push_back(kids[i]);
     }
-    if (!suffix.valid()) return {};
-    auto const kids = visibleChildren(tree, suffix);
-    for (std::size_t i = 0; i < kids.size(); ++i) {
-        if (i == 0 || i + 1 == kids.size()) continue;   // skip `[` and `]`
-        return kids[i];
-    }
-    return {};
+    return out;
 }
 
 // VLA C1a (D-CSUBSET-VLA, C99/C11 §6.7.6.2): the Pass-2 VLA constraint validator
@@ -3837,15 +3836,17 @@ void validateVlaDeclarator(EngineState& s, SemanticConfig const& cfg,
                          "(C 6.7.6.2p2)", rec.name));
         return;
     }
-    // NON-INTEGER size (C 6.7.6.2p1) — locate the length expr under THIS declarator +
-    // query its RESOLVED type (available now, post-typing). A float / nullptr_t /
+    // NON-INTEGER size (C 6.7.6.2p1) — locate the length expr(s) under THIS declarator +
+    // query each RESOLVED type (available now, post-typing). A float / nullptr_t /
     // pointer bound is illegal C. `nullptr` is caught HERE (semantic-tier NullptrT)
     // and nowhere downstream (it is I32 0 by MIR). An unresolved length type (the
-    // length itself already failed loud) skips this — no cascade.
+    // length itself already failed loud) skips this — no cascade. VLA C3
+    // (IMPORTANT-7): a MULTI-DIM VLA has one bound per suffix; EVERY dim is checked,
+    // so `int a[n][3.5f]` is rejected on the second dim, not silently accepted.
     if (cfg.declarators.has_value()) {
-        NodeId const lenNode =
-            vlaLengthNode(tree, declaratorNode, *cfg.declarators);
-        if (lenNode.valid()) {
+        for (NodeId const lenNode :
+                 vlaLengthNodes(tree, declaratorNode, *cfg.declarators)) {
+            if (!lenNode.valid()) continue;
             TypeId const lenTy = subtreeType(s, tree, lenNode, rec.scope);
             if (lenTy.valid()
                 && !isVlaSizeIntegerType(s.lattice.interner().kind(lenTy))) {
@@ -7515,7 +7516,14 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                 // below needs no VLA hook (it is declarator-mode-free
                                 // and file-scope — but even a positional VLA would be
                                 // caught by the file-scope branch if one existed).
+                                // VLA C3 (D-CSUBSET-VLA): `||typeContainsVla` so a
+                                // FIXED-outer multi-dim VLA (`int a[5][n]` — whose top
+                                // type is a fixed Array, NOT isVlaArray) is ALSO routed
+                                // to the constraint validator (file-scope / static /
+                                // per-dim non-integer rejects apply to it too).
                                 if (s.lattice.interner().isVlaArray(
+                                        s.symbols.at(vSym).type)
+                                    || s.lattice.interner().typeContainsVla(
                                         s.symbols.at(vSym).type)) {
                                     validateVlaDeclarator(s, cfg, tree, node, dNode,
                                                           decl, vName, vSym);

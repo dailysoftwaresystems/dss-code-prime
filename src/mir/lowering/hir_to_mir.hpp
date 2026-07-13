@@ -235,12 +235,13 @@ lowerToMir(Hir const&               hir,
            // static-storage initializers for `&tls` address constants
            // (S_ThreadLocalAddressNotConstant — C11 6.6p9, the arc's CRIT-1).
            HirThreadLocalMap const* threadLocalMap = nullptr,
-           // VLA C1a (D-CSUBSET-VLA): per-LOCAL variable-length-array size-expression
+           // VLA C1a/C3 (D-CSUBSET-VLA): per-LOCAL variable-length-array size-expression
            // side-table, populated by the CST→HIR lowerer (SymbolId.v → the lowered
-           // size HIR node). Optional: nullptr (or a local with no entry) ⇒ not a
-           // VLA. Read in `allocaForLocal` to lower the runtime bound into the
-           // Alloca's total-byte-size operand at the declaration point.
-           std::unordered_map<std::uint32_t, HirNodeId> const* vlaSizeMap
+           // per-DIMENSION size HIR nodes, outer→inner). Optional: nullptr (or a local
+           // with no entry) ⇒ not a VLA. Read in `vlaAllocaForLocal` to lower each
+           // runtime bound + form the cumulative row strides and the total byte size
+           // at the declaration point. A 1-D VLA has one entry.
+           std::unordered_map<std::uint32_t, std::vector<HirNodeId>> const* vlaSizeMap
                = nullptr,
            // VLA C2 (D-CSUBSET-VLA): per-`sizeof <vla-object>` side-table (the SizeOf
            // HIR node id.v → the VLA operand's SymbolId.v), populated by the CST→HIR

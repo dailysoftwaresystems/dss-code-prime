@@ -263,6 +263,23 @@ bool TypeInterner::isVlaArray(TypeId id) const {
     return !sc.empty() && sc[0] == kVlaLength;
 }
 
+bool TypeInterner::typeContainsVla(TypeId id) const {
+    // VLA C3 (D-CSUBSET-VLA): walk the array-element spine (`ops[0]`), testing
+    // `isVlaArray` at each level. `int a[5][n]` = array(vlaArray(int),5): the top
+    // is a fixed Array (not a VLA), but its element IS a VLA → true. A fully-fixed
+    // `int[5][5]` = array(array(int,5),5): no level is a VLA → false (no over-fire).
+    // A `volatile`-skin at any level is seen through by the transparent `kind()` /
+    // `operands()` accessors (mirroring isVlaArray's own materialId_ strip).
+    while (id.valid()) {
+        if (isVlaArray(id)) return true;
+        if (kind(id) != TypeKind::Array) return false;   // non-array base — stop
+        auto const ops = operands(id);
+        if (ops.empty()) return false;
+        id = ops[0];
+    }
+    return false;
+}
+
 TypeId TypeInterner::tuple(std::span<TypeId const> elements) {
     return internContent(TypeKind::Tuple, {}, elements, {}, {});
 }

@@ -182,6 +182,18 @@ public:
     // `isVlaArray`. `computeLayout` already nullopts on the negative length scalar.
     TypeId vlaArray(TypeId element);
     [[nodiscard]] bool isVlaArray(TypeId id) const;
+    // VLA C3 (D-CSUBSET-VLA): does `id` CONTAIN a variable-length array at ANY level
+    // of its array spine — i.e. is `id` itself a VLA, or an ARRAY (fixed or VLA)
+    // whose element (recursively, via ops[0]) is a VLA? This is the transitive
+    // predicate that routes a FIXED-outer multi-dim VLA (`int a[5][n]` —
+    // `array(vlaArray(int),5)`, whose top is a fixed Array, NOT `isVlaArray`) to the
+    // runtime alloca / stride / sizeof paths that `isVlaArray` alone would miss. It
+    // walks ONLY the array-element chain (`ops[0]`) and tests `isVlaArray` at EACH
+    // level — NOT `kind==Array`, so a fully-fixed `int[5][5]` does NOT over-fire
+    // (every level is a non-VLA Array → false). A non-array base terminates the walk.
+    // The `typeContainsFlexibleArray` mirror, on the interner (callable from
+    // semantic + hir_to_mir + mir_verifier). An invalid id is not a VLA container.
+    [[nodiscard]] bool typeContainsVla(TypeId id) const;
     // tuple: operands=[elements...].
     TypeId tuple(std::span<TypeId const> elements);
 

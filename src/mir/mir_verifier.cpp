@@ -166,8 +166,15 @@ void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const 
                     auto const ops = interner_->operands(resTy);
                     if (!ops.empty()) pointee = ops[0];
                 }
+                // VLA C3: `||typeContainsVla` so a FIXED-outer multi-dim VLA
+                // (`int a[5][n]` — pointee array(vlaArray,5), a fixed Array whose top
+                // is NOT isVlaArray but which STILL takes the runtime-operand alloca)
+                // is correctly classified as runtime-sized (else its size operand
+                // trips the "fixed alloca must carry no operand" arm below).
                 bool const isVla =
-                    pointee.valid() && interner_->isVlaArray(pointee);
+                    pointee.valid()
+                    && (interner_->isVlaArray(pointee)
+                        || interner_->typeContainsVla(pointee));
                 if (isVla && allocaOperands != 1) {
                     reportInst(reporter,
                         DiagnosticCode::I_VlaAllocaOperandInvalid, id,
