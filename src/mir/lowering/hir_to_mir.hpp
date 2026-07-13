@@ -241,6 +241,13 @@ lowerToMir(Hir const&               hir,
            // VLA. Read in `allocaForLocal` to lower the runtime bound into the
            // Alloca's total-byte-size operand at the declaration point.
            std::unordered_map<std::uint32_t, HirNodeId> const* vlaSizeMap
+               = nullptr,
+           // VLA C2 (D-CSUBSET-VLA): per-`sizeof <vla-object>` side-table (the SizeOf
+           // HIR node id.v → the VLA operand's SymbolId.v), populated by the CST→HIR
+           // lowerer. Optional: nullptr (or a SizeOf with no entry) ⇒ a plain static
+           // sizeof. Read in the MIR SizeOf case to emit a runtime Load of the VLA's
+           // decl-frozen size slot instead of a compile-time layout fold.
+           std::unordered_map<std::uint32_t, std::uint32_t> const* sizeofVlaSymMap
                = nullptr);
 
 } // namespace dss

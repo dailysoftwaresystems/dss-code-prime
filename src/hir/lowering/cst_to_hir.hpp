@@ -106,6 +106,14 @@ struct DSS_EXPORT CstToHirResult {
     // it to a total byte size for the Alloca's runtime operand. Empty for every
     // non-VLA translation unit.
     std::unordered_map<std::uint32_t, HirNodeId> vlaSizeExprBySymbol;
+    // VLA C2 (D-CSUBSET-VLA): a `sizeof <vla-object>` HirNode → the VLA operand's
+    // SymbolId (`.v`), keyed by the SizeOf HIR node's id (`.v`). Populated at CST→HIR
+    // ONLY when the sizeof operand resolves to a VLA-typed symbol; the SizeOf node's
+    // TypeRef child is LEFT as the `vlaArray` type UNCHANGED, so every const-eval
+    // consumer keeps declining a VLA sizeof (never a wrong constant). HIR→MIR reads
+    // this to emit a runtime Load of the decl-frozen size instead of a static fold.
+    // Empty for every non-VLA translation unit.
+    std::unordered_map<std::uint32_t, std::uint32_t> sizeofVlaSymbol;
     HirLiteralPool literalPool;   // decoded literal values, indexed by literalIndex
     // True iff neither lowering nor the verify-on-load pass emitted an
     // Error-severity diagnostic (delta-computed, so prior diagnostics on the

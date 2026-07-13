@@ -96,6 +96,10 @@ struct Lowerer {
     // the local is not a VLA. Read in `allocaForLocal` to lower the runtime bound
     // into the Alloca's size operand at the DECL point.
     std::unordered_map<std::uint32_t, HirNodeId> const* vlaSizeMap = nullptr;
+    // VLA C2 (D-CSUBSET-VLA): a `sizeof <vla-object>` SizeOf HIR node id.v → the VLA
+    // operand's SymbolId.v. nullptr / no entry ⇒ a plain (static-fold) sizeof. Read in
+    // the MIR SizeOf case to emit a runtime Load of the decl-frozen size slot below.
+    std::unordered_map<std::uint32_t, std::uint32_t> const* sizeofVlaSymMap = nullptr;
     MirBuilder               mir;
     // Extern symbols extracted during the pre-pass. Each extern's
     // SymbolId is also inserted into `functionSymbols` so a `Ref`
@@ -113,6 +117,11 @@ struct Lowerer {
     // `Ref` reads emit `Load(alloca)`; `AssignStmt` writes emit `Store(value,
     // alloca)`; `AddressOf(Ref(sym))` returns the alloca itself.
     std::unordered_map<std::uint32_t, MirInstId> addressableLocal;
+    // VLA C2 (D-CSUBSET-VLA): within one function, a VLA local's SymbolId.v → the
+    // hidden 8-byte `Alloca` slot holding its decl-frozen BYTE size (`count*stride`,
+    // = the C `sizeof`). Materialized once at the decl by `vlaAllocaForLocal`; the MIR
+    // SizeOf case `Load`s it for a runtime `sizeof <vla>`. Cleared per function.
+    std::unordered_map<std::uint32_t, MirInstId> vlaSizeSlot;
     // FC7 (D-FC7-MEMBER-ACCESS): per-CU memoized struct/union layouts keyed
     // by TypeId.v. `computeLayout` is PURE and a TypeId's layout is
     // invariant within the CU (one interner + one target config), so this
@@ -1737,6 +1746,33 @@ struct Lowerer {
                 return mir.addConst(toMirLiteral(src), t);
             }
             case HirKind::SizeOf: {
+                // VLA C2 (D-CSUBSET-VLA): a `sizeof <vla-object>` is a RUNTIME value —
+                // the byte size frozen at the VLA's declaration (C 6.7.6.2p2), NOT a
+                // static layout fold (a VLA's size is not a constant expression, C 6.6).
+                // If this SizeOf node is the recorded VLA-object form, LOAD its
+                // decl-frozen size slot (U64 = `t`). This runs ONLY for a genuine runtime
+                // sizeof: a constant-required context (`_Static_assert`, an array bound)
+                // const-evaluates the sizeof and DECLINES it (the vlaArray TypeRef →
+                // `computeLayout` nullopt) BEFORE MIR, so it never reaches here.
+                if (sizeofVlaSymMap != nullptr) {
+                    if (auto it = sizeofVlaSymMap->find(node.v);
+                        it != sizeofVlaSymMap->end()) {
+                        auto slotIt = vlaSizeSlot.find(it->second);
+                        if (slotIt == vlaSizeSlot.end()) {
+                            // The VLA's decl (which materializes the slot) dominates every
+                            // use of the object, so the slot MUST exist. Absent ⇒ an
+                            // internal side-table desync — fail loud, never a stale/guessed
+                            // size (mirrors `vlaAllocaForLocal`'s desync guard).
+                            unsupported(node,
+                                        "sizeof of a variable-length array whose "
+                                        "decl-frozen size slot was not materialized "
+                                        "(internal side-table desync)");
+                            return InvalidMirInst;
+                        }
+                        std::array<MirInstId, 1> ld{slotIt->second};
+                        return mir.addInst(MirOpcode::Load, ld, t);
+                    }
+                }
                 // FC6: fold sizeof(T) to T's byte size (result type size_t = U64,
                 // = `t`) via the type_layout engine. The TypeRef child carries the
                 // type being sized (its typeId). Fail loud — never a guessed size —
@@ -3833,6 +3869,25 @@ struct Lowerer {
         std::array<MirInstId, 2> mulOps{count, ci64(static_cast<std::int64_t>(*stride))};
         MirInstId const bytes = mir.addInst(MirOpcode::Mul, mulOps, i64ty);
         if (!bytes.valid()) return InvalidMirInst;
+        // VLA C2 (D-CSUBSET-VLA): FREEZE this VLA's byte size — `bytes` (= count*stride)
+        // is EXACTLY the C `sizeof a` (the 16-byte stack round-up is applied only at LIR
+        // for the `sub sp` and never mutates this logical size). Store it once, HERE at
+        // the decl (C 6.7.6.2p2: the size is evaluated once — side-effect-safe for
+        // `int a[f()]`), in a hidden fixed 8-byte slot a later `sizeof a` Loads. `size_t`
+        // (U64) slot so the SizeOf-case Load result matches the sizeof node's type. This
+        // fixed no-operand Alloca takes the ordinary fixed-frame path (summed by callconv,
+        // FP-relative in the C1b VLA frame) — distinct from the VLA's own runtime Alloca.
+        {
+            TypeId const u64PtrTy =
+                interner.pointer(interner.primitive(TypeKind::U64));
+            MirInstId const sizeSlot =
+                mir.addInst(MirOpcode::Alloca, {}, u64PtrTy, /*payload=*/8,
+                            MirInstFlags::None, /*payload2=*/8);
+            if (!sizeSlot.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> stOps{bytes, sizeSlot};
+            mir.addInst(MirOpcode::Store, stOps, InvalidType);
+            vlaSizeSlot[sym.v] = sizeSlot;
+        }
         // Effective alignment from the ELEMENT (the VLA type has no static layout) +
         // any `alignas` override on the decl. 0 = "no info". Mirrors the fixed path's
         // payload2 channel; the PRIMARY payload stays 0 (the runtime-sized sentinel).
@@ -8609,6 +8664,7 @@ struct Lowerer {
         // bindings — entries from the previous function are stale.
         symbolToValue.clear();
         addressableLocal.clear();
+        vlaSizeSlot.clear();   // VLA C2 (D-CSUBSET-VLA): per-function size slots
         labelBlocks_.clear();   // FC5: labels are function-scoped
         addressTakenLabelOrdinals_.clear();  // D-CSUBSET-COMPUTED-GOTO
         // FC7 C1c: per-function by-value return state.
@@ -10051,7 +10107,9 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           HirAlignmentMap const*   alignmentMap,
                           HirThreadLocalMap const* threadLocalMap,
                           std::unordered_map<std::uint32_t, HirNodeId> const*
-                                                   vlaSizeMap) {
+                                                   vlaSizeMap,
+                          std::unordered_map<std::uint32_t, std::uint32_t> const*
+                                                   sizeofVlaSymMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -10071,6 +10129,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .alignmentMap = alignmentMap,
         .threadLocalMap = threadLocalMap,
         .vlaSizeMap = vlaSizeMap,
+        .sizeofVlaSymMap = sizeofVlaSymMap,
         .mir       = MirBuilder{},
     };
     // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING: stamp the module-

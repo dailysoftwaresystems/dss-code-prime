@@ -250,6 +250,10 @@ struct Lowerer {
     // `vlaSizeExprBySymbol` map AFTER finish() (same frozen-hir discipline as the
     // attribute accumulators). Sparse: only VLA locals are recorded.
     std::vector<std::pair<std::uint32_t, HirNodeId>>& vlaSizeAcc;
+    // VLA C2 (D-CSUBSET-VLA): shared accumulator of (SizeOf HIR node id.v → the VLA
+    // operand's SymbolId.v) pairs. Populated at a `sizeof <vla-object>` site; moved
+    // onto result->sizeofVlaSymbol AFTER finish(). Sparse: only VLA-object sizeofs.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>>& sizeofVlaSymAcc;
 
     // D-CSUBSET-LOCAL-STATIC: the module-level decls accumulator (the SAME
     // vector `lowerTree` appends top-level decls to). A block-scope `static`
@@ -821,11 +825,12 @@ struct Lowerer {
             std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& tls,
             std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
             std::vector<std::pair<HirNodeId, AlignmentAttr>>& aln,
-            std::vector<std::pair<std::uint32_t, HirNodeId>>& vlaSz)
+            std::vector<std::pair<std::uint32_t, HirNodeId>>& vlaSz,
+            std::vector<std::pair<std::uint32_t, std::uint32_t>>& sizeofVlaSym)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
           linkage(lk), mutability(mut), threadLocalAcc(tls), volatileAcc(vol),
-          alignmentAcc(aln), vlaSizeAcc(vlaSz) {
+          alignmentAcc(aln), vlaSizeAcc(vlaSz), sizeofVlaSymAcc(sizeofVlaSym) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -5330,6 +5335,60 @@ struct Lowerer {
         }
         return InvalidType;
     }
+    // VLA C2 (D-CSUBSET-VLA): the SymbolId of a `sizeof <operand>` when the operand is a
+    // DIRECT reference to a VLA object (`a`, `(a)`, `((a))`). Mirrors `simpleLvalue`'s
+    // core (side-effect-free): `peelToCore` peels transparent paren/wrapper nodes, and
+    // the result MUST be a bare identifier `operandRule` whose type `isVlaArray`. This is
+    // the C lvalue-vs-conversion distinction: a direct array-object operand keeps its
+    // array type under `sizeof`, so `sizeof a` == the array size (the frozen runtime
+    // value). A COMPOSITE operand — `sizeof(b, a)` (comma), `sizeof(c ? a : b)`, a
+    // cast/call — undergoes lvalue conversion (array→pointer decay), so its `sizeof` is
+    // the POINTER size, NOT the object's frozen size; those peel to a NON-operandRule
+    // expression node → invalid SymbolId → the caller records nothing → the existing
+    // static path stands (which fails loud on the VLA type — never a silently wrong
+    // VLA size). Also rejects `sizeof a[0]` naturally: its `sized` is the element type,
+    // so `isVlaArray(sized)` is already false and this helper is never reached.
+    [[nodiscard]] SymbolId vlaObjectOperandSymbol(NodeId operand) const {
+        NodeId cur = operand;
+        for (int guard = 0; guard < 128 && cur.valid(); ++guard) {
+            if (isToken(cur)) return SymbolId{};   // a bare non-identifier token operand
+            // Classify children: SUB-EXPRESSION nodes vs. a direct identifier token.
+            // (Operator/punctuation tokens — `(`, `)`, `,`, `?` — are neither.)
+            NodeId identTok{}, sub{};
+            int subCount = 0;
+            for (NodeId c : visible(cur)) {
+                if (isToken(c)) {
+                    if (sem.identifierToken.valid()
+                        && tree().tokenKind(c).v == sem.identifierToken.v)
+                        identTok = c;
+                } else {
+                    ++subCount;
+                    sub = c;
+                }
+            }
+            // Terminal: a bare identifier operand (no sub-expressions). Resolve it to a
+            // VLA OBJECT via the symbol's own DECLARED type isVlaArray (stamp-independent
+            // + precise) — this rejects a VLA-yielding-but-non-object operand like
+            // `sizeof *p` (the identifier `p` is a pointer whose pointee is a VLA).
+            if (subCount == 0) {
+                if (!identTok.valid()) return SymbolId{};
+                SymbolId const sym = model.symbolAt(identTok);
+                SymbolRecord const* rec = sym.valid() ? model.recordFor(sym) : nullptr;
+                return (rec != nullptr && interner.isVlaArray(rec->type)) ? sym
+                                                                          : SymbolId{};
+            }
+            // Transparent grouping wrapper (parens / operand / postfix): exactly ONE
+            // sub-expression and no stray identifier — descend. Anything else (≥2
+            // sub-expressions = a comma/ternary/binary composite, or an identifier
+            // alongside a sub-expression) is NOT a direct object reference → reject: the
+            // caller records nothing and the existing fail-loud static path stands (so
+            // `sizeof(b, a)` / `sizeof(0, a)` fail loud rather than silently loading a
+            // VLA's frozen size — C decays a composite operand to a pointer).
+            if (subCount == 1 && !identTok.valid()) { cur = sub; continue; }
+            return SymbolId{};
+        }
+        return SymbolId{};
+    }
     [[nodiscard]] E lowerCompoundLiteral(NodeId clNode) {
         NodeId typeRefN{}, braceN{};
         for (NodeId c : visible(clNode)) {
@@ -5378,7 +5437,27 @@ struct Lowerer {
         }
         HirNodeId const tref = track(builder.makeTypeRef(sized), node);
         TypeId const u64 = interner.primitive(TypeKind::U64);
-        return {track(builder.makeSizeOf(tref, u64), node), u64};
+        HirNodeId const so = track(builder.makeSizeOf(tref, u64), node);
+        // VLA C2 (D-CSUBSET-VLA): for a VLA-OBJECT operand, `sizeof a` is a RUNTIME
+        // value (the size frozen at a's decl, C 6.7.6.2p2), not a static fold. Record
+        // (SizeOf node → the VLA symbol) so MIR emits a Load of the decl-frozen size.
+        // The TypeRef child is LEFT as `vlaArray` (unchanged), so every const-eval
+        // consumer keeps DECLINING a VLA sizeof (never a wrong constant) — the runtime
+        // path lives solely at the MIR SizeOf case, reached only for genuine runtime
+        // expressions (a constant-required context const-evals + declines before MIR).
+        if (interner.isVlaArray(sized)) {
+            // The operand is the first sub-expression child of the form node (the
+            // `castOperand` after the `sizeof` keyword). Record ONLY a direct VLA-object
+            // reference (see vlaObjectOperandSymbol); a composite operand falls through.
+            NodeId operandN{};
+            for (NodeId c : visible(scan))
+                if (tree().kind(c) == NodeKind::Internal) { operandN = c; break; }
+            if (operandN.valid())
+                if (SymbolId const opSym = vlaObjectOperandSymbol(operandN);
+                    opSym.valid())
+                    sizeofVlaSymAcc.emplace_back(so.v, opSym.v);
+        }
+        return {so, u64};
     }
 
     // C11/C23 6.5.3.4: `_Alignof ( type-name )` | `alignof ( type-name )` → core
@@ -8299,6 +8378,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // VLA C1a (D-CSUBSET-VLA): shared (local SymbolId.v → size-expr HIR node)
     // accumulator, moved onto result->vlaSizeExprBySymbol after finish().
     std::vector<std::pair<std::uint32_t, HirNodeId>> vlaSizeAcc;
+    // VLA C2 (D-CSUBSET-VLA): shared (SizeOf HIR node id.v → VLA operand SymbolId.v)
+    // accumulator, moved onto result->sizeofVlaSymbol after finish().
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> sizeofVlaSymAcc;
 
     // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
     // to its language's config + the shared output. `Tree::schema()` is the
@@ -8310,7 +8392,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
-            mutability, threadLocalAcc, volatileAcc, alignmentAcc, vlaSizeAcc));
+            mutability, threadLocalAcc, volatileAcc, alignmentAcc, vlaSizeAcc,
+            sizeofVlaSymAcc));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -8364,6 +8447,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     for (auto& [id, attr] : alignmentAcc) result->alignmentMap.set(id, attr);  // alignas
     for (auto& [symV, sizeNode] : vlaSizeAcc)   // VLA C1a (D-CSUBSET-VLA)
         result->vlaSizeExprBySymbol.emplace(symV, sizeNode);
+    for (auto& [sizeofNodeV, symV] : sizeofVlaSymAcc)   // VLA C2 (D-CSUBSET-VLA)
+        result->sizeofVlaSymbol.emplace(sizeofNodeV, symV);
     result->externDecls = std::move(externDecls);
 
     // verify-on-load.

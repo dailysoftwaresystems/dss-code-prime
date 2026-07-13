@@ -421,7 +421,8 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           &hir->linkageMap, &hir->mutabilityMap,
                           &hir->volatileMap, &hir->alignmentMap,
                           &hir->threadLocalMap,   // TLS C1
-                          &hir->vlaSizeExprBySymbol);   // VLA C1a (D-CSUBSET-VLA)
+                          &hir->vlaSizeExprBySymbol,   // VLA C1a (D-CSUBSET-VLA)
+                          &hir->sizeofVlaSymbol);   // VLA C2 (D-CSUBSET-VLA)
     phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;

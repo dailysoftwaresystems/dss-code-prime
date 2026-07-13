@@ -1201,6 +1201,33 @@ TEST(SemanticAnalyzerCSubset, StaticAssertSizeofConditionFoldsFalseFailsLoud) {
         << "sizeof(int)==99 must FOLD false — the assertion fails loud";
 }
 
+// VLA C2 (D-CSUBSET-VLA) — THE INVARIANT: `sizeof <vla>` is a RUNTIME value, NOT a
+// constant expression (C 6.6). It must therefore DECLINE the const-eval fold in a
+// constant-required context, so `_Static_assert(sizeof a == K)` fails loud (the
+// "not an integer constant expression" branch of S_StaticAssertFailed), never folding
+// to a compile-time constant. Red-on-disable for the central C2 safety property: if a
+// change ever taught const-eval to fold a VLA sizeof, this assertion would either pass
+// (K matched) or fail as an ordinary false assertion — either way the count/behavior
+// shifts. C2 keeps the SizeOf node's `vlaArray` TypeRef so this decline holds for free.
+TEST(SemanticAnalyzerCSubset, StaticAssertSizeofVlaIsNotConstantFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){\n"
+        "  volatile int s = 6;\n"
+        "  int n = s;\n"
+        "  int a[n];\n"                 // a VLA — sizeof a is runtime, not constant
+        "  _Static_assert(sizeof a == 24, \"vla sizeof is not a constant\");\n"
+        "  return 0;\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u)
+        << "sizeof of a VLA is not a constant expression — the _Static_assert must "
+           "fail loud (const-eval declines), never fold to a compile-time value";
+}
+
 // sizeof-of-a-STRUCT in the condition folds (exercises the aggregateLayout path,
 // not just the scalar width). `struct S{int a; int b;}` = 8 bytes under natural
 // alignment → the assertion passes; the wrong size fails loud.

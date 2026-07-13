@@ -124,7 +124,8 @@ struct Lowered {
                                     &hir->linkageMap, &hir->mutabilityMap,
                                     &hir->volatileMap, /*alignmentMap=*/nullptr,
                                     &hir->threadLocalMap,
-                                    &hir->vlaSizeExprBySymbol);   // VLA C1a
+                                    &hir->vlaSizeExprBySymbol,   // VLA C1a
+                                    &hir->sizeofVlaSymbol);   // VLA C2
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -8620,4 +8621,107 @@ TEST(MirLoweringCSubset, VlaLocalLowersToRuntimeOperandAllocaAtDeclPoint) {
         << "the VLA alloca must follow the store to its runtime bound `n`";
     EXPECT_NE(vlaIdx, 0)
         << "the VLA alloca must NOT be hoisted to the entry-block top";
+}
+
+// VLA C2 (D-CSUBSET-VLA): `sizeof <vla-object>` lowers to a runtime Load of the VLA's
+// decl-frozen byte-size slot — NOT a static fold (which HEAD fails loud, H0009). This
+// pins the whole slot mechanism: a hidden fixed 8-byte Alloca, a Store of the VLA's
+// byte size (the `count*stride` Mul) into it AT THE DECL, and a Load from it at the
+// sizeof. Red-on-disable: revert C2 and `sizeof a` fails loud (mir.ok == false), so the
+// leading ASSERT_TRUE alone catches a regression; the slot/Store/Load shape locks the
+// mechanism (a static-fold Const or a re-evaluated size would break these).
+TEST(MirLoweringCSubset, SizeofOfVlaLoadsDeclFrozenSizeSlot) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 4;\n"
+        "  int a[n];\n"
+        "  return (int)sizeof a;\n"   // runtime Load of the decl-frozen size (n*4)
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)   // red-on-disable: HEAD (pre-C2) fails loud H0009 here
+        << "sizeof of a VLA object must lower cleanly to a runtime Load (not H0009): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& in = L.model.lattice().interner();
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // (1) THE SIZE SLOT: a fixed 8-byte Alloca (no operand, primary payload 8). The
+    // scalar `n` alloca is payload 4; the VLA alloca is operand-bearing (payload 0);
+    // so the payload-8 no-operand Alloca is uniquely the C2 size slot.
+    MirInstId sizeSlot{};
+    int sizeSlotCount = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) == MirOpcode::Alloca && m.instOperands(id).empty()
+            && m.instPayload(id) == 8u) {
+            ++sizeSlotCount;
+            sizeSlot = id;
+        }
+    }
+    ASSERT_EQ(sizeSlotCount, 1) << "exactly one hidden 8-byte VLA size slot";
+    // Its element type is size_t (U64) so the sizeof Load result matches the node type.
+    TypeId const slotTy = m.instType(sizeSlot);
+    ASSERT_EQ(in.kind(slotTy), TypeKind::Ptr);
+    auto const slotPtrOps = in.operands(slotTy);
+    ASSERT_EQ(slotPtrOps.size(), 1u);
+    EXPECT_EQ(in.kind(slotPtrOps[0]), TypeKind::U64) << "size slot holds a size_t";
+
+    // (2) THE FREEZE STORE: a Store whose ADDRESS is the size slot and whose VALUE is
+    // the VLA's byte size (a Mul == count*stride) — proving the size is frozen at the
+    // decl, not re-evaluated at the sizeof.
+    bool sawFreezeStore = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Store) continue;
+        auto const ops = m.instOperands(id);
+        if (ops.size() == 2u && ops[1].v == sizeSlot.v
+            && m.instOpcode(ops[0]) == MirOpcode::Mul) {
+            sawFreezeStore = true;
+        }
+    }
+    EXPECT_TRUE(sawFreezeStore)
+        << "the VLA's byte size (count*stride Mul) must be Stored into the size slot "
+           "at the decl point (freeze-at-decl, C 6.7.6.2p2)";
+
+    // (3) THE SIZEOF LOAD: a Load FROM the size slot, typed U64 — this IS `sizeof a`.
+    bool sawSizeofLoad = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Load) continue;
+        auto const ops = m.instOperands(id);
+        if (ops.size() == 1u && ops[0].v == sizeSlot.v
+            && in.kind(m.instType(id)) == TypeKind::U64) {
+            sawSizeofLoad = true;
+        }
+    }
+    EXPECT_TRUE(sawSizeofLoad)
+        << "`sizeof a` must lower to a U64 Load of the decl-frozen size slot, never a "
+           "static Const fold (a VLA sizeof is not a constant expression)";
+}
+
+// VLA C2 (D-CSUBSET-VLA) — CRITICAL-1 guard: `sizeof` of a COMPOSITE operand whose value
+// is a VLA (`sizeof(0, a)` — a comma expression) must NOT be treated as the object's
+// frozen size. C decays the comma result (an rvalue) to a pointer, so its sizeof is the
+// pointer size; the c-subset does not model that decay, so this must FAIL LOUD (H0009 at
+// MIR) — never silently Load a (possibly wrong) VLA's frozen size. Red-on-disable for the
+// operand-shape guard in `vlaObjectOperandSymbol`: a broad "find any VLA leaf" match would
+// mis-key `a` here and lower a bogus runtime size (mir.ok would flip true).
+TEST(MirLoweringCSubset, SizeofOfCompositeVlaOperandFailsLoud) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 4;\n"
+        "  int a[n];\n"
+        "  return (int)sizeof(0, a);\n"   // composite operand — must fail loud, not Load a
+        "}\n");
+    // The front-end accepts it (a is a valid VLA); the failure is the sizeof lowering.
+    EXPECT_FALSE(L.mir.ok)
+        << "sizeof of a composite (comma) operand yielding a VLA must fail loud (its C "
+           "value decays to a pointer), never silently load the VLA's frozen size";
 }
