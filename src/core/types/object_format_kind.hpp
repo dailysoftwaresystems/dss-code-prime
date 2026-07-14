@@ -288,6 +288,62 @@ struct DSS_EXPORT TlsAccessInfo {
     std::string    tlsIndexSlotName;
 };
 
+// ── Shipped-library synthesis vehicle (D-CSUBSET-C11-THREADS-MACHO) ─
+//
+// WHICH native primitive family a COMPILER-SYNTHESIZED shipped-library
+// shim (today: C11 <threads.h>) emits its body over — a property of the
+// OBJECT FORMAT's host-OS runtime, exactly like `TlsAccessInfo` /
+// `ProcessArgs` above. A format whose libc does NOT export a shipped
+// header's symbols has each such function SYNTHESIZED by the compiler
+// (src/mir/merge/synth_threads_shim.cpp) over the OS's real primitives;
+// this block declares WHICH primitive family + WHICH library to import
+// them from, so the synth pass never branches on the format identity.
+//
+//   * `win32`   (PE / Windows): the CRT exports no thrd_*/mtx_*/… , so
+//     each C11 threads function is emitted over kernel32 CRITICAL_SECTION
+//     / CONDITION_VARIABLE / Fls* primitives (libraryPath = kernel32.dll).
+//   * `pthread` (Mach-O / Darwin): macOS libSystem exports no C11 threads
+//     symbols (verified — `_thrd_create` is undefined at link), but
+//     pthread IS in libSystem, so each function is emitted over
+//     pthread_mutex_* / pthread_cond_* / pthread_key_* / pthread_self /
+//     sched_yield (libraryPath = /usr/lib/libSystem.B.dylib).
+//
+// ELF declares NO block: glibc>=2.34 exports the C11 thread API directly
+// from libc.so.6, so those symbols are ordinary FFI imports and the synth
+// pass is a clean no-op (its recipe map is empty on elf). A format that
+// carries synthesize-tagged shipped symbols but declares NO vehicle fails
+// LOUD in the synth pass (never a silently-defaulted vehicle). The pass
+// dispatches on this closed verb set, never on a format/CPU identity.
+enum class LibrarySynthVehicle : std::uint8_t {
+    Win32   = 1,  // kernel32 CRITICAL_SECTION / CONDITION_VARIABLE / Fls*
+    Pthread = 2,  // POSIX pthread_* (Darwin libSystem)
+};
+
+inline constexpr EnumNameTable<LibrarySynthVehicle, 2> kLibrarySynthVehicleTable{{{
+    { LibrarySynthVehicle::Win32,   "win32"   },
+    { LibrarySynthVehicle::Pthread, "pthread" },
+}}};
+
+[[nodiscard]] constexpr std::string_view
+librarySynthVehicleName(LibrarySynthVehicle v) noexcept {
+    return kLibrarySynthVehicleTable.name(v);
+}
+[[nodiscard]] constexpr std::optional<LibrarySynthVehicle>
+librarySynthVehicleFromName(std::string_view s) noexcept {
+    return kLibrarySynthVehicleTable.fromName(s);
+}
+
+// The format's shipped-library synthesis block (`"librarySynthesis"` in
+// `.format.json`). `vehicle` selects the primitive family the synth pass
+// emits over; `libraryPath` is the native library its on-demand helper
+// imports name (the value that dissolves the pass's former hardcoded
+// "kernel32.dll"). Present on pe/macho formats; absent on elf (direct
+// FFI) and wasm/spirv (no native shim).
+struct DSS_EXPORT LibrarySynthesis {
+    LibrarySynthVehicle vehicle = LibrarySynthVehicle::Win32;
+    std::string         libraryPath;
+};
+
 // THE single source of truth for the extern-call-site SHAPE selection
 // (D-FFI-EXTERN-CALL-DISPATCH). `true`  → the call site DEREFERENCES a
 // pointer slot (x86_64 `FF 15 disp32` = `call [RIP+disp]`); the LIR

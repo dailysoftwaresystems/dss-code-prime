@@ -476,6 +476,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
     // define each shim. `hir` (the CstToHirResult) is still alive here — lowerToMir read
     // its maps by pointer, it was not consumed. Empty for the overwhelming majority.
     cuMir.threadsRecipes = hir->synthRecipeBySymbol;
+    // D-CSUBSET-C11-THREADS-MACHO: capture the format's synth vehicle (win32/pthread +
+    // import library) the SAME post-construction way as threadsRecipes, so the LOWER
+    // half's `synthesizeThreadsShim` picks the right primitive family. nullopt on elf.
+    cuMir.librarySynthesis = format.librarySynthesis();
+    cuMir.objectFormat     = format.kind();   // for the synth pass's per-format helper mangling
     return cuMir;
 }
 
@@ -1079,14 +1084,16 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         }
     }
 
-    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): single-CU counterpart of the merge-path
-    // shim synth (program.cpp). Supply a definition for every pe64 <threads.h> shim
-    // symbol the descriptor tagged (mtx_lock etc.) over kernel32 primitives; a clean
-    // no-op when `threadsRecipes` is empty (every elf/macho + non-threads TU). Same seam
-    // as synthesizePeStartup (the CU is per-CU-optimized; the appended shims are lowered
-    // like any other function). The interner is the CU model's.
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER / D-CSUBSET-C11-THREADS-MACHO): single-CU
+    // counterpart of the merge-path shim synth (program.cpp). Supply a definition for every
+    // <threads.h> shim symbol the descriptor tagged (mtx_lock etc.) over the format's synth
+    // vehicle (pe→kernel32, macho→pthread); a clean no-op when `threadsRecipes` is empty
+    // (every elf + non-threads TU). Same seam as synthesizePeStartup (the CU is per-CU-
+    // optimized; the appended shims are lowered like any other function). The interner is
+    // the CU model's; the vehicle comes from `cuMir.librarySynthesis`.
     if (!synthesizeThreadsShim(cuMir.mir, model.lattice().interner(),
-                               cuMir.threadsRecipes, cuMir.externImports, reporter)) {
+                               cuMir.threadsRecipes, cuMir.librarySynthesis,
+                               cuMir.objectFormat, cuMir.externImports, reporter)) {
         return std::nullopt;  // internal invariant breach (vocab/switch drift) — reported.
     }
 

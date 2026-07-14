@@ -201,6 +201,11 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
             // WASM/SPIR-V (their thread-local story is format-native
             // vocabulary when it lands).
             "tlsAccess",
+            // D-CSUBSET-C11-THREADS-MACHO: the shipped-library synth
+            // vehicle (kernel32 / pthread primitive family for a
+            // compiler-synthesized shim) is an ELF/PE/Mach-O native-
+            // runtime notion — dead data on WASM/SPIR-V.
+            "librarySynthesis",
         };
         for (auto const* field : universalFields) {
             if (doc.contains(field)) {
@@ -519,6 +524,71 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 ok = false;
             }
             if (ok) data.tlsAccess = info;
+        }
+    }
+
+    // D-CSUBSET-C11-THREADS-MACHO: `librarySynthesis` block — the format's
+    // compiler-synthesized-shim vehicle (the kernel32 vs pthread primitive
+    // family a synthesized shipped-library shim, today C11 <threads.h>,
+    // emits over) + the native library its on-demand helpers import from.
+    // Optional in the JSON: ELF omits it (glibc exports the C11 thread API
+    // directly → the synth recipe map is empty on elf → clean no-op). A
+    // PRESENT block is strict (closed verb set + non-empty path); a format
+    // that carries synthesize-tagged threads symbols yet declares NO block
+    // fails loud in `synthesizeThreadsShim` (never a silently-assumed
+    // vehicle) — the same fail-loud-on-absence discipline as tlsAccess.
+    if (doc.contains("librarySynthesis")) {
+        auto const& ls = doc.at("librarySynthesis");
+        if (!ls.is_object()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/librarySynthesis",
+                      "'librarySynthesis' must be an object { \"vehicle\": "
+                      "\"win32\"|\"pthread\", \"libraryPath\": \"…\" }");
+        } else {
+            LibrarySynthesis info{};
+            bool ok = true;
+            if (!ls.contains("vehicle") || !ls.at("vehicle").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/librarySynthesis/vehicle",
+                          "'librarySynthesis.vehicle' is required and must be "
+                          "a string — accepted: \"win32\" (kernel32 "
+                          "CRITICAL_SECTION/CONDITION_VARIABLE/Fls*), "
+                          "\"pthread\" (POSIX pthread_* / Darwin libSystem)");
+                ok = false;
+            } else {
+                auto const s = ls.at("vehicle").get<std::string>();
+                auto const v = librarySynthVehicleFromName(s);
+                if (!v.has_value()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/librarySynthesis/vehicle",
+                              std::format("unknown librarySynthesis vehicle "
+                                          "'{}' — accepted: \"win32\", "
+                                          "\"pthread\"",
+                                          s));
+                    ok = false;
+                } else {
+                    info.vehicle = *v;
+                }
+            }
+            if (!ls.contains("libraryPath")
+                || !ls.at("libraryPath").is_string()) {
+                coll.emit(DiagnosticCode::C_MissingField,
+                          "/librarySynthesis/libraryPath",
+                          "'librarySynthesis.libraryPath' is required and must "
+                          "be a string (the native library the synthesized "
+                          "shim's helpers import from — e.g. \"kernel32.dll\" "
+                          "or \"/usr/lib/libSystem.B.dylib\")");
+                ok = false;
+            } else {
+                info.libraryPath = ls.at("libraryPath").get<std::string>();
+                if (info.libraryPath.empty()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/librarySynthesis/libraryPath",
+                              "'librarySynthesis.libraryPath' must be "
+                              "non-empty");
+                    ok = false;
+                }
+            }
+            if (ok) data.librarySynthesis = info;
         }
     }
 

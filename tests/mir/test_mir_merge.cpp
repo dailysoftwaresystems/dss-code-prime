@@ -1418,7 +1418,9 @@ TEST(SynthThreadsShim, SynthesizesDefinitionAndHelperImportNotTheShimName) {
     std::unordered_map<std::uint32_t, std::string> recipes{{10u, "mtx_lock"}};
     std::vector<ExternImport> externs;   // a threads.h-only TU imports no cond-var/CS yet
     DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, externs, rep));
+    LibrarySynthesis const win32{LibrarySynthVehicle::Win32, "kernel32.dll"};
+    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, win32, ObjectFormatKind::Pe,
+                                      externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     // M4(a): SymbolId{10} (mtx_lock) is now a DEFINED module function.
@@ -1463,10 +1465,13 @@ TEST(SynthThreadsShim, EmptyRecipeMapIsNoOp) {
     std::unordered_map<std::uint32_t, std::string> recipes;   // empty
     std::vector<ExternImport> externs;
     DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, externs, rep));
+    // nullopt vehicle: the empty-map gate MUST short-circuit BEFORE the vehicle check, so
+    // an empty map is a clean no-op even with no declared vehicle (elf's steady state).
+    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, std::nullopt, ObjectFormatKind::Elf,
+                                      externs, rep));
     EXPECT_FALSE(rep.hasErrors());
     EXPECT_EQ(mir.moduleFuncCount(), 1u) << "no shim appended for an empty map";
-    EXPECT_TRUE(externs.empty()) << "no kernel32 import planted for an empty map";
+    EXPECT_TRUE(externs.empty()) << "no import planted for an empty map";
 }
 
 // ── FC17.9(a) Cycle 2 (D-CSUBSET-C11-THREADS-TRAMPOLINES) ────────────────────────
@@ -1496,7 +1501,9 @@ TEST(SynthThreadsShim, ThrdCreateDirectPassesStartRoutineNoTrampoline) {
     std::unordered_map<std::uint32_t, std::string> recipes{{10u, "thrd_create"}};
     std::vector<ExternImport> externs;
     DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, externs, rep));
+    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
+                                      LibrarySynthesis{LibrarySynthVehicle::Win32, "kernel32.dll"},
+                                      ObjectFormatKind::Pe, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     // DIRECT-PASS adds ONLY thrd_create (main + thrd_create) — no trampoline function.
@@ -1584,7 +1591,9 @@ TEST(SynthThreadsShim, CallOnceSynthesizesAddressTakenTrampolineWithIndirectCall
     std::unordered_map<std::uint32_t, std::string> recipes{{10u, "call_once"}};
     std::vector<ExternImport> externs;
     DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, externs, rep));
+    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
+                                      LibrarySynthesis{LibrarySynthVehicle::Win32, "kernel32.dll"},
+                                      ObjectFormatKind::Pe, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     // 3 functions: main + call_once + the synthesized __dss_once_tramp.
@@ -1697,7 +1706,9 @@ TEST(SynthThreadsShim, ThrdJoinIsMultiBlockAndVerifies) {
     std::unordered_map<std::uint32_t, std::string> recipes{{10u, "thrd_join"}};
     std::vector<ExternImport> externs;
     DiagnosticReporter rep;
-    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, externs, rep));
+    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes,
+                                      LibrarySynthesis{LibrarySynthVehicle::Win32, "kernel32.dll"},
+                                      ObjectFormatKind::Pe, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     MirFuncId joinFn{};
@@ -1793,8 +1804,9 @@ TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
 
     std::unordered_map<std::uint32_t, std::string> mergedRecipes{{*shimV, "mtx_lock"}};
     std::vector<ExternImport> externs = merged->externImports;
+    LibrarySynthesis const win32{LibrarySynthVehicle::Win32, "kernel32.dll"};
     ASSERT_TRUE(synthesizeThreadsShim(merged->mir, merged->host.interner(),
-                                      mergedRecipes, externs, rep));
+                                      mergedRecipes, win32, ObjectFormatKind::Pe, externs, rep));
     EXPECT_FALSE(rep.hasErrors());
 
     bool defined = false;
@@ -1804,4 +1816,218 @@ TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
 
     MirVerifier verifier{merged->mir, &merged->host.interner()};
     EXPECT_TRUE(verifier.verify(rep)) << "the merged + shim-synthesized module must verify";
+}
+
+// ── D-CSUBSET-C11-THREADS-MACHO: the `pthread` vehicle (Darwin libSystem) ──────────────
+
+// The pthread vehicle mirrors the win32 test above: SymbolId{10} (mtx_lock) becomes a
+// DEFINED shim over pthread_mutex_lock imported from libSystem — NEVER the shim name, and
+// NEVER a kernel32 primitive. Proves the vehicle switch reads the DECLARED vehicle, not the
+// format.
+TEST(SynthThreadsShim, PthreadVehicleSynthesizesDefinitionAndPthreadHelperImport) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const pV  = in.pointer(in.primitive(TypeKind::Void));
+    TypeId const mainSig = in.fnSig({}, i32, CallConv::CcMS64);
+    std::array<TypeId, 1> const lockParams{pV};
+    TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcAAPCS64);
+
+    MirBuilder mb;
+    mb.addFunction(mainSig, SymbolId{100});
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
+    MirInstId const slot     = mb.addInst(MirOpcode::Alloca, {}, pV, 64);   // a macho mtx_t (64B)
+    MirInstId const lockAddr = mb.addGlobalAddr(SymbolId{10}, in.pointer(lockSig));
+    MirInstId const callOps[] = {lockAddr, slot};
+    mb.addInst(MirOpcode::Call, callOps, i32);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    Mir mir = std::move(mb).finish();
+
+    std::unordered_map<std::uint32_t, std::string> recipes{{10u, "mtx_lock"}};
+    std::vector<ExternImport> externs;
+    DiagnosticReporter rep;
+    LibrarySynthesis const pthread{LibrarySynthVehicle::Pthread, "/usr/lib/libSystem.B.dylib"};
+    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, pthread, ObjectFormatKind::MachO,
+                                      externs, rep));
+    EXPECT_FALSE(rep.hasErrors());
+
+    bool foundLockDef = false;
+    for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i)
+        if (mir.funcSymbol(mir.funcAt(i)).v == 10u) foundLockDef = true;
+    EXPECT_TRUE(foundLockDef) << "mtx_lock must be a synthesized pthread-shim definition";
+
+    // The helper import is macho-C-MANGLED (`_pthread_mutex_lock`) so dyld resolves it in
+    // libSystem — the un-mangled name is what SIGABRT'd the first witness.
+    bool importedLock = false, importedPthreadLock = false, importedKernel32 = false;
+    for (auto const& imp : externs) {
+        if (imp.mangledName == "mtx_lock" || imp.mangledName == "_mtx_lock") importedLock = true;
+        if (imp.mangledName == "_pthread_mutex_lock") {
+            importedPthreadLock = true;
+            EXPECT_EQ(imp.libraryPath, "/usr/lib/libSystem.B.dylib");
+            EXPECT_FALSE(imp.isData);
+        }
+        if (imp.mangledName == "EnterCriticalSection" || imp.libraryPath == "kernel32.dll")
+            importedKernel32 = true;
+    }
+    EXPECT_FALSE(importedLock) << "mtx_lock must NOT be an import (eager-import law)";
+    EXPECT_TRUE(importedPthreadLock)
+        << "the pthread mtx_lock body must import the macho-mangled _pthread_mutex_lock";
+    EXPECT_FALSE(importedKernel32) << "the pthread vehicle must NEVER emit a kernel32 primitive";
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << "the pthread-shim-synthesized module must verify";
+}
+
+// RED-on-disable for the new fail-loud: a NON-empty recipe map with NO declared vehicle
+// must fail loud (never silently assume win32). This is the guard that keeps the vehicle a
+// config value, not a defaulted format identity.
+TEST(SynthThreadsShim, MissingLibrarySynthesisWithNonEmptyRecipesFailsLoud) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    MirBuilder mb;
+    mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    Mir mir = std::move(mb).finish();
+
+    std::unordered_map<std::uint32_t, std::string> recipes{{10u, "mtx_lock"}};
+    std::vector<ExternImport> externs;
+    DiagnosticReporter rep;
+    EXPECT_FALSE(synthesizeThreadsShim(mir, in, recipes, std::nullopt, ObjectFormatKind::MachO,
+                                       externs, rep))
+        << "recipes present + no vehicle MUST fail loud, never assume a primitive family";
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// Per-recipe COVERAGE (multi-form contract, §A.5): every one of the 18 pthread recipes must
+// (a) land as a definition, (b) import its SPECIFIC pthread primitive from libSystem, and
+// (c) verify. A subset-only test would let a latent miss at an unexercised recipe survive.
+TEST(SynthThreadsShim, PthreadAllEighteenRecipesEmitAndVerify) {
+    struct Case { char const* recipe; char const* helper; };
+    static constexpr Case kCases[] = {
+        {"mtx_init", "pthread_mutex_init"},   {"mtx_lock", "pthread_mutex_lock"},
+        {"mtx_unlock", "pthread_mutex_unlock"},{"mtx_trylock", "pthread_mutex_trylock"},
+        {"mtx_destroy", "pthread_mutex_destroy"},
+        {"cnd_init", "pthread_cond_init"},    {"cnd_signal", "pthread_cond_signal"},
+        {"cnd_broadcast", "pthread_cond_broadcast"}, {"cnd_wait", "pthread_cond_wait"},
+        {"cnd_destroy", "pthread_cond_destroy"},
+        {"tss_create", "pthread_key_create"}, {"tss_get", "pthread_getspecific"},
+        {"tss_set", "pthread_setspecific"},   {"tss_delete", "pthread_key_delete"},
+        {"thrd_current", "pthread_self"},     {"thrd_yield", "sched_yield"},
+        {"thrd_exit", "pthread_exit"},        {"thrd_detach", "pthread_detach"},
+    };
+    for (auto const& c : kCases) {
+        TypeInterner in{CompilationUnitId{1}};
+        TypeId const i32 = in.primitive(TypeKind::I32);
+        MirBuilder mb;
+        mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        mb.addReturn(mb.addConst(i32Lit(0), i32));
+        Mir mir = std::move(mb).finish();
+
+        std::unordered_map<std::uint32_t, std::string> recipes{{10u, c.recipe}};
+        std::vector<ExternImport> externs;
+        DiagnosticReporter rep;
+        LibrarySynthesis const pthread{LibrarySynthVehicle::Pthread, "/usr/lib/libSystem.B.dylib"};
+        ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, pthread, ObjectFormatKind::MachO,
+                                          externs, rep))
+            << "recipe '" << c.recipe << "' must synthesize";
+        EXPECT_FALSE(rep.hasErrors()) << c.recipe;
+
+        bool defined = false;
+        for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i)
+            if (mir.funcSymbol(mir.funcAt(i)).v == 10u) defined = true;
+        EXPECT_TRUE(defined) << c.recipe << " must be a synthesized definition";
+
+        // The helper is macho-C-mangled (leading `_`), matching libSystem's export.
+        std::string const expectedHelper = std::string("_") + c.helper;
+        bool importedHelper = false, importedShimName = false;
+        for (auto const& imp : externs) {
+            if (imp.mangledName == expectedHelper) {
+                importedHelper = true;
+                EXPECT_EQ(imp.libraryPath, "/usr/lib/libSystem.B.dylib") << c.recipe;
+            }
+            if (imp.mangledName == c.recipe) importedShimName = true;
+        }
+        EXPECT_TRUE(importedHelper)
+            << c.recipe << " must import its pthread primitive '" << expectedHelper << "'";
+        EXPECT_FALSE(importedShimName) << c.recipe << " shim name must never be imported";
+
+        MirVerifier verifier{mir, &in};
+        EXPECT_TRUE(verifier.verify(rep)) << c.recipe << " synthesized module must verify";
+    }
+}
+
+// The merge-path reconstruction (program.cpp) is vehicle-agnostic: the SAME referenced-only
+// shim, handed the pthread vehicle, synthesizes over libSystem. Mirrors the win32 multi-CU
+// test with the pthread vehicle (proves the vehicle threads through the merge seam too).
+TEST(MirMerge, MultiCuThreadsShimSynthesizesPthreadVehicle) {
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32_0 = in0.primitive(TypeKind::I32);
+    TypeId const pV0   = in0.pointer(in0.primitive(TypeKind::Void));
+    TypeId const mainSig = in0.fnSig({}, i32_0, CallConv::CcMS64);
+    std::array<TypeId, 1> const lockParams{pV0};
+    TypeId const lockSig = in0.fnSig(lockParams, i32_0, CallConv::CcAAPCS64);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        mb.addFunction(mainSig, SymbolId{100});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        MirInstId const slot     = mb.addInst(MirOpcode::Alloca, {}, pV0, 64);
+        MirInstId const lockAddr = mb.addGlobalAddr(SymbolId{10}, in0.pointer(lockSig));
+        MirInstId const callOps[] = {lockAddr, slot};
+        mb.addInst(MirOpcode::Call, callOps, i32_0);
+        mb.addReturn(mb.addConst(i32Lit(0), i32_0));
+        mir0 = std::move(mb).finish();
+    }
+    std::unordered_map<std::uint32_t, std::string> const recipes0{{10u, "mtx_lock"}};
+
+    TypeInterner in1{CompilationUnitId{2}};
+    TypeId const i32_1 = in1.primitive(TypeKind::I32);
+    TypeId const sig1  = in1.fnSig({}, i32_1, CallConv::CcSysV);
+    Mir mir1;
+    {
+        MirBuilder mb;
+        mb.addFunction(sig1, SymbolId{50});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        mb.addReturn(mb.addConst(i32Lit(7), i32_1));
+        mir1 = std::move(mb).finish();
+    }
+
+    MergeCuInput cu0{&mir0, &in0, namerOf({{100, "main"}, {10, "mtx_lock"}}), {}};
+    cu0.synthRecipes = &recipes0;
+    MergeCuInput cu1{&mir1, &in1, namerOf({{50, "helper"}}), {}};
+    std::vector<MergeCuInput> cus{cu0, cu1};
+
+    std::vector<std::string> const entries{"main"};
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    ASSERT_TRUE(merged.has_value());
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    std::optional<std::uint32_t> shimV;
+    for (auto const& [v, name] : merged->symbolNames)
+        if (name == "mtx_lock") shimV = v;
+    ASSERT_TRUE(shimV.has_value());
+
+    std::unordered_map<std::uint32_t, std::string> mergedRecipes{{*shimV, "mtx_lock"}};
+    std::vector<ExternImport> externs = merged->externImports;
+    LibrarySynthesis const pthread{LibrarySynthVehicle::Pthread, "/usr/lib/libSystem.B.dylib"};
+    ASSERT_TRUE(synthesizeThreadsShim(merged->mir, merged->host.interner(),
+                                      mergedRecipes, pthread, ObjectFormatKind::MachO,
+                                      externs, rep));
+    EXPECT_FALSE(rep.hasErrors());
+
+    bool importedPthreadLock = false;
+    for (auto const& imp : externs)
+        if (imp.mangledName == "_pthread_mutex_lock") importedPthreadLock = true;
+    EXPECT_TRUE(importedPthreadLock)
+        << "the merged pthread shim must import the macho-mangled _pthread_mutex_lock";
+
+    MirVerifier verifier{merged->mir, &merged->host.interner()};
+    EXPECT_TRUE(verifier.verify(rep)) << "the merged + pthread-shim module must verify";
 }

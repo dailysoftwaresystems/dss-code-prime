@@ -48,6 +48,13 @@
     "baseDisplacement": 88,
     "tlsIndexSlotName": "__dss_tls_index"
   },
+
+  "$librarySynthesisComment": "D-CSUBSET-C11-THREADS-MACHO (opened for the pe/macho vehicle split): the Windows CRT exports NO C11 <threads.h> symbols, so each thrd_*/mtx_*/cnd_*/tss_* function is a COMPILER-SYNTHESIZED shim (src/mir/merge/synth_threads_shim.cpp, the `win32` vehicle) emitted over kernel32 CRITICAL_SECTION / CONDITION_VARIABLE / Fls* primitives. libraryPath is the DLL the on-demand kernel32 helpers import from — the value that DISSOLVES the pass's former hardcoded \"kernel32.dll\" literal (now config-sourced for BOTH vehicles). Keyed by the FORMAT; the synth pass dispatches on this declared verb, never on a format identity.",
+  "librarySynthesis": {
+    "vehicle": "win32",
+    "libraryPath": "kernel32.dll"
+  },
+
   "$artifactProfilesComment": "Profiles this format SERVES (plan 06 AP3) — a runnable console executable ⇒ cli (the format-side twin of the language's artifactProfiles[]; driver fails loud D_ArtifactProfileFormatMismatch on a profile not in this set). A `gui` profile (IMAGE_SUBSYSTEM_WINDOWS_GUI) would be added when gui codegen lands — same format, profile-selected subsystem/entry, zero gate-code change.",
   "artifactProfiles": ["cli"],
 

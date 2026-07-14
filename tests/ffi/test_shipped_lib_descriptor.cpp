@@ -200,6 +200,46 @@ TEST(ShippedLibDescriptor, SymbolPerTargetAvailabilityDecodesAndSelects) {
                                               ObjectFormatKind::MachO));
 }
 
+// D-CSUBSET-C11-THREADS-MACHO: the C11 `tss_t` (pthread_key_t) width DIVERGES per format —
+// 8 bytes (u64) on macho, 4 (u32) on elf/pe. The 3-way typedef variant must select the
+// format-correct width; a wrong width is a SILENT tss miscompile (the macho witness's
+// tss_create/set/get round-trip would corrupt the key). Structural, host-independent pin
+// for the width the named-import synth test cannot see. RED-on-disable: collapse the macho
+// variant to u32 and the MachO assertion fails.
+TEST(ShippedLibDescriptor, ThreadsTssKeyTypedefWidthDivergesPerFormat) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "threads_tss.json", R"JSON({
+        "header": "threads.h",
+        "availableObjectFormats": ["elf", "pe", "macho"],
+        "typedefs": [
+            { "name": "tss_t", "variants": [
+                { "when": { "format": "elf" },   "type": "u32" },
+                { "when": { "format": "pe" },    "type": "u32" },
+                { "when": { "format": "macho" }, "type": "u64" }
+            ] }
+        ]
+    })JSON");
+    auto tssIsKind = [&](ObjectFormatKind fmt, TypeKind expected) -> bool {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, "arm64", fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        for (auto const& td : desc->typedefs)
+            if (td.name == "tss_t") return td.type == interner.primitive(expected);
+        ADD_FAILURE() << "tss_t typedef missing";
+        return false;
+    };
+    EXPECT_TRUE(tssIsKind(ObjectFormatKind::MachO, TypeKind::U64))
+        << "macho tss_t must be u64 (pthread_key_t = 8 bytes)";
+    EXPECT_TRUE(tssIsKind(ObjectFormatKind::Elf, TypeKind::U32))
+        << "elf tss_t must be u32 (glibc pthread_key_t = 4 bytes)";
+    EXPECT_FALSE(tssIsKind(ObjectFormatKind::MachO, TypeKind::U32))
+        << "the macho variant must NOT collapse to the elf u32 width";
+}
+
 // An unknown per-symbol availability format name fails loud (closed vocabulary,
 // the SAME `objectFormatKindFromName` the header-level set + `library` keys use).
 TEST(ShippedLibDescriptor, SymbolPerTargetAvailabilityUnknownFormatFailsLoud) {

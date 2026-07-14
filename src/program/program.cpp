@@ -454,14 +454,17 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         }
     }
 
-    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): whole-program counterpart of the single-CU
-    // shim synth. The per-CU {SymbolId, recipeId} tables do not survive the merge's symbol
-    // remap, so RECONSTRUCT the merged recipe map from the merged symbol NAMES (== the
-    // recipe ids; the descriptor pins `synthesize == name`): a merged symbol whose name is
-    // a known threads recipe AND that is NOT a defined function / FFI extern is a shim to
-    // define. pe64 C mangling is identity (verified: "main" matches un-mangled), so the
-    // mangled `symbolNames` value equals the un-mangled recipe id the vocab checks. Runs
-    // BEFORE optimize so the shims are DCE-rooted + optimized (canonical markers re-derived).
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER / D-CSUBSET-C11-THREADS-MACHO): whole-program
+    // counterpart of the single-CU shim synth. The per-CU {SymbolId, recipeId} tables do not
+    // survive the merge's symbol remap, so RECONSTRUCT the merged recipe map from the merged
+    // symbol NAMES (== the recipe ids; the descriptor pins `synthesize == name`): a merged
+    // symbol whose name is a known threads recipe AND that is NOT a defined function / FFI
+    // extern is a shim to define. The `symbolNames` values are format-C-MANGLED (macho adds a
+    // leading `_`) while the recipe vocabulary + the synth switch key on the BARE C name, so
+    // `unapplyCMangling` un-decorates before the vocab check AND the bare id is what the synth
+    // pass receives — identity on pe/elf (their C mangling is identity, "main" == un-mangled),
+    // strips the `_` on macho. Runs BEFORE optimize so the shims are DCE-rooted + optimized
+    // (canonical markers re-derived).
     // A no-op when the map is empty. ★ The merge's step-3c pre-registers each referenced-
     // only shim symbol with a merged id + a `symbolNames` entry (else the clone would abort
     // on a shim `GlobalAddr`), so a shim that is NOT collapsed onto a genuine user def lands
@@ -475,12 +478,14 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         for (auto const& e : merged->externImports) definedOrImported.insert(e.symbol.v);
         std::unordered_map<std::uint32_t, std::string> mergedRecipes;
         for (auto const& [symV, name] : merged->symbolNames) {
-            if (dss::ffi::isKnownSynthesizeRecipe(name)
+            std::string const bare = dss::ffi::unapplyCMangling(name, fmtKind);
+            if (dss::ffi::isKnownSynthesizeRecipe(bare)
                 && definedOrImported.find(symV) == definedOrImported.end())
-                mergedRecipes.emplace(symV, name);
+                mergedRecipes.emplace(symV, bare);
         }
         if (!synthesizeThreadsShim(merged->mir, merged->host.interner(),
-                                   mergedRecipes, merged->externImports, reporter)) {
+                                   mergedRecipes, (*formatR)->librarySynthesis(),
+                                   fmtKind, merged->externImports, reporter)) {
             return false;  // internal invariant breach (vocab/switch drift) — reported.
         }
     }

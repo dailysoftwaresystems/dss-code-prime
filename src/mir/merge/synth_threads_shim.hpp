@@ -1,11 +1,16 @@
 #pragma once
 
-// FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): the pe64 <threads.h> Win32 SHIM synthesis
-// pass — Vehicle A. The Windows CRT exports no `thrd_*`/`mtx_*`/`cnd_*`/`tss_*`, so the
-// C11 <threads.h> function each user program calls is a COMPILER-SYNTHESIZED function
-// whose body this pass emits over the real kernel32 primitives (CRITICAL_SECTION,
-// CONDITION_VARIABLE, Fls*, the thread APIs). On elf/macho the SAME <threads.h> symbols
-// are ordinary libc FFI imports and this pass is a clean no-op.
+// FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER / D-CSUBSET-C11-THREADS-MACHO): the <threads.h>
+// SHIM synthesis pass — VEHICLE-PARAMETERIZED. Neither the Windows CRT nor macOS libSystem
+// exports `thrd_*`/`mtx_*`/`cnd_*`/`tss_*`, so on those formats the C11 function each user
+// program calls is a COMPILER-SYNTHESIZED function whose body this pass emits over the
+// host OS's real primitives — the `win32` vehicle over kernel32 (CRITICAL_SECTION,
+// CONDITION_VARIABLE, Fls*, the thread APIs) or the `pthread` vehicle over Darwin
+// libSystem (pthread_mutex_*, pthread_cond_*, pthread_key_*, pthread_self, sched_yield).
+// The vehicle + the import library name are read from the FORMAT descriptor's
+// `librarySynthesis` block (`LibrarySynthesis`), never from a format-name branch. On elf
+// the SAME <threads.h> symbols are ordinary libc FFI imports and this pass is a clean
+// no-op (its recipe map is empty).
 //
 // This pass mirrors the `synthesizePeStartup` / `synthesizeSehFunclets` structure (a
 // whole-Mir rebuild via `MirFunctionRebuilder` + `IdentityClonePolicy`, then the synth
@@ -30,9 +35,11 @@
 // returns false — never a silently-undefined shim.
 
 #include "core/export.hpp"
-#include "core/types/extern_import.hpp"   // ExternImport (kernel32 helper imports)
+#include "core/types/extern_import.hpp"       // ExternImport (native helper imports)
+#include "core/types/object_format_kind.hpp"  // LibrarySynthesis (win32/pthread vehicle)
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -43,16 +50,21 @@ class Mir;
 class TypeInterner;
 class DiagnosticReporter;
 
-// Synthesize a definition for every pe64 <threads.h> shim symbol in `recipeBySymbol`.
-// EMPTY map ⇒ clean no-op (every elf/macho + every non-threads TU). On success `mir` is
-// REBUILT with the shim functions appended and `externImports` carries the kernel32
-// helpers they call (deduped). Returns false (fail-loud, reported) only on an internal
-// invariant breach — a recipe id with no switch arm (the closed-vocab loader guard makes
-// this unreachable in practice, but the arm is the anti-silent-gap backstop).
+// Synthesize a definition for every <threads.h> shim symbol in `recipeBySymbol`, over the
+// primitive family the format's `librarySynthesis` block declares. EMPTY map ⇒ clean no-op
+// (every elf + every non-threads TU). On success `mir` is REBUILT with the shim functions
+// appended and `externImports` carries the native helpers they call (deduped, imported from
+// `librarySynthesis->libraryPath`). Returns false (fail-loud, reported) on: (a) a non-empty
+// recipe map with NO `librarySynthesis` — a format carrying synthesize-tagged threads
+// symbols but declaring no vehicle (never silently assume one); or (b) a recipe id with no
+// switch arm for the active vehicle (the closed-vocab loader guard makes this unreachable
+// in practice, but the arm is the anti-silent-gap backstop).
 [[nodiscard]] DSS_EXPORT bool
 synthesizeThreadsShim(Mir&                                                  mir,
                       TypeInterner&                                         interner,
                       std::unordered_map<std::uint32_t, std::string> const& recipeBySymbol,
+                      std::optional<LibrarySynthesis> const&                librarySynthesis,
+                      ObjectFormatKind                                      format,
                       std::vector<ExternImport>&                            externImports,
                       DiagnosticReporter&                                   reporter);
 
