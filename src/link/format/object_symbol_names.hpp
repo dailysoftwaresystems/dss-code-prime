@@ -1,6 +1,6 @@
 #pragma once
 
-#include "asm/asm.hpp"                  // AssembledModule, ModuleSymbol
+#include "asm/asm.hpp"                  // AssembledModule, ModuleSymbol, ExternImport
 #include "core/types/strong_ids.hpp"    // SymbolId
 #include "core/types/symbol_attrs.hpp"  // SymbolBinding, SymbolVisibility, isExternallyVisible
 
@@ -30,14 +30,13 @@
 // vs its current GLOBAL `sym_<id>`, is the separate symtab-ordering concern
 // the anchor defers).
 //
-// The IMPORT side (naming an UNDEFINED extern from `ExternImport.mangledName`)
-// is NOT handled here: the relocatable-object path does not yet support extern
-// imports at all — `elf::encode` fail-louds on a non-empty `externImports` in
-// ET_REL ("externs flow to the linker only via ET_EXEC / ET_DYN"), so an
-// undefined-extern symbol never arises in a `.o`. Naming it is deferred with
-// that object-path extern support (D-FFI-EXTERN-CALL-DISPATCH for relocatable
-// output); adding an `externName(mangledName)` method here is the trivial
-// closing step when that lands.
+// The IMPORT side (`externName`) names an UNDEFINED extern reference so a
+// foreign linker resolves it — its `ExternImport.mangledName` (already the
+// on-binary form) replaces the internal `<prefix><id>`. Consumed by the ET_REL
+// writer's undefined-symbol loop once the format declares an `externCallDispatch`
+// (D-LK-OBJECT-EXTERN-CALL-RELOCATABLE): an extern call lowers to a `call rel32`
+// + a reloc against the extern, and the writer emits the extern as an SHN_UNDEF
+// symtab entry the final (foreign) linker resolves.
 //
 // FORMAT-NEUTRAL: the one per-format value, the internal-fallback PREFIX
 // ("sym_" on ELF/PE, "_sym_" on Mach-O), is a caller PARAMETER — the same
@@ -53,6 +52,10 @@ public:
         definedBySym_.reserve(module.symbols.size());
         for (ModuleSymbol const& ms : module.symbols) {
             definedBySym_.emplace(ms.symbol.v, &ms);
+        }
+        externBySym_.reserve(module.externImports.size());
+        for (ExternImport const& e : module.externImports) {
+            externBySym_.emplace(e.symbol.v, &e);
         }
     }
 
@@ -72,11 +75,26 @@ public:
         return std::string{internalPrefix} + std::to_string(id.v);
     }
 
+    // The `.symtab` name for an UNDEFINED extern reference. Returns the import's
+    // (already-mangled) on-binary name so a foreign linker resolves it;
+    // otherwise the internal `<internalPrefix><id>` (a reloc target that is
+    // neither a defined symbol nor a known import).
+    [[nodiscard]] std::string
+    externName(SymbolId id, std::string_view internalPrefix) const {
+        if (auto const it = externBySym_.find(id.v); it != externBySym_.end()) {
+            if (!it->second->mangledName.empty()) {
+                return it->second->mangledName;
+            }
+        }
+        return std::string{internalPrefix} + std::to_string(id.v);
+    }
+
 private:
     // Keyed by SymbolId.v — pointers alias the caller's `AssembledModule`,
     // which outlives this helper (the writer builds it on the stack inside
     // `encode()`, before the symtab loop, and discards it after).
     std::unordered_map<std::uint32_t, ModuleSymbol const*> definedBySym_;
+    std::unordered_map<std::uint32_t, ExternImport const*> externBySym_;
 };
 
 } // namespace dss::link::format

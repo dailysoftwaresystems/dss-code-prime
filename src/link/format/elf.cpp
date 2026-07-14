@@ -1794,51 +1794,87 @@ encode(AssembledModule const&    module,
         bool const isExecEarly =
             (fmt.elf().objectType == ElfObjectType::Exec);
         if (!isExecEarly) {
-            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-                 std::string{"elf::encode: extern imports present ("}
-                     + std::to_string(module.externImports.size())
-                     + " entries) but format is ET_REL. Externs flow "
-                       "to the linker only via ET_EXEC / ET_DYN.");
-            return {};
+            // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: an ET_REL object CAN carry
+            // extern imports IF the format declares an `externCallDispatch` —
+            // the externs become SHN_UNDEF `.symtab` entries + `.rela.text`
+            // relocs that the FINAL (foreign) linker resolves (it synthesizes
+            // the PLT/GOT), NOT DSS. A format with NO `externCallDispatch`
+            // still rejects (extern calls have no defined relocation form). On
+            // the dispatch-present path we FALL THROUGH to the normal ET_REL
+            // writer below — the exec-only dynamic-image emission is skipped.
+            if (!fmt.externCallDispatch().has_value()) {
+                emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                     std::string{"elf::encode: extern imports present ("}
+                         + std::to_string(module.externImports.size())
+                         + " entries) but the ET_REL format declares no "
+                           "`externCallDispatch` - extern calls have no "
+                           "defined relocation form. Declare it (e.g. "
+                           "\"direct-plt\") to emit undefined-extern symbols "
+                           "+ relocations for the final linker.");
+                return {};
+            }
+            // Only FUNCTION-call externs are emitted in a relocatable object (a
+            // `call` → SHN_UNDEF symbol + PLT32 reloc the final linker
+            // resolves). An extern DATA import (`isData`) needs a copy-
+            // relocation / GOT-indirect binding the relocatable path does NOT
+            // emit — a plain UNDEF + abs reloc would mis-bind shared-library
+            // data (the silent-miscompile class). Fail loud until extern-DATA-
+            // in-`.o` lands (a sibling of D-LK-EXTERN-DATA-IMPORT).
+            for (auto const& e : module.externImports) {
+                if (e.isData) {
+                    emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                         std::string{"elf::encode: extern DATA import '"}
+                             + e.mangledName
+                             + "' in a relocatable object is not yet supported "
+                               "- only function-call externs lower to an "
+                               "SHN_UNDEF symbol + reloc. Extern data needs a "
+                               "copy-relocation / GOT binding (a sibling of "
+                               "D-LK-EXTERN-DATA-IMPORT).");
+                    return {};
+                }
+            }
+            // else: ET_REL with externCallDispatch (function externs) — fall
+            // through to the normal ET_REL writer below.
+        } else {
+            if (fmt.elf().interpreter.empty()) {
+                emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                     std::string{"elf::encode: extern imports present ("}
+                         + std::to_string(module.externImports.size())
+                         + " entries) but `elf.interpreter` is empty — "
+                           "declare a PT_INTERP path on the schema (e.g. "
+                           "'/lib64/ld-linux-x86-64.so.2') for a loadable "
+                           "dynamic image.");
+                return {};
+            }
+            // Machine-dispatch guard (D-LK6-8 closed 2026-06-01).
+            // `encodeElfExecDynamic` now dispatches per-machine to
+            // `emitPltStub` + `globDatTypeFor` + `pltStubSizeFor`.
+            // Supported: x86_64 (62), ARM64 (183). Other machines fail
+            // loud — adding RISC-V (243) / PPC64 (21) / MIPS (8) means
+            // adding the per-machine arms in this file (see top-level
+            // comment near `kEmX86_64` / `kEmAArch64`).
+            std::uint16_t const elfMachine = fmt.elf().machine;
+            if (elfMachine != kEmX86_64 && elfMachine != kEmAArch64) {
+                emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                     std::string{"elf::encode: extern imports present but "}
+                         + "ELF e_machine=" + std::to_string(elfMachine)
+                         + " has no PLT stub emitter yet. Supported "
+                           "machines: x86_64 (62), ARM64 (183). Other "
+                           "ISAs (RISC-V 243, PPC64 21, MIPS 8) are "
+                           "anchored as future work — add a row to "
+                           "pltStubSizeFor / globDatTypeFor / emitPltStub.");
+                return {};
+            }
+            // Section schema lookup mirrors the existing path so the
+            // dynamic helper inherits the same K_NoMatchingObjectFormat
+            // guard.
+            auto const* secTextDyn =
+                requireSection(fmt, SectionKind::Text, "ELF dynamic writer",
+                               reporter);
+            if (!secTextDyn) return {};
+            return encodeElfExecDynamic(module, targetSchema, fmt,
+                                         *secTextDyn, reporter);
         }
-        if (fmt.elf().interpreter.empty()) {
-            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-                 std::string{"elf::encode: extern imports present ("}
-                     + std::to_string(module.externImports.size())
-                     + " entries) but `elf.interpreter` is empty — "
-                       "declare a PT_INTERP path on the schema (e.g. "
-                       "'/lib64/ld-linux-x86-64.so.2') for a loadable "
-                       "dynamic image.");
-            return {};
-        }
-        // Machine-dispatch guard (D-LK6-8 closed 2026-06-01).
-        // `encodeElfExecDynamic` now dispatches per-machine to
-        // `emitPltStub` + `globDatTypeFor` + `pltStubSizeFor`.
-        // Supported: x86_64 (62), ARM64 (183). Other machines fail
-        // loud — adding RISC-V (243) / PPC64 (21) / MIPS (8) means
-        // adding the per-machine arms in this file (see top-level
-        // comment near `kEmX86_64` / `kEmAArch64`).
-        std::uint16_t const elfMachine = fmt.elf().machine;
-        if (elfMachine != kEmX86_64 && elfMachine != kEmAArch64) {
-            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-                 std::string{"elf::encode: extern imports present but "}
-                     + "ELF e_machine=" + std::to_string(elfMachine)
-                     + " has no PLT stub emitter yet. Supported "
-                       "machines: x86_64 (62), ARM64 (183). Other "
-                       "ISAs (RISC-V 243, PPC64 21, MIPS 8) are "
-                       "anchored as future work — add a row to "
-                       "pltStubSizeFor / globDatTypeFor / emitPltStub.");
-            return {};
-        }
-        // Section schema lookup mirrors the existing path so the
-        // dynamic helper inherits the same K_NoMatchingObjectFormat
-        // guard.
-        auto const* secTextDyn =
-            requireSection(fmt, SectionKind::Text, "ELF dynamic writer",
-                           reporter);
-        if (!secTextDyn) return {};
-        return encodeElfExecDynamic(module, targetSchema, fmt,
-                                     *secTextDyn, reporter);
     }
 
     // Route between ET_REL and ET_EXEC based on the schema's
@@ -2144,12 +2180,11 @@ encode(AssembledModule const&    module,
     StringTable strtab;
     std::vector<std::uint8_t> symtab;
 
-    // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real source-level C names for the
-    // externally-visible defined functions (so a foreign linker resolves
-    // `gcc main.c dss.o` by name); `sym_<id>` fallback for static/local/
-    // synthesized symbols. Built once from `module` for O(1) per-symbol
-    // lookup below. (The IMPORT side is moot in ET_REL — extern imports are
-    // rejected before this point.)
+    // Real source-level C names for the externally-visible defined functions
+    // (D-LK-OBJECT-EXTERN-SYMBOL-NAMES) AND the undefined extern references
+    // (D-LK-OBJECT-EXTERN-CALL-RELOCATABLE), so a foreign linker resolves both
+    // by name; `sym_<id>` fallback for static/local/synthesized symbols. Built
+    // once from `module` for O(1) per-symbol lookup below.
     link::format::ObjectSymbolNames const objNames{module};
 
     // Helper: emit one Elf64_Sym record (24 bytes).
@@ -2241,8 +2276,11 @@ encode(AssembledModule const&    module,
         for (auto const& fn : module.functions) {
             for (auto const& rel : fn.relocations) {
                 if (symIdxBySymbol.contains(rel.target)) continue;
+                // Real import name (D-LK-OBJECT-EXTERN-CALL-RELOCATABLE) so a
+                // foreign linker resolves the extern; `sym_<id>` fallback for a
+                // reloc target that is neither defined nor a known import.
                 std::string const symName =
-                    std::string{"sym_"} + std::to_string(rel.target.v);
+                    objNames.externName(rel.target, "sym_");
                 std::uint32_t const nameOff = strtab.add(symName);
                 std::uint32_t const idx =
                     static_cast<std::uint32_t>(symtab.size() / 24);
@@ -2263,6 +2301,14 @@ encode(AssembledModule const&    module,
 
     std::vector<std::uint8_t> relaText;
     if (!isExec) {
+        // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: undefined-extern targets (built
+        // once) — a rel32 CALL to one emits the PLT-capable reloc variant so a
+        // foreign PIE link resolves it through a linker-built PLT.
+        std::unordered_set<SymbolId> externTargets;
+        externTargets.reserve(module.externImports.size());
+        for (auto const& e : module.externImports) {
+            externTargets.insert(e.symbol);
+        }
         for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
             auto const& fn = module.functions[fi];
             std::uint64_t const fnStart = funcTextStart[fi];
@@ -2312,9 +2358,21 @@ encode(AssembledModule const&    module,
                     continue;
                 }
                 std::uint32_t const symIdx = it->second;
+                // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: a rel32 CALL to an
+                // UNDEFINED extern emits the PLT-capable variant (PLT32) so a
+                // foreign PIE link routes it through a linker-built PLT — a bare
+                // PC32 against an undefined symbol errors under -pie. Same
+                // S+A-P formula + -4 addend; intra-module (defined) call
+                // targets keep plain PC32 (pltNativeId is used only when the
+                // target is an extern import).
+                std::uint32_t const emittedNativeId =
+                    (fmtReloc->pltNativeId != 0
+                     && externTargets.contains(rel.target))
+                        ? fmtReloc->pltNativeId
+                        : fmtReloc->nativeId;
                 std::uint64_t const rOffset = fnStart + rel.offset;
                 appendU64LE(relaText, rOffset);
-                appendU64LE(relaText, makeRelaInfo(symIdx, fmtReloc->nativeId));
+                appendU64LE(relaText, makeRelaInfo(symIdx, emittedNativeId));
                 appendI64LE(relaText, rel.addend + triReloc->addendBias);
             }
         }

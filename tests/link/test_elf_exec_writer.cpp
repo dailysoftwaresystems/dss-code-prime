@@ -1648,11 +1648,13 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterFailsLoud) {
     EXPECT_TRUE(sawCode);
 }
 
-TEST(ElfRelWriter, ExternImportsFailLoudOnEtRelAlso) {
-    // test-analyzer #7: the externImports fail-loud gate runs BEFORE
-    // the isExec branch, so .o output also rejects non-empty
-    // externImports (relocatable objects don't carry imports either
-    // — those resolve at final-link time).
+TEST(ElfRelWriter, ExternDataImportFailsLoudOnEtRel) {
+    // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: a relocatable object now ACCEPTS
+    // FUNCTION-call externs (the shipped format declares externCallDispatch —
+    // see ElfWriter.ObjectExternCallEmitsUndefImportNameAndPlt32Reloc). But an
+    // extern DATA import (`isData`) STILL fails loud: it needs a copy-relocation
+    // / GOT binding the relocatable path does not emit, and a plain UNDEF+reloc
+    // would mis-bind shared-library data (the silent-miscompile class).
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
@@ -1665,12 +1667,14 @@ TEST(ElfRelWriter, ExternImportsFailLoudOnEtRelAlso) {
     mod.functions.push_back(std::move(fn));
     ExternImport imp;
     imp.symbol      = SymbolId{99};
-    imp.mangledName = "puts";
+    imp.mangledName = "stdout";
     imp.libraryPath = "libc.so.6";
+    imp.isData      = true;          // extern DATA — the still-rejected case
     mod.externImports.push_back(std::move(imp));
     DiagnosticReporter rep;
     auto bytes = elf::encode(mod, **target, **fmt, rep);
-    EXPECT_TRUE(bytes.empty());
+    EXPECT_TRUE(bytes.empty())
+        << "an extern DATA import in a relocatable object must fail loud";
     bool sawCode = false;
     for (auto const& d : rep.all()) {
         if (d.code == DiagnosticCode::K_FormatLacksImportSupport) sawCode = true;

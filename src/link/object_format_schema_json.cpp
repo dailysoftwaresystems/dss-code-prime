@@ -959,6 +959,27 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 return false;
             }
             info.nativeId = static_cast<std::uint32_t>(v);
+            // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: optional PLT-variant
+            // nativeId (e.g. R_X86_64_PLT32=4) emitted for an undefined-extern
+            // call in a relocatable object. Absent → 0 (no PLT variant).
+            if (r.contains("pltNativeId")) {
+                if (!r.at("pltNativeId").is_number_integer()) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/pltNativeId", i),
+                           "'pltNativeId' must be an integer");
+                    return false;
+                }
+                std::int64_t const pv =
+                    r.at("pltNativeId").get<std::int64_t>();
+                if (pv <= 0 || pv > 0xFFFFFFFFLL) {
+                    c.emit(DiagnosticCode::C_MalformedJson,
+                           std::format("/relocations/{}/pltNativeId", i),
+                           std::format("'pltNativeId' ({}) must be in (0, 2^32)",
+                                       pv));
+                    return false;
+                }
+                info.pltNativeId = static_cast<std::uint32_t>(pv);
+            }
             return true;
         });
 

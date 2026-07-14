@@ -15,6 +15,9 @@
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: C bit-field allocation is OS/format-determined (the x86_64 CPU target serves BOTH this ELF-SysV format and PE-MS), so the strategy lives here, not on the target. SysV/Itanium/GNU LSB-first packing into the declared-type unit — byte-ABI-exact to gcc (verified by the conformance witness). Different-sized adjacent bit-fields may SHARE a unit (unlike MSVC).",
   "bitFieldStrategy": "gnu_packed",
 
+  "$externCallDispatchComment": "D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: extern calls in a RELOCATABLE object lower to a PLAIN DIRECT `call` (E8 disp32) + a rel32 relocation against the UNDEFINED extern symbol — the SAME call-site shape as the exec `direct-plt`, except the FINAL (foreign) linker synthesizes the PLT/GOT and resolves the symbol, not DSS. So `direct-plt` is the right dispatch here too; the relocatable writer emits the extern as an SHN_UNDEF `.symtab` entry + a `.rela.text` reloc rather than a DSS-synthesized stub. The undefined-extern CALL reloc is emitted as R_X86_64_PLT32 (the linker-may-use-PLT variant of PC32, same S+A-P formula) so a foreign PIE link resolves it through a linker-built PLT instead of erroring on a bare PC32 against an undefined symbol.",
+  "externCallDispatch": "direct-plt",
+
   "elf": {
     "$comment": "Elf64_Ehdr identity fields. `class` = ELFCLASS64; `data` = ELFDATA2LSB (little-endian); `osabi` = ELFOSABI_NONE (SysV, conventional for relocatable .o); `machine` = EM_X86_64 (62).",
     "class": "elf64",
@@ -83,10 +86,11 @@
 
   "relocations": [
     {
-      "$comment": "PC-relative 32-bit (call / jmp rel32). ELF type R_X86_64_PC32 = 2. `kind` = 1 matches x86_64.target.json's `rel32` row.",
+      "$comment": "PC-relative 32-bit (call / jmp rel32). ELF type R_X86_64_PC32 = 2. `kind` = 1 matches x86_64.target.json's `rel32` row. `pltNativeId` = 4 (R_X86_64_PLT32): when this rel32 targets an UNDEFINED extern (a `call` to a libc function the FINAL linker resolves), the writer emits PLT32 instead so a foreign PIE link routes it through a linker-built PLT — a bare PC32 against an undefined symbol errors under -pie (D-LK-OBJECT-EXTERN-CALL-RELOCATABLE). Same S+A-P formula, same -4 addend.",
       "name": "R_X86_64_PC32",
       "kind": 1,
-      "nativeId": 2
+      "nativeId": 2,
+      "pltNativeId": 4
     },
     {
       "$comment": "Absolute 64-bit. ELF type R_X86_64_64 = 1. `kind` = 2 matches x86_64.target.json's `abs64` row.",

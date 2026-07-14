@@ -269,9 +269,8 @@ TEST(ElfWriter, ObjectSymtabCarriesRealNameForExternalDefButStaticStaysInternal)
     // Two defined functions covering both externally-visible forms:
     //   * fn A (SymbolId 10) — externally-visible (Global) → REAL name.
     //   * fn B (SymbolId 11) — static (Local) → stays internal `sym_11`.
-    // (The IMPORT side — naming an undefined extern — is out of scope: the
-    // ET_REL path rejects extern imports before the symtab, so no undefined
-    // symbol arises; it is deferred with object-path extern support.)
+    // (The IMPORT side — naming an undefined extern + its PLT32 reloc — is
+    // covered by ObjectExternCallEmitsUndefImportNameAndPlt32Reloc below.)
     AssembledModule mod;
     mod.expectedFuncCount = 2;
 
@@ -319,6 +318,62 @@ TEST(ElfWriter, ObjectSymtabCarriesRealNameForExternalDefButStaticStaysInternal)
         << "a static (Local-binding) function must stay internal, not leak its "
            "real name into the object symtab";
     EXPECT_EQ(infoAt(3), 0x12u);   // still STB_GLOBAL|STT_FUNC (name-only carve-out)
+}
+
+// ── D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: undefined extern + PLT32 ──
+
+TEST(ElfWriter, ObjectExternCallEmitsUndefImportNameAndPlt32Reloc) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    // The relocatable format now declares externCallDispatch, so an ET_REL
+    // object CAN carry an extern import (a `call` to a libc function the FINAL
+    // linker resolves). The extern must appear as an SHN_UNDEF symbol with its
+    // real name, and its rel32 call reloc must be the PLT-capable PLT32 (type
+    // 4) — a bare PC32 against an undefined symbol errors under a foreign -pie.
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction caller;
+    caller.symbol = SymbolId{10};
+    caller.bytes  = {0xE8, 0x00, 0x00, 0x00, 0x00};   // call rel32 → extern
+    caller.relocations.push_back(Relocation{/*offset=*/1u, /*target=*/SymbolId{20},
+                                            /*kind=*/RelocationKind{1},  // rel32
+                                            /*addend=*/0});
+    mod.functions.push_back(std::move(caller));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "caller",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    ExternImport ext;
+    ext.symbol      = SymbolId{20};
+    ext.mangledName = "libc_fn";
+    ext.isData      = false;
+    mod.externImports.push_back(std::move(ext));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << "ET_REL with externCallDispatch must "
+                                       "accept an extern import";
+
+    std::uint64_t const shoff     = readU64LE(bytes, 40);
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + 3 * 64 + 24);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + 4 * 64 + 24);
+
+    // Symtab: 0=UNDEF, 1=STT_SECTION, 2=caller, 3=extern.
+    std::uint32_t const extStName = readU32LE(bytes, symtabOff + 3 * 24 + 0);
+    EXPECT_EQ(readStrtabName(bytes, strtabOff, extStName), "libc_fn")
+        << "undefined extern must carry its real import name";
+    EXPECT_EQ(readU16LE(bytes, symtabOff + 3 * 24 + 6), 0u)      // st_shndx
+        << "extern must be SHN_UNDEF";
+
+    // .rela.text (section index 2): one entry, type = PLT32 (4), addend -4.
+    std::uint64_t const relaOff = readU64LE(bytes, shoff + 2 * 64 + 24);
+    std::uint64_t const rInfo   = readU64LE(bytes, relaOff + 8);
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo), 4u)
+        << "an extern call reloc must be R_X86_64_PLT32 (4), not PC32 (2), so a "
+           "foreign PIE link routes it through a linker-built PLT";
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo >> 32), 3u)  // symtab idx = extern
+        << "reloc must target the undefined extern symbol";
+    std::int64_t const addend = static_cast<std::int64_t>(readU64LE(bytes, relaOff + 16));
+    EXPECT_EQ(addend, -4) << "psABI rel32 addend (baked bias)";
 }
 
 // ── Rela r_info encodes (sym << 32) | nativeId ──────────────────
