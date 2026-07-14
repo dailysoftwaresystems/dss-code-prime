@@ -2288,11 +2288,34 @@ encode(AssembledModule const&    module,
                              + " has no symtab entry");
                     continue;
                 }
+                // D-LK-OBJECT-RELOC-ADDEND-CROSSTOOLCHAIN: the ELF RELA
+                // r_addend a FOREIGN linker (gcc's ld) reads is the FULL psABI
+                // implicit addend. DSS splits that as `Relocation::addend` +
+                // the target schema's `addendBias` (applied together only by
+                // DSS's OWN in-place exec applier, `applyExecRelocations`,
+                // which never emits `.rela`). A `.o` is consumed exclusively by
+                // an external linker (DSS re-links AssembledModules, never its
+                // own emitted `.o`), so we must BAKE the bias in here: for a
+                // `call`/`lea` rel32 (R_X86_64_PC32, addendBias=-4) → r_addend
+                // -4 (a rel32 field is relative to the instruction END, 4 bytes
+                // past the reloc offset), matching exactly what gcc emits; for
+                // abs64/abs32 (addendBias=0) → r_addend unchanged. Without this
+                // gcc resolved a call to sym+4 (mid-instruction) → SIGSEGV.
+                auto const* triReloc = targetSchema.relocationInfo(rel.kind);
+                if (triReloc == nullptr) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         "elf::encode: relocation kind "
+                             + std::to_string(rel.kind.v)
+                             + " has no TargetRelocationInfo on target schema '"
+                             + std::string{targetSchema.name()}
+                             + "' - cannot compute the psABI r_addend.");
+                    continue;
+                }
                 std::uint32_t const symIdx = it->second;
                 std::uint64_t const rOffset = fnStart + rel.offset;
                 appendU64LE(relaText, rOffset);
                 appendU64LE(relaText, makeRelaInfo(symIdx, fmtReloc->nativeId));
-                appendI64LE(relaText, rel.addend);
+                appendI64LE(relaText, rel.addend + triReloc->addendBias);
             }
         }
     }

@@ -336,7 +336,10 @@ TEST(ElfWriter, RelaRecordsNativeRelocTypeAndSymtabIndex) {
     rel.offset = 1;                  // patch site = byte 1 (the rel32)
     rel.target = SymbolId{2};        // undefined extern
     rel.kind   = RelocationKind{1};  // matches `rel32` (PC32 in elf JSON)
-    rel.addend = -4;
+    rel.addend = 0;                  // real codegen stamps 0; the psABI -4 for a
+                                     // rel32 field lives in the target schema's
+                                     // addendBias, baked into r_addend at emit
+                                     // (D-LK-OBJECT-RELOC-ADDEND-CROSSTOOLCHAIN)
     caller.relocations.push_back(rel);
     mod.functions.push_back(std::move(caller));
 
@@ -357,9 +360,15 @@ TEST(ElfWriter, RelaRecordsNativeRelocTypeAndSymtabIndex) {
     EXPECT_EQ(type, 2u) << "R_X86_64_PC32 = 2";
     // sym 0 = STN_UNDEF, sym 1 = section, sym 2 = caller, sym 3 = target.
     EXPECT_EQ(symIdx, 3u);
-    // r_addend == -4 (assembler's rel32 bias).
+    // r_addend == -4 = rel.addend(0) + the rel32 addendBias(-4), baked in for a
+    // FOREIGN linker (D-LK-OBJECT-RELOC-ADDEND-CROSSTOOLCHAIN). A rel32 field is
+    // relative to the instruction END (4 bytes past the reloc offset), so gcc's
+    // ld — applying the psABI S + A - P with no knowledge of DSS's addendBias —
+    // needs A = -4 to land on the symbol. Red-on-disable: emitting rel.addend
+    // verbatim (0) makes gcc resolve a call to sym+4 → SIGSEGV.
     std::int64_t const addend = static_cast<std::int64_t>(readU64LE(bytes, relaOff + 16));
-    EXPECT_EQ(addend, -4);
+    EXPECT_EQ(addend, -4)
+        << "psABI r_addend for a rel32 call must be -4 (the addendBias baked in)";
 }
 
 // ── Non-ELF schema → fail-loud ──────────────────────────────────
