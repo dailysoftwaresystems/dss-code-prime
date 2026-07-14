@@ -5383,7 +5383,15 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                             // → EXCLUDED (they keep their own capture + deferred
                             // fail-loud). A miss here is a safe fail-loud downstream (no
                             // captured size), never a silent miscompile.
-                            if (declTy == headTy
+                            // Gate to OBJECT declarations only — `vlaTypedefOrigin`
+                            // means "the VLA typedef this OBJECT froze its size from",
+                            // read solely by the object's HIR alloca. A chained VLA
+                            // typedef (`typedef R S;`) is itself DeclarationKind::Type
+                            // and is discriminated at HIR by its own suffix presence
+                            // (declaratorHasArraySuffix), so it needs no origin flag —
+                            // keeping this write off typedef symbols.
+                            if (s.symbols.at(sym).kind == DeclarationKind::Variable
+                                && declTy == headTy
                                 && (s.lattice.interner().isVlaArray(headTy)
                                     || s.lattice.interner().typeContainsVla(headTy))
                                 && decl.headChild.has_value()

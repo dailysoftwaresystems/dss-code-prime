@@ -1166,6 +1166,28 @@ struct Lowerer {
             alignmentAcc.push_back(
                 {node, AlignmentAttr{*rec->explicitAlignment}});
     }
+    // VLA C4b (D-CSUBSET-VLA): does this declarator carry its OWN array suffix
+    // (`[...]`)? The HIR-tier discriminator that separates the ORIGINAL VLA typedef
+    // (`typedef int R[n];` — has the `[n]` suffix, so its runtime bound is
+    // capturable) from a CHAINED VLA typedef (`typedef R S;` — S's VLA-ness is
+    // inherited from the head alias R, S's own declarator has NO suffix → a
+    // deferred shape, D-CSUBSET-VLA-TYPEDEF-CHAINED). Same suffix-locating walk as
+    // `captureVlaSize` but presence-only (returns on the first hit) — self-contained,
+    // so it does NOT depend on any semantic-tier flag being stamped on the typedef.
+    [[nodiscard]] bool declaratorHasArraySuffix(NodeId declaratorNode) {
+        if (!sem.declarators.has_value()) return false;
+        DeclaratorConfig const& dc = *sem.declarators;
+        std::vector<NodeId> stack{declaratorNode};
+        for (int guard = 0; guard < 16384 && !stack.empty(); ++guard) {
+            NodeId const c = stack.back();
+            stack.pop_back();
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (tree().rule(c).v == dc.arraySuffixRule.v) return true;
+            auto const kids = visible(c);
+            for (std::size_t i = kids.size(); i-- > 0;) stack.push_back(kids[i]);
+        }
+        return false;
+    }
     // VLA C1a (D-CSUBSET-VLA): lower a block-scope variable-length array local's
     // SIZE expression and record it in the out-of-band side-table keyed by the
     // local's SymbolId. The array suffix is normally SKIPPED at CST→HIR (a fixed
@@ -7633,11 +7655,7 @@ struct Lowerer {
                         declaratorNameNode(tree(), d, *sem.declarators);
                     if (!nameNode.valid()) continue;
                     sym = model.symbolAt(nameNode);
-                    SymbolId typedefVlaOrigin{};
-                    if (auto const* rec = model.recordFor(sym)) {
-                        type = rec->type;
-                        typedefVlaOrigin = rec->vlaTypedefOrigin;
-                    }
+                    if (auto const* rec = model.recordFor(sym)) type = rec->type;
                     // VLA C4b (D-CSUBSET-VLA): a VARIABLE-LENGTH-array typedef
                     // (`typedef int R[n];` / multi-dim `R[n][m]`/`R[5][n]`/`R[n][5]`)
                     // must lower + capture its OWN runtime bound(s) NOW, keyed by the
@@ -7655,19 +7673,19 @@ struct Lowerer {
                         // Discriminate the ORIGINAL VLA typedef (VLA from its OWN `[n]`
                         // suffix — capturable) from a CHAINED VLA typedef
                         // (`typedef R S;` — VLA inherited from ANOTHER typedef, NO own
-                        // suffix). The semantic I1 gate stamps `vlaTypedefOrigin` on the
-                        // chained form (`declTy == headTy`) but never the original (its
-                        // headTy is the non-VLA base). A chained alias has no `[n]` to
-                        // capture → `captureVlaSize` would hit its "no suffix" desync;
-                        // it is a distinct deferred shape (D-CSUBSET-VLA-TYPEDEF-CHAINED)
-                        // → fail loud CLEANLY here instead.
-                        if (typedefVlaOrigin.valid())
+                        // suffix) by the declarator's OWN suffix presence (a
+                        // self-contained HIR-tier check — no reliance on a semantic
+                        // flag). The original carries the `[n]`; a chained alias has
+                        // none → it is a distinct deferred shape
+                        // (D-CSUBSET-VLA-TYPEDEF-CHAINED) → fail loud CLEANLY here
+                        // (instead of `captureVlaSize`'s "no suffix" internal desync).
+                        if (declaratorHasArraySuffix(d))
+                            captureVlaSize(d, sym);
+                        else
                             (void)reportedError(
                                 d,
                                 "a typedef that aliases a variable-length-array "
                                 "typedef is not yet supported");
-                        else
-                            captureVlaSize(d, sym);
                     }
                     break;   // typedefs declare a single declarator
                 }
