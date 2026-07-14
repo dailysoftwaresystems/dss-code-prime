@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace dss {
 
@@ -160,6 +161,75 @@ decodeInteger(std::string_view text, NumberStyle const* ns) {
         value = value * base + digit;
     }
     return value;
+}
+
+// C23 6.4.4.1 (D-CSUBSET-BITINT-WIDE-LITERAL): decode an integer literal's text
+// to its ARBITRARY-MAGNITUDE unsigned value as little-endian 64-bit limbs. The
+// sibling of `decodeInteger` for a `wb`/`uwb` bit-precise literal ONLY — whose
+// magnitude may exceed u64 (`633825300114114700748351602688uwb`), which
+// `decodeInteger` rejects (nullopt) by design. Same normalization as
+// `decodeInteger` (strip ONE declared suffix, strip separators, resolve the
+// radix from the longest declared prefix), then a bignum multiply-accumulate.
+// Returns std::nullopt only when the body has NO base-valid digits (a malformed
+// token the caller surfaces fail-loud) — never on "overflow" (there is none).
+// `ns` may be null (plain decimal). The suffix strip happens FIRST (a suffix
+// letter is a valid high-radix digit).
+[[nodiscard]] inline std::optional<std::vector<std::uint64_t>>
+decodeBigInteger(std::string_view text, NumberStyle const* ns) {
+    if (ns != nullptr) {
+        text = detail::stripTrailingSuffix(text, ns->integerSuffixes);
+    }
+    std::string s;
+    s.reserve(text.size());
+    char const sep = (ns && ns->digitSeparator) ? *ns->digitSeparator : '\0';
+    for (char c : text) {
+        if (sep != '\0' && c == sep) continue;
+        s += c;
+    }
+    std::string_view v{s};
+    std::uint64_t base = 10;
+    if (ns != nullptr) {
+        std::size_t  bestLen   = 0;
+        std::uint8_t bestRadix = 10;
+        for (auto const& p : ns->integerPrefixes) {
+            if (p.prefix.size() > bestLen && v.size() >= p.prefix.size()
+                && v.substr(0, p.prefix.size()) == p.prefix) {
+                bestLen   = p.prefix.size();
+                bestRadix = p.radix;
+            }
+        }
+        if (bestLen > 0) { base = bestRadix; v.remove_prefix(bestLen); }
+    }
+    std::vector<std::uint64_t> mag{0};   // little-endian magnitude accumulator
+    bool anyDigit = false;
+    for (char c : v) {
+        std::uint64_t digit;
+        if (c >= '0' && c <= '9') digit = static_cast<std::uint64_t>(c - '0');
+        else if (c >= 'a' && c <= 'z') digit = static_cast<std::uint64_t>(10 + (c - 'a'));
+        else if (c >= 'A' && c <= 'Z') digit = static_cast<std::uint64_t>(10 + (c - 'A'));
+        else break;                       // stray char — caller's domain
+        if (digit >= base) break;
+        anyDigit = true;
+        // mag = mag * base + digit, as a little-endian bignum multiply-accumulate.
+        std::uint64_t carry = digit;
+        for (std::size_t i = 0; i < mag.size(); ++i) {
+            // 64×64 → 128 via 32-bit halves (portable; no __uint128_t / _umul128).
+            std::uint64_t const a = mag[i];
+            std::uint64_t const aL = a & 0xFFFFFFFFull, aH = a >> 32;
+            std::uint64_t const bL = base & 0xFFFFFFFFull, bH = base >> 32;
+            std::uint64_t const ll = aL * bL, lh = aL * bH, hl = aH * bL, hh = aH * bH;
+            std::uint64_t const cross = (ll >> 32) + (lh & 0xFFFFFFFFull) + (hl & 0xFFFFFFFFull);
+            std::uint64_t lo = (ll & 0xFFFFFFFFull) | (cross << 32);
+            std::uint64_t hi = hh + (lh >> 32) + (hl >> 32) + (cross >> 32);
+            std::uint64_t const s0 = lo + carry;          // add the running carry
+            hi += (s0 < lo) ? 1u : 0u;
+            mag[i] = s0;
+            carry  = hi;
+        }
+        if (carry != 0) mag.push_back(carry);
+    }
+    if (!anyDigit) return std::nullopt;
+    return mag;
 }
 
 // Decode a float literal's text per the language's NumberStyle: strip

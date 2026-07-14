@@ -237,7 +237,47 @@ bool TypeInterner::isIncompleteArray(TypeId id) const {
     id = materialId_(id);
     if (arena_.at(id).kind != TypeKind::Array) return false;
     auto const sc = scalars(id);
+    // Exactly -1 — a VLA's -2 sentinel is a DISTINCT, complete type (isVlaArray),
+    // so FAM logic (layout contribution, `sizeof` ill-formedness) never matches it.
     return !sc.empty() && sc[0] == kIncompleteArrayLength;
+}
+
+TypeId TypeInterner::vlaArray(TypeId element) {
+    // VLA C1a (D-CSUBSET-VLA): the exact incompleteArray mirror — a kind=Array with
+    // the `kVlaLength` (-2) sentinel. Dedups by content, so every `int` VLA shares
+    // one TypeId; the per-declaration runtime bound is held out-of-band.
+    return array(element, kVlaLength);
+}
+
+bool TypeInterner::isVlaArray(TypeId id) const {
+    // Robust to an INVALID id: this predicate is called on symbol/declared types
+    // that may be `InvalidType` (a declarator whose type failed to resolve — e.g. a
+    // rejected multi-dim VLA), so an unguarded `arena_.at(invalid)` would abort
+    // ("TypeId out of range"). An invalid type is not a VLA.
+    if (!id.valid()) return false;
+    // Strip a `volatile`-qualifier skin first (mirror isIncompleteArray) so a
+    // `volatile`-qualified VLA still reads as Array on the raw kind.
+    id = materialId_(id);
+    if (arena_.at(id).kind != TypeKind::Array) return false;
+    auto const sc = scalars(id);
+    return !sc.empty() && sc[0] == kVlaLength;
+}
+
+bool TypeInterner::typeContainsVla(TypeId id) const {
+    // VLA C3 (D-CSUBSET-VLA): walk the array-element spine (`ops[0]`), testing
+    // `isVlaArray` at each level. `int a[5][n]` = array(vlaArray(int),5): the top
+    // is a fixed Array (not a VLA), but its element IS a VLA → true. A fully-fixed
+    // `int[5][5]` = array(array(int,5),5): no level is a VLA → false (no over-fire).
+    // A `volatile`-skin at any level is seen through by the transparent `kind()` /
+    // `operands()` accessors (mirroring isVlaArray's own materialId_ strip).
+    while (id.valid()) {
+        if (isVlaArray(id)) return true;
+        if (kind(id) != TypeKind::Array) return false;   // non-array base — stop
+        auto const ops = operands(id);
+        if (ops.empty()) return false;
+        id = ops[0];
+    }
+    return false;
 }
 
 TypeId TypeInterner::tuple(std::span<TypeId const> elements) {
@@ -573,6 +613,50 @@ TypeId TypeInterner::enumType(std::string_view name, TypeKind underlying) {
     // is identified nominally by name + tagged with its underlying type).
     std::array<std::int64_t, 1> const sc{static_cast<std::int64_t>(underlying)};
     return internContent(TypeKind::Enum, {}, {}, sc, names_.intern(name));
+}
+
+TypeId TypeInterner::bitInt(std::int64_t widthBits, bool isSigned) {
+    // scalars=[widthBits, signed?1:0]; no operands, no name. The interner dedups
+    // on the scalar pair, so `_BitInt(N)` / `unsigned _BitInt(N)` each intern once.
+    std::array<std::int64_t, 2> const sc{widthBits, isSigned ? std::int64_t{1}
+                                                             : std::int64_t{0}};
+    return internContent(TypeKind::BitInt, {}, {}, sc, {});
+}
+
+std::int64_t TypeInterner::bitIntWidth(TypeId id) const {
+    if (kind(id) != TypeKind::BitInt) latticeFatal("bitIntWidth: TypeId is not a BitInt");
+    auto const sc = scalars(id);
+    if (sc.empty()) latticeFatal("bitIntWidth: BitInt has no width scalar");
+    return sc[0];
+}
+
+bool TypeInterner::bitIntIsSigned(TypeId id) const {
+    if (kind(id) != TypeKind::BitInt) latticeFatal("bitIntIsSigned: TypeId is not a BitInt");
+    auto const sc = scalars(id);
+    // scalars[1] is the signedness flag; a 1-scalar BitInt (shouldn't occur via the
+    // builder) is treated as signed (the C default).
+    return sc.size() < 2 || sc[1] != 0;
+}
+
+TypeKind TypeInterner::bitIntContainerKind(TypeId id) const {
+    if (kind(id) != TypeKind::BitInt)
+        latticeFatal("bitIntContainerKind: TypeId is not a BitInt");
+    std::int64_t const n = bitIntWidth(id);
+    bool const s = bitIntIsSigned(id);
+    // Smallest native integer container holding N bits.
+    if (n <= 8)  return s ? TypeKind::I8  : TypeKind::U8;
+    if (n <= 16) return s ? TypeKind::I16 : TypeKind::U16;
+    if (n <= 32) return s ? TypeKind::I32 : TypeKind::U32;
+    if (n <= 64) return s ? TypeKind::I64 : TypeKind::U64;
+    // D-CSUBSET-BITINT-C2-WIDE (M1): N>64 has NO single native container — it is a
+    // MULTI-LIMB memory value. A "container kind" query for a wide `_BitInt` is a
+    // scalar-path LEAK: every wide consumer works on i64 LIMBS (never the whole type as
+    // a scalar), so reaching here means a wide value slipped into the scalar path. FAIL
+    // LOUD (a crash), never the old silent `Void` sentinel that would flow to codegen
+    // as a garbage-width op. The C2 by-address diverts keep this unreachable for wide.
+    latticeFatal("bitIntContainerKind: _BitInt(N>64) has no native container — a wide "
+                 "_BitInt is multi-limb (memory), reached by ADDRESS, never as a scalar "
+                 "value; this query is a scalar-path leak (D-CSUBSET-BITINT-C2-WIDE)");
 }
 
 TypeId TypeInterner::fnSig(std::span<TypeId const> params, TypeId result, CallConv cc) {

@@ -196,6 +196,25 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "S_ThreadLocalAddressNotConstant";
         case DiagnosticCode::S_ThreadLocalInvalidCombination:
             return "S_ThreadLocalInvalidCombination";
+        case DiagnosticCode::S_BitIntWidthNotConstant:
+            return "S_BitIntWidthNotConstant";
+        case DiagnosticCode::S_BitIntWidthNotPositive:
+            return "S_BitIntWidthNotPositive";
+        case DiagnosticCode::S_BitIntSignedWidthTooSmall:
+            return "S_BitIntSignedWidthTooSmall";
+        case DiagnosticCode::S_BitIntWidthExceedsMax:
+            return "S_BitIntWidthExceedsMax";
+        case DiagnosticCode::S_BitIntWidthAboveC1Limit:
+            return "S_BitIntWidthAboveC1Limit";
+        case DiagnosticCode::S_BitIntWideMulDivUnsupported:
+            return "S_BitIntWideMulDivUnsupported";
+        case DiagnosticCode::S_BitIntWideFloatConvUnsupported:
+            return "S_BitIntWideFloatConvUnsupported";
+        case DiagnosticCode::S_VlaWithStaticStorage:     return "S_VlaWithStaticStorage";
+        case DiagnosticCode::S_VlaMultiDimUnsupported:   return "S_VlaMultiDimUnsupported";
+        case DiagnosticCode::S_VlaSizeNotInteger:        return "S_VlaSizeNotInteger";
+        case DiagnosticCode::S_ArrayParamQualifierNonParameter:
+            return "S_ArrayParamQualifierNonParameter";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
@@ -230,6 +249,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_InvalidUniversalCharacterName: return "H_InvalidUniversalCharacterName";
         case DiagnosticCode::H_WideByteEscapeUnsupported: return "H_WideByteEscapeUnsupported";
         case DiagnosticCode::H_ConflictingStringLiteralPrefixes: return "H_ConflictingStringLiteralPrefixes";
+        case DiagnosticCode::H_VlaJumpIntoScope:         return "H_VlaJumpIntoScope";
+        case DiagnosticCode::H_VlaComputedGotoInScope:   return "H_VlaComputedGotoInScope";
         case DiagnosticCode::I_VerifierFailure:          return "I_VerifierFailure";
         case DiagnosticCode::I_NoEntryBlock:             return "I_NoEntryBlock";
         case DiagnosticCode::I_MultipleEntryBlocks:      return "I_MultipleEntryBlocks";
@@ -242,6 +263,9 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_ArgPositionDuplicate:     return "I_ArgPositionDuplicate";
         case DiagnosticCode::I_AllocaAlignmentNotPowerOfTwo: return "I_AllocaAlignmentNotPowerOfTwo";
         case DiagnosticCode::I_NullptrTypeInMir:         return "I_NullptrTypeInMir";
+        case DiagnosticCode::I_BitIntWidthInconsistent:  return "I_BitIntWidthInconsistent";
+        case DiagnosticCode::I_VlaAllocaOperandInvalid:  return "I_VlaAllocaOperandInvalid";
+        case DiagnosticCode::I_VlaStackRestorePairing:   return "I_VlaStackRestorePairing";
         case DiagnosticCode::I_ExtensionTypeInMir:       return "I_ExtensionTypeInMir";
         case DiagnosticCode::I_StructCfMismatch:         return "I_StructCfMismatch";
         case DiagnosticCode::I_UnreachableBlock:         return "I_UnreachableBlock";
@@ -262,6 +286,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::L_IndirectCallUnsupported:      return "L_IndirectCallUnsupported";
         case DiagnosticCode::L_IndirectCalleeClobberedByArgSetup: return "L_IndirectCalleeClobberedByArgSetup";
         case DiagnosticCode::L_OverAlignedStackLocal:        return "L_OverAlignedStackLocal";
+        case DiagnosticCode::L_VlaDynamicAllocaUnsupported:  return "L_VlaDynamicAllocaUnsupported";
+        case DiagnosticCode::L_VlaNonLeafFrameUnsupported:   return "L_VlaNonLeafFrameUnsupported";
         case DiagnosticCode::R_NoCallingConventions:          return "R_NoCallingConventions";
         case DiagnosticCode::R_CallingConventionLookupFailed: return "R_CallingConventionLookupFailed";
         case DiagnosticCode::R_VRegHasNoClass:                return "R_VRegHasNoClass";

@@ -12,6 +12,7 @@
 #include "core/types/grammar_schema.hpp"
 #include "core/types/char_decode.hpp"
 #include "core/types/hir_lowering_config.hpp"
+#include "core/types/bit_int_value.hpp"          // C4b: host bignum for wb/uwb literals
 #include "core/types/integer_literal_ladder.hpp" // FC3 c1: the C 6.4.4.1 ladder (shared with the semantic tier)
 #include "core/types/object_format_kind.hpp"     // kObjectFormatKindTable (per-format library-map keys)
 #include "core/types/number_decode.hpp"
@@ -93,13 +94,20 @@ namespace {
 // early-outed there before this is consulted). A SHAPE predicate over
 // TypeKind — never language identity.
 [[nodiscard]] bool isArithmeticCore(TypeKind k) noexcept {
+    // C23 6.2.5 (D-CSUBSET-BITINT): a `_BitInt(N)` is an arithmetic (integer) type,
+    // so `coerce` materializes a Cast on a `_BitInt`↔int / `_BitInt`↔`_BitInt`
+    // mismatch (which `hir_to_mir` masks to N — CRIT-1). Ungated shape admission:
+    // BitInt only ever appears in the `_BitInt`-declaring schema, so this is inert
+    // elsewhere (no BitInt TypeKind flows through a non-C lowering). A missed
+    // admission would leave the conversion UN-cast → a spurious loud reject (M-8).
     return k == TypeKind::Bool || k == TypeKind::Char || k == TypeKind::Byte
         || k == TypeKind::I8   || k == TypeKind::I16  || k == TypeKind::I32
         || k == TypeKind::I64  || k == TypeKind::I128
         || k == TypeKind::U8   || k == TypeKind::U16  || k == TypeKind::U32
         || k == TypeKind::U64  || k == TypeKind::U128
         || k == TypeKind::F16  || k == TypeKind::F32
-        || k == TypeKind::F64  || k == TypeKind::F128;
+        || k == TypeKind::F64  || k == TypeKind::F128
+        || k == TypeKind::BitInt;
 }
 
 // Full-width-integer return predicate for D-LK10-ENTRY-MAIN-IMPLICIT-
@@ -235,6 +243,22 @@ struct Lowerer {
     // is global-only): a global's value raises its data-item section alignment;
     // a local's value raises its alloca's effective (frame-slot) alignment.
     std::vector<std::pair<HirNodeId, AlignmentAttr>>& alignmentAcc;
+    // VLA C1a (D-CSUBSET-VLA): shared accumulator of (declared local SymbolId.v →
+    // the LOWERED size-expression HIR node) pairs. Populated at the local VarDecl
+    // site when the declared type `isVlaArray` — the array suffix (normally SKIPPED
+    // at CST→HIR) is un-skipped and its length expr lowered. Moved onto the result's
+    // `vlaSizeExprBySymbol` map AFTER finish() (same frozen-hir discipline as the
+    // attribute accumulators). Sparse: only VLA locals are recorded.
+    std::vector<std::pair<std::uint32_t, HirNodeId>>& vlaSizeAcc;
+    // VLA C2 (D-CSUBSET-VLA): shared accumulator of (SizeOf HIR node id.v → the VLA
+    // operand's SymbolId.v) pairs. Populated at a `sizeof <vla-object>` site; moved
+    // onto result->sizeofVlaSymbol AFTER finish(). Sparse: only VLA-object sizeofs.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>>& sizeofVlaSymAcc;
+    // VLA C4b (D-CSUBSET-VLA): shared accumulator of (VLA-typedef OBJECT SymbolId.v →
+    // its typedef origin R's SymbolId.v) pairs. Populated at the object's VarDecl
+    // site when its `SymbolRecord.vlaTypedefOrigin` is set; moved onto the result's
+    // `typedefVlaOriginBySymbol` AFTER finish(). Sparse: only VLA-typedef objects.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>>& typedefOriginAcc;
 
     // D-CSUBSET-LOCAL-STATIC: the module-level decls accumulator (the SAME
     // vector `lowerTree` appends top-level decls to). A block-scope `static`
@@ -805,11 +829,15 @@ struct Lowerer {
             std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut,
             std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& tls,
             std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
-            std::vector<std::pair<HirNodeId, AlignmentAttr>>& aln)
+            std::vector<std::pair<HirNodeId, AlignmentAttr>>& aln,
+            std::vector<std::pair<std::uint32_t, HirNodeId>>& vlaSz,
+            std::vector<std::pair<std::uint32_t, std::uint32_t>>& sizeofVlaSym,
+            std::vector<std::pair<std::uint32_t, std::uint32_t>>& typedefOrigin)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
           linkage(lk), mutability(mut), threadLocalAcc(tls), volatileAcc(vol),
-          alignmentAcc(aln) {
+          alignmentAcc(aln), vlaSizeAcc(vlaSz), sizeofVlaSymAcc(sizeofVlaSym),
+          typedefOriginAcc(typedefOrigin) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -831,6 +859,10 @@ struct Lowerer {
         dataModel_ = m.dataModel();
         if (sem.arithmeticConversions.has_value()) {
             arith_ = resolveArithmeticRules(*sem.arithmeticConversions, dataModel_);
+            // D-CSUBSET-BITINT: `_BitInt` participation in the usual arithmetic
+            // conversions is a SEPARATE top-level flag (keeps ArithmeticConversions'
+            // JSON unchanged) — inject it into the resolved rules here.
+            arith_->bitIntConversions = sem.bitIntConversions;
         }
         for (RuleId r : cfg.deferredRules) deferred_.emplace(r.v, true);
         // HR10: register every declared extension kind up front, so a rule mapped
@@ -1133,6 +1165,137 @@ struct Lowerer {
             && *rec->explicitAlignment > 0u)
             alignmentAcc.push_back(
                 {node, AlignmentAttr{*rec->explicitAlignment}});
+    }
+    // VLA C4b (D-CSUBSET-VLA): does this declarator carry its OWN array suffix
+    // (`[...]`)? The HIR-tier discriminator that separates the ORIGINAL VLA typedef
+    // (`typedef int R[n];` — has the `[n]` suffix, so its runtime bound is
+    // capturable) from a CHAINED VLA typedef (`typedef R S;` — S's VLA-ness is
+    // inherited from the head alias R, S's own declarator has NO suffix → a
+    // deferred shape, D-CSUBSET-VLA-TYPEDEF-CHAINED). Same suffix-locating walk as
+    // `captureVlaSize` but presence-only (returns on the first hit) — self-contained,
+    // so it does NOT depend on any semantic-tier flag being stamped on the typedef.
+    [[nodiscard]] bool declaratorHasArraySuffix(NodeId declaratorNode) {
+        if (!sem.declarators.has_value()) return false;
+        DeclaratorConfig const& dc = *sem.declarators;
+        std::vector<NodeId> stack{declaratorNode};
+        for (int guard = 0; guard < 16384 && !stack.empty(); ++guard) {
+            NodeId const c = stack.back();
+            stack.pop_back();
+            if (tree().kind(c) != NodeKind::Internal) continue;
+            if (tree().rule(c).v == dc.arraySuffixRule.v) return true;
+            auto const kids = visible(c);
+            for (std::size_t i = kids.size(); i-- > 0;) stack.push_back(kids[i]);
+        }
+        return false;
+    }
+    // VLA C1a (D-CSUBSET-VLA): lower a block-scope variable-length array local's
+    // SIZE expression and record it in the out-of-band side-table keyed by the
+    // local's SymbolId. The array suffix is normally SKIPPED at CST→HIR (a fixed
+    // length is consumed at the semantic tier + never lowered); a VLA's RUNTIME
+    // bound must reach HIR→MIR to size its alloca, so here we un-skip it. Called
+    // only for a NON-global local whose resolved type `isVlaArray` (the semantic
+    // scope gate guarantees that shape). `declaratorNode` is the declarator CST
+    // node; `sym` its declared symbol. The lowered size node is FLOATING (valid in
+    // the arena, reachable only via the side-table — no statement parents it).
+    void captureVlaSize(NodeId declaratorNode, SymbolId sym) {
+        if (!sem.declarators.has_value() || !sym.valid()) return;
+        DeclaratorConfig const& dc = *sem.declarators;
+        // VLA C3: collect EVERY array suffix in SOURCE order (outer→inner) — a multi-
+        // dimensional VLA (`int a[n][m]`) has one suffix per dimension, and the order
+        // MUST match the nested type's levels (level 0 = outermost) so HIR→MIR pairs
+        // each captured bound with its dimension when it forms the cumulative row
+        // strides. Ordered pre-order work-stack: push children REVERSED so they pop
+        // left-to-right; an array-suffix node is recorded, NOT descended into (its
+        // only children are `[`, the bound expr, `]`).
+        std::vector<NodeId> suffixes;
+        {
+            std::vector<NodeId> stack{declaratorNode};
+            for (int guard = 0; guard < 16384 && !stack.empty(); ++guard) {
+                NodeId const c = stack.back(); stack.pop_back();
+                if (tree().kind(c) != NodeKind::Internal) continue;
+                if (tree().rule(c).v == dc.arraySuffixRule.v) {
+                    suffixes.push_back(c);
+                    continue;
+                }
+                auto const kids = visible(c);
+                for (std::size_t i = kids.size(); i-- > 0;) stack.push_back(kids[i]);
+            }
+        }
+        if (suffixes.empty()) {
+            // The type is a VLA but no suffix was located — an internal desync, not
+            // a user error. Fail loud rather than silently drop the runtime size (an
+            // unsized VLA alloca downstream).
+            (void)reportedError(declaratorNode,
+                "internal: variable-length array declarator carries no array "
+                "suffix to lower its runtime size from");
+            return;
+        }
+        // VLA C4a-param (D-CSUBSET-VLA, FIX-3): a ptr-to-VLA PARAMETER's declarator
+        // carries DECAYED leading array suffix(es) that are NOT part of the pointee's
+        // array spine. `int a[][n]` decays its OUTER `[]` to a pointer, so the
+        // declarator has 2 suffixes but the pointee `int[n]` has only 1 array level;
+        // `int (*p)[n]` has 1 suffix and a depth-1 pointee (skip 0). Skip the LEADING
+        // `numArraySuffixes − pointeeArrayDepth` suffix(es) so the captured bounds pair
+        // 1:1 with the pointee's runtime dimensions (`computeVlaByteSize` asserts
+        // dims==depth). Applies ONLY when the symbol type is `kind==Ptr` — a VLA-OBJECT
+        // local (`int a[n][m]`, kind Array) is UNTOUCHED (skip=0 preserves every
+        // dimension). Without the skip a decayed `[]` (no lowerable middle child) fails
+        // loud on the leading suffix. Order: the pre-order walk records suffixes
+        // outer→inner, and the decaying dims are the OUTERMOST, so erase from front.
+        if (auto const* rec = model.recordFor(sym);
+            rec != nullptr && interner.kind(rec->type) == TypeKind::Ptr) {
+            auto const pops = interner.operands(rec->type);
+            if (!pops.empty()) {
+                std::size_t pointeeDepth = 0;
+                for (TypeId t = pops[0];
+                     t.valid() && interner.kind(t) == TypeKind::Array;) {
+                    ++pointeeDepth;
+                    auto const o = interner.operands(t);
+                    if (o.empty()) break;
+                    t = o[0];
+                }
+                if (suffixes.size() > pointeeDepth)
+                    suffixes.erase(
+                        suffixes.begin(),
+                        suffixes.begin()
+                            + static_cast<std::ptrdiff_t>(suffixes.size()
+                                                          - pointeeDepth));
+            }
+        }
+        // Lower each suffix's length — the child BETWEEN the bracket delimiters
+        // (`arrayDeclSuffix = [ BracketOpen, expr, BracketClose ]`) — to a FLOATING
+        // HIR node, in outer→inner order, appending one accumulator entry per
+        // dimension. `lowerExpr` handles every expression form incl. a bare
+        // identifier a rule-set filter would miss; a FIXED dim (`[5]`) lowers to a
+        // Const, a runtime dim (`[n]`) to its expression. EVERY suffix must yield a
+        // bound — a suffix with no lowerable middle child is an internal desync,
+        // never a silently unsized dimension.
+        for (NodeId const suffix : suffixes) {
+            // VLA C4c (D-CSUBSET-VLA): the bound sits BEHIND any array-parameter
+            // decoration (`int a[static n]`) — locate it via the shared skipper so a
+            // leading `static`/cv/`*` token is never mistaken for, or lowered as, the
+            // runtime size (a mis-lowered decoration would size the alloca wrong).
+            NodeId const boundNode =
+                arraySuffixBoundNode(tree(), suffix, dc.arraySuffixModifierTokens)
+                    .value_or(NodeId{});
+            bool lowered = false;
+            if (boundNode.valid()) {
+                E const sizeE = lowerExpr(boundNode);
+                if (sizeE.id.valid()) {
+                    vlaSizeAcc.emplace_back(sym.v, sizeE.id);
+                    lowered = true;
+                }
+            }
+            if (!lowered) {
+                // No lowerable length child on this dimension — an internal desync
+                // (the semantic tier built the VLA, so a bound WAS present). Fail
+                // loud, never a silently unsized VLA.
+                (void)reportedError(declaratorNode,
+                    "internal: variable-length array declarator's runtime size "
+                    "expression could not be lowered");
+                return;
+            }
+        }
     }
     // c21/c27: record an ACCESS HIR node's OBJECT-volatility — true iff the bound
     // symbol's STORAGE is itself volatile, i.e. its resolved type is TOP-LEVEL
@@ -3037,6 +3200,36 @@ struct Lowerer {
             if (ok) {
                 double const d = decodeFloat(text, numberStyle, ok);
                 if (ok) val.value = d;
+            }
+        } else if (std::optional<bool> const bpSigned =
+                       (!sem.integerLiteralTyping.empty() && numberStyle != nullptr
+                        && numberStyle->emitKind.integer.valid()
+                        && tk == numberStyle->emitKind.integer)
+                           ? bitPreciseLiteralSignedness(text, numberStyle,
+                                                         sem.integerLiteralTyping)
+                           : std::nullopt) {
+            // C23 6.4.4.1 (D-CSUBSET-BITINT-WIDE-LITERAL / Fork-1b): a `wb`/`uwb`
+            // bit-precise literal. Its value may exceed u64 (`...688uwb`), so it
+            // decodes through the ARBITRARY-MAGNITUDE `decodeBigInteger` sibling;
+            // its type is `[unsigned] _BitInt(N)` with N the magnitude-derived
+            // minimal width (`BitIntValue::fromLiteralMagnitude`). The value lives
+            // in the `BitIntValue` pool arm for EVERY N (narrow + wide) — never the
+            // int64 arm (I1: an int64 arm would fold via the un-wrapped int64
+            // helpers = silent miscompile). I4: a derived N above __BITINT_MAXWIDTH__
+            // is a constraint violation — fail loud, never a truncated type.
+            if (auto mag = decodeBigInteger(text, numberStyle)) {
+                BitIntValue bv = BitIntValue::fromLiteralMagnitude(*mag, *bpSigned);
+                if (bv.width() > kBitIntMaxWidth) {
+                    unsupported(tokenNode, std::format(
+                        "`_BitInt` literal width {} exceeds __BITINT_MAXWIDTH__ ({})",
+                        bv.width(), kBitIntMaxWidth));
+                    return {errorNode(operandNode), InvalidType};
+                }
+                core = TypeKind::BitInt;
+                type = interner.bitInt(static_cast<std::int64_t>(bv.width()), *bpSigned);
+                val.value = std::move(bv);
+            } else {
+                ok = false;   // no base-valid digits (malformed) — fail loud below
             }
         } else if (auto iv = decodeInteger(text, numberStyle)) {
             // FC3 c1: the integer-literal ladder (C 6.4.4.1) — the SAME
@@ -5227,6 +5420,84 @@ struct Lowerer {
         }
         return InvalidType;
     }
+    // VLA C2 (D-CSUBSET-VLA): the SymbolId of a `sizeof <operand>` when the operand is a
+    // DIRECT reference to a VLA object (`a`, `(a)`, `((a))`). Mirrors `simpleLvalue`'s
+    // core (side-effect-free): `peelToCore` peels transparent paren/wrapper nodes, and
+    // the result MUST be a bare identifier `operandRule` whose type `isVlaArray`. This is
+    // the C lvalue-vs-conversion distinction: a direct array-object operand keeps its
+    // array type under `sizeof`, so `sizeof a` == the array size (the frozen runtime
+    // value). A COMPOSITE operand — `sizeof(b, a)` (comma), `sizeof(c ? a : b)`, a
+    // cast/call — undergoes lvalue conversion (array→pointer decay), so its `sizeof` is
+    // the POINTER size, NOT the object's frozen size; those peel to a NON-operandRule
+    // expression node → invalid SymbolId → the caller records nothing → the existing
+    // static path stands (which fails loud on the VLA type — never a silently wrong
+    // VLA size). Also rejects `sizeof a[0]` naturally: its `sized` is the element type,
+    // so `isVlaArray(sized)` is already false and this helper is never reached.
+    // VLA C3: also peels a SUBSCRIPT operand (`sizeof a[0]` — a ROW of a multi-dim
+    // VLA keeps its row type under sizeof, no lvalue decay) through the postfix Index
+    // BASE to the root VLA object; the MIR SizeOf case then Loads the SAME
+    // (sym, sized-row-type) stride slot the index path uses. Non-const so it can call
+    // the postfix classifier `postfixFlattenPlan`.
+    [[nodiscard]] SymbolId vlaObjectOperandSymbol(NodeId operand) {
+        NodeId cur = operand;
+        for (int guard = 0; guard < 128 && cur.valid(); ++guard) {
+            if (isToken(cur)) return SymbolId{};   // a bare non-identifier token operand
+            // VLA C3: a postfix subscript (`a[0]`, `a[i][j]`) — descend the BASE
+            // (skipping the subscript index), reaching the root VLA object. A
+            // subscript keeps the row's array type under sizeof (no array→pointer
+            // decay), UNLIKE the composite comma/ternary operands rejected below.
+            {
+                NodeId baseN{}, subscriptN{};
+                HirOperatorEntry const* e = nullptr;
+                if (postfixFlattenPlan(cur, baseN, subscriptN, e)
+                        == PostfixFlatten::Index
+                    && baseN.valid()) {
+                    cur = baseN;
+                    continue;
+                }
+            }
+            // Classify children: SUB-EXPRESSION nodes vs. a direct identifier token.
+            // (Operator/punctuation tokens — `(`, `)`, `,`, `?` — are neither.)
+            NodeId identTok{}, sub{};
+            int subCount = 0;
+            for (NodeId c : visible(cur)) {
+                if (isToken(c)) {
+                    if (sem.identifierToken.valid()
+                        && tree().tokenKind(c).v == sem.identifierToken.v)
+                        identTok = c;
+                } else {
+                    ++subCount;
+                    sub = c;
+                }
+            }
+            // Terminal: a bare identifier operand (no sub-expressions). Resolve it to a
+            // VLA OBJECT via the symbol's own DECLARED type (stamp-independent + precise)
+            // — this rejects a VLA-yielding-but-non-object operand like `sizeof *p` (the
+            // identifier `p` is a pointer whose pointee is a VLA). VLA C3: accept
+            // `typeContainsVla` too so a FIXED-outer VLA object (`int a[5][n]` — declared
+            // type array(vlaArray,5), not isVlaArray) is a valid `sizeof a` object.
+            if (subCount == 0) {
+                if (!identTok.valid()) return SymbolId{};
+                SymbolId const sym = model.symbolAt(identTok);
+                SymbolRecord const* rec = sym.valid() ? model.recordFor(sym) : nullptr;
+                return (rec != nullptr
+                        && (interner.isVlaArray(rec->type)
+                            || interner.typeContainsVla(rec->type)))
+                           ? sym
+                           : SymbolId{};
+            }
+            // Transparent grouping wrapper (parens / operand / postfix): exactly ONE
+            // sub-expression and no stray identifier — descend. Anything else (≥2
+            // sub-expressions = a comma/ternary/binary composite, or an identifier
+            // alongside a sub-expression) is NOT a direct object reference → reject: the
+            // caller records nothing and the existing fail-loud static path stands (so
+            // `sizeof(b, a)` / `sizeof(0, a)` fail loud rather than silently loading a
+            // VLA's frozen size — C decays a composite operand to a pointer).
+            if (subCount == 1 && !identTok.valid()) { cur = sub; continue; }
+            return SymbolId{};
+        }
+        return SymbolId{};
+    }
     [[nodiscard]] E lowerCompoundLiteral(NodeId clNode) {
         NodeId typeRefN{}, braceN{};
         for (NodeId c : visible(clNode)) {
@@ -5275,7 +5546,30 @@ struct Lowerer {
         }
         HirNodeId const tref = track(builder.makeTypeRef(sized), node);
         TypeId const u64 = interner.primitive(TypeKind::U64);
-        return {track(builder.makeSizeOf(tref, u64), node), u64};
+        HirNodeId const so = track(builder.makeSizeOf(tref, u64), node);
+        // VLA C2/C3 (D-CSUBSET-VLA): for a VLA-OBJECT operand, `sizeof a` (and the C3
+        // ROW form `sizeof a[0]`) is a RUNTIME value (the size frozen at a's decl,
+        // C 6.7.6.2p2), not a static fold. Record (SizeOf node → the VLA symbol) so MIR
+        // emits a Load of the decl-frozen (sym, sized-type) size slot. The TypeRef child
+        // is LEFT as its VLA type (unchanged), so every const-eval consumer keeps
+        // DECLINING a VLA sizeof (never a wrong constant) — the runtime path lives solely
+        // at the MIR SizeOf case, reached only for genuine runtime expressions (a
+        // constant-required context const-evals + declines before MIR). `||typeContainsVla`
+        // admits a FIXED-outer VLA object (`int a[5][n]` — sized array(vlaArray,5), not
+        // isVlaArray) whose `sizeof a` is still a runtime size.
+        if (interner.isVlaArray(sized) || interner.typeContainsVla(sized)) {
+            // The operand is the first sub-expression child of the form node (the
+            // `castOperand` after the `sizeof` keyword). Record ONLY a direct VLA-object
+            // reference (see vlaObjectOperandSymbol); a composite operand falls through.
+            NodeId operandN{};
+            for (NodeId c : visible(scan))
+                if (tree().kind(c) == NodeKind::Internal) { operandN = c; break; }
+            if (operandN.valid())
+                if (SymbolId const opSym = vlaObjectOperandSymbol(operandN);
+                    opSym.valid())
+                    sizeofVlaSymAcc.emplace_back(so.v, opSym.v);
+        }
+        return {so, u64};
     }
 
     // C11/C23 6.5.3.4: `_Alignof ( type-name )` | `alignof ( type-name )` → core
@@ -5541,6 +5835,10 @@ struct Lowerer {
             if (!isFloatCore(kind)) intLits.insert(tok);
         }
         CstEvalContext ctx{tree(), tree().schema(), intLits, numberStyle};
+        // C4b (Fork-2c): let a `wb`/`uwb` bit-precise index designator fold too, and
+        // stamp standard literals' true data-model core for the BitInt UAC width.
+        ctx.integerLiteralTyping = sem.integerLiteralTyping;
+        ctx.dataModel = dataModel_;
         // Ref resolution: name → symbol via `symbolAt(identTok)` →
         // SymbolRecord. Only `isConst` symbols are foldable. The
         // shared `findInitExprInDecl` helper (in the engine library)
@@ -7219,6 +7517,49 @@ struct Lowerer {
             // (raises its alloca's effective frame-slot alignment) — record
             // unconditionally on the VarDecl/Global node, like volatility.
             recordAlignment(lowered, sym);
+            // VLA C1a (D-CSUBSET-VLA): a block-scope variable-length array local —
+            // lower + record its runtime size expr (the semantic scope gate already
+            // guaranteed the vlaArray shape only at block scope; a static/extern VLA
+            // was rejected loud, and never reaches this automatic-local branch). A
+            // global array is never a VLA (file-scope non-constant length stays
+            // S_NonConstantArrayLength), so the `!asGlobal` guard is exact. VLA C3:
+            // `||typeContainsVla` so a FIXED-outer multi-dim VLA (`int a[5][n]` —
+            // whose top type is a fixed Array, NOT isVlaArray) ALSO captures its
+            // bounds (else HIR→MIR's `vlaAllocaForLocal` fails loud on the missing
+            // size side-table entry). VLA C4a-local (D-CSUBSET-VLA): a LOCAL
+            // pointer-to-VLA (`int (*p)[n]`) is `kind==Ptr` — `typeContainsVla` stops at
+            // the non-array pointer top, so its POINTEE is tested explicitly. The suffix
+            // walk in `captureVlaSize` descends the whole `(*p)[n]` declarator and records
+            // the `[n]` bound keyed to `p`; HIR→MIR then freezes the pointee's runtime row
+            // stride at the decl point (`storePtrToVlaStride`). A ptr to a FIXED array
+            // (`int (*p)[5]`) has a non-VLA pointee → NOT captured (its stride folds at
+            // compile time).
+            // VLA C4b (D-CSUBSET-VLA): a VLA-TYPEDEF object (`typedef int R[n]; R a;`)
+            // gets its VLA-ness from the head alias, NOT its own declarator — it carries
+            // NO `[n]` suffix, so calling `captureVlaSize` on it would fail loud
+            // ("carries no array suffix"). Record a.v→origin R.v instead (the object's
+            // `SymbolRecord.vlaTypedefOrigin`, set semantically ONLY for the in-scope
+            // pure `R a;` shape where declTy == headTy — so the deferred stacked-suffix
+            // `R a[m]` and ptr `R *p` shapes never take this arm) and SKIP the object's
+            // own capture; HIR→MIR's alloca copies R's decl-frozen per-level size slots
+            // down into a's own slots + sizes a's runtime alloca from R's whole-object
+            // slot. R's own bound was already captured under R's SymbolId in
+            // `lowerTypeDecl`.
+            auto const* symRec = sym.valid() ? model.recordFor(sym) : nullptr;
+            SymbolId const vlaOrigin =
+                symRec != nullptr ? symRec->vlaTypedefOrigin : SymbolId{};
+            if (!asGlobal && vlaOrigin.valid()) {
+                typedefOriginAcc.emplace_back(sym.v, vlaOrigin.v);
+            } else {
+                bool const isPtrToVla =
+                    interner.kind(type) == TypeKind::Ptr
+                    && !interner.operands(type).empty()
+                    && interner.typeContainsVla(interner.operands(type)[0]);
+                if (!asGlobal
+                    && (interner.isVlaArray(type) || interner.typeContainsVla(type)
+                        || isPtrToVla))
+                    captureVlaSize(d, sym);
+            }
             out.push_back(lowered);
         }
     }
@@ -7318,6 +7659,37 @@ struct Lowerer {
                     if (!nameNode.valid()) continue;
                     sym = model.symbolAt(nameNode);
                     if (auto const* rec = model.recordFor(sym)) type = rec->type;
+                    // VLA C4b (D-CSUBSET-VLA): a VARIABLE-LENGTH-array typedef
+                    // (`typedef int R[n];` / multi-dim `R[n][m]`/`R[5][n]`/`R[n][5]`)
+                    // must lower + capture its OWN runtime bound(s) NOW, keyed by the
+                    // typedef symbol R — C99 §6.7.7p2 evaluates `n` once, when the
+                    // typedef is reached. R's own declarator carries the `[n]`
+                    // suffix(es), so `captureVlaSize` works unmodified (mirrors the
+                    // local-VarDecl VLA condition below). HIR→MIR's TypeDecl case then
+                    // freezes R's per-level size slots from `vlaSizeExprBySymbol[R.v]`.
+                    // A ptr-to-VLA typedef (`typedef int (*P)[n];`) is `kind==Ptr` —
+                    // `typeContainsVla` stops at the pointer top → NOT captured (its
+                    // ptr-to-VLA-typedef composition is deferred, fail-loud).
+                    if (type.valid()
+                        && (interner.isVlaArray(type)
+                            || interner.typeContainsVla(type))) {
+                        // Discriminate the ORIGINAL VLA typedef (VLA from its OWN `[n]`
+                        // suffix — capturable) from a CHAINED VLA typedef
+                        // (`typedef R S;` — VLA inherited from ANOTHER typedef, NO own
+                        // suffix) by the declarator's OWN suffix presence (a
+                        // self-contained HIR-tier check — no reliance on a semantic
+                        // flag). The original carries the `[n]`; a chained alias has
+                        // none → it is a distinct deferred shape
+                        // (D-CSUBSET-VLA-TYPEDEF-CHAINED) → fail loud CLEANLY here
+                        // (instead of `captureVlaSize`'s "no suffix" internal desync).
+                        if (declaratorHasArraySuffix(d))
+                            captureVlaSize(d, sym);
+                        else
+                            (void)reportedError(
+                                d,
+                                "a typedef that aliases a variable-length-array "
+                                "typedef is not yet supported");
+                    }
                     break;   // typedefs declare a single declarator
                 }
             }
@@ -7514,7 +7886,7 @@ struct Lowerer {
                 && tree().rule(direct).v == dc.directRule.v) {
                 for (NodeId c : visible(direct)) {
                     if (tree().kind(c) == NodeKind::Internal
-                        && tree().rule(c).v == dc.fnSuffixRule.v) {
+                        && isFnSuffixRule(tree().rule(c), dc)) {
                         collectParams(c, params);
                         break;
                     }
@@ -8181,6 +8553,16 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: shared (decl node → AlignmentAttr)
     // accumulator, moved onto result->alignmentMap after finish().
     std::vector<std::pair<HirNodeId, AlignmentAttr>> alignmentAcc;
+    // VLA C1a (D-CSUBSET-VLA): shared (local SymbolId.v → size-expr HIR node)
+    // accumulator, moved onto result->vlaSizeExprBySymbol after finish().
+    std::vector<std::pair<std::uint32_t, HirNodeId>> vlaSizeAcc;
+    // VLA C2 (D-CSUBSET-VLA): shared (SizeOf HIR node id.v → VLA operand SymbolId.v)
+    // accumulator, moved onto result->sizeofVlaSymbol after finish().
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> sizeofVlaSymAcc;
+    // VLA C4b (D-CSUBSET-VLA): shared (VLA-typedef object SymbolId.v → origin R's
+    // SymbolId.v) accumulator, moved onto result->typedefVlaOriginBySymbol after
+    // finish().
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> typedefOriginAcc;
 
     // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
     // to its language's config + the shared output. `Tree::schema()` is the
@@ -8192,7 +8574,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
-            mutability, threadLocalAcc, volatileAcc, alignmentAcc));
+            mutability, threadLocalAcc, volatileAcc, alignmentAcc, vlaSizeAcc,
+            sizeofVlaSymAcc, typedefOriginAcc));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -8244,6 +8627,12 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         result->threadLocalMap.set(id, attr);   // TLS C1
     for (auto& [id, attr] : volatileAcc) result->volatileMap.set(id, attr);  // c21
     for (auto& [id, attr] : alignmentAcc) result->alignmentMap.set(id, attr);  // alignas
+    for (auto& [symV, sizeNode] : vlaSizeAcc)   // VLA C1a/C3 (D-CSUBSET-VLA)
+        result->vlaSizeExprBySymbol[symV].push_back(sizeNode);  // outer→inner order
+    for (auto& [sizeofNodeV, symV] : sizeofVlaSymAcc)   // VLA C2 (D-CSUBSET-VLA)
+        result->sizeofVlaSymbol.emplace(sizeofNodeV, symV);
+    for (auto& [objV, originV] : typedefOriginAcc)   // VLA C4b (D-CSUBSET-VLA)
+        result->typedefVlaOriginBySymbol.emplace(objV, originV);
     result->externDecls = std::move(externDecls);
 
     // verify-on-load.

@@ -1041,6 +1041,7 @@ namespace {
 struct LoweredAgg {
     std::vector<AssembledData> items;
     std::size_t                errors;
+    std::string                messages;   // C4b (I2): concatenated diag text for substring pins
 };
 [[nodiscard]] LoweredAgg lowerOneAggGlobal(
         TypeInterner const& ti, TypeId type, MirLiteralValue init,
@@ -1053,7 +1054,9 @@ struct LoweredAgg {
     Mir const m = std::move(b).finish();
     DiagnosticReporter rep;
     auto items = lowerMirGlobalsToDataItems(m, ti, lp, dm, rep);
-    return {std::move(items), rep.errorCount()};
+    std::string msgs;
+    for (auto const& d : rep.all()) msgs += d.actual;
+    return {std::move(items), rep.errorCount(), std::move(msgs)};
 }
 
 // A scalar field literal of `kind` carrying integer bits `v`.
@@ -1132,6 +1135,41 @@ TEST(AsmDataSection, MutableInitializedGlobalLowersToData) {
         << "a mutable initialized global must route to writable .data";
     std::vector<std::uint8_t> const expect{5, 0, 0, 0};
     EXPECT_EQ(r.items[0].bytes, expect);
+}
+
+// ── I5 (D-CSUBSET-BITINT-DATA-GLOBAL): a const-folded `_BitInt` global fails loud ──
+// C4b makes `_BitInt` values const-fold, so one can reach the globals byte-emitter
+// as an initializer. Emitting its bytes is a DEFERRAL boundary — the emitter must
+// FAIL LOUD (a real diagnostic), NEVER emit wrong / zero bytes. The EXPLICIT
+// `BitIntValue` arm emits the SPECIFIC `D-CSUBSET-BITINT-DATA-GLOBAL` deferral
+// diagnostic; if it were removed the value would fall to the scalar arm, where
+// `scalarByteSize(BitInt)` returns nullopt → ALSO fail-loud, but with the GENERIC
+// `K_NoMatchingObjectFormat` message (SAME diagnostic CODE — so an error-count /
+// empty-items assertion alone is NOT red-on-disable). RED-ON-DISABLE therefore
+// pins the distinguishing MESSAGE substring, present only in the explicit arm.
+TEST(AsmDataSection, BitIntGlobalFailsLoud) {
+    TypeInterner ti{CompilationUnitId{1}};
+    // A WIDE _BitInt(100) global initialized by a const-folded bit-precise value.
+    MirLiteralValue wide;
+    wide.core  = TypeKind::BitInt;
+    wide.value = BitIntValue::fromU64(42, 100, /*isSigned=*/false);
+    auto const rw = lowerOneAggGlobal(ti, ti.bitInt(100, /*isSigned=*/false),
+                                      std::move(wide), kNatural16, DataModel::Lp64);
+    EXPECT_GE(rw.errors, 1u)
+        << "a wide _BitInt data-global must fail loud (D-CSUBSET-BITINT-DATA-GLOBAL)";
+    EXPECT_TRUE(rw.items.empty()) << "no bytes for a deferred _BitInt global";
+    EXPECT_NE(rw.messages.find("D-CSUBSET-BITINT-DATA-GLOBAL"), std::string::npos)
+        << "the EXPLICIT _BitInt arm's deferral diagnostic — red-on-disable: the "
+           "generic scalar-fallback message does not carry this anchor";
+    // A NARROW _BitInt(8) global is deferred TOO (uniform fail-loud, never bytes).
+    MirLiteralValue narrow;
+    narrow.core  = TypeKind::BitInt;
+    narrow.value = BitIntValue::fromI64(5, 8, /*isSigned=*/true);
+    auto const rn = lowerOneAggGlobal(ti, ti.bitInt(8, /*isSigned=*/true),
+                                      std::move(narrow), kNatural16, DataModel::Lp64);
+    EXPECT_GE(rn.errors, 1u) << "a narrow _BitInt data-global must also fail loud";
+    EXPECT_NE(rn.messages.find("D-CSUBSET-BITINT-DATA-GLOBAL"), std::string::npos)
+        << "the narrow arm emits the SAME explicit deferral diagnostic";
 }
 
 // A CONST initialized global stays read-only `.rodata`. RED if the section

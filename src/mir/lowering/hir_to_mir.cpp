@@ -48,6 +48,13 @@ namespace {
             // const-eval engines collapse it to an integer before pooling); if one
             // did, the asm emitter's symbol-address arm would fail loud on symbol 0.
             dst.value = MirSymbolAddrValue{arm.base, arm.byteOffset};
+        } else if constexpr (std::is_same_v<T, BitIntValue>) {
+            // C4b (D-CSUBSET-BITINT-WIDE-LITERAL / I1+C2): the `_BitInt` bit-precise
+            // value is the SAME host type in both pools — copy it directly (NEVER
+            // degrade to monostate, which would silently drop the value). The narrow-
+            // literal MIR lowering extracts the container int from this arm; the
+            // wide path fills limbs; the globals emitter fails loud on it.
+            dst.value = arm;
         } else {
             dst.value = arm;
         }
@@ -84,6 +91,23 @@ struct Lowerer {
                                            // storage duration (TLS C1,
                                            // D-CSUBSET-THREAD-LOCAL). nullptr / no
                                            // entry ⇒ ordinary process-shared.
+    // VLA C1a/C3 (D-CSUBSET-VLA): optional — a block-scope variable-length array
+    // local's per-DIMENSION SIZE-expression HIR nodes (outer→inner order), keyed by
+    // SymbolId.v. nullptr / no entry ⇒ the local is not a VLA. Read in
+    // `vlaAllocaForLocal` to lower each runtime bound + form the cumulative row
+    // strides and the total byte size at the DECL point. A 1-D VLA has one entry.
+    std::unordered_map<std::uint32_t, std::vector<HirNodeId>> const* vlaSizeMap =
+        nullptr;
+    // VLA C2 (D-CSUBSET-VLA): a `sizeof <vla-object>` SizeOf HIR node id.v → the VLA
+    // operand's SymbolId.v. nullptr / no entry ⇒ a plain (static-fold) sizeof. Read in
+    // the MIR SizeOf case to emit a runtime Load of the decl-frozen size slot below.
+    std::unordered_map<std::uint32_t, std::uint32_t> const* sizeofVlaSymMap = nullptr;
+    // VLA C4b (D-CSUBSET-VLA): a VLA-typedef OBJECT's SymbolId.v → its typedef origin
+    // R's SymbolId.v. nullptr / no entry ⇒ not a VLA typedef. Read in `allocaForLocal`
+    // to route `R a;` to `vlaAllocaFromTypedef`, which copies R's decl-frozen size
+    // slots down (freeze-once) instead of re-lowering the bound.
+    std::unordered_map<std::uint32_t, std::uint32_t> const* typedefVlaOriginMap =
+        nullptr;
     MirBuilder               mir;
     // Extern symbols extracted during the pre-pass. Each extern's
     // SymbolId is also inserted into `functionSymbols` so a `Ref`
@@ -101,6 +125,19 @@ struct Lowerer {
     // `Ref` reads emit `Load(alloca)`; `AssignStmt` writes emit `Store(value,
     // alloca)`; `AddressOf(Ref(sym))` returns the alloca itself.
     std::unordered_map<std::uint32_t, MirInstId> addressableLocal;
+    // VLA C2/C3 (D-CSUBSET-VLA): within one function, a VLA object's per-LEVEL
+    // decl-frozen BYTE-size slots, keyed by `pack(SymbolId.v, TypeId.v)` where the
+    // TypeId is the level's SHAPE type (CRITICAL-1: keyed by the SUBSCRIPT-RESULT
+    // type, so each slot holds EXACTLY `sizeof(that type)` by construction). The
+    // whole-object entry is (sym, declaredType) = `sizeof a` (the C2 total); each
+    // intermediate VLA row is (sym, rowType) = the runtime stride an index steps by
+    // AND `sizeof a[0]`. Materialized once at the decl by `vlaAllocaForLocal`. The MIR
+    // SizeOf case Loads (sym, sized-type); `scaleIndexToBytes` Loads (root-sym,
+    // Index-result-type). Cleared per function. `pack` = (uint64(sym)<<32)|typeId.
+    std::unordered_map<std::uint64_t, MirInstId> vlaStrideSlot;
+    static std::uint64_t vlaSlotKey(std::uint32_t symV, std::uint32_t typeV) {
+        return (static_cast<std::uint64_t>(symV) << 32) | typeV;
+    }
     // FC7 (D-FC7-MEMBER-ACCESS): per-CU memoized struct/union layouts keyed
     // by TypeId.v. `computeLayout` is PURE and a TypeId's layout is
     // invariant within the CU (one interner + one target config), so this
@@ -174,8 +211,38 @@ struct Lowerer {
         // Used by `DoWhileStmt` to decide whether to lower the (otherwise
         // dead) condition block when the body self-sealed.
         bool       continueReferenced = false;
+        // VLA C5 (D-CSUBSET-VLA, audit fix #3): the `vlaScopeStack_.size()` captured
+        // when THIS loop/switch frame was pushed. A `break`/`continue` targeting this
+        // frame exits every VLA scope opened INSIDE it (indices >= this depth), so it
+        // restores SP to the entry watermark of `vlaScopeStack_[vlaDepthAtPush]` (the
+        // shallowest VLA scope strictly inside the target) — or nothing if the loop/
+        // switch declared no VLA (size == depth).
+        std::size_t vlaDepthAtPush = 0;
     };
     std::vector<BranchFrame> branchStack;
+
+    // VLA C5 (D-CSUBSET-VLA): the stack of currently-OPEN block-scope VLA
+    // watermarks, innermost on the back. One frame per dynamic-VLA VarDecl (the
+    // finer per-decl granularity that makes a backward `goto` between two VLAs
+    // correct). Pushed at the VarDecl (with `saveBefore` = the StackSave emitted
+    // just BEFORE the VLA's `sub sp`); popped when the declaring lexical block's
+    // lowering completes. Correlated with `branchStack` (break/continue) via
+    // `vlaDepthAtPush`, and walked for `goto` teardown via HIR ancestry. Reset per
+    // function. See the teardown helpers below.
+    struct VlaScopeFrame {
+        HirNodeId  declNode;    // the VLA VarDecl (textual-position anchor for goto)
+        HirNodeId  scopeNode;   // the enclosing lexical Block (== hir.parent(declNode))
+        MirInstId  saveBefore;  // the StackSave value (SP captured before this VLA)
+        std::uint32_t scopeId;  // the StackSave/StackRestore pairing payload
+    };
+    std::vector<VlaScopeFrame> vlaScopeStack_;
+    // VLA C5: per-function monotonic scopeId stamped on each StackSave/StackRestore
+    // (the verifier pairs Restore→Save on it). Reset per function.
+    std::uint32_t vlaScopeCounter_ = 0;
+    // VLA C5: per-function label-ordinal → LabelStmt HIR node, for resolving a
+    // `goto`'s target label to compute which VLA scopes the jump exits (the
+    // ancestry walk). Populated at function entry; reset per function.
+    std::unordered_map<std::uint32_t, HirNodeId> labelNodeByOrdinal_;
 
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the enclosing function's count of FIXED
     // (non-variadic) params that consumed an integer / SSE arg register. `va_start`
@@ -345,6 +412,26 @@ struct Lowerer {
     void unsupported(HirNodeId node, std::string what) {
         ParseDiagnostic d;
         d.code     = DiagnosticCode::H_UnsupportedLoweringForKind;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::move(what);
+        if (sourceMap != nullptr) {
+            if (auto const* loc = sourceMap->tryGet(node); loc != nullptr) {
+                d.buffer = loc->buffer;
+                d.span   = loc->span;
+            }
+        }
+        reporter.report(std::move(d));
+    }
+
+    // Emit a SPECIFIC-code positioned error from the MIR-lowering tier (the twin of
+    // `unsupported`, which uses the generic H_UnsupportedLoweringForKind). Used for the
+    // still-deferred wide-`_BitInt` gaps (e.g. S_BitIntWideFloatConvUnsupported,
+    // D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV) — a real, unsuppressable diagnostic, never a
+    // silent scalar op. (The C2 `* / %` boundary code S_BitIntWideMulDivUnsupported is
+    // retired as of C3 — those ops now lower to the multi-limb path.)
+    void diagnoseCode(HirNodeId node, DiagnosticCode code, std::string what) {
+        ParseDiagnostic d;
+        d.code     = code;
         d.severity = DiagnosticSeverity::Error;
         d.actual   = std::move(what);
         if (sourceMap != nullptr) {
@@ -533,6 +620,1073 @@ struct Lowerer {
         return MirOpcode::Invalid;
     }
 
+    // ── C23 _BitInt(N) codegen — the mod-2^N wrap (D-CSUBSET-BITINT) ──────────
+    //
+    // A `_BitInt(N≤64)` value lives in its native CONTAINER (I8/I16/I32/I64 by
+    // size + signedness — `reprKind` at the LIR tier); its arithmetic COMPUTES at a
+    // native ALU width B (32 for N≤32, 64 for N≤64) and MASKS the result back to
+    // exactly N bits, reusing the bit-field extract/insert shift+mask primitive
+    // (signed: Shl(B-N)+AShr(B-N); unsigned: And((1<<N)-1)). A SUB-32 container
+    // (N≤16) computes PROMOTED to I32 then Truncs back — the `emitBitfieldExtract`
+    // `promote = B0 < 32` precedent — so a `_BitInt(4)` never trips the sub-native
+    // ALU gate. N≥17's container IS the compute width, so it computes at the BitInt
+    // type directly (reprKind → I32/I64 passes the gate). Comparisons promote their
+    // operands and emit an ICmp at the compute width.
+
+    // The plain compute integer kind for a `_BitInt(N)`: I32/U32 (N≤32) or I64/U64
+    // (N≤64), by signedness. Where the ALU op + mask are computed for a sub-32
+    // container (N≤16); IS the container kind for N≥17.
+    [[nodiscard]] TypeKind bitIntComputeKind(TypeId bitIntTy) const {
+        std::int64_t const n = interner.bitIntWidth(bitIntTy);
+        bool const s = interner.bitIntIsSigned(bitIntTy);
+        if (n <= 32) return s ? TypeKind::I32 : TypeKind::U32;
+        return s ? TypeKind::I64 : TypeKind::U64;
+    }
+
+    // Materialize a `_BitInt(N)` operand at its compute width: a no-op for N≥17
+    // (the container IS the compute kind), else SExt/ZExt the sub-32 container up
+    // to I32/U32 (`mapCast(container, compute)`).
+    [[nodiscard]] MirInstId bitIntToCompute(MirInstId v, TypeId bitIntTy) {
+        TypeKind const container = interner.bitIntContainerKind(bitIntTy);
+        TypeKind const compute   = bitIntComputeKind(bitIntTy);
+        if (container == compute) return v;
+        std::array<MirInstId, 1> a{v};
+        return mir.addInst(mapCast(container, compute), a,
+                           interner.primitive(compute));
+    }
+
+    // Mask `raw` (typed `ty`, whose compute width is B bits) to the low N bits: the
+    // signed sign-extend (Shl(B-N) then arithmetic AShr(B-N)) or the unsigned
+    // zero-extend (And with (1<<N)-1). A no-op when N==B (a _BitInt(32)/_BitInt(64)
+    // whose native op already wraps at the full width). Reuses the bit-field
+    // primitive's exact shift+mask sequence.
+    [[nodiscard]] MirInstId
+    bitIntMask(MirInstId raw, std::int64_t n, bool signd, int B, TypeId ty) {
+        if (n >= B) return raw;
+        if (signd) {
+            MirInstId const s1 = constIntOfType(B - n, ty);
+            std::array<MirInstId, 2> a1{raw, s1};
+            MirInstId const shl = mir.addInst(MirOpcode::Shl, a1, ty);
+            MirInstId const s2 = constIntOfType(B - n, ty);
+            std::array<MirInstId, 2> a2{shl, s2};
+            return mir.addInst(MirOpcode::AShr, a2, ty);
+        }
+        std::uint64_t const mask = (n >= 64) ? ~0ull : ((1ull << n) - 1);
+        MirInstId const m = constIntOfType(static_cast<std::int64_t>(mask), ty);
+        std::array<MirInstId, 2> a{raw, m};
+        return mir.addInst(MirOpcode::And, a, ty);
+    }
+
+    // ★ CRIT-2 — the ONE by-construction WRAP CHOKEPOINT. Emit `op` over `operands`
+    // producing a `_BitInt(N)`-typed value, masked to N iff `needsMask`. Every
+    // producer of a BitInt value (Add/Sub/Mul/Neg/Shl + the compound-assign/++/--
+    // that desugar to them; the no-mask Div/Mod/And/Or/Xor/right-shift pass
+    // `needsMask=false`) routes through here. N≥17 computes at the BitInt type
+    // directly; N≤16 promotes to I32, computes, masks, and Truncs to the container.
+    [[nodiscard]] MirInstId
+    emitBitIntOp(MirOpcode op, std::span<MirInstId const> operands, TypeId bitIntTy,
+                 bool needsMask) {
+        std::int64_t const n = interner.bitIntWidth(bitIntTy);
+        bool const signd     = interner.bitIntIsSigned(bitIntTy);
+        bool const sub32     = n <= 16;   // container < 32 bits → promote to I32
+        int const B          = (n <= 32) ? 32 : 64;
+        if (!sub32) {
+            // Compute at the BitInt type (reprKind → I32/I64 → passes the ALU gate).
+            MirInstId const raw = mir.addInst(op, operands, bitIntTy);
+            if (!raw.valid()) return InvalidMirInst;
+            return needsMask ? bitIntMask(raw, n, signd, B, bitIntTy) : raw;
+        }
+        // Sub-32 container: promote operands to I32/U32, compute, mask, Trunc back.
+        TypeKind const compute   = bitIntComputeKind(bitIntTy);
+        TypeId   const computeTy = interner.primitive(compute);
+        TypeKind const container = interner.bitIntContainerKind(bitIntTy);
+        // A SHIFT's count (operand[1]) is NOT a `_BitInt` — it keeps its own integer
+        // type (C 6.5.7: a shift's operands are NOT converted to a common type). Only
+        // the shifted VALUE (operand[0]) promotes; the count passes through so a
+        // sub-32 `_BitInt(4) << n` never mis-widens `n` through the container decode.
+        bool const isShift = op == MirOpcode::Shl || op == MirOpcode::LShr
+                          || op == MirOpcode::AShr;
+        std::array<MirInstId, 2> promoted{};
+        for (std::size_t i = 0; i < operands.size() && i < 2; ++i)
+            promoted[i] = (isShift && i == 1)
+                              ? operands[i]
+                              : bitIntToCompute(operands[i], bitIntTy);
+        MirInstId raw = mir.addInst(
+            op, std::span<MirInstId const>{promoted.data(), operands.size()},
+            computeTy);
+        if (!raw.valid()) return InvalidMirInst;
+        if (needsMask) raw = bitIntMask(raw, n, signd, B, computeTy);
+        std::array<MirInstId, 1> ta{raw};
+        return mir.addInst(mapCast(compute, container), ta, bitIntTy);   // Trunc → N
+    }
+
+    // ★ CRIT-1 — a conversion TO `_BitInt(N)` masks UNCONDITIONALLY (incl. the
+    // same-container case: `int→_BitInt(17)` shares the i32 container, so a plain
+    // Bitcast would leave bits 17-31 DIRTY). `srcK` is the source's already-resolved
+    // plain integer kind (enum→underlying / BitInt→container / else its kind). Emits
+    // the container conversion (Trunc/SExt/ZExt/Bitcast) THEN the mask-to-N, then
+    // (sub-32) the Trunc to the container.
+    [[nodiscard]] MirInstId
+    emitCastToBitInt(MirInstId src, TypeKind srcK, TypeId bitIntTy) {
+        std::int64_t const n = interner.bitIntWidth(bitIntTy);
+        bool const signd     = interner.bitIntIsSigned(bitIntTy);
+        bool const sub32     = n <= 16;
+        int const B          = (n <= 32) ? 32 : 64;
+        TypeKind const compute   = bitIntComputeKind(bitIntTy);
+        TypeId   const computeTy = interner.primitive(compute);
+        TypeKind const container = interner.bitIntContainerKind(bitIntTy);
+        // 1. Convert the source to the compute kind (no-op when it already IS it).
+        MirInstId inCompute = src;
+        if (srcK != compute) {
+            MirOpcode const conv = mapCast(srcK, compute);
+            if (conv == MirOpcode::Invalid) return InvalidMirInst;
+            std::array<MirInstId, 1> ca{src};
+            inCompute = mir.addInst(conv, ca, computeTy);
+            if (!inCompute.valid()) return InvalidMirInst;
+        }
+        // 2. Mask to N (UNCONDITIONAL — the CRIT-1 dirty-bits fix), at compute width.
+        MirInstId const masked = bitIntMask(inCompute, n, signd, B, computeTy);
+        // 3. Re-type to the BitInt container: Trunc (sub-32) or a same-width Bitcast.
+        std::array<MirInstId, 1> ta{masked};
+        return mir.addInst(sub32 ? mapCast(compute, container) : MirOpcode::Bitcast,
+                           ta, bitIntTy);
+    }
+
+    // ══ C23 _BitInt(N>64) — the multi-limb (C2) codegen (D-CSUBSET-BITINT-C2-WIDE) ══
+    //
+    // A wide `_BitInt(N>64)` value is MEMORY-RESIDENT: ceil(N/64) little-endian 64-bit
+    // limbs (limb 0 = least significant) in an alloca — EXACTLY the by-value aggregate
+    // model. It has NO SSA register value; every consumer reaches it BY ADDRESS. Each
+    // wide OP works on limb ADDRESSES, computes limb-by-limb via a bounded RUNTIME loop
+    // over the (compile-time-known) limb count — ONE code shape for N = 65 … 8388608
+    // (the O(1)-code scalability mandate) — and a value-producing op ends by masking
+    // the TOP limb (`maskTopLimb`) to re-establish the clean-N invariant (the wide
+    // analog of C1's by-construction wrap chokepoint). The counter / carry / accumulator
+    // are small i64 alloca slots (the C-`for`-loop precedent; mem2reg promotes them in
+    // the release arm, the debug arm runs the memory loop correctly). NO source /
+    // target / format identity anywhere — the limb work is generic MIR (Add/Sub/And/…/
+    // Gep + Br/CondBr over the closed verb set), agnostic by construction.
+
+    // Signed native integer kind (the `mapCast` local `isSignedInt`, hoisted for the
+    // wide-op reuse). Char is signed on both shipped targets' data models.
+    [[nodiscard]] static bool isSignedIntKind(TypeKind k) noexcept {
+        return k == TypeKind::I8  || k == TypeKind::I16 || k == TypeKind::I32
+            || k == TypeKind::I64 || k == TypeKind::I128 || k == TypeKind::Char;
+    }
+
+    // A C floating type (the F-prefixed kinds). Used to fail loud on a float<->WIDE
+    // `_BitInt(N>64)` conversion (D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV): the multi-limb
+    // FP<->limbs path is a later cycle; the naive scalar path would drop the upper limbs.
+    [[nodiscard]] static bool isFloatingKind(TypeKind k) noexcept {
+        return k == TypeKind::F16 || k == TypeKind::F32
+            || k == TypeKind::F64 || k == TypeKind::F128;
+    }
+
+    // ceil(N/64) — the limb count of a wide `_BitInt(N)`.
+    [[nodiscard]] std::int64_t wideLimbCount(TypeId bitIntTy) const {
+        return (interner.bitIntWidth(bitIntTy) + 63) / 64;
+    }
+    [[nodiscard]] TypeId i64Ty()  { return interner.primitive(TypeKind::I64); }
+    [[nodiscard]] TypeId ptrI64() { return interner.pointer(i64Ty()); }
+    [[nodiscard]] MirInstId ci64(std::int64_t v) { return constIntOfType(v, i64Ty()); }
+    // A binary/unary i64 op (the workhorse limb emitter).
+    [[nodiscard]] MirInstId i64bin(MirOpcode op, MirInstId a, MirInstId b) {
+        std::array<MirInstId, 2> ops{a, b};
+        return mir.addInst(op, ops, i64Ty());
+    }
+    [[nodiscard]] MirInstId i64un(MirOpcode op, MirInstId a) {
+        std::array<MirInstId, 1> ops{a};
+        return mir.addInst(op, ops, i64Ty());
+    }
+    // &slot[limbIdx] (Ptr<I64>) for a COMPILE-TIME limb index.
+    [[nodiscard]] MirInstId limbAddrConst(MirInstId slot, std::int64_t limbIdx) {
+        std::array<MirInstId, 2> g{slot, ci64(limbIdx * 8)};
+        return mir.addInst(MirOpcode::Gep, g, ptrI64());
+    }
+    // &slot[idxVal] (Ptr<I64>) for a RUNTIME limb index (a loop counter value).
+    [[nodiscard]] MirInstId limbAddrRuntime(MirInstId slot, MirInstId idxVal) {
+        MirInstId const off = i64bin(MirOpcode::Mul, idxVal, ci64(8));
+        std::array<MirInstId, 2> g{slot, off};
+        return mir.addInst(MirOpcode::Gep, g, ptrI64());
+    }
+    [[nodiscard]] MirInstId loadLimb(MirInstId addr) {
+        std::array<MirInstId, 1> a{addr};
+        return mir.addInst(MirOpcode::Load, a, i64Ty());
+    }
+    void storeLimb(MirInstId value, MirInstId addr) {
+        std::array<MirInstId, 2> a{value, addr};
+        mir.addInst(MirOpcode::Store, a, InvalidType);
+    }
+    [[nodiscard]] MirInstId zextBoolToI64(MirInstId b) {
+        std::array<MirInstId, 1> a{b};
+        return mir.addInst(MirOpcode::ZExt, a, i64Ty());
+    }
+    // A limb comparison — result is Bool (NOT i64: `i64bin` would mis-type it and the
+    // ZExt would see an i64 source). `zextCmp` widens the Bool result to an i64 0/1.
+    [[nodiscard]] MirInstId icmp(MirOpcode op, MirInstId a, MirInstId b) {
+        std::array<MirInstId, 2> ops{a, b};
+        return mir.addInst(op, ops, interner.primitive(TypeKind::Bool));
+    }
+    [[nodiscard]] MirInstId zextCmp(MirOpcode op, MirInstId a, MirInstId b) {
+        return zextBoolToI64(icmp(op, a, b));
+    }
+
+    // The TOP-limb mask — the wide analog of C1's `bitIntMask`, applied to ONE limb.
+    // The highest limb keeps `hb = ((N-1)%64)+1` significant bits; the rest are 0
+    // (unsigned) or a sign-extension of bit hb-1 (signed). L1: at hb==64 (N a multiple
+    // of 64) the top limb is ALREADY full-width — a NO-OP (unsigned `(1<<64)-1` is UB;
+    // signed shift-by-0 is identity). Idempotent on an already-clean limb, so a
+    // producer may always end here. `slot` is the result's Ptr<BitInt(N)>.
+    [[nodiscard]] bool maskTopLimb(MirInstId slot, TypeId bitIntTy) {
+        std::int64_t const n  = interner.bitIntWidth(bitIntTy);
+        bool const signd      = interner.bitIntIsSigned(bitIntTy);
+        std::int64_t const hb = ((n - 1) % 64) + 1;   // significant bits in the top limb
+        if (hb == 64) return true;                      // L1: full limb — nothing to clear
+        MirInstId const topAddr = limbAddrConst(slot, wideLimbCount(bitIntTy) - 1);
+        MirInstId const top     = loadLimb(topAddr);
+        MirInstId masked;
+        if (signd) {
+            // Sign-extend bit hb-1 across [hb,64): Shl(64-hb) then arithmetic AShr(64-hb).
+            MirInstId const sh = ci64(64 - hb);
+            masked = i64bin(MirOpcode::AShr, i64bin(MirOpcode::Shl, top, sh), sh);
+        } else {
+            masked = i64bin(MirOpcode::And, top,
+                            ci64(static_cast<std::int64_t>((1ull << hb) - 1)));
+        }
+        if (!masked.valid()) return false;
+        storeLimb(masked, topAddr);
+        return true;
+    }
+
+    // Emit a bounded runtime loop `for (i64 i=0; i<count; ++i) body(i)` in the CURRENT
+    // block, leaving the loop-EXIT block open. `body(idxVal)` emits the per-iteration
+    // work (false ⇒ fail-loud already reported). ONE code shape for any count → O(1)
+    // MIR at any width. The counter is a small i64 slot (the C-`for` precedent).
+    template <class BodyFn>
+    [[nodiscard]] bool emitLimbLoop(std::int64_t count, BodyFn&& body) {
+        if (count <= 0) return true;   // no limbs — nothing to emit (defensive)
+        MirInstId const ctr = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
+        if (!ctr.valid()) return false;
+        storeLimb(ci64(0), ctr);
+        MirBlockId const header = mir.createBlock(StructCfMarker::LoopHeader);
+        MirBlockId const bodyBB = mir.createBlock(StructCfMarker::Linear);
+        MirBlockId const exitBB = mir.createBlock(StructCfMarker::LoopExit);
+        mir.addBr(header);
+        mir.beginBlock(header);
+        std::array<MirInstId, 2> c{loadLimb(ctr), ci64(count)};
+        MirInstId const cond =
+            mir.addInst(MirOpcode::ICmpSlt, c, interner.primitive(TypeKind::Bool));
+        if (!cond.valid()) {
+            sealCreatedAsUnreachable(bodyBB);
+            sealCreatedAsUnreachable(exitBB);
+            return false;
+        }
+        mir.addCondBr(cond, bodyBB, exitBB);
+        mir.beginBlock(bodyBB);
+        MirInstId const iv = loadLimb(ctr);
+        if (!body(iv)) {
+            if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+            sealCreatedAsUnreachable(exitBB);
+            return false;
+        }
+        storeLimb(i64bin(MirOpcode::Add, iv, ci64(1)), ctr);
+        mir.addBr(header);
+        mir.beginBlock(exitBB);
+        return true;
+    }
+
+    // The RUNTIME-count sibling of `emitLimbLoop`: `for (i64 i=0; i<countVal; ++i)
+    // body(i)` where `countVal` is an i64 SSA VALUE (not a compile-time constant). Same
+    // LoopHeader/Linear/LoopExit shape; the guard is `ICmpSlt(ctr, countVal)` so a
+    // count<=0 runs the body zero times (no compile-time special-case needed). Used by
+    // the wide-multiply inner loop whose bound `limbCount - i` is only known at run time.
+    // `countVal` must dominate the header (it does: the caller computes it in the
+    // enclosing block, and it is loop-invariant across the back-edge).
+    template <class BodyFn>
+    [[nodiscard]] bool emitLimbLoopN(MirInstId countVal, BodyFn&& body) {
+        if (!countVal.valid()) return false;
+        MirInstId const ctr = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
+        if (!ctr.valid()) return false;
+        storeLimb(ci64(0), ctr);
+        MirBlockId const header = mir.createBlock(StructCfMarker::LoopHeader);
+        MirBlockId const bodyBB = mir.createBlock(StructCfMarker::Linear);
+        MirBlockId const exitBB = mir.createBlock(StructCfMarker::LoopExit);
+        mir.addBr(header);
+        mir.beginBlock(header);
+        std::array<MirInstId, 2> c{loadLimb(ctr), countVal};
+        MirInstId const cond =
+            mir.addInst(MirOpcode::ICmpSlt, c, interner.primitive(TypeKind::Bool));
+        if (!cond.valid()) {
+            sealCreatedAsUnreachable(bodyBB);
+            sealCreatedAsUnreachable(exitBB);
+            return false;
+        }
+        mir.addCondBr(cond, bodyBB, exitBB);
+        mir.beginBlock(bodyBB);
+        MirInstId const iv = loadLimb(ctr);
+        if (!body(iv)) {
+            if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+            sealCreatedAsUnreachable(exitBB);
+            return false;
+        }
+        storeLimb(i64bin(MirOpcode::Add, iv, ci64(1)), ctr);
+        mir.addBr(header);
+        mir.beginBlock(exitBB);
+        return true;
+    }
+
+    // dst[i] = a[i] <op> b[i], limb-parallel (& | ^). NO mask — a bitwise op of two
+    // clean-N operands yields a clean-N result (the high bits are a uniform function
+    // of the two sign/zero fills, i.e. the result's own fill).
+    [[nodiscard]] bool emitWideBitwise(MirOpcode op, MirInstId dst, MirInstId aAddr,
+                                       MirInstId bAddr, TypeId bitIntTy) {
+        return emitLimbLoop(wideLimbCount(bitIntTy), [&](MirInstId i) {
+            MirInstId const av = loadLimb(limbAddrRuntime(aAddr, i));
+            MirInstId const bv = loadLimb(limbAddrRuntime(bAddr, i));
+            MirInstId const r  = i64bin(op, av, bv);
+            if (!r.valid()) return false;
+            storeLimb(r, limbAddrRuntime(dst, i));
+            return true;
+        });
+    }
+
+    // dst[i] = ~a[i], then mask the top limb (unsigned: ~ dirties bits ≥N → must clear;
+    // signed: the ~sign fill IS the new sign — the mask is a no-op belt).
+    [[nodiscard]] bool emitWideNot(MirInstId dst, MirInstId aAddr, TypeId bitIntTy) {
+        bool const ok = emitLimbLoop(wideLimbCount(bitIntTy), [&](MirInstId i) {
+            MirInstId const r = i64un(MirOpcode::Not, loadLimb(limbAddrRuntime(aAddr, i)));
+            if (!r.valid()) return false;
+            storeLimb(r, limbAddrRuntime(dst, i));
+            return true;
+        });
+        return ok && maskTopLimb(dst, bitIntTy);
+    }
+
+    // dst = a ± b, a carry (add) / borrow (sub) chain — MIR has no ADC/SBB, so the
+    // carry is `(sum < operand)` (generic). Per limb: `s=a±b; c1=carry(s,a); s±=cin;
+    // c2=carry(s,cin); dst=s; cin=c1|c2`. The carry rides an i64 slot across iterations.
+    // Top-limb mask after (a ± can overflow bit N).
+    [[nodiscard]] bool emitWideAddSub(bool isSub, MirInstId dst, MirInstId aAddr,
+                                      MirInstId bAddr, TypeId bitIntTy) {
+        MirInstId const carry = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
+        if (!carry.valid()) return false;
+        storeLimb(ci64(0), carry);
+        bool const ok = emitLimbLoop(wideLimbCount(bitIntTy), [&](MirInstId i) {
+            MirInstId const av  = loadLimb(limbAddrRuntime(aAddr, i));
+            MirInstId const bv  = loadLimb(limbAddrRuntime(bAddr, i));
+            MirInstId const cin = loadLimb(carry);
+            MirInstId s, c1, c2;
+            if (isSub) {
+                s  = i64bin(MirOpcode::Sub, av, bv);
+                c1 = zextCmp(MirOpcode::ICmpUlt, av, bv);   // a<b ⇒ borrow
+                MirInstId const s2 = i64bin(MirOpcode::Sub, s, cin);
+                c2 = zextCmp(MirOpcode::ICmpUlt, s, cin);   // s<cin ⇒ borrow
+                s  = s2;
+            } else {
+                s  = i64bin(MirOpcode::Add, av, bv);
+                c1 = zextCmp(MirOpcode::ICmpUlt, s, av);    // sum<a ⇒ carry
+                MirInstId const s2 = i64bin(MirOpcode::Add, s, cin);
+                c2 = zextCmp(MirOpcode::ICmpUlt, s2, cin);  // s2<cin ⇒ carry
+                s  = s2;
+            }
+            if (!s.valid() || !c1.valid() || !c2.valid()) return false;
+            storeLimb(s, limbAddrRuntime(dst, i));
+            storeLimb(i64bin(MirOpcode::Or, c1, c2), carry);
+            return true;
+        });
+        return ok && maskTopLimb(dst, bitIntTy);
+    }
+
+    // dst = -a, computed as `0 - a` with a borrow chain (minuend limbs are constant 0).
+    // Per limb: `d = 0 - a[i] = Neg(a[i]); b1 = (a[i]!=0); d2 = d - borrow;
+    // b2 = (d<borrow); dst=d2; borrow = b1|b2`. Top-limb mask after.
+    [[nodiscard]] bool emitWideNeg(MirInstId dst, MirInstId aAddr, TypeId bitIntTy) {
+        MirInstId const borrow = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
+        if (!borrow.valid()) return false;
+        storeLimb(ci64(0), borrow);
+        bool const ok = emitLimbLoop(wideLimbCount(bitIntTy), [&](MirInstId i) {
+            MirInstId const av  = loadLimb(limbAddrRuntime(aAddr, i));
+            MirInstId const bin = loadLimb(borrow);
+            MirInstId const d   = i64un(MirOpcode::Neg, av);                 // 0 - a[i]
+            MirInstId const b1  = zextCmp(MirOpcode::ICmpNe, av, ci64(0));
+            MirInstId const d2  = i64bin(MirOpcode::Sub, d, bin);
+            MirInstId const b2  = zextCmp(MirOpcode::ICmpUlt, d, bin);
+            if (!d2.valid() || !b1.valid() || !b2.valid()) return false;
+            storeLimb(d2, limbAddrRuntime(dst, i));
+            storeLimb(i64bin(MirOpcode::Or, b1, b2), borrow);
+            return true;
+        });
+        return ok && maskTopLimb(dst, bitIntTy);
+    }
+
+    // Load src[idxVal] (i64) when idxVal ∈ [0,limbCount); else `fillVal`. Branchless:
+    // clamp the index for the LOAD (so no OOB memory access) then select via a 0/~0
+    // mask. Used by the shift's cross-limb reads (a source limb below 0 / at-or-above
+    // the top is out of range).
+    [[nodiscard]] MirInstId loadLimbOrFill(MirInstId src, MirInstId idxVal,
+                                           std::int64_t limbCount, MirInstId fillVal) {
+        TypeId const boolTy = interner.primitive(TypeKind::Bool);
+        std::array<MirInstId, 2> ge{idxVal, ci64(0)};
+        MirInstId const geB = mir.addInst(MirOpcode::ICmpSge, ge, boolTy);
+        std::array<MirInstId, 2> lt{idxVal, ci64(limbCount)};
+        MirInstId const ltB = mir.addInst(MirOpcode::ICmpSlt, lt, boolTy);
+        MirInstId const inRange =
+            i64bin(MirOpcode::And, zextBoolToI64(geB), zextBoolToI64(ltB));   // 0/1
+        MirInstId const clamped = i64bin(MirOpcode::Mul, idxVal, inRange);    // in-range idx
+        MirInstId const loaded  = loadLimb(limbAddrRuntime(src, clamped));
+        MirInstId const mask    = i64un(MirOpcode::Neg, inRange);             // 0 or ~0
+        MirInstId const keep    = i64bin(MirOpcode::And, loaded, mask);
+        MirInstId const fill    = i64bin(MirOpcode::And, fillVal,
+                                         i64un(MirOpcode::Not, mask));
+        return i64bin(MirOpcode::Or, keep, fill);
+    }
+
+    // Wide shift `a << k` / `a >> k` (k a RUNTIME count value, already widened to i64).
+    // wordShift=k/64, bitShift=k%64. Each dst limb combines two source limbs; the
+    // `x >> (64-bitShift)` / `x << (64-bitShift)` sub-shift is `(x >> (63-bitShift))>>1`
+    // / `(x << (63-bitShift))<<1` so bitShift==0 is well-defined (no UB `<<64`). `>>`
+    // is arithmetic (sign fill) for a signed type, logical for unsigned. A left shift
+    // masks the top limb after (it can push bits past N). `isArith` = signed `>>`.
+    [[nodiscard]] bool emitWideShift(bool isLeft, bool isArith, MirInstId dst,
+                                     MirInstId aAddr, MirInstId kI64, TypeId bitIntTy) {
+        std::int64_t const limbCount = wideLimbCount(bitIntTy);
+        MirInstId const wordShift = i64bin(MirOpcode::LShr, kI64, ci64(6));   // k / 64
+        MirInstId const bitShift  = i64bin(MirOpcode::And,  kI64, ci64(63));  // k % 64
+        MirInstId const sh63      = i64bin(MirOpcode::Sub,  ci64(63), bitShift);
+        // Right-shift fill for a source limb at/above the top: sign fill (arith) or 0.
+        MirInstId fill = ci64(0);
+        if (isArith)
+            fill = i64bin(MirOpcode::AShr,
+                          loadLimb(limbAddrConst(aAddr, limbCount - 1)), ci64(63));
+        return emitLimbLoop(limbCount, [&](MirInstId j) {
+            MirInstId lo, hi;
+            if (isLeft) {
+                // dst[j] = (a[j-word] << bit) | (a[j-word-1] >> (64-bit))
+                MirInstId const hiIdx = i64bin(MirOpcode::Sub, j, wordShift);
+                MirInstId const loIdx = i64bin(MirOpcode::Sub, hiIdx, ci64(1));
+                MirInstId const hs = loadLimbOrFill(aAddr, hiIdx, limbCount, ci64(0));
+                MirInstId const ls = loadLimbOrFill(aAddr, loIdx, limbCount, ci64(0));
+                lo = i64bin(MirOpcode::Shl, hs, bitShift);
+                hi = i64bin(MirOpcode::LShr, i64bin(MirOpcode::LShr, ls, sh63), ci64(1));
+            } else {
+                // dst[j] = (a[j+word] >> bit) | (a[j+word+1] << (64-bit))
+                MirInstId const loIdx = i64bin(MirOpcode::Add, j, wordShift);
+                MirInstId const hiIdx = i64bin(MirOpcode::Add, loIdx, ci64(1));
+                MirInstId const ls = loadLimbOrFill(aAddr, loIdx, limbCount, fill);
+                MirInstId const hs = loadLimbOrFill(aAddr, hiIdx, limbCount, fill);
+                lo = i64bin(MirOpcode::LShr, ls, bitShift);
+                hi = i64bin(MirOpcode::Shl, i64bin(MirOpcode::Shl, hs, sh63), ci64(1));
+            }
+            MirInstId const r = i64bin(MirOpcode::Or, lo, hi);
+            if (!r.valid()) return false;
+            storeLimb(r, limbAddrRuntime(dst, j));
+            return true;
+        }) && (!isLeft || maskTopLimb(dst, bitIntTy));
+    }
+
+    // int/enum/narrow-container scalar → wide `_BitInt`. Write the (sign/zero-extended)
+    // source into limb 0, fill the higher limbs with the source's sign fill (signed
+    // negative → ~0, else 0), mask the top limb. `srcVal` is a scalar MirInstId; its
+    // SIGNEDNESS drives the extension (a signed source sign-extends into the wide value).
+    [[nodiscard]] bool emitWideFromScalar(MirInstId dst, MirInstId srcVal,
+                                          TypeKind srcKind, TypeId bitIntTy) {
+        bool const srcSigned = isSignedIntKind(srcKind);
+        // Widen the source to i64 (SExt signed / ZExt unsigned; a no-op if already 64).
+        MirInstId src64 = srcVal;
+        if (srcKind != TypeKind::I64 && srcKind != TypeKind::U64) {
+            MirOpcode const conv = mapCast(srcKind, srcSigned ? TypeKind::I64 : TypeKind::U64);
+            if (conv == MirOpcode::Invalid) return false;
+            std::array<MirInstId, 1> a{srcVal};
+            src64 = mir.addInst(conv, a, i64Ty());
+            if (!src64.valid()) return false;
+        }
+        storeLimb(src64, limbAddrConst(dst, 0));
+        // Higher limbs: sign fill (arith shift of the source) for signed, else 0.
+        MirInstId const fill =
+            srcSigned ? i64bin(MirOpcode::AShr, src64, ci64(63)) : ci64(0);
+        std::int64_t const limbCount = wideLimbCount(bitIntTy);
+        for (std::int64_t li = 1; li < limbCount; ++li)
+            storeLimb(fill, limbAddrConst(dst, li));
+        return maskTopLimb(dst, bitIntTy);
+    }
+
+    // wide `_BitInt` → wide `_BitInt` (different N). Copy min(src,dst) limbs, fill the
+    // rest with the SOURCE's sign fill (signed → sign of its top limb, else 0), mask
+    // the DEST top limb. Handles both widening and narrowing.
+    [[nodiscard]] bool emitWideFromWide(MirInstId dst, MirInstId srcAddr,
+                                        TypeId srcTy, TypeId dstTy) {
+        std::int64_t const srcLimbs = wideLimbCount(srcTy);
+        std::int64_t const dstLimbs = wideLimbCount(dstTy);
+        std::int64_t const common   = std::min(srcLimbs, dstLimbs);
+        MirInstId const fill = interner.bitIntIsSigned(srcTy)
+            ? i64bin(MirOpcode::AShr, loadLimb(limbAddrConst(srcAddr, srcLimbs - 1)), ci64(63))
+            : ci64(0);
+        for (std::int64_t li = 0; li < common; ++li)
+            storeLimb(loadLimb(limbAddrConst(srcAddr, li)), limbAddrConst(dst, li));
+        for (std::int64_t li = common; li < dstLimbs; ++li)
+            storeLimb(fill, limbAddrConst(dst, li));
+        return maskTopLimb(dst, dstTy);
+    }
+
+    // wide `_BitInt` → a scalar VALUE: the low bits truncated to `targetKind` (C
+    // 6.3.1.3). Read limb 0 and convert (Trunc/Bitcast). Returns the scalar MirInstId.
+    [[nodiscard]] MirInstId emitScalarFromWide(MirInstId srcAddr, TypeKind targetKind) {
+        MirInstId const limb0 = loadLimb(limbAddrConst(srcAddr, 0));   // I64
+        if (targetKind == TypeKind::I64) return limb0;
+        // Every other target (incl. U64 → a same-width Bitcast so the RESULT value's
+        // type matches the cast's declared kind) routes through the container mapCast.
+        MirOpcode const conv = mapCast(TypeKind::I64, targetKind);
+        if (conv == MirOpcode::Invalid) return InvalidMirInst;
+        std::array<MirInstId, 1> a{limb0};
+        return mir.addInst(conv, a, interner.primitive(targetKind));
+    }
+
+    // wide `_BitInt` → Bool: `(OR of all limbs) != 0` (a nonzero-test, e.g. an if-cond
+    // or a `(_Bool)` cast) or `== 0` (a logical `!`). Returns the Bool MirInstId.
+    [[nodiscard]] MirInstId emitBoolFromWide(MirInstId srcAddr, TypeId bitIntTy,
+                                             bool zeroIsTrue) {
+        MirInstId const acc = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
+        if (!acc.valid()) return InvalidMirInst;
+        storeLimb(ci64(0), acc);
+        if (!emitLimbLoop(wideLimbCount(bitIntTy), [&](MirInstId i) {
+                MirInstId const v = loadLimb(limbAddrRuntime(srcAddr, i));
+                storeLimb(i64bin(MirOpcode::Or, loadLimb(acc), v), acc);
+                return true;
+            }))
+            return InvalidMirInst;
+        std::array<MirInstId, 2> c{loadLimb(acc), ci64(0)};
+        return mir.addInst(zeroIsTrue ? MirOpcode::ICmpEq : MirOpcode::ICmpNe, c,
+                           interner.primitive(TypeKind::Bool));
+    }
+
+    // wide == / != : `(OR of per-limb XORs) == 0` (equal) / `!= 0` (differ). No order.
+    [[nodiscard]] MirInstId emitWideEq(bool isNe, MirInstId aAddr, MirInstId bAddr,
+                                       TypeId bitIntTy) {
+        MirInstId const acc = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
+        if (!acc.valid()) return InvalidMirInst;
+        storeLimb(ci64(0), acc);
+        if (!emitLimbLoop(wideLimbCount(bitIntTy), [&](MirInstId i) {
+                MirInstId const av = loadLimb(limbAddrRuntime(aAddr, i));
+                MirInstId const bv = loadLimb(limbAddrRuntime(bAddr, i));
+                MirInstId const x  = i64bin(MirOpcode::Xor, av, bv);
+                storeLimb(i64bin(MirOpcode::Or, loadLimb(acc), x), acc);
+                return true;
+            }))
+            return InvalidMirInst;
+        std::array<MirInstId, 2> c{loadLimb(acc), ci64(0)};
+        return mir.addInst(isNe ? MirOpcode::ICmpNe : MirOpcode::ICmpEq, c,
+                           interner.primitive(TypeKind::Bool));
+    }
+
+    // wide ordered compare `< <= > >=`. MS-limb decides: scan the LOWER limbs LS→MS
+    // (a more-significant differing limb OVERWRITES a less-significant one) UNSIGNED,
+    // then the TOP limb (SIGNED for a signed type, unsigned otherwise) overwrites all.
+    // Accumulate `lt`/`gt` (i64 0/1) in slots; the operator result is lt / gt / !gt /
+    // !lt. Branchless select `x = differ ? cur : prev` = `cur | (keep & prev)`,
+    // keep = !differ (cur is 0 when equal, so an OR-combine is exact).
+    [[nodiscard]] MirInstId emitWideOrder(HirOpKind op, MirInstId aAddr, MirInstId bAddr,
+                                          TypeId bitIntTy) {
+        bool const signd = interner.bitIntIsSigned(bitIntTy);
+        std::int64_t const limbCount = wideLimbCount(bitIntTy);
+        MirInstId const ltS = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
+        MirInstId const gtS = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
+        if (!ltS.valid() || !gtS.valid()) return InvalidMirInst;
+        storeLimb(ci64(0), ltS);
+        storeLimb(ci64(0), gtS);
+        // The lower limbs (0 .. limbCount-2), UNSIGNED, LS→MS (later = more significant
+        // → its result overwrites). Skipped when limbCount==1 (no lower limbs).
+        if (!emitLimbLoop(limbCount - 1, [&](MirInstId i) {
+                MirInstId const av  = loadLimb(limbAddrRuntime(aAddr, i));
+                MirInstId const bv  = loadLimb(limbAddrRuntime(bAddr, i));
+                MirInstId const lti = zextCmp(MirOpcode::ICmpUlt, av, bv);
+                MirInstId const gti = zextCmp(MirOpcode::ICmpUgt, av, bv);
+                MirInstId const keep =
+                    i64un(MirOpcode::Not, i64bin(MirOpcode::Or, lti, gti));   // ~differ
+                storeLimb(i64bin(MirOpcode::Or, lti,
+                                 i64bin(MirOpcode::And, keep, loadLimb(ltS))), ltS);
+                storeLimb(i64bin(MirOpcode::Or, gti,
+                                 i64bin(MirOpcode::And, keep, loadLimb(gtS))), gtS);
+                return true;
+            }))
+            return InvalidMirInst;
+        // The TOP limb (signed compare for a signed type) overwrites all lower limbs.
+        MirInstId const at = loadLimb(limbAddrConst(aAddr, limbCount - 1));
+        MirInstId const bt = loadLimb(limbAddrConst(bAddr, limbCount - 1));
+        MirInstId const ltT =
+            zextCmp(signd ? MirOpcode::ICmpSlt : MirOpcode::ICmpUlt, at, bt);
+        MirInstId const gtT =
+            zextCmp(signd ? MirOpcode::ICmpSgt : MirOpcode::ICmpUgt, at, bt);
+        MirInstId const keepT =
+            i64un(MirOpcode::Not, i64bin(MirOpcode::Or, ltT, gtT));
+        MirInstId const lt = i64bin(MirOpcode::Or, ltT,
+                                    i64bin(MirOpcode::And, keepT, loadLimb(ltS)));
+        MirInstId const gt = i64bin(MirOpcode::Or, gtT,
+                                    i64bin(MirOpcode::And, keepT, loadLimb(gtS)));
+        // Operator result (Bool): < → lt!=0 ; > → gt!=0 ; <= → gt==0 ; >= → lt==0.
+        TypeId const boolTy = interner.primitive(TypeKind::Bool);
+        MirInstId sel; MirOpcode cmp;
+        switch (op) {
+            case HirOpKind::Lt: sel = lt; cmp = MirOpcode::ICmpNe; break;
+            case HirOpKind::Gt: sel = gt; cmp = MirOpcode::ICmpNe; break;
+            case HirOpKind::Le: sel = gt; cmp = MirOpcode::ICmpEq; break;
+            case HirOpKind::Ge: sel = lt; cmp = MirOpcode::ICmpEq; break;
+            default: return InvalidMirInst;
+        }
+        std::array<MirInstId, 2> c{sel, ci64(0)};
+        return mir.addInst(cmp, c, boolTy);
+    }
+
+    // ══ C23 _BitInt(N>64) — the multi-limb HARD arithmetic (C3, D-CSUBSET-BITINT-C3-
+    // MULDIV): `*` schoolbook via UMulH, `/`·`%` binary long division. Builds ENTIRELY
+    // on the C2 substrate + the small limb helpers below. Sign handling: multiply's low
+    // N bits are two's-complement sign-AGNOSTIC (one path, signedness enters only at the
+    // final maskTopLimb); divide operates on magnitudes with a C99 trunc-toward-zero sign
+    // fixup. Fully agnostic generic MIR — no source/target/format identity. ══
+
+    // dst[i] = 0 for all limbs (a RUNTIME loop — O(1) code at any width; freshAggregate-
+    // Temp allocas are NOT zero-initialized).
+    [[nodiscard]] bool zeroWide(MirInstId dst, std::int64_t limbCount) {
+        return emitLimbLoop(limbCount, [&](MirInstId i) {
+            storeLimb(ci64(0), limbAddrRuntime(dst, i));
+            return true;
+        });
+    }
+    // dst[i] = src[i] for all limbs (limb-wise copy; src/dst distinct).
+    [[nodiscard]] bool copyWide(MirInstId dst, MirInstId src, std::int64_t limbCount) {
+        return emitLimbLoop(limbCount, [&](MirInstId i) {
+            storeLimb(loadLimb(limbAddrRuntime(src, i)), limbAddrRuntime(dst, i));
+            return true;
+        });
+    }
+    // Bit N-1 (the sign bit) of the wide value at `addr`, as an i64 0/1. N-1 is a
+    // COMPILE-TIME position → a const limb index + shift.
+    [[nodiscard]] MirInstId signBitI64(MirInstId addr, TypeId bitIntTy) {
+        std::int64_t const n = interner.bitIntWidth(bitIntTy);
+        MirInstId const top = loadLimb(limbAddrConst(addr, (n - 1) / 64));
+        return i64bin(MirOpcode::And,
+                      i64bin(MirOpcode::LShr, top, ci64((n - 1) % 64)), ci64(1));
+    }
+
+    // dst = `signBit ? (-src mod 2^N) : src`, BRANCHLESS (a 0/~0 select mask). Used for
+    // the divide's operand magnitudes and its result sign-fixup. `emitWideNeg` masks the
+    // scratch to `uType`; the caller re-masks dst to the SIGNED result type afterwards
+    // when it wants sign-extension. src/dst/scratch are distinct slots. `signBit` is an
+    // i64 0/1.
+    [[nodiscard]] bool emitWideCondNeg(MirInstId dst, MirInstId srcAddr,
+                                       MirInstId signBit, TypeId uType) {
+        std::int64_t const limbCount = wideLimbCount(uType);
+        MirInstId const scratch = freshAggregateTemp(uType);
+        if (!scratch.valid()) return false;
+        if (!emitWideNeg(scratch, srcAddr, uType)) return false;   // scratch = -src mod 2^N
+        MirInstId const mask = i64un(MirOpcode::Neg, signBit);      // 0 or ~0
+        MirInstId const notMask = i64un(MirOpcode::Not, mask);
+        return emitLimbLoop(limbCount, [&](MirInstId i) {
+            MirInstId const ni = loadLimb(limbAddrRuntime(scratch, i));
+            MirInstId const si = loadLimb(limbAddrRuntime(srcAddr, i));
+            MirInstId const sel = i64bin(MirOpcode::Or,
+                                         i64bin(MirOpcode::And, ni, mask),
+                                         i64bin(MirOpcode::And, si, notMask));
+            if (!sel.valid()) return false;
+            storeLimb(sel, limbAddrRuntime(dst, i));
+            return true;
+        });
+    }
+
+    // IN-PLACE `slot = (slot << 1) | carryIn0` over `limbCount` limbs (the divide's
+    // per-bit shift, with the next dividend bit injected at position 0). In-place-safe:
+    // each iteration reads then writes ONLY limb i and threads the shifted-out top bit
+    // forward through a scalar carry slot (unlike the cross-limb `emitWideShift`, which
+    // is NOT in-place-safe and masks away the bit that long division must inspect). The
+    // top limb's final carry-out is DROPPED; by the divide's loop invariant (rem <
+    // divisor ≤ 2^N-1 entering each shift), the shifted-out bit is provably 0, so nothing
+    // is lost (the caller then maskTopLimbs the result to the N-bit window).
+    [[nodiscard]] bool emitWideShl1InPlace(MirInstId slot, MirInstId carryIn0,
+                                           std::int64_t limbCount) {
+        MirInstId const carry = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
+        if (!carry.valid()) return false;
+        storeLimb(carryIn0, carry);
+        return emitLimbLoop(limbCount, [&](MirInstId i) {
+            MirInstId const v    = loadLimb(limbAddrRuntime(slot, i));
+            MirInstId const cin  = loadLimb(carry);
+            MirInstId const newv = i64bin(MirOpcode::Or,
+                                          i64bin(MirOpcode::Shl, v, ci64(1)), cin);
+            MirInstId const cout = i64bin(MirOpcode::LShr, v, ci64(63)); // bit leaving limb i
+            if (!newv.valid() || !cout.valid()) return false;
+            storeLimb(newv, limbAddrRuntime(slot, i));
+            storeLimb(cout, carry);
+            return true;
+        });
+    }
+
+    // dst = (a * b) mod 2^N — schoolbook multiply of the LOW `limbCount` limbs via the
+    // 64×64→128 UMulH primitive. The low N bits are two's-complement sign-agnostic, so
+    // this ONE path serves signed AND unsigned; signedness enters only via the final
+    // maskTopLimb. dst must be DISTINCT from a/b (it is a freshAggregateTemp). Products
+    // a[i]*b[j] with i+j >= limbCount contribute only to bits >= limbCount*64 → dropped
+    // (they wrap away mod 2^N); the inner bound is therefore `limbCount - i` (runtime).
+    [[nodiscard]] bool emitWideMul(MirInstId dst, MirInstId aAddr, MirInstId bAddr,
+                                   TypeId bitIntTy) {
+        std::int64_t const limbCount = wideLimbCount(bitIntTy);
+        if (!zeroWide(dst, limbCount)) return false;
+        MirInstId const carry = mir.addInst(MirOpcode::Alloca, {}, ptrI64(), 0);
+        if (!carry.valid()) return false;
+        bool const ok = emitLimbLoop(limbCount, [&](MirInstId i) {   // outer: a[i]
+            storeLimb(ci64(0), carry);                               // carry := 0 per i
+            MirInstId const ai = loadLimb(limbAddrRuntime(aAddr, i));
+            MirInstId const innerCount = i64bin(MirOpcode::Sub, ci64(limbCount), i);
+            return emitLimbLoopN(innerCount, [&](MirInstId j) {      // inner: b[j], j<limbCount-i
+                MirInstId const bj = loadLimb(limbAddrRuntime(bAddr, j));
+                MirInstId const lo = i64bin(MirOpcode::Mul,   ai, bj);
+                MirInstId const hi = i64bin(MirOpcode::UMulH, ai, bj);   // high 64 of a[i]*b[j]
+                MirInstId const dAddr = limbAddrRuntime(dst, i64bin(MirOpcode::Add, i, j));
+                MirInstId const dij = loadLimb(dAddr);
+                MirInstId const cin = loadLimb(carry);
+                MirInstId const s1 = i64bin(MirOpcode::Add, dij, lo);
+                MirInstId const c1 = zextCmp(MirOpcode::ICmpUlt, s1, lo);  // s1<lo ⇒ carry
+                MirInstId const s2 = i64bin(MirOpcode::Add, s1, cin);
+                MirInstId const c2 = zextCmp(MirOpcode::ICmpUlt, s2, cin); // s2<cin ⇒ carry
+                // ★ CRIT-A: the column carry-out is `hi + c1 + c2` via INTEGER Add —
+                // NEVER Or(c1,c2). A multiply column can carry out 2 (c1+c2==2); OR would
+                // silently drop 2^64. Fits u64 by the aggregate invariant
+                // dst+a·b+carry ≤ (B-1)+(B-1)²+(B-1) = B²-1 ⟹ new carry ≤ B-1.
+                MirInstId const newCarry =
+                    i64bin(MirOpcode::Add, i64bin(MirOpcode::Add, hi, c1), c2);
+                if (!s2.valid() || !newCarry.valid()) return false;
+                storeLimb(s2, dAddr);
+                storeLimb(newCarry, carry);
+                return true;
+            });
+        });
+        return ok && maskTopLimb(dst, bitIntTy);
+    }
+
+    // dst = a / b (wantRem=false) or a % b (wantRem=true), bit-precise wrap. Binary long
+    // division of the operand MAGNITUDES (unsigned) with a C99 trunc-toward-zero sign
+    // fixup. ★ CRIT-B: every magnitude/rem/quotient temp is driven by an UNSIGNED
+    // `_BitInt(N)` type — the reused helpers bake signedness into their tail (emitWideNeg
+    // sign-extends, emitWideOrder's top-limb compare goes signed), which would corrupt a
+    // magnitude ≥ 2^(N-1); under the unsigned type they are correct and every internal
+    // maskTopLimb stays a no-op. Only the FINAL sign fixup + mask use the SIGNED type.
+    // Div-by-zero → a hard trap (Unreachable ⇒ ud2 / BRK #0), narrow-idiv #DE parity.
+    [[nodiscard]] bool emitWideDivMod(MirInstId dst, MirInstId aAddr, MirInstId bAddr,
+                                      TypeId resultTy, bool wantRem) {
+        std::int64_t const n = interner.bitIntWidth(resultTy);
+        std::int64_t const limbCount = wideLimbCount(resultTy);
+        bool const signd = interner.bitIntIsSigned(resultTy);
+        TypeId const uType = interner.bitInt(n, /*isSigned=*/false);   // CRIT-B
+
+        // ── divide-by-zero → hard trap (narrow idiv #DE / SIGFPE parity) ──
+        MirInstId const isZero = emitBoolFromWide(bAddr, resultTy, /*zeroIsTrue=*/true);
+        if (!isZero.valid()) return false;
+        MirBlockId const trapBB = mir.createBlock(StructCfMarker::IfThen);
+        MirBlockId const okBB   = mir.createBlock(StructCfMarker::IfElse);
+        mir.addCondBr(isZero, trapBB, okBB);
+        mir.beginBlock(trapBB);
+        mir.addUnreachable();   // ud2 (x86_64) / BRK #0 (arm64) — a real hardware fault
+        mir.beginBlock(okBB);
+
+        // ── operand magnitudes (signed: |a|,|b| in unsigned temps; unsigned: direct) ──
+        MirInstId divA = aAddr, divB = bAddr;
+        MirInstId sa = InvalidMirInst, sb = InvalidMirInst;
+        if (signd) {
+            MirInstId const ua = freshAggregateTemp(uType);
+            MirInstId const ub = freshAggregateTemp(uType);
+            if (!ua.valid() || !ub.valid()) return false;
+            sa = signBitI64(aAddr, resultTy);
+            sb = signBitI64(bAddr, resultTy);
+            if (!emitWideCondNeg(ua, aAddr, sa, uType)) return false;   // ua = |a|
+            if (!emitWideCondNeg(ub, bAddr, sb, uType)) return false;   // ub = |b|
+            divA = ua; divB = ub;
+        }
+
+        // ── unsigned binary long division: divA / divB → rem (remainder), uq (quotient) ──
+        MirInstId const rem = freshAggregateTemp(uType);
+        MirInstId const uq  = wantRem ? InvalidMirInst : freshAggregateTemp(uType);
+        if (!rem.valid() || (!wantRem && !uq.valid())) return false;
+        if (!zeroWide(rem, limbCount)) return false;
+        if (!wantRem && !zeroWide(uq, limbCount)) return false;
+        bool const ok = emitLimbLoop(n, [&](MirInstId iv) {   // iv=0..N-1 ; bit k=N-1-iv
+            MirInstId const k     = i64bin(MirOpcode::Sub, ci64(n - 1), iv);
+            MirInstId const kLimb = i64bin(MirOpcode::LShr, k, ci64(6));   // k/64
+            MirInstId const kBit  = i64bin(MirOpcode::And,  k, ci64(63));  // k%64
+            MirInstId const dv    = loadLimb(limbAddrRuntime(divA, kLimb));
+            MirInstId const bitk  = i64bin(MirOpcode::And,
+                                       i64bin(MirOpcode::LShr, dv, kBit), ci64(1));
+            // rem = ((rem << 1) | bitk) mod 2^N.
+            if (!emitWideShl1InPlace(rem, bitk, limbCount)) return false;
+            if (!maskTopLimb(rem, uType)) return false;
+            // doSub = (rem >=u divisor). No captured "overflow bit N" is needed: by the
+            // loop invariant rem < divisor ≤ 2^N-1 entering each shift (a divisor >
+            // 2^(N-1) forces quotient ≤ 1 ⇒ no mid-stream subtract keeps rem small), the
+            // shifted rem is always < 2^N — the shifted-out top bit is provably 0. This is
+            // the design-audit's original sizing, verified exhaustively by the C3
+            // code-audit (a captured bit N fired on 0 of hundreds of thousands of trials).
+            MirInstId const doSub = emitWideOrder(HirOpKind::Ge, rem, divB, uType);
+            if (!doSub.valid()) return false;
+            // ★ N-1: the conditional subtract is a CondBr diamond inside the loop body —
+            // it MUST converge to a SINGLE open block (contBB) before the body returns,
+            // so emitLimbLoop's ctr++/back-edge form off it.
+            MirBlockId const subBB  = mir.createBlock(StructCfMarker::IfThen);
+            MirBlockId const contBB = mir.createBlock(StructCfMarker::IfJoin);
+            mir.addCondBr(doSub, subBB, contBB);
+            mir.beginBlock(subBB);
+            if (!emitWideAddSub(/*isSub=*/true, rem, rem, divB, uType)) {   // rem -= divisor
+                if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                sealCreatedAsUnreachable(contBB);
+                return false;
+            }
+            if (!wantRem) {   // set quotient bit k: uq[kLimb] |= (1 << kBit)
+                MirInstId const qAddr = limbAddrRuntime(uq, kLimb);
+                MirInstId const qbit  = i64bin(MirOpcode::Shl, ci64(1), kBit);
+                storeLimb(i64bin(MirOpcode::Or, loadLimb(qAddr), qbit), qAddr);
+            }
+            mir.addBr(contBB);
+            mir.beginBlock(contBB);
+            return true;
+        });
+        if (!ok) return false;
+
+        // ── select the magnitude, apply the sign, mask to the result type ──
+        MirInstId const mag = wantRem ? rem : uq;
+        if (!signd) {
+            if (!copyWide(dst, mag, limbCount)) return false;
+            return maskTopLimb(dst, resultTy);
+        }
+        // C99 trunc-toward-zero: q takes sign (sa^sb); r takes the DIVIDEND's sign (sa).
+        MirInstId const flip = wantRem ? sa : i64bin(MirOpcode::Xor, sa, sb);
+        if (!emitWideCondNeg(dst, mag, flip, uType)) return false;   // dst = flip ? -mag : mag
+        return maskTopLimb(dst, resultTy);                          // re-mask SIGNED (sign-ext)
+    }
+
+    // The plain integer kind a scalar SOURCE projects to (enum→underlying, narrow
+    // `_BitInt`→container, else its own kind) — the scalar feeding a wide conversion
+    // or a shift count. A WIDE `_BitInt` source is handled separately by the caller
+    // (this must NOT be called on one — `bitIntContainerKind` is fatal for N>64).
+    [[nodiscard]] TypeKind resolveScalarIntKind(TypeId ty) {
+        if (!ty.valid()) return TypeKind::I32;
+        TypeKind const k = interner.kind(ty);
+        if (k == TypeKind::Enum) {
+            auto const sc = interner.scalars(ty);
+            return sc.empty() ? k : static_cast<TypeKind>(sc[0]);
+        }
+        if (k == TypeKind::BitInt) return interner.bitIntContainerKind(ty);
+        return k;
+    }
+
+    // Lower a shift COUNT expression to an i64 value (C 6.5.7: the count keeps its own
+    // type — it is NOT converted to the shifted operand's type). Widens to i64 for the
+    // multi-limb word/bit split. A wide-`_BitInt` count (pathological) reads its low limb.
+    [[nodiscard]] MirInstId lowerShiftCountToI64(HirNodeId countNode) {
+        TypeId const ct = hir.typeId(countNode);
+        if (isWideBitInt(interner, ct)) {
+            MirInstId const addr = lowerLvalueAddress(countNode);
+            if (!addr.valid()) return InvalidMirInst;
+            return emitScalarFromWide(addr, TypeKind::I64);
+        }
+        MirInstId const cv = lowerExpr(countNode);
+        if (!cv.valid()) return InvalidMirInst;
+        TypeKind const ck = resolveScalarIntKind(ct);
+        if (ck == TypeKind::I64 || ck == TypeKind::U64) return cv;
+        MirOpcode const conv =
+            mapCast(ck, isSignedIntKind(ck) ? TypeKind::I64 : TypeKind::U64);
+        if (conv == MirOpcode::Invalid) return InvalidMirInst;
+        std::array<MirInstId, 1> a{cv};
+        return mir.addInst(conv, a, i64Ty());
+    }
+
+    // ── Model A: materialize a wide-`_BitInt` RVALUE into a fresh slot, return its
+    // ADDRESS. lowerLvalueAddressNode routes a wide-BitInt-typed BinaryOp/UnaryOp/Cast
+    // here (they are the FIRST aggregates in C produced by arithmetic). Operands are
+    // reached BY ADDRESS (a wide operand is itself memory-resident; nested wide
+    // arithmetic materializes into its own slot). This is the C2 wrap chokepoint: every
+    // producing op ends by masking the top limb.
+    [[nodiscard]] MirInstId materializeWideBinaryOp(HirNodeId node) {
+        TypeId const t = hir.typeId(node);
+        HirOpKind const op = decodeCoreOp(hir.payload(node));
+        auto kids = hir.children(node);
+        if (kids.size() != 2) {
+            unsupported(node, "malformed wide _BitInt BinaryOp (expect 2 children)");
+            return InvalidMirInst;
+        }
+        // C3 (D-CSUBSET-BITINT-C3-MULDIV): * / % on a wide `_BitInt` now LOWER to the
+        // multi-limb `emitWideMul` / `emitWideDivMod` below — the C2 fail-loud
+        // (S_BitIntWideMulDivUnsupported) is retired for these ops.
+        MirInstId const aAddr = lowerLvalueAddress(kids[0]);
+        if (!aAddr.valid()) return InvalidMirInst;
+        MirInstId const dst = freshAggregateTemp(t);
+        if (!dst.valid()) {
+            unsupported(node, "wide _BitInt result requires a sizeable layout");
+            return InvalidMirInst;
+        }
+        bool ok = false;
+        if (op == HirOpKind::Shl || op == HirOpKind::Shr) {
+            MirInstId const kI64 = lowerShiftCountToI64(kids[1]);
+            if (!kI64.valid()) return InvalidMirInst;
+            bool const isLeft = (op == HirOpKind::Shl);
+            ok = emitWideShift(isLeft,
+                               /*isArith=*/!isLeft && interner.bitIntIsSigned(t),
+                               dst, aAddr, kI64, t);
+        } else {
+            MirInstId const bAddr = lowerLvalueAddress(kids[1]);
+            if (!bAddr.valid()) return InvalidMirInst;
+            switch (op) {
+                case HirOpKind::BitAnd:
+                    ok = emitWideBitwise(MirOpcode::And, dst, aAddr, bAddr, t); break;
+                case HirOpKind::BitOr:
+                    ok = emitWideBitwise(MirOpcode::Or,  dst, aAddr, bAddr, t); break;
+                case HirOpKind::BitXor:
+                    ok = emitWideBitwise(MirOpcode::Xor, dst, aAddr, bAddr, t); break;
+                case HirOpKind::Add:
+                    ok = emitWideAddSub(false, dst, aAddr, bAddr, t); break;
+                case HirOpKind::Sub:
+                    ok = emitWideAddSub(true,  dst, aAddr, bAddr, t); break;
+                case HirOpKind::Mul:
+                    ok = emitWideMul(dst, aAddr, bAddr, t); break;
+                case HirOpKind::Div:
+                    ok = emitWideDivMod(dst, aAddr, bAddr, t, /*wantRem=*/false); break;
+                case HirOpKind::Rem:
+                    ok = emitWideDivMod(dst, aAddr, bAddr, t, /*wantRem=*/true); break;
+                default:
+                    unsupported(node, std::format(
+                        "BinaryOp '{}' producing a wide _BitInt is not supported",
+                        opName(op)));
+                    return InvalidMirInst;
+            }
+        }
+        return ok ? dst : InvalidMirInst;
+    }
+
+    [[nodiscard]] MirInstId materializeWideUnaryOp(HirNodeId node) {
+        TypeId const t = hir.typeId(node);
+        HirOpKind const op = decodeCoreOp(hir.payload(node));
+        auto kids = hir.children(node);
+        if (kids.size() != 1) {
+            unsupported(node, "malformed wide _BitInt UnaryOp (expect 1 child)");
+            return InvalidMirInst;
+        }
+        MirInstId const aAddr = lowerLvalueAddress(kids[0]);
+        if (!aAddr.valid()) return InvalidMirInst;
+        MirInstId const dst = freshAggregateTemp(t);
+        if (!dst.valid()) {
+            unsupported(node, "wide _BitInt result requires a sizeable layout");
+            return InvalidMirInst;
+        }
+        bool ok = false;
+        switch (op) {
+            case HirOpKind::Neg:    ok = emitWideNeg(dst, aAddr, t); break;
+            case HirOpKind::BitNot: ok = emitWideNot(dst, aAddr, t); break;
+            default:
+                // Logical `!` produces a Bool (not a wide result) → handled in the
+                // value path (combineUnary), never here.
+                unsupported(node, std::format(
+                    "UnaryOp '{}' producing a wide _BitInt is not supported",
+                    opName(op)));
+                return InvalidMirInst;
+        }
+        return ok ? dst : InvalidMirInst;
+    }
+
+    // A wide `_BitInt` LITERAL materialized into a slot — the synthetic `1` that ++/--
+    // desugars to (`incDecArithValue` synths a `_BitInt(N)`-typed one), or a small
+    // `wb`/`uwb` literal whose value fits in 64 bits. Value → limb 0 (sign/zero-extended
+    // per the type's signedness), fill the rest, mask the top limb. An arbitrary-
+    // magnitude literal (value beyond i64 — D-CSUBSET-BITINT-WIDE-LITERAL) is C4-
+    // deferred; a non-integer literal is a front-end invariant break — both fail loud,
+    // never a silent truncation.
+    [[nodiscard]] MirInstId materializeWideLiteral(HirNodeId node) {
+        TypeId const t = hir.typeId(node);
+        HirLiteralValue const& src = literals.at(hir.payload(node));
+        MirInstId const dst = freshAggregateTemp(t);
+        if (!dst.valid()) {
+            unsupported(node, "wide _BitInt literal requires a sizeable layout");
+            return InvalidMirInst;
+        }
+        // C4b (D-CSUBSET-BITINT-WIDE-LITERAL): an arbitrary-magnitude `wb`/`uwb`
+        // literal lives in the `BitIntValue` pool arm. Fill the ceil(N/64) Model-A
+        // limbs DIRECTLY from the host value (converted to the node's exact
+        // (width, signed) so the limb count + top-limb wrap match the slot) — a
+        // COMPILE-TIME limb fill, no runtime FROM-scalar sign/zero-extension.
+        if (auto const* bv = std::get_if<BitIntValue>(&src.value)) {
+            std::uint32_t const n   = static_cast<std::uint32_t>(interner.bitIntWidth(t));
+            bool const          sgn = interner.bitIntIsSigned(t);
+            BitIntValue const   conv = bv->withType(n, sgn);
+            auto const&         limbs = conv.limbs();
+            std::int64_t const  count = wideLimbCount(t);
+            for (std::int64_t i = 0; i < count; ++i) {
+                std::uint64_t const limbVal =
+                    (static_cast<std::size_t>(i) < limbs.size()) ? limbs[i] : 0ull;
+                storeLimb(ci64(static_cast<std::int64_t>(limbVal)), limbAddrConst(dst, i));
+            }
+            return dst;
+        }
+        // Legacy path: the synthetic `1` that ++/-- desugars to (a `_BitInt(N)`-typed
+        // one) is a plain int64-arm literal. Extend per the DECLARED signedness: an
+        // unsigned wide literal zero-fills, a signed one sign-fills (a negative
+        // value's 2's-complement high limbs).
+        if (!std::holds_alternative<std::int64_t>(src.value)) {
+            unsupported(node, "a wide _BitInt literal must be a bit-precise value or a "
+                              "64-bit integer constant");
+            return InvalidMirInst;
+        }
+        TypeKind const srcK =
+            interner.bitIntIsSigned(t) ? TypeKind::I64 : TypeKind::U64;
+        return emitWideFromScalar(dst, ci64(std::get<std::int64_t>(src.value)), srcK, t)
+                   ? dst : InvalidMirInst;
+    }
+
+    [[nodiscard]] MirInstId materializeWideCast(HirNodeId node) {
+        TypeId const t = hir.typeId(node);   // wide `_BitInt` target
+        auto kids = hir.children(node);
+        if (kids.size() != 1) {
+            unsupported(node, "malformed wide _BitInt Cast (expect 1 child)");
+            return InvalidMirInst;
+        }
+        TypeId const srcTy = hir.typeId(kids[0]);
+        // D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV: `float -> wide _BitInt(N>64)` is NOT
+        // yet supported — the naive scalar path (emitWideFromScalar) would emit an
+        // FPToUI/FPToSI keyed off the source and fill only limb 0 (wrong sign, wrong
+        // value, dropped upper limbs). Fail LOUD here rather than silently miscompile;
+        // the correct multi-limb FP->limbs conversion lands in a later cycle. NARROW
+        // (N<=64) float->_BitInt is unaffected — it never reaches materializeWideCast.
+        if (srcTy.valid() && isFloatingKind(interner.kind(srcTy))) {
+            diagnoseCode(node, DiagnosticCode::S_BitIntWideFloatConvUnsupported,
+                "conversion from a floating type to a `_BitInt` wider than 64 bits is "
+                "not yet supported — the multi-limb float-to-bit-precise conversion "
+                "lands in a later cycle (D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV)");
+            return InvalidMirInst;
+        }
+        MirInstId const dst = freshAggregateTemp(t);
+        if (!dst.valid()) {
+            unsupported(node, "wide _BitInt result requires a sizeable layout");
+            return InvalidMirInst;
+        }
+        bool ok = false;
+        if (isWideBitInt(interner, srcTy)) {
+            MirInstId const srcAddr = lowerLvalueAddress(kids[0]);
+            if (!srcAddr.valid()) return InvalidMirInst;
+            ok = emitWideFromWide(dst, srcAddr, srcTy, t);
+        } else {
+            MirInstId const srcVal = lowerExpr(kids[0]);
+            if (!srcVal.valid()) return InvalidMirInst;
+            ok = emitWideFromScalar(dst, srcVal, resolveScalarIntKind(srcTy), t);
+        }
+        return ok ? dst : InvalidMirInst;
+    }
+
+    // A `_BitInt` opcode is an integer comparison (result Bool, operands promoted).
+    [[nodiscard]] static bool isIntCompareOpcode(MirOpcode op) noexcept {
+        switch (op) {
+            case MirOpcode::ICmpEq:  case MirOpcode::ICmpNe:
+            case MirOpcode::ICmpSlt: case MirOpcode::ICmpSle:
+            case MirOpcode::ICmpSgt: case MirOpcode::ICmpSge:
+            case MirOpcode::ICmpUlt: case MirOpcode::ICmpUle:
+            case MirOpcode::ICmpUgt: case MirOpcode::ICmpUge:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     // Lower ONE HIR expression node in the currently-open MIR block, given
     // that its child sub-expressions are lowered by RE-ENTERING `lowerExpr`
     // (the driver below). Returns the MirInstId that produces the value
@@ -613,25 +1767,79 @@ struct Lowerer {
                     std::array<MirInstId, 1> ops{addr};
                     return mir.addInst(MirOpcode::Load, ops, t);
                 }
+                // C4b (D-CSUBSET-BITINT-WIDE-LITERAL): a `wb`/`uwb` literal's value
+                // lives in the `BitIntValue` pool arm. A NARROW (N≤64) one
+                // materializes into its C1 container: emit a container-int Const
+                // typed as the `_BitInt` (reprKind projects it to the native
+                // container at LIR). The value is already mod-2^N wrapped and a
+                // literal is a non-negative magnitude, so its low bits ARE the
+                // container value. A WIDE (N>64) literal is memory-resident (reached
+                // by address via materializeWideLiteral) — never a scalar value.
+                if (auto const* bv = std::get_if<BitIntValue>(&src.value)) {
+                    if (t.valid() && interner.kind(t) == TypeKind::BitInt
+                        && interner.bitIntWidth(t) <= 64) {
+                        MirLiteralValue lit;
+                        lit.core = TypeKind::BitInt;
+                        if (interner.bitIntIsSigned(t)) lit.value = bv->asI64();
+                        else                            lit.value = bv->low64();
+                        return mir.addConst(std::move(lit), t);
+                    }
+                    unsupported(node,
+                        "a wide _BitInt(N>64) literal cannot be produced as a scalar "
+                        "value (it is memory-resident, reached by address)");
+                    return InvalidMirInst;
+                }
                 return mir.addConst(toMirLiteral(src), t);
             }
             case HirKind::SizeOf: {
-                // FC6: fold sizeof(T) to T's byte size (result type size_t = U64,
-                // = `t`) via the type_layout engine. The TypeRef child carries the
-                // type being sized (its typeId). Fail loud — never a guessed size —
-                // if the target declared no layout params or the type is
-                // incomplete/un-sizeable.
-                if (!config.aggregateLayoutLoaded) {
-                    unsupported(node, "sizeof requires the target to declare its "
-                                      "'aggregateLayout' params");
-                    return InvalidMirInst;
-                }
+                // FC6: the TypeRef child carries the type being sized (its typeId).
                 auto kids = hir.children(node);
                 if (kids.empty()) {
                     unsupported(node, "SizeOf has no type-ref child");
                     return InvalidMirInst;
                 }
                 TypeId const sized = hir.typeId(kids.front());
+                // VLA C2/C3 (D-CSUBSET-VLA): a `sizeof <vla-object>` (whole `sizeof a`
+                // OR row `sizeof a[0]`) is a RUNTIME value — the byte size frozen at the
+                // VLA's declaration (C 6.7.6.2p2), NOT a static layout fold (a VLA's size
+                // is not a constant expression, C 6.6). If this SizeOf node is the
+                // recorded VLA-object form, LOAD its decl-frozen `(sym, sized-type)` slot
+                // (U64 = `t`) — the SAME per-object slot family the index path Loads
+                // (CRITICAL-1: `sized` IS the slot's shape-type key, so `sizeof a` Loads
+                // the whole total and `sizeof a[0]` Loads the row stride, by
+                // construction). This runs ONLY for a genuine runtime sizeof: a
+                // constant-required context (`_Static_assert`, an array bound) const-
+                // evaluates the sizeof and DECLINES it (the VLA TypeRef → `computeLayout`
+                // nullopt) BEFORE MIR, so it never reaches here.
+                if (sizeofVlaSymMap != nullptr) {
+                    if (auto it = sizeofVlaSymMap->find(node.v);
+                        it != sizeofVlaSymMap->end()) {
+                        auto slotIt =
+                            vlaStrideSlot.find(vlaSlotKey(it->second, sized.v));
+                        if (slotIt == vlaStrideSlot.end()) {
+                            // The VLA's decl (which materializes the slot) dominates every
+                            // use of the object, so the slot MUST exist. Absent ⇒ an
+                            // internal side-table desync — fail loud, never a stale/guessed
+                            // size (mirrors `vlaAllocaForLocal`'s desync guard).
+                            unsupported(node,
+                                        "sizeof of a variable-length array whose "
+                                        "decl-frozen size slot was not materialized "
+                                        "(internal side-table desync)");
+                            return InvalidMirInst;
+                        }
+                        std::array<MirInstId, 1> ld{slotIt->second};
+                        return mir.addInst(MirOpcode::Load, ld, t);
+                    }
+                }
+                // FC6: fold sizeof(T) to T's byte size (result type size_t = U64,
+                // = `t`) via the type_layout engine. Fail loud — never a guessed size
+                // — if the target declared no layout params or the type is
+                // incomplete/un-sizeable.
+                if (!config.aggregateLayoutLoaded) {
+                    unsupported(node, "sizeof requires the target to declare its "
+                                      "'aggregateLayout' params");
+                    return InvalidMirInst;
+                }
                 auto const layout = computeLayout(sized, interner,
                                                   config.aggregateLayout,
                                                   config.dataModel);
@@ -957,10 +2165,10 @@ struct Lowerer {
                 // instead of by address — fail loud rather than silently
                 // synthesizing a phi-of-aggregate (plus aggregate-width arm
                 // Loads) that flows to LIR as a latent miscompile.
-                if (t.valid()) {
-                    TypeKind const tk = interner.kind(t);
-                    if (tk == TypeKind::Struct || tk == TypeKind::Union
-                        || tk == TypeKind::Array) {
+                {
+                    // D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt` is memory-resident
+                    // too — it MUST reach a by-address carrier, never a bare SSA value.
+                    if (isMemoryResidentType(interner, t)) {
                         unsupported(node,
                             "internal: an aggregate-typed ternary must be lowered "
                             "into a slot by ADDRESS (lowerLvalueAddress — a CFG "
@@ -1255,10 +2463,10 @@ struct Lowerer {
                 // routes through it too. Reaching here with an aggregate type is
                 // a misroute — fail loud rather than running the side effects and
                 // then producing an aggregate-width rvalue of the result.
-                if (t.valid()) {
-                    TypeKind const tk = interner.kind(t);
-                    if (tk == TypeKind::Struct || tk == TypeKind::Union
-                        || tk == TypeKind::Array) {
+                {
+                    // D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt` is memory-resident
+                    // too — it MUST reach a by-address carrier, never a bare SSA value.
+                    if (isMemoryResidentType(interner, t)) {
                         unsupported(node,
                             "internal: an aggregate-typed comma/SeqExpr must be "
                             "lowered by ADDRESS (lowerLvalueAddress), never as a "
@@ -1329,6 +2537,55 @@ struct Lowerer {
         TypeId const operandType = hir.typeId(kids[0]);
         TypeKind const tk = operandType.valid()
             ? interner.kind(operandType) : TypeKind::Void;
+        // C23 _BitInt(N) (D-CSUBSET-BITINT, CRIT-2): a unary op on a `_BitInt`.
+        if (tk == TypeKind::BitInt) {
+            // D-CSUBSET-BITINT-C2-WIDE (Model A divert): a WIDE operand arrives as an
+            // ADDRESS (request flipped it). Only logical `!` (a Bool result) stays in
+            // the value path — via the MS-first-free limb-OR, NOT bitIntToCompute.
+            // Neg/BitNot produce a WIDE result → materialized by ADDRESS
+            // (materializeWideUnaryOp); reaching here is a misroute → fail loud.
+            if (isWideBitInt(interner, operandType)) {
+                if (op == HirOpKind::Not)
+                    return emitBoolFromWide(operand, operandType, /*zeroIsTrue=*/true);
+                unsupported(node, std::format(
+                    "internal: UnaryOp '{}' producing a wide _BitInt must be "
+                    "materialized by ADDRESS (lowerLvalueAddress), never as a bare SSA "
+                    "value (D-CSUBSET-BITINT-C2-WIDE)", opName(op)));
+                return InvalidMirInst;
+            }
+            switch (op) {
+                case HirOpKind::Neg: {
+                    std::array<MirInstId, 1> a{operand};
+                    return emitBitIntOp(MirOpcode::Neg, a, operandType,
+                                        /*needsMask=*/true);
+                }
+                case HirOpKind::BitNot: {
+                    // ~ flips the high (zero/sign) bits → unsigned needs re-masking;
+                    // the mask is a no-op-safe belt for signed (sign-ext preserved).
+                    std::array<MirInstId, 1> a{operand};
+                    return emitBitIntOp(MirOpcode::Not, a, operandType,
+                                        /*needsMask=*/true);
+                }
+                case HirOpKind::Not: {
+                    // logical `!bitInt` ≡ `bitInt == 0`: promote to the compute width,
+                    // compare against a compute-width zero (result Bool).
+                    MirInstId const v = bitIntToCompute(operand, operandType);
+                    if (!v.valid()) return InvalidMirInst;
+                    TypeId const computeTy =
+                        interner.primitive(bitIntComputeKind(operandType));
+                    MirLiteralValue zero;
+                    zero.value = std::int64_t{0};
+                    zero.core  = interner.kind(computeTy);
+                    MirInstId const z = mir.addConst(std::move(zero), computeTy);
+                    std::array<MirInstId, 2> ops{v, z};
+                    return mir.addInst(MirOpcode::ICmpEq, ops, t);   // t is Bool
+                }
+                default:
+                    unsupported(node, std::format(
+                        "UnaryOp '{}' on _BitInt not yet supported", opName(op)));
+                    return InvalidMirInst;
+            }
+        }
         bool const isFloat = (tk == TypeKind::F16 || tk == TypeKind::F32
                            || tk == TypeKind::F64 || tk == TypeKind::F128);
         MirOpcode mop = MirOpcode::Invalid;
@@ -1467,6 +2724,56 @@ struct Lowerer {
             std::array<MirInstId, 2> gepOps{lhs, byteOff};
             return mir.addInst(MirOpcode::Gep, gepOps, t);
         }
+        // C23 _BitInt(N) (D-CSUBSET-BITINT, CRIT-2): both operands are `_BitInt(N)`
+        // (a `_BitInt op int` was coerced to a standard int by the UAC, so it never
+        // reaches here with a BitInt operand). Route through the wrap chokepoint: the
+        // container kind picks the signed/unsigned opcode (SDiv/UDiv/AShr/LShr), a
+        // comparison promotes its operands + emits the ICmp typed Bool, and an
+        // arithmetic op masks its result to N (Add/Sub/Mul/Shl) or not (Div/Mod/And/
+        // Or/Xor/right-shift — clean-N-extension-preserving).
+        if (tk == TypeKind::BitInt) {
+            // D-CSUBSET-BITINT-C2-WIDE (Model A divert): WIDE operands arrive as
+            // ADDRESSES (request flipped them). Only a COMPARISON (a Bool result)
+            // stays in the value path — via the limb-OR (== !=) / MS-limb-first scan
+            // (< <= > >=), NOT bitIntToCompute. Arithmetic/bitwise/shift produce a
+            // WIDE result → materialized by ADDRESS (materializeWideBinaryOp);
+            // reaching here with one is a misroute → fail loud (never a silent scalar
+            // op that would truncate the value to its low limb).
+            if (isWideBitInt(interner, operandType)) {
+                switch (op) {
+                    case HirOpKind::Eq: return emitWideEq(false, lhs, rhs, operandType);
+                    case HirOpKind::Ne: return emitWideEq(true,  lhs, rhs, operandType);
+                    case HirOpKind::Lt: case HirOpKind::Le:
+                    case HirOpKind::Gt: case HirOpKind::Ge:
+                        return emitWideOrder(op, lhs, rhs, operandType);
+                    default:
+                        unsupported(node, std::format(
+                            "internal: BinaryOp '{}' producing a wide _BitInt must be "
+                            "materialized by ADDRESS (lowerLvalueAddress), never as a "
+                            "bare SSA value (D-CSUBSET-BITINT-C2-WIDE)", opName(op)));
+                        return InvalidMirInst;
+                }
+            }
+            TypeKind const container = interner.bitIntContainerKind(operandType);
+            MirOpcode const bop = mapBinaryOp(op, container);
+            if (bop == MirOpcode::Invalid) {
+                unsupported(node, std::format(
+                    "BinaryOp '{}' on _BitInt not yet supported", opName(op)));
+                return InvalidMirInst;
+            }
+            if (isIntCompareOpcode(bop)) {
+                MirInstId const l = bitIntToCompute(lhs, operandType);
+                MirInstId const r = bitIntToCompute(rhs, operandType);
+                if (!l.valid() || !r.valid()) return InvalidMirInst;
+                std::array<MirInstId, 2> cops{l, r};
+                return mir.addInst(bop, cops, t);   // t is Bool
+            }
+            bool const needsMask =
+                bop == MirOpcode::Add || bop == MirOpcode::Sub
+                || bop == MirOpcode::Mul || bop == MirOpcode::Shl;
+            std::array<MirInstId, 2> bops{lhs, rhs};
+            return emitBitIntOp(bop, bops, t, needsMask);
+        }
         MirOpcode const mop = mapBinaryOp(op, tk);
         if (mop == MirOpcode::Invalid) {
             unsupported(node,
@@ -1541,7 +2848,71 @@ struct Lowerer {
                 auto const sc = interner.scalars(ty);
                 return sc.empty() ? kk : static_cast<TypeKind>(sc[0]);
             };
-        TypeKind const fromResolved = enumUnderlying(fromTy, fromK);
+        // D-CSUBSET-BITINT-C2-WIDE (Model A divert): a cast involving a WIDE `_BitInt`.
+        // A wide TARGET makes the whole Cast a wide result → materialized by ADDRESS
+        // (materializeWideCast); reaching the value path is a misroute → fail loud. A
+        // wide SOURCE with a scalar target reaches here with `operand` = the ADDRESS of
+        // the wide value (request flipped it): produce the low bits (C 6.3.1.3) — bool
+        // (nonzero-test over all limbs), a narrow `_BitInt` (limb 0 masked to its N),
+        // or a plain scalar (limb 0 truncated). Placed BEFORE any `bitIntContainerKind`
+        // query (fatal for N>64).
+        if (isWideBitInt(interner, t)) {
+            unsupported(node, "internal: a cast producing a wide _BitInt must be "
+                              "materialized by ADDRESS (lowerLvalueAddress), never as a "
+                              "bare SSA value (D-CSUBSET-BITINT-C2-WIDE)");
+            return InvalidMirInst;
+        }
+        if (isWideBitInt(interner, fromTy)) {
+            // D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV: `wide _BitInt(N>64) -> float` is NOT
+            // yet supported — emitScalarFromWide reads only limb 0, so everything above
+            // 2^64 (and the true magnitude) is lost. Fail LOUD rather than silently
+            // miscompile; the correct multi-limb limbs->FP conversion lands in a later
+            // cycle. NARROW (N<=64) _BitInt->float rides the container and never gets here.
+            if (isFloatingKind(toK)) {
+                diagnoseCode(node, DiagnosticCode::S_BitIntWideFloatConvUnsupported,
+                    "conversion from a `_BitInt` wider than 64 bits to a floating type is "
+                    "not yet supported — the multi-limb bit-precise-to-float conversion "
+                    "lands in a later cycle (D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV)");
+                return InvalidMirInst;
+            }
+            if (toK == TypeKind::Bool)
+                return emitBoolFromWide(operand, fromTy, /*zeroIsTrue=*/false);
+            if (toK == TypeKind::BitInt)      // wide → NARROW _BitInt: low limb, masked
+                return emitCastToBitInt(loadLimb(limbAddrConst(operand, 0)),
+                                        TypeKind::I64, t);
+            MirInstId const r = emitScalarFromWide(operand, enumUnderlying(t, toK));
+            if (!r.valid()) {
+                unsupported(node, std::format(
+                    "cast from a wide _BitInt to TypeKind {} has no MIR opcode",
+                    static_cast<unsigned>(toK)));
+                return InvalidMirInst;
+            }
+            return r;
+        }
+        // C23 _BitInt(N) (D-CSUBSET-BITINT): a BitInt SOURCE casts AS its native
+        // container (I8/I16/I32/I64 — the enum→underlying twin), so a `_BitInt→int`
+        // is the ordinary container→target `mapCast`.
+        auto const resolveScalarKind =
+            [&](TypeId ty, TypeKind kk) -> TypeKind {
+                if (kk == TypeKind::BitInt && ty.valid())
+                    return interner.bitIntContainerKind(ty);
+                return enumUnderlying(ty, kk);
+            };
+        TypeKind const fromResolved = resolveScalarKind(fromTy, fromK);
+        // ★ CRIT-1: a cast TO `_BitInt(N)` masks UNCONDITIONALLY (even the same-
+        // container `int→_BitInt(17)` case — a plain Bitcast would leave bits 17-31
+        // dirty). Route through the dedicated masking path; `mapCast` stays
+        // BYTE-IDENTICAL for its non-BitInt callers (M-7).
+        if (toK == TypeKind::BitInt) {
+            MirInstId const r = emitCastToBitInt(operand, fromResolved, t);
+            if (!r.valid()) {
+                unsupported(node, std::format(
+                    "Cast from TypeKind {} to _BitInt has no MIR opcode",
+                    static_cast<unsigned>(fromK)));
+                return InvalidMirInst;
+            }
+            return r;
+        }
         TypeKind const toResolved    = enumUnderlying(t, toK);
         MirOpcode const mop = mapCast(fromResolved, toResolved);
         if (mop == MirOpcode::Invalid) {
@@ -1667,10 +3038,10 @@ struct Lowerer {
 
     [[nodiscard]] bool ternaryAggregateGuardFails(HirNodeId node) {
         TypeId const t = hir.typeId(node);
-        if (t.valid()) {
-            TypeKind const tk = interner.kind(t);
-            if (tk == TypeKind::Struct || tk == TypeKind::Union
-                || tk == TypeKind::Array) {
+        {
+            // D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt` is memory-resident too — it
+            // MUST reach a by-address carrier, never a bare SSA value.
+            if (isMemoryResidentType(interner, t)) {
                 unsupported(node,
                     "internal: an aggregate-typed ternary must be lowered "
                     "into a slot by ADDRESS (lowerLvalueAddress — a CFG "
@@ -1686,10 +3057,10 @@ struct Lowerer {
 
     [[nodiscard]] bool seqExprAggregateGuardFails(HirNodeId node) {
         TypeId const t = hir.typeId(node);
-        if (t.valid()) {
-            TypeKind const tk = interner.kind(t);
-            if (tk == TypeKind::Struct || tk == TypeKind::Union
-                || tk == TypeKind::Array) {
+        {
+            // D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt` is memory-resident too — it
+            // MUST reach a by-address carrier, never a bare SSA value.
+            if (isMemoryResidentType(interner, t)) {
                 unsupported(node,
                     "internal: an aggregate-typed comma/SeqExpr must be "
                     "lowered by ADDRESS (lowerLvalueAddress), never as a "
@@ -1787,6 +3158,22 @@ struct Lowerer {
         // dangle after.
         auto const request = [&](HirNodeId n, bool wantAddr) {
             HirKind const nk = hir.kind(n);
+            // C23 _BitInt(N>64) (D-CSUBSET-BITINT-C2-WIDE): a wide `_BitInt` is
+            // MEMORY-RESIDENT — it has NO SSA rvalue. A VALUE read of a wide-BitInt-
+            // typed node yields the ADDRESS of its limbs (exactly as an array rvalue
+            // decays to its element address), so flip the request to by-ADDRESS. This
+            // is the ONE chokepoint that keeps wide arithmetic/convert out of the
+            // scalar value path: a wide arithmetic node materializes into a slot
+            // (lowerLvalueAddressNode's new arms), a wide operand of a scalar-
+            // producing op (a compare / logical-! / wide→scalar cast) is delivered as
+            // an address to `combine*`. Call/IntrinsicCall/BuiltinCall are EXEMPT —
+            // their value path already yields the result slot address (finishCall),
+            // and flipping would loop through the by-address Call arm's `lowerExpr`.
+            if (!wantAddr && isWideBitInt(interner, hir.typeId(n))
+                && nk != HirKind::Call && nk != HirKind::IntrinsicCall
+                && nk != HirKind::BuiltinCall) {
+                wantAddr = true;
+            }
             if (wantAddr) {
                 switch (nk) {
                     case HirKind::MemberAccess:
@@ -2381,6 +3768,35 @@ struct Lowerer {
             return InvalidMirInst;
         }
         TypeId const ptrTy = interner.pointer(ty);
+        // VLA C4b (D-CSUBSET-VLA): a VLA-TYPEDEF OBJECT (`typedef int R[n]; R a;`) has
+        // NO own captured runtime size — its size was FROZEN once at R's TypeDecl (C99
+        // §6.7.7p2). Route it to the copy-down path, which sources every size from R's
+        // decl-frozen slots (never re-lowering `n`). Checked BEFORE the direct-VLA arm:
+        // the object's own size capture was skipped at CST→HIR, so `vlaSizeMap[a.v]` is
+        // absent and `vlaAllocaForLocal`/`computeVlaByteSize(a)` would fail loud on the
+        // missing side-table.
+        if (typedefVlaOriginMap != nullptr) {
+            if (auto it = typedefVlaOriginMap->find(sym.v);
+                it != typedefVlaOriginMap->end())
+                return vlaAllocaFromTypedef(sym, SymbolId{it->second}, ty, ptrTy,
+                                            anchor);
+        }
+        // VLA C1a (D-CSUBSET-VLA): a VARIABLE-LENGTH array local reserves a RUNTIME-
+        // sized slot — the Alloca carries a size OPERAND, not a compile-time payload.
+        // This arm runs BEFORE the isMemoryResidentType byte-size path below (which
+        // nullopts + fails loud on a VLA — its layout has no static size). The size
+        // expr is evaluated HERE, at the DECL point (§6.7.6.2p2: once when the
+        // declaration is reached) — a VLA is emitted at its VarDecl site, never the
+        // entry-block hoist (the collectLocalDecls hoist SKIPS un-sizeable arrays; the
+        // load-bearing dependency that keeps `int a[f()]` evaluating in program
+        // order). C1a fails loud at MIR→LIR; C1b builds the dynamic-alloca codegen.
+        // VLA C3: `||typeContainsVla` routes a FIXED-outer multi-dim VLA (`int a[5][n]`
+        // — top type is a fixed Array, NOT isVlaArray) to the SAME runtime path (else
+        // it falls to the fixed aggregateByteSize path and fails loud on the VLA
+        // element's un-sizeable layout).
+        if (interner.isVlaArray(ty) || interner.typeContainsVla(ty)) {
+            return vlaAllocaForLocal(sym, ty, ptrTy, anchor);
+        }
         // FC7 (D-FC7-MEMBER-ACCESS): a struct/union/ARRAY local reserves its
         // FULL layout size in the frame, not one scalar slot. Encode the byte
         // size in the Alloca payload (the channel ML6 anticipated; the LIR
@@ -2392,9 +3808,10 @@ struct Lowerer {
         // cycle makes them runnable (index + brace-init), so a bare `int a[4]`
         // must reserve 16 bytes, not the 8-byte scalar sentinel.
         std::uint32_t allocaPayload = 0;
-        TypeKind const tk = interner.kind(ty);
-        if (tk == TypeKind::Struct || tk == TypeKind::Union
-            || tk == TypeKind::Array) {
+        // D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt(N>64)` local reserves its full
+        // ceil(N/64)*8-byte multi-limb layout — the memory-resident sizing path (a
+        // scalar 8-byte slot would under-allocate + alias the neighbour).
+        if (isMemoryResidentType(interner, ty)) {
             auto const sz = aggregateByteSize(ty);
             if (!sz.has_value()) {
                 unsupported(anchor, "aggregate/array local requires a sizeable "
@@ -2435,6 +3852,328 @@ struct Lowerer {
                         MirInstFlags::None, /*payload2=*/effectiveAlign);
         addressableLocal[sym.v] = a;
         return a;
+    }
+
+    // VLA (D-CSUBSET-VLA): widen ONE VLA dimension bound to an i64 count, applying the
+    // codegen belts (a semantic-tier S_VlaSizeNotInteger should already have fired; these
+    // are defense-in-depth). A FLOAT bound would silently FPToSI-truncate; a wide
+    // `_BitInt(N>64)` bound's multi-limb→i64 narrow is a later cycle; a non-integer with
+    // no widening → fail loud. Shared by the direct-VLA alloca and the ptr-to-VLA stride
+    // store so NEITHER can drop a belt (IMPORTANT-2).
+    [[nodiscard]] MirInstId widenVlaDim(HirNodeId dimNode, HirNodeId anchor) {
+        TypeId const i64ty = i64Ty();
+        MirInstId const v = lowerExpr(dimNode);
+        if (!v.valid()) return InvalidMirInst;
+        TypeId const dimTy = hir.typeId(dimNode);
+        // A FLOAT bound would silently FPToSI-TRUNCATE through mapCast — fail loud.
+        if (dimTy.valid() && isFloatingKind(interner.kind(dimTy))) {
+            unsupported(anchor, "variable-length array size expression has floating "
+                                "type — must be integer (C 6.7.6.2p1; a semantic-"
+                                "tier constraint that should already have fired)");
+            return InvalidMirInst;
+        }
+        // A WIDE `_BitInt(N>64)` bound is a legal integer VLA size, but its
+        // multi-limb → i64 narrow is a later cycle — fail loud CLEANLY, never the
+        // fatal `bitIntContainerKind`-on-wide path.
+        if (dimTy.valid() && interner.kind(dimTy) == TypeKind::BitInt
+            && interner.bitIntWidth(dimTy) > 64) {
+            unsupported(anchor, "a wide _BitInt(N>64) variable-length array bound "
+                                "is not yet lowered (deferred — D-CSUBSET-VLA)");
+            return InvalidMirInst;
+        }
+        // Project the SOURCE kind: enum→underlying, narrow `_BitInt`→native
+        // container, else its own kind; then WIDEN to i64 (signed→SExt,
+        // unsigned→ZExt — both C-consistent for a byte count).
+        TypeKind const fromK =
+            dimTy.valid() ? resolveScalarIntKind(dimTy) : TypeKind::I32;
+        if (fromK == TypeKind::I64) return v;
+        MirOpcode const ext = mapCast(fromK, TypeKind::I64);
+        if (ext == MirOpcode::Invalid) {
+            unsupported(anchor, "variable-length array size expression has a "
+                                "non-integer type with no widening to a 64-bit "
+                                "byte count");
+            return InvalidMirInst;
+        }
+        std::array<MirInstId, 1> eo{v};
+        return mir.addInst(ext, eo, i64ty);
+    }
+
+    // VLA (D-CSUBSET-VLA): the total runtime BYTE size of a nested array type + its
+    // innermost base element type. Shared by the direct-VLA `Alloca` sizing
+    // (`vlaAllocaForLocal`, `arrayTy` = the whole object) and the ptr-to-VLA row-stride
+    // store (`storePtrToVlaStride`, `arrayTy` = the POINTEE row). Walks the array spine
+    // into per-LEVEL shape types (level 0 = `arrayTy`), widens each captured dimension
+    // bound (via `widenVlaDim`), and forms the cumulative product BOTTOM-UP: after level
+    // L the running product == `sizeof` of the shape type at level L (dims L..depth-1 ×
+    // baseElem). When `freezeLevelSlots`, each RUNTIME-sized level's byte size is frozen
+    // ONCE into a hidden fixed 8-byte U64 `(sym, levelType)` slot (CRITICAL-1) — the
+    // whole object is `sizeof a`; an intermediate VLA row is BOTH its index stride AND
+    // `sizeof a[0]`. A FULLY-FIXED intermediate level (`int a[n][5]`'s `int[5]` row) is
+    // NOT slotted (its stride is a compile-time `elementStride`). `freezeLevelSlots=false`
+    // freezes no level (the ptr caller freezes only the single pointee slot). The captured
+    // dim count MUST equal the array-level count — a mismatch (e.g. a VLA whose element
+    // comes from an array typedef) is deferred (fail loud). nullopt on any belt fail-loud
+    // (already reported). Program-order: the dim size-exprs (`int a[f()]`) lower HERE, at
+    // the caller's decl site — never the entry hoist.
+    struct VlaByteSize { MirInstId totalBytes{}; TypeId baseElemTy{}; };
+    [[nodiscard]] std::optional<VlaByteSize>
+    computeVlaByteSize(SymbolId sym, TypeId arrayTy, HirNodeId anchor,
+                       bool freezeLevelSlots) {
+        TypeId const i64ty = i64Ty();
+        // The per-dimension bound exprs were captured by CST→HIR (un-skipping EVERY
+        // array suffix) keyed by SymbolId, in outer→inner order. Absent ⇒ an internal
+        // side-table desync — fail loud, never a 0-sized / fixed slot.
+        std::vector<HirNodeId> const* dims = nullptr;
+        if (vlaSizeMap != nullptr)
+            if (auto it = vlaSizeMap->find(sym.v); it != vlaSizeMap->end())
+                dims = &it->second;
+        if (dims == nullptr || dims->empty()) {
+            unsupported(anchor, "variable-length array local has no captured runtime "
+                                "size expression (internal side-table desync)");
+            return std::nullopt;
+        }
+        // Walk the nested array type into per-LEVEL shape types (level 0 = `arrayTy`, the
+        // whole object; each next = its element via ops[0]) down to the non-array
+        // base. A level is EITHER a VLA (runtime dim) or a fixed Array (compile-time
+        // dim) — both are kind Array; the base terminates the walk.
+        std::vector<TypeId> levelTypes;
+        TypeId walk = arrayTy;
+        for (int guard = 0; guard < 4096 && walk.valid()
+                            && interner.kind(walk) == TypeKind::Array; ++guard) {
+            levelTypes.push_back(walk);
+            auto const ops = interner.operands(walk);
+            if (ops.empty()) {
+                unsupported(anchor, "variable-length array type has an array level with "
+                                    "no element (interner invariant violated)");
+                return std::nullopt;
+            }
+            walk = ops[0];
+        }
+        TypeId const baseElemTy = walk;   // the innermost non-array element
+        std::size_t const depth = levelTypes.size();
+        // The captured dim count MUST equal the array-level count — one bound per
+        // declarator suffix. A mismatch means the type carries array levels that are
+        // NOT declarator suffixes on this object — realistically a VLA whose element
+        // comes from an array typedef (`typedef int R[5]; R a[n];` → type `int[n][5]`,
+        // one `[n]` suffix but two levels). C3 captures only declarator suffixes, so
+        // this shape is deferred (C4) — fail loud with a real diagnostic, never guess.
+        if (dims->size() != depth) {
+            unsupported(anchor, std::format(
+                "a variable-length array of this shape is not yet supported: its type "
+                "has {} array level(s) but only {} declarator dimension bound(s) were "
+                "captured (e.g. a VLA whose element comes from an array typedef, "
+                "`typedef int R[5]; R a[n];`) — deferred (D-CSUBSET-VLA)",
+                depth, dims->size()));
+            return std::nullopt;
+        }
+        // Lower + widen each dimension bound to an i64 count, in OUTER→INNER (source)
+        // order so any side effects (`int a[(k+=3)][(k+=5)]`) evaluate ONCE, in
+        // program order (C 6.7.6.2p2). The per-dim belts apply to EVERY dimension.
+        std::vector<MirInstId> counts;
+        counts.reserve(depth);
+        for (HirNodeId const dimNode : *dims) {
+            MirInstId const c = widenVlaDim(dimNode, anchor);
+            if (!c.valid()) return std::nullopt;
+            counts.push_back(c);
+        }
+        // baseElemSize = the innermost element's byte size (a COMPILE-TIME constant).
+        // nullopt / 0 → fail loud (incomplete / empty-aggregate element), never a
+        // `Mul(count, 0)` that makes every index alias offset 0.
+        std::optional<std::uint64_t> const baseStride =
+            baseElemTy.valid() ? elementStride(baseElemTy) : std::nullopt;
+        if (!baseStride.has_value() || *baseStride == 0) {
+            unsupported(anchor, "variable-length array base element type has no "
+                                "computable non-zero size (incomplete element or no "
+                                "aggregateLayout)");
+            return std::nullopt;
+        }
+        // Cumulative product BOTTOM-UP (see the doc comment). Each runtime-sized level is
+        // frozen into a per-object (sym, levelType) slot ONLY when `freezeLevelSlots`.
+        MirInstId acc = ci64(static_cast<std::int64_t>(*baseStride));
+        for (std::size_t L = depth; L-- > 0;) {
+            std::array<MirInstId, 2> mo{counts[L], acc};
+            acc = mir.addInst(MirOpcode::Mul, mo, i64ty);
+            if (!acc.valid()) return std::nullopt;
+            if (freezeLevelSlots
+                && (interner.isVlaArray(levelTypes[L])
+                    || interner.typeContainsVla(levelTypes[L]))) {
+                TypeId const u64PtrTy =
+                    interner.pointer(interner.primitive(TypeKind::U64));
+                MirInstId const slot =
+                    mir.addInst(MirOpcode::Alloca, {}, u64PtrTy, /*payload=*/8,
+                                MirInstFlags::None, /*payload2=*/8);
+                if (!slot.valid()) return std::nullopt;
+                std::array<MirInstId, 2> stOps{acc, slot};
+                mir.addInst(MirOpcode::Store, stOps, InvalidType);
+                vlaStrideSlot[vlaSlotKey(sym.v, levelTypes[L].v)] = slot;
+            }
+        }
+        if (!acc.valid()) return std::nullopt;
+        return VlaByteSize{acc, baseElemTy};
+    }
+
+    // VLA C4a-local (D-CSUBSET-VLA): freeze a LOCAL pointer-to-VLA's runtime ROW stride
+    // at its decl point. `int (*p)[n]` — the subscript `p[i]` steps by the pointee's
+    // runtime byte size (`n*sizeof(int)`), recovered by `scaleIndexToBytes` from the
+    // `(p, pointeeTy)` slot exactly as a declared VLA row. CRITICAL-2: this MUST run at
+    // the VarDecl decl site (program order) — the pointer's own 8-byte alloca is HOISTED
+    // to entry, where `n` is not yet stored; reading `n` there would freeze a garbage
+    // stride. `freezeLevelSlots=false` so ONLY the single top pointee slot is frozen
+    // here — a multi-level pointee `int(*p)[n][m]`'s inner subscript then MISSES and
+    // fails loud cleanly at `scaleIndexToBytes` (never a partial silent miscompute,
+    // MINOR-1). `pointeeTy == operands(p.type)[0] == hir.typeId(Index(p,i))`, so the key
+    // matches the subscript lookup verbatim.
+    [[nodiscard]] bool storePtrToVlaStride(SymbolId sym, TypeId pointeeTy,
+                                           HirNodeId anchor) {
+        auto const sz = computeVlaByteSize(sym, pointeeTy, anchor,
+                                           /*freezeLevelSlots=*/false);
+        if (!sz.has_value()) return false;   // a belt fail-loud already reported
+        TypeId const u64PtrTy =
+            interner.pointer(interner.primitive(TypeKind::U64));
+        MirInstId const slot =
+            mir.addInst(MirOpcode::Alloca, {}, u64PtrTy, /*payload=*/8,
+                        MirInstFlags::None, /*payload2=*/8);
+        if (!slot.valid()) return false;
+        std::array<MirInstId, 2> stOps{sz->totalBytes, slot};
+        mir.addInst(MirOpcode::Store, stOps, InvalidType);
+        vlaStrideSlot[vlaSlotKey(sym.v, pointeeTy.v)] = slot;
+        return true;
+    }
+
+    // VLA C1a/C3 (D-CSUBSET-VLA): materialize a (possibly MULTI-DIMENSIONAL) variable-
+    // length array local's RUNTIME-sized `Alloca`. The caller (`allocaForLocal`) ran
+    // the duplicate-binding guard; this runs for `isVlaArray(ty) || typeContainsVla(ty)`.
+    // Shape: operand[0] = the total runtime BYTE size (via the shared
+    // `computeVlaByteSize`), payload = 0 (the "runtime-sized" sentinel, DISTINCT from a
+    // fixed alloca's non-zero byte payload), payload2 = the effective alignment. Fails
+    // loud downstream at MIR→LIR (C1a) / builds the dynamic `sub sp,<size>` (C1b).
+    // `freezeLevelSlots=true`: every runtime-sized LEVEL's byte size is frozen into a
+    // per-object `(sym, levelType)` slot (the whole object is `sizeof a`; each VLA row is
+    // its index stride) — CRITICAL-1.
+    [[nodiscard]] MirInstId vlaAllocaForLocal(SymbolId sym, TypeId ty, TypeId ptrTy,
+                                              HirNodeId anchor) {
+        // VLA C4a-local (D-CSUBSET-VLA): the stride math is shared with the ptr-to-VLA
+        // decl-site store (`storePtrToVlaStride`) via `computeVlaByteSize`, so neither
+        // can silently drop a belt. `freezeLevelSlots=true`: as a DIRECT VLA object,
+        // freeze every runtime-sized level's `(sym, levelType)` size slot (CRITICAL-1 —
+        // the whole object is `sizeof a`; each VLA row is its index stride).
+        auto const sz = computeVlaByteSize(sym, ty, anchor, /*freezeLevelSlots=*/true);
+        if (!sz.has_value()) return InvalidMirInst;
+        MirInstId const bytes = sz->totalBytes;   // = sizeof level 0 = whole-object total
+        TypeId const baseElemTy = sz->baseElemTy;
+        // Effective alignment from the BASE element (the VLA levels have no static
+        // layout) + any `alignas` override on the decl. 0 = "no info". Mirrors the
+        // fixed path's payload2 channel; the PRIMARY payload stays 0 (runtime-sized).
+        std::uint32_t effectiveAlign = 0;
+        if (config.aggregateLayoutLoaded && baseElemTy.valid())
+            if (auto const lay = computeLayout(baseElemTy, interner,
+                                               config.aggregateLayout,
+                                               config.dataModel);
+                lay.has_value())
+                effectiveAlign = lay->align.bytes();
+        if (alignmentMap != nullptr && anchor.valid())
+            if (auto const* p = alignmentMap->tryGet(anchor);
+                p != nullptr && p->alignmentBytes > effectiveAlign)
+                effectiveAlign = p->alignmentBytes;
+        std::array<MirInstId, 1> aops{bytes};
+        MirInstId const a =
+            mir.addInst(MirOpcode::Alloca, aops, ptrTy, /*payload=*/0,
+                        MirInstFlags::None, /*payload2=*/effectiveAlign);
+        addressableLocal[sym.v] = a;
+        return a;
+    }
+
+    // VLA C4b (D-CSUBSET-VLA): materialize a VLA-TYPEDEF object's (`typedef int R[n]; R
+    // a;`) runtime `Alloca` by COPYING the typedef origin R's decl-frozen per-level size
+    // slots DOWN into the object's OWN `(a, levelType)` slots — NOT by re-lowering `n`
+    // (C99 §6.7.7p2: the size was frozen ONCE, when R was reached; `n` may have changed
+    // since — the freeze-once invariant). `a`'s type is byte-identical to R's (the
+    // semantic `declTy == headTy` gate), so the interned level-type peel yields the SAME
+    // TypeIds R froze under → the copied keys EXACTLY match what `a[i]` /
+    // `sizeof a`(/`sizeof a[0]`) later Load (I3, no depth arithmetic). Only the levels R
+    // ACTUALLY froze are copied (a FIXED intermediate level — `R[n][5]`'s `int[5]` — was
+    // never slotted; its stride is compile-time). Level 0 (the whole object) is a VLA by
+    // construction (a VLA-typedef object is a VLA at the top), so it is always frozen,
+    // and its value doubles as `a`'s runtime alloca byte size. Emitted at `a`'s VarDecl
+    // site in program order, AFTER R's TypeDecl freeze — a VLA local is NOT entry-hoisted
+    // (`computeLayout` nullopts on the -2 level → the hoist skips it), the load-bearing
+    // ordering that keeps this copy-down reading R's already-Stored (live) frozen slots.
+    [[nodiscard]] MirInstId vlaAllocaFromTypedef(SymbolId a, SymbolId origin, TypeId ty,
+                                                 TypeId ptrTy, HirNodeId anchor) {
+        TypeId const i64ty    = i64Ty();
+        TypeId const u64PtrTy =
+            interner.pointer(interner.primitive(TypeKind::U64));
+        // Peel `ty`'s array spine into per-LEVEL shape types (level 0 = whole object,
+        // each next via ops[0]) down to the non-array base — the SAME walk
+        // `computeVlaByteSize` used when it froze R's slots (so the level TypeIds, hence
+        // the slot keys, are identical).
+        std::vector<TypeId> levelTypes;
+        TypeId walk = ty;
+        for (int guard = 0; guard < 4096 && walk.valid()
+                            && interner.kind(walk) == TypeKind::Array; ++guard) {
+            levelTypes.push_back(walk);
+            auto const ops = interner.operands(walk);
+            if (ops.empty()) {
+                unsupported(anchor, "variable-length array typedef object has an array "
+                                    "level with no element (interner invariant "
+                                    "violated)");
+                return InvalidMirInst;
+            }
+            walk = ops[0];
+        }
+        if (levelTypes.empty()) {
+            unsupported(anchor, "variable-length array typedef object has a non-array "
+                                "top type (internal side-table desync)");
+            return InvalidMirInst;
+        }
+        // Copy each level R froze down into a's own slot, keyed IDENTICALLY so `a[i]` /
+        // `sizeof a` Load them (I3 — copy ONLY the HITS; a fixed intermediate level R
+        // never slotted is skipped, matching `computeVlaByteSize`'s freeze predicate).
+        // Capture level 0's copied value as a's whole-object runtime byte size.
+        MirInstId total = InvalidMirInst;
+        for (std::size_t L = 0; L < levelTypes.size(); ++L) {
+            auto const it =
+                vlaStrideSlot.find(vlaSlotKey(origin.v, levelTypes[L].v));
+            if (it == vlaStrideSlot.end()) continue;   // R did not freeze this level
+            std::array<MirInstId, 1> ld{it->second};
+            MirInstId const val = mir.addInst(MirOpcode::Load, ld, i64ty);
+            if (!val.valid()) return InvalidMirInst;
+            MirInstId const slot =
+                mir.addInst(MirOpcode::Alloca, {}, u64PtrTy, /*payload=*/8,
+                            MirInstFlags::None, /*payload2=*/8);
+            if (!slot.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> st{val, slot};
+            mir.addInst(MirOpcode::Store, st, InvalidType);
+            vlaStrideSlot[vlaSlotKey(a.v, levelTypes[L].v)] = slot;
+            if (L == 0) total = val;   // level 0's frozen value == whole-object total
+        }
+        if (!total.valid()) {
+            // Level 0 (the whole object) is a VLA by construction, so R MUST have frozen
+            // it — absent ⇒ an internal side-table desync (R's TypeDecl freeze did not
+            // run, or keyed differently). Fail loud, never a 0-sized / stale alloca.
+            unsupported(anchor, "variable-length array typedef object's origin froze no "
+                                "whole-object size slot (internal side-table desync)");
+            return InvalidMirInst;
+        }
+        // Effective alignment from the BASE element (`walk` = the innermost non-array
+        // element) + any `alignas` override — mirror `vlaAllocaForLocal` (the VLA levels
+        // have no static layout; the PRIMARY payload stays 0 = runtime-sized).
+        std::uint32_t effectiveAlign = 0;
+        if (config.aggregateLayoutLoaded && walk.valid())
+            if (auto const lay = computeLayout(walk, interner, config.aggregateLayout,
+                                               config.dataModel);
+                lay.has_value())
+                effectiveAlign = lay->align.bytes();
+        if (alignmentMap != nullptr && anchor.valid())
+            if (auto const* p = alignmentMap->tryGet(anchor);
+                p != nullptr && p->alignmentBytes > effectiveAlign)
+                effectiveAlign = p->alignmentBytes;
+        std::array<MirInstId, 1> aops{total};
+        MirInstId const av =
+            mir.addInst(MirOpcode::Alloca, aops, ptrTy, /*payload=*/0,
+                        MirInstFlags::None, /*payload2=*/effectiveAlign);
+        addressableLocal[a.v] = av;
+        return av;
     }
 
     // FC7 (D-FC7-MEMBER-ACCESS): the cached layout of aggregate `aggTy`, or
@@ -2525,13 +4264,24 @@ struct Lowerer {
         return sc.empty() ? t : interner.primitive(static_cast<TypeKind>(sc[0]));
     }
 
+    // D-CSUBSET-BITINT-BITFIELD: a `_BitInt(N<=64)` bit-field's allocation unit runs
+    // at its native container (I8/U8..I64/U64 by width+signedness), the same
+    // Enum→underlying trick (the reprKind precedent). Resolving here means
+    // bitfieldIsSigned / the shift-mask constants / mapCast all see a plain primitive,
+    // never BitInt. Wide (N>64) BitInt bit-fields are rejected at the semantic tier
+    // (the >64 allocation-unit cap) and never reach codegen.
+    [[nodiscard]] TypeId bitIntReprType(TypeId t) {
+        if (!t.valid() || interner.kind(t) != TypeKind::BitInt) return t;
+        return interner.primitive(interner.bitIntContainerKind(t));
+    }
+
     // FC8 D-CSUBSET-BITFIELD: extract a bit-field value from a loaded allocation
     // unit. Unsigned: `(unit >> bitOffset) & ((1<<W)-1)`. Signed: sign-extend via
     // `(unit << (B - bitOffset - W)) >>arith (B - W)` (B = unit bits). All ops are
     // computed at the field's (unit) type — reuses the existing MIR shift/and ops.
     [[nodiscard]] MirInstId
     emitBitfieldExtract(MirInstId unitVal, BitFieldPlacement const& p, TypeId fieldTy) {
-        fieldTy = enumReprType(fieldTy);   // enum bit-field → underlying integer
+        fieldTy = bitIntReprType(enumReprType(fieldTy));   // enum/BitInt → container
         std::uint32_t const B0 = p.unitBytes * 8;
         // c73 (D-CSUBSET-32BIT-ALU-FORMS): a SUB-INT (u8/u16/i8/i16/char) allocation
         // UNIT makes the shift/mask/and ops sub-int-width, which walls at the
@@ -2595,7 +4345,7 @@ struct Lowerer {
         // `volatile`, BOTH halves of the read-modify-write (the unit Load below
         // and the unit Store at the end) carry the flag — the whole RMW is one
         // volatile access of the unit, never elided/reordered.
-        fieldTy = enumReprType(fieldTy);   // enum bit-field → underlying integer
+        fieldTy = bitIntReprType(enumReprType(fieldTy));   // enum/BitInt → container
         // c73 (D-CSUBSET-32BIT-ALU-FORMS): mirror emitBitfieldExtract — a SUB-INT
         // unit computes the read-modify-write at the promoted int width, then
         // Truncs the merged unit back to the field type for the Store. A native
@@ -2742,6 +4492,20 @@ struct Lowerer {
 
     [[nodiscard]] MirInstId lowerLvalueAddressNode(HirNodeId node) {
         HirKind const k = hir.kind(node);
+        // C23 _BitInt(N>64) (D-CSUBSET-BITINT-C2-WIDE, Model A): a wide-`_BitInt`-typed
+        // arithmetic/bitwise/shift/convert result is an AGGREGATE rvalue — the FIRST
+        // one in C produced by arithmetic. It has no SSA value, so it is realized BY
+        // ADDRESS: materialize the multi-limb result into a fresh slot and return the
+        // slot address. `request` flips a wide-BitInt VALUE read here too, so a wide
+        // operand of a compare/`!`/wide→scalar-cast is delivered as an address to the
+        // combine* value arm. (A wide-BitInt lvalue Ref/Deref/Member/Index falls
+        // through to the ordinary lvalue arms below.)
+        if (isWideBitInt(interner, hir.typeId(node))) {
+            if (k == HirKind::BinaryOp) return materializeWideBinaryOp(node);
+            if (k == HirKind::UnaryOp)  return materializeWideUnaryOp(node);
+            if (k == HirKind::Cast)     return materializeWideCast(node);
+            if (k == HirKind::Literal)  return materializeWideLiteral(node);
+        }
         // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value struct/union-
         // returning CALL is an aggregate rvalue materialized into a result slot;
         // its lvalue address IS that slot. `lowerExpr(Call)` does the
@@ -2749,11 +4513,15 @@ struct Lowerer {
         // consumer (`a = f()`, `g(f())`, `f().x`, `return f();`) reaches the
         // result by address (the call is emitted exactly once — see the
         // call-once pin). A scalar call is not an lvalue → falls through.
+        // D-CSUBSET-BITINT-C2-WIDE: a wide-`_BitInt`-returning call is likewise an
+        // aggregate rvalue — its result slot is set up by `callSetup`/`finishCall`
+        // (the wide `isByValueClass` return classification), reached by address here.
         if (k == HirKind::Call) {
             TypeId const ct = hir.typeId(node);
             if (ct.valid()
                 && (interner.kind(ct) == TypeKind::Struct
-                    || interner.kind(ct) == TypeKind::Union))
+                    || interner.kind(ct) == TypeKind::Union
+                    || isWideBitInt(interner, ct)))
                 return lowerExpr(node);
         }
         if (k == HirKind::Ref) {
@@ -2929,12 +4697,11 @@ struct Lowerer {
             // model is memory-based (no LIR aggregate-width SSA value), so the
             // "merge" is a shared memory location, not an SSA Phi (a scalar
             // ternary in lowerExpr uses a Phi; an aggregate one cannot). Keys
-            // ONLY on HirKind + the type's kind (Struct/Union/Array) + the
+            // ONLY on HirKind + the type's kind (Struct/Union/Array, or a wide
+            // `_BitInt` — D-CSUBSET-BITINT-C2-WIDE, also memory-resident) + the
             // config-driven layout — no target/arch/format identity.
             TypeId const at = hir.typeId(node);
-            TypeKind const ak = at.valid() ? interner.kind(at) : TypeKind::Void;
-            if (ak == TypeKind::Struct || ak == TypeKind::Union
-                || ak == TypeKind::Array) {
+            if (isMemoryResidentType(interner, at)) {
                 auto kids = hir.children(node);
                 if (kids.size() != 3) {
                     unsupported(node, "malformed Ternary (expect 3 children)");
@@ -3016,10 +4783,18 @@ struct Lowerer {
             if (ak == TypeKind::Struct || ak == TypeKind::Union) {
                 return lowerVaArgAggregate(node);
             }
+            // A NATIVE scalar va_arg (a <=64-bit type, incl. `_BitInt(N<=64)`) is an
+            // rvalue lowered via lowerExpr — never by address — so reaching here means
+            // the type is a wide `_BitInt(N>64)`: memory-resident, so it IS requested by
+            // address, but its multi-limb by-address gather is a later cycle. Fail LOUD
+            // either way (a genuine misroute of a native scalar, or the deferred wide
+            // path) — never a silent low-limb-only read.
             unsupported(node,
-                "internal: a non-aggregate va_arg reached lowerLvalueAddress — a "
-                "scalar va_arg is an rvalue lowered via lowerExpr "
-                "(D-FC12A-VARIADIC-CALLEE)");
+                "internal: a va_arg reached lowerLvalueAddress that is neither a struct/"
+                "union nor a native scalar — a native scalar va_arg is an rvalue lowered "
+                "via lowerExpr, while a wide `_BitInt(N>64)` va_arg is memory-resident but "
+                "its multi-limb by-address gather is a later cycle "
+                "(D-FC12A-VARIADIC-CALLEE / D-CSUBSET-BITINT-C2-WIDE)");
             return InvalidMirInst;
         }
         // Any OTHER lvalue kind is still unsupported — fail loud (the
@@ -3094,11 +4869,38 @@ struct Lowerer {
         // This is the single chokepoint that also widths the enum-bit-field
         // init zero-store (D-CSUBSET-ENUM-BITFIELD).
         ty = enumReprType(ty);
+        // D-CSUBSET-BITINT: a `_BitInt(N)`-typed constant IS its container integer
+        // value — `interner.primitive(BitInt)` has no width scalar (the enum twin),
+        // so resolve BitInt → its native container kind (I8/I16/I32/I64) before
+        // materializing. Reached by the mask/shift-amount consts of an N≥17 wrap.
+        if (ty.valid() && interner.kind(ty) == TypeKind::BitInt)
+            ty = interner.primitive(interner.bitIntContainerKind(ty));
         TypeKind const k = ty.valid() ? interner.kind(ty) : TypeKind::I32;
         MirLiteralValue lit;
         lit.value = v;
         lit.core  = k;
         return mir.addConst(std::move(lit), interner.primitive(k));
+    }
+
+    // VLA C3 (D-CSUBSET-VLA, MINOR-10): the ROOT VLA object SymbolId of a subscript
+    // chain — peel the Index base `children[0]` down to the terminal `Ref`. `a[i]` →
+    // `a`; `a[i][j]` → `a`. Returns an INVALID SymbolId if the base is anything OTHER
+    // than a single VLA root symbol (a row via a ternary/cast/deref) so the caller
+    // FAILS LOUD rather than form a bogus stride.
+    [[nodiscard]] SymbolId vlaIndexRootSymbol(HirNodeId indexNode) const {
+        HirNodeId cur = indexNode;
+        for (int guard = 0; guard < 4096 && cur.valid(); ++guard) {
+            HirKind const k = hir.kind(cur);
+            if (k == HirKind::Index) {
+                auto kids = hir.children(cur);
+                if (kids.empty()) return SymbolId{};
+                cur = kids[0];   // peel to the base
+                continue;
+            }
+            if (k == HirKind::Ref) return SymbolId{hir.payload(cur)};
+            return SymbolId{};   // not a single VLA root object
+        }
+        return SymbolId{};
     }
 
     // Pre-multiply an element index by its element STRIDE so the resulting
@@ -3114,6 +4916,62 @@ struct Lowerer {
     // element type.
     [[nodiscard]] MirInstId scaleIndexToBytes(MirInstId idx, TypeId elemTy,
                                               HirNodeId node, TypeId indexTy) {
+        // VLA C3 (CRITICAL-1): a VLA-ROW element (the subscript RESULT type contains a
+        // VLA — `int a[n][m]`'s `a[i]` yields the `int[m]` row, `int a[5][n]`'s `a[i]`
+        // yields the `int[n]` row) has a RUNTIME stride = the per-object byte size
+        // frozen at the VLA's decl. Load the `(root-sym, elemTy)` slot rather than a
+        // compile-time `elementStride` (which nullopts on a VLA element). `elemTy ==
+        // hir.typeId(node)` by construction (both Index arms pass the Index node's
+        // type), so the key matches EXACTLY what `vlaAllocaForLocal` stored — no depth
+        // arithmetic, no off-by-one. A FIXED row (`int a[n][5]`'s `int[5]`) is NOT a
+        // VLA container → falls through to the compile-time path below.
+        if (interner.typeContainsVla(elemTy)) {
+            SymbolId const root = vlaIndexRootSymbol(node);
+            if (!root.valid()) {
+                unsupported(node, "variable-length array subscript base is not a single "
+                                  "VLA object (e.g. a row via a ternary/cast) — its "
+                                  "runtime row stride cannot be recovered");
+                return InvalidMirInst;
+            }
+            auto const it = vlaStrideSlot.find(vlaSlotKey(root.v, elemTy.v));
+            if (it == vlaStrideSlot.end()) {
+                // A DECLARED VLA object's decl materializes its stride slots and
+                // dominates every use, so a missing slot here means the subscript base
+                // is NOT such an object — realistically a pointer-to-VLA
+                // (`int (*p)[m]; p[i]`), whose runtime row stride C3 does not yet track.
+                // Fail loud with a real diagnostic (deferred, C4), never a guessed stride.
+                unsupported(node, "a pointer-to-variable-length-array subscript (or a "
+                                  "similar VLA row not reached as a declared VLA object) "
+                                  "is not yet supported — its runtime row stride is not "
+                                  "tracked (deferred, D-CSUBSET-VLA)");
+                return InvalidMirInst;
+            }
+            TypeId const i64ty = i64Ty();
+            std::array<MirInstId, 1> ld{it->second};
+            MirInstId const stride = mir.addInst(MirOpcode::Load, ld, i64ty);
+            if (!stride.valid()) return InvalidMirInst;
+            // Widen the index to i64 so the byte-offset Mul matches the i64 runtime
+            // stride (a truncation to a narrower `indexTy` would drop the high bits of
+            // a large row size). The subscript was already integer-promoted in HIR.
+            MirInstId idx64 = idx;
+            if (!(indexTy.valid() && interner.kind(indexTy) == TypeKind::I64)) {
+                TypeKind const fromK =
+                    indexTy.valid() ? resolveScalarIntKind(indexTy) : TypeKind::I32;
+                if (fromK != TypeKind::I64) {
+                    MirOpcode const ext = mapCast(fromK, TypeKind::I64);
+                    if (ext == MirOpcode::Invalid) {
+                        unsupported(node, "variable-length array subscript index has a "
+                                          "non-integer type with no widening to i64");
+                        return InvalidMirInst;
+                    }
+                    std::array<MirInstId, 1> eo{idx};
+                    idx64 = mir.addInst(ext, eo, i64ty);
+                    if (!idx64.valid()) return InvalidMirInst;
+                }
+            }
+            std::array<MirInstId, 2> ops{idx64, stride};
+            return mir.addInst(MirOpcode::Mul, ops, i64ty);
+        }
         std::optional<std::uint64_t> const stride = elementStride(elemTy);
         if (!stride.has_value()) {
             unsupported(node, "array/pointer index element type has no "
@@ -3264,8 +5122,12 @@ struct Lowerer {
                     MirOpcode::Gep, gepOps, interner.pointer(fieldTy));
                 if (!fieldPtr.valid()) return false;
                 TypeKind const fk = interner.kind(fieldTy);
-                if (fk == TypeKind::Struct || fk == TypeKind::Union) {
-                    if (hir.kind(child) == HirKind::ConstructAggregate) {
+                // D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt` field is memory-resident
+                // (like a struct/union field) — it copies from the init value's
+                // ADDRESS, never a scalar Store of a (pointer-width) rvalue.
+                if (isByValueClass(interner, fieldTy)) {
+                    if (fk != TypeKind::BitInt
+                        && hir.kind(child) == HirKind::ConstructAggregate) {
                         if (!lowerAggregateInitIntoSlot(child, fieldPtr, fieldTy, vf))
                             return false;
                     } else {
@@ -3387,8 +5249,11 @@ struct Lowerer {
             // field-into-field copy — that needs the byte/field-wise
             // aggregate copy, fail loud (D-FC7-AGGREGATE-COPY-MEMCPY).
             TypeKind const fk = interner.kind(fieldTy);
-            if (fk == TypeKind::Struct || fk == TypeKind::Union) {
-                if (hir.kind(kids[i]) == HirKind::ConstructAggregate) {
+            // D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt` field copies from the init
+            // value's ADDRESS (memory-resident), never a scalar Store below.
+            if (isByValueClass(interner, fieldTy)) {
+                if (fk != TypeKind::BitInt
+                    && hir.kind(kids[i]) == HirKind::ConstructAggregate) {
                     if (!lowerAggregateInitIntoSlot(kids[i], fieldPtr, fieldTy, vf))
                         return false;
                     continue;
@@ -3468,8 +5333,11 @@ struct Lowerer {
             if (!elemPtr.valid()) return false;
 
             TypeKind const ek = interner.kind(elemTy);
-            if (ek == TypeKind::Struct || ek == TypeKind::Union) {
-                if (hir.kind(kids[j]) == HirKind::ConstructAggregate) {
+            // D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt` array element copies from the
+            // init value's ADDRESS (memory-resident), never a scalar Store below.
+            if (isByValueClass(interner, elemTy)) {
+                if (ek != TypeKind::BitInt
+                    && hir.kind(kids[j]) == HirKind::ConstructAggregate) {
                     if (!lowerAggregateInitIntoSlot(kids[j], elemPtr, elemTy, vf))
                         return false;
                     continue;
@@ -3594,6 +5462,12 @@ struct Lowerer {
         // a byte-wise copy moves exactly N bytes — the array twin of the Union arm.
         if (aggKind == TypeKind::Array)
             return lowerByteWiseCopy(srcPtr, dstPtr, layout->size, vf);
+        // D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt(N>64)` is a multi-limb MEMORY
+        // object with no field list — its copy is a whole-object byte-wise copy of
+        // ceil(N/64)*8 bytes (the twin of the Union/Array arm). A scalar (aggregate-
+        // width) Load+Store would move only the low 8 bytes → a silent partial copy.
+        if (isWideBitInt(interner, aggTy))
+            return lowerByteWiseCopy(srcPtr, dstPtr, layout->size, vf);
         if (aggKind != TypeKind::Struct) {
             unsupported(atNode, "aggregate copy of a non-struct/union/array value "
                                 "is not supported");
@@ -3617,11 +5491,14 @@ struct Lowerer {
                                 "layout field-offset count (internal invariant)");
             return false;
         }
+        // CRIT-B (D-CSUBSET-BITINT-C2-WIDE): a struct with ANY memory-resident field
+        // (struct / union / array / a wide `_BitInt` member) copies BYTE-WISE. A wide-
+        // BitInt field falls through the flat-scalar field-wise Load (16+ bytes read
+        // as one 8-byte value) → a silent partial copy, so it must join the byte-wise
+        // branch. `isMemoryResidentType` includes the wide-BitInt case by construction.
         bool anyAggregateField = false;
         for (TypeId ft : fieldTypes) {
-            TypeKind const fk = interner.kind(ft);
-            if (fk == TypeKind::Struct || fk == TypeKind::Union
-                || fk == TypeKind::Array) {
+            if (isMemoryResidentType(interner, ft)) {
                 anyAggregateField = true;
                 break;
             }
@@ -3758,9 +5635,10 @@ struct Lowerer {
             ctx.byvalCalleeSig.valid()
             && interner.kind(ctx.byvalCalleeSig) == TypeKind::FnSig
             && interner.fnIsVariadic(ctx.byvalCalleeSig);
-        if (t.valid()
-            && (interner.kind(t) == TypeKind::Struct
-                || interner.kind(t) == TypeKind::Union)) {
+        // D-CSUBSET-BITINT-C2-WIDE: a wide-`_BitInt`-returning call is classified +
+        // slot-materialized here exactly like a struct/union return (isByValueClass);
+        // finishCall then routes it through emitStructReturningCall (2-GPR / sret).
+        if (isByValueClass(interner, t)) {
             ctx.structRetAbi = byValueClassify(t);
             if (!ctx.structRetAbi.has_value()) {
                 unsupported(node,
@@ -3813,8 +5691,10 @@ struct Lowerer {
         std::size_t const i = ctx.argIdx;
         TypeId const argTy = hir.typeId(kids[i]);
         if (argTy.valid()) {
-            TypeKind const ak = interner.kind(argTy);
-            if (ak == TypeKind::Struct || ak == TypeKind::Union) {
+            // D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt` arg is passed BY VALUE exactly
+            // like a struct/union (isByValueClass → classifyAggregate → 2-GPR / by-ref),
+            // materialized here; it never becomes a ScalarPending register value.
+            if (isByValueClass(interner, argTy)) {
                 if (!emitByValueStructCallArg(ctx, kids[i], argTy))
                     return CallArgStep::Error;
                 if (i == ctx.fnParamsSize) {
@@ -4550,6 +6430,143 @@ struct Lowerer {
         }
     }
 
+    // ── VLA C5 (D-CSUBSET-VLA): block-scope stack teardown helpers ──────────
+    // A dynamic VLA descends SP; C5 restores it on every NON-return exit of the
+    // declaring scope. The decisions live HERE (HIR→MIR) because MIR is flat — a
+    // Br/CondBr carries no scope tag, so "which VLA scopes does this edge exit" must
+    // be computed while lexical-block structure is still visible.
+
+    // Map each LabelStmt's ordinal → its HIR node (goto-teardown ancestry). Populated
+    // at function entry, alongside the addressTakenLabels scan. Reset per function.
+    void collectLabelNodes(HirNodeId node) {
+        if (!node.valid()) return;
+        if (hir.kind(node) == HirKind::LabelStmt)
+            labelNodeByOrdinal_[hir.labelOrdinal(node)] = node;
+        for (HirNodeId child : hir.children(node)) collectLabelNodes(child);
+    }
+    [[nodiscard]] HirNodeId resolveLabelNode(std::uint32_t ordinal) const {
+        auto it = labelNodeByOrdinal_.find(ordinal);
+        return it == labelNodeByOrdinal_.end() ? HirNodeId{} : it->second;
+    }
+
+    // Open a teardown watermark for a dynamic-VLA local: emit a StackSave (SP
+    // captured just BEFORE the VLA's `sub sp`) and push a vlaScopeStack_ frame. The
+    // caller (VarDecl lowering) invokes this IMMEDIATELY before `allocaForLocal`
+    // emits the VLA alloca — the fixed stride-slot allocas emitted in between do NOT
+    // move SP (they are FP-relative frame slots), so the save == SP pre-`sub sp`.
+    // The scope node is EITHER a compound-statement Block (a body/nested-block VLA,
+    // torn down at the block's exit) OR a ForStmt (a `for`-INIT VLA — declared once at
+    // loop entry, persists across iterations, torn down at the loop's EXIT edges by
+    // the For driver, NEVER on the back-edge). A VLA in a MULTI-declarator for-init
+    // (`for (int a[n], b[m]; ...)`) is wrapped in a Block whose parent is the ForStmt;
+    // that Block's own teardown would free the VLA at the END OF THE INIT (before the
+    // body), so that narrow shape is deferred fail-loud (never a silent early-free).
+    [[nodiscard]] bool emitStackSaveForVla(HirNodeId declNode) {
+        HirNodeId const scopeNode = hir.parent(declNode);
+        bool const scopeIsBlock =
+            scopeNode.valid() && hir.kind(scopeNode) == HirKind::Block;
+        bool const scopeIsForInit =
+            scopeNode.valid() && hir.kind(scopeNode) == HirKind::ForStmt;
+        if (!scopeIsBlock && !scopeIsForInit) {
+            unsupported(declNode,
+                "a variable-length array in this declaration position is not yet "
+                "torn down at scope exit (D-CSUBSET-VLA)");
+            return false;
+        }
+        // A multi-declarator for-init Block (parent == ForStmt, and it IS that for's
+        // init clause): defer — its Block teardown would free the VLA before the body.
+        if (scopeIsBlock) {
+            HirNodeId const gp = hir.parent(scopeNode);
+            if (gp.valid() && hir.kind(gp) == HirKind::ForStmt) {
+                auto const initN = hir.forInit(gp);
+                if (initN.has_value() && *initN == scopeNode) {
+                    unsupported(declNode,
+                        "a variable-length array in a MULTI-declarator `for`-init "
+                        "clause (`for (int a[n], b[m]; ...)`) is not yet torn down at "
+                        "loop exit — deferred (D-CSUBSET-VLA-FOR-INIT-MULTIDECL)");
+                    return false;
+                }
+            }
+        }
+        std::uint32_t const scopeId = vlaScopeCounter_++;
+        MirInstId const save =
+            mir.addInst(MirOpcode::StackSave, {}, i64Ty(), scopeId);
+        if (!save.valid()) return false;
+        vlaScopeStack_.push_back({declNode, scopeNode, save, scopeId});
+        return true;
+    }
+
+    // Emit a StackRestore to the entry watermark of vlaScopeStack_[frameIdx] (frees
+    // that scope's VLA + every DEEPER one — the stack grows down, so a shallower
+    // watermark reclaims all below it). scopeId payload pairs it to its StackSave.
+    void emitVlaRestore(std::size_t frameIdx) {
+        VlaScopeFrame const& fr = vlaScopeStack_[frameIdx];
+        std::array<MirInstId, 1> ops{fr.saveBefore};
+        mir.addInst(MirOpcode::StackRestore, ops, InvalidType, fr.scopeId);
+    }
+
+    // A lexical block whose lowering opened VLA scopes at depth >= `baseDepth` is
+    // finishing. On a FALL-THROUGH exit (the open block NOT already sealed by a
+    // break/continue/goto/return — audit fix #10), restore SP to the SHALLOWEST VLA
+    // this block declared (index == baseDepth), then pop those frames. `emitRestore
+    // = false` on the error-bail path (pop only; compilation is aborting). No-op —
+    // emits NEITHER op — when the block declared no VLA (the byte-clean common case).
+    void closeVlaBlockScope(std::size_t baseDepth, bool emitRestore) {
+        if (vlaScopeStack_.size() <= baseDepth) return;   // no VLA opened here
+        if (emitRestore && !mir.openBlockHasTerminator())
+            emitVlaRestore(baseDepth);
+        vlaScopeStack_.resize(baseDepth);
+    }
+
+    // Is label `L` inside `fr`'s VLA scope? Drives which scopes a `goto` exits.
+    //  * A BLOCK-scope VLA: true iff fr.scopeNode is a lexical ancestor of L AND
+    //    fr.declNode textually PRECEDES (in the block's child order) the child leading
+    //    to L — the VLA's scope runs from its decl to the end of its block (C99 6.2.4).
+    //  * A for-INIT VLA (scopeNode is the ForStmt): true iff the ForStmt is a lexical
+    //    ancestor of L — a for-init object is in scope for the ENTIRE for statement
+    //    (there is no position "before" the for-init inside the loop), so ANY label in
+    //    the loop is enclosed; a goto to a label OUTSIDE the for exits the for-init.
+    [[nodiscard]] bool vlaFrameEnclosesLabel(VlaScopeFrame const& fr,
+                                             HirNodeId L) const {
+        bool const scopeIsBlock = hir.kind(fr.scopeNode) == HirKind::Block;
+        HirNodeId prev = L;
+        for (HirNodeId cur = hir.parent(L); cur.valid(); cur = hir.parent(cur)) {
+            if (cur == fr.scopeNode) {
+                if (!scopeIsBlock) return true;   // for-init: whole-for scope
+                auto kids = hir.children(cur);
+                int pIdx = -1, dIdx = -1;
+                for (std::size_t i = 0; i < kids.size(); ++i) {
+                    if (kids[i] == prev)        pIdx = static_cast<int>(i);
+                    if (kids[i] == fr.declNode) dIdx = static_cast<int>(i);
+                }
+                return dIdx >= 0 && pIdx >= 0 && dIdx < pIdx;
+            }
+            prev = cur;
+        }
+        return false;   // scopeNode not an ancestor of L → L is outside this scope
+    }
+
+    // Emit the SP teardown for a `goto`. Every open vlaScopeStack_ frame encloses the
+    // goto textually; those NOT enclosing the target label L are EXITED. Scopes nest,
+    // so the enclosing-L frames form a PREFIX and the exited ones a SUFFIX — restore
+    // to the SHALLOWEST exited frame (frees all exited). The entry-side ban
+    // (H_VlaJumpIntoScope) guarantees a legal goto never enters a VLA scope past its
+    // decl, so the restore-target StackSave always dominates the goto (SSA-valid).
+    // Nothing to do when the goto stays within every open scope (frees nothing).
+    void emitGotoVlaTeardown(HirNodeId gotoNode) {
+        if (vlaScopeStack_.empty()) return;
+        HirNodeId const L = resolveLabelNode(hir.labelOrdinal(gotoNode));
+        for (std::size_t k = 0; k < vlaScopeStack_.size(); ++k) {
+            // A defensively-unresolved L (should not occur post-HIR-verify) frees ALL
+            // open scopes — the safe over-approximation for an outward jump, never a
+            // leak.
+            if (!L.valid() || !vlaFrameEnclosesLabel(vlaScopeStack_[k], L)) {
+                emitVlaRestore(k);
+                return;
+            }
+        }
+    }
+
     // c69 (D-MIR-ENTRY-BLOCK-ALLOCA-HOIST): collect every body-local `VarDecl`
     // node, so `lowerFunction` can pre-emit its storage `Alloca` into the ENTRY
     // block (which dominates every use) BEFORE lowering the body. Without this a
@@ -4628,9 +6645,12 @@ struct Lowerer {
     // A scalar discard lowers as an ordinary rvalue via `lowerExpr`.
     [[nodiscard]] bool lowerDiscardedExpr(HirNodeId expr) {
         if (TypeId const et = hir.typeId(expr); et.valid()) {
-            TypeKind const ek = interner.kind(et);
-            if (ek == TypeKind::Struct || ek == TypeKind::Union
-                || ek == TypeKind::Array) {
+            // A memory-resident result (Struct/Union/Array AND a wide `_BitInt(N>64)`,
+            // D-CSUBSET-BITINT-C2-WIDE) has no bare-SSA value — route it BY ADDRESS, the
+            // same by-construction path aggregates use. `isMemoryResidentType` folds the
+            // wide-BitInt case in (previously a discarded wide expr relied on lowerExpr's
+            // request-flip — harmless, but off the shared funnel).
+            if (isMemoryResidentType(interner, et)) {
                 return lowerLvalueAddress(expr).valid();
             }
         }
@@ -4939,8 +6959,11 @@ struct Lowerer {
         // type means a NEW consumer lowered an aggregate va_arg as a bare rvalue —
         // fail loud rather than synthesize a Phi-of-aggregate / aggregate-width Load
         // (a latent miscompile), mirroring the Ternary anti-resurrection guard.
-        TypeKind const tk = interner.kind(t);
-        if (tk == TypeKind::Struct || tk == TypeKind::Union) {
+        // D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt` va_arg is memory-resident too —
+        // it must reach the by-address VaArg arm; a bare scalar read would silently
+        // load only its low limb. (Wide-BitInt va_arg codegen is itself a later cycle,
+        // so the address arm currently fails loud too — but never SILENTLY here.)
+        if (isByValueClass(interner, t)) {
             unsupported(node,
                 "internal: an aggregate-typed va_arg must be lowered by ADDRESS via "
                 "lowerLvalueAddress, never as a bare SSA rvalue — the MIR has no "
@@ -5793,6 +7816,12 @@ struct Lowerer {
         // others. (c60: the Switch frame no longer needs a per-arm cursor — its
         // body lowers as ONE Block via the work-stack — so it carries only `bb0`.)
         std::uint32_t aux{};
+        // VLA C5 (D-CSUBSET-VLA): for a Block frame, `vlaScopeStack_.size()` captured
+        // at the block's entry (phase 0). At the block's fall-through finish, the
+        // frames [vlaBase, size) are the VLAs this block declared — restore SP to the
+        // shallowest (index vlaBase) + pop them (`closeVlaBlockScope`). Unused (0) by
+        // the other kinds.
+        std::uint32_t vlaBase{};
     };
 
     // LIFO cursor for an unbounded child-statement list (a Block's stmts, or a
@@ -5877,6 +7906,10 @@ struct Lowerer {
             case StmtFrame::Kind::Block: {
                 if (f.phase == 0) {
                     f.aux = static_cast<std::uint32_t>(blockCtxs.size());
+                    // VLA C5 (D-CSUBSET-VLA): watermark the VLA-scope stack at this
+                    // block's entry, so its fall-through finish restores + pops
+                    // exactly the VLAs it declared.
+                    f.vlaBase = static_cast<std::uint32_t>(vlaScopeStack_.size());
                     blockCtxs.push_back({.idx = 0});
                     f.phase = 1;
                     // fall into phase 1 below (no sub-request yet)
@@ -5884,10 +7917,15 @@ struct Lowerer {
                 // phase 1: dispatch the next child (or finish). Re-address the
                 // ctx by index — a nested block grew `blockCtxs`.
                 std::uint32_t const ctxIdx = f.aux;
+                std::uint32_t const vlaBase = f.vlaBase;
                 HirNodeId const node2 = f.node;
                 if (f.phase == 2) {
-                    // Resuming after a child finished. Bail on failure.
-                    if (!ok) { blockCtxs.pop_back(); work.pop_back(); break; }
+                    // Resuming after a child finished. Bail on failure (pop the VLA
+                    // frames this block opened; no restore — we are aborting).
+                    if (!ok) {
+                        closeVlaBlockScope(vlaBase, /*emitRestore=*/false);
+                        blockCtxs.pop_back(); work.pop_back(); break;
+                    }
                     auto kids = hir.children(node2);
                     std::uint32_t const justDone = blockCtxs[ctxIdx].idx;
                     // A child may have sealed the open block mid-block; a
@@ -5905,6 +7943,10 @@ struct Lowerer {
                 auto kids = hir.children(node2);
                 std::uint32_t const i = blockCtxs[ctxIdx].idx;
                 if (i >= kids.size()) {
+                    // VLA C5: the block ran to completion — on a fall-through exit
+                    // restore SP to the shallowest VLA it declared (before the
+                    // enclosing frame's back-edge / Br), then pop those frames.
+                    closeVlaBlockScope(vlaBase, /*emitRestore=*/true);
                     blockCtxs.pop_back();
                     work.pop_back();
                     ok = true;
@@ -6013,6 +8055,9 @@ struct Lowerer {
                     mir.addCondBr(cond, body, exit);
                     mir.beginBlock(body);
                     branchStack.push_back({header, exit});
+                    // VLA C5 (D-CSUBSET-VLA): record the VLA depth so a break/continue
+                    // targeting this loop restores SP past every VLA opened inside it.
+                    branchStack.back().vlaDepthAtPush = vlaScopeStack_.size();
                     f.bb0 = header; f.bb1 = body; f.bb2 = exit;
                     f.phase = 1;
                     HirNodeId const bodyN = hir.loopBody(node2);
@@ -6052,6 +8097,7 @@ struct Lowerer {
                     mir.addBr(body);
                     mir.beginBlock(body);
                     branchStack.push_back({continueBB, exit, false});
+                    branchStack.back().vlaDepthAtPush = vlaScopeStack_.size();  // VLA C5
                     f.bb0 = body; f.bb1 = continueBB; f.bb2 = exit;
                     f.phase = 1;
                     HirNodeId const bodyN = hir.loopBody(node2);
@@ -6107,10 +8153,18 @@ struct Lowerer {
                     auto const initN   = hir.forInit(node2);
                     auto const condN   = hir.loopCondition(node2);
                     auto const updateN = hir.forUpdate(node2);
+                    // VLA C5 (D-CSUBSET-VLA): watermark the VLA stack BEFORE the init,
+                    // so a for-INIT VLA is pushed at exactly `vlaBase`. The init runs
+                    // ONCE at loop entry, so its VLA PERSISTS across every iteration —
+                    // the For driver frees it at the loop EXIT (phase 1), NEVER on the
+                    // back-edge (the body block's watermark is deeper, so its per-
+                    // iteration teardown cannot reach the for-init frame).
+                    f.vlaBase = static_cast<std::uint32_t>(vlaScopeStack_.size());
                     if (initN.has_value()) {
                         if (!lowerForClauseNode(*initN)) {
                             if (!mir.openBlockHasTerminator())
                                 mir.addUnreachable();
+                            vlaScopeStack_.resize(f.vlaBase);  // pop any for-init frame
                             work.pop_back(); ok = false; break;
                         }
                     }
@@ -6135,6 +8189,7 @@ struct Lowerer {
                             sealCreatedAsUnreachable(body);
                             sealCreatedAsUnreachable(update);
                             sealCreatedAsUnreachable(exit);
+                            vlaScopeStack_.resize(f.vlaBase);  // pop the for-init frame
                             work.pop_back(); ok = false; break;
                         }
                         mir.addCondBr(cond, body, exit);
@@ -6143,6 +8198,7 @@ struct Lowerer {
                     }
                     mir.beginBlock(body);
                     branchStack.push_back({backTarget, exit});
+                    branchStack.back().vlaDepthAtPush = vlaScopeStack_.size();  // VLA C5
                     f.bb0 = header; f.bb1 = body; f.bb2 = update;
                     f.bb3 = exit;   f.bb4 = backTarget;
                     f.phase = 1;
@@ -6154,11 +8210,13 @@ struct Lowerer {
                     MirBlockId const update     = f.bb2;
                     MirBlockId const exit       = f.bb3;
                     MirBlockId const backTarget = f.bb4;
+                    std::size_t const vlaBase   = f.vlaBase;  // VLA C5: for-init watermark
                     branchStack.pop_back();
                     if (!ok) {
                         if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                         sealCreatedAsUnreachable(update);
                         sealCreatedAsUnreachable(exit);
+                        vlaScopeStack_.resize(vlaBase);  // pop the for-init frame (aborting)
                         work.pop_back(); ok = false; break;
                     }
                     if (!mir.openBlockHasTerminator()) mir.addBr(backTarget);
@@ -6169,11 +8227,24 @@ struct Lowerer {
                             if (!mir.openBlockHasTerminator())
                                 mir.addUnreachable();
                             sealCreatedAsUnreachable(exit);
+                            vlaScopeStack_.resize(vlaBase);  // pop the for-init frame
                             work.pop_back(); ok = false; break;
                         }
                         mir.addBr(header);
                     }
                     mir.beginBlock(exit);
+                    // VLA C5 (D-CSUBSET-VLA): free the for-INIT VLA at the loop EXIT.
+                    // The exit block is the merge of the cond-false edge AND every
+                    // `break` (a break already restored the body VLAs to THIS post-init
+                    // watermark, and the back-edge kept the for-init live — so both
+                    // predecessors arrive with SP at the post-init level). ONE restore
+                    // here reclaims the for-init on every exit path; a `goto` OUT of the
+                    // loop restores it via the ancestry walk instead (it bypasses this
+                    // block). No-op when the for-init declared no VLA.
+                    if (vlaScopeStack_.size() > vlaBase) {
+                        emitVlaRestore(vlaBase);
+                        vlaScopeStack_.resize(vlaBase);
+                    }
                     work.pop_back(); ok = true;
                 }
                 break;
@@ -6255,6 +8326,7 @@ struct Lowerer {
                     mir.addSwitch(disc, cases, defaultBB);
                     // Push the break-frame ONCE for the whole switch.
                     branchStack.push_back({MirBlockId{}, exitBB});
+                    branchStack.back().vlaDepthAtPush = vlaScopeStack_.size();  // VLA C5
                     // Only a non-label-first body (a jumped-over leading decl) needs a
                     // fresh predecessor-less block (pruned as unreachable); a case
                     // marker opens its own label-block (see the recursive form).
@@ -6311,9 +8383,18 @@ struct Lowerer {
         HirKind const k = hir.kind(node);
         switch (k) {
             case HirKind::Block: {
+                // NOTE (VLA C5, D-CSUBSET-VLA): this recursive Block arm is DEAD via
+                // the StmtFrame driver (enterStmt intercepts Block); the LIVE block-
+                // scope VLA teardown lives in StmtFrame::Kind::Block. The same
+                // `closeVlaBlockScope` helper is mirrored here so a future
+                // reactivation of this fallback cannot silently leak the dynamic stack.
+                std::size_t const vlaBase = vlaScopeStack_.size();
                 auto kids = hir.children(node);
                 for (std::size_t i = 0; i < kids.size(); ++i) {
-                    if (!lowerStmt(kids[i])) return false;
+                    if (!lowerStmt(kids[i])) {
+                        closeVlaBlockScope(vlaBase, /*emitRestore=*/false);
+                        return false;
+                    }
                     // A child may unconditionally transfer control and seal the
                     // open block mid-block (the `Block{ infinite-loop, Unreachable }`
                     // wrapper cst_to_hir synthesizes for a provably-infinite loop —
@@ -6331,6 +8412,7 @@ struct Lowerer {
                         mir.beginBlock(dead);
                     }
                 }
+                closeVlaBlockScope(vlaBase, /*emitRestore=*/true);
                 return true;
             }
             case HirKind::ReturnStmt: {
@@ -6342,11 +8424,12 @@ struct Lowerer {
                 // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value
                 // struct/union return is lowered specially (sret copy-through or
                 // multi-piece Return) — never as a single truncating value.
-                if (currentFnResult_.valid()) {
-                    TypeKind const rk = interner.kind(currentFnResult_);
-                    if (rk == TypeKind::Struct || rk == TypeKind::Union)
-                        return lowerStructReturn(*v);
-                }
+                // D-CSUBSET-BITINT-C2-WIDE: a wide-`_BitInt` return is likewise a
+                // multi-limb by-value return (isByValueClass → lowerStructReturn copies
+                // the limbs through the sret / 2-GPR pieces).
+                if (currentFnResult_.valid()
+                    && isByValueClass(interner, currentFnResult_))
+                    return lowerStructReturn(*v);
                 MirInstId const value = lowerExpr(*v);
                 if (!value.valid()) return false;
                 mir.addReturn(value);
@@ -6396,8 +8479,35 @@ struct Lowerer {
                     it != addressableLocal.end()) {
                     alloca = it->second;
                 } else {
+                    // VLA C5 (D-CSUBSET-VLA): a dynamic-stack VLA local (`int a[n]`,
+                    // a multi-dim VLA, or a VLA-typedef object) descends SP via
+                    // `sub sp`. Open a block-scope teardown watermark FIRST — capture
+                    // SP (StackSave) just before that `sub sp` and push a
+                    // vlaScopeStack_ frame — so every non-return exit of the enclosing
+                    // block restores it (the fixed stride-slot allocas emitted inside
+                    // allocaForLocal do NOT move SP). This is the SAME predicate
+                    // allocaForLocal uses to route the dynamic alloca; a ptr-to-VLA
+                    // (a fixed 8-byte slot, no `sub sp`) is deliberately NOT matched.
+                    // A non-VLA local emits NEITHER op (byte-clean).
+                    if (interner.isVlaArray(ty) || interner.typeContainsVla(ty)) {
+                        if (!emitStackSaveForVla(node)) return false;
+                    }
                     alloca = allocaForLocal(sym, ty, node);
                     if (!alloca.valid()) return false;
+                }
+                // VLA C4a-local (D-CSUBSET-VLA): a LOCAL pointer-to-VLA (`int (*p)[n]`)
+                // freezes its runtime POINTEE row stride HERE, at the decl point in
+                // program order — CRITICAL-2: the pointer's own 8-byte alloca is HOISTED
+                // to entry, where `n` is not yet stored, so freezing the stride there
+                // would read garbage. `scaleIndexToBytes` recovers the `p[i]` stride from
+                // the `(p, pointeeTy)` slot exactly as a declared VLA row. A ptr to a
+                // FIXED array (`int (*p)[5]`) has a non-VLA pointee → skipped (compile-
+                // time stride). Frozen BEFORE the initializer lowers: the pointee's size
+                // is part of `p`'s type, evaluated when the declaration is reached.
+                if (interner.kind(ty) == TypeKind::Ptr) {
+                    auto const pops = interner.operands(ty);
+                    if (!pops.empty() && interner.typeContainsVla(pops[0]))
+                        if (!storePtrToVlaStride(sym, pops[0], node)) return false;
                 }
                 if (auto initN = hir.varDeclInit(node); initN.has_value()) {
                     // FC7 (D-FC7-MEMBER-ACCESS): a struct/union initializer
@@ -6440,13 +8550,16 @@ struct Lowerer {
                         if (!srcPtr.valid()) return false;
                         if (!lowerAggregateCopy(*initN, srcPtr, alloca, ty, initVf))
                             return false;
-                    } else if (initKind == TypeKind::Struct
-                               || initKind == TypeKind::Union) {
+                    } else if (isByValueClass(interner, ty)) {
                         // FC7 (D-FC7-MEMBER-ACCESS): struct/union COPY-init
                         // from another aggregate VALUE (`T a = b;`) — copy
                         // field-wise from the source lvalue's address. An
                         // aggregate-width Load+Store would truncate to one
-                        // register.
+                        // register. D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt`
+                        // init (`_BitInt(200) a = b;` / `= b+c;` / `= (int)x;`)
+                        // is memory-resident — copy from the (existing or freshly
+                        // materialized) source ADDRESS, byte-wise; a scalar Store
+                        // of the (pointer-width) rvalue would truncate to 8 bytes.
                         MirInstId const srcPtr = lowerLvalueAddress(*initN);
                         if (!srcPtr.valid()) return false;
                         // c21/c27: a WHOLE-VOLATILE aggregate copy flags every
@@ -6489,11 +8602,11 @@ struct Lowerer {
                 // (`a = b`, `*pa = *pb`) copies field-wise from the source
                 // lvalue to the target lvalue — an aggregate-width Load+Store
                 // would TRUNCATE a wider-than-register struct to its low
-                // bytes (a silent miscompile).
+                // bytes (a silent miscompile). D-CSUBSET-BITINT-C2-WIDE: a wide
+                // `_BitInt` assignment (`a = b`, `a = b+c`) is the multi-limb
+                // memory-copy twin — reach both sides by address, byte-wise copy.
                 TypeId const valTy = hir.typeId(valueN);
-                if (valTy.valid()
-                    && (interner.kind(valTy) == TypeKind::Struct
-                        || interner.kind(valTy) == TypeKind::Union)) {
+                if (isByValueClass(interner, valTy)) {
                     MirInstId const dstPtr = lowerLvalueAddress(targetN);
                     if (!dstPtr.valid()) return false;
                     MirInstId const srcPtr = lowerLvalueAddress(valueN);
@@ -6882,8 +8995,15 @@ struct Lowerer {
                         depth, branchStack.size()));
                     return false;
                 }
-                MirBlockId const target =
-                    branchStack[branchStack.size() - 1 - depth].breakBB;
+                BranchFrame const& targetFrame =
+                    branchStack[branchStack.size() - 1 - depth];
+                MirBlockId const target = targetFrame.breakBB;
+                // VLA C5 (D-CSUBSET-VLA): `break` exits every VLA scope opened INSIDE
+                // the target loop/switch — restore SP to that frame's entry watermark
+                // (the shallowest VLA scope strictly inside it) BEFORE the branch.
+                // Nothing to restore when the target declared no VLA.
+                if (vlaScopeStack_.size() > targetFrame.vlaDepthAtPush)
+                    emitVlaRestore(targetFrame.vlaDepthAtPush);
                 mir.addBr(target);
                 return true;
             }
@@ -6894,12 +9014,14 @@ struct Lowerer {
                 // (so a `continue` inside a switch inside a loop reaches the loop).
                 std::uint32_t depth = hir.branchDepth(node);
                 MirBlockId target{};
+                std::size_t targetVlaDepth = 0;   // VLA C5: the target loop's watermark
                 for (std::size_t i = branchStack.size(); i-- > 0;) {
                     BranchFrame& frame = branchStack[i];
                     if (!frame.continueBB.valid()) continue;   // skip switch frames
                     if (depth == 0) {
                         frame.continueReferenced = true;
                         target = frame.continueBB;
+                        targetVlaDepth = frame.vlaDepthAtPush;
                         break;
                     }
                     --depth;
@@ -6910,10 +9032,21 @@ struct Lowerer {
                         "verifier should have flagged this)");
                     return false;
                 }
+                // VLA C5 (D-CSUBSET-VLA): `continue` exits the VLA scopes opened in the
+                // current iteration's body — restore SP to the loop's entry watermark
+                // BEFORE the back-edge (nothing if the loop body declared no VLA).
+                if (vlaScopeStack_.size() > targetVlaDepth)
+                    emitVlaRestore(targetVlaDepth);
                 mir.addBr(target);
                 return true;
             }
             case HirKind::GotoStmt: {
+                // VLA C5 (D-CSUBSET-VLA): restore SP for every VLA scope this goto
+                // EXITS (computed from HIR label ancestry) BEFORE the branch. The
+                // entry-side ban (H_VlaJumpIntoScope) guarantees a legal goto never
+                // enters a VLA scope past its decl, so the restore-target watermark
+                // dominates the goto. No-op when the goto frees no VLA scope.
+                emitGotoVlaTeardown(node);
                 // Unconditional jump to the target label's block (created lazily so
                 // forward + backward gotos resolve identically). The open block is
                 // now terminated; a following sibling opens a fresh dead block (the
@@ -6929,6 +9062,20 @@ struct Lowerer {
                 // computed goto with NO `&&label` anywhere in the function can never
                 // have a valid target → fail loud rather than emit a successorless
                 // IndirectBr (opcodeInfo requires ≥1 successor).
+                //
+                // VLA C5 (D-CSUBSET-VLA): a computed goto LEXICALLY inside a VLA scope
+                // has a runtime target set — no single SP-restore watermark is provably
+                // correct. Fail loud (defense-in-depth; the HIR verifier's
+                // H_VlaComputedGotoInScope catches it pre-MIR). Runs fine with no open
+                // VLA scope.
+                if (!vlaScopeStack_.empty()) {
+                    unsupported(node,
+                        "computed `goto *` inside the scope of a variable-length "
+                        "array is not supported — its runtime target set cannot be "
+                        "proven to share the array's dynamic stack frame "
+                        "(D-CSUBSET-VLA)");
+                    return false;
+                }
                 if (addressTakenLabelOrdinals_.empty()) {
                     unsupported(node,
                         "computed `goto *` in a function that takes no label address "
@@ -7053,13 +9200,38 @@ struct Lowerer {
                 mir.beginBlock(exitBB);
                 return true;
             }
-            case HirKind::TypeDecl:
+            case HirKind::TypeDecl: {
                 // c30 (D-CSUBSET-LOCAL-TYPEDEF): a BLOCK-SCOPED typedef lowers to
-                // a statement-position TypeDecl. Exactly like the TOP-LEVEL
-                // TypeDecl (a no-op — "interns a type into the lattice but emits
-                // no code"), it has NO MIR runtime effect: the alias was resolved
-                // at semantic time, so the declaration emits nothing. Skip it.
+                // a statement-position TypeDecl. For an ORDINARY (non-VLA) typedef
+                // this is a no-op — like the top-level TypeDecl, it "interns a type
+                // into the lattice but emits no code" (the alias was resolved at
+                // semantic time).
+                //
+                // VLA C4b (D-CSUBSET-VLA): a VARIABLE-LENGTH-array typedef
+                // (`typedef int R[n];` / multi-dim `R[n][m]`/`R[5][n]`/`R[n][5]`)
+                // is the ONE typedef with a runtime effect: C99 §6.7.7p2 evaluates
+                // the size expr `n` ONCE, when the typedef declaration is REACHED
+                // (NOT at each later `R a;`). FREEZE it HERE, in program order:
+                // `computeVlaByteSize` lowers each dim exactly once + Allocas+Stores
+                // R's per-level 8-byte U64 size slots keyed by R's SymbolId
+                // (`vlaStrideSlot[(R, levelType)]`). Every later `R a;` COPIES those
+                // frozen slots down into its own — so `n` changing between two `R`
+                // uses does NOT re-size them (the freeze-once invariant). The dim
+                // bound(s) were captured in `lowerTypeDecl` under R's SymbolId. On a
+                // belt fail-loud (M4): seal the open block + return false, mirroring
+                // the `vlaAllocaForLocal` caller (never a silently-dropped freeze).
+                TypeId   const ty = hir.typeDeclType(node);
+                SymbolId const R  = hir.typeDeclSymbol(node);
+                if (R.valid() && ty.valid()
+                    && (interner.isVlaArray(ty) || interner.typeContainsVla(ty))) {
+                    if (!computeVlaByteSize(R, ty, node, /*freezeLevelSlots=*/true)
+                             .has_value()) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        return false;
+                    }
+                }
                 return true;
+            }
             default: break;
         }
         unsupported(node,
@@ -7117,8 +9289,13 @@ struct Lowerer {
         // bindings — entries from the previous function are stale.
         symbolToValue.clear();
         addressableLocal.clear();
+        vlaStrideSlot.clear();   // VLA C2/C3 (D-CSUBSET-VLA): per-function size/stride slots
         labelBlocks_.clear();   // FC5: labels are function-scoped
         addressTakenLabelOrdinals_.clear();  // D-CSUBSET-COMPUTED-GOTO
+        // VLA C5 (D-CSUBSET-VLA): the block-scope teardown state is per-function.
+        vlaScopeStack_.clear();
+        vlaScopeCounter_ = 0;
+        labelNodeByOrdinal_.clear();
         // FC7 C1c: per-function by-value return state.
         currentFnResult_ = interner.fnResult(signature);
         sretPtr_         = InvalidMirInst;
@@ -7142,6 +9319,9 @@ struct Lowerer {
         // (a forward `&&end` must be a known IndirectBr successor regardless of
         // textual order). The blocks are created lazily at first reference.
         collectAddressTakenLabels(body, addressTakenLabelOrdinals_);
+        // VLA C5 (D-CSUBSET-VLA): map every LabelStmt ordinal → node so a `goto`
+        // inside a VLA scope can resolve its target and compute the exited scopes.
+        collectLabelNodes(body);
 
         // From here on a block is open — any return-false MUST seal it.
         // D-CSUBSET-LINKAGE-SPECIFIERS / D-OPT7-LINKAGE-HIR-TO-MIR-MAPPING
@@ -7176,8 +9356,9 @@ struct Lowerer {
         // loads the eightbyte pieces. A strategy that can't classify the aggregate
         // (AAPCS64 until C3) fails loud (sealing the open block first).
         if (currentFnResult_.valid()) {
-            TypeKind const rk = interner.kind(currentFnResult_);
-            if (rk == TypeKind::Struct || rk == TypeKind::Union) {
+            // D-CSUBSET-BITINT-C2-WIDE: a wide-`_BitInt` return uses the SAME sret /
+            // 2-GPR-piece prologue as a by-value struct/union (isByValueClass).
+            if (isByValueClass(interner, currentFnResult_)) {
                 auto const abi = byValueClassify(currentFnResult_);
                 if (!abi.has_value()) {
                     unsupported(node,
@@ -7252,8 +9433,10 @@ struct Lowerer {
             // verifier already enforced the kind invariant upstream.
             SymbolId const sym = hir.varDeclSymbol(p);
             TypeId const ty = paramTypes[i];
-            TypeKind const pk = interner.kind(ty);
-            if (pk == TypeKind::Struct || pk == TypeKind::Union) {
+            // D-CSUBSET-BITINT-C2-WIDE: a wide-`_BitInt` PARAM is received BY VALUE
+            // exactly like a struct/union (isByValueClass → receiveByValueParam places
+            // the 2-GPR pieces / by-ref pointer into the param's local slot).
+            if (isByValueClass(interner, ty)) {
                 // Classify FIRST (FC12a-struct): the variadic check now keys on the
                 // ABI kind, not the type kind. An InRegisters fixed struct param in
                 // a variadic function is fine — receiveByValueParam advances argCtr
@@ -7353,6 +9536,27 @@ struct Lowerer {
             } else {
                 symbolToValue[sym.v] = arg;
             }
+            // VLA C4a-param (D-CSUBSET-VLA): a PARAMETER pointer-to-VLA (`int (*p)[n]`,
+            // or the adjusted `int a[][n]`) freezes its runtime POINTEE row stride HERE,
+            // in the entry block at the param's decl point — mirroring the local VarDecl
+            // store. SIMPLER than the local case: `n` (an EARLIER param) is ALREADY
+            // placed by a prior loop iteration (symbolToValue / addressableLocal), so
+            // there is NO decl-site-vs-entry-hoist hazard — reading `n` here is in
+            // program order. `scaleIndexToBytes` recovers the `p[i]` row stride from the
+            // `(p, pointeeTy)` slot exactly as a declared VLA row. A ptr to a FIXED array
+            // (`int (*p)[5]`) has a non-VLA pointee → skipped (compile-time stride). On a
+            // belt fail-loud (e.g. a non-standard `int (*p)[n], int n` where `n` is not yet
+            // placed) TERMINATE the open entry block before bailing — the same convention as
+            // every other param-loop bail above — so the half-built function finalizes as a
+            // clean `mir` fail (diagnostic preserved), never a MirBuilder "no terminator" fatal.
+            if (interner.kind(ty) == TypeKind::Ptr) {
+                auto const pops = interner.operands(ty);
+                if (!pops.empty() && interner.typeContainsVla(pops[0])
+                    && !storePtrToVlaStride(sym, pops[0], p)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+            }
         }
         // FC12a-core (D-FC12A-VARIADIC-CALLEE): after every FIXED param is placed,
         // `argCtr.gpr`/`.fpr` hold the count of fixed params that consumed an
@@ -7393,6 +9597,13 @@ struct Lowerer {
                     || symbolToValue.contains(dsym.v))
                     continue;  // already slotted (defensive; locals/params are distinct)
                 TypeKind const dtk = interner.kind(dty);
+                // VLA C1a (D-CSUBSET-VLA) — LOAD-BEARING: a variable-length array
+                // (kind==Array, `aggregateByteSize` nullopt because computeLayout
+                // nullopts on the -2 length) matches this skip, so its Alloca is NOT
+                // hoisted to the entry block — it emits at the VarDecl site in program
+                // order, AFTER the runtime bound (`n` / a side-effecting `f()`) has
+                // been evaluated. Hoisting it would read an uninitialized bound. The
+                // MIR-tier ORDERING pin (IMPORTANT-3) guards this implicit dependency.
                 if ((dtk == TypeKind::Struct || dtk == TypeKind::Union
                      || dtk == TypeKind::Array)
                     && !aggregateByteSize(dty).has_value())
@@ -8547,7 +10758,14 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           HirMutabilityMap const*  mutabilityMap,
                           HirVolatileMap const*    volatileMap,
                           HirAlignmentMap const*   alignmentMap,
-                          HirThreadLocalMap const* threadLocalMap) {
+                          HirThreadLocalMap const* threadLocalMap,
+                          std::unordered_map<std::uint32_t,
+                                             std::vector<HirNodeId>> const*
+                                                   vlaSizeMap,
+                          std::unordered_map<std::uint32_t, std::uint32_t> const*
+                                                   sizeofVlaSymMap,
+                          std::unordered_map<std::uint32_t, std::uint32_t> const*
+                                                   typedefVlaOriginMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -8566,6 +10784,9 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .volatileMap = volatileMap,
         .alignmentMap = alignmentMap,
         .threadLocalMap = threadLocalMap,
+        .vlaSizeMap = vlaSizeMap,
+        .sizeofVlaSymMap = sizeofVlaSymMap,
+        .typedefVlaOriginMap = typedefVlaOriginMap,
         .mir       = MirBuilder{},
     };
     // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING: stamp the module-

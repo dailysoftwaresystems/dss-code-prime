@@ -232,6 +232,22 @@ struct DSS_EXPORT SymbolRecord {
     // codegen is a SEPARATE deferred task (D-CSUBSET-ALIGNAS: this cycle stores it
     // unconsumed for variables — member alignas works end-to-end via the interner).
     std::optional<std::uint32_t> explicitAlignment;
+    // VLA C4b (D-CSUBSET-VLA): for a VLA-TYPEDEF OBJECT (`typedef int R[n]; R a;`)
+    // — the SymbolId of the typedef `R` whose (variable-length) array type this
+    // object aliases; `InvalidSymbol` (default) for every other symbol. C99
+    // §6.7.7p2: the size expression `n` is evaluated ONCE, when the typedef `R`
+    // is reached, and FROZEN — every later `R a;` allocates with that frozen
+    // size. `R a;`'s VLA-ness comes entirely from the head alias, so the object's
+    // own declarator carries no size to capture; this field records WHICH typedef
+    // froze it. Set in `resolveDeclTypesPost` ONLY when the object's declared type
+    // is EXACTLY the head type (`declTy == headTy` — a pure `R a;`, no own suffix
+    // / stars) AND that head type is (or contains) a VLA; the `declTy == headTy`
+    // gate excludes the deferred stacked-suffix (`R a[m]`) and ptr (`R *p`)
+    // shapes. Read at HIR lowering (record a.v→R.v into `typedefVlaOriginBySymbol`
+    // + skip the object's own size capture) and threaded to HIR→MIR, where `R a;`'s
+    // alloca copies R's decl-frozen size slots down into its own. A dropped/unset
+    // origin is a safe fail-loud downstream (no captured size), never a miscompile.
+    SymbolId        vlaTypedefOrigin{};
     // FC16 (D-CSUBSET-NORETURN): TRUE iff this FUNCTION symbol is declared
     // `noreturn` (C11 6.7.4 `_Noreturn` / C23 6.7.12.7 `[[noreturn]]` / GNU
     // `__attribute__((noreturn))`). Set at Pass-1.5 declarator resolution when the

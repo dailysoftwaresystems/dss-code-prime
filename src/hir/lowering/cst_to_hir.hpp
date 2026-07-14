@@ -96,6 +96,35 @@ struct DSS_EXPORT CstToHirResult {
                                   // `alignas` (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN);
                                   // read at HIR→MIR to raise a global's data-item
                                   // alignment + a local's effective alloca alignment
+    // VLA C1a/C3 (D-CSUBSET-VLA, Fork A out-of-band size side-table): a block-scope
+    // variable-length array's LOWERED size-expression HIR nodes, keyed by the
+    // declared local's SymbolId (`.v`). The array suffixes are normally SKIPPED at
+    // CST→HIR; for a VLA declarator EVERY suffix is un-skipped and its length expr
+    // lowered to a floating HIR node (valid in `hir`, reachable only via this map —
+    // the arena keeps it; no pass walks to it). The vector holds one node per
+    // dimension in OUTER→INNER (source) order — a 1-D VLA has one entry, `int a[n][m]`
+    // has [n, m]. HIR→MIR's `allocaForLocal`/`vlaAllocaForLocal` re-lowers each to a
+    // runtime MIR value at the DECL point and forms the cumulative row strides + the
+    // total byte size for the Alloca's runtime operand. Empty for every non-VLA TU.
+    std::unordered_map<std::uint32_t, std::vector<HirNodeId>> vlaSizeExprBySymbol;
+    // VLA C2 (D-CSUBSET-VLA): a `sizeof <vla-object>` HirNode → the VLA operand's
+    // SymbolId (`.v`), keyed by the SizeOf HIR node's id (`.v`). Populated at CST→HIR
+    // ONLY when the sizeof operand resolves to a VLA-typed symbol; the SizeOf node's
+    // TypeRef child is LEFT as the `vlaArray` type UNCHANGED, so every const-eval
+    // consumer keeps declining a VLA sizeof (never a wrong constant). HIR→MIR reads
+    // this to emit a runtime Load of the decl-frozen size instead of a static fold.
+    // Empty for every non-VLA translation unit.
+    std::unordered_map<std::uint32_t, std::uint32_t> sizeofVlaSymbol;
+    // VLA C4b (D-CSUBSET-VLA): a VLA-TYPEDEF OBJECT's SymbolId.v → its typedef
+    // origin `R`'s SymbolId.v (`typedef int R[n]; R a;` → a.v → R.v). Populated at
+    // CST→HIR from the object symbol's `SymbolRecord.vlaTypedefOrigin` (set
+    // semantically). The object's OWN size capture is SKIPPED (its declarator
+    // carries no `[n]`); R's bound was captured under R's own SymbolId instead
+    // (`vlaSizeExprBySymbol[R.v]`). HIR→MIR reads this to, at `R a;`'s alloca, copy
+    // R's decl-frozen per-level size slots DOWN into a's own `(a, levelType)` slots
+    // (so `a[i]` / `sizeof a` read them) and size a's runtime alloca from R's
+    // whole-object slot. Empty for every non-VLA-typedef translation unit.
+    std::unordered_map<std::uint32_t, std::uint32_t> typedefVlaOriginBySymbol;
     HirLiteralPool literalPool;   // decoded literal values, indexed by literalIndex
     // True iff neither lowering nor the verify-on-load pass emitted an
     // Error-severity diagnostic (delta-computed, so prior diagnostics on the

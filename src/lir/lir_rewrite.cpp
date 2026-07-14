@@ -133,6 +133,14 @@ pickScratchRegs(TargetSchema const& schema, LirFuncAllocation const& alloc,
         if (info.regClass == TargetRegClass::None) continue;
         if (!info.subOf.empty()) continue;
         if (!allocatable.contains(info.name)) continue;  // reserved-role filter
+        // D-CSUBSET-VLA (C1b): in a VLA function the frame pointer is RESERVED as the
+        // fixed-frame base (regalloc held it out of the allocatable pool). It is
+        // therefore unassigned AND allocatable — exactly the shape this loop harvests
+        // as scratch. Skip it, or the rewriter would stage a spill reload through the
+        // frame pointer and clobber the frame base (a stack miscompile). No-op for a
+        // non-VLA function (reservedFramePointer == nullopt).
+        if (alloc.reservedFramePointer.has_value()
+            && i == *alloc.reservedFramePointer) continue;
         std::size_t const c = static_cast<std::size_t>(info.regClass);
         if (c >= out.pool.size()) continue;
         if (usedOrdinals[c].contains(i)) continue;  // already assigned to a vreg

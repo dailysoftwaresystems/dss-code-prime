@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-VLA C3: MULTI-DIMENSIONAL VLAs run with a RUNTIME inner stride. Exercises every §B-included shape RUNNING on all 3 legs: a[n][m] (asymmetric 3x5) with the OFF-DIAGONAL a[1][0] vs a[0][1] write/read (the single witness that catches a CRITICAL-1 level/order swap — a diagonal-only write would hide it), a 3-D a[n][m][k] (runtime stride at two levels), the FIXED-OUTER a[5][n] (transitive typeContainsVla routing — top type is a fixed Array whose element is a VLA), the TOP-VLA a[n][5] (fixed inner, compile-time inner stride), plus the freeze-at-decl / evaluate-once witness int e[(kk+=3)][(kk+=5)] (kk==8, each size-expr once). sizeof a / sizeof a[0] pin the whole vs row byte sizes (runtime Loads of the decl-frozen per-level slots). The arm64 leg proves the runtime-stride math on the non-host target (agnostic MIR under the arm64 VLA frame); the `release` arm proves the stride Loads + per-level size slots survive the full optimizer (never folded to a constant, never dropped). exitCode 42; return 1..20 are the strict in-program pins.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -278,6 +278,20 @@ struct DSS_EXPORT DeclaratorConfig {
     SchemaTokenId nameToken{};
     RuleId        fnSuffixRule{};
     std::optional<RuleId> fnSuffixParamsRule;
+    // VLA C4c (D-CSUBSET-VLA-PARAM-STAR): the OPTIONAL guard-less post-base twin of
+    // `fnSuffixRule` — a `( paramList? )` suffix grammar-IDENTICAL to `fnSuffixRule`
+    // but carrying NO `commitRequiresTypeName` guard. It exists because the
+    // direct-declarator SUFFIX repeat is now SPECULATIVE (to disambiguate the
+    // bare-`[*]` `arrayStarSuffix` from `arrayDeclSuffix`), and a guarded
+    // `fnSuffixRule` at that suffix position would spuriously roll back a valid
+    // function's `()` (empty / cross-file-typedef params) — breaking `int f()`,
+    // casts, EVERY named function declarator (whose `(...)` rides the suffix
+    // repeat). Every function-suffix recognition site treats this rule IDENTICALLY
+    // to `fnSuffixRule` (via the shared `isFnSuffixRule` predicate below); its
+    // param list is the SAME `fnSuffixParamsRule`, so param harvest is unchanged.
+    // `nullopt` ⇒ the grammar has only the single fn-suffix rule (every grammar
+    // before this landed) — behavior is exactly as before.
+    std::optional<RuleId> fnSuffixTailRule;
     // c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): the OPTIONAL param-list rule that opens a
     // per-declarator FUNCTION-PROTOTYPE scope (C 6.2.1p4). A param in a
     // NON-definition declarator — a function-POINTER member/typedef/param, or a
@@ -296,6 +310,13 @@ struct DSS_EXPORT DeclaratorConfig {
     // Toy/tsql declare no `declarators` block at all, so they are unaffected.
     std::optional<RuleId> prototypeParamScopeRule;
     RuleId        arraySuffixRule{};
+    // VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2p4): the OPTIONAL bare-`[*]`
+    // unspecified-size array-suffix rule (`arrayStarSuffix`) — a prototype-form
+    // VLA-parameter marker. A DISTINCT CST rule from `arraySuffixRule` so the
+    // flat bound-locator / lengthChild / captureVlaSize sites are untouched.
+    // `nullopt` ⇒ the language has no `[*]` suffix (toy/tsql, and c-subset
+    // before this landed) — the declarator engine simply never matches it.
+    std::optional<RuleId> arrayStarSuffixRule;
     RuleId        initDeclaratorRule{};
     RuleId        listRule{};
     // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): the OPTIONAL struct/union
@@ -332,6 +353,16 @@ struct DSS_EXPORT DeclaratorConfig {
     // DEFINITION built a non-variadic FnSig — the gap FC12a-core closes). `nullopt`
     // ⇒ the language has no varargs (FnSigs through this path are non-variadic).
     std::optional<SchemaTokenId> variadicMarker;
+    // VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the token kinds that DECORATE
+    // an array-PARAMETER suffix — a `static`, the cv-qualifiers, and the
+    // unspecified-size `*` — none part of the length BOUND. The shared
+    // `arraySuffixBoundNode`/`arraySuffixHasModifier` helpers (decl_prefix_strip.hpp)
+    // skip these to LOCATE the bound behind a decoration and to detect a
+    // parameter-only decoration on a non-parameter declarator (the constraint
+    // violation S_ArrayParamQualifierNonParameter). EMPTY for a language without
+    // array-parameter decorations (the helpers degrade to the plain
+    // first-non-bracket-child view — the prior behavior, unchanged).
+    std::vector<SchemaTokenId> arraySuffixModifierTokens;
     // Source spellings, retained for diagnostics (mirrors the
     // rule+ruleName pairing convention of the other facets).
     std::string   declaratorRuleName;
@@ -342,6 +373,7 @@ struct DSS_EXPORT DeclaratorConfig {
     std::string   nameTokenName;
     std::string   fnSuffixRuleName;
     std::string   fnSuffixParamsRuleName;
+    std::string   fnSuffixTailRuleName;          // VLA C4c D-CSUBSET-VLA-PARAM-STAR
     std::string   prototypeParamScopeRuleName;   // c32 D-CSUBSET-FNPTR-PARAM-SCOPE
     std::string   arraySuffixRuleName;
     std::string   initDeclaratorRuleName;
@@ -350,7 +382,25 @@ struct DSS_EXPORT DeclaratorConfig {
     std::string   memberListRuleName;         // c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR
     std::string   directAbstractRuleName;     // c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME
     std::string   variadicMarkerName;
+    std::vector<std::string> arraySuffixModifierTokenNames;   // VLA C4c D-CSUBSET-VLA
+    std::string   arrayStarSuffixRuleName;                    // VLA C4c D-CSUBSET-VLA-PARAM-STAR
 };
+
+// VLA C4c (D-CSUBSET-VLA-PARAM-STAR): is rule `r` a FUNCTION suffix — either the
+// guarded base-position `fnSuffixRule` or its guard-less post-base twin
+// `fnSuffixTailRule`? The two rules are grammar-IDENTICAL (`( paramList? )`) and
+// MUST be recognized identically at every function-suffix site (the fn-declarator
+// detection, the definition-param scope test, the FnSig type fold in
+// `directDeclaredType`/`applyDeclaratorSuffix`, and the HIR param harvest) — ONE
+// predicate so those sites can never drift. `fnSuffixTailRule` nullopt ⇒ the
+// grammar has only the single fn-suffix rule, the second disjunct is dead, and
+// behavior is exactly as before this landed. Shared across the semantic analyzer
+// and the CST→HIR lowerer (both consume `DeclaratorConfig`).
+[[nodiscard]] inline bool
+isFnSuffixRule(RuleId r, DeclaratorConfig const& dc) {
+    return r == dc.fnSuffixRule
+        || (dc.fnSuffixTailRule.has_value() && r == *dc.fnSuffixTailRule);
+}
 
 struct DSS_EXPORT DeclarationRule {
     // The rule (resolved to RuleId) whose subtree introduces the decl.
@@ -1031,6 +1081,17 @@ struct DSS_EXPORT IntegerLiteralTypingRule {
     std::vector<std::string>      suffixes;   // exact spellings; empty = unsuffixed
     std::vector<DataModelTypeRef> decimal;
     std::vector<DataModelTypeRef> nondecimal;
+    // C23 6.4.4.1 (D-CSUBSET-BITINT-WIDE-LITERAL / Fork-1b): a `wb`/`uwb`
+    // bit-precise suffix rule. When true, `decimal`/`nondecimal` are EMPTY (the
+    // type is not a fixed core — it is `[unsigned] _BitInt(N)` with N derived from
+    // the literal's decoded MAGNITUDE, magnitude-derived at the two typing call
+    // sites via `BitIntValue::fromLiteralMagnitude`); `bitPreciseSigned` selects
+    // `wb` (signed) vs `uwb` (unsigned). This keeps wb/uwb typing INSIDE the one
+    // `integerLiteralTyping` mechanism, so the loader's suffix-coverage cross-check
+    // is satisfied natively (a bit-precise rule IS coverage). A schema without any
+    // bit-precise rule never mints a `_BitInt` from a literal.
+    bool                          bitPrecise       = false;
+    bool                          bitPreciseSigned = false;
 };
 
 // ── FC3.5 sweep-c2: float-literal typing (`semantics.floatLiteralTyping`) ──
@@ -1312,6 +1373,22 @@ struct DSS_EXPORT SemanticConfig {
     RuleId        typeofValueRule{};  std::string typeofValueRuleName;
     std::uint32_t typeofOperandChild = 0;
     std::optional<SchemaTokenId> typeofStripQualifiersToken;
+    // C23 6.2.5/6.7.2 (D-CSUBSET-BITINT): the `_BitInt(N)` bit-precise integer
+    // type-specifier. `bitIntSpecRule` = the `bitIntSpecifier` shape = [ keyword,
+    // '(', const-expr, ')' ]; `bitIntWidthChild` = the visible-child index of the
+    // width constant-expression (2). `bitIntUnsignedToken`/`bitIntSignedToken` name
+    // the C 6.7.2 signedness keywords the resolveTypeNodeImpl bitInt arm scans for
+    // among a specifier RUN's sibling tokens (a `_BitInt` inside a `typeSpecifierSeq`
+    // composes with `unsigned`/`signed`, order-independently; DEFAULT signed when
+    // neither is present). The arm const-folds + validates N (the S_BitIntWidthNot*
+    // width gates 0xE04A–0xE04D) and interns `bitInt(N, signed)` for ANY valid width —
+    // N>64 is a runnable multi-limb type (the C1 `S_BitIntWidthAboveC1Limit` N>64 gate
+    // is RETIRED in C2). Invalid `bitIntSpecRule` ⇒ the language has no _BitInt
+    // surface (the arm never fires). Source-AGNOSTIC: nothing hardcodes "_BitInt".
+    RuleId        bitIntSpecRule{};   std::string bitIntSpecRuleName;
+    std::uint32_t bitIntWidthChild = 0;
+    std::optional<SchemaTokenId> bitIntUnsignedToken;
+    std::optional<SchemaTokenId> bitIntSignedToken;
     // C11/C23 6.7.5 (D-CSUBSET-ALIGNAS): the `_Alignas`/`alignas` alignment
     // SPECIFIER. `alignasSpecRule` = the `alignasSpec` shape = [ keyword, '(',
     // alignasArg, ')' ]; `alignasArgChild` = the visible-child index of the
@@ -1711,6 +1788,16 @@ struct DSS_EXPORT SemanticConfig {
     // SExt). Default false → a non-C schema (toy/tsql) keeps `Char` strictly distinct
     // from the integer ranks. Required by the char-literal typing AND char value use.
     bool charConvertsToArith = false;
+
+    // C23 6.3.1.3/6.3.1.8 (D-CSUBSET-BITINT): admit `_BitInt(N)` into the implicit
+    // integer conversions. Read by `isAssignable`'s BitInt arm (BitInt↔BitInt and
+    // BitInt↔standard-integer, either direction) AND injected into the resolved
+    // `usualArithmeticCommonType` rules at the two `resolveArithmeticRules` call
+    // sites (so a `_BitInt` participates in the usual arithmetic conversions without
+    // promoting). Default false → a non-C schema keeps `_BitInt` inert (and it has
+    // no `_BitInt` types anyway). Mirrors the charConvertsToArith / enumConvertsToArith
+    // gate. Set true alongside the `semantics.bitInt` surface.
+    bool bitIntConversions = false;
 
     // C 6.7.2.2 / 6.3.1.1: an enum is an integer type with an underlying integer
     // (DSS interns it as `TypeKind::Enum`, the underlying kind in `scalars[0]`).

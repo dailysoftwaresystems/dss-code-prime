@@ -12,7 +12,9 @@
 #include "hir/hir_literal_pool.hpp"
 #include "mir/mir.hpp"
 
+#include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 // HIR → MIR lowering (plan 12 / ML2). Public entry: takes a frozen HIR
@@ -232,6 +234,29 @@ lowerToMir(Hir const&               hir,
            // assembler's `.tdata`/`.tbss` routing input) AND to screen
            // static-storage initializers for `&tls` address constants
            // (S_ThreadLocalAddressNotConstant — C11 6.6p9, the arc's CRIT-1).
-           HirThreadLocalMap const* threadLocalMap = nullptr);
+           HirThreadLocalMap const* threadLocalMap = nullptr,
+           // VLA C1a/C3 (D-CSUBSET-VLA): per-LOCAL variable-length-array size-expression
+           // side-table, populated by the CST→HIR lowerer (SymbolId.v → the lowered
+           // per-DIMENSION size HIR nodes, outer→inner). Optional: nullptr (or a local
+           // with no entry) ⇒ not a VLA. Read in `vlaAllocaForLocal` to lower each
+           // runtime bound + form the cumulative row strides and the total byte size
+           // at the declaration point. A 1-D VLA has one entry.
+           std::unordered_map<std::uint32_t, std::vector<HirNodeId>> const* vlaSizeMap
+               = nullptr,
+           // VLA C2 (D-CSUBSET-VLA): per-`sizeof <vla-object>` side-table (the SizeOf
+           // HIR node id.v → the VLA operand's SymbolId.v), populated by the CST→HIR
+           // lowerer. Optional: nullptr (or a SizeOf with no entry) ⇒ a plain static
+           // sizeof. Read in the MIR SizeOf case to emit a runtime Load of the VLA's
+           // decl-frozen size slot instead of a compile-time layout fold.
+           std::unordered_map<std::uint32_t, std::uint32_t> const* sizeofVlaSymMap
+               = nullptr,
+           // VLA C4b (D-CSUBSET-VLA): per-VLA-typedef-OBJECT side-table (the object's
+           // SymbolId.v → its typedef origin R's SymbolId.v), populated by the CST→HIR
+           // lowerer. Optional: nullptr (or an object with no entry) ⇒ not a VLA
+           // typedef. Read in `allocaForLocal` to route `R a;` to a copy-down path that
+           // sources every size from R's decl-frozen slots (freeze-once, C99 §6.7.7p2)
+           // instead of re-lowering `n`.
+           std::unordered_map<std::uint32_t, std::uint32_t> const*
+               typedefVlaOriginMap = nullptr);
 
 } // namespace dss

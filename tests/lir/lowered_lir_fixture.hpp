@@ -91,9 +91,16 @@ lowerCSubsetToLir(std::string src, std::shared_ptr<TargetSchema> target,
             cc->aggregateStackExhaustsRegisters;
         mirCfg.vaListLayout              = cc->vaListLayout;
     }
+    // D-CSUBSET-VLA (C1b): thread the captured VLA size-expr map so a `int a[n]`
+    // source lowers its runtime-operand Alloca through THIS fixture too (else the
+    // VLA has no bound → fail loud). The intervening maps stay nullptr (defaults).
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
-                                    &hir->sourceMap, mirCfg);
+                                    &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
+                                    /*linkageMap=*/nullptr, /*mutabilityMap=*/nullptr,
+                                    /*volatileMap=*/nullptr, /*alignmentMap=*/nullptr,
+                                    /*threadLocalMap=*/nullptr,
+                                    &hir->vlaSizeExprBySymbol);
     DiagnosticReporter lirReporter;
     MirToLirResult lir = lowerToLir(mir.mir, *target,
                                     model.lattice().interner(),

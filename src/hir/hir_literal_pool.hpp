@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/bit_int_value.hpp"            // BitIntValue (C23 _BitInt const-fold arm)
 #include "core/types/type_lattice/core_type.hpp"   // TypeKind
 #include "core/types/strong_ids.hpp"               // TypeId (HirAddressValue.pointeeType)
 
@@ -100,9 +101,17 @@ struct HirLiteralValue {
     //     own `HirLiteralValue`, positional declaration order, all
     //     elements present (omitted struct fields are zero-filled at
     //     lowering time; HIR's positional discipline holds). D5.3.
+    //   - `core == BitInt`: held in the `BitIntValue` arm — a C23 `_BitInt(N)`
+    //     bit-precise value (D-CSUBSET-BITINT-WIDE-LITERAL / -CONSTFOLD-LARGE,
+    //     C4b). ★ EVERY `_BitInt` literal + const-fold result — narrow (N≤64)
+    //     AND wide (N>64) — lives HERE, NEVER the int64 arm (an int64 arm would
+    //     fold via the plain wrapping-int64 helpers WITHOUT the mod-2^N wrap = a
+    //     silent miscompile; the dedicated arm fails loud by construction on any
+    //     un-updated consumer). The narrow-literal MIR lowering extracts the
+    //     container value from this arm; the wide path fills limbs from it.
     //   - `core == Void`: held as `std::monostate` (decode failure).
     std::variant<std::monostate, bool, std::int64_t, std::uint64_t, double, std::string,
-                 HirAggregateValue, HirAddressValue> value;
+                 HirAggregateValue, HirAddressValue, BitIntValue> value;
     TypeKind core = TypeKind::Void;
 };
 

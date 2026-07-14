@@ -220,6 +220,28 @@ enum class MirOpcode : std::uint16_t {
     // establisher frame == the parent's post-prologue SP (FrameRegister=0), so
     // `[base + off]` == the parent's `[SP + off]`.
     RecoverParentFrameSlot,
+    // ── VLA C5 (D-CSUBSET-VLA): block-scope stack teardown. ──
+    // A dynamic VLA (`int a[n]`) descends SP (`sub sp,reg`); C5 makes that VLA's
+    // lifetime BLOCK-SCOPED by restoring SP on every NON-return exit of the
+    // declaring scope (the function epilogue's SP<-FP already frees all on
+    // `return`). Without it, a VLA in a loop leaks SP per iteration → stack
+    // overflow. The pair is the DSS realization of LLVM stacksave/stackrestore,
+    // emitted at HIR->MIR where lexical-block scope is still visible (MIR is flat,
+    // so an exit edge carries no scope tag — the decision must be made upstream).
+    //   StackSave — capture SP just BEFORE a VLA's `sub sp` (the scope's entry
+    //     watermark). 0 operands, result = the saved SP (a value); payload = a
+    //     per-function scopeId (the verifier pairs Restore→Save on it).
+    //     hasSideEffects=true (pins order vs the following alloca; DCE never drops
+    //     it even when the saved value is unused — a return-only scope needs no
+    //     restore) AND in `opcodeClobbersMemory` (a VLA-region load must never sink
+    //     across a restore into reclaimed stack).
+    //   StackRestore — restore SP to a saved watermark on a scope exit
+    //     (fall-through / loop back-edge / break / continue / goto). operand[0] =
+    //     the saved-SP value (a StackSave), NO result; payload = the matching
+    //     scopeId. hasSideEffects + opcodeClobbersMemory (the conservative memory
+    //     barrier). Lowers to a dedicated `sp_restore` LIR op (result:none,
+    //     operands [SP, saved]) — never `sp_copy`-with-SP-as-result.
+    StackSave, StackRestore,
     // ── SIMD (reserved post-v1; vocabulary fixed now) ──
     VAdd, VSub, VMul, VShuffle, VExtract, VInsert,
 
@@ -372,10 +394,12 @@ struct MirOpcodeInfo {
         case MirOpcode::FCmpUgt: return {2, 2, 0, 0, R::Value, false, false, false, "fcmp.ugt"};
         case MirOpcode::FCmpUge: return {2, 2, 0, 0, R::Value, false, false, false, "fcmp.uge"};
 
-        // memory. Alloca yields a pointer; an optional operand is the element
-        // count (array alloca). It is flagged side-effecting so DCE cannot drop a
-        // stack slot whose address escaped (via Store/Call) even when the SSA
-        // result looks unused. Store writes [value, ptr] and yields no value.
+        // memory. Alloca yields a pointer; an optional operand is the TOTAL RUNTIME
+        // BYTE SIZE of a variable-length array (VLA C1a, D-CSUBSET-VLA — with a ZERO
+        // primary payload, the runtime-sized sentinel; a FIXED alloca carries its
+        // byte size in the payload and NO operand). It is flagged side-effecting so
+        // DCE cannot drop a stack slot whose address escaped (via Store/Call) even
+        // when the SSA result looks unused. Store writes [value, ptr], yields nothing.
         case MirOpcode::Alloca: return {0, 1, 0, 0, R::Value, false, true,  false, "alloca"};
         case MirOpcode::Load:   return {1, 1, 0, 0, R::Value, false, false, false, "load"};
         case MirOpcode::Store:  return {2, 2, 0, 0, R::None,  false, true,  false, "store"};
@@ -477,6 +501,13 @@ struct MirOpcodeInfo {
         case MirOpcode::RecoverParentFrameSlot:
                                           return {1, 1, 0, 0, R::Value, false, false, false, "recover_parent_frame_slot"};
 
+        // VLA C5 (D-CSUBSET-VLA): stack teardown pair. StackSave — 0 operands, a
+        // value result (the saved SP), side-effecting (pins + DCE-safe). StackRestore
+        // — 1 operand (a saved-SP value), NO result, side-effecting. Both join
+        // opcodeClobbersMemory below.
+        case MirOpcode::StackSave:    return {0, 0, 0, 0, R::Value, false, true, false, "stack_save"};
+        case MirOpcode::StackRestore: return {1, 1, 0, 0, R::None,  false, true, false, "stack_restore"};
+
         // SIMD (reserved — provisional arities).
         case MirOpcode::VAdd:     return {2, 2, 0, 0, R::Value, false, false, false, "vadd"};
         case MirOpcode::VSub:     return {2, 2, 0, 0, R::Value, false, false, false, "vsub"};
@@ -566,6 +597,13 @@ struct MirOpcodeInfo {
         case MirOpcode::SehTryBegin:
         case MirOpcode::SehTryEnd:
         case MirOpcode::SehFilterReturn:
+        // VLA C5 (D-CSUBSET-VLA): a StackRestore reclaims a VLA's stack region;
+        // a StackSave marks the watermark. Both fence Load/Store motion — a load
+        // from the VLA region must never be CSE'd/sunk PAST a restore (the stack
+        // it addresses is freed after) nor hoisted ABOVE a save into unallocated
+        // stack. The conservative full-memory barrier (audit fix #4).
+        case MirOpcode::StackSave:
+        case MirOpcode::StackRestore:
             return true;
         default:
             return false;

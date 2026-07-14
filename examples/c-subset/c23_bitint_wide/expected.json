@@ -1,0 +1,34 @@
+{
+  "$comment": "C23 _BitInt(N>64) MULTI-LIMB bit-precise integers (D-CSUBSET-BITINT-C2-WIDE), C2: N>64 as ceil(N/64) little-endian i64 limbs, alloca-backed like a struct, reached BY ADDRESS. Exercises + - & | ^ ~ << >> (constant AND variable count) == < >, int<->wide and wide->wide conversions, a BY-VALUE wide arg + wide return (InRegisters 128b two-GPR + by-reference 200b sret), a carry/borrow that CROSSES a limb boundary, and the TOP-LIMB MASK (a bit set past N reads back 0). RED-ON-DISABLE: the exit 42 is load-bearing on the multi-limb machinery — a NON-CARRYING impl loses the >>64 high limb, a NON-MASKING impl keeps the overflowed top bit, a LOW-LIMB-ONLY impl reads 0 for every high-limb probe; each changes the exit. Wide arithmetic is materialized by ADDRESS (never a bare SSA aggregate), so the release arm's mem2reg/const-fold preserve the And-masks + carry loops and still exit 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

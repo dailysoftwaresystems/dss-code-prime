@@ -1,0 +1,34 @@
+{
+  "$comment": "C23 _BitInt(N) in control flow (D-CSUBSET-BITINT), C1 — the coverage gap that let the first `I_BitIntWidthInconsistent` verifier miscope ship. (a) a _BitInt PHI: a `_BitInt(8)` ternary (a CFG merge, debug) + a `for (unsigned _BitInt(8) i; …)` induction var (mem2reg, release) each materialize a `_BitInt(8)` Phi — the denylist verifier's `instOperands(Phi)` ABORTS (a hard compiler crash). (b) a mixed return/arg-width CALL: `low4` returns `_BitInt(4)` from a `_BitInt(40)` arg, so the Call is `_BitInt(4)`-typed with a `_BitInt(40)` operand — the denylist FALSE-REJECTED it. The verifier now allowlists only the arithmetic ops the wrap chokepoint produces (Phi/Call exempt). RED-ON-DISABLE: revert the allowlist to the `!conversion` denylist and this aborts (the Phi) / fails the build (the Call) instead of exit 42. Runs on debug AND release: 17 (ternary) + 15 (loop sum 0..5) + 10 (1034 mod 16) == 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

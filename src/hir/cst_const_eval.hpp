@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/types/data_model.hpp"
 #include "core/types/number_decode.hpp"
 #include "hir/const_eval.hpp"
 #include "hir/hir_literal_pool.hpp"
@@ -8,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -51,6 +53,7 @@ namespace dss {
 
 class GrammarSchema;
 class Tree;
+struct IntegerLiteralTypingRule;
 
 // Resolved-symbol record returned by the resolver. The engine
 // recurses into `initExpr` and threads `initScopeOpaque` as the
@@ -58,9 +61,22 @@ class Tree;
 // that subtree. The opaque-scope handle is meaningful only to the
 // resolver — the engine treats it as a uint32_t cookie carried
 // through recursion.
+// C4b (I1): a resolved const symbol's DECLARED `_BitInt(width, isSigned)`, when
+// it is a bit-precise type. The engine converts the folded initializer TO this.
+struct CstBitPreciseDeclType { std::uint32_t width; bool isSigned; };
+
 struct CstResolvedSymbol {
     NodeId        initExpr{};
     std::uint32_t initScopeOpaque = 0;
+    // C4b (I1): when the const symbol's DECLARED type is `_BitInt(N)`, its
+    // (width, isSigned). A const object's value is its initializer CONVERTED to
+    // the object's declared type (C 6.7.9 / 6.3.1.3), so the engine applies
+    // `convertTo(width, isSigned)` to the folded initializer. Without it
+    // `const _BitInt(4) k = 20wb; k` folds to the initializer's value (20, at
+    // `_BitInt(6)`) instead of `(_BitInt(4))20 == 4`. `nullopt` for a non-
+    // `_BitInt` declared type — the raw fold stands (standard-type narrowing of
+    // a const ref is a separate pre-existing concern, out of this arc's scope).
+    std::optional<CstBitPreciseDeclType> declaredBitPrecise{};
 };
 
 // Caller-supplied identifier resolver: maps a CST identifier-token
@@ -135,6 +151,13 @@ struct CstCastTarget {
     int    intBits   = 0;       // integer target width (8/16/32/64)
     bool   intSigned = false;
     TypeId pointeeType{};       // a pointer target's pointee (retype / future stride)
+    // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a `(_BitInt(N))expr` cast target — the
+    // engine folds it via the bignum `convertTo(bitWidth, bitSigned)` (mod-2^N wrap),
+    // for ANY N (narrow + wide). Distinct from `isInteger` (whose `intBits` maxes at
+    // 64 and whose fold is `narrowIntToBits`, which cannot express a wide `_BitInt`).
+    bool          isBitPrecise = false;
+    std::uint32_t bitWidth     = 0;
+    bool          bitSigned    = false;
 };
 
 // c43: cast-target resolver — given a cast CST node, return its TARGET descriptor
@@ -197,6 +220,22 @@ struct CstEvalContext {
     // `_Static_assert(nullptr,"")` stay loud). NULLABLE and null by default.
     std::unordered_map<std::uint32_t, HirLiteralValue> const* fixedValueTokens
         = nullptr;
+    // C4b (D-CSUBSET-BITINT-WIDE-LITERAL / Fork-2c): the language's
+    // `integerLiteralTyping` rules, so the leaf can detect a `wb`/`uwb` bit-precise
+    // suffix (via the shared `bitPreciseLiteralSignedness`) and fold it to a
+    // `BitIntValue` leaf of the magnitude-derived width. EMPTY by default — the
+    // bit-precise-capable const-expr consumers (array dim / static_assert /
+    // constexpr / index designator) populate it; an empty span keeps a
+    // wb/uwb-suffixed literal typed by the standard leaf (which, absent a rule,
+    // never returns a bit-precise signedness anyway).
+    std::span<IntegerLiteralTypingRule const> integerLiteralTyping{};
+    // C4b (Fork-2c): the active data model, so the leaf can run the SAME
+    // `typeIntegerLiteral` ladder the typed side runs and stamp a STANDARD integer
+    // literal's TRUE core (`int`/`long`/`long long`, data-model-resolved) — not a
+    // flat I32. This makes the `_BitInt` UAC width of a mixed `_BitInt op <long
+    // literal>` const-expr mirror the typed side (else a `long` literal would be
+    // treated as `int` and mis-wrap). Only used when `integerLiteralTyping` is set.
+    DataModel dataModel = DataModel::Lp64;
 };
 
 // Evaluate `expr` to a compile-time `HirLiteralValue`. Pure function;

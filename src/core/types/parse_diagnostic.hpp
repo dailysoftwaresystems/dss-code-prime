@@ -778,6 +778,100 @@ enum class DiagnosticCode : std::uint16_t {
     // UNSUPPRESSABLE — suppressed, the declaration would silently drop
     // whichever specifier the downstream tiers don't model.
     S_ThreadLocalInvalidCombination = 0xE049,
+    // C23 §6.2.5/§6.7.2 (D-CSUBSET-BITINT): the `_BitInt(N)` width constant-
+    // expression is NOT an integer constant expression (`_BitInt(n)` with a runtime
+    // `n`, `_BitInt(x+y)` over non-constants). C23 requires N to be an ICE.
+    // UNSUPPRESSABLE — suppressed, the type would have no computable width and the
+    // masking/layout would silently pick a garbage N.
+    S_BitIntWidthNotConstant = 0xE04A,
+    // C23 §6.2.5 (D-CSUBSET-BITINT): `_BitInt(N)` with N ≤ 0 (`_BitInt(0)`,
+    // `_BitInt(-3)`). A bit-precise integer must have a positive width.
+    // UNSUPPRESSABLE — a non-positive width has no representation.
+    S_BitIntWidthNotPositive = 0xE04B,
+    // C23 §6.2.5 (D-CSUBSET-BITINT): a SIGNED `_BitInt(1)` — a signed bit-precise
+    // integer needs at least 1 sign bit + 1 value bit, so the minimum signed width
+    // is 2 (`unsigned _BitInt(1)` IS legal — one value bit). UNSUPPRESSABLE — a
+    // 1-bit signed integer has no value range.
+    S_BitIntSignedWidthTooSmall = 0xE04C,
+    // C23 §6.2.5 (D-CSUBSET-BITINT): `_BitInt(N)` with N > __BITINT_MAXWIDTH__
+    // (8388608). The width exceeds the implementation's maximum bit-precise width.
+    // UNSUPPRESSABLE — an over-max width is a hard constraint violation.
+    S_BitIntWidthExceedsMax = 0xE04D,
+    // D-CSUBSET-BITINT — the C1 cycle boundary: `_BitInt(N)` with N > 64. RETIRED in
+    // C2 (N>64 is now a runnable multi-limb type — the semantic gate no longer emits
+    // this). The code + its span slot are KEPT (never renumber — the append-only
+    // discipline; still on the unsuppressable list) so every historical 0xE04E golden
+    // stays stable; no live site references it after the C2 gate relaxation.
+    S_BitIntWidthAboveC1Limit = 0xE04E,
+    // D-CSUBSET-BITINT-C2-WIDE — the C3 cycle boundary: `* / %` on a WIDE `_BitInt(N>64)`.
+    // C2 ships the multi-limb storage + the EASY ops (+ - & | ^ ~ << >> compare convert);
+    // wide MULTIPLY / DIVIDE / MODULO (schoolbook UMulH / long-division) land in C3. A
+    // dedicated positioned diagnostic emitted at the MIR by-address wide-BinaryOp arm
+    // (a wide `a*b` result is materialized by address) — NOT a silent scalar op / the
+    // incidental i128 ALU wall. UNSUPPRESSABLE — suppressed, the op would reach codegen
+    // with no multi-limb lowering and silently miscompile. ★ RETIRED C3 (2026-07-12): wide
+    // `* / %` now LOWER (multi-limb schoolbook mul + long-division) — this code is no longer
+    // emitted; kept append-only (stable-id), pinned unreachable by the flipped
+    // WideBitIntMulDivModLowersAtC3 unit test (asserts nDiag(0xE04F)==0).
+    S_BitIntWideMulDivUnsupported = 0xE04F,
+    // D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV — conversion between a FLOATING type and a
+    // WIDE `_BitInt(N>64)` (`(_BitInt(128))1.5`, `(double)wide`). C2 ships integer<->wide
+    // and wide<->wide; a correct multi-limb float<->wide conversion (the full FP
+    // significand<->limbs path) is genuinely hard and lands in a later cycle. The naive
+    // scalar path keys signedness off the source and touches only limb 0 — wrong sign,
+    // wrong value, dropped upper limbs — so a wide float conversion FAILS LOUD at the MIR
+    // cast site (materializeWideCast for a wide TARGET, combineCast's wide-SOURCE arm for
+    // a wide SOURCE) rather than silently miscompiling. NARROW (N<=64) float<->`_BitInt`
+    // is unaffected (it rides the native container, C1). UNSUPPRESSABLE.
+    S_BitIntWideFloatConvUnsupported = 0xE050,
+    // VLA C1a (D-CSUBSET-VLA, C99/C11 §6.7.6.2p2): a block-scope variable-length
+    // array declared with STATIC or EXTERN storage (`static int a[n];`). A VLA
+    // requires AUTOMATIC storage duration — a static/thread/extern object may not
+    // have a variably modified type. Emitted by the Pass-2 `validateVlaDeclarator`
+    // (the thread_local-validator model): the type arm builds the `vlaArray` at
+    // block scope regardless of storage; this validator rejects the non-automatic
+    // ones. UNSUPPRESSABLE — a suppressed static VLA would carry a runtime-sized
+    // type into the static-local→hidden-global lowering, whose layout has no static
+    // size (a wrong-storage miscompile). (File-scope `int g[n]` never becomes a VLA
+    // — the scope gate leaves it S_NonConstantArrayLength.)
+    S_VlaWithStaticStorage = 0xE051,
+    // VLA C1a (D-CSUBSET-VLA) — the C3 multi-dimensional boundary: a VLA whose
+    // ELEMENT is itself an array or a VLA (`int a[n][m]`, `int a[5][n]`,
+    // `int a[n][5]`). C1a ships 1-D VLAs only; a runtime STRIDE through index/GEP
+    // for a multi-dimensional VLA lands in C3. Rejected on BOTH the VLA arm (any
+    // array/VLA element) AND the constant arms (a VLA element — `typeContains-
+    // FlexibleArray`/`isIncompleteArray` check -1, so they would silently build
+    // `array(vlaArray)`). UNSUPPRESSABLE — a suppressed multi-dim VLA would build a
+    // nested array-of-VLA / VLA-of-array type that no lowering tier handles.
+    S_VlaMultiDimUnsupported = 0xE052,
+    // VLA C1a (D-CSUBSET-VLA, C11 §6.7.6.2p1): a variable-length array whose size
+    // expression does NOT have integer type (`int a[1.5]` — float; `int a[nullptr]` —
+    // nullptr_t; a pointer; etc.). C requires the VLA size to have integer type.
+    // Enforced at the SEMANTIC tier (Pass-2 `validateVlaDeclarator`, after expression
+    // typing) because a MIR-tier integer check CANNOT catch `nullptr` — it lowers to
+    // an I32 0 by MIR (NullptrT is semantic-tier-only). UNSUPPRESSABLE — a suppressed
+    // non-integer length would reach codegen as a bogus VLA: a float bound
+    // `FPToSI`-truncates to a garbage element count, a nullptr bound is a silent
+    // 0-byte array. Integer kinds ACCEPTED: the standard integers, Bool, Char, Byte,
+    // Enum, and `_BitInt` (a `_BitInt(N)` bound is a legal VLA size).
+    S_VlaSizeNotInteger = 0xE053,
+    // VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): an array declarator carries a
+    // `static` and/or cv-qualifier and/or the unspecified-size `*` INSIDE its `[ ]`
+    // (`int a[static 3]`, `int a[const n]`, `int a[*]`) in a position that is NOT a
+    // function parameter — a local, struct field, typedef, or file-scope object. C
+    // permits these array-size decorations ONLY in a function-parameter declarator
+    // (they inform the callee that the pointer is non-null / of at-least-N elements,
+    // or defer the size in a prototype); anywhere else they are a constraint
+    // violation. The grammar is deliberately permissive (the ONE shared array suffix
+    // admits them) and this SEMANTIC gate rejects the non-parameter use, mirroring
+    // the typeSpecifierSeq → S_InvalidTypeSpecifierCombination discipline. Emitted at
+    // BOTH array-suffix sites (the declarator-mode `applyDeclaratorSuffix`, gated on
+    // the param-only `paramDecay` signal, and the legacy externDecl `applyArray-
+    // Suffix`, always a non-parameter). UNSUPPRESSABLE — suppressing it would let a
+    // decorated non-parameter array through with the decoration silently dropped (a
+    // mis-typed / mis-sized object), the same silent-miscompile-guard class as the
+    // S_Vla* siblings.
+    S_ArrayParamQualifierNonParameter = 0xE054,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
@@ -1118,6 +1212,24 @@ enum class DiagnosticCode : std::uint16_t {
     //   UNTYPED + emits this (so a `sizeof` of it reports the real reason), and HIR
     //   lowering emits it + an `Error` node, continuing the collect-all lowering.
     H_ConflictingStringLiteralPrefixes = 0xF017,
+    // ── VLA C5 (D-CSUBSET-VLA) — HirVerifier::checkVlaJumpScoping ──
+    // H_VlaJumpIntoScope (C99 6.8.6.1p1): a `goto`, a `switch` case/default label,
+    //   or an `&&label` whose target label sits inside the scope of a
+    //   variably-modified (VLA) object PAST that object's declaration — the jump
+    //   would bypass the VLA's runtime allocation, so on arrival the array's
+    //   storage (and its size) is undefined. Fail-loud (never a jump into
+    //   uninitialized dynamic stack). This is ALSO the dominance guarantor for the
+    //   C5 teardown: banning entry-past-a-decl makes every LEGAL goto's restore-
+    //   target StackSave dominate the goto in the CFG. Mirrors the SEH
+    //   H_SehJumpIntoRegion / H_SehLabelAddress ancestor-walk.
+    H_VlaJumpIntoScope            = 0xF018,
+    // H_VlaComputedGotoInScope (D-CSUBSET-VLA): a computed `goto *expr`
+    //   (GNU IndirectGotoStmt) lexically inside a VLA scope. Its target set is a
+    //   runtime value, so the SP-restore watermark to unwind to cannot be proven
+    //   at compile time — fail-loud rather than leak or over-free the dynamic
+    //   stack. Runs fine when no VLA scope is involved. Mirrors the SEH
+    //   H_SehEarlyExit IndirectGotoStmt arm.
+    H_VlaComputedGotoInScope      = 0xF019,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,
@@ -1216,6 +1328,34 @@ enum class DiagnosticCode : std::uint16_t {
     // would catch a regression of that keystone invariant (e.g. a future change that
     // lets a NullptrT-typed Const materialize). Caught at every verify point.
     I_NullptrTypeInMir             = 0xA014,
+    // C23 _BitInt(N) (D-CSUBSET-BITINT): a MIR value typed `_BitInt(N)` whose
+    // producers disagree on the width — a tripwire for the by-construction wrap
+    // chokepoint (CRIT-2). A `_BitInt(N)` value must always be N-significant-bits
+    // (masked/sign-extended at materialization); a producer emitting a differently-
+    // masked value would silently miscompile the wrap. Never fires under the
+    // chokepoint discipline; the backstop that catches a regression of it.
+    I_BitIntWidthInconsistent      = 0xA015,
+    // VLA C1a (D-CSUBSET-VLA): a MIR `Alloca` whose operand/payload shape breaks the
+    // runtime-sized invariant. A VLA-typed alloca (its pointee `isVlaArray`) MUST
+    // carry exactly ONE operand (the total runtime byte size) and a ZERO primary
+    // payload (the "runtime-sized" sentinel, distinct from a fixed alloca's non-zero
+    // byte-size payload); a NON-VLA (fixed) alloca MUST carry NO operand. A mismatch
+    // (a VLA alloca that lost its size operand → a silently under-sized fixed slot,
+    // or a fixed alloca that grew a spurious runtime operand) is a by-construction
+    // break of the PIECE-4 lowering. Interner-gated (needs `isVlaArray`); the
+    // operand↔payload consistency half also runs interner-free. Caught at every
+    // verify point.
+    I_VlaAllocaOperandInvalid      = 0xA016,
+    // VLA C5 (D-CSUBSET-VLA): a MIR `StackRestore` whose pairing invariant breaks.
+    // A StackRestore's operand[0] MUST be a `StackSave`, and its scopeId payload
+    // MUST equal that StackSave's payload (the pairing key). The generic SSA
+    // dominance check already enforces that the StackSave dominates the restore
+    // (the restore references it as an operand); this code adds the STRUCTURAL
+    // pairing the flat IR can't otherwise express. The flat CFG cannot prove
+    // "every exit edge is covered", so this is a pairing/containment check, NOT a
+    // coverage claim (audit fix #6). Caught at every verify point (so an optimizer
+    // transform that mis-pairs a save/restore reds AT the pass that did it).
+    I_VlaStackRestorePairing       = 0xA017,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //
@@ -1299,6 +1439,26 @@ enum class DiagnosticCode : std::uint16_t {
     //   over-alignment (e.g. `alignas(16)`) is HONORED via a local-area pad, not
     //   this code — so this fires only past the representable bound.
     L_OverAlignedStackLocal        = 0xB00C,
+    // VLA C1a → C1b boundary (D-CSUBSET-VLA): `lowerAlloca` reached a MIR `Alloca`
+    //   carrying a RUNTIME size operand (a variable-length array `int a[n]`). The
+    //   static frame model + `lea_frame_slot` rematerialization assume a fixed
+    //   compile-time slot; a dynamic `sub rsp,<size>` + frame-pointer addressing is
+    //   the NAMED C1b cycle. Fails loud BEFORE `emitInst` so no bogus fixed slot is
+    //   recorded. UNSUPPRESSABLE — suppressed, the alloca would fall through to the
+    //   fixed-slot path and silently lose the runtime size (a `lea` of a 1-slot
+    //   scalar for the whole array — a stack miscompile).
+    L_VlaDynamicAllocaUnsupported  = 0xB00D,
+    // VLA C1b LEAF-scope gate (D-CSUBSET-VLA-NONLEAF-CALL-FRAME): a function with a
+    //   variable-length array ALSO makes a call OR calls `va_start`. C1b builds the
+    //   dynamic-stack frame model for a LEAF function only: after `sub sp,<vlaSize>`
+    //   the outgoing-args area (call args) and the va-area leas are SP-relative, and
+    //   under the moved SP NO base (neither SP nor the frame pointer) addresses them
+    //   correctly while the `call`/va-walk runs at the moved SP. The non-leaf VLA
+    //   frame model (outgoing-args placement under a runtime-moved SP) is a separate
+    //   designed cycle. Fails loud (never a silent outgoing-arg/va miscompile).
+    //   UNSUPPRESSABLE — suppressed, a non-leaf VLA would emit call args INSIDE the
+    //   VLA region (an ABI break). Red-on-disable via the non-leaf fail-loud pins.
+    L_VlaNonLeafFrameUnsupported   = 0xB00E,
 
     // ── Register allocator (renders as `R`) ────────────────────────────
     //

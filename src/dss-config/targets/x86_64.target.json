@@ -264,6 +264,73 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-VLA (C1b): `sub_sp_reg sp, <sizeReg>` — subtract a RUNTIME byte count (in a register) from the stack pointer, the dynamic-alloca core (`int a[n]` => `sub rsp, alignUp(n*4,16)`). REX.W 0x29 /r (SUB r/m64, r64), the SAME opcode as `sub` reg-reg but a DISTINCT mnemonic (its own single encoding: operand0=sp is BOTH the r/m destination AND source1, operand1=size is the r64 source2). result:none (SP mutates in place — no SSA value; the moved SP is captured by a following `sp_copy`). hasSideEffects=true so no pass drops/reorders it relative to the sp_copy that captures the result. Emitted by MIR->LIR (with the physical stack-pointer operand); the callconv pass passes it through unchanged.",
+      "mnemonic":      "sub_sp_reg",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template": { "rexW": true, "opcode": [41] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-VLA (C1b): `sp_copy dst, src` — a plain register move used for the three frame-pointer plumbing roles a VLA function needs: prologue FP<-SP (capture the fixed-frame base), epilogue SP<-FP (discard the VLA + restore SP to the fixed-frame base), and the VLA-base capture base<-SP (the post-`sub_sp_reg` stack pointer). REX.W 0x8B /r (MOV r64, r/m64), a DISTINCT mnemonic from `mov` so it can be marked hasSideEffects=true (it reads/writes the physical SP; no pass may drop or reorder it across the `sub_sp_reg`). resultSlot modrm.reg = dst; operand0=src -> modrm.rm. rsp/rbp are valid register-direct in both fields.",
+      "mnemonic":      "sp_copy",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   1,
+      "maxOperands":   1,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "rexW": true, "opcode": [139] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "D-CSUBSET-VLA (C5): `sp_restore sp, <savedReg>` = `mov rsp, savedReg` — RESTORE the stack pointer to a previously-captured watermark (a StackSave's `sp_copy`), the block-scope VLA teardown emitted on every NON-return exit of a VLA-declaring scope (fall-through / loop back-edge / break / continue / goto). REX.W 0x89 /r (MOV r/m64, r64): operand0=sp is the r/m DESTINATION (modrm.rm), operand1=saved is the r64 SOURCE (modrm.reg). A DISTINCT mnemonic + result:none (SP mutates in place, NOT an SSA value) — mirrors `sub_sp_reg` keeping SP an operand, NEVER the `sp_copy`-with-SP-as-result shape (audit fix #5). hasSideEffects=true so no pass drops/reorders it vs the sub_sp_reg / sp_copy around it. Emitted by MIR->LIR with the physical stack-pointer operand; the callconv passes it through unchanged.",
+      "mnemonic":      "sp_restore",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template": { "rexW": true, "opcode": [137] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.rm" },
+              { "index": 1, "slotKind": "modrm.reg" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "D-WIN64-LARGE-FRAME-STACK-PROBE: a SINGLE LIR op that the x86_64 encoder lowers to a MULTI-INSTRUCTION inline stack-probe loop (one-LIR-op→N-instructions). Operands: [sp(reg), frameBytes(imm32), pageBytes(imm32)] — the stack-pointer register, the total frame size to descend, and the guard-page step (= the cc's stackProbePageBytes). The ML7 prologue emits this INSTEAD of a bare `sub rsp, F` when totalFrameSize > stackProbePageBytes, so the loop touches (commits) every guard page on the way down (Windows reserves the stack lazily behind a single PAGE_GUARD page; a bare `sub` skips it → access violation). The encoder hand-pushes the loop: `mov r11d, frame` / .L: `sub rsp, page` / `or qword [rsp], 0` (page-touch) / `sub r11d, page` / `cmp r11d, page` / `ja .L` (rel8 back) / `sub rsp, r11` (final remainder). r11 is ms_x64 caller-saved, never an arg/return reg, and the probe runs before any arg-home, so it is free. NO __chkstk, NO relocation (the rel8 is a compile-time constant). This is x86_64-ONLY: arm64 OMITS this opcode entirely (its CCs have stackProbePageBytes=0 → never emitted → arm64 encoder would fire A_NoEncodingDeclared, defense-in-depth). The encoding block below exists ONLY to satisfy the shape/routing contract (shape!=None ⇒ asm.cpp routes to the x86-variable walker; the walker's DEDICATED stack_probe arm intercepts BEFORE variant matching and hand-emits the bytes — the variant row itself is never consumed for emission). hasSideEffects=true so no pass drops/reorders it.",
       "mnemonic":      "stack_probe",
       "result":        "none",
@@ -1938,6 +2005,8 @@
                       "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"],
       "calleeSaved": ["rbx", "rbp", "r12", "r13", "r14", "r15"],
       "stackPointer": "rsp",
+      "$framePointerComment": "D-CSUBSET-VLA (C1b): rbp is the frame-pointer register a VLA function reserves as a stable fixed-frame base (captured at the fixed-frame bottom, then every fixed-frame ref switches SP→rbp so it survives the runtime `sub rsp,<vlaSize>`). A NON-VLA function never reserves it — rbp stays an ordinary callee-saved allocatable GPR (byte-identical frames). Consumed by lir_regalloc (pool exclusion) + lir_callconv (force-save + prologue capture + epilogue restore).",
+      "framePointer": "rbp",
       "stackAlignment":   16,
       "shadowSpaceBytes": 0,
       "redZoneBytes":     128,
@@ -1984,6 +2053,8 @@
                       "xmm6", "xmm7", "xmm8",  "xmm9",  "xmm10",
                       "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"],
       "stackPointer": "rsp",
+      "$framePointerComment": "D-CSUBSET-VLA (C1b): rbp is the frame-pointer register a VLA function reserves as a stable fixed-frame base (captured at the fixed-frame bottom, then every fixed-frame ref switches SP→rbp so it survives the runtime `sub rsp,<vlaSize>`). A NON-VLA function never reserves it — rbp stays an ordinary callee-saved allocatable GPR (byte-identical frames). Consumed by lir_regalloc (pool exclusion) + lir_callconv (force-save + prologue capture + epilogue restore).",
+      "framePointer": "rbp",
       "stackAlignment":   16,
       "shadowSpaceBytes": 32,
       "redZoneBytes":     0,

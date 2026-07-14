@@ -5,6 +5,7 @@
 #include "core/types/declarator_walk.hpp"     // FC4: collectDeclarators / declaratorNameNode
 #include "core/types/grammar_schema.hpp"
 #include "core/types/hir_lowering_config.hpp"
+#include "core/types/integer_literal_ladder.hpp"  // C4b: bitPreciseLiteralSignedness
 #include "core/types/semantic_config.hpp"
 #include "core/types/tree.hpp"
 #include "hir/const_eval_arith.hpp"
@@ -119,6 +120,13 @@ combineBinaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& opti
     if (!opK.has_value()) {
         return fail(ConstEvalFailure::UnsupportedOperator, expr);
     }
+    // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a `_BitInt`-involving binary op folds
+    // via the shared wrap-aware bignum at the TRUE C23 UAC result width. A BitInt
+    // operand is never float / address, so this is checked FIRST.
+    if (auto bf = detail::foldBitIntBinary(*opK, *a.value, *b.value); bf.applies) {
+        if (bf.ok) return ok(std::move(bf.value));
+        return fail(bf.failure, expr);
+    }
     bool const eitherFloat = isFloatValue(*a.value) || isFloatValue(*b.value);
     if (eitherFloat) {
         if (!options.allowFloat) {
@@ -183,6 +191,11 @@ combineUnaryCst(NodeId expr, HirOperatorEntry const& e, EvalOptions const& optio
     auto opK = opFromName(e.target);
     if (!opK.has_value()) {
         return fail(ConstEvalFailure::UnsupportedOperator, expr);
+    }
+    // C4b: a unary op on a `_BitInt` operand (`-5wb`, `~x`) folds via the bignum.
+    if (auto uf = detail::foldBitIntUnary(*opK, *inner.value); uf.applies) {
+        if (uf.ok) return ok(std::move(uf.value));
+        return fail(uf.failure, expr);
     }
     if (isFloatValue(*inner.value)) {
         if (!options.allowFloat) {
@@ -354,6 +367,31 @@ evalNode(NodeId                              expr,
             }
         }
         if (ctx.integerLiteralTokens.contains(tk.v)) {
+            // C23 6.4.4.1 (D-CSUBSET-BITINT-WIDE-LITERAL / Fork-2c): a `wb`/`uwb`
+            // bit-precise literal folds to a `BitIntValue` leaf of the magnitude-
+            // derived width (arbitrary magnitude via `decodeBigInteger`), so a
+            // `_Static_assert(15wb + 1 == 16)` / `...688uwb` const-expr sees the
+            // true bit-precise value. Gated on the consumer supplying the
+            // `integerLiteralTyping` rules (the opt-in, mirroring floatLiteralTokens).
+            if (!ctx.integerLiteralTyping.empty()) {
+                if (auto const bpSigned = bitPreciseLiteralSignedness(
+                        tree.text(expr), ctx.numberStyle, ctx.integerLiteralTyping)) {
+                    auto mag = decodeBigInteger(tree.text(expr), ctx.numberStyle);
+                    if (!mag.has_value()) {
+                        return fail(ConstEvalFailure::NotAConstantExpression, expr);
+                    }
+                    BitIntValue bv = BitIntValue::fromLiteralMagnitude(*mag, *bpSigned);
+                    if (bv.width() > kBitIntMaxWidth) {
+                        // The typing tier already emitted S_BitIntWidthExceedsMax;
+                        // the fold declines (a pure function emits no diagnostic).
+                        return fail(ConstEvalFailure::NotAConstantExpression, expr);
+                    }
+                    HirLiteralValue lv;
+                    lv.core  = TypeKind::BitInt;
+                    lv.value = std::move(bv);
+                    return ok(std::move(lv));
+                }
+            }
             auto iv = decodeInteger(tree.text(expr), ctx.numberStyle);
             if (!iv.has_value()) {
                 // Decode failure (overflow / malformed text) — not a
@@ -363,9 +401,20 @@ evalNode(NodeId                              expr,
                 return fail(ConstEvalFailure::NotAConstantExpression, expr);
             }
             HirLiteralValue lv;
-            lv.core  = TypeKind::I32;  // see header note: default core
-                                       // suffices for the int64-arm value;
-                                       // consumers use `.value`, not `.core`.
+            // C4b (Fork-2c): stamp the TRUE data-model core (int / long / long long)
+            // via the SAME `typeIntegerLiteral` ladder the typed side runs — so a
+            // mixed `_BitInt op <long literal>` const-expr computes the C23 UAC width
+            // correctly (a `long` literal must NOT be treated as `int`). The int64
+            // arm PRESERVES the bit pattern, so `asBitIntValue` recovers the value at
+            // the true (width, signed); absent rules ⇒ the I32 default (inert for
+            // every non-BitInt fold — the leaf's other consumers read `.value`).
+            lv.core = TypeKind::I32;
+            if (!ctx.integerLiteralTyping.empty()) {
+                auto const r = typeIntegerLiteral(tree.text(expr), ctx.numberStyle,
+                                                  ctx.integerLiteralTyping,
+                                                  ctx.dataModel, *iv);
+                if (r.status == IntegerLadderStatus::Typed) lv.core = r.kind;
+            }
             lv.value = static_cast<std::int64_t>(*iv);
             return ok(std::move(lv));
         }
@@ -426,6 +475,26 @@ evalNode(NodeId                              expr,
                                              resolved->initScopeOpaque, visitedInitNodes);
             visitedInitNodes.erase(resolved->initExpr.v);
             if (!inner.value.has_value()) inner.blamedNode = HirNodeId{expr.v};
+            // C4b (I1, D-CSUBSET-BITINT-CONSTFOLD-LARGE): a const `_BitInt(N)`
+            // symbol's value is its initializer CONVERTED to `_BitInt(N)` (C
+            // 6.7.9 / 6.3.1.3: mod-2^N wrap), not the raw initializer value —
+            // else `const _BitInt(4) k = 20wb; k` folds to 20 (the initializer's
+            // `_BitInt(6)` value) instead of `(_BitInt(4))20 == 4`. Mirrors the
+            // `(_BitInt(N))expr` cast-fold arm above (same `asBitIntValue` +
+            // `convertTo`). Only for a `_BitInt`-declared symbol; a standard
+            // declared type leaves the fold untouched — the pre-existing standard
+            // analog (`const char c=300; c` folds to 300 not 44) is tracked as
+            // `D-CSUBSET-CONST-REF-DECLARED-NARROWING`, out of this arc's scope.
+            if (resolved->declaredBitPrecise && inner.value.has_value()) {
+                if (auto bv = detail::asBitIntValue(*inner.value)) {
+                    bv->convertTo(resolved->declaredBitPrecise->width,
+                                  resolved->declaredBitPrecise->isSigned);
+                    HirLiteralValue lv;
+                    lv.core  = TypeKind::BitInt;
+                    lv.value = std::move(*bv);
+                    inner.value = std::move(lv);
+                }
+            }
             return inner;
         }
         return fail(ConstEvalFailure::NotAConstantExpression, expr);
@@ -507,6 +576,20 @@ evalNode(NodeId                              expr,
         ConstEvalResult inner =
             evalImpl(operandN, ctx, env, options, currentScopeOpaque, visitedInitNodes);
         if (!inner.value.has_value()) return inner;
+        // C4b (D-CSUBSET-BITINT-CONSTFOLD-LARGE): a `(_BitInt(N))expr` cast folds via
+        // the wrap-aware bignum `convertTo(N, signed)` (mod-2^N) — narrow AND wide.
+        // Any integer / bit-precise operand converts; a non-integer operand fails loud.
+        if (tgt->isBitPrecise) {
+            auto bv = detail::asBitIntValue(*inner.value);
+            if (!bv.has_value()) {
+                return fail(ConstEvalFailure::UnsupportedTypeKind, expr);
+            }
+            bv->convertTo(tgt->bitWidth, tgt->bitSigned);
+            HirLiteralValue v;
+            v.core  = TypeKind::BitInt;
+            v.value = std::move(*bv);
+            return ok(std::move(v));
+        }
         if (tgt->isPointer) {
             if (auto const* a = asAddress(*inner.value)) {
                 HirAddressValue out = *a;           // ptr→ptr: identity, retype pointee

@@ -159,6 +159,18 @@ TEST(UnsuppressableCodes, ThreadLocalRejectsAreUnsuppressable) {
         DiagnosticCode::S_ThreadLocalAddressNotConstant));
     EXPECT_TRUE(isUnsuppressable(
         DiagnosticCode::S_ThreadLocalInvalidCombination));
+    // VLA C1a (D-CSUBSET-VLA): the two VLA constraint/boundary codes + the MIR
+    // verifier invariant + the C1a→C1b LIR fail-loud. Suppressing the static-storage
+    // form would carry a runtime-sized vlaArray into the static→global lowering; the
+    // multi-dim form would build a nested array-of-VLA no tier handles; and the LIR
+    // boundary, suppressed, would silently lower a runtime alloca as a 1-slot scalar
+    // (MINOR-3). Named per-code pins.
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_VlaWithStaticStorage));
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_VlaMultiDimUnsupported));
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::S_VlaSizeNotInteger));
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::I_VlaAllocaOperandInvalid));
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::L_VlaDynamicAllocaUnsupported));
+    EXPECT_TRUE(isUnsuppressable(DiagnosticCode::L_VlaNonLeafFrameUnsupported));
 }
 
 TEST(UnsuppressableCodes, ListSelfConsistent) {

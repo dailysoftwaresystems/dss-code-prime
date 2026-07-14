@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-VLA C4a-local: a LOCAL pointer-to-VLA `int (*p)[n]` RUNS on all 3 legs. The subscript p[i] steps by the RUNTIME pointee row size (n*sizeof(int)), frozen ONCE at p's decl into the C3 vlaStrideSlot and recovered by scaleIndexToBytes exactly as a declared VLA row. Witness = the ASSIGNMENT form `int (*p)[n]; p = b;` (the natural `= b` init form is a clean fail-loud, deferred as D-CSUBSET-VLA-PTR-INIT-FORM-TYPING). The KEY correctness witness is the OFF-DIAGONAL write p[1][0] vs p[0][2] (DISTINCT cells) — a wrong row stride would alias/transpose them; plus p<->b aliasing at the far corner proves p's runtime stride equals b's. `volatile vn` defeats const-fold so n is genuinely runtime; main is a LEAF (the C1b VLA frame). The arm64 leg proves the runtime-stride math on the non-host target (agnostic MIR under the arm64 VLA frame); the `release` arm proves the stride Loads survive the full optimizer (never folded to a constant). exitCode 42; return 1..6 are strict in-program pins.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

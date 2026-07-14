@@ -346,6 +346,17 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
                 || op == MirOpcode::SehExceptionInfo) {
                 return std::nullopt;
             }
+            // VLA C5 (D-CSUBSET-VLA): do NOT inline a callee that performs block-scope
+            // VLA teardown (StackSave present). Splicing its dynamic-stack frame
+            // machinery (a moving SP + the frame-pointer reservation the sub_sp_reg
+            // presence triggers) into a caller that may not expect a shifting SP is
+            // fragile, and its per-function scopeIds would collide on a twice-inlined
+            // callee. Fail-SAFE (forgoes the optimization, never miscompiles) —
+            // exactly the SEH rationale above. VLA functions are leaves and rare, so
+            // the cost is ~nil.
+            if (op == MirOpcode::StackSave || op == MirOpcode::StackRestore) {
+                return std::nullopt;
+            }
             if (op == MirOpcode::Return
                 && mir.instOperands(cid).size() > 1) {
                 return std::nullopt;

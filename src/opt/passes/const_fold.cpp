@@ -44,6 +44,12 @@ HirLiteralValue toHirLiteral(MirLiteralValue const& src) {
             // a foldable use. Map to monostate (unknown/opaque) so the const-fold
             // bridge treats it as non-foldable rather than failing to compile.
             dst.value = std::monostate{};
+        } else if constexpr (std::is_same_v<T, BitIntValue>) {
+            // C4b (I1+C2): the `_BitInt` bit-precise value is the SAME host type in
+            // both pools — copy directly (NEVER monostate). The I3 optimizer-fold
+            // bail means a BitInt Const never reaches `tryFold`, but the bridge must
+            // still round-trip it losslessly for any other consumer.
+            dst.value = arm;
         } else {
             dst.value = arm;
         }
@@ -67,6 +73,10 @@ MirLiteralValue toMirLiteral(HirLiteralValue const& src) {
             // relocation (the inverse of the toHirLiteral MirSymbolAddrValue arm
             // above, which stays monostate: a symbol address is non-foldable here).
             dst.value = MirSymbolAddrValue{arm.base, arm.byteOffset};
+        } else if constexpr (std::is_same_v<T, BitIntValue>) {
+            // C4b (I1+C2): the `_BitInt` bit-precise value copies directly between
+            // the structurally-parallel pools (NEVER monostate).
+            dst.value = arm;
         } else {
             dst.value = arm;
         }
@@ -157,6 +167,19 @@ public:
 private:
     [[nodiscard]] std::optional<HirLiteralValue>
     tryFold(MirOpcode op, MirInstId oldId) {
+        // I3 (D-CSUBSET-BITINT): NEVER fold a `_BitInt`-typed instruction here — for
+        // ANY N, narrow OR wide. This pass's int64/uint64 helpers have NO mod-2^N
+        // wrap, so a NARROW `_BitInt` Const pair would otherwise reach applyBinaryInt
+        // via `asInt64` and produce an UN-wrapped int64 (a silent miscompile). The
+        // wrap-aware fold lives in the HIR/CST const-eval (C4b); the optimizer defers
+        // BitInt entirely. (A wide `_BitInt` is memory-resident — no scalar Const —
+        // but the explicit guard pins the intent + is a red-on-disable boundary.)
+        // A non-value instruction (Store/Br/…) carries InvalidType — `kind()` aborts
+        // on it, so gate on `valid()` first.
+        if (TypeId const it = src_.instType(oldId);
+            it.valid() && interner_.kind(it) == TypeKind::BitInt) {
+            return std::nullopt;
+        }
         auto const oldOps = src_.instOperands(oldId);
 
         // Unary integer fold.

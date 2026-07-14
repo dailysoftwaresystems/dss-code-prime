@@ -362,3 +362,79 @@ TEST(TypeRules, NullptrTExplicitCastToPointerOnly) {
     EXPECT_FALSE(isExplicitCastable(in, nptr, voidPtr));   // nothing → nullptr_t
     EXPECT_FALSE(isExplicitCastable(in, nptr, intT));
 }
+
+// ── C23 _BitInt(N) (D-CSUBSET-BITINT) ─────────────────────────────────────────
+
+// A `_BitInt(N)` IS arithmetic (ungated shape admission — inert for non-C schemas
+// which never mint a BitInt TypeId).
+TEST(TypeRules, IsArithmeticAdmitsBitInt) {
+    auto in = makeInterner();
+    EXPECT_TRUE(isArithmetic(in, in.bitInt(17, /*signed=*/true)));
+    EXPECT_TRUE(isArithmetic(in, in.bitInt(40, /*signed=*/false)));
+}
+
+// isAssignable admits BitInt↔BitInt and BitInt↔standard-integer ONLY when the
+// `bitIntConversions` gate is on (RED-ON-DISABLE: default false rejects, so a
+// non-C schema stays strict). M-8.
+TEST(TypeRules, IsAssignableBitIntGated) {
+    auto in = makeInterner();
+    auto b4  = in.bitInt(4,  /*signed=*/false);
+    auto b40 = in.bitInt(40, /*signed=*/false);
+    auto i32 = in.primitive(TypeKind::I32);
+    // gate OFF (default) — every BitInt pairing is a loud reject
+    EXPECT_FALSE(isAssignable(in, b4, i32));
+    EXPECT_FALSE(isAssignable(in, i32, b4));
+    EXPECT_FALSE(isAssignable(in, b4, b40));
+    // gate ON — bidirectional BitInt↔int + BitInt↔BitInt(any width)
+    auto A = [&](TypeId l, TypeId r) {
+        return isAssignable(in, l, r, {}, false, false, false, false, false,
+                            false, false, false, /*bitIntConversions=*/true);
+    };
+    EXPECT_TRUE(A(b4, i32));
+    EXPECT_TRUE(A(i32, b4));
+    EXPECT_TRUE(A(b4, b40));
+    EXPECT_TRUE(A(b40, b4));
+}
+
+// An explicit `(int)b` / `(_BitInt(N))x` cast is legal (isExplicitCastable).
+TEST(TypeRules, IsExplicitCastableBitInt) {
+    auto in = makeInterner();
+    auto b17 = in.bitInt(17, true);
+    auto i32 = in.primitive(TypeKind::I32);
+    auto f64 = in.primitive(TypeKind::F64);
+    EXPECT_TRUE(isExplicitCastable(in, i32, b17));   // (int)b
+    EXPECT_TRUE(isExplicitCastable(in, b17, i32));   // (_BitInt(17))x
+    EXPECT_TRUE(isExplicitCastable(in, b17, f64));   // (_BitInt(17))aDouble
+    EXPECT_TRUE(isExplicitCastable(in, b17, in.bitInt(40, false)));  // BitInt→BitInt
+}
+
+// The usual arithmetic conversions (C23 6.3.1.8): two BitInts → the wider N (equal
+// N → unsigned wins); BitInt(N) vs a standard int of width W → N>W ? BitInt : std.
+TEST(TypeRules, UsualArithmeticCommonTypeBitInt) {
+    auto in = makeInterner();
+    ResolvedArithmeticRules rules;
+    rules.minRank = TypeKind::I32;
+    rules.bitIntConversions = true;
+    auto UAC = [&](TypeId a, TypeId b) {
+        return usualArithmeticCommonType(in, a, b, rules);
+    };
+    auto b20s = in.bitInt(20, true);
+    auto b40s = in.bitInt(40, true);
+    auto b20u = in.bitInt(20, false);
+    auto i32  = in.primitive(TypeKind::I32);
+    // two BitInts → wider N
+    EXPECT_EQ(UAC(b20s, b40s).v, b40s.v);
+    EXPECT_EQ(UAC(b40s, b20s).v, b40s.v);
+    // equal N, mixed sign → unsigned wins
+    EXPECT_EQ(UAC(b20s, b20u).v, b20u.v);
+    // BitInt(40) vs int(32): N>W → the BitInt
+    EXPECT_EQ(UAC(b40s, i32).v, b40s.v);
+    // BitInt(20) vs int(32): N<W → the standard int (a _BitInt(20) does NOT out-rank int)
+    EXPECT_EQ(in.kind(UAC(in.bitInt(20, true), i32)), TypeKind::I32);
+    // BitInt vs float → the float
+    EXPECT_EQ(in.kind(UAC(b40s, in.primitive(TypeKind::F64))), TypeKind::F64);
+    // gate OFF → InvalidType (no accidental promotion)
+    ResolvedArithmeticRules off;
+    off.minRank = TypeKind::I32;
+    EXPECT_FALSE(usualArithmeticCommonType(in, b20s, b40s, off).valid());
+}

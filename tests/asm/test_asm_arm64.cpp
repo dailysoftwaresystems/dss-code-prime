@@ -172,6 +172,87 @@ TEST(Arm64Encoder, UnreachableEncodesD4200000) {
     EXPECT_EQ(bytes[3], 0xD4);
 }
 
+// ── D-CSUBSET-VLA (C1b): `sub_sp_reg` + `sp_copy` byte pins ───────
+//
+// ★ THE XZR-VS-SP TRAP guard. `sub_sp_reg sp, Xm` MUST encode the
+// EXTENDED-register SUB (0xCB2063FF base: option=011 UXTX, bit 21 set,
+// Rd=Rn=sp=31), NOT the shifted-register SUB (0xCB000000) where reg 31
+// = XZR would compute `sp - 0` and silently discard the size. A byte
+// regression here is a silent stack miscompile the qemu run also
+// catches (examples/c-subset/c99_vla) — this is the host-independent
+// red-on-disable pin.
+
+TEST(Arm64Encoder, SubSpRegEncodesExtendedRegisterWord) {
+    // sub_sp_reg sp, x9  =>  SUB sp, sp, x9 (extended reg, UXTX):
+    //   base 0xCB2063FF | (Rm=x9=9 << 16) = 0xCB2963FF.  LE: FF 63 29 CB.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const subSpReg = (*s)->opcodeByMnemonic("sub_sp_reg");
+    auto const retOp    = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(subSpReg.has_value());
+    ASSERT_TRUE(retOp.has_value());
+    auto const sp = (*s)->registerByName("sp");
+    auto const x9 = (*s)->registerByName("x9");
+    ASSERT_TRUE(sp.has_value() && x9.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const r_sp{static_cast<std::uint32_t>(*sp), 1, cls};
+    LirReg const r_x9{static_cast<std::uint32_t>(*x9), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(r_sp), LirOperand::makeReg(r_x9) };
+    (void)b.addInst(*subSpReg, InvalidLirReg, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xFF);
+    EXPECT_EQ(bytes[1], 0x63);
+    EXPECT_EQ(bytes[2], 0x29);   // 0x20 base | (Rm=9 at bits 16..20) => 0x29
+    EXPECT_EQ(bytes[3], 0xCB);
+}
+
+TEST(Arm64Encoder, SpCopyEncodesAddImmZero) {
+    // sp_copy x29, sp  =>  ADD x29, sp, #0 (the SP-capable add-imm form,
+    //   reg 31 = SP not XZR):  0x91000000 | Rd=29 | (Rn=sp=31 << 5)
+    //   = 0x910003FD.  LE: FD 03 00 91.  (== the prologue `mov x29, sp`.)
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const spCopy = (*s)->opcodeByMnemonic("sp_copy");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(spCopy.has_value());
+    ASSERT_TRUE(retOp.has_value());
+    auto const sp  = (*s)->registerByName("sp");
+    auto const x29 = (*s)->registerByName("x29");
+    ASSERT_TRUE(sp.has_value() && x29.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const r_sp{static_cast<std::uint32_t>(*sp), 1, cls};
+    LirReg const r_x29{static_cast<std::uint32_t>(*x29), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(r_sp) };
+    (void)b.addInst(*spCopy, r_x29, ops);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0xFD);
+    EXPECT_EQ(bytes[1], 0x03);
+    EXPECT_EQ(bytes[2], 0x00);
+    EXPECT_EQ(bytes[3], 0x91);
+}
+
 // ── fixed32 walker — `mov Xd, Xm` (ORR alias) ─────────────────────
 
 TEST(Arm64Encoder, MovX0FromX1EncodesORR) {

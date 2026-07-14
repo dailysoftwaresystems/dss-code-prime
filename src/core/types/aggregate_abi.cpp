@@ -18,8 +18,15 @@ bool aggregateAbiImplemented(AggregateClassKind strategy) noexcept {
 namespace {
 
 struct LeafField {
-    std::uint64_t offset;   // absolute byte offset within the top aggregate
-    TypeKind      kind;     // a scalar/pointer leaf kind
+    std::uint64_t offset;    // absolute byte offset within the top aggregate
+    TypeKind      kind;      // a scalar/pointer leaf kind
+    // D-CSUBSET-BITINT: the leaf's byte size, resolved at collection through
+    // `sizeOfScalarOrBitInt` (a `_BitInt(N)`'s size needs its width scalar, which
+    // `scalarByteSize(kind,...)` — kind-only — cannot see). 0 = un-sized (the
+    // classifier's defensive fsz=1). Carrying it here fixes a BitInt leaf that
+    // STRADDLES an eightbyte boundary: sized as 1 byte it would leave the second
+    // eightbyte marked SSE (a silent GPR→XMM ABI miscompile of a by-value struct).
+    std::uint64_t byteSize;
 };
 
 [[nodiscard]] bool isFloatKind(TypeKind k) noexcept {
@@ -60,7 +67,10 @@ struct LeafField {
                 return false;
         return true;
     }
-    out.push_back(LeafField{base, k});   // scalar/pointer leaf
+    // D-CSUBSET-BITINT: size the leaf through the TypeId-aware shim so a
+    // `_BitInt(N)` gets its CONTAINER size (not the kind-only nullopt→1 default).
+    out.push_back(LeafField{base, k,
+                            sizeOfScalarOrBitInt(in, ty, dm).value_or(0)});
     return true;
 }
 
@@ -164,7 +174,7 @@ classifyAggregate(AggregateClassKind strategy, std::uint16_t maxRegBytes,
     // integer/pointer field in the eightbyte ⇒ INTEGER (INTEGER wins the merge).
     std::vector<bool> isInteger(n, false);
     for (LeafField const& f : leaves) {
-        std::uint64_t fsz = scalarByteSize(f.kind, dm).value_or(0);
+        std::uint64_t fsz = f.byteSize;   // BitInt-aware (D-CSUBSET-BITINT)
         if (fsz == 0) fsz = 1;   // defensive: a non-sized leaf can't be SSE-clean
         std::uint64_t const lo = f.offset;
         std::uint64_t const hi = f.offset + fsz;   // [lo, hi)

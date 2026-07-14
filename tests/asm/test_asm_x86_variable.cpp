@@ -151,6 +151,72 @@ TEST(X86VariableEncoder, MovRaxRaxEmits48_8B_C0) {
     EXPECT_EQ(bytes[3], 0xC3);
 }
 
+// ── D-CSUBSET-VLA (C1b): `sub_sp_reg` + `sp_copy` byte pins ───────
+// The x86 realizations: `sub_sp_reg` is REX.W 0x29 /r (SUB r/m64,r64 —
+// operand0=sp is the r/m dest+src1, operand1=size is the reg src2);
+// `sp_copy` is REX.W 0x8B /r (MOV r64,r/m64 — resultSlot=reg dst,
+// operand0=src -> r/m). DISTINCT mnemonics from `sub`/`mov` so they can
+// be hasSideEffects. Red-on-disable byte pins for the two dedicated ops.
+
+TEST(X86VariableEncoder, SubSpRegRspRcxEmits48_29_CC) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const subSpReg = (*schema)->opcodeByMnemonic("sub_sp_reg");
+    ASSERT_TRUE(subSpReg.has_value());
+    auto const rsp = (*schema)->registerByName("rsp");
+    auto const rcx = (*schema)->registerByName("rcx");
+    ASSERT_TRUE(rsp.has_value() && rcx.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const r_rsp{static_cast<std::uint32_t>(*rsp), 1, cls};
+    LirReg const r_rcx{static_cast<std::uint32_t>(*rcx), 1, cls};
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = { LirOperand::makeReg(r_rsp),
+                                   LirOperand::makeReg(r_rcx) };
+        (void)b.addInst(*subSpReg, InvalidLirReg, ops);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // sub rsp, rcx = REX.W 0x48 + 0x29 + ModR/M(mod=3 reg=rcx(1) rm=rsp(4)
+    // = 0xC0|0x08|0x04 = 0xCC); then ret 0xC3.
+    ASSERT_EQ(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x29);
+    EXPECT_EQ(bytes[2], 0xCC);
+    EXPECT_EQ(bytes[3], 0xC3);
+}
+
+TEST(X86VariableEncoder, SpCopyRbpRspEmits48_8B_EC) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const spCopy = (*schema)->opcodeByMnemonic("sp_copy");
+    ASSERT_TRUE(spCopy.has_value());
+    auto const rbp = (*schema)->registerByName("rbp");
+    auto const rsp = (*schema)->registerByName("rsp");
+    ASSERT_TRUE(rbp.has_value() && rsp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const r_rbp{static_cast<std::uint32_t>(*rbp), 1, cls};
+    LirReg const r_rsp{static_cast<std::uint32_t>(*rsp), 1, cls};
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = { LirOperand::makeReg(r_rsp) };
+        (void)b.addInst(*spCopy, r_rbp, ops);   // sp_copy rbp, rsp (FP<-SP)
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // mov rbp, rsp = REX.W 0x48 + 0x8B + ModR/M(mod=3 reg=rbp(5) rm=rsp(4)
+    // = 0xC0|0x28|0x04 = 0xEC); then ret 0xC3.
+    ASSERT_EQ(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x48);
+    EXPECT_EQ(bytes[1], 0x8B);
+    EXPECT_EQ(bytes[2], 0xEC);
+    EXPECT_EQ(bytes[3], 0xC3);
+}
+
 TEST(X86VariableEncoder, MovR8RaxDerivesRexR) {
     // dest=r8 (hwEncoding=8) → ModR/M.reg low 3 = 0, REX.R = 1.
     // src=rax(0)             → ModR/M.rm  low 3 = 0, REX.B = 0.

@@ -13,6 +13,7 @@
 #include "core/types/declarator_walk.hpp"     // FC4: declaratorNameNode / collectDeclarators
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
+#include "core/types/bit_int_value.hpp"
 #include "core/types/integer_literal_ladder.hpp"
 #include "core/types/number_decode.hpp"
 #include "core/types/operator_table.hpp"
@@ -401,7 +402,7 @@ hasFnSuffixOnName(Tree const& tree, NodeId nameNode,
     }
     for (NodeId c : visibleChildren(tree, direct)) {
         if (tree.kind(c) == NodeKind::Internal
-            && tree.rule(c) == dc.fnSuffixRule) {
+            && isFnSuffixRule(tree.rule(c), dc)) {
             return true;
         }
     }
@@ -486,7 +487,7 @@ isPrototypeParamScopeNode(EngineState const& s, SemanticConfig const& cfg,
     // paramList → fnSuffix (its direct parent must be the fn-suffix rule).
     NodeId const fnSuffix = tree.parent(node);
     if (!fnSuffix.valid() || tree.kind(fnSuffix) != NodeKind::Internal
-        || tree.rule(fnSuffix) != dc.fnSuffixRule) {
+        || !isFnSuffixRule(tree.rule(fnSuffix), dc)) {
         // Not a function-suffix param list (defensive — the role is the
         // fnSuffix's param list by construction). Treat as a prototype scope
         // (the safe direction: isolate the names) only when it IS a fnSuffix;
@@ -1008,7 +1009,8 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
 directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                    NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
                    bool allowFlexibleArray,
-                   bool allowInitInferredArray = false);
+                   bool allowInitInferredArray = false,
+                   bool paramDecay = false);
 
 // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: forward declaration — the
 // tag-namespace-scope floater (defined below) is consumed early by
@@ -1017,6 +1019,21 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 [[nodiscard]] ScopeId
 floatToNamespaceScope(EngineState const& s, SemanticConfig const& cfg,
                       Tree const& tree, ScopeId scope);
+
+// D-CSUBSET-BITINT: `resolveTypeNodeImpl` (below) folds a `_BitInt(N)` width
+// through `constIntExpr`, which is DEFINED later in this TU — forward-declare it
+// here (no default args; the definition supplies them). Same const-expr evaluator
+// the array-dimension / alignas / static_assert consumers use.
+[[nodiscard]] std::optional<std::int64_t>
+constIntExpr(EngineState& s, Tree const& tree, NodeId node, ScopeId fromScope,
+             SemanticConfig const* cfg);
+
+// VLA C1a (D-CSUBSET-VLA): the two array-suffix arms (`applyArraySuffix`,
+// `applyDeclaratorSuffix` — both DEFINED above the definition below) gate the VLA
+// accept on BLOCK scope via `fileScopeOf` (the agnostic scope-chain walk the
+// thread_local validator uses). Forward-declare it here so those arms can call it.
+[[nodiscard]] ScopeId fileScopeOf(EngineState const& s, Tree const& tree,
+                                  ScopeId scope);
 
 // Resolve a type-position subtree to a TypeId. Walks `typeShapes`
 // recursively (e.g. pointerType[innerType] → Ptr<innerType>) and looks
@@ -1112,6 +1129,127 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                     if (rec.type.valid()) return rec.type;
                 }
                 return InvalidType;
+            }
+        }
+        // C23 6.2.5/6.7.2 (D-CSUBSET-BITINT): `_BitInt(N)` — a bit-precise integer
+        // type-specifier. Handled BEFORE the multiset arm (a run containing a
+        // `bitIntSpecifier` node is NOT all-tokens, so that arm skips it). Two
+        // shapes: `node` IS the bitIntSpecifier (a bare `_BitInt(N)` reached
+        // directly), OR `node` is a `typeSpecifierSeq` run holding the
+        // bitIntSpecifier NODE plus sibling `unsigned`/`signed` TOKENS (order-
+        // independent; DEFAULT signed). The arm resolves the width const-expr and
+        // fail-loud-gates it. Fires only for a language declaring `semantics.bitInt`
+        // (never a keyword identity).
+        if (cfg.bitIntSpecRule.valid()) {
+            NodeId bitSpec{};
+            bool sawUnsigned = false;
+            bool sawSigned   = false;
+            bool sawOther    = false;   // any specifier other than signedness → invalid
+            if (rule.v == cfg.bitIntSpecRule.v) {
+                bitSpec = node;   // bare `_BitInt(N)` — default signed, no siblings
+            } else {
+                for (NodeId c : visibleChildren(tree, node)) {
+                    if (tree.kind(c) == NodeKind::Internal
+                        && tree.rule(c).v == cfg.bitIntSpecRule.v) {
+                        if (bitSpec.valid()) sawOther = true;   // two `_BitInt` → invalid
+                        else bitSpec = c;
+                    } else if (tree.kind(c) == NodeKind::Token) {
+                        auto const ck = tree.tokenKind(c);
+                        if (cfg.bitIntUnsignedToken && ck == *cfg.bitIntUnsignedToken)
+                            sawUnsigned = true;
+                        else if (cfg.bitIntSignedToken && ck == *cfg.bitIntSignedToken)
+                            sawSigned = true;
+                        else
+                            sawOther = true;   // int/long/short/… mixed with `_BitInt`
+                    } else {
+                        sawOther = true;
+                    }
+                }
+            }
+            if (bitSpec.valid()) {
+                // `unsigned _BitInt` → unsigned; `signed _BitInt` / bare → signed.
+                bool const isSigned = !sawUnsigned;
+                if (sawUnsigned && sawSigned) sawOther = true;   // contradictory pair
+                if (sawOther) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_InvalidTypeSpecifierCombination;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(node);
+                    d.actual   = std::string{tree.text(node)};
+                    s.reporter.report(std::move(d));
+                    specifierDiagnosed = true;
+                    return InvalidType;
+                }
+                auto bitKids = visibleChildren(tree, bitSpec);
+                if (cfg.bitIntWidthChild >= bitKids.size()) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_UnknownType;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(bitSpec);
+                    d.actual   = std::string{tree.text(bitSpec)};
+                    s.reporter.report(std::move(d));
+                    specifierDiagnosed = true;
+                    return InvalidType;
+                }
+                // The width is a shared-CST const-expr (the array-dim / alignas /
+                // static_assert evaluator). A width diagnostic is UNSUPPRESSABLE and
+                // is emitted regardless of `emitOnMiss` (a global's head resolves
+                // that way) so the fail-loud is never silently dropped; the reporter's
+                // recent-duplicate window collapses a Pass-1.5 + Pass-2 double-visit.
+                auto const emitWidth = [&](DiagnosticCode code, std::string msg) {
+                    ParseDiagnostic d;
+                    d.code     = code;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(bitSpec);
+                    d.actual   = std::move(msg);
+                    s.reporter.report(std::move(d));
+                    specifierDiagnosed = true;
+                };
+                auto const width =
+                    constIntExpr(s, tree, bitKids[cfg.bitIntWidthChild], scope, &cfg);
+                if (!width.has_value()) {
+                    emitWidth(DiagnosticCode::S_BitIntWidthNotConstant,
+                              "`_BitInt(N)` requires an integer constant-expression "
+                              "width: " + std::string{tree.text(bitSpec)});
+                    return InvalidType;
+                }
+                std::int64_t const n = *width;
+                if (n <= 0) {
+                    emitWidth(DiagnosticCode::S_BitIntWidthNotPositive,
+                              std::format("`_BitInt` width must be positive (got {})",
+                                          n));
+                    return InvalidType;
+                }
+                if (isSigned && n < 2) {
+                    emitWidth(DiagnosticCode::S_BitIntSignedWidthTooSmall,
+                              "a signed `_BitInt` needs at least 2 bits (1 sign + 1 "
+                              "value bit); use `unsigned _BitInt(1)` for a 1-bit type");
+                    return InvalidType;
+                }
+                // __BITINT_MAXWIDTH__ (C23 6.2.5) — the same 8388608 the predefined
+                // macro carries; the two encode ONE ABI constant.
+                constexpr std::int64_t kBitIntMaxWidth = 8388608;
+                if (n > kBitIntMaxWidth) {
+                    emitWidth(DiagnosticCode::S_BitIntWidthExceedsMax,
+                              std::format("`_BitInt` width {} exceeds "
+                                          "__BITINT_MAXWIDTH__ ({})",
+                                          n, kBitIntMaxWidth));
+                    return InvalidType;
+                }
+                // D-CSUBSET-BITINT-C2-WIDE: N>64 is now a runnable MULTI-LIMB type
+                // (ceil(N/64) i64 limbs) — the C1 `S_BitIntWidthAboveC1Limit` cycle
+                // gate is RETIRED here. `bitInt(n, ...)` mints any width; the wrap /
+                // storage / ABI / ops for N>64 live in the MIR-lowering tier. As of C3
+                // (D-CSUBSET-BITINT-C3-MULDIV) `* / %` also lower (multi-limb multiply
+                // + binary long division); the remaining wide gaps are float<->wide
+                // conversion and wide literals, which fail loud at their own sites.
+                TypeId const result = s.lattice.interner().bitInt(n, isSigned);
+                s.nodeToType.set(node, result);
+                if (bitSpec.v != node.v) s.nodeToType.set(bitSpec, result);
+                return result;
             }
         }
         // FC3 c1: type-specifier keyword run (C 6.7.2 — `unsigned long
@@ -1677,7 +1815,18 @@ resolveConstSymbolInit(EngineState const& s, Tree const& tree,
     // its init expression in the scope where the symbol was declared
     // — not the original use-site scope. This is what makes shadowing
     // work correctly across const ref chains.
-    return CstResolvedSymbol{*initExpr, rec.scope.v};
+    CstResolvedSymbol out{*initExpr, rec.scope.v, std::nullopt};
+    // C4b (I1): a const `_BitInt(N)` symbol's value is its initializer CONVERTED
+    // to `_BitInt(N)` (C 6.7.9 / 6.3.1.3). Hand the engine the declared (width,
+    // signed) so it applies the mod-2^N wrap — else `const _BitInt(4) k = 20wb;
+    // k` folds to 20 (the initializer's `_BitInt(6)` value) instead of 4.
+    auto const& in = s.lattice.interner();
+    if (rec.type.valid() && in.kind(rec.type) == TypeKind::BitInt) {
+        out.declaredBitPrecise = CstBitPreciseDeclType{
+            static_cast<std::uint32_t>(in.bitIntWidth(rec.type)),
+            in.bitIntIsSigned(rec.type)};
+    }
+    return out;
 }
 
 // FC17 (D-CSUBSET-CONSTEXPR): the ONE resolver-environment builder shared by
@@ -1849,6 +1998,17 @@ buildConstEvalEnv(EngineState& s, Tree const& tree,
                 case TypeKind::U32:  t.isInteger=true; t.intBits=32; t.intSigned=false; break;
                 case TypeKind::I64:  t.isInteger=true; t.intBits=64; t.intSigned=true;  break;
                 case TypeKind::U64:  t.isInteger=true; t.intBits=64; t.intSigned=false; break;
+                // C23 6.3.1.3 (D-CSUBSET-BITINT-CONSTFOLD-LARGE, C4b): a cast TO
+                // `_BitInt(N)` folds via the wrap-aware bignum at width N (mod-2^N),
+                // for ANY N (narrow AND wide) — `(_BitInt(4))15 + 1 == 0` /
+                // `(_BitInt(40))2000000 * ...`. Carried as the bit-precise descriptor
+                // (NOT `isInteger`, whose `intBits` maxes at 64 and whose narrow
+                // fold cannot express a wide `_BitInt`).
+                case TypeKind::BitInt:
+                    t.isBitPrecise = true;
+                    t.bitWidth = static_cast<std::uint32_t>(in.bitIntWidth(ty));
+                    t.bitSigned = in.bitIntIsSigned(ty);
+                    return t;
                 default: return std::nullopt;   // float / aggregate — non-foldable cast
             }
             return t;
@@ -1895,6 +2055,11 @@ constIntExpr(EngineState& s, Tree const& tree, NodeId node,
     auto fixedVals = fixedValueTokenMap(tree);
     CstEvalContext ctx{tree, tree.schema(), intLits, s.idx().numberStyle};
     ctx.fixedValueTokens = &fixedVals;
+    // C4b (Fork-2c): supply the `integerLiteralTyping` rules so a `wb`/`uwb`
+    // bit-precise literal folds to a BitIntValue leaf (`_Static_assert(15wb+1==16)`,
+    // an ICE `_BitInt` array dim). Absent cfg ⇒ empty ⇒ off (unchanged behavior).
+    if (cfg != nullptr) ctx.integerLiteralTyping = cfg->integerLiteralTyping;
+    ctx.dataModel = s.dataModel;
     CstEvalEnvironment env = buildConstEvalEnv(s, tree, fromScope, cfg);
     ConstEvalResult const r = evaluateConstantCst(node, ctx, env, {}, fromScope.v);
     if (!r.value.has_value()) return std::nullopt;
@@ -1925,6 +2090,10 @@ constExprValue(EngineState& s, Tree const& tree, NodeId node,
     CstEvalContext ctx{tree, tree.schema(), intLits, s.idx().numberStyle};
     ctx.floatLiteralTokens = &floatLits;
     ctx.fixedValueTokens   = &fixedVals;
+    // C4b (Fork-2c): a `wb`/`uwb` bit-precise constexpr initializer folds to a
+    // BitIntValue (`constexpr _BitInt(8) k = 15wb;`).
+    if (cfg != nullptr) ctx.integerLiteralTyping = cfg->integerLiteralTyping;
+    ctx.dataModel = s.dataModel;
     CstEvalEnvironment env = buildConstEvalEnv(s, tree, fromScope, cfg);
     EvalOptions options;
     options.allowFloat = true;
@@ -2125,6 +2294,22 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         s.reporter.report(std::move(d));
     };
 
+    // VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the array-parameter
+    // decorations `static` / cv-qualifiers / `*` are legal ONLY in a
+    // function-parameter declarator. This legacy suffix facet is externDecl's,
+    // and an extern object declaration is NEVER a parameter — so ANY decoration
+    // is a constraint violation. Reject BEFORE the fixed-index `lengthChild`
+    // lookup below: with a leading decoration the bound is no longer at
+    // `lengthChild`, so a widened `extern int arr[static 5];` would otherwise
+    // SILENTLY drop the `static 5` → a bogus incompleteArray. (The declarator-
+    // mode twin gates the same construct in applyDeclaratorSuffix via paramDecay.)
+    if (cfg != nullptr && cfg->declarators.has_value()
+        && arraySuffixHasModifier(tree, suffix,
+                                  cfg->declarators->arraySuffixModifierTokens)) {
+        emit(DiagnosticCode::S_ArrayParamQualifierNonParameter);
+        return InvalidType;
+    }
+
     NodeId lenNode{};
     if (as.lengthChild.has_value()) {
         auto sufKids = visibleChildren(tree, suffix);
@@ -2149,7 +2334,31 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         return s.lattice.interner().incompleteArray(base);
     }
     auto len = constIntExpr(s, tree, lenNode, fromScope, cfg);
-    if (!len.has_value()) { emit(DiagnosticCode::S_NonConstantArrayLength); return InvalidType; }
+    if (!len.has_value()) {
+        // VLA C1a (D-CSUBSET-VLA): the legacy-facet twin of the declarator-mode VLA
+        // arm — a PRESENT-but-non-constant length on a NON-FAM, NON-param declarator
+        // is a variable-length array. Build the vlaArray here; the block-vs-file +
+        // automatic-storage constraints are enforced by the Pass-2
+        // `validateVlaDeclarator` (reading the symbol's binding scope), NOT by the
+        // type-construction `fromScope` (a descendant of the file scope even for a
+        // file-scope decl). Params (`arrayToPointer`) + struct fields
+        // (`allowFlexibleArray`) already took their absent-length paths above.
+        // `visibleChildren(suffix).size() > 2` mirrors the twin's `hasPresentLength`:
+        // a PRESENT length (`[ expr ]`, 3 children) is a VLA; an ABSENT one (`[]`, 2)
+        // stays S_NonConstantArrayLength (defense-in-depth — the only legacy array-
+        // suffix row today is `externDecl`/allowFlexibleArray, skipped above).
+        if (!decl.allowFlexibleArray && !decl.arrayToPointer
+            && visibleChildren(tree, suffix).size() > 2) {
+            TypeInterner& in = s.lattice.interner();
+            // VLA C3 (D-CSUBSET-VLA): a VLA whose element is itself an array or a VLA
+            // (`int a[n][m]`, `int a[n][5]`) is a MULTI-DIMENSIONAL VLA — build the
+            // nested `vlaArray(element)`; HIR→MIR sizes the runtime row stride. The
+            // right-to-left suffix fold already produced `base` as the inner type.
+            return in.vlaArray(base);
+        }
+        emit(DiagnosticCode::S_NonConstantArrayLength);
+        return InvalidType;
+    }
     // C99 §6.7.5.2: array length is a positive integer constant
     // expression. Negative folds (e.g. `int a[-1]`) and zero are
     // out-of-range; fail loud rather than wrap to a giant unsigned.
@@ -2165,6 +2374,12 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         emit(DiagnosticCode::S_FlexibleArrayInAggregate);
         return InvalidType;
     }
+    // VLA C3 (D-CSUBSET-VLA): a CONSTANT outer bound over a VLA element (`int a[5][n]`
+    // — the `[n]` folded first into a vlaArray, now `[5]` folds over it) is a fixed-
+    // outer multi-dimensional VLA. Build `array(vlaArray, N)`; the transitive
+    // `typeContainsVla` routes it to the runtime alloca/stride paths downstream. The
+    // FAM guard above still rejects an incomplete (-1) element; only the -2 VLA
+    // element flows through here.
     return s.lattice.interner().array(base, *len);
 }
 
@@ -2232,7 +2447,15 @@ resolveBitfieldSuffix(EngineState& s, Tree const& tree, DeclarationRule const& d
             default:                                  return 0;
         }
     };
-    std::uint32_t const typeBits = intBits(k);
+    // D-CSUBSET-BITINT-BITFIELD (C23 6.7.2.1): a `_BitInt(N)` bit-field's base
+    // bit-size is N (reprType is the BitInt itself — enumUnderlyingOrSelf passes a
+    // non-enum through). The >64 cap below then excludes wide (N>64) BitInt
+    // bit-fields for free (same as I128/U128 — no >64 allocation-unit codegen), and
+    // the `M <= typeBits` check enforces M <= N with no extra code.
+    std::uint32_t const typeBits =
+        (k == TypeKind::BitInt)
+            ? static_cast<std::uint32_t>(s.lattice.interner().bitIntWidth(reprType))
+            : intBits(k);
     if (typeBits == 0) { emit(DiagnosticCode::S_BitFieldNonIntegerType); return out; }
     // A bit-field on a >32-bit base (`long`/`long long`/I64/U64) needs a 64-bit
     // allocation-unit access. D-CSUBSET-BITFIELD-WIDE-UNIT (v0.0.2 FC8) closed the
@@ -2941,7 +3164,8 @@ declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                        Tree const& tree, NodeId node, TypeId base,
                        ScopeId scope, bool emitOnMiss,
                        bool allowFlexibleArray = false,
-                       bool allowInitInferredArray = false);
+                       bool allowInitInferredArray = false,
+                       bool paramDecay = false);
 
 // c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT (C 6.7.6.3p7): a declaration form with
 // `arrayToPointer` whose resolved declarator type is an ARRAY — sized
@@ -2996,15 +3220,20 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         }
         if (decl.declaratorChild.has_value()) {
             if (*decl.declaratorChild < kids.size()) {
-                // c82 (C 6.7.6.3p7): an `arrayToPointer` row admits the
-                // absent-length `T x[]` on its OWN outermost suffix (the
-                // incomplete-array resolution path), then the adjustment
-                // below rewrites any top-level array to Ptr<element> —
-                // matching the definitive visit's identical sequence.
+                // c82 (C 6.7.6.3p7) + VLA C4a-param (D-CSUBSET-VLA, FIX-2): an
+                // `arrayToPointer` row is a C PARAMETER — route its array-decay
+                // through the DISTINCT `paramDecay` signal (NOT the struct-field FAM
+                // `allowFlexibleArray`, which stays false here). paramDecay admits the
+                // absent-length `T x[]` AND builds a `vlaArray` for a non-outermost
+                // present-length suffix (`int (*p)[n]` → the pointee keeps `[n]`); the
+                // adjustment below then rewrites any top-level array to Ptr<element>.
+                // Mirrors the definitive visit's identical sequence so the FnSig agrees.
                 TypeId const t = declaratorDeclaredType(
                     s, cfg, tree, kids[*decl.declaratorChild], head, scope,
                     emitOnMiss,
-                    /*allowFlexibleArray=*/decl.arrayToPointer);
+                    /*allowFlexibleArray=*/false,
+                    /*allowInitInferredArray=*/false,
+                    /*paramDecay=*/decl.arrayToPointer);
                 return adjustArrayToPointer(s, decl, t);
             }
             // Declarator structurally absent — a TYPE-ONLY (abstract) param.
@@ -3037,10 +3266,11 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                       Tree const& tree, NodeId suffix, TypeId inner,
                       ScopeId scope, bool emitOnMiss,
-                      bool allowFlexibleArray = false) {
+                      bool allowFlexibleArray = false,
+                      bool paramDecay = false) {
     DeclaratorConfig const& dc = *cfg.declarators;
     RuleId const r = tree.rule(suffix);
-    if (r == dc.fnSuffixRule) {
+    if (isFnSuffixRule(r, dc)) {
         // The param harvest is the SHARED `collectParamTypes` walker (one
         // chokepoint with the legacy function-decl path): it descends
         // wrapper rules (c-subset's `paramOrEllipsis` alt wrapper),
@@ -3093,6 +3323,31 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
         // applies the target's real convention at materialize time.
         return s.lattice.interner().fnSig(paramTypes, inner, CallConv::CcSysV);
     }
+    if (dc.arrayStarSuffixRule.has_value() && r == *dc.arrayStarSuffixRule) {
+        // VLA C4c (D-CSUBSET-VLA-PARAM-STAR, C99 §6.7.6.2p4): the bare
+        // unspecified-size `[*]` — a prototype-form VLA-parameter marker. Legal
+        // ONLY inside a function-parameter declarator (C 6.7.6.3p7 adjusts it to
+        // a pointer). For a PARAMETER (`paramDecay`) it is an UNSPECIFIED-size
+        // (absent-length) array — IDENTICAL to a bare `[]` — that
+        // `adjustArrayToPointer` then strips to `Ptr<element>`; the `*` carries
+        // no runtime bound (unlike `[static n]`, so NEVER a vlaArray). A
+        // NON-parameter `[*]` is a constraint violation — the SAME paramDecay
+        // gate + diagnostic (S_ArrayParamQualifierNonParameter, 0xE054) a
+        // static/qualifier decoration trips in the arraySuffixRule arm below.
+        if (!paramDecay) {
+            if (emitOnMiss) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_ArrayParamQualifierNonParameter;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(suffix);
+                d.actual   = std::string{tree.text(suffix)};
+                s.reporter.report(std::move(d));
+            }
+            return InvalidType;
+        }
+        return s.lattice.interner().incompleteArray(inner);
+    }
     if (r == dc.arraySuffixRule) {
         auto const emit = [&](DiagnosticCode code) {
             if (!emitOnMiss) return;
@@ -3104,6 +3359,23 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             d.actual   = std::string{tree.text(suffix)};
             s.reporter.report(std::move(d));
         };
+        // VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the array-PARAMETER
+        // decorations — a `static`, a cv-qualifier, or the unspecified-size `*` —
+        // are legal ONLY in a function-parameter declarator (C 6.7.6.3p7 adjusts
+        // such a `[static n]`/`[*]` to a pointer). This ONE arm folds EVERY
+        // declarator-mode row; `paramDecay` is true ONLY on the `param` row, so a
+        // decoration on ANY other row (a local / struct field / typedef / for-init)
+        // is a constraint violation — fail loud (the typeSpecifierSeq →
+        // S_InvalidTypeSpecifierCombination reject-the-construct discipline). A
+        // legal deref-sized VLA `int a[*p]` is an EXPRESSION node, NOT a bare `*`
+        // token, so `arraySuffixHasModifier` (direct-children scan) never trips on
+        // it. externDecl takes the legacy `applyArraySuffix` twin (never a
+        // parameter), which carries its own copy of this gate.
+        if (!paramDecay
+            && arraySuffixHasModifier(tree, suffix, dc.arraySuffixModifierTokens)) {
+            emit(DiagnosticCode::S_ArrayParamQualifierNonParameter);
+            return InvalidType;
+        }
         // The length is whichever of the suffix's visible children
         // CONSTANT-FOLDS (`[ n ]` — a bare literal TOKEN or an expression
         // rule; the bracket tokens fold to nothing, so the first foldable
@@ -3117,15 +3389,55 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             if (len.has_value()) break;
         }
         if (!len.has_value()) {
-            // c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR (FAM): an ABSENT length on
-            // a declaration form that may bear a flexible array member (a
-            // struct field) is an INCOMPLETE array (C99 §6.7.2.1), NOT an
-            // error — the declarator-mode twin of the legacy `applyArraySuffix`
-            // FAM branch. Only the field's OWN array suffix inherits this; a
-            // nested fn-ptr param's array never does (the caller passes false
-            // into the group recursion).
+            // CRITICAL discriminator — an ABSENT length (`T x[]`, an incomplete/
+            // decaying array) vs a PRESENT non-constant length (`T x[n]`, a VLA): BOTH
+            // fold to nullopt, so the discriminator is whether a real BOUND child sits
+            // between the brackets. VLA C4c (D-CSUBSET-VLA): NOT a raw child COUNT — a
+            // `[static n]` bound sits BEHIND the `static` token (count 4, bound present)
+            // while a `[*]` / `[restrict]` decoration has NO bound child (count 3, bound
+            // ABSENT — it must decay like `[]`, NEVER route to `vlaArray`). The shared
+            // `arraySuffixBoundNode` skips the decorations and returns the real bound (or
+            // nullopt) — the ONE locator every array-suffix site now agrees on.
+            bool const hasPresentLength =
+                arraySuffixBoundNode(tree, suffix, dc.arraySuffixModifierTokens)
+                    .has_value();
+            // VLA C4a-param (D-CSUBSET-VLA, Option B): a C PARAMETER declarator
+            // (`arrayToPointer` row — a DISTINCT signal threaded as `paramDecay`, NEVER
+            // the struct-field FAM `allowFlexibleArray`). C 6.7.6.3p7 adjusts a param's
+            // OUTERMOST array to a pointer, but a NON-outermost VLA suffix survives in
+            // the pointee (`int (*p)[n]` → `int (*)[n]`; `int a[][n]` → same after the
+            // decayed outer `[]`). Build the vlaArray for a PRESENT length so the
+            // pointee carries the runtime row shape; an ABSENT `[]` is the (possibly
+            // outermost) decaying dim → incompleteArray, which `adjustArrayToPointer`
+            // then strips to `Ptr<element>`. Checked FIRST + kept off the FAM bool so
+            // the struct-field FAM path (below) stays BYTE-IDENTICAL — a param never
+            // reaches the FAM branch, a field never reaches here.
+            if (paramDecay) {
+                TypeInterner& in = s.lattice.interner();
+                return hasPresentLength ? in.vlaArray(inner)
+                                        : in.incompleteArray(inner);
+            }
+            // c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR (FAM): an ABSENT length on a
+            // declaration form that may bear a flexible array member (a struct field,
+            // OR an init-inferred `[]`) is an INCOMPLETE array (C99 §6.7.2.1), NOT an
+            // error — the declarator-mode twin of the legacy `applyArraySuffix` FAM
+            // branch. Only the field's OWN array suffix inherits this; a nested fn-ptr
+            // param's array never does (the group recursion passes false).
             if (allowFlexibleArray)
                 return s.lattice.interner().incompleteArray(inner);
+            // VLA C1a (D-CSUBSET-VLA): a PRESENT-but-non-constant length on a NON-FAM,
+            // NON-param declarator is a VARIABLE-LENGTH array (C99/C11 §6.7.6.2
+            // `int a[n]` — a VLA OBJECT). Build the vlaArray HERE regardless of
+            // scope/storage: the block-vs-file + automatic-storage constraints are
+            // enforced by the Pass-2 `validateVlaDeclarator`, which reads the SYMBOL's
+            // binding scope (`rec.scope`) — the type-construction `scope` here is a
+            // descendant of, NOT equal to, the file scope even for a file-scope decl,
+            // so `fileScopeOf(scope)` cannot discriminate file from block at this tier.
+            // VLA C3: a VLA whose ELEMENT is itself an array or VLA (`int a[n][m]`,
+            // `int a[n][5]`) is a MULTI-DIMENSIONAL VLA — the right-to-left suffix fold
+            // already produced `inner` as the element; HIR→MIR sizes the runtime stride.
+            if (hasPresentLength)
+                return s.lattice.interner().vlaArray(inner);
             emit(DiagnosticCode::S_NonConstantArrayLength);
             return InvalidType;
         }
@@ -3140,6 +3452,12 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             emit(DiagnosticCode::S_FlexibleArrayInAggregate);
             return InvalidType;
         }
+        // VLA C3 (D-CSUBSET-VLA): a CONSTANT outer bound over a VLA element
+        // (`int a[5][n]` — the `[n]` folded first into a vlaArray, now `[5]` folds
+        // over it) is a fixed-outer multi-dimensional VLA. Build `array(vlaArray, 5)`;
+        // the transitive `typeContainsVla` routes it to the runtime alloca/stride/
+        // sizeof paths downstream. The FAM guard above still rejects an incomplete
+        // (-1) element; only the -2 VLA element flows through here.
         return s.lattice.interner().array(inner, *len);
     }
     return InvalidType;   // caller filters to the two suffix roles
@@ -3158,7 +3476,8 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
 [[nodiscard]] TypeId
 directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                    NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
-                   bool allowFlexibleArray, bool allowInitInferredArray) {
+                   bool allowFlexibleArray, bool allowInitInferredArray,
+                   bool paramDecay) {
     if (!cfg.declarators.has_value()) return InvalidType;
     DeclaratorConfig const& dc = *cfg.declarators;
     if (!direct.valid() || !base.valid()) return InvalidType;
@@ -3188,7 +3507,14 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             continue;
         }
         RuleId const cr = tree.rule(c);
-        if (cr == dc.fnSuffixRule || cr == dc.arraySuffixRule) {
+        // VLA C4c (D-CSUBSET-VLA-PARAM-STAR): the bare-`[*]` suffix is a THIRD
+        // array-suffix role alongside fn/array — collect it so `applyDeclarator-
+        // Suffix` folds it (a param `[*]` decays like `[]`; a non-param is a
+        // constraint violation). Omitting it here would SILENTLY drop the `[*]`
+        // → `int a[*]` would mis-type as a plain `int` (a silent miscompile).
+        if (isFnSuffixRule(cr, dc) || cr == dc.arraySuffixRule
+            || (dc.arrayStarSuffixRule.has_value()
+                && cr == *dc.arrayStarSuffixRule)) {
             suffixes.push_back(c);
             continue;
         }
@@ -3198,7 +3524,7 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // Suffixes fold RIGHT-to-LEFT (source-first suffix = outermost type).
     for (std::size_t i = suffixes.size(); i-- > 0;) {
         t = applyDeclaratorSuffix(s, cfg, tree, suffixes[i], t, scope,
-                                  emitOnMiss, allowFlexibleArray);
+                                  emitOnMiss, allowFlexibleArray, paramDecay);
         if (!t.valid()) return InvalidType;
     }
 
@@ -3217,9 +3543,17 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // fn-ptrs) carries its `[]` on THIS inner declarator and is sized from the
         // top-level initializer. Propagate ONLY that init-inference signal as the
         // inner's flexible flag; a NO-init grouped `[]` keeps it false ⇒ S000B.
+        // VLA C4a-param FIX-1 (D-CSUBSET-VLA): param decay applies ONLY to the
+        // OUTERMOST dim (C 6.7.6.3p7); a grouped/parenthesized inner declarator is
+        // NOT the decaying dim, so RESET `paramDecay=false` here (the two witnesses
+        // are unaffected — `(*p)[n]`'s `[n]` folds at the OUTER suffix above, before
+        // this recursion; `a[][n]` has no group — but the reset prevents a latent
+        // over-lenient accept on an exotic `int (*p[])[n]`). `allowInitInferredArray`
+        // stays a DISTINCT signal (c47 init-inferred fn-ptr arrays), not collapsed.
         return declaratorDeclaredType(s, cfg, tree, inner, t, scope, emitOnMiss,
                                       /*allowFlexibleArray=*/allowInitInferredArray,
-                                      /*allowInitInferredArray=*/allowInitInferredArray);
+                                      /*allowInitInferredArray=*/allowInitInferredArray,
+                                      /*paramDecay=*/false);
     }
     return t;   // abstract direct — the type itself
 }
@@ -3227,7 +3561,8 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                               Tree const& tree, NodeId node, TypeId base,
                               ScopeId scope, bool emitOnMiss,
-                              bool allowFlexibleArray, bool allowInitInferredArray) {
+                              bool allowFlexibleArray, bool allowInitInferredArray,
+                              bool paramDecay) {
     if (!cfg.declarators.has_value()) return InvalidType;
     DeclaratorConfig const& dc = *cfg.declarators;
     if (!node.valid() || !base.valid()) return InvalidType;
@@ -3237,9 +3572,11 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
         NodeId const inner = declarator_walk_detail::firstChildOfRule(
             TreeDeclaratorView{tree}, node, dc.declaratorRule);
         if (!inner.valid()) return InvalidType;
+        // Transparent wrapper — paramDecay rides through UNCHANGED (the decaying-dim
+        // signal belongs to the wrapped declarator, not this init-declarator shell).
         return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
                                       emitOnMiss, allowFlexibleArray,
-                                      allowInitInferredArray);
+                                      allowInitInferredArray, paramDecay);
     }
     // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR) FIX 1: a struct/union member-list
     // slot wraps ONE declarator (+ its own bitfield suffix). Descend to the
@@ -3259,9 +3596,11 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
         NodeId const inner = declarator_walk_detail::firstChildOfRule(
             TreeDeclaratorView{tree}, node, dc.declaratorRule);
         if (!inner.valid()) return InvalidType;
+        // Transparent wrapper — paramDecay rides through UNCHANGED (a struct member
+        // slot; paramDecay is false here in practice, but stay signal-preserving).
         return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
                                       emitOnMiss, allowFlexibleArray,
-                                      allowInitInferredArray);
+                                      allowInitInferredArray, paramDecay);
     }
     if (r != dc.declaratorRule) return InvalidType;
 
@@ -3299,7 +3638,8 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
     // resolver uses; see its comment). `t` already carries the pointer-star
     // depth from the loop above.
     return directDeclaredType(s, cfg, tree, direct, t, scope, emitOnMiss,
-                              allowFlexibleArray, allowInitInferredArray);
+                              allowFlexibleArray, allowInitInferredArray,
+                              paramDecay);
 }
 
 // FC4 c1 (M5): first token of `kind` in `node`'s subtree in SOURCE order —
@@ -3503,6 +3843,132 @@ void validateThreadLocalDeclarator(EngineState& s, SemanticConfig const& cfg,
              std::format("'{}' — a block-scope thread_local object requires "
                          "'static' or 'extern' (C 6.7.1p3)", rec.name));
     }
+}
+
+// VLA C1a (D-CSUBSET-VLA, C11 §6.7.6.2p1): kinds a VLA SIZE expression may have —
+// integer type (the standard integers, Bool, Char, Byte, Enum, and `_BitInt`; a
+// `_BitInt(N)` bound is a legal VLA size). A float / nullptr_t / pointer / any other
+// kind is rejected (S_VlaSizeNotInteger). Mirrors mapCast's integer set + Enum +
+// BitInt (both integer-compatible at array-index / arithmetic sites).
+[[nodiscard]] constexpr bool isVlaSizeIntegerType(TypeKind k) noexcept {
+    switch (k) {
+        case TypeKind::Bool:
+        case TypeKind::I8:  case TypeKind::I16: case TypeKind::I32:
+        case TypeKind::I64: case TypeKind::I128:
+        case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
+        case TypeKind::U64: case TypeKind::U128:
+        case TypeKind::Char: case TypeKind::Byte:
+        case TypeKind::Enum: case TypeKind::BitInt:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// VLA C1a/C3 (D-CSUBSET-VLA): the SIZE-expression CST node of EVERY array suffix of a
+// (possibly multi-dimensional) variable-length array declarator — each is the child
+// BETWEEN that suffix's bracket delimiters (`arrayDeclSuffix = [ BracketOpen, expr,
+// BracketClose ]`). Ordered pre-order scan (children left-to-right = SOURCE order =
+// outer→inner) collecting one middle child per array-suffix node; a suffix node is
+// NOT descended into (its only children are `[`, the expr, `]`). Empty if none. C3
+// returns MULTIPLE nodes (`int a[n][m]` → [n, m]) so the validator can check each
+// dim's bound type independently; a 1-D VLA returns exactly one.
+[[nodiscard]] std::vector<NodeId>
+vlaLengthNodes(Tree const& tree, NodeId declaratorNode, DeclaratorConfig const& dc) {
+    std::vector<NodeId> out;
+    // VLA C4c (D-CSUBSET-VLA): route through the shared bound locator so a
+    // multi-dim VLA param whose inner dim carries an array-parameter decoration
+    // (`int a[n][static m]`) reads the REAL bound `m`, NOT the leading `static`
+    // token — a mis-located bound would query the wrong node's type in the
+    // Pass-2 non-integer-size check.
+    auto middleOf = [&](NodeId suffix) -> NodeId {
+        return arraySuffixBoundNode(tree, suffix, dc.arraySuffixModifierTokens)
+            .value_or(NodeId{});
+    };
+    // Explicit work-stack pre-order that preserves sibling SOURCE order: push
+    // children in REVERSE so they pop left-to-right. An array-suffix node is
+    // recorded (its middle child) and NOT descended into.
+    std::vector<NodeId> stack{declaratorNode};
+    for (int guard = 0; guard < 16384 && !stack.empty(); ++guard) {
+        NodeId const c = stack.back(); stack.pop_back();
+        if (tree.kind(c) != NodeKind::Internal) continue;
+        if (tree.rule(c).v == dc.arraySuffixRule.v) { out.push_back(middleOf(c)); continue; }
+        auto const kids = visibleChildren(tree, c);
+        for (std::size_t i = kids.size(); i-- > 0;) stack.push_back(kids[i]);
+    }
+    return out;
+}
+
+// VLA C1a (D-CSUBSET-VLA, C99/C11 §6.7.6.2): the Pass-2 VLA constraint validator
+// (the validateThreadLocalDeclarator model — `declNode` + `declaratorNode` + `decl`
+// + `rec` in hand, runs AFTER expression typing). The type arm (applyDeclarator-
+// Suffix / applyArraySuffix) builds the `vlaArray` REGARDLESS of scope/storage/size-
+// type — the specifier prefix + the length's resolved type are not in hand at pure
+// type-construction time — so THIS validator owns all three constraints, in order:
+//   * FILE scope (`rec.scope` == file scope) → S_NonConstantArrayLength (a VLA needs
+//     AUTOMATIC storage; the type-construction scope is a descendant of the file
+//     scope even for a file-scope decl, so only `rec.scope` discriminates reliably —
+//     the SAME test the thread_local validator uses);
+//   * non-integer SIZE type (C 6.7.6.2p1) → S_VlaSizeNotInteger — a float / nullptr /
+//     pointer bound. THIS is the ONLY tier that can catch `nullptr` (it lowers to an
+//     I32 0 by MIR, so a MIR-tier integer check sees an integer);
+//   * BLOCK scope with non-automatic storage (`static`/`extern`) → S_VlaWithStatic-
+//     Storage (IMPORTANT-1; the static test reads the SAME staticStorage facet the
+//     D-CSUBSET-LOCAL-STATIC lowering routes on; the extern test is the record flag).
+// The caller gates on `isVlaArray(rec.type)` — only a RESOLVED VLA reaches here.
+void validateVlaDeclarator(EngineState& s, SemanticConfig const& cfg,
+                           Tree const& tree, NodeId declNode, NodeId declaratorNode,
+                           DeclarationRule const& decl, NodeId nameNode,
+                           SymbolId sym) {
+    SymbolRecord const& rec = s.symbols.at(sym);
+    auto const emit = [&](DiagnosticCode code, std::string what) {
+        ParseDiagnostic d;
+        d.code     = code;
+        d.severity = DiagnosticSeverity::Error;
+        d.buffer   = tree.source().id();
+        d.span     = tree.span(nameNode);
+        d.actual   = std::move(what);
+        s.reporter.report(std::move(d));
+    };
+    // FILE scope — a file-scope array requires a CONSTANT bound (S_NonConstantArray-
+    // Length — the file-scope twin of the pre-VLA behavior). See the header comment.
+    if (rec.scope.v == fileScopeOf(s, tree, rec.scope).v) {
+        emit(DiagnosticCode::S_NonConstantArrayLength,
+             std::format("'{}' — a file-scope array requires a constant length; a "
+                         "variable-length array has automatic storage duration only "
+                         "(C 6.7.6.2p2)", rec.name));
+        return;
+    }
+    // NON-INTEGER size (C 6.7.6.2p1) — locate the length expr(s) under THIS declarator +
+    // query each RESOLVED type (available now, post-typing). A float / nullptr_t /
+    // pointer bound is illegal C. `nullptr` is caught HERE (semantic-tier NullptrT)
+    // and nowhere downstream (it is I32 0 by MIR). An unresolved length type (the
+    // length itself already failed loud) skips this — no cascade. VLA C3
+    // (IMPORTANT-7): a MULTI-DIM VLA has one bound per suffix; EVERY dim is checked,
+    // so `int a[n][3.5f]` is rejected on the second dim, not silently accepted.
+    if (cfg.declarators.has_value()) {
+        for (NodeId const lenNode :
+                 vlaLengthNodes(tree, declaratorNode, *cfg.declarators)) {
+            if (!lenNode.valid()) continue;
+            TypeId const lenTy = subtreeType(s, tree, lenNode, rec.scope);
+            if (lenTy.valid()
+                && !isVlaSizeIntegerType(s.lattice.interner().kind(lenTy))) {
+                emit(DiagnosticCode::S_VlaSizeNotInteger,
+                     std::format("'{}' — a variable-length array size must have "
+                                 "integer type (C 6.7.6.2p1)", rec.name));
+                return;
+            }
+        }
+    }
+    // BLOCK scope but non-automatic storage (`static`/`extern`) — IMPORTANT-1.
+    bool const isExtern = rec.isExternDeclaration;
+    bool const isStatic =
+        scanSpecifierPrefixStorage(tree, declNode, decl).staticStorage;
+    if (!isExtern && !isStatic) return;   // automatic storage — a legal VLA
+    emit(DiagnosticCode::S_VlaWithStaticStorage,
+         std::format("'{}' — a variable-length array requires automatic storage "
+                     "duration; it may not be declared '{}' (C 6.7.6.2p2)",
+                     rec.name, isExtern ? "extern" : "static"));
 }
 
 // D-CSUBSET-FN-PROTOTYPE + D-CSUBSET-EXTERN-DEFINITION-MERGE + c33
@@ -4922,18 +5388,24 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // ARRAY `(*const arr[])(T) = {…}` is sized from its init.
                         NodeId const initNode =
                             initializerNodeOf(tree, dNode, *cfg.declarators);
-                        // c82 (C 6.7.6.3p7): an `arrayToPointer` row (a C
-                        // parameter) also admits the absent-length `[]` —
-                        // the adjustment below rewrites the array to
-                        // Ptr<element>, so the incomplete form never
-                        // escapes as the bound type.
+                        // c82 (C 6.7.6.3p7) + VLA C4a-param (D-CSUBSET-VLA,
+                        // FIX-2): an `arrayToPointer` row (a C parameter) routes
+                        // its array-decay through the DISTINCT `paramDecay`
+                        // signal, NOT `allowIncomplete` (the struct-field FAM /
+                        // init-inference bool) — so a param's present-length
+                        // non-outermost suffix builds a `vlaArray` in the pointee
+                        // (`int (*p)[n]`, `int a[][n]`) while an absent `[]` still
+                        // decays; the FAM path stays byte-identical. The
+                        // adjustment below rewrites any top-level array to
+                        // Ptr<element>, so the incomplete/VLA form never escapes
+                        // as the bound type.
                         bool const allowIncomplete =
-                            decl.allowFlexibleArray || decl.arrayToPointer
-                            || initNode.valid();
+                            decl.allowFlexibleArray || initNode.valid();
                         TypeId declTy = declaratorDeclaredType(
                             s, cfg, tree, dNode, headTy, here,
                             /*emitOnMiss=*/true, allowIncomplete,
-                            /*allowInitInferredArray=*/initNode.valid());
+                            /*allowInitInferredArray=*/initNode.valid(),
+                            /*paramDecay=*/decl.arrayToPointer);
                         // Complete an inferred `[]` from its initializer (string
                         // length + NUL, or brace top-level element count). A
                         // non-array / already-sized / no-init type passes through
@@ -4965,6 +5437,81 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         if (declTy.valid()) {
                             s.symbols.at(sym).type = declTy;
                             s.nodeToType.set(nameNode, declTy);
+                            // VLA C4b (D-CSUBSET-VLA, design-audit I1): a VLA-typedef
+                            // OBJECT (`typedef int R[n]; R a;`) derives its VLA-ness
+                            // entirely from the head alias — nothing else records WHICH
+                            // typedef froze the runtime size (C99 §6.7.7p2: `n` is
+                            // evaluated once, at the typedef). Correlate a→R HERE: when
+                            // the declared type is EXACTLY the head type (`declTy ==
+                            // headTy` — a pure `R a;`, no stars/own suffix, so
+                            // `directDeclaredType` returned the base byte-identically)
+                            // AND that head type is (or contains) a VLA, descend the head
+                            // for the alias type-name identifier and, if it resolves to a
+                            // typedef of that VLA type, stamp the object's
+                            // `vlaTypedefOrigin`. The `declTy == headTy` gate is
+                            // load-bearing: `R a[m]` (extra dim → declTy has one more
+                            // array level) and `R *p` (declTy is Ptr) DIFFER from headTy
+                            // → EXCLUDED (they keep their own capture + deferred
+                            // fail-loud). A miss here is a safe fail-loud downstream (no
+                            // captured size), never a silent miscompile.
+                            // Gate to OBJECT declarations only — `vlaTypedefOrigin`
+                            // means "the VLA typedef this OBJECT froze its size from",
+                            // read solely by the object's HIR alloca. A chained VLA
+                            // typedef (`typedef R S;`) is itself DeclarationKind::Type
+                            // and is discriminated at HIR by its own suffix presence
+                            // (declaratorHasArraySuffix), so it needs no origin flag —
+                            // keeping this write off typedef symbols.
+                            if (s.symbols.at(sym).kind == DeclarationKind::Variable
+                                && declTy == headTy
+                                && (s.lattice.interner().isVlaArray(headTy)
+                                    || s.lattice.interner().typeContainsVla(headTy))
+                                && decl.headChild.has_value()
+                                && *decl.headChild < kids.size()) {
+                                // First type-name identifier token in the head (the
+                                // alias); cv-qualifier keyword tokens are not
+                                // identifierToken → skipped. A pure VLA-typed head is a
+                                // single alias identifier. Push children REVERSED so the
+                                // work-stack pops left-to-right (leftmost-first).
+                                NodeId aliasTok{};
+                                if (cfg.identifierToken.valid()) {
+                                    std::vector<NodeId> stk{kids[*decl.headChild]};
+                                    for (int guard = 0;
+                                         guard < 4096 && !stk.empty()
+                                             && !aliasTok.valid();
+                                         ++guard) {
+                                        NodeId const cur = stk.back();
+                                        stk.pop_back();
+                                        if (tree.kind(cur) == NodeKind::Token) {
+                                            if (tree.tokenKind(cur)
+                                                == cfg.identifierToken)
+                                                aliasTok = cur;
+                                            continue;
+                                        }
+                                        auto const hk = visibleChildren(tree, cur);
+                                        for (std::size_t i = hk.size(); i-- > 0;)
+                                            stk.push_back(hk[i]);
+                                    }
+                                }
+                                if (aliasTok.valid() && here.valid()) {
+                                    // SAME scope-resolution the type resolver used
+                                    // (resolveTypeNodeImpl's alias arm: ordinary-namespace
+                                    // `s.scopes.lookup(scope, text)` with scope == here),
+                                    // so this recovers EXACTLY the typedef symbol that
+                                    // produced `headTy`.
+                                    std::string const nm{tree.text(aliasTok)};
+                                    SymbolId const aliasSym = s.scopes.lookup(here, nm);
+                                    if (aliasSym.valid()) {
+                                        auto const& arec = s.symbols.at(aliasSym);
+                                        if (arec.kind == DeclarationKind::Type
+                                            && arec.type.valid()
+                                            && (s.lattice.interner()
+                                                    .isVlaArray(arec.type)
+                                                || s.lattice.interner()
+                                                       .typeContainsVla(arec.type)))
+                                            s.symbols.at(sym).vlaTypedefOrigin = aliasSym;
+                                    }
+                                }
+                            }
                             // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: an OBJECT
                             // (a named local/global, `requireNamedDeclarators` —
                             // NOT a param, NOT a struct field [those route through
@@ -6228,6 +6775,36 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                 && s.idx().numberStyle->emitKind.integer.valid()
                 && tk == s.idx().numberStyle->emitKind.integer) {
                 auto const text = tree.text(node);
+                // C23 6.4.4.1 (D-CSUBSET-BITINT-WIDE-LITERAL / Fork-1b): a `wb`/`uwb`
+                // bit-precise literal is typed `[unsigned] _BitInt(N)` with N derived
+                // from its ARBITRARY-MAGNITUDE value (`decodeBigInteger`, which the u64
+                // ladder cannot hold). Checked BEFORE the magnitude ladder so a `>u64`
+                // uwb literal is not mis-diagnosed S_IntegerLiteralTooLarge. I4: an N
+                // above __BITINT_MAXWIDTH__ reuses the specifier's over-width path.
+                if (auto const bpSigned = bitPreciseLiteralSignedness(
+                        text, s.idx().numberStyle, cfg.integerLiteralTyping)) {
+                    if (auto mag = decodeBigInteger(text, s.idx().numberStyle)) {
+                        BitIntValue const bv =
+                            BitIntValue::fromLiteralMagnitude(*mag, *bpSigned);
+                        if (bv.width() > kBitIntMaxWidth) {
+                            ParseDiagnostic d;
+                            d.code     = DiagnosticCode::S_BitIntWidthExceedsMax;
+                            d.severity = DiagnosticSeverity::Error;
+                            d.buffer   = tree.source().id();
+                            d.span     = tree.span(node);
+                            d.actual   = std::format("`_BitInt` literal width {} exceeds "
+                                                     "__BITINT_MAXWIDTH__ ({})",
+                                                     bv.width(), kBitIntMaxWidth);
+                            s.reporter.report(std::move(d));
+                            return;   // leave untyped (cascade-suppress)
+                        }
+                        s.nodeToType.set(node, s.lattice.interner().bitInt(
+                            static_cast<std::int64_t>(bv.width()), *bpSigned));
+                        return;   // fully typed as _BitInt(N); skip the ladder
+                    }
+                    // A bit-precise suffix with no base-valid digits is malformed —
+                    // fall through to the standard ladder's fail-loud below.
+                }
                 auto const magnitude = decodeInteger(text, s.idx().numberStyle);
                 bool fits = magnitude.has_value();
                 if (fits) {
@@ -7110,6 +7687,31 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                         s, cfg, tree, node, decl, vName,
                                         vSym);
                                 }
+                                // VLA C1a (D-CSUBSET-VLA): the type arm builds a
+                                // vlaArray REGARDLESS of scope/storage/size-type, so
+                                // this Pass-2 validator owns ALL the VLA constraints —
+                                // a FILE-scope VLA (`int g[n]`, whose vlaArray the arm
+                                // DID build) is rejected here by its rec.scope
+                                // file-scope branch (S_NonConstantArrayLength), a
+                                // non-integer size by S_VlaSizeNotInteger, and a
+                                // block-scope static/extern by S_VlaWithStaticStorage.
+                                // `dNode` is THIS declarator (the length-node scan
+                                // needs it). The positional-name externDecl mirror
+                                // below needs no VLA hook (it is declarator-mode-free
+                                // and file-scope — but even a positional VLA would be
+                                // caught by the file-scope branch if one existed).
+                                // VLA C3 (D-CSUBSET-VLA): `||typeContainsVla` so a
+                                // FIXED-outer multi-dim VLA (`int a[5][n]` — whose top
+                                // type is a fixed Array, NOT isVlaArray) is ALSO routed
+                                // to the constraint validator (file-scope / static /
+                                // per-dim non-integer rejects apply to it too).
+                                if (s.lattice.interner().isVlaArray(
+                                        s.symbols.at(vSym).type)
+                                    || s.lattice.interner().typeContainsVla(
+                                        s.symbols.at(vSym).type)) {
+                                    validateVlaDeclarator(s, cfg, tree, node, dNode,
+                                                          decl, vName, vSym);
+                                }
                             }
                         }
                         if (tree.rule(dNode)
@@ -7151,6 +7753,17 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             if (wk.size() != 1) break;
                             walk = wk[0];
                         }
+                        // VLA C4a-local (D-CSUBSET-VLA-PTR-INIT-FORM-TYPING, DEFERRED):
+                        // the natural init form `int (*p)[n] = b` does NOT compile — the
+                        // typeAt walk (and `subtreeType`, which short-circuits on the same
+                        // stamped node) yields `b`'s DECAYED pointer type, not the raw
+                        // `array(vlaArray(int),2)` the `Ptr<vlaArray> ← array(array)` decay
+                        // compare needs, so S_TypeMismatch fires (a CLEAN fail-loud, never
+                        // a silent miscompile). A guarded `subtreeType` override was tried
+                        // (CRITICAL-1) but is inert here because `b`'s initializer node is
+                        // pre-stamped decayed by an earlier pass. Deferred; the C4a-local
+                        // witness uses the ASSIGNMENT form (`int (*p)[n]; p = b;`), which
+                        // passes assignability and reaches the runtime-stride path.
                         if (!rec.type.valid()) {
                             if (initTy.valid()) {
                                 rec.type = initTy;
@@ -7162,7 +7775,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode))
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions)
                                    && !admitsNullPointerConstant(
                                           s, tree, rec.type, initNode,
                                           tree.schema().semantics()
@@ -7210,7 +7823,7 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                                     tree.schema().semantics()
                                                         .pointerConversions,
                                                     /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode))
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/initIsStringLiteral(s, tree, initNode), /*bitIntConversions=*/cfg.bitIntConversions)
                                    // D-LANG-NULL-POINTER-CONSTANT (step
                                    // 13.3): admit `T* p = 0;` initializer
                                    // per C §6.3.2.3.3.
@@ -7333,7 +7946,9 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                              /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts,
                                              /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows,
                                              /*intConvertsToFloat=*/cfg.intConvertsToFloat,
-                                             /*floatConvertsToInt=*/cfg.floatConvertsToInt)
+                                             /*floatConvertsToInt=*/cfg.floatConvertsToInt,
+                                             /*charArrayFromStringLiteralInit=*/false,
+                                             /*bitIntConversions=*/cfg.bitIntConversions)
                             && !admitsNullPointerConstant(
                                    s, tree, lhsTy, rhsN, ptrRules, here, cfg)) {
                             ParseDiagnostic d;
@@ -7897,7 +8512,7 @@ void checkCallAgainstSig(EngineState& s, SemanticConfig const& cfg,
         if (!argTy.valid()) continue;  // unknown arg type — suppress cascade
         if (!isAssignable(s.lattice.interner(), params[i], argTy, ptrRules,
                           /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt)) {
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions)) {
             // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit literal-0
             // → Ptr<*> as null pointer constant per C §6.3.2.3.3. The
             // check lives here (NOT in isAssignable) because it is
@@ -8452,6 +9067,10 @@ subtreeType(EngineState const& s, Tree const& tree, NodeId rootNode, ScopeId sco
     std::optional<ResolvedArithmeticRules> arith;
     if (sem.arithmeticConversions.has_value()) {
         arith = resolveArithmeticRules(*sem.arithmeticConversions, s.dataModel);
+        // D-CSUBSET-BITINT: inject the `_BitInt`-conversions flag (a separate
+        // top-level flag, mirroring the cst_to_hir resolve site) so the semantic-
+        // tier expression typer agrees with the HIR lowering on a BitInt common type.
+        arith->bitIntConversions = sem.bitIntConversions;
     }
     auto const commonArithType = [&](TypeId a, TypeId b) -> TypeId {
         if (arith.has_value()) {
@@ -9128,7 +9747,7 @@ void checkReturn(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     auto const& ptrRules = tree.schema().semantics().pointerConversions;
     if (!isAssignable(s.lattice.interner(), fnResult, exprTy, ptrRules,
                       /*boolWidensToArith=*/true,
-                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt)) {
+                                                    /*charConvertsToArith=*/cfg.charConvertsToArith, /*enumConvertsToArith=*/cfg.enumConvertsToArith, /*intCrossSignednessConverts=*/cfg.intCrossSignednessConverts, /*intSameSignednessNarrows=*/cfg.intSameSignednessNarrows, /*intConvertsToFloat=*/cfg.intConvertsToFloat, /*floatConvertsToInt=*/cfg.floatConvertsToInt, /*charArrayFromStringLiteralInit=*/false, /*bitIntConversions=*/cfg.bitIntConversions)) {
         // D-LANG-NULL-POINTER-CONSTANT (step 13.3): admit `return 0;`
         // from a Ptr<*>-returning function per C §6.3.2.3.3.
         if (admitsNullPointerConstant(s, tree, fnResult,

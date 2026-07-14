@@ -65,6 +65,7 @@ bool HirVerifier::verify(DiagnosticReporter& reporter) const {
     checkNodeArity(reporter);
     checkBreakContinueScoping(reporter);
     checkSehContext(reporter);
+    checkVlaJumpScoping(reporter);
     checkDeclarationShape(reporter);
     // HR6 rules.
     checkBlockTermination(reporter);
@@ -422,6 +423,154 @@ void HirVerifier::checkSehContext(DiagnosticReporter& reporter) const {
                     }
                 }
                 prev = cur;
+            }
+            break;
+        }
+        default: break;
+        }
+    }
+}
+
+// VLA C5 (D-CSUBSET-VLA): the variably-modified-scope jump rules (C99 6.8.6.1p1).
+// A jump must not enter the scope of a VLA object bypassing its declaration — on
+// arrival the array's storage (and size) would be undefined. This ALSO guarantees
+// the HIR→MIR block-scope teardown is sound: banning entry-past-a-decl makes every
+// LEGAL goto's restore-target StackSave dominate the goto in the CFG. Mirrors the
+// SEH ancestor-walk (checkSehContext). Interner-gated + zero-cost when VLA-free.
+void HirVerifier::checkVlaJumpScoping(DiagnosticReporter& reporter) const {
+    if (interner_ == nullptr) return;   // the VLA-ness of a type can't be read
+    std::uint32_t const moduleTag = hir_.id().v;
+
+    auto const isVlaDecl = [&](HirNodeId d) {
+        if (hir_.kind(d) != HirKind::VarDecl) return false;
+        TypeId const ty = hir_.varDeclType(d);
+        return ty.valid()
+            && (interner_->isVlaArray(ty) || interner_->typeContainsVla(ty));
+    };
+
+    // Zero-cost bail for the VLA-free world: one flat scan for any VLA local.
+    bool anyVla = false;
+    for (std::uint32_t i = 1; i < hir_.nodeCount() && !anyVla; ++i)
+        if (isVlaDecl(HirNodeId{i, moduleTag})) anyVla = true;
+    if (!anyVla) return;
+
+    // Per-function label-ordinal → LabelStmt map (labels are function-scoped) —
+    // the SAME construction checkSehContext uses for goto-target resolution.
+    auto const enclosingFunction = [&](HirNodeId id) {
+        for (HirNodeId cur = hir_.parent(id); cur.valid(); cur = hir_.parent(cur))
+            if (hir_.kind(cur) == HirKind::Function) return cur;
+        return HirNodeId{};
+    };
+    std::unordered_map<std::uint64_t, HirNodeId> labelByFnOrd;
+    for (std::uint32_t i = 1; i < hir_.nodeCount(); ++i) {
+        HirNodeId const id{i, moduleTag};
+        if (hir_.kind(id) != HirKind::LabelStmt) continue;
+        HirNodeId const fn = enclosingFunction(id);
+        if (!fn.valid()) continue;
+        labelByFnOrd.emplace(
+            (static_cast<std::uint64_t>(fn.v) << 32) | hir_.labelOrdinal(id), id);
+    }
+    auto const resolveLabel = [&](HirNodeId from, std::uint32_t ord) {
+        HirNodeId const fn = enclosingFunction(from);
+        if (!fn.valid()) return HirNodeId{};
+        auto const it = labelByFnOrd.find(
+            (static_cast<std::uint64_t>(fn.v) << 32) | ord);
+        return it == labelByFnOrd.end() ? HirNodeId{} : it->second;
+    };
+
+    // The VLA VarDecls whose SCOPE contains `node`: walking up, at each enclosing
+    // Block collect every VLA VarDecl that appears textually BEFORE the child of that
+    // Block on `node`'s path (a VLA's scope runs from its decl to the end of the
+    // block, C99 6.2.4). Innermost-nested VLAs come first, but order is irrelevant —
+    // membership is all the jump rules test.
+    auto const vlaScopeAncestry = [&](HirNodeId node) {
+        std::vector<HirNodeId> out;
+        HirNodeId prev = node;
+        for (HirNodeId cur = hir_.parent(node); cur.valid();
+             cur = hir_.parent(cur)) {
+            if (hir_.kind(cur) == HirKind::Block) {
+                auto kids = hir_.children(cur);
+                int pIdx = -1;
+                for (std::size_t i = 0; i < kids.size(); ++i)
+                    if (kids[i] == prev) { pIdx = static_cast<int>(i); break; }
+                for (int i = 0; i < pIdx; ++i)
+                    if (isVlaDecl(kids[static_cast<std::size_t>(i)]))
+                        out.push_back(kids[static_cast<std::size_t>(i)]);
+            }
+            prev = cur;
+        }
+        return out;
+    };
+    auto const contains = [](std::vector<HirNodeId> const& v, HirNodeId x) {
+        for (HirNodeId n : v) if (n == x) return true;
+        return false;
+    };
+    // A jump from `fromNode` to label `L` is illegal iff L is in some VLA's scope
+    // that `fromNode` is NOT in (the jump would enter that scope past the decl).
+    auto const jumpsIntoVlaScope = [&](HirNodeId fromNode, HirNodeId L) {
+        auto const fromAnc = vlaScopeAncestry(fromNode);
+        for (HirNodeId const v : vlaScopeAncestry(L))
+            if (!contains(fromAnc, v)) return true;
+        return false;
+    };
+
+    for (std::uint32_t i = 1; i < hir_.nodeCount(); ++i) {
+        HirNodeId const id{i, moduleTag};
+        if (hasError(hir_.flags(id))) continue;
+        switch (hir_.kind(id)) {
+        case HirKind::GotoStmt: {
+            HirNodeId const label = resolveLabel(id, hir_.labelOrdinal(id));
+            if (label.valid() && jumpsIntoVlaScope(id, label)) {
+                reportAt(reporter, DiagnosticCode::H_VlaJumpIntoScope, id,
+                         "goto jumps into the scope of a variable-length array, "
+                         "bypassing its declaration — the array's storage is "
+                         "undefined on arrival (C99 6.8.6.1)",
+                         sourceMap_);
+            }
+            break;
+        }
+        case HirKind::SwitchStmt: {
+            // A `case`/`default` label inside a VLA scope the switch header is not in
+            // is entered sideways by the dispatch — same rule, the switch node is the
+            // jump source.
+            for (HirNodeId const arm : hir_.switchArms(id)) {
+                HirNodeId const label =
+                    resolveLabel(id, hir_.caseArmLabelOrdinal(arm));
+                if (label.valid() && jumpsIntoVlaScope(id, label)) {
+                    reportAt(reporter, DiagnosticCode::H_VlaJumpIntoScope, arm,
+                             "a switch case/default label is inside the scope of a "
+                             "variable-length array declared in the switch body — "
+                             "the dispatch would enter it past the declaration "
+                             "(C99 6.8.6.1)",
+                             sourceMap_);
+                }
+            }
+            break;
+        }
+        case HirKind::IndirectGotoStmt: {
+            // A computed goto lexically inside a VLA scope has a runtime target set —
+            // no single restore watermark is provably correct.
+            if (!vlaScopeAncestry(id).empty()) {
+                reportAt(reporter, DiagnosticCode::H_VlaComputedGotoInScope, id,
+                         "computed `goto *` inside the scope of a variable-length "
+                         "array is not supported — its runtime target set cannot be "
+                         "proven to share the array's stack frame (D-CSUBSET-VLA)",
+                         sourceMap_);
+            }
+            break;
+        }
+        case HirKind::LabelAddressOf: {
+            // `&&label` naming a VLA-scoped label would let a computed goto enter that
+            // scope undetectably — ban it (mirrors H_SehLabelAddress).
+            HirNodeId const label =
+                resolveLabel(id, hir_.labelAddressOrdinal(id));
+            if (label.valid() && !vlaScopeAncestry(label).empty()) {
+                reportAt(reporter, DiagnosticCode::H_VlaJumpIntoScope, id,
+                         "'&&label' naming a label inside the scope of a "
+                         "variable-length array is not supported — a computed goto "
+                         "could enter the array's scope past its declaration "
+                         "(D-CSUBSET-VLA)",
+                         sourceMap_);
             }
             break;
         }

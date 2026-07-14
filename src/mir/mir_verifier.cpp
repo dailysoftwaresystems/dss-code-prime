@@ -71,6 +71,7 @@ bool MirVerifier::verify(DiagnosticReporter& reporter) const {
     checkBlockTermination(reporter);
     checkPhiIncomings(reporter);
     checkSehStructure(reporter);
+    checkVlaStackTeardown(reporter);
     // StructCfMarker equality lives INSIDE checkDomination — the
     // derivation needs the same per-function preds/RPO/dom the
     // use-dom-def scan computes, so they share one computation.
@@ -140,6 +141,52 @@ void MirVerifier::checkStructuralInvariants(DiagnosticReporter& reporter) const 
                     DiagnosticCode::I_AllocaAlignmentNotPowerOfTwo, id,
                     std::format("alloca alignment payload {} is not a power of "
                                 "two in [1, 256]", a));
+            }
+            // VLA C1a (D-CSUBSET-VLA): the runtime-sized-Alloca invariant. A VLA
+            // alloca (its pointee `isVlaArray`) MUST carry exactly ONE operand (the
+            // total runtime byte size) and a ZERO primary payload (the runtime-sized
+            // sentinel); a FIXED (non-VLA) alloca MUST carry NO operand. Ties operand
+            // presence to the type so a regression that drops the size operand (→ a
+            // 0-sized fixed slot) or bolts one onto a fixed alloca is caught loud.
+            std::size_t const allocaOperands = mir_.instOperands(id).size();
+            std::uint32_t const primaryPayload = mir_.instPayload(id);
+            // Interner-free half: an operand present ⇒ the byte payload MUST be 0
+            // (exactly one channel encodes the size).
+            if (allocaOperands >= 1 && primaryPayload != 0) {
+                reportInst(reporter,
+                    DiagnosticCode::I_VlaAllocaOperandInvalid, id,
+                    std::format("runtime-sized (VLA) alloca carries a size operand "
+                                "AND a non-zero byte payload {} — exactly one must "
+                                "encode the size", primaryPayload));
+            }
+            // Interner-gated half: tie operand-presence to VLA-ness of the pointee.
+            if (interner_ != nullptr) {
+                TypeId const resTy = mir_.instType(id);   // ptr<allocated>
+                TypeId pointee{};
+                if (resTy.valid() && interner_->kind(resTy) == TypeKind::Ptr) {
+                    auto const ops = interner_->operands(resTy);
+                    if (!ops.empty()) pointee = ops[0];
+                }
+                // VLA C3: `||typeContainsVla` so a FIXED-outer multi-dim VLA
+                // (`int a[5][n]` — pointee array(vlaArray,5), a fixed Array whose top
+                // is NOT isVlaArray but which STILL takes the runtime-operand alloca)
+                // is correctly classified as runtime-sized (else its size operand
+                // trips the "fixed alloca must carry no operand" arm below).
+                bool const isVla =
+                    pointee.valid()
+                    && (interner_->isVlaArray(pointee)
+                        || interner_->typeContainsVla(pointee));
+                if (isVla && allocaOperands != 1) {
+                    reportInst(reporter,
+                        DiagnosticCode::I_VlaAllocaOperandInvalid, id,
+                        std::format("VLA-typed alloca must carry exactly one runtime "
+                                    "size operand, found {}", allocaOperands));
+                } else if (!isVla && allocaOperands != 0) {
+                    reportInst(reporter,
+                        DiagnosticCode::I_VlaAllocaOperandInvalid, id,
+                        std::format("fixed (non-VLA) alloca must carry no runtime "
+                                    "size operand, found {}", allocaOperands));
+                }
             }
         }
     });
@@ -333,6 +380,48 @@ void MirVerifier::checkSehStructure(DiagnosticReporter& reporter) const {
             }
         }
     }
+}
+
+// VLA C5 (D-CSUBSET-VLA): the block-scope stack-teardown pairing invariant.
+// Runs verify-after-every-pass so an optimizer transform that mis-pairs or
+// re-points a save/restore reds AT the pass that did it. Zero-cost when no
+// StackSave exists.
+void MirVerifier::checkVlaStackTeardown(DiagnosticReporter& reporter) const {
+    // One flat scan; bail before the per-restore check when teardown-free.
+    bool anyTeardown = false;
+    forEachInst(mir_, [&](MirInstId id) {
+        MirOpcode const op = mir_.instOpcode(id);
+        if (op == MirOpcode::StackSave || op == MirOpcode::StackRestore)
+            anyTeardown = true;
+    });
+    if (!anyTeardown) return;
+
+    forEachInst(mir_, [&](MirInstId id) {
+        if (mir_.instOpcode(id) != MirOpcode::StackRestore) return;
+        auto const ops = mir_.instOperands(id);
+        // Arity is builder-enforced (1 operand); re-check defensively — a
+        // direct-Mir-ctor path (fixtures / synthetic IR) could bypass it.
+        if (ops.size() != 1) {
+            reportInst(reporter, DiagnosticCode::I_VlaStackRestorePairing, id,
+                std::format("StackRestore must have exactly one operand (the "
+                            "saved-SP value), found {}", ops.size()));
+            return;
+        }
+        MirInstId const savedDef = ops[0];
+        if (!savedDef.valid()
+            || mir_.instOpcode(savedDef) != MirOpcode::StackSave) {
+            reportInst(reporter, DiagnosticCode::I_VlaStackRestorePairing, id,
+                "StackRestore operand[0] must be a StackSave value (the "
+                "captured scope-entry watermark)");
+            return;
+        }
+        if (mir_.instPayload(id) != mir_.instPayload(savedDef)) {
+            reportInst(reporter, DiagnosticCode::I_VlaStackRestorePairing, id,
+                std::format("StackRestore scopeId {} does not match its paired "
+                            "StackSave scopeId {}",
+                    mir_.instPayload(id), mir_.instPayload(savedDef)));
+        }
+    });
 }
 
 void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {
@@ -557,6 +646,49 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                             "integer-0 null constant and never reach MIR)",
                     t.v));
         }
+        // C23 _BitInt(N) (D-CSUBSET-BITINT): the by-construction WRAP-CHOKEPOINT
+        // tripwire (CRIT-2). Only the ARITHMETIC opcodes the wrap chokepoint PRODUCES
+        // carry the single-width-operand invariant: their `_BitInt(N)` result computes
+        // at width N, so each `_BitInt`-typed VALUE operand must ALSO be width N. This
+        // is an ALLOWLIST, NOT a `!conversion` denylist — the denylist wrongly admitted
+        //   • Phi — `instOperands` ABORTS on a Phi (mir.cpp), and a `_BitInt` ternary /
+        //     a `for (_BitInt i; …)` induction var (mem2reg) legitimately materialize a
+        //     `_BitInt(N)` Phi that MERGES same-N arms (already width N);
+        //   • Call — its result width is its RETURN type, UNRELATED to argument widths
+        //     (`unsigned _BitInt(4) f(unsigned _BitInt(40))` is a valid mixed-width call);
+        //   • Load / Const / GEP / conversions — no width-N-operand invariant either.
+        // A shift's COUNT (operand 1 of Shl/LShr/AShr) is NOT width-constrained (C 6.5.7)
+        // and is exempt; a non-`_BitInt` operand (an int count, a container mask const)
+        // is skipped. Never fires under the chokepoint; catches a mixed-width arith op.
+        if (interner_->kind(t) == TypeKind::BitInt) {
+            MirOpcode const op = mir_.instOpcode(id);
+            bool const isBitIntArith =
+                op == MirOpcode::Add  || op == MirOpcode::Sub  || op == MirOpcode::Mul
+             || op == MirOpcode::SDiv || op == MirOpcode::UDiv
+             || op == MirOpcode::SMod || op == MirOpcode::UMod
+             || op == MirOpcode::And  || op == MirOpcode::Or   || op == MirOpcode::Xor
+             || op == MirOpcode::Shl  || op == MirOpcode::LShr || op == MirOpcode::AShr
+             || op == MirOpcode::Neg  || op == MirOpcode::Not;
+            if (isBitIntArith) {
+                bool const isShift = op == MirOpcode::Shl || op == MirOpcode::LShr
+                                  || op == MirOpcode::AShr;
+                std::int64_t const n = interner_->bitIntWidth(t);
+                auto const ops = mir_.instOperands(id);
+                for (std::size_t i = 0; i < ops.size(); ++i) {
+                    if (isShift && i == 1) continue;   // shift count — width-free (6.5.7)
+                    TypeId const ot = mir_.instType(ops[i]);
+                    if (ot.valid() && interner_->kind(ot) == TypeKind::BitInt
+                        && interner_->bitIntWidth(ot) != n) {
+                        reportInst(reporter, DiagnosticCode::I_BitIntWidthInconsistent,
+                            id, std::format(
+                                "_BitInt({}) arithmetic result has a _BitInt({}) operand "
+                                "(#{}) — a bit-precise op must compute at ONE width; the "
+                                "wrap chokepoint coerces operands to the common width "
+                                "first", n, interner_->bitIntWidth(ot), ops[i].v));
+                    }
+                }
+            }
+        }
     });
     for (std::uint32_t fi = 0; fi < mir_.moduleFuncCount(); ++fi) {
         MirFuncId const f = mir_.funcAt(fi);
@@ -669,7 +801,15 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                                         "returns a non-void type", f.v));
                     } else if (hasValue && wantValue) {
                         TypeKind const rk = interner_->kind(returnTy);
-                        if (rk == TypeKind::Struct || rk == TypeKind::Union) {
+                        // D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt(N>64)` return uses
+                        // the SAME by-value ABI as a struct/union (2-GPR pieces or an
+                        // sret pointer) — admit it into the aggregate-return arm so the
+                        // Ptr/I64-piece operands are not mis-flagged against the wide
+                        // `_BitInt` declared return type.
+                        bool const wideBitIntRet = rk == TypeKind::BitInt
+                            && interner_->bitIntWidth(returnTy) > 64;
+                        if (rk == TypeKind::Struct || rk == TypeKind::Union
+                            || wideBitIntRet) {
                             // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value
                             // struct/union return is EITHER the first-class aggregate
                             // VALUE (a single operand of the return type — the const-

@@ -274,6 +274,22 @@ enum class MnemonicSlot : std::uint8_t {
     // L_RequiredLirOpcodeMissing at the thread-local GlobalAddr — the
     // per-target un-landed-leg gate.
     TlsBase,
+    // D-CSUBSET-VLA (C1b): the two dynamic-stack ops a variable-length-array
+    // `int a[n]` lowers to. `SubSpReg` = `sub sp, <sizeReg>` (descend the stack by a
+    // runtime byte count); `SpCopy` = a side-effecting SP register move (capture the
+    // post-sub SP as the VLA base). Optional — a target WITHOUT both (no VLA
+    // substrate) leaves them nullopt and the VLA lowering fails loud
+    // (L_VlaDynamicAllocaUnsupported) rather than miscompiling. The presence of a
+    // `SubSpReg` op in a function is also the callconv/regalloc "has-VLA" signal.
+    SubSpReg,
+    SpCopy,
+    // VLA C5 (D-CSUBSET-VLA): `sp_restore sp, <saved>` — restore SP to a saved
+    // watermark (a StackSave's captured SP) on a block-scope VLA teardown exit.
+    // result:none (SP is an operand, not a result — audit fix #5), operands
+    // [SP, saved]. Optional per target (a target without the VLA substrate leaves
+    // it nullopt and the StackRestore lowering fails loud, never a silent no-op
+    // that would leak the stack).
+    SpRestore,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -376,6 +392,9 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::FNegMask,           "fneg_mask"},
     {MnemonicSlot::RecoverParentFrameSlot, "recover_parent_frame_slot"},
     {MnemonicSlot::TlsBase,            "tlsbase"},
+    {MnemonicSlot::SubSpReg,           "sub_sp_reg"},
+    {MnemonicSlot::SpCopy,             "sp_copy"},
+    {MnemonicSlot::SpRestore,          "sp_restore"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -1294,6 +1313,18 @@ struct Lowerer {
             auto const sc = interner.scalars(ty);
             if (!sc.empty()) return static_cast<TypeKind>(sc[0]);
         }
+        // C23 _BitInt(N) (D-CSUBSET-BITINT, M-4): project to the signed/unsigned
+        // native CONTAINER kind (N≤8→I8/U8, ≤16→I16/U16, ≤32→I32/U32, ≤64→I64/U64)
+        // — the enum→underlying precedent above. This is what makes every width-tier
+        // consumer (`widthFlagsForType`, `memAccessWidthFlags`, and via them
+        // `registerOpWidthFlags`) see a NATIVE kind for a `_BitInt` value, so a
+        // `_BitInt(4)` stores/loads byte-exact and register-plumbs promoted-to-32
+        // (the char/short story). N>64 (D-CSUBSET-BITINT-C2-WIDE) cannot reach here:
+        // a wide `_BitInt` is MULTI-LIMB memory — every value the LIR tier sees is an
+        // i64 LIMB or a pointer, never the whole wide type as a scalar. If a wide value
+        // leaked to the scalar path, `bitIntContainerKind` FAILS LOUD (M1) rather than
+        // returning a garbage width. `reprKind` is identity for every other kind.
+        if (k == TypeKind::BitInt) return interner.bitIntContainerKind(ty);
         return k;
     }
 
@@ -1404,6 +1435,23 @@ struct Lowerer {
         d.actual   = std::format(
             "MIR opcode '{}' is not yet lowered to target '{}' (inst {})",
             mirOpcodeName(op), target.name(), at.v);
+        reporter.report(std::move(d));
+    }
+
+    // VLA C1a → C1b boundary (D-CSUBSET-VLA): a runtime-sized `Alloca` (a
+    // variable-length array `int a[n]`, carrying a size operand) reached the LIR
+    // lowering. The static frame model + `lea_frame_slot` rematerialization assume a
+    // fixed compile-time slot; a dynamic `sub rsp,<size>` + frame-pointer addressing
+    // is the NAMED C1b cycle. Fails loud (never a silent fixed-slot miscompile).
+    void reportVlaDynamicAlloca(MirInstId at) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::L_VlaDynamicAllocaUnsupported;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "variable-length array requires a dynamic stack allocation (runtime "
+            "sub-sp + frame pointer), not yet lowered to target '{}' (MIR inst {}) "
+            "— D-CSUBSET-VLA C1b",
+            target.name(), at.v);
         reporter.report(std::move(d));
     }
 
@@ -1553,6 +1601,9 @@ struct Lowerer {
                 return lowerFCmp(id);
             case MirOpcode::Phi:    return;  // pre-pass-allocated; no body emission
             case MirOpcode::Alloca: return lowerAlloca(id);
+            // VLA C5 (D-CSUBSET-VLA): block-scope stack teardown save/restore.
+            case MirOpcode::StackSave:    return lowerStackSave(id);
+            case MirOpcode::StackRestore: return lowerStackRestore(id);
             case MirOpcode::Load:   return lowerLoad(id);
             case MirOpcode::Store:  return lowerStore(id);
             case MirOpcode::Gep:    return lowerGep(id);
@@ -2344,9 +2395,162 @@ struct Lowerer {
 
     // ── memory ops (cycle 3c) ────────────────────────────────────────
 
+    // VLA C1b (D-CSUBSET-VLA): lower a runtime-sized `Alloca` (a variable-length
+    // array `int a[n]`) to the LEAF dynamic-stack sequence. The MIR Alloca's
+    // operand[0] is the total runtime BYTE size (an i64 `Mul(count, stride)`, C1a);
+    // payload2 is the element's effective alignment. The emitted sequence:
+    //   t0     = size + (A-1)                            (A = cc.stackAlignment)
+    //   size16 = t0 & ~(A-1)             = alignUp(size, A)  — keeps SP stack-aligned
+    //   sub_sp_reg SP, size16                            — descend the stack
+    //   base   = sp_copy SP                              — VLA base = post-sub SP
+    // then bind the alloca value to `base` so every `a[i]` address use reads it. The
+    // callconv pass reserves the frame pointer for the function (the `sub_sp_reg`
+    // presence is its "has-VLA" signal) so the fixed frame survives this runtime SP
+    // move; the callconv LEAF gate fails loud on a VLA function that also calls /
+    // uses va_start (D-CSUBSET-VLA-NONLEAF-CALL-FRAME).
+    void lowerVlaAlloca(MirInstId id) {
+        auto const subOp  = opcode(MnemonicSlot::SubSpReg);
+        auto const copyOp = opcode(MnemonicSlot::SpCopy);
+        auto const addOp  = opcode(MnemonicSlot::Add);
+        auto const andOp  = opcode(MnemonicSlot::And);
+        // The stack + frame pointer are cc fields, but TARGET-uniform (the same
+        // physical register across every cc of a target — rsp/sp, rbp/x29), so cc
+        // index 0 is the canonical source at MIR->LIR (pre-abi-resolution). A target
+        // missing any part of the substrate (either op, no stackPointer, or no
+        // framePointer) cannot build the dynamic frame — fail loud, never miscompile.
+        auto const* cc = target.callingConvention(0);
+        if (!subOp.has_value() || !copyOp.has_value() || !addOp.has_value()
+            || !andOp.has_value() || cc == nullptr
+            || !cc->stackPointer.has_value() || !cc->framePointer.has_value()) {
+            reportVlaDynamicAlloca(id);
+            poisonValue(id);
+            return;
+        }
+        // The VLA base is only as aligned as the stack pointer the `sub` leaves it at
+        // (rounded to stackAlignment below). An element demanding MORE alignment than
+        // the stack guarantees would land under-aligned — reuse the over-aligned-local
+        // fail-loud class (the dynamically-realigned-SP case is a separate cycle).
+        std::uint32_t const elemAlign  = mir.instPayload2(id);
+        std::uint32_t const stackAlign =
+            cc->stackAlignment > 0 ? cc->stackAlignment : 16u;
+        if (elemAlign > stackAlign) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::L_OverAlignedStackLocal;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "variable-length array element requires {}-byte alignment, which "
+                "exceeds the {}-byte stack alignment the dynamic `sub sp` guarantees "
+                "— an over-aligned VLA element needs a dynamically realigned stack "
+                "pointer, not built (D-CSUBSET-VLA)",
+                elemAlign, stackAlign);
+            reporter.report(std::move(d));
+            poisonValue(id);
+            return;
+        }
+        std::optional<LirReg> const sizeRaw = regForValue(mir.instOperands(id)[0]);
+        if (!sizeRaw.has_value()) { poisonValue(id); return; }
+        // alignUp(size, A) = (size + (A-1)) & ~(A-1), all width-64 (byte counts). The
+        // `& ~(A-1)` mask is a wide NEGATIVE constant materialized into a register (a
+        // reg-reg `and` — the single AArch64/x86 form both targets share; a bitmask-
+        // immediate AND is not portable, and the const materialization is arch-correct
+        // via emitBareConstToFresh: x86 sign-extending mov-imm32, arm64 MOVZ/MOVK).
+        std::int64_t const addend = static_cast<std::int64_t>(stackAlign) - 1;
+        LirReg const t0 = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 2> ops{
+                LirOperand::makeReg(*sizeRaw),
+                LirOperand::makeImmInt32(static_cast<std::int32_t>(addend))};
+            emitInst(*addOp, t0, ops, /*payload=*/0, /*flags=*/0);  // width 64
+        }
+        std::optional<LirReg> const mask =
+            emitBareConstToFresh(-static_cast<std::int64_t>(stackAlign));
+        if (!mask.has_value()) { poisonValue(id); return; }
+        LirReg const size16 = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 2> ops{
+                LirOperand::makeReg(t0), LirOperand::makeReg(*mask)};
+            emitInst(*andOp, size16, ops, /*payload=*/0, /*flags=*/0);  // width 64
+        }
+        // `sub sp, size16`: descend the stack. operand0 = the physical SP (the r/m
+        // destination+source1 on x86, the baked Rd=Rn=sp on arm64), operand1 = the
+        // aligned byte count. result:none (SP mutates in place). A physical-reg
+        // operand pre-regalloc is skipped by liveness (the div/mul precedent) and
+        // passed through by legalize + regalloc + the callconv default arm.
+        LirReg const sp = makePhysicalReg(cc->stackPointer->ordinal, LirRegClass::GPR);
+        {
+            std::array<LirOperand, 2> ops{
+                LirOperand::makeReg(sp), LirOperand::makeReg(size16)};
+            emitInst(*subOp, InvalidLirReg, ops, /*payload=*/0, /*flags=*/0);
+        }
+        // `base = sp_copy SP`: capture the POST-sub SP as the VLA base. hasSideEffects
+        // on BOTH ops pins the order — the capture cannot float above the sub. Every
+        // `a[i]` address use routes to `base` via `defineValue`/`regForValue`.
+        LirReg const base = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 1> ops{LirOperand::makeReg(sp)};
+            emitInst(*copyOp, base, ops, /*payload=*/0, /*flags=*/0);
+        }
+        defineValue(id, base);
+    }
+
+    // VLA C5 (D-CSUBSET-VLA): capture SP into a fresh vreg — the scope-entry
+    // watermark a later StackRestore restores to. `saved = sp_copy SP`, the SAME
+    // base-capture shape lowerVlaAlloca uses for the VLA base. A target WITHOUT the
+    // sp_copy substrate (no VLA support) fails loud rather than emit nothing — a
+    // dropped save would strand its StackRestore, silently leaking the stack.
+    void lowerStackSave(MirInstId id) {
+        auto const copyOp = opcode(MnemonicSlot::SpCopy);
+        auto const* cc = target.callingConvention(0);
+        if (!copyOp.has_value() || cc == nullptr || !cc->stackPointer.has_value()) {
+            reportVlaDynamicAlloca(id);
+            poisonValue(id);
+            return;
+        }
+        LirReg const sp =
+            makePhysicalReg(cc->stackPointer->ordinal, LirRegClass::GPR);
+        LirReg const saved = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> ops{LirOperand::makeReg(sp)};
+        emitInst(*copyOp, saved, ops, /*payload=*/0, /*flags=*/0);
+        defineValue(id, saved);
+    }
+
+    // VLA C5 (D-CSUBSET-VLA): restore SP to a saved watermark — `sp_restore SP,
+    // saved` (result:none, operands [SP, saved]; NEVER sp_copy-with-SP-as-result,
+    // audit fix #5). Mirrors sub_sp_reg keeping the physical SP an operand. A target
+    // WITHOUT the sp_restore substrate fails loud (never a silent no-op that would
+    // leave the descended SP unreclaimed → the very stack leak C5 exists to fix).
+    void lowerStackRestore(MirInstId id) {
+        auto const restoreOp = opcode(MnemonicSlot::SpRestore);
+        auto const* cc = target.callingConvention(0);
+        auto const ops0 = mir.instOperands(id);
+        if (!restoreOp.has_value() || cc == nullptr
+            || !cc->stackPointer.has_value() || ops0.empty()) {
+            reportVlaDynamicAlloca(id);
+            return;
+        }
+        std::optional<LirReg> const saved = regForValue(ops0[0]);
+        if (!saved.has_value()) return;   // the saved-SP value was poisoned upstream
+        LirReg const sp =
+            makePhysicalReg(cc->stackPointer->ordinal, LirRegClass::GPR);
+        std::array<LirOperand, 2> ops{
+            LirOperand::makeReg(sp), LirOperand::makeReg(*saved)};
+        emitInst(*restoreOp, InvalidLirReg, ops, /*payload=*/0, /*flags=*/0);
+    }
+
     void lowerAlloca(MirInstId id) {
         if (!opcode(MnemonicSlot::Alloca).has_value()) {
             reportMissingOpcode(MnemonicSlot::Alloca, "MIR Alloca");
+            return;
+        }
+        // VLA C1b (D-CSUBSET-VLA): a runtime-sized Alloca carries a size OPERAND (a
+        // VLA `int a[n]`) instead of a compile-time byte payload. Lower it to the
+        // dynamic-stack sequence (alignUp(size, stackAlignment) → `sub sp,<size>` →
+        // capture the post-sub SP as the VLA base) rather than the fixed-slot path.
+        // A target WITHOUT the dynamic-stack substrate (sub_sp_reg / sp_copy / frame
+        // pointer) falls back inside `lowerVlaAlloca` to the fail-loud boundary —
+        // never a silent fixed-slot 1-scalar miscompile that drops the runtime size.
+        if (!mir.instOperands(id).empty()) {
+            lowerVlaAlloca(id);
             return;
         }
         std::uint32_t const payload = mir.instPayload(id);

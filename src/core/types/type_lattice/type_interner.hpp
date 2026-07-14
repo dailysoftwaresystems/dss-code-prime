@@ -172,6 +172,28 @@ public:
     // check `isIncompleteArray`.
     TypeId incompleteArray(TypeId element);
     [[nodiscard]] bool isIncompleteArray(TypeId id) const;
+    // VLA C1a (D-CSUBSET-VLA): a VARIABLE-LENGTH array (`int a[n]`) — a kind=Array
+    // type whose length scalar is the `kVlaLength` (-2) sentinel. DISTINCT from an
+    // incomplete array (-1): a VLA is a COMPLETE object type with a runtime size,
+    // but that size lives OUT-OF-BAND (a decl-keyed size side-table), NOT on the
+    // type — so all VLAs of one element dedup to a single TypeId (the incomplete-
+    // array precedent, Fork A1). No new TypeKind, so every Array consumer keeps
+    // working; only runtime-size-bearing consumers (alloca, later sizeof) check
+    // `isVlaArray`. `computeLayout` already nullopts on the negative length scalar.
+    TypeId vlaArray(TypeId element);
+    [[nodiscard]] bool isVlaArray(TypeId id) const;
+    // VLA C3 (D-CSUBSET-VLA): does `id` CONTAIN a variable-length array at ANY level
+    // of its array spine — i.e. is `id` itself a VLA, or an ARRAY (fixed or VLA)
+    // whose element (recursively, via ops[0]) is a VLA? This is the transitive
+    // predicate that routes a FIXED-outer multi-dim VLA (`int a[5][n]` —
+    // `array(vlaArray(int),5)`, whose top is a fixed Array, NOT `isVlaArray`) to the
+    // runtime alloca / stride / sizeof paths that `isVlaArray` alone would miss. It
+    // walks ONLY the array-element chain (`ops[0]`) and tests `isVlaArray` at EACH
+    // level — NOT `kind==Array`, so a fully-fixed `int[5][5]` does NOT over-fire
+    // (every level is a non-VLA Array → false). A non-array base terminates the walk.
+    // The `typeContainsFlexibleArray` mirror, on the interner (callable from
+    // semantic + hir_to_mir + mir_verifier). An invalid id is not a VLA container.
+    [[nodiscard]] bool typeContainsVla(TypeId id) const;
     // tuple: operands=[elements...].
     TypeId tuple(std::span<TypeId const> elements);
 
@@ -303,6 +325,26 @@ public:
     // with the enum TypeId; the enum type itself is int-compatible).
     TypeId enumType(std::string_view name,
                     TypeKind underlying = TypeKind::I32);
+    // C23 _BitInt(N) (D-CSUBSET-BITINT / C23 §6.2.5): a bit-precise integer of
+    // EXACT width `widthBits`, signed iff `isSigned`. scalars=[widthBits, signed?1:0];
+    // no operands, no name (structural identity — two `_BitInt(N)` of the same width
+    // + signedness collapse to one TypeId, like every other scalar-parameterized
+    // kind). The interner dedups on the scalar pair for free.
+    TypeId bitInt(std::int64_t widthBits, bool isSigned);
+    // The declared bit-width N of a `_BitInt(N)` (scalars[0]). Aborts if `id` is not
+    // a BitInt (a caller bug — every consumer gates on `kind(id)==BitInt` first).
+    [[nodiscard]] std::int64_t bitIntWidth(TypeId id) const;
+    // True iff `id` is a SIGNED `_BitInt(N)` (scalars[1]==1). Aborts if not a BitInt.
+    [[nodiscard]] bool bitIntIsSigned(TypeId id) const;
+    // The native signed/unsigned CONTAINER kind a `_BitInt(N≤64)` projects to at the
+    // width tier — N≤8→I8/U8, ≤16→I16/U16, ≤32→I32/U32, ≤64→I64/U64 by signedness
+    // (the smallest native integer holding N bits). The enum→underlying `reprKind`
+    // precedent: it makes `requireNativeIntWidth`/`widthFlagsForType`/`memAccess-
+    // WidthFlags` see a native kind, and it IS the ABI container (`computeLayout`
+    // sizes a `_BitInt(N)` as this kind). N>64 (a C2 multi-limb width) returns
+    // `TypeKind::Void` — the fail-loud sentinel; the C1 semantic gate rejects N>64
+    // before any consumer queries this. Aborts if `id` is not a BitInt.
+    [[nodiscard]] TypeKind bitIntContainerKind(TypeId id) const;
     // fnSig: operands=[result, params...], scalars=[(int)cc, isVariadic].
     // D-LANG-VARIADIC (step 13.4): variadic flips the second scalar slot;
     // non-variadic encodings remain 1-slot for cache stability against

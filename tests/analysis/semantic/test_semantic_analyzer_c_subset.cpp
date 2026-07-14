@@ -85,12 +85,17 @@ TEST(SemanticAnalyzerCSubset, ArrayDeclaratorTypedAsArray) {
     EXPECT_EQ(ti.kind(ti.operands(aRec->type)[0]), TypeKind::I32);
 }
 
-// SE-arrays: a non-constant length (`int a[n]`) must fail loud rather than
+// SE-arrays: a non-constant length at FILE scope must fail loud rather than
 // guess. The engine emits S_NonConstantArrayLength and leaves the type
-// unresolved (no silent pointer decay, no assumed length).
+// unresolved (no silent pointer decay, no assumed length). VLA C1a
+// (D-CSUBSET-VLA): a BLOCK-scope `int a[n]` is now a variable-length array
+// (accepted at semantic, fails loud at the MIR->LIR C1b boundary — see the
+// mir/lir pins); a FILE-scope non-constant length is NOT a VLA (a VLA needs
+// automatic storage) and stays S_NonConstantArrayLength.
 TEST(SemanticAnalyzerCSubset, NonConstantArrayLengthEmitsDiagnostic) {
     auto cu = buildShippedUnit("c-subset", {
-        "int main(int n) { int a[n]; }\n",
+        "int n;\n"
+        "int g[n];\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu);
@@ -1196,6 +1201,33 @@ TEST(SemanticAnalyzerCSubset, StaticAssertSizeofConditionFoldsFalseFailsLoud) {
         << "sizeof(int)==99 must FOLD false — the assertion fails loud";
 }
 
+// VLA C2 (D-CSUBSET-VLA) — THE INVARIANT: `sizeof <vla>` is a RUNTIME value, NOT a
+// constant expression (C 6.6). It must therefore DECLINE the const-eval fold in a
+// constant-required context, so `_Static_assert(sizeof a == K)` fails loud (the
+// "not an integer constant expression" branch of S_StaticAssertFailed), never folding
+// to a compile-time constant. Red-on-disable for the central C2 safety property: if a
+// change ever taught const-eval to fold a VLA sizeof, this assertion would either pass
+// (K matched) or fail as an ordinary false assertion — either way the count/behavior
+// shifts. C2 keeps the SizeOf node's `vlaArray` TypeRef so this decline holds for free.
+TEST(SemanticAnalyzerCSubset, StaticAssertSizeofVlaIsNotConstantFailsLoud) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){\n"
+        "  volatile int s = 6;\n"
+        "  int n = s;\n"
+        "  int a[n];\n"                 // a VLA — sizeof a is runtime, not constant
+        "  _Static_assert(sizeof a == 24, \"vla sizeof is not a constant\");\n"
+        "  return 0;\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu, DataModel::Lp64,
+                         AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_StaticAssertFailed), 1u)
+        << "sizeof of a VLA is not a constant expression — the _Static_assert must "
+           "fail loud (const-eval declines), never fold to a compile-time value";
+}
+
 // sizeof-of-a-STRUCT in the condition folds (exercises the aggregateLayout path,
 // not just the scalar width). `struct S{int a; int b;}` = 8 bytes under natural
 // alignment → the assertion passes; the wrong size fails loud.
@@ -2066,9 +2098,13 @@ TEST(SemanticAnalyzerCSubset, GenericTypedefAssociationMatches) {
 // before its declaration's type resolves) STAYS correct fail-loud (invalid C:
 // declare-before-use). This is NOT the closed member-access case — it pins the
 // reclassified anchor: forward-ref rejected, member-access-at-Pass-1.5 closed.
+// VLA C1a (D-CSUBSET-VLA): pinned at FILE scope so a non-foldable sizeof operand
+// stays S_NonConstantArrayLength (a file-scope array needs a constant bound — it is
+// NOT a VLA). Block-scope `int a[sizeof(b)]` would be a VLA (accepted at semantic,
+// fails at the LIR C1b boundary); the const-eval-refusal intent is preserved here.
 TEST(SemanticAnalyzerCSubset, ForwardRefSizeofArrayDimensionStillRejected) {
     auto cu = buildShippedUnit("c-subset", {
-        "int main() { int a[sizeof(b)]; int b; return 0; }\n",
+        "int a[sizeof(b)]; int b;\n",
     });
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DataModel::Lp64,
@@ -2078,9 +2114,11 @@ TEST(SemanticAnalyzerCSubset, ForwardRefSizeofArrayDimensionStillRejected) {
         << "a forward-referenced sizeof operand must fail loud, never fold";
 }
 
-// R1: a non-existent field in the Pass-1.5 const context fails loud (the helper's
-// UndeclaredField → the dim cannot fold). Guards against the member arm admitting
-// a phantom field and folding a guessed size.
+// R1: a non-existent field in the sizeof operand fails loud. VLA C1a
+// (D-CSUBSET-VLA): the array dim is now a block-scope VLA (accepted), but the
+// UNDERLYING bad-field access `s.nope` fails loud on its own
+// (S_UndeclaredIdentifier) — the build still fails, never a silently-folded guessed
+// size. Guards against the member arm admitting a phantom field.
 TEST(SemanticAnalyzerCSubset, BadFieldSizeofArrayDimensionRejected) {
     auto cu = buildShippedUnit("c-subset", {
         "struct S { int x; int y; };\n"
@@ -2089,9 +2127,11 @@ TEST(SemanticAnalyzerCSubset, BadFieldSizeofArrayDimensionRejected) {
     assertNoBuilderErrors(*cu);
     auto model = analyze(cu, DataModel::Lp64,
                          AggregateLayoutParams{ScalarAlignmentRule::Natural, 16});
-    EXPECT_EQ(countCode(model.diagnostics(),
-                        DiagnosticCode::S_NonConstantArrayLength), 1u)
+    EXPECT_TRUE(model.hasErrors())
         << "sizeof(s.nope) — no such field — must fail loud, never fold a guess";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_UndeclaredIdentifier), 1u)
+        << "the phantom field `nope` fails loud independently of the array dim";
 }
 
 // FC12b (D-FC12B-WIN64-VARIADIC-CALLEE, BLOCKER-2) sizeof(va_list) pin: the injected
@@ -2424,6 +2464,44 @@ TEST(SemanticAnalyzerCSubset, CompoundShlAssignToConstEmitsConstViolation) {
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_ConstViolation), 1u);
     EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u);
+}
+
+// D-CSUBSET-FOR-INIT-SCOPE (C99 6.8.5.3): each `for`-statement's init clause has its
+// OWN scope, so two SIBLING `for (int i = ...)` loops in one block re-declaring the same
+// loop name are BOTH valid — the second `i` is a distinct object in a distinct scope,
+// not a redeclaration of the first. Before the fix (`forStmt` absent from the config
+// `scopes` list) the for-init leaked into the enclosing block, so the second `for(int i)`
+// mis-resolved: its uses reported undeclared AND its decl reported unused. Red-on-disable:
+// revert the `scopes` add and BOTH diagnostics fire on the second loop.
+TEST(SemanticAnalyzerCSubset, SiblingForInitSameNameHaveDistinctScopes) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){\n"
+        "  int s = 0;\n"
+        "  for (int i = 0; i < 2; i++) s = s + i;\n"
+        "  for (int i = 0; i < 2; i++) s = s + i;\n"   // same name — a distinct for-scope
+        "  return s;\n"
+        "}\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 0u)
+        << "the second for(int i)'s uses must resolve to its own for-scoped i";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UnusedVariable), 0u)
+        << "the second for(int i)'s decl must not be orphaned as unused";
+}
+
+// D-CSUBSET-FOR-INIT-SCOPE control: the for-init variable is OUT of scope AFTER the
+// for-statement (it is a real for-scope, not a leak into the enclosing block). Using `i`
+// after the loop must fail loud (S_UndeclaredIdentifier) — this is what proves the fix is
+// a correct scope, and it stays a fail-loud reject, never a silent resolve to a stale i.
+TEST(SemanticAnalyzerCSubset, ForInitVariableOutOfScopeAfterForRejects) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ for (int i = 0; i < 2; i++) {} return i; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_UndeclaredIdentifier), 1u)
+        << "`i` is scoped to the for-statement — a use after the loop must fail loud";
 }
 
 // D2: a NON-const variable compound-assigned (`y <<= 2;`) → zero
@@ -7213,8 +7291,12 @@ TEST(SemanticAnalyzerCSubset, FloatDoesNotLeakIntoIntegerConstExprConsumers) {
     EXPECT_EQ(countCode(saModel.diagnostics(),
                         DiagnosticCode::S_StaticAssertFailed), 1u)
         << "a float condition is NOT an integer constant expression (C 6.7.10)";
+    // VLA C1a (D-CSUBSET-VLA): pinned at FILE scope — a float bound is not an
+    // integer constant, so the file-scope array stays S_NonConstantArrayLength (it
+    // is not a VLA; a VLA needs automatic storage). A block-scope float bound would
+    // become a VLA (fails at the LIR C1b boundary); the no-leak intent holds here.
     auto dimModel = analyzeShipped("c-subset", {
-        "int main(void) { int a[1.5 + 1.5]; return 0; }\n",
+        "int a[1.5 + 1.5];\n",
     });
     EXPECT_EQ(countCode(dimModel.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 1u)
@@ -7227,8 +7309,10 @@ TEST(SemanticAnalyzerCSubset, FloatDoesNotLeakIntoIntegerConstExprConsumers) {
 // position. RED-ON-DISABLE: drop the integer-valued-core filter in
 // fixedValueTokenMap and both EXPECTs red (nullptr would fold to 0).
 TEST(SemanticAnalyzerCSubset, NullptrStaysNonFoldableInIntegerConstExpr) {
+    // VLA C1a (D-CSUBSET-VLA): pinned at FILE scope — `nullptr` is not an integer
+    // constant, so the file-scope array stays S_NonConstantArrayLength (not a VLA).
     auto dimModel = analyzeShipped("c-subset", {
-        "int main(void) { int a[nullptr]; return 0; }\n",
+        "int a[nullptr];\n",
     });
     EXPECT_EQ(countCode(dimModel.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 1u);
@@ -8431,4 +8515,433 @@ TEST(SemanticAnalyzerCSubset, ThreadLocalInvalidCombinationsFailLoud) {
     EXPECT_EQ(countCode(reg.diagnostics(),
                         DiagnosticCode::S_ThreadLocalInvalidCombination), 1u)
         << "register may not pair with thread_local (6.7.1p2)";
+}
+
+// VLA C4a-local (D-CSUBSET-VLA): a pointer-to-VLA assignability compare stays EXACT — a
+// FIXED-pointee `int (*p)[5]` initialized from a VLA object `int b[2][n]` (rows int[n])
+// is a MISMATCH (`Ptr<int[5]>` vs `array(vlaArray(int),2)`; int[5] != int[n]) and must
+// REJECT with S_TypeMismatch, never silently decay-accept. Forward-guard for the deferred
+// init form (D-CSUBSET-VLA-PTR-INIT-FORM-TYPING): whatever makes `= b` work must NOT
+// weaken this exact-row compare. RED-ON-DISABLE: broaden the type_rules.hpp:371 decay
+// branch to ignore the element type → this stops firing.
+TEST(SemanticAnalyzerCSubset, PtrToVlaFixedPointeeFromVlaObjectRejects) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "  volatile int vn = 4;\n"
+        "  int n = vn;\n"
+        "  int b[2][n];\n"
+        "  int (*p)[5] = b;\n"   // MISMATCH: rows int[5] != int[n]
+        "  return 0;\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "a fixed-pointee ptr initialized from a VLA object with a different row length "
+           "must reject with S_TypeMismatch (the decay compare stays exact)";
+}
+
+// VLA C4a-local (D-CSUBSET-VLA): the ptr-to-VLA init-form work (and its deferred fix,
+// D-CSUBSET-VLA-PTR-INIT-FORM-TYPING) must NEVER regress ordinary aggregate brace-init —
+// `int a[3]={1,2,3}` / nested / a scalar init all stay clean (no false S_TypeMismatch
+// from a subtreeType descent into a braceInitList). The CRITICAL-1 control that keeps the
+// eventual init-form fix guarded. RED-ON-DISABLE: an unguarded subtreeType override on the
+// init-derivation path would descend a brace list to a member literal → this reds.
+TEST(SemanticAnalyzerCSubset, LocalAggregateBraceInitStaysCleanNoFalseTypeMismatch) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "  int a[3] = {1, 2, 3};\n"
+        "  int nested[2][2] = {{1, 2}, {3, 4}};\n"
+        "  int scalar = 9;\n"
+        "  int *sp = a;\n"                 // plain array-decay init (must also stay clean)
+        "  return a[0] + nested[0][0] + scalar + sp[0];\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "aggregate brace-init / nested / scalar / array-decay inits must not false-fire "
+           "S_TypeMismatch";
+    EXPECT_FALSE(model.hasErrors())
+        << "the brace-init control program must compile clean";
+}
+
+// VLA C4b (D-CSUBSET-VLA): `typedef int R[n]; R a;` — a VLA TYPEDEF object — ACCEPTS at
+// the semantic tier (zero diagnostics) AND records its typedef ORIGIN: `a`'s
+// `vlaTypedefOrigin` is set to the typedef `R` (so HIR/MIR can copy R's decl-frozen size
+// down at a's alloca, C99 §6.7.7p2). RED-ON-DISABLE: revert the resolveDeclTypesPost a→R
+// correlation and `vlaTypedefOrigin` stays InvalidSymbol (the field EXPECT below reds) —
+// the accept was always semantic, so the recorded ORIGIN is the new, load-bearing bit.
+TEST(SemanticAnalyzerCSubset, VlaTypedefObjectAcceptsAndRecordsOrigin) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "  volatile int vn = 3;\n"
+        "  int n = vn;\n"
+        "  typedef int R[n];\n"
+        "  R a;\n"
+        "  a[0] = 1;\n"
+        "  return a[0];\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a VLA typedef object `R a;` must analyze clean (zero diagnostics)";
+    SymbolRecord const* aRec = findSym(model, "a");
+    SymbolRecord const* rRec = findSym(model, "R");
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_NE(rRec, nullptr);
+    EXPECT_TRUE(aRec->vlaTypedefOrigin.valid())
+        << "`a`'s vlaTypedefOrigin must be SET (the a→R correlation) so HIR/MIR copy R's "
+           "frozen size down instead of re-evaluating `n`";
+    // The recorded origin must be the typedef R itself (name + Type kind) — not a
+    // different same-typed symbol (type-dedup makes vlaArray(int) shared, so identity
+    // MUST come from the SymbolId, not the type).
+    ASSERT_LT(aRec->vlaTypedefOrigin.v, model.symbols().size());
+    EXPECT_EQ(model.symbols()[aRec->vlaTypedefOrigin.v].name, "R")
+        << "the recorded origin is the typedef R";
+    EXPECT_EQ(model.symbols()[aRec->vlaTypedefOrigin.v].kind, DeclarationKind::Type)
+        << "the recorded origin is a typedef (DeclarationKind::Type)";
+}
+
+// VLA C4a-param (D-CSUBSET-VLA): a PARAMETER pointer-to-VLA `int (*p)[n]` (n a sibling
+// param) now RESOLVES — Option B's DISTINCT `paramDecay` signal builds a `vlaArray` row in
+// the pointee, so a call passing a VLA object `int b[2][n]` DECAYS to `int (*)[n]` and
+// type-checks (zero S_TypeMismatch). The runtime witness is examples/c-subset/
+// c99_vla_ptr_param (a genuine VLA-object caller is a NON-leaf VLA function — a C1b
+// deferral — so the runnable example casts a fixed buffer; THIS pin covers the VLA-arg
+// decay type-check that the example cannot exercise at runtime). RED-ON-DISABLE: revert the
+// paramDecay threading and the pointee never becomes a VLA row → the arg fails the exact
+// decay compare → S_TypeMismatch reappears.
+TEST(SemanticAnalyzerCSubset, ParamPtrToVlaAcceptsAndVlaArgDecays) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int n, int (*p)[n]) { return p[1][0]; }\n"
+        "int main(void) {\n"
+        "  volatile int vn = 3;\n"
+        "  int n = vn;\n"
+        "  int b[2][n];\n"
+        "  return f(n, b);\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "a VLA object `int b[2][n]` passed to a `int (*p)[n]` param must DECAY and "
+           "type-check (zero S_TypeMismatch) — the ptr-to-VLA param resolves the sibling n";
+    EXPECT_FALSE(model.hasErrors())
+        << "the parameter pointer-to-VLA program analyzes clean at the semantic tier (the "
+           "non-leaf VLA-object caller is a separate MIR-tier deferral, not a semantic error)";
+}
+
+// VLA C4a-param FIX-5(a) (D-CSUBSET-VLA): a param pointer to a FIXED-length array
+// `int (*p)[5]` must STILL accept — paramDecay must NOT turn a constant-length pointee into
+// a VLA. The `[5]` constant-folds and never reaches the nullopt/VLA branch, so the store
+// gate (typeContainsVla) does not over-fire. RED-ON-DISABLE: if paramDecay wrongly forced a
+// VLA on a constant length, the ptr(array(int,5)) pointee would flip to ptr(vlaArray) and a
+// fixed `int b[2][5]` arg would then MISMATCH.
+TEST(SemanticAnalyzerCSubset, ParamPtrToFixedArrayStillAccepts) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int (*p)[5]) { return p[1][0]; }\n"
+        "int main(void) {\n"
+        "  int b[2][5];\n"
+        "  return f(b);\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "a fixed-pointee `int (*p)[5]` param accepts a fixed `int b[2][5]` arg";
+    EXPECT_FALSE(model.hasErrors())
+        << "the fixed-pointee ptr param program must analyze clean";
+}
+
+// VLA C4a-param FIX-5(b) (D-CSUBSET-VLA): the ADJUSTED form `int a[][n]` — the outer `[]`
+// decays to the pointer, the inner `[n]` is the runtime pointee row (C-equivalent to
+// `int (*a)[n]`) — must accept a VLA-object arg (zero S_TypeMismatch). RED-ON-DISABLE:
+// without the paramDecay threading the inner `[n]` fails S_NonConstantArrayLength.
+TEST(SemanticAnalyzerCSubset, ParamAdjustedArrayOfVlaAccepts) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int n, int a[][n]) { return a[1][0]; }\n"
+        "int main(void) {\n"
+        "  volatile int vn = 3;\n"
+        "  int n = vn;\n"
+        "  int b[2][n];\n"
+        "  return f(n, b);\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "`int a[][n]` (the adjusted form) must accept a VLA-object arg";
+    EXPECT_FALSE(model.hasErrors())
+        << "the int a[][n] program must analyze clean";
+}
+
+// VLA C4a-param (D-CSUBSET-VLA) regression control: a PLAIN `int a[n]` param must STILL
+// decay to `int*` (C 6.7.6.3p7 adjusts the OUTERMOST dim to a pointer). A pointer is
+// REASSIGNABLE (`a = q`), an array is not — so this compiles clean iff the paramDecay path
+// stripped the transient outermost vlaArray via adjustArrayToPointer. RED-ON-DISABLE: if a
+// plain array param stopped decaying (stayed a VLA-array object), `a = q` would fail loud
+// (S_TypeMismatch — arrays are not assignable, per the genuine-array control elsewhere).
+TEST(SemanticAnalyzerCSubset, PlainVlaArrayParamStillDecaysToPointer) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int n, int a[n], int *q) { a = q; return a[0]; }\n"
+        "int main(void) { int x = 5; return f(1, &x, &x); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a plain `int a[n]` param must DECAY to `int*` (a POINTER is reassignable); the "
+           "paramDecay path must strip the outermost VLA, never leave a VLA-array object";
+}
+
+// VLA C4a-param THE KEY OPTION-B GUARD (D-CSUBSET-VLA): a struct field `int a[n]` (variable
+// n) must STILL resolve via the struct-field FAM incompleteArray path -> a sole flexible
+// array member -> S_FlexibleArraySoleMember. Option B threads a DISTINCT paramDecay signal
+// that a struct field NEVER carries (its config row has allowFlexibleArray, not
+// arrayToPointer), so the FAM path is byte-identical. RED-ON-DISABLE: a broad fix that
+// routed struct fields through the paramDecay VLA branch would build a vlaArray instead of
+// an incompleteArray and this diagnostic vanishes.
+TEST(SemanticAnalyzerCSubset, StructFieldVlaSoleMemberStillFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int n = 4;\n"
+        "struct S { int a[n]; };\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_FlexibleArraySoleMember), 1u)
+        << "the Option-B no-regression guard: a struct field `int a[n]` (variable n) still "
+           "routes through the FAM incompleteArray path -> S_FlexibleArraySoleMember";
+}
+
+// VLA C4a-param (D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT, deferred): a FIXED arg `int b[2][2]`
+// decays to `ptr(array(int,2))`, which is DISTINCT from the param's `ptr(vlaArray)` — the
+// DSS -2 VLA sentinel is STRICTER than C's runtime VLA/fixed pointer compatibility — so it
+// rejects with S_TypeMismatch (a fail-loud reject of valid-C, NEVER a miscompile). This
+// pins that the accept is scoped to a genuinely VLA-shaped arg. RED-ON-DISABLE: a broadened
+// decay compare that ignored the element length would silently accept this mismatch.
+TEST(SemanticAnalyzerCSubset, ParamPtrToVlaFixedArgRejects) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int n, int (*p)[n]) { return p[1][0]; }\n"
+        "int main(void) {\n"
+        "  int b[2][2];\n"
+        "  return f(2, b);\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "a FIXED `int b[2][2]` arg (ptr(array(int,2))) is DISTINCT from the param's "
+           "ptr(vlaArray) -> S_TypeMismatch (D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT deferral)";
+}
+
+// ── VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): array-PARAMETER `static` / cv-qualifier
+//    / `*` decorations. ALL decay the parameter to a bare pointer; a NON-parameter use is a
+//    constraint violation (S_ArrayParamQualifierNonParameter, 0xE054). ──
+
+// A `int a[static N]` PARAMETER decays to `int*` (C 6.7.6.3p7) — a pointer is REASSIGNABLE
+// (`a = q`), an array is not — so this compiles clean iff `[static N]` was accepted AND the
+// array decayed. RED-ON-DISABLE: if `[static N]` failed to parse or decay, `a = q` (or the
+// parse) fails. Runtime witness: examples/c-subset/c99_array_param_static.
+TEST(SemanticAnalyzerCSubset, ArrayParamStaticDecaysToPointer) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int a[static 3], int *q) { a = q; return a[0]; }\n"
+        "int main(void) { int x = 5; return f(&x, &x); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "`int a[static 3]` is a legal parameter decoration (C 6.7.6.3p7) — accept + decay "
+           "to `int*` (a reassignable pointer)";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayParamQualifierNonParameter), 0u)
+        << "a PARAMETER `[static 3]` is legal — the non-parameter gate must NOT fire";
+}
+
+// Every array-parameter decoration — `[static n]` (runtime), `[const 3]`, `[restrict]`,
+// `[volatile 3]`, and the `[const static 3]` combo — is legal in a parameter and DECAYS to
+// `int*` (a `[restrict]` with NO bound decays like `int a[]`, NEVER a runtime VLA).
+// RED-ON-DISABLE: any form that failed to parse or wrongly routed to a VLA errors here.
+// (The bare unspecified-size `[*]` form LANDED — see ArrayParamStarFormDecaysCleanNonParamFailsLoud.)
+TEST(SemanticAnalyzerCSubset, ArrayParamDecorationsAllDecayClean) {
+    auto model = analyzeShipped("c-subset", {
+        "int fa(int n, int p[static n]) { return p[0]; }\n"
+        "int fb(int p[const 3])         { return p[0]; }\n"
+        "int fc(int p[restrict])        { return p[0]; }\n"
+        "int fd(int p[volatile 3])      { return p[0]; }\n"
+        "int fg(int p[const static 3])  { return p[0]; }\n"
+        "int main(void) { int x[3]; x[0]=1; x[1]=2; x[2]=3;\n"
+        "  return fa(3,x)+fb(x)+fc(x)+fd(x)+fg(x); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "every array-parameter decoration (static / const / volatile / restrict and "
+           "combos) is legal in a parameter and decays to `int*`";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayParamQualifierNonParameter), 0u)
+        << "no decoration on a PARAMETER may trip the non-parameter gate";
+}
+
+// VLA C4c (D-CSUBSET-VLA-PARAM-STAR): the bare unspecified-size `int a[*]` prototype-form
+// VLA-parameter marker — LANDED via the distinct `arrayStarSuffix` grammar rule + the
+// speculative-repeat-alt schema-compiler engine fix (grammar_schema_json.cpp). In a PARAMETER it
+// decays to a bare pointer EXACTLY like `[]` (no error, no 0xE054); a NON-parameter `[*]` is a
+// constraint violation → S_ArrayParamQualifierNonParameter (0xE054, the SAME paramDecay gate as a
+// static/qualifier decoration). RED-ON-DISABLE: a regression that drops the `*` (mis-types the
+// param as a plain `int`), fails to parse `[*]`, or fails to gate the non-param form flips this.
+TEST(SemanticAnalyzerCSubset, ArrayParamStarFormDecaysCleanNonParamFailsLoud) {
+    // PARAMETER `int a[*]` — decays to a bare pointer, compiles clean.
+    auto param = analyzeShipped("c-subset", {
+        "int f(int a[*]) { return a[0]; }\n"
+        "int main(void) { int x[1]; x[0] = 7; return f(x); }\n",
+    });
+    EXPECT_FALSE(param.hasErrors())
+        << "a PARAMETER `int a[*]` must decay to a bare pointer + compile clean";
+    EXPECT_EQ(countCode(param.diagnostics(),
+                        DiagnosticCode::S_ArrayParamQualifierNonParameter), 0u)
+        << "a `[*]` on a PARAMETER must NOT trip the non-parameter gate";
+
+    // NON-PARAMETER `int a[*];` (a local) — a constraint violation → 0xE054.
+    auto local = analyzeShipped("c-subset", {
+        "int main(void) { int a[*]; return 0; }\n",
+    });
+    EXPECT_TRUE(hasCode(local.diagnostics(),
+                        DiagnosticCode::S_ArrayParamQualifierNonParameter))
+        << "a `[*]` on a NON-parameter (local) is a constraint violation -> 0xE054, "
+           "never silently accepted with the `*` dropped";
+}
+
+// A `[static N]` on a NON-parameter (a LOCAL) is a constraint violation — these decorations
+// are legal ONLY in a function-parameter declarator (C 6.7.6.3p7). Fail loud with
+// S_ArrayParamQualifierNonParameter (0xE054). RED-ON-DISABLE: without the paramDecay gate a
+// local `[static 3]` would silently build an array with the decoration dropped.
+TEST(SemanticAnalyzerCSubset, ArrayStaticOnLocalFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { int a[static 3]; return a[0]; }\n",
+    });
+    EXPECT_TRUE(hasCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayParamQualifierNonParameter))
+        << "a LOCAL `int a[static 3]` is a non-parameter constraint violation -> 0xE054";
+}
+
+// The same gate on a STRUCT FIELD (also a declarator-mode row with paramDecay=false).
+TEST(SemanticAnalyzerCSubset, ArrayStaticOnStructFieldFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "struct S { int a[static 3]; };\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_TRUE(hasCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayParamQualifierNonParameter))
+        << "a struct field `int a[static 3]` is a non-parameter constraint violation -> 0xE054";
+}
+
+// The same gate on an EXTERN object — the LEGACY `applyArraySuffix` path (externDecl is never
+// a parameter). RED-ON-DISABLE: without the externDecl reject the widened suffix would
+// silently DROP `static 5` (the fixed lengthChild index now points past it) -> a bogus
+// incomplete array.
+TEST(SemanticAnalyzerCSubset, ExternArrayStaticFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "extern int arr[static 5];\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_TRUE(hasCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayParamQualifierNonParameter))
+        << "`extern int arr[static 5]` (never a parameter) -> 0xE054, not a silent drop";
+}
+
+// A GROUPED-inner declarator resets paramDecay (C 6.7.6.3p7 adjusts only the OUTERMOST dim),
+// so a decoration on a grouped inner array is a non-parameter use -> 0xE054 (deliberately
+// stricter). RED-ON-DISABLE: the paramDecay=false reset at the group recursion is what makes
+// this fire; drop it and the inner `[static 3]` is wrongly accepted.
+TEST(SemanticAnalyzerCSubset, ArrayStaticOnGroupedInnerParamFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int (*p[static 3]));\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_TRUE(hasCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayParamQualifierNonParameter))
+        << "a `[static 3]` on a grouped-inner declarator is not the decaying outermost dim "
+           "-> 0xE054 (the paramDecay reset)";
+}
+
+// VLA C4c REGRESSION GUARD (D-CSUBSET-VLA, audit MUST-FIX 1): `int a[*p]` — a LOCAL VLA sized
+// by a DEREF `*p` — compiled BEFORE C4c and must STILL compile after the `[*]` (arrayStarSuffix)
+// landing. The suffix repeat is speculative: the fixed 3-token `arrayStarSuffix` (`[ * ]`) probes
+// FIRST, fails at the `]` position (it sees `p`, not `]`), and rolls back CLEANLY to
+// `arrayDeclSuffix`, which parses `*p` as a normal VLA bound EXPRESSION. `*p` is an EXPRESSION
+// node under arrayDeclSuffix, NOT the bare-`*` arrayStarSuffix, so it is NEITHER a `[*]` marker
+// (no 0xE054) NOR read as absent. RED-ON-DISABLE: a non-speculative `arrayStarSuffix`-first
+// dispatch (committing on the shared `[`), or a lost engine rollback, regresses this working VLA.
+// The gate corpus has no `[*expr]`, so this is the ONLY guard.
+TEST(SemanticAnalyzerCSubset, DerefSizedVlaStillCompiles) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "  volatile int vn = 3;\n"
+        "  int n = vn;\n"
+        "  int *p = &n;\n"
+        "  int a[*p];\n"                 // a VLA sized by *p (== 3)
+        "  a[0] = 7;\n"
+        "  return a[0];\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "`int a[*p]` (a deref-sized VLA) must STILL compile — the `[*]`-vs-`[*expr]` "
+           "speculation must parse `*p` as the bound, not the `*` decoration";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayParamQualifierNonParameter), 0u)
+        << "a deref bound `*p` is an expression, NOT the `[*]` decoration — no 0xE054";
+}
+
+// VLA C4c (D-CSUBSET-VLA, code-audit IMPORTANT): the EMERGENT multi-dim `[*]` combinations now
+// parse+fold (arrayStarSuffix rides the suffix repeat) — outside C4c's single-`[*]` scope. They
+// must be CORRECT or FAIL LOUD, NEVER a silent stride: `int a[*][3]` is the OUTER star-modifier
+// (decays exactly like `int a[][3]` → `int(*)[3]`, a FIXED inner stride — accepted, no VLA); an
+// INNER `[*]` (`int a[n][*]`) yields a pointer to an UNSPECIFIED-size array whose fixed-array
+// argument is a distinct interned type → `S_TypeMismatch` (S0003) fail-loud (NEVER a wrong/zero
+// row stride). RED-ON-DISABLE: an inner `[*]` silently accepted with a bogus stride would flip
+// the arg-compat reject.
+TEST(SemanticAnalyzerCSubset, ArrayStarOuterDecaysInnerStarFailsLoud) {
+    auto outer = analyzeShipped("c-subset", {
+        "int f(int a[*][3]) { return a[1][2]; }\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_FALSE(outer.hasErrors())
+        << "`int a[*][3]` = an outer star-modifier + fixed inner: decays to `int(*)[3]` "
+           "(a fixed inner stride), accepted exactly like `int a[][3]`";
+    auto inner = analyzeShipped("c-subset", {
+        "int f(int n, int a[n][*]) { return a[0][0]; }\n"
+        "int main(void) { int x[2][3] = {{1,0,0},{0,0,0}}; return f(2, x); }\n",
+    });
+    EXPECT_TRUE(inner.hasErrors())
+        << "an INNER `[*]` (`int a[n][*]`) → ptr-to-unspecified-array: a fixed-array arg is a "
+           "distinct interned type → S_TypeMismatch fail-loud, NEVER a silent stride";
+}
+
+// VLA C4c (D-CSUBSET-VLA, audit IMPORTANT 3): a multi-dim VLA parameter whose INNER dim
+// carries a lenient `static` (`int a[n][static m]`) must locate the REAL inner bound `m` (the
+// shared bound-locator skips the `static`), never mis-size or spuriously reject. The inner
+// `static` is leniently accepted on a parameter (both dims carry paramDecay=true, so the gate
+// does not fire), and `m` still types the inner dimension. RED-ON-DISABLE: a mis-located bound
+// (reading `static` instead of `m`) would query the wrong node's type -> a spurious
+// S_VlaSizeNotInteger.
+TEST(SemanticAnalyzerCSubset, MultiDimParamInnerStaticSizesCorrectly) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int n, int m, int a[n][static m]);\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_VlaSizeNotInteger), 0u)
+        << "the inner `[static m]` bound must resolve to `m` (integer), never the `static` "
+           "token -> no spurious S_VlaSizeNotInteger";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_ArrayParamQualifierNonParameter), 0u)
+        << "a lenient inner `[static m]` on a PARAMETER (paramDecay=true both dims) must NOT "
+           "trip the non-parameter gate";
+    EXPECT_FALSE(model.hasErrors())
+        << "`int a[n][static m]` (a multi-dim VLA param with a lenient inner `static`) "
+           "analyzes clean — the decoration is skipped, `m` sizes the inner dim";
+}
+
+// D-CSUBSET-VLA-PTR-INIT-FORM-TYPING boundary guard: the INITIALIZER form
+// `int (*p)[n] = b;` is DEFERRED (the initializer node is pre-stamped decayed, defeating
+// the init-compat derivation; C4a-local witnesses via the assignment form `p = b;`). It
+// must FAIL LOUD at the semantic tier (S_TypeMismatch) — NOT silently accept. ★ This pin
+// is the safety boundary for the deferral: a future PARTIAL fix that makes `= b`
+// assignable WITHOUT also fixing the body-typing wrinkle would silently convert this safe
+// reject into a wrong-STRIDE miscompile at the subscript. This test goes RED on exactly
+// that dangerous partial change; when the init form PROPERLY lands it is flipped to
+// accept + a runtime witness. (Assignment-form `int (*p)[n]; p = b; p[i][j]` RUNS today.)
+TEST(SemanticAnalyzerCSubset, PtrToVlaInitFormDeferredStillFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "  volatile int vn = 3;\n"
+        "  int n = vn;\n"
+        "  int b[2][n];\n"
+        "  int (*p)[n] = b;\n"          // the INIT form (deferred) — must reject, not run
+        "  return p[1][0];\n"
+        "}\n",
+    });
+    EXPECT_TRUE(model.hasErrors())
+        << "the pointer-to-VLA INIT form `int (*p)[n] = b` is deferred and must fail loud "
+           "(S_TypeMismatch) — never a silent accept that would mis-stride the subscript";
 }

@@ -123,7 +123,10 @@ struct Lowered {
                                     &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
                                     &hir->linkageMap, &hir->mutabilityMap,
                                     &hir->volatileMap, /*alignmentMap=*/nullptr,
-                                    &hir->threadLocalMap);
+                                    &hir->threadLocalMap,
+                                    &hir->vlaSizeExprBySymbol,   // VLA C1a
+                                    &hir->sizeofVlaSymbol,   // VLA C2
+                                    &hir->typedefVlaOriginBySymbol);   // VLA C4b
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -8386,4 +8389,1039 @@ TEST(MirLoweringCSubset, SehInsideLoopStaysVerifierGreen) {
                                       *pipelineR, rep);
     EXPECT_TRUE(result.ok)
         << (rep.all().empty() ? "" : rep.all()[0].actual);
+}
+
+// Collect EVERY MIR opcode across all blocks of all functions (the wide ops emit
+// multi-block loops, so an entry-only scan would miss the loop-body opcodes).
+namespace {
+[[nodiscard]] std::vector<MirOpcode> allOpcodes(Mir const& m) {
+    std::vector<MirOpcode> out;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        std::uint32_t const nb = m.funcBlockCount(f);
+        for (std::uint32_t bi = 0; bi < nb; ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            std::uint32_t const n = m.blockInstCount(b);
+            for (std::uint32_t ii = 0; ii < n; ++ii)
+                out.push_back(m.instOpcode(m.blockInstAt(b, ii)));
+        }
+    }
+    return out;
+}
+} // namespace
+
+// D-CSUBSET-BITINT-C3-MULDIV: `* / %` on a wide `_BitInt(N>64)` now LOWER to the multi-
+// limb path (C3) — the C2 S_BitIntWideMulDivUnsupported (0xE04F) boundary is RETIRED for
+// these ops. This pins the SHAPE, not just "ok": a wide `*` emits the 64x64->128 `UMulH`
+// primitive (schoolbook multiply) and no div-by-zero trap; a wide `/`/`%` emits the
+// div-by-zero `Unreachable` hard-trap (binary long division, no UMulH). The op still
+// type-checks (a wide `a*b` is a valid expression); only the CODEGEN changed. RED-ON-
+// DISABLE: revert the dispatch and mir.ok flips false with a 0xE04F diagnostic; swap the
+// multiply's carry to OR and the value example (c23_bitint_wide_muldiv) breaks, but the
+// UMulH shape here still pins the primitive is used.
+TEST(MirLoweringCSubset, WideBitIntMulDivModLowersAtC3) {
+    struct Case { char const* op; bool wantUMulH; bool wantTrap; };
+    for (Case const& c : {Case{"*", true, false},
+                          Case{"/", false, true},
+                          Case{"%", false, true}}) {
+        std::string const src =
+            std::string("int main(void){ _BitInt(200) a = 3, b = 5;\n"
+                        "  _BitInt(200) cc = a ") + c.op + " b;\n"
+            "  return (int)cc; }\n";
+        auto L = lowerCSubset(src);
+        ASSERT_FALSE(L.model.hasErrors()) << src;
+        ASSERT_TRUE(L.hir->ok) << src;
+        EXPECT_TRUE(L.mir.ok) << src
+            << "\na wide _BitInt '" << c.op << "' must LOWER at C3"
+            << "\n" << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        std::size_t nDiag = 0;
+        for (auto const& d : L.mirReporter.all())
+            if (d.code == DiagnosticCode::S_BitIntWideMulDivUnsupported) ++nDiag;
+        EXPECT_EQ(nDiag, 0u) << src
+            << "\nthe retired 0xE04F boundary must NOT fire for a lowered wide '"
+            << c.op << "'";
+        auto const ops = allOpcodes(L.mir.mir);
+        EXPECT_EQ(countOpcode(ops, MirOpcode::UMulH) > 0, c.wantUMulH) << src
+            << "\nwide '" << c.op << "': UMulH presence pins the schoolbook multiply "
+               "primitive (mul uses it; long division does not)";
+        EXPECT_EQ(countOpcode(ops, MirOpcode::Unreachable) > 0, c.wantTrap) << src
+            << "\nwide '" << c.op << "': the div-by-zero Unreachable hard-trap is emitted "
+               "for divide/modulo (narrow idiv #DE parity), never for multiply";
+    }
+}
+
+// D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV: a conversion between a FLOATING type and a wide
+// `_BitInt(N>64)` is not yet supported (the multi-limb FP<->limbs path is a later cycle);
+// EACH direction fails LOUD at the MIR cast site with the dedicated unsuppressable
+// S_BitIntWideFloatConvUnsupported (0xE050), never a silent scalar path. The naive path
+// keys signedness off the source + touches only limb 0 (wrong sign, wrong value, dropped
+// upper limbs). RED-ON-DISABLE: drop the guard in materializeWideCast (wide TARGET) or
+// combineCast's wide-SOURCE arm and a wide `(_BitInt(128))f` / `(double)wide` silently
+// miscompiles (mir.ok flips true with no diagnostic). NARROW (N<=64) float<->_BitInt is
+// unaffected — it rides the native container (asserted green just below).
+TEST(MirLoweringCSubset, WideBitIntFloatConversionFailsLoud) {
+    struct Case { char const* src; char const* what; };
+    Case const cases[] = {
+        {"int main(void){ double f = 1.5; _BitInt(128) a = (_BitInt(128))f;\n"
+         "  return (int)a; }\n",                         "float -> wide _BitInt"},
+        {"int main(void){ _BitInt(128) x = 3; double d = (double)x;\n"
+         "  return (int)d; }\n",                         "wide _BitInt -> float"},
+    };
+    for (auto const& c : cases) {
+        auto L = lowerCSubset(c.src);
+        ASSERT_FALSE(L.model.hasErrors()) << c.what << ": " << c.src;  // it type-checks
+        ASSERT_TRUE(L.hir->ok) << c.what << ": " << c.src;
+        EXPECT_FALSE(L.mir.ok) << c.what << ": " << c.src
+            << "\na float<->wide _BitInt conversion must fail loud at the MIR cast site";
+        std::size_t n = 0;
+        for (auto const& d : L.mirReporter.all())
+            if (d.code == DiagnosticCode::S_BitIntWideFloatConvUnsupported) ++n;
+        EXPECT_EQ(n, 1u) << c.what << ": " << c.src
+            << "\nexactly one S_BitIntWideFloatConvUnsupported (0xE050)";
+    }
+}
+
+// D-CSUBSET-BITINT-FLOAT-CHAR-ENUM-CONV: the NARROW (N<=64) float<->_BitInt conversions
+// are UNAFFECTED by the wide fail-loud — they ride the native container (C1) and lower
+// CLEANLY. Pins that the wide guard is scoped to N>64 only (never a regression on C1).
+TEST(MirLoweringCSubset, NarrowBitIntFloatConversionLowersGreen) {
+    for (char const* src : {
+        "int main(void){ double f = 1.5; _BitInt(40) a = (_BitInt(40))f;\n"
+        "  return (int)a; }\n",
+        "int main(void){ _BitInt(40) x = 3; double d = (double)x;\n"
+        "  return (int)d; }\n"}) {
+        auto L = lowerCSubset(src);
+        ASSERT_FALSE(L.model.hasErrors()) << src;
+        ASSERT_TRUE(L.hir->ok) << src;
+        EXPECT_TRUE(L.mir.ok) << src
+            << "\nnarrow (N<=64) float<->_BitInt must lower green (C1 container path)"
+            << "\n" << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    }
+}
+
+// D-CSUBSET-BITINT-C2-WIDE: a wide `_BitInt(N>64)` local + the EASY ops lower CLEANLY
+// (the C1 N>64 semantic gate is retired). Pins add/sub/and/or/xor/shift/compare +
+// int<->wide conversions + a BY-VALUE wide arg+return + a wide TERNARY all reaching
+// MIR green — the anti-resurrection guards admit a wide `_BitInt` by construction.
+TEST(MirLoweringCSubset, WideBitIntEasyOpsLowerGreen) {
+    auto L = lowerCSubset(
+        "_BitInt(200) triple(_BitInt(200) x){ return x + x + x; }\n"
+        "int main(void){\n"
+        "  _BitInt(200) a = 10, b = 3;\n"
+        "  _BitInt(200) s = a + b;\n"
+        "  _BitInt(200) d = a - b;\n"
+        "  unsigned _BitInt(200) u = 12, v = 10;\n"
+        "  unsigned _BitInt(200) w = (u & v) | (u ^ v);\n"
+        "  unsigned _BitInt(200) sh = u << 65;\n"
+        "  _BitInt(200) t = (a < b) ? a : triple(b);\n"
+        "  a += b; a -= 1; a <<= 2;\n"   // compound-assign desugars to the wide ops
+        "  _BitInt(200) c = 4; c++; ++c; c--;\n"  // ++/-- synth a wide _BitInt(200) `1`
+        "  int r = (int)s + (int)d + (int)w + (int)sh + (int)t + (int)a + (int)c\n"
+        "        + (a == b);\n"
+        "  return r;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    EXPECT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+}
+
+// ── VLA C1a (D-CSUBSET-VLA): the front-end + IR pin ──────────────────────────
+//
+// A block-scope `int a[n]` lowers to a `vlaArray(int)`-typed local whose MIR
+// `Alloca` carries a RUNTIME size OPERAND = Mul(widened(load n), sizeof(int)),
+// primary payload 0 — emitted AT THE DECL POINT, AFTER the store to `n` and NOT
+// hoisted to the entry-block top (IMPORTANT-3). C1a proves this at the MIR tier;
+// the runnable dynamic-alloca codegen is C1b (this alloca fails loud at MIR->LIR).
+// RED-ON-DISABLE: revert the semantic VLA arm -> `int a[n]` is S_NonConstantArray-
+// Length (no MIR); revert the MIR arm -> the aggregateByteSize fail-loud.
+TEST(MirLoweringCSubset, VlaLocalLowersToRuntimeOperandAllocaAtDeclPoint) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 4;\n"
+        "  int a[n];\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "a valid automatic VLA must lower cleanly to MIR (the fail-loud is at "
+           "MIR->LIR, not here): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& in = L.model.lattice().interner();
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // Find THE runtime-operand Alloca (the VLA `a`) + the Store to `n`'s slot.
+    int vlaIdx = -1, storeIdx = -1;
+    MirInstId vlaAlloca{};
+    int allocaWithOperandCount = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        MirOpcode const op = m.instOpcode(id);
+        if (op == MirOpcode::Alloca && !m.instOperands(id).empty()) {
+            ++allocaWithOperandCount;
+            vlaIdx    = static_cast<int>(i);
+            vlaAlloca = id;
+        }
+        if (op == MirOpcode::Store && storeIdx < 0) storeIdx = static_cast<int>(i);
+    }
+    ASSERT_EQ(allocaWithOperandCount, 1)
+        << "exactly one runtime-operand (VLA) Alloca must be emitted";
+    ASSERT_GE(storeIdx, 0) << "`n = 4` must emit a Store to n's slot";
+
+    // (1) TYPE: the alloca result is ptr<vlaArray(int)> (the -2 sentinel), elem I32.
+    TypeId const allocaTy = m.instType(vlaAlloca);
+    ASSERT_TRUE(allocaTy.valid());
+    ASSERT_EQ(in.kind(allocaTy), TypeKind::Ptr);
+    auto const ptrOps = in.operands(allocaTy);
+    ASSERT_EQ(ptrOps.size(), 1u);
+    TypeId const pointee = ptrOps[0];
+    EXPECT_TRUE(in.isVlaArray(pointee))
+        << "the VLA local's type must be a vlaArray (kVlaLength=-2 sentinel)";
+    EXPECT_FALSE(in.isIncompleteArray(pointee))
+        << "a VLA (-2) must NOT read as an incomplete array (-1)";
+    auto const elemOps = in.operands(pointee);
+    ASSERT_EQ(elemOps.size(), 1u);
+    EXPECT_EQ(in.kind(elemOps[0]), TypeKind::I32) << "element type is int";
+
+    // (2) OPERAND SHAPE: operand[0] = Mul(SExt(Load n), Const 4), primary payload 0.
+    EXPECT_EQ(m.instPayload(vlaAlloca), 0u)
+        << "a runtime-sized VLA alloca carries a ZERO primary payload (the size is "
+           "the OPERAND, not the payload)";
+    auto const aOps = m.instOperands(vlaAlloca);
+    ASSERT_EQ(aOps.size(), 1u);
+    MirInstId const bytes = aOps[0];
+    ASSERT_EQ(m.instOpcode(bytes), MirOpcode::Mul);
+    auto const mulOps = m.instOperands(bytes);
+    ASSERT_EQ(mulOps.size(), 2u);
+    // op1 = the element stride constant (sizeof(int) == 4).
+    ASSERT_EQ(m.instOpcode(mulOps[1]), MirOpcode::Const);
+    auto const& strideLit = m.literalValue(m.constLiteralIndex(mulOps[1]));
+    auto const* strideVal = std::get_if<std::int64_t>(&strideLit.value);
+    ASSERT_NE(strideVal, nullptr);
+    EXPECT_EQ(*strideVal, 4) << "byte size = count * sizeof(int)";
+    // op0 = the widened count: SExt(Load n) (signed int n -> i64).
+    ASSERT_EQ(m.instOpcode(mulOps[0]), MirOpcode::SExt);
+    auto const sextOps = m.instOperands(mulOps[0]);
+    ASSERT_EQ(sextOps.size(), 1u);
+    EXPECT_EQ(m.instOpcode(sextOps[0]), MirOpcode::Load)
+        << "the runtime bound is the LOAD of the local `n` (proves the size expr "
+           "was un-skipped + lowered at the decl point)";
+
+    // (3) ORDERING (IMPORTANT-3): emitted at the DECL point — AFTER the store to
+    // `n`, NOT at the entry-block top (index 0 is the hoisted scalar `n` alloca).
+    EXPECT_GT(vlaIdx, storeIdx)
+        << "the VLA alloca must follow the store to its runtime bound `n`";
+    EXPECT_NE(vlaIdx, 0)
+        << "the VLA alloca must NOT be hoisted to the entry-block top";
+}
+
+// VLA C2 (D-CSUBSET-VLA): `sizeof <vla-object>` lowers to a runtime Load of the VLA's
+// decl-frozen byte-size slot — NOT a static fold (which HEAD fails loud, H0009). This
+// pins the whole slot mechanism: a hidden fixed 8-byte Alloca, a Store of the VLA's
+// byte size (the `count*stride` Mul) into it AT THE DECL, and a Load from it at the
+// sizeof. Red-on-disable: revert C2 and `sizeof a` fails loud (mir.ok == false), so the
+// leading ASSERT_TRUE alone catches a regression; the slot/Store/Load shape locks the
+// mechanism (a static-fold Const or a re-evaluated size would break these).
+TEST(MirLoweringCSubset, SizeofOfVlaLoadsDeclFrozenSizeSlot) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 4;\n"
+        "  int a[n];\n"
+        "  return (int)sizeof a;\n"   // runtime Load of the decl-frozen size (n*4)
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)   // red-on-disable: HEAD (pre-C2) fails loud H0009 here
+        << "sizeof of a VLA object must lower cleanly to a runtime Load (not H0009): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& in = L.model.lattice().interner();
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // (1) THE SIZE SLOT: a fixed 8-byte Alloca (no operand, primary payload 8). The
+    // scalar `n` alloca is payload 4; the VLA alloca is operand-bearing (payload 0);
+    // so the payload-8 no-operand Alloca is uniquely the C2 size slot.
+    MirInstId sizeSlot{};
+    int sizeSlotCount = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) == MirOpcode::Alloca && m.instOperands(id).empty()
+            && m.instPayload(id) == 8u) {
+            ++sizeSlotCount;
+            sizeSlot = id;
+        }
+    }
+    ASSERT_EQ(sizeSlotCount, 1) << "exactly one hidden 8-byte VLA size slot";
+    // Its element type is size_t (U64) so the sizeof Load result matches the node type.
+    TypeId const slotTy = m.instType(sizeSlot);
+    ASSERT_EQ(in.kind(slotTy), TypeKind::Ptr);
+    auto const slotPtrOps = in.operands(slotTy);
+    ASSERT_EQ(slotPtrOps.size(), 1u);
+    EXPECT_EQ(in.kind(slotPtrOps[0]), TypeKind::U64) << "size slot holds a size_t";
+
+    // (2) THE FREEZE STORE: a Store whose ADDRESS is the size slot and whose VALUE is
+    // the VLA's byte size (a Mul == count*stride) — proving the size is frozen at the
+    // decl, not re-evaluated at the sizeof.
+    bool sawFreezeStore = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Store) continue;
+        auto const ops = m.instOperands(id);
+        if (ops.size() == 2u && ops[1].v == sizeSlot.v
+            && m.instOpcode(ops[0]) == MirOpcode::Mul) {
+            sawFreezeStore = true;
+        }
+    }
+    EXPECT_TRUE(sawFreezeStore)
+        << "the VLA's byte size (count*stride Mul) must be Stored into the size slot "
+           "at the decl point (freeze-at-decl, C 6.7.6.2p2)";
+
+    // (3) THE SIZEOF LOAD: a Load FROM the size slot, typed U64 — this IS `sizeof a`.
+    bool sawSizeofLoad = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Load) continue;
+        auto const ops = m.instOperands(id);
+        if (ops.size() == 1u && ops[0].v == sizeSlot.v
+            && in.kind(m.instType(id)) == TypeKind::U64) {
+            sawSizeofLoad = true;
+        }
+    }
+    EXPECT_TRUE(sawSizeofLoad)
+        << "`sizeof a` must lower to a U64 Load of the decl-frozen size slot, never a "
+           "static Const fold (a VLA sizeof is not a constant expression)";
+}
+
+// VLA C2 (D-CSUBSET-VLA) — CRITICAL-1 guard: `sizeof` of a COMPOSITE operand whose value
+// is a VLA (`sizeof(0, a)` — a comma expression) must NOT be treated as the object's
+// frozen size. C decays the comma result (an rvalue) to a pointer, so its sizeof is the
+// pointer size; the c-subset does not model that decay, so this must FAIL LOUD (H0009 at
+// MIR) — never silently Load a (possibly wrong) VLA's frozen size. Red-on-disable for the
+// operand-shape guard in `vlaObjectOperandSymbol`: a broad "find any VLA leaf" match would
+// mis-key `a` here and lower a bogus runtime size (mir.ok would flip true).
+TEST(MirLoweringCSubset, SizeofOfCompositeVlaOperandFailsLoud) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 4;\n"
+        "  int a[n];\n"
+        "  return (int)sizeof(0, a);\n"   // composite operand — must fail loud, not Load a
+        "}\n");
+    // The front-end accepts it (a is a valid VLA); the failure is the sizeof lowering.
+    EXPECT_FALSE(L.mir.ok)
+        << "sizeof of a composite (comma) operand yielding a VLA must fail loud (its C "
+           "value decays to a pointer), never silently load the VLA's frozen size";
+}
+
+// ── VLA C4b (D-CSUBSET-VLA): the VLA-typedef FREEZE + COPY-DOWN MIR pins ─────────
+//
+// `typedef int R[n]; R a;` — C99 §6.7.7p2: the typedef R evaluates `n` ONCE and FREEZES
+// its runtime size at the TypeDecl statement; every later `R a;` COPIES that frozen size
+// down into its own slots (never re-lowering `n`). These two pins lock the mechanism.
+// Both are red-on-disable: revert the MIR TypeDecl freeze OR the copy-down intercept and
+// `R a;` fails loud (mir.ok flips false — the leading ASSERT_TRUE alone catches it).
+
+// Pin 1 — FREEZE-AT-TYPEDEF: R's TypeDecl statement emits a Store of the count*stride
+// Mul into an 8-byte size slot (the old no-op TypeDecl emitted nothing). The Mul IS the
+// size expr `n*sizeof(int)` evaluated ONCE, at the typedef — distinct from a's copy-down,
+// which Stores a LOAD (Pin 2), never a Mul.
+TEST(MirLoweringCSubset, VlaTypedefFreezesSizeAtTypeDeclStatement) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 3;\n"
+        "  typedef int R[n];\n"
+        "  R a;\n"
+        "  a[0] = 1;\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)   // red-on-disable: no freeze => `R a;` copy-down fails loud
+        << "a VLA typedef object must lower cleanly (freeze at the typedef + copy-down): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // R's freeze: a Store whose VALUE is a Mul (count*stride) into an 8-byte size slot.
+    bool sawFreezeStore = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Store) continue;
+        auto const ops = m.instOperands(id);
+        if (ops.size() == 2u && m.instOpcode(ops[0]) == MirOpcode::Mul
+            && m.instOpcode(ops[1]) == MirOpcode::Alloca
+            && m.instPayload(ops[1]) == 8u) {
+            sawFreezeStore = true;
+        }
+    }
+    EXPECT_TRUE(sawFreezeStore)
+        << "the VLA typedef R must FREEZE its size (a count*stride Mul Stored into an "
+           "8-byte slot) AT the TypeDecl statement — not at each `R a;` (freeze-once, "
+           "C99 6.7.7p2)";
+}
+
+// Pin 2 — COPY-DOWN: `R a;`'s runtime Alloca sources its size OPERAND from a LOAD (of R's
+// frozen slot), NOT a fresh Mul (which would mean re-evaluating `n`). A copy-down Store
+// (value = a Load) populates a's OWN 8-byte slot so `a[i]` / `sizeof a` read it.
+TEST(MirLoweringCSubset, VlaTypedefObjectAllocaLoadsFrozenSizeNotReLoweredN) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 3;\n"
+        "  typedef int R[n];\n"
+        "  R a;\n"
+        "  a[0] = 1;\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& in = L.model.lattice().interner();
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // a's runtime Alloca = the operand-bearing Alloca whose pointee is a vlaArray.
+    MirInstId objAlloca{};
+    int objCount = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Alloca) continue;
+        if (m.instOperands(id).empty()) continue;   // skip the 8-byte size slots
+        TypeId const t = m.instType(id);
+        if (in.kind(t) != TypeKind::Ptr) continue;
+        auto const po = in.operands(t);
+        if (po.size() == 1u && in.isVlaArray(po[0])) { objAlloca = id; ++objCount; }
+    }
+    ASSERT_EQ(objCount, 1)
+        << "exactly one VLA-typedef object `a` runtime-operand Alloca (ptr<vlaArray>)";
+
+    // Its size operand is a LOAD (of R's frozen whole-object slot) — NOT a Mul. A Mul
+    // here would mean `R a;` re-lowered `n` (freeze-once violated).
+    auto const aOps = m.instOperands(objAlloca);
+    ASSERT_EQ(aOps.size(), 1u);
+    EXPECT_EQ(m.instOpcode(aOps[0]), MirOpcode::Load)
+        << "`R a;`'s alloca size must be a LOAD of R's decl-frozen slot (copy-down), "
+           "never a re-lowered count*stride Mul (that would re-evaluate `n`)";
+
+    // The copy-down also Stores that Load into a's OWN 8-byte slot: a Store whose VALUE
+    // is a Load into an 8-byte slot (distinct from R's freeze Store, whose value is a Mul).
+    bool sawCopyDownStore = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Store) continue;
+        auto const ops = m.instOperands(id);
+        if (ops.size() == 2u && m.instOpcode(ops[0]) == MirOpcode::Load
+            && m.instOpcode(ops[1]) == MirOpcode::Alloca
+            && m.instPayload(ops[1]) == 8u) {
+            sawCopyDownStore = true;
+        }
+    }
+    EXPECT_TRUE(sawCopyDownStore)
+        << "`R a;` must COPY R's frozen size DOWN — a Load(R's slot) Stored into a's own "
+           "8-byte slot — so `a[i]` / `sizeof a` Load a's own copied slot";
+}
+
+// VLA C4b (D-CSUBSET-VLA) — the DEFERRED shapes STAY fail-loud (I4). Type-dedup makes
+// `vlaArray(int)` a shared TypeId, so a VLA-typedef-WITH-OWN-SUFFIX object looks type-
+// identical to the in-scope `R a;` and MUST be pinned distinct. All three below fail loud
+// (no binary), never a silent miscompile. Red-on-disable: were the `declTy == headTy`
+// origin gate to leak and admit an own-suffix / ptr shape, the C4b copy-down would
+// mis-size (a captured-bound / array-level mismatch).
+
+// (a) Stacked-suffix `typedef int R[5]; R a[n];` — R is FIXED, the object adds a VLA `[n]`:
+// type `int[n][5]` (2 array levels) with only 1 declarator bound captured → the
+// computeVlaByteSize depth-vs-dims guard fires → fail loud.
+TEST(MirLoweringCSubset, VlaTypedefStackedFixedThenVlaSuffixFailsLoud) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 2;\n"
+        "  typedef int R[5];\n"
+        "  R a[n];\n"
+        "  return a[0][0];\n"
+        "}\n");
+    EXPECT_FALSE(L.mir.ok)
+        << "a fixed typedef with a VLA object suffix (`typedef int R[5]; R a[n];`) is a "
+           "2-level type with 1 captured bound — must fail loud (deferred), never guess";
+}
+
+// (b) VLA-typedef WITH its own suffix `typedef int R[n]; R a[m];` — R is a VLA, the object
+// adds another VLA `[m]`: type `int[m][n]`, again 2 levels vs 1 captured bound. The
+// `declTy == headTy` origin gate EXCLUDES it (declTy has the extra dim) → normal capture +
+// depth mismatch → fail loud. THE type-dedup distinctness pin (I4): it must NOT slip into
+// the C4b copy-down path just because `vlaArray(int)` dedups with the in-scope `R a;`.
+TEST(MirLoweringCSubset, VlaTypedefWithOwnVlaSuffixFailsLoud) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n; int m;\n"
+        "  n = 3; m = 2;\n"
+        "  typedef int R[n];\n"
+        "  R a[m];\n"
+        "  return a[0][0];\n"
+        "}\n");
+    EXPECT_FALSE(L.mir.ok)
+        << "a VLA typedef with its own VLA object suffix (`typedef int R[n]; R a[m];`) must "
+           "STAY fail-loud — NOT take the C4b copy-down path (I4)";
+}
+
+// (c) Ptr-to-VLA typedef `typedef int (*P)[n]; P p;` — the pointee is a VLA; the C4a+C4b
+// composition is deferred. `P p`'s declarator carries no array suffix, so captureVlaSize
+// fails loud (H0009) at the HIR tier (hir->ok flips false).
+TEST(MirLoweringCSubset, PtrToVlaTypedefObjectFailsLoud) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 3;\n"
+        "  typedef int (*P)[n];\n"
+        "  P p;\n"
+        "  (void)p;\n"
+        "  return 0;\n"
+        "}\n");
+    EXPECT_FALSE(L.hir->ok)
+        << "a ptr-to-VLA typedef object (`typedef int (*P)[n]; P p;`) is deferred — must "
+           "fail loud (H0009 at HIR), never silently produce a bogus pointer";
+}
+
+// (d) CHAINED VLA typedef `typedef int R[n]; typedef R S;` — S aliases a VLA typedef with
+// NO own `[n]` suffix (D-CSUBSET-VLA-TYPEDEF-CHAINED). The semantic I1 gate stamps S's
+// `vlaTypedefOrigin` (declTy==headTy), so `lowerTypeDecl` recognizes the chained form and
+// fails loud CLEANLY (a real "not yet supported" diagnostic) instead of the generic
+// captureVlaSize "no suffix" desync. Red-on-disable: drop the vlaTypedefOrigin discriminator
+// and S routes back into captureVlaSize → the confusing internal-desync message.
+TEST(MirLoweringCSubset, ChainedVlaTypedefFailsLoud) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 3;\n"
+        "  typedef int R[n];\n"
+        "  typedef R S;\n"
+        "  S a;\n"
+        "  a[0] = 42;\n"
+        "  return a[0];\n"
+        "}\n");
+    EXPECT_FALSE(L.hir->ok)
+        << "a chained VLA typedef (`typedef int R[n]; typedef R S;`) is deferred — must "
+           "fail loud at HIR, never silently alias a frozen size";
+}
+
+// ── VLA C3 (D-CSUBSET-VLA): multi-dimensional VLAs (runtime row stride) ───────
+namespace {
+// Count the hidden fixed 8-byte U64 size/stride slots (no-operand Alloca, payload 8):
+// a multi-dim VLA freezes ONE per runtime-sized level (the whole object + each VLA row).
+[[nodiscard]] int countVlaSizeSlots(Mir const& m, MirBlockId entry) {
+    int n = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) == MirOpcode::Alloca && m.instOperands(id).empty()
+            && m.instPayload(id) == 8u)
+            ++n;
+    }
+    return n;
+}
+// True iff some Mul is fed by a Load of an 8-byte size slot — the RUNTIME-stride
+// index signature (a VLA row stepped by a decl-frozen stride slot Load, CRITICAL-1),
+// as opposed to a compile-time Const stride. Robust: a fixed array's index Mul scales
+// by a Const and never Loads a payload-8 slot (its own index Load reads a payload-4
+// int slot, not a payload-8 stride slot).
+[[nodiscard]] bool hasRuntimeStrideIndexLoad(Mir const& m, MirBlockId entry) {
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Mul) continue;
+        for (MirInstId const op : m.instOperands(id)) {
+            if (m.instOpcode(op) != MirOpcode::Load) continue;
+            auto const lops = m.instOperands(op);
+            if (lops.size() == 1 && m.instOpcode(lops[0]) == MirOpcode::Alloca
+                && m.instPayload(lops[0]) == 8u)
+                return true;
+        }
+    }
+    return false;
+}
+} // namespace
+
+// A block-scope `int a[n][m]` lowers to a runtime-operand Alloca (total = n*m*4) AND
+// TWO decl-frozen size slots (the whole object + the `int[m]` row), and a subscript of
+// the OUTER dim scales the index by a RUNTIME stride LOADED from the row slot — never a
+// compile-time Const stride (CRITICAL-1). This is the whole C3 mechanism in one pin.
+// Red-on-disable: revert the semantic lift → `int a[n][m]` is S_VlaMultiDimUnsupported
+// (no MIR); revert the MIR stride path → the row index fails loud / uses a bogus stride.
+TEST(MirLoweringCSubset, MultiDimVlaLowersWithRuntimeStrideSlots) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 3, vm = 5;\n"
+        "  int n = vn, m = vm;\n"
+        "  int a[n][m];\n"
+        "  a[1][0] = 7;\n"           // OUTER index a[1] scales by the runtime row stride
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)   // red-on-disable: reverting C3 fails loud here
+        << "a multi-dimensional VLA must lower cleanly to MIR (runtime row stride): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // (1) exactly ONE runtime-operand (VLA) Alloca — the object `a`; its size operand
+    // is the total-bytes Mul (n*m*4). (The scalar n/m/seed slots carry no operand.)
+    int runtimeAllocas = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) == MirOpcode::Alloca && !m.instOperands(id).empty())
+            ++runtimeAllocas;
+    }
+    EXPECT_EQ(runtimeAllocas, 1) << "one runtime-sized VLA object alloca";
+
+    // (2) TWO decl-frozen size slots: the whole object (sizeof a) + the int[m] row
+    // (sizeof a[0] / the a[i] stride). A 1-D VLA would have exactly ONE.
+    EXPECT_EQ(countVlaSizeSlots(m, entry), 2)
+        << "int a[n][m] freezes a size slot per runtime level: the whole + the row";
+
+    // (3) the OUTER subscript scales by a RUNTIME stride LOADED from the row slot,
+    // never a compile-time Const stride.
+    EXPECT_TRUE(hasRuntimeStrideIndexLoad(m, entry))
+        << "the a[i] row index must scale by a Load of the decl-frozen row-stride slot "
+           "(a runtime stride), NOT a compile-time Const";
+}
+
+// CRITICAL-2 no-over-fire: a FULLY-FIXED multi-dim array `int b[5][5]` must NOT route
+// to any VLA path (typeContainsVla == false). Observable at MIR: it takes the fixed
+// aggregate path — a single fixed-size (100-byte) Alloca, NO runtime-operand alloca, NO
+// size slots, NO runtime-stride index Load (every stride is a compile-time Const).
+TEST(MirLoweringCSubset, FixedMultiDimArrayDoesNotRouteToVlaPath) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int b[5][5];\n"
+        "  b[1][0] = 7;\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    auto& in = L.model.lattice().interner();   // mutable: constructs the pin types
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // Direct interner pin: neither the fixed 2-D array nor its element is a VLA
+    // container (the ops[0] walk finds no -2 sentinel at any level).
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const fixed2d = in.array(in.array(i32, 5), 5);
+    EXPECT_FALSE(in.typeContainsVla(fixed2d))
+        << "int[5][5] must NOT read as a VLA container (no over-fire)";
+    EXPECT_TRUE(in.typeContainsVla(in.vlaArray(in.vlaArray(i32))))
+        << "vlaArray(vlaArray(int)) IS a VLA container (sanity of the predicate)";
+
+    // Observable MIR consequence: the fixed path was taken.
+    int runtimeAllocas = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) == MirOpcode::Alloca && !m.instOperands(id).empty())
+            ++runtimeAllocas;
+    }
+    EXPECT_EQ(runtimeAllocas, 0) << "a fixed 2-D array uses NO runtime-operand alloca";
+    EXPECT_EQ(countVlaSizeSlots(m, entry), 0) << "a fixed array freezes NO size slots";
+    EXPECT_FALSE(hasRuntimeStrideIndexLoad(m, entry))
+        << "a fixed array scales every subscript by a compile-time Const stride";
+}
+
+// `sizeof a[0]` of a multi-dim VLA is the ROW size (m*4) — a RUNTIME value LOADED from
+// the SAME decl-frozen row-stride slot the a[i] index uses (Piece 5), never a static
+// fold. Red-on-disable: revert Piece 5 → `sizeof a[0]` (a VLA row) fails loud (H0009).
+TEST(MirLoweringCSubset, RowSizeofOfMultiDimVlaLoadsStrideSlot) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 3, vm = 5;\n"
+        "  int n = vn, m = vm;\n"
+        "  int a[n][m];\n"
+        "  return (int)sizeof a[0];\n"   // ROW sizeof == m*4, a runtime Load
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)   // red-on-disable: reverting Piece 5 fails loud here
+        << "sizeof of a VLA ROW must lower cleanly to a runtime Load (not H0009): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& in = L.model.lattice().interner();
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // A U64 Load whose address is an 8-byte size slot (the row stride) — this IS
+    // `sizeof a[0]`, the SAME slot family the index path Loads.
+    bool sawRowSizeofLoad = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Load) continue;
+        auto const ops = m.instOperands(id);
+        if (ops.size() == 1 && m.instOpcode(ops[0]) == MirOpcode::Alloca
+            && m.instPayload(ops[0]) == 8u
+            && in.kind(m.instType(id)) == TypeKind::U64)
+            sawRowSizeofLoad = true;
+    }
+    EXPECT_TRUE(sawRowSizeofLoad)
+        << "`sizeof a[0]` must lower to a U64 Load of the decl-frozen row-stride slot, "
+           "never a static Const fold (a VLA row sizeof is not a constant expression)";
+}
+
+// ── VLA C5 (D-CSUBSET-VLA): block-scope stack teardown (StackSave/StackRestore) ──
+
+// The crash fix: a VLA in a loop body emits a StackSave at its decl + a StackRestore
+// at the body block's fall-through exit (before the back-edge), so each iteration
+// reclaims its stack. Red-on-disable: without the teardown the loop leaks `sub sp`
+// per iteration → STATUS_STACK_OVERFLOW (the c99_vla_loop runtime witness). Here we
+// pin the MIR SHAPE: exactly one StackSave (the one VLA) + one StackRestore (the one
+// fall-through exit edge of the body block).
+TEST(MirLoweringCSubset, VlaInLoopBodyEmitsBlockScopeTeardown) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 4;\n"
+        "  int n = vn;\n"
+        "  int i;\n"
+        "  for (i = 0; i < 3; i = i + 1) {\n"
+        "    int a[n];\n"
+        "    a[0] = 1;\n"
+        "  }\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = allOpcodes(L.mir.mir);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackSave), 1u)
+        << "one dynamic VLA in the loop body → one StackSave watermark";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackRestore), 1u)
+        << "the body block's fall-through exit restores SP once per iteration "
+           "(before the back-edge) — the loop-leak crash fix";
+}
+
+// break / continue / goto OUT of a VLA scope each emit a StackRestore on that exit
+// edge (in addition to the natural fall-through). Red-on-disable: drop the restore
+// at any of these arms and the edge leaks SP.
+TEST(MirLoweringCSubset, VlaBreakContinueGotoEmitStackRestore) {
+    struct Case { char const* body; char const* what; };
+    Case const cases[] = {
+        {"for (i = 0; i < 3; i = i + 1) { int a[n]; a[0] = 1;\n"
+         "  if (a[0] == 1) { break; } }",                    "break"},
+        {"for (i = 0; i < 3; i = i + 1) { int a[n]; a[0] = 1;\n"
+         "  if (a[0] == 1) { continue; } a[0] = 2; }",       "continue"},
+        {"{ int a[n]; a[0] = 1; if (a[0] == 1) { goto done; } }\n"
+         "done: ;",                                          "goto-out"},
+    };
+    for (Case const& c : cases) {
+        std::string const src =
+            std::string("int main(void) {\n"
+                        "  volatile int vn = 4;\n  int n = vn;\n  int i;\n")
+            + c.body + "\n  return 0;\n}\n";
+        auto L = lowerCSubset(src);
+        ASSERT_FALSE(L.model.hasErrors()) << c.what << "\n" << src
+            << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.mir.ok) << c.what << "\n" << src
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        auto const ops = allOpcodes(L.mir.mir);
+        EXPECT_EQ(countOpcode(ops, MirOpcode::StackSave), 1u) << c.what;
+        EXPECT_GE(countOpcode(ops, MirOpcode::StackRestore), 1u)
+            << c.what << ": the non-fall-through exit edge must restore SP";
+    }
+}
+
+// A NON-VLA loop body is BYTE-CLEAN: it emits NEITHER a StackSave nor a StackRestore
+// (the teardown is scoped to dynamic VLAs — a fixed array is a frame slot, no SP move,
+// no watermark). Guards against the teardown firing for every block.
+TEST(MirLoweringCSubset, NonVlaLoopBodyEmitsNoStackTeardown) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int i;\n"
+        "  for (i = 0; i < 3; i = i + 1) {\n"
+        "    int a[4];\n"          // FIXED array — a frame slot, not a dynamic VLA
+        "    a[0] = 1;\n"
+        "  }\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = allOpcodes(L.mir.mir);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackSave), 0u)
+        << "a fixed-array loop body opens no VLA watermark";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackRestore), 0u)
+        << "a fixed-array loop body emits no teardown (byte-clean)";
+}
+
+// A `goto` out of a NESTED VLA scope restores to the SHALLOWEST EXITED watermark, not
+// to an OUTER VLA scope that still encloses the target. Here `a` (scopeId 0) is
+// declared in main's body and `b` (scopeId 1) in an inner block; `goto done` (done in
+// main's body, AFTER a's decl) exits `b` but stays inside `a`. The single StackRestore
+// must reference `b`'s StackSave (payload 1), NOT over-free to `a` (payload 0).
+TEST(MirLoweringCSubset, NestedGotoRestoreTargetsShallowestExitedFrame) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 4;\n"
+        "  int n = vn;\n"
+        "  int a[n];\n"
+        "  a[0] = 1;\n"
+        "  {\n"
+        "    int b[n];\n"
+        "    b[0] = 2;\n"
+        "    goto done;\n"        // exits b (inner), NOT a (still in scope at done)
+        "  }\n"
+        "done:\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    // Collect the (scopeId payload of the StackSave each StackRestore references).
+    std::vector<std::uint32_t> restoreTargets;
+    int saves = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                MirInstId const id = m.blockInstAt(b, ii);
+                if (m.instOpcode(id) == MirOpcode::StackSave) ++saves;
+                if (m.instOpcode(id) != MirOpcode::StackRestore) continue;
+                auto const rops = m.instOperands(id);
+                ASSERT_EQ(rops.size(), 1u);
+                ASSERT_EQ(m.instOpcode(rops[0]), MirOpcode::StackSave)
+                    << "a StackRestore's operand must be a StackSave";
+                restoreTargets.push_back(m.instPayload(rops[0]));
+            }
+        }
+    }
+    EXPECT_EQ(saves, 2) << "two VLAs → two StackSave watermarks (scopeId 0 = a, 1 = b)";
+    ASSERT_EQ(restoreTargets.size(), 1u)
+        << "only the goto edge restores here (a/b's blocks are sealed by goto/return)";
+    EXPECT_EQ(restoreTargets[0], 1u)
+        << "the goto restores to b's watermark (the shallowest EXITED scope), never "
+           "over-freeing to a (payload 0), which still encloses `done`";
+}
+
+// VLA C5 for-SCOPE teardown (D-CSUBSET-VLA): a for-INIT VLA is declared ONCE at loop
+// entry, persists across all iterations, and is freed ONLY at the loop EXIT — NEVER on
+// the back-edge (freeing it there is a use-after-free in iteration 2+). A for-init-ONLY
+// loop (no body VLA) therefore emits exactly ONE StackSave and exactly ONE StackRestore
+// (the exit one) — the count==1 proves there is NO spurious back-edge restore.
+TEST(MirLoweringCSubset, ForInitVlaEmitsForScopeTeardownAtLoopExitOnly) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 4;\n"
+        "  int n = vn;\n"
+        "  int i;\n"
+        "  for (int a[n]; i < 3; i = i + 1) {\n"
+        "    a[0] = i;\n"          // body uses the for-init VLA; body has NO VLA of its own
+        "  }\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)   // red-on-disable: reverting the for-scope teardown fails here
+        << "a for-init VLA must lower (its teardown is no longer a fail-loud deferral): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = allOpcodes(L.mir.mir);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackSave), 1u)
+        << "one for-init VLA → one StackSave at loop entry";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackRestore), 1u)
+        << "the for-init VLA is freed ONLY at the loop exit — exactly one restore, "
+           "NONE on the back-edge (a back-edge free would be a use-after-free)";
+}
+
+// A for-init VLA + a body VLA are torn down at DISTINCT CFG points: the body VLA on
+// the back-edge (per iteration), the for-init VLA at the loop exit. Both restores
+// exist, target DIFFERENT StackSaves, and sit in DIFFERENT blocks — proving the
+// for-init frame is not folded into the body's per-iteration teardown.
+TEST(MirLoweringCSubset, ForInitAndBodyVlaTornDownAtDistinctPoints) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 4;\n"
+        "  int n = vn;\n"
+        "  int i;\n"
+        "  for (int a[n]; i < 3; i = i + 1) {\n"
+        "    int b[n];\n"          // a BODY VLA — freed each iteration on the back-edge
+        "    b[0] = i;\n"
+        "    a[0] = i;\n"
+        "  }\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    // For each StackRestore, record (its StackSave's scopeId, its block id).
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> restores;
+    int saves = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                MirInstId const id = m.blockInstAt(b, ii);
+                if (m.instOpcode(id) == MirOpcode::StackSave) ++saves;
+                if (m.instOpcode(id) != MirOpcode::StackRestore) continue;
+                auto const rops = m.instOperands(id);
+                ASSERT_EQ(rops.size(), 1u);
+                restores.emplace_back(m.instPayload(rops[0]), b.v);
+            }
+        }
+    }
+    EXPECT_EQ(saves, 2) << "two VLAs (for-init `a` = scopeId 0, body `b` = scopeId 1)";
+    ASSERT_EQ(restores.size(), 2u)
+        << "one back-edge restore (body b) + one loop-exit restore (for-init a)";
+    // Both scopeIds are restored, in different blocks.
+    bool sawForInit = false, sawBody = false;
+    std::uint32_t forInitBlk = 0, bodyBlk = 0;
+    for (auto const& [scopeId, blk] : restores) {
+        if (scopeId == 0u) { sawForInit = true; forInitBlk = blk; }
+        if (scopeId == 1u) { sawBody = true;    bodyBlk = blk; }
+    }
+    EXPECT_TRUE(sawForInit) << "the for-init VLA (scopeId 0) is restored (at the exit)";
+    EXPECT_TRUE(sawBody)    << "the body VLA (scopeId 1) is restored (on the back-edge)";
+    EXPECT_NE(forInitBlk, bodyBlk)
+        << "the for-init and body restores sit in DIFFERENT blocks — the for-init is "
+           "not folded into the body's per-iteration back-edge teardown";
+}
+
+// ── VLA C4a-local (D-CSUBSET-VLA): pointer-to-VLA (runtime pointee row stride) ──
+
+// A LOCAL pointer-to-VLA `int (*p)[n]` freezes its runtime POINTEE row stride at its
+// DECL SITE (a hidden 8-byte slot; CRITICAL-2 — NOT the hoisted 8-byte pointer alloca,
+// where `n` is unread), and a subscript p[i] scales the index by a Load of that slot,
+// never a compile-time Const. `b` is a VLA (so `p` is a genuine ptr-to-VLA) but ONLY
+// `p` is subscripted, so any runtime-stride index Load is p's: scaleIndexToBytes peels
+// p[1]'s root to `p` and looks up (p, int[n]) — the exact slot storePtrToVlaStride wrote.
+// Red-on-disable: revert the capture-gate widening (cst_to_hir) OR the decl-site store
+// (hir_to_mir) → p[1] misses the slot and fails loud at scaleIndexToBytes (:4746, mir
+// not ok). b (int[2][n]) freezes 2 level slots; p (int(*)[n]) adds 1 pointee-stride slot.
+TEST(MirLoweringCSubset, PtrToVlaLocalSubscriptScalesByDeclSiteStrideSlot) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 4;\n"
+        "  int n = vn;\n"
+        "  int b[2][n];\n"
+        "  int (*p)[n];\n"
+        "  p = b;\n"
+        "  p[1][0] = 7;\n"     // ONLY p is subscripted (b is never directly indexed)
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)   // red-on-disable: reverting GAP 2 fails loud here
+        << "a local pointer-to-VLA subscript must lower cleanly (runtime pointee stride): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // (1) the p[1] subscript scales by a RUNTIME stride LOADED from an 8-byte slot,
+    // never a compile-time Const — since only p is subscripted, this is p's slot.
+    EXPECT_TRUE(hasRuntimeStrideIndexLoad(m, entry))
+        << "p[i] must scale by a Load of the decl-frozen pointee-stride slot (a runtime "
+           "stride), NOT a compile-time Const";
+
+    // (2) the pointer adds exactly ONE decl-site pointee-stride slot beyond b's two
+    // level slots (the whole-object int[2][n] + the int[n] row) — the store exists.
+    EXPECT_EQ(countVlaSizeSlots(m, entry), 3)
+        << "int (*p)[n] freezes ONE pointee-stride slot at its decl, added to b's two";
+}
+
+// FAIL-LOUD (deferred): pointer ARITHMETIC on a ptr-to-VLA (`p + j`) is not yet tracked
+// — its arith result flowing into a subscript base is NOT a single VLA root symbol, so
+// scaleIndexToBytes fails loud (:4734) rather than form a bogus stride. Never a silent
+// miscompute. Red-on-disable is intentional: when `p+j` runtime scaling lands, flip this.
+TEST(MirLoweringCSubset, PtrToVlaPointerArithSubscriptFailsLoud) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 3;\n"
+        "  int n = vn;\n"
+        "  int b[2][n];\n"
+        "  int (*p)[n];\n"
+        "  p = b;\n"
+        "  int (*q)[n] = p + 1;\n"   // pointer arithmetic on a ptr-to-VLA (deferred)
+        "  q[0][0] = 7;\n"
+        "  return 0;\n"
+        "}\n");
+    // The front-end accepts it (p+1 is a same-type pointer init); the failure is at the
+    // MIR subscript lowering — a clean fail-loud, never a silent wrong stride.
+    EXPECT_FALSE(L.mir.ok)
+        << "a subscript whose base is a ptr-to-VLA pointer-arithmetic result must fail "
+           "loud (its runtime row stride cannot be recovered from a non-root base)";
+}
+
+// ── VLA C4a-param (D-CSUBSET-VLA): PARAMETER pointer-to-VLA (prologue pointee stride) ──
+
+// A PARAMETER pointer-to-VLA `int (*p)[n]` freezes its runtime POINTEE row stride in the
+// CALLEE PROLOGUE (the entry block, at the param's decl point — `n`, an EARLIER param, is
+// already placed, so there is no decl-vs-hoist hazard), and the body subscript p[i][j]
+// scales by a Load of that slot, never a compile-time Const. The stride slot is a FIXED
+// 8-byte alloca — NO dynamic-stack VLA object — so the callee is NOT leaf-restricted (it may
+// freely call). Red-on-disable: revert the param-loop storePtrToVlaStride (hir_to_mir) OR
+// the paramDecay pointee (semantic) → p[i] misses the slot and fails loud at
+// scaleIndexToBytes (mir not ok).
+TEST(MirLoweringCSubset, ParamPtrToVlaSubscriptScalesByPrologueStrideSlot) {
+    auto L = lowerCSubset(
+        "int g(int n, int (*p)[n]) { p[1][0] = 7; return 0; }\n"
+        "int main(void) { return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)   // red-on-disable: reverting the param stride store fails loud here
+        << "a parameter pointer-to-VLA subscript must lower cleanly (runtime pointee stride): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    ASSERT_GE(m.moduleFuncCount(), 1u);
+    // Find the callee g (the function whose entry carries a runtime-stride index Load);
+    // main has no subscript, so only g qualifies.
+    bool anyRuntimeStride = false;
+    int  gStrideSlots = 0;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        MirBlockId const entry = m.funcEntry(m.funcAt(f));
+        if (hasRuntimeStrideIndexLoad(m, entry)) {
+            anyRuntimeStride = true;
+            gStrideSlots = countVlaSizeSlots(m, entry);
+        }
+    }
+    EXPECT_TRUE(anyRuntimeStride)
+        << "the callee's p[i][j] must scale by a Load of the prologue-frozen pointee-stride "
+           "slot (a runtime stride), NOT a compile-time Const";
+    // Exactly ONE prologue-frozen pointee-stride slot — and NO runtime-operand (dynamic-
+    // stack) Alloca: a ptr-to-VLA PARAM carries a fixed 8-byte slot, never a VLA object.
+    EXPECT_EQ(gStrideSlots, 1)
+        << "a ptr-to-VLA PARAM freezes exactly ONE pointee-stride slot in the prologue";
 }

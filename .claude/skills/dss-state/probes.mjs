@@ -31,6 +31,14 @@ export const CATEGORIES = {
   preprocessor:  { label: 'Preprocessor',                         sqliteWeight: 20 },
   ffi:           { label: 'libc FFI (shipped headers)',           sqliteWeight: 4 },
   modern:        { label: 'C11/C23 modern surface',               sqliteWeight: 0 },
+  // Plan-23 FC17.9 — the full-C23 completeness tier (PROMOTED into scope
+  // 2026-07-14: 100% C23 BEFORE FC18, the DSS Axis substrate mandate; these were
+  // the §3.2 "named exclusions"). Tracked HERE as loud red gaps (the DSS Axis
+  // foundation). Weight 0: SQLite uses none, so readiness is unaffected — but the
+  // empirical-battery denominator IS, on purpose. Each flips green the cycle its
+  // feature lands (FC17.9 order: threads→stdbit→setjmp→atomics→long double→
+  // complex→tgmath→embed→asm).
+  c23_advanced:  { label: 'C23 advanced tier / FC17.9 (atomics/complex/tgmath/…)', sqliteWeight: 0 },
 };
 
 // Canonical known-good program used for the cross-target emit/run matrix.
@@ -1192,6 +1200,119 @@ int main() {
     int a[n];
     a[0] = 42;
     return a[0];
+}
+` },
+
+  // ───── C23 advanced tier — plan-23 FC17.9 (the promoted §3.2 exclusions) ─────
+  // The full-C23 completeness tier — the substrate DSS Axis will stand on
+  // (PROMOTED into FC17.9 on 2026-07-14: 100% C23 before FC18, no longer scoped
+  // out of "C23 as mainstream compilers implement it"). A loud red gap until its arc lands,
+  // then flips green. Values are exact (no precision/edge sensitivity) so a probe
+  // either cleanly PASSES (feature present) or cleanly REJECTS (feature absent) —
+  // never a spurious miscompile. `_Atomic` qualifier is split from <stdatomic.h>
+  // because the qualifier may be accepted long before real atomics + ordering.
+
+  // _Atomic type qualifier (C11) — language-level; may go green before real atomics.
+  { id: 'c23_atomic_qualifier', cat: 'c23_advanced', expect: 42, src:
+`int main() {
+    _Atomic int x;
+    x = 42;
+    return x;
+}
+` },
+  // <stdatomic.h> + explicit memory ordering — the real "atomics with ordering" test.
+  { id: 'c11_stdatomic_order', cat: 'c23_advanced', expect: 42, src:
+`#include <stdatomic.h>
+
+int main() {
+    atomic_int x;
+    atomic_store_explicit(&x, 42, memory_order_relaxed);
+    return atomic_load_explicit(&x, memory_order_seq_cst);
+}
+` },
+  // _Complex + <complex.h> — creal(40+2i)=40, cimag=2.
+  { id: 'c99_complex_arith', cat: 'c23_advanced', expect: 42, src:
+`#include <complex.h>
+
+int main() {
+    double _Complex z;
+    z = 40.0 + 2.0 * I;
+    return (int)creal(z) + (int)cimag(z);
+}
+` },
+  // <tgmath.h> type-generic dispatch — sqrt on a float must select sqrtf; 42^2=1764.
+  { id: 'c99_tgmath_generic', cat: 'c23_advanced', expect: 42, src:
+`#include <tgmath.h>
+
+int main() {
+    float x;
+    x = 1764.0f;
+    return (int)sqrt(x);
+}
+` },
+  // #embed (C23) — the companion byte file (aux, NOT compiled) holds '*' = 0x2A = 42.
+  { id: 'c23_embed', cat: 'c23_advanced', expect: 42, aux: { 'embed_answer.bin': '*' }, src:
+`int main() {
+    static const unsigned char answer[] = {
+#embed "embed_answer.bin"
+    };
+    return answer[0];
+}
+` },
+  // long double — acceptance + the L suffix (20+22=42, exact in any format, so no
+  // precision-divergence miscompile). Real 80/128-bit divergence is an ABI matter.
+  { id: 'c_long_double', cat: 'c23_advanced', expect: 42, src:
+`int main() {
+    long double x;
+    x = 20.0L;
+    x = x + 22.0L;
+    return (int)x;
+}
+` },
+  // setjmp/longjmp — non-local control flow; longjmp(env,42) makes setjmp return 42.
+  { id: 'c_setjmp_longjmp', cat: 'c23_advanced', expect: 42, src:
+`#include <setjmp.h>
+
+int main() {
+    jmp_buf env;
+    int r;
+    r = setjmp(env);
+    if (r == 0) { longjmp(env, 42); }
+    return r;
+}
+` },
+  // Inline asm — acceptance of the asm statement (empty template = host-agnostic,
+  // no arch-specific instruction, no miscompile risk); real codegen is per-target.
+  { id: 'c_inline_asm', cat: 'c23_advanced', expect: 42, src:
+`int main() {
+    int x;
+    x = 42;
+    __asm__ volatile ("");
+    return x;
+}
+` },
+  // <stdbit.h> (C23) — popcount(255) = 8, + 34 = 42.
+  { id: 'c23_stdbit_popcount', cat: 'c23_advanced', expect: 42, src:
+`#include <stdbit.h>
+
+int main() {
+    unsigned int x;
+    x = 255u;
+    return (int)stdc_count_ones(x) + 34;
+}
+` },
+  // <threads.h> (C11) — PROMOTED into scope, lands before FC18. Deterministic
+  // mutex round-trip (no thread scheduling) so it's a clean pass the cycle it lands.
+  { id: 'c11_threads_mutex', cat: 'c23_advanced', expect: 42, src:
+`#include <threads.h>
+
+int main() {
+    mtx_t m;
+    mtx_init(&m, mtx_plain);
+    mtx_lock(&m);
+    mtx_unlock(&m);
+    mtx_destroy(&m);
+    return 42;
 }
 ` },
 ];

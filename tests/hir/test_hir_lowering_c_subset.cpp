@@ -2127,6 +2127,70 @@ TEST(HirLoweringCSubset, GotoAndLabelLowerCleanAndTerminateViaLabel) {
     EXPECT_EQ(countCode(r2, DiagnosticCode::H_VerifierFailure), 0u);
 }
 
+// VLA C5 (D-CSUBSET-VLA, C99 6.8.6.1p1): a `goto` that jumps INTO the scope of a
+// variable-length array, bypassing its declaration, is FAILED LOUD at HIR verify
+// (H_VlaJumpIntoScope). `goto L` sits BEFORE `int a[n]`; `L:` sits AFTER it, so
+// arriving at L skips the array's runtime allocation — undefined storage. This is
+// ALSO the dominance guarantor for the C5 teardown. Red-on-disable: drop
+// checkVlaJumpScoping and this compiles (a silent jump into unallocated dynamic
+// stack). A LEGAL goto OUT of a VLA scope stays clean (asserted second).
+TEST(HirLoweringCSubset, GotoIntoVlaScopeFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int main(void){ volatile int vn = 4; int n = vn;\n"
+        "  goto L;\n"
+        "  int a[n];\n"
+        "  L: a[0] = 1;\n"
+        "  return a[0]; }");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok)
+        << "a goto into a VLA scope past its decl must fail HIR verification";
+    EXPECT_GE(countCode(r, DiagnosticCode::H_VlaJumpIntoScope), 1u)
+        << "the C99 6.8.6.1 jump-into-VLA-scope ban must fire";
+
+    // A LEGAL goto OUT of a VLA scope (the array is declared BEFORE the goto and the
+    // label) does NOT trip the ban — it is torn down, not entered.
+    SemanticModel ok = analyzeCSubset(
+        "int main(void){ volatile int vn = 4; int n = vn;\n"
+        "  int a[n];\n"
+        "  a[0] = 1;\n"
+        "  goto L;\n"
+        "  L: return a[0]; }");
+    ASSERT_FALSE(ok.hasErrors())
+        << (ok.diagnostics().all().empty() ? "" : ok.diagnostics().all()[0].actual);
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(ok, r2);
+    EXPECT_EQ(countCode(r2, DiagnosticCode::H_VlaJumpIntoScope), 0u)
+        << "a goto that stays within (or exits) a VLA scope is legal";
+}
+
+// VLA C5 (D-CSUBSET-VLA): a computed `goto *expr` (GNU IndirectGotoStmt) LEXICALLY
+// inside a VLA scope has a runtime target set — no single SP-restore watermark is
+// provable — so it FAILS LOUD at HIR verify (H_VlaComputedGotoInScope). The label
+// `L` is OUTSIDE any VLA scope, so `&&L` is fine; only the `goto *p` inside the VLA
+// block trips. Red-on-disable: drop the IndirectGotoStmt arm and it compiles.
+TEST(HirLoweringCSubset, ComputedGotoInsideVlaScopeFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int main(void){ volatile int vn = 4; int n = vn;\n"
+        "  void *p = &&L;\n"
+        "  {\n"
+        "    int a[n];\n"
+        "    a[0] = 1;\n"
+        "    goto *p;\n"
+        "  }\n"
+        "  L: return 0; }");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok)
+        << "a computed goto inside a VLA scope must fail HIR verification";
+    EXPECT_GE(countCode(r, DiagnosticCode::H_VlaComputedGotoInScope), 1u)
+        << "the computed-goto-in-VLA-scope ban must fire";
+}
+
 // FC5 (audit MUST-FIX 2) — the dead-code scan must NOT flag a goto's TARGET label
 // as unreachable: `goto X; X: …` is the universal cleanup idiom and the label is
 // manifestly reachable. But a genuinely-dead NON-label statement after a goto
@@ -2264,9 +2328,12 @@ TEST(HirLoweringCSubset, NestedInnerBreakDoesNotDeInfiniteOuterLoop) {
 }
 
 TEST(HirLoweringCSubset, NonConstantArrayLengthFailsLoud) {
-    // `int a[n]` (variable length) must NOT silently decay or assume a length —
-    // the semantic phase emits S_NonConstantArrayLength.
-    SemanticModel model = analyzeCSubset("void f(int n) { int a[n]; }");
+    // VLA C1a (D-CSUBSET-VLA): a FILE-scope non-constant length must NOT silently
+    // decay or assume a length — the semantic phase emits S_NonConstantArrayLength (a
+    // file-scope array needs a constant bound; it is NOT a VLA). A BLOCK-scope
+    // `int a[n]` is now a VLA (accepted at semantic, fails loud at the MIR->LIR C1b
+    // boundary — see the mir/lir VLA pins).
+    SemanticModel model = analyzeCSubset("int n;\nint g[n];");
     EXPECT_TRUE(model.hasErrors());
 }
 
@@ -3824,11 +3891,15 @@ TEST(HirLoweringCSubset, CstConstEval_LogicalOrShortCircuits) {
 // Cycle detection: `const int a = b + 0; const int b = a + 0;` is a
 // genuine cycle. The engine refuses with NotAConstantExpression at
 // the second encounter; caller emits S_NonConstantArrayLength.
+// VLA C1a (D-CSUBSET-VLA): the array is pinned at FILE scope so the non-foldable
+// (cyclic) bound stays S_NonConstantArrayLength — the const-eval-cycle refusal is
+// preserved. A block-scope `int xs[a + 1]` would become a VLA (fails at the LIR C1b
+// boundary); this keeps the cycle-detection intent.
 TEST(HirLoweringCSubset, CstConstEval_CycleRefuses) {
     SemanticModel model = analyzeCSubset(
         "const int a = b + 0;\n"
         "const int b = a + 0;\n"
-        "void f() { int xs[a + 1]; }\n");
+        "int xs[a + 1];\n");
     bool found = false;
     for (auto const& d : model.diagnostics().all()) {
         if (d.code == DiagnosticCode::S_NonConstantArrayLength) {
@@ -3875,9 +3946,12 @@ TEST(HirLoweringCSubset, CstConstEval_TransitiveConstRef) {
 // Division by zero in a const-expr: `int xs[1/0];` — the engine
 // refuses with DivisionByZero (caller maps to S_NonConstantArrayLength
 // since array length doesn't have a dedicated div-by-zero diagnostic).
+// VLA C1a (D-CSUBSET-VLA): pinned at FILE scope so the div-by-zero const-expr stays
+// S_NonConstantArrayLength (a block-scope `int xs[1/0]` would become a VLA that
+// fails at the LIR C1b boundary; the div-by-zero-refusal intent is preserved here).
 TEST(HirLoweringCSubset, CstConstEval_DivByZeroRefuses) {
     SemanticModel model = analyzeCSubset(
-        "void f() { int xs[1/0]; }\n");
+        "int xs[1/0];\n");
     bool found = false;
     for (auto const& d : model.diagnostics().all()) {
         if (d.code == DiagnosticCode::S_NonConstantArrayLength) {
@@ -3956,23 +4030,42 @@ TEST(HirLoweringCSubset, CstConstEval_TernaryFolds) {
         << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
 }
 
-// Mutable ref still refuses: `int n = 1; int xs[n+1];` emits
-// S_NonConstantArrayLength because `n` is NOT `isConst`. The engine
-// correctly walks the scope chain, finds `n`, sees it's mutable, and
-// refuses — preserving the locked-in NonLiteralIndexDesignatorEmitsDiag
-// test for the design-time case where a programmer used a runtime
-// variable in a const-expr slot.
-TEST(HirLoweringCSubset, CstConstEval_MutableRefRefuses) {
+// VLA C1a (D-CSUBSET-VLA): a BLOCK-scope array whose bound is a mutable runtime
+// integer (`int n = 1; int xs[n + 1];`) is EXACTLY a variable-length array — the
+// const-eval correctly declines to fold `n` (it is not `isConst`), and at block
+// scope that non-constant integer bound is now a VLA (accepted at semantic; the
+// runtime alloca fails loud at the MIR->LIR C1b boundary). It no longer emits
+// S_NonConstantArrayLength. (Pre-VLA this was a reject; the feature reclassifies a
+// runtime-int array bound as a VLA.)
+TEST(HirLoweringCSubset, CstConstEval_MutableRefIsVla) {
     SemanticModel model = analyzeCSubset(
         "void f() { int n = 1; int xs[n + 1]; }\n");
+    EXPECT_FALSE(model.hasErrors())
+        << "a runtime-int array bound is a valid VLA, accepted at semantic";
     bool foundDiag = false;
     for (auto const& d : model.diagnostics().all()) {
         if (d.code == DiagnosticCode::S_NonConstantArrayLength) {
             foundDiag = true; break;
         }
     }
-    EXPECT_TRUE(foundDiag)
-        << "mutable ref `n` must refuse to fold and emit S_NonConstantArrayLength";
+    EXPECT_FALSE(foundDiag)
+        << "a block-scope runtime-int bound is a VLA, not S_NonConstantArrayLength";
+}
+
+// VLA C1a (D-CSUBSET-VLA, C 6.7.6.2p1): a `_BitInt(N)` bound is a LEGAL VLA size
+// (BitInt is an integer kind) — accepted at semantic, NOT S_VlaSizeNotInteger. It
+// fails loud only at the MIR->LIR C1b boundary, like any VLA. RED-ON-DISABLE: drop
+// BitInt from `isVlaSizeIntegerType` and this VLA wrongly errors as a non-integer
+// size.
+TEST(HirLoweringCSubset, VlaBitIntBoundIsAcceptedNotSizeError) {
+    SemanticModel model = analyzeCSubset(
+        "void f() { unsigned _BitInt(20) n; int a[n]; }\n");
+    EXPECT_FALSE(model.hasErrors())
+        << "a _BitInt VLA bound is a valid integer size, accepted at semantic";
+    for (auto const& d : model.diagnostics().all()) {
+        EXPECT_NE(d.code, DiagnosticCode::S_VlaSizeNotInteger)
+            << "a _BitInt bound is an integer VLA size, not S_VlaSizeNotInteger";
+    }
 }
 
 // ── D5.4 unions ──────────────────────────────────────────────────────

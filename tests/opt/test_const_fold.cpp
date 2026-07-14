@@ -191,6 +191,39 @@ TEST(ConstFold, DoesNotFoldWhenOperandIsArg) {
     EXPECT_EQ(ret.op, MirOpcode::Add);
 }
 
+// I3 (D-CSUBSET-BITINT): the ConstFold pass MUST NOT fold a `_BitInt`-typed
+// instruction. Its int64 helpers have no mod-2^N wrap, so folding
+// `(unsigned _BitInt(4))9 + (unsigned _BitInt(4))9` via applyBinaryInt would yield
+// an UN-wrapped 18 — the correct bit-precise result is 18 mod 16 == 2. The pass
+// bails on the BitInt result type; the Add survives (the wrap-aware fold lives in
+// the HIR/CST const-eval, not here). Pin: instructionsFolded == 0, the return
+// operand is still an Add. (The explicit tryFold guard + normalizeToType's
+// intKindInfo-nullopt bail are BOTH walls here — this pins the combined invariant.)
+TEST(ConstFold, DoesNotFoldBitIntArithmetic) {
+    TypeInterner interner{CompilationUnitId{1}};
+    BuildResult br;
+    TypeId const bt = interner.bitInt(4, /*isSigned=*/false);
+    br.i32   = interner.primitive(TypeKind::I32);
+    br.fnSig = interner.fnSig({}, bt, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(br.fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirLiteralValue va; va.value = std::int64_t{9}; va.core = TypeKind::BitInt;
+    MirLiteralValue vb; vb.value = std::int64_t{9}; vb.core = TypeKind::BitInt;
+    MirInstId const ops[] = {mb.addConst(va, bt), mb.addConst(vb, bt)};
+    mb.addReturn(mb.addInst(MirOpcode::Add, ops, bt));
+    br.mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runConstFold(br.mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.instructionsFolded, 0u) << "a _BitInt Add must NOT const-fold (I3)";
+    auto const ret = inspectReturnOperand(br.mir);
+    EXPECT_EQ(ret.op, MirOpcode::Add) << "the _BitInt Add must survive unfolded";
+    EXPECT_FALSE(ret.isConst);
+}
+
 // Div-by-zero MUST defer to runtime (folding would introduce a trap
 // that the unoptimized path doesn't have). Pin: the SDiv(7, 0) is
 // preserved as an SDiv, not folded.

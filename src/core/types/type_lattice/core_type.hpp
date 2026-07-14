@@ -73,6 +73,23 @@ enum class TypeKind : std::uint16_t {
     // pre-existing kind keeps its integer value — see the VolatileQual note above.
     NullptrT,
 
+    // ── C23 _BitInt(N) bit-precise integer (D-CSUBSET-BITINT / C23 §6.2.5) ──
+    // A bit-precise signed/unsigned integer of an EXACT programmer-chosen width N.
+    // Carries `scalars=[N, signed]` (N in bits; signed = 1 for `_BitInt`/`signed
+    // _BitInt`, 0 for `unsigned _BitInt`) — NOT a distinct kind per signedness
+    // (signedness never lives in the kind for any integer). Distinct from the
+    // standard I*/U* ranks: `_BitInt(N)` does NOT integer-PROMOTE (C23 §6.3.1.1 —
+    // its rank sits between adjacent standard widths), so `_BitInt(4)+_BitInt(4)`
+    // is `_BitInt(4)`, and arithmetic WRAPS mod-2^N (masked by construction at the
+    // MIR value-materialization boundary). The width tier projects a `_BitInt(N≤64)`
+    // to its signed/unsigned native CONTAINER kind (I8/I16/I32/I64 by size) via
+    // `reprKind`/`bitIntContainerKind` — the enum→underlying projection precedent —
+    // so `requireNativeIntWidth`/`widthFlagsForType` see a native kind and the
+    // masking reuses the bit-field extract/insert shift+mask primitive. Appended
+    // AFTER NullptrT (before Count_) so every pre-existing kind keeps its integer
+    // value — the VolatileQual/NullptrT placement precedent.
+    BitInt,
+
     Count_  // keep last — counts the core members
 };
 
@@ -89,6 +106,18 @@ inline constexpr std::uint32_t kFirstExtensionKind = 256;
 // (which is >= 0; the semantic phase rejects 0/negative declared lengths, so -1
 // can never collide with a user-written array length).
 inline constexpr std::int64_t kIncompleteArrayLength = -1;
+
+// VLA C1a (D-CSUBSET-VLA): the length-scalar sentinel marking a kind=Array as a
+// VARIABLE-LENGTH array (C99/C11 §6.7.6.2 `int a[n]` with a runtime bound).
+// DISTINCT from `kIncompleteArrayLength` (-1, a FAM) — a VLA has a real (runtime)
+// size that is NOT known at compile time, so it carries no static layout
+// (`computeLayout` already nullopts on any negative length scalar) but is a
+// COMPLETE object type. All VLAs of the same element dedup to one TypeId (the
+// per-declaration runtime bound lives OUT-OF-BAND in a size side-table, NOT on the
+// type — the incomplete-array precedent, Fork A1). Like -1 it can never collide
+// with a user-written length (the semantic phase rejects 0/negative declared
+// constant lengths).
+inline constexpr std::int64_t kVlaLength = -2;
 
 // FC8 bitfields (D-CSUBSET-BITFIELD): the per-field bitfield-width sentinel
 // marking an ORDINARY (non-bitfield) struct field in `structType`'s

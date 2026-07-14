@@ -82,6 +82,16 @@ private:
     // Emits I_SehStructure. Zero-cost when the module has no SehTryBegin.
     void checkSehStructure(DiagnosticReporter& reporter) const;
 
+    // VLA C5 (D-CSUBSET-VLA): the block-scope stack-teardown pairing rule —
+    // every `StackRestore`'s operand[0] must be a `StackSave`, and its scopeId
+    // payload must equal that StackSave's payload. The generic SSA dominance check
+    // (checkDomination) already enforces that the StackSave dominates each restore
+    // (it is a value operand); this adds the STRUCTURAL pairing the flat IR cannot
+    // otherwise express. NOT a coverage claim ("every exit edge covered") — the
+    // flattened CFG can't support that; pairing + dominance is the provable check
+    // (audit fix #6). Emits I_VlaStackRestorePairing. Zero-cost when no StackSave.
+    void checkVlaStackTeardown(DiagnosticReporter& reporter) const;
+
     // SSA invariant: every value operand is defined in a block that
     // DOMINATES the use site (or in the same block, with the def
     // preceding the use). Computes dominator tree via Cooper-Harvey-

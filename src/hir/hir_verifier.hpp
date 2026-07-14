@@ -173,6 +173,15 @@ private:
     // Zero-cost when the module has no SehTryExcept node.
     void checkSehContext(DiagnosticReporter& reporter) const;
 
+    // VLA C5 (D-CSUBSET-VLA): the variably-modified-scope jump rules (C99 6.8.6.1p1)
+    // — no `goto`/switch-case/`&&label` INTO a VLA scope past its declaration
+    // (H_VlaJumpIntoScope), and no computed `goto *` inside a VLA scope
+    // (H_VlaComputedGotoInScope). The entry-side ban is ALSO the dominance guarantor
+    // for the HIR→MIR block-scope teardown: it makes every legal goto's restore-
+    // target StackSave dominate the goto. Interner-gated (needs `isVlaArray`);
+    // zero-cost when the function has no VLA local. Mirrors the SEH ancestor-walk.
+    void checkVlaJumpScoping(DiagnosticReporter& reporter) const;
+
     // Declaration structure (HR4): a `Function`'s last child is its body `Block`
     // and its other children are parameter `VarDecl`s with no initializer; an
     // `ExternFunction` has no body `Block` and only parameter `VarDecl`s. Each

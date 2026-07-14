@@ -14,6 +14,7 @@ dss_add_test(NAME core/test_unsuppressable_codes SOURCES test_unsuppressable_cod
 dss_add_test(NAME core/test_grammar_schema      SOURCES test_grammar_schema.cpp)
 dss_add_test(NAME core/test_target_schema       SOURCES test_target_schema.cpp)
 dss_add_test(NAME core/test_number_decode       SOURCES test_number_decode.cpp)
+dss_add_test(NAME core/test_bit_int_value       SOURCES test_bit_int_value.cpp)
 dss_add_test(NAME core/test_tree_builder        SOURCES test_tree_builder.cpp)
 dss_add_test(NAME core/test_tree_cursor         SOURCES test_tree_cursor.cpp)
 dss_add_test(NAME core/test_tree_node           SOURCES test_tree_node.cpp)

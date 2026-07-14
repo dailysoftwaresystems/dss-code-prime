@@ -81,7 +81,7 @@ rule:root
           rule:declarator
             rule:directDeclarator
               tok:"square"
-              rule:fnSuffix
+              rule:fnSuffixTail
                 tok:"("
                 rule:paramList
                   rule:param
@@ -117,7 +117,7 @@ rule:root
           rule:declarator
             rule:directDeclarator
               tok:"add"
-              rule:fnSuffix
+              rule:fnSuffixTail
                 tok:"("
                 rule:paramList
                   rule:param
@@ -162,7 +162,7 @@ rule:root
           rule:declarator
             rule:directDeclarator
               tok:"max3"
-              rule:fnSuffix
+              rule:fnSuffixTail
                 tok:"("
                 rule:paramList
                   rule:param
@@ -281,7 +281,7 @@ rule:root
           rule:declarator
             rule:directDeclarator
               tok:"sum_array"
-              rule:fnSuffix
+              rule:fnSuffixTail
                 tok:"("
                 rule:paramList
                   rule:param
@@ -404,7 +404,7 @@ rule:root
           rule:declarator
             rule:directDeclarator
               tok:"fact"
-              rule:fnSuffix
+              rule:fnSuffixTail
                 tok:"("
                 rule:paramList
                   rule:param
@@ -474,7 +474,7 @@ rule:root
           rule:declarator
             rule:directDeclarator
               tok:"fib"
-              rule:fnSuffix
+              rule:fnSuffixTail
                 tok:"("
                 rule:paramList
                   rule:param
@@ -555,7 +555,7 @@ rule:root
           rule:declarator
             rule:directDeclarator
               tok:"abs_int"
-              rule:fnSuffix
+              rule:fnSuffixTail
                 tok:"("
                 rule:paramList
                   rule:param
@@ -612,7 +612,7 @@ rule:root
           rule:declarator
             rule:directDeclarator
               tok:"bit_count"
-              rule:fnSuffix
+              rule:fnSuffixTail
                 tok:"("
                 rule:paramList
                   rule:param
@@ -751,7 +751,7 @@ rule:root
           rule:declarator
             rule:directDeclarator
               tok:"load_indirect"
-              rule:fnSuffix
+              rule:fnSuffixTail
                 tok:"("
                 rule:paramList
                   rule:param
@@ -785,7 +785,7 @@ rule:root
           rule:declarator
             rule:directDeclarator
               tok:"min"
-              rule:fnSuffix
+              rule:fnSuffixTail
                 tok:"("
                 rule:paramList
                   rule:param
@@ -849,7 +849,7 @@ rule:root
           rule:declarator
             rule:directDeclarator
               tok:"clamp"
-              rule:fnSuffix
+              rule:fnSuffixTail
                 tok:"("
                 rule:paramList
                   rule:param
@@ -925,7 +925,7 @@ rule:root
           rule:declarator
             rule:directDeclarator
               tok:"saturating_add"
-              rule:fnSuffix
+              rule:fnSuffixTail
                 tok:"("
                 rule:paramList
                   rule:param
@@ -1047,7 +1047,7 @@ rule:root
           rule:declarator
             rule:directDeclarator
               tok:"compose_calc"
-              rule:fnSuffix
+              rule:fnSuffixTail
                 tok:"("
                 rule:paramList
                   rule:param
@@ -1203,7 +1203,7 @@ rule:root
           rule:declarator
             rule:directDeclarator
               tok:"main"
-              rule:fnSuffix
+              rule:fnSuffixTail
                 tok:"("
                 tok:")"
       rule:topLevelDeclTail

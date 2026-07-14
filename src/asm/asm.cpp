@@ -1184,6 +1184,25 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             continue;
         }
 
+        // C4b (I5, D-CSUBSET-BITINT-DATA-GLOBAL): a const-folded `_BitInt` value
+        // reaching a DATA-global initializer is a DEFERRAL boundary — the on-disk
+        // byte layout of a `_BitInt` global (wide multi-limb, and a narrow one for
+        // uniformity) is not yet emitted. FAIL LOUD rather than emit wrong / zero
+        // bytes: the value folds correctly (C4b), but its GLOBAL byte-emission waits.
+        // Placed BEFORE the scalar arm (whose `scalarByteSize` would otherwise
+        // mis-handle a `_BitInt` TypeKind), the same dispatch-order discipline the
+        // string / aggregate arms follow.
+        if (std::holds_alternative<BitIntValue>(v.value)) {
+            emit(DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("lowerMirGlobalsToDataItems: global SymbolId={{ {} }} has "
+                             "a const-folded `_BitInt` initializer — `_BitInt` "
+                             "DATA-globals are not yet emitted "
+                             "(D-CSUBSET-BITINT-DATA-GLOBAL); the value folds correctly "
+                             "but its global byte layout is deferred.",
+                             sym.v));
+            continue;
+        }
+
         // Scalar arm: encode the variant's u64/i64/bool value as LE bytes
         // sized by the type. Width comes from `scalarByteSize` — the SAME
         // sizing chokepoint the aggregate-member leaf recursion uses (a strict

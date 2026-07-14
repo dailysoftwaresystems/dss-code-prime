@@ -686,6 +686,18 @@ struct DSS_EXPORT TargetCallingConvention {
     // target (operand-stack VMs).
     std::optional<NamedRegisterRef> stackPointer;
 
+    // D-CSUBSET-VLA (C1b): frame-pointer register (x86_64 rbp / arm64 x29).
+    // ENGAGED only for a target that supports variable-length-array (dynamic-
+    // stack) codegen. When a function contains a VLA, the callconv pass reserves
+    // this register (excluded from the regalloc pool + force-saved in the prologue)
+    // as a stable frame BASE captured at the fixed-frame bottom, so every fixed-
+    // frame reference (spills, fixed locals, incoming stack args) stays addressable
+    // after the runtime `sub sp,<vlaSize>` moves SP. EMPTY ⇒ the target declares no
+    // frame-pointer role; a VLA then stays fail-loud (L_VlaDynamicAllocaUnsupported)
+    // rather than silently miscompiling. A NON-VLA function never consults it — its
+    // frame stays SP-relative + byte-identical (the zero-blast-radius invariant).
+    std::optional<NamedRegisterRef> framePointer;
+
     // D-LANG-VARIADIC (step 13.4, 2026-06-02): the register the caller
     // MUST load with the count of vector (FPR) arguments passed in
     // vector registers BEFORE the call instruction of any C-style

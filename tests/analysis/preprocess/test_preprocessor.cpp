@@ -1973,14 +1973,13 @@ TEST(Preprocessor, FC15bStdcConstants) {
     }
 }
 
-// FC17.5 (D-CSUBSET-VLA): `__STDC_NO_VLA__` is DEFINED (= 1). C11 6.10.8.3 /
-// C23 6.10.9.3 REQUIRE an implementation without variable-length-array support
-// to define it — DSS has no VLA support (a runtime array bound fails loud,
-// S_NonConstantArrayLength), so declaring the macro is the conformance-honest
-// line: a conforming program's `#ifdef __STDC_NO_VLA__` now selects its
-// fixed-size fallback instead of tripping the fail-loud gate. RED-ON-DISABLE:
-// drop the predefinedMacros row → `#ifdef` selects the else arm.
-TEST(Preprocessor, FC175StdcNoVlaDefined) {
+// D-CSUBSET-VLA C1b (2026-07-13): VLA support LANDED (`int a[n]` now RUNS —
+// dynamic-stack `sub sp,<size>` + a conditional frame pointer), so `__STDC_NO_VLA__`
+// is REMOVED from the predefinedMacros — a VLA-SUPPORTING implementation must NOT
+// define it (C11 6.10.8.3 / C23 6.10.9.3). This is the FLIP of the fail-loud-era
+// FC175StdcNoVlaDefined pin. RED-ON-DISABLE: re-add the predefinedMacros row → the
+// `#ifdef` selects the no_vla arm again (a conformance lie for a VLA-capable impl).
+TEST(Preprocessor, VlaSupportedStdcNoVlaUndefined) {
     {
         PreprocessResult r;
         auto lexs = ppLexemes(
@@ -1988,16 +1987,17 @@ TEST(Preprocessor, FC175StdcNoVlaDefined) {
             r);
         EXPECT_FALSE(r.diagnostics->hasErrors());
         ASSERT_EQ(lexs.size(), 3u)
-            << "__STDC_NO_VLA__ must be defined -> the no_vla arm";
-        EXPECT_EQ(lexs[1], "no_vla");
+            << "__STDC_NO_VLA__ must be UNDEFINED (VLA supported) -> the has_vla arm";
+        EXPECT_EQ(lexs[1], "has_vla");
     }
     {
         PreprocessResult r;
         auto lexs = ppLexemes("int v = __STDC_NO_VLA__;\n", r);
         EXPECT_FALSE(r.diagnostics->hasErrors());
         ASSERT_EQ(lexs.size(), 5u);
-        EXPECT_EQ(lexs[3], "1")
-            << "__STDC_NO_VLA__ materializes its config value 1";
+        // Undefined object-like macro in a non-#if context stays a bare identifier.
+        EXPECT_EQ(lexs[3], "__STDC_NO_VLA__")
+            << "__STDC_NO_VLA__ is no longer a predefined macro -> not replaced";
     }
 }
 
@@ -2228,12 +2228,14 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     auto c = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(c.has_value());
     auto const& pms = (*c)->preprocess().predefinedMacros;
-    // 9 ungated (the 7 C 6.10.8 core + the FC17.5 `__STDC_NO_VLA__`
-    // conformance line, D-CSUBSET-VLA, + the TLS C1 `__STDC_NO_THREADS__`
-    // line, D-CSUBSET-THREAD-LOCAL — <threads.h> is never shipped) + 10
-    // pe-gated = 19: the c95 Windows selection
-    // (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the c105
-    // MSVC-profile flip (_MSC_VER/__int64/__forceinline/__declspec).
+    // 9 ungated (the 7 C 6.10.8 core + the TLS C1 `__STDC_NO_THREADS__` line,
+    // D-CSUBSET-THREAD-LOCAL — <threads.h> is never shipped, + the `_BitInt` C1
+    // `__BITINT_MAXWIDTH__` line, D-CSUBSET-BITINT — C23 6.2.5, the mandatory
+    // bit-precise max width 8388608) + 10 pe-gated = 19: the c95 Windows selection
+    // (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the c105 MSVC-profile
+    // flip (_MSC_VER/__int64/__forceinline/__declspec). D-CSUBSET-VLA C1b REMOVED
+    // `__STDC_NO_VLA__` (VLA is now supported — a VLA-capable impl must not define
+    // it), dropping the ungated count from 10 to 9.
     EXPECT_EQ(pms.size(), 19u)
         << "c-subset declares 9 un-gated + 10 pe-gated Windows predefined macros";
     std::size_t ungated = 0;
@@ -2250,9 +2252,9 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
         }
     }
     EXPECT_EQ(ungated, 9u)
-        << "the 7 C 6.10.8 macros + __STDC_NO_VLA__ (FC17.5) + "
-           "__STDC_NO_THREADS__ (TLS C1) are un-gated "
-           "(available on every format)";
+        << "the 7 C 6.10.8 macros + __STDC_NO_THREADS__ (TLS C1) + "
+           "__BITINT_MAXWIDTH__ (_BitInt C1) are un-gated (every format); "
+           "__STDC_NO_VLA__ was removed by D-CSUBSET-VLA C1b (VLA supported)";
     EXPECT_EQ(peGated, 10u)
         << "_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI (c95) + "
            "_MSC_VER/__int64/__forceinline/__declspec (c105) are pe-gated";

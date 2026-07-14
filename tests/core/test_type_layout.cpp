@@ -1125,3 +1125,75 @@ TEST(TypeLayout, VolatileQualifierDoesNotChangeLayout) {
     EXPECT_EQ(layoutOf(va, ti).size, layoutOf(a, ti).size);
     EXPECT_EQ(layoutOf(va, ti).size, 16u);
 }
+
+// ── C23 _BitInt(N) ABI (D-CSUBSET-BITINT) — witnessed vs clang-19 x86-64 psABI ──
+
+TEST(TypeLayout, BitIntSizeAndAlign) {
+    auto ti = makeInterner(70);
+    struct Case { std::int64_t n; bool sgned; std::uint64_t size; std::uint32_t align; };
+    // N<=64 → smallest {1,2,4,8}B container, align == size. N>64 → ceil(N/64) eight-
+    // bytes, align 8 (the _BitInt(128) size-16 / align-8 quirk). Matches clang-19.
+    for (Case const c : {
+             Case{4,  true,  1, 1}, Case{4,  false, 1, 1},
+             Case{8,  false, 1, 1}, Case{9,  false, 2, 2},
+             Case{16, true,  2, 2}, Case{17, true,  4, 4},
+             Case{32, false, 4, 4}, Case{33, true,  8, 8},
+             Case{40, false, 8, 8}, Case{64, true,  8, 8},
+             Case{128, true, 16, 8}, Case{200, false, 32, 8}}) {
+        auto const l = layoutOf(ti.bitInt(c.n, c.sgned), ti);
+        EXPECT_EQ(l.size, c.size) << "sizeof(_BitInt(" << c.n << "))";
+        EXPECT_EQ(l.align.bytes(), c.align) << "_Alignof(_BitInt(" << c.n << "))";
+    }
+}
+
+// `sizeOfScalarOrBitInt` — the TypeId-aware shim (aggregate-ABI / data-global leaf
+// sizing): a BitInt gets its container size; every other scalar defers to
+// `scalarByteSize`.
+TEST(TypeLayout, SizeOfScalarOrBitIntShim) {
+    auto ti = makeInterner(71);
+    EXPECT_EQ(sizeOfScalarOrBitInt(ti, ti.bitInt(4, false),  DataModel::Lp64), 1u);
+    EXPECT_EQ(sizeOfScalarOrBitInt(ti, ti.bitInt(40, false), DataModel::Lp64), 8u);
+    EXPECT_EQ(sizeOfScalarOrBitInt(ti, ti.bitInt(128, true), DataModel::Lp64), 16u);
+    EXPECT_EQ(sizeOfScalarOrBitInt(ti, ti.primitive(TypeKind::I32), DataModel::Lp64), 4u);
+}
+
+// D-CSUBSET-BITINT-C2-WIDE: the memory-resident / by-value-class type-shape predicates
+// over EVERY form. A wide `_BitInt(N>64)` is BOTH (multi-limb, reached by ADDRESS); a
+// narrow `_BitInt(N<=64)` is NEITHER (a single native container — a scalar). Array is
+// memory-resident but NOT by-value-class (it decays); struct/union are both; a plain
+// scalar and the invalid TypeId are neither. `isWideBitInt` is the exact N>64 line.
+TEST(TypeLayout, WideBitIntTypeShapePredicates) {
+    auto ti = makeInterner(72);
+    TypeId const wide   = ti.bitInt(128, true);
+    TypeId const wide2  = ti.bitInt(65, false);   // the smallest wide width
+    TypeId const narrow = ti.bitInt(64, true);    // the widest single-container width
+    TypeId const i32    = ti.primitive(TypeKind::I32);
+    std::array<TypeId, 1> const sfields{i32};
+    TypeId const st     = ti.structType("S", sfields);
+    TypeId const arr    = ti.array(i32, 4);
+
+    // isWideBitInt — the exact N>64 boundary (64 is narrow, 65 is wide).
+    EXPECT_TRUE(isWideBitInt(ti, wide));
+    EXPECT_TRUE(isWideBitInt(ti, wide2));
+    EXPECT_FALSE(isWideBitInt(ti, narrow));
+    EXPECT_FALSE(isWideBitInt(ti, i32));
+    EXPECT_FALSE(isWideBitInt(ti, st));
+    EXPECT_FALSE(isWideBitInt(ti, TypeId{}));
+
+    // isMemoryResidentType — struct/union/array + wide _BitInt; NOT narrow/scalar/invalid.
+    EXPECT_TRUE(isMemoryResidentType(ti, wide));
+    EXPECT_TRUE(isMemoryResidentType(ti, st));
+    EXPECT_TRUE(isMemoryResidentType(ti, arr));
+    EXPECT_FALSE(isMemoryResidentType(ti, narrow));
+    EXPECT_FALSE(isMemoryResidentType(ti, i32));
+    EXPECT_FALSE(isMemoryResidentType(ti, TypeId{}));
+
+    // isByValueClass — struct/union + wide _BitInt; ARRAY EXCLUDED (decays), NOT narrow/
+    // scalar/invalid. This is the ONLY difference from isMemoryResidentType: the array.
+    EXPECT_TRUE(isByValueClass(ti, wide));
+    EXPECT_TRUE(isByValueClass(ti, st));
+    EXPECT_FALSE(isByValueClass(ti, arr));       // the array/by-value distinction
+    EXPECT_FALSE(isByValueClass(ti, narrow));
+    EXPECT_FALSE(isByValueClass(ti, i32));
+    EXPECT_FALSE(isByValueClass(ti, TypeId{}));
+}
