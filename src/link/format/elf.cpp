@@ -1992,9 +1992,16 @@ encode(AssembledModule const&    module,
     if (!bssLayoutOpt.has_value()) return {};
     auto const& bssLayout = *bssLayoutOpt;
 
-    bool const hasRodata = isExec && !rodataLayout.empty();
-    bool const hasData   = isExec && !dataLayout.empty();
-    bool const hasBss    = isExec && !bssLayout.empty();
+    // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: data sections are emitted for BOTH
+    // ET_EXEC and ET_REL. ET_EXEC binds them into loaded PT_LOAD segments with
+    // computed VAs; ET_REL emits them with sh_addr=0 + section-relative data
+    // symbols the final linker binds. `buildExecDataSection` (called
+    // unconditionally below) already produced the layouts format-blind; the
+    // only ET_REL-vs-exec differences are downstream (no VA math, no PT_LOAD,
+    // relocs emitted into `.rela.text` rather than applied in place).
+    bool const hasRodata = !rodataLayout.empty();
+    bool const hasData   = !dataLayout.empty();
+    bool const hasBss    = !bssLayout.empty();
     // D-LK-OBJECT-EXTERN-SYMBOL-NAMES (secondary): an empty `.note.GNU-stack`
     // marks the ET_REL object's stack as NON-executable, silencing the
     // `ld: missing .note.GNU-stack section implies executable stack` warning
@@ -2005,19 +2012,13 @@ encode(AssembledModule const&    module,
     // section). `secNote` may be null; the peek never fails loud.
     auto const* secNote = fmt.sectionByKind(SectionKind::Note);
     bool const hasNote  = !isExec && (secNote != nullptr);
-    // Reject dataItems on the ET_REL (.o) path loudly — the linker's
-    // per-format gate already advertises rodata only on the exec
-    // schema, but defend in depth: a hand-built ET_REL module with
-    // dataItems would otherwise silently drop them (no data sections in .o).
-    if (!isExec && !module.dataItems.empty()) {
-        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-             "elf::encode (ET_REL): AssembledData items are not "
-             "emitted into relocatable .o output — data in a .o "
-             "rides through the symbol+section table, not the "
-             "dataItems pipeline. D-LK1-ELF-EXEC-DATA-SECTIONS is "
-             "exec-only.");
-        return {};
-    }
+    // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: ET_REL now EMITS dataItems (a
+    // global → `.rodata`/`.data`/`.bss` + a section-relative `.symtab` symbol +
+    // `.rela.text` relocs). The deferred cases still fail loud upstream: an
+    // unadvertised section kind (TLS `tdata`/`tbss`) is caught by the linker's
+    // `acceptsDataSection` gate + this arm's earlier TLS reject; a data item
+    // carrying its OWN relocations (a pointer-initializer needing `.rela.data`)
+    // is rejected by `buildExecDataSection` (allowItemRelocations=false above).
     // On the exec path each PRESENT section's row is MANDATORY — fail loud
     // (the format JSON must declare it). The rows also feed the section-header
     // sh_type / sh_flags / name below (all read from the schema, never hardcoded).
@@ -2173,9 +2174,24 @@ encode(AssembledModule const&    module,
     // ── Build .strtab + .symtab ────────────────────────────────
     //
     // Symbol layout: STN_UNDEF (idx 0) → STT_SECTION for .text
-    // (LOCAL) → defined function symbols (GLOBAL) → undefined extern
-    // symbols (GLOBAL, SHN_UNDEF). `.symtab.sh_info` = index of
-    // first non-LOCAL symbol.
+    // (LOCAL) → defined function symbols (GLOBAL) → defined DATA symbols
+    // (GLOBAL, STT_OBJECT, D-LK-OBJECT-DATA-SECTION-RELOCATABLE) → undefined
+    // extern symbols (GLOBAL, SHN_UNDEF). `.symtab.sh_info` = index of first
+    // non-LOCAL symbol.
+    //
+    // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: the data-section header indices,
+    // computed HERE (before the symtab) so a data symbol's `st_shndx` names its
+    // section. Data sections sit right after `.text`(1) in rodata→data→bss
+    // order — the SAME order the `nextIdxS()` cursor + the `headers` push use
+    // below — so each index is a running count from 2. (Kept in lockstep with
+    // that cursor; the golden ET_REL byte tests pin the resulting layout.)
+    std::uint16_t const IDX_RODATA = hasRodata ? 2u : 0u;
+    std::uint16_t const IDX_DATA   =
+        hasData ? static_cast<std::uint16_t>(2u + (hasRodata ? 1u : 0u)) : 0u;
+    std::uint16_t const IDX_BSS    =
+        hasBss ? static_cast<std::uint16_t>(
+                     2u + (hasRodata ? 1u : 0u) + (hasData ? 1u : 0u))
+               : 0u;
 
     StringTable strtab;
     std::vector<std::uint8_t> symtab;
@@ -2266,6 +2282,53 @@ encode(AssembledModule const&    module,
         appendSym(nameOff, makeStInfo(STB_GLOBAL, STT_FUNC), 0,
                   /*shndx=.text*/ 1, f.valueInText, f.size);
         symIdxBySymbol.emplace(f.symId, idx);
+    }
+
+    // Defined DATA symbols (GLOBAL + STT_OBJECT, SECTION-RELATIVE) — ET_REL
+    // only (D-LK-OBJECT-DATA-SECTION-RELOCATABLE). A global lands in
+    // `.rodata`/`.data`/`.bss`; its symtab entry names the section (st_shndx)
+    // + section-relative offset (st_value) + size the FINAL linker binds, so a
+    // `.text`→global reloc resolves to a DEFINED symbol rather than being
+    // misclassified as an undefined extern by the loop below. Externally-
+    // visible → real name; static → `sym_<id>` (same carve-out as functions).
+    // ET_EXEC resolves data symbols via `addDataSymbolVas` (absolute VAs) and
+    // emits none into this symtab. MUST precede the extern-fallback loop.
+    if (!isExec) {
+        auto emitDataSyms =
+            [&](link::format::ExecDataSectionLayout const& layout,
+                std::uint16_t sectionIdx) {
+                for (std::size_t j = 0; j < layout.itemIndices.size(); ++j) {
+                    AssembledData const& di =
+                        module.dataItems[layout.itemIndices[j]];
+                    if (di.symbol == SymbolId{}) continue;   // anonymous item
+                    // A data global's SymbolId must be unique. A collision with
+                    // an already-emitted (function / block / data) symbol is a
+                    // producer-contract breach — fail loud (symmetry with the
+                    // exec `addDataSymbolVas` K_DuplicateDataSymbol), never a
+                    // silent skip that would bind a `.text`→data reloc to the
+                    // WRONG symbol.
+                    if (symIdxBySymbol.contains(di.symbol)) {
+                        emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
+                             "elf::encode (ET_REL): data SymbolId={ "
+                                 + std::to_string(di.symbol.v)
+                                 + " } collides with an already-emitted symbol "
+                                   "- a data global's SymbolId must be unique.");
+                        continue;
+                    }
+                    std::string const symName =
+                        objNames.definedName(di.symbol, "sym_");
+                    std::uint32_t const nameOff = strtab.add(symName);
+                    std::uint32_t const idx =
+                        static_cast<std::uint32_t>(symtab.size() / 24);
+                    appendSym(nameOff, makeStInfo(STB_GLOBAL, STT_OBJECT), 0,
+                              sectionIdx, layout.itemOffsets[j],
+                              di.sizeInSection());
+                    symIdxBySymbol.emplace(di.symbol, idx);
+                }
+            };
+        if (hasRodata) emitDataSyms(rodataLayout, IDX_RODATA);
+        if (hasData)   emitDataSyms(dataLayout, IDX_DATA);
+        if (hasBss)    emitDataSyms(bssLayout, IDX_BSS);
     }
 
     // Undefined extern symbols referenced by any relocation but not
@@ -2421,32 +2484,46 @@ encode(AssembledModule const&    module,
     }
 
     // Section indices — IDX_TEXT==1 is pinned (the STT_SECTION sym
-    // emitted above hardcodes st_shndx=1). Other indices depend on
-    // whether the `.rela.text` slot is present AND whether `.rodata`
-    // is present:
-    //   ET_REL:               Null(0), Text(1), Rela(2), Symtab(3), Strtab(4), ShStrtab(5).
+    // emitted above hardcodes st_shndx=1). Other indices depend on which
+    // optional sections are present. Since D-LK-OBJECT-DATA-SECTION-
+    // RELOCATABLE, data sections appear on BOTH forms (ET_REL now carries
+    // data + `.rela.text` together):
+    //   ET_REL (no data):     Null(0), Text(1), Rela(2), Symtab(3), Strtab(4), ShStrtab(5)[, Note(6)].
+    //   ET_REL (+ .data):     Null(0), Text(1), Data(2), Rela(3), Symtab(4), Strtab(5), ShStrtab(6)[, Note(7)].
     //   ET_EXEC (no rodata):  Null(0), Text(1),          Symtab(2), Strtab(3), ShStrtab(4).
     //   ET_EXEC (+ rodata):   Null(0), Text(1), Rodata(2), Symtab(3), Strtab(4), ShStrtab(5).
     // The phantom SHT_NULL placeholder in ET_EXEC was an LK1-cycle-2
     // first draft; architect convergence pulled it out so `readelf
     // -S` doesn't show a blank slot at idx 2 and the index math is
-    // honest. `.rodata` (D-LK1-ELF-EXEC-DATA-SECTIONS) sits at index
-    // 2 when present, shifting the trailing sections +1.
+    // honest. `[.rodata]/[.data]/[.bss]` sit at index 2.. (in that order)
+    // when present, shifting the trailing sections; `.note.GNU-stack` (ET_REL)
+    // is appended LAST.
     constexpr std::uint16_t IDX_TEXT     = 1;
     // Trailing-section indices computed INCREMENTALLY from the emit order so the
-    // optional sections ([.rodata]/[.data]/[.bss] on ET_EXEC; [.rela.text] on
-    // ET_REL) each shift the rest coherently without a hand-maintained per-
-    // section constant. Emit order:
-    //   ET_REL:  0 NULL, 1 .text, 2 .rela.text, .symtab, .strtab, .shstrtab
-    //   ET_EXEC: 0 NULL, 1 .text, [.rodata], [.data], [.bss], .symtab, .strtab,
-    //            .shstrtab
-    // (.data/.bss are exec-only — hasData/hasBss already imply isExec.)
+    // optional sections ([.rodata]/[.data]/[.bss], then [.rela.text] on ET_REL)
+    // each shift the rest coherently without a hand-maintained per-section
+    // constant. Emit order (BOTH forms):
+    //   0 NULL, 1 .text, [.rodata], [.data], [.bss], [.rela.text (ET_REL)],
+    //   .symtab, .strtab, .shstrtab, [.note.GNU-stack (ET_REL, last)].
+    // The data indices themselves were captured EARLY (IDX_RODATA/IDX_DATA/
+    // IDX_BSS, before the symtab) for the data symbols' st_shndx; here the
+    // cursor only advances past them.
     std::uint16_t idxCursorS = 2;  // after NULL(0) + .text(1)
     auto nextIdxS = [&]() { return idxCursorS++; };
-    if (!isExec) { (void)nextIdxS(); }            // .rela.text slot (ET_REL)
+    // ORDER MUST MATCH the `headers` push order below:
+    //   NULL, .text, [.rodata], [.data], [.bss], [.rela.text (ET_REL)],
+    //   .symtab, .strtab, .shstrtab, [.note.GNU-stack].
+    // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: data sections are bumped BEFORE
+    // `.rela.text` (fixing the prior cursor, which bumped `.rela.text` first —
+    // harmless while data was exec-only + rela was ET_REL-only [mutually
+    // exclusive], but WRONG now that an ET_REL object carries BOTH). Their
+    // indices were already captured as IDX_RODATA/IDX_DATA/IDX_BSS earlier (the
+    // data-symtab loop needs them before this point); here we only advance the
+    // cursor so IDX_SYMTAB/IDX_STRTAB/IDX_SHSTRTAB land after them.
     if (hasRodata) { (void)nextIdxS(); }
     if (hasData)   { (void)nextIdxS(); }
     if (hasBss)    { (void)nextIdxS(); }
+    if (!isExec) { (void)nextIdxS(); }            // .rela.text slot (ET_REL)
     std::uint16_t const IDX_SYMTAB   = nextIdxS();
     std::uint16_t const IDX_STRTAB   = nextIdxS();
     std::uint16_t const IDX_SHSTRTAB = nextIdxS();
@@ -2471,7 +2548,7 @@ encode(AssembledModule const&    module,
         hRodata.addr_align = rodataAlign;
         hRodata.entry_size = secRodata->entrySize;
         hRodata.size       = rodataBytes.size();
-        hRodata.addr       = rodataSectionVa;
+        hRodata.addr       = isExec ? rodataSectionVa : 0;  // ET_REL: unbound
     }
     // `.data` / `.bss` section headers (D-LK4-DATA-PRODUCER). sh_type /
     // sh_flags from the SCHEMA ROW (NOT hardcoded — `.data` = SHT_PROGBITS +
@@ -2485,7 +2562,7 @@ encode(AssembledModule const&    module,
         hData.addr_align = dataAlign;
         hData.entry_size = secData->entrySize;
         hData.size       = dataSize;
-        hData.addr       = dataSectionVa;
+        hData.addr       = isExec ? dataSectionVa : 0;  // ET_REL: unbound
     }
     if (hasBss) {
         hBss.type        = secBss->type;
@@ -2493,7 +2570,7 @@ encode(AssembledModule const&    module,
         hBss.addr_align  = bssAlign;
         hBss.entry_size  = secBss->entrySize;
         hBss.size        = bssSize;
-        hBss.addr        = bssSectionVa;
+        hBss.addr        = isExec ? bssSectionVa : 0;  // ET_REL: unbound
     }
 
     if (secRela != nullptr) {
@@ -2599,18 +2676,22 @@ encode(AssembledModule const&    module,
     // maps the wrong bytes at the global's runtime address).
     if (hasRodata) {
         layoutSection(hRodata, rodataBytes);
-        std::uint64_t const fileDelta = hRodata.offset - hText.offset;
-        if (secText->virtualAddress + fileDelta != rodataSectionVa) {
-            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("elf::encode (ET_EXEC): .rodata file/VA "
-                             "congruence broken — textVa({}) + "
-                             "fileDelta({}) != rodataSectionVa({}). The "
-                             "single PT_LOAD requires the on-disk "
-                             ".rodata-from-.text offset to equal the VA "
-                             "offset. D-LK1-ELF-EXEC-DATA-SECTIONS.",
-                             secText->virtualAddress, fileDelta,
-                             rodataSectionVa));
-            return {};
+        // ET_REL has no VA — the file/VA congruence check (a PT_LOAD invariant)
+        // is exec-only. D-LK-OBJECT-DATA-SECTION-RELOCATABLE.
+        if (isExec) {
+            std::uint64_t const fileDelta = hRodata.offset - hText.offset;
+            if (secText->virtualAddress + fileDelta != rodataSectionVa) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("elf::encode (ET_EXEC): .rodata file/VA "
+                                 "congruence broken — textVa({}) + "
+                                 "fileDelta({}) != rodataSectionVa({}). The "
+                                 "single PT_LOAD requires the on-disk "
+                                 ".rodata-from-.text offset to equal the VA "
+                                 "offset. D-LK1-ELF-EXEC-DATA-SECTIONS.",
+                                 secText->virtualAddress, fileDelta,
+                                 rodataSectionVa));
+                return {};
+            }
         }
     }
     // `.data` + `.bss` (D-LK4-DATA-PRODUCER) — the WRITABLE segment, page-
@@ -2618,19 +2699,23 @@ encode(AssembledModule const&    module,
     // (W^X). `.data` is file-backed; `.bss` consumes NO file bytes (its sh_offset
     // points just past `.data` but the layout pass appends nothing). Each
     // section's file/VA congruence is asserted fail-loud.
-    if (hasWritableSeg) {
+    // ET_REL packs data compactly (section alignment only); the page-boundary
+    // padding is a PT_LOAD (exec) concern. D-LK-OBJECT-DATA-SECTION-RELOCATABLE.
+    if (isExec && hasWritableSeg) {
         padTo(bytes, pageAlign);   // PT_LOAD #2 page boundary (file + VA)
     }
     if (hasData) {
         layoutSection(hData, dataLayout.bytes);
-        std::uint64_t const fileDelta = hData.offset - hText.offset;
-        if (secText->virtualAddress + fileDelta != dataSectionVa) {
-            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                 std::format("elf::encode (ET_EXEC): .data file/VA congruence "
-                             "broken — textVa({}) + fileDelta({}) != "
-                             "dataSectionVa({}). D-LK4-DATA-PRODUCER.",
-                             secText->virtualAddress, fileDelta, dataSectionVa));
-            return {};
+        if (isExec) {   // exec-only file/VA congruence (PT_LOAD invariant)
+            std::uint64_t const fileDelta = hData.offset - hText.offset;
+            if (secText->virtualAddress + fileDelta != dataSectionVa) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format("elf::encode (ET_EXEC): .data file/VA congruence "
+                                 "broken — textVa({}) + fileDelta({}) != "
+                                 "dataSectionVa({}). D-LK4-DATA-PRODUCER.",
+                                 secText->virtualAddress, fileDelta, dataSectionVa));
+                return {};
+            }
         }
     }
     if (hasBss) {
@@ -2655,10 +2740,11 @@ encode(AssembledModule const&    module,
     // (LK1 ELF executable adding .data/.rodata/.bss, LK6 dynamic
     // linking adding .dynamic/.dynsym/.dynstr) cannot drift between
     // the Ehdr's e_shnum and the actual table size.
-    // ET_REL keeps `.rela.text` in slot 2; ET_EXEC drops it entirely
-    // (no SHT_NULL placeholder). Section count derives from the
-    // actually-emitted slots — same architect B-LK1-2 / D-LK2-5
-    // discipline that LK1 cycle 1 + LK2 already adopt.
+    // ET_REL keeps `.rela.text` (after any `.rodata`/`.data`/`.bss` —
+    // D-LK-OBJECT-DATA-SECTION-RELOCATABLE); ET_EXEC drops it entirely (no
+    // SHT_NULL placeholder). Section count derives from the actually-emitted
+    // slots — same architect B-LK1-2 / D-LK2-5 discipline that LK1 cycle 1 +
+    // LK2 already adopt.
     std::vector<SectionHeader const*> headers;
     headers.reserve(8);
     headers.push_back(&hNull);

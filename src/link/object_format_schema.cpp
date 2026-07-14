@@ -919,21 +919,18 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "(D-RUNTIME-MAIN-ARGC-ARGV.)");
     }
 
-    // D-LK2-RODATA closure: producer-data-section capability is only
-    // meaningful on exec-flavored formats. Relocatable artifacts
-    // (PE Obj / ELF ET_REL / Mach-O MH_OBJECT) emit rodata via the
-    // symbol+section table at .obj time, not through the dataItems
-    // capability gate; declaring `supportedDataSections` on a
-    // relocatable schema is dead data that would silently confuse
-    // anyone diffing format schemas.
-    if (!supportedDataSections.empty() && !isExecFlavor) {
-        fail("/supportedDataSections",
-             "supportedDataSections is only legal on exec-flavored "
-             "formats (ELF ET_EXEC / PE PE32+ Exec/Dll / Mach-O "
-             "MH_EXECUTE). Relocatable artifacts (.o / Obj / Object) "
-             "emit rodata via symbol tables, not via the dataItems "
-             "capability gate. (D-LK2-RODATA closure.)");
-    }
+    // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: `supportedDataSections` is NO
+    // longer restricted to exec-flavored formats. A RELOCATABLE object DOES
+    // carry data — a global lands in `.data`/`.rodata`/`.bss` with `sh_addr=0`
+    // and a section-relative `.symtab` entry the final linker binds. So the
+    // capability is legal on a relocatable schema too; legality is enforced
+    // DOWNSTREAM (the walker fail-louds if it cannot actually emit a declared
+    // section — the same ungated discipline `externCallDispatch` uses just
+    // below). The prior D-LK2-RODATA reject (relocatable objects "emit rodata
+    // via symbol tables, not the dataItems gate") described an INTENT the ELF
+    // ET_REL writer never implemented; this anchor implements it, keeping the
+    // dataItems producer path (which is already format-blind) as the single
+    // source of the section bytes + symbols for BOTH exec and relocatable.
 
     // D-FFI-EXTERN-CALL-DISPATCH: `externCallDispatch` is NOT validate-
     // required, even on exec formats. The precise requirement is "a format

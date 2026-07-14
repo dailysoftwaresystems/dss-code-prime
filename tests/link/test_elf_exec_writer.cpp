@@ -2063,13 +2063,15 @@ TEST(ElfExecWriter, RodataDataItemWithRelocationFailsLoud) {
 
 // ── Code-review FOLD pins (H1 / M1 / L1) ──────────────────────────
 
-TEST(ElfExecWriter, ElfExecRejectsDataItemsOnRelocatable) {
-    // L1 / defence-in-depth: dataItems on the ET_REL (.o) path are
-    // rejected loudly — rodata in a .o rides the symbol+section table,
-    // NOT the dataItems pipeline. We call elf::encode DIRECTLY against
-    // the ET_REL schema (`elf64-x86_64-linux`, the .o format) so the
-    // writer's own `!isExec && !dataItems.empty()` guard fires (the
-    // linker's per-format gate would otherwise reject earlier).
+TEST(ElfExecWriter, ElfRelAcceptsRodataDataItem) {
+    // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: a relocatable object now EMITS a
+    // plain (no-reloc) rodata item — the former "(ET_REL) … D-LK1-ELF-EXEC-
+    // DATA-SECTIONS exec-only" reject is LIFTED. The item lands in `.rodata`
+    // (sh_addr=0) with a section-relative `.symtab` symbol the final linker
+    // binds. (The section-relative data-symbol shape is pinned by
+    // ElfWriter.ObjectEmitsDataSectionAndSectionRelativeDataSymbol; a data item
+    // WITH its own relocation still fails loud — the D-LK1-ELF-RODATA-DATAITEM-
+    // RELOC test above.) RED if the ELF writer reverts to rejecting ET_REL data.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
@@ -2077,26 +2079,16 @@ TEST(ElfExecWriter, ElfExecRejectsDataItemsOnRelocatable) {
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     AssembledData d;
     d.symbol    = SymbolId{42};
-    d.section   = DataSectionKind::Rodata;   // a VALID rodata item —
-    d.bytes     = {42, 0, 0, 0};             // it sails past the
-    d.alignment = Alignment::of<4>();        // Rodata/no-reloc scans
-    mod.dataItems.push_back(std::move(d));    // and hits the !isExec gate
+    d.section   = DataSectionKind::Rodata;
+    d.bytes     = {42, 0, 0, 0};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
     auto bytes = elf::encode(mod, **target, **fmt, rep);
-    EXPECT_TRUE(bytes.empty());
-    EXPECT_GT(rep.errorCount(), 0u);
-    bool sawCode = false;
-    for (auto const& diag : rep.all()) {
-        if (diag.code == DiagnosticCode::K_NoMatchingObjectFormat
-         && diag.actual.find("(ET_REL)") != std::string::npos
-         && diag.actual.find("D-LK1-ELF-EXEC-DATA-SECTIONS")
-                != std::string::npos) {
-            sawCode = true;
-        }
-    }
-    EXPECT_TRUE(sawCode)
-        << "dataItems on ET_REL must fail loud as (ET_REL) citing "
-           "D-LK1-ELF-EXEC-DATA-SECTIONS";
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "ET_REL must ACCEPT a plain rodata item "
+           "(D-LK-OBJECT-DATA-SECTION-RELOCATABLE)";
+    EXPECT_FALSE(bytes.empty());
 }
 
 TEST(ElfExecWriter, ElfExecMultipleRodataItemsLayoutWithAlignmentPadding) {

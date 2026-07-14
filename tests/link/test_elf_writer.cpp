@@ -376,6 +376,53 @@ TEST(ElfWriter, ObjectExternCallEmitsUndefImportNameAndPlt32Reloc) {
     EXPECT_EQ(addend, -4) << "psABI rel32 addend (baked bias)";
 }
 
+// ── D-LK-OBJECT-DATA-SECTION-RELOCATABLE: .data + section-relative sym ──
+
+TEST(ElfWriter, ObjectEmitsDataSectionAndSectionRelativeDataSymbol) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);   // one `ret` function
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {7, 0, 0, 0};                            // int counter = 7
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{42}, "counter",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "ET_REL must now accept a Data item (D-LK-OBJECT-DATA-SECTION-RELOCATABLE)";
+
+    // Section table: NULL(0), .text(1), .data(2), .rela.text(3), .symtab(4),
+    // .strtab(5), .shstrtab(6), .note.GNU-stack(7).
+    EXPECT_EQ(readU16LE(bytes, 60), 8u) << "e_shnum grows to 8 with .data";
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    // .data (index 2): SHT_PROGBITS(1); SHF_ALLOC|SHF_WRITE(3); sh_addr=0 (unbound).
+    EXPECT_EQ(readU32LE(bytes, shoff + 2 * 64 + 4), 1u)  << ".data SHT_PROGBITS";
+    EXPECT_EQ(readU64LE(bytes, shoff + 2 * 64 + 8), 3u)  << ".data SHF_ALLOC|SHF_WRITE";
+    EXPECT_EQ(readU64LE(bytes, shoff + 2 * 64 + 16), 0u) << ".data sh_addr=0 in a .o";
+
+    // .symtab at index 4; the data symbol at symtab idx 3
+    // (0=UNDEF, 1=.text section, 2=func, 3=data).
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + 4 * 64 + 24);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + 5 * 64 + 24);
+    std::uint32_t const stName = readU32LE(bytes, symtabOff + 3 * 24 + 0);
+    EXPECT_EQ(readStrtabName(bytes, strtabOff, stName), "counter")
+        << "data global carries its real name (red-on-disable vs sym_42)";
+    EXPECT_EQ(bytes[symtabOff + 3 * 24 + 4], 0x11u)             // STB_GLOBAL|STT_OBJECT
+        << "data symbol is STB_GLOBAL|STT_OBJECT";
+    EXPECT_EQ(readU16LE(bytes, symtabOff + 3 * 24 + 6), 2u)     // st_shndx = .data
+        << "data symbol st_shndx names .data (index 2)";
+    EXPECT_EQ(readU64LE(bytes, symtabOff + 3 * 24 + 8), 0u)     // st_value
+        << "section-relative st_value (offset 0 in .data)";
+    EXPECT_EQ(readU64LE(bytes, symtabOff + 3 * 24 + 16), 4u)    // st_size
+        << "st_size = sizeof(int)";
+}
+
 // ── Rela r_info encodes (sym << 32) | nativeId ──────────────────
 
 TEST(ElfWriter, RelaRecordsNativeRelocTypeAndSymtabIndex) {
