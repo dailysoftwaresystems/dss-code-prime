@@ -8958,3 +8958,47 @@ TEST(MirLoweringCSubset, PtrToVlaPointerArithSubscriptFailsLoud) {
         << "a subscript whose base is a ptr-to-VLA pointer-arithmetic result must fail "
            "loud (its runtime row stride cannot be recovered from a non-root base)";
 }
+
+// ── VLA C4a-param (D-CSUBSET-VLA): PARAMETER pointer-to-VLA (prologue pointee stride) ──
+
+// A PARAMETER pointer-to-VLA `int (*p)[n]` freezes its runtime POINTEE row stride in the
+// CALLEE PROLOGUE (the entry block, at the param's decl point — `n`, an EARLIER param, is
+// already placed, so there is no decl-vs-hoist hazard), and the body subscript p[i][j]
+// scales by a Load of that slot, never a compile-time Const. The stride slot is a FIXED
+// 8-byte alloca — NO dynamic-stack VLA object — so the callee is NOT leaf-restricted (it may
+// freely call). Red-on-disable: revert the param-loop storePtrToVlaStride (hir_to_mir) OR
+// the paramDecay pointee (semantic) → p[i] misses the slot and fails loud at
+// scaleIndexToBytes (mir not ok).
+TEST(MirLoweringCSubset, ParamPtrToVlaSubscriptScalesByPrologueStrideSlot) {
+    auto L = lowerCSubset(
+        "int g(int n, int (*p)[n]) { p[1][0] = 7; return 0; }\n"
+        "int main(void) { return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)   // red-on-disable: reverting the param stride store fails loud here
+        << "a parameter pointer-to-VLA subscript must lower cleanly (runtime pointee stride): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    ASSERT_GE(m.moduleFuncCount(), 1u);
+    // Find the callee g (the function whose entry carries a runtime-stride index Load);
+    // main has no subscript, so only g qualifies.
+    bool anyRuntimeStride = false;
+    int  gStrideSlots = 0;
+    for (std::uint32_t f = 0; f < m.moduleFuncCount(); ++f) {
+        MirBlockId const entry = m.funcEntry(m.funcAt(f));
+        if (hasRuntimeStrideIndexLoad(m, entry)) {
+            anyRuntimeStride = true;
+            gStrideSlots = countVlaSizeSlots(m, entry);
+        }
+    }
+    EXPECT_TRUE(anyRuntimeStride)
+        << "the callee's p[i][j] must scale by a Load of the prologue-frozen pointee-stride "
+           "slot (a runtime stride), NOT a compile-time Const";
+    // Exactly ONE prologue-frozen pointee-stride slot — and NO runtime-operand (dynamic-
+    // stack) Alloca: a ptr-to-VLA PARAM carries a fixed 8-byte slot, never a VLA object.
+    EXPECT_EQ(gStrideSlots, 1)
+        << "a ptr-to-VLA PARAM freezes exactly ONE pointee-stride slot in the prologue";
+}

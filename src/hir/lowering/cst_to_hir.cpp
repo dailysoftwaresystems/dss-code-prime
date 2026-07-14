@@ -1201,6 +1201,38 @@ struct Lowerer {
                 "suffix to lower its runtime size from");
             return;
         }
+        // VLA C4a-param (D-CSUBSET-VLA, FIX-3): a ptr-to-VLA PARAMETER's declarator
+        // carries DECAYED leading array suffix(es) that are NOT part of the pointee's
+        // array spine. `int a[][n]` decays its OUTER `[]` to a pointer, so the
+        // declarator has 2 suffixes but the pointee `int[n]` has only 1 array level;
+        // `int (*p)[n]` has 1 suffix and a depth-1 pointee (skip 0). Skip the LEADING
+        // `numArraySuffixes − pointeeArrayDepth` suffix(es) so the captured bounds pair
+        // 1:1 with the pointee's runtime dimensions (`computeVlaByteSize` asserts
+        // dims==depth). Applies ONLY when the symbol type is `kind==Ptr` — a VLA-OBJECT
+        // local (`int a[n][m]`, kind Array) is UNTOUCHED (skip=0 preserves every
+        // dimension). Without the skip a decayed `[]` (no lowerable middle child) fails
+        // loud on the leading suffix. Order: the pre-order walk records suffixes
+        // outer→inner, and the decaying dims are the OUTERMOST, so erase from front.
+        if (auto const* rec = model.recordFor(sym);
+            rec != nullptr && interner.kind(rec->type) == TypeKind::Ptr) {
+            auto const pops = interner.operands(rec->type);
+            if (!pops.empty()) {
+                std::size_t pointeeDepth = 0;
+                for (TypeId t = pops[0];
+                     t.valid() && interner.kind(t) == TypeKind::Array;) {
+                    ++pointeeDepth;
+                    auto const o = interner.operands(t);
+                    if (o.empty()) break;
+                    t = o[0];
+                }
+                if (suffixes.size() > pointeeDepth)
+                    suffixes.erase(
+                        suffixes.begin(),
+                        suffixes.begin()
+                            + static_cast<std::ptrdiff_t>(suffixes.size()
+                                                          - pointeeDepth));
+            }
+        }
         // Lower each suffix's length — the child BETWEEN the bracket delimiters
         // (`arrayDeclSuffix = [ BracketOpen, expr, BracketClose ]`) — to a FLOATING
         // HIR node, in outer→inner order, appending one accumulator entry per

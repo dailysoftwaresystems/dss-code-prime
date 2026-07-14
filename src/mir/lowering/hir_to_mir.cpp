@@ -9119,6 +9119,27 @@ struct Lowerer {
             } else {
                 symbolToValue[sym.v] = arg;
             }
+            // VLA C4a-param (D-CSUBSET-VLA): a PARAMETER pointer-to-VLA (`int (*p)[n]`,
+            // or the adjusted `int a[][n]`) freezes its runtime POINTEE row stride HERE,
+            // in the entry block at the param's decl point — mirroring the local VarDecl
+            // store. SIMPLER than the local case: `n` (an EARLIER param) is ALREADY
+            // placed by a prior loop iteration (symbolToValue / addressableLocal), so
+            // there is NO decl-site-vs-entry-hoist hazard — reading `n` here is in
+            // program order. `scaleIndexToBytes` recovers the `p[i]` row stride from the
+            // `(p, pointeeTy)` slot exactly as a declared VLA row. A ptr to a FIXED array
+            // (`int (*p)[5]`) has a non-VLA pointee → skipped (compile-time stride). On a
+            // belt fail-loud (e.g. a non-standard `int (*p)[n], int n` where `n` is not yet
+            // placed) TERMINATE the open entry block before bailing — the same convention as
+            // every other param-loop bail above — so the half-built function finalizes as a
+            // clean `mir` fail (diagnostic preserved), never a MirBuilder "no terminator" fatal.
+            if (interner.kind(ty) == TypeKind::Ptr) {
+                auto const pops = interner.operands(ty);
+                if (!pops.empty() && interner.typeContainsVla(pops[0])
+                    && !storePtrToVlaStride(sym, pops[0], p)) {
+                    if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                    return false;
+                }
+            }
         }
         // FC12a-core (D-FC12A-VARIADIC-CALLEE): after every FIXED param is placed,
         // `argCtr.gpr`/`.fpr` hold the count of fixed params that consumed an

@@ -8562,12 +8562,16 @@ TEST(SemanticAnalyzerCSubset, LocalAggregateBraceInitStaysCleanNoFalseTypeMismat
         << "the brace-init control program must compile clean";
 }
 
-// FAIL-LOUD (deferred): a PARAMETER pointer-to-VLA `int (*p)[n]` (n a sibling param) is
-// GAP 1b (next cycle) — the param pointee does not yet resolve the sibling `n` into a VLA
-// row, so a call passing a VLA object is a clean fail-loud (S_TypeMismatch at the arg),
-// never a silent miscompile. RED-ON-DISABLE is intentional: when the param form lands
-// (D-CSUBSET-VLA C4a-param), flip this to an accept + a runtime witness.
-TEST(SemanticAnalyzerCSubset, ParamPtrToVlaFailsLoud) {
+// VLA C4a-param (D-CSUBSET-VLA): a PARAMETER pointer-to-VLA `int (*p)[n]` (n a sibling
+// param) now RESOLVES — Option B's DISTINCT `paramDecay` signal builds a `vlaArray` row in
+// the pointee, so a call passing a VLA object `int b[2][n]` DECAYS to `int (*)[n]` and
+// type-checks (zero S_TypeMismatch). The runtime witness is examples/c-subset/
+// c99_vla_ptr_param (a genuine VLA-object caller is a NON-leaf VLA function — a C1b
+// deferral — so the runnable example casts a fixed buffer; THIS pin covers the VLA-arg
+// decay type-check that the example cannot exercise at runtime). RED-ON-DISABLE: revert the
+// paramDecay threading and the pointee never becomes a VLA row → the arg fails the exact
+// decay compare → S_TypeMismatch reappears.
+TEST(SemanticAnalyzerCSubset, ParamPtrToVlaAcceptsAndVlaArgDecays) {
     auto model = analyzeShipped("c-subset", {
         "int f(int n, int (*p)[n]) { return p[1][0]; }\n"
         "int main(void) {\n"
@@ -8577,8 +8581,105 @@ TEST(SemanticAnalyzerCSubset, ParamPtrToVlaFailsLoud) {
         "  return f(n, b);\n"
         "}\n",
     });
-    EXPECT_TRUE(model.hasErrors())
-        << "a parameter pointer-to-VLA is not yet supported (GAP 1b) — must fail loud";
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "a VLA object `int b[2][n]` passed to a `int (*p)[n]` param must DECAY and "
+           "type-check (zero S_TypeMismatch) — the ptr-to-VLA param resolves the sibling n";
+    EXPECT_FALSE(model.hasErrors())
+        << "the parameter pointer-to-VLA program analyzes clean at the semantic tier (the "
+           "non-leaf VLA-object caller is a separate MIR-tier deferral, not a semantic error)";
+}
+
+// VLA C4a-param FIX-5(a) (D-CSUBSET-VLA): a param pointer to a FIXED-length array
+// `int (*p)[5]` must STILL accept — paramDecay must NOT turn a constant-length pointee into
+// a VLA. The `[5]` constant-folds and never reaches the nullopt/VLA branch, so the store
+// gate (typeContainsVla) does not over-fire. RED-ON-DISABLE: if paramDecay wrongly forced a
+// VLA on a constant length, the ptr(array(int,5)) pointee would flip to ptr(vlaArray) and a
+// fixed `int b[2][5]` arg would then MISMATCH.
+TEST(SemanticAnalyzerCSubset, ParamPtrToFixedArrayStillAccepts) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int (*p)[5]) { return p[1][0]; }\n"
+        "int main(void) {\n"
+        "  int b[2][5];\n"
+        "  return f(b);\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "a fixed-pointee `int (*p)[5]` param accepts a fixed `int b[2][5]` arg";
+    EXPECT_FALSE(model.hasErrors())
+        << "the fixed-pointee ptr param program must analyze clean";
+}
+
+// VLA C4a-param FIX-5(b) (D-CSUBSET-VLA): the ADJUSTED form `int a[][n]` — the outer `[]`
+// decays to the pointer, the inner `[n]` is the runtime pointee row (C-equivalent to
+// `int (*a)[n]`) — must accept a VLA-object arg (zero S_TypeMismatch). RED-ON-DISABLE:
+// without the paramDecay threading the inner `[n]` fails S_NonConstantArrayLength.
+TEST(SemanticAnalyzerCSubset, ParamAdjustedArrayOfVlaAccepts) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int n, int a[][n]) { return a[1][0]; }\n"
+        "int main(void) {\n"
+        "  volatile int vn = 3;\n"
+        "  int n = vn;\n"
+        "  int b[2][n];\n"
+        "  return f(n, b);\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "`int a[][n]` (the adjusted form) must accept a VLA-object arg";
+    EXPECT_FALSE(model.hasErrors())
+        << "the int a[][n] program must analyze clean";
+}
+
+// VLA C4a-param (D-CSUBSET-VLA) regression control: a PLAIN `int a[n]` param must STILL
+// decay to `int*` (C 6.7.6.3p7 adjusts the OUTERMOST dim to a pointer). A pointer is
+// REASSIGNABLE (`a = q`), an array is not — so this compiles clean iff the paramDecay path
+// stripped the transient outermost vlaArray via adjustArrayToPointer. RED-ON-DISABLE: if a
+// plain array param stopped decaying (stayed a VLA-array object), `a = q` would fail loud
+// (S_TypeMismatch — arrays are not assignable, per the genuine-array control elsewhere).
+TEST(SemanticAnalyzerCSubset, PlainVlaArrayParamStillDecaysToPointer) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int n, int a[n], int *q) { a = q; return a[0]; }\n"
+        "int main(void) { int x = 5; return f(1, &x, &x); }\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a plain `int a[n]` param must DECAY to `int*` (a POINTER is reassignable); the "
+           "paramDecay path must strip the outermost VLA, never leave a VLA-array object";
+}
+
+// VLA C4a-param THE KEY OPTION-B GUARD (D-CSUBSET-VLA): a struct field `int a[n]` (variable
+// n) must STILL resolve via the struct-field FAM incompleteArray path -> a sole flexible
+// array member -> S_FlexibleArraySoleMember. Option B threads a DISTINCT paramDecay signal
+// that a struct field NEVER carries (its config row has allowFlexibleArray, not
+// arrayToPointer), so the FAM path is byte-identical. RED-ON-DISABLE: a broad fix that
+// routed struct fields through the paramDecay VLA branch would build a vlaArray instead of
+// an incompleteArray and this diagnostic vanishes.
+TEST(SemanticAnalyzerCSubset, StructFieldVlaSoleMemberStillFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int n = 4;\n"
+        "struct S { int a[n]; };\n"
+        "int main(void) { return 0; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_FlexibleArraySoleMember), 1u)
+        << "the Option-B no-regression guard: a struct field `int a[n]` (variable n) still "
+           "routes through the FAM incompleteArray path -> S_FlexibleArraySoleMember";
+}
+
+// VLA C4a-param (D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT, deferred): a FIXED arg `int b[2][2]`
+// decays to `ptr(array(int,2))`, which is DISTINCT from the param's `ptr(vlaArray)` — the
+// DSS -2 VLA sentinel is STRICTER than C's runtime VLA/fixed pointer compatibility — so it
+// rejects with S_TypeMismatch (a fail-loud reject of valid-C, NEVER a miscompile). This
+// pins that the accept is scoped to a genuinely VLA-shaped arg. RED-ON-DISABLE: a broadened
+// decay compare that ignored the element length would silently accept this mismatch.
+TEST(SemanticAnalyzerCSubset, ParamPtrToVlaFixedArgRejects) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int n, int (*p)[n]) { return p[1][0]; }\n"
+        "int main(void) {\n"
+        "  int b[2][2];\n"
+        "  return f(2, b);\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "a FIXED `int b[2][2]` arg (ptr(array(int,2))) is DISTINCT from the param's "
+           "ptr(vlaArray) -> S_TypeMismatch (D-CSUBSET-VLA-FIXED-ARRAY-ARG-COMPAT deferral)";
 }
 
 // D-CSUBSET-VLA-PTR-INIT-FORM-TYPING boundary guard: the INITIALIZER form

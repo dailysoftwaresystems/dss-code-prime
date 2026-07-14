@@ -1009,7 +1009,8 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
 directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                    NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
                    bool allowFlexibleArray,
-                   bool allowInitInferredArray = false);
+                   bool allowInitInferredArray = false,
+                   bool paramDecay = false);
 
 // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: forward declaration — the
 // tag-namespace-scope floater (defined below) is consumed early by
@@ -3147,7 +3148,8 @@ declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                        Tree const& tree, NodeId node, TypeId base,
                        ScopeId scope, bool emitOnMiss,
                        bool allowFlexibleArray = false,
-                       bool allowInitInferredArray = false);
+                       bool allowInitInferredArray = false,
+                       bool paramDecay = false);
 
 // c82 D-CSUBSET-PARAM-ARRAY-ADJUSTMENT (C 6.7.6.3p7): a declaration form with
 // `arrayToPointer` whose resolved declarator type is an ARRAY — sized
@@ -3202,15 +3204,20 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         }
         if (decl.declaratorChild.has_value()) {
             if (*decl.declaratorChild < kids.size()) {
-                // c82 (C 6.7.6.3p7): an `arrayToPointer` row admits the
-                // absent-length `T x[]` on its OWN outermost suffix (the
-                // incomplete-array resolution path), then the adjustment
-                // below rewrites any top-level array to Ptr<element> —
-                // matching the definitive visit's identical sequence.
+                // c82 (C 6.7.6.3p7) + VLA C4a-param (D-CSUBSET-VLA, FIX-2): an
+                // `arrayToPointer` row is a C PARAMETER — route its array-decay
+                // through the DISTINCT `paramDecay` signal (NOT the struct-field FAM
+                // `allowFlexibleArray`, which stays false here). paramDecay admits the
+                // absent-length `T x[]` AND builds a `vlaArray` for a non-outermost
+                // present-length suffix (`int (*p)[n]` → the pointee keeps `[n]`); the
+                // adjustment below then rewrites any top-level array to Ptr<element>.
+                // Mirrors the definitive visit's identical sequence so the FnSig agrees.
                 TypeId const t = declaratorDeclaredType(
                     s, cfg, tree, kids[*decl.declaratorChild], head, scope,
                     emitOnMiss,
-                    /*allowFlexibleArray=*/decl.arrayToPointer);
+                    /*allowFlexibleArray=*/false,
+                    /*allowInitInferredArray=*/false,
+                    /*paramDecay=*/decl.arrayToPointer);
                 return adjustArrayToPointer(s, decl, t);
             }
             // Declarator structurally absent — a TYPE-ONLY (abstract) param.
@@ -3243,7 +3250,8 @@ declRowDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                       Tree const& tree, NodeId suffix, TypeId inner,
                       ScopeId scope, bool emitOnMiss,
-                      bool allowFlexibleArray = false) {
+                      bool allowFlexibleArray = false,
+                      bool paramDecay = false) {
     DeclaratorConfig const& dc = *cfg.declarators;
     RuleId const r = tree.rule(suffix);
     if (r == dc.fnSuffixRule) {
@@ -3323,41 +3331,50 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             if (len.has_value()) break;
         }
         if (!len.has_value()) {
-            // c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR (FAM): an ABSENT length on
-            // a declaration form that may bear a flexible array member (a
-            // struct field) is an INCOMPLETE array (C99 §6.7.2.1), NOT an
-            // error — the declarator-mode twin of the legacy `applyArraySuffix`
-            // FAM branch. Only the field's OWN array suffix inherits this; a
-            // nested fn-ptr param's array never does (the caller passes false
-            // into the group recursion).
+            // CRITICAL discriminator — an ABSENT length (`T x[]`, an incomplete/
+            // decaying array) vs a PRESENT non-constant length (`T x[n]`, a VLA): BOTH
+            // fold to nullopt, so the discriminator is a length CHILD between the
+            // brackets. `arrayDeclSuffix = [ BracketOpen, {optional expr}, BracketClose ]`
+            // → 3 visible children when present, 2 when absent.
+            bool const hasPresentLength =
+                visibleChildren(tree, suffix).size() > 2;
+            // VLA C4a-param (D-CSUBSET-VLA, Option B): a C PARAMETER declarator
+            // (`arrayToPointer` row — a DISTINCT signal threaded as `paramDecay`, NEVER
+            // the struct-field FAM `allowFlexibleArray`). C 6.7.6.3p7 adjusts a param's
+            // OUTERMOST array to a pointer, but a NON-outermost VLA suffix survives in
+            // the pointee (`int (*p)[n]` → `int (*)[n]`; `int a[][n]` → same after the
+            // decayed outer `[]`). Build the vlaArray for a PRESENT length so the
+            // pointee carries the runtime row shape; an ABSENT `[]` is the (possibly
+            // outermost) decaying dim → incompleteArray, which `adjustArrayToPointer`
+            // then strips to `Ptr<element>`. Checked FIRST + kept off the FAM bool so
+            // the struct-field FAM path (below) stays BYTE-IDENTICAL — a param never
+            // reaches the FAM branch, a field never reaches here.
+            if (paramDecay) {
+                TypeInterner& in = s.lattice.interner();
+                return hasPresentLength ? in.vlaArray(inner)
+                                        : in.incompleteArray(inner);
+            }
+            // c10 D-CSUBSET-STRUCT-MEMBER-DECLARATOR (FAM): an ABSENT length on a
+            // declaration form that may bear a flexible array member (a struct field,
+            // OR an init-inferred `[]`) is an INCOMPLETE array (C99 §6.7.2.1), NOT an
+            // error — the declarator-mode twin of the legacy `applyArraySuffix` FAM
+            // branch. Only the field's OWN array suffix inherits this; a nested fn-ptr
+            // param's array never does (the group recursion passes false).
             if (allowFlexibleArray)
                 return s.lattice.interner().incompleteArray(inner);
-            // VLA C1a (D-CSUBSET-VLA): a PRESENT-but-non-constant length on a NON-FAM
-            // declarator (`!allowFlexibleArray` — params decay via the FAM branch
-            // above, struct fields take it too) is a VARIABLE-LENGTH array
-            // (C99/C11 §6.7.6.2 `int a[n]`). Build the vlaArray HERE regardless of
+            // VLA C1a (D-CSUBSET-VLA): a PRESENT-but-non-constant length on a NON-FAM,
+            // NON-param declarator is a VARIABLE-LENGTH array (C99/C11 §6.7.6.2
+            // `int a[n]` — a VLA OBJECT). Build the vlaArray HERE regardless of
             // scope/storage: the block-vs-file + automatic-storage constraints are
             // enforced by the Pass-2 `validateVlaDeclarator`, which reads the SYMBOL's
             // binding scope (`rec.scope`) — the type-construction `scope` here is a
             // descendant of, NOT equal to, the file scope even for a file-scope decl,
             // so `fileScopeOf(scope)` cannot discriminate file from block at this tier.
-            //
-            // CRITICAL — distinguish an ABSENT length (`T x[]`, an incomplete-array
-            // local — still `S_NonConstantArrayLength`) from a PRESENT non-constant
-            // length (`T x[n]`, a VLA): BOTH fold to nullopt, so the discriminator is
-            // a length CHILD between the brackets. `arrayDeclSuffix = [ BracketOpen,
-            // {optional expr}, BracketClose ]` → 3 visible children when present, 2
-            // when absent. Only a PRESENT length is a VLA.
-            bool const hasPresentLength =
-                visibleChildren(tree, suffix).size() > 2;
-            if (hasPresentLength) {
-                TypeInterner& in = s.lattice.interner();
-                // VLA C3 (D-CSUBSET-VLA): a VLA whose ELEMENT is itself an array or a
-                // VLA (`int a[n][m]`, `int a[n][5]`) is a MULTI-DIMENSIONAL VLA — build
-                // the nested `vlaArray(inner)`; HIR→MIR sizes the runtime row stride.
-                // The right-to-left suffix fold already produced `inner` as the element.
-                return in.vlaArray(inner);
-            }
+            // VLA C3: a VLA whose ELEMENT is itself an array or VLA (`int a[n][m]`,
+            // `int a[n][5]`) is a MULTI-DIMENSIONAL VLA — the right-to-left suffix fold
+            // already produced `inner` as the element; HIR→MIR sizes the runtime stride.
+            if (hasPresentLength)
+                return s.lattice.interner().vlaArray(inner);
             emit(DiagnosticCode::S_NonConstantArrayLength);
             return InvalidType;
         }
@@ -3396,7 +3413,8 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
 [[nodiscard]] TypeId
 directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                    NodeId direct, TypeId base, ScopeId scope, bool emitOnMiss,
-                   bool allowFlexibleArray, bool allowInitInferredArray) {
+                   bool allowFlexibleArray, bool allowInitInferredArray,
+                   bool paramDecay) {
     if (!cfg.declarators.has_value()) return InvalidType;
     DeclaratorConfig const& dc = *cfg.declarators;
     if (!direct.valid() || !base.valid()) return InvalidType;
@@ -3436,7 +3454,7 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
     // Suffixes fold RIGHT-to-LEFT (source-first suffix = outermost type).
     for (std::size_t i = suffixes.size(); i-- > 0;) {
         t = applyDeclaratorSuffix(s, cfg, tree, suffixes[i], t, scope,
-                                  emitOnMiss, allowFlexibleArray);
+                                  emitOnMiss, allowFlexibleArray, paramDecay);
         if (!t.valid()) return InvalidType;
     }
 
@@ -3455,9 +3473,17 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // fn-ptrs) carries its `[]` on THIS inner declarator and is sized from the
         // top-level initializer. Propagate ONLY that init-inference signal as the
         // inner's flexible flag; a NO-init grouped `[]` keeps it false ⇒ S000B.
+        // VLA C4a-param FIX-1 (D-CSUBSET-VLA): param decay applies ONLY to the
+        // OUTERMOST dim (C 6.7.6.3p7); a grouped/parenthesized inner declarator is
+        // NOT the decaying dim, so RESET `paramDecay=false` here (the two witnesses
+        // are unaffected — `(*p)[n]`'s `[n]` folds at the OUTER suffix above, before
+        // this recursion; `a[][n]` has no group — but the reset prevents a latent
+        // over-lenient accept on an exotic `int (*p[])[n]`). `allowInitInferredArray`
+        // stays a DISTINCT signal (c47 init-inferred fn-ptr arrays), not collapsed.
         return declaratorDeclaredType(s, cfg, tree, inner, t, scope, emitOnMiss,
                                       /*allowFlexibleArray=*/allowInitInferredArray,
-                                      /*allowInitInferredArray=*/allowInitInferredArray);
+                                      /*allowInitInferredArray=*/allowInitInferredArray,
+                                      /*paramDecay=*/false);
     }
     return t;   // abstract direct — the type itself
 }
@@ -3465,7 +3491,8 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
 TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                               Tree const& tree, NodeId node, TypeId base,
                               ScopeId scope, bool emitOnMiss,
-                              bool allowFlexibleArray, bool allowInitInferredArray) {
+                              bool allowFlexibleArray, bool allowInitInferredArray,
+                              bool paramDecay) {
     if (!cfg.declarators.has_value()) return InvalidType;
     DeclaratorConfig const& dc = *cfg.declarators;
     if (!node.valid() || !base.valid()) return InvalidType;
@@ -3475,9 +3502,11 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
         NodeId const inner = declarator_walk_detail::firstChildOfRule(
             TreeDeclaratorView{tree}, node, dc.declaratorRule);
         if (!inner.valid()) return InvalidType;
+        // Transparent wrapper — paramDecay rides through UNCHANGED (the decaying-dim
+        // signal belongs to the wrapped declarator, not this init-declarator shell).
         return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
                                       emitOnMiss, allowFlexibleArray,
-                                      allowInitInferredArray);
+                                      allowInitInferredArray, paramDecay);
     }
     // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR) FIX 1: a struct/union member-list
     // slot wraps ONE declarator (+ its own bitfield suffix). Descend to the
@@ -3497,9 +3526,11 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
         NodeId const inner = declarator_walk_detail::firstChildOfRule(
             TreeDeclaratorView{tree}, node, dc.declaratorRule);
         if (!inner.valid()) return InvalidType;
+        // Transparent wrapper — paramDecay rides through UNCHANGED (a struct member
+        // slot; paramDecay is false here in practice, but stay signal-preserving).
         return declaratorDeclaredType(s, cfg, tree, inner, base, scope,
                                       emitOnMiss, allowFlexibleArray,
-                                      allowInitInferredArray);
+                                      allowInitInferredArray, paramDecay);
     }
     if (r != dc.declaratorRule) return InvalidType;
 
@@ -3537,7 +3568,8 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
     // resolver uses; see its comment). `t` already carries the pointer-star
     // depth from the loop above.
     return directDeclaredType(s, cfg, tree, direct, t, scope, emitOnMiss,
-                              allowFlexibleArray, allowInitInferredArray);
+                              allowFlexibleArray, allowInitInferredArray,
+                              paramDecay);
 }
 
 // FC4 c1 (M5): first token of `kind` in `node`'s subtree in SOURCE order —
@@ -5285,18 +5317,24 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         // ARRAY `(*const arr[])(T) = {…}` is sized from its init.
                         NodeId const initNode =
                             initializerNodeOf(tree, dNode, *cfg.declarators);
-                        // c82 (C 6.7.6.3p7): an `arrayToPointer` row (a C
-                        // parameter) also admits the absent-length `[]` —
-                        // the adjustment below rewrites the array to
-                        // Ptr<element>, so the incomplete form never
-                        // escapes as the bound type.
+                        // c82 (C 6.7.6.3p7) + VLA C4a-param (D-CSUBSET-VLA,
+                        // FIX-2): an `arrayToPointer` row (a C parameter) routes
+                        // its array-decay through the DISTINCT `paramDecay`
+                        // signal, NOT `allowIncomplete` (the struct-field FAM /
+                        // init-inference bool) — so a param's present-length
+                        // non-outermost suffix builds a `vlaArray` in the pointee
+                        // (`int (*p)[n]`, `int a[][n]`) while an absent `[]` still
+                        // decays; the FAM path stays byte-identical. The
+                        // adjustment below rewrites any top-level array to
+                        // Ptr<element>, so the incomplete/VLA form never escapes
+                        // as the bound type.
                         bool const allowIncomplete =
-                            decl.allowFlexibleArray || decl.arrayToPointer
-                            || initNode.valid();
+                            decl.allowFlexibleArray || initNode.valid();
                         TypeId declTy = declaratorDeclaredType(
                             s, cfg, tree, dNode, headTy, here,
                             /*emitOnMiss=*/true, allowIncomplete,
-                            /*allowInitInferredArray=*/initNode.valid());
+                            /*allowInitInferredArray=*/initNode.valid(),
+                            /*paramDecay=*/decl.arrayToPointer);
                         // Complete an inferred `[]` from its initializer (string
                         // length + NUL, or brace top-level element count). A
                         // non-array / already-sized / no-init type passes through
