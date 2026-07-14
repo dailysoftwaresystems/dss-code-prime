@@ -31,12 +31,14 @@ export const CATEGORIES = {
   preprocessor:  { label: 'Preprocessor',                         sqliteWeight: 20 },
   ffi:           { label: 'libc FFI (shipped headers)',           sqliteWeight: 4 },
   modern:        { label: 'C11/C23 modern surface',               sqliteWeight: 0 },
-  // The §3.2 "named exclusions" of plan-23 — C23 features scoped OUT of the FC
-  // arc's "C23 as mainstream compilers implement it" target. Tracked HERE as
-  // loud red gaps (the DSS Axis foundation) instead of left invisible. Weight 0:
-  // SQLite uses none, so readiness is unaffected — but the empirical-battery
-  // denominator IS, on purpose. Each flips green the cycle its feature lands.
-  c23_advanced:  { label: 'C23 advanced tier (atomics/complex/tgmath/…)', sqliteWeight: 0 },
+  // Plan-23 FC17.9 — the full-C23 completeness tier (PROMOTED into scope
+  // 2026-07-14: 100% C23 BEFORE FC18, the DSS Axis substrate mandate; these were
+  // the §3.2 "named exclusions"). Tracked HERE as loud red gaps (the DSS Axis
+  // foundation). Weight 0: SQLite uses none, so readiness is unaffected — but the
+  // empirical-battery denominator IS, on purpose. Each flips green the cycle its
+  // feature lands (FC17.9 order: threads→stdbit→setjmp→atomics→long double→
+  // complex→tgmath→embed→asm).
+  c23_advanced:  { label: 'C23 advanced tier / FC17.9 (atomics/complex/tgmath/…)', sqliteWeight: 0 },
 };
 
 // Canonical known-good program used for the cross-target emit/run matrix.
@@ -1201,9 +1203,10 @@ int main() {
 }
 ` },
 
-  // ───── C23 advanced tier — plan-23 §3.2 named exclusions (added 2026-07-14) ─────
-  // The features scoped OUT of "C23 as mainstream compilers implement it": the
-  // substrate DSS Axis will stand on. Each is a loud red gap until its arc lands,
+  // ───── C23 advanced tier — plan-23 FC17.9 (the promoted §3.2 exclusions) ─────
+  // The full-C23 completeness tier — the substrate DSS Axis will stand on
+  // (PROMOTED into FC17.9 on 2026-07-14: 100% C23 before FC18, no longer scoped
+  // out of "C23 as mainstream compilers implement it"). A loud red gap until its arc lands,
   // then flips green. Values are exact (no precision/edge sensitivity) so a probe
   // either cleanly PASSES (feature present) or cleanly REJECTS (feature absent) —
   // never a spurious miscompile. `_Atomic` qualifier is split from <stdatomic.h>

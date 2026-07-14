@@ -40,7 +40,7 @@ const PHASE_CYCLE_EST = {
   '6': 3, '7': 2, '8': 3,                               // cluster B aggregates backend
   '9': 4, '10': 2, '11': 3, '12a': 3, '12b': 2, '12c': 2, // cluster C ABI
   '13': 4, '14': 2, '15': 2,                            // cluster D preprocessor
-  '16': 4, '17': 2, '17.5': 2, '18': 3,                 // cluster E completeness (+FC17.5 conformance sweep)
+  '16': 4, '17': 2, '17.5': 2, '17.9': 16, '18': 3,     // cluster E (+FC17.5 sweep; +FC17.9 full-C23 tier = 9 library/type-system sub-features, the heaviest cluster-E phase — user 2026-07-14, 100% C23 before FC18)
 };
 // SQLite milestone = "compile + link + run the sqlite3.c amalgamation
 // (single TU, SQLITE_THREADSAFE=0, SQLITE_OMIT_LOADEXT) + a tiny shell
