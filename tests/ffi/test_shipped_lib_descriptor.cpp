@@ -3000,7 +3000,7 @@ TEST(ShippedLibDescriptor, RealWindowsUlargeOverlayLayout) {
 
 // A known recipe id that EQUALS the symbol name decodes onto `ShippedSymbol.synthesize`.
 // The vocabulary predicate is the SINGLE source of truth shared with the driver's merged
-// reconstruction; the Cycle-2 trampolines are NOT in it (deferred).
+// reconstruction; Cycle 2 ADDED thrd_create/call_once/thrd_join (the last threads recipes).
 TEST(ShippedLibDescriptor, SynthesizeTagDecodesForKnownRecipe) {
     ScratchDir dir{Location::Temp, "shipped-lib"};
     auto const path = writeTemp(dir, "threads.json", R"({
@@ -3025,8 +3025,9 @@ TEST(ShippedLibDescriptor, SynthesizeTagDecodesForKnownRecipe) {
     EXPECT_TRUE(desc->symbols[1].synthesize.empty());
     EXPECT_TRUE(isKnownSynthesizeRecipe("mtx_lock"));
     EXPECT_TRUE(isKnownSynthesizeRecipe("tss_create"));
-    EXPECT_FALSE(isKnownSynthesizeRecipe("thrd_create"));  // Cycle-2 trampoline (deferred)
-    EXPECT_FALSE(isKnownSynthesizeRecipe("thrd_join"));    // deferred (multi-block/unusable)
+    EXPECT_TRUE(isKnownSynthesizeRecipe("thrd_create"));   // Cycle 2 (DIRECT-PASS)
+    EXPECT_TRUE(isKnownSynthesizeRecipe("thrd_join"));     // Cycle 2 (multi-block)
+    EXPECT_TRUE(isKnownSynthesizeRecipe("call_once"));     // Cycle 2 (once trampoline)
     EXPECT_FALSE(isKnownSynthesizeRecipe("bogus"));
 }
 

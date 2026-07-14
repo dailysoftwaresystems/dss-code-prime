@@ -6,11 +6,13 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "mir/mir.hpp"
 #include "mir/mir_opcode.hpp"
+#include "mir/mir_struct_markers.hpp"   // rederiveStructCfMarkers (Cycle-2 thrd_join multi-block)
 #include "opt/passes/mir_rebuild_helper.hpp"
 
 #include <algorithm>   // std::max, std::sort
 #include <array>
 #include <cstdint>
+#include <optional>    // std::optional (the once-adapter symbol, minted iff call_once present)
 #include <string>
 #include <unordered_map>
 #include <utility>     // std::move, std::pair
@@ -84,9 +86,12 @@ bool synthesizeThreadsShim(
     TypeId const voidTy = interner.primitive(TypeKind::Void);
     TypeId const i32Ty  = interner.primitive(TypeKind::I32);
     TypeId const u32Ty  = interner.primitive(TypeKind::U32);
+    TypeId const i64Ty  = interner.primitive(TypeKind::I64);   // Cycle 2: PtrToInt(handle/res) compares
+    TypeId const u64Ty  = interner.primitive(TypeKind::U64);   // Cycle 2: CreateThread dwStackSize
     TypeId const boolTy = interner.primitive(TypeKind::Bool);
     TypeId const pVoid  = interner.pointer(voidTy);   // ptr<void> (mtx_t*/cnd_t*/HANDLE)
-    TypeId const pU32   = interner.pointer(u32Ty);    // tss_t* (u32*)
+    TypeId const pU32   = interner.pointer(u32Ty);    // tss_t* (u32*) / GetExitCodeThread LPDWORD
+    TypeId const pI32   = interner.pointer(i32Ty);    // Cycle 2: thrd_join int* res
 
     // ── kernel32 helper signatures (CcMS64; the FnSig CC is documentary — the MS-x64
     //    ABI is applied downstream by the target's callingConventionIndex, not keyed
@@ -104,6 +109,14 @@ bool synthesizeThreadsShim(
     TypeId const hSig_i32_void    = sig({}, i32Ty);                      // SwitchToThread
     TypeId const hSig_v_u32       = sig({u32Ty}, voidTy);                // ExitThread
     TypeId const hSig_pV_void     = sig({}, pVoid);                      // GetCurrentThread
+    // Cycle 2 (D-CSUBSET-C11-THREADS-TRAMPOLINES) kernel32 helper signatures (match
+    // windows.json exactly). CreateThread/WaitForSingleObject/GetExitCodeThread/
+    // CloseHandle(=hSig_i32_pV) drive thrd_create/thrd_join; InitOnceExecuteOnce drives
+    // call_once.
+    TypeId const hSig_CreateThread = sig({pVoid, u64Ty, pVoid, pVoid, u32Ty, pVoid}, pVoid);
+    TypeId const hSig_u32_pVu32    = sig({pVoid, u32Ty}, u32Ty);         // WaitForSingleObject
+    TypeId const hSig_i32_pVpU32   = sig({pVoid, pU32}, i32Ty);          // GetExitCodeThread(HANDLE,LPDWORD)
+    TypeId const hSig_i32_4pV      = sig({pVoid, pVoid, pVoid, pVoid}, i32Ty); // InitOnceExecuteOnce
 
     // ── shim (recipe) signatures (CcMS64; the pe thrd_t is ptr<void>) ──
     TypeId const rSig_mtx_init  = sig({pVoid, i32Ty}, i32Ty);
@@ -117,6 +130,12 @@ bool synthesizeThreadsShim(
     TypeId const rSig_pV_void   = sig({}, pVoid);             // thrd_current
     TypeId const rSig_v_void    = sig({}, voidTy);            // thrd_yield
     TypeId const rSig_v_i32     = sig({i32Ty}, voidTy);       // thrd_exit
+    // Cycle 2 recipe signatures (the pe thrd_t is ptr<void>=HANDLE).
+    TypeId const rSig_thrd_create = sig({pVoid, pVoid, pVoid}, i32Ty);  // (thrd_t*, start, arg)->int
+    TypeId const rSig_thrd_join   = sig({pVoid, pI32}, i32Ty);          // (thrd_t, int*)->int
+    TypeId const rSig_call_once   = sig({pVoid, pVoid}, voidTy);        // (once_flag*, void(*)(void))->void
+    // The module-scoped InitOnceExecuteOnce adapter (PINIT_ONCE_FN shape, BOOL return).
+    TypeId const onceTrampSig     = sig({pVoid, pVoid, pVoid}, i32Ty);  // (InitOnce*, param, ctx*)->BOOL
 
     // ── Rebuild the module (Mir is frozen): clone every existing function verbatim,
     //    then APPEND each shim function, then clone globals — the shared rebuild idiom. ──
@@ -133,6 +152,16 @@ bool synthesizeThreadsShim(
     // maxSymbolIdV would miss it → a fresh helper could collide with a shim id).
     std::uint32_t nextSymV = maxSymbolIdV(mir, externImports);
     for (auto const& [symV, _] : recipes) nextSymV = std::max(nextSymV, symV);
+
+    // Cycle 2 (D-CSUBSET-C11-THREADS-TRAMPOLINES): call_once passes InitOnceExecuteOnce a
+    // PINIT_ONCE_FN(InitOnce*, param, ctx*)->BOOL, but C11's callback is a bare
+    // void(*)(void) with a DIFFERENT arg shape + no return, so we synthesize ONE
+    // module-scoped adapter and address-take it. Mint its symbol here (above every
+    // existing + recipe id) iff a call_once recipe is present; the kernel32-helper
+    // importOf draws from the SAME monotonic `nextSymV` afterward, so no id collides.
+    std::optional<SymbolId> onceTrampSym;
+    for (auto const& [symV, recipe] : recipes)
+        if (recipe == "call_once") { onceTrampSym = SymbolId{++nextSymV}; break; }
 
     // On-demand kernel32 import, deduped by mangledName. Seed from the existing imports
     // so a TU that ALSO `#include`s <windows.h> (which eagerly imports the cond-var / CS
@@ -182,6 +211,16 @@ bool synthesizeThreadsShim(
         std::array<MirInstId, 4> ops{importOf(n, hs), a, b, c};
         return builder.addInst(MirOpcode::Call, ops, ret, /*payload=*/0);
     };
+    auto call4 = [&](char const* n, TypeId hs, TypeId ret, MirInstId a, MirInstId b,
+                     MirInstId c, MirInstId d) {
+        std::array<MirInstId, 5> ops{importOf(n, hs), a, b, c, d};
+        return builder.addInst(MirOpcode::Call, ops, ret, /*payload=*/0);
+    };
+    auto call6 = [&](char const* n, TypeId hs, TypeId ret, MirInstId a, MirInstId b,
+                     MirInstId c, MirInstId d, MirInstId e, MirInstId f) {
+        std::array<MirInstId, 7> ops{importOf(n, hs), a, b, c, d, e, f};
+        return builder.addInst(MirOpcode::Call, ops, ret, /*payload=*/0);
+    };
     // A Bool = (x == 0), then zero-extended to i32 (0 or 1). The C11 error codes fall
     // straight out: thrd_success=0, thrd_busy=1, and thrd_error=2 = (that)*2.
     auto isZeroI32 = [&](MirInstId x) -> MirInstId {
@@ -191,16 +230,36 @@ bool synthesizeThreadsShim(
         return builder.addInst(MirOpcode::ZExt, ze, i32Ty);
     };
 
-    // Open a shim function + its sole (entry) block. The block IS the entry block — the
-    // single-CU seam synthesizes POST-optimize with no marker re-derive, so the raw
-    // EntryBlock marker must be canonical (every recipe is single-block by design, so it
-    // trivially is). Returns nothing; the caller emits the body then a Return.
+    // Open a shim function + its entry block, stamped EntryBlock. Most recipes are
+    // single-block, so this raw marker is already canonical; the one MULTI-block recipe
+    // (thrd_join) creates its extra blocks with default markers that the module-wide
+    // `rederiveStructCfMarkers` at the end makes canonical (the merge path's per-pass
+    // MirVerifier enforces stored==derived; the single-CU post-optimize path has no
+    // verifier and codegen ignores markers, so the rederive is idempotent there).
+    // Returns nothing; the caller emits the body then a terminator.
     auto begin = [&](SymbolId sym, TypeId fnSig) {
         (void)builder.addFunction(fnSig, sym, SymbolBinding::Global,
                                   SymbolVisibility::Default);
         MirBlockId const entry = builder.createBlock(StructCfMarker::EntryBlock);
         builder.beginBlock(entry);
     };
+
+    // Cycle 2: emit the once-adapter ONCE, before the recipe loop (every call_once
+    // GlobalAddr-references it). Global-bound so DCE — which runs AFTER the multi-CU
+    // synth, pre-optimize — keeps it: an OS-invoked callback is never a direct-call
+    // target, so it would otherwise look dead (the synthesizePeStartup `_dss_pe_start`
+    // precedent). Its 3 params match PINIT_ONCE_FN; only `param` (the C11 fn) is used, but
+    // all 3 Args are emitted so their ordinals stay contiguous (0,1,2) — DCE keeps every
+    // Arg as a root (D-OPT-VARIADIC-RELEASE-ARGINDEX), so the unused io/ctx survive.
+    if (onceTrampSym.has_value()) {
+        begin(*onceTrampSym, onceTrampSig);
+        (void)builder.addArg(0, pVoid);                  // InitOnce* (ignored)
+        MirInstId const fn = builder.addArg(1, pVoid);   // the C11 void(*)(void)
+        (void)builder.addArg(2, pVoid);                  // Context* (ignored)
+        std::array<MirInstId, 1> ind{fn};                // fn() — indirect (D-CSUBSET-FNPTR-INDIRECT-CALL)
+        builder.addInst(MirOpcode::Call, ind, InvalidType);
+        builder.addReturn(i32c(1));   // TRUE — else InitOnceExecuteOnce treats init as FAILED
+    }
 
     for (auto const& [symV, recipe] : recipes) {
         SymbolId const sym{symV};
@@ -286,7 +345,7 @@ bool synthesizeThreadsShim(
             call1("FlsFree", hSig_i32_u32, i32Ty, builder.addArg(0, u32Ty));
             builder.addReturn();
 
-        // ── thread management (the Cycle-1 usable subset; thrd_create/join are Cycle 2) ──
+        // ── thread management ──
         } else if (recipe == "thrd_current") { // ret GetCurrentThread() [pseudo-handle wart, named]
             begin(sym, rSig_pV_void);
             builder.addReturn(call0("GetCurrentThread", hSig_pV_void, pVoid));
@@ -303,6 +362,80 @@ bool synthesizeThreadsShim(
             call1("CloseHandle", hSig_i32_pV, i32Ty, builder.addArg(0, pVoid));
             builder.addReturn(i32c(0));
 
+        // ── Cycle 2 (D-CSUBSET-C11-THREADS-TRAMPOLINES) ──
+        } else if (recipe == "thrd_create") {
+            // DIRECT-PASS (no closure/trampoline): the C11 start routine int(*)(void*) has
+            // the SAME x64 ABI as Win32's LPTHREAD_START_ROUTINE DWORD(*)(void*) — one arg
+            // (a ptr, in rcx), a 32-bit return in eax (the thread exit code). So hand
+            // `func`+`arg` straight to CreateThread; no malloc, no adapter.
+            //   h = CreateThread(NULL, 0, func, arg, 0, NULL); *thr = h;
+            //   ret (h == NULL) ? thrd_error(2) : thrd_success(0)     (branchless)
+            begin(sym, rSig_thrd_create);
+            MirInstId const thr  = builder.addArg(0, pVoid);   // thrd_t* (out)
+            MirInstId const func = builder.addArg(1, pVoid);   // thrd_start_t == start routine
+            MirInstId const arg  = builder.addArg(2, pVoid);   // void* lpParameter
+            MirInstId const nul  = konst(0, TypeKind::Ptr, pVoid);  // lpThreadAttributes / lpThreadId
+            MirInstId const z64  = konst(0, TypeKind::U64, u64Ty);  // dwStackSize (default)
+            MirInstId const z32  = konst(0, TypeKind::U32, u32Ty);  // dwCreationFlags (run now)
+            MirInstId const h    = call6("CreateThread", hSig_CreateThread, pVoid,
+                                         nul, z64, func, arg, z32, nul);
+            std::array<MirInstId, 2> st{h, thr};
+            builder.addInst(MirOpcode::Store, st, InvalidType);    // *thr = h (8-byte handle; value-width driven)
+            std::array<MirInstId, 1> hi{h};
+            MirInstId const hInt = builder.addInst(MirOpcode::PtrToInt, hi, i64Ty);
+            std::array<MirInstId, 2> cmp{hInt, konst(0, TypeKind::I64, i64Ty)};
+            MirInstId const eq   = builder.addInst(MirOpcode::ICmpEq, cmp, boolTy);  // h == 0?
+            std::array<MirInstId, 1> ze{eq};
+            MirInstId const z    = builder.addInst(MirOpcode::ZExt, ze, i32Ty);      // 0/1
+            std::array<MirInstId, 2> mul{z, i32c(2)};
+            builder.addReturn(builder.addInst(MirOpcode::Mul, mul, i32Ty));          // 0 or thrd_error(2)
+
+        } else if (recipe == "call_once") {
+            // InitOnceExecuteOnce(f, &__dss_once_tramp, fn, NULL) — the adapter (minted +
+            // emitted above) invokes the C11 void(*)(void) `fn` exactly once.
+            if (!onceTrampSym.has_value()) {   // never fires: the pre-loop scan minted it
+                emitErr(reporter, "synthesizeThreadsShim: call_once recipe without a "
+                                  "synthesized __dss_once_tramp adapter (internal breach)");
+                return false;
+            }
+            begin(sym, rSig_call_once);
+            MirInstId const flag  = builder.addArg(0, pVoid);   // once_flag* (INIT_ONCE*)
+            MirInstId const fn    = builder.addArg(1, pVoid);   // void(*)(void)
+            MirInstId const tramp = builder.addGlobalAddr(*onceTrampSym,
+                                                          interner.pointer(onceTrampSig));
+            MirInstId const nul   = konst(0, TypeKind::Ptr, pVoid);   // Context = NULL
+            call4("InitOnceExecuteOnce", hSig_i32_4pV, i32Ty, flag, tramp, fn, nul);
+            builder.addReturn();   // void
+
+        } else if (recipe == "thrd_join") {
+            // MULTI-block: WaitForSingleObject(t, INFINITE); if (res) GetExitCodeThread(t,
+            // res); CloseHandle(t); ret thrd_success. The `if (res)` guard is a real branch
+            // (a NULL `res` must not fault). Blocks are created with default markers; the
+            // module-wide rederive at the end makes them canonical (IfThen/IfJoin).
+            begin(sym, rSig_thrd_join);                        // opens the ENTRY block
+            MirInstId const t   = builder.addArg(0, pVoid);    // thrd_t (HANDLE) by value
+            MirInstId const res = builder.addArg(1, pI32);     // int* (exit-code out; may be NULL)
+            MirInstId const inf = konst(static_cast<std::int64_t>(0xFFFFFFFFu),
+                                        TypeKind::U32, u32Ty); // INFINITE
+            call2("WaitForSingleObject", hSig_u32_pVu32, u32Ty, t, inf);
+            std::array<MirInstId, 1> rp{res};
+            MirInstId const resInt = builder.addInst(MirOpcode::PtrToInt, rp, i64Ty);
+            std::array<MirInstId, 2> ne{resInt, konst(0, TypeKind::I64, i64Ty)};
+            MirInstId const cond   = builder.addInst(MirOpcode::ICmpNe, ne, boolTy); // res != 0
+            MirBlockId const thenBB = builder.createBlock();   // marker set by the module-wide rederive
+            MirBlockId const joinBB = builder.createBlock();
+            builder.addCondBr(cond, thenBB, joinBB);
+            // then: GetExitCodeThread(t, (LPDWORD)res); Br join
+            builder.beginBlock(thenBB);
+            std::array<MirInstId, 1> rc{res};
+            MirInstId const resU32 = builder.addInst(MirOpcode::Bitcast, rc, pU32); // ptr<i32> → ptr<u32>
+            call2("GetExitCodeThread", hSig_i32_pVpU32, i32Ty, t, resU32);
+            builder.addBr(joinBB);
+            // join: CloseHandle(t); ret thrd_success(0)
+            builder.beginBlock(joinBB);
+            call1("CloseHandle", hSig_i32_pV, i32Ty, t);
+            builder.addReturn(i32c(0));
+
         } else {
             // A recipe id present in the descriptor vocabulary but with NO arm here — a
             // vocab/switch drift. Fail loud (never a silently-undefined shim). The loader
@@ -315,6 +448,12 @@ bool synthesizeThreadsShim(
 
     opt::passes::cloneGlobalsVerbatim(mir, builder);
     mir = std::move(builder).finish();
+    // Cycle 2: canonicalize StructCfMarkers module-wide from the CFG — REQUIRED for
+    // thrd_join's multi-block (its then/join blocks were created with default markers) so
+    // the merge-path per-pass MirVerifier's stored==derived check passes; idempotent for
+    // every other function (single-block recipes + clones re-derive to their existing
+    // markers). Never hand-stamp IfThen/IfJoin (mir_struct_markers is the single source).
+    rederiveStructCfMarkers(mir);
     return true;
 }
 

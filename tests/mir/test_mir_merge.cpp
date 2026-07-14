@@ -1469,6 +1469,258 @@ TEST(SynthThreadsShim, EmptyRecipeMapIsNoOp) {
     EXPECT_TRUE(externs.empty()) << "no kernel32 import planted for an empty map";
 }
 
+// ── FC17.9(a) Cycle 2 (D-CSUBSET-C11-THREADS-TRAMPOLINES) ────────────────────────
+// thrd_create is DIRECT-PASS: it hands the caller's start routine STRAIGHT to
+// CreateThread — NO malloc closure, NO __dss_thrd_tramp. RED-on-disable: a regression
+// to a closure/trampoline would (a) add a 3rd synthesized function and (b) make the
+// CreateThread lpStartAddress a GlobalAddr(tramp) instead of the func Arg.
+TEST(SynthThreadsShim, ThrdCreateDirectPassesStartRoutineNoTrampoline) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const pV  = in.pointer(in.primitive(TypeKind::Void));
+    TypeId const mainSig = in.fnSig({}, i32, CallConv::CcMS64);
+    std::array<TypeId, 3> const cp{pV, pV, pV};
+    TypeId const createSig = in.fnSig(cp, i32, CallConv::CcMS64);   // (thr, func, arg)->int
+
+    MirBuilder mb;
+    mb.addFunction(mainSig, SymbolId{100});
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pV, 8);
+    MirInstId const ga   = mb.addGlobalAddr(SymbolId{10}, in.pointer(createSig));
+    MirInstId const co[] = {ga, slot, slot, slot};   // a referenced-only shim call
+    mb.addInst(MirOpcode::Call, co, i32);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    Mir mir = std::move(mb).finish();
+
+    std::unordered_map<std::uint32_t, std::string> recipes{{10u, "thrd_create"}};
+    std::vector<ExternImport> externs;
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, externs, rep));
+    EXPECT_FALSE(rep.hasErrors());
+
+    // DIRECT-PASS adds ONLY thrd_create (main + thrd_create) — no trampoline function.
+    EXPECT_EQ(mir.moduleFuncCount(), 2u)
+        << "thrd_create is DIRECT-PASS — no __dss_thrd_tramp closure function";
+
+    // CreateThread imported; malloc NOT (a closure would need it).
+    std::optional<std::uint32_t> createSym;
+    bool importedMalloc = false;
+    for (auto const& imp : externs) {
+        if (imp.mangledName == "CreateThread") {
+            createSym = imp.symbol.v;
+            EXPECT_EQ(imp.libraryPath, "kernel32.dll");
+        }
+        if (imp.mangledName == "malloc") importedMalloc = true;
+    }
+    ASSERT_TRUE(createSym.has_value()) << "thrd_create's body must import CreateThread";
+    EXPECT_FALSE(importedMalloc) << "DIRECT-PASS thrd_create allocates no closure — no malloc";
+
+    // The func Arg (argIndex 1) + arg Arg (argIndex 2) must be the CreateThread call's
+    // lpStartAddress + lpParameter operands — at their EXACT positions (a func/arg swap
+    // is red here, not only via the runtime example).
+    MirFuncId createFn{};
+    for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i)
+        if (mir.funcSymbol(mir.funcAt(i)).v == 10u) createFn = mir.funcAt(i);
+    ASSERT_TRUE(createFn.valid());
+    MirInstId funcArg{}, argArg{}, createCall{};
+    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(createFn); ++bi) {
+        MirBlockId const b = mir.funcBlockAt(createFn, bi);
+        for (std::uint32_t j = 0; j < mir.blockInstCount(b); ++j) {
+            MirInstId const id = mir.blockInstAt(b, j);
+            if (mir.instOpcode(id) == MirOpcode::Arg) {
+                if (mir.argIndex(id) == 1u) funcArg = id;   // thrd_start_t (start routine)
+                if (mir.argIndex(id) == 2u) argArg  = id;   // void* (thread param)
+            }
+            if (mir.instOpcode(id) == MirOpcode::Call) {
+                auto ops = mir.instOperands(id);
+                if (!ops.empty() && mir.instOpcode(ops[0]) == MirOpcode::GlobalAddr
+                    && mir.globalAddrSymbol(ops[0]).v == *createSym)
+                    createCall = id;
+            }
+        }
+    }
+    ASSERT_TRUE(funcArg.valid());
+    ASSERT_TRUE(argArg.valid());
+    ASSERT_TRUE(createCall.valid());
+    // CreateThread(lpThreadAttributes, dwStackSize, lpStartAddress, lpParameter,
+    // dwCreationFlags, lpThreadId) — the Call operands are [callee, a..f], so
+    // lpStartAddress is operand[3] and lpParameter operand[4]. The start routine (Arg 1)
+    // MUST land at [3] and the thread param (Arg 2) at [4] — a func/arg SWAP fails HERE.
+    auto createOps = mir.instOperands(createCall);
+    ASSERT_EQ(createOps.size(), 7u) << "CreateThread takes 6 args (callee + 6 operands)";
+    EXPECT_EQ(createOps[3].v, funcArg.v)
+        << "the start routine (Arg 1) is CreateThread's lpStartAddress (operand 3), DIRECT-passed";
+    EXPECT_EQ(createOps[4].v, argArg.v)
+        << "the thread param (Arg 2) is CreateThread's lpParameter (operand 4)";
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << "the thrd_create-synthesized module must verify";
+}
+
+// call_once synthesizes ONE module-scoped __dss_once_tramp, address-takes it, and the
+// adapter invokes the C11 void(*)(void) INDIRECTLY. RED-on-disable: dropping the adapter
+// (passing the bare fn as PINIT_ONCE_FN) removes the 3rd function + the indirect call.
+TEST(SynthThreadsShim, CallOnceSynthesizesAddressTakenTrampolineWithIndirectCall) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32    = in.primitive(TypeKind::I32);
+    TypeId const voidTy = in.primitive(TypeKind::Void);
+    TypeId const pV     = in.pointer(voidTy);
+    TypeId const mainSig = in.fnSig({}, i32, CallConv::CcMS64);
+    std::array<TypeId, 2> const cp{pV, pV};
+    TypeId const onceSig = in.fnSig(cp, voidTy, CallConv::CcMS64);   // (flag, fn)->void
+
+    MirBuilder mb;
+    mb.addFunction(mainSig, SymbolId{100});
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pV, 8);
+    MirInstId const ga   = mb.addGlobalAddr(SymbolId{10}, in.pointer(onceSig));
+    MirInstId const co[] = {ga, slot, slot};
+    mb.addInst(MirOpcode::Call, co, InvalidType);   // call_once returns void
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    Mir mir = std::move(mb).finish();
+
+    std::unordered_map<std::uint32_t, std::string> recipes{{10u, "call_once"}};
+    std::vector<ExternImport> externs;
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, externs, rep));
+    EXPECT_FALSE(rep.hasErrors());
+
+    // 3 functions: main + call_once + the synthesized __dss_once_tramp.
+    EXPECT_EQ(mir.moduleFuncCount(), 3u)
+        << "call_once synthesizes the module-scoped __dss_once_tramp adapter";
+
+    // InitOnceExecuteOnce imported; call_once itself never imported.
+    std::optional<std::uint32_t> ioeo;
+    bool importedCallOnce = false;
+    for (auto const& imp : externs) {
+        if (imp.mangledName == "InitOnceExecuteOnce") {
+            ioeo = imp.symbol.v;
+            EXPECT_EQ(imp.libraryPath, "kernel32.dll");
+        }
+        if (imp.mangledName == "call_once") importedCallOnce = true;
+    }
+    EXPECT_TRUE(ioeo.has_value()) << "call_once's body imports InitOnceExecuteOnce";
+    EXPECT_FALSE(importedCallOnce) << "call_once is a synthesized def, never a kernel32 import";
+
+    // The trampoline = the 3rd function (symbol not main's 100 nor the recipe's 10),
+    // minted ABOVE the recipe id.
+    std::optional<std::uint32_t> trampSym;
+    MirFuncId trampFn{}, onceFn{};
+    for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i) {
+        MirFuncId const f = mir.funcAt(i);
+        std::uint32_t const s = mir.funcSymbol(f).v;
+        if (s == 10u) onceFn = f;
+        else if (s != 100u) { trampSym = s; trampFn = f; }
+    }
+    ASSERT_TRUE(trampSym.has_value());
+    ASSERT_TRUE(onceFn.valid());
+    ASSERT_TRUE(trampFn.valid());
+    EXPECT_GT(*trampSym, 10u) << "the trampoline symbol is minted ABOVE the recipe id";
+
+    // call_once ADDRESS-TAKES the trampoline (GlobalAddr(trampSym) in its body).
+    bool addressTaken = false;
+    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(onceFn); ++bi) {
+        MirBlockId const b = mir.funcBlockAt(onceFn, bi);
+        for (std::uint32_t j = 0; j < mir.blockInstCount(b); ++j) {
+            MirInstId const id = mir.blockInstAt(b, j);
+            if (mir.instOpcode(id) == MirOpcode::GlobalAddr
+                && mir.globalAddrSymbol(id).v == *trampSym)
+                addressTaken = true;
+        }
+    }
+    EXPECT_TRUE(addressTaken) << "call_once passes &__dss_once_tramp to InitOnceExecuteOnce";
+
+    // The trampoline makes an INDIRECT call: a Call whose callee (operand 0) is an Arg,
+    // not a GlobalAddr to a named import.
+    bool indirectCall = false;
+    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(trampFn); ++bi) {
+        MirBlockId const b = mir.funcBlockAt(trampFn, bi);
+        for (std::uint32_t j = 0; j < mir.blockInstCount(b); ++j) {
+            MirInstId const id = mir.blockInstAt(b, j);
+            if (mir.instOpcode(id) == MirOpcode::Call) {
+                auto ops = mir.instOperands(id);
+                if (!ops.empty() && mir.instOpcode(ops[0]) == MirOpcode::Arg)
+                    indirectCall = true;
+            }
+        }
+    }
+    EXPECT_TRUE(indirectCall)
+        << "the trampoline invokes the C11 callback INDIRECTLY through its param Arg";
+
+    // The trampoline's terminator Returns the constant 1 (TRUE): InitOnceExecuteOnce
+    // treats a FALSE (0) return as init-FAILED and would RE-RUN the init — so a `ret 0`
+    // regression (breaking exactly-once) is red at the unit tier, not just the example.
+    bool returnsOne = false;
+    for (std::uint32_t bi = 0; bi < mir.funcBlockCount(trampFn); ++bi) {
+        MirInstId const term = mir.blockTerminator(mir.funcBlockAt(trampFn, bi));
+        if (mir.instOpcode(term) != MirOpcode::Return) continue;
+        auto ops = mir.instOperands(term);
+        ASSERT_EQ(ops.size(), 1u) << "__dss_once_tramp's Return carries the BOOL value";
+        ASSERT_EQ(mir.instOpcode(ops[0]), MirOpcode::Const) << "the return value is a constant";
+        MirLiteralValue const& lit = mir.literalValue(mir.constLiteralIndex(ops[0]));
+        if (auto const* i = std::get_if<std::int64_t>(&lit.value)) returnsOne = (*i == 1);
+        else if (auto const* u = std::get_if<std::uint64_t>(&lit.value)) returnsOne = (*u == 1u);
+    }
+    EXPECT_TRUE(returnsOne)
+        << "__dss_once_tramp must return TRUE(1) — a ret 0 makes InitOnceExecuteOnce re-run init";
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << "the call_once + trampoline module must verify";
+}
+
+// thrd_join is the first MULTI-block recipe (WaitForSingleObject; if(res)
+// GetExitCodeThread; CloseHandle). Running MirVerifier PINS the canonical StructCfMarkers
+// the module-wide rederiveStructCfMarkers stamped on the entry/then/join blocks (a wrong
+// marker fires I_StructCfMismatch).
+TEST(SynthThreadsShim, ThrdJoinIsMultiBlockAndVerifies) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32  = in.primitive(TypeKind::I32);
+    TypeId const pV   = in.pointer(in.primitive(TypeKind::Void));
+    TypeId const pI32 = in.pointer(i32);
+    TypeId const mainSig = in.fnSig({}, i32, CallConv::CcMS64);
+    std::array<TypeId, 2> const jp{pV, pI32};
+    TypeId const joinSig = in.fnSig(jp, i32, CallConv::CcMS64);   // (thrd_t, int*)->int
+
+    MirBuilder mb;
+    mb.addFunction(mainSig, SymbolId{100});
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, pV, 8);
+    MirInstId const ga   = mb.addGlobalAddr(SymbolId{10}, in.pointer(joinSig));
+    MirInstId const co[] = {ga, slot, slot};
+    mb.addInst(MirOpcode::Call, co, i32);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    Mir mir = std::move(mb).finish();
+
+    std::unordered_map<std::uint32_t, std::string> recipes{{10u, "thrd_join"}};
+    std::vector<ExternImport> externs;
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, externs, rep));
+    EXPECT_FALSE(rep.hasErrors());
+
+    MirFuncId joinFn{};
+    for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i)
+        if (mir.funcSymbol(mir.funcAt(i)).v == 10u) joinFn = mir.funcAt(i);
+    ASSERT_TRUE(joinFn.valid());
+    EXPECT_GT(mir.funcBlockCount(joinFn), 1u)
+        << "thrd_join is MULTI-block (the res!=NULL guard is a real branch)";
+
+    bool wfso = false, gect = false, ch = false;
+    for (auto const& imp : externs) {
+        if (imp.mangledName == "WaitForSingleObject") wfso = true;
+        if (imp.mangledName == "GetExitCodeThread")   gect = true;
+        if (imp.mangledName == "CloseHandle")         ch   = true;
+    }
+    EXPECT_TRUE(wfso && gect && ch)
+        << "thrd_join imports WaitForSingleObject + GetExitCodeThread + CloseHandle";
+
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep))
+        << "the multi-block thrd_join module must verify (canonical markers rederived)";
+}
+
 // ── FC17.9(a): MULTI-CU threads. A shim symbol is REFERENCED-ONLY per CU (skipped from
 // import at CST→HIR; defined POST-merge). The merge's step-3c must pre-register it a
 // merged id, else the clone ABORTS (mergedSymbolOf) on the caller's GlobalAddr — the
