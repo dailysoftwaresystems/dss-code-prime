@@ -188,6 +188,11 @@ async function runProbe(cli, host, tmpRoot, p) {
     writeFileSync(fp, content);
     srcPaths.push(fp);
   }
+  // Companion resources written NEXT to the sources but not compiled as TUs
+  // (e.g. an #embed target). Keeps a probe's data file off the --compile line.
+  for (const [name, content] of Object.entries(p.aux ?? {})) {
+    writeFileSync(join(dir, name), content);
+  }
   const c = await run(cli, ['--compile', ...srcPaths, '--language', 'c-subset', '--target', host.spec, '--output', outDir], { timeoutMs: 60000 });
   if (c.timedOut) return { ...p, status: 'toolfail', detail: 'compiler timeout' };
   if (c.spawnError) return { ...p, status: 'toolfail', detail: 'compiler spawn failed' };
