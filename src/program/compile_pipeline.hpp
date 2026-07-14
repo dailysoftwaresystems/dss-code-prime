@@ -24,6 +24,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -258,6 +259,12 @@ struct DSS_EXPORT CuMirModule {
     // exact for the active format. The target's alignment params come from
     // `*target`; this overlays the per-format bit-field rule onto them.
     BitFieldStrategy bitFieldStrategy = BitFieldStrategy::None;
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): pe64 <threads.h> shim SymbolId.v →
+    // recipe id, carried from the BUILD half's `CstToHirResult.synthRecipeBySymbol` so
+    // the LOWER half's `synthesizeThreadsShim` (fired at the synthesizePeStartup seam)
+    // can supply each shim function's definition. Empty for every elf/macho + every
+    // non-threads pe TU (the overwhelming majority — a bare default-constructed map).
+    std::unordered_map<std::uint32_t, std::string> threadsRecipes;
 };
 
 // BUILD half: semantic analysis → HIR → FFI synthesis → MIR → optimize. Returns the

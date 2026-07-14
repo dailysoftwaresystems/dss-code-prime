@@ -141,7 +141,35 @@ struct DSS_EXPORT ShippedSymbol {
     // `Block{ ExprStmt(call), Unreachable }` at HIR lowering — the same treatment a
     // user-declared noreturn function gets. Default false.
     bool noreturn = false;
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): optional PE-SHIM recipe tag — when
+    // non-empty, this symbol is NOT a plain external FFI import but a
+    // COMPILER-SYNTHESIZED function whose body `src/mir/merge/synth_threads_shim.cpp`
+    // emits over kernel32 primitives (the C11 <threads.h> Win32 shim: the CRT exports
+    // no thrd_*). The value is a recipe id from the CLOSED vocabulary
+    // (`isKnownSynthesizeRecipe`) and MUST EQUAL this symbol's `name` (a validated
+    // invariant — the pe64 synth pass identifies each recipe by its symbol name, so a
+    // mismatch would synthesize the wrong body; the loader rejects both an unknown id
+    // AND a name-mismatch, closed-vocab fail-loud). Present ONLY on the pe `variants`
+    // of a threads symbol (availableObjectFormats:["pe"]); the elf entry carries no tag
+    // and is a plain libc FFI import (glibc exports the C11 API from libc.so.6). At
+    // CST->HIR a tagged symbol is SKIPPED from extern-import synthesis (kernel32 does
+    // not export mtx_lock — the eager-import law) and instead recorded into
+    // `CstToHirResult.synthRecipeBySymbol` so HIR->MIR seeds `functionSymbols` (the
+    // call lowers to GlobalAddr) and the synth pass supplies the definition. Empty
+    // (default) for every ordinary shipped extern. (D-CSUBSET-C11-THREADS-HEADER)
+    std::string synthesize;
 };
+
+// True iff `id` is a member of the CLOSED pe64 <threads.h> synth-recipe vocabulary
+// (the 18 NON-trampoline Cycle-1 recipes; thrd_sleep + thrd_join are elf-FFI-only —
+// deferred on pe, see the .cpp vocab list). The SINGLE source of truth shared by the
+// descriptor loader (which rejects an unknown `synthesize` value fail-loud —
+// F_ShippedLibDescriptorMalformed) AND the driver's multi-CU merged-module recipe
+// reconstruction (program.cpp). The pe64 synth pass (`synthesizeThreadsShim`) has the
+// matching per-recipe body switch; a vocab id with no switch arm fails loud at synth
+// (they cannot silently diverge). Cycle-2 recipes (thrd_create/call_once) are NOT
+// here — they are the deferred trampolines. (D-CSUBSET-C11-THREADS-HEADER)
+[[nodiscard]] DSS_EXPORT bool isKnownSynthesizeRecipe(std::string_view id);
 
 // One decoded named CONSTANT — the neutral form of a header's object-like
 // `#define CHAR_BIT 8` surface (a macro that IS a compile-time constant). A C

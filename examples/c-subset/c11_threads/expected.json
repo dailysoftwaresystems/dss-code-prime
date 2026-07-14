@@ -1,0 +1,14 @@
+{
+  "$comment": "FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER) Cycle 1 — C11 <threads.h> on 3 legs. elf x86_64 + arm64 (qemu) resolve mtx_*/cnd_*/tss_* as DIRECT libc.so.6 FFI (glibc>=2.34); pe64 SYNTHESIZES each over kernel32 (synth_threads_shim.cpp). Deterministic exit 42 (40+2 via mutable globals, so the release arm runs the real path), NO thread creation (thrd_create is Cycle 2). macho CARVED OUT this cycle (D-CSUBSET-C11-THREADS-MACHO — macOS libSystem C11-threads export unverified) so there is NO darwin arm. RED-on-disable: delete shippedLibs/threads.json -> the #include fires F_ShippedHeaderNotFound and the compile fails.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

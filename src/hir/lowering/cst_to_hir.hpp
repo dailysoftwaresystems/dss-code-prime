@@ -125,6 +125,16 @@ struct DSS_EXPORT CstToHirResult {
     // (so `a[i]` / `sizeof a` read them) and size a's runtime alloca from R's
     // whole-object slot. Empty for every non-VLA-typedef translation unit.
     std::unordered_map<std::uint32_t, std::uint32_t> typedefVlaOriginBySymbol;
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): a pe64 <threads.h> shim symbol's
+    // SymbolId.v → its synth-recipe id (== the symbol name). Populated at CST→HIR when
+    // a `synthesize`-tagged `ShippedExternSymbol` is reached: instead of an
+    // ExternFunction/HirExternRecord (which would eager-import a non-exported kernel32
+    // name — the c101 0xC0000139 law), the symbol is recorded HERE. HIR→MIR reads it
+    // to SEED `functionSymbols` so the user's `mtx_lock(&m)` call lowers to
+    // GlobalAddr(sym) against a not-yet-defined callee (MirVerifier tolerates that),
+    // and `synthesizeThreadsShim` (mir/merge) supplies the definition before link.
+    // Empty for every non-threads (and every elf/macho) translation unit.
+    std::unordered_map<std::uint32_t, std::string> synthRecipeBySymbol;
     HirLiteralPool literalPool;   // decoded literal values, indexed by literalIndex
     // True iff neither lowering nor the verify-on-load pass emitted an
     // Error-severity diagnostic (delta-computed, so prior diagnostics on the

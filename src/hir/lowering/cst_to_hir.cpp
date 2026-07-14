@@ -8601,7 +8601,25 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // FnSig carries the param types, so the node needs NO param children — the
     // HIR→MIR extern pre-pass reads the signature, never the children); an
     // object symbol synthesizes ExternGlobal.
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): pe64 <threads.h> shim SymbolId.v →
+    // recipe id, for the module maps below. A tagged symbol is NOT turned into an
+    // ExternFunction/HirExternRecord here (see the skip in the loop).
+    std::vector<std::pair<std::uint32_t, std::string>> synthRecipeAcc;
     for (ShippedExternSymbol const& ext : model.shippedExterns()) {
+        // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): a `synthesize`-tagged symbol is a
+        // pe64 shim (mtx_lock etc.). Do NOT synthesize an extern import — kernel32
+        // exports no such name, and DSS eager-imports EVERY declared shipped extern, so
+        // a plain import would break the pe loader (STATUS_ENTRYPOINT_NOT_FOUND, the
+        // c101 law). Record {symbol, recipeId} instead so HIR→MIR SEEDS
+        // `functionSymbols` (the user call lowers to GlobalAddr against a not-yet-
+        // defined callee) and `synthesizeThreadsShim` supplies the body pre-link. This
+        // keys on the descriptor TAG (a data property carried ONLY on the pe variant),
+        // never on `if (format == pe)` — the elf variant is untagged and falls through
+        // to the ordinary extern-import path below.
+        if (!ext.recipeId.empty()) {
+            synthRecipeAcc.emplace_back(ext.symbol.v, ext.recipeId);
+            continue;
+        }
         HirNodeId const node = ext.isFunction
             ? builder.makeExternFunction(ext.signature, ext.symbol.v, {})
             : builder.makeExternGlobal(ext.signature, ext.symbol.v);
@@ -8633,6 +8651,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         result->sizeofVlaSymbol.emplace(sizeofNodeV, symV);
     for (auto& [objV, originV] : typedefOriginAcc)   // VLA C4b (D-CSUBSET-VLA)
         result->typedefVlaOriginBySymbol.emplace(objV, originV);
+    for (auto& [symV, recipe] : synthRecipeAcc)   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
+        result->synthRecipeBySymbol.emplace(symV, std::move(recipe));
     result->externDecls = std::move(externDecls);
 
     // verify-on-load.

@@ -38,6 +38,7 @@
 #include "mir/merge/mir_merge.hpp"
 #include "mir/merge/synth_pe_startup.hpp"       // synthesizePeStartup (c111)
 #include "mir/merge/synth_seh_funclets.hpp"     // synthesizeSehFunclets (c116)
+#include "mir/merge/synth_threads_shim.hpp"      // synthesizeThreadsShim (FC17.9a)
 #include "mir/mir.hpp"
 #include "mir/mir_node.hpp"
 #include "mir/mir_opcode.hpp"
@@ -1386,4 +1387,169 @@ TEST(SynthSehFunclets, FilterReadingParentLocalEmitsRecoverParentFrameSlot) {
 
     MirVerifier verifier{mir, &in};
     EXPECT_TRUE(verifier.verify(rep)) << "the H1 SEH-lowered module must verify";
+}
+
+// ── FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): synthesizeThreadsShim ──────────────
+// A caller references mtx_lock (pre-minted SymbolId{10}, seeded into functionSymbols by
+// the CST→HIR seam so the reference lowered to a GlobalAddr against a NOT-yet-defined
+// callee). The shim pass must (M4-a) turn that symbol into a DEFINED function, and
+// (M4-c) import EnterCriticalSection from kernel32 WITHOUT importing mtx_lock itself (the
+// eager-import law — kernel32 exports no mtx_lock). RED-on-disable: drop the seam and the
+// def never lands / the import re-appears.
+TEST(SynthThreadsShim, SynthesizesDefinitionAndHelperImportNotTheShimName) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    TypeId const pV  = in.pointer(in.primitive(TypeKind::Void));
+    TypeId const mainSig = in.fnSig({}, i32, CallConv::CcMS64);
+    std::array<TypeId, 1> const lockParams{pV};
+    TypeId const lockSig = in.fnSig(lockParams, i32, CallConv::CcSysV);  // the descriptor sig
+
+    MirBuilder mb;
+    mb.addFunction(mainSig, SymbolId{100});   // main
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
+    MirInstId const slot     = mb.addInst(MirOpcode::Alloca, {}, pV, 40);   // a mtx_t
+    MirInstId const lockAddr = mb.addGlobalAddr(SymbolId{10}, in.pointer(lockSig)); // ref mtx_lock
+    MirInstId const callOps[] = {lockAddr, slot};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+    mb.addReturn(call);
+    Mir mir = std::move(mb).finish();
+
+    std::unordered_map<std::uint32_t, std::string> recipes{{10u, "mtx_lock"}};
+    std::vector<ExternImport> externs;   // a threads.h-only TU imports no cond-var/CS yet
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, externs, rep));
+    EXPECT_FALSE(rep.hasErrors());
+
+    // M4(a): SymbolId{10} (mtx_lock) is now a DEFINED module function.
+    bool foundLockDef = false;
+    for (std::uint32_t i = 0; i < mir.moduleFuncCount(); ++i)
+        if (mir.funcSymbol(mir.funcAt(i)).v == 10u) foundLockDef = true;
+    EXPECT_TRUE(foundLockDef) << "mtx_lock must be a synthesized definition (M4-a)";
+
+    // M4(c): the shim NAME is never a kernel32 import; the helper it calls IS.
+    bool importedLock = false, importedEnter = false;
+    for (auto const& imp : externs) {
+        if (imp.mangledName == "mtx_lock") importedLock = true;
+        if (imp.mangledName == "EnterCriticalSection") {
+            importedEnter = true;
+            EXPECT_EQ(imp.libraryPath, "kernel32.dll");
+            EXPECT_FALSE(imp.isData);
+        }
+    }
+    EXPECT_FALSE(importedLock) << "mtx_lock must NOT be a kernel32 import (eager-import law, M4-c)";
+    EXPECT_TRUE(importedEnter) << "the synthesized mtx_lock body must import EnterCriticalSection";
+
+    // The synthesized module (the CcSysV user call + the CcMS64 shim definition +
+    // GlobalAddr to a fresh kernel32 helper) must survive MirVerifier — the mixed-CallConv
+    // call/def is verified per-instruction (the verifier tolerates the not-cross-checked CC).
+    MirVerifier verifier{mir, &in};
+    EXPECT_TRUE(verifier.verify(rep)) << "the shim-synthesized module must verify";
+}
+
+// An EMPTY recipe map (every elf/macho + non-threads TU) is a clean no-op: the module is
+// unchanged and no import is planted. Locks the pass to a pure data gate (never a format
+// check).
+TEST(SynthThreadsShim, EmptyRecipeMapIsNoOp) {
+    TypeInterner in{CompilationUnitId{1}};
+    TypeId const i32 = in.primitive(TypeKind::I32);
+    MirBuilder mb;
+    mb.addFunction(in.fnSig({}, i32, CallConv::CcMS64), SymbolId{100});
+    MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(e);
+    mb.addReturn(mb.addConst(i32Lit(0), i32));
+    Mir mir = std::move(mb).finish();
+
+    std::unordered_map<std::uint32_t, std::string> recipes;   // empty
+    std::vector<ExternImport> externs;
+    DiagnosticReporter rep;
+    ASSERT_TRUE(synthesizeThreadsShim(mir, in, recipes, externs, rep));
+    EXPECT_FALSE(rep.hasErrors());
+    EXPECT_EQ(mir.moduleFuncCount(), 1u) << "no shim appended for an empty map";
+    EXPECT_TRUE(externs.empty()) << "no kernel32 import planted for an empty map";
+}
+
+// ── FC17.9(a): MULTI-CU threads. A shim symbol is REFERENCED-ONLY per CU (skipped from
+// import at CST→HIR; defined POST-merge). The merge's step-3c must pre-register it a
+// merged id, else the clone ABORTS (mergedSymbolOf) on the caller's GlobalAddr — the
+// exact latent crash the audit caught. RED-on-disable: WITHOUT step-3c this test does not
+// fail-soft, it std::abort()s the process (a hard crash) — the strongest red-on-disable.
+// After the merge the shim lands in symbolNames as a not-yet-defined vocab symbol; the
+// program.cpp reconstruction (mirrored here) synthesizes it → the merged module verifies.
+TEST(MirMerge, MultiCuThreadsShimRegistersAndSynthesizes) {
+    // CU0: int main() { mtx_lock(&slot); return 0; } — mtx_lock is a referenced-only shim
+    // (SymbolId{10}: a GlobalAddr callee, NOT a defined func, NOT an ExternImport).
+    TypeInterner in0{CompilationUnitId{1}};
+    TypeId const i32_0 = in0.primitive(TypeKind::I32);
+    TypeId const pV0   = in0.pointer(in0.primitive(TypeKind::Void));
+    TypeId const mainSig = in0.fnSig({}, i32_0, CallConv::CcMS64);
+    std::array<TypeId, 1> const lockParams{pV0};
+    TypeId const lockSig = in0.fnSig(lockParams, i32_0, CallConv::CcSysV);
+    Mir mir0;
+    {
+        MirBuilder mb;
+        mb.addFunction(mainSig, SymbolId{100});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        MirInstId const slot     = mb.addInst(MirOpcode::Alloca, {}, pV0, 40);
+        MirInstId const lockAddr = mb.addGlobalAddr(SymbolId{10}, in0.pointer(lockSig));
+        MirInstId const callOps[] = {lockAddr, slot};
+        mb.addInst(MirOpcode::Call, callOps, i32_0);
+        mb.addReturn(mb.addConst(i32Lit(0), i32_0));
+        mir0 = std::move(mb).finish();
+    }
+    std::unordered_map<std::uint32_t, std::string> const recipes0{{10u, "mtx_lock"}};
+
+    // CU1: a plain helper (only to force the N>1 merge path).
+    TypeInterner in1{CompilationUnitId{2}};
+    TypeId const i32_1 = in1.primitive(TypeKind::I32);
+    TypeId const sig1  = in1.fnSig({}, i32_1, CallConv::CcSysV);
+    Mir mir1;
+    {
+        MirBuilder mb;
+        mb.addFunction(sig1, SymbolId{50});
+        MirBlockId const e = mb.createBlock(StructCfMarker::EntryBlock);
+        mb.beginBlock(e);
+        mb.addReturn(mb.addConst(i32Lit(7), i32_1));
+        mir1 = std::move(mb).finish();
+    }
+
+    MergeCuInput cu0{&mir0, &in0, namerOf({{100, "main"}, {10, "mtx_lock"}}), {}};
+    cu0.synthRecipes = &recipes0;   // ← the referenced-only shim, threaded to the merge
+    MergeCuInput cu1{&mir1, &in1, namerOf({{50, "helper"}}), {}};
+    std::vector<MergeCuInput> cus{cu0, cu1};
+
+    std::vector<std::string> const entries{"main"};
+    DiagnosticReporter rep;
+    auto merged = mergeCuMirs(cus, TypeLattice{CompilationUnitId{99}}, entries, rep);
+    ASSERT_TRUE(merged.has_value())
+        << "the merge must NOT abort on a referenced-only shim GlobalAddr (multi-CU defect)";
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    // step-3c registered the shim with a merged id + a symbolNames entry.
+    std::optional<std::uint32_t> shimV;
+    for (auto const& [v, name] : merged->symbolNames)
+        if (name == "mtx_lock") shimV = v;
+    ASSERT_TRUE(shimV.has_value())
+        << "step-3c must register the referenced-only shim in symbolNames";
+    // It is referenced-only in the merged module (no def, no import) — the exact state the
+    // program.cpp reconstruction detects and hands to synthesizeThreadsShim.
+    for (std::uint32_t i = 0; i < merged->mir.moduleFuncCount(); ++i)
+        EXPECT_NE(merged->mir.funcSymbol(merged->mir.funcAt(i)).v, *shimV)
+            << "the shim is not yet defined pre-synthesis";
+    EXPECT_TRUE(merged->externImports.empty()) << "the shim is never an import";
+
+    std::unordered_map<std::uint32_t, std::string> mergedRecipes{{*shimV, "mtx_lock"}};
+    std::vector<ExternImport> externs = merged->externImports;
+    ASSERT_TRUE(synthesizeThreadsShim(merged->mir, merged->host.interner(),
+                                      mergedRecipes, externs, rep));
+    EXPECT_FALSE(rep.hasErrors());
+
+    bool defined = false;
+    for (std::uint32_t i = 0; i < merged->mir.moduleFuncCount(); ++i)
+        if (merged->mir.funcSymbol(merged->mir.funcAt(i)).v == *shimV) defined = true;
+    EXPECT_TRUE(defined) << "the shim is synthesized as a merged-module definition";
+
+    MirVerifier verifier{merged->mir, &merged->host.interner()};
+    EXPECT_TRUE(verifier.verify(rep)) << "the merged + shim-synthesized module must verify";
 }

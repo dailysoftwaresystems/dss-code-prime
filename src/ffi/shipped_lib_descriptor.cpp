@@ -677,6 +677,30 @@ decodeConstantValueAndType(json const& obj, std::string const& at,
 
 } // namespace
 
+// FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): the CLOSED pe64 <threads.h> synth-recipe
+// vocabulary — the 18 NON-trampoline Cycle-1 recipes, each named for the C11 function
+// it implements (the `synthesize` value MUST equal the symbol name). Grouped by family
+// for auditability; ALL are single-basic-block (the post-optimize single-CU synth site
+// re-derives no canonical CF markers, so a multi-block recipe is out of scope this
+// cycle). DELIBERATELY absent (deferred): thrd_create/call_once (the Cycle-2
+// trampolines, D-CSUBSET-C11-THREADS-TRAMPOLINES) · thrd_equal · the timed-waits AND
+// thrd_sleep (a pe timespec read has an unverified time_t/long-width layout — a wrong
+// offset is a silent miscompile → elf-FFI-only, D-CSUBSET-C11-THREADS-TIMED) · thrd_join
+// (its only correct recipe branches on `res != NULL` → multi-block, AND it is unusable
+// without thrd_create's joinable handle → elf-FFI-only, deferred to Cycle 2). A closed
+// `contains`-check — never an `if (id == ...)` chain that could silently drift; MUST
+// stay in lock-step with the synth pass switch (a vocab id with no arm fails loud).
+bool isKnownSynthesizeRecipe(std::string_view id) {
+    static constexpr std::string_view kRecipes[] = {
+        "mtx_init", "mtx_lock", "mtx_unlock", "mtx_trylock", "mtx_destroy",
+        "cnd_init", "cnd_signal", "cnd_broadcast", "cnd_wait", "cnd_destroy",
+        "tss_create", "tss_get", "tss_set", "tss_delete",
+        "thrd_current", "thrd_yield", "thrd_exit", "thrd_detach",
+    };
+    for (auto r : kRecipes) if (r == id) return true;
+    return false;
+}
+
 std::optional<ShippedLibDescriptor>
 readShippedLibDescriptor(std::filesystem::path const&    path,
                          TypeInterner&                   interner,
@@ -876,6 +900,39 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             noreturn = sym.at("noreturn").get<bool>();
         }
 
+        // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): optional `synthesize` recipe tag
+        // (default empty) — marks a pe64 <threads.h> shim symbol (mtx_lock etc.) whose
+        // body the synth pass emits over kernel32, rather than a plain FFI import.
+        // Closed-vocab + name-invariant fail-loud: a non-empty value MUST be a known
+        // recipe id (`isKnownSynthesizeRecipe`) AND equal this symbol's own `name` (the
+        // synth pass keys the body on the symbol name — a mismatch would emit the wrong
+        // recipe). A typo in either fails the read (never a silent wrong shim). The
+        // `linkageFromName`/closed-enum precedent, applied to a config verb.
+        std::string synthesize;
+        if (sym.contains("synthesize")) {
+            if (!sym.at("synthesize").is_string()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": 'synthesize' must be a string");
+                continue;
+            }
+            synthesize = sym.at("synthesize").get<std::string>();
+            if (!synthesize.empty()) {
+                if (!isKnownSynthesizeRecipe(synthesize)) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                        + ": unknown 'synthesize' recipe id '" + synthesize
+                        + "' (closed vocabulary — see isKnownSynthesizeRecipe)");
+                    continue;
+                }
+                if (synthesize != name) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                        + ": 'synthesize' recipe id '" + synthesize
+                        + "' must equal the symbol name '" + name
+                        + "' (the synth pass identifies the recipe by symbol name)");
+                    continue;
+                }
+            }
+        }
+
         // Optional per-SYMBOL `availableObjectFormats` — which object-formats this
         // symbol EXISTS on (errno's __error is ["macho"], __errno_location ["elf"];
         // the Linux-only fdatasync/fallocate/mremap are ["elf"]). EMPTY/absent =
@@ -949,7 +1006,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         (void)rejectUnknownKeys(reporter, sym, "symbols[" + std::to_string(idx - 1) + "]",
                                 {"name", "signature", "signatureByDataModel",
                                  "kind", "linkage", "availableObjectFormats",
-                                 "noreturn"});
+                                 "noreturn", "synthesize"});
 
         // Decode the signature via the ONE type-text decoder. A decode failure
         // is the CRITICAL fail-loud: F_ShippedLibUnsupportedType, and the
@@ -977,7 +1034,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
 
         out.symbols.push_back(
             ShippedSymbol{std::move(name), sig, kind, linkage, std::move(symAvail),
-                          noreturn});
+                          noreturn, std::move(synthesize)});
     }
 
     // (5) Optional `constants` array — the neutral form of a header's object-

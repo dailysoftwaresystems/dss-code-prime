@@ -2995,4 +2995,80 @@ TEST(ShippedLibDescriptor, RealWindowsUlargeOverlayLayout) {
     EXPECT_TRUE(saw) << "ULARGE_INTEGER absent from windows.json structs on pe";
 }
 
+// ── FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): the pe64 <threads.h> shim `synthesize`
+//    recipe tag ────────────────────────────────────────────────────────────────────
+
+// A known recipe id that EQUALS the symbol name decodes onto `ShippedSymbol.synthesize`.
+// The vocabulary predicate is the SINGLE source of truth shared with the driver's merged
+// reconstruction; the Cycle-2 trampolines are NOT in it (deferred).
+TEST(ShippedLibDescriptor, SynthesizeTagDecodesForKnownRecipe) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "threads.json", R"({
+        "header": "threads.h",
+        "symbols": [
+            { "name": "mtx_lock", "signature": "fn(ptr<void>) -> i32",
+              "availableObjectFormats": ["pe"], "synthesize": "mtx_lock" },
+            { "name": "mtx_lock", "signature": "fn(ptr<void>) -> i32",
+              "availableObjectFormats": ["elf"] }
+        ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->symbols.size(), 2u);
+    // The pe entry carries the tag; the elf entry is a PLAIN untagged extern (locks the
+    // tag pe-only — M4(b) at the descriptor tier).
+    EXPECT_EQ(desc->symbols[0].synthesize, "mtx_lock");
+    EXPECT_TRUE(desc->symbols[1].synthesize.empty());
+    EXPECT_TRUE(isKnownSynthesizeRecipe("mtx_lock"));
+    EXPECT_TRUE(isKnownSynthesizeRecipe("tss_create"));
+    EXPECT_FALSE(isKnownSynthesizeRecipe("thrd_create"));  // Cycle-2 trampoline (deferred)
+    EXPECT_FALSE(isKnownSynthesizeRecipe("thrd_join"));    // deferred (multi-block/unusable)
+    EXPECT_FALSE(isKnownSynthesizeRecipe("bogus"));
+}
+
+// M4(d): an UNKNOWN `synthesize` recipe id fails the read (closed vocabulary).
+// RED-ON-DISABLE: without the isKnownSynthesizeRecipe guard a typo'd recipe reaches the
+// synth pass with no arm → a silently-undefined shim.
+TEST(ShippedLibDescriptor, SynthesizeUnknownRecipeFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "threads_bad.json", R"({
+        "header": "threads.h",
+        "symbols": [
+            { "name": "mtx_lock", "signature": "fn(ptr<void>) -> i32",
+              "availableObjectFormats": ["pe"], "synthesize": "mtx_lokc" }
+        ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// The `synthesize` value MUST EQUAL the symbol name — the synth pass keys each body on
+// the symbol name, so a mismatch would synthesize the WRONG recipe. Fail loud.
+// RED-ON-DISABLE: without the name-invariant a descriptor could map mtx_lock's symbol to
+// mtx_unlock's body (a lock that silently unlocks).
+TEST(ShippedLibDescriptor, SynthesizeNameMismatchFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "threads_mismatch.json", R"({
+        "header": "threads.h",
+        "symbols": [
+            { "name": "mtx_lock", "signature": "fn(ptr<void>) -> i32",
+              "availableObjectFormats": ["pe"], "synthesize": "mtx_unlock" }
+        ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
 } // namespace
