@@ -3,9 +3,10 @@
 // Pins golden byte-level invariants of the emitted ELF64 relocatable
 // object:
 //   * Elf64_Ehdr identity bytes match the gABI spec for ET_REL x86_64.
-//   * Section count = 6 (SHT_NULL + .text + .rela.text + .symtab +
-//     .strtab + .shstrtab).
-//   * e_shstrndx points at .shstrtab (index 5).
+//   * Section count = 7 (SHT_NULL + .text + .rela.text + .symtab +
+//     .strtab + .shstrtab + .note.GNU-stack appended last).
+//   * e_shstrndx points at .shstrtab (index 5) — unchanged by the
+//     appended-last .note.GNU-stack (D-LK-OBJECT-EXTERN-SYMBOL-NAMES).
 //   * .symtab sh_info equals the index of the first non-LOCAL symbol
 //     (mandatory by gABI 4.18 — local-then-global ordering).
 //   * Function symbol's st_value matches its offset within .text.
@@ -83,6 +84,17 @@ struct Loaded {
     return mod;
 }
 
+// Read the NUL-terminated symbol name at `strtabOff + stName` in `.strtab`.
+[[nodiscard]] std::string readStrtabName(std::vector<std::uint8_t> const& bytes,
+                                          std::uint64_t strtabOff,
+                                          std::uint32_t stName) {
+    std::string out;
+    for (std::size_t p = strtabOff + stName; p < bytes.size() && bytes[p] != 0; ++p) {
+        out.push_back(static_cast<char>(bytes[p]));
+    }
+    return out;
+}
+
 } // namespace
 
 // ── Shipped JSON loads ───────────────────────────────────────────
@@ -145,15 +157,15 @@ TEST(ElfWriter, Elf64EhdrIdentityBytesMatchGabiSpec) {
     EXPECT_EQ(readU16LE(bytes, 52), 64u);
     // e_shentsize = 64 (sizeof Elf64_Shdr)
     EXPECT_EQ(readU16LE(bytes, 58), 64u);
-    // e_shnum = 6
-    EXPECT_EQ(readU16LE(bytes, 60), 6u);
-    // e_shstrndx = 5
+    // e_shnum = 7 (…+ .note.GNU-stack appended last)
+    EXPECT_EQ(readU16LE(bytes, 60), 7u);
+    // e_shstrndx = 5 (.shstrtab; unchanged — .note.GNU-stack is index 6)
     EXPECT_EQ(readU16LE(bytes, 62), 5u);
 }
 
 // ── Section header table layout ─────────────────────────────────
 
-TEST(ElfWriter, SectionHeaderTableHasSixEntriesNullThenTextThenRelocAtEnd) {
+TEST(ElfWriter, SectionHeaderTableHasSevenEntriesNullThenTextThenRelocThenNoteLast) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 42);
     DiagnosticReporter rep;
@@ -163,7 +175,7 @@ TEST(ElfWriter, SectionHeaderTableHasSixEntriesNullThenTextThenRelocAtEnd) {
     // e_shoff is the file offset of the section header table.
     std::uint64_t const shoff = readU64LE(bytes, 40);
     ASSERT_GT(shoff, 64u);
-    ASSERT_LE(shoff + 6 * 64, bytes.size())
+    ASSERT_LE(shoff + 7 * 64, bytes.size())
         << "section header table must fit within file";
 
     // Section header 0 (SHT_NULL) is all zero.
@@ -181,6 +193,17 @@ TEST(ElfWriter, SectionHeaderTableHasSixEntriesNullThenTextThenRelocAtEnd) {
     // Section header 2 (.rela.text): sh_type=SHT_RELA(4), sh_entsize=24.
     EXPECT_EQ(readU32LE(bytes, shoff + 128 + 4), 4u);
     EXPECT_EQ(readU64LE(bytes, shoff + 128 + 56), 24u);
+
+    // Section header 6 (.note.GNU-stack, appended LAST — D-LK-OBJECT-EXTERN-
+    // SYMBOL-NAMES): SHT_PROGBITS(1), sh_flags=0 (NO SHF_EXECINSTR — the
+    // non-executable-stack marker), sh_size=0 (empty).
+    std::uint64_t const noteShdr = shoff + 6 * 64;
+    EXPECT_EQ(readU32LE(bytes, noteShdr + 4), 1u)  // sh_type
+        << ".note.GNU-stack must be SHT_PROGBITS";
+    EXPECT_EQ(readU64LE(bytes, noteShdr + 8), 0u)  // sh_flags
+        << ".note.GNU-stack sh_flags must be 0 (no SHF_EXECINSTR)";
+    EXPECT_EQ(readU64LE(bytes, noteShdr + 32), 0u) // sh_size
+        << ".note.GNU-stack is an empty marker section";
 }
 
 // ── .symtab local-then-global ordering ──────────────────────────
@@ -235,6 +258,67 @@ TEST(ElfWriter, FunctionSymbolStValueMatchesTextOffset) {
     // sizes match function byte counts.
     EXPECT_EQ(readU64LE(bytes, symtabOff + 2 * 24 + 16), 3u);
     EXPECT_EQ(readU64LE(bytes, symtabOff + 3 * 24 + 16), 1u);
+}
+
+// ── D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real names in the .o symtab ──
+
+TEST(ElfWriter, ObjectSymtabCarriesRealNameForExternalDefButStaticStaysInternal) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    // Two defined functions covering both externally-visible forms:
+    //   * fn A (SymbolId 10) — externally-visible (Global) → REAL name.
+    //   * fn B (SymbolId 11) — static (Local) → stays internal `sym_11`.
+    // (The IMPORT side — naming an undefined extern — is out of scope: the
+    // ET_REL path rejects extern imports before the symtab, so no undefined
+    // symbol arises; it is deferred with object-path extern support.)
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+
+    AssembledFunction a;
+    a.symbol = SymbolId{10};
+    a.bytes  = {0xC3};
+    mod.functions.push_back(std::move(a));
+
+    AssembledFunction b;
+    b.symbol = SymbolId{11};
+    b.bytes  = {0xC3};
+    mod.functions.push_back(std::move(b));
+
+    // The name/binding table the compile pipeline populates (LK11a), carrying
+    // the already-mangled on-binary name (identity on ELF).
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "public_fn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{11}, "static_fn",
+                                       SymbolBinding::Local,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    std::uint64_t const shoff     = readU64LE(bytes, 40);
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + 3 * 64 + 24);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + 4 * 64 + 24);
+
+    // Symtab order: 0=UNDEF, 1=STT_SECTION, 2=fnA, 3=fnB.
+    auto nameAt = [&](std::uint64_t i) {
+        return readStrtabName(bytes, strtabOff,
+                              readU32LE(bytes, symtabOff + i * 24 + 0));
+    };
+    auto infoAt = [&](std::uint64_t i) { return bytes[symtabOff + i * 24 + 4]; };
+
+    // EXPORT — externally-visible fn A carries its real C name (STB_GLOBAL|STT_FUNC).
+    EXPECT_EQ(nameAt(2), "public_fn")
+        << "externally-visible defined function must carry its real name";
+    EXPECT_EQ(infoAt(2), 0x12u);   // (STB_GLOBAL<<4)|STT_FUNC
+
+    // CARVE-OUT — static fn B stays internal `sym_11` (isExternallyVisible=false).
+    EXPECT_EQ(nameAt(3), "sym_11")
+        << "a static (Local-binding) function must stay internal, not leak its "
+           "real name into the object symtab";
+    EXPECT_EQ(infoAt(3), 0x12u);   // still STB_GLOBAL|STT_FUNC (name-only carve-out)
 }
 
 // ── Rela r_info encodes (sym << 32) | nativeId ──────────────────

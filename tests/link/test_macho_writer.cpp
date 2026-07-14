@@ -232,6 +232,42 @@ TEST(MachOWriter, LcSymtabReferencesNlist64AndStringTable) {
     EXPECT_GE(strsize, 8u);
 }
 
+// ── D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real (pre-mangled) name verbatim ──
+
+TEST(MachOWriter, ObjectSymtabEmitsPipelineMangledNameVerbatimNoDoubleUnderscore) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{10};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    // The compile pipeline pre-mangles a Mach-O defined name with a leading
+    // `_` (applyCMangling). The writer must emit it VERBATIM — a writer-side
+    // re-mangle would DOUBLE it to `__public_fn`. Seeding the already-`_`-
+    // prefixed name is what makes a double-mangle detectable.
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_public_fn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // Single-symbol layout matches the LcSymtab test: LC_SYMTAB at 184,
+    // stroff at 200; the name sits at strtab offset 1 (past the leading NUL).
+    std::uint32_t const stroff = readU32LE(bytes, 200);
+    std::string name;
+    for (std::size_t p = stroff + 1; p < bytes.size() && bytes[p] != 0; ++p) {
+        name.push_back(static_cast<char>(bytes[p]));
+    }
+    EXPECT_EQ(name, "_public_fn")
+        << "Mach-O writer must emit the pipeline-mangled name verbatim — "
+           "exactly one leading underscore, never a re-mangled `__public_fn`";
+}
+
 // ── relocation_info r_info packing ─────────────────────────────
 
 TEST(MachOWriter, RelocationInfoPacksTypeLengthPcrelExternSymbolnum) {

@@ -349,7 +349,8 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // would re-intern CU0's types into a fresh host (a no-op for correctness, but extra
     // work + a different code path); keep the proven single-CU lowering for byte-identity.
     if (cuMirs.size() == 1) {
-        auto mod = lowerCuMirToAssembly(cuMirs[0], (*formatR)->processArgs(), reporter);
+        auto mod = lowerCuMirToAssembly(cuMirs[0], (*formatR)->processArgs(),
+                                        (*formatR)->kind(), reporter);
         if (!mod) return false;  // back-half tier failure already reported via `reporter`
         return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},
                             **targetR, **formatR, outPath, reporter);

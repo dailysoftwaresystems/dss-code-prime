@@ -226,6 +226,56 @@ TEST(PeWriter, SymbolRecordsAre18BytesPackedNoPadding) {
     EXPECT_EQ(bytes[symPtr + 17], 0u);
 }
 
+// ── D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real names in the .obj symtab ──
+
+TEST(PeWriter, ObjectSymtabCarriesRealNameForExternalDefButStaticStaysInternal) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    // Two defined functions: A externally-visible (Global) → real name;
+    // B static (Local) → stays internal `sym_11`. Names are ≤ 8 chars so
+    // the COFF Name field inlines them (no string-table indirection).
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction a;
+    a.symbol = SymbolId{10};
+    a.bytes  = {0xC3};
+    mod.functions.push_back(std::move(a));
+    AssembledFunction b;
+    b.symbol = SymbolId{11};
+    b.bytes  = {0xC3};
+    mod.functions.push_back(std::move(b));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "realfn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{11}, "statfn",
+                                       SymbolBinding::Local,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    std::uint32_t const symPtr  = readU32LE(bytes, 8);
+    std::uint32_t const numSyms = readU32LE(bytes, 12);
+    ASSERT_EQ(numSyms, 2u);
+
+    auto inlineNameAt = [&](std::uint32_t recOff) {
+        std::string s;
+        for (std::size_t i = 0; i < 8 && bytes[recOff + i] != 0; ++i) {
+            s.push_back(static_cast<char>(bytes[recOff + i]));
+        }
+        return s;
+    };
+
+    // Symbol 0 = fn A (externally-visible) → real inlined name.
+    EXPECT_EQ(inlineNameAt(symPtr), "realfn")
+        << "externally-visible defined function must carry its real name";
+    // Symbol 1 = fn B (static) → stays internal `sym_11`.
+    EXPECT_EQ(inlineNameAt(symPtr + 18u), "sym_11")
+        << "a static (Local-binding) function must stay internal in the .obj";
+}
+
 // ── String table starts with 4-byte u32 size including itself ──
 
 TEST(PeWriter, StringTableHasSizePrefixAndIncludesItself) {

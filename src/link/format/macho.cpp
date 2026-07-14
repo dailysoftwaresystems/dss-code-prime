@@ -7,6 +7,7 @@
 #include "link/format/interior_block_symbol_va.hpp"
 #include "link/format/macho_chained_fixups.hpp"
 #include "link/format/macho_codesign.hpp"
+#include "link/format/object_symbol_names.hpp"
 #include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
 
@@ -670,10 +671,15 @@ encode(AssembledModule const&    module,
 
     constexpr std::uint8_t kTextSectionNumber = 1;
 
+    // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real source-level C names (already
+    // Mach-O-mangled with a leading `_` by the pipeline — emitted VERBATIM,
+    // never re-mangled) for the externally-visible defined functions;
+    // `_sym_<id>` fallback for static/local/synthesized symbols.
+    link::format::ObjectSymbolNames const objNames{module};
+
     // Defined function symbols: N_SECT|N_EXT, n_sect=1, n_value=offset.
     for (auto const& f : funcSyms) {
-        std::string const symName =
-            std::string{"_sym_"} + std::to_string(f.symId.v);
+        std::string const symName = objNames.definedName(f.symId, "_sym_");
         std::uint32_t const nameOff = strtab.add(symName);
         appendNlist(nameOff,
                     static_cast<std::uint8_t>(N_SECT | N_EXT),

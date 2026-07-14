@@ -6,6 +6,7 @@
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/interior_block_symbol_va.hpp"
+#include "link/format/object_symbol_names.hpp"
 #include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
 
@@ -1958,6 +1959,16 @@ encode(AssembledModule const&    module,
     bool const hasRodata = isExec && !rodataLayout.empty();
     bool const hasData   = isExec && !dataLayout.empty();
     bool const hasBss    = isExec && !bssLayout.empty();
+    // D-LK-OBJECT-EXTERN-SYMBOL-NAMES (secondary): an empty `.note.GNU-stack`
+    // marks the ET_REL object's stack as NON-executable, silencing the
+    // `ld: missing .note.GNU-stack section implies executable stack` warning
+    // when a foreign linker consumes it. Schema-DRIVEN + graceful: emitted
+    // only when the format declares a `note` section (so a format opts out by
+    // omitting the row — no hard `requireSection`), and only for ET_REL (an
+    // executable carries stack policy in a PT_GNU_STACK program header, not a
+    // section). `secNote` may be null; the peek never fails loud.
+    auto const* secNote = fmt.sectionByKind(SectionKind::Note);
+    bool const hasNote  = !isExec && (secNote != nullptr);
     // Reject dataItems on the ET_REL (.o) path loudly — the linker's
     // per-format gate already advertises rodata only on the exec
     // schema, but defend in depth: a hand-built ET_REL module with
@@ -2133,6 +2144,14 @@ encode(AssembledModule const&    module,
     StringTable strtab;
     std::vector<std::uint8_t> symtab;
 
+    // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real source-level C names for the
+    // externally-visible defined functions (so a foreign linker resolves
+    // `gcc main.c dss.o` by name); `sym_<id>` fallback for static/local/
+    // synthesized symbols. Built once from `module` for O(1) per-symbol
+    // lookup below. (The IMPORT side is moot in ET_REL — extern imports are
+    // rejected before this point.)
+    link::format::ObjectSymbolNames const objNames{module};
+
     // Helper: emit one Elf64_Sym record (24 bytes).
     auto appendSym = [&](std::uint32_t nameOff, std::uint8_t info,
                           std::uint8_t other, std::uint16_t shndx,
@@ -2193,10 +2212,19 @@ encode(AssembledModule const&    module,
     std::uint32_t const firstNonLocalSymIdx =
         static_cast<std::uint32_t>(symtab.size() / 24);
 
-    // Defined function symbols (GLOBAL + STT_FUNC + shndx=.text).
+    // Defined function symbols (GLOBAL + STT_FUNC + shndx=.text). In an
+    // ET_REL object an externally-visible symbol gets its real C name
+    // (D-LK-OBJECT-EXTERN-SYMBOL-NAMES) so a foreign linker resolves it; a
+    // static/local one keeps `sym_<id>` (binding stays GLOBAL — the `may stay
+    // internal` name carve-out). ET_EXEC keeps the synthesized `sym_<id>`
+    // form UNCHANGED — its entry-point resolution matches the schema's
+    // `entryPoint` string against that reconstructed name (D-LK1-1), and no
+    // foreign toolchain ever re-links a DSS executable, so real names there
+    // are an unfired, separate concern.
     for (auto const& f : funcSyms) {
         std::string const symName =
-            std::string{"sym_"} + std::to_string(f.symId.v);
+            isExec ? std::string{"sym_"} + std::to_string(f.symId.v)
+                   : objNames.definedName(f.symId, "sym_");
         std::uint32_t const nameOff = strtab.add(symName);
         std::uint32_t const idx =
             static_cast<std::uint32_t>(symtab.size() / 24);
@@ -2272,11 +2300,14 @@ encode(AssembledModule const&    module,
     // ── Section ordering + .shstrtab ───────────────────────────
     //
     // ET_REL order: SHT_NULL, .text, .rela.text, .symtab, .strtab,
-    // .shstrtab. ET_EXEC drops `.rela.text` entirely (no SHT_NULL
-    // placeholder): intra-module relocations were applied in-place
-    // to `.text` by `applyExecRelocations` above (LK6 cycle 1,
-    // closes D-LK1-3); extern relocs (FFI / dynamic linking) are
-    // anchored at D-LK6-2 and don't reach this point.
+    // .shstrtab, [.note.GNU-stack]. `.note.GNU-stack` (when the schema
+    // declares it) is appended LAST — after .shstrtab — so every existing
+    // section index and e_shstrndx stay put (a zero-size marker's position
+    // is irrelevant; e_shstrndx names .shstrtab explicitly). ET_EXEC drops
+    // `.rela.text` entirely (no SHT_NULL placeholder): intra-module
+    // relocations were applied in-place to `.text` by `applyExecRelocations`
+    // above (LK6 cycle 1, closes D-LK1-3); extern relocs (FFI / dynamic
+    // linking) are anchored at D-LK6-2 and don't reach this point.
     StringTable shstrtab;
     SectionHeader hNull{};
     SectionHeader hText{};
@@ -2287,6 +2318,7 @@ encode(AssembledModule const&    module,
     SectionHeader hSymtab{};
     SectionHeader hStrtab{};
     SectionHeader hShStrtab{};
+    SectionHeader hNote{};
     hText.name_offset      = shstrtab.add(secText->name);
     if (hasRodata) {
         hRodata.name_offset = shstrtab.add(secRodata->name);
@@ -2303,6 +2335,9 @@ encode(AssembledModule const&    module,
     hSymtab.name_offset    = shstrtab.add(secSymtab->name);
     hStrtab.name_offset    = shstrtab.add(secStrtab->name);
     hShStrtab.name_offset  = shstrtab.add(secShStrtab->name);
+    if (hasNote) {
+        hNote.name_offset  = shstrtab.add(secNote->name);
+    }
 
     // Section indices — IDX_TEXT==1 is pinned (the STT_SECTION sym
     // emitted above hardcodes st_shndx=1). Other indices depend on
@@ -2413,6 +2448,18 @@ encode(AssembledModule const&    module,
     hShStrtab.entry_size = secShStrtab->entrySize;
     hShStrtab.size       = shstrtab.size();
 
+    // `.note.GNU-stack` — empty (size 0) SHT_PROGBITS with sh_flags=0 (NO
+    // SHF_EXECINSTR): its mere presence tells `ld` the object needs no
+    // executable stack. type/flags/align all from the schema row (not
+    // hardcoded), matching `.section .note.GNU-stack,"",@progbits`.
+    if (hasNote) {
+        hNote.type       = secNote->type;
+        hNote.flags      = secNote->flags;
+        hNote.addr_align = std::max<std::uint64_t>(1, secNote->addrAlign);
+        hNote.entry_size = secNote->entrySize;
+        hNote.size       = 0;
+    }
+
     // ── Layout pass: compute sh_offset for each section ────────
     //
     // ET_REL: [Ehdr] + section bodies + SHT at end.
@@ -2431,7 +2478,7 @@ encode(AssembledModule const&    module,
 
     std::vector<std::uint8_t> bytes;
     bytes.reserve(kEhdrSize + phtSize + text.size() + relaText.size()
-                  + symtab.size() + strtab.size() + shstrtab.size() + 6 * 64);
+                  + symtab.size() + strtab.size() + shstrtab.size() + 7 * 64);
     bytes.resize(kEhdrSize + phtSize);  // placeholder; rewritten below
 
     // Single layout lambda — `vector<uint8_t> const&` decays to
@@ -2516,6 +2563,10 @@ encode(AssembledModule const&    module,
     layoutSection(hSymtab, symtab);
     layoutSection(hStrtab, strtab.view());
     layoutSection(hShStrtab, shstrtab.view());
+    // `.note.GNU-stack` last — a zero-length body, so it just records a valid
+    // sh_offset (no bytes appended). Keeping it after .shstrtab is what leaves
+    // every existing section index + e_shstrndx untouched.
+    if (hasNote) layoutSection(hNote, std::span<std::uint8_t const>{});
 
     padTo(bytes, 8);  // SHT alignment
     std::uint64_t const shoff = bytes.size();
@@ -2528,7 +2579,7 @@ encode(AssembledModule const&    module,
     // actually-emitted slots — same architect B-LK1-2 / D-LK2-5
     // discipline that LK1 cycle 1 + LK2 already adopt.
     std::vector<SectionHeader const*> headers;
-    headers.reserve(7);
+    headers.reserve(8);
     headers.push_back(&hNull);
     headers.push_back(&hText);
     // `.rodata` at index 2 when present (D-LK1-ELF-EXEC-DATA-SECTIONS)
@@ -2544,6 +2595,9 @@ encode(AssembledModule const&    module,
     headers.push_back(&hSymtab);
     headers.push_back(&hStrtab);
     headers.push_back(&hShStrtab);
+    // `.note.GNU-stack` appended LAST (after .shstrtab) so it grows only
+    // `e_shnum` — every prior index + `e_shstrndx` are unchanged.
+    if (hasNote) headers.push_back(&hNote);
     std::uint16_t const sectionCount =
         static_cast<std::uint16_t>(headers.size());
     for (auto const* h : headers) writeSectionHeader(bytes, *h);

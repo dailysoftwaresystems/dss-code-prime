@@ -69,6 +69,15 @@
       "flags": 0,
       "addrAlign": 1,
       "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-EXTERN-SYMBOL-NAMES: empty non-executable-stack marker for foreign-toolchain interop. sh_type = SHT_PROGBITS (1); sh_flags = 0 (NO SHF_EXECINSTR) is what tells `ld` the stack need not be executable; addralign = 1; size 0. The ELF writer emits it (appended last, ET_REL only) iff this row is present.",
+      "kind": "note",
+      "name": ".note.GNU-stack",
+      "type": 1,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0
     }
   ],
 

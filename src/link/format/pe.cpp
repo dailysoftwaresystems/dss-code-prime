@@ -6,6 +6,7 @@
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/interior_block_symbol_va.hpp"
+#include "link/format/object_symbol_names.hpp"
 #include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
 
@@ -755,10 +756,15 @@ encode(AssembledModule const&    module,
 
     constexpr std::int16_t kTextSectionNumber = 1;
 
+    // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real source-level C names for the
+    // externally-visible defined functions; `sym_<id>` fallback for
+    // static/local/synthesized symbols.
+    link::format::ObjectSymbolNames const objNames{module};
+
     // Defined function symbols (GLOBAL EXTERNAL, type=FUNCTION,
     // SectionNumber=1 for `.text`).
     for (auto const& f : funcSyms) {
-        std::string const symName = "sym_" + std::to_string(f.symId.v);
+        std::string const symName = objNames.definedName(f.symId, "sym_");
         emitSymWithName(symName,
                         static_cast<std::uint32_t>(f.valueInText),
                         kTextSectionNumber,
