@@ -115,6 +115,16 @@ struct DSS_EXPORT CstToHirResult {
     // this to emit a runtime Load of the decl-frozen size instead of a static fold.
     // Empty for every non-VLA translation unit.
     std::unordered_map<std::uint32_t, std::uint32_t> sizeofVlaSymbol;
+    // VLA C4b (D-CSUBSET-VLA): a VLA-TYPEDEF OBJECT's SymbolId.v → its typedef
+    // origin `R`'s SymbolId.v (`typedef int R[n]; R a;` → a.v → R.v). Populated at
+    // CST→HIR from the object symbol's `SymbolRecord.vlaTypedefOrigin` (set
+    // semantically). The object's OWN size capture is SKIPPED (its declarator
+    // carries no `[n]`); R's bound was captured under R's own SymbolId instead
+    // (`vlaSizeExprBySymbol[R.v]`). HIR→MIR reads this to, at `R a;`'s alloca, copy
+    // R's decl-frozen per-level size slots DOWN into a's own `(a, levelType)` slots
+    // (so `a[i]` / `sizeof a` read them) and size a's runtime alloca from R's
+    // whole-object slot. Empty for every non-VLA-typedef translation unit.
+    std::unordered_map<std::uint32_t, std::uint32_t> typedefVlaOriginBySymbol;
     HirLiteralPool literalPool;   // decoded literal values, indexed by literalIndex
     // True iff neither lowering nor the verify-on-load pass emitted an
     // Error-severity diagnostic (delta-computed, so prior diagnostics on the

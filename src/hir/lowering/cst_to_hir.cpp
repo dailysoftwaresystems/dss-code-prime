@@ -254,6 +254,11 @@ struct Lowerer {
     // operand's SymbolId.v) pairs. Populated at a `sizeof <vla-object>` site; moved
     // onto result->sizeofVlaSymbol AFTER finish(). Sparse: only VLA-object sizeofs.
     std::vector<std::pair<std::uint32_t, std::uint32_t>>& sizeofVlaSymAcc;
+    // VLA C4b (D-CSUBSET-VLA): shared accumulator of (VLA-typedef OBJECT SymbolId.v →
+    // its typedef origin R's SymbolId.v) pairs. Populated at the object's VarDecl
+    // site when its `SymbolRecord.vlaTypedefOrigin` is set; moved onto the result's
+    // `typedefVlaOriginBySymbol` AFTER finish(). Sparse: only VLA-typedef objects.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>>& typedefOriginAcc;
 
     // D-CSUBSET-LOCAL-STATIC: the module-level decls accumulator (the SAME
     // vector `lowerTree` appends top-level decls to). A block-scope `static`
@@ -826,11 +831,13 @@ struct Lowerer {
             std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
             std::vector<std::pair<HirNodeId, AlignmentAttr>>& aln,
             std::vector<std::pair<std::uint32_t, HirNodeId>>& vlaSz,
-            std::vector<std::pair<std::uint32_t, std::uint32_t>>& sizeofVlaSym)
+            std::vector<std::pair<std::uint32_t, std::uint32_t>>& sizeofVlaSym,
+            std::vector<std::pair<std::uint32_t, std::uint32_t>>& typedefOrigin)
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
           linkage(lk), mutability(mut), threadLocalAcc(tls), volatileAcc(vol),
-          alignmentAcc(aln), vlaSizeAcc(vlaSz), sizeofVlaSymAcc(sizeofVlaSym) {
+          alignmentAcc(aln), vlaSizeAcc(vlaSz), sizeofVlaSymAcc(sizeofVlaSym),
+          typedefOriginAcc(typedefOrigin) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -7502,14 +7509,32 @@ struct Lowerer {
             // stride at the decl point (`storePtrToVlaStride`). A ptr to a FIXED array
             // (`int (*p)[5]`) has a non-VLA pointee → NOT captured (its stride folds at
             // compile time).
-            bool const isPtrToVla =
-                interner.kind(type) == TypeKind::Ptr
-                && !interner.operands(type).empty()
-                && interner.typeContainsVla(interner.operands(type)[0]);
-            if (!asGlobal
-                && (interner.isVlaArray(type) || interner.typeContainsVla(type)
-                    || isPtrToVla))
-                captureVlaSize(d, sym);
+            // VLA C4b (D-CSUBSET-VLA): a VLA-TYPEDEF object (`typedef int R[n]; R a;`)
+            // gets its VLA-ness from the head alias, NOT its own declarator — it carries
+            // NO `[n]` suffix, so calling `captureVlaSize` on it would fail loud
+            // ("carries no array suffix"). Record a.v→origin R.v instead (the object's
+            // `SymbolRecord.vlaTypedefOrigin`, set semantically ONLY for the in-scope
+            // pure `R a;` shape where declTy == headTy — so the deferred stacked-suffix
+            // `R a[m]` and ptr `R *p` shapes never take this arm) and SKIP the object's
+            // own capture; HIR→MIR's alloca copies R's decl-frozen per-level size slots
+            // down into a's own slots + sizes a's runtime alloca from R's whole-object
+            // slot. R's own bound was already captured under R's SymbolId in
+            // `lowerTypeDecl`.
+            auto const* symRec = sym.valid() ? model.recordFor(sym) : nullptr;
+            SymbolId const vlaOrigin =
+                symRec != nullptr ? symRec->vlaTypedefOrigin : SymbolId{};
+            if (!asGlobal && vlaOrigin.valid()) {
+                typedefOriginAcc.emplace_back(sym.v, vlaOrigin.v);
+            } else {
+                bool const isPtrToVla =
+                    interner.kind(type) == TypeKind::Ptr
+                    && !interner.operands(type).empty()
+                    && interner.typeContainsVla(interner.operands(type)[0]);
+                if (!asGlobal
+                    && (interner.isVlaArray(type) || interner.typeContainsVla(type)
+                        || isPtrToVla))
+                    captureVlaSize(d, sym);
+            }
             out.push_back(lowered);
         }
     }
@@ -7608,7 +7633,42 @@ struct Lowerer {
                         declaratorNameNode(tree(), d, *sem.declarators);
                     if (!nameNode.valid()) continue;
                     sym = model.symbolAt(nameNode);
-                    if (auto const* rec = model.recordFor(sym)) type = rec->type;
+                    SymbolId typedefVlaOrigin{};
+                    if (auto const* rec = model.recordFor(sym)) {
+                        type = rec->type;
+                        typedefVlaOrigin = rec->vlaTypedefOrigin;
+                    }
+                    // VLA C4b (D-CSUBSET-VLA): a VARIABLE-LENGTH-array typedef
+                    // (`typedef int R[n];` / multi-dim `R[n][m]`/`R[5][n]`/`R[n][5]`)
+                    // must lower + capture its OWN runtime bound(s) NOW, keyed by the
+                    // typedef symbol R — C99 §6.7.7p2 evaluates `n` once, when the
+                    // typedef is reached. R's own declarator carries the `[n]`
+                    // suffix(es), so `captureVlaSize` works unmodified (mirrors the
+                    // local-VarDecl VLA condition below). HIR→MIR's TypeDecl case then
+                    // freezes R's per-level size slots from `vlaSizeExprBySymbol[R.v]`.
+                    // A ptr-to-VLA typedef (`typedef int (*P)[n];`) is `kind==Ptr` —
+                    // `typeContainsVla` stops at the pointer top → NOT captured (its
+                    // ptr-to-VLA-typedef composition is deferred, fail-loud).
+                    if (type.valid()
+                        && (interner.isVlaArray(type)
+                            || interner.typeContainsVla(type))) {
+                        // Discriminate the ORIGINAL VLA typedef (VLA from its OWN `[n]`
+                        // suffix — capturable) from a CHAINED VLA typedef
+                        // (`typedef R S;` — VLA inherited from ANOTHER typedef, NO own
+                        // suffix). The semantic I1 gate stamps `vlaTypedefOrigin` on the
+                        // chained form (`declTy == headTy`) but never the original (its
+                        // headTy is the non-VLA base). A chained alias has no `[n]` to
+                        // capture → `captureVlaSize` would hit its "no suffix" desync;
+                        // it is a distinct deferred shape (D-CSUBSET-VLA-TYPEDEF-CHAINED)
+                        // → fail loud CLEANLY here instead.
+                        if (typedefVlaOrigin.valid())
+                            (void)reportedError(
+                                d,
+                                "a typedef that aliases a variable-length-array "
+                                "typedef is not yet supported");
+                        else
+                            captureVlaSize(d, sym);
+                    }
                     break;   // typedefs declare a single declarator
                 }
             }
@@ -8478,6 +8538,10 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // VLA C2 (D-CSUBSET-VLA): shared (SizeOf HIR node id.v → VLA operand SymbolId.v)
     // accumulator, moved onto result->sizeofVlaSymbol after finish().
     std::vector<std::pair<std::uint32_t, std::uint32_t>> sizeofVlaSymAcc;
+    // VLA C4b (D-CSUBSET-VLA): shared (VLA-typedef object SymbolId.v → origin R's
+    // SymbolId.v) accumulator, moved onto result->typedefVlaOriginBySymbol after
+    // finish().
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> typedefOriginAcc;
 
     // One Lowerer per distinct schema in the CU (keyed by SchemaId), each bound
     // to its language's config + the shared output. `Tree::schema()` is the
@@ -8490,7 +8554,7 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
             mutability, threadLocalAcc, volatileAcc, alignmentAcc, vlaSizeAcc,
-            sizeofVlaSymAcc));
+            sizeofVlaSymAcc, typedefOriginAcc));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -8546,6 +8610,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         result->vlaSizeExprBySymbol[symV].push_back(sizeNode);  // outer→inner order
     for (auto& [sizeofNodeV, symV] : sizeofVlaSymAcc)   // VLA C2 (D-CSUBSET-VLA)
         result->sizeofVlaSymbol.emplace(sizeofNodeV, symV);
+    for (auto& [objV, originV] : typedefOriginAcc)   // VLA C4b (D-CSUBSET-VLA)
+        result->typedefVlaOriginBySymbol.emplace(objV, originV);
     result->externDecls = std::move(externDecls);
 
     // verify-on-load.

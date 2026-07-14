@@ -102,6 +102,12 @@ struct Lowerer {
     // operand's SymbolId.v. nullptr / no entry ⇒ a plain (static-fold) sizeof. Read in
     // the MIR SizeOf case to emit a runtime Load of the decl-frozen size slot below.
     std::unordered_map<std::uint32_t, std::uint32_t> const* sizeofVlaSymMap = nullptr;
+    // VLA C4b (D-CSUBSET-VLA): a VLA-typedef OBJECT's SymbolId.v → its typedef origin
+    // R's SymbolId.v. nullptr / no entry ⇒ not a VLA typedef. Read in `allocaForLocal`
+    // to route `R a;` to `vlaAllocaFromTypedef`, which copies R's decl-frozen size
+    // slots down (freeze-once) instead of re-lowering the bound.
+    std::unordered_map<std::uint32_t, std::uint32_t> const* typedefVlaOriginMap =
+        nullptr;
     MirBuilder               mir;
     // Extern symbols extracted during the pre-pass. Each extern's
     // SymbolId is also inserted into `functionSymbols` so a `Ref`
@@ -3732,6 +3738,19 @@ struct Lowerer {
             return InvalidMirInst;
         }
         TypeId const ptrTy = interner.pointer(ty);
+        // VLA C4b (D-CSUBSET-VLA): a VLA-TYPEDEF OBJECT (`typedef int R[n]; R a;`) has
+        // NO own captured runtime size — its size was FROZEN once at R's TypeDecl (C99
+        // §6.7.7p2). Route it to the copy-down path, which sources every size from R's
+        // decl-frozen slots (never re-lowering `n`). Checked BEFORE the direct-VLA arm:
+        // the object's own size capture was skipped at CST→HIR, so `vlaSizeMap[a.v]` is
+        // absent and `vlaAllocaForLocal`/`computeVlaByteSize(a)` would fail loud on the
+        // missing side-table.
+        if (typedefVlaOriginMap != nullptr) {
+            if (auto it = typedefVlaOriginMap->find(sym.v);
+                it != typedefVlaOriginMap->end())
+                return vlaAllocaFromTypedef(sym, SymbolId{it->second}, ty, ptrTy,
+                                            anchor);
+        }
         // VLA C1a (D-CSUBSET-VLA): a VARIABLE-LENGTH array local reserves a RUNTIME-
         // sized slot — the Alloca carries a size OPERAND, not a compile-time payload.
         // This arm runs BEFORE the isMemoryResidentType byte-size path below (which
@@ -4032,6 +4051,99 @@ struct Lowerer {
                         MirInstFlags::None, /*payload2=*/effectiveAlign);
         addressableLocal[sym.v] = a;
         return a;
+    }
+
+    // VLA C4b (D-CSUBSET-VLA): materialize a VLA-TYPEDEF object's (`typedef int R[n]; R
+    // a;`) runtime `Alloca` by COPYING the typedef origin R's decl-frozen per-level size
+    // slots DOWN into the object's OWN `(a, levelType)` slots — NOT by re-lowering `n`
+    // (C99 §6.7.7p2: the size was frozen ONCE, when R was reached; `n` may have changed
+    // since — the freeze-once invariant). `a`'s type is byte-identical to R's (the
+    // semantic `declTy == headTy` gate), so the interned level-type peel yields the SAME
+    // TypeIds R froze under → the copied keys EXACTLY match what `a[i]` /
+    // `sizeof a`(/`sizeof a[0]`) later Load (I3, no depth arithmetic). Only the levels R
+    // ACTUALLY froze are copied (a FIXED intermediate level — `R[n][5]`'s `int[5]` — was
+    // never slotted; its stride is compile-time). Level 0 (the whole object) is a VLA by
+    // construction (a VLA-typedef object is a VLA at the top), so it is always frozen,
+    // and its value doubles as `a`'s runtime alloca byte size. Emitted at `a`'s VarDecl
+    // site in program order, AFTER R's TypeDecl freeze — a VLA local is NOT entry-hoisted
+    // (`computeLayout` nullopts on the -2 level → the hoist skips it), the load-bearing
+    // ordering that keeps this copy-down reading R's already-Stored (live) frozen slots.
+    [[nodiscard]] MirInstId vlaAllocaFromTypedef(SymbolId a, SymbolId origin, TypeId ty,
+                                                 TypeId ptrTy, HirNodeId anchor) {
+        TypeId const i64ty    = i64Ty();
+        TypeId const u64PtrTy =
+            interner.pointer(interner.primitive(TypeKind::U64));
+        // Peel `ty`'s array spine into per-LEVEL shape types (level 0 = whole object,
+        // each next via ops[0]) down to the non-array base — the SAME walk
+        // `computeVlaByteSize` used when it froze R's slots (so the level TypeIds, hence
+        // the slot keys, are identical).
+        std::vector<TypeId> levelTypes;
+        TypeId walk = ty;
+        for (int guard = 0; guard < 4096 && walk.valid()
+                            && interner.kind(walk) == TypeKind::Array; ++guard) {
+            levelTypes.push_back(walk);
+            auto const ops = interner.operands(walk);
+            if (ops.empty()) {
+                unsupported(anchor, "variable-length array typedef object has an array "
+                                    "level with no element (interner invariant "
+                                    "violated)");
+                return InvalidMirInst;
+            }
+            walk = ops[0];
+        }
+        if (levelTypes.empty()) {
+            unsupported(anchor, "variable-length array typedef object has a non-array "
+                                "top type (internal side-table desync)");
+            return InvalidMirInst;
+        }
+        // Copy each level R froze down into a's own slot, keyed IDENTICALLY so `a[i]` /
+        // `sizeof a` Load them (I3 — copy ONLY the HITS; a fixed intermediate level R
+        // never slotted is skipped, matching `computeVlaByteSize`'s freeze predicate).
+        // Capture level 0's copied value as a's whole-object runtime byte size.
+        MirInstId total = InvalidMirInst;
+        for (std::size_t L = 0; L < levelTypes.size(); ++L) {
+            auto const it =
+                vlaStrideSlot.find(vlaSlotKey(origin.v, levelTypes[L].v));
+            if (it == vlaStrideSlot.end()) continue;   // R did not freeze this level
+            std::array<MirInstId, 1> ld{it->second};
+            MirInstId const val = mir.addInst(MirOpcode::Load, ld, i64ty);
+            if (!val.valid()) return InvalidMirInst;
+            MirInstId const slot =
+                mir.addInst(MirOpcode::Alloca, {}, u64PtrTy, /*payload=*/8,
+                            MirInstFlags::None, /*payload2=*/8);
+            if (!slot.valid()) return InvalidMirInst;
+            std::array<MirInstId, 2> st{val, slot};
+            mir.addInst(MirOpcode::Store, st, InvalidType);
+            vlaStrideSlot[vlaSlotKey(a.v, levelTypes[L].v)] = slot;
+            if (L == 0) total = val;   // level 0's frozen value == whole-object total
+        }
+        if (!total.valid()) {
+            // Level 0 (the whole object) is a VLA by construction, so R MUST have frozen
+            // it — absent ⇒ an internal side-table desync (R's TypeDecl freeze did not
+            // run, or keyed differently). Fail loud, never a 0-sized / stale alloca.
+            unsupported(anchor, "variable-length array typedef object's origin froze no "
+                                "whole-object size slot (internal side-table desync)");
+            return InvalidMirInst;
+        }
+        // Effective alignment from the BASE element (`walk` = the innermost non-array
+        // element) + any `alignas` override — mirror `vlaAllocaForLocal` (the VLA levels
+        // have no static layout; the PRIMARY payload stays 0 = runtime-sized).
+        std::uint32_t effectiveAlign = 0;
+        if (config.aggregateLayoutLoaded && walk.valid())
+            if (auto const lay = computeLayout(walk, interner, config.aggregateLayout,
+                                               config.dataModel);
+                lay.has_value())
+                effectiveAlign = lay->align.bytes();
+        if (alignmentMap != nullptr && anchor.valid())
+            if (auto const* p = alignmentMap->tryGet(anchor);
+                p != nullptr && p->alignmentBytes > effectiveAlign)
+                effectiveAlign = p->alignmentBytes;
+        std::array<MirInstId, 1> aops{total};
+        MirInstId const av =
+            mir.addInst(MirOpcode::Alloca, aops, ptrTy, /*payload=*/0,
+                        MirInstFlags::None, /*payload2=*/effectiveAlign);
+        addressableLocal[a.v] = av;
+        return av;
     }
 
     // FC7 (D-FC7-MEMBER-ACCESS): the cached layout of aggregate `aggTy`, or
@@ -8815,13 +8927,38 @@ struct Lowerer {
                 mir.beginBlock(exitBB);
                 return true;
             }
-            case HirKind::TypeDecl:
+            case HirKind::TypeDecl: {
                 // c30 (D-CSUBSET-LOCAL-TYPEDEF): a BLOCK-SCOPED typedef lowers to
-                // a statement-position TypeDecl. Exactly like the TOP-LEVEL
-                // TypeDecl (a no-op — "interns a type into the lattice but emits
-                // no code"), it has NO MIR runtime effect: the alias was resolved
-                // at semantic time, so the declaration emits nothing. Skip it.
+                // a statement-position TypeDecl. For an ORDINARY (non-VLA) typedef
+                // this is a no-op — like the top-level TypeDecl, it "interns a type
+                // into the lattice but emits no code" (the alias was resolved at
+                // semantic time).
+                //
+                // VLA C4b (D-CSUBSET-VLA): a VARIABLE-LENGTH-array typedef
+                // (`typedef int R[n];` / multi-dim `R[n][m]`/`R[5][n]`/`R[n][5]`)
+                // is the ONE typedef with a runtime effect: C99 §6.7.7p2 evaluates
+                // the size expr `n` ONCE, when the typedef declaration is REACHED
+                // (NOT at each later `R a;`). FREEZE it HERE, in program order:
+                // `computeVlaByteSize` lowers each dim exactly once + Allocas+Stores
+                // R's per-level 8-byte U64 size slots keyed by R's SymbolId
+                // (`vlaStrideSlot[(R, levelType)]`). Every later `R a;` COPIES those
+                // frozen slots down into its own — so `n` changing between two `R`
+                // uses does NOT re-size them (the freeze-once invariant). The dim
+                // bound(s) were captured in `lowerTypeDecl` under R's SymbolId. On a
+                // belt fail-loud (M4): seal the open block + return false, mirroring
+                // the `vlaAllocaForLocal` caller (never a silently-dropped freeze).
+                TypeId   const ty = hir.typeDeclType(node);
+                SymbolId const R  = hir.typeDeclSymbol(node);
+                if (R.valid() && ty.valid()
+                    && (interner.isVlaArray(ty) || interner.typeContainsVla(ty))) {
+                    if (!computeVlaByteSize(R, ty, node, /*freezeLevelSlots=*/true)
+                             .has_value()) {
+                        if (!mir.openBlockHasTerminator()) mir.addUnreachable();
+                        return false;
+                    }
+                }
                 return true;
+            }
             default: break;
         }
         unsupported(node,
@@ -10346,7 +10483,9 @@ HirToMirResult lowerToMir(Hir const&               hir,
                                              std::vector<HirNodeId>> const*
                                                    vlaSizeMap,
                           std::unordered_map<std::uint32_t, std::uint32_t> const*
-                                                   sizeofVlaSymMap) {
+                                                   sizeofVlaSymMap,
+                          std::unordered_map<std::uint32_t, std::uint32_t> const*
+                                                   typedefVlaOriginMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -10367,6 +10506,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .threadLocalMap = threadLocalMap,
         .vlaSizeMap = vlaSizeMap,
         .sizeofVlaSymMap = sizeofVlaSymMap,
+        .typedefVlaOriginMap = typedefVlaOriginMap,
         .mir       = MirBuilder{},
     };
     // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING: stamp the module-

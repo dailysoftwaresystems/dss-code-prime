@@ -125,7 +125,8 @@ struct Lowered {
                                     &hir->volatileMap, /*alignmentMap=*/nullptr,
                                     &hir->threadLocalMap,
                                     &hir->vlaSizeExprBySymbol,   // VLA C1a
-                                    &hir->sizeofVlaSymbol);   // VLA C2
+                                    &hir->sizeofVlaSymbol,   // VLA C2
+                                    &hir->typedefVlaOriginBySymbol);   // VLA C4b
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
@@ -8724,6 +8725,203 @@ TEST(MirLoweringCSubset, SizeofOfCompositeVlaOperandFailsLoud) {
     EXPECT_FALSE(L.mir.ok)
         << "sizeof of a composite (comma) operand yielding a VLA must fail loud (its C "
            "value decays to a pointer), never silently load the VLA's frozen size";
+}
+
+// ── VLA C4b (D-CSUBSET-VLA): the VLA-typedef FREEZE + COPY-DOWN MIR pins ─────────
+//
+// `typedef int R[n]; R a;` — C99 §6.7.7p2: the typedef R evaluates `n` ONCE and FREEZES
+// its runtime size at the TypeDecl statement; every later `R a;` COPIES that frozen size
+// down into its own slots (never re-lowering `n`). These two pins lock the mechanism.
+// Both are red-on-disable: revert the MIR TypeDecl freeze OR the copy-down intercept and
+// `R a;` fails loud (mir.ok flips false — the leading ASSERT_TRUE alone catches it).
+
+// Pin 1 — FREEZE-AT-TYPEDEF: R's TypeDecl statement emits a Store of the count*stride
+// Mul into an 8-byte size slot (the old no-op TypeDecl emitted nothing). The Mul IS the
+// size expr `n*sizeof(int)` evaluated ONCE, at the typedef — distinct from a's copy-down,
+// which Stores a LOAD (Pin 2), never a Mul.
+TEST(MirLoweringCSubset, VlaTypedefFreezesSizeAtTypeDeclStatement) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 3;\n"
+        "  typedef int R[n];\n"
+        "  R a;\n"
+        "  a[0] = 1;\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)   // red-on-disable: no freeze => `R a;` copy-down fails loud
+        << "a VLA typedef object must lower cleanly (freeze at the typedef + copy-down): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // R's freeze: a Store whose VALUE is a Mul (count*stride) into an 8-byte size slot.
+    bool sawFreezeStore = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Store) continue;
+        auto const ops = m.instOperands(id);
+        if (ops.size() == 2u && m.instOpcode(ops[0]) == MirOpcode::Mul
+            && m.instOpcode(ops[1]) == MirOpcode::Alloca
+            && m.instPayload(ops[1]) == 8u) {
+            sawFreezeStore = true;
+        }
+    }
+    EXPECT_TRUE(sawFreezeStore)
+        << "the VLA typedef R must FREEZE its size (a count*stride Mul Stored into an "
+           "8-byte slot) AT the TypeDecl statement — not at each `R a;` (freeze-once, "
+           "C99 6.7.7p2)";
+}
+
+// Pin 2 — COPY-DOWN: `R a;`'s runtime Alloca sources its size OPERAND from a LOAD (of R's
+// frozen slot), NOT a fresh Mul (which would mean re-evaluating `n`). A copy-down Store
+// (value = a Load) populates a's OWN 8-byte slot so `a[i]` / `sizeof a` read it.
+TEST(MirLoweringCSubset, VlaTypedefObjectAllocaLoadsFrozenSizeNotReLoweredN) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 3;\n"
+        "  typedef int R[n];\n"
+        "  R a;\n"
+        "  a[0] = 1;\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& in = L.model.lattice().interner();
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // a's runtime Alloca = the operand-bearing Alloca whose pointee is a vlaArray.
+    MirInstId objAlloca{};
+    int objCount = 0;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Alloca) continue;
+        if (m.instOperands(id).empty()) continue;   // skip the 8-byte size slots
+        TypeId const t = m.instType(id);
+        if (in.kind(t) != TypeKind::Ptr) continue;
+        auto const po = in.operands(t);
+        if (po.size() == 1u && in.isVlaArray(po[0])) { objAlloca = id; ++objCount; }
+    }
+    ASSERT_EQ(objCount, 1)
+        << "exactly one VLA-typedef object `a` runtime-operand Alloca (ptr<vlaArray>)";
+
+    // Its size operand is a LOAD (of R's frozen whole-object slot) — NOT a Mul. A Mul
+    // here would mean `R a;` re-lowered `n` (freeze-once violated).
+    auto const aOps = m.instOperands(objAlloca);
+    ASSERT_EQ(aOps.size(), 1u);
+    EXPECT_EQ(m.instOpcode(aOps[0]), MirOpcode::Load)
+        << "`R a;`'s alloca size must be a LOAD of R's decl-frozen slot (copy-down), "
+           "never a re-lowered count*stride Mul (that would re-evaluate `n`)";
+
+    // The copy-down also Stores that Load into a's OWN 8-byte slot: a Store whose VALUE
+    // is a Load into an 8-byte slot (distinct from R's freeze Store, whose value is a Mul).
+    bool sawCopyDownStore = false;
+    for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+        MirInstId const id = m.blockInstAt(entry, i);
+        if (m.instOpcode(id) != MirOpcode::Store) continue;
+        auto const ops = m.instOperands(id);
+        if (ops.size() == 2u && m.instOpcode(ops[0]) == MirOpcode::Load
+            && m.instOpcode(ops[1]) == MirOpcode::Alloca
+            && m.instPayload(ops[1]) == 8u) {
+            sawCopyDownStore = true;
+        }
+    }
+    EXPECT_TRUE(sawCopyDownStore)
+        << "`R a;` must COPY R's frozen size DOWN — a Load(R's slot) Stored into a's own "
+           "8-byte slot — so `a[i]` / `sizeof a` Load a's own copied slot";
+}
+
+// VLA C4b (D-CSUBSET-VLA) — the DEFERRED shapes STAY fail-loud (I4). Type-dedup makes
+// `vlaArray(int)` a shared TypeId, so a VLA-typedef-WITH-OWN-SUFFIX object looks type-
+// identical to the in-scope `R a;` and MUST be pinned distinct. All three below fail loud
+// (no binary), never a silent miscompile. Red-on-disable: were the `declTy == headTy`
+// origin gate to leak and admit an own-suffix / ptr shape, the C4b copy-down would
+// mis-size (a captured-bound / array-level mismatch).
+
+// (a) Stacked-suffix `typedef int R[5]; R a[n];` — R is FIXED, the object adds a VLA `[n]`:
+// type `int[n][5]` (2 array levels) with only 1 declarator bound captured → the
+// computeVlaByteSize depth-vs-dims guard fires → fail loud.
+TEST(MirLoweringCSubset, VlaTypedefStackedFixedThenVlaSuffixFailsLoud) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 2;\n"
+        "  typedef int R[5];\n"
+        "  R a[n];\n"
+        "  return a[0][0];\n"
+        "}\n");
+    EXPECT_FALSE(L.mir.ok)
+        << "a fixed typedef with a VLA object suffix (`typedef int R[5]; R a[n];`) is a "
+           "2-level type with 1 captured bound — must fail loud (deferred), never guess";
+}
+
+// (b) VLA-typedef WITH its own suffix `typedef int R[n]; R a[m];` — R is a VLA, the object
+// adds another VLA `[m]`: type `int[m][n]`, again 2 levels vs 1 captured bound. The
+// `declTy == headTy` origin gate EXCLUDES it (declTy has the extra dim) → normal capture +
+// depth mismatch → fail loud. THE type-dedup distinctness pin (I4): it must NOT slip into
+// the C4b copy-down path just because `vlaArray(int)` dedups with the in-scope `R a;`.
+TEST(MirLoweringCSubset, VlaTypedefWithOwnVlaSuffixFailsLoud) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n; int m;\n"
+        "  n = 3; m = 2;\n"
+        "  typedef int R[n];\n"
+        "  R a[m];\n"
+        "  return a[0][0];\n"
+        "}\n");
+    EXPECT_FALSE(L.mir.ok)
+        << "a VLA typedef with its own VLA object suffix (`typedef int R[n]; R a[m];`) must "
+           "STAY fail-loud — NOT take the C4b copy-down path (I4)";
+}
+
+// (c) Ptr-to-VLA typedef `typedef int (*P)[n]; P p;` — the pointee is a VLA; the C4a+C4b
+// composition is deferred. `P p`'s declarator carries no array suffix, so captureVlaSize
+// fails loud (H0009) at the HIR tier (hir->ok flips false).
+TEST(MirLoweringCSubset, PtrToVlaTypedefObjectFailsLoud) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 3;\n"
+        "  typedef int (*P)[n];\n"
+        "  P p;\n"
+        "  (void)p;\n"
+        "  return 0;\n"
+        "}\n");
+    EXPECT_FALSE(L.hir->ok)
+        << "a ptr-to-VLA typedef object (`typedef int (*P)[n]; P p;`) is deferred — must "
+           "fail loud (H0009 at HIR), never silently produce a bogus pointer";
+}
+
+// (d) CHAINED VLA typedef `typedef int R[n]; typedef R S;` — S aliases a VLA typedef with
+// NO own `[n]` suffix (D-CSUBSET-VLA-TYPEDEF-CHAINED). The semantic I1 gate stamps S's
+// `vlaTypedefOrigin` (declTy==headTy), so `lowerTypeDecl` recognizes the chained form and
+// fails loud CLEANLY (a real "not yet supported" diagnostic) instead of the generic
+// captureVlaSize "no suffix" desync. Red-on-disable: drop the vlaTypedefOrigin discriminator
+// and S routes back into captureVlaSize → the confusing internal-desync message.
+TEST(MirLoweringCSubset, ChainedVlaTypedefFailsLoud) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int n;\n"
+        "  n = 3;\n"
+        "  typedef int R[n];\n"
+        "  typedef R S;\n"
+        "  S a;\n"
+        "  a[0] = 42;\n"
+        "  return a[0];\n"
+        "}\n");
+    EXPECT_FALSE(L.hir->ok)
+        << "a chained VLA typedef (`typedef int R[n]; typedef R S;`) is deferred — must "
+           "fail loud at HIR, never silently alias a frozen size";
 }
 
 // ── VLA C3 (D-CSUBSET-VLA): multi-dimensional VLAs (runtime row stride) ───────

@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-VLA C4b: a VLA TYPEDEF (`typedef int R[n]; R a;`) RUNS on all 3 legs. C99 §6.7.7p2 evaluates the size expr ONCE at the typedef and FREEZES it; every later `R a;` allocates with that frozen size. Two witnesses carry the weight: (A) FREEZE-ONCE — after mutating `n` to 100 between two `R` objects, BOTH `a` and `b` stay int[3] (proven by the runtime `sizeof a == sizeof b == 12`; a leak would re-eval n=100 => 400), returns 1/2 the strict catch; (B) MULTI-DIM OFF-DIAGONAL — `c[1][0]` vs `c[0][1]` (and `d`'s) are DISTINCT cells, so a wrong copied-down runtime row stride would alias/transpose them (returns 5/6/9/10). `sizeof c[0]` / `sizeof d[0]` pin the copied-down per-level row slots. main is a LEAF (no calls) — the VLA frame-model scope. The arm64 leg proves the copy-down stride math on the non-host target; the `release` arm proves R's frozen size slots + the copied-down slots survive the full optimizer (never folded to a constant, never dropped). exitCode 42; return 1..12 are the strict in-program pins.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

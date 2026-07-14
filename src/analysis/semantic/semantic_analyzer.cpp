@@ -5366,6 +5366,73 @@ void resolveDeclTypesPost(EngineState& s, SemanticConfig const& cfg, Tree const&
                         if (declTy.valid()) {
                             s.symbols.at(sym).type = declTy;
                             s.nodeToType.set(nameNode, declTy);
+                            // VLA C4b (D-CSUBSET-VLA, design-audit I1): a VLA-typedef
+                            // OBJECT (`typedef int R[n]; R a;`) derives its VLA-ness
+                            // entirely from the head alias — nothing else records WHICH
+                            // typedef froze the runtime size (C99 §6.7.7p2: `n` is
+                            // evaluated once, at the typedef). Correlate a→R HERE: when
+                            // the declared type is EXACTLY the head type (`declTy ==
+                            // headTy` — a pure `R a;`, no stars/own suffix, so
+                            // `directDeclaredType` returned the base byte-identically)
+                            // AND that head type is (or contains) a VLA, descend the head
+                            // for the alias type-name identifier and, if it resolves to a
+                            // typedef of that VLA type, stamp the object's
+                            // `vlaTypedefOrigin`. The `declTy == headTy` gate is
+                            // load-bearing: `R a[m]` (extra dim → declTy has one more
+                            // array level) and `R *p` (declTy is Ptr) DIFFER from headTy
+                            // → EXCLUDED (they keep their own capture + deferred
+                            // fail-loud). A miss here is a safe fail-loud downstream (no
+                            // captured size), never a silent miscompile.
+                            if (declTy == headTy
+                                && (s.lattice.interner().isVlaArray(headTy)
+                                    || s.lattice.interner().typeContainsVla(headTy))
+                                && decl.headChild.has_value()
+                                && *decl.headChild < kids.size()) {
+                                // First type-name identifier token in the head (the
+                                // alias); cv-qualifier keyword tokens are not
+                                // identifierToken → skipped. A pure VLA-typed head is a
+                                // single alias identifier. Push children REVERSED so the
+                                // work-stack pops left-to-right (leftmost-first).
+                                NodeId aliasTok{};
+                                if (cfg.identifierToken.valid()) {
+                                    std::vector<NodeId> stk{kids[*decl.headChild]};
+                                    for (int guard = 0;
+                                         guard < 4096 && !stk.empty()
+                                             && !aliasTok.valid();
+                                         ++guard) {
+                                        NodeId const cur = stk.back();
+                                        stk.pop_back();
+                                        if (tree.kind(cur) == NodeKind::Token) {
+                                            if (tree.tokenKind(cur)
+                                                == cfg.identifierToken)
+                                                aliasTok = cur;
+                                            continue;
+                                        }
+                                        auto const hk = visibleChildren(tree, cur);
+                                        for (std::size_t i = hk.size(); i-- > 0;)
+                                            stk.push_back(hk[i]);
+                                    }
+                                }
+                                if (aliasTok.valid() && here.valid()) {
+                                    // SAME scope-resolution the type resolver used
+                                    // (resolveTypeNodeImpl's alias arm: ordinary-namespace
+                                    // `s.scopes.lookup(scope, text)` with scope == here),
+                                    // so this recovers EXACTLY the typedef symbol that
+                                    // produced `headTy`.
+                                    std::string const nm{tree.text(aliasTok)};
+                                    SymbolId const aliasSym = s.scopes.lookup(here, nm);
+                                    if (aliasSym.valid()) {
+                                        auto const& arec = s.symbols.at(aliasSym);
+                                        if (arec.kind == DeclarationKind::Type
+                                            && arec.type.valid()
+                                            && (s.lattice.interner()
+                                                    .isVlaArray(arec.type)
+                                                || s.lattice.interner()
+                                                       .typeContainsVla(arec.type)))
+                                            s.symbols.at(sym).vlaTypedefOrigin = aliasSym;
+                                    }
+                                }
+                            }
                             // c35 D-CSUBSET-FORWARD-STRUCT-DECLARATION: an OBJECT
                             // (a named local/global, `requireNamedDeclarators` —
                             // NOT a param, NOT a struct field [those route through

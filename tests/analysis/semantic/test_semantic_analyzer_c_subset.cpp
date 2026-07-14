@@ -8562,6 +8562,42 @@ TEST(SemanticAnalyzerCSubset, LocalAggregateBraceInitStaysCleanNoFalseTypeMismat
         << "the brace-init control program must compile clean";
 }
 
+// VLA C4b (D-CSUBSET-VLA): `typedef int R[n]; R a;` — a VLA TYPEDEF object — ACCEPTS at
+// the semantic tier (zero diagnostics) AND records its typedef ORIGIN: `a`'s
+// `vlaTypedefOrigin` is set to the typedef `R` (so HIR/MIR can copy R's decl-frozen size
+// down at a's alloca, C99 §6.7.7p2). RED-ON-DISABLE: revert the resolveDeclTypesPost a→R
+// correlation and `vlaTypedefOrigin` stays InvalidSymbol (the field EXPECT below reds) —
+// the accept was always semantic, so the recorded ORIGIN is the new, load-bearing bit.
+TEST(SemanticAnalyzerCSubset, VlaTypedefObjectAcceptsAndRecordsOrigin) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "  volatile int vn = 3;\n"
+        "  int n = vn;\n"
+        "  typedef int R[n];\n"
+        "  R a;\n"
+        "  a[0] = 1;\n"
+        "  return a[0];\n"
+        "}\n",
+    });
+    EXPECT_FALSE(model.hasErrors())
+        << "a VLA typedef object `R a;` must analyze clean (zero diagnostics)";
+    SymbolRecord const* aRec = findSym(model, "a");
+    SymbolRecord const* rRec = findSym(model, "R");
+    ASSERT_NE(aRec, nullptr);
+    ASSERT_NE(rRec, nullptr);
+    EXPECT_TRUE(aRec->vlaTypedefOrigin.valid())
+        << "`a`'s vlaTypedefOrigin must be SET (the a→R correlation) so HIR/MIR copy R's "
+           "frozen size down instead of re-evaluating `n`";
+    // The recorded origin must be the typedef R itself (name + Type kind) — not a
+    // different same-typed symbol (type-dedup makes vlaArray(int) shared, so identity
+    // MUST come from the SymbolId, not the type).
+    ASSERT_LT(aRec->vlaTypedefOrigin.v, model.symbols().size());
+    EXPECT_EQ(model.symbols()[aRec->vlaTypedefOrigin.v].name, "R")
+        << "the recorded origin is the typedef R";
+    EXPECT_EQ(model.symbols()[aRec->vlaTypedefOrigin.v].kind, DeclarationKind::Type)
+        << "the recorded origin is a typedef (DeclarationKind::Type)";
+}
+
 // VLA C4a-param (D-CSUBSET-VLA): a PARAMETER pointer-to-VLA `int (*p)[n]` (n a sibling
 // param) now RESOLVES — Option B's DISTINCT `paramDecay` signal builds a `vlaArray` row in
 // the pointee, so a call passing a VLA object `int b[2][n]` DECAYS to `int (*)[n]` and

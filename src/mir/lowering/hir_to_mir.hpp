@@ -249,6 +249,14 @@ lowerToMir(Hir const&               hir,
            // sizeof. Read in the MIR SizeOf case to emit a runtime Load of the VLA's
            // decl-frozen size slot instead of a compile-time layout fold.
            std::unordered_map<std::uint32_t, std::uint32_t> const* sizeofVlaSymMap
-               = nullptr);
+               = nullptr,
+           // VLA C4b (D-CSUBSET-VLA): per-VLA-typedef-OBJECT side-table (the object's
+           // SymbolId.v → its typedef origin R's SymbolId.v), populated by the CST→HIR
+           // lowerer. Optional: nullptr (or an object with no entry) ⇒ not a VLA
+           // typedef. Read in `allocaForLocal` to route `R a;` to a copy-down path that
+           // sources every size from R's decl-frozen slots (freeze-once, C99 §6.7.7p2)
+           // instead of re-lowering `n`.
+           std::unordered_map<std::uint32_t, std::uint32_t> const*
+               typedefVlaOriginMap = nullptr);
 
 } // namespace dss
