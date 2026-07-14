@@ -1088,3 +1088,153 @@ TEST(ParserSpeculation, SpeculativeOptionalBodyExceedsBudgetParsesNonSpeculative
     EXPECT_EQ(countNodesByRule(t, "typeClause"), 1u)
         << "the trailing `W Y : T` underlying-type clause must parse";
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// VLA C4c (§B): speculative INLINE repeat-alt. The schema compiler must honor
+// `"speculative": true` on an inline `{"repeat": {"alt": […], …}}` by
+// propagating the flag onto the loopEntry AltChoice the parser dispatches at
+// (grammar_schema_json.cpp "repeat" arm) — reusing the D-PARSE-SPECULATIVE-
+// OPTIONAL skip-branch machinery so the loop-exit continuation is excluded
+// from candidate enumeration. Without the fix the flag lands on the inner
+// alt's Position (`innerStart`), which the parser never dispatches at, so the
+// repeat runs NON-speculatively and commits to the FIRST FIRST-matching branch
+// on the shared leading token — a hard parse error for any input the SECOND
+// branch matches. This is the enabler for `arrayStarSuffix` (`int a[*]`)
+// rolling back to `arrayDeclSuffix` (`int a[N]` / `int a[*p]`).
+constexpr std::string_view kSpecRepeatAltSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "SpecRepeatAlt", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "[":  [{ "kind": "BracketOpen" }],
+    "]":  [{ "kind": "BracketClose" }],
+    "*":  [{ "kind": "StarOp" }],
+    "N":  [{ "kind": "Num" }]
+  },
+  "shapes": {
+    "root":     { "sequence": [{ "repeat": { "alt": ["caseStar", "caseNum"], "speculative": true, "lookahead": 3 } }] },
+    "caseStar": { "sequence": ["BracketOpen", "StarOp", "BracketClose"] },
+    "caseNum":  { "sequence": ["BracketOpen", "Num", "BracketClose"] }
+  }
+})JSON";
+
+// A speculative repeat-alt whose body is a SEQUENCE beginning with the
+// speculative alt (`{"repeat": {"sequence": [{"alt": spec}, X]}}`). The guard
+// in the "repeat" arm INTENTIONALLY fires here — `innerStart` (the sequence's
+// first position, right-to-left build) IS the speculative alt — and it
+// composes correctly: the alt at the loop head speculates, the rest of the
+// body (`Semi`) parses non-speculatively, and `cont` stays the loop exit.
+// This pins that the guard's "first element is a speculative alt" firing is
+// sound, per the design-audit corner-case note. Do NOT tighten the guard.
+constexpr std::string_view kSpecRepeatSeqAltSchema = R"JSON({
+  "dssSchemaVersion": 2,
+  "language": { "name": "SpecRepeatSeqAlt", "version": "0.1.0" },
+  "tokens": {
+    " ":  [{ "kind": "Whitespace", "flags": ["EmptySpace"] }],
+    "\n": [{ "kind": "Newline",    "flags": ["EmptySpace"] }],
+    "[":  [{ "kind": "BracketOpen" }],
+    "]":  [{ "kind": "BracketClose" }],
+    "*":  [{ "kind": "StarOp" }],
+    "N":  [{ "kind": "Num" }],
+    ";":  [{ "kind": "Semi" }]
+  },
+  "shapes": {
+    "root":     { "sequence": [{ "repeat": { "sequence": [ { "alt": ["caseStar", "caseNum"], "speculative": true, "lookahead": 3 }, "Semi" ] } }] },
+    "caseStar": { "sequence": ["BracketOpen", "StarOp", "BracketClose"] },
+    "caseNum":  { "sequence": ["BracketOpen", "Num", "BracketClose"] }
+  }
+})JSON";
+
+[[nodiscard]] Tree parseWithSchema(std::string_view schemaText,
+                                   std::string source) {
+    auto loaded = GrammarSchema::loadFromText(std::string(schemaText));
+    EXPECT_TRUE(loaded.has_value())
+        << (loaded.has_value() ? "" : loaded.error()[0].message);
+    auto src = SourceBuffer::fromString(std::move(source), "<specrepeat>");
+    Tokenizer tk{src, *loaded};
+    auto [stream, _] = std::move(tk).tokenize();
+    Parser p{src, *loaded, std::move(stream)};
+    return std::move(p).parse().tree;
+}
+
+TEST(ParserSpeculation, SpeculativeInlineRepeatAltBacktracksToSiblingBranch) {
+    // `[N]` matches the SECOND branch (caseNum) — the load-bearing case. The
+    // repeat's two branches share the leading `[`; a non-speculative loop
+    // dispatch commits to the declared-FIRST branch (caseStar) on the shared
+    // `[`, then chokes on `N` where `*` is required. THE red-on-disable: revert
+    // the "repeat"-arm speculative propagation and this parse hard-fails
+    // (caseNum == 0, hasErrors() == true).
+    Tree tn = parseWithSchema(kSpecRepeatAltSchema, "[ N ]");
+    ASSERT_NE(tn.root(), InvalidNode);
+    EXPECT_FALSE(tn.diagnostics().hasErrors())
+        << "the `[ N ]` must roll back off caseStar to the sibling caseNum";
+    EXPECT_EQ(countCode(tn.diagnostics().all(),
+                        DiagnosticCode::P_BacktrackFailed), 0u);
+    EXPECT_EQ(countNodesByRule(tn, "caseNum"), 1u)
+        << "`[ N ]` must parse as caseNum";
+    EXPECT_EQ(countNodesByRule(tn, "caseStar"), 0u)
+        << "caseStar must NOT commit on `[ N ]`";
+    // Flat CST: the winning branch is a DIRECT child of root (no wrapper level
+    // — the inline alt is a Position, not a rule, and the loopEntry is a
+    // Position too, so neither materializes a node).
+    ASSERT_NE(tn.root(), InvalidNode);
+    {
+        const auto caseNumRule = tn.schema().rules().find("caseNum");
+        ASSERT_TRUE(caseNumRule.valid());
+        std::size_t directChildren = 0;
+        for (std::uint32_t i = 1; i < tn.nodeCount(); ++i) {
+            const NodeId id{i};
+            if (tn.kind(id) == NodeKind::Internal
+                && tn.rule(id).v == caseNumRule.v
+                && tn.parent(id) == tn.root()) {
+                ++directChildren;
+            }
+        }
+        EXPECT_EQ(directChildren, 1u)
+            << "caseNum must be a DIRECT child of root (flat CST)";
+    }
+
+    // The FIRST branch (`[*]`) also parses — the speculative repeat admits
+    // both alternatives, iteration after iteration.
+    Tree ts = parseWithSchema(kSpecRepeatAltSchema, "[ * ]");
+    ASSERT_NE(ts.root(), InvalidNode);
+    EXPECT_FALSE(ts.diagnostics().hasErrors())
+        << "the `[ * ]` first branch must parse clean";
+    EXPECT_EQ(countCode(ts.diagnostics().all(),
+                        DiagnosticCode::P_BacktrackFailed), 0u);
+    EXPECT_EQ(countNodesByRule(ts, "caseStar"), 1u);
+    EXPECT_EQ(countNodesByRule(ts, "caseNum"), 0u);
+
+    // Both branches, repeated — the loop re-enters speculatively each time and
+    // exits cleanly at EOF via the nullable skip (loopEntry's `cont` branch).
+    Tree tm = parseWithSchema(kSpecRepeatAltSchema, "[ N ] [ * ] [ N ]");
+    ASSERT_NE(tm.root(), InvalidNode);
+    EXPECT_FALSE(tm.diagnostics().hasErrors());
+    EXPECT_EQ(countNodesByRule(tm, "caseNum"), 2u);
+    EXPECT_EQ(countNodesByRule(tm, "caseStar"), 1u);
+
+    // LOOP-EXIT BOUNDARY (design-audit): the speculative repeat exits cleanly
+    // ONLY because `cont` is nullable-tailed (the repeat is root's LAST
+    // sequence element → `cont` → End). A speculative repeat FOLLOWED BY a
+    // required non-nullable rule whose FIRST is disjoint from the body cannot
+    // cleanly exit and would fail loud with P_BacktrackFailed — an inherited
+    // property of the speculative-optional engine. The shipped use
+    // (directDeclarator/abstractDirectDeclarator suffix repeat) is the last
+    // sequence element, so it is on the SAFE side of that boundary.
+}
+
+TEST(ParserSpeculation, SpeculativeInlineRepeatSeqAltComposes) {
+    // The guard fires on a sequence-bodied repeat whose FIRST element is the
+    // speculative alt. `[ N ] ; [ * ] ;` — two iterations, each: speculate the
+    // alt, then consume the trailing `Semi` non-speculatively. Must compose
+    // (design-audit corner case: sound, do NOT tighten the guard).
+    Tree t = parseWithSchema(kSpecRepeatSeqAltSchema, "[ N ] ; [ * ] ;");
+    ASSERT_NE(t.root(), InvalidNode);
+    EXPECT_FALSE(t.diagnostics().hasErrors())
+        << "a sequence-bodied speculative repeat-alt must compose";
+    EXPECT_EQ(countCode(t.diagnostics().all(),
+                        DiagnosticCode::P_BacktrackFailed), 0u);
+    EXPECT_EQ(countNodesByRule(t, "caseNum"), 1u);
+    EXPECT_EQ(countNodesByRule(t, "caseStar"), 1u);
+}

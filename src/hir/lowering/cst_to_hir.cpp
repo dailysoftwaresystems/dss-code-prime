@@ -1271,16 +1271,19 @@ struct Lowerer {
         // bound — a suffix with no lowerable middle child is an internal desync,
         // never a silently unsized dimension.
         for (NodeId const suffix : suffixes) {
-            std::vector<NodeId> kids;
-            for (NodeId c : visible(suffix)) kids.push_back(c);
+            // VLA C4c (D-CSUBSET-VLA): the bound sits BEHIND any array-parameter
+            // decoration (`int a[static n]`) — locate it via the shared skipper so a
+            // leading `static`/cv/`*` token is never mistaken for, or lowered as, the
+            // runtime size (a mis-lowered decoration would size the alloca wrong).
+            NodeId const boundNode =
+                arraySuffixBoundNode(tree(), suffix, dc.arraySuffixModifierTokens)
+                    .value_or(NodeId{});
             bool lowered = false;
-            for (std::size_t i = 0; i < kids.size(); ++i) {
-                if (i == 0 || i + 1 == kids.size()) continue;   // skip `[` and `]`
-                E const sizeE = lowerExpr(kids[i]);
+            if (boundNode.valid()) {
+                E const sizeE = lowerExpr(boundNode);
                 if (sizeE.id.valid()) {
                     vlaSizeAcc.emplace_back(sym.v, sizeE.id);
                     lowered = true;
-                    break;
                 }
             }
             if (!lowered) {
@@ -7883,7 +7886,7 @@ struct Lowerer {
                 && tree().rule(direct).v == dc.directRule.v) {
                 for (NodeId c : visible(direct)) {
                     if (tree().kind(c) == NodeKind::Internal
-                        && tree().rule(c).v == dc.fnSuffixRule.v) {
+                        && isFnSuffixRule(tree().rule(c), dc)) {
                         collectParams(c, params);
                         break;
                     }

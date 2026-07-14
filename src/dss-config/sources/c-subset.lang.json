@@ -627,12 +627,18 @@
     },
 
     "directDeclarator": {
-      "$comment": "Base alt is INLINE + SPECULATIVE: fnSuffix vs parenDeclarator genuinely collide on `(` (C 6.7.6.3p11) — fnSuffix probes FIRST (declared order) under its requireKnownType guard; rollback yields the parenthesized-declarator reading. Identifier rides the token-leaf route (no probe); arrayDeclSuffix at base is the abstract `int [3]` param form. lookahead 64 = the operand-alt precedent (1024-token probe budget): a probe must swallow a whole parenthesized param list / nested declarator.",
+      "$comment": "Base alt is INLINE + SPECULATIVE: fnSuffix vs parenDeclarator genuinely collide on `(` (C 6.7.6.3p11) — fnSuffix probes FIRST (declared order) under its requireKnownType guard; rollback yields the parenthesized-declarator reading. Identifier rides the token-leaf route (no probe); arrayStarSuffix/arrayDeclSuffix at base are the abstract `int [*]` / `int [3]` param forms. lookahead 64 = the operand-alt precedent (1024-token probe budget): a probe must swallow a whole parenthesized param list / nested declarator. VLA C4c (D-CSUBSET-VLA): the suffix repeat is SPECULATIVE and lists arrayStarSuffix (the fixed 3-token `[ * ]`) BEFORE arrayDeclSuffix so `int a[*]` (a prototype-form unspecified-size VLA parameter) probes arrayStarSuffix first and, on a real bound (`[N]`/`[*p]`), rolls back CLEANLY to arrayDeclSuffix — enabled by the schema-compiler propagating `speculative` onto an inline repeat-alt's loopEntry (grammar_schema_json.cpp repeat arm). fnSuffix still leads (declared order) since it is FIRST-disjoint (`(`).",
       "sequence": [
         { "alt": [ "Identifier", "fnSuffix", "parenDeclarator", "arrayDeclSuffix" ],
           "speculative": true, "lookahead": 64 },
-        { "repeat": { "alt": [ "fnSuffix", "arrayDeclSuffix" ] } }
+        { "repeat": { "alt": [ "fnSuffixTail", "arrayStarSuffix", "arrayDeclSuffix" ],
+          "speculative": true, "lookahead": 8 } }
       ]
+    },
+
+    "fnSuffixTail": {
+      "$comment": "VLA C4c (§B 2026-07-14): the POST-BASE (suffix-position) function-suffix `( params )` — grammar-IDENTICAL to `fnSuffix` but WITHOUT the `commitRequiresTypeName` guard. Needed because the suffix repeat is now SPECULATIVE (to disambiguate arrayStarSuffix `[*]` vs arrayDeclSuffix): a guarded `fnSuffix` there would be PROBED even as a FIRST-unique sole survivor on `(` (the sole-survivor direct-descent skips guarded candidates so the binder triage runs), and its `requireKnownType` guard would spuriously ROLL BACK a valid function's `()` (empty params) / cross-file-typedef params — breaking `int f()`, casts, every function declarator. The guard is MEANINGLESS at the suffix position (there is no `parenDeclarator` competitor — that ambiguity is resolved once, at the BASE alt which KEEPS `fnSuffix`), so dropping it is C-correct. Semantically fnSuffixTail IS a function suffix: the `fnSuffixTailRule` config role makes `directDeclaredType` fold it → `FnSig` identically to `fnSuffix`, and the fn-declarator / definition-scope detection recognizes both.",
+      "sequence": [ "ParenOpen", { "optional": "paramList" }, "ParenClose" ]
     },
 
     "parenDeclarator": {
@@ -787,11 +793,18 @@
     "initValue": { "$comment": "FC5: assignmentExpr (NOT expression) — the comma-gate. Covers ALL three initializer consumers (initDeclarator, structField, braceInitList initElement), so `int a = b, c;` stays 2 declarators (not `a = (b,c)`).", "alt": [ "braceInitList", "assignmentExpr" ] },
 
     "arrayDeclSuffix": {
+      "$comment": "VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the ONE array-declarator suffix `[ … ]`, SHARED across EVERY declarator-mode row (param, varDecl, structField, typedefDecl, forDecl) + the legacy externDecl. It admits the C99 array-PARAMETER decorations — a leading `static` and/or cv-qualifier run before the length BOUND (`int a[static 3]`, `int a[const n]`, `int a[const static 10]`). These are legal ONLY inside a function-parameter declarator; a NON-param use is a constraint violation caught SEMANTICALLY (the paramDecay-gated S_ArrayParamQualifierNonParameter), mirroring the typeSpecifierSeq → S_InvalidTypeSpecifierCombination discipline — the parser is deliberately permissive rather than forking a param-only sub-grammar. The qualifier run is INLINE keyword tokens (they land as DIRECT children, like typeSpecifierSeq's specifier run) and is FIRST-disjoint from the bound (no expression begins with static/const/volatile/restrict), so it is NON-speculative — a plain leading run before the unchanged `{optional expression}` bound. `int a[*p]` (a deref-sized VLA, LEGAL) keeps parsing `*p` as the bound EXPRESSION (unchanged). The bound's CST position is NO LONGER a fixed index (a leading qualifier shifts it) — every bound-locating site skips the decorations via the shared arraySuffixBoundNode helper keyed on DeclaratorConfig.arraySuffixModifierTokens. LANDED (D-CSUBSET-VLA-PARAM-STAR): the bare unspecified-size `*` form `int a[*]` (a prototype VLA-parameter marker) is admitted via the DISTINCT `arrayStarSuffix` = `[BracketOpen,StarOp,BracketClose]` rule (NOT this `arrayDeclSuffix`) + the speculative-repeat-alt schema-compiler engine fix (grammar_schema_json.cpp propagates `speculative` onto an inline repeat-alt's loopEntry, so the suffix repeat probes `arrayStarSuffix` then rolls back CLEANLY to this `arrayDeclSuffix` for a real bound). `int a[*p]` (a deref-sized VLA, LEGAL) still parses `*p` as THIS rule's bound EXPRESSION — the star-modifier is its own fixed-3-token rule, so this flat bound locator is UNTOUCHED. `StarOp` also stays in arraySuffixModifierTokens (the arraySuffixBoundNode scan skips a stray `*`).",
       "sequence": [
         "BracketOpen",
+        { "repeat": { "alt": [ "StaticKeyword", "ConstKeyword", "VolatileKeyword", "RestrictKeyword" ] } },
         { "optional": "expression" },
         "BracketClose"
       ]
+    },
+
+    "arrayStarSuffix": {
+      "$comment": "VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2p4): the bare unspecified-size `[ * ]` array-declarator suffix — a prototype-form VLA-parameter marker. A FIXED 3-token sequence with its OWN CST node (distinct from arrayDeclSuffix), so the flat bound-locator / lengthChild / captureVlaSize sites that read arrayDeclSuffix's children are UNTOUCHED. It sits BEFORE arrayDeclSuffix in the SPECULATIVE suffix repeat (directDeclarator/abstractDirectDeclarator): `[*]` matches here; a real bound (`[N]`, or the deref-VLA `[*p]` whose `*p` is an expression) fails at the `]` / `*` position and the speculative loopEntry rolls back CLEANLY to arrayDeclSuffix (enabled by the schema-compiler honoring `speculative` on an inline repeat-alt). Semantics: an arrayStarSuffix suffix decays to a pointer EXACTLY like an absent-length `[]` for a parameter; a NON-parameter `[*]` is a constraint violation caught by the SAME paramDecay-gated S_ArrayParamQualifierNonParameter (0xE054).",
+      "sequence": [ "BracketOpen", "StarOp", "BracketClose" ]
     },
 
     "typeSpecifierSeq": {
@@ -1387,10 +1400,14 @@
       "groupRule":          "parenDeclarator",
       "nameToken":          "Identifier",
       "fnSuffixRule":       "fnSuffix",
+      "fnSuffixTailRule":   "fnSuffixTail",
       "fnSuffixParamsRule": "paramList",
       "prototypeParamScopeRule": "paramList",
       "variadicMarker":     "EllipsisOp",
       "arraySuffixRule":    "arrayDeclSuffix",
+      "arrayStarSuffixRule": "arrayStarSuffix",
+      "$arraySuffixModifierTokensComment": "VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the token kinds that decorate an array-PARAMETER suffix — a `static`, the three cv-qualifiers, and the unspecified-size `*` — none of which is part of the length BOUND. The shared arraySuffixBoundNode / arraySuffixHasModifier helpers skip these (DIRECT children only) so a bound behind a decoration (`int a[static n]`) is still located, and a bare decoration (`int a[*]`, `int a[restrict]`) reads as an ABSENT bound (decays like `[]`) rather than a runtime VLA. ENGINE-AGNOSTIC: a language without array-parameter decorations simply omits this list (empty ⇒ the plain first-non-bracket-child view, unchanged).",
+      "arraySuffixModifierTokens": [ "StaticKeyword", "ConstKeyword", "VolatileKeyword", "RestrictKeyword", "StarOp" ],
       "initDeclaratorRule": "initDeclarator",
       "listRule":           "initDeclaratorList",
       "memberDeclaratorRule": "structMemberDeclarator",

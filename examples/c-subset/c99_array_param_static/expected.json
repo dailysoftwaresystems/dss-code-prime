@@ -1,0 +1,34 @@
+{
+  "$comment": "D-CSUBSET-VLA C4c: a C99 §6.7.6.2/6.7.6.3 array-PARAMETER declarator carrying `static` and/or a cv-qualifier INSIDE its `[ ]` — `int a[static 3]`, `int a[static n]`, `int a[const 3]`, `int a[const static 3]`. ALL decay the parameter to a plain pointer (C 6.7.6.3p7) with ZERO new codegen: each callee compiles like its `int *a` twin and RUNS. The decorations carry no runtime effect and DSS drops them (a `static N` non-null/at-least-N hint, a cv-qualifier on the decayed pointer). Each form is a REAL call with a fixed-array arg reading through the decayed pointer; sumn's `int a[static n]` uses a genuinely runtime `n`. The arm64 leg proves the decay on a non-host target (agnostic MIR) and the `release` arm proves it survives the full optimizer. exitCode 42; returns 1..4 are strict per-form pins. These decorations are legal ONLY in a parameter — a non-parameter use fails loud (S_ArrayParamQualifierNonParameter), pinned in the semantic tests. The bare unspecified-size `int a[*]` prototype form (gstar) LANDED (D-CSUBSET-VLA-PARAM-STAR — via the arrayStarSuffix rule + the speculative-repeat-alt engine fix): it decays to `int *a` like a bare `[]` and RUNS; a non-parameter `[*]` fails loud (0xE054).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

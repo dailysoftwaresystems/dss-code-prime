@@ -213,6 +213,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::S_VlaWithStaticStorage:     return "S_VlaWithStaticStorage";
         case DiagnosticCode::S_VlaMultiDimUnsupported:   return "S_VlaMultiDimUnsupported";
         case DiagnosticCode::S_VlaSizeNotInteger:        return "S_VlaSizeNotInteger";
+        case DiagnosticCode::S_ArrayParamQualifierNonParameter:
+            return "S_ArrayParamQualifierNonParameter";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";

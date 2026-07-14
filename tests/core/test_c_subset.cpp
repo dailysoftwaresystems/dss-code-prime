@@ -128,7 +128,12 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
             auto direct = b.open(h.schema->rules().find("directDeclarator"));
             drainWhitespace(b, h.stream);
             b.pushToken(h.stream.advance());
-            auto fs = b.open(h.schema->rules().find("fnSuffix"));
+            // VLA C4c (§B): the POST-BASE function suffix is now `fnSuffixTail`
+            // (a guard-less `fnSuffix` clone) — the directDeclarator suffix
+            // repeat became SPECULATIVE (to disambiguate `[*]`), and a guarded
+            // `fnSuffix` there would spuriously roll back. The base-position
+            // fnSuffix is unchanged.
+            auto fs = b.open(h.schema->rules().find("fnSuffixTail"));
             b.pushToken(h.stream.advance());
             {
                 auto pl   = b.open(h.schema->rules().find("paramList"));
@@ -200,7 +205,7 @@ TEST(CSubsetEndToEnd, FunctionWithIfReturnInsideBlock) {
         "          rule:declarator\n"
         "            rule:directDeclarator\n"
         "              tok:\"main\"\n"
-        "              rule:fnSuffix\n"
+        "              rule:fnSuffixTail\n"
         "                tok:\"(\"\n"
         "                rule:paramList\n"
         "                  rule:param\n"

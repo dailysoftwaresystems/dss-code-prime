@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 118> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 119> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -502,6 +502,12 @@ constexpr std::array<DiagnosticCode, 118> kUnsuppressableCodes{{
     // a garbage element count, a nullptr bound is a silent 0-byte array. Same
     // silent-miscompile-guard class as the S_Vla* siblings above.
     DiagnosticCode::S_VlaSizeNotInteger,
+    // S_ArrayParamQualifierNonParameter (VLA C4c, D-CSUBSET-VLA, C99 §6.7.6.2/
+    // 6.7.6.3): a `static` / cv-qualifier / `*` inside an array declarator's `[ ]`
+    // outside a function parameter. Suppressed, it ships the decorated array with
+    // the illegal decoration silently dropped (a mis-typed / mis-sized object) —
+    // the same silent-miscompile-guard class as the S_Vla* siblings above.
+    DiagnosticCode::S_ArrayParamQualifierNonParameter,
     // S_UnknownAttribute / S_DeprecatedSymbolUsed / S_NodiscardResultDiscarded
     // (FC17, D-CSUBSET-ATTRIBUTE-SEMANTICS, C23 6.7.13) are deliberately NOT
     // members — the same suppressible posture as S_UnknownTypeAttribute above.

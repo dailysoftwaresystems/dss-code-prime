@@ -855,6 +855,23 @@ enum class DiagnosticCode : std::uint16_t {
     // 0-byte array. Integer kinds ACCEPTED: the standard integers, Bool, Char, Byte,
     // Enum, and `_BitInt` (a `_BitInt(N)` bound is a legal VLA size).
     S_VlaSizeNotInteger = 0xE053,
+    // VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): an array declarator carries a
+    // `static` and/or cv-qualifier and/or the unspecified-size `*` INSIDE its `[ ]`
+    // (`int a[static 3]`, `int a[const n]`, `int a[*]`) in a position that is NOT a
+    // function parameter — a local, struct field, typedef, or file-scope object. C
+    // permits these array-size decorations ONLY in a function-parameter declarator
+    // (they inform the callee that the pointer is non-null / of at-least-N elements,
+    // or defer the size in a prototype); anywhere else they are a constraint
+    // violation. The grammar is deliberately permissive (the ONE shared array suffix
+    // admits them) and this SEMANTIC gate rejects the non-parameter use, mirroring
+    // the typeSpecifierSeq → S_InvalidTypeSpecifierCombination discipline. Emitted at
+    // BOTH array-suffix sites (the declarator-mode `applyDeclaratorSuffix`, gated on
+    // the param-only `paramDecay` signal, and the legacy externDecl `applyArray-
+    // Suffix`, always a non-parameter). UNSUPPRESSABLE — suppressing it would let a
+    // decorated non-parameter array through with the decoration silently dropped (a
+    // mis-typed / mis-sized object), the same silent-miscompile-guard class as the
+    // S_Vla* siblings.
+    S_ArrayParamQualifierNonParameter = 0xE054,
 
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.

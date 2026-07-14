@@ -6,6 +6,7 @@
 #include "core/types/tree_node.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -110,6 +111,79 @@ descendVisibleDecl(Tree const& tree, NodeId start,
         cur = kids[path[i]];
     }
     return cur;
+}
+
+// ── VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): array-suffix bound locating ──
+//
+// A C99 array-PARAMETER declarator suffix (`arrayDeclSuffix`) may carry a leading
+// `static` and/or cv-qualifier run and a bound that is either an expression or
+// absent — `int a[static n]`, `int a[const 3]`, `int a[]`. (The bare
+// unspecified-size `int a[*]` form is its OWN `arrayStarSuffix` rule
+// [D-CSUBSET-VLA-PARAM-STAR], NOT this suffix, so it never reaches these
+// helpers.) The grammar admits the decorations on the ONE shared
+// `arrayDeclSuffix` (they are legal only in a parameter; a non-parameter use is
+// caught semantically). A leading decoration SHIFTS the bound off its former
+// fixed child index, so EVERY bound-locating site scans past the decorations via
+// these two helpers rather than assuming "the bound is child N". Direct children
+// ONLY — never recurse into the bound expression's own subtree (a `const`/`*`
+// inside a cast/sizeof bound is NOT a suffix decoration). Engine-agnostic: the
+// decoration token-kind set is per-language config
+// (`DeclaratorConfig.arraySuffixModifierTokens`); an EMPTY set degrades both
+// helpers to the plain first-non-bracket-child view (the pre-C4c behavior).
+
+namespace array_suffix_detail {
+
+// Is `child` one of the configured array-parameter decoration tokens
+// (static / const / volatile / restrict / `*`)? A decoration is always a BARE
+// token — a `*p`-form deref bound (`int a[*p]`) is an Internal expression node,
+// NOT a bare `*` token, so a legal deref-sized VLA is never mistaken for a
+// bare-`*` decoration token. (`StarOp` stays in the set defensively; a real
+// `arrayDeclSuffix` never carries a bare `*` — the bare `[*]` is arrayStarSuffix.)
+[[nodiscard]] inline bool
+isArraySuffixModifierToken(Tree const& tree, NodeId child,
+                           std::span<SchemaTokenId const> modifierTokens) {
+    if (tree.kind(child) != NodeKind::Token) return false;
+    SchemaTokenId const tk = tree.tokenKind(child);
+    for (SchemaTokenId const m : modifierTokens)
+        if (tk == m) return true;
+    return false;
+}
+
+} // namespace array_suffix_detail
+
+// The length-BOUND child of an array-declarator suffix, or nullopt when the
+// suffix carries no bound (`[]`, `[const]`). Skips the bracket delimiters
+// (first + last visible child) and any array-parameter decoration tokens; the
+// first remaining child is the bound (an expression node, or — for languages
+// where a scalar bound is a bare token — that token).
+[[nodiscard]] inline std::optional<NodeId>
+arraySuffixBoundNode(Tree const& tree, NodeId suffix,
+                     std::span<SchemaTokenId const> modifierTokens) {
+    auto const kids = decl_prefix_detail::visibleChildren(tree, suffix);
+    for (std::size_t i = 0; i < kids.size(); ++i) {
+        if (i == 0 || i + 1 == kids.size()) continue;   // skip `[` and `]`
+        if (array_suffix_detail::isArraySuffixModifierToken(tree, kids[i],
+                                                            modifierTokens))
+            continue;
+        return kids[i];
+    }
+    return std::nullopt;
+}
+
+// Does the array-declarator suffix carry ANY array-parameter decoration
+// (static / cv-qualifier / `*`)? Such a decoration is legal ONLY in a
+// function-parameter declarator (C 6.7.6.3p7); a non-parameter use is a
+// constraint violation (S_ArrayParamQualifierNonParameter). Direct children
+// only — a `[*p]` deref bound is an Internal node, not a bare `*` token, so a
+// legal deref-sized VLA never trips this.
+[[nodiscard]] inline bool
+arraySuffixHasModifier(Tree const& tree, NodeId suffix,
+                       std::span<SchemaTokenId const> modifierTokens) {
+    for (NodeId const c : decl_prefix_detail::visibleChildren(tree, suffix))
+        if (array_suffix_detail::isArraySuffixModifierToken(tree, c,
+                                                            modifierTokens))
+            return true;
+    return false;
 }
 
 } // namespace dss

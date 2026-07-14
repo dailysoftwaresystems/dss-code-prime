@@ -402,7 +402,7 @@ hasFnSuffixOnName(Tree const& tree, NodeId nameNode,
     }
     for (NodeId c : visibleChildren(tree, direct)) {
         if (tree.kind(c) == NodeKind::Internal
-            && tree.rule(c) == dc.fnSuffixRule) {
+            && isFnSuffixRule(tree.rule(c), dc)) {
             return true;
         }
     }
@@ -487,7 +487,7 @@ isPrototypeParamScopeNode(EngineState const& s, SemanticConfig const& cfg,
     // paramList → fnSuffix (its direct parent must be the fn-suffix rule).
     NodeId const fnSuffix = tree.parent(node);
     if (!fnSuffix.valid() || tree.kind(fnSuffix) != NodeKind::Internal
-        || tree.rule(fnSuffix) != dc.fnSuffixRule) {
+        || !isFnSuffixRule(tree.rule(fnSuffix), dc)) {
         // Not a function-suffix param list (defensive — the role is the
         // fnSuffix's param list by construction). Treat as a prototype scope
         // (the safe direction: isolate the names) only when it IS a fnSuffix;
@@ -2294,6 +2294,22 @@ applyArraySuffix(EngineState& s, Tree const& tree, DeclarationRule const& decl,
         s.reporter.report(std::move(d));
     };
 
+    // VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the array-parameter
+    // decorations `static` / cv-qualifiers / `*` are legal ONLY in a
+    // function-parameter declarator. This legacy suffix facet is externDecl's,
+    // and an extern object declaration is NEVER a parameter — so ANY decoration
+    // is a constraint violation. Reject BEFORE the fixed-index `lengthChild`
+    // lookup below: with a leading decoration the bound is no longer at
+    // `lengthChild`, so a widened `extern int arr[static 5];` would otherwise
+    // SILENTLY drop the `static 5` → a bogus incompleteArray. (The declarator-
+    // mode twin gates the same construct in applyDeclaratorSuffix via paramDecay.)
+    if (cfg != nullptr && cfg->declarators.has_value()
+        && arraySuffixHasModifier(tree, suffix,
+                                  cfg->declarators->arraySuffixModifierTokens)) {
+        emit(DiagnosticCode::S_ArrayParamQualifierNonParameter);
+        return InvalidType;
+    }
+
     NodeId lenNode{};
     if (as.lengthChild.has_value()) {
         auto sufKids = visibleChildren(tree, suffix);
@@ -3254,7 +3270,7 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
                       bool paramDecay = false) {
     DeclaratorConfig const& dc = *cfg.declarators;
     RuleId const r = tree.rule(suffix);
-    if (r == dc.fnSuffixRule) {
+    if (isFnSuffixRule(r, dc)) {
         // The param harvest is the SHARED `collectParamTypes` walker (one
         // chokepoint with the legacy function-decl path): it descends
         // wrapper rules (c-subset's `paramOrEllipsis` alt wrapper),
@@ -3307,6 +3323,31 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
         // applies the target's real convention at materialize time.
         return s.lattice.interner().fnSig(paramTypes, inner, CallConv::CcSysV);
     }
+    if (dc.arrayStarSuffixRule.has_value() && r == *dc.arrayStarSuffixRule) {
+        // VLA C4c (D-CSUBSET-VLA-PARAM-STAR, C99 §6.7.6.2p4): the bare
+        // unspecified-size `[*]` — a prototype-form VLA-parameter marker. Legal
+        // ONLY inside a function-parameter declarator (C 6.7.6.3p7 adjusts it to
+        // a pointer). For a PARAMETER (`paramDecay`) it is an UNSPECIFIED-size
+        // (absent-length) array — IDENTICAL to a bare `[]` — that
+        // `adjustArrayToPointer` then strips to `Ptr<element>`; the `*` carries
+        // no runtime bound (unlike `[static n]`, so NEVER a vlaArray). A
+        // NON-parameter `[*]` is a constraint violation — the SAME paramDecay
+        // gate + diagnostic (S_ArrayParamQualifierNonParameter, 0xE054) a
+        // static/qualifier decoration trips in the arraySuffixRule arm below.
+        if (!paramDecay) {
+            if (emitOnMiss) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::S_ArrayParamQualifierNonParameter;
+                d.severity = DiagnosticSeverity::Error;
+                d.buffer   = tree.source().id();
+                d.span     = tree.span(suffix);
+                d.actual   = std::string{tree.text(suffix)};
+                s.reporter.report(std::move(d));
+            }
+            return InvalidType;
+        }
+        return s.lattice.interner().incompleteArray(inner);
+    }
     if (r == dc.arraySuffixRule) {
         auto const emit = [&](DiagnosticCode code) {
             if (!emitOnMiss) return;
@@ -3318,6 +3359,23 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
             d.actual   = std::string{tree.text(suffix)};
             s.reporter.report(std::move(d));
         };
+        // VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the array-PARAMETER
+        // decorations — a `static`, a cv-qualifier, or the unspecified-size `*` —
+        // are legal ONLY in a function-parameter declarator (C 6.7.6.3p7 adjusts
+        // such a `[static n]`/`[*]` to a pointer). This ONE arm folds EVERY
+        // declarator-mode row; `paramDecay` is true ONLY on the `param` row, so a
+        // decoration on ANY other row (a local / struct field / typedef / for-init)
+        // is a constraint violation — fail loud (the typeSpecifierSeq →
+        // S_InvalidTypeSpecifierCombination reject-the-construct discipline). A
+        // legal deref-sized VLA `int a[*p]` is an EXPRESSION node, NOT a bare `*`
+        // token, so `arraySuffixHasModifier` (direct-children scan) never trips on
+        // it. externDecl takes the legacy `applyArraySuffix` twin (never a
+        // parameter), which carries its own copy of this gate.
+        if (!paramDecay
+            && arraySuffixHasModifier(tree, suffix, dc.arraySuffixModifierTokens)) {
+            emit(DiagnosticCode::S_ArrayParamQualifierNonParameter);
+            return InvalidType;
+        }
         // The length is whichever of the suffix's visible children
         // CONSTANT-FOLDS (`[ n ]` — a bare literal TOKEN or an expression
         // rule; the bracket tokens fold to nothing, so the first foldable
@@ -3333,11 +3391,16 @@ applyDeclaratorSuffix(EngineState& s, SemanticConfig const& cfg,
         if (!len.has_value()) {
             // CRITICAL discriminator — an ABSENT length (`T x[]`, an incomplete/
             // decaying array) vs a PRESENT non-constant length (`T x[n]`, a VLA): BOTH
-            // fold to nullopt, so the discriminator is a length CHILD between the
-            // brackets. `arrayDeclSuffix = [ BracketOpen, {optional expr}, BracketClose ]`
-            // → 3 visible children when present, 2 when absent.
+            // fold to nullopt, so the discriminator is whether a real BOUND child sits
+            // between the brackets. VLA C4c (D-CSUBSET-VLA): NOT a raw child COUNT — a
+            // `[static n]` bound sits BEHIND the `static` token (count 4, bound present)
+            // while a `[*]` / `[restrict]` decoration has NO bound child (count 3, bound
+            // ABSENT — it must decay like `[]`, NEVER route to `vlaArray`). The shared
+            // `arraySuffixBoundNode` skips the decorations and returns the real bound (or
+            // nullopt) — the ONE locator every array-suffix site now agrees on.
             bool const hasPresentLength =
-                visibleChildren(tree, suffix).size() > 2;
+                arraySuffixBoundNode(tree, suffix, dc.arraySuffixModifierTokens)
+                    .has_value();
             // VLA C4a-param (D-CSUBSET-VLA, Option B): a C PARAMETER declarator
             // (`arrayToPointer` row — a DISTINCT signal threaded as `paramDecay`, NEVER
             // the struct-field FAM `allowFlexibleArray`). C 6.7.6.3p7 adjusts a param's
@@ -3444,7 +3507,14 @@ directDeclaredType(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             continue;
         }
         RuleId const cr = tree.rule(c);
-        if (cr == dc.fnSuffixRule || cr == dc.arraySuffixRule) {
+        // VLA C4c (D-CSUBSET-VLA-PARAM-STAR): the bare-`[*]` suffix is a THIRD
+        // array-suffix role alongside fn/array — collect it so `applyDeclarator-
+        // Suffix` folds it (a param `[*]` decays like `[]`; a non-param is a
+        // constraint violation). Omitting it here would SILENTLY drop the `[*]`
+        // → `int a[*]` would mis-type as a plain `int` (a silent miscompile).
+        if (isFnSuffixRule(cr, dc) || cr == dc.arraySuffixRule
+            || (dc.arrayStarSuffixRule.has_value()
+                && cr == *dc.arrayStarSuffixRule)) {
             suffixes.push_back(c);
             continue;
         }
@@ -3806,13 +3876,14 @@ void validateThreadLocalDeclarator(EngineState& s, SemanticConfig const& cfg,
 [[nodiscard]] std::vector<NodeId>
 vlaLengthNodes(Tree const& tree, NodeId declaratorNode, DeclaratorConfig const& dc) {
     std::vector<NodeId> out;
+    // VLA C4c (D-CSUBSET-VLA): route through the shared bound locator so a
+    // multi-dim VLA param whose inner dim carries an array-parameter decoration
+    // (`int a[n][static m]`) reads the REAL bound `m`, NOT the leading `static`
+    // token — a mis-located bound would query the wrong node's type in the
+    // Pass-2 non-integer-size check.
     auto middleOf = [&](NodeId suffix) -> NodeId {
-        auto const kids = visibleChildren(tree, suffix);
-        for (std::size_t i = 0; i < kids.size(); ++i) {
-            if (i == 0 || i + 1 == kids.size()) continue;   // skip `[` and `]`
-            return kids[i];
-        }
-        return {};
+        return arraySuffixBoundNode(tree, suffix, dc.arraySuffixModifierTokens)
+            .value_or(NodeId{});
     };
     // Explicit work-stack pre-order that preserves sibling SOURCE order: push
     // children in REVERSE so they pop left-to-right. An array-suffix node is

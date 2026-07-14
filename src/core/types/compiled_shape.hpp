@@ -157,8 +157,13 @@ public:
     // is the position-id of the SECOND branch — the skip/continuation
     // (`cont`) the optional falls through to when X is absent. It is NOT one
     // of the optional's own alternatives, so a SPECULATIVE optional excludes
-    // it from candidate enumeration (see `collectAltBranchRules`). Unset
-    // (false / 0) for `"alt"`/`"repeat"`-built AltChoices and every leaf.
+    // it from candidate enumeration (see `collectAltBranchRules`). VLA C4c
+    // (§B): a SPECULATIVE `{"repeat": {"alt": …, "speculative": true}}` also
+    // sets it — its loopEntry AltChoice carries the loop-exit `cont` as the
+    // skip branch so a speculative suffix repeat excludes the loop exit from
+    // candidate enumeration, exactly like the optional. Unset (false / 0) for
+    // plain `"alt"`-built AltChoices, NON-speculative `"repeat"`-built
+    // AltChoices, and every leaf.
     [[nodiscard]] bool          hasSkipBranch() const noexcept { return hasSkipBranch_; }
     [[nodiscard]] std::uint32_t skipBranch()    const noexcept { return skipBranch_; }
 

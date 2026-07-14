@@ -970,6 +970,27 @@ struct PositionBuilder {
             mergeSorted(ex, positions[cont].expectedSet());
             positions[loopEntry] = detail::Position::makeAltChoice(
                 {innerStart, cont}, std::move(ex));
+            // VLA C4c (§B): propagate a speculative INLINE repeat-alt onto
+            // loopEntry — the position the parser actually dispatches at —
+            // reusing the D-PARSE-SPECULATIVE-OPTIONAL skip-branch machinery so
+            // the loop-exit `cont` is excluded from the alt's candidate
+            // enumeration. Without this the inner alt's `speculative`/`lookahead`
+            // (set by applySpeculativeFlags on `innerStart`) land on a position
+            // the parser never reaches: the repeat body's AltChoice is only ever
+            // entered through loopEntry, which is built here bypassing the
+            // speculative setter. Opt-in: inert unless the repeat body IS a
+            // speculative alt (every shipped repeat-alt is non-speculative, so
+            // byte-identical). Also fires for a repeat body whose FIRST element
+            // is a speculative alt (`{"repeat":{"sequence":[{"alt":spec},…]}}`) —
+            // `innerStart` is then that alt; marking loopEntry speculative is
+            // sound (the alt at the loop head still speculates, `cont` is still
+            // the loop exit).
+            if (positions[innerStart].slotKind() == SlotKind::AltChoice
+                && positions[innerStart].speculative()) {
+                positions[loopEntry].setSpeculative(
+                    true, positions[innerStart].lookahead());
+                positions[loopEntry].setSkipBranch(cont);
+            }
             return loopEntry;
         }
         if (body.contains("expr")) {
@@ -4434,14 +4455,23 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                               "'semantics.declarators' must be an object of "
                               "declarator role names");
                 } else {
-                    static constexpr std::array<std::string_view, 16>
+                    static constexpr std::array<std::string_view, 19>
                         kDeclaratorKeys{
                             "declaratorRule",     "pointerLayerRule",
                             "pointerToken",       "directRule",
                             "groupRule",          "nameToken",
                             "fnSuffixRule",       "fnSuffixParamsRule",
+                            // VLA C4c (D-CSUBSET-VLA-PARAM-STAR): the OPTIONAL
+                            // guard-less post-base twin of `fnSuffixRule`.
+                            "fnSuffixTailRule",
                             "arraySuffixRule",    "initDeclaratorRule",
                             "listRule",
+                            // VLA C4c (D-CSUBSET-VLA-PARAM-STAR): the OPTIONAL bare-`[*]`
+                            // unspecified-size array-suffix rule.
+                            "arrayStarSuffixRule",
+                            // VLA C4c (D-CSUBSET-VLA): the OPTIONAL array-parameter
+                            // decoration token-kind set (static / cv-qualifiers / `*`).
+                            "arraySuffixModifierTokens",
                             // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): the OPTIONAL
                             // struct/union member-declarator + member-list roles.
                             "memberDeclaratorRule", "memberListRule",
@@ -4456,6 +4486,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             "prototypeParamScopeRule"};
                     bool dOk = true;
                     for (auto it = dj.begin(); it != dj.end(); ++it) {
+                        // `$`-prefixed keys are the codebase-wide documentation
+                        // convention (`$comment` / `$…Comment`) — never a role,
+                        // so exempt them from the typo discriminator (matches how
+                        // every other config block carries inline `$` comments).
+                        if (!it.key().empty() && it.key().front() == '$') continue;
                         bool known = false;
                         for (auto const& k : kDeclaratorKeys) {
                             if (it.key() == k) { known = true; break; }
@@ -4593,6 +4628,20 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             }
                             outId = data.rules->find(outName);
                         };
+                    // VLA C4c (D-CSUBSET-VLA-PARAM-STAR): the OPTIONAL bare-`[*]`
+                    // unspecified-size array-suffix rule — same optional-role
+                    // discipline (absent ⇒ no `[*]` suffix; the declarator engine
+                    // never matches it).
+                    readOptionalRuleRole("arrayStarSuffixRule",
+                                         dc.arrayStarSuffixRule,
+                                         dc.arrayStarSuffixRuleName);
+                    // VLA C4c (D-CSUBSET-VLA-PARAM-STAR): the OPTIONAL guard-less
+                    // post-base twin of `fnSuffixRule` — same optional-role
+                    // discipline (absent ⇒ only the single fn-suffix rule; the
+                    // semantic tier's `isFnSuffixRule` second disjunct stays dead).
+                    readOptionalRuleRole("fnSuffixTailRule",
+                                         dc.fnSuffixTailRule,
+                                         dc.fnSuffixTailRuleName);
                     readOptionalRuleRole("memberDeclaratorRule",
                                          dc.memberDeclaratorRule,
                                          dc.memberDeclaratorRuleName);
@@ -4634,6 +4683,48 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             } else {
                                 dc.variadicMarker =
                                     data.schemaTokens->find(dc.variadicMarkerName);
+                            }
+                        }
+                    }
+                    // VLA C4c (D-CSUBSET-VLA): the OPTIONAL array-parameter decoration
+                    // token-kind set (static / cv-qualifiers / `*`). Absent ⇒ empty (the
+                    // bound-locating helpers degrade to the plain first-non-bracket-child
+                    // view — a language with no array-parameter decorations). Present must
+                    // be an array of KNOWN token-kind names; an unknown / non-string entry
+                    // FAILS the load (a typo would silently blind the bound locator to a
+                    // real decoration → a mis-sized array), mirroring readTokenRole.
+                    if (dj.contains("arraySuffixModifierTokens")) {
+                        json const& mt = dj.at("arraySuffixModifierTokens");
+                        if (!mt.is_array()) {
+                            coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                      dPath + "/arraySuffixModifierTokens",
+                                      "'declarators.arraySuffixModifierTokens' must be "
+                                      "an array of token-kind name strings");
+                            dOk = false;
+                        } else {
+                            for (auto const& el : mt) {
+                                if (!el.is_string()) {
+                                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                              dPath + "/arraySuffixModifierTokens",
+                                              "each 'arraySuffixModifierTokens' entry "
+                                              "must be a token-kind name string");
+                                    dOk = false;
+                                    continue;
+                                }
+                                auto const nm = el.get<std::string>();
+                                if (!data.schemaTokens->contains(nm)) {
+                                    coll.emit(DiagnosticCode::C_UnknownToken,
+                                              dPath + "/arraySuffixModifierTokens",
+                                              std::format("'declarators."
+                                                          "arraySuffixModifierTokens' "
+                                                          "references unknown token kind "
+                                                          "'{}'", nm));
+                                    dOk = false;
+                                    continue;
+                                }
+                                dc.arraySuffixModifierTokens.push_back(
+                                    data.schemaTokens->find(nm));
+                                dc.arraySuffixModifierTokenNames.push_back(nm);
                             }
                         }
                     }

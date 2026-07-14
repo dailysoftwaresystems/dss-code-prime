@@ -278,6 +278,20 @@ struct DSS_EXPORT DeclaratorConfig {
     SchemaTokenId nameToken{};
     RuleId        fnSuffixRule{};
     std::optional<RuleId> fnSuffixParamsRule;
+    // VLA C4c (D-CSUBSET-VLA-PARAM-STAR): the OPTIONAL guard-less post-base twin of
+    // `fnSuffixRule` — a `( paramList? )` suffix grammar-IDENTICAL to `fnSuffixRule`
+    // but carrying NO `commitRequiresTypeName` guard. It exists because the
+    // direct-declarator SUFFIX repeat is now SPECULATIVE (to disambiguate the
+    // bare-`[*]` `arrayStarSuffix` from `arrayDeclSuffix`), and a guarded
+    // `fnSuffixRule` at that suffix position would spuriously roll back a valid
+    // function's `()` (empty / cross-file-typedef params) — breaking `int f()`,
+    // casts, EVERY named function declarator (whose `(...)` rides the suffix
+    // repeat). Every function-suffix recognition site treats this rule IDENTICALLY
+    // to `fnSuffixRule` (via the shared `isFnSuffixRule` predicate below); its
+    // param list is the SAME `fnSuffixParamsRule`, so param harvest is unchanged.
+    // `nullopt` ⇒ the grammar has only the single fn-suffix rule (every grammar
+    // before this landed) — behavior is exactly as before.
+    std::optional<RuleId> fnSuffixTailRule;
     // c32 (D-CSUBSET-FNPTR-PARAM-SCOPE): the OPTIONAL param-list rule that opens a
     // per-declarator FUNCTION-PROTOTYPE scope (C 6.2.1p4). A param in a
     // NON-definition declarator — a function-POINTER member/typedef/param, or a
@@ -296,6 +310,13 @@ struct DSS_EXPORT DeclaratorConfig {
     // Toy/tsql declare no `declarators` block at all, so they are unaffected.
     std::optional<RuleId> prototypeParamScopeRule;
     RuleId        arraySuffixRule{};
+    // VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2p4): the OPTIONAL bare-`[*]`
+    // unspecified-size array-suffix rule (`arrayStarSuffix`) — a prototype-form
+    // VLA-parameter marker. A DISTINCT CST rule from `arraySuffixRule` so the
+    // flat bound-locator / lengthChild / captureVlaSize sites are untouched.
+    // `nullopt` ⇒ the language has no `[*]` suffix (toy/tsql, and c-subset
+    // before this landed) — the declarator engine simply never matches it.
+    std::optional<RuleId> arrayStarSuffixRule;
     RuleId        initDeclaratorRule{};
     RuleId        listRule{};
     // c23 (D-CSUBSET-STRUCT-MULTI-DECLARATOR): the OPTIONAL struct/union
@@ -332,6 +353,16 @@ struct DSS_EXPORT DeclaratorConfig {
     // DEFINITION built a non-variadic FnSig — the gap FC12a-core closes). `nullopt`
     // ⇒ the language has no varargs (FnSigs through this path are non-variadic).
     std::optional<SchemaTokenId> variadicMarker;
+    // VLA C4c (D-CSUBSET-VLA, C99 §6.7.6.2/6.7.6.3): the token kinds that DECORATE
+    // an array-PARAMETER suffix — a `static`, the cv-qualifiers, and the
+    // unspecified-size `*` — none part of the length BOUND. The shared
+    // `arraySuffixBoundNode`/`arraySuffixHasModifier` helpers (decl_prefix_strip.hpp)
+    // skip these to LOCATE the bound behind a decoration and to detect a
+    // parameter-only decoration on a non-parameter declarator (the constraint
+    // violation S_ArrayParamQualifierNonParameter). EMPTY for a language without
+    // array-parameter decorations (the helpers degrade to the plain
+    // first-non-bracket-child view — the prior behavior, unchanged).
+    std::vector<SchemaTokenId> arraySuffixModifierTokens;
     // Source spellings, retained for diagnostics (mirrors the
     // rule+ruleName pairing convention of the other facets).
     std::string   declaratorRuleName;
@@ -342,6 +373,7 @@ struct DSS_EXPORT DeclaratorConfig {
     std::string   nameTokenName;
     std::string   fnSuffixRuleName;
     std::string   fnSuffixParamsRuleName;
+    std::string   fnSuffixTailRuleName;          // VLA C4c D-CSUBSET-VLA-PARAM-STAR
     std::string   prototypeParamScopeRuleName;   // c32 D-CSUBSET-FNPTR-PARAM-SCOPE
     std::string   arraySuffixRuleName;
     std::string   initDeclaratorRuleName;
@@ -350,7 +382,25 @@ struct DSS_EXPORT DeclaratorConfig {
     std::string   memberListRuleName;         // c23 D-CSUBSET-STRUCT-MULTI-DECLARATOR
     std::string   directAbstractRuleName;     // c26 D-CSUBSET-ABSTRACT-DECLARATOR-TYPE-NAME
     std::string   variadicMarkerName;
+    std::vector<std::string> arraySuffixModifierTokenNames;   // VLA C4c D-CSUBSET-VLA
+    std::string   arrayStarSuffixRuleName;                    // VLA C4c D-CSUBSET-VLA-PARAM-STAR
 };
+
+// VLA C4c (D-CSUBSET-VLA-PARAM-STAR): is rule `r` a FUNCTION suffix — either the
+// guarded base-position `fnSuffixRule` or its guard-less post-base twin
+// `fnSuffixTailRule`? The two rules are grammar-IDENTICAL (`( paramList? )`) and
+// MUST be recognized identically at every function-suffix site (the fn-declarator
+// detection, the definition-param scope test, the FnSig type fold in
+// `directDeclaredType`/`applyDeclaratorSuffix`, and the HIR param harvest) — ONE
+// predicate so those sites can never drift. `fnSuffixTailRule` nullopt ⇒ the
+// grammar has only the single fn-suffix rule, the second disjunct is dead, and
+// behavior is exactly as before this landed. Shared across the semantic analyzer
+// and the CST→HIR lowerer (both consume `DeclaratorConfig`).
+[[nodiscard]] inline bool
+isFnSuffixRule(RuleId r, DeclaratorConfig const& dc) {
+    return r == dc.fnSuffixRule
+        || (dc.fnSuffixTailRule.has_value() && r == *dc.fnSuffixTailRule);
+}
 
 struct DSS_EXPORT DeclarationRule {
     // The rule (resolved to RuleId) whose subtree introduces the decl.
