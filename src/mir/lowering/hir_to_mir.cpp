@@ -211,8 +211,38 @@ struct Lowerer {
         // Used by `DoWhileStmt` to decide whether to lower the (otherwise
         // dead) condition block when the body self-sealed.
         bool       continueReferenced = false;
+        // VLA C5 (D-CSUBSET-VLA, audit fix #3): the `vlaScopeStack_.size()` captured
+        // when THIS loop/switch frame was pushed. A `break`/`continue` targeting this
+        // frame exits every VLA scope opened INSIDE it (indices >= this depth), so it
+        // restores SP to the entry watermark of `vlaScopeStack_[vlaDepthAtPush]` (the
+        // shallowest VLA scope strictly inside the target) — or nothing if the loop/
+        // switch declared no VLA (size == depth).
+        std::size_t vlaDepthAtPush = 0;
     };
     std::vector<BranchFrame> branchStack;
+
+    // VLA C5 (D-CSUBSET-VLA): the stack of currently-OPEN block-scope VLA
+    // watermarks, innermost on the back. One frame per dynamic-VLA VarDecl (the
+    // finer per-decl granularity that makes a backward `goto` between two VLAs
+    // correct). Pushed at the VarDecl (with `saveBefore` = the StackSave emitted
+    // just BEFORE the VLA's `sub sp`); popped when the declaring lexical block's
+    // lowering completes. Correlated with `branchStack` (break/continue) via
+    // `vlaDepthAtPush`, and walked for `goto` teardown via HIR ancestry. Reset per
+    // function. See the teardown helpers below.
+    struct VlaScopeFrame {
+        HirNodeId  declNode;    // the VLA VarDecl (textual-position anchor for goto)
+        HirNodeId  scopeNode;   // the enclosing lexical Block (== hir.parent(declNode))
+        MirInstId  saveBefore;  // the StackSave value (SP captured before this VLA)
+        std::uint32_t scopeId;  // the StackSave/StackRestore pairing payload
+    };
+    std::vector<VlaScopeFrame> vlaScopeStack_;
+    // VLA C5: per-function monotonic scopeId stamped on each StackSave/StackRestore
+    // (the verifier pairs Restore→Save on it). Reset per function.
+    std::uint32_t vlaScopeCounter_ = 0;
+    // VLA C5: per-function label-ordinal → LabelStmt HIR node, for resolving a
+    // `goto`'s target label to compute which VLA scopes the jump exits (the
+    // ancestry walk). Populated at function entry; reset per function.
+    std::unordered_map<std::uint32_t, HirNodeId> labelNodeByOrdinal_;
 
     // FC12a-core (D-FC12A-VARIADIC-CALLEE): the enclosing function's count of FIXED
     // (non-variadic) params that consumed an integer / SSE arg register. `va_start`
@@ -6400,6 +6430,143 @@ struct Lowerer {
         }
     }
 
+    // ── VLA C5 (D-CSUBSET-VLA): block-scope stack teardown helpers ──────────
+    // A dynamic VLA descends SP; C5 restores it on every NON-return exit of the
+    // declaring scope. The decisions live HERE (HIR→MIR) because MIR is flat — a
+    // Br/CondBr carries no scope tag, so "which VLA scopes does this edge exit" must
+    // be computed while lexical-block structure is still visible.
+
+    // Map each LabelStmt's ordinal → its HIR node (goto-teardown ancestry). Populated
+    // at function entry, alongside the addressTakenLabels scan. Reset per function.
+    void collectLabelNodes(HirNodeId node) {
+        if (!node.valid()) return;
+        if (hir.kind(node) == HirKind::LabelStmt)
+            labelNodeByOrdinal_[hir.labelOrdinal(node)] = node;
+        for (HirNodeId child : hir.children(node)) collectLabelNodes(child);
+    }
+    [[nodiscard]] HirNodeId resolveLabelNode(std::uint32_t ordinal) const {
+        auto it = labelNodeByOrdinal_.find(ordinal);
+        return it == labelNodeByOrdinal_.end() ? HirNodeId{} : it->second;
+    }
+
+    // Open a teardown watermark for a dynamic-VLA local: emit a StackSave (SP
+    // captured just BEFORE the VLA's `sub sp`) and push a vlaScopeStack_ frame. The
+    // caller (VarDecl lowering) invokes this IMMEDIATELY before `allocaForLocal`
+    // emits the VLA alloca — the fixed stride-slot allocas emitted in between do NOT
+    // move SP (they are FP-relative frame slots), so the save == SP pre-`sub sp`.
+    // The scope node is EITHER a compound-statement Block (a body/nested-block VLA,
+    // torn down at the block's exit) OR a ForStmt (a `for`-INIT VLA — declared once at
+    // loop entry, persists across iterations, torn down at the loop's EXIT edges by
+    // the For driver, NEVER on the back-edge). A VLA in a MULTI-declarator for-init
+    // (`for (int a[n], b[m]; ...)`) is wrapped in a Block whose parent is the ForStmt;
+    // that Block's own teardown would free the VLA at the END OF THE INIT (before the
+    // body), so that narrow shape is deferred fail-loud (never a silent early-free).
+    [[nodiscard]] bool emitStackSaveForVla(HirNodeId declNode) {
+        HirNodeId const scopeNode = hir.parent(declNode);
+        bool const scopeIsBlock =
+            scopeNode.valid() && hir.kind(scopeNode) == HirKind::Block;
+        bool const scopeIsForInit =
+            scopeNode.valid() && hir.kind(scopeNode) == HirKind::ForStmt;
+        if (!scopeIsBlock && !scopeIsForInit) {
+            unsupported(declNode,
+                "a variable-length array in this declaration position is not yet "
+                "torn down at scope exit (D-CSUBSET-VLA)");
+            return false;
+        }
+        // A multi-declarator for-init Block (parent == ForStmt, and it IS that for's
+        // init clause): defer — its Block teardown would free the VLA before the body.
+        if (scopeIsBlock) {
+            HirNodeId const gp = hir.parent(scopeNode);
+            if (gp.valid() && hir.kind(gp) == HirKind::ForStmt) {
+                auto const initN = hir.forInit(gp);
+                if (initN.has_value() && *initN == scopeNode) {
+                    unsupported(declNode,
+                        "a variable-length array in a MULTI-declarator `for`-init "
+                        "clause (`for (int a[n], b[m]; ...)`) is not yet torn down at "
+                        "loop exit — deferred (D-CSUBSET-VLA-FOR-INIT-MULTIDECL)");
+                    return false;
+                }
+            }
+        }
+        std::uint32_t const scopeId = vlaScopeCounter_++;
+        MirInstId const save =
+            mir.addInst(MirOpcode::StackSave, {}, i64Ty(), scopeId);
+        if (!save.valid()) return false;
+        vlaScopeStack_.push_back({declNode, scopeNode, save, scopeId});
+        return true;
+    }
+
+    // Emit a StackRestore to the entry watermark of vlaScopeStack_[frameIdx] (frees
+    // that scope's VLA + every DEEPER one — the stack grows down, so a shallower
+    // watermark reclaims all below it). scopeId payload pairs it to its StackSave.
+    void emitVlaRestore(std::size_t frameIdx) {
+        VlaScopeFrame const& fr = vlaScopeStack_[frameIdx];
+        std::array<MirInstId, 1> ops{fr.saveBefore};
+        mir.addInst(MirOpcode::StackRestore, ops, InvalidType, fr.scopeId);
+    }
+
+    // A lexical block whose lowering opened VLA scopes at depth >= `baseDepth` is
+    // finishing. On a FALL-THROUGH exit (the open block NOT already sealed by a
+    // break/continue/goto/return — audit fix #10), restore SP to the SHALLOWEST VLA
+    // this block declared (index == baseDepth), then pop those frames. `emitRestore
+    // = false` on the error-bail path (pop only; compilation is aborting). No-op —
+    // emits NEITHER op — when the block declared no VLA (the byte-clean common case).
+    void closeVlaBlockScope(std::size_t baseDepth, bool emitRestore) {
+        if (vlaScopeStack_.size() <= baseDepth) return;   // no VLA opened here
+        if (emitRestore && !mir.openBlockHasTerminator())
+            emitVlaRestore(baseDepth);
+        vlaScopeStack_.resize(baseDepth);
+    }
+
+    // Is label `L` inside `fr`'s VLA scope? Drives which scopes a `goto` exits.
+    //  * A BLOCK-scope VLA: true iff fr.scopeNode is a lexical ancestor of L AND
+    //    fr.declNode textually PRECEDES (in the block's child order) the child leading
+    //    to L — the VLA's scope runs from its decl to the end of its block (C99 6.2.4).
+    //  * A for-INIT VLA (scopeNode is the ForStmt): true iff the ForStmt is a lexical
+    //    ancestor of L — a for-init object is in scope for the ENTIRE for statement
+    //    (there is no position "before" the for-init inside the loop), so ANY label in
+    //    the loop is enclosed; a goto to a label OUTSIDE the for exits the for-init.
+    [[nodiscard]] bool vlaFrameEnclosesLabel(VlaScopeFrame const& fr,
+                                             HirNodeId L) const {
+        bool const scopeIsBlock = hir.kind(fr.scopeNode) == HirKind::Block;
+        HirNodeId prev = L;
+        for (HirNodeId cur = hir.parent(L); cur.valid(); cur = hir.parent(cur)) {
+            if (cur == fr.scopeNode) {
+                if (!scopeIsBlock) return true;   // for-init: whole-for scope
+                auto kids = hir.children(cur);
+                int pIdx = -1, dIdx = -1;
+                for (std::size_t i = 0; i < kids.size(); ++i) {
+                    if (kids[i] == prev)        pIdx = static_cast<int>(i);
+                    if (kids[i] == fr.declNode) dIdx = static_cast<int>(i);
+                }
+                return dIdx >= 0 && pIdx >= 0 && dIdx < pIdx;
+            }
+            prev = cur;
+        }
+        return false;   // scopeNode not an ancestor of L → L is outside this scope
+    }
+
+    // Emit the SP teardown for a `goto`. Every open vlaScopeStack_ frame encloses the
+    // goto textually; those NOT enclosing the target label L are EXITED. Scopes nest,
+    // so the enclosing-L frames form a PREFIX and the exited ones a SUFFIX — restore
+    // to the SHALLOWEST exited frame (frees all exited). The entry-side ban
+    // (H_VlaJumpIntoScope) guarantees a legal goto never enters a VLA scope past its
+    // decl, so the restore-target StackSave always dominates the goto (SSA-valid).
+    // Nothing to do when the goto stays within every open scope (frees nothing).
+    void emitGotoVlaTeardown(HirNodeId gotoNode) {
+        if (vlaScopeStack_.empty()) return;
+        HirNodeId const L = resolveLabelNode(hir.labelOrdinal(gotoNode));
+        for (std::size_t k = 0; k < vlaScopeStack_.size(); ++k) {
+            // A defensively-unresolved L (should not occur post-HIR-verify) frees ALL
+            // open scopes — the safe over-approximation for an outward jump, never a
+            // leak.
+            if (!L.valid() || !vlaFrameEnclosesLabel(vlaScopeStack_[k], L)) {
+                emitVlaRestore(k);
+                return;
+            }
+        }
+    }
+
     // c69 (D-MIR-ENTRY-BLOCK-ALLOCA-HOIST): collect every body-local `VarDecl`
     // node, so `lowerFunction` can pre-emit its storage `Alloca` into the ENTRY
     // block (which dominates every use) BEFORE lowering the body. Without this a
@@ -7649,6 +7816,12 @@ struct Lowerer {
         // others. (c60: the Switch frame no longer needs a per-arm cursor — its
         // body lowers as ONE Block via the work-stack — so it carries only `bb0`.)
         std::uint32_t aux{};
+        // VLA C5 (D-CSUBSET-VLA): for a Block frame, `vlaScopeStack_.size()` captured
+        // at the block's entry (phase 0). At the block's fall-through finish, the
+        // frames [vlaBase, size) are the VLAs this block declared — restore SP to the
+        // shallowest (index vlaBase) + pop them (`closeVlaBlockScope`). Unused (0) by
+        // the other kinds.
+        std::uint32_t vlaBase{};
     };
 
     // LIFO cursor for an unbounded child-statement list (a Block's stmts, or a
@@ -7733,6 +7906,10 @@ struct Lowerer {
             case StmtFrame::Kind::Block: {
                 if (f.phase == 0) {
                     f.aux = static_cast<std::uint32_t>(blockCtxs.size());
+                    // VLA C5 (D-CSUBSET-VLA): watermark the VLA-scope stack at this
+                    // block's entry, so its fall-through finish restores + pops
+                    // exactly the VLAs it declared.
+                    f.vlaBase = static_cast<std::uint32_t>(vlaScopeStack_.size());
                     blockCtxs.push_back({.idx = 0});
                     f.phase = 1;
                     // fall into phase 1 below (no sub-request yet)
@@ -7740,10 +7917,15 @@ struct Lowerer {
                 // phase 1: dispatch the next child (or finish). Re-address the
                 // ctx by index — a nested block grew `blockCtxs`.
                 std::uint32_t const ctxIdx = f.aux;
+                std::uint32_t const vlaBase = f.vlaBase;
                 HirNodeId const node2 = f.node;
                 if (f.phase == 2) {
-                    // Resuming after a child finished. Bail on failure.
-                    if (!ok) { blockCtxs.pop_back(); work.pop_back(); break; }
+                    // Resuming after a child finished. Bail on failure (pop the VLA
+                    // frames this block opened; no restore — we are aborting).
+                    if (!ok) {
+                        closeVlaBlockScope(vlaBase, /*emitRestore=*/false);
+                        blockCtxs.pop_back(); work.pop_back(); break;
+                    }
                     auto kids = hir.children(node2);
                     std::uint32_t const justDone = blockCtxs[ctxIdx].idx;
                     // A child may have sealed the open block mid-block; a
@@ -7761,6 +7943,10 @@ struct Lowerer {
                 auto kids = hir.children(node2);
                 std::uint32_t const i = blockCtxs[ctxIdx].idx;
                 if (i >= kids.size()) {
+                    // VLA C5: the block ran to completion — on a fall-through exit
+                    // restore SP to the shallowest VLA it declared (before the
+                    // enclosing frame's back-edge / Br), then pop those frames.
+                    closeVlaBlockScope(vlaBase, /*emitRestore=*/true);
                     blockCtxs.pop_back();
                     work.pop_back();
                     ok = true;
@@ -7869,6 +8055,9 @@ struct Lowerer {
                     mir.addCondBr(cond, body, exit);
                     mir.beginBlock(body);
                     branchStack.push_back({header, exit});
+                    // VLA C5 (D-CSUBSET-VLA): record the VLA depth so a break/continue
+                    // targeting this loop restores SP past every VLA opened inside it.
+                    branchStack.back().vlaDepthAtPush = vlaScopeStack_.size();
                     f.bb0 = header; f.bb1 = body; f.bb2 = exit;
                     f.phase = 1;
                     HirNodeId const bodyN = hir.loopBody(node2);
@@ -7908,6 +8097,7 @@ struct Lowerer {
                     mir.addBr(body);
                     mir.beginBlock(body);
                     branchStack.push_back({continueBB, exit, false});
+                    branchStack.back().vlaDepthAtPush = vlaScopeStack_.size();  // VLA C5
                     f.bb0 = body; f.bb1 = continueBB; f.bb2 = exit;
                     f.phase = 1;
                     HirNodeId const bodyN = hir.loopBody(node2);
@@ -7963,10 +8153,18 @@ struct Lowerer {
                     auto const initN   = hir.forInit(node2);
                     auto const condN   = hir.loopCondition(node2);
                     auto const updateN = hir.forUpdate(node2);
+                    // VLA C5 (D-CSUBSET-VLA): watermark the VLA stack BEFORE the init,
+                    // so a for-INIT VLA is pushed at exactly `vlaBase`. The init runs
+                    // ONCE at loop entry, so its VLA PERSISTS across every iteration —
+                    // the For driver frees it at the loop EXIT (phase 1), NEVER on the
+                    // back-edge (the body block's watermark is deeper, so its per-
+                    // iteration teardown cannot reach the for-init frame).
+                    f.vlaBase = static_cast<std::uint32_t>(vlaScopeStack_.size());
                     if (initN.has_value()) {
                         if (!lowerForClauseNode(*initN)) {
                             if (!mir.openBlockHasTerminator())
                                 mir.addUnreachable();
+                            vlaScopeStack_.resize(f.vlaBase);  // pop any for-init frame
                             work.pop_back(); ok = false; break;
                         }
                     }
@@ -7991,6 +8189,7 @@ struct Lowerer {
                             sealCreatedAsUnreachable(body);
                             sealCreatedAsUnreachable(update);
                             sealCreatedAsUnreachable(exit);
+                            vlaScopeStack_.resize(f.vlaBase);  // pop the for-init frame
                             work.pop_back(); ok = false; break;
                         }
                         mir.addCondBr(cond, body, exit);
@@ -7999,6 +8198,7 @@ struct Lowerer {
                     }
                     mir.beginBlock(body);
                     branchStack.push_back({backTarget, exit});
+                    branchStack.back().vlaDepthAtPush = vlaScopeStack_.size();  // VLA C5
                     f.bb0 = header; f.bb1 = body; f.bb2 = update;
                     f.bb3 = exit;   f.bb4 = backTarget;
                     f.phase = 1;
@@ -8010,11 +8210,13 @@ struct Lowerer {
                     MirBlockId const update     = f.bb2;
                     MirBlockId const exit       = f.bb3;
                     MirBlockId const backTarget = f.bb4;
+                    std::size_t const vlaBase   = f.vlaBase;  // VLA C5: for-init watermark
                     branchStack.pop_back();
                     if (!ok) {
                         if (!mir.openBlockHasTerminator()) mir.addUnreachable();
                         sealCreatedAsUnreachable(update);
                         sealCreatedAsUnreachable(exit);
+                        vlaScopeStack_.resize(vlaBase);  // pop the for-init frame (aborting)
                         work.pop_back(); ok = false; break;
                     }
                     if (!mir.openBlockHasTerminator()) mir.addBr(backTarget);
@@ -8025,11 +8227,24 @@ struct Lowerer {
                             if (!mir.openBlockHasTerminator())
                                 mir.addUnreachable();
                             sealCreatedAsUnreachable(exit);
+                            vlaScopeStack_.resize(vlaBase);  // pop the for-init frame
                             work.pop_back(); ok = false; break;
                         }
                         mir.addBr(header);
                     }
                     mir.beginBlock(exit);
+                    // VLA C5 (D-CSUBSET-VLA): free the for-INIT VLA at the loop EXIT.
+                    // The exit block is the merge of the cond-false edge AND every
+                    // `break` (a break already restored the body VLAs to THIS post-init
+                    // watermark, and the back-edge kept the for-init live — so both
+                    // predecessors arrive with SP at the post-init level). ONE restore
+                    // here reclaims the for-init on every exit path; a `goto` OUT of the
+                    // loop restores it via the ancestry walk instead (it bypasses this
+                    // block). No-op when the for-init declared no VLA.
+                    if (vlaScopeStack_.size() > vlaBase) {
+                        emitVlaRestore(vlaBase);
+                        vlaScopeStack_.resize(vlaBase);
+                    }
                     work.pop_back(); ok = true;
                 }
                 break;
@@ -8111,6 +8326,7 @@ struct Lowerer {
                     mir.addSwitch(disc, cases, defaultBB);
                     // Push the break-frame ONCE for the whole switch.
                     branchStack.push_back({MirBlockId{}, exitBB});
+                    branchStack.back().vlaDepthAtPush = vlaScopeStack_.size();  // VLA C5
                     // Only a non-label-first body (a jumped-over leading decl) needs a
                     // fresh predecessor-less block (pruned as unreachable); a case
                     // marker opens its own label-block (see the recursive form).
@@ -8167,9 +8383,18 @@ struct Lowerer {
         HirKind const k = hir.kind(node);
         switch (k) {
             case HirKind::Block: {
+                // NOTE (VLA C5, D-CSUBSET-VLA): this recursive Block arm is DEAD via
+                // the StmtFrame driver (enterStmt intercepts Block); the LIVE block-
+                // scope VLA teardown lives in StmtFrame::Kind::Block. The same
+                // `closeVlaBlockScope` helper is mirrored here so a future
+                // reactivation of this fallback cannot silently leak the dynamic stack.
+                std::size_t const vlaBase = vlaScopeStack_.size();
                 auto kids = hir.children(node);
                 for (std::size_t i = 0; i < kids.size(); ++i) {
-                    if (!lowerStmt(kids[i])) return false;
+                    if (!lowerStmt(kids[i])) {
+                        closeVlaBlockScope(vlaBase, /*emitRestore=*/false);
+                        return false;
+                    }
                     // A child may unconditionally transfer control and seal the
                     // open block mid-block (the `Block{ infinite-loop, Unreachable }`
                     // wrapper cst_to_hir synthesizes for a provably-infinite loop —
@@ -8187,6 +8412,7 @@ struct Lowerer {
                         mir.beginBlock(dead);
                     }
                 }
+                closeVlaBlockScope(vlaBase, /*emitRestore=*/true);
                 return true;
             }
             case HirKind::ReturnStmt: {
@@ -8253,6 +8479,19 @@ struct Lowerer {
                     it != addressableLocal.end()) {
                     alloca = it->second;
                 } else {
+                    // VLA C5 (D-CSUBSET-VLA): a dynamic-stack VLA local (`int a[n]`,
+                    // a multi-dim VLA, or a VLA-typedef object) descends SP via
+                    // `sub sp`. Open a block-scope teardown watermark FIRST — capture
+                    // SP (StackSave) just before that `sub sp` and push a
+                    // vlaScopeStack_ frame — so every non-return exit of the enclosing
+                    // block restores it (the fixed stride-slot allocas emitted inside
+                    // allocaForLocal do NOT move SP). This is the SAME predicate
+                    // allocaForLocal uses to route the dynamic alloca; a ptr-to-VLA
+                    // (a fixed 8-byte slot, no `sub sp`) is deliberately NOT matched.
+                    // A non-VLA local emits NEITHER op (byte-clean).
+                    if (interner.isVlaArray(ty) || interner.typeContainsVla(ty)) {
+                        if (!emitStackSaveForVla(node)) return false;
+                    }
                     alloca = allocaForLocal(sym, ty, node);
                     if (!alloca.valid()) return false;
                 }
@@ -8756,8 +8995,15 @@ struct Lowerer {
                         depth, branchStack.size()));
                     return false;
                 }
-                MirBlockId const target =
-                    branchStack[branchStack.size() - 1 - depth].breakBB;
+                BranchFrame const& targetFrame =
+                    branchStack[branchStack.size() - 1 - depth];
+                MirBlockId const target = targetFrame.breakBB;
+                // VLA C5 (D-CSUBSET-VLA): `break` exits every VLA scope opened INSIDE
+                // the target loop/switch — restore SP to that frame's entry watermark
+                // (the shallowest VLA scope strictly inside it) BEFORE the branch.
+                // Nothing to restore when the target declared no VLA.
+                if (vlaScopeStack_.size() > targetFrame.vlaDepthAtPush)
+                    emitVlaRestore(targetFrame.vlaDepthAtPush);
                 mir.addBr(target);
                 return true;
             }
@@ -8768,12 +9014,14 @@ struct Lowerer {
                 // (so a `continue` inside a switch inside a loop reaches the loop).
                 std::uint32_t depth = hir.branchDepth(node);
                 MirBlockId target{};
+                std::size_t targetVlaDepth = 0;   // VLA C5: the target loop's watermark
                 for (std::size_t i = branchStack.size(); i-- > 0;) {
                     BranchFrame& frame = branchStack[i];
                     if (!frame.continueBB.valid()) continue;   // skip switch frames
                     if (depth == 0) {
                         frame.continueReferenced = true;
                         target = frame.continueBB;
+                        targetVlaDepth = frame.vlaDepthAtPush;
                         break;
                     }
                     --depth;
@@ -8784,10 +9032,21 @@ struct Lowerer {
                         "verifier should have flagged this)");
                     return false;
                 }
+                // VLA C5 (D-CSUBSET-VLA): `continue` exits the VLA scopes opened in the
+                // current iteration's body — restore SP to the loop's entry watermark
+                // BEFORE the back-edge (nothing if the loop body declared no VLA).
+                if (vlaScopeStack_.size() > targetVlaDepth)
+                    emitVlaRestore(targetVlaDepth);
                 mir.addBr(target);
                 return true;
             }
             case HirKind::GotoStmt: {
+                // VLA C5 (D-CSUBSET-VLA): restore SP for every VLA scope this goto
+                // EXITS (computed from HIR label ancestry) BEFORE the branch. The
+                // entry-side ban (H_VlaJumpIntoScope) guarantees a legal goto never
+                // enters a VLA scope past its decl, so the restore-target watermark
+                // dominates the goto. No-op when the goto frees no VLA scope.
+                emitGotoVlaTeardown(node);
                 // Unconditional jump to the target label's block (created lazily so
                 // forward + backward gotos resolve identically). The open block is
                 // now terminated; a following sibling opens a fresh dead block (the
@@ -8803,6 +9062,20 @@ struct Lowerer {
                 // computed goto with NO `&&label` anywhere in the function can never
                 // have a valid target → fail loud rather than emit a successorless
                 // IndirectBr (opcodeInfo requires ≥1 successor).
+                //
+                // VLA C5 (D-CSUBSET-VLA): a computed goto LEXICALLY inside a VLA scope
+                // has a runtime target set — no single SP-restore watermark is provably
+                // correct. Fail loud (defense-in-depth; the HIR verifier's
+                // H_VlaComputedGotoInScope catches it pre-MIR). Runs fine with no open
+                // VLA scope.
+                if (!vlaScopeStack_.empty()) {
+                    unsupported(node,
+                        "computed `goto *` inside the scope of a variable-length "
+                        "array is not supported — its runtime target set cannot be "
+                        "proven to share the array's dynamic stack frame "
+                        "(D-CSUBSET-VLA)");
+                    return false;
+                }
                 if (addressTakenLabelOrdinals_.empty()) {
                     unsupported(node,
                         "computed `goto *` in a function that takes no label address "
@@ -9019,6 +9292,10 @@ struct Lowerer {
         vlaStrideSlot.clear();   // VLA C2/C3 (D-CSUBSET-VLA): per-function size/stride slots
         labelBlocks_.clear();   // FC5: labels are function-scoped
         addressTakenLabelOrdinals_.clear();  // D-CSUBSET-COMPUTED-GOTO
+        // VLA C5 (D-CSUBSET-VLA): the block-scope teardown state is per-function.
+        vlaScopeStack_.clear();
+        vlaScopeCounter_ = 0;
+        labelNodeByOrdinal_.clear();
         // FC7 C1c: per-function by-value return state.
         currentFnResult_ = interner.fnResult(signature);
         sretPtr_         = InvalidMirInst;
@@ -9042,6 +9319,9 @@ struct Lowerer {
         // (a forward `&&end` must be a known IndirectBr successor regardless of
         // textual order). The blocks are created lazily at first reference.
         collectAddressTakenLabels(body, addressTakenLabelOrdinals_);
+        // VLA C5 (D-CSUBSET-VLA): map every LabelStmt ordinal → node so a `goto`
+        // inside a VLA scope can resolve its target and compute the exited scopes.
+        collectLabelNodes(body);
 
         // From here on a block is open — any return-false MUST seal it.
         // D-CSUBSET-LINKAGE-SPECIFIERS / D-OPT7-LINKAGE-HIR-TO-MIR-MAPPING

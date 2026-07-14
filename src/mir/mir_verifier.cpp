@@ -71,6 +71,7 @@ bool MirVerifier::verify(DiagnosticReporter& reporter) const {
     checkBlockTermination(reporter);
     checkPhiIncomings(reporter);
     checkSehStructure(reporter);
+    checkVlaStackTeardown(reporter);
     // StructCfMarker equality lives INSIDE checkDomination — the
     // derivation needs the same per-function preds/RPO/dom the
     // use-dom-def scan computes, so they share one computation.
@@ -379,6 +380,48 @@ void MirVerifier::checkSehStructure(DiagnosticReporter& reporter) const {
             }
         }
     }
+}
+
+// VLA C5 (D-CSUBSET-VLA): the block-scope stack-teardown pairing invariant.
+// Runs verify-after-every-pass so an optimizer transform that mis-pairs or
+// re-points a save/restore reds AT the pass that did it. Zero-cost when no
+// StackSave exists.
+void MirVerifier::checkVlaStackTeardown(DiagnosticReporter& reporter) const {
+    // One flat scan; bail before the per-restore check when teardown-free.
+    bool anyTeardown = false;
+    forEachInst(mir_, [&](MirInstId id) {
+        MirOpcode const op = mir_.instOpcode(id);
+        if (op == MirOpcode::StackSave || op == MirOpcode::StackRestore)
+            anyTeardown = true;
+    });
+    if (!anyTeardown) return;
+
+    forEachInst(mir_, [&](MirInstId id) {
+        if (mir_.instOpcode(id) != MirOpcode::StackRestore) return;
+        auto const ops = mir_.instOperands(id);
+        // Arity is builder-enforced (1 operand); re-check defensively — a
+        // direct-Mir-ctor path (fixtures / synthetic IR) could bypass it.
+        if (ops.size() != 1) {
+            reportInst(reporter, DiagnosticCode::I_VlaStackRestorePairing, id,
+                std::format("StackRestore must have exactly one operand (the "
+                            "saved-SP value), found {}", ops.size()));
+            return;
+        }
+        MirInstId const savedDef = ops[0];
+        if (!savedDef.valid()
+            || mir_.instOpcode(savedDef) != MirOpcode::StackSave) {
+            reportInst(reporter, DiagnosticCode::I_VlaStackRestorePairing, id,
+                "StackRestore operand[0] must be a StackSave value (the "
+                "captured scope-entry watermark)");
+            return;
+        }
+        if (mir_.instPayload(id) != mir_.instPayload(savedDef)) {
+            reportInst(reporter, DiagnosticCode::I_VlaStackRestorePairing, id,
+                std::format("StackRestore scopeId {} does not match its paired "
+                            "StackSave scopeId {}",
+                    mir_.instPayload(id), mir_.instPayload(savedDef)));
+        }
+    });
 }
 
 void MirVerifier::checkDomination(DiagnosticReporter& reporter) const {

@@ -249,6 +249,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::H_InvalidUniversalCharacterName: return "H_InvalidUniversalCharacterName";
         case DiagnosticCode::H_WideByteEscapeUnsupported: return "H_WideByteEscapeUnsupported";
         case DiagnosticCode::H_ConflictingStringLiteralPrefixes: return "H_ConflictingStringLiteralPrefixes";
+        case DiagnosticCode::H_VlaJumpIntoScope:         return "H_VlaJumpIntoScope";
+        case DiagnosticCode::H_VlaComputedGotoInScope:   return "H_VlaComputedGotoInScope";
         case DiagnosticCode::I_VerifierFailure:          return "I_VerifierFailure";
         case DiagnosticCode::I_NoEntryBlock:             return "I_NoEntryBlock";
         case DiagnosticCode::I_MultipleEntryBlocks:      return "I_MultipleEntryBlocks";
@@ -263,6 +265,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_NullptrTypeInMir:         return "I_NullptrTypeInMir";
         case DiagnosticCode::I_BitIntWidthInconsistent:  return "I_BitIntWidthInconsistent";
         case DiagnosticCode::I_VlaAllocaOperandInvalid:  return "I_VlaAllocaOperandInvalid";
+        case DiagnosticCode::I_VlaStackRestorePairing:   return "I_VlaStackRestorePairing";
         case DiagnosticCode::I_ExtensionTypeInMir:       return "I_ExtensionTypeInMir";
         case DiagnosticCode::I_StructCfMismatch:         return "I_StructCfMismatch";
         case DiagnosticCode::I_UnreachableBlock:         return "I_UnreachableBlock";

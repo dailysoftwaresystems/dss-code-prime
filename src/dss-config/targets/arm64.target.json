@@ -432,6 +432,29 @@
       }
     },
     {
+      "$comment": "D-CSUBSET-VLA (C5): `sp_restore sp, <savedReg>` = `mov sp, savedReg` = `add sp, savedReg, #0` (the ADD-IMMEDIATE form, fixedWord 0x9100001F: Rd=sp=31 baked, imm12=0) — RESTORE the stack pointer to a previously-captured watermark (a StackSave's `sp_copy`), the block-scope VLA teardown emitted on every NON-return exit of a VLA-declaring scope. ★ Like sub_sp_reg/sp_copy this uses the SP-capable ADD-immediate encoding (reg 31 = the STACK POINTER, NOT XZR): `add sp, saved, #0` moves the real SP, where a register-register ORR `mov` (reg 31 = XZR) would write XZR. Rd=sp=31 is BAKED; operand0(sp) wires into rd (IDEMPOTENT with the baked 31 — sp's hwEncoding IS 31, mirroring sub_sp_reg's idempotent operand0→rn), operand1(saved) wires into Rn (bits 5..9, the source). result:none (SP mutates in place — NOT an SSA value; NEVER the sp_copy-with-SP-as-result shape, audit fix #5). A DISTINCT mnemonic so it stays hasSideEffects=true (reads/writes the physical SP; no pass may drop or reorder it across the sub_sp_reg).",
+      "mnemonic":      "sp_restore",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   2,
+      "maxOperands":   2,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg"], "width": 64 },
+            "template":   { "fixedWord": 2432696351 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd" },
+              { "index": 1, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "MUL Xd, Xn, Xm = MADD Xd, Xn, Xm, XZR. Base = 0x9B000000 | (XZR=31 << 10) = 0x9B007C00. Slots: Rd, Rn, Rm (Ra=XZR baked into fixedWord).",
       "mnemonic":      "mul",
       "result":        "value",

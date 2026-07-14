@@ -4872,6 +4872,54 @@ TEST(MirToLir, VlaRuntimeOperandAllocaLowersToDynamicStackSequence) {
         << "the VLA must emit `sp_copy` (capture the post-sub SP as the VLA base)";
 }
 
+// VLA C5 (D-CSUBSET-VLA): a MIR StackRestore (block-scope teardown) lowers to a
+// dedicated `sp_restore` LIR op with result:none and operands [SP, saved] — NOT a
+// `sp_copy`-with-SP-as-result (audit fix #5). A VLA in a loop body emits the restore
+// at the body's fall-through exit. RED-ON-DISABLE: revert lowerStackRestore and
+// `sp_restore` vanishes (the SP leak the c99_vla_loop runtime witness crashes on).
+TEST(MirToLir, VlaBlockScopeStackRestoreLowersToSpRestore) {
+    auto L = lowerCSubsetToLir(
+        "int f(int n) {\n"
+        "  int i; int total; total = 0;\n"
+        "  for (i = 0; i < 2; i = i + 1) {\n"
+        "    int a[n];\n"
+        "    a[0] = i;\n"
+        "    total = total + a[0];\n"
+        "  }\n"
+        "  return total;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    ASSERT_TRUE(L.lir.ok)
+        << (L.lirReporter.all().empty() ? "" : L.lirReporter.all()[0].actual);
+
+    Lir const& lir = L.lir.lir;
+    auto const& sch = *L.target;
+    auto const spRestoreOpt = sch.opcodeByMnemonic("sp_restore");
+    ASSERT_TRUE(spRestoreOpt.has_value())
+        << "the target must declare the `sp_restore` LIR op";
+    std::uint16_t const spRestore = *spRestoreOpt;
+    LirFuncId const fn = lir.funcAt(0);
+    int nRestore = 0;
+    for (std::uint32_t bi = 0; bi < lir.funcBlockCount(fn); ++bi) {
+        LirBlockId const blk = lir.funcBlockAt(fn, bi);
+        for (std::uint32_t k = 0; k < lir.blockInstCount(blk); ++k) {
+            LirInstId const id = lir.blockInstAt(blk, k);
+            if (lir.instOpcode(id) != spRestore) continue;
+            ++nRestore;
+            EXPECT_EQ(lir.instOperands(id).size(), 2u)
+                << "sp_restore takes [SP, saved]";
+            EXPECT_FALSE(lir.instResult(id).valid())
+                << "sp_restore is result:none — SP is an operand, not a result "
+                   "(never the sp_copy-with-SP-as-result shape)";
+        }
+    }
+    EXPECT_GE(nRestore, 1)
+        << "the VLA loop body's exit must emit at least one sp_restore";
+}
+
 // VLA C1b (D-CSUBSET-VLA): a VLA whose ELEMENT is over-aligned beyond the stack
 // alignment the dynamic `sub sp` can guarantee FAILS LOUD (L_OverAlignedStackLocal)
 // at MIR->LIR — the base a `sub sp` leaves is only stack-aligned, so a 32-aligned

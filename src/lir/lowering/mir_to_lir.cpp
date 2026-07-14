@@ -283,6 +283,13 @@ enum class MnemonicSlot : std::uint8_t {
     // `SubSpReg` op in a function is also the callconv/regalloc "has-VLA" signal.
     SubSpReg,
     SpCopy,
+    // VLA C5 (D-CSUBSET-VLA): `sp_restore sp, <saved>` — restore SP to a saved
+    // watermark (a StackSave's captured SP) on a block-scope VLA teardown exit.
+    // result:none (SP is an operand, not a result — audit fix #5), operands
+    // [SP, saved]. Optional per target (a target without the VLA substrate leaves
+    // it nullopt and the StackRestore lowering fails loud, never a silent no-op
+    // that would leak the stack).
+    SpRestore,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -387,6 +394,7 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::TlsBase,            "tlsbase"},
     {MnemonicSlot::SubSpReg,           "sub_sp_reg"},
     {MnemonicSlot::SpCopy,             "sp_copy"},
+    {MnemonicSlot::SpRestore,          "sp_restore"},
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -1593,6 +1601,9 @@ struct Lowerer {
                 return lowerFCmp(id);
             case MirOpcode::Phi:    return;  // pre-pass-allocated; no body emission
             case MirOpcode::Alloca: return lowerAlloca(id);
+            // VLA C5 (D-CSUBSET-VLA): block-scope stack teardown save/restore.
+            case MirOpcode::StackSave:    return lowerStackSave(id);
+            case MirOpcode::StackRestore: return lowerStackRestore(id);
             case MirOpcode::Load:   return lowerLoad(id);
             case MirOpcode::Store:  return lowerStore(id);
             case MirOpcode::Gep:    return lowerGep(id);
@@ -2480,6 +2491,50 @@ struct Lowerer {
             emitInst(*copyOp, base, ops, /*payload=*/0, /*flags=*/0);
         }
         defineValue(id, base);
+    }
+
+    // VLA C5 (D-CSUBSET-VLA): capture SP into a fresh vreg — the scope-entry
+    // watermark a later StackRestore restores to. `saved = sp_copy SP`, the SAME
+    // base-capture shape lowerVlaAlloca uses for the VLA base. A target WITHOUT the
+    // sp_copy substrate (no VLA support) fails loud rather than emit nothing — a
+    // dropped save would strand its StackRestore, silently leaking the stack.
+    void lowerStackSave(MirInstId id) {
+        auto const copyOp = opcode(MnemonicSlot::SpCopy);
+        auto const* cc = target.callingConvention(0);
+        if (!copyOp.has_value() || cc == nullptr || !cc->stackPointer.has_value()) {
+            reportVlaDynamicAlloca(id);
+            poisonValue(id);
+            return;
+        }
+        LirReg const sp =
+            makePhysicalReg(cc->stackPointer->ordinal, LirRegClass::GPR);
+        LirReg const saved = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 1> ops{LirOperand::makeReg(sp)};
+        emitInst(*copyOp, saved, ops, /*payload=*/0, /*flags=*/0);
+        defineValue(id, saved);
+    }
+
+    // VLA C5 (D-CSUBSET-VLA): restore SP to a saved watermark — `sp_restore SP,
+    // saved` (result:none, operands [SP, saved]; NEVER sp_copy-with-SP-as-result,
+    // audit fix #5). Mirrors sub_sp_reg keeping the physical SP an operand. A target
+    // WITHOUT the sp_restore substrate fails loud (never a silent no-op that would
+    // leave the descended SP unreclaimed → the very stack leak C5 exists to fix).
+    void lowerStackRestore(MirInstId id) {
+        auto const restoreOp = opcode(MnemonicSlot::SpRestore);
+        auto const* cc = target.callingConvention(0);
+        auto const ops0 = mir.instOperands(id);
+        if (!restoreOp.has_value() || cc == nullptr
+            || !cc->stackPointer.has_value() || ops0.empty()) {
+            reportVlaDynamicAlloca(id);
+            return;
+        }
+        std::optional<LirReg> const saved = regForValue(ops0[0]);
+        if (!saved.has_value()) return;   // the saved-SP value was poisoned upstream
+        LirReg const sp =
+            makePhysicalReg(cc->stackPointer->ordinal, LirRegClass::GPR);
+        std::array<LirOperand, 2> ops{
+            LirOperand::makeReg(sp), LirOperand::makeReg(*saved)};
+        emitInst(*restoreOp, InvalidLirReg, ops, /*payload=*/0, /*flags=*/0);
     }
 
     void lowerAlloca(MirInstId id) {

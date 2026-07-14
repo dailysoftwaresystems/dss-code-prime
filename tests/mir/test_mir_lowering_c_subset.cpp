@@ -9088,6 +9088,231 @@ TEST(MirLoweringCSubset, RowSizeofOfMultiDimVlaLoadsStrideSlot) {
            "never a static Const fold (a VLA row sizeof is not a constant expression)";
 }
 
+// ── VLA C5 (D-CSUBSET-VLA): block-scope stack teardown (StackSave/StackRestore) ──
+
+// The crash fix: a VLA in a loop body emits a StackSave at its decl + a StackRestore
+// at the body block's fall-through exit (before the back-edge), so each iteration
+// reclaims its stack. Red-on-disable: without the teardown the loop leaks `sub sp`
+// per iteration → STATUS_STACK_OVERFLOW (the c99_vla_loop runtime witness). Here we
+// pin the MIR SHAPE: exactly one StackSave (the one VLA) + one StackRestore (the one
+// fall-through exit edge of the body block).
+TEST(MirLoweringCSubset, VlaInLoopBodyEmitsBlockScopeTeardown) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 4;\n"
+        "  int n = vn;\n"
+        "  int i;\n"
+        "  for (i = 0; i < 3; i = i + 1) {\n"
+        "    int a[n];\n"
+        "    a[0] = 1;\n"
+        "  }\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = allOpcodes(L.mir.mir);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackSave), 1u)
+        << "one dynamic VLA in the loop body → one StackSave watermark";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackRestore), 1u)
+        << "the body block's fall-through exit restores SP once per iteration "
+           "(before the back-edge) — the loop-leak crash fix";
+}
+
+// break / continue / goto OUT of a VLA scope each emit a StackRestore on that exit
+// edge (in addition to the natural fall-through). Red-on-disable: drop the restore
+// at any of these arms and the edge leaks SP.
+TEST(MirLoweringCSubset, VlaBreakContinueGotoEmitStackRestore) {
+    struct Case { char const* body; char const* what; };
+    Case const cases[] = {
+        {"for (i = 0; i < 3; i = i + 1) { int a[n]; a[0] = 1;\n"
+         "  if (a[0] == 1) { break; } }",                    "break"},
+        {"for (i = 0; i < 3; i = i + 1) { int a[n]; a[0] = 1;\n"
+         "  if (a[0] == 1) { continue; } a[0] = 2; }",       "continue"},
+        {"{ int a[n]; a[0] = 1; if (a[0] == 1) { goto done; } }\n"
+         "done: ;",                                          "goto-out"},
+    };
+    for (Case const& c : cases) {
+        std::string const src =
+            std::string("int main(void) {\n"
+                        "  volatile int vn = 4;\n  int n = vn;\n  int i;\n")
+            + c.body + "\n  return 0;\n}\n";
+        auto L = lowerCSubset(src);
+        ASSERT_FALSE(L.model.hasErrors()) << c.what << "\n" << src
+            << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.mir.ok) << c.what << "\n" << src
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        auto const ops = allOpcodes(L.mir.mir);
+        EXPECT_EQ(countOpcode(ops, MirOpcode::StackSave), 1u) << c.what;
+        EXPECT_GE(countOpcode(ops, MirOpcode::StackRestore), 1u)
+            << c.what << ": the non-fall-through exit edge must restore SP";
+    }
+}
+
+// A NON-VLA loop body is BYTE-CLEAN: it emits NEITHER a StackSave nor a StackRestore
+// (the teardown is scoped to dynamic VLAs — a fixed array is a frame slot, no SP move,
+// no watermark). Guards against the teardown firing for every block.
+TEST(MirLoweringCSubset, NonVlaLoopBodyEmitsNoStackTeardown) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  int i;\n"
+        "  for (i = 0; i < 3; i = i + 1) {\n"
+        "    int a[4];\n"          // FIXED array — a frame slot, not a dynamic VLA
+        "    a[0] = 1;\n"
+        "  }\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = allOpcodes(L.mir.mir);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackSave), 0u)
+        << "a fixed-array loop body opens no VLA watermark";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackRestore), 0u)
+        << "a fixed-array loop body emits no teardown (byte-clean)";
+}
+
+// A `goto` out of a NESTED VLA scope restores to the SHALLOWEST EXITED watermark, not
+// to an OUTER VLA scope that still encloses the target. Here `a` (scopeId 0) is
+// declared in main's body and `b` (scopeId 1) in an inner block; `goto done` (done in
+// main's body, AFTER a's decl) exits `b` but stays inside `a`. The single StackRestore
+// must reference `b`'s StackSave (payload 1), NOT over-free to `a` (payload 0).
+TEST(MirLoweringCSubset, NestedGotoRestoreTargetsShallowestExitedFrame) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 4;\n"
+        "  int n = vn;\n"
+        "  int a[n];\n"
+        "  a[0] = 1;\n"
+        "  {\n"
+        "    int b[n];\n"
+        "    b[0] = 2;\n"
+        "    goto done;\n"        // exits b (inner), NOT a (still in scope at done)
+        "  }\n"
+        "done:\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    // Collect the (scopeId payload of the StackSave each StackRestore references).
+    std::vector<std::uint32_t> restoreTargets;
+    int saves = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                MirInstId const id = m.blockInstAt(b, ii);
+                if (m.instOpcode(id) == MirOpcode::StackSave) ++saves;
+                if (m.instOpcode(id) != MirOpcode::StackRestore) continue;
+                auto const rops = m.instOperands(id);
+                ASSERT_EQ(rops.size(), 1u);
+                ASSERT_EQ(m.instOpcode(rops[0]), MirOpcode::StackSave)
+                    << "a StackRestore's operand must be a StackSave";
+                restoreTargets.push_back(m.instPayload(rops[0]));
+            }
+        }
+    }
+    EXPECT_EQ(saves, 2) << "two VLAs → two StackSave watermarks (scopeId 0 = a, 1 = b)";
+    ASSERT_EQ(restoreTargets.size(), 1u)
+        << "only the goto edge restores here (a/b's blocks are sealed by goto/return)";
+    EXPECT_EQ(restoreTargets[0], 1u)
+        << "the goto restores to b's watermark (the shallowest EXITED scope), never "
+           "over-freeing to a (payload 0), which still encloses `done`";
+}
+
+// VLA C5 for-SCOPE teardown (D-CSUBSET-VLA): a for-INIT VLA is declared ONCE at loop
+// entry, persists across all iterations, and is freed ONLY at the loop EXIT — NEVER on
+// the back-edge (freeing it there is a use-after-free in iteration 2+). A for-init-ONLY
+// loop (no body VLA) therefore emits exactly ONE StackSave and exactly ONE StackRestore
+// (the exit one) — the count==1 proves there is NO spurious back-edge restore.
+TEST(MirLoweringCSubset, ForInitVlaEmitsForScopeTeardownAtLoopExitOnly) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 4;\n"
+        "  int n = vn;\n"
+        "  int i;\n"
+        "  for (int a[n]; i < 3; i = i + 1) {\n"
+        "    a[0] = i;\n"          // body uses the for-init VLA; body has NO VLA of its own
+        "  }\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)   // red-on-disable: reverting the for-scope teardown fails here
+        << "a for-init VLA must lower (its teardown is no longer a fail-loud deferral): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    auto const ops = allOpcodes(L.mir.mir);
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackSave), 1u)
+        << "one for-init VLA → one StackSave at loop entry";
+    EXPECT_EQ(countOpcode(ops, MirOpcode::StackRestore), 1u)
+        << "the for-init VLA is freed ONLY at the loop exit — exactly one restore, "
+           "NONE on the back-edge (a back-edge free would be a use-after-free)";
+}
+
+// A for-init VLA + a body VLA are torn down at DISTINCT CFG points: the body VLA on
+// the back-edge (per iteration), the for-init VLA at the loop exit. Both restores
+// exist, target DIFFERENT StackSaves, and sit in DIFFERENT blocks — proving the
+// for-init frame is not folded into the body's per-iteration teardown.
+TEST(MirLoweringCSubset, ForInitAndBodyVlaTornDownAtDistinctPoints) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 4;\n"
+        "  int n = vn;\n"
+        "  int i;\n"
+        "  for (int a[n]; i < 3; i = i + 1) {\n"
+        "    int b[n];\n"          // a BODY VLA — freed each iteration on the back-edge
+        "    b[0] = i;\n"
+        "    a[0] = i;\n"
+        "  }\n"
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    // For each StackRestore, record (its StackSave's scopeId, its block id).
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> restores;
+    int saves = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(b); ++ii) {
+                MirInstId const id = m.blockInstAt(b, ii);
+                if (m.instOpcode(id) == MirOpcode::StackSave) ++saves;
+                if (m.instOpcode(id) != MirOpcode::StackRestore) continue;
+                auto const rops = m.instOperands(id);
+                ASSERT_EQ(rops.size(), 1u);
+                restores.emplace_back(m.instPayload(rops[0]), b.v);
+            }
+        }
+    }
+    EXPECT_EQ(saves, 2) << "two VLAs (for-init `a` = scopeId 0, body `b` = scopeId 1)";
+    ASSERT_EQ(restores.size(), 2u)
+        << "one back-edge restore (body b) + one loop-exit restore (for-init a)";
+    // Both scopeIds are restored, in different blocks.
+    bool sawForInit = false, sawBody = false;
+    std::uint32_t forInitBlk = 0, bodyBlk = 0;
+    for (auto const& [scopeId, blk] : restores) {
+        if (scopeId == 0u) { sawForInit = true; forInitBlk = blk; }
+        if (scopeId == 1u) { sawBody = true;    bodyBlk = blk; }
+    }
+    EXPECT_TRUE(sawForInit) << "the for-init VLA (scopeId 0) is restored (at the exit)";
+    EXPECT_TRUE(sawBody)    << "the body VLA (scopeId 1) is restored (on the back-edge)";
+    EXPECT_NE(forInitBlk, bodyBlk)
+        << "the for-init and body restores sit in DIFFERENT blocks — the for-init is "
+           "not folded into the body's per-iteration back-edge teardown";
+}
+
 // ── VLA C4a-local (D-CSUBSET-VLA): pointer-to-VLA (runtime pointee row stride) ──
 
 // A LOCAL pointer-to-VLA `int (*p)[n]` freezes its runtime POINTEE row stride at its

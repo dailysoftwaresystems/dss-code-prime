@@ -2127,6 +2127,70 @@ TEST(HirLoweringCSubset, GotoAndLabelLowerCleanAndTerminateViaLabel) {
     EXPECT_EQ(countCode(r2, DiagnosticCode::H_VerifierFailure), 0u);
 }
 
+// VLA C5 (D-CSUBSET-VLA, C99 6.8.6.1p1): a `goto` that jumps INTO the scope of a
+// variable-length array, bypassing its declaration, is FAILED LOUD at HIR verify
+// (H_VlaJumpIntoScope). `goto L` sits BEFORE `int a[n]`; `L:` sits AFTER it, so
+// arriving at L skips the array's runtime allocation — undefined storage. This is
+// ALSO the dominance guarantor for the C5 teardown. Red-on-disable: drop
+// checkVlaJumpScoping and this compiles (a silent jump into unallocated dynamic
+// stack). A LEGAL goto OUT of a VLA scope stays clean (asserted second).
+TEST(HirLoweringCSubset, GotoIntoVlaScopeFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int main(void){ volatile int vn = 4; int n = vn;\n"
+        "  goto L;\n"
+        "  int a[n];\n"
+        "  L: a[0] = 1;\n"
+        "  return a[0]; }");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok)
+        << "a goto into a VLA scope past its decl must fail HIR verification";
+    EXPECT_GE(countCode(r, DiagnosticCode::H_VlaJumpIntoScope), 1u)
+        << "the C99 6.8.6.1 jump-into-VLA-scope ban must fire";
+
+    // A LEGAL goto OUT of a VLA scope (the array is declared BEFORE the goto and the
+    // label) does NOT trip the ban — it is torn down, not entered.
+    SemanticModel ok = analyzeCSubset(
+        "int main(void){ volatile int vn = 4; int n = vn;\n"
+        "  int a[n];\n"
+        "  a[0] = 1;\n"
+        "  goto L;\n"
+        "  L: return a[0]; }");
+    ASSERT_FALSE(ok.hasErrors())
+        << (ok.diagnostics().all().empty() ? "" : ok.diagnostics().all()[0].actual);
+    DiagnosticReporter r2;
+    auto res2 = lowerToHir(ok, r2);
+    EXPECT_EQ(countCode(r2, DiagnosticCode::H_VlaJumpIntoScope), 0u)
+        << "a goto that stays within (or exits) a VLA scope is legal";
+}
+
+// VLA C5 (D-CSUBSET-VLA): a computed `goto *expr` (GNU IndirectGotoStmt) LEXICALLY
+// inside a VLA scope has a runtime target set — no single SP-restore watermark is
+// provable — so it FAILS LOUD at HIR verify (H_VlaComputedGotoInScope). The label
+// `L` is OUTSIDE any VLA scope, so `&&L` is fine; only the `goto *p` inside the VLA
+// block trips. Red-on-disable: drop the IndirectGotoStmt arm and it compiles.
+TEST(HirLoweringCSubset, ComputedGotoInsideVlaScopeFailsLoud) {
+    SemanticModel model = analyzeCSubset(
+        "int main(void){ volatile int vn = 4; int n = vn;\n"
+        "  void *p = &&L;\n"
+        "  {\n"
+        "    int a[n];\n"
+        "    a[0] = 1;\n"
+        "    goto *p;\n"
+        "  }\n"
+        "  L: return 0; }");
+    ASSERT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    EXPECT_FALSE(res->ok)
+        << "a computed goto inside a VLA scope must fail HIR verification";
+    EXPECT_GE(countCode(r, DiagnosticCode::H_VlaComputedGotoInScope), 1u)
+        << "the computed-goto-in-VLA-scope ban must fire";
+}
+
 // FC5 (audit MUST-FIX 2) — the dead-code scan must NOT flag a goto's TARGET label
 // as unreachable: `goto X; X: …` is the universal cleanup idiom and the label is
 // manifestly reachable. But a genuinely-dead NON-label statement after a goto

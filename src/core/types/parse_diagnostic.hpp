@@ -1212,6 +1212,24 @@ enum class DiagnosticCode : std::uint16_t {
     //   UNTYPED + emits this (so a `sizeof` of it reports the real reason), and HIR
     //   lowering emits it + an `Error` node, continuing the collect-all lowering.
     H_ConflictingStringLiteralPrefixes = 0xF017,
+    // ── VLA C5 (D-CSUBSET-VLA) — HirVerifier::checkVlaJumpScoping ──
+    // H_VlaJumpIntoScope (C99 6.8.6.1p1): a `goto`, a `switch` case/default label,
+    //   or an `&&label` whose target label sits inside the scope of a
+    //   variably-modified (VLA) object PAST that object's declaration — the jump
+    //   would bypass the VLA's runtime allocation, so on arrival the array's
+    //   storage (and its size) is undefined. Fail-loud (never a jump into
+    //   uninitialized dynamic stack). This is ALSO the dominance guarantor for the
+    //   C5 teardown: banning entry-past-a-decl makes every LEGAL goto's restore-
+    //   target StackSave dominate the goto in the CFG. Mirrors the SEH
+    //   H_SehJumpIntoRegion / H_SehLabelAddress ancestor-walk.
+    H_VlaJumpIntoScope            = 0xF018,
+    // H_VlaComputedGotoInScope (D-CSUBSET-VLA): a computed `goto *expr`
+    //   (GNU IndirectGotoStmt) lexically inside a VLA scope. Its target set is a
+    //   runtime value, so the SP-restore watermark to unwind to cannot be proven
+    //   at compile time — fail-loud rather than leak or over-free the dynamic
+    //   stack. Runs fine when no VLA scope is involved. Mirrors the SEH
+    //   H_SehEarlyExit IndirectGotoStmt arm.
+    H_VlaComputedGotoInScope      = 0xF019,
 
     // ── I0xxx — MIR verifier (plan 12 ML3; the 0xA high nibble renders as "I"
     // for the IR-gen / mid-level layer). Each code names a structural-,
@@ -1328,6 +1346,16 @@ enum class DiagnosticCode : std::uint16_t {
     // operand↔payload consistency half also runs interner-free. Caught at every
     // verify point.
     I_VlaAllocaOperandInvalid      = 0xA016,
+    // VLA C5 (D-CSUBSET-VLA): a MIR `StackRestore` whose pairing invariant breaks.
+    // A StackRestore's operand[0] MUST be a `StackSave`, and its scopeId payload
+    // MUST equal that StackSave's payload (the pairing key). The generic SSA
+    // dominance check already enforces that the StackSave dominates the restore
+    // (the restore references it as an operand); this code adds the STRUCTURAL
+    // pairing the flat IR can't otherwise express. The flat CFG cannot prove
+    // "every exit edge is covered", so this is a pairing/containment check, NOT a
+    // coverage claim (audit fix #6). Caught at every verify point (so an optimizer
+    // transform that mis-pairs a save/restore reds AT the pass that did it).
+    I_VlaStackRestorePairing       = 0xA017,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //
