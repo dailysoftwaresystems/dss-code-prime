@@ -7569,6 +7569,17 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                             if (wk.size() != 1) break;
                             walk = wk[0];
                         }
+                        // VLA C4a-local (D-CSUBSET-VLA-PTR-INIT-FORM-TYPING, DEFERRED):
+                        // the natural init form `int (*p)[n] = b` does NOT compile — the
+                        // typeAt walk (and `subtreeType`, which short-circuits on the same
+                        // stamped node) yields `b`'s DECAYED pointer type, not the raw
+                        // `array(vlaArray(int),2)` the `Ptr<vlaArray> ← array(array)` decay
+                        // compare needs, so S_TypeMismatch fires (a CLEAN fail-loud, never
+                        // a silent miscompile). A guarded `subtreeType` override was tried
+                        // (CRITICAL-1) but is inert here because `b`'s initializer node is
+                        // pre-stamped decayed by an earlier pass. Deferred; the C4a-local
+                        // witness uses the ASSIGNMENT form (`int (*p)[n]; p = b;`), which
+                        // passes assignability and reaches the runtime-stride path.
                         if (!rec.type.valid()) {
                             if (initTy.valid()) {
                                 rec.type = initTy;

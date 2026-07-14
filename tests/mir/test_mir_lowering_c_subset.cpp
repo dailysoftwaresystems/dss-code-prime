@@ -8889,3 +8889,72 @@ TEST(MirLoweringCSubset, RowSizeofOfMultiDimVlaLoadsStrideSlot) {
         << "`sizeof a[0]` must lower to a U64 Load of the decl-frozen row-stride slot, "
            "never a static Const fold (a VLA row sizeof is not a constant expression)";
 }
+
+// ── VLA C4a-local (D-CSUBSET-VLA): pointer-to-VLA (runtime pointee row stride) ──
+
+// A LOCAL pointer-to-VLA `int (*p)[n]` freezes its runtime POINTEE row stride at its
+// DECL SITE (a hidden 8-byte slot; CRITICAL-2 — NOT the hoisted 8-byte pointer alloca,
+// where `n` is unread), and a subscript p[i] scales the index by a Load of that slot,
+// never a compile-time Const. `b` is a VLA (so `p` is a genuine ptr-to-VLA) but ONLY
+// `p` is subscripted, so any runtime-stride index Load is p's: scaleIndexToBytes peels
+// p[1]'s root to `p` and looks up (p, int[n]) — the exact slot storePtrToVlaStride wrote.
+// Red-on-disable: revert the capture-gate widening (cst_to_hir) OR the decl-site store
+// (hir_to_mir) → p[1] misses the slot and fails loud at scaleIndexToBytes (:4746, mir
+// not ok). b (int[2][n]) freezes 2 level slots; p (int(*)[n]) adds 1 pointee-stride slot.
+TEST(MirLoweringCSubset, PtrToVlaLocalSubscriptScalesByDeclSiteStrideSlot) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 4;\n"
+        "  int n = vn;\n"
+        "  int b[2][n];\n"
+        "  int (*p)[n];\n"
+        "  p = b;\n"
+        "  p[1][0] = 7;\n"     // ONLY p is subscripted (b is never directly indexed)
+        "  return 0;\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty() ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)   // red-on-disable: reverting GAP 2 fails loud here
+        << "a local pointer-to-VLA subscript must lower cleanly (runtime pointee stride): "
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    ASSERT_EQ(m.moduleFuncCount(), 1u);
+    MirBlockId const entry = m.funcEntry(m.funcAt(0));
+
+    // (1) the p[1] subscript scales by a RUNTIME stride LOADED from an 8-byte slot,
+    // never a compile-time Const — since only p is subscripted, this is p's slot.
+    EXPECT_TRUE(hasRuntimeStrideIndexLoad(m, entry))
+        << "p[i] must scale by a Load of the decl-frozen pointee-stride slot (a runtime "
+           "stride), NOT a compile-time Const";
+
+    // (2) the pointer adds exactly ONE decl-site pointee-stride slot beyond b's two
+    // level slots (the whole-object int[2][n] + the int[n] row) — the store exists.
+    EXPECT_EQ(countVlaSizeSlots(m, entry), 3)
+        << "int (*p)[n] freezes ONE pointee-stride slot at its decl, added to b's two";
+}
+
+// FAIL-LOUD (deferred): pointer ARITHMETIC on a ptr-to-VLA (`p + j`) is not yet tracked
+// — its arith result flowing into a subscript base is NOT a single VLA root symbol, so
+// scaleIndexToBytes fails loud (:4734) rather than form a bogus stride. Never a silent
+// miscompute. Red-on-disable is intentional: when `p+j` runtime scaling lands, flip this.
+TEST(MirLoweringCSubset, PtrToVlaPointerArithSubscriptFailsLoud) {
+    auto L = lowerCSubset(
+        "int main(void) {\n"
+        "  volatile int vn = 3;\n"
+        "  int n = vn;\n"
+        "  int b[2][n];\n"
+        "  int (*p)[n];\n"
+        "  p = b;\n"
+        "  int (*q)[n] = p + 1;\n"   // pointer arithmetic on a ptr-to-VLA (deferred)
+        "  q[0][0] = 7;\n"
+        "  return 0;\n"
+        "}\n");
+    // The front-end accepts it (p+1 is a same-type pointer init); the failure is at the
+    // MIR subscript lowering — a clean fail-loud, never a silent wrong stride.
+    EXPECT_FALSE(L.mir.ok)
+        << "a subscript whose base is a ptr-to-VLA pointer-arithmetic result must fail "
+           "loud (its runtime row stride cannot be recovered from a non-root base)";
+}

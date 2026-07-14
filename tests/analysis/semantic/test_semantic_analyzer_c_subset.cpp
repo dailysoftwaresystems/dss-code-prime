@@ -8516,3 +8516,91 @@ TEST(SemanticAnalyzerCSubset, ThreadLocalInvalidCombinationsFailLoud) {
                         DiagnosticCode::S_ThreadLocalInvalidCombination), 1u)
         << "register may not pair with thread_local (6.7.1p2)";
 }
+
+// VLA C4a-local (D-CSUBSET-VLA): a pointer-to-VLA assignability compare stays EXACT — a
+// FIXED-pointee `int (*p)[5]` initialized from a VLA object `int b[2][n]` (rows int[n])
+// is a MISMATCH (`Ptr<int[5]>` vs `array(vlaArray(int),2)`; int[5] != int[n]) and must
+// REJECT with S_TypeMismatch, never silently decay-accept. Forward-guard for the deferred
+// init form (D-CSUBSET-VLA-PTR-INIT-FORM-TYPING): whatever makes `= b` work must NOT
+// weaken this exact-row compare. RED-ON-DISABLE: broaden the type_rules.hpp:371 decay
+// branch to ignore the element type → this stops firing.
+TEST(SemanticAnalyzerCSubset, PtrToVlaFixedPointeeFromVlaObjectRejects) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "  volatile int vn = 4;\n"
+        "  int n = vn;\n"
+        "  int b[2][n];\n"
+        "  int (*p)[5] = b;\n"   // MISMATCH: rows int[5] != int[n]
+        "  return 0;\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "a fixed-pointee ptr initialized from a VLA object with a different row length "
+           "must reject with S_TypeMismatch (the decay compare stays exact)";
+}
+
+// VLA C4a-local (D-CSUBSET-VLA): the ptr-to-VLA init-form work (and its deferred fix,
+// D-CSUBSET-VLA-PTR-INIT-FORM-TYPING) must NEVER regress ordinary aggregate brace-init —
+// `int a[3]={1,2,3}` / nested / a scalar init all stay clean (no false S_TypeMismatch
+// from a subtreeType descent into a braceInitList). The CRITICAL-1 control that keeps the
+// eventual init-form fix guarded. RED-ON-DISABLE: an unguarded subtreeType override on the
+// init-derivation path would descend a brace list to a member literal → this reds.
+TEST(SemanticAnalyzerCSubset, LocalAggregateBraceInitStaysCleanNoFalseTypeMismatch) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "  int a[3] = {1, 2, 3};\n"
+        "  int nested[2][2] = {{1, 2}, {3, 4}};\n"
+        "  int scalar = 9;\n"
+        "  int *sp = a;\n"                 // plain array-decay init (must also stay clean)
+        "  return a[0] + nested[0][0] + scalar + sp[0];\n"
+        "}\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "aggregate brace-init / nested / scalar / array-decay inits must not false-fire "
+           "S_TypeMismatch";
+    EXPECT_FALSE(model.hasErrors())
+        << "the brace-init control program must compile clean";
+}
+
+// FAIL-LOUD (deferred): a PARAMETER pointer-to-VLA `int (*p)[n]` (n a sibling param) is
+// GAP 1b (next cycle) — the param pointee does not yet resolve the sibling `n` into a VLA
+// row, so a call passing a VLA object is a clean fail-loud (S_TypeMismatch at the arg),
+// never a silent miscompile. RED-ON-DISABLE is intentional: when the param form lands
+// (D-CSUBSET-VLA C4a-param), flip this to an accept + a runtime witness.
+TEST(SemanticAnalyzerCSubset, ParamPtrToVlaFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int f(int n, int (*p)[n]) { return p[1][0]; }\n"
+        "int main(void) {\n"
+        "  volatile int vn = 3;\n"
+        "  int n = vn;\n"
+        "  int b[2][n];\n"
+        "  return f(n, b);\n"
+        "}\n",
+    });
+    EXPECT_TRUE(model.hasErrors())
+        << "a parameter pointer-to-VLA is not yet supported (GAP 1b) — must fail loud";
+}
+
+// D-CSUBSET-VLA-PTR-INIT-FORM-TYPING boundary guard: the INITIALIZER form
+// `int (*p)[n] = b;` is DEFERRED (the initializer node is pre-stamped decayed, defeating
+// the init-compat derivation; C4a-local witnesses via the assignment form `p = b;`). It
+// must FAIL LOUD at the semantic tier (S_TypeMismatch) — NOT silently accept. ★ This pin
+// is the safety boundary for the deferral: a future PARTIAL fix that makes `= b`
+// assignable WITHOUT also fixing the body-typing wrinkle would silently convert this safe
+// reject into a wrong-STRIDE miscompile at the subscript. This test goes RED on exactly
+// that dangerous partial change; when the init form PROPERLY lands it is flipped to
+// accept + a runtime witness. (Assignment-form `int (*p)[n]; p = b; p[i][j]` RUNS today.)
+TEST(SemanticAnalyzerCSubset, PtrToVlaInitFormDeferredStillFailsLoud) {
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) {\n"
+        "  volatile int vn = 3;\n"
+        "  int n = vn;\n"
+        "  int b[2][n];\n"
+        "  int (*p)[n] = b;\n"          // the INIT form (deferred) — must reject, not run
+        "  return p[1][0];\n"
+        "}\n",
+    });
+    EXPECT_TRUE(model.hasErrors())
+        << "the pointer-to-VLA INIT form `int (*p)[n] = b` is deferred and must fail loud "
+           "(S_TypeMismatch) — never a silent accept that would mis-stride the subscript";
+}

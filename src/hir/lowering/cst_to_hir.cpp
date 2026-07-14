@@ -7462,9 +7462,21 @@ struct Lowerer {
             // `||typeContainsVla` so a FIXED-outer multi-dim VLA (`int a[5][n]` —
             // whose top type is a fixed Array, NOT isVlaArray) ALSO captures its
             // bounds (else HIR→MIR's `vlaAllocaForLocal` fails loud on the missing
-            // size side-table entry).
+            // size side-table entry). VLA C4a-local (D-CSUBSET-VLA): a LOCAL
+            // pointer-to-VLA (`int (*p)[n]`) is `kind==Ptr` — `typeContainsVla` stops at
+            // the non-array pointer top, so its POINTEE is tested explicitly. The suffix
+            // walk in `captureVlaSize` descends the whole `(*p)[n]` declarator and records
+            // the `[n]` bound keyed to `p`; HIR→MIR then freezes the pointee's runtime row
+            // stride at the decl point (`storePtrToVlaStride`). A ptr to a FIXED array
+            // (`int (*p)[5]`) has a non-VLA pointee → NOT captured (its stride folds at
+            // compile time).
+            bool const isPtrToVla =
+                interner.kind(type) == TypeKind::Ptr
+                && !interner.operands(type).empty()
+                && interner.typeContainsVla(interner.operands(type)[0]);
             if (!asGlobal
-                && (interner.isVlaArray(type) || interner.typeContainsVla(type)))
+                && (interner.isVlaArray(type) || interner.typeContainsVla(type)
+                    || isPtrToVla))
                 captureVlaSize(d, sym);
             out.push_back(lowered);
         }
