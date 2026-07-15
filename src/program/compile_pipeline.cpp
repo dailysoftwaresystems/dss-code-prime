@@ -426,7 +426,8 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           &hir->vlaSizeExprBySymbol,   // VLA C1a (D-CSUBSET-VLA)
                           &hir->sizeofVlaSymbol,   // VLA C2 (D-CSUBSET-VLA)
                           &hir->typedefVlaOriginBySymbol,   // VLA C4b (D-CSUBSET-VLA)
-                          &hir->synthRecipeBySymbol);   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
+                          &hir->synthRecipeBySymbol,   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
+                          &hir->returnsTwiceMap);   // FC17.9(c) (D-CSUBSET-SETJMP)
     phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;

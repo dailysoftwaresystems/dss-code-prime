@@ -232,6 +232,14 @@ struct Lowerer {
     // side-table stays sparse; the only unsafe direction is a MISSED volatile
     // access, which the exhaustive threading closes.
     std::vector<std::pair<HirNodeId, VolatileAttr>>& volatileAcc;
+    // FC17.9(c) (D-CSUBSET-SETJMP): shared accumulator of (CALL HIR node →
+    // ReturnsTwiceAttr) pairs, populated at `emitCallOrBuiltin` when the lowered
+    // Call's DIRECT callee record is `returnsTwice` (setjmp/_setjmp). Applied to the
+    // result's HirReturnsTwiceMap AFTER finish() — the same frozen-hir discipline as
+    // `volatileAcc`. Only returns-twice calls are recorded (absence ⇒ ordinary call),
+    // so the side-table stays sparse; the only unsafe direction is a SPURIOUS flag,
+    // which the direct-Ref-callee gate (the isDirectNoreturnCall discipline) prevents.
+    std::vector<std::pair<HirNodeId, ReturnsTwiceAttr>>& returnsTwiceAcc;
     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: shared accumulator of (DECLARATION HIR
     // node → AlignmentAttr) pairs, populated from the bound symbol's
     // `SymbolRecord.explicitAlignment` at each Global / local VarDecl lowering
@@ -829,6 +837,7 @@ struct Lowerer {
             std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut,
             std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& tls,
             std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
+            std::vector<std::pair<HirNodeId, ReturnsTwiceAttr>>& rtwice,
             std::vector<std::pair<HirNodeId, AlignmentAttr>>& aln,
             std::vector<std::pair<std::uint32_t, HirNodeId>>& vlaSz,
             std::vector<std::pair<std::uint32_t, std::uint32_t>>& sizeofVlaSym,
@@ -836,8 +845,8 @@ struct Lowerer {
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
           linkage(lk), mutability(mut), threadLocalAcc(tls), volatileAcc(vol),
-          alignmentAcc(aln), vlaSizeAcc(vlaSz), sizeofVlaSymAcc(sizeofVlaSym),
-          typedefOriginAcc(typedefOrigin) {
+          returnsTwiceAcc(rtwice), alignmentAcc(aln), vlaSizeAcc(vlaSz),
+          sizeofVlaSymAcc(sizeofVlaSym), typedefOriginAcc(typedefOrigin) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -3078,7 +3087,31 @@ struct Lowerer {
                     static_cast<std::uint32_t>(rec->builtinLowering), args, resultType);
             }
         }
-        return builder.makeCall(calleeId, args, resultType);
+        HirNodeId const call = builder.makeCall(calleeId, args, resultType);
+        recordReturnsTwiceIfDirect(call);
+        return call;
+    }
+
+    // FC17.9(c) (D-CSUBSET-SETJMP): record the returns-twice side-table entry for a
+    // just-built `Call` node whose callee is a DIRECT reference to a `returnsTwice`
+    // function symbol (setjmp/_setjmp). The EXACT structural twin of
+    // `isDirectNoreturnCall` (F1 miscompile guard): inspect the lowered Call's CALLEE
+    // CHILD directly (`makeCall` pushes the callee first, so it is `children().front()`)
+    // — it must be a `HirKind::Ref` whose bound record is `returnsTwice`. NEVER the
+    // `firstNameToken` name-resolver: a returns-twice function is ADDRESS-TAKEABLE, so
+    // `(cond ? sj : other)(env)` would resolve wrongly. A ternary / deref / cast callee
+    // lowers to a non-Ref node → not flagged (safe, conservative); an indirect
+    // fn-pointer call `fp(env)` lowers to Ref(fp) whose record has returnsTwice==false
+    // → not flagged. Only a bare direct call to a returns-twice callee is annotated; the
+    // HIR->MIR side then ORs MirInstFlags::ReturnsTwice onto its emitted Call.
+    void recordReturnsTwiceIfDirect(HirNodeId call) {
+        if (!call.valid() || builder.kind(call) != HirKind::Call) return;
+        auto const kids = builder.children(call);
+        if (kids.empty() || builder.kind(kids.front()) != HirKind::Ref) return;
+        SymbolId const sym{builder.payload(kids.front())};
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->returnsTwice)
+            returnsTwiceAcc.push_back({call, ReturnsTwiceAttr{/*returnsTwice=*/true}});
     }
 
     // A name reference as an expression (id + type): resolves the last identifier
@@ -8550,6 +8583,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared (access node → VolatileAttr)
     // accumulator, moved onto result->volatileMap after finish().
     std::vector<std::pair<HirNodeId, VolatileAttr>> volatileAcc;
+    // FC17.9(c) (D-CSUBSET-SETJMP): shared (Call node → ReturnsTwiceAttr) accumulator,
+    // moved onto result->returnsTwiceMap after finish().
+    std::vector<std::pair<HirNodeId, ReturnsTwiceAttr>> returnsTwiceAcc;
     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: shared (decl node → AlignmentAttr)
     // accumulator, moved onto result->alignmentMap after finish().
     std::vector<std::pair<HirNodeId, AlignmentAttr>> alignmentAcc;
@@ -8574,8 +8610,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
-            mutability, threadLocalAcc, volatileAcc, alignmentAcc, vlaSizeAcc,
-            sizeofVlaSymAcc, typedefOriginAcc));
+            mutability, threadLocalAcc, volatileAcc, returnsTwiceAcc, alignmentAcc,
+            vlaSizeAcc, sizeofVlaSymAcc, typedefOriginAcc));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -8644,6 +8680,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     for (auto& [id, attr] : threadLocalAcc)
         result->threadLocalMap.set(id, attr);   // TLS C1
     for (auto& [id, attr] : volatileAcc) result->volatileMap.set(id, attr);  // c21
+    for (auto& [id, attr] : returnsTwiceAcc)   // FC17.9(c) (D-CSUBSET-SETJMP)
+        result->returnsTwiceMap.set(id, attr);
     for (auto& [id, attr] : alignmentAcc) result->alignmentMap.set(id, attr);  // alignas
     for (auto& [symV, sizeNode] : vlaSizeAcc)   // VLA C1a/C3 (D-CSUBSET-VLA)
         result->vlaSizeExprBySymbol[symV].push_back(sizeNode);  // outer→inner order

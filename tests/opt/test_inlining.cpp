@@ -491,6 +491,56 @@ TEST(Inlining, VariadicCalleeCallingVaStartIsNotInlined) {
     EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 1u);
 }
 
+// D-OPT-SETJMP-RETURNS-TWICE-INLINE: a callee whose body CALLS a returns-twice
+// function (setjmp / _setjmp) MUST NOT be inlined. `setjmp` captures the CALLER's
+// frame (SP + callee-saved) into the jmp_buf; splicing the setjmp Call into the caller
+// binds that capture to the wrong frame, so a later longjmp restores the wrong SP →
+// corruption on resume. The gate refuses on the per-Call MirInstFlags::ReturnsTwice
+// bit (a generic MIR flag riding the Call from the callee's SymbolRecord.returnsTwice
+// — no setjmp-name/arch matching), exactly like the va_start-leaf refusal. RED-ON-
+// DISABLE: drop the returns-twice Call refusal arm in inlineLegalityGate and this
+// callee inlines (callsInlined → 1). Sibling of VariadicCalleeCallingVaStartIsNotInlined.
+TEST(Inlining, CalleeCallingReturnsTwiceFunctionIsNotInlined) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const fnSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    // callee f (SymbolId 50): a NON-LEAF body whose only inline-disqualifier is a
+    // returns-twice Call to an EXTERN setjmp-class function (SymbolId 60 — undefined
+    // here, so it stays a Call and is not itself inlined) carrying
+    // MirInstFlags::ReturnsTwice. Without the returns-twice refusal a plain non-leaf
+    // callee is admitted (OPT7 cycle 3), so ONLY the flag blocks the inline.
+    mb.addFunction(fnSig, SymbolId{50});
+    MirBlockId const fEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(fEntry);
+    MirInstId const sjAddr = mb.addGlobalAddr(SymbolId{60}, fnSig);
+    std::array<MirInstId, 1> sjOps{sjAddr};
+    MirInstId const sj = mb.addInst(MirOpcode::Call, sjOps, i32, /*payload=*/0,
+                                    MirInstFlags::ReturnsTwice);
+    mb.addReturn(sj);
+    // main (SymbolId 100): calls f — a prime inline candidate (direct, defined, non-
+    // recursive, address does not escape).
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const mEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(mEntry);
+    MirInstId const calleeAddr = mb.addGlobalAddr(SymbolId{50}, fnSig);
+    std::array<MirInstId, 1> callOps{calleeAddr};
+    MirInstId const call = mb.addInst(MirOpcode::Call, callOps, i32);
+    mb.addReturn(call);
+    Mir mir = std::move(mb).finish();
+
+    ASSERT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);  // f→setjmp + main→f
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runInlining(mir, interner, rep,
+                                            opt::kMaxInlineThreshold);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.callsInlined, 0u)
+        << "a callee that calls a returns-twice (setjmp) function MUST NOT be inlined — "
+           "the spliced setjmp would capture the caller's frame, not the callee's";
+    // Nothing inlined: main's call to f and f's inner setjmp Call both survive.
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Call), 2u);
+}
+
 // ── Argument substitution: a callee taking a parameter is inlined,
 // and the actual argument flows into the spliced body. ─────────────
 // Callee g(int x) { return x + 1; }; main() { return g(41); } → after

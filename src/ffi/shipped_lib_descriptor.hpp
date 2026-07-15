@@ -141,6 +141,19 @@ struct DSS_EXPORT ShippedSymbol {
     // `Block{ ExprStmt(call), Unreachable }` at HIR lowering — the same treatment a
     // user-declared noreturn function gets. Default false.
     bool noreturn = false;
+    // FC17.9(c) (D-CSUBSET-SETJMP): optional — TRUE iff this extern "returns more
+    // than once" (C11 7.13.1.1: `setjmp`/`_setjmp` — a `longjmp` makes an earlier
+    // `setjmp` call appear to return a SECOND time from the caller's frame). Like
+    // `noreturn` a shipped extern has no user prototype to carry the attribute, so
+    // the descriptor declares it. The semantic phase threads it onto the injected
+    // `SymbolRecord.returnsTwice`; UNLIKE noreturn (which is HIR-discharged into an
+    // `Unreachable` and never reaches MIR) it must survive to MIR, so HIR->MIR sets a
+    // per-Call `MirInstFlags::ReturnsTwice` on the lowered `Call` (the EXACT mirror of
+    // how `MirInstFlags::Volatile` rides from `SymbolRecord.isVolatile`) — that flag is
+    // what the optimizer's returns-twice-aware passes (mem2reg no-promote, inliner
+    // callee-refusal) consult so a live-across-setjmp local is never promoted and a
+    // setjmp-containing callee is never inlined (frame-sensitive). Default false.
+    bool returnsTwice = false;
     // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): optional PE-SHIM recipe tag — when
     // non-empty, this symbol is NOT a plain external FFI import but a
     // COMPILER-SYNTHESIZED function whose body `src/mir/merge/synth_threads_shim.cpp`

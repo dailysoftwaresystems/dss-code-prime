@@ -261,6 +261,20 @@ struct DSS_EXPORT SymbolRecord {
     // DROPPED flag is a safe miss (a spurious H_VerifierFailure — fail-loud), never
     // a silent miscompile. Default false.
     bool            isNoreturn = false;
+    // FC17.9(c) (D-CSUBSET-SETJMP): TRUE iff this FUNCTION symbol "returns more than
+    // once" (C11 7.13.1.1 — `setjmp`/`_setjmp`: a matching `longjmp` makes the setjmp
+    // call appear to return a SECOND time). There is NO source syntax for it (unlike
+    // `_Noreturn`); it rides ONLY a shipped-lib descriptor's `returnsTwice`
+    // (setjmp.json), threaded here at descriptor injection — the `isNoreturn`-from-
+    // descriptor mirror. Read at HIR->MIR lowering, where a DIRECT call to such a
+    // callee stamps `MirInstFlags::ReturnsTwice` on the emitted `Call` (via a CST->HIR
+    // side-table, the `isVolatile` funnel discipline). That MIR flag — NOT this
+    // semantic bit — is what the optimizer's returns-twice-aware passes consult
+    // (noreturn is HIR-discharged and never reaches MIR; returnsTwice MUST, so it needs
+    // the carrier). A DROPPED flag is a conservative miss for the WALKING-SKELETON
+    // (determinate cases already work — a Call is a memory barrier and longjmp restores
+    // callee-saved+SP), never a silent miscompile. Default false.
+    bool            returnsTwice = false;
     // FC17 (D-CSUBSET-CONSTEXPR): TRUE iff this symbol was declared with the C23
     // 6.7.1 `constexpr` OBJECT storage-class. Set at Pass-1 minting when the
     // declaration's specifier prefix carries the language's

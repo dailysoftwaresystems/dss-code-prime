@@ -84,6 +84,9 @@ struct Lowerer {
     HirVolatileMap const*    volatileMap; // optional — per-ACCESS volatility (c21,
                                            // D-CSUBSET-VOLATILE-QUALIFIER). nullptr /
                                            // no entry ⇒ plain (non-volatile) access.
+    HirReturnsTwiceMap const* returnsTwiceMap; // optional — per-CALL returns-twice
+                                           // (FC17.9(c), D-CSUBSET-SETJMP). nullptr /
+                                           // no entry ⇒ ordinary call (no flag).
     HirAlignmentMap const*   alignmentMap; // optional — per-DECLARATION explicit
                                            // `alignas` (D-CSUBSET-ALIGNAS-VARIABLE-
                                            // CODEGEN). nullptr / no entry ⇒ natural.
@@ -464,6 +467,22 @@ struct Lowerer {
             return MirInstFlags::None;
         if (auto const* p = volatileMap->tryGet(accessNode); p != nullptr && p->isVolatile)
             return MirInstFlags::Volatile;
+        return MirInstFlags::None;
+    }
+
+    // FC17.9(c) (D-CSUBSET-SETJMP): the returns-twice funnel — the EXACT twin of
+    // `volatileFlagFor`. Returns `MirInstFlags::ReturnsTwice` iff `callNode` carries a
+    // ReturnsTwiceAttr (set by CST→HIR when the Call's direct callee record is
+    // `SymbolRecord.returnsTwice` — a `setjmp`/`_setjmp`), else `None`. The Call-lowering
+    // chokepoint (`finishCall`) passes its HIR node through here so the flag's coverage
+    // is by-construction at one site. nullptr map / no entry ⇒ an ordinary call the
+    // optimizer may freely transform (promote locals across it, inline its callee).
+    [[nodiscard]] MirInstFlags returnsTwiceFlagFor(HirNodeId callNode) const {
+        if (returnsTwiceMap == nullptr || !callNode.valid())
+            return MirInstFlags::None;
+        if (auto const* p = returnsTwiceMap->tryGet(callNode);
+            p != nullptr && p->returnsTwice)
+            return MirInstFlags::ReturnsTwice;
         return MirInstFlags::None;
     }
 
@@ -6099,10 +6118,16 @@ struct Lowerer {
             && ctx.structRetAbi->kind == AbiPassing::Kind::ByReference
             && !config.aggregateSretViaHiddenArg)
             callPayload |= ::dss::call_payload::kIndirectResultBit;
+        // FC17.9(c) (D-CSUBSET-SETJMP): OR the returns-twice flag onto the emitted Call
+        // from the CST→HIR side-table (a direct `setjmp`/`_setjmp` callee) — the EXACT
+        // mirror of how `volatileFlagFor` rides onto a Load/Store. The optimizer's
+        // returns-twice-aware passes read this MIR flag (noreturn never reaches MIR).
+        MirInstFlags const rtFlag = returnsTwiceFlagFor(node);
         if (ctx.structRetAbi.has_value())
             return emitStructReturningCall(node, ctx.operands, callPayload,
-                                           *ctx.structRetAbi, ctx.structRetSlot);
-        return mir.addInst(MirOpcode::Call, ctx.operands, t, callPayload);
+                                           *ctx.structRetAbi, ctx.structRetSlot, rtFlag);
+        return mir.addInst(MirOpcode::Call, ctx.operands, t, callPayload,
+                           /*flags=*/rtFlag);
     }
 
     // The register class of a SCALAR/pointer param (for the per-class arg
@@ -6421,10 +6446,17 @@ struct Lowerer {
     // caller and callee agree on which register each piece occupies.
     [[nodiscard]] MirInstId emitStructReturningCall(
             HirNodeId node, std::span<MirInstId const> operands,
-            std::uint32_t callPayload, AbiPassing const& abi, MirInstId slot) {
+            std::uint32_t callPayload, AbiPassing const& abi, MirInstId slot,
+            MirInstFlags callFlags = MirInstFlags::None) {
+        // `callFlags` carries the FC17.9(c) returns-twice bit (D-CSUBSET-SETJMP) for a
+        // returns-twice callee that returns a struct BY VALUE. No returns-twice libc
+        // function does (setjmp returns int) — but threading it here keeps the carrier
+        // complete for EVERY Call shape rather than only the scalar/void path (no
+        // silent-drop seam if a future returns-twice extern returns an aggregate).
         if (abi.kind == AbiPassing::Kind::ByReference) {
             MirInstId const call =
-                mir.addInst(MirOpcode::Call, operands, InvalidType, callPayload);
+                mir.addInst(MirOpcode::Call, operands, InvalidType, callPayload,
+                            /*flags=*/callFlags);
             if (!call.valid()) return InvalidMirInst;
             return slot;
         }
@@ -6436,7 +6468,8 @@ struct Lowerer {
         }
         TypeId const p0ty = pieceType(abi.pieces[0]);
         MirInstId const call =
-            mir.addInst(MirOpcode::Call, operands, p0ty, callPayload);
+            mir.addInst(MirOpcode::Call, operands, p0ty, callPayload,
+                        /*flags=*/callFlags);
         if (!call.valid()) return InvalidMirInst;
         // Pass 1: capture every piece IMMEDIATELY after the call — the
         // lir_callconv caller look-ahead requires the `ReturnPiece` reads to be
@@ -11014,7 +11047,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           std::unordered_map<std::uint32_t, std::uint32_t> const*
                                                    typedefVlaOriginMap,
                           std::unordered_map<std::uint32_t, std::string> const*
-                                                   synthRecipeMap) {
+                                                   synthRecipeMap,
+                          HirReturnsTwiceMap const* returnsTwiceMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -11031,6 +11065,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .linkageMap = linkageMap,
         .mutabilityMap = mutabilityMap,
         .volatileMap = volatileMap,
+        .returnsTwiceMap = returnsTwiceMap,   // FC17.9(c) (D-CSUBSET-SETJMP)
         .alignmentMap = alignmentMap,
         .threadLocalMap = threadLocalMap,
         .vlaSizeMap = vlaSizeMap,

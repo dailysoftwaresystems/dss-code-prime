@@ -10435,6 +10435,12 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 // to carry `_Noreturn`, so the flag rides the descriptor. A direct
                 // call to one is wrapped at HIR lowering exactly like a user one.
                 rec.isNoreturn = sym.noreturn;
+                // FC17.9(c) (D-CSUBSET-SETJMP): a descriptor-declared returns-twice
+                // extern (setjmp.json's `setjmp`/`_setjmp`) — externs have no user
+                // prototype to carry the attribute, so it rides the descriptor. Read
+                // at HIR->MIR to stamp the Call's MirInstFlags::ReturnsTwice (the
+                // isNoreturn-from-descriptor mirror, one line above).
+                rec.returnsTwice = sym.returnsTwice;
                 SymbolId const id = s.symbols.mint(rec);
                 s.scopes.injectBinding(cuRoot, sym.name, id);
 

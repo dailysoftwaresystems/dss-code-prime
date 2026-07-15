@@ -322,6 +322,27 @@ inlineLegalityGate(Mir const& mir, ModuleAnalysis const& a,
                 || op == MirOpcode::VaHomeArgAreaAddr) {
                 return std::nullopt;
             }
+            // D-OPT-SETJMP-RETURNS-TWICE-INLINE (FC17.9(c) D-CSUBSET-SETJMP): refuse to
+            // inline a callee that CALLS a returns-twice function (setjmp / _setjmp). A
+            // `setjmp` captures the frame of the function that CALLED it — its SP + the
+            // callee-saved registers — into the `jmp_buf`, and a matching `longjmp`
+            // restores exactly that frame. Splicing the setjmp Call into the CALLER binds
+            // the capture to the CALLER's frame instead of the callee's, so a later
+            // longjmp restores the wrong SP → stack corruption on resume. The returns-
+            // twice Call is a frame-capture barrier, exactly like va_start's register-
+            // save-area leaves above, and is refused the same way. The condition is the
+            // per-Call `MirInstFlags::ReturnsTwice` bit, which rides the Call from HIR→MIR
+            // out of the callee's `SymbolRecord.returnsTwice` — so this keys on a GENERIC
+            // MIR flag, never a setjmp name/arch/format. Fail-SAFE (forgoes the
+            // optimization, never miscompiles); reachable under the shipped
+            // release.pipeline.json (which runs Inlining), so a REAL silent-miscompile
+            // fix. Sibling of the va_start refusal above; DISTINCT from the hypothetical-
+            // intrinsic D-OPT7-INLINE-FRAME-SENSITIVE-INTRINSIC (setjmp is an FFI `Call`,
+            // NOT an `IntrinsicCall`, so that anchor stays open).
+            if (op == MirOpcode::Call
+                && has(mir.instFlags(cid), MirInstFlags::ReturnsTwice)) {
+                return std::nullopt;
+            }
             // D-CSUBSET-COMPUTED-GOTO (MF-4): refuse to inline a callee that takes a
             // label address (`BlockAddress`) or contains an indirect branch
             // (`IndirectBr`). Inlining renumbers the callee's blocks into the caller,

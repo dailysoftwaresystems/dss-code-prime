@@ -20,11 +20,15 @@
 #include "opt/optimizer.hpp"
 #include "opt/passes/dce.hpp"
 #include "core/types/symbol_attrs.hpp"
+#include "core/types/object_format_kind.hpp"   // ObjectFormatKind (setjmp variant selector)
 #include "core/types/target_schema.hpp"
+#include "scratch_dir.hpp"                      // ScratchDir (setjmp descriptor sys-dir)
 
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -9662,4 +9666,195 @@ TEST(MirLoweringCSubset, StdbitBitCeilShiftAmountIsClampedNotBareBitWidth) {
     // The clamp masks against the (W−1) constant.
     EXPECT_EQ(m.instOpcode(andOps[1]), MirOpcode::Const)
         << "the clamp mask (W−1) must be a Const";
+}
+
+// ── FC17.9(c) (D-CSUBSET-SETJMP): the returns-twice MIR carrier + array-decay ──
+
+namespace {
+
+// The classic setjmp/longjmp round-trip (the dss-state `c_setjmp_longjmp` probe).
+constexpr char const* kSetjmpRoundTripSrc =
+    "#include <setjmp.h>\n"
+    "int main(void) {\n"
+    "    jmp_buf env;\n"
+    "    int r = setjmp(env);\n"
+    "    if (r == 0) longjmp(env, 42);\n"
+    "    return r;\n"
+    "}\n";
+
+// Lower a program that `#include <setjmp.h>` through the FULL c-subset pipeline with a
+// scratch-dir setjmp descriptor on the system path (the buildAngleDescriptorUnit
+// discipline) — the ONLY way to exercise the returnsTwice descriptor→SymbolRecord→MIR
+// carrier chain end-to-end. analyze() is passed the ACTIVE (arch=x86_64, format=Elf) so
+// the per-(arch,format) jmp_buf variant is selected (a flat analyze() would not inject
+// it). lowerToMir threads `&hir->returnsTwiceMap` — the side-table the carrier reads.
+[[nodiscard]] Lowered lowerSetjmpProgram(std::string mainSrc) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir sysDir{Location::Temp, "setjmp-mir"};
+    // A minimal real-shaped setjmp.json: elf `setjmp` (returnsTwice) + `longjmp`
+    // (noreturn) + the elf-x86_64 jmp_buf variant. The descriptor file is read at
+    // analyze() time, before this helper returns, so the ScratchDir may clean up after.
+    std::ofstream(sysDir.path() / "setjmp.json", std::ios::binary) << R"JSON({
+        "header": "setjmp.h",
+        "availableObjectFormats": ["elf", "pe", "macho"],
+        "library": { "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "setjmp",  "signature": "fn(ptr<void>) -> i32",       "returnsTwice": true, "availableObjectFormats": ["elf", "macho"] },
+            { "name": "longjmp", "signature": "fn(ptr<void>, i32) -> void", "noreturn": true }
+        ],
+        "typedefs": [
+            { "name": "jmp_buf", "variants": [
+                { "when": { "arch": "x86_64", "format": "elf" }, "type": "arr<i64, 25>" }
+            ] }
+        ]
+    })JSON";
+
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    UnitBuilder builder{*loaded};
+    builder.addSystemDir(sysDir.path());
+    builder.addInMemory(std::move(mainSrc), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+
+    // Pass the ACTIVE target/format so the jmp_buf {arch:x86_64,format:elf} variant is
+    // selected (nullopt would inject no variant typedef → `jmp_buf` undefined).
+    auto model = analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+                         ObjectFormatKind::Elf, "x86_64");
+    DiagnosticReporter hirReporter;
+    auto hir = lowerToHir(model, hirReporter);
+    DiagnosticReporter mirReporter;
+    MirLoweringConfig mirCfg;
+    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
+        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+        if (auto const* cc = (*t)->callingConventionByName("sysv_amd64")) {
+            mirCfg.aggregateClassification   = cc->aggregateClassification;
+            mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
+            mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
+            mirCfg.argSlotAligned            = cc->slotAligned;
+            mirCfg.argGprCount = static_cast<std::uint32_t>(cc->argGprs.size());
+            mirCfg.argFprCount = static_cast<std::uint32_t>(cc->argFprs.size());
+            mirCfg.aggregateStackExhaustsRegisters = cc->aggregateStackExhaustsRegisters;
+            mirCfg.vaListLayout = cc->vaListLayout;
+        }
+    }
+    // The real pipeline's FFI-synthesis stage (compile_pipeline step 2.5) populates a
+    // per-extern FfiMetadata (mangledName + importLibrary) BETWEEN HIR and MIR; the
+    // HIR→MIR extern pre-pass requires it. Attach a minimal one per shipped extern
+    // (setjmp/longjmp) so MIR lowering proceeds — the documented test convention (mangled
+    // name / library correctness is FFI's concern, exercised in test_ingest.cpp, not this
+    // carrier pin).
+    HirFfiMap ffiMap{hir->hir};
+    for (auto const& r : hir->externDecls) {
+        FfiMetadata meta;
+        meta.mangledName   = r.canonicalName;
+        meta.importLibrary = "libc.so.6";
+        ffiMap.set(r.node, meta);
+    }
+    HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
+                                    model.lattice().interner(), mirReporter,
+                                    &hir->sourceMap, mirCfg, &ffiMap,
+                                    &hir->linkageMap, &hir->mutabilityMap,
+                                    &hir->volatileMap, /*alignmentMap=*/nullptr,
+                                    &hir->threadLocalMap,
+                                    &hir->vlaSizeExprBySymbol,
+                                    &hir->sizeofVlaSymbol,
+                                    &hir->typedefVlaOriginBySymbol,
+                                    /*synthRecipeMap=*/nullptr,
+                                    &hir->returnsTwiceMap);   // FC17.9(c) (D-CSUBSET-SETJMP)
+    return Lowered{
+        .model       = std::move(model),
+        .hir         = std::move(hir),
+        .hirReporter = std::move(hirReporter),
+        .mir         = std::move(mir),
+        .mirReporter = std::move(mirReporter),
+    };
+}
+
+} // namespace
+
+// THE CARRIER PIN (D-CSUBSET-SETJMP, audit C2): the setjmp Call reaches MIR carrying
+// `MirInstFlags::ReturnsTwice`, and NO other Call does — the flag the optimizer's
+// returns-twice passes will read. Bundles the array-decay proof (audit Q8): `setjmp(env)`
+// with NO `&` decays the jmp_buf ARRAY typedef to a POINTER arg (not passed by value).
+// RED-ON-DISABLE: drop the `returnsTwiceFlagFor` OR in finishCall → the setjmp Call
+// carries no flag → returnsTwiceCalls==0 → the EXPECT_EQ(…,1) fails.
+TEST(MirLoweringCSubset, SetjmpCallCarriesReturnsTwiceFlagAndDecaysEnv) {
+    auto L = lowerSetjmpProgram(kSetjmpRoundTripSrc);
+    ASSERT_FALSE(L.model.hasErrors())
+        << "semantic: " << (L.model.diagnostics().all().empty()
+                                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "HIR: " << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR: " << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& interner = L.model.lattice().interner();
+
+    int returnsTwiceCalls = 0;
+    int plainCalls        = 0;
+    MirInstId setjmpCall{};
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const fn = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+            MirBlockId const blk = m.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(blk); ++ii) {
+                MirInstId const id = m.blockInstAt(blk, ii);
+                if (m.instOpcode(id) != MirOpcode::Call) continue;
+                if (has(m.instFlags(id), MirInstFlags::ReturnsTwice)) {
+                    ++returnsTwiceCalls;
+                    setjmpCall = id;
+                } else {
+                    ++plainCalls;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(returnsTwiceCalls, 1)
+        << "exactly the setjmp Call must carry MirInstFlags::ReturnsTwice (the carrier "
+           "reached MIR)";
+    EXPECT_GE(plainCalls, 1)
+        << "the longjmp Call must NOT carry ReturnsTwice (noreturn, not returns-twice)";
+    ASSERT_TRUE(setjmpCall.valid());
+
+    // setjmp returns i32.
+    EXPECT_EQ(interner.kind(m.instType(setjmpCall)), TypeKind::I32);
+    // Array-decay proof: operands = [callee, env-arg]; the env arg is POINTER-typed —
+    // the jmp_buf array decayed to a pointer at the call site, NOT passed by value.
+    auto const ops = m.instOperands(setjmpCall);
+    ASSERT_GE(ops.size(), 2u) << "setjmp Call must have [callee, env-arg]";
+    EXPECT_EQ(interner.kind(m.instType(ops[1])), TypeKind::Ptr)
+        << "env (jmp_buf array) must decay to a pointer arg "
+           "(D-CSUBSET-ARRAY-DECAY-TO-VOID-PTR)";
+}
+
+// The longjmp `noreturn` discharge reaches MIR: the block emitting the longjmp Call
+// terminates in `Unreachable` (post-longjmp code is unreachable — C11 7.13.2.1). The
+// existing D-CSUBSET-NORETURN machinery covers it; this pins it holds for a shipped
+// setjmp.json `longjmp`. RED-ON-DISABLE: drop longjmp's `noreturn` bit → the call's
+// block falls through instead of terminating in Unreachable.
+TEST(MirLoweringCSubset, LongjmpNoreturnTerminatesBlockInUnreachable) {
+    auto L = lowerSetjmpProgram(kSetjmpRoundTripSrc);
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR: " << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    bool sawUnreachable = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const fn = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+            MirBlockId const blk = m.funcBlockAt(fn, bi);
+            std::uint32_t const n = m.blockInstCount(blk);
+            if (n == 0) continue;
+            if (m.instOpcode(m.blockInstAt(blk, n - 1)) == MirOpcode::Unreachable)
+                sawUnreachable = true;
+        }
+    }
+    EXPECT_TRUE(sawUnreachable)
+        << "longjmp is noreturn → its block must terminate in Unreachable";
 }

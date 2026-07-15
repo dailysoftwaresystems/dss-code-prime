@@ -3112,4 +3112,180 @@ TEST(ShippedLibDescriptor, SynthesizeNameMismatchFailsLoud) {
     EXPECT_TRUE(rep.hasErrors());
 }
 
+// ── FC17.9(c) (D-CSUBSET-SETJMP): setjmp.json descriptor decode ───────────────
+
+// The `returnsTwice` symbol bit decodes (default false) exactly like `noreturn`, and
+// the two are INDEPENDENT: setjmp/_setjmp are returnsTwice (NOT noreturn); longjmp is
+// noreturn (NOT returnsTwice). This is the descriptor half of the carrier chain
+// (returnsTwice -> SymbolRecord -> MirInstFlags::ReturnsTwice). RED-ON-DISABLE: drop
+// the `returnsTwice` decode arm and the setjmp assertion flips to false.
+TEST(ShippedLibDescriptor, SetjmpReturnsTwiceAndLongjmpNoreturnDecode) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "setjmp.json", R"JSON({
+        "header": "setjmp.h",
+        "availableObjectFormats": ["elf", "pe", "macho"],
+        "symbols": [
+            { "name": "setjmp",  "signature": "fn(ptr<void>) -> i32",            "returnsTwice": true, "availableObjectFormats": ["elf", "macho"] },
+            { "name": "_setjmp", "signature": "fn(ptr<void>, ptr<void>) -> i32", "returnsTwice": true, "availableObjectFormats": ["pe"] },
+            { "name": "longjmp", "signature": "fn(ptr<void>, i32) -> void",      "noreturn": true }
+        ]
+    })JSON");
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->symbols.size(), 3u);
+
+    auto sym = [&](std::string_view n) -> ShippedSymbol const* {
+        for (auto const& s : desc->symbols) if (s.name == n) return &s;
+        return nullptr;
+    };
+    ASSERT_NE(sym("setjmp"), nullptr);
+    ASSERT_NE(sym("_setjmp"), nullptr);
+    ASSERT_NE(sym("longjmp"), nullptr);
+    // setjmp / _setjmp: returnsTwice, NOT noreturn.
+    EXPECT_TRUE(sym("setjmp")->returnsTwice);
+    EXPECT_FALSE(sym("setjmp")->noreturn);
+    EXPECT_TRUE(sym("_setjmp")->returnsTwice);
+    EXPECT_FALSE(sym("_setjmp")->noreturn);
+    // longjmp: noreturn, NOT returnsTwice — the two bits are independent.
+    EXPECT_TRUE(sym("longjmp")->noreturn);
+    EXPECT_FALSE(sym("longjmp")->returnsTwice);
+}
+
+// `returnsTwice` must be a boolean — a non-bool fails loud (the `noreturn`
+// type-validation mirror). RED-ON-DISABLE: drop the is_boolean guard and this reads a
+// garbage value silently.
+TEST(ShippedLibDescriptor, SetjmpReturnsTwiceMustBeBoolean) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "bad_rt.json", R"JSON({
+        "header": "setjmp.h",
+        "symbols": [
+            { "name": "setjmp", "signature": "fn(ptr<void>) -> i32", "returnsTwice": "yes" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// The `jmp_buf` opaque buffer is sized per-(arch,format) — the sys/stat.json per-arch
+// variant mechanism, keyed on BOTH {arch,format} (setjmp diverges by ARCH within elf).
+// Pins each built pair's SIZE + ALIGNMENT via computeLayout. ★ THE LOAD-BEARING pe64
+// pin: the pe x86_64 buffer is 256B AND 16-ALIGNED (MSVC's `_setjmp` saves Xmm6-Xmm15
+// with `movaps`, which #GP-crashes on an 8-aligned buffer). The 16-alignment is pure
+// CONFIG DATA — a `u128` element self-aligns to the target's maxAlignment (16), so
+// `arr<u128,16>` is 256B/16-align with NO alignas field. RED-ON-DISABLE: change the pe
+// element to `i64` (arr<i64,32>, also 256B) → align drops to 8 → the pe assertion fails
+// (and the pe64 example would #GP-crash at runtime).
+TEST(ShippedLibDescriptor, SetjmpJmpBufSizeAndAlignPerArchFormat) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "setjmp.json", R"JSON({
+        "header": "setjmp.h",
+        "availableObjectFormats": ["elf", "pe", "macho"],
+        "typedefs": [
+            { "name": "jmp_buf", "variants": [
+                { "when": { "arch": "x86_64", "format": "elf" },   "type": "arr<i64, 25>" },
+                { "when": { "arch": "arm64",  "format": "elf" },   "type": "arr<i64, 39>" },
+                { "when": { "arch": "x86_64", "format": "pe" },    "type": "arr<u128, 16>" },
+                { "when": { "arch": "arm64",  "format": "macho" }, "type": "arr<i64, 28>" }
+            ] }
+        ]
+    })JSON");
+
+    auto layoutFor = [&](std::string_view arch, ObjectFormatKind fmt)
+        -> std::optional<StructLayout> {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, arch, fmt);
+        EXPECT_TRUE(desc.has_value()) << "arch=" << arch;
+        EXPECT_FALSE(rep.hasErrors());
+        for (auto const& td : desc->typedefs)
+            if (td.name == "jmp_buf")
+                return computeLayout(td.type, interner, kNatural16, DataModel::Lp64);
+        ADD_FAILURE() << "jmp_buf typedef missing for arch=" << arch;
+        return std::nullopt;
+    };
+
+    auto elfX86 = layoutFor("x86_64", ObjectFormatKind::Elf);
+    auto elfArm = layoutFor("arm64",  ObjectFormatKind::Elf);
+    auto peX86  = layoutFor("x86_64", ObjectFormatKind::Pe);
+    auto machoArm = layoutFor("arm64", ObjectFormatKind::MachO);
+    ASSERT_TRUE(elfX86.has_value());
+    ASSERT_TRUE(elfArm.has_value());
+    ASSERT_TRUE(peX86.has_value());
+    ASSERT_TRUE(machoArm.has_value());
+
+    EXPECT_EQ(elfX86->size, 200u);   // glibc x86_64 jmp_buf
+    EXPECT_EQ(elfArm->size, 312u);   // glibc arm64 jmp_buf (DIVERGES by arch)
+    EXPECT_EQ(peX86->size, 256u);    // MSVC _JUMP_BUFFER
+    EXPECT_EQ(machoArm->size, 224u); // macOS arm64 jmp_buf, over-sized from 192B
+    // ★ THE pe64 16-alignment (the movaps crash-guard).
+    EXPECT_EQ(peX86->align.bytes(), 16u)
+        << "pe x86_64 jmp_buf MUST be 16-aligned or _setjmp's movaps #GP-crashes";
+    // The elf/macho buffers are 8-aligned (arr<i64,N>) — correct there.
+    EXPECT_EQ(elfX86->align.bytes(), 8u);
+    EXPECT_EQ(machoArm->align.bytes(), 8u);
+
+    // A (arch,format) pair NOT enumerated (e.g. macho x86_64) yields NO jmp_buf —
+    // fail-loud-safe: not injected, so a later use is a loud undefined type, never a
+    // silent wrong size.
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                         DataModel::Lp64, "x86_64",
+                                         ObjectFormatKind::MachO);
+    ASSERT_TRUE(desc.has_value());
+    bool hasJmpBuf = false;
+    for (auto const& td : desc->typedefs) if (td.name == "jmp_buf") hasJmpBuf = true;
+    EXPECT_FALSE(hasJmpBuf)
+        << "an un-enumerated (arch,format) must NOT inject a jmp_buf (fail-loud-safe)";
+}
+
+// The pe-only `setjmp(env) -> _setjmp(env, 0)` function-like macro (the stdbit.json
+// per-format macro precedent): on pe the macro is present; on elf it is NOT (elf ships
+// the real 1-arg `setjmp` symbol, not a macro). Read via the interner-FREE
+// `readShippedLibMacros` (the preprocessor's path). RED-ON-DISABLE: drop the pe macro
+// variant → the pe `setjmp(env)` never expands to `_setjmp` and resolves to nothing.
+TEST(ShippedLibDescriptor, SetjmpPeMacroExpandsToUnderscoreSetjmp) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "setjmp.json", R"JSON({
+        "header": "setjmp.h",
+        "availableObjectFormats": ["elf", "pe", "macho"],
+        "macros": [
+            { "name": "setjmp", "variants": [
+                { "when": { "format": "pe" }, "params": ["env"], "replacement": "_setjmp(env, 0)" }
+            ] }
+        ]
+    })JSON");
+    DiagnosticReporter rep;
+
+    // pe: the macro is present, function-like (params=[env]), expands to _setjmp(env,0).
+    auto pe = readShippedLibMacros(path, rep, ObjectFormatKind::Pe);
+    ASSERT_TRUE(pe.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(pe->size(), 1u);
+    EXPECT_EQ((*pe)[0].name, "setjmp");
+    ASSERT_TRUE((*pe)[0].params.has_value());
+    ASSERT_EQ((*pe)[0].params->size(), 1u);
+    EXPECT_EQ((*pe)[0].params->at(0), "env");
+    EXPECT_EQ((*pe)[0].replacement, "_setjmp(env, 0)");
+
+    // elf: the variants-only macro has NO elf variant → not injected (elf uses the
+    // real `setjmp` symbol).
+    auto elf = readShippedLibMacros(path, rep, ObjectFormatKind::Elf);
+    ASSERT_TRUE(elf.has_value());
+    EXPECT_TRUE(elf->empty())
+        << "the pe-only setjmp macro must NOT be injected on elf";
+}
+
 } // namespace
