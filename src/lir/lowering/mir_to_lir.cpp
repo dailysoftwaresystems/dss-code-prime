@@ -32,6 +32,9 @@ namespace {
         case MirOpcode::Sub:           return "Sub";
         case MirOpcode::Mul:           return "Mul";
         case MirOpcode::UMulH:         return "UMulH";
+        case MirOpcode::Popcount:      return "Popcount";  // FC17.9(b)
+        case MirOpcode::Clz:           return "Clz";       // FC17.9(b)
+        case MirOpcode::Ctz:           return "Ctz";       // FC17.9(b)
         case MirOpcode::AtomicCas:     return "AtomicCas";
         case MirOpcode::ICmpEq:        return "ICmpEq";
         case MirOpcode::ICmpNe:        return "ICmpNe";
@@ -290,6 +293,20 @@ enum class MnemonicSlot : std::uint8_t {
     // it nullopt and the StackRestore lowering fails loud, never a silent no-op
     // that would leak the stack).
     SpRestore,
+    // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the NATIVE hardware bit-count
+    // realizations, probed by mnemonic presence (the umulh/div capability split).
+    // `PopcountNative` = x86 POPCNT (arm64 declares none → SWAR, the fallback the
+    // arm64-elf example arm witnesses). `ClzNative` = x86 LZCNT / arm64 CLZ (BOTH
+    // targets declare "clz" — same 1-source result:value shape, defined =width at
+    // 0). `CtzNative` = x86 TZCNT (arm64 declares none — it composes `Rbit`+CLZ).
+    // `Rbit` = arm64 bit-reverse (RBIT), which turns leading-zeros (CLZ) into
+    // trailing-zeros; x86 declares none (it has direct TZCNT). A target declaring
+    // none of a given verb's realizations lowers that op via the SWAR fallback —
+    // never fail-loud, never an `if (arch==…)`.
+    PopcountNative,
+    ClzNative,
+    CtzNative,
+    Rbit,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -395,6 +412,10 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::SubSpReg,           "sub_sp_reg"},
     {MnemonicSlot::SpCopy,             "sp_copy"},
     {MnemonicSlot::SpRestore,          "sp_restore"},
+    {MnemonicSlot::PopcountNative,     "popcount"},  // FC17.9(b): x86 POPCNT
+    {MnemonicSlot::ClzNative,          "clz"},       // FC17.9(b): x86 LZCNT / arm64 CLZ
+    {MnemonicSlot::CtzNative,          "ctz"},       // FC17.9(b): x86 TZCNT
+    {MnemonicSlot::Rbit,               "rbit"},      // FC17.9(b): arm64 RBIT (→ ctz via CLZ)
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -1537,6 +1558,10 @@ struct Lowerer {
             case MirOpcode::Sub:    return lowerBinaryOp(id, MnemonicSlot::Sub);
             case MirOpcode::Mul:    return lowerBinaryOp(id, MnemonicSlot::Mul);
             case MirOpcode::UMulH:  return lowerMulHigh(id);
+            // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): native-or-SWAR bit counts.
+            case MirOpcode::Popcount: return lowerPopcount(id);
+            case MirOpcode::Clz:      return lowerClz(id);
+            case MirOpcode::Ctz:      return lowerCtz(id);
             case MirOpcode::AtomicCas: return lowerAtomicCas(id);
             // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier is a pure
             // COMPILE-TIME ordering fence — it emits NO instruction. Its whole
@@ -4770,6 +4795,329 @@ struct Lowerer {
         std::array<LirOperand, 1> const captureOps{LirOperand::makeReg(highPhys)};
         emitInst(*movOp, result, captureOps);
         defineValue(id, result);
+    }
+
+    // ── FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): bit-count lowerings ─────────
+    //
+    // MIR Popcount/Clz/Ctz lower NATIVE-or-SWAR, the __umulh capability split:
+    // probe `opcode(MnemonicSlot::…Native)` — present ⇒ the hardware instruction,
+    // absent ⇒ a branchless SWAR bit-trick sequence over the UNIVERSAL ALU verbs
+    // (add/sub/and/or/mul/not + shifts). NO `if (arch==…)`: the native-vs-SWAR
+    // choice reads the config-declared opcode vocabulary. All three run at the
+    // OPERAND's promotion width P∈{32,64} (U32→32, U64→64); the count (0..P≤64)
+    // has zero upper bits, so it reads correctly at the I32 MIR result with no
+    // Trunc (the ICmp→Bool narrowing precedent).
+
+    // Emit a native 1-source result:value instruction (POPCNT/LZCNT/TZCNT/CLZ/
+    // RBIT) at `widthFlags` → fresh vreg; nullopt (fail-loud, mirroring
+    // lowerMulHigh Rule 1) if the declared opcode is misconfigured (result:none).
+    [[nodiscard]] std::optional<LirReg> emitNativeUnary(
+            std::uint16_t op, LirReg operand, std::uint8_t widthFlags,
+            LirRegClass cls) {
+        auto const* ni = target.opcodeInfo(op);
+        if (ni == nullptr || ni->result != TargetResultRule::Value) {
+            reportUnsupported(mir.instOpcode(currentMir), currentMir);
+            return std::nullopt;
+        }
+        LirReg const r = lir.newVReg(cls);
+        std::array<LirOperand, 1> const ops{LirOperand::makeReg(operand)};
+        emitInst(op, r, ops, /*payload=*/0, widthFlags);
+        return r;
+    }
+
+    // Emit a 3-address reg-reg ALU op (add/sub/and/or/mul) at `widthFlags` → fresh
+    // GPR vreg — the plain form BOTH ISAs declare identically (the jump-table
+    // `mul reg,reg` agnosticism precedent). `op` is caller-resolved (fail-loud on
+    // absence happens at the caller, before the sequence starts).
+    [[nodiscard]] LirReg emitAluRegReg(std::uint16_t op, LirReg a, LirReg b,
+                                       std::uint8_t widthFlags) {
+        LirReg const r = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 2> const ops{
+            LirOperand::makeReg(a), LirOperand::makeReg(b)};
+        emitInst(op, r, ops, /*payload=*/0, widthFlags);
+        return r;
+    }
+
+    // Materialize an ARBITRARY integer constant into a fresh GPR vreg, CORRECT at
+    // full 64-bit width — the wide-capable sibling of `emitBareConstToFresh`
+    // (which was built for ≤imm32 jump-table scratch and TRUNCATES a >imm32 value
+    // on a `mov r64,imm64` target that lacks the MOVK ladder). Needed for the
+    // 64-bit SWAR masks (0x5555…/0x0F0F…). Routing (the lowerConst wide-integer
+    // path, D-CSUBSET-BITFIELD-WIDE-UNIT): fits-imm32 or arm64 MOVK ladder →
+    // emitBareConstToFresh (already correct); else `mov r64,imm64` (x86) → the
+    // LiteralPool carrier here. Capability-probed, never `if (arch==…)`.
+    [[nodiscard]] std::optional<LirReg> emitWideConstToFresh(std::uint64_t value) {
+        std::int64_t const sval = static_cast<std::int64_t>(value);
+        bool const fitsImm32 =
+            sval >= std::numeric_limits<std::int32_t>::min()
+            && sval <= std::numeric_limits<std::int32_t>::max();
+        if (!fitsImm32 && targetHasMovImm64()) {
+            auto const movOp = classOp(LirRegClass::GPR, RegClassOp::Move);
+            if (!movOp.has_value()) {
+                reportMissingClassOp(LirRegClass::GPR, RegClassOp::Move,
+                                     "bit-count SWAR wide mask");
+                return std::nullopt;
+            }
+            LirLiteralValue lit;
+            lit.core  = TypeKind::U64;
+            lit.value = value;
+            std::uint32_t const idx = lir.literalPoolAdd(std::move(lit));
+            LirReg const r = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 1> const ops{
+                LirOperand::makeLiteralIndex(idx)};
+            emitInst(*movOp, r, ops, /*payload=*/0, /*flags=*/0);  // 64-bit
+            return r;
+        }
+        return emitBareConstToFresh(sval);
+    }
+
+    // Emit `result = value >>/<< amount` for a COMPILE-TIME-CONSTANT `amount`,
+    // selecting the shift realization by the SAME capability rules `lowerShift`
+    // uses: a reg-imm variant (x86 `shr r,imm8`) / an implicit-count register
+    // (x86 CL) / a native 3-address reg-reg (arm64 LSRV/LSLV). A SEPARATE helper
+    // from lowerShift because the SWAR emits SYNTHETIC shifts inside a lowering
+    // sequence (no MIR operand to read; the amount is always a small literal), so
+    // the hot source-level path stays untouched. Shifts are the one ALU family
+    // NOT shape-uniform across ISAs (the jump-table comment), so this is where
+    // that split lives — read from config, never `if (arch==…)`.
+    [[nodiscard]] std::optional<LirReg> emitShiftConst(
+            LirReg value, std::uint8_t amount, MnemonicSlot slot,
+            std::uint8_t widthFlags) {
+        auto const op = opcode(slot);
+        if (!op.has_value()) {
+            reportMissingOpcode(slot, "bit-count SWAR shift");
+            return std::nullopt;
+        }
+        auto const* info = target.opcodeInfo(*op);
+        if (info == nullptr) {
+            reportUnsupported(mir.instOpcode(currentMir), currentMir);
+            return std::nullopt;
+        }
+        // Rule 1 — immediate count (x86 `shr r/m, imm8`).
+        if (declaresRegImmVariant(*info)) {
+            LirReg const result = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 2> const ops{
+                LirOperand::makeReg(value),
+                LirOperand::makeImmInt32(static_cast<std::int32_t>(amount))};
+            emitInst(*op, result, ops, /*payload=*/0, widthFlags);
+            return result;
+        }
+        // The reg-count forms need the amount in a register.
+        std::optional<LirReg> const amtReg = emitBareConstToFresh(amount);
+        if (!amtReg.has_value()) return std::nullopt;
+        // Rule 2 — implicit-count register (a CL-only ISA; x86 takes Rule 1).
+        if (info->implicitRegisters.has_value()) {
+            auto const& ir = *info->implicitRegisters;
+            auto const countOrd = ir.inputOrdinalForRole("count");
+            if (!countOrd.has_value()) {
+                reportMissingImplicitRole(*op, "inputRoles", "count", currentMir);
+                return std::nullopt;
+            }
+            auto const movOp = opcode(MnemonicSlot::Mov);
+            if (!movOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Mov,
+                                    "bit-count SWAR shift count pin");
+                return std::nullopt;
+            }
+            auto const* countRegInfo = target.registerInfo(*countOrd);
+            if (countRegInfo == nullptr) {
+                reportUnsupported(mir.instOpcode(currentMir), currentMir);
+                return std::nullopt;
+            }
+            LirReg const countPhys = makePhysicalReg(
+                *countOrd, static_cast<LirRegClass>(countRegInfo->regClass));
+            std::array<LirOperand, 1> const pin{LirOperand::makeReg(*amtReg)};
+            emitInst(*movOp, countPhys, pin);
+            LirReg const result = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 1> const sops{LirOperand::makeReg(value)};
+            emitInst(*op, result, sops, /*payload=*/0, widthFlags);
+            return result;
+        }
+        // Rule 3 — native 3-address reg-reg (arm64 LSRV/LSLV).
+        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 2> const ops{
+            LirOperand::makeReg(value), LirOperand::makeReg(*amtReg)};
+        emitInst(*op, result, ops, /*payload=*/0, widthFlags);
+        return result;
+    }
+
+    // The classic Hacker's-Delight SWAR popcount, P-parameterized, over the
+    // universal ALU verbs. `(x * ONES) >> (P-8)` sums the per-byte counts into the
+    // top byte. Returns the count vreg (0..P). The fallback when no native POPCNT
+    // is declared (arm64 has no scalar-GPR popcount) — runtime-witnessed on the
+    // arm64-elf example arm.
+    [[nodiscard]] std::optional<LirReg> emitSwarPopcount(
+            LirReg x, bool is64, std::uint8_t widthFlags) {
+        auto const andOp = opcode(MnemonicSlot::And);
+        auto const addOp = opcode(MnemonicSlot::Add);
+        auto const subOp = opcode(MnemonicSlot::Sub);
+        auto const mulOp = opcode(MnemonicSlot::Mul);
+        if (!andOp.has_value()) { reportMissingOpcode(MnemonicSlot::And, "SWAR popcount"); return std::nullopt; }
+        if (!addOp.has_value()) { reportMissingOpcode(MnemonicSlot::Add, "SWAR popcount"); return std::nullopt; }
+        if (!subOp.has_value()) { reportMissingOpcode(MnemonicSlot::Sub, "SWAR popcount"); return std::nullopt; }
+        if (!mulOp.has_value()) { reportMissingOpcode(MnemonicSlot::Mul, "SWAR popcount"); return std::nullopt; }
+        std::uint64_t const m1   = is64 ? 0x5555555555555555ULL : 0x55555555ULL;
+        std::uint64_t const m2   = is64 ? 0x3333333333333333ULL : 0x33333333ULL;
+        std::uint64_t const m3   = is64 ? 0x0F0F0F0F0F0F0F0FULL : 0x0F0F0F0FULL;
+        std::uint64_t const ones = is64 ? 0x0101010101010101ULL : 0x01010101ULL;
+        std::uint8_t  const finalShift = is64 ? 56 : 24;
+
+        // a = x - ((x >> 1) & m1)
+        auto const s1 = emitShiftConst(x, 1, MnemonicSlot::ShrL, widthFlags);
+        if (!s1.has_value()) return std::nullopt;
+        auto const m1r = emitWideConstToFresh(m1);
+        if (!m1r.has_value()) return std::nullopt;
+        LirReg const t1 = emitAluRegReg(*andOp, *s1, *m1r, widthFlags);
+        LirReg const a  = emitAluRegReg(*subOp, x, t1, widthFlags);
+        // b = (a & m2) + ((a >> 2) & m2)
+        auto const m2r = emitWideConstToFresh(m2);
+        if (!m2r.has_value()) return std::nullopt;
+        auto const s2 = emitShiftConst(a, 2, MnemonicSlot::ShrL, widthFlags);
+        if (!s2.has_value()) return std::nullopt;
+        LirReg const lo = emitAluRegReg(*andOp, a, *m2r, widthFlags);
+        LirReg const hi = emitAluRegReg(*andOp, *s2, *m2r, widthFlags);
+        LirReg const b  = emitAluRegReg(*addOp, lo, hi, widthFlags);
+        // c = (b + (b >> 4)) & m3
+        auto const s4 = emitShiftConst(b, 4, MnemonicSlot::ShrL, widthFlags);
+        if (!s4.has_value()) return std::nullopt;
+        LirReg const c0 = emitAluRegReg(*addOp, b, *s4, widthFlags);
+        auto const m3r = emitWideConstToFresh(m3);
+        if (!m3r.has_value()) return std::nullopt;
+        LirReg const c = emitAluRegReg(*andOp, c0, *m3r, widthFlags);
+        // result = (c * ones) >> finalShift
+        auto const onesr = emitWideConstToFresh(ones);
+        if (!onesr.has_value()) return std::nullopt;
+        LirReg const p = emitAluRegReg(*mulOp, c, *onesr, widthFlags);
+        return emitShiftConst(p, finalShift, MnemonicSlot::ShrL, widthFlags);
+    }
+
+    // SWAR count-leading-zeros: smear the highest set bit down to fill all lower
+    // bits, then P - popcount(smeared). clz(0) = P (smear of 0 stays 0 → popcount
+    // 0 → P). The fallback when no native LZCNT/CLZ is declared.
+    [[nodiscard]] std::optional<LirReg> emitSwarClz(
+            LirReg x, bool is64, std::uint8_t widthFlags) {
+        auto const orOp  = opcode(MnemonicSlot::Or);
+        auto const subOp = opcode(MnemonicSlot::Sub);
+        if (!orOp.has_value())  { reportMissingOpcode(MnemonicSlot::Or,  "SWAR clz"); return std::nullopt; }
+        if (!subOp.has_value()) { reportMissingOpcode(MnemonicSlot::Sub, "SWAR clz"); return std::nullopt; }
+        static constexpr std::array<std::uint8_t, 6> kSmears{1, 2, 4, 8, 16, 32};
+        std::size_t const n = is64 ? 6u : 5u;
+        LirReg s = x;
+        for (std::size_t i = 0; i < n; ++i) {
+            auto const sh = emitShiftConst(s, kSmears[i], MnemonicSlot::ShrL, widthFlags);
+            if (!sh.has_value()) return std::nullopt;
+            s = emitAluRegReg(*orOp, s, *sh, widthFlags);
+        }
+        auto const pc = emitSwarPopcount(s, is64, widthFlags);
+        if (!pc.has_value()) return std::nullopt;
+        // result = P - popcount(smeared)
+        std::optional<LirReg> const pConst = emitBareConstToFresh(is64 ? 64 : 32);
+        if (!pConst.has_value()) return std::nullopt;
+        return emitAluRegReg(*subOp, *pConst, *pc, widthFlags);
+    }
+
+    // SWAR count-trailing-zeros: popcount((~x) & (x-1)). ctz(0) = P (~0 & (0-1) =
+    // all-ones → popcount P). Reached only on a bare ISA declaring neither a
+    // native ctz (x86 TZCNT) nor RBIT+CLZ (arm64).
+    [[nodiscard]] std::optional<LirReg> emitSwarCtz(
+            LirReg x, bool is64, std::uint8_t widthFlags) {
+        auto const notOp = opcode(MnemonicSlot::Not);
+        auto const subOp = opcode(MnemonicSlot::Sub);
+        auto const andOp = opcode(MnemonicSlot::And);
+        if (!notOp.has_value()) { reportMissingOpcode(MnemonicSlot::Not, "SWAR ctz"); return std::nullopt; }
+        if (!subOp.has_value()) { reportMissingOpcode(MnemonicSlot::Sub, "SWAR ctz"); return std::nullopt; }
+        if (!andOp.has_value()) { reportMissingOpcode(MnemonicSlot::And, "SWAR ctz"); return std::nullopt; }
+        // notx = ~x  (Not is a unary op — the lowerUnaryOp operand shape).
+        LirReg const notx = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 1> const ops{LirOperand::makeReg(x)};
+            emitInst(*notOp, notx, ops, /*payload=*/0, widthFlags);
+        }
+        std::optional<LirReg> const one = emitBareConstToFresh(1);
+        if (!one.has_value()) return std::nullopt;
+        LirReg const xm1 = emitAluRegReg(*subOp, x, *one, widthFlags);   // x - 1
+        LirReg const t   = emitAluRegReg(*andOp, notx, xm1, widthFlags); // ~x & (x-1)
+        return emitSwarPopcount(t, is64, widthFlags);
+    }
+
+    // Shared preamble: validate the single operand + return (operandReg, pWidth,
+    // is64). pWidth keys on the OPERAND type (P), not the I32 result. nullopt ⇒
+    // a diagnostic already fired (bad arity / poisoned operand).
+    struct BitCountOperand { LirReg reg; std::uint8_t pWidth; bool is64; };
+    [[nodiscard]] std::optional<BitCountOperand> bitCountOperand(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(mir.instOpcode(id), id);
+            return std::nullopt;
+        }
+        std::optional<LirReg> const x = regForValue(operands[0]);
+        if (!x.has_value()) return std::nullopt;
+        std::uint8_t const pWidth = widthFlagsForType(mir.instType(operands[0]));
+        return BitCountOperand{*x, pWidth, lirInstWidthBits(pWidth) == 64};
+    }
+
+    void lowerPopcount(MirInstId id) {
+        auto const in = bitCountOperand(id);
+        if (!in.has_value()) return;
+        if (auto const nativeOp = opcode(MnemonicSlot::PopcountNative);
+            nativeOp.has_value()) {  // x86 POPCNT
+            auto const r = emitNativeUnary(*nativeOp, in->reg, in->pWidth, regClassFor(id));
+            if (!r.has_value()) { poisonValue(id); return; }
+            defineValue(id, *r);
+            return;
+        }
+        // SWAR fallback (arm64 + any ISA without a scalar popcount;
+        // D-FULLC-STDBIT-ARM64-CNT-POPCOUNT trigger-gates a future arm64 NEON CNT).
+        auto const r = emitSwarPopcount(in->reg, in->is64, in->pWidth);
+        if (!r.has_value()) { poisonValue(id); return; }
+        defineValue(id, *r);
+    }
+
+    void lowerClz(MirInstId id) {
+        auto const in = bitCountOperand(id);
+        if (!in.has_value()) return;
+        if (auto const nativeOp = opcode(MnemonicSlot::ClzNative);
+            nativeOp.has_value()) {  // x86 LZCNT / arm64 CLZ (defined =width at 0)
+            auto const r = emitNativeUnary(*nativeOp, in->reg, in->pWidth, regClassFor(id));
+            if (!r.has_value()) { poisonValue(id); return; }
+            defineValue(id, *r);
+            return;
+        }
+        // SWAR fallback.
+        auto const r = emitSwarClz(in->reg, in->is64, in->pWidth);
+        if (!r.has_value()) { poisonValue(id); return; }
+        defineValue(id, *r);
+    }
+
+    void lowerCtz(MirInstId id) {
+        auto const in = bitCountOperand(id);
+        if (!in.has_value()) return;
+        // Rule 1 — native ctz (x86 TZCNT, defined =width at 0).
+        if (auto const nativeOp = opcode(MnemonicSlot::CtzNative);
+            nativeOp.has_value()) {
+            auto const r = emitNativeUnary(*nativeOp, in->reg, in->pWidth, regClassFor(id));
+            if (!r.has_value()) { poisonValue(id); return; }
+            defineValue(id, *r);
+            return;
+        }
+        // Rule 2 — RBIT then CLZ (arm64: reverse the bits, then leading-zeros of
+        // the reversed = trailing-zeros of the original; reuses the native CLZ).
+        // ctz(0): RBIT(0)=0, CLZ(0)=P. Requires BOTH — a target with rbit but no
+        // clz falls through to the SWAR (a legitimate realization, not fail-loud).
+        if (auto const rbitOp = opcode(MnemonicSlot::Rbit); rbitOp.has_value()) {
+            if (auto const clzOp = opcode(MnemonicSlot::ClzNative); clzOp.has_value()) {
+                auto const rev = emitNativeUnary(*rbitOp, in->reg, in->pWidth, regClassFor(id));
+                if (!rev.has_value()) { poisonValue(id); return; }
+                auto const r = emitNativeUnary(*clzOp, *rev, in->pWidth, regClassFor(id));
+                if (!r.has_value()) { poisonValue(id); return; }
+                defineValue(id, *r);
+                return;
+            }
+        }
+        // Rule 3 — SWAR fallback (neither TZCNT nor RBIT+CLZ).
+        auto const r = emitSwarCtz(in->reg, in->is64, in->pWidth);
+        if (!r.has_value()) { poisonValue(id); return; }
+        defineValue(id, *r);
     }
 
     // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): lower MIR `AtomicCas` — operands

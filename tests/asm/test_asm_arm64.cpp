@@ -616,6 +616,77 @@ TEST(Arm64Encoder, UmulhEncodesDataProc3SourceHighRegs) {
     EXPECT_EQ(bytes[3], 0x9B);
 }
 
+// ── FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): CLZ / RBIT ──
+//
+// The arm64 half of the native bit-count realization: CLZ (Clz's native op, the
+// `clz` verb shared with x86 LZCNT) + RBIT (arm64's ctz composes CLZ(RBIT(x))).
+// Both are data-processing 1-source (operand in Rn bits 9:5, result in Rd bits
+// 4:0). The opcode field (bits 15:10) discriminates CLZ (000100) from RBIT
+// (000000) — byte 1 (0x10 vs 0x00). The sf bit (byte 3, 0xDA vs 0x5A) picks the
+// 64- vs 32-bit form.
+
+namespace {
+[[nodiscard]] std::vector<std::uint8_t>
+assembleArm64Unary(char const* mnemonic, char const* dst, char const* src,
+                   bool width32) {
+    auto s = TargetSchema::loadShipped("arm64");
+    EXPECT_TRUE(s.has_value());
+    auto const op    = (*s)->opcodeByMnemonic(mnemonic);
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    EXPECT_TRUE(op.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const rd{static_cast<std::uint32_t>(*(*s)->registerByName(dst)), 1, cls};
+    LirReg const rn{static_cast<std::uint32_t>(*(*s)->registerByName(src)), 1, cls};
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(rn) };
+    (void)b.addInst(*op, rd, ops, /*payload=*/0,
+                    width32 ? ::dss::kLirInstFlagWidth32 : std::uint8_t{0});
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    return bytes;
+}
+} // namespace
+
+TEST(Arm64Encoder, ClzX3X4EncodesDataProc1Source) {
+    // clz x3, x4 — base 0xDAC01000 | Rn=x4(4)<<5=0x80 | Rd=x3(3) = 0xDAC01083
+    // → LE bytes: 83 10 C0 DA. The runtime witness is the qemu example arm.
+    auto const bytes = assembleArm64Unary("clz", "x3", "x4", /*width32=*/false);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x83);
+    EXPECT_EQ(bytes[1], 0x10);
+    EXPECT_EQ(bytes[2], 0xC0);
+    EXPECT_EQ(bytes[3], 0xDA);
+}
+
+TEST(Arm64Encoder, ClzW3W4EncodesWForm) {
+    // clz w3, w4 — the 32-bit form (sf=0): 0x5AC01000 | 0x80 | 3 = 0x5AC01083
+    // → LE bytes: 83 10 C0 5A. Byte 3 (0x5A vs 0xDA) pins the sf width bit.
+    auto const bytes = assembleArm64Unary("clz", "x3", "x4", /*width32=*/true);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x83);
+    EXPECT_EQ(bytes[1], 0x10);
+    EXPECT_EQ(bytes[2], 0xC0);
+    EXPECT_EQ(bytes[3], 0x5A);
+}
+
+TEST(Arm64Encoder, RbitX3X4EncodesDataProc1Source) {
+    // rbit x3, x4 — opcode field 000000 (vs CLZ's 000100): 0xDAC00000 | 0x80 | 3
+    // = 0xDAC00083 → LE bytes: 83 00 C0 DA. Byte 1 (0x00 vs 0x10) discriminates
+    // it from CLZ — a swap would silently miscompute ctz. Used by arm64 ctz.
+    auto const bytes = assembleArm64Unary("rbit", "x3", "x4", /*width32=*/false);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x83);
+    EXPECT_EQ(bytes[1], 0x00);
+    EXPECT_EQ(bytes[2], 0xC0);
+    EXPECT_EQ(bytes[3], 0xDA);
+}
+
 TEST(Arm64Encoder, LdaxrW0X1EncodesLoadAcquireExclusive) {
     // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): ldaxr w0, [x1] — load-acquire
     // exclusive, the LL half of the CAS retry loop. W-form base 0x885FFC00

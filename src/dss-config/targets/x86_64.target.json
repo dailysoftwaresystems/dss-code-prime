@@ -548,6 +548,75 @@
       }
     },
     {
+      "$comment": "FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): POPCNT r, r/m — population count (set bits). F3 0F B8 /r; width 64 adds REX.W (bytes F3 48 0F B8 /r), width 32 no REX.W (F3 0F B8 /r). ModR/M.reg = the GPR destination (resultSlot), ModR/M.rm = the source (wire 0) — the `fpcvt` mandatoryPrefix + modrm.reg-dest shape. The mandatoryPrefix F3 emits BEFORE the auto-REX (the fpcvt/lock_cmpxchg legacy-prefix-then-REX order). MIR Popcount's NATIVE realization; a target NOT declaring `popcount` (arm64) takes the SWAR fallback. `popcount` (verb) not `popcnt` — the DSS internal mnemonic is the semantic verb (a future arm64 NEON CNT would share this slot).",
+      "mnemonic": "popcount", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [243], "rexW": true, "opcode": [15, 184] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [243], "opcode": [15, 184] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): LZCNT r, r/m — count leading zeros, DEFINED at 0 = operand width (32/64) — unlike BSR (UB at 0). F3 0F BD /r; width 64 adds REX.W. Same modrm.reg-dest + F3-mandatoryPrefix shape as popcount. MIR Clz's NATIVE realization; the DSS verb is `clz` (shared with arm64 CLZ — same semantics, defined =width at 0). Assumes an x86-64 baseline with ABM/LZCNT (as the umulh/cmpxchg intrinsics already assume a modern baseline); a target without it would drop the `clz` row and take the SWAR fallback.",
+      "mnemonic": "clz", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [243], "rexW": true, "opcode": [15, 189] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [243], "opcode": [15, 189] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): TZCNT r, r/m — count trailing zeros, DEFINED at 0 = operand width (32/64) — unlike BSF (UB at 0). F3 0F BC /r; width 64 adds REX.W. Same shape. MIR Ctz's NATIVE realization (DSS verb `ctz`); arm64 has no scalar TZCNT and composes RBIT-then-CLZ instead. BMI1 baseline assumption (as LZCNT above).",
+      "mnemonic": "ctz", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [243], "rexW": true, "opcode": [15, 188] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [243], "opcode": [15, 188] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS) — atomic compare-and-swap, mem-dest: LOCK CMPXCHG [base+disp32], reg (LOCK 0xF0 mandatoryPrefix + 0x0F 0xB1 /r). Semantics: compares RAX/EAX (the implicit 'comparand' input-role) with [mem]; equal -> stores the wired reg (the NEW value, modrm.reg); unequal -> loads [mem] into RAX/EAX. EITHER way RAX ends holding the ORIGINAL observed value (the 'old' output-role the MIR AtomicCas lowering captures). LOCK makes it a full barrier — the correct strength for Win32 InterlockedCompareExchange. Operand shape mirrors `store`'s 4-op mem-dest form: [newval_reg, base_reg, MemBase(scale), MemOffset(disp)]. mandatoryPrefix [240] emits BEFORE the auto-REX (the 0x66 width-16-store precedent — legacy prefixes precede REX, REX immediately precedes the opcode), so a high-numbered base/newval register REX.B/R composes correctly: F0 [REX] 0F B1 /r. Width 32 = the Win32 LONG (LLP64) CAS — NO rexW; width 64 for completeness (a future 64-bit CAS consumer). implicitRegisters: inputs=[rax] (the comparand), outputs/clobbered=[rax] (the observed-original; outputs ⊆ clobbered).",
       "mnemonic":      "lock_cmpxchg",
       "result":        "none",

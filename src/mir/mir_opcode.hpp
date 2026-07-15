@@ -69,6 +69,20 @@ enum class MirOpcode : std::uint16_t {
     FAdd, FSub, FMul, FDiv, FNeg,
     // ── bitwise ──
     And, Or, Xor, Shl, LShr, AShr, Not,
+    // FC17.9(b) walking-skeleton (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 hardware
+    // bit-count primitives — the C23 <stdbit.h> substrate the 14 stdc_* ops build
+    // on. Each is a PURE UNARY compute (one operand, one result, at the operand's
+    // promotion width P∈{32,64}), mirroring UMulH: non-terminator, no side effect,
+    // NOT commutative/memory-clobbering, NOT const-folded (so absent from those
+    // switches). Clz/Ctz are DEFINED at 0 = P (x86 LZCNT/TZCNT + arm64 CLZ
+    // semantics — NOT the x86-BSR/BSF UB-at-0), a safe superset of GCC's UB-at-0
+    // __builtin_clz/ctz. Lowered native-or-SWAR at mir_to_lir (lowerPopcount/
+    // lowerClz/lowerCtz): a target that declares the popcount/clz/ctz mnemonic
+    // emits the hardware instruction; one that does not gets a branchless SWAR
+    // bit-trick sequence over the universal ALU verbs — the capability probe reads
+    // `opcode(MnemonicSlot::…Native)`, never an arch identity. (arm64 has no scalar
+    // GPR popcount → SWAR, runtime-witnessed on the arm64-elf example arm.)
+    Popcount, Clz, Ctz,
     // ── integer comparison (result = Bool/i1) ──
     ICmpEq, ICmpNe, ICmpSlt, ICmpSle, ICmpSgt, ICmpSge,
     ICmpUlt, ICmpUle, ICmpUgt, ICmpUge,
@@ -367,6 +381,15 @@ struct MirOpcodeInfo {
         case MirOpcode::LShr: return {2, 2, 0, 0, R::Value, false, false, false, "lshr"};
         case MirOpcode::AShr: return {2, 2, 0, 0, R::Value, false, false, false, "ashr"};
         case MirOpcode::Not:  return {1, 1, 0, 0, R::Value, false, false, false, "not"};
+
+        // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): unary hardware bit-count
+        // primitives. Pure like UMulH — {1,1} arity, result Value, no side effect,
+        // not a terminator, not phi (so — like UMulH — they are intentionally
+        // absent from the isCommutative / opcodeClobbersMemory / const_fold
+        // switches). Operand + result operate at the operand's promotion width P.
+        case MirOpcode::Popcount: return {1, 1, 0, 0, R::Value, false, false, false, "popcount"};
+        case MirOpcode::Clz:      return {1, 1, 0, 0, R::Value, false, false, false, "clz"};
+        case MirOpcode::Ctz:      return {1, 1, 0, 0, R::Value, false, false, false, "ctz"};
 
         // integer comparison.
         case MirOpcode::ICmpEq:  return {2, 2, 0, 0, R::Value, false, false, false, "icmp.eq"};

@@ -44,14 +44,20 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     // CU-wide builtins scope): c103 `__umulh` (D-CSUBSET-INTRINSIC-UMULH) + c104
     // `_InterlockedCompareExchange` (D-CSUBSET-INTRINSIC-ATOMIC-CAS) + c113
     // `_ReadWriteBarrier` (D-CSUBSET-INTRINSIC-BARRIER) + c115 `_exception_code`
-    // + `_exception_info` (D-WIN64-SEH-FUNCLETS SEH intrinsics) + the 2 FC17.5
+    // + `_exception_info` (D-WIN64-SEH-FUNCLETS SEH intrinsics) + the 6 FC17.9(b)
+    // bit-count builtins (`__builtin_{popcount,clz,ctz}{,ll}`,
+    // D-CSUBSET-BITCOUNT-INTRINSICS) + the 2 FC17.5
     // predefined function-name symbols (`__func__` + `__FUNCTION__`, C99
     // 6.4.2.2 — one per configured spelling per function DEFINITION, bound into
-    // main's own scope; D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
-    ASSERT_EQ(model.symbols().size() - 1, 11u)
+    // main's own scope; D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER) + the 56 FC17.9(b)
+    // C23 <stdbit.h> `__builtin_stdc_<op>_<T>` intrinsics (14 ops × 4 widths,
+    // always-injected like every other builtin; D-FULLC-STDBIT).
+    ASSERT_EQ(model.symbols().size() - 1, 73u)
         << "main + x + __va_list_tag + va_list + __umulh + "
            "_InterlockedCompareExchange + _ReadWriteBarrier + "
-           "_exception_code + _exception_info + __func__ + __FUNCTION__";
+           "_exception_code + _exception_info + the 6 __builtin bit-count "
+           "intrinsics + the 56 __builtin_stdc_* <stdbit.h> intrinsics + "
+           "__func__ + __FUNCTION__";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xRec = &model.symbols()[i];
@@ -2289,10 +2295,13 @@ TEST(SemanticAnalyzerCSubset, NestedBlocksShadowWithoutRedecl) {
     // main (function) + two distinct `x` symbols (one per block scope) + the 2
     // FC12a-core builtin TYPES (__va_list_tag + va_list) + the 5 intrinsic
     // builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
-    // _ReadWriteBarrier + c115 _exception_code + _exception_info) + the 2
-    // FC17.5 predefined function-name symbols (__func__ + __FUNCTION__, per
+    // _ReadWriteBarrier + c115 _exception_code + _exception_info) + the 6
+    // FC17.9(b) bit-count builtins (__builtin_{popcount,clz,ctz}{,ll},
+    // D-CSUBSET-BITCOUNT-INTRINSICS) + the 56 FC17.9(b) <stdbit.h>
+    // __builtin_stdc_<op>_<T> intrinsics (14 ops × 4 widths, D-FULLC-STDBIT) +
+    // the 2 FC17.5 predefined function-name symbols (__func__ + __FUNCTION__, per
     // function definition — D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
-    EXPECT_EQ(model.symbols().size() - 1, 12u);
+    EXPECT_EQ(model.symbols().size() - 1, 74u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -2310,9 +2319,11 @@ TEST(SemanticAnalyzerCSubset, ForwardReferenceWithinBlock) {
     // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
     // (__va_list_tag + va_list) + the 5 intrinsic builtins (c103 __umulh +
     // c104 _InterlockedCompareExchange + c113 _ReadWriteBarrier + c115
-    // _exception_code + _exception_info) + the 2 FC17.5 predefined
-    // function-name symbols (__func__ + __FUNCTION__). Find x by name.
-    ASSERT_EQ(model.symbols().size() - 1, 11u);
+    // _exception_code + _exception_info) + the 6 FC17.9(b) bit-count builtins
+    // (__builtin_{popcount,clz,ctz}{,ll}, D-CSUBSET-BITCOUNT-INTRINSICS) + the 56
+    // FC17.9(b) <stdbit.h> __builtin_stdc_<op>_<T> intrinsics (D-FULLC-STDBIT) +
+    // the 2 FC17.5 predefined function-name symbols (__func__ + __FUNCTION__). Find x by name.
+    ASSERT_EQ(model.symbols().size() - 1, 73u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -4669,12 +4680,16 @@ TEST(SemanticAnalyzerCSubset, ValueStarValueStaysExpressionStatement) {
     EXPECT_FALSE(model.hasErrors());
     // main + a + b + the 2 FC12a-core builtin TYPES (__va_list_tag + va_list) + the
     // 5 intrinsic builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
-    // _ReadWriteBarrier + c115 _exception_code + _exception_info) + the 2 FC17.5
+    // _ReadWriteBarrier + c115 _exception_code + _exception_info) + the 6 FC17.9(b)
+    // bit-count builtins (__builtin_{popcount,clz,ctz}{,ll},
+    // D-CSUBSET-BITCOUNT-INTRINSICS) + the 56 FC17.9(b) <stdbit.h>
+    // __builtin_stdc_<op>_<T> intrinsics (D-FULLC-STDBIT) + the 2 FC17.5
     // predefined function-name symbols (__func__ + __FUNCTION__) — the
     // multiplication must mint NO symbol.
-    EXPECT_EQ(model.symbols().size() - 1, 12u)
+    EXPECT_EQ(model.symbols().size() - 1, 74u)
         << "main + a + b + __va_list_tag + va_list + the 5 intrinsic builtins + "
-           "__func__ + __FUNCTION__ — the multiplication mints none";
+           "the 6 __builtin bit-count intrinsics + the 56 __builtin_stdc_* "
+           "<stdbit.h> intrinsics + __func__ + __FUNCTION__ — the multiplication mints none";
 }
 
 // UNKNOWN `u * v;` (no `u` anywhere, single file) — the oracle-candidate

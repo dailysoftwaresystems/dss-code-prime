@@ -9425,3 +9425,241 @@ TEST(MirLoweringCSubset, ParamPtrToVlaSubscriptScalesByPrologueStrideSlot) {
     EXPECT_EQ(gStrideSlots, 1)
         << "a ptr-to-VLA PARAM freezes exactly ONE pointee-stride slot in the prologue";
 }
+
+// FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): each of the 6 GCC-compat builtins
+// __builtin_{popcount,clz,ctz}{,ll} lowers to its DEDICATED pure-unary MIR op
+// (Popcount/Clz/Ctz) — NOT a Call (a compiler intrinsic is not a linkable symbol).
+// The {,ll} pair shares one lowering, so each op appears twice. The op's operand
+// is the wrapper's Arg (single-eval) and its result core is I32 (the GCC `int`).
+TEST(MirLoweringCSubset, BitCountBuiltinsLowerToDedicatedMirOps) {
+    auto L = lowerCSubset(
+        "typedef unsigned int u32;\n"
+        "typedef unsigned long long u64;\n"
+        "int pc32(u32 x){return __builtin_popcount(x);}\n"
+        "int pc64(u64 x){return __builtin_popcountll(x);}\n"
+        "int lz32(u32 x){return __builtin_clz(x);}\n"
+        "int lz64(u64 x){return __builtin_clzll(x);}\n"
+        "int tz32(u32 x){return __builtin_ctz(x);}\n"
+        "int tz64(u64 x){return __builtin_ctzll(x);}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "semantic phase: " << (L.model.diagnostics().all().empty()
+            ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "HIR lowering: " << (L.hirReporter.all().empty()
+            ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    int nPop = 0, nClz = 0, nCtz = 0, nCall = 0;
+    MirInstId popInst{};
+    for (std::size_t f = 0; f < m.moduleFuncCount(); ++f) {
+        MirFuncId const fn = m.funcAt(static_cast<std::uint32_t>(f));
+        MirBlockId const entry = m.funcEntry(fn);
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+            MirInstId const id = m.blockInstAt(entry, i);
+            switch (m.instOpcode(id)) {
+                case MirOpcode::Popcount: ++nPop; popInst = id; break;
+                case MirOpcode::Clz:      ++nClz; break;
+                case MirOpcode::Ctz:      ++nCtz; break;
+                case MirOpcode::Call:     ++nCall; break;
+                default: break;
+            }
+        }
+    }
+    EXPECT_EQ(nPop, 2);
+    EXPECT_EQ(nClz, 2);
+    EXPECT_EQ(nCtz, 2);
+    EXPECT_EQ(nCall, 0) << "a compiler intrinsic must not lower to a Call";
+
+    // Structural: Popcount is unary, its operand is the fn's Arg, result core I32.
+    ASSERT_GT(nPop, 0);
+    auto const popOps = m.instOperands(popInst);
+    ASSERT_EQ(popOps.size(), 1u);
+    EXPECT_EQ(m.instOpcode(popOps[0]), MirOpcode::Arg);
+    EXPECT_EQ(interner.kind(m.instType(popInst)), TypeKind::I32);
+}
+
+// ── FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 stdc_* op MIR-shape pins ──
+// Each `__builtin_stdc_<op>_<T>` lowers (hir_to_mir emitStdbitOp) to a width-correct
+// BRANCHLESS composition of the 3 primitives (Popcount/Clz/Ctz) + universal ALU
+// verbs — NO new MIR op, NO Call, single straight-line block. The builtins are
+// always-injected, so no <stdbit.h> include is needed to reach the composition.
+namespace {
+// The composition is branchless → every op is in some function's entry block.
+[[nodiscard]] std::vector<MirInstId> stdbitAllEntryInsts(Mir const& m) {
+    std::vector<MirInstId> out;
+    for (std::size_t f = 0; f < m.moduleFuncCount(); ++f) {
+        MirFuncId const fn    = m.funcAt(static_cast<std::uint32_t>(f));
+        MirBlockId const entry = m.funcEntry(fn);
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i)
+            out.push_back(m.blockInstAt(entry, i));
+    }
+    return out;
+}
+[[nodiscard]] int stdbitCountOp(Mir const& m, std::vector<MirInstId> const& ids,
+                                MirOpcode op) {
+    int n = 0;
+    for (MirInstId id : ids) if (m.instOpcode(id) == op) ++n;
+    return n;
+}
+[[nodiscard]] MirInstId stdbitFirstOp(Mir const& m, std::vector<MirInstId> const& ids,
+                                      MirOpcode op) {
+    for (MirInstId id : ids) if (m.instOpcode(id) == op) return id;
+    return MirInstId{};
+}
+} // namespace
+
+// leading_zeros = clz(x) − (P − W): a single Clz, NO Popcount/Ctz/Shl.
+TEST(MirLoweringCSubset, StdbitLeadingZerosComposesClz) {
+    auto L = lowerCSubset(
+        "unsigned f(unsigned char x){ return __builtin_stdc_leading_zeros_uc(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Clz), 1);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Popcount), 0);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Ctz), 0);
+    EXPECT_GE(stdbitCountOp(m, ids, MirOpcode::Sub), 1);   // − (P−W)
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Shl), 0);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Call), 0)
+        << "a stdc_* intrinsic must not lower to a Call";
+}
+
+// count_ones = popcount(x): a single Popcount, NO Clz/Ctz.
+TEST(MirLoweringCSubset, StdbitCountOnesComposesPopcount) {
+    auto L = lowerCSubset(
+        "unsigned f(unsigned int x){ return __builtin_stdc_count_ones_ui(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Popcount), 1);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Clz), 0);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Ctz), 0);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Call), 0);
+}
+
+// bit_width = P − clz(x): a single Clz + a Sub, NO Popcount/Shl (clz(0)=P → 0, no guard).
+TEST(MirLoweringCSubset, StdbitBitWidthComposesClzSub) {
+    auto L = lowerCSubset(
+        "unsigned f(unsigned short x){ return __builtin_stdc_bit_width_us(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Clz), 1);
+    EXPECT_GE(stdbitCountOp(m, ids, MirOpcode::Sub), 1);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Popcount), 0);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Shl), 0);
+}
+
+// has_single_bit = popcount(x)==1: a Popcount feeding an ICmpEq whose result IS Bool.
+TEST(MirLoweringCSubset, StdbitHasSingleBitIsPopcountEqOneBool) {
+    auto L = lowerCSubset(
+        "int f(unsigned int x){ return __builtin_stdc_has_single_bit_ui(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Popcount), 1);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Clz), 0);
+    MirInstId const eq = stdbitFirstOp(m, ids, MirOpcode::ICmpEq);
+    ASSERT_TRUE(eq.valid());
+    EXPECT_EQ(interner.kind(m.instType(eq)), TypeKind::Bool)
+        << "has_single_bit's compare must be the Bool result (C23 returns bool)";
+}
+
+// first_leading_one = x==0 ? 0 : leading_zeros+1: a Clz + an Add + a branchless
+// select (the Or of the two masked arms), NO Popcount/Ctz.
+TEST(MirLoweringCSubset, StdbitFirstLeadingOneComposesClzSelect) {
+    auto L = lowerCSubset(
+        "unsigned f(unsigned char x){ return __builtin_stdc_first_leading_one_uc(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_GE(stdbitCountOp(m, ids, MirOpcode::Clz), 1);
+    EXPECT_GE(stdbitCountOp(m, ids, MirOpcode::Add), 1);   // +1
+    EXPECT_GE(stdbitCountOp(m, ids, MirOpcode::Or), 1);    // the branchless select
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Popcount), 0);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Ctz), 0);
+}
+
+// bit_ceil = a Clz + a Shl + an And (the W−1 mask): the branchless power-of-two ceil.
+TEST(MirLoweringCSubset, StdbitBitCeilComposesClzShlAndMask) {
+    auto L = lowerCSubset(
+        "unsigned f(unsigned int x){ return __builtin_stdc_bit_ceil_ui(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Clz), 1);
+    EXPECT_GE(stdbitCountOp(m, ids, MirOpcode::Shl), 1);
+    EXPECT_GE(stdbitCountOp(m, ids, MirOpcode::And), 1);   // the (W−1) clamp mask
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Popcount), 0);
+}
+
+// ★ RED-ON-DISABLE shift-clamp pin (audit I3): bit_floor's `1 << amt` amount MUST be
+// the CLAMPED `bit_width − (x≠0)` — i.e. Shl.operand[1] is a Sub whose RHS is a ZExt
+// of an ICmpNe, NOT a bare `bit_width − 1` (Const). The branchless composition ALWAYS
+// evaluates the shift (the outer sel only discards its RESULT for x==0), so the shift
+// amount must be in range on EVERY path: the clamp yields amt=0 at x==0, whereas a bare
+// `bw − 1` would emit `1 << (0−1)` — an out-of-range (UB) shift in the always-evaluated
+// arm. Removing the clamp puts a Const at Sub.operand[1] → this pin FAILS, as it must.
+TEST(MirLoweringCSubset, StdbitBitFloorShiftAmountIsClampedNotBareMinusOne) {
+    auto L = lowerCSubset(
+        "unsigned f(unsigned char x){ return __builtin_stdc_bit_floor_uc(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    ASSERT_EQ(stdbitCountOp(m, ids, MirOpcode::Shl), 1) << "bit_floor has exactly one shift";
+    ASSERT_EQ(stdbitCountOp(m, ids, MirOpcode::Clz), 1);
+    MirInstId const shl = stdbitFirstOp(m, ids, MirOpcode::Shl);
+    ASSERT_TRUE(shl.valid());
+    auto const shlOps = m.instOperands(shl);
+    ASSERT_EQ(shlOps.size(), 2u);
+    // Shl.operand[1] = amt = Sub(bit_width, ZExt(ICmpNe(x, 0))).
+    MirInstId const amt = shlOps[1];
+    ASSERT_EQ(m.instOpcode(amt), MirOpcode::Sub)
+        << "the shift amount must be a Sub (bit_width − (x≠0)), the clamped form";
+    auto const subOps = m.instOperands(amt);
+    ASSERT_EQ(subOps.size(), 2u);
+    // The SECOND Sub operand is the clamp term — a ZExt of a compare, NOT a Const 1.
+    MirInstId const clampTerm = subOps[1];
+    EXPECT_NE(m.instOpcode(clampTerm), MirOpcode::Const)
+        << "an unguarded `1 << (bit_width − 1)` (Const 1 here) is a shift-UB regression";
+    ASSERT_EQ(m.instOpcode(clampTerm), MirOpcode::ZExt);
+    auto const zextOps = m.instOperands(clampTerm);
+    ASSERT_EQ(zextOps.size(), 1u);
+    EXPECT_EQ(m.instOpcode(zextOps[0]), MirOpcode::ICmpNe)
+        << "the clamp is ZExt(x != 0) → amt ∈ [0, W−1] on every branch";
+}
+
+// ★ RED-ON-DISABLE shift-clamp pin (audit I-1): bit_ceil's `1 << amt` amount MUST be the
+// CLAMPED `bit_width(x−1) & (W−1)` — the And keeps amt ∈ [0, W−1] so the ALWAYS-evaluated
+// branchless shift is never out-of-range, even for the overflow input the outer sel discards.
+// The earlier `EXPECT_GE(And, 1)` pin was INERT: bit_ceil's two branchless selects already
+// emit 4 Ands, so dropping the clamp And still left ≥1 → green. This pins the SHIFT's operand
+// chain instead: remove the clamp and Shl.operand[1] becomes the bare `Sub` (bit_width(x−1)) →
+// this ASSERT_EQ(...And) FAILS, exactly as a red-on-disable clamp pin must.
+TEST(MirLoweringCSubset, StdbitBitCeilShiftAmountIsClampedNotBareBitWidth) {
+    auto L = lowerCSubset(
+        "unsigned f(unsigned int x){ return __builtin_stdc_bit_ceil_ui(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    ASSERT_EQ(stdbitCountOp(m, ids, MirOpcode::Shl), 1) << "bit_ceil has exactly one shift";
+    MirInstId const shl = stdbitFirstOp(m, ids, MirOpcode::Shl);
+    ASSERT_TRUE(shl.valid());
+    auto const shlOps = m.instOperands(shl);
+    ASSERT_EQ(shlOps.size(), 2u);
+    // Shl.operand[1] = amt = And(bit_width(x−1), Const(W−1)) — the clamp op.
+    MirInstId const amt = shlOps[1];
+    ASSERT_EQ(m.instOpcode(amt), MirOpcode::And)
+        << "the shift amount must be And(bit_width(x−1), W−1), the clamped form — "
+           "a bare Sub (bit_width) here is the shift-UB regression";
+    auto const andOps = m.instOperands(amt);
+    ASSERT_EQ(andOps.size(), 2u);
+    // The clamp masks against the (W−1) constant.
+    EXPECT_EQ(m.instOpcode(andOps[1]), MirOpcode::Const)
+        << "the clamp mask (W−1) must be a Const";
+}

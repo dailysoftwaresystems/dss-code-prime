@@ -55,6 +55,13 @@ bar **stops and reports** — it never pushes a partial or a workaround.
    (exact counts, full-sequence/byte equality, `static_assert`, death-test message match).
    See the `dss-code-prime` skill §7. A test that still passes when the implementation is
    silently broken is not strict enough.
+   - **Aggregate op-count pins go INERT when a shared helper emits the same op elsewhere.** An
+     `EXPECT_GE(And, N)` / op-count assertion is a worthless guard if a branchless-select (or any
+     composition helper) already emits that op — deleting the guarded instance leaves the count
+     satisfied and the test green (the FC17.9(b) `bit_ceil` shift-clamp pin was inert exactly so:
+     two `sel()`s emitted 4 `And`s, so dropping the clamp `And` stayed green). Pin the guarded
+     value's **operand chain** (e.g. assert `Shl.operand[1]` IS the clamp `And`, not a bare `Sub`)
+     and **demonstrate red-on-disable** by actually removing the guard, not merely asserting present.
    - **Multi-site / multi-form contracts** — the "apply X at every site/form of class C"
      class (e.g. "strip the specifier prefix at every positional decl resolution"). A green
      suite over a SUBSET of the sites/forms is NOT proof: latent misses at the unexercised

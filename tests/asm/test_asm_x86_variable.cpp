@@ -580,6 +580,105 @@ TEST(X86VariableEncoder, ZextRaxRaxEmits48_0F_B6_C0) {
     EXPECT_EQ(bytes[4], 0xC3);
 }
 
+// ── FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): POPCNT / LZCNT / TZCNT ──
+//
+// The 3 hardware bit-count primitives. All share the `fpcvt` shape — an F3
+// mandatoryPrefix (emitted BEFORE the auto-REX) + a 2-byte 0F opcode + ModR/M.reg
+// destination / ModR/M.rm source. The 64-bit form adds REX.W (F3 48 0F xx C0),
+// the 32-bit form omits it (F3 0F xx C0). These pins discriminate the three
+// opcodes (B8 / BD / BC) and the REX.W-vs-not width split — a schema opcode swap
+// or a dropped rexW fails at the exact byte.
+
+namespace {
+// Assemble `<mnemonic> rax, rax` (or eax,eax when width32) + the trailing ret,
+// returning the function bytes. rax = ordinal 0 (no REX.B/R), so the only REX is
+// the width-64 REX.W.
+[[nodiscard]] std::vector<std::uint8_t>
+assembleUnaryRaxRax(char const* mnemonic, bool width32) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(schema.has_value());
+    auto const op = (*schema)->opcodeByMnemonic(mnemonic);
+    EXPECT_TRUE(op.has_value());
+    auto const raxOrd = (*schema)->registerByName("rax");
+    EXPECT_TRUE(raxOrd.has_value());
+    LirReg const rax{static_cast<std::uint32_t>(*raxOrd),
+                     /*isPhysical=*/1,
+                     /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = { LirOperand::makeReg(rax) };
+        (void)b.addInst(*op, rax, ops, /*payload=*/0,
+                        width32 ? ::dss::kLirInstFlagWidth32 : std::uint8_t{0});
+    });
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    return bytes;
+}
+} // namespace
+
+TEST(X86VariableEncoder, PopcntRaxRax64EmitsF3_48_0F_B8_C0) {
+    auto const bytes = assembleUnaryRaxRax("popcount", /*width32=*/false);
+    ASSERT_EQ(bytes.size(), 6u);
+    EXPECT_EQ(bytes[0], 0xF3);  // mandatoryPrefix (before REX)
+    EXPECT_EQ(bytes[1], 0x48);  // REX.W
+    EXPECT_EQ(bytes[2], 0x0F);
+    EXPECT_EQ(bytes[3], 0xB8);  // POPCNT
+    EXPECT_EQ(bytes[4], 0xC0);  // ModR/M reg=rax rm=rax
+    EXPECT_EQ(bytes[5], 0xC3);  // ret
+}
+
+TEST(X86VariableEncoder, PopcntEaxEax32EmitsF3_0F_B8_C0) {
+    auto const bytes = assembleUnaryRaxRax("popcount", /*width32=*/true);
+    ASSERT_EQ(bytes.size(), 5u);
+    EXPECT_EQ(bytes[0], 0xF3);  // no REX.W in the 32-bit form
+    EXPECT_EQ(bytes[1], 0x0F);
+    EXPECT_EQ(bytes[2], 0xB8);
+    EXPECT_EQ(bytes[3], 0xC0);
+    EXPECT_EQ(bytes[4], 0xC3);
+}
+
+TEST(X86VariableEncoder, LzcntRaxRax64EmitsF3_48_0F_BD_C0) {
+    auto const bytes = assembleUnaryRaxRax("clz", /*width32=*/false);
+    ASSERT_EQ(bytes.size(), 6u);
+    EXPECT_EQ(bytes[0], 0xF3);
+    EXPECT_EQ(bytes[1], 0x48);
+    EXPECT_EQ(bytes[2], 0x0F);
+    EXPECT_EQ(bytes[3], 0xBD);  // LZCNT (discriminated from POPCNT B8 / TZCNT BC)
+    EXPECT_EQ(bytes[4], 0xC0);
+    EXPECT_EQ(bytes[5], 0xC3);
+}
+
+TEST(X86VariableEncoder, LzcntEaxEax32EmitsF3_0F_BD_C0) {
+    auto const bytes = assembleUnaryRaxRax("clz", /*width32=*/true);
+    ASSERT_EQ(bytes.size(), 5u);
+    EXPECT_EQ(bytes[0], 0xF3);
+    EXPECT_EQ(bytes[1], 0x0F);
+    EXPECT_EQ(bytes[2], 0xBD);
+    EXPECT_EQ(bytes[3], 0xC0);
+    EXPECT_EQ(bytes[4], 0xC3);
+}
+
+TEST(X86VariableEncoder, TzcntRaxRax64EmitsF3_48_0F_BC_C0) {
+    auto const bytes = assembleUnaryRaxRax("ctz", /*width32=*/false);
+    ASSERT_EQ(bytes.size(), 6u);
+    EXPECT_EQ(bytes[0], 0xF3);
+    EXPECT_EQ(bytes[1], 0x48);
+    EXPECT_EQ(bytes[2], 0x0F);
+    EXPECT_EQ(bytes[3], 0xBC);  // TZCNT
+    EXPECT_EQ(bytes[4], 0xC0);
+    EXPECT_EQ(bytes[5], 0xC3);
+}
+
+TEST(X86VariableEncoder, TzcntEaxEax32EmitsF3_0F_BC_C0) {
+    auto const bytes = assembleUnaryRaxRax("ctz", /*width32=*/true);
+    ASSERT_EQ(bytes.size(), 5u);
+    EXPECT_EQ(bytes[0], 0xF3);
+    EXPECT_EQ(bytes[1], 0x0F);
+    EXPECT_EQ(bytes[2], 0xBC);
+    EXPECT_EQ(bytes[3], 0xC0);
+    EXPECT_EQ(bytes[4], 0xC3);
+}
+
 // ── D-CSUBSET-DIVISION-OP-CODEGEN byte-pins (cycle 10r split, 2026-06-04) ──
 //
 // Cycle 10r splits the cycle-10q compound opcodes into separate pre

@@ -58,7 +58,9 @@ struct Lowered {
     MirToLirResult                   lir;
 };
 
-[[nodiscard]] Lowered lowerCSubsetToLir(std::string src) {
+[[nodiscard]] Lowered lowerCSubsetToLir(
+        std::string src,
+        std::shared_ptr<TargetSchema> customTarget = nullptr) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
     UnitBuilder builder{*loaded};
@@ -74,10 +76,17 @@ struct Lowered {
     // alloca's element STRIDE (sizeof(int)) resolves at MIR (cachedLayout gates on
     // aggregateLayoutLoaded — even a scalar element needs it). Harmless for the
     // existing scalar-only pins. Load the target here (also reused below).
-    auto target = TargetSchema::loadShipped("x86_64");
-    if (!target) { ADD_FAILURE() << "loadShipped(x86_64) failed"; std::abort(); }
-    mirCfg.aggregateLayout       = (*target)->aggregateLayout();
-    mirCfg.aggregateLayoutLoaded = (*target)->aggregateLayoutLoaded();
+    // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): a caller may pass a mutated
+    // target (e.g. shipped x86_64 minus the `popcount` mnemonic) to exercise the
+    // SWAR fallback; default (nullptr) = the shipped x86_64.
+    std::shared_ptr<TargetSchema> tgt = std::move(customTarget);
+    if (!tgt) {
+        auto loadedTarget = TargetSchema::loadShipped("x86_64");
+        if (!loadedTarget) { ADD_FAILURE() << "loadShipped(x86_64) failed"; std::abort(); }
+        tgt = *loadedTarget;
+    }
+    mirCfg.aggregateLayout       = tgt->aggregateLayout();
+    mirCfg.aggregateLayoutLoaded = tgt->aggregateLayoutLoaded();
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
@@ -87,14 +96,14 @@ struct Lowered {
                                     /*threadLocalMap=*/nullptr,
                                     &hir->vlaSizeExprBySymbol);   // VLA C1a
     DiagnosticReporter lirReporter;
-    auto lir = lowerToLir(mir.mir, **target, model.lattice().interner(), lirReporter);
+    auto lir = lowerToLir(mir.mir, *tgt, model.lattice().interner(), lirReporter);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
         .hirReporter = std::move(hirReporter),
         .mir         = std::move(mir),
         .mirReporter = std::move(mirReporter),
-        .target      = std::move(*target),
+        .target      = std::move(tgt),
         .lirReporter = std::move(lirReporter),
         .lir         = std::move(lir),
     };
@@ -4941,4 +4950,77 @@ TEST(MirToLir, VlaOverAlignedElementFailsLoud) {
     }
     EXPECT_TRUE(sawOverAlign)
         << "an over-aligned VLA element must surface L_OverAlignedStackLocal";
+}
+
+// ── FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): native-vs-SWAR lowering ─────────
+
+namespace {
+// Count LIR insts whose opcode equals the named mnemonic across every function.
+[[nodiscard]] int countLirOp(Lir const& lir, TargetSchema const& sch,
+                             char const* mnemonic) {
+    auto const op = sch.opcodeByMnemonic(mnemonic);
+    if (!op.has_value()) return 0;
+    int n = 0;
+    for (std::size_t f = 0; f < lir.moduleFuncCount(); ++f) {
+        LirFuncId const fn = lir.funcAt(static_cast<std::uint32_t>(f));
+        for (std::uint32_t b = 0; b < lir.funcBlockCount(fn); ++b) {
+            LirBlockId const bb = lir.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+                if (lir.instOpcode(lir.blockInstAt(bb, i)) == *op) ++n;
+            }
+        }
+    }
+    return n;
+}
+} // namespace
+
+// On x86_64 the 3 primitives lower to their NATIVE hardware instructions (the
+// popcount/clz/ctz mnemonics are declared) — one op each, no SWAR multiply.
+TEST(MirToLir, BitCountLowersToNativeOnX86) {
+    auto L = lowerCSubsetToLir(
+        "typedef unsigned int u32;\n"
+        "int pc(u32 x){return __builtin_popcount(x);}\n"
+        "int lz(u32 x){return __builtin_clz(x);}\n"
+        "int tz(u32 x){return __builtin_ctz(x);}\n");
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "LIR lowering: " << (L.lirReporter.all().empty()
+            ? "" : L.lirReporter.all()[0].actual);
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    EXPECT_EQ(countLirOp(lir, sch, "popcount"), 1);  // POPCNT
+    EXPECT_EQ(countLirOp(lir, sch, "clz"), 1);        // LZCNT
+    EXPECT_EQ(countLirOp(lir, sch, "ctz"), 1);        // TZCNT
+    EXPECT_EQ(countLirOp(lir, sch, "mul"), 0)
+        << "the native path emits no SWAR multiply";
+}
+
+// RED-ON-DISABLE: drop the `popcount` mnemonic from x86_64 and MIR Popcount MUST
+// lower to the SWAR bit-trick sequence (a `mul` by the 0x0101.. magic + the
+// 0x55/0x33/0x0F masks) — NOT fail loud, NOT a `popcount` op. This proves the
+// fallback is REAL (arm64 declares no popcount, so it lands here at runtime — the
+// runnable example `builtin_bitcount` witnesses the SWAR result on qemu-arm64).
+TEST(MirToLir, PopcountFallsBackToSwarWhenNoNativeMnemonic) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaJson(
+        "x86_64", {"popcount"});
+    ASSERT_TRUE(mutated.has_value())
+        << "mutateShippedTargetSchemaJson(x86_64, -popcount) failed";
+    auto L = lowerCSubsetToLir(
+        "int pc(unsigned int x){return __builtin_popcount(x);}\n", *mutated);
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "the SWAR fallback must lower cleanly, NOT fail loud: "
+        << (L.lirReporter.all().empty() ? "" : L.lirReporter.all()[0].actual);
+    auto const& sch = *L.target;
+    // The mnemonic really was removed → the native probe returns nullopt.
+    EXPECT_FALSE(sch.opcodeByMnemonic("popcount").has_value());
+    Lir const& lir = L.lir.lir;
+    EXPECT_EQ(countLirOp(lir, sch, "popcount"), 0)
+        << "no native popcount when the mnemonic is absent";
+    EXPECT_GE(countLirOp(lir, sch, "mul"), 1)
+        << "the SWAR popcount's distinctive 0x0101.. multiply";
+    EXPECT_GE(countLirOp(lir, sch, "and"), 3)
+        << "the SWAR popcount masks with 0x55/0x33/0x0F";
+    EXPECT_GE(countLirOp(lir, sch, "sub"), 1)
+        << "the SWAR popcount's x -= (x>>1)&m1 step";
 }

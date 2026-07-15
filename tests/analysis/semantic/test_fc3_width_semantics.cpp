@@ -770,3 +770,68 @@ TEST(Fc3Descriptor, MalformedOverrideFailsEvenWhenNotSelected) {
     EXPECT_GT(rep.errorCount(), 0u);
     fs::remove(tmp);
 }
+
+// ── FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 4-way _Generic routing ──
+// The generic `stdc_<op>(x)` macro (shippedLibs/stdbit.json) expands to a 4-WAY
+// _Generic over {unsigned char, unsigned short, unsigned int, unsigned long long}
+// — `unsigned long` is DROPPED (audit C1): DSS interns it to a width-core TypeId
+// that would COLLIDE with `_ui` (LLP64) / `_ull` (LP64) in a 5-way → an
+// S_GenericSelectionAmbiguous. The 4-way is unambiguous on BOTH data models AND
+// routes an `unsigned long` operand correctly by the SAME width-collapse
+// (pe/LLP64: U32 → the `unsigned int` arm; elf+macho/LP64: U64 → the `unsigned
+// long long` arm). These pins lock that in on both models — the exact source the
+// macro produces (built here, since the semantic harness does not run #include).
+
+// The 4-way _Generic text for `op` over operand expression `arg`.
+[[nodiscard]] static std::string stdbitGeneric4Way(std::string const& op,
+                                                   std::string const& arg) {
+    auto call = [&](char const* w) {
+        return "__builtin_stdc_" + op + "_" + w + "(" + arg + ")";
+    };
+    return "_Generic((" + arg + "), "
+           "unsigned char: "      + call("uc")  + ", "
+           "unsigned short: "     + call("us")  + ", "
+           "unsigned int: "       + call("ui")  + ", "
+           "unsigned long long: " + call("ull") + ")";
+}
+
+// The 4-way over uc/us/ui/UL/ull compiles with NO ambiguity + NO no-match (the C1
+// regression guard — `unsigned long` collapses onto exactly one distinct arm).
+static void expectStdbit4WayCleanUnder(DataModel dm) {
+    std::string const src =
+        "unsigned f(unsigned char a, unsigned short b, unsigned int c,\n"
+        "           unsigned long d, unsigned long long e){\n"
+        "  return " + stdbitGeneric4Way("count_ones", "a")
+              + "\n       + " + stdbitGeneric4Way("count_ones", "b")
+              + "\n       + " + stdbitGeneric4Way("count_ones", "c")
+              + "\n       + " + stdbitGeneric4Way("count_ones", "d")
+              + "\n       + " + stdbitGeneric4Way("count_ones", "e") + ";\n}\n";
+    auto m = analyzeCSubset(src, dm);
+    EXPECT_FALSE(m.hasErrors()) << "the 4-way _Generic must compile clean";
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_GenericSelectionAmbiguous), 0u)
+        << "the 4-way (unsigned long DROPPED) must NOT be ambiguous";
+    EXPECT_EQ(countCode(m.diagnostics(), DiagnosticCode::S_GenericSelectionNoMatch), 0u)
+        << "every unsigned width (incl. unsigned long via width-collapse) matches an arm";
+}
+
+TEST(Fc3Stdbit, GenericFourWayNoAmbiguityLp64)  { expectStdbit4WayCleanUnder(DataModel::Lp64); }
+TEST(Fc3Stdbit, GenericFourWayNoAmbiguityLlp64) { expectStdbit4WayCleanUnder(DataModel::Llp64); }
+
+// Positive routing of an `unsigned long` operand through the 4-way, observed via
+// bit_floor (whose result type = the SELECTED arm's width) into an `auto` local —
+// promotion-immune here since both candidate widths (U32/U64) are ≥ int. LP64:
+// unsigned long is 64-bit → the `unsigned long long` arm → U64. LLP64: 32-bit →
+// the `unsigned int` arm → U32. A mis-route or a reintroduced ambiguity changes r.
+TEST(Fc3Stdbit, GenericUnsignedLongRoutesByDataModel) {
+    std::string const src =
+        "unsigned long f(unsigned long x){ auto r = "
+        + stdbitGeneric4Way("bit_floor", "x") + "; return r; }\n";
+    auto lp = analyzeCSubset(src, DataModel::Lp64);
+    ASSERT_FALSE(lp.hasErrors());
+    EXPECT_EQ(kindOf(lp, "r"), TypeKind::U64)
+        << "LP64: unsigned long (64-bit) → the unsigned long long arm → U64";
+    auto llp = analyzeCSubset(src, DataModel::Llp64);
+    ASSERT_FALSE(llp.hasErrors());
+    EXPECT_EQ(kindOf(llp, "r"), TypeKind::U32)
+        << "LLP64: unsigned long (32-bit) → the unsigned int arm → U32";
+}

@@ -1,0 +1,35 @@
+{
+  "$comment": "FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): runtime witness for the 3 hardware bit-count primitives as 6 GCC-compat builtins (__builtin_{popcount,clz,ctz}{,ll}) -- the C23 <stdbit.h> substrate. Each lowers to a DEDICATED pure-unary MIR op (Popcount/Clz/Ctz) -> a NATIVE instruction where the target declares the mnemonic (x86 POPCNT/LZCNT/TZCNT; arm64 CLZ + RBIT-then-CLZ ctz), else a branchless SWAR bit-trick sequence (arm64 has no scalar-GPR popcount -> the SWAR fallback the arm64-elf/qemu arm witnesses at RUNTIME, alongside native CLZ). Fold-resistant: each builtin runs behind a wrapper fn taking the value as an arg, and Popcount/Clz/Ctz are NOT in ConstFold's fold set -- so the `release` (shippedPipeline) arm proves the ops survive Inlining + the full optimizer. Inputs are width-discriminating (pc64/clz64 set only HIGH bits -> a 32-bit miscompile changes the sum) and defined at 0 = width. exit = 16 + 32 + 16 + 32 + 23 + 39 = 158.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 158,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

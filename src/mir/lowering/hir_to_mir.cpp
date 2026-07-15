@@ -2104,6 +2104,50 @@ struct Lowerer {
                 switch (static_cast<BuiltinLowering>(hir.payload(node))) {
                     case BuiltinLowering::UMulHigh:
                         return mir.addInst(MirOpcode::UMulH, operands, t);
+                    // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 bit-count
+                    // primitives. `t` is the builtin's result type (I32, since GCC's
+                    // __builtin_popcount/clz/ctz all return `int`); the single
+                    // operand is U32 (…) / U64 (…ll) and the mir_to_lir lowering
+                    // reads the OPERAND's width via mir.instType(operand) to pick the
+                    // 32- vs 64-bit realization. The count (0..P, P≤64) has zero
+                    // upper bits, so it reads correctly at the I32 result with no
+                    // explicit Trunc (the ICmp→Bool narrowing precedent).
+                    case BuiltinLowering::Popcount:
+                        return mir.addInst(MirOpcode::Popcount, operands, t);
+                    case BuiltinLowering::Clz:
+                        return mir.addInst(MirOpcode::Clz, operands, t);
+                    case BuiltinLowering::Ctz:
+                        return mir.addInst(MirOpcode::Ctz, operands, t);
+                    // FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 stdc_* ops
+                    // COMPOSE the 3 primitives above + universal ALU verbs into the
+                    // N3096 §7.18 formula — one shared, width-correct, single-eval,
+                    // branchless emitter (emitStdbitOp) the 14 leaf lowerings route
+                    // through (NO new MIR op; the operand is bound ONCE in operands).
+                    case BuiltinLowering::StdcLeadingZeros:
+                    case BuiltinLowering::StdcLeadingOnes:
+                    case BuiltinLowering::StdcTrailingZeros:
+                    case BuiltinLowering::StdcTrailingOnes:
+                    case BuiltinLowering::StdcFirstLeadingZero:
+                    case BuiltinLowering::StdcFirstLeadingOne:
+                    case BuiltinLowering::StdcFirstTrailingZero:
+                    case BuiltinLowering::StdcFirstTrailingOne:
+                    case BuiltinLowering::StdcCountZeros:
+                    case BuiltinLowering::StdcCountOnes:
+                    case BuiltinLowering::StdcHasSingleBit:
+                    case BuiltinLowering::StdcBitWidth:
+                    case BuiltinLowering::StdcBitFloor:
+                    case BuiltinLowering::StdcBitCeil: {
+                        if (kids.size() != 1) {
+                            unsupported(node,
+                                "a stdc_* bit builtin expects exactly 1 argument");
+                            return InvalidMirInst;
+                        }
+                        // The operand's width is read from its coerced HIR type
+                        // (its builtin param core), not the MirBuilder value.
+                        return emitStdbitOp(
+                            static_cast<BuiltinLowering>(hir.payload(node)),
+                            operands[0], hir.typeId(kids[0]), node, t);
+                    }
                     case BuiltinLowering::AtomicCas: {
                         // c104: MIR AtomicCas is the UNIVERSAL CAS order
                         // [ptr, comparand(expected), newval(desired)] — the
@@ -4400,6 +4444,184 @@ struct Lowerer {
         std::array<MirInstId, 2> st{merged, unitPtr};
         mir.addInst(MirOpcode::Store, st, InvalidType, /*payload=*/0, vf);
         return true;
+    }
+
+    // ── FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 stdc_* op composition ──
+    //
+    // The bit-width (in bits) of an integer/bool TypeKind — the operand-width probe
+    // the stdc_* arms key on. 0 for a non-fixed-width kind (a fail-loud sentinel).
+    [[nodiscard]] static int intBitWidth(TypeKind k) noexcept {
+        switch (k) {
+            case TypeKind::Bool: case TypeKind::I8:  case TypeKind::U8:
+            case TypeKind::Char: case TypeKind::Byte: return 8;
+            case TypeKind::I16:  case TypeKind::U16:  return 16;
+            case TypeKind::I32:  case TypeKind::U32:  return 32;
+            case TypeKind::I64:  case TypeKind::U64:  return 64;
+            default: return 0;
+        }
+    }
+
+    // Compose one C23 `stdc_*` bit operation (N3096 §7.18) from the 3 hardware
+    // bit-count primitives (MIR Popcount/Clz/Ctz) + the universal ALU verbs.
+    //   • WIDTH-CORRECT: the operand's EXACT width W∈{8,16,32,64} is read from its
+    //     coerced HIR param-core type `xTy` (guaranteed by the pre-BuiltinCall arg
+    //     coercion). All compute is at the promotion width P∈{32,64} (the
+    //     primitives' native width — Clz/Ctz are DEFINED at 0 = P), then the value
+    //     is cast to `t` (the builtin's C23 result type). A sub-word W is handled by
+    //     ARITHMETIC (subtract the P−W zero-ext pad; mask the W-bit complement),
+    //     never a per-width instruction.
+    //   • SINGLE-EVAL: `x` is lowered ONCE by the caller into operands[0]; every
+    //     sub-expression here reuses that ONE SSA value.
+    //   • BRANCHLESS: the 8 ops with a C `?:` select via `mask = 0 − (uP)cond` (all
+    //     -ones iff cond, else 0) → `(a & mask) | (b & ~mask)`. NO CFG diamond, NO
+    //     `if (arch/format==…)`: pure generic MIR the optimizer + every target
+    //     lowering already understand.
+    //   • SHIFT-UB SAFE (audit I3): every `Shl(1, amt)` has amt∈[0,W−1] on EVERY
+    //     branch (bit_floor amt = bitWidth − (x≠0); bit_ceil amt = bitWidth(x−1) &
+    //     (W−1), with the ==W overflow arm selecting 0). Never an unguarded shift.
+    // `xTy` is the operand's coerced HIR type (its builtin param core U8/U16/U32/
+    // U64 — read by the caller via hir.typeId(argNode)); the width W is taken from
+    // it, so the composition never queries the MirBuilder for a value's type.
+    [[nodiscard]] MirInstId emitStdbitOp(BuiltinLowering op, MirInstId x0,
+                                         TypeId xTy, HirNodeId node, TypeId t) {
+        TypeKind const xKind = interner.kind(xTy);
+        int const W = intBitWidth(xKind);
+        if (W != 8 && W != 16 && W != 32 && W != 64) {
+            unsupported(node,
+                "a stdc_* bit builtin operand must be an 8/16/32/64-bit integer "
+                "(its builtin param core) — the width is read to compose the "
+                "N3096 §7.18 formula");
+            return InvalidMirInst;
+        }
+        int const P = (W <= 32) ? 32 : 64;
+        TypeKind const pKind = (P == 32) ? TypeKind::U32 : TypeKind::U64;
+        TypeId   const pTy   = interner.primitive(pKind);
+        // vP = (uP)x — zero-extend to the promotion width (a no-op when W==P).
+        MirInstId vP = x0;
+        if (xKind != pKind) {
+            std::array<MirInstId, 1> za{x0};
+            vP = mir.addInst(mapCast(xKind, pKind), za, pTy);
+        }
+
+        // ── shared branchless composition helpers (all pTy-typed) ──
+        auto konst = [&](std::int64_t v) { return constIntOfType(v, pTy); };
+        auto bin = [&](MirOpcode o, MirInstId a, MirInstId b) {
+            std::array<MirInstId, 2> ops{a, b};
+            return mir.addInst(o, ops, pTy);
+        };
+        auto un = [&](MirOpcode o, MirInstId a) {
+            std::array<MirInstId, 1> ops{a};
+            return mir.addInst(o, ops, pTy);
+        };
+        // an ICmp result is i1 (Bool), NEVER pTy — a pTy-typed compare would
+        // mis-type the ZExt in `sel` (it would see a pTy source, not a Bool).
+        auto cmp = [&](MirOpcode o, MirInstId a, MirInstId b) {
+            std::array<MirInstId, 2> ops{a, b};
+            return mir.addInst(o, ops, interner.primitive(TypeKind::Bool));
+        };
+        // the 3 primitives at width P (result pTy — the count ≤P fits; mir_to_lir
+        // reads the OPERAND type, here pTy, to pick the 32- vs 64-bit realization).
+        auto pop = [&](MirInstId v) { return un(MirOpcode::Popcount, v); };
+        auto clz = [&](MirInstId v) { return un(MirOpcode::Clz, v); };
+        auto ctz = [&](MirInstId v) { return un(MirOpcode::Ctz, v); };
+        // (uP)(uW)~x — the W-bit complement: flip all P bits, keep the low W.
+        std::uint64_t const allOnesW = (W >= 64) ? ~0ull : ((1ull << W) - 1);
+        auto complementW = [&]() {
+            return bin(MirOpcode::And, un(MirOpcode::Not, vP),
+                       konst(static_cast<std::int64_t>(allOnesW)));
+        };
+        // branchless select: cond ? a : b (a,b already-computed pTy SSA values →
+        // single-eval). mask = 0 − (uP)cond (all-ones iff cond, else 0).
+        auto sel = [&](MirInstId condBool, MirInstId a, MirInstId b) {
+            MirInstId const condP   = un(MirOpcode::ZExt, condBool);
+            MirInstId const mask    = bin(MirOpcode::Sub, konst(0), condP);
+            MirInstId const notMask = un(MirOpcode::Not, mask);
+            return bin(MirOpcode::Or, bin(MirOpcode::And, a, mask),
+                                      bin(MirOpcode::And, b, notMask));
+        };
+        // cast the pTy compute value to the builtin result type t (a Trunc for a
+        // U64 compute → U32 count / a narrow bit_floor result; else a no-op).
+        auto toResult = [&](MirInstId v) -> MirInstId {
+            TypeKind const tk = interner.kind(t);
+            if (tk == pKind) return v;
+            std::array<MirInstId, 1> ca{v};
+            return mir.addInst(mapCast(pKind, tk), ca, t);
+        };
+
+        MirInstId const ZERO = konst(0);
+        MirInstId const ONE  = konst(1);
+        MirInstId const WK   = konst(W);       // W
+        MirInstId const PmWK = konst(P - W);   // P − W (the zero-ext pad width)
+
+        switch (op) {
+            case BuiltinLowering::StdcCountOnes:      // pc
+                return toResult(pop(vP));
+            case BuiltinLowering::StdcCountZeros:     // W − pc (W real bits only)
+                return toResult(bin(MirOpcode::Sub, WK, pop(vP)));
+            case BuiltinLowering::StdcLeadingZeros:   // clz(x) − (P − W)
+                return toResult(bin(MirOpcode::Sub, clz(vP), PmWK));
+            case BuiltinLowering::StdcLeadingOnes:    // clz((uP)(uW)~x) − (P − W)
+                return toResult(bin(MirOpcode::Sub, clz(complementW()), PmWK));
+            case BuiltinLowering::StdcTrailingZeros: {  // x==0 ? W : ctz(x)
+                MirInstId const isZero = cmp(MirOpcode::ICmpEq, vP, ZERO);
+                return toResult(sel(isZero, WK, ctz(vP)));
+            }
+            case BuiltinLowering::StdcTrailingOnes: {   // x==(uW)~0 ? W : ctz((uP)(uW)~x)
+                MirInstId const isAllOnes =
+                    cmp(MirOpcode::ICmpEq, vP, konst(static_cast<std::int64_t>(allOnesW)));
+                return toResult(sel(isAllOnes, WK, ctz(complementW())));
+            }
+            case BuiltinLowering::StdcFirstLeadingZero: {  // lo==W ? 0 : lo+1 (lo=leading_ones)
+                MirInstId const lo  = bin(MirOpcode::Sub, clz(complementW()), PmWK);
+                MirInstId const isW = cmp(MirOpcode::ICmpEq, lo, WK);
+                return toResult(sel(isW, ZERO, bin(MirOpcode::Add, lo, ONE)));
+            }
+            case BuiltinLowering::StdcFirstLeadingOne: {   // x==0 ? 0 : leading_zeros+1
+                MirInstId const lz     = bin(MirOpcode::Sub, clz(vP), PmWK);
+                MirInstId const isZero = cmp(MirOpcode::ICmpEq, vP, ZERO);
+                return toResult(sel(isZero, ZERO, bin(MirOpcode::Add, lz, ONE)));
+            }
+            case BuiltinLowering::StdcFirstTrailingZero: { // to==W ? 0 : to+1 (to=trailing_ones)
+                MirInstId const isAllOnes =
+                    cmp(MirOpcode::ICmpEq, vP, konst(static_cast<std::int64_t>(allOnesW)));
+                MirInstId const to  = sel(isAllOnes, WK, ctz(complementW()));
+                MirInstId const isW = cmp(MirOpcode::ICmpEq, to, WK);
+                return toResult(sel(isW, ZERO, bin(MirOpcode::Add, to, ONE)));
+            }
+            case BuiltinLowering::StdcFirstTrailingOne: {  // x==0 ? 0 : trailing_zeros+1
+                MirInstId const isZero = cmp(MirOpcode::ICmpEq, vP, ZERO);
+                return toResult(sel(isZero, ZERO, bin(MirOpcode::Add, ctz(vP), ONE)));
+            }
+            case BuiltinLowering::StdcHasSingleBit:   // popcount(x)==1 (result IS Bool == t)
+                return cmp(MirOpcode::ICmpEq, pop(vP), ONE);
+            case BuiltinLowering::StdcBitWidth:       // P − clz(x)  (clz(0)=P → 0; no guard)
+                return toResult(bin(MirOpcode::Sub, konst(P), clz(vP)));
+            case BuiltinLowering::StdcBitFloor: {      // x==0 ? 0 : 1 << (bit_width(x)−1)
+                MirInstId const bw      = bin(MirOpcode::Sub, konst(P), clz(vP));
+                MirInstId const neZero  = cmp(MirOpcode::ICmpNe, vP, ZERO);
+                MirInstId const neZeroP = un(MirOpcode::ZExt, neZero);
+                // amt = bit_width − (x≠0) ∈ [0, W−1] on EVERY branch (x==0 → 0−0=0).
+                MirInstId const amt     = bin(MirOpcode::Sub, bw, neZeroP);
+                MirInstId const shifted = bin(MirOpcode::Shl, ONE, amt);
+                return toResult(sel(neZero, shifted, ZERO));
+            }
+            case BuiltinLowering::StdcBitCeil: {       // x<=1 ? 1 : bw(x−1)==W ? 0 : 1<<bw(x−1)
+                MirInstId const isLe1   = cmp(MirOpcode::ICmpUle, vP, ONE);
+                MirInstId const xm1     = bin(MirOpcode::Sub, vP, ONE);
+                MirInstId const bwm1    = bin(MirOpcode::Sub, konst(P), clz(xm1));
+                MirInstId const isOvf   = cmp(MirOpcode::ICmpEq, bwm1, WK);
+                // amt = bw(x−1) & (W−1) ∈ [0, W−1] (bw(x−1)==W → 0, but the overflow
+                // arm discards the shift result anyway) — never an unguarded Shl.
+                MirInstId const amt     = bin(MirOpcode::And, bwm1, konst(W - 1));
+                MirInstId const shifted = bin(MirOpcode::Shl, ONE, amt);
+                MirInstId const inner   = sel(isOvf, ZERO, shifted);
+                return toResult(sel(isLe1, ONE, inner));
+            }
+            default:
+                break;
+        }
+        unsupported(node, "internal: emitStdbitOp reached with a non-stdbit lowering");
+        return InvalidMirInst;
     }
 
     // Resolve the ADDRESS of an lvalue expression for ONE node, given that its

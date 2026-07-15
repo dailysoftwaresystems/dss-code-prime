@@ -507,6 +507,62 @@
       }
     },
     {
+      "$comment": "FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): CLZ Xd, Xn — count leading zeros (data-processing 1-source). fixedWord 0xDAC01000 (X, sf=1 = 3670020096) / 0x5AC01000 (W, sf=0 = 1522536448); opcode field 000100 (RBIT=000000 below; REV16/32=00000x/00001x). Rn (bits 9:5) = the source operand (wire 0), Rd (bits 4:0) = the result. arm64 CLZ is DEFINED at 0 = the width (32/64) — EXACTLY the MIR Clz contract — so it is Clz's NATIVE realization (the DSS `clz` verb, shared with x86 LZCNT). Also the 2nd half of arm64's ctz: RBIT then CLZ. A 1-source op like `neg`/`not` but the operand wires to `rn` (data-proc-1-source) not `rm`.",
+      "mnemonic":      "clz",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 3670020096 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 1522536448 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): RBIT Xd, Xn — reverse the bit order (data-processing 1-source, opcode field 000000). fixedWord 0xDAC00000 (X = 3670016000) / 0x5AC00000 (W = 1522532352). Rn (bits 9:5) = source (wire 0), Rd (bits 4:0) = result. Used ONLY by arm64's ctz realization: ctz(x) = CLZ(RBIT(x)) — reversing turns the lowest set bit into the highest, so leading-zeros of the reversed value = trailing-zeros of the original (defined at 0 = width via CLZ(0)=width). x86 declares no `rbit` (it has direct TZCNT).",
+      "mnemonic":      "rbit",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 3670016000 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 1522532352 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): LDAXR Wt/Xt, [Xn] — load-acquire EXCLUSIVE (arms the exclusive monitor; the acquire half of the LL/SC CAS loop). W-form 0x885FFC00 = size=10 | 001000 | o2=0 L=1 o1=0 | Rs=11111 | o0=1 | Rt2=11111 | Rn | Rt; X-form flips size to 11 -> 0xC85FFC00. Result = the loaded value (Rt, bits 4:0 = the `rd` slot); operand 0 = the address base (Rn). The MIR AtomicCas value width picks W (the Win32 LONG i32 CAS) vs X.",
       "mnemonic":      "ldaxr",
       "result":        "value",

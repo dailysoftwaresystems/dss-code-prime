@@ -808,6 +808,38 @@ enum class BuiltinLowering : std::uint16_t {
     // context; until then mir_to_lir fails loud on them.
     SehExceptionCode,
     SehExceptionInfo,
+    // FC17.9(b) walking-skeleton (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 hardware
+    // bit-count primitives, exposed as 6 GCC-compatible builtins that SHARE these
+    // 3 lowerings (the {,ll} width pair per op). Each maps to a dedicated pure
+    // unary MirOpcode (Popcount/Clz/Ctz) at hir_to_mir — the C23 <stdbit.h>
+    // substrate. Clz/Ctz are defined at 0 = width (LZCNT/CLZ/TZCNT semantics), a
+    // safe superset of GCC's UB-at-0.
+    Popcount,
+    Clz,
+    Ctz,
+    // FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 type-generic `stdc_*`
+    // bit operations, each a distinct leaf lowering that COMPOSES the 3 hardware
+    // primitives (Popcount/Clz/Ctz) + universal ALU verbs into the N3096 §7.18
+    // formula at hir_to_mir (the ONE place the width-correct, single-eval,
+    // branchless composition lives). The operand's EXACT width W∈{8,16,32,64} is
+    // read from its param core (56 `__builtin_stdc_<op>_<T>` builtins, 4 widths ×
+    // 14 ops); all count/index/width ops return U32, has_single_bit returns Bool,
+    // bit_floor/bit_ceil return the operand core (C23 return-type rules). NO new
+    // MIR op — these are pure HIR→MIR composition over the proven substrate.
+    StdcLeadingZeros,
+    StdcLeadingOnes,
+    StdcTrailingZeros,
+    StdcTrailingOnes,
+    StdcFirstLeadingZero,
+    StdcFirstLeadingOne,
+    StdcFirstTrailingZero,
+    StdcFirstTrailingOne,
+    StdcCountZeros,
+    StdcCountOnes,
+    StdcHasSingleBit,
+    StdcBitWidth,
+    StdcBitFloor,
+    StdcBitCeil,
 };
 
 // Resolve the config `lowering` name to its BuiltinLowering. nullopt = an unknown
@@ -820,6 +852,29 @@ builtinLoweringFromName(std::string_view name) noexcept {
     if (name == "barrier")    { return BuiltinLowering::Barrier;   }
     if (name == "seh_exception_code") { return BuiltinLowering::SehExceptionCode; }
     if (name == "seh_exception_info") { return BuiltinLowering::SehExceptionInfo; }
+    // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 bit-count verbs shared by
+    // the 6 __builtin_{popcount,clz,ctz}{,ll} rows (the width lives in the param
+    // core U32/U64, read by the hir_to_mir arm — the lowering tag is width-blind).
+    if (name == "popcount") { return BuiltinLowering::Popcount; }
+    if (name == "clz")      { return BuiltinLowering::Clz;      }
+    if (name == "ctz")      { return BuiltinLowering::Ctz;      }
+    // FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 `stdc_*` op lowerings
+    // (shared by each op's 4 width rows — the width lives in the param core, read
+    // by the hir_to_mir arm; the lowering tag is width-blind, like popcount/clz/ctz).
+    if (name == "stdc_leading_zeros")       { return BuiltinLowering::StdcLeadingZeros; }
+    if (name == "stdc_leading_ones")        { return BuiltinLowering::StdcLeadingOnes; }
+    if (name == "stdc_trailing_zeros")      { return BuiltinLowering::StdcTrailingZeros; }
+    if (name == "stdc_trailing_ones")       { return BuiltinLowering::StdcTrailingOnes; }
+    if (name == "stdc_first_leading_zero")  { return BuiltinLowering::StdcFirstLeadingZero; }
+    if (name == "stdc_first_leading_one")   { return BuiltinLowering::StdcFirstLeadingOne; }
+    if (name == "stdc_first_trailing_zero") { return BuiltinLowering::StdcFirstTrailingZero; }
+    if (name == "stdc_first_trailing_one")  { return BuiltinLowering::StdcFirstTrailingOne; }
+    if (name == "stdc_count_zeros")         { return BuiltinLowering::StdcCountZeros; }
+    if (name == "stdc_count_ones")          { return BuiltinLowering::StdcCountOnes; }
+    if (name == "stdc_has_single_bit")      { return BuiltinLowering::StdcHasSingleBit; }
+    if (name == "stdc_bit_width")           { return BuiltinLowering::StdcBitWidth; }
+    if (name == "stdc_bit_floor")           { return BuiltinLowering::StdcBitFloor; }
+    if (name == "stdc_bit_ceil")            { return BuiltinLowering::StdcBitCeil; }
     return std::nullopt;
 }
 
