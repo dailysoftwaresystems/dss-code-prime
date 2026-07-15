@@ -1,0 +1,15 @@
+{
+  "$comment": "c145 D-LK-RELRO-CONST-DATA-RELOCATABLE: a const global with a link-time symbol-address static initializer (const fn-ptr table `const op ctab[]={add10,add20}` + const scalar pointer `int *const gpp=&gbase`) routes to the RelRoConst section kind (relocated-read-only). Each slot carries a load-time relocation; the loader writes the resolved VA, then the call-through / deref reads it -> ctab[0](5)+ctab[1](5)+*gpp = 15+25+2 = 42. In a relocatable object this lands in .data.rel.ro + .rela.data.rel.ro (R_X86_64_64 / R_AARCH64_ABS64) the final linker resolves -- the mechanism that let the real 269k-line sqlite3.c compile to a foreign-linkable sqlite3.o that gcc links + runs. In an exec image it merges into the writable-at-load data segment (ELF .data / PE .rdata base-reloc / Mach-O __DATA dyld-rebase) + relocates in place. A mis-relocated table slot SIGSEGVs on the indirect call; a mis-relocated *gpp shifts the exit off 42. The pe arm RUNS on windows, elf x86_64 on linux, elf arm64 under qemu, macho arm64 on darwin. The byte-level .data.rel.ro/.rela.data.rel.ro emission is red-on-disable in tests/link/test_elf_writer.cpp. The release arm witnesses the optimizer over the const-table load + indirect-call + relro-deref shapes.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
+    { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    { "label": "release", "shippedPipeline": "release" }
+  ]
+}

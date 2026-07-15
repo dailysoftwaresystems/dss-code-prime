@@ -1113,6 +1113,30 @@ struct LoweredScalar {
     return {std::move(items), rep.errorCount()};
 }
 
+// c145 (D-LK-RELRO-CONST-DATA-RELOCATABLE): lower ONE scalar POINTER global
+// initialized to a link-time SYMBOL ADDRESS (`int *p = &target;` — the F5
+// reloc-bearing shape) with a chosen mutability. Passes a synthetic abs64
+// `absPtrRelocKind` so the symbol-address arm fires; the const-vs-mutable
+// ROUTING under test is independent of the reloc kind's numeric value.
+[[nodiscard]] LoweredScalar lowerOneSymAddrScalarGlobal(TypeInterner& ti,
+                                                        bool isConst) {
+    MirBuilder b;
+    TypeId const i32 = ti.primitive(TypeKind::I32);
+    TypeId const ptr = ti.pointer(i32);
+    MirLiteralValue v;
+    v.value = MirSymbolAddrValue{/*symbol=*/2u, /*addend=*/0};
+    v.core  = TypeKind::Ptr;
+    std::uint32_t const lit = b.literalPoolAdd(std::move(v));
+    b.addGlobal(ptr, SymbolId{1}, lit, MirFuncId{},
+                SymbolBinding::Global, SymbolVisibility::Default, isConst,
+                MirThreadStorage::Shared);
+    Mir const m = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto items = lowerMirGlobalsToDataItems(m, ti, kNatural16, DataModel::Lp64,
+                                            rep, RelocationKind{2});
+    return {std::move(items), rep.errorCount()};
+}
+
 } // namespace
 
 // ── D-LK4-DATA-PRODUCER-MUTABLE-GLOBAL: section-selection pins ─────────
@@ -1184,6 +1208,42 @@ TEST(AsmDataSection, ConstInitializedGlobalLowersToRodata) {
         << "a const initialized global must stay read-only .rodata";
     std::vector<std::uint8_t> const expect{5, 0, 0, 0};
     EXPECT_EQ(r.items[0].bytes, expect);
+}
+
+// c145 (D-LK-RELRO-CONST-DATA-RELOCATABLE): a CONST global initialized to a
+// SYMBOL ADDRESS (`int *const p = &x;` — reloc-bearing) routes to RelRoConst
+// (relocated-read-only) — NOT read-only `.rodata` (the loader must WRITE the
+// resolved VA into the slot) and NOT writable `.data` (it is const). This is
+// the asm-tier red-on-disable pin for the `relocBearingGlobalSection`
+// chokepoint that BOTH the scalar symbol-address arm and the aggregate arm
+// route through: revert its `isConst ? RelRoConst` to `Data` and this flips to
+// `.data`. The -exec corpus cannot catch that regression (relro FOLDS into
+// writable `.data` on the exec path -> same runtime result); only the `.o`
+// path makes `.data.rel.ro` observable, so this producer-tier pin is where the
+// routing is red-on-disable.
+TEST(AsmDataSection, ConstSymbolAddressGlobalLowersToRelRo) {
+    TypeInterner ti{CompilationUnitId{1}};
+    auto const r = lowerOneSymAddrScalarGlobal(ti, /*isConst=*/true);
+    ASSERT_EQ(r.errors, 0u);
+    ASSERT_EQ(r.items.size(), 1u);
+    EXPECT_EQ(r.items[0].section, DataSectionKind::RelRoConst)
+        << "a const symbol-address (reloc-bearing) global must route to RelRoConst";
+    EXPECT_FALSE(r.items[0].relocations.empty())
+        << "it carries the abs64 pointer relocation the linker resolves";
+    EXPECT_EQ(r.items[0].bytes.size(), 8u) << "pointer-width zero slot";
+}
+
+// A MUTABLE symbol-address global (`int *p = &x;`) stays writable `.data` (NOT
+// RelRoConst — const is the discriminator). RED-ON-DISABLE: drop the isConst
+// arm of the chokepoint (routing every reloc-bearing global to RelRoConst).
+TEST(AsmDataSection, MutableSymbolAddressGlobalLowersToData) {
+    TypeInterner ti{CompilationUnitId{1}};
+    auto const r = lowerOneSymAddrScalarGlobal(ti, /*isConst=*/false);
+    ASSERT_EQ(r.errors, 0u);
+    ASSERT_EQ(r.items.size(), 1u);
+    EXPECT_EQ(r.items[0].section, DataSectionKind::Data)
+        << "a mutable symbol-address global stays writable .data";
+    EXPECT_FALSE(r.items[0].relocations.empty());
 }
 
 // A TENTATIVE (zero-init, no initializer) global lowers to `.bss` with EMPTY

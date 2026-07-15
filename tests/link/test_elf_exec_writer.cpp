@@ -96,6 +96,27 @@ struct Loaded {
     return mod;
 }
 
+// c145: locate a section header index by its `.shstrtab` name (−1 if absent).
+[[nodiscard]] std::string readCStr(std::vector<std::uint8_t> const& b,
+                                   std::uint64_t off) {
+    std::string s;
+    for (std::uint64_t p = off; p < b.size() && b[p] != 0; ++p)
+        s.push_back(static_cast<char>(b[p]));
+    return s;
+}
+[[nodiscard]] int findSectionByName(std::vector<std::uint8_t> const& b,
+                                    std::string const& name) {
+    std::uint64_t const shoff    = readU64LE(b, 40);
+    std::uint16_t const shnum    = readU16LE(b, 60);
+    std::uint16_t const shstrndx = readU16LE(b, 62);
+    std::uint64_t const shstrOff = readU64LE(b, shoff + shstrndx * 64 + 24);
+    for (std::uint16_t i = 0; i < shnum; ++i) {
+        std::uint32_t const nameOff = readU32LE(b, shoff + i * 64 + 0);
+        if (readCStr(b, shstrOff + nameOff) == name) return static_cast<int>(i);
+    }
+    return -1;
+}
+
 } // namespace
 
 // ── Shipped JSON loads with new fields ──────────────────────────
@@ -2065,6 +2086,48 @@ TEST(ElfExecWriter, RodataDataItemWithRelocationFailsLoud) {
     EXPECT_TRUE(sawCode)
         << "rodata dataItem with relocations must fail loud citing "
            "D-LK1-ELF-RODATA-DATAITEM-RELOC";
+}
+
+TEST(ElfExecWriter, RelRoConstItemFoldsIntoDataAndPatchesInPlace) {
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): in the EXECUTABLE image a relro
+    // item is FOLDED into `.data` ("treat relro like .data") and its abs64 slot is
+    // patched IN PLACE with the target's absolute VA — NOT fail-loud, and no
+    // `.rela`. RED-on-disable: without the merge+apply the writer either
+    // fail-louds (the old D-LK1-ELF-RODATA-DATAITEM-RELOC path, now relro-routed)
+    // or leaves the pointer slot zero.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);   // `ret` at .text+0
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::RelRoConst;
+    d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};   // 8-byte slot, patched below
+    d.alignment = Alignment::of<8>();
+    Relocation r;
+    r.offset = 0;
+    r.target = SymbolId{1};          // points at the intra-module function
+    r.kind   = RelocationKind{2};    // abs64
+    r.addend = 0;
+    d.relocations.push_back(r);
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "a relro item must NOT fail loud in an executable image";
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_EQ(readU16LE(bytes, 16), 2u) << "e_type = ET_EXEC";
+    // The exec image folds relro into `.data` — NO separate `.data.rel.ro`.
+    EXPECT_LT(findSectionByName(bytes, ".data.rel.ro"), 0)
+        << "the exec image folds relro into .data (no separate .data.rel.ro)";
+    int const dataIdx = findSectionByName(bytes, ".data");
+    ASSERT_GE(dataIdx, 0) << "the relro item rides `.data` in the exec image";
+    std::uint64_t const shoff   = readU64LE(bytes, 40);
+    std::uint64_t const dataOff = readU64LE(bytes, shoff + dataIdx * 64 + 24);
+    auto const* secText = loaded.format->sectionByKind(SectionKind::Text);
+    ASSERT_NE(secText, nullptr);
+    EXPECT_EQ(readU64LE(bytes, dataOff), secText->virtualAddress)
+        << "the relro pointer slot is patched in place with the function VA";
 }
 
 // ── Code-review FOLD pins (H1 / M1 / L1) ──────────────────────────

@@ -780,6 +780,22 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     return true;
 }
 
+// D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): the ONE chokepoint for the section a
+// RELOC-BEARING global lands in. A pointer object patched by the loader (an
+// `int *p = &x;` scalar, or a fn-ptr-table / `&global` member of an aggregate)
+// cannot sit in read-only `.rodata`; it routes to a thread-local template
+// (Tdata), relocated-read-only const (RelRoConst — gcc's `.data.rel.ro`), or
+// writable data (Data). BOTH the F5 scalar symbol-address arm AND the aggregate
+// arm route through here, so the const-vs-mutable relro decision has a SINGLE
+// point of truth (a duplicated ternary is what breeds a missed site). Thread-
+// locality wins first — a reloc-bearing `thread_local` keeps its per-thread
+// `.tdata` template (never demoted to a process-shared slot).
+[[nodiscard]] DataSectionKind relocBearingGlobalSection(bool isThreadLocal,
+                                                        bool isConst) noexcept {
+    if (isThreadLocal) return DataSectionKind::Tdata;
+    return isConst ? DataSectionKind::RelRoConst : DataSectionKind::Data;
+}
+
 } // namespace
 
 std::vector<AssembledData>
@@ -953,10 +969,15 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // through this `const` object, but per-thread IDENTITY requires the
         // TLS template section. Initialized thread_local → Tdata (the
         // template bytes each thread's copy starts from).
+        // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): capture const-ness once —
+        // the symbol-address / aggregate arms below reuse it to route a
+        // reloc-BEARING const global to RelRoConst (relocated-read-only)
+        // instead of writable `.data`.
+        bool const isConstGlobal = mir.globalIsConst(gid);
         d.section = isThreadLocal
                         ? DataSectionKind::Tdata
-                        : (mir.globalIsConst(gid) ? DataSectionKind::Rodata
-                                                  : DataSectionKind::Data);
+                        : (isConstGlobal ? DataSectionKind::Rodata
+                                         : DataSectionKind::Data);
 
         // String-literal arm: bytes are the literal's std::string
         // contents. The HIR convention is Array<Char,N+1> where
@@ -1078,13 +1099,15 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // A symbol-address pointer is INHERENTLY load-writable: the loader
             // writes the resolved (and, on a PIE image, slid) target address into
             // this slot via the relocation below. It therefore MUST live in a
-            // writable-at-load section — NEVER read-only rodata — even when the
-            // source global is const-qualified (`const char* const p`, or a
-            // `const char* p` whose pointer-OBJECT DSS marks const). ELF
-            // (ET_EXEC, no slide) and PE (.rdata is load-writable) merely TOLERATE
-            // rodata; a Mach-O PIE image cannot rebase the sealed __TEXT,__const.
-            // Overriding the section-above choice to .data on every format is the
-            // agnostic root-cause placement, not a per-format special case.
+            // section that is WRITABLE at load — never read-only rodata (a
+            // Mach-O PIE image cannot rebase the sealed __TEXT,__const).
+            //
+            // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a CONST such pointer now
+            // routes to RelRoConst (relocated-read-only: ELF `.data.rel.ro` /
+            // Mach-O `__DATA_CONST` / PE `.rdata`) — load-writable for the
+            // relocation, then read-only, matching gcc's `.data.rel.ro`. Only a
+            // MUTABLE pointer stays writable `.data`. (Before c145 both went to
+            // `.data`, silently dropping const-ness + the relro hardening.)
             //
             // ★ TLS C1 audit fold CRIT-2 (D-CSUBSET-THREAD-LOCAL): the override
             // must PRESERVE thread-locality. A `thread_local char *msg = "hi";`
@@ -1094,8 +1117,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // starts from the patched template). Demoting it to .data would
             // silently make the pointer ONE process-shared slot — the exact
             // storage-duration miscompile the section-select guards against.
-            d.section = isThreadLocal ? DataSectionKind::Tdata
-                                      : DataSectionKind::Data;
+            d.section = relocBearingGlobalSection(isThreadLocal, isConstGlobal);
             d.bytes.assign(8, 0);                       // pointer-width zero slot
             d.alignment = raiseToExplicit(Alignment::ofRuntimePow2(8));
             d.relocations.push_back(Relocation{
@@ -1162,11 +1184,15 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // carries load-time relocations (a fn/`&global`/string member) is
             // INHERENTLY load-writable — the loader patches the resolved (and on
             // a PIE image slid) target VAs into the member slots. It MUST live in
-            // a writable-at-load section, never read-only rodata, even when the
-            // source global is const: the SAME rationale as the F5 scalar arm at
-            // 951-961 (a Mach-O PIE __TEXT,__const cannot be rebased; ELF/PE
-            // merely tolerate rodata). A reloc-free const aggregate keeps the
-            // section chosen above (.rodata for a const global).
+            // a section writable at load, never read-only rodata (a Mach-O PIE
+            // __TEXT,__const cannot be rebased). A reloc-free const aggregate
+            // keeps the section chosen above (.rodata for a const global).
+            //
+            // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a CONST reloc-bearing
+            // aggregate (the sqlite VFS method-table / `aSyscall[]` shape — a
+            // `const` array of function pointers) now routes to RelRoConst
+            // (relocated-read-only), matching gcc's `.data.rel.ro`; only a
+            // MUTABLE one stays writable `.data`. SAME rule as the F5 scalar arm.
             //
             // ★ TLS C1 audit fold CRIT-2 (D-CSUBSET-THREAD-LOCAL): PRESERVE
             // thread-locality — a reloc-bearing `thread_local` aggregate (e.g.
@@ -1176,8 +1202,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
             // thread_local aggregate already sits in Tdata from the initial
             // selection and is untouched by this override.
             if (!d.relocations.empty()) {
-                d.section = isThreadLocal ? DataSectionKind::Tdata
-                                          : DataSectionKind::Data;
+                d.section = relocBearingGlobalSection(isThreadLocal, isConstGlobal);
             }
             d.alignment = raiseToExplicit(lay->align);
             out.push_back(std::move(d));

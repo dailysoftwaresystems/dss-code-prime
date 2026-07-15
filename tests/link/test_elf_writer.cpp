@@ -95,6 +95,23 @@ struct Loaded {
     return out;
 }
 
+// Find a section header index by its `.shstrtab` name (robust to layout
+// reordering — the c145 relro tests key on names, not golden indices).
+// Returns -1 when absent.
+[[nodiscard]] int findSectionByName(std::vector<std::uint8_t> const& bytes,
+                                    std::string const& name) {
+    std::uint64_t const shoff    = readU64LE(bytes, 40);
+    std::uint16_t const shnum    = readU16LE(bytes, 60);
+    std::uint16_t const shstrndx = readU16LE(bytes, 62);
+    std::uint64_t const shstrOff = readU64LE(bytes, shoff + shstrndx * 64 + 24);
+    for (std::uint16_t i = 0; i < shnum; ++i) {
+        std::uint32_t const nameOff = readU32LE(bytes, shoff + i * 64 + 0);
+        if (readStrtabName(bytes, shstrOff, nameOff) == name)
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
 } // namespace
 
 // ── Shipped JSON loads ───────────────────────────────────────────
@@ -551,6 +568,180 @@ TEST(ElfWriter, RelaRecordsNativeRelocTypeAndSymtabIndex) {
     std::int64_t const addend = static_cast<std::int64_t>(readU64LE(bytes, relaOff + 16));
     EXPECT_EQ(addend, -4)
         << "psABI r_addend for a rel32 call must be -4 (the addendBias baked in)";
+}
+
+// ── c145: reloc-bearing const data → .data.rel.ro + .rela.data.rel.ro ──
+
+TEST(ElfWriter, RelRoConstDataItemEmitsDataRelRoSectionAndRelaDataRelRo) {
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a CONST global that carries a
+    // LOAD-TIME relocation (a const function-pointer table / `int (*const p)() =
+    // f;` — sqlite's VFS method tables + aSyscall[]) must land in `.data.rel.ro`
+    // (gcc's contract: SHT_PROGBITS + SHF_ALLOC|SHF_WRITE) and the ET_REL writer
+    // must emit its OWN relocation into `.rela.data.rel.ro` as R_X86_64_64 (abs64,
+    // addend 0), sh_info → the target data section. RED-on-disable: before c145 a
+    // reloc-bearing data item fail-louded (D-LK1-ELF-RODATA-DATAITEM-RELOC).
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);   // one `ret` fn, sym 1
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::RelRoConst;
+    d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};   // 8-byte pointer slot
+    d.alignment = Alignment::of<8>();
+    Relocation r;
+    r.offset = 0;
+    r.target = SymbolId{1};          // the slot points at the function
+    r.kind   = RelocationKind{2};    // abs64 → R_X86_64_64 (elf JSON kind 2)
+    r.addend = 0;
+    d.relocations.push_back(r);
+    mod.dataItems.push_back(std::move(d));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{42}, "vtable",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "reloc-bearing CONST data must now compile to relro, not fail loud";
+    ASSERT_FALSE(bytes.empty());
+
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+
+    // `.data.rel.ro`: SHT_PROGBITS(1), SHF_ALLOC|SHF_WRITE(3), sh_addr=0, size 8.
+    int const relroIdx = findSectionByName(bytes, ".data.rel.ro");
+    ASSERT_GE(relroIdx, 0) << ".data.rel.ro section must be emitted";
+    EXPECT_EQ(readU32LE(bytes, shoff + relroIdx * 64 + 4), 1u) << "SHT_PROGBITS";
+    EXPECT_EQ(readU64LE(bytes, shoff + relroIdx * 64 + 8), 3u)
+        << "SHF_ALLOC|SHF_WRITE (gcc's .data.rel.ro flags — NOT read-only .rodata)";
+    EXPECT_EQ(readU64LE(bytes, shoff + relroIdx * 64 + 16), 0u) << "sh_addr=0 in .o";
+    EXPECT_EQ(readU64LE(bytes, shoff + relroIdx * 64 + 32), 8u)
+        << "sh_size = one 8-byte pointer slot";
+
+    // `.rela.data.rel.ro`: SHT_RELA(4), sh_link=.symtab, sh_info=.data.rel.ro.
+    int const symtabIdx = findSectionByName(bytes, ".symtab");
+    int const relaIdx   = findSectionByName(bytes, ".rela.data.rel.ro");
+    ASSERT_GE(symtabIdx, 0);
+    ASSERT_GE(relaIdx, 0) << ".rela.data.rel.ro section must be emitted";
+    EXPECT_EQ(readU32LE(bytes, shoff + relaIdx * 64 + 4), 4u) << "SHT_RELA";
+    EXPECT_EQ(static_cast<int>(readU32LE(bytes, shoff + relaIdx * 64 + 40)), symtabIdx)
+        << "sh_link names .symtab";
+    EXPECT_EQ(static_cast<int>(readU32LE(bytes, shoff + relaIdx * 64 + 44)), relroIdx)
+        << "sh_info names the target .data.rel.ro section";
+
+    // The single Elf64_Rela: r_offset = itemOffset(0)+rel.offset(0) = 0;
+    // r_info low32 = R_X86_64_64 (1, NOT the PLT variant — a data reloc is never a
+    // call); r_addend = 0 (abs64 addendBias 0).
+    std::uint64_t const relaOff  = readU64LE(bytes, shoff + relaIdx * 64 + 24);
+    std::uint64_t const relaSize = readU64LE(bytes, shoff + relaIdx * 64 + 32);
+    ASSERT_EQ(relaSize, 24u) << "exactly one Elf64_Rela";
+    EXPECT_EQ(readU64LE(bytes, relaOff + 0), 0u) << "r_offset = 0";
+    std::uint64_t const rInfo = readU64LE(bytes, relaOff + 8);
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo), 1u)
+        << "R_X86_64_64 = 1 (abs64) — the native reloc id from the format JSON";
+    EXPECT_EQ(static_cast<std::int64_t>(readU64LE(bytes, relaOff + 16)), 0)
+        << "r_addend = 0";
+
+    // The reloc's symIdx names the FUNCTION symbol (st_shndx = .text = idx 1).
+    std::uint32_t const relSymIdx = static_cast<std::uint32_t>(rInfo >> 32);
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + symtabIdx * 64 + 24);
+    EXPECT_EQ(readU16LE(bytes, symtabOff + relSymIdx * 24 + 6), 1u)
+        << "reloc target resolves to the function symbol (st_shndx = .text)";
+
+    // The relro DATA global itself: STT_OBJECT, st_shndx = .data.rel.ro.
+    int const strtabIdx = findSectionByName(bytes, ".strtab");
+    ASSERT_GE(strtabIdx, 0);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + strtabIdx * 64 + 24);
+    std::uint64_t const symtabSize = readU64LE(bytes, shoff + symtabIdx * 64 + 32);
+    bool sawVtable = false;
+    for (std::uint64_t o = 0; o + 24 <= symtabSize; o += 24) {
+        std::uint32_t const nm = readU32LE(bytes, symtabOff + o + 0);
+        if (readStrtabName(bytes, strtabOff, nm) == "vtable") {
+            sawVtable = true;
+            EXPECT_EQ(bytes[symtabOff + o + 4], 0x11u) << "STB_GLOBAL|STT_OBJECT";
+            EXPECT_EQ(readU16LE(bytes, symtabOff + o + 6),
+                      static_cast<std::uint16_t>(relroIdx))
+                << "relro data symbol st_shndx names .data.rel.ro";
+            EXPECT_EQ(readU64LE(bytes, symtabOff + o + 16), 8u) << "st_size = 8";
+        }
+    }
+    EXPECT_TRUE(sawVtable) << "the relro data global must have a .symtab entry";
+}
+
+TEST(ElfWriter, RelRoConstDataRelocIsMachineAgnosticOnAarch64) {
+    // AGNOSTIC pin: the SAME machine-neutral ELF ET_REL writer emits the relro
+    // reloc for arm64 with the arm64 native id — R_AARCH64_ABS64 (257), read from
+    // the arm64 format JSON, NOT hardcoded. RED-on-disable: a machine branch in
+    // the writer (or a missing aarch64 `.data.rel.ro`/`relro` row) breaks this.
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-aarch64-linux");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod = makeTrivialModule({0xC0, 0x03, 0x5F, 0xD6}, 1);  // `ret`
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::RelRoConst;
+    d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};
+    d.alignment = Alignment::of<8>();
+    Relocation r;
+    r.offset = 0;
+    r.target = SymbolId{1};
+    r.kind   = RelocationKind{4};    // arm64 abs64 → R_AARCH64_ABS64 (JSON kind 4)
+    r.addend = 0;
+    d.relocations.push_back(r);
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    int const relaIdx = findSectionByName(bytes, ".rela.data.rel.ro");
+    ASSERT_GE(relaIdx, 0) << "arm64 .o must also emit .rela.data.rel.ro";
+    std::uint64_t const relaOff = readU64LE(bytes, shoff + relaIdx * 64 + 24);
+    std::uint64_t const rInfo   = readU64LE(bytes, relaOff + 8);
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo), 257u)
+        << "R_AARCH64_ABS64 = 257 — the arm64 native id from the format JSON";
+}
+
+TEST(ElfWriter, MutablePointerDataItemEmitsRelaData) {
+    // c145: a reloc-bearing MUTABLE pointer global (`int *p = &x;`) lands in
+    // `.data` (writable) and gets `.rela.data` — the same mechanism as relro but
+    // NOT read-only-after. Pins that the generalized `.rela.<section>` covers
+    // `.data` too, not only relro.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Data;   // MUTABLE
+    d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};
+    d.alignment = Alignment::of<8>();
+    Relocation r;
+    r.offset = 0;
+    r.target = SymbolId{1};
+    r.kind   = RelocationKind{2};    // abs64
+    r.addend = 0;
+    d.relocations.push_back(r);
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "reloc-bearing MUTABLE data must compile (was rejected pre-c145)";
+    ASSERT_FALSE(bytes.empty());
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    int const dataIdx = findSectionByName(bytes, ".data");
+    int const relaIdx = findSectionByName(bytes, ".rela.data");
+    ASSERT_GE(dataIdx, 0);
+    ASSERT_GE(relaIdx, 0) << ".rela.data must be emitted for a reloc-bearing .data item";
+    EXPECT_EQ(static_cast<int>(readU32LE(bytes, shoff + relaIdx * 64 + 44)), dataIdx)
+        << ".rela.data sh_info names .data";
+    std::uint64_t const relaOff = readU64LE(bytes, shoff + relaIdx * 64 + 24);
+    EXPECT_EQ(static_cast<std::uint32_t>(readU64LE(bytes, relaOff + 8)), 1u)
+        << "R_X86_64_64 abs64";
+    // No `.data.rel.ro` for a mutable-only module.
+    EXPECT_LT(findSectionByName(bytes, ".data.rel.ro"), 0)
+        << "a mutable pointer must NOT create a .data.rel.ro section";
 }
 
 // ── Non-ELF schema → fail-loud ──────────────────────────────────

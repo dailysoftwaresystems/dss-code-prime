@@ -173,6 +173,43 @@ struct ExecDataSectionLayout {
     return layout;
 }
 
+// Merge the file-backed `src` layout onto the END of the file-backed `into`
+// layout so a caller can treat two `DataSectionKind`s as ONE section. The c145
+// D-LK-RELRO-CONST-DATA-RELOCATABLE EXEC decision: the exec IMAGE folds a
+// RelRoConst item into an existing relocated-writable section ("treat relro
+// like `.data`" — the read-only-after hardening is a linker-SEGMENT nicety not
+// required for correctness), so every exec writer routes relro through the SAME
+// machinery its ordinary data section already uses (symbolVa registration,
+// applyDataItemRelocations, base-reloc collection, section emission) instead of
+// threading a whole parallel section through the intricate exec layout. The
+// RELOCATABLE (.o) path does NOT merge — it emits a distinct `.data.rel.ro` +
+// `.rela.data.rel.ro` (gcc's contract).
+//
+// `src`'s items are placed at `alignUp(into.spanSize, src.maxAlign)` so each
+// keeps its within-section alignment (the base is a multiple of `src.maxAlign`,
+// itself the max of every `src` item's alignment, so every shifted offset stays
+// aligned). `itemOffsets`/`itemIndices` are appended (offsets shifted by that
+// base) so `addDataSymbolVas` / `applyDataItemRelocations` over the merged
+// layout still map each item to its bytes. Both layouts MUST be file-backed
+// (NOT zero-fill) — the only merge the writers need; a zero-fill merge would
+// mishandle the empty-`bytes` invariant. `into` is grown; `src` is unchanged.
+inline void mergeFileBackedDataSection(ExecDataSectionLayout&       into,
+                                       ExecDataSectionLayout const& src) {
+    if (src.itemIndices.empty()) return;   // no-op: nothing to merge
+    std::uint64_t const base =
+        src.maxAlign <= 1
+            ? into.spanSize
+            : ((into.spanSize + src.maxAlign - 1) / src.maxAlign) * src.maxAlign;
+    while (into.bytes.size() < base) into.bytes.push_back(0);
+    for (std::size_t j = 0; j < src.itemIndices.size(); ++j) {
+        into.itemOffsets.push_back(base + src.itemOffsets[j]);
+        into.itemIndices.push_back(src.itemIndices[j]);
+    }
+    into.bytes.insert(into.bytes.end(), src.bytes.begin(), src.bytes.end());
+    into.spanSize = base + src.spanSize;
+    into.maxAlign = std::max(into.maxAlign, src.maxAlign);
+}
+
 // Add each NAMED matching data item's absolute VA (`sectionVa + itemOffsets[j]`)
 // to `symbolVa`. `layout` MUST be the one `buildExecDataSection` produced for the
 // SAME `dataItems` + kind (its `itemOffsets`/`itemIndices` are parallel). Works

@@ -1791,6 +1791,25 @@ encodeExecDynamic(AssembledModule const&    module,
         "macho::encodeExecDynamic", reporter);
     if (!bssLayoutOpt.has_value()) return {};
     auto const& bssLayout = *bssLayoutOpt;
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a CONST global carrying LOAD-TIME
+    // relocations (a const function-pointer table / `int *const p=&x;`) lands in
+    // `relro`. In the MH_EXECUTE image we FOLD it into the writable `__DATA,__data`
+    // section (the exec decision — "treat relro like data"; the task blesses the
+    // existing writable __DATA over a separate __DATA_CONST section as "simpler +
+    // correct": dyld rebases each slot via the __DATA rebase-opcode stream, and
+    // the read-only-after-rebase hardening of __DATA_CONST is a nicety not required
+    // for correctness). Merging routes relro through the SAME __data machinery
+    // (addDataSymbolVas, applyDataItemRelocations + the dataRebaseSiteVas stream at
+    // __DATA segment index, the section_64) — no parallel section, and it stays
+    // byte-identical for a relro-free module (the merge is a no-op when empty).
+    ObjectFormatSectionInfo const* secRelRoM =
+        fmt.sectionByKind(SectionKind::RelRoConst);
+    auto relroLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::RelRoConst,
+        secRelRoM != nullptr ? secRelRoM->addrAlign : 1,
+        "macho::encodeExecDynamic", reporter, /*allowItemRelocations=*/true);
+    if (!relroLayoutOpt.has_value()) return {};
+    link::format::mergeFileBackedDataSection(dataLayout, *relroLayoutOpt);
     bool const hasConst = !constLayout.empty();
     bool const hasData  = !dataLayout.empty();
     bool const hasBss   = !bssLayout.empty();

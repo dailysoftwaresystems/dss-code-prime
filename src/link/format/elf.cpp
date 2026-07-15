@@ -561,6 +561,29 @@ encodeElfExecDynamic(
         "elf::encodeElfExecDynamic", reporter, /*allowItemRelocations=*/true);
     if (!dataDynLayoutOpt.has_value()) return {};
     auto& dataDynLayout = *dataDynLayoutOpt;
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a CONST global carrying LOAD-TIME
+    // relocations (a const function-pointer table / `int *const p=&x;`) lands in
+    // `relro`. In the EXECUTABLE image we FOLD it into `.data` ("treat relro like
+    // .data" — the loader writes the resolved target VA into each slot; the
+    // read-only-after-relocation hardening of a separate GNU_RELRO segment is a
+    // nicety not required for correctness). Merging routes relro through the SAME
+    // machinery `.data` already uses (addDataSymbolVas, applyDataItemRelocations,
+    // R+W PT_LOAD #2, the `.data` section header) with ZERO parallel-section
+    // plumbing through this intricate dynamic arm — and stays BYTE-IDENTICAL for a
+    // relro-free module (the merge is a no-op when the relro subset is empty, so
+    // the sqlite-dormant / no-data byte-identity guarantees hold). The distinct
+    // `.data.rel.ro` + `.rela.data.rel.ro` (gcc's contract) is emitted only by the
+    // RELOCATABLE `.o` writer (`encode`, ET_REL). No relro section ROW is declared
+    // on the exec schema (relro rides `.data`), so the floor peek yields 1.
+    ObjectFormatSectionInfo const* secRelRoDyn =
+        fmt.sectionByKind(SectionKind::RelRoConst);
+    std::uint64_t const relroDynAlignFloor =
+        secRelRoDyn != nullptr ? secRelRoDyn->addrAlign : 1;
+    auto relroDynLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::RelRoConst, relroDynAlignFloor,
+        "elf::encodeElfExecDynamic", reporter, /*allowItemRelocations=*/true);
+    if (!relroDynLayoutOpt.has_value()) return {};
+    link::format::mergeFileBackedDataSection(dataDynLayout, *relroDynLayoutOpt);
     auto const bssDynLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Bss, bssDynAlignFloor,
         "elf::encodeElfExecDynamic", reporter);
@@ -1965,30 +1988,58 @@ encode(AssembledModule const&    module,
         fmt.sectionByKind(SectionKind::Data);
     ObjectFormatSectionInfo const* secBssPeek =
         fmt.sectionByKind(SectionKind::Bss);
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): the relro (relocated-read-only
+    // const) section peek — the ET_REL `.data.rel.ro` row (present on the `.o`
+    // schema; absent on the exec schema, where relro rides `.data`).
+    ObjectFormatSectionInfo const* secRelRoPeek =
+        fmt.sectionByKind(SectionKind::RelRoConst);
     std::uint64_t const rodataAlignFloor =
         secRodataPeek != nullptr ? secRodataPeek->addrAlign : 1;
     std::uint64_t const dataAlignFloor =
         secDataPeek != nullptr ? secDataPeek->addrAlign : 1;
     std::uint64_t const bssAlignFloor =
         secBssPeek != nullptr ? secBssPeek->addrAlign : 1;
+    std::uint64_t const relroAlignFloor =
+        secRelRoPeek != nullptr ? secRelRoPeek->addrAlign : 1;
     // Lay out each data section kind via the shared kind-parameterized helper
     // (D-LK1-ELF-EXEC-DATA-SECTIONS for rodata; D-LK4-DATA-PRODUCER for the
-    // writable `.data` + zero-fill `.bss`).
+    // writable `.data` + zero-fill `.bss`; D-LK-RELRO-CONST-DATA-RELOCATABLE for
+    // the reloc-bearing const `relro`). `.data` + `relro` ALLOW item relocations
+    // (a reloc-bearing MUTABLE pointer global lands in `.data`; a reloc-bearing
+    // CONST one in `relro`) — ET_EXEC applies them in place below; ET_REL emits
+    // `.rela.data` / `.rela.data.rel.ro`. `.rodata` does NOT allow them (a
+    // reloc-bearing rodata item is a producer-contract breach — kept failing loud,
+    // the RodataDataItemWithRelocationFailsLoud pin).
     auto const rodataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Rodata, rodataAlignFloor,
         elfDataWriterName, reporter);
     if (!rodataLayoutOpt.has_value()) return {};
     auto const& rodataLayout = *rodataLayoutOpt;
-    auto const dataLayoutOpt = link::format::buildExecDataSection(
+    auto dataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Data, dataAlignFloor,
-        elfDataWriterName, reporter);
+        elfDataWriterName, reporter, /*allowItemRelocations=*/true);
     if (!dataLayoutOpt.has_value()) return {};
-    auto const& dataLayout = *dataLayoutOpt;
+    auto& dataLayout = *dataLayoutOpt;
     auto const bssLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Bss, bssAlignFloor,
         elfDataWriterName, reporter);
     if (!bssLayoutOpt.has_value()) return {};
     auto const& bssLayout = *bssLayoutOpt;
+    auto relroLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::RelRoConst, relroAlignFloor,
+        elfDataWriterName, reporter, /*allowItemRelocations=*/true);
+    if (!relroLayoutOpt.has_value()) return {};
+    auto& relroLayout = *relroLayoutOpt;
+    // ET_EXEC: FOLD relro into `.data` (the exec decision — "treat relro like
+    // .data"; the loader writes the resolved target VA into each slot, then a
+    // foreign linker's GNU_RELRO seals it — a hardening nicety, not required for
+    // correctness). This static ET_EXEC arm handles externless modules; the
+    // reloc-bearing relro/data items are patched IN PLACE below
+    // (applyDataItemRelocations). ET_REL keeps relro a DISTINCT `.data.rel.ro`
+    // section + emits `.rela.data.rel.ro` (gcc's contract).
+    if (isExec) {
+        link::format::mergeFileBackedDataSection(dataLayout, relroLayout);
+    }
 
     // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: data sections are emitted for BOTH
     // ET_EXEC and ET_REL. ET_EXEC binds them into loaded PT_LOAD segments with
@@ -2000,6 +2051,11 @@ encode(AssembledModule const&    module,
     bool const hasRodata = !rodataLayout.empty();
     bool const hasData   = !dataLayout.empty();
     bool const hasBss    = !bssLayout.empty();
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): relro is a SEPARATE `.data.rel.ro`
+    // section ONLY in ET_REL. In ET_EXEC it was FOLDED into `.data` above
+    // (mergeFileBackedDataSection), so `hasRelRo` stays false there — no separate
+    // section, no `.rela.data.rel.ro`; the merged items ride `.data`.
+    bool const hasRelRo  = !isExec && !relroLayout.empty();
     // D-LK-OBJECT-EXTERN-SYMBOL-NAMES (secondary): an empty `.note.GNU-stack`
     // marks the ET_REL object's stack as NON-executable, silencing the
     // `ld: missing .note.GNU-stack section implies executable stack` warning
@@ -2014,9 +2070,12 @@ encode(AssembledModule const&    module,
     // global → `.rodata`/`.data`/`.bss` + a section-relative `.symtab` symbol +
     // `.rela.text` relocs). The deferred cases still fail loud upstream: an
     // unadvertised section kind (TLS `tdata`/`tbss`) is caught by the linker's
-    // `acceptsDataSection` gate + this arm's earlier TLS reject; a data item
-    // carrying its OWN relocations (a pointer-initializer needing `.rela.data`)
-    // is rejected by `buildExecDataSection` (allowItemRelocations=false above).
+    // `acceptsDataSection` gate + this arm's earlier TLS reject. A data item
+    // carrying its OWN relocations (a pointer-initializer) is now SUPPORTED:
+    // `.data`/`relro` are laid out with allowItemRelocations=true above; ET_REL
+    // emits its `.rela.data` / `.rela.data.rel.ro`, ET_EXEC applies it in place
+    // (D-LK-RELRO-CONST-DATA-RELOCATABLE). A reloc-bearing `.rodata` item still
+    // fails loud (allow=false — the RodataDataItemWithRelocationFailsLoud pin).
     // On the exec path each PRESENT section's row is MANDATORY — fail loud
     // (the format JSON must declare it). The rows also feed the section-header
     // sh_type / sh_flags / name below (all read from the schema, never hardcoded).
@@ -2033,6 +2092,15 @@ encode(AssembledModule const&    module,
         hasBss ? requireSection(fmt, SectionKind::Bss, "ELF writer", reporter)
                : nullptr;
     if (hasBss && secBss == nullptr) return {};
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): the `.data.rel.ro` row is
+    // MANDATORY when an ET_REL object carries relro items (the `.o` schema
+    // declares it). ET_EXEC merged relro into `.data`, so hasRelRo is false and
+    // this peek is skipped there.
+    ObjectFormatSectionInfo const* secRelRo =
+        hasRelRo ? requireSection(fmt, SectionKind::RelRoConst, "ELF writer",
+                                  reporter)
+                 : nullptr;
+    if (hasRelRo && secRelRo == nullptr) return {};
     std::uint64_t const rodataAlign = hasRodata ? rodataLayout.maxAlign : 1;
     std::vector<std::uint8_t> const& rodataBytes = rodataLayout.bytes;
 
@@ -2167,6 +2235,20 @@ encode(AssembledModule const&    module,
                 "elf::encode (ET_EXEC)", reporter)) {
             return {};
         }
+        // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): `.data` now carries reloc-
+        // bearing items — a MUTABLE pointer global's abs64, and the relro CONST
+        // pointers FOLDED in above. Patch each in place with its target's
+        // absolute VA via the SAME shared kernel the dynamic arm + PE/Mach-O use.
+        // (`.rodata` carries none — allow=false; `.bss` is zero-fill.) A static
+        // ET_EXEC is non-PIE with resolved VAs, so there is no `.rela`/base-reloc
+        // table — `siteVasOut` is nullptr.
+        if (hasData
+            && !link::format::applyDataItemRelocations(
+                   dataLayout.bytes, module.dataItems, dataLayout,
+                   dataSectionVa, symbolVa, targetSchema,
+                   "elf::encode (ET_EXEC)", reporter)) {
+            return {};
+        }
     }
 
     // ── Build .strtab + .symtab ────────────────────────────────
@@ -2179,16 +2261,24 @@ encode(AssembledModule const&    module,
     //
     // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: the data-section header indices,
     // computed HERE (before the symtab) so a data symbol's `st_shndx` names its
-    // section. Data sections sit right after `.text`(1) in rodata→data→bss
+    // section. Data sections sit right after `.text`(1) in rodata→data→relro→bss
     // order — the SAME order the `nextIdxS()` cursor + the `headers` push use
     // below — so each index is a running count from 2. (Kept in lockstep with
     // that cursor; the golden ET_REL byte tests pin the resulting layout.)
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): `.data.rel.ro` slots between
+    // `.data` and `.bss` (hasRelRo is ET_REL-only — ET_EXEC merged it into
+    // `.data`, so these indices are unshifted there).
     std::uint16_t const IDX_RODATA = hasRodata ? 2u : 0u;
     std::uint16_t const IDX_DATA   =
         hasData ? static_cast<std::uint16_t>(2u + (hasRodata ? 1u : 0u)) : 0u;
+    std::uint16_t const IDX_RELRO  =
+        hasRelRo ? static_cast<std::uint16_t>(
+                       2u + (hasRodata ? 1u : 0u) + (hasData ? 1u : 0u))
+                 : 0u;
     std::uint16_t const IDX_BSS    =
         hasBss ? static_cast<std::uint16_t>(
-                     2u + (hasRodata ? 1u : 0u) + (hasData ? 1u : 0u))
+                     2u + (hasRodata ? 1u : 0u) + (hasData ? 1u : 0u)
+                     + (hasRelRo ? 1u : 0u))
                : 0u;
 
     StringTable strtab;
@@ -2326,6 +2416,7 @@ encode(AssembledModule const&    module,
             };
         if (hasRodata) emitDataSyms(rodataLayout, IDX_RODATA);
         if (hasData)   emitDataSyms(dataLayout, IDX_DATA);
+        if (hasRelRo)  emitDataSyms(relroLayout, IDX_RELRO);   // c145
         if (hasBss)    emitDataSyms(bssLayout, IDX_BSS);
     }
 
@@ -2333,23 +2424,31 @@ encode(AssembledModule const&    module,
     // defined by any function. ET_EXEC has no extern symbols at this
     // point — the cycle-1 reloc-application pass above failed loud on
     // any unresolved target (FFI / dynamic linking is LK6 cycle 2).
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): scan DATA-ITEM relocations too
+    // — a relro/`.data` const pointer table whose target is an UNDEFINED extern
+    // (`int *const p = &extern_var;`) needs an SHN_UNDEF `.symtab` entry so the
+    // `.rela.data.rel.ro` / `.rela.data` emission below resolves its symIdx (the
+    // final linker binds it). Only `.data`/relro items carry relocs here (a
+    // reloc-bearing `.rodata` item already failed `buildExecDataSection`).
     if (!isExec) {
-        for (auto const& fn : module.functions) {
-            for (auto const& rel : fn.relocations) {
-                if (symIdxBySymbol.contains(rel.target)) continue;
-                // Real import name (D-LK-OBJECT-EXTERN-CALL-RELOCATABLE) so a
-                // foreign linker resolves the extern; `sym_<id>` fallback for a
-                // reloc target that is neither defined nor a known import.
-                std::string const symName =
-                    objNames.externName(rel.target, "sym_");
-                std::uint32_t const nameOff = strtab.add(symName);
-                std::uint32_t const idx =
-                    static_cast<std::uint32_t>(symtab.size() / 24);
-                appendSym(nameOff, makeStInfo(STB_GLOBAL, STT_NOTYPE), 0,
-                          SHN_UNDEF, 0, 0);
-                symIdxBySymbol.emplace(rel.target, idx);
-            }
-        }
+        auto emitExternForReloc = [&](Relocation const& rel) {
+            if (symIdxBySymbol.contains(rel.target)) return;
+            // Real import name (D-LK-OBJECT-EXTERN-CALL-RELOCATABLE) so a
+            // foreign linker resolves the extern; `sym_<id>` fallback for a
+            // reloc target that is neither defined nor a known import.
+            std::string const symName =
+                objNames.externName(rel.target, "sym_");
+            std::uint32_t const nameOff = strtab.add(symName);
+            std::uint32_t const idx =
+                static_cast<std::uint32_t>(symtab.size() / 24);
+            appendSym(nameOff, makeStInfo(STB_GLOBAL, STT_NOTYPE), 0,
+                      SHN_UNDEF, 0, 0);
+            symIdxBySymbol.emplace(rel.target, idx);
+        };
+        for (auto const& fn : module.functions)
+            for (auto const& rel : fn.relocations) emitExternForReloc(rel);
+        for (auto const& di : module.dataItems)
+            for (auto const& rel : di.relocations) emitExternForReloc(rel);
     }
 
     // ── Build .rela.text ───────────────────────────────────────
@@ -2449,6 +2548,71 @@ encode(AssembledModule const&    module,
         }
     }
 
+    // ── Build .rela.data / .rela.data.rel.ro ───────────────────
+    //
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a DATA section whose items carry
+    // their OWN relocations (a const/mutable pointer table — sqlite's VFS method
+    // tables + `aSyscall[]`) gets a `.rela.<section>` mirroring `.rela.text`. Each
+    // item's relocations emit at `r_offset = itemSectionOffset + rel.offset`
+    // against the item's target `.symtab` entry. UNLIKE `.rela.text`, a data
+    // relocation is NEVER a call, so it always emits the plain `nativeId` (never
+    // the PLT variant — a data slot bound through a PLT stub would read jump-stub
+    // bytes as the pointer's value). r_addend bakes the psABI bias
+    // (D-LK-OBJECT-RELOC-ADDEND-CROSSTOOLCHAIN) exactly like `.rela.text`; for an
+    // abs64 pointer (addendBias 0) it is the item's stored addend. ET_REL-only.
+    auto buildDataRela =
+        [&](link::format::ExecDataSectionLayout const& layout)
+        -> std::vector<std::uint8_t> {
+        std::vector<std::uint8_t> rela;
+        for (std::size_t j = 0; j < layout.itemIndices.size(); ++j) {
+            AssembledData const& di = module.dataItems[layout.itemIndices[j]];
+            std::uint64_t const itemOff = layout.itemOffsets[j];
+            for (auto const& rel : di.relocations) {
+                auto const* fmtReloc = fmt.relocationByKind(rel.kind);
+                if (fmtReloc == nullptr) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         "elf::encode: data relocation kind "
+                             + std::to_string(rel.kind.v)
+                             + " not declared by ELF format '"
+                             + std::string{fmt.name()} + "'");
+                    continue;
+                }
+                auto const it = symIdxBySymbol.find(rel.target);
+                if (it == symIdxBySymbol.end()) {
+                    emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                         "elf::encode: data relocation target symbol #"
+                             + std::to_string(rel.target.v)
+                             + " has no symtab entry");
+                    continue;
+                }
+                auto const* triReloc = targetSchema.relocationInfo(rel.kind);
+                if (triReloc == nullptr) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         "elf::encode: data relocation kind "
+                             + std::to_string(rel.kind.v)
+                             + " has no TargetRelocationInfo on target schema '"
+                             + std::string{targetSchema.name()} + "'");
+                    continue;
+                }
+                appendU64LE(rela, itemOff + rel.offset);
+                appendU64LE(rela, makeRelaInfo(it->second, fmtReloc->nativeId));
+                appendI64LE(rela, rel.addend + triReloc->addendBias);
+            }
+        }
+        return rela;
+    };
+    // `.rela.data` for reloc-bearing MUTABLE `.data` items; `.rela.data.rel.ro`
+    // for the const relro items. Both ET_REL-only (on the exec path relro was
+    // merged into `.data` + applied in place, so these layouts hold no relocs).
+    std::vector<std::uint8_t> relaData;
+    std::vector<std::uint8_t> relaRelRo;
+    if (!isExec) {
+        if (hasData)  relaData  = buildDataRela(dataLayout);
+        if (hasRelRo) relaRelRo = buildDataRela(relroLayout);
+    }
+    bool const hasRelaData  = !relaData.empty();
+    bool const hasRelaRelRo = !relaRelRo.empty();
+
     // ── Section ordering + .shstrtab ───────────────────────────
     //
     // ET_REL order: SHT_NULL, .text, .rela.text, .symtab, .strtab,
@@ -2466,11 +2630,37 @@ encode(AssembledModule const&    module,
     SectionHeader hRodata{};
     SectionHeader hData{};
     SectionHeader hBss{};
+    SectionHeader hRelRo{};        // c145: .data.rel.ro (ET_REL)
     SectionHeader hRela{};
+    SectionHeader hRelaData{};     // c145: .rela.data (ET_REL)
+    SectionHeader hRelaRelRo{};    // c145: .rela.data.rel.ro (ET_REL)
     SectionHeader hSymtab{};
     SectionHeader hStrtab{};
     SectionHeader hShStrtab{};
     SectionHeader hNote{};
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): derive the `.rela.<section>` names
+    // for the data relocation tables. ELF names an SHT_RELA table the format's
+    // rela-prefix + the section it applies to; recover the prefix from the
+    // `.rela.text` row (secRela) by stripping the `.text` suffix — schema-driven,
+    // no hardcoded `.rela` literal (a `.rel`/SHT_REL format derives `.rel` the
+    // same way). ET_REL only (secRela is null on the exec path).
+    std::string relaDataName;
+    std::string relaRelRoName;
+    if (secRela != nullptr) {
+        std::string_view relaPrefix{secRela->name};
+        std::string_view const textName{secText->name};
+        if (relaPrefix.size() > textName.size()
+            && relaPrefix.substr(relaPrefix.size() - textName.size())
+                   == textName) {
+            relaPrefix =
+                relaPrefix.substr(0, relaPrefix.size() - textName.size());
+        }
+        if (hasData)
+            relaDataName = std::string{relaPrefix} + std::string{secData->name};
+        if (hasRelRo)
+            relaRelRoName =
+                std::string{relaPrefix} + std::string{secRelRo->name};
+    }
     hText.name_offset      = shstrtab.add(secText->name);
     if (hasRodata) {
         hRodata.name_offset = shstrtab.add(secRodata->name);
@@ -2478,11 +2668,20 @@ encode(AssembledModule const&    module,
     if (hasData) {
         hData.name_offset  = shstrtab.add(secData->name);
     }
+    if (hasRelRo) {
+        hRelRo.name_offset = shstrtab.add(secRelRo->name);
+    }
     if (hasBss) {
         hBss.name_offset   = shstrtab.add(secBss->name);
     }
     if (secRela != nullptr) {
         hRela.name_offset  = shstrtab.add(secRela->name);
+    }
+    if (hasRelaData) {
+        hRelaData.name_offset = shstrtab.add(relaDataName);
+    }
+    if (hasRelaRelRo) {
+        hRelaRelRo.name_offset = shstrtab.add(relaRelRoName);
     }
     hSymtab.name_offset    = shstrtab.add(secSymtab->name);
     hStrtab.name_offset    = shstrtab.add(secStrtab->name);
@@ -2530,8 +2729,13 @@ encode(AssembledModule const&    module,
     // cursor so IDX_SYMTAB/IDX_STRTAB/IDX_SHSTRTAB land after them.
     if (hasRodata) { (void)nextIdxS(); }
     if (hasData)   { (void)nextIdxS(); }
+    if (hasRelRo)  { (void)nextIdxS(); }           // .data.rel.ro (ET_REL) c145
     if (hasBss)    { (void)nextIdxS(); }
     if (!isExec) { (void)nextIdxS(); }            // .rela.text slot (ET_REL)
+    // c145: `.rela.data` / `.rela.data.rel.ro` follow `.rela.text` (ET_REL only,
+    // each present only when its data section carries reloc-bearing items).
+    if (hasRelaData)  { (void)nextIdxS(); }
+    if (hasRelaRelRo) { (void)nextIdxS(); }
     std::uint16_t const IDX_SYMTAB   = nextIdxS();
     std::uint16_t const IDX_STRTAB   = nextIdxS();
     std::uint16_t const IDX_SHSTRTAB = nextIdxS();
@@ -2580,6 +2784,18 @@ encode(AssembledModule const&    module,
         hBss.size        = bssSize;
         hBss.addr        = isExec ? bssSectionVa : 0;  // ET_REL: unbound
     }
+    // `.data.rel.ro` section header (D-LK-RELRO-CONST-DATA-RELOCATABLE, c145).
+    // sh_type / sh_flags from the SCHEMA ROW (SHT_PROGBITS + SHF_ALLOC|SHF_WRITE,
+    // like `.data`). ET_REL only — sh_addr=0 (ET_EXEC merged relro into `.data`,
+    // so hasRelRo is false there). Its OWN relocations live in `.rela.data.rel.ro`.
+    if (hasRelRo) {
+        hRelRo.type       = secRelRo->type;
+        hRelRo.flags      = secRelRo->flags;
+        hRelRo.addr_align = relroLayout.maxAlign;
+        hRelRo.entry_size = secRelRo->entrySize;
+        hRelRo.size       = relroLayout.bytes.size();
+        hRelRo.addr       = 0;  // ET_REL: unbound (never reached with isExec)
+    }
 
     if (secRela != nullptr) {
         hRela.type       = secRela->type;
@@ -2592,6 +2808,29 @@ encode(AssembledModule const&    module,
     } else {
         // ET_EXEC: slot remains SHT_NULL (all zeros). Section index
         // stays in the header table to preserve IDX_* parity.
+    }
+    // `.rela.data` / `.rela.data.rel.ro` (c145): same SHT_RELA type/flags/align/
+    // entrysize as `.rela.text` (all read from the secRela schema row — SHT_RELA
+    // properties are format-owned), but sh_info names the TARGET data section
+    // (IDX_DATA / IDX_RELRO) whose items these relocations patch. sh_link =
+    // .symtab. ET_REL only; each present only when its blob is non-empty.
+    if (hasRelaData) {
+        hRelaData.type       = secRela->type;
+        hRelaData.flags      = secRela->flags;
+        hRelaData.addr_align = secRela->addrAlign;
+        hRelaData.entry_size = secRela->entrySize;
+        hRelaData.link       = IDX_SYMTAB;
+        hRelaData.info       = IDX_DATA;
+        hRelaData.size       = relaData.size();
+    }
+    if (hasRelaRelRo) {
+        hRelaRelRo.type       = secRela->type;
+        hRelaRelRo.flags      = secRela->flags;
+        hRelaRelRo.addr_align = secRela->addrAlign;
+        hRelaRelRo.entry_size = secRela->entrySize;
+        hRelaRelRo.link       = IDX_SYMTAB;
+        hRelaRelRo.info       = IDX_RELRO;
+        hRelaRelRo.size       = relaRelRo.size();
     }
 
     hSymtab.type       = secSymtab->type;
@@ -2726,6 +2965,13 @@ encode(AssembledModule const&    module,
             }
         }
     }
+    // `.data.rel.ro` (c145) — file-backed, packed at its section alignment right
+    // after `.data`, before the zero-fill `.bss` tail. ET_REL only (relro was
+    // merged into `.data` on the exec path, so hasRelRo is false there → no VA
+    // congruence concern).
+    if (hasRelRo) {
+        layoutSection(hRelRo, relroLayout.bytes);
+    }
     if (hasBss) {
         // NOBITS: record sh_offset at the current cursor (conventional — points
         // just past .data) WITHOUT appending bytes; sh_size is the zero-fill
@@ -2734,6 +2980,9 @@ encode(AssembledModule const&    module,
         hBss.offset = bytes.size();
     }
     if (secRela != nullptr) layoutSection(hRela, relaText);
+    // `.rela.data` / `.rela.data.rel.ro` (c145) follow `.rela.text` (ET_REL only).
+    if (hasRelaData)  layoutSection(hRelaData, relaData);
+    if (hasRelaRelRo) layoutSection(hRelaRelRo, relaRelRo);
     layoutSection(hSymtab, symtab);
     layoutSection(hStrtab, strtab.view());
     layoutSection(hShStrtab, shstrtab.view());
@@ -2765,8 +3014,13 @@ encode(AssembledModule const&    module,
     // `.data` / `.bss` (D-LK4-DATA-PRODUCER) follow `.rodata` in the header
     // table (exec-only) — this push order matches the incremental IDX_* math.
     if (hasData) headers.push_back(&hData);
+    // `.data.rel.ro` (c145) between `.data` and `.bss` (ET_REL only).
+    if (hasRelRo) headers.push_back(&hRelRo);
     if (hasBss) headers.push_back(&hBss);
     if (!isExec) headers.push_back(&hRela);
+    // `.rela.data` / `.rela.data.rel.ro` (c145) after `.rela.text` (ET_REL only).
+    if (hasRelaData) headers.push_back(&hRelaData);
+    if (hasRelaRelRo) headers.push_back(&hRelaRelRo);
     headers.push_back(&hSymtab);
     headers.push_back(&hStrtab);
     headers.push_back(&hShStrtab);

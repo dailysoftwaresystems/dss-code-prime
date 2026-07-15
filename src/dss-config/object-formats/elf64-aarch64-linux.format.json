@@ -15,6 +15,9 @@
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: Linux arm64 (AAPCS64) uses the generic LSB-first bit-field allocation — identical to SysV/GNU gnu_packed for little-endian — so it shares the strategy. Byte-ABI-exact (the qemu arm64-ELF corpus is self-consistent under it; the CI cross-compile-compare confirms against the native compiler).",
   "bitFieldStrategy": "gnu_packed",
 
+  "$supportedDataSectionsComment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE + D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a relocatable object carries data — a global lands in `.rodata`/`.data`/`.bss`/`.data.rel.ro` with `sh_addr=0` + a section-relative `.symtab` entry the FINAL linker binds. Same machine-NEUTRAL elf.cpp ET_REL writer as elf64-x86_64-linux (it reads section names/flags + reloc nativeIds from THIS schema, never hardcoding a machine); arch differs only via config — the abs64 data reloc is R_AARCH64_ABS64 (257) here vs R_X86_64_64 (1) on x86_64. A reloc-bearing CONST global (`relro`) emits `.rela.data.rel.ro`; a reloc-bearing MUTABLE pointer emits `.rela.data`. TLS (`tdata`/`tbss`) is deferred to a follow-up.",
+  "supportedDataSections": ["rodata", "data", "bss", "relro"],
+
   "elf": {
     "$comment": "Elf64_Ehdr identity fields. `class` = ELFCLASS64; `data` = ELFDATA2LSB (little-endian — AArch64 is little-endian by convention on Linux); `osabi` = ELFOSABI_NONE (SysV); `machine` = EM_AARCH64 (183).",
     "class": "elf64",
@@ -77,6 +80,42 @@
       "type": 1,
       "flags": 0,
       "addrAlign": 1,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE: read-only initialized data (string literals, const globals). SHT_PROGBITS(1); SHF_ALLOC(2). sh_addr=0 in a relocatable object — the final linker assigns the VA. Same machine-neutral writer as x86_64.",
+      "kind": "rodata",
+      "name": ".rodata",
+      "type": 1,
+      "flags": 2,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE: writable initialized data (mutable globals). SHT_PROGBITS(1); SHF_ALLOC|SHF_WRITE(3). sh_addr=0 in a relocatable object.",
+      "kind": "data",
+      "name": ".data",
+      "type": 1,
+      "flags": 3,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE: zero-initialized data (tentative globals `int g;`). SHT_NOBITS(8) — occupies no file bytes. SHF_ALLOC|SHF_WRITE(3). sh_addr=0 in a relocatable object.",
+      "kind": "bss",
+      "name": ".bss",
+      "type": 8,
+      "flags": 3,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): relocated-read-only const data — a CONST global carrying LOAD-TIME relocations (a const function-pointer table / `int *const p = &x;`). gcc's `.data.rel.ro` contract: SHT_PROGBITS(1) + SHF_ALLOC|SHF_WRITE(3) (the loader writes the resolved target VA into each slot; a foreign linker places it in GNU_RELRO, read-only after relocation). sh_addr=0 in a relocatable object. The writer emits this section's OWN relocations into `.rela.data.rel.ro` (R_AARCH64_ABS64, abs64) — the `.rela.<section>` name is synthesized from this row's name.",
+      "kind": "relro",
+      "name": ".data.rel.ro",
+      "type": 1,
+      "flags": 3,
+      "addrAlign": 8,
       "entrySize": 0
     }
   ],
