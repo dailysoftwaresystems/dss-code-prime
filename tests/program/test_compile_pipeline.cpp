@@ -287,6 +287,43 @@ TEST(Program_CompileFiles, OutputFlagSingleTargetPlacesArtifactFlat) {
            "drift artifact paths for downstream build scripts";
 }
 
+// ── D-LK-OBJECT-EXTERN-SYMBOL-NAMES: single-CU Mach-O name mangling ─
+//
+// The single-CU lowering path runs a defined symbol's on-binary name through
+// the format's C mangling (applyCMangling) — matching the merge path — so a
+// Mach-O relocatable object carries the ld64-expected leading `_`. Identity on
+// ELF/PE; adds `_` on Mach-O. This is the end-to-end proof that the pipeline
+// (not just the writer) produces the mangled form. Red-on-disable: without the
+// single-CU mangle the name is the raw `forty_two`, and `_forty_two` never
+// appears in the .o.
+TEST(Program_CompileFiles, SingleCuMachOObjectSymbolCarriesLeadingUnderscore) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "forty_two.c",
+        "int forty_two() { return 42; }\n");
+    scratch.useAsCwd();
+    auto const outDir = scratch.path() / "out";
+
+    Program prog;
+    prog.setOutputDir(outDir);
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset", {"x86_64:macho64-x86_64-darwin"});
+    ASSERT_EQ(rc, 0);
+    auto const obj = outDir / "forty_two.o";
+    ASSERT_TRUE(fs::exists(obj));
+
+    std::ifstream in(obj, std::ios::binary | std::ios::ate);
+    ASSERT_TRUE(in.good());
+    auto const size = static_cast<std::streamoff>(in.tellg());
+    std::string data(static_cast<std::size_t>(size), '\0');
+    in.seekg(0);
+    in.read(data.data(), size);
+
+    EXPECT_NE(data.find(std::string("_forty_two")), std::string::npos)
+        << "single-CU Mach-O .o must carry the leading-underscore mangled "
+           "symbol name (ld64 convention) — proves the single-CU nameOf mangle";
+}
+
 // ── D-LK10-ENTRY-MAIN-IMPLICIT-RETURN ──────────────────────────────
 //
 // C99 §5.1.2.2.3: a `main` function that reaches the closing `}`

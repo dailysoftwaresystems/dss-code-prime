@@ -96,6 +96,27 @@ struct Loaded {
     return mod;
 }
 
+// c145: locate a section header index by its `.shstrtab` name (−1 if absent).
+[[nodiscard]] std::string readCStr(std::vector<std::uint8_t> const& b,
+                                   std::uint64_t off) {
+    std::string s;
+    for (std::uint64_t p = off; p < b.size() && b[p] != 0; ++p)
+        s.push_back(static_cast<char>(b[p]));
+    return s;
+}
+[[nodiscard]] int findSectionByName(std::vector<std::uint8_t> const& b,
+                                    std::string const& name) {
+    std::uint64_t const shoff    = readU64LE(b, 40);
+    std::uint16_t const shnum    = readU16LE(b, 60);
+    std::uint16_t const shstrndx = readU16LE(b, 62);
+    std::uint64_t const shstrOff = readU64LE(b, shoff + shstrndx * 64 + 24);
+    for (std::uint16_t i = 0; i < shnum; ++i) {
+        std::uint32_t const nameOff = readU32LE(b, shoff + i * 64 + 0);
+        if (readCStr(b, shstrOff + nameOff) == name) return static_cast<int>(i);
+    }
+    return -1;
+}
+
 } // namespace
 
 // ── Shipped JSON loads with new fields ──────────────────────────
@@ -1648,11 +1669,18 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterFailsLoud) {
     EXPECT_TRUE(sawCode);
 }
 
-TEST(ElfRelWriter, ExternImportsFailLoudOnEtRelAlso) {
-    // test-analyzer #7: the externImports fail-loud gate runs BEFORE
-    // the isExec branch, so .o output also rejects non-empty
-    // externImports (relocatable objects don't carry imports either
-    // — those resolve at final-link time).
+TEST(ElfRelWriter, ExternDataImportNoLongerFailsLoudOnEtRel) {
+    // D-LK-OBJECT-DATA-EXTERN-RELOCATABLE (c144): a relocatable object no
+    // longer rejects an extern DATA import. It emits the referenced ones as
+    // SHN_UNDEF NOTYPE symbols + PC32 relocs the FINAL linker resolves by
+    // copy-relocation (see ElfWriter.ObjectDataExternRefEmitsUndefNameAnd
+    // Pc32NotPlt32 for the byte-level pin), and silently DROPS the
+    // UNREFERENCED ones (dead surface — no reloc names them, so the
+    // reloc-driven symtab loop never emits them). This module's `stdout` is
+    // unreferenced (the sole function has no relocation), so encode succeeds
+    // and drops it — where it previously failed loud with
+    // K_FormatLacksImportSupport. Red-on-disable: restore the writer's isData
+    // reject and `errorCount` becomes non-zero.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
@@ -1665,17 +1693,20 @@ TEST(ElfRelWriter, ExternImportsFailLoudOnEtRelAlso) {
     mod.functions.push_back(std::move(fn));
     ExternImport imp;
     imp.symbol      = SymbolId{99};
-    imp.mangledName = "puts";
+    imp.mangledName = "stdout";
     imp.libraryPath = "libc.so.6";
+    imp.isData      = true;          // extern DATA — now accepted, not rejected
     mod.externImports.push_back(std::move(imp));
     DiagnosticReporter rep;
     auto bytes = elf::encode(mod, **target, **fmt, rep);
-    EXPECT_TRUE(bytes.empty());
-    bool sawCode = false;
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "an extern DATA import in a relocatable object must NOT fail loud";
+    EXPECT_FALSE(bytes.empty())
+        << "the object still encodes (the unreferenced data extern is dropped)";
     for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_FormatLacksImportSupport) sawCode = true;
+        EXPECT_NE(d.code, DiagnosticCode::K_FormatLacksImportSupport)
+            << "the ET_REL data-import reject is lifted (c144)";
     }
-    EXPECT_TRUE(sawCode);
 }
 
 // ── D-LK1-ELF-EXEC-DATA-SECTIONS: .rodata emitted from dataItems ──
@@ -2057,15 +2088,59 @@ TEST(ElfExecWriter, RodataDataItemWithRelocationFailsLoud) {
            "D-LK1-ELF-RODATA-DATAITEM-RELOC";
 }
 
+TEST(ElfExecWriter, RelRoConstItemFoldsIntoDataAndPatchesInPlace) {
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): in the EXECUTABLE image a relro
+    // item is FOLDED into `.data` ("treat relro like .data") and its abs64 slot is
+    // patched IN PLACE with the target's absolute VA — NOT fail-loud, and no
+    // `.rela`. RED-on-disable: without the merge+apply the writer either
+    // fail-louds (the old D-LK1-ELF-RODATA-DATAITEM-RELOC path, now relro-routed)
+    // or leaves the pointer slot zero.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);   // `ret` at .text+0
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::RelRoConst;
+    d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};   // 8-byte slot, patched below
+    d.alignment = Alignment::of<8>();
+    Relocation r;
+    r.offset = 0;
+    r.target = SymbolId{1};          // points at the intra-module function
+    r.kind   = RelocationKind{2};    // abs64
+    r.addend = 0;
+    d.relocations.push_back(r);
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "a relro item must NOT fail loud in an executable image";
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_EQ(readU16LE(bytes, 16), 2u) << "e_type = ET_EXEC";
+    // The exec image folds relro into `.data` — NO separate `.data.rel.ro`.
+    EXPECT_LT(findSectionByName(bytes, ".data.rel.ro"), 0)
+        << "the exec image folds relro into .data (no separate .data.rel.ro)";
+    int const dataIdx = findSectionByName(bytes, ".data");
+    ASSERT_GE(dataIdx, 0) << "the relro item rides `.data` in the exec image";
+    std::uint64_t const shoff   = readU64LE(bytes, 40);
+    std::uint64_t const dataOff = readU64LE(bytes, shoff + dataIdx * 64 + 24);
+    auto const* secText = loaded.format->sectionByKind(SectionKind::Text);
+    ASSERT_NE(secText, nullptr);
+    EXPECT_EQ(readU64LE(bytes, dataOff), secText->virtualAddress)
+        << "the relro pointer slot is patched in place with the function VA";
+}
+
 // ── Code-review FOLD pins (H1 / M1 / L1) ──────────────────────────
 
-TEST(ElfExecWriter, ElfExecRejectsDataItemsOnRelocatable) {
-    // L1 / defence-in-depth: dataItems on the ET_REL (.o) path are
-    // rejected loudly — rodata in a .o rides the symbol+section table,
-    // NOT the dataItems pipeline. We call elf::encode DIRECTLY against
-    // the ET_REL schema (`elf64-x86_64-linux`, the .o format) so the
-    // writer's own `!isExec && !dataItems.empty()` guard fires (the
-    // linker's per-format gate would otherwise reject earlier).
+TEST(ElfExecWriter, ElfRelAcceptsRodataDataItem) {
+    // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: a relocatable object now EMITS a
+    // plain (no-reloc) rodata item — the former "(ET_REL) … D-LK1-ELF-EXEC-
+    // DATA-SECTIONS exec-only" reject is LIFTED. The item lands in `.rodata`
+    // (sh_addr=0) with a section-relative `.symtab` symbol the final linker
+    // binds. (The section-relative data-symbol shape is pinned by
+    // ElfWriter.ObjectEmitsDataSectionAndSectionRelativeDataSymbol; a data item
+    // WITH its own relocation still fails loud — the D-LK1-ELF-RODATA-DATAITEM-
+    // RELOC test above.) RED if the ELF writer reverts to rejecting ET_REL data.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
@@ -2073,26 +2148,16 @@ TEST(ElfExecWriter, ElfExecRejectsDataItemsOnRelocatable) {
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     AssembledData d;
     d.symbol    = SymbolId{42};
-    d.section   = DataSectionKind::Rodata;   // a VALID rodata item —
-    d.bytes     = {42, 0, 0, 0};             // it sails past the
-    d.alignment = Alignment::of<4>();        // Rodata/no-reloc scans
-    mod.dataItems.push_back(std::move(d));    // and hits the !isExec gate
+    d.section   = DataSectionKind::Rodata;
+    d.bytes     = {42, 0, 0, 0};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
     DiagnosticReporter rep;
     auto bytes = elf::encode(mod, **target, **fmt, rep);
-    EXPECT_TRUE(bytes.empty());
-    EXPECT_GT(rep.errorCount(), 0u);
-    bool sawCode = false;
-    for (auto const& diag : rep.all()) {
-        if (diag.code == DiagnosticCode::K_NoMatchingObjectFormat
-         && diag.actual.find("(ET_REL)") != std::string::npos
-         && diag.actual.find("D-LK1-ELF-EXEC-DATA-SECTIONS")
-                != std::string::npos) {
-            sawCode = true;
-        }
-    }
-    EXPECT_TRUE(sawCode)
-        << "dataItems on ET_REL must fail loud as (ET_REL) citing "
-           "D-LK1-ELF-EXEC-DATA-SECTIONS";
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "ET_REL must ACCEPT a plain rodata item "
+           "(D-LK-OBJECT-DATA-SECTION-RELOCATABLE)";
+    EXPECT_FALSE(bytes.empty());
 }
 
 TEST(ElfExecWriter, ElfExecMultipleRodataItemsLayoutWithAlignmentPadding) {

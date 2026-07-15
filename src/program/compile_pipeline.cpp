@@ -8,6 +8,7 @@
 #include "core/substrate/phase_timers.hpp"      // c97: per-phase --time accumulation
 #include "core/types/parse_diagnostic.hpp"
 #include "ffi/ingest.hpp"
+#include "ffi/mangling/c_mangle.hpp"  // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: applyCMangling
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "link/linker.hpp"
@@ -1057,6 +1058,7 @@ resolveSingleCuUserEntry(SemanticModel const& model, GrammarSchema const& gramma
 std::optional<AssembledModule>
 lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::optional<ProcessArgs> const& processArgs,
+                     ObjectFormatKind                  fmtKind,
                      DiagnosticReporter&               reporter) {
     SemanticModel&       model   = cuMir.model;
     GrammarSchema const& grammar = *cuMir.grammar;
@@ -1107,12 +1109,19 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
         return std::nullopt;  // unsupported SEH shape (c116b frontier) — fail-loud.
     }
 
-    // `nameOf`: SymbolId → declared name. A SymbolId with no record (synthesized /
-    // out-of-range) yields "" — the LK11a symbol-table populate then skips it as
-    // module-private, exactly as the old `rec == nullptr` skip did.
+    // `nameOf`: SymbolId → the on-binary symbol name = the declared name run
+    // through the FORMAT'S C mangling (`applyCMangling`: identity on ELF/PE, a
+    // leading `_` on Mach-O). D-LK-OBJECT-EXTERN-SYMBOL-NAMES: this makes the
+    // single-CU `ModuleSymbol.name` the SAME pre-mangled on-binary form the
+    // merge path already stores (program.cpp, via D-LK-MACHO-CROSSCU-MANGLE-
+    // MERGE-KEY / c118), so the object writers emit it VERBATIM with no per-
+    // path divergence and no double-mangle. Identity on ELF/PE → byte-identical
+    // to the pre-fix output; adds the `_` on Mach-O only. A SymbolId with no
+    // record (synthesized / out-of-range) yields "" — the LK11a symbol-table
+    // populate then skips it as module-private, exactly as before.
     auto nameOf = [&](SymbolId s) -> std::string {
         SymbolRecord const* r = model.recordFor(s);
-        return r ? r->name : std::string{};
+        return r ? dss::ffi::applyCMangling(r->name, fmtKind) : std::string{};
     };
 
     return lowerMirModuleToAssembly(
@@ -1209,7 +1218,8 @@ assembleUnit(CompilationUnit const&        cu,
     auto cuMir = buildCuMir(cu, grammar, target, format,
                             callingConventionIndex, reporter, opts);
     if (!cuMir) return std::nullopt;
-    return lowerCuMirToAssembly(*cuMir, format.processArgs(), reporter);
+    return lowerCuMirToAssembly(*cuMir, format.processArgs(),
+                                format.kind(), reporter);
 }
 
 bool compileSingleUnit(CompilationUnit const&        cu,

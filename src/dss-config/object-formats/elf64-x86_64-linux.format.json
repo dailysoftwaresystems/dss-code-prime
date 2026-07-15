@@ -15,6 +15,12 @@
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: C bit-field allocation is OS/format-determined (the x86_64 CPU target serves BOTH this ELF-SysV format and PE-MS), so the strategy lives here, not on the target. SysV/Itanium/GNU LSB-first packing into the declared-type unit — byte-ABI-exact to gcc (verified by the conformance witness). Different-sized adjacent bit-fields may SHARE a unit (unlike MSVC).",
   "bitFieldStrategy": "gnu_packed",
 
+  "$externCallDispatchComment": "D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: extern calls in a RELOCATABLE object lower to a PLAIN DIRECT `call` (E8 disp32) + a rel32 relocation against the UNDEFINED extern symbol — the SAME call-site shape as the exec `direct-plt`, except the FINAL (foreign) linker synthesizes the PLT/GOT and resolves the symbol, not DSS. So `direct-plt` is the right dispatch here too; the relocatable writer emits the extern as an SHN_UNDEF `.symtab` entry + a `.rela.text` reloc rather than a DSS-synthesized stub. The undefined-extern CALL reloc is emitted as R_X86_64_PLT32 (the linker-may-use-PLT variant of PC32, same S+A-P formula) so a foreign PIE link resolves it through a linker-built PLT instead of erroring on a bare PC32 against an undefined symbol.",
+  "externCallDispatch": "direct-plt",
+
+  "$supportedDataSectionsComment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE: a relocatable object DOES carry data — a global lands in `.rodata`/`.data`/`.bss`/`.data.rel.ro` with `sh_addr=0` and a section-relative `.symtab` entry (STT_OBJECT, st_shndx = the data section, st_value = offset) the FINAL linker binds. Same `AssembledModule.dataItems` producer path as exec (format-blind); the ET_REL writer emits the section bytes + data symbols + relocs against them instead of resolving to absolute VAs. D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a CONST global that carries LOAD-TIME relocations (a const function-pointer table / `int *const p = &x;` — sqlite's VFS method tables + `aSyscall[]`) lands in `relro` (ELF `.data.rel.ro`) and the writer emits its OWN relocations into `.rela.data.rel.ro` (R_X86_64_64); a reloc-bearing MUTABLE pointer global lands in `.data` and gets `.rela.data`. TLS (`tdata`/`tbss`) is deferred to a follow-up.",
+  "supportedDataSections": ["rodata", "data", "bss", "relro"],
+
   "elf": {
     "$comment": "Elf64_Ehdr identity fields. `class` = ELFCLASS64; `data` = ELFDATA2LSB (little-endian); `osabi` = ELFOSABI_NONE (SysV, conventional for relocatable .o); `machine` = EM_X86_64 (62).",
     "class": "elf64",
@@ -69,15 +75,61 @@
       "flags": 0,
       "addrAlign": 1,
       "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-EXTERN-SYMBOL-NAMES: empty non-executable-stack marker for foreign-toolchain interop. sh_type = SHT_PROGBITS (1); sh_flags = 0 (NO SHF_EXECINSTR) is what tells `ld` the stack need not be executable; addralign = 1; size 0. The ELF writer emits it (appended last, ET_REL only) iff this row is present.",
+      "kind": "note",
+      "name": ".note.GNU-stack",
+      "type": 1,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE: read-only initialized data (string literals, const globals). SHT_PROGBITS(1); SHF_ALLOC(2). In a relocatable object sh_addr=0 (the writer forces it) — the final linker assigns the VA. No virtualAddress field (exec-only).",
+      "kind": "rodata",
+      "name": ".rodata",
+      "type": 1,
+      "flags": 2,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE: writable initialized data (mutable globals, `int counter = 7;`). SHT_PROGBITS(1); SHF_ALLOC|SHF_WRITE(3). sh_addr=0 in a relocatable object.",
+      "kind": "data",
+      "name": ".data",
+      "type": 1,
+      "flags": 3,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE: zero-initialized data (tentative globals `int g;`). SHT_NOBITS(8) — occupies no file bytes. SHF_ALLOC|SHF_WRITE(3). sh_addr=0 in a relocatable object.",
+      "kind": "bss",
+      "name": ".bss",
+      "type": 8,
+      "flags": 3,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): relocated-read-only const data — a CONST global that carries LOAD-TIME relocations (a const function-pointer table / `int *const p = &x;` — sqlite's VFS method tables + `aSyscall[]`). This is the gcc `.data.rel.ro` contract: SHT_PROGBITS(1) + SHF_ALLOC|SHF_WRITE(3) — identical flags to `.data` (the loader must WRITE the resolved target VA into each slot during load-time relocation; it cannot sit in read-only `.rodata`, which would force DT_TEXTREL under PIE). A foreign linker places it in the GNU_RELRO segment (read-only AFTER relocation). sh_addr=0 in a relocatable object. The writer emits this section's OWN relocations into `.rela.data.rel.ro` (R_X86_64_64, abs64) — the ET_REL writer synthesizes the `.rela.<section>` name from this row's name, so no separate reloc-table row is declared here.",
+      "kind": "relro",
+      "name": ".data.rel.ro",
+      "type": 1,
+      "flags": 3,
+      "addrAlign": 8,
+      "entrySize": 0
     }
   ],
 
   "relocations": [
     {
-      "$comment": "PC-relative 32-bit (call / jmp rel32). ELF type R_X86_64_PC32 = 2. `kind` = 1 matches x86_64.target.json's `rel32` row.",
+      "$comment": "PC-relative 32-bit (call / jmp rel32). ELF type R_X86_64_PC32 = 2. `kind` = 1 matches x86_64.target.json's `rel32` row. `pltNativeId` = 4 (R_X86_64_PLT32): when this rel32 targets an UNDEFINED extern (a `call` to a libc function the FINAL linker resolves), the writer emits PLT32 instead so a foreign PIE link routes it through a linker-built PLT — a bare PC32 against an undefined symbol errors under -pie (D-LK-OBJECT-EXTERN-CALL-RELOCATABLE). Same S+A-P formula, same -4 addend.",
       "name": "R_X86_64_PC32",
       "kind": 1,
-      "nativeId": 2
+      "nativeId": 2,
+      "pltNativeId": 4
     },
     {
       "$comment": "Absolute 64-bit. ELF type R_X86_64_64 = 1. `kind` = 2 matches x86_64.target.json's `abs64` row.",

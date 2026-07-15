@@ -122,6 +122,15 @@ struct DSS_EXPORT ObjectFormatRelocationInfo {
     std::uint32_t  nativeId = 0;    // ELF r_info type / PE Type /
                                     // Mach-O r_type / WASM reloc type
                                     // — format-specific wire value
+    // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: the "may go through a PLT" variant
+    // of this reloc type (e.g. R_X86_64_PLT32=4 for the R_X86_64_PC32=2 rel32
+    // call). Emitted INSTEAD of `nativeId` when this reloc targets an UNDEFINED
+    // extern in a relocatable object, so a foreign PIE linker resolves the
+    // extern through a linker-built PLT — a bare PC32 against an undefined
+    // symbol errors under -pie. 0 (default) = no PLT variant (the reloc never
+    // names an extern call — e.g. abs64/abs32 data relocs), and the emitter
+    // uses `nativeId` unchanged.
+    std::uint32_t  pltNativeId = 0;
 };
 
 // ── Per-section row (plan 14 D-LK4-2) ───────────────────────────

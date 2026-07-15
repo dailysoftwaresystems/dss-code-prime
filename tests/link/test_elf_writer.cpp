@@ -3,9 +3,10 @@
 // Pins golden byte-level invariants of the emitted ELF64 relocatable
 // object:
 //   * Elf64_Ehdr identity bytes match the gABI spec for ET_REL x86_64.
-//   * Section count = 6 (SHT_NULL + .text + .rela.text + .symtab +
-//     .strtab + .shstrtab).
-//   * e_shstrndx points at .shstrtab (index 5).
+//   * Section count = 7 (SHT_NULL + .text + .rela.text + .symtab +
+//     .strtab + .shstrtab + .note.GNU-stack appended last).
+//   * e_shstrndx points at .shstrtab (index 5) — unchanged by the
+//     appended-last .note.GNU-stack (D-LK-OBJECT-EXTERN-SYMBOL-NAMES).
 //   * .symtab sh_info equals the index of the first non-LOCAL symbol
 //     (mandatory by gABI 4.18 — local-then-global ordering).
 //   * Function symbol's st_value matches its offset within .text.
@@ -83,6 +84,34 @@ struct Loaded {
     return mod;
 }
 
+// Read the NUL-terminated symbol name at `strtabOff + stName` in `.strtab`.
+[[nodiscard]] std::string readStrtabName(std::vector<std::uint8_t> const& bytes,
+                                          std::uint64_t strtabOff,
+                                          std::uint32_t stName) {
+    std::string out;
+    for (std::size_t p = strtabOff + stName; p < bytes.size() && bytes[p] != 0; ++p) {
+        out.push_back(static_cast<char>(bytes[p]));
+    }
+    return out;
+}
+
+// Find a section header index by its `.shstrtab` name (robust to layout
+// reordering — the c145 relro tests key on names, not golden indices).
+// Returns -1 when absent.
+[[nodiscard]] int findSectionByName(std::vector<std::uint8_t> const& bytes,
+                                    std::string const& name) {
+    std::uint64_t const shoff    = readU64LE(bytes, 40);
+    std::uint16_t const shnum    = readU16LE(bytes, 60);
+    std::uint16_t const shstrndx = readU16LE(bytes, 62);
+    std::uint64_t const shstrOff = readU64LE(bytes, shoff + shstrndx * 64 + 24);
+    for (std::uint16_t i = 0; i < shnum; ++i) {
+        std::uint32_t const nameOff = readU32LE(bytes, shoff + i * 64 + 0);
+        if (readStrtabName(bytes, shstrOff, nameOff) == name)
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
 } // namespace
 
 // ── Shipped JSON loads ───────────────────────────────────────────
@@ -145,15 +174,15 @@ TEST(ElfWriter, Elf64EhdrIdentityBytesMatchGabiSpec) {
     EXPECT_EQ(readU16LE(bytes, 52), 64u);
     // e_shentsize = 64 (sizeof Elf64_Shdr)
     EXPECT_EQ(readU16LE(bytes, 58), 64u);
-    // e_shnum = 6
-    EXPECT_EQ(readU16LE(bytes, 60), 6u);
-    // e_shstrndx = 5
+    // e_shnum = 7 (…+ .note.GNU-stack appended last)
+    EXPECT_EQ(readU16LE(bytes, 60), 7u);
+    // e_shstrndx = 5 (.shstrtab; unchanged — .note.GNU-stack is index 6)
     EXPECT_EQ(readU16LE(bytes, 62), 5u);
 }
 
 // ── Section header table layout ─────────────────────────────────
 
-TEST(ElfWriter, SectionHeaderTableHasSixEntriesNullThenTextThenRelocAtEnd) {
+TEST(ElfWriter, SectionHeaderTableHasSevenEntriesNullThenTextThenRelocThenNoteLast) {
     auto loaded = loadShipped();
     AssembledModule mod = makeTrivialModule({0xC3}, 42);
     DiagnosticReporter rep;
@@ -163,7 +192,7 @@ TEST(ElfWriter, SectionHeaderTableHasSixEntriesNullThenTextThenRelocAtEnd) {
     // e_shoff is the file offset of the section header table.
     std::uint64_t const shoff = readU64LE(bytes, 40);
     ASSERT_GT(shoff, 64u);
-    ASSERT_LE(shoff + 6 * 64, bytes.size())
+    ASSERT_LE(shoff + 7 * 64, bytes.size())
         << "section header table must fit within file";
 
     // Section header 0 (SHT_NULL) is all zero.
@@ -181,6 +210,17 @@ TEST(ElfWriter, SectionHeaderTableHasSixEntriesNullThenTextThenRelocAtEnd) {
     // Section header 2 (.rela.text): sh_type=SHT_RELA(4), sh_entsize=24.
     EXPECT_EQ(readU32LE(bytes, shoff + 128 + 4), 4u);
     EXPECT_EQ(readU64LE(bytes, shoff + 128 + 56), 24u);
+
+    // Section header 6 (.note.GNU-stack, appended LAST — D-LK-OBJECT-EXTERN-
+    // SYMBOL-NAMES): SHT_PROGBITS(1), sh_flags=0 (NO SHF_EXECINSTR — the
+    // non-executable-stack marker), sh_size=0 (empty).
+    std::uint64_t const noteShdr = shoff + 6 * 64;
+    EXPECT_EQ(readU32LE(bytes, noteShdr + 4), 1u)  // sh_type
+        << ".note.GNU-stack must be SHT_PROGBITS";
+    EXPECT_EQ(readU64LE(bytes, noteShdr + 8), 0u)  // sh_flags
+        << ".note.GNU-stack sh_flags must be 0 (no SHF_EXECINSTR)";
+    EXPECT_EQ(readU64LE(bytes, noteShdr + 32), 0u) // sh_size
+        << ".note.GNU-stack is an empty marker section";
 }
 
 // ── .symtab local-then-global ordering ──────────────────────────
@@ -237,6 +277,249 @@ TEST(ElfWriter, FunctionSymbolStValueMatchesTextOffset) {
     EXPECT_EQ(readU64LE(bytes, symtabOff + 3 * 24 + 16), 1u);
 }
 
+// ── D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real names in the .o symtab ──
+
+TEST(ElfWriter, ObjectSymtabCarriesRealNameForExternalDefButStaticStaysInternal) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    // Two defined functions covering both externally-visible forms:
+    //   * fn A (SymbolId 10) — externally-visible (Global) → REAL name.
+    //   * fn B (SymbolId 11) — static (Local) → stays internal `sym_11`.
+    // (The IMPORT side — naming an undefined extern + its PLT32 reloc — is
+    // covered by ObjectExternCallEmitsUndefImportNameAndPlt32Reloc below.)
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+
+    AssembledFunction a;
+    a.symbol = SymbolId{10};
+    a.bytes  = {0xC3};
+    mod.functions.push_back(std::move(a));
+
+    AssembledFunction b;
+    b.symbol = SymbolId{11};
+    b.bytes  = {0xC3};
+    mod.functions.push_back(std::move(b));
+
+    // The name/binding table the compile pipeline populates (LK11a), carrying
+    // the already-mangled on-binary name (identity on ELF).
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "public_fn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{11}, "static_fn",
+                                       SymbolBinding::Local,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    std::uint64_t const shoff     = readU64LE(bytes, 40);
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + 3 * 64 + 24);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + 4 * 64 + 24);
+
+    // Symtab order: 0=UNDEF, 1=STT_SECTION, 2=fnA, 3=fnB.
+    auto nameAt = [&](std::uint64_t i) {
+        return readStrtabName(bytes, strtabOff,
+                              readU32LE(bytes, symtabOff + i * 24 + 0));
+    };
+    auto infoAt = [&](std::uint64_t i) { return bytes[symtabOff + i * 24 + 4]; };
+
+    // EXPORT — externally-visible fn A carries its real C name (STB_GLOBAL|STT_FUNC).
+    EXPECT_EQ(nameAt(2), "public_fn")
+        << "externally-visible defined function must carry its real name";
+    EXPECT_EQ(infoAt(2), 0x12u);   // (STB_GLOBAL<<4)|STT_FUNC
+
+    // CARVE-OUT — static fn B stays internal `sym_11` (isExternallyVisible=false).
+    EXPECT_EQ(nameAt(3), "sym_11")
+        << "a static (Local-binding) function must stay internal, not leak its "
+           "real name into the object symtab";
+    EXPECT_EQ(infoAt(3), 0x12u);   // still STB_GLOBAL|STT_FUNC (name-only carve-out)
+}
+
+// ── D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: undefined extern + PLT32 ──
+
+TEST(ElfWriter, ObjectExternCallEmitsUndefImportNameAndPlt32Reloc) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    // The relocatable format now declares externCallDispatch, so an ET_REL
+    // object CAN carry an extern import (a `call` to a libc function the FINAL
+    // linker resolves). The extern must appear as an SHN_UNDEF symbol with its
+    // real name, and its rel32 call reloc must be the PLT-capable PLT32 (type
+    // 4) — a bare PC32 against an undefined symbol errors under a foreign -pie.
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction caller;
+    caller.symbol = SymbolId{10};
+    caller.bytes  = {0xE8, 0x00, 0x00, 0x00, 0x00};   // call rel32 → extern
+    caller.relocations.push_back(Relocation{/*offset=*/1u, /*target=*/SymbolId{20},
+                                            /*kind=*/RelocationKind{1},  // rel32
+                                            /*addend=*/0});
+    mod.functions.push_back(std::move(caller));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "caller",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    ExternImport ext;
+    ext.symbol      = SymbolId{20};
+    ext.mangledName = "libc_fn";
+    ext.isData      = false;
+    mod.externImports.push_back(std::move(ext));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u) << "ET_REL with externCallDispatch must "
+                                       "accept an extern import";
+
+    std::uint64_t const shoff     = readU64LE(bytes, 40);
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + 3 * 64 + 24);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + 4 * 64 + 24);
+
+    // Symtab: 0=UNDEF, 1=STT_SECTION, 2=caller, 3=extern.
+    std::uint32_t const extStName = readU32LE(bytes, symtabOff + 3 * 24 + 0);
+    EXPECT_EQ(readStrtabName(bytes, strtabOff, extStName), "libc_fn")
+        << "undefined extern must carry its real import name";
+    EXPECT_EQ(readU16LE(bytes, symtabOff + 3 * 24 + 6), 0u)      // st_shndx
+        << "extern must be SHN_UNDEF";
+
+    // .rela.text (section index 2): one entry, type = PLT32 (4), addend -4.
+    std::uint64_t const relaOff = readU64LE(bytes, shoff + 2 * 64 + 24);
+    std::uint64_t const rInfo   = readU64LE(bytes, relaOff + 8);
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo), 4u)
+        << "an extern call reloc must be R_X86_64_PLT32 (4), not PC32 (2), so a "
+           "foreign PIE link routes it through a linker-built PLT";
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo >> 32), 3u)  // symtab idx = extern
+        << "reloc must target the undefined extern symbol";
+    std::int64_t const addend = static_cast<std::int64_t>(readU64LE(bytes, relaOff + 16));
+    EXPECT_EQ(addend, -4) << "psABI rel32 addend (baked bias)";
+}
+
+// ── D-LK-OBJECT-DATA-EXTERN-RELOCATABLE: data extern → PC32, not PLT32 ──
+
+TEST(ElfWriter, ObjectDataExternRefEmitsUndefNameAndPc32NotPlt32) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    // A relocatable object references BOTH a libc DATA object (`stdout`, an
+    // extern `isData` import) and a libc FUNCTION (`fputs`). The DATA
+    // reference must emit a plain PC32 (type 2) — exactly what gcc emits for
+    // `extern FILE *stdout` in a `.o`, which the final executable link
+    // resolves by copy-relocation — while the CALL keeps the PLT-capable
+    // PLT32 (type 4). This is the correctness pin for the isData exclusion in
+    // externCallTargets: were the data ref PLT32, the final linker would bind
+    // `stdout` to a PLT stub and the code would read jump-stub bytes as the
+    // FILE* value (the silent miscompile the image-path reject guards). Both
+    // externs are SHN_UNDEF NOTYPE (matching gcc's stdout/fputs symbols).
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{10};
+    // Synthetic opcodes; only the two relocations drive the ELF Rela under
+    // test. Byte 3: rel32 slot of a `mov rax,[rip+stdout]`; byte 8: rel32
+    // slot of a `call fputs`.
+    fn.bytes  = {0x48, 0x8B, 0x05, 0, 0, 0, 0,   // mov rax,[rip+disp32]  (7 bytes)
+                 0xE8, 0, 0, 0, 0};              // call rel32            (5 bytes)
+    fn.relocations.push_back(Relocation{/*offset=*/3u, /*target=*/SymbolId{20},
+                                        /*kind=*/RelocationKind{1}, /*addend=*/0});
+    fn.relocations.push_back(Relocation{/*offset=*/8u, /*target=*/SymbolId{30},
+                                        /*kind=*/RelocationKind{1}, /*addend=*/0});
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "user_fn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    ExternImport dataExt;
+    dataExt.symbol      = SymbolId{20};
+    dataExt.mangledName = "stdout";
+    dataExt.libraryPath = "libc.so.6";
+    dataExt.isData      = true;                       // the DATA extern
+    mod.externImports.push_back(std::move(dataExt));
+    ExternImport fnExt;
+    fnExt.symbol      = SymbolId{30};
+    fnExt.mangledName = "fputs";
+    fnExt.libraryPath = "libc.so.6";
+    fnExt.isData      = false;                        // the FUNCTION extern
+    mod.externImports.push_back(std::move(fnExt));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "ET_REL must accept a data extern (D-LK-OBJECT-DATA-EXTERN-RELOCATABLE)";
+
+    std::uint64_t const shoff     = readU64LE(bytes, 40);
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + 3 * 64 + 24);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + 4 * 64 + 24);
+
+    // Symtab: 0=UNDEF, 1=STT_SECTION, 2=user_fn, then externs in first-
+    // reference order → 3=stdout (reloc[0]), 4=fputs (reloc[1]).
+    EXPECT_EQ(readStrtabName(bytes, strtabOff, readU32LE(bytes, symtabOff + 3 * 24 + 0)),
+              "stdout") << "data extern carries its real libc name";
+    EXPECT_EQ(bytes[symtabOff + 3 * 24 + 4], 0x10u)             // STB_GLOBAL|STT_NOTYPE
+        << "data extern is NOTYPE (matches gcc's `stdout` symbol), not STT_OBJECT";
+    EXPECT_EQ(readU16LE(bytes, symtabOff + 3 * 24 + 6), 0u)     // st_shndx = SHN_UNDEF
+        << "data extern must be SHN_UNDEF";
+    EXPECT_EQ(readStrtabName(bytes, strtabOff, readU32LE(bytes, symtabOff + 4 * 24 + 0)),
+              "fputs") << "function extern follows in reference order";
+
+    // .rela.text (section index 2): entry 0 = data ref, entry 1 = the call.
+    std::uint64_t const relaOff = readU64LE(bytes, shoff + 2 * 64 + 24);
+    std::uint64_t const rInfo0  = readU64LE(bytes, relaOff + 0 * 24 + 8);
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo0), 2u)
+        << "a DATA extern reference must be R_X86_64_PC32 (2), NOT PLT32 (4)";
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo0 >> 32), 3u)
+        << "reloc 0 targets the stdout symbol (symtab idx 3)";
+    std::uint64_t const rInfo1  = readU64LE(bytes, relaOff + 1 * 24 + 8);
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo1), 4u)
+        << "the FUNCTION call keeps R_X86_64_PLT32 (4) — the isData exclusion "
+           "must not weaken function-call dispatch";
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo1 >> 32), 4u)
+        << "reloc 1 targets the fputs symbol (symtab idx 4)";
+}
+
+// ── D-LK-OBJECT-DATA-SECTION-RELOCATABLE: .data + section-relative sym ──
+
+TEST(ElfWriter, ObjectEmitsDataSectionAndSectionRelativeDataSymbol) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);   // one `ret` function
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Data;
+    d.bytes     = {7, 0, 0, 0};                            // int counter = 7
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{42}, "counter",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "ET_REL must now accept a Data item (D-LK-OBJECT-DATA-SECTION-RELOCATABLE)";
+
+    // Section table: NULL(0), .text(1), .data(2), .rela.text(3), .symtab(4),
+    // .strtab(5), .shstrtab(6), .note.GNU-stack(7).
+    EXPECT_EQ(readU16LE(bytes, 60), 8u) << "e_shnum grows to 8 with .data";
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    // .data (index 2): SHT_PROGBITS(1); SHF_ALLOC|SHF_WRITE(3); sh_addr=0 (unbound).
+    EXPECT_EQ(readU32LE(bytes, shoff + 2 * 64 + 4), 1u)  << ".data SHT_PROGBITS";
+    EXPECT_EQ(readU64LE(bytes, shoff + 2 * 64 + 8), 3u)  << ".data SHF_ALLOC|SHF_WRITE";
+    EXPECT_EQ(readU64LE(bytes, shoff + 2 * 64 + 16), 0u) << ".data sh_addr=0 in a .o";
+
+    // .symtab at index 4; the data symbol at symtab idx 3
+    // (0=UNDEF, 1=.text section, 2=func, 3=data).
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + 4 * 64 + 24);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + 5 * 64 + 24);
+    std::uint32_t const stName = readU32LE(bytes, symtabOff + 3 * 24 + 0);
+    EXPECT_EQ(readStrtabName(bytes, strtabOff, stName), "counter")
+        << "data global carries its real name (red-on-disable vs sym_42)";
+    EXPECT_EQ(bytes[symtabOff + 3 * 24 + 4], 0x11u)             // STB_GLOBAL|STT_OBJECT
+        << "data symbol is STB_GLOBAL|STT_OBJECT";
+    EXPECT_EQ(readU16LE(bytes, symtabOff + 3 * 24 + 6), 2u)     // st_shndx = .data
+        << "data symbol st_shndx names .data (index 2)";
+    EXPECT_EQ(readU64LE(bytes, symtabOff + 3 * 24 + 8), 0u)     // st_value
+        << "section-relative st_value (offset 0 in .data)";
+    EXPECT_EQ(readU64LE(bytes, symtabOff + 3 * 24 + 16), 4u)    // st_size
+        << "st_size = sizeof(int)";
+}
+
 // ── Rela r_info encodes (sym << 32) | nativeId ──────────────────
 
 TEST(ElfWriter, RelaRecordsNativeRelocTypeAndSymtabIndex) {
@@ -252,7 +535,10 @@ TEST(ElfWriter, RelaRecordsNativeRelocTypeAndSymtabIndex) {
     rel.offset = 1;                  // patch site = byte 1 (the rel32)
     rel.target = SymbolId{2};        // undefined extern
     rel.kind   = RelocationKind{1};  // matches `rel32` (PC32 in elf JSON)
-    rel.addend = -4;
+    rel.addend = 0;                  // real codegen stamps 0; the psABI -4 for a
+                                     // rel32 field lives in the target schema's
+                                     // addendBias, baked into r_addend at emit
+                                     // (D-LK-OBJECT-RELOC-ADDEND-CROSSTOOLCHAIN)
     caller.relocations.push_back(rel);
     mod.functions.push_back(std::move(caller));
 
@@ -273,9 +559,189 @@ TEST(ElfWriter, RelaRecordsNativeRelocTypeAndSymtabIndex) {
     EXPECT_EQ(type, 2u) << "R_X86_64_PC32 = 2";
     // sym 0 = STN_UNDEF, sym 1 = section, sym 2 = caller, sym 3 = target.
     EXPECT_EQ(symIdx, 3u);
-    // r_addend == -4 (assembler's rel32 bias).
+    // r_addend == -4 = rel.addend(0) + the rel32 addendBias(-4), baked in for a
+    // FOREIGN linker (D-LK-OBJECT-RELOC-ADDEND-CROSSTOOLCHAIN). A rel32 field is
+    // relative to the instruction END (4 bytes past the reloc offset), so gcc's
+    // ld — applying the psABI S + A - P with no knowledge of DSS's addendBias —
+    // needs A = -4 to land on the symbol. Red-on-disable: emitting rel.addend
+    // verbatim (0) makes gcc resolve a call to sym+4 → SIGSEGV.
     std::int64_t const addend = static_cast<std::int64_t>(readU64LE(bytes, relaOff + 16));
-    EXPECT_EQ(addend, -4);
+    EXPECT_EQ(addend, -4)
+        << "psABI r_addend for a rel32 call must be -4 (the addendBias baked in)";
+}
+
+// ── c145: reloc-bearing const data → .data.rel.ro + .rela.data.rel.ro ──
+
+TEST(ElfWriter, RelRoConstDataItemEmitsDataRelRoSectionAndRelaDataRelRo) {
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a CONST global that carries a
+    // LOAD-TIME relocation (a const function-pointer table / `int (*const p)() =
+    // f;` — sqlite's VFS method tables + aSyscall[]) must land in `.data.rel.ro`
+    // (gcc's contract: SHT_PROGBITS + SHF_ALLOC|SHF_WRITE) and the ET_REL writer
+    // must emit its OWN relocation into `.rela.data.rel.ro` as R_X86_64_64 (abs64,
+    // addend 0), sh_info → the target data section. RED-on-disable: before c145 a
+    // reloc-bearing data item fail-louded (D-LK1-ELF-RODATA-DATAITEM-RELOC).
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);   // one `ret` fn, sym 1
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::RelRoConst;
+    d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};   // 8-byte pointer slot
+    d.alignment = Alignment::of<8>();
+    Relocation r;
+    r.offset = 0;
+    r.target = SymbolId{1};          // the slot points at the function
+    r.kind   = RelocationKind{2};    // abs64 → R_X86_64_64 (elf JSON kind 2)
+    r.addend = 0;
+    d.relocations.push_back(r);
+    mod.dataItems.push_back(std::move(d));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{42}, "vtable",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "reloc-bearing CONST data must now compile to relro, not fail loud";
+    ASSERT_FALSE(bytes.empty());
+
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+
+    // `.data.rel.ro`: SHT_PROGBITS(1), SHF_ALLOC|SHF_WRITE(3), sh_addr=0, size 8.
+    int const relroIdx = findSectionByName(bytes, ".data.rel.ro");
+    ASSERT_GE(relroIdx, 0) << ".data.rel.ro section must be emitted";
+    EXPECT_EQ(readU32LE(bytes, shoff + relroIdx * 64 + 4), 1u) << "SHT_PROGBITS";
+    EXPECT_EQ(readU64LE(bytes, shoff + relroIdx * 64 + 8), 3u)
+        << "SHF_ALLOC|SHF_WRITE (gcc's .data.rel.ro flags — NOT read-only .rodata)";
+    EXPECT_EQ(readU64LE(bytes, shoff + relroIdx * 64 + 16), 0u) << "sh_addr=0 in .o";
+    EXPECT_EQ(readU64LE(bytes, shoff + relroIdx * 64 + 32), 8u)
+        << "sh_size = one 8-byte pointer slot";
+
+    // `.rela.data.rel.ro`: SHT_RELA(4), sh_link=.symtab, sh_info=.data.rel.ro.
+    int const symtabIdx = findSectionByName(bytes, ".symtab");
+    int const relaIdx   = findSectionByName(bytes, ".rela.data.rel.ro");
+    ASSERT_GE(symtabIdx, 0);
+    ASSERT_GE(relaIdx, 0) << ".rela.data.rel.ro section must be emitted";
+    EXPECT_EQ(readU32LE(bytes, shoff + relaIdx * 64 + 4), 4u) << "SHT_RELA";
+    EXPECT_EQ(static_cast<int>(readU32LE(bytes, shoff + relaIdx * 64 + 40)), symtabIdx)
+        << "sh_link names .symtab";
+    EXPECT_EQ(static_cast<int>(readU32LE(bytes, shoff + relaIdx * 64 + 44)), relroIdx)
+        << "sh_info names the target .data.rel.ro section";
+
+    // The single Elf64_Rela: r_offset = itemOffset(0)+rel.offset(0) = 0;
+    // r_info low32 = R_X86_64_64 (1, NOT the PLT variant — a data reloc is never a
+    // call); r_addend = 0 (abs64 addendBias 0).
+    std::uint64_t const relaOff  = readU64LE(bytes, shoff + relaIdx * 64 + 24);
+    std::uint64_t const relaSize = readU64LE(bytes, shoff + relaIdx * 64 + 32);
+    ASSERT_EQ(relaSize, 24u) << "exactly one Elf64_Rela";
+    EXPECT_EQ(readU64LE(bytes, relaOff + 0), 0u) << "r_offset = 0";
+    std::uint64_t const rInfo = readU64LE(bytes, relaOff + 8);
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo), 1u)
+        << "R_X86_64_64 = 1 (abs64) — the native reloc id from the format JSON";
+    EXPECT_EQ(static_cast<std::int64_t>(readU64LE(bytes, relaOff + 16)), 0)
+        << "r_addend = 0";
+
+    // The reloc's symIdx names the FUNCTION symbol (st_shndx = .text = idx 1).
+    std::uint32_t const relSymIdx = static_cast<std::uint32_t>(rInfo >> 32);
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + symtabIdx * 64 + 24);
+    EXPECT_EQ(readU16LE(bytes, symtabOff + relSymIdx * 24 + 6), 1u)
+        << "reloc target resolves to the function symbol (st_shndx = .text)";
+
+    // The relro DATA global itself: STT_OBJECT, st_shndx = .data.rel.ro.
+    int const strtabIdx = findSectionByName(bytes, ".strtab");
+    ASSERT_GE(strtabIdx, 0);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + strtabIdx * 64 + 24);
+    std::uint64_t const symtabSize = readU64LE(bytes, shoff + symtabIdx * 64 + 32);
+    bool sawVtable = false;
+    for (std::uint64_t o = 0; o + 24 <= symtabSize; o += 24) {
+        std::uint32_t const nm = readU32LE(bytes, symtabOff + o + 0);
+        if (readStrtabName(bytes, strtabOff, nm) == "vtable") {
+            sawVtable = true;
+            EXPECT_EQ(bytes[symtabOff + o + 4], 0x11u) << "STB_GLOBAL|STT_OBJECT";
+            EXPECT_EQ(readU16LE(bytes, symtabOff + o + 6),
+                      static_cast<std::uint16_t>(relroIdx))
+                << "relro data symbol st_shndx names .data.rel.ro";
+            EXPECT_EQ(readU64LE(bytes, symtabOff + o + 16), 8u) << "st_size = 8";
+        }
+    }
+    EXPECT_TRUE(sawVtable) << "the relro data global must have a .symtab entry";
+}
+
+TEST(ElfWriter, RelRoConstDataRelocIsMachineAgnosticOnAarch64) {
+    // AGNOSTIC pin: the SAME machine-neutral ELF ET_REL writer emits the relro
+    // reloc for arm64 with the arm64 native id — R_AARCH64_ABS64 (257), read from
+    // the arm64 format JSON, NOT hardcoded. RED-on-disable: a machine branch in
+    // the writer (or a missing aarch64 `.data.rel.ro`/`relro` row) breaks this.
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-aarch64-linux");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod = makeTrivialModule({0xC0, 0x03, 0x5F, 0xD6}, 1);  // `ret`
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::RelRoConst;
+    d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};
+    d.alignment = Alignment::of<8>();
+    Relocation r;
+    r.offset = 0;
+    r.target = SymbolId{1};
+    r.kind   = RelocationKind{4};    // arm64 abs64 → R_AARCH64_ABS64 (JSON kind 4)
+    r.addend = 0;
+    d.relocations.push_back(r);
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, **target, **fmt, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    int const relaIdx = findSectionByName(bytes, ".rela.data.rel.ro");
+    ASSERT_GE(relaIdx, 0) << "arm64 .o must also emit .rela.data.rel.ro";
+    std::uint64_t const relaOff = readU64LE(bytes, shoff + relaIdx * 64 + 24);
+    std::uint64_t const rInfo   = readU64LE(bytes, relaOff + 8);
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo), 257u)
+        << "R_AARCH64_ABS64 = 257 — the arm64 native id from the format JSON";
+}
+
+TEST(ElfWriter, MutablePointerDataItemEmitsRelaData) {
+    // c145: a reloc-bearing MUTABLE pointer global (`int *p = &x;`) lands in
+    // `.data` (writable) and gets `.rela.data` — the same mechanism as relro but
+    // NOT read-only-after. Pins that the generalized `.rela.<section>` covers
+    // `.data` too, not only relro.
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeTrivialModule({0xC3}, 1);
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Data;   // MUTABLE
+    d.bytes     = {0, 0, 0, 0, 0, 0, 0, 0};
+    d.alignment = Alignment::of<8>();
+    Relocation r;
+    r.offset = 0;
+    r.target = SymbolId{1};
+    r.kind   = RelocationKind{2};    // abs64
+    r.addend = 0;
+    d.relocations.push_back(r);
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "reloc-bearing MUTABLE data must compile (was rejected pre-c145)";
+    ASSERT_FALSE(bytes.empty());
+    std::uint64_t const shoff = readU64LE(bytes, 40);
+    int const dataIdx = findSectionByName(bytes, ".data");
+    int const relaIdx = findSectionByName(bytes, ".rela.data");
+    ASSERT_GE(dataIdx, 0);
+    ASSERT_GE(relaIdx, 0) << ".rela.data must be emitted for a reloc-bearing .data item";
+    EXPECT_EQ(static_cast<int>(readU32LE(bytes, shoff + relaIdx * 64 + 44)), dataIdx)
+        << ".rela.data sh_info names .data";
+    std::uint64_t const relaOff = readU64LE(bytes, shoff + relaIdx * 64 + 24);
+    EXPECT_EQ(static_cast<std::uint32_t>(readU64LE(bytes, relaOff + 8)), 1u)
+        << "R_X86_64_64 abs64";
+    // No `.data.rel.ro` for a mutable-only module.
+    EXPECT_LT(findSectionByName(bytes, ".data.rel.ro"), 0)
+        << "a mutable pointer must NOT create a .data.rel.ro section";
 }
 
 // ── Non-ELF schema → fail-loud ──────────────────────────────────

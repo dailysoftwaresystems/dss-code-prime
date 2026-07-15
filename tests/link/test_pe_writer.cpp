@@ -226,6 +226,56 @@ TEST(PeWriter, SymbolRecordsAre18BytesPackedNoPadding) {
     EXPECT_EQ(bytes[symPtr + 17], 0u);
 }
 
+// ── D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real names in the .obj symtab ──
+
+TEST(PeWriter, ObjectSymtabCarriesRealNameForExternalDefButStaticStaysInternal) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    // Two defined functions: A externally-visible (Global) → real name;
+    // B static (Local) → stays internal `sym_11`. Names are ≤ 8 chars so
+    // the COFF Name field inlines them (no string-table indirection).
+    AssembledModule mod;
+    mod.expectedFuncCount = 2;
+    AssembledFunction a;
+    a.symbol = SymbolId{10};
+    a.bytes  = {0xC3};
+    mod.functions.push_back(std::move(a));
+    AssembledFunction b;
+    b.symbol = SymbolId{11};
+    b.bytes  = {0xC3};
+    mod.functions.push_back(std::move(b));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "realfn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    mod.symbols.push_back(ModuleSymbol{SymbolId{11}, "statfn",
+                                       SymbolBinding::Local,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    std::uint32_t const symPtr  = readU32LE(bytes, 8);
+    std::uint32_t const numSyms = readU32LE(bytes, 12);
+    ASSERT_EQ(numSyms, 2u);
+
+    auto inlineNameAt = [&](std::uint32_t recOff) {
+        std::string s;
+        for (std::size_t i = 0; i < 8 && bytes[recOff + i] != 0; ++i) {
+            s.push_back(static_cast<char>(bytes[recOff + i]));
+        }
+        return s;
+    };
+
+    // Symbol 0 = fn A (externally-visible) → real inlined name.
+    EXPECT_EQ(inlineNameAt(symPtr), "realfn")
+        << "externally-visible defined function must carry its real name";
+    // Symbol 1 = fn B (static) → stays internal `sym_11`.
+    EXPECT_EQ(inlineNameAt(symPtr + 18u), "sym_11")
+        << "a static (Local-binding) function must stay internal in the .obj";
+}
+
 // ── String table starts with 4-byte u32 size including itself ──
 
 TEST(PeWriter, StringTableHasSizePrefixAndIncludesItself) {
@@ -1070,6 +1120,53 @@ TEST(PeExecWriter, Abs64RodataSlotEmitsDir64BaseRelocation) {
         << "entry = (DIR64 << 12) | page-offset";
     EXPECT_EQ(readU16LE(bytes, reloc.second + 10), 0u)
         << "odd DIR64 entry count → one ABSOLUTE(0) u16 pad to 4-byte alignment";
+}
+
+// c145 (D-LK-RELRO-CONST-DATA-RELOCATABLE): a CONST symbol-address global (relro)
+// is FOLDED into read-only `.rdata` in the PE32+ image; because the exec keeps
+// ASLR the walker writes the slot's PREFERRED VA AND emits an IMAGE_REL_BASED_DIR64
+// `.reloc` entry (PE base-relocates `.rdata` before sealing it read-only). Same
+// shape as the F5 rodata slot above — proving relro rides `.rdata` with no
+// fail-loud. RED-on-disable: without the relro→`.rdata` merge the item is dropped
+// or rejected and no slot / DIR64 entry appears.
+TEST(PeExecWriter, RelRoConstSlotFoldsIntoRdataAndEmitsDir64BaseReloc) {
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};                       // ret — first .text fn at RVA 0x1000
+    mod.functions.push_back(std::move(fn));
+    AssembledData slot;
+    slot.symbol  = SymbolId{2};
+    slot.section = DataSectionKind::RelRoConst;   // the c145 routing
+    slot.bytes.assign(8, std::uint8_t{0});
+    Relocation slotRel;
+    slotRel.offset = 0;
+    slotRel.target = SymbolId{1};
+    slotRel.kind   = RelocationKind{2};       // abs64
+    slotRel.addend = 0;
+    slot.relocations.push_back(slotRel);
+    mod.dataItems.push_back(std::move(slot));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "a relro item must NOT fail loud in a PE exec image";
+
+    constexpr std::uint64_t kImageBase = 0x140000000ull;
+    auto const text  = findExecSection(bytes, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+    auto const rdata = findExecSection(bytes, {'.', 'r', 'd', 'a', 't', 'a', 0, 0});
+    auto const reloc = findExecSection(bytes, {'.', 'r', 'e', 'l', 'o', 'c', 0, 0});
+    ASSERT_NE(rdata.first, 0u) << "the relro slot must ride `.rdata`";
+    ASSERT_NE(reloc.first, 0u) << ".reloc must carry the DIR64 for the relro slot";
+    EXPECT_EQ(readU64LE(bytes, rdata.second), kImageBase + text.first)
+        << "the relro slot holds the def's PREFERRED VA (imageBase + targetRVA)";
+    std::uint32_t const slotRva = rdata.first;
+    EXPECT_EQ(readU16LE(bytes, reloc.second + 8),
+              static_cast<std::uint16_t>((10u << 12) | (slotRva & 0x0FFFu)))
+        << "IMAGE_REL_BASED_DIR64 entry emitted for the relro slot in .rdata";
 }
 
 // ── D-CSUBSET-THREAD-LOCAL (TLS C3): the PE writer's .tls / directory /

@@ -67,9 +67,20 @@ enum class SectionKind : std::uint8_t {
     // (like the tdata/tbss rows), keeping the writer free of a hardcoded
     // section flag.
     ThreadVars = 14, // thread-local variable descriptors (Mach-O __thread_vars)
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): initialised CONST data that
+    // carries load-time relocations (a const function-pointer table / `int
+    // *const p = &x;` — sqlite's VFS method tables + `aSyscall[]`). It cannot
+    // sit in read-only `.rodata` (the loader must write the resolved target
+    // VA into the slot), yet must be READ-ONLY AFTER relocation (const
+    // semantics + hardening). Every format has a "relocated-read-only"
+    // placement: ELF `.data.rel.ro` (in the GNU_RELRO segment), Mach-O
+    // `__DATA_CONST,__const` (dyld-rebased then mprotect'd RO), PE `.rdata`
+    // (base-relocated before the page is sealed RO). Distinct from `Data`
+    // (stays writable) — reloc-bearing MUTABLE data still routes to `Data`.
+    RelRoConst = 15, // const data needing load-time relocations (relro)
 };
 
-inline constexpr EnumNameTable<SectionKind, 15> kSectionKindTable{{{
+inline constexpr EnumNameTable<SectionKind, 16> kSectionKindTable{{{
     { SectionKind::Text,       "text"       },
     { SectionKind::Rodata,     "rodata"     },
     { SectionKind::Data,       "data"       },
@@ -85,6 +96,7 @@ inline constexpr EnumNameTable<SectionKind, 15> kSectionKindTable{{{
     { SectionKind::ThreadData, "tdata"      },
     { SectionKind::ThreadBss,  "tbss"       },
     { SectionKind::ThreadVars, "tvars"      },
+    { SectionKind::RelRoConst, "relro"      },
 }}};
 
 [[nodiscard]] constexpr std::string_view
@@ -108,9 +120,9 @@ sectionKindFromName(std::string_view s) noexcept {
 // is semantically nonsense — the assembler doesn't emit symbol
 // tables; the linker walker synthesizes them.
 //
-// The FIVE valid producer-emittable kinds:
+// The SIX valid producer-emittable kinds:
 //   * `Rodata` — read-only initialised data (string literals,
-//                const arrays, vtables).
+//                const arrays, vtables) with NO load-time relocations.
 //   * `Data`   — read-write initialised data (mutable globals).
 //   * `Bss`    — zero-fill mutable data (uninitialised globals).
 //   * `Tdata`  — initialised THREAD-LOCAL template data: the
@@ -118,6 +130,10 @@ sectionKindFromName(std::string_view s) noexcept {
 //                `thread_local T g = init;` (D-CSUBSET-THREAD-LOCAL).
 //   * `Tbss`   — zero-fill THREAD-LOCAL template extent: the
 //                per-thread zero-init span of a `thread_local T g;`.
+//   * `RelRoConst` — const initialised data that carries LOAD-TIME
+//                RELOCATIONS (a const function-pointer table / `int
+//                *const p = &x;`): relocated-then-read-only
+//                (D-LK-RELRO-CONST-DATA-RELOCATABLE, c145).
 //
 // The walker still keys on `SectionKind` (the full enum). The
 // `toSectionKind()` conversion is total — every `DataSectionKind`
@@ -125,11 +141,14 @@ sectionKindFromName(std::string_view s) noexcept {
 // direction is partial: `dataSectionKindOf()` returns nullopt for
 // the 9 walker-synthesized kinds.
 enum class DataSectionKind : std::uint8_t {
-    Rodata = static_cast<std::uint8_t>(SectionKind::Rodata),
-    Data   = static_cast<std::uint8_t>(SectionKind::Data),
-    Bss    = static_cast<std::uint8_t>(SectionKind::Bss),
-    Tdata  = static_cast<std::uint8_t>(SectionKind::ThreadData),
-    Tbss   = static_cast<std::uint8_t>(SectionKind::ThreadBss),
+    Rodata     = static_cast<std::uint8_t>(SectionKind::Rodata),
+    Data       = static_cast<std::uint8_t>(SectionKind::Data),
+    Bss        = static_cast<std::uint8_t>(SectionKind::Bss),
+    Tdata      = static_cast<std::uint8_t>(SectionKind::ThreadData),
+    Tbss       = static_cast<std::uint8_t>(SectionKind::ThreadBss),
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): const data carrying load-time
+    // relocations — file-backed (NOT zero-fill), read-only after relocation.
+    RelRoConst = static_cast<std::uint8_t>(SectionKind::RelRoConst),
 };
 
 [[nodiscard]] constexpr SectionKind
@@ -145,6 +164,7 @@ dataSectionKindOf(SectionKind k) noexcept {
         case SectionKind::Bss:        return DataSectionKind::Bss;
         case SectionKind::ThreadData: return DataSectionKind::Tdata;
         case SectionKind::ThreadBss:  return DataSectionKind::Tbss;
+        case SectionKind::RelRoConst: return DataSectionKind::RelRoConst;
         default:                      return std::nullopt;
     }
 }
@@ -177,17 +197,20 @@ static_assert(toSectionKind(DataSectionKind::Data)   == SectionKind::Data);
 static_assert(toSectionKind(DataSectionKind::Bss)    == SectionKind::Bss);
 static_assert(toSectionKind(DataSectionKind::Tdata)  == SectionKind::ThreadData);
 static_assert(toSectionKind(DataSectionKind::Tbss)   == SectionKind::ThreadBss);
+static_assert(toSectionKind(DataSectionKind::RelRoConst) == SectionKind::RelRoConst);
 static_assert(dataSectionKindOf(SectionKind::Rodata) == DataSectionKind::Rodata);
 static_assert(dataSectionKindOf(SectionKind::Data)   == DataSectionKind::Data);
 static_assert(dataSectionKindOf(SectionKind::Bss)    == DataSectionKind::Bss);
 static_assert(dataSectionKindOf(SectionKind::ThreadData) == DataSectionKind::Tdata);
 static_assert(dataSectionKindOf(SectionKind::ThreadBss)  == DataSectionKind::Tbss);
+static_assert(dataSectionKindOf(SectionKind::RelRoConst) == DataSectionKind::RelRoConst);
 // The zero-fill predicate covers EXACTLY the two no-file-bytes kinds.
 static_assert(!isZeroFill(DataSectionKind::Rodata));
 static_assert(!isZeroFill(DataSectionKind::Data));
 static_assert( isZeroFill(DataSectionKind::Bss));
 static_assert(!isZeroFill(DataSectionKind::Tdata));
 static_assert( isZeroFill(DataSectionKind::Tbss));
+static_assert(!isZeroFill(DataSectionKind::RelRoConst));  // file-backed (relocated RO)
 
 [[nodiscard]] constexpr std::string_view
 dataSectionKindName(DataSectionKind d) noexcept {
@@ -201,6 +224,7 @@ dataSectionKindFromName(std::string_view s) noexcept {
     if (s == "bss")    return DataSectionKind::Bss;
     if (s == "tdata")  return DataSectionKind::Tdata;
     if (s == "tbss")   return DataSectionKind::Tbss;
+    if (s == "relro")  return DataSectionKind::RelRoConst;
     return std::nullopt;
 }
 

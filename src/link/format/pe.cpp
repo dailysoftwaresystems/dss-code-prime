@@ -6,6 +6,7 @@
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
 #include "link/format/interior_block_symbol_va.hpp"
+#include "link/format/object_symbol_names.hpp"
 #include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
 
@@ -755,10 +756,15 @@ encode(AssembledModule const&    module,
 
     constexpr std::int16_t kTextSectionNumber = 1;
 
+    // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real source-level C names for the
+    // externally-visible defined functions; `sym_<id>` fallback for
+    // static/local/synthesized symbols.
+    link::format::ObjectSymbolNames const objNames{module};
+
     // Defined function symbols (GLOBAL EXTERNAL, type=FUNCTION,
     // SectionNumber=1 for `.text`).
     for (auto const& f : funcSyms) {
-        std::string const symName = "sym_" + std::to_string(f.symId.v);
+        std::string const symName = objNames.definedName(f.symId, "sym_");
         emitSymWithName(symName,
                         static_cast<std::uint32_t>(f.valueInText),
                         kTextSectionNumber,
@@ -1134,12 +1140,12 @@ encodeExec(AssembledModule const&    module,
     // call the rdata/data/bss spans use (below, once the lambda is defined).
     // `allowItemRelocations=true`: PE patches data-item (data→data) relocations
     // — its cross-CU thunk-slot feature — into the laid-out bytes below.
-    auto const rdataLayoutOpt = link::format::buildExecDataSection(
+    auto rdataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Rodata,
         /*alignFloor=*/1, "pe::encodeExec", reporter,
         /*allowItemRelocations=*/true);
     if (!rdataLayoutOpt.has_value()) return {};
-    auto const& rdataDataLayout = *rdataLayoutOpt;
+    auto& rdataDataLayout = *rdataLayoutOpt;
     auto const dataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Data,
         /*alignFloor=*/1, "pe::encodeExec", reporter,
@@ -1152,6 +1158,21 @@ encodeExec(AssembledModule const&    module,
         /*allowItemRelocations=*/true);
     if (!bssLayoutOpt.has_value()) return {};
     auto const& bssDataLayout = *bssLayoutOpt;
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a CONST global carrying LOAD-TIME
+    // relocations (a const function-pointer table — sqlite os_win.c aSyscall[])
+    // lands in `relro`. In the PE32+ image we FOLD it into read-only `.rdata`
+    // (the design contract: PE base-relocates `.rdata` — the loader applies the
+    // IMAGE_REL_BASED_DIR64 base-relocation into each slot BEFORE the page is
+    // sealed read-only, exactly as it already does for F5 symbol-address global
+    // pointers). Merging routes relro through the SAME `.rdata` machinery (the
+    // rdata offset map, the reloc-loop DIR64 base-reloc arm, the section header)
+    // — no parallel section, byte-identical for a relro-free module.
+    auto relroLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::RelRoConst,
+        /*alignFloor=*/1, "pe::encodeExec", reporter,
+        /*allowItemRelocations=*/true);
+    if (!relroLayoutOpt.has_value()) return {};
+    link::format::mergeFileBackedDataSection(rdataDataLayout, *relroLayoutOpt);
     bool const hasRdata = !rdataDataLayout.empty();
     bool const hasData  = !dataDataLayout.empty();
     bool const hasBss   = !bssDataLayout.empty();

@@ -327,6 +327,7 @@ optimizeModule(Mir&                  mir,
 [[nodiscard]] DSS_EXPORT std::optional<AssembledModule>
 lowerCuMirToAssembly(CuMirModule&                       cuMir,
                      std::optional<ProcessArgs> const& processArgs,
+                     ObjectFormatKind                  fmtKind,
                      DiagnosticReporter&               reporter);
 
 // LOWER half for the MERGED whole-program module (Cycle 25 Stage C). Drives the

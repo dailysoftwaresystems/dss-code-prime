@@ -7,6 +7,7 @@
 #include "link/format/interior_block_symbol_va.hpp"
 #include "link/format/macho_chained_fixups.hpp"
 #include "link/format/macho_codesign.hpp"
+#include "link/format/object_symbol_names.hpp"
 #include "link/format/string_table.hpp"
 #include "lir/lir_pass_util.hpp"
 
@@ -670,10 +671,15 @@ encode(AssembledModule const&    module,
 
     constexpr std::uint8_t kTextSectionNumber = 1;
 
+    // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real source-level C names (already
+    // Mach-O-mangled with a leading `_` by the pipeline — emitted VERBATIM,
+    // never re-mangled) for the externally-visible defined functions;
+    // `_sym_<id>` fallback for static/local/synthesized symbols.
+    link::format::ObjectSymbolNames const objNames{module};
+
     // Defined function symbols: N_SECT|N_EXT, n_sect=1, n_value=offset.
     for (auto const& f : funcSyms) {
-        std::string const symName =
-            std::string{"_sym_"} + std::to_string(f.symId.v);
+        std::string const symName = objNames.definedName(f.symId, "_sym_");
         std::uint32_t const nameOff = strtab.add(symName);
         appendNlist(nameOff,
                     static_cast<std::uint8_t>(N_SECT | N_EXT),
@@ -1785,6 +1791,25 @@ encodeExecDynamic(AssembledModule const&    module,
         "macho::encodeExecDynamic", reporter);
     if (!bssLayoutOpt.has_value()) return {};
     auto const& bssLayout = *bssLayoutOpt;
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a CONST global carrying LOAD-TIME
+    // relocations (a const function-pointer table / `int *const p=&x;`) lands in
+    // `relro`. In the MH_EXECUTE image we FOLD it into the writable `__DATA,__data`
+    // section (the exec decision — "treat relro like data"; the task blesses the
+    // existing writable __DATA over a separate __DATA_CONST section as "simpler +
+    // correct": dyld rebases each slot via the __DATA rebase-opcode stream, and
+    // the read-only-after-rebase hardening of __DATA_CONST is a nicety not required
+    // for correctness). Merging routes relro through the SAME __data machinery
+    // (addDataSymbolVas, applyDataItemRelocations + the dataRebaseSiteVas stream at
+    // __DATA segment index, the section_64) — no parallel section, and it stays
+    // byte-identical for a relro-free module (the merge is a no-op when empty).
+    ObjectFormatSectionInfo const* secRelRoM =
+        fmt.sectionByKind(SectionKind::RelRoConst);
+    auto relroLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::RelRoConst,
+        secRelRoM != nullptr ? secRelRoM->addrAlign : 1,
+        "macho::encodeExecDynamic", reporter, /*allowItemRelocations=*/true);
+    if (!relroLayoutOpt.has_value()) return {};
+    link::format::mergeFileBackedDataSection(dataLayout, *relroLayoutOpt);
     bool const hasConst = !constLayout.empty();
     bool const hasData  = !dataLayout.empty();
     bool const hasBss   = !bssLayout.empty();

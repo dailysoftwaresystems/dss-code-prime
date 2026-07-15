@@ -232,6 +232,42 @@ TEST(MachOWriter, LcSymtabReferencesNlist64AndStringTable) {
     EXPECT_GE(strsize, 8u);
 }
 
+// ── D-LK-OBJECT-EXTERN-SYMBOL-NAMES: real (pre-mangled) name verbatim ──
+
+TEST(MachOWriter, ObjectSymtabEmitsPipelineMangledNameVerbatimNoDoubleUnderscore) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{10};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    // The compile pipeline pre-mangles a Mach-O defined name with a leading
+    // `_` (applyCMangling). The writer must emit it VERBATIM — a writer-side
+    // re-mangle would DOUBLE it to `__public_fn`. Seeding the already-`_`-
+    // prefixed name is what makes a double-mangle detectable.
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_public_fn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // Single-symbol layout matches the LcSymtab test: LC_SYMTAB at 184,
+    // stroff at 200; the name sits at strtab offset 1 (past the leading NUL).
+    std::uint32_t const stroff = readU32LE(bytes, 200);
+    std::string name;
+    for (std::size_t p = stroff + 1; p < bytes.size() && bytes[p] != 0; ++p) {
+        name.push_back(static_cast<char>(bytes[p]));
+    }
+    EXPECT_EQ(name, "_public_fn")
+        << "Mach-O writer must emit the pipeline-mangled name verbatim — "
+           "exactly one leading underscore, never a re-mangled `__public_fn`";
+}
+
 // ── relocation_info r_info packing ─────────────────────────────
 
 TEST(MachOWriter, RelocationInfoPacksTypeLengthPcrelExternSymbolnum) {
@@ -698,6 +734,77 @@ TEST(MachOExecWriter, SymbolAddressDataGlobalEmitsDyldRebaseStream) {
     }
     EXPECT_TRUE(sawDyldInfo)
         << "LC_DYLD_INFO_ONLY must be present on the legacy darwin exec path.";
+}
+
+// c145 (D-LK-RELRO-CONST-DATA-RELOCATABLE): a CONST symbol-address global (relro)
+// is FOLDED into the writable `__DATA,__data` section in the MH_EXECUTE image and
+// dyld rebases its slot via the __DATA rebase stream — the task-blessed "treat
+// relro like data" placement (over a separate __DATA_CONST). No fail-loud.
+// RED-on-disable: without the relro→__data merge the item is dropped/rejected and
+// rebase_size returns to 0. Mirrors the F5 symbol-address pin above, relro-routed.
+TEST(MachOExecWriter, RelRoConstItemFoldsIntoDataAndEmitsDyldRebase) {
+    auto targetR = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(targetR.has_value());
+    auto target = std::move(targetR).value();
+    auto formatR = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-exec");
+    ASSERT_TRUE(formatR.has_value());
+    auto format = std::move(formatR).value();
+    RelocationKind abs64{0};
+    bool foundAbs64 = false;
+    for (auto const& r : target->relocations())
+        if (r.widthBytes == 8 && !r.pcRelative) { abs64 = r.kind; foundAbs64 = true; break; }
+    ASSERT_TRUE(foundAbs64);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x00, 0x00, 0x00, 0x94, 0xC0, 0x03, 0x5F, 0xD6};  // BL _abs ; RET
+    fn.relocations.push_back(Relocation{0u, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    // An extern import forces the dynamic writer (the only path that lays __DATA).
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "_abs", "/usr/lib/libSystem.B.dylib"});
+    // A plain data target (no reloc — must NOT be rebased).
+    AssembledData targetData;
+    targetData.symbol    = SymbolId{50};
+    targetData.section   = DataSectionKind::Data;
+    targetData.bytes.assign(8, 0);
+    targetData.alignment = Alignment::ofRuntimePow2(8);
+    mod.dataItems.push_back(std::move(targetData));
+    // A CONST pointer table → relro (the c145 routing): folds into __data + rebased.
+    AssembledData p;
+    p.symbol    = SymbolId{51};
+    p.section   = DataSectionKind::RelRoConst;
+    p.bytes.assign(8, 0);
+    p.alignment = Alignment::ofRuntimePow2(8);
+    p.relocations.push_back(Relocation{0u, SymbolId{50}, abs64, 0});
+    mod.dataItems.push_back(std::move(p));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *target, *format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "a relro item must NOT fail loud in a Mach-O exec image";
+    ASSERT_FALSE(bytes.empty());
+
+    std::uint32_t const ncmds = readU32LE(bytes, 16);
+    std::size_t off = 32;
+    bool sawRebase = false;
+    for (std::uint32_t i = 0; i < ncmds; ++i) {
+        std::uint32_t const cmd     = readU32LE(bytes, off);
+        std::uint32_t const cmdsize = readU32LE(bytes, off + 4);
+        if (cmdsize == 0) break;
+        if (cmd == 0x80000022u) {  // LC_DYLD_INFO_ONLY
+            std::uint32_t const rebaseSize = readU32LE(bytes, off + 12);
+            ASSERT_GT(rebaseSize, 0u)
+                << "the relro pointer folded into __data must get a dyld REBASE; "
+                   "rebase_size==0 means the relro merge/rebase wiring regressed.";
+            sawRebase = true;
+            break;
+        }
+        off += cmdsize;
+    }
+    EXPECT_TRUE(sawRebase) << "LC_DYLD_INFO_ONLY with a rebase for the relro slot.";
 }
 
 // D-LK-MACHO-DATA-EXTERN-DEAD-STUB (c119): the __stubs band is COMPACTED to the

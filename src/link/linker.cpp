@@ -101,6 +101,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
 [[nodiscard]] bool rejectOrDropUnboundExterns(
     AssembledModule const& m,
     AssembledModule&       filtered,
+    bool                   outputIsImage,
     DiagnosticReporter&    reporter) {
     bool anyUnbound = false;
     for (auto const& ext : m.externImports) {
@@ -125,14 +126,25 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
         if (!ext.libraryPath.empty()) continue;          // library-bound import
         if (ext.mangledName.empty()) continue;           // already rejected (compound index)
         if (referenced.contains(ext.symbol.v)) {
-            report(reporter, DiagnosticCode::K_SymbolUndefined,
-                   DiagnosticSeverity::Error,
-                   "undefined symbol '" + ext.mangledName + "' — the symbol "
-                   "is referenced (a prototype/extern declaration with no "
-                   "import library) but no linked compilation unit defines "
-                   "it and no library import binds it. Provide a definition "
-                   "in a linked translation unit, or declare the owning "
-                   "library for the symbol.");
+            // D-LK-OBJECT-NOLIB-EXTERN-RELOCATABLE: a referenced no-library
+            // extern is unresolvable in an IMAGE (nothing at load time binds
+            // it) → reject loud. But in a RELOCATABLE OBJECT it is a LEGAL
+            // SHN_UNDEF symbol the FINAL (foreign) linker resolves against a
+            // sibling object or library — the bare-prototype `SQLITE_API`
+            // shape (`int sqlite3_foo(...);`, no `extern`, no import library).
+            // Keep it: the ET_REL writer's undefined-symbol loop emits it by
+            // its `mangledName` (via `externName`), and gcc's `ld` resolves it.
+            if (outputIsImage) {
+                report(reporter, DiagnosticCode::K_SymbolUndefined,
+                       DiagnosticSeverity::Error,
+                       "undefined symbol '" + ext.mangledName + "' — the symbol "
+                       "is referenced (a prototype/extern declaration with no "
+                       "import library) but no linked compilation unit defines "
+                       "it and no library import binds it. Provide a definition "
+                       "in a linked translation unit, or declare the owning "
+                       "library for the symbol.");
+            }
+            // else (relocatable object): kept — deferred to the final linker.
         } else {
             anyDrop = true;   // unreferenced + unbound ⇒ drop below
         }
@@ -504,6 +516,7 @@ LinkedImage link(std::span<AssembledModule const> modules,
     {
         std::size_t const errsBeforeUnbound = reporter.errorCount();
         if (!rejectOrDropUnboundExterns(*selectedInput, unboundFilteredStorage,
+                                        objectFormatSchema.isImageFlavor(),
                                         reporter)) {
             selectedInput = &unboundFilteredStorage;
         }
@@ -537,7 +550,34 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // declared, not format-name-enumerated (the supportedDataSections
     // discipline): a format gains data imports by declaring the field +
     // landing its walker arm — zero gate changes.
-    if (!objectFormatSchema.dataImportBinding().has_value()) {
+    //
+    // D-LK-OBJECT-DATA-EXTERN-RELOCATABLE (c144): the "no model → reject"
+    // rule is IMAGE-scoped. A relocatable object does NOT bind imports — it
+    // has no import walker; a surviving data extern is emitted as an
+    // SHN_UNDEF symbol (the reloc-driven symtab loop in elf.cpp) and the
+    // FINAL (foreign) linker resolves it — for an executable link via a
+    // copy-relocation, exactly what gcc does for `extern FILE *stdout` in a
+    // `.o` (empirically R_X86_64_PC32 + a NOTYPE UND symbol, even under
+    // default-PIE). The data-bound-as-code miscompile this reject guards
+    // against lives in the IMAGE import walker; the relocatable writer's own
+    // guard is that a data-extern reference emits PC32, never the PLT32 call
+    // variant (elf.cpp restricts pltNativeId to FUNCTION externs). So only an
+    // IMAGE (load-time-bound, no later linker to resolve the object) with no
+    // declared binding rejects. Mirrors D-LK-OBJECT-NOLIB-EXTERN-RELOCATABLE
+    // (c143), which kept referenced no-library FUNCTION externs as SHN_UNDEF.
+    //
+    // This gate is format-AGNOSTIC (isImageFlavor() is false for every
+    // relocatable flavor), so it lifts the reject for the Mach-O `object` and
+    // PE `Obj` relocatable formats too, not only ELF ET_REL. That is correct:
+    // those relocatable writers also emit a surviving extern as a faithful
+    // undefined symbol (macho.cpp `N_UNDF|N_EXT`, SectionNumber 0; pe.cpp
+    // `IMAGE_SYM_UNDEFINED`) with the producer-chosen relocation — none does
+    // isData-dependent code-binding (the import-thunk/stub machinery is
+    // exec-only). A relocatable writer that DID bind data as code would have
+    // to reject or fix it in ITS OWN walker (as elf.cpp does via PC32); this
+    // central gate only protects the IMAGE walkers.
+    if (objectFormatSchema.isImageFlavor()
+        && !objectFormatSchema.dataImportBinding().has_value()) {
         for (auto const& ext : inputModule.externImports) {
             if (!ext.isData) continue;
             report(reporter, DiagnosticCode::K_FormatLacksImportSupport,
