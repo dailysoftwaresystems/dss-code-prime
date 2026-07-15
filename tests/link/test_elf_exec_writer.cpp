@@ -1648,13 +1648,18 @@ TEST(ElfExecWriter, ExternImportsWithEmptyInterpreterFailsLoud) {
     EXPECT_TRUE(sawCode);
 }
 
-TEST(ElfRelWriter, ExternDataImportFailsLoudOnEtRel) {
-    // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: a relocatable object now ACCEPTS
-    // FUNCTION-call externs (the shipped format declares externCallDispatch —
-    // see ElfWriter.ObjectExternCallEmitsUndefImportNameAndPlt32Reloc). But an
-    // extern DATA import (`isData`) STILL fails loud: it needs a copy-relocation
-    // / GOT binding the relocatable path does not emit, and a plain UNDEF+reloc
-    // would mis-bind shared-library data (the silent-miscompile class).
+TEST(ElfRelWriter, ExternDataImportNoLongerFailsLoudOnEtRel) {
+    // D-LK-OBJECT-DATA-EXTERN-RELOCATABLE (c144): a relocatable object no
+    // longer rejects an extern DATA import. It emits the referenced ones as
+    // SHN_UNDEF NOTYPE symbols + PC32 relocs the FINAL linker resolves by
+    // copy-relocation (see ElfWriter.ObjectDataExternRefEmitsUndefNameAnd
+    // Pc32NotPlt32 for the byte-level pin), and silently DROPS the
+    // UNREFERENCED ones (dead surface — no reloc names them, so the
+    // reloc-driven symtab loop never emits them). This module's `stdout` is
+    // unreferenced (the sole function has no relocation), so encode succeeds
+    // and drops it — where it previously failed loud with
+    // K_FormatLacksImportSupport. Red-on-disable: restore the writer's isData
+    // reject and `errorCount` becomes non-zero.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
@@ -1669,17 +1674,18 @@ TEST(ElfRelWriter, ExternDataImportFailsLoudOnEtRel) {
     imp.symbol      = SymbolId{99};
     imp.mangledName = "stdout";
     imp.libraryPath = "libc.so.6";
-    imp.isData      = true;          // extern DATA — the still-rejected case
+    imp.isData      = true;          // extern DATA — now accepted, not rejected
     mod.externImports.push_back(std::move(imp));
     DiagnosticReporter rep;
     auto bytes = elf::encode(mod, **target, **fmt, rep);
-    EXPECT_TRUE(bytes.empty())
-        << "an extern DATA import in a relocatable object must fail loud";
-    bool sawCode = false;
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "an extern DATA import in a relocatable object must NOT fail loud";
+    EXPECT_FALSE(bytes.empty())
+        << "the object still encodes (the unreferenced data extern is dropped)";
     for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_FormatLacksImportSupport) sawCode = true;
+        EXPECT_NE(d.code, DiagnosticCode::K_FormatLacksImportSupport)
+            << "the ET_REL data-import reject is lifted (c144)";
     }
-    EXPECT_TRUE(sawCode);
 }
 
 // ── D-LK1-ELF-EXEC-DATA-SECTIONS: .rodata emitted from dataItems ──

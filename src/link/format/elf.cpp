@@ -1813,28 +1813,26 @@ encode(AssembledModule const&    module,
                            "+ relocations for the final linker.");
                 return {};
             }
-            // Only FUNCTION-call externs are emitted in a relocatable object (a
-            // `call` → SHN_UNDEF symbol + PLT32 reloc the final linker
-            // resolves). An extern DATA import (`isData`) needs a copy-
-            // relocation / GOT-indirect binding the relocatable path does NOT
-            // emit — a plain UNDEF + abs reloc would mis-bind shared-library
-            // data (the silent-miscompile class). Fail loud until extern-DATA-
-            // in-`.o` lands (a sibling of D-LK-EXTERN-DATA-IMPORT).
-            for (auto const& e : module.externImports) {
-                if (e.isData) {
-                    emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
-                         std::string{"elf::encode: extern DATA import '"}
-                             + e.mangledName
-                             + "' in a relocatable object is not yet supported "
-                               "- only function-call externs lower to an "
-                               "SHN_UNDEF symbol + reloc. Extern data needs a "
-                               "copy-relocation / GOT binding (a sibling of "
-                               "D-LK-EXTERN-DATA-IMPORT).");
-                    return {};
-                }
-            }
-            // else: ET_REL with externCallDispatch (function externs) — fall
-            // through to the normal ET_REL writer below.
+            // D-LK-OBJECT-DATA-EXTERN-RELOCATABLE (c144): BOTH function-call
+            // and DATA externs are emitted in a relocatable object. A function
+            // `call` → SHN_UNDEF symbol + PLT32 reloc; a DATA reference (e.g.
+            // sqlite `out = stdout`) → the SAME SHN_UNDEF symbol + a plain PC32
+            // reloc (the .rela.text loop below excludes data from
+            // externCallTargets, so it emits nativeId/PC32, never
+            // pltNativeId/PLT32 — a data symbol bound through a PLT stub would
+            // read jump-stub bytes as the object's value). This is EXACTLY what
+            // gcc emits for `extern FILE *stdout` in a `.o`: a NOTYPE UND
+            // symbol + R_X86_64_PC32, even under default-PIE — the FINAL linker
+            // binds it by copy-relocation when the `.o` links into an
+            // EXECUTABLE (the DSS `.o` consumer today: sqlite's testfixture).
+            // The one case a data extern would instead need a GOT-indirect
+            // binding (R_X86_64_GOTPCREL) — the `.o` linked into a SHARED
+            // LIBRARY — is NOT a silent miscompile: ld itself fails loud
+            // ("relocation R_X86_64_PC32 against undefined symbol `stdout' can
+            // not be used when making a shared object; recompile with -fPIC").
+            // A `.o`→`.so` consumer + a got-indirect data binding for the
+            // relocatable ELF format is the pinned future trigger. So both
+            // extern kinds FALL THROUGH to the normal ET_REL writer below.
         } else {
             if (fmt.elf().interpreter.empty()) {
                 emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
@@ -2364,13 +2362,22 @@ encode(AssembledModule const&    module,
 
     std::vector<std::uint8_t> relaText;
     if (!isExec) {
-        // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: undefined-extern targets (built
-        // once) — a rel32 CALL to one emits the PLT-capable reloc variant so a
-        // foreign PIE link resolves it through a linker-built PLT.
-        std::unordered_set<SymbolId> externTargets;
-        externTargets.reserve(module.externImports.size());
+        // D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: undefined-extern FUNCTION
+        // targets (built once) — a rel32 CALL to one emits the PLT-capable
+        // reloc variant so a foreign PIE link resolves it through a
+        // linker-built PLT. D-LK-OBJECT-DATA-EXTERN-RELOCATABLE (c144): DATA
+        // externs are EXCLUDED — a data reference is not a call and must emit
+        // plain PC32 (the copy-relocation shape gcc emits for `extern FILE
+        // *stdout`), never PLT32; PLT32 would bind the data symbol to a
+        // linker-built PLT stub and the code would read jump-stub bytes as
+        // the object's value (the silent miscompile the image-path
+        // K_FormatLacksImportSupport reject guards against, here prevented in
+        // the relocatable writer).
+        std::unordered_set<SymbolId> externCallTargets;
+        externCallTargets.reserve(module.externImports.size());
         for (auto const& e : module.externImports) {
-            externTargets.insert(e.symbol);
+            if (e.isData) continue;
+            externCallTargets.insert(e.symbol);
         }
         for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
             auto const& fn = module.functions[fi];
@@ -2427,10 +2434,11 @@ encode(AssembledModule const&    module,
                 // PC32 against an undefined symbol errors under -pie. Same
                 // S+A-P formula + -4 addend; intra-module (defined) call
                 // targets keep plain PC32 (pltNativeId is used only when the
-                // target is an extern import).
+                // target is an extern FUNCTION import — data externs are
+                // excluded from externCallTargets and keep plain PC32).
                 std::uint32_t const emittedNativeId =
                     (fmtReloc->pltNativeId != 0
-                     && externTargets.contains(rel.target))
+                     && externCallTargets.contains(rel.target))
                         ? fmtReloc->pltNativeId
                         : fmtReloc->nativeId;
                 std::uint64_t const rOffset = fnStart + rel.offset;

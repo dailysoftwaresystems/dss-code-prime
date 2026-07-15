@@ -184,6 +184,83 @@ TEST(Linker, RelocatableKeepsReferencedNoLibraryExternAsUndefined) {
     EXPECT_FALSE(image.bytes.empty());
 }
 
+TEST(Linker, RelocatableKeepsReferencedDataExternAsUndefined) {
+    // D-LK-OBJECT-DATA-EXTERN-RELOCATABLE (c144): a library DATA extern (the
+    // `stdout` shape — `extern FILE *stdout;` from libc, `isData`) that is
+    // REFERENCED must NOT be rejected when the output is a RELOCATABLE object.
+    // The relocatable format declares no `dataImportBinding` — but a `.o` does
+    // not bind imports; it emits the data extern as an SHN_UNDEF symbol the
+    // final (foreign) linker resolves by copy-relocation. Only an IMAGE with no
+    // binding rejects. RED if the reject re-fires for a .o (revert the
+    // isImageFlavor gate on the data-import reject).
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(fmt.has_value());
+    ASSERT_FALSE((*fmt)->isImageFlavor()) << "elf64-x86_64-linux is relocatable";
+    ASSERT_FALSE((*fmt)->dataImportBinding().has_value())
+        << "the relocatable ELF format declares no dataImportBinding — the "
+           "exact condition the reject used to fire on";
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x48, 0x8B, 0x05, 0, 0, 0, 0};   // mov rax,[rip+stdout]
+    fn.relocations.push_back(
+        Relocation{3u, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    ExternImport imp;
+    imp.symbol      = SymbolId{99};
+    imp.mangledName = "stdout";
+    imp.libraryPath = "libc.so.6";
+    imp.isData      = true;                        // the DATA extern
+    mod.externImports.push_back(std::move(imp));
+    DiagnosticReporter rep;
+    auto image = linker::link(mod, **target, **fmt, rep);
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "a referenced data extern must NOT be rejected for a relocatable "
+           "object (D-LK-OBJECT-DATA-EXTERN-RELOCATABLE)";
+    EXPECT_TRUE(image.ok());
+    EXPECT_FALSE(image.bytes.empty());
+}
+
+TEST(Linker, ImageWithNoDataBindingStillRejectsReferencedDataExtern) {
+    // The IMAGE side of the c144 gate (positive pin, mirrors c143's image-side
+    // reject test): an IMAGE format that declares no `dataImportBinding` (PE
+    // Exec — its `__imp_` data-thunk model is unbuilt) MUST still reject a
+    // surviving data extern with K_FormatLacksImportSupport. An image is
+    // load-time-bound with no later linker to resolve the object, so an
+    // unbindable data import is a load-time silent-failure. RED if the reject
+    // is deleted outright — RelocatableKeepsReferencedDataExternAsUndefined
+    // alone would not catch that (it only pins the relocatable branch).
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(fmt.has_value());
+    ASSERT_TRUE((*fmt)->isImageFlavor()) << "pe64-x86_64-windows-exec is an image";
+    ASSERT_FALSE((*fmt)->dataImportBinding().has_value())
+        << "PE exec declares no dataImportBinding — the reject condition";
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x48, 0x8B, 0x05, 0, 0, 0, 0};   // mov rax,[rip+stdout]
+    fn.relocations.push_back(
+        Relocation{3u, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    ExternImport imp;
+    imp.symbol      = SymbolId{99};
+    imp.mangledName = "stdout";
+    imp.libraryPath = "msvcrt.dll";
+    imp.isData      = true;                        // the DATA extern
+    mod.externImports.push_back(std::move(imp));
+    DiagnosticReporter rep;
+    auto image = linker::link(mod, **target, **fmt, rep);
+    EXPECT_FALSE(image.ok())
+        << "an image with no dataImportBinding must reject a data extern";
+    EXPECT_GE(countCode(rep, DiagnosticCode::K_FormatLacksImportSupport), 1u);
+}
+
 TEST(Linker, IntraModuleSymbolReferenceResolves) {
     auto loaded = loadMinimal();
     AssembledModule mod;

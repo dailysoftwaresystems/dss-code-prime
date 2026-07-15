@@ -376,6 +376,86 @@ TEST(ElfWriter, ObjectExternCallEmitsUndefImportNameAndPlt32Reloc) {
     EXPECT_EQ(addend, -4) << "psABI rel32 addend (baked bias)";
 }
 
+// ── D-LK-OBJECT-DATA-EXTERN-RELOCATABLE: data extern → PC32, not PLT32 ──
+
+TEST(ElfWriter, ObjectDataExternRefEmitsUndefNameAndPc32NotPlt32) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    // A relocatable object references BOTH a libc DATA object (`stdout`, an
+    // extern `isData` import) and a libc FUNCTION (`fputs`). The DATA
+    // reference must emit a plain PC32 (type 2) — exactly what gcc emits for
+    // `extern FILE *stdout` in a `.o`, which the final executable link
+    // resolves by copy-relocation — while the CALL keeps the PLT-capable
+    // PLT32 (type 4). This is the correctness pin for the isData exclusion in
+    // externCallTargets: were the data ref PLT32, the final linker would bind
+    // `stdout` to a PLT stub and the code would read jump-stub bytes as the
+    // FILE* value (the silent miscompile the image-path reject guards). Both
+    // externs are SHN_UNDEF NOTYPE (matching gcc's stdout/fputs symbols).
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{10};
+    // Synthetic opcodes; only the two relocations drive the ELF Rela under
+    // test. Byte 3: rel32 slot of a `mov rax,[rip+stdout]`; byte 8: rel32
+    // slot of a `call fputs`.
+    fn.bytes  = {0x48, 0x8B, 0x05, 0, 0, 0, 0,   // mov rax,[rip+disp32]  (7 bytes)
+                 0xE8, 0, 0, 0, 0};              // call rel32            (5 bytes)
+    fn.relocations.push_back(Relocation{/*offset=*/3u, /*target=*/SymbolId{20},
+                                        /*kind=*/RelocationKind{1}, /*addend=*/0});
+    fn.relocations.push_back(Relocation{/*offset=*/8u, /*target=*/SymbolId{30},
+                                        /*kind=*/RelocationKind{1}, /*addend=*/0});
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "user_fn",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    ExternImport dataExt;
+    dataExt.symbol      = SymbolId{20};
+    dataExt.mangledName = "stdout";
+    dataExt.libraryPath = "libc.so.6";
+    dataExt.isData      = true;                       // the DATA extern
+    mod.externImports.push_back(std::move(dataExt));
+    ExternImport fnExt;
+    fnExt.symbol      = SymbolId{30};
+    fnExt.mangledName = "fputs";
+    fnExt.libraryPath = "libc.so.6";
+    fnExt.isData      = false;                        // the FUNCTION extern
+    mod.externImports.push_back(std::move(fnExt));
+
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "ET_REL must accept a data extern (D-LK-OBJECT-DATA-EXTERN-RELOCATABLE)";
+
+    std::uint64_t const shoff     = readU64LE(bytes, 40);
+    std::uint64_t const symtabOff = readU64LE(bytes, shoff + 3 * 64 + 24);
+    std::uint64_t const strtabOff = readU64LE(bytes, shoff + 4 * 64 + 24);
+
+    // Symtab: 0=UNDEF, 1=STT_SECTION, 2=user_fn, then externs in first-
+    // reference order → 3=stdout (reloc[0]), 4=fputs (reloc[1]).
+    EXPECT_EQ(readStrtabName(bytes, strtabOff, readU32LE(bytes, symtabOff + 3 * 24 + 0)),
+              "stdout") << "data extern carries its real libc name";
+    EXPECT_EQ(bytes[symtabOff + 3 * 24 + 4], 0x10u)             // STB_GLOBAL|STT_NOTYPE
+        << "data extern is NOTYPE (matches gcc's `stdout` symbol), not STT_OBJECT";
+    EXPECT_EQ(readU16LE(bytes, symtabOff + 3 * 24 + 6), 0u)     // st_shndx = SHN_UNDEF
+        << "data extern must be SHN_UNDEF";
+    EXPECT_EQ(readStrtabName(bytes, strtabOff, readU32LE(bytes, symtabOff + 4 * 24 + 0)),
+              "fputs") << "function extern follows in reference order";
+
+    // .rela.text (section index 2): entry 0 = data ref, entry 1 = the call.
+    std::uint64_t const relaOff = readU64LE(bytes, shoff + 2 * 64 + 24);
+    std::uint64_t const rInfo0  = readU64LE(bytes, relaOff + 0 * 24 + 8);
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo0), 2u)
+        << "a DATA extern reference must be R_X86_64_PC32 (2), NOT PLT32 (4)";
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo0 >> 32), 3u)
+        << "reloc 0 targets the stdout symbol (symtab idx 3)";
+    std::uint64_t const rInfo1  = readU64LE(bytes, relaOff + 1 * 24 + 8);
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo1), 4u)
+        << "the FUNCTION call keeps R_X86_64_PLT32 (4) — the isData exclusion "
+           "must not weaken function-call dispatch";
+    EXPECT_EQ(static_cast<std::uint32_t>(rInfo1 >> 32), 4u)
+        << "reloc 1 targets the fputs symbol (symtab idx 4)";
+}
+
 // ── D-LK-OBJECT-DATA-SECTION-RELOCATABLE: .data + section-relative sym ──
 
 TEST(ElfWriter, ObjectEmitsDataSectionAndSectionRelativeDataSymbol) {
