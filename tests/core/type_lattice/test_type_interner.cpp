@@ -543,6 +543,88 @@ TEST(TypeInternerVolatile, OperandsAndScalarsSeeThroughToComposite) {
     EXPECT_EQ(ops[1].v, f32.v);
 }
 
+// ── FC17.9(d) 1a (D-CSUBSET-QUAL-BITSET): the {volatile, atomic} qualifier bitset ──
+//
+// The VolatileQual skin now carries a `QualBit` mask, so `volatile T`, `_Atomic T`,
+// and `_Atomic volatile T` are three distinct transparent skins over one material T.
+// These pins prove the generalized `qualified` machinery for a SECOND bit BEFORE any
+// grammar/MIR path produces `_Atomic` (the substrate's consuming shape is built here,
+// by the interner API, not left latent for cycle 1b). const is deliberately NOT a bit.
+
+TEST(TypeInternerQualBitset, AtomicDistinctAndTransparent) {
+    auto ti = makeInterner(1);
+    const TypeId i32  = ti.primitive(TypeKind::I32);
+    const TypeId vi32 = ti.volatileQualified(i32);
+    const TypeId ai32 = ti.atomicQualified(i32);
+    // `_Atomic int` is its OWN TypeId — distinct from both `int` and `volatile int`.
+    EXPECT_NE(ai32.v, i32.v);
+    EXPECT_NE(ai32.v, vi32.v);
+    // The atomic/volatile bits are read independently off the SAME skin kind.
+    EXPECT_TRUE(ti.isAtomicQualified(ai32));
+    EXPECT_FALSE(ti.isVolatileQualified(ai32));
+    EXPECT_TRUE(ti.isVolatileQualified(vi32));
+    EXPECT_FALSE(ti.isAtomicQualified(vi32));
+    // TRANSPARENT: kind() reports the material I32; the raw record is the shared skin.
+    EXPECT_EQ(ti.kind(ai32), TypeKind::I32);
+    EXPECT_EQ(ti.get(ai32).kind, TypeKind::VolatileQual);
+    EXPECT_EQ(ti.stripVolatile(ai32).v, i32.v);
+}
+
+TEST(TypeInternerQualBitset, MaskEncodingRawRead) {
+    auto ti = makeInterner(1);
+    const TypeId i32 = ti.primitive(TypeKind::I32);
+    const auto V = static_cast<std::int64_t>(QualBit::Volatile);
+    const auto A = static_cast<std::int64_t>(QualBit::Atomic);
+    // qualifierBits is 0 for a non-qualifier and the exact mask on a skin. The raw
+    // read must NOT be the transparent scalars() (which redirects through the skin).
+    EXPECT_EQ(ti.qualifierBits(i32), 0);
+    EXPECT_EQ(ti.qualifierBits(ti.volatileQualified(i32)), V);
+    EXPECT_EQ(ti.qualifierBits(ti.atomicQualified(i32)),   A);
+}
+
+TEST(TypeInternerQualBitset, CombinedCarriesBothBits) {
+    // ★ THE C1 Trap-1 red-on-disable pin. `qualified` must STRIP→UNION→RE-INTERN;
+    // if it ever reverts to a "return inner if already qualified" early-out, layering
+    // Atomic over volatile would DROP the atomic bit and `isAtomicQualified` below
+    // goes RED (a silent loss-of-atomicity miscompile caught at the unit tier).
+    auto ti = makeInterner(1);
+    const TypeId i32 = ti.primitive(TypeKind::I32);
+    const auto V = static_cast<std::int64_t>(QualBit::Volatile);
+    const auto A = static_cast<std::int64_t>(QualBit::Atomic);
+    const TypeId av = ti.qualified(ti.qualified(i32, V), A);  // Atomic over volatile
+    EXPECT_TRUE(ti.isVolatileQualified(av));
+    EXPECT_TRUE(ti.isAtomicQualified(av));                    // ← RED if a bit is dropped
+    EXPECT_EQ(ti.qualifierBits(av), V | A);
+    EXPECT_EQ(ti.kind(av), TypeKind::I32);                    // still transparent
+    EXPECT_EQ(ti.stripVolatile(av).v, i32.v);                 // strips the WHOLE skin
+}
+
+TEST(TypeInternerQualBitset, MergeIdempotentAndOrderIndependent) {
+    auto ti = makeInterner(1);
+    const TypeId i32 = ti.primitive(TypeKind::I32);
+    const auto V = static_cast<std::int64_t>(QualBit::Volatile);
+    const auto A = static_cast<std::int64_t>(QualBit::Atomic);
+    // Order-independent: Atomic-over-volatile ≡ volatile-over-atomic ≡ qualified(T,V|A).
+    const TypeId va = ti.atomicQualified(ti.volatileQualified(i32));
+    const TypeId av = ti.volatileQualified(ti.atomicQualified(i32));
+    EXPECT_EQ(va.v, av.v);
+    EXPECT_EQ(va.v, ti.qualified(i32, V | A).v);
+    // Idempotent: re-adding a bit already present is a no-op (union of equal masks).
+    EXPECT_EQ(ti.qualified(va, A).v, va.v);
+    EXPECT_EQ(ti.qualified(va, V).v, va.v);
+    // The combined skin is distinct from either single-bit skin.
+    EXPECT_NE(va.v, ti.volatileQualified(i32).v);
+    EXPECT_NE(va.v, ti.atomicQualified(i32).v);
+}
+
+TEST(TypeInternerQualBitset, ZeroMaskYieldsMaterial) {
+    // A zero mask adds no codegen-affecting qualifier ⇒ no skin (returns material).
+    auto ti = makeInterner(1);
+    const TypeId i32 = ti.primitive(TypeKind::I32);
+    EXPECT_EQ(ti.qualified(i32, 0).v, i32.v);
+    EXPECT_FALSE(ti.atomicQualified(InvalidType).valid());  // invalid inner → invalid
+}
+
 // ── C23 _BitInt(N) (D-CSUBSET-BITINT) ─────────────────────────────────────────
 
 // bitInt(N, signed) interns on the {N, signed} scalar pair; accessors decode it,

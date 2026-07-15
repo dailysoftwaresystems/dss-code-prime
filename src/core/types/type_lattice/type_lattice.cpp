@@ -184,23 +184,40 @@ TypeId TypeInterner::optional(TypeId inner) {
     return internContent(TypeKind::Optional, {}, ops, {}, {});
 }
 
-// ── volatile qualifier (D-CSUBSET-VOLATILE-POINTEE / c27) ──
+// ── type qualifiers (D-CSUBSET-VOLATILE-POINTEE / c27 · D-CSUBSET-QUAL-BITSET) ──
+
+TypeId TypeInterner::qualified(TypeId inner, std::int64_t addBits) {
+    if (!inner.valid()) return InvalidType;
+    // STRIP → UNION → RE-INTERN — never a "return inner if already qualified"
+    // early-out, which would silently DROP `addBits` when `inner` is already a
+    // qualifier (e.g. `_Atomic` over `volatile` collapsing to merely volatile — a
+    // loss-of-atomicity miscompile). Read the existing mask off `inner` (0 if it is
+    // not a qualifier skin), OR in the new bits, and re-intern ONE skin over the
+    // material type. Idempotent AND order-independent by construction:
+    // `qualified(qualified(T,A),B) == qualified(T, A|B)`. `volatile (volatile T)`
+    // ≡ `volatile T` (C 6.7.3p5) falls out — the union of equal masks is unchanged.
+    std::int64_t const merged = qualifierBits(inner) | addBits;
+    TypeId const base = materialId_(inner);
+    if (merged == 0) return base;  // no codegen-affecting qualifier ⇒ no skin
+    std::array<TypeId, 1> const ops{base};
+    std::array<std::int64_t, 1> const sc{merged};
+    return internContent(TypeKind::VolatileQual, {}, ops, sc, {});
+}
 
 TypeId TypeInterner::volatileQualified(TypeId inner) {
-    if (!inner.valid()) return InvalidType;
-    // Idempotent: a VolatileQual over a VolatileQual is the same VolatileQual.
-    // Read the RAW record kind (not the transparent `kind()`, which would see
-    // through and re-wrap). `volatile (volatile T)` ≡ `volatile T` (C 6.7.3p5).
-    if (arena_.at(inner).kind == TypeKind::VolatileQual) return inner;
-    std::array<TypeId, 1> const ops{inner};
-    return internContent(TypeKind::VolatileQual, {}, ops, {}, {});
+    return qualified(inner, static_cast<std::int64_t>(QualBit::Volatile));
+}
+
+TypeId TypeInterner::atomicQualified(TypeId inner) {
+    return qualified(inner, static_cast<std::int64_t>(QualBit::Atomic));
 }
 
 TypeId TypeInterner::materialId_(TypeId id) const {
-    // Strip VolatileQual skins to the material type. Idempotency keeps the chain
-    // at one level, but loop defensively (cost: a handful of valid ids never
-    // exceed depth 1). Reads `arena_` directly so `kind()`/`operands()` can call
-    // this without recursing back into themselves.
+    // Strip the qualifier skin to the material type. `qualified` never nests (it
+    // merges bits into ONE skin), so this is at most one level, but loop
+    // defensively (cost: a handful of valid ids never exceed depth 1). Reads
+    // `arena_` directly so `kind()`/`operands()` can call this without recursing
+    // back into themselves.
     while (id.valid() && arena_.at(id).kind == TypeKind::VolatileQual) {
         id = operandPool_[arena_.at(id).operandStart];
     }
@@ -211,8 +228,30 @@ TypeId TypeInterner::stripVolatile(TypeId id) const {
     return materialId_(id);
 }
 
+std::int64_t TypeInterner::qualifierBits(TypeId id) const {
+    // RAW read of the qualifier mask in scalar slot 0 — NOT the transparent
+    // `scalars()`, which redirects THROUGH the skin to the inner type's scalars.
+    // Returns 0 for any NON-qualifier id (so callers can OR unconditionally).
+    if (!id.valid()) return 0;
+    TypeRecord const& rec = arena_.at(id);
+    if (rec.kind != TypeKind::VolatileQual) return 0;
+    // A real qualifier ALWAYS carries exactly one nonzero-mask scalar (the sole
+    // producer `qualified` never mints a skin with a zero/absent mask — a zero mask
+    // returns the material type, no skin). A VolatileQual with no scalar is a corrupt
+    // invariant; FAIL LOUD rather than silently return 0 — a silent 0 would make
+    // `isVolatileQualified`/`isAtomicQualified` false, DROPPING the qualifier, which
+    // is the exact silent-miscompile class this refactor exists to prevent.
+    if (rec.scalarCount == 0)
+        latticeFatal("qualifierBits: VolatileQual record has no mask scalar");
+    return scalarPool_[rec.scalarStart];
+}
+
 bool TypeInterner::isVolatileQualified(TypeId id) const {
-    return id.valid() && arena_.at(id).kind == TypeKind::VolatileQual;
+    return (qualifierBits(id) & static_cast<std::int64_t>(QualBit::Volatile)) != 0;
+}
+
+bool TypeInterner::isAtomicQualified(TypeId id) const {
+    return (qualifierBits(id) & static_cast<std::int64_t>(QualBit::Atomic)) != 0;
 }
 
 TypeId TypeInterner::array(TypeId element, std::int64_t length) {

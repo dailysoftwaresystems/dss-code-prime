@@ -56,7 +56,18 @@ enum class TypeKind : std::uint16_t {
     // binds the innermost pointee, C 6.7.3); east `u32 * volatile` =
     // VolatileQual(Ptr<U32>) (a volatile POINTER). Idempotent (no double-wrap).
     // const gets NO such wrapper — const stays ignored for type identity, since
-    // only volatile affects codegen (the optimizer's MirInstFlags::Volatile).
+    // it never affects codegen or layout.
+    //   FC17.9(d) 1a (D-CSUBSET-QUAL-BITSET): GENERALIZED to a qualifier BITSET.
+    //   The node carries a `QualBit` mask (see below) in scalar slot 0 —
+    //   `volatile T` = bits{Volatile}, `_Atomic T` = bits{Atomic}, `_Atomic
+    //   volatile T` = bits{Volatile,Atomic} — so a multiply-qualified scalar is
+    //   ONE skin, not a nesting. Distinct masks intern distinctly (the scalar
+    //   joins hashContent/equalContent, exactly like an array's length). The kind
+    //   stays named `VolatileQual` (not `QualifiedType`) so pre-existing TypeId
+    //   integers, the exhaustive `typeKindName` switch, and the whole volatile
+    //   test surface are UNCHANGED. The mask is read ONLY via the raw
+    //   `qualifierBits(id)`; the transparent `scalars(id)` sees THROUGH the skin
+    //   to the inner type's scalars.
     // Placed LAST (before Count_) so every pre-existing kind keeps its integer
     // value — TypeKind ints appear in scalar pools (enum underlying / CallConv)
     // and cached/round-tripped TypeIds; renumbering would silently shift them.
@@ -127,6 +138,21 @@ inline constexpr std::int64_t kVlaLength = -2;
 // pool = non-bitfield and a struct with NO bitfields interns with EMPTY scalars
 // (bit-identical to a pre-bitfield struct — no TypeId churn).
 inline constexpr std::int64_t kNotBitfield = -1;
+
+// FC17.9(d) 1a (D-CSUBSET-QUAL-BITSET): the type-qualifier bits carried in a
+// VolatileQual node's scalar pool (slot 0). The single generalized qualifier
+// skin carries a BITSET so a multiply-qualified scalar — e.g. `_Atomic volatile
+// int` — is ONE skin (bits {Volatile,Atomic}) rather than a nesting.
+// `volatileQualified` sets Volatile; `atomicQualified` sets Atomic; `qualified`
+// merges bits idempotently and order-independently. Read ONLY via the raw
+// `qualifierBits(id)` — the transparent `scalars(id)` sees THROUGH the skin to
+// the inner type. const is NOT a bit here (it never affects codegen/layout, so
+// it is not materialized as a qualifier skin at all). The underlying type is
+// int64 because the mask rides an int64 scalar slot.
+enum class QualBit : std::int64_t {
+    Volatile = 1 << 0,  // C `volatile`  — drives MirInstFlags::Volatile at access.
+    Atomic   = 1 << 1,  // C11 `_Atomic` — consumed by FC17.9(d) cycle 1b codegen.
+};
 
 // Calling conventions are machine-shaped (not language-shaped) — core lattice
 // members, attached to FnSig and consumed by the FFI plan. Stored in a

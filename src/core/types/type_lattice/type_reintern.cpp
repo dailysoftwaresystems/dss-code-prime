@@ -108,16 +108,19 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
     // round-trip). The raw kind preserves VolatileQual so the wrapper round-trips.
     TypeKind const kind      = src.get(srcId).kind;
 
-    // ── volatile qualifier (D-CSUBSET-VOLATILE-POINTEE) ──
-    // A VolatileQual wraps exactly ONE inner type. Re-intern the inner into the
-    // host, then re-wrap. Handled HERE (before the transparent operand read below)
-    // because `src.operands(VolatileQual(T))` redirects to T's operands (NOT [T]).
-    // `stripVolatile` recovers the inner (idempotency keeps VolatileQual one level
-    // deep, so the strip yields exactly the wrapped type).
+    // ── type qualifiers (D-CSUBSET-VOLATILE-POINTEE / D-CSUBSET-QUAL-BITSET) ──
+    // A VolatileQual wraps exactly ONE inner type + a QualBit mask. Re-intern the
+    // inner into the host, then re-wrap with the SAME mask. Handled HERE (before the
+    // transparent operand read below) because `src.operands(VolatileQual(T))`
+    // redirects to T's operands (NOT [T]); `stripVolatile` recovers the material
+    // inner (the skin never nests). Re-wrap via `qualified(inner, bits)`, NOT
+    // `volatileQualified` — the latter sets only the Volatile bit and would DROP an
+    // `_Atomic` (or `_Atomic volatile`) qualifier on this cross-CU merge / text
+    // round-trip, a silent loss-of-atomicity miscompile.
     if (kind == TypeKind::VolatileQual) {
         TypeId const inner  = reinternType(src, src.stripVolatile(srcId),
                                            dstHost, remap);
-        TypeId const result = dst.volatileQualified(inner);
+        TypeId const result = dst.qualified(inner, src.qualifierBits(srcId));
         remap.emplace(srcId.v, result);
         return result;
     }

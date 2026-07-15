@@ -1126,6 +1126,42 @@ TEST(TypeLayout, VolatileQualifierDoesNotChangeLayout) {
     EXPECT_EQ(layoutOf(va, ti).size, 16u);
 }
 
+// FC17.9(d) 1a (D-CSUBSET-QUAL-BITSET): the SAME layout-invariance holds for the
+// atomic bit and for the combined `_Atomic volatile` mask — the layout engine strips
+// the whole qualifier skin, so a lock-free-scalar atomic never changes size/align (a
+// naturally-aligned `_Atomic int` IS lock-free; non-lock-free `_Atomic` is a cycle-1b
+// fail-loud, never a silent layout change). The scalar arms are coverage-by-
+// construction (kind() is transparent); the top-level `_Atomic struct` arm is the
+// RED-ON-DISABLE seam — computeLayout must `stripVolatile` at entry to see the raw
+// Struct kind, so deleting that strip makes the atomic-qualified struct hit the engine
+// default (raw kind != Struct) → nullopt → the struct EXPECTs below fail (the exact
+// `VolatileQualifierDoesNotChangeLayout` precedent, now proven for the atomic bit too).
+TEST(TypeLayout, AtomicQualifierDoesNotChangeLayout) {
+    auto ti = makeInterner(1);
+    const TypeId i32  = ti.primitive(TypeKind::I32);
+    const TypeId ai32 = ti.atomicQualified(i32);                          // _Atomic int
+    const TypeId avi32 = ti.atomicQualified(ti.volatileQualified(i32));   // _Atomic volatile int
+    auto const li = layoutOf(i32, ti);
+    for (const TypeId q : {ai32, avi32}) {                                // scalar: 4/4
+        auto const lq = layoutOf(q, ti);
+        EXPECT_EQ(lq.size, li.size);
+        EXPECT_EQ(lq.align.bytes(), li.align.bytes());
+        EXPECT_EQ(lq.size, 4u);
+    }
+    // top-level `_Atomic struct S` ≡ struct S (2 fields i32+f32) — the strip-seam arm.
+    const TypeId f32 = ti.primitive(TypeKind::F32);
+    std::array<TypeId, 2> const fields{i32, f32};
+    const TypeId s  = ti.structType("S", fields);
+    const TypeId as = ti.atomicQualified(s);
+    auto const ls  = layoutOf(s, ti);
+    auto const las = layoutOf(as, ti);
+    EXPECT_EQ(las.size, ls.size);
+    EXPECT_EQ(las.align.bytes(), ls.align.bytes());
+    ASSERT_EQ(las.fieldOffsets.size(), ls.fieldOffsets.size());
+    for (std::size_t i = 0; i < ls.fieldOffsets.size(); ++i)
+        EXPECT_EQ(las.fieldOffsets[i], ls.fieldOffsets[i]);
+}
+
 // ── C23 _BitInt(N) ABI (D-CSUBSET-BITINT) — witnessed vs clang-19 x86-64 psABI ──
 
 TEST(TypeLayout, BitIntSizeAndAlign) {
