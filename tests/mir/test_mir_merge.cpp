@@ -1900,10 +1900,11 @@ TEST(SynthThreadsShim, MissingLibrarySynthesisWithNonEmptyRecipesFailsLoud) {
     EXPECT_TRUE(rep.hasErrors());
 }
 
-// Per-recipe COVERAGE (multi-form contract, §A.5): every one of the 18 pthread recipes must
-// (a) land as a definition, (b) import its SPECIFIC pthread primitive from libSystem, and
-// (c) verify. A subset-only test would let a latent miss at an unexercised recipe survive.
-TEST(SynthThreadsShim, PthreadAllEighteenRecipesEmitAndVerify) {
+// Per-recipe COVERAGE (multi-form contract, §A.5): every one of the 21 pthread recipes (the
+// 18 non-trampoline + the 3 trampolines thrd_create/call_once/thrd_join) must (a) land as a
+// definition, (b) import its SPECIFIC pthread primitive from libSystem, and (c) verify. A
+// subset-only test would let a latent miss at an unexercised recipe survive.
+TEST(SynthThreadsShim, PthreadAllTwentyOneRecipesEmitAndVerify) {
     struct Case { char const* recipe; char const* helper; };
     static constexpr Case kCases[] = {
         {"mtx_init", "pthread_mutex_init"},   {"mtx_lock", "pthread_mutex_lock"},
@@ -1916,6 +1917,8 @@ TEST(SynthThreadsShim, PthreadAllEighteenRecipesEmitAndVerify) {
         {"tss_set", "pthread_setspecific"},   {"tss_delete", "pthread_key_delete"},
         {"thrd_current", "pthread_self"},     {"thrd_yield", "sched_yield"},
         {"thrd_exit", "pthread_exit"},        {"thrd_detach", "pthread_detach"},
+        {"thrd_create", "pthread_create"},    {"call_once", "pthread_once"},
+        {"thrd_join", "pthread_join"},
     };
     for (auto const& c : kCases) {
         TypeInterner in{CompilationUnitId{1}};

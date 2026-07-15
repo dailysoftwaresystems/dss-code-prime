@@ -18,9 +18,12 @@
  * so a call_once that fired 0x or 2x (g_once_count 0 or 2) SHIFTS the exit code
  * to 41/43 - both witnesses are load-bearing.
  *
- * macho is CARVED OUT (D-CSUBSET-C11-THREADS-MACHO) so there is no darwin arm.
- * RED-on-disable: delete shippedLibs/threads.json and the #include fires
- * F_ShippedHeaderNotFound and the compile fails. */
+ * On macho (arm64) each is a pthread shim: thrd_create DIRECT-PASSes worker to
+ * pthread_create, thrd_join is a pthread_join into a stack void-star slot then a
+ * truncate, and call_once is a DIRECT pthread_once. The macho arm RUNS natively
+ * on a macOS-arm64 host (a real pthread spawn). RED-on-disable: delete
+ * shippedLibs/threads.json and the #include fires F_ShippedHeaderNotFound and the
+ * compile fails. */
 #include <threads.h>
 
 static int       g_once_count = 0;

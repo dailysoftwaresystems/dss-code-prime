@@ -171,6 +171,8 @@ bool synthesizeThreadsShim(
     TypeId const phSig_u64_void   = sig({}, u64Ty);                 // pthread_self()
     TypeId const phSig_i32_void   = sig({}, i32Ty);                 // sched_yield()
     TypeId const phSig_v_pV       = sig({pVoid}, voidTy);           // pthread_exit(value_ptr)
+    TypeId const phSig_i32_4pV    = sig({pVoid, pVoid, pVoid, pVoid}, i32Ty); // pthread_create(thr, attr, start, arg)
+    TypeId const phSig_i32_u64pU  = sig({u64Ty, pVoid}, i32Ty);     // pthread_join(thread, void** retval)
 
     // ── pthread shim (recipe) signatures (the macho thrd_t/tss_t are u64) ──
     TypeId const rSigP_mtx_init   = sig({pVoid, i32Ty}, i32Ty);
@@ -185,6 +187,9 @@ bool synthesizeThreadsShim(
     TypeId const rSigP_v_void     = sig({}, voidTy);           // thrd_yield
     TypeId const rSigP_v_i32      = sig({i32Ty}, voidTy);      // thrd_exit
     TypeId const rSigP_i32_u64    = sig({u64Ty}, i32Ty);       // thrd_detach
+    TypeId const rSigP_thrd_create= sig({pVoid, pVoid, pVoid}, i32Ty);  // (thrd_t*, start, arg)->int
+    TypeId const rSigP_call_once  = sig({pVoid, pVoid}, voidTy);        // (once_flag*, void(*)(void))->void
+    TypeId const rSigP_thrd_join  = sig({u64Ty, pI32}, i32Ty);         // (thrd_t, int*)->int
 
     // ── Rebuild the module (Mir is frozen): clone every existing function verbatim,
     //    then APPEND each shim function, then clone globals — the shared rebuild idiom. ──
@@ -625,6 +630,66 @@ bool synthesizeThreadsShim(
                                           builder.addArg(0, u64Ty));
                 std::array<MirInstId, 2> mul{isNonZeroI32(r), i32c(2)};
                 builder.addReturn(builder.addInst(MirOpcode::Mul, mul, i32Ty));         // r!=0 → error(2)
+
+            // ── Cycle 2 (D-CSUBSET-C11-THREADS-TRAMPOLINES) — macho pthread trampolines ──
+            } else if (recipe == "thrd_create") {
+                // DIRECT-PASS (no closure): the C11 start routine int(*)(void*) is handed
+                // straight to pthread_create's void*(*)(void*) — the arg is one ptr (x0) and the
+                // int return lands in the low 32 of x0 that thrd_join reads back (validated
+                // end-to-end on the Mac). pthread_create(thr, NULL attr, func, arg); *thr is
+                // written by pthread_create itself. ret (r!=0)?thrd_error(2):thrd_success(0).
+                begin(sym, rSigP_thrd_create);
+                MirInstId const thr  = builder.addArg(0, pVoid);   // thrd_t* (out)
+                MirInstId const func = builder.addArg(1, pVoid);   // thrd_start_t == start routine
+                MirInstId const arg  = builder.addArg(2, pVoid);   // void* arg
+                MirInstId const r    = call4("pthread_create", phSig_i32_4pV, i32Ty,
+                                             thr, nullPtr(), func, arg);
+                std::array<MirInstId, 2> mul{isNonZeroI32(r), i32c(2)};
+                builder.addReturn(builder.addInst(MirOpcode::Mul, mul, i32Ty));         // r!=0 → thrd_error(2)
+
+            } else if (recipe == "call_once") {
+                // pthread_once(flag, func) — the SAME shape as C11 call_once (once_flag* +
+                // void(*)(void)), so a DIRECT pass; NO adapter (unlike pe's InitOnceExecuteOnce
+                // via __dss_once_tramp). The macho once_flag is seeded with the macOS
+                // PTHREAD_ONCE_INIT magic sig via the ONCE_FLAG_INIT variant (threads.json).
+                begin(sym, rSigP_call_once);
+                MirInstId const flag = builder.addArg(0, pVoid);
+                MirInstId const func = builder.addArg(1, pVoid);
+                call2("pthread_once", phSig_i32_pVpV, i32Ty, flag, func);   // int ret discarded (call_once is void)
+                builder.addReturn();
+
+            } else if (recipe == "thrd_join") {
+                // MULTI-block: pthread_join wants a void** out-slot (8 bytes) but the C11 `res`
+                // is an int* (4) — so Alloca an 8-byte slot, join into it, then `if (res)`
+                // truncate the returned void* to int and store (a NULL `res` must not fault).
+                // ret thrd_success. Blocks get default markers; the module-wide rederive at the
+                // end makes them canonical (IfThen/IfJoin).
+                begin(sym, rSigP_thrd_join);                       // opens the ENTRY block
+                MirInstId const t    = builder.addArg(0, u64Ty);   // thrd_t (pthread_t) by value
+                MirInstId const res  = builder.addArg(1, pI32);    // int* (exit-code out; may be NULL)
+                MirInstId const slot = builder.addInst(MirOpcode::Alloca, {}, pVoid, /*bytes=*/8); // void* retval slot
+                call2("pthread_join", phSig_i32_u64pU, i32Ty, t, slot);   // pthread_join(t, &slot)
+                std::array<MirInstId, 1> rp{res};
+                MirInstId const resInt = builder.addInst(MirOpcode::PtrToInt, rp, i64Ty);
+                std::array<MirInstId, 2> ne{resInt, konst(0, TypeKind::I64, i64Ty)};
+                MirInstId const cond   = builder.addInst(MirOpcode::ICmpNe, ne, boolTy);  // res != 0
+                MirBlockId const thenBB = builder.createBlock();   // marker set by the module-wide rederive
+                MirBlockId const joinBB = builder.createBlock();
+                builder.addCondBr(cond, thenBB, joinBB);
+                // then: *res = (int)(intptr_t)(*slot)  — the void* the thread returned, truncated
+                builder.beginBlock(thenBB);
+                std::array<MirInstId, 1> ld{slot};
+                MirInstId const rv    = builder.addInst(MirOpcode::Load, ld, pVoid);       // void* retval
+                std::array<MirInstId, 1> pti{rv};
+                MirInstId const rvInt = builder.addInst(MirOpcode::PtrToInt, pti, i64Ty);
+                std::array<MirInstId, 1> tr{rvInt};
+                MirInstId const rv32  = builder.addInst(MirOpcode::Trunc, tr, i32Ty);
+                std::array<MirInstId, 2> st{rv32, res};
+                builder.addInst(MirOpcode::Store, st, InvalidType);   // *res = (int)rv
+                builder.addBr(joinBB);
+                // join: ret thrd_success(0)
+                builder.beginBlock(joinBB);
+                builder.addReturn(i32c(0));
 
             } else {
                 // A recipe id present in the descriptor vocabulary but with NO pthread arm — a

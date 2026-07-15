@@ -160,15 +160,15 @@ struct DSS_EXPORT ShippedSymbol {
     std::string synthesize;
 };
 
-// True iff `id` is a member of the CLOSED pe64 <threads.h> synth-recipe vocabulary
-// (the 18 NON-trampoline Cycle-1 recipes; thrd_sleep + thrd_join are elf-FFI-only —
-// deferred on pe, see the .cpp vocab list). The SINGLE source of truth shared by the
-// descriptor loader (which rejects an unknown `synthesize` value fail-loud —
-// F_ShippedLibDescriptorMalformed) AND the driver's multi-CU merged-module recipe
-// reconstruction (program.cpp). The pe64 synth pass (`synthesizeThreadsShim`) has the
-// matching per-recipe body switch; a vocab id with no switch arm fails loud at synth
-// (they cannot silently diverge). Cycle-2 recipes (thrd_create/call_once) are NOT
-// here — they are the deferred trampolines. (D-CSUBSET-C11-THREADS-HEADER)
+// True iff `id` is a member of the CLOSED <threads.h> synth-recipe vocabulary — the 21
+// recipes: the 18 non-trampoline (Cycle 1) + the 3 trampolines thrd_create/call_once/
+// thrd_join (Cycle 2). (thrd_sleep + the timed-waits stay elf-FFI-only — deferred, see the
+// .cpp vocab list.) The SINGLE source of truth shared by the descriptor loader (which
+// rejects an unknown `synthesize` value fail-loud — F_ShippedLibDescriptorMalformed) AND
+// the driver's multi-CU merged-module recipe reconstruction (program.cpp). The synth pass
+// (`synthesizeThreadsShim`) has the matching per-recipe body switch PER VEHICLE (pe→win32/
+// kernel32, macho→pthread/libSystem); a vocab id with no switch arm fails loud at synth
+// (they cannot silently diverge). (D-CSUBSET-C11-THREADS-HEADER)
 [[nodiscard]] DSS_EXPORT bool isKnownSynthesizeRecipe(std::string_view id);
 
 // One decoded named CONSTANT — the neutral form of a header's object-like

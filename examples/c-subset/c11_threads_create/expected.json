@@ -1,12 +1,13 @@
 {
-  "$comment": "FC17.9(a) (D-CSUBSET-C11-THREADS-TRAMPOLINES) Cycle 2 - C11 <threads.h> thread CREATION on 3 legs. elf x86_64 + arm64 (qemu) resolve thrd_create/thrd_join/call_once as DIRECT libc.so.6 FFI (glibc>=2.28, `nm -D` verified real dynamic exports on both arches); pe64 SYNTHESIZES them over kernel32 (thrd_create DIRECT-PASS to CreateThread, thrd_join a multi-block WaitForSingleObject/GetExitCodeThread/CloseHandle, call_once over InitOnceExecuteOnce via the __dss_once_tramp adapter). A REAL spawned thread returns 42 through thrd_join, and call_once fires bump_once exactly once (g_once_count == 1) so exit = 42 + (1-1) = 42; a 0x/2x call_once shifts it to 41/43 (both witnesses load-bearing). Fold-resistant (a real CreateThread/pthread_create cannot const-fold), so the release arm runs the true path. macho CARVED OUT (D-CSUBSET-C11-THREADS-MACHO) so there is NO darwin arm. RED-on-disable: delete shippedLibs/threads.json -> the #include fires F_ShippedHeaderNotFound and the compile fails.",
+  "$comment": "FC17.9(a) (D-CSUBSET-C11-THREADS-TRAMPOLINES) Cycle 2 - C11 <threads.h> thread CREATION on 3 legs. elf x86_64 + arm64 (qemu) resolve thrd_create/thrd_join/call_once as DIRECT libc.so.6 FFI (glibc>=2.28, `nm -D` verified real dynamic exports on both arches); pe64 SYNTHESIZES them over kernel32 (thrd_create DIRECT-PASS to CreateThread, thrd_join a multi-block WaitForSingleObject/GetExitCodeThread/CloseHandle, call_once over InitOnceExecuteOnce via the __dss_once_tramp adapter). macho (arm64) SYNTHESIZES them over libSystem pthread (thrd_create DIRECT-PASSes worker to pthread_create, thrd_join a pthread_join into a stack void* out-slot + truncate, call_once a DIRECT pthread_once — the macho once_flag seeded with the macOS PTHREAD_ONCE_INIT magic sig). A REAL spawned thread returns 42 through thrd_join, and call_once fires bump_once exactly once (g_once_count == 1) so exit = 42 + (1-1) = 42; a 0x/2x call_once shifts it to 41/43 (both witnesses load-bearing). Fold-resistant (a real CreateThread/pthread_create cannot const-fold), so the release arm runs the true path. The macho arm RUNS natively on a macOS-arm64 host (real pthread spawn). RED-on-disable: delete shippedLibs/threads.json -> the #include fires F_ShippedHeaderNotFound and the compile fails.",
   "language": "c-subset",
   "source": "main.c",
   "exitCode": 42,
   "targets": [
     { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] },
     { "spec": "x86_64:elf64-x86_64-linux-exec",  "artifact": "main", "runOn": ["linux"] },
-    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" }
+    { "spec": "arm64:elf64-aarch64-linux-exec",  "artifact": "main", "runOn": ["linux"], "emulator": "qemu-aarch64" },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"] }
   ],
   "optimizedPipelines": [
     { "label": "release", "shippedPipeline": "release" }
