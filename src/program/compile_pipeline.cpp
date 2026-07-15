@@ -22,6 +22,7 @@
 #include "mir/lowering/hir_to_mir.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergedMirModule (lowerMergedToAssembly consumes it)
 #include "mir/merge/synth_pe_startup.hpp"  // synthesizePeStartup (c111 D-RUNTIME-PE-MAIN-ARGS)
+#include "mir/merge/synth_threads_shim.hpp"  // synthesizeThreadsShim (FC17.9a D-CSUBSET-C11-THREADS-HEADER)
 #include "opt/optimizer.hpp"
 #include "opt/passes/prune_unreachable.hpp"
 
@@ -423,7 +424,8 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           &hir->threadLocalMap,   // TLS C1
                           &hir->vlaSizeExprBySymbol,   // VLA C1a (D-CSUBSET-VLA)
                           &hir->sizeofVlaSymbol,   // VLA C2 (D-CSUBSET-VLA)
-                          &hir->typedefVlaOriginBySymbol);   // VLA C4b (D-CSUBSET-VLA)
+                          &hir->typedefVlaOriginBySymbol,   // VLA C4b (D-CSUBSET-VLA)
+                          &hir->synthRecipeBySymbol);   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
     phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;
@@ -469,6 +471,16 @@ static std::optional<CuMirModule> buildCuMirImpl(
         // strategy so the LOWER half lays out bit-field globals byte-ABI-exact.
         effectiveBfStrategy,
     };
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): carry the pe64 <threads.h> shim recipe
+    // table across the MIR/LIR seam so the LOWER half's `synthesizeThreadsShim` can
+    // define each shim. `hir` (the CstToHirResult) is still alive here — lowerToMir read
+    // its maps by pointer, it was not consumed. Empty for the overwhelming majority.
+    cuMir.threadsRecipes = hir->synthRecipeBySymbol;
+    // D-CSUBSET-C11-THREADS-MACHO: capture the format's synth vehicle (win32/pthread +
+    // import library) the SAME post-construction way as threadsRecipes, so the LOWER
+    // half's `synthesizeThreadsShim` picks the right primitive family. nullopt on elf.
+    cuMir.librarySynthesis = format.librarySynthesis();
+    cuMir.objectFormat     = format.kind();   // for the synth pass's per-format helper mangling
     return cuMir;
 }
 
@@ -1070,6 +1082,19 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
                                  *processArgs, reporter)) {
             return std::nullopt;  // malformed argv parameter type — fail-loud reported.
         }
+    }
+
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER / D-CSUBSET-C11-THREADS-MACHO): single-CU
+    // counterpart of the merge-path shim synth (program.cpp). Supply a definition for every
+    // <threads.h> shim symbol the descriptor tagged (mtx_lock etc.) over the format's synth
+    // vehicle (pe→kernel32, macho→pthread); a clean no-op when `threadsRecipes` is empty
+    // (every elf + non-threads TU). Same seam as synthesizePeStartup (the CU is per-CU-
+    // optimized; the appended shims are lowered like any other function). The interner is
+    // the CU model's; the vehicle comes from `cuMir.librarySynthesis`.
+    if (!synthesizeThreadsShim(cuMir.mir, model.lattice().interner(),
+                               cuMir.threadsRecipes, cuMir.librarySynthesis,
+                               cuMir.objectFormat, cuMir.externImports, reporter)) {
+        return std::nullopt;  // internal invariant breach (vocab/switch drift) — reported.
     }
 
     // c116 (D-WIN64-SEH-FUNCLETS): synthesize the SEH filter funclets + record the

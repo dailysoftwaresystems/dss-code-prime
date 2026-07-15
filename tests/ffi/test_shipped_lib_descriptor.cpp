@@ -200,6 +200,46 @@ TEST(ShippedLibDescriptor, SymbolPerTargetAvailabilityDecodesAndSelects) {
                                               ObjectFormatKind::MachO));
 }
 
+// D-CSUBSET-C11-THREADS-MACHO: the C11 `tss_t` (pthread_key_t) width DIVERGES per format —
+// 8 bytes (u64) on macho, 4 (u32) on elf/pe. The 3-way typedef variant must select the
+// format-correct width; a wrong width is a SILENT tss miscompile (the macho witness's
+// tss_create/set/get round-trip would corrupt the key). Structural, host-independent pin
+// for the width the named-import synth test cannot see. RED-on-disable: collapse the macho
+// variant to u32 and the MachO assertion fails.
+TEST(ShippedLibDescriptor, ThreadsTssKeyTypedefWidthDivergesPerFormat) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "threads_tss.json", R"JSON({
+        "header": "threads.h",
+        "availableObjectFormats": ["elf", "pe", "macho"],
+        "typedefs": [
+            { "name": "tss_t", "variants": [
+                { "when": { "format": "elf" },   "type": "u32" },
+                { "when": { "format": "pe" },    "type": "u32" },
+                { "when": { "format": "macho" }, "type": "u64" }
+            ] }
+        ]
+    })JSON");
+    auto tssIsKind = [&](ObjectFormatKind fmt, TypeKind expected) -> bool {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, "arm64", fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        for (auto const& td : desc->typedefs)
+            if (td.name == "tss_t") return td.type == interner.primitive(expected);
+        ADD_FAILURE() << "tss_t typedef missing";
+        return false;
+    };
+    EXPECT_TRUE(tssIsKind(ObjectFormatKind::MachO, TypeKind::U64))
+        << "macho tss_t must be u64 (pthread_key_t = 8 bytes)";
+    EXPECT_TRUE(tssIsKind(ObjectFormatKind::Elf, TypeKind::U32))
+        << "elf tss_t must be u32 (glibc pthread_key_t = 4 bytes)";
+    EXPECT_FALSE(tssIsKind(ObjectFormatKind::MachO, TypeKind::U32))
+        << "the macho variant must NOT collapse to the elf u32 width";
+}
+
 // An unknown per-symbol availability format name fails loud (closed vocabulary,
 // the SAME `objectFormatKindFromName` the header-level set + `library` keys use).
 TEST(ShippedLibDescriptor, SymbolPerTargetAvailabilityUnknownFormatFailsLoud) {
@@ -2993,6 +3033,83 @@ TEST(ShippedLibDescriptor, RealWindowsUlargeOverlayLayout) {
         saw = true;
     }
     EXPECT_TRUE(saw) << "ULARGE_INTEGER absent from windows.json structs on pe";
+}
+
+// ── FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): the pe64 <threads.h> shim `synthesize`
+//    recipe tag ────────────────────────────────────────────────────────────────────
+
+// A known recipe id that EQUALS the symbol name decodes onto `ShippedSymbol.synthesize`.
+// The vocabulary predicate is the SINGLE source of truth shared with the driver's merged
+// reconstruction; Cycle 2 ADDED thrd_create/call_once/thrd_join (the last threads recipes).
+TEST(ShippedLibDescriptor, SynthesizeTagDecodesForKnownRecipe) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "threads.json", R"({
+        "header": "threads.h",
+        "symbols": [
+            { "name": "mtx_lock", "signature": "fn(ptr<void>) -> i32",
+              "availableObjectFormats": ["pe"], "synthesize": "mtx_lock" },
+            { "name": "mtx_lock", "signature": "fn(ptr<void>) -> i32",
+              "availableObjectFormats": ["elf"] }
+        ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->symbols.size(), 2u);
+    // The pe entry carries the tag; the elf entry is a PLAIN untagged extern (locks the
+    // tag pe-only — M4(b) at the descriptor tier).
+    EXPECT_EQ(desc->symbols[0].synthesize, "mtx_lock");
+    EXPECT_TRUE(desc->symbols[1].synthesize.empty());
+    EXPECT_TRUE(isKnownSynthesizeRecipe("mtx_lock"));
+    EXPECT_TRUE(isKnownSynthesizeRecipe("tss_create"));
+    EXPECT_TRUE(isKnownSynthesizeRecipe("thrd_create"));   // Cycle 2 (DIRECT-PASS)
+    EXPECT_TRUE(isKnownSynthesizeRecipe("thrd_join"));     // Cycle 2 (multi-block)
+    EXPECT_TRUE(isKnownSynthesizeRecipe("call_once"));     // Cycle 2 (once trampoline)
+    EXPECT_FALSE(isKnownSynthesizeRecipe("bogus"));
+}
+
+// M4(d): an UNKNOWN `synthesize` recipe id fails the read (closed vocabulary).
+// RED-ON-DISABLE: without the isKnownSynthesizeRecipe guard a typo'd recipe reaches the
+// synth pass with no arm → a silently-undefined shim.
+TEST(ShippedLibDescriptor, SynthesizeUnknownRecipeFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "threads_bad.json", R"({
+        "header": "threads.h",
+        "symbols": [
+            { "name": "mtx_lock", "signature": "fn(ptr<void>) -> i32",
+              "availableObjectFormats": ["pe"], "synthesize": "mtx_lokc" }
+        ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
+}
+
+// The `synthesize` value MUST EQUAL the symbol name — the synth pass keys each body on
+// the symbol name, so a mismatch would synthesize the WRONG recipe. Fail loud.
+// RED-ON-DISABLE: without the name-invariant a descriptor could map mtx_lock's symbol to
+// mtx_unlock's body (a lock that silently unlocks).
+TEST(ShippedLibDescriptor, SynthesizeNameMismatchFailsLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "threads_mismatch.json", R"({
+        "header": "threads.h",
+        "symbols": [
+            { "name": "mtx_lock", "signature": "fn(ptr<void>) -> i32",
+              "availableObjectFormats": ["pe"], "synthesize": "mtx_unlock" }
+        ]
+    })");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    EXPECT_FALSE(desc.has_value());
+    EXPECT_TRUE(rep.hasErrors());
 }
 
 } // namespace

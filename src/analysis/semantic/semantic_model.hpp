@@ -372,6 +372,14 @@ struct DSS_EXPORT ShippedExternSymbol {
     // scope). A missing format key inherits externLibraryByFormat[format].
     std::unordered_map<std::string, std::string> library;
     bool        isFunction = true;  // ExternFunction vs ExternGlobal
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): the pe64 <threads.h> synth-recipe id
+    // (== the symbol name, a validated descriptor invariant), or EMPTY for an ordinary
+    // shipped extern. When non-empty the CST->HIR lowerer SKIPS this symbol's
+    // extern-import synthesis (kernel32 exports no mtx_lock — the eager-import law) and
+    // records {symbol, recipeId} into `CstToHirResult.synthRecipeBySymbol` so HIR->MIR
+    // seeds `functionSymbols` (the user call lowers to GlobalAddr against a not-yet-
+    // defined callee) and `synthesizeThreadsShim` supplies the definition before link.
+    std::string recipeId;
 };
 
 class DSS_EXPORT SemanticModel {

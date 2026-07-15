@@ -257,6 +257,14 @@ lowerToMir(Hir const&               hir,
            // sources every size from R's decl-frozen slots (freeze-once, C99 §6.7.7p2)
            // instead of re-lowering `n`.
            std::unordered_map<std::uint32_t, std::uint32_t> const*
-               typedefVlaOriginMap = nullptr);
+               typedefVlaOriginMap = nullptr,
+           // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): per-pe64-<threads.h>-shim
+           // side-table (SymbolId.v → recipe id), populated by the CST→HIR lowerer
+           // when a `synthesize`-tagged shipped extern is reached. Optional: nullptr
+           // (or empty) ⇒ no threads shim. Read by the `collectThreadShimSymbols`
+           // pre-pass to SEED `functionSymbols` so a user call to a shim function
+           // lowers to GlobalAddr against the not-yet-defined synth callee.
+           std::unordered_map<std::uint32_t, std::string> const*
+               synthRecipeMap = nullptr);
 
 } // namespace dss

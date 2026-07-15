@@ -818,6 +818,22 @@ struct DSS_EXPORT ObjectFormatData {
     // VALUE still fails loud at load (the closed-enum check).
     std::optional<TlsAccessInfo> tlsAccess;
 
+    // ── D-CSUBSET-C11-THREADS-MACHO: shipped-library synthesis vehicle ──
+    //
+    // THIS format's compiler-synthesized-shim vehicle (`"librarySynthesis"`
+    // in the JSON): the closed primitive family (`win32` / `pthread`) a
+    // synthesized shipped-library shim (today C11 <threads.h>) emits its
+    // body over, plus the native library its on-demand helpers import from.
+    // See `LibrarySynthesis` (core/types/object_format_kind.hpp).
+    //
+    // `std::nullopt` = the format declared no synth vehicle. This is NOT a
+    // silent default: a format that carries synthesize-tagged shipped
+    // symbols but no vehicle fails loud in `synthesizeThreadsShim` (never a
+    // silently-assumed vehicle). ELF omits it (glibc exports the C11 thread
+    // API directly → the synth recipe map is empty on elf → clean no-op);
+    // pe/macho declare it. An unknown VALUE fails loud at load.
+    std::optional<LibrarySynthesis> librarySynthesis;
+
     // ── D-LK2-RODATA closure: producer-data-section capability set ──
     //
     // Schema-declared set of `DataSectionKind` values the format's
@@ -1032,6 +1048,16 @@ public:
     [[nodiscard]] std::optional<TlsAccessInfo>
     tlsAccess() const noexcept {
         return d_.tlsAccess;
+    }
+
+    // D-CSUBSET-C11-THREADS-MACHO: the shipped-library synth vehicle this
+    // format declared (`win32` / `pthread`), or `std::nullopt` if none.
+    // `synthesizeThreadsShim` reads it to emit the right primitive family
+    // + import library; a nullopt under a module carrying synthesize-tagged
+    // threads symbols is a fail-loud, never a silently-assumed vehicle.
+    [[nodiscard]] std::optional<LibrarySynthesis> const&
+    librarySynthesis() const noexcept {
+        return d_.librarySynthesis;
     }
 
     // ── D-LK2-RODATA producer-data-section capability gate ─────

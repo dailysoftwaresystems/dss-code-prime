@@ -11,9 +11,11 @@
 #include "core/types/type_lattice/type_lattice.hpp"  // TypeLattice (fresh merge host)
 #include "ffi/abi/abi_catalog.hpp"
 #include "ffi/mangling/c_mangle.hpp"  // applyCMangling — the cross-CU merge-key mangling (D-LK-MACHO-CROSSCU-MANGLE-MERGE-KEY)
+#include "ffi/shipped_lib_descriptor.hpp"  // isKnownSynthesizeRecipe (FC17.9a threads-shim vocab)
 #include "link/object_format_schema.hpp"
 #include "mir/merge/mir_merge.hpp"  // MergeCuInput, mergeCuMirs (N>1 whole-program merge)
 #include "mir/merge/synth_pe_startup.hpp"  // synthesizePeStartup (c111 D-RUNTIME-PE-MAIN-ARGS)
+#include "mir/merge/synth_threads_shim.hpp"  // synthesizeThreadsShim (FC17.9a D-CSUBSET-C11-THREADS-HEADER)
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
 #include "lsp/thread_pool.hpp"
@@ -38,6 +40,8 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -392,6 +396,11 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
             return std::string{};
         };
         in.externImports = cuMir.externImports;
+        // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): this CU's referenced-only pe64
+        // <threads.h> shim symbols, so the merge planning assigns them a merged id
+        // (else the clone aborts on a shim GlobalAddr — the multi-CU threads defect).
+        // Non-owning; `cuMir` (in `cuMirs`) outlives the merge.
+        in.synthRecipes = &cuMir.threadsRecipes;
         mergeInputs.push_back(std::move(in));
     }
 
@@ -442,6 +451,42 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                  merged->userEntrySymbol, merged->externImports,
                                  *pa, reporter)) {
             return false;  // malformed argv parameter type — fail-loud already reported.
+        }
+    }
+
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER / D-CSUBSET-C11-THREADS-MACHO): whole-program
+    // counterpart of the single-CU shim synth. The per-CU {SymbolId, recipeId} tables do not
+    // survive the merge's symbol remap, so RECONSTRUCT the merged recipe map from the merged
+    // symbol NAMES (== the recipe ids; the descriptor pins `synthesize == name`): a merged
+    // symbol whose name is a known threads recipe AND that is NOT a defined function / FFI
+    // extern is a shim to define. The `symbolNames` values are format-C-MANGLED (macho adds a
+    // leading `_`) while the recipe vocabulary + the synth switch key on the BARE C name, so
+    // `unapplyCMangling` un-decorates before the vocab check AND the bare id is what the synth
+    // pass receives — identity on pe/elf (their C mangling is identity, "main" == un-mangled),
+    // strips the `_` on macho. Runs BEFORE optimize so the shims are DCE-rooted + optimized
+    // (canonical markers re-derived).
+    // A no-op when the map is empty. ★ The merge's step-3c pre-registers each referenced-
+    // only shim symbol with a merged id + a `symbolNames` entry (else the clone would abort
+    // on a shim `GlobalAddr`), so a shim that is NOT collapsed onto a genuine user def lands
+    // here as a not-defined/not-imported vocab name and IS synthesized — multi-CU threads
+    // works (a 2-file pe64 witness runs → 42). A shim collapsed onto a real user def is a
+    // DEFINED symbol → filtered out → correctly not re-synthesized.
+    {
+        std::unordered_set<std::uint32_t> definedOrImported;
+        for (std::uint32_t i = 0; i < merged->mir.moduleFuncCount(); ++i)
+            definedOrImported.insert(merged->mir.funcSymbol(merged->mir.funcAt(i)).v);
+        for (auto const& e : merged->externImports) definedOrImported.insert(e.symbol.v);
+        std::unordered_map<std::uint32_t, std::string> mergedRecipes;
+        for (auto const& [symV, name] : merged->symbolNames) {
+            std::string const bare = dss::ffi::unapplyCMangling(name, fmtKind);
+            if (dss::ffi::isKnownSynthesizeRecipe(bare)
+                && definedOrImported.find(symV) == definedOrImported.end())
+                mergedRecipes.emplace(symV, bare);
+        }
+        if (!synthesizeThreadsShim(merged->mir, merged->host.interner(),
+                                   mergedRecipes, (*formatR)->librarySynthesis(),
+                                   fmtKind, merged->externImports, reporter)) {
+            return false;  // internal invariant breach (vocab/switch drift) — reported.
         }
     }
 

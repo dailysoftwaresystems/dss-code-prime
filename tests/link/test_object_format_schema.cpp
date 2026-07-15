@@ -317,6 +317,61 @@ TEST(LK10EntrySliceB, ShippedElfExecExitsViaLibcExitImport) {
     EXPECT_EQ((*rArm)->entryCallingConvention(), "aapcs64");
 }
 
+// ── D-CSUBSET-C11-THREADS-MACHO: `librarySynthesis` block ──────────────
+// The synth vehicle + import library the compiler-synthesized <threads.h> shim reads.
+// RED-on-disable: delete the macho `librarySynthesis` block and a macho threads compile
+// fails loud in synthesizeThreadsShim (recipes present, no vehicle).
+TEST(LibrarySynthesis, ShippedMachoArm64ExecDeclaresPthreadVehicle) {
+    auto r = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-exec");
+    ASSERT_TRUE(r.has_value());
+    auto const& ls = (*r)->librarySynthesis();
+    ASSERT_TRUE(ls.has_value())
+        << "macho arm64 exec must declare a librarySynthesis vehicle (D-CSUBSET-C11-THREADS-MACHO)";
+    EXPECT_EQ(ls->vehicle, LibrarySynthVehicle::Pthread);
+    EXPECT_EQ(ls->libraryPath, "/usr/lib/libSystem.B.dylib");
+}
+
+TEST(LibrarySynthesis, ShippedPeExecDeclaresWin32Vehicle) {
+    auto r = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    ASSERT_TRUE(r.has_value());
+    auto const& ls = (*r)->librarySynthesis();
+    ASSERT_TRUE(ls.has_value()) << "pe64 exec must declare a librarySynthesis vehicle";
+    EXPECT_EQ(ls->vehicle, LibrarySynthVehicle::Win32);
+    EXPECT_EQ(ls->libraryPath, "kernel32.dll");
+}
+
+// ELF omits the block (glibc exports the C11 thread API directly → the synth map is empty).
+TEST(LibrarySynthesis, ShippedElfExecOmitsVehicle) {
+    auto r = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-exec");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_FALSE((*r)->librarySynthesis().has_value())
+        << "elf must NOT declare a synth vehicle (direct libc FFI)";
+}
+
+// A PRESENT block is strict: an unknown vehicle is a fail-loud at load (never a silent
+// degrade to "no synth support").
+TEST(LibrarySynthesis, UnknownVehicleRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": { "name": "x", "version": "1.0", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "relocations": [],
+      "librarySynthesis": { "vehicle": "bogus", "libraryPath": "libc.so.6" }
+    })");
+    EXPECT_FALSE(r.has_value()) << "an unknown librarySynthesis vehicle must fail loud at load";
+}
+
+TEST(LibrarySynthesis, MissingLibraryPathRejected) {
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "format": { "name": "x", "version": "1.0", "kind": "elf" },
+      "elf": { "class": "elf64", "data": "lsb", "machine": 62 },
+      "relocations": [],
+      "librarySynthesis": { "vehicle": "pthread" }
+    })");
+    EXPECT_FALSE(r.has_value()) << "a librarySynthesis block without libraryPath must fail loud";
+}
+
 TEST(LK10EntrySliceB, EntryCallingConventionResolvesAgainstTarget) {
     // Cross-schema invariant: the shipped exec format's
     // `entryCallingConvention` string must resolve to a declared

@@ -10440,7 +10440,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
 
                 shippedExterns.push_back(ShippedExternSymbol{
                     id, sym.name, sym.signature, desc->library,
-                    sym.kind == ffi::ShippedSymbolKind::Function});
+                    sym.kind == ffi::ShippedSymbolKind::Function,
+                    sym.synthesize});   // D-CSUBSET-C11-THREADS-HEADER (pe shim tag)
             }
 
             // Item 1: inject the descriptor's CONSTANTS (the neutral form of a

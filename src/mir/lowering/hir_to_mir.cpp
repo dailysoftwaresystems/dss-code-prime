@@ -108,6 +108,12 @@ struct Lowerer {
     // slots down (freeze-once) instead of re-lowering the bound.
     std::unordered_map<std::uint32_t, std::uint32_t> const* typedefVlaOriginMap =
         nullptr;
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): pe64 <threads.h> shim SymbolId.v →
+    // recipe id. nullptr / empty ⇒ no threads shim. The `collectThreadShimSymbols`
+    // pre-pass SEEDS `functionSymbols` with each key so the user's `mtx_lock(&m)` call
+    // lowers to `GlobalAddr(sym)` (the callee is defined later by the synth pass, which
+    // MirVerifier tolerates) instead of failing loud "HIR Ref to unbound symbol".
+    std::unordered_map<std::uint32_t, std::string> const* synthRecipeMap = nullptr;
     MirBuilder               mir;
     // Extern symbols extracted during the pre-pass. Each extern's
     // SymbolId is also inserted into `functionSymbols` so a `Ref`
@@ -9656,6 +9662,24 @@ struct Lowerer {
         }
     }
 
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): pre-pass — SEED `functionSymbols` with
+    // every pe64 <threads.h> shim symbol (mtx_lock etc.). CST→HIR SKIPPED these from
+    // extern-import synthesis (kernel32 exports no such name — the eager-import law), so
+    // `collectExterns` never registers them; without this seed the user's
+    // `mtx_lock(&m)` call would fail loud "HIR Ref to unbound symbol" at the Ref
+    // lowering BEFORE the synth pass runs. Seeding routes the call through the ordinary
+    // `GlobalAddr(sym)` path (a not-yet-defined function callee, which MirVerifier
+    // tolerates); `synthesizeThreadsShim` (mir/merge) supplies the definition pre-link.
+    // Empty for every non-threads / elf / macho TU. Agnostic: keys on the config-carried
+    // recipe tag, never a format check.
+    void collectThreadShimSymbols() {
+        if (synthRecipeMap == nullptr) return;
+        for (auto const& [symV, recipeId] : *synthRecipeMap) {
+            (void)recipeId;
+            functionSymbols.insert(symV);
+        }
+    }
+
     // Pre-pass: collect extern function SymbolIds + build per-row
     // `ExternImport` records by consulting the optional
     // `HirAttribute<FfiMetadata>` side-table. Extern SymbolIds are
@@ -10682,6 +10706,7 @@ struct Lowerer {
         // an extern declaration. Reordering would silently degrade
         // the guard to "extern wins, prior function shadowed."
         collectFunctions(root);
+        collectThreadShimSymbols();   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
         collectGlobals(root);
         collectExterns(root);
         classifyGlobals(root);
@@ -10765,7 +10790,9 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           std::unordered_map<std::uint32_t, std::uint32_t> const*
                                                    sizeofVlaSymMap,
                           std::unordered_map<std::uint32_t, std::uint32_t> const*
-                                                   typedefVlaOriginMap) {
+                                                   typedefVlaOriginMap,
+                          std::unordered_map<std::uint32_t, std::string> const*
+                                                   synthRecipeMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -10787,6 +10814,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .vlaSizeMap = vlaSizeMap,
         .sizeofVlaSymMap = sizeofVlaSymMap,
         .typedefVlaOriginMap = typedefVlaOriginMap,
+        .synthRecipeMap = synthRecipeMap,   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
         .mir       = MirBuilder{},
     };
     // D-OPT-LOAD-ALIAS-ANALYSIS-STRICT-TBAA-WIRING: stamp the module-

@@ -95,6 +95,17 @@ struct MergePlan {
     // resolve to it. Disjoint from `canonicalForName`: a name that IS a defined
     // winner never lands here (it rewires to the direct def instead).
     std::unordered_map<std::string, SymbolId> ffiCanonicalForName;
+    // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): pe64 <threads.h> SHIM mangledName →
+    // its single canonical merged SymbolId, shared across CUs. A shim symbol (mtx_lock
+    // etc.) is REFERENCED-ONLY in each CU (CST→HIR skipped its import; the def is
+    // synthesized POST-merge by `synthesizeThreadsShim` in program.cpp), so it is
+    // neither a def nor an ExternImport — the def/extern planning below never sees it,
+    // and a cloned caller's `GlobalAddr(shimSym)` would abort in `mergedSymbolOf`. This
+    // pre-registers each shim symbol with a merged id (unified by name across CUs, like
+    // `ffiCanonicalForName`) so the clone remaps cleanly; the merged id lands in
+    // `symbolNames` so the post-merge reconstruction re-finds it. NEVER emitted as an
+    // import (shims carry no ExternImport row → they cannot leak into survivingExterns).
+    std::unordered_map<std::string, SymbolId> shimCanonicalForName;
     // merged-symbol .v → declared name (for the lower half's symtab populate).
     std::unordered_map<std::uint32_t, std::string> symbolNames;
     // (cuIdx, oldFunc.v) → merged MirFuncId — populated as functions are
@@ -620,6 +631,48 @@ mergeCuMirs(std::span<MergeCuInput const> cus, TypeLattice&& host,
             // An extern's name is its mangledName (nameOf must agree, but the
             // import row is authoritative for the on-binary name).
             assignSymbol(ci, e.symbol, e.mangledName, /*isFfiExtern=*/true);
+        }
+    }
+
+    // ── (3c) FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): pe64 <threads.h> SHIM symbols.
+    // A shim (mtx_lock etc.) is REFERENCED-ONLY in each CU (CST→HIR skipped its import;
+    // the definition is synthesized POST-merge by `synthesizeThreadsShim`), so 3b never
+    // assigned it a merged id and a cloned caller's `GlobalAddr(shimSym)` would abort in
+    // `mergedSymbolOf`. Register each with a merged id, unified by NAME across CUs (two
+    // CUs both `#include <threads.h>` share ONE merged mtx_lock, synthesized once). MUST
+    // run AFTER 3a/3b so a name that ALSO has a genuine def winner (a user-defined
+    // mtx_lock — goal-2 per CU) or FFI extern collapses to THAT (the user's def wins;
+    // the post-merge reconstruction then sees a DEFINED symbol and synthesizes nothing).
+    // The merged id lands in `symbolNames` so program.cpp's reconstruction re-finds it;
+    // it is NEVER an ExternImport row, so it cannot leak into `survivingExterns`.
+    for (std::uint32_t ci = 0; ci < cus.size(); ++ci) {
+        if (cus[ci].synthRecipes == nullptr) continue;
+        for (auto const& [shimV, recipeId] : *cus[ci].synthRecipes) {
+            (void)recipeId;
+            CuSymKey const key{ci, shimV};
+            if (plan.symMerged.count(key)) continue;   // also a real symbol — leave it
+            std::string const name = cus[ci].nameOf(SymbolId{shimV});
+            if (name.empty()) continue;                // no match key — cannot unify
+            if (auto it = plan.canonicalForName.find(name);
+                it != plan.canonicalForName.end()) {   // a genuine def winner wins
+                plan.symMerged.emplace(key, it->second);
+                continue;
+            }
+            if (auto it = plan.ffiCanonicalForName.find(name);
+                it != plan.ffiCanonicalForName.end()) {  // defensive (a shim name is not FFI)
+                plan.symMerged.emplace(key, it->second);
+                continue;
+            }
+            if (auto it = plan.shimCanonicalForName.find(name);
+                it != plan.shimCanonicalForName.end()) { // another CU's same-named shim
+                plan.symMerged.emplace(key, it->second);
+                continue;
+            }
+            SymbolId const merged =
+                (ci == 0 && alloc.isFree(shimV)) ? alloc.claim(shimV) : alloc.mint();
+            plan.symMerged.emplace(key, merged);
+            plan.symbolNames.emplace(merged.v, name);
+            plan.shimCanonicalForName.emplace(name, merged);
         }
     }
 

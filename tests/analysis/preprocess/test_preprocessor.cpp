@@ -2228,33 +2228,37 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     auto c = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(c.has_value());
     auto const& pms = (*c)->preprocess().predefinedMacros;
-    // 9 ungated (the 7 C 6.10.8 core + the TLS C1 `__STDC_NO_THREADS__` line,
-    // D-CSUBSET-THREAD-LOCAL — <threads.h> is never shipped, + the `_BitInt` C1
-    // `__BITINT_MAXWIDTH__` line, D-CSUBSET-BITINT — C23 6.2.5, the mandatory
-    // bit-precise max width 8388608) + 10 pe-gated = 19: the c95 Windows selection
-    // (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the c105 MSVC-profile
-    // flip (_MSC_VER/__int64/__forceinline/__declspec). D-CSUBSET-VLA C1b REMOVED
-    // `__STDC_NO_VLA__` (VLA is now supported — a VLA-capable impl must not define
-    // it), dropping the ungated count from 10 to 9.
-    EXPECT_EQ(pms.size(), 19u)
-        << "c-subset declares 9 un-gated + 10 pe-gated Windows predefined macros";
+    // 8 ungated (the 7 C 6.10.8 core + the `_BitInt` C1 `__BITINT_MAXWIDTH__` line,
+    // D-CSUBSET-BITINT — C23 6.2.5, the mandatory bit-precise max width 8388608) +
+    // 10 pe-gated + 1 macho-gated = 19: the pe-gated set is the c95 Windows selection
+    // (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the c105 MSVC-profile flip
+    // (_MSC_VER/__int64/__forceinline/__declspec); the macho-gated one is
+    // `__STDC_NO_THREADS__` is now REMOVED ENTIRELY (FC17.9(a) macho trampolines —
+    // D-CSUBSET-C11-THREADS-MACHO closed: <threads.h> is COMPLETE on ALL legs incl. macho,
+    // so a conforming impl defines the macro on NO target). D-CSUBSET-VLA C1b removed
+    // `__STDC_NO_VLA__`; the threads macro's removal drops the count 19 → 18, with NO
+    // macho-gated macros remaining.
+    EXPECT_EQ(pms.size(), 18u)
+        << "c-subset declares 8 un-gated + 10 pe-gated predefined macros (no macho-gated)";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     for (auto const& pm : pms) {
         if (pm.availableObjectFormats.empty()) {
             ++ungated;
         } else {
-            ++peGated;
             EXPECT_EQ(pm.availableObjectFormats.size(), 1u)
                 << pm.name << " should be gated to exactly one format";
+            EXPECT_NE(pm.name, "__STDC_NO_THREADS__")
+                << "__STDC_NO_THREADS__ must be REMOVED (threads.h complete on all legs)";
+            ++peGated;
             EXPECT_EQ(pm.availableObjectFormats.front(), "pe")
-                << pm.name << " should be pe-gated (Windows selection)";
+                << pm.name << " should be pe-gated (Windows selection) — no macho-gated macro remains";
         }
     }
-    EXPECT_EQ(ungated, 9u)
-        << "the 7 C 6.10.8 macros + __STDC_NO_THREADS__ (TLS C1) + "
-           "__BITINT_MAXWIDTH__ (_BitInt C1) are un-gated (every format); "
-           "__STDC_NO_VLA__ was removed by D-CSUBSET-VLA C1b (VLA supported)";
+    EXPECT_EQ(ungated, 8u)
+        << "the 7 C 6.10.8 macros + __BITINT_MAXWIDTH__ (_BitInt C1) are un-gated (every "
+           "format); __STDC_NO_VLA__ (D-CSUBSET-VLA C1b) + __STDC_NO_THREADS__ (threads.h "
+           "complete on all legs) are both REMOVED";
     EXPECT_EQ(peGated, 10u)
         << "_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI (c95) + "
            "_MSC_VER/__int64/__forceinline/__declspec (c105) are pe-gated";
@@ -3481,6 +3485,28 @@ TEST(Preprocessor, FunctionLikePredefineErasesArgsOnPe) {
         "int", "x", ";", "int", "f", "(", "void", ")", ";"};
     EXPECT_EQ(lexs, expect)
         << "__declspec(...) must erase to nothing on pe, args fully eaten";
+}
+
+// FC17.9(a) (D-CSUBSET-C11-THREADS-TRAMPOLINES / -MACHO): <threads.h> is now COMPLETE on
+// ALL legs — thrd_create/call_once/thrd_join land on elf (libc FFI), pe64 (kernel32 synth)
+// AND macho (libSystem pthread synth: pthread_create/pthread_once/pthread_join). So a
+// conforming impl must NOT define `__STDC_NO_THREADS__` on ANY target (C11 6.10.8.3 /
+// C23 6.10.9.3) — the macro is REMOVED from c-subset.lang.json entirely. RED-on-disable:
+// re-add the macro (any gating) → the corresponding arm flips to the no_threads
+// (conformance-lie) branch.
+TEST(Preprocessor, ThreadsCompleteStdcNoThreadsRemovedAllLegs) {
+    char const* const src =
+        "#ifdef __STDC_NO_THREADS__\nint no_threads;\n#else\nint has_threads;\n#endif\n";
+    for (ObjectFormatKind fmt :
+         {ObjectFormatKind::MachO, ObjectFormatKind::Elf, ObjectFormatKind::Pe}) {
+        // every leg: <threads.h> complete -> the macro is UNDEFINED -> has_threads arm.
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDefines(src, {}, r, fmt);
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u)
+            << "__STDC_NO_THREADS__ UNDEFINED on every leg (threads.h complete) -> has_threads";
+        EXPECT_EQ(lexs[1], "has_threads");
+    }
 }
 
 // The SAME source WITHOUT the pe format: `__declspec` is format-gated

@@ -22,6 +22,7 @@
 
 #include <array>
 #include <string>
+#include <unordered_map>
 
 using namespace dss;
 
@@ -528,4 +529,74 @@ TEST(MirLoweringExtern, LowerToLirPropagatesExternsToMirToLirResult) {
     EXPECT_EQ(result.externImports[0].symbol, SymbolId{99});
     EXPECT_EQ(result.externImports[0].mangledName, "printf");
     EXPECT_EQ(result.externImports[0].libraryPath, "libc.so.6");
+}
+
+// ── FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): the HIR→MIR seam (the audit's C1 fix). ──
+// A module whose `main`-like function CALLS a symbol (99) that the CST→HIR skip left OUT
+// of both the extern-import set AND the defined-function set — the referenced-only pe64
+// <threads.h> shim shape. `collectThreadShimSymbols` must SEED `functionSymbols` from the
+// `synthRecipeMap` so the callee Ref lowers to GlobalAddr(99); without it the Ref is
+// "unbound" and lowering fails loud (the exact break the audit's C1 fix prevents).
+namespace {
+struct SeamBuilt { Hir hir; std::uint32_t shimSymV; };
+[[nodiscard]] SeamBuilt buildModuleCallingShim(TypeInterner& ti) {
+    TypeId const i32     = ti.primitive(TypeKind::I32);
+    TypeId const shimSig = ti.fnSig({}, i32, CallConv::CcSysV);   // the shim: fn()->i32
+    TypeId const fSig    = ti.fnSig({}, i32, CallConv::CcSysV);
+    constexpr std::uint32_t kShimSym = 99;   // NOT defined here, NOT an extern
+    HirBuilder b{"c-subset"};
+    HirNodeId const callee = b.makeRef(shimSig, kShimSym);
+    HirNodeId const call   = b.makeCall(callee, {}, i32);
+    HirNodeId const ret    = b.makeReturn(call);
+    HirNodeId const body   = b.makeBlock(std::array{ret});
+    HirNodeId const f      = b.makeFunction(fSig, /*symbol=*/1, {}, body);
+    HirNodeId const root   = b.makeModule(std::array{f});
+    return SeamBuilt{std::move(b).finish(root), kShimSym};
+}
+[[nodiscard]] bool hasGlobalAddrTo(Mir const& m, std::uint32_t symV) {
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const bb = m.funcBlockAt(f, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(bb); ++ii) {
+                MirInstId const inst = m.blockInstAt(bb, ii);
+                if (m.instOpcode(inst) == MirOpcode::GlobalAddr
+                    && m.globalAddrSymbol(inst).v == symV)
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+} // namespace
+
+TEST(MirLoweringExtern, ThreadsShimSymbolSeedsFunctionSymbols) {
+    TypeInterner ti = makeInterner();
+    auto built = buildModuleCallingShim(ti);
+    std::unordered_map<std::uint32_t, std::string> const recipes{{built.shimSymV, "mtx_lock"}};
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    MirLoweringConfig cfg;
+    auto result = lowerToMir(built.hir, pool, ti, rep, /*sourceMap=*/nullptr, cfg,
+                             /*ffiMap=*/nullptr, nullptr, nullptr, nullptr, nullptr,
+                             nullptr, nullptr, nullptr, nullptr, &recipes);
+    ASSERT_TRUE(result.ok)
+        << "a Ref to a seeded shim symbol must lower cleanly (the C1 functionSymbols seed)";
+    EXPECT_TRUE(hasGlobalAddrTo(result.mir, built.shimSymV))
+        << "the shim call callee must lower to GlobalAddr(shimSym), not an unbound error";
+}
+
+// RED-on-disable: the SAME module WITHOUT the seed (null map) → the shim Ref is unbound →
+// lowering fails loud. If this ever passes, the seed became load-BEARING-less.
+TEST(MirLoweringExtern, ThreadsShimUnseededRefFailsLoud) {
+    TypeInterner ti = makeInterner();
+    auto built = buildModuleCallingShim(ti);
+    DiagnosticReporter rep;
+    HirLiteralPool pool;
+    MirLoweringConfig cfg;
+    auto result = lowerToMir(built.hir, pool, ti, rep, /*sourceMap=*/nullptr, cfg,
+                             /*ffiMap=*/nullptr, nullptr, nullptr, nullptr, nullptr,
+                             nullptr, nullptr, nullptr, nullptr, /*synthRecipeMap=*/nullptr);
+    EXPECT_FALSE(result.ok)
+        << "without the seed the shim Ref is unbound — lowering must fail loud, never silent";
 }

@@ -28,6 +28,13 @@
   "tlsAccess": {
     "model": "macho-tlv"
   },
+
+  "$librarySynthesisComment": "D-CSUBSET-C11-THREADS-MACHO: macOS libSystem exports NO C11 <threads.h> symbols (verified — `_thrd_create` is undefined at link, and there is no <threads.h> in the macOS SDK), but pthread IS in libSystem. So each C11 threads function on macho is a COMPILER-SYNTHESIZED shim (src/mir/merge/synth_threads_shim.cpp, the `pthread` vehicle) emitted over pthread_mutex_* / pthread_cond_* / pthread_key_* / pthread_self / sched_yield — the Darwin analog of the pe64 `win32` (kernel32) shim. libraryPath is the libSystem dylib the on-demand pthread helper imports name (same value processExit/tlsAccess use). Keyed by the FORMAT (not the CPU): the vehicle is pthread for every Darwin arch; the synth pass dispatches on this declared verb, never on a format identity. ELF omits this block (glibc>=2.34 exports the C11 thread API directly from libc.so.6 → those symbols are ordinary FFI imports → the synth recipe map is empty on elf).",
+  "librarySynthesis": {
+    "vehicle": "pthread",
+    "libraryPath": "/usr/lib/libSystem.B.dylib"
+  },
+
   "$artifactProfilesComment": "Profiles this format SERVES (plan 06 AP3) — a runnable console executable ⇒ cli (the format-side twin of the language's artifactProfiles[]; driver fails loud D_ArtifactProfileFormatMismatch on a profile not in this set). macho64-x86_64-darwin-exec deliberately does NOT declare it (its processExit / exit spine is deferred → it cannot emit a runnable cli yet).",
   "artifactProfiles": ["cli"],
 
