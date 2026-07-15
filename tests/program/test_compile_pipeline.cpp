@@ -324,6 +324,47 @@ TEST(Program_CompileFiles, SingleCuMachOObjectSymbolCarriesLeadingUnderscore) {
            "symbol name (ld64 convention) — proves the single-CU nameOf mangle";
 }
 
+// ── D-LK3-MACHO-ARM64-OBJECT: the arm64 sibling emits a real .o ──
+//
+// End-to-end pipeline proof for the arm64 Mach-O relocatable object
+// (macho64-arm64-darwin, this cycle's sibling of macho64-x86_64-darwin): the
+// compile of a leaf function to the `arm64:macho64-arm64-darwin` target emits a
+// `forty_two.o` carrying the ld64-mangled `_forty_two`. The DSS-emitted .o links +
+// runs under the system clang/ld64 on Apple Silicon (the cross-toolchain witness,
+// exit 42; asserted here structurally, host-independent). Red-on-disable: delete the
+// format file → the compile fails (format not found) and the .o is never produced.
+TEST(Program_CompileFiles, SingleCuArm64MachOObjectEmitsMangledSymbol) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const src = writeCSubsetSource(
+        scratch.path(), "forty_two.c",
+        "int forty_two() { return 42; }\n");
+    scratch.useAsCwd();
+    auto const outDir = scratch.path() / "out";
+
+    Program prog;
+    prog.setOutputDir(outDir);
+    int const rc = prog.compileFiles(
+        {src.generic_string()}, "c-subset", {"arm64:macho64-arm64-darwin"});
+    ASSERT_EQ(rc, 0);
+    auto const obj = outDir / "forty_two.o";
+    ASSERT_TRUE(fs::exists(obj));
+
+    std::ifstream in(obj, std::ios::binary | std::ios::ate);
+    ASSERT_TRUE(in.good());
+    auto const size = static_cast<std::streamoff>(in.tellg());
+    std::string data(static_cast<std::size_t>(size), '\0');
+    in.seekg(0);
+    in.read(data.data(), size);
+
+    // mach_header cputype = CPU_TYPE_ARM64 (0x0100000C) at byte 4 (LE): 0C 00 00 01.
+    ASSERT_GE(data.size(), 8u);
+    EXPECT_EQ(static_cast<unsigned char>(data[4]), 0x0Cu);
+    EXPECT_EQ(static_cast<unsigned char>(data[7]), 0x01u)
+        << "the arm64 Mach-O .o header must carry CPU_TYPE_ARM64";
+    EXPECT_NE(data.find(std::string("_forty_two")), std::string::npos)
+        << "the arm64 Mach-O .o must carry the ld64-mangled _forty_two symbol";
+}
+
 // ── D-LK10-ENTRY-MAIN-IMPLICIT-RETURN ──────────────────────────────
 //
 // C99 §5.1.2.2.3: a `main` function that reaches the closing `}`

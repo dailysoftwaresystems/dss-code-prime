@@ -78,6 +78,27 @@ struct Loaded {
     return out;
 }
 
+// The arm64 sibling loader (D-LK3-MACHO-ARM64-OBJECT): arm64 target + the new
+// macho64-arm64-darwin relocatable-object format.
+[[nodiscard]] Loaded loadShippedArm64() {
+    Loaded out;
+    auto t = TargetSchema::loadShipped("arm64");
+    if (!t.has_value()) {
+        ADD_FAILURE() << "loadShipped(arm64) failed";
+        for (auto const& d : t.error()) ADD_FAILURE() << "  " << d.message;
+    } else {
+        out.target = std::move(t).value();
+    }
+    auto f = ObjectFormatSchema::loadShipped("macho64-arm64-darwin");
+    if (!f.has_value()) {
+        ADD_FAILURE() << "loadShipped(macho64-arm64-darwin) failed";
+        for (auto const& d : f.error()) ADD_FAILURE() << "  " << d.message;
+    } else {
+        out.format = std::move(f).value();
+    }
+    return out;
+}
+
 [[nodiscard]] AssembledModule makeTrivialModule(std::vector<std::uint8_t> bytes,
                                                   std::uint32_t symId) {
     AssembledModule mod;
@@ -307,6 +328,81 @@ TEST(MachOWriter, RelocationInfoPacksTypeLengthPcrelExternSymbolnum) {
     EXPECT_EQ((rInfo >> 24) & 0x1u, 1u);          // r_pcrel = 1
     // symtab index: 0 = caller (defined), 1 = extern target.
     EXPECT_EQ(rInfo & 0x00FFFFFFu, 1u);
+}
+
+// ── D-LK3-MACHO-ARM64-OBJECT: the arm64 sibling object format ───
+
+// The shipped macho64-arm64-darwin.format.json loads with the arm64 identity —
+// the arm64 mirror of ShippedFileLoadsCleanly. RED-on-disable: delete the file →
+// loadShipped fails.
+TEST(MachOFormatJson, ShippedArm64FileLoadsCleanly) {
+    auto loaded = loadShippedArm64();
+    ASSERT_TRUE(loaded.format);
+    EXPECT_EQ(loaded.format->kind(), ObjectFormatKind::MachO);
+    EXPECT_EQ(loaded.format->name(), "macho64-arm64-darwin");
+    // CPU_TYPE_ARM64 = (12 | CPU_ARCH_ABI64 0x01000000) = 0x0100000C.
+    EXPECT_EQ(loaded.format->macho().cputype, 0x0100000Cu);
+    EXPECT_EQ(loaded.format->macho().cpusubtype, 0u);   // CPU_SUBTYPE_ARM64_ALL
+    EXPECT_TRUE(loaded.format->macho().filetype == MachOObjectType::Object);
+    auto const* textRow = loaded.format->sectionByKind(SectionKind::Text);
+    ASSERT_NE(textRow, nullptr);
+    EXPECT_EQ(textRow->name, "__text");
+    EXPECT_EQ(textRow->segment, "__TEXT");
+    EXPECT_EQ(textRow->type, 0x80000400u);
+    // The arm64 relocation vocabulary: BRANCH26(1)/PAGE21(2)/PAGEOFF12(3)/UNSIGNED(4)
+    // — the walker validates emitted reloc kinds against these.
+    EXPECT_EQ(loaded.format->relocationByKind(RelocationKind{2})->nativeId, 0x35000000u); // PAGE21
+    EXPECT_EQ(loaded.format->relocationByKind(RelocationKind{3})->nativeId, 0x44000000u); // PAGEOFF12
+}
+
+// mach_header_64 golden bytes for arm64 — the arm64 mirror of the x86_64 header
+// pin. The cputype byte (0x0100000C) is the distinguishing field a foreign
+// toolchain reads to accept the .o as arm64 (proven live: `file` reports "Mach-O
+// 64-bit object arm64" and system clang links it → exit 42, this cycle's witness).
+TEST(MachOWriter, MachHeader64Arm64IdentityBytesMatchAppleAbi) {
+    auto loaded = loadShippedArm64();
+    AssembledModule mod = makeTrivialModule({0xC0, 0x03, 0x5F, 0xD6}, 42); // arm64 RET
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_GE(bytes.size(), 32u);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(readU32LE(bytes, 0), 0xFEEDFACFu);    // MH_MAGIC_64
+    EXPECT_EQ(readU32LE(bytes, 4), 0x0100000Cu);    // cputype = CPU_TYPE_ARM64
+    EXPECT_EQ(readU32LE(bytes, 8), 0u);             // cpusubtype = CPU_SUBTYPE_ARM64_ALL
+    EXPECT_EQ(readU32LE(bytes, 12), 1u);            // filetype = MH_OBJECT
+    EXPECT_EQ(readU32LE(bytes, 24), 0u);            // flags = 0
+}
+
+// An ARM64-DISTINCT relocation (PAGE21, kind=2 → r_type=3) packs correctly — proves
+// the arm64 format's reloc table is loaded, NOT x86_64's (whose kind=2 is UNSIGNED,
+// r_type=0). RED-on-disable: a wrong nativeId in the format flips the packed r_type.
+TEST(MachOWriter, Arm64RelocationInfoPacksPage21) {
+    auto loaded = loadShippedArm64();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction caller;
+    caller.symbol = SymbolId{1};
+    caller.bytes = {0x00, 0x00, 0x00, 0x90, 0xC0, 0x03, 0x5F, 0xD6}; // adrp x0,#0 ; ret
+    Relocation rel;
+    rel.offset = 0;
+    rel.target = SymbolId{2};        // extern
+    rel.kind   = RelocationKind{2};  // → ARM64_RELOC_PAGE21
+    rel.addend = 0;
+    caller.relocations.push_back(rel);
+    mod.functions.push_back(std::move(caller));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    std::uint32_t const relocOff = readU32LE(bytes, 160);
+    ASSERT_EQ(readU32LE(bytes, 164), 1u);           // one reloc
+    ASSERT_LE(relocOff + 8u, bytes.size());
+    std::uint32_t const rInfo = readU32LE(bytes, relocOff + 4);
+    EXPECT_EQ((rInfo >> 28) & 0xFu, 3u);            // r_type = 3 (PAGE21) — NOT x86's 0
+    EXPECT_EQ((rInfo >> 27) & 0x1u, 1u);            // r_extern
+    EXPECT_EQ((rInfo >> 25) & 0x3u, 2u);            // r_length = 2 (4 bytes)
+    EXPECT_EQ((rInfo >> 24) & 0x1u, 1u);            // r_pcrel = 1
+    EXPECT_EQ(rInfo & 0x00FFFFFFu, 1u);             // symtab index of the extern target
 }
 
 // ── Wrong-format kind rejection ────────────────────────────────
