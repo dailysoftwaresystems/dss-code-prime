@@ -101,6 +101,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
 [[nodiscard]] bool rejectOrDropUnboundExterns(
     AssembledModule const& m,
     AssembledModule&       filtered,
+    bool                   outputIsImage,
     DiagnosticReporter&    reporter) {
     bool anyUnbound = false;
     for (auto const& ext : m.externImports) {
@@ -125,14 +126,25 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
         if (!ext.libraryPath.empty()) continue;          // library-bound import
         if (ext.mangledName.empty()) continue;           // already rejected (compound index)
         if (referenced.contains(ext.symbol.v)) {
-            report(reporter, DiagnosticCode::K_SymbolUndefined,
-                   DiagnosticSeverity::Error,
-                   "undefined symbol '" + ext.mangledName + "' — the symbol "
-                   "is referenced (a prototype/extern declaration with no "
-                   "import library) but no linked compilation unit defines "
-                   "it and no library import binds it. Provide a definition "
-                   "in a linked translation unit, or declare the owning "
-                   "library for the symbol.");
+            // D-LK-OBJECT-NOLIB-EXTERN-RELOCATABLE: a referenced no-library
+            // extern is unresolvable in an IMAGE (nothing at load time binds
+            // it) → reject loud. But in a RELOCATABLE OBJECT it is a LEGAL
+            // SHN_UNDEF symbol the FINAL (foreign) linker resolves against a
+            // sibling object or library — the bare-prototype `SQLITE_API`
+            // shape (`int sqlite3_foo(...);`, no `extern`, no import library).
+            // Keep it: the ET_REL writer's undefined-symbol loop emits it by
+            // its `mangledName` (via `externName`), and gcc's `ld` resolves it.
+            if (outputIsImage) {
+                report(reporter, DiagnosticCode::K_SymbolUndefined,
+                       DiagnosticSeverity::Error,
+                       "undefined symbol '" + ext.mangledName + "' — the symbol "
+                       "is referenced (a prototype/extern declaration with no "
+                       "import library) but no linked compilation unit defines "
+                       "it and no library import binds it. Provide a definition "
+                       "in a linked translation unit, or declare the owning "
+                       "library for the symbol.");
+            }
+            // else (relocatable object): kept — deferred to the final linker.
         } else {
             anyDrop = true;   // unreferenced + unbound ⇒ drop below
         }
@@ -504,6 +516,7 @@ LinkedImage link(std::span<AssembledModule const> modules,
     {
         std::size_t const errsBeforeUnbound = reporter.errorCount();
         if (!rejectOrDropUnboundExterns(*selectedInput, unboundFilteredStorage,
+                                        objectFormatSchema.isImageFlavor(),
                                         reporter)) {
             selectedInput = &unboundFilteredStorage;
         }
