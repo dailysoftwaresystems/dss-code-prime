@@ -34,6 +34,7 @@
 #include <string>
 #include <utility>
 #include <variant>
+#include <vector>
 
 using namespace dss;
 
@@ -238,6 +239,173 @@ TEST(MirLoweringCSubset, AtomicScalarAccessLowersToAtomicLoadStore) {
     // The funnel REPLACES the plain ops — no plain Store/Load of `x` survives.
     EXPECT_FALSE(sawPlainStore) << "the atomic assignment must not emit a plain store";
     EXPECT_FALSE(sawPlainLoad)  << "the atomic read must not emit a plain load";
+}
+
+namespace {
+
+// C99 _Complex (D-CSUBSET-COMPLEX): collect every instance of `op` across the whole
+// module, in emission order — the complex arithmetic-shape pins read the exact
+// float-op sequence materializeComplexBinaryOp emits.
+[[nodiscard]] std::vector<MirInstId> collectOps(Mir const& m, MirOpcode op) {
+    std::vector<MirInstId> out;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                if (m.instOpcode(id) == op) out.push_back(id);
+            }
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+// C99 _Complex (D-CSUBSET-COMPLEX / design test #8): the MULTIPLY cross-term shape.
+// `ga * gb` (both double _Complex) must emit EXACTLY the 4-FMul + 1-FSub + 1-FAdd
+// componentwise form of (a+bi)(c+di) = (ac−bd) + (ad+bc)i — materialized BY ADDRESS
+// (no FDiv, no bare-SSA complex value). Strongest provable: the operand CHAIN is
+// asserted, not just counts — FSub consumes the 1st/2nd FMul (ac−bd), FAdd the
+// 3rd/4th (ad+bc), and BOTH results feed component Stores into the result slot.
+// RED-ON-DISABLE: any drift in the cross-term formula (a swapped operand, a lost
+// term, a scalar mis-route into combineBinaryOp) breaks the chain or the counts.
+TEST(MirLoweringCSubset, ComplexMultiplyEmitsCrossTermShape) {
+    auto L = lowerCSubset(
+        "double _Complex ga;\n"
+        "double _Complex gb;\n"
+        "int main(void) { double _Complex p = ga * gb; return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    auto const muls = collectOps(m, MirOpcode::FMul);
+    auto const subs = collectOps(m, MirOpcode::FSub);
+    auto const adds = collectOps(m, MirOpcode::FAdd);
+    ASSERT_EQ(muls.size(), 4u) << "complex x emits EXACTLY 4 FMul (ac, bd, ad, bc)";
+    ASSERT_EQ(subs.size(), 1u) << "complex x emits EXACTLY 1 FSub (ac - bd)";
+    ASSERT_EQ(adds.size(), 1u) << "complex x emits EXACTLY 1 FAdd (ad + bc)";
+    EXPECT_TRUE(collectOps(m, MirOpcode::FDiv).empty()) << "no FDiv in a multiply";
+
+    // The operand chain: FSub = (muls[0], muls[1]) — the real part ac−bd;
+    // FAdd = (muls[2], muls[3]) — the imag part ad+bc (emission order pins the
+    // formula's term pairing exactly as materializeComplexBinaryOp emits it).
+    auto const subOps = m.instOperands(subs[0]);
+    ASSERT_EQ(subOps.size(), 2u);
+    EXPECT_EQ(subOps[0], muls[0]) << "real part = FIRST product (ac) minus ...";
+    EXPECT_EQ(subOps[1], muls[1]) << "... the SECOND product (bd)";
+    auto const addOps = m.instOperands(adds[0]);
+    ASSERT_EQ(addOps.size(), 2u);
+    EXPECT_EQ(addOps[0], muls[2]) << "imag part = THIRD product (ad) plus ...";
+    EXPECT_EQ(addOps[1], muls[3]) << "... the FOURTH product (bc)";
+
+    // Both results are STORED into the slot (the by-address contract — a complex
+    // rvalue never stays a bare SSA value).
+    bool realStored = false, imagStored = false;
+    for (MirInstId const st : collectOps(m, MirOpcode::Store)) {
+        auto const ops = m.instOperands(st);
+        if (ops.size() == 2 && ops[0] == subs[0]) realStored = true;
+        if (ops.size() == 2 && ops[0] == adds[0]) imagStored = true;
+    }
+    EXPECT_TRUE(realStored) << "the real component must be stored into the slot";
+    EXPECT_TRUE(imagStored) << "the imag component must be stored into the slot";
+}
+
+// C99 _Complex (D-CSUBSET-COMPLEX / design test #8, the IMPORTANT-9 division witness
+// at the MIR tier): `ga / gb` emits the basic algebraic form
+// (a+bi)/(c+di) = [(ac+bd) + (bc−ad)i] / (c²+d²) — 6 FMul, 2 FAdd (denominator c²+d²
+// and numerator-real ac+bd), 1 FSub (numerator-imag bc−ad), 2 FDiv. The DENOMINATOR
+// IS COMPUTED ONCE: both FDivs share the SAME second operand (one FAdd), pinned by
+// identity — a re-computed denominator (two distinct FAdd feeds) fails this.
+TEST(MirLoweringCSubset, ComplexDivideEmitsSharedDenominatorShape) {
+    auto L = lowerCSubset(
+        "double _Complex ga;\n"
+        "double _Complex gb;\n"
+        "int main(void) { double _Complex q = ga / gb; return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    auto const muls = collectOps(m, MirOpcode::FMul);
+    auto const adds = collectOps(m, MirOpcode::FAdd);
+    auto const subs = collectOps(m, MirOpcode::FSub);
+    auto const divs = collectOps(m, MirOpcode::FDiv);
+    ASSERT_EQ(muls.size(), 6u) << "complex / emits EXACTLY 6 FMul (ac,bd,bc,ad,cc,dd)";
+    ASSERT_EQ(adds.size(), 2u) << "complex / emits EXACTLY 2 FAdd (denom c2+d2, numR ac+bd)";
+    ASSERT_EQ(subs.size(), 1u) << "complex / emits EXACTLY 1 FSub (numI bc-ad)";
+    ASSERT_EQ(divs.size(), 2u) << "complex / emits EXACTLY 2 FDiv (re, im)";
+
+    // The denominator is computed ONCE and SHARED: both FDivs' divisor operand is
+    // the SAME instruction, and it is one of the two FAdds (c²+d²).
+    auto const d0 = m.instOperands(divs[0]);
+    auto const d1 = m.instOperands(divs[1]);
+    ASSERT_EQ(d0.size(), 2u);
+    ASSERT_EQ(d1.size(), 2u);
+    EXPECT_EQ(d0[1], d1[1])
+        << "BOTH divisions must divide by the SAME denominator instruction "
+           "(computed once — a re-computed c2+d2 is a shape regression)";
+    EXPECT_TRUE(d0[1] == adds[0] || d0[1] == adds[1])
+        << "the shared denominator must be one of the two FAdds (c2+d2)";
+    // The two dividends are the numerator FAdd (ac+bd) and the numerator FSub
+    // (bc−ad) — one each.
+    MirInstId const numAdd = (d0[1] == adds[0]) ? adds[1] : adds[0];
+    EXPECT_TRUE((d0[0] == numAdd && d1[0] == subs[0])
+             || (d0[0] == subs[0] && d1[0] == numAdd))
+        << "the dividends must be the numerator FAdd (real) and FSub (imag)";
+}
+
+// C99 _Complex (D-CSUBSET-COMPLEX / design test #9): the complex->complex ELEMENT
+// CONVERT — `double _Complex z = w;` (w float _Complex) element-converts each
+// component: EXACTLY 2 FPExt (re, im) via materializeComplexCast/convertScalar; the
+// narrowing direction emits EXACTLY 2 FPTrunc. (The runtime witness rides the
+// c99_complex example's float arm; this pins the MIR shape.)
+TEST(MirLoweringCSubset, ComplexElementConvertEmitsTwoComponentConverts) {
+    {
+        auto L = lowerCSubset(
+            "float _Complex w;\n"
+            "int main(void) { double _Complex z = w; return 0; }\n");
+        ASSERT_FALSE(L.model.hasErrors())
+            << (L.model.diagnostics().all().empty()
+                    ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.hir->ok)
+            << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        auto const exts = collectOps(m, MirOpcode::FPExt);
+        ASSERT_EQ(exts.size(), 2u)
+            << "float _Complex -> double _Complex must FPExt EACH component "
+               "(re and im) — one lost convert is a half-converted value";
+        EXPECT_TRUE(collectOps(m, MirOpcode::FPTrunc).empty());
+    }
+    {
+        auto L = lowerCSubset(
+            "double _Complex z;\n"
+            "int main(void) { float _Complex w = z; return 0; }\n");
+        ASSERT_FALSE(L.model.hasErrors())
+            << (L.model.diagnostics().all().empty()
+                    ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.hir->ok)
+            << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        auto const truncs = collectOps(m, MirOpcode::FPTrunc);
+        ASSERT_EQ(truncs.size(), 2u)
+            << "double _Complex -> float _Complex must FPTrunc EACH component";
+        EXPECT_TRUE(collectOps(m, MirOpcode::FPExt).empty());
+    }
 }
 
 namespace {

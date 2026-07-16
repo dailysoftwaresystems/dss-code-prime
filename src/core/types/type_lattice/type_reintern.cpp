@@ -55,6 +55,7 @@ namespace {
         case TypeKind::VolatileQual: return "VolatileQual";
         case TypeKind::NullptrT:  return "NullptrT";
         case TypeKind::BitInt:    return "BitInt";
+        case TypeKind::Complex:   return "Complex";
         case TypeKind::Count_:    return "Count_";
     }
     return "<unknown>";
@@ -250,6 +251,13 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
         //    signedness would silently flip the wrap/compare semantics). ──
         case TypeKind::BitInt:
             result = dst.bitInt(srcScalar[0], srcScalar.size() > 1 && srcScalar[1] != 0);
+            break;
+
+        // ── C99 _Complex: operands=[element]; NO scalars (D-CSUBSET-COMPLEX).
+        //    Rebuild via the element builder so a `_Complex` crossing a CU / text
+        //    round-trip keeps its exact element float type. ──
+        case TypeKind::Complex:
+            result = dst.complex(ops[0]);
             break;
 
         // ── tuple: operands=[elements...] ──

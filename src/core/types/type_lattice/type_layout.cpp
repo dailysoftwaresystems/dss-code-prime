@@ -328,12 +328,20 @@ bool isWideBitInt(TypeInterner const& interner, TypeId id) noexcept {
         && interner.bitIntWidth(id) > 64;
 }
 
+bool isComplex(TypeInterner const& interner, TypeId id) noexcept {
+    return id.valid() && interner.kind(id) == TypeKind::Complex;
+}
+
 bool isMemoryResidentType(TypeInterner const& interner, TypeId id) noexcept {
     if (!id.valid()) return false;
     switch (interner.kind(id)) {
         case TypeKind::Struct:
         case TypeKind::Union:
         case TypeKind::Array:
+        // C99 _Complex (D-CSUBSET-COMPLEX): a complex is a memory-resident by-value
+        // aggregate {re, im} reached by ADDRESS, mirroring a wide `_BitInt` exactly
+        // — it has no bare-SSA aggregate value.
+        case TypeKind::Complex:
             return true;
         case TypeKind::BitInt:
             return interner.bitIntWidth(id) > 64;   // wide _BitInt is multi-limb
@@ -347,6 +355,10 @@ bool isByValueClass(TypeInterner const& interner, TypeId id) noexcept {
     switch (interner.kind(id)) {
         case TypeKind::Struct:
         case TypeKind::Union:
+        // C99 _Complex (D-CSUBSET-COMPLEX): passed/returned/copy-assigned BY VALUE
+        // like a struct{re, im} (the by-address call/return/init/assign gates funnel
+        // here). NOT Array — a complex does not decay.
+        case TypeKind::Complex:
             return true;
         case TypeKind::BitInt:
             return interner.bitIntWidth(id) > 64;   // ARRAY excluded (it decays)
@@ -414,6 +426,20 @@ computeLayout(TypeId id, TypeInterner const& interner,
                 alignBytes = 8;                       // psABI: align 8 even at N>64
             }
             return StructLayout{size, scalarAlign(alignBytes, params), {}, false};
+        }
+        case TypeKind::Complex: {
+            // C99 _Complex (D-CSUBSET-COMPLEX) §6.2.5p13: a complex lays out EXACTLY
+            // like an array {re, im} of two element-float components — real@0,
+            // imag@elemSize, size 2×elemSize, align = element align. This IS the ABI
+            // leaf layout (collectLeaves emits 2 float leaves at 0/elemSize). A
+            // long-double-complex (F80/F128 element) sizes fine here (decl/sizeof/
+            // ABI-reject work); only its VALUE arithmetic walls loud downstream.
+            auto const ops = interner.operands(id);
+            if (ops.empty()) return std::nullopt;
+            auto const elem = computeLayout(ops[0], interner, params, dm);
+            if (!elem) return std::nullopt;
+            std::uint64_t const es = elem->size;
+            return StructLayout{es * 2, elem->align, {}, false};
         }
         case TypeKind::Array: {
             // A bare flexible/incomplete array `T[]` has NO standalone size — it is

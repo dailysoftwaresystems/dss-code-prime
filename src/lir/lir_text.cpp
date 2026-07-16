@@ -73,6 +73,7 @@ typeKindFromName(std::string_view s) noexcept;
         case TypeKind::Bind:      return "Bind";
         case TypeKind::Extension: return "Extension";
         case TypeKind::BitInt:    return "BitInt";
+        case TypeKind::Complex:   return "Complex";   // D-CSUBSET-COMPLEX (round-trip tag)
         case TypeKind::Count_:    break;
     }
     return "?";

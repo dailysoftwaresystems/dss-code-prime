@@ -809,8 +809,13 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
                         // `_BitInt` declared return type.
                         bool const wideBitIntRet = rk == TypeKind::BitInt
                             && interner_->bitIntWidth(returnTy) > 64;
+                        // C99 _Complex (D-CSUBSET-COMPLEX): a complex return uses the
+                        // SAME by-value ABI as a struct/union (register pieces or an
+                        // sret pointer) — admit it into the aggregate-return arm so the
+                        // Ptr/F64-piece operands are not mis-flagged against the complex
+                        // declared return type (the wide-BitInt precedent).
                         if (rk == TypeKind::Struct || rk == TypeKind::Union
-                            || wideBitIntRet) {
+                            || rk == TypeKind::Complex || wideBitIntRet) {
                             // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value
                             // struct/union return is EITHER the first-class aggregate
                             // VALUE (a single operand of the return type — the const-

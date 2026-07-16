@@ -89,6 +89,22 @@ struct LeafField {
                 return false;
         return true;
     }
+    // C99 _Complex (D-CSUBSET-COMPLEX / D10): a complex is ABI-passed like a
+    // struct{re, im} — emit TWO float leaves, re@base and im@base+elemSize, of the
+    // element FLOAT kind. WITHOUT this arm the bare-Complex default below emits ONE
+    // zero-size NON-float leaf → the eightbyte mis-classes INTEGER (a silent 2-GPR
+    // by-value pass, ABI-divergent at FFI). double _Complex → 2 SSE eightbytes /
+    // 2-double HFA; a long-double-complex leaf (F80/F128) then trips
+    // hasLongDoubleClassLeaf and the aggregate refuses classification — automatic.
+    if (k == TypeKind::Complex) {
+        TypeId const elem = in.complexElement(ty);
+        auto const elemLay = computeLayout(elem, in, lp, dm);
+        if (!elemLay.has_value()) return false;
+        TypeKind const ek = in.kind(elem);
+        out.push_back(LeafField{base, ek, elemLay->size});
+        out.push_back(LeafField{base + elemLay->size, ek, elemLay->size});
+        return true;
+    }
     // D-CSUBSET-BITINT: size the leaf through the TypeId-aware shim so a
     // `_BitInt(N)` gets its CONTAINER size (not the kind-only nullopt→1 default).
     out.push_back(LeafField{base, k,

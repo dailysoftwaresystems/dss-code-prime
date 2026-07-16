@@ -90,6 +90,15 @@ sizeOfScalarOrBitInt(TypeInterner const& interner, TypeId id, DataModel dm) noex
 [[nodiscard]] DSS_EXPORT bool
 isWideBitInt(TypeInterner const& interner, TypeId id) noexcept;
 
+// C99 _Complex (D-CSUBSET-COMPLEX): a pure type-shape query — `true` iff `id` is a
+// Complex kind. The dedicated helper the by-address contract funnels through: the
+// hir_to_mir request value->address FLIP, the lowerLvalueAddressNode materialize
+// dispatch, and the combineBinaryOp/combineCast misroute guards all key on it
+// (mirroring `isWideBitInt`). No target/format/language identity — Complex only
+// ever appears in a `_Complex`-declaring schema, so this is inert elsewhere.
+[[nodiscard]] DSS_EXPORT bool
+isComplex(TypeInterner const& interner, TypeId id) noexcept;
+
 // C23 _BitInt(N>64) (D-CSUBSET-BITINT-C2-WIDE): the by-construction STORAGE/GUARD
 // predicate. A wide `_BitInt` is MEMORY-RESIDENT — like an aggregate it has NO SSA
 // register value and is always reached by ADDRESS. `true` for Struct/Union/Array

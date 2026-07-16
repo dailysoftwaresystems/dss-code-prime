@@ -405,6 +405,12 @@ private:
             case TypeKind::Matrix:
                 out_ += "mat<"; appendType(in.operands(t)[0]);
                 out_ += std::format(", {}, {}>", in.scalars(t)[0], in.scalars(t)[1]); return;
+            // C99 _Complex (D-CSUBSET-COMPLEX, M1): `complex<elem>` — the bidirectional
+            // twin of parseType's `complex` keyword. So a `double complex` typedef /
+            // the `__builtin_complex` signature spells a genuine Complex type through
+            // the shipped-lib text codec.
+            case TypeKind::Complex:
+                out_ += "complex<"; appendType(in.operands(t)[0]); out_ += '>'; return;
             case TypeKind::Array:
                 out_ += "arr<"; appendType(in.operands(t)[0]);
                 out_ += std::format(", {}>", in.scalars(t)[0]); return;
@@ -1932,6 +1938,12 @@ private:
         if (kw == "nullable") return wrap1(&TypeInterner::nullable);
         if (kw == "optional") return wrap1(&TypeInterner::optional);
         if (kw == "slice") return wrap1(&TypeInterner::slice);
+        // C99 _Complex (D-CSUBSET-COMPLEX, M1): `complex<elem>` reinterns via the
+        // single-operand `complex` builder — the appendType twin. Placed among the
+        // wrap1 keywords (the `signature` decode of `__builtin_complex`'s
+        // `complex<f64>` result routes here). primFromName has no "complex" entry, so
+        // the check above fell through to here.
+        if (kw == "complex") return wrap1(&TypeInterner::complex);
         // D-CSUBSET-QUAL-BITSET (M1): the bidirectional twin of appendType's qualifier
         // spelling. `volatile<T>`/`atomic<T>` reintern via volatileQualified/
         // atomicQualified, which STRIP→UNION→re-intern ONE skin — so a nested

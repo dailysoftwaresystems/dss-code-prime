@@ -849,6 +849,19 @@ enum class BuiltinLowering : std::uint16_t {
     // in `.dsshir` text (the TypeKind-placed-LAST numeric-stability precedent).
     AtomicLoad,
     AtomicStore,
+    // C99 _Complex (D-CSUBSET-COMPLEX §7.3): the complex builtins the <complex.h>
+    // macros route to. ComplexMake(re, im) constructs a complex BY ADDRESS (the
+    // first aggregate-returning builtin — its "value" is the materialized slot
+    // address; CRITICAL-2). ComplexReal/ComplexImag take a complex BY ADDRESS (the
+    // request value->address flip delivers it) and Gep+Load the F64 component.
+    // ComplexConj copies re, negates im into a fresh slot (by address). APPENDED
+    // (not grouped) so every pre-existing enumerator keeps its integer value — the
+    // BuiltinCall payload prints numerically in `.dsshir` text (the AtomicLoad/Store
+    // + TypeKind-placed-LAST numeric-stability precedent).
+    ComplexMake,
+    ComplexReal,
+    ComplexImag,
+    ComplexConj,
 };
 
 // Resolve the config `lowering` name to its BuiltinLowering. nullopt = an unknown
@@ -861,6 +874,11 @@ builtinLoweringFromName(std::string_view name) noexcept {
     // FC17.9(d) atomic cycle-1 (D-CSUBSET-ATOMIC): the explicit-order scalar accessors.
     if (name == "atomic_load")  { return BuiltinLowering::AtomicLoad;  }
     if (name == "atomic_store") { return BuiltinLowering::AtomicStore; }
+    // C99 _Complex (D-CSUBSET-COMPLEX §7.3): the complex-builtin lowerings.
+    if (name == "complex_make") { return BuiltinLowering::ComplexMake; }
+    if (name == "complex_real") { return BuiltinLowering::ComplexReal; }
+    if (name == "complex_imag") { return BuiltinLowering::ComplexImag; }
+    if (name == "complex_conj") { return BuiltinLowering::ComplexConj; }
     if (name == "barrier")    { return BuiltinLowering::Barrier;   }
     if (name == "seh_exception_code") { return BuiltinLowering::SehExceptionCode; }
     if (name == "seh_exception_info") { return BuiltinLowering::SehExceptionInfo; }
@@ -1094,6 +1112,15 @@ struct DSS_EXPORT TypeSpecifierRule {
     // precedent). Closed keys (longDoubleFormatFromName) + closed values
     // (coreTypeFromName) at load, mirroring coreByDataModel.
     std::unordered_map<LongDoubleFormat, TypeKind> coreByLongDoubleFormat;
+    // C99 _Complex (D-CSUBSET-COMPLEX §6.2.5): when true, the resolved (data-model +
+    // long-double-axis-aware) `core` is the ELEMENT float type, and the specifier-
+    // resolution site wraps it in `interner.complex(interner.primitive(element))`
+    // instead of `interner.primitive(element)`. So `double _Complex`→complex(F64),
+    // `long double _Complex`→complex(F80/F128/F64) — the element rides the SAME
+    // resolveCore axis machinery for free. `false` = an ordinary scalar specifier
+    // (every pre-existing row, byte-identical). A non-float `core` under `complex`
+    // is a config bug (the loader could validate; the interner would just wrap it).
+    bool complex = false;
     [[nodiscard]] TypeKind resolveCore(DataModel dm) const {
         if (auto it = coreByDataModel.find(dm); it != coreByDataModel.end()) {
             return it->second;

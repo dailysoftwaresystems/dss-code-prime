@@ -6768,13 +6768,15 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             if (key != "tokens" && key != "core"
                                 && key != "coreByDataModel"
                                 && key != "coreByLongDoubleFormat"
+                                && key != "complex"
                                 && key.rfind("$", 0) != 0) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           path + "/" + key,
                                           std::format("unknown 'typeSpecifiers' field "
                                                       "'{}' — expected 'tokens', 'core', "
-                                                      "'coreByDataModel', or "
-                                                      "'coreByLongDoubleFormat'", key));
+                                                      "'coreByDataModel', "
+                                                      "'coreByLongDoubleFormat', or "
+                                                      "'complex'", key));
                             }
                         }
                         if (!entry.contains("tokens") || !entry.at("tokens").is_array()
@@ -6828,6 +6830,18 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         if (!readCoreByLongDoubleFormat(entry, path,
                                                         rule.coreByLongDoubleFormat)) {
                             continue;
+                        }
+                        // C99 _Complex (D-CSUBSET-COMPLEX): the optional `complex`
+                        // flag — the resolved element core is wrapped in
+                        // interner.complex() at the specifier-resolve site.
+                        if (entry.contains("complex")) {
+                            if (!entry.at("complex").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/complex",
+                                          "'complex' must be a boolean");
+                                continue;
+                            }
+                            rule.complex = entry.at("complex").get<bool>();
                         }
                         // Canonicalize: sort the (kind, name) pairs by kind id
                         // so lookup is order-free (C's specifier multiset).

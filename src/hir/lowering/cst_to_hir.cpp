@@ -640,6 +640,29 @@ struct Lowerer {
             }
             return {cast, target};
         }
+        // C99 _Complex (D-CSUBSET-COMPLEX / CRITICAL-3): coerce a real OR a
+        // differently-elemented complex INTO a Complex target — the promotion the
+        // binary path's `common = commonArithType` demands so a mixed `2.0 * I`
+        // reaches materializeComplexBinaryOp with BOTH operands complex-by-address.
+        // `isArithmeticCore` EXCLUDES Complex, so WITHOUT this arm (before the gate
+        // below) a real->complex coerce falls through returning the child UNCHANGED
+        // (a bare F64) — mis-lowering the op (the child is the "leaves 2.0 a bare
+        // F64" bug). real->complex constructs (v, 0); complex->complex element-
+        // converts — both realized by materializeComplexCast at hir_to_mir. Implicit
+        // complex->real is NOT here (it stays a semantic reject, C99 6.3.1.7). The
+        // identical-type case already returned at the top (`child.type == target`).
+        if (tk == TypeKind::Complex
+            && (ck == TypeKind::Complex || isArithmeticCore(ck))) {
+            HirNodeId const cast =
+                builder.makeCast(child.id, target, HirFlags::Synthetic);
+            for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                if (it->first == child.id) {
+                    spans.push_back({cast, it->second});
+                    break;
+                }
+            }
+            return {cast, target};
+        }
         // Pointers, structs, FnSig are not coerced implicitly; let the
         // caller decide whether the mismatch is a diagnostic. Arithmetic
         // (int + float kinds — file-scope `isArithmeticCore`) is the

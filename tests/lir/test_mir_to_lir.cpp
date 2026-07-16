@@ -4615,6 +4615,79 @@ TEST(MirToLir, F80ReturnOperandBoundaryWallsFailLoud) {
     EXPECT_TRUE(sawAnchor(probe.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
 }
 
+// ══ C99 _Complex (D-CSUBSET-COMPLEX / design test #11): long-double-complex
+// ARITHMETIC walls loud on an x87-80 axis ═══════════════════════════════════
+//
+// `long double _Complex` on elf-x86_64 (x87-80 axis) has an F80 ELEMENT. Its
+// decl/layout/sizeof work (the semantic + layout pins), but its VALUE arithmetic
+// emits componentwise F80 float ops — which MUST hit the SAME
+// requireEncodedFloatWidth wall every scalar F80 op hits (no new wall; the
+// long-double arithmetic deferral D-CSUBSET-LONG-DOUBLE-X87-ARITH covers the
+// complex element by construction). This drives the REAL pipeline end-to-end —
+// c-subset source (analyze on the X87_80 axis, the driver's
+// effectiveLongDoubleFormat) → HIR → MIR (materializeComplexBinaryOp emits the
+// F80 component ops) → MIR→LIR (the wall) — NOT a hand-built MIR. The
+// red-on-disable for the wall itself was demonstrated in the long-double cycle;
+// this pin asserts the COMPLEX element rides it: compile must FAIL with
+// L_UnsupportedLoweringForOpcode carrying the D-TARGET-ENCODING-WIDTH-GUARD
+// anchor, never a silently mis-encoded 8-byte op over a 16-byte component.
+TEST(MirToLir, LongDoubleComplexArithmeticWallsLoudOnX87Axis) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    UnitBuilder builder{*loaded};
+    builder.addInMemory(
+        "long double _Complex ga;\n"
+        "long double _Complex gb;\n"
+        "int main(void) { long double _Complex s = ga + gb; return 0; }\n",
+        "<mem>");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    // The X87_80 long-double axis (elf-x86_64) — the typeSpecifiers row resolves
+    // `long double _Complex` to complex(F80).
+    auto model = analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+                         std::nullopt, std::nullopt, LongDoubleFormat::X87_80);
+    ASSERT_FALSE(model.hasErrors())
+        << "the DECLARATION tier must accept long double _Complex on the x87 axis: "
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter hirReporter;
+    auto hir = lowerToHir(model, hirReporter);
+    ASSERT_TRUE(hir->ok)
+        << (hirReporter.all().empty() ? "" : hirReporter.all()[0].actual);
+    DiagnosticReporter mirReporter;
+    MirLoweringConfig mirCfg;
+    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    mirCfg.aggregateLayout       = (*target)->aggregateLayout();
+    mirCfg.aggregateLayoutLoaded = (*target)->aggregateLayoutLoaded();
+    HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
+                                    model.lattice().interner(), mirReporter,
+                                    &hir->sourceMap, mirCfg);
+    ASSERT_TRUE(mir.ok)
+        << "MIR lowering emits the componentwise F80 ops cleanly (the wall is "
+           "the LIR width gate, not MIR): "
+        << (mirReporter.all().empty() ? "" : mirReporter.all()[0].actual);
+    DiagnosticReporter lirReporter;
+    auto lir = lowerToLir(mir.mir, **target, model.lattice().interner(), lirReporter);
+    EXPECT_FALSE(lir.ok)
+        << "long-double-complex ARITHMETIC must wall loud on the x87-80 axis — "
+           "its F80 components have no scalar float encoding this cycle "
+           "(D-CSUBSET-LONG-DOUBLE-X87-ARITH); a clean lowering means an 8-byte "
+           "op silently mis-encoded a 16-byte component";
+    EXPECT_TRUE(sawAnchor(lirReporter, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "the wall must be the encoded-float-width guard, with its anchor";
+    bool sawWallCode = false;
+    for (auto const& d : lirReporter.all()) {
+        if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode) {
+            sawWallCode = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawWallCode)
+        << "the wall must carry L_UnsupportedLoweringForOpcode (the fail-loud "
+           "diagnostic), not a silent ok=false";
+}
+
 // ══ TLS C1 (D-CSUBSET-THREAD-LOCAL): the thread-local GlobalAddr arm ══
 //
 // A THREAD-LOCAL symbol's "address" is per-thread — tp + tpoff(sym),

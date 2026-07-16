@@ -54,13 +54,15 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     // always-injected like every other builtin; D-FULLC-STDBIT) + the 2 FC17.9(d)
     // atomic explicit-order accessors (`atomic_load_explicit` +
     // `atomic_store_explicit`, always-injected builtins; D-CSUBSET-ATOMIC).
-    ASSERT_EQ(model.symbols().size() - 1, 75u)
+    // FC17.9(f) (D-CSUBSET-COMPLEX): + the 4 complex builtins __builtin_complex/
+    // __builtin_creal/__builtin_cimag/__builtin_conj (always-injected like the rest).
+    ASSERT_EQ(model.symbols().size() - 1, 79u)
         << "main + x + __va_list_tag + va_list + __umulh + "
            "_InterlockedCompareExchange + _ReadWriteBarrier + "
            "_exception_code + _exception_info + the 6 __builtin bit-count "
            "intrinsics + the 56 __builtin_stdc_* <stdbit.h> intrinsics + "
-           "atomic_load_explicit + atomic_store_explicit + "
-           "__func__ + __FUNCTION__";
+           "atomic_load_explicit + atomic_store_explicit + the 4 __builtin_complex/"
+           "creal/cimag/conj complex builtins + __func__ + __FUNCTION__";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xRec = &model.symbols()[i];
@@ -68,6 +70,89 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     ASSERT_NE(xRec, nullptr);
     ASSERT_TRUE(xRec->type.valid()) << "the int builtin must resolve to a TypeId";
     EXPECT_EQ(model.lattice().interner().kind(xRec->type), TypeKind::I32);
+}
+
+// C99 _Complex (D-CSUBSET-COMPLEX §6.2.5): `double _Complex z;` resolves the
+// `[Complex, Double]` type-specifier multiset to a Complex over F64 (via the
+// `complex:true` typeSpecifiers row + the interner.complex wrap). `float _Complex`
+// → Complex over F32.
+TEST(SemanticAnalyzerCSubset, ComplexDeclTypedAsComplex) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { double _Complex z; float _Complex w; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* z = nullptr;
+    SymbolRecord const* w = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == "z") z = &model.symbols()[i];
+        if (model.symbols()[i].name == "w") w = &model.symbols()[i];
+    }
+    ASSERT_NE(z, nullptr); ASSERT_TRUE(z->type.valid());
+    EXPECT_EQ(ti.kind(z->type), TypeKind::Complex);
+    EXPECT_EQ(ti.kind(ti.complexElement(z->type)), TypeKind::F64);
+    ASSERT_NE(w, nullptr); ASSERT_TRUE(w->type.valid());
+    EXPECT_EQ(ti.kind(w->type), TypeKind::Complex);
+    EXPECT_EQ(ti.kind(ti.complexElement(w->type)), TypeKind::F32);
+}
+
+// C99 _Complex (D-CSUBSET-COMPLEX): both `_Complex int` and `_Imaginary` fail LOUD,
+// via the AGNOSTIC absent-multiset discipline (no per-language token-identity branch
+// in the engine). `_Complex int` — ComplexKeyword IS in the specifier vocabulary (the
+// complex rows), but [Complex, Int] is an invalid multiset → S_InvalidTypeSpecifier-
+// Combination (the `unsigned float` precedent). `_Imaginary` — ImaginaryKeyword sits
+// in NO typeSpecifiers row (pure-imaginary types unsupported, D-CSUBSET-IMAGINARY-TYPE),
+// so it is not a specifier at all → resolves as an unknown type name → S_UnknownType.
+TEST(SemanticAnalyzerCSubset, ComplexIntAndImaginaryFailLoud) {
+    auto ci = analyzeShipped("c-subset", {"int main() { _Complex int y; }\n"});
+    EXPECT_TRUE(ci.hasErrors());
+    EXPECT_GT(countCode(ci.diagnostics(),
+                        DiagnosticCode::S_InvalidTypeSpecifierCombination), 0u)
+        << "`_Complex int` is not a valid type-specifier multiset — must fail loud";
+    auto im = analyzeShipped("c-subset", {"int main() { _Imaginary x; }\n"});
+    EXPECT_TRUE(im.hasErrors());
+    EXPECT_GT(countCode(im.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "`_Imaginary` (unsupported pure-imaginary type) must fail loud";
+}
+
+// C99 _Complex (D-CSUBSET-COMPLEX / design test #10): a complex subexpression in a
+// CONSTEXPR context REFUSES to fold — loud (S_ConstexprNonConstantInitializer),
+// never a silently-baked constant. Complex values have NO fold representation
+// (HirLiteralValue's single double cannot hold {re, im}): a complex-constructing
+// builtin is not const-evaluable, and a cast whose target is complex refuses at
+// the const-eval cast-target classification (not pointer/integer/bit-precise —
+// the "float / aggregate cast target" NotAConstantExpression arm). So `40.0+2.0*I`
+// is ALWAYS a runtime by-address construction — the anti-fold posture the
+// c99_complex example's release arm witnesses. The negative control pins that the
+// SAME expressions are accepted at RUNTIME (the refusal is the constexpr gate, not
+// an expression rejection).
+TEST(SemanticAnalyzerCSubset, ComplexConstexprInitializerRefusesToFold) {
+    // (a) a complex-constructing builtin feeding a scalar accessor: not foldable.
+    auto viaBuiltin = analyzeShipped("c-subset", {
+        "int main(void) { constexpr double r = "
+        "__builtin_creal(__builtin_complex(40.0, 2.0)); }\n"});
+    EXPECT_EQ(countCode(viaBuiltin.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
+        << "a complex construction in a constexpr initializer must REFUSE the "
+           "fold — a clean analysis means a complex value was silently baked";
+    // (b) an explicit real->complex->real cast chain: the complex cast TARGET
+    // refuses at the const-eval cast classification.
+    auto viaCast = analyzeShipped("c-subset", {
+        "int main(void) { constexpr double d = (double)(double _Complex)2.0; }\n"});
+    EXPECT_EQ(countCode(viaCast.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
+        << "a cast through a complex type in a constexpr initializer must "
+           "refuse to fold";
+    // Negative control: WITHOUT constexpr the same expressions are legal RUNTIME
+    // constructions (the refusal above is the fold gate, not a reject of complex).
+    auto runtime = analyzeShipped("c-subset", {
+        "int main(void) { double r = __builtin_creal(__builtin_complex(40.0, 2.0));"
+        " double d = (double)(double _Complex)2.0; return (int)(r + d); }\n"});
+    EXPECT_FALSE(runtime.hasErrors())
+        << "the same complex expressions must analyze clean at runtime: "
+        << (runtime.diagnostics().all().empty()
+                ? "" : runtime.diagnostics().all()[0].actual);
 }
 
 // SE-arrays (HR9): a `[N]` declarator suffix folds the element type into
@@ -2303,9 +2388,10 @@ TEST(SemanticAnalyzerCSubset, NestedBlocksShadowWithoutRedecl) {
     // D-CSUBSET-BITCOUNT-INTRINSICS) + the 56 FC17.9(b) <stdbit.h>
     // __builtin_stdc_<op>_<T> intrinsics (14 ops × 4 widths, D-FULLC-STDBIT) +
     // the 2 FC17.9(d) atomic accessors (atomic_load_explicit + atomic_store_explicit,
-    // D-CSUBSET-ATOMIC) + the 2 FC17.5 predefined function-name symbols (__func__ +
-    // __FUNCTION__, per function definition — D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
-    EXPECT_EQ(model.symbols().size() - 1, 76u);
+    // D-CSUBSET-ATOMIC) + the 4 FC17.9(f) complex builtins (__builtin_complex/creal/
+    // cimag/conj, D-CSUBSET-COMPLEX) + the 2 FC17.5 predefined function-name symbols
+    // (__func__ + __FUNCTION__, per function definition — D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
+    EXPECT_EQ(model.symbols().size() - 1, 80u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -2327,9 +2413,10 @@ TEST(SemanticAnalyzerCSubset, ForwardReferenceWithinBlock) {
     // (__builtin_{popcount,clz,ctz}{,ll}, D-CSUBSET-BITCOUNT-INTRINSICS) + the 56
     // FC17.9(b) <stdbit.h> __builtin_stdc_<op>_<T> intrinsics (D-FULLC-STDBIT) +
     // the 2 FC17.9(d) atomic accessors (atomic_load_explicit + atomic_store_explicit,
-    // D-CSUBSET-ATOMIC) + the 2 FC17.5 predefined function-name symbols (__func__ +
-    // __FUNCTION__). Find x by name.
-    ASSERT_EQ(model.symbols().size() - 1, 75u);
+    // D-CSUBSET-ATOMIC) + the 4 FC17.9(f) complex builtins (__builtin_complex/creal/
+    // cimag/conj, D-CSUBSET-COMPLEX) + the 2 FC17.5 predefined function-name symbols
+    // (__func__ + __FUNCTION__). Find x by name.
+    ASSERT_EQ(model.symbols().size() - 1, 79u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -4830,10 +4917,11 @@ TEST(SemanticAnalyzerCSubset, ValueStarValueStaysExpressionStatement) {
     // accessors (atomic_load_explicit + atomic_store_explicit, D-CSUBSET-ATOMIC) +
     // the 2 FC17.5 predefined function-name symbols (__func__ + __FUNCTION__) — the
     // multiplication must mint NO symbol.
-    EXPECT_EQ(model.symbols().size() - 1, 76u)
+    EXPECT_EQ(model.symbols().size() - 1, 80u)
         << "main + a + b + __va_list_tag + va_list + the 5 intrinsic builtins + "
            "the 6 __builtin bit-count intrinsics + the 56 __builtin_stdc_* "
            "<stdbit.h> intrinsics + atomic_load_explicit + atomic_store_explicit + "
+           "the 4 __builtin_complex/creal/cimag/conj complex builtins + "
            "__func__ + __FUNCTION__ — the multiplication mints none";
 }
 

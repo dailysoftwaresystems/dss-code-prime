@@ -133,6 +133,17 @@ public:
     TypeId vector(TypeId element, std::int64_t lanes);
     // matrix: operands=[element], scalars=[rows, cols].
     TypeId matrix(TypeId element, std::int64_t rows, std::int64_t cols);
+    // C99 _Complex (D-CSUBSET-COMPLEX): a complex number over the element FLOAT
+    // type `element` (F32/F64/F80/F128). operands=[element]; NO scalars, NO name —
+    // structural identity (two `double _Complex` collapse to one TypeId, the
+    // single-operand `slice`/`pointer` precedent; the "2 components" is implicit in
+    // the kind, so unlike vector NO lane scalar is carried). The interner dedups on
+    // the element for free.
+    TypeId complex(TypeId element);
+    // The element FLOAT type of a `_Complex` (operands[0]). Aborts if `id` is not a
+    // Complex (a caller bug — every consumer gates on `kind(id)==Complex` first, the
+    // `bitIntWidth`/`complexElement` decoder precedent).
+    [[nodiscard]] TypeId complexElement(TypeId id) const;
     // single-operand indirection: operands=[target].
     TypeId pointer(TypeId pointee);
     TypeId reference(TypeId referent);

@@ -47,6 +47,23 @@ TEST(TypeInterner, VectorOfF32x4InternsToOneTypeId) {
     EXPECT_EQ(ti.scalars(v1)[0], 4);
 }
 
+// C99 _Complex (D-CSUBSET-COMPLEX): a complex over an element float — structural
+// identity (dedup on the element), operands=[element], NO scalars; complexElement
+// round-trips the element. A different element interns distinctly.
+TEST(TypeInterner, ComplexOverElementDedupsAndDecodes) {
+    auto ti = makeInterner(1);
+    const TypeId f64 = ti.primitive(TypeKind::F64);
+    const TypeId c1  = ti.complex(f64);
+    const TypeId c2  = ti.complex(f64);
+    EXPECT_EQ(c1.v, c2.v);                                          // canonical
+    EXPECT_NE(c1.v, ti.complex(ti.primitive(TypeKind::F32)).v);      // element matters
+    EXPECT_EQ(ti.kind(c1), TypeKind::Complex);
+    ASSERT_EQ(ti.operands(c1).size(), 1u);
+    EXPECT_EQ(ti.operands(c1)[0].v, f64.v);
+    EXPECT_TRUE(ti.scalars(c1).empty());                            // no scalar (unlike vec)
+    EXPECT_EQ(ti.complexElement(c1).v, f64.v);                      // decoder round-trip
+}
+
 TEST(TypeInterner, StructIsNominalAndStructural) {
     auto ti = makeInterner(1);
     const TypeId i32 = ti.primitive(TypeKind::I32);

@@ -110,6 +110,23 @@ enum class TypeKind : std::uint16_t {
     // value — the VolatileQual/NullptrT placement precedent.
     BitInt,
 
+    // ── C99 _Complex (D-CSUBSET-COMPLEX / C99 §6.2.5) ──
+    // A complex number = an ordered pair {real, imaginary} of an element FLOAT
+    // type (`double _Complex` → element F64, `float _Complex` → F32, `long double
+    // _Complex` → the long-double-axis element F80/F128/F64). operands=[element];
+    // no scalars, no name (structural identity — two `double _Complex` collapse to
+    // one TypeId, like every other single-operand structural kind). Layout is a
+    // MEMORY-RESIDENT by-value aggregate {re@0, im@elemSize}, sized 2×elemSize —
+    // it enters `isByValueClass`/`isMemoryResidentType`, so a complex rvalue NEVER
+    // becomes a bare SSA value: it lives in a slot reached BY ADDRESS, mirroring a
+    // wide `_BitInt(N>64)` EXACTLY. Componentwise arithmetic emits F64/F32 ops (they
+    // pass the LIR encoded-width gate); an F80/F128 component walls loud at the
+    // existing requireEncodedFloatWidth (no new wall — long-double-complex arithmetic
+    // rides the long-double arith deferrals). Appended AFTER BitInt (before Count_)
+    // so every pre-existing kind keeps its integer value — the VolatileQual/NullptrT/
+    // BitInt placement precedent (no TypeKind ordinal is serialized).
+    Complex,
+
     Count_  // keep last — counts the core members
 };
 

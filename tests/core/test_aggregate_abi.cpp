@@ -125,6 +125,53 @@ TEST(AggregateAbiSysV, TwoDoubles_TwoFprEightbytes) {
     EXPECT_EQ(r->pieces[1].cls, AbiPieceClass::Fpr);
 }
 
+// C99 _Complex (D-CSUBSET-COMPLEX / D10): `double _Complex` = collectLeaves emits 2
+// F64 leaves @0/@8 → SysV classes it EXACTLY like struct{double,double} → 2 FPR
+// eightbytes. This is the RED-ON-DISABLE for the collectLeaves Complex arm: WITHOUT
+// it, the bare-Complex default emits ONE zero-size non-float leaf → the eightbyte
+// mis-classes INTEGER (a silent 2-GPR by-value pass, ABI-divergent at FFI).
+TEST(AggregateAbiSysV, DoubleComplex_TwoFprEightbytes) {
+    auto ti = makeInterner(1);
+    TypeId const cd = ti.complex(ti.primitive(TypeKind::F64));
+    auto r = classifySysV(cd, ti);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->pieces.size(), 2u);
+    EXPECT_EQ(r->pieces[0].cls, AbiPieceClass::Fpr);
+    EXPECT_EQ(r->pieces[0].byteOffset, 0u);
+    EXPECT_EQ(r->pieces[1].cls, AbiPieceClass::Fpr);
+    EXPECT_EQ(r->pieces[1].byteOffset, 8u) << "imag leaf must sit at elemSize=8";
+    // float _Complex = 8 bytes, both F32 in eightbyte 0 → ONE SSE eightbyte.
+    TypeId const cf = ti.complex(ti.primitive(TypeKind::F32));
+    auto rf = classifySysV(cf, ti);
+    ASSERT_TRUE(rf.has_value());
+    ASSERT_EQ(rf->pieces.size(), 1u);
+    EXPECT_EQ(rf->pieces[0].cls, AbiPieceClass::Fpr);
+}
+
+// long double _Complex (F80/F128 element) — on AAPCS64 the leaf walk runs BEFORE the
+// size rule (an HFA is not size-capped), so an F80/F128 leaf trips
+// hasLongDoubleClassLeaf → refuse (nullopt), exactly like a struct with a long-double
+// member. On SysV a 32-byte long-double-complex is MEMORY (ByReference) by the >16B
+// rule (which runs first) — a VALID by-reference pass (the value moves correctly; the
+// long-double VALUE arithmetic walls loud separately at the component ops).
+TEST(AggregateAbiAapcs64, LongDoubleComplexIsNulloptFailLoud) {
+    auto ti = makeInterner(1);
+    TypeId const cld = ti.complex(ti.primitive(TypeKind::F80));
+    EXPECT_FALSE(classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, cld, ti,
+                                   kNatural16, DataModel::Lp64).has_value())
+        << "AAPCS64: an F80-element complex has F80 leaves → must refuse (the "
+           "long-double leaf wall runs before the size rule for HFAs)";
+    TypeId const cq = ti.complex(ti.primitive(TypeKind::F128));
+    EXPECT_FALSE(classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, cq, ti,
+                                   kNatural16, DataModel::Lp64).has_value())
+        << "AAPCS64: a binary128-element complex likewise refuses";
+    // SysV: a 32-byte long-double-complex is MEMORY (ByReference) — valid, not a
+    // refusal (the >16B rule runs first; the value moves, arithmetic walls elsewhere).
+    auto sysv = classifySysV(cld, ti);
+    ASSERT_TRUE(sysv.has_value());
+    EXPECT_EQ(sysv->kind, AbiPassing::Kind::ByReference);
+}
+
 // {float,float} = 8 bytes, BOTH floats in eightbyte 0 → SSE → one FPR piece.
 TEST(AggregateAbiSysV, TwoFloats_OneSseEightbyte) {
     auto ti = makeInterner(1);

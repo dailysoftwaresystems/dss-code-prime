@@ -8,6 +8,7 @@
 #include "core/types/aggregate_layout.hpp"
 #include "core/types/data_model.hpp"
 #include "core/types/strong_ids.hpp"
+#include "core/types/target_schema.hpp"   // D-CSUBSET-COMPLEX: regClassForCoreType pin
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
@@ -1236,4 +1237,43 @@ TEST(TypeLayout, WideBitIntTypeShapePredicates) {
     EXPECT_FALSE(isByValueClass(ti, narrow));
     EXPECT_FALSE(isByValueClass(ti, i32));
     EXPECT_FALSE(isByValueClass(ti, TypeId{}));
+}
+
+// C99 _Complex (D-CSUBSET-COMPLEX §6.2.5p13): a complex lays out as {re@0, im@es},
+// size 2×elemSize, align = element align — the ABI leaf {re, im} layout. It is a
+// memory-resident by-VALUE class (like a struct{re,im}; NOT decaying like an array).
+TEST(TypeLayout, ComplexLayoutAndShapePredicates) {
+    auto ti = makeInterner(73);
+    TypeId const cd  = ti.complex(ti.primitive(TypeKind::F64));   // double _Complex
+    TypeId const cf  = ti.complex(ti.primitive(TypeKind::F32));   // float _Complex
+    TypeId const cld = ti.complex(ti.primitive(TypeKind::F80));   // long double (x87-80)
+
+    // Layout: size 2×elem, align == element align. double→16/8, float→8/4, F80→32/16.
+    auto const ld = layoutOf(cd, ti);
+    EXPECT_EQ(ld.size, 16u);   EXPECT_EQ(ld.align.bytes(), 8u);
+    auto const lf = layoutOf(cf, ti);
+    EXPECT_EQ(lf.size, 8u);    EXPECT_EQ(lf.align.bytes(), 4u);
+    auto const lld = layoutOf(cld, ti);
+    EXPECT_EQ(lld.size, 32u);  EXPECT_EQ(lld.align.bytes(), 16u);
+
+    // isComplex + complexElement round-trip; a non-complex is not complex.
+    EXPECT_TRUE(isComplex(ti, cd));
+    EXPECT_FALSE(isComplex(ti, ti.primitive(TypeKind::F64)));
+    EXPECT_FALSE(isComplex(ti, TypeId{}));
+    EXPECT_EQ(ti.complexElement(cd).v, ti.primitive(TypeKind::F64).v);
+    EXPECT_EQ(ti.complexElement(cf).v, ti.primitive(TypeKind::F32).v);
+
+    // Memory-resident AND by-value-class (a complex is passed/returned like a struct;
+    // it does NOT decay). NOT a wide _BitInt.
+    EXPECT_TRUE(isMemoryResidentType(ti, cd));
+    EXPECT_TRUE(isByValueClass(ti, cd));
+    EXPECT_FALSE(isWideBitInt(ti, cd));
+
+    // IMPORTANT-5 (red-on-disable): a Complex takes the GPR default reg class — NEVER
+    // the FPR arm. requireEncodedFloatWidth no-ops on non-FPR, so the aggregate never
+    // trips the F80/F128 wall; its F64 COMPONENTS query regClassForCoreType(F64)=FPR
+    // correctly. A Complex→FPR arm would silently integer-plumb / wrong-gate — this
+    // pin fails the moment one is added.
+    EXPECT_EQ(regClassForCoreType(TypeKind::Complex), TargetRegClass::GPR);
+    EXPECT_EQ(regClassForCoreType(TypeKind::F64),     TargetRegClass::FPR);
 }

@@ -164,6 +164,21 @@ TypeId TypeInterner::matrix(TypeId element, std::int64_t rows, std::int64_t cols
     return internContent(TypeKind::Matrix, {}, ops, sc, {});
 }
 
+TypeId TypeInterner::complex(TypeId element) {
+    // C99 _Complex (D-CSUBSET-COMPLEX): operands=[element], NO scalars, NO name.
+    // Structural interning dedups two `double _Complex` to one TypeId for free.
+    std::array<TypeId, 1> const ops{element};
+    return internContent(TypeKind::Complex, {}, ops, {}, {});
+}
+
+TypeId TypeInterner::complexElement(TypeId id) const {
+    if (kind(id) != TypeKind::Complex)
+        latticeFatal("complexElement: TypeId is not a Complex");
+    auto const ops = operands(id);
+    if (ops.empty()) latticeFatal("complexElement: Complex has no element operand");
+    return ops[0];
+}
+
 TypeId TypeInterner::pointer(TypeId pointee) {
     std::array<TypeId, 1> const ops{pointee};
     return internContent(TypeKind::Ptr, {}, ops, {}, {});

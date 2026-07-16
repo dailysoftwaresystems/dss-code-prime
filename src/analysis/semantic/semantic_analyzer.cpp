@@ -1020,8 +1020,15 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
             idx.unrealizedLongDoubleSets.insert(std::move(key));
             continue;
         }
+        // C99 _Complex (D-CSUBSET-COMPLEX §6.2.5, MINOR-8): a `complex` row's
+        // resolved core is the ELEMENT float — wrap it in interner.complex() so the
+        // multiset `double _Complex`/`float _Complex`/`long double _Complex` binds a
+        // genuine Complex TypeId at EVERY type position (decl/param/member/cast/
+        // sizeof funnel through this table). The element rode the same resolveCore
+        // axis, so `long double _Complex`'s element is F80/F128/F64 for free.
+        TypeId const elemTy = s.lattice.interner().primitive(*resolved);
         idx.typeSpecifierSets[std::move(key)] =
-            s.lattice.interner().primitive(*resolved);
+            ts.complex ? s.lattice.interner().complex(elemTy) : elemTy;
     }
 }
 

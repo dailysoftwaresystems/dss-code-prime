@@ -250,6 +250,10 @@ private:
                 out_ += "arr<"; appendType(in.operands(t)[0]);
                 out_ += std::format(", {}>", in.scalars(t)[0]);
                 return;
+            // C99 _Complex (D-CSUBSET-COMPLEX): a complex slot is a Ptr<complex<elem>>
+            // in MIR; spell the pointee so the .dssmir dump is legible (not '?').
+            case TypeKind::Complex:
+                out_ += "complex<"; appendType(in.operands(t)[0]); out_ += '>'; return;
             case TypeKind::Tuple:
                 out_ += "tuple<"; args(in.operands(t)); out_ += '>'; return;
             case TypeKind::Struct:

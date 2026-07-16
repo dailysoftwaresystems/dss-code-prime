@@ -1,0 +1,15 @@
+{
+  "$comment": "C99 <complex.h> (§7.3) — FC17.9(f) (D-CSUBSET-COMPLEX). The `_Complex` type-specifier is a c-subset.lang.json KEYWORD (no header needed); this header ships only the MACRO surface. `complex`→`_Complex` (C11 7.3.1). `I`/`_Complex_I`→`__builtin_complex(0.0, 1.0)` — the imaginary unit built from the always-injected `__builtin_complex(re, im)` complex-constructing builtin (the GCC/Clang builtin; c-subset.lang.json builtinFunctions, reserved `__builtin_` namespace). `creal`/`cimag`/`conj`(z) are function-like macros routing to the matching `__builtin_creal`/`__builtin_cimag`/`__builtin_conj` intrinsics (cycle-1 F64-monomorph — D-CSUBSET-COMPLEX-MONOMORPH-F64; crealf/creall/cimagf/… + the transcendental math cabs/carg/cexp/clog/csqrt/csin/… are the named deferral D-CSUBSET-COMPLEX-TRANSCENDENTAL; the float/long-double accessors crealf/creall/cimagf/… are D-CSUBSET-COMPLEX-MONOMORPH-F64). No `library`/`symbols` (all lowering is compiler-intrinsic, no linkable symbol), so available on every object format. `imaginary`/`_Imaginary_I` are NOT shipped: pure-imaginary types are unsupported (C99 optional Annex G — `_Imaginary` fails loud; D-CSUBSET-IMAGINARY-TYPE).",
+  "header": "complex.h",
+  "standard": "c99",
+  "availableObjectFormats": ["elf", "pe", "macho"],
+  "macros": [
+    { "name": "complex", "replacement": "_Complex" },
+    { "name": "_Complex_I", "replacement": "__builtin_complex(0.0, 1.0)" },
+    { "name": "I", "replacement": "__builtin_complex(0.0, 1.0)" },
+    { "name": "creal", "params": ["z"], "replacement": "__builtin_creal(z)" },
+    { "name": "cimag", "params": ["z"], "replacement": "__builtin_cimag(z)" },
+    { "name": "conj", "params": ["z"], "replacement": "__builtin_conj(z)" },
+    { "name": "__STDC_VERSION_COMPLEX_H__", "replacement": "199901L" }
+  ]
+}

@@ -372,6 +372,9 @@
 
     { "word": "_BitInt",        "kind": "BitIntKeyword"        },
 
+    { "word": "_Complex",       "kind": "ComplexKeyword"       },
+    { "word": "_Imaginary",     "kind": "ImaginaryKeyword"     },
+
     { "word": "_Static_assert", "kind": "StaticAssertKeyword"       },
     { "word": "static_assert",  "kind": "StaticAssertLegacyKeyword" },
 
@@ -810,8 +813,8 @@
     "typeSpecifierSeq": {
       "$comment": "FC3 c1: C 6.7.2 type-specifier run — one-or-more specifier KEYWORDS in any order (`unsigned long long int` == `long long unsigned int` == `long unsigned long`). The inner alt is INLINE (no named wrapper rule) so the matched keyword TOKENS land as typeSpecifierSeq's DIRECT children — the semantic engine's multiset arm requires all-token children. Which multisets are VALID (and what core each resolves to, per data model) is the semantics.typeSpecifiers table; invalid combos (`unsigned float`, `short long`) parse fine here and reject SEMANTICALLY by absence from the table (S_InvalidTypeSpecifierCombination). The seq SUBSUMES the former single-token Void/Int/Long/Char alts (a one-keyword run). Keyword-led, so castExpr's commitRequiresTypeName triage rule 1 (not-a-lone-identifier) always commits a seq-led cast type. D-CSUBSET-BITINT: the `bitIntSpecifier` rule (`_BitInt(N)`) joins the element alt so `unsigned _BitInt(40)` parses as ONE run [unsigned-token, bitIntSpecifier-node] — keyword-led + FIRST-disjoint, so it only adds `_BitInt` to the element FIRST set (no speculation). A run CONTAINING a bitIntSpecifier is NOT all-tokens → the multiset arm skips it and the semantic engine's bitInt arm (semantics.bitInt) resolves it, scanning the sibling signedness tokens.",
       "sequence": [
-        { "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "ShortKeyword", "UnsignedKeyword", "SignedKeyword", "BoolKeyword", "LegacyBoolKeyword", "FloatKeyword", "DoubleKeyword", "bitIntSpecifier" ] },
-        { "repeat": { "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "ShortKeyword", "UnsignedKeyword", "SignedKeyword", "BoolKeyword", "LegacyBoolKeyword", "FloatKeyword", "DoubleKeyword", "bitIntSpecifier" ] } }
+        { "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "ShortKeyword", "UnsignedKeyword", "SignedKeyword", "BoolKeyword", "LegacyBoolKeyword", "FloatKeyword", "DoubleKeyword", "ComplexKeyword", "ImaginaryKeyword", "bitIntSpecifier" ] },
+        { "repeat": { "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "ShortKeyword", "UnsignedKeyword", "SignedKeyword", "BoolKeyword", "LegacyBoolKeyword", "FloatKeyword", "DoubleKeyword", "ComplexKeyword", "ImaginaryKeyword", "bitIntSpecifier" ] } }
       ]
     },
 
@@ -1675,6 +1678,10 @@
       { "name": "_ReadWriteBarrier", "signature": "fn() -> void", "lowering": "barrier" },
       { "name": "_exception_code", "signature": "fn() -> u32", "lowering": "seh_exception_code" },
       { "name": "_exception_info", "signature": "fn() -> ptr<void>", "lowering": "seh_exception_info" },
+      { "$comment": "C99 _Complex (D-CSUBSET-COMPLEX §7.3): the always-injected complex builtins the <complex.h> macros route to. The `signature` form spells the `complex<f64>` result/param the scalar params/result axis cannot express (the _InterlockedCompareExchange ptr<> precedent; parseType decodes `complex<..>` via the M1 codec). `__builtin_complex(re, im)` constructs a complex from two reals (by-address materialized — the FIRST aggregate-returning builtin, CRITICAL-2). creal/cimag extract the real/imag F64 component; conj negates imag. Cycle-1 F64-monomorph (D-CSUBSET-COMPLEX-MONOMORPH-F64).", "name": "__builtin_complex", "signature": "fn(f64, f64) -> complex<f64>", "lowering": "complex_make" },
+      { "name": "__builtin_creal", "signature": "fn(complex<f64>) -> f64", "lowering": "complex_real" },
+      { "name": "__builtin_cimag", "signature": "fn(complex<f64>) -> f64", "lowering": "complex_imag" },
+      { "name": "__builtin_conj",  "signature": "fn(complex<f64>) -> complex<f64>", "lowering": "complex_conj" },
       { "name": "__builtin_popcount",   "params": ["U32"], "result": "I32", "lowering": "popcount" },
       { "name": "__builtin_popcountll", "params": ["U64"], "result": "I32", "lowering": "popcount" },
       { "name": "__builtin_clz",   "params": ["U32"], "result": "I32", "lowering": "clz" },
@@ -1786,7 +1793,10 @@
       { "tokens": ["LegacyBoolKeyword"],                                        "core": "Bool" },
       { "tokens": ["FloatKeyword"],                                             "core": "F32"  },
       { "tokens": ["DoubleKeyword"],                                            "core": "F64"  },
-      { "tokens": ["LongKeyword", "DoubleKeyword"],                             "core": "F64", "coreByLongDoubleFormat": { "x87-80": "F80", "ieee128": "F128" } }
+      { "tokens": ["LongKeyword", "DoubleKeyword"],                             "core": "F64", "coreByLongDoubleFormat": { "x87-80": "F80", "ieee128": "F128" } },
+      { "$comment": "C99 _Complex (D-CSUBSET-COMPLEX §6.2.5): the `complex` row flag wraps the resolved ELEMENT float core in interner.complex() at the specifier-resolve site (semantic_analyzer.cpp), so `double _Complex`→complex(F64), `float _Complex`→complex(F32). `_Complex int`/`_Imaginary` (no row) reject via the absent-multiset discipline (S_InvalidTypeSpecifierCombination), the `unsigned float` precedent. `long double _Complex` reuses the LD axis: its element is F80/F128 on x87-80/ieee128 (arith walls loud there), F64 on the f64-axis formats (decl/layout/sizeof/ABI-reject work).", "tokens": ["FloatKeyword", "ComplexKeyword"],                    "core": "F32", "complex": true },
+      { "tokens": ["DoubleKeyword", "ComplexKeyword"],                          "core": "F64", "complex": true },
+      { "tokens": ["LongKeyword", "DoubleKeyword", "ComplexKeyword"],           "core": "F64", "coreByLongDoubleFormat": { "x87-80": "F80", "ieee128": "F128" }, "complex": true }
     ],
     "$literalTypesComment": "FC3 c1: IntLiteral's I32 is the BASE core; the integerLiteralTyping ladder below refines the width by magnitude/suffix/radix per C 6.4.4.1. FloatLiteral's F64 is the BASE core; the floatLiteralTyping suffix map below refines it per C 6.4.4.2 (FC3.5 sweep-c2 / D-CSUBSET-F32-CODEGEN closure: `1.5f` now types F32 — the F32 arithmetic surface shipped, so the typing flip pairs with real codegen). true/false are C23 keyword literals: type Bool with config-declared FIXED values (1/0) — the engine never decodes their text as a number.",
     "literalTypes": [

@@ -677,6 +677,32 @@ TEST(ParseTypeFromText, RoundTripsViaInterner) {
     EXPECT_EQ(rep.errorCount(), 0u);
 }
 
+// C99 _Complex (D-CSUBSET-COMPLEX, M1): `complex<f64>` decodes to a Complex over F64,
+// and the `fn(complex<f64>) -> f64` signature form (the __builtin_creal/cimag decode
+// path) parses to an FnSig with a Complex param — the codec that lets the shipped-lib
+// builtin `signature` spell a genuine Complex type.
+TEST(ParseTypeFromText, RoundTripsComplex) {
+    TypeInterner interner{CompilationUnitId{11}};
+    TypeRegistry reg;
+    DiagnosticReporter rep;
+
+    TypeId const cd = parseTypeFromText("complex<f64>", interner, reg, rep);
+    ASSERT_TRUE(cd.valid());
+    EXPECT_EQ(interner.kind(cd), TypeKind::Complex);
+    ASSERT_EQ(interner.operands(cd).size(), 1u);
+    EXPECT_EQ(interner.kind(interner.operands(cd)[0]), TypeKind::F64);
+    EXPECT_TRUE(interner.scalars(cd).empty());
+
+    // The __builtin_complex result form `fn(f64, f64) -> complex<f64>`.
+    TypeId const mk = parseTypeFromText("fn(f64, f64) -> complex<f64>", interner, reg, rep);
+    ASSERT_TRUE(mk.valid());
+    ASSERT_EQ(interner.kind(mk), TypeKind::FnSig);
+    EXPECT_EQ(interner.kind(interner.fnResult(mk)), TypeKind::Complex);
+    // Canonicalization: the standalone `complex<f64>` == the fn result.
+    EXPECT_EQ(interner.fnResult(mk), cd);
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
 // (3) Truncated text (`fn(ptr<`) returns InvalidType AND emits ≥1 error. RED-on-
 // disable: if the decoder silently handed back a partial type, `valid()` would be
 // true (or no error would be reported) and this fails.
