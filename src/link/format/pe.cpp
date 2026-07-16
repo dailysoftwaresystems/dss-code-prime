@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -24,13 +25,18 @@
 #include <utility>
 #include <vector>
 
-// PE/COFF writer — plan 14 LK2 cycle 1 (.obj) + cycle 2 (PE32+ .exe).
+// PE/COFF writer — plan 14 LK2 cycle 1 (.obj) + cycle 2 (PE32+ .exe)
+// + c148 (.obj data sections + extern naming — the PE analog of the
+// ELF c141/c142/c145 and Mach-O c146/c147 cross-toolchain arcs).
 //
 // .obj byte layout (PE/COFF spec §3-5):
 //   [0x00]   IMAGE_FILE_HEADER (20 B)
-//   [0x14]   IMAGE_SECTION_HEADER × N (40 B each)
-//   [...]    section raw data (.text first)
-//   [...]    per-section IMAGE_RELOCATION[] (10 B packed each)
+//   [0x14]   IMAGE_SECTION_HEADER × N (40 B each; .text, then any
+//            present .rdata / .data / .rdata-relro / .bss)
+//   [...]    section raw data (.text first, then the file-backed data
+//            sections packed back-to-back; .bss stores no bytes)
+//   [...]    per-section IMAGE_RELOCATION[] (10 B packed each; .text,
+//            then data, then relro)
 //   [ptr]    IMAGE_SYMBOL[] (18 B packed each)
 //   [...]    String table (u32 size + NUL-terminated strings)
 //
@@ -67,6 +73,13 @@ using link::format::detail::requireSection;
 
 // IMAGE_SYM_CLASS_*
 constexpr std::uint8_t IMAGE_SYM_CLASS_EXTERNAL = 2;
+// STATIC(3): a symbol resolved ONLY within its own object — link.exe
+// never enters it into the cross-object global table. Used for the
+// synthetic per-block symbols (jump-table / computed-goto targets):
+// EXTERNAL would let a sibling object's unrelated `sym_<id>` bind to
+// an interior block address (silent wrong-control-flow) — the COFF
+// analog of ELF STB_LOCAL / Mach-O no-N_EXT (c147 fold, baked in).
+constexpr std::uint8_t IMAGE_SYM_CLASS_STATIC = 3;
 // IMAGE_SECTION_NUMBER specials
 constexpr std::int16_t IMAGE_SYM_UNDEFINED = 0;
 // IMAGE_SYM_TYPE_*
@@ -577,9 +590,198 @@ encode(AssembledModule const&    module,
         }
         return encodeExec(module, targetSchema, fmt, *secText, reporter);
     }
-    (void)targetSchema;  // Obj path does not apply relocations — the
-                         // assembler stamped the bytes and the .obj
-                         // writer just serializes them.
+    // NOTE: the Obj path does not APPLY relocations (the assembler
+    // stamped the bytes; the .obj writer serializes them + the
+    // IMAGE_RELOCATION records link.exe resolves). `targetSchema` is
+    // consulted only to VALIDATE data-item relocation kinds (linear,
+    // absolute, non-zero width) before emitting their records —
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (PE/COFF Obj arm, c148).
+
+    // ── D-LK-OBJECT-DATA-SECTION-RELOCATABLE (PE/COFF Obj arm, c148) ──
+    //
+    // The .obj writer emits DATA sections from `AssembledModule.dataItems`
+    // — the PE analog of the ELF c142 ET_REL arm + the Mach-O c147 mirror.
+    // A global lands in `.rdata` (rodata) / `.data` (data) / a SECOND
+    // `.rdata` (relro — COFF has no relro segment; MSVC itself places
+    // reloc-bearing const data in `.rdata` and the linked image
+    // base-relocates it; link.exe merges same-name contributions) /
+    // `.bss` (bss) with a SECTION-RELATIVE IMAGE_SYMBOL (SectionNumber =
+    // 1-based ordinal, Value = offset within the section — the COFF
+    // convention, NOT Mach-O's flat-address n_value) the final linker
+    // binds. Section names / Characteristics come from the format JSON
+    // rows (sectionByKind) — nothing hardcoded here.
+    //
+    // Thread-local items are rejected loud (mirror of the ELF / Mach-O
+    // object-arm belts): the .obj walker emits no `.tls` /
+    // IMAGE_TLS_DIRECTORY64 machinery (that is the PE EXEC arm,
+    // D-CSUBSET-THREAD-LOCAL C3). Unreachable via the shipped pipeline
+    // (the linker's acceptsDataSection gate fires first — the schema
+    // declares no tdata/tbss), this is the anti-silent-drop belt for a
+    // direct walker call or a format JSON opting in prematurely.
+    for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+        auto const s = module.dataItems[i].section;
+        if (s != DataSectionKind::Tdata && s != DataSectionKind::Tbss)
+            continue;
+        emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+             std::format("pe::encode (Obj): AssembledData item #{} is "
+                         "thread-local ({}) but the .obj walker emits no "
+                         ".tls machinery - thread-locals are supported "
+                         "only on the PE EXEC arm "
+                         "(D-CSUBSET-THREAD-LOCAL).",
+                         i, dataSectionKindName(s)));
+        return {};
+    }
+
+    // Lay out each data-section kind via the shared kind-parameterized
+    // substrate (`exec_data_section.hpp`) — the SAME helper the ELF /
+    // Mach-O / PE-exec arms use. The alignment floor is 1 for every PE
+    // row: validate() REJECTS a non-zero `addrAlign` on PE rows (PE
+    // carries alignment in the Characteristics IMAGE_SCN_ALIGN_*BYTES
+    // bits, which the writer derives from the H1-raised layout alignment
+    // below — the per-contribution align class cl.exe itself stamps).
+    // `data` + `relro` ALLOW item relocations (the c145/c147 analog: the
+    // writer emits their IMAGE_RELOCATION tables below); a reloc-bearing
+    // `rodata` item stays fail-loud (allow=false — the
+    // RodataDataItemWithRelocationFailsLoud discipline), and `bss` items
+    // carry no bytes to relocate.
+    auto const rodataLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Rodata,
+        /*alignFloor=*/1, "pe::encode (Obj)", reporter);
+    if (!rodataLayoutOpt.has_value()) return {};
+    auto const& rodataLayout = *rodataLayoutOpt;
+    auto dataLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Data,
+        /*alignFloor=*/1, "pe::encode (Obj)", reporter,
+        /*allowItemRelocations=*/true);
+    if (!dataLayoutOpt.has_value()) return {};
+    auto& dataLayout = *dataLayoutOpt;
+    auto const bssLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Bss,
+        /*alignFloor=*/1, "pe::encode (Obj)", reporter);
+    if (!bssLayoutOpt.has_value()) return {};
+    auto const& bssLayout = *bssLayoutOpt;
+    // Unlike the PE-exec arm (which FOLDS relro into `.rdata` bytes), the
+    // .obj keeps relro a DISTINCT section (the ELF `.data.rel.ro` /
+    // Mach-O `__DATA,__const` mirror) so it carries its OWN
+    // IMAGE_RELOCATION table; it shares the `.rdata` NAME (the MSVC
+    // placement) and link.exe merges the same-name contributions.
+    auto relroLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::RelRoConst,
+        /*alignFloor=*/1, "pe::encode (Obj)", reporter,
+        /*allowItemRelocations=*/true);
+    if (!relroLayoutOpt.has_value()) return {};
+    auto& relroLayout = *relroLayoutOpt;
+
+    bool const hasRodata = !rodataLayout.empty();
+    bool const hasData   = !dataLayout.empty();
+    bool const hasRelRo  = !relroLayout.empty();
+    bool const hasBss    = !bssLayout.empty();
+    // Each PRESENT section's schema row is MANDATORY — fail loud (the
+    // format JSON must declare it; requireSection emits).
+    ObjectFormatSectionInfo const* secRodata =
+        hasRodata ? requireSection(fmt, SectionKind::Rodata,
+                                   "PE writer (Obj)", reporter)
+                  : nullptr;
+    if (hasRodata && secRodata == nullptr) return {};
+    ObjectFormatSectionInfo const* secData =
+        hasData ? requireSection(fmt, SectionKind::Data,
+                                 "PE writer (Obj)", reporter)
+                : nullptr;
+    if (hasData && secData == nullptr) return {};
+    ObjectFormatSectionInfo const* secRelRo =
+        hasRelRo ? requireSection(fmt, SectionKind::RelRoConst,
+                                  "PE writer (Obj)", reporter)
+                 : nullptr;
+    if (hasRelRo && secRelRo == nullptr) return {};
+    ObjectFormatSectionInfo const* secBss =
+        hasBss ? requireSection(fmt, SectionKind::Bss,
+                                "PE writer (Obj)", reporter)
+               : nullptr;
+    if (hasBss && secBss == nullptr) return {};
+
+    // COFF section-contribution alignment: IMAGE_SCN_ALIGN_*BYTES bits in
+    // Characteristics — value (log2(align)+1) << 20, representable for
+    // 1..8192 bytes only. Derived from the H1-raised layout alignment
+    // (max of every member item's alignment) so the final linker places
+    // the contribution at least as aligned as its strictest member —
+    // exactly the per-contribution class cl.exe stamps. Fail loud on a
+    // non-power-of-two (no log2) or > 8192 (no encoding exists) — either
+    // would otherwise ship silently-wrong align bits. The JSON row's
+    // `type` must arrive WITHOUT align bits (the rows deliberately carry
+    // none); OR-ing onto preexisting bits would corrupt the class field
+    // (e.g. ALIGN_16 | ALIGN_4 reads as ALIGN_64).
+    auto const alignBitsFor =
+        [&](std::uint64_t maxAlign, ObjectFormatSectionInfo const& row,
+            std::string_view sectionLabel,
+            std::uint32_t& bitsOut) -> bool {
+        constexpr std::uint32_t kAlignClassMask = 0x00F00000u;
+        if (!std::has_single_bit(maxAlign) || maxAlign > 8192u) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encode (Obj): {} section alignment {} "
+                             "has no IMAGE_SCN_ALIGN_*BYTES encoding - "
+                             "COFF expresses object-section alignment as "
+                             "a power of two between 1 and 8192 bytes.",
+                             sectionLabel, maxAlign));
+            return false;
+        }
+        if ((row.type & kAlignClassMask) != 0) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encode (Obj): {} schema row '{}' "
+                             "Characteristics 0x{:x} already carries "
+                             "IMAGE_SCN_ALIGN_*BYTES bits - the .obj "
+                             "walker derives the align class from the "
+                             "layout (H1) and OR-ing would corrupt it; "
+                             "declare the row without align bits.",
+                             sectionLabel, row.name, row.type));
+            return false;
+        }
+        bitsOut = static_cast<std::uint32_t>(
+                      std::countr_zero(maxAlign) + 1)
+                  << 20;
+        return true;
+    };
+    std::uint32_t rodataAlignBits = 0;
+    std::uint32_t dataAlignBits   = 0;
+    std::uint32_t relroAlignBits  = 0;
+    std::uint32_t bssAlignBits    = 0;
+    if (hasRodata && !alignBitsFor(rodataLayout.maxAlign, *secRodata,
+                                   "rodata", rodataAlignBits)) {
+        return {};
+    }
+    if (hasData && !alignBitsFor(dataLayout.maxAlign, *secData, "data",
+                                 dataAlignBits)) {
+        return {};
+    }
+    if (hasRelRo && !alignBitsFor(relroLayout.maxAlign, *secRelRo,
+                                  "relro", relroAlignBits)) {
+        return {};
+    }
+    if (hasBss && !alignBitsFor(bssLayout.maxAlign, *secBss, "bss",
+                                bssAlignBits)) {
+        return {};
+    }
+    // u32 overflow belt (SizeOfRawData / pointers are u32 wire fields —
+    // the PE-exec checkU32Span mirror): surface a > 4 GiB span loud
+    // rather than silently truncating at the narrowing casts below.
+    auto const checkU32Span = [&](char const* kindName,
+                                  std::uint64_t span) -> bool {
+        if (span > std::numeric_limits<std::uint32_t>::max()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encode (Obj): {} section size {} bytes "
+                             "exceeds the PE/COFF u32 wire limit "
+                             "(2^32-1); the format cannot represent "
+                             "this object.",
+                             kindName, span));
+            return false;
+        }
+        return true;
+    };
+    if (!checkU32Span("rodata", rodataLayout.spanSize)
+        || !checkU32Span("data", dataLayout.spanSize)
+        || !checkU32Span("relro", relroLayout.spanSize)
+        || !checkU32Span("bss", bssLayout.spanSize)) {
+        return {};
+    }
 
     // ── Build .text + per-function symbols ─────────────────────
     std::vector<std::uint8_t> text;
@@ -601,44 +803,42 @@ encode(AssembledModule const&    module,
                             static_cast<std::uint64_t>(fn.bytes.size())});
     }
 
-    // ── Build .text relocation table ───────────────────────────
-    //
-    // PE/COFF stores relocations per-section, immediately after the
-    // section's raw data. Each IMAGE_RELOCATION is 10 bytes packed.
+    // 1-based COFF section ordinals (IMAGE_SYMBOL SectionNumber /
+    // section-header order): .text = 1, then each present data section
+    // in emission order (rodata → data → relro → bss — bss last, the
+    // no-file-bytes tail; matches the Mach-O zerofill-last mirror).
+    std::int16_t sectOrdinalCursor = 1;   // .text
+    std::int16_t const IDX_RODATA =
+        hasRodata ? ++sectOrdinalCursor : 0;
+    std::int16_t const IDX_DATA  = hasData ? ++sectOrdinalCursor : 0;
+    std::int16_t const IDX_RELRO = hasRelRo ? ++sectOrdinalCursor : 0;
+    std::int16_t const IDX_BSS   = hasBss ? ++sectOrdinalCursor : 0;
+    std::size_t const numSections =
+        static_cast<std::size_t>(sectOrdinalCursor);
 
-    // Index every symbol the writer will emit so the relocation
-    // records can reference them by SymbolTableIndex.
+    // ── Build symbol-table indices ─────────────────────────────
+    //
+    // Order: defined FUNCTION symbols → synthetic per-BLOCK locals
+    // (computed-goto / jump-table targets at interior .text offsets) →
+    // defined DATA symbols (SectionNumber = the data section's ordinal,
+    // Value = the item's SECTION-RELATIVE offset) → undefined externs
+    // (SectionNumber = 0). The IMAGE_RELOCATION SymbolTableIndex values
+    // below must match this exact order.
+    //
+    // AUX-ENTRY ACCOUNTING: COFF SymbolTableIndex counts auxiliary
+    // records as index slots. This writer emits ZERO aux records (every
+    // appendSym call below passes numAuxSymbols = 0 — no section-
+    // definition, file, or function-definition aux), so a symbol's index
+    // equals its record ordinal with no adjustment. If aux records are
+    // ever added, every index minted here must skip them.
     //
     // Symbol indices are minted strictly with `emplace.second` —
     // duplicates do not advance the index counter (silent-failure
     // H3 fix: prior version `nextSymIdx++` ran unconditionally,
     // desynchronizing the index map from the appended symtab).
-    // O(1) lookup against an `unordered_set<SymbolId>` of defined
-    // symbols replaces the prior O(n²) linear scans (simplifier
-    // fold-in #5).
     std::unordered_map<SymbolId, std::uint32_t> symIdxBySymbol;
-    symIdxBySymbol.reserve(module.functions.size() * 2);
-
-    std::unordered_set<SymbolId> definedSet;
-    definedSet.reserve(module.functions.size());
-    for (auto const& f : funcSyms) definedSet.insert(f.symId);
-
-    std::vector<SymbolId> externSyms;
-    std::unordered_set<SymbolId> externSeen;
-    for (auto const& fn : module.functions) {
-        for (auto const& rel : fn.relocations) {
-            if (definedSet.contains(rel.target)) continue;
-            // Externs become IMAGE_SYM_UNDEFINED entries (SectionNumber=0).
-            if (externSeen.insert(rel.target).second) {
-                externSyms.push_back(rel.target);
-            }
-        }
-    }
-
-    // Assign symbol-table indices: defined functions first (mirrors
-    // LK1's discipline), then externs. PE doesn't require this
-    // ordering but the ELF writer uses it and consistency simplifies
-    // the test fixtures. Index advances ONLY when emplace succeeds.
+    symIdxBySymbol.reserve(module.functions.size()
+                           + module.dataItems.size());
     std::uint32_t nextSymIdx = 0;
     for (auto const& f : funcSyms) {
         auto const [it, fresh] =
@@ -653,21 +853,122 @@ encode(AssembledModule const&    module,
         }
         ++nextSymIdx;
     }
+
+    // D-CSUBSET-COMPUTED-GOTO / jump tables: synthetic per-block symbols
+    // (the `&&label` / dense-switch jump-table relocation targets) are
+    // intra-module DEFINED LOCAL symbols pointing at an interior `.text`
+    // offset. Register + emit them as IMAGE_SYM_CLASS_STATIC (LOCAL — a
+    // sibling object's unrelated `sym_<id>` must never bind to or be
+    // bound by an interior block address; the ELF STB_LOCAL / Mach-O
+    // no-N_EXT mirror), SectionNumber = 1 (.text), Value =
+    // funcTextStart + blockByteOffset (SECTION-relative — for .text that
+    // equals the flat offset). Registering them BEFORE the undefined-
+    // extern scan makes a jump-table slot's abs64 reloc resolve to this
+    // defined local rather than the extern fallback fabricating a bogus
+    // undefined `sym_<id>` nothing can ever define (the c147 Mach-O
+    // CRITICAL fold, baked into the PE arm from the start).
+    struct BlockSymRecord {
+        SymbolId      symId{};
+        std::uint64_t textOffset = 0;
+    };
+    std::vector<BlockSymRecord> blockSyms;
+    for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+        for (auto const& bs : module.functions[fi].blockSymbols) {
+            auto const [it, fresh] =
+                symIdxBySymbol.emplace(bs.symbol, nextSymIdx);
+            if (!fresh) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::string{"PE writer: synthetic block symbol #"}
+                         + std::to_string(bs.symbol.v)
+                         + " collides with an already-registered symbol"
+                           " - block SymbolIds must be unique.");
+                return {};
+            }
+            ++nextSymIdx;
+            blockSyms.push_back(
+                {bs.symbol, funcTextStart[fi] + bs.blockByteOffset});
+        }
+    }
+
+    // Defined DATA symbols — one IMAGE_SYMBOL per NAMED item (anonymous
+    // SymbolId{} items are section-offset-referenced, never reloc
+    // targets — M1 skip). A SymbolId colliding with an already-
+    // registered (function / block / data) symbol is a producer-contract
+    // breach — fail loud (the ELF ET_REL / Mach-O K_DuplicateDataSymbol
+    // mirror), never a silent skip that would bind a reloc to the WRONG
+    // symbol.
+    struct DataSymRecord {
+        SymbolId      symId{};
+        std::int16_t  sectionNumber = 0;      // 1-based ordinal
+        std::uint64_t sectionRelOffset = 0;   // COFF Value convention
+    };
+    std::vector<DataSymRecord> dataSyms;
+    auto registerDataSyms =
+        [&](link::format::ExecDataSectionLayout const& layout,
+            std::int16_t sectionNumber) -> bool {
+        for (std::size_t j = 0; j < layout.itemIndices.size(); ++j) {
+            AssembledData const& di =
+                module.dataItems[layout.itemIndices[j]];
+            if (di.symbol == SymbolId{}) continue;   // anonymous item (M1)
+            if (!symIdxBySymbol.emplace(di.symbol, nextSymIdx).second) {
+                emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
+                     std::format(
+                         "pe::encode (Obj): data SymbolId={{ {} }} "
+                         "collides with an already-emitted symbol - a "
+                         "data global's SymbolId must be unique.",
+                         di.symbol.v));
+                return false;
+            }
+            ++nextSymIdx;
+            dataSyms.push_back({di.symbol, sectionNumber,
+                                layout.itemOffsets[j]});
+        }
+        return true;
+    };
+    if (hasRodata && !registerDataSyms(rodataLayout, IDX_RODATA)) {
+        return {};
+    }
+    if (hasData && !registerDataSyms(dataLayout, IDX_DATA)) return {};
+    if (hasRelRo && !registerDataSyms(relroLayout, IDX_RELRO)) return {};
+    if (hasBss && !registerDataSyms(bssLayout, IDX_BSS)) return {};
+
+    // Undefined externs: any reloc target that is neither a defined
+    // function / block / data symbol. Scans DATA-ITEM relocations too
+    // (the ELF c145 / Mach-O c147 mirror) — a relro const table of libc
+    // function pointers whose targets appear in NO function reloc still
+    // needs its IMAGE_SYM_UNDEFINED entries so the data IMAGE_RELOCATION
+    // records below resolve their SymbolTableIndex.
+    std::vector<SymbolId> externSyms;
+    std::unordered_set<SymbolId> externSeen;
+    auto noteExternTarget = [&](SymbolId target) {
+        if (symIdxBySymbol.contains(target)) return;   // defined
+        if (externSeen.insert(target).second) externSyms.push_back(target);
+    };
+    for (auto const& fn : module.functions)
+        for (auto const& rel : fn.relocations) noteExternTarget(rel.target);
+    for (auto const& di : module.dataItems)
+        for (auto const& rel : di.relocations) noteExternTarget(rel.target);
     for (auto const& e : externSyms) {
         if (symIdxBySymbol.emplace(e, nextSymIdx).second) ++nextSymIdx;
     }
 
-    // Per-section relocation table (only `.text` has relocations
-    // in this cycle scope).
+    // ── Build .text relocation table ───────────────────────────
     //
+    // PE/COFF stores relocations per-section. Each IMAGE_RELOCATION is
+    // 10 bytes packed; each reloc-bearing section header names its own
+    // table via PointerToRelocations/NumberOfRelocations.
+
     // PE/COFF convention: the relocation addend lives IN THE PATCH
     // BYTES (the section's raw data), NOT as a separate field on
     // the IMAGE_RELOCATION record. ELF Rela carries `r_addend`
     // explicitly; PE has no such column. If an `AssembledModule`
-    // arrives with `rel.addend != 0`, the PE walker would silently
-    // drop the addend — that's exactly the silent-failure class the
-    // substrate discipline rejects. Fail loud so the caller fixes
-    // the assembler (or pre-stamps the addend into the patch bytes).
+    // FUNCTION reloc arrives with `rel.addend != 0`, the PE walker
+    // would silently drop the addend — that's exactly the silent-
+    // failure class the substrate discipline rejects. Fail loud so the
+    // caller fixes the assembler (or pre-stamps the addend into the
+    // patch bytes). DATA-item relocations differ: their slot bytes ARE
+    // the addend carrier, so the data-reloc pass below WRITES the
+    // addend in-slot instead (see its block comment).
     std::vector<std::uint8_t> textRelocs;
     std::uint32_t textRelocCount = 0;
     for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
@@ -702,21 +1003,159 @@ encode(AssembledModule const&    module,
         }
     }
 
-    // Silent-failure C1 guard: PE/COFF spec §4 says when relocation
-    // count > 65534, the writer must set IMAGE_SCN_LNK_NRELOC_OVFL
-    // (0x01000000) in section Characteristics AND put the real count
-    // in the first IMAGE_RELOCATION's VirtualAddress field. That
-    // path is not implemented in this cycle; emit a hard diagnostic
-    // rather than silently truncating to u16. Anchored at plan 14
-    // §3.1 as a deferred item (overflow path arrives with the first
-    // module that needs it).
-    if (textRelocCount > 0xFFFEu) {
+    // ── Build per-DATA-SECTION IMAGE_RELOCATION tables ─────────
+    //
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (PE/COFF Obj arm, c148) — the
+    // `.rela.data` / `.rela.data.rel.ro` analog: a data section whose
+    // items carry their OWN relocations (a const/mutable pointer table —
+    // sqlite's VFS method tables + `aSyscall[]`) gets its own
+    // IMAGE_RELOCATION table (PointerToRelocations/NumberOfRelocations).
+    // Each record: u32 VirtualAddress = the slot's offset WITHIN its
+    // section (a .obj section's VA base is 0), u32 SymbolTableIndex, u16
+    // Type = the reloc kind's format-declared nativeId (an abs64 slot
+    // arrives as the schema's IMAGE_REL_AMD64_ADDR64 row — read from the
+    // JSON, never hardcoded). A data reloc is NEVER a call, so the plain
+    // nativeId is always used.
+    //
+    // ADDEND: IMAGE_RELOCATION has NO addend column. The .text table
+    // above fails loud on a non-zero addend (the assembler pre-stamps
+    // call/jmp patch bytes). A DATA slot is different: link.exe reads
+    // the slot CONTENT as the implicit addend for ADDR64 (final = S +
+    // slot) — the in-place-addend convention cl.exe itself emits for
+    // `&arr[1]`-style initializers, and exactly what the PE-exec DIR64
+    // path realizes when `applyDataItemRelocations` resolves S+A into
+    // the slot. So the writer WRITES rel.addend into the slot bytes here
+    // (the producer zero-fills every reloc slot, so the write is
+    // authoritative, not additive). Failing loud instead would
+    // gratuitously reject initializers the ELF/Mach-O mirrors support.
+    auto buildDataRelocTable =
+        [&](link::format::ExecDataSectionLayout& layout,
+            std::string_view sectionLabel,
+            std::vector<std::uint8_t>& relocsOut,
+            std::uint32_t& relocCountOut) -> bool {
+        for (std::size_t j = 0; j < layout.itemIndices.size(); ++j) {
+            AssembledData const& di =
+                module.dataItems[layout.itemIndices[j]];
+            std::uint64_t const itemOff = layout.itemOffsets[j];
+            for (auto const& rel : di.relocations) {
+                auto const* fmtReloc = fmt.relocationByKind(rel.kind);
+                if (fmtReloc == nullptr) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("pe::encode (Obj): {} data "
+                                     "relocation kind {} is not declared "
+                                     "by object format '{}'.",
+                                     sectionLabel, rel.kind.v, fmt.name()));
+                    return false;
+                }
+                auto const* tri = targetSchema.relocationInfo(rel.kind);
+                if (tri == nullptr) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("pe::encode (Obj): {} data "
+                                     "relocation kind {} has no "
+                                     "TargetRelocationInfo on target "
+                                     "schema '{}'.",
+                                     sectionLabel, rel.kind.v,
+                                     targetSchema.name()));
+                    return false;
+                }
+                // A data pointer slot needs a plain LINEAR absolute fixup
+                // with a concrete width. `pcRelative` alone is NOT a
+                // sufficient discriminator (it is a Linear-only field —
+                // the loader forces every non-Linear formula row to
+                // pcRelative=false), so reject any non-Linear kind
+                // outright (the c147 Mach-O gate, copied verbatim).
+                if (tri->formulaKind != RelocFormulaKind::Linear
+                    || tri->pcRelative || tri->widthBytes == 0) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("pe::encode (Obj): {} data item "
+                                     "SymbolId={{ {} }} relocation '{}' "
+                                     "is pc-relative, zero-width, or a "
+                                     "non-linear instruction fixup - a "
+                                     "data pointer needs a plain absolute "
+                                     "fixup with a concrete write width.",
+                                     sectionLabel, di.symbol.v, tri->name));
+                    return false;
+                }
+                auto const it = symIdxBySymbol.find(rel.target);
+                if (it == symIdxBySymbol.end()) {
+                    emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                         std::format("pe::encode (Obj): {} data "
+                                     "relocation target symbol #{} has no "
+                                     "symtab entry - substrate-invariant "
+                                     "violation.",
+                                     sectionLabel, rel.target.v));
+                    return false;
+                }
+                std::uint64_t const patchOff = itemOff + rel.offset;
+                if (rel.offset + tri->widthBytes > di.bytes.size()
+                    || patchOff + tri->widthBytes > layout.bytes.size()) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("pe::encode (Obj): {} data item "
+                                     "SymbolId={{ {} }} relocation offset "
+                                     "{} + width {} overruns the item's "
+                                     "{} bytes.",
+                                     sectionLabel, di.symbol.v, rel.offset,
+                                     static_cast<int>(tri->widthBytes),
+                                     di.bytes.size()));
+                    return false;
+                }
+                // In-place addend (see the block comment above): the slot
+                // bytes carry A; link.exe computes S + slot. addend 0
+                // rewrites the producer's zero slot — a no-op by
+                // construction.
+                auto const a = static_cast<std::uint64_t>(rel.addend);
+                for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {
+                    layout.bytes[static_cast<std::size_t>(patchOff) + b] =
+                        static_cast<std::uint8_t>((a >> (8u * b)) & 0xFFu);
+                }
+                appendU32LE(relocsOut,
+                            static_cast<std::uint32_t>(patchOff));
+                appendU32LE(relocsOut, it->second);
+                appendU16LE(relocsOut,
+                            static_cast<std::uint16_t>(fmtReloc->nativeId));
+                ++relocCountOut;
+            }
+        }
+        return true;
+    };
+    std::vector<std::uint8_t> dataRelocs;
+    std::uint32_t dataRelocCount = 0;
+    std::vector<std::uint8_t> relroRelocs;
+    std::uint32_t relroRelocCount = 0;
+    if (hasData
+        && !buildDataRelocTable(dataLayout, "data", dataRelocs,
+                                dataRelocCount)) {
+        return {};
+    }
+    if (hasRelRo
+        && !buildDataRelocTable(relroLayout, "relro", relroRelocs,
+                                relroRelocCount)) {
+        return {};
+    }
+
+    // Silent-failure C1 guard: PE/COFF spec §4 says when a section's
+    // relocation count > 65534, the writer must set
+    // IMAGE_SCN_LNK_NRELOC_OVFL (0x01000000) in section Characteristics
+    // AND put the real count in the first IMAGE_RELOCATION's
+    // VirtualAddress field. That path is not implemented; emit a hard
+    // diagnostic rather than silently truncating to u16. Anchored at
+    // plan 14 §3.1 as a deferred item (overflow path arrives with the
+    // first module that needs it). Applied PER SECTION — the u16
+    // NumberOfRelocations is a per-header field.
+    auto const checkRelocCountFits = [&](char const* sectionLabel,
+                                         std::uint32_t count) -> bool {
+        if (count <= 0xFFFEu) return true;
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-             std::string{"PE writer: relocation count "}
-                 + std::to_string(textRelocCount)
+             std::string{"PE writer: "} + sectionLabel
+                 + " relocation count " + std::to_string(count)
                  + " exceeds u16 capacity; PE/COFF NRELOC_OVFL overflow "
                    "path is anchored as plan 14 §3.1 D-LK2-3 (LK6 trigger). "
                    "Module too large for cycle-1 PE writer.");
+        return false;
+    };
+    if (!checkRelocCountFits(".text", textRelocCount)
+        || !checkRelocCountFits(".data", dataRelocCount)
+        || !checkRelocCountFits("relro", relroRelocCount)) {
         return {};
     }
 
@@ -771,10 +1210,52 @@ encode(AssembledModule const&    module,
                         IMAGE_SYM_DTYPE_FUNCTION,
                         IMAGE_SYM_CLASS_EXTERNAL);
     }
+    // Synthetic per-block symbols (computed-goto labels / dense-switch
+    // jump-table targets): IMAGE_SYM_CLASS_STATIC — deliberately LOCAL,
+    // so a sibling object's unrelated `sym_<id>` can never bind to (or
+    // be bound by) an interior block address — SectionNumber = 1
+    // (.text), Value = the section-relative text offset. Emission order
+    // matches the symIdxBySymbol registration above (functions → blocks
+    // → data → externs) so relocation SymbolTableIndex values line up.
+    // The ELF STB_LOCAL / Mach-O no-N_EXT block-symbol legs are the
+    // mirrors (c147 fold, baked in).
+    for (auto const& b : blockSyms) {
+        std::string const symName =
+            std::string{"sym_"} + std::to_string(b.symId.v);
+        emitSymWithName(symName,
+                        static_cast<std::uint32_t>(b.textOffset),
+                        kTextSectionNumber,
+                        /*type=*/0,
+                        IMAGE_SYM_CLASS_STATIC);
+    }
+    // Defined DATA symbols (D-LK-OBJECT-DATA-SECTION-RELOCATABLE, PE
+    // arm): EXTERNAL, SectionNumber = the item's 1-based section
+    // ordinal, Value = the item's SECTION-RELATIVE offset (the COFF
+    // convention — dumpbin shows e.g. `table` as `00000000 SECT4
+    // External`; NOT Mach-O's flat-address n_value), type = 0 (COFF
+    // data symbols are `notype`; DTYPE_FUNCTION is functions-only).
+    // Externally-visible items carry their real (identity-mangled)
+    // name; static/synthesized ones keep `sym_<id>` (the same carve-out
+    // the function loop above uses).
+    for (auto const& d : dataSyms) {
+        std::string const symName = objNames.definedName(d.symId, "sym_");
+        emitSymWithName(symName,
+                        static_cast<std::uint32_t>(d.sectionRelOffset),
+                        d.sectionNumber,
+                        /*type=*/0,
+                        IMAGE_SYM_CLASS_EXTERNAL);
+    }
     // Undefined extern symbols (SectionNumber=0=UNDEF, type=0,
-    // value=0).
+    // value=0). D-LK-OBJECT-EXTERN-CALL-RELOCATABLE (PE arm, c148): the
+    // undefined extern carries its REAL import name (`externName` — the
+    // pipeline-mangled `mangledName`; PE x64 C mangling is IDENTITY, so
+    // `puts` is emitted verbatim with no leading underscore) so the
+    // FINAL linker (link.exe / lld-link) resolves it against a sibling
+    // object or an import library — the PE analog of the ELF c141 /
+    // Mach-O c146 fix. `sym_<id>` remains the fallback for a reloc
+    // target that is neither defined nor a known import.
     for (auto const& e : externSyms) {
-        std::string const symName = "sym_" + std::to_string(e.v);
+        std::string const symName = objNames.externName(e, "sym_");
         emitSymWithName(symName, /*value=*/0, IMAGE_SYM_UNDEFINED,
                         /*type=*/0, IMAGE_SYM_CLASS_EXTERNAL);
     }
@@ -782,28 +1263,55 @@ encode(AssembledModule const&    module,
     // ── Layout the file: header → section headers → section data
     //    → per-section relocs → symbol table → string table ─────
     //
-    // Section count is DERIVED from the section-header vector built
-    // below (architect D-LK2-5 convergence): pre-fix hardcoded
-    // literal `1` would silently corrupt the file when LK6 adds
-    // .data/.rdata. Same fix that closed B-LK1-2 on the ELF side.
+    // Section count is DERIVED from `numSections` (the ordinal cursor
+    // above — architect D-LK2-5 convergence; a hardcoded literal would
+    // silently corrupt the file whenever a data section appears). Raw
+    // section data is PACKED back-to-back with no inter-section file
+    // padding — cl.exe's own convention (its raw pointers land at odd
+    // offsets); a COFF contribution's placement alignment comes from the
+    // Characteristics ALIGN bits at final link, never its file offset.
+    // A data-free module derives numSections = 1 and every offset below
+    // collapses to the historical single-section layout — BYTE-IDENTICAL
+    // output (an explicit test pin).
     std::vector<PeSectionHeader> sectionHeaders;
-    std::size_t const kNumSectionsEmitted = 1;  // .text only, current
-                                                 // cycle — sized at
-                                                 // emit time below.
     std::size_t const sectionDataOffsetBase =
-        kFileHeaderSize + kNumSectionsEmitted * kSectionHeaderSize;
+        kFileHeaderSize + numSections * kSectionHeaderSize;
 
     std::uint32_t const textRawPointer =
         static_cast<std::uint32_t>(sectionDataOffsetBase);
     std::uint32_t const textRawSize    =
         static_cast<std::uint32_t>(text.size());
+    // File-backed data sections follow .text (rodata → data → relro);
+    // .bss stores NO file bytes (PointerToRawData = 0 — its span rides
+    // SizeOfRawData only, the cl.exe-witnessed COFF .obj convention).
+    std::uint32_t rawCursor = textRawPointer + textRawSize;
+    std::uint32_t const rodataRawPointer = hasRodata ? rawCursor : 0u;
+    if (hasRodata) {
+        rawCursor += static_cast<std::uint32_t>(rodataLayout.spanSize);
+    }
+    std::uint32_t const dataRawPointer = hasData ? rawCursor : 0u;
+    if (hasData) {
+        rawCursor += static_cast<std::uint32_t>(dataLayout.spanSize);
+    }
+    std::uint32_t const relroRawPointer = hasRelRo ? rawCursor : 0u;
+    if (hasRelRo) {
+        rawCursor += static_cast<std::uint32_t>(relroLayout.spanSize);
+    }
+    // Relocation tables follow ALL file-backed section bytes (.text's
+    // first, then each reloc-bearing data section's — the same order the
+    // section headers are emitted). A no-reloc table keeps pointer = 0.
+    std::uint32_t relocCursor = rawCursor;
     std::uint32_t const textRelocPointer =
-        textRelocCount > 0 ? textRawPointer + textRawSize : 0u;
-    std::uint32_t const textRelocSize =
-        static_cast<std::uint32_t>(textRelocs.size());
+        textRelocCount > 0 ? relocCursor : 0u;
+    relocCursor += static_cast<std::uint32_t>(textRelocs.size());
+    std::uint32_t const dataRelocPointer =
+        dataRelocCount > 0 ? relocCursor : 0u;
+    relocCursor += static_cast<std::uint32_t>(dataRelocs.size());
+    std::uint32_t const relroRelocPointer =
+        relroRelocCount > 0 ? relocCursor : 0u;
+    relocCursor += static_cast<std::uint32_t>(relroRelocs.size());
 
-    std::uint32_t const symtabPointer =
-        textRawPointer + textRawSize + textRelocSize;
+    std::uint32_t const symtabPointer = relocCursor;
     std::uint32_t const symtabSizeBytes =
         static_cast<std::uint32_t>(symtab.size());
     // Substrate invariant: every `appendSym` writes exactly 18
@@ -827,9 +1335,30 @@ encode(AssembledModule const&    module,
     std::vector<std::uint8_t> bytes;
     bytes.reserve(symtabPointer + symtabSizeBytes + strtab.size());
 
-    // Build the section header for .text (the only emitted section
-    // this cycle); push onto the vector so NumberOfSections derives
-    // from `.size()`.
+    // The .obj arm never adds section names to the string table, so a
+    // schema row name > 8 chars would silently encode as a dangling
+    // `/0` string-table reference. Every shipped PE row name fits; fail
+    // loud on a future JSON edit rather than emit a corrupt header.
+    auto const checkSectionNameFits =
+        [&](ObjectFormatSectionInfo const& row) -> bool {
+        if (row.name.size() <= 8) return true;
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("pe::encode (Obj): section name '{}' exceeds 8 "
+                         "chars; the .obj writer does not emit the "
+                         "COFF long-name (/N string-table) form.",
+                         row.name));
+        return false;
+    };
+    if (!checkSectionNameFits(*secText)
+        || (hasRodata && !checkSectionNameFits(*secRodata))
+        || (hasData && !checkSectionNameFits(*secData))
+        || (hasRelRo && !checkSectionNameFits(*secRelRo))
+        || (hasBss && !checkSectionNameFits(*secBss))) {
+        return {};
+    }
+
+    // Section header for .text; data-section headers follow in ordinal
+    // order (rodata → data → relro → bss).
     {
         PeSectionHeader hText{};
         hText.name                  = encodeSectionName(secText->name, 0);
@@ -844,7 +1373,67 @@ encode(AssembledModule const&    module,
         hText.characteristics       = secText->type;  // PE uses substrate
                                                        // `type` field for
                                                        // Characteristics
+                                                       // (.text row carries
+                                                       // its align bits
+                                                       // statically)
         sectionHeaders.push_back(hText);
+    }
+    // Data-section headers. VirtualSize/VirtualAddress = 0 (.obj);
+    // SizeOfRawData = the section span (for .bss the ZERO-FILL span with
+    // PointerToRawData = 0 — the cl.exe-witnessed convention: dumpbin
+    // shows `.bss` SizeOfRawData = 0x190, no raw pointer);
+    // Characteristics = the schema row's class bits OR the walker-derived
+    // IMAGE_SCN_ALIGN_*BYTES (validated align-bit-free above).
+    auto const pushDataSectionHeader =
+        [&](ObjectFormatSectionInfo const& row,
+            link::format::ExecDataSectionLayout const& layout,
+            bool zeroFill, std::uint32_t rawPointer,
+            std::uint32_t relocPointer, std::uint32_t relocCount,
+            std::uint32_t alignBits) {
+        PeSectionHeader h{};
+        h.name                 = encodeSectionName(row.name, 0);
+        h.virtualSize          = 0;
+        h.virtualAddress       = 0;
+        h.sizeOfRawData        =
+            static_cast<std::uint32_t>(layout.spanSize);
+        h.pointerToRawData     = zeroFill ? 0u : rawPointer;
+        h.pointerToRelocations = relocPointer;
+        h.pointerToLinenumbers = 0;
+        h.numberOfRelocations  = static_cast<std::uint16_t>(relocCount);
+        h.numberOfLinenumbers  = 0;
+        h.characteristics      = row.type | alignBits;
+        sectionHeaders.push_back(h);
+    };
+    if (hasRodata) {
+        pushDataSectionHeader(*secRodata, rodataLayout, /*zeroFill=*/false,
+                              rodataRawPointer, /*relocPointer=*/0,
+                              /*relocCount=*/0, rodataAlignBits);
+    }
+    if (hasData) {
+        pushDataSectionHeader(*secData, dataLayout, /*zeroFill=*/false,
+                              dataRawPointer, dataRelocPointer,
+                              dataRelocCount, dataAlignBits);
+    }
+    if (hasRelRo) {
+        pushDataSectionHeader(*secRelRo, relroLayout, /*zeroFill=*/false,
+                              relroRawPointer, relroRelocPointer,
+                              relroRelocCount, relroAlignBits);
+    }
+    if (hasBss) {
+        pushDataSectionHeader(*secBss, bssLayout, /*zeroFill=*/true,
+                              /*rawPointer=*/0, /*relocPointer=*/0,
+                              /*relocCount=*/0, bssAlignBits);
+    }
+    // Belt: the header vector must match the ordinal cursor the symbol
+    // SectionNumbers were minted from — a drift here would bind every
+    // data symbol to the WRONG section at final link.
+    if (sectionHeaders.size() != numSections) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("pe::encode (Obj): emitted {} section headers "
+                         "but the ordinal cursor derived {} - "
+                         "substrate-invariant violation.",
+                         sectionHeaders.size(), numSections));
+        return {};
     }
 
     // IMAGE_FILE_HEADER
@@ -862,9 +1451,40 @@ encode(AssembledModule const&    module,
         writeSectionHeader(bytes, h);
     }
 
-    // Section data + relocations
+    // Section raw data (.text, then each file-backed data section —
+    // .bss stores nothing), then the relocation tables (.text, data,
+    // relro — the layouts' bytes already carry the in-slot addends the
+    // data-reloc pass patched).
     bytes.insert(bytes.end(), text.begin(), text.end());
+    if (hasRodata) {
+        bytes.insert(bytes.end(), rodataLayout.bytes.begin(),
+                     rodataLayout.bytes.end());
+    }
+    if (hasData) {
+        bytes.insert(bytes.end(), dataLayout.bytes.begin(),
+                     dataLayout.bytes.end());
+    }
+    if (hasRelRo) {
+        bytes.insert(bytes.end(), relroLayout.bytes.begin(),
+                     relroLayout.bytes.end());
+    }
     bytes.insert(bytes.end(), textRelocs.begin(), textRelocs.end());
+    bytes.insert(bytes.end(), dataRelocs.begin(), dataRelocs.end());
+    bytes.insert(bytes.end(), relroRelocs.begin(), relroRelocs.end());
+
+    // The emitted byte cursor must equal the symtab pointer stamped into
+    // the file header — a file-backed layout whose bytes diverge from
+    // its spanSize would silently shift every trailing structure.
+    if (bytes.size() != symtabPointer) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("pe::encode (Obj): assembled section data ends "
+                         "at {} but the layout computed symtab pointer "
+                         "{} - substrate-invariant violation (a "
+                         "file-backed layout's bytes must equal its "
+                         "spanSize).",
+                         bytes.size(), symtabPointer));
+        return {};
+    }
 
     // Symbol table
     bytes.insert(bytes.end(), symtab.begin(), symtab.end());

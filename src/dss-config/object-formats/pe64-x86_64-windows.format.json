@@ -17,6 +17,11 @@
 
   "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: MSVC x64 `long double` IS `double` (64-bit IEEE, 8/8) — the f64 axis collapses the c-subset `long double` row to F64. See pe64-x86_64-windows-exec for the full rationale.",
   "longDoubleFormat": "f64",
+  "$externCallDispatchComment": "D-LK-OBJECT-EXTERN-CALL-RELOCATABLE (PE/COFF arm, c148 — the PE analog of the ELF c141 + Mach-O c146 closures): extern FUNCTION calls lower into this relocatable .obj as a plain direct `call rel32` (E8 disp32, zero patch bytes) + an IMAGE_REL_AMD64_REL32 relocation against an UNDEFINED COFF symbol (SectionNumber=0, StorageClass=EXTERNAL) carrying its REAL import name — PE x64 C mangling is IDENTITY (applyCMangling adds no leading underscore, unlike Mach-O), so `puts` is emitted verbatim. That rel32-CALL-against-undefined-symbol shape is the standard COFF contract: the FINAL linker (link.exe / lld-link) resolves it either directly to a same-link definition or through an import thunk it synthesizes for a DLL import — DSS never builds a stub/thunk inside a `.obj` (thunk synthesis is the EXEC walker's job, D-FFI-PE-IMPORT-THUNK). `direct-plt` is the declared verb because the call-site byte shape is the direct-call form (the ELF/Mach-O relocatable formats declare the same value for the same reason).",
+  "externCallDispatch": "direct-plt",
+
+  "$supportedDataSectionsComment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE (PE/COFF arm, c148 — the PE analog of the ELF c142 + Mach-O c147 `.o` data sections): a relocatable .obj DOES carry data — a global lands in `.rdata`/`.data`/`.bss` with a section-relative IMAGE_SYMBOL (SectionNumber = the section's 1-based ordinal, Value = the item's SECTION-RELATIVE offset — the COFF convention, unlike Mach-O's flat-address n_value) the FINAL linker binds. Same format-blind `AssembledModule.dataItems` producer path as ELF/Mach-O. D-LK-RELRO-CONST-DATA-RELOCATABLE (PE arm): a CONST global carrying LOAD-TIME relocations (a const function-pointer table / `int *const p = &x;` — sqlite's VFS method tables + `aSyscall[]`) lands in `relro` = a SECOND `.rdata`-named section (see the relro row) and the writer emits its OWN IMAGE_RELOCATION table (IMAGE_REL_AMD64_ADDR64, addend IN the 8-byte slot bytes — COFF's in-place-addend convention; IMAGE_RELOCATION has no addend column); a reloc-bearing MUTABLE pointer global lands in `data`. TLS (`tdata`/`tbss`) stays UNDECLARED — the linker's acceptsDataSection gate rejects it loud (the .obj walker emits no `.tls`/IMAGE_TLS_DIRECTORY64 machinery; that is the PE EXEC arm, D-CSUBSET-THREAD-LOCAL C3).",
+  "supportedDataSections": ["rodata", "data", "bss", "relro"],
 
   "pe": {
     "$comment": "IMAGE_FILE_HEADER identity. machine = IMAGE_FILE_MACHINE_AMD64 (0x8664). characteristics = 0 — relocatable .obj carries no file-level flags (link.exe sets image-level flags when producing the .exe/.dll).",
@@ -30,6 +35,42 @@
       "kind": "text",
       "name": ".text",
       "type": 1615855648,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE (PE arm, c148): read-only initialized data (string literals, const globals WITHOUT relocations) — exactly where cl.exe places it in a .obj. Characteristics (`type`) = IMAGE_SCN_CNT_INITIALIZED_DATA (0x40) | IMAGE_SCN_MEM_READ (0x40000000) = 0x40000040 = 1073741888 — DELIBERATELY WITHOUT IMAGE_SCN_ALIGN_*BYTES bits: the .obj walker ORs in the align class computed from the H1-raised layout alignment (max of every member item's alignment) at emit time, exactly the per-contribution align class cl.exe itself stamps (e.g. an 8-byte-aligned .rdata contribution carries 0x40400040). addrAlign MUST stay 0 (validate-rejected on PE rows — alignment lives in Characteristics, never the substrate field).",
+      "kind": "rodata",
+      "name": ".rdata",
+      "type": 1073741888,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE (PE arm, c148): writable initialized data (mutable globals, `int counter = 7;`). Characteristics (`type`) = IMAGE_SCN_CNT_INITIALIZED_DATA (0x40) | IMAGE_SCN_MEM_READ (0x40000000) | IMAGE_SCN_MEM_WRITE (0x80000000) = 0xC0000040 = 3221225536 — no align bits (walker-computed; see the rodata row). A reloc-bearing MUTABLE pointer global also lands here and the walker emits its IMAGE_RELOCATION records against this section (VirtualAddress = the slot's section-relative offset).",
+      "kind": "data",
+      "name": ".data",
+      "type": 3221225536,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE (PE arm, c148): zero-initialized data (tentative globals `int g;` — DSS commits tentatives to a real `.bss` definition, the gcc -fno-common shape, NOT the MSVC COMMON-symbol form). Characteristics (`type`) = IMAGE_SCN_CNT_UNINITIALIZED_DATA (0x80) | IMAGE_SCN_MEM_READ (0x40000000) | IMAGE_SCN_MEM_WRITE (0x80000000) = 0xC0000080 = 3221225600 — no align bits (walker-computed). COFF .obj header convention (cl.exe-witnessed, dumpbin-confirmed): the bss span lives in SizeOfRawData with PointerToRawData = 0 and VirtualSize = 0 — the FILE stores no bytes; the final linker reserves SizeOfRawData zero-fill bytes.",
+      "kind": "bss",
+      "name": ".bss",
+      "type": 3221225600,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-RELRO-CONST-DATA-RELOCATABLE (PE arm, c148): relocated-read-only const data — a CONST global carrying LOAD-TIME relocations (a const function-pointer table / `int *const p = &x;`). COFF has NO relro segment concept: MSVC places reloc-bearing const data in read-only `.rdata` and the LINKED image base-relocates it (the loader applies IMAGE_REL_BASED_DIR64 into the slot before the page is mapped read-only) — cl.exe-witnessed: `int (*const table[])(void)` lands in `.rdata` (0x40400040) with ADDR64 relocations. So this row is `.rdata`-CLASS under the SAME `.rdata` NAME but as its OWN row → the walker emits it as a SECOND `.rdata` section header, which COFF explicitly permits (link.exe merges same-name contributions into one image section). A distinct row (rather than folding into the rodata row) keeps the .o discipline the ELF `.data.rel.ro` / Mach-O `__DATA,__const` mirrors use: reloc-bearing rodata stays fail-loud while relro items get their own IMAGE_RELOCATION table. Characteristics (`type`) = 0x40000040 = 1073741888 — identical class to the rodata row, no align bits (walker-computed).",
+      "kind": "relro",
+      "name": ".rdata",
+      "type": 1073741888,
       "flags": 0,
       "addrAlign": 0,
       "entrySize": 0
