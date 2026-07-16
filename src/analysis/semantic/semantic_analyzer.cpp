@@ -1580,15 +1580,29 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // Config-driven; empty/invalid for a language without typeof (no effect).
         std::array<RuleId, 2> const typeofOpaqueRules{cfg.typeofTypeRule,
                                                       cfg.typeofValueRule};
+        // D-CSUBSET-ATOMIC (FC17.9(d) 1b): `_Atomic` is scanned in EXACT PARALLEL to
+        // `volatile` (the `atomicMarker` semantics token) — a base-position `_Atomic`
+        // BEFORE the first star qualifies the base pointee (`_Atomic int *` =>
+        // Ptr<atomicQualified(int)>). The scan is position-aware identically (an
+        // `_Atomic` after the last star is the pointer object's, threaded by the
+        // declarator's pointer-layer loop, so it breaks at the star run just like
+        // volatile). Both bits compose in the shared qualifier skin (cycle 1a).
         bool baseIsVolatile = false;
-        if (cfg.volatileMarker.has_value()) {
+        bool baseIsAtomic   = false;
+        if (cfg.volatileMarker.has_value() || cfg.atomicMarker.has_value()) {
             for (auto child : kids) {
                 if (isPointerStar(child)) {
-                    break;   // reached the star run — a later volatile is the pointer object's
+                    break;   // reached the star run — a later qualifier is the pointer object's
                 }
-                if (subtreeContainsToken(tree, child, *cfg.volatileMarker,
-                                         &s.idx().declByRule, typeofOpaqueRules)) {
+                if (cfg.volatileMarker.has_value()
+                    && subtreeContainsToken(tree, child, *cfg.volatileMarker,
+                                            &s.idx().declByRule, typeofOpaqueRules)) {
                     baseIsVolatile = true;
+                }
+                if (cfg.atomicMarker.has_value()
+                    && subtreeContainsToken(tree, child, *cfg.atomicMarker,
+                                            &s.idx().declByRule, typeofOpaqueRules)) {
+                    baseIsAtomic = true;
                 }
             }
         }
@@ -1638,6 +1652,32 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             // scalar / split-form head); the caller's declarator adds any pointers.
             if (baseIsVolatile)
                 inner = s.lattice.interner().volatileQualified(inner);
+            // D-CSUBSET-ATOMIC (FC17.9(d) 1b): wrap the base in the Atomic bit too.
+            // `qualified` merges bits, so `_Atomic volatile int` becomes ONE {V,A}
+            // skin regardless of which wrap runs first (order-independent).
+            if (baseIsAtomic) {
+                // D-CSUBSET-ATOMIC-NONLOCKFREE: `_Atomic` is supported this cycle ONLY
+                // on a naturally-aligned lock-free SCALAR. On an aggregate or a wide
+                // scalar (`isByValueClass`), a copy decomposes to plain field/byte
+                // Load/Store AFTER `computeLayout` strips this TRANSPARENT skin — the
+                // type-based atomic-access belt then sees only plain types, so it would
+                // be a SILENT non-atomic access (C11 7.17.5). FAIL LOUD + do NOT wrap
+                // (never let an atomic-qualified non-lock-free type reach codegen); the
+                // lock-table / large-atomic path is deferred beyond atomic cycle-1.
+                if (isByValueClass(s.lattice.interner(), inner)) {
+                    if (emitOnMiss) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::S_AtomicNonLockFree;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.buffer   = tree.source().id();
+                        d.span     = tree.span(node);
+                        d.actual   = std::string{tree.text(node)};
+                        s.reporter.report(std::move(d));
+                    }
+                } else {
+                    inner = s.lattice.interner().atomicQualified(inner);
+                }
+            }
             for (std::uint32_t i = 0; i < ptrDepth; ++i)
                 inner = s.lattice.interner().pointer(inner);
             // c26: fold the abstract declarator (fn-ptr / array type-name) onto the
@@ -3626,6 +3666,16 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                 && subtreeContainsToken(tree, c, *cfg.volatileMarker,
                                         &s.idx().declByRule)) {
                 t = s.lattice.interner().volatileQualified(t);
+            }
+            // D-CSUBSET-ATOMIC (FC17.9(d) 1b): the EAST `_Atomic` — an `atomicMarker`
+            // ptrQualifier INSIDE this pointer layer (after the star, `int * _Atomic p`)
+            // makes THIS pointer OBJECT atomic ⇒ atomicQualified(Ptr<...>), the exact
+            // mirror of the east-volatile wrap above. Composes with a co-present east
+            // volatile in the one shared skin (cycle 1a bit-merge).
+            if (cfg.atomicMarker.has_value()
+                && subtreeContainsToken(tree, c, *cfg.atomicMarker,
+                                        &s.idx().declByRule)) {
+                t = s.lattice.interner().atomicQualified(t);
             }
             continue;
         }

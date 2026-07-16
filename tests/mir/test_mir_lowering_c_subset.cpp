@@ -188,6 +188,58 @@ TEST(MirLoweringCSubset, StraightLineAddFunction) {
     EXPECT_EQ(retOps[0], sum);
 }
 
+// FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): a scalar `_Atomic` access lowers to
+// AtomicStore/AtomicLoad (seq_cst — payload 5), NEVER a plain Store/Load. The MIR
+// probe: `_Atomic int x; x = 42; return x;`. RED-ON-DISABLE: revert the
+// emitScalarLoad/emitScalarStore funnel → the store/load stay plain `Store`/`Load`
+// (and the MIR verifier's atomic belt would then reject them) — this test flips
+// (sees plain ops, no atomic ops).
+TEST(MirLoweringCSubset, AtomicScalarAccessLowersToAtomicLoadStore) {
+    auto L = lowerCSubset(
+        "int g;\n"
+        "int main(void) { _Atomic int x; x = 42; return x; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    bool sawAtomicStore = false, sawAtomicLoad = false;
+    bool sawPlainStore = false, sawPlainLoad = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                switch (m.instOpcode(id)) {
+                    case MirOpcode::AtomicStore:
+                        sawAtomicStore = true;
+                        EXPECT_EQ(m.instPayload(id), 5u)   // seq_cst
+                            << "atomic_store must carry the seq_cst memory order";
+                        break;
+                    case MirOpcode::AtomicLoad:
+                        sawAtomicLoad = true;
+                        EXPECT_EQ(m.instPayload(id), 5u)   // seq_cst
+                            << "atomic_load must carry the seq_cst memory order";
+                        break;
+                    case MirOpcode::Store: sawPlainStore = true; break;
+                    case MirOpcode::Load:  sawPlainLoad  = true; break;
+                    default: break;
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(sawAtomicStore) << "`x = 42` must lower to atomic_store, not store";
+    EXPECT_TRUE(sawAtomicLoad)  << "`return x` must lower to atomic_load, not load";
+    // The funnel REPLACES the plain ops — no plain Store/Load of `x` survives.
+    EXPECT_FALSE(sawPlainStore) << "the atomic assignment must not emit a plain store";
+    EXPECT_FALSE(sawPlainLoad)  << "the atomic read must not emit a plain load";
+}
+
 // D-CSUBSET-ENUM-INT-CONVERSION (FC8): a bare enumerator lowers to a Const of its
 // value through HIR→MIR. RED-ON-DISABLE (and red TODAY before the A1 Ref→Const
 // fold): an enumerator Ref has no storage / SSA binding, so without the fold it

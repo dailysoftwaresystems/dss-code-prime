@@ -8926,6 +8926,31 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── atomicMarker (FC17.9(d) cycle 1b, D-CSUBSET-ATOMIC) ──
+            // An OPTIONAL token: the language's `_Atomic`-class type qualifier. The
+            // LIVE driver of the atomic qualifier wrap — read by the type-position
+            // resolver's CO-LOCATED base arm + declaratorDeclaredType's east arm to
+            // wrap the resolved type via `atomicQualified`, EXACTLY parallel to
+            // `volatileMarker` above. Same validation shape.
+            if (sem.contains("atomicMarker")) {
+                json const& tok = sem.at("atomicMarker");
+                if (!tok.is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/atomicMarker",
+                              "'atomicMarker' must be a string");
+                } else {
+                    auto const name = tok.get<std::string>();
+                    if (!data.schemaTokens->contains(name)) {
+                        coll.emit(DiagnosticCode::C_UnknownToken,
+                                  "/semantics/atomicMarker",
+                                  std::format("'atomicMarker' references unknown "
+                                              "token kind '{}'", name));
+                    } else {
+                        cfg.atomicMarker = data.schemaTokens->find(name);
+                    }
+                }
+            }
+
             // FF6 Slice 2 + audit fold (2026-06-02): per-language
             // `externLibraryByFormat` — runtime library identity
             // per ObjectFormatKind for source-declared externs.

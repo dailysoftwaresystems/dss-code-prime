@@ -502,6 +502,51 @@ struct Lowerer {
                                                         : MirInstFlags::None;
     }
 
+    // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the C11 memory_order carried in an
+    // AtomicLoad/AtomicStore `payload` (relaxed=0..seq_cst=5). A plain `_Atomic`
+    // access is seq_cst — the strongest, default order (C11 6.5.2.4/7.17.3).
+    static constexpr std::uint32_t kAtomicOrderSeqCst = 5;
+
+    // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the SINGLE scalar-access chokepoint
+    // that decides atomic-vs-plain. Every scalar Load emit routes through here so
+    // an `_Atomic`-qualified access lowers to `AtomicLoad` (seq_cst) BY
+    // CONSTRUCTION, and a plain access keeps the EXACT c21|c27 volatile-flag
+    // expression it always used. `accessedTy` is the value type read (the Load's
+    // result type); `node` is the HIR access node (drives the c21 object-volatile
+    // flag). A missed funnel site is caught LOUD by the MIR verifier's atomic belt
+    // (I_AtomicAccessNotLowered) — never a silent non-atomic access.
+    [[nodiscard]] MirInstId emitScalarLoad(std::span<MirInstId const> ptrOps,
+                                           TypeId accessedTy, HirNodeId node) {
+        if (interner.isAtomicQualified(accessedTy)) {
+            // `_Atomic` (incl. `_Atomic volatile`): AtomicLoad ALONE — its
+            // hasSideEffects + opcodeClobbersMemory membership subsume volatile's
+            // no-elide / no-CSE / no-hoist, so no Volatile flag is threaded.
+            return mir.addInst(MirOpcode::AtomicLoad, ptrOps, accessedTy,
+                               /*payload=*/kAtomicOrderSeqCst, MirInstFlags::None);
+        }
+        return mir.addInst(MirOpcode::Load, ptrOps, accessedTy, /*payload=*/0,
+                           volatileFlagFor(node) | volatileFlagForType(accessedTy));
+    }
+
+    // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the Store twin of `emitScalarLoad`.
+    // `storeOps` is the plain-Store operand pair {value, ptr} (AtomicStore reuses
+    // that exact order — a drop-in). `accessedTy` is the lvalue's type (the store
+    // target's declared/pointee type); `node` is the target HIR node. An `_Atomic`
+    // target lowers to `AtomicStore` (seq_cst); a plain target keeps the exact
+    // c21|c27 volatile flag. NOTE: object INITIALIZATION stores (C11 7.17.2.1 —
+    // init is not itself atomic) do NOT route here; they stay plain `Store` and are
+    // marked `AtomicInitExempt` so the verifier belt spares them.
+    void emitScalarStore(std::span<MirInstId const> storeOps, TypeId accessedTy,
+                         HirNodeId node) {
+        if (interner.isAtomicQualified(accessedTy)) {
+            mir.addInst(MirOpcode::AtomicStore, storeOps, InvalidType,
+                        /*payload=*/kAtomicOrderSeqCst, MirInstFlags::None);
+            return;
+        }
+        mir.addInst(MirOpcode::Store, storeOps, InvalidType, /*payload=*/0,
+                    volatileFlagFor(node) | volatileFlagForType(accessedTy));
+    }
+
     // Map a HIR core operator + operand TypeKind to a MIR opcode. Integer
     // signed/unsigned is type-driven (HirOpKind has only `Div`/`Rem`/`Shr`,
     // not separate signed/unsigned forms — same convention as type_lattice).
@@ -1965,9 +2010,9 @@ struct Lowerer {
                     // rvalue Load carries the flag. c21 via the node's VolatileAttr
                     // (object-volatile symbol); c27 also OR's the value type `t`
                     // (top-level VolatileQual) so the two halves agree by
-                    // construction.
-                    return mir.addInst(MirOpcode::Load, ops, t, /*payload=*/0,
-                                       volatileFlagFor(node) | volatileFlagForType(t));
+                    // construction. FC17.9(d): an `_Atomic` local's Load becomes
+                    // AtomicLoad via the scalar-access chokepoint.
+                    return emitScalarLoad(ops, t, node);
                 }
                 if (auto it = symbolToValue.find(sym); it != symbolToValue.end()) {
                     return it->second;
@@ -2015,9 +2060,9 @@ struct Lowerer {
                     std::array<MirInstId, 1> ops{addr};
                     // c21/c27: a Ref to a `volatile` global — its rvalue Load
                     // carries the flag (c21 VolatileAttr OR c27 value-type
-                    // VolatileQual).
-                    return mir.addInst(MirOpcode::Load, ops, t, /*payload=*/0,
-                                       volatileFlagFor(node) | volatileFlagForType(t));
+                    // VolatileQual). FC17.9(d): an `_Atomic` global's Load becomes
+                    // AtomicLoad via the scalar-access chokepoint.
+                    return emitScalarLoad(ops, t, node);
                 }
                 if (functionSymbols.contains(sym)) {
                     return mir.addGlobalAddr(SymbolId{sym}, t);
@@ -2447,14 +2492,18 @@ struct Lowerer {
                 MirInstFlags const vf =
                     volatileFlagFor(node) | volatileFlagForType(t);
                 if (BitFieldPlacement const* bf = bitfieldPlacementOf(node)) {
+                    // Bit-field read-modify-write of the allocation unit stays a
+                    // plain Load (an `_Atomic` bit-field is not a supported form;
+                    // were `t` ever atomic here the verifier belt fails loud).
                     std::array<MirInstId, 1> lo{ptr};
                     MirInstId const unit = mir.addInst(MirOpcode::Load, lo, t,
                                                        /*payload=*/0, vf);
                     if (!unit.valid()) return InvalidMirInst;
                     return emitBitfieldExtract(unit, *bf, t);
                 }
+                // FC17.9(d): an `_Atomic` member/element read becomes AtomicLoad.
                 std::array<MirInstId, 1> ops{ptr};
-                return mir.addInst(MirOpcode::Load, ops, t, /*payload=*/0, vf);
+                return emitScalarLoad(ops, t, node);
             }
             case HirKind::Cast: {
                 // children: [operand]. The HIR node's typeId is the target
@@ -2888,10 +2937,10 @@ struct Lowerer {
             return mir.addInst(MirOpcode::Gep, gep,
                                interner.pointer(elems[0]));
         }
+        // FC17.9(d): a deref of a `_Atomic`-pointee pointer (`*p`, `p[i]`) becomes
+        // AtomicLoad via the scalar-access chokepoint (else the exact c21|c27 flag).
         std::array<MirInstId, 1> ops{ptr};
-        MirInstFlags const vf =
-            volatileFlagFor(node) | volatileFlagForType(pointeeTy);
-        return mir.addInst(MirOpcode::Load, ops, pointeeTy, /*payload=*/0, vf);
+        return emitScalarLoad(ops, pointeeTy, node);
     }
 
     // Scalar-Cast epilogue (operand already lowered): the array→pointer DECAY
@@ -8844,8 +8893,11 @@ struct Lowerer {
                         // carries the flag — via the VarDecl object annotation (c21)
                         // OR the declared type's VolatileQual (c27, e.g. a `vint x`
                         // typedef = `volatile int`). OR both so neither is missed.
-                        mir.addInst(MirOpcode::Store, ops, InvalidType, /*payload=*/0,
-                                    volatileFlagFor(node) | volatileFlagForType(ty));
+                        // FC17.9(d): an `_Atomic` local's scalar init becomes
+                        // AtomicStore (harmless-if-stronger on a fresh, unshared
+                        // slot; keeps the scalar-store funnel uniform — the DISTINCT
+                        // param/global runtime-init paths stay plain + belt-exempt).
+                        emitScalarStore(ops, ty, node);
                     }
                 }
                 return true;
@@ -8906,8 +8958,10 @@ struct Lowerer {
                 if (BitFieldPlacement const* bf = bitfieldPlacementOf(targetN)) {
                     return emitBitfieldInsert(ptr, rhs, *bf, hir.typeId(targetN), vf);
                 }
+                // FC17.9(d): an `_Atomic` scalar assignment becomes AtomicStore via
+                // the scalar-access chokepoint (else the exact c21|c27 flag `vf`).
                 std::array<MirInstId, 2> ops{rhs, ptr};
-                mir.addInst(MirOpcode::Store, ops, InvalidType, /*payload=*/0, vf);
+                emitScalarStore(ops, hir.typeId(targetN), targetN);
                 return true;
             }
             case HirKind::IfStmt: {
@@ -9792,8 +9846,12 @@ struct Lowerer {
                 // store carries the flag (the param VarDecl node `p` was annotated
                 // at CST→HIR's `lowerVarLikeInto`, same path as a body local), so
                 // the read side (flagged at the Ref) and the init store agree.
+                // FC17.9(d) (D-CSUBSET-ATOMIC): an `_Atomic` param's incoming-arg→slot
+                // reception is INITIALIZATION (C11 7.17.2.1 — not itself atomic), so
+                // it stays a plain Store, marked AtomicInitExempt so the verifier's
+                // atomic belt spares it despite the atomic-qualified slot pointee.
                 mir.addInst(MirOpcode::Store, ops, InvalidType, /*payload=*/0,
-                            volatileFlagFor(p));
+                            volatileFlagFor(p) | MirInstFlags::AtomicInitExempt);
             } else {
                 symbolToValue[sym.v] = arg;
             }
@@ -10933,9 +10991,14 @@ struct Lowerer {
                 std::array<MirInstId, 2> ops{val, addr};
                 // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a `volatile` global's
                 // runtime load-time init store carries the flag.
+                // FC17.9(d) (D-CSUBSET-ATOMIC): an `_Atomic` global's load-time
+                // runtime init is INITIALIZATION (C11 7.17.2.1 — not itself atomic),
+                // so it stays a plain Store, marked AtomicInitExempt so the verifier's
+                // atomic belt spares it despite the atomic-qualified global pointee.
                 mir.addInst(MirOpcode::Store, ops, InvalidType, /*payload=*/0,
-                            pg.isVolatile ? MirInstFlags::Volatile
-                                          : MirInstFlags::None);
+                            (pg.isVolatile ? MirInstFlags::Volatile
+                                           : MirInstFlags::None)
+                                | MirInstFlags::AtomicInitExempt);
             }
             if (!mir.openBlockHasTerminator()) mir.addReturn();
         }

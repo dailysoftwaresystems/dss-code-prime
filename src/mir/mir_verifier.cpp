@@ -77,6 +77,7 @@ bool MirVerifier::verify(DiagnosticReporter& reporter) const {
     // use-dom-def scan computes, so they share one computation.
     checkDomination(reporter);
     checkTypeInvariants(reporter);
+    checkAtomicAccessLowered(reporter);
     if (reporter.hitCap()) return false;
     return reporter.errorCount() == errorsBefore;
 }
@@ -856,6 +857,48 @@ void MirVerifier::checkTypeInvariants(DiagnosticReporter& reporter) const {
             }
         }
     }
+}
+
+void MirVerifier::checkAtomicAccessLowered(DiagnosticReporter& reporter) const {
+    // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the atomic-lowering belt. Needs the
+    // interner to decode `isAtomicQualified`; without one (a raw test fixture) the
+    // rule is skipped exactly like the other interner-gated checks.
+    if (interner_ == nullptr) return;
+    forEachInst(mir_, [&](MirInstId id) {
+        MirOpcode const op = mir_.instOpcode(id);
+        if (op == MirOpcode::Load) {
+            // A Load's ACCESSED type IS its result type. Atomic ⇒ it should have
+            // funnelled to AtomicLoad; a surviving plain Load is a missed site.
+            TypeId const acc = mir_.instType(id);
+            if (acc.valid() && interner_->isAtomicQualified(acc)) {
+                reportInst(reporter, DiagnosticCode::I_AtomicAccessNotLowered, id,
+                    "plain `load` of an _Atomic-qualified type — must lower to "
+                    "`atomic_load` (a missed FC17.9(d) scalar-access funnel site; "
+                    "a plain load would silently perform a NON-atomic read)");
+            }
+        } else if (op == MirOpcode::Store) {
+            // Object-INITIALIZATION stores are the ONE exemption (C11 7.17.2.1 —
+            // atomic initialization is not itself atomic); they stay plain by
+            // design and carry AtomicInitExempt.
+            if (has(mir_.instFlags(id), MirInstFlags::AtomicInitExempt)) return;
+            // A Store has NO result type; its ACCESSED type is the POINTEE of its
+            // address operand. Store operand order is [value, ptr] (mir_opcode.hpp),
+            // so operand[1] is the address.
+            auto const ops = mir_.instOperands(id);
+            if (ops.size() != 2) return;
+            TypeId const addrTy = mir_.instType(ops[1]);
+            if (!addrTy.valid() || interner_->kind(addrTy) != TypeKind::Ptr) return;
+            auto const pointee = interner_->operands(addrTy);
+            if (pointee.empty() || !pointee[0].valid()) return;
+            if (interner_->isAtomicQualified(pointee[0])) {
+                reportInst(reporter, DiagnosticCode::I_AtomicAccessNotLowered, id,
+                    "plain `store` to an _Atomic-qualified pointee — must lower to "
+                    "`atomic_store` (a missed FC17.9(d) scalar-access funnel site; "
+                    "a plain store would silently perform a NON-atomic write). An "
+                    "initialization store must carry MirInstFlags::AtomicInitExempt");
+            }
+        }
+    });
 }
 
 } // namespace dss

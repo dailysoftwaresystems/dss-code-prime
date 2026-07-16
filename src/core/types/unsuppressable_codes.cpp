@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 119> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 120> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -191,6 +191,13 @@ constexpr std::array<DiagnosticCode, 119> kUnsuppressableCodes{{
     // zero payload; a fixed alloca carries none). A member like every I_* verifier
     // invariant — a suppressed violation would let a mis-sized stack slot sail past.
     DiagnosticCode::I_VlaAllocaOperandInvalid,
+    // I_AtomicAccessNotLowered (FC17.9(d) 1b, D-CSUBSET-ATOMIC): the atomic-lowering
+    // belt — a plain Load/Store still carrying an `_Atomic`-qualified accessed type
+    // is a missed funnel site that would SILENTLY perform a non-atomic access. A
+    // member like every I_* verifier invariant; a suppressed violation would let a
+    // non-atomic access to atomic memory sail past (the exact miscompile `_Atomic`
+    // exists to prevent).
+    DiagnosticCode::I_AtomicAccessNotLowered,
 
     // K_* linker band — image refused / undefined extern + the LK10
     // image-write contract codes. Suppressing any K_ImageWrite* code

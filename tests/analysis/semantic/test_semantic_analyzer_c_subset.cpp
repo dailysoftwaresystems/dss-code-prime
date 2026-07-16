@@ -4358,6 +4358,143 @@ TEST(SemanticAnalyzerCSubset, PreStarVolatileDoublePtrCastBuildsNestedPointee) {
                 ? "" : model.diagnostics().all()[0].actual);
 }
 
+// ── FC17.9(d) cycle 1b: `_Atomic` type qualifier (D-CSUBSET-ATOMIC) ──────────
+//
+// PHASE A pin: `_Atomic int x;` must PARSE (no P0001) and resolve to a type whose
+// raw qualifier mask carries the Atomic bit — the front-end acceptance gate. The
+// skin is TRANSPARENT, so `kind()` still sees the material I32; only the RAW
+// `isAtomicQualified` query observes the qualifier. Volatile is NOT set (the atomic
+// scan must not over-fire).
+TEST(SemanticAnalyzerCSubset, AtomicQualifierResolvesAtomicQualified) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Atomic int x;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->type.valid());
+    EXPECT_TRUE(ti.isAtomicQualified(x->type))
+        << "_Atomic int resolves to atomicQualified(int)";
+    EXPECT_FALSE(ti.isVolatileQualified(x->type))
+        << "a plain _Atomic must NOT set the Volatile bit";
+    EXPECT_EQ(ti.kind(x->type), TypeKind::I32)
+        << "the qualifier skin is transparent — the material type is bare int";
+}
+
+// D-CSUBSET-ATOMIC-NONLOCKFREE (code-audit CRITICAL C1): `_Atomic` on an AGGREGATE
+// (struct/union/by-value array) must FAIL LOUD at type resolution. The qualifier is a
+// TRANSPARENT skin, so a wrapped aggregate would reach codegen, `computeLayout` strips
+// the skin, and the copy decomposes to plain field Load/Store the type-based belt cannot
+// see — a SILENT non-atomic access. RED-ON-DISABLE: remove the `isByValueClass` reject at
+// the base-position `_Atomic` wrap and this count drops to 0 (the aggregate is silently
+// atomic-wrapped, then non-atomically copied).
+TEST(SemanticAnalyzerCSubset, AtomicOnAggregateFailsLoudNonLockFree) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int a; int b; };\n"
+        "_Atomic struct S x;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AtomicNonLockFree), 1u)
+        << "_Atomic on an aggregate must fail loud (non-lock-free — deferred)";
+}
+
+// The NEGATIVE that keeps the gate honest: a lock-free SCALAR `_Atomic` must NOT be
+// rejected (it is the supported case — it resolves to atomicQualified + lowers to the
+// atomic opcodes). Without it, a too-broad reject would silently break scalar atomics.
+TEST(SemanticAnalyzerCSubset, AtomicOnScalarNotRejectedNonLockFree) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Atomic int x;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AtomicNonLockFree), 0u)
+        << "a lock-free scalar _Atomic must be accepted (the supported case)";
+}
+
+// The user-named combination: `_Atomic volatile int` must set BOTH bits in the ONE
+// shared skin (cycle 1a's `qualified` merges {V}+{A}). Order-independent: the
+// reverse spelling `volatile _Atomic int` resolves to the SAME interned type.
+TEST(SemanticAnalyzerCSubset, AtomicVolatileSetsBothQualifierBits) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Atomic volatile int a;\n"
+        "volatile _Atomic int b;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = findSym(model, "a");
+    ASSERT_NE(a, nullptr);
+    ASSERT_TRUE(a->type.valid());
+    EXPECT_TRUE(ti.isAtomicQualified(a->type))
+        << "_Atomic volatile int carries the Atomic bit";
+    EXPECT_TRUE(ti.isVolatileQualified(a->type))
+        << "_Atomic volatile int ALSO carries the Volatile bit (one {V,A} skin)";
+    EXPECT_EQ(ti.kind(a->type), TypeKind::I32)
+        << "transparent skin — material int";
+    SymbolRecord const* b = findSym(model, "b");
+    ASSERT_NE(b, nullptr);
+    ASSERT_TRUE(b->type.valid());
+    EXPECT_EQ(a->type, b->type)
+        << "`_Atomic volatile int` and `volatile _Atomic int` intern to the SAME "
+           "type — the bitset merge is order-independent";
+}
+
+// Red-on-disable guard for bit INDEPENDENCE: plain `volatile int` must carry ONLY
+// the Volatile bit, never Atomic — proves the new atomic scan/wrap is a DISTINCT
+// bit and does not leak onto volatile. (Delete the atomic wrap and this stays
+// green; but paired with AtomicQualifierResolvesAtomicQualified it pins that the
+// two qualifiers are separate — a volatile-tags-atomic regression fails here.)
+TEST(SemanticAnalyzerCSubset, PlainVolatileIsNotAtomicQualified) {
+    auto cu = buildShippedUnit("c-subset", {
+        "volatile int v;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* v = findSym(model, "v");
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(v->type.valid());
+    EXPECT_TRUE(ti.isVolatileQualified(v->type));
+    EXPECT_FALSE(ti.isAtomicQualified(v->type))
+        << "volatile alone must NOT carry the Atomic bit";
+}
+
+// Both resolver arms: a WEST `_Atomic` qualifies the POINTEE (`_Atomic int *p` =>
+// Ptr<atomicQualified(int)>, pointer NOT atomic); an EAST `_Atomic` qualifies the
+// POINTER OBJECT (`int * _Atomic q` => atomicQualified(Ptr<int>), pointee NOT
+// atomic). This exercises resolveTypeNodeImpl's base arm AND declaratorDeclaredType's
+// pointer-layer arm — the volatile-pointee/pointer-object mirror.
+TEST(SemanticAnalyzerCSubset, AtomicPointeeVsPointerObject) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Atomic int *p;\n"
+        "int * _Atomic q;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* p = findSym(model, "p");
+    ASSERT_NE(p, nullptr);
+    ASSERT_TRUE(p->type.valid());
+    ASSERT_EQ(ti.kind(p->type), TypeKind::Ptr);
+    EXPECT_FALSE(ti.isAtomicQualified(p->type))
+        << "`_Atomic int *p` — the POINTER object is not atomic";
+    EXPECT_TRUE(ti.isAtomicQualified(ti.operands(p->type)[0]))
+        << "`_Atomic int *p` — the POINTEE is atomic (Ptr<atomicQualified(int)>)";
+    SymbolRecord const* q = findSym(model, "q");
+    ASSERT_NE(q, nullptr);
+    ASSERT_TRUE(q->type.valid());
+    ASSERT_EQ(ti.kind(q->type), TypeKind::Ptr);
+    EXPECT_TRUE(ti.isAtomicQualified(q->type))
+        << "`int * _Atomic q` — the POINTER object is atomic (atomicQualified(Ptr<int>))";
+    EXPECT_FALSE(ti.isAtomicQualified(ti.operands(q->type)[0]))
+        << "`int * _Atomic q` — the POINTEE is not atomic";
+}
+
 // Pointer casts: ptr↔ptr, int→ptr (the null-constant idiom and beyond),
 // and ptr→int are all in the explicit-cast matrix (mapCast: Bitcast /
 // IntToPtr / PtrToInt). Zero diagnostics.

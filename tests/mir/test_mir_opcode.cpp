@@ -113,6 +113,45 @@ TEST(MirOpcode, SideEffects) {
     EXPECT_FALSE(opcodeInfo(MirOpcode::Load).hasSideEffects);
 }
 
+// FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the scalar atomic load/store pair. Their
+// shape is what makes the 4 optimizer barriers hold BY CONSTRUCTION (no marker
+// flag, no pass edits): hasSideEffects=true is READ by CSE's isCseCandidateOpcode
+// (false ⇒ never CSE'd), LICM's isLicmCandidateOpcode (false ⇒ never hoisted), and
+// DCE's isSideEffectRoot (true ⇒ kept live); opcodeClobbersMemory membership is
+// READ by the CSE/LICM Load-motion clobber walk (a seq_cst atomic op fences plain
+// Load/Store motion across it). mem2reg only rewrites Load/Store opcodes + marks an
+// alloca reached by any OTHER opcode non-promotable, so an atomic-accessed local is
+// never promoted. This test pins the exact table facts those predicates consume —
+// RED-ON-DISABLE: flip either row's hasSideEffects to false, or drop either from
+// opcodeClobbersMemory, and the corresponding EXPECT fails.
+TEST(MirOpcode, AtomicLoadStoreAreOrderedSideEffectingBarriers) {
+    // AtomicLoad: 1 operand [ptr], a Value result, mnemonic "atomic_load".
+    EXPECT_EQ(opcodeInfo(MirOpcode::AtomicLoad).minOperands, 1);
+    EXPECT_EQ(opcodeInfo(MirOpcode::AtomicLoad).maxOperands, 1);
+    EXPECT_EQ(resultRule(MirOpcode::AtomicLoad), MirResultRule::Value);
+    EXPECT_EQ(mnemonic(MirOpcode::AtomicLoad), "atomic_load");
+    // AtomicStore: 2 operands [value, ptr], NO result, mnemonic "atomic_store".
+    EXPECT_EQ(opcodeInfo(MirOpcode::AtomicStore).minOperands, 2);
+    EXPECT_EQ(opcodeInfo(MirOpcode::AtomicStore).maxOperands, 2);
+    EXPECT_EQ(resultRule(MirOpcode::AtomicStore), MirResultRule::None);
+    EXPECT_EQ(mnemonic(MirOpcode::AtomicStore), "atomic_store");
+
+    // hasSideEffects — the DCE-liveness / CSE-exclusion / LICM-exclusion axis.
+    EXPECT_TRUE(opcodeInfo(MirOpcode::AtomicLoad).hasSideEffects);
+    EXPECT_TRUE(opcodeInfo(MirOpcode::AtomicStore).hasSideEffects);
+    // opcodeClobbersMemory — the Load-motion fence axis (a full seq_cst barrier).
+    EXPECT_TRUE(opcodeClobbersMemory(MirOpcode::AtomicLoad));
+    EXPECT_TRUE(opcodeClobbersMemory(MirOpcode::AtomicStore));
+
+    // Neither is a terminator, phi, or commutative op.
+    EXPECT_FALSE(isTerminator(MirOpcode::AtomicLoad));
+    EXPECT_FALSE(isTerminator(MirOpcode::AtomicStore));
+    EXPECT_FALSE(isPhi(MirOpcode::AtomicLoad));
+    EXPECT_FALSE(isPhi(MirOpcode::AtomicStore));
+    EXPECT_FALSE(isCommutative(MirOpcode::AtomicLoad));
+    EXPECT_FALSE(isCommutative(MirOpcode::AtomicStore));
+}
+
 TEST(MirOpcode, InvalidSentinelHasImpossibleArity) {
     // The slot-0 sentinel's impossible {min=1, max=0} arity surfaces any
     // accidental use loudly (no real opcode can satisfy min > max).

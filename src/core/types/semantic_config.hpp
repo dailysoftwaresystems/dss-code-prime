@@ -1669,6 +1669,18 @@ struct DSS_EXPORT SemanticConfig {
     // volatile qualifier. Source-agnostic: the engine reads THIS, never a hardcoded
     // token name.
     std::optional<SchemaTokenId>    volatileMarker;
+    // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the language's `_Atomic`-class qualifier
+    // token (c-subset: `AtomicKeyword`). The LIVE driver of the atomic type-qualifier
+    // wrap, EXACTLY parallel to `volatileMarker` above and read at the SAME two resolver
+    // arms: a `atomicMarker` token BEFORE the first `pointerToken` qualifies the base
+    // (innermost pointee) ⇒ wrap base via `atomicQualified` so `_Atomic int *` =
+    // Ptr<atomicQualified(int)>; AFTER the last star (east) is the POINTER OBJECT's
+    // `_Atomic`, threaded by the declarator's pointer-layer loop as
+    // atomicQualified(Ptr<...>). Composes with `volatileMarker` in the ONE shared
+    // {volatile,atomic} bitset skin (cycle 1a `qualified` merges bits, order-independent).
+    // Absent (nullopt) ⇒ the language has no `_Atomic` qualifier. Source-agnostic: the
+    // engine reads THIS, never a hardcoded token name.
+    std::optional<SchemaTokenId>    atomicMarker;
     // FF6 Slice 2 + audit fold (2026-06-02): per-object-format
     // runtime library identity for SOURCE-DECLARED externs. The
     // source language's grammar emits a complete `extern int

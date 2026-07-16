@@ -873,6 +873,18 @@ enum class DiagnosticCode : std::uint16_t {
     // S_Vla* siblings.
     S_ArrayParamQualifierNonParameter = 0xE054,
 
+    // FC17.9(d) atomic 1b-i (D-CSUBSET-ATOMIC-NONLOCKFREE): `_Atomic` is applied to a
+    // type that is NOT a naturally-aligned lock-free SCALAR — an aggregate (struct /
+    // union / by-value array) or a scalar wider than the lock-free width (`_BitInt`>64,
+    // `__int128`, `long double`). Such a type needs a lock-table / large-atomic runtime
+    // path (C11 7.17.5) DEFERRED beyond atomic cycle-1. FAIL LOUD at type resolution
+    // rather than wrap it: the qualifier is a TRANSPARENT skin, so a wrapped aggregate
+    // would reach codegen, `computeLayout` would strip the skin, and the copy would
+    // decompose to plain non-atomic field/byte Load/Store that the type-based
+    // atomic-access belt cannot see — a SILENT non-atomic access. Same silent-
+    // miscompile-guard class as I_AtomicAccessNotLowered (the scalar belt).
+    S_AtomicNonLockFree = 0xE055,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-
@@ -1356,6 +1368,19 @@ enum class DiagnosticCode : std::uint16_t {
     // coverage claim (audit fix #6). Caught at every verify point (so an optimizer
     // transform that mis-pairs a save/restore reds AT the pass that did it).
     I_VlaStackRestorePairing       = 0xA017,
+    // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): a plain MIR `Load` or `Store` whose
+    // ACCESSED type is `_Atomic`-qualified — a MISSED atomic-lowering funnel site.
+    // Every scalar `_Atomic` access must lower to `AtomicLoad`/`AtomicStore` at the
+    // hir_to_mir scalar-access chokepoint; a plain Load/Store still carrying an
+    // atomic-qualified accessed type would SILENTLY perform a non-atomic access
+    // (the exact miscompile the `_Atomic` qualifier exists to prevent). The belt
+    // converts that silent gap into a LOUD failure at every verify point — for a
+    // current OR a future new emit site. Load's accessed type is its result type;
+    // Store's is the pointee of its address operand. Object-INITIALIZATION stores
+    // (MirInstFlags::AtomicInitExempt; C11 7.17.2.1 — init is not itself atomic)
+    // are the ONE exemption and do not trip it. Interner-gated (needs
+    // isAtomicQualified). Caught at every verify point (verify-after-every-pass).
+    I_AtomicAccessNotLowered       = 0xA018,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //

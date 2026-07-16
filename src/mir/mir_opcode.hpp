@@ -57,6 +57,26 @@ enum class MirOpcode : std::uint16_t {
     // hasSideEffects=TRUE (a store): DCE keeps it live even when the result is
     // unused, CSE never dedups two CASes, LICM never hoists one. NOT commutative.
     AtomicCas,
+    // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the `_Atomic` scalar lock-free
+    // load/store pair — a plain access to an `_Atomic`-qualified lvalue lowers to
+    // ONE of these (not a bare Load/Store), emitted at the hir_to_mir scalar-access
+    // chokepoint when `interner.isAtomicQualified(accessedTy)`. Both are ORDERED
+    // memory ops carrying the C11 memory_order in `payload` (relaxed=0, consume=1,
+    // acquire=2, release=3, acq_rel=4, seq_cst=5); a plain `_Atomic` access is
+    // seq_cst (payload=5). Like AtomicCas: hasSideEffects=TRUE and in the
+    // `opcodeClobbersMemory` positive list, so — BY CONSTRUCTION, with NO
+    // MirInstFlags marker and NO edit to the 4 opt passes — CSE never dedups them
+    // (isCseCandidateOpcode is false on hasSideEffects), DCE keeps them live
+    // (isSideEffectRoot), LICM never hoists them (isLicmCandidateOpcode false), and
+    // mem2reg never promotes/rewrites the alloca they touch (it only rewrites
+    // Load/Store, and an alloca reached by any other opcode is marked
+    // non-promotable). An atomic op is ALSO a full barrier to plain Load/Store
+    // motion across it (the AtomicCas / seq_cst-fence precedent). Until Phase C
+    // lowers them, mir_to_lir FAILS LOUD (unlowered opcode) on both.
+    //   AtomicLoad  — operand [ptr]; result = the loaded value (R::Value).
+    //   AtomicStore — operands [value, ptr]; NO result (R::None) — the plain-Store
+    //                 operand order, so the funnel is a drop-in for the Store emit.
+    AtomicLoad, AtomicStore,
     // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier -- an MSVC COMPILER
     // reordering fence. ZERO operands, produces NO value (R::None), emits NO
     // runtime instruction; hasSideEffects=TRUE so DCE keeps it and CSE/LICM
@@ -356,6 +376,13 @@ struct MirOpcodeInfo {
         case MirOpcode::Mul:  return {2, 2, 0, 0, R::Value, false, false, false, "mul"};
         case MirOpcode::UMulH: return {2, 2, 0, 0, R::Value, false, false, false, "umulh"};
         case MirOpcode::AtomicCas: return {3, 3, 0, 0, R::Value, false, true, false, "atomic_cas"};
+        // FC17.9(d) 1b (D-CSUBSET-ATOMIC): scalar atomic load/store. hasSideEffects
+        // =TRUE (kept live, never CSE'd, never hoisted) + both join opcodeClobbers-
+        // Memory below (a seq_cst fence to plain Load/Store motion). AtomicLoad: 1
+        // operand [ptr], a Value result. AtomicStore: 2 operands [value, ptr] (the
+        // plain-Store order), NO result. memory_order rides `payload` (seq_cst=5).
+        case MirOpcode::AtomicLoad:  return {1, 1, 0, 0, R::Value, false, true, false, "atomic_load"};
+        case MirOpcode::AtomicStore: return {2, 2, 0, 0, R::None,  false, true, false, "atomic_store"};
         // 0 operands, NO result (R::None), side-effecting (never DCE'd, never
         // CSE'd/hoisted) + in the opcodeClobbersMemory list (a fence to
         // Load/Store motion across it). Lowers to ZERO instructions.
@@ -597,6 +624,9 @@ struct MirOpcodeInfo {
 //   * Call /        — an opaque callee may write anything reachable
 //     IntrinsicCall
 //   * AtomicCas     — a store (the CAS write)
+//   * AtomicLoad /  — a seq_cst atomic access is a full ordering fence: a plain
+//     AtomicStore     Load/Store must never be reordered across it (AtomicStore
+//                     also writes memory). The AtomicCas precedent (D-CSUBSET-ATOMIC).
 //   * CompilerBarrier — an ordering FENCE: no write, but Load/Store motion
 //     across it is forbidden by contract (_ReadWriteBarrier)
 // Consumed by the Load-motion clobber walk (opt/analysis/mir_alias.hpp,
@@ -609,6 +639,10 @@ struct MirOpcodeInfo {
         case MirOpcode::Call:
         case MirOpcode::IntrinsicCall:
         case MirOpcode::AtomicCas:
+        // FC17.9(d) 1b (D-CSUBSET-ATOMIC): a seq_cst atomic access fences all
+        // plain Load/Store motion across it (AtomicStore also writes memory).
+        case MirOpcode::AtomicLoad:
+        case MirOpcode::AtomicStore:
         case MirOpcode::CompilerBarrier:
         // c115 SEH region boundaries: memory state must be exactly ordered at
         // SehTryBegin (the filter/handler observe fault-time memory — pre-try

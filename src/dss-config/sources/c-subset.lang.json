@@ -339,6 +339,7 @@
     { "word": "_Thread_local", "kind": "ThreadLocalKeyword"    },
     { "word": "thread_local",  "kind": "ThreadLocalC23Keyword" },
     { "word": "volatile", "kind": "VolatileKeyword" },
+    { "word": "_Atomic",  "kind": "AtomicKeyword"   },
     { "word": "restrict", "kind": "RestrictKeyword" },
     { "word": "register", "kind": "RegisterKeyword" },
     { "word": "auto",     "kind": "AutoKeyword"     },
@@ -610,8 +611,8 @@
       "sequence": [ "compositeAttr", { "repeat": "compositeAttr" } ]
     },
 
-    "headQualifier": { "alt": [ "ConstKeyword", "VolatileKeyword" ] },
-    "ptrQualifier":  { "alt": [ "ConstKeyword", "VolatileKeyword", "RestrictKeyword" ] },
+    "headQualifier": { "alt": [ "ConstKeyword", "VolatileKeyword", "AtomicKeyword" ] },
+    "ptrQualifier":  { "alt": [ "ConstKeyword", "VolatileKeyword", "RestrictKeyword", "AtomicKeyword" ] },
 
     "pointerLayer": {
       "sequence": [ "StarOp", { "repeat": "ptrQualifier" } ]
@@ -1369,6 +1370,8 @@
     "pointerToken":    "StarOp",
     "$volatileMarkerComment": "c21 (D-CSUBSET-VOLATILE-QUALIFIER): the language's volatile qualifier token. Read by the type-position resolver's CO-LOCATED pointer arm (castTypeRef cast/sizeof type-names) to reject a pointer-to-volatile-POINTEE (`volatile int *`) position-aware (volatile-before-star = pointee = REJECT; after-the-star = pointer-object = ACCEPT). DECLARATION forms — objects, params, AND struct/union members (c23 removed the head star from typeRefAllowingStruct, so a member's `*` now binds per-declarator like every other declaration position) — reject via the per-declaration-rule volatileMarker (head-volatile + a declarator star); the two arms together make the fail-loud complete.",
     "volatileMarker":  "VolatileKeyword",
+    "$atomicMarkerComment": "FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the language's `_Atomic`-class qualifier token — the LIVE SemanticConfig-level driver of the type-qualifier wrap, EXACTLY parallel to `volatileMarker` above. The type-position resolver (resolveTypeNodeImpl's CO-LOCATED base arm + declaratorDeclaredType's east/pointer-layer arm) reads THIS token: an `atomicMarker` BEFORE the first `pointerToken` wraps the base pointee (`_Atomic int *` => Ptr<atomicQualified(int)>); an `atomicMarker` INSIDE a pointer layer (east) wraps that pointer object (`int * _Atomic` => atomicQualified(Ptr<int>)). It COMPOSES with `volatileMarker` in the ONE shared {volatile,atomic} bitset skin (cycle 1a `qualified` merges bits, order-independent). NOTE: unlike volatile, `_Atomic` is a NEW qualifier with NO legacy per-DeclarationRule marker — object-atomicity is derived UNIFORMLY from the resolved TYPE (isAtomicQualified) at access lowering, exactly as c27 made volatile do (the per-DeclarationRule `volatileMarker` scan was RETIRED at c27; a parallel per-declaration atomicMarker would be write-only dead config, so it is deliberately NOT added). Source-agnostic: the engine reads THIS token, never a hardcoded keyword.",
+    "atomicMarker":    "AtomicKeyword",
     "$externLibraryByFormatComment": "FF6 Slice 2 + audit fold (2026-06-02): per-format runtime library identity for source-declared externs. compileSingleUnit step 2.5 populates HirAttribute<FfiMetadata> per ExternFunction/ExternGlobal by calling synthesizeFfiFromSourceDecls() with the entry whose key matches objectFormatKindName(format.kind()). Per-LANGUAGE field (not per-declaration-rule) — the post-fold #1 placement on DeclarationRule was fragile; the pipeline first-match-loop would silently pick the wrong rule on grammars with multiple extern-shaped decl rules. Library identities: PE → msvcrt.dll (Win32 C runtime for x86_64 hello-world); ELF → libc.so.6 (glibc on Linux); Mach-O → /usr/lib/libSystem.B.dylib (libSystem dispatcher publishes the libc surface). Per-symbol overrides (`extern \"otherlib.dll\" int foo();`) anchored D-CSUBSET-EXTERN-LIBRARY-SYNTAX.",
     "externLibraryByFormat": {
       "pe":    "msvcrt.dll",
