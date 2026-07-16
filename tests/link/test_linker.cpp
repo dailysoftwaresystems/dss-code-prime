@@ -981,26 +981,32 @@ TEST(Linker, CrossCuRetargetAndStripPatches) {
     EXPECT_EQ(std::count(image.externImportNames.begin(), image.externImportNames.end(),
                          std::string{"crossfn"}), 0)
         << "a cross-CU-resolved extern must be stripped, not emitted as a library import";
-    // Mint + fail-loud: the merge minted a GOT-like THUNK SLOT — an 8-byte rodata data item
-    // carrying the abs64 fixup to the sibling def, so the c-subset indirect call
-    // `call qword ptr [slot]` dereferences the def's runtime address. The thunk slot is an
-    // EXEC-image mechanism (the loader fills it via a base relocation). A relocatable OBJECT
-    // format — this synthetic `test-elf`, which carries rodata through the symbol table and
-    // so cannot declare `supportedDataSections` (legal only on exec flavors) — MUST reject
-    // the slot LOUDLY (K_NoMatchingObjectFormat) rather than silently drop the cross-CU
-    // indirect-call slot. So this diagnostic is POSITIVE evidence the slot was minted: the
-    // capability gate fires only on a rodata `dataItems` entry, which only the thunk-slot
-    // path produces here (the two CUs carry no other data). End-to-end EXEC emission of the
-    // slot (callee body + resolved pointer + base-reloc) is pinned by the runnable
-    // `examples/c-subset/cross_cu_call` (PE exec, exit 42). ELF/Mach-O exec thunk-slot
-    // emission is deferred — format-triggered anchor D-LK11-ELF-MACHO-CROSSCU-THUNK-EMISSION
-    // (needs the rodata + base-relocation walker arms). `calleeBody` stays the CU#2 def body.
-    EXPECT_EQ(countCode(rep, DiagnosticCode::K_NoMatchingObjectFormat), 1u)
-        << "the merge must mint a rodata thunk slot, and a non-exec object format must reject "
-           "it loudly — never silently drop the cross-CU indirect-call slot";
-    EXPECT_TRUE(image.bytes.empty())
-        << "emission must abort when the thunk slot's section cannot be carried — no "
-           "half-emitted image past the capability gate";
+    // Direct bind (c154, D-LK11-ELF-MACHO-CROSSCU-THUNK-EMISSION closure): this
+    // synthetic `test-elf` declares NO `externCallDispatch`, so the merge binds the
+    // reference DIRECTLY to the sibling definition's merged id — no thunk slot is
+    // minted (the slot arm is scoped to `indirect-slot` formats, whose call sites
+    // dereference it; see CrossCuLinkFormats.IndirectSlotDynMintsRelRoThunkSlotWith
+    // RelativeRow). The pre-c154 merge minted the slot unconditionally and
+    // retargeted this DIRECT `call rel32` into the slot's DATA bytes — the linked
+    // exec branched into data (SIGSEGV, witnessed on elf-exec + pe-exec). With no
+    // data item minted, this relocatable format emits the merged object CLEAN: no
+    // capability-gate rejection, both bodies present, the call resolved to the def.
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_NoMatchingObjectFormat), 0u)
+        << "a direct-bind cross-CU merge mints no data item — nothing for the "
+           "capability gate to reject";
+    EXPECT_FALSE(image.bytes.empty())
+        << "the merged relocatable object must emit — the cross-CU reference is an "
+           "ordinary intra-module reference after the direct bind";
+    auto contains = [](std::vector<std::uint8_t> const& hay,
+                       std::vector<std::uint8_t> const& needle) {
+        if (needle.empty() || hay.size() < needle.size()) return false;
+        for (std::size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+            if (std::equal(needle.begin(), needle.end(), hay.begin() + i)) return true;
+        }
+        return false;
+    };
+    EXPECT_TRUE(contains(image.bytes, calleeBody))
+        << "the sibling definition's body must land in the merged object";
 }
 
 // The strip must NOT over-strip: a real FFI extern (no sibling definition) survives the

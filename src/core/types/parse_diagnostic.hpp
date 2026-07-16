@@ -1844,6 +1844,11 @@ enum class DiagnosticCode : std::uint16_t {
     //   Fail loud rather than emit an image whose cross-CU calls dereference
     //   a null slot. (A target that genuinely has no abs64 reloc must add the
     //   row to its `*.target.json` before it can host cross-CU indirect calls.)
+    //   c154: SCOPED to formats whose declared `externCallDispatch` is
+    //   `indirect-slot` — the only dispatch whose call sites dereference a
+    //   slot. A `direct-plt`/undeclared format binds the reference directly
+    //   to the sibling definition (no slot, no abs64 needed), so this never
+    //   fires there (pinned by Abs64GateFiresOnlyOnTheIndirectSlotArm).
     K_AbsolutePointerRelocMissing  = 0x8013,
     // K_ImageExecBitFailed: setting the POSIX execute bit on a just-written
     //   EXECUTABLE-flavor output (writer.cpp `--output` path) failed —

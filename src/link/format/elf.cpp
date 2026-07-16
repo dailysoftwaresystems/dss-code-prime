@@ -661,15 +661,17 @@ encodeElfExecDynamic(
         "elf::encodeElfExecDynamic", reporter, /*allowItemRelocations=*/true);
     if (!rodataDynLayoutOpt.has_value()) return {};
     auto& rodataDynLayout = *rodataDynLayoutOpt;
-    // D-LK-DYN-RODATA-ITEM-RELOC (c150): in the ET_DYN image, `.rodata`
-    // lives in the READ-ONLY PT_LOAD #1 — a reloc-bearing rodata item
-    // would need a load-time R_*_RELATIVE write into a non-writable
-    // page (DT_TEXTREL territory, rejected by hardened loaders). The
-    // shipped producer routes every reloc-bearing CONST global to
-    // `relro` (c145), which the dynamic arm merges into the WRITABLE
-    // `.data` — so the only rodata+relocs producer today is the LK11
-    // cross-CU thunk slot (multi-CU merge). Fail loud rather than emit
-    // a TEXTREL image; the fix is relro placement for those slots.
+    // D-LK-DYN-RODATA-ITEM-RELOC (c150; producer closed c154): in the
+    // ET_DYN image, `.rodata` lives in the READ-ONLY PT_LOAD #1 — a
+    // reloc-bearing rodata item would need a load-time R_*_RELATIVE
+    // write into a non-writable page (DT_TEXTREL territory, rejected
+    // by hardened loaders). NO shipped producer emits rodata+relocs:
+    // the asm tier routes every reloc-bearing CONST global to `relro`
+    // (c145) and the LK11 cross-CU merge mints its indirect-slot
+    // thunk slots as `relro` too (c154, the same chokepoint) — both
+    // merge into the WRITABLE `.data` here. This belt stays for a
+    // hand-built module / future producer regression: fail loud
+    // rather than emit a TEXTREL image.
     if (isDyn) {
         for (std::size_t j = 0; j < rodataDynLayout.itemIndices.size(); ++j) {
             auto const& di = module.dataItems[rodataDynLayout.itemIndices[j]];

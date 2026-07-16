@@ -1,4 +1,5 @@
 {
+  "$comment": "LK11/CU6 cross-CU CALL (cycle 19: the first runnable multi-CU binary, pe64-only). c154 (D-LK11-ELF-MACHO-CROSSCU-THUNK-EMISSION): the elf x86_64 / elf aarch64(qemu) / macho arm64 exec arms join — the 2-TU build routes through the LK11 whole-program MIR merge (cross-CU calls become intra-module DIRECT calls; no assembled-tier thunk), so ONE image per format carries both TUs and exits 42 iff main.c's extern call bound to helper.c's add5. Witnessed end-to-end on WSL glibc (elf x86_64 exit 42) + natively on windows (pe exit 42); the macho arm runs on the darwin CI leg.",
   "language": "c-subset",
   "sources": ["main.c", "helper.c"],
   "exitCode": 42,
@@ -8,6 +9,22 @@
       "spec": "x86_64:pe64-x86_64-windows-exec",
       "artifact": "main.exe",
       "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
     }
   ],
   "optimizedPipelines": [

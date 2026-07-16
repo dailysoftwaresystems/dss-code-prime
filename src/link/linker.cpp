@@ -1,6 +1,8 @@
 #include "link/linker.hpp"
 
+#include "core/types/object_format_kind.hpp"  // externCallUsesIndirectShape
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/section_kind.hpp"        // relocBearingGlobalSection (c145 chokepoint)
 #include "link/cross_cu_resolve.hpp"
 #include "link/entry_trampoline.hpp"
 #include "link/format/elf.hpp"
@@ -266,15 +268,35 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
 // SymbolId{3} locals are different functions). Every function's relocations are
 // retargeted from (its cuId, old SymbolId) to the merged id.
 //
-// Cross-CU REFERENCE resolution via a GOT-like THUNK SLOT (the c-subset extern call is
-// INDIRECT — `call qword ptr [slot]`, x86 `FF 15 disp32`, which DEREFERENCES the slot;
-// see `mir_to_lir.cpp` CallIndirectViaExtern). For each extern bound to a sibling-CU
-// definition (image.resolvedCrossCuRefs) the merge mints a fresh 8-byte data item — the
-// thunk slot — carrying ONE absolute-64-bit-pointer relocation to the definition, and
-// retargets the reference's merged id to THAT SLOT (not the def). So the indirect call
-// reads a slot that the walker fills with the def's runtime address. The extern import is
-// STRIPPED (the sibling def shadows the library fallback). An extern with NO cross-CU
-// definition is a real FFI import, kept (remapped) for the library tier (FF11).
+// Cross-CU REFERENCE resolution is keyed on the FORMAT's declared extern-call shape
+// (`externCallDispatch` — config, never format identity; c154):
+//
+//   * `direct-plt` (every shipped format) or UNDECLARED: the call site is a plain
+//     direct call (E8 rel32 / BL imm26) — the reference retargets DIRECTLY to the
+//     sibling definition's merged id, exactly like an intra-CU call after the merge
+//     (the definition is IN the merged image). Correct for every reference shape:
+//     a direct call branches to the def; an address-taken abs64 data slot gets the
+//     def's real address (pointer identity holds). Pre-c154 this arm did not exist —
+//     the merge unconditionally minted the indirect slot below and retargeted the
+//     DIRECT call into the slot's DATA bytes (a silent branch-to-data SIGSEGV,
+//     witnessed on elf-exec + pe-exec before the fix). An UNDECLARED dispatch means
+//     the format cannot lower extern CALLS at all (MIR->LIR fails loud), so any
+//     surviving reference is data-shaped — direct retarget is correct there too.
+//
+//   * `indirect-slot`: the call site DEREFERENCES a pointer slot (`call qword ptr
+//     [slot]`, x86 `FF 15 disp32` — see `mir_to_lir.cpp` CallIndirectViaExtern).
+//     For each extern bound to a sibling-CU definition (image.resolvedCrossCuRefs)
+//     the merge mints a fresh 8-byte data item — the GOT-like thunk slot — carrying
+//     ONE absolute-64-bit-pointer relocation to the definition, and retargets the
+//     reference's merged id to THAT SLOT (not the def). The slot is a CONST pointer
+//     table written only by the loader, so it mints as `RelRoConst` via the shared
+//     c145 `relocBearingGlobalSection` chokepoint (const + reloc-bearing -> relro;
+//     pre-c154 it minted as `Rodata`, the D-LK-DYN-RODATA-ITEM-RELOC loud wall on
+//     the ET_DYN arm and the Mach-O exec __TEXT,__const rebase reject).
+//
+// Either way the extern import is STRIPPED (the sibling def shadows the library
+// fallback). An extern with NO cross-CU definition is a real FFI import, kept
+// (remapped) for the library tier (FF11).
 //
 // The absolute-pointer relocation kind is found AGNOSTICALLY from the `TargetSchema` —
 // the row whose `relocationInfo` reports `widthBytes == 8 && !pcRelative` — never by a
@@ -282,10 +304,18 @@ void resolveCrossCuSymbols(std::span<AssembledModule const> modules,
 // veto). If no such row exists, fail loud (K_AbsolutePointerRelocMissing); a thunk slot
 // without its abs64 fixup would be a broken null pointer.
 AssembledModule mergeModules(std::span<AssembledModule const> modules,
-                             LinkedImage const&  image,
-                             TargetSchema const& targetSchema,
-                             DiagnosticReporter& reporter) {
+                             LinkedImage const&        image,
+                             TargetSchema const&       targetSchema,
+                             ObjectFormatSchema const& objectFormatSchema,
+                             DiagnosticReporter&       reporter) {
     AssembledModule combined;
+
+    // The format's extern-call shape decides the reference-resolution mechanism
+    // below: an indirect-slot call site needs the deref-able thunk slot; a
+    // direct-plt (or undeclared-dispatch) reference binds straight to the def.
+    bool const useIndirectSlot =
+        objectFormatSchema.externCallDispatch().has_value()
+        && externCallUsesIndirectShape(*objectFormatSchema.externCallDispatch());
 
     // Find the target's ABSOLUTE 64-bit pointer relocation kind by FORMULA (never by
     // name/constant — agnosticism). This is the relocation the thunk slot carries so the
@@ -336,28 +366,36 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         for (auto& rel : relocs) rel.target = SymbolId{mergedIdFor(modIdx, rel.target)};
     };
 
-    // Cross-CU REFERENCE resolution via a GOT-like THUNK SLOT. An extern import bound to a
-    // sibling-CU definition (image.resolvedCrossCuRefs) resolves to that def. Because the
-    // c-subset extern call is INDIRECT (`call qword ptr [slot]` — dereferences a slot), the
-    // referencing relocation must point at a SLOT that CONTAINS the def's address, NOT at
-    // the def directly (a direct retarget would make the indirect call read def bytes as a
-    // pointer). So for each cross-CU reference the merge:
-    //   * mints a fresh thunk-slot SymbolId (8 zero bytes) carrying ONE absolute-64-bit
-    //     relocation to the definition's merged id (the walker writes the def's runtime VA
-    //     into the slot);
-    //   * retargets the reference's merged id to the THUNK SLOT (via `remap` — every
-    //     referencing reloc then routes through `retargetRelocs` to the slot);
-    //   * STRIPS the extern import (the sibling def shadows the library fallback).
-    // A real FFI extern (no sibling def, absent from resolvedCrossCuRefs) is untouched —
-    // that is FF11's library tier. The definition's merged id is resolvable from `remap`
-    // here (the def is a winning global, pre-assigned above).
+    // Cross-CU REFERENCE resolution. An extern import bound to a sibling-CU definition
+    // (image.resolvedCrossCuRefs) resolves to that def; the MECHANISM is dispatch-keyed
+    // (see the function docblock):
+    //   * direct-plt / undeclared → retarget the reference's merged id DIRECTLY to the
+    //     definition's merged id (via `remap` — every referencing reloc then routes
+    //     through `retargetRelocs` to the def, like an intra-CU reference).
+    //   * indirect-slot → mint a fresh RelRoConst thunk slot (8 zero bytes + ONE
+    //     absolute-64-bit relocation to the definition's merged id; the walker writes
+    //     the def's runtime VA into the slot) and retarget the reference to THE SLOT —
+    //     the indirect call site dereferences it. CONSTRAINT (c154 review): this arm
+    //     retargets EVERY reference shape to the slot, which is correct ONLY for
+    //     slot-deref-shaped sites (`FF 15` calls / GotIndirect data derefs). An
+    //     ADDRESS-TAKEN cross-CU reference (`lea`-of-extern-fn, an abs64 `&extern_fn`
+    //     data initializer) would receive the SLOT's address — one indirection off.
+    //     Unreachable today (no shipped format declares indirect-slot and no shipped
+    //     route reaches N>1 modules); when the separate-compilation trigger fires
+    //     (D-OPT7-CROSSCU-THUNK-RESERVED-FOR-SEPARATE-COMPILATION), retargeting must
+    //     key per-reference-shape or fail loud on a non-call-shaped reference here.
+    // Either way the extern import is STRIPPED (the sibling def shadows the library
+    // fallback). A real FFI extern (no sibling def, absent from resolvedCrossCuRefs) is
+    // untouched — that is FF11's library tier. The definition's merged id is resolvable
+    // from `remap` here (the def is a winning global, pre-assigned above).
     std::unordered_map<std::uint32_t, std::size_t> cuIdToIdx;
     for (std::size_t i = 0; i < modules.size(); ++i) cuIdToIdx.emplace(modules[i].cuId.v, i);
     std::unordered_set<LinkedSymbolKey> strippedExterns;
-    if (!image.resolvedCrossCuRefs.empty() && !absPtrKind.has_value()) {
+    if (useIndirectSlot && !image.resolvedCrossCuRefs.empty() && !absPtrKind.has_value()) {
         // The target cannot express a 64-bit absolute pointer fixup — a thunk slot would be
         // an un-relocated null. Fail loud rather than emit an image whose cross-CU indirect
-        // calls dereference a null slot.
+        // calls dereference a null slot. (The direct-plt arm needs no pointer slot, so a
+        // target without an abs64 row still cross-CU-links there.)
         report(reporter, DiagnosticCode::K_AbsolutePointerRelocMissing,
                DiagnosticSeverity::Error,
                "cross-CU reference resolution needs an absolute 64-bit pointer relocation "
@@ -373,7 +411,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             // INVARIANT: resolveCrossCuSymbols populated `ref.definition` from THIS same
             // `modules` span, so its CU is always present. A miss means a future refactor
             // breached that contract — fail LOUD instead of silently skipping: a silent
-            // `continue` would leave the indirect call un-thunked (no slot minted) yet the
+            // `continue` would leave the reference unresolved (no retarget) yet the
             // extern un-stripped, surfacing as a confusing downstream undefined rather than
             // pointing at the breached merge contract here.
             report(reporter, DiagnosticCode::K_SymbolUndefined, DiagnosticSeverity::Error,
@@ -384,19 +422,28 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             continue;
         }
         std::uint32_t const defId = mergedIdFor(dit->second, ref.definition.symbol);
-        std::uint32_t const thunkSlotId = nextId++;
-        AssembledData slot;
-        slot.symbol  = SymbolId{thunkSlotId};
-        slot.section = DataSectionKind::Rodata;     // read-only pointer table (loader fills via base-reloc)
-        slot.bytes.assign(8, std::uint8_t{0});      // 8 zero bytes — the abs64 fixup site
-        Relocation slotRel;
-        slotRel.offset = 0;
-        slotRel.target = SymbolId{defId};           // the sibling def's merged id
-        slotRel.kind   = *absPtrKind;               // abs64 (found by formula)
-        slotRel.addend = 0;
-        slot.relocations.push_back(slotRel);
-        combined.dataItems.push_back(std::move(slot));
-        remap[ref.reference] = thunkSlotId;         // the indirect call's reloc → the slot
+        if (useIndirectSlot) {
+            std::uint32_t const thunkSlotId = nextId++;
+            AssembledData slot;
+            slot.symbol  = SymbolId{thunkSlotId};
+            // A CONST pointer table the loader fills — the shared c145 chokepoint
+            // routes it to RelRoConst (relocated-then-read-only), NEVER read-only
+            // Rodata (the pre-c154 D-LK-DYN-RODATA-ITEM-RELOC wall) and NEVER a
+            // format-identity branch.
+            slot.section = relocBearingGlobalSection(/*isThreadLocal=*/false,
+                                                     /*isConst=*/true);
+            slot.bytes.assign(8, std::uint8_t{0});  // 8 zero bytes — the abs64 fixup site
+            Relocation slotRel;
+            slotRel.offset = 0;
+            slotRel.target = SymbolId{defId};       // the sibling def's merged id
+            slotRel.kind   = *absPtrKind;           // abs64 (found by formula)
+            slotRel.addend = 0;
+            slot.relocations.push_back(slotRel);
+            combined.dataItems.push_back(std::move(slot));
+            remap[ref.reference] = thunkSlotId;     // the indirect call's reloc → the slot
+        } else {
+            remap[ref.reference] = defId;           // direct bind — reloc → the def itself
+        }
         strippedExterns.insert(ref.reference);
     }
 
@@ -423,6 +470,7 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
         return !(winner == self);  // a different key won → this body is shadowed
     };
 
+    std::unordered_set<std::uint32_t> seenMergedSymIds;
     for (std::size_t i = 0; i < modules.size(); ++i) {
         auto const& m = modules[i];
         for (auto const& fn : m.functions) {
@@ -446,6 +494,23 @@ AssembledModule mergeModules(std::span<AssembledModule const> modules,
             ExternImport out = ext;
             out.symbol = SymbolId{mergedIdFor(i, ext.symbol)};
             combined.externImports.push_back(std::move(out));
+        }
+        // Carry each SURVIVING definition's ModuleSymbol row (name / binding /
+        // visibility), re-keyed to the merged id — the walkers' real-name surfaces
+        // (the c150 ET_DYN `.dynsym` exports, the c139 ET_REL `.symtab` names, the
+        // dylib/DLL export tables) all read `module.symbols`, so a merge that drops
+        // the table would silently emit an EXPORT-LESS library image (witnessed on
+        // the c154 dyn probe before this rebuild: an empty `.dynsym`). A shadowed
+        // duplicate's row is dropped with its body; same-name versions folded onto
+        // one winner id keep exactly the winner's row (`seenMergedSymIds` dedups —
+        // defensive; the shadow drop already excludes losers).
+        for (auto const& ms : m.symbols) {
+            if (ms.name.empty()) continue;
+            if (isShadowedDuplicate(i, ms.symbol)) continue;
+            std::uint32_t const mergedId = mergedIdFor(i, ms.symbol);
+            if (!seenMergedSymIds.insert(mergedId).second) continue;
+            combined.symbols.push_back(ModuleSymbol{
+                SymbolId{mergedId}, ms.name, ms.binding, ms.visibility});
         }
     }
     combined.expectedFuncCount = combined.functions.size();
@@ -514,8 +579,11 @@ LinkedImage link(std::span<AssembledModule const> modules,
         }
         // Pre-merge into one combined module + flow it through the emission path below.
         // `targetSchema` is threaded in so the merge can find the absolute-64-bit pointer
-        // relocation kind by formula (thunk-slot minting) — never by a hardcoded name.
-        mergedStorage = mergeModules(modules, image, targetSchema, reporter);
+        // relocation kind by formula (thunk-slot minting) — never by a hardcoded name;
+        // `objectFormatSchema` so the reference-resolution mechanism keys on the format's
+        // DECLARED `externCallDispatch` (direct bind vs indirect thunk slot — c154).
+        mergedStorage = mergeModules(modules, image, targetSchema,
+                                     objectFormatSchema, reporter);
         if (reporter.errorCount() != errsBeforeMerge) {
             return image;  // merge fail-loud (ambiguous entry / cross-CU ref pending).
         }

@@ -1154,7 +1154,8 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
 // intra-module calls (stripping the resolved extern imports), and computed the
 // user-entry symbol. This drives that single module through the same LOWER body,
 // so the linker downstream receives exactly ONE AssembledModule (no assembled-tier
-// cross-CU thunk — the cycle-19 GOT-like rodata slot is never minted).
+// cross-CU resolution — the linker's dispatch-keyed direct-bind / thunk-slot
+// machinery, c154, only runs for N>1 pre-assembled modules).
 //
 // `merged` is taken by non-const ref because the shared body needs a mutable `Mir&`
 // (MIR→LIR may intern lowered-expression types into the host) + the surviving

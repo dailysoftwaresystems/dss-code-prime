@@ -1861,7 +1861,8 @@ encodeExec(AssembledModule const&    module,
     // The u32-wire-limit guard for these spans rides the SAME `checkU32Span`
     // call the rdata/data/bss spans use (below, once the lambda is defined).
     // `allowItemRelocations=true`: PE patches data-item (data→data) relocations
-    // — its cross-CU thunk-slot feature — into the laid-out bytes below.
+    // (F5 symbol-address pointers, folded relro tables) into the laid-out
+    // bytes below + emits their `.reloc` DIR64 base relocations.
     auto rdataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Rodata,
         /*alignFloor=*/1, "pe::encodeExec", reporter,
@@ -1921,7 +1922,7 @@ encodeExec(AssembledModule const&    module,
         return {};
     }
     // `.rdata` AND `.data` bytes are MUTABLE here because PE patches data-item
-    // relocations into them post-layout (below): cross-CU thunk slots + F5
+    // relocations into them post-layout (below): folded relro const tables + F5
     // string-rodata pointers land in `.rdata`; F5 MUTABLE symbol-address global
     // pointers (`char* g="..."`, `int* p=&x`) land in `.data` and carry an abs64
     // data→data reloc to their target's VA (the patched bytes are emitted at the
@@ -1930,7 +1931,7 @@ encodeExec(AssembledModule const&    module,
     std::vector<std::uint8_t> dataBytes  = dataDataLayout.bytes;
     // Original-dataItems-index → `.rdata` section-relative offset, for the
     // data-item-relocation patch loop below (the layout records these for the
-    // items it placed; reloc-bearing thunk slots are rodata).
+    // items it placed — including the relro items merged in above).
     std::unordered_map<std::size_t, std::uint64_t> rdataOffsetByIndex;
     for (std::size_t j = 0; j < rdataDataLayout.itemIndices.size(); ++j) {
         rdataOffsetByIndex.emplace(rdataDataLayout.itemIndices[j],
@@ -2797,10 +2798,13 @@ encodeExec(AssembledModule const&    module,
     // ── Apply DATA-ITEM relocations into the .rdata bytes ─────────
     //
     // `applyExecRelocations` above patches FUNCTION relocations into `.text`. A data item
-    // may ALSO carry relocations — e.g. the cross-CU thunk slot (LK11b), an 8-byte rodata
-    // pointer the linker mints whose single absolute-64-bit reloc targets a sibling-CU
-    // definition (so an indirect cross-CU call `call qword ptr [slot]` dereferences a slot
-    // holding the def's runtime address). The def's VA already lives in `symbolVa` (built
+    // may ALSO carry relocations — an F5 symbol-address pointer, a folded relro const
+    // table slot, or the LK11b cross-CU thunk slot (an 8-byte RelRoConst pointer the
+    // linker mints for an INDIRECT-SLOT-dispatch format, whose single absolute-64-bit
+    // reloc targets a sibling-CU definition — the indirect cross-CU call `call qword ptr
+    // [slot]` dereferences a slot holding the def's runtime address; c154: a direct-plt
+    // format binds the reference straight to the def and mints no slot). The target's VA
+    // already lives in `symbolVa` (built
     // above for functions + externs/IAT + rodata items). Patch each data-item relocation
     // directly into `rdataBytes` at the item's section-relative offset + the reloc's
     // intra-item offset, writing the absolute VA `widthBytes` LE. This runs against the
@@ -2819,11 +2823,11 @@ encodeExec(AssembledModule const&    module,
     for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
         auto const& di = module.dataItems[i];
         if (di.relocations.empty()) continue;
-        // The reloc-bearing item lives in `.rdata` (const data / cross-CU thunk
-        // slots / F5 string-rodata pointers) or `.data` (F5 MUTABLE symbol-address
-        // global pointers `char* g="..."` / `int* p=&x`). Resolve its section-
-        // relative offset + the buffer to patch + the section base RVA. A `.bss` /
-        // unplaced reloc-bearing item has no on-disk patch site → fail loud.
+        // The reloc-bearing item lives in `.rdata` (folded relro const tables /
+        // cross-CU thunk slots / F5 string-rodata pointers) or `.data` (F5 MUTABLE
+        // symbol-address global pointers `char* g="..."` / `int* p=&x`). Resolve its
+        // section-relative offset + the buffer to patch + the section base RVA. A
+        // `.bss` / unplaced reloc-bearing item has no on-disk patch site → fail loud.
         std::vector<std::uint8_t>* patchBuf = nullptr;
         std::size_t                itemBaseOff = 0;
         std::uint32_t              itemSecRva  = 0;

@@ -228,4 +228,27 @@ dataSectionKindFromName(std::string_view s) noexcept {
     return std::nullopt;
 }
 
+// D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): the ONE chokepoint for the section a
+// RELOC-BEARING global lands in. A pointer object patched by the loader (an
+// `int *p = &x;` scalar, a fn-ptr-table / `&global` aggregate member, or a
+// linker-minted cross-CU indirection slot) cannot sit in read-only `.rodata`;
+// it routes to a thread-local template (Tdata), relocated-read-only const
+// (RelRoConst — gcc's `.data.rel.ro`), or writable data (Data). The asm-tier
+// global lowering AND the linker's cross-CU merge both route through here, so
+// the const-vs-mutable relro decision has a SINGLE point of truth (a duplicated
+// ternary is what breeds a missed site — the c154 D-LK-DYN-RODATA-ITEM-RELOC
+// wall was exactly a second site minting Rodata). Thread-locality wins first —
+// a reloc-bearing `thread_local` keeps its per-thread `.tdata` template (never
+// demoted to a process-shared slot).
+[[nodiscard]] constexpr DataSectionKind
+relocBearingGlobalSection(bool isThreadLocal, bool isConst) noexcept {
+    if (isThreadLocal) return DataSectionKind::Tdata;
+    return isConst ? DataSectionKind::RelRoConst : DataSectionKind::Data;
+}
+
+static_assert(relocBearingGlobalSection(true,  true)  == DataSectionKind::Tdata);
+static_assert(relocBearingGlobalSection(true,  false) == DataSectionKind::Tdata);
+static_assert(relocBearingGlobalSection(false, true)  == DataSectionKind::RelRoConst);
+static_assert(relocBearingGlobalSection(false, false) == DataSectionKind::Data);
+
 } // namespace dss
