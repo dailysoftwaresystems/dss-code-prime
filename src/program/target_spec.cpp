@@ -53,7 +53,16 @@ std::string_view TargetSpec::outputExtension(
             switch (fmt.elf().objectType) {
                 case ElfObjectType::Rel:  return ".o";
                 case ElfObjectType::Exec: return "";
-                case ElfObjectType::Dyn:  return ".so";
+                case ElfObjectType::Dyn:
+                    // c151 (D-LK1-4 PIE half): ET_DYN is a `.so` OR
+                    // a PIE executable — the schema's entry cluster
+                    // discriminates (validate() pins it all-or-none;
+                    // `processExit` is the canonical single-member
+                    // witness). A PIE takes executable naming: no
+                    // extension, exactly like ET_EXEC (`gcc -pie
+                    // hello.c -o prog` names it `prog`, not
+                    // `prog.so`).
+                    return fmt.processExit().has_value() ? "" : ".so";
             }
             return "";
         case ObjectFormatKind::Pe:

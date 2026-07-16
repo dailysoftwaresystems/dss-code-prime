@@ -1,0 +1,155 @@
+{
+  "$comment": "ELF64 POSITION-INDEPENDENT EXECUTABLE (PIE: ET_DYN + PT_INTERP + entry) for x86_64 Linux -- c151, the D-LK1-4 PIE half (plan 14 / roadmap A1 part 2; part 1 = the c150 .so). This is the modern-distro-DEFAULT executable shape: `gcc hello.c` (default PIE since gcc 6/Ubuntu 16.10) emits exactly ET_DYN + PT_PHDR + PT_INTERP + non-zero e_entry + DT_FLAGS_1 DF_1_PIE, and the kernel execve's it at a randomized base (full-image ASLR). Consumed by `src/link/format/elf.cpp` via the format-blind linker engine: `elf.type = dyn` routes to the SAME `encodeElfExecDynamic` substrate as the .so, and the ENTRY CLUSTER declared here (elf.interpreter + processExit + entryCallingConvention + processArgs) flips the walker's `isPie` sub-mode: PT_PHDR + PT_INTERP + `.interp` come back (the exec shapes at BASE-RELATIVE VAs), e_entry = the synthesized `_start` trampoline's base-relative VA (ld.so adds the load base), and DT_FLAGS_1 carries DF_1_NOW | DF_1_PIE. Everything else stays the c150 dyn shape: base-0 VAs the loader slides, R_X86_64_RELATIVE rows for internal absolute data slots, symbol-based absolute relocs for extern-address data slots, got-indirect extern DATA imports, real-named .dynsym exports (the -rdynamic-like stance -- harmless and keeps the arm uniform with the .so). THE DISCRIMINATOR between this schema and the .so sibling (elf64-x86_64-linux-dyn) is ENTRY-CLUSTER PRESENCE, not a new elf.type value: a PIE IS ET_DYN. validate() accepts an ET_DYN schema with EITHER none of the cluster (a .so) OR all of it (a PIE); half-configured states reject loud. POLICY: unlike the .so, a PIE is an EXECUTABLE -- `allowsUndefinedImports()` is FALSE (a referenced no-library extern rejects at link time; nothing later resolves it -- ld.so would fail at load, the deferred-failure class the c143 gate exists to prevent). NO `elf.soname`: DT_SONAME in a PIE is legal-but-meaningless ELF (only DT_NEEDED lookups read it, and nothing links against a PIE); validate() REJECTS soname + entry-cluster to keep configs honest. NO tlsAccess / tdata / tbss rows: thread_local fails loud at the MIR->LIR gate / linker section gate (D-LK-DYN-TLS-MODEL; a PIE's own thread-locals COULD use local-exec -- it is the executable -- but the layout under a slid base is unwitnessed, so the opt-in waits for its own cycle).",
+
+  "dssObjectFormatVersion": 1,
+
+  "format": {
+    "name": "elf64-x86_64-linux-pie",
+    "version": "1.0",
+    "kind": "elf"
+  },
+
+  "$dataModelComment": "Same LP64 identity as the exec/dyn/rel siblings (64-bit Linux).",
+  "dataModel": "LP64",
+
+  "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: SysV/GNU LSB-first bit-field packing, same as the ELF siblings.",
+  "bitFieldStrategy": "gnu_packed",
+
+  "$externCallDispatchComment": "Same call-site shape as the exec image and the .so: the walker synthesizes a PLT stub per extern FUNCTION (jmp through the GOT slot, GLOB_DAT eager-bound) and the call site is a plain direct `call rel32` to the stub -- pc-relative, so the code needs no fixup under the ET_DYN load slide. D-FFI-EXTERN-CALL-DISPATCH.",
+  "externCallDispatch": "direct-plt",
+
+  "$dataImportBindingComment": "c151 (D-LK1-4 PIE half): extern library DATA objects bind GOT-INDIRECT -- the walker reserves a GOT slot per imported object and emits R_X86_64_GLOB_DAT against it; ld.so writes the object's address into the slot and the c117/c149 GotIndirect lowering (lea-of-slot + deref) reads it. This is gcc's PIE data-import shape too (-fPIE code reaches extern objects through the GOT). Copy relocations are the FIXED-BASE ET_EXEC mechanism (the c84 arm); validate() rejects copy-relocation on any ET_DYN schema, PIE included.",
+  "dataImportBinding": "got-indirect",
+
+  "$supportedDataSectionsComment": "rodata (read-only, R+X PT_LOAD #1 -- reloc-FREE items only: a reloc-bearing rodata item would need a load-time write into a read-only page, D-LK-DYN-RODATA-ITEM-RELOC fails loud), data (mutable initialized globals, R+W PT_LOAD #2), bss (zero-init, NOBITS tail of PT_LOAD #2), relro (reloc-bearing CONST data, c145 -- merged into `.data` by the dynamic arm so its R_X86_64_RELATIVE slots land in writable pages, exactly why gcc places such data in .data.rel.ro). NO tdata/tbss: see the top-level $comment (D-LK-DYN-TLS-MODEL); every thread_local fails loud at the MIR->LIR gate / linker section gate by this set's absence.",
+  "supportedDataSections": ["rodata", "data", "bss", "relro"],
+
+  "$artifactProfilesComment": "This format SERVES the runnable-console-binary profile (plan 06 AP3) -- a PIE is an executable, so cli, exactly like the ET_EXEC sibling. The lib profile is NOT served (nothing links against a PIE; that is the elf64-x86_64-linux-dyn .so).",
+  "artifactProfiles": ["cli"],
+
+  "$entryPointComment": "Empty entryPoint defaults the walker to module.functions[0] -- after the linker prepends the synthetic `_start` trampoline (keyed on processExit presence, same as ET_EXEC) that IS the trampoline, so e_entry = the trampoline's base-relative VA. The USER entry (the trampoline's call target) resolves via module.userEntrySymbol (the language's entry-function name config) exactly as on the exec arm.",
+  "entryPoint": "",
+
+  "$processExitComment": "ENTRY CLUSTER member (the PIE discriminator -- see the top-level $comment). Identical to the ET_EXEC sibling: terminate via libc `exit(3)` by-name-import (STDIO-FLUSH-AT-EXIT, 2026-06-09) -- the C standard says returning from `main` is equivalent to calling `exit(3)`, which flushes stdio + runs atexit handlers. The trampoline emits a DIRECT `call` to the PLT stub for `exit` (per externCallDispatch=direct-plt) -- pc-relative, slide-safe. libc.so.6 becomes a DT_NEEDED; ld.so resolves the GOT slot eagerly (DF_1_NOW).",
+  "processExit": {
+    "mechanism": "by-name-import",
+    "importMangledName": "exit",
+    "importLibraryPath": "libc.so.6"
+  },
+
+  "$entryCallingConventionComment": "ENTRY CLUSTER member. SysV AMD64 calling convention -- status (user fn return value in rax) is moved into argGprs[0] = rdi before the exit call. Read via `target.callingConventionByName(\"sysv_amd64\")` at trampoline-build time.",
+  "entryCallingConvention": "sysv_amd64",
+
+  "$processArgsComment": "ENTRY CLUSTER member. c88 (D-RUNTIME-MAIN-ARGC-ARGV): program-entry argc/argv materialization, identical to the ET_EXEC sibling. SysV AMD64 psABI 3.4.1 -- at the process entry point argc sits at [rsp+0] and the NULL-terminated argv vector IN PLACE at [rsp+8]; ld.so transfers control to a PIE's e_entry with this exact layout (the ABI stack contract is loader-preserved). The trampoline emits `mov rdi,[rsp+0]` + `lea rsi,[rsp+8]` before any SP adjustment and before `call main`.",
+  "processArgs": {
+    "mechanism": "stack-vector",
+    "argcStackOffset": 0,
+    "argvStackOffset": 8
+  },
+
+  "elf": {
+    "$comment": "Elf64_Ehdr identity for a PIE. type = ET_DYN (3) -- a PIE IS a shared object to the kernel/loader; what makes it an EXECUTABLE is the entry cluster (this block's `interpreter` + the top-level processExit/entryCallingConvention/processArgs) and the resulting non-zero e_entry + PT_INTERP. class/data/osabi/machine identical to the siblings. pageAlign = 4096 (x86_64 Linux 4 KB pages). interpreter = the PT_INTERP path (gcc ground truth: /lib64/ld-linux-x86-64.so.2 -- the kernel maps ld.so, which relocates the image at a randomized base and jumps to base + e_entry). NO soname (validate-rejected with the entry cluster -- a PIE is not a library). bindNow = true: eager binding, DT_FLAGS_1 = DF_1_NOW | DF_1_PIE (0x08000001 -- readelf shows 'Flags: NOW PIE', witnessed on gcc 13.3 default-PIE output; lazy .rela.plt/JUMP_SLOT is D-LK6-11).",
+    "class": "elf64",
+    "data": "lsb",
+    "osabi": "sysv",
+    "abiVersion": 0,
+    "machine": 62,
+    "type": "dyn",
+    "pageAlign": 4096,
+    "interpreter": "/lib64/ld-linux-x86-64.so.2",
+    "bindNow": true
+  },
+
+  "sections": [
+    {
+      "$comment": "Executable code. virtualAddress = 4096 = elf.pageAlign, PINNED by validate() for every ET_DYN schema: VAs are BASE-RELATIVE (the loader slides the whole image), and the walker computes baseImageVa = text.virtualAddress - pageAlign, so the equality makes the image base 0 BY CONSTRUCTION -- page zero holds Ehdr + PHT + .interp + dynamic metadata; .text opens the second page (the gcc PIE convention: entry 0x1040-ish, base-relative). sh_flags = SHF_ALLOC|SHF_EXECINSTR (6).",
+      "kind": "text",
+      "name": ".text",
+      "type": 1,
+      "flags": 6,
+      "addrAlign": 16,
+      "entrySize": 0,
+      "virtualAddress": 4096
+    },
+    {
+      "$comment": "Read-only initialized data (string literals, reloc-free const globals). Folded into the R+X PT_LOAD #1 after .text. virtualAddress = 0 -- computed. A reloc-BEARING const global goes to relro instead (c145): RELATIVE fixups must land in writable pages.",
+      "kind": "rodata",
+      "name": ".rodata",
+      "type": 1,
+      "flags": 2,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Writable initialized data. R+W PT_LOAD #2 (W^X preserved). virtualAddress = 0 -- computed.",
+      "kind": "data",
+      "name": ".data",
+      "type": 1,
+      "flags": 3,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Zero-initialized data. SHT_NOBITS (8); memsz-only tail of PT_LOAD #2. virtualAddress = 0 -- computed.",
+      "kind": "bss",
+      "name": ".bss",
+      "type": 8,
+      "flags": 3,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Symbol table (debugger support; the LOADER reads .dynsym). sh_entsize = 24.",
+      "kind": "symtab",
+      "name": ".symtab",
+      "type": 2,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 24,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Symbol-name string table.",
+      "kind": "strtab",
+      "name": ".strtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Section-header string table.",
+      "kind": "shstrtab",
+      "name": ".shstrtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    }
+  ],
+
+  "relocations": [
+    {
+      "$comment": "The pc-relative kinds are the only ones legal in ET_DYN `.text` (an absolute fixup in code would need DT_TEXTREL -- D-LK-DYN-TEXT-ABS-RELOC fails loud). kind numbers match the target schema rows (the cross-reference unifier requires both sides).",
+      "name": "R_X86_64_PC32",
+      "kind": 1,
+      "nativeId": 2
+    },
+    {
+      "$comment": "abs64 -- legal in DATA items only on this arm: the walker patches the slot with the base-relative value AND emits an R_X86_64_RELATIVE row for it (the load slide completes the address); extern-targeted slots emit a symbol-based R_X86_64_64 row with the slot zeroed instead (the c150 review-fold shape).",
+      "name": "R_X86_64_64",
+      "kind": 2,
+      "nativeId": 1
+    },
+    {
+      "name": "R_X86_64_32",
+      "kind": 3,
+      "nativeId": 10
+    }
+  ]
+}

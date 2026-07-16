@@ -103,6 +103,23 @@ TEST(TargetSpec, OutputExtensionElfExecHasNoExtension) {
     EXPECT_EQ(spec.outputExtension(**r), "");
 }
 
+TEST(TargetSpec, OutputExtensionElfDynSoAndPieNoExtension) {
+    // c151 (D-LK1-4 PIE half): the TWO ET_DYN sub-shapes name
+    // differently — a shared library takes `.so`; a PIE is an
+    // EXECUTABLE and takes the exec convention (no extension,
+    // `gcc -pie hello.c -o prog` names it `prog`). Discriminated by
+    // the schema's entry cluster (processExit presence), never a
+    // format-name check.
+    auto so = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-dyn");
+    ASSERT_TRUE(so.has_value());
+    TargetSpec soSpec{"x86_64", "elf64-x86_64-linux-dyn"};
+    EXPECT_EQ(soSpec.outputExtension(**so), ".so");
+    auto pie = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-pie");
+    ASSERT_TRUE(pie.has_value());
+    TargetSpec pieSpec{"x86_64", "elf64-x86_64-linux-pie"};
+    EXPECT_EQ(pieSpec.outputExtension(**pie), "");
+}
+
 TEST(TargetSpec, OutputExtensionPeObjForShippedObjSchema) {
     auto r = ObjectFormatSchema::loadShipped("pe64-x86_64-windows");
     ASSERT_TRUE(r.has_value());

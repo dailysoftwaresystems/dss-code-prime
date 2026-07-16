@@ -132,6 +132,15 @@ constexpr std::uint64_t DT_SYMENT  = 11;
 constexpr std::uint64_t DT_SONAME  = 14;
 constexpr std::uint64_t DT_FLAGS_1 = 0x6ffffffb;
 constexpr std::uint64_t DF_1_NOW   = 1;
+// DF_1_PIE (glibc elf.h / binutils) — marks an ET_DYN as a
+// position-independent EXECUTABLE, not a shared library. Emitted on
+// the PIE sub-mode only (c151, D-LK1-4 PIE half); ground truth: gcc
+// 13.3 default-PIE output carries DT_FLAGS_1 = 0x8000001 (`readelf
+// -d` shows "Flags: NOW PIE" on tag 0x6ffffffb). Modern kernels/
+// tools (execveat protections, readelf's "DYN (Position-Independent
+// Executable file)" label) read this bit to distinguish a PIE from
+// a `.so`.
+constexpr std::uint64_t DF_1_PIE   = 0x08000000;
 
 // Per-machine ELF reloc type for "write resolved symbol VA into GOT
 // slot at load time" (dyld semantics).
@@ -504,7 +513,53 @@ encodeElfExecDynamic(
     //       needs `.dynamic`/`.dynsym`/`.hash` for its exports) and
     //       an extern with an EMPTY libraryPath is LEGAL (undefined,
     //       resolved from ld.so's global scope — no DT_NEEDED row).
+    //
+    // c151 (D-LK1-4 PIE half): ET_DYN splits into TWO sub-shapes,
+    // discriminated by the schema's ENTRY CLUSTER (interpreter +
+    // processExit + entryCallingConvention + processArgs — validate()
+    // pins all-or-none, so `processExit` presence is a faithful
+    // single-member witness):
+    //   * `.so` (no cluster): everything above, unchanged.
+    //   * PIE  (full cluster): a directly-execve'd EXECUTABLE at a
+    //     randomized base — the gcc-default shape. Divergences (b)
+    //     and the e_entry half of (a) REVERT to the exec shapes, at
+    //     BASE-RELATIVE VAs: PT_PHDR + PT_INTERP + `.interp` come
+    //     back, e_entry = the trampoline's base-relative VA (ld.so
+    //     jumps to base + e_entry), and DT_FLAGS_1 gains DF_1_PIE
+    //     alongside DF_1_NOW. e_type STAYS ET_DYN (a PIE is not a
+    //     new object type); (c)-(g) stay the dyn shapes — RELATIVE
+    //     rows, symbol-based extern-address rows, got-indirect data
+    //     imports, exports (the -rdynamic-like stance; harmless in
+    //     an executable and keeps the arm uniform with the `.so`).
+    //     `isExecveImage` below names the union "exec OR PIE" for
+    //     the entry/interp machinery gates.
     bool const isDyn = elfId.objectType == ElfObjectType::Dyn;
+    bool const isPie = isDyn && fmt.processExit().has_value();
+    // Belt for hand-built ObjectFormatData that bypassed validate():
+    // the walker consumes `elf.interpreter` (PT_INTERP) and the
+    // trampoline machinery keyed on `processExit` in lock-step — a
+    // half-cluster here would emit a broken image (see validate()'s
+    // ET_DYN cluster rule), so re-check the two members this walker
+    // actually reads.
+    if (isDyn && (isPie != !elfId.interpreter.empty())) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::string{"elf::encodeElfExecDynamic (ET_DYN): schema '"}
+                 + std::string{fmt.name()}
+                 + "' declares a PARTIAL PIE entry cluster ("
+                 + (isPie ? "processExit present but elf.interpreter "
+                            "empty -- no loader would resolve the "
+                            "trampoline's libc exit import"
+                          : "elf.interpreter present but no "
+                            "processExit -- no trampoline; e_entry "
+                            "would be 0 and the kernel would execute "
+                            "header bytes")
+                 + "). An ET_DYN schema is a .so (neither) or a PIE "
+                   "(both + entryCallingConvention + processArgs); "
+                   "validate() enforces this all-or-none -- this "
+                   "module bypassed it (D-LK1-4).");
+        return {};
+    }
+    bool const isExecveImage = !isDyn || isPie;
 
     // Pre-conditions (caller dispatches on these; re-checked here so
     // the helper is callable from future entry paths too —
@@ -719,7 +774,10 @@ encodeElfExecDynamic(
              "has a loader-assigned module offset -- the local-exec "
              "link-time tpoffs this walker computes are exec-only. "
              "General-dynamic/initial-exec TLS for .so output is not "
-             "implemented (D-LK-DYN-TLS-MODEL).");
+             "implemented (D-LK-DYN-TLS-MODEL). (A PIE, though it IS "
+             "the executable and local-exec would be model-correct for "
+             "its own thread-locals, ships without TLS rows until the "
+             "PT_TLS-under-slide layout is witnessed -- same anchor.)");
         return {};
     }
     // Each present section's schema row is MANDATORY (the format JSON must
@@ -812,17 +870,22 @@ encodeElfExecDynamic(
         libraryOrder.end());
     std::size_t const numExterns = module.externImports.size();
     std::size_t const numLibs = libraryOrder.size();
-    // Defense-in-depth (exec arm): the linker validates per-extern
-    // non-empty `libraryPath` before dispatch (LK6 cycle 2a substrate
-    // + the c143 image reject), so `numLibs == 0` cannot occur via the
+    // Defense-in-depth (exec + PIE arms): the linker validates
+    // per-extern non-empty `libraryPath` before dispatch (LK6 cycle
+    // 2a substrate + the c143 image reject — which the c151 PIE
+    // inherits via `allowsUndefinedImports() == false`), so
+    // `numLibs == 0` with externs present cannot occur via the
     // linker entry path. This guard makes that invariant explicit in
     // case a future caller bypasses the linker (e.g. a writer-only
-    // test harness) — an ET_EXEC with zero DT_NEEDED entries fails at
-    // runtime (dyld has no library to resolve externs from). The
-    // ET_DYN arm is exempt: a `.so` whose externs are all
-    // global-scope-resolved (or that has no externs) legitimately
-    // ships zero DT_NEEDED rows.
-    if (!isDyn && numLibs == 0) {
+    // test harness) — an executable with zero DT_NEEDED entries
+    // fails at runtime (the loader has no library to resolve externs
+    // from). Only the `.so` sub-shape is exempt: its externs may all
+    // be global-scope-resolved (no DT_NEEDED rows — ld.so binds them
+    // from the executable / sibling libraries at load). The
+    // `numExterns > 0` guard is load-bearing for the PIE only (the
+    // exec arm's zero-extern precondition already returned above);
+    // a hand-built zero-extern PIE is as legal as a zero-extern .so.
+    if ((isPie || !isDyn) && numExterns > 0 && numLibs == 0) {
         emit(reporter, DiagnosticCode::K_SymbolUndefined,
              "elf::encodeElfExecDynamic: " +
              std::to_string(numExterns) +
@@ -955,7 +1018,10 @@ encodeElfExecDynamic(
     std::uint16_t idxCursor = 0;
     auto nextIdx = [&]() { return idxCursor++; };
     std::uint16_t const IDX_NULL   = nextIdx();  (void)IDX_NULL;
-    std::uint16_t const IDX_INTERP = isDyn ? std::uint16_t{0} : nextIdx();
+    // `.interp` row exists on every execve'd image (exec AND the
+    // c151 PIE sub-mode); only the `.so` skips it.
+    std::uint16_t const IDX_INTERP =
+        isExecveImage ? nextIdx() : std::uint16_t{0};
     (void)IDX_INTERP;
     std::uint16_t const IDX_TEXT   = nextIdx();  (void)IDX_TEXT;
     std::uint16_t const IDX_RODATA = hasRodataDyn ? nextIdx() : std::uint16_t{0};
@@ -1046,12 +1112,15 @@ encodeElfExecDynamic(
     }
 
     // ── (c) .interp body (NUL-terminated dynamic-linker path) ──
-    // ET_DYN emits none (a shared library is mapped by an already-
-    // running ld.so; validate() guarantees `elf.interpreter` is
-    // empty for dyn schemas) — the vector stays EMPTY so the interp
-    // body/phdr/section emissions below all no-op on the dyn arm.
+    // Emitted on every execve'd image: ET_EXEC and the c151 PIE
+    // sub-mode (the kernel maps the named loader, which relocates
+    // the PIE at a randomized base). The `.so` emits none (mapped by
+    // an already-running ld.so; validate() guarantees
+    // `elf.interpreter` is empty for the entry-cluster-less dyn
+    // shape) — its vector stays EMPTY so the interp body/phdr/
+    // section emissions below all no-op there.
     std::vector<std::uint8_t> interp;
-    if (!isDyn) {
+    if (isExecveImage) {
         for (char c : elfId.interpreter)
             interp.push_back(static_cast<std::uint8_t>(c));
         interp.push_back(0);
@@ -1192,11 +1261,15 @@ encodeElfExecDynamic(
     // sqlite included — BYTE-IDENTICAL to the pre-TLS walker (phtSize/
     // interpOff/every downstream offset shifts ONLY when TLS is
     // present).
-    // DYN (c150): LOAD×2 + DYNAMIC only — no PT_INTERP (loaded by an
-    // already-running ld.so) and no PT_PHDR (an aux-vector nicety for
-    // process images; gcc's `ld -shared` omits it too). TLS-in-dyn was
-    // rejected above, so no PT_TLS arm here.
-    std::uint32_t const numPhdrs = isDyn ? 3u : (hasTls ? 6u : 5u);
+    // DYN `.so` (c150): LOAD×2 + DYNAMIC only — no PT_INTERP (loaded
+    // by an already-running ld.so) and no PT_PHDR (an aux-vector
+    // nicety for process images; gcc's `ld -shared` omits it too).
+    // PIE (c151): the exec 5 — PT_PHDR + PT_INTERP + LOAD×2 +
+    // DYNAMIC (gcc PIE ground truth carries both PHDR and INTERP);
+    // TLS-in-dyn (both sub-shapes) was rejected above, so the PIE
+    // never takes the 6-phdr TLS arm.
+    std::uint32_t const numPhdrs =
+        !isExecveImage ? 3u : (hasTls ? 6u : 5u);
     std::uint64_t const phtOff = kEhdrSize;
     std::uint64_t const phtSize = numPhdrs * kPhdrSize;
     std::uint64_t const interpOff = phtOff + phtSize;
@@ -1404,7 +1477,12 @@ encodeElfExecDynamic(
         appendDyn(DT_RELASZ,  relaDynSz);
         appendDyn(DT_RELAENT, 24);
     }
-    appendDyn(DT_FLAGS_1, DF_1_NOW);
+    // DF_1_NOW = eager binding (both arms, all shapes). The c151 PIE
+    // additionally carries DF_1_PIE — the ET_DYN "this is an
+    // executable, not a library" marker (gcc ground truth: FLAGS_1 =
+    // NOW PIE on default-PIE output; readelf keys its "(Position-
+    // Independent Executable file)" label on it).
+    appendDyn(DT_FLAGS_1, isPie ? (DF_1_NOW | DF_1_PIE) : DF_1_NOW);
     appendDyn(DT_NULL,    0);
     std::uint64_t const dynamicSz = dynamicSec.size();
 
@@ -1516,11 +1594,12 @@ encodeElfExecDynamic(
     }
 
     StringTable shstrtab;
-    // `.interp` name only on the exec arm (the dyn image has no
-    // PT_INTERP / `.interp` row — gated like the tdata/tbss adds
-    // below, so the dyn shstrtab carries no dead name bytes).
+    // `.interp` name on every execve'd image — exec + the c151 PIE
+    // (the `.so` has no PT_INTERP / `.interp` row — gated like the
+    // tdata/tbss adds below, so its shstrtab carries no dead name
+    // bytes).
     std::uint32_t const shsInterp =
-        isDyn ? 0u : shstrtab.add(".interp");
+        isExecveImage ? shstrtab.add(".interp") : 0u;
     auto const shsText     = shstrtab.add(".text");
     // `.rodata` section name (schema row when present, else the literal).
     // Added unconditionally to shstrtab (a few unused bytes when no rodata);
@@ -2058,9 +2137,11 @@ encodeElfExecDynamic(
         appendU64LE(bytes, pMemsz);
         appendU64LE(bytes, pAlign);
     };
-    // PT_PHDR + PT_INTERP: exec arm only (c150 — a `.so` carries
-    // neither; see the numPhdrs comment above).
-    if (!isDyn) {
+    // PT_PHDR + PT_INTERP: every execve'd image — exec AND the c151
+    // PIE (at base-relative VAs there: baseImageVa == 0, ld.so adds
+    // the slide). Only the `.so` carries neither; see the numPhdrs
+    // comment above.
+    if (isExecveImage) {
         appendPhdrEntry(PT_PHDR,    PF_R,        phtOff,       baseImageVa + phtOff,
                         phtSize,        phtSize,        8);
         appendPhdrEntry(PT_INTERP,  PF_R,        interpOff,    interpVa,
@@ -2096,10 +2177,11 @@ encodeElfExecDynamic(
 
     // Section bodies: pad-to-offset + append per section (simplifier
     // #1 + #4 fold using local padToOffset / appendBytes helpers).
-    // `.interp` bytes: exec arm only (the dyn `interp` vector is
-    // empty by construction; skip the pad too — nothing sits between
-    // the PHT and the page-aligned `.text` on the dyn arm).
-    if (!isDyn) { padToOffset(bytes, interpOff); appendBytes(bytes, interp); }
+    // `.interp` bytes: execve'd images only — exec + PIE (the `.so`
+    // `interp` vector is empty by construction; skip the pad too —
+    // nothing sits between the PHT and the page-aligned `.text`
+    // there).
+    if (isExecveImage) { padToOffset(bytes, interpOff); appendBytes(bytes, interp); }
     padToOffset(bytes, textOff);      appendBytes(bytes, text);
     if (hasRodataDyn) { padToOffset(bytes, rodataOff); appendBytes(bytes, rodataDyn); }
     padToOffset(bytes, pltOff);       appendBytes(bytes, plt);
@@ -2141,9 +2223,10 @@ encodeElfExecDynamic(
     // dropped (silent u32/u64 swap-bug surface) in favor of named
     // fields at every call site.
     writeSectionHeader(bytes, SectionHeader{});  // SHT_NULL (slot 0)
-    // `.interp` row: exec arm only (c150 — the dyn header table goes
-    // straight from SHT_NULL to `.text`; IDX_* above matched this).
-    if (!isDyn) {
+    // `.interp` row: execve'd images — exec + the c151 PIE (the
+    // `.so` header table goes straight from SHT_NULL to `.text`;
+    // IDX_* above matched this).
+    if (isExecveImage) {
         writeSectionHeader(bytes, SectionHeader{
             .name_offset = shsInterp, .type = SHT_PROGBITS, .flags = SHF_ALLOC,
             .addr = interpVa, .offset = interpOff, .size = interp.size(),
@@ -2266,14 +2349,20 @@ encodeElfExecDynamic(
     // `sym_<id>` name today (real-name resolution closes with
     // D-LK1-1 / LK7).
     // D-LK10-ENTRY Slice C audit fold: shared resolver.
-    // ET_DYN (c150): a shared library has NO entry — e_entry = 0 and
-    // the resolver is not consulted (nothing downstream reads an
-    // entry: the trampoline was never injected — the dyn schema
+    // ET_DYN `.so` (c150): a shared library has NO entry — e_entry =
+    // 0 and the resolver is not consulted (nothing downstream reads
+    // an entry: the trampoline was never injected — the schema
     // declares no processExit — and ld.so ignores e_entry on
-    // DT_NEEDED objects). The PIE follow-up re-engages the resolver
-    // for its ET_DYN-with-entry shape.
+    // DT_NEEDED objects).
+    // ET_DYN PIE (c151) + ET_EXEC: the resolver runs. Empty
+    // entryPoint defaults to functions[0] — the linker-prepended
+    // `_start` trampoline (keyed on processExit presence, the same
+    // cluster member as `isPie`). On the PIE the resulting entryVa
+    // is BASE-RELATIVE (textVa = pageAlign, baseImageVa == 0); ld.so
+    // transfers control to load_base + e_entry — the gcc PIE shape
+    // (Entry 0x1040-class values in readelf -h).
     std::uint64_t entryVa = 0;
-    if (!isDyn) {
+    if (isExecveImage) {
         auto const entryIdxOpt = link::format::resolveEntryFnIdx(
             module, fmt, "sym_", "elf::encodeElfExecDynamic", reporter);
         if (!entryIdxOpt.has_value()) return {};
@@ -2330,14 +2419,16 @@ encode(AssembledModule const&    module,
                  + ")");
         return {};
     }
-    // c150 (D-LK1-4): ET_DYN (`.so`) routes to the dynamic-image
-    // walker UNCONDITIONALLY — a shared library needs `.dynamic` /
-    // `.dynsym` / `.hash` for its EXPORTS even with zero extern
-    // imports (the exec arm's externs-only entry condition below
-    // does not apply). The dyn arm has no interpreter requirement
-    // (validate() enforces the field is absent); the machine guard
-    // mirrors the exec arm's (the PLT/GLOB_DAT emitters are
-    // per-machine).
+    // c150 + c151 (D-LK1-4): ET_DYN routes to the dynamic-image
+    // walker UNCONDITIONALLY — both sub-shapes need `.dynamic` /
+    // `.dynsym` / `.hash` even with zero extern imports (a `.so` for
+    // its EXPORTS; a PIE for its loader metadata), so the exec arm's
+    // externs-only entry condition below does not apply. The walker
+    // discriminates `.so` vs PIE internally by the schema's entry
+    // cluster (`isPie` — processExit presence; validate() pinned the
+    // cluster all-or-none, and the walker re-checks the two members
+    // it consumes). The machine guard mirrors the exec arm's (the
+    // PLT/GLOB_DAT emitters are per-machine).
     if (fmt.elf().objectType == ElfObjectType::Dyn) {
         std::uint16_t const elfMachine = fmt.elf().machine;
         if (elfMachine != kEmX86_64 && elfMachine != kEmAArch64) {

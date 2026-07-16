@@ -145,6 +145,11 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
             //     `.dynsym` entry + PLT/GOT machinery; no DT_NEEDED row).
             //   * EXEC image: nothing later binds it — an unresolved
             //     reference is a load-time failure; reject LOUD (unchanged).
+            //     c151 (D-LK1-4 PIE half): the ELF ET_DYN PIE is THIS flavor
+            //     — an executable, discriminated from the `.so` by its
+            //     schema's entry cluster (never a format-name check); ld.so
+            //     erroring "symbol lookup error" at ./prog time is exactly
+            //     the deferred-failure class this reject prevents.
             if (!allowUndefinedExterns) {
                 report(reporter, DiagnosticCode::K_SymbolUndefined,
                        DiagnosticSeverity::Error,
@@ -677,9 +682,12 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // ELF ET_DYN `.so` declares NO `processExit` (validate() rejects
     // it there: entry machinery is exec-flavor-only), so no
     // trampoline is synthesized for a shared library (a `.so` has no
-    // entry; e_entry = 0). The PIE-executable follow-up declares
-    // `processExit` on its ET_DYN schema and gets the trampoline
-    // through this same condition, zero gate changes.
+    // entry; e_entry = 0). c151 (the D-LK1-4 PIE half, landed):
+    // the ELF ET_DYN PIE schema declares `processExit` (one of its
+    // entry-cluster members) and gets the trampoline through this
+    // same condition — zero gate changes, exactly as designed; its
+    // e_entry is the trampoline's BASE-RELATIVE VA (ld.so adds the
+    // load base).
     AssembledModule moduleCopy;
     AssembledModule const* moduleP = &inputModule;
     bool const wantTrampoline =

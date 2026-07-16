@@ -1043,10 +1043,10 @@ public:
         }
     }
 
-    // Undefined-extern policy (c150, D-LK1-4 — the c143 gate's third
-    // flavor): may the emitted artifact carry a REFERENCED extern
-    // that no library binds (an undefined symbol resolved by a LATER
-    // binder)?
+    // Undefined-extern policy (c150 + c151, D-LK1-4 — the c143
+    // gate's third flavor): may the emitted artifact carry a
+    // REFERENCED extern that no library binds (an undefined symbol
+    // resolved by a LATER binder)?
     //   * relocatable (.o/.obj)  → TRUE — the final (foreign) linker
     //     resolves SHN_UNDEF symbols against sibling objects /
     //     libraries (D-LK-OBJECT-NOLIB-EXTERN-RELOCATABLE, c143);
@@ -1057,15 +1057,23 @@ public:
     //   * executable images      → FALSE — nothing later binds them;
     //     an unresolved reference is a load-time failure, so the
     //     linker rejects LOUD at build time (c143, unchanged).
-    // Schema-driven (declared objectType), never a format-name
-    // branch. PE Dll (when its arm lands) stays FALSE — Windows
-    // DLLs resolve every import at link time; Mach-O dylib default
-    // two-level namespace likewise (a flat-namespace opt-in would
-    // flip its arm then).
+    // c151: an ELF ET_DYN PIE is an EXECUTABLE — FALSE, exactly like
+    // ET_EXEC (ld.so erroring "symbol lookup error" at ./prog time
+    // is the deferred-failure class the c143 gate exists to
+    // prevent). The PIE discriminator is ENTRY-CLUSTER presence on
+    // the dyn schema (validate() pins the cluster all-or-none, so
+    // `processExit` presence is a faithful single-member witness) —
+    // never a format-name check.
+    // Schema-driven (declared objectType + declared entry cluster),
+    // never a format-name branch. PE Dll (when its arm lands) stays
+    // FALSE — Windows DLLs resolve every import at link time; Mach-O
+    // dylib default two-level namespace likewise (a flat-namespace
+    // opt-in would flip its arm then).
     [[nodiscard]] bool allowsUndefinedImports() const noexcept {
         if (!isImageFlavor()) return true;   // relocatable: later linker resolves
         return d_.kind == ObjectFormatKind::Elf
-            && d_.elf.objectType == ElfObjectType::Dyn;
+            && d_.elf.objectType == ElfObjectType::Dyn
+            && !d_.processExit.has_value();  // .so only — a PIE is an executable
     }
 
     // Image-side entry-point symbol name. Empty for relocatable

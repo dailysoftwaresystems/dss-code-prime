@@ -28,6 +28,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "core/types/symbol_attrs.hpp"
 #include "core/types/target_schema.hpp"
+#include "link/entry_trampoline.hpp"
 #include "link/format/elf.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
@@ -69,7 +70,7 @@ struct Loaded {
     std::shared_ptr<ObjectFormatSchema> format;
 };
 
-[[nodiscard]] Loaded loadShippedDyn() {
+[[nodiscard]] Loaded loadShippedElfImage(std::string_view formatName) {
     Loaded out;
     auto t = TargetSchema::loadShipped("x86_64");
     if (!t.has_value()) {
@@ -78,14 +79,24 @@ struct Loaded {
     } else {
         out.target = std::move(t).value();
     }
-    auto f = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-dyn");
+    auto f = ObjectFormatSchema::loadShipped(formatName);
     if (!f.has_value()) {
-        ADD_FAILURE() << "loadShipped(elf64-x86_64-linux-dyn) failed";
+        ADD_FAILURE() << "loadShipped(" << formatName << ") failed";
         for (auto const& d : f.error()) ADD_FAILURE() << "  " << d.message;
     } else {
         out.format = std::move(f).value();
     }
     return out;
+}
+
+[[nodiscard]] Loaded loadShippedDyn() {
+    return loadShippedElfImage("elf64-x86_64-linux-dyn");
+}
+
+// c151 (D-LK1-4 PIE half): the PIE sibling — ET_DYN + the full
+// entry cluster.
+[[nodiscard]] Loaded loadShippedPie() {
+    return loadShippedElfImage("elf64-x86_64-linux-pie");
 }
 
 // ── Parsed-image helpers ─────────────────────────────────────────
@@ -313,6 +324,11 @@ constexpr std::uint64_t kDtNeeded = 1;
 constexpr std::uint64_t kDtSoname = 14;
 constexpr std::uint64_t kDtRela   = 7;
 constexpr std::uint64_t kDtRelasz = 8;
+constexpr std::uint64_t kDtFlags1 = 0x6ffffffb;
+constexpr std::uint64_t kDf1Now   = 1;
+constexpr std::uint64_t kDf1Pie   = 0x08000000;
+constexpr std::uint32_t kPtLoad   = 1;
+constexpr std::uint32_t kPtDynamic = 2;
 constexpr std::uint32_t kPtInterp = 3;
 constexpr std::uint32_t kPtPhdr   = 6;
 constexpr std::uint32_t kRGlobDat = 6;
@@ -844,6 +860,34 @@ TEST(ElfDynLinker, ReferencedNoLibraryExternKeptForDynRejectedForExec) {
         EXPECT_TRUE(sawUndef)
             << "an exec image still rejects referenced no-library externs";
     }
+    // PIE (c151, D-LK1-4 PIE half): an ET_DYN PIE is an EXECUTABLE —
+    // exec semantics, NOT .so semantics. Nothing later resolves a
+    // missing symbol (ld.so erroring "symbol lookup error" at ./prog
+    // time is the deferred-failure class the c143 gate prevents), so
+    // the referenced no-library extern rejects loud at link time.
+    // The discriminator is the schema's entry cluster (processExit
+    // presence), never a format-name check — pinned by the shipped
+    // pie schema flowing through the SAME linker gate as exec.
+    {
+        auto pieFmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-pie");
+        ASSERT_TRUE(pieFmt.has_value());
+        EXPECT_FALSE((*pieFmt)->allowsUndefinedImports())
+            << "a PIE is an executable -- undefined imports must reject";
+        AssembledModule mod = makeExternCallModule("");
+        DiagnosticReporter rep;
+        auto image = linker::link(mod, **target, **pieFmt, rep);
+        EXPECT_FALSE(image.ok());
+        bool sawUndef = false;
+        for (auto const& d : rep.all()) {
+            if (d.code == DiagnosticCode::K_SymbolUndefined
+                && d.actual.find("puts") != std::string::npos) {
+                sawUndef = true;
+            }
+        }
+        EXPECT_TRUE(sawUndef)
+            << "a PIE rejects referenced no-library externs (exec "
+               "semantics keyed on the entry cluster)";
+    }
 }
 
 // ── Fail-loud belts ─────────────────────────────────────────────
@@ -904,6 +948,275 @@ TEST(ElfDynWriter, AbsoluteTextRelocFailsLoudOnDynArm) {
         }
     }
     EXPECT_TRUE(saw);
+}
+
+// ── PIE: ET_DYN + PT_INTERP + entry (c151, D-LK1-4 PIE half) ─────
+//
+// A PIE is the modern-distro-default executable shape: ET_DYN +
+// PT_PHDR + PT_INTERP + non-zero e_entry + DT_FLAGS_1 DF_1_PIE (gcc
+// 13.3 default-PIE ground truth, witnessed via readelf: Type "DYN
+// (Position-Independent Executable file)", Entry 0x1040, PHDR +
+// INTERP phdrs, FLAGS_1 "NOW PIE"). The schema discriminator is the
+// ENTRY CLUSTER (elf.interpreter + processExit +
+// entryCallingConvention + processArgs) on an ET_DYN schema — all
+// four or none; never a new elf.type.
+
+TEST(ElfPieFormatJson, ShippedPieFileLoadsWithPieShape) {
+    auto loaded = loadShippedPie();
+    ASSERT_TRUE(loaded.format);
+    EXPECT_EQ(loaded.format->kind(), ObjectFormatKind::Elf);
+    EXPECT_EQ(loaded.format->name(), "elf64-x86_64-linux-pie");
+    EXPECT_EQ(loaded.format->elf().objectType, ElfObjectType::Dyn)
+        << "a PIE IS ET_DYN -- no new object type";
+    // Image flavor: load-time-bound, exec-bit-worthy (writeImage +x).
+    EXPECT_TRUE(loaded.format->isImageFlavor());
+    // POLICY: a PIE is an EXECUTABLE — undefined imports REJECT
+    // (unlike the .so sibling). Keyed on the entry cluster.
+    EXPECT_FALSE(loaded.format->allowsUndefinedImports());
+    // The full entry cluster is present.
+    EXPECT_EQ(loaded.format->elf().interpreter,
+              "/lib64/ld-linux-x86-64.so.2");
+    ASSERT_TRUE(loaded.format->processExit().has_value());
+    EXPECT_EQ(loaded.format->processExit()->mechanism,
+              ExitMechanism::ByNameImport);
+    EXPECT_EQ(loaded.format->processExit()->importMangledName, "exit");
+    EXPECT_EQ(loaded.format->processExit()->importLibraryPath,
+              "libc.so.6");
+    EXPECT_EQ(loaded.format->entryCallingConvention(), "sysv_amd64");
+    EXPECT_TRUE(loaded.format->processArgs().has_value());
+    // Dyn-shape carryovers: got-indirect data imports, no soname,
+    // base-0 text VA convention.
+    ASSERT_TRUE(loaded.format->dataImportBinding().has_value());
+    EXPECT_EQ(*loaded.format->dataImportBinding(),
+              DataImportBinding::GotIndirect);
+    EXPECT_TRUE(loaded.format->elf().soname.empty());
+    auto const* secText = loaded.format->sectionByKind(SectionKind::Text);
+    ASSERT_NE(secText, nullptr);
+    EXPECT_EQ(secText->virtualAddress, loaded.format->elf().pageAlign);
+    // Cross-check: the .so sibling KEEPS the permissive policy — the
+    // two ET_DYN sub-shapes diverge exactly on the cluster.
+    auto dynFmt = ObjectFormatSchema::loadShipped("elf64-x86_64-linux-dyn");
+    ASSERT_TRUE(dynFmt.has_value());
+    EXPECT_TRUE((*dynFmt)->allowsUndefinedImports());
+    EXPECT_FALSE((*dynFmt)->processExit().has_value());
+}
+
+TEST(ElfPieFormatJson, PartialEntryClusterRejectedAtLoad) {
+    // (a) interpreter alone (a .so with a stray PT_INTERP path — the
+    // pre-c151 reject, now owned by the all-or-none cluster rule).
+    auto a = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "LP64",
+      "format": {"name":"dyn-half-interp","kind":"elf"},
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_FALSE(a.has_value())
+        << "interpreter without the rest of the entry cluster must "
+           "reject (no trampoline -> e_entry = 0 executes header "
+           "bytes)";
+    // (b) the trampoline trio WITHOUT the interpreter — a PIE with
+    // no loader to resolve its libc exit import.
+    auto b = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "LP64",
+      "format": {"name":"dyn-half-exit","kind":"elf"},
+      "externCallDispatch": "direct-plt",
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
+      "processArgs": {"mechanism":"stack-vector","argcStackOffset":0,"argvStackOffset":8},
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_FALSE(b.has_value())
+        << "processExit/cc/processArgs without elf.interpreter must "
+           "reject (half-configured PIE)";
+    // (c) interpreter + processExit + cc but NO processArgs — the
+    // sneakiest half-state: the image would load and run, but
+    // main(argc, argv) would read process-entry register garbage.
+    auto c = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "LP64",
+      "format": {"name":"dyn-half-args","kind":"elf"},
+      "externCallDispatch": "direct-plt",
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2" },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_FALSE(c.has_value())
+        << "a PIE cluster missing processArgs must reject (main's "
+           "argc/argv would be register garbage)";
+}
+
+TEST(ElfPieFormatJson, SonameWithEntryClusterRejectedAtLoad) {
+    // A PIE is not a library: DT_SONAME is legal-but-meaningless ELF
+    // there (only DT_NEEDED lookups read it; nothing links against a
+    // PIE) — rejecting keeps configs honest.
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "LP64",
+      "format": {"name":"pie-with-soname","kind":"elf"},
+      "externCallDispatch": "direct-plt",
+      "processExit": {"mechanism":"by-name-import","importMangledName":"exit","importLibraryPath":"libc.so.6"},
+      "entryCallingConvention": "sysv_amd64",
+      "processArgs": {"mechanism":"stack-vector","argcStackOffset":0,"argvStackOffset":8},
+      "elf": { "class":"elf64", "data":"lsb", "machine": 62, "type":"dyn", "pageAlign": 4096, "interpreter": "/lib64/ld-linux-x86-64.so.2", "soname": "libnot-a-lib.so.1" },
+      "sections":[{"kind":"text","name":".text","type":1,"flags":6,"addrAlign":16,"entrySize":0,"virtualAddress":4096}]
+    })");
+    ASSERT_FALSE(r.has_value())
+        << "soname + entry cluster must reject (a PIE is not a "
+           "library)";
+}
+
+// ── PIE writer: header/phdr/dynamic pins ────────────────────────
+
+// One user fn `mov eax,42; ret` — the linker prepends the `_start`
+// trampoline (keyed on the pie schema's processExit) exactly as on
+// the ET_EXEC arm.
+[[nodiscard]] AssembledModule makeReturn42UserModule() {
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "main",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    return mod;
+}
+
+TEST(ElfPieWriter, HeaderPinsNonZeroEntryPhdrInterpFlags1Pie) {
+    auto loaded = loadShippedPie();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeReturn42UserModule();
+    DiagnosticReporter rep;
+    auto image = linker::link(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_TRUE(image.ok());
+    ASSERT_FALSE(image.bytes.empty());
+    auto const& bytes = image.bytes;
+    // The trampoline was prepended EXACTLY ONCE: 1 user fn + 1.
+    EXPECT_EQ(image.expectedFuncCount, 2u)
+        << "linker must prepend the _start trampoline exactly once "
+           "(processExit-keyed, same condition as ET_EXEC)";
+    // e_type stays ET_DYN — a PIE is not a new object type.
+    EXPECT_EQ(readU16LE(bytes, 16), 3u) << "e_type must be ET_DYN";
+    // e_entry: NON-zero, BASE-RELATIVE — the trampoline sits at
+    // functions[0] = the start of .text = pageAlign (base-0 image).
+    // ld.so jumps to load_base + e_entry (the gcc PIE shape).
+    EXPECT_EQ(readU64LE(bytes, 24), 0x1000u)
+        << "e_entry = the trampoline's base-relative VA (.text head)";
+    // Program headers: the exec five — PHDR, INTERP, LOAD x2,
+    // DYNAMIC (gcc PIE ground truth carries PHDR + INTERP).
+    std::uint64_t const phoff = readU64LE(bytes, 32);
+    std::uint16_t const phnum = readU16LE(bytes, 56);
+    EXPECT_EQ(phnum, 5u);
+    std::size_t nPhdr = 0, nInterp = 0, nLoad = 0, nDynamic = 0;
+    std::uint64_t interpVaddr = 0, interpFilesz = 0;
+    for (std::uint16_t i = 0; i < phnum; ++i) {
+        std::uint64_t const off = phoff + i * 56ull;
+        switch (readU32LE(bytes, off)) {
+            case kPtPhdr:    ++nPhdr; break;
+            case kPtInterp:
+                ++nInterp;
+                interpVaddr  = readU64LE(bytes, off + 16);
+                interpFilesz = readU64LE(bytes, off + 32);
+                break;
+            case kPtLoad:    ++nLoad; break;
+            case kPtDynamic: ++nDynamic; break;
+            default: break;
+        }
+    }
+    EXPECT_EQ(nPhdr, 1u)    << "PT_PHDR present (execve'd image)";
+    EXPECT_EQ(nInterp, 1u)  << "PT_INTERP present (the kernel maps ld.so)";
+    EXPECT_EQ(nLoad, 2u);
+    EXPECT_EQ(nDynamic, 1u);
+    // The .interp section carries the loader path at the PT_INTERP VA.
+    auto const secs = readSections(bytes);
+    Shdr const* interp = findSection(secs, ".interp");
+    ASSERT_NE(interp, nullptr);
+    EXPECT_EQ(interp->addr, interpVaddr);
+    EXPECT_EQ(interp->size, interpFilesz);
+    EXPECT_EQ(readCStr(bytes, interp->offset),
+              "/lib64/ld-linux-x86-64.so.2");
+    // DT_FLAGS_1 carries DF_1_PIE alongside the eager-binding NOW —
+    // the "executable, not library" ET_DYN marker (readelf keys its
+    // "Position-Independent Executable" label on it).
+    auto const dyn = readDynamic(bytes, secs);
+    auto const flags1 = dynValue(dyn, kDtFlags1);
+    ASSERT_TRUE(flags1.has_value());
+    EXPECT_EQ(*flags1, kDf1Now | kDf1Pie)
+        << "DT_FLAGS_1 must be NOW | PIE (gcc ground truth)";
+    // The trampoline's libc exit import produced DT_NEEDED libc.so.6
+    // + one PLT stub.
+    auto const needed = dynValue(dyn, kDtNeeded);
+    ASSERT_TRUE(needed.has_value());
+    Shdr const* dynstr = findSection(secs, ".dynstr");
+    ASSERT_NE(dynstr, nullptr);
+    EXPECT_EQ(readCStr(bytes, dynstr->offset + *needed), "libc.so.6");
+    Shdr const* plt = findSection(secs, ".plt");
+    ASSERT_NE(plt, nullptr);
+    EXPECT_EQ(plt->size, 6u) << "one x86_64 PLT stub (the exit import)";
+
+    // Control: the .so sibling stays entry-less and PIE-flag-less —
+    // FLAGS_1 == NOW only, e_entry == 0, no PT_INTERP (red if the
+    // isPie sub-mode ever leaks into the entry-cluster-less shape).
+    auto dynLoaded = loadShippedDyn();
+    ASSERT_TRUE(dynLoaded.target && dynLoaded.format);
+    AssembledModule soMod = makeExternCallModule("libc.so.6");
+    DiagnosticReporter soRep;
+    auto soBytes = elf::encode(soMod, *dynLoaded.target,
+                               *dynLoaded.format, soRep);
+    ASSERT_EQ(soRep.errorCount(), 0u);
+    ASSERT_FALSE(soBytes.empty());
+    EXPECT_EQ(readU64LE(soBytes, 24), 0u) << ".so keeps e_entry = 0";
+    auto const soSecs = readSections(soBytes);
+    auto const soDyn = readDynamic(soBytes, soSecs);
+    auto const soFlags1 = dynValue(soDyn, kDtFlags1);
+    ASSERT_TRUE(soFlags1.has_value());
+    EXPECT_EQ(*soFlags1, kDf1Now)
+        << ".so DT_FLAGS_1 must stay NOW-only (no DF_1_PIE)";
+    EXPECT_EQ(findSection(soSecs, ".interp"), nullptr)
+        << ".so carries no .interp";
+}
+
+TEST(ElfPieWriter, TrampolinePrependedExactlyOnceAtFunctionsZero) {
+    // Direct injectEntryTrampoline pin against the pie schema —
+    // mirrors the exec-arm SyntheticExitProcessExternThreadsThroughIat
+    // shape: the trampoline lands at functions[0] exactly once, wires
+    // the libc exit extern, and targets the user entry via REL32.
+    auto loaded = loadShippedPie();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    AssembledModule mod = makeReturn42UserModule();
+    SymbolId const userSym = mod.functions[0].symbol;
+    DiagnosticReporter rep;
+    ASSERT_TRUE(linker::injectEntryTrampoline(mod, *loaded.target,
+                                              *loaded.format, rep));
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_EQ(mod.functions.size(), 2u)
+        << "exactly one trampoline prepended";
+    EXPECT_EQ(mod.expectedFuncCount, 2u);
+    ASSERT_TRUE(mod.imageEntryOverride.has_value());
+    EXPECT_EQ(*mod.imageEntryOverride, 0u)
+        << "the trampoline IS functions[0]";
+    EXPECT_EQ(mod.functions[1].symbol.v, userSym.v)
+        << "the user fn keeps its slot behind the trampoline";
+    // The exit extern rides the pie schema's processExit block.
+    ASSERT_EQ(mod.externImports.size(), 1u);
+    EXPECT_EQ(mod.externImports[0].mangledName, "exit");
+    EXPECT_EQ(mod.externImports[0].libraryPath, "libc.so.6");
+    // The trampoline body targets BOTH the user entry and the exit
+    // import (each via a relocation).
+    auto const& tramp = mod.functions[0];
+    bool callsUser = false, callsExit = false;
+    for (auto const& rel : tramp.relocations) {
+        if (rel.target.v == userSym.v) callsUser = true;
+        if (rel.target.v == mod.externImports[0].symbol.v) callsExit = true;
+    }
+    EXPECT_TRUE(callsUser) << "trampoline must call the user entry";
+    EXPECT_TRUE(callsExit) << "trampoline must call the libc exit import";
 }
 
 TEST(ElfDynWriter, RelocBearingRodataFailsLoudOnDynArm) {

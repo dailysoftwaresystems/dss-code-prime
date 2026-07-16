@@ -195,16 +195,21 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
             // The walker (LK6 cycle 2b — D-LK6-4) enforces non-empty
             // when externImports is non-empty.
         }
-        // ── ET_DYN (`.so`) shape rules — c150, D-LK1-4 shared-library
-        // half. An ELF shared library is a base-0, loader-slid,
-        // ENTRY-LESS image: ld.so maps it at an arbitrary base and
-        // adds the load bias to every base-relative VA. The schema
-        // must therefore declare the base-0 layout and must NOT
-        // declare any of the exec-only entry machinery. The PIE
-        // EXECUTABLE follow-up (the D-LK1-4 remainder) is exactly
-        // where these rules relax: a PIE is ET_DYN + PT_INTERP +
-        // entry trampoline — that cycle lifts the interpreter /
-        // entryPoint rejects below for its schema shape.
+        // ── ET_DYN shape rules — c150 (shared-library half) + c151
+        // (PIE half), D-LK1-4. An ELF ET_DYN schema describes ONE of
+        // exactly TWO artifact shapes, discriminated by ENTRY-CLUSTER
+        // presence (never a new e_type — a PIE IS ET_DYN):
+        //   * a SHARED LIBRARY (`.so`): loaded by an already-running
+        //     ld.so; no process entry — NONE of the entry cluster.
+        //   * a POSITION-INDEPENDENT EXECUTABLE (PIE): execve'd
+        //     directly; the kernel maps ld.so via PT_INTERP, ld.so
+        //     relocates the image at a randomized base and jumps to
+        //     base + e_entry — ALL of the entry cluster (the modern
+        //     gcc-default executable shape: ET_DYN + PT_PHDR +
+        //     PT_INTERP + non-zero e_entry + DF_1_PIE).
+        // Both are base-0, loader-slid images: the base-0 layout
+        // rules below (pageAlign + text VA == pageAlign) apply to
+        // both shapes uniformly.
         if (elf.objectType == ElfObjectType::Dyn) {
             if (elf.pageAlign == 0) {
                 fail("/elf/pageAlign",
@@ -243,28 +248,85 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "page zero. D-LK1-4.",
                                  secText->virtualAddress, elf.pageAlign));
             }
-            if (!elf.interpreter.empty()) {
-                fail("/elf/interpreter",
-                     std::format("ELF ET_DYN format must not declare "
-                                 "'elf.interpreter' (got '{}'). A "
-                                 "shared library is loaded by an "
-                                 "already-running dynamic linker and "
-                                 "carries no PT_INTERP. The PIE "
-                                 "executable (ET_DYN + PT_INTERP) is "
-                                 "the anchored D-LK1-4 follow-up; its "
-                                 "cycle lifts this rule for the PIE "
-                                 "schema shape.",
-                                 elf.interpreter));
+            // The ENTRY CLUSTER (c151, D-LK1-4 PIE half). Exactly
+            // FOUR fields form it:
+            //   1. `elf.interpreter`        (the PT_INTERP path)
+            //   2. `processExit`            (termination mechanism)
+            //   3. `entryCallingConvention` (paired with processExit
+            //      by the generic §2.13 rule below)
+            //   4. `processArgs`            (argc/argv materialization)
+            // ALL FOUR present = a PIE; NONE = a `.so`. A half-
+            // configured state is a schema bug that would emit a
+            // broken image either way (an interpreter with no
+            // trampoline leaves e_entry = 0 — the kernel jumps to the
+            // load base and executes header bytes; a trampoline with
+            // no interpreter emits no PT_INTERP — execve gets no
+            // loader to resolve the trampoline's libc `exit` import),
+            // so it rejects loud naming exactly which members are
+            // missing. `entryPoint` is NOT a cluster member: empty
+            // means "functions[0]" on every exec-flavored schema
+            // (the shipped exec JSONs all leave it empty), so its
+            // presence cannot discriminate — it is instead rejected
+            // on the `.so` shape below.
+            bool const hasInterp = !elf.interpreter.empty();
+            bool const hasExit   = processExit.has_value();
+            bool const hasCc     = !entryCallingConvention.empty();
+            bool const hasArgs   = processArgs.has_value();
+            int const clusterCount = static_cast<int>(hasInterp)
+                                   + static_cast<int>(hasExit)
+                                   + static_cast<int>(hasCc)
+                                   + static_cast<int>(hasArgs);
+            bool const isPieShape = clusterCount == 4;
+            if (clusterCount != 0 && !isPieShape) {
+                fail("/elf",
+                     std::format(
+                         "ELF ET_DYN format declares a PARTIAL entry "
+                         "cluster -- elf.interpreter: {}, processExit: "
+                         "{}, entryCallingConvention: {}, processArgs: "
+                         "{}. An ET_DYN schema is EITHER a shared "
+                         "library (NONE of the four) or a PIE "
+                         "executable (ALL FOUR: ET_DYN + PT_INTERP + "
+                         "entry trampoline, the gcc-default shape). A "
+                         "half-configured state would emit a broken "
+                         "image (no-trampoline: e_entry = 0 executes "
+                         "header bytes; no-interpreter: no loader to "
+                         "resolve the trampoline's libc exit import). "
+                         "D-LK1-4.",
+                         hasInterp ? "present" : "MISSING",
+                         hasExit   ? "present" : "MISSING",
+                         hasCc     ? "present" : "MISSING",
+                         hasArgs   ? "present" : "MISSING"));
             }
-            if (!entryPoint.empty()) {
+            if (!entryPoint.empty() && !isPieShape) {
                 fail("/entryPoint",
                      std::format("ELF ET_DYN format must not declare "
-                                 "'entryPoint' (got '{}') -- a shared "
+                                 "'entryPoint' (got '{}') without the "
+                                 "full PIE entry cluster -- a shared "
                                  "library has no process entry "
-                                 "(e_entry = 0). The PIE executable "
-                                 "follow-up (D-LK1-4) owns the ET_DYN "
-                                 "entry story.",
+                                 "(e_entry = 0). On a PIE schema "
+                                 "(interpreter + processExit + "
+                                 "entryCallingConvention + processArgs "
+                                 "all present) a non-empty entryPoint "
+                                 "is legal and names the user entry "
+                                 "function. D-LK1-4.",
                                  entryPoint));
+            }
+            // A PIE is NOT a library: nothing ever links against it,
+            // so DT_SONAME (read only by DT_NEEDED lookups) is
+            // legal-but-meaningless ELF there. Rejecting keeps
+            // configs honest — a soname on a PIE schema is a
+            // copy-paste from the `.so` sibling.
+            if (isPieShape && !elf.soname.empty()) {
+                fail("/elf/soname",
+                     std::format("ELF ET_DYN PIE format (full entry "
+                                 "cluster) must not declare "
+                                 "'elf.soname' (got '{}') -- DT_SONAME "
+                                 "names a shared library for DT_NEEDED "
+                                 "lookups; nothing links against a "
+                                 "PIE, so the field is dead config "
+                                 "copy-pasted from the .so sibling. "
+                                 "D-LK1-4.",
+                                 elf.soname));
             }
             // A `.so` cannot host copy relocations — R_*_COPY is the
             // EXECUTABLE's mechanism (the exec owns the one canonical
@@ -900,25 +962,38 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
 
     // Cross-format exec-flavor invariant (type-design Q5 convergence
     // + type-design O1 post-audit fold). Since c150 this predicate
-    // is DELIBERATELY NARROWER than `isImageFlavor()`: ELF ET_DYN is
-    // an image flavor (load-time-bound) but NOT an exec flavor — a
-    // `.so` has no entry, so the entry-machinery legality gates below
-    // (processExit / entryCallingConvention / processArgs) and this
-    // Text-VA rule exclude it (the dyn Text-row + VA==pageAlign rule
-    // lives in the ELF block above). The PIE-executable follow-up
-    // (D-LK1-4 remainder) is where an ET_DYN schema joins the
-    // exec-flavor set.
+    // is DELIBERATELY NARROWER than `isImageFlavor()`: an ELF ET_DYN
+    // `.so` is an image flavor (load-time-bound) but NOT an exec
+    // flavor — it has no entry, so the entry-machinery legality
+    // gates below (processExit / entryCallingConvention /
+    // processArgs) exclude it (the dyn Text-row + VA==pageAlign rule
+    // lives in the ELF block above). c151 (D-LK1-4 PIE half): an
+    // ET_DYN schema carrying the FULL entry cluster (interpreter +
+    // processExit + entryCallingConvention + processArgs — the
+    // all-or-none rule above already rejected partial states) is a
+    // PIE EXECUTABLE and joins the exec-flavor set, making its entry
+    // machinery legal here. The cluster is re-derived from the same
+    // four fields (single source of truth with the ELF-block rule).
     //
     // A single source of truth tying the image-side triplet:
     //   format declares "executable mode" ⟺ a Text-section row
     //   declares a non-zero virtualAddress (where to load it).
     // `entryPoint` is independent (empty defaults to functions[0];
-    // non-empty resolves by name) — NOT cross-tied here. All three
-    // image arms (ELF ET_EXEC, PE PE32+ Exec/Dll, Mach-O MH_EXECUTE)
-    // inherit this gate uniformly.
+    // non-empty resolves by name) — NOT cross-tied here. All image
+    // arms (ELF ET_EXEC + ET_DYN-PIE, PE PE32+ Exec/Dll, Mach-O
+    // MH_EXECUTE) inherit this gate uniformly (an ET_DYN Text row
+    // carries VA == pageAlign != 0, so the rule below is consistent
+    // for the PIE by construction).
+    bool const elfDynPieShape =
+        kind == ObjectFormatKind::Elf
+     && elf.objectType == ElfObjectType::Dyn
+     && !elf.interpreter.empty()
+     && processExit.has_value()
+     && !entryCallingConvention.empty()
+     && processArgs.has_value();
     bool const isExecFlavor =
         (kind == ObjectFormatKind::Elf
-         && elf.objectType == ElfObjectType::Exec)
+         && (elf.objectType == ElfObjectType::Exec || elfDynPieShape))
      || (kind == ObjectFormatKind::Pe
          && pe.objectType != PeObjectType::Obj)
      || (kind == ObjectFormatKind::MachO
@@ -981,9 +1056,11 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     if (processExit.has_value() && !isExecFlavor) {
         fail("/processExit",
              "processExit is only legal on exec-flavored formats "
-             "(ELF ET_EXEC / PE PE32+ Exec/Dll / Mach-O MH_EXECUTE). "
+             "(ELF ET_EXEC / ELF ET_DYN PIE with the full entry "
+             "cluster / PE PE32+ Exec/Dll / Mach-O MH_EXECUTE). "
              "Relocatable artifacts (.o / Obj / Object) cannot have "
-             "an entry trampoline. (D-LK10-ENTRY §2.13.)");
+             "an entry trampoline, and an ELF ET_DYN shared library "
+             "has no entry. (D-LK10-ENTRY 2.13 / D-LK1-4.)");
     }
     if (!entryCallingConvention.empty() && !isExecFlavor) {
         fail("/entryCallingConvention",
@@ -1008,7 +1085,8 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     if (processArgs.has_value() && !isExecFlavor) {
         fail("/processArgs",
              "processArgs is only legal on exec-flavored formats "
-             "(ELF ET_EXEC / PE PE32+ Exec/Dll / Mach-O MH_EXECUTE). "
+             "(ELF ET_EXEC / ELF ET_DYN PIE with the full entry "
+             "cluster / PE PE32+ Exec/Dll / Mach-O MH_EXECUTE). "
              "Relocatable artifacts (.o / Obj / Object) have no entry "
              "trampoline to materialize arguments in. "
              "(D-RUNTIME-MAIN-ARGC-ARGV.)");
