@@ -37,6 +37,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -477,6 +478,569 @@ TEST(MachOWriter, Arm64RelocationInfoPacksPage21) {
     EXPECT_EQ((rInfo >> 25) & 0x3u, 2u);            // r_length = 2 (4 bytes)
     EXPECT_EQ((rInfo >> 24) & 0x1u, 1u);            // r_pcrel = 1
     EXPECT_EQ(rInfo & 0x00FFFFFFu, 1u);             // symtab index of the extern target
+}
+
+// ── D-LK-OBJECT-DATA-SECTION-RELOCATABLE (Mach-O MH_OBJECT arm, c147) ──
+//
+// The arm64 MH_OBJECT writer emits DATA sections — the Mach-O analog of
+// the ELF c142 ET_REL arm (+ the c145 data-relocation emission). Layout
+// constants for a TWO-section .o (used by the pins below):
+//   header 32 | LC_SEGMENT_64 @32 (segname@40, vmaddr@56, vmsize@64,
+//   fileoff@72, filesize@80, nsects@96) | section_64[0] __text @104
+//   (reloff@160, nreloc@164) | section_64[1] @184 (sectname@184,
+//   segname@200, addr@216, size@224, offset@232, align@236, reloff@240,
+//   nreloc@244, flags@248) | LC_SYMTAB @264 (symoff@272, nsyms@276,
+//   stroff@280) | section bytes @288 (= 32 + 72 + 2*80 + 24).
+
+namespace {
+// Read a NUL-terminated name from the string table.
+[[nodiscard]] std::string readStrtabName(std::vector<std::uint8_t> const& bytes,
+                                          std::size_t stroff,
+                                          std::uint32_t nStrx) {
+    std::string name;
+    for (std::size_t p = stroff + nStrx; p < bytes.size() && bytes[p] != 0; ++p)
+        name.push_back(static_cast<char>(bytes[p]));
+    return name;
+}
+// Compare a 16-byte section_64 name field with an expected string.
+[[nodiscard]] bool name16Equals(std::vector<std::uint8_t> const& bytes,
+                                 std::size_t off, std::string_view expect) {
+    char buf[17] = {};
+    std::memcpy(buf, bytes.data() + off, 16);
+    return std::string_view{buf} == expect;
+}
+} // namespace
+
+// (1) A function + one rodata item: the section count grows to 2, the
+// `__TEXT,__const` section_64 carries the right sectname/segname/addr/
+// offset/size/flags, the data symbol's nlist is N_SECT|N_EXT with
+// n_sect = 2 and n_value = the FLAT address (section addr + item offset —
+// Mach-O n_value is an address, not ELF's section-relative st_value), and
+// the name is the real pre-mangled `_msg` (definedName). RED-on-disable:
+// revert the data-section emission → nsects stays 1 and nsyms stays 1.
+TEST(MachOWriter, Arm64ObjectRodataItemEmitsConstSectionAndDataSymbol) {
+    auto loaded = loadShippedArm64();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};   // arm64 RET (4 bytes)
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "_greet",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Rodata;
+    d.bytes     = {'h', 'i', 0};
+    d.alignment = Alignment::of<1>();
+    mod.dataItems.push_back(std::move(d));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{42}, "_msg",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    // Two sections: sizeofcmds = 72 + 2*80 + 24 = 256; nsects = 2.
+    EXPECT_EQ(readU32LE(bytes, 16), 2u);     // ncmds unchanged
+    EXPECT_EQ(readU32LE(bytes, 20), 256u);   // sizeofcmds
+    EXPECT_EQ(readU32LE(bytes, 96), 2u);     // nsects
+    // Flat layout: text 4 bytes at addr 0; rodata at alignUp(4, 8) = 8
+    // (schema floor 8 raw bytes), span 3. vmsize = filesize = 11.
+    EXPECT_EQ(readU64LE(bytes, 64), 11u);    // vmsize
+    EXPECT_EQ(readU64LE(bytes, 72), 288u);   // fileoff (header+cmds)
+    EXPECT_EQ(readU64LE(bytes, 80), 11u);    // filesize (all file-backed)
+
+    // section_64[1] = __TEXT,__const.
+    EXPECT_TRUE(name16Equals(bytes, 184, "__const"));
+    EXPECT_TRUE(name16Equals(bytes, 200, "__TEXT"));
+    EXPECT_EQ(readU64LE(bytes, 216), 8u);    // addr (flat space)
+    EXPECT_EQ(readU64LE(bytes, 224), 3u);    // size
+    EXPECT_EQ(readU32LE(bytes, 232), 296u);  // offset = 288 + addr 8
+    EXPECT_EQ(readU32LE(bytes, 236), 3u);    // align = log2(8)
+    EXPECT_EQ(readU32LE(bytes, 240), 0u);    // reloff (no relocs)
+    EXPECT_EQ(readU32LE(bytes, 244), 0u);    // nreloc
+    EXPECT_EQ(readU32LE(bytes, 248), 0u);    // flags = S_REGULAR
+    // The item's bytes land at the section's file offset.
+    ASSERT_GE(bytes.size(), 299u);
+    EXPECT_EQ(bytes[296], 'h');
+    EXPECT_EQ(bytes[297], 'i');
+    EXPECT_EQ(bytes[298], 0u);
+
+    // LC_SYMTAB @264: symoff = 288 + 11 (no relocs), nsyms = 2.
+    std::uint32_t const symoff = readU32LE(bytes, 272);
+    std::uint32_t const nsyms  = readU32LE(bytes, 276);
+    std::uint32_t const stroff = readU32LE(bytes, 280);
+    EXPECT_EQ(symoff, 299u);
+    ASSERT_EQ(nsyms, 2u);
+    // nlist[1] = the data symbol: real name, N_SECT|N_EXT, n_sect=2,
+    // n_value = the FLAT address 8.
+    std::size_t const n1 = symoff + 16;
+    EXPECT_EQ(readStrtabName(bytes, stroff, readU32LE(bytes, n1)), "_msg");
+    EXPECT_EQ(bytes[n1 + 4], 0x0Fu);         // N_SECT | N_EXT
+    EXPECT_EQ(bytes[n1 + 5], 2u);            // n_sect = __const ordinal
+    EXPECT_EQ(readU64LE(bytes, n1 + 8), 8u); // n_value = flat address
+}
+
+// (2) A RelRoConst item carrying an abs64 reloc to a DEFINED function (a
+// const fn-ptr table slot): the `__DATA,__const` section carries its OWN
+// relocation_info table (the c145 `.rela.data.rel.ro` analog) — nreloc=1,
+// r_extern=1 / r_pcrel=0 / r_length=3 / r_type=0 (ARM64_RELOC_UNSIGNED),
+// r_symbolnum = the function's symtab index, r_address = the slot's
+// SECTION-relative offset. The relocation's addend is written INTO the
+// 8-byte slot (Mach-O's in-place-addend convention — relocation_info has
+// no addend column; ld64 computes S + slot). RED-on-disable: drop the
+// data-reloc emission → nreloc reads 0; drop the in-slot addend → the
+// slot reads 0.
+TEST(MachOWriter, Arm64ObjectRelRoFnPtrSlotEmitsUnsignedRelocAndInSlotAddend) {
+    auto loaded = loadShippedArm64();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f1;
+    f1.symbol = SymbolId{1};
+    f1.bytes  = {0xC0, 0x03, 0x5F, 0xD6};   // RET
+    mod.functions.push_back(std::move(f1));
+    AssembledData tab;
+    tab.symbol    = SymbolId{7};
+    tab.section   = DataSectionKind::RelRoConst;
+    tab.bytes.assign(8, 0);                  // one pointer slot
+    tab.alignment = Alignment::of<8>();
+    tab.relocations.push_back(Relocation{/*offset=*/0u,
+                                         /*target=*/SymbolId{1},
+                                         /*kind=*/RelocationKind{4},  // UNSIGNED
+                                         /*addend=*/8});
+    mod.dataItems.push_back(std::move(tab));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    // Two sections; relro at alignUp(4, 8) = 8, span 8 → filesize 16.
+    EXPECT_EQ(readU32LE(bytes, 96), 2u);     // nsects
+    EXPECT_TRUE(name16Equals(bytes, 184, "__const"));
+    EXPECT_TRUE(name16Equals(bytes, 200, "__DATA"));
+    EXPECT_EQ(readU64LE(bytes, 216), 8u);    // addr
+    EXPECT_EQ(readU64LE(bytes, 224), 8u);    // size
+    EXPECT_EQ(readU32LE(bytes, 232), 296u);  // offset = 288 + 8
+    std::uint32_t const reloff = readU32LE(bytes, 240);
+    std::uint32_t const nreloc = readU32LE(bytes, 244);
+    ASSERT_EQ(nreloc, 1u)
+        << "the relro section must carry its own relocation_info table "
+           "(the .rela.data.rel.ro analog)";
+    // Reloc tables follow ALL file-backed section bytes: 288 + 16.
+    EXPECT_EQ(reloff, 304u);
+    ASSERT_LE(reloff + 8u, bytes.size());
+    // r_address = the slot's offset WITHIN its section.
+    EXPECT_EQ(readU32LE(bytes, reloff + 0), 0u);
+    std::uint32_t const rInfo = readU32LE(bytes, reloff + 4);
+    EXPECT_EQ((rInfo >> 28) & 0xFu, 0u);     // r_type = ARM64_RELOC_UNSIGNED
+    EXPECT_EQ((rInfo >> 27) & 0x1u, 1u);     // r_extern = 1
+    EXPECT_EQ((rInfo >> 25) & 0x3u, 3u);     // r_length = 3 (8 bytes)
+    EXPECT_EQ((rInfo >> 24) & 0x1u, 0u);     // r_pcrel = 0
+    EXPECT_EQ(rInfo & 0x00FFFFFFu, 0u)       // r_symbolnum = f1's index
+        << "the slot must target the DEFINED function's symtab entry";
+    // In-place addend: the 8-byte slot at file offset 296 carries 8.
+    EXPECT_EQ(readU64LE(bytes, 296), 8u)
+        << "Mach-O has no RELA addend column — rel.addend must be written "
+           "into the slot bytes (ld64 computes S + slot)";
+    // The table's own symbol: nlist[1], n_sect=2, n_value=8.
+    std::uint32_t const symoff = readU32LE(bytes, 272);
+    ASSERT_EQ(readU32LE(bytes, 276), 2u);    // nsyms = f1 + tab
+    EXPECT_EQ(bytes[symoff + 16 + 5], 2u);
+    EXPECT_EQ(readU64LE(bytes, symoff + 16 + 8), 8u);
+}
+
+// A jump-table data slot targeting a SYNTHETIC PER-BLOCK symbol (the dense-
+// switch / computed-goto shape: `AssembledData` abs64 reloc → an interior
+// `__text` offset recorded in `fn.blockSymbols`) must resolve to a DEFINED
+// LOCAL nlist — N_SECT with NO N_EXT, n_sect=1, n_value = the flat text
+// address — never the undefined-extern fallback. Before the c147 review fold
+// the MH_OBJECT writer skipped block-symbol registration, so the extern scan
+// fabricated an N_UNDF|N_EXT `_sym_<id>` nothing could ever define: a
+// cleanly-emitted but unlinkable .o (ld64 "undefined symbol '_sym_77'"), or
+// — worse — a silent wrong-control-flow bind against a sibling object's
+// unrelated `_sym_77` export. The ELF ET_REL writer's STB_LOCAL block-symbol
+// leg is the mirror. RED-ON-DISABLE: drop the block-symbol registration →
+// nlist[1] flips to the data symbol and the block lands N_UNDF|N_EXT at the
+// tail → the n_type/n_value assertions fail.
+TEST(MachOWriter, Arm64ObjectJumpTableBlockSymbolIsLocalDefinedNotUndef) {
+    auto loaded = loadShippedArm64();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{10};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6,     // RET (block 0)
+                 0xC0, 0x03, 0x5F, 0xD6};    // RET (block 1, offset 4)
+    fn.blockSymbols.push_back({SymbolId{77}, /*blockByteOffset=*/4u});
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_dispatch",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    AssembledData tab;                        // one jump-table slot
+    tab.symbol    = SymbolId{7};
+    tab.section   = DataSectionKind::Data;
+    tab.bytes.assign(8, 0);
+    tab.alignment = Alignment::of<8>();
+    tab.relocations.push_back(Relocation{/*offset=*/0u,
+                                         /*target=*/SymbolId{77},   // the BLOCK
+                                         /*kind=*/RelocationKind{4}, // UNSIGNED
+                                         /*addend=*/0});
+    mod.dataItems.push_back(std::move(tab));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "a jump-table slot targeting a block symbol must encode";
+
+    // Symbol order: func(0) → BLOCK local(1) → data(2). No undefined extern.
+    std::uint32_t const symoff = readU32LE(bytes, 272);
+    std::uint32_t const nsyms  = readU32LE(bytes, 276);
+    std::uint32_t const stroff = readU32LE(bytes, 280);
+    ASSERT_EQ(nsyms, 3u) << "func + block local + data symbol - and NO "
+                            "fabricated undefined extern for the block";
+    std::size_t const n1 = symoff + 16;      // the block symbol's nlist
+    std::uint32_t const nStrx = readU32LE(bytes, n1 + 0);
+    std::string name;
+    for (std::size_t p = stroff + nStrx; p < bytes.size() && bytes[p] != 0; ++p) {
+        name.push_back(static_cast<char>(bytes[p]));
+    }
+    EXPECT_EQ(name, "_sym_77");
+    EXPECT_EQ(bytes[n1 + 4], 0x0Eu)
+        << "block symbol must be N_SECT LOCAL (0x0E) - N_EXT would let a "
+           "sibling object's unrelated _sym_<id> bind to an interior block "
+           "address (silent wrong-control-flow); N_UNDF (0x01) is the "
+           "fabricated-extern break this pin guards";
+    EXPECT_EQ(bytes[n1 + 5], 1u)             // n_sect = __text
+        << "block symbol lives in __text";
+    EXPECT_EQ(readU64LE(bytes, n1 + 8), 4u)  // n_value = flat text addr
+        << "n_value = funcTextStart + blockByteOffset (flat address)";
+
+    // The data section's reloc resolves r_symbolnum to the block (index 1).
+    std::uint32_t const reloff = readU32LE(bytes, 240);
+    std::uint32_t const nreloc = readU32LE(bytes, 244);
+    ASSERT_EQ(nreloc, 1u);
+    std::uint32_t const rInfo = readU32LE(bytes, reloff + 4);
+    EXPECT_EQ((rInfo >> 27) & 0x1u, 1u);     // r_extern = 1 (symbol-relative)
+    EXPECT_EQ(rInfo & 0x00FFFFFFu, 1u)
+        << "the jump-table slot targets the DEFINED block local, not a "
+           "fabricated undefined extern";
+}
+
+// (3) A bss item: S_ZEROFILL flags from the schema row, offset = 0, size =
+// reservedSize, NO file bytes — vmsize covers the zero-fill tail, filesize
+// does not. RED-on-disable: emitting bss as file-backed flips offset/
+// filesize; dropping it flips nsects.
+TEST(MachOWriter, Arm64ObjectBssItemIsZeroFillWithVmsizeButNoFileBytes) {
+    auto loaded = loadShippedArm64();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};
+    mod.functions.push_back(std::move(fn));
+    AssembledData g;
+    g.symbol       = SymbolId{9};
+    g.section      = DataSectionKind::Bss;
+    g.reservedSize = 4;                      // int g; — no file bytes
+    g.alignment    = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(g));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    EXPECT_EQ(readU32LE(bytes, 96), 2u);     // nsects
+    // bss at alignUp(4, 8) = 8 (schema floor 8), span 4.
+    EXPECT_EQ(readU64LE(bytes, 64), 12u)     // vmsize INCLUDES zero-fill
+        << "LC_SEGMENT_64.vmsize must cover the zero-fill tail";
+    EXPECT_EQ(readU64LE(bytes, 80), 4u)      // filesize EXCLUDES it
+        << "LC_SEGMENT_64.filesize must cover only file-backed bytes";
+    EXPECT_TRUE(name16Equals(bytes, 184, "__bss"));
+    EXPECT_TRUE(name16Equals(bytes, 200, "__DATA"));
+    EXPECT_EQ(readU64LE(bytes, 216), 8u);    // addr still advances
+    EXPECT_EQ(readU64LE(bytes, 224), 4u);    // size = reservedSize
+    EXPECT_EQ(readU32LE(bytes, 232), 0u);    // offset = 0 (S_ZEROFILL)
+    EXPECT_EQ(readU32LE(bytes, 248), 1u);    // flags = S_ZEROFILL (schema)
+    // symtab directly after text bytes (288 + 4) — bss stored nothing.
+    EXPECT_EQ(readU32LE(bytes, 272), 292u);
+    // The bss symbol's n_value is its flat address.
+    std::uint32_t const symoff = readU32LE(bytes, 272);
+    EXPECT_EQ(bytes[symoff + 16 + 5], 2u);
+    EXPECT_EQ(readU64LE(bytes, symoff + 16 + 8), 8u);
+}
+
+// (4) A DATA-FREE module keeps the exact single-section layout (the
+// pre-c147 shape): ncmds/sizeofcmds/nsects/vmsize/filesize/symoff/stroff
+// all unchanged — the data-section machinery must be a no-op when no data
+// items exist (every historical LcSymtab/reloc pin hardcodes this layout).
+TEST(MachOWriter, Arm64ObjectDataFreeModuleKeepsSingleSectionLayout) {
+    auto loaded = loadShippedArm64();
+    AssembledModule mod = makeTrivialModule({0xC0, 0x03, 0x5F, 0xD6}, 42);
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    EXPECT_EQ(readU32LE(bytes, 16), 2u);     // ncmds
+    EXPECT_EQ(readU32LE(bytes, 20), 176u);   // sizeofcmds = 72 + 80 + 24
+    EXPECT_EQ(readU32LE(bytes, 96), 1u);     // nsects = 1 (__text only)
+    EXPECT_EQ(readU64LE(bytes, 64), 4u);     // vmsize = text only
+    EXPECT_EQ(readU64LE(bytes, 72), 208u);   // fileoff = 32 + 72 + 80 + 24
+    EXPECT_EQ(readU64LE(bytes, 80), 4u);     // filesize = text only
+    // LC_SYMTAB at 184; symtab right after text (208 + 4); strtab after
+    // the single 16-byte nlist.
+    EXPECT_EQ(readU32LE(bytes, 184), 0x02u);
+    EXPECT_EQ(readU32LE(bytes, 192), 212u);  // symoff
+    EXPECT_EQ(readU32LE(bytes, 196), 1u);    // nsyms
+    EXPECT_EQ(readU32LE(bytes, 200), 228u);  // stroff
+}
+
+// (5) The shipped arm64 object format declares the four data-section rows
+// + supportedDataSections (the linker's acceptsDataSection gate) — and
+// does NOT declare TLS (tdata/tbss stay gate-rejected). RED-on-disable:
+// remove a JSON row → the corresponding assertion fails.
+TEST(MachOFormatJson, Arm64ObjectDeclaresDataSectionRows) {
+    auto loaded = loadShippedArm64();
+    ASSERT_TRUE(loaded.format);
+    auto const& fmt = *loaded.format;
+    EXPECT_TRUE(fmt.acceptsDataSection(DataSectionKind::Rodata));
+    EXPECT_TRUE(fmt.acceptsDataSection(DataSectionKind::Data));
+    EXPECT_TRUE(fmt.acceptsDataSection(DataSectionKind::Bss));
+    EXPECT_TRUE(fmt.acceptsDataSection(DataSectionKind::RelRoConst));
+    EXPECT_FALSE(fmt.acceptsDataSection(DataSectionKind::Tdata))
+        << "TLS stays undeclared on the MH_OBJECT schema (fail-loud gate)";
+    EXPECT_FALSE(fmt.acceptsDataSection(DataSectionKind::Tbss));
+
+    auto const* rodata = fmt.sectionByKind(SectionKind::Rodata);
+    ASSERT_NE(rodata, nullptr);
+    EXPECT_EQ(rodata->name, "__const");
+    EXPECT_EQ(rodata->segment, "__TEXT");
+    EXPECT_EQ(rodata->type, 0u);             // S_REGULAR
+    auto const* data = fmt.sectionByKind(SectionKind::Data);
+    ASSERT_NE(data, nullptr);
+    EXPECT_EQ(data->name, "__data");
+    EXPECT_EQ(data->segment, "__DATA");
+    EXPECT_EQ(data->type, 0u);
+    auto const* relro = fmt.sectionByKind(SectionKind::RelRoConst);
+    ASSERT_NE(relro, nullptr);
+    EXPECT_EQ(relro->name, "__const")
+        << "relro is __DATA,__const — the .o precursor of __DATA_CONST";
+    EXPECT_EQ(relro->segment, "__DATA");
+    EXPECT_EQ(relro->type, 0u);
+    auto const* bss = fmt.sectionByKind(SectionKind::Bss);
+    ASSERT_NE(bss, nullptr);
+    EXPECT_EQ(bss->name, "__bss");
+    EXPECT_EQ(bss->segment, "__DATA");
+    EXPECT_EQ(bss->type, 1u);                // S_ZEROFILL
+}
+
+// (6) A reloc-bearing RODATA item stays fail-loud (allow=false — the
+// RodataDataItemWithRelocationFailsLoud discipline shared with ELF): a
+// relocated slot cannot live in never-written `__TEXT,__const`.
+TEST(MachOWriter, Arm64ObjectRodataItemWithRelocationFailsLoud) {
+    auto loaded = loadShippedArm64();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};
+    mod.functions.push_back(std::move(fn));
+    AssembledData d;
+    d.symbol    = SymbolId{3};
+    d.section   = DataSectionKind::Rodata;
+    d.bytes.assign(8, 0);
+    d.alignment = Alignment::of<8>();
+    d.relocations.push_back(Relocation{0u, SymbolId{1}, RelocationKind{4}, 0});
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+// (7) The c145 extern-coverage mirror: a target referenced ONLY by a
+// DATA-item relocation (a const table of libc fn pointers) still gets its
+// N_UNDF|N_EXT nlist under the REAL import name, and the data reloc's
+// r_symbolnum points at it. RED-on-disable: scan only function relocs →
+// the extern nlist is never emitted (K_SymbolUndefined aborts the encode).
+TEST(MachOWriter, Arm64ObjectDataRelocOnlyExternGetsUndefNlist) {
+    auto loaded = loadShippedArm64();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};   // RET — NO relocations
+    mod.functions.push_back(std::move(fn));
+    AssembledData tab;
+    tab.symbol    = SymbolId{7};
+    tab.section   = DataSectionKind::RelRoConst;
+    tab.bytes.assign(8, 0);
+    tab.alignment = Alignment::of<8>();
+    tab.relocations.push_back(Relocation{0u, SymbolId{20},
+                                         RelocationKind{4}, 0});
+    mod.dataItems.push_back(std::move(tab));
+    ExternImport ext;
+    ext.symbol      = SymbolId{20};
+    ext.mangledName = "_puts";
+    ext.isData      = false;
+    mod.externImports.push_back(std::move(ext));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "a data-reloc-only extern must be covered by the undefined-"
+           "extern scan (the ELF c145 mirror)";
+    std::uint32_t const symoff = readU32LE(bytes, 272);
+    std::uint32_t const nsyms  = readU32LE(bytes, 276);
+    std::uint32_t const stroff = readU32LE(bytes, 280);
+    ASSERT_EQ(nsyms, 3u) << "f1 + table + undefined _puts";
+    std::size_t const n2 = symoff + 2 * 16;
+    EXPECT_EQ(readStrtabName(bytes, stroff, readU32LE(bytes, n2)), "_puts");
+    EXPECT_EQ(bytes[n2 + 4], 0x01u);         // N_UNDF | N_EXT
+    EXPECT_EQ(bytes[n2 + 5], 0u);            // NO_SECT
+    // The relro reloc targets the extern's index (2).
+    std::uint32_t const reloff = readU32LE(bytes, 240);
+    std::uint32_t const rInfo  = readU32LE(bytes, reloff + 4);
+    EXPECT_EQ(rInfo & 0x00FFFFFFu, 2u);
+}
+
+// (8) Thread-local items fail LOUD on the direct walker call (the linker's
+// acceptsDataSection gate fires first in the shipped pipeline; this is the
+// anti-silent-drop belt behind it, mirroring the ELF static-arm reject).
+TEST(MachOWriter, Arm64ObjectThreadLocalItemFailsLoud) {
+    auto loaded = loadShippedArm64();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};
+    mod.functions.push_back(std::move(fn));
+    AssembledData t;
+    t.symbol    = SymbolId{4};
+    t.section   = DataSectionKind::Tdata;
+    t.bytes     = {7, 0, 0, 0};
+    t.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(t));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool saw = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_FormatLacksThreadLocalSupport)
+            saw = true;
+    }
+    EXPECT_TRUE(saw)
+        << "a Tdata item must be rejected loud, never silently dropped";
+}
+
+// (9) A data SymbolId colliding with a function SymbolId is a producer-
+// contract breach — fail loud (the K_DuplicateDataSymbol mirror of the
+// ELF ET_REL / exec addDataSymbolVas discipline).
+TEST(MachOWriter, Arm64ObjectDuplicateDataSymbolFailsLoud) {
+    auto loaded = loadShippedArm64();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};
+    mod.functions.push_back(std::move(fn));
+    AssembledData d;
+    d.symbol    = SymbolId{1};               // collides with the function
+    d.section   = DataSectionKind::Rodata;
+    d.bytes     = {1, 2, 3, 4};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool saw = false;
+    for (auto const& diag : rep.all()) {
+        if (diag.code == DiagnosticCode::K_DuplicateDataSymbol) saw = true;
+    }
+    EXPECT_TRUE(saw);
+}
+
+// (10) All four data sections at once: the full section order (__text →
+// __TEXT,__const → __DATA,__data → __DATA,__const → __DATA,__bss LAST,
+// the zerofill-last convention), cumulative flat addrs, and 1-based
+// n_sect ordinals across every symbol. Pins the multi-section cursor
+// arithmetic a single-data-section module cannot exercise.
+TEST(MachOWriter, Arm64ObjectAllFourDataSectionsOrderAndOrdinals) {
+    auto loaded = loadShippedArm64();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC0, 0x03, 0x5F, 0xD6};
+    mod.functions.push_back(std::move(fn));
+    auto addItem = [&](std::uint32_t sym, DataSectionKind k,
+                       std::vector<std::uint8_t> b, std::uint64_t reserved) {
+        AssembledData d;
+        d.symbol       = SymbolId{sym};
+        d.section      = k;
+        d.bytes        = std::move(b);
+        d.reservedSize = reserved;
+        d.alignment    = Alignment::of<8>();
+        mod.dataItems.push_back(std::move(d));
+    };
+    addItem(10, DataSectionKind::Rodata, {1, 2, 3, 4, 5, 6, 7, 8}, 0);
+    addItem(11, DataSectionKind::Data, {9, 9, 9, 9, 9, 9, 9, 9}, 0);
+    addItem(12, DataSectionKind::RelRoConst, {0, 0, 0, 0, 0, 0, 0, 0}, 0);
+    addItem(13, DataSectionKind::Bss, {}, 8);
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // 5 sections: sizeofcmds = 72 + 5*80 + 24 = 496; header+cmds = 528.
+    EXPECT_EQ(readU32LE(bytes, 20), 496u);
+    EXPECT_EQ(readU32LE(bytes, 96), 5u);
+    // Flat addrs: text [0,4) → rodata [8,16) → data [16,24) → relro
+    // [24,32) → bss [32,40). filesize = 32, vmsize = 40.
+    EXPECT_EQ(readU64LE(bytes, 64), 40u);    // vmsize
+    EXPECT_EQ(readU64LE(bytes, 80), 32u);    // filesize
+    struct Expect {
+        char const* sect; char const* seg;
+        std::uint64_t addr; std::uint32_t offset;
+    };
+    // section_64[i] starts at 104 + i*80; fileoff base = 528.
+    Expect const rows[] = {
+        {"__const", "__TEXT", 8, 536},
+        {"__data",  "__DATA", 16, 544},
+        {"__const", "__DATA", 24, 552},
+        {"__bss",   "__DATA", 32, 0},
+    };
+    for (std::size_t i = 0; i < 4; ++i) {
+        std::size_t const base = 104 + (i + 1) * 80;
+        EXPECT_TRUE(name16Equals(bytes, base, rows[i].sect)) << i;
+        EXPECT_TRUE(name16Equals(bytes, base + 16, rows[i].seg)) << i;
+        EXPECT_EQ(readU64LE(bytes, base + 32), rows[i].addr) << i;
+        EXPECT_EQ(readU32LE(bytes, base + 48), rows[i].offset) << i;
+    }
+    // nlist n_sect ordinals: fn=1, rodata=2, data=3, relro=4, bss=5;
+    // n_value = each item's flat address.
+    std::uint32_t const symoff = readU32LE(bytes, 32 + 72 + 5 * 80 + 8);
+    ASSERT_EQ(readU32LE(bytes, 32 + 72 + 5 * 80 + 12), 5u);   // nsyms
+    std::uint8_t const expectSect[] = {1, 2, 3, 4, 5};
+    std::uint64_t const expectValue[] = {0, 8, 16, 24, 32};
+    for (std::size_t s = 0; s < 5; ++s) {
+        EXPECT_EQ(bytes[symoff + s * 16 + 5], expectSect[s]) << s;
+        EXPECT_EQ(readU64LE(bytes, symoff + s * 16 + 8), expectValue[s]) << s;
+    }
 }
 
 // ── Wrong-format kind rejection ────────────────────────────────

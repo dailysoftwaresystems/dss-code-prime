@@ -431,10 +431,20 @@ inline void mergeFileBackedDataSection(ExecDataSectionLayout&       into,
                                  writerName, di.symbol.v, rel.kind.v));
                 return false;
             }
-            if (tri->pcRelative || tri->widthBytes == 0) {
+            // `pcRelative` is a Linear-only field (the loader forces every
+            // non-Linear formula row to pcRelative=false), so it alone
+            // cannot exclude the genuinely pc-relative instruction-fixup
+            // kinds (call26 / adr_prel_pg_hi21 / add_abs_lo12_nc). A data
+            // pointer slot takes a plain LINEAR absolute fixup only — a
+            // non-Linear kind here would apply instruction-formula
+            // semantics to data bytes (c147 silent-failure-review fold;
+            // same discriminator as the Mach-O MH_OBJECT data-reloc gate).
+            if (tri->formulaKind != RelocFormulaKind::Linear
+                || tri->pcRelative || tri->widthBytes == 0) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                      std::format("{}: data item SymbolId={{ {} }} relocation '{}' is "
-                                 "pc-relative or zero-width — a data pointer needs an "
+                                 "pc-relative, zero-width, or a non-linear "
+                                 "instruction fixup - a data pointer needs a plain "
                                  "absolute fixup with a concrete write width.",
                                  writerName, di.symbol.v, tri->name));
                 return false;

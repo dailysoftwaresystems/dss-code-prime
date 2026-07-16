@@ -19,6 +19,8 @@
 
   "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: Apple arm64 `long double` IS `double` (64-bit IEEE, 8/8) — a documented Apple divergence from generic AAPCS64's binary128. See macho64-arm64-darwin-exec.",
   "longDoubleFormat": "f64",
+  "$supportedDataSectionsComment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE (Mach-O MH_OBJECT arm, c147 — the macho analog of the ELF c142 `.o` data sections): a relocatable object DOES carry data — a global lands in `__TEXT,__const` / `__DATA,__data` / `__DATA,__bss` / `__DATA,__const` with walker-computed flat-`.o`-space addrs and an N_SECT|N_EXT nlist_64 (n_sect = the section's 1-based ordinal, n_value = the item's FLAT address) the FINAL linker (ld64/clang) binds. Same format-blind `AssembledModule.dataItems` producer path as ELF/PE. D-LK-RELRO-CONST-DATA-RELOCATABLE (Mach-O arm): a CONST global carrying LOAD-TIME relocations (a const function-pointer table / `int *const p = &x;` — sqlite's VFS method tables + `aSyscall[]`) lands in `relro` = `__DATA,__const` and the writer emits its OWN relocation_info table (ARM64_RELOC_UNSIGNED, r_extern=1, addend IN the 8-byte slot bytes — Mach-O's in-place-addend convention; there is no RELA addend column); a reloc-bearing MUTABLE pointer global lands in `data`. TLS (`tdata`/`tbss`) stays UNDECLARED — the linker's acceptsDataSection gate rejects it loud (the MH_OBJECT walker emits no `__thread_data`/`__thread_vars`; the exec TLV machinery is MH_EXECUTE-only, D-CSUBSET-THREAD-LOCAL C4).",
+  "supportedDataSections": ["rodata", "data", "bss", "relro"],
 
   "macho": {
     "$comment": "mach_header_64 identity. cputype = CPU_TYPE_ARM64 = (12 | CPU_ARCH_ABI64 0x01000000) = 0x0100000C = 16777228 (the SAME value the macho64-arm64-darwin-exec schema declares). cpusubtype = CPU_SUBTYPE_ARM64_ALL (0). filetype = MH_OBJECT (1). flags = 0 — MH_SUBSECTIONS_VIA_SYMBOLS (0x2000) is intentionally NOT set (mirrors the x86_64-darwin object): the walker emits one flat `__text` blob with no N_ALT_ENTRY subsection markers, so advertising the flag would lie to ld64 about function-granular dead-strip safety. The flag returns when the substrate emits per-function subsections (plan 14 §3.1 D-LK3-2).",
@@ -30,13 +32,53 @@
 
   "sections": [
     {
-      "$comment": "Executable code. Mach-O two-level naming: section `__text` inside segment `__TEXT`. section_64.flags = S_REGULAR (0x0) | S_ATTR_PURE_INSTRUCTIONS (0x80000000) | S_ATTR_SOME_INSTRUCTIONS (0x00000400) = 0x80000400. addrAlign in log2 form: 4 = 16 bytes. PE's substrate `type` field repurposed for Mach-O section_64.flags. Mirrors the x86_64-darwin object (text-only relocatable scope this cycle; data-section .o is the same future gap the x86_64 object carries, plan 14 §3.1).",
+      "$comment": "Executable code. Mach-O two-level naming: section `__text` inside segment `__TEXT`. section_64.flags = S_REGULAR (0x0) | S_ATTR_PURE_INSTRUCTIONS (0x80000000) | S_ATTR_SOME_INSTRUCTIONS (0x00000400) = 0x80000400. addrAlign in log2 form: 4 = 16 bytes — this row's addrAlign IS the literal section_64.align field, written VERBATIM by the walker (the data rows below use the raw-byte-floor convention instead; see their comments). PE's substrate `type` field repurposed for Mach-O section_64.flags. The x86_64-darwin object sibling stays text-only + leaf-only (no runtime leg to witness it); THIS arm64 file carries the data rows (D-LK-OBJECT-DATA-SECTION-RELOCATABLE, c147).",
       "kind": "text",
       "name": "__text",
       "segment": "__TEXT",
       "type": 2147484672,
       "flags": 0,
       "addrAlign": 4,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE (Mach-O arm, c147): read-only initialized data (string literals, const globals WITHOUT relocations) — exactly where clang places it in an arm64 `.o`: section `__const` inside the R+X `__TEXT` segment. section_64.flags (substrate `type`) = S_REGULAR (0). addrAlign = 8 is the RAW-BYTE alignment FLOOR fed to the shared `buildExecDataSection` substrate (the SAME convention the darwin-exec schema's data rows use); the walker H1-raises it to the strictest member alignment and writes section_64.align as log2 (countr_zero) — UNLIKE the `__text` row above, whose addrAlign is the literal log2 field. No `virtualAddress`: MH_OBJECT section addrs are walker-computed in the flat `.o` address space (text at 0, each next section H1-aligned after the previous), and validate() rejects a non-zero VA on an object row.",
+      "kind": "rodata",
+      "name": "__const",
+      "segment": "__TEXT",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE (Mach-O arm, c147): writable initialized data (mutable globals, `int counter = 7;`) — clang's `__DATA,__data`. section_64.flags (substrate `type`) = S_REGULAR (0). addrAlign = 8 raw-byte floor (H1-raised; walker writes log2 — see the rodata row's comment). A reloc-bearing MUTABLE pointer global also lands here and the walker emits its relocation_info against this section (r_address = the slot's section-relative offset).",
+      "kind": "data",
+      "name": "__data",
+      "segment": "__DATA",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-RELRO-CONST-DATA-RELOCATABLE (Mach-O arm, c147): relocated-read-only const data — a CONST global carrying LOAD-TIME relocations (a const function-pointer table / `int *const p = &x;`). In an arm64 `.o` clang emits this as `__DATA,__const` — the `.o` PRECURSOR of the image's `__DATA_CONST,__const` (ld64 gathers `__DATA,__const` input sections into the __DATA_CONST segment, read-only after rebase — the Mach-O analog of gcc's `.data.rel.ro` / GNU_RELRO). section_64.flags (substrate `type`) = S_REGULAR (0); the two `__const` rows are DISTINCT Mach-O sections because the (segment, section) PAIR is the identity — (`__TEXT`,`__const`) is the reloc-free rodata row above. addrAlign = 8 raw-byte floor (H1-raised; walker writes log2). The walker emits this section's OWN relocation_info table (the c145 `.rela.data.rel.ro` analog): ARM64_RELOC_UNSIGNED, r_extern=1, r_length=3, addend written INTO the 8-byte slot (in-place-addend — Mach-O relocation_info has no addend column).",
+      "kind": "relro",
+      "name": "__const",
+      "segment": "__DATA",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE (Mach-O arm, c147): zero-initialized data (tentative globals `int g;`) — clang's `__DATA,__bss`. section_64.flags (substrate `type`) = S_ZEROFILL (1): size > 0 but section_64.offset = 0 and NO file bytes (the flat-space addr still advances — LC_SEGMENT_64.vmsize covers it, filesize does NOT). The walker emits it LAST in the section list (the zerofill-last Mach-O convention). addrAlign = 8 raw-byte floor (H1-raised; walker writes log2).",
+      "kind": "bss",
+      "name": "__bss",
+      "segment": "__DATA",
+      "type": 1,
+      "flags": 0,
+      "addrAlign": 8,
       "entrySize": 0
     }
   ],
