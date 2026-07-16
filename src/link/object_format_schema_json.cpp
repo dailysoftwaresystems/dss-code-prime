@@ -859,7 +859,8 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // D-LK2-RODATA closure — `supportedDataSections`. Optional
     // top-level array of `DataSectionKind` names ("rodata" / "data" /
     // "bss" / "tdata" / "tbss" — the last two per D-CSUBSET-THREAD-
-    // LOCAL) the format's walker accepts on `AssembledModule.
+    // LOCAL — plus "relro" per D-LK-RELRO-CONST-DATA-RELOCATABLE, c145)
+    // the format's walker accepts on `AssembledModule.
     // dataItems`. Absent / empty = walker rejects all producer-data-
     // section items (the format-side validate() rule below also
     // gates this on isImageFlavor — relocatable .obj cannot declare
@@ -874,7 +875,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                       "/supportedDataSections",
                       "'supportedDataSections' must be an array of "
                       "DataSectionKind names (\"rodata\" / \"data\" / "
-                      "\"bss\" / \"tdata\" / \"tbss\")");
+                      "\"bss\" / \"tdata\" / \"tbss\" / \"relro\")");
         } else {
             auto const& arr = doc.at("supportedDataSections");
             std::size_t i = 0;
@@ -892,7 +893,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                   std::format("unknown DataSectionKind "
                                               "'{}' (expected 'rodata' "
                                               "/ 'data' / 'bss' / "
-                                              "'tdata' / 'tbss')",
+                                              "'tdata' / 'tbss' / 'relro')",
                                               name));
                     } else {
                         bool dup = false;
