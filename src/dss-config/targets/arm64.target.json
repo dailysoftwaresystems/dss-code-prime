@@ -623,6 +623,105 @@
       }
     },
     {
+      "$comment": "FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): LDAR Wt/Xt, [Xn] — load-ACQUIRE (RCsc), the acquire/seq_cst realization of MIR AtomicLoad. Derived from LDAXR by SETTING o2 (bit 23): LDAR = LDAXR | (1<<23). W-form 0x88DFFC00 (= 0x885FFC00 | 0x800000), X-form 0xC8DFFC00. VERIFIED by aarch64-as: `ldar w0,[x0]`=88dffc00, `ldar x0,[x0]`=c8dffc00. LDAR has NO offset field (addresses [Xn], disp 0), so the UNIFIED [ptr, MemBase, MemOffset] shape (which x86's mov-load needs) wires ptr->Rn (bits 5..9), result->Rd (bits 0..4 = Rt, the loaded value), MemBase->membase.noscale + MemOffset->memoffset.zero (width-0 markers; memoffset.zero FAILS LOUD on a nonzero disp — a naturally-aligned atomic is always offset 0, the base+index-lea precedent). Value width picks W (i32 / _Atomic int) vs X (i64 / pointer).",
+      "mnemonic":      "load_acquire",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "template":   { "fixedWord": 2296380416 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"              },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "memoffset.zero"  }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
+            "template":   { "fixedWord": 3370122240 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"              },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "memoffset.zero"  }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): STLR Wt/Xt, [Xn] — store-RELEASE (RCsc), the release/acq_rel realization of MIR AtomicStore. Derived from STLXR by SETTING o2 (bit 23) AND baking Rs=11111 (STLR has NO status output, unlike STLXR whose Rs is the status reg): STLR = 0x8800FC00 | (1<<23) | (0x1F<<16) = 0x889FFC00 (W), 0xC89FFC00 (X). VERIFIED by aarch64-as: `stlr w0,[x0]`=889ffc00, `stlr x0,[x0]`=c89ffc00. result:none (no status reg). UNIFIED [value, ptr, MemBase, MemOffset] shape (the STUR store precedent): value->Rd (bits 0..4 = Rt data reg), ptr->Rn (bits 5..9), MemBase->membase.noscale + MemOffset->memoffset.zero (fail-loud nonzero disp). Value width picks W vs X.",
+      "mnemonic":      "store_release",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template":   { "fixedWord": 2292186112 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd"              },
+              { "index": 1, "slotKind": "rn"              },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "memoffset.zero"  }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template":   { "fixedWord": 3365927936 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd"              },
+              { "index": 1, "slotKind": "rn"              },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "memoffset.zero"  }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): STLR again — the SEQ_CST realization of MIR AtomicStore. LDAR/STLR are RCsc, so a release store IS a seq_cst store on arm64 (NO DMB) — BOTH the store_release and store_seqcst slots bind the IDENTICAL STLR encoding (the x86 twin diverges: store_release=mov, store_seqcst=xchg). Same words/wiring as store_release above (W 0x889FFC00, X 0xC89FFC00). Declared so the pure-slot-presence probe finds a seq_cst-store realization on arm64 (never fail-loud on a legal seq_cst store).",
+      "mnemonic":      "store_seqcst",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template":   { "fixedWord": 2292186112 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd"              },
+              { "index": 1, "slotKind": "rn"              },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "memoffset.zero"  }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template":   { "fixedWord": 3365927936 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd"              },
+              { "index": 1, "slotKind": "rn"              },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "memoffset.zero"  }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "FC1 V2-4.X (2026-06-10): NEG Xd, Xm = SUB Xd, XZR, Xm (shifted-register alias, Rn=XZR baked). Base = 0xCB000000 | (XZR=31 << 5) = 0xCB0003E0. Slots: Rd, Rm. Surfaced by the modulo corpus' negative literals — under the BASELINE (no-ConstFold) pipeline a unary minus reaches LIR as a live `neg`, and arm64 had never declared one (every prior arm64 corpus avoided unary minus).",
       "mnemonic":      "neg",
       "result":        "value",

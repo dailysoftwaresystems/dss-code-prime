@@ -547,6 +547,29 @@ struct Lowerer {
                     volatileFlagFor(node) | volatileFlagForType(accessedTy));
     }
 
+    // FC17.9(d) atomic cycle-1 Phase D (D-CSUBSET-ATOMIC): fold an
+    // `atomic_load_explicit`/`atomic_store_explicit` memory_order argument to a
+    // compile-time 0..5 for the AtomicLoad/AtomicStore `payload`. A shipped
+    // `memory_order_*` constant folds to a literal at cst_to_hir (constant_symbol_fold),
+    // so a DEFAULT const-eval env resolves it (no symbol resolver needed). M3: a
+    // NON-constant (runtime) or out-of-range order → the safe seq_cst (5) fallback —
+    // over-fencing is C11-legal and strictly more permissive, so this is CORRECT (not a
+    // silent miscompile), NOT fail-loud (a runtime order value is legal C11).
+    [[nodiscard]] std::uint32_t foldAtomicOrder(HirNodeId orderNode) {
+        ConstEvalResult const r =
+            evaluateConstant(hir, interner, literals, orderNode);
+        std::int64_t v = -1;
+        if (r.value.has_value()) {
+            if (std::holds_alternative<std::int64_t>(r.value->value))
+                v = std::get<std::int64_t>(r.value->value);
+            else if (std::holds_alternative<std::uint64_t>(r.value->value))
+                v = static_cast<std::int64_t>(
+                    std::get<std::uint64_t>(r.value->value));
+        }
+        if (v < 0 || v > 5) return kAtomicOrderSeqCst;   // M3 seq_cst fallback
+        return static_cast<std::uint32_t>(v);
+    }
+
     // Map a HIR core operator + operand TypeKind to a MIR opcode. Integer
     // signed/unsigned is type-driven (HirOpKind has only `Div`/`Rem`/`Shr`,
     // not separate signed/unsigned forms — same convention as type_lattice).
@@ -2231,6 +2254,37 @@ struct Lowerer {
                         std::array<MirInstId, 3> const casOrder{
                             operands[0], operands[2], operands[1]};
                         return mir.addInst(MirOpcode::AtomicCas, casOrder, t);
+                    }
+                    case BuiltinLowering::AtomicLoad: {
+                        // FC17.9(d) (D-CSUBSET-ATOMIC): atomic_load_explicit(ptr, order)
+                        // → AtomicLoad([ptr], payload=order). The order arg (kids[1]) is
+                        // const-folded into the payload and DROPPED from the operands
+                        // (audit c); the lowered-but-unused order value is dead (DCE).
+                        if (operands.size() != 2) {
+                            unsupported(node,
+                                "atomic_load_explicit expects exactly 2 args");
+                            return InvalidMirInst;
+                        }
+                        std::array<MirInstId, 1> const ld{operands[0]};
+                        return mir.addInst(MirOpcode::AtomicLoad, ld, t,
+                                           foldAtomicOrder(kids[1]),
+                                           MirInstFlags::None);
+                    }
+                    case BuiltinLowering::AtomicStore: {
+                        // FC17.9(d) (D-CSUBSET-ATOMIC): atomic_store_explicit(ptr, val,
+                        // order) → AtomicStore([val, ptr], payload=order). Operands are
+                        // [value, ptr] (the plain-Store order the AtomicStore opcode
+                        // reuses — mind the swap: HIR arg0=ptr, arg1=value). R::None ⇒
+                        // InvalidType result (the Store convention). Order = kids[2].
+                        if (operands.size() != 3) {
+                            unsupported(node,
+                                "atomic_store_explicit expects exactly 3 args");
+                            return InvalidMirInst;
+                        }
+                        std::array<MirInstId, 2> const st{operands[1], operands[0]};
+                        return mir.addInst(MirOpcode::AtomicStore, st, InvalidType,
+                                           foldAtomicOrder(kids[2]),
+                                           MirInstFlags::None);
                     }
                     case BuiltinLowering::Barrier:
                         // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier —

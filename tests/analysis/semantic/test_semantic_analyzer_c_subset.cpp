@@ -51,12 +51,15 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     // 6.4.2.2 — one per configured spelling per function DEFINITION, bound into
     // main's own scope; D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER) + the 56 FC17.9(b)
     // C23 <stdbit.h> `__builtin_stdc_<op>_<T>` intrinsics (14 ops × 4 widths,
-    // always-injected like every other builtin; D-FULLC-STDBIT).
-    ASSERT_EQ(model.symbols().size() - 1, 73u)
+    // always-injected like every other builtin; D-FULLC-STDBIT) + the 2 FC17.9(d)
+    // atomic explicit-order accessors (`atomic_load_explicit` +
+    // `atomic_store_explicit`, always-injected builtins; D-CSUBSET-ATOMIC).
+    ASSERT_EQ(model.symbols().size() - 1, 75u)
         << "main + x + __va_list_tag + va_list + __umulh + "
            "_InterlockedCompareExchange + _ReadWriteBarrier + "
            "_exception_code + _exception_info + the 6 __builtin bit-count "
            "intrinsics + the 56 __builtin_stdc_* <stdbit.h> intrinsics + "
+           "atomic_load_explicit + atomic_store_explicit + "
            "__func__ + __FUNCTION__";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
@@ -2299,9 +2302,10 @@ TEST(SemanticAnalyzerCSubset, NestedBlocksShadowWithoutRedecl) {
     // FC17.9(b) bit-count builtins (__builtin_{popcount,clz,ctz}{,ll},
     // D-CSUBSET-BITCOUNT-INTRINSICS) + the 56 FC17.9(b) <stdbit.h>
     // __builtin_stdc_<op>_<T> intrinsics (14 ops × 4 widths, D-FULLC-STDBIT) +
-    // the 2 FC17.5 predefined function-name symbols (__func__ + __FUNCTION__, per
-    // function definition — D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
-    EXPECT_EQ(model.symbols().size() - 1, 74u);
+    // the 2 FC17.9(d) atomic accessors (atomic_load_explicit + atomic_store_explicit,
+    // D-CSUBSET-ATOMIC) + the 2 FC17.5 predefined function-name symbols (__func__ +
+    // __FUNCTION__, per function definition — D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
+    EXPECT_EQ(model.symbols().size() - 1, 76u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -2322,8 +2326,10 @@ TEST(SemanticAnalyzerCSubset, ForwardReferenceWithinBlock) {
     // _exception_code + _exception_info) + the 6 FC17.9(b) bit-count builtins
     // (__builtin_{popcount,clz,ctz}{,ll}, D-CSUBSET-BITCOUNT-INTRINSICS) + the 56
     // FC17.9(b) <stdbit.h> __builtin_stdc_<op>_<T> intrinsics (D-FULLC-STDBIT) +
-    // the 2 FC17.5 predefined function-name symbols (__func__ + __FUNCTION__). Find x by name.
-    ASSERT_EQ(model.symbols().size() - 1, 73u);
+    // the 2 FC17.9(d) atomic accessors (atomic_load_explicit + atomic_store_explicit,
+    // D-CSUBSET-ATOMIC) + the 2 FC17.5 predefined function-name symbols (__func__ +
+    // __FUNCTION__). Find x by name.
+    ASSERT_EQ(model.symbols().size() - 1, 75u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -4820,13 +4826,15 @@ TEST(SemanticAnalyzerCSubset, ValueStarValueStaysExpressionStatement) {
     // _ReadWriteBarrier + c115 _exception_code + _exception_info) + the 6 FC17.9(b)
     // bit-count builtins (__builtin_{popcount,clz,ctz}{,ll},
     // D-CSUBSET-BITCOUNT-INTRINSICS) + the 56 FC17.9(b) <stdbit.h>
-    // __builtin_stdc_<op>_<T> intrinsics (D-FULLC-STDBIT) + the 2 FC17.5
-    // predefined function-name symbols (__func__ + __FUNCTION__) — the
+    // __builtin_stdc_<op>_<T> intrinsics (D-FULLC-STDBIT) + the 2 FC17.9(d) atomic
+    // accessors (atomic_load_explicit + atomic_store_explicit, D-CSUBSET-ATOMIC) +
+    // the 2 FC17.5 predefined function-name symbols (__func__ + __FUNCTION__) — the
     // multiplication must mint NO symbol.
-    EXPECT_EQ(model.symbols().size() - 1, 74u)
+    EXPECT_EQ(model.symbols().size() - 1, 76u)
         << "main + a + b + __va_list_tag + va_list + the 5 intrinsic builtins + "
            "the 6 __builtin bit-count intrinsics + the 56 __builtin_stdc_* "
-           "<stdbit.h> intrinsics + __func__ + __FUNCTION__ — the multiplication mints none";
+           "<stdbit.h> intrinsics + atomic_load_explicit + atomic_store_explicit + "
+           "__func__ + __FUNCTION__ — the multiplication mints none";
 }
 
 // UNKNOWN `u * v;` (no `u` anywhere, single file) — the oracle-candidate

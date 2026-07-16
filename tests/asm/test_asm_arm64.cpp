@@ -759,6 +759,121 @@ TEST(Arm64Encoder, StlxrW2W0X1EncodesStoreReleaseExclusiveStatusInRs) {
     EXPECT_EQ(bytes[3], 0x88);
 }
 
+// ── FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the per-order fence
+// encodings LDAR / STLR (the non-exclusive RCsc acquire-load /
+// release-store the seq_cst `_Atomic` scalar accesses lower to). ALL
+// three fixed words cross-checked against `aarch64-linux-gnu-as`:
+//   ldar w0,[x0] = 88dffc00 · stlr w0,[x0] = 889ffc00 (see the arc
+// report). A wrong o2/L/Rs bit silently degrades the fence — the
+// byte-3/2 pins lock the exact ordering-class bits. ────────────────
+
+TEST(Arm64Encoder, LdarW0X1EncodesLoadAcquire) {
+    // ldar w0, [x1] — the acquire/seq_cst atomic LOAD. W-form base 0x88DFFC00
+    // (= LDAXR 0x885FFC00 | (1<<23), the o2 acquire bit) | Rn=x1(1)<<5 |
+    // Rt=w0(0) = 0x88DFFC20 — LE bytes: 20 FC DF 88. Unified [ptr, MemBase,
+    // MemOffset] shape: ptr→Rn, result→Rt(rd), MemBase→membase.noscale,
+    // MemOffset(0)→memoffset.zero (LDAR has no offset field; nonzero fails loud).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const ldarOp = (*s)->opcodeByMnemonic("load_acquire");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(ldarOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(x1),
+                               LirOperand::makeMemBase(1),
+                               LirOperand::makeMemOffset(0) };
+    (void)b.addInst(*ldarOp, x0, ops, /*payload=*/0, kLirInstFlagWidth32);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0xFC);
+    EXPECT_EQ(bytes[2], 0xDF);
+    EXPECT_EQ(bytes[3], 0x88);
+}
+
+TEST(Arm64Encoder, StlrW0X1EncodesStoreRelease) {
+    // stlr w0, [x1] — the release atomic STORE. W-form base 0x889FFC00
+    // (= STLXR 0x8800FC00 | (1<<23) o2 | (0x1F<<16) Rs=11111, i.e. NO status
+    // reg) | Rn=x1(1)<<5 | Rt(value)=w0(0) = 0x889FFC20 — LE bytes: 20 FC 9F 88.
+    // result:none, [value, ptr, MemBase, MemOffset]: value→Rt(rd), ptr→Rn.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const stlrOp = (*s)->opcodeByMnemonic("store_release");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(stlrOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(x0),    // stored value → Rt
+                               LirOperand::makeReg(x1),    // base → Rn
+                               LirOperand::makeMemBase(1),
+                               LirOperand::makeMemOffset(0) };
+    (void)b.addInst(*stlrOp, InvalidLirReg, ops, /*payload=*/0, kLirInstFlagWidth32);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0xFC);
+    EXPECT_EQ(bytes[2], 0x9F);
+    EXPECT_EQ(bytes[3], 0x88);
+}
+
+TEST(Arm64Encoder, StoreSeqCstW0X1IsIdenticalStlr) {
+    // The seq_cst atomic STORE (the DEFAULT for a plain `_Atomic` write) binds
+    // the SAME STLR encoding as store_release on arm64 — LDAR/STLR are RCsc, so
+    // a release store IS seq_cst (no DMB). stlr w0, [x1] = 0x889FFC20 → 20 FC 9F 88.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const seqOp = (*s)->opcodeByMnemonic("store_seqcst");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(seqOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(x0),
+                               LirOperand::makeReg(x1),
+                               LirOperand::makeMemBase(1),
+                               LirOperand::makeMemOffset(0) };
+    (void)b.addInst(*seqOp, InvalidLirReg, ops, /*payload=*/0, kLirInstFlagWidth32);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0xFC);
+    EXPECT_EQ(bytes[2], 0x9F);
+    EXPECT_EQ(bytes[3], 0x88);
+}
+
 // ── FC3.5 sweep-c3: MSUB — D-LIR-MOD-MSUB-FUSION (the fixed32 `ra`
 // slot's first consumer; rule 3's fused remainder realization) ─────
 

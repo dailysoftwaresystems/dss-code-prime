@@ -240,6 +240,279 @@ TEST(MirLoweringCSubset, AtomicScalarAccessLowersToAtomicLoadStore) {
     EXPECT_FALSE(sawPlainLoad)  << "the atomic read must not emit a plain load";
 }
 
+namespace {
+
+// FC17.9(d) atomic cycle-1 Phase D/E (D-CSUBSET-ATOMIC): lower a program that
+// `#include <stdatomic.h>` through the FULL pipeline with a scratch-dir stdatomic
+// descriptor on the system path (the setjmp buildAngleDescriptorUnit discipline).
+// The scratch descriptor uses the REAL codec spelling `atomic<i32>` for atomic_int +
+// the 6 memory_order constants — so it faithfully exercises the M1 hir_text codec
+// (parseTypeFromText → interner.atomicQualified) that the shipped stdatomic.json uses.
+[[nodiscard]] Lowered lowerAtomicProgram(std::string mainSrc) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir sysDir{Location::Temp, "stdatomic-mir"};
+    std::ofstream(sysDir.path() / "stdatomic.json", std::ios::binary) << R"JSON({
+        "header": "stdatomic.h",
+        "availableObjectFormats": ["elf", "pe", "macho"],
+        "typedefs": [
+            { "name": "atomic_int", "type": "atomic<i32>" }
+        ],
+        "constants": [
+            { "name": "memory_order_relaxed", "value": 0, "type": "i32" },
+            { "name": "memory_order_consume", "value": 1, "type": "i32" },
+            { "name": "memory_order_acquire", "value": 2, "type": "i32" },
+            { "name": "memory_order_release", "value": 3, "type": "i32" },
+            { "name": "memory_order_acq_rel", "value": 4, "type": "i32" },
+            { "name": "memory_order_seq_cst", "value": 5, "type": "i32" }
+        ]
+    })JSON";
+
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    UnitBuilder builder{*loaded};
+    builder.addSystemDir(sysDir.path());
+    builder.addInMemory(std::move(mainSrc), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    // Active elf/x86_64 (harmless — atomic_int carries no per-format variant).
+    auto model = analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+                         ObjectFormatKind::Elf, "x86_64");
+    DiagnosticReporter hirReporter;
+    auto hir = lowerToHir(model, hirReporter);
+    DiagnosticReporter mirReporter;
+    MirLoweringConfig mirCfg;
+    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
+        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+        if (auto const* cc = (*t)->callingConventionByName("sysv_amd64")) {
+            mirCfg.aggregateClassification   = cc->aggregateClassification;
+            mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
+            mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
+            mirCfg.argSlotAligned            = cc->slotAligned;
+            mirCfg.argGprCount = static_cast<std::uint32_t>(cc->argGprs.size());
+            mirCfg.argFprCount = static_cast<std::uint32_t>(cc->argFprs.size());
+            mirCfg.aggregateStackExhaustsRegisters = cc->aggregateStackExhaustsRegisters;
+            mirCfg.vaListLayout = cc->vaListLayout;
+        }
+    }
+    HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
+                                    model.lattice().interner(), mirReporter,
+                                    &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
+                                    &hir->linkageMap, &hir->mutabilityMap,
+                                    &hir->volatileMap, /*alignmentMap=*/nullptr,
+                                    &hir->threadLocalMap,
+                                    &hir->vlaSizeExprBySymbol,
+                                    &hir->sizeofVlaSymbol,
+                                    &hir->typedefVlaOriginBySymbol);
+    return Lowered{
+        .model       = std::move(model),
+        .hir         = std::move(hir),
+        .hirReporter = std::move(hirReporter),
+        .mir         = std::move(mir),
+        .mirReporter = std::move(mirReporter),
+    };
+}
+
+} // namespace
+
+// E2 — the bare-`atomic_int` atomicity pin (audit-a / M1 critical path): a shipped
+// `atomic_int x; x = 5; return x;` MUST lower to AtomicStore/AtomicLoad, proving the
+// shipped typedef genuinely carries the Atomic bit through the parseTypeFromText codec
+// (`atomic<i32>` → atomicQualified). RED-ON-DISABLE: drop the M1 codec qualifier
+// spelling (hir_text.cpp) → `atomic<i32>` reinterns as plain `int` → `atomic_int`
+// decays to a plain int → the accesses lower to plain Store/Load → this flips.
+TEST(MirLoweringCSubset, ShippedAtomicIntTypedefCarriesAtomicBit) {
+    auto L = lowerAtomicProgram(
+        "#include <stdatomic.h>\n"
+        "int main(void) { atomic_int x; x = 5; return x; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    bool sawAtomicStore = false, sawAtomicLoad = false;
+    bool sawPlainStore = false, sawPlainLoad = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                switch (m.instOpcode(m.blockInstAt(b, i))) {
+                    case MirOpcode::AtomicStore: sawAtomicStore = true; break;
+                    case MirOpcode::AtomicLoad:  sawAtomicLoad  = true; break;
+                    case MirOpcode::Store:       sawPlainStore  = true; break;
+                    case MirOpcode::Load:        sawPlainLoad   = true; break;
+                    default: break;
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(sawAtomicStore) << "shipped `atomic_int x; x=5` must lower to atomic_store"
+                                   " (the typedef must carry the Atomic bit via M1)";
+    EXPECT_TRUE(sawAtomicLoad)  << "shipped `atomic_int` read must lower to atomic_load";
+    EXPECT_FALSE(sawPlainStore) << "atomic_int must not decay to a plain-int store";
+    EXPECT_FALSE(sawPlainLoad)  << "atomic_int must not decay to a plain-int load";
+}
+
+// E3 — the order-fold pins (audit-c): the memory_order arg of atomic_store_explicit /
+// atomic_load_explicit folds to the EXACT MIR payload. `memory_order_relaxed` → 0 on
+// the store; `memory_order_seq_cst` → 5 on the load. RED-ON-DISABLE: break the
+// foldAtomicOrder const-fold (e.g. hardcode seq_cst) → the relaxed store's payload
+// becomes 5, not 0 → the EXPECT_EQ(...,0u) fails. Also pins the operand SHAPE:
+// AtomicStore = [value, ptr], AtomicLoad = [ptr] — the order arg is DROPPED.
+TEST(MirLoweringCSubset, AtomicExplicitAccessorsFoldMemoryOrderIntoPayload) {
+    auto L = lowerAtomicProgram(
+        "#include <stdatomic.h>\n"
+        "int main(void) {\n"
+        "    atomic_int x;\n"
+        "    atomic_store_explicit(&x, 42, memory_order_relaxed);\n"
+        "    return atomic_load_explicit(&x, memory_order_seq_cst);\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    int atomicStores = 0, atomicLoads = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                switch (m.instOpcode(id)) {
+                    case MirOpcode::AtomicStore:
+                        ++atomicStores;
+                        EXPECT_EQ(m.instPayload(id), 0u)   // memory_order_relaxed
+                            << "atomic_store_explicit(_, _, memory_order_relaxed) must"
+                               " fold to payload 0";
+                        EXPECT_EQ(m.instOperands(id).size(), 2u)   // [value, ptr]
+                            << "AtomicStore takes [value, ptr] — the order arg is dropped";
+                        break;
+                    case MirOpcode::AtomicLoad:
+                        ++atomicLoads;
+                        EXPECT_EQ(m.instPayload(id), 5u)   // memory_order_seq_cst
+                            << "atomic_load_explicit(_, memory_order_seq_cst) must fold"
+                               " to payload 5";
+                        EXPECT_EQ(m.instOperands(id).size(), 1u)   // [ptr]
+                            << "AtomicLoad takes [ptr] — the order arg is dropped";
+                        break;
+                    default: break;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(atomicStores, 1) << "exactly one atomic_store_explicit";
+    EXPECT_EQ(atomicLoads, 1)  << "exactly one atomic_load_explicit";
+}
+
+// audit fold-d — `_Atomic volatile int` (the user-named combination): the access
+// lowers to AtomicLoad/AtomicStore ALONE (NO separate MirInstFlags::Volatile) — the
+// atomic op's hasSideEffects + opcodeClobbersMemory subsume volatile's
+// no-elide/no-CSE/no-hoist. Uses the RAW qualifier form (no <stdatomic.h> needed).
+// RED-ON-DISABLE: were the combined qualifier routed through the volatile path
+// instead, it would emit a plain Store/Load carrying the Volatile flag → the atomic
+// ops would be absent (EXPECT_TRUE flips) and a plain Store would appear.
+TEST(MirLoweringCSubset, AtomicVolatileScalarLowersToAtomicOpsAlone) {
+    auto L = lowerCSubset(
+        "int main(void) { _Atomic volatile int v; v = 7; return v; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    bool sawAtomicStore = false, sawAtomicLoad = false;
+    bool sawPlainStore = false, sawPlainLoad = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                switch (m.instOpcode(id)) {
+                    case MirOpcode::AtomicStore:
+                    case MirOpcode::AtomicLoad:
+                        if (m.instOpcode(id) == MirOpcode::AtomicStore)
+                            sawAtomicStore = true;
+                        else
+                            sawAtomicLoad = true;
+                        // fold-d: the atomic op carries NO separate Volatile flag.
+                        EXPECT_FALSE(has(m.instFlags(id), MirInstFlags::Volatile))
+                            << "an _Atomic volatile access must not ALSO carry the"
+                               " Volatile flag — the atomic op subsumes it";
+                        break;
+                    case MirOpcode::Store: sawPlainStore = true; break;
+                    case MirOpcode::Load:  sawPlainLoad  = true; break;
+                    default: break;
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(sawAtomicStore) << "`_Atomic volatile v = 7` must lower to atomic_store";
+    EXPECT_TRUE(sawAtomicLoad)  << "`return v` must lower to atomic_load";
+    EXPECT_FALSE(sawPlainStore) << "_Atomic volatile must take the atomic path, not a"
+                                   " plain volatile store";
+    EXPECT_FALSE(sawPlainLoad)  << "_Atomic volatile must take the atomic path, not a"
+                                   " plain volatile load";
+}
+
+// M3 — a NON-constant (runtime) memory_order arg → the safe seq_cst (5) fallback
+// (over-fencing is C11-legal, strictly more permissive) — NOT fail-loud (a runtime
+// order value is legal C11). `ord` is a function parameter (non-foldable), so
+// foldAtomicOrder can't const-fold it and clamps to seq_cst. RED-ON-DISABLE: drop the
+// `v < 0 || v > 5 → seq_cst` clamp (return the raw fold) → a non-foldable order yields
+// no value (v stays -1) and the payload becomes a garbage cast, not 5.
+TEST(MirLoweringCSubset, AtomicExplicitNonConstOrderFallsBackToSeqCst) {
+    auto L = lowerAtomicProgram(
+        "#include <stdatomic.h>\n"
+        "int run(int ord) {\n"
+        "    atomic_int x;\n"
+        "    atomic_store_explicit(&x, 42, ord);\n"
+        "    return atomic_load_explicit(&x, ord);\n"
+        "}\n"
+        "int main(void) { return run(0); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    int atomics = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                MirOpcode const op = m.instOpcode(id);
+                if (op == MirOpcode::AtomicStore || op == MirOpcode::AtomicLoad) {
+                    ++atomics;
+                    EXPECT_EQ(m.instPayload(id), 5u)   // seq_cst fallback
+                        << "a runtime (non-constant) memory_order must fall back to"
+                           " seq_cst (5), never fail loud or emit garbage";
+                }
+            }
+        }
+    }
+    EXPECT_EQ(atomics, 2) << "one atomic_store + one atomic_load";
+}
+
 // D-CSUBSET-ENUM-INT-CONVERSION (FC8): a bare enumerator lowers to a Const of its
 // value through HIR→MIR. RED-ON-DISABLE (and red TODAY before the A1 Ref→Const
 // fold): an enumerator Ref has no storage / SSA binding, so without the fold it

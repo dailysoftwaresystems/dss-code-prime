@@ -660,6 +660,111 @@
       }
     },
     {
+      "$comment": "FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the acquire/seq_cst realization of MIR AtomicLoad on x86-64 — a PLAIN `mov reg, [base+disp32]` (x86 loads are ALREADY acquire; no fence instruction needed). Declared as a distinct slot with the SAME encoding as the scalar `load` (0x8B /r) so the pure-slot-presence probe finds an acquire-load realization on x86 (a target omitting it would fail loud, never silently under-fence). Operand shape [ptr, MemBase(1), MemOffset(0)] (unified with arm64 LDAR): ptr->modrm.rm.mem, result->modrm.reg, disp32=0. VERIFIED by objdump: `mov ecx,[rax]` = 8b 08. Widths 64 (REX.W — i64/pointer) + 32 (int / _Atomic int).",
+      "mnemonic":      "load_acquire",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [139] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "resultSlot": "modrm.reg",
+            "template":   { "opcode": [139] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the release/acq_rel realization of MIR AtomicStore on x86-64 — a PLAIN `mov [base+disp32], reg` (x86 stores are ALREADY release). Same encoding as the scalar `store` (0x89 /r). Operand shape [value, ptr, MemBase(1), MemOffset(0)]: value->modrm.reg, ptr->modrm.rm.mem, disp32=0. A `mov` does NOT write its value reg (no clobber hazard, unlike the seq_cst XCHG). VERIFIED by objdump: `mov [rax],ecx` = 89 08. Widths 64 (REX.W) + 32.",
+      "mnemonic":      "store_release",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [137] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [137] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the SEQ_CST realization of MIR AtomicStore on x86-64 — `xchg [base+disp32], reg` (0x87 /r). A MEMORY-operand XCHG is IMPLICITLY LOCK'd (Intel SDM Vol.2B XCHG: the LOCK protocol is automatic whenever a memory operand is referenced, no LOCK prefix needed) = a FULL fence, the correct strength for a seq_cst store. ★ XCHG WRITES the OLD memory value back into its reg operand, so `lowerAtomicStore` COPIES the stored value into a fresh scratch first — else a live-after value vreg is corrupted. Operand shape [value(scratch), ptr, MemBase(1), MemOffset(0)] (same as `store`): value->modrm.reg, ptr->modrm.rm.mem. VERIFIED by objdump: `xchg dword [rax],ecx` = 87 08, `xchg qword [rax],rcx` = 48 87 08. Widths 64 (REX.W) + 32.",
+      "mnemonic":      "store_seqcst",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [135] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [135] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "D-CSUBSET-WHILE-LOOP-SUBSTRATE (step 13.5 cycle 1, 2026-06-03): integer compare (writes FLAGS, no GPR result). Two variants: reg-reg (REX.W 0x39 /r — cmp r/m64, r64) + reg-imm32 (REX.W 0x81 /7 imm32 — cmp r/m64, imm32 with sign-extended imm32). modrmRegExt=7 fills ModR/M.reg with the /7 opcode-extension digit. ML5 lowerICmp + lowerCondBr both emit `cmp` against an immediate-0 or against another reg.",
       "mnemonic":      "cmp",
       "result":        "none",

@@ -840,6 +840,15 @@ enum class BuiltinLowering : std::uint16_t {
     StdcBitWidth,
     StdcBitFloor,
     StdcBitCeil,
+    // FC17.9(d) atomic cycle-1 (D-CSUBSET-ATOMIC): the C11 <stdatomic.h> explicit-
+    // order scalar accessors `atomic_load_explicit`/`atomic_store_explicit`. Each maps
+    // to the dedicated MirOpcode AtomicLoad/AtomicStore (the SAME ops a bare `_Atomic`
+    // access emits) with the memory_order arg const-folded into MirInst.payload (0..5)
+    // at hir_to_mir. APPENDED here (not grouped by AtomicCas) so every pre-existing
+    // enumerator keeps its integer value — the BuiltinCall payload prints numerically
+    // in `.dsshir` text (the TypeKind-placed-LAST numeric-stability precedent).
+    AtomicLoad,
+    AtomicStore,
 };
 
 // Resolve the config `lowering` name to its BuiltinLowering. nullopt = an unknown
@@ -849,6 +858,9 @@ enum class BuiltinLowering : std::uint16_t {
 builtinLoweringFromName(std::string_view name) noexcept {
     if (name == "umulh")      { return BuiltinLowering::UMulHigh;  }
     if (name == "atomic_cas") { return BuiltinLowering::AtomicCas; }
+    // FC17.9(d) atomic cycle-1 (D-CSUBSET-ATOMIC): the explicit-order scalar accessors.
+    if (name == "atomic_load")  { return BuiltinLowering::AtomicLoad;  }
+    if (name == "atomic_store") { return BuiltinLowering::AtomicStore; }
     if (name == "barrier")    { return BuiltinLowering::Barrier;   }
     if (name == "seh_exception_code") { return BuiltinLowering::SehExceptionCode; }
     if (name == "seh_exception_info") { return BuiltinLowering::SehExceptionInfo; }

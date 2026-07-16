@@ -366,6 +366,26 @@ private:
             return;
         }
         TypeInterner const& in = *ctx_.interner;
+        // D-CSUBSET-QUAL-BITSET (M1): a qualifier skin (`volatile` / `_Atomic`) is
+        // TRANSPARENT to in.kind()/operands()/scalars(), so it must be spelled from
+        // the RAW `isVolatileQualified`/`isAtomicQualified` predicates BEFORE the kind
+        // switch — otherwise the switch sees THROUGH to the material kind and the
+        // qualifier silently DROPS in text (a shipped `_Atomic int` typedef would
+        // reintern as plain `int` — the exact loss-of-atomicity this codec closes).
+        // Emit nested keyword wrappers over the material type; `parseType` merges the
+        // bits back into ONE skin on reintern (`atomic<volatile<T>>` → bits{V,A}), so
+        // the round-trip is identity. `atomic` outermost is the canonical order (the
+        // bitset is order-independent — this only fixes a deterministic spelling).
+        if (in.isVolatileQualified(t) || in.isAtomicQualified(t)) {
+            bool const atom = in.isAtomicQualified(t);
+            bool const vol  = in.isVolatileQualified(t);
+            if (atom) out_ += "atomic<";
+            if (vol)  out_ += "volatile<";
+            appendType(in.stripVolatile(t));   // the material type (skin stripped)
+            if (vol)  out_ += '>';
+            if (atom) out_ += '>';
+            return;
+        }
         auto args = [&](std::span<TypeId const> ops) {
             bool first = true;
             for (TypeId o : ops) { if (!first) out_ += ", "; appendType(o); first = false; }
@@ -1910,6 +1930,14 @@ private:
         if (kw == "nullable") return wrap1(&TypeInterner::nullable);
         if (kw == "optional") return wrap1(&TypeInterner::optional);
         if (kw == "slice") return wrap1(&TypeInterner::slice);
+        // D-CSUBSET-QUAL-BITSET (M1): the bidirectional twin of appendType's qualifier
+        // spelling. `volatile<T>`/`atomic<T>` reintern via volatileQualified/
+        // atomicQualified, which STRIP→UNION→re-intern ONE skin — so a nested
+        // `atomic<volatile<T>>` merges to bits{Volatile,Atomic} (order-independent),
+        // and a shipped `atomic<i32>` typedef (stdatomic.json's atomic_int) genuinely
+        // carries the Atomic bit. Closes the pre-existing volatile-drops-in-text gap too.
+        if (kw == "volatile") return wrap1(&TypeInterner::volatileQualified);
+        if (kw == "atomic") return wrap1(&TypeInterner::atomicQualified);
         if (kw == "fnptr") { expect(Tk::LAngle, "'<'"); (void)parseType(); expect(Tk::RAngle, "'>'");
             malformed("fnptr<> is not constructible in this interner"); return InvalidType; }
         if (kw == "vec") { expect(Tk::LAngle, "'<'"); TypeId e = parseType(); expect(Tk::Comma, "','");

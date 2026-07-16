@@ -36,6 +36,8 @@ namespace {
         case MirOpcode::Clz:           return "Clz";       // FC17.9(b)
         case MirOpcode::Ctz:           return "Ctz";       // FC17.9(b)
         case MirOpcode::AtomicCas:     return "AtomicCas";
+        case MirOpcode::AtomicLoad:    return "AtomicLoad";   // FC17.9(d)
+        case MirOpcode::AtomicStore:   return "AtomicStore";  // FC17.9(d)
         case MirOpcode::ICmpEq:        return "ICmpEq";
         case MirOpcode::ICmpNe:        return "ICmpNe";
         case MirOpcode::ICmpSlt:       return "ICmpSlt";
@@ -307,6 +309,32 @@ enum class MnemonicSlot : std::uint8_t {
     ClzNative,
     CtzNative,
     Rbit,
+    // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the per-order fence
+    // realizations MIR AtomicLoad/AtomicStore lower to, probed by mnemonic
+    // presence (the lowerAtomicCas capability-probe — NEVER an `if (arch==)`).
+    // A relaxed/consume atomic scalar access is a PLAIN naturally-aligned
+    // access (mov / ldr — always available), so it reuses the plain
+    // Load/Store and needs NO slot here. The stronger orders bind:
+    //   `LoadAcquire`  — an acquire/seq_cst atomic load. arm64 = LDAR
+    //     (RCsc load-acquire); x86 = a plain `mov r,[mem]` (x86 loads are
+    //     already acquire), declared with the scalar-load encoding so the
+    //     slot-presence probe succeeds. A load never writes its data reg,
+    //     so no clobber hazard.
+    //   `StoreRelease` — a release/acq_rel atomic store. arm64 = STLR
+    //     (RCsc store-release); x86 = a plain `mov [mem],r` (x86 stores are
+    //     already release). Neither writes its value reg.
+    //   `StoreSeqCst` — a seq_cst atomic store (the DEFAULT for a plain
+    //     `_Atomic` write). arm64 = STLR too (LDAR/STLR are RCsc, so a
+    //     release store IS a seq_cst store — no DMB); x86 = `xchg [mem],r`
+    //     (a MEMORY-operand XCHG is implicitly LOCK'd = a full fence). ★ the
+    //     XCHG WRITES the old memory value back into its reg operand, so the
+    //     lowering COPIES the stored value into a fresh scratch first (the
+    //     lowerAtomicCas comparand-pin precedent) — else a live-after value
+    //     vreg is corrupted.
+    // A target that declares NEITHER the plain Load/Store nor a needed
+    // acquire/release/seqcst slot FAILS LOUD (reportMissingOpcode) — the one
+    // forbidden miscompile direction (a silent under-fence) can never happen.
+    LoadAcquire, StoreRelease, StoreSeqCst,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -416,6 +444,9 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::ClzNative,          "clz"},       // FC17.9(b): x86 LZCNT / arm64 CLZ
     {MnemonicSlot::CtzNative,          "ctz"},       // FC17.9(b): x86 TZCNT
     {MnemonicSlot::Rbit,               "rbit"},      // FC17.9(b): arm64 RBIT (→ ctz via CLZ)
+    {MnemonicSlot::LoadAcquire,        "load_acquire"},  // FC17.9(d): arm64 LDAR / x86 acquire mov
+    {MnemonicSlot::StoreRelease,       "store_release"}, // FC17.9(d): arm64 STLR / x86 release mov
+    {MnemonicSlot::StoreSeqCst,        "store_seqcst"},  // FC17.9(d): arm64 STLR / x86 XCHG [mem],r
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -1563,6 +1594,13 @@ struct Lowerer {
             case MirOpcode::Clz:      return lowerClz(id);
             case MirOpcode::Ctz:      return lowerCtz(id);
             case MirOpcode::AtomicCas: return lowerAtomicCas(id);
+            // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): per-order fence
+            // matrix. Relaxed/consume reuse the plain scalar Load/Store; the
+            // stronger orders bind the LoadAcquire/StoreRelease/StoreSeqCst
+            // slots (pure slot-presence probe; fail-loud on a missing needed
+            // slot — never a silent under-fence).
+            case MirOpcode::AtomicLoad:  return lowerAtomicLoad(id);
+            case MirOpcode::AtomicStore: return lowerAtomicStore(id);
             // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier is a pure
             // COMPILE-TIME ordering fence — it emits NO instruction. Its whole
             // effect (forbidding CSE/LICM from moving memory ops across it) is
@@ -5308,6 +5346,185 @@ struct Lowerer {
         // missing capability (mirrors emitDivLikeValue / lowerMulHigh).
         reportMissingOpcode(MnemonicSlot::LockCmpxchg,
                             mirOpcodeName(mir.instOpcode(id)));
+    }
+
+    // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the C11 memory_order values a
+    // MIR AtomicLoad/AtomicStore carries in its `payload` (the hir_to_mir
+    // kAtomicOrder* encoding). A plain `_Atomic` access is seq_cst (the default,
+    // strongest order). Relaxed/consume reuse the plain scalar Load/Store; the
+    // stronger orders bind a per-order fence slot.
+    static constexpr std::uint32_t kAtomicOrderRelaxed = 0;
+    static constexpr std::uint32_t kAtomicOrderConsume = 1;
+    static constexpr std::uint32_t kAtomicOrderAcquire = 2;
+    static constexpr std::uint32_t kAtomicOrderRelease = 3;
+    static constexpr std::uint32_t kAtomicOrderAcqRel  = 4;
+    static constexpr std::uint32_t kAtomicOrderSeqCst  = 5;
+
+    // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): a FENCED (acquire/release/
+    // seq_cst) `_Atomic` access of a NON-integer (FPR/float) scalar. The LDAR/
+    // STLR/XCHG fence realizations are GPR-only, and the encoding-variant guard
+    // matches operand KIND, not register class — so an FPR value would silently
+    // mis-encode through a GPR instruction form. FAIL LOUD (never a silent
+    // miscompile): a float lock-free `_Atomic` is a NAMED deferral this cycle
+    // (cycle-1 = integer lock-free scalars). A RELAXED FPR atomic still works —
+    // it reuses the plain movsd/fp Load/Store (a relaxed atomic == plain access).
+    void reportNonGprAtomic(MirOpcode op, MirInstId id) {
+        dss::report(reporter,
+            DiagnosticCode::L_UnsupportedLoweringForOpcode,
+            DiagnosticSeverity::Error,
+            std::format(
+                "MIR {} (inst {}): a fenced (acquire/release/seq_cst) _Atomic "
+                "access of a non-integer (FPR) scalar is not lowered on target "
+                "'{}' this cycle — the LDAR/STLR/XCHG fence realizations are "
+                "GPR-only (cycle-1 atomics are integer lock-free scalars; a "
+                "float _Atomic is a named deferral). Proceeding would silently "
+                "mis-encode an FPR value through a GPR instruction form.",
+                mirOpcodeName(op), id.v, target.name()));
+    }
+
+    // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): lower a MIR AtomicLoad to a
+    // per-order load. Operand [ptr]; result = the loaded value. The order
+    // (`payload`) selects the fence via a CLOSED (order, op)→slot matrix,
+    // capability-probed (`opcode(slot).has_value()`, NEVER an arch identity):
+    //   relaxed(0)/consume(1) → the PLAIN scalar Load (a naturally-aligned
+    //     relaxed atomic IS a plain access — `mov` on x86, `ldr` on arm64; no
+    //     fence, always available). REUSE lowerLoad — the identical [ptr]
+    //     operand shape + width/class/FPR handling, zero duplication.
+    //   acquire(2)/seq_cst(5) [+ the load-INVALID release/acq_rel, over-fenced
+    //     UP to acquire — the only safe direction, never under-fence] → the
+    //     LoadAcquire slot (arm64 LDAR; x86 a plain acquire `mov`). FAIL LOUD if
+    //     the target declares no LoadAcquire (a weak target that omits its
+    //     acquire realization REDS rather than racing).
+    void lowerAtomicLoad(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(MirOpcode::AtomicLoad, id);
+            return;
+        }
+        std::uint32_t const order = mir.instPayload(id);
+        if (order == kAtomicOrderRelaxed || order == kAtomicOrderConsume) {
+            lowerLoad(id);   // relaxed atomic scalar load == plain scalar load
+            return;
+        }
+        // acquire / seq_cst (and any load-invalid stronger encoding, over-fenced
+        // to acquire). LDAR / x86-acquire-mov are GPR — an FPR `_Atomic` (a
+        // lock-free 8-byte scalar, but not this cycle) fails loud, never a
+        // GPR-form mis-encode.
+        LirRegClass const cls = regClassFor(id);
+        if (cls != LirRegClass::GPR) {
+            reportNonGprAtomic(MirOpcode::AtomicLoad, id);
+            poisonValue(id);
+            return;
+        }
+        auto const acqOp = opcode(MnemonicSlot::LoadAcquire);
+        if (!acqOp.has_value()) {
+            reportMissingOpcode(MnemonicSlot::LoadAcquire,
+                                mirOpcodeName(MirOpcode::AtomicLoad));
+            poisonValue(id);
+            return;
+        }
+        std::optional<LirReg> const base = regForValue(operands[0]);
+        if (!base.has_value()) return;
+        // The loaded type drives the access width EXACTLY as lowerLoad
+        // (memAccessWidthFlags: int→width-32, ptr/i64→width-64) — the atomic
+        // qualifier is transparent to `reprKind`, so `_Atomic int` reads as int.
+        std::uint8_t const widthFlags = memAccessWidthFlags(mir.instType(id), cls);
+        LirReg const result = lir.newVReg(cls);
+        // Unified [ptr, MemBase(1), MemOffset(0)] shape (x86 memory addressing
+        // needs the disp32; arm64 LDAR carries no offset field and pins
+        // MemBase→membase.noscale + MemOffset→memoffset.zero, FAIL-LOUD on a
+        // non-zero disp — a naturally-aligned atomic is always offset 0).
+        std::array<LirOperand, 3> ops{
+            LirOperand::makeReg(*base),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        emitInst(*acqOp, result, ops, /*payload=*/0, widthFlags);
+        defineValue(id, result);
+    }
+
+    // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): lower a MIR AtomicStore to a
+    // per-order store. Operands [value, ptr]; NO result (width comes from the
+    // VALUE operand — an AtomicStore has no result type, the plain-Store rule).
+    // The order (`payload`) selects the fence:
+    //   relaxed(0) → the PLAIN scalar Store (`mov` / `str`; no fence). REUSE
+    //     lowerStore.
+    //   release(3)/acq_rel(4) → the StoreRelease slot (arm64 STLR; x86 a plain
+    //     release `mov`). Neither writes its value reg — no scratch needed.
+    //   seq_cst(5) [the DEFAULT for a plain `_Atomic` write; + any store-INVALID
+    //     acquire/consume, over-fenced UP to seq_cst — never under-fence] → the
+    //     StoreSeqCst slot (arm64 STLR — LDAR/STLR are RCsc so a release store IS
+    //     seq_cst, no DMB; x86 `xchg [mem],reg` — a MEMORY-operand XCHG is
+    //     implicitly LOCK'd = a full fence). ★ XCHG WRITES the old memory value
+    //     back into its reg operand, so COPY the value into a fresh scratch first
+    //     (the lowerAtomicCas comparand-into-RAX precedent) — else a live-after
+    //     value vreg is corrupted. (arm64 STLR does not clobber; the copy is a
+    //     harmless, coalescable reg move.)
+    // FAIL LOUD on a missing needed slot (never a silent under-fence).
+    void lowerAtomicStore(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 2) {
+            reportUnsupported(MirOpcode::AtomicStore, id);
+            return;
+        }
+        std::uint32_t const order = mir.instPayload(id);
+        if (order == kAtomicOrderRelaxed) {
+            lowerStore(id);   // relaxed atomic scalar store == plain scalar store
+            return;
+        }
+        // The stored value's class/width drive the encoding. STLR/XCHG are GPR —
+        // an FPR `_Atomic` store fails loud (see reportNonGprAtomic).
+        LirRegClass const cls = regClassForType(mir.instType(operands[0]));
+        if (cls != LirRegClass::GPR) {
+            reportNonGprAtomic(MirOpcode::AtomicStore, id);
+            return;
+        }
+        std::optional<LirReg> const value = regForValue(operands[0]);
+        std::optional<LirReg> const base  = regForValue(operands[1]);
+        if (!value.has_value() || !base.has_value()) return;
+        std::uint8_t const widthFlags =
+            memAccessWidthFlags(mir.instType(operands[0]), cls);
+
+        // release/acq_rel → StoreRelease; everything else (seq_cst + any
+        // store-invalid order) → StoreSeqCst (the strongest — over-fence, never
+        // under-fence).
+        bool const isSeqCst =
+            (order != kAtomicOrderRelease && order != kAtomicOrderAcqRel);
+        MnemonicSlot const slot =
+            isSeqCst ? MnemonicSlot::StoreSeqCst : MnemonicSlot::StoreRelease;
+        auto const stOp = opcode(slot);
+        if (!stOp.has_value()) {
+            reportMissingOpcode(slot, mirOpcodeName(MirOpcode::AtomicStore));
+            return;
+        }
+
+        // ★ the seq_cst XCHG clobber hazard: copy the stored value into a fresh
+        // scratch so a live-after value vreg survives the reg write-back. Release
+        // stores (mov/stlr) do not clobber, so they store the value reg directly.
+        LirReg valueReg = *value;
+        if (isSeqCst) {
+            auto const movOp = opcode(MnemonicSlot::Mov);
+            if (!movOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Mov,
+                                    "MIR AtomicStore (seq_cst scratch copy)");
+                return;
+            }
+            LirReg const scratch = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 1> const movOps{LirOperand::makeReg(*value)};
+            emitInst(*movOp, scratch, movOps);
+            valueReg = scratch;
+        }
+
+        // Unified [value, ptr, MemBase(1), MemOffset(0)] shape (mirrors
+        // lowerStore; x86 needs the disp32, arm64 STLR pins membase.noscale +
+        // memoffset.zero, FAIL-LOUD on a non-zero disp).
+        std::array<LirOperand, 4> ops{
+            LirOperand::makeReg(valueReg),
+            LirOperand::makeReg(*base),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        emitInst(*stOp, InvalidLirReg, ops, /*payload=*/0, widthFlags);
     }
 
     void reportMissingImplicitRole(std::uint16_t opId, char const* mapName,

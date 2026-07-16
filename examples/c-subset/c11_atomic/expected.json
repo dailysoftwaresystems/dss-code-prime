@@ -1,0 +1,35 @@
+{
+  "$comment": "FC17.9(d) atomic cycle-1 (D-CSUBSET-ATOMIC): runtime witness for the C11/C23 <stdatomic.h> lock-free scalar surface across the legs, RUN on BOTH the baseline (debug) AND the `release` (shippedPipeline) arm. Three arms in one exit: (1) a plain `_Atomic int` (assignment→AtomicStore seq_cst, read→AtomicLoad seq_cst); (2) `#include <stdatomic.h>` + `atomic_int` + atomic_store_explicit(relaxed)/atomic_load_explicit(seq_cst) — the genuinely _Atomic-qualified typedef (M1) + the memory_order folded into the MIR payload; (3) `_Atomic volatile int` (the user-named combination — lowers to AtomicLoad/AtomicStore ALONE, the atomic op subsuming volatile). The atomic ops carry hasSideEffects + opcodeClobbersMemory so the `release` arm proves they survive Mem2Reg/CSE/LICM/DCE + Inlining intact (a dropped store → the load reads an uninitialized slot → a wrong exit). ANTI-FOLD: g_a/g_b/g_c are mutable globals (runtime-opaque). The x86-64 (xchg/mov) vs arm64 (LDAR/STLR) differential must agree. exit = 10 + 12 + 20 = 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

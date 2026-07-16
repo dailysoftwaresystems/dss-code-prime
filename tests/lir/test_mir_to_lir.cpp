@@ -1192,6 +1192,217 @@ TEST(MirToLir, MissingInputRolesFailsLoudOnDivLowering) {
            "('dividend') and the map ('inputRoles').";
 }
 
+// ── FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the per-order fence matrix ──
+//
+// AtomicLoad/AtomicStore carry a C11 memory_order in their MIR payload
+// (relaxed=0, consume=1, acquire=2, release=3, acq_rel=4, seq_cst=5). The
+// MIR→LIR lowering maps (order, op)→a per-target fence slot by PURE
+// slot-presence (never an arch identity):
+//   load:  relaxed/consume → plain `load`;  acquire/seq_cst → `load_acquire`.
+//   store: relaxed         → plain `store`; release/acq_rel → `store_release`;
+//          seq_cst         → `store_seqcst`.
+// These SHAPE pins are red-on-disable — a relaxed load MUST NOT emit a fence
+// (load_acquire), a seq_cst load MUST. On the shipped x86_64 the fence slots
+// are the mov-load / mov-store / xchg realizations (byte-pinned in
+// test_asm_x86_variable); on arm64 LDAR/STLR (test_asm_arm64). A weak target
+// omitting a needed slot FAILS LOUD (the I2 pin below) — never a silent
+// under-fence (a data race is the ONE forbidden miscompile direction).
+
+namespace {
+
+// fn(int* p) -> int { return AtomicLoad(p, order); }  — a hand-built MIR that
+// exercises the AtomicLoad lowering arm directly (the c-subset front-end emits
+// only seq_cst plain-access atomics; explicit per-order builtins are Phase D).
+[[nodiscard]] Mir buildAtomicLoadFnMir(std::uint32_t order, TypeInterner& interner) {
+    TypeId const i32  = interner.primitive(TypeKind::I32);
+    TypeId const i32p = interner.pointer(i32);
+    TypeId const params[] = {i32p};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const ptr = mb.addArg(0, i32p);
+    MirInstId const loadOps[] = {ptr};
+    MirInstId const v = mb.addInst(MirOpcode::AtomicLoad, loadOps, i32, order);
+    mb.addReturn(v);
+    return std::move(mb).finish();
+}
+
+// fn(int* p, int v) -> int { AtomicStore(v, p, order); return v; }
+// v is RETURNED (live-after the store) so the x86 seq_cst XCHG copy-to-scratch
+// is exercised — a clobbered value reg would return garbage, not v.
+[[nodiscard]] Mir buildAtomicStoreFnMir(std::uint32_t order, TypeInterner& interner) {
+    TypeId const i32  = interner.primitive(TypeKind::I32);
+    TypeId const i32p = interner.pointer(i32);
+    TypeId const params[] = {i32p, i32};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const ptr = mb.addArg(0, i32p);
+    MirInstId const val = mb.addArg(1, i32);
+    MirInstId const storeOps[] = {val, ptr};   // AtomicStore operands = [value, ptr]
+    (void)mb.addInst(MirOpcode::AtomicStore, storeOps, InvalidType, order);
+    mb.addReturn(val);
+    return std::move(mb).finish();
+}
+
+// Count LIR insts (fn 0, block 0) whose opcode is `mnemonic` on `sch`.
+[[nodiscard]] int countLirMnemonic(Lir const& lir, TargetSchema const& sch,
+                                   std::string_view mnemonic) {
+    auto const want = sch.opcodeByMnemonic(mnemonic);
+    if (!want.has_value()) return 0;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    int n = 0;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == *want) ++n;
+    }
+    return n;
+}
+
+}  // namespace
+
+TEST(MirToLirAtomic, StoreSeqCstEmitsStoreSeqCstNotPlainStore) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMir(/*seq_cst=*/5, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 1)
+        << "a seq_cst AtomicStore must lower to the store_seqcst (xchg) slot.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store"), 0)
+        << "RED-ON-DISABLE: a seq_cst store MUST NOT be a plain (unfenced) store.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_release"), 0);
+}
+
+TEST(MirToLirAtomic, StoreReleaseEmitsStoreReleaseNotSeqCst) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMir(/*release=*/3, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_release"), 1)
+        << "a release AtomicStore must lower to the store_release (mov) slot.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0)
+        << "RED-ON-DISABLE: a release store MUST NOT emit the seq_cst (xchg) fence.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store"), 0);
+}
+
+TEST(MirToLirAtomic, StoreRelaxedEmitsPlainStore) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMir(/*relaxed=*/0, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store"), 1)
+        << "a relaxed AtomicStore reuses the plain scalar store (mov; no fence).";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_release"), 0);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0);
+}
+
+TEST(MirToLirAtomic, LoadSeqCstEmitsLoadAcquireNotPlainLoad) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicLoadFnMir(/*seq_cst=*/5, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load_acquire"), 1)
+        << "a seq_cst AtomicLoad must lower to the load_acquire slot.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load"), 0)
+        << "RED-ON-DISABLE: a seq_cst load MUST NOT be a plain (unfenced) load.";
+}
+
+TEST(MirToLirAtomic, LoadAcquireEmitsLoadAcquire) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicLoadFnMir(/*acquire=*/2, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load_acquire"), 1);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load"), 0);
+}
+
+TEST(MirToLirAtomic, LoadRelaxedEmitsPlainLoadNotLoadAcquire) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicLoadFnMir(/*relaxed=*/0, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load"), 1)
+        << "a relaxed AtomicLoad reuses the plain scalar load (mov; no fence).";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load_acquire"), 0)
+        << "RED-ON-DISABLE: a relaxed load MUST NOT emit the acquire fence.";
+}
+
+TEST(MirToLirAtomic, SeqCstRoutesToStlrAndLdarOnArm64) {
+    // The same (order, op)→slot matrix on arm64: seq_cst store→store_seqcst
+    // (STLR), seq_cst load→load_acquire (LDAR). Confirms the pure-slot-presence
+    // dispatch is target-blind (byte encodings pinned in test_asm_arm64).
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+
+    Mir storeMir = buildAtomicStoreFnMir(/*seq_cst=*/5, interner);
+    auto storeR = lowerToLir(storeMir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(storeR.ok);
+    EXPECT_EQ(countLirMnemonic(storeR.lir, **target, "store_seqcst"), 1);
+
+    Mir loadMir = buildAtomicLoadFnMir(/*seq_cst=*/5, interner);
+    auto loadR = lowerToLir(loadMir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(loadR.ok);
+    EXPECT_EQ(countLirMnemonic(loadR.lir, **target, "load_acquire"), 1);
+}
+
+TEST(MirToLirAtomic, AcquireLoadFailsLoudWhenLoadAcquireSlotMissing) {
+    // I2 FAIL-LOUD belt: a target that declares NO load_acquire realization
+    // must FAIL LOUD on an acquire/seq_cst AtomicLoad (reportMissingOpcode) —
+    // never silently fall back to a plain (unfenced) load. A future weak target
+    // that omits its acquire slot REDS instead of racing.
+    auto mutated = dss::test_support::mutateShippedTargetSchemaJson(
+        "x86_64", {"load_acquire"});
+    ASSERT_TRUE(mutated.has_value())
+        << "removing the OPTIONAL load_acquire opcode must not fail the loader.";
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicLoadFnMir(/*seq_cst=*/5, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **mutated, interner, rep, noExterns);
+    EXPECT_FALSE(lirR.ok)
+        << "an acquire/seq_cst load with no load_acquire slot MUST fail the "
+           "lowering — never a silent plain-load under-fence.";
+    bool sawDiag = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_RequiredLirOpcodeMissing
+            && d.actual.find("load_acquire") != std::string::npos) {
+            sawDiag = true;
+        }
+    }
+    EXPECT_TRUE(sawDiag)
+        << "the fail-loud diagnostic must name the missing 'load_acquire' slot.";
+}
+
 // ── FC3.5 sweep-c1: capability-driven shift lowering ────────────────────
 // (the D-CSUBSET-32BIT-ALU-FORMS shifts residue — x86 implicit-CL
 //  "count" role contract / imm8 constant form / arm64 native LSLV.)

@@ -1865,6 +1865,79 @@ TEST(X86VariableEncoder, LockCmpxchgMem32HighRegsPinsLockBeforeRex) {
     EXPECT_EQ(bytes[8], 0x00);
 }
 
+TEST(X86VariableEncoder, XchgMem32EmitsSeqCstStore) {
+    // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): `xchg dword [rdi + 0], esi`
+    // — the SEQ_CST atomic STORE (a MEMORY-operand XCHG is implicitly LOCK'd =
+    // a full fence). Opcode 0x87 /r, width-32 (no REX.W) + ModR/M mod=10
+    // reg=esi(110) rm=rdi(111) = 0xB7 + disp32(0): 87 B7 00 00 00 00. Cross-
+    // checked with `as`: `xchg dword ptr [rax],ecx` = 87 08 (0x87 opcode). The
+    // value (esi) wires to modrm.reg exactly like `store`; `lowerAtomicStore`
+    // copies it into a scratch first (XCHG writes old-mem back into the reg).
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const xchgOp = (*schema)->opcodeByMnemonic("store_seqcst");
+    ASSERT_TRUE(xchgOp.has_value());
+    LirReg const rsi = physGprByName(**schema, "rsi");
+    LirReg const rdi = physGprByName(**schema, "rdi");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rsi),        // stored value → modrm.reg
+            LirOperand::makeReg(rdi),        // ptr          → modrm.rm.mem
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*xchgOp, InvalidLirReg, ops, /*payload=*/0,
+                        ::dss::kLirInstFlagWidth32);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 6u);
+    EXPECT_EQ(bytes[0], 0x87);  // XCHG r/m32, r32 — no REX.W (32-bit)
+    EXPECT_EQ(bytes[1], 0xB7);  // mod=10 reg=esi rm=rdi
+    EXPECT_EQ(bytes[2], 0x00);  // disp32 = 0
+    EXPECT_EQ(bytes[3], 0x00);
+    EXPECT_EQ(bytes[4], 0x00);
+    EXPECT_EQ(bytes[5], 0x00);
+}
+
+TEST(X86VariableEncoder, XchgMem64EmitsRexWSeqCstStore) {
+    // The 64-bit seq_cst store: `xchg qword [rdi + 0], rsi` = REX.W 0x48 + 0x87
+    // + 0xB7 + disp32(0): 48 87 B7 00 00 00 00. Cross-checked with `as`:
+    // `xchg qword ptr [rax],rcx` = 48 87 08.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const xchgOp = (*schema)->opcodeByMnemonic("store_seqcst");
+    ASSERT_TRUE(xchgOp.has_value());
+    LirReg const rsi = physGprByName(**schema, "rsi");
+    LirReg const rdi = physGprByName(**schema, "rdi");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rsi),
+            LirOperand::makeReg(rdi),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        // width-64 is the DEFAULT (no width flag bit → lirInstWidthBits == 64).
+        (void)b.addInst(*xchgOp, InvalidLirReg, ops, /*payload=*/0, /*flags=*/0);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 7u);
+    EXPECT_EQ(bytes[0], 0x48);  // REX.W
+    EXPECT_EQ(bytes[1], 0x87);
+    EXPECT_EQ(bytes[2], 0xB7);
+    EXPECT_EQ(bytes[3], 0x00);
+    EXPECT_EQ(bytes[4], 0x00);
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
+}
+
 TEST(X86VariableEncoder, StoreToR12ForcesSibByteAndRexB) {
     // `mov [r12 + 0x10], rax` → 49 89 44 24 10 00 00 00
     // r12 is rsp-family in REX-extended space.
