@@ -552,33 +552,66 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                      "(PE32+) or 0x10B (PE32). v1 ships PE32+ on "
                      "x86_64-windows.");
             }
-            // PE32+ EXECUTABLE (`.exe`) images MUST set
+            // PE32+ images (`.exe` AND `.dll`) MUST set
             // `IMAGE_FILE_EXECUTABLE_IMAGE` (0x0002) in
-            // `IMAGE_FILE_HEADER.Characteristics` — without this bit
-            // the Windows loader silently refuses to execute the
-            // file with `ERROR_BAD_EXE_FORMAT` and no diagnostic.
-            // The shipped JSON sets this (combined with
-            // `LARGE_ADDRESS_AWARE` 0x0020 → 0x0022); a hand-rolled
-            // schema that omits it would silently produce an
-            // unrunnable binary. (architect post-fold review,
-            // LK7-readiness gap for LK10 hermetic e2e.)
-            //
-            // Scope is Exec-only. Dll is anchored at D-LK2-4 — the
-            // Dll arm will use `IMAGE_FILE_DLL` (0x2000) instead
-            // (the two bits are mutually exclusive per PE COFF
-            // §3.3.2). The guard widens when Dll lands.
+            // `IMAGE_FILE_HEADER.Characteristics` — the bit means
+            // "this image is fully linked and loadable", NOT "this is
+            // a .exe" (PE COFF §3.3.2: "If this flag is not set, it
+            // indicates a linker error"); without it the Windows
+            // loader silently refuses the file with
+            // `ERROR_BAD_EXE_FORMAT` and no diagnostic. dumpbin
+            // ground truth (c152): a `cl /LD` DLL carries 0x2022 =
+            // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE | IMAGE_FILE_DLL
+            // — both bits together, retiring the earlier
+            // "mutually exclusive" misreading this guard's Exec-only
+            // scope was based on. (architect post-fold review,
+            // LK7-readiness gap for LK10 hermetic e2e; widened to the
+            // Dll arm at c152 / D-LK2-4.)
             constexpr std::uint16_t IMAGE_FILE_EXECUTABLE_IMAGE = 0x0002;
-            if (pe.objectType == PeObjectType::Exec
-             && (pe.characteristics & IMAGE_FILE_EXECUTABLE_IMAGE) == 0u) {
+            constexpr std::uint16_t IMAGE_FILE_DLL              = 0x2000;
+            if ((pe.characteristics & IMAGE_FILE_EXECUTABLE_IMAGE) == 0u) {
                 fail("/pe/characteristics",
-                     std::format("PE32+ executable image (.exe) "
-                                 "requires IMAGE_FILE_EXECUTABLE_IMAGE "
-                                 "bit (0x0002) set in "
-                                 "'pe.characteristics' (got 0x{:04x}); "
-                                 "without it the Windows loader fails "
-                                 "ERROR_BAD_EXE_FORMAT at "
-                                 "CreateProcess with no user-visible "
-                                 "diagnostic.",
+                     std::format("PE32+ image ({}) requires the "
+                                 "IMAGE_FILE_EXECUTABLE_IMAGE bit "
+                                 "(0x0002) set in 'pe.characteristics' "
+                                 "(got 0x{:04x}) -- the bit means "
+                                 "'fully linked, loadable image' and a "
+                                 "DLL carries it too (cl /LD emits "
+                                 "0x2022); without it the Windows "
+                                 "loader fails ERROR_BAD_EXE_FORMAT "
+                                 "with no user-visible diagnostic.",
+                                 std::string{peObjectTypeName(pe.objectType)},
+                                 pe.characteristics));
+            }
+            // The IMAGE_FILE_DLL bit (0x2000) is the .dll/.exe
+            // discriminator the LOADER reads: CreateProcess rejects an
+            // image carrying it; LoadLibrary requires it to treat the
+            // module as a library. It must agree with the schema's
+            // declared objectType both ways — a mismatch would emit an
+            // artifact whose extension (`TargetSpec::outputExtension`)
+            // and loader behavior contradict each other. c152, D-LK2-4.
+            if (pe.objectType == PeObjectType::Dll
+             && (pe.characteristics & IMAGE_FILE_DLL) == 0u) {
+                fail("/pe/characteristics",
+                     std::format("PE32+ dynamic-link library (pe.type "
+                                 "= 'dll') requires the IMAGE_FILE_DLL "
+                                 "bit (0x2000) set in "
+                                 "'pe.characteristics' (got 0x{:04x}) "
+                                 "-- without it the emitted .dll is a "
+                                 "mis-labeled executable image. cl /LD "
+                                 "ground truth: 0x2022. D-LK2-4.",
+                                 pe.characteristics));
+            }
+            if (pe.objectType == PeObjectType::Exec
+             && (pe.characteristics & IMAGE_FILE_DLL) != 0u) {
+                fail("/pe/characteristics",
+                     std::format("PE32+ executable image (pe.type = "
+                                 "'exec') must NOT set the "
+                                 "IMAGE_FILE_DLL bit (0x2000) in "
+                                 "'pe.characteristics' (got 0x{:04x}) "
+                                 "-- CreateProcess rejects an image "
+                                 "carrying it (a copy-paste from the "
+                                 "dll sibling). D-LK2-4.",
                                  pe.characteristics));
             }
             if (oh.imageBase == 0) {
@@ -661,6 +694,57 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "plan 16 fills the reserved bytes "
                                  "with WIN_CERTIFICATE entries).",
                                  oh.attributeCertReserveSize));
+            }
+        }
+        // ── PE Dll shape rules — c152, D-LK2-4 (the PE mirror of the
+        // ELF ET_DYN `.so` shape block above). A DSS `.dll` ships with
+        // AddressOfEntryPoint = 0 — NO DllMain (legal PE: the loader
+        // skips process/thread notifications for an entry-less
+        // module; `link /NOENTRY` produces the same shape) — so the
+        // entry cluster is ILLEGAL here, exactly as on the `.so`. A
+        // future DllMain-bearing DLL is the pinned follow-up
+        // D-LK2-DLL-DLLMAIN-ENTRY: it would legalize the cluster on
+        // the dll shape via a discriminator (the c151 PIE pattern),
+        // never by relaxing this reject silently.
+        if (pe.objectType == PeObjectType::Dll) {
+            bool sawText = false;
+            for (auto const& s : sections) {
+                if (s.kind == SectionKind::Text) sawText = true;
+            }
+            if (!sawText) {
+                fail("/sections",
+                     "PE32+ dll format requires a Text section row "
+                     "(SectionKind::Text) -- a dynamic-link library "
+                     "without code has nothing to export. D-LK2-4.");
+            }
+            if (processExit.has_value() || !entryCallingConvention.empty()
+             || processArgs.has_value()) {
+                fail("/pe",
+                     std::format(
+                         "PE32+ dll format declares entry-cluster "
+                         "machinery -- processExit: {}, "
+                         "entryCallingConvention: {}, processArgs: {}. "
+                         "A DSS .dll has NO DllMain (AddressOfEntryPoint "
+                         "= 0; the loader skips the notification call), "
+                         "so no entry trampoline is synthesized and the "
+                         "cluster is dead config that would silently "
+                         "diverge from the emitted image. The "
+                         "DllMain-bearing arm is the pinned follow-up "
+                         "D-LK2-DLL-DLLMAIN-ENTRY. D-LK2-4.",
+                         processExit.has_value() ? "present" : "absent",
+                         entryCallingConvention.empty() ? "absent"
+                                                        : "present",
+                         processArgs.has_value() ? "present" : "absent"));
+            }
+            if (!entryPoint.empty()) {
+                fail("/entryPoint",
+                     std::format("PE32+ dll format must not declare "
+                                 "'entryPoint' (got '{}') -- a DSS .dll "
+                                 "has no process entry "
+                                 "(AddressOfEntryPoint = 0, no DllMain; "
+                                 "D-LK2-DLL-DLLMAIN-ENTRY is the pinned "
+                                 "follow-up). D-LK2-4.",
+                                 entryPoint));
             }
         }
     }
@@ -974,16 +1058,24 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // PIE EXECUTABLE and joins the exec-flavor set, making its entry
     // machinery legal here. The cluster is re-derived from the same
     // four fields (single source of truth with the ELF-block rule).
+    // c152 (D-LK2-4): PE Dll likewise LEAVES the exec-flavor set — a
+    // DSS `.dll` has no entry (AddressOfEntryPoint = 0, no DllMain;
+    // the PE-block Dll rules above reject its entry cluster with the
+    // precise message, and these generic gates back them up). The
+    // DllMain follow-up (D-LK2-DLL-DLLMAIN-ENTRY) would rejoin via a
+    // cluster discriminator, the c151 PIE pattern.
     //
     // A single source of truth tying the image-side triplet:
     //   format declares "executable mode" ⟺ a Text-section row
     //   declares a non-zero virtualAddress (where to load it).
     // `entryPoint` is independent (empty defaults to functions[0];
-    // non-empty resolves by name) — NOT cross-tied here. All image
-    // arms (ELF ET_EXEC + ET_DYN-PIE, PE PE32+ Exec/Dll, Mach-O
-    // MH_EXECUTE) inherit this gate uniformly (an ET_DYN Text row
-    // carries VA == pageAlign != 0, so the rule below is consistent
-    // for the PIE by construction).
+    // non-empty resolves by name) — NOT cross-tied here. All exec
+    // arms (ELF ET_EXEC + ET_DYN-PIE, PE PE32+ Exec, Mach-O
+    // MH_EXECUTE) inherit this gate uniformly; the entry-less image
+    // shapes (ELF `.so`, PE Dll) carry their own Text-row/VA rules in
+    // their format blocks above (the PE `!= Obj` virtualAddress rules
+    // cover Exec AND Dll; the Dll block adds the Text-row-required
+    // rule).
     bool const elfDynPieShape =
         kind == ObjectFormatKind::Elf
      && elf.objectType == ElfObjectType::Dyn
@@ -995,7 +1087,7 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         (kind == ObjectFormatKind::Elf
          && (elf.objectType == ElfObjectType::Exec || elfDynPieShape))
      || (kind == ObjectFormatKind::Pe
-         && pe.objectType != PeObjectType::Obj)
+         && pe.objectType == PeObjectType::Exec)
      || (kind == ObjectFormatKind::MachO
          && macho.filetype == MachOObjectType::Execute);
     if (isExecFlavor) {
@@ -1057,10 +1149,11 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         fail("/processExit",
              "processExit is only legal on exec-flavored formats "
              "(ELF ET_EXEC / ELF ET_DYN PIE with the full entry "
-             "cluster / PE PE32+ Exec/Dll / Mach-O MH_EXECUTE). "
+             "cluster / PE PE32+ Exec / Mach-O MH_EXECUTE). "
              "Relocatable artifacts (.o / Obj / Object) cannot have "
-             "an entry trampoline, and an ELF ET_DYN shared library "
-             "has no entry. (D-LK10-ENTRY 2.13 / D-LK1-4.)");
+             "an entry trampoline, and the entry-less library shapes "
+             "(ELF ET_DYN .so, PE Dll) have no entry. "
+             "(D-LK10-ENTRY 2.13 / D-LK1-4 / D-LK2-4.)");
     }
     if (!entryCallingConvention.empty() && !isExecFlavor) {
         fail("/entryCallingConvention",
@@ -1086,10 +1179,11 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
         fail("/processArgs",
              "processArgs is only legal on exec-flavored formats "
              "(ELF ET_EXEC / ELF ET_DYN PIE with the full entry "
-             "cluster / PE PE32+ Exec/Dll / Mach-O MH_EXECUTE). "
+             "cluster / PE PE32+ Exec / Mach-O MH_EXECUTE). "
              "Relocatable artifacts (.o / Obj / Object) have no entry "
-             "trampoline to materialize arguments in. "
-             "(D-RUNTIME-MAIN-ARGC-ARGV.)");
+             "trampoline to materialize arguments in, and the "
+             "entry-less library shapes (ELF ET_DYN .so, PE Dll) have "
+             "no entry. (D-RUNTIME-MAIN-ARGC-ARGV.)");
     }
 
     // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: `supportedDataSections` is NO

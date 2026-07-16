@@ -19,6 +19,16 @@ dss_add_test(NAME link/test_elf_exec_writer      SOURCES test_elf_exec_writer.cp
 # three-flavor policy, and the dyn fail-loud belts.
 dss_add_test(NAME link/test_elf_dyn_writer       SOURCES test_elf_dyn_writer.cpp)
 
+# c152 (D-LK2-4 dll half) — PE32+ .dll writer: IMAGE_FILE_DLL +
+# entry-0 header pins, the .edata export directory (SORTED Name
+# Pointer Table — the GetProcAddress binary-search invariant, ordinal
+# -> EAT mapping, data exports), DIR64 .reloc completeness (fn-ptr
+# table + function-extern thunk bake), the extern-DATA-slot reject
+# (D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR, dll + exec arms), the
+# DYNAMIC_BASE text-abs-reloc belt, and the dll validate() shape
+# rules (no entry cluster / characteristics bits).
+dss_add_test(NAME link/test_pe_dll_writer        SOURCES test_pe_dll_writer.cpp)
+
 # D-LK6-1 closure — ARM64 bit-shift relocation-formula variants.
 dss_add_test(NAME link/test_aarch64_reloc_formulas SOURCES test_aarch64_reloc_formulas.cpp)
 

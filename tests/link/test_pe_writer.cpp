@@ -2511,16 +2511,22 @@ TEST(PeExecFormatJsonValidate, VirtualAddressNotMultipleOfSectionAlignmentReject
     ASSERT_FALSE(r.has_value());
 }
 
-TEST(PeExecWriter, DllArmFailsLoud) {
-    // Anchored D-LK2-4: PE .dll arm not yet implemented; walker
-    // emits K_NoMatchingObjectFormat rather than silently producing
-    // a malformed DLL.
+TEST(PeExecWriter, DllArmEncodesEntrylessImage) {
+    // c152 (D-LK2-4): the Dll arm SHIPPED — this replaces the retired
+    // `DllArmFailsLoud` red pin (which pinned the pre-c152
+    // not-implemented reject). The dll routes through the same
+    // encodeExec substrate; the deep pins (IMAGE_FILE_DLL, entry 0,
+    // .edata sort invariant, DIR64, fail-loud belts) live in
+    // tests/link/test_pe_dll_writer.cpp. Here: a hand-declared dll
+    // schema (validate now REQUIRES characteristics 0x2022-shaped
+    // bits — EXECUTABLE_IMAGE + IMAGE_FILE_DLL) loads and encodes a
+    // non-empty image with AddressOfEntryPoint == 0.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
       "format": {"name":"a-dll","kind":"pe"},
-      "pe": { "machine": 34404, "type": "dll" },
-      "optionalHeader": { "magic": 523, "imageBase": 6442450944, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "dllCharacteristics": 0, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
+      "pe": { "machine": 34404, "characteristics": 8226, "type": "dll" },
+      "optionalHeader": { "magic": 523, "imageBase": 6442450944, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 2, "dllCharacteristics": 352, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_TRUE(r.has_value());
@@ -2529,12 +2535,12 @@ TEST(PeExecWriter, DllArmFailsLoud) {
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
     auto bytes = pe::encode(mod, **target, **r, rep);
-    EXPECT_TRUE(bytes.empty());
-    bool sawCode = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat) sawCode = true;
-    }
-    EXPECT_TRUE(sawCode);
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // IMAGE_FILE_HEADER.Characteristics @ 0x96 carries IMAGE_FILE_DLL.
+    EXPECT_EQ(readU16LE(bytes, 0x96) & 0x2000u, 0x2000u);
+    // AddressOfEntryPoint (optional header +16 = 0x98+16) == 0.
+    EXPECT_EQ(readU32LE(bytes, 0x98 + 16), 0u);
 }
 
 TEST(PeExecWriter, EmptyTextFailsLoud) {

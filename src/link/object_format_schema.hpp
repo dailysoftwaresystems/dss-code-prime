@@ -289,16 +289,18 @@ struct DSS_EXPORT ElfIdentity {
 //
 // `objectType` discriminates between PE/COFF object files
 // (`MH_OBJECT`-equivalent — `.obj` relocatable, LK2 cycle 1) and
-// executable images (`.exe` for Exec / `.dll` for Dll, LK2 cycle
-// 2). Mirrors the `ElfObjectType` closed-enum pattern. Dll is
-// declared but rejected by validate() until a future cycle ships
-// the .dll arm (anchored at plan 14 §3.1 — same shape as ELF
-// ET_DYN's D-LK1-4 anchor).
+// executable images (`.exe` for Exec / `.dll` for Dll). Mirrors the
+// `ElfObjectType` closed-enum pattern. All three members have walker
+// arms: Obj (LK2 cycle 1), Exec (LK2 cycle 2, D-LK2-1), Dll (c152,
+// D-LK2-4 — the PE mirror of ELF ET_DYN's c150 `.so`: entry-less
+// image, `.edata` exports, complete `.reloc`).
 enum class PeObjectType : std::uint16_t {
     Obj  = 1,  // .obj relocatable — LK2 cycle 1 (default; preserves
                //                    LK2 cycle 1 schemas unchanged).
     Exec = 2,  // .exe executable — LK2 cycle 2 (closes D-LK2-1).
-    Dll  = 3,  // .dll dynamic library — anchored, not yet implemented.
+    Dll  = 3,  // .dll dynamic library — c152 (closes D-LK2-4 part 1;
+               //                        DllMain arm is the pinned
+               //                        follow-up D-LK2-DLL-DLLMAIN-ENTRY).
 };
 
 inline constexpr EnumNameTable<PeObjectType, 3> kPeObjectTypeTable{{{
@@ -324,18 +326,18 @@ struct DSS_EXPORT PeIdentity {
     PeObjectType  objectType = PeObjectType::Obj;
 };
 
-// ── PE32+ Optional Header (loaded only when PE objectType==Exec) ──
+// ── PE32+ Optional Header (loaded when PE objectType != Obj) ──
 //
 // Mirrors `IMAGE_OPTIONAL_HEADER64` (PE/COFF spec §3.4). Only the
 // load-bearing fields are declared — every field the Windows loader
-// requires for a minimal `.exe` is here; the deluxe data
+// requires for a minimal `.exe`/`.dll` is here; the deluxe data
 // directories (debug, security, etc.) are emitted as zero by the
-// walker (NumberOfRvaAndSizes=16, all entries zero — minimum
-// loadable image).
+// walker (NumberOfRvaAndSizes=16; the populated entries are Import/
+// IAT/Exception/BaseReloc/TLS on exec, plus Export on dll — c152).
 //
-// Validate() requires all fields populated when objectType==Exec;
-// Obj rejects any non-zero field (config-error trap mirroring the
-// ELF ET_REL `virtualAddress=0` symmetry).
+// Validate() requires all fields populated when objectType is
+// Exec/Dll; Obj rejects any non-zero field (config-error trap
+// mirroring the ELF ET_REL `virtualAddress=0` symmetry).
 struct DSS_EXPORT PeOptionalHeader {
     std::uint16_t magic = 0;                // PE32+=0x20B / PE32=0x10B
     std::uint64_t imageBase = 0;            // preferred load VA
@@ -1065,10 +1067,13 @@ public:
     // `processExit` presence is a faithful single-member witness) —
     // never a format-name check.
     // Schema-driven (declared objectType + declared entry cluster),
-    // never a format-name branch. PE Dll (when its arm lands) stays
-    // FALSE — Windows DLLs resolve every import at link time; Mach-O
-    // dylib default two-level namespace likewise (a flat-namespace
-    // opt-in would flip its arm then).
+    // never a format-name branch. PE Dll (c152, D-LK2-4) is FALSE —
+    // Windows has no ld.so-style deferred global scope for
+    // implicitly-linked DLLs: every import binds at load from a NAMED
+    // module's export table, so a referenced no-library extern still
+    // rejects loud at build time; Mach-O dylib default two-level
+    // namespace likewise (a flat-namespace opt-in would flip its arm
+    // then).
     [[nodiscard]] bool allowsUndefinedImports() const noexcept {
         if (!isImageFlavor()) return true;   // relocatable: later linker resolves
         return d_.kind == ObjectFormatKind::Elf

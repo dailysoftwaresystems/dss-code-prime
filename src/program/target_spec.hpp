@@ -93,12 +93,12 @@ struct DSS_EXPORT TargetSpec {
     //                                 belt-and-suspenders for closed-
     //                                 switch exhaustiveness)
     //
-    // The Dyn / Dll / Dylib arms return their canonical extensions
-    // even though their walker substrates haven't shipped. Schemas
-    // with those `objectType` values are rejected by the
-    // `ObjectFormatSchema::loadShipped` validate() step today, so
-    // the arms are unreachable until D-LK1-4 / D-LK2-4 / D-LK3-3
-    // close — at which point the extensions are already correct.
+    // The Dyn arm shipped at c150/c151 (D-LK1-4: `.so`, or "" for
+    // the PIE sub-shape — the entry cluster discriminates) and the
+    // Dll arm at c152 (D-LK2-4: `.dll`). Dylib still returns its
+    // canonical extension ahead of its walker: schemas with that
+    // `filetype` are rejected by validate() until D-LK3-3 closes —
+    // at which point the extension is already correct.
     [[nodiscard]] std::string_view
         outputExtension(ObjectFormatSchema const& fmt) const noexcept;
 };

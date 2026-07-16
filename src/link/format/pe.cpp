@@ -2,6 +2,7 @@
 
 #include "asm/format/x86_variable.hpp"   // kStackProbeLoopBytes (unwind allocLen)
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/symbol_attrs.hpp"   // isExternallyVisible (dll .edata exports)
 #include "link/format/byte_emit.hpp"
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
@@ -578,16 +579,17 @@ encode(AssembledModule const&    module,
     // — every other byte differs (.obj has no MS-DOS stub / PE sig /
     // optional header; image-side has no IMAGE_RELOCATION[] /
     // IMAGE_SYMBOL[] tables). validate() guarantees the optional
-    // header is populated for Exec/Dll, so the EXEC arm doesn't
-    // re-check those fields.
+    // header is populated for Exec/Dll, so the image arm doesn't
+    // re-check those fields. c152 (D-LK2-4): Dll routes through the
+    // SAME `encodeExec` substrate the .exe uses (the elf.cpp
+    // ET_EXEC/ET_DYN precedent) with the dll divergences keyed on
+    // the schema's declared objectType inside the walker —
+    // AddressOfEntryPoint = 0 (no DllMain; the entry trampoline is
+    // already absent because the dll schema declares no
+    // `processExit`), a `.edata` export directory wired into
+    // data-directory[0], and the extern-address / text-abs-reloc
+    // fail-loud belts.
     if (fmt.pe().objectType != PeObjectType::Obj) {
-        if (fmt.pe().objectType == PeObjectType::Dll) {
-            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                 "pe::encode: PE .dll arm not yet implemented; "
-                 "anchored at a future cycle paired with LK6 dynamic "
-                 "linking (same shape as ELF ET_DYN's D-LK1-4).");
-            return {};
-        }
         return encodeExec(module, targetSchema, fmt, *secText, reporter);
     }
     // NOTE: the Obj path does not APPLY relocations (the assembler
@@ -1496,16 +1498,45 @@ encode(AssembledModule const&    module,
     return bytes;
 }
 
-// ── PE32+ executable image (.exe) walker — LK2 cycle 2 ──────────
+// ── PE32+ image walker (.exe Exec / .dll Dll) — LK2 cycle 2 + c152 ──
 //
-// Closes plan 14 §3.1 D-LK2-1. Emits a minimal-valid PE32+ .exe
-// the Windows loader will accept: MS-DOS stub + PE signature +
-// IMAGE_FILE_HEADER (with EXECUTABLE_IMAGE flag) +
-// IMAGE_OPTIONAL_HEADER64 + section headers + section data
-// (fileAlignment-padded). Intra-module relocations are applied
-// in-place via the LK6 cycle 1 structured-formula triple
-// (`pcRelative + addendBias + widthBytes`). Extern symbols fail
-// loud (anchored D-LK6-2 — same boundary as ELF ET_EXEC).
+// Closes plan 14 §3.1 D-LK2-1 (Exec) + D-LK2-4 part 1 (Dll, c152 —
+// the PE mirror of the ELF c150 `.so`). Emits a minimal-valid PE32+
+// image the Windows loader will accept: MS-DOS stub + PE signature +
+// IMAGE_FILE_HEADER (EXECUTABLE_IMAGE, plus IMAGE_FILE_DLL on the
+// dll arm — both flags come from the SCHEMA's `pe.characteristics`,
+// validate()-pinned) + IMAGE_OPTIONAL_HEADER64 + section headers +
+// section data (fileAlignment-padded). Intra-module relocations are
+// applied in-place via the LK6 cycle 1 structured-formula triple
+// (`pcRelative + addendBias + widthBytes`).
+//
+// Dll divergences (all keyed on the schema's declared objectType —
+// the elf.cpp isDyn precedent, never a format-name branch):
+//   * AddressOfEntryPoint = 0 — a DSS .dll ships with NO DllMain
+//     (legal PE: the loader skips process/thread notifications for
+//     an entry-less module, the `link /NOENTRY` shape; the entry
+//     trampoline is already absent because the dll schema declares
+//     no `processExit` — linker.cpp's schema-keyed condition). The
+//     DllMain arm is the pinned follow-up D-LK2-DLL-DLLMAIN-ENTRY.
+//   * `.edata` export directory (data-directory[0]): Export Address
+//     Table + LEXICOGRAPHICALLY SORTED Name Pointer Table + Ordinal
+//     Table + DllName, built from `module.symbols` (externally-
+//     visible DEFINED functions + data globals under their real
+//     names — the same set the ELF dyn `.dynsym` exports, c150).
+//     GetProcAddress BINARY-SEARCHES the name table; the sort is a
+//     tested invariant (an unsorted table silently breaks lookup).
+//   * `.reloc` completeness: a DLL relocates — every absolute 64-bit
+//     slot in the image already gets an IMAGE_REL_BASED_DIR64 row
+//     (the c145 data-item machinery; the TLS directory VAs on exec).
+//     The remaining absolute-slot class — an absolute fixup in
+//     `.text` — is REJECTED loud on any DYNAMIC_BASE image
+//     (D-LK-PE-IMAGE-TEXT-ABS-RELOC below): its site is not
+//     collected into `.reloc`, so shipping it would leave a
+//     preferred-base address the loader never adjusts.
+//   * symbolVa keeps the schema's preferred ImageBase (0x180000000,
+//     the MSVC dll convention) — NO base-0 trick (unlike ELF dyn):
+//     PE DIR64 slots carry absolute preferred-base VAs the loader
+//     adjusts by the load delta.
 //
 // The validate() pass enforces the optional-header field
 // population, so this function never has to re-check those
@@ -1521,6 +1552,9 @@ encodeExec(AssembledModule const&    module,
            DiagnosticReporter&       reporter) {
     auto const& id = fmt.pe();
     auto const& oh = fmt.peOptionalHeader();
+    // c152 (D-LK2-4): the dll-arm discriminator — schema-declared
+    // objectType, mirroring elf.cpp's `isDyn`.
+    bool const isDll = id.objectType == PeObjectType::Dll;
 
     // ── (a) Build .text body + per-function start map ─────────
     std::vector<std::uint8_t> text;
@@ -1620,10 +1654,34 @@ encodeExec(AssembledModule const&    module,
     // falls back to `format.entryPoint()` string resolution, then
     // defaults to functions[0]. Synthesized-name prefix is "sym_"
     // for PE/ELF.
-    auto const entryIdxOpt = link::format::resolveEntryFnIdx(
-        module, fmt, "sym_", "pe::encodeExec", reporter);
-    if (!entryIdxOpt.has_value()) return {};
-    std::size_t const entryFnIdx = *entryIdxOpt;
+    //
+    // c152 (D-LK2-4): the Dll arm resolves NO entry —
+    // AddressOfEntryPoint is emitted as 0 (no DllMain; the loader
+    // skips the notification call for an entry-less module). A
+    // caller-provided `imageEntryOverride` on a dll module is a
+    // producer-contract breach (the linker never injects a
+    // trampoline for a schema without `processExit`; an override
+    // here means someone built entry machinery for an entry-less
+    // artifact) — fail loud rather than silently drop it.
+    std::size_t entryFnIdx = 0;
+    if (isDll) {
+        if (module.imageEntryOverride.has_value()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encodeExec (dll): module carries "
+                             "imageEntryOverride = {} but a PE dll has "
+                             "no image entry (AddressOfEntryPoint = 0, "
+                             "no DllMain -- D-LK2-DLL-DLLMAIN-ENTRY is "
+                             "the pinned follow-up). The entry override "
+                             "would be silently discarded (D-LK2-4).",
+                             *module.imageEntryOverride));
+            return {};
+        }
+    } else {
+        auto const entryIdxOpt = link::format::resolveEntryFnIdx(
+            module, fmt, "sym_", "pe::encodeExec", reporter);
+        if (!entryIdxOpt.has_value()) return {};
+        entryFnIdx = *entryIdxOpt;
+    }
 
     // ── (c) Synthesize .idata section for extern imports (LK6
     //         cycle 2a). PE32+ import-table layout per PE/COFF §6.4:
@@ -2079,8 +2137,214 @@ encodeExec(AssembledModule const&    module,
         }
     }
 
+    // ── (b4) `.edata` export directory — c152, D-LK2-4 (dll arm only) ──
+    //
+    // The PE mirror of the ELF dyn `.dynsym` export set (c150, elf.cpp
+    // (b.7)): every externally-visible DEFINED symbol — function or
+    // data global — from `module.symbols` (the same real-name rows the
+    // ET_REL `.symtab` uses, c139) becomes a named export. Local /
+    // Hidden / Internal symbols stay out (a `static` function is not
+    // part of the library's ABI); Weak exports export plainly (the PE
+    // export table has no binding column). Classification is by
+    // definition table: a row naming a function exports its `.text`
+    // RVA; a row naming a data item exports its section RVA
+    // (`.rdata`/`.data`/`.bss` — a data export's EAT RVA points into
+    // the mapped section; the consumer knows it is an object).
+    //
+    // Byte layout (PE/COFF §6.3), one self-contained `.edata` section:
+    //   [0]    IMAGE_EXPORT_DIRECTORY (40 B)
+    //   [40]   Export Address Table          — u32 RVA × N
+    //   [...]  Name Pointer Table            — u32 RVA × N, SORTED
+    //   [...]  Ordinal Table                 — u16 × N
+    //   [...]  DllName string + export-name strings
+    //
+    // ★ SORT INVARIANT: GetProcAddress BINARY-SEARCHES the Name
+    // Pointer Table (memcmp order — unsigned bytes); an unsorted
+    // table silently breaks lookup for a subset of names. The records
+    // are sorted here and the EAT is laid out IN SORTED ORDER with
+    // IDENTITY ordinals (ordinal[i] = i, Base 1) — the link.exe
+    // convention (dumpbin ground truth: ordinals 1..N follow the
+    // sorted names). The emitted-table sort is a tested invariant
+    // (deliberately out-of-order input names in the pin).
+    //
+    // The directory's Name field (the DLL's self-name) is emitted as
+    // an EMPTY string: per-artifact identity does not belong in a
+    // shipped format schema (the c150 decision that leaves DT_SONAME
+    // absent); GetProcAddress never reads it, and DSS emits no
+    // forwarder RVAs — the only loader consumer of that name.
+    // (Forwarder detection is RVA-range-based: an EAT entry pointing
+    // INSIDE the export directory's [rva, rva+size) span is a
+    // forwarder string. Every DSS export RVA points at `.text` /
+    // `.rdata` / `.data` / `.bss`, all OUTSIDE `.edata`, so no export
+    // can be misread as a forwarder.)
+    struct PeExportRec {
+        std::string   name;   // real (already-mangled) source name
+        std::uint32_t rva = 0;
+    };
+    std::vector<PeExportRec> dllExports;
+    if (isDll) {
+        std::unordered_map<std::uint32_t, std::size_t> funcIdxBySym;
+        funcIdxBySym.reserve(module.functions.size());
+        for (std::size_t i = 0; i < module.functions.size(); ++i) {
+            funcIdxBySym.emplace(module.functions[i].symbol.v, i);
+        }
+        // Data-item SymbolId → image RVA, across every placed data
+        // section (rdata incl. the c145 relro fold, data, bss). TLS
+        // items never appear (the dll schema advertises no
+        // tdata/tbss, so the pre-walker gate rejected them; a
+        // thread-local's template offset is not an RVA anyway).
+        std::unordered_map<std::uint32_t, std::uint32_t> dataRvaBySym;
+        auto addDataRvas = [&](link::format::ExecDataSectionLayout const&
+                                   layout,
+                               std::uint32_t sectionRva) {
+            for (std::size_t j = 0; j < layout.itemIndices.size(); ++j) {
+                auto const& item = module.dataItems[layout.itemIndices[j]];
+                if (item.symbol == SymbolId{}) continue;  // anonymous
+                dataRvaBySym.emplace(
+                    item.symbol.v,
+                    sectionRva
+                        + static_cast<std::uint32_t>(layout.itemOffsets[j]));
+            }
+        };
+        if (hasRdata) addDataRvas(rdataDataLayout, rdata->rva);
+        if (hasData)  addDataRvas(dataDataLayout, data->rva);
+        if (hasBss)   addDataRvas(bssDataLayout, bss->rva);
+        std::uint32_t const textRva0 =
+            static_cast<std::uint32_t>(secText.virtualAddress);
+        std::unordered_set<std::string_view> seenExportNames;
+        for (auto const& ms : module.symbols) {
+            if (ms.name.empty()) continue;
+            if (!isExternallyVisible(ms.binding, ms.visibility)) continue;
+            if (!seenExportNames.insert(ms.name).second) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::format(
+                         "pe::encodeExec (dll): duplicate export name "
+                         "'{}' -- two externally-visible ModuleSymbol "
+                         "rows share one name; the Name Pointer Table "
+                         "is a binary-searched UNIQUE-key table, so a "
+                         "duplicate silently shadows one definition "
+                         "(D-LK2-4).",
+                         ms.name));
+                return {};
+            }
+            if (auto const fit = funcIdxBySym.find(ms.symbol.v);
+                fit != funcIdxBySym.end()) {
+                dllExports.push_back(PeExportRec{
+                    ms.name,
+                    textRva0 + static_cast<std::uint32_t>(
+                                   funcTextStart[fit->second])});
+            } else if (auto const dit = dataRvaBySym.find(ms.symbol.v);
+                       dit != dataRvaBySym.end()) {
+                dllExports.push_back(PeExportRec{ms.name, dit->second});
+            } else {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::format(
+                         "pe::encodeExec (dll): ModuleSymbol '{}' "
+                         "(SymbolId #{}) names neither a defined "
+                         "function nor a placed data item -- the "
+                         "export table cannot place it (producer "
+                         "contract: one ModuleSymbol row per DEFINED "
+                         "function/global). D-LK2-4.",
+                         ms.name, ms.symbol.v));
+                return {};
+            }
+        }
+        // The binary-search invariant: memcmp order (std::string's
+        // char_traits compare is unsigned-byte lexicographic — the
+        // exact GetProcAddress comparison).
+        std::sort(dllExports.begin(), dllExports.end(),
+                  [](PeExportRec const& a, PeExportRec const& b) {
+                      return a.name < b.name;
+                  });
+    }
+    bool const hasExports = !dllExports.empty();
+    constexpr std::size_t kExportDirectorySize = 40;
+    std::uint32_t const edataRva = hasExports ? dataChainRva : 0u;
+    std::vector<std::uint8_t> edataBytes;
+    std::optional<DataSectionLayout> edata;
+    if (hasExports) {
+        std::size_t const n = dllExports.size();
+        std::size_t const eatOff  = kExportDirectorySize;
+        std::size_t const nameOff = eatOff + 4u * n;
+        std::size_t const ordOff  = nameOff + 4u * n;
+        std::size_t const strOff  = ordOff + 2u * n;
+        // Strings: DllName (empty — see the block comment) first,
+        // then the export names in sorted order.
+        std::vector<std::uint32_t> nameStrRvas(n, 0u);
+        std::size_t strCursor = strOff;
+        std::uint32_t const dllNameRva =
+            edataRva + static_cast<std::uint32_t>(strCursor);
+        strCursor += 1;  // the empty DllName's NUL
+        for (std::size_t i = 0; i < n; ++i) {
+            nameStrRvas[i] =
+                edataRva + static_cast<std::uint32_t>(strCursor);
+            strCursor += dllExports[i].name.size() + 1;
+        }
+        std::size_t const edataSize = strCursor;
+        if (edataSize > std::numeric_limits<std::uint32_t>::max()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encodeExec (dll): synthesized .edata "
+                             "size {} exceeds u32 -- PE32+ RVAs are "
+                             "32-bit.",
+                             edataSize));
+            return {};
+        }
+        // The ordinal table is u16 by PE spec (GetProcAddress takes a WORD
+        // ordinal; link.exe hard-errors at the 64K-export limit). Past
+        // 0xFFFF the cast below would WRAP: the name at sorted position
+        // 65536 would silently resolve to EAT[0] -- the wrong function,
+        // no diagnostic (c152 review fold; belt, no live producer).
+        if (n > 0xFFFFu) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encodeExec (dll): {} exports exceed the "
+                             "PE 64K-export limit (the ordinal table is "
+                             "u16; GetProcAddress takes a WORD ordinal).",
+                             n));
+            return {};
+        }
+        edataBytes.assign(edataSize, 0u);
+        auto putU16 = [&](std::size_t off, std::uint16_t v) {
+            edataBytes[off + 0] = static_cast<std::uint8_t>(v & 0xFFu);
+            edataBytes[off + 1] =
+                static_cast<std::uint8_t>((v >> 8) & 0xFFu);
+        };
+        auto putU32 = [&](std::size_t off, std::uint32_t v) {
+            for (int b = 0; b < 4; ++b)
+                edataBytes[off + b] =
+                    static_cast<std::uint8_t>((v >> (b * 8)) & 0xFFu);
+        };
+        // IMAGE_EXPORT_DIRECTORY. Characteristics / TimeDateStamp /
+        // Major/MinorVersion stay 0 (deterministic — matches the file
+        // header's TimeDateStamp=0 stance).
+        putU32(12, dllNameRva);                              // Name
+        putU32(16, 1u);                                      // Base (ordinal)
+        putU32(20, static_cast<std::uint32_t>(n));           // NumberOfFunctions
+        putU32(24, static_cast<std::uint32_t>(n));           // NumberOfNames
+        putU32(28, edataRva + static_cast<std::uint32_t>(eatOff));
+        putU32(32, edataRva + static_cast<std::uint32_t>(nameOff));
+        putU32(36, edataRva + static_cast<std::uint32_t>(ordOff));
+        for (std::size_t i = 0; i < n; ++i) {
+            putU32(eatOff + 4u * i, dllExports[i].rva);      // EAT
+            putU32(nameOff + 4u * i, nameStrRvas[i]);        // sorted names
+            putU16(ordOff + 2u * i,
+                   static_cast<std::uint16_t>(i));           // identity ordinal
+            std::size_t const so = nameStrRvas[i] - edataRva;
+            for (std::size_t c = 0; c < dllExports[i].name.size(); ++c) {
+                edataBytes[so + c] =
+                    static_cast<std::uint8_t>(dllExports[i].name[c]);
+            }
+        }
+        DataSectionLayout layout;
+        layout.rva = edataRva;
+        layout.virtualSize = static_cast<std::uint32_t>(
+            alignUp(edataSize, sectionAlignE));
+        edata = layout;
+        dataChainRva += layout.virtualSize;
+    }
+
     // `.idata` follows the LAST section in the VA chain (`dataChainRva` was
-    // advanced past .rdata/.data/.bss/.xdata/.pdata above), else after `.text`.
+    // advanced past .rdata/.data/.bss/.xdata/.pdata/[.edata] above), else
+    // after `.text`.
     std::uint32_t const idataRva = hasImports ? dataChainRva : 0u;
 
     // Lay out .idata bytes (synthesized, NOT raw-data padded yet):
@@ -2261,6 +2525,34 @@ encodeExec(AssembledModule const&    module,
     // so REL32 calls to either kind work uniformly. Format-side
     // fmt.relocationByKind(rel.kind) check stays here because its
     // diagnostic wording cites the PE format name.
+    // D-LK-PE-IMAGE-TEXT-ABS-RELOC (c152, the .reloc-completeness
+    // belt — registered with the D-LK2-4 dll cycle, and live on the
+    // exec too since its condition is schema-read): on a
+    // DYNAMIC_BASE image the loader may (dll: routinely does) rebase
+    // the whole image, adjusting every absolute slot listed in
+    // `.reloc`. The walker collects DIR64 sites from DATA-ITEM
+    // fixups + the TLS directory VAs — but NOT from `.text` (the
+    // `applyExecRelocations` kernel patches in place without
+    // reporting sites). An ABSOLUTE (non-pc-relative, non-tls)
+    // function relocation would therefore bake a preferred-base VA
+    // into code bytes that no `.reloc` row ever adjusts — a silent
+    // wrong-address under rebase. DSS x86_64 codegen emits none
+    // (globals are rip-relative lea, calls rel32, jump tables are
+    // data items, import thunks rip-relative FF 25), so this is a
+    // fail-loud belt, not a live path; the closure direction is to
+    // collect text sites into `.reloc` when a producer appears.
+    // tls-flagged kinds are exempt: a SECREL32 patch is a
+    // section-relative template OFFSET (rebase-invariant), not a VA.
+    constexpr std::uint16_t kDllCharDynamicBase = 0x0040;
+    // c152 review fold: DYNAMIC_BASE opts into ASLR, but a DLL is ALSO
+    // rebased on classic preferred-base COLLISION regardless of the flag
+    // (whenever relocations are not stripped). A dll schema without
+    // DYNAMIC_BASE would otherwise go dark on this belt and bake a
+    // preferred-base VA a collision-rebase never adjusts -- the exact
+    // silent wrong-address the belt exists to stop. Shipped schemas set
+    // the flag; this covers hand-rolled ones.
+    bool const imageIsRelocatableAtLoad =
+        isDll || (oh.dllCharacteristics & kDllCharDynamicBase) != 0u;
     for (auto const& fn : module.functions) {
         for (auto const& rel : fn.relocations) {
             if (fmt.relocationByKind(rel.kind) == nullptr) {
@@ -2269,6 +2561,26 @@ encodeExec(AssembledModule const&    module,
                                  "by object format '{}' — substrate-"
                                  "invariant violation.",
                                  rel.kind.v, fmt.name()));
+                return {};
+            }
+            auto const* tri = targetSchema.relocationInfo(rel.kind);
+            if (imageIsRelocatableAtLoad && tri != nullptr
+             && !tri->pcRelative && !tri->tls) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format(
+                         "pe::encodeExec: function SymbolId={{ {} }} "
+                         "carries an ABSOLUTE relocation ('{}', kind "
+                         "{}) into .text, but this image sets "
+                         "DYNAMIC_BASE and the walker collects "
+                         "IMAGE_REL_BASED_DIR64 sites only from data "
+                         "items -- the patched code bytes would keep "
+                         "the preferred-base address after the loader "
+                         "rebases the image (silent wrong address; on "
+                         "a .dll the loader rebases routinely). Emit "
+                         "the address as a data item, or extend the "
+                         ".reloc collector to .text sites "
+                         "(D-LK-PE-IMAGE-TEXT-ABS-RELOC).",
+                         fn.symbol.v, tri->name, rel.kind.v));
                 return {};
             }
         }
@@ -2545,6 +2857,61 @@ encodeExec(AssembledModule const&    module,
             return {};
         }
         for (auto const& rel : di.relocations) {
+            // ── D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR (c152, the PE half of
+            // the c150 CRITICAL): a data slot whose relocation targets
+            // an extern DATA import would bake the image-local IAT
+            // SLOT address — `symbolVa[dataExtern]` is the
+            // loader-filled `.idata` pointer cell, NOT the imported
+            // object — into the pointer bytes: one indirection off at
+            // runtime (`FILE **pp = &stdout;` would hold &IAT_slot;
+            // `*pp` reads the slot's content — the object's ADDRESS —
+            // where C semantics require the object's VALUE). On a
+            // relocatable-at-load artifact the slot also gets a DIR64
+            // row, faithfully rebasing the wrong value. MSVC itself
+            // REJECTS `&dllimport_obj` as a C static initializer
+            // (C2099 "initializer is not a constant"), so the honest
+            // arm is FAIL LOUD naming the extern. (The symbol-based
+            // fix — the ELF dyn arm's R_X86_64_64-against-dynsym
+            // shape — has no PE image analog short of a CRT-style
+            // runtime pseudo-reloc scheme, deliberately NOT
+            // attempted.)
+            //
+            // A FUNCTION extern is the OTHER half of the registered
+            // anchor and stays LEGAL by design: its symbolVa is the
+            // FF 25 import THUNK — a CALLABLE code address — so the
+            // baked pointer is call-correct (the c112 shipped,
+            // run-proven `addr_import` witness: `static putfn t[] =
+            // {puts};` — sqlite's aSyscall[] shape) and its DIR64 row
+            // rebases it correctly. Cross-image pointer IDENTITY for
+            // an imported function is not guaranteed on Windows
+            // (MSVC's own `&puts` binds each module's local thunk —
+            // the platform norm), exactly as the anchor row records.
+            if (auto const extIt = externIatVaBySym.find(rel.target);
+                extIt != externIatVaBySym.end()) {
+                ExternImport const* ext = nullptr;
+                for (auto const& e : module.externImports) {
+                    if (e.symbol == rel.target) { ext = &e; break; }
+                }
+                if (ext != nullptr && ext->isData) {
+                    emit(reporter,
+                         DiagnosticCode::K_RelocationKindMismatch,
+                         std::format(
+                             "pe::encodeExec: data-item SymbolId #{} "
+                             "carries a relocation targeting extern "
+                             "DATA import '{}' (symbol #{}) -- taking "
+                             "an imported OBJECT's address in a static "
+                             "initializer would bake the image-local "
+                             "IAT-slot address into the data slot (one "
+                             "indirection off at runtime; MSVC rejects "
+                             "the same shape as a non-constant C "
+                             "initializer, C2099). Initialize the "
+                             "pointer at runtime instead "
+                             "(D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR).",
+                             di.symbol.v, ext->mangledName,
+                             rel.target.v));
+                    return {};
+                }
+            }
             auto const sIt = symbolVa.find(rel.target);
             if (sIt == symbolVa.end()) {
                 emit(reporter, DiagnosticCode::K_SymbolUndefined,
@@ -2672,6 +3039,26 @@ encodeExec(AssembledModule const&    module,
     std::vector<std::uint8_t> relocBytes;
     if (!baseRelocSiteRvas.empty()) {
         std::sort(baseRelocSiteRvas.begin(), baseRelocSiteRvas.end());
+        // A duplicate DIR64 site would be applied TWICE at load: unlike ELF
+        // RELA (set semantics, idempotent), a base relocation ADDS the load
+        // delta to the slot -- two rows at one RVA double-add it, and the
+        // pointer is wrong ONLY when the loader actually rebases (works at
+        // the preferred base, corrupt under ASLR -- the hardest-to-debug
+        // variant). One 8-byte slot has exactly one fixup, so adjacent
+        // equality after the sort can never false-positive (c152 review
+        // fold; belt, no live producer emits duplicates).
+        for (std::size_t k = 1; k < baseRelocSiteRvas.size(); ++k) {
+            if (baseRelocSiteRvas[k] == baseRelocSiteRvas[k - 1]) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("pe::encodeExec: duplicate base-relocation "
+                                 "site RVA {:#x} -- a DIR64 fixup is "
+                                 "delta-ADD, so a duplicate would be "
+                                 "applied twice under rebase (silently "
+                                 "corrupt pointer).",
+                                 baseRelocSiteRvas[k]));
+                return {};
+            }
+        }
         constexpr std::uint32_t kPageSize          = 0x1000u;
         constexpr std::uint16_t kImageRelBasedDir64 = 10u;
         std::size_t cursor = 0;
@@ -2858,6 +3245,21 @@ encodeExec(AssembledModule const&    module,
         pdata->headerIndex = sectionHeaders.size();
         sectionHeaders.push_back(hPData);
     }
+    // .edata section header (c152, D-LK2-4 — dll exports). Read-only
+    // initialized data (0x40000040, like .rdata): the loader only
+    // READS the export directory; GetProcAddress walks it in place.
+    // Placed after .pdata and before .idata (its VA slot in the
+    // chain above).
+    constexpr std::uint32_t kEDataCharacteristics = 0x40000040u;
+    if (edata.has_value()) {
+        PeSectionHeader hEData{};
+        hEData.name            = encodeSectionName(".edata", 0);
+        hEData.virtualSize     = static_cast<std::uint32_t>(edataBytes.size());
+        hEData.virtualAddress  = edata->rva;
+        hEData.characteristics = kEDataCharacteristics;
+        edata->headerIndex = sectionHeaders.size();
+        sectionHeaders.push_back(hEData);
+    }
     // .idata section header (when externImports non-empty).
     // Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA (0x40) |
     //                   IMAGE_SCN_MEM_READ (0x40000000) |
@@ -2985,6 +3387,16 @@ encodeExec(AssembledModule const&    module,
         sectionHeaders[pdata->headerIndex].pointerToRawData = pdata->rawPointer;
         nextRawPointer += pdata->rawSize;
     }
+    // .edata (c152, D-LK2-4): file-backed, after .pdata and before
+    // .idata (matching its section-header and VA-chain order).
+    if (edata.has_value()) {
+        edata->rawSize = static_cast<std::uint32_t>(
+            alignUp(edataBytes.size(), fileAlign));
+        edata->rawPointer = nextRawPointer;
+        sectionHeaders[edata->headerIndex].sizeOfRawData = edata->rawSize;
+        sectionHeaders[edata->headerIndex].pointerToRawData = edata->rawPointer;
+        nextRawPointer += edata->rawSize;
+    }
     if (idata.has_value()) {
         idata->rawSize = static_cast<std::uint32_t>(
             alignUp(idataSize, fileAlign));
@@ -3032,6 +3444,9 @@ encodeExec(AssembledModule const&    module,
     if (pdata.has_value()) {
         lastSectionVaEnd = pdata->rva + pdata->virtualSize;
     }
+    if (edata.has_value()) {   // c152 — .edata RVA is after .pdata
+        lastSectionVaEnd = edata->rva + edata->virtualSize;
+    }
     if (idata.has_value()) {
         lastSectionVaEnd = idata->rva + idata->virtualSize;
     }
@@ -3040,9 +3455,15 @@ encodeExec(AssembledModule const&    module,
     }
     std::uint32_t const sizeOfImage = static_cast<std::uint32_t>(
         alignUp(lastSectionVaEnd, sectionAlign));
-    std::uint32_t const addressOfEntryPoint =
-        static_cast<std::uint32_t>(secText.virtualAddress
-                                    + funcTextStart[entryFnIdx]);
+    // c152 (D-LK2-4): a dll has NO entry — AddressOfEntryPoint = 0
+    // tells the loader to skip the DllMain notification call
+    // entirely (legal PE; the `link /NOENTRY` shape). The exec keeps
+    // its resolved entry (the injected trampoline via
+    // imageEntryOverride, or the schema/functions[0] fallback).
+    std::uint32_t const addressOfEntryPoint = isDll
+        ? 0u
+        : static_cast<std::uint32_t>(secText.virtualAddress
+                                      + funcTextStart[entryFnIdx]);
     std::uint32_t const baseOfCode =
         static_cast<std::uint32_t>(secText.virtualAddress);
 
@@ -3097,6 +3518,7 @@ encodeExec(AssembledModule const&    module,
         (rdata.has_value() ? rdata->rawSize : 0u)
         + (data.has_value() ? data->rawSize : 0u)
         + (tls.has_value() ? tls->rawSize : 0u)   // TLS C3 — CNT_INITIALIZED_DATA
+        + (edata.has_value() ? edata->rawSize : 0u)  // c152 — dll exports
         + (idata.has_value() ? idata->rawSize : 0u)
         + (reloc.has_value() ? reloc->rawSize : 0u);
     std::uint32_t const sizeOfUninitializedData =
@@ -3194,6 +3616,11 @@ encodeExec(AssembledModule const&    module,
             static_cast<std::uint64_t>(tls->rawPointer)
             + tls->rawSize;
     }
+    if (edata.has_value()) {   // c152 — .edata is file-backed, pre-.idata
+        sectionsEndFileOff =
+            static_cast<std::uint64_t>(edata->rawPointer)
+            + edata->rawSize;
+    }
     if (idata.has_value()) {
         sectionsEndFileOff =
             static_cast<std::uint64_t>(idata->rawPointer)
@@ -3250,8 +3677,22 @@ encodeExec(AssembledModule const&    module,
             ? tlsRva + static_cast<std::uint32_t>(tlsDirOffset)
             : 0u;
     std::uint32_t const tlsDirSize = tls.has_value() ? 40u : 0u;
+    // IMAGE_DIRECTORY_ENTRY_EXPORT (index 0, c152 D-LK2-4): RVA + byte
+    // size of the export directory block — GetProcAddress reads it.
+    // Size covers the WHOLE export block (directory + EAT + name
+    // pointers + ordinals + strings): the loader uses the [rva,
+    // rva+size) span for forwarder detection, so it must cover
+    // exactly the synthesized bytes (see the (b4) block comment).
+    std::uint32_t const exportDirRva =
+        edata.has_value() ? edata->rva : 0u;
+    std::uint32_t const exportDirSize =
+        edata.has_value() ? static_cast<std::uint32_t>(edataBytes.size())
+                          : 0u;
     for (std::size_t i = 0; i < kNumberOfRvaAndSizes; ++i) {
-        if (i == 1u) {
+        if (i == 0u) {
+            appendU32LE(bytes, exportDirRva);
+            appendU32LE(bytes, exportDirSize);
+        } else if (i == 1u) {
             appendU32LE(bytes, importDirRva);
             appendU32LE(bytes, importDirSize);
         } else if (i == 3u) {
@@ -3344,6 +3785,17 @@ encodeExec(AssembledModule const&    module,
         bytes.insert(bytes.end(), pdataBytes.begin(), pdataBytes.end());
         while (bytes.size()
                 < static_cast<std::size_t>(pdata->rawPointer) + pdata->rawSize) {
+            bytes.push_back(0);
+        }
+    }
+
+    // .edata body (c152, D-LK2-4 — dll export directory), padded to
+    // fileAlignment. The bytes were fully synthesized in step (b4);
+    // emitted after .pdata and before .idata (its raw-pointer order).
+    if (edata.has_value()) {
+        bytes.insert(bytes.end(), edataBytes.begin(), edataBytes.end());
+        while (bytes.size()
+                < static_cast<std::size_t>(edata->rawPointer) + edata->rawSize) {
             bytes.push_back(0);
         }
     }
