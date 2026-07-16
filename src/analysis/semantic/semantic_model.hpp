@@ -394,6 +394,32 @@ struct DSS_EXPORT ShippedExternSymbol {
     // seeds `functionSymbols` (the user call lowers to GlobalAddr against a not-yet-
     // defined callee) and `synthesizeThreadsShim` supplies the definition before link.
     std::string recipeId;
+    // c156 (D-LK-ELF-SYMBOL-VERSIONING): the REQUIRED ELF symbol version
+    // (e.g. "GLIBC_2.3"), already resolved for the active (arch, format) by the
+    // descriptor reader's per-target `version` variant. Empty ⇒ unversioned.
+    // Carried verbatim to HirExternRecord.version → the ELF writer's
+    // .gnu.version_r; ELF-only (unused on PE/Mach-O).
+    std::string version;
+};
+
+// c86 + c156: the link identity of a goal-2 SUPPRESSED shipped descriptor
+// symbol. When a user BARE PROTOTYPE re-declares a shipped name (e.g.
+// `extern char *realpath(const char*, char*);` over `#include <stdlib.h>` — a
+// common feature-test-macro pattern), goal-2 suppresses the descriptor's own
+// injection and the user's prototype synthesizes the import instead. BOTH the
+// per-format library map AND the required ELF symbol version must ride here, or
+// the synthesized import loses its version and ld.so silently misbinds an
+// unversioned reference to the library's OLDEST compat instance (the exact
+// D-LK-ELF-SYMBOL-VERSIONING realpath@GLIBC_2.2.5 bug the descriptor path
+// fixes). Availability-gated + first-wins at record time (mirroring injection).
+struct DSS_EXPORT SuppressedShippedSymbol {
+    // The descriptor's per-object-format `library` map ("pe"/"elf"/"macho" →
+    // runtime image), carried verbatim; folded to one string per target
+    // downstream (compile_pipeline), exactly like an injected extern.
+    std::unordered_map<std::string, std::string> library;
+    // The required ELF symbol version, already resolved for the active target
+    // (e.g. "GLIBC_2.3"); EMPTY ⇒ unversioned (D-LK-ELF-SYMBOL-VERSIONING).
+    std::string version;
 };
 
 class DSS_EXPORT SemanticModel {
@@ -412,7 +438,7 @@ public:
                   std::unordered_map<std::uint32_t, ScopeId> compositeScopeByType,
                   UnitAttribute<bool>                    nullPointerConstantNodes,
                   std::vector<ShippedExternSymbol>       shippedExterns,
-                  std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+                  std::unordered_map<std::string, SuppressedShippedSymbol>
                                                          suppressedShippedLibraries,
                   DataModel                              dataModel,
                   LongDoubleFormat                       longDoubleFormat) noexcept
@@ -513,16 +539,19 @@ public:
         return shippedExterns_;
     }
 
-    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): the per-format library map of
-    // a shipped descriptor symbol that GOAL-2 SUPPRESSED because a user
-    // declaration claimed the name (shell.c bare-declares `popen` while also
-    // `#include <stdio.h>`). Read by the CST→HIR bare-proto extern synthesis so
-    // the user's prototype re-binds the descriptor's import library instead of
-    // surviving to the linker as an undefined symbol. Availability-gated +
-    // first-wins at record time (exactly mirroring injection). Returns nullptr
-    // when no suppressed descriptor symbol carries this name.
-    [[nodiscard]] std::unordered_map<std::string, std::string> const*
-    suppressedShippedLibraryFor(std::string const& name) const noexcept {
+    // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS) + c156 (D-LK-ELF-SYMBOL-
+    // VERSIONING): the link identity (per-format library map + required ELF
+    // version) of a shipped descriptor symbol that GOAL-2 SUPPRESSED because a
+    // user declaration claimed the name (shell.c bare-declares `popen` while
+    // also `#include <stdio.h>`; the versioned case is `realpath` over `#include
+    // <stdlib.h>`). Read by the CST→HIR bare-proto extern synthesis so the
+    // user's prototype re-binds the descriptor's import library AND its symbol
+    // version instead of surviving unversioned (a silent realpath@GLIBC_2.2.5
+    // misbind) or as an undefined symbol. Availability-gated + first-wins at
+    // record time (exactly mirroring injection). Returns nullptr when no
+    // suppressed descriptor symbol carries this name.
+    [[nodiscard]] SuppressedShippedSymbol const*
+    suppressedShippedSymbolFor(std::string const& name) const noexcept {
         auto const it = suppressedShippedLibraries_.find(name);
         return it == suppressedShippedLibraries_.end() ? nullptr : &it->second;
     }
@@ -569,9 +598,9 @@ private:
     // descriptors (D-FFI-SHIPPED-LIB-DESCRIPTOR-AGNOSTIC). Consumed by the
     // CST→HIR lowerer.
     std::vector<ShippedExternSymbol>                       shippedExterns_;
-    // c86: name → per-format library map for goal-2-SUPPRESSED shipped
-    // descriptor symbols (see `suppressedShippedLibraryFor`).
-    std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+    // c86 + c156: name → {library map, required ELF version} for goal-2-
+    // SUPPRESSED shipped descriptor symbols (see `suppressedShippedSymbolFor`).
+    std::unordered_map<std::string, SuppressedShippedSymbol>
                                                            suppressedShippedLibraries_;
     // FC3 c1: the analysis-time data model (see `dataModel()`).
     DataModel                                              dataModel_ = DataModel::Lp64;

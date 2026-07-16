@@ -75,6 +75,13 @@ struct DSS_EXPORT HirExternRecord {
     // exclusive with a non-empty `libraryOverride` by construction (the
     // bare-proto producer sets exactly one of the two).
     bool noLibraryBinding = false;
+    // c156 (D-LK-ELF-SYMBOL-VERSIONING): the REQUIRED ELF symbol version
+    // (e.g. "GLIBC_2.3"), already resolved for the active (arch, format) by the
+    // descriptor reader. Unlike `libraryOverride` (a per-format MAP folded
+    // downstream), the version is a plain per-symbol STRING — resolved once at
+    // read time — so it rides the `canonicalName` rail, not the folded-map rail.
+    // Empty ⇒ unversioned. Threaded to FfiMetadata.version → the ELF writer.
+    std::string version;
 };
 
 struct DSS_EXPORT CstToHirResult {

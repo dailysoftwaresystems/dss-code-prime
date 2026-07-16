@@ -171,6 +171,23 @@ struct DSS_EXPORT ShippedSymbol {
     // call lowers to GlobalAddr) and the synth pass supplies the definition. Empty
     // (default) for every ordinary shipped extern. (D-CSUBSET-C11-THREADS-HEADER)
     std::string synthesize;
+    // c156 (D-LK-ELF-SYMBOL-VERSIONING): optional REQUIRED symbol version — the
+    // ELF version STRING (e.g. "GLIBC_2.3") this import must bind so ld.so
+    // resolves the DEFAULT version instead of misbinding an unversioned
+    // reference to a multi-versioned glibc symbol's OLDEST compat instance
+    // (glibc `realpath`: the unversioned ref lands `@GLIBC_2.2.5`, whose
+    // pre-2.3 form EINVALs a NULL resolved buffer, instead of the `@@GLIBC_2.3`
+    // default). EMPTY (default, every symbol until opted in) ⇒ UNVERSIONED,
+    // byte-identical to the pre-c156 image. The version is inherently
+    // PER-TARGET (glibc's `realpath` is `GLIBC_2.3` on x86_64 but the single
+    // baseline `GLIBC_2.17` on aarch64), so the descriptor resolves it via the
+    // SAME per-target `variants` (when:{arch?,format?}) mechanism the
+    // structs/constants/typedefs surfaces use: the reader selects the variant
+    // matching the active (arch, format) and produces THIS single string (0
+    // matches ⇒ empty ⇒ unversioned on that target — the aarch64 realpath
+    // case). A flat string is also accepted (arch-invariant). ELF-only
+    // semantics; carried but unused on PE/Mach-O.
+    std::string version;
 };
 
 // True iff `id` is a member of the CLOSED <threads.h> synth-recipe vocabulary — the 21

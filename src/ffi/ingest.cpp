@@ -332,6 +332,11 @@ ingest(std::span<IngestionSource const> sources,
         meta.linkage       = toFfiLinkage(matched.row.linkage);
         meta.visibility    = toFfiVisibility(matched.row.visibility);
         meta.importLibrary = matched.row.libraryPath;
+        // c156 (D-LK-ELF-SYMBOL-VERSIONING): carry the required symbol
+        // version (parity with the FF5 source-decl path). Dormant today
+        // (FF1 is the binary-reader ingestion path), but a versioned
+        // ExternDeclRef routed here must not silently drop its version.
+        meta.version = std::string{ext.version};
         // `soname` left empty — FF1 doesn't yet populate
         // DT_SONAME / Mach-O install_name; that's a future
         // refinement of `ImportSurface`.
@@ -451,6 +456,11 @@ synthesizeFfiFromSourceDecls(
                                      ? libCopy
                                      : std::string{ext.libraryOverride};
         }
+        // c156 (D-LK-ELF-SYMBOL-VERSIONING): the REQUIRED ELF symbol version,
+        // already resolved for the active (arch, format) by the descriptor
+        // reader. Rides to the MIR ExternImport → the ELF writer's
+        // .gnu.version_r. Empty (the default) ⇒ unversioned.
+        meta.version = std::string{ext.version};
         // `soname` left empty — same convention as `ingest()`.
 
         ffiMap.set(ext.node, std::move(meta));

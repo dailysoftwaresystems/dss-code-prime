@@ -1,0 +1,42 @@
+{
+  "$comment": "c156 D-LK-ELF-SYMBOL-VERSIONING silent-hole witness (the goal-2 SUPPRESSED-shipped path): a user redeclares realpath while #include <stdlib.h> ships it, so the descriptor's versioned realpath is suppressed and the user prototype synthesizes the import. The required version must ride through the suppression map (SuppressedShippedSymbol{library,version}) or x86_64 misbinds realpath@GLIBC_2.2.5 -> NULL -> exit 3. x86_64 emits .gnu.version_r requiring realpath@GLIBC_2.3; arm64 stays unversioned (single 2.17 baseline). RED-ON-DISABLE: drop the version from the suppression map (semantic_analyzer.cpp) or the synthesized HirExternRecord (cst_to_hir.cpp) -> x86_64 exit 3 (witnessed). gcc -std=c17 -D_DEFAULT_SOURCE linux cross-checked (42). elf legs only.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "redecl-versioned-ok\n",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "full-release-like",
+      "passes": [
+        "ConstFold",
+        "Mem2Reg",
+        "CopyProp",
+        "Cse",
+        "Licm",
+        "SimplifyCfg",
+        "Dce"
+      ]
+    },
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

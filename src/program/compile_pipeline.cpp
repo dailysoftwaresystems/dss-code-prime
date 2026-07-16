@@ -356,7 +356,8 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // at the link tier (sibling-TU definition, or the LOUD
             // undefined-symbol reject).
             refs.push_back({r.node, r.canonicalName, resolvedLibs[i],
-                            r.noLibraryBinding});
+                            r.noLibraryBinding,
+                            r.version});   // D-LK-ELF-SYMBOL-VERSIONING (c156)
         }
 
         auto const ffiEntry = reporter.errorCount();

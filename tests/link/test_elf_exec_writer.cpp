@@ -763,6 +763,189 @@ TEST(ElfExecWriter, TwoLibrariesEmitTwoDtNeededInLexicographicOrder) {
     EXPECT_EQ(relaSz, 48u);
 }
 
+// ── c156: symbol versioning (D-LK-ELF-SYMBOL-VERSIONING) ────────────
+// An import declaring a REQUIRED version binds that glibc version via a
+// `.gnu.version_r` requirement instead of misbinding an unversioned
+// reference to a library's OLDEST compat instance (realpath@GLIBC_2.2.5).
+
+namespace {
+// INDEPENDENT mirror of the writer's SysV/ELF version hash (gABI Fig.
+// 5-13) — so the pin tests the hash ALGORITHM, not the writer's own
+// constant. The same classic elf_hash `.hash` uses, applied to a version
+// string. elf_hash("GLIBC_2.3") == 0x0d696913.
+[[nodiscard]] std::uint32_t testVerHash(std::string_view s) {
+    std::uint32_t h = 0;
+    for (char const cc : s) {
+        h = (h << 4) + static_cast<std::uint8_t>(cc);
+        std::uint32_t const g = h & 0xf0000000u;
+        if (g != 0) h ^= g >> 24;
+        h &= ~g;
+    }
+    return h;
+}
+// Elf64_Shdr field readers (64-byte section headers; SHT @ e_shoff/+40).
+[[nodiscard]] std::uint32_t shType(std::vector<std::uint8_t> const& b, int i) {
+    return readU32LE(b, readU64LE(b, 40) + std::uint64_t(i) * 64 + 4);
+}
+[[nodiscard]] std::uint64_t shOffset(std::vector<std::uint8_t> const& b, int i) {
+    return readU64LE(b, readU64LE(b, 40) + std::uint64_t(i) * 64 + 24);
+}
+[[nodiscard]] std::uint64_t shSize(std::vector<std::uint8_t> const& b, int i) {
+    return readU64LE(b, readU64LE(b, 40) + std::uint64_t(i) * 64 + 32);
+}
+[[nodiscard]] std::uint32_t shLink(std::vector<std::uint8_t> const& b, int i) {
+    return readU32LE(b, readU64LE(b, 40) + std::uint64_t(i) * 64 + 40);
+}
+[[nodiscard]] std::uint32_t shInfo(std::vector<std::uint8_t> const& b, int i) {
+    return readU32LE(b, readU64LE(b, 40) + std::uint64_t(i) * 64 + 44);
+}
+[[nodiscard]] std::uint64_t shEntsize(std::vector<std::uint8_t> const& b, int i) {
+    return readU64LE(b, readU64LE(b, 40) + std::uint64_t(i) * 64 + 56);
+}
+// The DT_* tag→val map from `.dynamic` (PT_DYNAMIC = phdr #5, index 4).
+[[nodiscard]] std::unordered_map<std::uint64_t, std::uint64_t>
+dynEntries(std::vector<std::uint8_t> const& b) {
+    std::unordered_map<std::uint64_t, std::uint64_t> m;
+    std::uint64_t const phoff  = readU64LE(b, 32);
+    std::uint64_t const dynOff = readU64LE(b, phoff + 56 * 4 + 8);
+    for (std::size_t off = dynOff; off + 16 <= b.size(); off += 16) {
+        std::uint64_t const tag = readU64LE(b, off);
+        m[tag] = readU64LE(b, off + 8);
+        if (tag == 0u) break;
+    }
+    return m;
+}
+} // namespace
+
+TEST(ElfExecWriter, VersionedImportEmitsVerneedVersymAndDynamicEntries) {
+    // The full trio for a single versioned import realpath@GLIBC_2.3:
+    // DT_VERSYM/VERNEED/VERNEEDNUM + `.gnu.version` (versym) indexing the
+    // `.gnu.version_r` (Verneed libc.so.6 / Vernaux GLIBC_2.3). RED-ON-
+    // DISABLE: drop the emission (emitVersioning) → these sections vanish
+    // and every ASSERT_GE(..., 0) below fails.
+    auto loaded = loadShipped();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel; rel.offset = 1; rel.target = SymbolId{99}; rel.kind = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    ExternImport imp{SymbolId{99}, "realpath", "libc.so.6"};
+    imp.version = "GLIBC_2.3";
+    mod.externImports.push_back(std::move(imp));
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // (a) .dynamic carries DT_VERSYM / DT_VERNEED / DT_VERNEEDNUM.
+    auto const dyn = dynEntries(bytes);
+    ASSERT_TRUE(dyn.count(0x6ffffff0u));   // DT_VERSYM
+    ASSERT_TRUE(dyn.count(0x6ffffffeu));   // DT_VERNEED
+    ASSERT_TRUE(dyn.count(0x6fffffffu));   // DT_VERNEEDNUM
+    EXPECT_EQ(dyn.at(0x6fffffffu), 1u);    // exactly one Verneed (libc.so.6)
+
+    // (b) `.gnu.version` (Versym): one u16 per dynsym entry; STN_UNDEF (#0)
+    //     → 0, realpath (#1) → version index 2. link = .dynsym, entsize 2.
+    int const vsymIdx = findSectionByName(bytes, ".gnu.version");
+    ASSERT_GE(vsymIdx, 0);
+    EXPECT_EQ(shType(bytes, vsymIdx), 0x6fffffffu);   // SHT_GNU_versym
+    EXPECT_EQ(shEntsize(bytes, vsymIdx), 2u);
+    int const dynsymIdx = findSectionByName(bytes, ".dynsym");
+    ASSERT_GE(dynsymIdx, 0);
+    EXPECT_EQ(shLink(bytes, vsymIdx), static_cast<std::uint32_t>(dynsymIdx));
+    ASSERT_EQ(shSize(bytes, vsymIdx), 4u);            // 2 dynsym entries × 2 B
+    std::uint64_t const vsymOff = shOffset(bytes, vsymIdx);
+    EXPECT_EQ(readU16LE(bytes, vsymOff + 0), 0u);     // STN_UNDEF → LOCAL (0)
+    EXPECT_EQ(readU16LE(bytes, vsymOff + 2), 2u);     // realpath → version 2
+
+    // (c) `.gnu.version_r`: 1 Verneed (libc.so.6) + 1 Vernaux (GLIBC_2.3).
+    //     link = .dynstr, info = Verneed count (1).
+    int const vrIdx = findSectionByName(bytes, ".gnu.version_r");
+    ASSERT_GE(vrIdx, 0);
+    EXPECT_EQ(shType(bytes, vrIdx), 0x6ffffffeu);     // SHT_GNU_verneed
+    EXPECT_EQ(shInfo(bytes, vrIdx), 1u);
+    int const dynstrIdx = findSectionByName(bytes, ".dynstr");
+    ASSERT_GE(dynstrIdx, 0);
+    EXPECT_EQ(shLink(bytes, vrIdx), static_cast<std::uint32_t>(dynstrIdx));
+    std::uint64_t const vrOff     = shOffset(bytes, vrIdx);
+    std::uint64_t const dynstrOff = shOffset(bytes, dynstrIdx);
+    // Elf64_Verneed (16 B): vn_version=1, vn_cnt=1, vn_file→"libc.so.6",
+    // vn_aux=16, vn_next=0.
+    EXPECT_EQ(readU16LE(bytes, vrOff + 0), 1u);       // vn_version
+    EXPECT_EQ(readU16LE(bytes, vrOff + 2), 1u);       // vn_cnt
+    EXPECT_EQ(readCStr(bytes, dynstrOff + readU32LE(bytes, vrOff + 4)), "libc.so.6");
+    EXPECT_EQ(readU32LE(bytes, vrOff + 8), 16u);      // vn_aux
+    EXPECT_EQ(readU32LE(bytes, vrOff + 12), 0u);      // vn_next (last)
+    // Elf64_Vernaux (16 B at vrOff+16): vna_hash, flags=0, other=2,
+    // vna_name→"GLIBC_2.3", vna_next=0.
+    std::uint64_t const aux = vrOff + 16;
+    EXPECT_EQ(readU32LE(bytes, aux + 0), testVerHash("GLIBC_2.3"));  // vna_hash (algo)
+    EXPECT_EQ(readU32LE(bytes, aux + 0), 0x0d696913u);              // vna_hash (literal)
+    EXPECT_EQ(readU16LE(bytes, aux + 4), 0u);         // vna_flags
+    EXPECT_EQ(readU16LE(bytes, aux + 6), 2u);         // vna_other (version index)
+    EXPECT_EQ(readCStr(bytes, dynstrOff + readU32LE(bytes, aux + 8)), "GLIBC_2.3");
+    EXPECT_EQ(readU32LE(bytes, aux + 12), 0u);        // vna_next (last)
+}
+
+TEST(ElfExecWriter, UnversionedImportEmitsNoVersionMachinery) {
+    // Control (opt-in regression): an import with NO declared version emits
+    // no `.gnu.version` / `.gnu.version_r` / DT_VER* — byte-identical to the
+    // pre-c156 image. This is the inverse of the versioned pin above.
+    auto loaded = loadShipped();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xC3};
+    Relocation rel; rel.offset = 1; rel.target = SymbolId{99}; rel.kind = RelocationKind{1};
+    fn.relocations.push_back(rel);
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(ExternImport{SymbolId{99}, "printf", "libc.so.6"});
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    auto const dyn = dynEntries(bytes);
+    EXPECT_FALSE(dyn.count(0x6ffffff0u));   // no DT_VERSYM
+    EXPECT_FALSE(dyn.count(0x6ffffffeu));   // no DT_VERNEED
+    EXPECT_FALSE(dyn.count(0x6fffffffu));   // no DT_VERNEEDNUM
+    EXPECT_EQ(findSectionByName(bytes, ".gnu.version"), -1);
+    EXPECT_EQ(findSectionByName(bytes, ".gnu.version_r"), -1);
+}
+
+TEST(ElfExecWriter, MixedVersionedAndUnversionedImportsVersymDiscriminates) {
+    // Opt-in per symbol: printf stays *global* (versym 1) while realpath binds
+    // GLIBC_2.3 (versym 2) in ONE binary + ONE verneed — unversioned imports
+    // are untouched by an image that also carries a versioned one.
+    auto loaded = loadShipped();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0, 0xE8, 0, 0, 0, 0, 0xC3};  // 2 call rel32; ret
+    Relocation r1; r1.offset = 1; r1.target = SymbolId{98}; r1.kind = RelocationKind{1};
+    Relocation r2; r2.offset = 6; r2.target = SymbolId{99}; r2.kind = RelocationKind{1};
+    fn.relocations.push_back(r1);
+    fn.relocations.push_back(r2);
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(ExternImport{SymbolId{98}, "printf", "libc.so.6"});
+    ExternImport imp{SymbolId{99}, "realpath", "libc.so.6"};
+    imp.version = "GLIBC_2.3";
+    mod.externImports.push_back(std::move(imp));
+    DiagnosticReporter rep;
+    auto bytes = elf::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    int const vsymIdx = findSectionByName(bytes, ".gnu.version");
+    ASSERT_GE(vsymIdx, 0);
+    std::uint64_t const vsymOff = shOffset(bytes, vsymIdx);
+    ASSERT_EQ(shSize(bytes, vsymIdx), 6u);            // STN_UNDEF + printf + realpath
+    EXPECT_EQ(readU16LE(bytes, vsymOff + 0), 0u);     // STN_UNDEF
+    EXPECT_EQ(readU16LE(bytes, vsymOff + 2), 1u);     // printf → GLOBAL (unversioned)
+    EXPECT_EQ(readU16LE(bytes, vsymOff + 4), 2u);     // realpath → GLIBC_2.3
+    EXPECT_EQ(dynEntries(bytes).at(0x6fffffffu), 1u); // still one Verneed
+}
+
 TEST(ElfExecWriter, EntryPointHonoredOnDynamicPath) {
     // code-reviewer #1: dynamic path now honors fmt.entryPoint().
     // Schema overrides entry to function #2 → e_entry must reflect.

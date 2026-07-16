@@ -258,6 +258,107 @@ TEST(ShippedLibDescriptor, SymbolPerTargetAvailabilityUnknownFormatFailsLoud) {
     EXPECT_TRUE(rep.hasErrors());
 }
 
+// ── c156: per-symbol `version` (D-LK-ELF-SYMBOL-VERSIONING) ───────────────────
+
+// A flat `"version": "GLIBC_2.3"` (arch-invariant) decodes onto the symbol.
+TEST(ShippedLibDescriptor, SymbolVersionFlatStringDecodes) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "ver_flat.json", R"JSON({
+        "header": "x.h",
+        "library": { "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "f", "signature": "fn() -> i32", "version": "GLIBC_2.3" }
+        ]
+    })JSON");
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+    ASSERT_EQ(desc->symbols.size(), 1u);
+    EXPECT_EQ(desc->symbols[0].version, "GLIBC_2.3");
+}
+
+// The realpath shape: a version required only on x86_64/elf (GLIBC_2.3);
+// aarch64's single-versioned baseline needs none → 0 variants match → empty
+// (unversioned). RED-ON-DISABLE: a flat "GLIBC_2.3" would wrongly require it
+// on arm64, whose libc has no GLIBC_2.3 version node → load failure.
+TEST(ShippedLibDescriptor, SymbolVersionVariantSelectsPerTarget) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    auto const path = writeTemp(dir, "ver_variant.json", R"JSON({
+        "header": "stdlib.h",
+        "library": { "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "realpath", "signature": "fn(ptr<char>, ptr<char>) -> ptr<char>",
+              "version": { "variants": [
+                  { "when": { "arch": "x86_64", "format": "elf" }, "value": "GLIBC_2.3" }
+              ] } }
+        ]
+    })JSON");
+    auto versionFor = [&](std::string_view arch, ObjectFormatKind fmt) -> std::string {
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, arch, fmt);
+        EXPECT_TRUE(desc.has_value());
+        EXPECT_FALSE(rep.hasErrors());
+        for (auto const& s : desc->symbols)
+            if (s.name == "realpath") return s.version;
+        ADD_FAILURE() << "realpath symbol missing";
+        return "<none>";
+    };
+    EXPECT_EQ(versionFor("x86_64", ObjectFormatKind::Elf), "GLIBC_2.3")
+        << "x86_64/elf must require GLIBC_2.3 (the misbind-fix target)";
+    EXPECT_EQ(versionFor("arm64", ObjectFormatKind::Elf), "")
+        << "arm64 has one realpath version → unversioned (no requirement)";
+}
+
+// Malformed `version` shapes all fail loud (closed schema, anti-silent-drop).
+TEST(ShippedLibDescriptor, SymbolVersionMalformedShapesFailLoud) {
+    ScratchDir dir{Location::Temp, "shipped-lib"};
+    int caseNo = 0;
+    auto readsClean = [&](std::string const& body) -> bool {
+        auto const path =
+            writeTemp(dir, "verbad" + std::to_string(caseNo++) + ".json", body);
+        TypeInterner interner{CompilationUnitId{1}};
+        TypeRegistry typeReg;
+        DiagnosticReporter rep;
+        auto desc = readShippedLibDescriptor(path, interner, typeReg, rep,
+                                             DataModel::Lp64, "x86_64",
+                                             ObjectFormatKind::Elf);
+        return desc.has_value() && !rep.hasErrors();
+    };
+    // version is a number (neither string nor object).
+    EXPECT_FALSE(readsClean(R"JSON({ "header":"x.h", "library":{"elf":"libc.so.6"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32","version": 3 }] })JSON"));
+    // empty flat version string.
+    EXPECT_FALSE(readsClean(R"JSON({ "header":"x.h", "library":{"elf":"libc.so.6"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32","version": "" }] })JSON"));
+    // version OBJECT with no `variants` array.
+    EXPECT_FALSE(readsClean(R"JSON({ "header":"x.h", "library":{"elf":"libc.so.6"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32","version": {} }] })JSON"));
+    // a variant missing its `value`.
+    EXPECT_FALSE(readsClean(R"JSON({ "header":"x.h", "library":{"elf":"libc.so.6"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32",
+            "version": { "variants": [ { "when": { "format": "elf" } } ] } }] })JSON"));
+    // two variants BOTH matching the active target (x86_64/elf) → ambiguous.
+    EXPECT_FALSE(readsClean(R"JSON({ "header":"x.h", "library":{"elf":"libc.so.6"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32",
+            "version": { "variants": [
+                { "when": { "format": "elf" }, "value": "GLIBC_2.3" },
+                { "when": { "arch": "x86_64" }, "value": "GLIBC_2.2.5" }
+            ] } }] })JSON"));
+    // sanity: a well-formed variant DOES read clean (the negatives above are
+    // not failing for an unrelated reason).
+    EXPECT_TRUE(readsClean(R"JSON({ "header":"x.h", "library":{"elf":"libc.so.6"},
+        "symbols":[{ "name":"f","signature":"fn() -> i32",
+            "version": { "variants": [
+                { "when": { "arch": "x86_64", "format": "elf" }, "value": "GLIBC_2.3" }
+            ] } }] })JSON"));
+}
+
 // ── macros surface (preprocessor-macro; D-PP-DESCRIPTOR-MACRO-INJECT) ─────────
 
 // Function-like (assert), object-like (no params), and variadic forms all parse;

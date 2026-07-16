@@ -103,6 +103,11 @@ struct DSS_EXPORT ExternDeclRef {
     // belongs to the link tier: a sibling-TU definition, or a LOUD undefined-
     // symbol reject. Mutually exclusive with a non-empty `libraryOverride`.
     bool noLibraryBinding = false;
+    // c156 (D-LK-ELF-SYMBOL-VERSIONING): the REQUIRED ELF symbol version
+    // (e.g. "GLIBC_2.3"), already resolved for the active (arch, format) by the
+    // descriptor reader. Empty ⇒ unversioned. A plain string (already resolved,
+    // not a per-format map), threaded verbatim to FfiMetadata.version.
+    std::string_view version{};
 };
 
 // ── HirIngestResult ─────────────────────────────────────────────

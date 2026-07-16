@@ -142,6 +142,47 @@ constexpr std::uint64_t DF_1_NOW   = 1;
 // a `.so`.
 constexpr std::uint64_t DF_1_PIE   = 0x08000000;
 
+// ── Symbol versioning (gABI + Sun/GNU version extension) — the
+// D-LK-ELF-SYMBOL-VERSIONING import-requirement trio (c156). Emitted
+// ONLY when an import declares a REQUIRED version string (opt-in): a
+// DSS dynamic image importing a MULTI-versioned glibc symbol without
+// this machinery misbinds an UNVERSIONED reference to the library's
+// OLDEST compat instance (glibc `realpath` bound `@GLIBC_2.2.5`, whose
+// pre-2.3 form EINVALs a NULL resolved buffer, instead of the
+// `@@GLIBC_2.3` default). The image emits the standard toolchain
+// requirement so ld.so binds the DECLARED version — gcc parity.
+//
+//   SHT_GNU_versym  (`.gnu.version`)   — one u16 per `.dynsym` entry.
+//   SHT_GNU_verneed (`.gnu.version_r`) — VERNEED(lib) + VERNAUX(version)*.
+//   DT_VERSYM / DT_VERNEED / DT_VERNEEDNUM — the `.dynamic` pointers.
+constexpr std::uint32_t SHT_GNU_versym  = 0x6fffffff;
+constexpr std::uint32_t SHT_GNU_verneed = 0x6ffffffe;
+constexpr std::uint64_t DT_VERSYM     = 0x6ffffff0;
+constexpr std::uint64_t DT_VERNEED    = 0x6ffffffe;
+constexpr std::uint64_t DT_VERNEEDNUM = 0x6fffffff;
+// `.gnu.version` reserved indices (gABI): 0 = a LOCAL symbol (no
+// version), 1 = GLOBAL/unversioned (binds the library's default).
+// A declared requirement gets an index >= 2 (its VERNAUX vna_other).
+constexpr std::uint16_t VER_NDX_LOCAL  = 0;
+constexpr std::uint16_t VER_NDX_GLOBAL = 1;
+constexpr std::uint16_t VER_NEED_CURRENT = 1;  // Elf64_Verneed.vn_version
+constexpr std::uint16_t kFirstVersionIndex = 2; // first assignable vna_other
+
+// The classic SysV/ELF hash (gABI Fig. 5-13) — the SAME algorithm the
+// `.hash` table uses, applied here to a VERSION STRING to fill an
+// Elf64_Vernaux.vna_hash (ld.so matches a needed version to a library's
+// verdef by hash + name). e.g. elf_hash("GLIBC_2.3") == 0x0d696913.
+[[nodiscard]] constexpr std::uint32_t elf_hash(std::string_view name) noexcept {
+    std::uint32_t h = 0;
+    for (char const cc : name) {
+        h = (h << 4) + static_cast<std::uint8_t>(cc);
+        std::uint32_t const g = h & 0xf0000000u;
+        if (g != 0) h ^= g >> 24;
+        h &= ~g;
+    }
+    return h;
+}
+
 // Per-machine ELF reloc type for "write resolved symbol VA into GOT
 // slot at load time" (dyld semantics).
 // x86_64 psABI §4.4.1 — R_X86_64_GLOB_DAT = 6.
@@ -1000,6 +1041,61 @@ encodeElfExecDynamic(
     // the GOT, so only module globals count there).
     bool const hasBssSection = hasBssDyn || hasCopySlots;
 
+    // ── (b.6) Symbol-version REQUIREMENTS (D-LK-ELF-SYMBOL-VERSIONING) ──
+    // An import whose `ExternImport.version` is non-empty (config-driven,
+    // opt-in, already resolved for THIS target upstream) must bind that
+    // exact glibc version via `.gnu.version_r`, or an unversioned reference
+    // misbinds to the library's OLDEST compat instance. Each DISTINCT
+    // (library, version) pair becomes one VERNAUX under its library's
+    // VERNEED and is assigned a version index (>= 2) stamped into every
+    // referring import's `.gnu.version` slot. `importVersionIdx[i]` == 0
+    // means import i is UNVERSIONED (its slot stays VER_NDX_GLOBAL). The
+    // whole trio is emitted ONLY when at least one import is versioned
+    // (`emitVersioning`) — a versionless module is byte-identical to the
+    // pre-c156 image. The version STRING never drives a branch here; the
+    // writer groups + hashes it exactly as it groups `libraryPath` into
+    // DT_NEEDED — no arch/format/symbol-name identity in the substrate.
+    struct VersionReq {
+        std::size_t   libIndex;   // index into `libraryOrder` (the DT_NEEDED lib)
+        std::string   version;    // the ELF version string, e.g. "GLIBC_2.3"
+        std::uint16_t vnaOther;   // the assigned version index (>= 2)
+    };
+    std::vector<VersionReq> versionReqs;
+    std::vector<std::uint16_t> importVersionIdx(numExterns, 0);
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        auto const& ver = module.externImports[i].version;
+        if (ver.empty()) continue;   // unversioned import -- the common case
+        auto const& lib = module.externImports[i].libraryPath;
+        auto const libIt = std::find(libraryOrder.begin(), libraryOrder.end(), lib);
+        if (lib.empty() || libIt == libraryOrder.end()) {
+            // Fail loud on the inconsistency the directive names: a version
+            // string that references a library with no DT_NEEDED entry. A
+            // versioned symbol MUST originate from a concrete needed library
+            // (a no-library / bare-proto extern can never carry a version).
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"elf::encodeElfExecDynamic: import '"}
+                     + module.externImports[i].mangledName
+                     + "' declares required symbol version '" + ver
+                     + "' but its owning library '" + lib
+                     + "' has no DT_NEEDED entry -- a versioned import must "
+                       "bind a concrete needed library (D-LK-ELF-SYMBOL-"
+                       "VERSIONING).");
+            return {};
+        }
+        std::size_t const libIndex =
+            static_cast<std::size_t>(libIt - libraryOrder.begin());
+        std::uint16_t idx = 0;
+        for (auto const& r : versionReqs) {
+            if (r.libIndex == libIndex && r.version == ver) { idx = r.vnaOther; break; }
+        }
+        if (idx == 0) {
+            idx = static_cast<std::uint16_t>(kFirstVersionIndex + versionReqs.size());
+            versionReqs.push_back(VersionReq{libIndex, ver, idx});
+        }
+        importVersionIdx[i] = idx;
+    }
+    bool const emitVersioning = !versionReqs.empty();
+
     // ── Section indices (hoisted above the dynsym build — c84/c150) ──
     // Computed INCREMENTALLY from the emit order below so adding/
     // removing an optional section ([.interp]/[.rodata]/[.data]/
@@ -1032,6 +1128,16 @@ encodeElfExecDynamic(
     std::uint16_t const IDX_DYNSYM = nextIdx();
     std::uint16_t const IDX_DYNSTR = nextIdx();
     std::uint16_t const IDX_HASH   = nextIdx();  (void)IDX_HASH;
+    // `.gnu.version` + `.gnu.version_r` (D-LK-ELF-SYMBOL-VERSIONING) sit
+    // between `.hash` and `.rela.dyn` (gcc's section order) — present ONLY
+    // when the image has a versioned import, so a versionless image keeps
+    // every downstream index unshifted (byte-identical to pre-c156).
+    std::uint16_t const IDX_GNU_VERSION =
+        emitVersioning ? nextIdx() : std::uint16_t{0};
+    (void)IDX_GNU_VERSION;
+    std::uint16_t const IDX_GNU_VERSION_R =
+        emitVersioning ? nextIdx() : std::uint16_t{0};
+    (void)IDX_GNU_VERSION_R;
     std::uint16_t const IDX_RELADYN = nextIdx(); (void)IDX_RELADYN;
     std::uint16_t const IDX_TDATA  = hasTdataDyn ? nextIdx() : std::uint16_t{0};
     (void)IDX_TDATA;
@@ -1162,6 +1268,20 @@ encodeElfExecDynamic(
             dynstr.push_back(static_cast<std::uint8_t>(c));
         dynstr.push_back(0);
     }
+    // Version strings (D-LK-ELF-SYMBOL-VERSIONING) — each DISTINCT version
+    // string (deduped: two libraries may need the same "GLIBC_2.x" name and
+    // share one `.dynstr` entry) NUL-terminated after the soname. The
+    // VERNAUX vna_name below points here. Empty unless a versioned import
+    // exists, so a versionless image's `.dynstr` is byte-identical.
+    std::unordered_map<std::string, std::uint32_t> versionStrOff;
+    for (auto const& r : versionReqs) {
+        if (versionStrOff.count(r.version)) continue;
+        versionStrOff.emplace(r.version,
+                              static_cast<std::uint32_t>(dynstr.size()));
+        for (char c : r.version)
+            dynstr.push_back(static_cast<std::uint8_t>(c));
+        dynstr.push_back(0);
+    }
 
     // ── (e) .dynsym body (STN_UNDEF + N extern symbols)
     std::vector<std::uint8_t> dynsym;
@@ -1231,6 +1351,72 @@ encodeElfExecDynamic(
             (i + 1 < numDynsymEntries) ? static_cast<std::uint32_t>(i + 1)
                                        : 0u;
         appendU32LE(hashSec, next);
+    }
+
+    // ── (f.5) .gnu.version + .gnu.version_r (D-LK-ELF-SYMBOL-VERSIONING) ──
+    // Built ONLY when a versioned import exists (emitVersioning); both stay
+    // empty + unreferenced otherwise (byte-identical pre-c156 image).
+    //
+    // `.gnu.version` (Versym): one u16 per `.dynsym` entry, parallel to it.
+    //   [0] (STN_UNDEF)       = VER_NDX_LOCAL (0).
+    //   an unversioned import = VER_NDX_GLOBAL (1) — binds the lib default.
+    //   a versioned import    = its VERNAUX index (>= 2).
+    //   a c150 `.so` export   = VER_NDX_GLOBAL (1) — DSS emits no verdef.
+    std::vector<std::uint8_t> gnuVersion;
+    std::vector<std::uint8_t> gnuVersionR;
+    std::size_t numVerneed = 0;
+    if (emitVersioning) {
+        gnuVersion.resize(numDynsymEntries * 2, 0);
+        auto setVersym = [&](std::size_t dsIdx, std::uint16_t v) {
+            gnuVersion[dsIdx * 2]     = static_cast<std::uint8_t>(v & 0xFF);
+            gnuVersion[dsIdx * 2 + 1] = static_cast<std::uint8_t>((v >> 8) & 0xFF);
+        };
+        // Default every non-UNDEF entry (imports + .so exports) to GLOBAL;
+        // [0] stays LOCAL (0). Then stamp each versioned import's index.
+        for (std::size_t k = 1; k < numDynsymEntries; ++k)
+            setVersym(k, VER_NDX_GLOBAL);
+        for (std::size_t i = 0; i < numExterns; ++i) {
+            if (importVersionIdx[i] != 0)
+                setVersym(dynsymIdx[i], importVersionIdx[i]);
+        }
+
+        // `.gnu.version_r` (Verneed/Vernaux): one VERNEED per DISTINCT library
+        // that has versioned imports (grouped, in libraryOrder order), each
+        // with one VERNAUX per (library, version) requirement. Elf64_Verneed
+        // {vn_version, vn_cnt, vn_file, vn_aux, vn_next} + Elf64_Vernaux
+        // {vna_hash, vna_flags, vna_other, vna_name, vna_next}, both 16 B.
+        std::vector<std::size_t> verLibs;   // libIndexes with >= 1 versioned import
+        for (std::size_t L = 0; L < numLibs; ++L) {
+            for (auto const& r : versionReqs) {
+                if (r.libIndex == L) { verLibs.push_back(L); break; }
+            }
+        }
+        numVerneed = verLibs.size();
+        for (std::size_t vi = 0; vi < verLibs.size(); ++vi) {
+            std::size_t const L = verLibs[vi];
+            std::vector<VersionReq const*> aux;
+            for (auto const& r : versionReqs)
+                if (r.libIndex == L) aux.push_back(&r);
+            // Verneed header (16 B). vn_aux = 16 (the first VERNAUX follows
+            // immediately); vn_next = 0 on the last VERNEED, else the byte
+            // span of this VERNEED + all its VERNAUX (skip to the next).
+            appendU16LE(gnuVersionR, VER_NEED_CURRENT);                       // vn_version
+            appendU16LE(gnuVersionR, static_cast<std::uint16_t>(aux.size())); // vn_cnt
+            appendU32LE(gnuVersionR, libNameOff[L]);                          // vn_file
+            appendU32LE(gnuVersionR, 16);                                     // vn_aux
+            appendU32LE(gnuVersionR,
+                (vi + 1 < verLibs.size())
+                    ? static_cast<std::uint32_t>(16 + aux.size() * 16)
+                    : 0u);                                                    // vn_next
+            for (std::size_t a = 0; a < aux.size(); ++a) {
+                appendU32LE(gnuVersionR, elf_hash(aux[a]->version));          // vna_hash
+                appendU16LE(gnuVersionR, 0);                                  // vna_flags
+                appendU16LE(gnuVersionR, aux[a]->vnaOther);                   // vna_other
+                appendU32LE(gnuVersionR, versionStrOff.at(aux[a]->version));  // vna_name
+                appendU32LE(gnuVersionR,
+                    (a + 1 < aux.size()) ? 16u : 0u);                         // vna_next
+            }
+        }
     }
 
     // ── (g) .plt body (placeholder; filled after layout)
@@ -1310,7 +1496,21 @@ encodeElfExecDynamic(
     std::uint64_t const hashVa  = baseImageVa + hashOff;
     std::uint64_t const hashSz  = hashSec.size();
 
-    std::uint64_t const relaDynOff = alignUp(hashOff + hashSz, 8);
+    // `.gnu.version` (align 2, entsize 2) + `.gnu.version_r` (align 4) sit
+    // between `.hash` and `.rela.dyn` (D-LK-ELF-SYMBOL-VERSIONING). When
+    // versioning is OFF both are zero-size and collapse to hashOff+hashSz, so
+    // relaDynOff == alignUp(hashOff+hashSz, 8) — the exact pre-c156 formula
+    // (2|4|8 nested alignUps of an already-8-aligned base are a no-op).
+    std::uint64_t const gnuVersionOff =
+        emitVersioning ? alignUp(hashOff + hashSz, 2) : (hashOff + hashSz);
+    std::uint64_t const gnuVersionVa  = baseImageVa + gnuVersionOff;
+    std::uint64_t const gnuVersionSz  = gnuVersion.size();
+    std::uint64_t const gnuVersionROff =
+        emitVersioning ? alignUp(gnuVersionOff + gnuVersionSz, 4) : gnuVersionOff;
+    std::uint64_t const gnuVersionRVa  = baseImageVa + gnuVersionROff;
+    std::uint64_t const gnuVersionRSz  = gnuVersionR.size();
+
+    std::uint64_t const relaDynOff = alignUp(gnuVersionROff + gnuVersionRSz, 8);
     std::uint64_t const relaDynVa  = baseImageVa + relaDynOff;
     // c150 (D-LK1-4): on the ET_DYN arm every internal absolute
     // 64-bit data slot (a fn-ptr-table entry, a `&global`
@@ -1479,6 +1679,17 @@ encodeElfExecDynamic(
         appendDyn(DT_RELASZ,  relaDynSz);
         appendDyn(DT_RELAENT, 24);
     }
+    // Symbol-version requirement pointers (D-LK-ELF-SYMBOL-VERSIONING) —
+    // emitted only when a versioned import exists. DT_VERSYM → the Versym
+    // array, DT_VERNEED → the first Verneed record, DT_VERNEEDNUM → the
+    // Verneed count. ld.so keys version resolution on these three; without
+    // them an unversioned reference misbinds to a library's oldest compat
+    // version (the realpath@GLIBC_2.2.5 degradation this closes).
+    if (emitVersioning) {
+        appendDyn(DT_VERSYM,     gnuVersionVa);
+        appendDyn(DT_VERNEED,    gnuVersionRVa);
+        appendDyn(DT_VERNEEDNUM, numVerneed);
+    }
     // DF_1_NOW = eager binding (both arms, all shapes). The c151 PIE
     // additionally carries DF_1_PIE — the ET_DYN "this is an
     // executable, not a library" marker (gcc ground truth: FLAGS_1 =
@@ -1630,6 +1841,13 @@ encodeElfExecDynamic(
     auto const shsDynsym   = shstrtab.add(".dynsym");
     auto const shsDynstr   = shstrtab.add(".dynstr");
     auto const shsHash     = shstrtab.add(".hash");
+    // `.gnu.version` / `.gnu.version_r` names (D-LK-ELF-SYMBOL-VERSIONING)
+    // added ONLY when a versioned import exists — an unconditional add would
+    // grow `.shstrtab` on every image and break the pre-c156 byte-identity.
+    std::uint32_t const shsGnuVersion =
+        emitVersioning ? shstrtab.add(".gnu.version") : 0u;
+    std::uint32_t const shsGnuVersionR =
+        emitVersioning ? shstrtab.add(".gnu.version_r") : 0u;
     auto const shsRelaDyn  = shstrtab.add(".rela.dyn");
     auto const shsGot      = shstrtab.add(".got");
     auto const shsDynamic  = shstrtab.add(".dynamic");
@@ -2190,6 +2408,12 @@ encodeElfExecDynamic(
     padToOffset(bytes, dynsymOff);    appendBytes(bytes, dynsym);
                                        appendBytes(bytes, dynstr);  // align 1
     padToOffset(bytes, hashOff);      appendBytes(bytes, hashSec);
+    // `.gnu.version` + `.gnu.version_r` (D-LK-ELF-SYMBOL-VERSIONING) — only
+    // when a versioned import exists; absent otherwise (byte-identical image).
+    if (emitVersioning) {
+        padToOffset(bytes, gnuVersionOff);  appendBytes(bytes, gnuVersion);
+        padToOffset(bytes, gnuVersionROff); appendBytes(bytes, gnuVersionR);
+    }
     padToOffset(bytes, relaDynOff);   appendBytes(bytes, relaDyn);
     padToOffset(bytes, ptLoad2Start);                                // PT_LOAD #2 boundary
     // `.tdata` (thread-local template) opens PT_LOAD #2 (D-CSUBSET-THREAD-
@@ -2264,6 +2488,23 @@ encodeElfExecDynamic(
         .name_offset = shsHash, .type = SHT_HASH, .flags = SHF_ALLOC,
         .addr = hashVa, .offset = hashOff, .size = hashSz,
         .link = IDX_DYNSYM, .addr_align = 8, .entry_size = 4});
+    // `.gnu.version` (SHT_GNU_versym) + `.gnu.version_r` (SHT_GNU_verneed) —
+    // D-LK-ELF-SYMBOL-VERSIONING; emitted only when a versioned import exists
+    // (matches the IDX_GNU_VERSION[_R] + layout + emit gates above).
+    //   .gnu.version   → link = .dynsym (the parallel array), entsize 2.
+    //   .gnu.version_r → link = .dynstr (vn_file/vna_name offsets),
+    //                    info = the VERNEED count, entsize 0 (variable records).
+    if (emitVersioning) {
+        writeSectionHeader(bytes, SectionHeader{
+            .name_offset = shsGnuVersion, .type = SHT_GNU_versym, .flags = SHF_ALLOC,
+            .addr = gnuVersionVa, .offset = gnuVersionOff, .size = gnuVersionSz,
+            .link = IDX_DYNSYM, .addr_align = 2, .entry_size = 2});
+        writeSectionHeader(bytes, SectionHeader{
+            .name_offset = shsGnuVersionR, .type = SHT_GNU_verneed, .flags = SHF_ALLOC,
+            .addr = gnuVersionRVa, .offset = gnuVersionROff, .size = gnuVersionRSz,
+            .link = IDX_DYNSTR, .info = static_cast<std::uint32_t>(numVerneed),
+            .addr_align = 4});
+    }
     writeSectionHeader(bytes, SectionHeader{
         .name_offset = shsRelaDyn, .type = SHT_RELA, .flags = SHF_ALLOC,
         .addr = relaDynVa, .offset = relaDynOff, .size = relaDynSz,

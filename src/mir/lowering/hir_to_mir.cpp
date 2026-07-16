@@ -10613,6 +10613,7 @@ struct Lowerer {
                 row.symbol      = sym;
                 row.mangledName = meta->mangledName;
                 row.libraryPath = meta->importLibrary;
+                row.version     = meta->version;   // D-LK-ELF-SYMBOL-VERSIONING (c156)
                 row.isData      = true;
                 // TLS C1 (D-CSUBSET-THREAD-LOCAL): `extern thread_local int
                 // e;` — carry the declaration's thread-storage duration on
@@ -10760,6 +10761,7 @@ struct Lowerer {
             row.symbol      = sym;
             row.mangledName = meta->mangledName;
             row.libraryPath = meta->importLibrary;
+            row.version     = meta->version;   // D-LK-ELF-SYMBOL-VERSIONING (c156)
             externImports.push_back(std::move(row));
             functionSymbols.insert(sym.v);
         }

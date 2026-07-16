@@ -951,6 +951,108 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             }
         }
 
+        // c156 (D-LK-ELF-SYMBOL-VERSIONING): optional per-symbol REQUIRED ELF
+        // version string. Absent ⇒ unversioned (the default). A flat string
+        // applies to every target; a `{ "variants": [ {when:{arch?,format?},
+        // value}, … ] }` object selects PER-TARGET — glibc `realpath` is
+        // `GLIBC_2.3` on x86_64 but the single baseline `GLIBC_2.17` on
+        // aarch64, so a flat string would wrongly require GLIBC_2.3 on the
+        // arm64 leg (whose libc has no such version node). The reader resolves
+        // the version to a SINGLE string for the ACTIVE target HERE, so the
+        // whole downstream pipeline + the ELF writer carry a plain resolved
+        // string (the writer emits `.gnu.version_r` from it with NO arch/format
+        // branch — the agnostic law). 0 matching variants ⇒ empty ⇒ unversioned
+        // on that target (LEGAL — the aarch64 realpath case). EAGER: every
+        // variant's shape is validated regardless of which is active (a
+        // malformed INACTIVE variant fails the read on EVERY target —
+        // anti-lurking, mirrors `signatureByDataModel` / the struct variants).
+        std::string version;
+        if (sym.contains("version")) {
+            json const& vnode = sym.at("version");
+            if (vnode.is_string()) {
+                version = vnode.get<std::string>();
+                if (version.empty()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                        + ": 'version' string must be non-empty (omit the key "
+                          "for an unversioned symbol)");
+                    continue;
+                }
+            } else if (vnode.is_object()) {
+                std::string const vObjCtx =
+                    "symbols[" + std::to_string(idx - 1) + "].version";
+                if (!rejectUnknownKeys(reporter, vnode, vObjCtx, {"variants"}))
+                    continue;   // rejectUnknownKeys already reported
+                if (!vnode.contains("variants") || !vnode.at("variants").is_array()
+                    || vnode.at("variants").empty()) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                        + ": a 'version' OBJECT must carry a non-empty 'variants' "
+                          "array (or be a flat version string)");
+                    continue;
+                }
+                std::string const activeFormatName =
+                    activeFormat.has_value()
+                        ? std::string{objectFormatKindName(*activeFormat)}
+                        : std::string{};
+                bool verErr = false;
+                int matchCount = 0;
+                std::size_t vvi = 0;
+                for (auto const& vdef : vnode.at("variants")) {
+                    std::string const vctx = vObjCtx + ".variants["
+                        + std::to_string(vvi) + "]";
+                    ++vvi;
+                    if (!vdef.is_object()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + at
+                            + ": '" + vctx + "' must be an object with 'when' + "
+                              "'value'");
+                        verErr = true;
+                        break;
+                    }
+                    if (!rejectUnknownKeys(reporter, vdef, vctx, {"when", "value"})) {
+                        verErr = true;   // already reported
+                        break;
+                    }
+                    if (!vdef.contains("value") || !vdef.at("value").is_string()
+                        || vdef.at("value").get<std::string>().empty()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + at
+                            + ": '" + vctx
+                            + "' must carry a non-empty string 'value'");
+                        verErr = true;
+                        break;
+                    }
+                    if (!vdef.contains("when") || !vdef.at("when").is_object()) {
+                        emitMalformed(reporter, "shipped-lib descriptor " + at
+                            + ": '" + vctx + "' must carry a 'when' object");
+                        verErr = true;
+                        break;
+                    }
+                    WhenMatch const wm = matchVariantWhen(
+                        vdef.at("when"), /*allowArch=*/true, vctx + ".when",
+                        activeTarget, activeFormat, activeFormatName, reporter);
+                    if (wm == WhenMatch::Error) { verErr = true; break; }
+                    if (wm == WhenMatch::Match) {
+                        ++matchCount;
+                        version = vdef.at("value").get<std::string>();
+                    }
+                }
+                if (verErr) continue;
+                if (matchCount > 1) {
+                    emitMalformed(reporter, "shipped-lib descriptor " + at
+                        + ": 'version' has " + std::to_string(matchCount)
+                        + " variants matching the active target -- the selection "
+                          "is ambiguous (each target must match at most one)");
+                    continue;
+                }
+                // matchCount == 0 ⇒ version stays empty ⇒ unversioned on this
+                // target (the aarch64 realpath case — a single-versioned
+                // baseline needs no requirement). LEGAL, not an error.
+            } else {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                    + ": 'version' must be a STRING (arch-invariant) or an OBJECT "
+                      "with a 'variants' array (per-target)");
+                continue;
+            }
+        }
+
         // Optional per-SYMBOL `availableObjectFormats` — which object-formats this
         // symbol EXISTS on (errno's __error is ["macho"], __errno_location ["elf"];
         // the Linux-only fdatasync/fallocate/mremap are ["elf"]). EMPTY/absent =
@@ -1024,7 +1126,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         (void)rejectUnknownKeys(reporter, sym, "symbols[" + std::to_string(idx - 1) + "]",
                                 {"name", "signature", "signatureByDataModel",
                                  "kind", "linkage", "availableObjectFormats",
-                                 "noreturn", "returnsTwice", "synthesize"});
+                                 "noreturn", "returnsTwice", "synthesize", "version"});
 
         // Decode the signature via the ONE type-text decoder. A decode failure
         // is the CRITICAL fail-loud: F_ShippedLibUnsupportedType, and the
@@ -1052,7 +1154,8 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
 
         out.symbols.push_back(
             ShippedSymbol{std::move(name), sig, kind, linkage, std::move(symAvail),
-                          noreturn, returnsTwice, std::move(synthesize)});
+                          noreturn, returnsTwice, std::move(synthesize),
+                          std::move(version)});
     }
 
     // (5) Optional `constants` array — the neutral form of a header's object-
