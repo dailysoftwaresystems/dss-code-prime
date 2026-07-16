@@ -1,0 +1,27 @@
+# Maintainer: @MAINTAINER@
+# AUR binary package for the dsscp compiler. Rendered by packaging/render.py
+# and pushed to the AUR on each release (stable -> dsscp, beta -> dsscp-beta).
+# Depends on the queued install-layout + dsscp-rename prerequisites (installs a
+# `dsscp` binary + lib).
+pkgname=@PKGNAME@
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="@DESCRIPTION@"
+arch=('x86_64' 'aarch64')
+url="@HOMEPAGE@"
+license=('Apache-2.0')
+provides=('dsscp')
+conflicts=('dsscp')
+source_x86_64=("@PKGNAME@-$pkgver-x86_64.tar.gz::@URL_LINUX_X64@")
+source_aarch64=("@PKGNAME@-$pkgver-aarch64.tar.gz::@URL_LINUX_ARM64@")
+sha256sums_x86_64=('@SHA256_LINUX_X64@')
+sha256sums_aarch64=('@SHA256_LINUX_ARM64@')
+
+package() {
+  install -Dm755 "bin/dss/dsscp" "$pkgdir/usr/bin/dsscp"
+  # Shared library alongside the CLI (rpath $ORIGIN/../lib resolves it).
+  for _lib in bin/dss/*.so bin/dss/*.so.*; do
+    [ -e "$_lib" ] || continue
+    install -Dm644 "$_lib" "$pkgdir/usr/lib/$(basename "$_lib")"
+  done
+}

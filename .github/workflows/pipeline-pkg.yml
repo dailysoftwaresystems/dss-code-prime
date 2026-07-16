@@ -1,8 +1,19 @@
 name: Package
 
 # Package pipeline for this C++ application. Inlined from the DSS.DevOps reusable
-# `cpp-app-pkg.yml@v2` (a public repo cannot call the private/internal reusable).
-# Keep in sync with dailysoftwaresystems/DSS.DevOps.
+# `cpp-app-pkg.yml@v2`: a PUBLIC repository cannot call a reusable workflow that
+# lives in a private/internal repository, so the logic is vendored here. Keep in
+# sync with dailysoftwaresystems/DSS.DevOps. Settings baked from the former caller
+# inputs: run-macos + run-linux-arm64 ON, artifact-paths = bin, cmake-version =
+# latest, artifact-name = dsscp — the release-tarball brand and the INTENDED CLI
+# command name. The repo/project stays dss-code-prime, and the binary INSIDE the
+# tarball is still built as dss-code-prime until the CMake-target rename lands, so
+# the tarball and the executable names are briefly out of sync by design (project
+# name != command name, like Ziglang/`zig`).
+#
+# Flow (immutable-release-safe): create a DRAFT release, build the shippable
+# artifact on each platform leg in parallel and attach it to the draft, then
+# publish once every leg has succeeded. A failed leg leaves the release a draft.
 
 on:
   push:
@@ -16,12 +27,17 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  # Resolve the version/channel/tag and create the release as a DRAFT. GitHub
+  # freezes an immutable release's assets on PUBLISH, not while it is a draft,
+  # so the parallel build legs attach their tarballs to the draft and
+  # finalize-release publishes once they all succeed.
+  resolve-version:
     runs-on: ${{ 'ubuntu-latest' }}
     outputs:
       version: ${{ steps.v.outputs.version }}
       channel: ${{ steps.v.outputs.channel }}
       tag: ${{ steps.v.outputs.tag }}
+      artifact-name: ${{ steps.v.outputs.artifact_name }}
     steps:
       - name: Generate GitHub App token
         id: app-token
@@ -42,6 +58,7 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           VERSION_FILE: ${{ 'VERSION' }}
           TAG_PREFIX: ${{ 'v' }}
+          ARTIFACT_NAME_INPUT: ${{ 'dsscp' }}
         working-directory: ${{ '.' }}
         run: |
           if [ ! -f "$VERSION_FILE" ]; then
@@ -68,8 +85,20 @@ jobs:
             tag="${TAG_PREFIX}${raw}-${channel}"
           fi
 
-          if gh release view "$tag" > /dev/null 2>&1; then
-            echo "::error::Release $tag already exists. Bump $VERSION_FILE before re-running."
+          # Artifact base name: explicit input wins, else the repo name.
+          artifact_name="$ARTIFACT_NAME_INPUT"
+          if [ -z "$artifact_name" ]; then
+            artifact_name="${GITHUB_REPOSITORY##*/}"
+          fi
+
+          # Capture output so a genuine "release not found" (absent -> safe to
+          # create) is told apart from a transient auth/5xx/network error,
+          # which must fail closed rather than race ahead and create a duplicate.
+          if out=$(gh release view "$tag" 2>&1); then
+            echo "::error::Release $tag already exists (published or draft). Bump $VERSION_FILE or delete the draft before re-running."
+            exit 1
+          elif ! grep -qiE 'release not found|HTTP 404' <<<"$out"; then
+            echo "::error::Could not verify whether $tag exists (treating as fatal): $out"
             exit 1
           fi
 
@@ -77,39 +106,38 @@ jobs:
             echo "version=$raw"
             echo "channel=$channel"
             echo "tag=$tag"
+            echo "artifact_name=$artifact_name"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Resolved: tag=$tag channel=$channel version=$raw"
+          echo "Resolved: tag=$tag channel=$channel version=$raw artifact=$artifact_name"
 
-      - name: Create GitHub release
+      - name: Create draft release
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           TAG: ${{ steps.v.outputs.tag }}
           CHANNEL: ${{ steps.v.outputs.channel }}
           VERSION: ${{ steps.v.outputs.version }}
-        # `--generate-notes` asks GitHub to compose release notes from
-        # commits/PRs between the last tag and HEAD. The fallback to a
-        # static `--notes` body only fires for the first-ever release
-        # (no previous tag to diff against) — generate-notes returns an
-        # empty body in that case, which is fine; we replace it via the
-        # `--notes` arg if needed.
         run: |
+          # Mark non-final channels as prerelease so GitHub's "Latest release"
+          # pointer keeps tracking stable.
           prerelease=""
           if [ "$CHANNEL" != "stable" ]; then
             prerelease="--prerelease"
           fi
 
+          # --target pins the tag to the built commit; without it gh cuts the
+          # tag from the default branch, not this release/* commit.
           gh release create "$TAG" \
+            --target "${{ github.sha }}" \
             --title "Release $TAG" \
             --generate-notes \
+            --draft \
             $prerelease
 
-          # Verify the body landed; some first-tag scenarios produce an
-          # empty notes body. We must distinguish "body is genuinely
-          # empty" from "fetch failed" — the old `2>/dev/null || true`
-          # mask treated transient API errors and rate limits the same as
-          # "first release", silently clobbering --generate-notes output
-          # with the minimal stub on every transient failure.
+          # First-ever release has no previous tag to diff against, so
+          # --generate-notes yields an empty body; replace it with a minimal
+          # stub. Distinguish "genuinely empty" from "fetch failed" so a
+          # transient API error doesn't clobber good generated notes.
           if ! body=$(gh release view "$TAG" --json body --jq .body 2>&1); then
             echo "::warning::Could not read release body to verify --generate-notes output: $body"
             echo "::warning::Skipping notes-fallback to avoid clobbering generated notes on a transient failure."
@@ -117,3 +145,230 @@ jobs:
             gh release edit "$TAG" \
               --notes "Channel: $CHANNEL"$'\n'"Version: $VERSION"
           fi
+
+  # Build the Release-leg matrix from the run-* booleans. Only enabled legs
+  # land in the matrix, so a disabled leg allocates no runner.
+  build-matrix:
+    runs-on: ${{ 'ubuntu-latest' }}
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      empty: ${{ steps.set.outputs.empty }}
+    steps:
+      - id: set
+        run: |
+          legs='[]'
+          if [ "${{ true }}" = "true" ]; then
+            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-x64","os":"ubuntu-latest","cc":"gcc-13","cxx":"g++-13","platform":"linux-x64"}]')
+          fi
+          if [ "${{ true }}" = "true" ]; then
+            legs=$(echo "$legs" | jq -c '. + [{"name":"windows-x64","os":"windows-latest","cc":"","cxx":"","platform":"windows-x64"}]')
+          fi
+          if [ "${{ true }}" = "true" ]; then
+            legs=$(echo "$legs" | jq -c '. + [{"name":"macos-arm64","os":"macos-latest","cc":"","cxx":"","platform":"macos-arm64"}]')
+          fi
+          if [ "${{ true }}" = "true" ]; then
+            legs=$(echo "$legs" | jq -c '. + [{"name":"linux-arm64","os":"ubuntu-24.04-arm","cc":"gcc-13","cxx":"g++-13","platform":"linux-arm64"}]')
+          fi
+          echo "matrix={\"include\":$legs}" >> "$GITHUB_OUTPUT"
+          if [ "$legs" = "[]" ]; then
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::All build legs are disabled; the release will publish tag-only with no artifacts."
+          else
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # One leg per platform: build Release, package, attach the tarball to the
+  # draft. fail-fast:false so one platform's failure doesn't cancel the others
+  # mid-upload; finalize-release gates publish on the aggregate result.
+  build-artifact:
+    needs: [resolve-version, build-matrix]
+    if: ${{ needs.build-matrix.outputs.empty == 'false' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.build-matrix.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: ${{ '.' }}
+        shell: bash
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.DSS_PUBLIC_BOTS_APP_ID }}
+          private-key: ${{ secrets.DSS_PUBLIC_BOTS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Configure Git for private dependencies
+        run: git config --global url."https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/".insteadOf "git@github.com:"
+
+      - name: Install Linux toolchain
+        if: ${{ startsWith(matrix.os, 'ubuntu') }}
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
+          NEEDRESTART_SUSPEND: '1'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends ninja-build "${{ matrix.cc }}" "${{ matrix.cxx }}"
+        timeout-minutes: 10
+
+      - name: Setup MSVC environment
+        if: ${{ startsWith(matrix.os, 'windows') }}
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup macOS toolchain
+        if: ${{ startsWith(matrix.os, 'macos') }}
+        run: |
+          brew install ninja llvm
+          # Prefer Homebrew's clang for C++23 stdlib coverage (parity with the PR matrix).
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Ninja (Windows)
+        if: ${{ startsWith(matrix.os, 'windows') }}
+        uses: seanmiddleditch/gha-setup-ninja@v6
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@v4.3.3
+        with:
+          cmakeVersion: ${{ 'latest' }}
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        # Tests are off — the artifact build only produces shippable binaries
+        # (the PR pipeline already ran the suite). DSS_BUILD_TESTS=OFF is the
+        # repo-wide convention; a project that doesn't define it still
+        # configures fine — CMake just prints a harmless "Manually-specified
+        # variables were not used" warning.
+        run: |
+          cmake -S . -B "${{ 'build' }}" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDSS_BUILD_TESTS=OFF \
+            ${{ '' }}
+        timeout-minutes: 15
+
+      - name: Build
+        run: cmake --build "${{ 'build' }}" --parallel
+        timeout-minutes: 90
+
+      - name: Package artifact
+        env:
+          ARTIFACT_NAME: ${{ needs.resolve-version.outputs.artifact-name }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+          BUILD_DIR: ${{ 'build' }}
+          ARTIFACT_PATHS: ${{ 'bin' }}
+          PACKAGE_COMMAND: ${{ '' }}
+        run: |
+          set -e
+          mkdir -p dist
+          archive="$(pwd)/dist/${ARTIFACT_NAME}-${VERSION}-${PLATFORM}.tar.gz"
+
+          if [ -n "$PACKAGE_COMMAND" ]; then
+            # Escape hatch: the consumer's command must write the finished
+            # tarball to $ARCHIVE. Run under strict mode so a mid-command
+            # failure aborts instead of leaving a partial/empty archive.
+            echo "Packaging via custom package-command."
+            ARCHIVE="$archive" bash -euo pipefail -c "$PACKAGE_COMMAND"
+          else
+            # Default: tar the artifact-paths out of the build dir (absolute
+            # $archive so the subshell cd doesn't affect where it's written).
+            # Unquoted on purpose — artifact-paths may hold several globs,
+            # expanded inside build-dir; a glob that matches nothing makes tar
+            # fail loudly rather than shipping an empty archive.
+            # shellcheck disable=SC2086
+            ( cd "$BUILD_DIR" && tar -czf "$archive" $ARTIFACT_PATHS )
+          fi
+
+          # A plain -s check is not enough: tarring an existing-but-empty dir
+          # yields a valid ~100-byte archive with zero files, which would ship
+          # a payload-less release green. Require at least one regular file
+          # (tar entries not ending in '/').
+          files=$(tar -tzf "$archive" 2>/dev/null | grep -cE '[^/]$' || true)
+          if [ ! -s "$archive" ] || [ "${files:-0}" -eq 0 ]; then
+            echo "::error::Package produced an archive with no files (matched ${files:-0}). Check artifact-paths='${ARTIFACT_PATHS}' against build-dir='${BUILD_DIR}'."
+            exit 1
+          fi
+          echo "Built $(basename "$archive") ($(wc -c < "$archive") bytes, ${files} files)."
+
+      - name: Attach artifact to draft release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ needs.resolve-version.outputs.tag }}
+        run: gh release upload "$TAG" dist/*.tar.gz --clobber
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}-${{ needs.resolve-version.outputs.version }}
+          path: ${{ '.' }}/dist/*.tar.gz
+
+  # Publishes the draft once every build leg has succeeded. If any leg failed
+  # or was cancelled, the release is left as a draft and this job fails, so the
+  # run is red and no half-built release ships. An empty matrix (all legs
+  # disabled) publishes tag-only.
+  finalize-release:
+    needs: [resolve-version, build-matrix, build-artifact]
+    if: ${{ always() && needs.resolve-version.result == 'success' }}
+    runs-on: ${{ 'ubuntu-latest' }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.DSS_PUBLIC_BOTS_APP_ID }}
+          private-key: ${{ secrets.DSS_PUBLIC_BOTS_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Publish release (or leave it a draft on build failure)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # This job has no `actions/checkout` — it only flips a draft flag via
+          # the API. Without a local `.git`, `gh` can't infer which repo to act
+          # on and `gh release edit` dies with "fatal: not a git repository".
+          # GH_REPO gives it that context explicitly. `github.repository` is the
+          # caller (consumer) repo, where resolve-version created the draft.
+          GH_REPO: ${{ github.repository }}
+          REL_TAG: ${{ needs.resolve-version.outputs.tag }}
+          MATRIX_EMPTY: ${{ needs.build-matrix.outputs.empty }}
+          BUILD_RESULT: ${{ needs.build-artifact.result }}
+        run: |
+          # build-artifact is a matrix job: its result is 'success' only if
+          # every leg succeeded (fail-fast:false → one failed leg makes it
+          # 'failure'); it is 'skipped' when the matrix was empty OR when
+          # build-matrix itself failed. The MATRIX_EMPTY guard separates them:
+          # a real empty matrix (MATRIX_EMPTY='true') publishes tag-only; any
+          # other skip leaves it unset and is treated as a failure.
+          if [ "$MATRIX_EMPTY" != "true" ] && [ "$BUILD_RESULT" != "success" ]; then
+            echo "::error::A build leg did not succeed (build-artifact=$BUILD_RESULT). Leaving $REL_TAG as a draft."
+            exit 1
+          fi
+
+          # Attach a SHA256SUMS manifest before publishing — end users verify their
+          # downloads against it. (The package-manager publish workflow computes its
+          # own sha256 per asset independently, so this file is a convenience, not
+          # load-bearing.) Non-fatal: a failure here still publishes the release.
+          if [ "$MATRIX_EMPTY" != "true" ]; then
+            rm -rf dl && mkdir -p dl
+            if gh release download "$REL_TAG" --dir dl --pattern '*.tar.gz' 2>/dev/null && ls dl/*.tar.gz >/dev/null 2>&1; then
+              if ( cd dl && sha256sum *.tar.gz > SHA256SUMS ) && gh release upload "$REL_TAG" dl/SHA256SUMS --clobber; then
+                echo "Attached SHA256SUMS."
+              else
+                echo "::warning::SHA256SUMS generation/upload failed (non-fatal); publishing without it."
+              fi
+            else
+              echo "::warning::no tarballs found to checksum; skipping SHA256SUMS."
+            fi
+          fi
+
+          gh release edit "$REL_TAG" --draft=false
+          echo "Published release $REL_TAG."
