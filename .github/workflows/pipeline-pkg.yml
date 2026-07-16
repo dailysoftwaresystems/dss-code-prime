@@ -353,14 +353,18 @@ jobs:
             exit 1
           fi
 
-          # Attach a SHA256SUMS manifest before publishing — the package-manager
-          # publish workflow (and end users) verify the tarballs against it.
+          # Attach a SHA256SUMS manifest before publishing — end users verify their
+          # downloads against it. (The package-manager publish workflow computes its
+          # own sha256 per asset independently, so this file is a convenience, not
+          # load-bearing.) Non-fatal: a failure here still publishes the release.
           if [ "$MATRIX_EMPTY" != "true" ]; then
             rm -rf dl && mkdir -p dl
             if gh release download "$REL_TAG" --dir dl --pattern '*.tar.gz' 2>/dev/null && ls dl/*.tar.gz >/dev/null 2>&1; then
-              ( cd dl && sha256sum *.tar.gz > SHA256SUMS )
-              gh release upload "$REL_TAG" dl/SHA256SUMS --clobber
-              echo "Attached SHA256SUMS."
+              if ( cd dl && sha256sum *.tar.gz > SHA256SUMS ) && gh release upload "$REL_TAG" dl/SHA256SUMS --clobber; then
+                echo "Attached SHA256SUMS."
+              else
+                echo "::warning::SHA256SUMS generation/upload failed (non-fatal); publishing without it."
+              fi
             else
               echo "::warning::no tarballs found to checksum; skipping SHA256SUMS."
             fi

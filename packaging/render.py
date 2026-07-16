@@ -7,7 +7,8 @@ Every `@NAME@` token in <template> is replaced with the value of the
 environment variable NAME. A placeholder whose variable is unset is a FATAL
 error (fail-loud) — a manifest silently missing its version or sha256 would
 ship a broken package. Keeps the manifests declarative and free of shell
-`${...}` clashes (Ruby/JSON/YAML all use `${}` themselves).
+`${...}` clashes (scoop's `$version`, nix's `${system}`, and the PKGBUILD's
+shell `${}` would otherwise collide).
 """
 import os
 import re
@@ -20,7 +21,8 @@ template_path, output_path = sys.argv[1], sys.argv[2]
 with open(template_path, "r", encoding="utf-8") as fh:
     text = fh.read()
 
-missing = sorted({m for m in re.findall(r"@([A-Z0-9_]+)@", text) if m not in os.environ})
+# Treat unset AND set-but-empty as missing — a blank version/sha would ship a broken package.
+missing = sorted({m for m in re.findall(r"@([A-Z0-9_]+)@", text) if not os.environ.get(m)})
 if missing:
     sys.exit(f"render.py: {template_path}: unset placeholder(s): {', '.join('@'+m+'@' for m in missing)}")
 

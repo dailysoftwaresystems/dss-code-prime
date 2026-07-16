@@ -70,6 +70,8 @@ terminal-panel settings — I can't set them for you.
 
 ## 4. Per-manager setup
 
+> Grouped by shared infra below (deb + rpm share Cloudsmith). Enable in the §1 recommended order, not top-to-bottom here.
+
 ### Homebrew (macOS + Linux)
 1. Create a repo **named `homebrew-dsscp`** (the `homebrew-` prefix is required by `brew tap`).
 2. Set `HOMEBREW_TAP_REPO`, `TAP_PUSH_TOKEN`, `ENABLE_HOMEBREW=true`.

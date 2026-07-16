@@ -41,7 +41,8 @@ permissions:
 jobs:
   # ── Resolve version/channel + fetch each release asset's sha256 ─────────────
   # Emits a `vars.env` artifact (KEY="VALUE" lines) that every publish job
-  # sources and feeds to packaging/render.py. Gated by the master switch, so a
+  # sources; the template jobs (homebrew/scoop/aur/nix/snap) feed it to
+  # packaging/render.py, deb/rpm feed it to fpm. Gated by the master switch, so a
   # skipped prepare skips every downstream job (they all `needs: prepare`).
   prepare:
     if: ${{ vars.ENABLE_PKG_PUBLISH == 'true' }}
@@ -77,6 +78,13 @@ jobs:
             *) echo "::error::version '$version' is not Major.Minor.Patch"; exit 1 ;;
           esac
 
+          # These two come from repo variables and get written into vars.env then
+          # later `source`d — reject shell metacharacters so a stray quote/$/backtick
+          # can't break the sourcing (repo-owner footgun, not attacker-controlled).
+          case "${MAINTAINER_VAR}${NIX_FLAKE_REPO}" in
+            *'"'*|*'`'*|*'$'*) echo "::error::PKG_MAINTAINER / NIX_FLAKE_REPO must not contain a quote, backtick, or dollar sign"; exit 1 ;;
+          esac
+
           base="https://github.com/${REPO}/releases/download/${tag}"
           {
             echo "VERSION=\"$version\""
@@ -85,6 +93,7 @@ jobs:
             echo "PKGNAME=\"$pkgname\""
             echo "CLASSNAME=\"$classname\""
             echo "DESCRIPTION=\"DSS Code Prime (dsscp): a config-driven, source/target/linker-agnostic C compiler\""
+            echo "SUMMARY=\"A config-driven, source/target/linker-agnostic C compiler\""
             echo "HOMEPAGE=\"https://github.com/${REPO}\""
             echo "REPO_DOWNLOAD_BASE=\"https://github.com/${REPO}/releases/download\""
             echo "LICENSE=\"Apache-2.0\""
@@ -148,7 +157,11 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "Formula/${PKGNAME}.rb"
-          git commit -m "dsscp ${VERSION} (${CHANNEL})" || { echo "no formula change"; exit 0; }
+          if git diff --cached --quiet; then
+            echo "::warning::rendered formula is byte-identical to the tap — nothing to publish (re-run of a published version?)."
+            exit 0
+          fi
+          git commit -m "dsscp ${VERSION} (${CHANNEL})"
           git push
 
   # ── Scoop bucket (Windows) ──────────────────────────────────────────────────
@@ -175,7 +188,11 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "${PKGNAME}.json"
-          git commit -m "dsscp ${VERSION} (${CHANNEL})" || { echo "no manifest change"; exit 0; }
+          if git diff --cached --quiet; then
+            echo "::warning::rendered manifest is byte-identical to the bucket — nothing to publish (re-run of a published version?)."
+            exit 0
+          fi
+          git commit -m "dsscp ${VERSION} (${CHANNEL})"
           git push
 
   # ── winget (Windows, stable only) ───────────────────────────────────────────
@@ -221,9 +238,11 @@ jobs:
       - uses: actions/download-artifact@v7
         with: { name: manifest-vars }
       - name: Render PKGBUILD
+        env:
+          AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          [ -n "${{ secrets.AUR_SSH_PRIVATE_KEY }}" ] || { echo "::error::set secret AUR_SSH_PRIVATE_KEY (the SSH key registered with your AUR account)"; exit 1; }
+          [ -n "$AUR_KEY" ] || { echo "::error::set secret AUR_SSH_PRIVATE_KEY (the SSH key registered with your AUR account)"; exit 1; }
           set -a; source vars.env; set +a
           mkdir -p aur
           python3 packaging/render.py packaging/aur/PKGBUILD.tmpl aur/PKGBUILD
@@ -261,7 +280,11 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add flake.nix
-          git commit -m "dsscp ${VERSION} (${CHANNEL})" || { echo "no flake change"; exit 0; }
+          if git diff --cached --quiet; then
+            echo "::warning::rendered flake is byte-identical to the flake repo — nothing to publish (re-run of a published version?)."
+            exit 0
+          fi
+          git commit -m "dsscp ${VERSION} (${CHANNEL})"
           git push
 
   # ── Debian/Ubuntu .deb (built with fpm, published to Cloudsmith) ────────────
@@ -288,7 +311,9 @@ jobs:
             rm -rf stage pkg; mkdir -p stage/usr/bin stage/usr/lib pkg
             curl -fSL --retry 3 -o t.tgz "$url"; tar -xzf t.tgz
             install -Dm755 bin/dss/dsscp stage/usr/bin/dsscp
-            for l in bin/dss/*.so bin/dss/*.so.*; do [ -e "$l" ] && install -Dm644 "$l" "stage/usr/lib/$(basename "$l")"; done
+            shopt -s nullglob; libs=(bin/dss/*.so bin/dss/*.so.*); shopt -u nullglob
+            [ ${#libs[@]} -gt 0 ] || { echo "::error::no shared lib matched bin/dss/*.so from $url — would ship dsscp with no runtime lib"; exit 1; }
+            for l in "${libs[@]}"; do install -Dm644 "$l" "stage/usr/lib/$(basename "$l")"; done
             fpm -s dir -t deb -n "$PKGNAME" -v "$VERSION" -a "$deb_arch" -p "pkg/" \
               --license "$LICENSE" --description "$DESCRIPTION" --url "$HOMEPAGE" --maintainer "$MAINTAINER" \
               -C stage .
@@ -322,7 +347,9 @@ jobs:
             rm -rf stage pkg; mkdir -p stage/usr/bin stage/usr/lib pkg
             curl -fSL --retry 3 -o t.tgz "$url"; tar -xzf t.tgz
             install -Dm755 bin/dss/dsscp stage/usr/bin/dsscp
-            for l in bin/dss/*.so bin/dss/*.so.*; do [ -e "$l" ] && install -Dm644 "$l" "stage/usr/lib/$(basename "$l")"; done
+            shopt -s nullglob; libs=(bin/dss/*.so bin/dss/*.so.*); shopt -u nullglob
+            [ ${#libs[@]} -gt 0 ] || { echo "::error::no shared lib matched bin/dss/*.so from $url — would ship dsscp with no runtime lib"; exit 1; }
+            for l in "${libs[@]}"; do install -Dm644 "$l" "stage/usr/lib/$(basename "$l")"; done
             fpm -s dir -t rpm -n "$PKGNAME" -v "$VERSION" -a "$rpm_arch" -p "pkg/" \
               --license "$LICENSE" --description "$DESCRIPTION" --url "$HOMEPAGE" --maintainer "$MAINTAINER" \
               -C stage .
@@ -341,9 +368,11 @@ jobs:
       - uses: actions/download-artifact@v7
         with: { name: manifest-vars }
       - name: Guard + render snapcraft.yaml
+        env:
+          SNAP_CREDS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
         run: |
           set -euo pipefail
-          [ -n "${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}" ] || { echo "::error::set secret SNAPCRAFT_STORE_CREDENTIALS (snapcraft export-login output)"; exit 1; }
+          [ -n "$SNAP_CREDS" ] || { echo "::error::set secret SNAPCRAFT_STORE_CREDENTIALS (snapcraft export-login output)"; exit 1; }
           set -a; source vars.env; set +a
           mkdir -p snap
           python3 packaging/render.py packaging/snap/snapcraft.yaml.tmpl snap/snapcraft.yaml
