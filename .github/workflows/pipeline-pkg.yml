@@ -5,8 +5,11 @@ name: Package
 # lives in a private/internal repository, so the logic is vendored here. Keep in
 # sync with dailysoftwaresystems/DSS.DevOps. Settings baked from the former caller
 # inputs: run-macos + run-linux-arm64 ON, artifact-paths = bin, cmake-version =
-# latest, artifact-name = dsscp (the shipped command name; the repo/project name
-# stays dss-code-prime — project name != command name, like Ziglang/`zig`).
+# latest, artifact-name = dsscp — the release-tarball brand and the INTENDED CLI
+# command name. The repo/project stays dss-code-prime, and the binary INSIDE the
+# tarball is still built as dss-code-prime until the CMake-target rename lands, so
+# the tarball and the executable names are briefly out of sync by design (project
+# name != command name, like Ziglang/`zig`).
 #
 # Flow (immutable-release-safe): create a DRAFT release, build the shippable
 # artifact on each platform leg in parallel and attach it to the draft, then
