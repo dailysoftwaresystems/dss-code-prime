@@ -73,6 +73,7 @@ std::optional<TypeKind> coreTypeFromName(std::string_view name) {
     if (name == "F16")     return TypeKind::F16;
     if (name == "F32")     return TypeKind::F32;
     if (name == "F64")     return TypeKind::F64;
+    if (name == "F80")     return TypeKind::F80;   // x87 80-bit (D-CSUBSET-LONG-DOUBLE)
     if (name == "F128")    return TypeKind::F128;
     if (name == "Char")    return TypeKind::Char;
     if (name == "Byte")    return TypeKind::Byte;
@@ -4168,6 +4169,18 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // conditional-group state machine with the direct definedness path.
             readOptWord("elifdefDirective",       cfg.elifdefDirective);
             readOptWord("elifndefDirective",      cfg.elifndefDirective);
+            // FC17.9(h) (`#embed` / `__has_embed`; C23 6.10.4 / 6.10.1): the
+            // directive + operator WORDS (matched by lexeme TEXT, like the
+            // conditional words). OPTIONAL -- absent leaves both empty so an
+            // `#embed` line falls through to the unsupported-directive fail-loud
+            // and `__has_embed` folds to an ordinary identifier. NO angle-token
+            // self-consistency rule is imposed (unlike `hasIncludeOperator`): the
+            // `#embed`/`__has_embed` angle form is a deferred loud wall
+            // (D-PP-EMBED-ANGLE), so `hasEmbedOperator` reuses the existing
+            // `hasIncludeAngle*` KINDS only to recognise-and-reject an angle
+            // argument at runtime; see the field doc in preprocess_config.hpp.
+            readOptWord("embedDirective",         cfg.embedDirective);
+            readOptWord("hasEmbedOperator",       cfg.hasEmbedOperator);
             // FC15c (make-or-break agnosticism): the angle-delimiter token KINDS
             // for `__has_include(<h>)`. OPTIONAL token-name fields (validated like
             // `stringizeToken`). The make-or-break SELF-CONSISTENCY rule: a
@@ -4356,6 +4369,60 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         continue;
                     }
                     out.emplace(*dm, *core);
+                }
+                return ok;
+            };
+
+            // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the optional
+            // `coreByLongDoubleFormat` sub-object ({"x87-80": "F80",
+            // "ieee128": "F128"}) on `typeSpecifiers` rows — the per-axis
+            // sibling of `coreByDataModel` above, with the same closed-key
+            // discipline: every key must be a registered LongDoubleFormat
+            // spelling and every value a core TypeKind (a typo'd axis name
+            // would otherwise silently never override — the knob-that-lies).
+            // Returns false when anything was rejected.
+            auto const readCoreByLongDoubleFormat =
+                [&](json const& entry, std::string const& path,
+                    std::unordered_map<LongDoubleFormat, TypeKind>& out) -> bool {
+                if (!entry.contains("coreByLongDoubleFormat")) return true;
+                auto const& obj = entry.at("coreByLongDoubleFormat");
+                if (!obj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              path + "/coreByLongDoubleFormat",
+                              "'coreByLongDoubleFormat' must be an object mapping "
+                              "long-double-format names to core TypeKinds");
+                    return false;
+                }
+                bool ok = true;
+                for (auto const& [key, val] : obj.items()) {
+                    auto const lf = longDoubleFormatFromName(key);
+                    if (!lf) {
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  path + "/coreByLongDoubleFormat/" + key,
+                                  std::format("unknown longDoubleFormat '{}' "
+                                              "(expected one of 'f64', 'x87-80', "
+                                              "'ieee128')", key));
+                        ok = false;
+                        continue;
+                    }
+                    if (!val.is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  path + "/coreByLongDoubleFormat/" + key,
+                                  "long-double-format override must be a core "
+                                  "TypeKind name string");
+                        ok = false;
+                        continue;
+                    }
+                    auto const core = parseCore(val.get<std::string>());
+                    if (!core) {
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  path + "/coreByLongDoubleFormat/" + key,
+                                  std::format("unknown core TypeKind '{}'",
+                                              val.get<std::string>()));
+                        ok = false;
+                        continue;
+                    }
+                    out.emplace(*lf, *core);
                 }
                 return ok;
             };
@@ -6712,12 +6779,16 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         for (auto const& [key, _] : entry.items()) {
                             if (key != "tokens" && key != "core"
                                 && key != "coreByDataModel"
+                                && key != "coreByLongDoubleFormat"
+                                && key != "complex"
                                 && key.rfind("$", 0) != 0) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           path + "/" + key,
                                           std::format("unknown 'typeSpecifiers' field "
                                                       "'{}' — expected 'tokens', 'core', "
-                                                      "or 'coreByDataModel'", key));
+                                                      "'coreByDataModel', "
+                                                      "'coreByLongDoubleFormat', or "
+                                                      "'complex'", key));
                             }
                         }
                         if (!entry.contains("tokens") || !entry.at("tokens").is_array()
@@ -6767,6 +6838,22 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         rule.core = *k;
                         if (!readCoreByDataModel(entry, path, rule.coreByDataModel)) {
                             continue;
+                        }
+                        if (!readCoreByLongDoubleFormat(entry, path,
+                                                        rule.coreByLongDoubleFormat)) {
+                            continue;
+                        }
+                        // C99 _Complex (D-CSUBSET-COMPLEX): the optional `complex`
+                        // flag — the resolved element core is wrapped in
+                        // interner.complex() at the specifier-resolve site.
+                        if (entry.contains("complex")) {
+                            if (!entry.at("complex").is_boolean()) {
+                                coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                          path + "/complex",
+                                          "'complex' must be a boolean");
+                                continue;
+                            }
+                            rule.complex = entry.at("complex").get<bool>();
                         }
                         // Canonicalize: sort the (kind, name) pairs by kind id
                         // so lookup is order-free (C's specifier multiset).
@@ -6879,6 +6966,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             if (same) {
                                 out.core            = row.core;
                                 out.coreByDataModel = row.coreByDataModel;
+                                // FC17.9(e): copy the long-double axis map —
+                                // dropping it here would silently type the
+                                // "long double" LITERAL rule at the base core.
+                                out.coreByLongDoubleFormat =
+                                    row.coreByLongDoubleFormat;
                                 return true;
                             }
                         }
@@ -7153,10 +7245,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         [](DataModelTypeRef const& r) -> bool {
                         auto const isFlt = [](TypeKind k) noexcept {
                             return k == TypeKind::F16 || k == TypeKind::F32
-                                || k == TypeKind::F64 || k == TypeKind::F128;
+                                || k == TypeKind::F64 || k == TypeKind::F80
+                                || k == TypeKind::F128;
                         };
                         if (!isFlt(r.core)) return false;
                         for (auto const& [_, k] : r.coreByDataModel) {
+                            if (!isFlt(k)) return false;
+                        }
+                        // FC17.9(e): the long-double axis overrides must be
+                        // float kinds too (F80/F128 — a non-float override
+                        // would mis-type every `l`/`L` literal on that axis).
+                        for (auto const& [_, k] : r.coreByLongDoubleFormat) {
                             if (!isFlt(k)) return false;
                         }
                         return true;
@@ -7432,7 +7531,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     auto const promotable = [](TypeKind k) noexcept {
                                         return k != TypeKind::Void
                                             && k != TypeKind::F16 && k != TypeKind::F32
-                                            && k != TypeKind::F64 && k != TypeKind::F128;
+                                            && k != TypeKind::F64 && k != TypeKind::F80
+                                            && k != TypeKind::F128;
                                     };
                                     bool good = promotable(ref.core);
                                     for (auto const& [_, k2] : ref.coreByDataModel) {
@@ -8452,6 +8552,34 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── inlineAsmRule (FC17.9(i), D-CSUBSET-INLINE-ASM) ──
+            // A single OPTIONAL top-level rule reference: the `__asm__` inline-asm
+            // statement shape (asmStmt). Pass 2 decodes its template child + emits
+            // S_InlineAsmNonEmptyTemplate unless it decodes to strictly zero bytes.
+            // Absent ⇒ the language has no inline-asm surface (the check never runs).
+            // A present-but-bad value (not a string, or an unknown shape) emits +
+            // fails the load — a typo can never silently disarm the non-empty guard.
+            if (sem.contains("inlineAsmRule")) {
+                if (!sem.at("inlineAsmRule").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/inlineAsmRule",
+                              "'semantics.inlineAsmRule' must be a string");
+                } else {
+                    cfg.inlineAsmRuleName =
+                        sem.at("inlineAsmRule").get<std::string>();
+                    if (!data.rules->contains(cfg.inlineAsmRuleName)) {
+                        coll.emit(DiagnosticCode::C_UnknownShape,
+                                  "/semantics/inlineAsmRule",
+                                  std::format("'inlineAsmRule' references unknown "
+                                              "shape '{}'", cfg.inlineAsmRuleName));
+                        cfg.inlineAsmRuleName.clear();
+                    } else {
+                        cfg.inlineAsmRule =
+                            data.rules->find(cfg.inlineAsmRuleName);
+                    }
+                }
+            }
+
             // ── generic (FC16 C11/C23 6.5.1.1, D-CSUBSET-GENERIC-SELECTION) ──
             // `{ rule, controlChild, assocRule, typedAssocRule, defaultAssocRule }`
             // — `_Generic` generic selection. Pass 2 resolves the controlling
@@ -8922,6 +9050,31 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                               "token kind '{}'", name));
                     } else {
                         cfg.volatileMarker = data.schemaTokens->find(name);
+                    }
+                }
+            }
+
+            // ── atomicMarker (FC17.9(d) cycle 1b, D-CSUBSET-ATOMIC) ──
+            // An OPTIONAL token: the language's `_Atomic`-class type qualifier. The
+            // LIVE driver of the atomic qualifier wrap — read by the type-position
+            // resolver's CO-LOCATED base arm + declaratorDeclaredType's east arm to
+            // wrap the resolved type via `atomicQualified`, EXACTLY parallel to
+            // `volatileMarker` above. Same validation shape.
+            if (sem.contains("atomicMarker")) {
+                json const& tok = sem.at("atomicMarker");
+                if (!tok.is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/atomicMarker",
+                              "'atomicMarker' must be a string");
+                } else {
+                    auto const name = tok.get<std::string>();
+                    if (!data.schemaTokens->contains(name)) {
+                        coll.emit(DiagnosticCode::C_UnknownToken,
+                                  "/semantics/atomicMarker",
+                                  std::format("'atomicMarker' references unknown "
+                                              "token kind '{}'", name));
+                    } else {
+                        cfg.atomicMarker = data.schemaTokens->find(name);
                     }
                 }
             }

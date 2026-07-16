@@ -78,4 +78,54 @@ dataModelFromName(std::string_view s) noexcept {
     return std::nullopt;
 }
 
+// ── Long-double format (FC17.9(e), D-CSUBSET-LONG-DOUBLE): the per-format
+// `long double` representation axis ────────────────────────────────────────
+//
+// `long double` is the ONE C primitive whose FORMAT (not just width) is
+// ABI-divergent per OS/format: 64-bit IEEE (MSVC pe64 + Apple arm64), x87
+// 80-bit extended (SysV x86_64 + darwin-x86_64), IEEE binary128 (AAPCS64
+// linux-arm64). Like `DataModel` it is a property of the OBJECT FORMAT (the
+// same x86_64 target serves pe64's f64 AND elf64's x87-80), declared as an
+// OPTIONAL `"longDoubleFormat"` field on `.format.json` (closed enum, loader
+// fails loud on an unknown spelling; the bitFieldStrategy optional-field
+// precedent). Consumed by the SEMANTIC tier: the per-language
+// `coreByLongDoubleFormat` row overrides (typeSpecifiers + the float-literal
+// ladder's load-resolved refs) resolve `long double` to its per-axis core
+// (f64 → F64, x87-80 → F80, ieee128 → F128).
+//
+// **`None` is the UNDECLARED sentinel, never a silent fallback**: a row that
+// carries a `coreByLongDoubleFormat` map is UNREALIZED under a None axis
+// (wasm/spirv skeletons + direct-API callers) — resolving it emits
+// S_LongDoubleFormatUndeclared rather than quietly binding the base core
+// (the knob-that-lies / LLP64-`long` lesson). Non-long-double programs are
+// untouched (the row stays dormant).
+enum class LongDoubleFormat : std::uint8_t {
+    None    = 0,  // format declares no axis — `long double` rows unrealized
+    F64     = 1,  // 64-bit IEEE double (MSVC x64, Apple arm64) — ≡ `double`
+    X87_80  = 2,  // x87 80-bit extended, 16/16 storage (SysV/darwin x86_64)
+    Ieee128 = 3,  // IEEE binary128, 16/16 (AAPCS64 linux-arm64)
+};
+
+// Hand-rolled name pair (not EnumNameTable) — same include-cycle constraint
+// as dataModelName above. `None` deliberately has NO JSON spelling: omission
+// is the only way to leave the axis undeclared (a spellable "none" would let
+// a typo'd config look deliberate).
+[[nodiscard]] constexpr std::string_view
+longDoubleFormatName(LongDoubleFormat f) noexcept {
+    switch (f) {
+        case LongDoubleFormat::None:    return {};
+        case LongDoubleFormat::F64:     return "f64";
+        case LongDoubleFormat::X87_80:  return "x87-80";
+        case LongDoubleFormat::Ieee128: return "ieee128";
+    }
+    return {};
+}
+[[nodiscard]] constexpr std::optional<LongDoubleFormat>
+longDoubleFormatFromName(std::string_view s) noexcept {
+    if (s == "f64")     return LongDoubleFormat::F64;
+    if (s == "x87-80")  return LongDoubleFormat::X87_80;
+    if (s == "ieee128") return LongDoubleFormat::Ieee128;
+    return std::nullopt;
+}
+
 } // namespace dss

@@ -47,11 +47,16 @@ namespace detail::type_rules {
 }
 
 [[nodiscard]] inline constexpr int floatRank(TypeKind k) noexcept {
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): F64 < F80 < F128 — C 6.3.1.8 ranks
+    // long double above double whichever format realizes it. Renumbered IN
+    // LOCKSTEP with type_lattice.cpp's floatRank (a divergence is silent
+    // wrong UAC).
     switch (k) {
         case TypeKind::F16:  return 1;
         case TypeKind::F32:  return 2;
         case TypeKind::F64:  return 3;
-        case TypeKind::F128: return 4;
+        case TypeKind::F80:  return 4;
+        case TypeKind::F128: return 5;
         default:             return 0;
     }
 }
@@ -223,6 +228,22 @@ namespace detail::type_rules {
     if (floatRank(lk) != 0 && floatRank(rk) != 0) {
         return floatRank(rk) <= floatRank(lk);
     }
+    // C99 _Complex (D-CSUBSET-COMPLEX §6.3.1.7/§6.5.16.1, D8): a real OR a
+    // differently-elemented complex is assignable INTO a complex lhs — real->complex
+    // constructs (v, 0); complex->complex element-converts. A complex rhs into a REAL
+    // lhs is NOT implicitly assignable (the imaginary part is discarded only on an
+    // EXPLICIT cast — an implicit complex->real is a constraint violation → loud).
+    // UNGATED shape admission: Complex only ever appears in a `_Complex`-declaring
+    // schema, so this is inert elsewhere (the coerce `isArithmeticCore`-BitInt
+    // precedent). The identical-type case already returned via `sameType` above.
+    if (lk == TypeKind::Complex) {
+        if (rk == TypeKind::Complex) return true;   // element-convert
+        return floatRank(rk) != 0 || signedIntRank(rk) != 0
+            || unsignedIntRank(rk) != 0 || rk == TypeKind::Bool
+            || rk == TypeKind::Char;                // a real constructs (v, 0)
+    }
+    // (a complex rhs into a non-complex lhs is NOT admitted here → falls through to
+    //  the loud reject; the explicit complex->real cast lives in isExplicitCastable.)
     // C 6.3.1.4 / 6.5.16.1 (D-CSUBSET-INT-FLOAT-CONVERSION, int→float): an integer
     // value is implicitly assignable to a floating lhs — `double d = 5;`,
     // `f(anInt)` to a `double` param (the sqlite `kahanBabuskaNeumaierStep(pSum,
@@ -555,6 +576,14 @@ namespace detail::type_rules {
         return isCastableInt(k) || detail::type_rules::floatRank(k) != 0;
     };
     if (isCastableScalar(tk) && isCastableScalar(ok)) return true;
+    // C99 _Complex (D-CSUBSET-COMPLEX §6.3.1.7, D8): explicit casts to/from a complex.
+    // `(double _Complex)x` constructs (x, 0); `(float _Complex)z` element-converts;
+    // `(int)z` / `(double)z` discards the imaginary part → the real component. So a
+    // complex is explicit-castable against any complex OR any castable scalar, both
+    // directions.
+    if (tk == TypeKind::Complex
+        && (ok == TypeKind::Complex || isCastableScalar(ok))) return true;
+    if (ok == TypeKind::Complex && isCastableScalar(tk)) return true;
     if (tk == TypeKind::Ptr && ok == TypeKind::Ptr)   return true;
     // c37 (D-CSUBSET-FUNCTION-DESIGNATOR-CAST) C 6.3.2.1p4 + 6.3.2.3p8: a
     // function DESIGNATOR (FnSig) decays to the function's ADDRESS, so a cast
@@ -857,6 +886,24 @@ usualArithmeticCommonType(TypeInterner& interner, TypeId a, TypeId b,
         }
         return false;
     };
+    // C99 _Complex (D-CSUBSET-COMPLEX §6.3.1.8): if EITHER operand is complex, the
+    // result is complex over the WIDER float element. A real operand contributes its
+    // own float rank as the element (`complex(F32) + double` → `complex(F64)`); a real
+    // INTEGER operand takes the complex's element (it converts to that real type
+    // first). MUST precede the float-pair check below (floatRank(Complex)==0, so
+    // `complex + double` would otherwise misfire into the InvalidType arm). D7.
+    if (ka == TypeKind::Complex || kb == TypeKind::Complex) {
+        TypeId const ea = ka == TypeKind::Complex ? interner.complexElement(a) : a;
+        TypeId const eb = kb == TypeKind::Complex ? interner.complexElement(b) : b;
+        int const rea = floatRank(interner.kind(ea));
+        int const reb = floatRank(interner.kind(eb));
+        TypeId elem;
+        if (rea != 0 && reb != 0) elem = rea >= reb ? ea : eb;
+        else if (rea != 0)        elem = ea;   // e.g. complex(F64) + int → element F64
+        else if (reb != 0)        elem = eb;
+        else                      return InvalidType;   // neither element is a float
+        return interner.complex(elem);
+    }
     int const fa = floatRank(ka);
     int const fb = floatRank(kb);
     if (fa != 0 || fb != 0) {

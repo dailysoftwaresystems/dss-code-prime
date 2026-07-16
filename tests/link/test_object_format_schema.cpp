@@ -138,6 +138,60 @@ TEST(ObjectFormatSchemaLoader, UnknownKindRejected) {
     ASSERT_FALSE(r.has_value());
 }
 
+// ── FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the optional `longDoubleFormat` axis ──
+
+TEST(ObjectFormatSchemaLoader, LongDoubleFormatParsesClosedSet) {
+    // Each valid spelling loads and is exposed via the accessor.
+    struct Row { char const* spelling; LongDoubleFormat expected; };
+    for (Row const row : {Row{"f64", LongDoubleFormat::F64},
+                          Row{"x87-80", LongDoubleFormat::X87_80},
+                          Row{"ieee128", LongDoubleFormat::Ieee128}}) {
+        std::string json{kElfMinimal};
+        json.insert(json.rfind('}'),
+                    std::string{",\"longDoubleFormat\":\""} + row.spelling + "\"");
+        auto r = ObjectFormatSchema::loadFromText(json);
+        ASSERT_TRUE(r.has_value()) << row.spelling;
+        EXPECT_EQ((*r)->longDoubleFormat(), row.expected) << row.spelling;
+    }
+    // Omission = None (the honest undeclared state — wasm/spirv).
+    auto r = ObjectFormatSchema::loadFromText(kElfMinimal);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->longDoubleFormat(), LongDoubleFormat::None);
+}
+
+TEST(ObjectFormatSchemaLoader, UnknownLongDoubleFormatRejected) {
+    // A typo'd spelling must be a HARD reject — silently un-declaring the
+    // axis would turn every `long double` on the format into a spurious
+    // S_LongDoubleFormatUndeclared (the knob-that-lies).
+    std::string json{kElfMinimal};
+    json.insert(json.rfind('}'), ",\"longDoubleFormat\":\"x87\"");
+    EXPECT_FALSE(ObjectFormatSchema::loadFromText(json).has_value());
+}
+
+TEST(ObjectFormatSchemaLoader, ShippedFormatsDeclareTheAbiTruthTable) {
+    // The §1 ABI truth table, pinned against the shipped JSONs: pe64 + apple
+    // arm64 = f64 (long double IS double); SysV/darwin x86_64 = x87-80;
+    // linux arm64 = ieee128; wasm/spirv OMIT (None — declared-only formats).
+    struct Row { char const* name; LongDoubleFormat expected; };
+    for (Row const row : {
+             Row{"pe64-x86_64-windows-exec", LongDoubleFormat::F64},
+             Row{"pe64-x86_64-windows", LongDoubleFormat::F64},
+             Row{"macho64-arm64-darwin-exec", LongDoubleFormat::F64},
+             Row{"macho64-arm64-darwin", LongDoubleFormat::F64},
+             Row{"macho64-x86_64-darwin-exec", LongDoubleFormat::X87_80},
+             Row{"macho64-x86_64-darwin", LongDoubleFormat::X87_80},
+             Row{"elf64-x86_64-linux-exec", LongDoubleFormat::X87_80},
+             Row{"elf64-x86_64-linux", LongDoubleFormat::X87_80},
+             Row{"elf64-aarch64-linux-exec", LongDoubleFormat::Ieee128},
+             Row{"elf64-aarch64-linux", LongDoubleFormat::Ieee128},
+             Row{"wasm32-v1", LongDoubleFormat::None},
+             Row{"spirv-1.6", LongDoubleFormat::None}}) {
+        auto r = ObjectFormatSchema::loadShipped(row.name);
+        ASSERT_TRUE(r.has_value()) << row.name;
+        EXPECT_EQ((*r)->longDoubleFormat(), row.expected) << row.name;
+    }
+}
+
 TEST(ObjectFormatSchemaLoader, DuplicateRelocationNameRejected) {
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,

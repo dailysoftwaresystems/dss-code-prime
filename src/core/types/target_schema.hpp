@@ -282,6 +282,10 @@ targetRegClassFromName(std::string_view s) noexcept {
         case TypeKind::F16:
         case TypeKind::F32:
         case TypeKind::F64:
+        // F80 (D-CSUBSET-LONG-DOUBLE): FPR like every float — LOAD-BEARING for
+        // the encoded-width wall (a GPR default would bypass the whole FPR
+        // fail-loud tier and silently integer-plumb an x87 value).
+        case TypeKind::F80:
         case TypeKind::F128:
             return TargetRegClass::FPR;
         case TypeKind::Vector:

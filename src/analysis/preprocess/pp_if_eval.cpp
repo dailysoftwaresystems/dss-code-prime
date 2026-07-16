@@ -99,7 +99,7 @@ struct LiteralKinds {
         }
         TypeKind const k = m.core;
         if (k == TypeKind::F16 || k == TypeKind::F32 || k == TypeKind::F64
-            || k == TypeKind::F128) {
+            || k == TypeKind::F80 || k == TypeKind::F128) {
             lk.floating.insert(tok);
         } else {
             // Char / I8 / U8 / Bool / I16 / I32 / ... -> integer literal.
@@ -663,7 +663,8 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                      PpHasInclude const&    hasInclude,
                      SourceBuffer const&    synth,
                      PpProductText const&   productText,
-                     DiagnosticReporter&    rep) {
+                     DiagnosticReporter&    rep,
+                     PpHasEmbed const&      hasEmbed) {
     LiteralKinds const lits = gatherLiteralKinds(schema);
 
     PreprocessConfig const& pp = schema.preprocess();
@@ -680,6 +681,10 @@ evaluateIfExpression(std::span<Token const> operandTokens,
     // (`"` -> StringStart) for the quote form is `quoteIncludeToken`.
     std::string const& hasIncludeKw = pp.hasIncludeOperator;
     std::string const& hasCAttrKw   = pp.hasCAttributeOperator;
+    // FC17.9(h): `__has_embed` reuses the SAME angle-delimiter KINDS + quote
+    // opener as `__has_include` (they are the language's angle/quote vocabulary),
+    // matched by KIND never the `<`/`>`/`"` bytes.
+    std::string const& hasEmbedKw   = pp.hasEmbedOperator;
     SchemaTokenId const angleOpen =
         schema.schemaTokens().find(pp.hasIncludeAngleOpenToken);
     SchemaTokenId const angleClose =
@@ -724,6 +729,15 @@ evaluateIfExpression(std::span<Token const> operandTokens,
     // operator token, a DISTINCT code -- never a generic ICE fallthrough).
     auto failHasInclude = [&](SourceSpan span, std::string msg) {
         emit(rep, DiagnosticCode::P_PreprocessorHasInclude, synth.id(), span,
+             std::move(msg));
+        rewriteFailed = true;
+    };
+    // FC17.9(h) fail-loud helper for a malformed `__has_embed` (positioned on the
+    // operator token; the DISTINCT P_PreprocessorEmbed code -- never a generic ICE
+    // fallthrough). An UNSUPPORTED PARAMETER is NOT a malformed shape -- it mints
+    // NOT_FOUND(0) per C23, so it never routes here.
+    auto failHasEmbed = [&](SourceSpan span, std::string msg) {
+        emit(rep, DiagnosticCode::P_PreprocessorEmbed, synth.id(), span,
              std::move(msg));
         rewriteFailed = true;
     };
@@ -816,6 +830,118 @@ evaluateIfExpression(std::span<Token const> operandTokens,
             ++j;
             bool const found = hasInclude && hasInclude(filename, isAngle);
             afterDefined.push_back(mintNumber(found ? 1 : 0));
+            i = j;
+            continue;
+        }
+
+        // ── FC17.9(h): `__has_embed(<r>)` / `__has_embed("r")` (C23 6.10.1).
+        // Mirror the `__has_include` extraction (operand NOT macro-expanded; the
+        // angle delimiters + quote opener matched by CONFIG token KIND), but mint
+        // the C23 TRICHOTOMY 0/1/2 via the `hasEmbed` callback, and treat ANY
+        // token between the resource and the operator's `)` as an unsupported
+        // PARAMETER clause -> NOT_FOUND(0) (the C23 feature-probe contract: "not
+        // found OR at least one parameter unsupported" -- NOT an error; the value
+        // IS the signal, so a guarded `#embed` correctly never runs;
+        // D-PP-EMBED-PARAMS). Malformed shapes (no `(`, empty name, unterminated)
+        // fail loud P_PreprocessorEmbed. ──
+        if (isWordTok(t) && !hasEmbedKw.empty() && word == hasEmbedKw) {
+            std::size_t j = skipFwd(i + 1);
+            if (j >= operandTokens.size() || !openParen.valid()
+                || operandTokens[j].schemaKind != openParen) {
+                failHasEmbed(t.span,
+                    "operator '__has_embed' requires a parenthesized resource");
+                break;
+            }
+            j = skipFwd(j + 1);
+            std::string filename;
+            bool isAngle = false;
+            if (j < operandTokens.size() && angleOpen.valid()
+                && operandTokens[j].schemaKind == angleOpen) {
+                // ANGLE form `<r>`: accumulate the raw bytes between the angle
+                // delimiters (matched by KIND). The angle form is a loud deferral
+                // (D-PP-EMBED-ANGLE) at the DIRECTIVE; the operator recognises it
+                // only so the callback can answer 0 (NOT_FOUND) truthfully.
+                isAngle = true;
+                std::size_t k = j + 1;
+                ByteOffset const innerStart = operandTokens[j].span.end();
+                bool sawAngleClose = false;
+                ByteOffset innerEnd = innerStart;
+                for (; k < operandTokens.size(); ++k) {
+                    if (angleClose.valid()
+                        && operandTokens[k].schemaKind == angleClose) {
+                        sawAngleClose = true;
+                        break;
+                    }
+                    innerEnd = operandTokens[k].span.end();
+                }
+                if (!sawAngleClose) {
+                    failHasEmbed(t.span,
+                        "expected '>' to close '__has_embed(<...'");
+                    break;
+                }
+                if (innerEnd > innerStart) {
+                    filename = std::string{
+                        synth.slice(SourceSpan::of(innerStart, innerEnd))};
+                }
+                j = k + 1;
+            } else if (j < operandTokens.size() && stringOpen.valid()
+                       && operandTokens[j].schemaKind == stringOpen) {
+                // QUOTE form `"r"`: the coalesced StringLiteral BODY is the
+                // adjacent next token; its raw text is the resource name (escapes
+                // NOT decoded, like the include/embed resolver). An empty body
+                // (`""`) leaves the name empty -> loud below.
+                std::size_t k = j + 1;
+                if (k < operandTokens.size() && !isTriviaTok(operandTokens[k])
+                    && operandTokens[k].span.start()
+                           == operandTokens[j].span.end()) {
+                    filename = std::string{synth.slice(operandTokens[k].span)};
+                    ++k;
+                }
+                j = k;
+            } else {
+                failHasEmbed(t.span,
+                    "operator '__has_embed' requires <resource> or \"resource\"");
+                break;
+            }
+            if (filename.empty()) {
+                failHasEmbed(t.span,
+                    "operator '__has_embed' has an empty resource name");
+                break;
+            }
+            // Scan to the operator's matching close paren, paren-DEPTH-aware (a
+            // parameter like `limit(1)` nests its own parens). ANY significant
+            // token before the depth-0 close paren is an unsupported parameter
+            // clause -> NOT_FOUND(0). An unterminated operator fails loud.
+            bool hasParams = false;
+            bool sawClose  = false;
+            int  depth     = 0;
+            std::size_t k = skipFwd(j);
+            for (; k < operandTokens.size(); ++k) {
+                Token const& u = operandTokens[k];
+                if (isTriviaTok(u)) continue;
+                if (openParen.valid() && u.schemaKind == openParen) {
+                    hasParams = true;
+                    ++depth;
+                    continue;
+                }
+                if (closeParen.valid() && u.schemaKind == closeParen) {
+                    if (depth == 0) { sawClose = true; break; }
+                    --depth;
+                    continue;
+                }
+                hasParams = true;   // any other significant token = a parameter
+            }
+            if (!sawClose) {
+                failHasEmbed(t.span, "expected ')' to close '__has_embed('");
+                break;
+            }
+            j = k + 1;   // past the operator's close paren
+            // C23: any unsupported parameter -> NOT_FOUND(0); else resolve the
+            // trichotomy via the callback (null-tolerant -> 0 = NOT_FOUND).
+            int const v = hasParams
+                ? 0
+                : (hasEmbed ? hasEmbed(filename, isAngle, t.span) : 0);
+            afterDefined.push_back(mintNumber(v));
             i = j;
             continue;
         }

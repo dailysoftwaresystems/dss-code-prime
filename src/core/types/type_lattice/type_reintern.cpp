@@ -30,6 +30,7 @@ namespace {
         case TypeKind::F16:       return "F16";
         case TypeKind::F32:       return "F32";
         case TypeKind::F64:       return "F64";
+        case TypeKind::F80:       return "F80";
         case TypeKind::F128:      return "F128";
         case TypeKind::Char:      return "Char";
         case TypeKind::Byte:      return "Byte";
@@ -54,6 +55,7 @@ namespace {
         case TypeKind::VolatileQual: return "VolatileQual";
         case TypeKind::NullptrT:  return "NullptrT";
         case TypeKind::BitInt:    return "BitInt";
+        case TypeKind::Complex:   return "Complex";
         case TypeKind::Count_:    return "Count_";
     }
     return "<unknown>";
@@ -78,7 +80,7 @@ namespace {
         case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
         case TypeKind::U64: case TypeKind::U128:
         case TypeKind::F16: case TypeKind::F32: case TypeKind::F64:
-        case TypeKind::F128:
+        case TypeKind::F80: case TypeKind::F128:
         case TypeKind::Char: case TypeKind::Byte: case TypeKind::Void:
         // C23 nullptr_t: an operand-less scalar kind — reinterns via the
         // `dst.primitive(kind)` arm (mirrored in the rebuild switch below).
@@ -108,16 +110,19 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
     // round-trip). The raw kind preserves VolatileQual so the wrapper round-trips.
     TypeKind const kind      = src.get(srcId).kind;
 
-    // ── volatile qualifier (D-CSUBSET-VOLATILE-POINTEE) ──
-    // A VolatileQual wraps exactly ONE inner type. Re-intern the inner into the
-    // host, then re-wrap. Handled HERE (before the transparent operand read below)
-    // because `src.operands(VolatileQual(T))` redirects to T's operands (NOT [T]).
-    // `stripVolatile` recovers the inner (idempotency keeps VolatileQual one level
-    // deep, so the strip yields exactly the wrapped type).
+    // ── type qualifiers (D-CSUBSET-VOLATILE-POINTEE / D-CSUBSET-QUAL-BITSET) ──
+    // A VolatileQual wraps exactly ONE inner type + a QualBit mask. Re-intern the
+    // inner into the host, then re-wrap with the SAME mask. Handled HERE (before the
+    // transparent operand read below) because `src.operands(VolatileQual(T))`
+    // redirects to T's operands (NOT [T]); `stripVolatile` recovers the material
+    // inner (the skin never nests). Re-wrap via `qualified(inner, bits)`, NOT
+    // `volatileQualified` — the latter sets only the Volatile bit and would DROP an
+    // `_Atomic` (or `_Atomic volatile`) qualifier on this cross-CU merge / text
+    // round-trip, a silent loss-of-atomicity miscompile.
     if (kind == TypeKind::VolatileQual) {
         TypeId const inner  = reinternType(src, src.stripVolatile(srcId),
                                            dstHost, remap);
-        TypeId const result = dst.volatileQualified(inner);
+        TypeId const result = dst.qualified(inner, src.qualifierBits(srcId));
         remap.emplace(srcId.v, result);
         return result;
     }
@@ -214,7 +219,7 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
         case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
         case TypeKind::U64: case TypeKind::U128:
         case TypeKind::F16: case TypeKind::F32: case TypeKind::F64:
-        case TypeKind::F128:
+        case TypeKind::F80: case TypeKind::F128:
         case TypeKind::Char: case TypeKind::Byte: case TypeKind::Void:
         case TypeKind::NullptrT:   // C23 nullptr_t: operand-less primitive scalar
             result = dst.primitive(kind);
@@ -246,6 +251,13 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
         //    signedness would silently flip the wrap/compare semantics). ──
         case TypeKind::BitInt:
             result = dst.bitInt(srcScalar[0], srcScalar.size() > 1 && srcScalar[1] != 0);
+            break;
+
+        // ── C99 _Complex: operands=[element]; NO scalars (D-CSUBSET-COMPLEX).
+        //    Rebuild via the element builder so a `_Complex` crossing a CU / text
+        //    round-trip keeps its exact element float type. ──
+        case TypeKind::Complex:
+            result = dst.complex(ops[0]);
             break;
 
         // ── tuple: operands=[elements...] ──

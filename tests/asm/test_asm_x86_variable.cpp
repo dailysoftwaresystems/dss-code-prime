@@ -580,6 +580,105 @@ TEST(X86VariableEncoder, ZextRaxRaxEmits48_0F_B6_C0) {
     EXPECT_EQ(bytes[4], 0xC3);
 }
 
+// ── FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): POPCNT / LZCNT / TZCNT ──
+//
+// The 3 hardware bit-count primitives. All share the `fpcvt` shape — an F3
+// mandatoryPrefix (emitted BEFORE the auto-REX) + a 2-byte 0F opcode + ModR/M.reg
+// destination / ModR/M.rm source. The 64-bit form adds REX.W (F3 48 0F xx C0),
+// the 32-bit form omits it (F3 0F xx C0). These pins discriminate the three
+// opcodes (B8 / BD / BC) and the REX.W-vs-not width split — a schema opcode swap
+// or a dropped rexW fails at the exact byte.
+
+namespace {
+// Assemble `<mnemonic> rax, rax` (or eax,eax when width32) + the trailing ret,
+// returning the function bytes. rax = ordinal 0 (no REX.B/R), so the only REX is
+// the width-64 REX.W.
+[[nodiscard]] std::vector<std::uint8_t>
+assembleUnaryRaxRax(char const* mnemonic, bool width32) {
+    auto schema = TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(schema.has_value());
+    auto const op = (*schema)->opcodeByMnemonic(mnemonic);
+    EXPECT_TRUE(op.has_value());
+    auto const raxOrd = (*schema)->registerByName("rax");
+    EXPECT_TRUE(raxOrd.has_value());
+    LirReg const rax{static_cast<std::uint32_t>(*raxOrd),
+                     /*isPhysical=*/1,
+                     /*cls=*/static_cast<std::uint8_t>(LirRegClass::GPR)};
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = { LirOperand::makeReg(rax) };
+        (void)b.addInst(*op, rax, ops, /*payload=*/0,
+                        width32 ? ::dss::kLirInstFlagWidth32 : std::uint8_t{0});
+    });
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    return bytes;
+}
+} // namespace
+
+TEST(X86VariableEncoder, PopcntRaxRax64EmitsF3_48_0F_B8_C0) {
+    auto const bytes = assembleUnaryRaxRax("popcount", /*width32=*/false);
+    ASSERT_EQ(bytes.size(), 6u);
+    EXPECT_EQ(bytes[0], 0xF3);  // mandatoryPrefix (before REX)
+    EXPECT_EQ(bytes[1], 0x48);  // REX.W
+    EXPECT_EQ(bytes[2], 0x0F);
+    EXPECT_EQ(bytes[3], 0xB8);  // POPCNT
+    EXPECT_EQ(bytes[4], 0xC0);  // ModR/M reg=rax rm=rax
+    EXPECT_EQ(bytes[5], 0xC3);  // ret
+}
+
+TEST(X86VariableEncoder, PopcntEaxEax32EmitsF3_0F_B8_C0) {
+    auto const bytes = assembleUnaryRaxRax("popcount", /*width32=*/true);
+    ASSERT_EQ(bytes.size(), 5u);
+    EXPECT_EQ(bytes[0], 0xF3);  // no REX.W in the 32-bit form
+    EXPECT_EQ(bytes[1], 0x0F);
+    EXPECT_EQ(bytes[2], 0xB8);
+    EXPECT_EQ(bytes[3], 0xC0);
+    EXPECT_EQ(bytes[4], 0xC3);
+}
+
+TEST(X86VariableEncoder, LzcntRaxRax64EmitsF3_48_0F_BD_C0) {
+    auto const bytes = assembleUnaryRaxRax("clz", /*width32=*/false);
+    ASSERT_EQ(bytes.size(), 6u);
+    EXPECT_EQ(bytes[0], 0xF3);
+    EXPECT_EQ(bytes[1], 0x48);
+    EXPECT_EQ(bytes[2], 0x0F);
+    EXPECT_EQ(bytes[3], 0xBD);  // LZCNT (discriminated from POPCNT B8 / TZCNT BC)
+    EXPECT_EQ(bytes[4], 0xC0);
+    EXPECT_EQ(bytes[5], 0xC3);
+}
+
+TEST(X86VariableEncoder, LzcntEaxEax32EmitsF3_0F_BD_C0) {
+    auto const bytes = assembleUnaryRaxRax("clz", /*width32=*/true);
+    ASSERT_EQ(bytes.size(), 5u);
+    EXPECT_EQ(bytes[0], 0xF3);
+    EXPECT_EQ(bytes[1], 0x0F);
+    EXPECT_EQ(bytes[2], 0xBD);
+    EXPECT_EQ(bytes[3], 0xC0);
+    EXPECT_EQ(bytes[4], 0xC3);
+}
+
+TEST(X86VariableEncoder, TzcntRaxRax64EmitsF3_48_0F_BC_C0) {
+    auto const bytes = assembleUnaryRaxRax("ctz", /*width32=*/false);
+    ASSERT_EQ(bytes.size(), 6u);
+    EXPECT_EQ(bytes[0], 0xF3);
+    EXPECT_EQ(bytes[1], 0x48);
+    EXPECT_EQ(bytes[2], 0x0F);
+    EXPECT_EQ(bytes[3], 0xBC);  // TZCNT
+    EXPECT_EQ(bytes[4], 0xC0);
+    EXPECT_EQ(bytes[5], 0xC3);
+}
+
+TEST(X86VariableEncoder, TzcntEaxEax32EmitsF3_0F_BC_C0) {
+    auto const bytes = assembleUnaryRaxRax("ctz", /*width32=*/true);
+    ASSERT_EQ(bytes.size(), 5u);
+    EXPECT_EQ(bytes[0], 0xF3);
+    EXPECT_EQ(bytes[1], 0x0F);
+    EXPECT_EQ(bytes[2], 0xBC);
+    EXPECT_EQ(bytes[3], 0xC0);
+    EXPECT_EQ(bytes[4], 0xC3);
+}
+
 // ── D-CSUBSET-DIVISION-OP-CODEGEN byte-pins (cycle 10r split, 2026-06-04) ──
 //
 // Cycle 10r splits the cycle-10q compound opcodes into separate pre
@@ -1764,6 +1863,79 @@ TEST(X86VariableEncoder, LockCmpxchgMem32HighRegsPinsLockBeforeRex) {
     EXPECT_EQ(bytes[6], 0x00);
     EXPECT_EQ(bytes[7], 0x00);
     EXPECT_EQ(bytes[8], 0x00);
+}
+
+TEST(X86VariableEncoder, XchgMem32EmitsSeqCstStore) {
+    // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): `xchg dword [rdi + 0], esi`
+    // — the SEQ_CST atomic STORE (a MEMORY-operand XCHG is implicitly LOCK'd =
+    // a full fence). Opcode 0x87 /r, width-32 (no REX.W) + ModR/M mod=10
+    // reg=esi(110) rm=rdi(111) = 0xB7 + disp32(0): 87 B7 00 00 00 00. Cross-
+    // checked with `as`: `xchg dword ptr [rax],ecx` = 87 08 (0x87 opcode). The
+    // value (esi) wires to modrm.reg exactly like `store`; `lowerAtomicStore`
+    // copies it into a scratch first (XCHG writes old-mem back into the reg).
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const xchgOp = (*schema)->opcodeByMnemonic("store_seqcst");
+    ASSERT_TRUE(xchgOp.has_value());
+    LirReg const rsi = physGprByName(**schema, "rsi");
+    LirReg const rdi = physGprByName(**schema, "rdi");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rsi),        // stored value → modrm.reg
+            LirOperand::makeReg(rdi),        // ptr          → modrm.rm.mem
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        (void)b.addInst(*xchgOp, InvalidLirReg, ops, /*payload=*/0,
+                        ::dss::kLirInstFlagWidth32);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 6u);
+    EXPECT_EQ(bytes[0], 0x87);  // XCHG r/m32, r32 — no REX.W (32-bit)
+    EXPECT_EQ(bytes[1], 0xB7);  // mod=10 reg=esi rm=rdi
+    EXPECT_EQ(bytes[2], 0x00);  // disp32 = 0
+    EXPECT_EQ(bytes[3], 0x00);
+    EXPECT_EQ(bytes[4], 0x00);
+    EXPECT_EQ(bytes[5], 0x00);
+}
+
+TEST(X86VariableEncoder, XchgMem64EmitsRexWSeqCstStore) {
+    // The 64-bit seq_cst store: `xchg qword [rdi + 0], rsi` = REX.W 0x48 + 0x87
+    // + 0xB7 + disp32(0): 48 87 B7 00 00 00 00. Cross-checked with `as`:
+    // `xchg qword ptr [rax],rcx` = 48 87 08.
+    auto schema = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(schema.has_value());
+    auto const xchgOp = (*schema)->opcodeByMnemonic("store_seqcst");
+    ASSERT_TRUE(xchgOp.has_value());
+    LirReg const rsi = physGprByName(**schema, "rsi");
+    LirReg const rdi = physGprByName(**schema, "rdi");
+
+    Lir lir = buildSingleFnLirWithRet(**schema, [&](LirBuilder& b) {
+        LirOperand const ops[] = {
+            LirOperand::makeReg(rsi),
+            LirOperand::makeReg(rdi),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        // width-64 is the DEFAULT (no width flag bit → lirInstWidthBits == 64).
+        (void)b.addInst(*xchgOp, InvalidLirReg, ops, /*payload=*/0, /*flags=*/0);
+    });
+
+    DiagnosticReporter rep;
+    auto const bytes = assembleFirstFn(lir, **schema, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 7u);
+    EXPECT_EQ(bytes[0], 0x48);  // REX.W
+    EXPECT_EQ(bytes[1], 0x87);
+    EXPECT_EQ(bytes[2], 0xB7);
+    EXPECT_EQ(bytes[3], 0x00);
+    EXPECT_EQ(bytes[4], 0x00);
+    EXPECT_EQ(bytes[5], 0x00);
+    EXPECT_EQ(bytes[6], 0x00);
 }
 
 TEST(X86VariableEncoder, StoreToR12ForcesSibByteAndRexB) {

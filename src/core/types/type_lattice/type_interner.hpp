@@ -133,33 +133,64 @@ public:
     TypeId vector(TypeId element, std::int64_t lanes);
     // matrix: operands=[element], scalars=[rows, cols].
     TypeId matrix(TypeId element, std::int64_t rows, std::int64_t cols);
+    // C99 _Complex (D-CSUBSET-COMPLEX): a complex number over the element FLOAT
+    // type `element` (F32/F64/F80/F128). operands=[element]; NO scalars, NO name —
+    // structural identity (two `double _Complex` collapse to one TypeId, the
+    // single-operand `slice`/`pointer` precedent; the "2 components" is implicit in
+    // the kind, so unlike vector NO lane scalar is carried). The interner dedups on
+    // the element for free.
+    TypeId complex(TypeId element);
+    // The element FLOAT type of a `_Complex` (operands[0]). Aborts if `id` is not a
+    // Complex (a caller bug — every consumer gates on `kind(id)==Complex` first, the
+    // `bitIntWidth`/`complexElement` decoder precedent).
+    [[nodiscard]] TypeId complexElement(TypeId id) const;
     // single-operand indirection: operands=[target].
     TypeId pointer(TypeId pointee);
     TypeId reference(TypeId referent);
     TypeId nullable(TypeId inner);
     TypeId optional(TypeId inner);
 
-    // ── volatile qualifier (D-CSUBSET-VOLATILE-POINTEE / c27) ──
-    // `volatile T` — a kind=VolatileQual record, operands=[inner]. DISTINCT
-    // interned identity (volatile int != int — what carries the volatile through
-    // a declaration's type to its access sites), but a TRANSPARENT skin: the
-    // `kind()` / `operands()` / `scalars()` accessors SEE THROUGH it to `inner`,
-    // so every structural consumer dispatches on the material kind with NO
-    // per-site strip (the access-volatility chokepoints query `isVolatileQualified`
-    // instead). Idempotent: `volatileQualified(VolatileQual(T)) == VolatileQual(T)`.
-    // Wrapping an INVALID id returns InvalidType. const is NOT modelled (it never
-    // affects codegen); only volatile is materialized.
+    // ── type qualifiers (D-CSUBSET-VOLATILE-POINTEE / c27 · D-CSUBSET-QUAL-BITSET) ──
+    // A qualified scalar — `volatile T`, `_Atomic T`, or `_Atomic volatile T` — is a
+    // kind=VolatileQual record, operands=[inner], carrying a `QualBit` BITSET in
+    // scalar slot 0. DISTINCT interned identity per (inner, mask): `volatile int`,
+    // `_Atomic int`, and `int` are three distinct TypeIds (what carries the qualifier
+    // through a declaration's type to its access sites), but a TRANSPARENT skin: the
+    // `kind()` / `operands()` / `scalars()` accessors SEE THROUGH it to `inner`, so
+    // every structural consumer dispatches on the material kind with NO per-site strip
+    // (the access chokepoints query `isVolatileQualified` / `isAtomicQualified`).
+    //
+    // `qualified(inner, addBits)` is the primitive: it STRIPS any qualifier skin
+    // already on `inner`, UNIONs its bits with `addBits`, and re-interns a SINGLE skin
+    // over the material type. So it is idempotent and order-independent
+    // (`qualified(qualified(T,A),B) == qualified(T, A|B)`) and — critically — never
+    // DROPS a bit: qualifying an already-qualified type preserves what was there (a
+    // naive "return inner if already qualified" would silently lose the new bit, e.g.
+    // `_Atomic` over `volatile` staying merely volatile — a loss-of-atomicity
+    // miscompile). Wrapping an INVALID id returns InvalidType; a zero mask returns the
+    // material type (no skin). const is NOT a bit (it never affects codegen/layout).
+    TypeId qualified(TypeId inner, std::int64_t addBits);
+    // `volatile T` / `_Atomic T` — thin wrappers over `qualified` setting one bit.
     TypeId volatileQualified(TypeId inner);
-    // The inner type if `id` is a VolatileQual, else `id` unchanged. ONE strip
-    // chokepoint for the rare consumer that must look past the skin where the
+    TypeId atomicQualified(TypeId inner);
+    // The material type under `id`'s qualifier skin (`id` unchanged if none). ONE
+    // strip chokepoint for the rare consumer that must look past the skin where the
     // transparent accessors are bypassed (e.g. the layout entry's raw incomplete
-    // checks, or building a derived type that must drop the qualifier).
+    // checks, or building a derived type that must drop the qualifier). Strips the
+    // WHOLE skin (all bits) — the material type is qualifier-free, which is what every
+    // caller (layout / assignment compat / scope resolution) wants.
     [[nodiscard]] TypeId stripVolatile(TypeId id) const;
-    // True iff `id`'s OWN record is a VolatileQual (the access-volatility query).
-    // Reads the RAW record kind (not the transparent `kind()`), so it answers
-    // "is this exact type volatile-qualified?" — used at the deref / member /
-    // index / scalar access sites to set MirInstFlags::Volatile from the type.
+    // The raw QualBit mask on `id`'s OWN record (0 if `id` is not a qualifier skin).
+    // Reads the RAW scalar slot directly — NOT the transparent `scalars()`, which sees
+    // THROUGH the skin to the inner type's scalars. The single reader of the bitset.
+    [[nodiscard]] std::int64_t qualifierBits(TypeId id) const;
+    // True iff `id`'s OWN record carries the Volatile / Atomic bit (the access-
+    // qualifier queries). Read the RAW mask (not the transparent `kind()`), so they
+    // answer "is this exact type volatile / atomic-qualified?" — used at the deref /
+    // member / index / scalar access sites (volatile → MirInstFlags::Volatile;
+    // atomic → the FC17.9(d) 1b atomic-access lowering).
     [[nodiscard]] bool isVolatileQualified(TypeId id) const;
+    [[nodiscard]] bool isAtomicQualified(TypeId id) const;
     // array: operands=[element], scalars=[length]. slice: operands=[element].
     TypeId array(TypeId element, std::int64_t length);
     TypeId slice(TypeId element);

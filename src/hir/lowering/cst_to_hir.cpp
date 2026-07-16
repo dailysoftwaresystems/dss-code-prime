@@ -84,7 +84,8 @@ namespace {
     }
 }
 [[nodiscard]] bool isFloatCore(TypeKind k) noexcept {
-    return k == TypeKind::F16 || k == TypeKind::F32 || k == TypeKind::F64 || k == TypeKind::F128;
+    return k == TypeKind::F16 || k == TypeKind::F32 || k == TypeKind::F64
+        || k == TypeKind::F80 || k == TypeKind::F128;
 }
 
 // Arithmetic-kind predicate — the implicit-conversion surface (ints +
@@ -106,7 +107,7 @@ namespace {
         || k == TypeKind::U8   || k == TypeKind::U16  || k == TypeKind::U32
         || k == TypeKind::U64  || k == TypeKind::U128
         || k == TypeKind::F16  || k == TypeKind::F32
-        || k == TypeKind::F64  || k == TypeKind::F128
+        || k == TypeKind::F64  || k == TypeKind::F80 || k == TypeKind::F128
         || k == TypeKind::BitInt;
 }
 
@@ -232,6 +233,14 @@ struct Lowerer {
     // side-table stays sparse; the only unsafe direction is a MISSED volatile
     // access, which the exhaustive threading closes.
     std::vector<std::pair<HirNodeId, VolatileAttr>>& volatileAcc;
+    // FC17.9(c) (D-CSUBSET-SETJMP): shared accumulator of (CALL HIR node →
+    // ReturnsTwiceAttr) pairs, populated at `emitCallOrBuiltin` when the lowered
+    // Call's DIRECT callee record is `returnsTwice` (setjmp/_setjmp). Applied to the
+    // result's HirReturnsTwiceMap AFTER finish() — the same frozen-hir discipline as
+    // `volatileAcc`. Only returns-twice calls are recorded (absence ⇒ ordinary call),
+    // so the side-table stays sparse; the only unsafe direction is a SPURIOUS flag,
+    // which the direct-Ref-callee gate (the isDirectNoreturnCall discipline) prevents.
+    std::vector<std::pair<HirNodeId, ReturnsTwiceAttr>>& returnsTwiceAcc;
     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: shared accumulator of (DECLARATION HIR
     // node → AlignmentAttr) pairs, populated from the bound symbol's
     // `SymbolRecord.explicitAlignment` at each Global / local VarDecl lowering
@@ -286,6 +295,10 @@ struct Lowerer {
     // `analyze()` parameter travels on the SemanticModel) so this tier
     // can never run under a different model than the semantic tier.
     DataModel dataModel_ = DataModel::Lp64;
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the analysis-time `long double`
+    // axis, read OFF THE MODEL for the same two-tier-agreement reason —
+    // consumed by the float-literal ladder (typeFloatLiteral).
+    LongDoubleFormat longDoubleFormat_ = LongDoubleFormat::None;
     // FC3 c1: the language's usual-arithmetic-conversion rules resolved
     // for `dataModel_`. nullopt (no `arithmeticConversions` block) keeps
     // every combine site on the legacy `TypeInterner::commonType` path
@@ -627,6 +640,29 @@ struct Lowerer {
             }
             return {cast, target};
         }
+        // C99 _Complex (D-CSUBSET-COMPLEX / CRITICAL-3): coerce a real OR a
+        // differently-elemented complex INTO a Complex target — the promotion the
+        // binary path's `common = commonArithType` demands so a mixed `2.0 * I`
+        // reaches materializeComplexBinaryOp with BOTH operands complex-by-address.
+        // `isArithmeticCore` EXCLUDES Complex, so WITHOUT this arm (before the gate
+        // below) a real->complex coerce falls through returning the child UNCHANGED
+        // (a bare F64) — mis-lowering the op (the child is the "leaves 2.0 a bare
+        // F64" bug). real->complex constructs (v, 0); complex->complex element-
+        // converts — both realized by materializeComplexCast at hir_to_mir. Implicit
+        // complex->real is NOT here (it stays a semantic reject, C99 6.3.1.7). The
+        // identical-type case already returned at the top (`child.type == target`).
+        if (tk == TypeKind::Complex
+            && (ck == TypeKind::Complex || isArithmeticCore(ck))) {
+            HirNodeId const cast =
+                builder.makeCast(child.id, target, HirFlags::Synthetic);
+            for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+                if (it->first == child.id) {
+                    spans.push_back({cast, it->second});
+                    break;
+                }
+            }
+            return {cast, target};
+        }
         // Pointers, structs, FnSig are not coerced implicitly; let the
         // caller decide whether the mismatch is a diagnostic. Arithmetic
         // (int + float kinds — file-scope `isArithmeticCore`) is the
@@ -829,6 +865,7 @@ struct Lowerer {
             std::vector<std::pair<HirNodeId, MutabilityAttr>>& mut,
             std::vector<std::pair<HirNodeId, ThreadLocalAttr>>& tls,
             std::vector<std::pair<HirNodeId, VolatileAttr>>& vol,
+            std::vector<std::pair<HirNodeId, ReturnsTwiceAttr>>& rtwice,
             std::vector<std::pair<HirNodeId, AlignmentAttr>>& aln,
             std::vector<std::pair<std::uint32_t, HirNodeId>>& vlaSz,
             std::vector<std::pair<std::uint32_t, std::uint32_t>>& sizeofVlaSym,
@@ -836,8 +873,8 @@ struct Lowerer {
         : model(m), cfg(c), sem(s), numberStyle(ns), interner(m.lattice().interner()),
           reporter(r), builder(b), literals(lits), spans(sp), externDecls(ed),
           linkage(lk), mutability(mut), threadLocalAcc(tls), volatileAcc(vol),
-          alignmentAcc(aln), vlaSizeAcc(vlaSz), sizeofVlaSymAcc(sizeofVlaSym),
-          typedefOriginAcc(typedefOrigin) {
+          returnsTwiceAcc(rtwice), alignmentAcc(aln), vlaSizeAcc(vlaSz),
+          sizeofVlaSymAcc(sizeofVlaSym), typedefOriginAcc(typedefOrigin) {
         for (std::size_t i = 0; i < cfg.ruleMappings.size(); ++i)
             ruleMap_.emplace(cfg.ruleMappings[i].rule.v, i);
         for (std::size_t i = 0; i < sem.declarations.size(); ++i)
@@ -857,6 +894,8 @@ struct Lowerer {
         }
         // FC3 c1: data model + resolved UAC rules (see the member docs).
         dataModel_ = m.dataModel();
+        // FC17.9(e): the long-double axis rides the model the same way.
+        longDoubleFormat_ = m.longDoubleFormat();
         if (sem.arithmeticConversions.has_value()) {
             arith_ = resolveArithmeticRules(*sem.arithmeticConversions, dataModel_);
             // D-CSUBSET-BITINT: `_BitInt` participation in the usual arithmetic
@@ -3078,7 +3117,31 @@ struct Lowerer {
                     static_cast<std::uint32_t>(rec->builtinLowering), args, resultType);
             }
         }
-        return builder.makeCall(calleeId, args, resultType);
+        HirNodeId const call = builder.makeCall(calleeId, args, resultType);
+        recordReturnsTwiceIfDirect(call);
+        return call;
+    }
+
+    // FC17.9(c) (D-CSUBSET-SETJMP): record the returns-twice side-table entry for a
+    // just-built `Call` node whose callee is a DIRECT reference to a `returnsTwice`
+    // function symbol (setjmp/_setjmp). The EXACT structural twin of
+    // `isDirectNoreturnCall` (F1 miscompile guard): inspect the lowered Call's CALLEE
+    // CHILD directly (`makeCall` pushes the callee first, so it is `children().front()`)
+    // — it must be a `HirKind::Ref` whose bound record is `returnsTwice`. NEVER the
+    // `firstNameToken` name-resolver: a returns-twice function is ADDRESS-TAKEABLE, so
+    // `(cond ? sj : other)(env)` would resolve wrongly. A ternary / deref / cast callee
+    // lowers to a non-Ref node → not flagged (safe, conservative); an indirect
+    // fn-pointer call `fp(env)` lowers to Ref(fp) whose record has returnsTwice==false
+    // → not flagged. Only a bare direct call to a returns-twice callee is annotated; the
+    // HIR->MIR side then ORs MirInstFlags::ReturnsTwice onto its emitted Call.
+    void recordReturnsTwiceIfDirect(HirNodeId call) {
+        if (!call.valid() || builder.kind(call) != HirKind::Call) return;
+        auto const kids = builder.children(call);
+        if (kids.empty() || builder.kind(kids.front()) != HirKind::Ref) return;
+        SymbolId const sym{builder.payload(kids.front())};
+        auto const* rec = model.recordFor(sym);
+        if (rec != nullptr && rec->returnsTwice)
+            returnsTwiceAcc.push_back({call, ReturnsTwiceAttr{/*returnsTwice=*/true}});
     }
 
     // A name reference as an expression (id + type): resolves the last identifier
@@ -3186,14 +3249,18 @@ struct Lowerer {
                 && numberStyle->emitKind.floating.valid()
                 && tk == numberStyle->emitKind.floating) {
                 auto const fk = typeFloatLiteral(
-                    text, numberStyle, sem.floatLiteralTyping, dataModel_);
-                if (fk.has_value()) {
-                    core = *fk;
+                    text, numberStyle, sem.floatLiteralTyping, dataModel_,
+                    longDoubleFormat_);
+                if (fk.status == FloatLadderStatus::Typed) {
+                    core = fk.kind;
                     type = interner.primitive(core);
                 } else {
-                    // Loader invariant violated (uncovered suffix) —
-                    // stay loud through the arm below, mirroring the
-                    // integer ladder's NoRule handling.
+                    // NoRule: loader invariant violated (uncovered suffix).
+                    // AxisUndeclared (FC17.9(e)): a long-double literal on a
+                    // format with no declared axis — the semantic tier already
+                    // rejected it (S_LongDoubleFormatUndeclared), so this tier
+                    // is normally unreachable; a direct-API caller stays loud
+                    // through the arm below either way (never the base core).
                     ok = false;
                 }
             }
@@ -4518,6 +4585,12 @@ struct Lowerer {
             if (k == "ReturnStmt")  { stmtResult = lowerReturn(n); return; }
             if (k == "BreakStmt")    { stmtResult = track(builder.makeBreak(0), n); return; }
             if (k == "ContinueStmt") { stmtResult = track(builder.makeContinue(0), n); return; }
+            // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template `__asm__ [volatile]
+            // ("")` statement lowers to a 0-child InlineAsm leaf (no payload). The
+            // template gate lives in the semantic tier (semantics.inlineAsmRule →
+            // S_InlineAsmNonEmptyTemplate rejects a non-empty template before codegen),
+            // so this arm need not re-decode — it emits the barrier UNCONDITIONALLY.
+            if (k == "InlineAsm")    { stmtResult = track(builder.addLeaf(HirKind::InlineAsm), n); return; }
             // Switch is a DEEP form: its arm-grouping re-enters the driver for each
             // arm body (`lowerStmt(body)`), so a switch nested in a switch-arm body
             // would recurse on the host stack. Flatten it through a Switch frame —
@@ -6132,7 +6205,7 @@ struct Lowerer {
             case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
             case TypeKind::U64: case TypeKind::U128:
             case TypeKind::F16: case TypeKind::F32: case TypeKind::F64:
-            case TypeKind::F128:
+            case TypeKind::F80: case TypeKind::F128:
             case TypeKind::Char:
             case TypeKind::Byte:
             case TypeKind::Enum:
@@ -8550,6 +8623,9 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     // c21 (D-CSUBSET-VOLATILE-QUALIFIER): shared (access node → VolatileAttr)
     // accumulator, moved onto result->volatileMap after finish().
     std::vector<std::pair<HirNodeId, VolatileAttr>> volatileAcc;
+    // FC17.9(c) (D-CSUBSET-SETJMP): shared (Call node → ReturnsTwiceAttr) accumulator,
+    // moved onto result->returnsTwiceMap after finish().
+    std::vector<std::pair<HirNodeId, ReturnsTwiceAttr>> returnsTwiceAcc;
     // D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN: shared (decl node → AlignmentAttr)
     // accumulator, moved onto result->alignmentMap after finish().
     std::vector<std::pair<HirNodeId, AlignmentAttr>> alignmentAcc;
@@ -8574,8 +8650,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         lowerers.emplace(sch.schemaId().v, std::make_unique<Lowerer>(
             model, sch.hirLowering(), sch.semantics(), sch.numberStyle(),
             reporter, builder, literals, spans, externDecls, linkage,
-            mutability, threadLocalAcc, volatileAcc, alignmentAcc, vlaSizeAcc,
-            sizeofVlaSymAcc, typedefOriginAcc));
+            mutability, threadLocalAcc, volatileAcc, returnsTwiceAcc, alignmentAcc,
+            vlaSizeAcc, sizeofVlaSymAcc, typedefOriginAcc));
     }
 
     // Lower every tree IN ORDER, dispatching to its schema's Lowerer, into the
@@ -8644,6 +8720,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
     for (auto& [id, attr] : threadLocalAcc)
         result->threadLocalMap.set(id, attr);   // TLS C1
     for (auto& [id, attr] : volatileAcc) result->volatileMap.set(id, attr);  // c21
+    for (auto& [id, attr] : returnsTwiceAcc)   // FC17.9(c) (D-CSUBSET-SETJMP)
+        result->returnsTwiceMap.set(id, attr);
     for (auto& [id, attr] : alignmentAcc) result->alignmentMap.set(id, attr);  // alignas
     for (auto& [symV, sizeNode] : vlaSizeAcc)   // VLA C1a/C3 (D-CSUBSET-VLA)
         result->vlaSizeExprBySymbol[symV].push_back(sizeNode);  // outer→inner order

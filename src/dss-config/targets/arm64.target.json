@@ -507,6 +507,62 @@
       }
     },
     {
+      "$comment": "FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): CLZ Xd, Xn — count leading zeros (data-processing 1-source). fixedWord 0xDAC01000 (X, sf=1 = 3670020096) / 0x5AC01000 (W, sf=0 = 1522536448); opcode field 000100 (RBIT=000000 below; REV16/32=00000x/00001x). Rn (bits 9:5) = the source operand (wire 0), Rd (bits 4:0) = the result. arm64 CLZ is DEFINED at 0 = the width (32/64) — EXACTLY the MIR Clz contract — so it is Clz's NATIVE realization (the DSS `clz` verb, shared with x86 LZCNT). Also the 2nd half of arm64's ctz: RBIT then CLZ. A 1-source op like `neg`/`not` but the operand wires to `rn` (data-proc-1-source) not `rm`.",
+      "mnemonic":      "clz",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 3670020096 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 1522536448 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): RBIT Xd, Xn — reverse the bit order (data-processing 1-source, opcode field 000000). fixedWord 0xDAC00000 (X = 3670016000) / 0x5AC00000 (W = 1522532352). Rn (bits 9:5) = source (wire 0), Rd (bits 4:0) = result. Used ONLY by arm64's ctz realization: ctz(x) = CLZ(RBIT(x)) — reversing turns the lowest set bit into the highest, so leading-zeros of the reversed value = trailing-zeros of the original (defined at 0 = width via CLZ(0)=width). x86 declares no `rbit` (it has direct TZCNT).",
+      "mnemonic":      "rbit",
+      "result":        "value",
+      "minOperands":   1,
+      "maxOperands":   1,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "fixedWord": 3670016000 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "fixedWord": 1522532352 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): LDAXR Wt/Xt, [Xn] — load-acquire EXCLUSIVE (arms the exclusive monitor; the acquire half of the LL/SC CAS loop). W-form 0x885FFC00 = size=10 | 001000 | o2=0 L=1 o1=0 | Rs=11111 | o0=1 | Rt2=11111 | Rn | Rt; X-form flips size to 11 -> 0xC85FFC00. Result = the loaded value (Rt, bits 4:0 = the `rd` slot); operand 0 = the address base (Rn). The MIR AtomicCas value width picks W (the Win32 LONG i32 CAS) vs X.",
       "mnemonic":      "ldaxr",
       "result":        "value",
@@ -561,6 +617,105 @@
             "wires":      [
               { "index": 0, "slotKind": "rd" },
               { "index": 1, "slotKind": "rn" }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): LDAR Wt/Xt, [Xn] — load-ACQUIRE (RCsc), the acquire/seq_cst realization of MIR AtomicLoad. Derived from LDAXR by SETTING o2 (bit 23): LDAR = LDAXR | (1<<23). W-form 0x88DFFC00 (= 0x885FFC00 | 0x800000), X-form 0xC8DFFC00. VERIFIED by aarch64-as: `ldar w0,[x0]`=88dffc00, `ldar x0,[x0]`=c8dffc00. LDAR has NO offset field (addresses [Xn], disp 0), so the UNIFIED [ptr, MemBase, MemOffset] shape (which x86's mov-load needs) wires ptr->Rn (bits 5..9), result->Rd (bits 0..4 = Rt, the loaded value), MemBase->membase.noscale + MemOffset->memoffset.zero (width-0 markers; memoffset.zero FAILS LOUD on a nonzero disp — a naturally-aligned atomic is always offset 0, the base+index-lea precedent). Value width picks W (i32 / _Atomic int) vs X (i64 / pointer).",
+      "mnemonic":      "load_acquire",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "template":   { "fixedWord": 2296380416 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"              },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "memoffset.zero"  }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
+            "template":   { "fixedWord": 3370122240 },
+            "resultSlot": "rd",
+            "wires":      [
+              { "index": 0, "slotKind": "rn"              },
+              { "index": 1, "slotKind": "membase.noscale" },
+              { "index": 2, "slotKind": "memoffset.zero"  }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): STLR Wt/Xt, [Xn] — store-RELEASE (RCsc), the release/acq_rel realization of MIR AtomicStore. Derived from STLXR by SETTING o2 (bit 23) AND baking Rs=11111 (STLR has NO status output, unlike STLXR whose Rs is the status reg): STLR = 0x8800FC00 | (1<<23) | (0x1F<<16) = 0x889FFC00 (W), 0xC89FFC00 (X). VERIFIED by aarch64-as: `stlr w0,[x0]`=889ffc00, `stlr x0,[x0]`=c89ffc00. result:none (no status reg). UNIFIED [value, ptr, MemBase, MemOffset] shape (the STUR store precedent): value->Rd (bits 0..4 = Rt data reg), ptr->Rn (bits 5..9), MemBase->membase.noscale + MemOffset->memoffset.zero (fail-loud nonzero disp). Value width picks W vs X.",
+      "mnemonic":      "store_release",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template":   { "fixedWord": 2292186112 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd"              },
+              { "index": 1, "slotKind": "rn"              },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "memoffset.zero"  }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template":   { "fixedWord": 3365927936 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd"              },
+              { "index": 1, "slotKind": "rn"              },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "memoffset.zero"  }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): STLR again — the SEQ_CST realization of MIR AtomicStore. LDAR/STLR are RCsc, so a release store IS a seq_cst store on arm64 (NO DMB) — BOTH the store_release and store_seqcst slots bind the IDENTICAL STLR encoding (the x86 twin diverges: store_release=mov, store_seqcst=xchg). Same words/wiring as store_release above (W 0x889FFC00, X 0xC89FFC00). Declared so the pure-slot-presence probe finds a seq_cst-store realization on arm64 (never fail-loud on a legal seq_cst store).",
+      "mnemonic":      "store_seqcst",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "encoding": {
+        "format":   "fixed32",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template":   { "fixedWord": 2292186112 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd"              },
+              { "index": 1, "slotKind": "rn"              },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "memoffset.zero"  }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template":   { "fixedWord": 3365927936 },
+            "wires":      [
+              { "index": 0, "slotKind": "rd"              },
+              { "index": 1, "slotKind": "rn"              },
+              { "index": 2, "slotKind": "membase.noscale" },
+              { "index": 3, "slotKind": "memoffset.zero"  }
             ]
           }
         ]

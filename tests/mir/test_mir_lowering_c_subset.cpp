@@ -20,16 +20,21 @@
 #include "opt/optimizer.hpp"
 #include "opt/passes/dce.hpp"
 #include "core/types/symbol_attrs.hpp"
+#include "core/types/object_format_kind.hpp"   // ObjectFormatKind (setjmp variant selector)
 #include "core/types/target_schema.hpp"
+#include "scratch_dir.hpp"                      // ScratchDir (setjmp descriptor sys-dir)
 
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <variant>
+#include <vector>
 
 using namespace dss;
 
@@ -182,6 +187,498 @@ TEST(MirLoweringCSubset, StraightLineAddFunction) {
     auto retOps = m.instOperands(ret);
     ASSERT_EQ(retOps.size(), 1u);
     EXPECT_EQ(retOps[0], sum);
+}
+
+// FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): a scalar `_Atomic` access lowers to
+// AtomicStore/AtomicLoad (seq_cst — payload 5), NEVER a plain Store/Load. The MIR
+// probe: `_Atomic int x; x = 42; return x;`. RED-ON-DISABLE: revert the
+// emitScalarLoad/emitScalarStore funnel → the store/load stay plain `Store`/`Load`
+// (and the MIR verifier's atomic belt would then reject them) — this test flips
+// (sees plain ops, no atomic ops).
+TEST(MirLoweringCSubset, AtomicScalarAccessLowersToAtomicLoadStore) {
+    auto L = lowerCSubset(
+        "int g;\n"
+        "int main(void) { _Atomic int x; x = 42; return x; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    bool sawAtomicStore = false, sawAtomicLoad = false;
+    bool sawPlainStore = false, sawPlainLoad = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                switch (m.instOpcode(id)) {
+                    case MirOpcode::AtomicStore:
+                        sawAtomicStore = true;
+                        EXPECT_EQ(m.instPayload(id), 5u)   // seq_cst
+                            << "atomic_store must carry the seq_cst memory order";
+                        break;
+                    case MirOpcode::AtomicLoad:
+                        sawAtomicLoad = true;
+                        EXPECT_EQ(m.instPayload(id), 5u)   // seq_cst
+                            << "atomic_load must carry the seq_cst memory order";
+                        break;
+                    case MirOpcode::Store: sawPlainStore = true; break;
+                    case MirOpcode::Load:  sawPlainLoad  = true; break;
+                    default: break;
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(sawAtomicStore) << "`x = 42` must lower to atomic_store, not store";
+    EXPECT_TRUE(sawAtomicLoad)  << "`return x` must lower to atomic_load, not load";
+    // The funnel REPLACES the plain ops — no plain Store/Load of `x` survives.
+    EXPECT_FALSE(sawPlainStore) << "the atomic assignment must not emit a plain store";
+    EXPECT_FALSE(sawPlainLoad)  << "the atomic read must not emit a plain load";
+}
+
+namespace {
+
+// C99 _Complex (D-CSUBSET-COMPLEX): collect every instance of `op` across the whole
+// module, in emission order — the complex arithmetic-shape pins read the exact
+// float-op sequence materializeComplexBinaryOp emits.
+[[nodiscard]] std::vector<MirInstId> collectOps(Mir const& m, MirOpcode op) {
+    std::vector<MirInstId> out;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                if (m.instOpcode(id) == op) out.push_back(id);
+            }
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+// C99 _Complex (D-CSUBSET-COMPLEX / design test #8): the MULTIPLY cross-term shape.
+// `ga * gb` (both double _Complex) must emit EXACTLY the 4-FMul + 1-FSub + 1-FAdd
+// componentwise form of (a+bi)(c+di) = (ac−bd) + (ad+bc)i — materialized BY ADDRESS
+// (no FDiv, no bare-SSA complex value). Strongest provable: the operand CHAIN is
+// asserted, not just counts — FSub consumes the 1st/2nd FMul (ac−bd), FAdd the
+// 3rd/4th (ad+bc), and BOTH results feed component Stores into the result slot.
+// RED-ON-DISABLE: any drift in the cross-term formula (a swapped operand, a lost
+// term, a scalar mis-route into combineBinaryOp) breaks the chain or the counts.
+TEST(MirLoweringCSubset, ComplexMultiplyEmitsCrossTermShape) {
+    auto L = lowerCSubset(
+        "double _Complex ga;\n"
+        "double _Complex gb;\n"
+        "int main(void) { double _Complex p = ga * gb; return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    auto const muls = collectOps(m, MirOpcode::FMul);
+    auto const subs = collectOps(m, MirOpcode::FSub);
+    auto const adds = collectOps(m, MirOpcode::FAdd);
+    ASSERT_EQ(muls.size(), 4u) << "complex x emits EXACTLY 4 FMul (ac, bd, ad, bc)";
+    ASSERT_EQ(subs.size(), 1u) << "complex x emits EXACTLY 1 FSub (ac - bd)";
+    ASSERT_EQ(adds.size(), 1u) << "complex x emits EXACTLY 1 FAdd (ad + bc)";
+    EXPECT_TRUE(collectOps(m, MirOpcode::FDiv).empty()) << "no FDiv in a multiply";
+
+    // The operand chain: FSub = (muls[0], muls[1]) — the real part ac−bd;
+    // FAdd = (muls[2], muls[3]) — the imag part ad+bc (emission order pins the
+    // formula's term pairing exactly as materializeComplexBinaryOp emits it).
+    auto const subOps = m.instOperands(subs[0]);
+    ASSERT_EQ(subOps.size(), 2u);
+    EXPECT_EQ(subOps[0], muls[0]) << "real part = FIRST product (ac) minus ...";
+    EXPECT_EQ(subOps[1], muls[1]) << "... the SECOND product (bd)";
+    auto const addOps = m.instOperands(adds[0]);
+    ASSERT_EQ(addOps.size(), 2u);
+    EXPECT_EQ(addOps[0], muls[2]) << "imag part = THIRD product (ad) plus ...";
+    EXPECT_EQ(addOps[1], muls[3]) << "... the FOURTH product (bc)";
+
+    // Both results are STORED into the slot (the by-address contract — a complex
+    // rvalue never stays a bare SSA value).
+    bool realStored = false, imagStored = false;
+    for (MirInstId const st : collectOps(m, MirOpcode::Store)) {
+        auto const ops = m.instOperands(st);
+        if (ops.size() == 2 && ops[0] == subs[0]) realStored = true;
+        if (ops.size() == 2 && ops[0] == adds[0]) imagStored = true;
+    }
+    EXPECT_TRUE(realStored) << "the real component must be stored into the slot";
+    EXPECT_TRUE(imagStored) << "the imag component must be stored into the slot";
+}
+
+// C99 _Complex (D-CSUBSET-COMPLEX / design test #8, the IMPORTANT-9 division witness
+// at the MIR tier): `ga / gb` emits the basic algebraic form
+// (a+bi)/(c+di) = [(ac+bd) + (bc−ad)i] / (c²+d²) — 6 FMul, 2 FAdd (denominator c²+d²
+// and numerator-real ac+bd), 1 FSub (numerator-imag bc−ad), 2 FDiv. The DENOMINATOR
+// IS COMPUTED ONCE: both FDivs share the SAME second operand (one FAdd), pinned by
+// identity — a re-computed denominator (two distinct FAdd feeds) fails this.
+TEST(MirLoweringCSubset, ComplexDivideEmitsSharedDenominatorShape) {
+    auto L = lowerCSubset(
+        "double _Complex ga;\n"
+        "double _Complex gb;\n"
+        "int main(void) { double _Complex q = ga / gb; return 0; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    auto const muls = collectOps(m, MirOpcode::FMul);
+    auto const adds = collectOps(m, MirOpcode::FAdd);
+    auto const subs = collectOps(m, MirOpcode::FSub);
+    auto const divs = collectOps(m, MirOpcode::FDiv);
+    ASSERT_EQ(muls.size(), 6u) << "complex / emits EXACTLY 6 FMul (ac,bd,bc,ad,cc,dd)";
+    ASSERT_EQ(adds.size(), 2u) << "complex / emits EXACTLY 2 FAdd (denom c2+d2, numR ac+bd)";
+    ASSERT_EQ(subs.size(), 1u) << "complex / emits EXACTLY 1 FSub (numI bc-ad)";
+    ASSERT_EQ(divs.size(), 2u) << "complex / emits EXACTLY 2 FDiv (re, im)";
+
+    // The denominator is computed ONCE and SHARED: both FDivs' divisor operand is
+    // the SAME instruction, and it is one of the two FAdds (c²+d²).
+    auto const d0 = m.instOperands(divs[0]);
+    auto const d1 = m.instOperands(divs[1]);
+    ASSERT_EQ(d0.size(), 2u);
+    ASSERT_EQ(d1.size(), 2u);
+    EXPECT_EQ(d0[1], d1[1])
+        << "BOTH divisions must divide by the SAME denominator instruction "
+           "(computed once — a re-computed c2+d2 is a shape regression)";
+    EXPECT_TRUE(d0[1] == adds[0] || d0[1] == adds[1])
+        << "the shared denominator must be one of the two FAdds (c2+d2)";
+    // The two dividends are the numerator FAdd (ac+bd) and the numerator FSub
+    // (bc−ad) — one each.
+    MirInstId const numAdd = (d0[1] == adds[0]) ? adds[1] : adds[0];
+    EXPECT_TRUE((d0[0] == numAdd && d1[0] == subs[0])
+             || (d0[0] == subs[0] && d1[0] == numAdd))
+        << "the dividends must be the numerator FAdd (real) and FSub (imag)";
+}
+
+// C99 _Complex (D-CSUBSET-COMPLEX / design test #9): the complex->complex ELEMENT
+// CONVERT — `double _Complex z = w;` (w float _Complex) element-converts each
+// component: EXACTLY 2 FPExt (re, im) via materializeComplexCast/convertScalar; the
+// narrowing direction emits EXACTLY 2 FPTrunc. (The runtime witness rides the
+// c99_complex example's float arm; this pins the MIR shape.)
+TEST(MirLoweringCSubset, ComplexElementConvertEmitsTwoComponentConverts) {
+    {
+        auto L = lowerCSubset(
+            "float _Complex w;\n"
+            "int main(void) { double _Complex z = w; return 0; }\n");
+        ASSERT_FALSE(L.model.hasErrors())
+            << (L.model.diagnostics().all().empty()
+                    ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.hir->ok)
+            << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        auto const exts = collectOps(m, MirOpcode::FPExt);
+        ASSERT_EQ(exts.size(), 2u)
+            << "float _Complex -> double _Complex must FPExt EACH component "
+               "(re and im) — one lost convert is a half-converted value";
+        EXPECT_TRUE(collectOps(m, MirOpcode::FPTrunc).empty());
+    }
+    {
+        auto L = lowerCSubset(
+            "double _Complex z;\n"
+            "int main(void) { float _Complex w = z; return 0; }\n");
+        ASSERT_FALSE(L.model.hasErrors())
+            << (L.model.diagnostics().all().empty()
+                    ? "" : L.model.diagnostics().all()[0].actual);
+        ASSERT_TRUE(L.hir->ok)
+            << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+        ASSERT_TRUE(L.mir.ok)
+            << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+        Mir const& m = L.mir.mir;
+        auto const truncs = collectOps(m, MirOpcode::FPTrunc);
+        ASSERT_EQ(truncs.size(), 2u)
+            << "double _Complex -> float _Complex must FPTrunc EACH component";
+        EXPECT_TRUE(collectOps(m, MirOpcode::FPExt).empty());
+    }
+}
+
+namespace {
+
+// FC17.9(d) atomic cycle-1 Phase D/E (D-CSUBSET-ATOMIC): lower a program that
+// `#include <stdatomic.h>` through the FULL pipeline with a scratch-dir stdatomic
+// descriptor on the system path (the setjmp buildAngleDescriptorUnit discipline).
+// The scratch descriptor uses the REAL codec spelling `atomic<i32>` for atomic_int +
+// the 6 memory_order constants — so it faithfully exercises the M1 hir_text codec
+// (parseTypeFromText → interner.atomicQualified) that the shipped stdatomic.json uses.
+[[nodiscard]] Lowered lowerAtomicProgram(std::string mainSrc) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir sysDir{Location::Temp, "stdatomic-mir"};
+    std::ofstream(sysDir.path() / "stdatomic.json", std::ios::binary) << R"JSON({
+        "header": "stdatomic.h",
+        "availableObjectFormats": ["elf", "pe", "macho"],
+        "typedefs": [
+            { "name": "atomic_int", "type": "atomic<i32>" }
+        ],
+        "constants": [
+            { "name": "memory_order_relaxed", "value": 0, "type": "i32" },
+            { "name": "memory_order_consume", "value": 1, "type": "i32" },
+            { "name": "memory_order_acquire", "value": 2, "type": "i32" },
+            { "name": "memory_order_release", "value": 3, "type": "i32" },
+            { "name": "memory_order_acq_rel", "value": 4, "type": "i32" },
+            { "name": "memory_order_seq_cst", "value": 5, "type": "i32" }
+        ]
+    })JSON";
+
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    UnitBuilder builder{*loaded};
+    builder.addSystemDir(sysDir.path());
+    builder.addInMemory(std::move(mainSrc), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    // Active elf/x86_64 (harmless — atomic_int carries no per-format variant).
+    auto model = analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+                         ObjectFormatKind::Elf, "x86_64");
+    DiagnosticReporter hirReporter;
+    auto hir = lowerToHir(model, hirReporter);
+    DiagnosticReporter mirReporter;
+    MirLoweringConfig mirCfg;
+    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
+        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+        if (auto const* cc = (*t)->callingConventionByName("sysv_amd64")) {
+            mirCfg.aggregateClassification   = cc->aggregateClassification;
+            mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
+            mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
+            mirCfg.argSlotAligned            = cc->slotAligned;
+            mirCfg.argGprCount = static_cast<std::uint32_t>(cc->argGprs.size());
+            mirCfg.argFprCount = static_cast<std::uint32_t>(cc->argFprs.size());
+            mirCfg.aggregateStackExhaustsRegisters = cc->aggregateStackExhaustsRegisters;
+            mirCfg.vaListLayout = cc->vaListLayout;
+        }
+    }
+    HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
+                                    model.lattice().interner(), mirReporter,
+                                    &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
+                                    &hir->linkageMap, &hir->mutabilityMap,
+                                    &hir->volatileMap, /*alignmentMap=*/nullptr,
+                                    &hir->threadLocalMap,
+                                    &hir->vlaSizeExprBySymbol,
+                                    &hir->sizeofVlaSymbol,
+                                    &hir->typedefVlaOriginBySymbol);
+    return Lowered{
+        .model       = std::move(model),
+        .hir         = std::move(hir),
+        .hirReporter = std::move(hirReporter),
+        .mir         = std::move(mir),
+        .mirReporter = std::move(mirReporter),
+    };
+}
+
+} // namespace
+
+// E2 — the bare-`atomic_int` atomicity pin (audit-a / M1 critical path): a shipped
+// `atomic_int x; x = 5; return x;` MUST lower to AtomicStore/AtomicLoad, proving the
+// shipped typedef genuinely carries the Atomic bit through the parseTypeFromText codec
+// (`atomic<i32>` → atomicQualified). RED-ON-DISABLE: drop the M1 codec qualifier
+// spelling (hir_text.cpp) → `atomic<i32>` reinterns as plain `int` → `atomic_int`
+// decays to a plain int → the accesses lower to plain Store/Load → this flips.
+TEST(MirLoweringCSubset, ShippedAtomicIntTypedefCarriesAtomicBit) {
+    auto L = lowerAtomicProgram(
+        "#include <stdatomic.h>\n"
+        "int main(void) { atomic_int x; x = 5; return x; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    bool sawAtomicStore = false, sawAtomicLoad = false;
+    bool sawPlainStore = false, sawPlainLoad = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                switch (m.instOpcode(m.blockInstAt(b, i))) {
+                    case MirOpcode::AtomicStore: sawAtomicStore = true; break;
+                    case MirOpcode::AtomicLoad:  sawAtomicLoad  = true; break;
+                    case MirOpcode::Store:       sawPlainStore  = true; break;
+                    case MirOpcode::Load:        sawPlainLoad   = true; break;
+                    default: break;
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(sawAtomicStore) << "shipped `atomic_int x; x=5` must lower to atomic_store"
+                                   " (the typedef must carry the Atomic bit via M1)";
+    EXPECT_TRUE(sawAtomicLoad)  << "shipped `atomic_int` read must lower to atomic_load";
+    EXPECT_FALSE(sawPlainStore) << "atomic_int must not decay to a plain-int store";
+    EXPECT_FALSE(sawPlainLoad)  << "atomic_int must not decay to a plain-int load";
+}
+
+// E3 — the order-fold pins (audit-c): the memory_order arg of atomic_store_explicit /
+// atomic_load_explicit folds to the EXACT MIR payload. `memory_order_relaxed` → 0 on
+// the store; `memory_order_seq_cst` → 5 on the load. RED-ON-DISABLE: break the
+// foldAtomicOrder const-fold (e.g. hardcode seq_cst) → the relaxed store's payload
+// becomes 5, not 0 → the EXPECT_EQ(...,0u) fails. Also pins the operand SHAPE:
+// AtomicStore = [value, ptr], AtomicLoad = [ptr] — the order arg is DROPPED.
+TEST(MirLoweringCSubset, AtomicExplicitAccessorsFoldMemoryOrderIntoPayload) {
+    auto L = lowerAtomicProgram(
+        "#include <stdatomic.h>\n"
+        "int main(void) {\n"
+        "    atomic_int x;\n"
+        "    atomic_store_explicit(&x, 42, memory_order_relaxed);\n"
+        "    return atomic_load_explicit(&x, memory_order_seq_cst);\n"
+        "}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    int atomicStores = 0, atomicLoads = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                switch (m.instOpcode(id)) {
+                    case MirOpcode::AtomicStore:
+                        ++atomicStores;
+                        EXPECT_EQ(m.instPayload(id), 0u)   // memory_order_relaxed
+                            << "atomic_store_explicit(_, _, memory_order_relaxed) must"
+                               " fold to payload 0";
+                        EXPECT_EQ(m.instOperands(id).size(), 2u)   // [value, ptr]
+                            << "AtomicStore takes [value, ptr] — the order arg is dropped";
+                        break;
+                    case MirOpcode::AtomicLoad:
+                        ++atomicLoads;
+                        EXPECT_EQ(m.instPayload(id), 5u)   // memory_order_seq_cst
+                            << "atomic_load_explicit(_, memory_order_seq_cst) must fold"
+                               " to payload 5";
+                        EXPECT_EQ(m.instOperands(id).size(), 1u)   // [ptr]
+                            << "AtomicLoad takes [ptr] — the order arg is dropped";
+                        break;
+                    default: break;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(atomicStores, 1) << "exactly one atomic_store_explicit";
+    EXPECT_EQ(atomicLoads, 1)  << "exactly one atomic_load_explicit";
+}
+
+// audit fold-d — `_Atomic volatile int` (the user-named combination): the access
+// lowers to AtomicLoad/AtomicStore ALONE (NO separate MirInstFlags::Volatile) — the
+// atomic op's hasSideEffects + opcodeClobbersMemory subsume volatile's
+// no-elide/no-CSE/no-hoist. Uses the RAW qualifier form (no <stdatomic.h> needed).
+// RED-ON-DISABLE: were the combined qualifier routed through the volatile path
+// instead, it would emit a plain Store/Load carrying the Volatile flag → the atomic
+// ops would be absent (EXPECT_TRUE flips) and a plain Store would appear.
+TEST(MirLoweringCSubset, AtomicVolatileScalarLowersToAtomicOpsAlone) {
+    auto L = lowerCSubset(
+        "int main(void) { _Atomic volatile int v; v = 7; return v; }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    bool sawAtomicStore = false, sawAtomicLoad = false;
+    bool sawPlainStore = false, sawPlainLoad = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                switch (m.instOpcode(id)) {
+                    case MirOpcode::AtomicStore:
+                    case MirOpcode::AtomicLoad:
+                        if (m.instOpcode(id) == MirOpcode::AtomicStore)
+                            sawAtomicStore = true;
+                        else
+                            sawAtomicLoad = true;
+                        // fold-d: the atomic op carries NO separate Volatile flag.
+                        EXPECT_FALSE(has(m.instFlags(id), MirInstFlags::Volatile))
+                            << "an _Atomic volatile access must not ALSO carry the"
+                               " Volatile flag — the atomic op subsumes it";
+                        break;
+                    case MirOpcode::Store: sawPlainStore = true; break;
+                    case MirOpcode::Load:  sawPlainLoad  = true; break;
+                    default: break;
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(sawAtomicStore) << "`_Atomic volatile v = 7` must lower to atomic_store";
+    EXPECT_TRUE(sawAtomicLoad)  << "`return v` must lower to atomic_load";
+    EXPECT_FALSE(sawPlainStore) << "_Atomic volatile must take the atomic path, not a"
+                                   " plain volatile store";
+    EXPECT_FALSE(sawPlainLoad)  << "_Atomic volatile must take the atomic path, not a"
+                                   " plain volatile load";
+}
+
+// M3 — a NON-constant (runtime) memory_order arg → the safe seq_cst (5) fallback
+// (over-fencing is C11-legal, strictly more permissive) — NOT fail-loud (a runtime
+// order value is legal C11). `ord` is a function parameter (non-foldable), so
+// foldAtomicOrder can't const-fold it and clamps to seq_cst. RED-ON-DISABLE: drop the
+// `v < 0 || v > 5 → seq_cst` clamp (return the raw fold) → a non-foldable order yields
+// no value (v stays -1) and the payload becomes a garbage cast, not 5.
+TEST(MirLoweringCSubset, AtomicExplicitNonConstOrderFallsBackToSeqCst) {
+    auto L = lowerAtomicProgram(
+        "#include <stdatomic.h>\n"
+        "int run(int ord) {\n"
+        "    atomic_int x;\n"
+        "    atomic_store_explicit(&x, 42, ord);\n"
+        "    return atomic_load_explicit(&x, ord);\n"
+        "}\n"
+        "int main(void) { return run(0); }\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << (L.model.diagnostics().all().empty()
+                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    int atomics = 0;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const f = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(f); ++bi) {
+            MirBlockId const b = m.funcBlockAt(f, bi);
+            for (std::uint32_t i = 0; i < m.blockInstCount(b); ++i) {
+                MirInstId const id = m.blockInstAt(b, i);
+                MirOpcode const op = m.instOpcode(id);
+                if (op == MirOpcode::AtomicStore || op == MirOpcode::AtomicLoad) {
+                    ++atomics;
+                    EXPECT_EQ(m.instPayload(id), 5u)   // seq_cst fallback
+                        << "a runtime (non-constant) memory_order must fall back to"
+                           " seq_cst (5), never fail loud or emit garbage";
+                }
+            }
+        }
+    }
+    EXPECT_EQ(atomics, 2) << "one atomic_store + one atomic_load";
 }
 
 // D-CSUBSET-ENUM-INT-CONVERSION (FC8): a bare enumerator lowers to a Const of its
@@ -9424,4 +9921,469 @@ TEST(MirLoweringCSubset, ParamPtrToVlaSubscriptScalesByPrologueStrideSlot) {
     // stack) Alloca: a ptr-to-VLA PARAM carries a fixed 8-byte slot, never a VLA object.
     EXPECT_EQ(gStrideSlots, 1)
         << "a ptr-to-VLA PARAM freezes exactly ONE pointee-stride slot in the prologue";
+}
+
+// FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): each of the 6 GCC-compat builtins
+// __builtin_{popcount,clz,ctz}{,ll} lowers to its DEDICATED pure-unary MIR op
+// (Popcount/Clz/Ctz) — NOT a Call (a compiler intrinsic is not a linkable symbol).
+// The {,ll} pair shares one lowering, so each op appears twice. The op's operand
+// is the wrapper's Arg (single-eval) and its result core is I32 (the GCC `int`).
+TEST(MirLoweringCSubset, BitCountBuiltinsLowerToDedicatedMirOps) {
+    auto L = lowerCSubset(
+        "typedef unsigned int u32;\n"
+        "typedef unsigned long long u64;\n"
+        "int pc32(u32 x){return __builtin_popcount(x);}\n"
+        "int pc64(u64 x){return __builtin_popcountll(x);}\n"
+        "int lz32(u32 x){return __builtin_clz(x);}\n"
+        "int lz64(u64 x){return __builtin_clzll(x);}\n"
+        "int tz32(u32 x){return __builtin_ctz(x);}\n"
+        "int tz64(u64 x){return __builtin_ctzll(x);}\n");
+    ASSERT_FALSE(L.model.hasErrors())
+        << "semantic phase: " << (L.model.diagnostics().all().empty()
+            ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "HIR lowering: " << (L.hirReporter.all().empty()
+            ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR lowering: " << (L.mirReporter.all().empty()
+            ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    int nPop = 0, nClz = 0, nCtz = 0, nCall = 0;
+    MirInstId popInst{};
+    for (std::size_t f = 0; f < m.moduleFuncCount(); ++f) {
+        MirFuncId const fn = m.funcAt(static_cast<std::uint32_t>(f));
+        MirBlockId const entry = m.funcEntry(fn);
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i) {
+            MirInstId const id = m.blockInstAt(entry, i);
+            switch (m.instOpcode(id)) {
+                case MirOpcode::Popcount: ++nPop; popInst = id; break;
+                case MirOpcode::Clz:      ++nClz; break;
+                case MirOpcode::Ctz:      ++nCtz; break;
+                case MirOpcode::Call:     ++nCall; break;
+                default: break;
+            }
+        }
+    }
+    EXPECT_EQ(nPop, 2);
+    EXPECT_EQ(nClz, 2);
+    EXPECT_EQ(nCtz, 2);
+    EXPECT_EQ(nCall, 0) << "a compiler intrinsic must not lower to a Call";
+
+    // Structural: Popcount is unary, its operand is the fn's Arg, result core I32.
+    ASSERT_GT(nPop, 0);
+    auto const popOps = m.instOperands(popInst);
+    ASSERT_EQ(popOps.size(), 1u);
+    EXPECT_EQ(m.instOpcode(popOps[0]), MirOpcode::Arg);
+    EXPECT_EQ(interner.kind(m.instType(popInst)), TypeKind::I32);
+}
+
+// ── FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 stdc_* op MIR-shape pins ──
+// Each `__builtin_stdc_<op>_<T>` lowers (hir_to_mir emitStdbitOp) to a width-correct
+// BRANCHLESS composition of the 3 primitives (Popcount/Clz/Ctz) + universal ALU
+// verbs — NO new MIR op, NO Call, single straight-line block. The builtins are
+// always-injected, so no <stdbit.h> include is needed to reach the composition.
+namespace {
+// The composition is branchless → every op is in some function's entry block.
+[[nodiscard]] std::vector<MirInstId> stdbitAllEntryInsts(Mir const& m) {
+    std::vector<MirInstId> out;
+    for (std::size_t f = 0; f < m.moduleFuncCount(); ++f) {
+        MirFuncId const fn    = m.funcAt(static_cast<std::uint32_t>(f));
+        MirBlockId const entry = m.funcEntry(fn);
+        for (std::uint32_t i = 0; i < m.blockInstCount(entry); ++i)
+            out.push_back(m.blockInstAt(entry, i));
+    }
+    return out;
+}
+[[nodiscard]] int stdbitCountOp(Mir const& m, std::vector<MirInstId> const& ids,
+                                MirOpcode op) {
+    int n = 0;
+    for (MirInstId id : ids) if (m.instOpcode(id) == op) ++n;
+    return n;
+}
+[[nodiscard]] MirInstId stdbitFirstOp(Mir const& m, std::vector<MirInstId> const& ids,
+                                      MirOpcode op) {
+    for (MirInstId id : ids) if (m.instOpcode(id) == op) return id;
+    return MirInstId{};
+}
+} // namespace
+
+// ── FC17.9(i) (D-CSUBSET-INLINE-ASM): the asm→CompilerBarrier LOWERING pin ──
+// THE critical red-on-disable of this cycle. An empty optimizer barrier is
+// RESULT-NEUTRAL, so no exit-code test can tell "barrier present" from "barrier
+// absent" (the c_inline_asm example returns 42 either way). Mapping asmStmt to
+// Skip/nothing (the tempting staticAssertDecl twin, which lowers to nothing) would
+// PASS the runtime probe while SILENTLY DELETING the barrier — the exact semantics
+// the feature exists to provide. This pins the LINK at the MIR tier: the empty
+// `__asm__ volatile("")` must lower to EXACTLY ONE MirOpcode::CompilerBarrier.
+// RED-ON-DISABLE: map asmStmt→Skip (c-subset.lang.json hirLowering) or drop the
+// addInst in hir_to_mir's InlineAsm case → the count drops to 0 → RED. (The
+// barrier→blocks-optimizer half is pinned by test_cse LoadNotCsedAcrossCompiler-
+// Barrier; T2 ∘ that = "the asm statement blocks the optimizer", each link
+// independently red-on-disable.) Reuses the general entry-block opcode scanners
+// above (the barrier is in main/f's straight-line entry block).
+TEST(MirLoweringCSubset, InlineAsmEmptyTemplateLowersToCompilerBarrier) {
+    auto L = lowerCSubset("void f(void){ __asm__ volatile(\"\"); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::CompilerBarrier), 1)
+        << "the empty __asm__ statement must lower to exactly one CompilerBarrier "
+           "(a Skip-mapping would pass the exit-code probe but silently drop it)";
+    // The barrier emits NO runtime instruction and is NOT a Call.
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Call), 0);
+}
+
+// The empty asm WITHOUT `volatile` lowers to the SAME barrier — volatile is inert
+// for the empty form (a no-output asm is implicitly volatile; GCC 6.47.2.1).
+TEST(MirLoweringCSubset, InlineAsmEmptyTemplateNoVolatileLowersToCompilerBarrier) {
+    auto L = lowerCSubset("void f(void){ __asm__(\"\"); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::CompilerBarrier), 1);
+}
+
+// leading_zeros = clz(x) − (P − W): a single Clz, NO Popcount/Ctz/Shl.
+TEST(MirLoweringCSubset, StdbitLeadingZerosComposesClz) {
+    auto L = lowerCSubset(
+        "unsigned f(unsigned char x){ return __builtin_stdc_leading_zeros_uc(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Clz), 1);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Popcount), 0);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Ctz), 0);
+    EXPECT_GE(stdbitCountOp(m, ids, MirOpcode::Sub), 1);   // − (P−W)
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Shl), 0);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Call), 0)
+        << "a stdc_* intrinsic must not lower to a Call";
+}
+
+// count_ones = popcount(x): a single Popcount, NO Clz/Ctz.
+TEST(MirLoweringCSubset, StdbitCountOnesComposesPopcount) {
+    auto L = lowerCSubset(
+        "unsigned f(unsigned int x){ return __builtin_stdc_count_ones_ui(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Popcount), 1);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Clz), 0);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Ctz), 0);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Call), 0);
+}
+
+// bit_width = P − clz(x): a single Clz + a Sub, NO Popcount/Shl (clz(0)=P → 0, no guard).
+TEST(MirLoweringCSubset, StdbitBitWidthComposesClzSub) {
+    auto L = lowerCSubset(
+        "unsigned f(unsigned short x){ return __builtin_stdc_bit_width_us(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Clz), 1);
+    EXPECT_GE(stdbitCountOp(m, ids, MirOpcode::Sub), 1);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Popcount), 0);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Shl), 0);
+}
+
+// has_single_bit = popcount(x)==1: a Popcount feeding an ICmpEq whose result IS Bool.
+TEST(MirLoweringCSubset, StdbitHasSingleBitIsPopcountEqOneBool) {
+    auto L = lowerCSubset(
+        "int f(unsigned int x){ return __builtin_stdc_has_single_bit_ui(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto const& interner = L.model.lattice().interner();
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Popcount), 1);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Clz), 0);
+    MirInstId const eq = stdbitFirstOp(m, ids, MirOpcode::ICmpEq);
+    ASSERT_TRUE(eq.valid());
+    EXPECT_EQ(interner.kind(m.instType(eq)), TypeKind::Bool)
+        << "has_single_bit's compare must be the Bool result (C23 returns bool)";
+}
+
+// first_leading_one = x==0 ? 0 : leading_zeros+1: a Clz + an Add + a branchless
+// select (the Or of the two masked arms), NO Popcount/Ctz.
+TEST(MirLoweringCSubset, StdbitFirstLeadingOneComposesClzSelect) {
+    auto L = lowerCSubset(
+        "unsigned f(unsigned char x){ return __builtin_stdc_first_leading_one_uc(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_GE(stdbitCountOp(m, ids, MirOpcode::Clz), 1);
+    EXPECT_GE(stdbitCountOp(m, ids, MirOpcode::Add), 1);   // +1
+    EXPECT_GE(stdbitCountOp(m, ids, MirOpcode::Or), 1);    // the branchless select
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Popcount), 0);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Ctz), 0);
+}
+
+// bit_ceil = a Clz + a Shl + an And (the W−1 mask): the branchless power-of-two ceil.
+TEST(MirLoweringCSubset, StdbitBitCeilComposesClzShlAndMask) {
+    auto L = lowerCSubset(
+        "unsigned f(unsigned int x){ return __builtin_stdc_bit_ceil_ui(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Clz), 1);
+    EXPECT_GE(stdbitCountOp(m, ids, MirOpcode::Shl), 1);
+    EXPECT_GE(stdbitCountOp(m, ids, MirOpcode::And), 1);   // the (W−1) clamp mask
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Popcount), 0);
+}
+
+// ★ RED-ON-DISABLE shift-clamp pin (audit I3): bit_floor's `1 << amt` amount MUST be
+// the CLAMPED `bit_width − (x≠0)` — i.e. Shl.operand[1] is a Sub whose RHS is a ZExt
+// of an ICmpNe, NOT a bare `bit_width − 1` (Const). The branchless composition ALWAYS
+// evaluates the shift (the outer sel only discards its RESULT for x==0), so the shift
+// amount must be in range on EVERY path: the clamp yields amt=0 at x==0, whereas a bare
+// `bw − 1` would emit `1 << (0−1)` — an out-of-range (UB) shift in the always-evaluated
+// arm. Removing the clamp puts a Const at Sub.operand[1] → this pin FAILS, as it must.
+TEST(MirLoweringCSubset, StdbitBitFloorShiftAmountIsClampedNotBareMinusOne) {
+    auto L = lowerCSubset(
+        "unsigned f(unsigned char x){ return __builtin_stdc_bit_floor_uc(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    ASSERT_EQ(stdbitCountOp(m, ids, MirOpcode::Shl), 1) << "bit_floor has exactly one shift";
+    ASSERT_EQ(stdbitCountOp(m, ids, MirOpcode::Clz), 1);
+    MirInstId const shl = stdbitFirstOp(m, ids, MirOpcode::Shl);
+    ASSERT_TRUE(shl.valid());
+    auto const shlOps = m.instOperands(shl);
+    ASSERT_EQ(shlOps.size(), 2u);
+    // Shl.operand[1] = amt = Sub(bit_width, ZExt(ICmpNe(x, 0))).
+    MirInstId const amt = shlOps[1];
+    ASSERT_EQ(m.instOpcode(amt), MirOpcode::Sub)
+        << "the shift amount must be a Sub (bit_width − (x≠0)), the clamped form";
+    auto const subOps = m.instOperands(amt);
+    ASSERT_EQ(subOps.size(), 2u);
+    // The SECOND Sub operand is the clamp term — a ZExt of a compare, NOT a Const 1.
+    MirInstId const clampTerm = subOps[1];
+    EXPECT_NE(m.instOpcode(clampTerm), MirOpcode::Const)
+        << "an unguarded `1 << (bit_width − 1)` (Const 1 here) is a shift-UB regression";
+    ASSERT_EQ(m.instOpcode(clampTerm), MirOpcode::ZExt);
+    auto const zextOps = m.instOperands(clampTerm);
+    ASSERT_EQ(zextOps.size(), 1u);
+    EXPECT_EQ(m.instOpcode(zextOps[0]), MirOpcode::ICmpNe)
+        << "the clamp is ZExt(x != 0) → amt ∈ [0, W−1] on every branch";
+}
+
+// ★ RED-ON-DISABLE shift-clamp pin (audit I-1): bit_ceil's `1 << amt` amount MUST be the
+// CLAMPED `bit_width(x−1) & (W−1)` — the And keeps amt ∈ [0, W−1] so the ALWAYS-evaluated
+// branchless shift is never out-of-range, even for the overflow input the outer sel discards.
+// The earlier `EXPECT_GE(And, 1)` pin was INERT: bit_ceil's two branchless selects already
+// emit 4 Ands, so dropping the clamp And still left ≥1 → green. This pins the SHIFT's operand
+// chain instead: remove the clamp and Shl.operand[1] becomes the bare `Sub` (bit_width(x−1)) →
+// this ASSERT_EQ(...And) FAILS, exactly as a red-on-disable clamp pin must.
+TEST(MirLoweringCSubset, StdbitBitCeilShiftAmountIsClampedNotBareBitWidth) {
+    auto L = lowerCSubset(
+        "unsigned f(unsigned int x){ return __builtin_stdc_bit_ceil_ui(x); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    ASSERT_EQ(stdbitCountOp(m, ids, MirOpcode::Shl), 1) << "bit_ceil has exactly one shift";
+    MirInstId const shl = stdbitFirstOp(m, ids, MirOpcode::Shl);
+    ASSERT_TRUE(shl.valid());
+    auto const shlOps = m.instOperands(shl);
+    ASSERT_EQ(shlOps.size(), 2u);
+    // Shl.operand[1] = amt = And(bit_width(x−1), Const(W−1)) — the clamp op.
+    MirInstId const amt = shlOps[1];
+    ASSERT_EQ(m.instOpcode(amt), MirOpcode::And)
+        << "the shift amount must be And(bit_width(x−1), W−1), the clamped form — "
+           "a bare Sub (bit_width) here is the shift-UB regression";
+    auto const andOps = m.instOperands(amt);
+    ASSERT_EQ(andOps.size(), 2u);
+    // The clamp masks against the (W−1) constant.
+    EXPECT_EQ(m.instOpcode(andOps[1]), MirOpcode::Const)
+        << "the clamp mask (W−1) must be a Const";
+}
+
+// ── FC17.9(c) (D-CSUBSET-SETJMP): the returns-twice MIR carrier + array-decay ──
+
+namespace {
+
+// The classic setjmp/longjmp round-trip (the dss-state `c_setjmp_longjmp` probe).
+constexpr char const* kSetjmpRoundTripSrc =
+    "#include <setjmp.h>\n"
+    "int main(void) {\n"
+    "    jmp_buf env;\n"
+    "    int r = setjmp(env);\n"
+    "    if (r == 0) longjmp(env, 42);\n"
+    "    return r;\n"
+    "}\n";
+
+// Lower a program that `#include <setjmp.h>` through the FULL c-subset pipeline with a
+// scratch-dir setjmp descriptor on the system path (the buildAngleDescriptorUnit
+// discipline) — the ONLY way to exercise the returnsTwice descriptor→SymbolRecord→MIR
+// carrier chain end-to-end. analyze() is passed the ACTIVE (arch=x86_64, format=Elf) so
+// the per-(arch,format) jmp_buf variant is selected (a flat analyze() would not inject
+// it). lowerToMir threads `&hir->returnsTwiceMap` — the side-table the carrier reads.
+[[nodiscard]] Lowered lowerSetjmpProgram(std::string mainSrc) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+    ScratchDir sysDir{Location::Temp, "setjmp-mir"};
+    // A minimal real-shaped setjmp.json: elf `setjmp` (returnsTwice) + `longjmp`
+    // (noreturn) + the elf-x86_64 jmp_buf variant. The descriptor file is read at
+    // analyze() time, before this helper returns, so the ScratchDir may clean up after.
+    std::ofstream(sysDir.path() / "setjmp.json", std::ios::binary) << R"JSON({
+        "header": "setjmp.h",
+        "availableObjectFormats": ["elf", "pe", "macho"],
+        "library": { "elf": "libc.so.6" },
+        "symbols": [
+            { "name": "setjmp",  "signature": "fn(ptr<void>) -> i32",       "returnsTwice": true, "availableObjectFormats": ["elf", "macho"] },
+            { "name": "longjmp", "signature": "fn(ptr<void>, i32) -> void", "noreturn": true }
+        ],
+        "typedefs": [
+            { "name": "jmp_buf", "variants": [
+                { "when": { "arch": "x86_64", "format": "elf" }, "type": "arr<i64, 25>" }
+            ] }
+        ]
+    })JSON";
+
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
+    UnitBuilder builder{*loaded};
+    builder.addSystemDir(sysDir.path());
+    builder.addInMemory(std::move(mainSrc), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+
+    // Pass the ACTIVE target/format so the jmp_buf {arch:x86_64,format:elf} variant is
+    // selected (nullopt would inject no variant typedef → `jmp_buf` undefined).
+    auto model = analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+                         ObjectFormatKind::Elf, "x86_64");
+    DiagnosticReporter hirReporter;
+    auto hir = lowerToHir(model, hirReporter);
+    DiagnosticReporter mirReporter;
+    MirLoweringConfig mirCfg;
+    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    if (auto t = TargetSchema::loadShipped("x86_64"); t.has_value()) {
+        mirCfg.aggregateLayout       = (*t)->aggregateLayout();
+        mirCfg.aggregateLayoutLoaded = (*t)->aggregateLayoutLoaded();
+        if (auto const* cc = (*t)->callingConventionByName("sysv_amd64")) {
+            mirCfg.aggregateClassification   = cc->aggregateClassification;
+            mirCfg.aggregateMaxRegBytes      = cc->aggregateMaxRegBytes;
+            mirCfg.aggregateSretViaHiddenArg = !cc->indirectResultRegister.has_value();
+            mirCfg.argSlotAligned            = cc->slotAligned;
+            mirCfg.argGprCount = static_cast<std::uint32_t>(cc->argGprs.size());
+            mirCfg.argFprCount = static_cast<std::uint32_t>(cc->argFprs.size());
+            mirCfg.aggregateStackExhaustsRegisters = cc->aggregateStackExhaustsRegisters;
+            mirCfg.vaListLayout = cc->vaListLayout;
+        }
+    }
+    // The real pipeline's FFI-synthesis stage (compile_pipeline step 2.5) populates a
+    // per-extern FfiMetadata (mangledName + importLibrary) BETWEEN HIR and MIR; the
+    // HIR→MIR extern pre-pass requires it. Attach a minimal one per shipped extern
+    // (setjmp/longjmp) so MIR lowering proceeds — the documented test convention (mangled
+    // name / library correctness is FFI's concern, exercised in test_ingest.cpp, not this
+    // carrier pin).
+    HirFfiMap ffiMap{hir->hir};
+    for (auto const& r : hir->externDecls) {
+        FfiMetadata meta;
+        meta.mangledName   = r.canonicalName;
+        meta.importLibrary = "libc.so.6";
+        ffiMap.set(r.node, meta);
+    }
+    HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
+                                    model.lattice().interner(), mirReporter,
+                                    &hir->sourceMap, mirCfg, &ffiMap,
+                                    &hir->linkageMap, &hir->mutabilityMap,
+                                    &hir->volatileMap, /*alignmentMap=*/nullptr,
+                                    &hir->threadLocalMap,
+                                    &hir->vlaSizeExprBySymbol,
+                                    &hir->sizeofVlaSymbol,
+                                    &hir->typedefVlaOriginBySymbol,
+                                    /*synthRecipeMap=*/nullptr,
+                                    &hir->returnsTwiceMap);   // FC17.9(c) (D-CSUBSET-SETJMP)
+    return Lowered{
+        .model       = std::move(model),
+        .hir         = std::move(hir),
+        .hirReporter = std::move(hirReporter),
+        .mir         = std::move(mir),
+        .mirReporter = std::move(mirReporter),
+    };
+}
+
+} // namespace
+
+// THE CARRIER PIN (D-CSUBSET-SETJMP, audit C2): the setjmp Call reaches MIR carrying
+// `MirInstFlags::ReturnsTwice`, and NO other Call does — the flag the optimizer's
+// returns-twice passes will read. Bundles the array-decay proof (audit Q8): `setjmp(env)`
+// with NO `&` decays the jmp_buf ARRAY typedef to a POINTER arg (not passed by value).
+// RED-ON-DISABLE: drop the `returnsTwiceFlagFor` OR in finishCall → the setjmp Call
+// carries no flag → returnsTwiceCalls==0 → the EXPECT_EQ(…,1) fails.
+TEST(MirLoweringCSubset, SetjmpCallCarriesReturnsTwiceFlagAndDecaysEnv) {
+    auto L = lowerSetjmpProgram(kSetjmpRoundTripSrc);
+    ASSERT_FALSE(L.model.hasErrors())
+        << "semantic: " << (L.model.diagnostics().all().empty()
+                                ? "" : L.model.diagnostics().all()[0].actual);
+    ASSERT_TRUE(L.hir->ok)
+        << "HIR: " << (L.hirReporter.all().empty() ? "" : L.hirReporter.all()[0].actual);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR: " << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    TypeInterner const& interner = L.model.lattice().interner();
+
+    int returnsTwiceCalls = 0;
+    int plainCalls        = 0;
+    MirInstId setjmpCall{};
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const fn = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+            MirBlockId const blk = m.funcBlockAt(fn, bi);
+            for (std::uint32_t ii = 0; ii < m.blockInstCount(blk); ++ii) {
+                MirInstId const id = m.blockInstAt(blk, ii);
+                if (m.instOpcode(id) != MirOpcode::Call) continue;
+                if (has(m.instFlags(id), MirInstFlags::ReturnsTwice)) {
+                    ++returnsTwiceCalls;
+                    setjmpCall = id;
+                } else {
+                    ++plainCalls;
+                }
+            }
+        }
+    }
+    EXPECT_EQ(returnsTwiceCalls, 1)
+        << "exactly the setjmp Call must carry MirInstFlags::ReturnsTwice (the carrier "
+           "reached MIR)";
+    EXPECT_GE(plainCalls, 1)
+        << "the longjmp Call must NOT carry ReturnsTwice (noreturn, not returns-twice)";
+    ASSERT_TRUE(setjmpCall.valid());
+
+    // setjmp returns i32.
+    EXPECT_EQ(interner.kind(m.instType(setjmpCall)), TypeKind::I32);
+    // Array-decay proof: operands = [callee, env-arg]; the env arg is POINTER-typed —
+    // the jmp_buf array decayed to a pointer at the call site, NOT passed by value.
+    auto const ops = m.instOperands(setjmpCall);
+    ASSERT_GE(ops.size(), 2u) << "setjmp Call must have [callee, env-arg]";
+    EXPECT_EQ(interner.kind(m.instType(ops[1])), TypeKind::Ptr)
+        << "env (jmp_buf array) must decay to a pointer arg "
+           "(D-CSUBSET-ARRAY-DECAY-TO-VOID-PTR)";
+}
+
+// The longjmp `noreturn` discharge reaches MIR: the block emitting the longjmp Call
+// terminates in `Unreachable` (post-longjmp code is unreachable — C11 7.13.2.1). The
+// existing D-CSUBSET-NORETURN machinery covers it; this pins it holds for a shipped
+// setjmp.json `longjmp`. RED-ON-DISABLE: drop longjmp's `noreturn` bit → the call's
+// block falls through instead of terminating in Unreachable.
+TEST(MirLoweringCSubset, LongjmpNoreturnTerminatesBlockInUnreachable) {
+    auto L = lowerSetjmpProgram(kSetjmpRoundTripSrc);
+    ASSERT_FALSE(L.model.hasErrors());
+    ASSERT_TRUE(L.hir->ok);
+    ASSERT_TRUE(L.mir.ok)
+        << "MIR: " << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+
+    Mir const& m = L.mir.mir;
+    bool sawUnreachable = false;
+    for (std::uint32_t fi = 0; fi < m.moduleFuncCount(); ++fi) {
+        MirFuncId const fn = m.funcAt(fi);
+        for (std::uint32_t bi = 0; bi < m.funcBlockCount(fn); ++bi) {
+            MirBlockId const blk = m.funcBlockAt(fn, bi);
+            std::uint32_t const n = m.blockInstCount(blk);
+            if (n == 0) continue;
+            if (m.instOpcode(m.blockInstAt(blk, n - 1)) == MirOpcode::Unreachable)
+                sawUnreachable = true;
+        }
+    }
+    EXPECT_TRUE(sawUnreachable)
+        << "longjmp is noreturn → its block must terminate in Unreachable";
 }

@@ -268,12 +268,13 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
     // Float → Float: convert via host. F32 needs an actual
     // narrowing round-trip (otherwise the stored `double` would
     // diverge from the IEEE-754 single-precision value the runtime
-    // produces); F64 is identity; F16 / F128 have no host backing
-    // and refuse — storing a `double` under `core = F16` would
+    // produces); F64 is identity; F16 / F80 / F128 (every kind whose
+    // floatKindInfo.hostBacked is false — F80 joined with FC17.9(e)) have no
+    // host backing and refuse — storing a `double` under `core = F16` would
     // violate the `HirLiteralValue::core` ↔ variant-arm contract
-    // (the value-bits wouldn't be the actual half/quad). Lifting
-    // F16 / F128 requires a soft-float helper, deferred in plan
-    // 12.5 closure (no consumer today emits these literals).
+    // (the value-bits wouldn't be the actual half/x87-ext/quad). Lifting them
+    // requires a soft-float helper, deferred (long double: the per-format
+    // D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION arc).
     if (sourceFloat && targetFloat) {
         auto info = floatKindInfo(toK);
         if (!info.has_value() || !info->hostBacked) {
@@ -288,7 +289,8 @@ combineCast(Hir const& hir, TypeInterner& interner, HirNodeId expr,
 
     // Int → Float: host conversion (precision-loss for huge ints is
     // IEEE 754-defined behaviour; runtime path produces the same
-    // bits). F16 / F128 refuse for the same reason as float→float.
+    // bits). F16 / F80 / F128 refuse for the same reason as float→float
+    // (no host backing — the hostBacked gate below).
     if (!sourceFloat && targetFloat) {
         auto info = floatKindInfo(toK);
         if (!info.has_value() || !info->hostBacked) {

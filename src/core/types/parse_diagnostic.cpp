@@ -46,6 +46,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::P_PreprocessorPaste:        return "P_PreprocessorPaste";
         case DiagnosticCode::P_PreprocessorPredefinedMacro: return "P_PreprocessorPredefinedMacro";
         case DiagnosticCode::P_PreprocessorHasInclude:   return "P_PreprocessorHasInclude";
+        case DiagnosticCode::P_PreprocessorEmbed:        return "P_PreprocessorEmbed";
         case DiagnosticCode::P_ExpressionTooDeep:        return "P_ExpressionTooDeep";
         case DiagnosticCode::P_BuilderInvariant:         return "P_BuilderInvariant";
         case DiagnosticCode::P_TooManyDiagnostics:       return "P_TooManyDiagnostics";
@@ -215,6 +216,11 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::S_VlaSizeNotInteger:        return "S_VlaSizeNotInteger";
         case DiagnosticCode::S_ArrayParamQualifierNonParameter:
             return "S_ArrayParamQualifierNonParameter";
+        case DiagnosticCode::S_AtomicNonLockFree:        return "S_AtomicNonLockFree";
+        case DiagnosticCode::S_LongDoubleFormatUndeclared:
+            return "S_LongDoubleFormatUndeclared";
+        case DiagnosticCode::S_InlineAsmNonEmptyTemplate:
+            return "S_InlineAsmNonEmptyTemplate";
         case DiagnosticCode::D_FileNotFound:             return "D_FileNotFound";
         case DiagnosticCode::D_EmptyInput:               return "D_EmptyInput";
         case DiagnosticCode::D_DuplicateFile:            return "D_DuplicateFile";
@@ -266,6 +272,7 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
         case DiagnosticCode::I_BitIntWidthInconsistent:  return "I_BitIntWidthInconsistent";
         case DiagnosticCode::I_VlaAllocaOperandInvalid:  return "I_VlaAllocaOperandInvalid";
         case DiagnosticCode::I_VlaStackRestorePairing:   return "I_VlaStackRestorePairing";
+        case DiagnosticCode::I_AtomicAccessNotLowered:   return "I_AtomicAccessNotLowered";
         case DiagnosticCode::I_ExtensionTypeInMir:       return "I_ExtensionTypeInMir";
         case DiagnosticCode::I_StructCfMismatch:         return "I_StructCfMismatch";
         case DiagnosticCode::I_UnreachableBlock:         return "I_UnreachableBlock";

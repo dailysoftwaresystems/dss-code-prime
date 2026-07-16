@@ -616,6 +616,77 @@ TEST(Arm64Encoder, UmulhEncodesDataProc3SourceHighRegs) {
     EXPECT_EQ(bytes[3], 0x9B);
 }
 
+// ── FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): CLZ / RBIT ──
+//
+// The arm64 half of the native bit-count realization: CLZ (Clz's native op, the
+// `clz` verb shared with x86 LZCNT) + RBIT (arm64's ctz composes CLZ(RBIT(x))).
+// Both are data-processing 1-source (operand in Rn bits 9:5, result in Rd bits
+// 4:0). The opcode field (bits 15:10) discriminates CLZ (000100) from RBIT
+// (000000) — byte 1 (0x10 vs 0x00). The sf bit (byte 3, 0xDA vs 0x5A) picks the
+// 64- vs 32-bit form.
+
+namespace {
+[[nodiscard]] std::vector<std::uint8_t>
+assembleArm64Unary(char const* mnemonic, char const* dst, char const* src,
+                   bool width32) {
+    auto s = TargetSchema::loadShipped("arm64");
+    EXPECT_TRUE(s.has_value());
+    auto const op    = (*s)->opcodeByMnemonic(mnemonic);
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    EXPECT_TRUE(op.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const rd{static_cast<std::uint32_t>(*(*s)->registerByName(dst)), 1, cls};
+    LirReg const rn{static_cast<std::uint32_t>(*(*s)->registerByName(src)), 1, cls};
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(rn) };
+    (void)b.addInst(*op, rd, ops, /*payload=*/0,
+                    width32 ? ::dss::kLirInstFlagWidth32 : std::uint8_t{0});
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    return bytes;
+}
+} // namespace
+
+TEST(Arm64Encoder, ClzX3X4EncodesDataProc1Source) {
+    // clz x3, x4 — base 0xDAC01000 | Rn=x4(4)<<5=0x80 | Rd=x3(3) = 0xDAC01083
+    // → LE bytes: 83 10 C0 DA. The runtime witness is the qemu example arm.
+    auto const bytes = assembleArm64Unary("clz", "x3", "x4", /*width32=*/false);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x83);
+    EXPECT_EQ(bytes[1], 0x10);
+    EXPECT_EQ(bytes[2], 0xC0);
+    EXPECT_EQ(bytes[3], 0xDA);
+}
+
+TEST(Arm64Encoder, ClzW3W4EncodesWForm) {
+    // clz w3, w4 — the 32-bit form (sf=0): 0x5AC01000 | 0x80 | 3 = 0x5AC01083
+    // → LE bytes: 83 10 C0 5A. Byte 3 (0x5A vs 0xDA) pins the sf width bit.
+    auto const bytes = assembleArm64Unary("clz", "x3", "x4", /*width32=*/true);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x83);
+    EXPECT_EQ(bytes[1], 0x10);
+    EXPECT_EQ(bytes[2], 0xC0);
+    EXPECT_EQ(bytes[3], 0x5A);
+}
+
+TEST(Arm64Encoder, RbitX3X4EncodesDataProc1Source) {
+    // rbit x3, x4 — opcode field 000000 (vs CLZ's 000100): 0xDAC00000 | 0x80 | 3
+    // = 0xDAC00083 → LE bytes: 83 00 C0 DA. Byte 1 (0x00 vs 0x10) discriminates
+    // it from CLZ — a swap would silently miscompute ctz. Used by arm64 ctz.
+    auto const bytes = assembleArm64Unary("rbit", "x3", "x4", /*width32=*/false);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x83);
+    EXPECT_EQ(bytes[1], 0x00);
+    EXPECT_EQ(bytes[2], 0xC0);
+    EXPECT_EQ(bytes[3], 0xDA);
+}
+
 TEST(Arm64Encoder, LdaxrW0X1EncodesLoadAcquireExclusive) {
     // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): ldaxr w0, [x1] — load-acquire
     // exclusive, the LL half of the CAS retry loop. W-form base 0x885FFC00
@@ -685,6 +756,121 @@ TEST(Arm64Encoder, StlxrW2W0X1EncodesStoreReleaseExclusiveStatusInRs) {
     EXPECT_EQ(bytes[0], 0x20);
     EXPECT_EQ(bytes[1], 0xFC);
     EXPECT_EQ(bytes[2], 0x02);
+    EXPECT_EQ(bytes[3], 0x88);
+}
+
+// ── FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the per-order fence
+// encodings LDAR / STLR (the non-exclusive RCsc acquire-load /
+// release-store the seq_cst `_Atomic` scalar accesses lower to). ALL
+// three fixed words cross-checked against `aarch64-linux-gnu-as`:
+//   ldar w0,[x0] = 88dffc00 · stlr w0,[x0] = 889ffc00 (see the arc
+// report). A wrong o2/L/Rs bit silently degrades the fence — the
+// byte-3/2 pins lock the exact ordering-class bits. ────────────────
+
+TEST(Arm64Encoder, LdarW0X1EncodesLoadAcquire) {
+    // ldar w0, [x1] — the acquire/seq_cst atomic LOAD. W-form base 0x88DFFC00
+    // (= LDAXR 0x885FFC00 | (1<<23), the o2 acquire bit) | Rn=x1(1)<<5 |
+    // Rt=w0(0) = 0x88DFFC20 — LE bytes: 20 FC DF 88. Unified [ptr, MemBase,
+    // MemOffset] shape: ptr→Rn, result→Rt(rd), MemBase→membase.noscale,
+    // MemOffset(0)→memoffset.zero (LDAR has no offset field; nonzero fails loud).
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const ldarOp = (*s)->opcodeByMnemonic("load_acquire");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(ldarOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(x1),
+                               LirOperand::makeMemBase(1),
+                               LirOperand::makeMemOffset(0) };
+    (void)b.addInst(*ldarOp, x0, ops, /*payload=*/0, kLirInstFlagWidth32);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0xFC);
+    EXPECT_EQ(bytes[2], 0xDF);
+    EXPECT_EQ(bytes[3], 0x88);
+}
+
+TEST(Arm64Encoder, StlrW0X1EncodesStoreRelease) {
+    // stlr w0, [x1] — the release atomic STORE. W-form base 0x889FFC00
+    // (= STLXR 0x8800FC00 | (1<<23) o2 | (0x1F<<16) Rs=11111, i.e. NO status
+    // reg) | Rn=x1(1)<<5 | Rt(value)=w0(0) = 0x889FFC20 — LE bytes: 20 FC 9F 88.
+    // result:none, [value, ptr, MemBase, MemOffset]: value→Rt(rd), ptr→Rn.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const stlrOp = (*s)->opcodeByMnemonic("store_release");
+    auto const retOp  = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(stlrOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(x0),    // stored value → Rt
+                               LirOperand::makeReg(x1),    // base → Rn
+                               LirOperand::makeMemBase(1),
+                               LirOperand::makeMemOffset(0) };
+    (void)b.addInst(*stlrOp, InvalidLirReg, ops, /*payload=*/0, kLirInstFlagWidth32);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0xFC);
+    EXPECT_EQ(bytes[2], 0x9F);
+    EXPECT_EQ(bytes[3], 0x88);
+}
+
+TEST(Arm64Encoder, StoreSeqCstW0X1IsIdenticalStlr) {
+    // The seq_cst atomic STORE (the DEFAULT for a plain `_Atomic` write) binds
+    // the SAME STLR encoding as store_release on arm64 — LDAR/STLR are RCsc, so
+    // a release store IS seq_cst (no DMB). stlr w0, [x1] = 0x889FFC20 → 20 FC 9F 88.
+    auto s = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(s.has_value());
+    auto const seqOp = (*s)->opcodeByMnemonic("store_seqcst");
+    auto const retOp = (*s)->opcodeByMnemonic("ret");
+    ASSERT_TRUE(seqOp.has_value() && retOp.has_value());
+    auto const cls = static_cast<std::uint8_t>(LirRegClass::GPR);
+    LirReg const x0{static_cast<std::uint32_t>(*(*s)->registerByName("x0")), 1, cls};
+    LirReg const x1{static_cast<std::uint32_t>(*(*s)->registerByName("x1")), 1, cls};
+
+    LirBuilder b{**s};
+    (void)b.addFunction(SymbolId{1});
+    auto blk = b.createBlock();
+    b.beginBlock(blk);
+    LirOperand const ops[] = { LirOperand::makeReg(x0),
+                               LirOperand::makeReg(x1),
+                               LirOperand::makeMemBase(1),
+                               LirOperand::makeMemOffset(0) };
+    (void)b.addInst(*seqOp, InvalidLirReg, ops, /*payload=*/0, kLirInstFlagWidth32);
+    (void)b.addReturn(*retOp, {});
+    Lir lir = std::move(b).finish();
+
+    DiagnosticReporter rep;
+    auto bytes = assembleFirstFn(lir, **s, rep);
+    EXPECT_EQ(rep.errorCount(), 0u);
+    ASSERT_GE(bytes.size(), 4u);
+    EXPECT_EQ(bytes[0], 0x20);
+    EXPECT_EQ(bytes[1], 0xFC);
+    EXPECT_EQ(bytes[2], 0x9F);
     EXPECT_EQ(bytes[3], 0x88);
 }
 

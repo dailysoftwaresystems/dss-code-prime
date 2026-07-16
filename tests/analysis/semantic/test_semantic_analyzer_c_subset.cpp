@@ -44,14 +44,25 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     // CU-wide builtins scope): c103 `__umulh` (D-CSUBSET-INTRINSIC-UMULH) + c104
     // `_InterlockedCompareExchange` (D-CSUBSET-INTRINSIC-ATOMIC-CAS) + c113
     // `_ReadWriteBarrier` (D-CSUBSET-INTRINSIC-BARRIER) + c115 `_exception_code`
-    // + `_exception_info` (D-WIN64-SEH-FUNCLETS SEH intrinsics) + the 2 FC17.5
+    // + `_exception_info` (D-WIN64-SEH-FUNCLETS SEH intrinsics) + the 6 FC17.9(b)
+    // bit-count builtins (`__builtin_{popcount,clz,ctz}{,ll}`,
+    // D-CSUBSET-BITCOUNT-INTRINSICS) + the 2 FC17.5
     // predefined function-name symbols (`__func__` + `__FUNCTION__`, C99
     // 6.4.2.2 — one per configured spelling per function DEFINITION, bound into
-    // main's own scope; D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
-    ASSERT_EQ(model.symbols().size() - 1, 11u)
+    // main's own scope; D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER) + the 56 FC17.9(b)
+    // C23 <stdbit.h> `__builtin_stdc_<op>_<T>` intrinsics (14 ops × 4 widths,
+    // always-injected like every other builtin; D-FULLC-STDBIT) + the 2 FC17.9(d)
+    // atomic explicit-order accessors (`atomic_load_explicit` +
+    // `atomic_store_explicit`, always-injected builtins; D-CSUBSET-ATOMIC).
+    // FC17.9(f) (D-CSUBSET-COMPLEX): + the 4 complex builtins __builtin_complex/
+    // __builtin_creal/__builtin_cimag/__builtin_conj (always-injected like the rest).
+    ASSERT_EQ(model.symbols().size() - 1, 79u)
         << "main + x + __va_list_tag + va_list + __umulh + "
            "_InterlockedCompareExchange + _ReadWriteBarrier + "
-           "_exception_code + _exception_info + __func__ + __FUNCTION__";
+           "_exception_code + _exception_info + the 6 __builtin bit-count "
+           "intrinsics + the 56 __builtin_stdc_* <stdbit.h> intrinsics + "
+           "atomic_load_explicit + atomic_store_explicit + the 4 __builtin_complex/"
+           "creal/cimag/conj complex builtins + __func__ + __FUNCTION__";
     SymbolRecord const* xRec = nullptr;
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xRec = &model.symbols()[i];
@@ -59,6 +70,89 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     ASSERT_NE(xRec, nullptr);
     ASSERT_TRUE(xRec->type.valid()) << "the int builtin must resolve to a TypeId";
     EXPECT_EQ(model.lattice().interner().kind(xRec->type), TypeKind::I32);
+}
+
+// C99 _Complex (D-CSUBSET-COMPLEX §6.2.5): `double _Complex z;` resolves the
+// `[Complex, Double]` type-specifier multiset to a Complex over F64 (via the
+// `complex:true` typeSpecifiers row + the interner.complex wrap). `float _Complex`
+// → Complex over F32.
+TEST(SemanticAnalyzerCSubset, ComplexDeclTypedAsComplex) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main() { double _Complex z; float _Complex w; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* z = nullptr;
+    SymbolRecord const* w = nullptr;
+    for (std::size_t i = 1; i < model.symbols().size(); ++i) {
+        if (model.symbols()[i].name == "z") z = &model.symbols()[i];
+        if (model.symbols()[i].name == "w") w = &model.symbols()[i];
+    }
+    ASSERT_NE(z, nullptr); ASSERT_TRUE(z->type.valid());
+    EXPECT_EQ(ti.kind(z->type), TypeKind::Complex);
+    EXPECT_EQ(ti.kind(ti.complexElement(z->type)), TypeKind::F64);
+    ASSERT_NE(w, nullptr); ASSERT_TRUE(w->type.valid());
+    EXPECT_EQ(ti.kind(w->type), TypeKind::Complex);
+    EXPECT_EQ(ti.kind(ti.complexElement(w->type)), TypeKind::F32);
+}
+
+// C99 _Complex (D-CSUBSET-COMPLEX): both `_Complex int` and `_Imaginary` fail LOUD,
+// via the AGNOSTIC absent-multiset discipline (no per-language token-identity branch
+// in the engine). `_Complex int` — ComplexKeyword IS in the specifier vocabulary (the
+// complex rows), but [Complex, Int] is an invalid multiset → S_InvalidTypeSpecifier-
+// Combination (the `unsigned float` precedent). `_Imaginary` — ImaginaryKeyword sits
+// in NO typeSpecifiers row (pure-imaginary types unsupported, D-CSUBSET-IMAGINARY-TYPE),
+// so it is not a specifier at all → resolves as an unknown type name → S_UnknownType.
+TEST(SemanticAnalyzerCSubset, ComplexIntAndImaginaryFailLoud) {
+    auto ci = analyzeShipped("c-subset", {"int main() { _Complex int y; }\n"});
+    EXPECT_TRUE(ci.hasErrors());
+    EXPECT_GT(countCode(ci.diagnostics(),
+                        DiagnosticCode::S_InvalidTypeSpecifierCombination), 0u)
+        << "`_Complex int` is not a valid type-specifier multiset — must fail loud";
+    auto im = analyzeShipped("c-subset", {"int main() { _Imaginary x; }\n"});
+    EXPECT_TRUE(im.hasErrors());
+    EXPECT_GT(countCode(im.diagnostics(), DiagnosticCode::S_UnknownType), 0u)
+        << "`_Imaginary` (unsupported pure-imaginary type) must fail loud";
+}
+
+// C99 _Complex (D-CSUBSET-COMPLEX / design test #10): a complex subexpression in a
+// CONSTEXPR context REFUSES to fold — loud (S_ConstexprNonConstantInitializer),
+// never a silently-baked constant. Complex values have NO fold representation
+// (HirLiteralValue's single double cannot hold {re, im}): a complex-constructing
+// builtin is not const-evaluable, and a cast whose target is complex refuses at
+// the const-eval cast-target classification (not pointer/integer/bit-precise —
+// the "float / aggregate cast target" NotAConstantExpression arm). So `40.0+2.0*I`
+// is ALWAYS a runtime by-address construction — the anti-fold posture the
+// c99_complex example's release arm witnesses. The negative control pins that the
+// SAME expressions are accepted at RUNTIME (the refusal is the constexpr gate, not
+// an expression rejection).
+TEST(SemanticAnalyzerCSubset, ComplexConstexprInitializerRefusesToFold) {
+    // (a) a complex-constructing builtin feeding a scalar accessor: not foldable.
+    auto viaBuiltin = analyzeShipped("c-subset", {
+        "int main(void) { constexpr double r = "
+        "__builtin_creal(__builtin_complex(40.0, 2.0)); }\n"});
+    EXPECT_EQ(countCode(viaBuiltin.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
+        << "a complex construction in a constexpr initializer must REFUSE the "
+           "fold — a clean analysis means a complex value was silently baked";
+    // (b) an explicit real->complex->real cast chain: the complex cast TARGET
+    // refuses at the const-eval cast classification.
+    auto viaCast = analyzeShipped("c-subset", {
+        "int main(void) { constexpr double d = (double)(double _Complex)2.0; }\n"});
+    EXPECT_EQ(countCode(viaCast.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
+        << "a cast through a complex type in a constexpr initializer must "
+           "refuse to fold";
+    // Negative control: WITHOUT constexpr the same expressions are legal RUNTIME
+    // constructions (the refusal above is the fold gate, not a reject of complex).
+    auto runtime = analyzeShipped("c-subset", {
+        "int main(void) { double r = __builtin_creal(__builtin_complex(40.0, 2.0));"
+        " double d = (double)(double _Complex)2.0; return (int)(r + d); }\n"});
+    EXPECT_FALSE(runtime.hasErrors())
+        << "the same complex expressions must analyze clean at runtime: "
+        << (runtime.diagnostics().all().empty()
+                ? "" : runtime.diagnostics().all()[0].actual);
 }
 
 // SE-arrays (HR9): a `[N]` declarator suffix folds the element type into
@@ -112,6 +206,49 @@ TEST(SemanticAnalyzerCSubset, EmptyArrayLengthEmitsDiagnostic) {
     auto model = analyze(cu);
     EXPECT_EQ(countCode(model.diagnostics(),
                         DiagnosticCode::S_NonConstantArrayLength), 1u);
+}
+
+// FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template `__asm__ volatile("")` optimizer
+// barrier is ACCEPTED (it lowers to a CompilerBarrier fence — pinned in the MIR tests);
+// a NON-EMPTY template carries real per-target instructions cycle-1 cannot emit, so it
+// FAILS LOUD S_InlineAsmNonEmptyTemplate rather than silently lowering to a no-op barrier
+// (a miscompile: `__asm__("hlt")` would vanish). The template PARSES (the grammar admits
+// any string literal); the reject is SEMANTIC.
+TEST(SemanticAnalyzerCSubset, InlineAsmNonEmptyTemplateEmitsDiagnostic) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ __asm__(\"nop\"); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u);
+}
+
+// A whitespace-only template is NOT provably inert (we do not parse asm) → also rejects.
+// The conservative strictly-empty predicate is the only provably-inert template.
+TEST(SemanticAnalyzerCSubset, InlineAsmWhitespaceTemplateEmitsDiagnostic) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ __asm__(\"  \"); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u);
+}
+
+// The strictly-empty template (with OR without `volatile`) is accepted — no reject, no
+// errors. volatile is inert for the empty form (a no-output asm is implicitly volatile;
+// GCC 6.47.2.1), so both spellings lower to the same barrier.
+TEST(SemanticAnalyzerCSubset, InlineAsmEmptyTemplateAccepted) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ __asm__ volatile(\"\"); __asm__(\"\"); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmNonEmptyTemplate), 0u);
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
 }
 
 // SE-arrays: a non-decimal length exercises the shared decodeInteger through the
@@ -2289,10 +2426,15 @@ TEST(SemanticAnalyzerCSubset, NestedBlocksShadowWithoutRedecl) {
     // main (function) + two distinct `x` symbols (one per block scope) + the 2
     // FC12a-core builtin TYPES (__va_list_tag + va_list) + the 5 intrinsic
     // builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
-    // _ReadWriteBarrier + c115 _exception_code + _exception_info) + the 2
-    // FC17.5 predefined function-name symbols (__func__ + __FUNCTION__, per
-    // function definition — D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
-    EXPECT_EQ(model.symbols().size() - 1, 12u);
+    // _ReadWriteBarrier + c115 _exception_code + _exception_info) + the 6
+    // FC17.9(b) bit-count builtins (__builtin_{popcount,clz,ctz}{,ll},
+    // D-CSUBSET-BITCOUNT-INTRINSICS) + the 56 FC17.9(b) <stdbit.h>
+    // __builtin_stdc_<op>_<T> intrinsics (14 ops × 4 widths, D-FULLC-STDBIT) +
+    // the 2 FC17.9(d) atomic accessors (atomic_load_explicit + atomic_store_explicit,
+    // D-CSUBSET-ATOMIC) + the 4 FC17.9(f) complex builtins (__builtin_complex/creal/
+    // cimag/conj, D-CSUBSET-COMPLEX) + the 2 FC17.5 predefined function-name symbols
+    // (__func__ + __FUNCTION__, per function definition — D-CSUBSET-FUNC-PREDEFINED-IDENTIFIER).
+    EXPECT_EQ(model.symbols().size() - 1, 80u);
 }
 
 // Use-before-decl inside the same scope resolves through Pass 1's
@@ -2310,9 +2452,14 @@ TEST(SemanticAnalyzerCSubset, ForwardReferenceWithinBlock) {
     // main (function) + x (variable) + the 2 FC12a-core builtin TYPES
     // (__va_list_tag + va_list) + the 5 intrinsic builtins (c103 __umulh +
     // c104 _InterlockedCompareExchange + c113 _ReadWriteBarrier + c115
-    // _exception_code + _exception_info) + the 2 FC17.5 predefined
-    // function-name symbols (__func__ + __FUNCTION__). Find x by name.
-    ASSERT_EQ(model.symbols().size() - 1, 11u);
+    // _exception_code + _exception_info) + the 6 FC17.9(b) bit-count builtins
+    // (__builtin_{popcount,clz,ctz}{,ll}, D-CSUBSET-BITCOUNT-INTRINSICS) + the 56
+    // FC17.9(b) <stdbit.h> __builtin_stdc_<op>_<T> intrinsics (D-FULLC-STDBIT) +
+    // the 2 FC17.9(d) atomic accessors (atomic_load_explicit + atomic_store_explicit,
+    // D-CSUBSET-ATOMIC) + the 4 FC17.9(f) complex builtins (__builtin_complex/creal/
+    // cimag/conj, D-CSUBSET-COMPLEX) + the 2 FC17.5 predefined function-name symbols
+    // (__func__ + __FUNCTION__). Find x by name.
+    ASSERT_EQ(model.symbols().size() - 1, 79u);
     SymbolId xSym{};
     for (std::size_t i = 1; i < model.symbols().size(); ++i) {
         if (model.symbols()[i].name == "x") xSym = SymbolId{static_cast<std::uint32_t>(i)};
@@ -4347,6 +4494,143 @@ TEST(SemanticAnalyzerCSubset, PreStarVolatileDoublePtrCastBuildsNestedPointee) {
                 ? "" : model.diagnostics().all()[0].actual);
 }
 
+// ── FC17.9(d) cycle 1b: `_Atomic` type qualifier (D-CSUBSET-ATOMIC) ──────────
+//
+// PHASE A pin: `_Atomic int x;` must PARSE (no P0001) and resolve to a type whose
+// raw qualifier mask carries the Atomic bit — the front-end acceptance gate. The
+// skin is TRANSPARENT, so `kind()` still sees the material I32; only the RAW
+// `isAtomicQualified` query observes the qualifier. Volatile is NOT set (the atomic
+// scan must not over-fire).
+TEST(SemanticAnalyzerCSubset, AtomicQualifierResolvesAtomicQualified) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Atomic int x;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* x = findSym(model, "x");
+    ASSERT_NE(x, nullptr);
+    ASSERT_TRUE(x->type.valid());
+    EXPECT_TRUE(ti.isAtomicQualified(x->type))
+        << "_Atomic int resolves to atomicQualified(int)";
+    EXPECT_FALSE(ti.isVolatileQualified(x->type))
+        << "a plain _Atomic must NOT set the Volatile bit";
+    EXPECT_EQ(ti.kind(x->type), TypeKind::I32)
+        << "the qualifier skin is transparent — the material type is bare int";
+}
+
+// D-CSUBSET-ATOMIC-NONLOCKFREE (code-audit CRITICAL C1): `_Atomic` on an AGGREGATE
+// (struct/union/by-value array) must FAIL LOUD at type resolution. The qualifier is a
+// TRANSPARENT skin, so a wrapped aggregate would reach codegen, `computeLayout` strips
+// the skin, and the copy decomposes to plain field Load/Store the type-based belt cannot
+// see — a SILENT non-atomic access. RED-ON-DISABLE: remove the `isByValueClass` reject at
+// the base-position `_Atomic` wrap and this count drops to 0 (the aggregate is silently
+// atomic-wrapped, then non-atomically copied).
+TEST(SemanticAnalyzerCSubset, AtomicOnAggregateFailsLoudNonLockFree) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int a; int b; };\n"
+        "_Atomic struct S x;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AtomicNonLockFree), 1u)
+        << "_Atomic on an aggregate must fail loud (non-lock-free — deferred)";
+}
+
+// The NEGATIVE that keeps the gate honest: a lock-free SCALAR `_Atomic` must NOT be
+// rejected (it is the supported case — it resolves to atomicQualified + lowers to the
+// atomic opcodes). Without it, a too-broad reject would silently break scalar atomics.
+TEST(SemanticAnalyzerCSubset, AtomicOnScalarNotRejectedNonLockFree) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Atomic int x;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_AtomicNonLockFree), 0u)
+        << "a lock-free scalar _Atomic must be accepted (the supported case)";
+}
+
+// The user-named combination: `_Atomic volatile int` must set BOTH bits in the ONE
+// shared skin (cycle 1a's `qualified` merges {V}+{A}). Order-independent: the
+// reverse spelling `volatile _Atomic int` resolves to the SAME interned type.
+TEST(SemanticAnalyzerCSubset, AtomicVolatileSetsBothQualifierBits) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Atomic volatile int a;\n"
+        "volatile _Atomic int b;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* a = findSym(model, "a");
+    ASSERT_NE(a, nullptr);
+    ASSERT_TRUE(a->type.valid());
+    EXPECT_TRUE(ti.isAtomicQualified(a->type))
+        << "_Atomic volatile int carries the Atomic bit";
+    EXPECT_TRUE(ti.isVolatileQualified(a->type))
+        << "_Atomic volatile int ALSO carries the Volatile bit (one {V,A} skin)";
+    EXPECT_EQ(ti.kind(a->type), TypeKind::I32)
+        << "transparent skin — material int";
+    SymbolRecord const* b = findSym(model, "b");
+    ASSERT_NE(b, nullptr);
+    ASSERT_TRUE(b->type.valid());
+    EXPECT_EQ(a->type, b->type)
+        << "`_Atomic volatile int` and `volatile _Atomic int` intern to the SAME "
+           "type — the bitset merge is order-independent";
+}
+
+// Red-on-disable guard for bit INDEPENDENCE: plain `volatile int` must carry ONLY
+// the Volatile bit, never Atomic — proves the new atomic scan/wrap is a DISTINCT
+// bit and does not leak onto volatile. (Delete the atomic wrap and this stays
+// green; but paired with AtomicQualifierResolvesAtomicQualified it pins that the
+// two qualifiers are separate — a volatile-tags-atomic regression fails here.)
+TEST(SemanticAnalyzerCSubset, PlainVolatileIsNotAtomicQualified) {
+    auto cu = buildShippedUnit("c-subset", {
+        "volatile int v;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* v = findSym(model, "v");
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(v->type.valid());
+    EXPECT_TRUE(ti.isVolatileQualified(v->type));
+    EXPECT_FALSE(ti.isAtomicQualified(v->type))
+        << "volatile alone must NOT carry the Atomic bit";
+}
+
+// Both resolver arms: a WEST `_Atomic` qualifies the POINTEE (`_Atomic int *p` =>
+// Ptr<atomicQualified(int)>, pointer NOT atomic); an EAST `_Atomic` qualifies the
+// POINTER OBJECT (`int * _Atomic q` => atomicQualified(Ptr<int>), pointee NOT
+// atomic). This exercises resolveTypeNodeImpl's base arm AND declaratorDeclaredType's
+// pointer-layer arm — the volatile-pointee/pointer-object mirror.
+TEST(SemanticAnalyzerCSubset, AtomicPointeeVsPointerObject) {
+    auto cu = buildShippedUnit("c-subset", {
+        "_Atomic int *p;\n"
+        "int * _Atomic q;\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    auto const& ti = model.lattice().interner();
+    SymbolRecord const* p = findSym(model, "p");
+    ASSERT_NE(p, nullptr);
+    ASSERT_TRUE(p->type.valid());
+    ASSERT_EQ(ti.kind(p->type), TypeKind::Ptr);
+    EXPECT_FALSE(ti.isAtomicQualified(p->type))
+        << "`_Atomic int *p` — the POINTER object is not atomic";
+    EXPECT_TRUE(ti.isAtomicQualified(ti.operands(p->type)[0]))
+        << "`_Atomic int *p` — the POINTEE is atomic (Ptr<atomicQualified(int)>)";
+    SymbolRecord const* q = findSym(model, "q");
+    ASSERT_NE(q, nullptr);
+    ASSERT_TRUE(q->type.valid());
+    ASSERT_EQ(ti.kind(q->type), TypeKind::Ptr);
+    EXPECT_TRUE(ti.isAtomicQualified(q->type))
+        << "`int * _Atomic q` — the POINTER object is atomic (atomicQualified(Ptr<int>))";
+    EXPECT_FALSE(ti.isAtomicQualified(ti.operands(q->type)[0]))
+        << "`int * _Atomic q` — the POINTEE is not atomic";
+}
+
 // Pointer casts: ptr↔ptr, int→ptr (the null-constant idiom and beyond),
 // and ptr→int are all in the explicit-cast matrix (mapCast: Bitcast /
 // IntToPtr / PtrToInt). Zero diagnostics.
@@ -4669,11 +4953,18 @@ TEST(SemanticAnalyzerCSubset, ValueStarValueStaysExpressionStatement) {
     EXPECT_FALSE(model.hasErrors());
     // main + a + b + the 2 FC12a-core builtin TYPES (__va_list_tag + va_list) + the
     // 5 intrinsic builtins (c103 __umulh + c104 _InterlockedCompareExchange + c113
-    // _ReadWriteBarrier + c115 _exception_code + _exception_info) + the 2 FC17.5
-    // predefined function-name symbols (__func__ + __FUNCTION__) — the
+    // _ReadWriteBarrier + c115 _exception_code + _exception_info) + the 6 FC17.9(b)
+    // bit-count builtins (__builtin_{popcount,clz,ctz}{,ll},
+    // D-CSUBSET-BITCOUNT-INTRINSICS) + the 56 FC17.9(b) <stdbit.h>
+    // __builtin_stdc_<op>_<T> intrinsics (D-FULLC-STDBIT) + the 2 FC17.9(d) atomic
+    // accessors (atomic_load_explicit + atomic_store_explicit, D-CSUBSET-ATOMIC) +
+    // the 2 FC17.5 predefined function-name symbols (__func__ + __FUNCTION__) — the
     // multiplication must mint NO symbol.
-    EXPECT_EQ(model.symbols().size() - 1, 12u)
+    EXPECT_EQ(model.symbols().size() - 1, 80u)
         << "main + a + b + __va_list_tag + va_list + the 5 intrinsic builtins + "
+           "the 6 __builtin bit-count intrinsics + the 56 __builtin_stdc_* "
+           "<stdbit.h> intrinsics + atomic_load_explicit + atomic_store_explicit + "
+           "the 4 __builtin_complex/creal/cimag/conj complex builtins + "
            "__func__ + __FUNCTION__ — the multiplication mints none";
 }
 
@@ -8944,4 +9235,333 @@ TEST(SemanticAnalyzerCSubset, PtrToVlaInitFormDeferredStillFailsLoud) {
     EXPECT_TRUE(model.hasErrors())
         << "the pointer-to-VLA INIT form `int (*p)[n] = b` is deferred and must fail loud "
            "(S_TypeMismatch) — never a silent accept that would mis-stride the subscript";
+}
+
+// ─── FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the per-format long-double axis ──────
+//
+// `long double`'s REPRESENTATION is ABI-divergent per object format (64-bit
+// IEEE on pe64/apple-arm64, x87 80-bit on SysV/darwin x86_64, binary128 on
+// linux-arm64), so the c-subset typeSpecifiers row carries a
+// coreByLongDoubleFormat map resolved against `analyze()`'s LongDoubleFormat
+// axis: f64 → F64 (long double IS double — the full machinery serves it),
+// x87-80 → F80, ieee128 → F128, and an UNDECLARED axis (None — wasm/spirv/
+// direct-API) leaves the row UNREALIZED → the precise
+// S_LongDoubleFormatUndeclared, NEVER a silently-guessed base core.
+
+// (Symbol lookup reuses the file-wide `findSymbolNamed` helper above.)
+namespace {
+[[nodiscard]] SemanticModel analyzeWithLongDoubleAxis(
+    std::initializer_list<std::string> sources, LongDoubleFormat axis) {
+    auto cu = buildShippedUnit("c-subset", sources);
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+                   std::nullopt, std::nullopt, axis);
+}
+} // namespace
+
+TEST(SemanticAnalyzerCSubset, LongDoubleResolvesPerAxis) {
+    struct Row { LongDoubleFormat axis; TypeKind expected; };
+    for (Row const row : {Row{LongDoubleFormat::F64, TypeKind::F64},
+                          Row{LongDoubleFormat::X87_80, TypeKind::F80},
+                          Row{LongDoubleFormat::Ieee128, TypeKind::F128}}) {
+        auto model = analyzeWithLongDoubleAxis(
+            {"int main(void) { long double x; }\n"}, row.axis);
+        EXPECT_FALSE(model.hasErrors())
+            << "axis " << static_cast<int>(row.axis)
+            << ": a `long double` declaration must resolve";
+        auto const* x = findSymbolNamed(model, "x");
+        ASSERT_NE(x, nullptr);
+        ASSERT_TRUE(x->type.valid());
+        EXPECT_EQ(model.lattice().interner().kind(x->type), row.expected)
+            << "axis " << static_cast<int>(row.axis);
+    }
+}
+
+TEST(SemanticAnalyzerCSubset, LongDoubleUndeclaredAxisFailsLoud) {
+    // Default analyze() = LongDoubleFormat::None (direct-API / wasm / spirv):
+    // the row is UNREALIZED — the PRECISE 0xE056, not the generic S0011, and
+    // NEVER a silent F64 bind (the base-core-fallback trap, IMPORTANT-4).
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { long double x; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_LongDoubleFormatUndeclared), 1u)
+        << "a `long double` DECLARATION under an undeclared axis must emit "
+           "S_LongDoubleFormatUndeclared (0xE056)";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidTypeSpecifierCombination), 0u)
+        << "the combination is VALID C — the unrealized-row arm must fire "
+           "BEFORE the invalid-combination miss";
+    auto const* x = findSymbolNamed(model, "x");
+    ASSERT_NE(x, nullptr);
+    EXPECT_FALSE(x->type.valid())
+        << "the symbol must stay UNTYPED — a valid TypeId here means the row "
+           "silently base-core-resolved under an undeclared axis";
+}
+
+TEST(SemanticAnalyzerCSubset, LongDoubleIsDoubleOnF64Axis) {
+    // The f64 axis (pe64 / apple-arm64): `long double` COLLAPSES to F64 —
+    // assignment-compatible with `double` in BOTH directions (the LLP64
+    // long==int identity-collapse precedent), so the whole double machinery
+    // serves it with zero new codegen.
+    auto model = analyzeWithLongDoubleAxis(
+        {"int main(void) { long double x; double d; x = d; d = x; x = 1.5; }\n"},
+        LongDoubleFormat::F64);
+    EXPECT_FALSE(model.hasErrors())
+        << "on the f64 axis `long double` IS double — both assignment "
+           "directions must be clean";
+}
+
+TEST(SemanticAnalyzerCSubset, LongDoubleLiteralTypesPerAxis) {
+    // C 6.4.4.2: the l/L float suffix types `long double` — resolved through
+    // the SAME axis map the typeSpecifiers row carries. On x87-80 a `20.0L`
+    // initializer binds an F80 `long double` cleanly; the sibling `20L`
+    // INTEGER literal stays `long` (the CRITICAL-1 suffix-shape pin, semantic
+    // tier: it must remain a valid ARRAY DIMENSION, which no float can be).
+    auto ld = analyzeWithLongDoubleAxis(
+        {"int main(void) { long double x = 20.0L; }\n"},
+        LongDoubleFormat::X87_80);
+    EXPECT_FALSE(ld.hasErrors())
+        << "`long double x = 20.0L;` on the x87-80 axis: the literal types "
+           "F80 and binds the F80 declaration cleanly";
+
+    auto intL = analyzeWithLongDoubleAxis(
+        {"int main(void) { int a[20L]; return sizeof a ? 0 : 1; }\n"},
+        LongDoubleFormat::X87_80);
+    EXPECT_FALSE(intL.hasErrors())
+        << "`20L` must stay an INTEGER `long` (a constant array dimension) — "
+           "an error here means the l-suffix float rule swallowed it";
+
+    // Undeclared axis: the long-double LITERAL is as unknowable as the
+    // declaration — the same precise 0xE056 (never a silent F64 typing).
+    auto none = analyzeShipped("c-subset", {
+        "int main(void) { double d = 20.0L; }\n",
+    });
+    EXPECT_EQ(countCode(none.diagnostics(),
+                        DiagnosticCode::S_LongDoubleFormatUndeclared), 1u)
+        << "a `20.0L` literal under an undeclared axis must emit 0xE056";
+}
+
+TEST(SemanticAnalyzerCSubset, LongDoubleUsualArithmeticConversionOutranksDouble) {
+    // C 6.3.1.8: long double outranks double (floatRank F80=4 > F64=3). On a
+    // WALLED axis the arm is observable: `x + d` types F80, so it binds an
+    // F80 lhs cleanly and REJECTS an F64 lhs (were the result F64, the two
+    // expectations would invert — a strict both-ways pin of the rank order).
+    auto good = analyzeWithLongDoubleAxis(
+        {"int main(void) { long double x; double d; long double r; r = x + d; }\n"},
+        LongDoubleFormat::X87_80);
+    EXPECT_FALSE(good.hasErrors())
+        << "`long double + double` must type long double (F80) — assignable "
+           "into a long double lhs";
+
+    auto bad = analyzeWithLongDoubleAxis(
+        {"int main(void) { long double x; double d; double r; r = x + d; }\n"},
+        LongDoubleFormat::X87_80);
+    EXPECT_TRUE(bad.hasErrors())
+        << "`long double + double` into a DOUBLE lhs is a narrowing float "
+           "assignment (F80 -> F64) — must reject, proving the UAC result is "
+           "F80, not F64";
+}
+
+TEST(SemanticAnalyzerCSubset, LongDoubleConstexprFoldRefusedOnWalledAxis) {
+    // IMPORTANT-5 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): the const-eval
+    // fold gate. F80/F128 are NOT host-backed (floatKindInfo.hostBacked ==
+    // false) — folding `20.0L + 22.0L` at the host's binary64 would bake a
+    // silently-rounded constant for any value needing >53 mantissa bits. The
+    // gate refuses at applyBinaryFloat, so the constexpr initializer is NOT a
+    // compile-time constant on a walled axis (loud), while the SAME source on
+    // the f64 axis folds exactly (long double IS binary64 there).
+    auto walled = analyzeWithLongDoubleAxis(
+        {"int main(void) { constexpr long double k = 20.0L + 22.0L; }\n"},
+        LongDoubleFormat::X87_80);
+    EXPECT_EQ(countCode(walled.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
+        << "F80 constexpr arithmetic must REFUSE the host-double fold "
+           "(hostBacked==false) — a clean analysis here means the fold gate "
+           "is bypassed and a binary64-rounded constant was baked";
+
+    auto f64 = analyzeWithLongDoubleAxis(
+        {"int main(void) { constexpr long double k = 20.0L + 22.0L; }\n"},
+        LongDoubleFormat::F64);
+    EXPECT_FALSE(f64.hasErrors())
+        << "on the f64 axis the SAME fold is exact (long double IS binary64) "
+           "— must fold clean";
+}
+
+// ── FC17.9(g) (D-CSUBSET-TGMATH): the SHIPPED <tgmath.h> type-generic macros ──
+//
+// These pins run against the REAL src/dss-config/shippedLibs/tgmath.json — NOT
+// a scratch copy — so a regression IN THE SHIPPED FILE flips them red (the
+// scratch-descriptor discipline would keep a stale mirror green while the
+// shipped macro rotted). Each tgmath name is a function-like `_Generic` macro
+// spliced by the preprocessor at `#include <tgmath.h>`: float → the f-variant
+// with an explicit `(float)` cast; default → the BARE f64 function. Both cast
+// directions are load-bearing (the descriptor $comment documents the empirical
+// proofs); the pins here are:
+//   * the 17-function × {float,double,int} COMPILE MATRIX stays clean on BOTH
+//     an elf and a pe target (pe exercises the fabs/ldexp per-format `variants`
+//     whose float arm bridges through the f64 fn — msvcrt exports no
+//     fabsf/ldexpf, D-CSUBSET-MATH-FLOAT-VARIANTS-PE), with every float-arg
+//     result assigned into a FLOAT lvalue — if a float arm ever mis-dispatched
+//     to the f64 default, that assignment becomes an F64→F32 narrowing
+//     S_TypeMismatch → RED (a per-function wrong-arm pin, not just "compiles");
+//   * a `double _Complex` argument fails S_TypeMismatch LOUD through the BARE
+//     default arm (D-CSUBSET-TGMATH-COMPLEX). RED-ON-DISABLE (verified during
+//     the cycle): flip a default arm to `sqrt((double)(x))` in tgmath.json and
+//     the complex call compiles SILENTLY — (double)z is legal C, drops the
+//     imaginary part, a conformance MISCOMPILE — which is exactly what these
+//     count pins catch.
+
+namespace {
+
+namespace fs = std::filesystem;
+
+// Resolve the REAL shipped system-include dir (src/dss-config/shippedLibs) by
+// the same 8-level upward walk program.cpp's applySystemDirs uses, so the pins
+// exercise the descriptor the production driver ships.
+[[nodiscard]] fs::path findRealShippedLibsDir() {
+    std::error_code ec;
+    fs::path here = fs::current_path(ec);
+    for (int i = 0; i < 8 && !here.empty(); ++i) {
+        fs::path const candidate = here / "src" / "dss-config" / "shippedLibs";
+        if (fs::is_directory(candidate, ec)) return candidate;
+        fs::path const parent = here.parent_path();
+        if (parent == here) break;
+        here = parent;
+    }
+    return {};
+}
+
+// Build + analyze `mainSrc` with the REAL shippedLibs dir on the system path
+// and `format` as the ACTIVE object-format — required by the fabs/ldexp macro
+// `variants` (format-keyed splice, the setjmp.json precedent) and the
+// fabsf/ldexpf per-symbol availability gate. Mirrors the production driver's
+// per-format CU build (UnitBuilder::setActiveFormat + analyze(activeFormat)).
+[[nodiscard]] SemanticModel analyzeRealTgmath(std::string mainSrc,
+                                              ObjectFormatKind format,
+                                              DataModel dataModel) {
+    fs::path const shipped = findRealShippedLibsDir();
+    if (shipped.empty()) {
+        ADD_FAILURE() << "could not locate src/dss-config/shippedLibs from cwd";
+        std::abort();
+    }
+    auto schema = loadShippedSchema("c-subset");
+    UnitBuilder builder{schema};
+    builder.addSystemDir(shipped);
+    builder.setActiveFormat(format);
+    builder.addInMemory(std::move(mainSrc), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, dataModel, std::nullopt, std::nullopt, format, "x86_64");
+}
+
+// The 17-function × {float,double,int} matrix. Every float-column result is
+// assigned into FLOAT `s` — the strict wrong-arm pin: a float arm that
+// mis-dispatches to the f64 default makes the assignment an F64→F32 narrowing
+// S_TypeMismatch. The double/int columns assign into DOUBLE `r` (the f64
+// default's return; int rides `default:` via int→f64 implicit widening,
+// C 7.25p3). Mixed two-arg combos (any non-float arg) route to the f64 fn.
+constexpr char const* kTgmathMatrixSrc =
+    "#include <tgmath.h>\n"
+    "int main(void) {\n"
+    "    float f; double d; int i; float s; double r;\n"
+    "    f = 1.0f; d = 1.0; i = 1;\n"
+    "    s = sqrt(f); s = sin(f); s = cos(f); s = tan(f); s = asin(f);\n"
+    "    s = acos(f); s = atan(f); s = exp(f); s = log(f); s = log10(f);\n"
+    "    s = floor(f); s = ceil(f); s = fabs(f); s = pow(f, f);\n"
+    "    s = atan2(f, f); s = fmod(f, f); s = ldexp(f, i);\n"
+    "    r = sqrt(d); r = sin(d); r = cos(d); r = tan(d); r = asin(d);\n"
+    "    r = acos(d); r = atan(d); r = exp(d); r = log(d); r = log10(d);\n"
+    "    r = floor(d); r = ceil(d); r = fabs(d); r = pow(d, d);\n"
+    "    r = atan2(d, d); r = fmod(d, d); r = ldexp(d, i);\n"
+    "    r = sqrt(i); r = sin(i); r = cos(i); r = tan(i); r = asin(i);\n"
+    "    r = acos(i); r = atan(i); r = exp(i); r = log(i); r = log10(i);\n"
+    "    r = floor(i); r = ceil(i); r = fabs(i); r = pow(i, i);\n"
+    "    r = atan2(i, i); r = fmod(i, i); r = ldexp(i, i);\n"
+    "    r = pow(f, d); r = pow(d, f); r = pow(f, i);\n"
+    "    r = atan2(i, f); r = fmod(d, f);\n"
+    "    return 0;\n"
+    "}\n";
+
+} // namespace
+
+// The matrix on an ELF target: the float arms bind the REAL fabsf/ldexpf
+// imports (per-symbol availableObjectFormats admits elf) and the elf macro
+// variants. ZERO diagnostics of any kind.
+TEST(SemanticAnalyzerCSubset, TgmathMatrixCleanOnElf) {
+    auto model = analyzeRealTgmath(kTgmathMatrixSrc,
+                                   ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "a float-column S_TypeMismatch here means a float arm mis-dispatched "
+           "to the f64 default (F64->F32 narrowing at the `s =` assignment)";
+}
+
+// The SAME matrix on a PE target: msvcrt exports no fabsf/ldexpf, so the
+// fabs/ldexp macros' pe `variants` arm routes their float arm THROUGH the f64
+// function — `(float)fabs((double)(x))` — typed float (the `s = fabs(f)`
+// assignment still requires a FLOAT result). RED if the pe variant arm is
+// dropped (the flat elf body would reference the pe-unavailable fabsf) or if
+// the bridge loses its `(float)` result cast (F64->F32 narrowing).
+TEST(SemanticAnalyzerCSubset, TgmathMatrixCleanOnPeViaVariantBridge) {
+    auto model = analyzeRealTgmath(kTgmathMatrixSrc,
+                                   ObjectFormatKind::Pe, DataModel::Llp64);
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+
+// D-CSUBSET-TGMATH-COMPLEX: a `double _Complex` argument through the shipped
+// sqrt macro fails EXACTLY one S_TypeMismatch — the SELECTED bare default arm
+// `sqrt((z))` passes a complex value to the f64 param (loud); the UNSELECTED
+// float arm's `(float)(z)` cast type-checks but never lowers. RED-ON-DISABLE:
+// rewrite the default arm as `sqrt((double)(x))` and this compiles clean —
+// the cast launders the complex arg (drops imag), the exact conformance
+// miscompile the bare arm exists to prevent.
+TEST(SemanticAnalyzerCSubset, TgmathComplexArgSqrtFailsLoud) {
+    auto model = analyzeRealTgmath(
+        "#include <tgmath.h>\n"
+        "int main(void) { double _Complex z; double r; z = 4.0;\n"
+        "                 r = sqrt(z); return (int)r; }\n",
+        ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "sqrt(double _Complex) must fail LOUD through the bare default arm "
+           "— zero means the arm laundered the complex arg ((double)(x) crept "
+           "back in): a silent drop-imag miscompile";
+}
+
+// The two-arg nested `_Generic` (pow) with a complex first arg: TWO
+// S_TypeMismatch — the SELECTED outer default `pow((z),(y))` plus the
+// UNSELECTED-but-type-checked inner default arm (same bare-call text inside
+// the float branch). Both are the SAME loudness guarantee; the count is
+// pinned so a silent-arm regression (either bare call gaining a cast) drops
+// the count and flips this red.
+TEST(SemanticAnalyzerCSubset, TgmathComplexArgPowFailsLoudTwice) {
+    auto model = analyzeRealTgmath(
+        "#include <tgmath.h>\n"
+        "int main(void) { double _Complex z; double r; z = 4.0;\n"
+        "                 r = pow(z, 2.0); return (int)r; }\n",
+        ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 2u)
+        << "pow(double _Complex, double) must fail LOUD through both bare "
+           "default arms (selected outer + type-checked inner)";
+}
+
+// fabs — the per-format `variants` macro — keeps the SAME complex loudness on
+// BOTH realizations: the elf arm's `fabs((x))` and the pe BRIDGE arm's
+// `fabs((x))` default are equally bare. One S_TypeMismatch each.
+TEST(SemanticAnalyzerCSubset, TgmathComplexArgFabsFailsLoudOnBothFormats) {
+    constexpr char const* src =
+        "#include <tgmath.h>\n"
+        "int main(void) { double _Complex z; double r; z = 4.0;\n"
+        "                 r = fabs(z); return (int)r; }\n";
+    auto elf = analyzeRealTgmath(src, ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_EQ(countCode(elf.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "fabs(double _Complex) must fail LOUD on elf (fabsf variant arm)";
+    auto pe = analyzeRealTgmath(src, ObjectFormatKind::Pe, DataModel::Llp64);
+    EXPECT_EQ(countCode(pe.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "fabs(double _Complex) must fail LOUD on pe (the f64 bridge arm)";
 }

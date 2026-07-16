@@ -535,8 +535,9 @@ assemble(Lir const&                 lir,
 // `struct P { int x; int y; } v = { 20, 22 };` at file scope reaches
 // the binary's `.rodata` byte-exact. `aggregateLayout` is nullopt
 // only when the target declared no `aggregateLayout` block; an
-// aggregate global then fails loud (no guessed layout). F16/F128
-// leaves + zero-init (`.bss`) globals + runtime-init globals stay
+// aggregate global then fails loud (no guessed layout). F16/F80/F128
+// leaves (any float without a lossless host-`double` byte arm) + zero-init
+// (`.bss`) globals + runtime-init globals stay
 // fail-loud-deferred (their own anchors). Pointer-with-address-
 // constant leaves are not byte-encodable (they need a relocation)
 // and fail loud — no consumer yet.

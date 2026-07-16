@@ -32,7 +32,12 @@ namespace {
         case MirOpcode::Sub:           return "Sub";
         case MirOpcode::Mul:           return "Mul";
         case MirOpcode::UMulH:         return "UMulH";
+        case MirOpcode::Popcount:      return "Popcount";  // FC17.9(b)
+        case MirOpcode::Clz:           return "Clz";       // FC17.9(b)
+        case MirOpcode::Ctz:           return "Ctz";       // FC17.9(b)
         case MirOpcode::AtomicCas:     return "AtomicCas";
+        case MirOpcode::AtomicLoad:    return "AtomicLoad";   // FC17.9(d)
+        case MirOpcode::AtomicStore:   return "AtomicStore";  // FC17.9(d)
         case MirOpcode::ICmpEq:        return "ICmpEq";
         case MirOpcode::ICmpNe:        return "ICmpNe";
         case MirOpcode::ICmpSlt:       return "ICmpSlt";
@@ -290,6 +295,46 @@ enum class MnemonicSlot : std::uint8_t {
     // it nullopt and the StackRestore lowering fails loud, never a silent no-op
     // that would leak the stack).
     SpRestore,
+    // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the NATIVE hardware bit-count
+    // realizations, probed by mnemonic presence (the umulh/div capability split).
+    // `PopcountNative` = x86 POPCNT (arm64 declares none → SWAR, the fallback the
+    // arm64-elf example arm witnesses). `ClzNative` = x86 LZCNT / arm64 CLZ (BOTH
+    // targets declare "clz" — same 1-source result:value shape, defined =width at
+    // 0). `CtzNative` = x86 TZCNT (arm64 declares none — it composes `Rbit`+CLZ).
+    // `Rbit` = arm64 bit-reverse (RBIT), which turns leading-zeros (CLZ) into
+    // trailing-zeros; x86 declares none (it has direct TZCNT). A target declaring
+    // none of a given verb's realizations lowers that op via the SWAR fallback —
+    // never fail-loud, never an `if (arch==…)`.
+    PopcountNative,
+    ClzNative,
+    CtzNative,
+    Rbit,
+    // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the per-order fence
+    // realizations MIR AtomicLoad/AtomicStore lower to, probed by mnemonic
+    // presence (the lowerAtomicCas capability-probe — NEVER an `if (arch==)`).
+    // A relaxed/consume atomic scalar access is a PLAIN naturally-aligned
+    // access (mov / ldr — always available), so it reuses the plain
+    // Load/Store and needs NO slot here. The stronger orders bind:
+    //   `LoadAcquire`  — an acquire/seq_cst atomic load. arm64 = LDAR
+    //     (RCsc load-acquire); x86 = a plain `mov r,[mem]` (x86 loads are
+    //     already acquire), declared with the scalar-load encoding so the
+    //     slot-presence probe succeeds. A load never writes its data reg,
+    //     so no clobber hazard.
+    //   `StoreRelease` — a release/acq_rel atomic store. arm64 = STLR
+    //     (RCsc store-release); x86 = a plain `mov [mem],r` (x86 stores are
+    //     already release). Neither writes its value reg.
+    //   `StoreSeqCst` — a seq_cst atomic store (the DEFAULT for a plain
+    //     `_Atomic` write). arm64 = STLR too (LDAR/STLR are RCsc, so a
+    //     release store IS a seq_cst store — no DMB); x86 = `xchg [mem],r`
+    //     (a MEMORY-operand XCHG is implicitly LOCK'd = a full fence). ★ the
+    //     XCHG WRITES the old memory value back into its reg operand, so the
+    //     lowering COPIES the stored value into a fresh scratch first (the
+    //     lowerAtomicCas comparand-pin precedent) — else a live-after value
+    //     vreg is corrupted.
+    // A target that declares NEITHER the plain Load/Store nor a needed
+    // acquire/release/seqcst slot FAILS LOUD (reportMissingOpcode) — the one
+    // forbidden miscompile direction (a silent under-fence) can never happen.
+    LoadAcquire, StoreRelease, StoreSeqCst,
     Count_
 };
 constexpr std::size_t kMnemonicCount = static_cast<std::size_t>(MnemonicSlot::Count_);
@@ -395,6 +440,13 @@ constexpr std::array<MnemonicRow, kMnemonicCount> kMnemonicRows{{
     {MnemonicSlot::SubSpReg,           "sub_sp_reg"},
     {MnemonicSlot::SpCopy,             "sp_copy"},
     {MnemonicSlot::SpRestore,          "sp_restore"},
+    {MnemonicSlot::PopcountNative,     "popcount"},  // FC17.9(b): x86 POPCNT
+    {MnemonicSlot::ClzNative,          "clz"},       // FC17.9(b): x86 LZCNT / arm64 CLZ
+    {MnemonicSlot::CtzNative,          "ctz"},       // FC17.9(b): x86 TZCNT
+    {MnemonicSlot::Rbit,               "rbit"},      // FC17.9(b): arm64 RBIT (→ ctz via CLZ)
+    {MnemonicSlot::LoadAcquire,        "load_acquire"},  // FC17.9(d): arm64 LDAR / x86 acquire mov
+    {MnemonicSlot::StoreRelease,       "store_release"}, // FC17.9(d): arm64 STLR / x86 release mov
+    {MnemonicSlot::StoreSeqCst,        "store_seqcst"},  // FC17.9(d): arm64 STLR / x86 XCHG [mem],r
 }};
 consteval bool kMnemonicRowsAligned() noexcept {
     for (std::size_t i = 0; i < kMnemonicRows.size(); ++i) {
@@ -973,7 +1025,7 @@ struct Lowerer {
     }
 
     // Map a MIR `TypeId` to the LIR register class that holds its
-    // values. F16/F32/F64/F128 → FPR; Vector/Matrix → VR (SIMD);
+    // values. F16/F32/F64/F80/F128 → FPR; Vector/Matrix → VR (SIMD);
     // integer/bool/pointer → GPR; default for aggregates (Struct/
     // Union/Array/Enum/Tuple/Slice) and any future variant arm →
     // GPR with explicit "scoped to ML5; cycle 3e aggregate-flattening
@@ -1006,15 +1058,22 @@ struct Lowerer {
     // the only tier where MIR types are still visible (post-regalloc
     // LIR carries register CLASSES, not widths), so the gate lives
     // here: any FPR-class type flowing into a width-keyed float
-    // mnemonic must be one of the ENCODED widths. F16/F128 stay
+    // mnemonic must be one of the ENCODED widths. F16/F80/F128 stay
     // fail-loud (no encodings at any width — first-match could
-    // otherwise pick a wrong-width form). Returns true (no-op) for
+    // otherwise pick a wrong-width form; F80 = x87, F128 = binary128 —
+    // D-CSUBSET-LONG-DOUBLE-X87-ARITH / D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH
+    // are the future arcs that realize them). Returns true (no-op) for
     // non-FPR types. Applied exactly where float encodings exist
     // (FAdd, FSub, FMul, FDiv, FCmp operands, FPToSI source, FPTrunc/FPExt
     // source+result, FPR-class Load, and — since c78 — FNeg, whose
     // capability-dispatched lowering (native FNEG / sign-mask XORPD) gates
     // here so F16/F128 fail loud before a wrong-width mask/opcode is picked
-    // (D-CSUBSET-FLOAT-NEG-ENCODING).
+    // (D-CSUBSET-FLOAT-NEG-ENCODING). FC17.9(e) CRITICAL-2 adds the four
+    // CALL-BOUNDARY sites (Arg, Call result, Return operand, Store value):
+    // those are pure register/memory PLUMBING with no producer gate of
+    // their own, and widthFlagsForType defaults F80/F128 to width 0 = a
+    // 64-bit move — 8-byte plumbing of a 16-byte value, a silent ABI
+    // miscompile without the gate.
     [[nodiscard]] bool requireEncodedFloatWidth(MirInstId id, TypeId ty,
                                                 std::string_view context) {
         if (!ty.valid()) return true;  // upstream diagnosed the type hole
@@ -1537,7 +1596,18 @@ struct Lowerer {
             case MirOpcode::Sub:    return lowerBinaryOp(id, MnemonicSlot::Sub);
             case MirOpcode::Mul:    return lowerBinaryOp(id, MnemonicSlot::Mul);
             case MirOpcode::UMulH:  return lowerMulHigh(id);
+            // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): native-or-SWAR bit counts.
+            case MirOpcode::Popcount: return lowerPopcount(id);
+            case MirOpcode::Clz:      return lowerClz(id);
+            case MirOpcode::Ctz:      return lowerCtz(id);
             case MirOpcode::AtomicCas: return lowerAtomicCas(id);
+            // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): per-order fence
+            // matrix. Relaxed/consume reuse the plain scalar Load/Store; the
+            // stronger orders bind the LoadAcquire/StoreRelease/StoreSeqCst
+            // slots (pure slot-presence probe; fail-loud on a missing needed
+            // slot — never a silent under-fence).
+            case MirOpcode::AtomicLoad:  return lowerAtomicLoad(id);
+            case MirOpcode::AtomicStore: return lowerAtomicStore(id);
             // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier is a pure
             // COMPILE-TIME ordering fence — it emits NO instruction. Its whole
             // effect (forbidding CSE/LICM from moving memory ops across it) is
@@ -1787,15 +1857,29 @@ struct Lowerer {
                 // width as the override. The DESTINATION float is fixed at F64 (sd /
                 // Dd) this cycle on BOTH targets — the variant guard carries ONE
                 // width axis and the source-int axis OWNS it (REX.W / Wn-vs-Xn must
-                // be exact), so a NON-F64 result (int→F32) has no encoding and FAILS
-                // LOUD here rather than silently selecting a wrong-width form
-                // (D-CSUBSET-INT-TO-F32-CODEGEN, deferred; sqlite uses `double`
-                // only). A NARROW source (Char/I8/I16 — widthFlagsForType → 8/16)
-                // also has no declared variant and fails loud at the matcher
-                // (no partial-register conversion this cycle); the C int literal
-                // `5` is I32 and the sqlite blocker is I64, both encoded.
+                // be exact), so a NON-F64 result has no encoding and FAILS LOUD
+                // here rather than silently selecting a wrong-width form. TWO
+                // deferral classes reach this arm: an F32 destination (int→F32,
+                // D-CSUBSET-INT-TO-F32-CODEGEN; sqlite uses `double` only) AND —
+                // FC17.9(e) — an F80/F128 long double destination (`long double
+                // ld = anInt;`), whose real conversion rides the per-format x87 /
+                // binary128 arithmetic arcs (D-CSUBSET-LONG-DOUBLE-X87-ARITH /
+                // -IEEE128-ARITH); until then it walls under the same encoded-
+                // width guard (D-TARGET-ENCODING-WIDTH-GUARD) as every other
+                // unencoded FPR width. A NARROW source (Char/I8/I16 —
+                // widthFlagsForType → 8/16) also has no declared variant and
+                // fails loud at the matcher (no partial-register conversion this
+                // cycle); the C int literal `5` is I32 and the sqlite blocker is
+                // I64, both encoded.
                 TypeKind const resultK = interner.kind(mir.instType(id));
                 if (resultK != TypeKind::F64) {
+                    // Cite the anchor matching the deferral class the result
+                    // kind falls into, so a long double conversion-result wall
+                    // points at the long-double arc, not the int→F32 one.
+                    char const* const resultAnchor =
+                        (resultK == TypeKind::F80 || resultK == TypeKind::F128)
+                            ? "D-CSUBSET-LONG-DOUBLE / D-TARGET-ENCODING-WIDTH-GUARD"
+                            : "D-CSUBSET-INT-TO-F32-CODEGEN";
                     dss::report(reporter,
                         DiagnosticCode::L_UnsupportedLoweringForOpcode,
                         DiagnosticSeverity::Error,
@@ -1804,9 +1888,10 @@ struct Lowerer {
                             "not lowerable to target '{}' — only an F64 (double) "
                             "destination has an int→float encoding this cycle; "
                             "proceeding would silently select a wrong-width "
-                            "instruction form (D-CSUBSET-INT-TO-F32-CODEGEN)",
+                            "instruction form ({})",
                             op == MirOpcode::SIToFP ? "SIToFP" : "UIToFP",
-                            static_cast<unsigned>(resultK), target.name()));
+                            static_cast<unsigned>(resultK), target.name(),
+                            resultAnchor));
                     poisonValue(id);
                     return;
                 }
@@ -1841,6 +1926,12 @@ struct Lowerer {
             reportMissingOpcode(MnemonicSlot::Arg, "MIR Arg");
             return;
         }
+        // FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): the call-boundary
+        // width gate — an F80/F128 PARAMETER would otherwise plumb through
+        // a width-0 (64-bit) FPR move (widthFlagsForType defaults them to
+        // 0), silently truncating a 16-byte value: `long double f(long
+        // double x){return x;}` ran 8-byte plumbing before this gate.
+        if (!requireEncodedFloatWidth(id, mir.instType(id), "MIR Arg")) return;
         // Cycle 3d: Arg's result reg class follows the parameter type
         // (F32/F64 → FPR; integer/ptr → GPR). ML7 callconv lowering
         // reads the result class to pick the right arg-passing
@@ -2731,6 +2822,12 @@ struct Lowerer {
     void lowerStore(MirInstId id) {
         auto const operands = mir.instOperands(id);
         if (operands.size() != 2) { reportUnsupported(MirOpcode::Store, id); return; }
+        // FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): width gate on the
+        // stored VALUE — memAccessWidthFlags defaults F80/F128 to width 0 =
+        // an 8-byte movsd/STUR of a 16-byte value (the Load side has gated
+        // since FC2; the Store side had no gate).
+        if (!requireEncodedFloatWidth(id, mir.instType(operands[0]),
+                                      "MIR Store value")) return;
         std::optional<LirReg> const value = regForValue(operands[0]);
         std::optional<LirReg> const base  = regForValue(operands[1]);
         if (!value.has_value() || !base.has_value()) return;
@@ -3815,6 +3912,10 @@ struct Lowerer {
             emitInst(*opcode(callSlot), InvalidLirReg, ops, payload);
             return;
         }
+        // FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): call-boundary width
+        // gate on the RESULT — an F80/F128-returning call would otherwise
+        // move the return register through 64-bit plumbing (see lowerArg).
+        if (!requireEncodedFloatWidth(id, resultTy, "MIR Call result")) return;
         LirReg const result = lir.newVReg(regClassFor(id));
         emitInst(*opcode(callSlot), result, ops, payload);
         defineValue(id, result);
@@ -4772,6 +4873,329 @@ struct Lowerer {
         defineValue(id, result);
     }
 
+    // ── FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): bit-count lowerings ─────────
+    //
+    // MIR Popcount/Clz/Ctz lower NATIVE-or-SWAR, the __umulh capability split:
+    // probe `opcode(MnemonicSlot::…Native)` — present ⇒ the hardware instruction,
+    // absent ⇒ a branchless SWAR bit-trick sequence over the UNIVERSAL ALU verbs
+    // (add/sub/and/or/mul/not + shifts). NO `if (arch==…)`: the native-vs-SWAR
+    // choice reads the config-declared opcode vocabulary. All three run at the
+    // OPERAND's promotion width P∈{32,64} (U32→32, U64→64); the count (0..P≤64)
+    // has zero upper bits, so it reads correctly at the I32 MIR result with no
+    // Trunc (the ICmp→Bool narrowing precedent).
+
+    // Emit a native 1-source result:value instruction (POPCNT/LZCNT/TZCNT/CLZ/
+    // RBIT) at `widthFlags` → fresh vreg; nullopt (fail-loud, mirroring
+    // lowerMulHigh Rule 1) if the declared opcode is misconfigured (result:none).
+    [[nodiscard]] std::optional<LirReg> emitNativeUnary(
+            std::uint16_t op, LirReg operand, std::uint8_t widthFlags,
+            LirRegClass cls) {
+        auto const* ni = target.opcodeInfo(op);
+        if (ni == nullptr || ni->result != TargetResultRule::Value) {
+            reportUnsupported(mir.instOpcode(currentMir), currentMir);
+            return std::nullopt;
+        }
+        LirReg const r = lir.newVReg(cls);
+        std::array<LirOperand, 1> const ops{LirOperand::makeReg(operand)};
+        emitInst(op, r, ops, /*payload=*/0, widthFlags);
+        return r;
+    }
+
+    // Emit a 3-address reg-reg ALU op (add/sub/and/or/mul) at `widthFlags` → fresh
+    // GPR vreg — the plain form BOTH ISAs declare identically (the jump-table
+    // `mul reg,reg` agnosticism precedent). `op` is caller-resolved (fail-loud on
+    // absence happens at the caller, before the sequence starts).
+    [[nodiscard]] LirReg emitAluRegReg(std::uint16_t op, LirReg a, LirReg b,
+                                       std::uint8_t widthFlags) {
+        LirReg const r = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 2> const ops{
+            LirOperand::makeReg(a), LirOperand::makeReg(b)};
+        emitInst(op, r, ops, /*payload=*/0, widthFlags);
+        return r;
+    }
+
+    // Materialize an ARBITRARY integer constant into a fresh GPR vreg, CORRECT at
+    // full 64-bit width — the wide-capable sibling of `emitBareConstToFresh`
+    // (which was built for ≤imm32 jump-table scratch and TRUNCATES a >imm32 value
+    // on a `mov r64,imm64` target that lacks the MOVK ladder). Needed for the
+    // 64-bit SWAR masks (0x5555…/0x0F0F…). Routing (the lowerConst wide-integer
+    // path, D-CSUBSET-BITFIELD-WIDE-UNIT): fits-imm32 or arm64 MOVK ladder →
+    // emitBareConstToFresh (already correct); else `mov r64,imm64` (x86) → the
+    // LiteralPool carrier here. Capability-probed, never `if (arch==…)`.
+    [[nodiscard]] std::optional<LirReg> emitWideConstToFresh(std::uint64_t value) {
+        std::int64_t const sval = static_cast<std::int64_t>(value);
+        bool const fitsImm32 =
+            sval >= std::numeric_limits<std::int32_t>::min()
+            && sval <= std::numeric_limits<std::int32_t>::max();
+        if (!fitsImm32 && targetHasMovImm64()) {
+            auto const movOp = classOp(LirRegClass::GPR, RegClassOp::Move);
+            if (!movOp.has_value()) {
+                reportMissingClassOp(LirRegClass::GPR, RegClassOp::Move,
+                                     "bit-count SWAR wide mask");
+                return std::nullopt;
+            }
+            LirLiteralValue lit;
+            lit.core  = TypeKind::U64;
+            lit.value = value;
+            std::uint32_t const idx = lir.literalPoolAdd(std::move(lit));
+            LirReg const r = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 1> const ops{
+                LirOperand::makeLiteralIndex(idx)};
+            emitInst(*movOp, r, ops, /*payload=*/0, /*flags=*/0);  // 64-bit
+            return r;
+        }
+        return emitBareConstToFresh(sval);
+    }
+
+    // Emit `result = value >>/<< amount` for a COMPILE-TIME-CONSTANT `amount`,
+    // selecting the shift realization by the SAME capability rules `lowerShift`
+    // uses: a reg-imm variant (x86 `shr r,imm8`) / an implicit-count register
+    // (x86 CL) / a native 3-address reg-reg (arm64 LSRV/LSLV). A SEPARATE helper
+    // from lowerShift because the SWAR emits SYNTHETIC shifts inside a lowering
+    // sequence (no MIR operand to read; the amount is always a small literal), so
+    // the hot source-level path stays untouched. Shifts are the one ALU family
+    // NOT shape-uniform across ISAs (the jump-table comment), so this is where
+    // that split lives — read from config, never `if (arch==…)`.
+    [[nodiscard]] std::optional<LirReg> emitShiftConst(
+            LirReg value, std::uint8_t amount, MnemonicSlot slot,
+            std::uint8_t widthFlags) {
+        auto const op = opcode(slot);
+        if (!op.has_value()) {
+            reportMissingOpcode(slot, "bit-count SWAR shift");
+            return std::nullopt;
+        }
+        auto const* info = target.opcodeInfo(*op);
+        if (info == nullptr) {
+            reportUnsupported(mir.instOpcode(currentMir), currentMir);
+            return std::nullopt;
+        }
+        // Rule 1 — immediate count (x86 `shr r/m, imm8`).
+        if (declaresRegImmVariant(*info)) {
+            LirReg const result = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 2> const ops{
+                LirOperand::makeReg(value),
+                LirOperand::makeImmInt32(static_cast<std::int32_t>(amount))};
+            emitInst(*op, result, ops, /*payload=*/0, widthFlags);
+            return result;
+        }
+        // The reg-count forms need the amount in a register.
+        std::optional<LirReg> const amtReg = emitBareConstToFresh(amount);
+        if (!amtReg.has_value()) return std::nullopt;
+        // Rule 2 — implicit-count register (a CL-only ISA; x86 takes Rule 1).
+        if (info->implicitRegisters.has_value()) {
+            auto const& ir = *info->implicitRegisters;
+            auto const countOrd = ir.inputOrdinalForRole("count");
+            if (!countOrd.has_value()) {
+                reportMissingImplicitRole(*op, "inputRoles", "count", currentMir);
+                return std::nullopt;
+            }
+            auto const movOp = opcode(MnemonicSlot::Mov);
+            if (!movOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Mov,
+                                    "bit-count SWAR shift count pin");
+                return std::nullopt;
+            }
+            auto const* countRegInfo = target.registerInfo(*countOrd);
+            if (countRegInfo == nullptr) {
+                reportUnsupported(mir.instOpcode(currentMir), currentMir);
+                return std::nullopt;
+            }
+            LirReg const countPhys = makePhysicalReg(
+                *countOrd, static_cast<LirRegClass>(countRegInfo->regClass));
+            std::array<LirOperand, 1> const pin{LirOperand::makeReg(*amtReg)};
+            emitInst(*movOp, countPhys, pin);
+            LirReg const result = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 1> const sops{LirOperand::makeReg(value)};
+            emitInst(*op, result, sops, /*payload=*/0, widthFlags);
+            return result;
+        }
+        // Rule 3 — native 3-address reg-reg (arm64 LSRV/LSLV).
+        LirReg const result = lir.newVReg(LirRegClass::GPR);
+        std::array<LirOperand, 2> const ops{
+            LirOperand::makeReg(value), LirOperand::makeReg(*amtReg)};
+        emitInst(*op, result, ops, /*payload=*/0, widthFlags);
+        return result;
+    }
+
+    // The classic Hacker's-Delight SWAR popcount, P-parameterized, over the
+    // universal ALU verbs. `(x * ONES) >> (P-8)` sums the per-byte counts into the
+    // top byte. Returns the count vreg (0..P). The fallback when no native POPCNT
+    // is declared (arm64 has no scalar-GPR popcount) — runtime-witnessed on the
+    // arm64-elf example arm.
+    [[nodiscard]] std::optional<LirReg> emitSwarPopcount(
+            LirReg x, bool is64, std::uint8_t widthFlags) {
+        auto const andOp = opcode(MnemonicSlot::And);
+        auto const addOp = opcode(MnemonicSlot::Add);
+        auto const subOp = opcode(MnemonicSlot::Sub);
+        auto const mulOp = opcode(MnemonicSlot::Mul);
+        if (!andOp.has_value()) { reportMissingOpcode(MnemonicSlot::And, "SWAR popcount"); return std::nullopt; }
+        if (!addOp.has_value()) { reportMissingOpcode(MnemonicSlot::Add, "SWAR popcount"); return std::nullopt; }
+        if (!subOp.has_value()) { reportMissingOpcode(MnemonicSlot::Sub, "SWAR popcount"); return std::nullopt; }
+        if (!mulOp.has_value()) { reportMissingOpcode(MnemonicSlot::Mul, "SWAR popcount"); return std::nullopt; }
+        std::uint64_t const m1   = is64 ? 0x5555555555555555ULL : 0x55555555ULL;
+        std::uint64_t const m2   = is64 ? 0x3333333333333333ULL : 0x33333333ULL;
+        std::uint64_t const m3   = is64 ? 0x0F0F0F0F0F0F0F0FULL : 0x0F0F0F0FULL;
+        std::uint64_t const ones = is64 ? 0x0101010101010101ULL : 0x01010101ULL;
+        std::uint8_t  const finalShift = is64 ? 56 : 24;
+
+        // a = x - ((x >> 1) & m1)
+        auto const s1 = emitShiftConst(x, 1, MnemonicSlot::ShrL, widthFlags);
+        if (!s1.has_value()) return std::nullopt;
+        auto const m1r = emitWideConstToFresh(m1);
+        if (!m1r.has_value()) return std::nullopt;
+        LirReg const t1 = emitAluRegReg(*andOp, *s1, *m1r, widthFlags);
+        LirReg const a  = emitAluRegReg(*subOp, x, t1, widthFlags);
+        // b = (a & m2) + ((a >> 2) & m2)
+        auto const m2r = emitWideConstToFresh(m2);
+        if (!m2r.has_value()) return std::nullopt;
+        auto const s2 = emitShiftConst(a, 2, MnemonicSlot::ShrL, widthFlags);
+        if (!s2.has_value()) return std::nullopt;
+        LirReg const lo = emitAluRegReg(*andOp, a, *m2r, widthFlags);
+        LirReg const hi = emitAluRegReg(*andOp, *s2, *m2r, widthFlags);
+        LirReg const b  = emitAluRegReg(*addOp, lo, hi, widthFlags);
+        // c = (b + (b >> 4)) & m3
+        auto const s4 = emitShiftConst(b, 4, MnemonicSlot::ShrL, widthFlags);
+        if (!s4.has_value()) return std::nullopt;
+        LirReg const c0 = emitAluRegReg(*addOp, b, *s4, widthFlags);
+        auto const m3r = emitWideConstToFresh(m3);
+        if (!m3r.has_value()) return std::nullopt;
+        LirReg const c = emitAluRegReg(*andOp, c0, *m3r, widthFlags);
+        // result = (c * ones) >> finalShift
+        auto const onesr = emitWideConstToFresh(ones);
+        if (!onesr.has_value()) return std::nullopt;
+        LirReg const p = emitAluRegReg(*mulOp, c, *onesr, widthFlags);
+        return emitShiftConst(p, finalShift, MnemonicSlot::ShrL, widthFlags);
+    }
+
+    // SWAR count-leading-zeros: smear the highest set bit down to fill all lower
+    // bits, then P - popcount(smeared). clz(0) = P (smear of 0 stays 0 → popcount
+    // 0 → P). The fallback when no native LZCNT/CLZ is declared.
+    [[nodiscard]] std::optional<LirReg> emitSwarClz(
+            LirReg x, bool is64, std::uint8_t widthFlags) {
+        auto const orOp  = opcode(MnemonicSlot::Or);
+        auto const subOp = opcode(MnemonicSlot::Sub);
+        if (!orOp.has_value())  { reportMissingOpcode(MnemonicSlot::Or,  "SWAR clz"); return std::nullopt; }
+        if (!subOp.has_value()) { reportMissingOpcode(MnemonicSlot::Sub, "SWAR clz"); return std::nullopt; }
+        static constexpr std::array<std::uint8_t, 6> kSmears{1, 2, 4, 8, 16, 32};
+        std::size_t const n = is64 ? 6u : 5u;
+        LirReg s = x;
+        for (std::size_t i = 0; i < n; ++i) {
+            auto const sh = emitShiftConst(s, kSmears[i], MnemonicSlot::ShrL, widthFlags);
+            if (!sh.has_value()) return std::nullopt;
+            s = emitAluRegReg(*orOp, s, *sh, widthFlags);
+        }
+        auto const pc = emitSwarPopcount(s, is64, widthFlags);
+        if (!pc.has_value()) return std::nullopt;
+        // result = P - popcount(smeared)
+        std::optional<LirReg> const pConst = emitBareConstToFresh(is64 ? 64 : 32);
+        if (!pConst.has_value()) return std::nullopt;
+        return emitAluRegReg(*subOp, *pConst, *pc, widthFlags);
+    }
+
+    // SWAR count-trailing-zeros: popcount((~x) & (x-1)). ctz(0) = P (~0 & (0-1) =
+    // all-ones → popcount P). Reached only on a bare ISA declaring neither a
+    // native ctz (x86 TZCNT) nor RBIT+CLZ (arm64).
+    [[nodiscard]] std::optional<LirReg> emitSwarCtz(
+            LirReg x, bool is64, std::uint8_t widthFlags) {
+        auto const notOp = opcode(MnemonicSlot::Not);
+        auto const subOp = opcode(MnemonicSlot::Sub);
+        auto const andOp = opcode(MnemonicSlot::And);
+        if (!notOp.has_value()) { reportMissingOpcode(MnemonicSlot::Not, "SWAR ctz"); return std::nullopt; }
+        if (!subOp.has_value()) { reportMissingOpcode(MnemonicSlot::Sub, "SWAR ctz"); return std::nullopt; }
+        if (!andOp.has_value()) { reportMissingOpcode(MnemonicSlot::And, "SWAR ctz"); return std::nullopt; }
+        // notx = ~x  (Not is a unary op — the lowerUnaryOp operand shape).
+        LirReg const notx = lir.newVReg(LirRegClass::GPR);
+        {
+            std::array<LirOperand, 1> const ops{LirOperand::makeReg(x)};
+            emitInst(*notOp, notx, ops, /*payload=*/0, widthFlags);
+        }
+        std::optional<LirReg> const one = emitBareConstToFresh(1);
+        if (!one.has_value()) return std::nullopt;
+        LirReg const xm1 = emitAluRegReg(*subOp, x, *one, widthFlags);   // x - 1
+        LirReg const t   = emitAluRegReg(*andOp, notx, xm1, widthFlags); // ~x & (x-1)
+        return emitSwarPopcount(t, is64, widthFlags);
+    }
+
+    // Shared preamble: validate the single operand + return (operandReg, pWidth,
+    // is64). pWidth keys on the OPERAND type (P), not the I32 result. nullopt ⇒
+    // a diagnostic already fired (bad arity / poisoned operand).
+    struct BitCountOperand { LirReg reg; std::uint8_t pWidth; bool is64; };
+    [[nodiscard]] std::optional<BitCountOperand> bitCountOperand(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(mir.instOpcode(id), id);
+            return std::nullopt;
+        }
+        std::optional<LirReg> const x = regForValue(operands[0]);
+        if (!x.has_value()) return std::nullopt;
+        std::uint8_t const pWidth = widthFlagsForType(mir.instType(operands[0]));
+        return BitCountOperand{*x, pWidth, lirInstWidthBits(pWidth) == 64};
+    }
+
+    void lowerPopcount(MirInstId id) {
+        auto const in = bitCountOperand(id);
+        if (!in.has_value()) return;
+        if (auto const nativeOp = opcode(MnemonicSlot::PopcountNative);
+            nativeOp.has_value()) {  // x86 POPCNT
+            auto const r = emitNativeUnary(*nativeOp, in->reg, in->pWidth, regClassFor(id));
+            if (!r.has_value()) { poisonValue(id); return; }
+            defineValue(id, *r);
+            return;
+        }
+        // SWAR fallback (arm64 + any ISA without a scalar popcount;
+        // D-FULLC-STDBIT-ARM64-CNT-POPCOUNT trigger-gates a future arm64 NEON CNT).
+        auto const r = emitSwarPopcount(in->reg, in->is64, in->pWidth);
+        if (!r.has_value()) { poisonValue(id); return; }
+        defineValue(id, *r);
+    }
+
+    void lowerClz(MirInstId id) {
+        auto const in = bitCountOperand(id);
+        if (!in.has_value()) return;
+        if (auto const nativeOp = opcode(MnemonicSlot::ClzNative);
+            nativeOp.has_value()) {  // x86 LZCNT / arm64 CLZ (defined =width at 0)
+            auto const r = emitNativeUnary(*nativeOp, in->reg, in->pWidth, regClassFor(id));
+            if (!r.has_value()) { poisonValue(id); return; }
+            defineValue(id, *r);
+            return;
+        }
+        // SWAR fallback.
+        auto const r = emitSwarClz(in->reg, in->is64, in->pWidth);
+        if (!r.has_value()) { poisonValue(id); return; }
+        defineValue(id, *r);
+    }
+
+    void lowerCtz(MirInstId id) {
+        auto const in = bitCountOperand(id);
+        if (!in.has_value()) return;
+        // Rule 1 — native ctz (x86 TZCNT, defined =width at 0).
+        if (auto const nativeOp = opcode(MnemonicSlot::CtzNative);
+            nativeOp.has_value()) {
+            auto const r = emitNativeUnary(*nativeOp, in->reg, in->pWidth, regClassFor(id));
+            if (!r.has_value()) { poisonValue(id); return; }
+            defineValue(id, *r);
+            return;
+        }
+        // Rule 2 — RBIT then CLZ (arm64: reverse the bits, then leading-zeros of
+        // the reversed = trailing-zeros of the original; reuses the native CLZ).
+        // ctz(0): RBIT(0)=0, CLZ(0)=P. Requires BOTH — a target with rbit but no
+        // clz falls through to the SWAR (a legitimate realization, not fail-loud).
+        if (auto const rbitOp = opcode(MnemonicSlot::Rbit); rbitOp.has_value()) {
+            if (auto const clzOp = opcode(MnemonicSlot::ClzNative); clzOp.has_value()) {
+                auto const rev = emitNativeUnary(*rbitOp, in->reg, in->pWidth, regClassFor(id));
+                if (!rev.has_value()) { poisonValue(id); return; }
+                auto const r = emitNativeUnary(*clzOp, *rev, in->pWidth, regClassFor(id));
+                if (!r.has_value()) { poisonValue(id); return; }
+                defineValue(id, *r);
+                return;
+            }
+        }
+        // Rule 3 — SWAR fallback (neither TZCNT nor RBIT+CLZ).
+        auto const r = emitSwarCtz(in->reg, in->is64, in->pWidth);
+        if (!r.has_value()) { poisonValue(id); return; }
+        defineValue(id, *r);
+    }
+
     // c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): lower MIR `AtomicCas` — operands
     // [ptr, comparand, newval] → the ORIGINAL value at *ptr; newval stored iff
     // original==comparand, atomically. Two capability-probed realizations
@@ -4960,6 +5384,185 @@ struct Lowerer {
         // missing capability (mirrors emitDivLikeValue / lowerMulHigh).
         reportMissingOpcode(MnemonicSlot::LockCmpxchg,
                             mirOpcodeName(mir.instOpcode(id)));
+    }
+
+    // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the C11 memory_order values a
+    // MIR AtomicLoad/AtomicStore carries in its `payload` (the hir_to_mir
+    // kAtomicOrder* encoding). A plain `_Atomic` access is seq_cst (the default,
+    // strongest order). Relaxed/consume reuse the plain scalar Load/Store; the
+    // stronger orders bind a per-order fence slot.
+    static constexpr std::uint32_t kAtomicOrderRelaxed = 0;
+    static constexpr std::uint32_t kAtomicOrderConsume = 1;
+    static constexpr std::uint32_t kAtomicOrderAcquire = 2;
+    static constexpr std::uint32_t kAtomicOrderRelease = 3;
+    static constexpr std::uint32_t kAtomicOrderAcqRel  = 4;
+    static constexpr std::uint32_t kAtomicOrderSeqCst  = 5;
+
+    // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): a FENCED (acquire/release/
+    // seq_cst) `_Atomic` access of a NON-integer (FPR/float) scalar. The LDAR/
+    // STLR/XCHG fence realizations are GPR-only, and the encoding-variant guard
+    // matches operand KIND, not register class — so an FPR value would silently
+    // mis-encode through a GPR instruction form. FAIL LOUD (never a silent
+    // miscompile): a float lock-free `_Atomic` is a NAMED deferral this cycle
+    // (cycle-1 = integer lock-free scalars). A RELAXED FPR atomic still works —
+    // it reuses the plain movsd/fp Load/Store (a relaxed atomic == plain access).
+    void reportNonGprAtomic(MirOpcode op, MirInstId id) {
+        dss::report(reporter,
+            DiagnosticCode::L_UnsupportedLoweringForOpcode,
+            DiagnosticSeverity::Error,
+            std::format(
+                "MIR {} (inst {}): a fenced (acquire/release/seq_cst) _Atomic "
+                "access of a non-integer (FPR) scalar is not lowered on target "
+                "'{}' this cycle — the LDAR/STLR/XCHG fence realizations are "
+                "GPR-only (cycle-1 atomics are integer lock-free scalars; a "
+                "float _Atomic is a named deferral). Proceeding would silently "
+                "mis-encode an FPR value through a GPR instruction form.",
+                mirOpcodeName(op), id.v, target.name()));
+    }
+
+    // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): lower a MIR AtomicLoad to a
+    // per-order load. Operand [ptr]; result = the loaded value. The order
+    // (`payload`) selects the fence via a CLOSED (order, op)→slot matrix,
+    // capability-probed (`opcode(slot).has_value()`, NEVER an arch identity):
+    //   relaxed(0)/consume(1) → the PLAIN scalar Load (a naturally-aligned
+    //     relaxed atomic IS a plain access — `mov` on x86, `ldr` on arm64; no
+    //     fence, always available). REUSE lowerLoad — the identical [ptr]
+    //     operand shape + width/class/FPR handling, zero duplication.
+    //   acquire(2)/seq_cst(5) [+ the load-INVALID release/acq_rel, over-fenced
+    //     UP to acquire — the only safe direction, never under-fence] → the
+    //     LoadAcquire slot (arm64 LDAR; x86 a plain acquire `mov`). FAIL LOUD if
+    //     the target declares no LoadAcquire (a weak target that omits its
+    //     acquire realization REDS rather than racing).
+    void lowerAtomicLoad(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 1) {
+            reportUnsupported(MirOpcode::AtomicLoad, id);
+            return;
+        }
+        std::uint32_t const order = mir.instPayload(id);
+        if (order == kAtomicOrderRelaxed || order == kAtomicOrderConsume) {
+            lowerLoad(id);   // relaxed atomic scalar load == plain scalar load
+            return;
+        }
+        // acquire / seq_cst (and any load-invalid stronger encoding, over-fenced
+        // to acquire). LDAR / x86-acquire-mov are GPR — an FPR `_Atomic` (a
+        // lock-free 8-byte scalar, but not this cycle) fails loud, never a
+        // GPR-form mis-encode.
+        LirRegClass const cls = regClassFor(id);
+        if (cls != LirRegClass::GPR) {
+            reportNonGprAtomic(MirOpcode::AtomicLoad, id);
+            poisonValue(id);
+            return;
+        }
+        auto const acqOp = opcode(MnemonicSlot::LoadAcquire);
+        if (!acqOp.has_value()) {
+            reportMissingOpcode(MnemonicSlot::LoadAcquire,
+                                mirOpcodeName(MirOpcode::AtomicLoad));
+            poisonValue(id);
+            return;
+        }
+        std::optional<LirReg> const base = regForValue(operands[0]);
+        if (!base.has_value()) return;
+        // The loaded type drives the access width EXACTLY as lowerLoad
+        // (memAccessWidthFlags: int→width-32, ptr/i64→width-64) — the atomic
+        // qualifier is transparent to `reprKind`, so `_Atomic int` reads as int.
+        std::uint8_t const widthFlags = memAccessWidthFlags(mir.instType(id), cls);
+        LirReg const result = lir.newVReg(cls);
+        // Unified [ptr, MemBase(1), MemOffset(0)] shape (x86 memory addressing
+        // needs the disp32; arm64 LDAR carries no offset field and pins
+        // MemBase→membase.noscale + MemOffset→memoffset.zero, FAIL-LOUD on a
+        // non-zero disp — a naturally-aligned atomic is always offset 0).
+        std::array<LirOperand, 3> ops{
+            LirOperand::makeReg(*base),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        emitInst(*acqOp, result, ops, /*payload=*/0, widthFlags);
+        defineValue(id, result);
+    }
+
+    // FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): lower a MIR AtomicStore to a
+    // per-order store. Operands [value, ptr]; NO result (width comes from the
+    // VALUE operand — an AtomicStore has no result type, the plain-Store rule).
+    // The order (`payload`) selects the fence:
+    //   relaxed(0) → the PLAIN scalar Store (`mov` / `str`; no fence). REUSE
+    //     lowerStore.
+    //   release(3)/acq_rel(4) → the StoreRelease slot (arm64 STLR; x86 a plain
+    //     release `mov`). Neither writes its value reg — no scratch needed.
+    //   seq_cst(5) [the DEFAULT for a plain `_Atomic` write; + any store-INVALID
+    //     acquire/consume, over-fenced UP to seq_cst — never under-fence] → the
+    //     StoreSeqCst slot (arm64 STLR — LDAR/STLR are RCsc so a release store IS
+    //     seq_cst, no DMB; x86 `xchg [mem],reg` — a MEMORY-operand XCHG is
+    //     implicitly LOCK'd = a full fence). ★ XCHG WRITES the old memory value
+    //     back into its reg operand, so COPY the value into a fresh scratch first
+    //     (the lowerAtomicCas comparand-into-RAX precedent) — else a live-after
+    //     value vreg is corrupted. (arm64 STLR does not clobber; the copy is a
+    //     harmless, coalescable reg move.)
+    // FAIL LOUD on a missing needed slot (never a silent under-fence).
+    void lowerAtomicStore(MirInstId id) {
+        auto const operands = mir.instOperands(id);
+        if (operands.size() != 2) {
+            reportUnsupported(MirOpcode::AtomicStore, id);
+            return;
+        }
+        std::uint32_t const order = mir.instPayload(id);
+        if (order == kAtomicOrderRelaxed) {
+            lowerStore(id);   // relaxed atomic scalar store == plain scalar store
+            return;
+        }
+        // The stored value's class/width drive the encoding. STLR/XCHG are GPR —
+        // an FPR `_Atomic` store fails loud (see reportNonGprAtomic).
+        LirRegClass const cls = regClassForType(mir.instType(operands[0]));
+        if (cls != LirRegClass::GPR) {
+            reportNonGprAtomic(MirOpcode::AtomicStore, id);
+            return;
+        }
+        std::optional<LirReg> const value = regForValue(operands[0]);
+        std::optional<LirReg> const base  = regForValue(operands[1]);
+        if (!value.has_value() || !base.has_value()) return;
+        std::uint8_t const widthFlags =
+            memAccessWidthFlags(mir.instType(operands[0]), cls);
+
+        // release/acq_rel → StoreRelease; everything else (seq_cst + any
+        // store-invalid order) → StoreSeqCst (the strongest — over-fence, never
+        // under-fence).
+        bool const isSeqCst =
+            (order != kAtomicOrderRelease && order != kAtomicOrderAcqRel);
+        MnemonicSlot const slot =
+            isSeqCst ? MnemonicSlot::StoreSeqCst : MnemonicSlot::StoreRelease;
+        auto const stOp = opcode(slot);
+        if (!stOp.has_value()) {
+            reportMissingOpcode(slot, mirOpcodeName(MirOpcode::AtomicStore));
+            return;
+        }
+
+        // ★ the seq_cst XCHG clobber hazard: copy the stored value into a fresh
+        // scratch so a live-after value vreg survives the reg write-back. Release
+        // stores (mov/stlr) do not clobber, so they store the value reg directly.
+        LirReg valueReg = *value;
+        if (isSeqCst) {
+            auto const movOp = opcode(MnemonicSlot::Mov);
+            if (!movOp.has_value()) {
+                reportMissingOpcode(MnemonicSlot::Mov,
+                                    "MIR AtomicStore (seq_cst scratch copy)");
+                return;
+            }
+            LirReg const scratch = lir.newVReg(LirRegClass::GPR);
+            std::array<LirOperand, 1> const movOps{LirOperand::makeReg(*value)};
+            emitInst(*movOp, scratch, movOps);
+            valueReg = scratch;
+        }
+
+        // Unified [value, ptr, MemBase(1), MemOffset(0)] shape (mirrors
+        // lowerStore; x86 needs the disp32, arm64 STLR pins membase.noscale +
+        // memoffset.zero, FAIL-LOUD on a non-zero disp).
+        std::array<LirOperand, 4> ops{
+            LirOperand::makeReg(valueReg),
+            LirOperand::makeReg(*base),
+            LirOperand::makeMemBase(1),
+            LirOperand::makeMemOffset(0),
+        };
+        emitInst(*stOp, InvalidLirReg, ops, /*payload=*/0, widthFlags);
     }
 
     void reportMissingImplicitRole(std::uint16_t opId, char const* mapName,
@@ -5430,6 +6033,11 @@ struct Lowerer {
         std::vector<LirOperand> ops;
         ops.reserve(operands.size());
         for (MirInstId const operand : operands) {
+            // FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): call-boundary
+            // width gate on the RETURN operand — the return-register move is
+            // plain plumbing with no producer gate of its own (see lowerArg).
+            if (!requireEncodedFloatWidth(id, mir.instType(operand),
+                                          "MIR Return operand")) return false;
             std::optional<LirReg> const v = regForValue(operand);
             if (!v.has_value()) return false;
             ops.push_back(LirOperand::makeReg(*v));

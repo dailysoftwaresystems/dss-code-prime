@@ -74,7 +74,7 @@ struct PendingIncoming {
         case TypeKind::Ptr: case TypeKind::Ref: case TypeKind::FnPtr:
             return true;
         default:
-            return false;  // F16/F32/F64/F128 (rodata), I128/U128, Struct/Union/Tuple/
+            return false;  // F16/F32/F64/F80/F128 (rodata), I128/U128, Struct/Union/Tuple/
                            // Array/Slice/Vector/Matrix/Nullable/Optional/Void (no scalar zero)
     }
 }
@@ -326,6 +326,34 @@ void Mem2RegPolicy::analyze(MirFuncId fn) {
         if (src_.instOpcode(src_.blockInstAt(b, n - 1))
             == MirOpcode::SehTryBegin) {
             return;   // promoted_ stays empty → shouldEmit/tryRewrite = identity
+        }
+    }
+
+    // D-OPT-SETJMP-RETURNS-TWICE-INLINE (mem2reg half; FC17.9(c) D-CSUBSET-SETJMP):
+    // a function containing a RETURNS-TWICE Call (setjmp/_setjmp) promotes NO
+    // allocas. A matching `longjmp` makes the setjmp Call "return a second time"
+    // over a control-flow edge the compiler CANNOT SEE — the resume re-enters at
+    // the setjmp site, but the block that dynamically ran between the two returns
+    // is NOT a static predecessor of the resume point. A promoted local reassigned
+    // on that hidden path would carry its stale ENTRY-reaching SSA value past the
+    // resume (a silent miscompile); kept in MEMORY, longjmp restores SP +
+    // callee-saved so the last store is observed (the GCC `returns_twice`
+    // treatment). Function-level over-approximation, exactly like the SEH scan
+    // above (correctness-safe; only fires for the rare returns-twice-containing
+    // function, so it does not pessimize ordinary code). Keys on the GENERIC
+    // `MirInstFlags::ReturnsTwice` bit (set at HIR→MIR from the callee's
+    // SymbolRecord.returnsTwice) — no arch/format/name matching. ★ Unlike the SEH
+    // scan (SehTryBegin is a block TERMINATOR), a returns-twice Call is MID-BLOCK,
+    // so this scan walks EVERY instruction in every block, not just terminators.
+    for (std::uint32_t bi = 0; bi < src_.funcBlockCount(fn); ++bi) {
+        MirBlockId const b = src_.funcBlockAt(fn, bi);
+        std::uint32_t const n = src_.blockInstCount(b);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            MirInstId const id = src_.blockInstAt(b, i);
+            if (src_.instOpcode(id) == MirOpcode::Call
+                && has(src_.instFlags(id), MirInstFlags::ReturnsTwice)) {
+                return;   // promoted_ stays empty → shouldEmit/tryRewrite = identity
+            }
         }
     }
 

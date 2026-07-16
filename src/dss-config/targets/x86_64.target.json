@@ -548,6 +548,75 @@
       }
     },
     {
+      "$comment": "FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): POPCNT r, r/m — population count (set bits). F3 0F B8 /r; width 64 adds REX.W (bytes F3 48 0F B8 /r), width 32 no REX.W (F3 0F B8 /r). ModR/M.reg = the GPR destination (resultSlot), ModR/M.rm = the source (wire 0) — the `fpcvt` mandatoryPrefix + modrm.reg-dest shape. The mandatoryPrefix F3 emits BEFORE the auto-REX (the fpcvt/lock_cmpxchg legacy-prefix-then-REX order). MIR Popcount's NATIVE realization; a target NOT declaring `popcount` (arm64) takes the SWAR fallback. `popcount` (verb) not `popcnt` — the DSS internal mnemonic is the semantic verb (a future arm64 NEON CNT would share this slot).",
+      "mnemonic": "popcount", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [243], "rexW": true, "opcode": [15, 184] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [243], "opcode": [15, 184] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): LZCNT r, r/m — count leading zeros, DEFINED at 0 = operand width (32/64) — unlike BSR (UB at 0). F3 0F BD /r; width 64 adds REX.W. Same modrm.reg-dest + F3-mandatoryPrefix shape as popcount. MIR Clz's NATIVE realization; the DSS verb is `clz` (shared with arm64 CLZ — same semantics, defined =width at 0). Assumes an x86-64 baseline with ABM/LZCNT (as the umulh/cmpxchg intrinsics already assume a modern baseline); a target without it would drop the `clz` row and take the SWAR fallback.",
+      "mnemonic": "clz", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [243], "rexW": true, "opcode": [15, 189] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [243], "opcode": [15, 189] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): TZCNT r, r/m — count trailing zeros, DEFINED at 0 = operand width (32/64) — unlike BSF (UB at 0). F3 0F BC /r; width 64 adds REX.W. Same shape. MIR Ctz's NATIVE realization (DSS verb `ctz`); arm64 has no scalar TZCNT and composes RBIT-then-CLZ instead. BMI1 baseline assumption (as LZCNT above).",
+      "mnemonic": "ctz", "result": "value",
+      "minOperands": 1, "maxOperands": 1,
+      "minSuccessors": 0, "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 64 },
+            "template":   { "mandatoryPrefix": [243], "rexW": true, "opcode": [15, 188] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          },
+          {
+            "guard":      { "operandKinds": ["reg"], "width": 32 },
+            "template":   { "mandatoryPrefix": [243], "opcode": [15, 188] },
+            "resultSlot": "modrm.reg",
+            "wires":      [{ "index": 0, "slotKind": "modrm.rm" }]
+          }
+        ]
+      }
+    },
+    {
       "$comment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS) — atomic compare-and-swap, mem-dest: LOCK CMPXCHG [base+disp32], reg (LOCK 0xF0 mandatoryPrefix + 0x0F 0xB1 /r). Semantics: compares RAX/EAX (the implicit 'comparand' input-role) with [mem]; equal -> stores the wired reg (the NEW value, modrm.reg); unequal -> loads [mem] into RAX/EAX. EITHER way RAX ends holding the ORIGINAL observed value (the 'old' output-role the MIR AtomicCas lowering captures). LOCK makes it a full barrier — the correct strength for Win32 InterlockedCompareExchange. Operand shape mirrors `store`'s 4-op mem-dest form: [newval_reg, base_reg, MemBase(scale), MemOffset(disp)]. mandatoryPrefix [240] emits BEFORE the auto-REX (the 0x66 width-16-store precedent — legacy prefixes precede REX, REX immediately precedes the opcode), so a high-numbered base/newval register REX.B/R composes correctly: F0 [REX] 0F B1 /r. Width 32 = the Win32 LONG (LLP64) CAS — NO rexW; width 64 for completeness (a future 64-bit CAS consumer). implicitRegisters: inputs=[rax] (the comparand), outputs/clobbered=[rax] (the observed-original; outputs ⊆ clobbered).",
       "mnemonic":      "lock_cmpxchg",
       "result":        "none",
@@ -580,6 +649,111 @@
             "$comment": "64-bit form (REX.W): lock cmpxchg qword [base+disp32], r64 — no shipped consumer yet (InterlockedCompareExchange is the 32-bit LONG CAS); declared so a future i64 CAS selects it by width instead of silently mis-encoding.",
             "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
             "template": { "mandatoryPrefix": [240], "rexW": true, "opcode": [15, 177] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the acquire/seq_cst realization of MIR AtomicLoad on x86-64 — a PLAIN `mov reg, [base+disp32]` (x86 loads are ALREADY acquire; no fence instruction needed). Declared as a distinct slot with the SAME encoding as the scalar `load` (0x8B /r) so the pure-slot-presence probe finds an acquire-load realization on x86 (a target omitting it would fail loud, never silently under-fence). Operand shape [ptr, MemBase(1), MemOffset(0)] (unified with arm64 LDAR): ptr->modrm.rm.mem, result->modrm.reg, disp32=0. VERIFIED by objdump: `mov ecx,[rax]` = 8b 08. Widths 64 (REX.W — i64/pointer) + 32 (int / _Atomic int).",
+      "mnemonic":      "load_acquire",
+      "result":        "value",
+      "hasSideEffects": true,
+      "minOperands":   3,
+      "maxOperands":   3,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 64 },
+            "resultSlot": "modrm.reg",
+            "template":   { "rexW": true, "opcode": [139] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":      { "operandKinds": ["reg", "membase", "memoffset"], "width": 32 },
+            "resultSlot": "modrm.reg",
+            "template":   { "opcode": [139] },
+            "wires":      [
+              { "index": 0, "slotKind": "modrm.rm.mem"  },
+              { "index": 1, "slotKind": "membase.scale" },
+              { "index": 2, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the release/acq_rel realization of MIR AtomicStore on x86-64 — a PLAIN `mov [base+disp32], reg` (x86 stores are ALREADY release). Same encoding as the scalar `store` (0x89 /r). Operand shape [value, ptr, MemBase(1), MemOffset(0)]: value->modrm.reg, ptr->modrm.rm.mem, disp32=0. A `mov` does NOT write its value reg (no clobber hazard, unlike the seq_cst XCHG). VERIFIED by objdump: `mov [rax],ecx` = 89 08. Widths 64 (REX.W) + 32.",
+      "mnemonic":      "store_release",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [137] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [137] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "$comment": "FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the SEQ_CST realization of MIR AtomicStore on x86-64 — `xchg [base+disp32], reg` (0x87 /r). A MEMORY-operand XCHG is IMPLICITLY LOCK'd (Intel SDM Vol.2B XCHG: the LOCK protocol is automatic whenever a memory operand is referenced, no LOCK prefix needed) = a FULL fence, the correct strength for a seq_cst store. ★ XCHG WRITES the OLD memory value back into its reg operand, so `lowerAtomicStore` COPIES the stored value into a fresh scratch first — else a live-after value vreg is corrupted. Operand shape [value(scratch), ptr, MemBase(1), MemOffset(0)] (same as `store`): value->modrm.reg, ptr->modrm.rm.mem. VERIFIED by objdump: `xchg dword [rax],ecx` = 87 08, `xchg qword [rax],rcx` = 48 87 08. Widths 64 (REX.W) + 32.",
+      "mnemonic":      "store_seqcst",
+      "result":        "none",
+      "hasSideEffects": true,
+      "minOperands":   4,
+      "maxOperands":   4,
+      "minSuccessors": 0,
+      "maxSuccessors": 0,
+      "encoding": {
+        "format": "x86-variable",
+        "variants": [
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 64 },
+            "template": { "rexW": true, "opcode": [135] },
+            "wires":    [
+              { "index": 0, "slotKind": "modrm.reg"     },
+              { "index": 1, "slotKind": "modrm.rm.mem"  },
+              { "index": 2, "slotKind": "membase.scale" },
+              { "index": 3, "slotKind": "disp32.mem"    }
+            ]
+          },
+          {
+            "guard":    { "operandKinds": ["reg", "reg", "membase", "memoffset"], "width": 32 },
+            "template": { "opcode": [135] },
             "wires":    [
               { "index": 0, "slotKind": "modrm.reg"     },
               { "index": 1, "slotKind": "modrm.rm.mem"  },

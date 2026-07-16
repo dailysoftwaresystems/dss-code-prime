@@ -1,0 +1,23 @@
+{
+  "$comment": "FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the per-format long-double axis, runtime-witnessed on the f64-axis formats where `long double` IS `double` (pe64 x86_64 MSVC + Apple arm64 — the axis collapses the typeSpecifiers row to F64, so the whole double substrate serves it with zero new codegen). Exercises: the `long double` declaration multiset, 20.0L/22.0L l-suffixed FLOAT literals (the CRITICAL-1 suffix-shape separation keeps integer 20L distinct), UAC arithmetic, sizeof (f64-axis identity guard), and (int) conversion. Operands route through MUTABLE GLOBALS so the release arm proves real runtime arithmetic, not a fold (the c11_atomic anti-fold precedent). The x87-80/ieee128 formats are deliberately ABSENT — long double VALUE ops wall loud there until D-CSUBSET-LONG-DOUBLE-X87-ARITH / -IEEE128-ARITH land; that walled behavior is pinned in the unit suites (the F80 arithmetic-wall arm + the four call-boundary walls F80{Arg,StoreValue,CallResult,ReturnOperand}BoundaryWallsFailLoud in tests/lir/test_mir_to_lir.cpp, the constexpr fold-gate refusal in the semantic + const_eval suites), not by a runtime arm here. exit = (int)(20.0L + 22.0L) = 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -283,7 +283,11 @@ std::optional<std::uint64_t> scalarByteSize(TypeKind kind, DataModel dm) noexcep
             return 4;
         case TypeKind::I64: case TypeKind::U64: case TypeKind::F64:
             return 8;
-        case TypeKind::I128: case TypeKind::U128: case TypeKind::F128:
+        // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): F80 (x87 80-bit) STORES as 16/16 —
+        // x86_64-SysV and darwin-x86_64 both pad the 10 significant bytes to a
+        // 16-byte, 16-aligned slot (the same size/align binary128 uses).
+        case TypeKind::I128: case TypeKind::U128: case TypeKind::F80:
+        case TypeKind::F128:
             return 16;
         // Pointer-class scalars take the model's pointer width. C23 nullptr_t has
         // the same size/representation as `void*` (§6.2.5), so `sizeof(nullptr)`
@@ -324,12 +328,20 @@ bool isWideBitInt(TypeInterner const& interner, TypeId id) noexcept {
         && interner.bitIntWidth(id) > 64;
 }
 
+bool isComplex(TypeInterner const& interner, TypeId id) noexcept {
+    return id.valid() && interner.kind(id) == TypeKind::Complex;
+}
+
 bool isMemoryResidentType(TypeInterner const& interner, TypeId id) noexcept {
     if (!id.valid()) return false;
     switch (interner.kind(id)) {
         case TypeKind::Struct:
         case TypeKind::Union:
         case TypeKind::Array:
+        // C99 _Complex (D-CSUBSET-COMPLEX): a complex is a memory-resident by-value
+        // aggregate {re, im} reached by ADDRESS, mirroring a wide `_BitInt` exactly
+        // — it has no bare-SSA aggregate value.
+        case TypeKind::Complex:
             return true;
         case TypeKind::BitInt:
             return interner.bitIntWidth(id) > 64;   // wide _BitInt is multi-limb
@@ -343,6 +355,10 @@ bool isByValueClass(TypeInterner const& interner, TypeId id) noexcept {
     switch (interner.kind(id)) {
         case TypeKind::Struct:
         case TypeKind::Union:
+        // C99 _Complex (D-CSUBSET-COMPLEX): passed/returned/copy-assigned BY VALUE
+        // like a struct{re, im} (the by-address call/return/init/assign gates funnel
+        // here). NOT Array — a complex does not decay.
+        case TypeKind::Complex:
             return true;
         case TypeKind::BitInt:
             return interner.bitIntWidth(id) > 64;   // ARRAY excluded (it decays)
@@ -410,6 +426,20 @@ computeLayout(TypeId id, TypeInterner const& interner,
                 alignBytes = 8;                       // psABI: align 8 even at N>64
             }
             return StructLayout{size, scalarAlign(alignBytes, params), {}, false};
+        }
+        case TypeKind::Complex: {
+            // C99 _Complex (D-CSUBSET-COMPLEX) §6.2.5p13: a complex lays out EXACTLY
+            // like an array {re, im} of two element-float components — real@0,
+            // imag@elemSize, size 2×elemSize, align = element align. This IS the ABI
+            // leaf layout (collectLeaves emits 2 float leaves at 0/elemSize). A
+            // long-double-complex (F80/F128 element) sizes fine here (decl/sizeof/
+            // ABI-reject work); only its VALUE arithmetic walls loud downstream.
+            auto const ops = interner.operands(id);
+            if (ops.empty()) return std::nullopt;
+            auto const elem = computeLayout(ops[0], interner, params, dm);
+            if (!elem) return std::nullopt;
+            std::uint64_t const es = elem->size;
+            return StructLayout{es * 2, elem->align, {}, false};
         }
         case TypeKind::Array: {
             // A bare flexible/incomplete array `T[]` has NO standalone size — it is

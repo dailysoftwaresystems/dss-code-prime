@@ -2228,18 +2228,17 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
     auto c = GrammarSchema::loadShipped("c-subset");
     ASSERT_TRUE(c.has_value());
     auto const& pms = (*c)->preprocess().predefinedMacros;
-    // 8 ungated (the 7 C 6.10.8 core + the `_BitInt` C1 `__BITINT_MAXWIDTH__` line,
-    // D-CSUBSET-BITINT — C23 6.2.5, the mandatory bit-precise max width 8388608) +
-    // 10 pe-gated + 1 macho-gated = 19: the pe-gated set is the c95 Windows selection
-    // (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the c105 MSVC-profile flip
-    // (_MSC_VER/__int64/__forceinline/__declspec); the macho-gated one is
-    // `__STDC_NO_THREADS__` is now REMOVED ENTIRELY (FC17.9(a) macho trampolines —
-    // D-CSUBSET-C11-THREADS-MACHO closed: <threads.h> is COMPLETE on ALL legs incl. macho,
-    // so a conforming impl defines the macro on NO target). D-CSUBSET-VLA C1b removed
-    // `__STDC_NO_VLA__`; the threads macro's removal drops the count 19 → 18, with NO
-    // macho-gated macros remaining.
-    EXPECT_EQ(pms.size(), 18u)
-        << "c-subset declares 8 un-gated + 10 pe-gated predefined macros (no macho-gated)";
+    // 11 ungated (the 7 C 6.10.8 core + the `_BitInt` C1 `__BITINT_MAXWIDTH__` line,
+    // D-CSUBSET-BITINT — C23 6.2.5, the mandatory bit-precise max width 8388608 + the
+    // FC17.9(h) C23 `#embed` trichotomy macros `__STDC_EMBED_NOT_FOUND__`/`_FOUND__`/
+    // `_EMPTY__` = 0/1/2, D-PP-EMBED) + 10 pe-gated = 21: the pe-gated set is the c95
+    // Windows selection (_WIN32/_WIN64/__stdcall/__cdecl/__fastcall/WINAPI) + the c105
+    // MSVC-profile flip (_MSC_VER/__int64/__forceinline/__declspec). NO macho-gated
+    // macros remain: `__STDC_NO_THREADS__` is REMOVED ENTIRELY (FC17.9(a) macho
+    // trampolines — <threads.h> is COMPLETE on ALL legs), and D-CSUBSET-VLA C1b removed
+    // `__STDC_NO_VLA__` (a VLA-supporting impl must not define it).
+    EXPECT_EQ(pms.size(), 21u)
+        << "c-subset declares 11 un-gated + 10 pe-gated predefined macros (no macho-gated)";
     std::size_t ungated = 0;
     std::size_t peGated = 0;
     for (auto const& pm : pms) {
@@ -2255,8 +2254,9 @@ TEST(Preprocessor, FC15bPredefinedMacrosAreOptOutPerLanguage) {
                 << pm.name << " should be pe-gated (Windows selection) — no macho-gated macro remains";
         }
     }
-    EXPECT_EQ(ungated, 8u)
-        << "the 7 C 6.10.8 macros + __BITINT_MAXWIDTH__ (_BitInt C1) are un-gated (every "
+    EXPECT_EQ(ungated, 11u)
+        << "the 7 C 6.10.8 macros + __BITINT_MAXWIDTH__ (_BitInt C1) + the 3 C23 "
+           "__STDC_EMBED_* trichotomy macros (FC17.9(h), D-PP-EMBED) are un-gated (every "
            "format); __STDC_NO_VLA__ (D-CSUBSET-VLA C1b) + __STDC_NO_THREADS__ (threads.h "
            "complete on all legs) are both REMOVED";
     EXPECT_EQ(peGated, 10u)
@@ -3850,4 +3850,408 @@ TEST(Preprocessor, DeadElifdefArmSkipsNestedQuoteInclude) {
     for (auto const& l : lexs)
         if (l == "from_a") hasFromA = true;
     EXPECT_TRUE(hasFromA) << "the taken #ifdef arm survives: int from_a ;";
+}
+
+// ── FC17.9(h) C23 `#embed` (6.10.4 / N3096 6.10.3) + `__has_embed` (6.10.1) ──
+// D-PP-EMBED. The quote-form scalar `#embed` splices a binary resource's bytes as
+// a comma-separated list of decimal `int` constants; `__has_embed` reports the
+// C23 trichotomy 0/1/2. Every fixture writes its resource at RUNTIME in binary
+// mode (no git involvement); resources reach the resolver via `includeDirs`
+// (main.c has no directory, so its self-dir is empty). Every assertion is the
+// strongest provable property and red-on-disable.
+namespace {
+namespace fsemb = std::filesystem;
+
+// Write `bytes` (exact, embedded NULs allowed) to `dir/name` in BINARY mode so a
+// CR/LF/SUB byte survives verbatim; returns the containing directory.
+[[nodiscard]] fsemb::path
+writeEmbedResource(std::string const& sub, std::string const& name,
+                   std::string const& bytes) {
+    auto dir = fsemb::temp_directory_path() / sub;
+    fsemb::create_directories(dir);
+    std::ofstream out(dir / name, std::ios::binary);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    return dir;
+}
+
+// The significant (non-trivia, non-Eof) tokens of preprocessing `text` with
+// `includeDirs` as the resource search path.
+[[nodiscard]] std::vector<Token>
+ppEmbedTokens(std::string text, PreprocessResult& out,
+              std::vector<fsemb::path> includeDirs) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(std::move(text), "main.c");
+    std::vector<fsemb::path> noSys;
+    out = preprocess(buf, schema, includeDirs, noSys);
+    std::vector<Token> sig;
+    for (Token const& t : out.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof) continue;
+        if (t.coreKind == CoreTokenKind::Whitespace) continue;
+        if (t.coreKind == CoreTokenKind::Newline) continue;
+        sig.push_back(t);
+    }
+    return sig;
+}
+
+// The lexemes strictly between the FIRST `{` and the next `}` (the initializer
+// list of a FILE-SCOPE `... x[] = { ... };`, so no function-body brace precedes).
+[[nodiscard]] std::vector<std::string>
+braceInner(std::vector<Token> const& toks, PreprocessResult const& out) {
+    std::vector<std::string> inner;
+    bool inBrace = false;
+    for (Token const& t : toks) {
+        std::string s{out.synthBuffer->slice(t.span)};
+        if (!inBrace) { if (s == "{") inBrace = true; continue; }
+        if (s == "}") break;
+        inner.push_back(std::move(s));
+    }
+    return inner;
+}
+
+[[nodiscard]] std::string firstEmbedMsg(PreprocessResult const& r) {
+    for (auto const& d : r.diagnostics->all())
+        if (d.code == DiagnosticCode::P_PreprocessorEmbed) return d.actual;
+    return {};
+}
+} // namespace
+
+// T1 (RUN FIRST — the P2 residual closure): a multi-byte resource splices to
+// EXACTLY the byte values as a comma-separated `int` list, product tokens
+// (IntLiteral + Comma) accepted in brace-init position. Bytes {42, 0, 7}.
+TEST(Preprocessor, FC179EmbedByteExactProductTokenStream) {
+    auto dir = writeEmbedResource("dss_embed_t1", "three.bin",
+                                  std::string("\x2a\x00\x07", 3));
+    PreprocessResult r;
+    auto toks = ppEmbedTokens(
+        "static const unsigned char x[] = {\n#embed \"three.bin\"\n};\n", r, {dir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    auto inner = braceInner(toks, r);
+    ASSERT_EQ(inner.size(), 5u) << "spliced as exactly `42, 0, 7`";
+    EXPECT_EQ(inner[0], "42");
+    EXPECT_EQ(inner[1], ",");
+    EXPECT_EQ(inner[2], "0");
+    EXPECT_EQ(inner[3], ",");
+    EXPECT_EQ(inner[4], "7");
+    // Each byte value is an IntLiteral token (a value the parser accepts in a
+    // brace initializer -- the make-or-break P2 premise, empirically closed).
+    int intLiterals = 0;
+    bool inBrace = false;
+    for (Token const& t : toks) {
+        std::string s{r.synthBuffer->slice(t.span)};
+        if (!inBrace) { if (s == "{") inBrace = true; continue; }
+        if (s == "}") break;
+        if (t.coreKind == CoreTokenKind::IntLiteral) ++intLiterals;
+    }
+    EXPECT_EQ(intLiterals, 3) << "each embedded byte materializes as an IntLiteral";
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// T2: binary-mode read preserves hostile bytes. {13, 10, 26, 0, 255} -> the
+// decimal texts. RED if anyone ever "simplifies" to a text-mode read (CR/LF/SUB
+// would mangle on Windows).
+TEST(Preprocessor, FC179EmbedBinaryModeReadPreservesHostileBytes) {
+    auto dir = writeEmbedResource("dss_embed_t2", "hostile.bin",
+                                  std::string("\x0d\x0a\x1a\x00\xff", 5));
+    PreprocessResult r;
+    auto toks = ppEmbedTokens(
+        "static const unsigned char x[] = {\n#embed \"hostile.bin\"\n};\n", r, {dir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    auto inner = braceInner(toks, r);
+    ASSERT_EQ(inner.size(), 9u) << "5 values + 4 commas";
+    EXPECT_EQ(inner[0], "13");
+    EXPECT_EQ(inner[2], "10");
+    EXPECT_EQ(inner[4], "26");
+    EXPECT_EQ(inner[6], "0");
+    EXPECT_EQ(inner[8], "255");
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// T3: the dss-state `c23_embed` probe shape -- a single-byte '*' (0x2A) resource
+// -> the value 42.
+TEST(Preprocessor, FC179EmbedProbeShapeSingleByteIsFortyTwo) {
+    auto dir = writeEmbedResource("dss_embed_t3", "answer.bin", std::string("*"));
+    PreprocessResult r;
+    auto toks = ppEmbedTokens(
+        "static const unsigned char answer[] = {\n#embed \"answer.bin\"\n};\n",
+        r, {dir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    auto inner = braceInner(toks, r);
+    ASSERT_EQ(inner.size(), 1u);
+    EXPECT_EQ(inner[0], "42") << "'*' = 0x2A = 42";
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// T4: the resource resolves relative to the FILE THAT CONTAINS the directive (the
+// per-origin dir via the line-map), NOT the main file's dir. `inc/h.h` carries
+// the `#embed "res.bin"`; `inc/res.bin` exists but NO copy sits next to main.c.
+// RED-ON-DISABLE: resolving against the main dir (not the header's) misses res.bin.
+TEST(Preprocessor, FC179EmbedResolvesRelativeToIncludingHeader) {
+    auto root = fsemb::temp_directory_path() / "dss_embed_t4";
+    auto inc  = root / "inc";
+    fsemb::create_directories(inc);
+    { std::ofstream(inc / "h.h", std::ios::binary)
+          << "static const unsigned char x[] = {\n#embed \"res.bin\"\n};\n"; }
+    { std::ofstream out(inc / "res.bin", std::ios::binary); out.put('*'); }
+    // main.c lives in `root`, includes `inc/h.h`; res.bin is NOT in `root`.
+    auto buf = SourceBuffer::fromString("#include \"inc/h.h\"\n",
+                                        (root / "main.c").string());
+    auto schema = cSubset();
+    std::vector<fsemb::path> dirs{root};
+    auto r = preprocess(buf, schema, dirs);
+    EXPECT_FALSE(r.diagnostics->hasErrors())
+        << "#embed inside a spliced header resolves relative to the HEADER's dir";
+    bool has42 = false;
+    for (Token const& t : r.tokens)
+        if (std::string{r.synthBuffer->slice(t.span)} == "42") has42 = true;
+    EXPECT_TRUE(has42) << "the header-relative resource spliced its byte (42)";
+    std::error_code ec; fsemb::remove_all(root, ec);
+}
+
+// T5: a missing resource fails loud (a C23 constraint violation).
+TEST(Preprocessor, FC179EmbedMissingResourceFailsLoud) {
+    PreprocessResult r;
+    (void)ppEmbedTokens(
+        "static const unsigned char x[] = {\n#embed \"no_such_embed_xyz.bin\"\n};\n",
+        r, {});
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+        << "a missing #embed resource must fail loud";
+    EXPECT_NE(firstEmbedMsg(r).find("not found"), std::string::npos);
+}
+
+// T6: `#embed ""` (empty filename) fails loud.
+TEST(Preprocessor, FC179EmbedEmptyFilenameFailsLoud) {
+    PreprocessResult r;
+    (void)ppEmbedTokens("static const unsigned char x[] = {\n#embed \"\"\n};\n",
+                        r, {});
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+}
+
+// T7 (D-PP-EMBED-PARAMS): ANY standard/vendor parameter after the filename fails
+// loud -- even for an EXISTING resource (silently honoring `limit` would embed a
+// different byte set = a silent miscompile). Resource present, so ONLY the param
+// can red.
+TEST(Preprocessor, FC179EmbedParametersFailLoud) {
+    auto dir = writeEmbedResource("dss_embed_t7", "r.bin", std::string("*"));
+    for (std::string const& param :
+         {"limit(1)", "if_empty(0)", "prefix(1)", "suffix(2)", "gnu"}) {
+        PreprocessResult r;
+        (void)ppEmbedTokens(
+            "static const unsigned char x[] = {\n#embed \"r.bin\" " + param
+                + "\n};\n",
+            r, {dir});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+            << "#embed parameter must fail loud (even for an existing file): "
+            << param;
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// T8 (D-PP-EMBED-ANGLE / D-PP-EMBED-MACRO-ARG): the angle form and a
+// macro-expanded argument are deferred loud (never silent).
+TEST(Preprocessor, FC179EmbedAngleAndMacroArgFailLoud) {
+    {
+        PreprocessResult r;
+        (void)ppEmbedTokens(
+            "static const unsigned char x[] = {\n#embed <r.bin>\n};\n", r, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+            << "the angle form is a loud deferral";
+    }
+    {
+        PreprocessResult r;
+        (void)ppEmbedTokens(
+            "static const unsigned char x[] = {\n#embed RES\n};\n", r, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+            << "a macro-expanded argument is a loud deferral";
+    }
+}
+
+// T9: an empty resource expands to NOTHING (C23 6.10.3/6.10.4). `{ <empty> 42 }`
+// -> array {42}.
+TEST(Preprocessor, FC179EmbedEmptyResourceExpandsToNothing) {
+    auto dir = writeEmbedResource("dss_embed_t9", "empty.bin", std::string());
+    PreprocessResult r;
+    auto toks = ppEmbedTokens(
+        "static const unsigned char x[] = {\n#embed \"empty.bin\"\n42\n};\n",
+        r, {dir});
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    auto inner = braceInner(toks, r);
+    ASSERT_EQ(inner.size(), 1u) << "empty resource -> zero tokens spliced";
+    EXPECT_EQ(inner[0], "42");
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// T10: `__has_embed` trichotomy -- found(1) / empty(2, == __STDC_EMBED_EMPTY__) /
+// missing(0) / an unsupported parameter clause -> NOT_FOUND(0) NOT an error (the
+// C23 feature-probe contract) / malformed -> loud.
+TEST(Preprocessor, FC179HasEmbedTrichotomy) {
+    auto dir = writeEmbedResource("dss_embed_t10", "full.bin", std::string("*"));
+    (void)writeEmbedResource("dss_embed_t10", "empty.bin", std::string());
+    { // found (non-empty) -> 1 -> yes
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_embed(\"full.bin\")\nint yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes") << "a non-empty resource -> __has_embed == 1";
+    }
+    { // empty -> 2, and 2 == __STDC_EMBED_EMPTY__ (the config<->engine coupling)
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_embed(\"empty.bin\") == __STDC_EMBED_EMPTY__\n"
+            "int yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "yes")
+            << "an empty resource -> __has_embed == 2 == __STDC_EMBED_EMPTY__";
+    }
+    { // missing -> 0 -> no
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_embed(\"nope.bin\")\nint yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors());
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "no") << "a missing resource -> __has_embed == 0";
+    }
+    { // an unsupported parameter clause -> NOT_FOUND(0), NOT an error
+        PreprocessResult r;
+        auto lexs = ppLexemesWithDirs(
+            "#if __has_embed(\"full.bin\" limit(1))\n"
+            "int yes;\n#else\nint no;\n#endif\n",
+            r, {dir}, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "an unsupported parameter is the standard NOT_FOUND signal, "
+               "not an error";
+        ASSERT_EQ(lexs.size(), 3u);
+        EXPECT_EQ(lexs[1], "no")
+            << "any parameter clause -> __has_embed == 0 (C23 feature-probe)";
+    }
+    { // malformed (no `(`) -> loud
+        PreprocessResult r;
+        (void)ppLexemesWithDirs("#if __has_embed\nint a;\n#endif\n", r, {dir}, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+            << "__has_embed with no `(` must fail loud";
+    }
+    { // malformed (empty name) -> loud
+        PreprocessResult r;
+        (void)ppLexemesWithDirs("#if __has_embed(\"\")\nint a;\n#endif\n",
+                                r, {dir}, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+            << "__has_embed with an empty name must fail loud";
+    }
+    std::error_code ec; fsemb::remove_all(dir, ec);
+}
+
+// T11: dead-branch parity -- a `#if 0` `#embed` of a MISSING file is silent (no
+// resolution, no diagnostic; the :stackActive gate), while the live twin fails
+// loud. RED-ON-DISABLE: moving the arm above the gate reds the first half.
+TEST(Preprocessor, FC179EmbedInDeadBranchIsSilent) {
+    {
+        PreprocessResult r;
+        (void)ppEmbedTokens(
+            "int a;\n#if 0\n#embed \"missing_dead.bin\"\n#endif\nint b;\n", r, {});
+        EXPECT_FALSE(r.diagnostics->hasErrors())
+            << "a dead-branch #embed of a missing file must be silent";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+    }
+    {
+        PreprocessResult r;
+        (void)ppEmbedTokens(
+            "#if 1\nstatic const unsigned char x[] = {\n"
+            "#embed \"missing_live.bin\"\n};\n#endif\n",
+            r, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+            << "a LIVE #embed of a missing file must fail loud";
+    }
+}
+
+// T13 (C 6.10.8.1): a `#define` of a predefined `__STDC_EMBED_*` macro fails loud.
+TEST(Preprocessor, FC179EmbedStdcMacrosAreProtectedPredefines) {
+    for (std::string const& name : {"__STDC_EMBED_NOT_FOUND__",
+                                    "__STDC_EMBED_FOUND__",
+                                    "__STDC_EMBED_EMPTY__"}) {
+        PreprocessResult r;
+        (void)ppEmbedTokens("#define " + name + " 9\nint a;\n", r, {});
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorPredefinedMacro))
+            << "#define of a predefined embed macro must fail loud: " << name;
+    }
+}
+
+// T14 (agnosticism): the directive WORD is config-driven, never a hard-coded
+// "embed". Rebind `embedDirective` off "embed" -> "embad": now `#embed` is an
+// unknown directive (P0015) and `#embad "..."` drives the embed handler
+// (P_PreprocessorEmbed). RED-ON-DISABLE: a hard-coded "embed" ignores the rebind.
+TEST(Preprocessor, FC179EmbedDirectiveIsConfigDrivenNotHardcoded) {
+    auto schema = reboundCSubset("\"embed\"", "\"embad\"", "<rebound-embed>");
+    ASSERT_TRUE(schema != nullptr);
+    ASSERT_EQ(schema->preprocess().embedDirective, "embad");
+    namespace fs = std::filesystem;
+    std::vector<fs::path> noDirs;
+    {
+        auto buf = SourceBuffer::fromString(
+            "static const unsigned char x[] = {\n#embed \"missing.bin\"\n};\n",
+            "main.c");
+        auto r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorUnsupported))
+            << "with the word rebound, `#embed` is an unknown directive (P0015)";
+        EXPECT_FALSE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed));
+    }
+    {
+        auto buf = SourceBuffer::fromString(
+            "static const unsigned char x[] = {\n#embad \"missing.bin\"\n};\n",
+            "main.c");
+        auto r = preprocess(buf, schema, noDirs);
+        EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorEmbed))
+            << "the rebound `#embad` word now drives the embed handler";
+    }
+}
+
+// FIX-1 (D-PP-EMBED, the streaming boundary): the PURE size-budget helper is a
+// catchable LOUD wall, not an OOM. Called directly with a COUNT (no giant
+// fixture). RED-ON-DISABLE: removing the gate makes the helper always return
+// nullopt -> the over-budget assertion reds.
+TEST(Preprocessor, FC179EmbedResourceSizeBudgetIsLoudNotOom) {
+    EXPECT_FALSE(embedResourceSizeError(0).has_value());
+    EXPECT_FALSE(embedResourceSizeError(kEmbedMaxResourceBytes).has_value())
+        << "exactly at the budget is allowed";
+    auto over = embedResourceSizeError(kEmbedMaxResourceBytes + 1);
+    ASSERT_TRUE(over.has_value())
+        << "one byte over the budget must yield a loud diagnostic, never an OOM";
+    EXPECT_NE(over->find("D-PP-EMBED-STREAMING"), std::string::npos)
+        << "the message names the streaming-deferral boundary";
+}
+
+// T12 (the pre-scan-parity witness, §9 FIX-4): a `#if __has_embed("res.bin")`
+// gates a quote-`#include "defs.h"` whose header supplies a typedef `main` needs.
+// GREEN requires the SynthBuilder PRE-SCAN to evaluate `__has_embed` exactly like
+// the authoritative pass (live -> the header is spliced, so the `typedef` token
+// appears). RED-ON-DISABLE (demonstrated by stubbing the pre-scan `embedCb` to
+// {}): the guard turns UNCERTAIN -> the quote-include is conservatively SKIPPED
+// -> the `typedef` is ABSENT (and downstream the type is unresolved -- the loud
+// divergence direction, never silent).
+TEST(Preprocessor, FC179HasEmbedPreScanParityGatesQuoteInclude) {
+    auto dir = writeEmbedResource("dss_embed_t12", "res.bin", std::string("*"));
+    { std::ofstream(dir / "defs.h", std::ios::binary)
+          << "typedef int EmbedGatedType;\n"; }
+    auto buf = SourceBuffer::fromString(
+        "#if __has_embed(\"res.bin\")\n#include \"defs.h\"\n#endif\n"
+        "EmbedGatedType v;\n",
+        (dir / "main.c").string());
+    auto schema = cSubset();
+    std::vector<fsemb::path> dirs{dir};
+    auto r = preprocess(buf, schema, dirs);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+    // The header's `typedef` keyword appears ONLY if the pre-scan took the
+    // __has_embed branch and spliced defs.h (main.c has no `typedef` of its own).
+    bool sawTypedef = false;
+    for (Token const& t : r.tokens)
+        if (std::string{r.synthBuffer->slice(t.span)} == "typedef")
+            sawTypedef = true;
+    EXPECT_TRUE(sawTypedef)
+        << "the pre-scan must evaluate __has_embed like the authoritative pass "
+           "and splice the gated header (else the include is conservatively "
+           "skipped and the type is unresolved)";
+    std::error_code ec; fsemb::remove_all(dir, ec);
 }

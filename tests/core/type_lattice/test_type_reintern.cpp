@@ -327,6 +327,36 @@ TEST(TypeReintern, VolatileQualifierSurvivesReintern) {
         << "the POINTEE must stay volatile-qualified through re-intern";
 }
 
+// FC17.9(d) 1a (D-CSUBSET-QUAL-BITSET): the qualifier MASK must survive re-intern —
+// an `_Atomic` (or `_Atomic volatile`) qualifier must NOT degrade to plain volatile on
+// a cross-CU merge / text round-trip. RED-ON-DISABLE: the reintern arm rebuilds via
+// `qualified(inner, src.qualifierBits(srcId))`; reverting it to `volatileQualified`
+// sets only the Volatile bit, so `isAtomicQualified` below goes RED (Trap 2 — the
+// silent loss-of-atomicity twin of the volatile-drop caught above).
+TEST(TypeReintern, AtomicQualifierMaskSurvivesReintern) {
+    TypeInterner src{CompilationUnitId{1}};
+    const TypeId i32   = src.primitive(TypeKind::I32);
+    const TypeId ai32  = src.atomicQualified(i32);                          // _Atomic int
+    const TypeId avi32 = src.atomicQualified(src.volatileQualified(i32));   // _Atomic volatile int
+
+    TypeLattice host{CompilationUnitId{2}};
+    auto& hi = host.interner();
+    std::unordered_map<std::uint32_t, TypeId> remap;
+
+    // bare `_Atomic int` round-trips with the Atomic bit intact (NOT dropped/degraded).
+    const TypeId hai32 = reinternType(src, ai32, host, remap);
+    EXPECT_EQ(hi.get(hai32).kind, TypeKind::VolatileQual);   // the shared qualifier skin kind
+    EXPECT_TRUE(hi.isAtomicQualified(hai32));                // ← RED if the mask is dropped
+    EXPECT_FALSE(hi.isVolatileQualified(hai32));             // and NOT spuriously volatile
+    EXPECT_EQ(hi.kind(hai32), TypeKind::I32);                // transparent material kind
+
+    // `_Atomic volatile int` round-trips with BOTH bits (order-independent, one skin).
+    const TypeId havi32 = reinternType(src, avi32, host, remap);
+    EXPECT_TRUE(hi.isAtomicQualified(havi32));
+    EXPECT_TRUE(hi.isVolatileQualified(havi32));
+    EXPECT_EQ(hi.stripVolatile(havi32).v, hi.primitive(TypeKind::I32).v);
+}
+
 // D-CSUBSET-MEMBER-ALIGNAS: member-alignas overrides must SURVIVE re-intern — without
 // threading them, the reinterned composite loses its declared field alignment (falls
 // back to natural) and forks the TypeId that `.member` scope keys on. RED-ON-DISABLE:

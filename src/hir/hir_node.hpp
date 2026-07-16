@@ -62,6 +62,18 @@ enum class HirKind : std::uint16_t {
     //    get NO HirKind — they fail loud at CST→HIR (D-CSUBSET-SEH-FINALLY /
     //    D-CSUBSET-SEH-LEAVE, trigger-gated; sqlite ground truth: zero uses). ──
     SehTryExcept,
+    // ── FC17.9(i) (D-CSUBSET-INLINE-ASM): the GNU inline-asm STATEMENT
+    //    `__asm__ [volatile] ("") ;`. Cycle-1 is the empty-template optimizer
+    //    barrier ONLY — a 0-child LEAF (no payload) that HIR→MIR lowers to
+    //    MirOpcode::CompilerBarrier (the _ReadWriteBarrier op: zero target
+    //    instructions, a full-memory reordering fence). The empty-vs-non-empty
+    //    gate is semantic (S_InlineAsmNonEmptyTemplate rejects a non-empty
+    //    template BEFORE codegen), so this node is emitted only for the
+    //    provably-inert empty form. A C-language statement in the core enum,
+    //    matching the SehTryExcept/goto precedent. The non-empty per-target
+    //    text arc (D-CSUBSET-INLINE-ASM-TEXT) will later carry the template
+    //    bytes on a literal-pool payload + a volatile side-table bit. ──
+    InlineAsm,
     // ── Expressions ──
     Literal, Ref, Call, IntrinsicCall,
     // c103 (D-CSUBSET-INTRINSIC-UMULH): a call to a builtin that lowers to a
@@ -172,6 +184,8 @@ inline constexpr std::uint32_t kFirstHirExtensionKind = 256;
         case HirKind::ContinueStmt: case HirKind::ReturnStmt: case HirKind::ExprStmt:
         case HirKind::GotoStmt: case HirKind::LabelStmt: case HirKind::IndirectGotoStmt:
         case HirKind::SehTryExcept:
+        // D-CSUBSET-INLINE-ASM: a statement (the empty-template barrier), no type.
+        case HirKind::InlineAsm:
         case HirKind::AssignStmt: case HirKind::Unreachable:
         case HirKind::Error: case HirKind::Extension: case HirKind::Count_:
             return false;
@@ -295,6 +309,10 @@ struct ChildArity {
         case HirKind::ReturnStmt: case HirKind::VarDecl:
             return {0, 1};                                             // [value/init?]
         case HirKind::BreakStmt: case HirKind::ContinueStmt: case HirKind::Unreachable:
+        // D-CSUBSET-INLINE-ASM: the empty-template asm barrier is a pure leaf —
+        // no children, no payload (cycle-1). A future non-empty form carries the
+        // template on a payload, still 0 children.
+        case HirKind::InlineAsm:
             return {0, 0};
         // ── Unstructured CF (FC5) ──
         case HirKind::GotoStmt:           return {0, 0};   // leaf; target label ordinal in payload

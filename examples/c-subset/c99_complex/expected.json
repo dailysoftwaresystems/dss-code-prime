@@ -1,0 +1,34 @@
+{
+  "$comment": "FC17.9(f) (D-CSUBSET-COMPLEX): runtime witness for C99 `_Complex` across the legs, RUN on BOTH the baseline (debug) AND the `release` (shippedPipeline) arm. EIGHT arms — seven double-complex arms worth 5 + the float-complex arm worth 7 → exit 35+7 = 42 iff all pass: + · - · * (cross-term) · / (the division witness) · mixed real+complex · a complex-RETURNING user function (IMPORTANT-6, the widened Call arm) · conj · `float _Complex` multiply (audit F1 — the F32-ELEMENT materializer at runtime: offsets {0,4}, F32 cross-term ops, plus BOTH element-convert directions: FPTrunc×2 narrowing the F64-complex builtin results into the F32 globals, FPExt×2 widening the creal/cimag args back to the F64-monomorph accessors). `_Complex` is memory-resident by-address (the wide-BitInt precedent); componentwise arithmetic is element-float ops which pass the LIR encoded-width gate. `I`/creal/cimag/conj come from <complex.h> (cycle-1 F64-monomorph); __builtin_complex constructs a complex by address. ANTI-FOLD: g_a/g_b/gf_a/gf_b are mutable globals so the `release` arm proves real runtime arithmetic, not a fold. F32/F64 components have NO per-format axis, so the pe64/elf-x86_64/arm64 codegen must agree. exit = 7×5 + 7 = 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

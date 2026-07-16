@@ -68,7 +68,10 @@
       { "name": "__stdcall",           "kind": "constant", "value": "", "availableObjectFormats": ["pe"] },
       { "name": "__cdecl",             "kind": "constant", "value": "", "availableObjectFormats": ["pe"] },
       { "name": "__fastcall",          "kind": "constant", "value": "", "availableObjectFormats": ["pe"] },
-      { "name": "WINAPI",              "kind": "constant", "value": "", "availableObjectFormats": ["pe"] }
+      { "name": "WINAPI",              "kind": "constant", "value": "", "availableObjectFormats": ["pe"] },
+      { "name": "__STDC_EMBED_NOT_FOUND__", "kind": "constant", "value": "0" },
+      { "name": "__STDC_EMBED_FOUND__",     "kind": "constant", "value": "1" },
+      { "name": "__STDC_EMBED_EMPTY__",     "kind": "constant", "value": "2" }
     ],
     "$fc15cComment": "FC15c. `#pragma` (C 6.10.6): consumed-and-DROPPED (C 6.10.6p2 licenses ignoring an unrecognized pragma; DSS recognizes none). `__has_include` (C23 6.10.1p4): tests header existence with the SAME resolution `#include` uses -- the angle delimiters are matched by TOKEN KIND (`hasIncludeAngleOpenToken`=LtOp / `hasIncludeAngleCloseToken`=GtOp), never the `<`/`>` bytes (agnosticism); the angle form maps `<stem>.json` on the system path (DSS ships JSON descriptors, e.g. `stdio.json`) so `__has_include(<stdio.h>)` agrees with `#include <stdio.h>`. `__has_c_attribute` (C23 6.10.1p4): reports the version int of a known standard attribute or 0; the lookup ignores leading/trailing `__` (so `__deprecated__` matches `deprecated`). The C23 standard attributes are 202311.",
     "pragmaDirective":          "pragma",
@@ -76,6 +79,9 @@
     "hasIncludeAngleOpenToken":  "LtOp",
     "hasIncludeAngleCloseToken": "GtOp",
     "hasCAttributeOperator":    "__has_c_attribute",
+    "$fc179EmbedComment": "FC17.9(h) C23 `#embed` (6.10.4) + `__has_embed` (6.10.1). `#embed \"r\"` resolves the QUOTED binary resource with the SAME search a quote-`#include` uses (self-dir first, then include dirs) and expands to the resource bytes as a comma-separated list of decimal `int` constants (0..255), spliced through the SAME product-token mechanism as `#`/`##` -- so the tokens are ordinary integer literals + commas the parser accepts in a brace initializer. `__has_embed` reports the C23 trichotomy NOT_FOUND(0)/FOUND(1)/EMPTY(2) (== the `__STDC_EMBED_*` macros above). CYCLE-1 SUBSET: the standard parameters (limit/prefix/suffix/if_empty + vendor) and the ANGLE form `<r>` and a macro-expanded argument are DEFERRED loud (D-PP-EMBED-{PARAMS,ANGLE,MACRO-ARG}); a resource above a ~16 MiB splice budget fails loud, never OOMs (the streaming boundary). `__has_embed` with any parameter clause answers NOT_FOUND(0) per C23 (the standard's own unsupported-signal, not an error). The angle delimiters are the SAME token KINDS as `__has_include` (hasIncludeAngleOpenToken/CloseToken), matched by KIND never the `<`/`>` bytes; the operator words are matched by TEXT, never a hard-coded spelling.",
+    "embedDirective":           "embed",
+    "hasEmbedOperator":         "__has_embed",
     "knownCAttributes": [
       { "name": "deprecated",   "version": 202311 },
       { "name": "nodiscard",    "version": 202311 },
@@ -311,7 +317,7 @@
                           "ull", "ULL", "llu", "LLU",
                           "wb", "WB",
                           "uwb", "uWB", "Uwb", "UWB", "wbu", "wbU", "WBu", "WBU"],
-    "floatSuffixes":    ["f", "F"],
+    "floatSuffixes":    ["f", "F", "l", "L"],
     "emitKind":         { "integer": "IntLiteral", "float": "FloatLiteral" }
   },
 
@@ -339,6 +345,7 @@
     { "word": "_Thread_local", "kind": "ThreadLocalKeyword"    },
     { "word": "thread_local",  "kind": "ThreadLocalC23Keyword" },
     { "word": "volatile", "kind": "VolatileKeyword" },
+    { "word": "_Atomic",  "kind": "AtomicKeyword"   },
     { "word": "restrict", "kind": "RestrictKeyword" },
     { "word": "register", "kind": "RegisterKeyword" },
     { "word": "auto",     "kind": "AutoKeyword"     },
@@ -371,6 +378,9 @@
 
     { "word": "_BitInt",        "kind": "BitIntKeyword"        },
 
+    { "word": "_Complex",       "kind": "ComplexKeyword"       },
+    { "word": "_Imaginary",     "kind": "ImaginaryKeyword"     },
+
     { "word": "_Static_assert", "kind": "StaticAssertKeyword"       },
     { "word": "static_assert",  "kind": "StaticAssertLegacyKeyword" },
 
@@ -388,7 +398,9 @@
     { "word": "__try",     "kind": "TryKeyword"     },
     { "word": "__except",  "kind": "ExceptKeyword"  },
     { "word": "__finally", "kind": "FinallyKeyword" },
-    { "word": "__leave",   "kind": "LeaveKeyword"   }
+    { "word": "__leave",   "kind": "LeaveKeyword"   },
+
+    { "word": "__asm__",   "kind": "AsmKeyword"     }
   ],
 
   "shapes": {
@@ -610,8 +622,8 @@
       "sequence": [ "compositeAttr", { "repeat": "compositeAttr" } ]
     },
 
-    "headQualifier": { "alt": [ "ConstKeyword", "VolatileKeyword" ] },
-    "ptrQualifier":  { "alt": [ "ConstKeyword", "VolatileKeyword", "RestrictKeyword" ] },
+    "headQualifier": { "alt": [ "ConstKeyword", "VolatileKeyword", "AtomicKeyword" ] },
+    "ptrQualifier":  { "alt": [ "ConstKeyword", "VolatileKeyword", "RestrictKeyword", "AtomicKeyword" ] },
 
     "pointerLayer": {
       "sequence": [ "StarOp", { "repeat": "ptrQualifier" } ]
@@ -809,8 +821,8 @@
     "typeSpecifierSeq": {
       "$comment": "FC3 c1: C 6.7.2 type-specifier run — one-or-more specifier KEYWORDS in any order (`unsigned long long int` == `long long unsigned int` == `long unsigned long`). The inner alt is INLINE (no named wrapper rule) so the matched keyword TOKENS land as typeSpecifierSeq's DIRECT children — the semantic engine's multiset arm requires all-token children. Which multisets are VALID (and what core each resolves to, per data model) is the semantics.typeSpecifiers table; invalid combos (`unsigned float`, `short long`) parse fine here and reject SEMANTICALLY by absence from the table (S_InvalidTypeSpecifierCombination). The seq SUBSUMES the former single-token Void/Int/Long/Char alts (a one-keyword run). Keyword-led, so castExpr's commitRequiresTypeName triage rule 1 (not-a-lone-identifier) always commits a seq-led cast type. D-CSUBSET-BITINT: the `bitIntSpecifier` rule (`_BitInt(N)`) joins the element alt so `unsigned _BitInt(40)` parses as ONE run [unsigned-token, bitIntSpecifier-node] — keyword-led + FIRST-disjoint, so it only adds `_BitInt` to the element FIRST set (no speculation). A run CONTAINING a bitIntSpecifier is NOT all-tokens → the multiset arm skips it and the semantic engine's bitInt arm (semantics.bitInt) resolves it, scanning the sibling signedness tokens.",
       "sequence": [
-        { "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "ShortKeyword", "UnsignedKeyword", "SignedKeyword", "BoolKeyword", "LegacyBoolKeyword", "FloatKeyword", "DoubleKeyword", "bitIntSpecifier" ] },
-        { "repeat": { "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "ShortKeyword", "UnsignedKeyword", "SignedKeyword", "BoolKeyword", "LegacyBoolKeyword", "FloatKeyword", "DoubleKeyword", "bitIntSpecifier" ] } }
+        { "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "ShortKeyword", "UnsignedKeyword", "SignedKeyword", "BoolKeyword", "LegacyBoolKeyword", "FloatKeyword", "DoubleKeyword", "ComplexKeyword", "ImaginaryKeyword", "bitIntSpecifier" ] },
+        { "repeat": { "alt": [ "VoidKeyword", "IntKeyword", "LongKeyword", "CharKeyword", "ShortKeyword", "UnsignedKeyword", "SignedKeyword", "BoolKeyword", "LegacyBoolKeyword", "FloatKeyword", "DoubleKeyword", "ComplexKeyword", "ImaginaryKeyword", "bitIntSpecifier" ] } }
       ]
     },
 
@@ -968,6 +980,7 @@
         "caseStmt",
         "sehTryStmt",
         "sehLeaveStmt",
+        "asmStmt",
         "emptyStmt",
         "declOrExprStmt"
       ]
@@ -1287,6 +1300,15 @@
       ]
     },
 
+    "asmStmt": {
+      "$comment": "FC17.9(i) D-CSUBSET-INLINE-ASM: the GNU inline-asm STATEMENT, cycle-1 = the empty-template optimizer barrier. `__asm__ [volatile] ( <string-literal-template> ) ;` — a structural CLONE of staticAssertDecl (keyword-led, consumes `(` a payload `)` `;`). FIRST = AsmKeyword, DISJOINT from every other statement alt → unique-production DIRECT DESCENT, NON-speculative (the sehTryStmt/TryKeyword precedent). The template is captured as stringLiteralExpr (adjacent-concat + prefixes); the semantic tier (semantics.inlineAsmRule) decodes it and REQUIRES a strictly-empty decoded string, else S_InlineAsmNonEmptyTemplate (D-CSUBSET-INLINE-ASM-TEXT) — a non-empty template carries real per-target instructions we cannot yet emit, so silently lowering it to a no-op barrier would be a miscompile. The optional `volatile` (already VolatileKeyword) is accepted but SEMANTICALLY INERT in cycle-1 (a no-output asm is implicitly volatile — GCC 6.47.2.1 — so the empty form is always a barrier). Operand/clobber lists (`: out : in : clobbers`) are NOT admitted here (the rule ends at `)`) → they fail loud at parse (P_UnexpectedToken on the `:`), the named deferral D-CSUBSET-INLINE-ASM-OPERANDS; `asm goto` (D-CSUBSET-INLINE-ASM-GOTO) and the bare `asm`/`__volatile__` spellings (D-CSUBSET-INLINE-ASM-SPELLING) are likewise deferred (the grammar admits only `__asm__`). The hirLowering row (asmStmt → InlineAsm) lowers it to MirOpcode::CompilerBarrier (the _ReadWriteBarrier op — zero target instructions, full-memory fence).",
+      "sequence": [
+        "AsmKeyword",
+        { "optional": "VolatileKeyword" },
+        "ParenOpen", "stringLiteralExpr", "ParenClose", "EndStatement"
+      ]
+    },
+
     "castTypeBase": {
       "alt": [ "typeSpecifierSeq", "Identifier", "structTypeRef", "unionTypeRef", "enumTypeRef", "typeofSpecifier" ]
     },
@@ -1369,6 +1391,8 @@
     "pointerToken":    "StarOp",
     "$volatileMarkerComment": "c21 (D-CSUBSET-VOLATILE-QUALIFIER): the language's volatile qualifier token. Read by the type-position resolver's CO-LOCATED pointer arm (castTypeRef cast/sizeof type-names) to reject a pointer-to-volatile-POINTEE (`volatile int *`) position-aware (volatile-before-star = pointee = REJECT; after-the-star = pointer-object = ACCEPT). DECLARATION forms — objects, params, AND struct/union members (c23 removed the head star from typeRefAllowingStruct, so a member's `*` now binds per-declarator like every other declaration position) — reject via the per-declaration-rule volatileMarker (head-volatile + a declarator star); the two arms together make the fail-loud complete.",
     "volatileMarker":  "VolatileKeyword",
+    "$atomicMarkerComment": "FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the language's `_Atomic`-class qualifier token — the LIVE SemanticConfig-level driver of the type-qualifier wrap, EXACTLY parallel to `volatileMarker` above. The type-position resolver (resolveTypeNodeImpl's CO-LOCATED base arm + declaratorDeclaredType's east/pointer-layer arm) reads THIS token: an `atomicMarker` BEFORE the first `pointerToken` wraps the base pointee (`_Atomic int *` => Ptr<atomicQualified(int)>); an `atomicMarker` INSIDE a pointer layer (east) wraps that pointer object (`int * _Atomic` => atomicQualified(Ptr<int>)). It COMPOSES with `volatileMarker` in the ONE shared {volatile,atomic} bitset skin (cycle 1a `qualified` merges bits, order-independent). NOTE: unlike volatile, `_Atomic` is a NEW qualifier with NO legacy per-DeclarationRule marker — object-atomicity is derived UNIFORMLY from the resolved TYPE (isAtomicQualified) at access lowering, exactly as c27 made volatile do (the per-DeclarationRule `volatileMarker` scan was RETIRED at c27; a parallel per-declaration atomicMarker would be write-only dead config, so it is deliberately NOT added). Source-agnostic: the engine reads THIS token, never a hardcoded keyword.",
+    "atomicMarker":    "AtomicKeyword",
     "$externLibraryByFormatComment": "FF6 Slice 2 + audit fold (2026-06-02): per-format runtime library identity for source-declared externs. compileSingleUnit step 2.5 populates HirAttribute<FfiMetadata> per ExternFunction/ExternGlobal by calling synthesizeFfiFromSourceDecls() with the entry whose key matches objectFormatKindName(format.kind()). Per-LANGUAGE field (not per-declaration-rule) — the post-fold #1 placement on DeclarationRule was fragile; the pipeline first-match-loop would silently pick the wrong rule on grammars with multiple extern-shaped decl rules. Library identities: PE → msvcrt.dll (Win32 C runtime for x86_64 hello-world); ELF → libc.so.6 (glibc on Linux); Mach-O → /usr/lib/libSystem.B.dylib (libSystem dispatcher publishes the libc surface). Per-symbol overrides (`extern \"otherlib.dll\" int foo();`) anchored D-CSUBSET-EXTERN-LIBRARY-SYNTAX.",
     "externLibraryByFormat": {
       "pe":    "msvcrt.dll",
@@ -1646,6 +1670,8 @@
     },
     "$staticAssertComment": "C11/C23 6.7.10: the `_Static_assert`/`static_assert` DECLARATION rule. Pass 2 const-evaluates the condition child (visible-child 1 — the assignmentExpr after the keyword+'(') through the SAME evaluator that folds sizeof(T)/enum/arithmetic in an array dimension; ZERO ⇒ S_StaticAssertFailed (message = the OPTIONAL trailing string-literal child), NONZERO ⇒ nothing. The construct lowers to nothing (hirLowering staticAssertDecl → Skip).",
     "staticAssertRule": "staticAssertDecl",
+    "$inlineAsmComment": "FC17.9(i) (D-CSUBSET-INLINE-ASM, C23 6.8 / GNU 6.47): the `__asm__` inline-asm STATEMENT rule (asmStmt). Pass 2 (pass2Post) decodes the template child (the stringLiteralExpr, via the SAME decodeAdjacentStringBodies chokepoint staticAssert's message uses) and REQUIRES a strictly-empty decoded string; a non-empty / whitespace-only / malformed-escape template fails loud S_InlineAsmNonEmptyTemplate (real per-target asm text is the D-CSUBSET-INLINE-ASM-TEXT deferral). The empty form lowers to nothing but a MirOpcode::CompilerBarrier fence (hirLowering asmStmt → InlineAsm → CompilerBarrier). Invalid ⇒ the language has no inline-asm surface (toy/tsql — the check never runs).",
+    "inlineAsmRule": "asmStmt",
     "$genericComment": "FC16 (D-CSUBSET-GENERIC-SELECTION): C11/C23 6.5.1.1 generic selection. `rule` = the genericExpr shape; `controlChild` = the visible-child index of the controlling `assignmentExpr` (child 2 — after the GenericKeyword + '('). `assocRule`/`typedAssocRule`/`defaultAssocRule` name the association shapes so Pass 2 discriminates each `_Generic` child: a genericTypedAssoc's FIRST child is a castTypeRef (resolved+stamped through the SAME type resolver casts/sizeof/va_arg use — a VALUE in type position fails loud S_UnknownType) and its LAST is the result expression; a genericDefaultAssoc is the `default:` fallback (no type). Pass 2 lvalue-converts the controlling type (strips top-level volatile, the isAssignable precedent), matches it against each typed assoc's resolved type for COMPATIBILITY (interned TypeId equality via sameType), enforces EXACTLY ONE typed match (S_GenericSelectionAmbiguous on >1) OR the default (S_GenericSelectionNoMatch on none-and-no-default), stamps the genericExpr node with the winner's RESULT type, and records the winning association's result-expression node (nodeToSelectedExpr side-table). The dedicated HIR lowering (hirLowering.genericRule) lowers ONLY that recorded sub-expression.",
     "generic": {
       "rule": "genericExpr",
@@ -1667,11 +1693,83 @@
     "builtinFunctions": [
       { "name": "__umulh", "params": ["U64", "U64"], "result": "U64", "lowering": "umulh" },
       { "name": "_InterlockedCompareExchange", "signature": "fn(ptr<i32>, i32, i32) -> i32", "lowering": "atomic_cas" },
+      { "name": "atomic_load_explicit",  "signature": "fn(ptr<i32>, i32) -> i32",      "lowering": "atomic_load" },
+      { "name": "atomic_store_explicit", "signature": "fn(ptr<i32>, i32, i32) -> void", "lowering": "atomic_store" },
       { "name": "_ReadWriteBarrier", "signature": "fn() -> void", "lowering": "barrier" },
       { "name": "_exception_code", "signature": "fn() -> u32", "lowering": "seh_exception_code" },
-      { "name": "_exception_info", "signature": "fn() -> ptr<void>", "lowering": "seh_exception_info" }
+      { "name": "_exception_info", "signature": "fn() -> ptr<void>", "lowering": "seh_exception_info" },
+      { "$comment": "C99 _Complex (D-CSUBSET-COMPLEX §7.3): the always-injected complex builtins the <complex.h> macros route to. The `signature` form spells the `complex<f64>` result/param the scalar params/result axis cannot express (the _InterlockedCompareExchange ptr<> precedent; parseType decodes `complex<..>` via the M1 codec). `__builtin_complex(re, im)` constructs a complex from two reals (by-address materialized — the FIRST aggregate-returning builtin, CRITICAL-2). creal/cimag extract the real/imag F64 component; conj negates imag. Cycle-1 F64-monomorph (D-CSUBSET-COMPLEX-MONOMORPH-F64).", "name": "__builtin_complex", "signature": "fn(f64, f64) -> complex<f64>", "lowering": "complex_make" },
+      { "name": "__builtin_creal", "signature": "fn(complex<f64>) -> f64", "lowering": "complex_real" },
+      { "name": "__builtin_cimag", "signature": "fn(complex<f64>) -> f64", "lowering": "complex_imag" },
+      { "name": "__builtin_conj",  "signature": "fn(complex<f64>) -> complex<f64>", "lowering": "complex_conj" },
+      { "name": "__builtin_popcount",   "params": ["U32"], "result": "I32", "lowering": "popcount" },
+      { "name": "__builtin_popcountll", "params": ["U64"], "result": "I32", "lowering": "popcount" },
+      { "name": "__builtin_clz",   "params": ["U32"], "result": "I32", "lowering": "clz" },
+      { "name": "__builtin_clzll", "params": ["U64"], "result": "I32", "lowering": "clz" },
+      { "name": "__builtin_ctz",   "params": ["U32"], "result": "I32", "lowering": "ctz" },
+      { "name": "__builtin_ctzll", "params": ["U64"], "result": "I32", "lowering": "ctz" },
+
+      { "name": "__builtin_stdc_leading_zeros_uc",  "params": ["U8"],  "result": "U32", "lowering": "stdc_leading_zeros" },
+      { "name": "__builtin_stdc_leading_zeros_us",  "params": ["U16"], "result": "U32", "lowering": "stdc_leading_zeros" },
+      { "name": "__builtin_stdc_leading_zeros_ui",  "params": ["U32"], "result": "U32", "lowering": "stdc_leading_zeros" },
+      { "name": "__builtin_stdc_leading_zeros_ull", "params": ["U64"], "result": "U32", "lowering": "stdc_leading_zeros" },
+      { "name": "__builtin_stdc_leading_ones_uc",   "params": ["U8"],  "result": "U32", "lowering": "stdc_leading_ones" },
+      { "name": "__builtin_stdc_leading_ones_us",   "params": ["U16"], "result": "U32", "lowering": "stdc_leading_ones" },
+      { "name": "__builtin_stdc_leading_ones_ui",   "params": ["U32"], "result": "U32", "lowering": "stdc_leading_ones" },
+      { "name": "__builtin_stdc_leading_ones_ull",  "params": ["U64"], "result": "U32", "lowering": "stdc_leading_ones" },
+      { "name": "__builtin_stdc_trailing_zeros_uc",  "params": ["U8"],  "result": "U32", "lowering": "stdc_trailing_zeros" },
+      { "name": "__builtin_stdc_trailing_zeros_us",  "params": ["U16"], "result": "U32", "lowering": "stdc_trailing_zeros" },
+      { "name": "__builtin_stdc_trailing_zeros_ui",  "params": ["U32"], "result": "U32", "lowering": "stdc_trailing_zeros" },
+      { "name": "__builtin_stdc_trailing_zeros_ull", "params": ["U64"], "result": "U32", "lowering": "stdc_trailing_zeros" },
+      { "name": "__builtin_stdc_trailing_ones_uc",   "params": ["U8"],  "result": "U32", "lowering": "stdc_trailing_ones" },
+      { "name": "__builtin_stdc_trailing_ones_us",   "params": ["U16"], "result": "U32", "lowering": "stdc_trailing_ones" },
+      { "name": "__builtin_stdc_trailing_ones_ui",   "params": ["U32"], "result": "U32", "lowering": "stdc_trailing_ones" },
+      { "name": "__builtin_stdc_trailing_ones_ull",  "params": ["U64"], "result": "U32", "lowering": "stdc_trailing_ones" },
+      { "name": "__builtin_stdc_first_leading_zero_uc",  "params": ["U8"],  "result": "U32", "lowering": "stdc_first_leading_zero" },
+      { "name": "__builtin_stdc_first_leading_zero_us",  "params": ["U16"], "result": "U32", "lowering": "stdc_first_leading_zero" },
+      { "name": "__builtin_stdc_first_leading_zero_ui",  "params": ["U32"], "result": "U32", "lowering": "stdc_first_leading_zero" },
+      { "name": "__builtin_stdc_first_leading_zero_ull", "params": ["U64"], "result": "U32", "lowering": "stdc_first_leading_zero" },
+      { "name": "__builtin_stdc_first_leading_one_uc",   "params": ["U8"],  "result": "U32", "lowering": "stdc_first_leading_one" },
+      { "name": "__builtin_stdc_first_leading_one_us",   "params": ["U16"], "result": "U32", "lowering": "stdc_first_leading_one" },
+      { "name": "__builtin_stdc_first_leading_one_ui",   "params": ["U32"], "result": "U32", "lowering": "stdc_first_leading_one" },
+      { "name": "__builtin_stdc_first_leading_one_ull",  "params": ["U64"], "result": "U32", "lowering": "stdc_first_leading_one" },
+      { "name": "__builtin_stdc_first_trailing_zero_uc",  "params": ["U8"],  "result": "U32", "lowering": "stdc_first_trailing_zero" },
+      { "name": "__builtin_stdc_first_trailing_zero_us",  "params": ["U16"], "result": "U32", "lowering": "stdc_first_trailing_zero" },
+      { "name": "__builtin_stdc_first_trailing_zero_ui",  "params": ["U32"], "result": "U32", "lowering": "stdc_first_trailing_zero" },
+      { "name": "__builtin_stdc_first_trailing_zero_ull", "params": ["U64"], "result": "U32", "lowering": "stdc_first_trailing_zero" },
+      { "name": "__builtin_stdc_first_trailing_one_uc",   "params": ["U8"],  "result": "U32", "lowering": "stdc_first_trailing_one" },
+      { "name": "__builtin_stdc_first_trailing_one_us",   "params": ["U16"], "result": "U32", "lowering": "stdc_first_trailing_one" },
+      { "name": "__builtin_stdc_first_trailing_one_ui",   "params": ["U32"], "result": "U32", "lowering": "stdc_first_trailing_one" },
+      { "name": "__builtin_stdc_first_trailing_one_ull",  "params": ["U64"], "result": "U32", "lowering": "stdc_first_trailing_one" },
+      { "name": "__builtin_stdc_count_zeros_uc",  "params": ["U8"],  "result": "U32", "lowering": "stdc_count_zeros" },
+      { "name": "__builtin_stdc_count_zeros_us",  "params": ["U16"], "result": "U32", "lowering": "stdc_count_zeros" },
+      { "name": "__builtin_stdc_count_zeros_ui",  "params": ["U32"], "result": "U32", "lowering": "stdc_count_zeros" },
+      { "name": "__builtin_stdc_count_zeros_ull", "params": ["U64"], "result": "U32", "lowering": "stdc_count_zeros" },
+      { "name": "__builtin_stdc_count_ones_uc",   "params": ["U8"],  "result": "U32", "lowering": "stdc_count_ones" },
+      { "name": "__builtin_stdc_count_ones_us",   "params": ["U16"], "result": "U32", "lowering": "stdc_count_ones" },
+      { "name": "__builtin_stdc_count_ones_ui",   "params": ["U32"], "result": "U32", "lowering": "stdc_count_ones" },
+      { "name": "__builtin_stdc_count_ones_ull",  "params": ["U64"], "result": "U32", "lowering": "stdc_count_ones" },
+      { "name": "__builtin_stdc_has_single_bit_uc",  "params": ["U8"],  "result": "Bool", "lowering": "stdc_has_single_bit" },
+      { "name": "__builtin_stdc_has_single_bit_us",  "params": ["U16"], "result": "Bool", "lowering": "stdc_has_single_bit" },
+      { "name": "__builtin_stdc_has_single_bit_ui",  "params": ["U32"], "result": "Bool", "lowering": "stdc_has_single_bit" },
+      { "name": "__builtin_stdc_has_single_bit_ull", "params": ["U64"], "result": "Bool", "lowering": "stdc_has_single_bit" },
+      { "name": "__builtin_stdc_bit_width_uc",  "params": ["U8"],  "result": "U32", "lowering": "stdc_bit_width" },
+      { "name": "__builtin_stdc_bit_width_us",  "params": ["U16"], "result": "U32", "lowering": "stdc_bit_width" },
+      { "name": "__builtin_stdc_bit_width_ui",  "params": ["U32"], "result": "U32", "lowering": "stdc_bit_width" },
+      { "name": "__builtin_stdc_bit_width_ull", "params": ["U64"], "result": "U32", "lowering": "stdc_bit_width" },
+      { "name": "__builtin_stdc_bit_floor_uc",  "params": ["U8"],  "result": "U8",  "lowering": "stdc_bit_floor" },
+      { "name": "__builtin_stdc_bit_floor_us",  "params": ["U16"], "result": "U16", "lowering": "stdc_bit_floor" },
+      { "name": "__builtin_stdc_bit_floor_ui",  "params": ["U32"], "result": "U32", "lowering": "stdc_bit_floor" },
+      { "name": "__builtin_stdc_bit_floor_ull", "params": ["U64"], "result": "U64", "lowering": "stdc_bit_floor" },
+      { "name": "__builtin_stdc_bit_ceil_uc",   "params": ["U8"],  "result": "U8",  "lowering": "stdc_bit_ceil" },
+      { "name": "__builtin_stdc_bit_ceil_us",   "params": ["U16"], "result": "U16", "lowering": "stdc_bit_ceil" },
+      { "name": "__builtin_stdc_bit_ceil_ui",   "params": ["U32"], "result": "U32", "lowering": "stdc_bit_ceil" },
+      { "name": "__builtin_stdc_bit_ceil_ull",  "params": ["U64"], "result": "U64", "lowering": "stdc_bit_ceil" }
     ],
+    "$builtinStdbitComment": "FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 56 `__builtin_stdc_<op>_<T>` builtins = the 14 N3096 §7.18 bit operations × 4 concrete widths {uc→U8, us→U16, ui→U32, ull→U64}. Each op's 4 width rows SHARE one `lowering` tag (stdc_leading_zeros … stdc_bit_ceil) → 14 BuiltinLowering enumerators → 14 hir_to_mir arms that COMPOSE the 3 hardware primitives (Popcount/Clz/Ctz) + universal ALU verbs (ZExt/Sub/Add/And/Or/Not/Shl/ICmp/Mul) into the exact width-correct, single-eval, branchless formula (NO new MIR op — pure composition over the proven bit-count substrate). The arm reads the operand's EXACT width W∈{8,16,32,64} from its param core (guaranteed by the pre-BuiltinCall arg coercion) → zero-extends to the promotion width P∈{32,64}. RESULT cores per C23: U32 for the 11 count/index/width ops; Bool for has_single_bit; the OPERAND core (U8/U16/U32/U64) for bit_floor/bit_ceil (they return the argument's type). These are the include-gated substrate for shippedLibs/stdbit.json's `stdc_*` macros (56 concrete + 14 per-format `ul` + 14 4-way `_Generic`); always-injected like `__umulh` (reserved `__builtin_` namespace, shadow-able). ★ MANDATORY shift-UB guard (bit_floor/bit_ceil): every `Shl(1, amt)` has amt∈[0,W-1] on EVERY branchless branch (bit_floor amt=bitWidth−(x≠0); bit_ceil amt=bitWidth(x−1)&(W−1) + the ==W overflow→0 select) — never an unguarded shift.",
+    "$builtinBitCountComment": "FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 hardware bit-count primitives as 6 GCC-compatible builtins (the walking skeleton for C23 <stdbit.h>; the 14 stdc_* ops layer on top). Each returns `int` (I32, the GCC signature) and takes an unsigned 32-bit (`__builtin_popcount`/`_clz`/`_ctz`) or 64-bit (`…ll`) value. `lowering` binds each call to a dedicated pure-unary MIR op (Popcount/Clz/Ctz) — like `__umulh`, a compiler intrinsic, not a linkable symbol; lowered to a native instruction (x86 POPCNT/LZCNT/TZCNT, arm64 CLZ + RBIT-then-CLZ for ctz) where the target declares the mnemonic, else a branchless SWAR bit-trick sequence (arm64 has no scalar GPR popcount). ★ DSS DEFINES clz/ctz at 0 = the width (LZCNT/CLZ/TZCNT hardware semantics — count = 32 or 64 for a zero input), NOT GCC's UB-at-0: a SAFE SUPERSET (every input GCC defines returns the same value; the 0 input GCC leaves UB is given the natural hardware answer).",
     "$builtinAtomicCasComment": "c104 (D-CSUBSET-INTRINSIC-ATOMIC-CAS): `_InterlockedCompareExchange(LONG volatile* dest, LONG exch, LONG comp) -> LONG` -- the MSVC atomic compare-and-swap intrinsic (returns the ORIGINAL *dest; stores exch iff original==comp). Win32 LONG = i32 (LLP64) -> the 32-bit CAS. The UNDERSCORE name is the real intrinsic exactly as the Windows SDK spells it; windows.json's `InterlockedCompareExchange` macro expands to it (the winnt.h convention), so sqlite's `#if defined(InterlockedCompareExchange)` takes the direct-intrinsic path and its calls land here. `signature` (full type-text, c104) instead of scalar params: the dest param is a POINTER. Lowers to x86 `lock cmpxchg` (implicit-RAX comparand/old) / an arm64 LDAXR-STLXR acquire-release loop.",
+    "$builtinAtomicExplicitComment": "FC17.9(d) atomic cycle-1 (D-CSUBSET-ATOMIC): `atomic_load_explicit(volatile A* obj, memory_order) -> C` and `atomic_store_explicit(volatile A* obj, C desired, memory_order) -> void` — the C11/C23 <stdatomic.h> §7.17.4/§7.17.7 explicit-order scalar accessors. Like `_InterlockedCompareExchange` these are always-injected compiler intrinsics (a non-linkable op, SE6-shadow-able) rather than shipped symbols; they route to the SAME MIR AtomicLoad/AtomicStore ops a bare `_Atomic` access uses, so the Phase C per-order LIR fence matrix realizes them. Monomorphized to `int` (i32) this cycle (defer atomic_long/llong/ptr → D-CSUBSET-ATOMIC-MONOMORPH-I32). The trailing `memory_order` arg (load arg[1] / store arg[2]) is CONST-FOLDED at hir_to_mir into the AtomicLoad/AtomicStore `payload` (0..5) and DROPPED from the operand list (AtomicLoad=[ptr], AtomicStore=[value,ptr]); a NON-constant order falls back to seq_cst (5) — over-fencing is C11-legal. The user-facing surface (atomic_int, memory_order_*) is include-gated in shippedLibs/stdatomic.json.",
     "$builtinTypesComment": "FC3 c1: the TEXT-keyed type-name table (typedef-style positions + the load-time fallback for single-word ladder/promotion names). The KEYWORD grammar path resolves through semantics.typeSpecifiers below (the C 6.7.2 multiset table) — both tables declare the SAME widths, and `long` carries the LLP64 override on BOTH so the two paths can never disagree (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH).",
     "builtinTypes": [
       { "name": "int",    "core": "I32"  },
@@ -1682,7 +1780,7 @@
       { "name": "float",  "core": "F32"  },
       { "name": "double", "core": "F64"  }
     ],
-    "$typeSpecifiersComment": "FC3 c1: every VALID C type-specifier multiset (C 6.7.2 6) over the shipped keyword surface; combinations are ORDER-FREE (the engine canonicalizes by sorting token kinds; `long long` = LongKeyword twice). Invalid combos (`unsigned float`, `short long`, `long double`) reject by ABSENCE -> S_InvalidTypeSpecifierCombination. `long`-bearing rows carry the LLP64 (Windows) 32-bit override; `long long` stays 64-bit everywhere. NO `long double` row: F128/long-double is an FC3+ exclusion (rejects by absence).",
+    "$typeSpecifiersComment": "FC3 c1: every VALID C type-specifier multiset (C 6.7.2 6) over the shipped keyword surface; combinations are ORDER-FREE (the engine canonicalizes by sorting token kinds; `long long` = LongKeyword twice). Invalid combos (`unsigned float`, `short long`) reject by ABSENCE -> S_InvalidTypeSpecifierCombination. `long`-bearing rows carry the LLP64 (Windows) 32-bit override; `long long` stays 64-bit everywhere. FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the `long double` row carries the per-format coreByLongDoubleFormat axis — base F64 for f64-axis formats (pe64, macho-arm64: long double IS double, the LLP64 identity-collapse precedent), F80 (x87 80-bit) for x87-80 (elf/macho x86_64), F128 (binary128) for ieee128 (elf-arm64); an axis-less format (wasm/spirv) leaves the row UNREALIZED -> S_LongDoubleFormatUndeclared.",
     "typeSpecifiers": [
       { "tokens": ["VoidKeyword"],                                              "core": "Void" },
       { "tokens": ["CharKeyword"],                                              "core": "Char" },
@@ -1714,7 +1812,11 @@
       { "tokens": ["BoolKeyword"],                                              "core": "Bool" },
       { "tokens": ["LegacyBoolKeyword"],                                        "core": "Bool" },
       { "tokens": ["FloatKeyword"],                                             "core": "F32"  },
-      { "tokens": ["DoubleKeyword"],                                            "core": "F64"  }
+      { "tokens": ["DoubleKeyword"],                                            "core": "F64"  },
+      { "tokens": ["LongKeyword", "DoubleKeyword"],                             "core": "F64", "coreByLongDoubleFormat": { "x87-80": "F80", "ieee128": "F128" } },
+      { "$comment": "C99 _Complex (D-CSUBSET-COMPLEX §6.2.5): the `complex` row flag wraps the resolved ELEMENT float core in interner.complex() at the specifier-resolve site (semantic_analyzer.cpp), so `double _Complex`→complex(F64), `float _Complex`→complex(F32). `_Complex int`/`_Imaginary` (no row) reject via the absent-multiset discipline (S_InvalidTypeSpecifierCombination), the `unsigned float` precedent. `long double _Complex` reuses the LD axis: its element is F80/F128 on x87-80/ieee128 (arith walls loud there), F64 on the f64-axis formats (decl/layout/sizeof/ABI-reject work).", "tokens": ["FloatKeyword", "ComplexKeyword"],                    "core": "F32", "complex": true },
+      { "tokens": ["DoubleKeyword", "ComplexKeyword"],                          "core": "F64", "complex": true },
+      { "tokens": ["LongKeyword", "DoubleKeyword", "ComplexKeyword"],           "core": "F64", "coreByLongDoubleFormat": { "x87-80": "F80", "ieee128": "F128" }, "complex": true }
     ],
     "$literalTypesComment": "FC3 c1: IntLiteral's I32 is the BASE core; the integerLiteralTyping ladder below refines the width by magnitude/suffix/radix per C 6.4.4.1. FloatLiteral's F64 is the BASE core; the floatLiteralTyping suffix map below refines it per C 6.4.4.2 (FC3.5 sweep-c2 / D-CSUBSET-F32-CODEGEN closure: `1.5f` now types F32 — the F32 arithmetic surface shipped, so the typing flip pairs with real codegen). true/false are C23 keyword literals: type Bool with config-declared FIXED values (1/0) — the engine never decodes their text as a number.",
     "literalTypes": [
@@ -1737,10 +1839,11 @@
     "$intFloatConvertComment": "C 6.3.1.4/6.3.1.5/6.5.16.1 (D-CSUBSET-INT-FLOAT-CONVERSION): admit the int<->float implicit assignment conversion in BOTH directions, gated independently. intConvertsToFloat -> an integer flows into a float lhs (`double d=5;`, `f(anInt)` to a `double` param; the sqlite kahanBabuskaNeumaierStep(pSum,iBig) shape feeds an i64 to a `volatile double`). floatConvertsToInt -> a float flows into an integer lhs (`int n=aDouble;`, truncating toward zero). coerce()'s arithmetic-core arm materializes the MIR SIToFP/UIToFP (int->float) / FPToSI/FPToUI (float->int). Flipping either to false -> that direction errors S0003 S_TypeMismatch (the int_float_convert corpus is RED-ON-DISABLE). Completes the C arithmetic-conversion matrix alongside intCrossSignednessConverts + intSameSignednessNarrows.",
     "intConvertsToFloat": true,
     "floatConvertsToInt": true,
-    "$floatLiteralTypingComment": "FC3.5 sweep-c2: C 6.4.4.2 — a floating constant's type is keyed by its SUFFIX alone (unsuffixed -> double, f/F -> float). Type names resolve through typeSpecifiers/builtinTypes at LOAD time like the integer ladder's candidates. The loader cross-checks every numberStyle.floatSuffixes spelling is covered exactly once + an unsuffixed rule exists. C's l/L long-double suffix is NOT declared in floatSuffixes (pre-existing FC1c2 note) — long double lands with its own width story, not here.",
+    "$floatLiteralTypingComment": "FC3.5 sweep-c2: C 6.4.4.2 — a floating constant's type is keyed by its SUFFIX alone (unsuffixed -> double, f/F -> float, l/L -> long double). Type names resolve through typeSpecifiers/builtinTypes at LOAD time like the integer ladder's candidates (the `long double` row copies the coreByLongDoubleFormat axis map, so `20.0L` types per-format: F64/F80/F128). The loader cross-checks every numberStyle.floatSuffixes spelling is covered exactly once + an unsuffixed rule exists. FC17.9(e): l/L are in BOTH suffix sets — the tokenizer's per-shape suffix rule keeps integer `20L` an IntLiteral (integer suffixes first on an integer-shaped token) while `20.0L`/`2e1L` take the float suffix.",
     "floatLiteralTyping": [
       { "suffixes": [],         "type": "double" },
-      { "suffixes": ["f", "F"], "type": "float"  }
+      { "suffixes": ["f", "F"], "type": "float"  },
+      { "suffixes": ["l", "L"], "type": "long double" }
     ],
     "$integerLiteralTypingComment": "FC3 c1: C 6.4.4.1 EXACTLY — the FIRST candidate (per suffix-group x radix-class) whose range holds the decoded magnitude is the literal's type. `decimal` = no declared numberStyle prefix matched; `nondecimal` (hex/octal/binary) adds the unsigned candidates per the C table. Type names resolve through typeSpecifiers/builtinTypes at LOAD time, so LLP64's 32-bit `long` falls out of the data-model select (2147483648 is `long` on LP64 but `long long` on LLP64). Suffix GROUPS list the exact numberStyle.integerSuffixes spellings they cover; the loader cross-checks every declared suffix is covered exactly once. A magnitude beyond the last candidate -> S_IntegerLiteralTooLarge.",
     "integerLiteralTyping": [
@@ -1805,6 +1908,8 @@
       { "rule": "caseStmt",     "hirKind": "CaseStmt"    },
       { "rule": "sehTryStmt",   "hirKind": "SehTryExcept" },
       { "rule": "sehLeaveStmt", "hirKind": "SehLeave"    },
+      { "rule": "asmStmt",      "hirKind": "InlineAsm",
+        "$comment": "FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template `__asm__ [volatile] (\"\")` lowers to a core InlineAsm leaf → MirOpcode::CompilerBarrier (HIR→MIR). UNCONDITIONAL: the empty-vs-non-empty gate lives in the semantic tier (semantics.inlineAsmRule → S_InlineAsmNonEmptyTemplate), which aborts before codegen on a non-empty template, so a rejected asm's MIR is never emitted — clean separation, mirroring staticAssertDecl (semantic gates the condition; the lowering row is unconditional)." },
       { "rule": "emptyStmt",    "hirKind": "Skip"        },
       { "rule": "attributeDeclaration", "hirKind": "Skip",
         "$comment": "FC17 (D-CSUBSET-ATTRIBUTE-STATEMENT): a bare attribute-declaration statement (`[[fallthrough]];`) lowers to NOTHING — the emptyStmt Skip precedent, zero C++. The enclosing `declOrAttrStmt` wrapper is deliberately UNMAPPED: the unmapped-statement soleMeaningfulChild PassThrough peels it (for BOTH branches — a varDecl statement reaches its VarDecl row through the same peel)." },

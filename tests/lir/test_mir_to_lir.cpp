@@ -58,7 +58,9 @@ struct Lowered {
     MirToLirResult                   lir;
 };
 
-[[nodiscard]] Lowered lowerCSubsetToLir(std::string src) {
+[[nodiscard]] Lowered lowerCSubsetToLir(
+        std::string src,
+        std::shared_ptr<TargetSchema> customTarget = nullptr) {
     auto loaded = GrammarSchema::loadShipped("c-subset");
     if (!loaded) { ADD_FAILURE() << "loadShipped(c-subset) failed"; std::abort(); }
     UnitBuilder builder{*loaded};
@@ -74,10 +76,17 @@ struct Lowered {
     // alloca's element STRIDE (sizeof(int)) resolves at MIR (cachedLayout gates on
     // aggregateLayoutLoaded — even a scalar element needs it). Harmless for the
     // existing scalar-only pins. Load the target here (also reused below).
-    auto target = TargetSchema::loadShipped("x86_64");
-    if (!target) { ADD_FAILURE() << "loadShipped(x86_64) failed"; std::abort(); }
-    mirCfg.aggregateLayout       = (*target)->aggregateLayout();
-    mirCfg.aggregateLayoutLoaded = (*target)->aggregateLayoutLoaded();
+    // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): a caller may pass a mutated
+    // target (e.g. shipped x86_64 minus the `popcount` mnemonic) to exercise the
+    // SWAR fallback; default (nullptr) = the shipped x86_64.
+    std::shared_ptr<TargetSchema> tgt = std::move(customTarget);
+    if (!tgt) {
+        auto loadedTarget = TargetSchema::loadShipped("x86_64");
+        if (!loadedTarget) { ADD_FAILURE() << "loadShipped(x86_64) failed"; std::abort(); }
+        tgt = *loadedTarget;
+    }
+    mirCfg.aggregateLayout       = tgt->aggregateLayout();
+    mirCfg.aggregateLayoutLoaded = tgt->aggregateLayoutLoaded();
     HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
                                     model.lattice().interner(), mirReporter,
                                     &hir->sourceMap, mirCfg, /*ffiMap=*/nullptr,
@@ -87,14 +96,14 @@ struct Lowered {
                                     /*threadLocalMap=*/nullptr,
                                     &hir->vlaSizeExprBySymbol);   // VLA C1a
     DiagnosticReporter lirReporter;
-    auto lir = lowerToLir(mir.mir, **target, model.lattice().interner(), lirReporter);
+    auto lir = lowerToLir(mir.mir, *tgt, model.lattice().interner(), lirReporter);
     return Lowered{
         .model       = std::move(model),
         .hir         = std::move(hir),
         .hirReporter = std::move(hirReporter),
         .mir         = std::move(mir),
         .mirReporter = std::move(mirReporter),
-        .target      = std::move(*target),
+        .target      = std::move(tgt),
         .lirReporter = std::move(lirReporter),
         .lir         = std::move(lir),
     };
@@ -1181,6 +1190,217 @@ TEST(MirToLir, MissingInputRolesFailsLoudOnDivLowering) {
     EXPECT_TRUE(sawRoleDiag)
         << "the fail-loud diagnostic must name the missing role "
            "('dividend') and the map ('inputRoles').";
+}
+
+// ── FC17.9(d) atomic Phase C (D-CSUBSET-ATOMIC): the per-order fence matrix ──
+//
+// AtomicLoad/AtomicStore carry a C11 memory_order in their MIR payload
+// (relaxed=0, consume=1, acquire=2, release=3, acq_rel=4, seq_cst=5). The
+// MIR→LIR lowering maps (order, op)→a per-target fence slot by PURE
+// slot-presence (never an arch identity):
+//   load:  relaxed/consume → plain `load`;  acquire/seq_cst → `load_acquire`.
+//   store: relaxed         → plain `store`; release/acq_rel → `store_release`;
+//          seq_cst         → `store_seqcst`.
+// These SHAPE pins are red-on-disable — a relaxed load MUST NOT emit a fence
+// (load_acquire), a seq_cst load MUST. On the shipped x86_64 the fence slots
+// are the mov-load / mov-store / xchg realizations (byte-pinned in
+// test_asm_x86_variable); on arm64 LDAR/STLR (test_asm_arm64). A weak target
+// omitting a needed slot FAILS LOUD (the I2 pin below) — never a silent
+// under-fence (a data race is the ONE forbidden miscompile direction).
+
+namespace {
+
+// fn(int* p) -> int { return AtomicLoad(p, order); }  — a hand-built MIR that
+// exercises the AtomicLoad lowering arm directly (the c-subset front-end emits
+// only seq_cst plain-access atomics; explicit per-order builtins are Phase D).
+[[nodiscard]] Mir buildAtomicLoadFnMir(std::uint32_t order, TypeInterner& interner) {
+    TypeId const i32  = interner.primitive(TypeKind::I32);
+    TypeId const i32p = interner.pointer(i32);
+    TypeId const params[] = {i32p};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const ptr = mb.addArg(0, i32p);
+    MirInstId const loadOps[] = {ptr};
+    MirInstId const v = mb.addInst(MirOpcode::AtomicLoad, loadOps, i32, order);
+    mb.addReturn(v);
+    return std::move(mb).finish();
+}
+
+// fn(int* p, int v) -> int { AtomicStore(v, p, order); return v; }
+// v is RETURNED (live-after the store) so the x86 seq_cst XCHG copy-to-scratch
+// is exercised — a clobbered value reg would return garbage, not v.
+[[nodiscard]] Mir buildAtomicStoreFnMir(std::uint32_t order, TypeInterner& interner) {
+    TypeId const i32  = interner.primitive(TypeKind::I32);
+    TypeId const i32p = interner.pointer(i32);
+    TypeId const params[] = {i32p, i32};
+    TypeId const fnSig = interner.fnSig(params, i32, CallConv::CcSysV);
+    MirBuilder mb;
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const ptr = mb.addArg(0, i32p);
+    MirInstId const val = mb.addArg(1, i32);
+    MirInstId const storeOps[] = {val, ptr};   // AtomicStore operands = [value, ptr]
+    (void)mb.addInst(MirOpcode::AtomicStore, storeOps, InvalidType, order);
+    mb.addReturn(val);
+    return std::move(mb).finish();
+}
+
+// Count LIR insts (fn 0, block 0) whose opcode is `mnemonic` on `sch`.
+[[nodiscard]] int countLirMnemonic(Lir const& lir, TargetSchema const& sch,
+                                   std::string_view mnemonic) {
+    auto const want = sch.opcodeByMnemonic(mnemonic);
+    if (!want.has_value()) return 0;
+    LirBlockId const bb = lir.funcBlockAt(lir.funcAt(0), 0);
+    int n = 0;
+    for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+        if (lir.instOpcode(lir.blockInstAt(bb, i)) == *want) ++n;
+    }
+    return n;
+}
+
+}  // namespace
+
+TEST(MirToLirAtomic, StoreSeqCstEmitsStoreSeqCstNotPlainStore) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMir(/*seq_cst=*/5, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 1)
+        << "a seq_cst AtomicStore must lower to the store_seqcst (xchg) slot.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store"), 0)
+        << "RED-ON-DISABLE: a seq_cst store MUST NOT be a plain (unfenced) store.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_release"), 0);
+}
+
+TEST(MirToLirAtomic, StoreReleaseEmitsStoreReleaseNotSeqCst) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMir(/*release=*/3, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_release"), 1)
+        << "a release AtomicStore must lower to the store_release (mov) slot.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0)
+        << "RED-ON-DISABLE: a release store MUST NOT emit the seq_cst (xchg) fence.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store"), 0);
+}
+
+TEST(MirToLirAtomic, StoreRelaxedEmitsPlainStore) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicStoreFnMir(/*relaxed=*/0, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store"), 1)
+        << "a relaxed AtomicStore reuses the plain scalar store (mov; no fence).";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_release"), 0);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "store_seqcst"), 0);
+}
+
+TEST(MirToLirAtomic, LoadSeqCstEmitsLoadAcquireNotPlainLoad) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicLoadFnMir(/*seq_cst=*/5, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load_acquire"), 1)
+        << "a seq_cst AtomicLoad must lower to the load_acquire slot.";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load"), 0)
+        << "RED-ON-DISABLE: a seq_cst load MUST NOT be a plain (unfenced) load.";
+}
+
+TEST(MirToLirAtomic, LoadAcquireEmitsLoadAcquire) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicLoadFnMir(/*acquire=*/2, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load_acquire"), 1);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load"), 0);
+}
+
+TEST(MirToLirAtomic, LoadRelaxedEmitsPlainLoadNotLoadAcquire) {
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicLoadFnMir(/*relaxed=*/0, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(lirR.ok);
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load"), 1)
+        << "a relaxed AtomicLoad reuses the plain scalar load (mov; no fence).";
+    EXPECT_EQ(countLirMnemonic(lirR.lir, **target, "load_acquire"), 0)
+        << "RED-ON-DISABLE: a relaxed load MUST NOT emit the acquire fence.";
+}
+
+TEST(MirToLirAtomic, SeqCstRoutesToStlrAndLdarOnArm64) {
+    // The same (order, op)→slot matrix on arm64: seq_cst store→store_seqcst
+    // (STLR), seq_cst load→load_acquire (LDAR). Confirms the pure-slot-presence
+    // dispatch is target-blind (byte encodings pinned in test_asm_arm64).
+    auto target = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(target.has_value());
+    TypeInterner interner{CompilationUnitId{1}};
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+
+    Mir storeMir = buildAtomicStoreFnMir(/*seq_cst=*/5, interner);
+    auto storeR = lowerToLir(storeMir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(storeR.ok);
+    EXPECT_EQ(countLirMnemonic(storeR.lir, **target, "store_seqcst"), 1);
+
+    Mir loadMir = buildAtomicLoadFnMir(/*seq_cst=*/5, interner);
+    auto loadR = lowerToLir(loadMir, **target, interner, rep, noExterns);
+    ASSERT_TRUE(loadR.ok);
+    EXPECT_EQ(countLirMnemonic(loadR.lir, **target, "load_acquire"), 1);
+}
+
+TEST(MirToLirAtomic, AcquireLoadFailsLoudWhenLoadAcquireSlotMissing) {
+    // I2 FAIL-LOUD belt: a target that declares NO load_acquire realization
+    // must FAIL LOUD on an acquire/seq_cst AtomicLoad (reportMissingOpcode) —
+    // never silently fall back to a plain (unfenced) load. A future weak target
+    // that omits its acquire slot REDS instead of racing.
+    auto mutated = dss::test_support::mutateShippedTargetSchemaJson(
+        "x86_64", {"load_acquire"});
+    ASSERT_TRUE(mutated.has_value())
+        << "removing the OPTIONAL load_acquire opcode must not fail the loader.";
+    TypeInterner interner{CompilationUnitId{1}};
+    Mir mir = buildAtomicLoadFnMir(/*seq_cst=*/5, interner);
+    DiagnosticReporter rep;
+    std::vector<dss::ExternImport> noExterns;
+    auto lirR = lowerToLir(mir, **mutated, interner, rep, noExterns);
+    EXPECT_FALSE(lirR.ok)
+        << "an acquire/seq_cst load with no load_acquire slot MUST fail the "
+           "lowering — never a silent plain-load under-fence.";
+    bool sawDiag = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::L_RequiredLirOpcodeMissing
+            && d.actual.find("load_acquire") != std::string::npos) {
+            sawDiag = true;
+        }
+    }
+    EXPECT_TRUE(sawDiag)
+        << "the fail-loud diagnostic must name the missing 'load_acquire' slot.";
 }
 
 // ── FC3.5 sweep-c1: capability-driven shift lowering ────────────────────
@@ -4219,6 +4439,253 @@ TEST(MirToLir, F32AddLowersAndExoticFloatWidthsStayWalled) {
                                      ::dss::MirOpcode::FDiv);
     EXPECT_FALSE(probe128.ok);
     EXPECT_TRUE(sawAnchor(probe128.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): F80 (x87 80-bit) is the third
+    // genuinely-unencoded FPR width — an ARITHMETIC op over it must wall at
+    // the SAME width guard (its real x87 codegen is D-CSUBSET-LONG-DOUBLE-
+    // X87-ARITH, still deferred). The arithmetic producers already gated it
+    // by construction (regClassForCoreType(F80)==FPR, not F32/F64); this arm
+    // pins that alongside the F16/F128 siblings.
+    auto probe80 = lowerBinaryProbe(::dss::TypeKind::F80,
+                                    ::dss::MirOpcode::FMul);
+    EXPECT_FALSE(probe80.ok)
+        << "F80 arithmetic must wall — no x87 scalar encodings this cycle";
+    EXPECT_TRUE(sawAnchor(probe80.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+}
+
+// ══ FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): the four CALL-BOUNDARY
+// walls ═══════════════════════════════════════════════════════════════════
+//
+// The in-function arithmetic PRODUCERS (FAdd..FNeg, Load, Const, conversions)
+// already wall F80/F128, but the four call/memory BOUNDARY plumbing sites had
+// NO producer gate of their own — Arg, Store-value, Call-result, and Return-
+// operand each just move a register/memory word, and widthFlagsForType /
+// memAccessWidthFlags DEFAULT F80/F128 to width 0 = a 64-bit move (8-byte
+// plumbing of a 16-byte value — a silent ABI miscompile). requireEncodedFloat-
+// Width now gates all four.
+//
+// Each pin is INDIVIDUALLY red-on-disable by keying on the walling site's
+// DISTINCT context string ("MIR Arg" / "MIR Store value" / "MIR Call result" /
+// "MIR Return operand"), NOT on the aggregate `ok` flag: three of the four
+// modules unavoidably co-fire the Arg gate (the F80 value has to be produced
+// somehow, and every F80 producer walls), so an `ok`-only assert would stay
+// green when its own gate is removed but a sibling still fires. Removing THE
+// gate under test deletes THAT context's diagnostic → THAT pin (and only it)
+// reds; the diagnostic text carries the D-TARGET-ENCODING-WIDTH-GUARD anchor.
+
+namespace {
+// void f(long double x) {}  — an F80 PARAMETER, unused, void return. The Arg
+// gate is the SOLE F80 site (no Const/Load/Store/Call, no F80 return), so this
+// pin's `ok` is walled ONLY by the Arg gate — the strict single-gate witness.
+[[nodiscard]] GuardProbe lowerF80ArgProbe() {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f80  = interner.primitive(::dss::TypeKind::F80);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    std::array<::dss::TypeId, 1> params{f80};
+    auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    (void)mb.addArg(0, f80);
+    mb.addReturn(std::nullopt);
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+
+// int f(long double x, long double* p) { *p = x; return 0; }  — the STORE-value
+// gate (mirrors buildF64StoreMir with F80). The Arg gate co-fires on arg0, so
+// this pin keys on the "MIR Store value" context.
+[[nodiscard]] GuardProbe lowerF80StoreProbe() {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f80  = interner.primitive(::dss::TypeKind::F80);
+    auto const ptrT = interner.pointer(f80);
+    auto const i32  = interner.primitive(::dss::TypeKind::I32);
+    std::array<::dss::TypeId, 2> params{f80, ptrT};
+    auto const sig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const v = mb.addArg(0, f80);
+    ::dss::MirInstId const p = mb.addArg(1, ptrT);
+    std::array<::dss::MirInstId, 2> storeOps{v, p};
+    (void)mb.addInst(::dss::MirOpcode::Store, storeOps, ::dss::InvalidType);
+    ::dss::MirLiteralValue zero; zero.value = std::int64_t{0};
+    zero.core = ::dss::TypeKind::I32;
+    mb.addReturn(mb.addConst(zero, i32));
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+
+// void f() { g(); }  where g returns long double — the CALL-RESULT gate. The
+// callee is a GlobalAddr (GPR, no wall), no args, void return: the call's F80
+// RESULT is the SOLE F80 site, so `ok` is walled ONLY by the Call-result gate.
+[[nodiscard]] GuardProbe lowerF80CallResultProbe() {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f80   = interner.primitive(::dss::TypeKind::F80);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    auto const ptrT  = interner.pointer(voidT);
+    auto const sig = interner.fnSig(std::span<::dss::TypeId const>{}, voidT,
+                                    ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const callee = mb.addGlobalAddr(::dss::SymbolId{2}, ptrT);
+    std::array<::dss::MirInstId, 1> callOps{callee};
+    (void)mb.addInst(::dss::MirOpcode::Call, callOps, f80);   // F80 result
+    mb.addReturn(std::nullopt);
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+
+// long double f(long double x) { return x; }  — the RETURN-operand gate. The
+// Arg gate co-fires on x, so this pin keys on the "MIR Return operand" context.
+[[nodiscard]] GuardProbe lowerF80ReturnProbe() {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f80 = interner.primitive(::dss::TypeKind::F80);
+    std::array<::dss::TypeId, 1> params{f80};
+    auto const sig = interner.fnSig(params, f80, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const x = mb.addArg(0, f80);
+    mb.addReturn(x);
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+} // namespace
+
+TEST(MirToLir, F80ArgBoundaryWallsFailLoud) {
+    auto probe = lowerF80ArgProbe();
+    EXPECT_FALSE(probe.ok)
+        << "an F80 PARAMETER is the sole F80 site here — the Arg gate must "
+           "wall it (else 64-bit plumbing of a 16-byte value)";
+    EXPECT_TRUE(sawAnchor(probe.rep, "MIR Arg"))
+        << "the Arg-boundary wall must fire with its own context string";
+    EXPECT_TRUE(sawAnchor(probe.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+}
+
+TEST(MirToLir, F80StoreValueBoundaryWallsFailLoud) {
+    auto probe = lowerF80StoreProbe();
+    EXPECT_FALSE(probe.ok);
+    EXPECT_TRUE(sawAnchor(probe.rep, "MIR Store value"))
+        << "the Store-value wall must fire — memAccessWidthFlags defaults F80 "
+           "to width 0 = an 8-byte movsd of a 16-byte value";
+    EXPECT_TRUE(sawAnchor(probe.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+}
+
+TEST(MirToLir, F80CallResultBoundaryWallsFailLoud) {
+    auto probe = lowerF80CallResultProbe();
+    EXPECT_FALSE(probe.ok)
+        << "a call RETURNING long double is the sole F80 site here — the "
+           "Call-result gate must wall it";
+    EXPECT_TRUE(sawAnchor(probe.rep, "MIR Call result"))
+        << "the Call-result wall must fire with its own context string";
+    EXPECT_TRUE(sawAnchor(probe.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+}
+
+TEST(MirToLir, F80ReturnOperandBoundaryWallsFailLoud) {
+    auto probe = lowerF80ReturnProbe();
+    EXPECT_FALSE(probe.ok);
+    EXPECT_TRUE(sawAnchor(probe.rep, "MIR Return operand"))
+        << "the Return-operand wall must fire — the return-register move is "
+           "plain plumbing with no producer gate of its own";
+    EXPECT_TRUE(sawAnchor(probe.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+}
+
+// ══ C99 _Complex (D-CSUBSET-COMPLEX / design test #11): long-double-complex
+// ARITHMETIC walls loud on an x87-80 axis ═══════════════════════════════════
+//
+// `long double _Complex` on elf-x86_64 (x87-80 axis) has an F80 ELEMENT. Its
+// decl/layout/sizeof work (the semantic + layout pins), but its VALUE arithmetic
+// emits componentwise F80 float ops — which MUST hit the SAME
+// requireEncodedFloatWidth wall every scalar F80 op hits (no new wall; the
+// long-double arithmetic deferral D-CSUBSET-LONG-DOUBLE-X87-ARITH covers the
+// complex element by construction). This drives the REAL pipeline end-to-end —
+// c-subset source (analyze on the X87_80 axis, the driver's
+// effectiveLongDoubleFormat) → HIR → MIR (materializeComplexBinaryOp emits the
+// F80 component ops) → MIR→LIR (the wall) — NOT a hand-built MIR. The
+// red-on-disable for the wall itself was demonstrated in the long-double cycle;
+// this pin asserts the COMPLEX element rides it: compile must FAIL with
+// L_UnsupportedLoweringForOpcode carrying the D-TARGET-ENCODING-WIDTH-GUARD
+// anchor, never a silently mis-encoded 8-byte op over a 16-byte component.
+TEST(MirToLir, LongDoubleComplexArithmeticWallsLoudOnX87Axis) {
+    auto loaded = GrammarSchema::loadShipped("c-subset");
+    ASSERT_TRUE(loaded.has_value());
+    UnitBuilder builder{*loaded};
+    builder.addInMemory(
+        "long double _Complex ga;\n"
+        "long double _Complex gb;\n"
+        "int main(void) { long double _Complex s = ga + gb; return 0; }\n",
+        "<mem>");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    // The X87_80 long-double axis (elf-x86_64) — the typeSpecifiers row resolves
+    // `long double _Complex` to complex(F80).
+    auto model = analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+                         std::nullopt, std::nullopt, LongDoubleFormat::X87_80);
+    ASSERT_FALSE(model.hasErrors())
+        << "the DECLARATION tier must accept long double _Complex on the x87 axis: "
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    DiagnosticReporter hirReporter;
+    auto hir = lowerToHir(model, hirReporter);
+    ASSERT_TRUE(hir->ok)
+        << (hirReporter.all().empty() ? "" : hirReporter.all()[0].actual);
+    DiagnosticReporter mirReporter;
+    MirLoweringConfig mirCfg;
+    mirCfg.globalsAllowFloat = (*loaded)->hirLowering().globalsConstEval.allowFloat;
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    mirCfg.aggregateLayout       = (*target)->aggregateLayout();
+    mirCfg.aggregateLayoutLoaded = (*target)->aggregateLayoutLoaded();
+    HirToMirResult mir = lowerToMir(hir->hir, hir->literalPool,
+                                    model.lattice().interner(), mirReporter,
+                                    &hir->sourceMap, mirCfg);
+    ASSERT_TRUE(mir.ok)
+        << "MIR lowering emits the componentwise F80 ops cleanly (the wall is "
+           "the LIR width gate, not MIR): "
+        << (mirReporter.all().empty() ? "" : mirReporter.all()[0].actual);
+    DiagnosticReporter lirReporter;
+    auto lir = lowerToLir(mir.mir, **target, model.lattice().interner(), lirReporter);
+    EXPECT_FALSE(lir.ok)
+        << "long-double-complex ARITHMETIC must wall loud on the x87-80 axis — "
+           "its F80 components have no scalar float encoding this cycle "
+           "(D-CSUBSET-LONG-DOUBLE-X87-ARITH); a clean lowering means an 8-byte "
+           "op silently mis-encoded a 16-byte component";
+    EXPECT_TRUE(sawAnchor(lirReporter, "D-TARGET-ENCODING-WIDTH-GUARD"))
+        << "the wall must be the encoded-float-width guard, with its anchor";
+    bool sawWallCode = false;
+    for (auto const& d : lirReporter.all()) {
+        if (d.code == DiagnosticCode::L_UnsupportedLoweringForOpcode) {
+            sawWallCode = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawWallCode)
+        << "the wall must carry L_UnsupportedLoweringForOpcode (the fail-loud "
+           "diagnostic), not a silent ok=false";
 }
 
 // ══ TLS C1 (D-CSUBSET-THREAD-LOCAL): the thread-local GlobalAddr arm ══
@@ -4941,4 +5408,77 @@ TEST(MirToLir, VlaOverAlignedElementFailsLoud) {
     }
     EXPECT_TRUE(sawOverAlign)
         << "an over-aligned VLA element must surface L_OverAlignedStackLocal";
+}
+
+// ── FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): native-vs-SWAR lowering ─────────
+
+namespace {
+// Count LIR insts whose opcode equals the named mnemonic across every function.
+[[nodiscard]] int countLirOp(Lir const& lir, TargetSchema const& sch,
+                             char const* mnemonic) {
+    auto const op = sch.opcodeByMnemonic(mnemonic);
+    if (!op.has_value()) return 0;
+    int n = 0;
+    for (std::size_t f = 0; f < lir.moduleFuncCount(); ++f) {
+        LirFuncId const fn = lir.funcAt(static_cast<std::uint32_t>(f));
+        for (std::uint32_t b = 0; b < lir.funcBlockCount(fn); ++b) {
+            LirBlockId const bb = lir.funcBlockAt(fn, b);
+            for (std::uint32_t i = 0; i < lir.blockInstCount(bb); ++i) {
+                if (lir.instOpcode(lir.blockInstAt(bb, i)) == *op) ++n;
+            }
+        }
+    }
+    return n;
+}
+} // namespace
+
+// On x86_64 the 3 primitives lower to their NATIVE hardware instructions (the
+// popcount/clz/ctz mnemonics are declared) — one op each, no SWAR multiply.
+TEST(MirToLir, BitCountLowersToNativeOnX86) {
+    auto L = lowerCSubsetToLir(
+        "typedef unsigned int u32;\n"
+        "int pc(u32 x){return __builtin_popcount(x);}\n"
+        "int lz(u32 x){return __builtin_clz(x);}\n"
+        "int tz(u32 x){return __builtin_ctz(x);}\n");
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "LIR lowering: " << (L.lirReporter.all().empty()
+            ? "" : L.lirReporter.all()[0].actual);
+    auto const& sch = *L.target;
+    Lir const& lir = L.lir.lir;
+    EXPECT_EQ(countLirOp(lir, sch, "popcount"), 1);  // POPCNT
+    EXPECT_EQ(countLirOp(lir, sch, "clz"), 1);        // LZCNT
+    EXPECT_EQ(countLirOp(lir, sch, "ctz"), 1);        // TZCNT
+    EXPECT_EQ(countLirOp(lir, sch, "mul"), 0)
+        << "the native path emits no SWAR multiply";
+}
+
+// RED-ON-DISABLE: drop the `popcount` mnemonic from x86_64 and MIR Popcount MUST
+// lower to the SWAR bit-trick sequence (a `mul` by the 0x0101.. magic + the
+// 0x55/0x33/0x0F masks) — NOT fail loud, NOT a `popcount` op. This proves the
+// fallback is REAL (arm64 declares no popcount, so it lands here at runtime — the
+// runnable example `builtin_bitcount` witnesses the SWAR result on qemu-arm64).
+TEST(MirToLir, PopcountFallsBackToSwarWhenNoNativeMnemonic) {
+    auto mutated = dss::test_support::mutateShippedTargetSchemaJson(
+        "x86_64", {"popcount"});
+    ASSERT_TRUE(mutated.has_value())
+        << "mutateShippedTargetSchemaJson(x86_64, -popcount) failed";
+    auto L = lowerCSubsetToLir(
+        "int pc(unsigned int x){return __builtin_popcount(x);}\n", *mutated);
+    assertUpstreamClean(L);
+    ASSERT_TRUE(L.lir.ok)
+        << "the SWAR fallback must lower cleanly, NOT fail loud: "
+        << (L.lirReporter.all().empty() ? "" : L.lirReporter.all()[0].actual);
+    auto const& sch = *L.target;
+    // The mnemonic really was removed → the native probe returns nullopt.
+    EXPECT_FALSE(sch.opcodeByMnemonic("popcount").has_value());
+    Lir const& lir = L.lir.lir;
+    EXPECT_EQ(countLirOp(lir, sch, "popcount"), 0)
+        << "no native popcount when the mnemonic is absent";
+    EXPECT_GE(countLirOp(lir, sch, "mul"), 1)
+        << "the SWAR popcount's distinctive 0x0101.. multiply";
+    EXPECT_GE(countLirOp(lir, sch, "and"), 3)
+        << "the SWAR popcount masks with 0x55/0x33/0x0F";
+    EXPECT_GE(countLirOp(lir, sch, "sub"), 1)
+        << "the SWAR popcount's x -= (x>>1)&m1 step";
 }

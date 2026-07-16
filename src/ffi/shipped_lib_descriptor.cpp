@@ -147,7 +147,7 @@ json const* cachedDescriptorJson(std::filesystem::path const& path,
 // math.h float constant needs them today).
 [[nodiscard]] bool isFloatScalarKind(TypeKind k) {
     return k == TypeKind::F16 || k == TypeKind::F32
-        || k == TypeKind::F64 || k == TypeKind::F128;
+        || k == TypeKind::F64 || k == TypeKind::F80 || k == TypeKind::F128;
 }
 
 // Decode a FLOAT constant's STRING `value` into a `double`. JSON has no
@@ -903,6 +903,21 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
             noreturn = sym.at("noreturn").get<bool>();
         }
 
+        // FC17.9(c) (D-CSUBSET-SETJMP): optional `returnsTwice` bool (default false) —
+        // TRUE for setjmp/_setjmp. Threaded onto the injected symbol's returnsTwice, then
+        // onto a per-Call MirInstFlags::ReturnsTwice at HIR->MIR (the isVolatile->Volatile
+        // mirror) so the optimizer's returns-twice-aware passes read it. Same decode shape
+        // as `noreturn` above.
+        bool returnsTwice = false;
+        if (sym.contains("returnsTwice")) {
+            if (!sym.at("returnsTwice").is_boolean()) {
+                emitMalformed(reporter, "shipped-lib descriptor " + at
+                                            + ": 'returnsTwice' must be a boolean");
+                continue;
+            }
+            returnsTwice = sym.at("returnsTwice").get<bool>();
+        }
+
         // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER): optional `synthesize` recipe tag
         // (default empty) — marks a pe64 <threads.h> shim symbol (mtx_lock etc.) whose
         // body the synth pass emits over kernel32, rather than a plain FFI import.
@@ -1009,7 +1024,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
         (void)rejectUnknownKeys(reporter, sym, "symbols[" + std::to_string(idx - 1) + "]",
                                 {"name", "signature", "signatureByDataModel",
                                  "kind", "linkage", "availableObjectFormats",
-                                 "noreturn", "synthesize"});
+                                 "noreturn", "returnsTwice", "synthesize"});
 
         // Decode the signature via the ONE type-text decoder. A decode failure
         // is the CRITICAL fail-loud: F_ShippedLibUnsupportedType, and the
@@ -1037,7 +1052,7 @@ readShippedLibDescriptor(std::filesystem::path const&    path,
 
         out.symbols.push_back(
             ShippedSymbol{std::move(name), sig, kind, linkage, std::move(symAvail),
-                          noreturn, std::move(synthesize)});
+                          noreturn, returnsTwice, std::move(synthesize)});
     }
 
     // (5) Optional `constants` array — the neutral form of a header's object-

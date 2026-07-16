@@ -58,6 +58,15 @@ effectiveBitFieldStrategy(TargetSchema const&       target,
     return target.aggregateLayout().bitFieldStrategy;
 }
 
+LongDoubleFormat
+effectiveLongDoubleFormat([[maybe_unused]] TargetSchema const& target,
+                          ObjectFormatSchema const&            format) noexcept {
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): FORMAT-only — no target-side field
+    // exists to fall back to (see the header docblock). `None` propagates as
+    // the honest undeclared state; the semantic bind fails loud on it.
+    return format.longDoubleFormat();
+}
+
 namespace {
 
 // Snapshot-vs-current `errorCount` gate. Each tier shares `reporter`,
@@ -246,7 +255,11 @@ static std::optional<CuMirModule> buildCuMirImpl(
     auto model = analyze(
         std::move(borrowed), format.dataModel(), analyzeLayout, analyzeVaStrategy,
         format.kind(),       // c8: the active object-format → per-target availability gate
-        target.name());      // plan 25: the active arch → per-target shipped-struct variant selector
+        target.name(),       // plan 25: the active arch → per-target shipped-struct variant selector
+        // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the format-resolved `long double`
+        // axis — drives the coreByLongDoubleFormat row overrides; None (wasm/
+        // spirv) leaves `long double` rows unrealized (loud on use).
+        effectiveLongDoubleFormat(target, format));
     phase.reset();
     copyDiagnostics(model.diagnostics(), reporter);
     if (model.hasErrors() || !tierClean(reporter, semEntry)) {
@@ -426,7 +439,8 @@ static std::optional<CuMirModule> buildCuMirImpl(
                           &hir->vlaSizeExprBySymbol,   // VLA C1a (D-CSUBSET-VLA)
                           &hir->sizeofVlaSymbol,   // VLA C2 (D-CSUBSET-VLA)
                           &hir->typedefVlaOriginBySymbol,   // VLA C4b (D-CSUBSET-VLA)
-                          &hir->synthRecipeBySymbol);   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
+                          &hir->synthRecipeBySymbol,   // FC17.9(a) (D-CSUBSET-C11-THREADS-HEADER)
+                          &hir->returnsTwiceMap);   // FC17.9(c) (D-CSUBSET-SETJMP)
     phase.reset();
     if (!mir.ok || !tierClean(reporter, mirEntry)) {
         return std::nullopt;

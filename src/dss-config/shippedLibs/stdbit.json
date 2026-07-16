@@ -1,0 +1,152 @@
+{
+  "$comment": "C23 <stdbit.h> (N3096 §7.18) — FC17.9(b) (D-FULLC-STDBIT). The type-generic bit utilities. This is the ONLY user-facing surface: the `stdc_*` names appear only on `#include <stdbit.h>` (function-like macros spliced by the preprocessor), while the underlying `__builtin_stdc_<op>_<T>` intrinsics are always-injected compiler builtins (c-subset.lang.json builtinFunctions, reserved `__builtin_` namespace) that lower via a width-correct branchless HIR→MIR composition of the 3 hardware bit-count primitives (Popcount/Clz/Ctz) — NO linkable symbol, so NO `library`/`symbols`, available on every object format. For each of the 14 operations: 4 CONCRETE width macros `stdc_<op>_uc/_us/_ui/_ull(x)` route to the matching-width builtin; `stdc_<op>_ul(x)` is a per-FORMAT `variants` macro carrying the LP64/LLP64 `unsigned long` divergence (pe/LLP64 → the 32-bit `_ui`; elf+macho/LP64 → the 64-bit `_ull`); the GENERIC `stdc_<op>(x)` is a 4-WAY `_Generic` over {unsigned char, unsigned short, unsigned int, unsigned long long} — `unsigned long` is DROPPED (audit C1: DSS interns it to a width-core TypeId that COLLIDES with `_ui` on LLP64 / `_ull` on LP64 → S_GenericSelectionAmbiguous; the same width-collapse makes the 4-way route an `unsigned long` operand CORRECTLY on both data models). Each `_Generic` association carries the FULL builtin CALL (never a bare callee) so only the selected arm lowers (the firstNameToken Area-5 mitigation). Plus the 4 object macros: `__STDC_VERSION_STDBIT_H__` and the endianness triple (all DSS targets are little-endian → NATIVE==LITTLE; a big-endian target is D-FULLC-STDBIT-BIG-ENDIAN-NATIVE). The concrete `stdc_*_T` are macros, so `&stdc_leading_zeros_ui` is D-FULLC-STDBIT-ADDRESSABLE-FN (deferred).",
+  "header": "stdbit.h",
+  "standard": "c23",
+  "availableObjectFormats": ["elf", "pe", "macho"],
+  "macros": [
+    { "name": "stdc_leading_zeros_uc", "params": ["x"], "replacement": "__builtin_stdc_leading_zeros_uc(x)" },
+    { "name": "stdc_leading_zeros_us", "params": ["x"], "replacement": "__builtin_stdc_leading_zeros_us(x)" },
+    { "name": "stdc_leading_zeros_ui", "params": ["x"], "replacement": "__builtin_stdc_leading_zeros_ui(x)" },
+    { "name": "stdc_leading_zeros_ull", "params": ["x"], "replacement": "__builtin_stdc_leading_zeros_ull(x)" },
+    { "name": "stdc_leading_zeros_ul", "variants": [
+        { "when": { "format": "pe" },    "params": ["x"], "replacement": "__builtin_stdc_leading_zeros_ui(x)" },
+        { "when": { "format": "elf" },   "params": ["x"], "replacement": "__builtin_stdc_leading_zeros_ull(x)" },
+        { "when": { "format": "macho" }, "params": ["x"], "replacement": "__builtin_stdc_leading_zeros_ull(x)" }
+    ] },
+    { "name": "stdc_leading_zeros", "params": ["x"], "replacement": "_Generic((x), unsigned char: __builtin_stdc_leading_zeros_uc(x), unsigned short: __builtin_stdc_leading_zeros_us(x), unsigned int: __builtin_stdc_leading_zeros_ui(x), unsigned long long: __builtin_stdc_leading_zeros_ull(x))" },
+    { "name": "stdc_leading_ones_uc", "params": ["x"], "replacement": "__builtin_stdc_leading_ones_uc(x)" },
+    { "name": "stdc_leading_ones_us", "params": ["x"], "replacement": "__builtin_stdc_leading_ones_us(x)" },
+    { "name": "stdc_leading_ones_ui", "params": ["x"], "replacement": "__builtin_stdc_leading_ones_ui(x)" },
+    { "name": "stdc_leading_ones_ull", "params": ["x"], "replacement": "__builtin_stdc_leading_ones_ull(x)" },
+    { "name": "stdc_leading_ones_ul", "variants": [
+        { "when": { "format": "pe" },    "params": ["x"], "replacement": "__builtin_stdc_leading_ones_ui(x)" },
+        { "when": { "format": "elf" },   "params": ["x"], "replacement": "__builtin_stdc_leading_ones_ull(x)" },
+        { "when": { "format": "macho" }, "params": ["x"], "replacement": "__builtin_stdc_leading_ones_ull(x)" }
+    ] },
+    { "name": "stdc_leading_ones", "params": ["x"], "replacement": "_Generic((x), unsigned char: __builtin_stdc_leading_ones_uc(x), unsigned short: __builtin_stdc_leading_ones_us(x), unsigned int: __builtin_stdc_leading_ones_ui(x), unsigned long long: __builtin_stdc_leading_ones_ull(x))" },
+    { "name": "stdc_trailing_zeros_uc", "params": ["x"], "replacement": "__builtin_stdc_trailing_zeros_uc(x)" },
+    { "name": "stdc_trailing_zeros_us", "params": ["x"], "replacement": "__builtin_stdc_trailing_zeros_us(x)" },
+    { "name": "stdc_trailing_zeros_ui", "params": ["x"], "replacement": "__builtin_stdc_trailing_zeros_ui(x)" },
+    { "name": "stdc_trailing_zeros_ull", "params": ["x"], "replacement": "__builtin_stdc_trailing_zeros_ull(x)" },
+    { "name": "stdc_trailing_zeros_ul", "variants": [
+        { "when": { "format": "pe" },    "params": ["x"], "replacement": "__builtin_stdc_trailing_zeros_ui(x)" },
+        { "when": { "format": "elf" },   "params": ["x"], "replacement": "__builtin_stdc_trailing_zeros_ull(x)" },
+        { "when": { "format": "macho" }, "params": ["x"], "replacement": "__builtin_stdc_trailing_zeros_ull(x)" }
+    ] },
+    { "name": "stdc_trailing_zeros", "params": ["x"], "replacement": "_Generic((x), unsigned char: __builtin_stdc_trailing_zeros_uc(x), unsigned short: __builtin_stdc_trailing_zeros_us(x), unsigned int: __builtin_stdc_trailing_zeros_ui(x), unsigned long long: __builtin_stdc_trailing_zeros_ull(x))" },
+    { "name": "stdc_trailing_ones_uc", "params": ["x"], "replacement": "__builtin_stdc_trailing_ones_uc(x)" },
+    { "name": "stdc_trailing_ones_us", "params": ["x"], "replacement": "__builtin_stdc_trailing_ones_us(x)" },
+    { "name": "stdc_trailing_ones_ui", "params": ["x"], "replacement": "__builtin_stdc_trailing_ones_ui(x)" },
+    { "name": "stdc_trailing_ones_ull", "params": ["x"], "replacement": "__builtin_stdc_trailing_ones_ull(x)" },
+    { "name": "stdc_trailing_ones_ul", "variants": [
+        { "when": { "format": "pe" },    "params": ["x"], "replacement": "__builtin_stdc_trailing_ones_ui(x)" },
+        { "when": { "format": "elf" },   "params": ["x"], "replacement": "__builtin_stdc_trailing_ones_ull(x)" },
+        { "when": { "format": "macho" }, "params": ["x"], "replacement": "__builtin_stdc_trailing_ones_ull(x)" }
+    ] },
+    { "name": "stdc_trailing_ones", "params": ["x"], "replacement": "_Generic((x), unsigned char: __builtin_stdc_trailing_ones_uc(x), unsigned short: __builtin_stdc_trailing_ones_us(x), unsigned int: __builtin_stdc_trailing_ones_ui(x), unsigned long long: __builtin_stdc_trailing_ones_ull(x))" },
+    { "name": "stdc_first_leading_zero_uc", "params": ["x"], "replacement": "__builtin_stdc_first_leading_zero_uc(x)" },
+    { "name": "stdc_first_leading_zero_us", "params": ["x"], "replacement": "__builtin_stdc_first_leading_zero_us(x)" },
+    { "name": "stdc_first_leading_zero_ui", "params": ["x"], "replacement": "__builtin_stdc_first_leading_zero_ui(x)" },
+    { "name": "stdc_first_leading_zero_ull", "params": ["x"], "replacement": "__builtin_stdc_first_leading_zero_ull(x)" },
+    { "name": "stdc_first_leading_zero_ul", "variants": [
+        { "when": { "format": "pe" },    "params": ["x"], "replacement": "__builtin_stdc_first_leading_zero_ui(x)" },
+        { "when": { "format": "elf" },   "params": ["x"], "replacement": "__builtin_stdc_first_leading_zero_ull(x)" },
+        { "when": { "format": "macho" }, "params": ["x"], "replacement": "__builtin_stdc_first_leading_zero_ull(x)" }
+    ] },
+    { "name": "stdc_first_leading_zero", "params": ["x"], "replacement": "_Generic((x), unsigned char: __builtin_stdc_first_leading_zero_uc(x), unsigned short: __builtin_stdc_first_leading_zero_us(x), unsigned int: __builtin_stdc_first_leading_zero_ui(x), unsigned long long: __builtin_stdc_first_leading_zero_ull(x))" },
+    { "name": "stdc_first_leading_one_uc", "params": ["x"], "replacement": "__builtin_stdc_first_leading_one_uc(x)" },
+    { "name": "stdc_first_leading_one_us", "params": ["x"], "replacement": "__builtin_stdc_first_leading_one_us(x)" },
+    { "name": "stdc_first_leading_one_ui", "params": ["x"], "replacement": "__builtin_stdc_first_leading_one_ui(x)" },
+    { "name": "stdc_first_leading_one_ull", "params": ["x"], "replacement": "__builtin_stdc_first_leading_one_ull(x)" },
+    { "name": "stdc_first_leading_one_ul", "variants": [
+        { "when": { "format": "pe" },    "params": ["x"], "replacement": "__builtin_stdc_first_leading_one_ui(x)" },
+        { "when": { "format": "elf" },   "params": ["x"], "replacement": "__builtin_stdc_first_leading_one_ull(x)" },
+        { "when": { "format": "macho" }, "params": ["x"], "replacement": "__builtin_stdc_first_leading_one_ull(x)" }
+    ] },
+    { "name": "stdc_first_leading_one", "params": ["x"], "replacement": "_Generic((x), unsigned char: __builtin_stdc_first_leading_one_uc(x), unsigned short: __builtin_stdc_first_leading_one_us(x), unsigned int: __builtin_stdc_first_leading_one_ui(x), unsigned long long: __builtin_stdc_first_leading_one_ull(x))" },
+    { "name": "stdc_first_trailing_zero_uc", "params": ["x"], "replacement": "__builtin_stdc_first_trailing_zero_uc(x)" },
+    { "name": "stdc_first_trailing_zero_us", "params": ["x"], "replacement": "__builtin_stdc_first_trailing_zero_us(x)" },
+    { "name": "stdc_first_trailing_zero_ui", "params": ["x"], "replacement": "__builtin_stdc_first_trailing_zero_ui(x)" },
+    { "name": "stdc_first_trailing_zero_ull", "params": ["x"], "replacement": "__builtin_stdc_first_trailing_zero_ull(x)" },
+    { "name": "stdc_first_trailing_zero_ul", "variants": [
+        { "when": { "format": "pe" },    "params": ["x"], "replacement": "__builtin_stdc_first_trailing_zero_ui(x)" },
+        { "when": { "format": "elf" },   "params": ["x"], "replacement": "__builtin_stdc_first_trailing_zero_ull(x)" },
+        { "when": { "format": "macho" }, "params": ["x"], "replacement": "__builtin_stdc_first_trailing_zero_ull(x)" }
+    ] },
+    { "name": "stdc_first_trailing_zero", "params": ["x"], "replacement": "_Generic((x), unsigned char: __builtin_stdc_first_trailing_zero_uc(x), unsigned short: __builtin_stdc_first_trailing_zero_us(x), unsigned int: __builtin_stdc_first_trailing_zero_ui(x), unsigned long long: __builtin_stdc_first_trailing_zero_ull(x))" },
+    { "name": "stdc_first_trailing_one_uc", "params": ["x"], "replacement": "__builtin_stdc_first_trailing_one_uc(x)" },
+    { "name": "stdc_first_trailing_one_us", "params": ["x"], "replacement": "__builtin_stdc_first_trailing_one_us(x)" },
+    { "name": "stdc_first_trailing_one_ui", "params": ["x"], "replacement": "__builtin_stdc_first_trailing_one_ui(x)" },
+    { "name": "stdc_first_trailing_one_ull", "params": ["x"], "replacement": "__builtin_stdc_first_trailing_one_ull(x)" },
+    { "name": "stdc_first_trailing_one_ul", "variants": [
+        { "when": { "format": "pe" },    "params": ["x"], "replacement": "__builtin_stdc_first_trailing_one_ui(x)" },
+        { "when": { "format": "elf" },   "params": ["x"], "replacement": "__builtin_stdc_first_trailing_one_ull(x)" },
+        { "when": { "format": "macho" }, "params": ["x"], "replacement": "__builtin_stdc_first_trailing_one_ull(x)" }
+    ] },
+    { "name": "stdc_first_trailing_one", "params": ["x"], "replacement": "_Generic((x), unsigned char: __builtin_stdc_first_trailing_one_uc(x), unsigned short: __builtin_stdc_first_trailing_one_us(x), unsigned int: __builtin_stdc_first_trailing_one_ui(x), unsigned long long: __builtin_stdc_first_trailing_one_ull(x))" },
+    { "name": "stdc_count_zeros_uc", "params": ["x"], "replacement": "__builtin_stdc_count_zeros_uc(x)" },
+    { "name": "stdc_count_zeros_us", "params": ["x"], "replacement": "__builtin_stdc_count_zeros_us(x)" },
+    { "name": "stdc_count_zeros_ui", "params": ["x"], "replacement": "__builtin_stdc_count_zeros_ui(x)" },
+    { "name": "stdc_count_zeros_ull", "params": ["x"], "replacement": "__builtin_stdc_count_zeros_ull(x)" },
+    { "name": "stdc_count_zeros_ul", "variants": [
+        { "when": { "format": "pe" },    "params": ["x"], "replacement": "__builtin_stdc_count_zeros_ui(x)" },
+        { "when": { "format": "elf" },   "params": ["x"], "replacement": "__builtin_stdc_count_zeros_ull(x)" },
+        { "when": { "format": "macho" }, "params": ["x"], "replacement": "__builtin_stdc_count_zeros_ull(x)" }
+    ] },
+    { "name": "stdc_count_zeros", "params": ["x"], "replacement": "_Generic((x), unsigned char: __builtin_stdc_count_zeros_uc(x), unsigned short: __builtin_stdc_count_zeros_us(x), unsigned int: __builtin_stdc_count_zeros_ui(x), unsigned long long: __builtin_stdc_count_zeros_ull(x))" },
+    { "name": "stdc_count_ones_uc", "params": ["x"], "replacement": "__builtin_stdc_count_ones_uc(x)" },
+    { "name": "stdc_count_ones_us", "params": ["x"], "replacement": "__builtin_stdc_count_ones_us(x)" },
+    { "name": "stdc_count_ones_ui", "params": ["x"], "replacement": "__builtin_stdc_count_ones_ui(x)" },
+    { "name": "stdc_count_ones_ull", "params": ["x"], "replacement": "__builtin_stdc_count_ones_ull(x)" },
+    { "name": "stdc_count_ones_ul", "variants": [
+        { "when": { "format": "pe" },    "params": ["x"], "replacement": "__builtin_stdc_count_ones_ui(x)" },
+        { "when": { "format": "elf" },   "params": ["x"], "replacement": "__builtin_stdc_count_ones_ull(x)" },
+        { "when": { "format": "macho" }, "params": ["x"], "replacement": "__builtin_stdc_count_ones_ull(x)" }
+    ] },
+    { "name": "stdc_count_ones", "params": ["x"], "replacement": "_Generic((x), unsigned char: __builtin_stdc_count_ones_uc(x), unsigned short: __builtin_stdc_count_ones_us(x), unsigned int: __builtin_stdc_count_ones_ui(x), unsigned long long: __builtin_stdc_count_ones_ull(x))" },
+    { "name": "stdc_has_single_bit_uc", "params": ["x"], "replacement": "__builtin_stdc_has_single_bit_uc(x)" },
+    { "name": "stdc_has_single_bit_us", "params": ["x"], "replacement": "__builtin_stdc_has_single_bit_us(x)" },
+    { "name": "stdc_has_single_bit_ui", "params": ["x"], "replacement": "__builtin_stdc_has_single_bit_ui(x)" },
+    { "name": "stdc_has_single_bit_ull", "params": ["x"], "replacement": "__builtin_stdc_has_single_bit_ull(x)" },
+    { "name": "stdc_has_single_bit_ul", "variants": [
+        { "when": { "format": "pe" },    "params": ["x"], "replacement": "__builtin_stdc_has_single_bit_ui(x)" },
+        { "when": { "format": "elf" },   "params": ["x"], "replacement": "__builtin_stdc_has_single_bit_ull(x)" },
+        { "when": { "format": "macho" }, "params": ["x"], "replacement": "__builtin_stdc_has_single_bit_ull(x)" }
+    ] },
+    { "name": "stdc_has_single_bit", "params": ["x"], "replacement": "_Generic((x), unsigned char: __builtin_stdc_has_single_bit_uc(x), unsigned short: __builtin_stdc_has_single_bit_us(x), unsigned int: __builtin_stdc_has_single_bit_ui(x), unsigned long long: __builtin_stdc_has_single_bit_ull(x))" },
+    { "name": "stdc_bit_width_uc", "params": ["x"], "replacement": "__builtin_stdc_bit_width_uc(x)" },
+    { "name": "stdc_bit_width_us", "params": ["x"], "replacement": "__builtin_stdc_bit_width_us(x)" },
+    { "name": "stdc_bit_width_ui", "params": ["x"], "replacement": "__builtin_stdc_bit_width_ui(x)" },
+    { "name": "stdc_bit_width_ull", "params": ["x"], "replacement": "__builtin_stdc_bit_width_ull(x)" },
+    { "name": "stdc_bit_width_ul", "variants": [
+        { "when": { "format": "pe" },    "params": ["x"], "replacement": "__builtin_stdc_bit_width_ui(x)" },
+        { "when": { "format": "elf" },   "params": ["x"], "replacement": "__builtin_stdc_bit_width_ull(x)" },
+        { "when": { "format": "macho" }, "params": ["x"], "replacement": "__builtin_stdc_bit_width_ull(x)" }
+    ] },
+    { "name": "stdc_bit_width", "params": ["x"], "replacement": "_Generic((x), unsigned char: __builtin_stdc_bit_width_uc(x), unsigned short: __builtin_stdc_bit_width_us(x), unsigned int: __builtin_stdc_bit_width_ui(x), unsigned long long: __builtin_stdc_bit_width_ull(x))" },
+    { "name": "stdc_bit_floor_uc", "params": ["x"], "replacement": "__builtin_stdc_bit_floor_uc(x)" },
+    { "name": "stdc_bit_floor_us", "params": ["x"], "replacement": "__builtin_stdc_bit_floor_us(x)" },
+    { "name": "stdc_bit_floor_ui", "params": ["x"], "replacement": "__builtin_stdc_bit_floor_ui(x)" },
+    { "name": "stdc_bit_floor_ull", "params": ["x"], "replacement": "__builtin_stdc_bit_floor_ull(x)" },
+    { "name": "stdc_bit_floor_ul", "variants": [
+        { "when": { "format": "pe" },    "params": ["x"], "replacement": "__builtin_stdc_bit_floor_ui(x)" },
+        { "when": { "format": "elf" },   "params": ["x"], "replacement": "__builtin_stdc_bit_floor_ull(x)" },
+        { "when": { "format": "macho" }, "params": ["x"], "replacement": "__builtin_stdc_bit_floor_ull(x)" }
+    ] },
+    { "name": "stdc_bit_floor", "params": ["x"], "replacement": "_Generic((x), unsigned char: __builtin_stdc_bit_floor_uc(x), unsigned short: __builtin_stdc_bit_floor_us(x), unsigned int: __builtin_stdc_bit_floor_ui(x), unsigned long long: __builtin_stdc_bit_floor_ull(x))" },
+    { "name": "stdc_bit_ceil_uc", "params": ["x"], "replacement": "__builtin_stdc_bit_ceil_uc(x)" },
+    { "name": "stdc_bit_ceil_us", "params": ["x"], "replacement": "__builtin_stdc_bit_ceil_us(x)" },
+    { "name": "stdc_bit_ceil_ui", "params": ["x"], "replacement": "__builtin_stdc_bit_ceil_ui(x)" },
+    { "name": "stdc_bit_ceil_ull", "params": ["x"], "replacement": "__builtin_stdc_bit_ceil_ull(x)" },
+    { "name": "stdc_bit_ceil_ul", "variants": [
+        { "when": { "format": "pe" },    "params": ["x"], "replacement": "__builtin_stdc_bit_ceil_ui(x)" },
+        { "when": { "format": "elf" },   "params": ["x"], "replacement": "__builtin_stdc_bit_ceil_ull(x)" },
+        { "when": { "format": "macho" }, "params": ["x"], "replacement": "__builtin_stdc_bit_ceil_ull(x)" }
+    ] },
+    { "name": "stdc_bit_ceil", "params": ["x"], "replacement": "_Generic((x), unsigned char: __builtin_stdc_bit_ceil_uc(x), unsigned short: __builtin_stdc_bit_ceil_us(x), unsigned int: __builtin_stdc_bit_ceil_ui(x), unsigned long long: __builtin_stdc_bit_ceil_ull(x))" },
+    { "name": "__STDC_VERSION_STDBIT_H__", "replacement": "202311L" },
+    { "name": "__STDC_ENDIAN_LITTLE__", "replacement": "1234" },
+    { "name": "__STDC_ENDIAN_BIG__", "replacement": "4321" },
+    { "name": "__STDC_ENDIAN_NATIVE__", "replacement": "1234" }
+  ]
+}

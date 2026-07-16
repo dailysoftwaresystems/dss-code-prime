@@ -438,3 +438,37 @@ TEST(TypeRules, UsualArithmeticCommonTypeBitInt) {
     off.minRank = TypeKind::I32;
     EXPECT_FALSE(usualArithmeticCommonType(in, b20s, b40s, off).valid());
 }
+
+// C99 _Complex (D-CSUBSET-COMPLEX §6.3.1.8 / design test #7): the usual arithmetic
+// conversions when EITHER operand is complex — the result is complex over the WIDER
+// float element; a REAL float operand contributes its own rank as the element; a
+// real INTEGER operand takes the complex's element. Both operand orders pinned (the
+// arm keys on `ka == Complex || kb == Complex`, so order must not matter).
+TEST(TypeRules, UsualArithmeticCommonTypeComplex) {
+    auto in = makeInterner();
+    ResolvedArithmeticRules rules;
+    rules.minRank = TypeKind::I32;
+    auto UAC = [&](TypeId a, TypeId b) {
+        return usualArithmeticCommonType(in, a, b, rules);
+    };
+    auto const f32  = in.primitive(TypeKind::F32);
+    auto const f64  = in.primitive(TypeKind::F64);
+    auto const i32  = in.primitive(TypeKind::I32);
+    auto const cf32 = in.complex(f32);
+    auto const cf64 = in.complex(f64);
+    // complex(F32) + double → complex(F64): the REAL's rank wins the element
+    // (the rea>=reb wider-element branch). BOTH orders.
+    EXPECT_EQ(UAC(cf32, f64).v, cf64.v);
+    EXPECT_EQ(UAC(f64, cf32).v, cf64.v);
+    // complex(F64) + complex(F64) → complex(F64) (identity).
+    EXPECT_EQ(UAC(cf64, cf64).v, cf64.v);
+    // complex(F32) + complex(F64) → complex(F64) (wider element). BOTH orders.
+    EXPECT_EQ(UAC(cf32, cf64).v, cf64.v);
+    EXPECT_EQ(UAC(cf64, cf32).v, cf64.v);
+    // complex + INTEGER → the complex unchanged (the int converts to the element;
+    // it contributes NO float rank). BOTH orders, both elements.
+    EXPECT_EQ(UAC(cf64, i32).v, cf64.v);
+    EXPECT_EQ(UAC(i32, cf32).v, cf32.v);
+    // float + float stays REAL (the complex arm must not over-fire).
+    EXPECT_EQ(UAC(f32, f64).v, f64.v);
+}

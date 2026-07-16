@@ -84,6 +84,9 @@ struct Lowerer {
     HirVolatileMap const*    volatileMap; // optional — per-ACCESS volatility (c21,
                                            // D-CSUBSET-VOLATILE-QUALIFIER). nullptr /
                                            // no entry ⇒ plain (non-volatile) access.
+    HirReturnsTwiceMap const* returnsTwiceMap; // optional — per-CALL returns-twice
+                                           // (FC17.9(c), D-CSUBSET-SETJMP). nullptr /
+                                           // no entry ⇒ ordinary call (no flag).
     HirAlignmentMap const*   alignmentMap; // optional — per-DECLARATION explicit
                                            // `alignas` (D-CSUBSET-ALIGNAS-VARIABLE-
                                            // CODEGEN). nullptr / no entry ⇒ natural.
@@ -467,6 +470,22 @@ struct Lowerer {
         return MirInstFlags::None;
     }
 
+    // FC17.9(c) (D-CSUBSET-SETJMP): the returns-twice funnel — the EXACT twin of
+    // `volatileFlagFor`. Returns `MirInstFlags::ReturnsTwice` iff `callNode` carries a
+    // ReturnsTwiceAttr (set by CST→HIR when the Call's direct callee record is
+    // `SymbolRecord.returnsTwice` — a `setjmp`/`_setjmp`), else `None`. The Call-lowering
+    // chokepoint (`finishCall`) passes its HIR node through here so the flag's coverage
+    // is by-construction at one site. nullptr map / no entry ⇒ an ordinary call the
+    // optimizer may freely transform (promote locals across it, inline its callee).
+    [[nodiscard]] MirInstFlags returnsTwiceFlagFor(HirNodeId callNode) const {
+        if (returnsTwiceMap == nullptr || !callNode.valid())
+            return MirInstFlags::None;
+        if (auto const* p = returnsTwiceMap->tryGet(callNode);
+            p != nullptr && p->returnsTwice)
+            return MirInstFlags::ReturnsTwice;
+        return MirInstFlags::None;
+    }
+
     // c27 (D-CSUBSET-VOLATILE-POINTEE): the TYPE-derived half of the access-
     // volatility funnel. A Load/Store whose ACCESSED type (the thing read/written
     // — the pointee for a deref/index, the field for a member, the value for a
@@ -483,6 +502,74 @@ struct Lowerer {
                                                         : MirInstFlags::None;
     }
 
+    // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the C11 memory_order carried in an
+    // AtomicLoad/AtomicStore `payload` (relaxed=0..seq_cst=5). A plain `_Atomic`
+    // access is seq_cst — the strongest, default order (C11 6.5.2.4/7.17.3).
+    static constexpr std::uint32_t kAtomicOrderSeqCst = 5;
+
+    // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the SINGLE scalar-access chokepoint
+    // that decides atomic-vs-plain. Every scalar Load emit routes through here so
+    // an `_Atomic`-qualified access lowers to `AtomicLoad` (seq_cst) BY
+    // CONSTRUCTION, and a plain access keeps the EXACT c21|c27 volatile-flag
+    // expression it always used. `accessedTy` is the value type read (the Load's
+    // result type); `node` is the HIR access node (drives the c21 object-volatile
+    // flag). A missed funnel site is caught LOUD by the MIR verifier's atomic belt
+    // (I_AtomicAccessNotLowered) — never a silent non-atomic access.
+    [[nodiscard]] MirInstId emitScalarLoad(std::span<MirInstId const> ptrOps,
+                                           TypeId accessedTy, HirNodeId node) {
+        if (interner.isAtomicQualified(accessedTy)) {
+            // `_Atomic` (incl. `_Atomic volatile`): AtomicLoad ALONE — its
+            // hasSideEffects + opcodeClobbersMemory membership subsume volatile's
+            // no-elide / no-CSE / no-hoist, so no Volatile flag is threaded.
+            return mir.addInst(MirOpcode::AtomicLoad, ptrOps, accessedTy,
+                               /*payload=*/kAtomicOrderSeqCst, MirInstFlags::None);
+        }
+        return mir.addInst(MirOpcode::Load, ptrOps, accessedTy, /*payload=*/0,
+                           volatileFlagFor(node) | volatileFlagForType(accessedTy));
+    }
+
+    // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the Store twin of `emitScalarLoad`.
+    // `storeOps` is the plain-Store operand pair {value, ptr} (AtomicStore reuses
+    // that exact order — a drop-in). `accessedTy` is the lvalue's type (the store
+    // target's declared/pointee type); `node` is the target HIR node. An `_Atomic`
+    // target lowers to `AtomicStore` (seq_cst); a plain target keeps the exact
+    // c21|c27 volatile flag. NOTE: object INITIALIZATION stores (C11 7.17.2.1 —
+    // init is not itself atomic) do NOT route here; they stay plain `Store` and are
+    // marked `AtomicInitExempt` so the verifier belt spares them.
+    void emitScalarStore(std::span<MirInstId const> storeOps, TypeId accessedTy,
+                         HirNodeId node) {
+        if (interner.isAtomicQualified(accessedTy)) {
+            mir.addInst(MirOpcode::AtomicStore, storeOps, InvalidType,
+                        /*payload=*/kAtomicOrderSeqCst, MirInstFlags::None);
+            return;
+        }
+        mir.addInst(MirOpcode::Store, storeOps, InvalidType, /*payload=*/0,
+                    volatileFlagFor(node) | volatileFlagForType(accessedTy));
+    }
+
+    // FC17.9(d) atomic cycle-1 Phase D (D-CSUBSET-ATOMIC): fold an
+    // `atomic_load_explicit`/`atomic_store_explicit` memory_order argument to a
+    // compile-time 0..5 for the AtomicLoad/AtomicStore `payload`. A shipped
+    // `memory_order_*` constant folds to a literal at cst_to_hir (constant_symbol_fold),
+    // so a DEFAULT const-eval env resolves it (no symbol resolver needed). M3: a
+    // NON-constant (runtime) or out-of-range order → the safe seq_cst (5) fallback —
+    // over-fencing is C11-legal and strictly more permissive, so this is CORRECT (not a
+    // silent miscompile), NOT fail-loud (a runtime order value is legal C11).
+    [[nodiscard]] std::uint32_t foldAtomicOrder(HirNodeId orderNode) {
+        ConstEvalResult const r =
+            evaluateConstant(hir, interner, literals, orderNode);
+        std::int64_t v = -1;
+        if (r.value.has_value()) {
+            if (std::holds_alternative<std::int64_t>(r.value->value))
+                v = std::get<std::int64_t>(r.value->value);
+            else if (std::holds_alternative<std::uint64_t>(r.value->value))
+                v = static_cast<std::int64_t>(
+                    std::get<std::uint64_t>(r.value->value));
+        }
+        if (v < 0 || v > 5) return kAtomicOrderSeqCst;   // M3 seq_cst fallback
+        return static_cast<std::uint32_t>(v);
+    }
+
     // Map a HIR core operator + operand TypeKind to a MIR opcode. Integer
     // signed/unsigned is type-driven (HirOpKind has only `Div`/`Rem`/`Shr`,
     // not separate signed/unsigned forms — same convention as type_lattice).
@@ -491,7 +578,8 @@ struct Lowerer {
     // diagnose with the actual HirOpKind name.
     [[nodiscard]] static MirOpcode mapBinaryOp(HirOpKind op, TypeKind tk) noexcept {
         bool const isFloat = (tk == TypeKind::F16 || tk == TypeKind::F32
-                           || tk == TypeKind::F64 || tk == TypeKind::F128);
+                           || tk == TypeKind::F64 || tk == TypeKind::F80
+                           || tk == TypeKind::F128);
         bool const isSigned = (tk == TypeKind::I8 || tk == TypeKind::I16
                             || tk == TypeKind::I32 || tk == TypeKind::I64
                             || tk == TypeKind::I128);
@@ -577,7 +665,8 @@ struct Lowerer {
         };
         auto isFloat = [](TypeKind k) noexcept {
             return k == TypeKind::F16 || k == TypeKind::F32
-                || k == TypeKind::F64 || k == TypeKind::F128;
+                || k == TypeKind::F64 || k == TypeKind::F80
+                || k == TypeKind::F128;
         };
         auto bitWidth = [](TypeKind k) noexcept -> int {
             switch (k) {
@@ -586,6 +675,10 @@ struct Lowerer {
                 case TypeKind::I16:  case TypeKind::U16: case TypeKind::F16: return 16;
                 case TypeKind::I32:  case TypeKind::U32: case TypeKind::F32: return 32;
                 case TypeKind::I64:  case TypeKind::U64: case TypeKind::F64: return 64;
+                // F80 sits BETWEEN F64 and F128 so float<->float conversion
+                // direction (FPTrunc vs FPExt) is width-ordered; the resulting
+                // op walls loud at MIR->LIR (D-CSUBSET-LONG-DOUBLE).
+                case TypeKind::F80:  return 80;
                 case TypeKind::I128: case TypeKind::U128: case TypeKind::F128: return 128;
                 default: return 0;
             }
@@ -785,7 +878,7 @@ struct Lowerer {
     // FP<->limbs path is a later cycle; the naive scalar path would drop the upper limbs.
     [[nodiscard]] static bool isFloatingKind(TypeKind k) noexcept {
         return k == TypeKind::F16 || k == TypeKind::F32
-            || k == TypeKind::F64 || k == TypeKind::F128;
+            || k == TypeKind::F64 || k == TypeKind::F80 || k == TypeKind::F128;
     }
 
     // ceil(N/64) — the limb count of a wide `_BitInt(N)`.
@@ -1679,6 +1772,273 @@ struct Lowerer {
         return ok ? dst : InvalidMirInst;
     }
 
+    // ── C99 _Complex (D-CSUBSET-COMPLEX): materialize a complex RVALUE into a fresh
+    // slot, return its ADDRESS — the by-address contract, mirroring
+    // materializeWideBinaryOp EXACTLY. A complex is memory-resident {re@0, im@es},
+    // so a complex-typed arithmetic / cast / construct result has NO SSA value.
+    // lowerLvalueAddressNode routes a complex BinaryOp/UnaryOp/Cast here; the request
+    // value->address flip delivers complex OPERANDS as addresses. Componentwise
+    // F32/F64 ops pass the LIR encoded-width gate; an F80/F128 component (a long-
+    // double-complex) walls loud at requireEncodedFloatWidth — the existing long-
+    // double arithmetic deferral, NO new wall.
+
+    // The element float type + its byte size (== the imag component offset) of a
+    // complex, or nullopt (caller fail-louds). `elementStride` sizes the scalar
+    // element via computeLayout's scalar early-return.
+    struct ComplexParts { TypeId elemTy; std::int64_t elemSize; };
+    [[nodiscard]] std::optional<ComplexParts> complexParts(TypeId complexTy) {
+        if (!isComplex(interner, complexTy)) return std::nullopt;
+        TypeId const elem = interner.complexElement(complexTy);
+        auto const es = elementStride(elem);
+        if (!es.has_value() || *es == 0) return std::nullopt;
+        return ComplexParts{elem, static_cast<std::int64_t>(*es)};
+    }
+    // &slot + byteOffset, typed Ptr<elemTy> — a complex component pointer.
+    [[nodiscard]] MirInstId complexCompAddr(MirInstId slot, std::int64_t byteOff,
+                                            TypeId elemTy) {
+        std::array<MirInstId, 2> g{slot, ci64(byteOff)};
+        return mir.addInst(MirOpcode::Gep, g, interner.pointer(elemTy));
+    }
+    [[nodiscard]] MirInstId loadComponent(MirInstId compAddr, TypeId elemTy) {
+        std::array<MirInstId, 1> a{compAddr};
+        return mir.addInst(MirOpcode::Load, a, elemTy);
+    }
+    void storeComponent(MirInstId value, MirInstId compAddr) {
+        std::array<MirInstId, 2> a{value, compAddr};
+        mir.addInst(MirOpcode::Store, a, InvalidType);
+    }
+    // A binary float op on the element type (FAdd/FSub/FMul/FDiv).
+    [[nodiscard]] MirInstId fBinOp(MirOpcode op, MirInstId a, MirInstId b, TypeId e) {
+        std::array<MirInstId, 2> ops{a, b};
+        return mir.addInst(op, ops, e);
+    }
+    // Load (re, im) of the complex at `addr` (element-typed).
+    [[nodiscard]] bool loadComplex(MirInstId addr, ComplexParts const& cp,
+                                   MirInstId& re, MirInstId& im) {
+        re = loadComponent(complexCompAddr(addr, 0, cp.elemTy), cp.elemTy);
+        im = loadComponent(complexCompAddr(addr, cp.elemSize, cp.elemTy), cp.elemTy);
+        return re.valid() && im.valid();
+    }
+    // Store (re, im) into the slot at `dst`.
+    void storeComplex(MirInstId dst, ComplexParts const& cp, MirInstId re, MirInstId im) {
+        storeComponent(re, complexCompAddr(dst, 0, cp.elemTy));
+        storeComponent(im, complexCompAddr(dst, cp.elemSize, cp.elemTy));
+    }
+    // A float constant of the element type — the real->complex construct's imag 0.0.
+    // MUST be promoted to an anonymous rodata global (GlobalAddr + Load), NOT a bare
+    // MIR Const: register machines have no float-immediate form and the LirLiteralPool
+    // has no float encoder path (a bare float Const walls at MIR->LIR — FC2 Part B).
+    // Mirrors the body-float-literal promotion (lowerExprNode Literal arm). F16/F80/
+    // F128 fall through to a bare Const → the LIR width guard walls loud (the long-
+    // double-complex arithmetic deferral, the SAME posture as a source F80 literal).
+    [[nodiscard]] MirInstId elementFloatConst(double value, TypeId elemTy) {
+        TypeKind const ek = interner.kind(elemTy);
+        if (ek == TypeKind::F64 || ek == TypeKind::F32) {
+            SymbolId const sym = mintSyntheticGlobalSymbol();
+            if (!sym.valid()) return InvalidMirInst;
+            MirLiteralValue lit;
+            lit.value = value;
+            lit.core  = ek;
+            std::uint32_t const mirLitIdx = mir.literalPoolAdd(std::move(lit));
+            (void)mir.addGlobal(elemTy, sym, mirLitIdx, MirFuncId{},
+                                SymbolBinding::Global, SymbolVisibility::Default,
+                                /*isConst=*/false, MirThreadStorage::Shared);
+            TypeId const ptrTy = interner.pointer(elemTy);
+            MirInstId const addr = mir.addGlobalAddr(sym, ptrTy);
+            std::array<MirInstId, 1> ops{addr};
+            return mir.addInst(MirOpcode::Load, ops, elemTy);
+        }
+        MirLiteralValue lit;
+        lit.value = value;
+        lit.core  = ek;
+        return mir.addConst(std::move(lit), elemTy);
+    }
+    [[nodiscard]] MirInstId elementZero(TypeId elemTy) {
+        return elementFloatConst(0.0, elemTy);
+    }
+    // Convert a scalar value from `fromTy` to `toTy` (float<->float, int->float),
+    // or return it unchanged when the kinds already match. Fails loud on a pair with
+    // no MIR cast opcode. (An F80/F128 element convert emits the FPExt/FPTrunc; the
+    // component op then walls at the LIR encoded-width gate — the long-double defer.)
+    [[nodiscard]] MirInstId convertScalar(MirInstId v, TypeId fromTy, TypeId toTy,
+                                          HirNodeId node) {
+        TypeKind const fk = fromTy.valid() ? resolveScalarIntKind(fromTy) : TypeKind::Void;
+        TypeKind const tk = toTy.valid()   ? interner.kind(toTy)          : TypeKind::Void;
+        if (fk == tk) return v;
+        MirOpcode const cop = mapCast(fk, tk);
+        if (cop == MirOpcode::Invalid) {
+            unsupported(node, std::format(
+                "complex component conversion from TypeKind {} to {} has no MIR "
+                "opcode (D-CSUBSET-COMPLEX)",
+                static_cast<unsigned>(fk), static_cast<unsigned>(tk)));
+            return InvalidMirInst;
+        }
+        std::array<MirInstId, 1> a{v};
+        return mir.addInst(cop, a, toTy);
+    }
+
+    [[nodiscard]] MirInstId materializeComplexBinaryOp(HirNodeId node) {
+        TypeId const t = hir.typeId(node);
+        HirOpKind const op = decodeCoreOp(hir.payload(node));
+        auto kids = hir.children(node);
+        if (kids.size() != 2) {
+            unsupported(node, "malformed complex BinaryOp (expect 2 children)");
+            return InvalidMirInst;
+        }
+        auto const cp = complexParts(t);
+        if (!cp.has_value()) {
+            unsupported(node, "complex result requires a sizeable element layout");
+            return InvalidMirInst;
+        }
+        // Both operands are complex-by-address: the coerce arm (CRITICAL-3) promoted a
+        // real operand to complex(v, 0), and the request flip delivered them as
+        // addresses (a nested complex arithmetic operand materializes its own slot).
+        MirInstId const aAddr = lowerLvalueAddress(kids[0]);
+        if (!aAddr.valid()) return InvalidMirInst;
+        MirInstId const bAddr = lowerLvalueAddress(kids[1]);
+        if (!bAddr.valid()) return InvalidMirInst;
+        MirInstId const dst = freshAggregateTemp(t);
+        if (!dst.valid()) {
+            unsupported(node, "complex result requires a sizeable layout");
+            return InvalidMirInst;
+        }
+        MirInstId ar = InvalidMirInst, ai = InvalidMirInst;
+        MirInstId br = InvalidMirInst, bi = InvalidMirInst;
+        if (!loadComplex(aAddr, *cp, ar, ai)) return InvalidMirInst;
+        if (!loadComplex(bAddr, *cp, br, bi)) return InvalidMirInst;
+        TypeId const e = cp->elemTy;
+        MirInstId rr = InvalidMirInst, ri = InvalidMirInst;
+        switch (op) {
+            case HirOpKind::Add:
+                rr = fBinOp(MirOpcode::FAdd, ar, br, e);
+                ri = fBinOp(MirOpcode::FAdd, ai, bi, e);
+                break;
+            case HirOpKind::Sub:
+                rr = fBinOp(MirOpcode::FSub, ar, br, e);
+                ri = fBinOp(MirOpcode::FSub, ai, bi, e);
+                break;
+            case HirOpKind::Mul: {
+                // (a+bi)(c+di) = (ac - bd) + (ad + bc)i — 4 FMul + FSub + FAdd.
+                MirInstId const ac = fBinOp(MirOpcode::FMul, ar, br, e);
+                MirInstId const bd = fBinOp(MirOpcode::FMul, ai, bi, e);
+                MirInstId const ad = fBinOp(MirOpcode::FMul, ar, bi, e);
+                MirInstId const bc = fBinOp(MirOpcode::FMul, ai, br, e);
+                rr = fBinOp(MirOpcode::FSub, ac, bd, e);
+                ri = fBinOp(MirOpcode::FAdd, ad, bc, e);
+                break;
+            }
+            case HirOpKind::Div: {
+                // (a+bi)/(c+di) = [(ac+bd) + (bc-ad)i] / (c^2 + d^2) — the BASIC
+                // algebraic formula; Annex-G infinity/NaN recovery is deferred
+                // (D-CSUBSET-COMPLEX-ANNEX-G).
+                MirInstId const ac = fBinOp(MirOpcode::FMul, ar, br, e);
+                MirInstId const bd = fBinOp(MirOpcode::FMul, ai, bi, e);
+                MirInstId const bc = fBinOp(MirOpcode::FMul, ai, br, e);
+                MirInstId const ad = fBinOp(MirOpcode::FMul, ar, bi, e);
+                MirInstId const cc = fBinOp(MirOpcode::FMul, br, br, e);
+                MirInstId const dd = fBinOp(MirOpcode::FMul, bi, bi, e);
+                MirInstId const denom = fBinOp(MirOpcode::FAdd, cc, dd, e);
+                MirInstId const numR  = fBinOp(MirOpcode::FAdd, ac, bd, e);
+                MirInstId const numI  = fBinOp(MirOpcode::FSub, bc, ad, e);
+                rr = fBinOp(MirOpcode::FDiv, numR, denom, e);
+                ri = fBinOp(MirOpcode::FDiv, numI, denom, e);
+                break;
+            }
+            default:
+                unsupported(node, std::format(
+                    "BinaryOp '{}' producing a complex is not supported (only "
+                    "+ - * / — D-CSUBSET-COMPLEX)", opName(op)));
+                return InvalidMirInst;
+        }
+        if (!rr.valid() || !ri.valid()) return InvalidMirInst;
+        storeComplex(dst, *cp, rr, ri);
+        return dst;
+    }
+
+    [[nodiscard]] MirInstId materializeComplexUnaryOp(HirNodeId node) {
+        TypeId const t = hir.typeId(node);
+        HirOpKind const op = decodeCoreOp(hir.payload(node));
+        auto kids = hir.children(node);
+        if (kids.size() != 1) {
+            unsupported(node, "malformed complex UnaryOp (expect 1 child)");
+            return InvalidMirInst;
+        }
+        auto const cp = complexParts(t);
+        if (!cp.has_value()) {
+            unsupported(node, "complex result requires a sizeable element layout");
+            return InvalidMirInst;
+        }
+        MirInstId const aAddr = lowerLvalueAddress(kids[0]);
+        if (!aAddr.valid()) return InvalidMirInst;
+        MirInstId const dst = freshAggregateTemp(t);
+        if (!dst.valid()) {
+            unsupported(node, "complex result requires a sizeable layout");
+            return InvalidMirInst;
+        }
+        MirInstId ar = InvalidMirInst, ai = InvalidMirInst;
+        if (!loadComplex(aAddr, *cp, ar, ai)) return InvalidMirInst;
+        TypeId const e = cp->elemTy;
+        switch (op) {
+            case HirOpKind::Neg: {
+                // -(a+bi) = (-a) + (-b)i
+                std::array<MirInstId, 1> na{ar};
+                std::array<MirInstId, 1> nb{ai};
+                MirInstId const nr = mir.addInst(MirOpcode::FNeg, na, e);
+                MirInstId const ni = mir.addInst(MirOpcode::FNeg, nb, e);
+                storeComplex(dst, *cp, nr, ni);
+                return dst;
+            }
+            default:
+                unsupported(node, std::format(
+                    "UnaryOp '{}' producing a complex is not supported (only "
+                    "unary - — D-CSUBSET-COMPLEX)", opName(op)));
+                return InvalidMirInst;
+        }
+    }
+
+    [[nodiscard]] MirInstId materializeComplexCast(HirNodeId node) {
+        TypeId const t = hir.typeId(node);   // complex target
+        auto kids = hir.children(node);
+        if (kids.size() != 1) {
+            unsupported(node, "malformed complex Cast (expect 1 child)");
+            return InvalidMirInst;
+        }
+        auto const cp = complexParts(t);
+        if (!cp.has_value()) {
+            unsupported(node, "complex result requires a sizeable element layout");
+            return InvalidMirInst;
+        }
+        MirInstId const dst = freshAggregateTemp(t);
+        if (!dst.valid()) {
+            unsupported(node, "complex result requires a sizeable layout");
+            return InvalidMirInst;
+        }
+        TypeId const srcTy = hir.typeId(kids[0]);
+        TypeId const e = cp->elemTy;
+        if (isComplex(interner, srcTy)) {
+            // complex -> complex: componentwise element convert (FPExt/FPTrunc/identity).
+            auto const scp = complexParts(srcTy);
+            if (!scp.has_value()) return InvalidMirInst;
+            MirInstId const srcAddr = lowerLvalueAddress(kids[0]);
+            if (!srcAddr.valid()) return InvalidMirInst;
+            MirInstId sr = InvalidMirInst, si = InvalidMirInst;
+            if (!loadComplex(srcAddr, *scp, sr, si)) return InvalidMirInst;
+            MirInstId const cr = convertScalar(sr, scp->elemTy, e, node);
+            MirInstId const ci = convertScalar(si, scp->elemTy, e, node);
+            if (!cr.valid() || !ci.valid()) return InvalidMirInst;
+            storeComplex(dst, *cp, cr, ci);
+            return dst;
+        }
+        // real -> complex: construct (elemConvert(v), 0) — the promotion the coerce
+        // arm (CRITICAL-3) and an explicit `(double _Complex)x` cast both build.
+        MirInstId const srcVal = lowerExpr(kids[0]);
+        if (!srcVal.valid()) return InvalidMirInst;
+        MirInstId const re = convertScalar(srcVal, srcTy, e, node);
+        if (!re.valid()) return InvalidMirInst;
+        storeComplex(dst, *cp, re, elementZero(e));
+        return dst;
+    }
+
     // A `_BitInt` opcode is an integer comparison (result Bool, operands promoted).
     [[nodiscard]] static bool isIntCompareOpcode(MirOpcode op) noexcept {
         switch (op) {
@@ -1743,11 +2103,12 @@ struct Lowerer {
                 // `double` only; a typed-float pool arm is the
                 // D-LK4-RODATA-PRODUCER-EXOTIC-FLOAT successor's
                 // concern. Exactly-representable corpus values are
-                // unaffected.) F16/F128 fall through to `addConst`
+                // unaffected.) F16/F80/F128 fall through to `addConst`
                 // and fail loud at MIR→LIR
                 // (D-TARGET-ENCODING-WIDTH-GUARD — promoting them
                 // here would silently pair them with wrong-width
-                // load/arithmetic encodings).
+                // load/arithmetic encodings; F80/F128 joined the
+                // fall-through with D-CSUBSET-LONG-DOUBLE).
                 if (std::holds_alternative<double>(src.value)
                     && t.valid()
                     && (interner.kind(t) == TypeKind::F64
@@ -1946,9 +2307,9 @@ struct Lowerer {
                     // rvalue Load carries the flag. c21 via the node's VolatileAttr
                     // (object-volatile symbol); c27 also OR's the value type `t`
                     // (top-level VolatileQual) so the two halves agree by
-                    // construction.
-                    return mir.addInst(MirOpcode::Load, ops, t, /*payload=*/0,
-                                       volatileFlagFor(node) | volatileFlagForType(t));
+                    // construction. FC17.9(d): an `_Atomic` local's Load becomes
+                    // AtomicLoad via the scalar-access chokepoint.
+                    return emitScalarLoad(ops, t, node);
                 }
                 if (auto it = symbolToValue.find(sym); it != symbolToValue.end()) {
                     return it->second;
@@ -1996,9 +2357,9 @@ struct Lowerer {
                     std::array<MirInstId, 1> ops{addr};
                     // c21/c27: a Ref to a `volatile` global — its rvalue Load
                     // carries the flag (c21 VolatileAttr OR c27 value-type
-                    // VolatileQual).
-                    return mir.addInst(MirOpcode::Load, ops, t, /*payload=*/0,
-                                       volatileFlagFor(node) | volatileFlagForType(t));
+                    // VolatileQual). FC17.9(d): an `_Atomic` global's Load becomes
+                    // AtomicLoad via the scalar-access chokepoint.
+                    return emitScalarLoad(ops, t, node);
                 }
                 if (functionSymbols.contains(sym)) {
                     return mir.addGlobalAddr(SymbolId{sym}, t);
@@ -2104,6 +2465,50 @@ struct Lowerer {
                 switch (static_cast<BuiltinLowering>(hir.payload(node))) {
                     case BuiltinLowering::UMulHigh:
                         return mir.addInst(MirOpcode::UMulH, operands, t);
+                    // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 bit-count
+                    // primitives. `t` is the builtin's result type (I32, since GCC's
+                    // __builtin_popcount/clz/ctz all return `int`); the single
+                    // operand is U32 (…) / U64 (…ll) and the mir_to_lir lowering
+                    // reads the OPERAND's width via mir.instType(operand) to pick the
+                    // 32- vs 64-bit realization. The count (0..P, P≤64) has zero
+                    // upper bits, so it reads correctly at the I32 result with no
+                    // explicit Trunc (the ICmp→Bool narrowing precedent).
+                    case BuiltinLowering::Popcount:
+                        return mir.addInst(MirOpcode::Popcount, operands, t);
+                    case BuiltinLowering::Clz:
+                        return mir.addInst(MirOpcode::Clz, operands, t);
+                    case BuiltinLowering::Ctz:
+                        return mir.addInst(MirOpcode::Ctz, operands, t);
+                    // FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 stdc_* ops
+                    // COMPOSE the 3 primitives above + universal ALU verbs into the
+                    // N3096 §7.18 formula — one shared, width-correct, single-eval,
+                    // branchless emitter (emitStdbitOp) the 14 leaf lowerings route
+                    // through (NO new MIR op; the operand is bound ONCE in operands).
+                    case BuiltinLowering::StdcLeadingZeros:
+                    case BuiltinLowering::StdcLeadingOnes:
+                    case BuiltinLowering::StdcTrailingZeros:
+                    case BuiltinLowering::StdcTrailingOnes:
+                    case BuiltinLowering::StdcFirstLeadingZero:
+                    case BuiltinLowering::StdcFirstLeadingOne:
+                    case BuiltinLowering::StdcFirstTrailingZero:
+                    case BuiltinLowering::StdcFirstTrailingOne:
+                    case BuiltinLowering::StdcCountZeros:
+                    case BuiltinLowering::StdcCountOnes:
+                    case BuiltinLowering::StdcHasSingleBit:
+                    case BuiltinLowering::StdcBitWidth:
+                    case BuiltinLowering::StdcBitFloor:
+                    case BuiltinLowering::StdcBitCeil: {
+                        if (kids.size() != 1) {
+                            unsupported(node,
+                                "a stdc_* bit builtin expects exactly 1 argument");
+                            return InvalidMirInst;
+                        }
+                        // The operand's width is read from its coerced HIR type
+                        // (its builtin param core), not the MirBuilder value.
+                        return emitStdbitOp(
+                            static_cast<BuiltinLowering>(hir.payload(node)),
+                            operands[0], hir.typeId(kids[0]), node, t);
+                    }
                     case BuiltinLowering::AtomicCas: {
                         // c104: MIR AtomicCas is the UNIVERSAL CAS order
                         // [ptr, comparand(expected), newval(desired)] — the
@@ -2123,6 +2528,37 @@ struct Lowerer {
                         std::array<MirInstId, 3> const casOrder{
                             operands[0], operands[2], operands[1]};
                         return mir.addInst(MirOpcode::AtomicCas, casOrder, t);
+                    }
+                    case BuiltinLowering::AtomicLoad: {
+                        // FC17.9(d) (D-CSUBSET-ATOMIC): atomic_load_explicit(ptr, order)
+                        // → AtomicLoad([ptr], payload=order). The order arg (kids[1]) is
+                        // const-folded into the payload and DROPPED from the operands
+                        // (audit c); the lowered-but-unused order value is dead (DCE).
+                        if (operands.size() != 2) {
+                            unsupported(node,
+                                "atomic_load_explicit expects exactly 2 args");
+                            return InvalidMirInst;
+                        }
+                        std::array<MirInstId, 1> const ld{operands[0]};
+                        return mir.addInst(MirOpcode::AtomicLoad, ld, t,
+                                           foldAtomicOrder(kids[1]),
+                                           MirInstFlags::None);
+                    }
+                    case BuiltinLowering::AtomicStore: {
+                        // FC17.9(d) (D-CSUBSET-ATOMIC): atomic_store_explicit(ptr, val,
+                        // order) → AtomicStore([val, ptr], payload=order). Operands are
+                        // [value, ptr] (the plain-Store order the AtomicStore opcode
+                        // reuses — mind the swap: HIR arg0=ptr, arg1=value). R::None ⇒
+                        // InvalidType result (the Store convention). Order = kids[2].
+                        if (operands.size() != 3) {
+                            unsupported(node,
+                                "atomic_store_explicit expects exactly 3 args");
+                            return InvalidMirInst;
+                        }
+                        std::array<MirInstId, 2> const st{operands[1], operands[0]};
+                        return mir.addInst(MirOpcode::AtomicStore, st, InvalidType,
+                                           foldAtomicOrder(kids[2]),
+                                           MirInstFlags::None);
                     }
                     case BuiltinLowering::Barrier:
                         // c113 (D-CSUBSET-INTRINSIC-BARRIER): _ReadWriteBarrier —
@@ -2144,6 +2580,91 @@ struct Lowerer {
                         // c115 SEH: `_exception_info()` — a 0-operand value op
                         // (void* → EXCEPTION_POINTERS), filter-expression only.
                         return mir.addInst(MirOpcode::SehExceptionInfo, operands, t);
+                    case BuiltinLowering::ComplexMake: {
+                        // C99 _Complex (D-CSUBSET-COMPLEX / CRITICAL-2):
+                        // __builtin_complex(re, im) constructs a complex BY ADDRESS —
+                        // the FIRST aggregate-returning builtin. `t` is the complex
+                        // result type; operands = [re, im] (scalar values). Alloca a
+                        // slot, store re@0/im@es, RETURN THE SLOT ADDRESS (the memory-
+                        // resident model's "value" — lowerLvalueAddressNode's new
+                        // BuiltinCall arm delegates here so `I` reached by address works).
+                        if (operands.size() != 2) {
+                            unsupported(node, "__builtin_complex expects exactly 2 args");
+                            return InvalidMirInst;
+                        }
+                        auto const cp = complexParts(t);
+                        if (!cp.has_value()) {
+                            unsupported(node, "__builtin_complex result requires a "
+                                              "sizeable complex element layout");
+                            return InvalidMirInst;
+                        }
+                        MirInstId const dst = freshAggregateTemp(t);
+                        if (!dst.valid()) {
+                            unsupported(node, "__builtin_complex result requires a "
+                                              "sizeable layout");
+                            return InvalidMirInst;
+                        }
+                        MirInstId const re = convertScalar(
+                            operands[0], hir.typeId(kids[0]), cp->elemTy, node);
+                        MirInstId const im = convertScalar(
+                            operands[1], hir.typeId(kids[1]), cp->elemTy, node);
+                        if (!re.valid() || !im.valid()) return InvalidMirInst;
+                        storeComplex(dst, *cp, re, im);
+                        return dst;
+                    }
+                    case BuiltinLowering::ComplexReal:
+                    case BuiltinLowering::ComplexImag: {
+                        // C99 _Complex (D-CSUBSET-COMPLEX / CRITICAL-4): creal(z)/
+                        // cimag(z). `z` is complex-by-address — the request flip
+                        // delivered operands[0] as z's base address (WITHOUT the flip
+                        // the Ref value arm would Load a 16-byte aggregate as a
+                        // scalar). Gep+Load component 0 / es; the F64 result is `t`.
+                        if (operands.size() != 1) {
+                            unsupported(node, "creal/cimag expects exactly 1 arg");
+                            return InvalidMirInst;
+                        }
+                        auto const cp = complexParts(hir.typeId(kids[0]));
+                        if (!cp.has_value()) {
+                            unsupported(node, "creal/cimag on a non-complex or "
+                                              "un-sizeable argument");
+                            return InvalidMirInst;
+                        }
+                        bool const wantImag =
+                            static_cast<BuiltinLowering>(hir.payload(node))
+                                == BuiltinLowering::ComplexImag;
+                        std::int64_t const off = wantImag ? cp->elemSize : 0;
+                        MirInstId const comp = loadComponent(
+                            complexCompAddr(operands[0], off, cp->elemTy), cp->elemTy);
+                        // Element IS F64 this cycle (monomorph); convert to the
+                        // declared result `t` if a future element diverges.
+                        return convertScalar(comp, cp->elemTy, t, node);
+                    }
+                    case BuiltinLowering::ComplexConj: {
+                        // C99 _Complex (D-CSUBSET-COMPLEX): conj(z) = (re, -im), BY
+                        // ADDRESS. z is complex-by-address (operands[0]).
+                        if (operands.size() != 1) {
+                            unsupported(node, "conj expects exactly 1 arg");
+                            return InvalidMirInst;
+                        }
+                        auto const cp = complexParts(t);
+                        if (!cp.has_value()) {
+                            unsupported(node, "conj result requires a sizeable complex "
+                                              "element layout");
+                            return InvalidMirInst;
+                        }
+                        MirInstId const dst = freshAggregateTemp(t);
+                        if (!dst.valid()) {
+                            unsupported(node, "conj result requires a sizeable layout");
+                            return InvalidMirInst;
+                        }
+                        MirInstId re = InvalidMirInst, im = InvalidMirInst;
+                        if (!loadComplex(operands[0], *cp, re, im))
+                            return InvalidMirInst;
+                        std::array<MirInstId, 1> nb{im};
+                        MirInstId const nim = mir.addInst(MirOpcode::FNeg, nb, cp->elemTy);
+                        storeComplex(dst, *cp, re, nim);
+                        return dst;
+                    }
                     case BuiltinLowering::None:
                         break;
                 }
@@ -2384,14 +2905,18 @@ struct Lowerer {
                 MirInstFlags const vf =
                     volatileFlagFor(node) | volatileFlagForType(t);
                 if (BitFieldPlacement const* bf = bitfieldPlacementOf(node)) {
+                    // Bit-field read-modify-write of the allocation unit stays a
+                    // plain Load (an `_Atomic` bit-field is not a supported form;
+                    // were `t` ever atomic here the verifier belt fails loud).
                     std::array<MirInstId, 1> lo{ptr};
                     MirInstId const unit = mir.addInst(MirOpcode::Load, lo, t,
                                                        /*payload=*/0, vf);
                     if (!unit.valid()) return InvalidMirInst;
                     return emitBitfieldExtract(unit, *bf, t);
                 }
+                // FC17.9(d): an `_Atomic` member/element read becomes AtomicLoad.
                 std::array<MirInstId, 1> ops{ptr};
-                return mir.addInst(MirOpcode::Load, ops, t, /*payload=*/0, vf);
+                return emitScalarLoad(ops, t, node);
             }
             case HirKind::Cast: {
                 // children: [operand]. The HIR node's typeId is the target
@@ -2593,7 +3118,8 @@ struct Lowerer {
             }
         }
         bool const isFloat = (tk == TypeKind::F16 || tk == TypeKind::F32
-                           || tk == TypeKind::F64 || tk == TypeKind::F128);
+                           || tk == TypeKind::F64 || tk == TypeKind::F80
+                           || tk == TypeKind::F128);
         MirOpcode mop = MirOpcode::Invalid;
         switch (op) {
             case HirOpKind::Neg:    mop = isFloat ? MirOpcode::FNeg : MirOpcode::Neg; break;
@@ -2635,6 +3161,22 @@ struct Lowerer {
         TypeId const operandType = hir.typeId(kids[0]);
         TypeKind const tk = operandType.valid()
             ? interner.kind(operandType) : TypeKind::Void;
+        // C99 _Complex (D-CSUBSET-COMPLEX / CRITICAL-1d): combineBinaryOp is the
+        // VALUE-path epilogue — it NEVER materializes. A complex binary op is
+        // materialized BY ADDRESS via materializeComplexBinaryOp (routed from
+        // lowerLvalueAddressNode; the request flip diverts a complex value read
+        // there). Reaching here with a complex operand OR a complex result is a
+        // MISROUTE — fail loud, never a silent bad scalar lowering (mirrors the
+        // wide-BitInt guard). A complex COMPARISON (== !=) yielding Bool is a future
+        // cycle (D-CSUBSET-COMPLEX); it too must not silently scalar-lower.
+        if (tk == TypeKind::Complex
+            || (t.valid() && interner.kind(t) == TypeKind::Complex)) {
+            unsupported(node, std::format(
+                "internal: BinaryOp '{}' on a complex must be materialized BY ADDRESS "
+                "(lowerLvalueAddress -> materializeComplexBinaryOp), never as a bare "
+                "SSA value (D-CSUBSET-COMPLEX)", opName(op)));
+            return InvalidMirInst;
+        }
         // c40 (D-CSUBSET-POINTER-SUBTRACTION) C 6.5.6p9: the HIR tier types
         // `p - q` (both Ptr<T>) as I64 (ptrdiff_t) while the OPERANDS stay Ptr —
         // that (op==Sub, operand kind Ptr, RESULT kind I64) is the signal to
@@ -2825,10 +3367,10 @@ struct Lowerer {
             return mir.addInst(MirOpcode::Gep, gep,
                                interner.pointer(elems[0]));
         }
+        // FC17.9(d): a deref of a `_Atomic`-pointee pointer (`*p`, `p[i]`) becomes
+        // AtomicLoad via the scalar-access chokepoint (else the exact c21|c27 flag).
         std::array<MirInstId, 1> ops{ptr};
-        MirInstFlags const vf =
-            volatileFlagFor(node) | volatileFlagForType(pointeeTy);
-        return mir.addInst(MirOpcode::Load, ops, pointeeTy, /*payload=*/0, vf);
+        return emitScalarLoad(ops, pointeeTy, node);
     }
 
     // Scalar-Cast epilogue (operand already lowered): the array→pointer DECAY
@@ -2854,6 +3396,34 @@ struct Lowerer {
                 auto const sc = interner.scalars(ty);
                 return sc.empty() ? kk : static_cast<TypeKind>(sc[0]);
             };
+        // C99 _Complex (D-CSUBSET-COMPLEX / IMPORTANT-7): a cast whose RESULT is a
+        // complex is materialized BY ADDRESS (materializeComplexCast, routed from
+        // lowerLvalueAddressNode via the request flip). Reaching the value path with a
+        // complex result is a MISROUTE → fail loud (mirrors the wide-BitInt guard).
+        if (interner.kind(t) == TypeKind::Complex) {
+            unsupported(node, "internal: a cast producing a complex must be "
+                              "materialized BY ADDRESS (lowerLvalueAddress -> "
+                              "materializeComplexCast), never as a bare SSA value "
+                              "(D-CSUBSET-COMPLEX)");
+            return InvalidMirInst;
+        }
+        // complex -> real (C99 6.3.1.7): the imaginary part is discarded — the value
+        // IS the real component. `operand` is the complex's ADDRESS (the request flip
+        // delivered it). Load component 0 (the element float), then convert to the
+        // scalar target if it differs. mapCast stays a pure Invalid-defaulting mapper
+        // (IMPORTANT-7); the by-address complex source is handled HERE.
+        if (fromTy.valid() && interner.kind(fromTy) == TypeKind::Complex) {
+            auto const cp = complexParts(fromTy);
+            if (!cp.has_value()) {
+                unsupported(node, "cast from a complex requires a sizeable element "
+                                  "layout (D-CSUBSET-COMPLEX)");
+                return InvalidMirInst;
+            }
+            MirInstId const re =
+                loadComponent(complexCompAddr(operand, 0, cp->elemTy), cp->elemTy);
+            if (!re.valid()) return InvalidMirInst;
+            return convertScalar(re, cp->elemTy, t, node);
+        }
         // D-CSUBSET-BITINT-C2-WIDE (Model A divert): a cast involving a WIDE `_BitInt`.
         // A wide TARGET makes the whole Cast a wide result → materialized by ADDRESS
         // (materializeWideCast); reaching the value path is a misroute → fail loud. A
@@ -3175,7 +3745,19 @@ struct Lowerer {
             // an address to `combine*`. Call/IntrinsicCall/BuiltinCall are EXEMPT —
             // their value path already yields the result slot address (finishCall),
             // and flipping would loop through the by-address Call arm's `lowerExpr`.
-            if (!wantAddr && isWideBitInt(interner, hir.typeId(n))
+            // C99 _Complex (D-CSUBSET-COMPLEX / CRITICAL-4): a complex is memory-
+            // resident like a wide `_BitInt`, so a VALUE read of a complex-typed node
+            // yields its slot ADDRESS. This ONE flip keeps complex arithmetic out of
+            // the scalar value path (a complex BinaryOp/UnaryOp/Cast materializes into
+            // a slot via lowerLvalueAddressNode's new arms) AND delivers a complex
+            // creal/cimag arg BY ADDRESS (else the Ref value arm would Load a 16-byte
+            // aggregate as a scalar). Same Call/IntrinsicCall/BuiltinCall EXEMPTION as
+            // wide-BitInt — a complex-returning builtin's (`__builtin_complex`) value
+            // path already yields the result slot address (finishCall / the ComplexMake
+            // handler), and flipping would loop through the by-address BuiltinCall arm.
+            if (!wantAddr
+                && (isComplex(interner, hir.typeId(n))
+                    || isWideBitInt(interner, hir.typeId(n)))
                 && nk != HirKind::Call && nk != HirKind::IntrinsicCall
                 && nk != HirKind::BuiltinCall) {
                 wantAddr = true;
@@ -4402,6 +4984,184 @@ struct Lowerer {
         return true;
     }
 
+    // ── FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 stdc_* op composition ──
+    //
+    // The bit-width (in bits) of an integer/bool TypeKind — the operand-width probe
+    // the stdc_* arms key on. 0 for a non-fixed-width kind (a fail-loud sentinel).
+    [[nodiscard]] static int intBitWidth(TypeKind k) noexcept {
+        switch (k) {
+            case TypeKind::Bool: case TypeKind::I8:  case TypeKind::U8:
+            case TypeKind::Char: case TypeKind::Byte: return 8;
+            case TypeKind::I16:  case TypeKind::U16:  return 16;
+            case TypeKind::I32:  case TypeKind::U32:  return 32;
+            case TypeKind::I64:  case TypeKind::U64:  return 64;
+            default: return 0;
+        }
+    }
+
+    // Compose one C23 `stdc_*` bit operation (N3096 §7.18) from the 3 hardware
+    // bit-count primitives (MIR Popcount/Clz/Ctz) + the universal ALU verbs.
+    //   • WIDTH-CORRECT: the operand's EXACT width W∈{8,16,32,64} is read from its
+    //     coerced HIR param-core type `xTy` (guaranteed by the pre-BuiltinCall arg
+    //     coercion). All compute is at the promotion width P∈{32,64} (the
+    //     primitives' native width — Clz/Ctz are DEFINED at 0 = P), then the value
+    //     is cast to `t` (the builtin's C23 result type). A sub-word W is handled by
+    //     ARITHMETIC (subtract the P−W zero-ext pad; mask the W-bit complement),
+    //     never a per-width instruction.
+    //   • SINGLE-EVAL: `x` is lowered ONCE by the caller into operands[0]; every
+    //     sub-expression here reuses that ONE SSA value.
+    //   • BRANCHLESS: the 8 ops with a C `?:` select via `mask = 0 − (uP)cond` (all
+    //     -ones iff cond, else 0) → `(a & mask) | (b & ~mask)`. NO CFG diamond, NO
+    //     `if (arch/format==…)`: pure generic MIR the optimizer + every target
+    //     lowering already understand.
+    //   • SHIFT-UB SAFE (audit I3): every `Shl(1, amt)` has amt∈[0,W−1] on EVERY
+    //     branch (bit_floor amt = bitWidth − (x≠0); bit_ceil amt = bitWidth(x−1) &
+    //     (W−1), with the ==W overflow arm selecting 0). Never an unguarded shift.
+    // `xTy` is the operand's coerced HIR type (its builtin param core U8/U16/U32/
+    // U64 — read by the caller via hir.typeId(argNode)); the width W is taken from
+    // it, so the composition never queries the MirBuilder for a value's type.
+    [[nodiscard]] MirInstId emitStdbitOp(BuiltinLowering op, MirInstId x0,
+                                         TypeId xTy, HirNodeId node, TypeId t) {
+        TypeKind const xKind = interner.kind(xTy);
+        int const W = intBitWidth(xKind);
+        if (W != 8 && W != 16 && W != 32 && W != 64) {
+            unsupported(node,
+                "a stdc_* bit builtin operand must be an 8/16/32/64-bit integer "
+                "(its builtin param core) — the width is read to compose the "
+                "N3096 §7.18 formula");
+            return InvalidMirInst;
+        }
+        int const P = (W <= 32) ? 32 : 64;
+        TypeKind const pKind = (P == 32) ? TypeKind::U32 : TypeKind::U64;
+        TypeId   const pTy   = interner.primitive(pKind);
+        // vP = (uP)x — zero-extend to the promotion width (a no-op when W==P).
+        MirInstId vP = x0;
+        if (xKind != pKind) {
+            std::array<MirInstId, 1> za{x0};
+            vP = mir.addInst(mapCast(xKind, pKind), za, pTy);
+        }
+
+        // ── shared branchless composition helpers (all pTy-typed) ──
+        auto konst = [&](std::int64_t v) { return constIntOfType(v, pTy); };
+        auto bin = [&](MirOpcode o, MirInstId a, MirInstId b) {
+            std::array<MirInstId, 2> ops{a, b};
+            return mir.addInst(o, ops, pTy);
+        };
+        auto un = [&](MirOpcode o, MirInstId a) {
+            std::array<MirInstId, 1> ops{a};
+            return mir.addInst(o, ops, pTy);
+        };
+        // an ICmp result is i1 (Bool), NEVER pTy — a pTy-typed compare would
+        // mis-type the ZExt in `sel` (it would see a pTy source, not a Bool).
+        auto cmp = [&](MirOpcode o, MirInstId a, MirInstId b) {
+            std::array<MirInstId, 2> ops{a, b};
+            return mir.addInst(o, ops, interner.primitive(TypeKind::Bool));
+        };
+        // the 3 primitives at width P (result pTy — the count ≤P fits; mir_to_lir
+        // reads the OPERAND type, here pTy, to pick the 32- vs 64-bit realization).
+        auto pop = [&](MirInstId v) { return un(MirOpcode::Popcount, v); };
+        auto clz = [&](MirInstId v) { return un(MirOpcode::Clz, v); };
+        auto ctz = [&](MirInstId v) { return un(MirOpcode::Ctz, v); };
+        // (uP)(uW)~x — the W-bit complement: flip all P bits, keep the low W.
+        std::uint64_t const allOnesW = (W >= 64) ? ~0ull : ((1ull << W) - 1);
+        auto complementW = [&]() {
+            return bin(MirOpcode::And, un(MirOpcode::Not, vP),
+                       konst(static_cast<std::int64_t>(allOnesW)));
+        };
+        // branchless select: cond ? a : b (a,b already-computed pTy SSA values →
+        // single-eval). mask = 0 − (uP)cond (all-ones iff cond, else 0).
+        auto sel = [&](MirInstId condBool, MirInstId a, MirInstId b) {
+            MirInstId const condP   = un(MirOpcode::ZExt, condBool);
+            MirInstId const mask    = bin(MirOpcode::Sub, konst(0), condP);
+            MirInstId const notMask = un(MirOpcode::Not, mask);
+            return bin(MirOpcode::Or, bin(MirOpcode::And, a, mask),
+                                      bin(MirOpcode::And, b, notMask));
+        };
+        // cast the pTy compute value to the builtin result type t (a Trunc for a
+        // U64 compute → U32 count / a narrow bit_floor result; else a no-op).
+        auto toResult = [&](MirInstId v) -> MirInstId {
+            TypeKind const tk = interner.kind(t);
+            if (tk == pKind) return v;
+            std::array<MirInstId, 1> ca{v};
+            return mir.addInst(mapCast(pKind, tk), ca, t);
+        };
+
+        MirInstId const ZERO = konst(0);
+        MirInstId const ONE  = konst(1);
+        MirInstId const WK   = konst(W);       // W
+        MirInstId const PmWK = konst(P - W);   // P − W (the zero-ext pad width)
+
+        switch (op) {
+            case BuiltinLowering::StdcCountOnes:      // pc
+                return toResult(pop(vP));
+            case BuiltinLowering::StdcCountZeros:     // W − pc (W real bits only)
+                return toResult(bin(MirOpcode::Sub, WK, pop(vP)));
+            case BuiltinLowering::StdcLeadingZeros:   // clz(x) − (P − W)
+                return toResult(bin(MirOpcode::Sub, clz(vP), PmWK));
+            case BuiltinLowering::StdcLeadingOnes:    // clz((uP)(uW)~x) − (P − W)
+                return toResult(bin(MirOpcode::Sub, clz(complementW()), PmWK));
+            case BuiltinLowering::StdcTrailingZeros: {  // x==0 ? W : ctz(x)
+                MirInstId const isZero = cmp(MirOpcode::ICmpEq, vP, ZERO);
+                return toResult(sel(isZero, WK, ctz(vP)));
+            }
+            case BuiltinLowering::StdcTrailingOnes: {   // x==(uW)~0 ? W : ctz((uP)(uW)~x)
+                MirInstId const isAllOnes =
+                    cmp(MirOpcode::ICmpEq, vP, konst(static_cast<std::int64_t>(allOnesW)));
+                return toResult(sel(isAllOnes, WK, ctz(complementW())));
+            }
+            case BuiltinLowering::StdcFirstLeadingZero: {  // lo==W ? 0 : lo+1 (lo=leading_ones)
+                MirInstId const lo  = bin(MirOpcode::Sub, clz(complementW()), PmWK);
+                MirInstId const isW = cmp(MirOpcode::ICmpEq, lo, WK);
+                return toResult(sel(isW, ZERO, bin(MirOpcode::Add, lo, ONE)));
+            }
+            case BuiltinLowering::StdcFirstLeadingOne: {   // x==0 ? 0 : leading_zeros+1
+                MirInstId const lz     = bin(MirOpcode::Sub, clz(vP), PmWK);
+                MirInstId const isZero = cmp(MirOpcode::ICmpEq, vP, ZERO);
+                return toResult(sel(isZero, ZERO, bin(MirOpcode::Add, lz, ONE)));
+            }
+            case BuiltinLowering::StdcFirstTrailingZero: { // to==W ? 0 : to+1 (to=trailing_ones)
+                MirInstId const isAllOnes =
+                    cmp(MirOpcode::ICmpEq, vP, konst(static_cast<std::int64_t>(allOnesW)));
+                MirInstId const to  = sel(isAllOnes, WK, ctz(complementW()));
+                MirInstId const isW = cmp(MirOpcode::ICmpEq, to, WK);
+                return toResult(sel(isW, ZERO, bin(MirOpcode::Add, to, ONE)));
+            }
+            case BuiltinLowering::StdcFirstTrailingOne: {  // x==0 ? 0 : trailing_zeros+1
+                MirInstId const isZero = cmp(MirOpcode::ICmpEq, vP, ZERO);
+                return toResult(sel(isZero, ZERO, bin(MirOpcode::Add, ctz(vP), ONE)));
+            }
+            case BuiltinLowering::StdcHasSingleBit:   // popcount(x)==1 (result IS Bool == t)
+                return cmp(MirOpcode::ICmpEq, pop(vP), ONE);
+            case BuiltinLowering::StdcBitWidth:       // P − clz(x)  (clz(0)=P → 0; no guard)
+                return toResult(bin(MirOpcode::Sub, konst(P), clz(vP)));
+            case BuiltinLowering::StdcBitFloor: {      // x==0 ? 0 : 1 << (bit_width(x)−1)
+                MirInstId const bw      = bin(MirOpcode::Sub, konst(P), clz(vP));
+                MirInstId const neZero  = cmp(MirOpcode::ICmpNe, vP, ZERO);
+                MirInstId const neZeroP = un(MirOpcode::ZExt, neZero);
+                // amt = bit_width − (x≠0) ∈ [0, W−1] on EVERY branch (x==0 → 0−0=0).
+                MirInstId const amt     = bin(MirOpcode::Sub, bw, neZeroP);
+                MirInstId const shifted = bin(MirOpcode::Shl, ONE, amt);
+                return toResult(sel(neZero, shifted, ZERO));
+            }
+            case BuiltinLowering::StdcBitCeil: {       // x<=1 ? 1 : bw(x−1)==W ? 0 : 1<<bw(x−1)
+                MirInstId const isLe1   = cmp(MirOpcode::ICmpUle, vP, ONE);
+                MirInstId const xm1     = bin(MirOpcode::Sub, vP, ONE);
+                MirInstId const bwm1    = bin(MirOpcode::Sub, konst(P), clz(xm1));
+                MirInstId const isOvf   = cmp(MirOpcode::ICmpEq, bwm1, WK);
+                // amt = bw(x−1) & (W−1) ∈ [0, W−1] (bw(x−1)==W → 0, but the overflow
+                // arm discards the shift result anyway) — never an unguarded Shl.
+                MirInstId const amt     = bin(MirOpcode::And, bwm1, konst(W - 1));
+                MirInstId const shifted = bin(MirOpcode::Shl, ONE, amt);
+                MirInstId const inner   = sel(isOvf, ZERO, shifted);
+                return toResult(sel(isLe1, ONE, inner));
+            }
+            default:
+                break;
+        }
+        unsupported(node, "internal: emitStdbitOp reached with a non-stdbit lowering");
+        return InvalidMirInst;
+    }
+
     // Resolve the ADDRESS of an lvalue expression for ONE node, given that its
     // child lvalue/sub-expressions are resolved by RE-ENTERING the public
     // `lowerLvalueAddress` / `lowerExpr` drivers. Distinct from `lowerExpr`
@@ -4512,6 +5272,26 @@ struct Lowerer {
             if (k == HirKind::Cast)     return materializeWideCast(node);
             if (k == HirKind::Literal)  return materializeWideLiteral(node);
         }
+        // C99 _Complex (D-CSUBSET-COMPLEX / CRITICAL-1b): a complex-typed arithmetic /
+        // cast result is a memory-resident aggregate rvalue — materialize the
+        // componentwise result into a fresh slot and return the slot address (the
+        // wide-BitInt materialize precedent). The request flip routes a complex VALUE
+        // read here too, so a complex operand of a scalar-producing op reaches by
+        // address. (A complex lvalue Ref/Deref/Member/Index falls through below.)
+        if (isComplex(interner, hir.typeId(node))) {
+            if (k == HirKind::BinaryOp) return materializeComplexBinaryOp(node);
+            if (k == HirKind::UnaryOp)  return materializeComplexUnaryOp(node);
+            if (k == HirKind::Cast)     return materializeComplexCast(node);
+        }
+        // C99 _Complex (D-CSUBSET-COMPLEX / CRITICAL-2): a complex-returning BuiltinCall
+        // (`__builtin_complex` / `conj`) is an aggregate rvalue whose value path
+        // materializes the result slot and yields its address — so its lvalue address
+        // IS that slot. Reached when such a builtin is an operand of complex arithmetic
+        // (e.g. `2.0 * I`, `I` = `__builtin_complex(0.0,1.0)`) — WITHOUT this arm the
+        // by-address lowering falls to the terminal fail-loud and the probe DIES at `I`.
+        if (k == HirKind::BuiltinCall && isByValueClass(interner, hir.typeId(node))) {
+            return lowerExpr(node);
+        }
         // FC7 C1c (D-FC7-SYSV-STRUCT-RETURN-IN-REGS): a by-value struct/union-
         // returning CALL is an aggregate rvalue materialized into a result slot;
         // its lvalue address IS that slot. `lowerExpr(Call)` does the
@@ -4524,10 +5304,12 @@ struct Lowerer {
         // (the wide `isByValueClass` return classification), reached by address here.
         if (k == HirKind::Call) {
             TypeId const ct = hir.typeId(node);
-            if (ct.valid()
-                && (interner.kind(ct) == TypeKind::Struct
-                    || interner.kind(ct) == TypeKind::Union
-                    || isWideBitInt(interner, ct)))
+            // IMPORTANT-6 (D-CSUBSET-COMPLEX): widen from Struct||Union||wide-BitInt to
+            // `isByValueClass` — a SUPERSET (behavior-identical for those; adds Complex
+            // uniformly) so `double _Complex f(); z = f();` reaches its result slot by
+            // address (the sret / classifyAggregate return path is set up by
+            // callSetup/finishCall for any by-value-class return).
+            if (ct.valid() && isByValueClass(interner, ct))
                 return lowerExpr(node);
         }
         if (k == HirKind::Ref) {
@@ -5474,6 +6256,12 @@ struct Lowerer {
         // width) Load+Store would move only the low 8 bytes → a silent partial copy.
         if (isWideBitInt(interner, aggTy))
             return lowerByteWiseCopy(srcPtr, dstPtr, layout->size, vf);
+        // C99 _Complex (D-CSUBSET-COMPLEX): a complex is a flat 2-component MEMORY
+        // object {re, im} with no field list — its copy is a whole-object byte-wise
+        // copy of 2×elemSize bytes (the twin of the Union/Array/wide-BitInt arm). This
+        // is the `z = <complex>` / by-value complex arg/return copy chokepoint.
+        if (aggKind == TypeKind::Complex)
+            return lowerByteWiseCopy(srcPtr, dstPtr, layout->size, vf);
         if (aggKind != TypeKind::Struct) {
             unsupported(atNode, "aggregate copy of a non-struct/union/array value "
                                 "is not supported");
@@ -5877,10 +6665,16 @@ struct Lowerer {
             && ctx.structRetAbi->kind == AbiPassing::Kind::ByReference
             && !config.aggregateSretViaHiddenArg)
             callPayload |= ::dss::call_payload::kIndirectResultBit;
+        // FC17.9(c) (D-CSUBSET-SETJMP): OR the returns-twice flag onto the emitted Call
+        // from the CST→HIR side-table (a direct `setjmp`/`_setjmp` callee) — the EXACT
+        // mirror of how `volatileFlagFor` rides onto a Load/Store. The optimizer's
+        // returns-twice-aware passes read this MIR flag (noreturn never reaches MIR).
+        MirInstFlags const rtFlag = returnsTwiceFlagFor(node);
         if (ctx.structRetAbi.has_value())
             return emitStructReturningCall(node, ctx.operands, callPayload,
-                                           *ctx.structRetAbi, ctx.structRetSlot);
-        return mir.addInst(MirOpcode::Call, ctx.operands, t, callPayload);
+                                           *ctx.structRetAbi, ctx.structRetSlot, rtFlag);
+        return mir.addInst(MirOpcode::Call, ctx.operands, t, callPayload,
+                           /*flags=*/rtFlag);
     }
 
     // The register class of a SCALAR/pointer param (for the per-class arg
@@ -5888,7 +6682,8 @@ struct Lowerer {
     [[nodiscard]] AbiPieceClass scalarArgClass(TypeId ty) const {
         TypeKind const k = interner.kind(ty);
         return (k == TypeKind::F16 || k == TypeKind::F32
-                || k == TypeKind::F64 || k == TypeKind::F128)
+                || k == TypeKind::F64 || k == TypeKind::F80
+                || k == TypeKind::F128)
             ? AbiPieceClass::Fpr : AbiPieceClass::Gpr;
     }
 
@@ -6199,10 +6994,17 @@ struct Lowerer {
     // caller and callee agree on which register each piece occupies.
     [[nodiscard]] MirInstId emitStructReturningCall(
             HirNodeId node, std::span<MirInstId const> operands,
-            std::uint32_t callPayload, AbiPassing const& abi, MirInstId slot) {
+            std::uint32_t callPayload, AbiPassing const& abi, MirInstId slot,
+            MirInstFlags callFlags = MirInstFlags::None) {
+        // `callFlags` carries the FC17.9(c) returns-twice bit (D-CSUBSET-SETJMP) for a
+        // returns-twice callee that returns a struct BY VALUE. No returns-twice libc
+        // function does (setjmp returns int) — but threading it here keeps the carrier
+        // complete for EVERY Call shape rather than only the scalar/void path (no
+        // silent-drop seam if a future returns-twice extern returns an aggregate).
         if (abi.kind == AbiPassing::Kind::ByReference) {
             MirInstId const call =
-                mir.addInst(MirOpcode::Call, operands, InvalidType, callPayload);
+                mir.addInst(MirOpcode::Call, operands, InvalidType, callPayload,
+                            /*flags=*/callFlags);
             if (!call.valid()) return InvalidMirInst;
             return slot;
         }
@@ -6214,7 +7016,8 @@ struct Lowerer {
         }
         TypeId const p0ty = pieceType(abi.pieces[0]);
         MirInstId const call =
-            mir.addInst(MirOpcode::Call, operands, p0ty, callPayload);
+            mir.addInst(MirOpcode::Call, operands, p0ty, callPayload,
+                        /*flags=*/callFlags);
         if (!call.valid()) return InvalidMirInst;
         // Pass 1: capture every piece IMMEDIATELY after the call — the
         // lir_callconv caller look-ahead requires the `ReturnPiece` reads to be
@@ -8462,6 +9265,22 @@ struct Lowerer {
                 // lowerDiscardedExpr (one funnel, no per-kind/per-position miss).
                 return lowerDiscardedExpr(hir.exprStmtExpr(node));
             }
+            case HirKind::InlineAsm:
+                // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template asm statement
+                // `__asm__ [volatile] ("")` is a pure compiler reordering + full-
+                // memory fence — semantically IDENTICAL to _ReadWriteBarrier. Reuse
+                // MirOpcode::CompilerBarrier (0 operands, R::None ⇒ InvalidType, side-
+                // effecting + opcodeClobbersMemory ⇒ the 4 optimizer gates cannot
+                // move/elide across it), which lowers to ZERO target instructions on
+                // every target (mir_to_lir.cpp CompilerBarrier → return). This is
+                // byte-for-byte the _ReadWriteBarrier emit (hir_to_mir BuiltinLowering::
+                // Barrier). The semantic tier already rejected any non-empty template
+                // (S_InlineAsmNonEmptyTemplate) before codegen, so only the provably-
+                // inert empty form reaches here. The non-empty per-target text arc
+                // (D-CSUBSET-INLINE-ASM-TEXT) will introduce its own template-carrying
+                // lowering; the empty case need never use it.
+                mir.addInst(MirOpcode::CompilerBarrier, {}, InvalidType);
+                return true;
             case HirKind::VarDecl: {
                 // Allocate the local's slot on the current block. The declared
                 // type drives the alloca's pointer result type via the lattice.
@@ -8589,8 +9408,11 @@ struct Lowerer {
                         // carries the flag — via the VarDecl object annotation (c21)
                         // OR the declared type's VolatileQual (c27, e.g. a `vint x`
                         // typedef = `volatile int`). OR both so neither is missed.
-                        mir.addInst(MirOpcode::Store, ops, InvalidType, /*payload=*/0,
-                                    volatileFlagFor(node) | volatileFlagForType(ty));
+                        // FC17.9(d): an `_Atomic` local's scalar init becomes
+                        // AtomicStore (harmless-if-stronger on a fresh, unshared
+                        // slot; keeps the scalar-store funnel uniform — the DISTINCT
+                        // param/global runtime-init paths stay plain + belt-exempt).
+                        emitScalarStore(ops, ty, node);
                     }
                 }
                 return true;
@@ -8651,8 +9473,10 @@ struct Lowerer {
                 if (BitFieldPlacement const* bf = bitfieldPlacementOf(targetN)) {
                     return emitBitfieldInsert(ptr, rhs, *bf, hir.typeId(targetN), vf);
                 }
+                // FC17.9(d): an `_Atomic` scalar assignment becomes AtomicStore via
+                // the scalar-access chokepoint (else the exact c21|c27 flag `vf`).
                 std::array<MirInstId, 2> ops{rhs, ptr};
-                mir.addInst(MirOpcode::Store, ops, InvalidType, /*payload=*/0, vf);
+                emitScalarStore(ops, hir.typeId(targetN), targetN);
                 return true;
             }
             case HirKind::IfStmt: {
@@ -9537,8 +10361,12 @@ struct Lowerer {
                 // store carries the flag (the param VarDecl node `p` was annotated
                 // at CST→HIR's `lowerVarLikeInto`, same path as a body local), so
                 // the read side (flagged at the Ref) and the init store agree.
+                // FC17.9(d) (D-CSUBSET-ATOMIC): an `_Atomic` param's incoming-arg→slot
+                // reception is INITIALIZATION (C11 7.17.2.1 — not itself atomic), so
+                // it stays a plain Store, marked AtomicInitExempt so the verifier's
+                // atomic belt spares it despite the atomic-qualified slot pointee.
                 mir.addInst(MirOpcode::Store, ops, InvalidType, /*payload=*/0,
-                            volatileFlagFor(p));
+                            volatileFlagFor(p) | MirInstFlags::AtomicInitExempt);
             } else {
                 symbolToValue[sym.v] = arg;
             }
@@ -10678,9 +11506,14 @@ struct Lowerer {
                 std::array<MirInstId, 2> ops{val, addr};
                 // c21 (D-CSUBSET-VOLATILE-QUALIFIER): a `volatile` global's
                 // runtime load-time init store carries the flag.
+                // FC17.9(d) (D-CSUBSET-ATOMIC): an `_Atomic` global's load-time
+                // runtime init is INITIALIZATION (C11 7.17.2.1 — not itself atomic),
+                // so it stays a plain Store, marked AtomicInitExempt so the verifier's
+                // atomic belt spares it despite the atomic-qualified global pointee.
                 mir.addInst(MirOpcode::Store, ops, InvalidType, /*payload=*/0,
-                            pg.isVolatile ? MirInstFlags::Volatile
-                                          : MirInstFlags::None);
+                            (pg.isVolatile ? MirInstFlags::Volatile
+                                           : MirInstFlags::None)
+                                | MirInstFlags::AtomicInitExempt);
             }
             if (!mir.openBlockHasTerminator()) mir.addReturn();
         }
@@ -10792,7 +11625,8 @@ HirToMirResult lowerToMir(Hir const&               hir,
                           std::unordered_map<std::uint32_t, std::uint32_t> const*
                                                    typedefVlaOriginMap,
                           std::unordered_map<std::uint32_t, std::string> const*
-                                                   synthRecipeMap) {
+                                                   synthRecipeMap,
+                          HirReturnsTwiceMap const* returnsTwiceMap) {
     std::size_t const errorsBefore = reporter.errorCount();
     // Designated initializers (code-simplifier REQUIRED fold, LK6
     // cycle 2d post-fold review): a future field addition or
@@ -10809,6 +11643,7 @@ HirToMirResult lowerToMir(Hir const&               hir,
         .linkageMap = linkageMap,
         .mutabilityMap = mutabilityMap,
         .volatileMap = volatileMap,
+        .returnsTwiceMap = returnsTwiceMap,   // FC17.9(c) (D-CSUBSET-SETJMP)
         .alignmentMap = alignmentMap,
         .threadLocalMap = threadLocalMap,
         .vlaSizeMap = vlaSizeMap,

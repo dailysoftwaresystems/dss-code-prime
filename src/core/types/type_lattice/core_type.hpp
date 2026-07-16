@@ -21,7 +21,16 @@ enum class TypeKind : std::uint16_t {
     Bool,
     I8, I16, I32, I64, I128,
     U8, U16, U32, U64, U128,
-    F16, F32, F64, F128,
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): F80 is the x87 80-bit extended format
+    // (SysV x86_64 / darwin-x86_64 `long double`, 16/16 storage); F128 is IEEE
+    // binary128 (AAPCS64 `long double`). DISTINCT kinds so the two future
+    // arithmetic arcs (x87 register-stack vs binary128 softfloat) can never
+    // cross-fire — both wall loudly at the LIR encoded-width gate until then.
+    // Inserted IN the float block (not appended) so the float widening rank
+    // reads in declaration order; the ordinal shift of later kinds is safe:
+    // no TypeKind ordinal is serialized (name codecs spell names, enum
+    // scalar-pool entries are integer kinds ordered BEFORE the floats).
+    F16, F32, F64, F80, F128,
     Char,   // Unicode codepoint
     Byte,
     Void,
@@ -56,7 +65,18 @@ enum class TypeKind : std::uint16_t {
     // binds the innermost pointee, C 6.7.3); east `u32 * volatile` =
     // VolatileQual(Ptr<U32>) (a volatile POINTER). Idempotent (no double-wrap).
     // const gets NO such wrapper — const stays ignored for type identity, since
-    // only volatile affects codegen (the optimizer's MirInstFlags::Volatile).
+    // it never affects codegen or layout.
+    //   FC17.9(d) 1a (D-CSUBSET-QUAL-BITSET): GENERALIZED to a qualifier BITSET.
+    //   The node carries a `QualBit` mask (see below) in scalar slot 0 —
+    //   `volatile T` = bits{Volatile}, `_Atomic T` = bits{Atomic}, `_Atomic
+    //   volatile T` = bits{Volatile,Atomic} — so a multiply-qualified scalar is
+    //   ONE skin, not a nesting. Distinct masks intern distinctly (the scalar
+    //   joins hashContent/equalContent, exactly like an array's length). The kind
+    //   stays named `VolatileQual` (not `QualifiedType`) so pre-existing TypeId
+    //   integers, the exhaustive `typeKindName` switch, and the whole volatile
+    //   test surface are UNCHANGED. The mask is read ONLY via the raw
+    //   `qualifierBits(id)`; the transparent `scalars(id)` sees THROUGH the skin
+    //   to the inner type's scalars.
     // Placed LAST (before Count_) so every pre-existing kind keeps its integer
     // value — TypeKind ints appear in scalar pools (enum underlying / CallConv)
     // and cached/round-tripped TypeIds; renumbering would silently shift them.
@@ -89,6 +109,23 @@ enum class TypeKind : std::uint16_t {
     // AFTER NullptrT (before Count_) so every pre-existing kind keeps its integer
     // value — the VolatileQual/NullptrT placement precedent.
     BitInt,
+
+    // ── C99 _Complex (D-CSUBSET-COMPLEX / C99 §6.2.5) ──
+    // A complex number = an ordered pair {real, imaginary} of an element FLOAT
+    // type (`double _Complex` → element F64, `float _Complex` → F32, `long double
+    // _Complex` → the long-double-axis element F80/F128/F64). operands=[element];
+    // no scalars, no name (structural identity — two `double _Complex` collapse to
+    // one TypeId, like every other single-operand structural kind). Layout is a
+    // MEMORY-RESIDENT by-value aggregate {re@0, im@elemSize}, sized 2×elemSize —
+    // it enters `isByValueClass`/`isMemoryResidentType`, so a complex rvalue NEVER
+    // becomes a bare SSA value: it lives in a slot reached BY ADDRESS, mirroring a
+    // wide `_BitInt(N>64)` EXACTLY. Componentwise arithmetic emits F64/F32 ops (they
+    // pass the LIR encoded-width gate); an F80/F128 component walls loud at the
+    // existing requireEncodedFloatWidth (no new wall — long-double-complex arithmetic
+    // rides the long-double arith deferrals). Appended AFTER BitInt (before Count_)
+    // so every pre-existing kind keeps its integer value — the VolatileQual/NullptrT/
+    // BitInt placement precedent (no TypeKind ordinal is serialized).
+    Complex,
 
     Count_  // keep last — counts the core members
 };
@@ -127,6 +164,21 @@ inline constexpr std::int64_t kVlaLength = -2;
 // pool = non-bitfield and a struct with NO bitfields interns with EMPTY scalars
 // (bit-identical to a pre-bitfield struct — no TypeId churn).
 inline constexpr std::int64_t kNotBitfield = -1;
+
+// FC17.9(d) 1a (D-CSUBSET-QUAL-BITSET): the type-qualifier bits carried in a
+// VolatileQual node's scalar pool (slot 0). The single generalized qualifier
+// skin carries a BITSET so a multiply-qualified scalar — e.g. `_Atomic volatile
+// int` — is ONE skin (bits {Volatile,Atomic}) rather than a nesting.
+// `volatileQualified` sets Volatile; `atomicQualified` sets Atomic; `qualified`
+// merges bits idempotently and order-independently. Read ONLY via the raw
+// `qualifierBits(id)` — the transparent `scalars(id)` sees THROUGH the skin to
+// the inner type. const is NOT a bit here (it never affects codegen/layout, so
+// it is not materialized as a qualifier skin at all). The underlying type is
+// int64 because the mask rides an int64 scalar slot.
+enum class QualBit : std::int64_t {
+    Volatile = 1 << 0,  // C `volatile`  — drives MirInstFlags::Volatile at access.
+    Atomic   = 1 << 1,  // C11 `_Atomic` — consumed by FC17.9(d) cycle 1b codegen.
+};
 
 // Calling conventions are machine-shaped (not language-shaped) — core lattice
 // members, attached to FnSig and consumed by the FFI plan. Stored in a

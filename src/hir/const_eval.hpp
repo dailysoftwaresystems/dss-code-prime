@@ -65,9 +65,11 @@
 //     `refuseOnOverflow` because the C99 bit-pattern is
 //     implementation-defined; the wrap-knob applies only to the
 //     inner-range "fits int64 but not target" case), float→float
-//     (F32 / F16 narrow, F64 identity; F128 refuses with
-//     `UnsupportedTypeKind` — no host backing AND no F128 arithmetic
-//     consumer today; plan-12.5 §0.2 D1b mapped to plan 19).
+//     (F32 / F16 narrow, F64 identity; F80 / F128 refuse with
+//     `UnsupportedTypeKind` — no host backing, keyed on
+//     floatKindInfo.hostBacked; F80 joined with FC17.9(e), whose
+//     per-format arithmetic arc is D-CSUBSET-LONG-DOUBLE-CONSTFOLD-
+//     PRECISION; F128 was plan-12.5 §0.2 D1b mapped to plan 19).
 //     Logical and Ternary cond accept floats too (via the shared
 //     `asBool(value, allowFloat)` helper). When `allowFloat=false`
 //     any float-involving operand refuses with `UnsupportedTypeKind`.

@@ -122,6 +122,11 @@ struct SchemaIndexes {
     // declaration rule. Pass 2 (`pass2Post`) const-evaluates its condition + emits
     // S_StaticAssertFailed on a zero / non-constant fold. Empty ⇒ no surface.
     std::unordered_map<std::uint32_t, bool>        staticAssertByRule;
+    // FC17.9(i) (D-CSUBSET-INLINE-ASM): true for the inline-asm statement rule
+    // (asmStmt). pass2Post decodes its template child and emits
+    // S_InlineAsmNonEmptyTemplate unless it decodes to strictly zero bytes. Empty
+    // ⇒ no surface.
+    std::unordered_map<std::uint32_t, bool>        inlineAsmByRule;
     // Built-in type name → TypeId (interned once per schema, into the CU
     // lattice; FC3 c1 — the per-row `coreByDataModel` override for the
     // ACTIVE data model is applied here, so every consumer below sees
@@ -199,6 +204,14 @@ struct SchemaIndexes {
     // languages without the table (toy / tsql) — the arm never fires.
     std::unordered_set<std::uint32_t>              typeSpecifierVocabulary;
     std::unordered_map<std::string, TypeId>        typeSpecifierSets;
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): multiset keys of rows carrying a
+    // `coreByLongDoubleFormat` map that the ACTIVE format leaves UNREALIZED
+    // (axis None — wasm/spirv/direct-API). Diverted here at index build
+    // instead of interned (a base-core intern would silently bind the F64
+    // meaning under an undeclared representation); the multiset-lookup miss
+    // path consults this set to emit the precise S_LongDoubleFormatUndeclared
+    // instead of the generic S_InvalidTypeSpecifierCombination.
+    std::unordered_set<std::string>                unrealizedLongDoubleSets;
 };
 
 // One transient per `analyze()` call. Consumed into the returned model.
@@ -241,6 +254,13 @@ struct EngineState {
     // `coreByDataModel` overrides), the integer-literal ladder, and the
     // shipped-lib descriptor reader. Set ONCE before any index is built.
     DataModel                  dataModel = DataModel::Lp64;
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the analysis-time `long double` axis
+    // (`analyze()`'s parameter — effectiveLongDoubleFormat(target, format)).
+    // Read by `buildIndexes` (the `coreByLongDoubleFormat` typeSpecifiers
+    // overrides — a map-carrying row under `None` is diverted UNREALIZED,
+    // never base-core-resolved) and the float-literal ladder. Set ONCE before
+    // any index is built, like `dataModel`.
+    LongDoubleFormat           longDoubleFormat = LongDoubleFormat::None;
     // FC6 deferral-close: the active target's aggregate-layout params
     // (`analyze()`'s parameter — target.aggregateLayout()). `nullopt` ⇒ the
     // target declared no `aggregateLayout` block, so a `sizeof` in an array
@@ -942,6 +962,7 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
     for (auto const& lr : cfg.loopRules)    idx.loopByRule[lr.rule.v] = true;
     for (auto const& lc : cfg.loopControls) idx.loopControlByRule[lc.rule.v] = true;
     if (cfg.staticAssertRule.valid()) idx.staticAssertByRule[cfg.staticAssertRule.v] = true;
+    if (cfg.inlineAsmRule.valid())    idx.inlineAsmByRule[cfg.inlineAsmRule.v] = true;
     for (auto const& bt : cfg.builtinTypes) {
         if (bt.extension.has_value()) {
             // The mapping names a registered type-extension (e.g. T-SQL's
@@ -996,8 +1017,24 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
             key += std::to_string(t.v);
             key += ',';
         }
+        // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): axis-aware resolution. nullopt ⇔
+        // the row depends on the long-double axis but the active format
+        // declared none — divert the key UNREALIZED (never intern the base
+        // core, which is the F64-axis meaning; see the SchemaIndexes field).
+        auto const resolved = ts.resolveCore(s.dataModel, s.longDoubleFormat);
+        if (!resolved.has_value()) {
+            idx.unrealizedLongDoubleSets.insert(std::move(key));
+            continue;
+        }
+        // C99 _Complex (D-CSUBSET-COMPLEX §6.2.5, MINOR-8): a `complex` row's
+        // resolved core is the ELEMENT float — wrap it in interner.complex() so the
+        // multiset `double _Complex`/`float _Complex`/`long double _Complex` binds a
+        // genuine Complex TypeId at EVERY type position (decl/param/member/cast/
+        // sizeof funnel through this table). The element rode the same resolveCore
+        // axis, so `long double _Complex`'s element is F80/F128/F64 for free.
+        TypeId const elemTy = s.lattice.interner().primitive(*resolved);
         idx.typeSpecifierSets[std::move(key)] =
-            s.lattice.interner().primitive(ts.resolveCore(s.dataModel));
+            ts.complex ? s.lattice.interner().complex(elemTy) : elemTy;
     }
 }
 
@@ -1290,6 +1327,25 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 if (setIt != s.idx().typeSpecifierSets.end()) {
                     return setIt->second;
                 }
+                // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): a VALID multiset whose
+                // row the active format leaves UNREALIZED (no longDoubleFormat
+                // axis) — the precise diagnostic, BEFORE the generic
+                // invalid-combination miss below (the combination is not
+                // invalid; its representation is undeclared).
+                if (s.idx().unrealizedLongDoubleSets.contains(key)) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_LongDoubleFormatUndeclared;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(node);
+                    d.actual   = std::format(
+                        "'{}' is not realized on this object format: the "
+                        "format declares no longDoubleFormat axis",
+                        tree.text(node));
+                    s.reporter.report(std::move(d));
+                    specifierDiagnosed = true;   // outer S_UnknownType suppressed
+                    return InvalidType;
+                }
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::S_InvalidTypeSpecifierCombination;
                 d.severity = DiagnosticSeverity::Error;
@@ -1580,15 +1636,29 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         // Config-driven; empty/invalid for a language without typeof (no effect).
         std::array<RuleId, 2> const typeofOpaqueRules{cfg.typeofTypeRule,
                                                       cfg.typeofValueRule};
+        // D-CSUBSET-ATOMIC (FC17.9(d) 1b): `_Atomic` is scanned in EXACT PARALLEL to
+        // `volatile` (the `atomicMarker` semantics token) — a base-position `_Atomic`
+        // BEFORE the first star qualifies the base pointee (`_Atomic int *` =>
+        // Ptr<atomicQualified(int)>). The scan is position-aware identically (an
+        // `_Atomic` after the last star is the pointer object's, threaded by the
+        // declarator's pointer-layer loop, so it breaks at the star run just like
+        // volatile). Both bits compose in the shared qualifier skin (cycle 1a).
         bool baseIsVolatile = false;
-        if (cfg.volatileMarker.has_value()) {
+        bool baseIsAtomic   = false;
+        if (cfg.volatileMarker.has_value() || cfg.atomicMarker.has_value()) {
             for (auto child : kids) {
                 if (isPointerStar(child)) {
-                    break;   // reached the star run — a later volatile is the pointer object's
+                    break;   // reached the star run — a later qualifier is the pointer object's
                 }
-                if (subtreeContainsToken(tree, child, *cfg.volatileMarker,
-                                         &s.idx().declByRule, typeofOpaqueRules)) {
+                if (cfg.volatileMarker.has_value()
+                    && subtreeContainsToken(tree, child, *cfg.volatileMarker,
+                                            &s.idx().declByRule, typeofOpaqueRules)) {
                     baseIsVolatile = true;
+                }
+                if (cfg.atomicMarker.has_value()
+                    && subtreeContainsToken(tree, child, *cfg.atomicMarker,
+                                            &s.idx().declByRule, typeofOpaqueRules)) {
+                    baseIsAtomic = true;
                 }
             }
         }
@@ -1638,6 +1708,32 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
             // scalar / split-form head); the caller's declarator adds any pointers.
             if (baseIsVolatile)
                 inner = s.lattice.interner().volatileQualified(inner);
+            // D-CSUBSET-ATOMIC (FC17.9(d) 1b): wrap the base in the Atomic bit too.
+            // `qualified` merges bits, so `_Atomic volatile int` becomes ONE {V,A}
+            // skin regardless of which wrap runs first (order-independent).
+            if (baseIsAtomic) {
+                // D-CSUBSET-ATOMIC-NONLOCKFREE: `_Atomic` is supported this cycle ONLY
+                // on a naturally-aligned lock-free SCALAR. On an aggregate or a wide
+                // scalar (`isByValueClass`), a copy decomposes to plain field/byte
+                // Load/Store AFTER `computeLayout` strips this TRANSPARENT skin — the
+                // type-based atomic-access belt then sees only plain types, so it would
+                // be a SILENT non-atomic access (C11 7.17.5). FAIL LOUD + do NOT wrap
+                // (never let an atomic-qualified non-lock-free type reach codegen); the
+                // lock-table / large-atomic path is deferred beyond atomic cycle-1.
+                if (isByValueClass(s.lattice.interner(), inner)) {
+                    if (emitOnMiss) {
+                        ParseDiagnostic d;
+                        d.code     = DiagnosticCode::S_AtomicNonLockFree;
+                        d.severity = DiagnosticSeverity::Error;
+                        d.buffer   = tree.source().id();
+                        d.span     = tree.span(node);
+                        d.actual   = std::string{tree.text(node)};
+                        s.reporter.report(std::move(d));
+                    }
+                } else {
+                    inner = s.lattice.interner().atomicQualified(inner);
+                }
+            }
             for (std::uint32_t i = 0; i < ptrDepth; ++i)
                 inner = s.lattice.interner().pointer(inner);
             // c26: fold the abstract declarator (fn-ptr / array type-name) onto the
@@ -1743,7 +1839,7 @@ floatLiteralTokenSet(EngineState const& s) {
     std::unordered_set<std::uint32_t> out;
     auto const isFloatKind = [](TypeKind k) noexcept {
         return k == TypeKind::F16 || k == TypeKind::F32
-            || k == TypeKind::F64 || k == TypeKind::F128;
+            || k == TypeKind::F64 || k == TypeKind::F80 || k == TypeKind::F128;
     };
     for (auto const& [tok, ty] : s.idx().literalTypeIds) {
         if (isFloatKind(s.lattice.interner().kind(ty))) out.insert(tok);
@@ -2094,6 +2190,12 @@ constExprValue(EngineState& s, Tree const& tree, NodeId node,
     // BitIntValue (`constexpr _BitInt(8) k = 15wb;`).
     if (cfg != nullptr) ctx.integerLiteralTyping = cfg->integerLiteralTyping;
     ctx.dataModel = s.dataModel;
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): float-literal ladder + axis so a
+    // `20.0L` leaf carries its TRUE core (F80/F128 on a walled axis) and the
+    // hostBacked fold gate refuses to fold it at binary64 — this is the ONLY
+    // ctx that admits float leaves, so it is the only one that threads them.
+    if (cfg != nullptr) ctx.floatLiteralTyping = cfg->floatLiteralTyping;
+    ctx.longDoubleFormat = s.longDoubleFormat;
     CstEvalEnvironment env = buildConstEvalEnv(s, tree, fromScope, cfg);
     EvalOptions options;
     options.allowFloat = true;
@@ -2247,7 +2349,7 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
         k == TypeKind::Bool || k == TypeKind::Char || k == TypeKind::Byte
         || isIntegerKind(k) || k == TypeKind::Enum
         || k == TypeKind::F16 || k == TypeKind::F32 || k == TypeKind::F64
-        || k == TypeKind::F128;
+        || k == TypeKind::F80 || k == TypeKind::F128;
     if (arithmetic) {
         if (constExprValue(s, tree, initNode, here, &cfg).has_value()) return;
         emit(DiagnosticCode::S_ConstexprNonConstantInitializer, initNode);
@@ -3626,6 +3728,16 @@ TypeId declaratorDeclaredType(EngineState& s, SemanticConfig const& cfg,
                 && subtreeContainsToken(tree, c, *cfg.volatileMarker,
                                         &s.idx().declByRule)) {
                 t = s.lattice.interner().volatileQualified(t);
+            }
+            // D-CSUBSET-ATOMIC (FC17.9(d) 1b): the EAST `_Atomic` — an `atomicMarker`
+            // ptrQualifier INSIDE this pointer layer (after the star, `int * _Atomic p`)
+            // makes THIS pointer OBJECT atomic ⇒ atomicQualified(Ptr<...>), the exact
+            // mirror of the east-volatile wrap above. Composes with a co-present east
+            // volatile in the one shared skin (cycle 1a bit-merge).
+            if (cfg.atomicMarker.has_value()
+                && subtreeContainsToken(tree, c, *cfg.atomicMarker,
+                                        &s.idx().declByRule)) {
+                t = s.lattice.interner().atomicQualified(t);
             }
             continue;
         }
@@ -6860,8 +6972,8 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                 && tk == s.idx().numberStyle->emitKind.floating) {
                 auto const fk = typeFloatLiteral(
                     tree.text(node), s.idx().numberStyle,
-                    cfg.floatLiteralTyping, s.dataModel);
-                if (!fk.has_value()) {
+                    cfg.floatLiteralTyping, s.dataModel, s.longDoubleFormat);
+                if (fk.status == FloatLadderStatus::NoRule) {
                     // Loader invariant: every numberStyle float suffix
                     // is covered and an unsuffixed rule exists. A miss
                     // here is substrate drift — fail loud, never
@@ -6872,7 +6984,25 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                                "violated)\n", stderr);
                     std::abort();
                 }
-                litTy = s.lattice.interner().primitive(*fk);
+                if (fk.status == FloatLadderStatus::AxisUndeclared) {
+                    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): a long-double
+                    // literal (`20.0L`) on a format with no declared axis —
+                    // its representation is unknowable; leave the token
+                    // UNTYPED (never the base core) and emit the precise
+                    // diagnostic, mirroring the typeSpecifiers bind.
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_LongDoubleFormatUndeclared;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(node);
+                    d.actual   = std::format(
+                        "'{}' is a long double literal, not realized on this "
+                        "object format: the format declares no "
+                        "longDoubleFormat axis", tree.text(node));
+                    s.reporter.report(std::move(d));
+                    return;
+                }
+                litTy = s.lattice.interner().primitive(fk.kind);
             }
             // C11/C23 6.4.4.4: a PREFIXED character constant (`L'x'`/`u'x'`/`U'x'`/
             // `u8'x'`) has the SCALAR type of its prefix (wchar_t/char16_t/char32_t/
@@ -8064,6 +8194,55 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
         }
     }
 
+    // FC17.9(i) (D-CSUBSET-INLINE-ASM, C23 6.8 / GNU 6.47): the GNU inline-asm
+    // STATEMENT `__asm__ [volatile] ( <string-literal-template> ) ;`. Cycle-1
+    // implements ONLY the empty-template optimizer barrier: the template must
+    // decode to STRICTLY ZERO bytes (`__asm__ volatile("")`), which HIR→MIR lowers
+    // to a pure compiler reordering + full-memory fence (MirOpcode::CompilerBarrier,
+    // the _ReadWriteBarrier op). A NON-EMPTY template carries real per-target
+    // instructions we cannot yet emit — decode the template (the SAME chokepoint
+    // staticAssert's message uses) and FAIL LOUD S_InlineAsmNonEmptyTemplate on
+    // anything but a strictly-empty decoded string: non-empty text, whitespace-only
+    // (`"  "` is NOT provably inert — we do not parse asm), or a malformed escape
+    // (decode → nullopt). This reject is an Error → the driver aborts before codegen,
+    // so a rejected asm's MIR is never emitted; silently lowering a non-empty asm to
+    // a no-op barrier would DROP its instructions — a miscompile — so the code is
+    // UNSUPPRESSABLE (unsuppressable_codes.cpp). Operand/clobber lists (`: … : …`) and
+    // `asm goto` never reach here: the asmStmt grammar ends at `)`, so those fail loud
+    // at parse (P_UnexpectedToken) — the D-CSUBSET-INLINE-ASM-OPERANDS / -GOTO
+    // deferrals. `volatile` is accepted but semantically INERT for the empty form.
+    // The template is the SOLE Internal child (the keyword / volatile / parens /
+    // semicolon are Tokens), located exactly as staticAssert locates its message.
+    if (k == NodeKind::Internal
+        && s.idx().inlineAsmByRule.contains(tree.rule(node).v)) {
+        NodeId tmplNode{};
+        for (NodeId c : visibleChildren(tree, node)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;   // skip kw / volatile / ( ) ;
+            tmplNode = c;
+            break;
+        }
+        std::optional<std::string> decoded;
+        if (tmplNode.valid() && s.idx().stringLiteralBodyToken.valid()) {
+            decoded = decodeAdjacentStringBodies(
+                tree, tmplNode, s.idx().stringLiteralBodyToken);
+        }
+        // Acceptance = a template that decodes to STRICTLY zero bytes. Anything else
+        // (non-empty / whitespace-only / malformed-escape nullopt / a malformed node
+        // with no template) fails loud — never a silently dropped instruction.
+        if (!(decoded && decoded->empty())) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_InlineAsmNonEmptyTemplate;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(tmplNode.valid() ? tmplNode : node);
+            d.actual   = "inline asm with a non-empty template is not yet supported "
+                         "(only the empty-template optimizer barrier "
+                         "`__asm__ volatile(\"\")` is implemented); real asm text is a "
+                         "per-target deferral (D-CSUBSET-INLINE-ASM-TEXT)";
+            s.reporter.report(std::move(d));
+        }
+    }
+
     // FC17 (D-CSUBSET-ATTRIBUTE-STATEMENT, C23 6.8.1): a BARE attribute-
     // declaration statement (`[[fallthrough]];` / `__attribute__((...));`).
     // No symbol to mark — the scan runs for its UNKNOWN-standard-attribute
@@ -8202,6 +8381,13 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         : InvalidNode;   // >1 typed match: ambiguous (handled below)
 
         if (matchCount > 1) {
+            // FC17.9(e) (D-CSUBSET-LONG-DOUBLE-GENERIC-DISTINCT): on an
+            // f64-axis format `double:` and `long double:` associations BOTH
+            // intern F64 → matchCount 2 lands HERE — LOUD (the LLP64
+            // long≡int collapse precedent), but it rejects valid C11 6.5.1.1
+            // (the two are distinct TYPES even when same-representation).
+            // <tgmath.h> (FC17.9(g)) dispatches on exactly that pair;
+            // distinct-type identity for _Generic rides that arc.
             ParseDiagnostic d;
             d.code     = DiagnosticCode::S_GenericSelectionAmbiguous;
             d.severity = DiagnosticSeverity::Error;
@@ -9771,7 +9957,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  std::optional<AggregateLayoutParams> aggregateLayout,
                                  std::optional<VaListStrategy> vaListStrategy,
                                  std::optional<ObjectFormatKind> activeFormat,
-                                 std::optional<std::string_view> activeTarget);
+                                 std::optional<std::string_view> activeTarget,
+                                 LongDoubleFormat longDoubleFormat);
 
 SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       DataModel dataModel,
@@ -9779,6 +9966,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       std::optional<VaListStrategy> vaListStrategy,
                       std::optional<ObjectFormatKind> activeFormat,
                       std::optional<std::string_view> activeTarget,
+                      LongDoubleFormat longDoubleFormat,
                       std::size_t deepRecursionReserveBytes) {
     // Run the recursive analysis on a dedicated large-stack worker thread
     // (JOIN-synchronous — no concurrency) so a deeply-nested-but-legal
@@ -9801,7 +9989,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
     return dss::substrate::callOnLargeStack(reserveBytes, [&] {
             return analyzeImpl(std::move(cu), dataModel, std::move(aggregateLayout),
                                std::move(vaListStrategy), std::move(activeFormat),
-                               std::move(activeTarget));
+                               std::move(activeTarget), longDoubleFormat);
         });
 }
 
@@ -9810,13 +9998,15 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  std::optional<AggregateLayoutParams> aggregateLayout,
                                  std::optional<VaListStrategy> vaListStrategy,
                                  std::optional<ObjectFormatKind> activeFormat,
-                                 std::optional<std::string_view> activeTarget) {
+                                 std::optional<std::string_view> activeTarget,
+                                 LongDoubleFormat longDoubleFormat) {
     if (!cu) {
         std::fputs("dss::analyze fatal: null CompilationUnit\n", stderr);
         std::abort();
     }
     EngineState s{*cu};
     s.dataModel = dataModel;
+    s.longDoubleFormat = longDoubleFormat;
     s.aggregateLayout = aggregateLayout;
     s.vaListStrategy = vaListStrategy;
     s.activeFormat = activeFormat;
@@ -10435,6 +10625,12 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 // to carry `_Noreturn`, so the flag rides the descriptor. A direct
                 // call to one is wrapped at HIR lowering exactly like a user one.
                 rec.isNoreturn = sym.noreturn;
+                // FC17.9(c) (D-CSUBSET-SETJMP): a descriptor-declared returns-twice
+                // extern (setjmp.json's `setjmp`/`_setjmp`) — externs have no user
+                // prototype to carry the attribute, so it rides the descriptor. Read
+                // at HIR->MIR to stamp the Call's MirInstFlags::ReturnsTwice (the
+                // isNoreturn-from-descriptor mirror, one line above).
+                rec.returnsTwice = sym.returnsTwice;
                 SymbolId const id = s.symbols.mint(rec);
                 s.scopes.injectBinding(cuRoot, sym.name, id);
 
@@ -10706,6 +10902,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::move(shippedExterns),
         std::move(suppressedShippedLibraries),
         dataModel,
+        longDoubleFormat,
     };
 }
 

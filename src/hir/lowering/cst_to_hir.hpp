@@ -92,6 +92,9 @@ struct DSS_EXPORT CstToHirResult {
     HirVolatileMap volatileMap;   // bound to `hir` — per-ACCESS volatility (c21,
                                   // D-CSUBSET-VOLATILE-QUALIFIER); read at HIR→MIR
                                   // to OR MirInstFlags::Volatile onto Load/Store
+    HirReturnsTwiceMap returnsTwiceMap; // bound to `hir` — per-CALL returns-twice
+                                  // (FC17.9(c), D-CSUBSET-SETJMP); read at HIR→MIR to
+                                  // OR MirInstFlags::ReturnsTwice onto a setjmp Call
     HirAlignmentMap alignmentMap; // bound to `hir` — per-DECLARATION explicit
                                   // `alignas` (D-CSUBSET-ALIGNAS-VARIABLE-CODEGEN);
                                   // read at HIR→MIR to raise a global's data-item
@@ -152,7 +155,7 @@ struct DSS_EXPORT CstToHirResult {
     CstToHirResult(Hir h, HirLiteralPool lp)
         : hir(std::move(h)), sourceMap(hir), linkageMap(hir),
           mutabilityMap(hir), threadLocalMap(hir), volatileMap(hir),
-          alignmentMap(hir), literalPool(std::move(lp)) {}
+          returnsTwiceMap(hir), alignmentMap(hir), literalPool(std::move(lp)) {}
 
     CstToHirResult(CstToHirResult const&)            = delete;
     CstToHirResult& operator=(CstToHirResult const&) = delete;

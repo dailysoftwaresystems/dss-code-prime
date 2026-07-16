@@ -66,6 +66,7 @@ constexpr int kVersion = 1;
         case TypeKind::F16:  return "f16";
         case TypeKind::F32:  return "f32";
         case TypeKind::F64:  return "f64";
+        case TypeKind::F80:  return "f80";
         case TypeKind::F128: return "f128";
         default: return {};
     }
@@ -89,6 +90,7 @@ constexpr int kVersion = 1;
     if (s == "f16")  return TypeKind::F16;
     if (s == "f32")  return TypeKind::F32;
     if (s == "f64")  return TypeKind::F64;
+    if (s == "f80")  return TypeKind::F80;
     if (s == "f128") return TypeKind::F128;
     return std::nullopt;
 }
@@ -248,6 +250,10 @@ private:
                 out_ += "arr<"; appendType(in.operands(t)[0]);
                 out_ += std::format(", {}>", in.scalars(t)[0]);
                 return;
+            // C99 _Complex (D-CSUBSET-COMPLEX): a complex slot is a Ptr<complex<elem>>
+            // in MIR; spell the pointee so the .dssmir dump is legible (not '?').
+            case TypeKind::Complex:
+                out_ += "complex<"; appendType(in.operands(t)[0]); out_ += '>'; return;
             case TypeKind::Tuple:
                 out_ += "tuple<"; args(in.operands(t)); out_ += '>'; return;
             case TypeKind::Struct:

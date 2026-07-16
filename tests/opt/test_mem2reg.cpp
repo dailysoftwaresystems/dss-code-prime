@@ -895,6 +895,70 @@ TEST(Mem2Reg, VolatileAccessAllocaNotPromoted) {
     EXPECT_EQ(countOpInModule(mir, MirOpcode::Load),   1u);
 }
 
+// D-OPT-SETJMP-RETURNS-TWICE-INLINE (mem2reg half; FC17.9(c) D-CSUBSET-SETJMP): a
+// function that CONTAINS a returns-twice Call (setjmp/_setjmp) promotes NO allocas —
+// even a slot the Call never touches. A matching longjmp re-enters the setjmp site
+// over a control-flow edge the CFG cannot see, so a promoted local reassigned on that
+// hidden path would carry a stale entry-reaching SSA value past the resume; kept in
+// memory (no promotion), longjmp's SP + callee-saved restore makes the last store
+// observable (GCC's returns_twice treatment). This pins the WHOLE-FUNCTION bail: the
+// alloca here is otherwise textbook-promotable — a single store then load, and the
+// Call does NOT take its address — so ONLY the MirInstFlags::ReturnsTwice Call blocks
+// it. RED-ON-DISABLE: remove the returns-twice whole-function scan in mem2reg.cpp
+// analyze() → the alloca IS promoted (allocasPromoted == 1) and this
+// EXPECT_EQ(...,0) fails. Structural twin of VolatileAccessAllocaNotPromoted.
+TEST(Mem2Reg, ReturnsTwiceCallInFunctionBlocksPromotion) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32   = interner.primitive(TypeKind::I32);
+    TypeId const ptr   = interner.pointer(i32);
+    TypeId const calleeSig = interner.fnSig({}, i32, CallConv::CcSysV);
+    TypeId const fnSig     = interner.fnSig({}, i32, CallConv::CcSysV);
+
+    MirBuilder mb;
+    // An extern returns-twice callee (setjmp-class), modeled as an externally-
+    // visible function (the AddressTakenAllocaNotPromoted extern-callee pattern).
+    // MIR lowering stamps MirInstFlags::ReturnsTwice on a DIRECT call to such a
+    // callee; here the fixture sets the flag directly (the carrier-test discipline).
+    mb.addFunction(calleeSig, SymbolId{50},
+                   SymbolBinding::Global, SymbolVisibility::Default);
+    MirBlockId const calleeEntry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(calleeEntry);
+    MirLiteralValue z; z.value = std::int64_t{0}; z.core = TypeKind::I32;
+    mb.addReturn(mb.addConst(z, i32));
+
+    // The function under test: a textbook-promotable scalar slot (single store then
+    // load) PLUS a returns-twice Call that does NOT touch the slot.
+    mb.addFunction(fnSig, SymbolId{100});
+    MirBlockId const entry = mb.createBlock(StructCfMarker::EntryBlock);
+    mb.beginBlock(entry);
+    MirInstId const slot = mb.addInst(MirOpcode::Alloca, {}, ptr);
+    MirLiteralValue v; v.value = std::int64_t{42}; v.core = TypeKind::I32;
+    MirInstId const c = mb.addConst(v, i32);
+    MirInstId const storeOps[] = {c, slot};
+    (void)mb.addInst(MirOpcode::Store, storeOps, InvalidType);   // non-volatile
+    // The returns-twice barrier — its ONLY operand is the callee (no alloca operand,
+    // so the slot does not escape and would otherwise promote cleanly).
+    MirInstId const calleeAddr = mb.addGlobalAddr(SymbolId{50}, calleeSig);
+    MirInstId const callOps[] = {calleeAddr};
+    (void)mb.addInst(MirOpcode::Call, callOps, i32, /*payload=*/0,
+                     MirInstFlags::ReturnsTwice);
+    MirInstId const loadOps[] = {slot};
+    MirInstId const ld = mb.addInst(MirOpcode::Load, loadOps, i32);
+    mb.addReturn(ld);
+    Mir mir = std::move(mb).finish();
+
+    DiagnosticReporter rep;
+    auto const r = opt::passes::runMem2Reg(mir, interner, rep);
+    EXPECT_TRUE(r.ok);
+    EXPECT_EQ(r.allocasPromoted, 0u)
+        << "a returns-twice (setjmp) Call in the function forces every local to stay "
+           "memory-resident — mem2reg must promote nothing (else a live-across-setjmp "
+           "local reads a stale value on the longjmp resume)";
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Alloca), 1u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Store),  1u);
+    EXPECT_EQ(countOpInModule(mir, MirOpcode::Load),   1u);
+}
+
 // Array allocas (alloca with operand count > 0) are NOT scalar slots
 // and MUST NOT be promoted — promoting them would lose memory identity
 // (array indexing reads / writes the contiguous slab).

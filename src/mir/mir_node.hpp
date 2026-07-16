@@ -48,7 +48,31 @@ enum class MirInstFlags : std::uint8_t {
     None      = 0,
     Synthetic = 1u << 0,
     Volatile  = 1u << 1,
-    // bits 2-7 reserved
+    // FC17.9(c) (D-CSUBSET-SETJMP): marks a `Call` whose callee "returns more than
+    // once" (C11 7.13.1.1 — `setjmp`/`_setjmp`). Set at HIR→MIR Call lowering from the
+    // callee's `SymbolRecord.returnsTwice` (via a CST→HIR side-table, the `Volatile`-
+    // from-`isVolatile` funnel mirror). Unlike `noreturn` (HIR-discharged into an
+    // `Unreachable`, never reaching MIR) this flag is the CARRIER the MIR optimizer
+    // passes read: a returns-twice `Call` is a frame-capture barrier — mem2reg must not
+    // promote locals live across it and the inliner must not inline its callee. The
+    // walking-skeleton lands the carrier (the flag reaches MIR + a red-on-disable pin);
+    // the passes that CONSUME it are a follow-on.
+    ReturnsTwice = 1u << 2,
+    // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): marks a plain `Store` that is an
+    // object INITIALIZATION (C11 7.17.2.1 — the initialization of an atomic object
+    // is NOT itself atomic), so the MIR verifier's atomic-lowering belt
+    // (I_AtomicAccessNotLowered) SPARES it even when its target's pointee is
+    // `_Atomic`-qualified. Set at exactly the two runtime-init store paths that are
+    // deliberately left plain (the address-taken atomic-param reception store + the
+    // atomic-global `__module_init__` store); every ordinary scalar `_Atomic`
+    // access instead funnels to AtomicLoad/AtomicStore, so a plain atomic-pointee
+    // Store WITHOUT this flag is a missed funnel site → fails LOUD. Fail-SAFE: a
+    // future init path that forgets the flag trips the belt (a false-positive
+    // caught at test time), never a silent non-atomic access. NOT read by any
+    // optimizer pass (it is a verifier-only exemption marker) — distinct from any
+    // atomic-OP marker (the atomic ops carry their own opcode identity, not a flag).
+    AtomicInitExempt = 1u << 3,
+    // bits 4-7 reserved
 };
 
 [[nodiscard]] inline constexpr MirInstFlags operator|(MirInstFlags a, MirInstFlags b) noexcept {

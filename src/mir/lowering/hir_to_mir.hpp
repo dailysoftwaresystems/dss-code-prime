@@ -265,6 +265,15 @@ lowerToMir(Hir const&               hir,
            // pre-pass to SEED `functionSymbols` so a user call to a shim function
            // lowers to GlobalAddr against the not-yet-defined synth callee.
            std::unordered_map<std::uint32_t, std::string> const*
-               synthRecipeMap = nullptr);
+               synthRecipeMap = nullptr,
+           // FC17.9(c) (D-CSUBSET-SETJMP): per-CALL returns-twice side-table, populated
+           // by the CST→HIR lowerer when a Call's DIRECT callee record is
+           // `SymbolRecord.returnsTwice` (a `setjmp`/`_setjmp`). Optional: nullptr (or a
+           // Call with no entry) ⇒ an ordinary call (no flag). Read at the `finishCall`
+           // chokepoint to OR `MirInstFlags::ReturnsTwice` onto the emitted `Call` — the
+           // carrier the optimizer's returns-twice-aware passes (mem2reg no-promote,
+           // inliner callee-refusal) consult (noreturn is HIR-discharged and never
+           // reaches MIR; returns-twice MUST, so it needs this flag).
+           HirReturnsTwiceMap const* returnsTwiceMap = nullptr);
 
 } // namespace dss

@@ -808,6 +808,60 @@ enum class BuiltinLowering : std::uint16_t {
     // context; until then mir_to_lir fails loud on them.
     SehExceptionCode,
     SehExceptionInfo,
+    // FC17.9(b) walking-skeleton (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 hardware
+    // bit-count primitives, exposed as 6 GCC-compatible builtins that SHARE these
+    // 3 lowerings (the {,ll} width pair per op). Each maps to a dedicated pure
+    // unary MirOpcode (Popcount/Clz/Ctz) at hir_to_mir — the C23 <stdbit.h>
+    // substrate. Clz/Ctz are defined at 0 = width (LZCNT/CLZ/TZCNT semantics), a
+    // safe superset of GCC's UB-at-0.
+    Popcount,
+    Clz,
+    Ctz,
+    // FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 type-generic `stdc_*`
+    // bit operations, each a distinct leaf lowering that COMPOSES the 3 hardware
+    // primitives (Popcount/Clz/Ctz) + universal ALU verbs into the N3096 §7.18
+    // formula at hir_to_mir (the ONE place the width-correct, single-eval,
+    // branchless composition lives). The operand's EXACT width W∈{8,16,32,64} is
+    // read from its param core (56 `__builtin_stdc_<op>_<T>` builtins, 4 widths ×
+    // 14 ops); all count/index/width ops return U32, has_single_bit returns Bool,
+    // bit_floor/bit_ceil return the operand core (C23 return-type rules). NO new
+    // MIR op — these are pure HIR→MIR composition over the proven substrate.
+    StdcLeadingZeros,
+    StdcLeadingOnes,
+    StdcTrailingZeros,
+    StdcTrailingOnes,
+    StdcFirstLeadingZero,
+    StdcFirstLeadingOne,
+    StdcFirstTrailingZero,
+    StdcFirstTrailingOne,
+    StdcCountZeros,
+    StdcCountOnes,
+    StdcHasSingleBit,
+    StdcBitWidth,
+    StdcBitFloor,
+    StdcBitCeil,
+    // FC17.9(d) atomic cycle-1 (D-CSUBSET-ATOMIC): the C11 <stdatomic.h> explicit-
+    // order scalar accessors `atomic_load_explicit`/`atomic_store_explicit`. Each maps
+    // to the dedicated MirOpcode AtomicLoad/AtomicStore (the SAME ops a bare `_Atomic`
+    // access emits) with the memory_order arg const-folded into MirInst.payload (0..5)
+    // at hir_to_mir. APPENDED here (not grouped by AtomicCas) so every pre-existing
+    // enumerator keeps its integer value — the BuiltinCall payload prints numerically
+    // in `.dsshir` text (the TypeKind-placed-LAST numeric-stability precedent).
+    AtomicLoad,
+    AtomicStore,
+    // C99 _Complex (D-CSUBSET-COMPLEX §7.3): the complex builtins the <complex.h>
+    // macros route to. ComplexMake(re, im) constructs a complex BY ADDRESS (the
+    // first aggregate-returning builtin — its "value" is the materialized slot
+    // address; CRITICAL-2). ComplexReal/ComplexImag take a complex BY ADDRESS (the
+    // request value->address flip delivers it) and Gep+Load the F64 component.
+    // ComplexConj copies re, negates im into a fresh slot (by address). APPENDED
+    // (not grouped) so every pre-existing enumerator keeps its integer value — the
+    // BuiltinCall payload prints numerically in `.dsshir` text (the AtomicLoad/Store
+    // + TypeKind-placed-LAST numeric-stability precedent).
+    ComplexMake,
+    ComplexReal,
+    ComplexImag,
+    ComplexConj,
 };
 
 // Resolve the config `lowering` name to its BuiltinLowering. nullopt = an unknown
@@ -817,9 +871,40 @@ enum class BuiltinLowering : std::uint16_t {
 builtinLoweringFromName(std::string_view name) noexcept {
     if (name == "umulh")      { return BuiltinLowering::UMulHigh;  }
     if (name == "atomic_cas") { return BuiltinLowering::AtomicCas; }
+    // FC17.9(d) atomic cycle-1 (D-CSUBSET-ATOMIC): the explicit-order scalar accessors.
+    if (name == "atomic_load")  { return BuiltinLowering::AtomicLoad;  }
+    if (name == "atomic_store") { return BuiltinLowering::AtomicStore; }
+    // C99 _Complex (D-CSUBSET-COMPLEX §7.3): the complex-builtin lowerings.
+    if (name == "complex_make") { return BuiltinLowering::ComplexMake; }
+    if (name == "complex_real") { return BuiltinLowering::ComplexReal; }
+    if (name == "complex_imag") { return BuiltinLowering::ComplexImag; }
+    if (name == "complex_conj") { return BuiltinLowering::ComplexConj; }
     if (name == "barrier")    { return BuiltinLowering::Barrier;   }
     if (name == "seh_exception_code") { return BuiltinLowering::SehExceptionCode; }
     if (name == "seh_exception_info") { return BuiltinLowering::SehExceptionInfo; }
+    // FC17.9(b) (D-CSUBSET-BITCOUNT-INTRINSICS): the 3 bit-count verbs shared by
+    // the 6 __builtin_{popcount,clz,ctz}{,ll} rows (the width lives in the param
+    // core U32/U64, read by the hir_to_mir arm — the lowering tag is width-blind).
+    if (name == "popcount") { return BuiltinLowering::Popcount; }
+    if (name == "clz")      { return BuiltinLowering::Clz;      }
+    if (name == "ctz")      { return BuiltinLowering::Ctz;      }
+    // FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): the 14 `stdc_*` op lowerings
+    // (shared by each op's 4 width rows — the width lives in the param core, read
+    // by the hir_to_mir arm; the lowering tag is width-blind, like popcount/clz/ctz).
+    if (name == "stdc_leading_zeros")       { return BuiltinLowering::StdcLeadingZeros; }
+    if (name == "stdc_leading_ones")        { return BuiltinLowering::StdcLeadingOnes; }
+    if (name == "stdc_trailing_zeros")      { return BuiltinLowering::StdcTrailingZeros; }
+    if (name == "stdc_trailing_ones")       { return BuiltinLowering::StdcTrailingOnes; }
+    if (name == "stdc_first_leading_zero")  { return BuiltinLowering::StdcFirstLeadingZero; }
+    if (name == "stdc_first_leading_one")   { return BuiltinLowering::StdcFirstLeadingOne; }
+    if (name == "stdc_first_trailing_zero") { return BuiltinLowering::StdcFirstTrailingZero; }
+    if (name == "stdc_first_trailing_one")  { return BuiltinLowering::StdcFirstTrailingOne; }
+    if (name == "stdc_count_zeros")         { return BuiltinLowering::StdcCountZeros; }
+    if (name == "stdc_count_ones")          { return BuiltinLowering::StdcCountOnes; }
+    if (name == "stdc_has_single_bit")      { return BuiltinLowering::StdcHasSingleBit; }
+    if (name == "stdc_bit_width")           { return BuiltinLowering::StdcBitWidth; }
+    if (name == "stdc_bit_floor")           { return BuiltinLowering::StdcBitFloor; }
+    if (name == "stdc_bit_ceil")            { return BuiltinLowering::StdcBitCeil; }
     return std::nullopt;
 }
 
@@ -1021,11 +1106,46 @@ struct DSS_EXPORT TypeSpecifierRule {
     std::vector<std::string>   tokenNames;   // source spellings, for diagnostics
     TypeKind                   core = TypeKind::Void;
     std::unordered_map<DataModel, TypeKind> coreByDataModel;
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the per-longDoubleFormat override —
+    // `{"x87-80": "F80", "ieee128": "F128"}` on the `long double` row (the
+    // f64 axis takes the BASE core, the LLP64 `long`≡`int` collapse
+    // precedent). Closed keys (longDoubleFormatFromName) + closed values
+    // (coreTypeFromName) at load, mirroring coreByDataModel.
+    std::unordered_map<LongDoubleFormat, TypeKind> coreByLongDoubleFormat;
+    // C99 _Complex (D-CSUBSET-COMPLEX §6.2.5): when true, the resolved (data-model +
+    // long-double-axis-aware) `core` is the ELEMENT float type, and the specifier-
+    // resolution site wraps it in `interner.complex(interner.primitive(element))`
+    // instead of `interner.primitive(element)`. So `double _Complex`→complex(F64),
+    // `long double _Complex`→complex(F80/F128/F64) — the element rides the SAME
+    // resolveCore axis machinery for free. `false` = an ordinary scalar specifier
+    // (every pre-existing row, byte-identical). A non-float `core` under `complex`
+    // is a config bug (the loader could validate; the interner would just wrap it).
+    bool complex = false;
     [[nodiscard]] TypeKind resolveCore(DataModel dm) const {
         if (auto it = coreByDataModel.find(dm); it != coreByDataModel.end()) {
             return it->second;
         }
         return core;
+    }
+    // FC17.9(e): the axis-aware resolver. nullopt ⇔ the row DEPENDS on the
+    // long-double axis (`coreByLongDoubleFormat` non-empty) but the active
+    // format declared none (`None`) — the row is UNREALIZED; the caller
+    // fails loud (S_LongDoubleFormatUndeclared). NEVER falls back to the
+    // base core in that case — the base is the F64-axis meaning, and
+    // silently binding it under an undeclared axis is the exact
+    // representation mis-bind this axis exists to prevent (the `long`
+    // lesson). A declared axis MISSING from the map (f64) takes the base
+    // core; a row with no map resolves exactly as resolveCore(dm).
+    [[nodiscard]] std::optional<TypeKind>
+    resolveCore(DataModel dm, LongDoubleFormat ldf) const {
+        if (!coreByLongDoubleFormat.empty()) {
+            if (auto it = coreByLongDoubleFormat.find(ldf);
+                it != coreByLongDoubleFormat.end()) {
+                return it->second;
+            }
+            if (ldf == LongDoubleFormat::None) return std::nullopt;
+        }
+        return resolveCore(dm);
     }
 };
 
@@ -1044,11 +1164,29 @@ struct DSS_EXPORT DataModelTypeRef {
     std::string name;                        // source spelling, for diagnostics
     TypeKind    core = TypeKind::Void;
     std::unordered_map<DataModel, TypeKind> coreByDataModel;
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): copied from the resolved
+    // typeSpecifiers row at load (the "long double" float-literal rule) —
+    // WITHOUT this copy the literal row would silently drop the axis map
+    // and type every `20.0L` at the base core (the knob-that-lies).
+    std::unordered_map<LongDoubleFormat, TypeKind> coreByLongDoubleFormat;
     [[nodiscard]] TypeKind resolveCore(DataModel dm) const {
         if (auto it = coreByDataModel.find(dm); it != coreByDataModel.end()) {
             return it->second;
         }
         return core;
+    }
+    // FC17.9(e): the axis-aware resolver — nullopt ⇔ axis-dependent ref
+    // under an undeclared (None) axis; see TypeSpecifierRule::resolveCore.
+    [[nodiscard]] std::optional<TypeKind>
+    resolveCore(DataModel dm, LongDoubleFormat ldf) const {
+        if (!coreByLongDoubleFormat.empty()) {
+            if (auto it = coreByLongDoubleFormat.find(ldf);
+                it != coreByLongDoubleFormat.end()) {
+                return it->second;
+            }
+            if (ldf == LongDoubleFormat::None) return std::nullopt;
+        }
+        return resolveCore(dm);
     }
 };
 
@@ -1545,6 +1683,15 @@ struct DSS_EXPORT SemanticConfig {
     // hirLowering row maps to Skip). Invalid ⇒ the language has no static-assertion
     // surface (toy/tsql — the check never runs).
     RuleId        staticAssertRule{}; std::string staticAssertRuleName;
+    // FC17.9(i) (D-CSUBSET-INLINE-ASM, C23 6.8 / GNU 6.47): the `__asm__` inline-asm
+    // STATEMENT rule (asmStmt). Pass 2 decodes the template child (the SAME
+    // decodeAdjacentStringBodies chokepoint staticAssert's message uses) and REQUIRES
+    // a strictly-empty decoded string; a non-empty / whitespace-only / malformed-escape
+    // template fails loud S_InlineAsmNonEmptyTemplate (real per-target asm text is the
+    // D-CSUBSET-INLINE-ASM-TEXT deferral). The empty form lowers to a MirOpcode::
+    // CompilerBarrier fence (hirLowering asmStmt → InlineAsm). Invalid ⇒ the language
+    // has no inline-asm surface (toy/tsql — the check never runs).
+    RuleId        inlineAsmRule{}; std::string inlineAsmRuleName;
     // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): `_Generic` generic
     // selection. `genericRule` = the `genericExpr` shape; `genericControlChild` =
     // the visible-child index of the controlling `assignmentExpr`. When Pass 2
@@ -1614,6 +1761,18 @@ struct DSS_EXPORT SemanticConfig {
     // volatile qualifier. Source-agnostic: the engine reads THIS, never a hardcoded
     // token name.
     std::optional<SchemaTokenId>    volatileMarker;
+    // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the language's `_Atomic`-class qualifier
+    // token (c-subset: `AtomicKeyword`). The LIVE driver of the atomic type-qualifier
+    // wrap, EXACTLY parallel to `volatileMarker` above and read at the SAME two resolver
+    // arms: a `atomicMarker` token BEFORE the first `pointerToken` qualifies the base
+    // (innermost pointee) ⇒ wrap base via `atomicQualified` so `_Atomic int *` =
+    // Ptr<atomicQualified(int)>; AFTER the last star (east) is the POINTER OBJECT's
+    // `_Atomic`, threaded by the declarator's pointer-layer loop as
+    // atomicQualified(Ptr<...>). Composes with `volatileMarker` in the ONE shared
+    // {volatile,atomic} bitset skin (cycle 1a `qualified` merges bits, order-independent).
+    // Absent (nullopt) ⇒ the language has no `_Atomic` qualifier. Source-agnostic: the
+    // engine reads THIS, never a hardcoded token name.
+    std::optional<SchemaTokenId>    atomicMarker;
     // FF6 Slice 2 + audit fold (2026-06-02): per-object-format
     // runtime library identity for SOURCE-DECLARED externs. The
     // source language's grammar emits a complete `extern int

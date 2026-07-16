@@ -7,6 +7,7 @@
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/attributes/linkage_attr.hpp"
 #include "hir/attributes/mutability_attr.hpp"
+#include "hir/attributes/returns_twice_attr.hpp"
 #include "hir/attributes/shader_intrinsic.hpp"
 #include "hir/attributes/source_span.hpp"
 #include "hir/attributes/thread_local_attr.hpp"
@@ -80,6 +81,15 @@ using HirAlignmentMap = HirAttribute<AlignmentAttr>;
 // declaration-keyed mutability map) and flows to the Load/Store FLAG (unlike
 // mutability's section selection) — genuinely new plumbing.
 using HirVolatileMap = HirAttribute<VolatileAttr>;
+
+// FC17.9(c) (D-CSUBSET-SETJMP): per-CALL returns-twice marker for a direct call to a
+// `setjmp`/`_setjmp` (a callee whose `SymbolRecord.returnsTwice` is set). Populated by
+// CST->HIR lowering; read by HIR->MIR lowering to OR `MirInstFlags::ReturnsTwice` onto
+// the emitted `Call` so the optimizer's returns-twice-aware passes (mem2reg no-promote,
+// inliner callee-refusal) cannot promote a live-across-setjmp local or inline a
+// setjmp-containing callee. Keyed on the USE (Call) node and flows to an instruction
+// FLAG — the `HirVolatileMap` discipline, applied to Call instead of Load/Store.
+using HirReturnsTwiceMap = HirAttribute<ReturnsTwiceAttr>;
 
 // Shader stage / built-in / workgroup / binding data. Populated by shader-shape
 // lowering (plan 17); read by SPIR-V codegen.

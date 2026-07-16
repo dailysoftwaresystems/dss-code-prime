@@ -1,0 +1,35 @@
+{
+  "$comment": "FC17.9(b) C23 <stdbit.h> (D-FULLC-STDBIT): runtime witness for ALL 14 type-generic bit operations (N3096 §7.18) across the 4 concrete widths (uc/us/ui/ull), the 4-way _Generic form, the per-format _ul macro, and the edge inputs (0, 1, all-ones, single high bit). Each stdc_* macro (from <stdbit.h>) expands to a __builtin_stdc_<op>_<T> compiler intrinsic that lowers to a width-correct, single-eval, BRANCHLESS composition of the 3 hardware bit-count primitives (Popcount/Clz/Ctz) + universal ALU verbs — NOT a linkable call. Fold-resistant: each op runs behind a wrapper fn taking the value as an arg, and the Clz/Ctz/Popcount cores are NOT in ConstFold's fold set — so the `release` (shippedPipeline) arm proves the ops survive Inlining + the full optimizer. Differential: x86-64 (native POPCNT/LZCNT/TZCNT) and arm64 (native CLZ + RBIT-then-CLZ ctz + SWAR popcount) MUST agree — a single-arch width/clz-ctz bug changes the sum. Exit derived BY HAND from C23 §7.18 (independently, not from DSS): 32+4+7+8+16+4+5+8+5+4+1+16+4+8 (the 14 ops) + 8+8+1+1+0+0+8 (edges/all-ones) + 8+8+4 (generic ×2 + per-format _ul) = 168.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 168,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

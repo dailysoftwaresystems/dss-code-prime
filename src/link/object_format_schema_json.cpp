@@ -288,6 +288,35 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
         }
     }
 
+    // ── FC17.9(e) (D-CSUBSET-LONG-DOUBLE): OPTIONAL `longDoubleFormat` ──
+    //
+    // The per-format `long double` representation axis ("f64" / "x87-80" /
+    // "ieee128"). OS/format-determined like `dataModel`/`bitFieldStrategy`
+    // (x86_64 serves BOTH pe64's 64-bit-IEEE and ELF-SysV's x87 80-bit), so
+    // it lives here. OPTIONAL: absent ⇒ LongDoubleFormat::None — the semantic
+    // bind then leaves `long double` rows UNREALIZED (loud
+    // S_LongDoubleFormatUndeclared on use, never a silent base-core width). A
+    // wrong spelling is a HARD error — a typo can never silently un-declare
+    // the axis (the dataModel discipline). `None` has no spelling: omission
+    // is the only undeclared state.
+    if (doc.contains("longDoubleFormat")) {
+        if (!doc.at("longDoubleFormat").is_string()) {
+            coll.emit(DiagnosticCode::C_MalformedJson, "/longDoubleFormat",
+                      "'longDoubleFormat' must be a string ('f64', 'x87-80', "
+                      "or 'ieee128')");
+        } else {
+            auto const s = doc.at("longDoubleFormat").get<std::string>();
+            auto const lf = longDoubleFormatFromName(s);
+            if (!lf) {
+                coll.emit(DiagnosticCode::C_MalformedJson, "/longDoubleFormat",
+                          std::format("unknown longDoubleFormat '{}' — expected "
+                                      "'f64', 'x87-80', or 'ieee128'", s));
+            } else {
+                data.longDoubleFormat = *lf;
+            }
+        }
+    }
+
     // Top-level `entryPoint` — universal entry-symbol name for
     // executable artifacts (e.g. "_start" / "main" / Mach-O's
     // LC_MAIN target). Empty for relocatable artifacts. The walker

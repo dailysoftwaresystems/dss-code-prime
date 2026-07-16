@@ -8,6 +8,7 @@
 #include "core/types/aggregate_layout.hpp"
 #include "core/types/data_model.hpp"
 #include "core/types/strong_ids.hpp"
+#include "core/types/target_schema.hpp"   // D-CSUBSET-COMPLEX: regClassForCoreType pin
 #include "core/types/type_lattice/core_type.hpp"
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
@@ -58,6 +59,10 @@ TEST(TypeLayout, ScalarSizesAndAligns) {
              Case{TypeKind::I32, 4, 4},  Case{TypeKind::F32, 4, 4},
              Case{TypeKind::I64, 8, 8},  Case{TypeKind::F64, 8, 8},
              Case{TypeKind::I128, 16, 16}, Case{TypeKind::F128, 16, 16},
+             // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): x87 80-bit STORES 16/16 —
+             // x86_64-SysV pads the 10 significant bytes to a 16-byte,
+             // 16-aligned slot (the same envelope binary128 uses).
+             Case{TypeKind::F80, 16, 16},
          }) {
         auto const l = layoutOf(ti.primitive(c.k), ti);
         EXPECT_EQ(l.size, c.size) << "size of kind " << static_cast<int>(c.k);
@@ -1126,6 +1131,42 @@ TEST(TypeLayout, VolatileQualifierDoesNotChangeLayout) {
     EXPECT_EQ(layoutOf(va, ti).size, 16u);
 }
 
+// FC17.9(d) 1a (D-CSUBSET-QUAL-BITSET): the SAME layout-invariance holds for the
+// atomic bit and for the combined `_Atomic volatile` mask — the layout engine strips
+// the whole qualifier skin, so a lock-free-scalar atomic never changes size/align (a
+// naturally-aligned `_Atomic int` IS lock-free; non-lock-free `_Atomic` is a cycle-1b
+// fail-loud, never a silent layout change). The scalar arms are coverage-by-
+// construction (kind() is transparent); the top-level `_Atomic struct` arm is the
+// RED-ON-DISABLE seam — computeLayout must `stripVolatile` at entry to see the raw
+// Struct kind, so deleting that strip makes the atomic-qualified struct hit the engine
+// default (raw kind != Struct) → nullopt → the struct EXPECTs below fail (the exact
+// `VolatileQualifierDoesNotChangeLayout` precedent, now proven for the atomic bit too).
+TEST(TypeLayout, AtomicQualifierDoesNotChangeLayout) {
+    auto ti = makeInterner(1);
+    const TypeId i32  = ti.primitive(TypeKind::I32);
+    const TypeId ai32 = ti.atomicQualified(i32);                          // _Atomic int
+    const TypeId avi32 = ti.atomicQualified(ti.volatileQualified(i32));   // _Atomic volatile int
+    auto const li = layoutOf(i32, ti);
+    for (const TypeId q : {ai32, avi32}) {                                // scalar: 4/4
+        auto const lq = layoutOf(q, ti);
+        EXPECT_EQ(lq.size, li.size);
+        EXPECT_EQ(lq.align.bytes(), li.align.bytes());
+        EXPECT_EQ(lq.size, 4u);
+    }
+    // top-level `_Atomic struct S` ≡ struct S (2 fields i32+f32) — the strip-seam arm.
+    const TypeId f32 = ti.primitive(TypeKind::F32);
+    std::array<TypeId, 2> const fields{i32, f32};
+    const TypeId s  = ti.structType("S", fields);
+    const TypeId as = ti.atomicQualified(s);
+    auto const ls  = layoutOf(s, ti);
+    auto const las = layoutOf(as, ti);
+    EXPECT_EQ(las.size, ls.size);
+    EXPECT_EQ(las.align.bytes(), ls.align.bytes());
+    ASSERT_EQ(las.fieldOffsets.size(), ls.fieldOffsets.size());
+    for (std::size_t i = 0; i < ls.fieldOffsets.size(); ++i)
+        EXPECT_EQ(las.fieldOffsets[i], ls.fieldOffsets[i]);
+}
+
 // ── C23 _BitInt(N) ABI (D-CSUBSET-BITINT) — witnessed vs clang-19 x86-64 psABI ──
 
 TEST(TypeLayout, BitIntSizeAndAlign) {
@@ -1196,4 +1237,43 @@ TEST(TypeLayout, WideBitIntTypeShapePredicates) {
     EXPECT_FALSE(isByValueClass(ti, narrow));
     EXPECT_FALSE(isByValueClass(ti, i32));
     EXPECT_FALSE(isByValueClass(ti, TypeId{}));
+}
+
+// C99 _Complex (D-CSUBSET-COMPLEX §6.2.5p13): a complex lays out as {re@0, im@es},
+// size 2×elemSize, align = element align — the ABI leaf {re, im} layout. It is a
+// memory-resident by-VALUE class (like a struct{re,im}; NOT decaying like an array).
+TEST(TypeLayout, ComplexLayoutAndShapePredicates) {
+    auto ti = makeInterner(73);
+    TypeId const cd  = ti.complex(ti.primitive(TypeKind::F64));   // double _Complex
+    TypeId const cf  = ti.complex(ti.primitive(TypeKind::F32));   // float _Complex
+    TypeId const cld = ti.complex(ti.primitive(TypeKind::F80));   // long double (x87-80)
+
+    // Layout: size 2×elem, align == element align. double→16/8, float→8/4, F80→32/16.
+    auto const ld = layoutOf(cd, ti);
+    EXPECT_EQ(ld.size, 16u);   EXPECT_EQ(ld.align.bytes(), 8u);
+    auto const lf = layoutOf(cf, ti);
+    EXPECT_EQ(lf.size, 8u);    EXPECT_EQ(lf.align.bytes(), 4u);
+    auto const lld = layoutOf(cld, ti);
+    EXPECT_EQ(lld.size, 32u);  EXPECT_EQ(lld.align.bytes(), 16u);
+
+    // isComplex + complexElement round-trip; a non-complex is not complex.
+    EXPECT_TRUE(isComplex(ti, cd));
+    EXPECT_FALSE(isComplex(ti, ti.primitive(TypeKind::F64)));
+    EXPECT_FALSE(isComplex(ti, TypeId{}));
+    EXPECT_EQ(ti.complexElement(cd).v, ti.primitive(TypeKind::F64).v);
+    EXPECT_EQ(ti.complexElement(cf).v, ti.primitive(TypeKind::F32).v);
+
+    // Memory-resident AND by-value-class (a complex is passed/returned like a struct;
+    // it does NOT decay). NOT a wide _BitInt.
+    EXPECT_TRUE(isMemoryResidentType(ti, cd));
+    EXPECT_TRUE(isByValueClass(ti, cd));
+    EXPECT_FALSE(isWideBitInt(ti, cd));
+
+    // IMPORTANT-5 (red-on-disable): a Complex takes the GPR default reg class — NEVER
+    // the FPR arm. requireEncodedFloatWidth no-ops on non-FPR, so the aggregate never
+    // trips the F80/F128 wall; its F64 COMPONENTS query regClassForCoreType(F64)=FPR
+    // correctly. A Complex→FPR arm would silently integer-plumb / wrong-gate — this
+    // pin fails the moment one is added.
+    EXPECT_EQ(regClassForCoreType(TypeKind::Complex), TargetRegClass::GPR);
+    EXPECT_EQ(regClassForCoreType(TypeKind::F64),     TargetRegClass::FPR);
 }

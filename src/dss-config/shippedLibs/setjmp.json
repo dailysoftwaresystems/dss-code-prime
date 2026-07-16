@@ -1,0 +1,25 @@
+{
+  "$comment": "C11/C23 <setjmp.h> (7.13) — FC17.9(c) (D-CSUBSET-SETJMP). Non-local jump via a libc FFI (Option A — the synthesized alternative is REFUTED: DSS's IndirectBr needs a closed same-function target list, so it can't jump into an arbitrary ancestor frame; there is no inline asm yet). setjmp/longjmp are REAL libc exports (glibc libc.so.6, macOS libSystem, Windows msvcrt) — this descriptor binds them exactly like the pthread/threads typedef+macro precedents. THREE realizations per format: elf+macho ship the plain 1-arg `setjmp(jmp_buf)->i32`; pe ships MSVC's 2-arg `_setjmp(env, frame)->i32` (msvcrt export) PLUS a pe-only function-like MACRO `setjmp(env) -> _setjmp(env, 0)` (the stdbit.json per-format macro precedent) — frame=0 selects the plain non-SEH restore, which is correct for c-subset (no __try/setjmp interaction; the SEH-aware frame!=0 unwind is DEFERRED — D-WIN64-SEH-SCOPE). `longjmp(env, v)->void` is one entry on ALL formats (same ABI) carrying `noreturn:true` (D-CSUBSET-NORETURN — the direct call is HIR-discharged into Block{ExprStmt(call), Unreachable}). setjmp/_setjmp carry `returnsTwice:true` (D-CSUBSET-SETJMP) — a SECOND value channel mirroring noreturn: the descriptor bit → SymbolRecord.returnsTwice → a per-Call MirInstFlags::ReturnsTwice carrier at HIR->MIR (noreturn is HIR-discharged and never reaches MIR, so the flag is what the OPTIMIZER's mem2reg/inliner passes read — the walking-skeleton lands the carrier; the optimizer hardening is a follow-on). ★ jmp_buf is an OPAQUE per-ARCH-sized buffer (the program only allocates one + passes &env; libc writes its own bytes). Sizes DIFFER BY ARCH within a format, so the typedef `variants` key on BOTH {arch,format} (matchVariantWhen allowArch=true — the sys/stat.json per-arch precedent) and ENUMERATE EVERY built (arch,format) pair; a 0-match ⇒ jmp_buf is NOT injected ⇒ a later use fails loud (undefined type), never a silent wrong size. VERIFIED sizes: elf x86_64 = 200B (glibc __jmp_buf 8 longs + __mask_was_saved + 128B sigset) = arr<i64,25>; elf arm64 = 312B (22-doubleword __jmp_buf + 128B sigset) = arr<i64,39>; pe x86_64 = 256B, ALIGN 16 (MSVC _JUMP_BUFFER = SETJMP_FLOAT128 Part[16], each a 16B/16-aligned unit — _setjmp saves Xmm6-Xmm15 with `movaps`, so the buffer MUST be 16-aligned or it #GP-crashes) — expressed as arr<u128,16>: a 16-BYTE/16-ALIGNED element (u128 aligns to the x86_64 target's maxAlignment=16) yields 256B at 16-align WITHOUT an alignas field (the alloca honors the type's natural alignment via computeLayout — pure config data, no code branch). macho arm64 = 192B researched (_JBLEN=(14+8+2)*2=48 ints × 4B; plain jmp_buf, no sigset — we ship setjmp not sigsetjmp), over-sized to 224B = arr<i64,28> for margin on the CI-only leg (can't run locally on win/wsl/qemu — validated on the macos-arm64 CI leg). sigsetjmp/siglongjmp + the sigmask channel are DEFERRED (D-CSUBSET-SETJMP-SIGMASK). Gated availableObjectFormats:[elf,pe,macho].",
+  "header": "setjmp.h",
+  "standard": "c11",
+  "availableObjectFormats": ["elf", "pe", "macho"],
+  "library": { "elf": "libc.so.6", "pe": "msvcrt.dll", "macho": "/usr/lib/libSystem.B.dylib" },
+  "symbols": [
+    { "name": "setjmp",  "signature": "fn(ptr<void>) -> i32",            "returnsTwice": true, "availableObjectFormats": ["elf", "macho"] },
+    { "name": "_setjmp", "signature": "fn(ptr<void>, ptr<void>) -> i32", "returnsTwice": true, "availableObjectFormats": ["pe"] },
+    { "name": "longjmp", "signature": "fn(ptr<void>, i32) -> void",      "noreturn": true }
+  ],
+  "typedefs": [
+    { "name": "jmp_buf", "variants": [
+      { "when": { "arch": "x86_64", "format": "elf" },   "type": "arr<i64, 25>" },
+      { "when": { "arch": "arm64",  "format": "elf" },   "type": "arr<i64, 39>" },
+      { "when": { "arch": "x86_64", "format": "pe" },    "type": "arr<u128, 16>" },
+      { "when": { "arch": "arm64",  "format": "macho" }, "type": "arr<i64, 28>" }
+    ] }
+  ],
+  "macros": [
+    { "name": "setjmp", "variants": [
+      { "when": { "format": "pe" }, "params": ["env"], "replacement": "_setjmp(env, 0)" }
+    ] }
+  ]
+}

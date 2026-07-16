@@ -24,6 +24,15 @@ src/dss-config/** text eol=lf
 # runner's source read, mis-resolving the asserted line:col.
 examples/** text eol=lf
 
+# FC17.9(h) C23 `#embed` resource files. A committed binary resource (e.g. the
+# c23_embed example's answer.bin, whose bytes include 0x0D CR / 0x0A LF / 0x1A
+# SUB) MUST NOT be CRLF-normalized by the `examples/** text eol=lf` rule above —
+# that would corrupt the bytes `#embed` reads, failing ONLY on fresh clones / CI.
+# This later line WINS by last-match precedence, marking every examples `.bin`
+# strictly binary (byte-identical on every checkout). The self-witnessing example
+# (blob[1] == 13) is the red canary if this is ever lost.
+examples/**/*.bin binary
+
 # `.dsshir` HIR text-format goldens — emitted with LF by `emitHir` and compared
 # byte-exact by the HIR text + lowering golden tests (test_hir_text.cpp,
 # test_hir_lowering_*.cpp). Without this a Windows `core.autocrlf` checkout

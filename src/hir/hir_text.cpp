@@ -79,7 +79,8 @@ namespace {
         case TypeKind::U32:  return "u32";  case TypeKind::U64: return "u64";
         case TypeKind::U128: return "u128";
         case TypeKind::F16:  return "f16";  case TypeKind::F32: return "f32";
-        case TypeKind::F64:  return "f64";  case TypeKind::F128: return "f128";
+        case TypeKind::F64:  return "f64";  case TypeKind::F80: return "f80";
+        case TypeKind::F128: return "f128";
         case TypeKind::Char: return "char"; case TypeKind::Byte: return "byte";
         case TypeKind::Void: return "void";
         case TypeKind::NullptrT: return "nullptr_t";  // C23 (debug-dump only)
@@ -95,7 +96,8 @@ namespace {
     if (s == "u32")  return TypeKind::U32;  if (s == "u64") return TypeKind::U64;
     if (s == "u128") return TypeKind::U128;
     if (s == "f16")  return TypeKind::F16;  if (s == "f32") return TypeKind::F32;
-    if (s == "f64")  return TypeKind::F64;  if (s == "f128") return TypeKind::F128;
+    if (s == "f64")  return TypeKind::F64;  if (s == "f80") return TypeKind::F80;
+    if (s == "f128") return TypeKind::F128;
     if (s == "char") return TypeKind::Char; if (s == "byte") return TypeKind::Byte;
     if (s == "void") return TypeKind::Void;
     if (s == "nullptr_t") return TypeKind::NullptrT;  // C23 (debug-dump only)
@@ -366,6 +368,26 @@ private:
             return;
         }
         TypeInterner const& in = *ctx_.interner;
+        // D-CSUBSET-QUAL-BITSET (M1): a qualifier skin (`volatile` / `_Atomic`) is
+        // TRANSPARENT to in.kind()/operands()/scalars(), so it must be spelled from
+        // the RAW `isVolatileQualified`/`isAtomicQualified` predicates BEFORE the kind
+        // switch — otherwise the switch sees THROUGH to the material kind and the
+        // qualifier silently DROPS in text (a shipped `_Atomic int` typedef would
+        // reintern as plain `int` — the exact loss-of-atomicity this codec closes).
+        // Emit nested keyword wrappers over the material type; `parseType` merges the
+        // bits back into ONE skin on reintern (`atomic<volatile<T>>` → bits{V,A}), so
+        // the round-trip is identity. `atomic` outermost is the canonical order (the
+        // bitset is order-independent — this only fixes a deterministic spelling).
+        if (in.isVolatileQualified(t) || in.isAtomicQualified(t)) {
+            bool const atom = in.isAtomicQualified(t);
+            bool const vol  = in.isVolatileQualified(t);
+            if (atom) out_ += "atomic<";
+            if (vol)  out_ += "volatile<";
+            appendType(in.stripVolatile(t));   // the material type (skin stripped)
+            if (vol)  out_ += '>';
+            if (atom) out_ += '>';
+            return;
+        }
         auto args = [&](std::span<TypeId const> ops) {
             bool first = true;
             for (TypeId o : ops) { if (!first) out_ += ", "; appendType(o); first = false; }
@@ -383,6 +405,12 @@ private:
             case TypeKind::Matrix:
                 out_ += "mat<"; appendType(in.operands(t)[0]);
                 out_ += std::format(", {}, {}>", in.scalars(t)[0], in.scalars(t)[1]); return;
+            // C99 _Complex (D-CSUBSET-COMPLEX, M1): `complex<elem>` — the bidirectional
+            // twin of parseType's `complex` keyword. So a `double complex` typedef /
+            // the `__builtin_complex` signature spells a genuine Complex type through
+            // the shipped-lib text codec.
+            case TypeKind::Complex:
+                out_ += "complex<"; appendType(in.operands(t)[0]); out_ += '>'; return;
             case TypeKind::Array:
                 out_ += "arr<"; appendType(in.operands(t)[0]);
                 out_ += std::format(", {}>", in.scalars(t)[0]); return;
@@ -722,6 +750,11 @@ private:
             case HirKind::IndirectGotoStmt:
                 out_ += "goto"; out_ += flagsStr(f); out_ += " *";
                 emitExpr(hir_.indirectGotoTarget(id)); out_ += '\n'; return;
+            case HirKind::InlineAsm:
+                // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template asm barrier —
+                // a 0-child leaf (no payload in cycle-1). Round-trips as a bare
+                // `inline_asm` keyword line.
+                out_ += "inline_asm"; out_ += flagsStr(f); out_ += '\n'; return;
             case HirKind::Error: case HirKind::Extension:
                 emitExtOrError(id, /*inlineForm=*/false, ind); out_ += '\n'; return;
             default:
@@ -1789,6 +1822,9 @@ private:
             return builder_.makeBreak(d, flags); }
         if (kw == "continue") { std::uint32_t d = peekIs(Tk::Int) ? static_cast<std::uint32_t>(takeInt()) : 0u;
             return builder_.makeContinue(d, flags); }
+        // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template asm barrier — a bare
+        // `inline_asm` leaf (mirrors the writer arm; no payload in cycle-1).
+        if (kw == "inline_asm") return builder_.addLeaf(HirKind::InlineAsm, InvalidType, 0, flags);
         if (kw == "return") {
             // A return value may carry inline attributes (`return @loc(...) expr`).
             // A value-less `return` is always block-terminal (nothing may follow
@@ -1910,6 +1946,20 @@ private:
         if (kw == "nullable") return wrap1(&TypeInterner::nullable);
         if (kw == "optional") return wrap1(&TypeInterner::optional);
         if (kw == "slice") return wrap1(&TypeInterner::slice);
+        // C99 _Complex (D-CSUBSET-COMPLEX, M1): `complex<elem>` reinterns via the
+        // single-operand `complex` builder — the appendType twin. Placed among the
+        // wrap1 keywords (the `signature` decode of `__builtin_complex`'s
+        // `complex<f64>` result routes here). primFromName has no "complex" entry, so
+        // the check above fell through to here.
+        if (kw == "complex") return wrap1(&TypeInterner::complex);
+        // D-CSUBSET-QUAL-BITSET (M1): the bidirectional twin of appendType's qualifier
+        // spelling. `volatile<T>`/`atomic<T>` reintern via volatileQualified/
+        // atomicQualified, which STRIP→UNION→re-intern ONE skin — so a nested
+        // `atomic<volatile<T>>` merges to bits{Volatile,Atomic} (order-independent),
+        // and a shipped `atomic<i32>` typedef (stdatomic.json's atomic_int) genuinely
+        // carries the Atomic bit. Closes the pre-existing volatile-drops-in-text gap too.
+        if (kw == "volatile") return wrap1(&TypeInterner::volatileQualified);
+        if (kw == "atomic") return wrap1(&TypeInterner::atomicQualified);
         if (kw == "fnptr") { expect(Tk::LAngle, "'<'"); (void)parseType(); expect(Tk::RAngle, "'>'");
             malformed("fnptr<> is not constructible in this interner"); return InvalidType; }
         if (kw == "vec") { expect(Tk::LAngle, "'<'"); TypeId e = parseType(); expect(Tk::Comma, "','");

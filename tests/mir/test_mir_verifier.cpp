@@ -906,3 +906,120 @@ TEST(MirVerifier, FixedAllocaWithSpuriousOperandRejected) {
     EXPECT_FALSE(v.verify(r));
     EXPECT_EQ(countCode(r, DiagnosticCode::I_VlaAllocaOperandInvalid), 1u);
 }
+
+// ── FC17.9(d) 1b (D-CSUBSET-ATOMIC): the atomic-lowering belt ────────────────
+//
+// A plain Load/Store still carrying an `_Atomic`-qualified accessed type is a
+// MISSED funnel site — it must have lowered to AtomicLoad/AtomicStore. The belt
+// converts that silent non-atomic access into a LOUD I_AtomicAccessNotLowered.
+
+// Negative (RED-ON-DISABLE): a plain `load` whose RESULT type is `_Atomic`-
+// qualified is rejected. Remove the belt (checkAtomicAccessLowered) → this Load
+// passes silently → a non-atomic read of atomic memory ships. That is exactly the
+// regression the belt exists to catch.
+TEST(MirVerifier, PlainLoadOfAtomicTypeRejected) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32       = interner.primitive(TypeKind::I32);
+    TypeId const atomicI32 = interner.atomicQualified(i32);
+    TypeId const ptrAtomic = interner.pointer(atomicI32);
+    TypeId const fnSig = interner.fnSig({}, interner.primitive(TypeKind::Void),
+                                        CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const slot = b.addInst(MirOpcode::Alloca, {}, ptrAtomic);
+    std::array<MirInstId, 1> const ld{slot};
+    // A PLAIN Load of an atomic-qualified type — the missed-funnel shape.
+    b.addInst(MirOpcode::Load, ld, atomicI32);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &interner};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_AtomicAccessNotLowered), 1u);
+}
+
+// Negative (RED-ON-DISABLE): a plain `store` whose ADDRESS operand's pointee is
+// `_Atomic`-qualified — and WITHOUT the AtomicInitExempt flag — is rejected.
+TEST(MirVerifier, PlainStoreToAtomicPointeeRejected) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32       = interner.primitive(TypeKind::I32);
+    TypeId const atomicI32 = interner.atomicQualified(i32);
+    TypeId const ptrAtomic = interner.pointer(atomicI32);
+    TypeId const fnSig = interner.fnSig({}, interner.primitive(TypeKind::Void),
+                                        CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const slot = b.addInst(MirOpcode::Alloca, {}, ptrAtomic);
+    MirInstId const val  = b.addConst(intLit(7), i32);
+    std::array<MirInstId, 2> const st{val, slot};   // Store order = [value, ptr]
+    b.addInst(MirOpcode::Store, st, InvalidType);    // PLAIN store, no exempt flag
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &interner};
+    EXPECT_FALSE(v.verify(r));
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_AtomicAccessNotLowered), 1u);
+}
+
+// Positive: the CORRECTLY-lowered atomic ops (AtomicLoad / AtomicStore) pass the
+// belt — the belt keys on the OPCODE (plain Load/Store), so the atomic opcodes are
+// never flagged. Pins that the belt does NOT false-positive on the intended form.
+TEST(MirVerifier, AtomicLoadAndAtomicStorePass) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32       = interner.primitive(TypeKind::I32);
+    TypeId const atomicI32 = interner.atomicQualified(i32);
+    TypeId const ptrAtomic = interner.pointer(atomicI32);
+    TypeId const fnSig = interner.fnSig({}, interner.primitive(TypeKind::Void),
+                                        CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const slot = b.addInst(MirOpcode::Alloca, {}, ptrAtomic);
+    MirInstId const val  = b.addConst(intLit(42), i32);
+    std::array<MirInstId, 2> const ast{val, slot};
+    b.addInst(MirOpcode::AtomicStore, ast, InvalidType, /*payload=*/5);
+    std::array<MirInstId, 1> const ald{slot};
+    b.addInst(MirOpcode::AtomicLoad, ald, atomicI32, /*payload=*/5);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &interner};
+    EXPECT_TRUE(v.verify(r)) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_AtomicAccessNotLowered), 0u);
+}
+
+// Positive: an INITIALIZATION store (C11 7.17.2.1 — atomic init is not itself
+// atomic) stays a plain Store and carries MirInstFlags::AtomicInitExempt, so the
+// belt SPARES it even though its pointee is atomic-qualified. Pins the exemption.
+TEST(MirVerifier, AtomicInitExemptStorePasses) {
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeId const i32       = interner.primitive(TypeKind::I32);
+    TypeId const atomicI32 = interner.atomicQualified(i32);
+    TypeId const ptrAtomic = interner.pointer(atomicI32);
+    TypeId const fnSig = interner.fnSig({}, interner.primitive(TypeKind::Void),
+                                        CallConv::CcSysV);
+    MirBuilder b;
+    (void)b.addFunction(fnSig, SymbolId{1});
+    MirBlockId const entry = b.createBlock(StructCfMarker::EntryBlock);
+    b.beginBlock(entry);
+    MirInstId const slot = b.addInst(MirOpcode::Alloca, {}, ptrAtomic);
+    MirInstId const val  = b.addConst(intLit(7), i32);
+    std::array<MirInstId, 2> const st{val, slot};
+    b.addInst(MirOpcode::Store, st, InvalidType, /*payload=*/0,
+              MirInstFlags::AtomicInitExempt);
+    b.addReturn();
+    Mir m = std::move(b).finish();
+
+    DiagnosticReporter r;
+    MirVerifier v{m, &interner};
+    EXPECT_TRUE(v.verify(r)) << (r.all().empty() ? "" : r.all()[0].actual);
+    EXPECT_EQ(countCode(r, DiagnosticCode::I_AtomicAccessNotLowered), 0u);
+}

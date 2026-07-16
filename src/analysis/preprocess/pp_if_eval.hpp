@@ -70,6 +70,22 @@ using PpIsDefined = std::function<bool(std::string_view)>;
 // holds the include search paths. Returns true iff the header exists.
 using PpHasInclude = std::function<bool(std::string_view filename, bool isAngle)>;
 
+// FC17.9(h) (`__has_embed`; C23 6.10.1): test whether the resource `filename`
+// that a `#embed` of the same form would read exists, returning the C23
+// trichotomy: 0 = `__STDC_EMBED_NOT_FOUND__`, 1 = `__STDC_EMBED_FOUND__`
+// (non-empty), 2 = `__STDC_EMBED_EMPTY__` (found but zero bytes). `isAngle`
+// selects the form (true = `<r>`, the deferred angle form -> the callback
+// answers 0 truthfully; false = `"r"`, the quote search). `opSpan` is the
+// operator token's span, so the authoritative callback can derive the
+// per-origin resolution directory (the resource search is relative to the file
+// containing the `__has_embed`, exactly as `#embed` resolves) -- so
+// `__has_embed` answers precisely what `#embed` would do at that spot. Supplied
+// by the MacroExpander, which holds the resource search paths. An UNSET
+// callback (`{}`) is null-tolerant and mints 0 (NOT_FOUND) -- the same
+// null-callback tolerance the `hasInclude && hasInclude(...)` site uses.
+using PpHasEmbed =
+    std::function<int(std::string_view filename, bool isAngle, SourceSpan opSpan)>;
+
 // FC15b: the MacroExpander's accumulated `#`/`##`/predefined PRODUCT text, as it
 // stands AFTER `macroExpand` runs over an `#if` operand. A predefined macro
 // (`__STDC_VERSION__` &c.) or a `#`/`##` product expanded inside a `#if`
@@ -94,6 +110,11 @@ using PpProductText = std::function<std::string_view()>;
 // folds as an ordinary identifier -> 0). The `__has_c_attribute` operator needs
 // no callback -- its known-attribute set is read directly from the schema's
 // `preprocess().knownCAttributes`.
+// FC17.9(h): `hasEmbed` resolves a `__has_embed(...)` operand to the C23
+// trichotomy (0/1/2). It is a DEFAULTED trailing parameter (null-callback
+// tolerance: an unset `{}` mints 0 = NOT_FOUND); both production callers thread
+// their per-origin resolver. A language with no `__has_embed` operator leaves it
+// unset and a stray `__has_embed` folds to an ordinary identifier -> 0.
 [[nodiscard]] std::optional<std::int64_t>
 evaluateIfExpression(std::span<Token const> operandTokens,
                      GrammarSchema const&   schema,
@@ -102,6 +123,7 @@ evaluateIfExpression(std::span<Token const> operandTokens,
                      PpHasInclude const&    hasInclude,
                      SourceBuffer const&    synth,
                      PpProductText const&   productText,
-                     DiagnosticReporter&    rep);
+                     DiagnosticReporter&    rep,
+                     PpHasEmbed const&      hasEmbed = {});
 
 } // namespace dss

@@ -323,6 +323,44 @@ struct DSS_EXPORT PreprocessConfig {
     // known (every `__has_c_attribute(x)` then yields 0).
     std::vector<CAttributeDef> knownCAttributes;
 
+    // FC17.9(h) (`#embed`; C23 6.10.4 / N3096 6.10.3): the `#embed` directive
+    // WORD, matched by lexeme TEXT against the token after `#` (like
+    // define/undef/include -- `embed` lexes as a plain Identifier, NOT a grammar
+    // keyword). A `#embed "resource"` directive resolves the QUOTED binary
+    // resource EXACTLY as a quote-`#include` would (self-dir first, then the
+    // include dirs) and expands to the resource's bytes as a comma-separated list
+    // of decimal integer constants (C23: constants of type `int` in
+    // [0, 2^CHAR_BIT)). OPTIONAL -- empty means the language declares NO `#embed`
+    // directive, so an `#embed` line falls through to the generic
+    // unsupported-directive fail-loud (`P_PreprocessorUnsupported`; the
+    // `pragmaDirective`/`elifdefDirective` opt-in model). The engine matches
+    // THIS string, never a hard-coded "embed".
+    std::string embedDirective;    // "embed"
+
+    // FC17.9(h) (`__has_embed`; C23 6.10.1): the `__has_embed` OPERATOR keyword,
+    // valid only inside a `#if`/`#elif` operand. `__has_embed("resource")` tests
+    // whether the resource a `#embed` of the same form would read exists, yielding
+    // the C23 trichotomy `__STDC_EMBED_NOT_FOUND__`(0) / `__STDC_EMBED_FOUND__`(1)
+    // / `__STDC_EMBED_EMPTY__`(2). Matched by lexeme TEXT (like `defined` /
+    // `__has_include`), a per-language CONFIG spelling. OPTIONAL -- empty means
+    // the language declares NO such operator (`__has_embed` then folds as an
+    // ordinary identifier -> 0, the identity property).
+    //
+    // ANGLE-form self-consistency (D-PP-EMBED, FIX-3, deliberate): unlike
+    // `hasIncludeOperator` (which REQUIRES both angle-delimiter tokens at load,
+    // since its angle form is supported), `hasEmbedOperator` imposes NO such
+    // load-time requirement. The `#embed <resource>` / `__has_embed(<resource>)`
+    // ANGLE form is a cycle-1 loud DEFERRAL (D-PP-EMBED-ANGLE): DSS ships JSON
+    // descriptors, not binary resources, on the system path, so an angle embed
+    // resolves nothing. `__has_embed` reuses the language's existing
+    // `hasIncludeAngleOpenToken`/`hasIncludeAngleCloseToken` KINDS to RECOGNISE an
+    // angle argument only so it can answer 0 truthfully; a language that declares
+    // `hasEmbedOperator` without them cannot lex an angle argument at all and its
+    // `__has_embed(<...>)` fails loud at RUNTIME as a malformed argument -- which
+    // suffices precisely because the angle form is deferred (no self-inconsistent
+    // contract to guard against at load).
+    std::string hasEmbedOperator;  // "__has_embed"
+
     // FC15 paste residuals (D-PP-VARIADIC-GNU-COMMA-ELISION): opt into the GNU
     // `,##__VA_ARGS__` extension. When TRUE, a `separator ## __VA_ARGS__` whose
     // variadic part expands to EMPTY drops the preceding separator entirely (so

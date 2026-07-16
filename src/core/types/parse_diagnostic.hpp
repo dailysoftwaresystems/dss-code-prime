@@ -90,6 +90,17 @@ enum class DiagnosticCode : std::uint16_t {
     // scanning for the literal `<`/`>` bytes (agnosticism). A well-formed
     // operator yields 1 (the header is found) or 0 -- never this diagnostic.
     P_PreprocessorHasInclude      = 0x001C,
+    // FC17.9(h) (`#embed` -- C23 6.10.4 / N3096 6.10.3): a malformed or
+    // unsupported `#embed` directive (D-PP-EMBED). ONE message-differentiated
+    // code (the `P_PreprocessorIncludeError` multi-message precedent): the
+    // resource is not found / unreadable / has an empty-or-missing quoted name
+    // / uses the deferred angle or macro-argument form / carries an unsupported
+    // standard parameter (limit/prefix/suffix/if_empty/vendor) / exceeds the
+    // cycle-1 splice size budget, and the `__has_embed` operator is malformed.
+    // Positioned on the directive word / operator token. Fail-loud invariant:
+    // every non-bare-quote-filename shape emits THIS code -- never a silent drop
+    // and never a silent partial embed.
+    P_PreprocessorEmbed           = 0x001D,
 
     // Expression-nesting depth guard (Pratt walker). A too-deeply-nested
     // expression (parens / right-assoc / prefix / ternary recursion past
@@ -873,6 +884,44 @@ enum class DiagnosticCode : std::uint16_t {
     // S_Vla* siblings.
     S_ArrayParamQualifierNonParameter = 0xE054,
 
+    // FC17.9(d) atomic 1b-i (D-CSUBSET-ATOMIC-NONLOCKFREE): `_Atomic` is applied to a
+    // type that is NOT a naturally-aligned lock-free SCALAR — an aggregate (struct /
+    // union / by-value array) or a scalar wider than the lock-free width (`_BitInt`>64,
+    // `__int128`, `long double`). Such a type needs a lock-table / large-atomic runtime
+    // path (C11 7.17.5) DEFERRED beyond atomic cycle-1. FAIL LOUD at type resolution
+    // rather than wrap it: the qualifier is a TRANSPARENT skin, so a wrapped aggregate
+    // would reach codegen, `computeLayout` would strip the skin, and the copy would
+    // decompose to plain non-atomic field/byte Load/Store that the type-based
+    // atomic-access belt cannot see — a SILENT non-atomic access. Same silent-
+    // miscompile-guard class as I_AtomicAccessNotLowered (the scalar belt).
+    S_AtomicNonLockFree = 0xE055,
+
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): `long double` is used (a declaration /
+    // cast / literal) but the active object format declares NO `longDoubleFormat`
+    // axis (wasm/spirv skeletons, direct-API callers) — the type's REPRESENTATION
+    // is genuinely unknowable (64-bit IEEE vs x87 80-bit vs binary128 is
+    // ABI-divergent per format), so the typeSpecifiers row is left UNREALIZED and
+    // this precise diagnostic replaces the generic S_InvalidTypeSpecifier-
+    // Combination miss. Deliberately NOT a silent base-core fallback: binding F64
+    // under an undeclared axis is the representation mis-bind (wrong sizeof,
+    // wrong ABI class) the axis exists to prevent — the `long`/LLP64 lesson.
+    // Suppressible like its S0011 sibling: a suppressed emission leaves the type
+    // unresolved (InvalidType), which cannot reach codegen.
+    S_LongDoubleFormatUndeclared = 0xE056,
+
+    // FC17.9(i) (D-CSUBSET-INLINE-ASM): an `__asm__` inline-asm statement whose
+    // template does NOT decode to strictly zero bytes — non-empty text
+    // (`__asm__("hlt")`), whitespace-only (`__asm__("  ")`), or a malformed escape.
+    // Cycle-1 implements ONLY the empty-template optimizer barrier (`__asm__
+    // volatile("")` → MirOpcode::CompilerBarrier, zero target instructions); a
+    // non-empty template carries real per-target machine instructions we cannot yet
+    // emit (the per-target asm-text arc is deferred, D-CSUBSET-INLINE-ASM-TEXT). FAIL
+    // LOUD rather than silently lower it to a no-op barrier — that would DROP the
+    // instructions (e.g. an `asm("hlt")` becoming a no-op), a genuine miscompile. In
+    // kUnsuppressableCodes (unsuppressable_codes.cpp): `--suppress` must never be able
+    // to turn a dropped `asm(...)` into a silent non-emission. Renders error[S0057].
+    S_InlineAsmNonEmptyTemplate = 0xE057,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-
@@ -1356,6 +1405,19 @@ enum class DiagnosticCode : std::uint16_t {
     // coverage claim (audit fix #6). Caught at every verify point (so an optimizer
     // transform that mis-pairs a save/restore reds AT the pass that did it).
     I_VlaStackRestorePairing       = 0xA017,
+    // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): a plain MIR `Load` or `Store` whose
+    // ACCESSED type is `_Atomic`-qualified — a MISSED atomic-lowering funnel site.
+    // Every scalar `_Atomic` access must lower to `AtomicLoad`/`AtomicStore` at the
+    // hir_to_mir scalar-access chokepoint; a plain Load/Store still carrying an
+    // atomic-qualified accessed type would SILENTLY perform a non-atomic access
+    // (the exact miscompile the `_Atomic` qualifier exists to prevent). The belt
+    // converts that silent gap into a LOUD failure at every verify point — for a
+    // current OR a future new emit site. Load's accessed type is its result type;
+    // Store's is the pointee of its address operand. Object-INITIALIZATION stores
+    // (MirInstFlags::AtomicInitExempt; C11 7.17.2.1 — init is not itself atomic)
+    // are the ONE exemption and do not trip it. Interner-gated (needs
+    // isAtomicQualified). Caught at every verify point (verify-after-every-pass).
+    I_AtomicAccessNotLowered       = 0xA018,
 
     // ── LIR lowering + verifier (renders as `L`) ──────────────────────
     //

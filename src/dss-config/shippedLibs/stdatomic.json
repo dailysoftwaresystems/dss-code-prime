@@ -1,0 +1,17 @@
+{
+  "$comment": "C11/C23 <stdatomic.h> (N3096 §7.17) — FC17.9(d) atomic cycle-1 (D-CSUBSET-ATOMIC). Cycle-1 scope = the lock-free scalar surface both dss-state probes need: the `atomic_int` object type + the 6 `memory_order` constants + the `atomic_load_explicit`/`atomic_store_explicit` accessors. `atomic_int` is a GENUINELY `_Atomic`-qualified `int` typedef (the codec spelling `atomic<i32>` → interner.atomicQualified(i32), M1 in hir_text.cpp) — NOT a plain alias — so a bare `atomic_int x; x = 5;` lowers to AtomicStore/AtomicLoad (seq_cst) by the SAME emitScalarLoad/Store chokepoint a raw `_Atomic int` uses; the E2 MIR pin proves the bit survives the text codec. The 6 `memory_order_*` are flat integer `constants` (0-5, the threads.json `thrd_success` precedent) that fold to literals at cst_to_hir (constant_symbol_fold) so the accessor order arg const-folds into the MIR AtomicLoad/AtomicStore `payload`. `atomic_load_explicit`/`atomic_store_explicit` are NOT symbols here: they are always-injected compiler builtins (c-subset.lang.json builtinFunctions `lowering:atomic_load`/`atomic_store`, the `_InterlockedCompareExchange`→atomic_cas precedent — a non-linkable intrinsic, shadow-able by a user decl, so NO `library`/`symbols` block and available on every object format), monomorphized to `int` (i32) this cycle. DEFERRED (each fail-loud/named, next cycles): the RMW family fetch_*/exchange/compare_exchange (`D-CSUBSET-ATOMIC-RMW`); atomic_thread_fence/signal_fence (`D-CSUBSET-ATOMIC-FENCE`); the non-i32 object typedefs atomic_char/short/long/llong/uint/ptr + generic atomic_load/store/init (`D-CSUBSET-ATOMIC-MONOMORPH-I32`); atomic_flag; ATOMIC_*_LOCK_FREE / ATOMIC_VAR_INIT; the `_Atomic(type-name)` specifier form (`D-CSUBSET-ATOMIC-SPECIFIER-FORM`). `D-CSUBSET-ATOMIC` closes when both probes (c23_atomic_qualifier + c11_stdatomic_order) run green ×3 legs.",
+  "header": "stdatomic.h",
+  "standard": "c11",
+  "availableObjectFormats": ["elf", "pe", "macho"],
+  "typedefs": [
+    { "name": "atomic_int", "type": "atomic<i32>" }
+  ],
+  "constants": [
+    { "name": "memory_order_relaxed", "value": 0, "type": "i32" },
+    { "name": "memory_order_consume", "value": 1, "type": "i32" },
+    { "name": "memory_order_acquire", "value": 2, "type": "i32" },
+    { "name": "memory_order_release", "value": 3, "type": "i32" },
+    { "name": "memory_order_acq_rel", "value": 4, "type": "i32" },
+    { "name": "memory_order_seq_cst", "value": 5, "type": "i32" }
+  ]
+}

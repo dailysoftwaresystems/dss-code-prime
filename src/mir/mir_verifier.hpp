@@ -117,6 +117,17 @@ private:
     // I_ExtensionTypeInMir.
     void checkTypeInvariants(DiagnosticReporter& reporter) const;
 
+    // FC17.9(d) cycle 1b (D-CSUBSET-ATOMIC): the atomic-lowering belt. A plain
+    // `Load` (accessed type = its result type) or `Store` (accessed type = the
+    // pointee of its address operand) whose accessed type `isAtomicQualified` is a
+    // MISSED funnel site — the scalar-access chokepoint must have lowered it to
+    // AtomicLoad/AtomicStore; a plain op would silently perform a NON-atomic
+    // access. Emits I_AtomicAccessNotLowered. The ONE exemption:
+    // `MirInstFlags::AtomicInitExempt` Stores (C11 7.17.2.1 — object
+    // initialization is not itself atomic). Interner-gated (needs
+    // isAtomicQualified); skipped when `interner_ == nullptr`.
+    void checkAtomicAccessLowered(DiagnosticReporter& reporter) const;
+
     Mir const&          mir_;
     TypeInterner const* interner_;
 };
