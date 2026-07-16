@@ -688,9 +688,15 @@ encode(AssembledModule const&    module,
                     f.valueInText);
     }
     // Undefined extern symbols: N_UNDF|N_EXT, n_sect=0, n_value=0.
+    // D-LK-OBJECT-EXTERN-CALL-MACHO: the undefined extern carries its REAL
+    // import name (`externName` — the pipeline-mangled `mangledName`, which
+    // already bears the ld64 leading `_` via applyCMangling, emitted
+    // VERBATIM) so a FOREIGN linker (ld64/clang) resolves it against libc /
+    // a sibling object — the Mach-O analog of the ELF c141 fix. `_sym_<id>`
+    // remains the fallback for a reloc target that is neither defined nor a
+    // known import (mirrors the ELF extern-fallback loop).
     for (auto const& e : externSyms) {
-        std::string const symName =
-            std::string{"_sym_"} + std::to_string(e.v);
+        std::string const symName = objNames.externName(e, "_sym_");
         std::uint32_t const nameOff = strtab.add(symName);
         appendNlist(nameOff,
                     static_cast<std::uint8_t>(N_UNDF | N_EXT),

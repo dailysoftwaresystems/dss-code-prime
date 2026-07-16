@@ -373,6 +373,80 @@ TEST(MachOWriter, MachHeader64Arm64IdentityBytesMatchAppleAbi) {
     EXPECT_EQ(readU32LE(bytes, 24), 0u);            // flags = 0
 }
 
+// ── D-LK-OBJECT-EXTERN-CALL-MACHO: undefined extern carries its REAL name ──
+
+// The Mach-O analog of ElfWriter.ObjectExternCallEmitsUndefImportNameAndPlt32
+// Reloc (c141): an arm64 MH_OBJECT with a BL to an extern import must emit the
+// undefined symbol under its REAL pipeline-mangled import name (`_libc_fn`) as
+// N_UNDF|N_EXT, with the BRANCH26 relocation's r_extern/r_symbolnum pointing at
+// that symtab entry — so a FOREIGN linker (ld64/clang) resolves it against libc
+// or a sibling object. Before this cycle the name was the internal `_sym_<id>`
+// (the exact blocker the D-LK3-MACHO-ARM64-OBJECT cycle documented: ld64 cannot
+// resolve `_sym_7`). RED-ON-DISABLE: revert the macho.cpp undefined-extern loop
+// to the `_sym_` spelling → the name assertion fails (`_sym_20` != `_libc_fn`).
+// The shipped format also declares `externCallDispatch: "direct-plt"` (pinned
+// here) so the LOWERING tier accepts the extern call — DSS never builds a stub
+// in a `.o`; ld64 synthesizes it (the ELF c141 direct-plt contract).
+TEST(MachOWriter, Arm64ObjectExternCallEmitsUndefImportRealName) {
+    auto loaded = loadShippedArm64();
+    ASSERT_TRUE(loaded.target && loaded.format);
+    ASSERT_TRUE(loaded.format->externCallDispatch().has_value())
+        << "macho64-arm64-darwin must declare externCallDispatch so extern "
+           "calls lower (D-LK-OBJECT-EXTERN-CALL-MACHO)";
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction caller;
+    caller.symbol = SymbolId{10};
+    caller.bytes  = {0x00, 0x00, 0x00, 0x94};   // BL #0 (imm26 unresolved)
+    caller.relocations.push_back(Relocation{/*offset=*/0u, /*target=*/SymbolId{20},
+                                            /*kind=*/RelocationKind{1},  // BRANCH26
+                                            /*addend=*/0});
+    mod.functions.push_back(std::move(caller));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "_caller",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    ExternImport ext;
+    ext.symbol      = SymbolId{20};
+    ext.mangledName = "_libc_fn";     // pipeline-mangled (leading `_`, macho)
+    ext.isData      = false;
+    mod.externImports.push_back(std::move(ext));
+
+    DiagnosticReporter rep;
+    auto bytes = macho::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "an MH_OBJECT with an extern-call import must encode";
+
+    // LC_SYMTAB fields (single-segment/single-section MH_OBJECT layout, same
+    // as the LcSymtab pin): cmd@184, symoff@192, nsyms@196, stroff@200.
+    std::uint32_t const symoff = readU32LE(bytes, 192);
+    std::uint32_t const nsyms  = readU32LE(bytes, 196);
+    std::uint32_t const stroff = readU32LE(bytes, 200);
+    ASSERT_EQ(nsyms, 2u) << "defined caller + undefined extern";
+
+    // nlist_64[1] = the undefined extern (defined-then-undefined order).
+    std::size_t const n1 = symoff + 16;
+    std::uint32_t const nStrx = readU32LE(bytes, n1 + 0);
+    std::string name;
+    for (std::size_t p = stroff + nStrx; p < bytes.size() && bytes[p] != 0; ++p) {
+        name.push_back(static_cast<char>(bytes[p]));
+    }
+    EXPECT_EQ(name, "_libc_fn")
+        << "undefined extern must carry its REAL import name (verbatim, one "
+           "leading underscore), never the internal _sym_<id> fallback";
+    EXPECT_EQ(bytes[n1 + 4], 0x01u)      // n_type = N_UNDF|N_EXT
+        << "extern is N_UNDF|N_EXT";
+    EXPECT_EQ(bytes[n1 + 5], 0u)         // n_sect = NO_SECT
+        << "undefined symbol carries no section";
+
+    // The BRANCH26 relocation targets that symtab entry: r_extern=1,
+    // r_symbolnum=1 (index of the extern nlist).
+    std::uint32_t const relocOff = readU32LE(bytes, 160);
+    std::uint32_t const rInfo    = readU32LE(bytes, relocOff + 4);
+    EXPECT_EQ((rInfo >> 27) & 0x1u, 1u)  << "r_extern = 1 (symbol-relative)";
+    EXPECT_EQ(rInfo & 0x00FFFFFFu, 1u)   << "r_symbolnum = the extern's index";
+}
+
 // An ARM64-DISTINCT relocation (PAGE21, kind=2 → r_type=3) packs correctly — proves
 // the arm64 format's reloc table is loaded, NOT x86_64's (whose kind=2 is UNSIGNED,
 // r_type=0). RED-on-disable: a wrong nativeId in the format flips the packed r_type.

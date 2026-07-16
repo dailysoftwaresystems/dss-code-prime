@@ -9,7 +9,8 @@
     "kind": "macho"
   },
 
-  "$externCallDispatchNote": "NO externCallDispatch — leaf-only, matching the x86_64-macho-object sibling. Empirically (this cycle): declaring direct-plt lowers an extern call + emits the BRANCH26/PAGE21/PAGEOFF12 relocs, but the UNDEFINED extern symbol is named `_sym_7` (an internal id) instead of the source `_base`, so a foreign linker fails to resolve it — the macho analog of the ELF c141 extern-call-in-.o work is NOT wired (undefined-extern source-name emission for the macho object walker). That is a separate mechanism, pinned D-LK-OBJECT-EXTERN-CALL-MACHO; enabling it here would ship a broken (unresolvable) .o.",
+  "$externCallDispatchComment": "D-LK-OBJECT-EXTERN-CALL-MACHO (closed this cycle): extern FUNCTION calls lower into this relocatable object — a plain BL + BRANCH26 reloc against an SHN_UNDEF-style N_UNDF|N_EXT symbol carrying its REAL import name (the macho.cpp undefined-extern loop now emits `externName`, i.e. the pipeline-mangled `_`-prefixed C name, not the internal `_sym_<id>` — the blocker the #42 note documented). The FINAL linker (ld64/clang) synthesizes the stub/GOT, exactly like the ELF c141 `direct-plt` contract; DSS never builds a stub in a `.o`. The x86_64-darwin object sibling stays leaf-only (no runtime leg exists to witness it — the D-LK1-MACHO-X8664-DARWIN-DATA-SECTION untested-form discipline); its walker code is shared and lights up by declaring this field when a runner lands.",
+  "externCallDispatch": "direct-plt",
   "$dataModelComment": "FC3 c1: 64-bit linux/darwin are LP64 (int 32, long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I64 here. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
   "dataModel": "LP64",
 
