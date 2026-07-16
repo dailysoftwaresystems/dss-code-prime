@@ -86,6 +86,20 @@ DSS_EXPORT void copyDiagnostics(DiagnosticReporter const& src,
 effectiveBitFieldStrategy(TargetSchema const&       target,
                           ObjectFormatSchema const& format) noexcept;
 
+// FC17.9(e) (D-CSUBSET-LONG-DOUBLE): resolve the effective `long double` axis
+// for a (target, format) pair — the effectiveBitFieldStrategy twin. The
+// representation is FORMAT/OS-determined (one x86_64 target serves BOTH pe64's
+// 64-bit-IEEE and ELF-SysV's x87 80-bit `long double`), and UNLIKE
+// bitFieldStrategy no target-side fallback field exists — the axis is
+// format-only, so `None` means genuinely undeclared (wasm/spirv skeletons):
+// the semantic bind then leaves `long double` rows unrealized
+// (S_LongDoubleFormatUndeclared on use), never a silent width guess. The
+// (target, format) signature keeps the resolver-family shape so a future
+// target-side contribution slots in without touching the call sites.
+[[nodiscard]] DSS_EXPORT LongDoubleFormat
+effectiveLongDoubleFormat(TargetSchema const&       target,
+                          ObjectFormatSchema const& format) noexcept;
+
 // Compile a single CompilationUnit through the full HIR→write
 // pipeline for one (target, format) pair. Returns true iff every
 // tier succeeded AND `writeImage` committed bytes to disk.

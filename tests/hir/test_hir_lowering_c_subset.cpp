@@ -4845,7 +4845,8 @@ TEST(HirLoweringCSubset, DeepNestedSwitchAnalyzesFlatOnNormalStack) {
     // → crash. Post-fix (flat driver): O(1) host stack → clean, error-free model.
     SemanticModel model =
         analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt, std::nullopt,
-                std::nullopt, /*deepRecursionReserveBytes=*/kAnalyzeReserveBytes);
+                std::nullopt, LongDoubleFormat::None,
+                /*deepRecursionReserveBytes=*/kAnalyzeReserveBytes);
     EXPECT_FALSE(model.hasErrors())
         << "deep nested-switch analysis must complete cleanly on a bounded stack "
            "— Pass 1.5 resolveDeclTypes is a flat heap work-stack, not recursion";

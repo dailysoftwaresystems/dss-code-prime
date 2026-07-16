@@ -84,7 +84,8 @@ namespace {
     }
 }
 [[nodiscard]] bool isFloatCore(TypeKind k) noexcept {
-    return k == TypeKind::F16 || k == TypeKind::F32 || k == TypeKind::F64 || k == TypeKind::F128;
+    return k == TypeKind::F16 || k == TypeKind::F32 || k == TypeKind::F64
+        || k == TypeKind::F80 || k == TypeKind::F128;
 }
 
 // Arithmetic-kind predicate — the implicit-conversion surface (ints +
@@ -106,7 +107,7 @@ namespace {
         || k == TypeKind::U8   || k == TypeKind::U16  || k == TypeKind::U32
         || k == TypeKind::U64  || k == TypeKind::U128
         || k == TypeKind::F16  || k == TypeKind::F32
-        || k == TypeKind::F64  || k == TypeKind::F128
+        || k == TypeKind::F64  || k == TypeKind::F80 || k == TypeKind::F128
         || k == TypeKind::BitInt;
 }
 
@@ -294,6 +295,10 @@ struct Lowerer {
     // `analyze()` parameter travels on the SemanticModel) so this tier
     // can never run under a different model than the semantic tier.
     DataModel dataModel_ = DataModel::Lp64;
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the analysis-time `long double`
+    // axis, read OFF THE MODEL for the same two-tier-agreement reason —
+    // consumed by the float-literal ladder (typeFloatLiteral).
+    LongDoubleFormat longDoubleFormat_ = LongDoubleFormat::None;
     // FC3 c1: the language's usual-arithmetic-conversion rules resolved
     // for `dataModel_`. nullopt (no `arithmeticConversions` block) keeps
     // every combine site on the legacy `TypeInterner::commonType` path
@@ -866,6 +871,8 @@ struct Lowerer {
         }
         // FC3 c1: data model + resolved UAC rules (see the member docs).
         dataModel_ = m.dataModel();
+        // FC17.9(e): the long-double axis rides the model the same way.
+        longDoubleFormat_ = m.longDoubleFormat();
         if (sem.arithmeticConversions.has_value()) {
             arith_ = resolveArithmeticRules(*sem.arithmeticConversions, dataModel_);
             // D-CSUBSET-BITINT: `_BitInt` participation in the usual arithmetic
@@ -3219,14 +3226,18 @@ struct Lowerer {
                 && numberStyle->emitKind.floating.valid()
                 && tk == numberStyle->emitKind.floating) {
                 auto const fk = typeFloatLiteral(
-                    text, numberStyle, sem.floatLiteralTyping, dataModel_);
-                if (fk.has_value()) {
-                    core = *fk;
+                    text, numberStyle, sem.floatLiteralTyping, dataModel_,
+                    longDoubleFormat_);
+                if (fk.status == FloatLadderStatus::Typed) {
+                    core = fk.kind;
                     type = interner.primitive(core);
                 } else {
-                    // Loader invariant violated (uncovered suffix) —
-                    // stay loud through the arm below, mirroring the
-                    // integer ladder's NoRule handling.
+                    // NoRule: loader invariant violated (uncovered suffix).
+                    // AxisUndeclared (FC17.9(e)): a long-double literal on a
+                    // format with no declared axis — the semantic tier already
+                    // rejected it (S_LongDoubleFormatUndeclared), so this tier
+                    // is normally unreachable; a direct-API caller stays loud
+                    // through the arm below either way (never the base core).
                     ok = false;
                 }
             }
@@ -6165,7 +6176,7 @@ struct Lowerer {
             case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
             case TypeKind::U64: case TypeKind::U128:
             case TypeKind::F16: case TypeKind::F32: case TypeKind::F64:
-            case TypeKind::F128:
+            case TypeKind::F80: case TypeKind::F128:
             case TypeKind::Char:
             case TypeKind::Byte:
             case TypeKind::Enum:

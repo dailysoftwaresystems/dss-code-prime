@@ -147,7 +147,7 @@ json const* cachedDescriptorJson(std::filesystem::path const& path,
 // math.h float constant needs them today).
 [[nodiscard]] bool isFloatScalarKind(TypeKind k) {
     return k == TypeKind::F16 || k == TypeKind::F32
-        || k == TypeKind::F64 || k == TypeKind::F128;
+        || k == TypeKind::F64 || k == TypeKind::F80 || k == TypeKind::F128;
 }
 
 // Decode a FLOAT constant's STRING `value` into a `double`. JSON has no

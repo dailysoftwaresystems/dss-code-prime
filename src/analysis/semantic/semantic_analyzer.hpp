@@ -74,6 +74,17 @@ analyze(std::shared_ptr<CompilationUnit const> cu,
         // selection (a flat-`fields` struct decodes as before; a variants-only
         // struct is not injected). (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH)
         std::optional<std::string_view> activeTarget = std::nullopt,
+        // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the ACTIVE FORMAT's `long double`
+        // axis (`effectiveLongDoubleFormat(target, format)`, threaded by the
+        // driver like `dataModel`). Drives the `coreByLongDoubleFormat` row
+        // overrides (typeSpecifiers + the float-literal ladder). The default
+        // (`None`) serves direct-API callers (unit tests, LSP): every
+        // non-long-double program analyzes exactly as before, and a `long
+        // double` use under None fails loud (S_LongDoubleFormatUndeclared) —
+        // never a silently-guessed representation. The returned SemanticModel
+        // CARRIES the axis (`SemanticModel::longDoubleFormat()`) so the HIR
+        // lowering reads the SAME value — the dataModel two-tier discipline.
+        LongDoubleFormat longDoubleFormat = LongDoubleFormat::None,
         // The worker-thread stack RESERVE for the deep-recursion analysis stage
         // (`analyze` runs `analyzeImpl` on a dedicated large stack so a deeply-
         // nested-but-legal tree does not overflow the host's ~1 MB main stack —

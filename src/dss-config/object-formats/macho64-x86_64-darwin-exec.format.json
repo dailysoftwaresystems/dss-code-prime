@@ -15,6 +15,9 @@
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: macOS x86_64 generic LSB-first bit-field allocation == gnu_packed (Apple does not diverge from generic AAPCS64 on bit-field packing). Byte-ABI-exact to clang. See macho64-x86_64-darwin for the divergence-list rationale.",
   "bitFieldStrategy": "gnu_packed",
 
+  "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: macOS x86_64 `long double` is the x87 80-bit extended format stored 16/16 (the SysV-x86_64 rule; Apple's x86_64 ABI follows SysV here). The axis resolves the c-subset row to F80 — declarations/layout/sizeof work; VALUE arithmetic walls loud until D-CSUBSET-LONG-DOUBLE-X87-ARITH lands.",
+  "longDoubleFormat": "x87-80",
+
   "$entryPointComment": "Empty defaults to module.functions[0] (cycle-2 convention). LC_MAIN.entryoff is computed as (entry_function_offset_in_.text) — relative to the __TEXT segment start, NOT to file offset.",
   "entryPoint": "",
   "$externCallDispatchComment": "DIRECT-PLT (corrected from the original mislabel). Mach-O resolves imports through a per-extern __stubs entry: the linker points each extern symbol's VA at its __stubs STUB (code) — see `symbolVa[extern] = stubVa` in macho.cpp — and the stub does the __got indirection internally (x86_64 `FF 25 disp32` jmp through the __got slot; ARM64 ADRP+LDR+BR x16). The call site is therefore a PLAIN DIRECT call (x86_64 `E8 disp32`, ARM64 `BL`) to the stub — byte-identical in shape to an intra-module call — NOT an `FF 15`-through-the-stub deref (that would dereference the stub's CODE bytes as a function pointer → SIGSEGV). This is the SAME direct-plt model ELF uses, and it matches what the trampoline + MIR→LIR `lowerCall` emit. D-FFI-EXTERN-CALL-DISPATCH.",

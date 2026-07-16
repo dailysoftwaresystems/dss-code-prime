@@ -525,18 +525,29 @@ struct NumberScan {
         }
     }
 
-    // 5. Suffixes — try float suffixes first (longer typically); a
-    //    float-suffix match promotes to float kind. Skip when we
-    //    bailed on a no-digit exponent letter (it belongs to the
-    //    next token). Two-pass longest-match across both lists keeps
-    //    selection deterministic; integer suffixes apply if no float
-    //    suffix matched.
+    // 5. Suffixes — PER-SHAPE (FC17.9(e) CRITICAL-1, the D-CSUBSET-LONG-DOUBLE
+    //    suffix-shape separation). A token already float-SHAPED (fraction /
+    //    exponent) takes only FLOAT suffixes — C 6.4.4.2's suffix set. An
+    //    integer-shaped token tries INTEGER suffixes FIRST and float-promotes
+    //    only when no integer suffix matches: a spelling in BOTH sets ("l"/"L"
+    //    — integer `20L` long vs float `20.0L` long double) keeps the token's
+    //    own shape, while a float-only spelling still promotes (`1f` stays a
+    //    float, 'f' is not an integer suffix). The pre-fix float-first order
+    //    silently RETYPED `20L` as FloatLiteral the moment "l"/"L" joined
+    //    floatSuffixes. Skip both when we bailed on a no-digit exponent
+    //    letter (it belongs to the next token).
     if (!sawExpLetterButNoExp) {
-        if (const auto fn = matchLongestSuffix(r, style.floatSuffixes); fn > 0) {
+        if (out.isFloat) {
+            if (const auto fn = matchLongestSuffix(r, style.floatSuffixes); fn > 0) {
+                r.advance(fn);
+            }
+        } else if (const auto in = matchLongestSuffix(r, style.integerSuffixes);
+                   in > 0) {
+            r.advance(in);
+        } else if (const auto fn = matchLongestSuffix(r, style.floatSuffixes);
+                   fn > 0) {
             out.isFloat = true;
             r.advance(fn);
-        } else if (const auto in = matchLongestSuffix(r, style.integerSuffixes); in > 0) {
-            r.advance(in);
         }
     }
 

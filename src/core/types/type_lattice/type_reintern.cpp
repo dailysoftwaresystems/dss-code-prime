@@ -30,6 +30,7 @@ namespace {
         case TypeKind::F16:       return "F16";
         case TypeKind::F32:       return "F32";
         case TypeKind::F64:       return "F64";
+        case TypeKind::F80:       return "F80";
         case TypeKind::F128:      return "F128";
         case TypeKind::Char:      return "Char";
         case TypeKind::Byte:      return "Byte";
@@ -78,7 +79,7 @@ namespace {
         case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
         case TypeKind::U64: case TypeKind::U128:
         case TypeKind::F16: case TypeKind::F32: case TypeKind::F64:
-        case TypeKind::F128:
+        case TypeKind::F80: case TypeKind::F128:
         case TypeKind::Char: case TypeKind::Byte: case TypeKind::Void:
         // C23 nullptr_t: an operand-less scalar kind — reinterns via the
         // `dst.primitive(kind)` arm (mirrored in the rebuild switch below).
@@ -217,7 +218,7 @@ TypeId reinternType(TypeInterner const& src, TypeId srcId, TypeLattice& dstHost,
         case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32:
         case TypeKind::U64: case TypeKind::U128:
         case TypeKind::F16: case TypeKind::F32: case TypeKind::F64:
-        case TypeKind::F128:
+        case TypeKind::F80: case TypeKind::F128:
         case TypeKind::Char: case TypeKind::Byte: case TypeKind::Void:
         case TypeKind::NullptrT:   // C23 nullptr_t: operand-less primitive scalar
             result = dst.primitive(kind);

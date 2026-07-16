@@ -199,6 +199,14 @@ struct SchemaIndexes {
     // languages without the table (toy / tsql) — the arm never fires.
     std::unordered_set<std::uint32_t>              typeSpecifierVocabulary;
     std::unordered_map<std::string, TypeId>        typeSpecifierSets;
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): multiset keys of rows carrying a
+    // `coreByLongDoubleFormat` map that the ACTIVE format leaves UNREALIZED
+    // (axis None — wasm/spirv/direct-API). Diverted here at index build
+    // instead of interned (a base-core intern would silently bind the F64
+    // meaning under an undeclared representation); the multiset-lookup miss
+    // path consults this set to emit the precise S_LongDoubleFormatUndeclared
+    // instead of the generic S_InvalidTypeSpecifierCombination.
+    std::unordered_set<std::string>                unrealizedLongDoubleSets;
 };
 
 // One transient per `analyze()` call. Consumed into the returned model.
@@ -241,6 +249,13 @@ struct EngineState {
     // `coreByDataModel` overrides), the integer-literal ladder, and the
     // shipped-lib descriptor reader. Set ONCE before any index is built.
     DataModel                  dataModel = DataModel::Lp64;
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the analysis-time `long double` axis
+    // (`analyze()`'s parameter — effectiveLongDoubleFormat(target, format)).
+    // Read by `buildIndexes` (the `coreByLongDoubleFormat` typeSpecifiers
+    // overrides — a map-carrying row under `None` is diverted UNREALIZED,
+    // never base-core-resolved) and the float-literal ladder. Set ONCE before
+    // any index is built, like `dataModel`.
+    LongDoubleFormat           longDoubleFormat = LongDoubleFormat::None;
     // FC6 deferral-close: the active target's aggregate-layout params
     // (`analyze()`'s parameter — target.aggregateLayout()). `nullopt` ⇒ the
     // target declared no `aggregateLayout` block, so a `sizeof` in an array
@@ -996,8 +1011,17 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
             key += std::to_string(t.v);
             key += ',';
         }
+        // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): axis-aware resolution. nullopt ⇔
+        // the row depends on the long-double axis but the active format
+        // declared none — divert the key UNREALIZED (never intern the base
+        // core, which is the F64-axis meaning; see the SchemaIndexes field).
+        auto const resolved = ts.resolveCore(s.dataModel, s.longDoubleFormat);
+        if (!resolved.has_value()) {
+            idx.unrealizedLongDoubleSets.insert(std::move(key));
+            continue;
+        }
         idx.typeSpecifierSets[std::move(key)] =
-            s.lattice.interner().primitive(ts.resolveCore(s.dataModel));
+            s.lattice.interner().primitive(*resolved);
     }
 }
 
@@ -1289,6 +1313,25 @@ resolveTypeNodeImpl(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                 auto setIt = s.idx().typeSpecifierSets.find(key);
                 if (setIt != s.idx().typeSpecifierSets.end()) {
                     return setIt->second;
+                }
+                // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): a VALID multiset whose
+                // row the active format leaves UNREALIZED (no longDoubleFormat
+                // axis) — the precise diagnostic, BEFORE the generic
+                // invalid-combination miss below (the combination is not
+                // invalid; its representation is undeclared).
+                if (s.idx().unrealizedLongDoubleSets.contains(key)) {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_LongDoubleFormatUndeclared;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(node);
+                    d.actual   = std::format(
+                        "'{}' is not realized on this object format: the "
+                        "format declares no longDoubleFormat axis",
+                        tree.text(node));
+                    s.reporter.report(std::move(d));
+                    specifierDiagnosed = true;   // outer S_UnknownType suppressed
+                    return InvalidType;
                 }
                 ParseDiagnostic d;
                 d.code     = DiagnosticCode::S_InvalidTypeSpecifierCombination;
@@ -1783,7 +1826,7 @@ floatLiteralTokenSet(EngineState const& s) {
     std::unordered_set<std::uint32_t> out;
     auto const isFloatKind = [](TypeKind k) noexcept {
         return k == TypeKind::F16 || k == TypeKind::F32
-            || k == TypeKind::F64 || k == TypeKind::F128;
+            || k == TypeKind::F64 || k == TypeKind::F80 || k == TypeKind::F128;
     };
     for (auto const& [tok, ty] : s.idx().literalTypeIds) {
         if (isFloatKind(s.lattice.interner().kind(ty))) out.insert(tok);
@@ -2134,6 +2177,12 @@ constExprValue(EngineState& s, Tree const& tree, NodeId node,
     // BitIntValue (`constexpr _BitInt(8) k = 15wb;`).
     if (cfg != nullptr) ctx.integerLiteralTyping = cfg->integerLiteralTyping;
     ctx.dataModel = s.dataModel;
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): float-literal ladder + axis so a
+    // `20.0L` leaf carries its TRUE core (F80/F128 on a walled axis) and the
+    // hostBacked fold gate refuses to fold it at binary64 — this is the ONLY
+    // ctx that admits float leaves, so it is the only one that threads them.
+    if (cfg != nullptr) ctx.floatLiteralTyping = cfg->floatLiteralTyping;
+    ctx.longDoubleFormat = s.longDoubleFormat;
     CstEvalEnvironment env = buildConstEvalEnv(s, tree, fromScope, cfg);
     EvalOptions options;
     options.allowFloat = true;
@@ -2287,7 +2336,7 @@ void validateConstexprDeclarator(EngineState& s, SemanticConfig const& cfg,
         k == TypeKind::Bool || k == TypeKind::Char || k == TypeKind::Byte
         || isIntegerKind(k) || k == TypeKind::Enum
         || k == TypeKind::F16 || k == TypeKind::F32 || k == TypeKind::F64
-        || k == TypeKind::F128;
+        || k == TypeKind::F80 || k == TypeKind::F128;
     if (arithmetic) {
         if (constExprValue(s, tree, initNode, here, &cfg).has_value()) return;
         emit(DiagnosticCode::S_ConstexprNonConstantInitializer, initNode);
@@ -6910,8 +6959,8 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                 && tk == s.idx().numberStyle->emitKind.floating) {
                 auto const fk = typeFloatLiteral(
                     tree.text(node), s.idx().numberStyle,
-                    cfg.floatLiteralTyping, s.dataModel);
-                if (!fk.has_value()) {
+                    cfg.floatLiteralTyping, s.dataModel, s.longDoubleFormat);
+                if (fk.status == FloatLadderStatus::NoRule) {
                     // Loader invariant: every numberStyle float suffix
                     // is covered and an unsuffixed rule exists. A miss
                     // here is substrate drift — fail loud, never
@@ -6922,7 +6971,25 @@ void typeLiteralIfAny(EngineState& s, SemanticConfig const& cfg,
                                "violated)\n", stderr);
                     std::abort();
                 }
-                litTy = s.lattice.interner().primitive(*fk);
+                if (fk.status == FloatLadderStatus::AxisUndeclared) {
+                    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): a long-double
+                    // literal (`20.0L`) on a format with no declared axis —
+                    // its representation is unknowable; leave the token
+                    // UNTYPED (never the base core) and emit the precise
+                    // diagnostic, mirroring the typeSpecifiers bind.
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::S_LongDoubleFormatUndeclared;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.buffer   = tree.source().id();
+                    d.span     = tree.span(node);
+                    d.actual   = std::format(
+                        "'{}' is a long double literal, not realized on this "
+                        "object format: the format declares no "
+                        "longDoubleFormat axis", tree.text(node));
+                    s.reporter.report(std::move(d));
+                    return;
+                }
+                litTy = s.lattice.interner().primitive(fk.kind);
             }
             // C11/C23 6.4.4.4: a PREFIXED character constant (`L'x'`/`u'x'`/`U'x'`/
             // `u8'x'`) has the SCALAR type of its prefix (wchar_t/char16_t/char32_t/
@@ -8252,6 +8319,13 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                         : InvalidNode;   // >1 typed match: ambiguous (handled below)
 
         if (matchCount > 1) {
+            // FC17.9(e) (D-CSUBSET-LONG-DOUBLE-GENERIC-DISTINCT): on an
+            // f64-axis format `double:` and `long double:` associations BOTH
+            // intern F64 → matchCount 2 lands HERE — LOUD (the LLP64
+            // long≡int collapse precedent), but it rejects valid C11 6.5.1.1
+            // (the two are distinct TYPES even when same-representation).
+            // <tgmath.h> (FC17.9(g)) dispatches on exactly that pair;
+            // distinct-type identity for _Generic rides that arc.
             ParseDiagnostic d;
             d.code     = DiagnosticCode::S_GenericSelectionAmbiguous;
             d.severity = DiagnosticSeverity::Error;
@@ -9821,7 +9895,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  std::optional<AggregateLayoutParams> aggregateLayout,
                                  std::optional<VaListStrategy> vaListStrategy,
                                  std::optional<ObjectFormatKind> activeFormat,
-                                 std::optional<std::string_view> activeTarget);
+                                 std::optional<std::string_view> activeTarget,
+                                 LongDoubleFormat longDoubleFormat);
 
 SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       DataModel dataModel,
@@ -9829,6 +9904,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
                       std::optional<VaListStrategy> vaListStrategy,
                       std::optional<ObjectFormatKind> activeFormat,
                       std::optional<std::string_view> activeTarget,
+                      LongDoubleFormat longDoubleFormat,
                       std::size_t deepRecursionReserveBytes) {
     // Run the recursive analysis on a dedicated large-stack worker thread
     // (JOIN-synchronous — no concurrency) so a deeply-nested-but-legal
@@ -9851,7 +9927,7 @@ SemanticModel analyze(std::shared_ptr<CompilationUnit const> cu,
     return dss::substrate::callOnLargeStack(reserveBytes, [&] {
             return analyzeImpl(std::move(cu), dataModel, std::move(aggregateLayout),
                                std::move(vaListStrategy), std::move(activeFormat),
-                               std::move(activeTarget));
+                               std::move(activeTarget), longDoubleFormat);
         });
 }
 
@@ -9860,13 +9936,15 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                                  std::optional<AggregateLayoutParams> aggregateLayout,
                                  std::optional<VaListStrategy> vaListStrategy,
                                  std::optional<ObjectFormatKind> activeFormat,
-                                 std::optional<std::string_view> activeTarget) {
+                                 std::optional<std::string_view> activeTarget,
+                                 LongDoubleFormat longDoubleFormat) {
     if (!cu) {
         std::fputs("dss::analyze fatal: null CompilationUnit\n", stderr);
         std::abort();
     }
     EngineState s{*cu};
     s.dataModel = dataModel;
+    s.longDoubleFormat = longDoubleFormat;
     s.aggregateLayout = aggregateLayout;
     s.vaListStrategy = vaListStrategy;
     s.activeFormat = activeFormat;
@@ -10762,6 +10840,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
         std::move(shippedExterns),
         std::move(suppressedShippedLibraries),
         dataModel,
+        longDoubleFormat,
     };
 }
 

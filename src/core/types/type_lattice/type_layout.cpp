@@ -283,7 +283,11 @@ std::optional<std::uint64_t> scalarByteSize(TypeKind kind, DataModel dm) noexcep
             return 4;
         case TypeKind::I64: case TypeKind::U64: case TypeKind::F64:
             return 8;
-        case TypeKind::I128: case TypeKind::U128: case TypeKind::F128:
+        // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): F80 (x87 80-bit) STORES as 16/16 —
+        // x86_64-SysV and darwin-x86_64 both pad the 10 significant bytes to a
+        // 16-byte, 16-aligned slot (the same size/align binary128 uses).
+        case TypeKind::I128: case TypeKind::U128: case TypeKind::F80:
+        case TypeKind::F128:
             return 16;
         // Pointer-class scalars take the model's pointer width. C23 nullptr_t has
         // the same size/representation as `void*` (§6.2.5), so `sizeof(nullptr)`

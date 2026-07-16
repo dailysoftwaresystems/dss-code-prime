@@ -311,7 +311,7 @@
                           "ull", "ULL", "llu", "LLU",
                           "wb", "WB",
                           "uwb", "uWB", "Uwb", "UWB", "wbu", "wbU", "WBu", "WBU"],
-    "floatSuffixes":    ["f", "F"],
+    "floatSuffixes":    ["f", "F", "l", "L"],
     "emitKind":         { "integer": "IntLiteral", "float": "FloatLiteral" }
   },
 
@@ -1753,7 +1753,7 @@
       { "name": "float",  "core": "F32"  },
       { "name": "double", "core": "F64"  }
     ],
-    "$typeSpecifiersComment": "FC3 c1: every VALID C type-specifier multiset (C 6.7.2 6) over the shipped keyword surface; combinations are ORDER-FREE (the engine canonicalizes by sorting token kinds; `long long` = LongKeyword twice). Invalid combos (`unsigned float`, `short long`, `long double`) reject by ABSENCE -> S_InvalidTypeSpecifierCombination. `long`-bearing rows carry the LLP64 (Windows) 32-bit override; `long long` stays 64-bit everywhere. NO `long double` row: F128/long-double is an FC3+ exclusion (rejects by absence).",
+    "$typeSpecifiersComment": "FC3 c1: every VALID C type-specifier multiset (C 6.7.2 6) over the shipped keyword surface; combinations are ORDER-FREE (the engine canonicalizes by sorting token kinds; `long long` = LongKeyword twice). Invalid combos (`unsigned float`, `short long`) reject by ABSENCE -> S_InvalidTypeSpecifierCombination. `long`-bearing rows carry the LLP64 (Windows) 32-bit override; `long long` stays 64-bit everywhere. FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the `long double` row carries the per-format coreByLongDoubleFormat axis — base F64 for f64-axis formats (pe64, macho-arm64: long double IS double, the LLP64 identity-collapse precedent), F80 (x87 80-bit) for x87-80 (elf/macho x86_64), F128 (binary128) for ieee128 (elf-arm64); an axis-less format (wasm/spirv) leaves the row UNREALIZED -> S_LongDoubleFormatUndeclared.",
     "typeSpecifiers": [
       { "tokens": ["VoidKeyword"],                                              "core": "Void" },
       { "tokens": ["CharKeyword"],                                              "core": "Char" },
@@ -1785,7 +1785,8 @@
       { "tokens": ["BoolKeyword"],                                              "core": "Bool" },
       { "tokens": ["LegacyBoolKeyword"],                                        "core": "Bool" },
       { "tokens": ["FloatKeyword"],                                             "core": "F32"  },
-      { "tokens": ["DoubleKeyword"],                                            "core": "F64"  }
+      { "tokens": ["DoubleKeyword"],                                            "core": "F64"  },
+      { "tokens": ["LongKeyword", "DoubleKeyword"],                             "core": "F64", "coreByLongDoubleFormat": { "x87-80": "F80", "ieee128": "F128" } }
     ],
     "$literalTypesComment": "FC3 c1: IntLiteral's I32 is the BASE core; the integerLiteralTyping ladder below refines the width by magnitude/suffix/radix per C 6.4.4.1. FloatLiteral's F64 is the BASE core; the floatLiteralTyping suffix map below refines it per C 6.4.4.2 (FC3.5 sweep-c2 / D-CSUBSET-F32-CODEGEN closure: `1.5f` now types F32 — the F32 arithmetic surface shipped, so the typing flip pairs with real codegen). true/false are C23 keyword literals: type Bool with config-declared FIXED values (1/0) — the engine never decodes their text as a number.",
     "literalTypes": [
@@ -1808,10 +1809,11 @@
     "$intFloatConvertComment": "C 6.3.1.4/6.3.1.5/6.5.16.1 (D-CSUBSET-INT-FLOAT-CONVERSION): admit the int<->float implicit assignment conversion in BOTH directions, gated independently. intConvertsToFloat -> an integer flows into a float lhs (`double d=5;`, `f(anInt)` to a `double` param; the sqlite kahanBabuskaNeumaierStep(pSum,iBig) shape feeds an i64 to a `volatile double`). floatConvertsToInt -> a float flows into an integer lhs (`int n=aDouble;`, truncating toward zero). coerce()'s arithmetic-core arm materializes the MIR SIToFP/UIToFP (int->float) / FPToSI/FPToUI (float->int). Flipping either to false -> that direction errors S0003 S_TypeMismatch (the int_float_convert corpus is RED-ON-DISABLE). Completes the C arithmetic-conversion matrix alongside intCrossSignednessConverts + intSameSignednessNarrows.",
     "intConvertsToFloat": true,
     "floatConvertsToInt": true,
-    "$floatLiteralTypingComment": "FC3.5 sweep-c2: C 6.4.4.2 — a floating constant's type is keyed by its SUFFIX alone (unsuffixed -> double, f/F -> float). Type names resolve through typeSpecifiers/builtinTypes at LOAD time like the integer ladder's candidates. The loader cross-checks every numberStyle.floatSuffixes spelling is covered exactly once + an unsuffixed rule exists. C's l/L long-double suffix is NOT declared in floatSuffixes (pre-existing FC1c2 note) — long double lands with its own width story, not here.",
+    "$floatLiteralTypingComment": "FC3.5 sweep-c2: C 6.4.4.2 — a floating constant's type is keyed by its SUFFIX alone (unsuffixed -> double, f/F -> float, l/L -> long double). Type names resolve through typeSpecifiers/builtinTypes at LOAD time like the integer ladder's candidates (the `long double` row copies the coreByLongDoubleFormat axis map, so `20.0L` types per-format: F64/F80/F128). The loader cross-checks every numberStyle.floatSuffixes spelling is covered exactly once + an unsuffixed rule exists. FC17.9(e): l/L are in BOTH suffix sets — the tokenizer's per-shape suffix rule keeps integer `20L` an IntLiteral (integer suffixes first on an integer-shaped token) while `20.0L`/`2e1L` take the float suffix.",
     "floatLiteralTyping": [
       { "suffixes": [],         "type": "double" },
-      { "suffixes": ["f", "F"], "type": "float"  }
+      { "suffixes": ["f", "F"], "type": "float"  },
+      { "suffixes": ["l", "L"], "type": "long double" }
     ],
     "$integerLiteralTypingComment": "FC3 c1: C 6.4.4.1 EXACTLY — the FIRST candidate (per suffix-group x radix-class) whose range holds the decoded magnitude is the literal's type. `decimal` = no declared numberStyle prefix matched; `nondecimal` (hex/octal/binary) adds the unsigned candidates per the C table. Type names resolve through typeSpecifiers/builtinTypes at LOAD time, so LLP64's 32-bit `long` falls out of the data-model select (2147483648 is `long` on LP64 but `long long` on LLP64). Suffix GROUPS list the exact numberStyle.integerSuffixes spellings they cover; the loader cross-checks every declared suffix is covered exactly once. A magnitude beyond the last candidate -> S_IntegerLiteralTooLarge.",
     "integerLiteralTyping": [

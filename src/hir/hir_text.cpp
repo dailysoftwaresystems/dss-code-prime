@@ -79,7 +79,8 @@ namespace {
         case TypeKind::U32:  return "u32";  case TypeKind::U64: return "u64";
         case TypeKind::U128: return "u128";
         case TypeKind::F16:  return "f16";  case TypeKind::F32: return "f32";
-        case TypeKind::F64:  return "f64";  case TypeKind::F128: return "f128";
+        case TypeKind::F64:  return "f64";  case TypeKind::F80: return "f80";
+        case TypeKind::F128: return "f128";
         case TypeKind::Char: return "char"; case TypeKind::Byte: return "byte";
         case TypeKind::Void: return "void";
         case TypeKind::NullptrT: return "nullptr_t";  // C23 (debug-dump only)
@@ -95,7 +96,8 @@ namespace {
     if (s == "u32")  return TypeKind::U32;  if (s == "u64") return TypeKind::U64;
     if (s == "u128") return TypeKind::U128;
     if (s == "f16")  return TypeKind::F16;  if (s == "f32") return TypeKind::F32;
-    if (s == "f64")  return TypeKind::F64;  if (s == "f128") return TypeKind::F128;
+    if (s == "f64")  return TypeKind::F64;  if (s == "f80") return TypeKind::F80;
+    if (s == "f128") return TypeKind::F128;
     if (s == "char") return TypeKind::Char; if (s == "byte") return TypeKind::Byte;
     if (s == "void") return TypeKind::Void;
     if (s == "nullptr_t") return TypeKind::NullptrT;  // C23 (debug-dump only)

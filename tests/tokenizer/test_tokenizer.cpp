@@ -228,6 +228,54 @@ TEST(Tokenizer, TrailingFractionMakesDigitsDotOneFloat) {
     EXPECT_EQ(textOf(*h2.src, result2.tokens[0]), "3.");
 }
 
+// ─── FC17.9(e) (D-CSUBSET-LONG-DOUBLE, CRITICAL-1): suffix-shape separation ──
+// "l"/"L" now live in BOTH suffix sets (integer `20L` long vs float `20.0L`
+// long double). The suffix step is PER-SHAPE: an integer-shaped token tries
+// integer suffixes FIRST (so `20L` STAYS IntLiteral — the pre-fix float-first
+// order silently retyped it FloatLiteral, the exact `20L` regression this pin
+// exists for); a float-shaped token takes only float suffixes.
+
+TEST(Tokenizer, IntegerShapedLSuffixStaysIntLiteral) {
+    auto h      = loadCSubset("20L");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral)
+        << "`20L` must stay an INTEGER literal (C `long`) — a FloatLiteral "
+           "here means the suffix step lost its shape separation";
+    EXPECT_EQ(textOf(*h.src, result.tokens[0]), "20L");
+}
+
+TEST(Tokenizer, IntegerShapedCompoundSuffixesStayIntLiteral) {
+    for (auto const* text : {"20UL", "20ul", "20LL", "7ull"}) {
+        auto h      = loadCSubset(text);
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 1u) << text;
+        EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::IntLiteral) << text;
+        EXPECT_EQ(textOf(*h.src, result.tokens[0]), text);
+    }
+}
+
+TEST(Tokenizer, FloatShapedLSuffixLexesAsFloatLiteral) {
+    for (auto const* text : {"20.0L", "20.0l", "2e1L", "3.L"}) {
+        auto h      = loadCSubset(text);
+        auto result = lex(h);
+        ASSERT_EQ(result.tokens.size(), 1u) << text;
+        EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral) << text;
+        EXPECT_EQ(textOf(*h.src, result.tokens[0]), text);
+    }
+}
+
+TEST(Tokenizer, FloatOnlySuffixStillPromotesIntegerShape) {
+    // `0f`-style promotion must SURVIVE the integer-first ordering: 'f' is
+    // not an integer suffix, so the integer probe misses and the float
+    // promotion still fires (the FloatLiteralWithFSuffixPromotesIntToFloat
+    // behavior, re-pinned here against the reordered suffix step).
+    auto h      = loadCSubset("42f");
+    auto result = lex(h);
+    ASSERT_EQ(result.tokens.size(), 1u);
+    EXPECT_EQ(result.tokens[0].coreKind, CoreTokenKind::FloatLiteral);
+}
+
 // ─── FC1 cycle 2 (2026-06-10): C23 hex-float literals ──────────────────────
 // The 0x/0X prefixes declare a `float` continuation (letters p/P,
 // decimal exponent digits). C23 6.4.4.2: optional fraction with digits

@@ -21,7 +21,16 @@ enum class TypeKind : std::uint16_t {
     Bool,
     I8, I16, I32, I64, I128,
     U8, U16, U32, U64, U128,
-    F16, F32, F64, F128,
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): F80 is the x87 80-bit extended format
+    // (SysV x86_64 / darwin-x86_64 `long double`, 16/16 storage); F128 is IEEE
+    // binary128 (AAPCS64 `long double`). DISTINCT kinds so the two future
+    // arithmetic arcs (x87 register-stack vs binary128 softfloat) can never
+    // cross-fire — both wall loudly at the LIR encoded-width gate until then.
+    // Inserted IN the float block (not appended) so the float widening rank
+    // reads in declaration order; the ordinal shift of later kinds is safe:
+    // no TypeKind ordinal is serialized (name codecs spell names, enum
+    // scalar-pool entries are integer kinds ordered BEFORE the floats).
+    F16, F32, F64, F80, F128,
     Char,   // Unicode codepoint
     Byte,
     Void,

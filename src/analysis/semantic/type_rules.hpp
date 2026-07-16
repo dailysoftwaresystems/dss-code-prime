@@ -47,11 +47,16 @@ namespace detail::type_rules {
 }
 
 [[nodiscard]] inline constexpr int floatRank(TypeKind k) noexcept {
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): F64 < F80 < F128 — C 6.3.1.8 ranks
+    // long double above double whichever format realizes it. Renumbered IN
+    // LOCKSTEP with type_lattice.cpp's floatRank (a divergence is silent
+    // wrong UAC).
     switch (k) {
         case TypeKind::F16:  return 1;
         case TypeKind::F32:  return 2;
         case TypeKind::F64:  return 3;
-        case TypeKind::F128: return 4;
+        case TypeKind::F80:  return 4;
+        case TypeKind::F128: return 5;
         default:             return 0;
     }
 }

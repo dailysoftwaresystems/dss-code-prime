@@ -1025,7 +1025,7 @@ struct Lowerer {
     }
 
     // Map a MIR `TypeId` to the LIR register class that holds its
-    // values. F16/F32/F64/F128 → FPR; Vector/Matrix → VR (SIMD);
+    // values. F16/F32/F64/F80/F128 → FPR; Vector/Matrix → VR (SIMD);
     // integer/bool/pointer → GPR; default for aggregates (Struct/
     // Union/Array/Enum/Tuple/Slice) and any future variant arm →
     // GPR with explicit "scoped to ML5; cycle 3e aggregate-flattening
@@ -1058,15 +1058,22 @@ struct Lowerer {
     // the only tier where MIR types are still visible (post-regalloc
     // LIR carries register CLASSES, not widths), so the gate lives
     // here: any FPR-class type flowing into a width-keyed float
-    // mnemonic must be one of the ENCODED widths. F16/F128 stay
+    // mnemonic must be one of the ENCODED widths. F16/F80/F128 stay
     // fail-loud (no encodings at any width — first-match could
-    // otherwise pick a wrong-width form). Returns true (no-op) for
+    // otherwise pick a wrong-width form; F80 = x87, F128 = binary128 —
+    // D-CSUBSET-LONG-DOUBLE-X87-ARITH / D-CSUBSET-LONG-DOUBLE-IEEE128-ARITH
+    // are the future arcs that realize them). Returns true (no-op) for
     // non-FPR types. Applied exactly where float encodings exist
     // (FAdd, FSub, FMul, FDiv, FCmp operands, FPToSI source, FPTrunc/FPExt
     // source+result, FPR-class Load, and — since c78 — FNeg, whose
     // capability-dispatched lowering (native FNEG / sign-mask XORPD) gates
     // here so F16/F128 fail loud before a wrong-width mask/opcode is picked
-    // (D-CSUBSET-FLOAT-NEG-ENCODING).
+    // (D-CSUBSET-FLOAT-NEG-ENCODING). FC17.9(e) CRITICAL-2 adds the four
+    // CALL-BOUNDARY sites (Arg, Call result, Return operand, Store value):
+    // those are pure register/memory PLUMBING with no producer gate of
+    // their own, and widthFlagsForType defaults F80/F128 to width 0 = a
+    // 64-bit move — 8-byte plumbing of a 16-byte value, a silent ABI
+    // miscompile without the gate.
     [[nodiscard]] bool requireEncodedFloatWidth(MirInstId id, TypeId ty,
                                                 std::string_view context) {
         if (!ty.valid()) return true;  // upstream diagnosed the type hole
@@ -1850,15 +1857,29 @@ struct Lowerer {
                 // width as the override. The DESTINATION float is fixed at F64 (sd /
                 // Dd) this cycle on BOTH targets — the variant guard carries ONE
                 // width axis and the source-int axis OWNS it (REX.W / Wn-vs-Xn must
-                // be exact), so a NON-F64 result (int→F32) has no encoding and FAILS
-                // LOUD here rather than silently selecting a wrong-width form
-                // (D-CSUBSET-INT-TO-F32-CODEGEN, deferred; sqlite uses `double`
-                // only). A NARROW source (Char/I8/I16 — widthFlagsForType → 8/16)
-                // also has no declared variant and fails loud at the matcher
-                // (no partial-register conversion this cycle); the C int literal
-                // `5` is I32 and the sqlite blocker is I64, both encoded.
+                // be exact), so a NON-F64 result has no encoding and FAILS LOUD
+                // here rather than silently selecting a wrong-width form. TWO
+                // deferral classes reach this arm: an F32 destination (int→F32,
+                // D-CSUBSET-INT-TO-F32-CODEGEN; sqlite uses `double` only) AND —
+                // FC17.9(e) — an F80/F128 long double destination (`long double
+                // ld = anInt;`), whose real conversion rides the per-format x87 /
+                // binary128 arithmetic arcs (D-CSUBSET-LONG-DOUBLE-X87-ARITH /
+                // -IEEE128-ARITH); until then it walls under the same encoded-
+                // width guard (D-TARGET-ENCODING-WIDTH-GUARD) as every other
+                // unencoded FPR width. A NARROW source (Char/I8/I16 —
+                // widthFlagsForType → 8/16) also has no declared variant and
+                // fails loud at the matcher (no partial-register conversion this
+                // cycle); the C int literal `5` is I32 and the sqlite blocker is
+                // I64, both encoded.
                 TypeKind const resultK = interner.kind(mir.instType(id));
                 if (resultK != TypeKind::F64) {
+                    // Cite the anchor matching the deferral class the result
+                    // kind falls into, so a long double conversion-result wall
+                    // points at the long-double arc, not the int→F32 one.
+                    char const* const resultAnchor =
+                        (resultK == TypeKind::F80 || resultK == TypeKind::F128)
+                            ? "D-CSUBSET-LONG-DOUBLE / D-TARGET-ENCODING-WIDTH-GUARD"
+                            : "D-CSUBSET-INT-TO-F32-CODEGEN";
                     dss::report(reporter,
                         DiagnosticCode::L_UnsupportedLoweringForOpcode,
                         DiagnosticSeverity::Error,
@@ -1867,9 +1888,10 @@ struct Lowerer {
                             "not lowerable to target '{}' — only an F64 (double) "
                             "destination has an int→float encoding this cycle; "
                             "proceeding would silently select a wrong-width "
-                            "instruction form (D-CSUBSET-INT-TO-F32-CODEGEN)",
+                            "instruction form ({})",
                             op == MirOpcode::SIToFP ? "SIToFP" : "UIToFP",
-                            static_cast<unsigned>(resultK), target.name()));
+                            static_cast<unsigned>(resultK), target.name(),
+                            resultAnchor));
                     poisonValue(id);
                     return;
                 }
@@ -1904,6 +1926,12 @@ struct Lowerer {
             reportMissingOpcode(MnemonicSlot::Arg, "MIR Arg");
             return;
         }
+        // FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): the call-boundary
+        // width gate — an F80/F128 PARAMETER would otherwise plumb through
+        // a width-0 (64-bit) FPR move (widthFlagsForType defaults them to
+        // 0), silently truncating a 16-byte value: `long double f(long
+        // double x){return x;}` ran 8-byte plumbing before this gate.
+        if (!requireEncodedFloatWidth(id, mir.instType(id), "MIR Arg")) return;
         // Cycle 3d: Arg's result reg class follows the parameter type
         // (F32/F64 → FPR; integer/ptr → GPR). ML7 callconv lowering
         // reads the result class to pick the right arg-passing
@@ -2794,6 +2822,12 @@ struct Lowerer {
     void lowerStore(MirInstId id) {
         auto const operands = mir.instOperands(id);
         if (operands.size() != 2) { reportUnsupported(MirOpcode::Store, id); return; }
+        // FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): width gate on the
+        // stored VALUE — memAccessWidthFlags defaults F80/F128 to width 0 =
+        // an 8-byte movsd/STUR of a 16-byte value (the Load side has gated
+        // since FC2; the Store side had no gate).
+        if (!requireEncodedFloatWidth(id, mir.instType(operands[0]),
+                                      "MIR Store value")) return;
         std::optional<LirReg> const value = regForValue(operands[0]);
         std::optional<LirReg> const base  = regForValue(operands[1]);
         if (!value.has_value() || !base.has_value()) return;
@@ -3878,6 +3912,10 @@ struct Lowerer {
             emitInst(*opcode(callSlot), InvalidLirReg, ops, payload);
             return;
         }
+        // FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): call-boundary width
+        // gate on the RESULT — an F80/F128-returning call would otherwise
+        // move the return register through 64-bit plumbing (see lowerArg).
+        if (!requireEncodedFloatWidth(id, resultTy, "MIR Call result")) return;
         LirReg const result = lir.newVReg(regClassFor(id));
         emitInst(*opcode(callSlot), result, ops, payload);
         defineValue(id, result);
@@ -5995,6 +6033,11 @@ struct Lowerer {
         std::vector<LirOperand> ops;
         ops.reserve(operands.size());
         for (MirInstId const operand : operands) {
+            // FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): call-boundary
+            // width gate on the RETURN operand — the return-register move is
+            // plain plumbing with no producer gate of its own (see lowerArg).
+            if (!requireEncodedFloatWidth(id, mir.instType(operand),
+                                          "MIR Return operand")) return false;
             std::optional<LirReg> const v = regForValue(operand);
             if (!v.has_value()) return false;
             ops.push_back(LirOperand::makeReg(*v));

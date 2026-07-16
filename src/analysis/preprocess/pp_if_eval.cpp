@@ -99,7 +99,7 @@ struct LiteralKinds {
         }
         TypeKind const k = m.core;
         if (k == TypeKind::F16 || k == TypeKind::F32 || k == TypeKind::F64
-            || k == TypeKind::F128) {
+            || k == TypeKind::F80 || k == TypeKind::F128) {
             lk.floating.insert(tok);
         } else {
             // Char / I8 / U8 / Bool / I16 / I32 / ... -> integer literal.

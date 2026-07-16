@@ -4439,6 +4439,180 @@ TEST(MirToLir, F32AddLowersAndExoticFloatWidthsStayWalled) {
                                      ::dss::MirOpcode::FDiv);
     EXPECT_FALSE(probe128.ok);
     EXPECT_TRUE(sawAnchor(probe128.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): F80 (x87 80-bit) is the third
+    // genuinely-unencoded FPR width — an ARITHMETIC op over it must wall at
+    // the SAME width guard (its real x87 codegen is D-CSUBSET-LONG-DOUBLE-
+    // X87-ARITH, still deferred). The arithmetic producers already gated it
+    // by construction (regClassForCoreType(F80)==FPR, not F32/F64); this arm
+    // pins that alongside the F16/F128 siblings.
+    auto probe80 = lowerBinaryProbe(::dss::TypeKind::F80,
+                                    ::dss::MirOpcode::FMul);
+    EXPECT_FALSE(probe80.ok)
+        << "F80 arithmetic must wall — no x87 scalar encodings this cycle";
+    EXPECT_TRUE(sawAnchor(probe80.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+}
+
+// ══ FC17.9(e) CRITICAL-2 (D-CSUBSET-LONG-DOUBLE): the four CALL-BOUNDARY
+// walls ═══════════════════════════════════════════════════════════════════
+//
+// The in-function arithmetic PRODUCERS (FAdd..FNeg, Load, Const, conversions)
+// already wall F80/F128, but the four call/memory BOUNDARY plumbing sites had
+// NO producer gate of their own — Arg, Store-value, Call-result, and Return-
+// operand each just move a register/memory word, and widthFlagsForType /
+// memAccessWidthFlags DEFAULT F80/F128 to width 0 = a 64-bit move (8-byte
+// plumbing of a 16-byte value — a silent ABI miscompile). requireEncodedFloat-
+// Width now gates all four.
+//
+// Each pin is INDIVIDUALLY red-on-disable by keying on the walling site's
+// DISTINCT context string ("MIR Arg" / "MIR Store value" / "MIR Call result" /
+// "MIR Return operand"), NOT on the aggregate `ok` flag: three of the four
+// modules unavoidably co-fire the Arg gate (the F80 value has to be produced
+// somehow, and every F80 producer walls), so an `ok`-only assert would stay
+// green when its own gate is removed but a sibling still fires. Removing THE
+// gate under test deletes THAT context's diagnostic → THAT pin (and only it)
+// reds; the diagnostic text carries the D-TARGET-ENCODING-WIDTH-GUARD anchor.
+
+namespace {
+// void f(long double x) {}  — an F80 PARAMETER, unused, void return. The Arg
+// gate is the SOLE F80 site (no Const/Load/Store/Call, no F80 return), so this
+// pin's `ok` is walled ONLY by the Arg gate — the strict single-gate witness.
+[[nodiscard]] GuardProbe lowerF80ArgProbe() {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f80  = interner.primitive(::dss::TypeKind::F80);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    std::array<::dss::TypeId, 1> params{f80};
+    auto const sig = interner.fnSig(params, voidT, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    (void)mb.addArg(0, f80);
+    mb.addReturn(std::nullopt);
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+
+// int f(long double x, long double* p) { *p = x; return 0; }  — the STORE-value
+// gate (mirrors buildF64StoreMir with F80). The Arg gate co-fires on arg0, so
+// this pin keys on the "MIR Store value" context.
+[[nodiscard]] GuardProbe lowerF80StoreProbe() {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f80  = interner.primitive(::dss::TypeKind::F80);
+    auto const ptrT = interner.pointer(f80);
+    auto const i32  = interner.primitive(::dss::TypeKind::I32);
+    std::array<::dss::TypeId, 2> params{f80, ptrT};
+    auto const sig = interner.fnSig(params, i32, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const v = mb.addArg(0, f80);
+    ::dss::MirInstId const p = mb.addArg(1, ptrT);
+    std::array<::dss::MirInstId, 2> storeOps{v, p};
+    (void)mb.addInst(::dss::MirOpcode::Store, storeOps, ::dss::InvalidType);
+    ::dss::MirLiteralValue zero; zero.value = std::int64_t{0};
+    zero.core = ::dss::TypeKind::I32;
+    mb.addReturn(mb.addConst(zero, i32));
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+
+// void f() { g(); }  where g returns long double — the CALL-RESULT gate. The
+// callee is a GlobalAddr (GPR, no wall), no args, void return: the call's F80
+// RESULT is the SOLE F80 site, so `ok` is walled ONLY by the Call-result gate.
+[[nodiscard]] GuardProbe lowerF80CallResultProbe() {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f80   = interner.primitive(::dss::TypeKind::F80);
+    auto const voidT = interner.primitive(::dss::TypeKind::Void);
+    auto const ptrT  = interner.pointer(voidT);
+    auto const sig = interner.fnSig(std::span<::dss::TypeId const>{}, voidT,
+                                    ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const callee = mb.addGlobalAddr(::dss::SymbolId{2}, ptrT);
+    std::array<::dss::MirInstId, 1> callOps{callee};
+    (void)mb.addInst(::dss::MirOpcode::Call, callOps, f80);   // F80 result
+    mb.addReturn(std::nullopt);
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+
+// long double f(long double x) { return x; }  — the RETURN-operand gate. The
+// Arg gate co-fires on x, so this pin keys on the "MIR Return operand" context.
+[[nodiscard]] GuardProbe lowerF80ReturnProbe() {
+    auto target = ::dss::TargetSchema::loadShipped("x86_64");
+    EXPECT_TRUE(target.has_value());
+    ::dss::TypeInterner interner{::dss::CompilationUnitId{1}};
+    auto const f80 = interner.primitive(::dss::TypeKind::F80);
+    std::array<::dss::TypeId, 1> params{f80};
+    auto const sig = interner.fnSig(params, f80, ::dss::CallConv::CcSysV);
+    ::dss::MirBuilder mb;
+    mb.addFunction(sig, ::dss::SymbolId{1});
+    mb.beginBlock(mb.createBlock(::dss::StructCfMarker::EntryBlock));
+    ::dss::MirInstId const x = mb.addArg(0, f80);
+    mb.addReturn(x);
+    ::dss::Mir m = std::move(mb).finish();
+    GuardProbe probe;
+    auto result = ::dss::lowerToLir(m, **target, interner, probe.rep);
+    probe.ok  = result.ok;
+    probe.lir = std::move(result.lir);
+    return probe;
+}
+} // namespace
+
+TEST(MirToLir, F80ArgBoundaryWallsFailLoud) {
+    auto probe = lowerF80ArgProbe();
+    EXPECT_FALSE(probe.ok)
+        << "an F80 PARAMETER is the sole F80 site here — the Arg gate must "
+           "wall it (else 64-bit plumbing of a 16-byte value)";
+    EXPECT_TRUE(sawAnchor(probe.rep, "MIR Arg"))
+        << "the Arg-boundary wall must fire with its own context string";
+    EXPECT_TRUE(sawAnchor(probe.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+}
+
+TEST(MirToLir, F80StoreValueBoundaryWallsFailLoud) {
+    auto probe = lowerF80StoreProbe();
+    EXPECT_FALSE(probe.ok);
+    EXPECT_TRUE(sawAnchor(probe.rep, "MIR Store value"))
+        << "the Store-value wall must fire — memAccessWidthFlags defaults F80 "
+           "to width 0 = an 8-byte movsd of a 16-byte value";
+    EXPECT_TRUE(sawAnchor(probe.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+}
+
+TEST(MirToLir, F80CallResultBoundaryWallsFailLoud) {
+    auto probe = lowerF80CallResultProbe();
+    EXPECT_FALSE(probe.ok)
+        << "a call RETURNING long double is the sole F80 site here — the "
+           "Call-result gate must wall it";
+    EXPECT_TRUE(sawAnchor(probe.rep, "MIR Call result"))
+        << "the Call-result wall must fire with its own context string";
+    EXPECT_TRUE(sawAnchor(probe.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
+}
+
+TEST(MirToLir, F80ReturnOperandBoundaryWallsFailLoud) {
+    auto probe = lowerF80ReturnProbe();
+    EXPECT_FALSE(probe.ok);
+    EXPECT_TRUE(sawAnchor(probe.rep, "MIR Return operand"))
+        << "the Return-operand wall must fire — the return-register move is "
+           "plain plumbing with no producer gate of its own";
+    EXPECT_TRUE(sawAnchor(probe.rep, "D-TARGET-ENCODING-WIDTH-GUARD"));
 }
 
 // ══ TLS C1 (D-CSUBSET-THREAD-LOCAL): the thread-local GlobalAddr arm ══

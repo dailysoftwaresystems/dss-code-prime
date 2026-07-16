@@ -15,6 +15,9 @@
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: Linux arm64 (AAPCS64) uses the generic LSB-first bit-field allocation — identical to SysV/GNU gnu_packed for little-endian — so it shares the strategy. Byte-ABI-exact (the qemu arm64-ELF corpus is self-consistent under it; the CI cross-compile-compare confirms against the native compiler).",
   "bitFieldStrategy": "gnu_packed",
 
+  "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: AAPCS64 linux-arm64 `long double` = IEEE binary128, 16/16. See elf64-aarch64-linux-exec.",
+  "longDoubleFormat": "ieee128",
+
   "$supportedDataSectionsComment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE + D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a relocatable object carries data — a global lands in `.rodata`/`.data`/`.bss`/`.data.rel.ro` with `sh_addr=0` + a section-relative `.symtab` entry the FINAL linker binds. Same machine-NEUTRAL elf.cpp ET_REL writer as elf64-x86_64-linux (it reads section names/flags + reloc nativeIds from THIS schema, never hardcoding a machine); arch differs only via config — the abs64 data reloc is R_AARCH64_ABS64 (257) here vs R_X86_64_64 (1) on x86_64. A reloc-bearing CONST global (`relro`) emits `.rela.data.rel.ro`; a reloc-bearing MUTABLE pointer emits `.rela.data`. TLS (`tdata`/`tbss`) is deferred to a follow-up.",
   "supportedDataSections": ["rodata", "data", "bss", "relro"],
 

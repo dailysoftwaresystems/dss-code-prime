@@ -680,6 +680,19 @@ struct DSS_EXPORT ObjectFormatData {
     // arm64 does NOT diverge from generic AAPCS64 on bit-field packing).
     BitFieldStrategy     bitFieldStrategy = BitFieldStrategy::None;
 
+    // ── FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the per-format `long double` axis ──
+    //
+    // OPTIONAL top-level `"longDoubleFormat"` ("f64" / "x87-80" / "ieee128";
+    // closed enum, loader fails loud on an unknown spelling — the
+    // bitFieldStrategy discipline). The representation is OS/format-determined
+    // (x86_64 serves BOTH pe64's 64-bit-IEEE `long double` and ELF-SysV's x87
+    // 80-bit), so the axis lives here next to `dataModel`. Absent ⇒ `None`
+    // (undeclared): a `long double` row is then UNREALIZED at semantic bind —
+    // S_LongDoubleFormatUndeclared, never a silent base-core fallback (wasm /
+    // spirv skeletons omit it deliberately). Unlike bitFieldStrategy there is
+    // NO target-side fallback field — the axis is format-only.
+    LongDoubleFormat     longDoubleFormat = LongDoubleFormat::None;
+
     // Relocations row — same shape as `TargetSchema::relocations[]`
     // so the reloc-taxonomy unifier (plan 13 §2.6) is symmetric.
     std::vector<ObjectFormatRelocationInfo> relocations;
@@ -927,6 +940,13 @@ public:
     // `AggregateLayoutParams` it threads into the layout engine.
     [[nodiscard]] BitFieldStrategy     bitFieldStrategy() const noexcept {
         return d_.bitFieldStrategy;
+    }
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the format's declared `long double`
+    // axis, or `None` if it declared none (the semantic bind then leaves any
+    // `long double` row unrealized — S_LongDoubleFormatUndeclared on use).
+    // Read by the driver via `effectiveLongDoubleFormat(target, format)`.
+    [[nodiscard]] LongDoubleFormat     longDoubleFormat() const noexcept {
+        return d_.longDoubleFormat;
     }
 
     // Relocation accessors — symmetric with TargetSchema's. The

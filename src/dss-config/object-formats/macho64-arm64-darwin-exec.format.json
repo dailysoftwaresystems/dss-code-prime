@@ -15,6 +15,9 @@
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: Apple arm64 (Apple Silicon) generic LSB-first bit-field allocation == AAPCS64 == gnu_packed. Apple's documented arm64 ABI divergences do NOT include bit-field packing (they cover char/wchar_t signedness, long double=double, va_list, red zone, stack args, empty structs). This is the ONLY ABI in the trio with no LOCAL runtime witness (no Mac/emulator here); the macOS CI leg (clang) is the runtime confirm + the documentation positively supports gnu_packed.",
   "bitFieldStrategy": "gnu_packed",
 
+  "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: Apple arm64 `long double` IS `double` (64-bit IEEE, 8/8) — one of Apple's DOCUMENTED divergences from generic AAPCS64 (which uses binary128; see the elf64-aarch64 formats). The f64 axis collapses the c-subset `long double` row to F64, so the full double machinery serves it end-to-end.",
+  "longDoubleFormat": "f64",
+
   "$entryPointComment": "Empty defaults to module.functions[0] (cycle-2 convention). LC_MAIN.entryoff is computed as (entry_function_offset_in_.text) — relative to the __TEXT segment start.",
   "entryPoint": "",
   "$externCallDispatchComment": "DIRECT-PLT. Mach-O points each extern symbol's VA at its __stubs STUB (code) — `symbolVa[extern] = stubVa` in macho.cpp — and the stub does the __got indirection internally (ARM64: ADRP x16, page → LDR x16,[x16,#lo12] → BR x16). The call site is therefore a PLAIN DIRECT call (ARM64 `BL imm26`, R_*/ARM64_RELOC_BRANCH26) to the stub, NOT a deref-the-stub-as-pointer. This is the SAME direct-plt model ELF uses; it matches what the trampoline + MIR→LIR `lowerCall` emit (both via `externCallUsesIndirectShape`). ARM64 has no `call_indirect_via_extern` opcode, so direct-plt is also the only lowerable shape. D-FFI-EXTERN-CALL-DISPATCH.",

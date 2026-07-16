@@ -9105,3 +9105,154 @@ TEST(SemanticAnalyzerCSubset, PtrToVlaInitFormDeferredStillFailsLoud) {
         << "the pointer-to-VLA INIT form `int (*p)[n] = b` is deferred and must fail loud "
            "(S_TypeMismatch) — never a silent accept that would mis-stride the subscript";
 }
+
+// ─── FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the per-format long-double axis ──────
+//
+// `long double`'s REPRESENTATION is ABI-divergent per object format (64-bit
+// IEEE on pe64/apple-arm64, x87 80-bit on SysV/darwin x86_64, binary128 on
+// linux-arm64), so the c-subset typeSpecifiers row carries a
+// coreByLongDoubleFormat map resolved against `analyze()`'s LongDoubleFormat
+// axis: f64 → F64 (long double IS double — the full machinery serves it),
+// x87-80 → F80, ieee128 → F128, and an UNDECLARED axis (None — wasm/spirv/
+// direct-API) leaves the row UNREALIZED → the precise
+// S_LongDoubleFormatUndeclared, NEVER a silently-guessed base core.
+
+// (Symbol lookup reuses the file-wide `findSymbolNamed` helper above.)
+namespace {
+[[nodiscard]] SemanticModel analyzeWithLongDoubleAxis(
+    std::initializer_list<std::string> sources, LongDoubleFormat axis) {
+    auto cu = buildShippedUnit("c-subset", sources);
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, DataModel::Lp64, std::nullopt, std::nullopt,
+                   std::nullopt, std::nullopt, axis);
+}
+} // namespace
+
+TEST(SemanticAnalyzerCSubset, LongDoubleResolvesPerAxis) {
+    struct Row { LongDoubleFormat axis; TypeKind expected; };
+    for (Row const row : {Row{LongDoubleFormat::F64, TypeKind::F64},
+                          Row{LongDoubleFormat::X87_80, TypeKind::F80},
+                          Row{LongDoubleFormat::Ieee128, TypeKind::F128}}) {
+        auto model = analyzeWithLongDoubleAxis(
+            {"int main(void) { long double x; }\n"}, row.axis);
+        EXPECT_FALSE(model.hasErrors())
+            << "axis " << static_cast<int>(row.axis)
+            << ": a `long double` declaration must resolve";
+        auto const* x = findSymbolNamed(model, "x");
+        ASSERT_NE(x, nullptr);
+        ASSERT_TRUE(x->type.valid());
+        EXPECT_EQ(model.lattice().interner().kind(x->type), row.expected)
+            << "axis " << static_cast<int>(row.axis);
+    }
+}
+
+TEST(SemanticAnalyzerCSubset, LongDoubleUndeclaredAxisFailsLoud) {
+    // Default analyze() = LongDoubleFormat::None (direct-API / wasm / spirv):
+    // the row is UNREALIZED — the PRECISE 0xE056, not the generic S0011, and
+    // NEVER a silent F64 bind (the base-core-fallback trap, IMPORTANT-4).
+    auto model = analyzeShipped("c-subset", {
+        "int main(void) { long double x; }\n",
+    });
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_LongDoubleFormatUndeclared), 1u)
+        << "a `long double` DECLARATION under an undeclared axis must emit "
+           "S_LongDoubleFormatUndeclared (0xE056)";
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InvalidTypeSpecifierCombination), 0u)
+        << "the combination is VALID C — the unrealized-row arm must fire "
+           "BEFORE the invalid-combination miss";
+    auto const* x = findSymbolNamed(model, "x");
+    ASSERT_NE(x, nullptr);
+    EXPECT_FALSE(x->type.valid())
+        << "the symbol must stay UNTYPED — a valid TypeId here means the row "
+           "silently base-core-resolved under an undeclared axis";
+}
+
+TEST(SemanticAnalyzerCSubset, LongDoubleIsDoubleOnF64Axis) {
+    // The f64 axis (pe64 / apple-arm64): `long double` COLLAPSES to F64 —
+    // assignment-compatible with `double` in BOTH directions (the LLP64
+    // long==int identity-collapse precedent), so the whole double machinery
+    // serves it with zero new codegen.
+    auto model = analyzeWithLongDoubleAxis(
+        {"int main(void) { long double x; double d; x = d; d = x; x = 1.5; }\n"},
+        LongDoubleFormat::F64);
+    EXPECT_FALSE(model.hasErrors())
+        << "on the f64 axis `long double` IS double — both assignment "
+           "directions must be clean";
+}
+
+TEST(SemanticAnalyzerCSubset, LongDoubleLiteralTypesPerAxis) {
+    // C 6.4.4.2: the l/L float suffix types `long double` — resolved through
+    // the SAME axis map the typeSpecifiers row carries. On x87-80 a `20.0L`
+    // initializer binds an F80 `long double` cleanly; the sibling `20L`
+    // INTEGER literal stays `long` (the CRITICAL-1 suffix-shape pin, semantic
+    // tier: it must remain a valid ARRAY DIMENSION, which no float can be).
+    auto ld = analyzeWithLongDoubleAxis(
+        {"int main(void) { long double x = 20.0L; }\n"},
+        LongDoubleFormat::X87_80);
+    EXPECT_FALSE(ld.hasErrors())
+        << "`long double x = 20.0L;` on the x87-80 axis: the literal types "
+           "F80 and binds the F80 declaration cleanly";
+
+    auto intL = analyzeWithLongDoubleAxis(
+        {"int main(void) { int a[20L]; return sizeof a ? 0 : 1; }\n"},
+        LongDoubleFormat::X87_80);
+    EXPECT_FALSE(intL.hasErrors())
+        << "`20L` must stay an INTEGER `long` (a constant array dimension) — "
+           "an error here means the l-suffix float rule swallowed it";
+
+    // Undeclared axis: the long-double LITERAL is as unknowable as the
+    // declaration — the same precise 0xE056 (never a silent F64 typing).
+    auto none = analyzeShipped("c-subset", {
+        "int main(void) { double d = 20.0L; }\n",
+    });
+    EXPECT_EQ(countCode(none.diagnostics(),
+                        DiagnosticCode::S_LongDoubleFormatUndeclared), 1u)
+        << "a `20.0L` literal under an undeclared axis must emit 0xE056";
+}
+
+TEST(SemanticAnalyzerCSubset, LongDoubleUsualArithmeticConversionOutranksDouble) {
+    // C 6.3.1.8: long double outranks double (floatRank F80=4 > F64=3). On a
+    // WALLED axis the arm is observable: `x + d` types F80, so it binds an
+    // F80 lhs cleanly and REJECTS an F64 lhs (were the result F64, the two
+    // expectations would invert — a strict both-ways pin of the rank order).
+    auto good = analyzeWithLongDoubleAxis(
+        {"int main(void) { long double x; double d; long double r; r = x + d; }\n"},
+        LongDoubleFormat::X87_80);
+    EXPECT_FALSE(good.hasErrors())
+        << "`long double + double` must type long double (F80) — assignable "
+           "into a long double lhs";
+
+    auto bad = analyzeWithLongDoubleAxis(
+        {"int main(void) { long double x; double d; double r; r = x + d; }\n"},
+        LongDoubleFormat::X87_80);
+    EXPECT_TRUE(bad.hasErrors())
+        << "`long double + double` into a DOUBLE lhs is a narrowing float "
+           "assignment (F80 -> F64) — must reject, proving the UAC result is "
+           "F80, not F64";
+}
+
+TEST(SemanticAnalyzerCSubset, LongDoubleConstexprFoldRefusedOnWalledAxis) {
+    // IMPORTANT-5 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): the const-eval
+    // fold gate. F80/F128 are NOT host-backed (floatKindInfo.hostBacked ==
+    // false) — folding `20.0L + 22.0L` at the host's binary64 would bake a
+    // silently-rounded constant for any value needing >53 mantissa bits. The
+    // gate refuses at applyBinaryFloat, so the constexpr initializer is NOT a
+    // compile-time constant on a walled axis (loud), while the SAME source on
+    // the f64 axis folds exactly (long double IS binary64 there).
+    auto walled = analyzeWithLongDoubleAxis(
+        {"int main(void) { constexpr long double k = 20.0L + 22.0L; }\n"},
+        LongDoubleFormat::X87_80);
+    EXPECT_EQ(countCode(walled.diagnostics(),
+                        DiagnosticCode::S_ConstexprNonConstantInitializer), 1u)
+        << "F80 constexpr arithmetic must REFUSE the host-double fold "
+           "(hostBacked==false) — a clean analysis here means the fold gate "
+           "is bypassed and a binary64-rounded constant was baked";
+
+    auto f64 = analyzeWithLongDoubleAxis(
+        {"int main(void) { constexpr long double k = 20.0L + 22.0L; }\n"},
+        LongDoubleFormat::F64);
+    EXPECT_FALSE(f64.hasErrors())
+        << "on the f64 axis the SAME fold is exact (long double IS binary64) "
+           "— must fold clean";
+}

@@ -59,7 +59,8 @@ constantLiteralForSymbol(SymbolRecord const& rec, TypeInterner const& interner) 
     // INJECTED constant can be a float (an enumerator's underlying type is always
     // integer, C 6.7.2.2), so this arm never fires for an enumerator.
     bool const isFloat = (core == TypeKind::F16 || core == TypeKind::F32
-                       || core == TypeKind::F64 || core == TypeKind::F128);
+                       || core == TypeKind::F64 || core == TypeKind::F80
+                       || core == TypeKind::F128);
     if (isFloat) {
         lv.value = std::bit_cast<double>(static_cast<std::int64_t>(rec.enumValue));
     } else if (detail::type_rules::unsignedIntRank(core) == 0) {

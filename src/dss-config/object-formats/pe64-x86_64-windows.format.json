@@ -15,6 +15,9 @@
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: MSVC x64 bit-field packing (byte-ABI-exact to cl.exe). The strategy is OS/format-determined (x86_64 serves both PE and ELF), so it lives on the format, not the target. See pe64-x86_64-windows-exec for the full rule.",
   "bitFieldStrategy": "msvc_straddle",
 
+  "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: MSVC x64 `long double` IS `double` (64-bit IEEE, 8/8) — the f64 axis collapses the c-subset `long double` row to F64. See pe64-x86_64-windows-exec for the full rationale.",
+  "longDoubleFormat": "f64",
+
   "pe": {
     "$comment": "IMAGE_FILE_HEADER identity. machine = IMAGE_FILE_MACHINE_AMD64 (0x8664). characteristics = 0 — relocatable .obj carries no file-level flags (link.exe sets image-level flags when producing the .exe/.dll).",
     "machine": 34404,

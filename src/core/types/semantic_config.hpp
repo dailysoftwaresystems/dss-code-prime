@@ -1088,11 +1088,37 @@ struct DSS_EXPORT TypeSpecifierRule {
     std::vector<std::string>   tokenNames;   // source spellings, for diagnostics
     TypeKind                   core = TypeKind::Void;
     std::unordered_map<DataModel, TypeKind> coreByDataModel;
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the per-longDoubleFormat override —
+    // `{"x87-80": "F80", "ieee128": "F128"}` on the `long double` row (the
+    // f64 axis takes the BASE core, the LLP64 `long`≡`int` collapse
+    // precedent). Closed keys (longDoubleFormatFromName) + closed values
+    // (coreTypeFromName) at load, mirroring coreByDataModel.
+    std::unordered_map<LongDoubleFormat, TypeKind> coreByLongDoubleFormat;
     [[nodiscard]] TypeKind resolveCore(DataModel dm) const {
         if (auto it = coreByDataModel.find(dm); it != coreByDataModel.end()) {
             return it->second;
         }
         return core;
+    }
+    // FC17.9(e): the axis-aware resolver. nullopt ⇔ the row DEPENDS on the
+    // long-double axis (`coreByLongDoubleFormat` non-empty) but the active
+    // format declared none (`None`) — the row is UNREALIZED; the caller
+    // fails loud (S_LongDoubleFormatUndeclared). NEVER falls back to the
+    // base core in that case — the base is the F64-axis meaning, and
+    // silently binding it under an undeclared axis is the exact
+    // representation mis-bind this axis exists to prevent (the `long`
+    // lesson). A declared axis MISSING from the map (f64) takes the base
+    // core; a row with no map resolves exactly as resolveCore(dm).
+    [[nodiscard]] std::optional<TypeKind>
+    resolveCore(DataModel dm, LongDoubleFormat ldf) const {
+        if (!coreByLongDoubleFormat.empty()) {
+            if (auto it = coreByLongDoubleFormat.find(ldf);
+                it != coreByLongDoubleFormat.end()) {
+                return it->second;
+            }
+            if (ldf == LongDoubleFormat::None) return std::nullopt;
+        }
+        return resolveCore(dm);
     }
 };
 
@@ -1111,11 +1137,29 @@ struct DSS_EXPORT DataModelTypeRef {
     std::string name;                        // source spelling, for diagnostics
     TypeKind    core = TypeKind::Void;
     std::unordered_map<DataModel, TypeKind> coreByDataModel;
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): copied from the resolved
+    // typeSpecifiers row at load (the "long double" float-literal rule) —
+    // WITHOUT this copy the literal row would silently drop the axis map
+    // and type every `20.0L` at the base core (the knob-that-lies).
+    std::unordered_map<LongDoubleFormat, TypeKind> coreByLongDoubleFormat;
     [[nodiscard]] TypeKind resolveCore(DataModel dm) const {
         if (auto it = coreByDataModel.find(dm); it != coreByDataModel.end()) {
             return it->second;
         }
         return core;
+    }
+    // FC17.9(e): the axis-aware resolver — nullopt ⇔ axis-dependent ref
+    // under an undeclared (None) axis; see TypeSpecifierRule::resolveCore.
+    [[nodiscard]] std::optional<TypeKind>
+    resolveCore(DataModel dm, LongDoubleFormat ldf) const {
+        if (!coreByLongDoubleFormat.empty()) {
+            if (auto it = coreByLongDoubleFormat.find(ldf);
+                it != coreByLongDoubleFormat.end()) {
+                return it->second;
+            }
+            if (ldf == LongDoubleFormat::None) return std::nullopt;
+        }
+        return resolveCore(dm);
     }
 };
 

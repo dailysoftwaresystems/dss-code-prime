@@ -16,6 +16,9 @@
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: macOS/Darwin (Apple x86_64 + arm64) uses the generic LSB-first bit-field allocation. Apple's enumerated arm64 ABI divergences from generic AAPCS64 are char/wchar_t signedness, long double=double, va_list, the red zone, the stack argument area, and empty-struct handling — NOT bit-field packing — so Mach-O shares gnu_packed (the SAME value the x86_64-darwin object + both darwin exec formats declare).",
   "bitFieldStrategy": "gnu_packed",
 
+  "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: Apple arm64 `long double` IS `double` (64-bit IEEE, 8/8) — a documented Apple divergence from generic AAPCS64's binary128. See macho64-arm64-darwin-exec.",
+  "longDoubleFormat": "f64",
+
   "macho": {
     "$comment": "mach_header_64 identity. cputype = CPU_TYPE_ARM64 = (12 | CPU_ARCH_ABI64 0x01000000) = 0x0100000C = 16777228 (the SAME value the macho64-arm64-darwin-exec schema declares). cpusubtype = CPU_SUBTYPE_ARM64_ALL (0). filetype = MH_OBJECT (1). flags = 0 — MH_SUBSECTIONS_VIA_SYMBOLS (0x2000) is intentionally NOT set (mirrors the x86_64-darwin object): the walker emits one flat `__text` blob with no N_ALT_ENTRY subsection markers, so advertising the flag would lie to ld64 about function-granular dead-strip safety. The flag returns when the substrate emits per-function subsections (plan 14 §3.1 D-LK3-2).",
     "cputype": 16777228,

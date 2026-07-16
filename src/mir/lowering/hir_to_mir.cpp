@@ -578,7 +578,8 @@ struct Lowerer {
     // diagnose with the actual HirOpKind name.
     [[nodiscard]] static MirOpcode mapBinaryOp(HirOpKind op, TypeKind tk) noexcept {
         bool const isFloat = (tk == TypeKind::F16 || tk == TypeKind::F32
-                           || tk == TypeKind::F64 || tk == TypeKind::F128);
+                           || tk == TypeKind::F64 || tk == TypeKind::F80
+                           || tk == TypeKind::F128);
         bool const isSigned = (tk == TypeKind::I8 || tk == TypeKind::I16
                             || tk == TypeKind::I32 || tk == TypeKind::I64
                             || tk == TypeKind::I128);
@@ -664,7 +665,8 @@ struct Lowerer {
         };
         auto isFloat = [](TypeKind k) noexcept {
             return k == TypeKind::F16 || k == TypeKind::F32
-                || k == TypeKind::F64 || k == TypeKind::F128;
+                || k == TypeKind::F64 || k == TypeKind::F80
+                || k == TypeKind::F128;
         };
         auto bitWidth = [](TypeKind k) noexcept -> int {
             switch (k) {
@@ -673,6 +675,10 @@ struct Lowerer {
                 case TypeKind::I16:  case TypeKind::U16: case TypeKind::F16: return 16;
                 case TypeKind::I32:  case TypeKind::U32: case TypeKind::F32: return 32;
                 case TypeKind::I64:  case TypeKind::U64: case TypeKind::F64: return 64;
+                // F80 sits BETWEEN F64 and F128 so float<->float conversion
+                // direction (FPTrunc vs FPExt) is width-ordered; the resulting
+                // op walls loud at MIR->LIR (D-CSUBSET-LONG-DOUBLE).
+                case TypeKind::F80:  return 80;
                 case TypeKind::I128: case TypeKind::U128: case TypeKind::F128: return 128;
                 default: return 0;
             }
@@ -872,7 +878,7 @@ struct Lowerer {
     // FP<->limbs path is a later cycle; the naive scalar path would drop the upper limbs.
     [[nodiscard]] static bool isFloatingKind(TypeKind k) noexcept {
         return k == TypeKind::F16 || k == TypeKind::F32
-            || k == TypeKind::F64 || k == TypeKind::F128;
+            || k == TypeKind::F64 || k == TypeKind::F80 || k == TypeKind::F128;
     }
 
     // ceil(N/64) — the limb count of a wide `_BitInt(N)`.
@@ -1830,11 +1836,12 @@ struct Lowerer {
                 // `double` only; a typed-float pool arm is the
                 // D-LK4-RODATA-PRODUCER-EXOTIC-FLOAT successor's
                 // concern. Exactly-representable corpus values are
-                // unaffected.) F16/F128 fall through to `addConst`
+                // unaffected.) F16/F80/F128 fall through to `addConst`
                 // and fail loud at MIR→LIR
                 // (D-TARGET-ENCODING-WIDTH-GUARD — promoting them
                 // here would silently pair them with wrong-width
-                // load/arithmetic encodings).
+                // load/arithmetic encodings; F80/F128 joined the
+                // fall-through with D-CSUBSET-LONG-DOUBLE).
                 if (std::holds_alternative<double>(src.value)
                     && t.valid()
                     && (interner.kind(t) == TypeKind::F64
@@ -2759,7 +2766,8 @@ struct Lowerer {
             }
         }
         bool const isFloat = (tk == TypeKind::F16 || tk == TypeKind::F32
-                           || tk == TypeKind::F64 || tk == TypeKind::F128);
+                           || tk == TypeKind::F64 || tk == TypeKind::F80
+                           || tk == TypeKind::F128);
         MirOpcode mop = MirOpcode::Invalid;
         switch (op) {
             case HirOpKind::Neg:    mop = isFloat ? MirOpcode::FNeg : MirOpcode::Neg; break;
@@ -6238,7 +6246,8 @@ struct Lowerer {
     [[nodiscard]] AbiPieceClass scalarArgClass(TypeId ty) const {
         TypeKind const k = interner.kind(ty);
         return (k == TypeKind::F16 || k == TypeKind::F32
-                || k == TypeKind::F64 || k == TypeKind::F128)
+                || k == TypeKind::F64 || k == TypeKind::F80
+                || k == TypeKind::F128)
             ? AbiPieceClass::Fpr : AbiPieceClass::Gpr;
     }
 

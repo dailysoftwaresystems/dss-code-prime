@@ -8,6 +8,7 @@
 #include "core/types/type_lattice/type_interner.hpp"
 #include "core/types/type_lattice/type_layout.hpp"
 #include "hir/const_eval.hpp"
+#include "hir/const_eval_arith.hpp"  // FC17.9(e): detail::floatKindInfo pins
 #include "hir/hir.hpp"
 #include "hir/hir_literal_pool.hpp"
 #include "hir/hir_op.hpp"
@@ -858,6 +859,76 @@ TEST(ConstEval, RemOnFloatRefusesAsUnsupportedTypeKind) {
     auto res = evaluateConstant(hir, r.interner, r.literals, rem, {}, opts);
     EXPECT_FALSE(res.value.has_value());
     EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
+}
+
+// ── FC17.9(e) (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): the hostBacked
+// fold gate. F80 (x87) and F128 (binary128) values CANNOT be represented by
+// the host `double` the fold engine computes in — folding `20.0L + 22.0L` at
+// binary64 would bake a silently-ROUNDED constant that then RUNS (never
+// reaching the LIR encoded-width wall). applyBinaryFloat/applyUnaryFloat
+// refuse when EITHER operand core has floatKindInfo(...).hostBacked == false;
+// F32/F64 keep folding exactly as before (F32 narrows losslessly through
+// narrowToFloatWidth; F64 is identity).
+
+TEST(ConstEval, NonHostBackedFloatBinaryFoldRefuses) {
+    for (TypeKind const k : {TypeKind::F80, TypeKind::F128}) {
+        Rig r;
+        TypeId const t = r.interner.primitive(k);
+        HirNodeId const a   = r.litFloat(20.0, t);
+        HirNodeId const b   = r.litFloat(22.0, t);
+        HirNodeId const add = r.binary(HirOpKind::Add, a, b, t);
+        EvalOptions opts;
+        opts.allowFloat = true;
+        Hir hir = r.finishWith(add);
+        auto res = evaluateConstant(hir, r.interner, r.literals, add, {}, opts);
+        EXPECT_FALSE(res.value.has_value())
+            << "kind " << static_cast<int>(k)
+            << ": a non-host-backed float ADD must refuse the binary64 fold";
+        EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind)
+            << "kind " << static_cast<int>(k);
+    }
+}
+
+TEST(ConstEval, NonHostBackedFloatComparisonAndNegRefuse) {
+    // Comparisons and unary Neg route through the SAME gated helpers — one
+    // operand being F80 is enough (the mixed-operand case).
+    Rig r;
+    TypeId const f80 = r.interner.primitive(TypeKind::F80);
+    HirNodeId const a  = r.litFloat(20.0, f80);
+    HirNodeId const b  = r.litFloat(22.0, r.f64T());
+    HirNodeId const lt = r.binary(HirOpKind::Lt, a, b, r.boolT());
+    EvalOptions opts;
+    opts.allowFloat = true;
+    Hir hir = r.finishWith(lt);
+    auto res = evaluateConstant(hir, r.interner, r.literals, lt, {}, opts);
+    EXPECT_FALSE(res.value.has_value())
+        << "an F80-vs-F64 comparison must refuse (either operand gates)";
+    EXPECT_EQ(res.failure, ConstEvalFailure::UnsupportedTypeKind);
+
+    Rig r2;
+    TypeId const f80b = r2.interner.primitive(TypeKind::F80);
+    HirNodeId const v   = r2.litFloat(20.0, f80b);
+    HirNodeId const neg = r2.unary(HirOpKind::Neg, v, f80b);
+    Hir hir2 = r2.finishWith(neg);
+    auto res2 = evaluateConstant(hir2, r2.interner, r2.literals, neg, {}, opts);
+    EXPECT_FALSE(res2.value.has_value()) << "F80 unary Neg must refuse";
+    EXPECT_EQ(res2.failure, ConstEvalFailure::UnsupportedTypeKind);
+}
+
+TEST(ConstEval, FloatKindInfoPinsHostBacking) {
+    // The gate's single source of truth: F16/F32/F64 host-backed;
+    // F80 = {80, false}; F128 = {128, false} (the IMPORTANT-5 pin).
+    auto const f80 = detail::floatKindInfo(TypeKind::F80);
+    ASSERT_TRUE(f80.has_value());
+    EXPECT_EQ(f80->bits, 80);
+    EXPECT_FALSE(f80->hostBacked);
+    auto const f128 = detail::floatKindInfo(TypeKind::F128);
+    ASSERT_TRUE(f128.has_value());
+    EXPECT_EQ(f128->bits, 128);
+    EXPECT_FALSE(f128->hostBacked);
+    EXPECT_TRUE(detail::floatKindInfo(TypeKind::F64)->hostBacked);
+    EXPECT_TRUE(detail::floatKindInfo(TypeKind::F32)->hostBacked);
+    EXPECT_TRUE(detail::floatKindInfo(TypeKind::F16)->hostBacked);
 }
 
 // IEEE 754 ordered comparisons: < ≤ > ≥ produce defined results for

@@ -185,14 +185,17 @@ TEST(Fc3WidthSemantics, FullSpecifierSurfaceResolvesDeclaredCores) {
 }
 
 TEST(Fc3WidthSemantics, InvalidSpecifierComboFailsLoudOnceByAbsence) {
-    // `unsigned float` / `short long` / `long double` are NOT rows in the
-    // typeSpecifiers table — they reject by ABSENCE, with EXACTLY ONE
-    // diagnostic (the precise S_InvalidTypeSpecifierCombination; the
-    // generic outer S_UnknownType is suppressed for the same resolution).
+    // `unsigned float` / `short long` are NOT rows in the typeSpecifiers
+    // table — they reject by ABSENCE, with EXACTLY ONE diagnostic (the
+    // precise S_InvalidTypeSpecifierCombination; the generic outer
+    // S_UnknownType is suppressed for the same resolution). `long double`
+    // LEFT this list with FC17.9(e) (D-CSUBSET-LONG-DOUBLE): it is now a
+    // VALID row carrying the per-format axis — under an undeclared axis it
+    // takes the precise S_LongDoubleFormatUndeclared instead (pinned by
+    // SemanticAnalyzerCSubset.LongDoubleUndeclaredAxisFailsLoud).
     for (auto const* src : {
              "int main() { unsigned float x; return 0; }\n",
              "int main() { short long x; return 0; }\n",
-             "int main() { long double x; return 0; }\n",
          }) {
         auto m = analyzeCSubset(src);
         EXPECT_EQ(countCode(m.diagnostics(),
@@ -529,6 +532,28 @@ TEST(Fc3LoaderRejects, UnknownDataModelKeyRejects) {
 TEST(Fc3LoaderRejects, UnknownTypeSpecifierFieldRejects) {
     auto doc = loadShippedCSubsetJson();
     doc["semantics"]["typeSpecifiers"][0]["coar"] = "I32";
+    EXPECT_FALSE(schemaLoads(doc));
+}
+
+// FC17.9(e) (D-CSUBSET-LONG-DOUBLE): `coreByLongDoubleFormat` is CLOSED both
+// ways — a typo'd axis key would silently never override (the long-double row
+// would bind base F64 on every walled format = the knob-that-lies), and a
+// typo'd core value has no meaning at all.
+TEST(Fc3LoaderRejects, UnknownLongDoubleFormatKeyRejects) {
+    auto doc = loadShippedCSubsetJson();
+    doc["semantics"]["typeSpecifiers"].push_back(
+        {{"tokens", {"LongKeyword", "FloatKeyword"}},
+         {"core", "F64"},
+         {"coreByLongDoubleFormat", {{"x86-80", "F80"}}}});   // typo'd key
+    EXPECT_FALSE(schemaLoads(doc));
+}
+
+TEST(Fc3LoaderRejects, UnknownLongDoubleFormatValueRejects) {
+    auto doc = loadShippedCSubsetJson();
+    doc["semantics"]["typeSpecifiers"].push_back(
+        {{"tokens", {"LongKeyword", "FloatKeyword"}},
+         {"core", "F64"},
+         {"coreByLongDoubleFormat", {{"x87-80", "F81"}}}});   // typo'd core
     EXPECT_FALSE(schemaLoads(doc));
 }
 

@@ -54,6 +54,7 @@ namespace dss {
 class GrammarSchema;
 class Tree;
 struct IntegerLiteralTypingRule;
+struct FloatLiteralTypingRule;   // FC17.9(e): the float ladder rules span
 
 // Resolved-symbol record returned by the resolver. The engine
 // recurses into `initExpr` and threads `initScopeOpaque` as the
@@ -236,6 +237,18 @@ struct CstEvalContext {
     // literal>` const-expr mirror the typed side (else a `long` literal would be
     // treated as `int` and mis-wrap). Only used when `integerLiteralTyping` is set.
     DataModel dataModel = DataModel::Lp64;
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the language's `floatLiteralTyping`
+    // rules + the active long-double axis, so the FLOAT leaf can stamp the
+    // literal's TRUE core via the SAME `typeFloatLiteral` ladder the typed side
+    // runs (the integer Fork-2c discipline) — not a flat F64. LOAD-BEARING for
+    // the hostBacked fold gate: a `20.0L` on an x87-80/ieee128 axis must carry
+    // core F80/F128 so `applyBinaryFloat` REFUSES to fold it at binary64
+    // (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION); a flat-F64 stamp would
+    // bypass the gate and bake a silently-rounded constant. EMPTY by default
+    // (the flat F64 stamp — inert for languages without the block). Only used
+    // when `floatLiteralTokens` admits float leaves at all.
+    std::span<FloatLiteralTypingRule const> floatLiteralTyping{};
+    LongDoubleFormat longDoubleFormat = LongDoubleFormat::None;
 };
 
 // Evaluate `expr` to a compile-time `HirLiteralValue`. Pure function;

@@ -91,7 +91,8 @@ namespace detail {
             case TypeKind::Bool:
             case TypeKind::I8:  case TypeKind::I16: case TypeKind::I32: case TypeKind::I64:
             case TypeKind::U8:  case TypeKind::U16: case TypeKind::U32: case TypeKind::U64:
-            case TypeKind::F16: case TypeKind::F32: case TypeKind::F64: case TypeKind::F128:
+            case TypeKind::F16: case TypeKind::F32: case TypeKind::F64: case TypeKind::F80:
+            case TypeKind::F128:
             case TypeKind::Char:
             case TypeKind::Byte:
                 return true;

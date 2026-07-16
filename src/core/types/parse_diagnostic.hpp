@@ -885,6 +885,19 @@ enum class DiagnosticCode : std::uint16_t {
     // miscompile-guard class as I_AtomicAccessNotLowered (the scalar belt).
     S_AtomicNonLockFree = 0xE055,
 
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): `long double` is used (a declaration /
+    // cast / literal) but the active object format declares NO `longDoubleFormat`
+    // axis (wasm/spirv skeletons, direct-API callers) — the type's REPRESENTATION
+    // is genuinely unknowable (64-bit IEEE vs x87 80-bit vs binary128 is
+    // ABI-divergent per format), so the typeSpecifiers row is left UNREALIZED and
+    // this precise diagnostic replaces the generic S_InvalidTypeSpecifier-
+    // Combination miss. Deliberately NOT a silent base-core fallback: binding F64
+    // under an undeclared axis is the representation mis-bind (wrong sizeof,
+    // wrong ABI class) the axis exists to prevent — the `long`/LLP64 lesson.
+    // Suppressible like its S0011 sibling: a suppressed emission leaves the type
+    // unresolved (InvalidType), which cannot reach codegen.
+    S_LongDoubleFormatUndeclared = 0xE056,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-

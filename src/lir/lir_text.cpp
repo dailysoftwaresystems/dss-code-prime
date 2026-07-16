@@ -50,6 +50,7 @@ typeKindFromName(std::string_view s) noexcept;
         case TypeKind::F16:       return "F16";
         case TypeKind::F32:       return "F32";
         case TypeKind::F64:       return "F64";
+        case TypeKind::F80:       return "F80";
         case TypeKind::F128:      return "F128";
         case TypeKind::Char:      return "Char";
         case TypeKind::Byte:      return "Byte";

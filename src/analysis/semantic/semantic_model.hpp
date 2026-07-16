@@ -414,7 +414,8 @@ public:
                   std::vector<ShippedExternSymbol>       shippedExterns,
                   std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
                                                          suppressedShippedLibraries,
-                  DataModel                              dataModel) noexcept
+                  DataModel                              dataModel,
+                  LongDoubleFormat                       longDoubleFormat) noexcept
         : cu_(std::move(cu)),
           lattice_(std::move(lattice)),
           scopes_(std::move(scopes)),
@@ -428,7 +429,8 @@ public:
           nullPointerConstantNodes_(std::move(nullPointerConstantNodes)),
           shippedExterns_(std::move(shippedExterns)),
           suppressedShippedLibraries_(std::move(suppressedShippedLibraries)),
-          dataModel_(dataModel) {}
+          dataModel_(dataModel),
+          longDoubleFormat_(longDoubleFormat) {}
 
     SemanticModel(SemanticModel const&)            = delete;
     SemanticModel& operator=(SemanticModel const&) = delete;
@@ -531,6 +533,15 @@ public:
     // ladder / UAC resolutions agree by construction.
     [[nodiscard]] DataModel dataModel() const noexcept { return dataModel_; }
 
+    // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the `long double` axis this analysis
+    // ran under (`analyze()`'s parameter — the active format's declared
+    // representation, or None). The HIR lowering reads THIS (never a second
+    // parameter), so the two tiers' float-literal-ladder resolutions agree by
+    // construction — the dataModel() discipline.
+    [[nodiscard]] LongDoubleFormat longDoubleFormat() const noexcept {
+        return longDoubleFormat_;
+    }
+
 private:
     std::shared_ptr<CompilationUnit const> cu_;
     TypeLattice                            lattice_;
@@ -564,6 +575,9 @@ private:
                                                            suppressedShippedLibraries_;
     // FC3 c1: the analysis-time data model (see `dataModel()`).
     DataModel                                              dataModel_ = DataModel::Lp64;
+    // FC17.9(e): the analysis-time long-double axis (see `longDoubleFormat()`).
+    LongDoubleFormat                                       longDoubleFormat_ =
+        LongDoubleFormat::None;
 };
 
 // Pin move-only / non-copyable at compile time so a future refactor

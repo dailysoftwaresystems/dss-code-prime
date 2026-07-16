@@ -74,7 +74,7 @@ struct PendingIncoming {
         case TypeKind::Ptr: case TypeKind::Ref: case TypeKind::FnPtr:
             return true;
         default:
-            return false;  // F16/F32/F64/F128 (rodata), I128/U128, Struct/Union/Tuple/
+            return false;  // F16/F32/F64/F80/F128 (rodata), I128/U128, Struct/Union/Tuple/
                            // Array/Slice/Vector/Matrix/Nullable/Optional/Void (no scalar zero)
     }
 }

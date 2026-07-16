@@ -437,6 +437,23 @@ evalNode(NodeId                              expr,
             HirLiteralValue lv;
             lv.core  = TypeKind::F64;  // the fold-arithmetic core; consumers
                                        // read `.value` (see the I32 note above)
+            // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): stamp the TRUE suffix-typed
+            // core via the SAME `typeFloatLiteral` ladder the typed side runs
+            // (the integer Fork-2c discipline above). LOAD-BEARING: a `20.0L`
+            // on a walled axis must carry F80/F128 so the hostBacked fold gate
+            // in applyBinary/UnaryFloat refuses it — the flat F64 stamp would
+            // silently fold at binary64. An axis-undeclared long-double
+            // literal is simply not a foldable constant here (the semantic
+            // literal typing already emitted S_LongDoubleFormatUndeclared).
+            if (!ctx.floatLiteralTyping.empty()) {
+                auto const r = typeFloatLiteral(tree.text(expr), ctx.numberStyle,
+                                                ctx.floatLiteralTyping,
+                                                ctx.dataModel, ctx.longDoubleFormat);
+                if (r.status == FloatLadderStatus::AxisUndeclared) {
+                    return fail(ConstEvalFailure::NotAConstantExpression, expr);
+                }
+                if (r.status == FloatLadderStatus::Typed) lv.core = r.kind;
+            }
             lv.value = d;
             return ok(std::move(lv));
         }

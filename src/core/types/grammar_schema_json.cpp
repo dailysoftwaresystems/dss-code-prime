@@ -73,6 +73,7 @@ std::optional<TypeKind> coreTypeFromName(std::string_view name) {
     if (name == "F16")     return TypeKind::F16;
     if (name == "F32")     return TypeKind::F32;
     if (name == "F64")     return TypeKind::F64;
+    if (name == "F80")     return TypeKind::F80;   // x87 80-bit (D-CSUBSET-LONG-DOUBLE)
     if (name == "F128")    return TypeKind::F128;
     if (name == "Char")    return TypeKind::Char;
     if (name == "Byte")    return TypeKind::Byte;
@@ -4360,6 +4361,60 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 return ok;
             };
 
+            // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): the optional
+            // `coreByLongDoubleFormat` sub-object ({"x87-80": "F80",
+            // "ieee128": "F128"}) on `typeSpecifiers` rows — the per-axis
+            // sibling of `coreByDataModel` above, with the same closed-key
+            // discipline: every key must be a registered LongDoubleFormat
+            // spelling and every value a core TypeKind (a typo'd axis name
+            // would otherwise silently never override — the knob-that-lies).
+            // Returns false when anything was rejected.
+            auto const readCoreByLongDoubleFormat =
+                [&](json const& entry, std::string const& path,
+                    std::unordered_map<LongDoubleFormat, TypeKind>& out) -> bool {
+                if (!entry.contains("coreByLongDoubleFormat")) return true;
+                auto const& obj = entry.at("coreByLongDoubleFormat");
+                if (!obj.is_object()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              path + "/coreByLongDoubleFormat",
+                              "'coreByLongDoubleFormat' must be an object mapping "
+                              "long-double-format names to core TypeKinds");
+                    return false;
+                }
+                bool ok = true;
+                for (auto const& [key, val] : obj.items()) {
+                    auto const lf = longDoubleFormatFromName(key);
+                    if (!lf) {
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  path + "/coreByLongDoubleFormat/" + key,
+                                  std::format("unknown longDoubleFormat '{}' "
+                                              "(expected one of 'f64', 'x87-80', "
+                                              "'ieee128')", key));
+                        ok = false;
+                        continue;
+                    }
+                    if (!val.is_string()) {
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  path + "/coreByLongDoubleFormat/" + key,
+                                  "long-double-format override must be a core "
+                                  "TypeKind name string");
+                        ok = false;
+                        continue;
+                    }
+                    auto const core = parseCore(val.get<std::string>());
+                    if (!core) {
+                        coll.emit(DiagnosticCode::C_InvalidSemantics,
+                                  path + "/coreByLongDoubleFormat/" + key,
+                                  std::format("unknown core TypeKind '{}'",
+                                              val.get<std::string>()));
+                        ok = false;
+                        continue;
+                    }
+                    out.emplace(*lf, *core);
+                }
+                return ok;
+            };
+
             auto const parseKind = [](std::string_view name) -> std::optional<DeclarationKind> {
                 if (name == "variable") return DeclarationKind::Variable;
                 if (name == "function") return DeclarationKind::Function;
@@ -6712,12 +6767,14 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         for (auto const& [key, _] : entry.items()) {
                             if (key != "tokens" && key != "core"
                                 && key != "coreByDataModel"
+                                && key != "coreByLongDoubleFormat"
                                 && key.rfind("$", 0) != 0) {
                                 coll.emit(DiagnosticCode::C_InvalidSemantics,
                                           path + "/" + key,
                                           std::format("unknown 'typeSpecifiers' field "
                                                       "'{}' — expected 'tokens', 'core', "
-                                                      "or 'coreByDataModel'", key));
+                                                      "'coreByDataModel', or "
+                                                      "'coreByLongDoubleFormat'", key));
                             }
                         }
                         if (!entry.contains("tokens") || !entry.at("tokens").is_array()
@@ -6766,6 +6823,10 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         }
                         rule.core = *k;
                         if (!readCoreByDataModel(entry, path, rule.coreByDataModel)) {
+                            continue;
+                        }
+                        if (!readCoreByLongDoubleFormat(entry, path,
+                                                        rule.coreByLongDoubleFormat)) {
                             continue;
                         }
                         // Canonicalize: sort the (kind, name) pairs by kind id
@@ -6879,6 +6940,11 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                             if (same) {
                                 out.core            = row.core;
                                 out.coreByDataModel = row.coreByDataModel;
+                                // FC17.9(e): copy the long-double axis map —
+                                // dropping it here would silently type the
+                                // "long double" LITERAL rule at the base core.
+                                out.coreByLongDoubleFormat =
+                                    row.coreByLongDoubleFormat;
                                 return true;
                             }
                         }
@@ -7153,10 +7219,17 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                         [](DataModelTypeRef const& r) -> bool {
                         auto const isFlt = [](TypeKind k) noexcept {
                             return k == TypeKind::F16 || k == TypeKind::F32
-                                || k == TypeKind::F64 || k == TypeKind::F128;
+                                || k == TypeKind::F64 || k == TypeKind::F80
+                                || k == TypeKind::F128;
                         };
                         if (!isFlt(r.core)) return false;
                         for (auto const& [_, k] : r.coreByDataModel) {
+                            if (!isFlt(k)) return false;
+                        }
+                        // FC17.9(e): the long-double axis overrides must be
+                        // float kinds too (F80/F128 — a non-float override
+                        // would mis-type every `l`/`L` literal on that axis).
+                        for (auto const& [_, k] : r.coreByLongDoubleFormat) {
                             if (!isFlt(k)) return false;
                         }
                         return true;
@@ -7432,7 +7505,8 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                                     auto const promotable = [](TypeKind k) noexcept {
                                         return k != TypeKind::Void
                                             && k != TypeKind::F16 && k != TypeKind::F32
-                                            && k != TypeKind::F64 && k != TypeKind::F128;
+                                            && k != TypeKind::F64 && k != TypeKind::F80
+                                            && k != TypeKind::F128;
                                     };
                                     bool good = promotable(ref.core);
                                     for (auto const& [_, k2] : ref.coreByDataModel) {

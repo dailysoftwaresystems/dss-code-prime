@@ -171,6 +171,7 @@ parseTextDocumentPosition(Request const& req) {
             case dss::TypeKind::F16:  return "f16";
             case dss::TypeKind::F32:  return "f32";
             case dss::TypeKind::F64:  return "f64";
+            case dss::TypeKind::F80:  return "f80";
             case dss::TypeKind::F128: return "f128";
             case dss::TypeKind::Char: return "char";
             case dss::TypeKind::Byte: return "byte";

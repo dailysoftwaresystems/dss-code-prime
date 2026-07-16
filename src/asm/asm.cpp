@@ -550,7 +550,12 @@ primitiveByteSize(TypeKind k) noexcept {
             return 4u;
         case TypeKind::I64: case TypeKind::U64: case TypeKind::F64:
             return 8u;
-        case TypeKind::I128: case TypeKind::U128: case TypeKind::F128:
+        // F80 (D-CSUBSET-LONG-DOUBLE): 16-byte storage like binary128 — the
+        // x87 format pads to 16/16. Sized here so LAYOUT-only uses work; a
+        // VALUE encode still fails loud (decodeScalarLiteralBits has no
+        // F80 arm — no lossless `double` backing).
+        case TypeKind::I128: case TypeKind::U128: case TypeKind::F80:
+        case TypeKind::F128:
             return 16u;
         default:
             return std::nullopt;
@@ -576,8 +581,9 @@ void appendLE(std::vector<std::uint8_t>& bytes,
 // bool / signed / unsigned integers and F32/F64 — a `double`-arm value is
 // NARROWED to `float` for an F32 leaf (writing the low 4 bytes of the
 // binary64 pattern would be garbage, not a valid binary32). Returns nullopt
-// for kinds the pool cannot represent as plain bytes: F16/F128 (no lossless
-// `double` arm) or a non-scalar / monostate variant (string /
+// for kinds the pool cannot represent as plain bytes: F16/F80/F128 — any float
+// wider than F64 or otherwise without a lossless host-`double` arm (F80 joined
+// with FC17.9(e)) — or a non-scalar / monostate variant (string /
 // MirAggregateValue / unknown). The SOLE scalar-encode chokepoint — the
 // scalar-global arm and the aggregate-leaf recursion both route through it,
 // so the int/float value semantics can never drift between the two encoders.
@@ -598,7 +604,7 @@ decodeScalarLiteralBits(MirLiteralValue const& v, TypeKind k) noexcept {
         } else if (k == TypeKind::F64) {
             std::memcpy(&bits, &dv, sizeof(double));
         } else {
-            return std::nullopt;   // F16/F128 — no lossless pool arm
+            return std::nullopt;   // F16/F80/F128 — no lossless pool arm
         }
         return bits;
     }
@@ -773,7 +779,7 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     auto const wOpt = scalarByteSize(k, dm);
     if (!wOpt.has_value()) return false;             // FnSig/Slice/Void/... → fail loud
     auto const bits = decodeScalarLiteralBits(v, k);
-    if (!bits.has_value()) return false;             // F16/F128/non-scalar → fail loud
+    if (!bits.has_value()) return false;             // F16/F80/F128/non-scalar → fail loud
     if (base + *wOpt > buf.size()) return false;     // layout↔encoder disagreement → fail loud
     for (std::uint64_t j = 0; j < *wOpt; ++j)
         buf[base + j] = static_cast<std::uint8_t>((*bits >> (j * 8)) & 0xFFu);
@@ -1174,7 +1180,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                                  "SymbolId={{ {} }} aggregate initializer "
                                  "could not be encoded (a type↔value shape "
                                  "mismatch or an unencodable leaf — e.g. "
-                                 "f16/f128, or an address-relocated leaf when "
+                                 "f16/f80/f128, or an address-relocated leaf when "
                                  "the target declares no abs64 reloc) "
                                  "(D-LK4-RODATA-PRODUCER-AGGREGATE-GLOBAL).",
                                  sym.v));
@@ -1253,7 +1259,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
         // int/float semantics the aggregate-leaf recursion uses, incl. the
         // mandatory `double → float` narrow for an F32 global — writing the
         // low 4 bytes of the binary64 pattern would be garbage). A nullopt
-        // means either an f16/f128 `double` (the pool can't represent it) or
+        // means either an f16/f80/f128 `double` (the pool can't represent it) or
         // a non-scalar / monostate variant — distinguished HERE for a precise
         // diagnostic (the `MirAggregateValue` arm already fired above, so a
         // non-scalar here is monostate). (Code-reviewer F1 audit fold — the
@@ -1266,7 +1272,7 @@ lowerMirGlobalsToDataItems(Mir const&                           mir,
                                  "global SymbolId={{ {} }} has "
                                  "TypeKind={} with a `double` "
                                  "literal — the pool cannot "
-                                 "represent f16/f128 losslessly "
+                                 "represent f16/f80/f128 losslessly "
                                  "(D-LK4-RODATA-PRODUCER-EXOTIC-"
                                  "FLOAT).",
                                  sym.v, static_cast<int>(k)));

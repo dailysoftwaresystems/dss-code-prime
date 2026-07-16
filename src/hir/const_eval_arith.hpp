@@ -160,6 +160,43 @@ applyUnaryInt(HirOpKind op, HirLiteralValue const& inner) {
     }
 }
 
+// Per-float-kind host-backing info: `bits` is the format's width; `hostBacked`
+// says whether the host `double` can carry the EXACT value (F16/F32 narrow
+// losslessly through `narrowToFloatWidth`; F64 is identity). F80/F128 are NOT
+// host-backed — no soft-float engine exists for them, so const-eval refuses
+// (fold + conversion) rather than bake a binary64-rounded value. Defined ABOVE
+// the applyUnary/BinaryFloat folds, which gate on it (FC17.9(e),
+// D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION).
+struct FloatKindInfo {
+    int  bits;
+    bool hostBacked;
+};
+[[nodiscard]] inline std::optional<FloatKindInfo> floatKindInfo(TypeKind k) noexcept {
+    switch (k) {
+        case TypeKind::F16:  return FloatKindInfo{16,  true};
+        case TypeKind::F32:  return FloatKindInfo{32,  true};
+        case TypeKind::F64:  return FloatKindInfo{64,  true};
+        // F80 (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): NOT host-backed —
+        // the host `double` cannot represent an 80-bit-mantissa value, so
+        // folding at binary64 would bake a silently-rounded constant.
+        case TypeKind::F80:  return FloatKindInfo{80,  false};
+        case TypeKind::F128: return FloatKindInfo{128, false};
+        default: return std::nullopt;
+    }
+}
+
+// FC17.9(e) (D-CSUBSET-LONG-DOUBLE-CONSTFOLD-PRECISION): does the operand's
+// core refuse host-double folding? A non-host-backed float kind (F80/F128)
+// folded at binary64 precision would produce a silently-ROUNDED constant that
+// then RUNS (never reaching the LIR encoded-width wall) — a precision
+// mis-bind for any value needing more than a 53-bit mantissa. Refusing keeps
+// the runtime op alive so the wall fires loud. On f64-axis formats `long
+// double` IS F64 (host-backed) and folds normally.
+[[nodiscard]] inline bool refusesHostFloatFold(TypeKind k) noexcept {
+    auto const fi = floatKindInfo(k);
+    return fi.has_value() && !fi->hostBacked;
+}
+
 // Fold a UnaryOp(Neg) on a float. BitNot/Not on float is C99-undefined
 // (bitwise / logical-not bitwise interpretations only apply to integers);
 // surfaced via `outFailure = UnsupportedTypeKind` so the caller can
@@ -167,6 +204,10 @@ applyUnaryInt(HirOpKind op, HirLiteralValue const& inner) {
 [[nodiscard]] inline std::optional<HirLiteralValue>
 applyUnaryFloat(HirOpKind op, HirLiteralValue const& inner,
                 ConstEvalFailure& outFailure) {
+    if (refusesHostFloatFold(inner.core)) {
+        outFailure = ConstEvalFailure::UnsupportedTypeKind;
+        return std::nullopt;
+    }
     auto dv = asDouble(inner);
     if (!dv.has_value()) return std::nullopt;
     HirLiteralValue folded = inner;
@@ -270,6 +311,13 @@ applyBinaryInt(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
 [[nodiscard]] inline std::optional<HirLiteralValue>
 applyBinaryFloat(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& b,
                  ConstEvalFailure& outFailure) {
+    // FC17.9(e): refuse when EITHER operand's core is a non-host-backed float
+    // (F80/F128) — see refusesHostFloatFold. Covers arithmetic AND comparisons
+    // for both const-eval walkers by construction (this is their one chokepoint).
+    if (refusesHostFloatFold(a.core) || refusesHostFloatFold(b.core)) {
+        outFailure = ConstEvalFailure::UnsupportedTypeKind;
+        return std::nullopt;
+    }
     auto adv = asDouble(a);
     auto bdv = asDouble(b);
     if (!adv.has_value() || !bdv.has_value()) return std::nullopt;
@@ -296,7 +344,7 @@ applyBinaryFloat(HirOpKind op, HirLiteralValue const& a, HirLiteralValue const& 
 
 [[nodiscard]] inline bool isFloatKind(TypeKind k) noexcept {
     return k == TypeKind::F16 || k == TypeKind::F32
-        || k == TypeKind::F64 || k == TypeKind::F128;
+        || k == TypeKind::F64 || k == TypeKind::F80 || k == TypeKind::F128;
 }
 
 // Soft-float narrow `double → IEEE 754 binary16 → double`. Produces the
@@ -387,19 +435,8 @@ done:
     return static_cast<double>(fout);
 }
 
-struct FloatKindInfo {
-    int  bits;
-    bool hostBacked;
-};
-[[nodiscard]] inline std::optional<FloatKindInfo> floatKindInfo(TypeKind k) noexcept {
-    switch (k) {
-        case TypeKind::F16:  return FloatKindInfo{16,  true};
-        case TypeKind::F32:  return FloatKindInfo{32,  true};
-        case TypeKind::F64:  return FloatKindInfo{64,  true};
-        case TypeKind::F128: return FloatKindInfo{128, false};
-        default: return std::nullopt;
-    }
-}
+// (FloatKindInfo + floatKindInfo moved ABOVE the applyUnary/BinaryFloat folds
+// — FC17.9(e): the folds gate on hostBacked.)
 
 [[nodiscard]] inline double narrowToFloatWidth(double dv, int bits) noexcept {
     switch (bits) {

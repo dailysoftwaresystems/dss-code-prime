@@ -15,6 +15,9 @@
   "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: C bit-field allocation is OS/format-determined (the x86_64 CPU target serves BOTH this ELF-SysV format and PE-MS), so the strategy lives here, not on the target. SysV/Itanium/GNU LSB-first packing into the declared-type unit — byte-ABI-exact to gcc (verified by the conformance witness). Different-sized adjacent bit-fields may SHARE a unit (unlike MSVC).",
   "bitFieldStrategy": "gnu_packed",
 
+  "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: SysV x86_64 `long double` = x87 80-bit, 16/16. See elf64-x86_64-linux-exec.",
+  "longDoubleFormat": "x87-80",
+
   "$externCallDispatchComment": "D-LK-OBJECT-EXTERN-CALL-RELOCATABLE: extern calls in a RELOCATABLE object lower to a PLAIN DIRECT `call` (E8 disp32) + a rel32 relocation against the UNDEFINED extern symbol — the SAME call-site shape as the exec `direct-plt`, except the FINAL (foreign) linker synthesizes the PLT/GOT and resolves the symbol, not DSS. So `direct-plt` is the right dispatch here too; the relocatable writer emits the extern as an SHN_UNDEF `.symtab` entry + a `.rela.text` reloc rather than a DSS-synthesized stub. The undefined-extern CALL reloc is emitted as R_X86_64_PLT32 (the linker-may-use-PLT variant of PC32, same S+A-P formula) so a foreign PIE link resolves it through a linker-built PLT instead of erroring on a bare PC32 against an undefined symbol.",
   "externCallDispatch": "direct-plt",
 

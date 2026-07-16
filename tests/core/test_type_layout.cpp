@@ -58,6 +58,10 @@ TEST(TypeLayout, ScalarSizesAndAligns) {
              Case{TypeKind::I32, 4, 4},  Case{TypeKind::F32, 4, 4},
              Case{TypeKind::I64, 8, 8},  Case{TypeKind::F64, 8, 8},
              Case{TypeKind::I128, 16, 16}, Case{TypeKind::F128, 16, 16},
+             // FC17.9(e) (D-CSUBSET-LONG-DOUBLE): x87 80-bit STORES 16/16 —
+             // x86_64-SysV pads the 10 significant bytes to a 16-byte,
+             // 16-aligned slot (the same envelope binary128 uses).
+             Case{TypeKind::F80, 16, 16},
          }) {
         auto const l = layoutOf(ti.primitive(c.k), ti);
         EXPECT_EQ(l.size, c.size) << "size of kind " << static_cast<int>(c.k);

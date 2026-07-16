@@ -70,6 +70,39 @@ TEST(AggregateAbiSysV, TwoLongs_TwoGprEightbytes) {
     EXPECT_EQ(r->pieces[1].widthBytes, 8u);
 }
 
+// FC17.9(e) (D-CSUBSET-LONG-DOUBLE-AGGREGATE-ABI): an F80/F128 LEAF makes the
+// aggregate UNCLASSIFIABLE this cycle — nullopt (fail loud), never a guessed
+// class. The dangerous wrong answers this pins against: SysV would need the
+// X87/X87UP → MEMORY rule (a float-kind join would say SSE; a non-join says
+// INTEGER = a silent 2-GPR by-value pass, ABI-divergent at FFI); AAPCS64 would
+// need Q-register HFA pieces. Both realize with their arithmetic arcs.
+TEST(AggregateAbiSysV, LongDoubleLeafStructIsNulloptFailLoud) {
+    auto ti = makeInterner(1);
+    auto r80 = classifySysV(structOf(ti, "LD", {ti.primitive(TypeKind::F80)}), ti);
+    EXPECT_FALSE(r80.has_value())
+        << "an F80 (x87 long double) leaf must refuse classification — the "
+           "SysV X87/X87UP MEMORY rule is not modeled; any classified answer "
+           "here is a silent ABI miscompile";
+    auto r128 = classifySysV(structOf(ti, "LQ", {ti.primitive(TypeKind::F128)}), ti);
+    EXPECT_FALSE(r128.has_value())
+        << "an F128 (binary128) leaf must refuse classification too";
+    // Nested: the leaf walk must see THROUGH an inner struct.
+    TypeId const inner = structOf(ti, "In", {ti.primitive(TypeKind::F80)});
+    auto nested = classifySysV(structOf(ti, "Out", {inner}), ti);
+    EXPECT_FALSE(nested.has_value())
+        << "a NESTED F80 leaf must also refuse — the check is leaf-deep";
+}
+
+TEST(AggregateAbiAapcs64, LongDoubleLeafStructIsNulloptFailLoud) {
+    auto ti = makeInterner(1);
+    TypeId const s = structOf(ti, "LQ", {ti.primitive(TypeKind::F128)});
+    EXPECT_FALSE(classifyAggregate(AggregateClassKind::Aapcs64Hfa, 16, s, ti,
+                                   kNatural16, DataModel::Lp64)
+                     .has_value())
+        << "AAPCS64: a binary128 member is a Q-register HFA — no realized "
+           "piece width; must refuse, never emit an 8-byte FPR piece";
+}
+
 // {int,float} = 8 bytes, one eightbyte holding an int(0..3) AND a float(4..7) →
 // INTEGER wins the mixed eightbyte → one GPR piece.
 TEST(AggregateAbiSysV, IntFloat_MixedEightbyteIsInteger) {

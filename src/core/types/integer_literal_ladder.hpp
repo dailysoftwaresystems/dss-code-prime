@@ -166,27 +166,50 @@ bitPreciseLiteralSignedness(std::string_view rawText,
 // tiers (semantic pass-2 + CST→HIR lowerLiteral) so they can never
 // drift. Far simpler than the integer ladder: a floating constant's
 // type is keyed by its SUFFIX alone — no magnitude ranges, no radix
-// classes (C 6.4.4.2: unsuffixed → double, f/F → float). Returns
-// nullopt when no rule covers the matched suffix — loader-prevented
-// for shipped configs (every numberStyle float suffix must be covered
-// + an unsuffixed rule must exist); a miss is substrate drift the
-// caller surfaces fail-loud, never silently the literalTypes base.
-[[nodiscard]] inline std::optional<TypeKind>
+// classes (C 6.4.4.2: unsuffixed → double, f/F → float). Two distinct
+// non-Typed outcomes (FC17.9(e)):
+//   * NoRule — no rule covers the matched suffix. Loader-prevented for
+//     shipped configs (every numberStyle float suffix must be covered +
+//     an unsuffixed rule must exist); a miss is substrate drift the
+//     caller surfaces fail-loud, never silently the literalTypes base.
+//   * AxisUndeclared — the matched rule's type DEPENDS on the
+//     long-double axis (`coreByLongDoubleFormat`) but the active format
+//     declared none (D-CSUBSET-LONG-DOUBLE): a `20.0L` whose
+//     representation is unknowable. The caller emits the precise
+//     S_LongDoubleFormatUndeclared — never the base core (the same
+//     no-silent-fallback rule the typeSpecifiers bind applies).
+enum class FloatLadderStatus : std::uint8_t {
+    Typed,
+    AxisUndeclared,
+    NoRule,
+};
+struct FloatLadderResult {
+    FloatLadderStatus status = FloatLadderStatus::NoRule;
+    TypeKind          kind   = TypeKind::Void;   // meaningful only when Typed
+};
+
+[[nodiscard]] inline FloatLadderResult
 typeFloatLiteral(std::string_view rawText,
                  NumberStyle const* ns,
                  std::span<FloatLiteralTypingRule const> rules,
-                 DataModel dm) {
+                 DataModel dm,
+                 LongDoubleFormat ldf) {
+    auto const resolve = [&](FloatLiteralTypingRule const& r) -> FloatLadderResult {
+        auto const k = r.type.resolveCore(dm, ldf);
+        if (!k.has_value()) return {FloatLadderStatus::AxisUndeclared, TypeKind::Void};
+        return {FloatLadderStatus::Typed, *k};
+    };
     std::string_view const suffix = matchFloatSuffix(rawText, ns);
     for (auto const& r : rules) {
         if (suffix.empty()) {
-            if (r.suffixes.empty()) return r.type.resolveCore(dm);
+            if (r.suffixes.empty()) return resolve(r);
             continue;
         }
         for (auto const& s : r.suffixes) {
-            if (s == suffix) return r.type.resolveCore(dm);
+            if (s == suffix) return resolve(r);
         }
     }
-    return std::nullopt;
+    return {FloatLadderStatus::NoRule, TypeKind::Void};
 }
 
 } // namespace dss
