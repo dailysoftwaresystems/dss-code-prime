@@ -1,0 +1,35 @@
+{
+  "$comment": "FC17.9(h) C23 #embed (D-PP-EMBED): runtime witness for the quote-form scalar #embed splice across the legs, RUN on BOTH the baseline (debug) AND the `release` (shippedPipeline) arm. `#embed \"answer.bin\"` splices the resource's 5 bytes {42,13,10,26,0} as a comma-separated decimal int list into a `static const unsigned char blob[]` initializer; the program checks sizeof(blob)==5 + blob[1..4] byte-exactly (13/10/26/0) so it SELF-WITNESSES binary-mode read AND git byte-integrity (blob[1]==13 is the CRLF-normalization canary — see the examples/**/*.bin binary .gitattributes override), then returns blob[g_i] where g_i is a mutable global 0 (the anti-fold pattern) so the release arm proves the embedded array is materialized + indexed at runtime, not const-folded. The aux resource answer.bin sits next to main.c and resolves self-dir (quote-relative to the includer) with zero harness change. exit = blob[0] = 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -10,9 +10,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <fstream>
 #include <functional>
 #include <iterator>
 #include <memory>
+#include <sstream>
 #include <optional>
 #include <set>
 #include <span>
@@ -685,10 +687,31 @@ struct SynthBuilder {
             return resolveQuote(filename, includingDir).has_value();
         };
         PpProductText productCb = []() { return std::string_view{}; };
+        // FC17.9(h): the pre-scan `__has_embed`, resolving against THIS
+        // recursion's `includingDir` (the origin file of every token in the scan
+        // buffer), so it AGREES with the authoritative per-origin callback by
+        // construction. Without it, an unknown `__has_embed(` makes the eval
+        // uncertain -> the conservative quote-include SKIP (a wrongly-skipped LIVE
+        // include fails loud downstream, never silent), which would falsely fail
+        // the legitimate `#if __has_embed("r") ... #include "impl.h"` pattern. Same
+        // C23 trichotomy 0/1/2; angle form -> 0. `resolveQuote` already requires a
+        // regular file, so a miss is NOT_FOUND and `file_size` gives emptiness.
+        PpHasEmbed embedCb =
+            [this, &includingDir](std::string_view filename, bool isAngle,
+                                  SourceSpan) -> int {
+            if (isAngle) return 0;
+            auto resolved = resolveQuote(filename, includingDir);
+            if (!resolved) return 0;                       // NOT_FOUND
+            std::error_code ec;
+            auto const sz = fs::file_size(*resolved, ec);
+            if (ec) return 0;
+            return sz == 0 ? 2 /*EMPTY*/ : 1 /*FOUND*/;
+        };
 
         DiagnosticReporter scratch;   // discard — re-reported by the macro pass
         auto v = evaluateIfExpression(operand, *schema, expandCb, definedCb,
-                                      hasIncludeCb, buf, productCb, scratch);
+                                      hasIncludeCb, buf, productCb, scratch,
+                                      embedCb);
         if (!v.has_value()) {
             uncertain = true;   // malformed/unsupported -> conservative (skip)
             return false;
@@ -1279,6 +1302,17 @@ public:
         // the `.valid()` guard never treats any token as the marker.
         variadicMarker_ =
             schema_->schemaTokens().find(cfg().variadicMarkerToken);
+        // FC17.9(h): the QUOTE-include opener kind (`"` -> StringStart) that
+        // `handleEmbed` matches to find the `#embed "resource"` filename, and the
+        // ANGLE opener kind (the REUSED `hasIncludeAngleOpenToken` = LtOp) so a
+        // `#embed <resource>` gets the specific angle-form deferral message. Both
+        // are CONFIG kinds (agnosticism), OPTIONAL: an empty field leaves the kind
+        // InvalidSchemaToken and the `.valid()` guards never fire (a language that
+        // declares no `#embed` never reaches handleEmbed anyway).
+        quoteIncludeKind_ =
+            schema_->schemaTokens().find(cfg().quoteIncludeToken);
+        embedAngleOpenKind_ =
+            schema_->schemaTokens().find(cfg().hasIncludeAngleOpenToken);
     }
 
     // TRUE iff a fatal nesting-backstop truncated the expansion.
@@ -1605,6 +1639,18 @@ private:
             // (a dead-branch quote include resolved upstream) no longer exists:
             // SynthBuilder gates quote resolution on its own conditional scan.
             for (std::size_t q = start; q < end; ++q) body.push_back(in[q]);
+        } else if (!cfg().embedDirective.empty()
+                   && word == cfg().embedDirective) {
+            // FC17.9(h) C23 6.10.4 / N3096 6.10.3 (D-PP-EMBED). Reached ONLY for
+            // a LIVE `#embed` (the dead-branch gate above already returned, so a
+            // dead-branch `#embed` -- even of a missing file -- is skipped with no
+            // resolution/diagnostic, the #define/#include/pragma parity). `p` is
+            // the `embed` directive WORD index; handleEmbed derives the resolution
+            // dir + all diagnostic positions from it and splices the resource
+            // bytes into `body`. Config-matched (`embedDirective`), never a
+            // hard-coded "embed"; an empty field (a language with no `#embed`)
+            // skips this arm -> the generic unsupported-directive fail-loud below.
+            handleEmbed(in, p, end, body);
         } else {
             emitPP(rep_, DiagnosticCode::P_PreprocessorUnsupported,
                    synth_->id(), in[p].span,
@@ -1730,8 +1776,30 @@ private:
         // evaluator assembles a combined prefix+product buffer to slice it.
         PpProductText productCb =
             [this]() -> std::string_view { return productText_; };
+        // FC17.9(h): `__has_embed` answers EXACTLY what `#embed` would do at the
+        // operator's spot -- per-origin resolution (the dir of the file containing
+        // the operator, derived from `opSpan` via the line-map), then the C23
+        // trichotomy NOT_FOUND(0) / FOUND(1) / EMPTY(2). Angle form -> 0 (the
+        // deferred angle form resolves no binary resource). Uses the SAME
+        // resolveIncludePath + is_regular_file the directive uses, so the operator
+        // and the directive can never disagree on a resource's existence/size.
+        PpHasEmbed embedCb =
+            [this](std::string_view filename, bool isAngle,
+                   SourceSpan opSpan) -> int {
+            if (isAngle) return 0;   // D-PP-EMBED-ANGLE: nothing to resolve
+            auto resolved = resolveIncludePath(filename,
+                                               embedResolutionDir(opSpan),
+                                               includeDirs_);
+            if (!resolved) return 0;                            // NOT_FOUND
+            std::error_code ec;
+            if (!fs::is_regular_file(*resolved, ec)) return 0;  // NOT_FOUND
+            auto const sz = fs::file_size(*resolved, ec);
+            if (ec) return 0;                                   // stat failed
+            return sz == 0 ? 2 /*EMPTY*/ : 1 /*FOUND*/;
+        };
         auto v = evaluateIfExpression(operand, *schema_, expandCb, definedCb,
-                                      hasIncludeCb, *synth_, productCb, rep_);
+                                      hasIncludeCb, *synth_, productCb, rep_,
+                                      embedCb);
         return v.has_value() && *v != 0;
     }
 
@@ -1768,6 +1836,176 @@ private:
     }
     bool isVariadicMarker(Token const& t) const {
         return variadicMarker_.valid() && t.schemaKind == variadicMarker_;
+    }
+
+    // FC17.9(h): read `path`'s bytes BINARY-exact into a string, WITHOUT minting a
+    // BufferId / registering a source (the byte-body of `SourceBuffer::fromFile`
+    // without the buffer machinery, and without throwing). nullopt on an open or
+    // read failure (the caller emits the loud unreadable diagnostic).
+    // `std::ios::binary` is load-bearing on Windows -- a CR/LF/SUB byte in the
+    // resource must survive verbatim (pinned by tests).
+    static std::optional<std::string> readResourceBytes(fs::path const& path) {
+        // The shared `resolveIncludePath` matches on `fs::exists`, so it can hand
+        // back a DIRECTORY. Require a regular file (nullopt -> the caller's loud
+        // unreadable diagnostic) so a directory-named resource fails LOUD, never
+        // reads as a silently-empty embed.
+        std::error_code ec;
+        if (!fs::is_regular_file(path, ec)) return std::nullopt;
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return std::nullopt;
+        std::ostringstream buf;
+        buf << in.rdbuf();
+        // A mid-stream IO error (disk/share failure) can silently truncate the
+        // read; check the stream state so a truncated resource is a LOUD error,
+        // never a quietly-shortened embed.
+        if (in.bad()) return std::nullopt;
+        return std::move(buf).str();
+    }
+
+    // FC17.9(h): the directory the `#embed` quote form resolves against -- the
+    // directory of the FILE that CONTAINS the directive (C23: the quote search is
+    // "as for #include" = relative to the containing file). Derive it from the
+    // directive word's offset via the line-map ORIGIN (the `__FILE__` File-kind
+    // precedent), so an `#embed` spliced in from a quote-header resolves relative
+    // to THAT header. Null/empty line-map or a null origin -> the main file's dir.
+    fs::path embedResolutionDir(SourceSpan dirSpan) const {
+        if (lineMap_ != nullptr && !lineMap_->empty()) {
+            LineMap::Resolved const r = lineMap_->resolve(dirSpan.start());
+            if (r.origin != nullptr) {
+                return fs::path{std::string{r.origin->name()}}.parent_path();
+            }
+        }
+        return includingDir_;
+    }
+
+    // FC17.9(h) C23 `#embed` (6.10.4 / N3096 6.10.3): the directive handler
+    // (D-PP-EMBED). Splices the QUOTED resource's bytes into `body` as a
+    // comma-separated list of decimal `int` constants (0..255), via the SAME
+    // product-token mechanism (`materializeSignificant`) the `#`/`##` operators
+    // use -- the spliced tokens are ordinary IntLiteral/Comma tokens that survive
+    // expansion untouched (only Word tokens re-trigger macros) and the parser
+    // accepts in a brace initializer. `wordIdx` is the `embed` directive WORD (the
+    // anchor for every diagnostic + the per-origin resolution dir). Every
+    // non-bare-quote-filename shape and every unsupported construct fails LOUD with
+    // `P_PreprocessorEmbed` -- never a silent drop, never a silent partial embed.
+    void handleEmbed(std::vector<Token> const& in, std::size_t wordIdx,
+                     std::size_t end, std::vector<Token>& body) {
+        SourceSpan const dirSpan = in[wordIdx].span;   // the `embed` word
+        std::size_t p = skipTrivia(in, wordIdx + 1);
+
+        // ── Extract the quote filename (the `#include "h"` shape). ──
+        if (p >= end || isNewline(in[p])) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
+                   dirSpan, "#embed requires a \"resource\" filename");
+            return;
+        }
+        // An angle opener (LtOp, the reused hasIncludeAngle kind) -> the deferred
+        // angle form (D-PP-EMBED-ANGLE: DSS ships JSON descriptors, not binary
+        // resources, on the system path). Anything that is NOT the quote opener
+        // (e.g. a macro name -- C23's "expand if not one of the forms") -> the
+        // deferred macro-argument form (D-PP-EMBED-MACRO-ARG). Never silent.
+        if (embedAngleOpenKind_.valid()
+            && in[p].schemaKind == embedAngleOpenKind_) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
+                   dirSpan,
+                   "#embed <resource> (angle form) is not supported "
+                   "(D-PP-EMBED-ANGLE); use \"resource\"");
+            return;
+        }
+        if (!quoteIncludeKind_.valid() || in[p].schemaKind != quoteIncludeKind_) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
+                   dirSpan,
+                   "#embed requires a \"resource\" filename (a macro-expanded "
+                   "argument is not supported: D-PP-EMBED-MACRO-ARG)");
+            return;
+        }
+        // The quote opener consumed only the opening `"`; the coalesced string
+        // BODY is the ADJACENT next token, its raw text the filename (escapes NOT
+        // decoded, like the include resolver). An empty body (`#embed ""`) leaves
+        // the filename empty -> loud below. The closing `"` byte is absorbed into
+        // the StringLiteral (coalesce:true) and produces NO token (the working
+        // `__has_include("h")` / SynthBuilder precedent), so it can't be mistaken
+        // for a trailing parameter.
+        std::string filename;
+        std::size_t after = p + 1;   // token index just past the filename body
+        if (after < end && !isTrivia(in[after]) && !isNewline(in[after])
+            && in[after].span.start() == in[p].span.end()) {
+            filename = std::string{text(in[after])};
+            ++after;
+        }
+        if (filename.empty()) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
+                   dirSpan, "#embed has an empty resource filename");
+            return;
+        }
+
+        // ── Reject parameters loudly (D-PP-EMBED-PARAMS). ANY significant token
+        // after the filename before the line-end newline -> loud, naming it.
+        // Silently honoring `limit(N)`/`prefix`/`suffix`/`if_empty`/vendor would
+        // embed a different byte set than the program asked for -- a silent
+        // miscompile class; the loud wall is the VLA-C1a fail-loud precedent. ──
+        std::size_t q = skipTrivia(in, after);
+        if (q < end && !isNewline(in[q])) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
+                   dirSpan,
+                   std::string{"#embed parameter '"} + std::string{text(in[q])}
+                       + "' is not supported (D-PP-EMBED-PARAMS); only "
+                         "`#embed \"resource\"` is supported this cycle");
+            return;
+        }
+
+        // ── Resolve the resource EXACTLY as a quote-`#include` would (the ONE
+        // shared quote search: absolute -> direct; else self-dir first, then the
+        // include dirs), relative to the FILE that contains the directive. ──
+        auto resolved = resolveIncludePath(filename, embedResolutionDir(dirSpan),
+                                           includeDirs_);
+        if (!resolved) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
+                   dirSpan, std::string{"#embed resource not found: "} + filename);
+            return;
+        }
+
+        // ── Read the bytes BINARY-exact (CRLF/SUB/NUL/0xFF preserved). ──
+        auto bytes = readResourceBytes(*resolved);
+        if (!bytes) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
+                   dirSpan, std::string{"#embed resource could not be read: "}
+                                + resolved->string());
+            return;
+        }
+
+        // ── FIX-1 (D-PP-EMBED, the streaming boundary): gate the byte COUNT
+        // through the pure size helper -- a catchable LOUD wall, never an OOM. ──
+        if (auto sizeErr = embedResourceSizeError(bytes->size())) {
+            emitPP(rep_, DiagnosticCode::P_PreprocessorEmbed, synth_->id(),
+                   dirSpan, std::move(*sizeErr));
+            return;
+        }
+
+        // ── Empty resource -> empty expansion (C23 6.10.3/6.10.4: the byte list
+        // is empty; cycle-1 has no `if_empty` parameter to change that). Push
+        // nothing and return -- the directive expands to the empty sequence. ──
+        if (bytes->empty()) return;
+
+        // ── Splice: spell the bytes as a comma-separated decimal `int` list, then
+        // materialize the product tokens (IntLiteral/Comma) and push into `body`
+        // (the include-arm push point). A `'\n'` before every 16th element keeps
+        // any later diagnostic-rendered product line short; `materializeSignificant`
+        // DROPS trivia/newlines from its returned tokens, so the newlines cost
+        // zero tokens (the spliced stream is exactly `42, 13, 10, ...`). ──
+        std::string spelling;
+        spelling.reserve(bytes->size() * 5);
+        for (std::size_t bi = 0; bi < bytes->size(); ++bi) {
+            if (bi != 0) {
+                spelling.push_back(',');
+                spelling.push_back((bi % 16 == 0) ? '\n' : ' ');
+            }
+            spelling.append(std::to_string(static_cast<unsigned>(
+                static_cast<unsigned char>((*bytes)[bi]))));
+        }
+        for (Token const& t : materializeSignificant(spelling)) {
+            body.push_back(t);
+        }
     }
 
     void handleDefine(std::vector<Token> const& in, std::size_t p,
@@ -2864,6 +3102,12 @@ private:
     // product).
     SchemaTokenId                        stringizeKind_{};
     SchemaTokenId                        pasteKind_{};
+    // FC17.9(h): the QUOTE-include opener kind (StringStart) + the ANGLE opener
+    // kind (the reused hasIncludeAngleOpenToken = LtOp) that `handleEmbed` matches
+    // to extract the `#embed "resource"` filename / detect the deferred angle form
+    // (InvalidSchemaToken when the language declares no `#embed`).
+    SchemaTokenId                        quoteIncludeKind_{};
+    SchemaTokenId                        embedAngleOpenKind_{};
     // FC15a (A2): byte length of the PREFIX buffer (`synth_`), and the
     // accumulated `#`/`##` PRODUCT spellings appended AFTER it. A product token's
     // span is `[prefixLen_ + offsetInProductText_, ...)`; `text()` dispatches a
@@ -2909,6 +3153,20 @@ private:
 };
 
 } // namespace
+
+// FC17.9(h) (D-PP-EMBED, the streaming boundary): the PURE size-budget check
+// (declared in preprocessor.hpp for direct unit-testability). Returns a
+// user-facing diagnostic message when a resource's byte count would blow the
+// cycle-1 non-streaming splice budget, else nullopt. The handler emits the
+// message as `P_PreprocessorEmbed` on the directive word -- a catchable LOUD
+// wall, never an OOM.
+std::optional<std::string> embedResourceSizeError(std::size_t byteCount) {
+    if (byteCount <= kEmbedMaxResourceBytes) return std::nullopt;
+    return std::string{"#embed resource is "} + std::to_string(byteCount)
+        + " bytes, over the " + std::to_string(kEmbedMaxResourceBytes)
+        + "-byte cycle-1 splice budget; the non-streaming splice materializes "
+          "~2 tokens/byte and would exhaust memory (see D-PP-EMBED-STREAMING)";
+}
 
 PreprocessResult preprocess(
     std::shared_ptr<SourceBuffer>        mainSource,

@@ -71,11 +71,13 @@
 #include "core/types/source_span.hpp"
 #include "tokenizer/token_stream.hpp"
 
+#include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace dss {
@@ -219,5 +221,21 @@ struct DSS_EXPORT PreprocessResult {
     std::span<std::filesystem::path const> systemDirs = {},
     std::optional<ObjectFormatKind>      activeFormat = std::nullopt,
     std::span<std::string const>         userDefines  = {});
+
+// FC17.9(h) (`#embed`; the size-cap boundary of D-PP-EMBED): a PURE budget
+// check for the cycle-1 `#embed` splice. The splice materializes the resource as
+// ~2 tokens/byte (an IntLiteral + a Comma) across the body/out/result.tokens
+// vectors + the parser's `fromTokens` copy, so a large resource (tens–hundreds
+// of MiB -- the exact use case a real `#embed` targets) OOM-CRASHES long before
+// the 4 GiB `ByteOffset` text wall. An OOM is neither fail-loud nor graceful, so
+// the handler gates the resource's byte COUNT through this helper FIRST: it
+// returns a diagnostic MESSAGE when `byteCount` exceeds `kEmbedMaxResourceBytes`
+// (the caller emits it as `P_PreprocessorEmbed` on the directive word, naming the
+// streaming deferral), else nullopt. Taking a COUNT (not a file) makes the
+// red-on-disable unit test call it directly with `cap+1` -- no giant fixture. A
+// real `limit`-aware streaming splice belongs with the deferred parameters cycle.
+inline constexpr std::size_t kEmbedMaxResourceBytes = 16u * 1024u * 1024u; // 16 MiB
+[[nodiscard]] DSS_EXPORT std::optional<std::string>
+embedResourceSizeError(std::size_t byteCount);
 
 } // namespace dss

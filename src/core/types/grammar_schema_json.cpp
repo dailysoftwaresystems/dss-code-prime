@@ -4169,6 +4169,18 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
             // conditional-group state machine with the direct definedness path.
             readOptWord("elifdefDirective",       cfg.elifdefDirective);
             readOptWord("elifndefDirective",      cfg.elifndefDirective);
+            // FC17.9(h) (`#embed` / `__has_embed`; C23 6.10.4 / 6.10.1): the
+            // directive + operator WORDS (matched by lexeme TEXT, like the
+            // conditional words). OPTIONAL -- absent leaves both empty so an
+            // `#embed` line falls through to the unsupported-directive fail-loud
+            // and `__has_embed` folds to an ordinary identifier. NO angle-token
+            // self-consistency rule is imposed (unlike `hasIncludeOperator`): the
+            // `#embed`/`__has_embed` angle form is a deferred loud wall
+            // (D-PP-EMBED-ANGLE), so `hasEmbedOperator` reuses the existing
+            // `hasIncludeAngle*` KINDS only to recognise-and-reject an angle
+            // argument at runtime; see the field doc in preprocess_config.hpp.
+            readOptWord("embedDirective",         cfg.embedDirective);
+            readOptWord("hasEmbedOperator",       cfg.hasEmbedOperator);
             // FC15c (make-or-break agnosticism): the angle-delimiter token KINDS
             // for `__has_include(<h>)`. OPTIONAL token-name fields (validated like
             // `stringizeToken`). The make-or-break SELF-CONSISTENCY rule: a

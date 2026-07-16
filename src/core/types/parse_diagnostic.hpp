@@ -90,6 +90,17 @@ enum class DiagnosticCode : std::uint16_t {
     // scanning for the literal `<`/`>` bytes (agnosticism). A well-formed
     // operator yields 1 (the header is found) or 0 -- never this diagnostic.
     P_PreprocessorHasInclude      = 0x001C,
+    // FC17.9(h) (`#embed` -- C23 6.10.4 / N3096 6.10.3): a malformed or
+    // unsupported `#embed` directive (D-PP-EMBED). ONE message-differentiated
+    // code (the `P_PreprocessorIncludeError` multi-message precedent): the
+    // resource is not found / unreadable / has an empty-or-missing quoted name
+    // / uses the deferred angle or macro-argument form / carries an unsupported
+    // standard parameter (limit/prefix/suffix/if_empty/vendor) / exceeds the
+    // cycle-1 splice size budget, and the `__has_embed` operator is malformed.
+    // Positioned on the directive word / operator token. Fail-loud invariant:
+    // every non-bare-quote-filename shape emits THIS code -- never a silent drop
+    // and never a silent partial embed.
+    P_PreprocessorEmbed           = 0x001D,
 
     // Expression-nesting depth guard (Pratt walker). A too-deeply-nested
     // expression (parens / right-assoc / prefix / ternary recursion past
