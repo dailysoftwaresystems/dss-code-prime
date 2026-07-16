@@ -1,0 +1,36 @@
+# Snap package for the dsscp compiler. Rendered by packaging/render.py.
+#
+# CLASSIC confinement is required: a compiler reads source files and writes
+# objects/executables at arbitrary paths, which strict confinement forbids.
+# Classic snaps must pass a MANUAL Snap Store review before they can be
+# published — factor that into the first release (see packaging/README.md).
+#
+# NOTE (scaffold): building a multi-arch snap from prebuilt tarballs is fiddly.
+# This packages the linux-x64 tarball via the `dump` plugin; the arm64 arm and
+# proper lib bundling are left to finalize when snap is enabled.
+name: @PKGNAME@
+base: core22
+version: '@VERSION@'
+summary: @DESCRIPTION@
+description: |
+  DSS Code Prime (dsscp) is a config-driven, source/target/linker-agnostic
+  C compiler. See @HOMEPAGE@.
+grade: stable
+confinement: classic
+license: @LICENSE@
+
+architectures:
+  - build-on: amd64
+    build-for: amd64
+
+parts:
+  dsscp:
+    plugin: dump
+    source: @URL_LINUX_X64@
+    source-type: tar
+    organize:
+      bin/dss/dsscp: bin/dsscp
+
+apps:
+  dsscp:
+    command: bin/dsscp

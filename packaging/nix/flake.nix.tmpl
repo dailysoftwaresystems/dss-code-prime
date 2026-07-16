@@ -1,0 +1,41 @@
+# Nix flake for the dsscp compiler (prebuilt-binary packaging). Rendered by
+# packaging/render.py on each release and pushed to the flake repo, so
+# `nix run github:@NIX_FLAKE_SLUG@` / `nix profile install github:@NIX_FLAKE_SLUG@`
+# fetch the matching release binary. Depends on the queued install-layout +
+# dsscp-rename prerequisites.
+{
+  description = "@DESCRIPTION@";
+
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.flake-utils.url = "github:numtide/flake-utils";
+
+  outputs = { self, nixpkgs, flake-utils }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = import nixpkgs { inherit system; };
+        assets = {
+          "x86_64-linux"  = { url = "@URL_LINUX_X64@";   sha256 = "@SHA256_LINUX_X64@"; };
+          "aarch64-linux" = { url = "@URL_LINUX_ARM64@"; sha256 = "@SHA256_LINUX_ARM64@"; };
+          "aarch64-darwin" = { url = "@URL_MACOS_ARM64@"; sha256 = "@SHA256_MACOS_ARM64@"; };
+        };
+        asset = assets.${system} or (throw "dsscp: no release asset for ${system}");
+      in {
+        packages.default = pkgs.stdenv.mkDerivation {
+          pname = "dsscp";
+          version = "@VERSION@";
+          src = pkgs.fetchurl { inherit (asset) url sha256; };
+          sourceRoot = ".";
+          nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+          buildInputs = [ pkgs.stdenv.cc.cc.lib ];
+          installPhase = ''
+            runHook preInstall
+            install -Dm755 bin/dss/dsscp "$out/bin/dsscp"
+            for lib in bin/dss/*.so bin/dss/*.so.* bin/dss/*.dylib; do
+              [ -e "$lib" ] && install -Dm644 "$lib" "$out/lib/$(basename "$lib")"
+            done
+            runHook postInstall
+          '';
+        };
+        apps.default = { type = "app"; program = "${self.packages.${system}.default}/bin/dsscp"; };
+      });
+}

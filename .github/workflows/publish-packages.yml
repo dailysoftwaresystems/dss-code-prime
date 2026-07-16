@@ -1,0 +1,359 @@
+name: Publish packages
+
+# Publishes a GitHub release to OS package managers (Windows / Linux / macOS).
+# Fires AFTER `pipeline-pkg.yml` has built + published the GitHub release with
+# the platform tarballs attached.
+#
+# ── INERT BY DEFAULT ──────────────────────────────────────────────────────────
+# Every job is gated on repository variables, so with none set NOTHING runs:
+#   - master switch:  vars.ENABLE_PKG_PUBLISH == 'true'   (gates `prepare`, which
+#                     every publish job needs — off => the whole workflow is a no-op)
+#   - per manager:    vars.ENABLE_HOMEBREW / _SCOOP / _WINGET / _AUR / _NIX /
+#                     _DEB / _RPM / _SNAP == 'true'
+# Turn managers on one at a time as you provision each one's repo + token
+# (see packaging/README.md for the exact variables/secrets each needs).
+#
+# ── PREREQUISITES (compiler-repo, currently behind the linker/FFI hold) ───────
+# The rendered manifests install a `dsscp` command + its shared lib and assume
+# an install layout + rpath. They depend on:
+#   (1) the CMake install()/rpath work (the "keep exe+lib" choice), and
+#   (2) the dss-code-prime -> dsscp binary rename.
+# Until both land, keep ENABLE_PKG_PUBLISH unset — the scaffolding is here and
+# ready, but a live publish would ship a manifest that can't install cleanly.
+#
+# Channels: a `vX.Y.Z` tag is stable (package name `dsscp`); a `vX.Y.Z-beta` tag
+# is beta (package name `dsscp-beta`, so stable + beta coexist in one tap/bucket).
+# winget + snap publish on STABLE only.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to (re)publish, e.g. v0.0.2 or v0.0.2-beta."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Resolve version/channel + fetch each release asset's sha256 ─────────────
+  # Emits a `vars.env` artifact (KEY="VALUE" lines) that every publish job
+  # sources and feeds to packaging/render.py. Gated by the master switch, so a
+  # skipped prepare skips every downstream job (they all `needs: prepare`).
+  prepare:
+    if: ${{ vars.ENABLE_PKG_PUBLISH == 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.meta.outputs.channel }}
+      version: ${{ steps.meta.outputs.version }}
+      pkgname: ${{ steps.meta.outputs.pkgname }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build manifest vars (version, channel, per-asset sha256)
+        id: meta
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REPO: ${{ github.repository }}
+          MAINTAINER_VAR: ${{ vars.PKG_MAINTAINER }}
+          NIX_FLAKE_REPO: ${{ vars.NIX_FLAKE_REPO }}
+        run: |
+          set -euo pipefail
+          tag="${EVENT_TAG:-$INPUT_TAG}"
+          [ -n "$tag" ] || { echo "::error::no release tag (release event or workflow_dispatch input)"; exit 1; }
+
+          # Channel + version from the tag. vX.Y.Z = stable; vX.Y.Z-beta = beta.
+          case "$tag" in
+            *-beta) channel=beta;   version="${tag#v}"; version="${version%-beta}"; pkgname=dsscp-beta; classname=DsscpBeta ;;
+            v*)     channel=stable; version="${tag#v}"; pkgname=dsscp; classname=Dsscp ;;
+            *) echo "::error::tag '$tag' is not vX.Y.Z or vX.Y.Z-beta"; exit 1 ;;
+          esac
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version '$version' is not Major.Minor.Patch"; exit 1 ;;
+          esac
+
+          base="https://github.com/${REPO}/releases/download/${tag}"
+          {
+            echo "VERSION=\"$version\""
+            echo "TAG=\"$tag\""
+            echo "CHANNEL=\"$channel\""
+            echo "PKGNAME=\"$pkgname\""
+            echo "CLASSNAME=\"$classname\""
+            echo "DESCRIPTION=\"DSS Code Prime (dsscp): a config-driven, source/target/linker-agnostic C compiler\""
+            echo "HOMEPAGE=\"https://github.com/${REPO}\""
+            echo "REPO_DOWNLOAD_BASE=\"https://github.com/${REPO}/releases/download\""
+            echo "LICENSE=\"Apache-2.0\""
+            echo "MAINTAINER=\"${MAINTAINER_VAR:-DSS <noreply@dailysoftwaresystems.com>}\""
+            echo "NIX_FLAKE_SLUG=\"${NIX_FLAKE_REPO:-dailysoftwaresystems/dsscp-nix}\""
+          } > vars.env
+
+          # Download each platform tarball and record its sha256. A missing
+          # asset is fatal (a manifest with no/blank sha256 must never ship).
+          emit_asset() {
+            local key="$1" plat="$2"
+            local url="$base/dsscp-${version}-${plat}.tar.gz"
+            echo "Fetching $url"
+            if ! curl -fSL --retry 3 --retry-delay 5 -o "asset-${plat}.tar.gz" "$url"; then
+              echo "::error::release asset missing: $url"; exit 1
+            fi
+            local sha; sha="$(sha256sum "asset-${plat}.tar.gz" | cut -d' ' -f1)"
+            echo "URL_${key}=\"$url\""       >> vars.env
+            echo "SHA256_${key}=\"$sha\""    >> vars.env
+          }
+          emit_asset LINUX_X64    linux-x64
+          emit_asset LINUX_ARM64  linux-arm64
+          emit_asset MACOS_ARM64  macos-arm64
+          emit_asset WINDOWS_X64  windows-x64
+
+          {
+            echo "channel=$channel"
+            echo "version=$version"
+            echo "pkgname=$pkgname"
+          } >> "$GITHUB_OUTPUT"
+          echo "----- vars.env -----"; cat vars.env
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: manifest-vars
+          path: vars.env
+          retention-days: 7
+
+  # ── Homebrew tap (macOS + Linux) ────────────────────────────────────────────
+  homebrew:
+    needs: prepare
+    if: ${{ vars.ENABLE_HOMEBREW == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
+        with: { name: manifest-vars }
+      - name: Render formula + push to the tap
+        env:
+          TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
+          TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$TAP_REPO" ] || { echo "::error::set variable HOMEBREW_TAP_REPO (e.g. dailysoftwaresystems/homebrew-dsscp)"; exit 1; }
+          [ -n "$TOKEN" ]    || { echo "::error::set secret TAP_PUSH_TOKEN (a PAT with push to the tap repo)"; exit 1; }
+          set -a; source vars.env; set +a
+          git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/${TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          python3 packaging/render.py packaging/homebrew/dsscp.rb.tmpl "tap/Formula/${PKGNAME}.rb"
+          cd tap
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "Formula/${PKGNAME}.rb"
+          git commit -m "dsscp ${VERSION} (${CHANNEL})" || { echo "no formula change"; exit 0; }
+          git push
+
+  # ── Scoop bucket (Windows) ──────────────────────────────────────────────────
+  scoop:
+    needs: prepare
+    if: ${{ vars.ENABLE_SCOOP == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
+        with: { name: manifest-vars }
+      - name: Render manifest + push to the bucket
+        env:
+          BUCKET_REPO: ${{ vars.SCOOP_BUCKET_REPO }}
+          TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$BUCKET_REPO" ] || { echo "::error::set variable SCOOP_BUCKET_REPO (e.g. dailysoftwaresystems/scoop-dsscp)"; exit 1; }
+          [ -n "$TOKEN" ]       || { echo "::error::set secret TAP_PUSH_TOKEN (a PAT with push to the bucket repo)"; exit 1; }
+          set -a; source vars.env; set +a
+          git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/${BUCKET_REPO}.git" bucket
+          python3 packaging/render.py packaging/scoop/dsscp.json.tmpl "bucket/${PKGNAME}.json"
+          cd bucket
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${PKGNAME}.json"
+          git commit -m "dsscp ${VERSION} (${CHANNEL})" || { echo "no manifest change"; exit 0; }
+          git push
+
+  # ── winget (Windows, stable only) ───────────────────────────────────────────
+  # winget-pkgs wants an installer/portable ZIP, not a .tar.gz. The release
+  # currently ships .tar.gz only, so this is a documented SCAFFOLD: provision a
+  # windows .zip asset first (see packaging/README.md), then wingetcreate can
+  # submit the PR. Gated off; a first submission is manually reviewed by winget.
+  winget:
+    needs: prepare
+    if: ${{ vars.ENABLE_WINGET == 'true' && needs.prepare.outputs.channel == 'stable' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with: { name: manifest-vars }
+      - name: Submit to winget-pkgs (wingetcreate)
+        shell: bash
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          WINGET_ID: ${{ vars.WINGET_IDENTIFIER }}
+        run: |
+          set -euo pipefail
+          [ -n "$WINGET_TOKEN" ] || { echo "::error::set secret WINGET_TOKEN (classic PAT w/ public_repo, for your winget-pkgs fork)"; exit 1; }
+          [ -n "$WINGET_ID" ]    || { echo "::error::set variable WINGET_IDENTIFIER (e.g. DailySoftwareSystems.dsscp)"; exit 1; }
+          set -a; source vars.env; set +a
+          # TODO: winget needs a .zip (portable) installer URL, not the .tar.gz.
+          # Emit a windows .zip in pipeline-pkg.yml (or repackage+upload here),
+          # then point --urls at it. Until then this fails loud on purpose.
+          echo "::error::winget publish needs a windows .zip release asset — see packaging/README.md (winget section)."
+          exit 1
+          # Reference once a .zip asset exists:
+          #   choco install wingetcreate -y
+          #   wingetcreate update "$WINGET_ID" --version "$VERSION" \
+          #     --urls "${REPO_DOWNLOAD_BASE}/${TAG}/dsscp-${VERSION}-windows-x64.zip" \
+          #     --token "$WINGET_TOKEN" --submit
+
+  # ── AUR (Arch Linux) ────────────────────────────────────────────────────────
+  aur:
+    needs: prepare
+    if: ${{ vars.ENABLE_AUR == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
+        with: { name: manifest-vars }
+      - name: Render PKGBUILD
+        run: |
+          set -euo pipefail
+          [ -n "${{ secrets.AUR_SSH_PRIVATE_KEY }}" ] || { echo "::error::set secret AUR_SSH_PRIVATE_KEY (the SSH key registered with your AUR account)"; exit 1; }
+          set -a; source vars.env; set +a
+          mkdir -p aur
+          python3 packaging/render.py packaging/aur/PKGBUILD.tmpl aur/PKGBUILD
+      - name: Publish to the AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v2.7.2
+        with:
+          pkgname: ${{ needs.prepare.outputs.pkgname }}
+          pkgbuild: aur/PKGBUILD
+          commit_username: github-actions[bot]
+          commit_email: github-actions[bot]@users.noreply.github.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "dsscp ${{ needs.prepare.outputs.version }} (${{ needs.prepare.outputs.channel }})"
+
+  # ── Nix flake (prebuilt-binary; pushed to a dedicated flake repo) ────────────
+  nix:
+    needs: prepare
+    if: ${{ vars.ENABLE_NIX == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
+        with: { name: manifest-vars }
+      - name: Render flake.nix + push to the flake repo
+        env:
+          FLAKE_REPO: ${{ vars.NIX_FLAKE_REPO }}
+          TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$FLAKE_REPO" ] || { echo "::error::set variable NIX_FLAKE_REPO (e.g. dailysoftwaresystems/dsscp-nix)"; exit 1; }
+          [ -n "$TOKEN" ]      || { echo "::error::set secret TAP_PUSH_TOKEN (a PAT with push to the flake repo)"; exit 1; }
+          set -a; source vars.env; set +a
+          git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/${FLAKE_REPO}.git" flake
+          python3 packaging/render.py packaging/nix/flake.nix.tmpl flake/flake.nix
+          cd flake
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add flake.nix
+          git commit -m "dsscp ${VERSION} (${CHANNEL})" || { echo "no flake change"; exit 0; }
+          git push
+
+  # ── Debian/Ubuntu .deb (built with fpm, published to Cloudsmith) ────────────
+  deb:
+    needs: prepare
+    if: ${{ vars.ENABLE_DEB == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with: { name: manifest-vars }
+      - name: Build + push .deb (both arches)
+        env:
+          CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
+          CLOUDSMITH_REPO: ${{ vars.CLOUDSMITH_REPO }}
+        run: |
+          set -euo pipefail
+          [ -n "$CLOUDSMITH_API_KEY" ] || { echo "::error::set secret CLOUDSMITH_API_KEY"; exit 1; }
+          [ -n "$CLOUDSMITH_REPO" ]    || { echo "::error::set variable CLOUDSMITH_REPO (e.g. dailysoftwaresystems/dsscp)"; exit 1; }
+          set -a; source vars.env; set +a
+          sudo gem install --no-document fpm
+          pip install --quiet cloudsmith-cli
+          build_and_push() {
+            local url="$1" deb_arch="$2"
+            rm -rf stage pkg; mkdir -p stage/usr/bin stage/usr/lib pkg
+            curl -fSL --retry 3 -o t.tgz "$url"; tar -xzf t.tgz
+            install -Dm755 bin/dss/dsscp stage/usr/bin/dsscp
+            for l in bin/dss/*.so bin/dss/*.so.*; do [ -e "$l" ] && install -Dm644 "$l" "stage/usr/lib/$(basename "$l")"; done
+            fpm -s dir -t deb -n "$PKGNAME" -v "$VERSION" -a "$deb_arch" -p "pkg/" \
+              --license "$LICENSE" --description "$DESCRIPTION" --url "$HOMEPAGE" --maintainer "$MAINTAINER" \
+              -C stage .
+            cloudsmith push deb "${CLOUDSMITH_REPO}/any-distro/any-version" pkg/*.deb
+          }
+          build_and_push "$URL_LINUX_X64"   amd64
+          build_and_push "$URL_LINUX_ARM64" arm64
+
+  # ── Fedora/RHEL .rpm (built with fpm, published to Cloudsmith) ──────────────
+  rpm:
+    needs: prepare
+    if: ${{ vars.ENABLE_RPM == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with: { name: manifest-vars }
+      - name: Build + push .rpm (both arches)
+        env:
+          CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
+          CLOUDSMITH_REPO: ${{ vars.CLOUDSMITH_REPO }}
+        run: |
+          set -euo pipefail
+          [ -n "$CLOUDSMITH_API_KEY" ] || { echo "::error::set secret CLOUDSMITH_API_KEY"; exit 1; }
+          [ -n "$CLOUDSMITH_REPO" ]    || { echo "::error::set variable CLOUDSMITH_REPO (e.g. dailysoftwaresystems/dsscp)"; exit 1; }
+          set -a; source vars.env; set +a
+          sudo gem install --no-document fpm
+          sudo apt-get update -y && sudo apt-get install -y --no-install-recommends rpm
+          pip install --quiet cloudsmith-cli
+          build_and_push() {
+            local url="$1" rpm_arch="$2"
+            rm -rf stage pkg; mkdir -p stage/usr/bin stage/usr/lib pkg
+            curl -fSL --retry 3 -o t.tgz "$url"; tar -xzf t.tgz
+            install -Dm755 bin/dss/dsscp stage/usr/bin/dsscp
+            for l in bin/dss/*.so bin/dss/*.so.*; do [ -e "$l" ] && install -Dm644 "$l" "stage/usr/lib/$(basename "$l")"; done
+            fpm -s dir -t rpm -n "$PKGNAME" -v "$VERSION" -a "$rpm_arch" -p "pkg/" \
+              --license "$LICENSE" --description "$DESCRIPTION" --url "$HOMEPAGE" --maintainer "$MAINTAINER" \
+              -C stage .
+            cloudsmith push rpm "${CLOUDSMITH_REPO}/any-distro/any-version" pkg/*.rpm
+          }
+          build_and_push "$URL_LINUX_X64"   x86_64
+          build_and_push "$URL_LINUX_ARM64" aarch64
+
+  # ── Snap (Linux, stable only; CLASSIC confinement needs manual store review) ─
+  snap:
+    needs: prepare
+    if: ${{ vars.ENABLE_SNAP == 'true' && needs.prepare.outputs.channel == 'stable' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
+        with: { name: manifest-vars }
+      - name: Guard + render snapcraft.yaml
+        run: |
+          set -euo pipefail
+          [ -n "${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}" ] || { echo "::error::set secret SNAPCRAFT_STORE_CREDENTIALS (snapcraft export-login output)"; exit 1; }
+          set -a; source vars.env; set +a
+          mkdir -p snap
+          python3 packaging/render.py packaging/snap/snapcraft.yaml.tmpl snap/snapcraft.yaml
+      - name: Build snap
+        id: snapbuild
+        uses: snapcore/action-build@v1
+      - name: Publish snap
+        uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.snapbuild.outputs.snap }}
+          release: stable

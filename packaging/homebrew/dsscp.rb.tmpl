@@ -1,0 +1,45 @@
+# Homebrew formula for the dsscp compiler (macOS + Linux tap).
+# Rendered by packaging/render.py from the release assets on each publish.
+#
+# This is a BINARY formula: it downloads the per-OS/arch release tarball and
+# installs the CLI + its shared library. It ASSUMES the eventual install
+# layout (a `dsscp` executable + the shared lib, with an rpath so the exe finds
+# the lib) — i.e. it depends on the queued `install()`/rpath + `dsscp`-rename
+# prerequisites. Until those land this formula will not `brew install` cleanly.
+class @CLASSNAME@ < Formula
+  desc "@DESCRIPTION@"
+  homepage "@HOMEPAGE@"
+  version "@VERSION@"
+  license "@LICENSE@"
+
+  on_macos do
+    on_arm do
+      url "@URL_MACOS_ARM64@"
+      sha256 "@SHA256_MACOS_ARM64@"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "@URL_LINUX_X64@"
+      sha256 "@SHA256_LINUX_X64@"
+    end
+    on_arm do
+      url "@URL_LINUX_ARM64@"
+      sha256 "@SHA256_LINUX_ARM64@"
+    end
+  end
+
+  def install
+    # The tarball unpacks to bin/dss/. Install the shared lib into the Homebrew
+    # prefix lib and the CLI into bin. The exe's baked rpath
+    # (@loader_path/../lib on macOS, $ORIGIN/../lib on Linux) resolves the lib.
+    lib.install Dir["bin/dss/*.dylib", "bin/dss/*.so", "bin/dss/*.so.*"]
+    bin.install "bin/dss/dsscp"
+  end
+
+  test do
+    # TODO: tighten once dsscp has a stable --version/--help contract.
+    assert_predicate bin/"dsscp", :exist?
+  end
+end
