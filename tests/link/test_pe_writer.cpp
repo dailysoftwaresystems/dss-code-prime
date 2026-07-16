@@ -72,6 +72,27 @@ findExecSection(std::vector<std::uint8_t> const& img,
     return {0u, 0u};
 }
 
+// c149 (D-LK-EXTERN-DATA-IMPORT, PE half) sibling: a section's
+// Misc.VirtualSize (section header +8) — the UNPADDED byte extent. The
+// data-extern tests pin `.text`'s VirtualSize to prove the import-thunk
+// block was compacted to the FUNCTION externs (a data extern reserving
+// a dead 6-byte `FF 25` thunk would grow it). Returns 0 if absent (the
+// caller asserts).
+[[nodiscard]] std::uint32_t
+findExecSectionVirtualSize(std::vector<std::uint8_t> const& img,
+                           std::array<char, 8> const&       name) {
+    std::uint16_t const n = readU16LE(img, 0x86);
+    for (std::uint16_t i = 0; i < n; ++i) {
+        std::size_t const h = 0x188u + static_cast<std::size_t>(i) * 40u;
+        bool eq = true;
+        for (std::size_t b = 0; b < 8; ++b) {
+            if (static_cast<char>(img[h + b]) != name[b]) { eq = false; break; }
+        }
+        if (eq) return readU32LE(img, h + 8);
+    }
+    return 0u;
+}
+
 struct Loaded {
     std::shared_ptr<TargetSchema>       target;
     std::shared_ptr<ObjectFormatSchema> format;
@@ -1152,6 +1173,29 @@ TEST(PeExecFormatJson, ShippedPeExecIsDirectPlt) {
                 == ExternCallDispatch::DirectPlt);
 }
 
+TEST(PeExecFormatJson, ShippedPeExecDeclaresGotIndirectDataImportBinding) {
+    // c149 (D-LK-EXTERN-DATA-IMPORT, the PE half — the LAST missing
+    // image binding model): the shipped pe64 exec format declares
+    // `dataImportBinding: "got-indirect"` — PE `__imp_<name>` semantics:
+    // the loader fills a data import's IAT slot with the imported
+    // OBJECT's address, so the slot IS a pointer (the Mach-O __got
+    // non-lazy-pointer model, same enum value). The linker's pre-walker
+    // gate keys on this field; MIR->LIR selects the lea-of-slot + deref
+    // GlobalAddr lowering from it. RED-on-disable: revert the JSON
+    // declaration -> this pin fails AND every data-import link rejects
+    // K_FormatLacksImportSupport again (the pre-c149 wall). Mirrors the
+    // macho64-arm64-darwin-exec c117 declaration pin.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.format->dataImportBinding().has_value())
+        << "pe64-x86_64-windows-exec must declare dataImportBinding "
+           "(D-LK-EXTERN-DATA-IMPORT, c149)";
+    EXPECT_TRUE(*loaded.format->dataImportBinding()
+                == DataImportBinding::GotIndirect)
+        << "PE data imports bind IAT-slot-indirect (__imp_ semantics) -- "
+           "the got-indirect model, not copy-relocation";
+}
+
 TEST(PeExecWriter, AddressTakenImportResolvesToTextThunkNotIdataSlot) {
     // D-FFI-PE-IMPORT-THUNK host-independent structural pin. The PE exec
     // walker synthesizes one `FF 25 disp32` import thunk per extern at
@@ -1229,6 +1273,304 @@ TEST(PeExecWriter, AddressTakenImportResolvesToTextThunkNotIdataSlot) {
         << std::hex << thunkRva << "), not the .idata IAT slot";
     EXPECT_LT(callTargetRva, static_cast<std::int64_t>(idataRva))
         << "extern call target must be in .text (< .idata RVA)";
+}
+
+TEST(PeExecWriter, DataExternBindsToIatSlotInIdataNotTextThunk) {
+    // c149 (D-LK-EXTERN-DATA-IMPORT, the PE half) — the data twin of
+    // AddressTakenImportResolvesToTextThunkNotIdataSlot. A DATA extern
+    // (isData — an msvcrt `_fmode`-class data export) binds to its
+    // `.idata` IAT SLOT VA (`__imp_` semantics: the loader fills the
+    // slot with the imported OBJECT's address — the Mach-O __got
+    // non-lazy-pointer model, got-indirect) and gets NO `FF 25` text
+    // thunk (a data object is not callable; a thunk-VA binding would
+    // read jump-stub bytes as the object's value).
+    //
+    // RED-on-disable both ways: (1) revert the JSON declaration -> the
+    // walker's binding assertion (and the linker's pre-walker gate)
+    // reject with K_FormatLacksImportSupport — no clean encode; (2)
+    // bind the data extern to a thunk VA (the function path) -> the
+    // resolved reference lands in .text, failing BOTH the exact-slot
+    // equality and the .idata range assertion, and .text VirtualSize
+    // grows by the dead 6-byte thunk.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    // main: `48 8B 05 <disp32>` (mov rax, [rip+disp32]) + `C3` = read
+    // the imported object, then ret — 8 bytes. The disp32 patch site is
+    // at function offset 3 (REL32, resolved against the end of the
+    // 7-byte mov); the reloc targets the DATA extern.
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x48, 0x8B, 0x05, 0, 0, 0, 0, 0xC3};
+    fn.relocations.push_back(
+        Relocation{/*offset=*/3, SymbolId{99}, RelocationKind{1},
+                   /*addend=*/0});
+    mod.functions.push_back(std::move(fn));
+    ExternImport dataExt{SymbolId{99}, "_fmode", "msvcrt.dll"};
+    dataExt.isData = true;
+    mod.externImports.push_back(std::move(dataExt));
+
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "the data-import gate must admit the declared got-indirect "
+           "binding (c149) -- no more K_FormatLacksImportSupport wall";
+    ASSERT_FALSE(img.empty());
+
+    auto const [textRva, textPtr] =
+        findExecSection(img, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+    auto const [idataRva, idataPtr] =
+        findExecSection(img, {'.', 'i', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(textRva, 0u);
+    ASSERT_NE(idataRva, 0u);
+    (void)idataPtr;
+
+    // (1) NO thunk was emitted for the data extern: `.text` holds
+    //     exactly the 8 function bytes — the thunk block is COMPACTED
+    //     to the function externs (here: none). A dead data thunk
+    //     would grow VirtualSize to 14.
+    EXPECT_EQ(findExecSectionVirtualSize(
+                  img, {'.', 't', 'e', 'x', 't', 0, 0, 0}),
+              8u)
+        << "a DATA extern must NOT reserve/emit an FF 25 import thunk "
+           "-- thunk bytes are per-FUNCTION-extern only";
+
+    // (2) `.idata` layout for 1 library x 1 extern: descriptors
+    //     (1+1)*20 = 40 (8-aligned) -> ILT @40 (extern + terminator =
+    //     16 B) -> IAT @56. The IAT data directory must point at it.
+    std::uint32_t const iatDirRva  = readU32LE(img, 0x108 + 12 * 8);
+    std::uint32_t const iatDirSize = readU32LE(img, 0x108 + 12 * 8 + 4);
+    EXPECT_EQ(iatDirRva, idataRva + 56u);
+    EXPECT_EQ(iatDirSize, 16u);  // 1 slot + u64 terminator
+
+    // (3) THE BINDING: the mov's disp32 resolves the data extern to
+    //     its IAT SLOT VA — inside .idata, at exactly the slot the
+    //     import machinery lays out — NOT a .text thunk.
+    auto const movDisp =
+        static_cast<std::int32_t>(readU32LE(img, textPtr + 3u));
+    std::int64_t const targetRva =
+        static_cast<std::int64_t>(textRva) + 7 + movDisp;
+    std::uint32_t const idataVSize = findExecSectionVirtualSize(
+        img, {'.', 'i', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(idataVSize, 0u);
+    EXPECT_GE(targetRva, static_cast<std::int64_t>(idataRva))
+        << "data-extern reference must resolve into .idata (the IAT "
+           "slot), not .text";
+    EXPECT_LT(targetRva,
+              static_cast<std::int64_t>(idataRva) + idataVSize)
+        << "data-extern reference must land inside .idata's extent";
+    EXPECT_EQ(targetRva, static_cast<std::int64_t>(idataRva) + 56)
+        << "data-extern symbolVa must be the IAT SLOT VA (idata+56 for "
+           "1 lib x 1 extern), the loader-filled __imp_ pointer";
+
+    // (4) The import machinery resolves a data import's NAME exactly
+    //     like a function's: HINT/NAME carries `_fmode`, the
+    //     descriptor names msvcrt.dll.
+    std::uint32_t const idataFileOff = readU32LE(
+        img, 0x188 + 40 + 20);  // section[1] (.idata) PointerToRawData
+    std::string_view const hay{
+        reinterpret_cast<char const*>(img.data() + idataFileOff),
+        idataVSize};
+    EXPECT_NE(hay.find("_fmode"), std::string_view::npos);
+    EXPECT_NE(hay.find("msvcrt.dll"), std::string_view::npos);
+}
+
+TEST(PeExecWriter, MixedFunctionAndDataExternsThunkForFunctionSlotForData) {
+    // c149 (D-LK-EXTERN-DATA-IMPORT, PE half), the MIXED-module pin:
+    // one FUNCTION extern (called) + one DATA extern (read) in ONE
+    // library. The function extern keeps its c112 `FF 25` thunk +
+    // thunk-VA binding; the data extern binds to its IAT slot VA; the
+    // IAT carries BOTH entries (+ terminator); ONE import descriptor.
+    // Mirrors macho.cpp's c119 DataExternGetsGotSlotButNoStub
+    // compaction pin (funcExternIdxs — thunk index j != extern index i).
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    // main: `E8 <rel32>` call puts (offset 0, patch @1)
+    //       `48 8B 05 <disp32>` mov rax,[rip+_fmode] (offset 5, patch @8)
+    //       `C3` ret                                  -> 13 bytes total.
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0,
+                 0x48, 0x8B, 0x05, 0, 0, 0, 0,
+                 0xC3};
+    fn.relocations.push_back(
+        Relocation{/*offset=*/1, SymbolId{99}, RelocationKind{1}, 0});
+    fn.relocations.push_back(
+        Relocation{/*offset=*/8, SymbolId{98}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "puts", "msvcrt.dll"});
+    ExternImport dataExt{SymbolId{98}, "_fmode", "msvcrt.dll"};
+    dataExt.isData = true;
+    mod.externImports.push_back(std::move(dataExt));
+
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(img.empty());
+
+    auto const [textRva, textPtr] =
+        findExecSection(img, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+    auto const [idataRva, idataPtr] =
+        findExecSection(img, {'.', 'i', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(textRva, 0u);
+    ASSERT_NE(idataRva, 0u);
+    (void)idataPtr;
+
+    // (1) Thunk count = FUNCTION externs only: 13 fn bytes + ONE
+    //     6-byte thunk = 19. A per-extern (lockstep) reservation would
+    //     give 25.
+    EXPECT_EQ(findExecSectionVirtualSize(
+                  img, {'.', 't', 'e', 'x', 't', 0, 0, 0}),
+              19u)
+        << "exactly one FF 25 thunk (the function extern's) -- the data "
+           "extern must not reserve thunk bytes";
+
+    // (2) The single thunk sits at .text offset 13 and jumps through
+    //     the FUNCTION extern's IAT slot. `.idata` layout for 1 lib x
+    //     2 externs: descriptors 40 -> ILT @40 (2 externs + term = 24)
+    //     -> IAT @64; extern[0] (puts) slot @64, extern[1] (_fmode)
+    //     slot @72.
+    std::size_t const thunkFileOff = static_cast<std::size_t>(textPtr) + 13u;
+    std::uint32_t const thunkRva   = textRva + 13u;
+    ASSERT_LT(thunkFileOff + 6u, img.size());
+    EXPECT_EQ(img[thunkFileOff + 0], 0xFFu);
+    EXPECT_EQ(img[thunkFileOff + 1], 0x25u);
+    auto const thunkDisp =
+        static_cast<std::int32_t>(readU32LE(img, thunkFileOff + 2u));
+    EXPECT_EQ(static_cast<std::int64_t>(thunkRva) + 6 + thunkDisp,
+              static_cast<std::int64_t>(idataRva) + 64)
+        << "the function thunk must jump through ITS OWN IAT slot "
+           "(idata+64), lockstep with the import layout";
+
+    // (3) The CALL resolves to the thunk (c112 function path,
+    //     unchanged by c149).
+    auto const callDisp =
+        static_cast<std::int32_t>(readU32LE(img, textPtr + 1u));
+    EXPECT_EQ(static_cast<std::int64_t>(textRva) + 5 + callDisp,
+              static_cast<std::int64_t>(thunkRva))
+        << "function extern still binds to its thunk VA";
+
+    // (4) The DATA reference resolves to the data extern's IAT slot
+    //     (idata+72) — in .idata, distinct from the function's slot.
+    auto const movDisp =
+        static_cast<std::int32_t>(readU32LE(img, textPtr + 8u));
+    std::int64_t const dataTargetRva =
+        static_cast<std::int64_t>(textRva) + 12 + movDisp;
+    EXPECT_EQ(dataTargetRva, static_cast<std::int64_t>(idataRva) + 72)
+        << "data extern must bind to ITS IAT slot VA (idata+72)";
+    EXPECT_GE(dataTargetRva, static_cast<std::int64_t>(idataRva))
+        << "data extern must never bind into .text";
+
+    // (5) Import accounting: ONE descriptor (1 lib + terminator = 40),
+    //     IAT block = 2 externs + terminator = 24 bytes; both names in
+    //     the HINT/NAME table.
+    EXPECT_EQ(readU32LE(img, 0x114), 40u);
+    EXPECT_EQ(readU32LE(img, 0x108 + 12 * 8), idataRva + 64u);
+    EXPECT_EQ(readU32LE(img, 0x108 + 12 * 8 + 4), 24u);
+    std::uint32_t const idataFileOff = readU32LE(img, 0x188 + 40 + 20);
+    std::uint32_t const idataVSize = findExecSectionVirtualSize(
+        img, {'.', 'i', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(idataVSize, 0u);
+    std::string_view const hay{
+        reinterpret_cast<char const*>(img.data() + idataFileOff),
+        idataVSize};
+    EXPECT_NE(hay.find("puts"), std::string_view::npos);
+    EXPECT_NE(hay.find("_fmode"), std::string_view::npos);
+    EXPECT_NE(hay.find("msvcrt.dll"), std::string_view::npos);
+}
+
+TEST(PeExecWriter, DataExternUnderForeignDataImportBindingFailsLoud) {
+    // c149 walker-side binding assertion (mirrors elf.cpp's
+    // copy-relocation check and macho.cpp's got-indirect check): the
+    // PE exec walker implements exactly `got-indirect`. A pe-exec
+    // schema declaring a FOREIGN model (copy-relocation — valid enum,
+    // wrong walker) passes the linker's schema-declared pre-walker
+    // gate, so the WALKER must reject loud rather than silently hand
+    // the data extern an IAT-slot binding it did not declare.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "LLP64",
+      "format": {"name":"pe-exec-foreign-data-binding","kind":"pe"},
+      "externCallDispatch": "direct-plt",
+      "dataImportBinding": "copy-relocation",
+      "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
+      "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}],
+      "relocations":[{"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4}]
+    })");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x48, 0x8B, 0x05, 0, 0, 0, 0, 0xC3};
+    fn.relocations.push_back(
+        Relocation{3u, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    ExternImport dataExt{SymbolId{99}, "_fmode", "msvcrt.dll"};
+    dataExt.isData = true;
+    mod.externImports.push_back(std::move(dataExt));
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(img.empty());
+    EXPECT_GE(::dss::test_support::countCode(
+                  rep, DiagnosticCode::K_FormatLacksImportSupport),
+              1u)
+        << "the walker must reject a data-import binding model it does "
+           "not implement -- never a silent IAT-slot bind";
+}
+
+TEST(LinkerEndToEnd, PeExecAcceptsAndBindsDataExternImport) {
+    // c149 end-to-end acceptance through linker::link with the SHIPPED
+    // pe64-x86_64-windows-exec schema: the pre-walker data-import gate
+    // (linker.cpp K_FormatLacksImportSupport) now ADMITS a surviving
+    // extern DATA import because the format declares got-indirect —
+    // the exact call path that rejected before c149 (see
+    // Linker.ImageWithNoDataBindingStillRejectsReferencedDataExtern
+    // for the reverted-JSON red pin). The shipped format also injects
+    // the ExitProcess entry trampoline, so this pins gate+walker+
+    // trampoline coexistence rather than exact byte layout (that is
+    // DataExternBindsToIatSlotInIdataNotTextThunk's job).
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x48, 0x8B, 0x05, 0, 0, 0, 0, 0xC3};
+    fn.relocations.push_back(
+        Relocation{3u, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    ExternImport dataExt{SymbolId{99}, "_fmode", "msvcrt.dll"};
+    dataExt.isData = true;
+    mod.externImports.push_back(std::move(dataExt));
+    DiagnosticReporter rep;
+    LinkedImage img = linker::link(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "the linker's data-import gate must pass under the declared "
+           "got-indirect binding (c149)";
+    EXPECT_TRUE(img.ok());
+    ASSERT_FALSE(img.bytes.empty());
+    // The import surfaced: the emitted image's import-name list carries
+    // the data extern (the walker resolved its name like any import).
+    EXPECT_EQ(std::count(img.externImportNames.begin(),
+                         img.externImportNames.end(),
+                         std::string{"_fmode"}),
+              1);
 }
 
 TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {

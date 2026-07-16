@@ -1541,23 +1541,67 @@ encodeExec(AssembledModule const&    module,
     }
 
     // ── (a2) Reserve the import-thunk block at the tail of .text ──
-    // D-FFI-PE-IMPORT-THUNK: one code thunk per extern (`jmp *[IAT
-    // slot]`) — the PE analog of an ELF PLT stub / Mach-O __stubs
+    // D-FFI-PE-IMPORT-THUNK: one code thunk per FUNCTION extern (`jmp
+    // *[IAT slot]`) — the PE analog of an ELF PLT stub / Mach-O __stubs
     // entry. RESERVED here, BEFORE .text is sized, so textVirtualSize /
     // textRawSize / the data-chain RVAs (incl. .idata) all account for
     // it; the bytes are written in step (c2) once each IAT slot's VA is
-    // known. `symbolVa[extern]` then names the thunk (direct-plt),
+    // known. `symbolVa[funcExtern]` then names the thunk (direct-plt),
     // making an address-taken import a CALLABLE code address. Zero
     // externs → `resize(+0)` no-op → byte-identical output (the
     // extern-free byte-for-byte writer pins hold).
+    //
+    // c149 (D-LK-EXTERN-DATA-IMPORT, the PE half): a DATA extern
+    // (isData — an msvcrt `_fmode`-class data export) is never CALLED,
+    // so it gets NO thunk — only its IAT slot, which the loader fills
+    // with the imported OBJECT's address (`__imp_<name>` semantics; the
+    // Mach-O __got non-lazy-pointer model, same `got-indirect` binding).
+    // The thunk block is therefore COMPACTED to the function externs
+    // (`funcExternIdxs[j]` = the extern index of the j-th thunk —
+    // mirrors macho.cpp's D-LK-MACHO-DATA-EXTERN-DEAD-STUB compaction),
+    // while the `.idata` ILT/IAT/HINT-NAME layout below stays LOCKSTEP
+    // with EVERY extern (a data import's name resolves identically).
+    // symbolVa[dataExtern] binds to the IAT SLOT VA — never a thunk VA
+    // (reading jump-stub bytes as the object's value is the exact
+    // silent-miscompile class the linker's data-import gate guards).
+    std::vector<std::size_t> funcExternIdxs;
+    funcExternIdxs.reserve(module.externImports.size());
+    std::size_t numDataExterns = 0;
+    for (std::size_t i = 0; i < module.externImports.size(); ++i) {
+        if (module.externImports[i].isData) ++numDataExterns;
+        else funcExternIdxs.push_back(i);
+    }
+    if (numDataExterns > 0) {
+        // The linker's pre-walker gate admits data imports only when
+        // the schema DECLARES a binding model; this walker implements
+        // exactly `got-indirect` (the IAT-slot pointer). A future
+        // second member reaching here without a walker arm must fail
+        // loud, not silently get an IAT-slot binding it did not
+        // declare (mirrors elf.cpp's copy-relocation assertion and
+        // macho.cpp's got-indirect assertion).
+        auto const binding = fmt.dataImportBinding();
+        if (!binding.has_value()
+            || *binding != DataImportBinding::GotIndirect) {
+            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                 std::string{"pe::encodeExec: module carries "}
+                     + std::to_string(numDataExterns)
+                     + " extern DATA import(s) but format '"
+                     + std::string{fmt.name()}
+                     + "' does not declare 'dataImportBinding': "
+                       "\"got-indirect\" -- the only data-import "
+                       "mechanism this walker implements "
+                       "(D-LK-EXTERN-DATA-IMPORT).");
+            return {};
+        }
+    }
     std::size_t const peThunkSize    = peThunkSizeFor(id.machine);
-    std::size_t const numImportThunks = module.externImports.size();
+    std::size_t const numImportThunks = funcExternIdxs.size();
     if (numImportThunks > 0 && peThunkSize == 0) {
         emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
              std::format("pe::encodeExec: machine 0x{:x} declares {} extern "
-                         "import(s) but has no import-thunk emitter — an "
-                         "address-taken import needs a callable thunk. Add "
-                         "a per-machine emitter (see emitPeThunk).",
+                         "function import(s) but has no import-thunk emitter "
+                         "-- an address-taken import needs a callable thunk. "
+                         "Add a per-machine emitter (see emitPeThunk).",
                          id.machine, numImportThunks));
         return {};
     }
@@ -2091,12 +2135,15 @@ encodeExec(AssembledModule const&    module,
 
     // ── (c2) Fill the import-thunk block reserved in step (a2) ──
     // Each extern's IAT slot VA is now known (externIatVaBySym); write
-    // one `FF 25 disp32` thunk per extern jumping through it, and
-    // record the thunk VA (a .text code address) in
+    // one `FF 25 disp32` thunk per FUNCTION extern jumping through it,
+    // and record the thunk VA (a .text code address) in
     // `externThunkVaBySym`. THAT map — not `externIatVaBySym` — feeds
-    // `symbolVa` below, so every extern reference (a direct call OR an
-    // address-taken value) resolves to the callable thunk (direct-plt),
-    // never the raw IAT data slot.
+    // `symbolVa` below, so every function-extern reference (a direct
+    // call OR an address-taken value) resolves to the callable thunk
+    // (direct-plt), never the raw IAT data slot. c149: the loop walks
+    // the COMPACTED `funcExternIdxs` (thunk index j → extern index i) —
+    // a DATA extern gets no thunk; its symbolVa binds to the IAT slot
+    // VA below.
     std::unordered_map<SymbolId, std::uint64_t> externThunkVaBySym;
     externThunkVaBySym.reserve(numImportThunks);
     if (numImportThunks > 0) {
@@ -2111,8 +2158,9 @@ encodeExec(AssembledModule const&    module,
                  "invariant violated).");
             return {};
         }
-        for (std::size_t i = 0; i < numImportThunks; ++i) {
-            std::size_t const thunkOff = thunkBlockOffset + i * peThunkSize;
+        for (std::size_t j = 0; j < numImportThunks; ++j) {
+            std::size_t const i = funcExternIdxs[j];
+            std::size_t const thunkOff = thunkBlockOffset + j * peThunkSize;
             std::uint64_t const thunkVa =
                 oh.imageBase + secText.virtualAddress + thunkOff;
             auto const iatIt =
@@ -2242,12 +2290,12 @@ encodeExec(AssembledModule const&    module,
         }
     }
     for (auto const& [sym, va] : externThunkVaBySym) {
-        // D-FFI-PE-IMPORT-THUNK: an extern's symbolVa names its import
-        // THUNK (a .text code address) — the PE analog of an ELF PLT
-        // stub / Mach-O __stubs entry — NOT the `.idata` IAT data slot.
-        // This makes an address-taken import a CALLABLE code address
-        // and a direct extern call a plain `call rel32 → thunk` (the
-        // thunk does the IAT indirection); PE is no longer the
+        // D-FFI-PE-IMPORT-THUNK: a FUNCTION extern's symbolVa names its
+        // import THUNK (a .text code address) — the PE analog of an ELF
+        // PLT stub / Mach-O __stubs entry — NOT the `.idata` IAT data
+        // slot. This makes an address-taken import a CALLABLE code
+        // address and a direct extern call a plain `call rel32 → thunk`
+        // (the thunk does the IAT indirection); PE is no longer the
         // asymmetric outlier. An extern SymbolId colliding with a
         // function's SymbolId is a caller bug; silently overriding the
         // in-text VA would patch in-text rel32 to the wrong target.
@@ -2258,6 +2306,39 @@ encodeExec(AssembledModule const&    module,
                  + " collides with another symbol — caller must "
                    "give each extern a unique SymbolId distinct "
                    "from function ids.");
+            return {};
+        }
+    }
+    // c149 (D-LK-EXTERN-DATA-IMPORT, the PE half): a DATA extern's
+    // symbolVa is its `.idata` IAT SLOT VA — the address of the pointer
+    // the loader fills with the imported object's address (`__imp_`
+    // semantics; the Mach-O __got non-lazy-pointer model, macho.cpp's
+    // c117 mirror). A GlobalAddr of the symbol (mir_to_lir got-indirect)
+    // lea's this image-local slot VA then derefs it — NEVER a thunk VA
+    // (a data object is not callable; reading `FF 25` jump-stub bytes as
+    // the object's value is the silent-miscompile class the gate
+    // guards). Bound HERE — after the IAT layout fixed each slot's VA
+    // but BEFORE `applyExecRelocations` — so a code reloc into the data
+    // symbol resolves to the slot VA through the SAME relocation kernel
+    // a function thunk / named data item uses.
+    for (auto const& ext : module.externImports) {
+        if (!ext.isData) continue;
+        auto const iatIt = externIatVaBySym.find(ext.symbol);
+        if (iatIt == externIatVaBySym.end()) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"pe::encodeExec: extern DATA SymbolId #"}
+                     + std::to_string(ext.symbol.v)
+                     + " has no IAT slot VA -- externIatVaBySym is "
+                       "incomplete (import layout bug).");
+            return {};
+        }
+        if (!symbolVa.emplace(ext.symbol, iatIt->second).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"pe::encodeExec: extern DATA SymbolId #"}
+                     + std::to_string(ext.symbol.v)
+                     + " collides with another symbol -- caller must "
+                       "give each extern a unique SymbolId distinct "
+                       "from function ids.");
             return {};
         }
     }

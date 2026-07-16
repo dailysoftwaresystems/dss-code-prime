@@ -1,0 +1,13 @@
+{
+  "$comment": "c149 (D-LK-EXTERN-DATA-IMPORT, the PE half — the LAST missing image binding model): the source-level extern-DATA-import RUN witness on Windows. `extern int _fmode;` / `extern char **_environ;` are REAL msvcrt.dll DATA exports declared in plain source (no shipped-header route, no __iob_func-style accessor): ExternGlobal -> FF5 default-library bind (pe: msvcrt.dll) -> surviving ExternImport{isData} -> the pe64 exec format's NEW `dataImportBinding: \"got-indirect\"` (PE __imp_ semantics: the loader fills the extern's .idata IAT SLOT with the imported OBJECT's address; symbolVa[dataExtern] = the slot VA; NO FF 25 thunk for data) -> MIR->LIR lea-of-slot + deref (the SAME GotIndirect lowering the Mach-O c117 arm uses). The exit ladder discriminates every wrong-binding class: _environ==0 -> 2 (dead slot); _fmode!=0 -> 3 (thunk-byte read `FF 25 ...` OR missing-deref address read — empirically the real msvcrt _fmode object holds 0x0 at CRT init, probed via GetProcAddress on this box); store 0x4000 through the import + read-back -> 4 on divergence (a thunk-VA bind makes the store hit R-X .text -> 0xC0000005, never 42); restore-0 read-back -> 5. RED-on-disable: remove the format JSON's dataImportBinding -> compile-time K_FormatLacksImportSupport (the pre-c149 wall); rebind data externs to thunk VAs or drop the deref -> exit 3/AV. pe64-ONLY: _fmode/_environ are msvcrt names — the elf/macho data-import runtime witnesses are stdio_stream_objects (libc stdout/stderr/stdin via copy-relocation / Mach-O __got). Optimized arms prove the slot-deref address materialization survives the release pipelines.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec", "artifact": "main.exe", "runOn": ["windows"] }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -226,20 +226,36 @@ TEST(Linker, RelocatableKeepsReferencedDataExternAsUndefined) {
 
 TEST(Linker, ImageWithNoDataBindingStillRejectsReferencedDataExtern) {
     // The IMAGE side of the c144 gate (positive pin, mirrors c143's image-side
-    // reject test): an IMAGE format that declares no `dataImportBinding` (PE
-    // Exec — its `__imp_` data-thunk model is unbuilt) MUST still reject a
-    // surviving data extern with K_FormatLacksImportSupport. An image is
-    // load-time-bound with no later linker to resolve the object, so an
-    // unbindable data import is a load-time silent-failure. RED if the reject
-    // is deleted outright — RelocatableKeepsReferencedDataExternAsUndefined
+    // reject test): an IMAGE format that declares no `dataImportBinding` MUST
+    // still reject a surviving data extern with K_FormatLacksImportSupport. An
+    // image is load-time-bound with no later linker to resolve the object, so
+    // an unbindable data import is a load-time silent-failure. RED if the
+    // reject is deleted outright — RelocatableKeepsReferencedDataExternAsUndefined
     // alone would not catch that (it only pins the relocatable branch).
+    //
+    // c149 (D-LK-EXTERN-DATA-IMPORT, the PE half): the shipped PE exec format
+    // NOW declares `dataImportBinding: "got-indirect"` (the IAT-slot `__imp_`
+    // model — the last missing image binding), so this pin runs against a
+    // loadFromText PE-exec schema with the declaration REMOVED — the exact
+    // "revert the JSON declaration" red-on-disable shape: the gate keys on the
+    // schema field, never on the format name, so the reverted schema must
+    // reject exactly as the pre-c149 shipped one did.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
-    auto fmt = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "LLP64",
+      "format": {"name":"pe-exec-no-data-binding","kind":"pe"},
+      "externCallDispatch": "direct-plt",
+      "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
+      "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}],
+      "relocations":[{"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4}]
+    })");
     ASSERT_TRUE(fmt.has_value());
-    ASSERT_TRUE((*fmt)->isImageFlavor()) << "pe64-x86_64-windows-exec is an image";
+    ASSERT_TRUE((*fmt)->isImageFlavor()) << "the no-binding schema is an image";
     ASSERT_FALSE((*fmt)->dataImportBinding().has_value())
-        << "PE exec declares no dataImportBinding — the reject condition";
+        << "the schema declares no dataImportBinding -- the reject condition";
     AssembledModule mod;
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
