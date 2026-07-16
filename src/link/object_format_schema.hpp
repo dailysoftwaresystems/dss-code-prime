@@ -221,10 +221,12 @@ struct DSS_EXPORT ElfIdentity {
     std::uint8_t   abiVersion = 0;
     std::uint16_t  machine = 0;      // e_machine: EM_X86_64=62 / EM_AARCH64=183
     // e_type — ET_REL/ET_EXEC walker arms ship at LK1 cycle 1+2;
-    // ET_DYN anchored at D-LK1-4 paired with LK6 dynamic linking.
-    // `validate()` rejects values outside {Rel, Exec}; ET_DYN
-    // accepted at load but rejected at walker dispatch until
-    // D-LK1-4 closes. Default = Rel preserves LK1 cycle 1
+    // ET_DYN (c150, D-LK1-4 shared-library half) is the base-0,
+    // loader-slid image flavor: a `.so` today (entry-less,
+    // interpreter-less — validate() enforces that shape); the PIE
+    // EXECUTABLE is the anchored follow-up (ET_DYN + PT_INTERP +
+    // entry trampoline — the validate() rules relax there, see the
+    // D-LK1-4 registry row). Default = Rel preserves LK1 cycle 1
     // schemas unchanged.
     ElfObjectType  objectType = ElfObjectType::Rel;
     // PT_LOAD `p_align` for Exec images. The Linux kernel rejects
@@ -245,8 +247,22 @@ struct DSS_EXPORT ElfIdentity {
     // empty for self-contained executables (LK1 cycle 2) and for
     // ET_REL relocatable objects. The walker emits this string as
     // the `.interp` section's contents and a PT_INTERP program
-    // header pointing at it.
+    // header pointing at it. MUST be empty for ET_DYN today (a
+    // `.so` is loaded by an already-running ld.so, never execve'd;
+    // validate() rejects) — the PIE-executable follow-up is exactly
+    // the ET_DYN + interpreter combination (D-LK1-4 remainder).
     std::string    interpreter;
+    // DT_SONAME for an ET_DYN shared library (c150, D-LK1-4): the
+    // logical name the dynamic linker records when an executable
+    // links against this `.so` (`libfoo.so.1`). OPTIONAL — empty
+    // emits NO DT_SONAME (matching `gcc -shared` without
+    // `-Wl,-soname`, where the consumer's linker records the file
+    // name instead). Config-driven: the schema field is the one
+    // knob; the walker never derives a soname from the output file
+    // name (the walker emits bytes and does not know it). Only
+    // legal on `type: "dyn"` schemas — validate() rejects it on
+    // Rel/Exec (dead config there).
+    std::string    soname;
     // Eager-vs-lazy dynamic-binding choice. `true` (the v1 stance,
     // plan 14 §5 risk row) emits `DT_FLAGS_1 = DF_1_NOW` so all
     // GOT slots are resolved at load via `R_X86_64_GLOB_DAT` in
@@ -999,19 +1015,25 @@ public:
     [[nodiscard]] MachOImage       const& machoImage()       const noexcept { return d_.machoImage; }
 
     // Cross-format image-flavor predicate. True iff the schema
-    // describes an executable / shared-library image (ELF ET_EXEC,
-    // PE Exec/Dll, Mach-O MH_EXECUTE) — i.e. the walker emits an
-    // image header (PT_LOAD / IMAGE_OPTIONAL_HEADER / LC_MAIN+
-    // LC_LOAD_DYLINKER) rather than relocatable section bytes.
-    // Mirrors the `isExecFlavor` rule inside `validate()` (the
-    // terminal cross-format Text-virtualAddress gate); exposing it
-    // as an accessor lets walker code branch on "am I image-side?"
-    // without duplicating the disjunction (type-design O1 fold-in,
-    // LK2 cycle 2 + LK3 cycle 2 post-audit).
+    // describes an executable / shared-library image (ELF ET_EXEC
+    // or ET_DYN, PE Exec/Dll, Mach-O MH_EXECUTE) — i.e. the walker
+    // emits a LOAD-TIME-BOUND image (PT_LOAD / IMAGE_OPTIONAL_HEADER
+    // / LC_MAIN+LC_LOAD_DYLINKER) rather than relocatable section
+    // bytes a LATER linker binds. c150 (D-LK1-4): ET_DYN now counts
+    // — a `.so` IS load-time-bound (ld.so maps + relocates it; no
+    // later static linker sees its innards), closing the c143-era
+    // latent imprecision this predicate carried while no dyn format
+    // shipped. "Image" does NOT imply "rejects undefined externs" —
+    // that policy is the SEPARATE `allowsUndefinedImports()` below
+    // (a .so is an image AND may carry undefined symbols).
+    // The `isExecFlavor` rule inside `validate()` remains
+    // EXEC-only by design (it gates entry/processExit machinery a
+    // `.so` must not declare) — the two predicates diverged at c150
+    // and no longer mirror each other.
     [[nodiscard]] bool isImageFlavor() const noexcept {
         switch (d_.kind) {
             case ObjectFormatKind::Elf:
-                return d_.elf.objectType == ElfObjectType::Exec;
+                return d_.elf.objectType != ElfObjectType::Rel;
             case ObjectFormatKind::Pe:
                 return d_.pe.objectType != PeObjectType::Obj;
             case ObjectFormatKind::MachO:
@@ -1019,6 +1041,31 @@ public:
             default:
                 return false;
         }
+    }
+
+    // Undefined-extern policy (c150, D-LK1-4 — the c143 gate's third
+    // flavor): may the emitted artifact carry a REFERENCED extern
+    // that no library binds (an undefined symbol resolved by a LATER
+    // binder)?
+    //   * relocatable (.o/.obj)  → TRUE — the final (foreign) linker
+    //     resolves SHN_UNDEF symbols against sibling objects /
+    //     libraries (D-LK-OBJECT-NOLIB-EXTERN-RELOCATABLE, c143);
+    //   * ELF ET_DYN (.so)       → TRUE — standard `ld -shared`
+    //     semantics: a shared library may reference symbols the
+    //     EXECUTABLE (or another loaded object) defines; ld.so
+    //     resolves them from the global scope at load;
+    //   * executable images      → FALSE — nothing later binds them;
+    //     an unresolved reference is a load-time failure, so the
+    //     linker rejects LOUD at build time (c143, unchanged).
+    // Schema-driven (declared objectType), never a format-name
+    // branch. PE Dll (when its arm lands) stays FALSE — Windows
+    // DLLs resolve every import at link time; Mach-O dylib default
+    // two-level namespace likewise (a flat-namespace opt-in would
+    // flip its arm then).
+    [[nodiscard]] bool allowsUndefinedImports() const noexcept {
+        if (!isImageFlavor()) return true;   // relocatable: later linker resolves
+        return d_.kind == ObjectFormatKind::Elf
+            && d_.elf.objectType == ElfObjectType::Dyn;
     }
 
     // Image-side entry-point symbol name. Empty for relocatable

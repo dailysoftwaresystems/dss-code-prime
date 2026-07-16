@@ -84,9 +84,13 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
 // was already STRIPPED by the merge), so what remains splits two ways, both
 // keyed on whether anything actually REFERENCES the symbol (a relocation in
 // any function or data item targets it) — exactly ld's rule:
-//   * REFERENCED + unbound  ⇒ a true undefined symbol: reject LOUD, naming
-//     the symbol (never an IAT/DT_NEEDED entry with no owning image, which
-//     would defer the failure to the loader or read a null slot);
+//   * REFERENCED + unbound  ⇒ policy-keyed (c150 — the schema-driven
+//     `allowsUndefinedImports()` third flavor): an artifact a LATER binder
+//     resolves (relocatable .o — the final linker; ELF ET_DYN .so — ld.so's
+//     global scope at load) KEEPS the row as a legal undefined symbol; an
+//     EXEC image (nothing later binds it) rejects LOUD, naming the symbol
+//     (never an IAT/DT_NEEDED entry with no owning image, which would defer
+//     the failure to the loader or read a null slot);
 //   * UNREFERENCED + unbound ⇒ DROPPED from the module (returns false ⇒ the
 //     caller swaps in `filtered`): a bare prototype nobody calls is dead
 //     declaration surface, NOT an error (ld ignores unreferenced undefined
@@ -101,7 +105,7 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
 [[nodiscard]] bool rejectOrDropUnboundExterns(
     AssembledModule const& m,
     AssembledModule&       filtered,
-    bool                   outputIsImage,
+    bool                   allowUndefinedExterns,
     DiagnosticReporter&    reporter) {
     bool anyUnbound = false;
     for (auto const& ext : m.externImports) {
@@ -126,15 +130,22 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
         if (!ext.libraryPath.empty()) continue;          // library-bound import
         if (ext.mangledName.empty()) continue;           // already rejected (compound index)
         if (referenced.contains(ext.symbol.v)) {
-            // D-LK-OBJECT-NOLIB-EXTERN-RELOCATABLE: a referenced no-library
-            // extern is unresolvable in an IMAGE (nothing at load time binds
-            // it) → reject loud. But in a RELOCATABLE OBJECT it is a LEGAL
-            // SHN_UNDEF symbol the FINAL (foreign) linker resolves against a
-            // sibling object or library — the bare-prototype `SQLITE_API`
-            // shape (`int sqlite3_foo(...);`, no `extern`, no import library).
-            // Keep it: the ET_REL writer's undefined-symbol loop emits it by
-            // its `mangledName` (via `externName`), and gcc's `ld` resolves it.
-            if (outputIsImage) {
+            // The c143 gate, generalized at c150 into a schema-driven
+            // THREE-flavor policy (`allowsUndefinedImports()`):
+            //   * RELOCATABLE (.o/.obj): a referenced no-library extern is a
+            //     LEGAL SHN_UNDEF symbol the FINAL (foreign) linker resolves
+            //     against a sibling object or library — the bare-prototype
+            //     `SQLITE_API` shape (D-LK-OBJECT-NOLIB-EXTERN-RELOCATABLE).
+            //     KEEP (the ET_REL writer's undefined-symbol loop emits it by
+            //     `mangledName` via `externName`; gcc's `ld` resolves it).
+            //   * ELF ET_DYN (.so): standard `ld -shared` semantics — a
+            //     shared library may reference symbols the EXECUTABLE (or a
+            //     sibling library) defines; ld.so resolves them from the
+            //     global scope at load. KEEP (the dyn walker emits an UNDEF
+            //     `.dynsym` entry + PLT/GOT machinery; no DT_NEEDED row).
+            //   * EXEC image: nothing later binds it — an unresolved
+            //     reference is a load-time failure; reject LOUD (unchanged).
+            if (!allowUndefinedExterns) {
                 report(reporter, DiagnosticCode::K_SymbolUndefined,
                        DiagnosticSeverity::Error,
                        "undefined symbol '" + ext.mangledName + "' — the symbol "
@@ -144,7 +155,8 @@ void buildCompoundIndex(std::unordered_map<LinkedSymbolKey, SymbolKind>& index,
                        "in a linked translation unit, or declare the owning "
                        "library for the symbol.");
             }
-            // else (relocatable object): kept — deferred to the final linker.
+            // else: kept — resolved by the final linker (relocatable) or
+            // by ld.so's global scope at load (ELF ET_DYN).
         } else {
             anyDrop = true;   // unreferenced + unbound ⇒ drop below
         }
@@ -516,7 +528,7 @@ LinkedImage link(std::span<AssembledModule const> modules,
     {
         std::size_t const errsBeforeUnbound = reporter.errorCount();
         if (!rejectOrDropUnboundExterns(*selectedInput, unboundFilteredStorage,
-                                        objectFormatSchema.isImageFlavor(),
+                                        objectFormatSchema.allowsUndefinedImports(),
                                         reporter)) {
             selectedInput = &unboundFilteredStorage;
         }
@@ -565,6 +577,13 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // IMAGE (load-time-bound, no later linker to resolve the object) with no
     // declared binding rejects. Mirrors D-LK-OBJECT-NOLIB-EXTERN-RELOCATABLE
     // (c143), which kept referenced no-library FUNCTION externs as SHN_UNDEF.
+    //
+    // c150 (D-LK1-4): ELF ET_DYN is now image-flavored, so a `.so` with a
+    // surviving data extern takes THIS gate — its schema declares
+    // `dataImportBinding: "got-indirect"` (the c117/c149 GotIndirect model:
+    // ld.so fills a GOT slot with the object's address; the lowering derefs
+    // it), so it passes by config. Copy-relocation stays exec-only
+    // (validate() rejects it on a dyn schema).
     //
     // This gate is format-AGNOSTIC (isImageFlavor() is false for every
     // relocatable flavor), so it lifts the reject for the Mach-O `object` and
@@ -653,6 +672,14 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // Bypass conditions: caller-provided `imageEntryOverride` (a
     // pre-injected trampoline; do not re-inject) OR empty functions
     // (no module to wrap).
+    //
+    // c150 (D-LK1-4): the condition is SCHEMA-driven by design — an
+    // ELF ET_DYN `.so` declares NO `processExit` (validate() rejects
+    // it there: entry machinery is exec-flavor-only), so no
+    // trampoline is synthesized for a shared library (a `.so` has no
+    // entry; e_entry = 0). The PIE-executable follow-up declares
+    // `processExit` on its ET_DYN schema and gets the trampoline
+    // through this same condition, zero gate changes.
     AssembledModule moduleCopy;
     AssembledModule const* moduleP = &inputModule;
     bool const wantTrampoline =

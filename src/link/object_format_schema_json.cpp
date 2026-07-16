@@ -1216,6 +1216,32 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     }
                 }
             }
+            // `soname`: DT_SONAME for an ET_DYN shared library
+            // (c150, D-LK1-4). Optional; absent = no DT_SONAME
+            // emitted (the `gcc -shared` no-`-soname` shape). An
+            // empty-string literal is rejected like `interpreter`:
+            // a zero-length DT_SONAME is unambiguously a config
+            // error (omit the field instead). validate() rejects
+            // the field on non-dyn schemas.
+            if (e.contains("soname")) {
+                if (!e.at("soname").is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/elf/soname",
+                              "'soname' must be a string (e.g. "
+                              "'libfoo.so.1')");
+                } else {
+                    auto const value = e.at("soname").get<std::string>();
+                    if (value.empty()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/elf/soname",
+                                  "'soname' must not be empty -- omit "
+                                  "the field entirely to emit no "
+                                  "DT_SONAME.");
+                    } else {
+                        data.elf.soname = value;
+                    }
+                }
+            }
             // `pageAlign`: PT_LOAD p_align for Exec images. Required
             // for ET_EXEC at validate() — the kernel rejects ELF
             // exec'd images whose p_align is smaller than the

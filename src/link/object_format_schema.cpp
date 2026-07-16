@@ -140,20 +140,10 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "(EM_* value, e.g. 62 for x86_64, "
                                  "183 for aarch64)");
         }
-        // e_type — the LK1 cycle 2 ELF walker supports ET_REL and
-        // ET_EXEC. ET_DYN is declared on the closed enum but
-        // rejected here until D-LK1-4 closes (PIE/.so paired with
-        // LK6 dynamic linking).
-        if (elf.objectType != ElfObjectType::Rel
-         && elf.objectType != ElfObjectType::Exec) {
-            fail("/elf/type",
-                 std::format("ELF format 'elf.type' = '{}' not yet "
-                             "supported by the walker; cycle 2 ships "
-                             "'rel' and 'exec'. 'dyn' (ET_DYN: PIE / "
-                             ".so) is anchored at plan 14 §3.1 D-LK1-4 "
-                             "paired with LK6 dynamic linking.",
-                             std::string{elfObjectTypeName(elf.objectType)}));
-        }
+        // e_type — all three closed-enum members now have walker
+        // arms: ET_REL (LK1 cycle 1), ET_EXEC (LK1 cycle 2 + the
+        // LK6 dynamic arm), ET_DYN (c150 — the D-LK1-4 shared-
+        // library half; the entry-less `.so` shape enforced below).
         // ET_EXEC schemas must declare which sections are loaded and
         // at what virtual address. Today the walker uses sh_addr =
         // section.virtualAddress directly (no relocation of
@@ -204,6 +194,106 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
             // observable states by the time validate() runs.
             // The walker (LK6 cycle 2b — D-LK6-4) enforces non-empty
             // when externImports is non-empty.
+        }
+        // ── ET_DYN (`.so`) shape rules — c150, D-LK1-4 shared-library
+        // half. An ELF shared library is a base-0, loader-slid,
+        // ENTRY-LESS image: ld.so maps it at an arbitrary base and
+        // adds the load bias to every base-relative VA. The schema
+        // must therefore declare the base-0 layout and must NOT
+        // declare any of the exec-only entry machinery. The PIE
+        // EXECUTABLE follow-up (the D-LK1-4 remainder) is exactly
+        // where these rules relax: a PIE is ET_DYN + PT_INTERP +
+        // entry trampoline — that cycle lifts the interpreter /
+        // entryPoint rejects below for its schema shape.
+        if (elf.objectType == ElfObjectType::Dyn) {
+            if (elf.pageAlign == 0) {
+                fail("/elf/pageAlign",
+                     "ELF ET_DYN format must declare 'elf.pageAlign' "
+                     "(PT_LOAD p_align) -- same kernel/loader page-"
+                     "congruence contract as ET_EXEC (D-LK6-3).");
+            }
+            auto const* secText = [&]() -> ObjectFormatSectionInfo const* {
+                for (auto const& s : sections) {
+                    if (s.kind == SectionKind::Text) return &s;
+                }
+                return nullptr;
+            }();
+            if (secText == nullptr) {
+                fail("/sections",
+                     "ELF ET_DYN format requires a Text section row "
+                     "(SectionKind::Text) -- a shared library without "
+                     "code has nothing to export.");
+            } else if (elf.pageAlign != 0
+                       && secText->virtualAddress != elf.pageAlign) {
+                // ET_DYN VAs are BASE-RELATIVE (the loader slides the
+                // whole image). The walker computes baseImageVa =
+                // text.virtualAddress - pageAlign; requiring equality
+                // pins baseImageVa to 0 BY CONSTRUCTION — the gcc
+                // `.so` convention (first page holds Ehdr + PHT +
+                // dynamic metadata, `.text` opens the second page).
+                // Any other value would bake a nonzero base offset
+                // into every "base-relative" VA for no benefit.
+                fail("/sections/<text>/virtualAddress",
+                     std::format("ELF ET_DYN format requires the .text "
+                                 "row's 'virtualAddress' to equal "
+                                 "'elf.pageAlign' (got {:#x}, pageAlign "
+                                 "{:#x}) -- ET_DYN images are base-0 "
+                                 "(loader-slid); .text sits one page in "
+                                 "so headers + dynamic metadata fill "
+                                 "page zero. D-LK1-4.",
+                                 secText->virtualAddress, elf.pageAlign));
+            }
+            if (!elf.interpreter.empty()) {
+                fail("/elf/interpreter",
+                     std::format("ELF ET_DYN format must not declare "
+                                 "'elf.interpreter' (got '{}'). A "
+                                 "shared library is loaded by an "
+                                 "already-running dynamic linker and "
+                                 "carries no PT_INTERP. The PIE "
+                                 "executable (ET_DYN + PT_INTERP) is "
+                                 "the anchored D-LK1-4 follow-up; its "
+                                 "cycle lifts this rule for the PIE "
+                                 "schema shape.",
+                                 elf.interpreter));
+            }
+            if (!entryPoint.empty()) {
+                fail("/entryPoint",
+                     std::format("ELF ET_DYN format must not declare "
+                                 "'entryPoint' (got '{}') -- a shared "
+                                 "library has no process entry "
+                                 "(e_entry = 0). The PIE executable "
+                                 "follow-up (D-LK1-4) owns the ET_DYN "
+                                 "entry story.",
+                                 entryPoint));
+            }
+            // A `.so` cannot host copy relocations — R_*_COPY is the
+            // EXECUTABLE's mechanism (the exec owns the one canonical
+            // copy every image binds to; a library declaring it would
+            // invert the interposition contract). The dyn data-import
+            // model is got-indirect (a GOT slot ld.so fills with the
+            // object's address — the c117/c149 GotIndirect lowering).
+            if (dataImportBinding.has_value()
+                && *dataImportBinding == DataImportBinding::CopyRelocation) {
+                fail("/dataImportBinding",
+                     "ELF ET_DYN format must not declare "
+                     "'dataImportBinding': \"copy-relocation\" -- copy "
+                     "relocations are exec-only (the executable owns "
+                     "the canonical copy). Declare \"got-indirect\" "
+                     "for extern data in a shared library. D-LK1-4.");
+            }
+        }
+        // `soname` is an ET_DYN-only field (DT_SONAME names a shared
+        // library; a `.o` / executable carrying one is dead config —
+        // a copy-paste error the bindNow/interpreter rules' shape
+        // already polices for their fields).
+        if (elf.objectType != ElfObjectType::Dyn && !elf.soname.empty()) {
+            fail("/elf/soname",
+                 std::format("ELF '{}' format must not declare "
+                             "'elf.soname' (got '{}') -- DT_SONAME is "
+                             "meaningful only on ET_DYN shared "
+                             "libraries.",
+                             std::string{elfObjectTypeName(elf.objectType)},
+                             elf.soname));
         }
         // ET_REL must NOT carry an interpreter path — `.interp` /
         // PT_INTERP are exec-image concepts and have no role in
@@ -809,10 +899,15 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     }
 
     // Cross-format exec-flavor invariant (type-design Q5 convergence
-    // + type-design O1 post-audit fold). The predicate mirrors
-    // `ObjectFormatSchema::isImageFlavor()` exactly — the schema
-    // and its private validate() helper share one disjunction (no
-    // drift surface).
+    // + type-design O1 post-audit fold). Since c150 this predicate
+    // is DELIBERATELY NARROWER than `isImageFlavor()`: ELF ET_DYN is
+    // an image flavor (load-time-bound) but NOT an exec flavor — a
+    // `.so` has no entry, so the entry-machinery legality gates below
+    // (processExit / entryCallingConvention / processArgs) and this
+    // Text-VA rule exclude it (the dyn Text-row + VA==pageAlign rule
+    // lives in the ELF block above). The PIE-executable follow-up
+    // (D-LK1-4 remainder) is where an ET_DYN schema joins the
+    // exec-flavor set.
     //
     // A single source of truth tying the image-side triplet:
     //   format declares "executable mode" ⟺ a Text-section row

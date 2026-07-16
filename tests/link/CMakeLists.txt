@@ -12,6 +12,13 @@ dss_add_test(NAME link/test_macho_chained_fixups SOURCES test_macho_chained_fixu
 dss_add_test(NAME link/test_string_table         SOURCES test_string_table.cpp)
 dss_add_test(NAME link/test_elf_exec_writer      SOURCES test_elf_exec_writer.cpp)
 
+# c150 (D-LK1-4 shared-library half) — ELF ET_DYN (.so) writer:
+# ET_DYN header/phdr pins, DT_SONAME knob, real-named .dynsym exports
+# findable via the SysV .hash walk, R_X86_64_RELATIVE for internal
+# absolute slots, got-indirect extern data, the undefined-extern
+# three-flavor policy, and the dyn fail-loud belts.
+dss_add_test(NAME link/test_elf_dyn_writer       SOURCES test_elf_dyn_writer.cpp)
+
 # D-LK6-1 closure — ARM64 bit-shift relocation-formula variants.
 dss_add_test(NAME link/test_aarch64_reloc_formulas SOURCES test_aarch64_reloc_formulas.cpp)
 

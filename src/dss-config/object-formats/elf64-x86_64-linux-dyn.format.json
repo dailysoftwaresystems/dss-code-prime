@@ -1,0 +1,134 @@
+{
+  "$comment": "ELF64 SHARED LIBRARY (ET_DYN, .so) for x86_64 Linux -- c150, the D-LK1-4 shared-library half (plan 14 / roadmap A1 part 1). Consumed by `src/link/format/elf.cpp` via the format-blind linker engine: `elf.type = dyn` routes to the SAME `encodeElfExecDynamic` substrate the exec image uses, with the dyn divergences (e_type=ET_DYN, e_entry=0, no PT_PHDR/PT_INTERP/.interp, base-0 VAs the loader slides, real-named .dynsym EXPORTS findable via .hash, R_X86_64_RELATIVE for internal absolute data slots, got-indirect extern data). A FOREIGN toolchain consumes the output: `gcc main.c -L. -lfoo` links against the DSS-emitted libfoo.so and the program runs. Differs from elf64-x86_64-linux-exec.format.json in: `elf.type` (dyn vs exec), NO `interpreter` (a .so is loaded by an already-running ld.so; validate() rejects one here), text `virtualAddress` = pageAlign (base-0 image by construction -- validate() pins the equality), NO `entryPoint`/`processExit`/`entryCallingConvention`/`processArgs` (a .so has no process entry; the linker synthesizes no trampoline -- the PIE-executable follow-up is exactly ET_DYN plus that entry machinery), `dataImportBinding` got-indirect (copy relocations are exec-only ELF), NO `tlsAccess` and NO tdata/tbss rows (TLS in a .so needs the general-dynamic model -- D-LK-DYN-TLS-MODEL; every thread_local fails loud at the MIR->LIR gate / linker section gate), `artifactProfiles` [\"lib\"], and an OPTIONAL `elf.soname` knob (absent here: per-artifact identity does not belong in a shipped format schema; DT_SONAME is emitted only when a schema declares it -- absent matches `gcc -shared` without -Wl,-soname, where the consumer's linker records the filename).",
+
+  "dssObjectFormatVersion": 1,
+
+  "format": {
+    "name": "elf64-x86_64-linux-dyn",
+    "version": "1.0",
+    "kind": "elf"
+  },
+
+  "$dataModelComment": "Same LP64 identity as the exec/rel siblings (64-bit Linux).",
+  "dataModel": "LP64",
+
+  "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: SysV/GNU LSB-first bit-field packing, same as the ELF siblings.",
+  "bitFieldStrategy": "gnu_packed",
+
+  "$externCallDispatchComment": "Same call-site shape as the exec image: the walker synthesizes a PLT stub per extern FUNCTION (jmp through the GOT slot, GLOB_DAT eager-bound) and the call site is a plain direct `call rel32` to the stub -- pc-relative, so the code needs no fixup under the ET_DYN load slide. D-FFI-EXTERN-CALL-DISPATCH.",
+  "externCallDispatch": "direct-plt",
+
+  "$dataImportBindingComment": "c150 (D-LK1-4 + D-LK-EXTERN-DATA-IMPORT): extern library DATA objects bind GOT-INDIRECT in a shared library -- the walker reserves a GOT slot per imported object and emits R_X86_64_GLOB_DAT against it; ld.so writes the object's address into the slot and the c117/c149 GotIndirect lowering (lea-of-slot + deref) reads it. Copy relocations are NOT valid inside a .so (R_*_COPY is the EXECUTABLE's mechanism -- the exec owns the one canonical copy every image binds to); validate() rejects copy-relocation on a dyn schema.",
+  "dataImportBinding": "got-indirect",
+
+  "$supportedDataSectionsComment": "rodata (read-only, R+X PT_LOAD #1 -- reloc-FREE items only: a reloc-bearing rodata item would need a load-time write into a read-only page, D-LK-DYN-RODATA-ITEM-RELOC fails loud), data (mutable initialized globals, R+W PT_LOAD #2), bss (zero-init, NOBITS tail of PT_LOAD #2), relro (reloc-bearing CONST data, c145 -- merged into `.data` by the dynamic arm so its R_X86_64_RELATIVE slots land in writable pages, exactly why gcc places such data in .data.rel.ro). NO tdata/tbss: thread-locals in a shared library need the general-dynamic TLS model (D-LK-DYN-TLS-MODEL, not implemented); the linker's pre-walker gate rejects them loudly by this set's absence.",
+  "supportedDataSections": ["rodata", "data", "bss", "relro"],
+
+  "$artifactProfilesComment": "This format SERVES the shared-library profile (plan 06 AP3). The c-subset language declares lib in its own set, so a lib-profile project may select this format; the cli profile is NOT served (a .so is not a runnable console binary).",
+  "artifactProfiles": ["lib"],
+
+  "elf": {
+    "$comment": "Elf64_Ehdr identity for a shared library. type = ET_DYN (3). e_entry = 0 (no process entry). class/data/osabi/machine identical to the exec sibling. pageAlign = 4096 (x86_64 Linux 4 KB pages). NO interpreter (validate() rejects one on dyn -- a .so carries no PT_INTERP). NO soname by default (see the top-level $comment). bindNow = true: eager binding, DT_FLAGS_1 = DF_1_NOW + R_X86_64_GLOB_DAT in .rela.dyn -- the same v1 stance as the exec image (lazy .rela.plt/JUMP_SLOT is D-LK6-11).",
+    "class": "elf64",
+    "data": "lsb",
+    "osabi": "sysv",
+    "abiVersion": 0,
+    "machine": 62,
+    "type": "dyn",
+    "pageAlign": 4096,
+    "bindNow": true
+  },
+
+  "sections": [
+    {
+      "$comment": "Executable code. virtualAddress = 4096 = elf.pageAlign, PINNED by validate(): ET_DYN VAs are BASE-RELATIVE (the loader slides the whole image), and the walker computes baseImageVa = text.virtualAddress - pageAlign, so the equality makes the image base 0 BY CONSTRUCTION -- the gcc .so convention (page zero holds Ehdr + PHT + dynamic metadata; .text opens the second page). sh_flags = SHF_ALLOC|SHF_EXECINSTR (6).",
+      "kind": "text",
+      "name": ".text",
+      "type": 1,
+      "flags": 6,
+      "addrAlign": 16,
+      "entrySize": 0,
+      "virtualAddress": 4096
+    },
+    {
+      "$comment": "Read-only initialized data (string literals, reloc-free const globals). Folded into the R+X PT_LOAD #1 after .text (same as the exec image). virtualAddress = 0 -- computed. A reloc-BEARING const global goes to relro instead (c145) -- in a .so that distinction is LOAD-BEARING, not a hardening nicety: RELATIVE fixups must land in writable pages.",
+      "kind": "rodata",
+      "name": ".rodata",
+      "type": 1,
+      "flags": 2,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Writable initialized data. R+W PT_LOAD #2 (W^X preserved). virtualAddress = 0 -- computed.",
+      "kind": "data",
+      "name": ".data",
+      "type": 1,
+      "flags": 3,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Zero-initialized data. SHT_NOBITS (8); memsz-only tail of PT_LOAD #2. virtualAddress = 0 -- computed.",
+      "kind": "bss",
+      "name": ".bss",
+      "type": 8,
+      "flags": 3,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Symbol table (debugger support; the LOADER reads .dynsym, which the walker emits unconditionally on this arm). sh_entsize = 24.",
+      "kind": "symtab",
+      "name": ".symtab",
+      "type": 2,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 24,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Symbol-name string table.",
+      "kind": "strtab",
+      "name": ".strtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Section-header string table.",
+      "kind": "shstrtab",
+      "name": ".shstrtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0,
+      "virtualAddress": 0
+    }
+  ],
+
+  "relocations": [
+    {
+      "$comment": "The pc-relative kinds are the only ones legal in ET_DYN `.text` (an absolute fixup in code would need DT_TEXTREL -- D-LK-DYN-TEXT-ABS-RELOC fails loud). kind numbers match the target schema rows (the cross-reference unifier requires both sides).",
+      "name": "R_X86_64_PC32",
+      "kind": 1,
+      "nativeId": 2
+    },
+    {
+      "$comment": "abs64 -- legal in DATA items only on this arm: the walker patches the slot with the base-relative value AND emits an R_X86_64_RELATIVE row for it (the load slide completes the address).",
+      "name": "R_X86_64_64",
+      "kind": 2,
+      "nativeId": 1
+    },
+    {
+      "name": "R_X86_64_32",
+      "kind": 3,
+      "nativeId": 10
+    }
+  ]
+}
