@@ -1,0 +1,39 @@
+{
+  "$comment": "c155 D-LK10-CRT-INIT-INVOKE closure witness #3: setlocale — the anchor's cited locale case — works on EVERY runnable leg with the trampoline calling main directly (no user-side CRT-init sequence): libc's loader-run init leaves the startup locale \"C\" queryable (pe: msvcrt DllMain; elf: ld.so runs libc.so.6's initializers; macho: dyld runs libSystem's before LC_MAIN). Category 0 = msvcrt LC_ALL / glibc LC_CTYPE — both valid, both echo \"C\" at startup (see main.c). stdout asserted byte-for-byte; msvcrt text mode makes it CRLF.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "C\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "C\n"
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-pie",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "C\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "C\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "expectedStdout": "C\n"
+    }
+  ]
+}

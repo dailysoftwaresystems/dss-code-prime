@@ -1,0 +1,35 @@
+{
+  "$comment": "c155 D-LK10-CRT-INIT-INVOKE closure witness #2: the fopen+fwrite+fclose / fopen+fread+fclose+remove stream roundtrip — the anchor's cited stdio-stream case — works on EVERY runnable leg with the trampoline calling main directly (no user-side CRT-init sequence): each format's loader runs libc's own init first (pe: msvcrt DllMain; elf: ld.so runs libc.so.6's initializers; macho: dyld runs libSystem's before LC_MAIN). Distinct non-42 exit codes name the failing layer (1..9, see main.c). No stdout: the empty-string pin asserts the binary printed NOTHING.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-pie",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"]
+    }
+  ]
+}

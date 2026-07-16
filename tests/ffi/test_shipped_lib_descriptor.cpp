@@ -3288,4 +3288,66 @@ TEST(ShippedLibDescriptor, SetjmpPeMacroExpandsToUnderscoreSetjmp) {
         << "the pe-only setjmp macro must NOT be injected on elf";
 }
 
+// c155 (D-FFI-ELF-ATEXIT-CXA-SPLIT, surfaced by the D-LK10-CRT-INIT-INVOKE closure
+// diagnosis): the real stdlib.json MUST keep
+// `atexit` gated OFF elf and `__cxa_atexit` gated elf-ONLY. Glibc's libc.so.6
+// exports only `__cxa_atexit` in its dynamic symbol table (`atexit` is a
+// libc_nonshared.a STATIC shim gcc links into every exec) — c155 re-witnessed the
+// failure mode on WSL glibc 2.39: an elf binary importing `atexit` by name dies at
+// spawn with `ld.so: symbol lookup error: undefined symbol: atexit`. That break is
+// invisible to compile-time CI (the compile succeeds; only the spawn fails), so the
+// availability sets are load-bearing runtime-correctness config, not documentation.
+// msvcrt.dll and libSystem DO export `atexit` (the pe arm is runtime-witnessed:
+// atexit handler runs at ExitProcess via msvcrt's DLL-detach onexit walk).
+// RED-ON-DISABLE: adding "elf" to atexit's set (the naive "fix" for an elf atexit
+// user) or widening __cxa_atexit beyond elf flips the exact-set asserts here before
+// the regression can reach a spawn-time failure.
+TEST(ShippedLibDescriptor, RealStdlibAtexitPerFormatAvailabilitySplit) {
+    fs::path const shippedRoot = shippedLibsRoot();
+    ASSERT_FALSE(shippedRoot.empty())
+        << "could not locate src/dss-config/shippedLibs from cwd";
+    fs::path const stdlibPath = shippedRoot / "stdlib.json";
+    ASSERT_TRUE(fs::exists(stdlibPath)) << stdlibPath.generic_string();
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    // Decode keeps EVERY symbol row regardless of the requested format (the
+    // per-symbol gate filters at INJECTION — the c106 pin-shape lesson), so one
+    // Elf-kind read exposes both symbols' availability sets.
+    auto desc = readShippedLibDescriptor(stdlibPath, interner, typeReg, rep,
+                                         DataModel::Lp64,
+                                         std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    ASSERT_TRUE(desc.has_value());
+    ASSERT_FALSE(rep.hasErrors());
+
+    std::vector<std::string> atexitSet;
+    std::vector<std::string> cxaSet;
+    bool sawAtexit = false;
+    bool sawCxa    = false;
+    for (auto const& s : desc->symbols) {
+        if (s.name == "atexit")        { sawAtexit = true; atexitSet = s.availableObjectFormats; }
+        if (s.name == "__cxa_atexit")  { sawCxa    = true; cxaSet    = s.availableObjectFormats; }
+    }
+    ASSERT_TRUE(sawAtexit) << "atexit absent from stdlib.json symbols";
+    ASSERT_TRUE(sawCxa)    << "__cxa_atexit absent from stdlib.json symbols";
+
+    EXPECT_EQ(atexitSet, (std::vector<std::string>{"pe", "macho"}))
+        << "atexit must stay OFF elf: glibc's libc.so.6 has no `atexit` dynsym "
+           "export -- an elf by-name import dies loud at spawn (ld.so symbol "
+           "lookup error), witnessed c155 on glibc 2.39";
+    EXPECT_EQ(cxaSet, (std::vector<std::string>{"elf"}))
+        << "__cxa_atexit is the elf-only registration primitive (GLIBC_2.2.5 "
+           "dynsym export); pe/macho ship the standard `atexit` instead";
+
+    // The gate the injector consults, asserted directly for both directions.
+    EXPECT_FALSE(objectFormatInAvailabilitySet(atexitSet, ObjectFormatKind::Elf));
+    EXPECT_TRUE(objectFormatInAvailabilitySet(atexitSet, ObjectFormatKind::Pe));
+    EXPECT_TRUE(objectFormatInAvailabilitySet(atexitSet, ObjectFormatKind::MachO));
+    EXPECT_TRUE(objectFormatInAvailabilitySet(cxaSet, ObjectFormatKind::Elf));
+    EXPECT_FALSE(objectFormatInAvailabilitySet(cxaSet, ObjectFormatKind::Pe));
+    EXPECT_FALSE(objectFormatInAvailabilitySet(cxaSet, ObjectFormatKind::MachO));
+}
+
 } // namespace
