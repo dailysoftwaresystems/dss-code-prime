@@ -9265,6 +9265,22 @@ struct Lowerer {
                 // lowerDiscardedExpr (one funnel, no per-kind/per-position miss).
                 return lowerDiscardedExpr(hir.exprStmtExpr(node));
             }
+            case HirKind::InlineAsm:
+                // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template asm statement
+                // `__asm__ [volatile] ("")` is a pure compiler reordering + full-
+                // memory fence — semantically IDENTICAL to _ReadWriteBarrier. Reuse
+                // MirOpcode::CompilerBarrier (0 operands, R::None ⇒ InvalidType, side-
+                // effecting + opcodeClobbersMemory ⇒ the 4 optimizer gates cannot
+                // move/elide across it), which lowers to ZERO target instructions on
+                // every target (mir_to_lir.cpp CompilerBarrier → return). This is
+                // byte-for-byte the _ReadWriteBarrier emit (hir_to_mir BuiltinLowering::
+                // Barrier). The semantic tier already rejected any non-empty template
+                // (S_InlineAsmNonEmptyTemplate) before codegen, so only the provably-
+                // inert empty form reaches here. The non-empty per-target text arc
+                // (D-CSUBSET-INLINE-ASM-TEXT) will introduce its own template-carrying
+                // lowering; the empty case need never use it.
+                mir.addInst(MirOpcode::CompilerBarrier, {}, InvalidType);
+                return true;
             case HirKind::VarDecl: {
                 // Allocate the local's slot on the current block. The declared
                 // type drives the alloca's pointer result type via the lattice.

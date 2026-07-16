@@ -909,6 +909,19 @@ enum class DiagnosticCode : std::uint16_t {
     // unresolved (InvalidType), which cannot reach codegen.
     S_LongDoubleFormatUndeclared = 0xE056,
 
+    // FC17.9(i) (D-CSUBSET-INLINE-ASM): an `__asm__` inline-asm statement whose
+    // template does NOT decode to strictly zero bytes — non-empty text
+    // (`__asm__("hlt")`), whitespace-only (`__asm__("  ")`), or a malformed escape.
+    // Cycle-1 implements ONLY the empty-template optimizer barrier (`__asm__
+    // volatile("")` → MirOpcode::CompilerBarrier, zero target instructions); a
+    // non-empty template carries real per-target machine instructions we cannot yet
+    // emit (the per-target asm-text arc is deferred, D-CSUBSET-INLINE-ASM-TEXT). FAIL
+    // LOUD rather than silently lower it to a no-op barrier — that would DROP the
+    // instructions (e.g. an `asm("hlt")` becoming a no-op), a genuine miscompile. In
+    // kUnsuppressableCodes (unsuppressable_codes.cpp): `--suppress` must never be able
+    // to turn a dropped `asm(...)` into a silent non-emission. Renders error[S0057].
+    S_InlineAsmNonEmptyTemplate = 0xE057,
+
     // ── D0xxx — driver / compilation-unit (see 08-compilation-unit-plan §2.6) ──
     // Emitted into a CompilationUnit's driver-level reporter by UnitBuilder.
     // The 0xD block is shared with future driver codes (e.g. the artifact-

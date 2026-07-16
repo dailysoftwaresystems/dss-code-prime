@@ -208,6 +208,49 @@ TEST(SemanticAnalyzerCSubset, EmptyArrayLengthEmitsDiagnostic) {
                         DiagnosticCode::S_NonConstantArrayLength), 1u);
 }
 
+// FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template `__asm__ volatile("")` optimizer
+// barrier is ACCEPTED (it lowers to a CompilerBarrier fence — pinned in the MIR tests);
+// a NON-EMPTY template carries real per-target instructions cycle-1 cannot emit, so it
+// FAILS LOUD S_InlineAsmNonEmptyTemplate rather than silently lowering to a no-op barrier
+// (a miscompile: `__asm__("hlt")` would vanish). The template PARSES (the grammar admits
+// any string literal); the reject is SEMANTIC.
+TEST(SemanticAnalyzerCSubset, InlineAsmNonEmptyTemplateEmitsDiagnostic) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ __asm__(\"nop\"); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u);
+}
+
+// A whitespace-only template is NOT provably inert (we do not parse asm) → also rejects.
+// The conservative strictly-empty predicate is the only provably-inert template.
+TEST(SemanticAnalyzerCSubset, InlineAsmWhitespaceTemplateEmitsDiagnostic) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ __asm__(\"  \"); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmNonEmptyTemplate), 1u);
+}
+
+// The strictly-empty template (with OR without `volatile`) is accepted — no reject, no
+// errors. volatile is inert for the empty form (a no-output asm is implicitly volatile;
+// GCC 6.47.2.1), so both spellings lower to the same barrier.
+TEST(SemanticAnalyzerCSubset, InlineAsmEmptyTemplateAccepted) {
+    auto cu = buildShippedUnit("c-subset", {
+        "int main(void){ __asm__ volatile(\"\"); __asm__(\"\"); return 0; }\n",
+    });
+    assertNoBuilderErrors(*cu);
+    auto model = analyze(cu);
+    EXPECT_EQ(countCode(model.diagnostics(),
+                        DiagnosticCode::S_InlineAsmNonEmptyTemplate), 0u);
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty() ? "" : model.diagnostics().all()[0].actual);
+}
+
 // SE-arrays: a non-decimal length exercises the shared decodeInteger through the
 // NEW semantic consumer — `0x10` must decode to 16 (radix handling), not be
 // rejected as non-constant.

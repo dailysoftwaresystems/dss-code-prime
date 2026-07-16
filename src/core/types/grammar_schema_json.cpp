@@ -8552,6 +8552,34 @@ LoadResult<std::shared_ptr<GrammarSchema>> buildSchemaFromJsonText(
                 }
             }
 
+            // ── inlineAsmRule (FC17.9(i), D-CSUBSET-INLINE-ASM) ──
+            // A single OPTIONAL top-level rule reference: the `__asm__` inline-asm
+            // statement shape (asmStmt). Pass 2 decodes its template child + emits
+            // S_InlineAsmNonEmptyTemplate unless it decodes to strictly zero bytes.
+            // Absent ⇒ the language has no inline-asm surface (the check never runs).
+            // A present-but-bad value (not a string, or an unknown shape) emits +
+            // fails the load — a typo can never silently disarm the non-empty guard.
+            if (sem.contains("inlineAsmRule")) {
+                if (!sem.at("inlineAsmRule").is_string()) {
+                    coll.emit(DiagnosticCode::C_InvalidSemantics,
+                              "/semantics/inlineAsmRule",
+                              "'semantics.inlineAsmRule' must be a string");
+                } else {
+                    cfg.inlineAsmRuleName =
+                        sem.at("inlineAsmRule").get<std::string>();
+                    if (!data.rules->contains(cfg.inlineAsmRuleName)) {
+                        coll.emit(DiagnosticCode::C_UnknownShape,
+                                  "/semantics/inlineAsmRule",
+                                  std::format("'inlineAsmRule' references unknown "
+                                              "shape '{}'", cfg.inlineAsmRuleName));
+                        cfg.inlineAsmRuleName.clear();
+                    } else {
+                        cfg.inlineAsmRule =
+                            data.rules->find(cfg.inlineAsmRuleName);
+                    }
+                }
+            }
+
             // ── generic (FC16 C11/C23 6.5.1.1, D-CSUBSET-GENERIC-SELECTION) ──
             // `{ rule, controlChild, assocRule, typedAssocRule, defaultAssocRule }`
             // — `_Generic` generic selection. Pass 2 resolves the controlling

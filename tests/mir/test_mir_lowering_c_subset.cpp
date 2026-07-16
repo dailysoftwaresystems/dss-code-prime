@@ -10009,6 +10009,42 @@ namespace {
 }
 } // namespace
 
+// ── FC17.9(i) (D-CSUBSET-INLINE-ASM): the asm→CompilerBarrier LOWERING pin ──
+// THE critical red-on-disable of this cycle. An empty optimizer barrier is
+// RESULT-NEUTRAL, so no exit-code test can tell "barrier present" from "barrier
+// absent" (the c_inline_asm example returns 42 either way). Mapping asmStmt to
+// Skip/nothing (the tempting staticAssertDecl twin, which lowers to nothing) would
+// PASS the runtime probe while SILENTLY DELETING the barrier — the exact semantics
+// the feature exists to provide. This pins the LINK at the MIR tier: the empty
+// `__asm__ volatile("")` must lower to EXACTLY ONE MirOpcode::CompilerBarrier.
+// RED-ON-DISABLE: map asmStmt→Skip (c-subset.lang.json hirLowering) or drop the
+// addInst in hir_to_mir's InlineAsm case → the count drops to 0 → RED. (The
+// barrier→blocks-optimizer half is pinned by test_cse LoadNotCsedAcrossCompiler-
+// Barrier; T2 ∘ that = "the asm statement blocks the optimizer", each link
+// independently red-on-disable.) Reuses the general entry-block opcode scanners
+// above (the barrier is in main/f's straight-line entry block).
+TEST(MirLoweringCSubset, InlineAsmEmptyTemplateLowersToCompilerBarrier) {
+    auto L = lowerCSubset("void f(void){ __asm__ volatile(\"\"); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::CompilerBarrier), 1)
+        << "the empty __asm__ statement must lower to exactly one CompilerBarrier "
+           "(a Skip-mapping would pass the exit-code probe but silently drop it)";
+    // The barrier emits NO runtime instruction and is NOT a Call.
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::Call), 0);
+}
+
+// The empty asm WITHOUT `volatile` lowers to the SAME barrier — volatile is inert
+// for the empty form (a no-output asm is implicitly volatile; GCC 6.47.2.1).
+TEST(MirLoweringCSubset, InlineAsmEmptyTemplateNoVolatileLowersToCompilerBarrier) {
+    auto L = lowerCSubset("void f(void){ __asm__(\"\"); }");
+    ASSERT_TRUE(L.mir.ok) << (L.mirReporter.all().empty() ? "" : L.mirReporter.all()[0].actual);
+    Mir const& m = L.mir.mir;
+    auto ids = stdbitAllEntryInsts(m);
+    EXPECT_EQ(stdbitCountOp(m, ids, MirOpcode::CompilerBarrier), 1);
+}
+
 // leading_zeros = clz(x) − (P − W): a single Clz, NO Popcount/Ctz/Shl.
 TEST(MirLoweringCSubset, StdbitLeadingZerosComposesClz) {
     auto L = lowerCSubset(

@@ -122,6 +122,11 @@ struct SchemaIndexes {
     // declaration rule. Pass 2 (`pass2Post`) const-evaluates its condition + emits
     // S_StaticAssertFailed on a zero / non-constant fold. Empty ⇒ no surface.
     std::unordered_map<std::uint32_t, bool>        staticAssertByRule;
+    // FC17.9(i) (D-CSUBSET-INLINE-ASM): true for the inline-asm statement rule
+    // (asmStmt). pass2Post decodes its template child and emits
+    // S_InlineAsmNonEmptyTemplate unless it decodes to strictly zero bytes. Empty
+    // ⇒ no surface.
+    std::unordered_map<std::uint32_t, bool>        inlineAsmByRule;
     // Built-in type name → TypeId (interned once per schema, into the CU
     // lattice; FC3 c1 — the per-row `coreByDataModel` override for the
     // ACTIVE data model is applied here, so every consumer below sees
@@ -957,6 +962,7 @@ void buildIndexes(EngineState& s, SchemaIndexes& idx, SemanticConfig const& cfg)
     for (auto const& lr : cfg.loopRules)    idx.loopByRule[lr.rule.v] = true;
     for (auto const& lc : cfg.loopControls) idx.loopControlByRule[lc.rule.v] = true;
     if (cfg.staticAssertRule.valid()) idx.staticAssertByRule[cfg.staticAssertRule.v] = true;
+    if (cfg.inlineAsmRule.valid())    idx.inlineAsmByRule[cfg.inlineAsmRule.v] = true;
     for (auto const& bt : cfg.builtinTypes) {
         if (bt.extension.has_value()) {
             // The mapping names a registered type-extension (e.g. T-SQL's
@@ -8184,6 +8190,55 @@ void pass2Post(EngineState& s, SemanticConfig const& cfg, Tree const& tree,
                                ? std::string{"static assertion failed"}
                                : "static assertion failed: \"" + message + "\"";
             }
+            s.reporter.report(std::move(d));
+        }
+    }
+
+    // FC17.9(i) (D-CSUBSET-INLINE-ASM, C23 6.8 / GNU 6.47): the GNU inline-asm
+    // STATEMENT `__asm__ [volatile] ( <string-literal-template> ) ;`. Cycle-1
+    // implements ONLY the empty-template optimizer barrier: the template must
+    // decode to STRICTLY ZERO bytes (`__asm__ volatile("")`), which HIR→MIR lowers
+    // to a pure compiler reordering + full-memory fence (MirOpcode::CompilerBarrier,
+    // the _ReadWriteBarrier op). A NON-EMPTY template carries real per-target
+    // instructions we cannot yet emit — decode the template (the SAME chokepoint
+    // staticAssert's message uses) and FAIL LOUD S_InlineAsmNonEmptyTemplate on
+    // anything but a strictly-empty decoded string: non-empty text, whitespace-only
+    // (`"  "` is NOT provably inert — we do not parse asm), or a malformed escape
+    // (decode → nullopt). This reject is an Error → the driver aborts before codegen,
+    // so a rejected asm's MIR is never emitted; silently lowering a non-empty asm to
+    // a no-op barrier would DROP its instructions — a miscompile — so the code is
+    // UNSUPPRESSABLE (unsuppressable_codes.cpp). Operand/clobber lists (`: … : …`) and
+    // `asm goto` never reach here: the asmStmt grammar ends at `)`, so those fail loud
+    // at parse (P_UnexpectedToken) — the D-CSUBSET-INLINE-ASM-OPERANDS / -GOTO
+    // deferrals. `volatile` is accepted but semantically INERT for the empty form.
+    // The template is the SOLE Internal child (the keyword / volatile / parens /
+    // semicolon are Tokens), located exactly as staticAssert locates its message.
+    if (k == NodeKind::Internal
+        && s.idx().inlineAsmByRule.contains(tree.rule(node).v)) {
+        NodeId tmplNode{};
+        for (NodeId c : visibleChildren(tree, node)) {
+            if (tree.kind(c) != NodeKind::Internal) continue;   // skip kw / volatile / ( ) ;
+            tmplNode = c;
+            break;
+        }
+        std::optional<std::string> decoded;
+        if (tmplNode.valid() && s.idx().stringLiteralBodyToken.valid()) {
+            decoded = decodeAdjacentStringBodies(
+                tree, tmplNode, s.idx().stringLiteralBodyToken);
+        }
+        // Acceptance = a template that decodes to STRICTLY zero bytes. Anything else
+        // (non-empty / whitespace-only / malformed-escape nullopt / a malformed node
+        // with no template) fails loud — never a silently dropped instruction.
+        if (!(decoded && decoded->empty())) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::S_InlineAsmNonEmptyTemplate;
+            d.severity = DiagnosticSeverity::Error;
+            d.buffer   = tree.source().id();
+            d.span     = tree.span(tmplNode.valid() ? tmplNode : node);
+            d.actual   = "inline asm with a non-empty template is not yet supported "
+                         "(only the empty-template optimizer barrier "
+                         "`__asm__ volatile(\"\")` is implemented); real asm text is a "
+                         "per-target deferral (D-CSUBSET-INLINE-ASM-TEXT)";
             s.reporter.report(std::move(d));
         }
     }

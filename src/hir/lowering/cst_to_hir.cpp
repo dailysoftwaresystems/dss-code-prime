@@ -4585,6 +4585,12 @@ struct Lowerer {
             if (k == "ReturnStmt")  { stmtResult = lowerReturn(n); return; }
             if (k == "BreakStmt")    { stmtResult = track(builder.makeBreak(0), n); return; }
             if (k == "ContinueStmt") { stmtResult = track(builder.makeContinue(0), n); return; }
+            // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template `__asm__ [volatile]
+            // ("")` statement lowers to a 0-child InlineAsm leaf (no payload). The
+            // template gate lives in the semantic tier (semantics.inlineAsmRule →
+            // S_InlineAsmNonEmptyTemplate rejects a non-empty template before codegen),
+            // so this arm need not re-decode — it emits the barrier UNCONDITIONALLY.
+            if (k == "InlineAsm")    { stmtResult = track(builder.addLeaf(HirKind::InlineAsm), n); return; }
             // Switch is a DEEP form: its arm-grouping re-enters the driver for each
             // arm body (`lowerStmt(body)`), so a switch nested in a switch-arm body
             // would recurse on the host stack. Flatten it through a Switch frame —

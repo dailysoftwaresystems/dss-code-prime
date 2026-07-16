@@ -1683,6 +1683,15 @@ struct DSS_EXPORT SemanticConfig {
     // hirLowering row maps to Skip). Invalid ⇒ the language has no static-assertion
     // surface (toy/tsql — the check never runs).
     RuleId        staticAssertRule{}; std::string staticAssertRuleName;
+    // FC17.9(i) (D-CSUBSET-INLINE-ASM, C23 6.8 / GNU 6.47): the `__asm__` inline-asm
+    // STATEMENT rule (asmStmt). Pass 2 decodes the template child (the SAME
+    // decodeAdjacentStringBodies chokepoint staticAssert's message uses) and REQUIRES
+    // a strictly-empty decoded string; a non-empty / whitespace-only / malformed-escape
+    // template fails loud S_InlineAsmNonEmptyTemplate (real per-target asm text is the
+    // D-CSUBSET-INLINE-ASM-TEXT deferral). The empty form lowers to a MirOpcode::
+    // CompilerBarrier fence (hirLowering asmStmt → InlineAsm). Invalid ⇒ the language
+    // has no inline-asm surface (toy/tsql — the check never runs).
+    RuleId        inlineAsmRule{}; std::string inlineAsmRuleName;
     // FC16 C11/C23 6.5.1.1 (D-CSUBSET-GENERIC-SELECTION): `_Generic` generic
     // selection. `genericRule` = the `genericExpr` shape; `genericControlChild` =
     // the visible-child index of the controlling `assignmentExpr`. When Pass 2

@@ -152,6 +152,33 @@ TEST(MirOpcode, AtomicLoadStoreAreOrderedSideEffectingBarriers) {
     EXPECT_FALSE(isCommutative(MirOpcode::AtomicStore));
 }
 
+// FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template `__asm__ volatile("")`
+// statement lowers to MirOpcode::CompilerBarrier (the c113 _ReadWriteBarrier op).
+// The WHOLE feature's correctness rests on this op's table membership: hasSideEffects
+// (DCE keeps it live though it has no result/consumers; CSE/LICM never move it) +
+// opcodeClobbersMemory (the Load-motion clobber walk fences plain Load/Store across
+// it). Those facts were pinned only BEHAVIORALLY (test_cse LoadNotCsedAcross-
+// CompilerBarrier, test_mir_alias RegionWalkTreatsMemoryClobberOpsAsClobber); this is
+// the direct property-table twin the atomic analog above already has. RED-ON-DISABLE:
+// flip hasSideEffects to false OR drop CompilerBarrier from opcodeClobbersMemory
+// (mir_opcode.hpp) and the corresponding EXPECT fails.
+TEST(MirOpcode, CompilerBarrierIsSideEffectingMemoryClobber) {
+    // 0 operands, NO result (R::None), mnemonic "compiler_barrier". Lowers to ZERO
+    // LIR instructions (mir_to_lir CompilerBarrier → return) — a pure fence.
+    EXPECT_EQ(opcodeInfo(MirOpcode::CompilerBarrier).minOperands, 0);
+    EXPECT_EQ(opcodeInfo(MirOpcode::CompilerBarrier).maxOperands, 0);
+    EXPECT_EQ(resultRule(MirOpcode::CompilerBarrier), MirResultRule::None);
+    EXPECT_EQ(mnemonic(MirOpcode::CompilerBarrier), "compiler_barrier");
+    // hasSideEffects — the DCE-liveness / CSE-exclusion / LICM-exclusion axis.
+    EXPECT_TRUE(opcodeInfo(MirOpcode::CompilerBarrier).hasSideEffects);
+    // opcodeClobbersMemory — the Load-motion fence axis (a full-memory barrier).
+    EXPECT_TRUE(opcodeClobbersMemory(MirOpcode::CompilerBarrier));
+    // Neither a terminator, phi, nor a commutative op.
+    EXPECT_FALSE(isTerminator(MirOpcode::CompilerBarrier));
+    EXPECT_FALSE(isPhi(MirOpcode::CompilerBarrier));
+    EXPECT_FALSE(isCommutative(MirOpcode::CompilerBarrier));
+}
+
 TEST(MirOpcode, InvalidSentinelHasImpossibleArity) {
     // The slot-0 sentinel's impossible {min=1, max=0} arity surfaces any
     // accidental use loudly (no real opcode can satisfy min > max).

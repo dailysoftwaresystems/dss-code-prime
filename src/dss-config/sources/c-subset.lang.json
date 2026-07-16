@@ -398,7 +398,9 @@
     { "word": "__try",     "kind": "TryKeyword"     },
     { "word": "__except",  "kind": "ExceptKeyword"  },
     { "word": "__finally", "kind": "FinallyKeyword" },
-    { "word": "__leave",   "kind": "LeaveKeyword"   }
+    { "word": "__leave",   "kind": "LeaveKeyword"   },
+
+    { "word": "__asm__",   "kind": "AsmKeyword"     }
   ],
 
   "shapes": {
@@ -978,6 +980,7 @@
         "caseStmt",
         "sehTryStmt",
         "sehLeaveStmt",
+        "asmStmt",
         "emptyStmt",
         "declOrExprStmt"
       ]
@@ -1294,6 +1297,15 @@
         "ParenOpen", "assignmentExpr",
         { "optional": { "sequence": [ "Comma", "stringLiteralExpr" ] } },
         "ParenClose", "EndStatement"
+      ]
+    },
+
+    "asmStmt": {
+      "$comment": "FC17.9(i) D-CSUBSET-INLINE-ASM: the GNU inline-asm STATEMENT, cycle-1 = the empty-template optimizer barrier. `__asm__ [volatile] ( <string-literal-template> ) ;` — a structural CLONE of staticAssertDecl (keyword-led, consumes `(` a payload `)` `;`). FIRST = AsmKeyword, DISJOINT from every other statement alt → unique-production DIRECT DESCENT, NON-speculative (the sehTryStmt/TryKeyword precedent). The template is captured as stringLiteralExpr (adjacent-concat + prefixes); the semantic tier (semantics.inlineAsmRule) decodes it and REQUIRES a strictly-empty decoded string, else S_InlineAsmNonEmptyTemplate (D-CSUBSET-INLINE-ASM-TEXT) — a non-empty template carries real per-target instructions we cannot yet emit, so silently lowering it to a no-op barrier would be a miscompile. The optional `volatile` (already VolatileKeyword) is accepted but SEMANTICALLY INERT in cycle-1 (a no-output asm is implicitly volatile — GCC 6.47.2.1 — so the empty form is always a barrier). Operand/clobber lists (`: out : in : clobbers`) are NOT admitted here (the rule ends at `)`) → they fail loud at parse (P_UnexpectedToken on the `:`), the named deferral D-CSUBSET-INLINE-ASM-OPERANDS; `asm goto` (D-CSUBSET-INLINE-ASM-GOTO) and the bare `asm`/`__volatile__` spellings (D-CSUBSET-INLINE-ASM-SPELLING) are likewise deferred (the grammar admits only `__asm__`). The hirLowering row (asmStmt → InlineAsm) lowers it to MirOpcode::CompilerBarrier (the _ReadWriteBarrier op — zero target instructions, full-memory fence).",
+      "sequence": [
+        "AsmKeyword",
+        { "optional": "VolatileKeyword" },
+        "ParenOpen", "stringLiteralExpr", "ParenClose", "EndStatement"
       ]
     },
 
@@ -1658,6 +1670,8 @@
     },
     "$staticAssertComment": "C11/C23 6.7.10: the `_Static_assert`/`static_assert` DECLARATION rule. Pass 2 const-evaluates the condition child (visible-child 1 — the assignmentExpr after the keyword+'(') through the SAME evaluator that folds sizeof(T)/enum/arithmetic in an array dimension; ZERO ⇒ S_StaticAssertFailed (message = the OPTIONAL trailing string-literal child), NONZERO ⇒ nothing. The construct lowers to nothing (hirLowering staticAssertDecl → Skip).",
     "staticAssertRule": "staticAssertDecl",
+    "$inlineAsmComment": "FC17.9(i) (D-CSUBSET-INLINE-ASM, C23 6.8 / GNU 6.47): the `__asm__` inline-asm STATEMENT rule (asmStmt). Pass 2 (pass2Post) decodes the template child (the stringLiteralExpr, via the SAME decodeAdjacentStringBodies chokepoint staticAssert's message uses) and REQUIRES a strictly-empty decoded string; a non-empty / whitespace-only / malformed-escape template fails loud S_InlineAsmNonEmptyTemplate (real per-target asm text is the D-CSUBSET-INLINE-ASM-TEXT deferral). The empty form lowers to nothing but a MirOpcode::CompilerBarrier fence (hirLowering asmStmt → InlineAsm → CompilerBarrier). Invalid ⇒ the language has no inline-asm surface (toy/tsql — the check never runs).",
+    "inlineAsmRule": "asmStmt",
     "$genericComment": "FC16 (D-CSUBSET-GENERIC-SELECTION): C11/C23 6.5.1.1 generic selection. `rule` = the genericExpr shape; `controlChild` = the visible-child index of the controlling `assignmentExpr` (child 2 — after the GenericKeyword + '('). `assocRule`/`typedAssocRule`/`defaultAssocRule` name the association shapes so Pass 2 discriminates each `_Generic` child: a genericTypedAssoc's FIRST child is a castTypeRef (resolved+stamped through the SAME type resolver casts/sizeof/va_arg use — a VALUE in type position fails loud S_UnknownType) and its LAST is the result expression; a genericDefaultAssoc is the `default:` fallback (no type). Pass 2 lvalue-converts the controlling type (strips top-level volatile, the isAssignable precedent), matches it against each typed assoc's resolved type for COMPATIBILITY (interned TypeId equality via sameType), enforces EXACTLY ONE typed match (S_GenericSelectionAmbiguous on >1) OR the default (S_GenericSelectionNoMatch on none-and-no-default), stamps the genericExpr node with the winner's RESULT type, and records the winning association's result-expression node (nodeToSelectedExpr side-table). The dedicated HIR lowering (hirLowering.genericRule) lowers ONLY that recorded sub-expression.",
     "generic": {
       "rule": "genericExpr",
@@ -1894,6 +1908,8 @@
       { "rule": "caseStmt",     "hirKind": "CaseStmt"    },
       { "rule": "sehTryStmt",   "hirKind": "SehTryExcept" },
       { "rule": "sehLeaveStmt", "hirKind": "SehLeave"    },
+      { "rule": "asmStmt",      "hirKind": "InlineAsm",
+        "$comment": "FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template `__asm__ [volatile] (\"\")` lowers to a core InlineAsm leaf → MirOpcode::CompilerBarrier (HIR→MIR). UNCONDITIONAL: the empty-vs-non-empty gate lives in the semantic tier (semantics.inlineAsmRule → S_InlineAsmNonEmptyTemplate), which aborts before codegen on a non-empty template, so a rejected asm's MIR is never emitted — clean separation, mirroring staticAssertDecl (semantic gates the condition; the lowering row is unconditional)." },
       { "rule": "emptyStmt",    "hirKind": "Skip"        },
       { "rule": "attributeDeclaration", "hirKind": "Skip",
         "$comment": "FC17 (D-CSUBSET-ATTRIBUTE-STATEMENT): a bare attribute-declaration statement (`[[fallthrough]];`) lowers to NOTHING — the emptyStmt Skip precedent, zero C++. The enclosing `declOrAttrStmt` wrapper is deliberately UNMAPPED: the unmapped-statement soleMeaningfulChild PassThrough peels it (for BOTH branches — a varDecl statement reaches its VarDecl row through the same peel)." },

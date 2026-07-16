@@ -750,6 +750,11 @@ private:
             case HirKind::IndirectGotoStmt:
                 out_ += "goto"; out_ += flagsStr(f); out_ += " *";
                 emitExpr(hir_.indirectGotoTarget(id)); out_ += '\n'; return;
+            case HirKind::InlineAsm:
+                // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template asm barrier —
+                // a 0-child leaf (no payload in cycle-1). Round-trips as a bare
+                // `inline_asm` keyword line.
+                out_ += "inline_asm"; out_ += flagsStr(f); out_ += '\n'; return;
             case HirKind::Error: case HirKind::Extension:
                 emitExtOrError(id, /*inlineForm=*/false, ind); out_ += '\n'; return;
             default:
@@ -1817,6 +1822,9 @@ private:
             return builder_.makeBreak(d, flags); }
         if (kw == "continue") { std::uint32_t d = peekIs(Tk::Int) ? static_cast<std::uint32_t>(takeInt()) : 0u;
             return builder_.makeContinue(d, flags); }
+        // FC17.9(i) (D-CSUBSET-INLINE-ASM): the empty-template asm barrier — a bare
+        // `inline_asm` leaf (mirrors the writer arm; no payload in cycle-1).
+        if (kw == "inline_asm") return builder_.addLeaf(HirKind::InlineAsm, InvalidType, 0, flags);
         if (kw == "return") {
             // A return value may carry inline attributes (`return @loc(...) expr`).
             // A value-less `return` is always block-terminal (nothing may follow
