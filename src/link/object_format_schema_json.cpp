@@ -1551,6 +1551,22 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                         im.at("dylinkerPath").get<std::string>();
                 }
             }
+            // D-LK3-3 (c153) — the MH_DYLIB LC_ID_DYLIB install name.
+            // Optional at parse; validate() requires it non-empty on a
+            // Dylib schema and rejects it on every other filetype.
+            if (im.contains("installName")) {
+                if (!im.at("installName").is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/image/installName",
+                              "'installName' must be a string (the "
+                              "LC_ID_DYLIB name a client links "
+                              "against, e.g. '@rpath/libdss.dylib' -- "
+                              "MH_DYLIB only)");
+                } else {
+                    data.machoImage.installName =
+                        im.at("installName").get<std::string>();
+                }
+            }
             if (im.contains("loadDylibs")) {
                 if (!im.at("loadDylibs").is_array()) {
                     coll.emit(DiagnosticCode::C_MalformedJson,

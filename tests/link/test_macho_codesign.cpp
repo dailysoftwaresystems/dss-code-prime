@@ -253,7 +253,8 @@ TEST(MachOAdHocCodeSign, SizeFunctionMatchesBuiltBlobLength) {
         std::vector<std::uint8_t> buf(codeLimit, std::uint8_t{0xAB});
         auto const blob = dss::macho::detail::buildAdHocCodeSignature(
             std::span<std::uint8_t const>{buf}, codeLimit, pageSize, id,
-            /*execSegLimit=*/0x4000);
+            /*execSegLimit=*/0x4000,
+            dss::macho::detail::kCsExecSegFlagsMainBinary);
         std::uint32_t const sz =
             dss::macho::detail::adHocCodeSignatureSize(codeLimit, pageSize, id);
         EXPECT_EQ(blob.size(), sz)

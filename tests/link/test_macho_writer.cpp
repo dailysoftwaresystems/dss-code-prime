@@ -1727,9 +1727,14 @@ TEST(MachOExecFormatJsonValidate, ExecMissingLoadDylibsRejected) {
 
 // ── New tests folded from 7-agent review of LK3 cycle 2 ────────
 
-TEST(MachOExecFormatJsonValidate, DylibFiletypeRejected) {
-    // Anchored D-LK3-3: MH_DYLIB declared on closed enum but
-    // rejected by validate() until LK6 dynamic linking lands.
+TEST(MachOExecFormatJsonValidate, DylibWithoutDylibImageShapeRejected) {
+    // c153 (D-LK3-3): MH_DYLIB is a SUPPORTED filetype now, but a
+    // dylib schema missing its image identity (installName, a
+    // loadDylibs entry, text VA == segmentPageSize) is still
+    // rejected by the dylib shape rules — the bare-minimum JSON that
+    // pre-c153 rejected on the filetype itself keeps failing, for
+    // the precise per-field reasons. (The ACCEPTED full dylib shape
+    // is pinned in test_macho_dylib_writer.cpp.)
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
@@ -1738,6 +1743,14 @@ TEST(MachOExecFormatJsonValidate, DylibFiletypeRejected) {
       "sections":[{"kind":"text","name":"__text","segment":"__TEXT","type":0,"flags":0,"addrAlign":16,"entrySize":0,"virtualAddress":0}]
     })");
     ASSERT_FALSE(r.has_value());
+    bool sawInstallName = false;
+    for (auto const& d : r.error()) {
+        if (d.message.find("installName") != std::string::npos) {
+            sawInstallName = true;
+        }
+    }
+    EXPECT_TRUE(sawInstallName)
+        << "expected the dylib installName requirement to fire";
 }
 
 TEST(MachOExecFormatJsonValidate, SectionVaBelowPageZeroRejected) {

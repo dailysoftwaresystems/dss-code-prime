@@ -29,6 +29,17 @@ dss_add_test(NAME link/test_elf_dyn_writer       SOURCES test_elf_dyn_writer.cpp
 # rules (no entry cluster / characteristics bits).
 dss_add_test(NAME link/test_pe_dll_writer        SOURCES test_pe_dll_writer.cpp)
 
+# c153 (D-LK3-3) — Mach-O MH_DYLIB (.dylib) writer: filetype/flags/
+# LC_ID_DYLIB header pins (no LC_MAIN / LC_LOAD_DYLINKER /
+# __PAGEZERO), the LC_DYLD_INFO export trie WALKED with dyld's own
+# algorithm (fn + data exports, strict-prefix radix pair, Local
+# omitted), internal fn-ptr slot REBASE completeness, the
+# extern-addr data-slot symbol-based BIND
+# (D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR Mach-O half — data + function
+# extern flavors), dylib codesign execSegFlags=0, weak-export /
+# entry-override belts, and the dylib validate() shape rules.
+dss_add_test(NAME link/test_macho_dylib_writer   SOURCES test_macho_dylib_writer.cpp)
+
 # D-LK6-1 closure — ARM64 bit-shift relocation-formula variants.
 dss_add_test(NAME link/test_aarch64_reloc_formulas SOURCES test_aarch64_reloc_formulas.cpp)
 

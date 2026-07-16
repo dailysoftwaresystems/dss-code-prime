@@ -1,0 +1,133 @@
+{
+  "$comment": "Mach-O DYNAMIC LIBRARY (MH_DYLIB, .dylib) for ARM64 Darwin/macOS (Apple Silicon) -- c153, the D-LK3-3 anchor (plan 14 / roadmap A3): the Mach-O mirror of the c150 ELF .so + c152 PE .dll. Consumed by `src/link/format/macho.cpp` via the format-blind linker engine: `macho.filetype = dylib` routes UNCONDITIONALLY through the SAME `encodeExecDynamic` substrate the exec image uses (even with zero externs -- the export trie needs the dynamic arm), with the dylib divergences: mach_header filetype MH_DYLIB (6) + no MH_PIE, NO __PAGEZERO (base-0 image dyld slides at load -- `image.pageZeroSize` = 0 and __TEXT.vmaddr = 0), NO LC_LOAD_DYLINKER (mapped by the already-running dyld), NO LC_MAIN (a dylib has no process entry; validate() rejects the entry cluster here exactly as the ELF dyn + PE dll schemas do), an LC_ID_DYLIB carrying `image.installName`, the EXPORT TRIE in LC_DYLD_INFO_ONLY.export_off (every externally-visible defined function + data global, real prefix-compressed radix nodes dlsym walks), real-named nlist entries for externally-visible functions, internal absolute data slots (fn-ptr tables / &global initializers / relro rows) REBASE-opcoded so dyld adds the load slide (the ELF R_X86_64_RELATIVE mirror), extern-targeted data slots emitted as SYMBOL-BASED dyld BIND opcodes with the slot zeroed (D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR Mach-O half -- the ELF c150 symbol-based-Rela mirror; never the baked got-slot/stub address), and an ad-hoc code signature with execSegFlags = 0 (NOT CS_EXECSEG_MAIN_BINARY -- codesign ground truth for a non-main image; Apple Silicon refuses to dlopen unsigned native code, so DSS self-signs). The macOS loader consumes the output: `dlopen(\"./libdss.dylib\") + dlsym(\"dss_add\")` on Apple Silicon. Differs from macho64-arm64-darwin-exec.format.json in: `macho.filetype` (dylib vs execute), `macho.flags` 0x100085 = MH_NOUNDEFS|MH_DYLDLINK|MH_TWOLEVEL|MH_NO_REEXPORTED_DYLIBS (the ld64 dylib convention -- NO MH_PIE, an executable-only flag; NO_REEXPORTED_DYLIBS is safe: DSS emits no LC_REEXPORT_DYLIB), `image.pageZeroSize` 0, NO `image.dylinkerPath`, NEW `image.installName`, text `virtualAddress` = segmentPageSize (base-0 image by construction -- validate() pins the equality, the ELF dyn text-VA==pageAlign mirror), NO `entryPoint`/`processExit`/`entryCallingConvention`/`processArgs`, NO `tlsAccess` and NO tdata/tbss rows (thread-locals in a dlopen'd dylib are an UNVERIFIED form on this no-Mac host even though Mach-O TLV descriptors are per-image -- D-LK3-DYLIB-TLS-MODEL; every thread_local fails loud at the linker's supportedDataSections gate by this set's absence, mirroring D-LK-DYN-TLS-MODEL / D-LK-DLL-TLS-MODEL), NO `librarySynthesis` (the pthread <threads.h> shim inside a dylib is an untested form -- the c152 dll precedent), and `artifactProfiles` [\"lib\"].",
+
+  "dssObjectFormatVersion": 1,
+
+  "format": {
+    "name": "macho64-arm64-darwin-dylib",
+    "version": "1.0",
+    "kind": "macho"
+  },
+
+  "$dataModelComment": "Same LP64 identity as the exec sibling (64-bit Darwin).",
+  "dataModel": "LP64",
+
+  "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: Apple arm64 == generic AAPCS64 == gnu_packed, same as the exec sibling.",
+  "bitFieldStrategy": "gnu_packed",
+
+  "$externCallDispatchComment": "Same call-site shape as the exec image: the walker synthesizes a __stubs entry per extern FUNCTION (ADRP+LDR+BR x16 through the __got slot, dyld-bound eagerly) and the call site is a plain direct BL to the stub -- pc-relative, so the code needs no fixup under the dylib load slide. D-FFI-EXTERN-CALL-DISPATCH.",
+  "externCallDispatch": "direct-plt",
+
+  "$dataImportBindingComment": "c153 (D-LK3-3 + D-LK-EXTERN-DATA-IMPORT): extern library DATA objects bind via Mach-O __got non-lazy pointers exactly as on the exec image (the import machinery is dyld's, not the artifact flavor's -- the c152 PE precedent): the walker reserves a __got slot per imported object, the bind stream names the symbol + owning dylib ordinal, dyld writes the object's address at load, and the c117 GotIndirect lowering (lea-of-slot + deref) reads it.",
+  "dataImportBinding": "got-indirect",
+
+  "$supportedDataSectionsComment": "rodata (read-only __TEXT,__const -- reloc-FREE items only: a reloc-bearing const item routes to relro at the producer, and a hand-built reloc-bearing rodata item fails loud at the walker's __const rebase guard), data (mutable initialized globals, __DATA,__data), bss (zero-init, __DATA,__bss S_ZEROFILL), relro (reloc-bearing CONST data, c145 -- merged into __data by the image arm so its rebase/bind slots land in dyld-writable pages, the same fold the exec makes). NO tdata/tbss: thread-locals in a dlopen'd dylib are an unverified form (D-LK3-DYLIB-TLS-MODEL); the linker's pre-walker gate rejects them loudly by this set's absence.",
+  "supportedDataSections": ["rodata", "data", "bss", "relro"],
+
+  "$artifactProfilesComment": "This format SERVES the shared-library profile (plan 06 AP3), mirroring elf64-x86_64-linux-dyn + pe64-x86_64-windows-dll. The cli profile is NOT served (a .dylib is not a runnable console binary).",
+  "artifactProfiles": ["lib"],
+
+  "macho": {
+    "$comment": "mach_header_64 identity. cputype = CPU_TYPE_ARM64 = (12 | CPU_ARCH_ABI64 0x01000000) = 0x0100000C = 16777228; cpusubtype = CPU_SUBTYPE_ARM64_ALL (0) -- same silicon as the exec sibling. filetype = 'dylib' (MH_DYLIB = 6). flags = MH_NOUNDEFS (0x1) | MH_DYLDLINK (0x4) | MH_TWOLEVEL (0x80) | MH_NO_REEXPORTED_DYLIBS (0x100000) = 0x100085 = 1048709 -- the ld64 dylib convention: NOUNDEFS because every undefined is bind-resolved, TWOLEVEL is the modern namespace (each bind names a specific dylib ordinal), NO_REEXPORTED_DYLIBS tells dyld it need not chase re-exports (DSS emits no LC_REEXPORT_DYLIB). MH_PIE is deliberately ABSENT -- it is an executable-only flag (a dylib is inherently position-independent; dyld slides its base-0 image unconditionally).",
+    "cputype": 16777228,
+    "cpusubtype": 0,
+    "filetype": "dylib",
+    "flags": 1048709
+  },
+
+  "image": {
+    "$comment": "Mach-O image fields for MH_DYLIB. pageZeroSize = 0 -- a dylib carries NO __PAGEZERO (validate() enforces; ld64 likewise rejects -pagezero_size on non-main links): __TEXT.vmaddr = 0 and dyld slides the whole base-0 image to its load address. segmentPageSize = 16384 (0x4000) -- Apple Silicon requires 16 KiB-aligned segments, same as the exec. NO dylinkerPath (LC_LOAD_DYLINKER is a main-executable load command). installName = the LC_ID_DYLIB identity a CLIENT records at link time ('@rpath/...' is the modern convention); plain dlopen-by-path ignores it. Like `codeSignature.identifier` below, a shipped-schema default identity is a deliberate concession -- a differently-named artifact overrides via its own format JSON (the walker NEVER derives it from the output file name; c150 DT_SONAME discipline). loadDylibs = [libSystem] -- the home of any libc import this dylib's code makes (every ld64-produced dylib depends on libSystem; harmless when unused since libSystem is loaded in every macOS process anyway). bindNow = true (eager binding, the v1 stance). buildVersion macos 11.0 -- dyld wants a platform load command on modern macOS for libraries too (ld64 always emits one). codeSignature = ad-hoc SHA-256: Apple Silicon REQUIRES all native code signed -- dlopen of an unsigned arm64 dylib fails with a code-signature error, so DSS self-signs exactly as the exec does; the walker sets CodeDirectory execSegFlags = 0 for this flavor (NOT CS_EXECSEG_MAIN_BINARY -- `codesign -s -` ground truth for a non-main image). codeSignature.identifier is the CodeDirectory identity (kernel keys the signature on it; generic shipped default, same concession as installName).",
+    "pageZeroSize": 0,
+    "segmentPageSize": 16384,
+    "installName": "@rpath/libdss.dylib",
+    "loadDylibs": [
+      "/usr/lib/libSystem.B.dylib"
+    ],
+    "bindNow": true,
+    "buildVersion": {
+      "platform": "macos",
+      "minOs": "11.0",
+      "sdk": "11.0"
+    },
+    "codeSignature": {
+      "kind": "adhoc",
+      "hashAlgorithm": "sha256",
+      "pageSize": 4096,
+      "identifier": "com.dss.dylib"
+    }
+  },
+
+  "sections": [
+    {
+      "$comment": "__text within __TEXT. virtualAddress = 0x4000 = image.segmentPageSize -- the base-0 dylib layout: page 0 holds the mach header + load commands, __text opens page 1 (textFileOff = alignUp(headerAndCmds, segmentPageSize) = 0x4000 while the load commands stay under one page -- the walker's congruence guard fails loud if they ever grow past it), and validate() PINS virtualAddress == segmentPageSize (the ELF dyn text-VA==pageAlign mirror; dyld slides everything by the load base). flags (substrate `type`) = S_REGULAR | S_ATTR_PURE_INSTRUCTIONS (0x80000000) | S_ATTR_SOME_INSTRUCTIONS (0x400) = 0x80000400, same as the exec sibling.",
+      "kind": "text",
+      "name": "__text",
+      "segment": "__TEXT",
+      "type": 2147484672,
+      "flags": 0,
+      "addrAlign": 16,
+      "entrySize": 0,
+      "virtualAddress": 16384
+    },
+    {
+      "$comment": "__const within __TEXT -- read-only data globals (reloc-free; the exec sibling's row verbatim). virtualAddress = 0 -- walker-computed (H1-aligned after __stubs). addrAlign = 8 is the schema FLOOR; the walker raises it to the strictest item's alignment.",
+      "kind": "rodata",
+      "name": "__const",
+      "segment": "__TEXT",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "__data within __DATA -- writable initialized globals (D-LK4-DATA-PRODUCER); relro rows fold in here with their dyld rebase/bind sites (c145 + c153). virtualAddress = 0 -- walker-computed.",
+      "kind": "data",
+      "name": "__data",
+      "segment": "__DATA",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "__bss within __DATA -- zero-init globals. `type` (section_64.flags) = S_ZEROFILL (1): VM extent, no file bytes, LAST section in __DATA. virtualAddress = 0 -- walker-computed.",
+      "kind": "bss",
+      "name": "__bss",
+      "segment": "__DATA",
+      "type": 1,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    }
+  ],
+
+  "relocations": [
+    {
+      "$comment": "ARM64 Mach-O relocation kinds -- the exec sibling's table verbatim (`kind` MUST match arm64.target.json's rows; nativeId is descriptive on image flavors, which apply relocs in place). ARM64_RELOC_BRANCH26 = 2, length 2, pcrel 1 -> 0x25000000.",
+      "name": "ARM64_RELOC_BRANCH26",
+      "kind": 1,
+      "nativeId": 620756992
+    },
+    {
+      "$comment": "ARM64_RELOC_PAGE21 = 3, length 2, pcrel 1 -> 0x35000000.",
+      "name": "ARM64_RELOC_PAGE21",
+      "kind": 2,
+      "nativeId": 889192448
+    },
+    {
+      "$comment": "ARM64_RELOC_PAGEOFF12 = 4, length 2, pcrel 0 -> 0x44000000.",
+      "name": "ARM64_RELOC_PAGEOFF12",
+      "kind": 3,
+      "nativeId": 1140850688
+    },
+    {
+      "$comment": "ARM64_RELOC_UNSIGNED = 0, length 3 (8 bytes), pcrel 0 -> 0x06000000. abs64 -- legal in DATA items only on this arm: an internal target gets a REBASE opcode (dyld adds the slide); an extern target gets a symbol-based BIND opcode with the slot zeroed (D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR).",
+      "name": "ARM64_RELOC_UNSIGNED",
+      "kind": 4,
+      "nativeId": 100663296
+    }
+  ]
+}

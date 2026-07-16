@@ -762,21 +762,11 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                  "value, e.g. 0x01000007 for x86_64, 0x0100000C for "
                  "arm64)");
         }
-        // LK3 cycle 1 + cycle 2 walker arms support MH_OBJECT (1)
-        // and MH_EXECUTE (2). MH_DYLIB (6) is declared on the closed
-        // enum but rejected at validate() until D-LK3-3 closes
-        // (paired with LK6 dynamic linking, same shape as ELF
-        // ET_DYN's D-LK1-4 anchor).
-        if (macho.filetype != MachOObjectType::Object
-         && macho.filetype != MachOObjectType::Execute) {
-            fail("/macho/filetype",
-                 std::format("Mach-O 'macho.filetype' = '{}' not yet "
-                             "supported by the walker; cycles 1+2 ship "
-                             "MH_OBJECT and MH_EXECUTE. MH_DYLIB is "
-                             "anchored at plan 14 §3.1 D-LK3-3 paired "
-                             "with LK6 dynamic linking.",
-                             std::string{machoObjectTypeName(macho.filetype)}));
-        }
+        // All three MachOObjectType members have walker arms: MH_OBJECT
+        // (LK3 cycle 1), MH_EXECUTE (LK3 cycle 2), MH_DYLIB (c153,
+        // D-LK3-3 — the Mach-O mirror of ELF ET_DYN c150 + PE Dll
+        // c152). The closed enum + the loader's fromName check already
+        // reject any other value; nothing to gate here since c153.
         for (std::size_t i = 0; i < sections.size(); ++i) {
             auto const& s = sections[i];
             if (s.segment.empty()) {
@@ -885,6 +875,7 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                 || mi.segmentPageSize != kDefaultMachoSegmentPageSize
                 || !mi.dylinkerPath.empty()
                 || !mi.loadDylibs.empty()
+                || !mi.installName.empty()
                 || !mi.bindNow
                 || mi.codeSignatureSize != 0
                 || mi.codeSignature.has_value()
@@ -893,13 +884,19 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                 fail("/image",
                      "Mach-O MH_OBJECT format must NOT declare an "
                      "'image' block — pageZeroSize / segmentPageSize / "
-                     "dylinkerPath / loadDylibs / bindNow / "
+                     "dylinkerPath / loadDylibs / installName / bindNow / "
                      "codeSignatureSize / codeSignature live only in "
                      "MH_EXECUTE / MH_DYLIB images. Set macho.filetype = 2 "
                      "(MH_EXECUTE) if this schema describes an executable.");
             }
-        } else if (macho.filetype == MachOObjectType::Execute) {
-            if (mi.pageZeroSize == 0) {
+        } else {
+            // Image flavors: MH_EXECUTE and MH_DYLIB (c153, D-LK3-3).
+            // Shared rules first, then the per-flavor divergences —
+            // keyed on the declared filetype (closed-enum schema data,
+            // never a format-name string).
+            bool const isDylibImage =
+                macho.filetype == MachOObjectType::Dylib;
+            if (!isDylibImage && mi.pageZeroSize == 0) {
                 fail("/image/pageZeroSize",
                      "Mach-O MH_EXECUTE image requires non-zero "
                      "'image.pageZeroSize' (__PAGEZERO segment vmsize "
@@ -907,18 +904,78 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                      "darwin; catches null-pointer derefs at the "
                      "kernel level).");
             }
-            if (mi.dylinkerPath.empty()) {
+            // D-LK3-3: a dylib carries NO __PAGEZERO — it is mapped at
+            // a dyld-chosen slid base (link-time base 0), and a 4 GiB
+            // zero-page segment inside a library would reserve address
+            // space at every dlopen; ld64 likewise rejects
+            // -pagezero_size on non-main links. The walker keys the
+            // __PAGEZERO emission (and __TEXT.vmaddr = pageZeroSize)
+            // on this field, so a non-zero value here would emit a
+            // loader-rejected dylib.
+            if (isDylibImage && mi.pageZeroSize != 0) {
+                fail("/image/pageZeroSize",
+                     std::format("Mach-O MH_DYLIB must declare "
+                                 "'image.pageZeroSize' = 0 (got 0x{:x}) "
+                                 "-- a dylib carries no __PAGEZERO; its "
+                                 "__TEXT.vmaddr is the base-0 link-time "
+                                 "address dyld slides at load "
+                                 "(D-LK3-3).",
+                                 mi.pageZeroSize));
+            }
+            if (!isDylibImage && mi.dylinkerPath.empty()) {
                 fail("/image/dylinkerPath",
                      "Mach-O MH_EXECUTE image requires non-empty "
                      "'image.dylinkerPath' (LC_LOAD_DYLINKER — "
                      "typical '/usr/lib/dyld' on macOS).");
             }
+            // D-LK3-3: LC_LOAD_DYLINKER names the loader the KERNEL
+            // execs for a MAIN executable; a dylib is mapped by the
+            // already-running dyld and must not carry one (ld64 emits
+            // none for -dylib output).
+            if (isDylibImage && !mi.dylinkerPath.empty()) {
+                fail("/image/dylinkerPath",
+                     std::format("Mach-O MH_DYLIB must not declare "
+                                 "'image.dylinkerPath' (got '{}') -- a "
+                                 "dylib is mapped by the already-running "
+                                 "dyld; LC_LOAD_DYLINKER is a "
+                                 "main-executable load command "
+                                 "(D-LK3-3).",
+                                 mi.dylinkerPath));
+            }
             if (mi.loadDylibs.empty()) {
                 fail("/image/loadDylibs",
-                     "Mach-O MH_EXECUTE image requires at least one "
-                     "'image.loadDylibs' entry (typical "
-                     "'/usr/lib/libSystem.B.dylib' — libc / process "
-                     "start function provider).");
+                     std::format("Mach-O {} image requires at least one "
+                                 "'image.loadDylibs' entry (typical "
+                                 "'/usr/lib/libSystem.B.dylib' -- libc / "
+                                 "process start function provider; every "
+                                 "real dylib ld64 produces depends on "
+                                 "libSystem too).",
+                                 std::string{machoObjectTypeName(
+                                     macho.filetype)}));
+            }
+            // D-LK3-3: the LC_ID_DYLIB install name — REQUIRED on a
+            // dylib (every ld64-produced MH_DYLIB carries one; clients
+            // record it at link time), dead config anywhere else. The
+            // walker never derives it from the output file name
+            // (config-driven + honest — the c150 DT_SONAME
+            // discipline), so an unset field must fail HERE, not
+            // silently emit an identity-less dylib.
+            if (isDylibImage && mi.installName.empty()) {
+                fail("/image/installName",
+                     "Mach-O MH_DYLIB requires non-empty "
+                     "'image.installName' (the LC_ID_DYLIB name a "
+                     "client links against, e.g. "
+                     "'@rpath/libdss.dylib'). The walker never derives "
+                     "it from the output file name (D-LK3-3).");
+            }
+            if (!isDylibImage && !mi.installName.empty()) {
+                fail("/image/installName",
+                     std::format("'image.installName' (got '{}') is "
+                                 "only legal on a Mach-O MH_DYLIB "
+                                 "schema -- LC_ID_DYLIB is the dylib's "
+                                 "identity; an executable carries none "
+                                 "(D-LK3-3).",
+                                 mi.installName));
             }
             // Mach-O mmap-congruence: vmaddr % page == fileoff %
             // page. __TEXT.fileoff = 0 by Apple convention, so
@@ -975,7 +1032,7 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                 if (s.kind != SectionKind::Text) continue;
                 if (s.virtualAddress < mi.pageZeroSize) {
                     fail("/sections/<text>/virtualAddress",
-                         std::format("Mach-O MH_EXECUTE: __text "
+                         std::format("Mach-O image: __text "
                                      "virtualAddress 0x{:x} is below "
                                      "__PAGEZERO end 0x{:x} (pageZeroSize) "
                                      "— __TEXT would overlap __PAGEZERO; "
@@ -994,7 +1051,7 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                     // misconfiguration here rather than ship a binary that
                     // fails to load. (D-LK10-ENTRY-MACHO-EXIT.)
                     fail("/sections/<text>/virtualAddress",
-                         std::format("Mach-O MH_EXECUTE: __text "
+                         std::format("Mach-O image: __text "
                                      "virtualAddress 0x{:x} is not aligned "
                                      "to segmentPageSize 0x{:x} relative to "
                                      "pageZeroSize 0x{:x} (offset 0x{:x} "
@@ -1025,6 +1082,100 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "blob whose layout requires 8-byte "
                                  "alignment).",
                                  mi.codeSignatureSize));
+            }
+            // ── Mach-O MH_DYLIB shape rules — c153, D-LK3-3 (the
+            // Mach-O mirror of the ELF ET_DYN `.so` block + the PE Dll
+            // block). A DSS `.dylib` ships entry-less — NO LC_MAIN, no
+            // trampoline — so the entry cluster is ILLEGAL here,
+            // exactly as on the `.so`/`.dll`. The generic exec-flavor
+            // gates at the bottom of validate() back these up; these
+            // carry the precise dylib-shaped message.
+            if (isDylibImage) {
+                bool sawText = false;
+                for (auto const& s : sections) {
+                    if (s.kind != SectionKind::Text) {
+                        continue;
+                    }
+                    sawText = true;
+                    // Base-0 image BY CONSTRUCTION (the ELF dyn
+                    // `virtualAddress == pageAlign` mirror): the walker
+                    // computes __TEXT.vmaddr = pageZeroSize = 0, and
+                    // textFileOff = alignUp(header+cmds, page) = one
+                    // page — so the schema VA must equal ONE
+                    // segmentPageSize (page 0 holds the mach header +
+                    // load commands; __text opens page 1; dyld slides
+                    // the whole base-0 image). The walker's
+                    // textSegmentVaMatchesFileOff chokepoint re-checks
+                    // the computed equality at emit time.
+                    if (s.virtualAddress != mi.segmentPageSize) {
+                        fail("/sections/<text>/virtualAddress",
+                             std::format(
+                                 "Mach-O MH_DYLIB: __text "
+                                 "virtualAddress 0x{:x} must equal "
+                                 "image.segmentPageSize 0x{:x} -- a "
+                                 "dylib is a base-0 image (no "
+                                 "__PAGEZERO; header page 0, __text "
+                                 "page 1) that dyld slides at load "
+                                 "(D-LK3-3).",
+                                 s.virtualAddress, mi.segmentPageSize));
+                    }
+                }
+                if (!sawText) {
+                    fail("/sections",
+                         "Mach-O MH_DYLIB format requires a Text "
+                         "section row (SectionKind::Text) -- a dynamic "
+                         "library without code has nothing to export. "
+                         "D-LK3-3.");
+                }
+                if (processExit.has_value()
+                 || !entryCallingConvention.empty()
+                 || processArgs.has_value()) {
+                    fail("/macho",
+                         std::format(
+                             "Mach-O MH_DYLIB format declares "
+                             "entry-cluster machinery -- processExit: "
+                             "{}, entryCallingConvention: {}, "
+                             "processArgs: {}. A DSS .dylib has NO "
+                             "LC_MAIN (a dylib has no process entry; "
+                             "dyld runs no entry code for it), so no "
+                             "entry trampoline is synthesized and the "
+                             "cluster is dead config that would "
+                             "silently diverge from the emitted image "
+                             "(D-LK3-3; mirrors the ELF .so + PE Dll "
+                             "rejects).",
+                             processExit.has_value() ? "present"
+                                                     : "absent",
+                             entryCallingConvention.empty() ? "absent"
+                                                            : "present",
+                             processArgs.has_value() ? "present"
+                                                     : "absent"));
+                }
+                if (!entryPoint.empty()) {
+                    fail("/entryPoint",
+                         std::format("Mach-O MH_DYLIB format must not "
+                                     "declare 'entryPoint' (got '{}') "
+                                     "-- a DSS .dylib has no process "
+                                     "entry (no LC_MAIN; D-LK3-3).",
+                                     entryPoint));
+                }
+                // The dylib arm emits its EXPORT TRIE through the
+                // legacy LC_DYLD_INFO_ONLY export_off field; the
+                // chained-fixups path would need the separate
+                // LC_DYLD_EXPORTS_TRIE load command, which is not
+                // implemented — reject the combination loud rather
+                // than emit a dylib whose exports dyld never finds
+                // (D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE).
+                if (mi.useChainedFixups) {
+                    fail("/image/useChainedFixups",
+                         "'useChainedFixups' = true is not supported "
+                         "on a Mach-O MH_DYLIB schema -- the dylib "
+                         "export trie is emitted through the legacy "
+                         "LC_DYLD_INFO_ONLY export_off field; the "
+                         "chained-fixups path would need the separate "
+                         "LC_DYLD_EXPORTS_TRIE load command "
+                         "(D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE). "
+                         "Set 'useChainedFixups' = false.");
+                }
             }
         }
     }
@@ -1063,7 +1214,11 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     // the PE-block Dll rules above reject its entry cluster with the
     // precise message, and these generic gates back them up). The
     // DllMain follow-up (D-LK2-DLL-DLLMAIN-ENTRY) would rejoin via a
-    // cluster discriminator, the c151 PIE pattern.
+    // cluster discriminator, the c151 PIE pattern. c153 (D-LK3-3):
+    // Mach-O MH_DYLIB completes the entry-less-library trio — the
+    // `macho.filetype == Execute` arm below excludes it by
+    // construction, and the Mach-O dylib block above rejects its
+    // entry cluster with the precise message.
     //
     // A single source of truth tying the image-side triplet:
     //   format declares "executable mode" ⟺ a Text-section row
@@ -1152,8 +1307,8 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "cluster / PE PE32+ Exec / Mach-O MH_EXECUTE). "
              "Relocatable artifacts (.o / Obj / Object) cannot have "
              "an entry trampoline, and the entry-less library shapes "
-             "(ELF ET_DYN .so, PE Dll) have no entry. "
-             "(D-LK10-ENTRY 2.13 / D-LK1-4 / D-LK2-4.)");
+             "(ELF ET_DYN .so, PE Dll, Mach-O MH_DYLIB) have no entry. "
+             "(D-LK10-ENTRY 2.13 / D-LK1-4 / D-LK2-4 / D-LK3-3.)");
     }
     if (!entryCallingConvention.empty() && !isExecFlavor) {
         fail("/entryCallingConvention",
@@ -1182,8 +1337,9 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
              "cluster / PE PE32+ Exec / Mach-O MH_EXECUTE). "
              "Relocatable artifacts (.o / Obj / Object) have no entry "
              "trampoline to materialize arguments in, and the "
-             "entry-less library shapes (ELF ET_DYN .so, PE Dll) have "
-             "no entry. (D-RUNTIME-MAIN-ARGC-ARGV.)");
+             "entry-less library shapes (ELF ET_DYN .so, PE Dll, "
+             "Mach-O MH_DYLIB) have no entry. "
+             "(D-RUNTIME-MAIN-ARGC-ARGV.)");
     }
 
     // D-LK-OBJECT-DATA-SECTION-RELOCATABLE: `supportedDataSections` is NO

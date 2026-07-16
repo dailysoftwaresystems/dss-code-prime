@@ -44,7 +44,9 @@
 //   [stroff]    string table (NUL-seeded)
 //
 // MH_EXECUTE (.exe) byte layout (LK3 cycle 2, closes D-LK3-2's
-// MH_EXECUTE half — D-LK3-3 anchors MH_DYLIB):
+// MH_EXECUTE half; c153 closed D-LK3-3's MH_DYLIB on the same
+// dynamic substrate — no __PAGEZERO / LC_LOAD_DYLINKER / LC_MAIN,
+// plus LC_ID_DYLIB and the LC_DYLD_INFO_ONLY export trie):
 //   [0x00]      mach_header_64                  (32 B)
 //   [0x20]      LC_SEGMENT_64 __PAGEZERO        (72 B, 0 sections)
 //   [...]       LC_SEGMENT_64 __TEXT + sec_64   (72 + 80*N B)
@@ -117,6 +119,15 @@ void padTo(std::vector<std::uint8_t>& out, std::uint64_t alignment) {
 constexpr std::uint32_t LC_LOAD_DYLINKER  = 0x0E;
 constexpr std::uint32_t LC_MAIN           = 0x80000028u;  // |= LC_REQ_DYLD
 constexpr std::uint32_t LC_LOAD_DYLIB     = 0x0C;
+// LC_ID_DYLIB (c153, D-LK3-3): the MH_DYLIB self-identity — same
+// 24-byte `dylib_command` wire shape as LC_LOAD_DYLIB (lc_str name
+// offset + timestamp + current_version + compatibility_version), the
+// name being the schema's `image.installName`. The three trailing
+// u32s are emitted as ZERO, matching this walker's LC_LOAD_DYLIB
+// convention (dyld ignores the timestamp; version checks fire only
+// when a CLIENT records a required compatibility version, and DSS
+// clients record none yet).
+constexpr std::uint32_t LC_ID_DYLIB       = 0x0D;
 constexpr std::uint32_t LC_DYLD_INFO_ONLY      = 0x80000022u;  // |= LC_REQ_DYLD
 constexpr std::uint32_t LC_DYLD_CHAINED_FIXUPS = 0x80000034u;  // |= LC_REQ_DYLD — D-LK6-14
 constexpr std::uint32_t LC_DYSYMTAB            = 0x0B;
@@ -219,6 +230,14 @@ constexpr std::uint8_t BIND_OPCODE_SET_DYLIB_ORDINAL_IMM          = 0x10;
 constexpr std::uint8_t BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB         = 0x20;
 constexpr std::uint8_t BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM  = 0x40;
 constexpr std::uint8_t BIND_OPCODE_SET_TYPE_IMM                   = 0x50;
+// SET_ADDEND_SLEB (c153, D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR Mach-O
+// half): dyld keeps ONE running addend across DO_BINDs (initial 0);
+// an extern-addr data slot with a non-zero reloc addend (`&stdout + 8`
+// style) sets it before its DO_BIND so dyld stores `resolved + addend`
+// into the slot. The emitter tracks the running value and re-emits
+// only on change (the GOT/TLV binds above never set it, so the stream
+// enters the extern-addr section with the interpreter's initial 0).
+constexpr std::uint8_t BIND_OPCODE_SET_ADDEND_SLEB                = 0x60;
 constexpr std::uint8_t BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB    = 0x70;
 constexpr std::uint8_t BIND_OPCODE_DO_BIND                        = 0x90;
 constexpr std::uint8_t BIND_TYPE_POINTER                          = 1;
@@ -428,6 +447,228 @@ appendULEB128(std::vector<std::uint8_t>& out, std::uint64_t v) {
     } while (v != 0);
 }
 
+// SLEB128 encoder — BIND_OPCODE_SET_ADDEND_SLEB carries a SIGNED
+// addend (c153, the extern-addr data-slot bind arm).
+inline void
+appendSLEB128(std::vector<std::uint8_t>& out, std::int64_t v) {
+    bool more = true;
+    while (more) {
+        std::uint8_t byte = static_cast<std::uint8_t>(v & 0x7F);
+        v >>= 7;   // arithmetic shift — sign-propagating
+        if ((v == 0 && (byte & 0x40) == 0)
+         || (v == -1 && (byte & 0x40) != 0)) {
+            more = false;
+        } else {
+            byte |= 0x80u;
+        }
+        out.push_back(byte);
+    }
+}
+
+// Number of bytes appendULEB128 would emit for `v` — the export-trie
+// layout fixpoint sizes child-offset ULEBs before emitting them.
+[[nodiscard]] inline std::size_t ulebLength(std::uint64_t v) noexcept {
+    std::size_t n = 0;
+    do { ++n; v >>= 7; } while (v != 0);
+    return n;
+}
+
+// ── MH_DYLIB export trie (c153, D-LK3-3) ────────────────────────────
+//
+// dyld resolves dlsym / two-level client binds against the image's
+// EXPORT TRIE (LC_DYLD_INFO_ONLY.export_off), NOT the nlist symtab.
+// On-wire node shape (Apple `dyld` MachOLoaded::trieWalk +
+// <mach-o/loader.h> EXPORT_SYMBOL_FLAGS_*):
+//   uleb128 terminalSize            (0 = interior node, no export here)
+//   [terminalSize bytes: uleb128 flags, uleb128 imageOffset]
+//   u8      childCount
+//   childCount × { edge chars + NUL, uleb128 childNodeOffset }
+// where `imageOffset` is the exported symbol's VA minus the image's
+// mach_header VA (== __TEXT.vmaddr; 0 for the base-0 dylib layout)
+// and `flags` = EXPORT_SYMBOL_FLAGS_KIND_REGULAR (0) for both code
+// and data exports.
+//
+// The trie MUST be a real prefix (radix) trie — a flat root listing
+// full-name edges is INVALID whenever one export name is a strict
+// prefix of another (`_foo` + `_foobar`): dyld's walker follows the
+// FIRST edge that prefixes the search string and never backtracks, so
+// the `_foo` edge would swallow a `_foobar` lookup and return
+// not-found. `insertExport` therefore splits edges at the divergence
+// point (the standard radix insert), which guarantees no two sibling
+// edges share a first byte — the property that makes dyld's greedy
+// first-match walk deterministic. Children are emitted sorted by edge
+// so the bytes are deterministic (ld64 sorts too).
+struct ExportTrieNode {
+    bool          terminal    = false;
+    std::uint64_t flags       = 0;   // EXPORT_SYMBOL_FLAGS_* (0=regular)
+    std::uint64_t imageOffset = 0;   // VA - mach_header VA
+    // edge label -> child node index (into the owning vector).
+    std::vector<std::pair<std::string, std::size_t>> children;
+};
+
+// Radix-insert `name` (terminal payload flags/imageOffset) into the
+// trie rooted at nodes[0]. Returns false on a duplicate export name
+// (caller fails loud — two exports of one name is a producer-contract
+// breach the cross-CU merge should have collapsed).
+[[nodiscard]] inline bool insertExport(std::vector<ExportTrieNode>& nodes,
+                                       std::string_view name,
+                                       std::uint64_t    flags,
+                                       std::uint64_t    imageOffset) {
+    std::size_t      cur  = 0;
+    std::string_view rest = name;
+    for (;;) {
+        bool descended = false;
+        for (auto& [edge, childIdx] : nodes[cur].children) {
+            std::size_t common = 0;
+            std::size_t const lim = std::min(edge.size(), rest.size());
+            while (common < lim && edge[common] == rest[common]) ++common;
+            if (common == 0) continue;
+            if (common == edge.size()) {
+                // Full edge matched — descend and keep walking.
+                cur  = childIdx;
+                rest = rest.substr(common);
+                descended = true;
+                break;
+            }
+            // Partial match — split the edge at the divergence point:
+            // a new interior node takes the edge's TAIL + the old
+            // child; the edge shrinks to the common prefix.
+            std::size_t const midIdx = nodes.size();
+            nodes.push_back(ExportTrieNode{});
+            nodes[midIdx].children.emplace_back(edge.substr(common),
+                                                childIdx);
+            // `edge`/`childIdx` reference a pair inside the children
+            // vector's HEAP buffer; nodes.push_back may reallocate
+            // `nodes` (moving the ExportTrieNode headers), but a
+            // vector move transfers the heap buffer unchanged, so
+            // the references stay valid — mutate through them now.
+            edge.resize(common);
+            childIdx = midIdx;
+            cur  = midIdx;
+            rest = rest.substr(common);
+            descended = true;
+            break;
+        }
+        if (descended) {
+            if (rest.empty()) {
+                if (nodes[cur].terminal) return false;   // duplicate
+                nodes[cur].terminal    = true;
+                nodes[cur].flags       = flags;
+                nodes[cur].imageOffset = imageOffset;
+                return true;
+            }
+            continue;
+        }
+        // No child shares a first byte with `rest` — append a leaf.
+        if (rest.empty()) {
+            if (nodes[cur].terminal) return false;       // duplicate
+            nodes[cur].terminal    = true;
+            nodes[cur].flags       = flags;
+            nodes[cur].imageOffset = imageOffset;
+            return true;
+        }
+        std::size_t const leafIdx = nodes.size();
+        nodes.push_back(ExportTrieNode{});
+        nodes[leafIdx].terminal    = true;
+        nodes[leafIdx].flags       = flags;
+        nodes[leafIdx].imageOffset = imageOffset;
+        nodes[cur].children.emplace_back(std::string{rest}, leafIdx);
+        return true;
+    }
+}
+
+// Serialize the trie. Child-node offsets are ULEB128s whose byte
+// length depends on the offsets themselves, so the layout runs a
+// FIXPOINT (ld64's approach): start all offsets at 0, recompute until
+// stable. Offsets grow monotonically per iteration and each ULEB is
+// at most 10 bytes, so the loop terminates; the iteration cap is a
+// belt that fails loud instead of spinning if that invariant ever
+// breaks. Nodes are laid out in creation order (root first) with
+// children sorted by edge label for deterministic bytes.
+[[nodiscard]] inline bool
+encodeExportTrie(std::vector<ExportTrieNode>& nodes,
+                 std::vector<std::uint8_t>&   out,
+                 DiagnosticReporter&          reporter) {
+    for (auto& n : nodes) {
+        if (n.children.size() > 255) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("macho::encodeExportTrie: a trie node has "
+                             "{} children -- the on-wire childCount is "
+                             "one byte (max 255).",
+                             n.children.size()));
+            return false;
+        }
+        std::sort(n.children.begin(), n.children.end(),
+                  [](auto const& a, auto const& b) {
+                      return a.first < b.first;
+                  });
+    }
+    std::vector<std::uint64_t> offsets(nodes.size(), 0);
+    auto nodeSize = [&](ExportTrieNode const& n) -> std::uint64_t {
+        std::uint64_t sz = 0;
+        if (n.terminal) {
+            std::uint64_t const payload =
+                ulebLength(n.flags) + ulebLength(n.imageOffset);
+            sz += ulebLength(payload) + payload;
+        } else {
+            sz += 1;   // uleb(0) terminalSize
+        }
+        sz += 1;       // childCount u8
+        for (auto const& [edge, childIdx] : n.children) {
+            sz += edge.size() + 1 + ulebLength(offsets[childIdx]);
+        }
+        return sz;
+    };
+    constexpr int kMaxFixpointIterations = 16;
+    bool stable = false;
+    for (int iter = 0; iter < kMaxFixpointIterations && !stable; ++iter) {
+        stable = true;
+        std::uint64_t off = 0;
+        for (std::size_t i = 0; i < nodes.size(); ++i) {
+            if (offsets[i] != off) {
+                offsets[i] = off;
+                stable = false;
+            }
+            off += nodeSize(nodes[i]);
+        }
+    }
+    if (!stable) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "macho::encodeExportTrie: node-offset fixpoint failed to "
+             "converge -- the monotone-offset invariant broke "
+             "(substrate bug).");
+        return false;
+    }
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+        auto const& n = nodes[i];
+        if (out.size() != offsets[i]) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("macho::encodeExportTrie: node {} emitted "
+                             "at byte {} but the layout placed it at "
+                             "{} -- size/emit disagreement (substrate "
+                             "bug).",
+                             i, out.size(), offsets[i]));
+            return false;
+        }
+        if (n.terminal) {
+            std::vector<std::uint8_t> payload;
+            appendULEB128(payload, n.flags);
+            appendULEB128(payload, n.imageOffset);
+            appendULEB128(out, payload.size());
+            out.insert(out.end(), payload.begin(), payload.end());
+        } else {
+            appendULEB128(out, 0);
+        }
+        appendU8(out, static_cast<std::uint8_t>(n.children.size()));
+        for (auto const& [edge, childIdx] : n.children) {
+            for (char c : edge) out.push_back(static_cast<std::uint8_t>(c));
+            out.push_back(0);
+            appendULEB128(out, offsets[childIdx]);
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 namespace {
@@ -467,12 +708,32 @@ encode(AssembledModule const&    module,
         requireSection(fmt, SectionKind::Text, "Mach-O writer", reporter);
     if (!secText) return {};
 
-    // Dispatch between MH_OBJECT (cycle 1) and MH_EXECUTE (cycle 2)
-    // based on the schema's declared filetype. validate() rejects
-    // any value outside {1, 2} so this switch is exhaustive. The
+    // Dispatch between MH_OBJECT (cycle 1), MH_EXECUTE (cycle 2) and
+    // MH_DYLIB (c153, D-LK3-3) based on the schema's declared
+    // filetype (closed enum — the loader rejects anything else). The
     // MH_EXECUTE arm further splits into the static path (no
     // externs; LK3 cycle 2) and the dynamic path (externs present;
-    // LK6 cycle 2c).
+    // LK6 cycle 2c). MH_DYLIB routes through the DYNAMIC arm
+    // UNCONDITIONALLY — even a zero-extern dylib needs the
+    // LC_DYLD_INFO_ONLY export trie, __LINKEDIT, LC_DYSYMTAB and the
+    // code-signature machinery that live only there (the ELF c150
+    // mirror: ET_DYN always takes encodeElfExecDynamic).
+    if (fmt.macho().filetype == MachOObjectType::Dylib) {
+        if (!module.externImports.empty() && !fmt.machoImage().bindNow) {
+            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                 "macho::encode: MH_DYLIB schema requests lazy binding "
+                 "('image.bindNow' = false) but Mach-O lazy "
+                 "binding (LC_DYLD_INFO_ONLY.lazy_bind_off "
+                 "opcode stream + dyld_stub_binder) has not "
+                 "yet landed. Anchored at plan 14 section 3.1 "
+                 "D-LK6-13. Set 'image.bindNow' = true (the v1 "
+                 "stance -- immediate bind_off opcode stream) to "
+                 "proceed.");
+            return {};
+        }
+        return encodeExecDynamic(module, targetSchema, fmt,
+                                 *secText, reporter);
+    }
     if (fmt.macho().filetype == MachOObjectType::Execute) {
         // LK7 codesign-placeholder gate (silent-failure HIGH fold,
         // architect anchor): the static `encodeExec` path emits no
@@ -1848,19 +2109,46 @@ encodeExecDynamic(AssembledModule const&    module,
                   DiagnosticReporter&       reporter) {
     auto const& id = fmt.macho();
     auto const& im = fmt.machoImage();
+    // c153 (D-LK3-3): the MH_DYLIB arm rides THIS dynamic substrate
+    // with schema-keyed divergences (filetype is closed-enum schema
+    // data — the elf.cpp `isDyn` precedent, never a format-name
+    // string): no __PAGEZERO (pageZeroSize == 0 by validate()), no
+    // LC_LOAD_DYLINKER / LC_MAIN, an LC_ID_DYLIB, real-named nlist
+    // entries for externally-visible functions, and the EXPORT TRIE
+    // in LC_DYLD_INFO_ONLY.export_off. A zero-extern dylib is legal
+    // (the c150/c152 `dss_add` witness shape imports nothing).
+    bool const isDylib = id.filetype == MachOObjectType::Dylib;
 
     // ── (a) Preconditions ────────────────────────────────────────
     //
     // Walker contract guards (parallel to ELF cycle 2b.2). The
-    // outer `encode()` already gated on externImports.empty() ==
-    // false + filetype == Execute + bindNow == true. Defense-in-
-    // depth + load-bearing inputs not enforced upstream.
-    if (module.externImports.empty()) {
+    // outer `encode()` already gated on filetype + bindNow (and, for
+    // Execute, externImports.empty() == false). Defense-in-depth +
+    // load-bearing inputs not enforced upstream.
+    if (module.externImports.empty() && !isDylib) {
         emit(reporter, DiagnosticCode::K_SymbolUndefined,
              "macho::encodeExecDynamic: called with zero "
-             "externImports — dynamic-image emission requires at "
-             "least one extern; static images route through "
-             "encodeExec.");
+             "externImports -- dynamic EXECUTABLE emission requires "
+             "at least one extern; static executables route through "
+             "encodeExec (a DYLIB legitimately reaches here with "
+             "zero externs -- its export trie still needs the "
+             "dynamic arm).");
+        return {};
+    }
+    // Belt behind validate()'s dylib shape rules (a hand-built
+    // ObjectFormatData could bypass the loader): a dylib has NO
+    // process entry, so entry-cluster machinery must be absent —
+    // emitting LC_MAIN into an MH_DYLIB would ship dead config that
+    // dyld ignores at best and rejects at worst.
+    if (isDylib
+        && (fmt.processExit().has_value() || !fmt.entryPoint().empty()
+            || module.imageEntryOverride.has_value())) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             "macho::encodeExecDynamic: MH_DYLIB with entry-cluster "
+             "machinery (processExit / entryPoint / a caller "
+             "imageEntryOverride) -- a dylib has no process entry and "
+             "no LC_MAIN; validate() rejects such a schema "
+             "(D-LK3-3).");
         return {};
     }
     // D-LK6-14 substrate: the useChainedFixups guard now fires at
@@ -1869,8 +2157,10 @@ encodeExecDynamic(AssembledModule const&    module,
     // useChainedFixups=false → legacy LC_DYLD_INFO_ONLY path.
     if (module.functions.empty()) {
         emit(reporter, DiagnosticCode::K_SymbolUndefined,
-             "macho::encodeExecDynamic: zero functions — MH_EXECUTE "
-             "needs at least one entry function.");
+             "macho::encodeExecDynamic: zero functions -- an "
+             "MH_EXECUTE needs at least one entry function, and an "
+             "MH_DYLIB without code has nothing to export "
+             "(D-LK3-3; mirrors the PE Dll Text-row rule).");
         return {};
     }
     // VM segment page size is config-driven (`image.segmentPageSize`):
@@ -1970,7 +2260,14 @@ encodeExecDynamic(AssembledModule const&    module,
         }
     }
     std::size_t const numLibs = libraryOrder.size();
-    if (numLibs == 0) {
+    // Gated on numExterns: a zero-extern DYLIB legitimately groups
+    // zero libraries (its LC_LOAD_DYLIB rows come from
+    // image.loadDylibs regardless). With externs present the guard
+    // is unchanged — Mach-O's two-level namespace binds every import
+    // against a NAMED dylib ordinal (allowsUndefinedImports() is
+    // false for both image flavors, so a library-less referenced
+    // extern was already rejected upstream; this is the belt).
+    if (numExterns > 0 && numLibs == 0) {
         emit(reporter, DiagnosticCode::K_SymbolUndefined,
              "macho::encodeExecDynamic: " +
              std::to_string(numExterns) +
@@ -2005,11 +2302,18 @@ encodeExecDynamic(AssembledModule const&    module,
     }
 
     // ── (d) Resolve entry function index — shared resolver
-    // (D-LK10-ENTRY Slice C audit fold).
-    auto const entryIdxDynOpt = link::format::resolveEntryFnIdx(
-        module, fmt, "_sym_", "macho::encodeExecDynamic", reporter);
-    if (!entryIdxDynOpt.has_value()) return {};
-    std::size_t const entryFnIdx = *entryIdxDynOpt;
+    // (D-LK10-ENTRY Slice C audit fold). A DYLIB has no entry: no
+    // LC_MAIN is emitted, so nothing consumes the index (the
+    // entry-cluster belt above already rejected any entry config);
+    // the resolver's functions[0] default would be a meaningless
+    // "entry" for a library.
+    std::size_t entryFnIdx = 0;
+    if (!isDylib) {
+        auto const entryIdxDynOpt = link::format::resolveEntryFnIdx(
+            module, fmt, "_sym_", "macho::encodeExecDynamic", reporter);
+        if (!entryIdxDynOpt.has_value()) return {};
+        entryFnIdx = *entryIdxDynOpt;
+    }
 
     // ── (e) Symbol-VA map: intra-fn VAs + extern __stubs slot VAs.
     //       __stubs lives right after __text within __TEXT.
@@ -2189,6 +2493,23 @@ encodeExecDynamic(AssembledModule const&    module,
     bool const hasTdata = !tdataLayout.empty();
     bool const hasTbss  = !tbssLayout.empty();
     bool const hasTls   = hasTdata || hasTbss;
+    // c153 F4 fold -- the D-LK3-DYLIB-TLS-MODEL walker belt (the
+    // elf.cpp `isDyn && hasTls` sibling): thread-locals in a dlopen'd
+    // dylib are an UNVERIFIED form on this no-Mac host (dlopen-time
+    // TLV setup + pre-existing-thread access unwitnessed). The shipped
+    // dylib schema advertises no tdata/tbss, so the linker's section
+    // gate rejects first; THIS belt catches a hand-built module / a
+    // future schema opting in without a Mac witness -- never a
+    // silently-shipped unverified TLV image.
+    if (isDylib && hasTls) {
+        emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+             "macho::encodeExecDynamic: thread-local items in an "
+             "MH_DYLIB -- the dlopen-time TLV path is unverified on "
+             "this host; the dylib format must not opt into "
+             "tdata/tbss until a Mac witness exists "
+             "(D-LK3-DYLIB-TLS-MODEL).");
+        return {};
+    }
     // Each present section's schema row is MANDATORY (the format opted into
     // tdata/tbss via supportedDataSections; a missing row is a config bug),
     // the tlsAccess model must be macho-tlv, and each section type MUST be the
@@ -2288,16 +2609,11 @@ encodeExecDynamic(AssembledModule const&    module,
             ++numTlsDescriptors;
     bool const hasTvars = numTlsDescriptors > 0;
     std::uint64_t const tvarsSize = numTlsDescriptors * kTlvDescriptorSize;
-    // ── TLS C4 (M-2 / audit FOLD-1): the segment index the __tlv_bootstrap
-    // descriptor binds target. __DATA is the 4th LC_SEGMENT_64 (index 3) —
-    // __PAGEZERO(0)/__TEXT(1)/__DATA_CONST(2) are UNCONDITIONAL, then __DATA
-    // (present because hasTls ⇒ hasDataSeg). Correct-by-invariant, but macho
-    // CANNOT be runtime-tested on this host — a future segment-layout change
-    // would SILENTLY bind the descriptors to the wrong segment (a Mac crash
-    // invisible to every local pin). The segment-emission loop below
-    // CROSS-CHECKS the ACTUAL emitted __DATA index against THIS value and fails
-    // loud on any mismatch (never a silent wrong-segment bind).
-    constexpr std::uint32_t kTlvDescriptorBindSegIndex = 3;
+    // (The __DATA bind/rebase segment index — formerly the constexpr
+    // kTlvDescriptorBindSegIndex = 3 — is now COMPUTED below as
+    // `segIdxData`, once the per-flavor segment presence is known:
+    // c153 made __PAGEZERO and __DATA_CONST conditional, so the
+    // exec's fixed 0/1/2/3 numbering no longer holds universally.)
     // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): allowItemRelocations=true — symbol-
     // address global pointers carry abs64 data→data relocs patched in place below
     // (after symbolVa). MUTABLE layouts so applyDataItemRelocations fixes the bytes.
@@ -2344,6 +2660,37 @@ encodeExecDynamic(AssembledModule const&    module,
     // TLS C4: the three __thread_* sections also live in __DATA, so any
     // thread-local forces the writable segment even with no ordinary globals.
     bool const hasDataSeg = hasData || hasBss || hasTls;   // needs __DATA
+    // ── LC_SEGMENT_64 ORDER + INDICES (c153 generalization) ────────
+    //
+    // dyld's bind/rebase opcodes address targets as (segment INDEX,
+    // offset) — the index being the ORDINAL of the LC_SEGMENT_64 in
+    // load-command order. The exec's historic fixed numbering
+    // (__PAGEZERO 0 / __TEXT 1 / __DATA_CONST 2 / __DATA 3) broke
+    // when c153 made two segments conditional:
+    //   * __PAGEZERO exists iff pageZeroSize > 0 — an MH_EXECUTE
+    //     always (validate() requires > 0); an MH_DYLIB never
+    //     (validate() requires == 0: a dylib is a slid base-0 image);
+    //   * __DATA_CONST (the __got holder) exists iff the module has
+    //     externs — the exec dynamic arm always does (its gate), a
+    //     dylib may not.
+    // So the indices are COMPUTED from segment presence, in the one
+    // emission order: [__PAGEZERO] __TEXT [__DATA_CONST] [__DATA]
+    // __LINKEDIT. The emission loop below counts ACTUAL emissions
+    // into `machoSegmentsBeforeData` and cross-checks it against
+    // `segIdxData` — a reorder/insertion that desyncs the two fails
+    // loud (never a silent wrong-segment bind; the TLS C4 M-2/FOLD-1
+    // discipline, now covering the F5 rebases + the extern-addr
+    // binds too). For the exec flavor every value below equals the
+    // historic constant — byte-identical output.
+    bool const hasPageZero     = im.pageZeroSize > 0;
+    bool const hasDataConstSeg = numExterns > 0;
+    std::uint32_t segIdxCursor = 0;
+    if (hasPageZero) ++segIdxCursor;                    // __PAGEZERO
+    ++segIdxCursor;                                     // __TEXT
+    std::uint32_t const segIdxDataConst =
+        hasDataConstSeg ? segIdxCursor++ : 0u;
+    std::uint32_t const segIdxData =
+        hasDataSeg ? segIdxCursor++ : 0u;
     std::uint64_t const constSize = constLayout.spanSize;
     // Each present section's schema row is MANDATORY — fail loud (the format
     // JSON must declare it). The rows feed the section_64 records below.
@@ -2560,6 +2907,148 @@ encodeExecDynamic(AssembledModule const&    module,
         return {};
     }
 
+    // ── MH_DYLIB export trie (c153, D-LK3-3 — the c150 ET_DYN
+    // export-set mirror): every externally-visible DEFINED symbol —
+    // function or data global — becomes a trie terminal so
+    // dlsym/two-level client binds FIND it (dyld resolves against
+    // the export trie, not nlist). The set comes from
+    // `module.symbols` (the same real-name rows the c150 .dynsym
+    // exports use; names arrive PRE-MANGLED — a leading underscore
+    // on Mach-O — and are inserted verbatim). Local/Hidden/Internal
+    // symbols stay out (a `static` function is not part of the
+    // library's ABI). The trie ADDRESS is the symbol's image offset
+    // (VA - mach_header VA, the __TEXT vmaddr = im.pageZeroSize = 0
+    // on the base-0 dylib); symbolVa is COMPLETE here (functions,
+    // data, bss, interior blocks), so a lookup miss is a producer-
+    // contract breach — fail loud, the c150 "names neither" mirror.
+    // A WEAK export fails loud: Mach-O weak-definition semantics
+    // need EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION + the MH_WEAK_DEFINES
+    // header bit + weak-bind machinery this cycle does not ship
+    // (D-LK3-DYLIB-WEAK-EXPORT) — silently exporting it strong
+    // would change cross-image coalescing semantics.
+    // The exec arm builds NO exports (exportTrieBlob stays empty and
+    // LC_DYLD_INFO's export fields stay 0/0) — byte-identical, the
+    // mandatory control.
+    std::vector<std::uint8_t> exportTrieBlob;
+    if (isDylib) {
+        std::vector<ExportTrieNode> trie;
+        trie.push_back(ExportTrieNode{});   // root
+        // Classify each export row against the DEFINITION tables
+        // (functions + named data items) — the exact c150 ELF shape
+        // (elf.cpp funcIdxBySym/dataSizeBySym). Looking up symbolVa
+        // alone would NOT do: symbolVa also carries the extern
+        // INDIRECTION CELLS (__stubs VAs for function externs, __got
+        // slot VAs for data externs), so a ModuleSymbol row naming an
+        // EXTERN (a producer-contract breach) would silently export
+        // the image-local stub/got-slot address — dlsym would hand a
+        // consumer the wrong pointer, the exact identity class the
+        // c153 extern-slot bind fold exists to prevent. Fail loud
+        // instead, naming the symbol.
+        std::unordered_set<std::uint32_t> definedFuncSyms;
+        definedFuncSyms.reserve(module.functions.size());
+        for (auto const& fn : module.functions) {
+            definedFuncSyms.insert(fn.symbol.v);
+        }
+        std::unordered_set<std::uint32_t> definedDataSyms;
+        definedDataSyms.reserve(module.dataItems.size());
+        for (auto const& di : module.dataItems) {
+            if (di.symbol == SymbolId{}) continue;   // anonymous
+            definedDataSyms.insert(di.symbol.v);
+        }
+        std::unordered_set<std::uint32_t> externSyms;
+        externSyms.reserve(module.externImports.size());
+        for (auto const& ext : module.externImports) {
+            externSyms.insert(ext.symbol.v);
+        }
+        std::size_t numExports = 0;
+        for (auto const& ms : module.symbols) {
+            if (ms.name.empty()) continue;
+            if (!isExternallyVisible(ms.binding, ms.visibility)) continue;
+            if (ms.binding == SymbolBinding::Weak) {
+                emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                     std::format(
+                         "macho::encodeExecDynamic (MH_DYLIB): symbol "
+                         "'{}' is a WEAK definition -- Mach-O weak "
+                         "exports need EXPORT_SYMBOL_FLAGS_WEAK_"
+                         "DEFINITION + MH_WEAK_DEFINES + weak-bind "
+                         "machinery not yet shipped "
+                         "(D-LK3-DYLIB-WEAK-EXPORT); exporting it "
+                         "strong would silently change cross-image "
+                         "coalescing semantics.",
+                         ms.name));
+                return {};
+            }
+            if (externSyms.contains(ms.symbol.v)) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::format(
+                         "macho::encodeExecDynamic (MH_DYLIB): "
+                         "ModuleSymbol '{}' (SymbolId #{}) names an "
+                         "EXTERN IMPORT -- exporting it would place "
+                         "the image-local indirection cell (__stubs "
+                         "stub / __got slot) in the export trie and "
+                         "dlsym would return that cell instead of the "
+                         "real symbol (producer contract: ModuleSymbol "
+                         "rows describe DEFINITIONS only).",
+                         ms.name, ms.symbol.v));
+                return {};
+            }
+            if (!definedFuncSyms.contains(ms.symbol.v)
+                && !definedDataSyms.contains(ms.symbol.v)) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::format(
+                         "macho::encodeExecDynamic (MH_DYLIB): "
+                         "ModuleSymbol '{}' (SymbolId #{}) names "
+                         "neither a defined function nor a data item "
+                         "-- the export trie cannot place it (producer "
+                         "contract: one ModuleSymbol row per DEFINED "
+                         "function/global).",
+                         ms.name, ms.symbol.v));
+                return {};
+            }
+            auto const vaIt = symbolVa.find(ms.symbol);
+            if (vaIt == symbolVa.end()) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::format(
+                         "macho::encodeExecDynamic (MH_DYLIB): defined "
+                         "symbol '{}' (SymbolId #{}) has no resolved "
+                         "VA -- the definition tables and symbolVa "
+                         "disagree (substrate invariant violation).",
+                         ms.name, ms.symbol.v));
+                return {};
+            }
+            // flags = EXPORT_SYMBOL_FLAGS_KIND_REGULAR (0) — code and
+            // data exports share the kind; imageOffset is relative to
+            // the mach header (== __TEXT.vmaddr == im.pageZeroSize).
+            if (!insertExport(trie, ms.name, /*flags=*/0,
+                              vaIt->second - im.pageZeroSize)) {
+                emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
+                     std::format(
+                         "macho::encodeExecDynamic (MH_DYLIB): export "
+                         "name '{}' inserted twice into the export "
+                         "trie -- two externally-visible definitions "
+                         "share one name (the cross-CU merge should "
+                         "have collapsed or rejected them).",
+                         ms.name));
+                return {};
+            }
+            ++numExports;
+        }
+        if (numExports > 0) {
+            if (!encodeExportTrie(trie, exportTrieBlob, reporter)) {
+                return {};
+            }
+            // Pad to the 8-byte load-command alignment (the same
+            // convention the rebase/bind blobs follow) so the next
+            // __LINKEDIT payload starts aligned.
+            while (exportTrieBlob.size() % kLoadCmdAlign != 0) {
+                exportTrieBlob.push_back(0);
+            }
+        }
+        // Zero exports leave the blob EMPTY — LC_DYLD_INFO_ONLY then
+        // carries export_off = export_size = 0, a legal dylib whose
+        // dlsym lookups all miss (nothing externally visible).
+    }
+
     // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): patch each symbol-address global
     // pointer's abs64 reloc IN PLACE with the target's resolved VA (symbolVa is
     // fully built now), AND collect each fixup site so the LC_DYLD_INFO_ONLY
@@ -2600,6 +3089,75 @@ encodeExecDynamic(AssembledModule const&    module,
                symbolVa, targetSchema, "macho::encodeExecDynamic", reporter,
                &dataRebaseSiteVas)) {
         return {};
+    }
+
+    // ── D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR (c153, the Mach-O half —
+    // the ELF c150 `externAddrBySlotVa` fold's semantic mirror): a
+    // __DATA slot whose relocation targets an EXTERN must NOT keep
+    // the value `applyDataItemRelocations` just baked, because
+    // `symbolVa[extern]` is an IMAGE-LOCAL indirection cell — the
+    // __got slot for a DATA extern (`FILE **pp = &stdout;` would
+    // point at the got slot, one indirection off at runtime) or the
+    // __stubs stub for a FUNCTION extern (call-correct but breaking
+    // cross-image pointer identity, C11 6.5.9: `fp == puts` false).
+    // The symbol-based fix — exactly what gcc/ld64 emit — is a dyld
+    // BIND OPCODE targeting the slot: zero the baked bytes, DROP the
+    // site from the rebase list (dyld would slide the garbage value
+    // before the bind overwrote it — wasted work at best), and
+    // record a bind site the section-(i) stream emitter appends
+    // after the __got/TLV binds. dyld then writes the REAL resolved
+    // address (+ the reloc addend via SET_ADDEND_SLEB) into the
+    // slot at load, across the global two-level scope — pointer
+    // identity holds. Every collected site is 8 bytes wide by the
+    // `applyDataItemRelocations` siteVasOut width gate.
+    struct ExternAddrBindSite {
+        std::uint64_t slotVa   = 0;
+        std::size_t   externIdx = 0;
+        std::int64_t  addend   = 0;
+    };
+    std::vector<ExternAddrBindSite> externAddrBindSites;
+    if (hasData && numExterns > 0) {
+        std::unordered_map<SymbolId, std::size_t> externIdxBySym;
+        externIdxBySym.reserve(numExterns);
+        for (std::size_t i = 0; i < numExterns; ++i) {
+            externIdxBySym.emplace(module.externImports[i].symbol, i);
+        }
+        for (std::size_t j = 0; j < dataLayout.itemIndices.size(); ++j) {
+            auto const& di = module.dataItems[dataLayout.itemIndices[j]];
+            for (auto const& rel : di.relocations) {
+                auto const extIt = externIdxBySym.find(rel.target);
+                if (extIt == externIdxBySym.end()) continue;  // internal
+                std::uint64_t const slotVa = dataSecVa
+                    + dataLayout.itemOffsets[j]
+                    + static_cast<std::uint64_t>(rel.offset);
+                std::size_t const slotOff = static_cast<std::size_t>(
+                    dataLayout.itemOffsets[j]
+                    + static_cast<std::uint64_t>(rel.offset));
+                for (std::size_t b = 0; b < 8; ++b) {
+                    dataLayout.bytes[slotOff + b] = 0;
+                }
+                auto const siteIt = std::find(dataRebaseSiteVas.begin(),
+                                              dataRebaseSiteVas.end(),
+                                              slotVa);
+                if (siteIt == dataRebaseSiteVas.end()) {
+                    emit(reporter,
+                         DiagnosticCode::K_RelocationKindMismatch,
+                         std::format(
+                             "macho::encodeExecDynamic: extern-"
+                             "targeted data slot VA 0x{:x} was not in "
+                             "the collected rebase-site list -- the "
+                             "applyDataItemRelocations site collector "
+                             "and this fold disagree (substrate "
+                             "invariant violation, "
+                             "D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR).",
+                             slotVa));
+                    return {};
+                }
+                dataRebaseSiteVas.erase(siteIt);
+                externAddrBindSites.push_back(
+                    ExternAddrBindSite{slotVa, extIt->second, rel.addend});
+            }
+        }
     }
 
     // ── (f) Apply intra-module relocations in-place ─────────────
@@ -2757,12 +3315,12 @@ encodeExecDynamic(AssembledModule const&    module,
         //
         // Segment index is 0-based in BIND_OPCODE_SET_SEGMENT_AND_
         // OFFSET_ULEB's 4-bit immediate. Segments are numbered in the
-        // order they appear via LC_SEGMENT_64: __PAGEZERO=0, __TEXT=1,
-        // __DATA_CONST=2, __LINKEDIT=3 (this walker's emission order).
-        // If the emission order ever changes, this constant must too.
-        // (code-reviewer I2 fold — comment said "1-based" then
-        // enumerated 0-based, contradicting itself.)
-        constexpr std::uint8_t kSegIdxDataConst = 2;
+        // order they appear via LC_SEGMENT_64 — since c153 that order
+        // has two CONDITIONAL members ([__PAGEZERO] __TEXT
+        // [__DATA_CONST] [__DATA] __LINKEDIT), so the index comes
+        // from the computed `segIdxDataConst` (exec: 2, the historic
+        // constant; a dylib without __PAGEZERO: 1). The emission
+        // cross-check below fails loud if the actual order desyncs.
         for (std::size_t i = 0; i < numExterns; ++i) {
             auto const& ext = module.externImports[i];
             std::uint32_t const ord = dylibOrdinal(ext.libraryPath);
@@ -2785,8 +3343,9 @@ encodeExecDynamic(AssembledModule const&    module,
                 dyldBindBlob.push_back(static_cast<std::uint8_t>(c));
             dyldBindBlob.push_back(0);  // NUL terminator
             dyldBindBlob.push_back(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
-            dyldBindBlob.push_back(
-                BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | kSegIdxDataConst);
+            dyldBindBlob.push_back(static_cast<std::uint8_t>(
+                BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
+                | (segIdxDataConst & 0x0Fu)));
             appendULEB128(dyldBindBlob,
                 static_cast<std::uint64_t>(i) * kGotSlotSize);
             dyldBindBlob.push_back(BIND_OPCODE_DO_BIND);
@@ -2795,9 +3354,9 @@ encodeExecDynamic(AssembledModule const&    module,
         // descriptor's word0 to the undefined libSystem `__tlv_bootstrap`
         // thunk. Unlike the extern binds above (which target __got slots in
         // __DATA_CONST), these target the __thread_vars descriptors in __DATA
-        // (segment index 3 — __PAGEZERO=0/__TEXT=1/__DATA_CONST=2/__DATA=3,
-        // present because hasTls ⇒ hasDataSeg; the SAME index the F5 rebase
-        // stream uses — M-2: derived from the fixed emission order). All
+        // (the computed `segIdxData` — 3 on the exec flavor, whose
+        // __PAGEZERO + __DATA_CONST both exist; the SAME index the F5 rebase
+        // stream uses — M-2: derived from the one emission order). All
         // descriptors share one symbol + dylib, so set ordinal+symbol+type
         // ONCE, then per descriptor SET_SEGMENT_AND_OFFSET + DO_BIND. word0 is
         // at descriptor offset 0, so the bind offset within __DATA =
@@ -2835,9 +3394,54 @@ encodeExecDynamic(AssembledModule const&    module,
             for (std::uint64_t d = 0; d < numTlsDescriptors; ++d) {
                 dyldBindBlob.push_back(static_cast<std::uint8_t>(
                     BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
-                    | (kTlvDescriptorBindSegIndex & 0x0Fu)));
+                    | (segIdxData & 0x0Fu)));
                 appendULEB128(dyldBindBlob,
                               tvarsOffsetInSeg + d * kTlvDescriptorSize);
+                dyldBindBlob.push_back(BIND_OPCODE_DO_BIND);
+            }
+        }
+        // ── D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR (c153, Mach-O half):
+        // one symbol-based bind per extern-targeted __DATA slot (the
+        // sites the post-apply fold collected + zeroed above). dyld
+        // resolves the NAMED symbol across the two-level scope and
+        // stores `resolved + addend` into the slot — the gcc/ld64
+        // shape, giving `FILE **pp = &stdout;` the real object
+        // address and `int (*fp)() = puts;` cross-image pointer
+        // identity (the ELF c150 symbol-based-Rela mirror). The
+        // interpreter's addend register starts 0 and none of the
+        // GOT/TLV binds above touch it, so SET_ADDEND_SLEB is
+        // emitted only when a site's addend differs from the running
+        // value.
+        {
+            std::int64_t runningAddend = 0;
+            for (auto const& site : externAddrBindSites) {
+                auto const& ext = module.externImports[site.externIdx];
+                std::uint32_t const ord = dylibOrdinal(ext.libraryPath);
+                if (ord <= 0x0F) {
+                    dyldBindBlob.push_back(static_cast<std::uint8_t>(
+                        BIND_OPCODE_SET_DYLIB_ORDINAL_IMM |
+                        static_cast<std::uint8_t>(ord & 0x0F)));
+                } else {
+                    dyldBindBlob.push_back(
+                        BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB);
+                    appendULEB128(dyldBindBlob, ord);
+                }
+                dyldBindBlob.push_back(static_cast<std::uint8_t>(
+                    BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | 0));
+                for (char c : ext.mangledName)
+                    dyldBindBlob.push_back(static_cast<std::uint8_t>(c));
+                dyldBindBlob.push_back(0);  // NUL terminator
+                dyldBindBlob.push_back(
+                    BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER);
+                if (site.addend != runningAddend) {
+                    dyldBindBlob.push_back(BIND_OPCODE_SET_ADDEND_SLEB);
+                    appendSLEB128(dyldBindBlob, site.addend);
+                    runningAddend = site.addend;
+                }
+                dyldBindBlob.push_back(static_cast<std::uint8_t>(
+                    BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
+                    | (segIdxData & 0x0Fu)));
+                appendULEB128(dyldBindBlob, site.slotVa - dataSegVaEarly);
                 dyldBindBlob.push_back(BIND_OPCODE_DO_BIND);
             }
         }
@@ -2876,12 +3480,29 @@ encodeExecDynamic(AssembledModule const&    module,
 
     // ── (k) Build nlist_64 + string table: defined externs first,
     //       undefined externs next.
+    //
+    // c153 (D-LK3-3): on the DYLIB arm a defined function's nlist
+    // name is its REAL (pre-mangled) source name when externally
+    // visible — `nm libdss.dylib` and debuggers read nlist, and a
+    // library's symbols are its ABI surface (the c139/c150 real-name
+    // discipline; ObjectSymbolNames falls back to the internal
+    // `_sym_<id>` for static/synthesized functions). dyld's dlsym
+    // resolves against the EXPORT TRIE (above), not nlist — this is
+    // the human-facing surface. The EXEC arm keeps the internal
+    // `_sym_<id>` names unchanged (byte-identical output; an
+    // executable's nlist is not a linking surface). NOTE: exported
+    // DATA globals appear in the trie only — the dynamic arm's nlist
+    // carries functions + undefined externs (extending it is a
+    // numDefs/LC_DYSYMTAB re-shape deferred until a consumer needs
+    // `nm` visibility for data; dlsym works today via the trie).
+    link::format::ObjectSymbolNames const dylibSymNames{module};
     StringTable strtab;
     std::vector<std::uint8_t> nlistBytes;
     for (std::size_t i = 0; i < module.functions.size(); ++i) {
         auto const& fn = module.functions[i];
         std::string const symName =
-            "_sym_" + std::to_string(fn.symbol.v);
+            isDylib ? dylibSymNames.definedName(fn.symbol, "_sym_")
+                    : "_sym_" + std::to_string(fn.symbol.v);
         std::uint32_t const nameOff = strtab.add(symName);
         appendU32LE(nlistBytes, nameOff);
         appendU8(nlistBytes,
@@ -2940,6 +3561,28 @@ encodeExecDynamic(AssembledModule const&    module,
             : 0u;
     constexpr std::size_t kSegCmdLinkeditSize = kSegmentCommand64Size;
     constexpr std::size_t kLcMainSize         = 24;
+    // c153 (D-LK3-3) — the per-flavor load-command set:
+    //   * __PAGEZERO's LC_SEGMENT_64 exists iff hasPageZero (exec
+    //     always, dylib never — validate() pins pageZeroSize per
+    //     flavor);
+    //   * __DATA_CONST's exists iff the module has externs (its only
+    //     content is __got);
+    //   * LC_LOAD_DYLINKER is schema-keyed on dylinkerPath (validate:
+    //     non-empty on exec, empty on dylib);
+    //   * LC_MAIN is exec-only (a dylib has no entry);
+    //   * LC_ID_DYLIB is dylib-only (the installName identity).
+    // Every exec-flavor value equals the historic constant — the
+    // exec image stays byte-identical (the mandatory control).
+    std::size_t const segCmdPageZeroActual =
+        hasPageZero ? kSegCmdPageZeroSize : 0u;
+    std::size_t const segCmdDataConstActual =
+        hasDataConstSeg ? kSegCmdDataConstSize : 0u;
+    bool const emitDylinker = !im.dylinkerPath.empty();
+    std::size_t const dylinkerCmdSizeActual =
+        emitDylinker ? dylinkerCmdSize : 0u;
+    std::size_t const lcMainSizeActual = isDylib ? 0u : kLcMainSize;
+    std::size_t const idDylibCmdSize =
+        isDylib ? commandSizeWithPath(24, im.installName) : 0u;
 
     // LK7: when `codeSignatureSize > 0` OR an ad-hoc `codeSignature`
     // block is present, append LC_CODE_SIGNATURE (16-byte
@@ -2963,18 +3606,27 @@ encodeExecDynamic(AssembledModule const&    module,
     // declares `image.buildVersion` — required for the image to load on
     // macOS 11+ / Apple Silicon (D-LK10-ENTRY-MACHO-EXIT).
     bool const emitBuildVersion = im.buildVersion.has_value();
-    // ncmds = 4 segments + LC_DYLD_{INFO_ONLY|CHAINED_FIXUPS}
-    //       + LC_LOAD_DYLINKER + LC_MAIN + N × LC_LOAD_DYLIB
+    // ncmds = segments + LC_DYLD_{INFO_ONLY|CHAINED_FIXUPS}
+    //       + [LC_LOAD_DYLINKER] + [LC_MAIN] + [LC_ID_DYLIB]
+    //       + N × LC_LOAD_DYLIB
     //       + LC_SYMTAB + (LC_DYSYMTAB when !useChainedFixups —
     //       D-LK6-14-INTEGRATION-GOT-SLOTS drops it because chained
     //       pointers in __got encode the import ordinal directly, so
     //       the indirect symbol table is redundant) + LC_CODE_SIGNATURE
     //       when emitCodeSig + LC_BUILD_VERSION when emitBuildVersion.
-    // Segment count: __PAGEZERO + __TEXT + __DATA_CONST + __LINKEDIT = 4, plus
-    // __DATA when the module has writable globals (D-LK4-DATA-PRODUCER).
-    std::uint32_t const segCount = 4u + (hasDataSeg ? 1u : 0u);
+    // Segment count: __TEXT + __LINKEDIT = 2, plus __PAGEZERO
+    // (exec-flavor only), __DATA_CONST (externs present), __DATA
+    // (writable globals — D-LK4-DATA-PRODUCER).
+    std::uint32_t const segCount = 2u
+        + (hasPageZero ? 1u : 0u)
+        + (hasDataConstSeg ? 1u : 0u)
+        + (hasDataSeg ? 1u : 0u);
     std::uint32_t const ncmds = static_cast<std::uint32_t>(
-        segCount + 1u + 1u + 1u + im.loadDylibs.size() + 1u
+        segCount + 1u
+        + (emitDylinker ? 1u : 0u)
+        + (isDylib ? 1u : 0u)          // LC_ID_DYLIB
+        + (isDylib ? 0u : 1u)          // LC_MAIN
+        + im.loadDylibs.size() + 1u
         + (useChainedFixups ? 0u : 1u)
         + (emitCodeSig ? 1u : 0u)
         + (emitBuildVersion ? 1u : 0u));
@@ -2985,10 +3637,10 @@ encodeExecDynamic(AssembledModule const&    module,
         ? kLinkeditDataCommandSize
         : kDyldInfoCommandSize;
     std::size_t const sizeofcmds =
-        kSegCmdPageZeroSize + kSegCmdTextSize + kSegCmdDataConstSize +
+        segCmdPageZeroActual + kSegCmdTextSize + segCmdDataConstActual +
         kSegCmdDataSize + kSegCmdLinkeditSize + dyldBindCmdSize +
-        dylinkerCmdSize + kLcMainSize + totalDylibCmdSize +
-        kSymtabCommandSize +
+        dylinkerCmdSizeActual + lcMainSizeActual + idDylibCmdSize +
+        totalDylibCmdSize + kSymtabCommandSize +
         (useChainedFixups ? 0u : kDysymtabCommandSize) +
         (emitCodeSig ? kCodeSigCommandSize : 0u) +
         (emitBuildVersion ? kBuildVersionCommandSize : 0u);
@@ -3139,27 +3791,39 @@ encodeExecDynamic(AssembledModule const&    module,
 
     // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): the LC_DYLD_INFO_ONLY REBASE opcode
     // stream for the __DATA abs64 pointer sites collected after symbolVa was
-    // built. Each is rebased as a POINTER at (segment __DATA, offset = siteVA −
-    // __DATA vmaddr). __DATA is the 4th segment: __PAGEZERO=0, __TEXT=1,
-    // __DATA_CONST=2 are ALL unconditional, then __DATA=3 (present whenever a
-    // data item exists, which is exactly when dataRebaseSiteVas is non-empty);
-    // i.e. the bind stream's kSegIdxDataConst (=2) + 1, same emission order. An
-    // empty site list yields ZERO rebase bytes — byte-identical to the no-data
-    // path. dyld adds the image's load slide to each rebased pointer.
-    constexpr std::uint8_t kSegIdxData = 3;
-    // The chained-fixups path (D-LK6-14) encodes rebases as inline
-    // DYLD_CHAINED_PTR_64 bitfields, NOT a rebase opcode stream — a different
-    // mechanism this writer does not yet emit for DATA sites. The shipped darwin
-    // formats use the legacy path (useChainedFixups=false), so this never fires
-    // for them; fail loud rather than drop the rebases silently if it is enabled.
-    if (useChainedFixups && !dataRebaseSiteVas.empty()) {
+    // built (MINUS the extern-targeted slots the c153 fold moved to BIND
+    // sites — dyld's bind overwrites the whole slot, so rebasing it first
+    // would slide a zeroed placeholder for nothing). Each remaining
+    // INTERNAL site — a fn-ptr table entry, an &global initializer, a
+    // relro row folded into __data — is rebased as a POINTER at (segment
+    // __DATA, offset = siteVA − __DATA vmaddr): the stored link-time VA
+    // plus dyld's slide is the loaded address, on the exec (MH_PIE random
+    // slide) and the dylib (base-0 image, slide = the load address) alike
+    // — the ELF c150 R_X86_64_RELATIVE mirror. The segment index is the
+    // computed `segIdxData` (3 on the exec flavor — the historic
+    // constant; earlier on a dylib whose __PAGEZERO/__DATA_CONST are
+    // absent), cross-checked against the actual emission order below. An
+    // empty site list yields ZERO rebase bytes — byte-identical to the
+    // no-data path. dyld adds the image's load slide to each rebased
+    // pointer.
+    //
+    // The chained-fixups path (D-LK6-14) encodes rebases AND binds as
+    // inline DYLD_CHAINED_PTR_64 bitfields, NOT opcode streams — a
+    // different mechanism this writer does not yet emit for DATA sites.
+    // The shipped darwin formats use the legacy path
+    // (useChainedFixups=false), so this never fires for them; fail loud
+    // rather than drop the fixups silently if it is enabled.
+    if (useChainedFixups
+        && (!dataRebaseSiteVas.empty() || !externAddrBindSites.empty())) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-             std::format("macho::encodeExecDynamic: {} symbol-address pointer "
-                         "site(s) need PIE rebasing, but the chained-fixups path "
-                         "(image.useChainedFixups=true) does not yet emit DATA "
-                         "rebases (D-LK6-14). Use the legacy LC_DYLD_INFO_ONLY "
-                         "path (useChainedFixups=false).",
-                         dataRebaseSiteVas.size()));
+             std::format("macho::encodeExecDynamic: {} symbol-address rebase "
+                         "site(s) + {} extern-addr bind site(s) in __DATA, but "
+                         "the chained-fixups path (image.useChainedFixups=true) "
+                         "does not yet emit DATA fixups (D-LK6-14). Use the "
+                         "legacy LC_DYLD_INFO_ONLY path "
+                         "(useChainedFixups=false).",
+                         dataRebaseSiteVas.size(),
+                         externAddrBindSites.size()));
         return {};
     }
     std::vector<std::uint8_t> dyldRebaseBlob;
@@ -3168,7 +3832,8 @@ encodeExecDynamic(AssembledModule const&    module,
             REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER));
         for (std::uint64_t const siteVa : dataRebaseSiteVas) {
             dyldRebaseBlob.push_back(static_cast<std::uint8_t>(
-                REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | kSegIdxData));
+                REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB
+                | (segIdxData & 0x0Fu)));
             appendULEB128(dyldRebaseBlob, siteVa - dataSegVmaddr);
             dyldRebaseBlob.push_back(static_cast<std::uint8_t>(
                 REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1u));   // rebase 1 pointer
@@ -3308,14 +3973,20 @@ encodeExecDynamic(AssembledModule const&    module,
         hasDataSegFile
             ? alignUp(dataSegLastFileEnd, kPageSize)
             : alignUp(gotFileOff + gotFileSize, kPageSize);
-    // F5: the REBASE stream leads __LINKEDIT (rebase, then bind, then the rest),
-    // matching dyld's LC_DYLD_INFO field order. bindOff (and every offset below)
-    // shifts up by rebaseSize, so linkeditFileSize grows by it automatically.
+    // F5: the REBASE stream leads __LINKEDIT (rebase, then bind, then
+    // the c153 EXPORT TRIE, then the rest), matching dyld's
+    // LC_DYLD_INFO field order — rebase_off < bind_off < export_off.
+    // bindOff (and every offset below) shifts up by rebaseSize, so
+    // linkeditFileSize grows by it automatically; the export blob is
+    // EMPTY on the exec arm (byte-identical output) and on an
+    // exportless dylib.
     std::uint64_t const rebaseOff = linkeditFileOff;
     std::uint64_t const rebaseSize = dyldRebaseBlob.size();
     std::uint64_t const bindOff = rebaseOff + rebaseSize;
     std::uint64_t const bindSize = dyldBindBlob.size();
-    std::uint64_t const indirectSymtabOff = bindOff + bindSize;
+    std::uint64_t const exportOff = bindOff + bindSize;
+    std::uint64_t const exportSize = exportTrieBlob.size();
+    std::uint64_t const indirectSymtabOff = exportOff + exportSize;
     std::uint64_t const indirectSymtabSize =
         static_cast<std::uint64_t>(indirectSyms.size()) * 4u;
     std::uint64_t const symtabOff = indirectSymtabOff + indirectSymtabSize;
@@ -3434,26 +4105,31 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, 0);
 
     // TLS C4 (audit FOLD-1): count the segments emitted BEFORE __DATA so the
-    // descriptor-bind segment index can be cross-checked against the ACTUAL
-    // emission (see the __DATA emission below). __PAGEZERO/__TEXT/__DATA_CONST
-    // each ++ this as they complete; a reorder or an inserted/removed segment
-    // makes the count diverge from kTlvDescriptorBindSegIndex → fail loud.
+    // __DATA-targeting bind/rebase segment index can be cross-checked against
+    // the ACTUAL emission (see the __DATA emission below). __PAGEZERO/__TEXT/
+    // __DATA_CONST each ++ this as they complete (the conditional ones only
+    // when EMITTED — c153); a reorder or an inserted/removed segment makes the
+    // count diverge from the computed segIdxData → fail loud.
     std::uint32_t machoSegmentsBeforeData = 0;
 
-    // LC_SEGMENT_64 __PAGEZERO
-    appendU32LE(bytes, LC_SEGMENT_64);
-    appendU32LE(bytes, static_cast<std::uint32_t>(kSegCmdPageZeroSize));
-    appendName16(bytes, "__PAGEZERO");
-    appendU64LE(bytes, 0);
-    appendU64LE(bytes, im.pageZeroSize);
-    appendU64LE(bytes, 0);
-    appendU64LE(bytes, 0);
-    appendU32LE(bytes, 0);
-    appendU32LE(bytes, 0);
-    appendU32LE(bytes, 0);
-    appendU32LE(bytes, 0);
+    // LC_SEGMENT_64 __PAGEZERO — exec flavor only (c153: a dylib is a
+    // base-0 slid image with no zero page; validate() pins
+    // pageZeroSize == 0 there and hasPageZero keys off it).
+    if (hasPageZero) {
+        appendU32LE(bytes, LC_SEGMENT_64);
+        appendU32LE(bytes, static_cast<std::uint32_t>(kSegCmdPageZeroSize));
+        appendName16(bytes, "__PAGEZERO");
+        appendU64LE(bytes, 0);
+        appendU64LE(bytes, im.pageZeroSize);
+        appendU64LE(bytes, 0);
+        appendU64LE(bytes, 0);
+        appendU32LE(bytes, 0);
+        appendU32LE(bytes, 0);
+        appendU32LE(bytes, 0);
+        appendU32LE(bytes, 0);
 
-    ++machoSegmentsBeforeData;  // __PAGEZERO emitted (index 0)
+        ++machoSegmentsBeforeData;  // __PAGEZERO emitted (exec index 0)
+    }
 
     // LC_SEGMENT_64 __TEXT (__text + __stubs, plus __const when data
     // globals are present — D-LK1-ELF-EXEC-DATA-SECTIONS Mach-O __const mirror).
@@ -3523,33 +4199,60 @@ encodeExecDynamic(AssembledModule const&    module,
 
     ++machoSegmentsBeforeData;  // __TEXT emitted (index 1)
 
-    // LC_SEGMENT_64 __DATA_CONST (1 section: __got)
+    // LC_SEGMENT_64 __DATA_CONST (1 section: __got) — present iff the
+    // module has externs (c153: its ONLY content is the __got table;
+    // a zero-extern dylib emits neither the segment nor its load
+    // command; the exec dynamic arm always has externs — its gate —
+    // so its output is unchanged).
     constexpr std::int32_t kVmProtRw = 3;
-    appendU32LE(bytes, LC_SEGMENT_64);
-    appendU32LE(bytes, static_cast<std::uint32_t>(kSegCmdDataConstSize));
-    appendName16(bytes, "__DATA_CONST");
-    appendU64LE(bytes, dataConstSegVmaddr);
-    appendU64LE(bytes, dataConstSegVmsize);
-    appendU64LE(bytes, gotFileOff);
-    appendU64LE(bytes, dataConstSegFileSize);
-    appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRw));
-    appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRw));
-    appendU32LE(bytes, 1);
-    appendU32LE(bytes, 0);
+    if (hasDataConstSeg) {
+        // c153 F3 fold: cross-check the __DATA_CONST emission index
+        // against the computed `segIdxDataConst` the __got BIND
+        // opcodes addressed — the same discipline as the __DATA check
+        // below, and the ONLY index check an externs-but-no-writable-
+        // data image gets (hasDataSeg false skips the __DATA one). A
+        // divergence means the got binds would resolve against the
+        // wrong segment — fail loud, never a silent wrong-segment
+        // bind.
+        if (machoSegmentsBeforeData != segIdxDataConst) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format(
+                     "macho::encodeExecDynamic: __DATA_CONST is emitted "
+                     "at segment index {} but the __got bind opcodes "
+                     "used index {} -- the segment layout changed and "
+                     "the got binds would resolve against the wrong "
+                     "segment (c153 F3; the __DATA sibling check).",
+                     machoSegmentsBeforeData, segIdxDataConst));
+            return {};
+        }
+        appendU32LE(bytes, LC_SEGMENT_64);
+        appendU32LE(bytes, static_cast<std::uint32_t>(kSegCmdDataConstSize));
+        appendName16(bytes, "__DATA_CONST");
+        appendU64LE(bytes, dataConstSegVmaddr);
+        appendU64LE(bytes, dataConstSegVmsize);
+        appendU64LE(bytes, gotFileOff);
+        appendU64LE(bytes, dataConstSegFileSize);
+        appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRw));
+        appendU32LE(bytes, static_cast<std::uint32_t>(kVmProtRw));
+        appendU32LE(bytes, 1);
+        appendU32LE(bytes, 0);
 
-    // section_64 __got
-    appendName16(bytes, "__got");
-    appendName16(bytes, "__DATA_CONST");
-    appendU64LE(bytes, gotVa);
-    appendU64LE(bytes, gotFileSize);
-    appendU32LE(bytes, static_cast<std::uint32_t>(gotFileOff));
-    appendU32LE(bytes, /*addrAlign=*/3);   // log2(8) = 3
-    appendU32LE(bytes, 0);
-    appendU32LE(bytes, 0);
-    appendU32LE(bytes, S_NON_LAZY_SYMBOL_POINTERS);
-    appendU32LE(bytes, kGotReserved1);    // index of first indirect sym
-    appendU32LE(bytes, 0);
-    appendU32LE(bytes, 0);
+        // section_64 __got
+        appendName16(bytes, "__got");
+        appendName16(bytes, "__DATA_CONST");
+        appendU64LE(bytes, gotVa);
+        appendU64LE(bytes, gotFileSize);
+        appendU32LE(bytes, static_cast<std::uint32_t>(gotFileOff));
+        appendU32LE(bytes, /*addrAlign=*/3);   // log2(8) = 3
+        appendU32LE(bytes, 0);
+        appendU32LE(bytes, 0);
+        appendU32LE(bytes, S_NON_LAZY_SYMBOL_POINTERS);
+        appendU32LE(bytes, kGotReserved1);    // index of first indirect sym
+        appendU32LE(bytes, 0);
+        appendU32LE(bytes, 0);
+
+        ++machoSegmentsBeforeData;  // __DATA_CONST emitted (exec index 2)
+    }
 
     // LC_SEGMENT_64 __DATA (D-LK4-DATA-PRODUCER) — writable (rw-) segment with
     // __data (file-backed mutable globals) and/or __bss (S_ZEROFILL zero-fill,
@@ -3558,23 +4261,23 @@ encodeExecDynamic(AssembledModule const&    module,
     // S_ZEROFILL) — never hardcoded, keeping the writer agnostic. filesize
     // covers __data only (__bss is zero-fill); vmsize covers both.
     if (hasDataSeg) {
-        ++machoSegmentsBeforeData;  // __DATA_CONST emitted (index 2)
-        // TLS C4 (audit FOLD-1): __DATA is the NEXT segment; its index ==
-        // machoSegmentsBeforeData. Cross-check it matches the value the
-        // __tlv_bootstrap descriptor binds used — a divergence means the
-        // segment layout changed and the binds now resolve against the WRONG
-        // segment (a Mac crash invisible to every local pin). Fail loud rather
-        // than ship a silently mis-bound image.
-        if (hasTvars
-            && machoSegmentsBeforeData != kTlvDescriptorBindSegIndex) {
+        // TLS C4 (audit FOLD-1), widened by c153: __DATA is the NEXT segment;
+        // its index == machoSegmentsBeforeData. Cross-check it matches the
+        // COMPUTED `segIdxData` that the __tlv_bootstrap descriptor binds, the
+        // F5 rebase stream AND the extern-addr binds all addressed — a
+        // divergence means the segment layout changed and every __DATA-
+        // targeting fixup would resolve against the wrong segment (a Mac
+        // crash invisible to every local pin). Fail loud rather than ship a
+        // silently mis-fixed image.
+        if (machoSegmentsBeforeData != segIdxData) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                  std::format(
                      "macho::encodeExecDynamic: __DATA is emitted at segment "
-                     "index {} but the __tlv_bootstrap descriptor binds target "
-                     "index {} — the segment layout changed and the TLV binds "
-                     "would resolve against the wrong segment "
-                     "(D-CSUBSET-THREAD-LOCAL, M-2/FOLD-1).",
-                     machoSegmentsBeforeData, kTlvDescriptorBindSegIndex));
+                     "index {} but the __DATA-targeting bind/rebase opcodes "
+                     "used index {} -- the segment layout changed and the "
+                     "fixups would resolve against the wrong segment "
+                     "(D-CSUBSET-THREAD-LOCAL M-2/FOLD-1, widened c153).",
+                     machoSegmentsBeforeData, segIdxData));
             return {};
         }
         appendU32LE(bytes, LC_SEGMENT_64);
@@ -3692,13 +4395,33 @@ encodeExecDynamic(AssembledModule const&    module,
     appendU32LE(bytes, 0);
     appendU32LE(bytes, 0);
 
-    // LC_BUILD_VERSION — emitted after the four LC_SEGMENT_64 commands
+    // LC_BUILD_VERSION — emitted after the LC_SEGMENT_64 commands
     // (so it does NOT shift the segment indices the bind opcodes
     // reference) and before the dyld-binding command. Declares the
     // platform / min-OS so dyld accepts the image on macOS 11+ / Apple
     // Silicon (D-LK10-ENTRY-MACHO-EXIT).
     if (emitBuildVersion) {
         appendBuildVersionCommand(bytes, *im.buildVersion);
+    }
+
+    // LC_ID_DYLIB (c153, D-LK3-3) — the dylib's install-name identity,
+    // 24-byte dylib_command + the NUL-terminated installName (same
+    // wire shape as LC_LOAD_DYLIB). timestamp / current_version /
+    // compatibility_version are ZERO, matching this walker's
+    // LC_LOAD_DYLIB convention (dyld ignores the timestamp; version
+    // checks fire only for clients that record a required version).
+    if (isDylib) {
+        std::size_t const cmdStart = bytes.size();
+        appendU32LE(bytes, LC_ID_DYLIB);
+        appendU32LE(bytes, static_cast<std::uint32_t>(idDylibCmdSize));
+        appendU32LE(bytes, 24);   // lc_str name offset
+        appendU32LE(bytes, 0);    // timestamp
+        appendU32LE(bytes, 0);    // current_version
+        appendU32LE(bytes, 0);    // compatibility_version
+        for (char c : im.installName)
+            appendU8(bytes, static_cast<std::uint8_t>(c));
+        appendU8(bytes, 0);
+        while (bytes.size() - cmdStart < idDylibCmdSize) appendU8(bytes, 0);
     }
 
     if (useChainedFixups) {
@@ -3723,11 +4446,18 @@ encodeExecDynamic(AssembledModule const&    module,
         appendU32LE(bytes, static_cast<std::uint32_t>(bindSize));
         appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // weak_bind
         appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // lazy_bind (eager — 0)
-        appendU32LE(bytes, 0); appendU32LE(bytes, 0);   // export
+        // export_off/export_size — the c153 MH_DYLIB EXPORT TRIE.
+        // Zero on the exec arm and on an exportless dylib (dyld
+        // treats 0/0 as "no exports"), exactly the pre-c153 bytes.
+        appendU32LE(bytes,
+                    static_cast<std::uint32_t>(exportSize ? exportOff : 0));
+        appendU32LE(bytes, static_cast<std::uint32_t>(exportSize));
     }
 
-    // LC_LOAD_DYLINKER
-    {
+    // LC_LOAD_DYLINKER — schema-keyed on a non-empty dylinkerPath
+    // (exec flavor; validate() pins it EMPTY on a dylib, which is
+    // mapped by the already-running dyld).
+    if (emitDylinker) {
         std::size_t const cmdStart = bytes.size();
         appendU32LE(bytes, LC_LOAD_DYLINKER);
         appendU32LE(bytes, static_cast<std::uint32_t>(dylinkerCmdSize));
@@ -3738,11 +4468,15 @@ encodeExecDynamic(AssembledModule const&    module,
         while (bytes.size() - cmdStart < dylinkerCmdSize) appendU8(bytes, 0);
     }
 
-    // LC_MAIN
-    appendU32LE(bytes, LC_MAIN);
-    appendU32LE(bytes, static_cast<std::uint32_t>(kLcMainSize));
-    appendU64LE(bytes, textFileOff + funcTextStart[entryFnIdx]);
-    appendU64LE(bytes, 0);
+    // LC_MAIN — exec flavor only (c153: a dylib has no process entry;
+    // the entry-cluster belt at the top already rejected any entry
+    // config on the dylib arm).
+    if (!isDylib) {
+        appendU32LE(bytes, LC_MAIN);
+        appendU32LE(bytes, static_cast<std::uint32_t>(kLcMainSize));
+        appendU64LE(bytes, textFileOff + funcTextStart[entryFnIdx]);
+        appendU64LE(bytes, 0);
+    }
 
     // LC_LOAD_DYLIB[]
     for (auto const& d : im.loadDylibs) {
@@ -3893,6 +4627,10 @@ encodeExecDynamic(AssembledModule const&    module,
     // OR chained-fixups payload depending on useChainedFixups).
     bytes.insert(bytes.end(), dyldBindBlob.begin(), dyldBindBlob.end());
 
+    // __LINKEDIT: the c153 MH_DYLIB export trie at exportOff (empty on
+    // the exec arm / an exportless dylib — zero bytes inserted).
+    bytes.insert(bytes.end(), exportTrieBlob.begin(), exportTrieBlob.end());
+
     // Indirect-symtab
     for (auto const idx : indirectSyms) appendU32LE(bytes, idx);
 
@@ -3915,7 +4653,11 @@ encodeExecDynamic(AssembledModule const&    module,
             // Build the real ad-hoc CodeDirectory + SuperBlob over the
             // signed bytes and write it into the reservation. execSeg
             // limit = the __TEXT segment file size (the kernel maps it
-            // as the main binary's executable region).
+            // as the image's executable region); execSegFlags is
+            // per-flavor (c153): CS_EXECSEG_MAIN_BINARY on the exec —
+            // byte-identical to pre-c153 — and NONE on a dylib
+            // (codesign ground truth: a dylib is not the main binary
+            // and Apple's tooling never flags one as such).
             std::vector<std::uint8_t> const sig =
                 dss::macho::detail::buildAdHocCodeSignature(
                     std::span<std::uint8_t const>{bytes.data(),
@@ -3923,7 +4665,10 @@ encodeExecDynamic(AssembledModule const&    module,
                     static_cast<std::uint32_t>(codeSigFileOff),
                     im.codeSignature->pageSize,
                     im.codeSignature->identifier,
-                    textSegFileSize);
+                    textSegFileSize,
+                    isDylib
+                        ? dss::macho::detail::kCsExecSegFlagsNone
+                        : dss::macho::detail::kCsExecSegFlagsMainBinary);
             // Substrate invariant: the built blob occupies the reserved
             // region EXACTLY (no overrun, no slack). The reservation
             // size was derived from `adHocCodeSignatureSize` over the

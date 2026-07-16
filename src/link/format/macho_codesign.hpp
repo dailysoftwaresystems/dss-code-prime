@@ -59,7 +59,12 @@
 //     [56..63] codeLimit64    = 0 (codeLimit fits in 32 bits here)
 //     [64..71] execSegBase    = 0 (__TEXT starts at file offset 0)
 //     [72..79] execSegLimit   = file size of the __TEXT segment
-//     [80..87] execSegFlags   = 1 (CS_EXECSEG_MAIN_BINARY)
+//     [80..87] execSegFlags   = caller-supplied: CS_EXECSEG_MAIN_BINARY
+//                               (1) for an MH_EXECUTE main binary; 0
+//                               for an MH_DYLIB (codesign ground truth
+//                               — a dylib is NOT the main binary, and
+//                               Apple's codesign never sets the flag
+//                               on one; c153 D-LK3-3)
 //     [88..]   identifier C-string (NUL-terminated) at identOffset
 //     [..]     nCodeSlots × 32-byte SHA-256 page hashes at hashOffset
 //   (nSpecialSlots == 0 ⇒ no negative special slots precede hashOffset.)
@@ -69,6 +74,14 @@
 // the fixed-header length, and hashOffset = identOffset + ident + 1.
 
 namespace dss::macho::detail {
+
+// CodeDirectory execSegFlags values (Apple `cs_blobs.h`). The caller
+// (macho.cpp) picks per image flavor: MAIN_BINARY on MH_EXECUTE, 0 on
+// MH_DYLIB — matching what `codesign -s -` stamps on each (c153,
+// D-LK3-3; a MAIN_BINARY-flagged dylib is a shape Apple's tooling
+// never produces, so this substrate does not ship it either).
+inline constexpr std::uint64_t kCsExecSegFlagsNone       = 0;
+inline constexpr std::uint64_t kCsExecSegFlagsMainBinary = 1;
 
 // Exact byte length of the ad-hoc signature blob the builder produces
 // for the given parameters. The macho.cpp reservation derives its size
@@ -93,10 +106,13 @@ adHocCodeSignatureSize(std::uint32_t   codeLimit,
 // SHA-256 over signedBytes[i*pageSize, min((i+1)*pageSize, codeLimit)).
 //
 // `execSegLimit` is the file size of the __TEXT segment (the execSeg
-// the kernel maps as the main binary's executable region).
+// the kernel maps as the image's executable region). `execSegFlags`
+// is the CodeDirectory execSeg flag word — `kCsExecSegFlagsMainBinary`
+// for an MH_EXECUTE, `kCsExecSegFlagsNone` for an MH_DYLIB (see the
+// constants above).
 //
 // The returned vector's size equals `adHocCodeSignatureSize(codeLimit,
-// pageSize, identifier)` exactly.
+// pageSize, identifier)` exactly (the flags do not affect the length).
 //
 // PRECONDITION: signedBytes.size() >= codeLimit, pageSize > 0.
 [[nodiscard]] DSS_EXPORT std::vector<std::uint8_t>
@@ -104,6 +120,7 @@ buildAdHocCodeSignature(std::span<std::uint8_t const> signedBytes,
                         std::uint32_t                 codeLimit,
                         std::uint32_t                 pageSize,
                         std::string_view              identifier,
-                        std::uint64_t                 execSegLimit);
+                        std::uint64_t                 execSegLimit,
+                        std::uint64_t                 execSegFlags);
 
 } // namespace dss::macho::detail

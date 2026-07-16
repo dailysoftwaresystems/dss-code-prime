@@ -383,14 +383,15 @@ struct DSS_EXPORT PeOptionalHeader {
 // definition.
 // Mach-O `mach_header_64.filetype` closed enum, mirroring
 // ElfObjectType / PeObjectType. Numeric values match
-// <mach-o/loader.h>'s MH_OBJECT / MH_EXECUTE / MH_DYLIB. The walker
-// supports the first two; Dylib is declared but rejected by
-// validate() until a future cycle ships the .dylib arm (anchored
-// at plan 14 §3.1 D-LK3-3).
+// <mach-o/loader.h>'s MH_OBJECT / MH_EXECUTE / MH_DYLIB. All three
+// have walker arms: Object (LK3 cycle 1), Execute (LK3 cycle 2),
+// Dylib (c153, D-LK3-3 — the Mach-O mirror of ELF ET_DYN's c150
+// `.so` + PE Dll's c152 `.dll`: entry-less image, LC_ID_DYLIB,
+// export trie in LC_DYLD_INFO_ONLY, no __PAGEZERO).
 enum class MachOObjectType : std::uint32_t {
     Object  = 1,   // MH_OBJECT  — relocatable .o
     Execute = 2,   // MH_EXECUTE — executable image
-    Dylib   = 6,   // MH_DYLIB   — dynamic library (anchored D-LK3-3)
+    Dylib   = 6,   // MH_DYLIB   — dynamic library (c153, D-LK3-3)
 };
 
 inline constexpr EnumNameTable<MachOObjectType, 3> kMachOObjectTypeTable{{{
@@ -416,15 +417,16 @@ struct DSS_EXPORT MachOIdentity {
     MachOObjectType filetype = MachOObjectType::Object;
                                      // LK3 cycle 1 ships MH_OBJECT;
                                      // LK3 cycle 2 adds MH_EXECUTE
-                                     // (closes D-LK3-2). MH_DYLIB
-                                     // anchored at D-LK3-3.
+                                     // (closes D-LK3-2); c153 adds
+                                     // MH_DYLIB (closes D-LK3-3).
     std::uint32_t flags = 0;         // MH_SUBSECTIONS_VIA_SYMBOLS=0x2000
                                      // / MH_PIE=0x200000 (mandatory for
                                      //   modern macOS exec). Optional;
                                      //   0 is legal for a minimal .o.
 };
 
-// ── Mach-O image block (loaded only when filetype==MH_EXECUTE) ──
+// ── Mach-O image block (loaded when filetype is MH_EXECUTE or
+//    MH_DYLIB — every loadable image flavor; rejected on MH_OBJECT) ──
 //
 // Carries the executable-only Mach-O identity fields. Mirrors LK1
 // cycle 2's universal pattern (`virtualAddress` on sections,
@@ -555,6 +557,12 @@ inline constexpr std::uint64_t kDefaultMachoSegmentPageSize = 0x1000u;  // 4 KiB
 
 struct DSS_EXPORT MachOImage {
     std::uint64_t pageZeroSize = 0;        // __PAGEZERO vmsize
+                                           // (MUST be 0 on MH_DYLIB — a
+                                           // dylib carries no __PAGEZERO;
+                                           // ld64 likewise rejects
+                                           // -pagezero_size on non-main
+                                           // links. validate() enforces
+                                           // >0 on Execute, ==0 on Dylib.)
     // VM segment page size — the granularity at which every
     // LC_SEGMENT_64's vmaddr / vmsize / fileoff is aligned (and the
     // file is padded between segments). The kernel's mmap-congruence
@@ -574,7 +582,32 @@ struct DSS_EXPORT MachOImage {
     // byte-identical (D-LK10-ENTRY-MACHO-EXIT).
     std::uint64_t segmentPageSize = kDefaultMachoSegmentPageSize;
     std::string   dylinkerPath;            // LC_LOAD_DYLINKER name
+                                           // (Execute-only: dyld is the
+                                           // EXECUTABLE's loader; a dylib
+                                           // is mapped by the already-
+                                           // running dyld. validate()
+                                           // requires non-empty on
+                                           // Execute, EMPTY on Dylib.)
     std::vector<MachODylibRef> loadDylibs; // each → LC_LOAD_DYLIB
+    // D-LK3-3 (c153): the MH_DYLIB LC_ID_DYLIB install name — the
+    // identity a CLIENT records at link time and dyld resolves at its
+    // load (`@rpath/libdss.dylib` is the modern convention). REQUIRED
+    // non-empty on a Dylib schema and REJECTED on every other filetype
+    // (dead config there): every ld64-produced MH_DYLIB carries an
+    // LC_ID_DYLIB, and dyld's two-level-namespace client binding keys
+    // on it — emitting a dylib without one is an unverifiable-without-
+    // a-Mac corner this substrate does not ship. Config-driven + honest
+    // (the c150 DT_SONAME discipline): the walker NEVER derives the
+    // name from the output file name (it emits bytes and does not know
+    // it), and an unset field fails loud at validate() rather than
+    // silently inventing an identity. The shipped
+    // `macho64-arm64-darwin-dylib` schema declares a generic default
+    // (the same shipped-schema-identity concession as
+    // `codeSignature.identifier`); a differently-named artifact
+    // overrides via its own format JSON. Not needed for plain
+    // dlopen-by-path (dyld keys that on the path), but clients that
+    // LINK against the dylib record this string verbatim.
+    std::string   installName;
     // Eager-vs-lazy dynamic-binding choice (parallel to
     // `ElfIdentity.bindNow` — same semantic across ELF + Mach-O).
     // `true` (the v1 stance per plan 14 §5 risk row) emits the
@@ -734,7 +767,8 @@ struct DSS_EXPORT ObjectFormatData {
                                            //   pe.objectType != Obj
     MachOIdentity    macho{};
     MachOImage       machoImage{};        // populated only when
-                                           //   macho.filetype == MH_EXECUTE
+                                           //   macho.filetype is
+                                           //   MH_EXECUTE / MH_DYLIB
 
     // ── Image-side fields (LK1 cycle 2+) ─────────────────────
     //
@@ -1018,20 +1052,25 @@ public:
 
     // Cross-format image-flavor predicate. True iff the schema
     // describes an executable / shared-library image (ELF ET_EXEC
-    // or ET_DYN, PE Exec/Dll, Mach-O MH_EXECUTE) — i.e. the walker
-    // emits a LOAD-TIME-BOUND image (PT_LOAD / IMAGE_OPTIONAL_HEADER
-    // / LC_MAIN+LC_LOAD_DYLINKER) rather than relocatable section
-    // bytes a LATER linker binds. c150 (D-LK1-4): ET_DYN now counts
-    // — a `.so` IS load-time-bound (ld.so maps + relocates it; no
-    // later static linker sees its innards), closing the c143-era
-    // latent imprecision this predicate carried while no dyn format
-    // shipped. "Image" does NOT imply "rejects undefined externs" —
-    // that policy is the SEPARATE `allowsUndefinedImports()` below
-    // (a .so is an image AND may carry undefined symbols).
+    // or ET_DYN, PE Exec/Dll, Mach-O MH_EXECUTE/MH_DYLIB) — i.e. the
+    // walker emits a LOAD-TIME-BOUND image (PT_LOAD /
+    // IMAGE_OPTIONAL_HEADER / LC_MAIN+LC_LOAD_DYLINKER) rather than
+    // relocatable section bytes a LATER linker binds. c150 (D-LK1-4):
+    // ET_DYN now counts — a `.so` IS load-time-bound (ld.so maps +
+    // relocates it; no later static linker sees its innards), closing
+    // the c143-era latent imprecision this predicate carried while no
+    // dyn format shipped. c153 (D-LK3-3): Mach-O MH_DYLIB likewise —
+    // dyld maps + rebases + binds a dylib at dlopen/load time exactly
+    // as it does the main image; the arm is `!= Object` (mirroring
+    // ELF `!= Rel` / PE `!= Obj`) so all three formats key the
+    // predicate the same way. "Image" does NOT imply "rejects
+    // undefined externs" — that policy is the SEPARATE
+    // `allowsUndefinedImports()` below (a .so is an image AND may
+    // carry undefined symbols).
     // The `isExecFlavor` rule inside `validate()` remains
     // EXEC-only by design (it gates entry/processExit machinery a
-    // `.so` must not declare) — the two predicates diverged at c150
-    // and no longer mirror each other.
+    // `.so` / `.dylib` must not declare) — the two predicates
+    // diverged at c150 and no longer mirror each other.
     [[nodiscard]] bool isImageFlavor() const noexcept {
         switch (d_.kind) {
             case ObjectFormatKind::Elf:
@@ -1039,7 +1078,7 @@ public:
             case ObjectFormatKind::Pe:
                 return d_.pe.objectType != PeObjectType::Obj;
             case ObjectFormatKind::MachO:
-                return d_.macho.filetype == MachOObjectType::Execute;
+                return d_.macho.filetype != MachOObjectType::Object;
             default:
                 return false;
         }
@@ -1071,9 +1110,18 @@ public:
     // Windows has no ld.so-style deferred global scope for
     // implicitly-linked DLLs: every import binds at load from a NAMED
     // module's export table, so a referenced no-library extern still
-    // rejects loud at build time; Mach-O dylib default two-level
-    // namespace likewise (a flat-namespace opt-in would flip its arm
-    // then).
+    // rejects loud at build time. c153 (D-LK3-3): Mach-O MH_DYLIB is
+    // FALSE for the same structural reason — the shipped bind model
+    // is the modern TWO-LEVEL namespace (MH_TWOLEVEL; every
+    // LC_DYLD_INFO bind opcode names a SPECIFIC dylib ordinal, and
+    // the walker fails loud on an import whose library is not in
+    // image.loadDylibs), so a library-less undefined has no bind row
+    // to ride: unlike ELF's flat global scope there is nothing that
+    // resolves it at load. macOS DOES have a flat-namespace opt-in
+    // (MH_FLAT + BIND_SPECIAL_DYLIB_FLAT_LOOKUP ordinal -2, or
+    // `-undefined dynamic_lookup`), but that is a DIFFERENT bind
+    // model the eager two-level machinery deliberately does not
+    // ship; a flat-namespace schema knob would flip this arm then.
     [[nodiscard]] bool allowsUndefinedImports() const noexcept {
         if (!isImageFlavor()) return true;   // relocatable: later linker resolves
         return d_.kind == ObjectFormatKind::Elf
