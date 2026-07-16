@@ -1,0 +1,11 @@
+{
+  "$comment": "c158 roadmap C2 (D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR, PE fail-loud witness): `int *p = &_fmode;` -- the address of a REAL msvcrt DATA export (_fmode) in a file-scope initializer -- is REJECTED on the pe64 image arm. PE has no symbol-based image relocation, so baking the extern's IAT-slot VA into the pointer slot would leave `p` one indirection off (MSVC rejects the same shape, C2099); pe::encodeExec FAILS LOUD with K_RelocationKindMismatch naming _fmode + this anchor and emits NO binary. Drives the full pipeline through the in-process runner AND the CLI subprocess, asserting a rejected compile with no artifact. The reject is a linker-tier diagnostic with NO source span, so it renders code-only (`error[K_RelocationKindMismatch]`) -> positioned:false (the in-process runner matches the CODE; the CLI harness greps `error[K_RelocationKindMismatch]`). The message-text pins (anchor + _fmode + C2099) live in the structural test PeExecWriterExternSlot.DataItemRelocTargetingExternDataFailsLoudOnExecToo. RED-ON-DISABLE: drop the pe.cpp extern-DATA data-item reject -> silent one-indirection-off bake -> zero diagnostics -> this manifest fails. The ELF/Mach-O positive counterpart (they HAVE a symbol-based fold) is extern_data_addr_static_init; the FUNCTION-extern-address positive on PE is addr_import (its symbolVa is a callable import thunk, kept legal by c152).",
+  "language": "c-subset",
+  "source": "main.c",
+  "targets": [
+    { "spec": "x86_64:pe64-x86_64-windows-exec" }
+  ],
+  "expectDiagnostics": [
+    { "code": "K_RelocationKindMismatch", "line": 1, "col": 1, "positioned": false }
+  ]
+}

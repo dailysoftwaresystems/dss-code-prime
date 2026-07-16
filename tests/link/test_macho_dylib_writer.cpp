@@ -49,14 +49,20 @@
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "macho_test_support.hpp"
+#include "program/program.hpp"
 #include "program/target_spec.hpp"
+#include "scratch_dir.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -805,6 +811,141 @@ TEST(MachoExecWriterExternSlot, ExternDataAddrSlotBindsOnExecArmToo) {
 TEST(MachoExecWriterExternSlot, ExternFunctionAddrSlotBindsOnExecArmToo) {
     expectExternSlotBind(loadShippedExec(), /*expectedDataSegIdx=*/3,
                          /*externIsData=*/false, "_puts");
+}
+
+// ── (4b) D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR: the EXEC arm END-TO-END,
+//    from REAL SOURCE through the shipped stdio.json ────────────────
+//
+// The (4) pins above prove the FOLD given a HAND-BUILT extern-targeted
+// data-item reloc. This pin proves the source->reloc chain the hand-
+// built module assumes: `FILE **pp = &stdout;` compiled through the
+// FULL pipeline (Program::compileFiles -- the CLI's own path) with the
+// shipped <stdio.h>, whose macho macro rewrites `stdout` to the real
+// `___stdoutp` data export, actually EMITS the symbol-based bind for
+// the `pp` __data slot (not a slot-VA bake). Host-independent (byte
+// inspection), so it witnesses the Mach-O exec arm on ANY host -- not
+// only the macos-latest run of the extern_data_addr_static_init corpus.
+namespace {
+namespace efs = std::filesystem;
+
+// Each LC_SEGMENT_64's vmaddr in load-command (index) order -- a bind
+// opcode addresses a slot by (segment INDEX, offset), so the bind's
+// segIdx indexes THIS vector (index 0 = __PAGEZERO on the exec arm).
+[[nodiscard]] std::vector<std::uint64_t>
+collectSegmentVmaddrs(std::vector<std::uint8_t> const& b) {
+    std::vector<std::uint64_t> out;
+    if (b.size() < 32) return out;
+    std::uint32_t const ncmds = readU32LE(b, 16);
+    std::size_t off = 32;
+    for (std::uint32_t i = 0; i < ncmds; ++i) {
+        if (off + 8 > b.size()) break;
+        std::uint32_t const cmd     = readU32LE(b, off);
+        std::uint32_t const cmdsize = readU32LE(b, off + 4);
+        if (cmd == 0x19u && off + 32 <= b.size()) {   // LC_SEGMENT_64
+            out.push_back(readU64LE(b, off + 24));    // segment_command_64.vmaddr
+        }
+        if (cmdsize == 0) break;
+        off += cmdsize;
+    }
+    return out;
+}
+
+[[nodiscard]] std::vector<std::uint8_t> readFileBytes(efs::path const& p) {
+    std::ifstream in(p, std::ios::binary);
+    return {std::istreambuf_iterator<char>(in),
+            std::istreambuf_iterator<char>()};
+}
+} // namespace
+
+TEST(MachoExecSourceExternSlot,
+     StdoutAddrStaticInitEmitsSymbolBasedBindThroughShippedStdio) {
+    using dss::test_support::Location;
+    using dss::test_support::ScratchDir;
+
+    // Compile `FILE **pp = &stdout;` -> arm64 macho exec via the FULL
+    // driver pipeline (the same path the CLI runs). The shipped
+    // <stdio.h> macho macro rewrites `stdout` -> `__stdoutp` (a real
+    // extern DATA export); the file-scope `&stdout` initializer must
+    // emit the c153 symbol-based bind, NOT a slot-VA bake.
+    ScratchDir scratch{Location::InsideRepo, "c158_macho_extern_addr"};
+    auto const src = scratch.path() / "extern_addr.c";
+    {
+        std::ofstream f(src);
+        f << "#include <stdio.h>\n"
+             "FILE **pp = &stdout;\n"
+             "int main(void) { return pp == &stdout ? 42 : 1; }\n";
+    }
+    scratch.useAsCwd();
+    auto const outDir = scratch.path() / "out";
+
+    Program            prog;
+    DiagnosticReporter rep;
+    prog.setOutputDir(outDir);
+    int const rc = prog.compileFiles({src.generic_string()}, "c-subset",
+                                     {"arm64:macho64-arm64-darwin-exec"}, rep);
+    std::ostringstream diag;
+    for (auto const& d : rep.all()) diag << "\n  " << d.actual;
+    ASSERT_EQ(rc, 0) << "compile failed:" << diag.str();
+    ASSERT_EQ(rep.errorCount(), 0u) << diag.str();
+
+    // Single-target build => <outputDir>/<stem>.
+    auto const artifact = outDir / "extern_addr";
+    ASSERT_TRUE(efs::exists(artifact))
+        << "no macho exec at " << artifact.generic_string();
+    auto const bytes = readFileBytes(artifact);
+    ASSERT_FALSE(bytes.empty());
+
+    auto const di = readDyldInfo(bytes);
+    ASSERT_TRUE(di.found);
+    ASSERT_GT(di.bindSize, 0u);
+
+    auto const segVmaddrs = collectSegmentVmaddrs(bytes);
+    auto const dataSegOff = findSegment(bytes, "__DATA");
+    ASSERT_TRUE(dataSegOff.has_value());
+    std::uint64_t const dataSegVmaddr  = readU64LE(bytes, *dataSegOff + 24);
+    std::uint64_t const dataSegFileOff = readU64LE(bytes, *dataSegOff + 40);
+    auto const dataSec = findSection(bytes, "__DATA", "__data");
+    ASSERT_TRUE(dataSec.has_value());
+    std::uint64_t const slotVa = readU64LE(bytes, *dataSec + 32);  // section_64.addr
+
+    // Decode the bind stream; find the bind whose (segIdx, segOff)
+    // resolves to the `pp` __data slot. It MUST target ___stdoutp.
+    std::span<std::uint8_t const> const bindStream{
+        bytes.data() + di.bindOff, di.bindSize};
+    auto const binds = decodeBindStream(bindStream);
+    bool sawSlotBind = false;
+    for (auto const& b : binds) {
+        if (b.segIdx >= segVmaddrs.size()) continue;
+        if (segVmaddrs[b.segIdx] + b.segOff != slotVa) continue;
+        EXPECT_EQ(b.symbol, "___stdoutp")
+            << "the &stdout static-init slot must bind the real data export";
+        EXPECT_EQ(b.ordinal, 1u);   // libSystem = LC_LOAD_DYLIB #1
+        sawSlotBind = true;
+    }
+    // RED-ON-DISABLE: without the c153 fold the walker bakes the got-
+    // slot VA + a rebase, so there is NO symbol-based bind at this slot.
+    EXPECT_TRUE(sawSlotBind)
+        << "no symbol-based bind targets the pp __data slot (VA 0x"
+        << std::hex << slotVa << ") -- a slot-VA bake regressed the fold";
+
+    // The slot bytes are ZEROED on disk (dyld writes resolved + addend).
+    std::uint64_t const slotFileOff =
+        dataSegFileOff + (slotVa - dataSegVmaddr);
+    ASSERT_LE(slotFileOff + 8, bytes.size());
+    EXPECT_EQ(readU64LE(bytes, static_cast<std::size_t>(slotFileOff)), 0u)
+        << "extern-addr slot must be zeroed (a non-zero value is the bake)";
+
+    // And the slot is NOT in the rebase stream (bind owns it).
+    if (di.rebaseSize > 0) {
+        auto const rebases = decodeRebaseStream(
+            std::span<std::uint8_t const>{bytes.data() + di.rebaseOff,
+                                          di.rebaseSize});
+        for (auto const& r : rebases) {
+            if (r.segIdx >= segVmaddrs.size()) continue;
+            EXPECT_NE(segVmaddrs[r.segIdx] + r.segOff, slotVa)
+                << "extern-addr slot must not be BOTH rebased and bound";
+        }
+    }
 }
 
 // ── (5) Codesign: dylib execSegFlags = 0 (not MAIN_BINARY) ────────
