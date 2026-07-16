@@ -9344,3 +9344,181 @@ TEST(SemanticAnalyzerCSubset, LongDoubleConstexprFoldRefusedOnWalledAxis) {
         << "on the f64 axis the SAME fold is exact (long double IS binary64) "
            "— must fold clean";
 }
+
+// ── FC17.9(g) (D-CSUBSET-TGMATH): the SHIPPED <tgmath.h> type-generic macros ──
+//
+// These pins run against the REAL src/dss-config/shippedLibs/tgmath.json — NOT
+// a scratch copy — so a regression IN THE SHIPPED FILE flips them red (the
+// scratch-descriptor discipline would keep a stale mirror green while the
+// shipped macro rotted). Each tgmath name is a function-like `_Generic` macro
+// spliced by the preprocessor at `#include <tgmath.h>`: float → the f-variant
+// with an explicit `(float)` cast; default → the BARE f64 function. Both cast
+// directions are load-bearing (the descriptor $comment documents the empirical
+// proofs); the pins here are:
+//   * the 17-function × {float,double,int} COMPILE MATRIX stays clean on BOTH
+//     an elf and a pe target (pe exercises the fabs/ldexp per-format `variants`
+//     whose float arm bridges through the f64 fn — msvcrt exports no
+//     fabsf/ldexpf, D-CSUBSET-MATH-FLOAT-VARIANTS-PE), with every float-arg
+//     result assigned into a FLOAT lvalue — if a float arm ever mis-dispatched
+//     to the f64 default, that assignment becomes an F64→F32 narrowing
+//     S_TypeMismatch → RED (a per-function wrong-arm pin, not just "compiles");
+//   * a `double _Complex` argument fails S_TypeMismatch LOUD through the BARE
+//     default arm (D-CSUBSET-TGMATH-COMPLEX). RED-ON-DISABLE (verified during
+//     the cycle): flip a default arm to `sqrt((double)(x))` in tgmath.json and
+//     the complex call compiles SILENTLY — (double)z is legal C, drops the
+//     imaginary part, a conformance MISCOMPILE — which is exactly what these
+//     count pins catch.
+
+namespace {
+
+namespace fs = std::filesystem;
+
+// Resolve the REAL shipped system-include dir (src/dss-config/shippedLibs) by
+// the same 8-level upward walk program.cpp's applySystemDirs uses, so the pins
+// exercise the descriptor the production driver ships.
+[[nodiscard]] fs::path findRealShippedLibsDir() {
+    std::error_code ec;
+    fs::path here = fs::current_path(ec);
+    for (int i = 0; i < 8 && !here.empty(); ++i) {
+        fs::path const candidate = here / "src" / "dss-config" / "shippedLibs";
+        if (fs::is_directory(candidate, ec)) return candidate;
+        fs::path const parent = here.parent_path();
+        if (parent == here) break;
+        here = parent;
+    }
+    return {};
+}
+
+// Build + analyze `mainSrc` with the REAL shippedLibs dir on the system path
+// and `format` as the ACTIVE object-format — required by the fabs/ldexp macro
+// `variants` (format-keyed splice, the setjmp.json precedent) and the
+// fabsf/ldexpf per-symbol availability gate. Mirrors the production driver's
+// per-format CU build (UnitBuilder::setActiveFormat + analyze(activeFormat)).
+[[nodiscard]] SemanticModel analyzeRealTgmath(std::string mainSrc,
+                                              ObjectFormatKind format,
+                                              DataModel dataModel) {
+    fs::path const shipped = findRealShippedLibsDir();
+    if (shipped.empty()) {
+        ADD_FAILURE() << "could not locate src/dss-config/shippedLibs from cwd";
+        std::abort();
+    }
+    auto schema = loadShippedSchema("c-subset");
+    UnitBuilder builder{schema};
+    builder.addSystemDir(shipped);
+    builder.setActiveFormat(format);
+    builder.addInMemory(std::move(mainSrc), "main.c");
+    auto cu = std::make_shared<CompilationUnit>(std::move(builder).finish());
+    assertNoBuilderErrors(*cu);
+    return analyze(cu, dataModel, std::nullopt, std::nullopt, format, "x86_64");
+}
+
+// The 17-function × {float,double,int} matrix. Every float-column result is
+// assigned into FLOAT `s` — the strict wrong-arm pin: a float arm that
+// mis-dispatches to the f64 default makes the assignment an F64→F32 narrowing
+// S_TypeMismatch. The double/int columns assign into DOUBLE `r` (the f64
+// default's return; int rides `default:` via int→f64 implicit widening,
+// C 7.25p3). Mixed two-arg combos (any non-float arg) route to the f64 fn.
+constexpr char const* kTgmathMatrixSrc =
+    "#include <tgmath.h>\n"
+    "int main(void) {\n"
+    "    float f; double d; int i; float s; double r;\n"
+    "    f = 1.0f; d = 1.0; i = 1;\n"
+    "    s = sqrt(f); s = sin(f); s = cos(f); s = tan(f); s = asin(f);\n"
+    "    s = acos(f); s = atan(f); s = exp(f); s = log(f); s = log10(f);\n"
+    "    s = floor(f); s = ceil(f); s = fabs(f); s = pow(f, f);\n"
+    "    s = atan2(f, f); s = fmod(f, f); s = ldexp(f, i);\n"
+    "    r = sqrt(d); r = sin(d); r = cos(d); r = tan(d); r = asin(d);\n"
+    "    r = acos(d); r = atan(d); r = exp(d); r = log(d); r = log10(d);\n"
+    "    r = floor(d); r = ceil(d); r = fabs(d); r = pow(d, d);\n"
+    "    r = atan2(d, d); r = fmod(d, d); r = ldexp(d, i);\n"
+    "    r = sqrt(i); r = sin(i); r = cos(i); r = tan(i); r = asin(i);\n"
+    "    r = acos(i); r = atan(i); r = exp(i); r = log(i); r = log10(i);\n"
+    "    r = floor(i); r = ceil(i); r = fabs(i); r = pow(i, i);\n"
+    "    r = atan2(i, i); r = fmod(i, i); r = ldexp(i, i);\n"
+    "    r = pow(f, d); r = pow(d, f); r = pow(f, i);\n"
+    "    r = atan2(i, f); r = fmod(d, f);\n"
+    "    return 0;\n"
+    "}\n";
+
+} // namespace
+
+// The matrix on an ELF target: the float arms bind the REAL fabsf/ldexpf
+// imports (per-symbol availableObjectFormats admits elf) and the elf macro
+// variants. ZERO diagnostics of any kind.
+TEST(SemanticAnalyzerCSubset, TgmathMatrixCleanOnElf) {
+    auto model = analyzeRealTgmath(kTgmathMatrixSrc,
+                                   ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u)
+        << "a float-column S_TypeMismatch here means a float arm mis-dispatched "
+           "to the f64 default (F64->F32 narrowing at the `s =` assignment)";
+}
+
+// The SAME matrix on a PE target: msvcrt exports no fabsf/ldexpf, so the
+// fabs/ldexp macros' pe `variants` arm routes their float arm THROUGH the f64
+// function — `(float)fabs((double)(x))` — typed float (the `s = fabs(f)`
+// assignment still requires a FLOAT result). RED if the pe variant arm is
+// dropped (the flat elf body would reference the pe-unavailable fabsf) or if
+// the bridge loses its `(float)` result cast (F64->F32 narrowing).
+TEST(SemanticAnalyzerCSubset, TgmathMatrixCleanOnPeViaVariantBridge) {
+    auto model = analyzeRealTgmath(kTgmathMatrixSrc,
+                                   ObjectFormatKind::Pe, DataModel::Llp64);
+    EXPECT_FALSE(model.hasErrors())
+        << (model.diagnostics().all().empty()
+                ? "" : model.diagnostics().all()[0].actual);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 0u);
+}
+
+// D-CSUBSET-TGMATH-COMPLEX: a `double _Complex` argument through the shipped
+// sqrt macro fails EXACTLY one S_TypeMismatch — the SELECTED bare default arm
+// `sqrt((z))` passes a complex value to the f64 param (loud); the UNSELECTED
+// float arm's `(float)(z)` cast type-checks but never lowers. RED-ON-DISABLE:
+// rewrite the default arm as `sqrt((double)(x))` and this compiles clean —
+// the cast launders the complex arg (drops imag), the exact conformance
+// miscompile the bare arm exists to prevent.
+TEST(SemanticAnalyzerCSubset, TgmathComplexArgSqrtFailsLoud) {
+    auto model = analyzeRealTgmath(
+        "#include <tgmath.h>\n"
+        "int main(void) { double _Complex z; double r; z = 4.0;\n"
+        "                 r = sqrt(z); return (int)r; }\n",
+        ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "sqrt(double _Complex) must fail LOUD through the bare default arm "
+           "— zero means the arm laundered the complex arg ((double)(x) crept "
+           "back in): a silent drop-imag miscompile";
+}
+
+// The two-arg nested `_Generic` (pow) with a complex first arg: TWO
+// S_TypeMismatch — the SELECTED outer default `pow((z),(y))` plus the
+// UNSELECTED-but-type-checked inner default arm (same bare-call text inside
+// the float branch). Both are the SAME loudness guarantee; the count is
+// pinned so a silent-arm regression (either bare call gaining a cast) drops
+// the count and flips this red.
+TEST(SemanticAnalyzerCSubset, TgmathComplexArgPowFailsLoudTwice) {
+    auto model = analyzeRealTgmath(
+        "#include <tgmath.h>\n"
+        "int main(void) { double _Complex z; double r; z = 4.0;\n"
+        "                 r = pow(z, 2.0); return (int)r; }\n",
+        ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_EQ(countCode(model.diagnostics(), DiagnosticCode::S_TypeMismatch), 2u)
+        << "pow(double _Complex, double) must fail LOUD through both bare "
+           "default arms (selected outer + type-checked inner)";
+}
+
+// fabs — the per-format `variants` macro — keeps the SAME complex loudness on
+// BOTH realizations: the elf arm's `fabs((x))` and the pe BRIDGE arm's
+// `fabs((x))` default are equally bare. One S_TypeMismatch each.
+TEST(SemanticAnalyzerCSubset, TgmathComplexArgFabsFailsLoudOnBothFormats) {
+    constexpr char const* src =
+        "#include <tgmath.h>\n"
+        "int main(void) { double _Complex z; double r; z = 4.0;\n"
+        "                 r = fabs(z); return (int)r; }\n";
+    auto elf = analyzeRealTgmath(src, ObjectFormatKind::Elf, DataModel::Lp64);
+    EXPECT_EQ(countCode(elf.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "fabs(double _Complex) must fail LOUD on elf (fabsf variant arm)";
+    auto pe = analyzeRealTgmath(src, ObjectFormatKind::Pe, DataModel::Llp64);
+    EXPECT_EQ(countCode(pe.diagnostics(), DiagnosticCode::S_TypeMismatch), 1u)
+        << "fabs(double _Complex) must fail LOUD on pe (the f64 bridge arm)";
+}

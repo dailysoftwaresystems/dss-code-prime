@@ -1,0 +1,35 @@
+{
+  "$comment": "FC17.9(g) (D-CSUBSET-TGMATH): runtime witness for the C99/C23 <tgmath.h> type-generic macros (shippedLibs/tgmath.json — PURE CONFIG, zero src/ change), on the baseline AND the `release` (shippedPipeline) arm. Dispatch is OBSERVABLE via sizeof witnesses (_Generic selection is static, sizeof does not evaluate: float arg -> the f-variant's FLOAT return = 4; double/int -> the f64 default = 8), so a wrong-arm regression exits 1..6 instead of silently passing on precision-identical values. Arms: sqrt(float)->sqrtf (the dss-state c99_tgmath_generic shape) + sqrt(double)->sqrt (the blue-painted self-reference binds the descriptor's own extern) + sqrt(int)->default (int->f64 widening) + the nested two-arg pow (f,f -> powf; f,d -> pow) + fabs/ldexp on float: elf/macho import the REAL fabsf/ldexpf; pe64 routes through the variant-macro bridge (float)fabs((double)(x)) because msvcrt exports neither (D-CSUBSET-MATH-FLOAT-VARIANTS-PE) — exact round-trip (|x|, 2^n*x of any F32 are exactly representable in F64). ANTI-FOLD: operands ride mutable globals (the c11_atomic precedent) so the release arm proves real dispatched libm calls survive the pipeline. On elf the f-variant imports resolve from libm.so.6 alongside libc.so.6 (the c87 DT_NEEDED split). The complex-arg loudness (bare default arm -> S0003, D-CSUBSET-TGMATH-COMPLEX) is pinned at the semantic tier in test_semantic_analyzer_c_subset, not here. exit = (int)sqrtf(1764.0f) = 42.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "emulator": ""
+    }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
