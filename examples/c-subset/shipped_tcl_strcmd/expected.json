@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C4 2026-07-17): the RUN witness for the TCL scalar/string/result surface (ClientData typedef + TCL_OK/TCL_ERROR/NULL PP-macros + Tcl_GetString + Tcl_WrongNumArgs). A registered C command reads a string arg + returns its length; libtcl parses `expr [len abc] + 39`, CALLS BACK into LenCmd (len abc -> 3), expr -> 42. The same test-command shape every sqlite src/test*.c uses. elf-x86_64 only (tcl.json availableObjectFormats:[elf]); the ubuntu x86_64 CI legs run it (libtcl8.6 installed), native-arm64 arch-gates, win/macos compile-only. RED-ON-DISABLE: revert tcl.json's elf `library` to libc.so.6 -> undefined symbol at load, exit 127.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-strcmd-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-strcmd-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -1464,12 +1464,15 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
     ASSERT_EQ(desc->availableObjectFormats.size(), 1u);
     EXPECT_EQ(desc->availableObjectFormats[0], "elf");    // elf-only in C1
 
-    // The two opaque handles (modeled like stdio.json's FILE — struct types).
-    ASSERT_EQ(desc->typedefs.size(), 2u);
+    // The two opaque handles (modeled like stdio.json's FILE — struct types) +
+    // the C4 ClientData typedef (void* — a Ptr, not a struct).
+    ASSERT_EQ(desc->typedefs.size(), 3u);
     EXPECT_EQ(desc->typedefs[0].name, "Tcl_Interp");
     EXPECT_EQ(desc->typedefs[1].name, "Tcl_Obj");
+    EXPECT_EQ(desc->typedefs[2].name, "ClientData");
     EXPECT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::Struct);
     EXPECT_EQ(interner.kind(desc->typedefs[1].type), TypeKind::Struct);
+    EXPECT_EQ(interner.kind(desc->typedefs[2].type), TypeKind::Ptr);  // ClientData = void*
 
     // Find a symbol by name (declaration order is not load-bearing).
     auto sym = [&](std::string_view name) -> ShippedSymbol const* {
@@ -1477,10 +1480,12 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
             if (s.name == name) return &s;
         return nullptr;
     };
-    ASSERT_EQ(desc->symbols.size(), 8u);
+    ASSERT_EQ(desc->symbols.size(), 12u);
     for (auto const* n : {"Tcl_CreateInterp", "Tcl_DeleteInterp", "Tcl_Eval",
                           "Tcl_GetObjResult", "Tcl_GetIntFromObj",
-                          "Tcl_NewIntObj", "Tcl_SetObjResult", "Tcl_CreateObjCommand"})
+                          "Tcl_NewIntObj", "Tcl_SetObjResult", "Tcl_CreateObjCommand",
+                          "Tcl_GetString", "Tcl_WrongNumArgs", "Tcl_SetResult",
+                          "Tcl_AppendResult"})
         EXPECT_NE(sym(n), nullptr) << "missing Tcl symbol: " << n;
 
     // Tcl_CreateInterp: fn() -> Tcl_Interp* (0 params, pointer result).
