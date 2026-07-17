@@ -1466,13 +1466,15 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
 
     // The two opaque handles (modeled like stdio.json's FILE — struct types) +
     // the C4 ClientData typedef (void* — a Ptr, not a struct).
-    ASSERT_EQ(desc->typedefs.size(), 3u);
+    ASSERT_EQ(desc->typedefs.size(), 4u);
     EXPECT_EQ(desc->typedefs[0].name, "Tcl_Interp");
     EXPECT_EQ(desc->typedefs[1].name, "Tcl_Obj");
     EXPECT_EQ(desc->typedefs[2].name, "ClientData");
+    EXPECT_EQ(desc->typedefs[3].name, "Tcl_CmdInfo");     // C5 (bare-name type)
     EXPECT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::Struct);
     EXPECT_EQ(interner.kind(desc->typedefs[1].type), TypeKind::Struct);
-    EXPECT_EQ(interner.kind(desc->typedefs[2].type), TypeKind::Ptr);  // ClientData = void*
+    EXPECT_EQ(interner.kind(desc->typedefs[2].type), TypeKind::Ptr);     // ClientData = void*
+    EXPECT_EQ(interner.kind(desc->typedefs[3].type), TypeKind::Struct);  // Tcl_CmdInfo
 
     // Find a symbol by name (declaration order is not load-bearing).
     auto sym = [&](std::string_view name) -> ShippedSymbol const* {
@@ -1480,13 +1482,29 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
             if (s.name == name) return &s;
         return nullptr;
     };
-    ASSERT_EQ(desc->symbols.size(), 12u);
+    ASSERT_EQ(desc->symbols.size(), 16u);
     for (auto const* n : {"Tcl_CreateInterp", "Tcl_DeleteInterp", "Tcl_Eval",
                           "Tcl_GetObjResult", "Tcl_GetIntFromObj",
                           "Tcl_NewIntObj", "Tcl_SetObjResult", "Tcl_CreateObjCommand",
                           "Tcl_GetString", "Tcl_WrongNumArgs", "Tcl_SetResult",
-                          "Tcl_AppendResult"})
+                          "Tcl_AppendResult", "Tcl_GetCommandInfo", "Tcl_SetCommandInfo",
+                          "Tcl_DeleteCommand", "Tcl_GetIndexFromObjStruct"})
         EXPECT_NE(sym(n), nullptr) << "missing Tcl symbol: " << n;
+
+    // C5: the Tcl_CmdInfo command-introspection struct — the FIRST field-access
+    // struct (8 fields: int + 7 pointers). Pin its shape so a wrong field
+    // layout (which would misplace what libtcl fills at runtime) fails loud.
+    {
+        ShippedStruct const* cmdInfo = nullptr;
+        for (auto const& s : desc->structs)
+            if (s.name == "Tcl_CmdInfo") cmdInfo = &s;
+        ASSERT_NE(cmdInfo, nullptr) << "missing Tcl_CmdInfo struct";
+        ASSERT_EQ(cmdInfo->fields.size(), 8u);
+        EXPECT_EQ(cmdInfo->fields[0].name, "isNativeObjectProc");
+        EXPECT_EQ(interner.kind(cmdInfo->fields[0].type), TypeKind::I32);  // offset 0
+        EXPECT_EQ(cmdInfo->fields[5].name, "deleteProc");
+        EXPECT_EQ(interner.kind(cmdInfo->fields[5].type), TypeKind::Ptr);  // a pointer
+    }
 
     // Tcl_CreateInterp: fn() -> Tcl_Interp* (0 params, pointer result).
     {
