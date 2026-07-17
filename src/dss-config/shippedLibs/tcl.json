@@ -1,0 +1,18 @@
+{
+  "$comment": "D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C1 2026-07-17): the neutral <tcl.h> FFI descriptor. SQLite's `testfixture` (the binary that runs the 1190-file .test suite = 'all sqlite units') is ~90 dense C TUs linked against libtcl8.6, and every src/test*.c uses TCL's C API. testfixture calls TCL DIRECTLY — its build recipe (main.mk `make -n testfixture`) carries NO -DUSE_TCL_STUBS (that flag is only on the loadable-EXTENSION targets tclsqlite-{shell,stubs}.o), and /usr/include/tcl8.6/tcl.h has ZERO tclStubsPtr references — so these are plain extern prototypes, NOT the stubs-table macro form. That makes tcl.json an ORDINARY (if large) FFI descriptor, exactly like the libc ones. | LINKAGE: the elf `library` is libtcl8.6.so (TCL's SONAME — it ships an UNVERSIONED soname; `readelf -d libtcl8.6.so.0` -> SONAME libtcl8.6.so, and the runtime pkg libtcl8.6 ships BOTH libtcl8.6.so and the libtcl8.6.so.0 compat file, so the soname resolves without tcl8.6-dev). The ELF walker emits one DT_NEEDED per DISTINCT referenced import library (D-FFI-MATH-LIBM-DT-NEEDED, the libm.so.6 precedent), so a <tcl.h> user links libtcl8.6.so ALONGSIDE libc.so.6 — witnessed by examples/c-subset/shipped_tcl_eval (RUN -> exit 42 on elf x86_64). | availableObjectFormats:[elf] — TCL exists on pe/macho too but with different sonames + no run witness yet; a pe/macho <tcl.h> include fails loud until those legs land (later arc cycle). | OPAQUE HANDLES: Tcl_Interp/Tcl_Obj are modeled like stdio.json's FILE — a named struct with an opaque byte blob, used only via ptr<...> (never by-value), so member access fails loud and the blob size is inert. C1 ships the MINIMAL surface the eval witness needs (5 functions); the full 106-symbol test-TU surface + the real Tcl_Obj layout land in later cycles.",
+  "header": "tcl.h",
+  "standard": "posix",
+  "library": { "elf": "libtcl8.6.so" },
+  "availableObjectFormats": ["elf"],
+  "typedefs": [
+    { "name": "Tcl_Interp", "type": "struct \"Tcl_Interp\" { arr<u64, 1> }" },
+    { "name": "Tcl_Obj",    "type": "struct \"Tcl_Obj\" { arr<u64, 6> }" }
+  ],
+  "symbols": [
+    { "name": "Tcl_CreateInterp",  "signature": "fn() -> ptr<struct \"Tcl_Interp\" { arr<u64, 1> }>", "kind": "function", "linkage": "external" },
+    { "name": "Tcl_DeleteInterp",  "signature": "fn(ptr<struct \"Tcl_Interp\" { arr<u64, 1> }>) -> void", "kind": "function", "linkage": "external" },
+    { "name": "Tcl_Eval",          "signature": "fn(ptr<struct \"Tcl_Interp\" { arr<u64, 1> }>, ptr<char>) -> i32", "kind": "function", "linkage": "external" },
+    { "name": "Tcl_GetObjResult",  "signature": "fn(ptr<struct \"Tcl_Interp\" { arr<u64, 1> }>) -> ptr<struct \"Tcl_Obj\" { arr<u64, 6> }>", "kind": "function", "linkage": "external" },
+    { "name": "Tcl_GetIntFromObj", "signature": "fn(ptr<struct \"Tcl_Interp\" { arr<u64, 1> }>, ptr<struct \"Tcl_Obj\" { arr<u64, 6> }>, ptr<i32>) -> i32", "kind": "function", "linkage": "external" }
+  ]
+}

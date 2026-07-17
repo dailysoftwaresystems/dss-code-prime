@@ -1428,6 +1428,96 @@ TEST(ShippedLibDescriptor, ConstantsAndTypedefsDecode) {
     EXPECT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::U64);
 }
 
+// ── D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C1): the REAL tcl.json ──────
+//
+// The first brick toward building SQLite's `testfixture` (which links libtcl8.6
+// and runs the .test suite = "all sqlite units") with DSS. Pins the seed
+// descriptor STRUCTURALLY against the real config file so a malformed edit /
+// wrong SONAME / broken signature fails loud here — always-on on every leg
+// (no libtcl needed to READ the descriptor; the RUN witness is the
+// shipped_tcl_eval example, linux-only). testfixture calls TCL DIRECTLY (no
+// USE_TCL_STUBS), so these are plain extern prototypes.
+//
+// RED-ON-DISABLE: change tcl.json's elf `library` off "libtcl8.6.so" (the TCL
+// SONAME the DT_NEEDED must name) -> the library pin below fails; drop a symbol
+// or corrupt a signature -> the corresponding structural pin fails.
+TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
+    fs::path const root = shippedLibsRoot();
+    ASSERT_FALSE(root.empty()) << "could not locate src/dss-config/shippedLibs";
+    fs::path const path = root / "tcl.json";
+    ASSERT_TRUE(fs::exists(path)) << "tcl.json not found at " << path.generic_string();
+
+    TypeInterner interner{CompilationUnitId{1}};
+    TypeRegistry typeReg;
+    DiagnosticReporter rep;
+    // Decode for the elf x86_64 target (tcl.json is elf-only, no variants).
+    auto desc = readShippedLibDescriptor(path, interner, typeReg, rep, DataModel::Lp64,
+                                         std::string_view{"x86_64"},
+                                         ObjectFormatKind::Elf);
+    ASSERT_TRUE(desc.has_value());
+    EXPECT_FALSE(rep.hasErrors());
+
+    // Provenance + the link target — the DT_NEEDED-driving fields.
+    EXPECT_EQ(desc->header, "tcl.h");
+    ASSERT_EQ(desc->library.count("elf"), 1u);
+    EXPECT_EQ(desc->library.at("elf"), "libtcl8.6.so");   // TCL's SONAME
+    ASSERT_EQ(desc->availableObjectFormats.size(), 1u);
+    EXPECT_EQ(desc->availableObjectFormats[0], "elf");    // elf-only in C1
+
+    // The two opaque handles (modeled like stdio.json's FILE — struct types).
+    ASSERT_EQ(desc->typedefs.size(), 2u);
+    EXPECT_EQ(desc->typedefs[0].name, "Tcl_Interp");
+    EXPECT_EQ(desc->typedefs[1].name, "Tcl_Obj");
+    EXPECT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::Struct);
+    EXPECT_EQ(interner.kind(desc->typedefs[1].type), TypeKind::Struct);
+
+    // Find a symbol by name (declaration order is not load-bearing).
+    auto sym = [&](std::string_view name) -> ShippedSymbol const* {
+        for (auto const& s : desc->symbols)
+            if (s.name == name) return &s;
+        return nullptr;
+    };
+    ASSERT_EQ(desc->symbols.size(), 5u);
+    for (auto const* n : {"Tcl_CreateInterp", "Tcl_DeleteInterp", "Tcl_Eval",
+                          "Tcl_GetObjResult", "Tcl_GetIntFromObj"})
+        EXPECT_NE(sym(n), nullptr) << "missing Tcl symbol: " << n;
+
+    // Tcl_CreateInterp: fn() -> Tcl_Interp* (0 params, pointer result).
+    {
+        auto const* s = sym("Tcl_CreateInterp");
+        ASSERT_NE(s, nullptr);
+        ASSERT_EQ(interner.kind(s->signature), TypeKind::FnSig);
+        EXPECT_TRUE(interner.fnParams(s->signature).empty());
+        EXPECT_EQ(interner.kind(interner.fnResult(s->signature)), TypeKind::Ptr);
+    }
+    // Tcl_Eval: fn(Tcl_Interp*, char*) -> i32 — result + the string param.
+    {
+        auto const* s = sym("Tcl_Eval");
+        ASSERT_NE(s, nullptr);
+        ASSERT_EQ(interner.kind(s->signature), TypeKind::FnSig);
+        EXPECT_EQ(interner.kind(interner.fnResult(s->signature)), TypeKind::I32);
+        auto const params = interner.fnParams(s->signature);
+        ASSERT_EQ(params.size(), 2u);
+        ASSERT_EQ(interner.kind(params[1]), TypeKind::Ptr);
+        auto const elem = interner.operands(params[1]);
+        ASSERT_EQ(elem.size(), 1u);
+        EXPECT_EQ(interner.kind(elem[0]), TypeKind::Char);
+    }
+    // Tcl_GetIntFromObj: fn(Tcl_Interp*, Tcl_Obj*, i32*) -> i32 — the int* out-param.
+    {
+        auto const* s = sym("Tcl_GetIntFromObj");
+        ASSERT_NE(s, nullptr);
+        ASSERT_EQ(interner.kind(s->signature), TypeKind::FnSig);
+        EXPECT_EQ(interner.kind(interner.fnResult(s->signature)), TypeKind::I32);
+        auto const params = interner.fnParams(s->signature);
+        ASSERT_EQ(params.size(), 3u);
+        ASSERT_EQ(interner.kind(params[2]), TypeKind::Ptr);
+        auto const elem = interner.operands(params[2]);
+        ASSERT_EQ(elem.size(), 1u);
+        EXPECT_EQ(interner.kind(elem[0]), TypeKind::I32);
+    }
+}
+
 // MF-2: an unsigned constant at the TOP of its range (ULLONG_MAX) round-trips
 // losslessly — stored as the int64 BIT-PATTERN (UINT64_MAX reinterpreted == -1),
 // which the HIR fold re-reads as uint64. RED-ON-DISABLE: a naive get<int64_t>

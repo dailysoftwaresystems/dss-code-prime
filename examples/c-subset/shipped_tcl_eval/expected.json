@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C1 2026-07-17): the RUN witness for the libtcl link — the first brick toward building SQLite's `testfixture` (links libtcl8.6, runs the .test suite = 'all sqlite units') with DSS. DSS compiles main.c to an ELF whose imports split across TWO libraries (tcl.json elf `library` = libtcl8.6.so for the 5 Tcl_ symbols; puts/exit stay libc.so.6) and the ELF walker emits one DT_NEEDED per DISTINCT import library (D-FFI-MATH-LIBM-DT-NEEDED, the libm precedent): `readelf -d main` shows NEEDED libc.so.6 + NEEDED libtcl8.6.so. At load ld.so binds the Tcl_ symbols from libtcl and a REAL interpreter evaluates `expr 40 + 2` -> the result object holds 42 -> exit 42 + `tcl-eval-ok`. ELF-ONLY for C1: tcl.json is availableObjectFormats:[elf], so a pe64/macho target would fail the <tcl.h> availability gate at compile (loud) — those legs + the full 106-symbol test-TU surface land in later arc cycles. Only the x86_64-linux target RUNS (libtcl present); on non-linux hosts the in-process runner cross-compiles it (compile-only) and the subprocess runner SKIPs (runOn). CI: the ubuntu x86_64 legs install libtcl8.6 so the run is green; the native-arm64 leg cross-compiles + arch-gates the run (skips). RED-ON-DISABLE: revert tcl.json's elf `library` to libc.so.6 -> only NEEDED libc.so.6 -> ld.so refuses to load (undefined symbol: Tcl_CreateInterp, exit 127).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-eval-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-eval-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
