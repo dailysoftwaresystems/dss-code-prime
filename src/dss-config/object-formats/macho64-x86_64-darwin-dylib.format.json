@@ -1,0 +1,119 @@
+{
+  "$comment": "Mach-O 64-bit DYNAMIC LIBRARY (MH_DYLIB, .dylib) for x86_64 macOS -- c171 conformance (the x86_64 sibling of macho64-arm64-darwin-dylib). CONFIG-ONLY for the writer: EVERY dylib divergence in `src/link/format/macho.cpp` is FILETYPE-keyed (`isDylib = filetype==Dylib`), never cputype-keyed -- MH_DYLIB routes unconditionally to `encodeExecDynamic` (the x86_64 macOS dynamic writer is in fact the ORIGINAL one, D-LK6-5); the sole cputype dispatch in the dynamic path is `__stubs` (`machoStubSizeFor` x86_64=6-byte FF 25 disp32, already supported); the export trie, ad-hoc code signing (execSegFlags is a caller-supplied per-flavor arg -- dylib=0, arch-neutral), and segment layout (`kPageSize = im.segmentPageSize`) are all arch-neutral. So this needs NO writer code, only this schema. Differs from macho64-arm64-darwin-dylib in ONLY the arch-specific fields: cputype (16777223 x86_64 vs 16777228 arm64), cpusubtype (3 vs 0), segmentPageSize (4096 x86_64 4 KiB pages vs 16384 Apple-Silicon 16 KiB), text virtualAddress (= segmentPageSize), longDoubleFormat (x87-80, x86_64's 80-bit extended -- arm64 uses IEEE-128 and omits it), and the reloc rows (X86_64_RELOC_* vs ARM64_RELOC_*). **RUNTIME IS macOS-x86_64/Rosetta-GATED**: there is NO macOS-x86_64 CI leg (macos-latest is Apple Silicon), so this ships with STRUCTURAL byte-pins ONLY (the writer emits it correctly -- proven at the byte level), and its exit-code RUN witness rides a future macOS-x86_64/Rosetta leg (the D-LK1-MACHO-X8664-DARWIN-DATA-SECTION untested-form discipline; follow-up D-LK-MACHO-X8664-DYLIB-RUNTIME). Code signing is KEPT (ad-hoc SHA-256) though x86_64 macOS does not REQUIRE it (unlike Apple Silicon) -- a signed dylib loads everywhere and mirrors modern ld64, which ad-hoc-signs all output.",
+
+  "dssObjectFormatVersion": 1,
+
+  "$dataModelComment": "LP64 (64-bit Darwin: int 32, long 64, ptr 64) -- same as the x86_64 exec/object siblings.",
+  "dataModel": "LP64",
+
+  "$longDoubleFormatComment": "x86_64 macOS `long double` is the 80-bit x87 extended type (16-byte aligned) -- the same value the macho64-x86_64-darwin-exec sibling declares. (arm64 macOS uses IEEE-754 binary128 and its dylib omits this field.)",
+  "longDoubleFormat": "x87-80",
+
+  "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: Darwin x86_64 uses the generic LSB-first bit-field allocation -- same gnu_packed as the x86_64 macho siblings.",
+  "bitFieldStrategy": "gnu_packed",
+
+  "format": {
+    "name": "macho64-x86_64-darwin-dylib",
+    "version": "1.0",
+    "kind": "macho"
+  },
+
+  "$externCallDispatchComment": "The walker synthesizes a `__stubs` entry per extern FUNCTION (x86_64 = 6-byte FF 25 disp32 through the `__got` slot, lazy/eager per bindNow) and the call site is a plain direct `call rel32` to the stub -- pc-relative, slide-safe under the dyld base slide. D-FFI-EXTERN-CALL-DISPATCH.",
+  "externCallDispatch": "direct-plt",
+
+  "$dataImportBindingComment": "extern library DATA objects bind GOT-INDIRECT -- the walker reserves a `__got` slot per imported object; dyld's bind opcodes write the object's address into the slot and the GotIndirect lowering reads it. Copy relocations are not a Mach-O mechanism.",
+  "dataImportBinding": "got-indirect",
+
+  "$supportedDataSectionsComment": "rodata (__TEXT,__const -- read-only), data (__DATA,__data), bss (__DATA,__bss zero-fill), relro (reloc-bearing const, __DATA,__const -- merged so its rebase slots land in writable pages). NO tdata/tbss: thread_local in a dylib needs the TLV descriptor model (D-LK3-DYLIB-TLS-MODEL); fails loud by this set's absence.",
+  "supportedDataSections": ["rodata", "data", "bss", "relro"],
+
+  "$artifactProfilesComment": "This format SERVES the shared-library profile (plan 06 AP3). The cli profile is the exec sibling.",
+  "artifactProfiles": ["lib"],
+
+  "macho": {
+    "$comment": "mach_header_64 identity for an x86_64 MH_DYLIB. cputype = 16777223 (0x01000007 = CPU_TYPE_X86_64), cpusubtype = 3 (CPU_SUBTYPE_X86_64_ALL, same as the x86_64 exec). filetype = dylib (MH_DYLIB = 6). flags = 1048709 (MH_NOUNDEFS|MH_DYLDLINK|MH_TWOLEVEL|MH_NO_REEXPORTED_DYLIBS -- no MH_PIE on a library; same value as the arm64 dylib).",
+    "cputype": 16777223,
+    "cpusubtype": 3,
+    "filetype": "dylib",
+    "flags": 1048709
+  },
+
+  "image": {
+    "$comment": "Mach-O image fields for an x86_64 MH_DYLIB. pageZeroSize = 0 -- a dylib carries NO __PAGEZERO (validate() enforces): __TEXT.vmaddr = 0 and dyld slides the whole base-0 image. segmentPageSize = 4096 (0x1000) -- x86_64 macOS uses 4 KiB segment alignment (Apple Silicon's dylib uses 16384). NO dylinkerPath. installName = the LC_ID_DYLIB identity a client records (@rpath convention; the walker NEVER derives it from the output file name -- c150 DT_SONAME discipline). loadDylibs = [libSystem] (the home of any libc import). bindNow = true. buildVersion macos 11.0. codeSignature = ad-hoc SHA-256: KEPT for symmetry with the arm64 dylib + modern ld64, though x86_64 macOS does not REQUIRE signing; the walker sets execSegFlags = 0 for the dylib flavor.",
+    "pageZeroSize": 0,
+    "segmentPageSize": 4096,
+    "installName": "@rpath/libdss.dylib",
+    "loadDylibs": ["/usr/lib/libSystem.B.dylib"],
+    "bindNow": true,
+    "buildVersion": {"platform": "macos", "minOs": "11.0", "sdk": "11.0"},
+    "codeSignature": {"kind": "adhoc", "hashAlgorithm": "sha256", "pageSize": 4096, "identifier": "com.dss.dylib"}
+  },
+
+  "sections": [
+    {
+      "$comment": "Executable code. virtualAddress = 4096 = image.segmentPageSize, the base-0 dylib convention (page zero holds the header + load commands; __text opens the second page). type = 0x80000400 = S_ATTR_PURE_INSTRUCTIONS|S_ATTR_SOME_INSTRUCTIONS (the section_64.flags DSS's macho writer reads from `type`).",
+      "kind": "text",
+      "name": "__text",
+      "segment": "__TEXT",
+      "type": 2147484672,
+      "flags": 0,
+      "addrAlign": 16,
+      "entrySize": 0,
+      "virtualAddress": 4096
+    },
+    {
+      "$comment": "Read-only initialized data. __TEXT,__const. virtualAddress = 0 -- computed. A reloc-bearing const global routes to relro (also __DATA,__const via the pair key).",
+      "kind": "rodata",
+      "name": "__const",
+      "segment": "__TEXT",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Writable initialized data. __DATA,__data. virtualAddress = 0 -- computed.",
+      "kind": "data",
+      "name": "__data",
+      "segment": "__DATA",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Zero-initialized data. __DATA,__bss. type = 1 = S_ZEROFILL (no file bytes). virtualAddress = 0 -- computed.",
+      "kind": "bss",
+      "name": "__bss",
+      "segment": "__DATA",
+      "type": 1,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0,
+      "virtualAddress": 0
+    }
+  ],
+
+  "relocations": [
+    {
+      "$comment": "X86_64_RELOC_BRANCH -- the extern-call reloc on a __stubs entry (a plain rel32 branch). kind = 1 matches x86_64.target.json's `rel32` row (nativeId is the packed (type<<28)|(length<<25)|(pcrel<<24)).",
+      "name": "X86_64_RELOC_BRANCH",
+      "kind": 1,
+      "nativeId": 369098752
+    },
+    {
+      "$comment": "X86_64_RELOC_UNSIGNED (length 3 = 8 bytes) -- an abs64 data pointer; the walker emits a dyld rebase for it under the base slide. kind = 2.",
+      "name": "X86_64_RELOC_UNSIGNED_8",
+      "kind": 2,
+      "nativeId": 100663296
+    },
+    {
+      "$comment": "X86_64_RELOC_UNSIGNED (length 2 = 4 bytes) -- an abs32 data slot. kind = 3.",
+      "name": "X86_64_RELOC_UNSIGNED_4",
+      "kind": 3,
+      "nativeId": 33554432
+    }
+  ]
+}

@@ -305,6 +305,86 @@ TEST(ShippedArm64ElfReloc, MachineCodeIsEmAarch64) {
     EXPECT_EQ((*r)->elf().machine, 183);
 }
 
+// -- c171 cross-arch variant-parity formats (arm64 .so / arm64 PIE /
+//    x86_64 .dylib) -- load + reloc cross-reference --
+//
+// The 3 new shared-library-family formats load + validate, and their
+// relocation rows unify (BY KIND) with the shipped target schema they
+// will be emitted against. Mirrors ShippedArm64ElfReloc's cross-check
+// (the linker engine resolves reloc rows by the `kind` tag): a typo in
+// either the format JSON or the target JSON would otherwise surface
+// only at the first image build on that arch.
+
+TEST(ShippedCrossArchVariantFormats, Aarch64DynLoadsAndRoundTripsReloKinds) {
+    auto r = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-dyn");
+    ASSERT_TRUE(r.has_value());
+    auto const& fmt = **r;
+    EXPECT_EQ(fmt.name(), "elf64-aarch64-linux-dyn");
+    EXPECT_EQ(fmt.kind(), ObjectFormatKind::Elf);
+    EXPECT_EQ(fmt.elf().objectType, ElfObjectType::Dyn);
+    EXPECT_EQ(fmt.elf().machine, 183);
+    auto tgtR = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(tgtR.has_value());
+    auto const& tgt = **tgtR;
+    for (auto const* name : {"call26", "adr_prel_pg_hi21",
+                              "add_abs_lo12_nc", "abs64"}) {
+        auto const* tri = tgt.relocationByName(name);
+        ASSERT_NE(tri, nullptr) << name << " missing from arm64.target.json";
+        auto const* fri = fmt.relocationByKind(tri->kind);
+        ASSERT_NE(fri, nullptr)
+            << "format-side has no row for kind=" << tri->kind.v
+            << " (target name=" << name << ")";
+    }
+}
+
+TEST(ShippedCrossArchVariantFormats, Aarch64PieLoadsAndCarriesEntryCluster) {
+    auto r = ObjectFormatSchema::loadShipped("elf64-aarch64-linux-pie");
+    ASSERT_TRUE(r.has_value());
+    auto const& fmt = **r;
+    EXPECT_EQ(fmt.name(), "elf64-aarch64-linux-pie");
+    EXPECT_EQ(fmt.kind(), ObjectFormatKind::Elf);
+    // A PIE IS ET_DYN -- the discriminator is the entry cluster.
+    EXPECT_EQ(fmt.elf().objectType, ElfObjectType::Dyn);
+    EXPECT_EQ(fmt.elf().machine, 183);
+    EXPECT_EQ(fmt.elf().interpreter, "/lib/ld-linux-aarch64.so.1");
+    ASSERT_TRUE(fmt.processExit().has_value());
+    EXPECT_EQ(fmt.processExit()->mechanism, ExitMechanism::ByNameImport);
+    EXPECT_EQ(fmt.entryCallingConvention(), "aapcs64");
+    // reloc rows unify with the arm64 target (same 4 as the .so).
+    auto tgtR = TargetSchema::loadShipped("arm64");
+    ASSERT_TRUE(tgtR.has_value());
+    auto const& tgt = **tgtR;
+    for (auto const* name : {"call26", "adr_prel_pg_hi21",
+                              "add_abs_lo12_nc", "abs64"}) {
+        auto const* tri = tgt.relocationByName(name);
+        ASSERT_NE(tri, nullptr) << name << " missing from arm64.target.json";
+        ASSERT_NE(fmt.relocationByKind(tri->kind), nullptr)
+            << "format-side has no row for target name=" << name;
+    }
+}
+
+TEST(ShippedCrossArchVariantFormats, X86_64DylibLoadsAndRoundTripsReloKinds) {
+    auto r = ObjectFormatSchema::loadShipped("macho64-x86_64-darwin-dylib");
+    ASSERT_TRUE(r.has_value());
+    auto const& fmt = **r;
+    EXPECT_EQ(fmt.name(), "macho64-x86_64-darwin-dylib");
+    EXPECT_EQ(fmt.kind(), ObjectFormatKind::MachO);
+    EXPECT_EQ(fmt.macho().filetype, MachOObjectType::Dylib);
+    // CPU_TYPE_X86_64 = 0x01000007 = 16777223.
+    EXPECT_EQ(fmt.macho().cputype, 0x01000007u);
+    auto tgtR = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(tgtR.has_value());
+    auto const& tgt = **tgtR;
+    for (auto const* name : {"rel32", "abs64", "abs32"}) {
+        auto const* tri = tgt.relocationByName(name);
+        ASSERT_NE(tri, nullptr) << name << " missing from x86_64.target.json";
+        auto const* fri = fmt.relocationByKind(tri->kind);
+        ASSERT_NE(fri, nullptr)
+            << "format-side has no row for kind=" << tri->kind.v
+            << " (target name=" << name << ")";
+    }
+}
+
 // ── D-LK10-ENTRY Slice B (plan 14 §2.13): ProcessExit substrate ──
 //
 // Tests pin both shipped exec format JSONs carrying the new
