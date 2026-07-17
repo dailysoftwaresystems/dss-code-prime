@@ -5,8 +5,10 @@
 #include "analysis/semantic/semantic_model.hpp"
 #include "asm/asm.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: BUILD half on a large stack
+#include "core/substrate/mint_monotonic_id.hpp"  // c165: fresh per-member CompilationUnitId (static pull)
 #include "core/substrate/phase_timers.hpp"      // c97: per-phase --time accumulation
 #include "core/types/parse_diagnostic.hpp"
+#include "ffi/binary_readers/ar_reader.hpp"  // c165: readArArchive (static-pull member index)
 #include "ffi/ingest.hpp"
 #include "ffi/mangling/c_mangle.hpp"  // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: applyCMangling
 #include "ffi/shipped_lib_descriptor.hpp"  // c162: collectShippedExternSymbolNames
@@ -14,6 +16,7 @@
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "link/format/ar.hpp"  // writeArArchive (D-LK-STATIC-ARCHIVE-WRITER, c163)
+#include "link/format/elf_object_reader.hpp"  // c165: readRelocatableObject (static-pull member parse)
 #include "link/linker.hpp"
 #include "link/writer.hpp"
 #include "lir/lir_2addr_legalize.hpp"
@@ -31,14 +34,19 @@
 #include "opt/passes/prune_unreachable.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <format>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 // Plan 14 LK10 cycle 2 — driver pipeline kernel.
@@ -1365,6 +1373,176 @@ bool linkAndWrite(std::span<AssembledModule const> modules,
     // never an arch/format identity branch) so a produced binary runs
     // directly without a manual `chmod +x`.
     return linker::writeImage(image, outPath, reporter, format.isImageFlavor());
+}
+
+// -- c165 (D-LK-STATIC-LINK): STATIC linking against `ar` archives --------------
+
+namespace {
+
+// The 8-byte GNU/SysV `ar` global magic ("!<arch>\n"). The ar-vs-dynamic
+// `--resolve-library` dispatch keys on THIS (magic bytes, agnostic -- never a
+// `.a` extension), mirroring `ffi::guessFormat`'s Ar arm. Kept local: `ffi`'s
+// `reader_common.hpp` is an internal header the program tier does not include,
+// and re-stating 8 bytes is cheaper than a new cross-layer include/export.
+constexpr std::uint8_t kArGlobalMagic[8] = {'!', '<', 'a', 'r', 'c', 'h', '>', 0x0Au};
+
+}  // namespace
+
+bool isArArchiveFile(std::filesystem::path const& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;   // unreadable -> stays dynamic (eager probe fails loud)
+    std::uint8_t buf[8] = {};
+    in.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(sizeof(buf)));
+    if (in.gcount() != static_cast<std::streamsize>(sizeof(buf))) return false;
+    for (std::size_t i = 0; i < sizeof(buf); ++i) {
+        if (buf[i] != kArGlobalMagic[i]) return false;
+    }
+    return true;
+}
+
+std::optional<std::vector<AssembledModule>>
+pullStaticArchiveMembers(AssembledModule const&                 clientModule,
+                         std::span<std::filesystem::path const> archivePaths,
+                         TargetSchema const&                    target,
+                         ObjectFormatSchema const&              format,
+                         DiagnosticReporter&                    reporter) {
+    std::vector<AssembledModule> pulled;
+    if (archivePaths.empty()) return pulled;  // nothing to pull
+
+    // Read every archive up front: its raw bytes (kept alive so member subspans
+    // stay valid) + its parsed member list + armap (c161 reader).
+    struct ParsedArchive {
+        std::vector<std::uint8_t> bytes;
+        ffi::ArArchive            archive;
+    };
+    std::vector<ParsedArchive> archives;
+    archives.reserve(archivePaths.size());
+    for (auto const& archivePath : archivePaths) {
+        std::ifstream in(archivePath, std::ios::binary);
+        if (!in) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::F_FileOpenFailed;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "static-link: failed to open archive '{}' for reading "
+                "(D-LK-STATIC-LINK).",
+                archivePath.generic_string());
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
+                                        std::istreambuf_iterator<char>()};
+        auto arch = ffi::readArArchive(
+            std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+            archivePath.filename().string(), reporter);
+        if (!arch) return std::nullopt;   // corrupt archive -> reader fail-loud
+        archives.push_back(ParsedArchive{std::move(bytes), std::move(*arch)});
+    }
+
+    // Global armap: symbol name -> (archiveIdx, memberIndex). First-wins across
+    // archives (standard left-to-right link order) + first-wins within one
+    // archive (an armap lists a symbol against its single defining member).
+    std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> armap;
+    for (std::size_t ai = 0; ai < archives.size(); ++ai) {
+        for (auto const& sym : archives[ai].archive.symbols) {
+            armap.emplace(sym.name, std::pair{ai, sym.memberIndex});
+        }
+    }
+
+    // Names already satisfied by a DEFINITION (client, then each pulled member).
+    // A worklist name that is already defined is never pulled again. Only
+    // externally-visible definitions can satisfy a cross-module reference (the
+    // same filter the c163 armap writer applies), so Local defs are excluded.
+    std::unordered_set<std::string> definedNames;
+    for (auto const& ms : clientModule.symbols) {
+        if (!ms.name.empty() && isExternallyVisible(ms.binding, ms.visibility)) {
+            definedNames.insert(ms.name);
+        }
+    }
+
+    // Worklist: the client's unresolved extern names (the references to satisfy).
+    std::vector<std::string> worklist;
+    for (auto const& ext : clientModule.externImports) {
+        if (!ext.mangledName.empty()) worklist.push_back(ext.mangledName);
+    }
+
+    // (archiveIdx << 32) | memberIndex of every member already pulled -- the LAZY
+    // dedup so a member defining several referenced symbols is pulled once.
+    std::unordered_set<std::uint64_t> pulledMembers;
+    auto memberKey = [](std::size_t ai, std::size_t mi) -> std::uint64_t {
+        return (static_cast<std::uint64_t>(ai) << 32)
+             |  static_cast<std::uint64_t>(static_cast<std::uint32_t>(mi));
+    };
+
+    for (std::size_t cursor = 0; cursor < worklist.size(); ++cursor) {
+        std::string const& name = worklist[cursor];
+        if (definedNames.count(name) != 0) continue;   // already satisfied
+        auto const it = armap.find(name);
+        if (it == armap.end()) continue;   // no archive defines it -> a real FFI
+                                           // import / an undefined the linker's
+                                           // own gate handles (never pulled here)
+        auto const [ai, mi] = it->second;
+        if (!pulledMembers.insert(memberKey(ai, mi)).second) continue;  // lazy dedup
+
+        ffi::ArMember const& member = archives[ai].archive.members[mi];
+        std::span<std::uint8_t const> const memberBytes{
+            archives[ai].bytes.data() + static_cast<std::size_t>(member.dataOffset),
+            static_cast<std::size_t>(member.size)};
+
+        // Fresh, process-unique CompilationUnitId per member: the merge keys its
+        // symbol index by (cuId, SymbolId), so a member must never share a cuId
+        // with the client or another member (the monotonic minter never repeats).
+        CompilationUnitId const memberCu =
+            substrate::mintMonotonicId<CompilationUnitId>();
+        auto member_mod = elf::readRelocatableObject(
+            memberBytes, target, format, reporter, memberCu);
+        // Consume the reader's optional as the read-success signal -- NOT
+        // `ok()`, which is a tautology for reader output AND false for a
+        // data-only member (see elf_object_reader.hpp).
+        if (!member_mod) return std::nullopt;   // member-read fail-loud
+
+        // A pulled member's externally-visible definitions satisfy later
+        // worklist names; its OWN unresolved externs feed the next pass -- the
+        // transitive lazy-pull (a member referencing another member).
+        for (auto const& ms : member_mod->symbols) {
+            if (!ms.name.empty() && isExternallyVisible(ms.binding, ms.visibility)) {
+                definedNames.insert(ms.name);
+            }
+        }
+        for (auto const& ext : member_mod->externImports) {
+            if (!ext.mangledName.empty()) worklist.push_back(ext.mangledName);
+        }
+        pulled.push_back(std::move(*member_mod));
+    }
+    return pulled;
+}
+
+bool linkAndWriteWithStaticArchives(AssembledModule                        clientModule,
+                                    std::span<std::filesystem::path const> staticArchives,
+                                    TargetSchema const&                    target,
+                                    ObjectFormatSchema const&              format,
+                                    std::filesystem::path const&           outPath,
+                                    DiagnosticReporter&                    reporter) {
+    if (staticArchives.empty()) {
+        return linkAndWrite(std::span<AssembledModule const>{&clientModule, 1},
+                            target, format, outPath, reporter);
+    }
+    auto pulled = pullStaticArchiveMembers(clientModule, staticArchives,
+                                           target, format, reporter);
+    if (!pulled) return false;   // pull fail-loud already reported
+
+    // Link the COMBINED span [client, pulled...]. >1 element triggers the c154
+    // cross-CU merge in `linker::link`, whose `mergeModules` binds each archive
+    // reference to the pulled member's definition (stripping the extern import)
+    // exactly as it resolves a sibling-CU reference. When nothing was pulled
+    // (the archives defined nothing referenced) the span is the client alone --
+    // the single-CU path, unchanged.
+    std::vector<AssembledModule> combined;
+    combined.reserve(1 + pulled->size());
+    combined.push_back(std::move(clientModule));
+    for (auto& member_mod : *pulled) combined.push_back(std::move(member_mod));
+    return linkAndWrite(std::span<AssembledModule const>{combined.data(), combined.size()},
+                        target, format, outPath, reporter);
 }
 
 // c163 (D-LK-STATIC-ARCHIVE-WRITER): link N assembled CUs into N relocatable

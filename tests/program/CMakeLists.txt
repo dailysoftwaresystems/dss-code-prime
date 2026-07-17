@@ -6,6 +6,8 @@ dss_add_test(NAME program/test_compile_pipeline
              SOURCES test_compile_pipeline.cpp)
 dss_add_test(NAME program/test_ffi_resolve_library
              SOURCES test_ffi_resolve_library.cpp)
+dss_add_test(NAME program/test_static_link
+             SOURCES test_static_link.cpp)
 dss_add_test(NAME program/test_cli_args
              SOURCES test_cli_args.cpp)
 dss_add_test(NAME program/test_input_resolver

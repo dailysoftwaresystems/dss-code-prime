@@ -331,6 +331,28 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     }
     auto const outPath = outDir / (std::string{sourceStem} + std::string{ext});
 
+    // c165 (D-LK-STATIC-LINK): partition `--resolve-library` into DYNAMIC
+    // libraries (`.so`/`.dll`/`.dylib` -- read for their export surface during
+    // per-CU FFI synthesis, the c162 path) and STATIC `ar` archives (pulled +
+    // merged at LINK time below). The dispatch is by MAGIC BYTES (`isArArchiveFile`
+    // -- agnostic; never a `.a`/`.lib` extension). Feeding an archive to the
+    // dynamic export reader would mis-bind its armap symbols as a runtime
+    // DT_NEEDED (a `.a` is not loadable), so the per-CU build sees the DYNAMIC
+    // subset only; the archives flow to `linkAndWriteWithStaticArchives`. An
+    // unreadable path stays DYNAMIC -- the dynamic path's eager open-probe
+    // (compile_pipeline step 2.5-pre) fails it loud, so a bad path is never
+    // silently dropped.
+    std::vector<std::filesystem::path> staticArchives;
+    CompileOptions perCuOpts = compileOpts;
+    {
+        std::vector<std::filesystem::path> dynamicLibs;
+        for (auto const& lib : compileOpts.resolveLibraries) {
+            if (isArArchiveFile(lib)) staticArchives.push_back(lib);
+            else                      dynamicLibs.push_back(lib);
+        }
+        perCuOpts.resolveLibraries = std::move(dynamicLibs);
+    }
+
     // Cycle 24/25 build-then-lower sequence. LOOP 1: build EVERY CU's MIR up front
     // (`buildCuMir` — sem→HIR→FFI→MIR→optimize), holding each `CuMirModule` (which keeps
     // its SemanticModel — the interner owner — alive). Early-return on the FIRST CU's
@@ -339,7 +361,7 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     cuMirs.reserve(cus.size());
     for (auto const& cu : cus) {
         auto cuMir = buildCuMir(cu, grammar, **targetR, **formatR,
-                                ccIndex, reporter, compileOpts);
+                                ccIndex, reporter, perCuOpts);
         if (!cuMir) return false;  // front-half tier failure already reported via `reporter`
         cuMirs.push_back(std::move(*cuMir));
     }
@@ -352,8 +374,12 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         auto mod = lowerCuMirToAssembly(cuMirs[0], (*formatR)->processArgs(),
                                         (*formatR)->kind(), reporter);
         if (!mod) return false;  // back-half tier failure already reported via `reporter`
-        return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},
-                            **targetR, **formatR, outPath, reporter);
+        // c165 (D-LK-STATIC-LINK): link against any `ar` static archives named on
+        // `--resolve-library` (pull the referenced members + merge them in). With
+        // no static archives this is `linkAndWrite({mod})`, unchanged.
+        return linkAndWriteWithStaticArchives(
+            std::move(*mod), std::span<std::filesystem::path const>{staticArchives},
+            **targetR, **formatR, outPath, reporter);
     }
 
     // N>1 (CU6 multi-CU): WHOLE-PROGRAM MIR MERGE (Cycle 25 Stage C). Fold the N per-CU
@@ -541,8 +567,13 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                      std::move(sehScopes),
                                      reporter);
     if (!mod) return false;  // back-half tier failure already reported via `reporter`
-    return linkAndWrite(std::span<AssembledModule const>{&*mod, 1},
-                        **targetR, **formatR, outPath, reporter);
+    // c165 (D-LK-STATIC-LINK): the merged whole-program client module links
+    // against any `ar` static archives named on `--resolve-library` the same way
+    // the single-CU path does (pull referenced members + merge). No archives =>
+    // `linkAndWrite({mod})`, unchanged.
+    return linkAndWriteWithStaticArchives(
+        std::move(*mod), std::span<std::filesystem::path const>{staticArchives},
+        **targetR, **formatR, outPath, reporter);
 }
 
 // c9 (Phase-2): the ObjectFormatKind a target spec compiles to, or nullopt if the
