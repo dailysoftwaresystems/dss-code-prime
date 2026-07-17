@@ -1497,14 +1497,26 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
             if (s.name == name) return &s;
         return nullptr;
     };
-    ASSERT_EQ(desc->symbols.size(), 16u);
+    ASSERT_EQ(desc->symbols.size(), 55u);   // C9: +39 exported Tcl functions (16 -> 55)
     for (auto const* n : {"Tcl_CreateInterp", "Tcl_DeleteInterp", "Tcl_Eval",
                           "Tcl_GetObjResult", "Tcl_GetIntFromObj",
                           "Tcl_NewIntObj", "Tcl_SetObjResult", "Tcl_CreateObjCommand",
                           "Tcl_GetString", "Tcl_WrongNumArgs", "Tcl_SetResult",
                           "Tcl_AppendResult", "Tcl_GetCommandInfo", "Tcl_SetCommandInfo",
-                          "Tcl_DeleteCommand", "Tcl_GetIndexFromObjStruct"})
+                          "Tcl_DeleteCommand", "Tcl_GetIndexFromObjStruct",
+                          // C9: representative of the 39-function surface (S0001 blocker)
+                          "Tcl_NewObj", "Tcl_NewStringObj", "Tcl_ListObjAppendElement",
+                          "Tcl_ListObjLength", "Tcl_ListObjIndex", "Tcl_SetVar",
+                          "Tcl_SetVar2", "Tcl_GetInt", "Tcl_GetDoubleFromObj",
+                          "Tcl_DStringInit", "Tcl_ResetResult", "Tcl_DuplicateObj",
+                          "Tcl_LinkVar", "Tcl_GetChannel"})
         EXPECT_NE(sym(n), nullptr) << "missing Tcl symbol: " << n;
+    // C9: Tcl_IncrRefCount / Tcl_DecrRefCount are macros in real tcl.h, NOT exported
+    // by libtcl8.6.so. DSS eager-imports ALL descriptor functions (even unreferenced),
+    // so listing an unexported one breaks the LOAD of every tcl binary. They are
+    // deliberately ABSENT, deferred to D-FFI-TCL-REFCOUNT-MACROS.
+    EXPECT_EQ(sym("Tcl_IncrRefCount"), nullptr) << "refcount ops must stay out (unexported by libtcl)";
+    EXPECT_EQ(sym("Tcl_DecrRefCount"), nullptr) << "refcount ops must stay out (unexported by libtcl)";
 
     // C5: the Tcl_CmdInfo command-introspection struct — the FIRST field-access
     // struct (8 fields: int + 7 pointers). Pin its shape so a wrong field
