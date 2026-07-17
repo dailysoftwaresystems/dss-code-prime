@@ -8,7 +8,8 @@
       "spec": "x86_64:pe64-x86_64-windows-exec",
       "artifact": "main.exe",
       "runOn": ["windows"]
-    }
+    },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
   ],
   "optimizedPipelines": [
     {"label": "mem2reg-cse", "passes": ["Mem2Reg", "Cse"]},
