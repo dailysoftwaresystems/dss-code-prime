@@ -1256,10 +1256,26 @@ encode(AssembledModule const&    module,
     // object or an import library — the PE analog of the ELF c141 /
     // Mach-O c146 fix. `sym_<id>` remains the fallback for a reloc
     // target that is neither defined nor a known import.
+    // Map each extern SymbolId to its isData class (from the module's extern
+    // imports). A FUNCTION extern (isData==false) carries
+    // IMAGE_SYM_DTYPE_FUNCTION -- mirroring the defined-function path above --
+    // so the c170 COFF object reader reconstructs the function/data class
+    // FAITHFULLY (c170 silent-failure-review fold: without the hint a
+    // reconstructed function extern defaults to DATA, which would route a
+    // `call rel32 -> extern` through the data IAT slot). An extern with no
+    // ExternImport row (a reloc target the source never declared) stays
+    // type=0; cl.exe / link.exe treat a type-0 undefined symbol as either.
+    std::unordered_map<SymbolId, bool> externIsData;
+    for (auto const& imp : module.externImports)
+        externIsData.emplace(imp.symbol, imp.isData);
     for (auto const& e : externSyms) {
         std::string const symName = objNames.externName(e, "sym_");
+        auto const it = externIsData.find(e);
+        bool const isFunction = (it != externIsData.end()) && !it->second;
+        std::uint16_t const symType =
+            isFunction ? static_cast<std::uint16_t>(IMAGE_SYM_DTYPE_FUNCTION) : 0u;
         emitSymWithName(symName, /*value=*/0, IMAGE_SYM_UNDEFINED,
-                        /*type=*/0, IMAGE_SYM_CLASS_EXTERNAL);
+                        symType, IMAGE_SYM_CLASS_EXTERNAL);
     }
 
     // ── Layout the file: header → section headers → section data

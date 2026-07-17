@@ -95,3 +95,14 @@ dss_add_test(NAME link/test_relocatable_object_reader SOURCES test_relocatable_o
 # unknown reloc nativeId, r_extern=0 section-relative reloc), non-Mach-O schema
 # fail-loud, and the x86_64 leaf-only agnosticism round-trip.
 dss_add_test(NAME link/test_macho_object_reader SOURCES test_macho_object_reader.cpp)
+
+# c170 (D-LK-RELOCATABLE-OBJECT-READER-COFF) -- the Windows COFF `.obj`
+# relocatable-object MEMBER READER: the inverse of pe.cpp's Obj-arm writer
+# (the PE/COFF sibling of the c164 ELF + c168 Mach-O readers). Writer<->reader
+# FULL-object round-trip (functions sliced by sorted section-relative Value +
+# data by name with the reloc-presence rodata-vs-relro disambiguation + externs
+# + relocations {offset,target,kind,in-slot-addend}), truncation-at-every-length
+# fuzz, the corruption red-pins (nonzero SizeOfOptionalHeader, unknown reloc
+# nativeId, out-of-range SymbolTableIndex, out-of-range SectionNumber), non-PE
+# schema fail-loud, and the DTYPE_FUNCTION extern isData inference.
+dss_add_test(NAME link/test_coff_object_reader SOURCES test_coff_object_reader.cpp)

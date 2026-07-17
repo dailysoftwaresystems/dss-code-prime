@@ -125,6 +125,23 @@ struct Schemas {
     return s;
 }
 
+// The Windows COFF sibling (x86_64): the `.obj` reloc format for the `.lib`
+// members + the PE `.exe` exec format for the client. The c170 pull dispatches
+// to the COFF object reader; the RUN executes NATIVELY on a Windows host.
+[[nodiscard]] Schemas loadCoffSchemas() {
+    Schemas s;
+    auto t = TargetSchema::loadShipped("x86_64");
+    auto r = ObjectFormatSchema::loadShipped("pe64-x86_64-windows");
+    auto e = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    auto g = GrammarSchema::loadShipped("c-subset");
+    if (!t || !r || !e || !g) { ADD_FAILURE() << "coff schema load failed"; return s; }
+    s.target = std::move(t).value();
+    s.reloc  = std::move(r).value();
+    s.exec   = std::move(e).value();
+    s.grammar = std::move(g).value();
+    return s;
+}
+
 [[nodiscard]] std::uint16_t ccIndexFor(TargetSchema const& target,
                                        ObjectFormatSchema const& format,
                                        DiagnosticReporter& rep) {
@@ -583,6 +600,100 @@ TEST(StaticLink, MachODriverStaticLinkBuildsSelfContainedExec) {
         << "exit 42 = dss_lib_answer() pulled from the Mach-O libdsslib.a, merged "
            "into main, and executed on Apple Silicon.";
 #endif  // __APPLE__ && __aarch64__
+}
+
+// -- c170: Windows COFF static-link (pull + merge via the c170 COFF reader) ------
+//
+// The COFF sibling of the ELF/Mach-O static-link witnesses: DSS writes a `.a` of
+// COFF `.obj` members, the pull DISPATCHES to the c170 COFF object reader (the
+// compile_pipeline switch on format.kind() == Pe), and the merge binds main's
+// extern to the pulled definition + STRIPS the import. STRUCTURAL (pull + merge),
+// runs on every host. PE x64 C mangling is IDENTITY (no leading underscore).
+TEST(StaticLink, CoffPullResolvesReferenceAndMergeStripsImport) {
+    ScratchDir scratch{Location::InsideRepo, "static-link"};
+    auto const dir = scratch.path();
+    Schemas const s = loadCoffSchemas();
+    ASSERT_TRUE(s.grammar);
+
+    auto const archive =
+        buildArchive(dir, "libdsslib_coff.a", {{std::string{kLibSrc}, "lib.o"}}, s);
+    ASSERT_FALSE(archive.empty());
+    auto refsAnswer = [](std::string const& n) {
+        return n.find("dss_lib_answer") != std::string::npos;
+    };
+
+    DiagnosticReporter mainRep;
+    auto mainMod = assembleFromSource(std::string{kMainSrc}, "main.c", s, *s.exec, mainRep);
+    ASSERT_TRUE(mainMod) << "main assemble failed; errs=" << mainRep.errorCount();
+    ASSERT_TRUE(std::any_of(mainMod->externImports.begin(), mainMod->externImports.end(),
+                            [&](ExternImport const& e){ return refsAnswer(e.mangledName); }))
+        << "main must reference dss_lib_answer as an extern import";
+
+    DiagnosticReporter pullRep;
+    std::vector<fs::path> const archives{archive};
+    auto pulled = pullStaticArchiveMembers(*mainMod, archives, *s.target, *s.exec, pullRep);
+    ASSERT_TRUE(pulled) << "coff pull failed; errs=" << pullRep.errorCount();
+    ASSERT_EQ(pulled->size(), 1u) << "exactly the one member defining dss_lib_answer";
+    EXPECT_TRUE(std::any_of((*pulled)[0].symbols.begin(), (*pulled)[0].symbols.end(),
+        [&](ModuleSymbol const& ms){
+            return refsAnswer(ms.name) && isExternallyVisible(ms.binding, ms.visibility);
+        }))
+        << "the pulled COFF member must define dss_lib_answer";
+    EXPECT_EQ(pullRep.errorCount(), 0u);
+
+    std::vector<AssembledModule> combined;
+    combined.push_back(*mainMod);
+    combined.push_back(std::move((*pulled)[0]));
+    DiagnosticReporter linkRep;
+    auto image = linker::link(
+        std::span<AssembledModule const>{combined.data(), combined.size()},
+        *s.target, *s.exec, linkRep);
+    EXPECT_EQ(linkRep.errorCount(), 0u) << "merged COFF static link must be clean";
+    EXPECT_TRUE(image.ok());
+    EXPECT_FALSE(std::any_of(image.externImportNames.begin(),
+                             image.externImportNames.end(), refsAnswer))
+        << "the merge must STRIP dss_lib_answer (bound to the pulled definition)";
+    EXPECT_EQ(image.resolvedCrossCuRefs.size(), 1u);
+}
+
+// -- c170: Windows COFF static-link through the PRODUCTION driver + NATIVE RUN ----
+//
+// DSS static-links `main` against a DSS-written `.a` of COFF `.obj` members via
+// the real driver, emitting a self-contained PE executable. Unlike the ELF (WSL)
+// and Mach-O (macOS-only) legs, the PE exec RUNS on THIS host: the `_WIN32` RUN
+// arm executes on the Windows MSVC gate + the windows-msvc CI leg -- exit 42 =
+// dss_lib_answer() pulled from the COFF `.a`, merged, and executed.
+TEST(StaticLink, CoffDriverStaticLinkExitsFortyTwo) {
+    ScratchDir scratch{Location::InsideRepo, "static-link"};
+    auto const dir = scratch.path();
+    Schemas const s = loadCoffSchemas();
+    ASSERT_TRUE(s.grammar);
+
+    auto const archive =
+        buildArchive(dir, "libdsslib_coff.a", {{std::string{kLibSrc}, "lib.o"}}, s);
+    ASSERT_FALSE(archive.empty());
+    auto const mainSrc = writeSrc(dir, "main.c", kMainSrc);
+
+    Program p;
+    p.setOutputDir(dir);
+    p.setResolveLibraries(std::vector<fs::path>{archive});
+    DiagnosticReporter rep;
+    int const rc = p.compileFiles(
+        std::vector<std::string>{mainSrc.string()}, "c-subset",
+        std::vector<std::string>{"x86_64:pe64-x86_64-windows-exec"}, rep);
+    ASSERT_EQ(rc, 0) << "COFF static-link build must succeed; errs=" << rep.errorCount();
+    auto mainPath = dir / "main.exe";
+    if (!fs::exists(mainPath)) mainPath = dir / "main";
+    ASSERT_TRUE(fs::exists(mainPath)) << "the self-contained PE exec must exist";
+
+#if defined(_WIN32)
+    auto const r = runBinary(mainPath, std::chrono::milliseconds{5000});
+    ASSERT_TRUE(r.spawned) << "main must spawn. " << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "THE c170 acceptance criterion: exit 42 = dss_lib_answer() pulled from "
+           "the COFF libdsslib.a, merged into main, and executed on Windows.";
+#endif  // _WIN32
 }
 
 // -- W1 real-lib.c artifact drop (DISABLED; run out-of-band) --------------------

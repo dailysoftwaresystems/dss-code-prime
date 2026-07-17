@@ -16,6 +16,7 @@
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "link/format/ar.hpp"  // writeArArchive (D-LK-STATIC-ARCHIVE-WRITER, c163)
+#include "link/format/coff_object_reader.hpp"  // c170: COFF .obj member reader (static-pull dispatch)
 #include "link/format/elf_object_reader.hpp"  // c165: readRelocatableObject (static-pull member parse)
 #include "link/format/macho_object_reader.hpp"  // c168: Mach-O MH_OBJECT member reader (static-pull dispatch)
 #include "link/linker.hpp"
@@ -1508,6 +1509,10 @@ pullStaticArchiveMembers(AssembledModule const&                 clientModule,
                 break;
             case ObjectFormatKind::MachO:
                 member_mod = macho::readRelocatableObject(
+                    memberBytes, target, format, reporter, memberCu);
+                break;
+            case ObjectFormatKind::Pe:
+                member_mod = pe::readRelocatableObject(
                     memberBytes, target, format, reporter, memberCu);
                 break;
             default: {
