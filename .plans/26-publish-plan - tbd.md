@@ -17,8 +17,8 @@
 
 ## ⛔ PHASE 0 — BLOCKERS (nothing publishes *cleanly* until these land)
 
-- [ ] **P0.1 — CMake `install()` rules + rpath.** Install the exe to `bin/` and the shared lib to `lib/`, with `$ORIGIN/../lib` (Linux) / `@loader_path/../lib` (macOS) so the exe finds the lib. *(The "keep exe+lib" decision. Compiler-repo change — behind the linker/FFI hold.)*
-- [ ] **P0.2 — `dss-code-prime` → `dsscp` binary rename.** So the installed command is `dsscp`. *(Compiler-repo change — behind the hold. The release tarball is already named `dsscp`; only the binary inside is still `dss-code-prime`.)*
+- [ ] **P0.1 — CMake `install()` rules + rpath.** Install the exe to `bin/` and the shared lib to `lib/`, with `$ORIGIN/../lib` (Linux) / `@loader_path/../lib` (macOS) so the exe finds the lib. *(The "keep exe+lib" decision. Compiler-repo change — queued; the linker/FFI hold was LIFTED 2026-07-17.)*
+- [ ] **P0.2 — `dss-code-prime` → `dsscp` binary rename.** So the installed command is `dsscp`. *(Compiler-repo change — queued (hold LIFTED 2026-07-17). The release tarball is already named `dsscp`; only the binary inside is still `dss-code-prime`.)*
 - [ ] **P0.3 — (winget only) a windows `.zip` asset.** winget wants an installer/portable `.zip`, not the `.tar.gz` we ship. Emit `dsscp-<ver>-windows-x64.zip` in `pipeline-pkg.yml` (or repackage in the winget job). Not needed for the other 7 managers.
 
 > Keep `ENABLE_PKG_PUBLISH` **unset** until P0.1 + P0.2 are done — a live publish before then ships a manifest that can't install cleanly.
