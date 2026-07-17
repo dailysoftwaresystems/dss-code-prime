@@ -17,6 +17,7 @@
 #include "hir/lowering/cst_to_hir.hpp"
 #include "link/format/ar.hpp"  // writeArArchive (D-LK-STATIC-ARCHIVE-WRITER, c163)
 #include "link/format/elf_object_reader.hpp"  // c165: readRelocatableObject (static-pull member parse)
+#include "link/format/macho_object_reader.hpp"  // c168: Mach-O MH_OBJECT member reader (static-pull dispatch)
 #include "link/linker.hpp"
 #include "link/writer.hpp"
 #include "lir/lir_2addr_legalize.hpp"
@@ -1494,8 +1495,34 @@ pullStaticArchiveMembers(AssembledModule const&                 clientModule,
         // with the client or another member (the monotonic minter never repeats).
         CompilationUnitId const memberCu =
             substrate::mintMonotonicId<CompilationUnitId>();
-        auto member_mod = elf::readRelocatableObject(
-            memberBytes, target, format, reporter, memberCu);
+        // Dispatch the member read by the format's object-format KIND -- the
+        // relocatable-object reader is per-format (ELF ET_REL c164 / Mach-O
+        // MH_OBJECT c168). A format with no reader arm fails loud rather than
+        // silently mis-parsing a member with the wrong reader (agnostic:
+        // switch on the schema-declared kind, never a format-name branch).
+        std::optional<AssembledModule> member_mod;
+        switch (format.kind()) {
+            case ObjectFormatKind::Elf:
+                member_mod = elf::readRelocatableObject(
+                    memberBytes, target, format, reporter, memberCu);
+                break;
+            case ObjectFormatKind::MachO:
+                member_mod = macho::readRelocatableObject(
+                    memberBytes, target, format, reporter, memberCu);
+                break;
+            default: {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::F_UnsupportedBinaryFormat;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "static-link member reader: object format '{}' (kind {}) "
+                    "has no relocatable-object reader -- cannot pull archive "
+                    "members for this format.",
+                    format.name(), objectFormatKindName(format.kind()));
+                reporter.report(std::move(d));
+                return std::nullopt;
+            }
+        }
         // Consume the reader's optional as the read-success signal -- NOT
         // `ok()`, which is a tautology for reader output AND false for a
         // data-only member (see elf_object_reader.hpp).

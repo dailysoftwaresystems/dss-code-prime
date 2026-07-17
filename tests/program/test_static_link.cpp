@@ -107,6 +107,24 @@ struct Schemas {
     return s;
 }
 
+// The Mach-O sibling of loadSchemas (arm64): the MH_OBJECT reloc format for
+// the `.a` members + the MH_EXECUTE exec format for the client. Used by the
+// c168 Mach-O static-link witness (the pull dispatches to the c168 Mach-O
+// object reader, the merge binds the reference exactly as the ELF path does).
+[[nodiscard]] Schemas loadMachoSchemas() {
+    Schemas s;
+    auto t = TargetSchema::loadShipped("arm64");
+    auto r = ObjectFormatSchema::loadShipped("macho64-arm64-darwin");
+    auto e = ObjectFormatSchema::loadShipped("macho64-arm64-darwin-exec");
+    auto g = GrammarSchema::loadShipped("c-subset");
+    if (!t || !r || !e || !g) { ADD_FAILURE() << "macho schema load failed"; return s; }
+    s.target = std::move(t).value();
+    s.reloc  = std::move(r).value();
+    s.exec   = std::move(e).value();
+    s.grammar = std::move(g).value();
+    return s;
+}
+
 [[nodiscard]] std::uint16_t ccIndexFor(TargetSchema const& target,
                                        ObjectFormatSchema const& format,
                                        DiagnosticReporter& rep) {
@@ -450,6 +468,121 @@ TEST(StaticLink, RealGccSectionRelativeJumpTableLibExitsFortyTwo) {
            "(anonymous .rodata gap atom + interior .text relocs) reconstructed, "
            "merged, and executed from a DSS-written .a.";
 #endif  // __linux__
+}
+
+// -- c168: Mach-O static-link (pull + merge via the c168 Mach-O reader) ---------
+//
+// The Mach-O sibling of PullResolvesReferenceAndMergeStripsImport: DSS writes a
+// Mach-O `.a` (arm64 MH_OBJECT members via the format-blind c163 ar writer),
+// then the static-link PULL dispatches to the c168 Mach-O object reader (NOT the
+// ELF one -- the compile_pipeline switch on format.kind()), reconstructs the
+// member into an AssembledModule, and the c154 merge binds main's extern to the
+// pulled definition + STRIPS the import EXACTLY as the ELF path does. This is the
+// STRUCTURAL witness (pull + merge), running on every host; the macOS RUN witness
+// rides the macos-latest CI leg (Mach-O has no off-Mac execution) -- the named
+// follow-up D-LK-MACHO-STATIC-LINK-RUNTIME. Red-on-disable: without the pull, the
+// merge leaves dss_lib_answer an unresolved import (asserted below).
+TEST(StaticLink, MachOPullResolvesReferenceAndMergeStripsImport) {
+    ScratchDir scratch{Location::InsideRepo, "static-link"};
+    auto const dir = scratch.path();
+    Schemas const s = loadMachoSchemas();
+    ASSERT_TRUE(s.grammar);
+
+    auto const archive =
+        buildArchive(dir, "libdsslib_macho.a", {{std::string{kLibSrc}, "lib.o"}}, s);
+    ASSERT_FALSE(archive.empty());
+    EXPECT_TRUE(isArArchiveFile(archive));
+
+    // Mach-O mangles a C name with a leading `_`, so match by substring.
+    auto refsAnswer = [](std::string const& n) {
+        return n.find("dss_lib_answer") != std::string::npos;
+    };
+
+    DiagnosticReporter mainRep;
+    auto mainMod = assembleFromSource(std::string{kMainSrc}, "main.c", s, *s.exec, mainRep);
+    ASSERT_TRUE(mainMod) << "main assemble failed; errs=" << mainRep.errorCount();
+    ASSERT_TRUE(std::any_of(mainMod->externImports.begin(), mainMod->externImports.end(),
+                            [&](ExternImport const& e){ return refsAnswer(e.mangledName); }))
+        << "main must reference dss_lib_answer as an extern import";
+
+    DiagnosticReporter pullRep;
+    std::vector<fs::path> const archives{archive};
+    auto pulled = pullStaticArchiveMembers(*mainMod, archives, *s.target, *s.exec, pullRep);
+    ASSERT_TRUE(pulled) << "macho pull failed; errs=" << pullRep.errorCount();
+    ASSERT_EQ(pulled->size(), 1u) << "exactly the one member defining dss_lib_answer";
+    EXPECT_TRUE(std::any_of((*pulled)[0].symbols.begin(), (*pulled)[0].symbols.end(),
+        [&](ModuleSymbol const& ms){
+            return refsAnswer(ms.name) && isExternallyVisible(ms.binding, ms.visibility);
+        }))
+        << "the pulled Mach-O member must define dss_lib_answer";
+    EXPECT_EQ(pullRep.errorCount(), 0u);
+
+    std::vector<AssembledModule> combined;
+    combined.push_back(*mainMod);
+    combined.push_back(std::move((*pulled)[0]));
+    DiagnosticReporter linkRep;
+    auto image = linker::link(
+        std::span<AssembledModule const>{combined.data(), combined.size()},
+        *s.target, *s.exec, linkRep);
+    EXPECT_EQ(linkRep.errorCount(), 0u) << "merged Mach-O static link must be clean";
+    EXPECT_TRUE(image.ok());
+    EXPECT_FALSE(std::any_of(image.externImportNames.begin(),
+                             image.externImportNames.end(), refsAnswer))
+        << "the merge must STRIP dss_lib_answer (bound to the pulled definition)";
+    EXPECT_EQ(image.resolvedCrossCuRefs.size(), 1u)
+        << "the reference->definition binding must be recorded";
+
+    // RED-ON-DISABLE: main ALONE (no pulled member) keeps dss_lib_answer an
+    // unresolved import -- the exact state the static pull removes.
+    DiagnosticReporter aloneRep;
+    auto imageAlone = linker::link(
+        std::span<AssembledModule const>{&*mainMod, 1}, *s.target, *s.exec, aloneRep);
+    EXPECT_TRUE(std::any_of(imageAlone.externImportNames.begin(),
+                            imageAlone.externImportNames.end(), refsAnswer))
+        << "without the static pull, dss_lib_answer stays an unresolved import";
+}
+
+// -- c168: Mach-O static-link through the PRODUCTION driver ----------------------
+//
+// The `--resolve-library <archive.a>` surface for Mach-O: DSS static-links `main`
+// against a DSS-written Mach-O `.a` through the real `Program::compileFiles`
+// driver, emitting a SELF-CONTAINED Mach-O executable. The BUILD runs on every
+// host (cross-compile to Mach-O -- proving the driver's Mach-O pull + merge +
+// exec-emit path); the RUN + red-on-disable are `__APPLE__`-gated (Mach-O has no
+// off-Mac execution -- the macos-latest CI leg is the runtime witness, the
+// cross-target-runtime-closure discipline; D-LK-MACHO-STATIC-LINK-RUNTIME).
+TEST(StaticLink, MachODriverStaticLinkBuildsSelfContainedExec) {
+    ScratchDir scratch{Location::InsideRepo, "static-link"};
+    auto const dir = scratch.path();
+    Schemas const s = loadMachoSchemas();
+    ASSERT_TRUE(s.grammar);
+
+    auto const archive =
+        buildArchive(dir, "libdsslib_macho.a", {{std::string{kLibSrc}, "lib.o"}}, s);
+    ASSERT_FALSE(archive.empty());
+    auto const mainSrc = writeSrc(dir, "main.c", kMainSrc);
+
+    Program p;
+    p.setOutputDir(dir);
+    p.setResolveLibraries(std::vector<fs::path>{archive});
+    DiagnosticReporter rep;
+    int const rc = p.compileFiles(
+        std::vector<std::string>{mainSrc.string()}, "c-subset",
+        std::vector<std::string>{"arm64:macho64-arm64-darwin-exec"}, rep);
+    ASSERT_EQ(rc, 0) << "Mach-O static-link build must succeed; errs=" << rep.errorCount();
+    auto const mainPath = dir / "main";
+    ASSERT_TRUE(fs::exists(mainPath)) << "the self-contained Mach-O exec must exist";
+
+#if defined(__APPLE__) && defined(__aarch64__)
+    // RUN (Apple-Silicon macOS): the pulled dss_lib_answer body is IN the exe ->
+    // exit 42. No dylib dependency for the archive's symbols (self-contained).
+    auto const r = runBinary(mainPath, std::chrono::milliseconds{5000});
+    ASSERT_TRUE(r.spawned) << "main must spawn. " << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "exit 42 = dss_lib_answer() pulled from the Mach-O libdsslib.a, merged "
+           "into main, and executed on Apple Silicon.";
+#endif  // __APPLE__ && __aarch64__
 }
 
 // -- W1 real-lib.c artifact drop (DISABLED; run out-of-band) --------------------

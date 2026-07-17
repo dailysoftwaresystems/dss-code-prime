@@ -85,3 +85,13 @@ dss_add_test(NAME link/test_ar_writer            SOURCES test_ar_writer.cpp)
 # (WSL), and header/section-table/symtab/rela truncation red-pins. Unblocks
 # the c165 static-link (pull a member, read it into a mergeable module, merge).
 dss_add_test(NAME link/test_relocatable_object_reader SOURCES test_relocatable_object_reader.cpp)
+
+# c168 (D-LK-RELOCATABLE-OBJECT-READER-MACHO) -- the Mach-O MH_OBJECT
+# relocatable-object MEMBER READER: the inverse of macho.cpp's MH_OBJECT writer
+# (the arm64 sibling of the c164 ELF reader). Writer<->reader FULL-object
+# round-trip (functions sliced by n_value + data by (segment,name) pair +
+# externs + relocations {offset,target,kind,in-slot-addend}), truncation-at-
+# every-length fuzz, the corruption red-pins (bad magic, MH_EXECUTE filetype,
+# unknown reloc nativeId, r_extern=0 section-relative reloc), non-Mach-O schema
+# fail-loud, and the x86_64 leaf-only agnosticism round-trip.
+dss_add_test(NAME link/test_macho_object_reader SOURCES test_macho_object_reader.cpp)
