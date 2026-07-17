@@ -145,7 +145,16 @@ TEST(FfiIngest, MachOFormatAppliesLeadingUnderscoreOnMangling) {
 
 // ── Unmatched extern: silent skip, externsAnnotated < externs.size ─
 
-TEST(FfiIngest, UnmatchedExternIsSilentlySkipped) {
+// c162 (D-FF1-READER-CONSUMER): `ingest()` is a BIND MECHANISM, not the
+// validation-policy owner. An extern that matches NO row in the aggregated
+// surface is SILENTLY SKIPPED here (no FfiMetadata written, ok() stays true)
+// -- the descriptor-aware VALIDATION POLICY (a bare `extern puts;` falls
+// through to its format-default library; a genuine typo fails loud) lives in
+// the sole production caller (compile_pipeline step 2.5), which has the
+// shipped-descriptor knowledge `ingest()` lacks. A blanket fail-loud HERE
+// would wrongly reject a legitimate `bare extern puts + --resolve-library
+// ownlib` mixed program (silent-failure review HIGH, folded).
+TEST(FfiIngest, UnmatchedExternIsSkippedBindMechanism) {
     TypeInterner ti = makeInterner();
     auto built = buildModuleWithExtern(ti);
     HirFfiMap ffi{built.hir};
@@ -170,12 +179,11 @@ TEST(FfiIngest, UnmatchedExternIsSilentlySkipped) {
         ExternDeclRef{built.externNode, "puts"}};  // not in header
     auto result = ingest(sources, externs, **target, **format, ffi, rep);
 
-    // No error — the linker will fail loud later if puts stays unresolved.
+    // Unmatched -> skipped (no error, no binding); the CALLER owns the policy.
     EXPECT_TRUE(result.ok());
     EXPECT_EQ(result.externsAnnotated, 0u);
     EXPECT_EQ(result.rowsAggregated, 1u);
     EXPECT_EQ(ffi.tryGet(built.externNode), nullptr);
-
 }
 
 // ── D-FF5-INGESTION-SOURCE: variant accepts all 3 source kinds ────
@@ -513,6 +521,28 @@ TEST(FfiIngest, DiagnosticCodeNameRoundTripFFfiIngestEmptyCanonical) {
 TEST(FfiIngest, DiagnosticCodeNameRoundTripDTargetAbiModelUnsupportedByDriver) {
     EXPECT_EQ(diagnosticCodeName(DiagnosticCode::D_TargetAbiModelUnsupportedByDriver),
               "D_TargetAbiModelUnsupportedByDriver");
+}
+TEST(FfiIngest, DiagnosticCodeNameRoundTripFFfiResolveLibrarySymbolAbsent) {
+    EXPECT_EQ(diagnosticCodeName(DiagnosticCode::F_FfiResolveLibrarySymbolAbsent),
+              "F_FfiResolveLibrarySymbolAbsent");
+}
+
+// c162 (D-FF1-READER-CONSUMER): a BinaryLibrarySource carrying a non-empty
+// `importName` OVERRIDES the reader's path-derived libraryPath on every row
+// it produced, so the resolved extern's import records the loader-resolvable
+// soname/DLL-name rather than the absolute build-time path. Proven here
+// through the header-source sibling is not possible (importName is
+// binary-only), so this pins the STRUCT contract: the field exists, defaults
+// empty, and a set value survives into the variant. The end-to-end binding
+// effect is witnessed by the round-trip integration test.
+TEST(FfiIngest, BinaryLibrarySourceImportNameDefaultsEmptyAndCarries) {
+    BinaryLibrarySource a{"/tmp/libdsslib.so"};
+    EXPECT_TRUE(a.importName.empty());
+    BinaryLibrarySource b{"/build/abs/path/libdsslib.so", "libdsslib.so"};
+    EXPECT_EQ(b.importName, "libdsslib.so");
+    IngestionSource src{b};
+    ASSERT_TRUE(std::holds_alternative<BinaryLibrarySource>(src));
+    EXPECT_EQ(std::get<BinaryLibrarySource>(src).importName, "libdsslib.so");
 }
 
 // ── FF3 (resolveAbi) gate: bad (target, format) pair fails ingest ─

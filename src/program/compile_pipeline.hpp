@@ -139,6 +139,24 @@ struct CompileOptions {
     // differential-verify arm + MIR unit tests (D-OPT1-DIFFERENTIAL-
     // VERIFY-RUNNER).
     ::dss::opt::OptPipeline const* pipelineOverride = nullptr;
+
+    // c162 (D-FF1-READER-CONSUMER): the `--resolve-library <path>` driver
+    // surface. Each entry is a real binary (a `.so` / `.dll` / `.dylib`,
+    // typically a DSS-BUILT library) whose export surface is READ (via the
+    // FF1 binary reader) and used to resolve this build's source-declared
+    // externs. A DSS-built library has NO shipped JSON descriptor, so
+    // reading its real export table is the ONLY way to link against it --
+    // a genuine, NON-DUPLICATIVE capability (unlike the shipped-lib JSON
+    // path). When non-empty, compile_pipeline step 2.5 routes every
+    // source-declared extern that carries no explicit per-symbol library
+    // override (and is not a bare no-library-binding reference) through the
+    // live `ingest()` consumer against these binaries: a match binds the
+    // extern to the library (validated PRESENT -- fail loud otherwise);
+    // externs with an explicit override / shipped-descriptor binding stay
+    // on the trusting `synthesizeFfiFromSourceDecls` path. Empty (the
+    // default) ⇒ every build before c162 is byte-identical (synthesize over
+    // all externs). See the step-2.5 precedence docblock.
+    std::vector<std::filesystem::path> resolveLibraries;
 };
 
 // Resolve `CompileConfig` to a shipped pipeline name. Uses a

@@ -244,6 +244,18 @@ ingest(std::span<IngestionSource const> sources,
         if (failed) return returnWithSnapshot();
         bool const fromBinary =
             std::holds_alternative<BinaryLibrarySource>(src);
+        // c162 (D-FF1-READER-CONSUMER): a BinaryLibrarySource carrying a
+        // non-empty `importName` OVERRIDES the reader's path-derived
+        // `libraryPath` on every row it produced, so the resolved extern's
+        // import records the loader-resolvable soname/DLL-name (the file's
+        // basename) rather than the absolute build-time path. Empty leaves
+        // the reader's label intact (the pre-c162 header/JSON behavior).
+        if (fromBinary) {
+            auto const& bin = std::get<BinaryLibrarySource>(src);
+            if (!bin.importName.empty()) {
+                for (auto& r : rows) r.libraryPath = bin.importName;
+            }
+        }
         aggregated.reserve(aggregated.size() + rows.size());
         for (auto& r : rows) {
             aggregated.push_back({std::move(r), fromBinary});
@@ -299,12 +311,22 @@ ingest(std::span<IngestionSource const> sources,
         }
     }
 
-    // (4) Walk the caller-supplied externs; populate FfiMetadata
-    // for each match. Unmatched externs are silently skipped —
-    // the downstream linker will fail loud with K_SymbolUndefined
-    // if no other source provides them; FF5 surfacing them here
-    // would be a false-positive (the user might have a different
-    // ingestion source planned for a later cycle).
+    // (4) Walk the caller-supplied externs; BIND FfiMetadata for each
+    // that MATCHES a row in the aggregated surface. An extern that
+    // matches NO row is SILENTLY SKIPPED here -- `ingest()` is a bind
+    // MECHANISM, not the policy owner. Its sole production caller
+    // (compile_pipeline step 2.5, c162 / D-FF1-READER-CONSUMER) inspects
+    // `ffiMap` AFTER this call to see which externs bound to a
+    // `--resolve-library` binary, then applies the VALIDATION POLICY to
+    // the unmatched ones: a bare `extern puts;` (a real system symbol the
+    // user did not #include) falls through to its format-default library,
+    // while a genuine typo (in neither the binaries nor any shipped
+    // descriptor) fails loud. That policy needs shipped-descriptor
+    // knowledge `ingest()` does not have -- keeping the skip silent HERE
+    // and the fail-loud in the descriptor-aware caller is the clean split
+    // (the alternative -- a blanket fail-loud in `ingest()` -- would
+    // wrongly reject a legitimate `bare extern puts + --resolve-library
+    // ownlib` program).
     for (auto const& ext : externs) {
         // post-fold #6 silent-failure C1: caller-side empty
         // canonicalName would match the empty-string key (if any
@@ -320,7 +342,7 @@ ingest(std::span<IngestionSource const> sources,
             continue;
         }
         auto it = bySymbol.find(std::string{ext.canonicalName});
-        if (it == bySymbol.end()) continue;
+        if (it == bySymbol.end()) continue;  // unmatched -> caller applies policy
         TaggedRow const& matched = *it->second;
 
         // Apply FF4 to produce the linker-visible decorated name.

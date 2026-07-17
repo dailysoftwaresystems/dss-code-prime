@@ -9,6 +9,7 @@
 #include "core/types/parse_diagnostic.hpp"
 #include "ffi/ingest.hpp"
 #include "ffi/mangling/c_mangle.hpp"  // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: applyCMangling
+#include "ffi/shipped_lib_descriptor.hpp"  // c162: collectShippedExternSymbolNames
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
 #include "link/linker.hpp"
@@ -29,6 +30,7 @@
 
 #include <algorithm>
 #include <format>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -275,6 +277,37 @@ static std::optional<CuMirModule> buildCuMirImpl(
         return std::nullopt;
     }
 
+    // 2.5-pre. c162 (D-FF1-READER-CONSUMER) EAGER path validation: a
+    //      `--resolve-library <path>` names a binary the build is pointed
+    //      at, so a MISSING / UNREADABLE path is a hard error the operator
+    //      must see -- UNCONDITIONALLY, even when this TU has no externs (or
+    //      only explicitly-bound ones) and nothing routes to `ingest()`
+    //      below. Without this eager open-probe the bad path would be
+    //      SILENTLY IGNORED (the reader is reached only through `ingest()`,
+    //      which the partition may skip). Fail loud `F_FileOpenFailed`,
+    //      honoring the documented contract ("opened + read at compile time,
+    //      fails loud on a missing/unreadable file"). A readable file's
+    //      binary validity is checked later by the reader when a governed
+    //      extern actually routes to it.
+    if (!opts.resolveLibraries.empty()) {
+        auto const probeEntry = reporter.errorCount();
+        for (auto const& lib : opts.resolveLibraries) {
+            std::ifstream probe(lib, std::ios::binary);
+            if (!probe) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::F_FileOpenFailed;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "--resolve-library: failed to open '{}' for reading "
+                    "(the resolve-library binary must exist + be readable at "
+                    "compile time). Check the path.",
+                    lib.generic_string());
+                reporter.report(std::move(d));
+            }
+        }
+        if (!tierClean(reporter, probeEntry)) return std::nullopt;
+    }
+
     // 2.5. FFI metadata synthesis for source-declared externs
     //      (FF6 Slice 2, 2026-06-02). When the language schema's
     //      `externDecl` rule declares an `externLibraryByFormat`
@@ -362,10 +395,128 @@ static std::optional<CuMirModule> buildCuMirImpl(
 
         auto const ffiEntry = reporter.errorCount();
         phase.emplace(substrate::CompilePhase::SynthesizeFfi);
-        auto const ffiResult = ffi::synthesizeFfiFromSourceDecls(
-            refs, importLibrary, target, format, ffiMap, reporter);
+
+        // c162 (D-FF1-READER-CONSUMER): the `--resolve-library` driver
+        // surface makes the FF5 `ingest()` binary-reader consumer LIVE.
+        //
+        // PRECEDENCE for a source-declared extern's import-library binding
+        // (highest wins):
+        //   1. `noLibraryBinding`  -- empty library; resolves at the link
+        //      tier (a sibling-TU definition or a loud undefined-symbol).
+        //   2. explicit `libraryOverride` -- a source `extern "lib" ...` OR a
+        //      shipped-library descriptor (its per-format `library`). The
+        //      binding is EXPLICIT; the binary read never overrides it.
+        //   3. `--resolve-library` binary MATCH -- the extern IS exported by
+        //      a named binary: bind to it (the true DT_NEEDED / import
+        //      descriptor for a DSS-built library that has no descriptor).
+        //   4. a governed extern ABSENT from every named binary:
+        //      * KNOWN system symbol (in some shipped descriptor, e.g. a bare
+        //        `extern int puts;` the user did not #include) → fall through
+        //        to the format-default library (`externLibraryByFormat`), the
+        //        gcc implicit-libc semantics -- NOT a fail-loud;
+        //      * GENUINE typo (in NEITHER a named binary NOR any shipped
+        //        descriptor, e.g. `dss_lib_answr`) → FAIL LOUD
+        //        `F_FfiResolveLibrarySymbolAbsent`. That is the meaningful,
+        //        false-positive-scarce validation: reading a real export
+        //        table proves an own-library symbol exists at compile time.
+        //
+        // The binary read is NON-DUPLICATIVE of the JSON/shipped path
+        // precisely because a DSS-BUILT library has no shipped descriptor --
+        // reading its real export table is the only way to discover its true
+        // library binding. The extern's TYPE still comes from the inline
+        // declaration; the reader supplies existence + binding only.
+        //
+        // When no `--resolve-library` is given (every build before c162),
+        // this collapses to the single `synthesizeFfiFromSourceDecls` call
+        // over ALL externs -- byte-identical output.
+        if (opts.resolveLibraries.empty()) {
+            auto const ffiResult = ffi::synthesizeFfiFromSourceDecls(
+                refs, importLibrary, target, format, ffiMap, reporter);
+            (void)ffiResult;  // shape inspected via reporter.errorCount()
+        } else {
+            // PARTITION: an extern with NEITHER an explicit per-symbol
+            // override NOR the no-library marker is "binary-governed" -- it
+            // would otherwise take the format-default (precedence 4), so it
+            // is exactly the class `--resolve-library` governs. `refs` and
+            // `binaryGoverned` are parallel-indexed to `hir->externDecls` so
+            // an unmatched governed extern can be recovered post-ingest.
+            std::vector<ffi::ExternDeclRef> binaryGoverned;
+            std::vector<ffi::ExternDeclRef> explicitlyBound;
+            for (std::size_t i = 0; i < refs.size(); ++i) {
+                bool const hasExplicit =
+                    !resolvedLibs[i].empty()
+                    || hir->externDecls[i].noLibraryBinding;
+                (hasExplicit ? explicitlyBound : binaryGoverned)
+                    .push_back(refs[i]);
+            }
+
+            // The resolve-library binaries become `ingest()` sources. The
+            // file BASENAME is the loader-resolvable identity recorded in
+            // the import (DT_NEEDED / import descriptor) -- see
+            // BinaryLibrarySource::importName.
+            std::vector<ffi::IngestionSource> binarySources;
+            binarySources.reserve(opts.resolveLibraries.size());
+            for (auto const& libPath : opts.resolveLibraries) {
+                binarySources.push_back(ffi::BinaryLibrarySource{
+                    libPath, libPath.filename().string()});
+            }
+
+            // (i) `ingest()` BINDS every governed extern the named binaries
+            // export (writes FfiMetadata to `ffiMap`); it SILENTLY SKIPS the
+            // rest (it is a mechanism -- the policy for the unmatched is ours).
+            if (!binaryGoverned.empty()) {
+                auto const r = ffi::ingest(binarySources, binaryGoverned,
+                                           target, format, ffiMap, reporter);
+                (void)r;
+            }
+
+            // (ii) The governed externs `ingest()` did NOT bind (absent from
+            // ffiMap) split by the shipped-descriptor oracle: a KNOWN system
+            // symbol falls through to `synthesize` (format-default library);
+            // a GENUINE typo fails loud. `shippedNames == nullopt` (config
+            // discovery failed) ⇒ treat every symbol as possibly-known and
+            // fall through -- never a false-positive fail-loud.
+            auto const shippedNames = ffi::collectShippedExternSymbolNames();
+            std::string libList;
+            for (std::size_t k = 0; k < opts.resolveLibraries.size(); ++k) {
+                if (k) libList += ", ";
+                libList += opts.resolveLibraries[k].filename().generic_string();
+            }
+            std::vector<ffi::ExternDeclRef> fallThrough = explicitlyBound;
+            for (auto const& g : binaryGoverned) {
+                if (ffiMap.tryGet(g.node) != nullptr) continue;  // bound to a binary
+                bool const known =
+                    !shippedNames.has_value()
+                    || shippedNames->count(std::string{g.canonicalName}) != 0;
+                if (known) {
+                    fallThrough.push_back(g);  // system symbol -> format-default
+                } else {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::F_FfiResolveLibrarySymbolAbsent;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.actual   = std::format(
+                        "declared extern '{}' is not exported by any "
+                        "--resolve-library binary [{}] and is not a known "
+                        "system symbol -- a genuine typo or a missing library. "
+                        "Fix the spelling, #include the header that declares "
+                        "it, or add the defining library to --resolve-library.",
+                        g.canonicalName, libList);
+                    reporter.report(std::move(d));
+                }
+            }
+
+            // (iii) `synthesize` binds the fall-through set (explicitly-bound
+            // + system-symbol governed) to their libraries. Skipped if the
+            // typo fail-loud above already dirtied the tier (keeps the
+            // diagnostic set focused).
+            if (tierClean(reporter, ffiEntry) && !fallThrough.empty()) {
+                auto const r = ffi::synthesizeFfiFromSourceDecls(
+                    fallThrough, importLibrary, target, format, ffiMap,
+                    reporter);
+                (void)r;
+            }
+        }
         phase.reset();
-        (void)ffiResult;  // shape inspected via reporter.errorCount()
         if (!tierClean(reporter, ffiEntry)) {
             return std::nullopt;
         }

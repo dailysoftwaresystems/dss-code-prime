@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>       // std::getenv (DSS_CONFIG_ROOT discovery)
 #include <fstream>
 #include <initializer_list>
 #include <optional>
@@ -22,6 +23,7 @@
 #include <filesystem>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1865,6 +1867,68 @@ bool shippedHeaderAvailableForFormat(std::filesystem::path const& descriptorPath
     auto avail = readShippedLibAvailability(descriptorPath, throwaway);
     if (!avail) return true;
     return objectFormatInAvailabilitySet(*avail, fmt);
+}
+
+std::optional<std::unordered_set<std::string>>
+collectShippedExternSymbolNames() {
+    namespace fs = std::filesystem;
+    // Locate src/dss-config/shippedLibs -- DSS_CONFIG_ROOT override first, then a
+    // cwd-walk up to 8 ancestors (mirrors findShippedConfig's discipline, but for
+    // the DIRECTORY rather than a single named file). nullopt on no hit.
+    fs::path root;
+    {
+        std::error_code ec;
+        if (char const* env = std::getenv("DSS_CONFIG_ROOT");
+            env != nullptr && env[0] != '\0') {
+            fs::path const cand =
+                fs::path{env} / "src" / "dss-config" / "shippedLibs";
+            if (fs::is_directory(cand, ec)) root = cand;
+        }
+        if (root.empty()) {
+            fs::path here = fs::current_path(ec);
+            for (int i = 0; i < 8 && !here.empty(); ++i) {
+                fs::path const cand =
+                    here / "src" / "dss-config" / "shippedLibs";
+                if (fs::is_directory(cand, ec)) { root = cand; break; }
+                fs::path const parent = here.parent_path();
+                if (parent == here) break;
+                here = parent;
+            }
+        }
+    }
+    if (root.empty()) return std::nullopt;  // discovery failed -> caller falls through
+
+    std::unordered_set<std::string> names;
+    std::error_code ec;
+    for (auto const& entry : fs::recursive_directory_iterator(root, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()
+            || entry.path().extension() != ".json") {
+            continue;
+        }
+        std::ifstream in(entry.path(), std::ios::binary);
+        if (!in) continue;  // lenient: unreadable descriptor skipped
+        nlohmann::json j;
+        // Names-only scan: no signature decode, no interner. A malformed
+        // descriptor is skipped (its symbols simply are not "known" -- caught
+        // for real by the semantic reader on #include + AllShippedDescriptorsDecode).
+        try {
+            in >> j;
+        } catch (...) {
+            continue;
+        }
+        if (!j.is_object() || !j.contains("symbols")
+            || !j.at("symbols").is_array()) {
+            continue;
+        }
+        for (auto const& sym : j.at("symbols")) {
+            if (sym.is_object() && sym.contains("name")
+                && sym.at("name").is_string()) {
+                names.insert(sym.at("name").get<std::string>());
+            }
+        }
+    }
+    return names;
 }
 
 } // namespace dss::ffi

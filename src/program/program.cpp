@@ -576,7 +576,8 @@ int runCusToTargets(
     DiagnosticReporter&                         rep,
     std::optional<std::filesystem::path> const& outputDir,
     CompileConfig                               config,
-    ::dss::opt::OptPipeline const*              pipelineOverride) {
+    ::dss::opt::OptPipeline const*              pipelineOverride,
+    std::vector<std::filesystem::path> const&   resolveLibraries) {
     // c9: build the front-end ONCE PER DISTINCT object-format-kind among the
     // targets (≤3). A language WITHOUT a preprocess pass produces identical CUs for
     // every format (activeFormat is inert) → a single nullopt-keyed build, no
@@ -649,6 +650,7 @@ int runCusToTargets(
         CompileOptions compileOpts;
         compileOpts.config           = config;
         compileOpts.pipelineOverride = pipelineOverride;
+        compileOpts.resolveLibraries = resolveLibraries;  // c162 (D-FF1-READER-CONSUMER)
         bool const ok = compileOneTarget(
             std::span<CompilationUnit const>{cus.data(), cus.size()},
             grammar, sourceStem, spec, scratch,
@@ -695,6 +697,16 @@ int Program::run(int argc, char* argv[]) {
     // `--config=<debug|release>` into the kernel so the right
     // shipped pipeline gets loaded at compile_pipeline step 3.5.
     setCompileConfig(args.config);
+    // c162 (D-FF1-READER-CONSUMER): thread `--resolve-library <path>` into the
+    // kernel so compile_pipeline step 2.5 reads each named binary's export
+    // surface to resolve + validate this run's externs. Map the CLI strings to
+    // filesystem paths (the same setOutputDir/setCompileConfig stamp pattern).
+    {
+        std::vector<std::filesystem::path> libs;
+        libs.reserve(args.resolveLibraries.size());
+        for (auto const& s : args.resolveLibraries) libs.emplace_back(s);
+        setResolveLibraries(std::move(libs));
+    }
     // `--time`: report the compilation's wall-clock to stderr when this run
     // returns — covers EVERY compile-producing mode (project / transpile /
     // directory / compile) via ONE scoped reporter, no per-mode duplication.
@@ -1035,7 +1047,8 @@ int Program::compileFiles(
     return runCusToTargets(
         buildCus, *grammar, sourceStem, targets, rep,
         outputDir_, compileConfig_,
-        optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr);
+        optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
+        resolveLibraries_);
 }
 
 int Program::compileUnits(
@@ -1113,7 +1126,8 @@ int Program::compileUnits(
     return runCusToTargets(
         buildCus, *grammar, sourceStem,
         targets, rep, outputDir_, compileConfig_,
-        optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr);
+        optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
+        resolveLibraries_);
 }
 
 // D-CAP-MARKER-COMPILE-DIR-PIN anchor: compileDirectory has NO

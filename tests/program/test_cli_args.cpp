@@ -719,6 +719,35 @@ TEST(CliArgs, DefineFlagCollectsRepeatableVerbatim) {
     EXPECT_EQ(r->defines[1], "Y=2");
 }
 
+// ── c162 (D-FF1-READER-CONSUMER): the --resolve-library CLI surface ──────────
+
+TEST(CliArgs, ResolveLibraryFlagCollectsRepeatable) {
+    // Both spellings (`--resolve-library <path>` / `--resolve-library=<path>`),
+    // repeatable, carried verbatim to CliArgs::resolveLibraries.
+    Argv a{"dss-code-prime", "--compile", "main.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux-exec",
+           "--resolve-library", "out/dsslib.so",
+           "--resolve-library=out/other.so"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->resolveLibraries.size(), 2u);
+    EXPECT_EQ(r->resolveLibraries[0], "out/dsslib.so");
+    EXPECT_EQ(r->resolveLibraries[1], "out/other.so");
+}
+
+TEST(CliArgs, ResolveLibraryFlagEmptyValueRejected) {
+    // Symmetric with every other value flag: an empty value is a hard
+    // MissingFlagValue, never a silently-stuffed "" resolve path.
+    Argv a{"dss-code-prime", "--compile", "main.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux-exec",
+           "--resolve-library="};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
+}
+
 TEST(CliArgs, DefineFlagFunctionLikeRejected) {
     // A '(' in NAME = a function-like -D — unsupported; must reject with a
     // pointer at the config predefinedMacros params axis, never half-parse.

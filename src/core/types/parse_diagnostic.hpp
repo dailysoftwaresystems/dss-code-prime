@@ -2176,6 +2176,28 @@ enum class DiagnosticCode : std::uint16_t {
     //   fully-specify / de-duplicate each variant's `when.format`.
     //   (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH, 2026-06-26.)
     F_ShippedMacroVariantAmbiguous = 0x5021,
+    // F_FfiResolveLibrarySymbolAbsent: under the `--resolve-library <path>`
+    //   driver surface (c162, D-FF1-READER-CONSUMER), compile_pipeline routed
+    //   a source-declared "binary-governed" extern (no per-symbol library
+    //   override, not a bare no-library reference) to the live `ingest()`
+    //   binary-reader consumer, and it matched NO row in ANY named binary's
+    //   real export table -- AND the symbol is NOT a known system symbol
+    //   (absent from every shipped-library descriptor too). So it is a
+    //   GENUINE typo or a missing library (e.g. `dss_lib_answr` for
+    //   `dss_lib_answer`), not a bare-`extern`'d libc call the user forgot to
+    //   #include. Failing loud NOW -- naming the symbol + the searched
+    //   libraries -- catches an own-library typo at compile time (reading a
+    //   real export table is proof the symbol exists) instead of letting it
+    //   mis-bind to the format-default library and fail at link/load. A
+    //   governed extern that IS a known system symbol falls through to its
+    //   format-default library (gcc implicit-libc), NOT this diagnostic, so a
+    //   legitimate `bare extern puts + --resolve-library ownlib` program is
+    //   never wrongly rejected. The extern TYPE still comes from the inline
+    //   declaration -- the reader supplies existence + binding only. Fail-loud:
+    //   a SILENT-DANGLING-IMPORT guard (unsuppressable). Remediation: fix the
+    //   spelling, #include the header that declares it, or add the defining
+    //   library to `--resolve-library`. (D-FF1-READER-CONSUMER, c162.)
+    F_FfiResolveLibrarySymbolAbsent = 0x5022,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".
