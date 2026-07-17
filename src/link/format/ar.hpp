@@ -96,13 +96,32 @@ struct DSS_EXPORT ArMemberInput {
     std::vector<std::string> exportedSymbols;
 };
 
-// Bundle `members` into a GNU/System V `ar` archive (`!<arch>` + "/" armap +
-// optional "//" long-name table + the member objects). Returns the archive
-// bytes on success; an EMPTY vector with a diagnostic on `reporter` on any
-// fail-loud belt (see the file docblock). An empty `members` span yields a
-// valid archive with just the magic + an empty (count-0) armap.
+// The archive index flavor.
+//   * `SysV` -- GNU / System V `.a` (Linux + macOS): the single "/" armap
+//     (big-endian). The GNU-compatible default (byte-audited against GNU `ar`).
+//   * `Coff` -- Windows `.lib` (D-FF1-AR-COFF-WRITER, c169): the SAME "/"
+//     first linker member (big-endian) PLUS a SECOND "/" linker member --
+//     Microsoft's LITTLE-endian SORTED symbol->member index (`link.exe`
+//     PREFERS it) -- emitted between the first armap and the "//" table. A
+//     `.lib` is a strict SUPERSET of the SysV `.a`; the extra member never
+//     changes an object member's bytes, only the on-disk offsets.
+enum class ArArchiveFlavor : std::uint8_t {
+    SysV = 0,
+    Coff = 1,
+};
+
+// Bundle `members` into an `ar` archive (`!<arch>` + "/" first-linker-member
+// armap + optional COFF "/" second-linker-member index + optional "//"
+// long-name table + the member objects). Returns the archive bytes on success;
+// an EMPTY vector with a diagnostic on `reporter` on any fail-loud belt (see
+// the file docblock). An empty `members` span yields a valid archive with just
+// the magic + an empty (count-0) armap. `flavor` selects the SysV `.a` (the
+// GNU-compatible default) or the Windows COFF `.lib` (adds the second linker
+// member) -- the framing + member bytes are byte-identical, only the index
+// members (and thus the member offsets) differ.
 [[nodiscard]] DSS_EXPORT std::vector<std::uint8_t>
 writeArArchive(std::span<ArMemberInput const> members,
-               DiagnosticReporter&            reporter);
+               DiagnosticReporter&            reporter,
+               ArArchiveFlavor                flavor = ArArchiveFlavor::SysV);
 
 } // namespace dss::link::format

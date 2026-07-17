@@ -298,8 +298,17 @@ readArArchive(std::span<std::uint8_t const> bytes,
         }
 
         if (trimmed == "/") {
-            armap = bytes.subspan(static_cast<std::size_t>(dataOffset),
-                                  static_cast<std::size_t>(memberSize));
+            // The FIRST "/" is the System V / COFF-1st-linker-member armap
+            // (big-endian), which this reader parses. A Windows COFF `.lib`
+            // carries a SECOND "/" member -- Microsoft's little-endian sorted
+            // index (D-FF1-AR-COFF-WRITER, c169) -- which link.exe prefers but
+            // this reader does NOT parse (it would mis-read the LE payload as
+            // BE). FIRST-"/"-WINS: keep the big-endian armap, treat the 2nd "/"
+            // as an ignored index member (not a linkable object).
+            if (!armap) {
+                armap = bytes.subspan(static_cast<std::size_t>(dataOffset),
+                                      static_cast<std::size_t>(memberSize));
+            }
         } else if (trimmed == "//") {
             longnames = bytes.subspan(static_cast<std::size_t>(dataOffset),
                                       static_cast<std::size_t>(memberSize));
