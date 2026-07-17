@@ -1,0 +1,39 @@
+{
+  "$comment": "c155 D-LK10-CRT-INIT-INVOKE closure witness #1: printf(\"%f\") — the anchor's cited FP-formatting case — works on EVERY runnable leg with the trampoline calling main directly (no user-side CRT-init sequence), because each format's loader runs libc's own initialization first (pe: msvcrt DllMain at attach; elf: ld.so runs libc.so.6's initializers; macho: dyld runs libSystem's initializers before LC_MAIN). Also the first corpus pin of a variadic DOUBLE on every ABI (SysV xmm0+al, ms_x64 GPR slot image, AAPCS64 v0, Apple always-stack). Exact stdout asserted byte-for-byte: default %f precision is 6 (C17 7.21.6.1); msvcrt text mode makes it CRLF.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "3.140000\r\n",
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "3.140000\n"
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-pie",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "expectedStdout": "3.140000\n"
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "emulator": "qemu-aarch64",
+      "expectedStdout": "3.140000\n"
+    },
+    {
+      "spec": "arm64:macho64-arm64-darwin-exec",
+      "artifact": "main",
+      "runOn": ["darwin"],
+      "expectedStdout": "3.140000\n"
+    }
+  ]
+}

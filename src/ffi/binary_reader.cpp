@@ -1,5 +1,6 @@
 #include "ffi/binary_reader.hpp"
 
+#include "ffi/binary_readers/ar_reader.hpp"
 #include "ffi/binary_readers/elf_reader.hpp"
 #include "ffi/binary_readers/macho_reader.hpp"
 #include "ffi/binary_readers/pe_reader.hpp"
@@ -61,6 +62,14 @@ readImportsFromBytes(std::span<std::uint8_t const> bytes,
             return readPe(bytes, libraryPathLabel, reporter);
         case FormatGuess::MachO64:
             return readMacho(bytes, libraryPathLabel, reporter);
+        case FormatGuess::Ar:
+            // Plan 11 FF1 roadmap B3 (D-FF1-AR-READER): an `ar` archive
+            // is a CONTAINER, not a single object -- its linker-facing
+            // export surface is the armap (symbol index), projected to
+            // one ImportSurface row per indexed symbol. The richer
+            // member-list + symbol->member map is reachable via the
+            // dedicated `readArArchive` (ar_reader.hpp).
+            return readAr(bytes, libraryPathLabel, reporter);
         case FormatGuess::MachOFat:
             // D-FF1-MACHO-FAT anchor: universal binaries package
             // multiple per-arch slices behind one outer wrapper.

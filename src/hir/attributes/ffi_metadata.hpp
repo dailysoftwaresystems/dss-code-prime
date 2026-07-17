@@ -47,6 +47,14 @@ struct FfiMetadata {
     // known. Used by the linker to record the runtime dependency.
     std::string soname;
 
+    // c156 (D-LK-ELF-SYMBOL-VERSIONING): the REQUIRED ELF symbol version this
+    // import must bind (e.g. "GLIBC_2.3"), already resolved for the active
+    // (arch, format) by the shipped descriptor's per-target `version` variant.
+    // Empty ⇒ unversioned (the default). Threaded verbatim to the MIR
+    // `ExternImport.version` the ELF writer consumes; ELF-only semantics
+    // (PE/Mach-O ignore it).
+    std::string version;
+
     // c86 (D-CSUBSET-BARE-PROTO-EXTERN-SYNTHESIS): TRUE ⇒ this extern
     // deliberately carries NO import library (a bare-prototype cross-TU
     // reference, C 6.2.2p5). The HIR→MIR extern pre-pass then ADMITS the empty

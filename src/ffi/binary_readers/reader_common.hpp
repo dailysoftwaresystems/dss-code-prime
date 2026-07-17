@@ -92,6 +92,19 @@ readU64(std::span<std::uint8_t const> b, std::size_t off) noexcept {
     return v;
 }
 
+// Big-endian u32. The `ar` armap (System V / GNU archive symbol index)
+// is the ONE structure in these formats stored big-endian (its count +
+// member-header offsets) -- everything else in `ar` is ASCII-decimal.
+// Kept beside the LE readers so the ar reader shares one byte-decode
+// home with its siblings.
+[[nodiscard]] inline std::uint32_t
+readU32BE(std::span<std::uint8_t const> b, std::size_t off) noexcept {
+    return  (static_cast<std::uint32_t>(b[off + 0]) << 24)
+         | (static_cast<std::uint32_t>(b[off + 1]) << 16)
+         | (static_cast<std::uint32_t>(b[off + 2]) <<  8)
+         |  static_cast<std::uint32_t>(b[off + 3]);
+}
+
 // Read a NUL-terminated C string from a string table at `index`,
 // bounded by the table's size. Returns empty string on out-of-range
 // (caller-side check; we never read past `tableEnd`).
@@ -118,10 +131,22 @@ enum class FormatGuess : std::uint8_t {
     MachO64    = 3,  // 0xFEEDFACF — 64-bit Mach-O (mach_header_64)
     MachOFat   = 4,  // 0xCAFEBABE — universal/FAT — UnsupportedFormat v1
     MachO32    = 5,  // 0xFEEDFACE — 32-bit Mach-O — UnsupportedFormat v1
+    Ar         = 6,  // "!<arch>\n" -- Unix `ar` static archive (.a / COFF .lib)
 };
+
+// The 8-byte global magic that opens every `ar` archive, GNU / BSD /
+// COFF alike: the ASCII "!<arch>\n" (0x0A newline terminator).
+constexpr std::uint8_t kArMagic[8] = {
+    '!', '<', 'a', 'r', 'c', 'h', '>', 0x0Au};
 
 [[nodiscard]] inline FormatGuess
 guessFormat(std::span<std::uint8_t const> b) noexcept {
+    if (b.size() >= 8
+     && b[0] == kArMagic[0] && b[1] == kArMagic[1] && b[2] == kArMagic[2]
+     && b[3] == kArMagic[3] && b[4] == kArMagic[4] && b[5] == kArMagic[5]
+     && b[6] == kArMagic[6] && b[7] == kArMagic[7]) {
+        return FormatGuess::Ar;
+    }
     if (b.size() >= 4
      && b[0] == 0x7Fu && b[1] == 'E' && b[2] == 'L' && b[3] == 'F') {
         return FormatGuess::Elf;

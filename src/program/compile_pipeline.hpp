@@ -139,6 +139,24 @@ struct CompileOptions {
     // differential-verify arm + MIR unit tests (D-OPT1-DIFFERENTIAL-
     // VERIFY-RUNNER).
     ::dss::opt::OptPipeline const* pipelineOverride = nullptr;
+
+    // c162 (D-FF1-READER-CONSUMER): the `--resolve-library <path>` driver
+    // surface. Each entry is a real binary (a `.so` / `.dll` / `.dylib`,
+    // typically a DSS-BUILT library) whose export surface is READ (via the
+    // FF1 binary reader) and used to resolve this build's source-declared
+    // externs. A DSS-built library has NO shipped JSON descriptor, so
+    // reading its real export table is the ONLY way to link against it --
+    // a genuine, NON-DUPLICATIVE capability (unlike the shipped-lib JSON
+    // path). When non-empty, compile_pipeline step 2.5 routes every
+    // source-declared extern that carries no explicit per-symbol library
+    // override (and is not a bare no-library-binding reference) through the
+    // live `ingest()` consumer against these binaries: a match binds the
+    // extern to the library (validated PRESENT -- fail loud otherwise);
+    // externs with an explicit override / shipped-descriptor binding stay
+    // on the trusting `synthesizeFfiFromSourceDecls` path. Empty (the
+    // default) ⇒ every build before c162 is byte-identical (synthesize over
+    // all externs). See the step-2.5 precedence docblock.
+    std::vector<std::filesystem::path> resolveLibraries;
 };
 
 // Resolve `CompileConfig` to a shipped pipeline name. Uses a
@@ -382,5 +400,97 @@ linkAndWrite(std::span<AssembledModule const> modules,
              ObjectFormatSchema const&        format,
              std::filesystem::path const&     outPath,
              DiagnosticReporter&              reporter);
+
+// -- c165 (D-LK-STATIC-LINK): STATIC linking against `ar` archives --------------
+//
+// The consume half of the "write + consume static and dynamic libs" goal. DSS
+// links DYNAMICALLY today (import tables); this adds the STATIC path: on an
+// unresolved extern, pull the defining member out of a `.a` and MERGE its code
+// INTO the output image (a self-contained executable -- the extern's definition
+// is IN the exe, not a runtime DT_NEEDED). Reuses the c154 cross-CU merge
+// (`linker::link`'s `mergeModules`) fed from archive members instead of sibling
+// CUs -- the reference resolves exactly as it does for a sibling translation unit.
+
+// Does the file at `path` OPEN + begin with the 8-byte GNU/SysV `ar` global
+// magic ("!<arch>\n")? This is the ar-vs-dynamic dispatch predicate for the
+// `--resolve-library` surface: an `ar` archive routes to the STATIC pull+merge
+// below; anything else stays on the dynamic export-reader path. The dispatch is
+// by MAGIC BYTES (agnostic), never a `.a`/`.lib` extension. A path that cannot
+// be opened/read returns false (it is NOT diverted to the static path -- it stays
+// on the dynamic path, whose eager open-probe fails loud `F_FileOpenFailed`, so
+// an unreadable `--resolve-library` path is never silently dropped).
+[[nodiscard]] DSS_EXPORT bool
+isArArchiveFile(std::filesystem::path const& path);
+
+// Pull the archive members that define `clientModule`'s (transitively)
+// unresolved externs, each parsed back into a mergeable `AssembledModule` via
+// the c164 ELF ET_REL reader (`elf::readRelocatableObject`). Two-pass LAZY-pull
+// (plan-11 Q5): a member is pulled only when a collected extern name resolves to
+// it through the archive symbol index (armap); a pulled member's OWN unresolved
+// externs feed the next pass (a member may reference another member). Members no
+// reference reaches are NEVER pulled (lazy, not whole-archive). Each pulled
+// member gets a fresh, process-unique `CompilationUnitId` (the merge keys by
+// `(cuId, SymbolId)`, so no member collides with the client or another member).
+//
+// Returns the pulled modules on success (an EMPTY vector is valid -- the archives
+// defined nothing the client referenced), or `nullopt` on any file-open /
+// archive-parse / member-read failure (fail loud via `reporter`). The reader's
+// `ok()` is a tautology for reader output (see elf_object_reader.hpp), so this
+// consumes the reader's `optional` return as the read-success signal -- never
+// `module.ok()`. SCOPE: ELF (the reader is ELF-only; a non-ELF `format` makes
+// `readRelocatableObject` fail loud -- Mach-O/COFF are named follow-ups).
+[[nodiscard]] DSS_EXPORT std::optional<std::vector<AssembledModule>>
+pullStaticArchiveMembers(AssembledModule const&                 clientModule,
+                         std::span<std::filesystem::path const> archivePaths,
+                         TargetSchema const&                    target,
+                         ObjectFormatSchema const&              format,
+                         DiagnosticReporter&                    reporter);
+
+// Link `clientModule` against zero-or-more static `ar` archives, then write the
+// image to `outPath`. When `staticArchives` is empty this is exactly
+// `linkAndWrite({clientModule})` (byte-identical to the pre-c165 path). Otherwise
+// it pulls the referenced members (`pullStaticArchiveMembers`) and links the
+// COMBINED span `[clientModule, pulled...]` -- the N>1 `linker::link` path, whose
+// `mergeModules` binds each archive reference to the pulled member's definition
+// (stripping the extern import) exactly as it does a sibling-CU reference.
+// Returns true iff the pull, merge, link, and write all succeeded.
+[[nodiscard]] DSS_EXPORT bool
+linkAndWriteWithStaticArchives(AssembledModule                        clientModule,
+                               std::span<std::filesystem::path const> staticArchives,
+                               TargetSchema const&                    target,
+                               ObjectFormatSchema const&              format,
+                               std::filesystem::path const&           outPath,
+                               DiagnosticReporter&                    reporter);
+
+// c163 (D-LK-STATIC-ARCHIVE-WRITER, the writer half of D-FF1-AR-WRITER-STATIC-
+// LINK): link N assembled CUs into N RELOCATABLE object members and bundle them
+// into ONE GNU/System V `ar` static archive (`.a`) committed to `outPath`. The
+// static-library counterpart of `linkAndWrite` (which emits ONE image).
+//
+// Each module is linked INDEPENDENTLY (a 1-element `link()`, NOT the cross-CU
+// merge) to its own `.o` bytes -- an archive PACKAGES separate objects, it does
+// not merge them; the FINAL (foreign) linker pulls + merges the members it
+// needs. Each member's armap symbol set is its DEFINED, externally-visible
+// symbols (`AssembledModule.symbols` filtered by `isExternallyVisible` -- the
+// same on-binary names the object writer put in the member's symbol table, so
+// the armap round-trips against the member). `format` MUST be a RELOCATABLE
+// object format (ELF ET_REL / Mach-O MH_OBJECT); an image-flavor format would
+// bundle non-relocatable images (a foreign linker cannot pull from those) and
+// fails loud. `memberNames` is parallel to `modules` (each member's archived
+// file name, e.g. "lib.o"). Returns true iff every member linked ok, the
+// archive built, and the bytes committed. The `ar` framing itself is
+// FORMAT-BLIND -- see `link/format/ar.hpp`.
+//
+// The DRIVER/CLI request surface (a project `artifactProfile: "staticlib"` or a
+// `--emit staticlib` flag routing here + the `.a`/`.lib` extension policy +
+// member naming) is the named follow-up D-FF1-AR-STATICLIB-DRIVER-WIRING; this
+// is the shipped composition it will call.
+[[nodiscard]] DSS_EXPORT bool
+linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
+                          std::span<std::string const>     memberNames,
+                          TargetSchema const&              target,
+                          ObjectFormatSchema const&        format,
+                          std::filesystem::path const&     outPath,
+                          DiagnosticReporter&              reporter);
 
 } // namespace dss

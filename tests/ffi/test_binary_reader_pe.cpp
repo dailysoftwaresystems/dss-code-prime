@@ -6,14 +6,21 @@
 //   * Failure modes: truncated DOS header, bad PE signature, malformed
 //     optional header magic, export RVA outside any section, names
 //     table runs past EOF.
-//   * Symbol kind/visibility/linkage mapping: every PE export becomes
-//     Function/Default/External (PE has no STT_/STV_/STB_ granularity
-//     equivalent in the export directory; refinements anchored at
-//     D-FF1-PE-OBJECT-EXPORTS).
+//   * c159 HARDENING (D-FF1-PE-READER; closes D-FF1-PE-OBJECT-EXPORTS):
+//     the reader walks the Export Address Table + name-ordinal table and
+//     CLASSIFIES each export by its EAT-RVA section membership —
+//     Function (executable section), Object (non-executable data
+//     section = a PE data export), or Forwarder (EAT RVA inside the
+//     export-directory span, pointing at a "DLL.Symbol" forward string).
+//     Visibility/linkage stay Default/External (the PE export table
+//     carries no STT_/STV_/STB_ granularity). New bounds/truncation pins
+//     for the EAT + ordinal tables + the forwarder-string read.
 //
 // Test strategy: synthesize minimal PE32+ binaries directly in C++ via
 // the byte-emit helpers + read them back. Avoids shipping real DLLs
-// in tests (CI hermeticity).
+// in tests (CI hermeticity). The fixture emits `.text` (executable),
+// `.data` (non-executable), and `.edata` sections so a per-export EAT
+// RVA lands in the section matching its intended kind.
 
 #include "core/types/diagnostic_reporter.hpp"
 #include "ffi/binary_reader.hpp"
@@ -35,148 +42,183 @@ using dss::test_support::putU32;
 
 namespace {
 
-// Build a minimal PE32+ binary with one section (`.edata`) carrying
-// the export directory + names. Returns the byte image.
+// One export the fixture emits into a synthesized PE. `kind` decides
+// which section the export's EAT RVA lands in (so the reader classifies
+// it): Function → `.text`, Data → `.data`, Forwarder → the
+// export-directory span (the RVA points at `forwardTarget`).
+enum class ExpKind { Function, Data, Forwarder };
+struct ExportSpec {
+    std::string name;
+    ExpKind     kind = ExpKind::Function;
+    std::string forwardTarget;   // used only when kind == Forwarder
+};
+
+// The built image plus the RVAs (== file offsets, see below) tests poke.
+struct BuiltPe {
+    std::vector<std::uint8_t> bytes;
+    std::uint32_t exportDirRva  = 0;   // = data-directory[0] RVA (also file off)
+    std::uint32_t exportDirSize = 0;
+    std::uint32_t eatRva        = 0;   // AddressOfFunctions
+    std::uint32_t namesTableRva = 0;   // AddressOfNames
+    std::uint32_t ordTableRva   = 0;   // AddressOfNameOrdinals
+    std::uint32_t textRva       = 0;
+    std::uint32_t dataRva       = 0;
+    std::uint32_t edataRva      = 0;
+};
+
+// Build a minimal PE32+ binary with THREE section headers:
+//   [.text ] executable, virtual-only (SizeOfRawData = 0)  — function RVAs
+//   [.data ] non-executable data, virtual-only             — data RVAs
+//   [.edata] file-backed: the export tables + name/forwarder strings
 //
-// Layout in execution order:
-//   [0..63]    DOS header (MZ + zero padding + peOffset at 0x3C)
-//   [64..127]  Padding so the PE signature starts at offset 128
-//   [128..131] PE signature 'P','E',0,0
-//   [132..151] COFF header (20 bytes)
-//   [152..391] Optional header — PE32+ requires 240 bytes
-//   [392..431] Section header for .edata (40 bytes)
-//   [432..]    .edata raw data: export directory + name pointers +
-//              name strings
-//
-// All RVAs equal file offsets for simplicity (section's
-// VirtualAddress == PointerToRawData).
-std::vector<std::uint8_t>
-buildMinimalPe32Plus(std::vector<std::string> const& exportNames) {
-    constexpr std::uint32_t kPeOffset           = 128;
-    constexpr std::uint32_t kSectionHdrOff      = kPeOffset + 4 + 20 + 240;
-    constexpr std::uint32_t kSectionRawDataOff  = kSectionHdrOff + 40;
-    constexpr std::uint16_t kPe32PlusMagic      = 0x020B;
-
-    std::vector<std::uint8_t> b(kSectionRawDataOff, 0);
-
-    // ── DOS header ──
-    b[0] = 'M'; b[1] = 'Z';
-    putU32(b, 0x3C, kPeOffset);
-
-    // ── PE signature ──
-    b[kPeOffset + 0] = 'P';
-    b[kPeOffset + 1] = 'E';
-    b[kPeOffset + 2] = 0;
-    b[kPeOffset + 3] = 0;
-
-    // ── COFF header ──
-    std::size_t const coffOff = kPeOffset + 4;
-    // Machine = 0x8664 (AMD64)
-    b[coffOff + 0] = 0x64; b[coffOff + 1] = 0x86;
-    // NumberOfSections = 1
-    b[coffOff + 2] = 0x01; b[coffOff + 3] = 0x00;
-    // SizeOfOptionalHeader = 240 (PE32+)
-    b[coffOff + 16] = 0xF0; b[coffOff + 17] = 0x00;
-    // (Other COFF fields stay zero for our purposes.)
-
-    // ── Optional header (PE32+) ──
-    std::size_t const optHeaderOff = coffOff + 20;
-    // Magic = PE32+ (0x020B)
-    b[optHeaderOff + 0] = static_cast<std::uint8_t>(kPe32PlusMagic & 0xFF);
-    b[optHeaderOff + 1] = static_cast<std::uint8_t>(kPe32PlusMagic >> 8);
-    // DataDirectories[0] = (exportRva, exportSize) at optHeaderOff + 112
-    std::size_t const dataDirsOff = optHeaderOff + 112;
-
-    // ── Build .edata section content first (so we know the sizes) ──
-    //
-    // Export directory header (40 bytes) at section start:
-    //   [ 0.. 3] ExportFlags
-    //   [ 4.. 7] TimeDateStamp
-    //   [ 8..11] Version (major/minor)
-    //   [12..15] NameRva (DLL name; pointed at "lib.dll" string)
-    //   [16..19] OrdinalBase
-    //   [20..23] AddressTableEntries (function count)
-    //   [24..27] NumberOfNamePointers (named export count)
-    //   [28..31] AddressOfFunctions
-    //   [32..35] AddressOfNames
-    //   [36..39] AddressOfNameOrdinals
-    //
-    // Then: name pointer table (4 bytes × N) at AddressOfNames RVA
-    // Then: ordinals table (2 bytes × N) — we leave it but don't read
-    // Then: function RVA table (4 bytes × N)
-    // Then: NUL-terminated name strings packed back-to-back.
-
-    std::uint32_t const sectionRva = kSectionRawDataOff;  // RVA = file offset
-    std::uint32_t const exportDirRva = sectionRva;
+// The `.edata` section keeps RVA == file offset (its VirtualAddress ==
+// PointerToRawData), so `namesTableRva` / `eatRva` / `ordTableRva` are
+// direct file offsets the corruption pins poke. `.text` / `.data` are
+// virtual-only at high RVAs (0x100000 / 0x200000) that never overlap the
+// export-directory span — so a function/data EAT RVA is never misread as
+// a forwarder. Layout inside `.edata`:
+//   [0]            IMAGE_EXPORT_DIRECTORY (40 B)
+//   [40]           Export Address Table   — u32 RVA × N
+//   [40+4N]        Name Pointer Table      — u32 RVA × N (INPUT order)
+//   [40+8N]        Ordinal Table           — u16 × N (identity: ord[i]=i)
+//   [40+10N]       name strings, then forwarder-target strings (packed)
+[[nodiscard]] BuiltPe buildPeExports(std::vector<ExportSpec> const& exports) {
+    constexpr std::uint32_t kPeOffset      = 128;
+    constexpr std::uint32_t kNumSections   = 3;
+    constexpr std::uint32_t kSectionHdrOff = kPeOffset + 4 + 20 + 240;      // 392
+    constexpr std::uint32_t kEdataRawOff   = kSectionHdrOff + kNumSections * 40;  // 512
+    constexpr std::uint16_t kPe32PlusMagic = 0x020B;
+    // Section Characteristics (PE/COFF §4.1). The reader classifies on
+    // IMAGE_SCN_MEM_EXECUTE (0x20000000) alone.
+    constexpr std::uint32_t kTextChars  = 0x60000020u;  // CNT_CODE|MEM_EXECUTE|MEM_READ
+    constexpr std::uint32_t kDataChars  = 0xC0000040u;  // CNT_INIT_DATA|MEM_READ|MEM_WRITE
+    constexpr std::uint32_t kEdataChars = 0x40000040u;  // CNT_INIT_DATA|MEM_READ
     constexpr std::uint32_t kExportDirSize = 40;
 
-    std::uint32_t const namesTableRva = exportDirRva + kExportDirSize;
-    std::uint32_t const namesTableSize =
-        4u * static_cast<std::uint32_t>(exportNames.size());
+    std::uint32_t const n       = static_cast<std::uint32_t>(exports.size());
+    std::uint32_t const edataRva = kEdataRawOff;   // RVA == file offset
+    std::uint32_t const textRva  = 0x100000u;
+    std::uint32_t const dataRva  = 0x200000u;
+    std::uint32_t const secVSize = n + 16u;        // headroom over the export count
 
-    // Skip the function-RVA + ordinal tables (we don't read them in v1
-    // but they should exist for completeness — keep them zero).
-    std::uint32_t const funcsTableRva = namesTableRva + namesTableSize;
-    std::uint32_t const funcsTableSize = namesTableSize;
-    std::uint32_t const ordsTableRva   = funcsTableRva + funcsTableSize;
-    std::uint32_t const ordsTableSize  =
-        2u * static_cast<std::uint32_t>(exportNames.size());
+    // ── .edata payload offsets (relative to the section start) ──
+    std::uint32_t const eatOff   = kExportDirSize;
+    std::uint32_t const namesOff = eatOff   + 4u * n;
+    std::uint32_t const ordOff   = namesOff + 4u * n;
+    std::uint32_t const strOff   = ordOff   + 2u * n;
 
-    std::uint32_t const stringsRva = ordsTableRva + ordsTableSize;
-
-    // Lay out the strings + remember each name's RVA.
-    std::vector<std::uint32_t> nameRvas;
-    std::vector<std::uint8_t> stringsRaw;
-    nameRvas.reserve(exportNames.size());
-    for (auto const& n : exportNames) {
-        nameRvas.push_back(stringsRva
-            + static_cast<std::uint32_t>(stringsRaw.size()));
-        for (char c : n) stringsRaw.push_back(static_cast<std::uint8_t>(c));
-        stringsRaw.push_back(0);
+    // Pack name strings, then (for forwarders only) forward-target
+    // strings; remember each string's section-relative offset.
+    std::vector<std::uint32_t> nameStrRel(n, 0);
+    std::vector<std::uint32_t> fwdStrRel(n, 0);
+    std::vector<std::uint8_t>  strBlob;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        nameStrRel[i] = strOff + static_cast<std::uint32_t>(strBlob.size());
+        for (char c : exports[i].name)
+            strBlob.push_back(static_cast<std::uint8_t>(c));
+        strBlob.push_back(0);
     }
-    std::uint32_t const stringsSize =
-        static_cast<std::uint32_t>(stringsRaw.size());
-    std::uint32_t const sectionSize =
-        kExportDirSize + namesTableSize + funcsTableSize + ordsTableSize
-        + stringsSize;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        if (exports[i].kind != ExpKind::Forwarder) continue;
+        fwdStrRel[i] = strOff + static_cast<std::uint32_t>(strBlob.size());
+        for (char c : exports[i].forwardTarget)
+            strBlob.push_back(static_cast<std::uint8_t>(c));
+        strBlob.push_back(0);
+    }
+    std::uint32_t const edataSize =
+        strOff + static_cast<std::uint32_t>(strBlob.size());
 
-    // Now back-patch DataDirectories[0] = (exportDirRva, kExportDirSize)
-    putU32(b, dataDirsOff + 0, exportDirRva);
-    putU32(b, dataDirsOff + 4, kExportDirSize);
+    // ── Header prefix ──
+    std::vector<std::uint8_t> b(kEdataRawOff, 0);
+    b[0] = 'M'; b[1] = 'Z';
+    putU32(b, 0x3C, kPeOffset);
+    b[kPeOffset + 0] = 'P'; b[kPeOffset + 1] = 'E';
+    b[kPeOffset + 2] = 0;   b[kPeOffset + 3] = 0;
+    std::size_t const coffOff = kPeOffset + 4;
+    b[coffOff + 0] = 0x64; b[coffOff + 1] = 0x86;                 // Machine AMD64
+    b[coffOff + 2] = static_cast<std::uint8_t>(kNumSections & 0xFF);
+    b[coffOff + 3] = static_cast<std::uint8_t>(kNumSections >> 8); // NumberOfSections
+    b[coffOff + 16] = 0xF0; b[coffOff + 17] = 0x00;               // SizeOfOptionalHeader = 240
+    std::size_t const optHeaderOff = coffOff + 20;
+    b[optHeaderOff + 0] = static_cast<std::uint8_t>(kPe32PlusMagic & 0xFF);
+    b[optHeaderOff + 1] = static_cast<std::uint8_t>(kPe32PlusMagic >> 8);
+    std::size_t const dataDirsOff = optHeaderOff + 112;
+    putU32(b, dataDirsOff + 0, edataRva);    // DataDirectories[0].RVA
+    putU32(b, dataDirsOff + 4, edataSize);   // DataDirectories[0].Size (covers forwarder strings)
 
-    // ── Section header ──
-    char const* const sectionName = ".edata";
-    std::memcpy(&b[kSectionHdrOff], sectionName, std::strlen(sectionName));
-    putU32(b, kSectionHdrOff +  8, sectionSize);         // VirtualSize
-    putU32(b, kSectionHdrOff + 12, sectionRva);          // VirtualAddress
-    putU32(b, kSectionHdrOff + 16, sectionSize);         // SizeOfRawData
-    putU32(b, kSectionHdrOff + 20, kSectionRawDataOff);  // PointerToRawData
+    // ── Section headers ──
+    auto writeSectionHdr = [&](std::uint32_t idx, char const* name,
+                               std::uint32_t vsize, std::uint32_t vaddr,
+                               std::uint32_t rawSize, std::uint32_t rawPtr,
+                               std::uint32_t chars) {
+        std::size_t const h = kSectionHdrOff + idx * 40u;
+        for (std::size_t k = 0; k < 8 && name[k] != '\0'; ++k)
+            b[h + k] = static_cast<std::uint8_t>(name[k]);
+        putU32(b, h +  8, vsize);
+        putU32(b, h + 12, vaddr);
+        putU32(b, h + 16, rawSize);
+        putU32(b, h + 20, rawPtr);
+        putU32(b, h + 36, chars);   // Characteristics
+    };
+    writeSectionHdr(0, ".text",  secVSize,  textRva,  0,         0,           kTextChars);
+    writeSectionHdr(1, ".data",  secVSize,  dataRva,  0,         0,           kDataChars);
+    writeSectionHdr(2, ".edata", edataSize, edataRva, edataSize, kEdataRawOff, kEdataChars);
 
-    // ── Append section raw data ──
-    // Export directory (40 bytes).
-    std::vector<std::uint8_t> ed(kExportDirSize, 0);
-    // NumberOfNamePointers @ [24..27]
-    putU32(ed, 24, static_cast<std::uint32_t>(exportNames.size()));
-    // AddressTableEntries @ [20..23]
-    putU32(ed, 20, static_cast<std::uint32_t>(exportNames.size()));
-    // AddressOfFunctions @ [28..31]
-    putU32(ed, 28, funcsTableRva);
-    // AddressOfNames @ [32..35]
-    putU32(ed, 32, namesTableRva);
-    // AddressOfNameOrdinals @ [36..39]
-    putU32(ed, 36, ordsTableRva);
+    // ── .edata content ──
+    std::vector<std::uint8_t> ed(edataSize, 0);
+    auto edU32 = [&](std::size_t off, std::uint32_t v) {
+        for (int k = 0; k < 4; ++k)
+            ed[off + k] = static_cast<std::uint8_t>((v >> (8 * k)) & 0xFF);
+    };
+    auto edU16 = [&](std::size_t off, std::uint16_t v) {
+        ed[off + 0] = static_cast<std::uint8_t>(v & 0xFF);
+        ed[off + 1] = static_cast<std::uint8_t>((v >> 8) & 0xFF);
+    };
+    edU32(16, 1u);                    // OrdinalBase
+    edU32(20, n);                     // AddressTableEntries
+    edU32(24, n);                     // NumberOfNamePointers
+    edU32(28, edataRva + eatOff);     // AddressOfFunctions
+    edU32(32, edataRva + namesOff);   // AddressOfNames
+    edU32(36, edataRva + ordOff);     // AddressOfNameOrdinals
+    for (std::uint32_t i = 0; i < n; ++i) {
+        std::uint32_t eat = 0;
+        switch (exports[i].kind) {
+            case ExpKind::Function:  eat = textRva + i;             break;
+            case ExpKind::Data:      eat = dataRva + i;             break;
+            case ExpKind::Forwarder: eat = edataRva + fwdStrRel[i]; break;
+        }
+        edU32(eatOff   + 4u * i, eat);
+        edU32(namesOff + 4u * i, edataRva + nameStrRel[i]);
+        edU16(ordOff   + 2u * i, static_cast<std::uint16_t>(i));   // identity ordinal
+    }
+    for (std::size_t k = 0; k < strBlob.size(); ++k)
+        ed[strOff + k] = strBlob[k];
+
     b.insert(b.end(), ed.begin(), ed.end());
 
-    // Names table: u32 RVAs.
-    for (auto rva : nameRvas) appU32(b, rva);
-    // Funcs table: zero stubs.
-    for (std::size_t i = 0; i < exportNames.size(); ++i) appU32(b, 0u);
-    // Ordinals table: zero stubs.
-    for (std::size_t i = 0; i < exportNames.size(); ++i) appU16(b, 0u);
-    // Name strings.
-    b.insert(b.end(), stringsRaw.begin(), stringsRaw.end());
+    BuiltPe out;
+    out.bytes         = std::move(b);
+    out.exportDirRva  = edataRva;
+    out.exportDirSize = edataSize;
+    out.eatRva        = edataRva + eatOff;
+    out.namesTableRva = edataRva + namesOff;
+    out.ordTableRva   = edataRva + ordOff;
+    out.textRva       = textRva;
+    out.dataRva       = dataRva;
+    out.edataRva      = edataRva;
+    return out;
+}
 
-    return b;
+// Back-compat shim: all-Function exports, returns just the image bytes.
+// Keeps the v1 tests (which assert every export is Function/Default/
+// External) reading exactly as before.
+[[nodiscard]] std::vector<std::uint8_t>
+buildMinimalPe32Plus(std::vector<std::string> const& exportNames) {
+    std::vector<ExportSpec> specs;
+    specs.reserve(exportNames.size());
+    for (auto const& nm : exportNames)
+        specs.push_back(ExportSpec{nm, ExpKind::Function, {}});
+    return buildPeExports(specs).bytes;
 }
 
 } // namespace
@@ -279,21 +321,16 @@ TEST(BinaryReaderPe, ExportRvaOutsideAnySectionRejected) {
 TEST(BinaryReaderPe, PartialCorruptionWarningFiresOnPoisonedNameRvas) {
     // Build with 3 names but corrupt 2 of the 3 name-RVAs to point
     // past EOF (which fails rvaToFileOff → ++corruptedNameSkips).
-    auto bytes = buildMinimalPe32Plus({"good", "bad1", "bad2"});
+    auto built = buildPeExports({{"good", ExpKind::Function, {}},
+                                 {"bad1", ExpKind::Function, {}},
+                                 {"bad2", ExpKind::Function, {}}});
+    auto& bytes = built.bytes;
 
-    // Locate the names table RVA in the export directory (offset +32
-    // inside the export-directory header, which lives at the start
-    // of the .edata section's raw data at file offset
-    // kSectionRawDataOff = 432).
-    constexpr std::uint32_t kSectionRawDataOff = 128 + 4 + 20 + 240 + 40;
-    constexpr std::uint32_t kExportDirHeaderSize = 40;
-    std::uint32_t const namesTableRva =
-        kSectionRawDataOff + kExportDirHeaderSize;
-    // Names table: 3 × u32 RVAs. Poison entries [1] and [2] to point
-    // past EOF (RVA 0xFFFFFFF0 — way past any section).
-    std::size_t const namesTableFileOff = namesTableRva;
-    putU32(bytes, namesTableFileOff + 1 * 4, 0xFFFFFFF0u);
-    putU32(bytes, namesTableFileOff + 2 * 4, 0xFFFFFFF1u);
+    // Names table: 3 × u32 RVAs (namesTableRva == file offset). Poison
+    // entries [1] and [2] to point past EOF (RVA 0xFFFFFFF0 — way past
+    // any section).
+    putU32(bytes, built.namesTableRva + 1 * 4, 0xFFFFFFF0u);
+    putU32(bytes, built.namesTableRva + 2 * 4, 0xFFFFFFF1u);
 
     DiagnosticReporter rep;
     auto r = readImportsFromBytes(bytes, "partial.dll", rep);
@@ -329,4 +366,135 @@ TEST(BinaryReaderPe, ZeroExportTableRvaReturnsEmptySurface) {
     ASSERT_TRUE(r.has_value())
         << "Zero exports is valid — not an error";
     EXPECT_EQ(r->size(), 0u);
+}
+
+// ── (8) c159 kind classification (closes D-FF1-PE-OBJECT-EXPORTS) ──
+
+// THE red-on-disable-per-kind pin: one Function (EAT RVA in `.text`),
+// one Data (EAT RVA in `.data`), one Forwarder (EAT RVA inside the
+// export-directory span → a "DLL.Symbol" string). Reverting the EAT
+// walk (default every export to Function, the v1 behavior) fails the
+// Data + Forwarder assertions; dropping the forwarder branch surfaces
+// HeapAlloc as a bogus Function with an empty target.
+TEST(BinaryReaderPe, ClassifiesFunctionDataAndForwarder) {
+    auto built = buildPeExports({
+        {"dss_add",    ExpKind::Function,  {}},
+        {"dss_global", ExpKind::Data,      {}},
+        {"HeapAlloc",  ExpKind::Forwarder, "NTDLL.RtlAllocateHeap"},
+    });
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "mixed.dll", rep);
+    ASSERT_TRUE(r.has_value())
+        << "reader rejected the mixed-kind PE: "
+        << (r.has_value() ? "" : r.error().detail);
+    ASSERT_EQ(r->size(), 3u);
+
+    EXPECT_EQ((*r)[0].mangledName, "dss_add");
+    EXPECT_EQ((*r)[0].kind, SymbolKind::Function);
+    EXPECT_TRUE((*r)[0].forwardTarget.empty());
+
+    // A PE data export classifies as Object (the shared data kind — the
+    // ELF STT_OBJECT / Mach-O __data precedent; there is no `Data`
+    // enumerator).
+    EXPECT_EQ((*r)[1].mangledName, "dss_global");
+    EXPECT_EQ((*r)[1].kind, SymbolKind::Object);
+    EXPECT_TRUE((*r)[1].forwardTarget.empty());
+
+    EXPECT_EQ((*r)[2].mangledName, "HeapAlloc");
+    EXPECT_EQ((*r)[2].kind, SymbolKind::Forwarder);
+    EXPECT_EQ((*r)[2].forwardTarget, "NTDLL.RtlAllocateHeap");
+
+    // Every row keeps Default/External (PE carries no STV_/STB_ column).
+    for (auto const& row : *r) {
+        EXPECT_EQ(row.visibility, SymbolVisibility::Default);
+        EXPECT_EQ(row.linkage, SymbolLinkage::External);
+    }
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+// ── (9) c159 EAT / ordinal / forwarder-string fail-loud pins ──
+
+TEST(BinaryReaderPe, EatRvaUnresolvableRejected) {
+    // Poison AddressOfFunctions (export dir + 28) to an RVA in no
+    // section — the EAT can't be located → fail loud (not silent).
+    auto built = buildPeExports({{"f", ExpKind::Function, {}}});
+    putU32(built.bytes, built.exportDirRva + 28, 0xDEADBEEFu);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "bad-eat.dll", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::SectionNotFound);
+    EXPECT_NE(r.error().detail.find("AddressOfFunctions"),
+              std::string::npos);
+}
+
+TEST(BinaryReaderPe, EatCountRunsPastEofRejected) {
+    // Poison AddressTableEntries (export dir + 20) to a huge count so
+    // the EAT region overruns the buffer — the truncation-shaped read
+    // must fail loud (W4 mid-EAT analog).
+    auto built = buildPeExports({{"f", ExpKind::Function, {}}});
+    putU32(built.bytes, built.exportDirRva + 20, 0x10000u);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "eat-oob.dll", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
+    EXPECT_NE(r.error().detail.find("Export Address Table"),
+              std::string::npos);
+}
+
+TEST(BinaryReaderPe, OrdinalTableRvaUnresolvableRejected) {
+    // Poison AddressOfNameOrdinals (export dir + 36) to an RVA in no
+    // section — the ordinal table can't be located → fail loud.
+    auto built = buildPeExports({{"f", ExpKind::Function, {}}});
+    putU32(built.bytes, built.exportDirRva + 36, 0xDEADBEEFu);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "bad-ord.dll", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::SectionNotFound);
+    EXPECT_NE(r.error().detail.find("AddressOfNameOrdinals"),
+              std::string::npos);
+}
+
+TEST(BinaryReaderPe, ForwarderStringUnterminatedRejected) {
+    // Cut the buffer's final byte — the forwarder string's terminating
+    // NUL (forwarder strings are packed last) — so it runs off EOF
+    // unterminated. The bounded forwarder read must fail loud (W4
+    // mid-forwarder-string analog), NOT return a truncated target.
+    auto built = buildPeExports({{"Fwd", ExpKind::Forwarder, "OTHER.Symbol"}});
+    built.bytes.resize(built.bytes.size() - 1);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "cut-fwd.dll", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
+    EXPECT_NE(r.error().detail.find("forwarder string"), std::string::npos);
+    EXPECT_NE(r.error().detail.find("unterminated"), std::string::npos);
+}
+
+TEST(BinaryReaderPe, OutOfRangeOrdinalSkippedAsPartialCorruption) {
+    // An ordinal entry >= AddressTableEntries is an internal
+    // inconsistency: skip that entry + warn (the partial-corruption
+    // discipline), surfacing the rest. Poison name[1]'s ordinal to 99.
+    auto built = buildPeExports({{"keep", ExpKind::Function, {}},
+                                 {"drop", ExpKind::Function, {}}});
+    // Ordinal table entry 1 (u16 LE at ordTableRva + 2) → 99 (>= 2).
+    built.bytes[built.ordTableRva + 2] = 99;
+    built.bytes[built.ordTableRva + 3] = 0;
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "ord-oob.dll", rep);
+    ASSERT_TRUE(r.has_value())
+        << "an out-of-range ordinal must skip that entry, not abort";
+    ASSERT_EQ(r->size(), 1u);
+    EXPECT_EQ((*r)[0].mangledName, "keep");
+    EXPECT_EQ((*r)[0].kind, SymbolKind::Function);
+    bool sawPartial = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::F_BinaryReaderPartialCorruption) {
+            sawPartial = true;
+            EXPECT_EQ(d.severity, DiagnosticSeverity::Warning);
+            EXPECT_NE(d.actual.find("skipped 1"), std::string::npos)
+                << "actual: " << d.actual;
+            break;
+        }
+    }
+    EXPECT_TRUE(sawPartial)
+        << "an out-of-range ordinal must fire the partial-corruption Warning";
 }

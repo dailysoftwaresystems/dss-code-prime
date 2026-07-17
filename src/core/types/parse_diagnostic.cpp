@@ -370,6 +370,8 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "F_ShippedTypedefVariantAmbiguous";
         case DiagnosticCode::F_ShippedMacroVariantAmbiguous:
             return "F_ShippedMacroVariantAmbiguous";
+        case DiagnosticCode::F_FfiResolveLibrarySymbolAbsent:
+            return "F_FfiResolveLibrarySymbolAbsent";
 
         // Semantic (S_) + assembler (A_) + linker (K_) enumerators added in
         // later cycles but not mirrored here until the per-file -Werror=switch
@@ -383,6 +385,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_FormatLacksThreadLocalSupport";
         case DiagnosticCode::K_ThreadLocalOveralignedForFormat:
             return "K_ThreadLocalOveralignedForFormat";
+        case DiagnosticCode::K_ArchiveMemberNameInvalid:
+            return "K_ArchiveMemberNameInvalid";
+        case DiagnosticCode::K_ArchiveFieldOverflow:
+            return "K_ArchiveFieldOverflow";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";

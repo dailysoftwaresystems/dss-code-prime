@@ -1,0 +1,116 @@
+{
+  "$comment": "PE32+ DYNAMIC-LINK LIBRARY (.dll) for x86_64 Windows -- c152, the D-LK2-4 anchor (plan 14 / roadmap A2): the PE mirror of the c150 ELF .so. Consumed by `src/link/format/pe.cpp` via the format-blind linker engine: `pe.type = dll` routes to the SAME `encodeExec` substrate the .exe image uses, with the dll divergences (IMAGE_FILE_DLL in Characteristics, AddressOfEntryPoint = 0, a `.edata` export directory wired into data-directory[0], ImageBase = the 0x180000000 MSVC DLL convention). The REAL Windows loader consumes the output: `ctypes.CDLL('dsslib.dll').dss_add(2, 40)` loads + GetProcAddress-binds + calls it. Differs from pe64-x86_64-windows-exec.format.json in: `pe.type` (dll vs exec), `pe.characteristics` 0x2022 = EXECUTABLE_IMAGE|LARGE_ADDRESS_AWARE|IMAGE_FILE_DLL (dumpbin ground truth for `cl /LD`: a DLL sets BOTH 0x0002 and 0x2000 -- EXECUTABLE_IMAGE means 'valid image', not 'is a .exe'), NO `entryPoint`/`processExit`/`entryCallingConvention`/`processArgs` (a DSS DLL ships with AddressOfEntryPoint = 0 -- NO DllMain; the loader treats entry 0 as 'skip process/thread notifications', a legal PE documented in the loader's LdrpCallInitRoutine path and produced by `link /NOENTRY`; the DllMain arm is the pinned follow-up D-LK2-DLL-DLLMAIN-ENTRY -- validate() rejects the entry cluster here exactly as the ELF dyn schema rejects it on the .so shape), `optionalHeader.imageBase` 0x180000000 (MSVC .dll default; the loader rebases via `.reloc` when the preferred base is taken or ASLR slides it -- DYNAMIC_BASE stays set so the DIR64 machinery is exercised for real), `optionalHeader.subsystem` 2 (GUI -- the `cl /LD` convention; the loader ignores the subsystem for a library loaded into an existing process) and `optionalHeader.dllCharacteristics` 0x160 (HIGH_ENTROPY_VA|DYNAMIC_BASE|NX_COMPAT -- dumpbin ground truth; link.exe does NOT set TERMINAL_SERVER_AWARE on DLLs, it is a per-process flag), NO `tlsAccess` and NO tdata/tbss rows (static TLS in a LoadLibrary'd DLL is its own loader-interaction arc -- D-LK-DLL-TLS-MODEL; every thread_local fails loud at the linker's supportedDataSections gate by this set's absence), `artifactProfiles` [\"lib\"], and NO `librarySynthesis` (the win32 <threads.h> shim vehicle inside a DLL is an UNTESTED form -- a threads.h-using lib fails loud at the synth pass rather than shipping unwitnessed machinery; the exec sibling keeps it). The export-directory DllName field is emitted EMPTY: per-artifact identity does not belong in a shipped format schema (the same decision as the dyn sibling's absent DT_SONAME) -- GetProcAddress never reads it and DSS emits no forwarder RVAs, the only consumer of that name.",
+
+  "dssObjectFormatVersion": 1,
+
+  "format": {
+    "name": "pe64-x86_64-windows-dll",
+    "version": "1.0",
+    "kind": "pe"
+  },
+
+  "$dataModelComment": "Same LLP64 identity as the exec sibling (64-bit Windows).",
+  "dataModel": "LLP64",
+
+  "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: MSVC x64 bit-field packing, same as the PE siblings.",
+  "bitFieldStrategy": "msvc_straddle",
+
+  "$externCallDispatchComment": "Same call-site shape as the exec image: one `jmp *[IAT slot]` code thunk per extern FUNCTION and a plain `call rel32 -> thunk` at the site -- pc-relative, so the code needs no fixup when the loader rebases the DLL. D-FFI-EXTERN-CALL-DISPATCH + D-FFI-PE-IMPORT-THUNK.",
+  "externCallDispatch": "direct-plt",
+
+  "$dataImportBindingComment": "c149 (D-LK-EXTERN-DATA-IMPORT, the PE half): extern library DATA objects bind via the IAT slot itself (`__imp_<name>` semantics -- the loader import-resolves every IAT slot to the exported symbol's address, function or data alike) and the shared GotIndirect lowering reads it. Identical on exec and dll: the import machinery is the loader's, not the artifact flavor's.",
+  "dataImportBinding": "got-indirect",
+
+  "$supportedDataSectionsComment": "rodata (read-only `.rdata`), data (mutable `.data`), bss (zero-init), relro (reloc-bearing CONST data, c145 -- folded into `.rdata`; the loader applies the IMAGE_REL_BASED_DIR64 base relocations into the slots at map time, before the page is exposed read-only, exactly as on the exec image; in a RELOCATABLE-AT-LOAD .dll that fold is LOAD-BEARING, not a hardening nicety). NO tdata/tbss: static TLS in a DLL needs the LoadLibrary static-TLS loader arc (IMAGE_TLS_DIRECTORY processing for late-loaded modules + DLL_THREAD_ATTACH-less threads -- D-LK-DLL-TLS-MODEL, not implemented); the linker's pre-walker gate rejects every thread_local loudly by this set's absence, mirroring the ELF dyn schema's D-LK-DYN-TLS-MODEL stance.",
+  "supportedDataSections": ["rodata", "data", "bss", "relro"],
+
+  "$artifactProfilesComment": "This format SERVES the shared-library profile (plan 06 AP3), mirroring elf64-x86_64-linux-dyn. The cli profile is NOT served (a .dll is not a runnable console binary).",
+  "artifactProfiles": ["lib"],
+
+  "pe": {
+    "$comment": "IMAGE_FILE_HEADER identity. machine = IMAGE_FILE_MACHINE_AMD64 (0x8664). characteristics = IMAGE_FILE_EXECUTABLE_IMAGE (0x0002) | IMAGE_FILE_LARGE_ADDRESS_AWARE (0x0020) | IMAGE_FILE_DLL (0x2000) = 0x2022 -- byte-identical to `cl /LD` ground truth (dumpbin: 'Executable / Application can handle large addresses / DLL'). EXECUTABLE_IMAGE is required on DLLs too (PE COFF: absent means 'linker error'; the loader refuses the file); IMAGE_FILE_DLL is what makes CreateProcess reject it and LoadLibrary accept it. type = dll routes the walker's Dll arm.",
+    "machine": 34404,
+    "characteristics": 8226,
+    "type": "dll"
+  },
+
+  "optionalHeader": {
+    "$comment": "IMAGE_OPTIONAL_HEADER64 (PE/COFF spec 3.4). magic = PE32+ (0x20B). imageBase = 0x180000000 (the MSVC x64 DLL preferred base; the loader rebases via the `.reloc` DIR64 table when ASLR or a base collision moves the image -- unlike the ELF .so there is NO base-0 layout trick: PE VAs are absolute at the preferred base and the loader adjusts each DIR64 site by the load delta). sectionAlignment = 0x1000, fileAlignment = 0x200 (MSVC defaults, same as the exec). subsystem = IMAGE_SUBSYSTEM_WINDOWS_GUI (2) -- the `cl /LD` convention; ignored by the loader for a library mapped into an existing process. dllCharacteristics = HIGH_ENTROPY_VA (0x0020) | DYNAMIC_BASE (0x0040) | NX_COMPAT (0x0100) = 0x160 -- dumpbin ground truth for a `cl /LD` DLL (no TERMINAL_SERVER_AWARE: link.exe sets 0x8000 on executables only; it is a per-process flag). DYNAMIC_BASE is deliberately KEPT so every load exercises the base-relocation machinery. Stack/heap reserve+commit are loader-ignored for DLLs (the process' exe owns them) but link.exe stamps them anyway -- same values as the exec sibling.",
+    "magic": 523,
+    "imageBase": 6442450944,
+    "sectionAlignment": 4096,
+    "fileAlignment": 512,
+    "majorOperatingSystemVersion": 6,
+    "minorOperatingSystemVersion": 0,
+    "majorSubsystemVersion": 6,
+    "minorSubsystemVersion": 0,
+    "subsystem": 2,
+    "dllCharacteristics": 352,
+    "sizeOfStackReserve": 1048576,
+    "sizeOfStackCommit": 4096,
+    "sizeOfHeapReserve": 1048576,
+    "sizeOfHeapCommit": 4096
+  },
+
+  "sections": [
+    {
+      "$comment": "Executable code section. virtualAddress = 0x1000 (RVA -- first page after the headers). Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ | IMAGE_SCN_ALIGN_16BYTES = 0x60500020, same as the exec sibling.",
+      "kind": "text",
+      "name": ".text",
+      "type": 1616904224,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0,
+      "virtualAddress": 4096
+    },
+    {
+      "$comment": "Read-only data (string literals, reloc-free const globals; relro items fold in here with their DIR64 base-reloc sites). virtualAddress = 0 -- walker-computed (contiguous after .text). Characteristics = CNT_INITIALIZED_DATA | MEM_READ = 0x40000040.",
+      "kind": "rodata",
+      "name": ".rdata",
+      "type": 1073741888,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Writable initialized data. virtualAddress = 0 -- walker-computed. Characteristics = CNT_INITIALIZED_DATA | MEM_READ | MEM_WRITE = 0xC0000040.",
+      "kind": "data",
+      "name": ".data",
+      "type": 3221225536,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0,
+      "virtualAddress": 0
+    },
+    {
+      "$comment": "Zero-initialized data (SizeOfRawData = 0 -- no file bytes; the loader zero-fills). Characteristics = CNT_UNINITIALIZED_DATA | MEM_READ | MEM_WRITE = 0xC0000080.",
+      "kind": "bss",
+      "name": ".bss",
+      "type": 3221225600,
+      "flags": 0,
+      "addrAlign": 0,
+      "entrySize": 0,
+      "virtualAddress": 0
+    }
+  ],
+
+  "relocations": [
+    {
+      "$comment": "Same image-side kinds as the exec sibling, minus the tls SECREL row (this schema advertises no thread-local sections; a tls-kind relocation reaching the walker fails loud at the kind-declared check). REL32 is pc-relative -- needs no load-time fixup under rebase. abs64 data slots (fn-ptr tables, &global initializers, jump tables) are patched with their preferred-base VAs AND given IMAGE_REL_BASED_DIR64 `.reloc` rows the loader adjusts by the load delta.",
+      "name": "IMAGE_REL_AMD64_REL32",
+      "kind": 1,
+      "nativeId": 4
+    },
+    {
+      "name": "IMAGE_REL_AMD64_ADDR64",
+      "kind": 2,
+      "nativeId": 1
+    },
+    {
+      "name": "IMAGE_REL_AMD64_ADDR32",
+      "kind": 3,
+      "nativeId": 2
+    }
+  ]
+}

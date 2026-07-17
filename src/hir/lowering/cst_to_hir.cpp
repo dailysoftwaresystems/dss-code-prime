@@ -7504,13 +7504,19 @@ struct Lowerer {
                     HirNodeId const ef = track(
                         builder.makeExternFunction(pr->type, sym.v, {}), d);
                     auto const* shipped =
-                        model.suppressedShippedLibraryFor(pr->name);
+                        model.suppressedShippedSymbolFor(pr->name);
                     externDecls.push_back(HirExternRecord{
                         ef, pr->name,
                         shipped != nullptr
-                            ? *shipped
+                            ? shipped->library
                             : std::unordered_map<std::string, std::string>{},
-                        /*noLibraryBinding=*/shipped == nullptr});
+                        /*noLibraryBinding=*/shipped == nullptr,
+                        // c156 (D-LK-ELF-SYMBOL-VERSIONING): carry the suppressed
+                        // shipped symbol's required version through the user
+                        // prototype's synthesized import, else the versioned
+                        // symbol misbinds unversioned (the realpath@GLIBC_2.2.5
+                        // silent bug the descriptor path fixes).
+                        shipped != nullptr ? shipped->version : std::string{}});
                     if (asGlobal) {
                         out.push_back(ef);
                     } else if (moduleDecls_ != nullptr) {
@@ -8706,7 +8712,8 @@ std::unique_ptr<CstToHirResult> lowerToHir(SemanticModel& model, DiagnosticRepor
         // missing that format ⇒ FF5 falls back to the language's
         // `externLibraryByFormat[format]` default.
         externDecls.push_back(HirExternRecord{
-            node, ext.name, ext.library});
+            node, ext.name, ext.library, /*noLibraryBinding=*/false,
+            ext.version});   // D-LK-ELF-SYMBOL-VERSIONING (c156)
     }
 
     HirNodeId const root = builder.makeModule(decls);

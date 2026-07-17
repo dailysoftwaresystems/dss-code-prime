@@ -1,0 +1,43 @@
+{
+  "$comment": "c156 D-LK-ELF-SYMBOL-VERSIONING witness: realpath(NULL) binds GLIBC_2.3 via the emitted .gnu.version_r on x86_64-elf (was NULL/exit-3 misbinding @GLIBC_2.2.5); the SAME source stays UNVERSIONED + runs on arm64 (single 2.17 baseline — the opt-in regression control), and the unversioned sibling strtoll in the same binary still binds. exit 42 = strtoll('42') after realpath+free succeed. RED-ON-DISABLE: drop realpath's descriptor `version` field -> x86_64 misbinds @GLIBC_2.2.5 -> realpath returns NULL -> exit 3. gcc -std=c17 -D_DEFAULT_SOURCE linux cross-checked (42). elf legs only (realpath is [elf,macho]; run legs mirror posix_shell_symbols).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "realpath-versioned-ok\n",
+  "targets": [
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ]
+    },
+    {
+      "spec": "arm64:elf64-aarch64-linux-exec",
+      "artifact": "main",
+      "runOn": [
+        "linux"
+      ],
+      "emulator": "qemu-aarch64"
+    },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "main", "runOn": ["darwin"], "emulator": "" }
+  ],
+  "optimizedPipelines": [
+    {
+      "label": "full-release-like",
+      "passes": [
+        "ConstFold",
+        "Mem2Reg",
+        "CopyProp",
+        "Cse",
+        "Licm",
+        "SimplifyCfg",
+        "Dce"
+      ]
+    },
+    {
+      "label": "release",
+      "shippedPipeline": "release"
+    }
+  ]
+}

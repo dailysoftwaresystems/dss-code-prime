@@ -859,7 +859,8 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
     // D-LK2-RODATA closure — `supportedDataSections`. Optional
     // top-level array of `DataSectionKind` names ("rodata" / "data" /
     // "bss" / "tdata" / "tbss" — the last two per D-CSUBSET-THREAD-
-    // LOCAL) the format's walker accepts on `AssembledModule.
+    // LOCAL — plus "relro" per D-LK-RELRO-CONST-DATA-RELOCATABLE, c145)
+    // the format's walker accepts on `AssembledModule.
     // dataItems`. Absent / empty = walker rejects all producer-data-
     // section items (the format-side validate() rule below also
     // gates this on isImageFlavor — relocatable .obj cannot declare
@@ -874,7 +875,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                       "/supportedDataSections",
                       "'supportedDataSections' must be an array of "
                       "DataSectionKind names (\"rodata\" / \"data\" / "
-                      "\"bss\" / \"tdata\" / \"tbss\")");
+                      "\"bss\" / \"tdata\" / \"tbss\" / \"relro\")");
         } else {
             auto const& arr = doc.at("supportedDataSections");
             std::size_t i = 0;
@@ -892,7 +893,7 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                                   std::format("unknown DataSectionKind "
                                               "'{}' (expected 'rodata' "
                                               "/ 'data' / 'bss' / "
-                                              "'tdata' / 'tbss')",
+                                              "'tdata' / 'tbss' / 'relro')",
                                               name));
                     } else {
                         bool dup = false;
@@ -1216,6 +1217,32 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                     }
                 }
             }
+            // `soname`: DT_SONAME for an ET_DYN shared library
+            // (c150, D-LK1-4). Optional; absent = no DT_SONAME
+            // emitted (the `gcc -shared` no-`-soname` shape). An
+            // empty-string literal is rejected like `interpreter`:
+            // a zero-length DT_SONAME is unambiguously a config
+            // error (omit the field instead). validate() rejects
+            // the field on non-dyn schemas.
+            if (e.contains("soname")) {
+                if (!e.at("soname").is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/elf/soname",
+                              "'soname' must be a string (e.g. "
+                              "'libfoo.so.1')");
+                } else {
+                    auto const value = e.at("soname").get<std::string>();
+                    if (value.empty()) {
+                        coll.emit(DiagnosticCode::C_MalformedJson,
+                                  "/elf/soname",
+                                  "'soname' must not be empty -- omit "
+                                  "the field entirely to emit no "
+                                  "DT_SONAME.");
+                    } else {
+                        data.elf.soname = value;
+                    }
+                }
+            }
             // `pageAlign`: PT_LOAD p_align for Exec images. Required
             // for ET_EXEC at validate() — the kernel rejects ELF
             // exec'd images whose p_align is smaller than the
@@ -1523,6 +1550,22 @@ ObjectFormatSchema::loadFromText(std::string_view jsonText,
                 } else {
                     data.machoImage.dylinkerPath =
                         im.at("dylinkerPath").get<std::string>();
+                }
+            }
+            // D-LK3-3 (c153) — the MH_DYLIB LC_ID_DYLIB install name.
+            // Optional at parse; validate() requires it non-empty on a
+            // Dylib schema and rejects it on every other filetype.
+            if (im.contains("installName")) {
+                if (!im.at("installName").is_string()) {
+                    coll.emit(DiagnosticCode::C_MalformedJson,
+                              "/image/installName",
+                              "'installName' must be a string (the "
+                              "LC_ID_DYLIB name a client links "
+                              "against, e.g. '@rpath/libdss.dylib' -- "
+                              "MH_DYLIB only)");
+                } else {
+                    data.machoImage.installName =
+                        im.at("installName").get<std::string>();
                 }
             }
             if (im.contains("loadDylibs")) {

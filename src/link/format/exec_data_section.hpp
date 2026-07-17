@@ -93,11 +93,16 @@ struct ExecDataSectionLayout {
     std::uint64_t                     sectionAlignFloor,
     std::string_view                  writerName,
     DiagnosticReporter&               reporter,
-    // PE patches data-item (data→data) relocations into the laid-out bytes
-    // AFTER this call (its cross-CU thunk-slot feature), so it passes `true`.
-    // ELF / Mach-O do NOT yet patch data-item relocations, so they leave this
-    // `false` and a reloc-bearing item fails loud here (no silent unpatched
-    // slot). Deferral anchor: D-LK1-ELF-RODATA-DATAITEM-RELOC.
+    // Every writer passes `true` for the kinds whose item relocations it
+    // patches/emits (`data` + `relro` on all three formats; `tdata` on ELF
+    // and PE — the Mach-O exec passes FALSE for tdata, an intentional
+    // fail-loud deferral; exec `rodata` is `true` on PE, the ELF dynamic
+    // arm, AND the Mach-O exec — the latter guarded downstream by the
+    // `__TEXT,__const` rebase wall), and leaves `false` where a
+    // reloc-bearing item is a producer-contract breach (read-only `rodata` on
+    // the static/relocatable arms — the RodataDataItemWithRelocationFailsLoud
+    // discipline): the item then fails loud here, never a silent unpatched
+    // slot. Deferral anchor: D-LK1-ELF-RODATA-DATAITEM-RELOC.
     bool                              allowItemRelocations = false) {
     using ::dss::link::format::detail::emit;
 
@@ -118,9 +123,10 @@ struct ExecDataSectionLayout {
         auto const& d = dataItems[i];
         if (d.section != kind) continue;     // belongs to another section
         // A data item carrying its OWN relocations (data->data references —
-        // a vtable / cross-CU thunk slot). The writers that don't patch them
-        // (Mach-O) reject loud; PE + ELF-dynamic (`allowItemRelocations`)
-        // patch them post-layout using the offsets this function records.
+        // a vtable / fn-ptr table / cross-CU thunk slot). Where the caller
+        // patches/emits them (`allowItemRelocations=true`) they flow through;
+        // where a reloc-bearing item is a producer-contract breach (read-only
+        // `rodata` on most arms) it rejects loud here.
         if (!d.relocations.empty() && !allowItemRelocations) {
             emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
                  std::format("{}: {} data item #{} (SymbolId={{ {} }}) carries "
@@ -431,10 +437,20 @@ inline void mergeFileBackedDataSection(ExecDataSectionLayout&       into,
                                  writerName, di.symbol.v, rel.kind.v));
                 return false;
             }
-            if (tri->pcRelative || tri->widthBytes == 0) {
+            // `pcRelative` is a Linear-only field (the loader forces every
+            // non-Linear formula row to pcRelative=false), so it alone
+            // cannot exclude the genuinely pc-relative instruction-fixup
+            // kinds (call26 / adr_prel_pg_hi21 / add_abs_lo12_nc). A data
+            // pointer slot takes a plain LINEAR absolute fixup only — a
+            // non-Linear kind here would apply instruction-formula
+            // semantics to data bytes (c147 silent-failure-review fold;
+            // same discriminator as the Mach-O MH_OBJECT data-reloc gate).
+            if (tri->formulaKind != RelocFormulaKind::Linear
+                || tri->pcRelative || tri->widthBytes == 0) {
                 emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
                      std::format("{}: data item SymbolId={{ {} }} relocation '{}' is "
-                                 "pc-relative or zero-width — a data pointer needs an "
+                                 "pc-relative, zero-width, or a non-linear "
+                                 "instruction fixup - a data pointer needs a plain "
                                  "absolute fixup with a concrete write width.",
                                  writerName, di.symbol.v, tri->name));
                 return false;

@@ -10474,7 +10474,7 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
     // user's bare re-declaration of a shipped symbol (`popen` over `#include
     // <stdio.h>`) re-binds the descriptor's import library rather than
     // surviving to the linker as an undefined symbol.
-    std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+    std::unordered_map<std::string, SuppressedShippedSymbol>
         suppressedShippedLibraries;
     {
         // Names any USER declaration (top-level, in any tree's own root scope)
@@ -10588,11 +10588,16 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                     // and first-wins across descriptors (emplace — the same
                     // order injection would have used). Recording objects too
                     // is harmless: the proto-synthesis consumer is fn-only.
+                    // c156 (D-LK-ELF-SYMBOL-VERSIONING): the REQUIRED symbol
+                    // version rides ALONGSIDE the library — a suppressed
+                    // versioned symbol (realpath over `#include <stdlib.h>`)
+                    // whose user prototype loses the version would silently
+                    // misbind the oldest compat instance.
                     if (!s.activeFormat.has_value()
                         || ffi::objectFormatInAvailabilitySet(
                                sym.availableObjectFormats, *s.activeFormat)) {
                         suppressedShippedLibraries.emplace(sym.name,
-                                                           desc->library);
+                            SuppressedShippedSymbol{desc->library, sym.version});
                     }
                     continue;
                 }
@@ -10637,7 +10642,8 @@ static SemanticModel analyzeImpl(std::shared_ptr<CompilationUnit const> cu,
                 shippedExterns.push_back(ShippedExternSymbol{
                     id, sym.name, sym.signature, desc->library,
                     sym.kind == ffi::ShippedSymbolKind::Function,
-                    sym.synthesize});   // D-CSUBSET-C11-THREADS-HEADER (pe shim tag)
+                    sym.synthesize,   // D-CSUBSET-C11-THREADS-HEADER (pe shim tag)
+                    sym.version});    // D-LK-ELF-SYMBOL-VERSIONING (c156)
             }
 
             // Item 1: inject the descriptor's CONSTANTS (the neutral form of a

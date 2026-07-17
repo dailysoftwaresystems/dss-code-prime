@@ -226,20 +226,36 @@ TEST(Linker, RelocatableKeepsReferencedDataExternAsUndefined) {
 
 TEST(Linker, ImageWithNoDataBindingStillRejectsReferencedDataExtern) {
     // The IMAGE side of the c144 gate (positive pin, mirrors c143's image-side
-    // reject test): an IMAGE format that declares no `dataImportBinding` (PE
-    // Exec — its `__imp_` data-thunk model is unbuilt) MUST still reject a
-    // surviving data extern with K_FormatLacksImportSupport. An image is
-    // load-time-bound with no later linker to resolve the object, so an
-    // unbindable data import is a load-time silent-failure. RED if the reject
-    // is deleted outright — RelocatableKeepsReferencedDataExternAsUndefined
+    // reject test): an IMAGE format that declares no `dataImportBinding` MUST
+    // still reject a surviving data extern with K_FormatLacksImportSupport. An
+    // image is load-time-bound with no later linker to resolve the object, so
+    // an unbindable data import is a load-time silent-failure. RED if the
+    // reject is deleted outright — RelocatableKeepsReferencedDataExternAsUndefined
     // alone would not catch that (it only pins the relocatable branch).
+    //
+    // c149 (D-LK-EXTERN-DATA-IMPORT, the PE half): the shipped PE exec format
+    // NOW declares `dataImportBinding: "got-indirect"` (the IAT-slot `__imp_`
+    // model — the last missing image binding), so this pin runs against a
+    // loadFromText PE-exec schema with the declaration REMOVED — the exact
+    // "revert the JSON declaration" red-on-disable shape: the gate keys on the
+    // schema field, never on the format name, so the reverted schema must
+    // reject exactly as the pre-c149 shipped one did.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
-    auto fmt = ObjectFormatSchema::loadShipped("pe64-x86_64-windows-exec");
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "LLP64",
+      "format": {"name":"pe-exec-no-data-binding","kind":"pe"},
+      "externCallDispatch": "direct-plt",
+      "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
+      "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}],
+      "relocations":[{"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4}]
+    })");
     ASSERT_TRUE(fmt.has_value());
-    ASSERT_TRUE((*fmt)->isImageFlavor()) << "pe64-x86_64-windows-exec is an image";
+    ASSERT_TRUE((*fmt)->isImageFlavor()) << "the no-binding schema is an image";
     ASSERT_FALSE((*fmt)->dataImportBinding().has_value())
-        << "PE exec declares no dataImportBinding — the reject condition";
+        << "the schema declares no dataImportBinding -- the reject condition";
     AssembledModule mod;
     mod.expectedFuncCount = 1;
     AssembledFunction fn;
@@ -965,26 +981,32 @@ TEST(Linker, CrossCuRetargetAndStripPatches) {
     EXPECT_EQ(std::count(image.externImportNames.begin(), image.externImportNames.end(),
                          std::string{"crossfn"}), 0)
         << "a cross-CU-resolved extern must be stripped, not emitted as a library import";
-    // Mint + fail-loud: the merge minted a GOT-like THUNK SLOT — an 8-byte rodata data item
-    // carrying the abs64 fixup to the sibling def, so the c-subset indirect call
-    // `call qword ptr [slot]` dereferences the def's runtime address. The thunk slot is an
-    // EXEC-image mechanism (the loader fills it via a base relocation). A relocatable OBJECT
-    // format — this synthetic `test-elf`, which carries rodata through the symbol table and
-    // so cannot declare `supportedDataSections` (legal only on exec flavors) — MUST reject
-    // the slot LOUDLY (K_NoMatchingObjectFormat) rather than silently drop the cross-CU
-    // indirect-call slot. So this diagnostic is POSITIVE evidence the slot was minted: the
-    // capability gate fires only on a rodata `dataItems` entry, which only the thunk-slot
-    // path produces here (the two CUs carry no other data). End-to-end EXEC emission of the
-    // slot (callee body + resolved pointer + base-reloc) is pinned by the runnable
-    // `examples/c-subset/cross_cu_call` (PE exec, exit 42). ELF/Mach-O exec thunk-slot
-    // emission is deferred — format-triggered anchor D-LK11-ELF-MACHO-CROSSCU-THUNK-EMISSION
-    // (needs the rodata + base-relocation walker arms). `calleeBody` stays the CU#2 def body.
-    EXPECT_EQ(countCode(rep, DiagnosticCode::K_NoMatchingObjectFormat), 1u)
-        << "the merge must mint a rodata thunk slot, and a non-exec object format must reject "
-           "it loudly — never silently drop the cross-CU indirect-call slot";
-    EXPECT_TRUE(image.bytes.empty())
-        << "emission must abort when the thunk slot's section cannot be carried — no "
-           "half-emitted image past the capability gate";
+    // Direct bind (c154, D-LK11-ELF-MACHO-CROSSCU-THUNK-EMISSION closure): this
+    // synthetic `test-elf` declares NO `externCallDispatch`, so the merge binds the
+    // reference DIRECTLY to the sibling definition's merged id — no thunk slot is
+    // minted (the slot arm is scoped to `indirect-slot` formats, whose call sites
+    // dereference it; see CrossCuLinkFormats.IndirectSlotDynMintsRelRoThunkSlotWith
+    // RelativeRow). The pre-c154 merge minted the slot unconditionally and
+    // retargeted this DIRECT `call rel32` into the slot's DATA bytes — the linked
+    // exec branched into data (SIGSEGV, witnessed on elf-exec + pe-exec). With no
+    // data item minted, this relocatable format emits the merged object CLEAN: no
+    // capability-gate rejection, both bodies present, the call resolved to the def.
+    EXPECT_EQ(countCode(rep, DiagnosticCode::K_NoMatchingObjectFormat), 0u)
+        << "a direct-bind cross-CU merge mints no data item — nothing for the "
+           "capability gate to reject";
+    EXPECT_FALSE(image.bytes.empty())
+        << "the merged relocatable object must emit — the cross-CU reference is an "
+           "ordinary intra-module reference after the direct bind";
+    auto contains = [](std::vector<std::uint8_t> const& hay,
+                       std::vector<std::uint8_t> const& needle) {
+        if (needle.empty() || hay.size() < needle.size()) return false;
+        for (std::size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+            if (std::equal(needle.begin(), needle.end(), hay.begin() + i)) return true;
+        }
+        return false;
+    };
+    EXPECT_TRUE(contains(image.bytes, calleeBody))
+        << "the sibling definition's body must land in the merged object";
 }
 
 // The strip must NOT over-strip: a real FFI extern (no sibling definition) survives the

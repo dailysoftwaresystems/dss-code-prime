@@ -550,6 +550,9 @@ private:
         field(std::string("vis ") + std::string(ffiVisName(v.visibility)));
         if (!v.importLibrary.empty()) field("lib " + quote(v.importLibrary));
         if (!v.soname.empty()) field("soname " + quote(v.soname));
+        // c156 (D-LK-ELF-SYMBOL-VERSIONING): the required ELF symbol version —
+        // conditional (unversioned externs stay byte-identical), mirroring soname.
+        if (!v.version.empty()) field("version " + quote(v.version));
         s += ')';
         return s;
     }
@@ -1547,6 +1550,7 @@ private:
             else if (acceptKeyword("vis")) { std::string n = takeIdent(); m.visibility = orMalformed(ffiVisFromName(n), n, "ffi visibility", FfiVisibility::Default); }
             else if (acceptKeyword("lib")) m.importLibrary = takeStr();
             else if (acceptKeyword("soname")) m.soname = takeStr();
+            else if (acceptKeyword("version")) m.version = takeStr();  // c156
             else break;
             if (!accept(Tk::Comma)) break;
         }

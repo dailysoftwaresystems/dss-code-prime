@@ -72,6 +72,27 @@ findExecSection(std::vector<std::uint8_t> const& img,
     return {0u, 0u};
 }
 
+// c149 (D-LK-EXTERN-DATA-IMPORT, PE half) sibling: a section's
+// Misc.VirtualSize (section header +8) — the UNPADDED byte extent. The
+// data-extern tests pin `.text`'s VirtualSize to prove the import-thunk
+// block was compacted to the FUNCTION externs (a data extern reserving
+// a dead 6-byte `FF 25` thunk would grow it). Returns 0 if absent (the
+// caller asserts).
+[[nodiscard]] std::uint32_t
+findExecSectionVirtualSize(std::vector<std::uint8_t> const& img,
+                           std::array<char, 8> const&       name) {
+    std::uint16_t const n = readU16LE(img, 0x86);
+    for (std::uint16_t i = 0; i < n; ++i) {
+        std::size_t const h = 0x188u + static_cast<std::size_t>(i) * 40u;
+        bool eq = true;
+        for (std::size_t b = 0; b < 8; ++b) {
+            if (static_cast<char>(img[h + b]) != name[b]) { eq = false; break; }
+        }
+        if (eq) return readU32LE(img, h + 8);
+    }
+    return 0u;
+}
+
 struct Loaded {
     std::shared_ptr<TargetSchema>       target;
     std::shared_ptr<ObjectFormatSchema> format;
@@ -497,6 +518,608 @@ TEST(LinkerEndToEnd, PeDispatchProducesNonEmptyBytes) {
     EXPECT_EQ(image.bytes[1], 0x86u);
 }
 
+// ── D-LK-OBJECT-DATA-SECTION-RELOCATABLE (PE/COFF Obj arm, c148) ──
+//
+// The .obj writer emits DATA sections — the PE analog of the ELF c142
+// ET_REL arm + the Mach-O c147 mirror (and the c145/c147 data-item
+// relocation emission). Layout constants for a TWO-section .obj (used
+// by the pins below): IMAGE_FILE_HEADER 20 | section header[0] (.text)
+// @20 | section header[1] @60 (Name@60, VirtualSize@68, VA@72,
+// SizeOfRawData@76, PointerToRawData@80, PointerToRelocations@84,
+// NumberOfRelocations@92 u16, Characteristics@96) | raw data @100.
+
+namespace {
+// Compare an 8-byte COFF header/symbol Name field with a short name
+// (inline names are NUL-padded; buf[8] stays NUL so the string_view
+// ctor stops at the pad for names under 8 chars and at index 8 for
+// full-width names).
+[[nodiscard]] bool coffNameEquals(std::vector<std::uint8_t> const& bytes,
+                                   std::size_t off, std::string_view expect) {
+    char buf[9] = {};
+    for (std::size_t i = 0; i < 8; ++i)
+        buf[i] = static_cast<char>(bytes[off + i]);
+    return std::string_view{buf} == expect;
+}
+} // namespace
+
+// (1) A function + one rodata item: NumberOfSections grows to 2, the
+// `.rdata` header carries the schema Characteristics OR'd with the
+// walker-derived IMAGE_SCN_ALIGN class, and the data symbol is
+// EXTERNAL with SectionNumber = the 1-based ordinal and Value = the
+// SECTION-RELATIVE offset (the COFF convention — NOT Mach-O's flat
+// address). RED-on-disable: revert the data-section emission →
+// NumberOfSections stays 1 and NumberOfSymbols stays 1.
+TEST(PeWriter, ObjRodataItemEmitsRdataSectionAndDataSymbol) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};                      // ret (1 byte)
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{1}, "greet",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    AssembledData d;
+    d.symbol    = SymbolId{42};
+    d.section   = DataSectionKind::Rodata;
+    d.bytes     = {'h', 'i', 0};
+    d.alignment = Alignment::of<1>();
+    mod.dataItems.push_back(std::move(d));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{42}, "msg",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    EXPECT_EQ(readU16LE(bytes, 2), 2u);      // NumberOfSections
+    // Section header[1] = `.rdata` (rodata).
+    EXPECT_TRUE(coffNameEquals(bytes, 60, ".rdata"));
+    EXPECT_EQ(readU32LE(bytes, 68), 0u);     // VirtualSize (obj)
+    EXPECT_EQ(readU32LE(bytes, 72), 0u);     // VirtualAddress (obj)
+    EXPECT_EQ(readU32LE(bytes, 76), 3u);     // SizeOfRawData = "hi\0"
+    EXPECT_EQ(readU32LE(bytes, 80), 101u);   // PointerToRawData = 100 + text 1
+    EXPECT_EQ(readU32LE(bytes, 84), 0u);     // PointerToRelocations (none)
+    EXPECT_EQ(readU16LE(bytes, 92), 0u);     // NumberOfRelocations
+    // Characteristics = CNT_INITIALIZED_DATA|MEM_READ (0x40000040, the
+    // schema row) | IMAGE_SCN_ALIGN_1BYTES (0x00100000, H1-derived).
+    EXPECT_EQ(readU32LE(bytes, 96), 0x40100040u);
+    // The item's bytes land at the raw pointer.
+    ASSERT_GE(bytes.size(), 104u);
+    EXPECT_EQ(bytes[101], 'h');
+    EXPECT_EQ(bytes[102], 'i');
+    EXPECT_EQ(bytes[103], 0u);
+
+    // Symbols: fn(0) + data(1). PointerToSymbolTable = 100 + 1 + 3.
+    std::uint32_t const symPtr = readU32LE(bytes, 8);
+    EXPECT_EQ(symPtr, 104u);
+    ASSERT_EQ(readU32LE(bytes, 12), 2u);     // NumberOfSymbols
+    std::size_t const s1 = symPtr + 18u;
+    EXPECT_TRUE(coffNameEquals(bytes, s1, "msg"))
+        << "externally-visible data global must carry its real name";
+    EXPECT_EQ(readU32LE(bytes, s1 + 8), 0u)
+        << "COFF Value = SECTION-RELATIVE offset";
+    EXPECT_EQ(readI16LE(bytes, s1 + 12), 2)
+        << "SectionNumber = the .rdata 1-based ordinal";
+    EXPECT_EQ(readU16LE(bytes, s1 + 14), 0u)  // notype (data)
+        << "COFF data symbols are notype - DTYPE_FUNCTION is fn-only";
+    EXPECT_EQ(bytes[s1 + 16], 2u);            // IMAGE_SYM_CLASS_EXTERNAL
+    EXPECT_EQ(bytes[s1 + 17], 0u);            // no aux records
+}
+
+// (2) A RelRoConst item carrying an abs64 reloc to a DEFINED function
+// (a const fn-ptr table slot): relro is its OWN section header NAMED
+// `.rdata` (COFF has no relro segment; MSVC places reloc-bearing const
+// in `.rdata` — link.exe merges the same-name contributions) with its
+// OWN IMAGE_RELOCATION table: VirtualAddress = the slot's
+// section-relative offset, SymbolTableIndex = the function's index,
+// Type = IMAGE_REL_AMD64_ADDR64 (the format JSON's abs64 nativeId).
+// The relocation's addend is written INTO the 8-byte slot (the COFF
+// in-place-addend convention — IMAGE_RELOCATION has no addend column;
+// link.exe computes S + slot). RED-on-disable: drop the data-reloc
+// emission → NumberOfRelocations reads 0; drop the in-slot addend →
+// the slot reads 0.
+TEST(PeWriter, ObjRelRoFnPtrSlotEmitsAddr64RelocAndInSlotAddend) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction f1;
+    f1.symbol = SymbolId{1};
+    f1.bytes  = {0xC3};
+    mod.functions.push_back(std::move(f1));
+    AssembledData tab;
+    tab.symbol    = SymbolId{7};
+    tab.section   = DataSectionKind::RelRoConst;
+    tab.bytes.assign(8, 0);                  // one pointer slot
+    tab.alignment = Alignment::of<8>();
+    tab.relocations.push_back(Relocation{/*offset=*/0u,
+                                         /*target=*/SymbolId{1},
+                                         /*kind=*/RelocationKind{2},  // abs64
+                                         /*addend=*/8});
+    mod.dataItems.push_back(std::move(tab));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    EXPECT_EQ(readU16LE(bytes, 2), 2u);      // .text + relro
+    EXPECT_TRUE(coffNameEquals(bytes, 60, ".rdata"))
+        << "relro rides the .rdata NAME as its own section header";
+    EXPECT_EQ(readU32LE(bytes, 76), 8u);     // SizeOfRawData
+    EXPECT_EQ(readU32LE(bytes, 80), 101u);   // PointerToRawData
+    // Characteristics = 0x40000040 | ALIGN_8BYTES (0x00400000) — the
+    // exact class cl.exe stamps for an 8-aligned .rdata contribution.
+    EXPECT_EQ(readU32LE(bytes, 96), 0x40400040u);
+    // Reloc table follows ALL raw data: 100 + 1 + 8.
+    std::uint32_t const relocPtr = readU32LE(bytes, 84);
+    ASSERT_EQ(readU16LE(bytes, 92), 1u)
+        << "the relro section must carry its own IMAGE_RELOCATION table "
+           "(the .rela.data.rel.ro analog)";
+    EXPECT_EQ(relocPtr, 109u);
+    ASSERT_LE(relocPtr + 10u, bytes.size());
+    EXPECT_EQ(readU32LE(bytes, relocPtr + 0), 0u)
+        << "VirtualAddress = the slot's offset WITHIN its section";
+    EXPECT_EQ(readU32LE(bytes, relocPtr + 4), 0u)
+        << "SymbolTableIndex = the DEFINED function's symtab entry";
+    EXPECT_EQ(readU16LE(bytes, relocPtr + 8), 1u)
+        << "Type = IMAGE_REL_AMD64_ADDR64 (nativeId from the format "
+           "JSON, never hardcoded in the walker)";
+    // In-place addend: the 8-byte slot at file offset 101 carries 8.
+    EXPECT_EQ(readU64LE(bytes, 101), 8u)
+        << "IMAGE_RELOCATION has no addend column - rel.addend must be "
+           "written into the slot bytes (link.exe computes S + slot)";
+    // The table's own symbol: Value = 0 (section-relative), sect 2.
+    std::uint32_t const symPtr = readU32LE(bytes, 8);
+    ASSERT_EQ(readU32LE(bytes, 12), 2u);     // fn + table
+    EXPECT_EQ(readI16LE(bytes, symPtr + 18 + 12), 2);
+    EXPECT_EQ(readU32LE(bytes, symPtr + 18 + 8), 0u);
+}
+
+// A jump-table data slot targeting a SYNTHETIC PER-BLOCK symbol (the
+// dense-switch / computed-goto shape) must resolve to a DEFINED LOCAL
+// IMAGE_SYMBOL — IMAGE_SYM_CLASS_STATIC, SectionNumber=1 (.text),
+// Value = funcTextStart + blockByteOffset — never the undefined-extern
+// fallback (which would fabricate an undefined `sym_<id>` nothing can
+// ever define: link.exe LNK2001, or — worse — a silent wrong-control-
+// flow bind against a sibling object's unrelated `sym_<id>` export).
+// The ELF STB_LOCAL / Mach-O no-N_EXT block-symbol legs are the
+// mirrors (c147 CRITICAL fold, baked into the PE arm from the start).
+// RED-ON-DISABLE: drop the block-symbol registration → symbol[1] flips
+// to the data symbol and the block lands UNDEF at the tail → the
+// StorageClass/SectionNumber/Value assertions fail.
+TEST(PeWriter, ObjJumpTableBlockSymbolIsStaticLocalDefinedNotUndefExtern) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{10};
+    fn.bytes  = {0xC3, 0x90, 0x90, 0x90,     // block 0
+                 0xC3, 0x90, 0x90, 0x90};    // block 1 at offset 4
+    fn.blockSymbols.push_back({SymbolId{77}, /*blockByteOffset=*/4u});
+    mod.functions.push_back(std::move(fn));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "dispatch",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    AssembledData tab;                        // one jump-table slot
+    tab.symbol    = SymbolId{7};
+    tab.section   = DataSectionKind::Data;
+    tab.bytes.assign(8, 0);
+    tab.alignment = Alignment::of<8>();
+    tab.relocations.push_back(Relocation{/*offset=*/0u,
+                                         /*target=*/SymbolId{77},  // BLOCK
+                                         /*kind=*/RelocationKind{2},
+                                         /*addend=*/0});
+    mod.dataItems.push_back(std::move(tab));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "a jump-table slot targeting a block symbol must encode";
+
+    // Symbol order: func(0) → BLOCK local(1) → data(2). No undefined
+    // extern fabricated for the block.
+    std::uint32_t const symPtr = readU32LE(bytes, 8);
+    ASSERT_EQ(readU32LE(bytes, 12), 3u)
+        << "func + block local + data symbol - and NO fabricated "
+           "undefined extern for the block";
+    std::size_t const s1 = symPtr + 18u;      // the block symbol
+    EXPECT_TRUE(coffNameEquals(bytes, s1, "sym_77"));
+    EXPECT_EQ(bytes[s1 + 16], 3u)
+        << "block symbol must be IMAGE_SYM_CLASS_STATIC (3, LOCAL) - "
+           "EXTERNAL would let a sibling object's unrelated sym_<id> "
+           "bind to an interior block address (silent wrong control "
+           "flow); UNDEF SectionNumber is the fabricated-extern break "
+           "this pin guards";
+    EXPECT_EQ(readI16LE(bytes, s1 + 12), 1)   // SectionNumber = .text
+        << "block symbol lives in .text";
+    EXPECT_EQ(readU32LE(bytes, s1 + 8), 4u)   // Value = text offset
+        << "Value = funcTextStart + blockByteOffset (section-relative)";
+
+    // The .data section's reloc resolves SymbolTableIndex to the block
+    // local (index 1), and its Type is the JSON abs64 nativeId.
+    std::uint32_t const relocPtr = readU32LE(bytes, 84);
+    ASSERT_EQ(readU16LE(bytes, 92), 1u);
+    EXPECT_EQ(readU32LE(bytes, relocPtr + 4), 1u)
+        << "the jump-table slot targets the DEFINED block local, not a "
+           "fabricated undefined extern";
+    EXPECT_EQ(readU16LE(bytes, relocPtr + 8), 1u);   // ADDR64
+}
+
+// (3) A bss item: SizeOfRawData carries the ZERO-FILL span with
+// PointerToRawData = 0 and VirtualSize = 0 — the COFF .obj convention
+// cl.exe itself emits (dumpbin: `.bss` SizeOfRawData=0x190, no raw
+// pointer) and link.exe accepts. NO file bytes — the symtab follows
+// the text bytes directly. RED-on-disable: emitting bss file-backed
+// shifts the symtab pointer; dropping it flips NumberOfSections.
+TEST(PeWriter, ObjBssItemCarriesSizeOfRawDataWithNoFilePointer) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    AssembledData g;
+    g.symbol       = SymbolId{9};
+    g.section      = DataSectionKind::Bss;
+    g.reservedSize = 4;                      // int g; — no file bytes
+    g.alignment    = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(g));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(bytes.empty());
+
+    EXPECT_EQ(readU16LE(bytes, 2), 2u);
+    EXPECT_TRUE(coffNameEquals(bytes, 60, ".bss"));
+    EXPECT_EQ(readU32LE(bytes, 68), 0u);     // VirtualSize = 0
+    EXPECT_EQ(readU32LE(bytes, 76), 4u)      // SizeOfRawData = span
+        << "COFF .obj bss carries its span in SizeOfRawData";
+    EXPECT_EQ(readU32LE(bytes, 80), 0u)      // PointerToRawData = 0
+        << "bss stores NO file bytes";
+    // 0xC0000080 (schema) | ALIGN_4BYTES (0x00300000) = 0xC0300080 —
+    // byte-identical to cl.exe's witnessed .bss Characteristics class.
+    EXPECT_EQ(readU32LE(bytes, 96), 0xC0300080u);
+    // Symtab directly after the text byte (100 + 1) — bss stored none.
+    EXPECT_EQ(readU32LE(bytes, 8), 101u);
+    // The bss symbol: SectionNumber=2, Value=0 (section-relative).
+    std::uint32_t const symPtr = readU32LE(bytes, 8);
+    EXPECT_EQ(readI16LE(bytes, symPtr + 18 + 12), 2);
+    EXPECT_EQ(readU32LE(bytes, symPtr + 18 + 8), 0u);
+}
+
+// (4) A DATA-FREE module keeps the exact single-section layout (the
+// pre-c148 shape) BYTE-IDENTICALLY: every header field and trailing
+// structure offset unchanged — the data-section machinery must be a
+// total no-op when no data items exist.
+TEST(PeWriter, ObjDataFreeModuleKeepsSingleSectionLayoutByteIdentical) {
+    auto loaded = loadShipped();
+    AssembledModule mod = makeTrivialModule({0xC3}, 42);
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+    // 20 header + 40 section header + 1 text + 18 symbol + 4 strtab.
+    ASSERT_EQ(bytes.size(), 83u);
+    EXPECT_EQ(readU16LE(bytes, 2), 1u);      // NumberOfSections
+    EXPECT_EQ(readU32LE(bytes, 8), 61u);     // PointerToSymbolTable
+    EXPECT_EQ(readU32LE(bytes, 12), 1u);     // NumberOfSymbols
+    EXPECT_TRUE(coffNameEquals(bytes, 20, ".text"));
+    EXPECT_EQ(readU32LE(bytes, 36), 1u);     // SizeOfRawData
+    EXPECT_EQ(readU32LE(bytes, 40), 60u);    // PointerToRawData
+    EXPECT_EQ(readU32LE(bytes, 44), 0u);     // PointerToRelocations
+    EXPECT_EQ(readU32LE(bytes, 56), 0x60500020u);   // Characteristics
+    EXPECT_EQ(bytes[60], 0xC3u);             // the text byte
+    EXPECT_EQ(readU32LE(bytes, 79), 4u);     // strtab = size prefix only
+}
+
+// (5) The shipped .obj format declares the four data-section rows +
+// supportedDataSections (the linker's acceptsDataSection gate) — and
+// does NOT declare TLS (tdata/tbss stay gate-rejected). Also pins the
+// c148 externCallDispatch declaration (the extern-call route into the
+// .obj). RED-on-disable: remove a JSON row/field → the corresponding
+// assertion fails.
+TEST(PeFormatJson, ObjDeclaresDataSectionRowsAndExternDispatch) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.format);
+    auto const& fmt = *loaded.format;
+    EXPECT_TRUE(fmt.acceptsDataSection(DataSectionKind::Rodata));
+    EXPECT_TRUE(fmt.acceptsDataSection(DataSectionKind::Data));
+    EXPECT_TRUE(fmt.acceptsDataSection(DataSectionKind::Bss));
+    EXPECT_TRUE(fmt.acceptsDataSection(DataSectionKind::RelRoConst));
+    EXPECT_FALSE(fmt.acceptsDataSection(DataSectionKind::Tdata))
+        << "TLS stays undeclared on the .obj schema (fail-loud gate)";
+    EXPECT_FALSE(fmt.acceptsDataSection(DataSectionKind::Tbss));
+
+    ASSERT_TRUE(fmt.externCallDispatch().has_value())
+        << "pe64-x86_64-windows (.obj) must declare externCallDispatch "
+           "so extern calls lower (D-LK-OBJECT-EXTERN-CALL-RELOCATABLE)";
+    EXPECT_EQ(*fmt.externCallDispatch(), ExternCallDispatch::DirectPlt);
+
+    auto const* rodata = fmt.sectionByKind(SectionKind::Rodata);
+    ASSERT_NE(rodata, nullptr);
+    EXPECT_EQ(rodata->name, ".rdata");
+    EXPECT_EQ(rodata->type, 0x40000040u);
+    auto const* data = fmt.sectionByKind(SectionKind::Data);
+    ASSERT_NE(data, nullptr);
+    EXPECT_EQ(data->name, ".data");
+    EXPECT_EQ(data->type, 0xC0000040u);
+    auto const* relro = fmt.sectionByKind(SectionKind::RelRoConst);
+    ASSERT_NE(relro, nullptr);
+    EXPECT_EQ(relro->name, ".rdata")
+        << "relro rides the .rdata NAME (COFF has no relro segment; "
+           "link.exe merges same-name contributions)";
+    EXPECT_EQ(relro->type, 0x40000040u);
+    auto const* bss = fmt.sectionByKind(SectionKind::Bss);
+    ASSERT_NE(bss, nullptr);
+    EXPECT_EQ(bss->name, ".bss");
+    EXPECT_EQ(bss->type, 0xC0000080u);
+    // The rows deliberately carry NO IMAGE_SCN_ALIGN bits — the walker
+    // derives the class from the H1 layout alignment (a preexisting
+    // align class would corrupt the OR; the walker fail-louds on it).
+    for (auto const* row : {rodata, data, relro, bss}) {
+        EXPECT_EQ(row->type & 0x00F00000u, 0u) << row->name;
+    }
+}
+
+// (6) A reloc-bearing RODATA item stays fail-loud (allow=false — the
+// RodataDataItemWithRelocationFailsLoud discipline shared with
+// ELF/Mach-O): a relocated slot cannot live in never-written rodata.
+TEST(PeWriter, ObjRodataItemWithRelocationFailsLoud) {
+    auto loaded = loadShipped();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    AssembledData d;
+    d.symbol    = SymbolId{3};
+    d.section   = DataSectionKind::Rodata;
+    d.bytes.assign(8, 0);
+    d.alignment = Alignment::of<8>();
+    d.relocations.push_back(Relocation{0u, SymbolId{1}, RelocationKind{2}, 0});
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    EXPECT_GT(rep.errorCount(), 0u);
+}
+
+// (7) Thread-local items fail LOUD on the direct walker call (the
+// linker's acceptsDataSection gate fires first in the shipped
+// pipeline; this is the anti-silent-drop belt behind it, mirroring
+// the ELF / Mach-O object-arm rejects).
+TEST(PeWriter, ObjThreadLocalItemFailsLoud) {
+    auto loaded = loadShipped();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    AssembledData t;
+    t.symbol    = SymbolId{4};
+    t.section   = DataSectionKind::Tdata;
+    t.bytes     = {7, 0, 0, 0};
+    t.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(t));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool saw = false;
+    for (auto const& d : rep.all()) {
+        if (d.code == DiagnosticCode::K_FormatLacksThreadLocalSupport)
+            saw = true;
+    }
+    EXPECT_TRUE(saw)
+        << "a Tdata item must be rejected loud, never silently dropped";
+}
+
+// (8) D-LK-OBJECT-EXTERN-CALL-RELOCATABLE (PE arm, c148): an extern
+// call's undefined symbol carries its REAL import name — PE x64 C
+// mangling is IDENTITY, so `puts` lands verbatim (no leading
+// underscore, unlike Mach-O) — never the internal `sym_<id>` fallback
+// the pre-c148 writer emitted (the exact break that made a foreign
+// `link.exe main.obj dss.obj` fail with an unresolvable `sym_20`).
+TEST(PeWriter, ObjExternCallEmitsUndefinedRealNameNotSymId) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction caller;
+    caller.symbol = SymbolId{10};
+    caller.bytes  = {0xE8, 0x00, 0x00, 0x00, 0x00};   // call rel32
+    caller.relocations.push_back(Relocation{/*offset=*/1u,
+                                            /*target=*/SymbolId{20},
+                                            /*kind=*/RelocationKind{1},
+                                            /*addend=*/0});
+    mod.functions.push_back(std::move(caller));
+    mod.symbols.push_back(ModuleSymbol{SymbolId{10}, "greet",
+                                       SymbolBinding::Global,
+                                       SymbolVisibility::Default});
+    ExternImport ext;
+    ext.symbol      = SymbolId{20};
+    ext.mangledName = "puts";        // pipeline-mangled (identity on PE)
+    ext.isData      = false;
+    mod.externImports.push_back(std::move(ext));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "a .obj with an extern-call import must encode";
+
+    std::uint32_t const symPtr = readU32LE(bytes, 8);
+    ASSERT_EQ(readU32LE(bytes, 12), 2u);     // caller + undefined extern
+    std::size_t const s1 = symPtr + 18u;
+    EXPECT_TRUE(coffNameEquals(bytes, s1, "puts"))
+        << "undefined extern must carry its REAL import name (identity "
+           "mangling on PE - no leading underscore), never sym_<id>";
+    EXPECT_EQ(readU32LE(bytes, s1 + 8), 0u);         // Value = 0
+    EXPECT_EQ(readI16LE(bytes, s1 + 12), 0);         // SectionNumber=UNDEF
+    EXPECT_EQ(bytes[s1 + 16], 2u);                   // EXTERNAL
+    // The rel32 reloc targets that symtab entry.
+    std::uint32_t const relocPtr = readU32LE(bytes, 44);
+    ASSERT_EQ(readU16LE(bytes, 52), 1u);
+    EXPECT_EQ(readU32LE(bytes, relocPtr + 4), 1u);
+    EXPECT_EQ(readU16LE(bytes, relocPtr + 8), 4u);   // REL32
+}
+
+// (9) The c145/c147 extern-coverage mirror: a target referenced ONLY
+// by a DATA-item relocation (a const table of libc fn pointers) still
+// gets its undefined IMAGE_SYMBOL under the REAL import name, and the
+// data reloc's SymbolTableIndex points at it. RED-on-disable: scan
+// only function relocs → the extern entry is never emitted
+// (K_SymbolUndefined aborts the encode).
+TEST(PeWriter, ObjDataRelocOnlyExternGetsUndefinedSymbol) {
+    auto loaded = loadShipped();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};                      // NO function relocations
+    mod.functions.push_back(std::move(fn));
+    AssembledData tab;
+    tab.symbol    = SymbolId{7};
+    tab.section   = DataSectionKind::RelRoConst;
+    tab.bytes.assign(8, 0);
+    tab.alignment = Alignment::of<8>();
+    tab.relocations.push_back(Relocation{0u, SymbolId{20},
+                                         RelocationKind{2}, 0});
+    mod.dataItems.push_back(std::move(tab));
+    ExternImport ext;
+    ext.symbol      = SymbolId{20};
+    ext.mangledName = "puts";
+    ext.isData      = false;
+    mod.externImports.push_back(std::move(ext));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "a data-reloc-only extern must be covered by the undefined-"
+           "extern scan (the ELF c145 / Mach-O c147 mirror)";
+    std::uint32_t const symPtr = readU32LE(bytes, 8);
+    ASSERT_EQ(readU32LE(bytes, 12), 3u) << "fn + table + undefined puts";
+    std::size_t const s2 = symPtr + 2u * 18u;
+    EXPECT_TRUE(coffNameEquals(bytes, s2, "puts"));
+    EXPECT_EQ(readI16LE(bytes, s2 + 12), 0);         // UNDEF
+    // The relro reloc targets the extern's index (2).
+    std::uint32_t const relocPtr = readU32LE(bytes, 84);
+    ASSERT_EQ(readU16LE(bytes, 92), 1u);
+    EXPECT_EQ(readU32LE(bytes, relocPtr + 4), 2u);
+}
+
+// (10) A data SymbolId colliding with a function SymbolId is a
+// producer-contract breach — fail loud (the K_DuplicateDataSymbol
+// mirror of the ELF/Mach-O discipline).
+TEST(PeWriter, ObjDuplicateDataSymbolFailsLoud) {
+    auto loaded = loadShipped();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    AssembledData d;
+    d.symbol    = SymbolId{1};               // collides with the function
+    d.section   = DataSectionKind::Rodata;
+    d.bytes     = {1, 2, 3, 4};
+    d.alignment = Alignment::of<4>();
+    mod.dataItems.push_back(std::move(d));
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    EXPECT_TRUE(bytes.empty());
+    bool saw = false;
+    for (auto const& diag : rep.all()) {
+        if (diag.code == DiagnosticCode::K_DuplicateDataSymbol) saw = true;
+    }
+    EXPECT_TRUE(saw);
+}
+
+// (11) All four data sections at once: the full section-header order
+// (.text → .rdata → .data → .rdata(relro) → .bss LAST), cumulative
+// raw-data pointers, and 1-based SectionNumber ordinals across every
+// symbol. Pins the multi-section cursor arithmetic a single-section
+// module cannot exercise — and that COFF accepts TWO same-name
+// `.rdata` headers as distinct sections.
+TEST(PeWriter, ObjAllFourDataSectionsOrderAndOrdinals) {
+    auto loaded = loadShipped();
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xC3};
+    mod.functions.push_back(std::move(fn));
+    auto addItem = [&](std::uint32_t sym, DataSectionKind k,
+                       std::vector<std::uint8_t> b, std::uint64_t reserved) {
+        AssembledData d;
+        d.symbol       = SymbolId{sym};
+        d.section      = k;
+        d.bytes        = std::move(b);
+        d.reservedSize = reserved;
+        d.alignment    = Alignment::of<8>();
+        mod.dataItems.push_back(std::move(d));
+    };
+    addItem(10, DataSectionKind::Rodata, {1, 2, 3, 4, 5, 6, 7, 8}, 0);
+    addItem(11, DataSectionKind::Data, {9, 9, 9, 9, 9, 9, 9, 9}, 0);
+    addItem(12, DataSectionKind::RelRoConst, {0, 0, 0, 0, 0, 0, 0, 0}, 0);
+    addItem(13, DataSectionKind::Bss, {}, 8);
+
+    DiagnosticReporter rep;
+    auto bytes = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    ASSERT_EQ(rep.errorCount(), 0u);
+
+    // 5 sections; raw base = 20 + 5*40 = 220.
+    ASSERT_EQ(readU16LE(bytes, 2), 5u);
+    struct Expect {
+        char const*   name;
+        std::uint32_t sizeOfRawData;
+        std::uint32_t pointerToRawData;
+        std::uint32_t characteristics;
+    };
+    Expect const rows[] = {
+        {".rdata", 8, 221, 0x40400040u},     // rodata (align 8)
+        {".data",  8, 229, 0xC0400040u},
+        {".rdata", 8, 237, 0x40400040u},     // relro — 2nd .rdata header
+        {".bss",   8, 0,   0xC0400080u},     // no raw pointer
+    };
+    for (std::size_t i = 0; i < 4; ++i) {
+        std::size_t const h = 20 + (i + 1) * 40;
+        EXPECT_TRUE(coffNameEquals(bytes, h, rows[i].name)) << i;
+        EXPECT_EQ(readU32LE(bytes, h + 16), rows[i].sizeOfRawData) << i;
+        EXPECT_EQ(readU32LE(bytes, h + 20), rows[i].pointerToRawData) << i;
+        EXPECT_EQ(readU32LE(bytes, h + 36), rows[i].characteristics) << i;
+    }
+    // Symtab after text(1) + rodata(8) + data(8) + relro(8) = 245; bss
+    // stored nothing. Symbols: fn=SECT1, then ordinals 2/3/4/5, each
+    // Value = 0 (every item is first in its section).
+    std::uint32_t const symPtr = readU32LE(bytes, 8);
+    EXPECT_EQ(symPtr, 245u);
+    ASSERT_EQ(readU32LE(bytes, 12), 5u);
+    std::int16_t const expectSect[] = {1, 2, 3, 4, 5};
+    for (std::size_t s = 0; s < 5; ++s) {
+        EXPECT_EQ(readI16LE(bytes, symPtr + s * 18 + 12), expectSect[s])
+            << s;
+        EXPECT_EQ(readU32LE(bytes, symPtr + s * 18 + 8), 0u) << s;
+    }
+}
+
 // ── LK2 cycle 2: PE32+ executable image (.exe) writer ──────────
 
 namespace {
@@ -548,6 +1171,29 @@ TEST(PeExecFormatJson, ShippedPeExecIsDirectPlt) {
     ASSERT_TRUE(loaded.format->externCallDispatch().has_value());
     EXPECT_TRUE(*loaded.format->externCallDispatch()
                 == ExternCallDispatch::DirectPlt);
+}
+
+TEST(PeExecFormatJson, ShippedPeExecDeclaresGotIndirectDataImportBinding) {
+    // c149 (D-LK-EXTERN-DATA-IMPORT, the PE half — the LAST missing
+    // image binding model): the shipped pe64 exec format declares
+    // `dataImportBinding: "got-indirect"` — PE `__imp_<name>` semantics:
+    // the loader fills a data import's IAT slot with the imported
+    // OBJECT's address, so the slot IS a pointer (the Mach-O __got
+    // non-lazy-pointer model, same enum value). The linker's pre-walker
+    // gate keys on this field; MIR->LIR selects the lea-of-slot + deref
+    // GlobalAddr lowering from it. RED-on-disable: revert the JSON
+    // declaration -> this pin fails AND every data-import link rejects
+    // K_FormatLacksImportSupport again (the pre-c149 wall). Mirrors the
+    // macho64-arm64-darwin-exec c117 declaration pin.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.format->dataImportBinding().has_value())
+        << "pe64-x86_64-windows-exec must declare dataImportBinding "
+           "(D-LK-EXTERN-DATA-IMPORT, c149)";
+    EXPECT_TRUE(*loaded.format->dataImportBinding()
+                == DataImportBinding::GotIndirect)
+        << "PE data imports bind IAT-slot-indirect (__imp_ semantics) -- "
+           "the got-indirect model, not copy-relocation";
 }
 
 TEST(PeExecWriter, AddressTakenImportResolvesToTextThunkNotIdataSlot) {
@@ -627,6 +1273,304 @@ TEST(PeExecWriter, AddressTakenImportResolvesToTextThunkNotIdataSlot) {
         << std::hex << thunkRva << "), not the .idata IAT slot";
     EXPECT_LT(callTargetRva, static_cast<std::int64_t>(idataRva))
         << "extern call target must be in .text (< .idata RVA)";
+}
+
+TEST(PeExecWriter, DataExternBindsToIatSlotInIdataNotTextThunk) {
+    // c149 (D-LK-EXTERN-DATA-IMPORT, the PE half) — the data twin of
+    // AddressTakenImportResolvesToTextThunkNotIdataSlot. A DATA extern
+    // (isData — an msvcrt `_fmode`-class data export) binds to its
+    // `.idata` IAT SLOT VA (`__imp_` semantics: the loader fills the
+    // slot with the imported OBJECT's address — the Mach-O __got
+    // non-lazy-pointer model, got-indirect) and gets NO `FF 25` text
+    // thunk (a data object is not callable; a thunk-VA binding would
+    // read jump-stub bytes as the object's value).
+    //
+    // RED-on-disable both ways: (1) revert the JSON declaration -> the
+    // walker's binding assertion (and the linker's pre-walker gate)
+    // reject with K_FormatLacksImportSupport — no clean encode; (2)
+    // bind the data extern to a thunk VA (the function path) -> the
+    // resolved reference lands in .text, failing BOTH the exact-slot
+    // equality and the .idata range assertion, and .text VirtualSize
+    // grows by the dead 6-byte thunk.
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    // main: `48 8B 05 <disp32>` (mov rax, [rip+disp32]) + `C3` = read
+    // the imported object, then ret — 8 bytes. The disp32 patch site is
+    // at function offset 3 (REL32, resolved against the end of the
+    // 7-byte mov); the reloc targets the DATA extern.
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x48, 0x8B, 0x05, 0, 0, 0, 0, 0xC3};
+    fn.relocations.push_back(
+        Relocation{/*offset=*/3, SymbolId{99}, RelocationKind{1},
+                   /*addend=*/0});
+    mod.functions.push_back(std::move(fn));
+    ExternImport dataExt{SymbolId{99}, "_fmode", "msvcrt.dll"};
+    dataExt.isData = true;
+    mod.externImports.push_back(std::move(dataExt));
+
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u)
+        << "the data-import gate must admit the declared got-indirect "
+           "binding (c149) -- no more K_FormatLacksImportSupport wall";
+    ASSERT_FALSE(img.empty());
+
+    auto const [textRva, textPtr] =
+        findExecSection(img, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+    auto const [idataRva, idataPtr] =
+        findExecSection(img, {'.', 'i', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(textRva, 0u);
+    ASSERT_NE(idataRva, 0u);
+    (void)idataPtr;
+
+    // (1) NO thunk was emitted for the data extern: `.text` holds
+    //     exactly the 8 function bytes — the thunk block is COMPACTED
+    //     to the function externs (here: none). A dead data thunk
+    //     would grow VirtualSize to 14.
+    EXPECT_EQ(findExecSectionVirtualSize(
+                  img, {'.', 't', 'e', 'x', 't', 0, 0, 0}),
+              8u)
+        << "a DATA extern must NOT reserve/emit an FF 25 import thunk "
+           "-- thunk bytes are per-FUNCTION-extern only";
+
+    // (2) `.idata` layout for 1 library x 1 extern: descriptors
+    //     (1+1)*20 = 40 (8-aligned) -> ILT @40 (extern + terminator =
+    //     16 B) -> IAT @56. The IAT data directory must point at it.
+    std::uint32_t const iatDirRva  = readU32LE(img, 0x108 + 12 * 8);
+    std::uint32_t const iatDirSize = readU32LE(img, 0x108 + 12 * 8 + 4);
+    EXPECT_EQ(iatDirRva, idataRva + 56u);
+    EXPECT_EQ(iatDirSize, 16u);  // 1 slot + u64 terminator
+
+    // (3) THE BINDING: the mov's disp32 resolves the data extern to
+    //     its IAT SLOT VA — inside .idata, at exactly the slot the
+    //     import machinery lays out — NOT a .text thunk.
+    auto const movDisp =
+        static_cast<std::int32_t>(readU32LE(img, textPtr + 3u));
+    std::int64_t const targetRva =
+        static_cast<std::int64_t>(textRva) + 7 + movDisp;
+    std::uint32_t const idataVSize = findExecSectionVirtualSize(
+        img, {'.', 'i', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(idataVSize, 0u);
+    EXPECT_GE(targetRva, static_cast<std::int64_t>(idataRva))
+        << "data-extern reference must resolve into .idata (the IAT "
+           "slot), not .text";
+    EXPECT_LT(targetRva,
+              static_cast<std::int64_t>(idataRva) + idataVSize)
+        << "data-extern reference must land inside .idata's extent";
+    EXPECT_EQ(targetRva, static_cast<std::int64_t>(idataRva) + 56)
+        << "data-extern symbolVa must be the IAT SLOT VA (idata+56 for "
+           "1 lib x 1 extern), the loader-filled __imp_ pointer";
+
+    // (4) The import machinery resolves a data import's NAME exactly
+    //     like a function's: HINT/NAME carries `_fmode`, the
+    //     descriptor names msvcrt.dll.
+    std::uint32_t const idataFileOff = readU32LE(
+        img, 0x188 + 40 + 20);  // section[1] (.idata) PointerToRawData
+    std::string_view const hay{
+        reinterpret_cast<char const*>(img.data() + idataFileOff),
+        idataVSize};
+    EXPECT_NE(hay.find("_fmode"), std::string_view::npos);
+    EXPECT_NE(hay.find("msvcrt.dll"), std::string_view::npos);
+}
+
+TEST(PeExecWriter, MixedFunctionAndDataExternsThunkForFunctionSlotForData) {
+    // c149 (D-LK-EXTERN-DATA-IMPORT, PE half), the MIXED-module pin:
+    // one FUNCTION extern (called) + one DATA extern (read) in ONE
+    // library. The function extern keeps its c112 `FF 25` thunk +
+    // thunk-VA binding; the data extern binds to its IAT slot VA; the
+    // IAT carries BOTH entries (+ terminator); ONE import descriptor.
+    // Mirrors macho.cpp's c119 DataExternGetsGotSlotButNoStub
+    // compaction pin (funcExternIdxs — thunk index j != extern index i).
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+
+    // main: `E8 <rel32>` call puts (offset 0, patch @1)
+    //       `48 8B 05 <disp32>` mov rax,[rip+_fmode] (offset 5, patch @8)
+    //       `C3` ret                                  -> 13 bytes total.
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0xE8, 0, 0, 0, 0,
+                 0x48, 0x8B, 0x05, 0, 0, 0, 0,
+                 0xC3};
+    fn.relocations.push_back(
+        Relocation{/*offset=*/1, SymbolId{99}, RelocationKind{1}, 0});
+    fn.relocations.push_back(
+        Relocation{/*offset=*/8, SymbolId{98}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    mod.externImports.push_back(
+        ExternImport{SymbolId{99}, "puts", "msvcrt.dll"});
+    ExternImport dataExt{SymbolId{98}, "_fmode", "msvcrt.dll"};
+    dataExt.isData = true;
+    mod.externImports.push_back(std::move(dataExt));
+
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    ASSERT_EQ(rep.errorCount(), 0u);
+    ASSERT_FALSE(img.empty());
+
+    auto const [textRva, textPtr] =
+        findExecSection(img, {'.', 't', 'e', 'x', 't', 0, 0, 0});
+    auto const [idataRva, idataPtr] =
+        findExecSection(img, {'.', 'i', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(textRva, 0u);
+    ASSERT_NE(idataRva, 0u);
+    (void)idataPtr;
+
+    // (1) Thunk count = FUNCTION externs only: 13 fn bytes + ONE
+    //     6-byte thunk = 19. A per-extern (lockstep) reservation would
+    //     give 25.
+    EXPECT_EQ(findExecSectionVirtualSize(
+                  img, {'.', 't', 'e', 'x', 't', 0, 0, 0}),
+              19u)
+        << "exactly one FF 25 thunk (the function extern's) -- the data "
+           "extern must not reserve thunk bytes";
+
+    // (2) The single thunk sits at .text offset 13 and jumps through
+    //     the FUNCTION extern's IAT slot. `.idata` layout for 1 lib x
+    //     2 externs: descriptors 40 -> ILT @40 (2 externs + term = 24)
+    //     -> IAT @64; extern[0] (puts) slot @64, extern[1] (_fmode)
+    //     slot @72.
+    std::size_t const thunkFileOff = static_cast<std::size_t>(textPtr) + 13u;
+    std::uint32_t const thunkRva   = textRva + 13u;
+    ASSERT_LT(thunkFileOff + 6u, img.size());
+    EXPECT_EQ(img[thunkFileOff + 0], 0xFFu);
+    EXPECT_EQ(img[thunkFileOff + 1], 0x25u);
+    auto const thunkDisp =
+        static_cast<std::int32_t>(readU32LE(img, thunkFileOff + 2u));
+    EXPECT_EQ(static_cast<std::int64_t>(thunkRva) + 6 + thunkDisp,
+              static_cast<std::int64_t>(idataRva) + 64)
+        << "the function thunk must jump through ITS OWN IAT slot "
+           "(idata+64), lockstep with the import layout";
+
+    // (3) The CALL resolves to the thunk (c112 function path,
+    //     unchanged by c149).
+    auto const callDisp =
+        static_cast<std::int32_t>(readU32LE(img, textPtr + 1u));
+    EXPECT_EQ(static_cast<std::int64_t>(textRva) + 5 + callDisp,
+              static_cast<std::int64_t>(thunkRva))
+        << "function extern still binds to its thunk VA";
+
+    // (4) The DATA reference resolves to the data extern's IAT slot
+    //     (idata+72) — in .idata, distinct from the function's slot.
+    auto const movDisp =
+        static_cast<std::int32_t>(readU32LE(img, textPtr + 8u));
+    std::int64_t const dataTargetRva =
+        static_cast<std::int64_t>(textRva) + 12 + movDisp;
+    EXPECT_EQ(dataTargetRva, static_cast<std::int64_t>(idataRva) + 72)
+        << "data extern must bind to ITS IAT slot VA (idata+72)";
+    EXPECT_GE(dataTargetRva, static_cast<std::int64_t>(idataRva))
+        << "data extern must never bind into .text";
+
+    // (5) Import accounting: ONE descriptor (1 lib + terminator = 40),
+    //     IAT block = 2 externs + terminator = 24 bytes; both names in
+    //     the HINT/NAME table.
+    EXPECT_EQ(readU32LE(img, 0x114), 40u);
+    EXPECT_EQ(readU32LE(img, 0x108 + 12 * 8), idataRva + 64u);
+    EXPECT_EQ(readU32LE(img, 0x108 + 12 * 8 + 4), 24u);
+    std::uint32_t const idataFileOff = readU32LE(img, 0x188 + 40 + 20);
+    std::uint32_t const idataVSize = findExecSectionVirtualSize(
+        img, {'.', 'i', 'd', 'a', 't', 'a', 0, 0});
+    ASSERT_NE(idataVSize, 0u);
+    std::string_view const hay{
+        reinterpret_cast<char const*>(img.data() + idataFileOff),
+        idataVSize};
+    EXPECT_NE(hay.find("puts"), std::string_view::npos);
+    EXPECT_NE(hay.find("_fmode"), std::string_view::npos);
+    EXPECT_NE(hay.find("msvcrt.dll"), std::string_view::npos);
+}
+
+TEST(PeExecWriter, DataExternUnderForeignDataImportBindingFailsLoud) {
+    // c149 walker-side binding assertion (mirrors elf.cpp's
+    // copy-relocation check and macho.cpp's got-indirect check): the
+    // PE exec walker implements exactly `got-indirect`. A pe-exec
+    // schema declaring a FOREIGN model (copy-relocation — valid enum,
+    // wrong walker) passes the linker's schema-declared pre-walker
+    // gate, so the WALKER must reject loud rather than silently hand
+    // the data extern an IAT-slot binding it did not declare.
+    auto target = TargetSchema::loadShipped("x86_64");
+    ASSERT_TRUE(target.has_value());
+    auto fmt = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+      "dataModel": "LLP64",
+      "format": {"name":"pe-exec-foreign-data-binding","kind":"pe"},
+      "externCallDispatch": "direct-plt",
+      "dataImportBinding": "copy-relocation",
+      "pe": { "machine": 34404, "characteristics": 34, "type": "exec" },
+      "optionalHeader": { "magic": 523, "imageBase": 5368709120, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
+      "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}],
+      "relocations":[{"name":"IMAGE_REL_AMD64_REL32","kind":1,"nativeId":4}]
+    })");
+    ASSERT_TRUE(fmt.has_value());
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x48, 0x8B, 0x05, 0, 0, 0, 0, 0xC3};
+    fn.relocations.push_back(
+        Relocation{3u, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    ExternImport dataExt{SymbolId{99}, "_fmode", "msvcrt.dll"};
+    dataExt.isData = true;
+    mod.externImports.push_back(std::move(dataExt));
+    DiagnosticReporter rep;
+    auto img = pe::encode(mod, **target, **fmt, rep);
+    EXPECT_TRUE(img.empty());
+    EXPECT_GE(::dss::test_support::countCode(
+                  rep, DiagnosticCode::K_FormatLacksImportSupport),
+              1u)
+        << "the walker must reject a data-import binding model it does "
+           "not implement -- never a silent IAT-slot bind";
+}
+
+TEST(LinkerEndToEnd, PeExecAcceptsAndBindsDataExternImport) {
+    // c149 end-to-end acceptance through linker::link with the SHIPPED
+    // pe64-x86_64-windows-exec schema: the pre-walker data-import gate
+    // (linker.cpp K_FormatLacksImportSupport) now ADMITS a surviving
+    // extern DATA import because the format declares got-indirect —
+    // the exact call path that rejected before c149 (see
+    // Linker.ImageWithNoDataBindingStillRejectsReferencedDataExtern
+    // for the reverted-JSON red pin). The shipped format also injects
+    // the ExitProcess entry trampoline, so this pins gate+walker+
+    // trampoline coexistence rather than exact byte layout (that is
+    // DataExternBindsToIatSlotInIdataNotTextThunk's job).
+    auto loaded = loadShippedExec();
+    ASSERT_TRUE(loaded.format);
+    ASSERT_TRUE(loaded.target);
+    AssembledModule mod;
+    mod.expectedFuncCount = 1;
+    AssembledFunction fn;
+    fn.symbol = SymbolId{1};
+    fn.bytes  = {0x48, 0x8B, 0x05, 0, 0, 0, 0, 0xC3};
+    fn.relocations.push_back(
+        Relocation{3u, SymbolId{99}, RelocationKind{1}, 0});
+    mod.functions.push_back(std::move(fn));
+    ExternImport dataExt{SymbolId{99}, "_fmode", "msvcrt.dll"};
+    dataExt.isData = true;
+    mod.externImports.push_back(std::move(dataExt));
+    DiagnosticReporter rep;
+    LinkedImage img = linker::link(mod, *loaded.target, *loaded.format, rep);
+    for (auto const& d : rep.all()) ADD_FAILURE() << d.actual;
+    EXPECT_EQ(rep.errorCount(), 0u)
+        << "the linker's data-import gate must pass under the declared "
+           "got-indirect binding (c149)";
+    EXPECT_TRUE(img.ok());
+    ASSERT_FALSE(img.bytes.empty());
+    // The import surfaced: the emitted image's import-name list carries
+    // the data extern (the walker resolved its name like any import).
+    EXPECT_EQ(std::count(img.externImportNames.begin(),
+                         img.externImportNames.end(),
+                         std::string{"_fmode"}),
+              1);
 }
 
 TEST(PeExecWriter, FunctionUnwindInfoEmitsPdataXdataAndExceptionDataDir) {
@@ -1567,16 +2511,22 @@ TEST(PeExecFormatJsonValidate, VirtualAddressNotMultipleOfSectionAlignmentReject
     ASSERT_FALSE(r.has_value());
 }
 
-TEST(PeExecWriter, DllArmFailsLoud) {
-    // Anchored D-LK2-4: PE .dll arm not yet implemented; walker
-    // emits K_NoMatchingObjectFormat rather than silently producing
-    // a malformed DLL.
+TEST(PeExecWriter, DllArmEncodesEntrylessImage) {
+    // c152 (D-LK2-4): the Dll arm SHIPPED — this replaces the retired
+    // `DllArmFailsLoud` red pin (which pinned the pre-c152
+    // not-implemented reject). The dll routes through the same
+    // encodeExec substrate; the deep pins (IMAGE_FILE_DLL, entry 0,
+    // .edata sort invariant, DIR64, fail-loud belts) live in
+    // tests/link/test_pe_dll_writer.cpp. Here: a hand-declared dll
+    // schema (validate now REQUIRES characteristics 0x2022-shaped
+    // bits — EXECUTABLE_IMAGE + IMAGE_FILE_DLL) loads and encodes a
+    // non-empty image with AddressOfEntryPoint == 0.
     auto r = ObjectFormatSchema::loadFromText(R"({
       "dssObjectFormatVersion": 1,
   "dataModel": "LP64",
       "format": {"name":"a-dll","kind":"pe"},
-      "pe": { "machine": 34404, "type": "dll" },
-      "optionalHeader": { "magic": 523, "imageBase": 6442450944, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 3, "dllCharacteristics": 0, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
+      "pe": { "machine": 34404, "characteristics": 8226, "type": "dll" },
+      "optionalHeader": { "magic": 523, "imageBase": 6442450944, "sectionAlignment": 4096, "fileAlignment": 512, "subsystem": 2, "dllCharacteristics": 352, "sizeOfStackReserve": 1048576, "sizeOfStackCommit": 4096, "sizeOfHeapReserve": 1048576, "sizeOfHeapCommit": 4096 },
       "sections":[{"kind":"text","name":".text","type":1616904224,"flags":0,"addrAlign":0,"entrySize":0,"virtualAddress":4096}]
     })");
     ASSERT_TRUE(r.has_value());
@@ -1585,12 +2535,12 @@ TEST(PeExecWriter, DllArmFailsLoud) {
     AssembledModule mod = makeTrivialModule({0xC3}, 1);
     DiagnosticReporter rep;
     auto bytes = pe::encode(mod, **target, **r, rep);
-    EXPECT_TRUE(bytes.empty());
-    bool sawCode = false;
-    for (auto const& d : rep.all()) {
-        if (d.code == DiagnosticCode::K_NoMatchingObjectFormat) sawCode = true;
-    }
-    EXPECT_TRUE(sawCode);
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_EQ(rep.errorCount(), 0u);
+    // IMAGE_FILE_HEADER.Characteristics @ 0x96 carries IMAGE_FILE_DLL.
+    EXPECT_EQ(readU16LE(bytes, 0x96) & 0x2000u, 0x2000u);
+    // AddressOfEntryPoint (optional header +16 = 0x98+16) == 0.
+    EXPECT_EQ(readU32LE(bytes, 0x98 + 16), 0u);
 }
 
 TEST(PeExecWriter, EmptyTextFailsLoud) {

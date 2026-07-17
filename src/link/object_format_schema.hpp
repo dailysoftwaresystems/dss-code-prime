@@ -221,10 +221,12 @@ struct DSS_EXPORT ElfIdentity {
     std::uint8_t   abiVersion = 0;
     std::uint16_t  machine = 0;      // e_machine: EM_X86_64=62 / EM_AARCH64=183
     // e_type — ET_REL/ET_EXEC walker arms ship at LK1 cycle 1+2;
-    // ET_DYN anchored at D-LK1-4 paired with LK6 dynamic linking.
-    // `validate()` rejects values outside {Rel, Exec}; ET_DYN
-    // accepted at load but rejected at walker dispatch until
-    // D-LK1-4 closes. Default = Rel preserves LK1 cycle 1
+    // ET_DYN (c150, D-LK1-4 shared-library half) is the base-0,
+    // loader-slid image flavor: a `.so` today (entry-less,
+    // interpreter-less — validate() enforces that shape); the PIE
+    // EXECUTABLE is the anchored follow-up (ET_DYN + PT_INTERP +
+    // entry trampoline — the validate() rules relax there, see the
+    // D-LK1-4 registry row). Default = Rel preserves LK1 cycle 1
     // schemas unchanged.
     ElfObjectType  objectType = ElfObjectType::Rel;
     // PT_LOAD `p_align` for Exec images. The Linux kernel rejects
@@ -245,8 +247,22 @@ struct DSS_EXPORT ElfIdentity {
     // empty for self-contained executables (LK1 cycle 2) and for
     // ET_REL relocatable objects. The walker emits this string as
     // the `.interp` section's contents and a PT_INTERP program
-    // header pointing at it.
+    // header pointing at it. MUST be empty for ET_DYN today (a
+    // `.so` is loaded by an already-running ld.so, never execve'd;
+    // validate() rejects) — the PIE-executable follow-up is exactly
+    // the ET_DYN + interpreter combination (D-LK1-4 remainder).
     std::string    interpreter;
+    // DT_SONAME for an ET_DYN shared library (c150, D-LK1-4): the
+    // logical name the dynamic linker records when an executable
+    // links against this `.so` (`libfoo.so.1`). OPTIONAL — empty
+    // emits NO DT_SONAME (matching `gcc -shared` without
+    // `-Wl,-soname`, where the consumer's linker records the file
+    // name instead). Config-driven: the schema field is the one
+    // knob; the walker never derives a soname from the output file
+    // name (the walker emits bytes and does not know it). Only
+    // legal on `type: "dyn"` schemas — validate() rejects it on
+    // Rel/Exec (dead config there).
+    std::string    soname;
     // Eager-vs-lazy dynamic-binding choice. `true` (the v1 stance,
     // plan 14 §5 risk row) emits `DT_FLAGS_1 = DF_1_NOW` so all
     // GOT slots are resolved at load via `R_X86_64_GLOB_DAT` in
@@ -273,16 +289,18 @@ struct DSS_EXPORT ElfIdentity {
 //
 // `objectType` discriminates between PE/COFF object files
 // (`MH_OBJECT`-equivalent — `.obj` relocatable, LK2 cycle 1) and
-// executable images (`.exe` for Exec / `.dll` for Dll, LK2 cycle
-// 2). Mirrors the `ElfObjectType` closed-enum pattern. Dll is
-// declared but rejected by validate() until a future cycle ships
-// the .dll arm (anchored at plan 14 §3.1 — same shape as ELF
-// ET_DYN's D-LK1-4 anchor).
+// executable images (`.exe` for Exec / `.dll` for Dll). Mirrors the
+// `ElfObjectType` closed-enum pattern. All three members have walker
+// arms: Obj (LK2 cycle 1), Exec (LK2 cycle 2, D-LK2-1), Dll (c152,
+// D-LK2-4 — the PE mirror of ELF ET_DYN's c150 `.so`: entry-less
+// image, `.edata` exports, complete `.reloc`).
 enum class PeObjectType : std::uint16_t {
     Obj  = 1,  // .obj relocatable — LK2 cycle 1 (default; preserves
                //                    LK2 cycle 1 schemas unchanged).
     Exec = 2,  // .exe executable — LK2 cycle 2 (closes D-LK2-1).
-    Dll  = 3,  // .dll dynamic library — anchored, not yet implemented.
+    Dll  = 3,  // .dll dynamic library — c152 (closes D-LK2-4 part 1;
+               //                        DllMain arm is the pinned
+               //                        follow-up D-LK2-DLL-DLLMAIN-ENTRY).
 };
 
 inline constexpr EnumNameTable<PeObjectType, 3> kPeObjectTypeTable{{{
@@ -308,18 +326,18 @@ struct DSS_EXPORT PeIdentity {
     PeObjectType  objectType = PeObjectType::Obj;
 };
 
-// ── PE32+ Optional Header (loaded only when PE objectType==Exec) ──
+// ── PE32+ Optional Header (loaded when PE objectType != Obj) ──
 //
 // Mirrors `IMAGE_OPTIONAL_HEADER64` (PE/COFF spec §3.4). Only the
 // load-bearing fields are declared — every field the Windows loader
-// requires for a minimal `.exe` is here; the deluxe data
+// requires for a minimal `.exe`/`.dll` is here; the deluxe data
 // directories (debug, security, etc.) are emitted as zero by the
-// walker (NumberOfRvaAndSizes=16, all entries zero — minimum
-// loadable image).
+// walker (NumberOfRvaAndSizes=16; the populated entries are Import/
+// IAT/Exception/BaseReloc/TLS on exec, plus Export on dll — c152).
 //
-// Validate() requires all fields populated when objectType==Exec;
-// Obj rejects any non-zero field (config-error trap mirroring the
-// ELF ET_REL `virtualAddress=0` symmetry).
+// Validate() requires all fields populated when objectType is
+// Exec/Dll; Obj rejects any non-zero field (config-error trap
+// mirroring the ELF ET_REL `virtualAddress=0` symmetry).
 struct DSS_EXPORT PeOptionalHeader {
     std::uint16_t magic = 0;                // PE32+=0x20B / PE32=0x10B
     std::uint64_t imageBase = 0;            // preferred load VA
@@ -365,14 +383,15 @@ struct DSS_EXPORT PeOptionalHeader {
 // definition.
 // Mach-O `mach_header_64.filetype` closed enum, mirroring
 // ElfObjectType / PeObjectType. Numeric values match
-// <mach-o/loader.h>'s MH_OBJECT / MH_EXECUTE / MH_DYLIB. The walker
-// supports the first two; Dylib is declared but rejected by
-// validate() until a future cycle ships the .dylib arm (anchored
-// at plan 14 §3.1 D-LK3-3).
+// <mach-o/loader.h>'s MH_OBJECT / MH_EXECUTE / MH_DYLIB. All three
+// have walker arms: Object (LK3 cycle 1), Execute (LK3 cycle 2),
+// Dylib (c153, D-LK3-3 — the Mach-O mirror of ELF ET_DYN's c150
+// `.so` + PE Dll's c152 `.dll`: entry-less image, LC_ID_DYLIB,
+// export trie in LC_DYLD_INFO_ONLY, no __PAGEZERO).
 enum class MachOObjectType : std::uint32_t {
     Object  = 1,   // MH_OBJECT  — relocatable .o
     Execute = 2,   // MH_EXECUTE — executable image
-    Dylib   = 6,   // MH_DYLIB   — dynamic library (anchored D-LK3-3)
+    Dylib   = 6,   // MH_DYLIB   — dynamic library (c153, D-LK3-3)
 };
 
 inline constexpr EnumNameTable<MachOObjectType, 3> kMachOObjectTypeTable{{{
@@ -398,15 +417,16 @@ struct DSS_EXPORT MachOIdentity {
     MachOObjectType filetype = MachOObjectType::Object;
                                      // LK3 cycle 1 ships MH_OBJECT;
                                      // LK3 cycle 2 adds MH_EXECUTE
-                                     // (closes D-LK3-2). MH_DYLIB
-                                     // anchored at D-LK3-3.
+                                     // (closes D-LK3-2); c153 adds
+                                     // MH_DYLIB (closes D-LK3-3).
     std::uint32_t flags = 0;         // MH_SUBSECTIONS_VIA_SYMBOLS=0x2000
                                      // / MH_PIE=0x200000 (mandatory for
                                      //   modern macOS exec). Optional;
                                      //   0 is legal for a minimal .o.
 };
 
-// ── Mach-O image block (loaded only when filetype==MH_EXECUTE) ──
+// ── Mach-O image block (loaded when filetype is MH_EXECUTE or
+//    MH_DYLIB — every loadable image flavor; rejected on MH_OBJECT) ──
 //
 // Carries the executable-only Mach-O identity fields. Mirrors LK1
 // cycle 2's universal pattern (`virtualAddress` on sections,
@@ -537,6 +557,12 @@ inline constexpr std::uint64_t kDefaultMachoSegmentPageSize = 0x1000u;  // 4 KiB
 
 struct DSS_EXPORT MachOImage {
     std::uint64_t pageZeroSize = 0;        // __PAGEZERO vmsize
+                                           // (MUST be 0 on MH_DYLIB — a
+                                           // dylib carries no __PAGEZERO;
+                                           // ld64 likewise rejects
+                                           // -pagezero_size on non-main
+                                           // links. validate() enforces
+                                           // >0 on Execute, ==0 on Dylib.)
     // VM segment page size — the granularity at which every
     // LC_SEGMENT_64's vmaddr / vmsize / fileoff is aligned (and the
     // file is padded between segments). The kernel's mmap-congruence
@@ -556,7 +582,32 @@ struct DSS_EXPORT MachOImage {
     // byte-identical (D-LK10-ENTRY-MACHO-EXIT).
     std::uint64_t segmentPageSize = kDefaultMachoSegmentPageSize;
     std::string   dylinkerPath;            // LC_LOAD_DYLINKER name
+                                           // (Execute-only: dyld is the
+                                           // EXECUTABLE's loader; a dylib
+                                           // is mapped by the already-
+                                           // running dyld. validate()
+                                           // requires non-empty on
+                                           // Execute, EMPTY on Dylib.)
     std::vector<MachODylibRef> loadDylibs; // each → LC_LOAD_DYLIB
+    // D-LK3-3 (c153): the MH_DYLIB LC_ID_DYLIB install name — the
+    // identity a CLIENT records at link time and dyld resolves at its
+    // load (`@rpath/libdss.dylib` is the modern convention). REQUIRED
+    // non-empty on a Dylib schema and REJECTED on every other filetype
+    // (dead config there): every ld64-produced MH_DYLIB carries an
+    // LC_ID_DYLIB, and dyld's two-level-namespace client binding keys
+    // on it — emitting a dylib without one is an unverifiable-without-
+    // a-Mac corner this substrate does not ship. Config-driven + honest
+    // (the c150 DT_SONAME discipline): the walker NEVER derives the
+    // name from the output file name (it emits bytes and does not know
+    // it), and an unset field fails loud at validate() rather than
+    // silently inventing an identity. The shipped
+    // `macho64-arm64-darwin-dylib` schema declares a generic default
+    // (the same shipped-schema-identity concession as
+    // `codeSignature.identifier`); a differently-named artifact
+    // overrides via its own format JSON. Not needed for plain
+    // dlopen-by-path (dyld keys that on the path), but clients that
+    // LINK against the dylib record this string verbatim.
+    std::string   installName;
     // Eager-vs-lazy dynamic-binding choice (parallel to
     // `ElfIdentity.bindNow` — same semantic across ELF + Mach-O).
     // `true` (the v1 stance per plan 14 §5 risk row) emits the
@@ -716,7 +767,8 @@ struct DSS_EXPORT ObjectFormatData {
                                            //   pe.objectType != Obj
     MachOIdentity    macho{};
     MachOImage       machoImage{};        // populated only when
-                                           //   macho.filetype == MH_EXECUTE
+                                           //   macho.filetype is
+                                           //   MH_EXECUTE / MH_DYLIB
 
     // ── Image-side fields (LK1 cycle 2+) ─────────────────────
     //
@@ -999,26 +1051,82 @@ public:
     [[nodiscard]] MachOImage       const& machoImage()       const noexcept { return d_.machoImage; }
 
     // Cross-format image-flavor predicate. True iff the schema
-    // describes an executable / shared-library image (ELF ET_EXEC,
-    // PE Exec/Dll, Mach-O MH_EXECUTE) — i.e. the walker emits an
-    // image header (PT_LOAD / IMAGE_OPTIONAL_HEADER / LC_MAIN+
-    // LC_LOAD_DYLINKER) rather than relocatable section bytes.
-    // Mirrors the `isExecFlavor` rule inside `validate()` (the
-    // terminal cross-format Text-virtualAddress gate); exposing it
-    // as an accessor lets walker code branch on "am I image-side?"
-    // without duplicating the disjunction (type-design O1 fold-in,
-    // LK2 cycle 2 + LK3 cycle 2 post-audit).
+    // describes an executable / shared-library image (ELF ET_EXEC
+    // or ET_DYN, PE Exec/Dll, Mach-O MH_EXECUTE/MH_DYLIB) — i.e. the
+    // walker emits a LOAD-TIME-BOUND image (PT_LOAD /
+    // IMAGE_OPTIONAL_HEADER / LC_MAIN+LC_LOAD_DYLINKER) rather than
+    // relocatable section bytes a LATER linker binds. c150 (D-LK1-4):
+    // ET_DYN now counts — a `.so` IS load-time-bound (ld.so maps +
+    // relocates it; no later static linker sees its innards), closing
+    // the c143-era latent imprecision this predicate carried while no
+    // dyn format shipped. c153 (D-LK3-3): Mach-O MH_DYLIB likewise —
+    // dyld maps + rebases + binds a dylib at dlopen/load time exactly
+    // as it does the main image; the arm is `!= Object` (mirroring
+    // ELF `!= Rel` / PE `!= Obj`) so all three formats key the
+    // predicate the same way. "Image" does NOT imply "rejects
+    // undefined externs" — that policy is the SEPARATE
+    // `allowsUndefinedImports()` below (a .so is an image AND may
+    // carry undefined symbols).
+    // The `isExecFlavor` rule inside `validate()` remains
+    // EXEC-only by design (it gates entry/processExit machinery a
+    // `.so` / `.dylib` must not declare) — the two predicates
+    // diverged at c150 and no longer mirror each other.
     [[nodiscard]] bool isImageFlavor() const noexcept {
         switch (d_.kind) {
             case ObjectFormatKind::Elf:
-                return d_.elf.objectType == ElfObjectType::Exec;
+                return d_.elf.objectType != ElfObjectType::Rel;
             case ObjectFormatKind::Pe:
                 return d_.pe.objectType != PeObjectType::Obj;
             case ObjectFormatKind::MachO:
-                return d_.macho.filetype == MachOObjectType::Execute;
+                return d_.macho.filetype != MachOObjectType::Object;
             default:
                 return false;
         }
+    }
+
+    // Undefined-extern policy (c150 + c151, D-LK1-4 — the c143
+    // gate's third flavor): may the emitted artifact carry a
+    // REFERENCED extern that no library binds (an undefined symbol
+    // resolved by a LATER binder)?
+    //   * relocatable (.o/.obj)  → TRUE — the final (foreign) linker
+    //     resolves SHN_UNDEF symbols against sibling objects /
+    //     libraries (D-LK-OBJECT-NOLIB-EXTERN-RELOCATABLE, c143);
+    //   * ELF ET_DYN (.so)       → TRUE — standard `ld -shared`
+    //     semantics: a shared library may reference symbols the
+    //     EXECUTABLE (or another loaded object) defines; ld.so
+    //     resolves them from the global scope at load;
+    //   * executable images      → FALSE — nothing later binds them;
+    //     an unresolved reference is a load-time failure, so the
+    //     linker rejects LOUD at build time (c143, unchanged).
+    // c151: an ELF ET_DYN PIE is an EXECUTABLE — FALSE, exactly like
+    // ET_EXEC (ld.so erroring "symbol lookup error" at ./prog time
+    // is the deferred-failure class the c143 gate exists to
+    // prevent). The PIE discriminator is ENTRY-CLUSTER presence on
+    // the dyn schema (validate() pins the cluster all-or-none, so
+    // `processExit` presence is a faithful single-member witness) —
+    // never a format-name check.
+    // Schema-driven (declared objectType + declared entry cluster),
+    // never a format-name branch. PE Dll (c152, D-LK2-4) is FALSE —
+    // Windows has no ld.so-style deferred global scope for
+    // implicitly-linked DLLs: every import binds at load from a NAMED
+    // module's export table, so a referenced no-library extern still
+    // rejects loud at build time. c153 (D-LK3-3): Mach-O MH_DYLIB is
+    // FALSE for the same structural reason — the shipped bind model
+    // is the modern TWO-LEVEL namespace (MH_TWOLEVEL; every
+    // LC_DYLD_INFO bind opcode names a SPECIFIC dylib ordinal, and
+    // the walker fails loud on an import whose library is not in
+    // image.loadDylibs), so a library-less undefined has no bind row
+    // to ride: unlike ELF's flat global scope there is nothing that
+    // resolves it at load. macOS DOES have a flat-namespace opt-in
+    // (MH_FLAT + BIND_SPECIAL_DYLIB_FLAT_LOOKUP ordinal -2, or
+    // `-undefined dynamic_lookup`), but that is a DIFFERENT bind
+    // model the eager two-level machinery deliberately does not
+    // ship; a flat-namespace schema knob would flip this arm then.
+    [[nodiscard]] bool allowsUndefinedImports() const noexcept {
+        if (!isImageFlavor()) return true;   // relocatable: later linker resolves
+        return d_.kind == ObjectFormatKind::Elf
+            && d_.elf.objectType == ElfObjectType::Dyn
+            && !d_.processExit.has_value();  // .so only — a PIE is an executable
     }
 
     // Image-side entry-point symbol name. Empty for relocatable

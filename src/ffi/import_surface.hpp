@@ -54,10 +54,17 @@ enum class SymbolVisibility : std::uint8_t {
 
 // What kind of symbol the binary exposes.
 enum class SymbolKind : std::uint8_t {
-    Function = 0,  // ELF STT_FUNC; PE export of function entry; Mach-O N_SECT in __text
-    Object   = 1,  // ELF STT_OBJECT (data); PE data export; Mach-O N_SECT in __data
-    Tls      = 2,  // ELF STT_TLS; PE __declspec(thread); Mach-O thread-local
-    NoType   = 3,  // ELF STT_NOTYPE (unknown — common in stripped .so)
+    Function  = 0,  // ELF STT_FUNC; PE export whose EAT RVA lands in an executable section; Mach-O N_SECT in __text
+    Object    = 1,  // ELF STT_OBJECT (data); PE export whose EAT RVA lands in a non-executable data section; Mach-O N_SECT in __data
+    Tls       = 2,  // ELF STT_TLS; PE __declspec(thread); Mach-O thread-local
+    NoType    = 3,  // ELF STT_NOTYPE (unknown -- common in stripped .so)
+    Forwarder = 4,  // PE export whose EAT RVA falls inside the export
+                    // directory span — the RVA points at a "DLL.Symbol"
+                    // forward string, not code/data (the row carries the
+                    // target in `forwardTarget`). kernel32 is full of these
+                    // (HeapAlloc → NTDLL.RtlAllocateHeap); the ELF analog is
+                    // an IFUNC/alias, the Mach-O analog a reexport — both
+                    // reserved for their readers when a corpus needs them.
 };
 
 // Linkage class — only relevant for header-mode (FF2). Binary readers
@@ -81,6 +88,13 @@ struct DSS_EXPORT ImportSurface {
     SymbolKind       kind       = SymbolKind::NoType;
     SymbolVisibility visibility = SymbolVisibility::Default;
     SymbolLinkage    linkage    = SymbolLinkage::External;
+    // For a `kind == SymbolKind::Forwarder` row only: the verbatim
+    // "DLL.Symbol" target the export forwards to (e.g. PE kernel32's
+    // HeapAlloc forwards to "NTDLL.RtlAllocateHeap"). Empty for every
+    // non-forwarder kind. Carrying the target explicitly (rather than
+    // rejecting the export) keeps a forwarder-heavy binary like kernel32
+    // readable — the consumer follows the redirect to the real owner.
+    std::string      forwardTarget;
 };
 
 } // namespace dss::ffi

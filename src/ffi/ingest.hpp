@@ -55,6 +55,22 @@ struct DSS_EXPORT BinaryLibrarySource {
     // discover the library's mangledName + identity from the
     // binary itself; no caller-supplied importLibrary required.
     std::filesystem::path path;
+    // c162 (D-FF1-READER-CONSUMER): the library IDENTITY to record in
+    // each resolved extern's import (the ELF DT_NEEDED / PE import
+    // descriptor / Mach-O LC_LOAD_DYLIB name). EMPTY (the default) ⇒
+    // `ingest()` binds each matched extern to the binary reader's own
+    // `libraryPath` label (== the on-disk path passed to `readImports`)
+    // -- the pre-c162 behavior every header/JSON caller relies on.
+    // NON-EMPTY ⇒ `ingest()` OVERRIDES every row read from THIS source
+    // to carry `importName` as its `libraryPath`, so the linker records
+    // the soname/DLL-name the loader resolves at runtime rather than the
+    // absolute build-time path (a Windows path in an ELF DT_NEEDED would
+    // never load). This is the honest stand-in for the binary's OWN
+    // DT_SONAME / export-directory DllName until FF1 extracts them
+    // (anchored `D-FF1-READER-SONAME`): the driver supplies the file's
+    // basename, which is exactly what a foreign linker records for a
+    // `-l<name>` / `gcc -shared` library with no explicit `-soname`.
+    std::string importName;
 };
 
 struct DSS_EXPORT CHeaderSource {
@@ -103,6 +119,11 @@ struct DSS_EXPORT ExternDeclRef {
     // belongs to the link tier: a sibling-TU definition, or a LOUD undefined-
     // symbol reject. Mutually exclusive with a non-empty `libraryOverride`.
     bool noLibraryBinding = false;
+    // c156 (D-LK-ELF-SYMBOL-VERSIONING): the REQUIRED ELF symbol version
+    // (e.g. "GLIBC_2.3"), already resolved for the active (arch, format) by the
+    // descriptor reader. Empty ⇒ unversioned. A plain string (already resolved,
+    // not a per-format map), threaded verbatim to FfiMetadata.version.
+    std::string_view version{};
 };
 
 // ── HirIngestResult ─────────────────────────────────────────────
@@ -192,11 +213,19 @@ private:
 //     must inspect `externsAnnotated` rather than branching solely
 //     on `ok()` to decide whether to consume ffiMap.
 //   * Extern in `externs` with no match in aggregated surface:
-//     skipped without error — the user's source declares the
-//     extern but no library/header provides it; the linker will
-//     fail loud at link time with `K_SymbolUndefined`. FF5 reports
-//     the count via `externsAnnotated < externs.size()` so the
-//     driver can warn upfront if desired.
+//     SILENTLY SKIPPED here (no FfiMetadata written) -- `ingest()`
+//     is a bind MECHANISM. Its sole production caller
+//     (compile_pipeline step 2.5, c162 / D-FF1-READER-CONSUMER)
+//     inspects `ffiMap` after the call to see which externs bound to
+//     a `--resolve-library` binary, then applies the VALIDATION
+//     POLICY to the unmatched ones: a bare `extern puts;` (a real
+//     system symbol, not #included) falls through to its
+//     format-default library, while a genuine typo (in neither the
+//     binaries nor any shipped descriptor) fails loud
+//     `F_FfiResolveLibrarySymbolAbsent`. That descriptor-aware policy
+//     lives in the caller, not here (`ingest()` has no shipped-
+//     descriptor knowledge); a blanket fail-loud here would wrongly
+//     reject a legitimate mixed program.
 [[nodiscard]] DSS_EXPORT HirIngestResult
 ingest(std::span<IngestionSource const> sources,
        std::span<ExternDeclRef const>   externs,

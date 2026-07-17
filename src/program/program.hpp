@@ -191,11 +191,24 @@ public:
         return userDefines_;
     }
 
+    /// c162 (D-FF1-READER-CONSUMER): the `--resolve-library <path>` binaries
+    /// whose export surfaces resolve + validate this run's source-declared
+    /// externs. `Program::run` stamps this from `CliArgs::resolveLibraries`;
+    /// the in-process round-trip harness (and tests) sets it directly before
+    /// building the `main` that links against a DSS-built library. Threaded to
+    /// `CompileOptions.resolveLibraries` at the per-target build.
+    void setResolveLibraries(std::vector<std::filesystem::path> libs) {
+        resolveLibraries_ = std::move(libs);
+    }
+    [[nodiscard]] std::vector<std::filesystem::path> const&
+    resolveLibraries() const noexcept { return resolveLibraries_; }
+
 private:
     std::optional<std::filesystem::path>   outputDir_;
     std::optional<::dss::opt::OptPipeline> optimizerPipelineOverride_;
     CompileConfig                          compileConfig_ = CompileConfig::Debug;
     std::vector<std::string>               userDefines_;  // c105: --define
+    std::vector<std::filesystem::path>     resolveLibraries_;  // c162: --resolve-library
 };
 
 } // namespace dss

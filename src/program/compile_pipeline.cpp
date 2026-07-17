@@ -5,12 +5,18 @@
 #include "analysis/semantic/semantic_model.hpp"
 #include "asm/asm.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: BUILD half on a large stack
+#include "core/substrate/mint_monotonic_id.hpp"  // c165: fresh per-member CompilationUnitId (static pull)
 #include "core/substrate/phase_timers.hpp"      // c97: per-phase --time accumulation
 #include "core/types/parse_diagnostic.hpp"
+#include "ffi/binary_readers/ar_reader.hpp"  // c165: readArArchive (static-pull member index)
 #include "ffi/ingest.hpp"
 #include "ffi/mangling/c_mangle.hpp"  // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: applyCMangling
+#include "ffi/shipped_lib_descriptor.hpp"  // c162: collectShippedExternSymbolNames
+#include "core/types/symbol_attrs.hpp"  // isExternallyVisible (armap export filter, c163)
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+#include "link/format/ar.hpp"  // writeArArchive (D-LK-STATIC-ARCHIVE-WRITER, c163)
+#include "link/format/elf_object_reader.hpp"  // c165: readRelocatableObject (static-pull member parse)
 #include "link/linker.hpp"
 #include "link/writer.hpp"
 #include "lir/lir_2addr_legalize.hpp"
@@ -28,13 +34,19 @@
 #include "opt/passes/prune_unreachable.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <format>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 // Plan 14 LK10 cycle 2 — driver pipeline kernel.
@@ -275,6 +287,37 @@ static std::optional<CuMirModule> buildCuMirImpl(
         return std::nullopt;
     }
 
+    // 2.5-pre. c162 (D-FF1-READER-CONSUMER) EAGER path validation: a
+    //      `--resolve-library <path>` names a binary the build is pointed
+    //      at, so a MISSING / UNREADABLE path is a hard error the operator
+    //      must see -- UNCONDITIONALLY, even when this TU has no externs (or
+    //      only explicitly-bound ones) and nothing routes to `ingest()`
+    //      below. Without this eager open-probe the bad path would be
+    //      SILENTLY IGNORED (the reader is reached only through `ingest()`,
+    //      which the partition may skip). Fail loud `F_FileOpenFailed`,
+    //      honoring the documented contract ("opened + read at compile time,
+    //      fails loud on a missing/unreadable file"). A readable file's
+    //      binary validity is checked later by the reader when a governed
+    //      extern actually routes to it.
+    if (!opts.resolveLibraries.empty()) {
+        auto const probeEntry = reporter.errorCount();
+        for (auto const& lib : opts.resolveLibraries) {
+            std::ifstream probe(lib, std::ios::binary);
+            if (!probe) {
+                ParseDiagnostic d;
+                d.code     = DiagnosticCode::F_FileOpenFailed;
+                d.severity = DiagnosticSeverity::Error;
+                d.actual   = std::format(
+                    "--resolve-library: failed to open '{}' for reading "
+                    "(the resolve-library binary must exist + be readable at "
+                    "compile time). Check the path.",
+                    lib.generic_string());
+                reporter.report(std::move(d));
+            }
+        }
+        if (!tierClean(reporter, probeEntry)) return std::nullopt;
+    }
+
     // 2.5. FFI metadata synthesis for source-declared externs
     //      (FF6 Slice 2, 2026-06-02). When the language schema's
     //      `externDecl` rule declares an `externLibraryByFormat`
@@ -356,15 +399,134 @@ static std::optional<CuMirModule> buildCuMirImpl(
             // at the link tier (sibling-TU definition, or the LOUD
             // undefined-symbol reject).
             refs.push_back({r.node, r.canonicalName, resolvedLibs[i],
-                            r.noLibraryBinding});
+                            r.noLibraryBinding,
+                            r.version});   // D-LK-ELF-SYMBOL-VERSIONING (c156)
         }
 
         auto const ffiEntry = reporter.errorCount();
         phase.emplace(substrate::CompilePhase::SynthesizeFfi);
-        auto const ffiResult = ffi::synthesizeFfiFromSourceDecls(
-            refs, importLibrary, target, format, ffiMap, reporter);
+
+        // c162 (D-FF1-READER-CONSUMER): the `--resolve-library` driver
+        // surface makes the FF5 `ingest()` binary-reader consumer LIVE.
+        //
+        // PRECEDENCE for a source-declared extern's import-library binding
+        // (highest wins):
+        //   1. `noLibraryBinding`  -- empty library; resolves at the link
+        //      tier (a sibling-TU definition or a loud undefined-symbol).
+        //   2. explicit `libraryOverride` -- a source `extern "lib" ...` OR a
+        //      shipped-library descriptor (its per-format `library`). The
+        //      binding is EXPLICIT; the binary read never overrides it.
+        //   3. `--resolve-library` binary MATCH -- the extern IS exported by
+        //      a named binary: bind to it (the true DT_NEEDED / import
+        //      descriptor for a DSS-built library that has no descriptor).
+        //   4. a governed extern ABSENT from every named binary:
+        //      * KNOWN system symbol (in some shipped descriptor, e.g. a bare
+        //        `extern int puts;` the user did not #include) → fall through
+        //        to the format-default library (`externLibraryByFormat`), the
+        //        gcc implicit-libc semantics -- NOT a fail-loud;
+        //      * GENUINE typo (in NEITHER a named binary NOR any shipped
+        //        descriptor, e.g. `dss_lib_answr`) → FAIL LOUD
+        //        `F_FfiResolveLibrarySymbolAbsent`. That is the meaningful,
+        //        false-positive-scarce validation: reading a real export
+        //        table proves an own-library symbol exists at compile time.
+        //
+        // The binary read is NON-DUPLICATIVE of the JSON/shipped path
+        // precisely because a DSS-BUILT library has no shipped descriptor --
+        // reading its real export table is the only way to discover its true
+        // library binding. The extern's TYPE still comes from the inline
+        // declaration; the reader supplies existence + binding only.
+        //
+        // When no `--resolve-library` is given (every build before c162),
+        // this collapses to the single `synthesizeFfiFromSourceDecls` call
+        // over ALL externs -- byte-identical output.
+        if (opts.resolveLibraries.empty()) {
+            auto const ffiResult = ffi::synthesizeFfiFromSourceDecls(
+                refs, importLibrary, target, format, ffiMap, reporter);
+            (void)ffiResult;  // shape inspected via reporter.errorCount()
+        } else {
+            // PARTITION: an extern with NEITHER an explicit per-symbol
+            // override NOR the no-library marker is "binary-governed" -- it
+            // would otherwise take the format-default (precedence 4), so it
+            // is exactly the class `--resolve-library` governs. `refs` and
+            // `binaryGoverned` are parallel-indexed to `hir->externDecls` so
+            // an unmatched governed extern can be recovered post-ingest.
+            std::vector<ffi::ExternDeclRef> binaryGoverned;
+            std::vector<ffi::ExternDeclRef> explicitlyBound;
+            for (std::size_t i = 0; i < refs.size(); ++i) {
+                bool const hasExplicit =
+                    !resolvedLibs[i].empty()
+                    || hir->externDecls[i].noLibraryBinding;
+                (hasExplicit ? explicitlyBound : binaryGoverned)
+                    .push_back(refs[i]);
+            }
+
+            // The resolve-library binaries become `ingest()` sources. The
+            // file BASENAME is the loader-resolvable identity recorded in
+            // the import (DT_NEEDED / import descriptor) -- see
+            // BinaryLibrarySource::importName.
+            std::vector<ffi::IngestionSource> binarySources;
+            binarySources.reserve(opts.resolveLibraries.size());
+            for (auto const& libPath : opts.resolveLibraries) {
+                binarySources.push_back(ffi::BinaryLibrarySource{
+                    libPath, libPath.filename().string()});
+            }
+
+            // (i) `ingest()` BINDS every governed extern the named binaries
+            // export (writes FfiMetadata to `ffiMap`); it SILENTLY SKIPS the
+            // rest (it is a mechanism -- the policy for the unmatched is ours).
+            if (!binaryGoverned.empty()) {
+                auto const r = ffi::ingest(binarySources, binaryGoverned,
+                                           target, format, ffiMap, reporter);
+                (void)r;
+            }
+
+            // (ii) The governed externs `ingest()` did NOT bind (absent from
+            // ffiMap) split by the shipped-descriptor oracle: a KNOWN system
+            // symbol falls through to `synthesize` (format-default library);
+            // a GENUINE typo fails loud. `shippedNames == nullopt` (config
+            // discovery failed) ⇒ treat every symbol as possibly-known and
+            // fall through -- never a false-positive fail-loud.
+            auto const shippedNames = ffi::collectShippedExternSymbolNames();
+            std::string libList;
+            for (std::size_t k = 0; k < opts.resolveLibraries.size(); ++k) {
+                if (k) libList += ", ";
+                libList += opts.resolveLibraries[k].filename().generic_string();
+            }
+            std::vector<ffi::ExternDeclRef> fallThrough = explicitlyBound;
+            for (auto const& g : binaryGoverned) {
+                if (ffiMap.tryGet(g.node) != nullptr) continue;  // bound to a binary
+                bool const known =
+                    !shippedNames.has_value()
+                    || shippedNames->count(std::string{g.canonicalName}) != 0;
+                if (known) {
+                    fallThrough.push_back(g);  // system symbol -> format-default
+                } else {
+                    ParseDiagnostic d;
+                    d.code     = DiagnosticCode::F_FfiResolveLibrarySymbolAbsent;
+                    d.severity = DiagnosticSeverity::Error;
+                    d.actual   = std::format(
+                        "declared extern '{}' is not exported by any "
+                        "--resolve-library binary [{}] and is not a known "
+                        "system symbol -- a genuine typo or a missing library. "
+                        "Fix the spelling, #include the header that declares "
+                        "it, or add the defining library to --resolve-library.",
+                        g.canonicalName, libList);
+                    reporter.report(std::move(d));
+                }
+            }
+
+            // (iii) `synthesize` binds the fall-through set (explicitly-bound
+            // + system-symbol governed) to their libraries. Skipped if the
+            // typo fail-loud above already dirtied the tier (keeps the
+            // diagnostic set focused).
+            if (tierClean(reporter, ffiEntry) && !fallThrough.empty()) {
+                auto const r = ffi::synthesizeFfiFromSourceDecls(
+                    fallThrough, importLibrary, target, format, ffiMap,
+                    reporter);
+                (void)r;
+            }
+        }
         phase.reset();
-        (void)ffiResult;  // shape inspected via reporter.errorCount()
         if (!tierClean(reporter, ffiEntry)) {
             return std::nullopt;
         }
@@ -1154,7 +1316,8 @@ lowerCuMirToAssembly(CuMirModule&                       cuMir,
 // intra-module calls (stripping the resolved extern imports), and computed the
 // user-entry symbol. This drives that single module through the same LOWER body,
 // so the linker downstream receives exactly ONE AssembledModule (no assembled-tier
-// cross-CU thunk — the cycle-19 GOT-like rodata slot is never minted).
+// cross-CU resolution — the linker's dispatch-keyed direct-bind / thunk-slot
+// machinery, c154, only runs for N>1 pre-assembled modules).
 //
 // `merged` is taken by non-const ref because the shared body needs a mutable `Mir&`
 // (MIR→LIR may intern lowered-expression types into the host) + the surviving
@@ -1210,6 +1373,247 @@ bool linkAndWrite(std::span<AssembledModule const> modules,
     // never an arch/format identity branch) so a produced binary runs
     // directly without a manual `chmod +x`.
     return linker::writeImage(image, outPath, reporter, format.isImageFlavor());
+}
+
+// -- c165 (D-LK-STATIC-LINK): STATIC linking against `ar` archives --------------
+
+namespace {
+
+// The 8-byte GNU/SysV `ar` global magic ("!<arch>\n"). The ar-vs-dynamic
+// `--resolve-library` dispatch keys on THIS (magic bytes, agnostic -- never a
+// `.a` extension), mirroring `ffi::guessFormat`'s Ar arm. Kept local: `ffi`'s
+// `reader_common.hpp` is an internal header the program tier does not include,
+// and re-stating 8 bytes is cheaper than a new cross-layer include/export.
+constexpr std::uint8_t kArGlobalMagic[8] = {'!', '<', 'a', 'r', 'c', 'h', '>', 0x0Au};
+
+}  // namespace
+
+bool isArArchiveFile(std::filesystem::path const& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;   // unreadable -> stays dynamic (eager probe fails loud)
+    std::uint8_t buf[8] = {};
+    in.read(reinterpret_cast<char*>(buf), static_cast<std::streamsize>(sizeof(buf)));
+    if (in.gcount() != static_cast<std::streamsize>(sizeof(buf))) return false;
+    for (std::size_t i = 0; i < sizeof(buf); ++i) {
+        if (buf[i] != kArGlobalMagic[i]) return false;
+    }
+    return true;
+}
+
+std::optional<std::vector<AssembledModule>>
+pullStaticArchiveMembers(AssembledModule const&                 clientModule,
+                         std::span<std::filesystem::path const> archivePaths,
+                         TargetSchema const&                    target,
+                         ObjectFormatSchema const&              format,
+                         DiagnosticReporter&                    reporter) {
+    std::vector<AssembledModule> pulled;
+    if (archivePaths.empty()) return pulled;  // nothing to pull
+
+    // Read every archive up front: its raw bytes (kept alive so member subspans
+    // stay valid) + its parsed member list + armap (c161 reader).
+    struct ParsedArchive {
+        std::vector<std::uint8_t> bytes;
+        ffi::ArArchive            archive;
+    };
+    std::vector<ParsedArchive> archives;
+    archives.reserve(archivePaths.size());
+    for (auto const& archivePath : archivePaths) {
+        std::ifstream in(archivePath, std::ios::binary);
+        if (!in) {
+            ParseDiagnostic d;
+            d.code     = DiagnosticCode::F_FileOpenFailed;
+            d.severity = DiagnosticSeverity::Error;
+            d.actual   = std::format(
+                "static-link: failed to open archive '{}' for reading "
+                "(D-LK-STATIC-LINK).",
+                archivePath.generic_string());
+            reporter.report(std::move(d));
+            return std::nullopt;
+        }
+        std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(in),
+                                        std::istreambuf_iterator<char>()};
+        auto arch = ffi::readArArchive(
+            std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+            archivePath.filename().string(), reporter);
+        if (!arch) return std::nullopt;   // corrupt archive -> reader fail-loud
+        archives.push_back(ParsedArchive{std::move(bytes), std::move(*arch)});
+    }
+
+    // Global armap: symbol name -> (archiveIdx, memberIndex). First-wins across
+    // archives (standard left-to-right link order) + first-wins within one
+    // archive (an armap lists a symbol against its single defining member).
+    std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> armap;
+    for (std::size_t ai = 0; ai < archives.size(); ++ai) {
+        for (auto const& sym : archives[ai].archive.symbols) {
+            armap.emplace(sym.name, std::pair{ai, sym.memberIndex});
+        }
+    }
+
+    // Names already satisfied by a DEFINITION (client, then each pulled member).
+    // A worklist name that is already defined is never pulled again. Only
+    // externally-visible definitions can satisfy a cross-module reference (the
+    // same filter the c163 armap writer applies), so Local defs are excluded.
+    std::unordered_set<std::string> definedNames;
+    for (auto const& ms : clientModule.symbols) {
+        if (!ms.name.empty() && isExternallyVisible(ms.binding, ms.visibility)) {
+            definedNames.insert(ms.name);
+        }
+    }
+
+    // Worklist: the client's unresolved extern names (the references to satisfy).
+    std::vector<std::string> worklist;
+    for (auto const& ext : clientModule.externImports) {
+        if (!ext.mangledName.empty()) worklist.push_back(ext.mangledName);
+    }
+
+    // (archiveIdx << 32) | memberIndex of every member already pulled -- the LAZY
+    // dedup so a member defining several referenced symbols is pulled once.
+    std::unordered_set<std::uint64_t> pulledMembers;
+    auto memberKey = [](std::size_t ai, std::size_t mi) -> std::uint64_t {
+        return (static_cast<std::uint64_t>(ai) << 32)
+             |  static_cast<std::uint64_t>(static_cast<std::uint32_t>(mi));
+    };
+
+    for (std::size_t cursor = 0; cursor < worklist.size(); ++cursor) {
+        std::string const& name = worklist[cursor];
+        if (definedNames.count(name) != 0) continue;   // already satisfied
+        auto const it = armap.find(name);
+        if (it == armap.end()) continue;   // no archive defines it -> a real FFI
+                                           // import / an undefined the linker's
+                                           // own gate handles (never pulled here)
+        auto const [ai, mi] = it->second;
+        if (!pulledMembers.insert(memberKey(ai, mi)).second) continue;  // lazy dedup
+
+        ffi::ArMember const& member = archives[ai].archive.members[mi];
+        std::span<std::uint8_t const> const memberBytes{
+            archives[ai].bytes.data() + static_cast<std::size_t>(member.dataOffset),
+            static_cast<std::size_t>(member.size)};
+
+        // Fresh, process-unique CompilationUnitId per member: the merge keys its
+        // symbol index by (cuId, SymbolId), so a member must never share a cuId
+        // with the client or another member (the monotonic minter never repeats).
+        CompilationUnitId const memberCu =
+            substrate::mintMonotonicId<CompilationUnitId>();
+        auto member_mod = elf::readRelocatableObject(
+            memberBytes, target, format, reporter, memberCu);
+        // Consume the reader's optional as the read-success signal -- NOT
+        // `ok()`, which is a tautology for reader output AND false for a
+        // data-only member (see elf_object_reader.hpp).
+        if (!member_mod) return std::nullopt;   // member-read fail-loud
+
+        // A pulled member's externally-visible definitions satisfy later
+        // worklist names; its OWN unresolved externs feed the next pass -- the
+        // transitive lazy-pull (a member referencing another member).
+        for (auto const& ms : member_mod->symbols) {
+            if (!ms.name.empty() && isExternallyVisible(ms.binding, ms.visibility)) {
+                definedNames.insert(ms.name);
+            }
+        }
+        for (auto const& ext : member_mod->externImports) {
+            if (!ext.mangledName.empty()) worklist.push_back(ext.mangledName);
+        }
+        pulled.push_back(std::move(*member_mod));
+    }
+    return pulled;
+}
+
+bool linkAndWriteWithStaticArchives(AssembledModule                        clientModule,
+                                    std::span<std::filesystem::path const> staticArchives,
+                                    TargetSchema const&                    target,
+                                    ObjectFormatSchema const&              format,
+                                    std::filesystem::path const&           outPath,
+                                    DiagnosticReporter&                    reporter) {
+    if (staticArchives.empty()) {
+        return linkAndWrite(std::span<AssembledModule const>{&clientModule, 1},
+                            target, format, outPath, reporter);
+    }
+    auto pulled = pullStaticArchiveMembers(clientModule, staticArchives,
+                                           target, format, reporter);
+    if (!pulled) return false;   // pull fail-loud already reported
+
+    // Link the COMBINED span [client, pulled...]. >1 element triggers the c154
+    // cross-CU merge in `linker::link`, whose `mergeModules` binds each archive
+    // reference to the pulled member's definition (stripping the extern import)
+    // exactly as it resolves a sibling-CU reference. When nothing was pulled
+    // (the archives defined nothing referenced) the span is the client alone --
+    // the single-CU path, unchanged.
+    std::vector<AssembledModule> combined;
+    combined.reserve(1 + pulled->size());
+    combined.push_back(std::move(clientModule));
+    for (auto& member_mod : *pulled) combined.push_back(std::move(member_mod));
+    return linkAndWrite(std::span<AssembledModule const>{combined.data(), combined.size()},
+                        target, format, outPath, reporter);
+}
+
+// c163 (D-LK-STATIC-ARCHIVE-WRITER): link N assembled CUs into N relocatable
+// object members + bundle them into ONE `.a` static archive. See the header
+// docblock for the contract.
+bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
+                               std::span<std::string const>     memberNames,
+                               TargetSchema const&              target,
+                               ObjectFormatSchema const&        format,
+                               std::filesystem::path const&     outPath,
+                               DiagnosticReporter&              reporter) {
+    substrate::PhaseTimers::Scope linkPhase{substrate::CompilePhase::Link};
+    auto const entry = reporter.errorCount();
+
+    // An archive bundles RELOCATABLE objects a foreign linker later pulls +
+    // merges -- an image-flavor format (.so/.exe/.dylib) is not poolable this
+    // way. Reject loud rather than emit an archive of non-relocatable members.
+    if (format.isImageFlavor()) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "linkAndWriteStaticArchive: object format '{}' is an image flavor "
+            "(.so/.dll/.exe/.dylib); a static archive bundles RELOCATABLE "
+            "objects (ELF ET_REL / Mach-O MH_OBJECT) a foreign linker pulls + "
+            "merges -- select a relocatable object format "
+            "(D-LK-STATIC-ARCHIVE-WRITER).",
+            format.name());
+        reporter.report(std::move(d));
+        return false;
+    }
+    if (modules.size() != memberNames.size()) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "linkAndWriteStaticArchive: {} module(s) but {} member name(s) -- "
+            "the spans must be parallel (one archived file name per member) "
+            "(D-LK-STATIC-ARCHIVE-WRITER).",
+            modules.size(), memberNames.size());
+        reporter.report(std::move(d));
+        return false;
+    }
+
+    // Link each module INDEPENDENTLY to its own `.o` bytes (a 1-element link,
+    // never the cross-CU merge) + collect its DEFINED externally-visible
+    // symbols for the armap (the same on-binary names the object writer put in
+    // the member's symbol table).
+    std::vector<link::format::ArMemberInput> members;
+    members.reserve(modules.size());
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        auto image = linker::link(std::span<AssembledModule const>{&modules[i], 1},
+                                  target, format, reporter);
+        if (!image.ok() || !tierClean(reporter, entry)) {
+            return false;
+        }
+        std::vector<std::string> exported;
+        for (ModuleSymbol const& ms : modules[i].symbols) {
+            if (isExternallyVisible(ms.binding, ms.visibility) && !ms.name.empty()) {
+                exported.push_back(ms.name);
+            }
+        }
+        members.push_back(link::format::ArMemberInput{
+            memberNames[i], std::move(image.bytes), std::move(exported)});
+    }
+
+    auto const archive = link::format::writeArArchive(members, reporter);
+    if (!tierClean(reporter, entry)) {
+        return false;   // a writer fail-loud belt fired (name/size/offset).
+    }
+    return linker::writeBytes(archive, outPath, reporter);
 }
 
 // Assemble ONE CompilationUnit to its AssembledModule (no link/write). Returns

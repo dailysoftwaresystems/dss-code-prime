@@ -81,6 +81,24 @@ struct DSS_EXPORT ExternImport {
     // reserved). Meaningless (0) for function imports.
     std::uint64_t dataSizeBytes  = 0;
     std::uint64_t dataAlignBytes = 0;
+    // c156 (D-LK-ELF-SYMBOL-VERSIONING): the REQUIRED symbol version this
+    // import must bind, as an ELF version STRING (e.g. "GLIBC_2.3"). EMPTY
+    // (the default, every symbol until opted in) ⇒ UNVERSIONED: the ELF
+    // writer stamps this import's `.gnu.version` slot with VER_NDX_GLOBAL (1)
+    // and emits no `.gnu.version_r` requirement for it — byte-identical to the
+    // pre-c156 image. NON-EMPTY ⇒ the ELF writer emits a `.gnu.version_r`
+    // (verneed) requirement against this import's `libraryPath` naming this
+    // version, and points the import's `.gnu.version` slot at it, so ld.so
+    // binds the DEFAULT/declared version instead of misbinding an unversioned
+    // reference to a library's OLDEST compat version (glibc `realpath` bound
+    // `@GLIBC_2.2.5` — the NULL-buffer-rejecting compat form — instead of the
+    // `@@GLIBC_2.3` default). CONFIG-DRIVEN + already resolved for the ACTIVE
+    // (arch, format) upstream (the descriptor's per-target `version` variant):
+    // the writer reads this string exactly as it reads `libraryPath` for
+    // DT_NEEDED — no arch/format/symbol-name branch in the shared substrate.
+    // Meaningless (stays empty) on formats that carry no symbol versioning
+    // (PE/Mach-O ignore it). Rides the LK11 merge's whole-row copy for free.
+    std::string   version;
 };
 
 } // namespace dss

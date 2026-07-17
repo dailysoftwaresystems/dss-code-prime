@@ -177,6 +177,9 @@ std::string cliHelpText() {
         "  --config=<debug|release>  build config "
             "(default: debug; release applies the full optimizer "
             "pipeline — plan 22)\n"
+        "  --resolve-library <path>  read a binary's (.so/.dll/.dylib) "
+            "export table to resolve + validate this build's externs "
+            "against it (repeatable; typically a DSS-built library)\n"
         "\n"
         "Diagnostic options:\n"
         "  --warnings-as-errors   promote every Warning to Error\n"
@@ -479,6 +482,21 @@ parseCliArgs(int argc, char* argv[]) {
                 continue;
             }
         }
+        {
+            // c162 (D-FF1-READER-CONSUMER): `--resolve-library <path>`
+            // (repeatable). Names a binary whose export surface resolves
+            // this build's source-declared externs. Structural check only
+            // here (non-empty value, enforced by `valueFlag`); the binary
+            // is opened + read at compile time by the FF5 ingest consumer,
+            // which fails loud on a missing/unreadable file or an absent
+            // symbol.
+            auto m = valueFlag(a, i, "--resolve-library");
+            if (!m) return std::unexpected(m.error());
+            if (m->has_value()) {
+                out.resolveLibraries.push_back(std::move(**m));
+                continue;
+            }
+        }
         if (a == "--recursive") {
             out.directoryMode = InputResolver::Mode::Recursive;
             continue;
@@ -581,6 +599,7 @@ parseCliArgs(int argc, char* argv[]) {
          || !out.sourceFiles.empty()
          || !out.transpileFiles.empty()
          || !out.suppress.empty()
+         || !out.resolveLibraries.empty()  // c162 (D-FF1-READER-CONSUMER)
          || out.warningsAsErrors
          || out.time
          || out.config != CompileConfig::Debug

@@ -786,21 +786,10 @@ encodeAggregateValue(TypeId ty, MirLiteralValue const& v,
     return true;
 }
 
-// D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): the ONE chokepoint for the section a
-// RELOC-BEARING global lands in. A pointer object patched by the loader (an
-// `int *p = &x;` scalar, or a fn-ptr-table / `&global` member of an aggregate)
-// cannot sit in read-only `.rodata`; it routes to a thread-local template
-// (Tdata), relocated-read-only const (RelRoConst — gcc's `.data.rel.ro`), or
-// writable data (Data). BOTH the F5 scalar symbol-address arm AND the aggregate
-// arm route through here, so the const-vs-mutable relro decision has a SINGLE
-// point of truth (a duplicated ternary is what breeds a missed site). Thread-
-// locality wins first — a reloc-bearing `thread_local` keeps its per-thread
-// `.tdata` template (never demoted to a process-shared slot).
-[[nodiscard]] DataSectionKind relocBearingGlobalSection(bool isThreadLocal,
-                                                        bool isConst) noexcept {
-    if (isThreadLocal) return DataSectionKind::Tdata;
-    return isConst ? DataSectionKind::RelRoConst : DataSectionKind::Data;
-}
+// D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): the reloc-bearing section choice is
+// the shared `relocBearingGlobalSection` chokepoint (core/types/section_kind.hpp)
+// — hoisted there in c154 so the linker's cross-CU merge routes through the SAME
+// rule as the F5 scalar symbol-address arm and the aggregate arm here.
 
 } // namespace
 

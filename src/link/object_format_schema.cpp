@@ -140,20 +140,10 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "(EM_* value, e.g. 62 for x86_64, "
                                  "183 for aarch64)");
         }
-        // e_type — the LK1 cycle 2 ELF walker supports ET_REL and
-        // ET_EXEC. ET_DYN is declared on the closed enum but
-        // rejected here until D-LK1-4 closes (PIE/.so paired with
-        // LK6 dynamic linking).
-        if (elf.objectType != ElfObjectType::Rel
-         && elf.objectType != ElfObjectType::Exec) {
-            fail("/elf/type",
-                 std::format("ELF format 'elf.type' = '{}' not yet "
-                             "supported by the walker; cycle 2 ships "
-                             "'rel' and 'exec'. 'dyn' (ET_DYN: PIE / "
-                             ".so) is anchored at plan 14 §3.1 D-LK1-4 "
-                             "paired with LK6 dynamic linking.",
-                             std::string{elfObjectTypeName(elf.objectType)}));
-        }
+        // e_type — all three closed-enum members now have walker
+        // arms: ET_REL (LK1 cycle 1), ET_EXEC (LK1 cycle 2 + the
+        // LK6 dynamic arm), ET_DYN (c150 — the D-LK1-4 shared-
+        // library half; the entry-less `.so` shape enforced below).
         // ET_EXEC schemas must declare which sections are loaded and
         // at what virtual address. Today the walker uses sh_addr =
         // section.virtualAddress directly (no relocation of
@@ -204,6 +194,168 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
             // observable states by the time validate() runs.
             // The walker (LK6 cycle 2b — D-LK6-4) enforces non-empty
             // when externImports is non-empty.
+        }
+        // ── ET_DYN shape rules — c150 (shared-library half) + c151
+        // (PIE half), D-LK1-4. An ELF ET_DYN schema describes ONE of
+        // exactly TWO artifact shapes, discriminated by ENTRY-CLUSTER
+        // presence (never a new e_type — a PIE IS ET_DYN):
+        //   * a SHARED LIBRARY (`.so`): loaded by an already-running
+        //     ld.so; no process entry — NONE of the entry cluster.
+        //   * a POSITION-INDEPENDENT EXECUTABLE (PIE): execve'd
+        //     directly; the kernel maps ld.so via PT_INTERP, ld.so
+        //     relocates the image at a randomized base and jumps to
+        //     base + e_entry — ALL of the entry cluster (the modern
+        //     gcc-default executable shape: ET_DYN + PT_PHDR +
+        //     PT_INTERP + non-zero e_entry + DF_1_PIE).
+        // Both are base-0, loader-slid images: the base-0 layout
+        // rules below (pageAlign + text VA == pageAlign) apply to
+        // both shapes uniformly.
+        if (elf.objectType == ElfObjectType::Dyn) {
+            if (elf.pageAlign == 0) {
+                fail("/elf/pageAlign",
+                     "ELF ET_DYN format must declare 'elf.pageAlign' "
+                     "(PT_LOAD p_align) -- same kernel/loader page-"
+                     "congruence contract as ET_EXEC (D-LK6-3).");
+            }
+            auto const* secText = [&]() -> ObjectFormatSectionInfo const* {
+                for (auto const& s : sections) {
+                    if (s.kind == SectionKind::Text) return &s;
+                }
+                return nullptr;
+            }();
+            if (secText == nullptr) {
+                fail("/sections",
+                     "ELF ET_DYN format requires a Text section row "
+                     "(SectionKind::Text) -- a shared library without "
+                     "code has nothing to export.");
+            } else if (elf.pageAlign != 0
+                       && secText->virtualAddress != elf.pageAlign) {
+                // ET_DYN VAs are BASE-RELATIVE (the loader slides the
+                // whole image). The walker computes baseImageVa =
+                // text.virtualAddress - pageAlign; requiring equality
+                // pins baseImageVa to 0 BY CONSTRUCTION — the gcc
+                // `.so` convention (first page holds Ehdr + PHT +
+                // dynamic metadata, `.text` opens the second page).
+                // Any other value would bake a nonzero base offset
+                // into every "base-relative" VA for no benefit.
+                fail("/sections/<text>/virtualAddress",
+                     std::format("ELF ET_DYN format requires the .text "
+                                 "row's 'virtualAddress' to equal "
+                                 "'elf.pageAlign' (got {:#x}, pageAlign "
+                                 "{:#x}) -- ET_DYN images are base-0 "
+                                 "(loader-slid); .text sits one page in "
+                                 "so headers + dynamic metadata fill "
+                                 "page zero. D-LK1-4.",
+                                 secText->virtualAddress, elf.pageAlign));
+            }
+            // The ENTRY CLUSTER (c151, D-LK1-4 PIE half). Exactly
+            // FOUR fields form it:
+            //   1. `elf.interpreter`        (the PT_INTERP path)
+            //   2. `processExit`            (termination mechanism)
+            //   3. `entryCallingConvention` (paired with processExit
+            //      by the generic §2.13 rule below)
+            //   4. `processArgs`            (argc/argv materialization)
+            // ALL FOUR present = a PIE; NONE = a `.so`. A half-
+            // configured state is a schema bug that would emit a
+            // broken image either way (an interpreter with no
+            // trampoline leaves e_entry = 0 — the kernel jumps to the
+            // load base and executes header bytes; a trampoline with
+            // no interpreter emits no PT_INTERP — execve gets no
+            // loader to resolve the trampoline's libc `exit` import),
+            // so it rejects loud naming exactly which members are
+            // missing. `entryPoint` is NOT a cluster member: empty
+            // means "functions[0]" on every exec-flavored schema
+            // (the shipped exec JSONs all leave it empty), so its
+            // presence cannot discriminate — it is instead rejected
+            // on the `.so` shape below.
+            bool const hasInterp = !elf.interpreter.empty();
+            bool const hasExit   = processExit.has_value();
+            bool const hasCc     = !entryCallingConvention.empty();
+            bool const hasArgs   = processArgs.has_value();
+            int const clusterCount = static_cast<int>(hasInterp)
+                                   + static_cast<int>(hasExit)
+                                   + static_cast<int>(hasCc)
+                                   + static_cast<int>(hasArgs);
+            bool const isPieShape = clusterCount == 4;
+            if (clusterCount != 0 && !isPieShape) {
+                fail("/elf",
+                     std::format(
+                         "ELF ET_DYN format declares a PARTIAL entry "
+                         "cluster -- elf.interpreter: {}, processExit: "
+                         "{}, entryCallingConvention: {}, processArgs: "
+                         "{}. An ET_DYN schema is EITHER a shared "
+                         "library (NONE of the four) or a PIE "
+                         "executable (ALL FOUR: ET_DYN + PT_INTERP + "
+                         "entry trampoline, the gcc-default shape). A "
+                         "half-configured state would emit a broken "
+                         "image (no-trampoline: e_entry = 0 executes "
+                         "header bytes; no-interpreter: no loader to "
+                         "resolve the trampoline's libc exit import). "
+                         "D-LK1-4.",
+                         hasInterp ? "present" : "MISSING",
+                         hasExit   ? "present" : "MISSING",
+                         hasCc     ? "present" : "MISSING",
+                         hasArgs   ? "present" : "MISSING"));
+            }
+            if (!entryPoint.empty() && !isPieShape) {
+                fail("/entryPoint",
+                     std::format("ELF ET_DYN format must not declare "
+                                 "'entryPoint' (got '{}') without the "
+                                 "full PIE entry cluster -- a shared "
+                                 "library has no process entry "
+                                 "(e_entry = 0). On a PIE schema "
+                                 "(interpreter + processExit + "
+                                 "entryCallingConvention + processArgs "
+                                 "all present) a non-empty entryPoint "
+                                 "is legal and names the user entry "
+                                 "function. D-LK1-4.",
+                                 entryPoint));
+            }
+            // A PIE is NOT a library: nothing ever links against it,
+            // so DT_SONAME (read only by DT_NEEDED lookups) is
+            // legal-but-meaningless ELF there. Rejecting keeps
+            // configs honest — a soname on a PIE schema is a
+            // copy-paste from the `.so` sibling.
+            if (isPieShape && !elf.soname.empty()) {
+                fail("/elf/soname",
+                     std::format("ELF ET_DYN PIE format (full entry "
+                                 "cluster) must not declare "
+                                 "'elf.soname' (got '{}') -- DT_SONAME "
+                                 "names a shared library for DT_NEEDED "
+                                 "lookups; nothing links against a "
+                                 "PIE, so the field is dead config "
+                                 "copy-pasted from the .so sibling. "
+                                 "D-LK1-4.",
+                                 elf.soname));
+            }
+            // A `.so` cannot host copy relocations — R_*_COPY is the
+            // EXECUTABLE's mechanism (the exec owns the one canonical
+            // copy every image binds to; a library declaring it would
+            // invert the interposition contract). The dyn data-import
+            // model is got-indirect (a GOT slot ld.so fills with the
+            // object's address — the c117/c149 GotIndirect lowering).
+            if (dataImportBinding.has_value()
+                && *dataImportBinding == DataImportBinding::CopyRelocation) {
+                fail("/dataImportBinding",
+                     "ELF ET_DYN format must not declare "
+                     "'dataImportBinding': \"copy-relocation\" -- copy "
+                     "relocations are exec-only (the executable owns "
+                     "the canonical copy). Declare \"got-indirect\" "
+                     "for extern data in a shared library. D-LK1-4.");
+            }
+        }
+        // `soname` is an ET_DYN-only field (DT_SONAME names a shared
+        // library; a `.o` / executable carrying one is dead config —
+        // a copy-paste error the bindNow/interpreter rules' shape
+        // already polices for their fields).
+        if (elf.objectType != ElfObjectType::Dyn && !elf.soname.empty()) {
+            fail("/elf/soname",
+                 std::format("ELF '{}' format must not declare "
+                             "'elf.soname' (got '{}') -- DT_SONAME is "
+                             "meaningful only on ET_DYN shared "
+                             "libraries.",
+                             std::string{elfObjectTypeName(elf.objectType)},
+                             elf.soname));
         }
         // ET_REL must NOT carry an interpreter path — `.interp` /
         // PT_INTERP are exec-image concepts and have no role in
@@ -400,33 +552,66 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                      "(PE32+) or 0x10B (PE32). v1 ships PE32+ on "
                      "x86_64-windows.");
             }
-            // PE32+ EXECUTABLE (`.exe`) images MUST set
+            // PE32+ images (`.exe` AND `.dll`) MUST set
             // `IMAGE_FILE_EXECUTABLE_IMAGE` (0x0002) in
-            // `IMAGE_FILE_HEADER.Characteristics` — without this bit
-            // the Windows loader silently refuses to execute the
-            // file with `ERROR_BAD_EXE_FORMAT` and no diagnostic.
-            // The shipped JSON sets this (combined with
-            // `LARGE_ADDRESS_AWARE` 0x0020 → 0x0022); a hand-rolled
-            // schema that omits it would silently produce an
-            // unrunnable binary. (architect post-fold review,
-            // LK7-readiness gap for LK10 hermetic e2e.)
-            //
-            // Scope is Exec-only. Dll is anchored at D-LK2-4 — the
-            // Dll arm will use `IMAGE_FILE_DLL` (0x2000) instead
-            // (the two bits are mutually exclusive per PE COFF
-            // §3.3.2). The guard widens when Dll lands.
+            // `IMAGE_FILE_HEADER.Characteristics` — the bit means
+            // "this image is fully linked and loadable", NOT "this is
+            // a .exe" (PE COFF §3.3.2: "If this flag is not set, it
+            // indicates a linker error"); without it the Windows
+            // loader silently refuses the file with
+            // `ERROR_BAD_EXE_FORMAT` and no diagnostic. dumpbin
+            // ground truth (c152): a `cl /LD` DLL carries 0x2022 =
+            // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE | IMAGE_FILE_DLL
+            // — both bits together, retiring the earlier
+            // "mutually exclusive" misreading this guard's Exec-only
+            // scope was based on. (architect post-fold review,
+            // LK7-readiness gap for LK10 hermetic e2e; widened to the
+            // Dll arm at c152 / D-LK2-4.)
             constexpr std::uint16_t IMAGE_FILE_EXECUTABLE_IMAGE = 0x0002;
-            if (pe.objectType == PeObjectType::Exec
-             && (pe.characteristics & IMAGE_FILE_EXECUTABLE_IMAGE) == 0u) {
+            constexpr std::uint16_t IMAGE_FILE_DLL              = 0x2000;
+            if ((pe.characteristics & IMAGE_FILE_EXECUTABLE_IMAGE) == 0u) {
                 fail("/pe/characteristics",
-                     std::format("PE32+ executable image (.exe) "
-                                 "requires IMAGE_FILE_EXECUTABLE_IMAGE "
-                                 "bit (0x0002) set in "
-                                 "'pe.characteristics' (got 0x{:04x}); "
-                                 "without it the Windows loader fails "
-                                 "ERROR_BAD_EXE_FORMAT at "
-                                 "CreateProcess with no user-visible "
-                                 "diagnostic.",
+                     std::format("PE32+ image ({}) requires the "
+                                 "IMAGE_FILE_EXECUTABLE_IMAGE bit "
+                                 "(0x0002) set in 'pe.characteristics' "
+                                 "(got 0x{:04x}) -- the bit means "
+                                 "'fully linked, loadable image' and a "
+                                 "DLL carries it too (cl /LD emits "
+                                 "0x2022); without it the Windows "
+                                 "loader fails ERROR_BAD_EXE_FORMAT "
+                                 "with no user-visible diagnostic.",
+                                 std::string{peObjectTypeName(pe.objectType)},
+                                 pe.characteristics));
+            }
+            // The IMAGE_FILE_DLL bit (0x2000) is the .dll/.exe
+            // discriminator the LOADER reads: CreateProcess rejects an
+            // image carrying it; LoadLibrary requires it to treat the
+            // module as a library. It must agree with the schema's
+            // declared objectType both ways — a mismatch would emit an
+            // artifact whose extension (`TargetSpec::outputExtension`)
+            // and loader behavior contradict each other. c152, D-LK2-4.
+            if (pe.objectType == PeObjectType::Dll
+             && (pe.characteristics & IMAGE_FILE_DLL) == 0u) {
+                fail("/pe/characteristics",
+                     std::format("PE32+ dynamic-link library (pe.type "
+                                 "= 'dll') requires the IMAGE_FILE_DLL "
+                                 "bit (0x2000) set in "
+                                 "'pe.characteristics' (got 0x{:04x}) "
+                                 "-- without it the emitted .dll is a "
+                                 "mis-labeled executable image. cl /LD "
+                                 "ground truth: 0x2022. D-LK2-4.",
+                                 pe.characteristics));
+            }
+            if (pe.objectType == PeObjectType::Exec
+             && (pe.characteristics & IMAGE_FILE_DLL) != 0u) {
+                fail("/pe/characteristics",
+                     std::format("PE32+ executable image (pe.type = "
+                                 "'exec') must NOT set the "
+                                 "IMAGE_FILE_DLL bit (0x2000) in "
+                                 "'pe.characteristics' (got 0x{:04x}) "
+                                 "-- CreateProcess rejects an image "
+                                 "carrying it (a copy-paste from the "
+                                 "dll sibling). D-LK2-4.",
                                  pe.characteristics));
             }
             if (oh.imageBase == 0) {
@@ -511,6 +696,57 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  oh.attributeCertReserveSize));
             }
         }
+        // ── PE Dll shape rules — c152, D-LK2-4 (the PE mirror of the
+        // ELF ET_DYN `.so` shape block above). A DSS `.dll` ships with
+        // AddressOfEntryPoint = 0 — NO DllMain (legal PE: the loader
+        // skips process/thread notifications for an entry-less
+        // module; `link /NOENTRY` produces the same shape) — so the
+        // entry cluster is ILLEGAL here, exactly as on the `.so`. A
+        // future DllMain-bearing DLL is the pinned follow-up
+        // D-LK2-DLL-DLLMAIN-ENTRY: it would legalize the cluster on
+        // the dll shape via a discriminator (the c151 PIE pattern),
+        // never by relaxing this reject silently.
+        if (pe.objectType == PeObjectType::Dll) {
+            bool sawText = false;
+            for (auto const& s : sections) {
+                if (s.kind == SectionKind::Text) sawText = true;
+            }
+            if (!sawText) {
+                fail("/sections",
+                     "PE32+ dll format requires a Text section row "
+                     "(SectionKind::Text) -- a dynamic-link library "
+                     "without code has nothing to export. D-LK2-4.");
+            }
+            if (processExit.has_value() || !entryCallingConvention.empty()
+             || processArgs.has_value()) {
+                fail("/pe",
+                     std::format(
+                         "PE32+ dll format declares entry-cluster "
+                         "machinery -- processExit: {}, "
+                         "entryCallingConvention: {}, processArgs: {}. "
+                         "A DSS .dll has NO DllMain (AddressOfEntryPoint "
+                         "= 0; the loader skips the notification call), "
+                         "so no entry trampoline is synthesized and the "
+                         "cluster is dead config that would silently "
+                         "diverge from the emitted image. The "
+                         "DllMain-bearing arm is the pinned follow-up "
+                         "D-LK2-DLL-DLLMAIN-ENTRY. D-LK2-4.",
+                         processExit.has_value() ? "present" : "absent",
+                         entryCallingConvention.empty() ? "absent"
+                                                        : "present",
+                         processArgs.has_value() ? "present" : "absent"));
+            }
+            if (!entryPoint.empty()) {
+                fail("/entryPoint",
+                     std::format("PE32+ dll format must not declare "
+                                 "'entryPoint' (got '{}') -- a DSS .dll "
+                                 "has no process entry "
+                                 "(AddressOfEntryPoint = 0, no DllMain; "
+                                 "D-LK2-DLL-DLLMAIN-ENTRY is the pinned "
+                                 "follow-up). D-LK2-4.",
+                                 entryPoint));
+            }
+        }
     }
 
     // Mach-O identity: cputype/cpusubtype/filetype must be declared.
@@ -526,21 +762,11 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                  "value, e.g. 0x01000007 for x86_64, 0x0100000C for "
                  "arm64)");
         }
-        // LK3 cycle 1 + cycle 2 walker arms support MH_OBJECT (1)
-        // and MH_EXECUTE (2). MH_DYLIB (6) is declared on the closed
-        // enum but rejected at validate() until D-LK3-3 closes
-        // (paired with LK6 dynamic linking, same shape as ELF
-        // ET_DYN's D-LK1-4 anchor).
-        if (macho.filetype != MachOObjectType::Object
-         && macho.filetype != MachOObjectType::Execute) {
-            fail("/macho/filetype",
-                 std::format("Mach-O 'macho.filetype' = '{}' not yet "
-                             "supported by the walker; cycles 1+2 ship "
-                             "MH_OBJECT and MH_EXECUTE. MH_DYLIB is "
-                             "anchored at plan 14 §3.1 D-LK3-3 paired "
-                             "with LK6 dynamic linking.",
-                             std::string{machoObjectTypeName(macho.filetype)}));
-        }
+        // All three MachOObjectType members have walker arms: MH_OBJECT
+        // (LK3 cycle 1), MH_EXECUTE (LK3 cycle 2), MH_DYLIB (c153,
+        // D-LK3-3 — the Mach-O mirror of ELF ET_DYN c150 + PE Dll
+        // c152). The closed enum + the loader's fromName check already
+        // reject any other value; nothing to gate here since c153.
         for (std::size_t i = 0; i < sections.size(); ++i) {
             auto const& s = sections[i];
             if (s.segment.empty()) {
@@ -649,6 +875,7 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                 || mi.segmentPageSize != kDefaultMachoSegmentPageSize
                 || !mi.dylinkerPath.empty()
                 || !mi.loadDylibs.empty()
+                || !mi.installName.empty()
                 || !mi.bindNow
                 || mi.codeSignatureSize != 0
                 || mi.codeSignature.has_value()
@@ -657,13 +884,19 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                 fail("/image",
                      "Mach-O MH_OBJECT format must NOT declare an "
                      "'image' block — pageZeroSize / segmentPageSize / "
-                     "dylinkerPath / loadDylibs / bindNow / "
+                     "dylinkerPath / loadDylibs / installName / bindNow / "
                      "codeSignatureSize / codeSignature live only in "
                      "MH_EXECUTE / MH_DYLIB images. Set macho.filetype = 2 "
                      "(MH_EXECUTE) if this schema describes an executable.");
             }
-        } else if (macho.filetype == MachOObjectType::Execute) {
-            if (mi.pageZeroSize == 0) {
+        } else {
+            // Image flavors: MH_EXECUTE and MH_DYLIB (c153, D-LK3-3).
+            // Shared rules first, then the per-flavor divergences —
+            // keyed on the declared filetype (closed-enum schema data,
+            // never a format-name string).
+            bool const isDylibImage =
+                macho.filetype == MachOObjectType::Dylib;
+            if (!isDylibImage && mi.pageZeroSize == 0) {
                 fail("/image/pageZeroSize",
                      "Mach-O MH_EXECUTE image requires non-zero "
                      "'image.pageZeroSize' (__PAGEZERO segment vmsize "
@@ -671,18 +904,78 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                      "darwin; catches null-pointer derefs at the "
                      "kernel level).");
             }
-            if (mi.dylinkerPath.empty()) {
+            // D-LK3-3: a dylib carries NO __PAGEZERO — it is mapped at
+            // a dyld-chosen slid base (link-time base 0), and a 4 GiB
+            // zero-page segment inside a library would reserve address
+            // space at every dlopen; ld64 likewise rejects
+            // -pagezero_size on non-main links. The walker keys the
+            // __PAGEZERO emission (and __TEXT.vmaddr = pageZeroSize)
+            // on this field, so a non-zero value here would emit a
+            // loader-rejected dylib.
+            if (isDylibImage && mi.pageZeroSize != 0) {
+                fail("/image/pageZeroSize",
+                     std::format("Mach-O MH_DYLIB must declare "
+                                 "'image.pageZeroSize' = 0 (got 0x{:x}) "
+                                 "-- a dylib carries no __PAGEZERO; its "
+                                 "__TEXT.vmaddr is the base-0 link-time "
+                                 "address dyld slides at load "
+                                 "(D-LK3-3).",
+                                 mi.pageZeroSize));
+            }
+            if (!isDylibImage && mi.dylinkerPath.empty()) {
                 fail("/image/dylinkerPath",
                      "Mach-O MH_EXECUTE image requires non-empty "
                      "'image.dylinkerPath' (LC_LOAD_DYLINKER — "
                      "typical '/usr/lib/dyld' on macOS).");
             }
+            // D-LK3-3: LC_LOAD_DYLINKER names the loader the KERNEL
+            // execs for a MAIN executable; a dylib is mapped by the
+            // already-running dyld and must not carry one (ld64 emits
+            // none for -dylib output).
+            if (isDylibImage && !mi.dylinkerPath.empty()) {
+                fail("/image/dylinkerPath",
+                     std::format("Mach-O MH_DYLIB must not declare "
+                                 "'image.dylinkerPath' (got '{}') -- a "
+                                 "dylib is mapped by the already-running "
+                                 "dyld; LC_LOAD_DYLINKER is a "
+                                 "main-executable load command "
+                                 "(D-LK3-3).",
+                                 mi.dylinkerPath));
+            }
             if (mi.loadDylibs.empty()) {
                 fail("/image/loadDylibs",
-                     "Mach-O MH_EXECUTE image requires at least one "
-                     "'image.loadDylibs' entry (typical "
-                     "'/usr/lib/libSystem.B.dylib' — libc / process "
-                     "start function provider).");
+                     std::format("Mach-O {} image requires at least one "
+                                 "'image.loadDylibs' entry (typical "
+                                 "'/usr/lib/libSystem.B.dylib' -- libc / "
+                                 "process start function provider; every "
+                                 "real dylib ld64 produces depends on "
+                                 "libSystem too).",
+                                 std::string{machoObjectTypeName(
+                                     macho.filetype)}));
+            }
+            // D-LK3-3: the LC_ID_DYLIB install name — REQUIRED on a
+            // dylib (every ld64-produced MH_DYLIB carries one; clients
+            // record it at link time), dead config anywhere else. The
+            // walker never derives it from the output file name
+            // (config-driven + honest — the c150 DT_SONAME
+            // discipline), so an unset field must fail HERE, not
+            // silently emit an identity-less dylib.
+            if (isDylibImage && mi.installName.empty()) {
+                fail("/image/installName",
+                     "Mach-O MH_DYLIB requires non-empty "
+                     "'image.installName' (the LC_ID_DYLIB name a "
+                     "client links against, e.g. "
+                     "'@rpath/libdss.dylib'). The walker never derives "
+                     "it from the output file name (D-LK3-3).");
+            }
+            if (!isDylibImage && !mi.installName.empty()) {
+                fail("/image/installName",
+                     std::format("'image.installName' (got '{}') is "
+                                 "only legal on a Mach-O MH_DYLIB "
+                                 "schema -- LC_ID_DYLIB is the dylib's "
+                                 "identity; an executable carries none "
+                                 "(D-LK3-3).",
+                                 mi.installName));
             }
             // Mach-O mmap-congruence: vmaddr % page == fileoff %
             // page. __TEXT.fileoff = 0 by Apple convention, so
@@ -739,7 +1032,7 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                 if (s.kind != SectionKind::Text) continue;
                 if (s.virtualAddress < mi.pageZeroSize) {
                     fail("/sections/<text>/virtualAddress",
-                         std::format("Mach-O MH_EXECUTE: __text "
+                         std::format("Mach-O image: __text "
                                      "virtualAddress 0x{:x} is below "
                                      "__PAGEZERO end 0x{:x} (pageZeroSize) "
                                      "— __TEXT would overlap __PAGEZERO; "
@@ -758,7 +1051,7 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                     // misconfiguration here rather than ship a binary that
                     // fails to load. (D-LK10-ENTRY-MACHO-EXIT.)
                     fail("/sections/<text>/virtualAddress",
-                         std::format("Mach-O MH_EXECUTE: __text "
+                         std::format("Mach-O image: __text "
                                      "virtualAddress 0x{:x} is not aligned "
                                      "to segmentPageSize 0x{:x} relative to "
                                      "pageZeroSize 0x{:x} (offset 0x{:x} "
@@ -790,6 +1083,100 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
                                  "alignment).",
                                  mi.codeSignatureSize));
             }
+            // ── Mach-O MH_DYLIB shape rules — c153, D-LK3-3 (the
+            // Mach-O mirror of the ELF ET_DYN `.so` block + the PE Dll
+            // block). A DSS `.dylib` ships entry-less — NO LC_MAIN, no
+            // trampoline — so the entry cluster is ILLEGAL here,
+            // exactly as on the `.so`/`.dll`. The generic exec-flavor
+            // gates at the bottom of validate() back these up; these
+            // carry the precise dylib-shaped message.
+            if (isDylibImage) {
+                bool sawText = false;
+                for (auto const& s : sections) {
+                    if (s.kind != SectionKind::Text) {
+                        continue;
+                    }
+                    sawText = true;
+                    // Base-0 image BY CONSTRUCTION (the ELF dyn
+                    // `virtualAddress == pageAlign` mirror): the walker
+                    // computes __TEXT.vmaddr = pageZeroSize = 0, and
+                    // textFileOff = alignUp(header+cmds, page) = one
+                    // page — so the schema VA must equal ONE
+                    // segmentPageSize (page 0 holds the mach header +
+                    // load commands; __text opens page 1; dyld slides
+                    // the whole base-0 image). The walker's
+                    // textSegmentVaMatchesFileOff chokepoint re-checks
+                    // the computed equality at emit time.
+                    if (s.virtualAddress != mi.segmentPageSize) {
+                        fail("/sections/<text>/virtualAddress",
+                             std::format(
+                                 "Mach-O MH_DYLIB: __text "
+                                 "virtualAddress 0x{:x} must equal "
+                                 "image.segmentPageSize 0x{:x} -- a "
+                                 "dylib is a base-0 image (no "
+                                 "__PAGEZERO; header page 0, __text "
+                                 "page 1) that dyld slides at load "
+                                 "(D-LK3-3).",
+                                 s.virtualAddress, mi.segmentPageSize));
+                    }
+                }
+                if (!sawText) {
+                    fail("/sections",
+                         "Mach-O MH_DYLIB format requires a Text "
+                         "section row (SectionKind::Text) -- a dynamic "
+                         "library without code has nothing to export. "
+                         "D-LK3-3.");
+                }
+                if (processExit.has_value()
+                 || !entryCallingConvention.empty()
+                 || processArgs.has_value()) {
+                    fail("/macho",
+                         std::format(
+                             "Mach-O MH_DYLIB format declares "
+                             "entry-cluster machinery -- processExit: "
+                             "{}, entryCallingConvention: {}, "
+                             "processArgs: {}. A DSS .dylib has NO "
+                             "LC_MAIN (a dylib has no process entry; "
+                             "dyld runs no entry code for it), so no "
+                             "entry trampoline is synthesized and the "
+                             "cluster is dead config that would "
+                             "silently diverge from the emitted image "
+                             "(D-LK3-3; mirrors the ELF .so + PE Dll "
+                             "rejects).",
+                             processExit.has_value() ? "present"
+                                                     : "absent",
+                             entryCallingConvention.empty() ? "absent"
+                                                            : "present",
+                             processArgs.has_value() ? "present"
+                                                     : "absent"));
+                }
+                if (!entryPoint.empty()) {
+                    fail("/entryPoint",
+                         std::format("Mach-O MH_DYLIB format must not "
+                                     "declare 'entryPoint' (got '{}') "
+                                     "-- a DSS .dylib has no process "
+                                     "entry (no LC_MAIN; D-LK3-3).",
+                                     entryPoint));
+                }
+                // The dylib arm emits its EXPORT TRIE through the
+                // legacy LC_DYLD_INFO_ONLY export_off field; the
+                // chained-fixups path would need the separate
+                // LC_DYLD_EXPORTS_TRIE load command, which is not
+                // implemented — reject the combination loud rather
+                // than emit a dylib whose exports dyld never finds
+                // (D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE).
+                if (mi.useChainedFixups) {
+                    fail("/image/useChainedFixups",
+                         "'useChainedFixups' = true is not supported "
+                         "on a Mach-O MH_DYLIB schema -- the dylib "
+                         "export trie is emitted through the legacy "
+                         "LC_DYLD_INFO_ONLY export_off field; the "
+                         "chained-fixups path would need the separate "
+                         "LC_DYLD_EXPORTS_TRIE load command "
+                         "(D-LK3-DYLIB-CHAINED-FIXUPS-EXPORT-TRIE). "
+                         "Set 'useChainedFixups' = false.");
+                }
+            }
         }
     }
 
@@ -809,23 +1196,53 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     }
 
     // Cross-format exec-flavor invariant (type-design Q5 convergence
-    // + type-design O1 post-audit fold). The predicate mirrors
-    // `ObjectFormatSchema::isImageFlavor()` exactly — the schema
-    // and its private validate() helper share one disjunction (no
-    // drift surface).
+    // + type-design O1 post-audit fold). Since c150 this predicate
+    // is DELIBERATELY NARROWER than `isImageFlavor()`: an ELF ET_DYN
+    // `.so` is an image flavor (load-time-bound) but NOT an exec
+    // flavor — it has no entry, so the entry-machinery legality
+    // gates below (processExit / entryCallingConvention /
+    // processArgs) exclude it (the dyn Text-row + VA==pageAlign rule
+    // lives in the ELF block above). c151 (D-LK1-4 PIE half): an
+    // ET_DYN schema carrying the FULL entry cluster (interpreter +
+    // processExit + entryCallingConvention + processArgs — the
+    // all-or-none rule above already rejected partial states) is a
+    // PIE EXECUTABLE and joins the exec-flavor set, making its entry
+    // machinery legal here. The cluster is re-derived from the same
+    // four fields (single source of truth with the ELF-block rule).
+    // c152 (D-LK2-4): PE Dll likewise LEAVES the exec-flavor set — a
+    // DSS `.dll` has no entry (AddressOfEntryPoint = 0, no DllMain;
+    // the PE-block Dll rules above reject its entry cluster with the
+    // precise message, and these generic gates back them up). The
+    // DllMain follow-up (D-LK2-DLL-DLLMAIN-ENTRY) would rejoin via a
+    // cluster discriminator, the c151 PIE pattern. c153 (D-LK3-3):
+    // Mach-O MH_DYLIB completes the entry-less-library trio — the
+    // `macho.filetype == Execute` arm below excludes it by
+    // construction, and the Mach-O dylib block above rejects its
+    // entry cluster with the precise message.
     //
     // A single source of truth tying the image-side triplet:
     //   format declares "executable mode" ⟺ a Text-section row
     //   declares a non-zero virtualAddress (where to load it).
     // `entryPoint` is independent (empty defaults to functions[0];
-    // non-empty resolves by name) — NOT cross-tied here. All three
-    // image arms (ELF ET_EXEC, PE PE32+ Exec/Dll, Mach-O MH_EXECUTE)
-    // inherit this gate uniformly.
+    // non-empty resolves by name) — NOT cross-tied here. All exec
+    // arms (ELF ET_EXEC + ET_DYN-PIE, PE PE32+ Exec, Mach-O
+    // MH_EXECUTE) inherit this gate uniformly; the entry-less image
+    // shapes (ELF `.so`, PE Dll) carry their own Text-row/VA rules in
+    // their format blocks above (the PE `!= Obj` virtualAddress rules
+    // cover Exec AND Dll; the Dll block adds the Text-row-required
+    // rule).
+    bool const elfDynPieShape =
+        kind == ObjectFormatKind::Elf
+     && elf.objectType == ElfObjectType::Dyn
+     && !elf.interpreter.empty()
+     && processExit.has_value()
+     && !entryCallingConvention.empty()
+     && processArgs.has_value();
     bool const isExecFlavor =
         (kind == ObjectFormatKind::Elf
-         && elf.objectType == ElfObjectType::Exec)
+         && (elf.objectType == ElfObjectType::Exec || elfDynPieShape))
      || (kind == ObjectFormatKind::Pe
-         && pe.objectType != PeObjectType::Obj)
+         && pe.objectType == PeObjectType::Exec)
      || (kind == ObjectFormatKind::MachO
          && macho.filetype == MachOObjectType::Execute);
     if (isExecFlavor) {
@@ -886,9 +1303,12 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     if (processExit.has_value() && !isExecFlavor) {
         fail("/processExit",
              "processExit is only legal on exec-flavored formats "
-             "(ELF ET_EXEC / PE PE32+ Exec/Dll / Mach-O MH_EXECUTE). "
+             "(ELF ET_EXEC / ELF ET_DYN PIE with the full entry "
+             "cluster / PE PE32+ Exec / Mach-O MH_EXECUTE). "
              "Relocatable artifacts (.o / Obj / Object) cannot have "
-             "an entry trampoline. (D-LK10-ENTRY §2.13.)");
+             "an entry trampoline, and the entry-less library shapes "
+             "(ELF ET_DYN .so, PE Dll, Mach-O MH_DYLIB) have no entry. "
+             "(D-LK10-ENTRY 2.13 / D-LK1-4 / D-LK2-4 / D-LK3-3.)");
     }
     if (!entryCallingConvention.empty() && !isExecFlavor) {
         fail("/entryCallingConvention",
@@ -913,9 +1333,12 @@ std::vector<ConfigDiagnostic> ObjectFormatData::validate() const {
     if (processArgs.has_value() && !isExecFlavor) {
         fail("/processArgs",
              "processArgs is only legal on exec-flavored formats "
-             "(ELF ET_EXEC / PE PE32+ Exec/Dll / Mach-O MH_EXECUTE). "
+             "(ELF ET_EXEC / ELF ET_DYN PIE with the full entry "
+             "cluster / PE PE32+ Exec / Mach-O MH_EXECUTE). "
              "Relocatable artifacts (.o / Obj / Object) have no entry "
-             "trampoline to materialize arguments in. "
+             "trampoline to materialize arguments in, and the "
+             "entry-less library shapes (ELF ET_DYN .so, PE Dll, "
+             "Mach-O MH_DYLIB) have no entry. "
              "(D-RUNTIME-MAIN-ARGC-ARGV.)");
     }
 

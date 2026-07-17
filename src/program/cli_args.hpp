@@ -72,6 +72,17 @@ struct DSS_EXPORT CliArgs {
     // validation happens in the directive handler where the real lexer lives.
     std::vector<std::string> defines;          // --define NAME[=VALUE]
 
+    // c162 (D-FF1-READER-CONSUMER): `--resolve-library <path>` (repeatable;
+    // the `=`-form is also accepted). Each names a real binary (a `.so` /
+    // `.dll` / `.dylib`, typically a DSS-BUILT library) whose EXPORT surface
+    // is READ (via the FF1 binary reader) to resolve this build's
+    // source-declared externs -- binding each matched extern to that library
+    // AND validating (fail loud) that the library actually exports it. A
+    // DSS-built library has no shipped JSON descriptor, so reading its real
+    // export table is the only way to link against it (a genuine,
+    // non-duplicative capability). Threaded to `CompileOptions.resolveLibraries`.
+    std::vector<std::string> resolveLibraries;  // --resolve-library <path>
+
     // ── Output routing (D-LK10-ENTRY Slice C companion) ─────────
     //
     // `--output <dir>` (or `--output=<dir>`) routes every emitted

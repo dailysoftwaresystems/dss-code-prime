@@ -25,7 +25,7 @@ namespace {
 // grows monotonically as new architectural surfaces close; each
 // addition includes a one-line rationale block alongside the
 // entry.
-constexpr std::array<DiagnosticCode, 121> kUnsuppressableCodes{{
+constexpr std::array<DiagnosticCode, 122> kUnsuppressableCodes{{
     // D_* driver / target band — pending-plan announcement,
     // permanent architectural exclusion of operand-stack / result-id
     // abiModels from the register-machine LIR pipeline, and the
@@ -53,6 +53,17 @@ constexpr std::array<DiagnosticCode, 121> kUnsuppressableCodes{{
     // pipeline. The closed-table membership pins the upstream
     // surface.
     DiagnosticCode::F_FfiNoImportLibraryForFormat,
+    // F_FfiResolveLibrarySymbolAbsent (c162, D-FF1-READER-CONSUMER):
+    // the live `ingest()` consumer matched a declared extern against
+    // the named `--resolve-library` binary's export surface and found
+    // NO row. Suppressing this would let the reference silently sail
+    // on to the format-default binding (a DANGLING import against the
+    // wrong library) or a downstream K_SymbolUndefined -- masking the
+    // real cause (the library does not export the symbol) at the wrong
+    // end of the pipeline. The whole VALUE of reading a real export
+    // table is compile-time proof the symbol exists; a suppressible
+    // validation is no validation. Membership pins the surface.
+    DiagnosticCode::F_FfiResolveLibrarySymbolAbsent,
     // F_BinaryReaderPartialCorruption (silent-failure-hunter
     // 2nd-order audit on 9dbdc8e): the Warning's stated intent is
     // "operators must see this signal". Without unsuppressable

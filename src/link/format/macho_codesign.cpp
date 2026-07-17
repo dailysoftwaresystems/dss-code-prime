@@ -25,7 +25,9 @@ constexpr std::uint32_t kCsSlotCodeDirectory      = 0u;           // BlobIndex.t
 constexpr std::uint8_t  kCsHashTypeSha256         = 2u;
 constexpr std::uint8_t  kCsHashSizeSha256         = 32u;
 constexpr std::uint8_t  kCsPlatformNotPlatform    = 0u;
-constexpr std::uint64_t kCsExecSegMainBinary      = 1u;          // execSegFlags
+// execSegFlags is caller-supplied since c153 (D-LK3-3): the header's
+// kCsExecSegFlagsMainBinary / kCsExecSegFlagsNone constants — an
+// MH_EXECUTE main binary sets MAIN_BINARY; an MH_DYLIB sets none.
 
 // CS_SuperBlob fixed header (magic + length + count) and one
 // CS_BlobIndex (type + offset). Exactly one sub-blob (the CD).
@@ -76,7 +78,8 @@ buildAdHocCodeSignature(std::span<std::uint8_t const> signedBytes,
                         std::uint32_t                 codeLimit,
                         std::uint32_t                 pageSize,
                         std::string_view              identifier,
-                        std::uint64_t                 execSegLimit) {
+                        std::uint64_t                 execSegLimit,
+                        std::uint64_t                 execSegFlags) {
     using namespace dss::link::format::detail;
 
     std::uint32_t const nCodeSlots = codeSlotCount(codeLimit, pageSize);
@@ -125,7 +128,7 @@ buildAdHocCodeSignature(std::span<std::uint8_t const> signedBytes,
     appendU64BE(out, 0u);                       // codeLimit64
     appendU64BE(out, 0u);                       // execSegBase
     appendU64BE(out, execSegLimit);             // execSegLimit
-    appendU64BE(out, kCsExecSegMainBinary);     // execSegFlags
+    appendU64BE(out, execSegFlags);             // execSegFlags
 
     // identifier C-string (NUL-terminated) at identOffset.
     out.insert(out.end(), identifier.begin(), identifier.end());

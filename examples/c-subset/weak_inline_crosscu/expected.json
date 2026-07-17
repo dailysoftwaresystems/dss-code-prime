@@ -8,7 +8,8 @@
       "spec": "x86_64:pe64-x86_64-windows-exec",
       "artifact": "cu_a.exe",
       "runOn": ["windows"]
-    }
+    },
+    { "spec": "arm64:macho64-arm64-darwin-exec", "artifact": "cu_a", "runOn": ["darwin"], "emulator": "" }
   ],
   "optimizedPipelines": [
     {"label": "inlining", "passes": ["Inlining"]}

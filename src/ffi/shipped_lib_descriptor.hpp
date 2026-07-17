@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // ── LANGUAGE-NEUTRAL shipped-library FFI descriptor reader ───────────────────
@@ -171,6 +172,23 @@ struct DSS_EXPORT ShippedSymbol {
     // call lowers to GlobalAddr) and the synth pass supplies the definition. Empty
     // (default) for every ordinary shipped extern. (D-CSUBSET-C11-THREADS-HEADER)
     std::string synthesize;
+    // c156 (D-LK-ELF-SYMBOL-VERSIONING): optional REQUIRED symbol version — the
+    // ELF version STRING (e.g. "GLIBC_2.3") this import must bind so ld.so
+    // resolves the DEFAULT version instead of misbinding an unversioned
+    // reference to a multi-versioned glibc symbol's OLDEST compat instance
+    // (glibc `realpath`: the unversioned ref lands `@GLIBC_2.2.5`, whose
+    // pre-2.3 form EINVALs a NULL resolved buffer, instead of the `@@GLIBC_2.3`
+    // default). EMPTY (default, every symbol until opted in) ⇒ UNVERSIONED,
+    // byte-identical to the pre-c156 image. The version is inherently
+    // PER-TARGET (glibc's `realpath` is `GLIBC_2.3` on x86_64 but the single
+    // baseline `GLIBC_2.17` on aarch64), so the descriptor resolves it via the
+    // SAME per-target `variants` (when:{arch?,format?}) mechanism the
+    // structs/constants/typedefs surfaces use: the reader selects the variant
+    // matching the active (arch, format) and produces THIS single string (0
+    // matches ⇒ empty ⇒ unversioned on that target — the aarch64 realpath
+    // case). A flat string is also accepted (arch-invariant). ELF-only
+    // semantics; carried but unused on PE/Mach-O.
+    std::string version;
 };
 
 // True iff `id` is a member of the CLOSED <threads.h> synth-recipe vocabulary — the 21
@@ -473,6 +491,30 @@ readShippedLibTypedefNames(std::filesystem::path const& path,
 // double-reported here). The preprocessor `__has_include` + macro-splice gate.
 [[nodiscard]] DSS_EXPORT bool shippedHeaderAvailableForFormat(
     std::filesystem::path const& descriptorPath, ObjectFormatKind fmt);
+
+// c162 fold (D-FF1-READER-CONSUMER): the UNION of every extern symbol NAME
+// declared by any shipped-library descriptor under `src/dss-config/shippedLibs`
+// (the `symbols[].name` set, FORMAT-AGNOSTIC -- a symbol known on ANY format
+// counts). This is the "is X a known system symbol" oracle the `--resolve-library`
+// consumer uses to distinguish a bare `extern puts;` (a real libc symbol the
+// user did not #include -- resolve it against the format-default library, NOT
+// fail loud) from a genuine typo (`dss_lib_answr` -- in neither the named
+// binary nor any descriptor -> fail loud). Returns std::nullopt iff the
+// shippedLibs directory cannot be located (DSS_CONFIG_ROOT unset + no ancestor
+// hit) -- the caller then treats every symbol as "possibly known" and falls
+// through to the format-default (SAFE: never a false-positive fail-loud on a
+// legitimate program just because config discovery failed).
+//
+// Names only (no signature decode / interner needed) -- a lightweight scan
+// distinct from the full `readShippedLibDescriptor`. Lenient per-file: an
+// unreadable / malformed descriptor is SKIPPED (its symbols are absent from the
+// set, so they would fail loud under --resolve-library -- an acceptable, LOUD,
+// user-fixable outcome; the descriptor's malformedness is caught for real by
+// the semantic-injection reader on #include + the AllShippedDescriptorsDecode
+// test). Not cached -- runs only on the --resolve-library path when a governed
+// extern is unmatched by the named binaries (the uncommon case).
+[[nodiscard]] DSS_EXPORT std::optional<std::unordered_set<std::string>>
+collectShippedExternSymbolNames();
 
 } // namespace ffi
 } // namespace dss

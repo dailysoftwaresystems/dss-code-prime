@@ -2,6 +2,7 @@
 
 #include "core/cpp_invariants.hpp"  // arithmetic-right-shift assert
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/symbol_attrs.hpp"  // isExternallyVisible (ET_DYN exports)
 #include "link/format/byte_emit.hpp"
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
@@ -60,6 +61,7 @@ constexpr std::uint32_t EV_CURRENT = 1;
 // Elf64_Sym st_info encoding (gABI 4.18).
 constexpr std::uint8_t STB_LOCAL  = 0;
 constexpr std::uint8_t STB_GLOBAL = 1;
+constexpr std::uint8_t STB_WEAK   = 2;  // ET_DYN weak exports (c150)
 constexpr std::uint8_t STT_NOTYPE = 0;
 constexpr std::uint8_t STT_OBJECT = 1;  // data object (copy-reloc dynsym)
 constexpr std::uint8_t STT_FUNC   = 2;
@@ -124,8 +126,62 @@ constexpr std::uint64_t DT_RELASZ  = 8;
 constexpr std::uint64_t DT_RELAENT = 9;
 constexpr std::uint64_t DT_STRSZ   = 10;
 constexpr std::uint64_t DT_SYMENT  = 11;
+// DT_SONAME (gABI 5.10) — the shared library's logical name; the
+// d_val is a `.dynstr` offset. Emitted on the ET_DYN arm ONLY when
+// the schema declares `elf.soname` (c150, D-LK1-4).
+constexpr std::uint64_t DT_SONAME  = 14;
 constexpr std::uint64_t DT_FLAGS_1 = 0x6ffffffb;
 constexpr std::uint64_t DF_1_NOW   = 1;
+// DF_1_PIE (glibc elf.h / binutils) — marks an ET_DYN as a
+// position-independent EXECUTABLE, not a shared library. Emitted on
+// the PIE sub-mode only (c151, D-LK1-4 PIE half); ground truth: gcc
+// 13.3 default-PIE output carries DT_FLAGS_1 = 0x8000001 (`readelf
+// -d` shows "Flags: NOW PIE" on tag 0x6ffffffb). Modern kernels/
+// tools (execveat protections, readelf's "DYN (Position-Independent
+// Executable file)" label) read this bit to distinguish a PIE from
+// a `.so`.
+constexpr std::uint64_t DF_1_PIE   = 0x08000000;
+
+// ── Symbol versioning (gABI + Sun/GNU version extension) — the
+// D-LK-ELF-SYMBOL-VERSIONING import-requirement trio (c156). Emitted
+// ONLY when an import declares a REQUIRED version string (opt-in): a
+// DSS dynamic image importing a MULTI-versioned glibc symbol without
+// this machinery misbinds an UNVERSIONED reference to the library's
+// OLDEST compat instance (glibc `realpath` bound `@GLIBC_2.2.5`, whose
+// pre-2.3 form EINVALs a NULL resolved buffer, instead of the
+// `@@GLIBC_2.3` default). The image emits the standard toolchain
+// requirement so ld.so binds the DECLARED version — gcc parity.
+//
+//   SHT_GNU_versym  (`.gnu.version`)   — one u16 per `.dynsym` entry.
+//   SHT_GNU_verneed (`.gnu.version_r`) — VERNEED(lib) + VERNAUX(version)*.
+//   DT_VERSYM / DT_VERNEED / DT_VERNEEDNUM — the `.dynamic` pointers.
+constexpr std::uint32_t SHT_GNU_versym  = 0x6fffffff;
+constexpr std::uint32_t SHT_GNU_verneed = 0x6ffffffe;
+constexpr std::uint64_t DT_VERSYM     = 0x6ffffff0;
+constexpr std::uint64_t DT_VERNEED    = 0x6ffffffe;
+constexpr std::uint64_t DT_VERNEEDNUM = 0x6fffffff;
+// `.gnu.version` reserved indices (gABI): 0 = a LOCAL symbol (no
+// version), 1 = GLOBAL/unversioned (binds the library's default).
+// A declared requirement gets an index >= 2 (its VERNAUX vna_other).
+constexpr std::uint16_t VER_NDX_LOCAL  = 0;
+constexpr std::uint16_t VER_NDX_GLOBAL = 1;
+constexpr std::uint16_t VER_NEED_CURRENT = 1;  // Elf64_Verneed.vn_version
+constexpr std::uint16_t kFirstVersionIndex = 2; // first assignable vna_other
+
+// The classic SysV/ELF hash (gABI Fig. 5-13) — the SAME algorithm the
+// `.hash` table uses, applied here to a VERSION STRING to fill an
+// Elf64_Vernaux.vna_hash (ld.so matches a needed version to a library's
+// verdef by hash + name). e.g. elf_hash("GLIBC_2.3") == 0x0d696913.
+[[nodiscard]] constexpr std::uint32_t elf_hash(std::string_view name) noexcept {
+    std::uint32_t h = 0;
+    for (char const cc : name) {
+        h = (h << 4) + static_cast<std::uint8_t>(cc);
+        std::uint32_t const g = h & 0xf0000000u;
+        if (g != 0) h ^= g >> 24;
+        h &= ~g;
+    }
+    return h;
+}
 
 // Per-machine ELF reloc type for "write resolved symbol VA into GOT
 // slot at load time" (dyld semantics).
@@ -189,6 +245,26 @@ copyRelocTypeFor(std::uint16_t machine) noexcept {
     switch (machine) {
         case kEmX86_64:  return R_X86_64_COPY;
         case kEmAArch64: return R_AARCH64_COPY;
+    }
+    return 0u;
+}
+
+// Per-machine RELATIVE relocation type (c150, D-LK1-4 — the ET_DYN
+// base-relative fixup): "write load_base + r_addend into the 64-bit
+// slot at r_offset". No symbol lookup — ld.so adds the module's own
+// load bias. Every internal absolute pointer slot in a slid image
+// (a fn-ptr table entry, a `&global` initializer, a jump-table row)
+// carries one of these instead of the exec arm's link-time in-place
+// final VA.
+// x86_64 psABI §4.4.1 — R_X86_64_RELATIVE = 8.
+// AArch64 ELF psABI §4.6.3 — R_AARCH64_RELATIVE = 1027 (0x403).
+constexpr std::uint32_t R_X86_64_RELATIVE  = 8;
+constexpr std::uint32_t R_AARCH64_RELATIVE = 1027;
+[[nodiscard]] constexpr std::uint32_t
+relativeRelocTypeFor(std::uint16_t machine) noexcept {
+    switch (machine) {
+        case kEmX86_64:  return R_X86_64_RELATIVE;
+        case kEmAArch64: return R_AARCH64_RELATIVE;
     }
     return 0u;
 }
@@ -458,22 +534,92 @@ encodeElfExecDynamic(
     DiagnosticReporter&            reporter) {
     auto const& elfId = fmt.elf();
     std::uint64_t const pageAlign = elfId.pageAlign;
+    // c150 (D-LK1-4): the ET_DYN shared-library arm rides THIS same
+    // dynamic-image substrate. Divergences from ET_EXEC, each gated
+    // on `isDyn` so the exec image stays byte-identical:
+    //   (a) e_type = ET_DYN, e_entry = 0 (no entry resolution);
+    //   (b) no PT_PHDR / PT_INTERP / `.interp` (loaded by an
+    //       already-running ld.so, never execve'd);
+    //   (c) base-0 VAs (validate() pins text VA == pageAlign, so
+    //       baseImageVa computes to 0; the loader slides);
+    //   (d) EXPORTS — every externally-visible defined function +
+    //       data global gets a real-named `.dynsym` entry findable
+    //       through `.hash`;
+    //   (e) internal absolute data slots emit R_*_RELATIVE entries
+    //       (base-relative addend) instead of link-final in-place
+    //       VAs;
+    //   (f) extern DATA imports bind got-indirect (a GOT slot +
+    //       GLOB_DAT; copy-relocation is exec-only);
+    //   (g) zero externs is LEGAL (a self-contained `.so` still
+    //       needs `.dynamic`/`.dynsym`/`.hash` for its exports) and
+    //       an extern with an EMPTY libraryPath is LEGAL (undefined,
+    //       resolved from ld.so's global scope — no DT_NEEDED row).
+    //
+    // c151 (D-LK1-4 PIE half): ET_DYN splits into TWO sub-shapes,
+    // discriminated by the schema's ENTRY CLUSTER (interpreter +
+    // processExit + entryCallingConvention + processArgs — validate()
+    // pins all-or-none, so `processExit` presence is a faithful
+    // single-member witness):
+    //   * `.so` (no cluster): everything above, unchanged.
+    //   * PIE  (full cluster): a directly-execve'd EXECUTABLE at a
+    //     randomized base — the gcc-default shape. Divergences (b)
+    //     and the e_entry half of (a) REVERT to the exec shapes, at
+    //     BASE-RELATIVE VAs: PT_PHDR + PT_INTERP + `.interp` come
+    //     back, e_entry = the trampoline's base-relative VA (ld.so
+    //     jumps to base + e_entry), and DT_FLAGS_1 gains DF_1_PIE
+    //     alongside DF_1_NOW. e_type STAYS ET_DYN (a PIE is not a
+    //     new object type); (c)-(g) stay the dyn shapes — RELATIVE
+    //     rows, symbol-based extern-address rows, got-indirect data
+    //     imports, exports (the -rdynamic-like stance; harmless in
+    //     an executable and keeps the arm uniform with the `.so`).
+    //     `isExecveImage` below names the union "exec OR PIE" for
+    //     the entry/interp machinery gates.
+    bool const isDyn = elfId.objectType == ElfObjectType::Dyn;
+    bool const isPie = isDyn && fmt.processExit().has_value();
+    // Belt for hand-built ObjectFormatData that bypassed validate():
+    // the walker consumes `elf.interpreter` (PT_INTERP) and the
+    // trampoline machinery keyed on `processExit` in lock-step — a
+    // half-cluster here would emit a broken image (see validate()'s
+    // ET_DYN cluster rule), so re-check the two members this walker
+    // actually reads.
+    if (isDyn && (isPie != !elfId.interpreter.empty())) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::string{"elf::encodeElfExecDynamic (ET_DYN): schema '"}
+                 + std::string{fmt.name()}
+                 + "' declares a PARTIAL PIE entry cluster ("
+                 + (isPie ? "processExit present but elf.interpreter "
+                            "empty -- no loader would resolve the "
+                            "trampoline's libc exit import"
+                          : "elf.interpreter present but no "
+                            "processExit -- no trampoline; e_entry "
+                            "would be 0 and the kernel would execute "
+                            "header bytes")
+                 + "). An ET_DYN schema is a .so (neither) or a PIE "
+                   "(both + entryCallingConvention + processArgs); "
+                   "validate() enforces this all-or-none -- this "
+                   "module bypassed it (D-LK1-4).");
+        return {};
+    }
+    bool const isExecveImage = !isDyn || isPie;
 
     // Pre-conditions (caller dispatches on these; re-checked here so
     // the helper is callable from future entry paths too —
     // silent-failure H2 + C1 convergence).
-    if (module.externImports.empty()) {
+    if (!isDyn && module.externImports.empty()) {
         emit(reporter, DiagnosticCode::K_SymbolUndefined,
              "elf::encodeElfExecDynamic: called with zero "
-             "externImports — dynamic-image emission requires at "
-             "least one extern; static images route through the "
-             "non-dynamic ET_EXEC arm.");
+             "externImports -- ET_EXEC dynamic-image emission requires "
+             "at least one extern; static executables route through "
+             "the non-dynamic ET_EXEC arm. (ET_DYN accepts zero -- a "
+             "self-contained .so still carries export metadata.)");
         return {};
     }
     if (module.functions.empty()) {
         emit(reporter, DiagnosticCode::K_SymbolUndefined,
-             "elf::encodeElfExecDynamic: zero functions — ET_EXEC "
-             "needs at least one entry function.");
+             "elf::encodeElfExecDynamic: zero functions -- an ET_EXEC "
+             "image needs at least one entry function, and a "
+             "function-less (data-only) ET_DYN library has no "
+             "shipped producer (D-LK1-4).");
         return {};
     }
     if (!elfId.bindNow) {
@@ -556,6 +702,35 @@ encodeElfExecDynamic(
         "elf::encodeElfExecDynamic", reporter, /*allowItemRelocations=*/true);
     if (!rodataDynLayoutOpt.has_value()) return {};
     auto& rodataDynLayout = *rodataDynLayoutOpt;
+    // D-LK-DYN-RODATA-ITEM-RELOC (c150; producer closed c154): in the
+    // ET_DYN image, `.rodata` lives in the READ-ONLY PT_LOAD #1 — a
+    // reloc-bearing rodata item would need a load-time R_*_RELATIVE
+    // write into a non-writable page (DT_TEXTREL territory, rejected
+    // by hardened loaders). NO shipped producer emits rodata+relocs:
+    // the asm tier routes every reloc-bearing CONST global to `relro`
+    // (c145) and the LK11 cross-CU merge mints its indirect-slot
+    // thunk slots as `relro` too (c154, the same chokepoint) — both
+    // merge into the WRITABLE `.data` here. This belt stays for a
+    // hand-built module / future producer regression: fail loud
+    // rather than emit a TEXTREL image.
+    if (isDyn) {
+        for (std::size_t j = 0; j < rodataDynLayout.itemIndices.size(); ++j) {
+            auto const& di = module.dataItems[rodataDynLayout.itemIndices[j]];
+            if (di.relocations.empty()) continue;
+            emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                 std::format("elf::encodeElfExecDynamic (ET_DYN): rodata "
+                             "data item #{} (SymbolId={{ {} }}) carries {} "
+                             "relocation(s) -- a slid shared library cannot "
+                             "patch read-only pages at load (DT_TEXTREL). "
+                             "Reloc-bearing const data belongs in `relro` "
+                             "(c145); the cross-CU thunk-slot placement is "
+                             "the open producer "
+                             "(D-LK-DYN-RODATA-ITEM-RELOC).",
+                             rodataDynLayout.itemIndices[j], di.symbol.v,
+                             di.relocations.size()));
+            return {};
+        }
+    }
     auto dataDynLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Data, dataDynAlignFloor,
         "elf::encodeElfExecDynamic", reporter, /*allowItemRelocations=*/true);
@@ -626,6 +801,28 @@ encodeElfExecDynamic(
     // image stays BYTE-IDENTICAL to the pre-TLS walker (the sqlite-dormant
     // guarantee — pinned by NoTlsModuleByteIdenticalToPreTlsShape).
     bool const hasTls = hasTdataDyn || hasTbssDyn;
+    // D-LK-DYN-TLS-MODEL (c150): thread-locals in a SHARED LIBRARY need
+    // the general-/local-dynamic (or initial-exec) TLS model — the
+    // library's block gets a LOADER-assigned module offset, so the
+    // link-time local-exec tpoffs this walker computes (valid only for
+    // the executable's own PT_TLS block) would silently address another
+    // module's slots. The shipped dyn schema advertises no tdata/tbss
+    // (the linker's acceptsDataSection gate + the MIR->LIR tlsAccess
+    // gate fire first on the real pipeline); this is the walker belt
+    // for a hand-built module / a prematurely-opted-in schema.
+    if (isDyn && hasTls) {
+        emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+             "elf::encodeElfExecDynamic (ET_DYN): module carries "
+             "thread-local data items but a shared library's TLS block "
+             "has a loader-assigned module offset -- the local-exec "
+             "link-time tpoffs this walker computes are exec-only. "
+             "General-dynamic/initial-exec TLS for .so output is not "
+             "implemented (D-LK-DYN-TLS-MODEL). (A PIE, though it IS "
+             "the executable and local-exec would be model-correct for "
+             "its own thread-locals, ships without TLS rows until the "
+             "PT_TLS-under-slide layout is witnessed -- same anchor.)");
+        return {};
+    }
     // Each present section's schema row is MANDATORY (the format JSON must
     // declare it — fail loud rather than emit an unnamed section header).
     if (hasRodataDyn && secRodataDyn == nullptr) {
@@ -697,10 +894,18 @@ encodeElfExecDynamic(
     // maps, the language's `externLibraryByFormat` default, the
     // format's `processExit.importLibraryPath`) — the engine never
     // invents one.
+    // c150 (D-LK1-4): an extern with an EMPTY libraryPath contributes
+    // no DT_NEEDED row. On the ET_DYN arm such rows are LEGAL — the
+    // c143 undefined-extern gate KEEPS a referenced no-library extern
+    // for a `.so` (ld.so resolves it from the global scope: the
+    // executable or a sibling library defines it); it still gets its
+    // UNDEF `.dynsym` entry + PLT/GOT machinery below. On the exec
+    // arm the linker gate rejected such rows before dispatch, so the
+    // skip is a no-op there.
     std::vector<std::string> libraryOrder;
     libraryOrder.reserve(module.externImports.size());
     for (auto const& ext : module.externImports) {
-        libraryOrder.push_back(ext.libraryPath);
+        if (!ext.libraryPath.empty()) libraryOrder.push_back(ext.libraryPath);
     }
     std::sort(libraryOrder.begin(), libraryOrder.end());
     libraryOrder.erase(
@@ -708,15 +913,22 @@ encodeElfExecDynamic(
         libraryOrder.end());
     std::size_t const numExterns = module.externImports.size();
     std::size_t const numLibs = libraryOrder.size();
-    // Defense-in-depth: the linker validates per-extern non-empty
-    // `libraryPath` before dispatch (LK6 cycle 2a substrate), so
-    // `numLibs == 0` cannot occur via the linker entry path. This
-    // guard makes that invariant explicit in case a future caller
-    // bypasses the linker (e.g. a writer-only test harness) — a
-    // dynamic image with zero DT_NEEDED entries fails at runtime
-    // (dyld has no library to resolve externs from), so failing
-    // loud here keeps the contract symmetric across entry paths.
-    if (numLibs == 0) {
+    // Defense-in-depth (exec + PIE arms): the linker validates
+    // per-extern non-empty `libraryPath` before dispatch (LK6 cycle
+    // 2a substrate + the c143 image reject — which the c151 PIE
+    // inherits via `allowsUndefinedImports() == false`), so
+    // `numLibs == 0` with externs present cannot occur via the
+    // linker entry path. This guard makes that invariant explicit in
+    // case a future caller bypasses the linker (e.g. a writer-only
+    // test harness) — an executable with zero DT_NEEDED entries
+    // fails at runtime (the loader has no library to resolve externs
+    // from). Only the `.so` sub-shape is exempt: its externs may all
+    // be global-scope-resolved (no DT_NEEDED rows — ld.so binds them
+    // from the executable / sibling libraries at load). The
+    // `numExterns > 0` guard is load-bearing for the PIE only (the
+    // exec arm's zero-extern precondition already returned above);
+    // a hand-built zero-extern PIE is as legal as a zero-extern .so.
+    if ((isPie || !isDyn) && numExterns > 0 && numLibs == 0) {
         emit(reporter, DiagnosticCode::K_SymbolUndefined,
              "elf::encodeElfExecDynamic: " +
              std::to_string(numExterns) +
@@ -748,37 +960,53 @@ encodeElfExecDynamic(
                             ? numDataExterns++
                             : numFuncExterns++;
     }
-    bool const hasCopySlots = numDataExterns > 0;
-    if (hasCopySlots) {
+    // c150 (D-LK1-4): the data-import binding is FLAVOR-keyed.
+    //   * ET_EXEC → copy-relocation (c84): a `.bss` copy slot + one
+    //     R_*_COPY; the exec owns the canonical copy.
+    //   * ET_DYN → got-indirect (the c117/c149 model): a GOT slot +
+    //     one R_*_GLOB_DAT; ld.so writes the object's address into
+    //     the slot and the GotIndirect lowering derefs it. A copy
+    //     relocation inside a `.so` is INVALID ELF (copy relocs are
+    //     the executable's mechanism; validate() rejects the config).
+    bool const hasCopySlots    = !isDyn && numDataExterns > 0;
+    bool const hasGotDataSlots =  isDyn && numDataExterns > 0;
+    if (numDataExterns > 0) {
         // The linker's pre-walker gate admits data imports only when
-        // the schema DECLARES a binding model; this walker implements
-        // exactly `copy-relocation`. A future second member reaching
-        // here without a walker arm must fail loud, not silently get
-        // a copy slot it did not declare.
+        // the schema DECLARES a binding model; each flavor arm here
+        // implements exactly one. A mismatched declaration must fail
+        // loud, not silently get a slot kind it did not declare.
         auto const binding = fmt.dataImportBinding();
-        if (!binding.has_value()
-            || *binding != DataImportBinding::CopyRelocation) {
+        DataImportBinding const required = isDyn
+            ? DataImportBinding::GotIndirect
+            : DataImportBinding::CopyRelocation;
+        if (!binding.has_value() || *binding != required) {
             emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
                  std::string{"elf::encodeElfExecDynamic: module carries "}
                      + std::to_string(numDataExterns)
                      + " extern DATA import(s) but format '"
                      + std::string{fmt.name()}
-                     + "' does not declare 'dataImportBinding': "
-                       "\"copy-relocation\" — the only data-import "
-                       "mechanism this walker implements "
-                       "(D-LK-EXTERN-DATA-IMPORT).");
+                     + "' does not declare 'dataImportBinding': \""
+                     + std::string{dataImportBindingName(required)}
+                     + "\" -- the data-import mechanism the "
+                     + (isDyn ? "ET_DYN" : "ET_EXEC")
+                     + " arm implements (D-LK-EXTERN-DATA-IMPORT / "
+                       "D-LK1-4).");
             return {};
         }
     }
-    // Validate each data import's shape: the copy slot needs a real
-    // size (an INCOMPLETE declared type — `extern const char v[];` —
-    // carries 0/0: legal ONLY when a sibling CU defines it, in which
-    // case the LK11 merge strips the row before this walker runs; one
-    // SURVIVING here means a true library import of an unsizeable
-    // object — fail loud, an unsized copy slot cannot be reserved)
-    // and a power-of-two alignment (layout-derived upstream; re-check
-    // so a hand-built module cannot corrupt the slot packing).
-    for (std::size_t i = 0; i < numExterns; ++i) {
+    // Validate each data import's shape — EXEC (copy-slot) arm only:
+    // the copy slot needs a real size (an INCOMPLETE declared type —
+    // `extern const char v[];` — carries 0/0: legal ONLY when a
+    // sibling CU defines it, in which case the LK11 merge strips the
+    // row before this walker runs; one SURVIVING here means a true
+    // library import of an unsizeable object — fail loud, an unsized
+    // copy slot cannot be reserved) and a power-of-two alignment
+    // (layout-derived upstream; re-check so a hand-built module
+    // cannot corrupt the slot packing). The ET_DYN got-indirect slot
+    // is a pointer — the object's size is irrelevant (an incomplete
+    // `extern char v[];` binds fine through the GOT), so the check
+    // is skipped there.
+    for (std::size_t i = 0; hasCopySlots && i < numExterns; ++i) {
         auto const& ext = module.externImports[i];
         if (!ext.isData) continue;
         if (ext.dataSizeBytes == 0 || ext.dataAlignBytes == 0) {
@@ -808,11 +1036,203 @@ encodeElfExecDynamic(
         }
     }
 
-    // ── (c) .interp body (NUL-terminated dynamic-linker path)
+    // c84: `.bss` exists for module zero-init globals AND/OR extern-
+    // data copy slots (exec arm; the dyn arm's data externs live in
+    // the GOT, so only module globals count there).
+    bool const hasBssSection = hasBssDyn || hasCopySlots;
+
+    // ── (b.6) Symbol-version REQUIREMENTS (D-LK-ELF-SYMBOL-VERSIONING) ──
+    // An import whose `ExternImport.version` is non-empty (config-driven,
+    // opt-in, already resolved for THIS target upstream) must bind that
+    // exact glibc version via `.gnu.version_r`, or an unversioned reference
+    // misbinds to the library's OLDEST compat instance. Each DISTINCT
+    // (library, version) pair becomes one VERNAUX under its library's
+    // VERNEED and is assigned a version index (>= 2) stamped into every
+    // referring import's `.gnu.version` slot. `importVersionIdx[i]` == 0
+    // means import i is UNVERSIONED (its slot stays VER_NDX_GLOBAL). The
+    // whole trio is emitted ONLY when at least one import is versioned
+    // (`emitVersioning`) — a versionless module is byte-identical to the
+    // pre-c156 image. The version STRING never drives a branch here; the
+    // writer groups + hashes it exactly as it groups `libraryPath` into
+    // DT_NEEDED — no arch/format/symbol-name identity in the substrate.
+    struct VersionReq {
+        std::size_t   libIndex;   // index into `libraryOrder` (the DT_NEEDED lib)
+        std::string   version;    // the ELF version string, e.g. "GLIBC_2.3"
+        std::uint16_t vnaOther;   // the assigned version index (>= 2)
+    };
+    std::vector<VersionReq> versionReqs;
+    std::vector<std::uint16_t> importVersionIdx(numExterns, 0);
+    for (std::size_t i = 0; i < numExterns; ++i) {
+        auto const& ver = module.externImports[i].version;
+        if (ver.empty()) continue;   // unversioned import -- the common case
+        auto const& lib = module.externImports[i].libraryPath;
+        auto const libIt = std::find(libraryOrder.begin(), libraryOrder.end(), lib);
+        if (lib.empty() || libIt == libraryOrder.end()) {
+            // Fail loud on the inconsistency the directive names: a version
+            // string that references a library with no DT_NEEDED entry. A
+            // versioned symbol MUST originate from a concrete needed library
+            // (a no-library / bare-proto extern can never carry a version).
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"elf::encodeElfExecDynamic: import '"}
+                     + module.externImports[i].mangledName
+                     + "' declares required symbol version '" + ver
+                     + "' but its owning library '" + lib
+                     + "' has no DT_NEEDED entry -- a versioned import must "
+                       "bind a concrete needed library (D-LK-ELF-SYMBOL-"
+                       "VERSIONING).");
+            return {};
+        }
+        std::size_t const libIndex =
+            static_cast<std::size_t>(libIt - libraryOrder.begin());
+        std::uint16_t idx = 0;
+        for (auto const& r : versionReqs) {
+            if (r.libIndex == libIndex && r.version == ver) { idx = r.vnaOther; break; }
+        }
+        if (idx == 0) {
+            idx = static_cast<std::uint16_t>(kFirstVersionIndex + versionReqs.size());
+            versionReqs.push_back(VersionReq{libIndex, ver, idx});
+        }
+        importVersionIdx[i] = idx;
+    }
+    bool const emitVersioning = !versionReqs.empty();
+
+    // ── Section indices (hoisted above the dynsym build — c84/c150) ──
+    // Computed INCREMENTALLY from the emit order below so adding/
+    // removing an optional section ([.interp]/[.rodata]/[.data]/
+    // [.bss]) keeps every cross-reference (.link/.info/e_shstrndx)
+    // coherent with the actual header table. Hoisted ABOVE the
+    // symbol-table builds because (1) the dynsym data-extern patch
+    // needs IDX_BSS, (2) the `.symtab` STT_SECTION + function entries
+    // need IDX_TEXT (c150 — no longer a hardcoded 2: the dyn image
+    // has no `.interp`, shifting `.text` to index 1), and (3) the
+    // ET_DYN export patch needs IDX_TEXT/IDX_RODATA/IDX_DATA/IDX_BSS.
+    // Emit order:
+    //   0 NULL, [.interp — exec only], .text, [.rodata], .plt,
+    //   .dynsym, .dynstr, .hash, .rela.dyn, [.tdata], [.tbss],
+    //   [.data], .got, .dynamic, [.bss], .symtab, .strtab, .shstrtab
+    // (D-CSUBSET-THREAD-LOCAL: `.tdata` right before `.data` matches the
+    // file layout — its bytes physically open PT_LOAD #2; `.tbss` (NOBITS,
+    // no file bytes) sits beside its template, the gcc pairing.)
+    std::uint16_t idxCursor = 0;
+    auto nextIdx = [&]() { return idxCursor++; };
+    std::uint16_t const IDX_NULL   = nextIdx();  (void)IDX_NULL;
+    // `.interp` row exists on every execve'd image (exec AND the
+    // c151 PIE sub-mode); only the `.so` skips it.
+    std::uint16_t const IDX_INTERP =
+        isExecveImage ? nextIdx() : std::uint16_t{0};
+    (void)IDX_INTERP;
+    std::uint16_t const IDX_TEXT   = nextIdx();  (void)IDX_TEXT;
+    std::uint16_t const IDX_RODATA = hasRodataDyn ? nextIdx() : std::uint16_t{0};
+    (void)IDX_RODATA;
+    std::uint16_t const IDX_PLT    = nextIdx();  (void)IDX_PLT;
+    std::uint16_t const IDX_DYNSYM = nextIdx();
+    std::uint16_t const IDX_DYNSTR = nextIdx();
+    std::uint16_t const IDX_HASH   = nextIdx();  (void)IDX_HASH;
+    // `.gnu.version` + `.gnu.version_r` (D-LK-ELF-SYMBOL-VERSIONING) sit
+    // between `.hash` and `.rela.dyn` (gcc's section order) — present ONLY
+    // when the image has a versioned import, so a versionless image keeps
+    // every downstream index unshifted (byte-identical to pre-c156).
+    std::uint16_t const IDX_GNU_VERSION =
+        emitVersioning ? nextIdx() : std::uint16_t{0};
+    (void)IDX_GNU_VERSION;
+    std::uint16_t const IDX_GNU_VERSION_R =
+        emitVersioning ? nextIdx() : std::uint16_t{0};
+    (void)IDX_GNU_VERSION_R;
+    std::uint16_t const IDX_RELADYN = nextIdx(); (void)IDX_RELADYN;
+    std::uint16_t const IDX_TDATA  = hasTdataDyn ? nextIdx() : std::uint16_t{0};
+    (void)IDX_TDATA;
+    std::uint16_t const IDX_TBSS   = hasTbssDyn ? nextIdx() : std::uint16_t{0};
+    (void)IDX_TBSS;
+    std::uint16_t const IDX_DATA   = hasDataDyn ? nextIdx() : std::uint16_t{0};
+    (void)IDX_DATA;
+    std::uint16_t const IDX_GOT    = nextIdx();  (void)IDX_GOT;
+    std::uint16_t const IDX_DYNAMIC = nextIdx(); (void)IDX_DYNAMIC;
+    std::uint16_t const IDX_BSS    = hasBssSection ? nextIdx() : std::uint16_t{0};
+    (void)IDX_BSS;
+    std::uint16_t const IDX_SYMTAB = nextIdx();  (void)IDX_SYMTAB;
+    std::uint16_t const IDX_STRTAB = nextIdx();
+    std::uint16_t const IDX_SHSTRTAB = nextIdx();
+    std::uint16_t const kNumSections = idxCursor;
+
+    // ── (b.7) ET_DYN export set (c150, D-LK1-4) ─────────────────
+    // Every externally-visible DEFINED symbol — function or data
+    // global — gets a real-named `.dynsym` entry so a foreign
+    // consumer (`gcc main.c -L. -lfoo`, then ld.so at load) can bind
+    // it. The set comes from `module.symbols` (the same real-name
+    // rows the ET_REL `.symtab` uses, c139): Local/Hidden/Internal
+    // symbols stay out (a `static` function is not part of the
+    // library's ABI); Weak exports keep STB_WEAK. Classification is
+    // by definition table: a row naming a function exports STT_FUNC
+    // with the function's byte size; a row naming a data item
+    // exports STT_OBJECT with its section size. st_value/st_shndx
+    // are patched after layout (the same two-phase shape as the c84
+    // data-extern patch). The exec arm exports nothing — its dynsym
+    // stays imports-only, byte-identical to the pre-c150 image.
+    struct DynExportRec {
+        SymbolId      sym{};
+        std::string   name;          // real (already-mangled) source name
+        std::uint8_t  info = 0;      // st_info (bind<<4 | type)
+        std::uint64_t size = 0;      // st_size
+        std::uint32_t nameOff = 0;   // .dynstr offset (filled at (d))
+        std::uint32_t dynsymIdx = 0; // entry index (filled at (e))
+    };
+    std::vector<DynExportRec> dynExports;
+    if (isDyn) {
+        std::unordered_map<std::uint32_t, std::size_t> funcIdxBySym;
+        funcIdxBySym.reserve(module.functions.size());
+        for (std::size_t i = 0; i < module.functions.size(); ++i) {
+            funcIdxBySym.emplace(module.functions[i].symbol.v, i);
+        }
+        std::unordered_map<std::uint32_t, std::uint64_t> dataSizeBySym;
+        dataSizeBySym.reserve(module.dataItems.size());
+        for (auto const& di : module.dataItems) {
+            if (di.symbol == SymbolId{}) continue;  // anonymous — never exported
+            dataSizeBySym.emplace(di.symbol.v, di.sizeInSection());
+        }
+        for (auto const& ms : module.symbols) {
+            if (ms.name.empty()) continue;
+            if (!isExternallyVisible(ms.binding, ms.visibility)) continue;
+            std::uint8_t const bind =
+                ms.binding == SymbolBinding::Weak ? STB_WEAK : STB_GLOBAL;
+            if (auto const fit = funcIdxBySym.find(ms.symbol.v);
+                fit != funcIdxBySym.end()) {
+                dynExports.push_back(DynExportRec{
+                    ms.symbol, ms.name, makeStInfo(bind, STT_FUNC),
+                    module.functions[fit->second].bytes.size(), 0, 0});
+            } else if (auto const dit = dataSizeBySym.find(ms.symbol.v);
+                       dit != dataSizeBySym.end()) {
+                dynExports.push_back(DynExportRec{
+                    ms.symbol, ms.name, makeStInfo(bind, STT_OBJECT),
+                    dit->second, 0, 0});
+            } else {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::string{"elf::encodeElfExecDynamic (ET_DYN): "
+                                 "ModuleSymbol '"} + ms.name
+                         + "' (SymbolId #"
+                         + std::to_string(ms.symbol.v)
+                         + ") names neither a defined function nor a "
+                           "data item -- the export table cannot place "
+                           "it (producer contract: one ModuleSymbol row "
+                           "per DEFINED function/global).");
+                return {};
+            }
+        }
+    }
+
+    // ── (c) .interp body (NUL-terminated dynamic-linker path) ──
+    // Emitted on every execve'd image: ET_EXEC and the c151 PIE
+    // sub-mode (the kernel maps the named loader, which relocates
+    // the PIE at a randomized base). The `.so` emits none (mapped by
+    // an already-running ld.so; validate() guarantees
+    // `elf.interpreter` is empty for the entry-cluster-less dyn
+    // shape) — its vector stays EMPTY so the interp body/phdr/
+    // section emissions below all no-op there.
     std::vector<std::uint8_t> interp;
-    for (char c : elfId.interpreter)
-        interp.push_back(static_cast<std::uint8_t>(c));
-    interp.push_back(0);
+    if (isExecveImage) {
+        for (char c : elfId.interpreter)
+            interp.push_back(static_cast<std::uint8_t>(c));
+        interp.push_back(0);
+    }
 
     // ── (d) .dynstr body (NUL + extern names + library paths)
     std::vector<std::uint8_t> dynstr;
@@ -828,6 +1248,37 @@ encodeElfExecDynamic(
     for (std::size_t i = 0; i < numLibs; ++i) {
         libNameOff[i] = static_cast<std::uint32_t>(dynstr.size());
         for (char c : libraryOrder[i])
+            dynstr.push_back(static_cast<std::uint8_t>(c));
+        dynstr.push_back(0);
+    }
+    // ET_DYN (c150): export names + the optional DT_SONAME string.
+    // Both are dyn-only additions — the exec dynstr stays
+    // byte-identical (dynExports is empty and soname is
+    // validate-rejected on non-dyn schemas).
+    for (auto& ex : dynExports) {
+        ex.nameOff = static_cast<std::uint32_t>(dynstr.size());
+        for (char c : ex.name)
+            dynstr.push_back(static_cast<std::uint8_t>(c));
+        dynstr.push_back(0);
+    }
+    std::uint32_t sonameOff = 0;
+    if (isDyn && !elfId.soname.empty()) {
+        sonameOff = static_cast<std::uint32_t>(dynstr.size());
+        for (char c : elfId.soname)
+            dynstr.push_back(static_cast<std::uint8_t>(c));
+        dynstr.push_back(0);
+    }
+    // Version strings (D-LK-ELF-SYMBOL-VERSIONING) — each DISTINCT version
+    // string (deduped: two libraries may need the same "GLIBC_2.x" name and
+    // share one `.dynstr` entry) NUL-terminated after the soname. The
+    // VERNAUX vna_name below points here. Empty unless a versioned import
+    // exists, so a versionless image's `.dynstr` is byte-identical.
+    std::unordered_map<std::string, std::uint32_t> versionStrOff;
+    for (auto const& r : versionReqs) {
+        if (versionStrOff.count(r.version)) continue;
+        versionStrOff.emplace(r.version,
+                              static_cast<std::uint32_t>(dynstr.size()));
+        for (char c : r.version)
             dynstr.push_back(static_cast<std::uint8_t>(c));
         dynstr.push_back(0);
     }
@@ -859,25 +1310,113 @@ encodeElfExecDynamic(
         // st_value (the `.bss` slot VA) + st_shndx (the `.bss` section
         // index) are patched after layout, once both exist.
         bool const isData = module.externImports[i].isData;
+        // st_size: the copy-relocation arm (exec) needs the object's
+        // size (the loader copies min(st_size) bytes); the dyn
+        // got-indirect arm's import stays a plain UNDEF reference
+        // (size 0 — no copy happens, the slot holds a pointer).
         appendDynsymEntry(externNameOff[i],
                           makeStInfo(STB_GLOBAL,
                                      isData ? STT_OBJECT : STT_NOTYPE),
                           SHN_UNDEF, 0,
-                          isData ? module.externImports[i].dataSizeBytes
-                                 : 0);
+                          (isData && !isDyn)
+                              ? module.externImports[i].dataSizeBytes
+                              : 0);
+    }
+    // ET_DYN exports (c150): appended AFTER the imports so import
+    // dynsym indices (and the exec image) are unchanged. st_shndx /
+    // st_value are patched post-layout; st_size is final now.
+    for (auto& ex : dynExports) {
+        ex.dynsymIdx = static_cast<std::uint32_t>(dynsym.size() / 24);
+        appendDynsymEntry(ex.nameOff, ex.info, SHN_UNDEF, 0, ex.size);
     }
 
     // ── (f) .hash body (DT_HASH single-bucket)
+    //
+    // ONE bucket whose chain threads EVERY dynsym entry (imports AND
+    // the c150 dyn exports): ld.so hashes the wanted name, lands in
+    // bucket 0, and walks the chain comparing names — a single-bucket
+    // table is slower than gcc's GNU_HASH but exactly as CORRECT
+    // (findability is what the ET_DYN export contract needs). nchain
+    // == the dynsym entry count (gABI: chain parallels the symbol
+    // table).
+    std::size_t const numDynsymEntries = dynsym.size() / 24;
     std::vector<std::uint8_t> hashSec;
     appendU32LE(hashSec, 1);  // nbucket
-    appendU32LE(hashSec, static_cast<std::uint32_t>(numExterns + 1));  // nchain
+    appendU32LE(hashSec, static_cast<std::uint32_t>(numDynsymEntries));  // nchain
     appendU32LE(hashSec,
-        numExterns > 0 ? 1u : 0u);                     // bucket[0]
+        numDynsymEntries > 1 ? 1u : 0u);               // bucket[0]
     appendU32LE(hashSec, 0);                            // chain[0]=STN_UNDEF
-    for (std::size_t i = 0; i < numExterns; ++i) {
+    for (std::size_t i = 1; i < numDynsymEntries; ++i) {
         std::uint32_t const next =
-            (i + 1 < numExterns) ? static_cast<std::uint32_t>(i + 2) : 0u;
+            (i + 1 < numDynsymEntries) ? static_cast<std::uint32_t>(i + 1)
+                                       : 0u;
         appendU32LE(hashSec, next);
+    }
+
+    // ── (f.5) .gnu.version + .gnu.version_r (D-LK-ELF-SYMBOL-VERSIONING) ──
+    // Built ONLY when a versioned import exists (emitVersioning); both stay
+    // empty + unreferenced otherwise (byte-identical pre-c156 image).
+    //
+    // `.gnu.version` (Versym): one u16 per `.dynsym` entry, parallel to it.
+    //   [0] (STN_UNDEF)       = VER_NDX_LOCAL (0).
+    //   an unversioned import = VER_NDX_GLOBAL (1) — binds the lib default.
+    //   a versioned import    = its VERNAUX index (>= 2).
+    //   a c150 `.so` export   = VER_NDX_GLOBAL (1) — DSS emits no verdef.
+    std::vector<std::uint8_t> gnuVersion;
+    std::vector<std::uint8_t> gnuVersionR;
+    std::size_t numVerneed = 0;
+    if (emitVersioning) {
+        gnuVersion.resize(numDynsymEntries * 2, 0);
+        auto setVersym = [&](std::size_t dsIdx, std::uint16_t v) {
+            gnuVersion[dsIdx * 2]     = static_cast<std::uint8_t>(v & 0xFF);
+            gnuVersion[dsIdx * 2 + 1] = static_cast<std::uint8_t>((v >> 8) & 0xFF);
+        };
+        // Default every non-UNDEF entry (imports + .so exports) to GLOBAL;
+        // [0] stays LOCAL (0). Then stamp each versioned import's index.
+        for (std::size_t k = 1; k < numDynsymEntries; ++k)
+            setVersym(k, VER_NDX_GLOBAL);
+        for (std::size_t i = 0; i < numExterns; ++i) {
+            if (importVersionIdx[i] != 0)
+                setVersym(dynsymIdx[i], importVersionIdx[i]);
+        }
+
+        // `.gnu.version_r` (Verneed/Vernaux): one VERNEED per DISTINCT library
+        // that has versioned imports (grouped, in libraryOrder order), each
+        // with one VERNAUX per (library, version) requirement. Elf64_Verneed
+        // {vn_version, vn_cnt, vn_file, vn_aux, vn_next} + Elf64_Vernaux
+        // {vna_hash, vna_flags, vna_other, vna_name, vna_next}, both 16 B.
+        std::vector<std::size_t> verLibs;   // libIndexes with >= 1 versioned import
+        for (std::size_t L = 0; L < numLibs; ++L) {
+            for (auto const& r : versionReqs) {
+                if (r.libIndex == L) { verLibs.push_back(L); break; }
+            }
+        }
+        numVerneed = verLibs.size();
+        for (std::size_t vi = 0; vi < verLibs.size(); ++vi) {
+            std::size_t const L = verLibs[vi];
+            std::vector<VersionReq const*> aux;
+            for (auto const& r : versionReqs)
+                if (r.libIndex == L) aux.push_back(&r);
+            // Verneed header (16 B). vn_aux = 16 (the first VERNAUX follows
+            // immediately); vn_next = 0 on the last VERNEED, else the byte
+            // span of this VERNEED + all its VERNAUX (skip to the next).
+            appendU16LE(gnuVersionR, VER_NEED_CURRENT);                       // vn_version
+            appendU16LE(gnuVersionR, static_cast<std::uint16_t>(aux.size())); // vn_cnt
+            appendU32LE(gnuVersionR, libNameOff[L]);                          // vn_file
+            appendU32LE(gnuVersionR, 16);                                     // vn_aux
+            appendU32LE(gnuVersionR,
+                (vi + 1 < verLibs.size())
+                    ? static_cast<std::uint32_t>(16 + aux.size() * 16)
+                    : 0u);                                                    // vn_next
+            for (std::size_t a = 0; a < aux.size(); ++a) {
+                appendU32LE(gnuVersionR, elf_hash(aux[a]->version));          // vna_hash
+                appendU16LE(gnuVersionR, 0);                                  // vna_flags
+                appendU16LE(gnuVersionR, aux[a]->vnaOther);                   // vna_other
+                appendU32LE(gnuVersionR, versionStrOff.at(aux[a]->version));  // vna_name
+                appendU32LE(gnuVersionR,
+                    (a + 1 < aux.size()) ? 16u : 0u);                         // vna_next
+            }
+        }
     }
 
     // ── (g) .plt body (placeholder; filled after layout)
@@ -890,19 +1429,35 @@ encodeElfExecDynamic(
     std::vector<std::uint8_t> plt(numFuncExterns * pltStubSize, 0);
 
     // ── (h) .got body (zero-init; dyld writes resolved fn ptrs) —
-    // FUNCTION imports only (c84: data imports have no GOT slot; the
-    // copy slot in `.bss` is their storage).
-    std::vector<std::uint8_t> got(numFuncExterns * 8, 0);
+    // FUNCTION imports on the exec arm (c84: exec data imports have
+    // no GOT slot; the copy slot in `.bss` is their storage). The
+    // ET_DYN arm (c150) ALSO gives each DATA import a GOT slot after
+    // the function slots — the got-indirect binding: ld.so writes
+    // the object's address into the slot (GLOB_DAT) and the
+    // GotIndirect lowering derefs it. Slot index for data extern i
+    // = numFuncExterns + externSlot[i].
+    std::size_t const numGotSlots =
+        numFuncExterns + (hasGotDataSlots ? numDataExterns : 0);
+    std::vector<std::uint8_t> got(numGotSlots * 8, 0);
 
     // ── (i) Layout: compute file offsets + VAs ─────────────────
     constexpr std::uint64_t kEhdrSize = 64;
     constexpr std::uint64_t kPhdrSize = 56;
-    // PHDR + INTERP + LOAD×2 + DYNAMIC, plus PT_TLS ONLY when the module
-    // carries thread-local items (D-CSUBSET-THREAD-LOCAL, audit fold
-    // HIGH-2): the conditional count keeps every no-TLS image — sqlite
-    // included — BYTE-IDENTICAL to the pre-TLS walker (phtSize/interpOff/
-    // every downstream offset shifts ONLY when TLS is present).
-    std::uint32_t const numPhdrs = hasTls ? 6u : 5u;
+    // EXEC: PHDR + INTERP + LOAD×2 + DYNAMIC, plus PT_TLS ONLY when the
+    // module carries thread-local items (D-CSUBSET-THREAD-LOCAL, audit
+    // fold HIGH-2): the conditional count keeps every no-TLS image —
+    // sqlite included — BYTE-IDENTICAL to the pre-TLS walker (phtSize/
+    // interpOff/every downstream offset shifts ONLY when TLS is
+    // present).
+    // DYN `.so` (c150): LOAD×2 + DYNAMIC only — no PT_INTERP (loaded
+    // by an already-running ld.so) and no PT_PHDR (an aux-vector
+    // nicety for process images; gcc's `ld -shared` omits it too).
+    // PIE (c151): the exec 5 — PT_PHDR + PT_INTERP + LOAD×2 +
+    // DYNAMIC (gcc PIE ground truth carries both PHDR and INTERP);
+    // TLS-in-dyn (both sub-shapes) was rejected above, so the PIE
+    // never takes the 6-phdr TLS arm.
+    std::uint32_t const numPhdrs =
+        !isExecveImage ? 3u : (hasTls ? 6u : 5u);
     std::uint64_t const phtOff = kEhdrSize;
     std::uint64_t const phtSize = numPhdrs * kPhdrSize;
     std::uint64_t const interpOff = phtOff + phtSize;
@@ -941,9 +1496,43 @@ encodeElfExecDynamic(
     std::uint64_t const hashVa  = baseImageVa + hashOff;
     std::uint64_t const hashSz  = hashSec.size();
 
-    std::uint64_t const relaDynOff = alignUp(hashOff + hashSz, 8);
+    // `.gnu.version` (align 2, entsize 2) + `.gnu.version_r` (align 4) sit
+    // between `.hash` and `.rela.dyn` (D-LK-ELF-SYMBOL-VERSIONING). When
+    // versioning is OFF both are zero-size and collapse to hashOff+hashSz, so
+    // relaDynOff == alignUp(hashOff+hashSz, 8) — the exact pre-c156 formula
+    // (2|4|8 nested alignUps of an already-8-aligned base are a no-op).
+    std::uint64_t const gnuVersionOff =
+        emitVersioning ? alignUp(hashOff + hashSz, 2) : (hashOff + hashSz);
+    std::uint64_t const gnuVersionVa  = baseImageVa + gnuVersionOff;
+    std::uint64_t const gnuVersionSz  = gnuVersion.size();
+    std::uint64_t const gnuVersionROff =
+        emitVersioning ? alignUp(gnuVersionOff + gnuVersionSz, 4) : gnuVersionOff;
+    std::uint64_t const gnuVersionRVa  = baseImageVa + gnuVersionROff;
+    std::uint64_t const gnuVersionRSz  = gnuVersionR.size();
+
+    std::uint64_t const relaDynOff = alignUp(gnuVersionROff + gnuVersionRSz, 8);
     std::uint64_t const relaDynVa  = baseImageVa + relaDynOff;
-    std::uint64_t const relaDynSz  = numExterns * 24;
+    // c150 (D-LK1-4): on the ET_DYN arm every internal absolute
+    // 64-bit data slot (a fn-ptr-table entry, a `&global`
+    // initializer, a jump-table row — the abs64 data-item relocs the
+    // exec arm patches in place with FINAL VAs) additionally emits
+    // one R_*_RELATIVE entry, so the loader can add the slide. The
+    // COUNT is fixed by the module (one per data-item relocation in
+    // the merged `.data` layout — relro rides it, c145); the CONTENT
+    // is assembled post-apply, when the base-relative slot values
+    // exist. `.rodata` items were rejected above if reloc-bearing
+    // (D-LK-DYN-RODATA-ITEM-RELOC) and `.bss`/tls carry none, so the
+    // merged `.data` layout is the complete RELATIVE universe.
+    std::size_t numRelativeRelocs = 0;
+    if (isDyn) {
+        for (std::size_t j = 0; j < dataDynLayout.itemIndices.size(); ++j) {
+            numRelativeRelocs +=
+                module.dataItems[dataDynLayout.itemIndices[j]]
+                    .relocations.size();
+        }
+    }
+    std::uint64_t const relaDynSz  =
+        (numExterns + numRelativeRelocs) * 24;
 
     std::uint64_t const ptLoad1End = relaDynOff + relaDynSz;
 
@@ -1064,20 +1653,49 @@ encodeElfExecDynamic(
         appendU64LE(dynamicSec, tag);
         appendU64LE(dynamicSec, val);
     };
-    // DT_NEEDED per library, then the resolution-side metadata,
-    // then DF_1_NOW for eager binding, then DT_NULL terminator.
+    // DT_NEEDED per library, [DT_SONAME — dyn, when configured], then
+    // the resolution-side metadata, then DF_1_NOW for eager binding,
+    // then DT_NULL terminator. The d_ptr entries (STRTAB/SYMTAB/HASH/
+    // RELA) carry base-relative VAs on the ET_DYN arm (baseImageVa ==
+    // 0); ld.so adds the load bias to every known d_ptr tag.
     for (std::size_t i = 0; i < numLibs; ++i) {
         appendDyn(DT_NEEDED, libNameOff[i]);
+    }
+    if (sonameOff != 0) {
+        appendDyn(DT_SONAME, sonameOff);   // c150 — dyn-only by construction
     }
     appendDyn(DT_STRTAB,  dynstrVa);
     appendDyn(DT_STRSZ,   dynstrSz);
     appendDyn(DT_SYMTAB,  dynsymVa);
     appendDyn(DT_SYMENT,  24);
     appendDyn(DT_HASH,    hashVa);
-    appendDyn(DT_RELA,    relaDynVa);
-    appendDyn(DT_RELASZ,  relaDynSz);
-    appendDyn(DT_RELAENT, 24);
-    appendDyn(DT_FLAGS_1, DF_1_NOW);
+    // The RELA trio is emitted only when entries exist. The exec arm
+    // always has >= 1 (one per extern, externs mandatory there —
+    // byte-identical). A dyn image with zero externs AND zero
+    // RELATIVE slots legitimately carries no `.rela.dyn` content;
+    // a DT_RELA pointing at zero bytes would be dead metadata.
+    if (relaDynSz > 0) {
+        appendDyn(DT_RELA,    relaDynVa);
+        appendDyn(DT_RELASZ,  relaDynSz);
+        appendDyn(DT_RELAENT, 24);
+    }
+    // Symbol-version requirement pointers (D-LK-ELF-SYMBOL-VERSIONING) —
+    // emitted only when a versioned import exists. DT_VERSYM → the Versym
+    // array, DT_VERNEED → the first Verneed record, DT_VERNEEDNUM → the
+    // Verneed count. ld.so keys version resolution on these three; without
+    // them an unversioned reference misbinds to a library's oldest compat
+    // version (the realpath@GLIBC_2.2.5 degradation this closes).
+    if (emitVersioning) {
+        appendDyn(DT_VERSYM,     gnuVersionVa);
+        appendDyn(DT_VERNEED,    gnuVersionRVa);
+        appendDyn(DT_VERNEEDNUM, numVerneed);
+    }
+    // DF_1_NOW = eager binding (both arms, all shapes). The c151 PIE
+    // additionally carries DF_1_PIE — the ET_DYN "this is an
+    // executable, not a library" marker (gcc ground truth: FLAGS_1 =
+    // NOW PIE on default-PIE output; readelf keys its "(Position-
+    // Independent Executable file)" label on it).
+    appendDyn(DT_FLAGS_1, isPie ? (DF_1_NOW | DF_1_PIE) : DF_1_NOW);
     appendDyn(DT_NULL,    0);
     std::uint64_t const dynamicSz = dynamicSec.size();
 
@@ -1095,7 +1713,6 @@ encodeElfExecDynamic(
     // when EITHER part is non-empty; its alignment is the max of both
     // parts (bssDynLayout.maxAlign already folds the schema floor, even
     // when the module part is empty).
-    bool const hasBssSection = hasBssDyn || hasCopySlots;
     if (hasBssSection && secBssDyn == nullptr) {
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
              "elf::encodeElfExecDynamic: module needs a `.bss` section "
@@ -1103,10 +1720,13 @@ encodeElfExecDynamic(
              "slots) but the format declares no 'bss' section row.");
         return {};
     }
+    // Copy slots are EXEC-only (c84); the dyn arm's data externs live
+    // in the GOT (hasCopySlots is false there), so `bssSpan` stays the
+    // module's own zero-init span.
     std::vector<std::uint64_t> copySlotOffset(numExterns, 0);
     std::uint64_t bssSpan = bssDynLayout.spanSize;
     std::uint64_t copyMaxAlign = 1;
-    for (std::size_t i = 0; i < numExterns; ++i) {
+    for (std::size_t i = 0; hasCopySlots && i < numExterns; ++i) {
         auto const& ext = module.externImports[i];
         if (!ext.isData) continue;
         bssSpan = alignUp(bssSpan, ext.dataAlignBytes);
@@ -1124,33 +1744,33 @@ encodeElfExecDynamic(
         hasBssSection ? ((bssVa + bssSz) - ptLoad2VaStart)
                       : ptLoad2FileSize;
 
-    // ── (k, moved) Build .rela.dyn — one Elf64_Rela per extern:
-    // GLOB_DAT (function → its GOT slot) or COPY (data → its `.bss`
-    // copy slot; the loader memcpy's the library's object there).
-    // D-LK6-8 (per-machine GLOB_DAT) + c84 D-LK-EXTERN-DATA-IMPORT
-    // (per-machine COPY).
-    std::vector<std::uint8_t> relaDyn;
-    relaDyn.reserve(relaDynSz);
+    // ── (k, moved) Build the EXTERN half of `.rela.dyn` — one
+    // Elf64_Rela per extern:
+    //   * function → GLOB_DAT against its GOT slot (both arms);
+    //   * data, exec arm → COPY against its `.bss` copy slot (c84);
+    //   * data, dyn arm  → GLOB_DAT against its GOT slot (c150
+    //     got-indirect — ld.so writes the object's address there).
+    // The dyn arm's RELATIVE half is assembled AFTER
+    // applyDataItemRelocations (its addends are the base-relative
+    // slot values that apply writes); the two halves concatenate —
+    // RELATIVE first (the gcc/glibc convention) — into `relaDyn`
+    // below, sized against relaDynSz.
+    std::vector<std::uint8_t> relaExtern;
+    relaExtern.reserve(numExterns * 24);
     for (std::size_t i = 0; i < numExterns; ++i) {
         bool const isData = module.externImports[i].isData;
         std::uint64_t const rOffset =
-            isData ? bssVa + copySlotOffset[i]
+            isData ? (isDyn ? gotVa + (numFuncExterns + externSlot[i]) * 8
+                            : bssVa + copySlotOffset[i])
                    : gotVa + externSlot[i] * 8;
+        std::uint32_t const rType =
+            (isData && !isDyn) ? copyType : globDatType;
         std::uint64_t const rInfo =
             (static_cast<std::uint64_t>(dynsymIdx[i]) << 32)
-            | static_cast<std::uint64_t>(isData ? copyType : globDatType);
-        appendU64LE(relaDyn, rOffset);
-        appendU64LE(relaDyn, rInfo);
-        appendI64LE(relaDyn, 0);
-    }
-    if (relaDyn.size() != relaDynSz) {
-        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
-             std::format("elf::encodeElfExecDynamic: .rela.dyn content "
-                         "({} bytes) disagrees with the laid-out size "
-                         "({}) — the one-Rela-per-extern invariant "
-                         "broke; the DT_RELASZ the loader reads would "
-                         "be wrong.", relaDyn.size(), relaDynSz));
-        return {};
+            | static_cast<std::uint64_t>(rType);
+        appendU64LE(relaExtern, rOffset);
+        appendU64LE(relaExtern, rInfo);
+        appendI64LE(relaExtern, 0);
     }
 
     // Non-loaded .symtab / .strtab / .shstrtab + SHT.
@@ -1169,8 +1789,10 @@ encodeElfExecDynamic(
         appendU64LE(symtab, size);
     };
     appendSymtabEntry(0, 0, 0, 0, 0);                  // STN_UNDEF
+    // shndx = IDX_TEXT (c150 — computed, not the pre-dyn literal 2:
+    // the ET_DYN image has no `.interp`, shifting `.text` to 1).
     appendSymtabEntry(0, makeStInfo(STB_LOCAL, STT_SECTION),
-                      2 /*shndx=.text*/, 0, 0);
+                      IDX_TEXT, 0, 0);
     std::uint32_t const firstNonLocal = 2;
     for (std::size_t i = 0; i < module.functions.size(); ++i) {
         auto const& fn = module.functions[i];
@@ -1179,13 +1801,18 @@ encodeElfExecDynamic(
         std::uint32_t const nameOff = strtab.add(name);
         appendSymtabEntry(nameOff,
                           makeStInfo(STB_GLOBAL, STT_FUNC),
-                          2 /*shndx=.text*/,
+                          IDX_TEXT,
                           textVa + funcTextStart[i],
                           fn.bytes.size());
     }
 
     StringTable shstrtab;
-    auto const shsInterp   = shstrtab.add(".interp");
+    // `.interp` name on every execve'd image — exec + the c151 PIE
+    // (the `.so` has no PT_INTERP / `.interp` row — gated like the
+    // tdata/tbss adds below, so its shstrtab carries no dead name
+    // bytes).
+    std::uint32_t const shsInterp =
+        isExecveImage ? shstrtab.add(".interp") : 0u;
     auto const shsText     = shstrtab.add(".text");
     // `.rodata` section name (schema row when present, else the literal).
     // Added unconditionally to shstrtab (a few unused bytes when no rodata);
@@ -1214,6 +1841,13 @@ encodeElfExecDynamic(
     auto const shsDynsym   = shstrtab.add(".dynsym");
     auto const shsDynstr   = shstrtab.add(".dynstr");
     auto const shsHash     = shstrtab.add(".hash");
+    // `.gnu.version` / `.gnu.version_r` names (D-LK-ELF-SYMBOL-VERSIONING)
+    // added ONLY when a versioned import exists — an unconditional add would
+    // grow `.shstrtab` on every image and break the pre-c156 byte-identity.
+    std::uint32_t const shsGnuVersion =
+        emitVersioning ? shstrtab.add(".gnu.version") : 0u;
+    std::uint32_t const shsGnuVersionR =
+        emitVersioning ? shstrtab.add(".gnu.version_r") : 0u;
     auto const shsRelaDyn  = shstrtab.add(".rela.dyn");
     auto const shsGot      = shstrtab.add(".got");
     auto const shsDynamic  = shstrtab.add(".dynamic");
@@ -1242,8 +1876,40 @@ encodeElfExecDynamic(
                      std::to_string(rel.kind.v) +
                      " not declared by ELF format '" +
                      std::string{fmt.name()} +
-                     "' — substrate-invariant violation.");
+                     "' -- substrate-invariant violation.");
                 return {};
+            }
+            // D-LK-DYN-TEXT-ABS-RELOC (c150): a slid ET_DYN image
+            // cannot carry an ABSOLUTE fixup in `.text` — the page is
+            // read-only at load, so patching it would need DT_TEXTREL
+            // (deprecated; rejected by hardened loaders), and the
+            // link-time value would be wrong under any nonzero slide
+            // anyway. Slide-safe kinds: Linear pc-relative (rel32 /
+            // riprel32) and every non-Linear instruction formula
+            // (the ARM64 page-pair/branch arms — pc-relative by
+            // construction despite their pcRelative=false rows).
+            // DSS codegen reaches globals rip-relatively, so the
+            // shipped pipeline never trips this; it is the belt for
+            // an absolute-in-code producer (incl. the tls-tpoff32
+            // Linear-absolute kind — TLS-in-.so is already rejected
+            // above, D-LK-DYN-TLS-MODEL).
+            if (isDyn) {
+                auto const* triPre = targetSchema.relocationInfo(rel.kind);
+                if (triPre != nullptr
+                    && triPre->formulaKind == RelocFormulaKind::Linear
+                    && !triPre->pcRelative) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format(
+                             "elf::encodeElfExecDynamic (ET_DYN): function "
+                             "SymbolId={{ {} }} carries an ABSOLUTE "
+                             "relocation (kind {} '{}') in `.text` -- a "
+                             "loader-slid shared library cannot patch "
+                             "read-only code pages (DT_TEXTREL). Code must "
+                             "reach targets pc-relatively "
+                             "(D-LK-DYN-TEXT-ABS-RELOC).",
+                             fn.symbol.v, rel.kind.v, triPre->name));
+                    return {};
+                }
             }
         }
     }
@@ -1316,14 +1982,19 @@ encodeElfExecDynamic(
     }
     for (std::size_t i = 0; i < numExterns; ++i) {
         // D-LK6-8: a FUNCTION extern's VA points at its PLT stub (per-
-        // machine stub size: 6 bytes x86_64 / 16 bytes ARM64). c84: a
-        // DATA extern's VA is its `.bss` COPY SLOT — module code
+        // machine stub size: 6 bytes x86_64 / 16 bytes ARM64). c84: an
+        // EXEC data extern's VA is its `.bss` COPY SLOT — module code
         // references the LOCAL copy through the normal GlobalAddr
         // reloc path; the loader fills the slot from the library's
         // object before entry (R_*_COPY, eager DF_1_NOW binding).
+        // c150: a DYN data extern's VA is its GOT SLOT (got-indirect —
+        // the lowering lea's the slot and derefs; ld.so fills it via
+        // GLOB_DAT), NEVER a thunk/stub VA (a data object is not
+        // callable — the PE/Mach-O c117/c149 model).
         bool const isData = module.externImports[i].isData;
         std::uint64_t const va =
-            isData ? bssVa + copySlotOffset[i]
+            isData ? (isDyn ? gotVa + (numFuncExterns + externSlot[i]) * 8
+                            : bssVa + copySlotOffset[i])
                    : pltVa + externSlot[i] * pltStubSize;
         auto const [it, inserted] = symbolVa.emplace(
             module.externImports[i].symbol, va);
@@ -1430,8 +2101,13 @@ encodeElfExecDynamic(
 
     // F5 (D-CSUBSET-SYMBOL-ADDRESS-GLOBAL): patch each MUTABLE symbol-address
     // global pointer's abs64 data→data reloc IN PLACE with the target's resolved
-    // VA (symbolVa is fully built now). ELF exec is in-place — no `.rela` for an
-    // ET_EXEC / PIE image (the loader applies the PIE slide); siteVasOut=nullptr.
+    // VA (symbolVa is fully built now). ELF ET_EXEC is in-place-final — no
+    // `.rela` rows (the VAs are absolute at link time); siteVasOut=nullptr.
+    // ET_DYN (c150): the SAME apply writes the BASE-RELATIVE value (baseImageVa
+    // == 0, so symbolVa's entries ARE base-relative) and ALSO collects every
+    // patched 8-byte site into `relativeSiteVas` — each becomes one
+    // R_*_RELATIVE row below whose r_addend equals the slot's value; glibc's
+    // ld.so computes load_base + addend into the slot, completing the address.
     // The emission below reads `rodataDynLayout.bytes` / `dataDynLayout.bytes`.
     if (hasRodataDyn
         && !link::format::applyDataItemRelocations(
@@ -1439,10 +2115,125 @@ encodeElfExecDynamic(
                symbolVa, targetSchema, "elf::encodeElfExecDynamic", reporter)) {
         return {};
     }
+    std::vector<std::uint64_t> relativeSiteVas;
     if (hasDataDyn
         && !link::format::applyDataItemRelocations(
                dataDynLayout.bytes, module.dataItems, dataDynLayout, dataVa,
-               symbolVa, targetSchema, "elf::encodeElfExecDynamic", reporter)) {
+               symbolVa, targetSchema, "elf::encodeElfExecDynamic", reporter,
+               isDyn ? &relativeSiteVas : nullptr)) {
+        return {};
+    }
+    // ── ET_DYN: assemble `.rela.dyn` = RELATIVE half ++ extern half ──
+    // (exec: the extern half alone — RELATIVE stays empty). The
+    // RELATIVE addend is READ BACK from the just-patched slot (the
+    // apply wrote S + A there; base-relative because baseImageVa==0),
+    // so slot bytes and r_addend agree BY CONSTRUCTION — the
+    // prelinked-slot convention gcc's ld emits.
+    //
+    // c150 silent-failure-review CRITICAL fold: a data slot whose reloc
+    // targets an EXTERN must NOT take the RELATIVE path. The apply patched
+    // it with `symbolVa[extern]` — the GOT SLOT VA (data extern) or the
+    // local PLT STUB VA (function extern) — so a RELATIVE row would bake
+    // load_base + slot/stub address into the pointer: one indirection off
+    // for data (`FILE **pp = &stdout;` pointed at the .so's own GOT slot,
+    // witnessed live), and a cross-module identity break for functions
+    // (`fp == puts` false in the executable, C11 6.5.9). gcc's shape —
+    // emitted here instead — is a SYMBOL-BASED absolute reloc
+    // (R_X86_64_64 <dynsym> + rel.addend) with the slot bytes ZEROED;
+    // ld.so resolves the symbol across the global scope and writes the
+    // real address. One row per site either way, so every count/size
+    // invariant below is unchanged. The abs64 native id comes from the
+    // reloc's own format row (machine-agnostic — R_AARCH64_ABS64 on an
+    // aarch64 dyn schema).
+    struct ExternAddrSite {
+        std::uint32_t dynsymIdx = 0;
+        std::uint32_t nativeId  = 0;
+        std::int64_t  addend    = 0;
+    };
+    std::unordered_map<std::uint64_t, ExternAddrSite> externAddrBySlotVa;
+    if (isDyn && hasDataDyn) {
+        std::unordered_map<SymbolId, std::size_t> externIdxBySym;
+        externIdxBySym.reserve(numExterns);
+        for (std::size_t i = 0; i < numExterns; ++i) {
+            externIdxBySym.emplace(module.externImports[i].symbol, i);
+        }
+        for (std::size_t j = 0; j < dataDynLayout.itemIndices.size(); ++j) {
+            AssembledData const& di =
+                module.dataItems[dataDynLayout.itemIndices[j]];
+            for (auto const& rel : di.relocations) {
+                auto const extIt = externIdxBySym.find(rel.target);
+                if (extIt == externIdxBySym.end()) continue;   // internal
+                auto const* fmtReloc = fmt.relocationByKind(rel.kind);
+                if (fmtReloc == nullptr) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format(
+                             "elf::encodeElfExecDynamic (ET_DYN): data-item "
+                             "relocation kind {} targeting extern '{}' is not "
+                             "declared by object format '{}' - cannot emit "
+                             "the symbol-based absolute reloc.",
+                             rel.kind.v,
+                             module.externImports[extIt->second].mangledName,
+                             fmt.name()));
+                    return {};
+                }
+                std::uint64_t const slotVa = dataVa
+                    + dataDynLayout.itemOffsets[j]
+                    + static_cast<std::uint64_t>(rel.offset);
+                externAddrBySlotVa.insert_or_assign(
+                    slotVa, ExternAddrSite{dynsymIdx[extIt->second],
+                                           fmtReloc->nativeId, rel.addend});
+            }
+        }
+    }
+    std::uint32_t const relativeType = relativeRelocTypeFor(machine);
+    std::vector<std::uint8_t> relaDyn;
+    relaDyn.reserve(relaDynSz);
+    if (isDyn) {
+        if (relativeSiteVas.size() != numRelativeRelocs) {
+            emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                 std::format("elf::encodeElfExecDynamic (ET_DYN): collected "
+                             "{} RELATIVE site(s) but the layout counted {} "
+                             "data-item relocation(s) -- DT_RELASZ would "
+                             "disagree with the emitted rows.",
+                             relativeSiteVas.size(), numRelativeRelocs));
+            return {};
+        }
+        for (std::uint64_t const siteVa : relativeSiteVas) {
+            std::uint64_t const slotOff = siteVa - dataVa;
+            // Extern-targeted slot: symbol-based row + zeroed slot (the
+            // apply's slot/stub VA is UNDONE — the review-fold above).
+            if (auto const extSite = externAddrBySlotVa.find(siteVa);
+                extSite != externAddrBySlotVa.end()) {
+                for (int b = 0; b < 8; ++b) {
+                    dataDynLayout.bytes[static_cast<std::size_t>(
+                        slotOff + static_cast<std::uint64_t>(b))] = 0;
+                }
+                appendU64LE(relaDyn, siteVa);
+                appendU64LE(relaDyn, makeRelaInfo(extSite->second.dynsymIdx,
+                                                  extSite->second.nativeId));
+                appendI64LE(relaDyn, extSite->second.addend);
+                continue;
+            }
+            std::uint64_t addend = 0;
+            for (int b = 7; b >= 0; --b) {
+                addend = (addend << 8)
+                       | dataDynLayout.bytes[static_cast<std::size_t>(
+                             slotOff + static_cast<std::uint64_t>(b))];
+            }
+            appendU64LE(relaDyn, siteVa);   // r_offset — the slot itself
+            appendU64LE(relaDyn, makeRelaInfo(0, relativeType));
+            appendI64LE(relaDyn, static_cast<std::int64_t>(addend));
+        }
+    }
+    appendBytes(relaDyn, relaExtern);
+    if (relaDyn.size() != relaDynSz) {
+        emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+             std::format("elf::encodeElfExecDynamic: .rela.dyn content "
+                         "({} bytes) disagrees with the laid-out size "
+                         "({}) -- the one-Rela-per-extern(+RELATIVE) "
+                         "invariant broke; the DT_RELASZ the loader "
+                         "reads would be wrong.",
+                         relaDyn.size(), relaDynSz));
         return {};
     }
     // D-CSUBSET-THREAD-LOCAL (CRIT-2 second half): patch `.tdata` TEMPLATE
@@ -1464,49 +2255,7 @@ encodeElfExecDynamic(
         return {};
     }
 
-    // ── Section indices (hoisted above the emit step — c84) ────
-    // Computed INCREMENTALLY from the emit order below so adding/
-    // removing an optional section ([.rodata]/[.data]/[.bss]) keeps
-    // every cross-reference (.link/.info/e_shstrndx) coherent with
-    // the actual header table. Hoisted ABOVE the byte-emit step
-    // because the dynsym patch below needs IDX_BSS (a data extern's
-    // st_shndx) BEFORE the dynsym body is appended. Emit order:
-    //   0 NULL, 1 .interp, 2 .text, [.rodata], .plt, .dynsym,
-    //   .dynstr, .hash, .rela.dyn, [.tdata], [.tbss], [.data], .got,
-    //   .dynamic, [.bss], .symtab, .strtab, .shstrtab
-    // (D-CSUBSET-THREAD-LOCAL: `.tdata` right before `.data` matches the
-    // file layout — its bytes physically open PT_LOAD #2; `.tbss` (NOBITS,
-    // no file bytes) sits beside its template, the gcc pairing.)
-    std::uint16_t idxCursor = 0;
-    auto nextIdx = [&]() { return idxCursor++; };
-    std::uint16_t const IDX_NULL   = nextIdx();  (void)IDX_NULL;
-    std::uint16_t const IDX_INTERP = nextIdx();  (void)IDX_INTERP;
-    std::uint16_t const IDX_TEXT   = nextIdx();  (void)IDX_TEXT;
-    std::uint16_t const IDX_RODATA = hasRodataDyn ? nextIdx() : std::uint16_t{0};
-    (void)IDX_RODATA;
-    std::uint16_t const IDX_PLT    = nextIdx();  (void)IDX_PLT;
-    std::uint16_t const IDX_DYNSYM = nextIdx();
-    std::uint16_t const IDX_DYNSTR = nextIdx();
-    std::uint16_t const IDX_HASH   = nextIdx();  (void)IDX_HASH;
-    std::uint16_t const IDX_RELADYN = nextIdx(); (void)IDX_RELADYN;
-    std::uint16_t const IDX_TDATA  = hasTdataDyn ? nextIdx() : std::uint16_t{0};
-    (void)IDX_TDATA;
-    std::uint16_t const IDX_TBSS   = hasTbssDyn ? nextIdx() : std::uint16_t{0};
-    (void)IDX_TBSS;
-    std::uint16_t const IDX_DATA   = hasDataDyn ? nextIdx() : std::uint16_t{0};
-    (void)IDX_DATA;
-    std::uint16_t const IDX_GOT    = nextIdx();  (void)IDX_GOT;
-    std::uint16_t const IDX_DYNAMIC = nextIdx(); (void)IDX_DYNAMIC;
-    // c84: `.bss` exists for module zero-init globals AND/OR extern-
-    // data copy slots.
-    std::uint16_t const IDX_BSS    = hasBssSection ? nextIdx() : std::uint16_t{0};
-    (void)IDX_BSS;
-    std::uint16_t const IDX_SYMTAB = nextIdx();  (void)IDX_SYMTAB;
-    std::uint16_t const IDX_STRTAB = nextIdx();
-    std::uint16_t const IDX_SHSTRTAB = nextIdx();
-    std::uint16_t const kNumSections = idxCursor;
-
-    // ── Patch the data externs' dynsym entries (c84) ───────────
+    // ── Patch the data externs' dynsym entries (c84, EXEC arm) ──
     // st_value = the `.bss` copy-slot VA; st_shndx = the `.bss`
     // section index — both unknowable at build time (step e). The
     // symbol is thereby a DEFINED OBJECT in this executable: the
@@ -1514,7 +2263,9 @@ encodeElfExecDynamic(
     // find the library's object (ELF_RTYPE_CLASS_COPY semantics),
     // while every OTHER image binds this name to the exec's copy
     // (interposition) — all references converge on one storage.
-    for (std::size_t i = 0; i < numExterns; ++i) {
+    // The ET_DYN arm skips this (hasCopySlots false): its data
+    // externs stay plain UNDEF references bound got-indirect.
+    for (std::size_t i = 0; hasCopySlots && i < numExterns; ++i) {
         if (!module.externImports[i].isData) continue;
         std::size_t const off =
             static_cast<std::size_t>(dynsymIdx[i]) * 24;
@@ -1524,6 +2275,61 @@ encodeElfExecDynamic(
         for (int b = 0; b < 8; ++b) {
             dynsym[off + 8 + b] =
                 static_cast<std::uint8_t>((slotVa >> (8 * b)) & 0xFF);
+        }
+    }
+
+    // ── Patch the ET_DYN exports' dynsym entries (c150) ─────────
+    // st_value = the symbol's base-relative VA (baseImageVa == 0, so
+    // symbolVa's entry is exactly the value ld.so adds the load base
+    // to when resolving); st_shndx = the DEFINING section's index.
+    // Placement is re-derived from the same layouts that populated
+    // symbolVa (functions → `.text`; data items → the layout whose
+    // itemIndices carries them), so value and section can never
+    // disagree.
+    if (isDyn && !dynExports.empty()) {
+        std::unordered_map<std::uint32_t,
+                           std::pair<std::uint64_t, std::uint16_t>> place;
+        place.reserve(module.functions.size() + module.dataItems.size());
+        for (std::size_t i = 0; i < module.functions.size(); ++i) {
+            place.emplace(module.functions[i].symbol.v,
+                          std::make_pair(textVa + funcTextStart[i], IDX_TEXT));
+        }
+        auto const addLayoutPlaces =
+            [&](link::format::ExecDataSectionLayout const& lay,
+                std::uint64_t secVa, std::uint16_t secIdx) {
+            for (std::size_t j = 0; j < lay.itemIndices.size(); ++j) {
+                auto const& di = module.dataItems[lay.itemIndices[j]];
+                if (di.symbol == SymbolId{}) continue;   // anonymous
+                place.emplace(di.symbol.v,
+                              std::make_pair(secVa + lay.itemOffsets[j],
+                                             secIdx));
+            }
+        };
+        if (hasRodataDyn) addLayoutPlaces(rodataDynLayout, rodataVa, IDX_RODATA);
+        if (hasDataDyn)   addLayoutPlaces(dataDynLayout,   dataVa,   IDX_DATA);
+        if (hasBssDyn)    addLayoutPlaces(bssDynLayout,    bssVa,    IDX_BSS);
+        for (auto const& ex : dynExports) {
+            auto const it = place.find(ex.sym.v);
+            if (it == place.end()) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::string{"elf::encodeElfExecDynamic (ET_DYN): "
+                                 "export '"} + ex.name
+                         + "' (SymbolId #" + std::to_string(ex.sym.v)
+                         + ") landed in no emitted section -- the "
+                           "export classification (b.7) and the "
+                           "section layouts disagree; walker bug.");
+                return {};
+            }
+            std::size_t const off =
+                static_cast<std::size_t>(ex.dynsymIdx) * 24;
+            std::uint16_t const shndx = it->second.second;
+            std::uint64_t const va    = it->second.first;
+            dynsym[off + 6] = static_cast<std::uint8_t>(shndx & 0xFF);
+            dynsym[off + 7] = static_cast<std::uint8_t>((shndx >> 8) & 0xFF);
+            for (int b = 0; b < 8; ++b) {
+                dynsym[off + 8 + b] =
+                    static_cast<std::uint8_t>((va >> (8 * b)) & 0xFF);
+            }
         }
     }
 
@@ -1551,11 +2357,17 @@ encodeElfExecDynamic(
         appendU64LE(bytes, pMemsz);
         appendU64LE(bytes, pAlign);
     };
-    appendPhdrEntry(PT_PHDR,    PF_R,        phtOff,       baseImageVa + phtOff,
-                    phtSize,        phtSize,        8);
-    appendPhdrEntry(PT_INTERP,  PF_R,        interpOff,    interpVa,
-                    interp.size(), interp.size(), 1);
-    // PT_LOAD #1 R+X — Ehdr + PHT + .interp + .text + .plt + .dynsym
+    // PT_PHDR + PT_INTERP: every execve'd image — exec AND the c151
+    // PIE (at base-relative VAs there: baseImageVa == 0, ld.so adds
+    // the slide). Only the `.so` carries neither; see the numPhdrs
+    // comment above.
+    if (isExecveImage) {
+        appendPhdrEntry(PT_PHDR,    PF_R,        phtOff,       baseImageVa + phtOff,
+                        phtSize,        phtSize,        8);
+        appendPhdrEntry(PT_INTERP,  PF_R,        interpOff,    interpVa,
+                        interp.size(), interp.size(), 1);
+    }
+    // PT_LOAD #1 R+X — Ehdr + PHT + [.interp] + .text + .plt + .dynsym
     //                  + .dynstr + .hash + .rela.dyn
     appendPhdrEntry(PT_LOAD,    PF_X | PF_R, 0,            baseImageVa,
                     ptLoad1End,    ptLoad1End,    pageAlign);
@@ -1585,13 +2397,23 @@ encodeElfExecDynamic(
 
     // Section bodies: pad-to-offset + append per section (simplifier
     // #1 + #4 fold using local padToOffset / appendBytes helpers).
-    padToOffset(bytes, interpOff);    appendBytes(bytes, interp);
+    // `.interp` bytes: execve'd images only — exec + PIE (the `.so`
+    // `interp` vector is empty by construction; skip the pad too —
+    // nothing sits between the PHT and the page-aligned `.text`
+    // there).
+    if (isExecveImage) { padToOffset(bytes, interpOff); appendBytes(bytes, interp); }
     padToOffset(bytes, textOff);      appendBytes(bytes, text);
     if (hasRodataDyn) { padToOffset(bytes, rodataOff); appendBytes(bytes, rodataDyn); }
     padToOffset(bytes, pltOff);       appendBytes(bytes, plt);
     padToOffset(bytes, dynsymOff);    appendBytes(bytes, dynsym);
                                        appendBytes(bytes, dynstr);  // align 1
     padToOffset(bytes, hashOff);      appendBytes(bytes, hashSec);
+    // `.gnu.version` + `.gnu.version_r` (D-LK-ELF-SYMBOL-VERSIONING) — only
+    // when a versioned import exists; absent otherwise (byte-identical image).
+    if (emitVersioning) {
+        padToOffset(bytes, gnuVersionOff);  appendBytes(bytes, gnuVersion);
+        padToOffset(bytes, gnuVersionROff); appendBytes(bytes, gnuVersionR);
+    }
     padToOffset(bytes, relaDynOff);   appendBytes(bytes, relaDyn);
     padToOffset(bytes, ptLoad2Start);                                // PT_LOAD #2 boundary
     // `.tdata` (thread-local template) opens PT_LOAD #2 (D-CSUBSET-THREAD-
@@ -1627,10 +2449,15 @@ encodeElfExecDynamic(
     // dropped (silent u32/u64 swap-bug surface) in favor of named
     // fields at every call site.
     writeSectionHeader(bytes, SectionHeader{});  // SHT_NULL (slot 0)
-    writeSectionHeader(bytes, SectionHeader{
-        .name_offset = shsInterp, .type = SHT_PROGBITS, .flags = SHF_ALLOC,
-        .addr = interpVa, .offset = interpOff, .size = interp.size(),
-        .addr_align = 1});
+    // `.interp` row: execve'd images — exec + the c151 PIE (the
+    // `.so` header table goes straight from SHT_NULL to `.text`;
+    // IDX_* above matched this).
+    if (isExecveImage) {
+        writeSectionHeader(bytes, SectionHeader{
+            .name_offset = shsInterp, .type = SHT_PROGBITS, .flags = SHF_ALLOC,
+            .addr = interpVa, .offset = interpOff, .size = interp.size(),
+            .addr_align = 1});
+    }
     writeSectionHeader(bytes, SectionHeader{
         .name_offset = shsText, .type = SHT_PROGBITS, .flags = SHF_ALLOC | SHF_EXECINSTR,
         .addr = textVa, .offset = textOff, .size = text.size(),
@@ -1661,6 +2488,23 @@ encodeElfExecDynamic(
         .name_offset = shsHash, .type = SHT_HASH, .flags = SHF_ALLOC,
         .addr = hashVa, .offset = hashOff, .size = hashSz,
         .link = IDX_DYNSYM, .addr_align = 8, .entry_size = 4});
+    // `.gnu.version` (SHT_GNU_versym) + `.gnu.version_r` (SHT_GNU_verneed) —
+    // D-LK-ELF-SYMBOL-VERSIONING; emitted only when a versioned import exists
+    // (matches the IDX_GNU_VERSION[_R] + layout + emit gates above).
+    //   .gnu.version   → link = .dynsym (the parallel array), entsize 2.
+    //   .gnu.version_r → link = .dynstr (vn_file/vna_name offsets),
+    //                    info = the VERNEED count, entsize 0 (variable records).
+    if (emitVersioning) {
+        writeSectionHeader(bytes, SectionHeader{
+            .name_offset = shsGnuVersion, .type = SHT_GNU_versym, .flags = SHF_ALLOC,
+            .addr = gnuVersionVa, .offset = gnuVersionOff, .size = gnuVersionSz,
+            .link = IDX_DYNSYM, .addr_align = 2, .entry_size = 2});
+        writeSectionHeader(bytes, SectionHeader{
+            .name_offset = shsGnuVersionR, .type = SHT_GNU_verneed, .flags = SHF_ALLOC,
+            .addr = gnuVersionRVa, .offset = gnuVersionROff, .size = gnuVersionRSz,
+            .link = IDX_DYNSTR, .info = static_cast<std::uint32_t>(numVerneed),
+            .addr_align = 4});
+    }
     writeSectionHeader(bytes, SectionHeader{
         .name_offset = shsRelaDyn, .type = SHT_RELA, .flags = SHF_ALLOC,
         .addr = relaDynVa, .offset = relaDynOff, .size = relaDynSz,
@@ -1748,11 +2592,25 @@ encodeElfExecDynamic(
     // `sym_<id>` name today (real-name resolution closes with
     // D-LK1-1 / LK7).
     // D-LK10-ENTRY Slice C audit fold: shared resolver.
-    auto const entryIdxOpt = link::format::resolveEntryFnIdx(
-        module, fmt, "sym_", "elf::encodeElfExecDynamic", reporter);
-    if (!entryIdxOpt.has_value()) return {};
-    std::size_t const entryFnIdx = *entryIdxOpt;
-    std::uint64_t const entryVa = textVa + funcTextStart[entryFnIdx];
+    // ET_DYN `.so` (c150): a shared library has NO entry — e_entry =
+    // 0 and the resolver is not consulted (nothing downstream reads
+    // an entry: the trampoline was never injected — the schema
+    // declares no processExit — and ld.so ignores e_entry on
+    // DT_NEEDED objects).
+    // ET_DYN PIE (c151) + ET_EXEC: the resolver runs. Empty
+    // entryPoint defaults to functions[0] — the linker-prepended
+    // `_start` trampoline (keyed on processExit presence, the same
+    // cluster member as `isPie`). On the PIE the resulting entryVa
+    // is BASE-RELATIVE (textVa = pageAlign, baseImageVa == 0); ld.so
+    // transfers control to load_base + e_entry — the gcc PIE shape
+    // (Entry 0x1040-class values in readelf -h).
+    std::uint64_t entryVa = 0;
+    if (isExecveImage) {
+        auto const entryIdxOpt = link::format::resolveEntryFnIdx(
+            module, fmt, "sym_", "elf::encodeElfExecDynamic", reporter);
+        if (!entryIdxOpt.has_value()) return {};
+        entryVa = textVa + funcTextStart[*entryIdxOpt];
+    }
     std::vector<std::uint8_t> ehdr;
     ehdr.reserve(kEhdrSize);
     ehdr.push_back(0x7F); ehdr.push_back('E');
@@ -1763,7 +2621,7 @@ encodeElfExecDynamic(
     ehdr.push_back(elfId.osabi);
     ehdr.push_back(elfId.abiVersion);
     for (int i = 0; i < 7; ++i) ehdr.push_back(0);
-    appendU16LE(ehdr, 2);  // ET_EXEC
+    appendU16LE(ehdr, isDyn ? 3 : 2);  // e_type: ET_DYN / ET_EXEC
     appendU16LE(ehdr, elfId.machine);
     appendU32LE(ehdr, EV_CURRENT);
     appendU64LE(ehdr, entryVa);
@@ -1803,6 +2661,37 @@ encode(AssembledModule const&    module,
                  + std::string{objectFormatKindName(fmt.kind())}
                  + ")");
         return {};
+    }
+    // c150 + c151 (D-LK1-4): ET_DYN routes to the dynamic-image
+    // walker UNCONDITIONALLY — both sub-shapes need `.dynamic` /
+    // `.dynsym` / `.hash` even with zero extern imports (a `.so` for
+    // its EXPORTS; a PIE for its loader metadata), so the exec arm's
+    // externs-only entry condition below does not apply. The walker
+    // discriminates `.so` vs PIE internally by the schema's entry
+    // cluster (`isPie` — processExit presence; validate() pinned the
+    // cluster all-or-none, and the walker re-checks the two members
+    // it consumes). The machine guard mirrors the exec arm's (the
+    // PLT/GLOB_DAT emitters are per-machine).
+    if (fmt.elf().objectType == ElfObjectType::Dyn) {
+        std::uint16_t const elfMachine = fmt.elf().machine;
+        if (elfMachine != kEmX86_64 && elfMachine != kEmAArch64) {
+            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                 std::string{"elf::encode: ET_DYN output but ELF "
+                             "e_machine="}
+                     + std::to_string(elfMachine)
+                     + " has no PLT/GLOB_DAT emitter yet. Supported "
+                       "machines: x86_64 (62), ARM64 (183) -- add the "
+                       "per-machine arms (pltStubSizeFor / "
+                       "globDatTypeFor / relativeRelocTypeFor / "
+                       "emitPltStub) for a new ISA.");
+            return {};
+        }
+        auto const* secTextDyn =
+            requireSection(fmt, SectionKind::Text, "ELF dynamic writer",
+                           reporter);
+        if (!secTextDyn) return {};
+        return encodeElfExecDynamic(module, targetSchema, fmt,
+                                     *secTextDyn, reporter);
     }
     // ELF dynamic-linker import-table emission — substrate landed
     // at LK6 cycle 2b.1 (PT_INTERP path field); walker emission

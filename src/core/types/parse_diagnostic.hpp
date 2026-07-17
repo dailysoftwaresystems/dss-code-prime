@@ -1844,6 +1844,11 @@ enum class DiagnosticCode : std::uint16_t {
     //   Fail loud rather than emit an image whose cross-CU calls dereference
     //   a null slot. (A target that genuinely has no abs64 reloc must add the
     //   row to its `*.target.json` before it can host cross-CU indirect calls.)
+    //   c154: SCOPED to formats whose declared `externCallDispatch` is
+    //   `indirect-slot` — the only dispatch whose call sites dereference a
+    //   slot. A `direct-plt`/undeclared format binds the reference directly
+    //   to the sibling definition (no slot, no abs64 needed), so this never
+    //   fires there (pinned by Abs64GateFiresOnlyOnTheIndirectSlotArm).
     K_AbsolutePointerRelocMissing  = 0x8013,
     // K_ImageExecBitFailed: setting the POSIX execute bit on a just-written
     //   EXECUTABLE-flavor output (writer.cpp `--output` path) failed —
@@ -1878,7 +1883,25 @@ enum class DiagnosticCode : std::uint16_t {
     //   otherwise fully honored. Fires from the PE walker (pe.cpp) when the
     //   max TLS-block var alignment exceeds the format's guaranteed 16.
     K_ThreadLocalOveralignedForFormat = 0x8016,
-    // K-NEXT-SLOT: 0x8017 — grep this marker before adding a K_* code.
+    // K_ArchiveMemberNameInvalid (D-LK-STATIC-ARCHIVE-WRITER): the `ar`
+    //   static-archive writer was handed a member whose file name is empty
+    //   or contains a byte that would corrupt the container framing -- a
+    //   '/' (the GNU short-name terminator + the reserved "/"/"//" special
+    //   member spellings) or a '\n' (the "//" long-name table entry
+    //   terminator). Fail loud rather than emit an archive whose member
+    //   list a reader would mis-resolve. Also fires on an empty EXPORTED
+    //   symbol name (an armap entry with no name is a caller bug -- the
+    //   c161 reader would skip+warn it, silently shrinking the index).
+    K_ArchiveMemberNameInvalid     = 0x8017,
+    // K_ArchiveFieldOverflow (D-LK-STATIC-ARCHIVE-WRITER): an archive field
+    //   cannot represent a value -- a member/armap/long-name-table payload
+    //   longer than the 60-byte `ar_hdr`'s 10-digit ASCII-decimal `size`
+    //   field can hold (>= 10^10 bytes), OR a member-header offset exceeding
+    //   the SysV armap's 32-bit big-endian offset range (a >4 GiB archive --
+    //   the GNU `/SYM64/` 64-bit-armap case, out of scope, see
+    //   D-FF1-AR-BSD-VARIANT). Fail loud rather than truncate a field.
+    K_ArchiveFieldOverflow         = 0x8018,
+    // K-NEXT-SLOT: 0x8019 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission
@@ -2171,6 +2194,28 @@ enum class DiagnosticCode : std::uint16_t {
     //   fully-specify / de-duplicate each variant's `when.format`.
     //   (D-LANG-PLATFORM-DEPENDENT-PRIMITIVE-WIDTH, 2026-06-26.)
     F_ShippedMacroVariantAmbiguous = 0x5021,
+    // F_FfiResolveLibrarySymbolAbsent: under the `--resolve-library <path>`
+    //   driver surface (c162, D-FF1-READER-CONSUMER), compile_pipeline routed
+    //   a source-declared "binary-governed" extern (no per-symbol library
+    //   override, not a bare no-library reference) to the live `ingest()`
+    //   binary-reader consumer, and it matched NO row in ANY named binary's
+    //   real export table -- AND the symbol is NOT a known system symbol
+    //   (absent from every shipped-library descriptor too). So it is a
+    //   GENUINE typo or a missing library (e.g. `dss_lib_answr` for
+    //   `dss_lib_answer`), not a bare-`extern`'d libc call the user forgot to
+    //   #include. Failing loud NOW -- naming the symbol + the searched
+    //   libraries -- catches an own-library typo at compile time (reading a
+    //   real export table is proof the symbol exists) instead of letting it
+    //   mis-bind to the format-default library and fail at link/load. A
+    //   governed extern that IS a known system symbol falls through to its
+    //   format-default library (gcc implicit-libc), NOT this diagnostic, so a
+    //   legitimate `bare extern puts + --resolve-library ownlib` program is
+    //   never wrongly rejected. The extern TYPE still comes from the inline
+    //   declaration -- the reader supplies existence + binding only. Fail-loud:
+    //   a SILENT-DANGLING-IMPORT guard (unsuppressable). Remediation: fix the
+    //   spelling, #include the header that declares it, or add the defining
+    //   library to `--resolve-library`. (D-FF1-READER-CONSUMER, c162.)
+    F_FfiResolveLibrarySymbolAbsent = 0x5022,
 };
 
 // Symbolic name like "P_UnexpectedToken" / "C_MalformedJson" / "P0042".

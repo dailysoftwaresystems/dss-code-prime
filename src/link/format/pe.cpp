@@ -2,6 +2,7 @@
 
 #include "asm/format/x86_variable.hpp"   // kStackProbeLoopBytes (unwind allocLen)
 #include "core/types/parse_diagnostic.hpp"
+#include "core/types/symbol_attrs.hpp"   // isExternallyVisible (dll .edata exports)
 #include "link/format/byte_emit.hpp"
 #include "link/format/exec_data_section.hpp"
 #include "link/format/exec_reloc_apply.hpp"
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -24,13 +26,18 @@
 #include <utility>
 #include <vector>
 
-// PE/COFF writer — plan 14 LK2 cycle 1 (.obj) + cycle 2 (PE32+ .exe).
+// PE/COFF writer — plan 14 LK2 cycle 1 (.obj) + cycle 2 (PE32+ .exe)
+// + c148 (.obj data sections + extern naming — the PE analog of the
+// ELF c141/c142/c145 and Mach-O c146/c147 cross-toolchain arcs).
 //
 // .obj byte layout (PE/COFF spec §3-5):
 //   [0x00]   IMAGE_FILE_HEADER (20 B)
-//   [0x14]   IMAGE_SECTION_HEADER × N (40 B each)
-//   [...]    section raw data (.text first)
-//   [...]    per-section IMAGE_RELOCATION[] (10 B packed each)
+//   [0x14]   IMAGE_SECTION_HEADER × N (40 B each; .text, then any
+//            present .rdata / .data / .rdata-relro / .bss)
+//   [...]    section raw data (.text first, then the file-backed data
+//            sections packed back-to-back; .bss stores no bytes)
+//   [...]    per-section IMAGE_RELOCATION[] (10 B packed each; .text,
+//            then data, then relro)
 //   [ptr]    IMAGE_SYMBOL[] (18 B packed each)
 //   [...]    String table (u32 size + NUL-terminated strings)
 //
@@ -67,6 +74,13 @@ using link::format::detail::requireSection;
 
 // IMAGE_SYM_CLASS_*
 constexpr std::uint8_t IMAGE_SYM_CLASS_EXTERNAL = 2;
+// STATIC(3): a symbol resolved ONLY within its own object — link.exe
+// never enters it into the cross-object global table. Used for the
+// synthetic per-block symbols (jump-table / computed-goto targets):
+// EXTERNAL would let a sibling object's unrelated `sym_<id>` bind to
+// an interior block address (silent wrong-control-flow) — the COFF
+// analog of ELF STB_LOCAL / Mach-O no-N_EXT (c147 fold, baked in).
+constexpr std::uint8_t IMAGE_SYM_CLASS_STATIC = 3;
 // IMAGE_SECTION_NUMBER specials
 constexpr std::int16_t IMAGE_SYM_UNDEFINED = 0;
 // IMAGE_SYM_TYPE_*
@@ -565,21 +579,211 @@ encode(AssembledModule const&    module,
     // — every other byte differs (.obj has no MS-DOS stub / PE sig /
     // optional header; image-side has no IMAGE_RELOCATION[] /
     // IMAGE_SYMBOL[] tables). validate() guarantees the optional
-    // header is populated for Exec/Dll, so the EXEC arm doesn't
-    // re-check those fields.
+    // header is populated for Exec/Dll, so the image arm doesn't
+    // re-check those fields. c152 (D-LK2-4): Dll routes through the
+    // SAME `encodeExec` substrate the .exe uses (the elf.cpp
+    // ET_EXEC/ET_DYN precedent) with the dll divergences keyed on
+    // the schema's declared objectType inside the walker —
+    // AddressOfEntryPoint = 0 (no DllMain; the entry trampoline is
+    // already absent because the dll schema declares no
+    // `processExit`), a `.edata` export directory wired into
+    // data-directory[0], and the extern-address / text-abs-reloc
+    // fail-loud belts.
     if (fmt.pe().objectType != PeObjectType::Obj) {
-        if (fmt.pe().objectType == PeObjectType::Dll) {
-            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-                 "pe::encode: PE .dll arm not yet implemented; "
-                 "anchored at a future cycle paired with LK6 dynamic "
-                 "linking (same shape as ELF ET_DYN's D-LK1-4).");
-            return {};
-        }
         return encodeExec(module, targetSchema, fmt, *secText, reporter);
     }
-    (void)targetSchema;  // Obj path does not apply relocations — the
-                         // assembler stamped the bytes and the .obj
-                         // writer just serializes them.
+    // NOTE: the Obj path does not APPLY relocations (the assembler
+    // stamped the bytes; the .obj writer serializes them + the
+    // IMAGE_RELOCATION records link.exe resolves). `targetSchema` is
+    // consulted only to VALIDATE data-item relocation kinds (linear,
+    // absolute, non-zero width) before emitting their records —
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (PE/COFF Obj arm, c148).
+
+    // ── D-LK-OBJECT-DATA-SECTION-RELOCATABLE (PE/COFF Obj arm, c148) ──
+    //
+    // The .obj writer emits DATA sections from `AssembledModule.dataItems`
+    // — the PE analog of the ELF c142 ET_REL arm + the Mach-O c147 mirror.
+    // A global lands in `.rdata` (rodata) / `.data` (data) / a SECOND
+    // `.rdata` (relro — COFF has no relro segment; MSVC itself places
+    // reloc-bearing const data in `.rdata` and the linked image
+    // base-relocates it; link.exe merges same-name contributions) /
+    // `.bss` (bss) with a SECTION-RELATIVE IMAGE_SYMBOL (SectionNumber =
+    // 1-based ordinal, Value = offset within the section — the COFF
+    // convention, NOT Mach-O's flat-address n_value) the final linker
+    // binds. Section names / Characteristics come from the format JSON
+    // rows (sectionByKind) — nothing hardcoded here.
+    //
+    // Thread-local items are rejected loud (mirror of the ELF / Mach-O
+    // object-arm belts): the .obj walker emits no `.tls` /
+    // IMAGE_TLS_DIRECTORY64 machinery (that is the PE EXEC arm,
+    // D-CSUBSET-THREAD-LOCAL C3). Unreachable via the shipped pipeline
+    // (the linker's acceptsDataSection gate fires first — the schema
+    // declares no tdata/tbss), this is the anti-silent-drop belt for a
+    // direct walker call or a format JSON opting in prematurely.
+    for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
+        auto const s = module.dataItems[i].section;
+        if (s != DataSectionKind::Tdata && s != DataSectionKind::Tbss)
+            continue;
+        emit(reporter, DiagnosticCode::K_FormatLacksThreadLocalSupport,
+             std::format("pe::encode (Obj): AssembledData item #{} is "
+                         "thread-local ({}) but the .obj walker emits no "
+                         ".tls machinery - thread-locals are supported "
+                         "only on the PE EXEC arm "
+                         "(D-CSUBSET-THREAD-LOCAL).",
+                         i, dataSectionKindName(s)));
+        return {};
+    }
+
+    // Lay out each data-section kind via the shared kind-parameterized
+    // substrate (`exec_data_section.hpp`) — the SAME helper the ELF /
+    // Mach-O / PE-exec arms use. The alignment floor is 1 for every PE
+    // row: validate() REJECTS a non-zero `addrAlign` on PE rows (PE
+    // carries alignment in the Characteristics IMAGE_SCN_ALIGN_*BYTES
+    // bits, which the writer derives from the H1-raised layout alignment
+    // below — the per-contribution align class cl.exe itself stamps).
+    // `data` + `relro` ALLOW item relocations (the c145/c147 analog: the
+    // writer emits their IMAGE_RELOCATION tables below); a reloc-bearing
+    // `rodata` item stays fail-loud (allow=false — the
+    // RodataDataItemWithRelocationFailsLoud discipline), and `bss` items
+    // carry no bytes to relocate.
+    auto const rodataLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Rodata,
+        /*alignFloor=*/1, "pe::encode (Obj)", reporter);
+    if (!rodataLayoutOpt.has_value()) return {};
+    auto const& rodataLayout = *rodataLayoutOpt;
+    auto dataLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Data,
+        /*alignFloor=*/1, "pe::encode (Obj)", reporter,
+        /*allowItemRelocations=*/true);
+    if (!dataLayoutOpt.has_value()) return {};
+    auto& dataLayout = *dataLayoutOpt;
+    auto const bssLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::Bss,
+        /*alignFloor=*/1, "pe::encode (Obj)", reporter);
+    if (!bssLayoutOpt.has_value()) return {};
+    auto const& bssLayout = *bssLayoutOpt;
+    // Unlike the PE-exec arm (which FOLDS relro into `.rdata` bytes), the
+    // .obj keeps relro a DISTINCT section (the ELF `.data.rel.ro` /
+    // Mach-O `__DATA,__const` mirror) so it carries its OWN
+    // IMAGE_RELOCATION table; it shares the `.rdata` NAME (the MSVC
+    // placement) and link.exe merges the same-name contributions.
+    auto relroLayoutOpt = link::format::buildExecDataSection(
+        module.dataItems, DataSectionKind::RelRoConst,
+        /*alignFloor=*/1, "pe::encode (Obj)", reporter,
+        /*allowItemRelocations=*/true);
+    if (!relroLayoutOpt.has_value()) return {};
+    auto& relroLayout = *relroLayoutOpt;
+
+    bool const hasRodata = !rodataLayout.empty();
+    bool const hasData   = !dataLayout.empty();
+    bool const hasRelRo  = !relroLayout.empty();
+    bool const hasBss    = !bssLayout.empty();
+    // Each PRESENT section's schema row is MANDATORY — fail loud (the
+    // format JSON must declare it; requireSection emits).
+    ObjectFormatSectionInfo const* secRodata =
+        hasRodata ? requireSection(fmt, SectionKind::Rodata,
+                                   "PE writer (Obj)", reporter)
+                  : nullptr;
+    if (hasRodata && secRodata == nullptr) return {};
+    ObjectFormatSectionInfo const* secData =
+        hasData ? requireSection(fmt, SectionKind::Data,
+                                 "PE writer (Obj)", reporter)
+                : nullptr;
+    if (hasData && secData == nullptr) return {};
+    ObjectFormatSectionInfo const* secRelRo =
+        hasRelRo ? requireSection(fmt, SectionKind::RelRoConst,
+                                  "PE writer (Obj)", reporter)
+                 : nullptr;
+    if (hasRelRo && secRelRo == nullptr) return {};
+    ObjectFormatSectionInfo const* secBss =
+        hasBss ? requireSection(fmt, SectionKind::Bss,
+                                "PE writer (Obj)", reporter)
+               : nullptr;
+    if (hasBss && secBss == nullptr) return {};
+
+    // COFF section-contribution alignment: IMAGE_SCN_ALIGN_*BYTES bits in
+    // Characteristics — value (log2(align)+1) << 20, representable for
+    // 1..8192 bytes only. Derived from the H1-raised layout alignment
+    // (max of every member item's alignment) so the final linker places
+    // the contribution at least as aligned as its strictest member —
+    // exactly the per-contribution class cl.exe stamps. Fail loud on a
+    // non-power-of-two (no log2) or > 8192 (no encoding exists) — either
+    // would otherwise ship silently-wrong align bits. The JSON row's
+    // `type` must arrive WITHOUT align bits (the rows deliberately carry
+    // none); OR-ing onto preexisting bits would corrupt the class field
+    // (e.g. ALIGN_16 | ALIGN_4 reads as ALIGN_64).
+    auto const alignBitsFor =
+        [&](std::uint64_t maxAlign, ObjectFormatSectionInfo const& row,
+            std::string_view sectionLabel,
+            std::uint32_t& bitsOut) -> bool {
+        constexpr std::uint32_t kAlignClassMask = 0x00F00000u;
+        if (!std::has_single_bit(maxAlign) || maxAlign > 8192u) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encode (Obj): {} section alignment {} "
+                             "has no IMAGE_SCN_ALIGN_*BYTES encoding - "
+                             "COFF expresses object-section alignment as "
+                             "a power of two between 1 and 8192 bytes.",
+                             sectionLabel, maxAlign));
+            return false;
+        }
+        if ((row.type & kAlignClassMask) != 0) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encode (Obj): {} schema row '{}' "
+                             "Characteristics 0x{:x} already carries "
+                             "IMAGE_SCN_ALIGN_*BYTES bits - the .obj "
+                             "walker derives the align class from the "
+                             "layout (H1) and OR-ing would corrupt it; "
+                             "declare the row without align bits.",
+                             sectionLabel, row.name, row.type));
+            return false;
+        }
+        bitsOut = static_cast<std::uint32_t>(
+                      std::countr_zero(maxAlign) + 1)
+                  << 20;
+        return true;
+    };
+    std::uint32_t rodataAlignBits = 0;
+    std::uint32_t dataAlignBits   = 0;
+    std::uint32_t relroAlignBits  = 0;
+    std::uint32_t bssAlignBits    = 0;
+    if (hasRodata && !alignBitsFor(rodataLayout.maxAlign, *secRodata,
+                                   "rodata", rodataAlignBits)) {
+        return {};
+    }
+    if (hasData && !alignBitsFor(dataLayout.maxAlign, *secData, "data",
+                                 dataAlignBits)) {
+        return {};
+    }
+    if (hasRelRo && !alignBitsFor(relroLayout.maxAlign, *secRelRo,
+                                  "relro", relroAlignBits)) {
+        return {};
+    }
+    if (hasBss && !alignBitsFor(bssLayout.maxAlign, *secBss, "bss",
+                                bssAlignBits)) {
+        return {};
+    }
+    // u32 overflow belt (SizeOfRawData / pointers are u32 wire fields —
+    // the PE-exec checkU32Span mirror): surface a > 4 GiB span loud
+    // rather than silently truncating at the narrowing casts below.
+    auto const checkU32Span = [&](char const* kindName,
+                                  std::uint64_t span) -> bool {
+        if (span > std::numeric_limits<std::uint32_t>::max()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encode (Obj): {} section size {} bytes "
+                             "exceeds the PE/COFF u32 wire limit "
+                             "(2^32-1); the format cannot represent "
+                             "this object.",
+                             kindName, span));
+            return false;
+        }
+        return true;
+    };
+    if (!checkU32Span("rodata", rodataLayout.spanSize)
+        || !checkU32Span("data", dataLayout.spanSize)
+        || !checkU32Span("relro", relroLayout.spanSize)
+        || !checkU32Span("bss", bssLayout.spanSize)) {
+        return {};
+    }
 
     // ── Build .text + per-function symbols ─────────────────────
     std::vector<std::uint8_t> text;
@@ -601,44 +805,42 @@ encode(AssembledModule const&    module,
                             static_cast<std::uint64_t>(fn.bytes.size())});
     }
 
-    // ── Build .text relocation table ───────────────────────────
-    //
-    // PE/COFF stores relocations per-section, immediately after the
-    // section's raw data. Each IMAGE_RELOCATION is 10 bytes packed.
+    // 1-based COFF section ordinals (IMAGE_SYMBOL SectionNumber /
+    // section-header order): .text = 1, then each present data section
+    // in emission order (rodata → data → relro → bss — bss last, the
+    // no-file-bytes tail; matches the Mach-O zerofill-last mirror).
+    std::int16_t sectOrdinalCursor = 1;   // .text
+    std::int16_t const IDX_RODATA =
+        hasRodata ? ++sectOrdinalCursor : 0;
+    std::int16_t const IDX_DATA  = hasData ? ++sectOrdinalCursor : 0;
+    std::int16_t const IDX_RELRO = hasRelRo ? ++sectOrdinalCursor : 0;
+    std::int16_t const IDX_BSS   = hasBss ? ++sectOrdinalCursor : 0;
+    std::size_t const numSections =
+        static_cast<std::size_t>(sectOrdinalCursor);
 
-    // Index every symbol the writer will emit so the relocation
-    // records can reference them by SymbolTableIndex.
+    // ── Build symbol-table indices ─────────────────────────────
+    //
+    // Order: defined FUNCTION symbols → synthetic per-BLOCK locals
+    // (computed-goto / jump-table targets at interior .text offsets) →
+    // defined DATA symbols (SectionNumber = the data section's ordinal,
+    // Value = the item's SECTION-RELATIVE offset) → undefined externs
+    // (SectionNumber = 0). The IMAGE_RELOCATION SymbolTableIndex values
+    // below must match this exact order.
+    //
+    // AUX-ENTRY ACCOUNTING: COFF SymbolTableIndex counts auxiliary
+    // records as index slots. This writer emits ZERO aux records (every
+    // appendSym call below passes numAuxSymbols = 0 — no section-
+    // definition, file, or function-definition aux), so a symbol's index
+    // equals its record ordinal with no adjustment. If aux records are
+    // ever added, every index minted here must skip them.
     //
     // Symbol indices are minted strictly with `emplace.second` —
     // duplicates do not advance the index counter (silent-failure
     // H3 fix: prior version `nextSymIdx++` ran unconditionally,
     // desynchronizing the index map from the appended symtab).
-    // O(1) lookup against an `unordered_set<SymbolId>` of defined
-    // symbols replaces the prior O(n²) linear scans (simplifier
-    // fold-in #5).
     std::unordered_map<SymbolId, std::uint32_t> symIdxBySymbol;
-    symIdxBySymbol.reserve(module.functions.size() * 2);
-
-    std::unordered_set<SymbolId> definedSet;
-    definedSet.reserve(module.functions.size());
-    for (auto const& f : funcSyms) definedSet.insert(f.symId);
-
-    std::vector<SymbolId> externSyms;
-    std::unordered_set<SymbolId> externSeen;
-    for (auto const& fn : module.functions) {
-        for (auto const& rel : fn.relocations) {
-            if (definedSet.contains(rel.target)) continue;
-            // Externs become IMAGE_SYM_UNDEFINED entries (SectionNumber=0).
-            if (externSeen.insert(rel.target).second) {
-                externSyms.push_back(rel.target);
-            }
-        }
-    }
-
-    // Assign symbol-table indices: defined functions first (mirrors
-    // LK1's discipline), then externs. PE doesn't require this
-    // ordering but the ELF writer uses it and consistency simplifies
-    // the test fixtures. Index advances ONLY when emplace succeeds.
+    symIdxBySymbol.reserve(module.functions.size()
+                           + module.dataItems.size());
     std::uint32_t nextSymIdx = 0;
     for (auto const& f : funcSyms) {
         auto const [it, fresh] =
@@ -653,21 +855,122 @@ encode(AssembledModule const&    module,
         }
         ++nextSymIdx;
     }
+
+    // D-CSUBSET-COMPUTED-GOTO / jump tables: synthetic per-block symbols
+    // (the `&&label` / dense-switch jump-table relocation targets) are
+    // intra-module DEFINED LOCAL symbols pointing at an interior `.text`
+    // offset. Register + emit them as IMAGE_SYM_CLASS_STATIC (LOCAL — a
+    // sibling object's unrelated `sym_<id>` must never bind to or be
+    // bound by an interior block address; the ELF STB_LOCAL / Mach-O
+    // no-N_EXT mirror), SectionNumber = 1 (.text), Value =
+    // funcTextStart + blockByteOffset (SECTION-relative — for .text that
+    // equals the flat offset). Registering them BEFORE the undefined-
+    // extern scan makes a jump-table slot's abs64 reloc resolve to this
+    // defined local rather than the extern fallback fabricating a bogus
+    // undefined `sym_<id>` nothing can ever define (the c147 Mach-O
+    // CRITICAL fold, baked into the PE arm from the start).
+    struct BlockSymRecord {
+        SymbolId      symId{};
+        std::uint64_t textOffset = 0;
+    };
+    std::vector<BlockSymRecord> blockSyms;
+    for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
+        for (auto const& bs : module.functions[fi].blockSymbols) {
+            auto const [it, fresh] =
+                symIdxBySymbol.emplace(bs.symbol, nextSymIdx);
+            if (!fresh) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::string{"PE writer: synthetic block symbol #"}
+                         + std::to_string(bs.symbol.v)
+                         + " collides with an already-registered symbol"
+                           " - block SymbolIds must be unique.");
+                return {};
+            }
+            ++nextSymIdx;
+            blockSyms.push_back(
+                {bs.symbol, funcTextStart[fi] + bs.blockByteOffset});
+        }
+    }
+
+    // Defined DATA symbols — one IMAGE_SYMBOL per NAMED item (anonymous
+    // SymbolId{} items are section-offset-referenced, never reloc
+    // targets — M1 skip). A SymbolId colliding with an already-
+    // registered (function / block / data) symbol is a producer-contract
+    // breach — fail loud (the ELF ET_REL / Mach-O K_DuplicateDataSymbol
+    // mirror), never a silent skip that would bind a reloc to the WRONG
+    // symbol.
+    struct DataSymRecord {
+        SymbolId      symId{};
+        std::int16_t  sectionNumber = 0;      // 1-based ordinal
+        std::uint64_t sectionRelOffset = 0;   // COFF Value convention
+    };
+    std::vector<DataSymRecord> dataSyms;
+    auto registerDataSyms =
+        [&](link::format::ExecDataSectionLayout const& layout,
+            std::int16_t sectionNumber) -> bool {
+        for (std::size_t j = 0; j < layout.itemIndices.size(); ++j) {
+            AssembledData const& di =
+                module.dataItems[layout.itemIndices[j]];
+            if (di.symbol == SymbolId{}) continue;   // anonymous item (M1)
+            if (!symIdxBySymbol.emplace(di.symbol, nextSymIdx).second) {
+                emit(reporter, DiagnosticCode::K_DuplicateDataSymbol,
+                     std::format(
+                         "pe::encode (Obj): data SymbolId={{ {} }} "
+                         "collides with an already-emitted symbol - a "
+                         "data global's SymbolId must be unique.",
+                         di.symbol.v));
+                return false;
+            }
+            ++nextSymIdx;
+            dataSyms.push_back({di.symbol, sectionNumber,
+                                layout.itemOffsets[j]});
+        }
+        return true;
+    };
+    if (hasRodata && !registerDataSyms(rodataLayout, IDX_RODATA)) {
+        return {};
+    }
+    if (hasData && !registerDataSyms(dataLayout, IDX_DATA)) return {};
+    if (hasRelRo && !registerDataSyms(relroLayout, IDX_RELRO)) return {};
+    if (hasBss && !registerDataSyms(bssLayout, IDX_BSS)) return {};
+
+    // Undefined externs: any reloc target that is neither a defined
+    // function / block / data symbol. Scans DATA-ITEM relocations too
+    // (the ELF c145 / Mach-O c147 mirror) — a relro const table of libc
+    // function pointers whose targets appear in NO function reloc still
+    // needs its IMAGE_SYM_UNDEFINED entries so the data IMAGE_RELOCATION
+    // records below resolve their SymbolTableIndex.
+    std::vector<SymbolId> externSyms;
+    std::unordered_set<SymbolId> externSeen;
+    auto noteExternTarget = [&](SymbolId target) {
+        if (symIdxBySymbol.contains(target)) return;   // defined
+        if (externSeen.insert(target).second) externSyms.push_back(target);
+    };
+    for (auto const& fn : module.functions)
+        for (auto const& rel : fn.relocations) noteExternTarget(rel.target);
+    for (auto const& di : module.dataItems)
+        for (auto const& rel : di.relocations) noteExternTarget(rel.target);
     for (auto const& e : externSyms) {
         if (symIdxBySymbol.emplace(e, nextSymIdx).second) ++nextSymIdx;
     }
 
-    // Per-section relocation table (only `.text` has relocations
-    // in this cycle scope).
+    // ── Build .text relocation table ───────────────────────────
     //
+    // PE/COFF stores relocations per-section. Each IMAGE_RELOCATION is
+    // 10 bytes packed; each reloc-bearing section header names its own
+    // table via PointerToRelocations/NumberOfRelocations.
+
     // PE/COFF convention: the relocation addend lives IN THE PATCH
     // BYTES (the section's raw data), NOT as a separate field on
     // the IMAGE_RELOCATION record. ELF Rela carries `r_addend`
     // explicitly; PE has no such column. If an `AssembledModule`
-    // arrives with `rel.addend != 0`, the PE walker would silently
-    // drop the addend — that's exactly the silent-failure class the
-    // substrate discipline rejects. Fail loud so the caller fixes
-    // the assembler (or pre-stamps the addend into the patch bytes).
+    // FUNCTION reloc arrives with `rel.addend != 0`, the PE walker
+    // would silently drop the addend — that's exactly the silent-
+    // failure class the substrate discipline rejects. Fail loud so the
+    // caller fixes the assembler (or pre-stamps the addend into the
+    // patch bytes). DATA-item relocations differ: their slot bytes ARE
+    // the addend carrier, so the data-reloc pass below WRITES the
+    // addend in-slot instead (see its block comment).
     std::vector<std::uint8_t> textRelocs;
     std::uint32_t textRelocCount = 0;
     for (std::size_t fi = 0; fi < module.functions.size(); ++fi) {
@@ -702,21 +1005,159 @@ encode(AssembledModule const&    module,
         }
     }
 
-    // Silent-failure C1 guard: PE/COFF spec §4 says when relocation
-    // count > 65534, the writer must set IMAGE_SCN_LNK_NRELOC_OVFL
-    // (0x01000000) in section Characteristics AND put the real count
-    // in the first IMAGE_RELOCATION's VirtualAddress field. That
-    // path is not implemented in this cycle; emit a hard diagnostic
-    // rather than silently truncating to u16. Anchored at plan 14
-    // §3.1 as a deferred item (overflow path arrives with the first
-    // module that needs it).
-    if (textRelocCount > 0xFFFEu) {
+    // ── Build per-DATA-SECTION IMAGE_RELOCATION tables ─────────
+    //
+    // D-LK-RELRO-CONST-DATA-RELOCATABLE (PE/COFF Obj arm, c148) — the
+    // `.rela.data` / `.rela.data.rel.ro` analog: a data section whose
+    // items carry their OWN relocations (a const/mutable pointer table —
+    // sqlite's VFS method tables + `aSyscall[]`) gets its own
+    // IMAGE_RELOCATION table (PointerToRelocations/NumberOfRelocations).
+    // Each record: u32 VirtualAddress = the slot's offset WITHIN its
+    // section (a .obj section's VA base is 0), u32 SymbolTableIndex, u16
+    // Type = the reloc kind's format-declared nativeId (an abs64 slot
+    // arrives as the schema's IMAGE_REL_AMD64_ADDR64 row — read from the
+    // JSON, never hardcoded). A data reloc is NEVER a call, so the plain
+    // nativeId is always used.
+    //
+    // ADDEND: IMAGE_RELOCATION has NO addend column. The .text table
+    // above fails loud on a non-zero addend (the assembler pre-stamps
+    // call/jmp patch bytes). A DATA slot is different: link.exe reads
+    // the slot CONTENT as the implicit addend for ADDR64 (final = S +
+    // slot) — the in-place-addend convention cl.exe itself emits for
+    // `&arr[1]`-style initializers, and exactly what the PE-exec DIR64
+    // path realizes when `applyDataItemRelocations` resolves S+A into
+    // the slot. So the writer WRITES rel.addend into the slot bytes here
+    // (the producer zero-fills every reloc slot, so the write is
+    // authoritative, not additive). Failing loud instead would
+    // gratuitously reject initializers the ELF/Mach-O mirrors support.
+    auto buildDataRelocTable =
+        [&](link::format::ExecDataSectionLayout& layout,
+            std::string_view sectionLabel,
+            std::vector<std::uint8_t>& relocsOut,
+            std::uint32_t& relocCountOut) -> bool {
+        for (std::size_t j = 0; j < layout.itemIndices.size(); ++j) {
+            AssembledData const& di =
+                module.dataItems[layout.itemIndices[j]];
+            std::uint64_t const itemOff = layout.itemOffsets[j];
+            for (auto const& rel : di.relocations) {
+                auto const* fmtReloc = fmt.relocationByKind(rel.kind);
+                if (fmtReloc == nullptr) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("pe::encode (Obj): {} data "
+                                     "relocation kind {} is not declared "
+                                     "by object format '{}'.",
+                                     sectionLabel, rel.kind.v, fmt.name()));
+                    return false;
+                }
+                auto const* tri = targetSchema.relocationInfo(rel.kind);
+                if (tri == nullptr) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("pe::encode (Obj): {} data "
+                                     "relocation kind {} has no "
+                                     "TargetRelocationInfo on target "
+                                     "schema '{}'.",
+                                     sectionLabel, rel.kind.v,
+                                     targetSchema.name()));
+                    return false;
+                }
+                // A data pointer slot needs a plain LINEAR absolute fixup
+                // with a concrete width. `pcRelative` alone is NOT a
+                // sufficient discriminator (it is a Linear-only field —
+                // the loader forces every non-Linear formula row to
+                // pcRelative=false), so reject any non-Linear kind
+                // outright (the c147 Mach-O gate, copied verbatim).
+                if (tri->formulaKind != RelocFormulaKind::Linear
+                    || tri->pcRelative || tri->widthBytes == 0) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("pe::encode (Obj): {} data item "
+                                     "SymbolId={{ {} }} relocation '{}' "
+                                     "is pc-relative, zero-width, or a "
+                                     "non-linear instruction fixup - a "
+                                     "data pointer needs a plain absolute "
+                                     "fixup with a concrete write width.",
+                                     sectionLabel, di.symbol.v, tri->name));
+                    return false;
+                }
+                auto const it = symIdxBySymbol.find(rel.target);
+                if (it == symIdxBySymbol.end()) {
+                    emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                         std::format("pe::encode (Obj): {} data "
+                                     "relocation target symbol #{} has no "
+                                     "symtab entry - substrate-invariant "
+                                     "violation.",
+                                     sectionLabel, rel.target.v));
+                    return false;
+                }
+                std::uint64_t const patchOff = itemOff + rel.offset;
+                if (rel.offset + tri->widthBytes > di.bytes.size()
+                    || patchOff + tri->widthBytes > layout.bytes.size()) {
+                    emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                         std::format("pe::encode (Obj): {} data item "
+                                     "SymbolId={{ {} }} relocation offset "
+                                     "{} + width {} overruns the item's "
+                                     "{} bytes.",
+                                     sectionLabel, di.symbol.v, rel.offset,
+                                     static_cast<int>(tri->widthBytes),
+                                     di.bytes.size()));
+                    return false;
+                }
+                // In-place addend (see the block comment above): the slot
+                // bytes carry A; link.exe computes S + slot. addend 0
+                // rewrites the producer's zero slot — a no-op by
+                // construction.
+                auto const a = static_cast<std::uint64_t>(rel.addend);
+                for (std::uint8_t b = 0; b < tri->widthBytes; ++b) {
+                    layout.bytes[static_cast<std::size_t>(patchOff) + b] =
+                        static_cast<std::uint8_t>((a >> (8u * b)) & 0xFFu);
+                }
+                appendU32LE(relocsOut,
+                            static_cast<std::uint32_t>(patchOff));
+                appendU32LE(relocsOut, it->second);
+                appendU16LE(relocsOut,
+                            static_cast<std::uint16_t>(fmtReloc->nativeId));
+                ++relocCountOut;
+            }
+        }
+        return true;
+    };
+    std::vector<std::uint8_t> dataRelocs;
+    std::uint32_t dataRelocCount = 0;
+    std::vector<std::uint8_t> relroRelocs;
+    std::uint32_t relroRelocCount = 0;
+    if (hasData
+        && !buildDataRelocTable(dataLayout, "data", dataRelocs,
+                                dataRelocCount)) {
+        return {};
+    }
+    if (hasRelRo
+        && !buildDataRelocTable(relroLayout, "relro", relroRelocs,
+                                relroRelocCount)) {
+        return {};
+    }
+
+    // Silent-failure C1 guard: PE/COFF spec §4 says when a section's
+    // relocation count > 65534, the writer must set
+    // IMAGE_SCN_LNK_NRELOC_OVFL (0x01000000) in section Characteristics
+    // AND put the real count in the first IMAGE_RELOCATION's
+    // VirtualAddress field. That path is not implemented; emit a hard
+    // diagnostic rather than silently truncating to u16. Anchored at
+    // plan 14 §3.1 as a deferred item (overflow path arrives with the
+    // first module that needs it). Applied PER SECTION — the u16
+    // NumberOfRelocations is a per-header field.
+    auto const checkRelocCountFits = [&](char const* sectionLabel,
+                                         std::uint32_t count) -> bool {
+        if (count <= 0xFFFEu) return true;
         emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
-             std::string{"PE writer: relocation count "}
-                 + std::to_string(textRelocCount)
+             std::string{"PE writer: "} + sectionLabel
+                 + " relocation count " + std::to_string(count)
                  + " exceeds u16 capacity; PE/COFF NRELOC_OVFL overflow "
                    "path is anchored as plan 14 §3.1 D-LK2-3 (LK6 trigger). "
                    "Module too large for cycle-1 PE writer.");
+        return false;
+    };
+    if (!checkRelocCountFits(".text", textRelocCount)
+        || !checkRelocCountFits(".data", dataRelocCount)
+        || !checkRelocCountFits("relro", relroRelocCount)) {
         return {};
     }
 
@@ -771,10 +1212,52 @@ encode(AssembledModule const&    module,
                         IMAGE_SYM_DTYPE_FUNCTION,
                         IMAGE_SYM_CLASS_EXTERNAL);
     }
+    // Synthetic per-block symbols (computed-goto labels / dense-switch
+    // jump-table targets): IMAGE_SYM_CLASS_STATIC — deliberately LOCAL,
+    // so a sibling object's unrelated `sym_<id>` can never bind to (or
+    // be bound by) an interior block address — SectionNumber = 1
+    // (.text), Value = the section-relative text offset. Emission order
+    // matches the symIdxBySymbol registration above (functions → blocks
+    // → data → externs) so relocation SymbolTableIndex values line up.
+    // The ELF STB_LOCAL / Mach-O no-N_EXT block-symbol legs are the
+    // mirrors (c147 fold, baked in).
+    for (auto const& b : blockSyms) {
+        std::string const symName =
+            std::string{"sym_"} + std::to_string(b.symId.v);
+        emitSymWithName(symName,
+                        static_cast<std::uint32_t>(b.textOffset),
+                        kTextSectionNumber,
+                        /*type=*/0,
+                        IMAGE_SYM_CLASS_STATIC);
+    }
+    // Defined DATA symbols (D-LK-OBJECT-DATA-SECTION-RELOCATABLE, PE
+    // arm): EXTERNAL, SectionNumber = the item's 1-based section
+    // ordinal, Value = the item's SECTION-RELATIVE offset (the COFF
+    // convention — dumpbin shows e.g. `table` as `00000000 SECT4
+    // External`; NOT Mach-O's flat-address n_value), type = 0 (COFF
+    // data symbols are `notype`; DTYPE_FUNCTION is functions-only).
+    // Externally-visible items carry their real (identity-mangled)
+    // name; static/synthesized ones keep `sym_<id>` (the same carve-out
+    // the function loop above uses).
+    for (auto const& d : dataSyms) {
+        std::string const symName = objNames.definedName(d.symId, "sym_");
+        emitSymWithName(symName,
+                        static_cast<std::uint32_t>(d.sectionRelOffset),
+                        d.sectionNumber,
+                        /*type=*/0,
+                        IMAGE_SYM_CLASS_EXTERNAL);
+    }
     // Undefined extern symbols (SectionNumber=0=UNDEF, type=0,
-    // value=0).
+    // value=0). D-LK-OBJECT-EXTERN-CALL-RELOCATABLE (PE arm, c148): the
+    // undefined extern carries its REAL import name (`externName` — the
+    // pipeline-mangled `mangledName`; PE x64 C mangling is IDENTITY, so
+    // `puts` is emitted verbatim with no leading underscore) so the
+    // FINAL linker (link.exe / lld-link) resolves it against a sibling
+    // object or an import library — the PE analog of the ELF c141 /
+    // Mach-O c146 fix. `sym_<id>` remains the fallback for a reloc
+    // target that is neither defined nor a known import.
     for (auto const& e : externSyms) {
-        std::string const symName = "sym_" + std::to_string(e.v);
+        std::string const symName = objNames.externName(e, "sym_");
         emitSymWithName(symName, /*value=*/0, IMAGE_SYM_UNDEFINED,
                         /*type=*/0, IMAGE_SYM_CLASS_EXTERNAL);
     }
@@ -782,28 +1265,55 @@ encode(AssembledModule const&    module,
     // ── Layout the file: header → section headers → section data
     //    → per-section relocs → symbol table → string table ─────
     //
-    // Section count is DERIVED from the section-header vector built
-    // below (architect D-LK2-5 convergence): pre-fix hardcoded
-    // literal `1` would silently corrupt the file when LK6 adds
-    // .data/.rdata. Same fix that closed B-LK1-2 on the ELF side.
+    // Section count is DERIVED from `numSections` (the ordinal cursor
+    // above — architect D-LK2-5 convergence; a hardcoded literal would
+    // silently corrupt the file whenever a data section appears). Raw
+    // section data is PACKED back-to-back with no inter-section file
+    // padding — cl.exe's own convention (its raw pointers land at odd
+    // offsets); a COFF contribution's placement alignment comes from the
+    // Characteristics ALIGN bits at final link, never its file offset.
+    // A data-free module derives numSections = 1 and every offset below
+    // collapses to the historical single-section layout — BYTE-IDENTICAL
+    // output (an explicit test pin).
     std::vector<PeSectionHeader> sectionHeaders;
-    std::size_t const kNumSectionsEmitted = 1;  // .text only, current
-                                                 // cycle — sized at
-                                                 // emit time below.
     std::size_t const sectionDataOffsetBase =
-        kFileHeaderSize + kNumSectionsEmitted * kSectionHeaderSize;
+        kFileHeaderSize + numSections * kSectionHeaderSize;
 
     std::uint32_t const textRawPointer =
         static_cast<std::uint32_t>(sectionDataOffsetBase);
     std::uint32_t const textRawSize    =
         static_cast<std::uint32_t>(text.size());
+    // File-backed data sections follow .text (rodata → data → relro);
+    // .bss stores NO file bytes (PointerToRawData = 0 — its span rides
+    // SizeOfRawData only, the cl.exe-witnessed COFF .obj convention).
+    std::uint32_t rawCursor = textRawPointer + textRawSize;
+    std::uint32_t const rodataRawPointer = hasRodata ? rawCursor : 0u;
+    if (hasRodata) {
+        rawCursor += static_cast<std::uint32_t>(rodataLayout.spanSize);
+    }
+    std::uint32_t const dataRawPointer = hasData ? rawCursor : 0u;
+    if (hasData) {
+        rawCursor += static_cast<std::uint32_t>(dataLayout.spanSize);
+    }
+    std::uint32_t const relroRawPointer = hasRelRo ? rawCursor : 0u;
+    if (hasRelRo) {
+        rawCursor += static_cast<std::uint32_t>(relroLayout.spanSize);
+    }
+    // Relocation tables follow ALL file-backed section bytes (.text's
+    // first, then each reloc-bearing data section's — the same order the
+    // section headers are emitted). A no-reloc table keeps pointer = 0.
+    std::uint32_t relocCursor = rawCursor;
     std::uint32_t const textRelocPointer =
-        textRelocCount > 0 ? textRawPointer + textRawSize : 0u;
-    std::uint32_t const textRelocSize =
-        static_cast<std::uint32_t>(textRelocs.size());
+        textRelocCount > 0 ? relocCursor : 0u;
+    relocCursor += static_cast<std::uint32_t>(textRelocs.size());
+    std::uint32_t const dataRelocPointer =
+        dataRelocCount > 0 ? relocCursor : 0u;
+    relocCursor += static_cast<std::uint32_t>(dataRelocs.size());
+    std::uint32_t const relroRelocPointer =
+        relroRelocCount > 0 ? relocCursor : 0u;
+    relocCursor += static_cast<std::uint32_t>(relroRelocs.size());
 
-    std::uint32_t const symtabPointer =
-        textRawPointer + textRawSize + textRelocSize;
+    std::uint32_t const symtabPointer = relocCursor;
     std::uint32_t const symtabSizeBytes =
         static_cast<std::uint32_t>(symtab.size());
     // Substrate invariant: every `appendSym` writes exactly 18
@@ -827,9 +1337,30 @@ encode(AssembledModule const&    module,
     std::vector<std::uint8_t> bytes;
     bytes.reserve(symtabPointer + symtabSizeBytes + strtab.size());
 
-    // Build the section header for .text (the only emitted section
-    // this cycle); push onto the vector so NumberOfSections derives
-    // from `.size()`.
+    // The .obj arm never adds section names to the string table, so a
+    // schema row name > 8 chars would silently encode as a dangling
+    // `/0` string-table reference. Every shipped PE row name fits; fail
+    // loud on a future JSON edit rather than emit a corrupt header.
+    auto const checkSectionNameFits =
+        [&](ObjectFormatSectionInfo const& row) -> bool {
+        if (row.name.size() <= 8) return true;
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("pe::encode (Obj): section name '{}' exceeds 8 "
+                         "chars; the .obj writer does not emit the "
+                         "COFF long-name (/N string-table) form.",
+                         row.name));
+        return false;
+    };
+    if (!checkSectionNameFits(*secText)
+        || (hasRodata && !checkSectionNameFits(*secRodata))
+        || (hasData && !checkSectionNameFits(*secData))
+        || (hasRelRo && !checkSectionNameFits(*secRelRo))
+        || (hasBss && !checkSectionNameFits(*secBss))) {
+        return {};
+    }
+
+    // Section header for .text; data-section headers follow in ordinal
+    // order (rodata → data → relro → bss).
     {
         PeSectionHeader hText{};
         hText.name                  = encodeSectionName(secText->name, 0);
@@ -844,7 +1375,67 @@ encode(AssembledModule const&    module,
         hText.characteristics       = secText->type;  // PE uses substrate
                                                        // `type` field for
                                                        // Characteristics
+                                                       // (.text row carries
+                                                       // its align bits
+                                                       // statically)
         sectionHeaders.push_back(hText);
+    }
+    // Data-section headers. VirtualSize/VirtualAddress = 0 (.obj);
+    // SizeOfRawData = the section span (for .bss the ZERO-FILL span with
+    // PointerToRawData = 0 — the cl.exe-witnessed convention: dumpbin
+    // shows `.bss` SizeOfRawData = 0x190, no raw pointer);
+    // Characteristics = the schema row's class bits OR the walker-derived
+    // IMAGE_SCN_ALIGN_*BYTES (validated align-bit-free above).
+    auto const pushDataSectionHeader =
+        [&](ObjectFormatSectionInfo const& row,
+            link::format::ExecDataSectionLayout const& layout,
+            bool zeroFill, std::uint32_t rawPointer,
+            std::uint32_t relocPointer, std::uint32_t relocCount,
+            std::uint32_t alignBits) {
+        PeSectionHeader h{};
+        h.name                 = encodeSectionName(row.name, 0);
+        h.virtualSize          = 0;
+        h.virtualAddress       = 0;
+        h.sizeOfRawData        =
+            static_cast<std::uint32_t>(layout.spanSize);
+        h.pointerToRawData     = zeroFill ? 0u : rawPointer;
+        h.pointerToRelocations = relocPointer;
+        h.pointerToLinenumbers = 0;
+        h.numberOfRelocations  = static_cast<std::uint16_t>(relocCount);
+        h.numberOfLinenumbers  = 0;
+        h.characteristics      = row.type | alignBits;
+        sectionHeaders.push_back(h);
+    };
+    if (hasRodata) {
+        pushDataSectionHeader(*secRodata, rodataLayout, /*zeroFill=*/false,
+                              rodataRawPointer, /*relocPointer=*/0,
+                              /*relocCount=*/0, rodataAlignBits);
+    }
+    if (hasData) {
+        pushDataSectionHeader(*secData, dataLayout, /*zeroFill=*/false,
+                              dataRawPointer, dataRelocPointer,
+                              dataRelocCount, dataAlignBits);
+    }
+    if (hasRelRo) {
+        pushDataSectionHeader(*secRelRo, relroLayout, /*zeroFill=*/false,
+                              relroRawPointer, relroRelocPointer,
+                              relroRelocCount, relroAlignBits);
+    }
+    if (hasBss) {
+        pushDataSectionHeader(*secBss, bssLayout, /*zeroFill=*/true,
+                              /*rawPointer=*/0, /*relocPointer=*/0,
+                              /*relocCount=*/0, bssAlignBits);
+    }
+    // Belt: the header vector must match the ordinal cursor the symbol
+    // SectionNumbers were minted from — a drift here would bind every
+    // data symbol to the WRONG section at final link.
+    if (sectionHeaders.size() != numSections) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("pe::encode (Obj): emitted {} section headers "
+                         "but the ordinal cursor derived {} - "
+                         "substrate-invariant violation.",
+                         sectionHeaders.size(), numSections));
+        return {};
     }
 
     // IMAGE_FILE_HEADER
@@ -862,9 +1453,40 @@ encode(AssembledModule const&    module,
         writeSectionHeader(bytes, h);
     }
 
-    // Section data + relocations
+    // Section raw data (.text, then each file-backed data section —
+    // .bss stores nothing), then the relocation tables (.text, data,
+    // relro — the layouts' bytes already carry the in-slot addends the
+    // data-reloc pass patched).
     bytes.insert(bytes.end(), text.begin(), text.end());
+    if (hasRodata) {
+        bytes.insert(bytes.end(), rodataLayout.bytes.begin(),
+                     rodataLayout.bytes.end());
+    }
+    if (hasData) {
+        bytes.insert(bytes.end(), dataLayout.bytes.begin(),
+                     dataLayout.bytes.end());
+    }
+    if (hasRelRo) {
+        bytes.insert(bytes.end(), relroLayout.bytes.begin(),
+                     relroLayout.bytes.end());
+    }
     bytes.insert(bytes.end(), textRelocs.begin(), textRelocs.end());
+    bytes.insert(bytes.end(), dataRelocs.begin(), dataRelocs.end());
+    bytes.insert(bytes.end(), relroRelocs.begin(), relroRelocs.end());
+
+    // The emitted byte cursor must equal the symtab pointer stamped into
+    // the file header — a file-backed layout whose bytes diverge from
+    // its spanSize would silently shift every trailing structure.
+    if (bytes.size() != symtabPointer) {
+        emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+             std::format("pe::encode (Obj): assembled section data ends "
+                         "at {} but the layout computed symtab pointer "
+                         "{} - substrate-invariant violation (a "
+                         "file-backed layout's bytes must equal its "
+                         "spanSize).",
+                         bytes.size(), symtabPointer));
+        return {};
+    }
 
     // Symbol table
     bytes.insert(bytes.end(), symtab.begin(), symtab.end());
@@ -876,16 +1498,45 @@ encode(AssembledModule const&    module,
     return bytes;
 }
 
-// ── PE32+ executable image (.exe) walker — LK2 cycle 2 ──────────
+// ── PE32+ image walker (.exe Exec / .dll Dll) — LK2 cycle 2 + c152 ──
 //
-// Closes plan 14 §3.1 D-LK2-1. Emits a minimal-valid PE32+ .exe
-// the Windows loader will accept: MS-DOS stub + PE signature +
-// IMAGE_FILE_HEADER (with EXECUTABLE_IMAGE flag) +
-// IMAGE_OPTIONAL_HEADER64 + section headers + section data
-// (fileAlignment-padded). Intra-module relocations are applied
-// in-place via the LK6 cycle 1 structured-formula triple
-// (`pcRelative + addendBias + widthBytes`). Extern symbols fail
-// loud (anchored D-LK6-2 — same boundary as ELF ET_EXEC).
+// Closes plan 14 §3.1 D-LK2-1 (Exec) + D-LK2-4 part 1 (Dll, c152 —
+// the PE mirror of the ELF c150 `.so`). Emits a minimal-valid PE32+
+// image the Windows loader will accept: MS-DOS stub + PE signature +
+// IMAGE_FILE_HEADER (EXECUTABLE_IMAGE, plus IMAGE_FILE_DLL on the
+// dll arm — both flags come from the SCHEMA's `pe.characteristics`,
+// validate()-pinned) + IMAGE_OPTIONAL_HEADER64 + section headers +
+// section data (fileAlignment-padded). Intra-module relocations are
+// applied in-place via the LK6 cycle 1 structured-formula triple
+// (`pcRelative + addendBias + widthBytes`).
+//
+// Dll divergences (all keyed on the schema's declared objectType —
+// the elf.cpp isDyn precedent, never a format-name branch):
+//   * AddressOfEntryPoint = 0 — a DSS .dll ships with NO DllMain
+//     (legal PE: the loader skips process/thread notifications for
+//     an entry-less module, the `link /NOENTRY` shape; the entry
+//     trampoline is already absent because the dll schema declares
+//     no `processExit` — linker.cpp's schema-keyed condition). The
+//     DllMain arm is the pinned follow-up D-LK2-DLL-DLLMAIN-ENTRY.
+//   * `.edata` export directory (data-directory[0]): Export Address
+//     Table + LEXICOGRAPHICALLY SORTED Name Pointer Table + Ordinal
+//     Table + DllName, built from `module.symbols` (externally-
+//     visible DEFINED functions + data globals under their real
+//     names — the same set the ELF dyn `.dynsym` exports, c150).
+//     GetProcAddress BINARY-SEARCHES the name table; the sort is a
+//     tested invariant (an unsorted table silently breaks lookup).
+//   * `.reloc` completeness: a DLL relocates — every absolute 64-bit
+//     slot in the image already gets an IMAGE_REL_BASED_DIR64 row
+//     (the c145 data-item machinery; the TLS directory VAs on exec).
+//     The remaining absolute-slot class — an absolute fixup in
+//     `.text` — is REJECTED loud on any DYNAMIC_BASE image
+//     (D-LK-PE-IMAGE-TEXT-ABS-RELOC below): its site is not
+//     collected into `.reloc`, so shipping it would leave a
+//     preferred-base address the loader never adjusts.
+//   * symbolVa keeps the schema's preferred ImageBase (0x180000000,
+//     the MSVC dll convention) — NO base-0 trick (unlike ELF dyn):
+//     PE DIR64 slots carry absolute preferred-base VAs the loader
+//     adjusts by the load delta.
 //
 // The validate() pass enforces the optional-header field
 // population, so this function never has to re-check those
@@ -901,6 +1552,9 @@ encodeExec(AssembledModule const&    module,
            DiagnosticReporter&       reporter) {
     auto const& id = fmt.pe();
     auto const& oh = fmt.peOptionalHeader();
+    // c152 (D-LK2-4): the dll-arm discriminator — schema-declared
+    // objectType, mirroring elf.cpp's `isDyn`.
+    bool const isDll = id.objectType == PeObjectType::Dll;
 
     // ── (a) Build .text body + per-function start map ─────────
     std::vector<std::uint8_t> text;
@@ -921,23 +1575,67 @@ encodeExec(AssembledModule const&    module,
     }
 
     // ── (a2) Reserve the import-thunk block at the tail of .text ──
-    // D-FFI-PE-IMPORT-THUNK: one code thunk per extern (`jmp *[IAT
-    // slot]`) — the PE analog of an ELF PLT stub / Mach-O __stubs
+    // D-FFI-PE-IMPORT-THUNK: one code thunk per FUNCTION extern (`jmp
+    // *[IAT slot]`) — the PE analog of an ELF PLT stub / Mach-O __stubs
     // entry. RESERVED here, BEFORE .text is sized, so textVirtualSize /
     // textRawSize / the data-chain RVAs (incl. .idata) all account for
     // it; the bytes are written in step (c2) once each IAT slot's VA is
-    // known. `symbolVa[extern]` then names the thunk (direct-plt),
+    // known. `symbolVa[funcExtern]` then names the thunk (direct-plt),
     // making an address-taken import a CALLABLE code address. Zero
     // externs → `resize(+0)` no-op → byte-identical output (the
     // extern-free byte-for-byte writer pins hold).
+    //
+    // c149 (D-LK-EXTERN-DATA-IMPORT, the PE half): a DATA extern
+    // (isData — an msvcrt `_fmode`-class data export) is never CALLED,
+    // so it gets NO thunk — only its IAT slot, which the loader fills
+    // with the imported OBJECT's address (`__imp_<name>` semantics; the
+    // Mach-O __got non-lazy-pointer model, same `got-indirect` binding).
+    // The thunk block is therefore COMPACTED to the function externs
+    // (`funcExternIdxs[j]` = the extern index of the j-th thunk —
+    // mirrors macho.cpp's D-LK-MACHO-DATA-EXTERN-DEAD-STUB compaction),
+    // while the `.idata` ILT/IAT/HINT-NAME layout below stays LOCKSTEP
+    // with EVERY extern (a data import's name resolves identically).
+    // symbolVa[dataExtern] binds to the IAT SLOT VA — never a thunk VA
+    // (reading jump-stub bytes as the object's value is the exact
+    // silent-miscompile class the linker's data-import gate guards).
+    std::vector<std::size_t> funcExternIdxs;
+    funcExternIdxs.reserve(module.externImports.size());
+    std::size_t numDataExterns = 0;
+    for (std::size_t i = 0; i < module.externImports.size(); ++i) {
+        if (module.externImports[i].isData) ++numDataExterns;
+        else funcExternIdxs.push_back(i);
+    }
+    if (numDataExterns > 0) {
+        // The linker's pre-walker gate admits data imports only when
+        // the schema DECLARES a binding model; this walker implements
+        // exactly `got-indirect` (the IAT-slot pointer). A future
+        // second member reaching here without a walker arm must fail
+        // loud, not silently get an IAT-slot binding it did not
+        // declare (mirrors elf.cpp's copy-relocation assertion and
+        // macho.cpp's got-indirect assertion).
+        auto const binding = fmt.dataImportBinding();
+        if (!binding.has_value()
+            || *binding != DataImportBinding::GotIndirect) {
+            emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
+                 std::string{"pe::encodeExec: module carries "}
+                     + std::to_string(numDataExterns)
+                     + " extern DATA import(s) but format '"
+                     + std::string{fmt.name()}
+                     + "' does not declare 'dataImportBinding': "
+                       "\"got-indirect\" -- the only data-import "
+                       "mechanism this walker implements "
+                       "(D-LK-EXTERN-DATA-IMPORT).");
+            return {};
+        }
+    }
     std::size_t const peThunkSize    = peThunkSizeFor(id.machine);
-    std::size_t const numImportThunks = module.externImports.size();
+    std::size_t const numImportThunks = funcExternIdxs.size();
     if (numImportThunks > 0 && peThunkSize == 0) {
         emit(reporter, DiagnosticCode::K_FormatLacksImportSupport,
              std::format("pe::encodeExec: machine 0x{:x} declares {} extern "
-                         "import(s) but has no import-thunk emitter — an "
-                         "address-taken import needs a callable thunk. Add "
-                         "a per-machine emitter (see emitPeThunk).",
+                         "function import(s) but has no import-thunk emitter "
+                         "-- an address-taken import needs a callable thunk. "
+                         "Add a per-machine emitter (see emitPeThunk).",
                          id.machine, numImportThunks));
         return {};
     }
@@ -956,10 +1654,34 @@ encodeExec(AssembledModule const&    module,
     // falls back to `format.entryPoint()` string resolution, then
     // defaults to functions[0]. Synthesized-name prefix is "sym_"
     // for PE/ELF.
-    auto const entryIdxOpt = link::format::resolveEntryFnIdx(
-        module, fmt, "sym_", "pe::encodeExec", reporter);
-    if (!entryIdxOpt.has_value()) return {};
-    std::size_t const entryFnIdx = *entryIdxOpt;
+    //
+    // c152 (D-LK2-4): the Dll arm resolves NO entry —
+    // AddressOfEntryPoint is emitted as 0 (no DllMain; the loader
+    // skips the notification call for an entry-less module). A
+    // caller-provided `imageEntryOverride` on a dll module is a
+    // producer-contract breach (the linker never injects a
+    // trampoline for a schema without `processExit`; an override
+    // here means someone built entry machinery for an entry-less
+    // artifact) — fail loud rather than silently drop it.
+    std::size_t entryFnIdx = 0;
+    if (isDll) {
+        if (module.imageEntryOverride.has_value()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encodeExec (dll): module carries "
+                             "imageEntryOverride = {} but a PE dll has "
+                             "no image entry (AddressOfEntryPoint = 0, "
+                             "no DllMain -- D-LK2-DLL-DLLMAIN-ENTRY is "
+                             "the pinned follow-up). The entry override "
+                             "would be silently discarded (D-LK2-4).",
+                             *module.imageEntryOverride));
+            return {};
+        }
+    } else {
+        auto const entryIdxOpt = link::format::resolveEntryFnIdx(
+            module, fmt, "sym_", "pe::encodeExec", reporter);
+        if (!entryIdxOpt.has_value()) return {};
+        entryFnIdx = *entryIdxOpt;
+    }
 
     // ── (c) Synthesize .idata section for extern imports (LK6
     //         cycle 2a). PE32+ import-table layout per PE/COFF §6.4:
@@ -1139,7 +1861,8 @@ encodeExec(AssembledModule const&    module,
     // The u32-wire-limit guard for these spans rides the SAME `checkU32Span`
     // call the rdata/data/bss spans use (below, once the lambda is defined).
     // `allowItemRelocations=true`: PE patches data-item (data→data) relocations
-    // — its cross-CU thunk-slot feature — into the laid-out bytes below.
+    // (F5 symbol-address pointers, folded relro tables) into the laid-out
+    // bytes below + emits their `.reloc` DIR64 base relocations.
     auto rdataLayoutOpt = link::format::buildExecDataSection(
         module.dataItems, DataSectionKind::Rodata,
         /*alignFloor=*/1, "pe::encodeExec", reporter,
@@ -1199,7 +1922,7 @@ encodeExec(AssembledModule const&    module,
         return {};
     }
     // `.rdata` AND `.data` bytes are MUTABLE here because PE patches data-item
-    // relocations into them post-layout (below): cross-CU thunk slots + F5
+    // relocations into them post-layout (below): folded relro const tables + F5
     // string-rodata pointers land in `.rdata`; F5 MUTABLE symbol-address global
     // pointers (`char* g="..."`, `int* p=&x`) land in `.data` and carry an abs64
     // data→data reloc to their target's VA (the patched bytes are emitted at the
@@ -1208,7 +1931,7 @@ encodeExec(AssembledModule const&    module,
     std::vector<std::uint8_t> dataBytes  = dataDataLayout.bytes;
     // Original-dataItems-index → `.rdata` section-relative offset, for the
     // data-item-relocation patch loop below (the layout records these for the
-    // items it placed; reloc-bearing thunk slots are rodata).
+    // items it placed — including the relro items merged in above).
     std::unordered_map<std::size_t, std::uint64_t> rdataOffsetByIndex;
     for (std::size_t j = 0; j < rdataDataLayout.itemIndices.size(); ++j) {
         rdataOffsetByIndex.emplace(rdataDataLayout.itemIndices[j],
@@ -1415,8 +2138,214 @@ encodeExec(AssembledModule const&    module,
         }
     }
 
+    // ── (b4) `.edata` export directory — c152, D-LK2-4 (dll arm only) ──
+    //
+    // The PE mirror of the ELF dyn `.dynsym` export set (c150, elf.cpp
+    // (b.7)): every externally-visible DEFINED symbol — function or
+    // data global — from `module.symbols` (the same real-name rows the
+    // ET_REL `.symtab` uses, c139) becomes a named export. Local /
+    // Hidden / Internal symbols stay out (a `static` function is not
+    // part of the library's ABI); Weak exports export plainly (the PE
+    // export table has no binding column). Classification is by
+    // definition table: a row naming a function exports its `.text`
+    // RVA; a row naming a data item exports its section RVA
+    // (`.rdata`/`.data`/`.bss` — a data export's EAT RVA points into
+    // the mapped section; the consumer knows it is an object).
+    //
+    // Byte layout (PE/COFF §6.3), one self-contained `.edata` section:
+    //   [0]    IMAGE_EXPORT_DIRECTORY (40 B)
+    //   [40]   Export Address Table          — u32 RVA × N
+    //   [...]  Name Pointer Table            — u32 RVA × N, SORTED
+    //   [...]  Ordinal Table                 — u16 × N
+    //   [...]  DllName string + export-name strings
+    //
+    // ★ SORT INVARIANT: GetProcAddress BINARY-SEARCHES the Name
+    // Pointer Table (memcmp order — unsigned bytes); an unsorted
+    // table silently breaks lookup for a subset of names. The records
+    // are sorted here and the EAT is laid out IN SORTED ORDER with
+    // IDENTITY ordinals (ordinal[i] = i, Base 1) — the link.exe
+    // convention (dumpbin ground truth: ordinals 1..N follow the
+    // sorted names). The emitted-table sort is a tested invariant
+    // (deliberately out-of-order input names in the pin).
+    //
+    // The directory's Name field (the DLL's self-name) is emitted as
+    // an EMPTY string: per-artifact identity does not belong in a
+    // shipped format schema (the c150 decision that leaves DT_SONAME
+    // absent); GetProcAddress never reads it, and DSS emits no
+    // forwarder RVAs — the only loader consumer of that name.
+    // (Forwarder detection is RVA-range-based: an EAT entry pointing
+    // INSIDE the export directory's [rva, rva+size) span is a
+    // forwarder string. Every DSS export RVA points at `.text` /
+    // `.rdata` / `.data` / `.bss`, all OUTSIDE `.edata`, so no export
+    // can be misread as a forwarder.)
+    struct PeExportRec {
+        std::string   name;   // real (already-mangled) source name
+        std::uint32_t rva = 0;
+    };
+    std::vector<PeExportRec> dllExports;
+    if (isDll) {
+        std::unordered_map<std::uint32_t, std::size_t> funcIdxBySym;
+        funcIdxBySym.reserve(module.functions.size());
+        for (std::size_t i = 0; i < module.functions.size(); ++i) {
+            funcIdxBySym.emplace(module.functions[i].symbol.v, i);
+        }
+        // Data-item SymbolId → image RVA, across every placed data
+        // section (rdata incl. the c145 relro fold, data, bss). TLS
+        // items never appear (the dll schema advertises no
+        // tdata/tbss, so the pre-walker gate rejected them; a
+        // thread-local's template offset is not an RVA anyway).
+        std::unordered_map<std::uint32_t, std::uint32_t> dataRvaBySym;
+        auto addDataRvas = [&](link::format::ExecDataSectionLayout const&
+                                   layout,
+                               std::uint32_t sectionRva) {
+            for (std::size_t j = 0; j < layout.itemIndices.size(); ++j) {
+                auto const& item = module.dataItems[layout.itemIndices[j]];
+                if (item.symbol == SymbolId{}) continue;  // anonymous
+                dataRvaBySym.emplace(
+                    item.symbol.v,
+                    sectionRva
+                        + static_cast<std::uint32_t>(layout.itemOffsets[j]));
+            }
+        };
+        if (hasRdata) addDataRvas(rdataDataLayout, rdata->rva);
+        if (hasData)  addDataRvas(dataDataLayout, data->rva);
+        if (hasBss)   addDataRvas(bssDataLayout, bss->rva);
+        std::uint32_t const textRva0 =
+            static_cast<std::uint32_t>(secText.virtualAddress);
+        std::unordered_set<std::string_view> seenExportNames;
+        for (auto const& ms : module.symbols) {
+            if (ms.name.empty()) continue;
+            if (!isExternallyVisible(ms.binding, ms.visibility)) continue;
+            if (!seenExportNames.insert(ms.name).second) {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::format(
+                         "pe::encodeExec (dll): duplicate export name "
+                         "'{}' -- two externally-visible ModuleSymbol "
+                         "rows share one name; the Name Pointer Table "
+                         "is a binary-searched UNIQUE-key table, so a "
+                         "duplicate silently shadows one definition "
+                         "(D-LK2-4).",
+                         ms.name));
+                return {};
+            }
+            if (auto const fit = funcIdxBySym.find(ms.symbol.v);
+                fit != funcIdxBySym.end()) {
+                dllExports.push_back(PeExportRec{
+                    ms.name,
+                    textRva0 + static_cast<std::uint32_t>(
+                                   funcTextStart[fit->second])});
+            } else if (auto const dit = dataRvaBySym.find(ms.symbol.v);
+                       dit != dataRvaBySym.end()) {
+                dllExports.push_back(PeExportRec{ms.name, dit->second});
+            } else {
+                emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                     std::format(
+                         "pe::encodeExec (dll): ModuleSymbol '{}' "
+                         "(SymbolId #{}) names neither a defined "
+                         "function nor a placed data item -- the "
+                         "export table cannot place it (producer "
+                         "contract: one ModuleSymbol row per DEFINED "
+                         "function/global). D-LK2-4.",
+                         ms.name, ms.symbol.v));
+                return {};
+            }
+        }
+        // The binary-search invariant: memcmp order (std::string's
+        // char_traits compare is unsigned-byte lexicographic — the
+        // exact GetProcAddress comparison).
+        std::sort(dllExports.begin(), dllExports.end(),
+                  [](PeExportRec const& a, PeExportRec const& b) {
+                      return a.name < b.name;
+                  });
+    }
+    bool const hasExports = !dllExports.empty();
+    constexpr std::size_t kExportDirectorySize = 40;
+    std::uint32_t const edataRva = hasExports ? dataChainRva : 0u;
+    std::vector<std::uint8_t> edataBytes;
+    std::optional<DataSectionLayout> edata;
+    if (hasExports) {
+        std::size_t const n = dllExports.size();
+        std::size_t const eatOff  = kExportDirectorySize;
+        std::size_t const nameOff = eatOff + 4u * n;
+        std::size_t const ordOff  = nameOff + 4u * n;
+        std::size_t const strOff  = ordOff + 2u * n;
+        // Strings: DllName (empty — see the block comment) first,
+        // then the export names in sorted order.
+        std::vector<std::uint32_t> nameStrRvas(n, 0u);
+        std::size_t strCursor = strOff;
+        std::uint32_t const dllNameRva =
+            edataRva + static_cast<std::uint32_t>(strCursor);
+        strCursor += 1;  // the empty DllName's NUL
+        for (std::size_t i = 0; i < n; ++i) {
+            nameStrRvas[i] =
+                edataRva + static_cast<std::uint32_t>(strCursor);
+            strCursor += dllExports[i].name.size() + 1;
+        }
+        std::size_t const edataSize = strCursor;
+        if (edataSize > std::numeric_limits<std::uint32_t>::max()) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encodeExec (dll): synthesized .edata "
+                             "size {} exceeds u32 -- PE32+ RVAs are "
+                             "32-bit.",
+                             edataSize));
+            return {};
+        }
+        // The ordinal table is u16 by PE spec (GetProcAddress takes a WORD
+        // ordinal; link.exe hard-errors at the 64K-export limit). Past
+        // 0xFFFF the cast below would WRAP: the name at sorted position
+        // 65536 would silently resolve to EAT[0] -- the wrong function,
+        // no diagnostic (c152 review fold; belt, no live producer).
+        if (n > 0xFFFFu) {
+            emit(reporter, DiagnosticCode::K_NoMatchingObjectFormat,
+                 std::format("pe::encodeExec (dll): {} exports exceed the "
+                             "PE 64K-export limit (the ordinal table is "
+                             "u16; GetProcAddress takes a WORD ordinal).",
+                             n));
+            return {};
+        }
+        edataBytes.assign(edataSize, 0u);
+        auto putU16 = [&](std::size_t off, std::uint16_t v) {
+            edataBytes[off + 0] = static_cast<std::uint8_t>(v & 0xFFu);
+            edataBytes[off + 1] =
+                static_cast<std::uint8_t>((v >> 8) & 0xFFu);
+        };
+        auto putU32 = [&](std::size_t off, std::uint32_t v) {
+            for (int b = 0; b < 4; ++b)
+                edataBytes[off + b] =
+                    static_cast<std::uint8_t>((v >> (b * 8)) & 0xFFu);
+        };
+        // IMAGE_EXPORT_DIRECTORY. Characteristics / TimeDateStamp /
+        // Major/MinorVersion stay 0 (deterministic — matches the file
+        // header's TimeDateStamp=0 stance).
+        putU32(12, dllNameRva);                              // Name
+        putU32(16, 1u);                                      // Base (ordinal)
+        putU32(20, static_cast<std::uint32_t>(n));           // NumberOfFunctions
+        putU32(24, static_cast<std::uint32_t>(n));           // NumberOfNames
+        putU32(28, edataRva + static_cast<std::uint32_t>(eatOff));
+        putU32(32, edataRva + static_cast<std::uint32_t>(nameOff));
+        putU32(36, edataRva + static_cast<std::uint32_t>(ordOff));
+        for (std::size_t i = 0; i < n; ++i) {
+            putU32(eatOff + 4u * i, dllExports[i].rva);      // EAT
+            putU32(nameOff + 4u * i, nameStrRvas[i]);        // sorted names
+            putU16(ordOff + 2u * i,
+                   static_cast<std::uint16_t>(i));           // identity ordinal
+            std::size_t const so = nameStrRvas[i] - edataRva;
+            for (std::size_t c = 0; c < dllExports[i].name.size(); ++c) {
+                edataBytes[so + c] =
+                    static_cast<std::uint8_t>(dllExports[i].name[c]);
+            }
+        }
+        DataSectionLayout layout;
+        layout.rva = edataRva;
+        layout.virtualSize = static_cast<std::uint32_t>(
+            alignUp(edataSize, sectionAlignE));
+        edata = layout;
+        dataChainRva += layout.virtualSize;
+    }
+
     // `.idata` follows the LAST section in the VA chain (`dataChainRva` was
-    // advanced past .rdata/.data/.bss/.xdata/.pdata above), else after `.text`.
+    // advanced past .rdata/.data/.bss/.xdata/.pdata/[.edata] above), else
+    // after `.text`.
     std::uint32_t const idataRva = hasImports ? dataChainRva : 0u;
 
     // Lay out .idata bytes (synthesized, NOT raw-data padded yet):
@@ -1471,12 +2400,15 @@ encodeExec(AssembledModule const&    module,
 
     // ── (c2) Fill the import-thunk block reserved in step (a2) ──
     // Each extern's IAT slot VA is now known (externIatVaBySym); write
-    // one `FF 25 disp32` thunk per extern jumping through it, and
-    // record the thunk VA (a .text code address) in
+    // one `FF 25 disp32` thunk per FUNCTION extern jumping through it,
+    // and record the thunk VA (a .text code address) in
     // `externThunkVaBySym`. THAT map — not `externIatVaBySym` — feeds
-    // `symbolVa` below, so every extern reference (a direct call OR an
-    // address-taken value) resolves to the callable thunk (direct-plt),
-    // never the raw IAT data slot.
+    // `symbolVa` below, so every function-extern reference (a direct
+    // call OR an address-taken value) resolves to the callable thunk
+    // (direct-plt), never the raw IAT data slot. c149: the loop walks
+    // the COMPACTED `funcExternIdxs` (thunk index j → extern index i) —
+    // a DATA extern gets no thunk; its symbolVa binds to the IAT slot
+    // VA below.
     std::unordered_map<SymbolId, std::uint64_t> externThunkVaBySym;
     externThunkVaBySym.reserve(numImportThunks);
     if (numImportThunks > 0) {
@@ -1491,8 +2423,9 @@ encodeExec(AssembledModule const&    module,
                  "invariant violated).");
             return {};
         }
-        for (std::size_t i = 0; i < numImportThunks; ++i) {
-            std::size_t const thunkOff = thunkBlockOffset + i * peThunkSize;
+        for (std::size_t j = 0; j < numImportThunks; ++j) {
+            std::size_t const i = funcExternIdxs[j];
+            std::size_t const thunkOff = thunkBlockOffset + j * peThunkSize;
             std::uint64_t const thunkVa =
                 oh.imageBase + secText.virtualAddress + thunkOff;
             auto const iatIt =
@@ -1593,6 +2526,34 @@ encodeExec(AssembledModule const&    module,
     // so REL32 calls to either kind work uniformly. Format-side
     // fmt.relocationByKind(rel.kind) check stays here because its
     // diagnostic wording cites the PE format name.
+    // D-LK-PE-IMAGE-TEXT-ABS-RELOC (c152, the .reloc-completeness
+    // belt — registered with the D-LK2-4 dll cycle, and live on the
+    // exec too since its condition is schema-read): on a
+    // DYNAMIC_BASE image the loader may (dll: routinely does) rebase
+    // the whole image, adjusting every absolute slot listed in
+    // `.reloc`. The walker collects DIR64 sites from DATA-ITEM
+    // fixups + the TLS directory VAs — but NOT from `.text` (the
+    // `applyExecRelocations` kernel patches in place without
+    // reporting sites). An ABSOLUTE (non-pc-relative, non-tls)
+    // function relocation would therefore bake a preferred-base VA
+    // into code bytes that no `.reloc` row ever adjusts — a silent
+    // wrong-address under rebase. DSS x86_64 codegen emits none
+    // (globals are rip-relative lea, calls rel32, jump tables are
+    // data items, import thunks rip-relative FF 25), so this is a
+    // fail-loud belt, not a live path; the closure direction is to
+    // collect text sites into `.reloc` when a producer appears.
+    // tls-flagged kinds are exempt: a SECREL32 patch is a
+    // section-relative template OFFSET (rebase-invariant), not a VA.
+    constexpr std::uint16_t kDllCharDynamicBase = 0x0040;
+    // c152 review fold: DYNAMIC_BASE opts into ASLR, but a DLL is ALSO
+    // rebased on classic preferred-base COLLISION regardless of the flag
+    // (whenever relocations are not stripped). A dll schema without
+    // DYNAMIC_BASE would otherwise go dark on this belt and bake a
+    // preferred-base VA a collision-rebase never adjusts -- the exact
+    // silent wrong-address the belt exists to stop. Shipped schemas set
+    // the flag; this covers hand-rolled ones.
+    bool const imageIsRelocatableAtLoad =
+        isDll || (oh.dllCharacteristics & kDllCharDynamicBase) != 0u;
     for (auto const& fn : module.functions) {
         for (auto const& rel : fn.relocations) {
             if (fmt.relocationByKind(rel.kind) == nullptr) {
@@ -1601,6 +2562,26 @@ encodeExec(AssembledModule const&    module,
                                  "by object format '{}' — substrate-"
                                  "invariant violation.",
                                  rel.kind.v, fmt.name()));
+                return {};
+            }
+            auto const* tri = targetSchema.relocationInfo(rel.kind);
+            if (imageIsRelocatableAtLoad && tri != nullptr
+             && !tri->pcRelative && !tri->tls) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format(
+                         "pe::encodeExec: function SymbolId={{ {} }} "
+                         "carries an ABSOLUTE relocation ('{}', kind "
+                         "{}) into .text, but this image sets "
+                         "DYNAMIC_BASE and the walker collects "
+                         "IMAGE_REL_BASED_DIR64 sites only from data "
+                         "items -- the patched code bytes would keep "
+                         "the preferred-base address after the loader "
+                         "rebases the image (silent wrong address; on "
+                         "a .dll the loader rebases routinely). Emit "
+                         "the address as a data item, or extend the "
+                         ".reloc collector to .text sites "
+                         "(D-LK-PE-IMAGE-TEXT-ABS-RELOC).",
+                         fn.symbol.v, tri->name, rel.kind.v));
                 return {};
             }
         }
@@ -1622,12 +2603,12 @@ encodeExec(AssembledModule const&    module,
         }
     }
     for (auto const& [sym, va] : externThunkVaBySym) {
-        // D-FFI-PE-IMPORT-THUNK: an extern's symbolVa names its import
-        // THUNK (a .text code address) — the PE analog of an ELF PLT
-        // stub / Mach-O __stubs entry — NOT the `.idata` IAT data slot.
-        // This makes an address-taken import a CALLABLE code address
-        // and a direct extern call a plain `call rel32 → thunk` (the
-        // thunk does the IAT indirection); PE is no longer the
+        // D-FFI-PE-IMPORT-THUNK: a FUNCTION extern's symbolVa names its
+        // import THUNK (a .text code address) — the PE analog of an ELF
+        // PLT stub / Mach-O __stubs entry — NOT the `.idata` IAT data
+        // slot. This makes an address-taken import a CALLABLE code
+        // address and a direct extern call a plain `call rel32 → thunk`
+        // (the thunk does the IAT indirection); PE is no longer the
         // asymmetric outlier. An extern SymbolId colliding with a
         // function's SymbolId is a caller bug; silently overriding the
         // in-text VA would patch in-text rel32 to the wrong target.
@@ -1638,6 +2619,39 @@ encodeExec(AssembledModule const&    module,
                  + " collides with another symbol — caller must "
                    "give each extern a unique SymbolId distinct "
                    "from function ids.");
+            return {};
+        }
+    }
+    // c149 (D-LK-EXTERN-DATA-IMPORT, the PE half): a DATA extern's
+    // symbolVa is its `.idata` IAT SLOT VA — the address of the pointer
+    // the loader fills with the imported object's address (`__imp_`
+    // semantics; the Mach-O __got non-lazy-pointer model, macho.cpp's
+    // c117 mirror). A GlobalAddr of the symbol (mir_to_lir got-indirect)
+    // lea's this image-local slot VA then derefs it — NEVER a thunk VA
+    // (a data object is not callable; reading `FF 25` jump-stub bytes as
+    // the object's value is the silent-miscompile class the gate
+    // guards). Bound HERE — after the IAT layout fixed each slot's VA
+    // but BEFORE `applyExecRelocations` — so a code reloc into the data
+    // symbol resolves to the slot VA through the SAME relocation kernel
+    // a function thunk / named data item uses.
+    for (auto const& ext : module.externImports) {
+        if (!ext.isData) continue;
+        auto const iatIt = externIatVaBySym.find(ext.symbol);
+        if (iatIt == externIatVaBySym.end()) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"pe::encodeExec: extern DATA SymbolId #"}
+                     + std::to_string(ext.symbol.v)
+                     + " has no IAT slot VA -- externIatVaBySym is "
+                       "incomplete (import layout bug).");
+            return {};
+        }
+        if (!symbolVa.emplace(ext.symbol, iatIt->second).second) {
+            emit(reporter, DiagnosticCode::K_SymbolUndefined,
+                 std::string{"pe::encodeExec: extern DATA SymbolId #"}
+                     + std::to_string(ext.symbol.v)
+                     + " collides with another symbol -- caller must "
+                       "give each extern a unique SymbolId distinct "
+                       "from function ids.");
             return {};
         }
     }
@@ -1784,10 +2798,13 @@ encodeExec(AssembledModule const&    module,
     // ── Apply DATA-ITEM relocations into the .rdata bytes ─────────
     //
     // `applyExecRelocations` above patches FUNCTION relocations into `.text`. A data item
-    // may ALSO carry relocations — e.g. the cross-CU thunk slot (LK11b), an 8-byte rodata
-    // pointer the linker mints whose single absolute-64-bit reloc targets a sibling-CU
-    // definition (so an indirect cross-CU call `call qword ptr [slot]` dereferences a slot
-    // holding the def's runtime address). The def's VA already lives in `symbolVa` (built
+    // may ALSO carry relocations — an F5 symbol-address pointer, a folded relro const
+    // table slot, or the LK11b cross-CU thunk slot (an 8-byte RelRoConst pointer the
+    // linker mints for an INDIRECT-SLOT-dispatch format, whose single absolute-64-bit
+    // reloc targets a sibling-CU definition — the indirect cross-CU call `call qword ptr
+    // [slot]` dereferences a slot holding the def's runtime address; c154: a direct-plt
+    // format binds the reference straight to the def and mints no slot). The target's VA
+    // already lives in `symbolVa` (built
     // above for functions + externs/IAT + rodata items). Patch each data-item relocation
     // directly into `rdataBytes` at the item's section-relative offset + the reloc's
     // intra-item offset, writing the absolute VA `widthBytes` LE. This runs against the
@@ -1806,11 +2823,11 @@ encodeExec(AssembledModule const&    module,
     for (std::size_t i = 0; i < module.dataItems.size(); ++i) {
         auto const& di = module.dataItems[i];
         if (di.relocations.empty()) continue;
-        // The reloc-bearing item lives in `.rdata` (const data / cross-CU thunk
-        // slots / F5 string-rodata pointers) or `.data` (F5 MUTABLE symbol-address
-        // global pointers `char* g="..."` / `int* p=&x`). Resolve its section-
-        // relative offset + the buffer to patch + the section base RVA. A `.bss` /
-        // unplaced reloc-bearing item has no on-disk patch site → fail loud.
+        // The reloc-bearing item lives in `.rdata` (folded relro const tables /
+        // cross-CU thunk slots / F5 string-rodata pointers) or `.data` (F5 MUTABLE
+        // symbol-address global pointers `char* g="..."` / `int* p=&x`). Resolve its
+        // section-relative offset + the buffer to patch + the section base RVA. A
+        // `.bss` / unplaced reloc-bearing item has no on-disk patch site → fail loud.
         std::vector<std::uint8_t>* patchBuf = nullptr;
         std::size_t                itemBaseOff = 0;
         std::uint32_t              itemSecRva  = 0;
@@ -1844,6 +2861,61 @@ encodeExec(AssembledModule const&    module,
             return {};
         }
         for (auto const& rel : di.relocations) {
+            // ── D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR (c152, the PE half of
+            // the c150 CRITICAL): a data slot whose relocation targets
+            // an extern DATA import would bake the image-local IAT
+            // SLOT address — `symbolVa[dataExtern]` is the
+            // loader-filled `.idata` pointer cell, NOT the imported
+            // object — into the pointer bytes: one indirection off at
+            // runtime (`FILE **pp = &stdout;` would hold &IAT_slot;
+            // `*pp` reads the slot's content — the object's ADDRESS —
+            // where C semantics require the object's VALUE). On a
+            // relocatable-at-load artifact the slot also gets a DIR64
+            // row, faithfully rebasing the wrong value. MSVC itself
+            // REJECTS `&dllimport_obj` as a C static initializer
+            // (C2099 "initializer is not a constant"), so the honest
+            // arm is FAIL LOUD naming the extern. (The symbol-based
+            // fix — the ELF dyn arm's R_X86_64_64-against-dynsym
+            // shape — has no PE image analog short of a CRT-style
+            // runtime pseudo-reloc scheme, deliberately NOT
+            // attempted.)
+            //
+            // A FUNCTION extern is the OTHER half of the registered
+            // anchor and stays LEGAL by design: its symbolVa is the
+            // FF 25 import THUNK — a CALLABLE code address — so the
+            // baked pointer is call-correct (the c112 shipped,
+            // run-proven `addr_import` witness: `static putfn t[] =
+            // {puts};` — sqlite's aSyscall[] shape) and its DIR64 row
+            // rebases it correctly. Cross-image pointer IDENTITY for
+            // an imported function is not guaranteed on Windows
+            // (MSVC's own `&puts` binds each module's local thunk —
+            // the platform norm), exactly as the anchor row records.
+            if (auto const extIt = externIatVaBySym.find(rel.target);
+                extIt != externIatVaBySym.end()) {
+                ExternImport const* ext = nullptr;
+                for (auto const& e : module.externImports) {
+                    if (e.symbol == rel.target) { ext = &e; break; }
+                }
+                if (ext != nullptr && ext->isData) {
+                    emit(reporter,
+                         DiagnosticCode::K_RelocationKindMismatch,
+                         std::format(
+                             "pe::encodeExec: data-item SymbolId #{} "
+                             "carries a relocation targeting extern "
+                             "DATA import '{}' (symbol #{}) -- taking "
+                             "an imported OBJECT's address in a static "
+                             "initializer would bake the image-local "
+                             "IAT-slot address into the data slot (one "
+                             "indirection off at runtime; MSVC rejects "
+                             "the same shape as a non-constant C "
+                             "initializer, C2099). Initialize the "
+                             "pointer at runtime instead "
+                             "(D-LK-IMAGE-DATA-SLOT-EXTERN-ADDR).",
+                             di.symbol.v, ext->mangledName,
+                             rel.target.v));
+                    return {};
+                }
+            }
             auto const sIt = symbolVa.find(rel.target);
             if (sIt == symbolVa.end()) {
                 emit(reporter, DiagnosticCode::K_SymbolUndefined,
@@ -1971,6 +3043,26 @@ encodeExec(AssembledModule const&    module,
     std::vector<std::uint8_t> relocBytes;
     if (!baseRelocSiteRvas.empty()) {
         std::sort(baseRelocSiteRvas.begin(), baseRelocSiteRvas.end());
+        // A duplicate DIR64 site would be applied TWICE at load: unlike ELF
+        // RELA (set semantics, idempotent), a base relocation ADDS the load
+        // delta to the slot -- two rows at one RVA double-add it, and the
+        // pointer is wrong ONLY when the loader actually rebases (works at
+        // the preferred base, corrupt under ASLR -- the hardest-to-debug
+        // variant). One 8-byte slot has exactly one fixup, so adjacent
+        // equality after the sort can never false-positive (c152 review
+        // fold; belt, no live producer emits duplicates).
+        for (std::size_t k = 1; k < baseRelocSiteRvas.size(); ++k) {
+            if (baseRelocSiteRvas[k] == baseRelocSiteRvas[k - 1]) {
+                emit(reporter, DiagnosticCode::K_RelocationKindMismatch,
+                     std::format("pe::encodeExec: duplicate base-relocation "
+                                 "site RVA {:#x} -- a DIR64 fixup is "
+                                 "delta-ADD, so a duplicate would be "
+                                 "applied twice under rebase (silently "
+                                 "corrupt pointer).",
+                                 baseRelocSiteRvas[k]));
+                return {};
+            }
+        }
         constexpr std::uint32_t kPageSize          = 0x1000u;
         constexpr std::uint16_t kImageRelBasedDir64 = 10u;
         std::size_t cursor = 0;
@@ -2157,6 +3249,21 @@ encodeExec(AssembledModule const&    module,
         pdata->headerIndex = sectionHeaders.size();
         sectionHeaders.push_back(hPData);
     }
+    // .edata section header (c152, D-LK2-4 — dll exports). Read-only
+    // initialized data (0x40000040, like .rdata): the loader only
+    // READS the export directory; GetProcAddress walks it in place.
+    // Placed after .pdata and before .idata (its VA slot in the
+    // chain above).
+    constexpr std::uint32_t kEDataCharacteristics = 0x40000040u;
+    if (edata.has_value()) {
+        PeSectionHeader hEData{};
+        hEData.name            = encodeSectionName(".edata", 0);
+        hEData.virtualSize     = static_cast<std::uint32_t>(edataBytes.size());
+        hEData.virtualAddress  = edata->rva;
+        hEData.characteristics = kEDataCharacteristics;
+        edata->headerIndex = sectionHeaders.size();
+        sectionHeaders.push_back(hEData);
+    }
     // .idata section header (when externImports non-empty).
     // Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA (0x40) |
     //                   IMAGE_SCN_MEM_READ (0x40000000) |
@@ -2284,6 +3391,16 @@ encodeExec(AssembledModule const&    module,
         sectionHeaders[pdata->headerIndex].pointerToRawData = pdata->rawPointer;
         nextRawPointer += pdata->rawSize;
     }
+    // .edata (c152, D-LK2-4): file-backed, after .pdata and before
+    // .idata (matching its section-header and VA-chain order).
+    if (edata.has_value()) {
+        edata->rawSize = static_cast<std::uint32_t>(
+            alignUp(edataBytes.size(), fileAlign));
+        edata->rawPointer = nextRawPointer;
+        sectionHeaders[edata->headerIndex].sizeOfRawData = edata->rawSize;
+        sectionHeaders[edata->headerIndex].pointerToRawData = edata->rawPointer;
+        nextRawPointer += edata->rawSize;
+    }
     if (idata.has_value()) {
         idata->rawSize = static_cast<std::uint32_t>(
             alignUp(idataSize, fileAlign));
@@ -2331,6 +3448,9 @@ encodeExec(AssembledModule const&    module,
     if (pdata.has_value()) {
         lastSectionVaEnd = pdata->rva + pdata->virtualSize;
     }
+    if (edata.has_value()) {   // c152 — .edata RVA is after .pdata
+        lastSectionVaEnd = edata->rva + edata->virtualSize;
+    }
     if (idata.has_value()) {
         lastSectionVaEnd = idata->rva + idata->virtualSize;
     }
@@ -2339,9 +3459,15 @@ encodeExec(AssembledModule const&    module,
     }
     std::uint32_t const sizeOfImage = static_cast<std::uint32_t>(
         alignUp(lastSectionVaEnd, sectionAlign));
-    std::uint32_t const addressOfEntryPoint =
-        static_cast<std::uint32_t>(secText.virtualAddress
-                                    + funcTextStart[entryFnIdx]);
+    // c152 (D-LK2-4): a dll has NO entry — AddressOfEntryPoint = 0
+    // tells the loader to skip the DllMain notification call
+    // entirely (legal PE; the `link /NOENTRY` shape). The exec keeps
+    // its resolved entry (the injected trampoline via
+    // imageEntryOverride, or the schema/functions[0] fallback).
+    std::uint32_t const addressOfEntryPoint = isDll
+        ? 0u
+        : static_cast<std::uint32_t>(secText.virtualAddress
+                                      + funcTextStart[entryFnIdx]);
     std::uint32_t const baseOfCode =
         static_cast<std::uint32_t>(secText.virtualAddress);
 
@@ -2396,6 +3522,7 @@ encodeExec(AssembledModule const&    module,
         (rdata.has_value() ? rdata->rawSize : 0u)
         + (data.has_value() ? data->rawSize : 0u)
         + (tls.has_value() ? tls->rawSize : 0u)   // TLS C3 — CNT_INITIALIZED_DATA
+        + (edata.has_value() ? edata->rawSize : 0u)  // c152 — dll exports
         + (idata.has_value() ? idata->rawSize : 0u)
         + (reloc.has_value() ? reloc->rawSize : 0u);
     std::uint32_t const sizeOfUninitializedData =
@@ -2493,6 +3620,11 @@ encodeExec(AssembledModule const&    module,
             static_cast<std::uint64_t>(tls->rawPointer)
             + tls->rawSize;
     }
+    if (edata.has_value()) {   // c152 — .edata is file-backed, pre-.idata
+        sectionsEndFileOff =
+            static_cast<std::uint64_t>(edata->rawPointer)
+            + edata->rawSize;
+    }
     if (idata.has_value()) {
         sectionsEndFileOff =
             static_cast<std::uint64_t>(idata->rawPointer)
@@ -2549,8 +3681,22 @@ encodeExec(AssembledModule const&    module,
             ? tlsRva + static_cast<std::uint32_t>(tlsDirOffset)
             : 0u;
     std::uint32_t const tlsDirSize = tls.has_value() ? 40u : 0u;
+    // IMAGE_DIRECTORY_ENTRY_EXPORT (index 0, c152 D-LK2-4): RVA + byte
+    // size of the export directory block — GetProcAddress reads it.
+    // Size covers the WHOLE export block (directory + EAT + name
+    // pointers + ordinals + strings): the loader uses the [rva,
+    // rva+size) span for forwarder detection, so it must cover
+    // exactly the synthesized bytes (see the (b4) block comment).
+    std::uint32_t const exportDirRva =
+        edata.has_value() ? edata->rva : 0u;
+    std::uint32_t const exportDirSize =
+        edata.has_value() ? static_cast<std::uint32_t>(edataBytes.size())
+                          : 0u;
     for (std::size_t i = 0; i < kNumberOfRvaAndSizes; ++i) {
-        if (i == 1u) {
+        if (i == 0u) {
+            appendU32LE(bytes, exportDirRva);
+            appendU32LE(bytes, exportDirSize);
+        } else if (i == 1u) {
             appendU32LE(bytes, importDirRva);
             appendU32LE(bytes, importDirSize);
         } else if (i == 3u) {
@@ -2643,6 +3789,17 @@ encodeExec(AssembledModule const&    module,
         bytes.insert(bytes.end(), pdataBytes.begin(), pdataBytes.end());
         while (bytes.size()
                 < static_cast<std::size_t>(pdata->rawPointer) + pdata->rawSize) {
+            bytes.push_back(0);
+        }
+    }
+
+    // .edata body (c152, D-LK2-4 — dll export directory), padded to
+    // fileAlignment. The bytes were fully synthesized in step (b4);
+    // emitted after .pdata and before .idata (its raw-pointer order).
+    if (edata.has_value()) {
+        bytes.insert(bytes.end(), edataBytes.begin(), edataBytes.end());
+        while (bytes.size()
+                < static_cast<std::size_t>(edata->rawPointer) + edata->rawSize) {
             bytes.push_back(0);
         }
     }

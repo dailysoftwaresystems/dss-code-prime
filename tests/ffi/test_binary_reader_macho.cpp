@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace dss;
@@ -656,4 +657,697 @@ TEST(BinaryReaderMacho, DysymtabSliceFiltersStabEntries) {
            "scoped isStab() to the fallback only would surface the "
            "stab row as a Function/Default export";
     EXPECT_EQ((*r)[0].mangledName, "real_export");
+}
+
+// ====================================================================
+// c160 HARDENING (D-FF1-MACHO-READER) -- the Mach-O twin of c159.
+//
+// The reader now walks the EXPORT TRIE (the dlsym surface) as the
+// authoritative export list when present, classifies each terminal's
+// address by SECTION membership (Function = executable __text; Object =
+// __data / __const), and surfaces reexports as Forwarders. Fixtures:
+//   * buildMachoDylib -- a synthetic single-arch MH_DYLIB carrying a
+//     LC_SEGMENT_64 (an executable __text + a data __data section), a
+//     LC_DYLD_INFO_ONLY export trie, and a LC_LOAD_DYLIB (so a reexport
+//     ordinal resolves to a dylib leaf). The trie's addresses land in
+//     __text / __data per the export's declared kind (the Mach-O analog
+//     of the PE fixture's per-EAT-RVA section placement).
+//   * the in-process WRITER->READER round-trip (W1) -- the strongest
+//     oracle: encode a real DSS dylib via `dss::macho::encode` and read
+//     its export trie back.
+// ====================================================================
+
+namespace {
+
+// Section VA plan for the synthetic dylib (single __TEXT segment based
+// at VA 0, so machHeaderVa == 0 and an export's image offset IS its VA):
+//   __text  [0x0100, 0x0200)  flags = pure|some instructions -> Function
+//   __data  [0x0200, 0x0300)  flags = S_REGULAR (0)          -> Object
+constexpr std::uint64_t kTextSecAddr = 0x0100u;
+constexpr std::uint64_t kTextSecSize = 0x0100u;
+constexpr std::uint64_t kDataSecAddr = 0x0200u;
+constexpr std::uint64_t kDataSecSize = 0x0100u;
+constexpr std::uint32_t kSTextFlags  = 0x80000400u;   // PURE|SOME instructions
+constexpr std::uint32_t kSDataFlags  = 0x00000000u;   // S_REGULAR
+
+constexpr std::uint32_t kLcSegment64Full  = 0x19u;
+constexpr std::uint32_t kLcDyldInfoOnly   = 0x80000022u;
+constexpr std::uint32_t kLcLoadDylibC     = 0x0Cu;
+constexpr std::uint64_t kExportReexport   = 0x08u;
+
+enum class TrieKind { Function, Data, Reexport };
+
+struct DylibExport {
+    std::string   name;
+    TrieKind      kind        = TrieKind::Function;
+    std::string   reexName;                   // Reexport: target symbol name
+    std::uint64_t reexOrdinal = 1;            // Reexport: 1-based dylib ordinal
+    std::uint64_t addrOverride = 0;           // 0 = section-default address
+};
+
+void appendUleb(std::vector<std::uint8_t>& out, std::uint64_t v) {
+    do {
+        std::uint8_t byte = static_cast<std::uint8_t>(v & 0x7Fu);
+        v >>= 7;
+        if (v != 0u) byte |= 0x80u;
+        out.push_back(byte);
+    } while (v != 0u);
+}
+[[nodiscard]] std::size_t ulebLen(std::uint64_t v) {
+    std::size_t n = 0;
+    do { ++n; v >>= 7; } while (v != 0u);
+    return n;
+}
+
+// Build a FLAT-ROOT export trie (root -> one leaf per export, edge =
+// full name). Valid for dyld ENUMERATION (the reader walks every child);
+// multi-level radix nesting + prefix accumulation is covered by the
+// real-writer round-trip (W1). Terminal payloads mirror Apple's on-wire
+// shape: regular = uleb(flags) uleb(imageOffset); reexport = uleb(flags)
+// uleb(ordinal) cstring(importName).
+[[nodiscard]] std::vector<std::uint8_t>
+buildExportTrie(std::vector<DylibExport> const& exps) {
+    std::size_t const N = exps.size();
+    std::vector<std::vector<std::uint8_t>> payloads(N);
+    for (std::size_t i = 0; i < N; ++i) {
+        auto& pl = payloads[i];
+        if (exps[i].kind == TrieKind::Reexport) {
+            appendUleb(pl, kExportReexport);
+            appendUleb(pl, exps[i].reexOrdinal);
+            for (char c : exps[i].reexName)
+                pl.push_back(static_cast<std::uint8_t>(c));
+            pl.push_back(0);                        // import-name NUL
+        } else {
+            std::uint64_t const imageOff = exps[i].addrOverride != 0u
+                ? exps[i].addrOverride
+                : (exps[i].kind == TrieKind::Function
+                       ? kTextSecAddr + i * 8u
+                       : kDataSecAddr + i * 8u);
+            appendUleb(pl, 0u);                     // flags = regular
+            appendUleb(pl, imageOff);
+        }
+    }
+    // Fixpoint the child node offsets (root = node0, leaves = node1..N).
+    std::vector<std::uint64_t> off(N + 1, 0);
+    auto const leafSize = [&](std::size_t i) -> std::uint64_t {
+        return ulebLen(payloads[i].size()) + payloads[i].size() + 1u;
+    };
+    for (int iter = 0; iter < 8; ++iter) {
+        std::uint64_t rootSize = 1u /*terminalSize*/ + 1u /*childCount*/;
+        for (std::size_t i = 0; i < N; ++i)
+            rootSize += exps[i].name.size() + 1u + ulebLen(off[i + 1]);
+        std::uint64_t cur = rootSize;
+        for (std::size_t i = 0; i < N; ++i) { off[i + 1] = cur; cur += leafSize(i); }
+    }
+    std::vector<std::uint8_t> out;
+    appendUleb(out, 0u);                            // root terminalSize
+    out.push_back(static_cast<std::uint8_t>(N));    // childCount
+    for (std::size_t i = 0; i < N; ++i) {
+        for (char c : exps[i].name) out.push_back(static_cast<std::uint8_t>(c));
+        out.push_back(0);                           // edge NUL
+        appendUleb(out, off[i + 1]);
+    }
+    for (std::size_t i = 0; i < N; ++i) {
+        appendUleb(out, payloads[i].size());        // terminalSize
+        out.insert(out.end(), payloads[i].begin(), payloads[i].end());
+        out.push_back(0);                           // childCount = 0
+    }
+    return out;
+}
+
+struct BuiltDylib {
+    std::vector<std::uint8_t> bytes;
+    std::size_t exportOff    = 0;
+    std::size_t exportSize   = 0;
+    std::size_t dyldInfoLcOff = 0;   // LC_DYLD_INFO_ONLY LC start
+};
+
+void putName16(std::vector<std::uint8_t>& b, std::size_t off,
+               std::string_view name) {
+    for (std::size_t k = 0; k < name.size() && k < 16u; ++k)
+        b[off + k] = static_cast<std::uint8_t>(name[k]);
+}
+
+// One dylib-load command in the assembled fixture. `cmd` is the LC type
+// (LC_LOAD_DYLIB / LC_LAZY_LOAD_DYLIB / ...); all such commands share the
+// 1-based reexport ordinal space, in emission order.
+constexpr std::uint32_t kLcLazyLoadDylib = 0x20u;   // no LC_REQ_DYLD
+struct DylibLC {
+    std::uint32_t cmd  = kLcLoadDylibC;
+    std::string   path;
+};
+// 8-aligned size of a dylib_command carrying `path` (24-byte header +
+// the NUL-terminated path, rounded up to 8).
+[[nodiscard]] std::size_t dylibLcSize(std::string const& path) {
+    return ((24 + path.size() + 1 + 7) / 8) * 8;
+}
+
+// Assemble a minimal MH_DYLIB around a (possibly hand-crafted) export
+// trie blob: header + LC_SEGMENT_64 __TEXT (__text exec + __data) +
+// LC_DYLD_INFO_ONLY (export_off/size -> the trie) + the given dylib-load
+// commands (in order -> the 1-based reexport ordinal space). The trie
+// bytes sit right after the load commands.
+[[nodiscard]] BuiltDylib
+assembleDylibMulti(std::vector<std::uint8_t> const& trie,
+                   std::vector<DylibLC> const& dylibs) {
+    constexpr std::size_t kSegCmdSize   = 72 + 2 * 80;   // hdr + 2 sections
+    constexpr std::size_t kDyldInfoSize = 48;
+    std::size_t dylibsSize = 0;
+    for (auto const& d : dylibs) dylibsSize += dylibLcSize(d.path);
+    std::uint32_t const ncmds =
+        static_cast<std::uint32_t>(2 + dylibs.size());
+    std::size_t const sizeofcmds = kSegCmdSize + kDyldInfoSize + dylibsSize;
+    std::size_t const trieOff   = 32 + sizeofcmds;
+    std::size_t const totalSize = trieOff + trie.size();
+
+    std::vector<std::uint8_t> b(totalSize, 0);
+    putU32(b, 0,  0xFEEDFACFu);
+    putU32(b, 4,  0x0100000Cu);                  // cputype CPU_TYPE_ARM64
+    putU32(b, 8,  0u);
+    putU32(b, 12, 0x6u);                         // MH_DYLIB
+    putU32(b, 16, ncmds);
+    putU32(b, 20, static_cast<std::uint32_t>(sizeofcmds));
+    putU32(b, 24, 0u);
+    putU32(b, 28, 0u);
+
+    std::size_t lc = 32;
+    // LC_SEGMENT_64 __TEXT (fileoff 0, filesize>0 -> the header segment,
+    // vmaddr 0 -> machHeaderVa 0). Two sections: __text (exec), __data.
+    putU32(b, lc + 0, kLcSegment64Full);
+    putU32(b, lc + 4, static_cast<std::uint32_t>(kSegCmdSize));
+    putName16(b, lc + 8, "__TEXT");
+    putU64(b, lc + 24, 0u);                      // vmaddr
+    putU64(b, lc + 32, 0x1000u);                 // vmsize
+    putU64(b, lc + 40, 0u);                      // fileoff
+    putU64(b, lc + 48, static_cast<std::uint64_t>(totalSize));  // filesize
+    putU32(b, lc + 56, 5u);                      // maxprot r-x
+    putU32(b, lc + 60, 5u);                      // initprot r-x
+    putU32(b, lc + 64, 2u);                      // nsects
+    putU32(b, lc + 68, 0u);
+    std::size_t const s0 = lc + 72;              // section_64 __text
+    putName16(b, s0 + 0,  "__text");
+    putName16(b, s0 + 16, "__TEXT");
+    putU64(b, s0 + 32, kTextSecAddr);
+    putU64(b, s0 + 40, kTextSecSize);
+    putU32(b, s0 + 64, kSTextFlags);
+    std::size_t const s1 = s0 + 80;              // section_64 __data
+    putName16(b, s1 + 0,  "__data");
+    putName16(b, s1 + 16, "__DATA");
+    putU64(b, s1 + 32, kDataSecAddr);
+    putU64(b, s1 + 40, kDataSecSize);
+    putU32(b, s1 + 64, kSDataFlags);
+    lc += kSegCmdSize;
+
+    std::size_t const dyldInfoLc = lc;           // LC_DYLD_INFO_ONLY
+    putU32(b, lc + 0, kLcDyldInfoOnly);
+    putU32(b, lc + 4, static_cast<std::uint32_t>(kDyldInfoSize));
+    putU32(b, lc + 40, static_cast<std::uint32_t>(trieOff));   // export_off
+    putU32(b, lc + 44, static_cast<std::uint32_t>(trie.size())); // export_size
+    lc += kDyldInfoSize;
+
+    for (auto const& d : dylibs) {                // dylib-load commands
+        std::size_t const sz = dylibLcSize(d.path);
+        putU32(b, lc + 0, d.cmd);
+        putU32(b, lc + 4, static_cast<std::uint32_t>(sz));
+        putU32(b, lc + 8, 24u);                  // name.offset
+        for (std::size_t k = 0; k < d.path.size(); ++k)
+            b[lc + 24 + k] = static_cast<std::uint8_t>(d.path[k]);
+        lc += sz;
+    }
+
+    for (std::size_t k = 0; k < trie.size(); ++k) b[trieOff + k] = trie[k];
+
+    BuiltDylib out;
+    out.bytes         = std::move(b);
+    out.exportOff     = trieOff;
+    out.exportSize    = trie.size();
+    out.dyldInfoLcOff = dyldInfoLc;
+    return out;
+}
+
+// Back-compat wrapper: 0 or 1 LC_LOAD_DYLIB commands.
+[[nodiscard]] BuiltDylib
+assembleDylib(std::vector<std::uint8_t> const& trie,
+              bool includeLoadDylib,
+              std::string dylibPath = "/usr/lib/libReexport.dylib") {
+    std::vector<DylibLC> dylibs;
+    if (includeLoadDylib)
+        dylibs.push_back(DylibLC{kLcLoadDylibC, std::move(dylibPath)});
+    return assembleDylibMulti(trie, dylibs);
+}
+
+[[nodiscard]] BuiltDylib buildMachoDylib(std::vector<DylibExport> const& exps) {
+    return assembleDylib(buildExportTrie(exps), /*includeLoadDylib=*/true);
+}
+
+// Build a "caterpillar" export trie: a spine of `depth` nodes where node
+// 0 is a non-terminal root and nodes 1..depth are TERMINALS reached via a
+// 1-byte edge from the prior node (so the accumulated names are "a",
+// "aa", ..., growing linearly). Structurally valid, but total materialized
+// name bytes are Theta(depth^2) -- the memory-exhaustion DoS the reader's
+// name-byte cap must reject. Child offsets are laid out by fixpoint (their
+// ULEB widths depend on the offsets they encode).
+[[nodiscard]] std::vector<std::uint8_t> buildCaterpillarTrie(std::size_t depth) {
+    std::vector<std::uint8_t> termPayload;      // shared regular-export payload
+    appendUleb(termPayload, 0u);                // flags = regular
+    appendUleb(termPayload, kTextSecAddr);      // address (in __text)
+    auto const nodeSize = [&](std::size_t k, std::uint64_t childOff) -> std::uint64_t {
+        std::uint64_t sz = (k == 0)
+            ? 1u                                              // terminalSize uleb(0)
+            : ulebLen(termPayload.size()) + termPayload.size();  // termSize + payload
+        sz += 1u;                                             // childCount u8
+        if (k < depth) sz += 1u /*edge 'a'*/ + 1u /*NUL*/ + ulebLen(childOff);
+        return sz;
+    };
+    std::vector<std::uint64_t> off(depth + 1, 0);
+    for (int iter = 0; iter < 16; ++iter) {
+        std::uint64_t cur = 0;
+        for (std::size_t k = 0; k <= depth; ++k) {
+            off[k] = cur;
+            cur += nodeSize(k, (k < depth) ? off[k + 1] : 0u);
+        }
+    }
+    std::vector<std::uint8_t> out;
+    for (std::size_t k = 0; k <= depth; ++k) {
+        if (k == 0) {
+            appendUleb(out, 0u);                 // root terminalSize = 0
+        } else {
+            appendUleb(out, termPayload.size()); // terminalSize
+            out.insert(out.end(), termPayload.begin(), termPayload.end());
+        }
+        if (k < depth) {
+            out.push_back(0x01);                 // childCount = 1
+            out.push_back(static_cast<std::uint8_t>('a'));  // edge
+            out.push_back(0x00);                 // edge NUL
+            appendUleb(out, off[k + 1]);         // child node offset
+        } else {
+            out.push_back(0x00);                 // leaf: childCount = 0
+        }
+    }
+    return out;
+}
+
+// Find a surfaced row by name (trie DFS order is not definition order).
+[[nodiscard]] ImportSurface const*
+findRow(std::vector<ImportSurface> const& rows, std::string_view name) {
+    for (auto const& r : rows) if (r.mangledName == name) return &r;
+    return nullptr;
+}
+
+// Build a minimal Mach-O with a LC_SEGMENT_64 (__text exec, __data) +
+// LC_SYMTAB (nlist), NO export trie -- so the reader takes the nlist
+// fallback and classifies each symbol by its n_sect (1 = __text, 2 =
+// __data). Used to pin the fallback-path kind classification.
+[[nodiscard]] std::vector<std::uint8_t>
+buildMachoNlistWithSections(std::vector<Nlist> const& syms,
+                            std::vector<std::string> const& names) {
+    constexpr std::size_t kHeaderSize = 32;
+    constexpr std::size_t kSegCmdSize = 72 + 2 * 80;
+    constexpr std::size_t kLcSymtabSz = 24;
+    constexpr std::size_t kNlist64Sz  = 16;
+
+    std::vector<std::uint8_t> strTab;
+    strTab.push_back(0);
+    std::vector<std::uint32_t> nameOffsets;
+    for (auto const& n : names) {
+        nameOffsets.push_back(static_cast<std::uint32_t>(strTab.size()));
+        for (char c : n) strTab.push_back(static_cast<std::uint8_t>(c));
+        strTab.push_back(0);
+    }
+
+    std::size_t const sizeofcmds    = kSegCmdSize + kLcSymtabSz;
+    std::size_t const symtabFileOff = kHeaderSize + sizeofcmds;
+    std::size_t const strtabFileOff = symtabFileOff + syms.size() * kNlist64Sz;
+    std::size_t const totalSize     = strtabFileOff + strTab.size();
+
+    std::vector<std::uint8_t> b(totalSize, 0);
+    putU32(b, 0,  kMachOMagic64);
+    putU32(b, 4,  0x0100000Cu);
+    putU32(b, 12, 0x6u);                          // MH_DYLIB
+    putU32(b, 16, 2u);                            // ncmds
+    putU32(b, 20, static_cast<std::uint32_t>(sizeofcmds));
+
+    std::size_t lc = kHeaderSize;
+    putU32(b, lc + 0, kLcSegment64Full);
+    putU32(b, lc + 4, static_cast<std::uint32_t>(kSegCmdSize));
+    putName16(b, lc + 8, "__TEXT");
+    putU64(b, lc + 24, 0u);                       // vmaddr
+    putU64(b, lc + 32, 0x1000u);
+    putU64(b, lc + 40, 0u);                       // fileoff
+    putU64(b, lc + 48, static_cast<std::uint64_t>(totalSize));  // filesize
+    putU32(b, lc + 56, 5u);
+    putU32(b, lc + 60, 5u);
+    putU32(b, lc + 64, 2u);                       // nsects
+    std::size_t const s0 = lc + 72;
+    putName16(b, s0 + 0,  "__text");
+    putName16(b, s0 + 16, "__TEXT");
+    putU64(b, s0 + 32, kTextSecAddr);
+    putU64(b, s0 + 40, kTextSecSize);
+    putU32(b, s0 + 64, kSTextFlags);
+    std::size_t const s1 = s0 + 80;
+    putName16(b, s1 + 0,  "__data");
+    putName16(b, s1 + 16, "__DATA");
+    putU64(b, s1 + 32, kDataSecAddr);
+    putU64(b, s1 + 40, kDataSecSize);
+    putU32(b, s1 + 64, kSDataFlags);
+    lc += kSegCmdSize;
+
+    putU32(b, lc + 0,  kLcSymtab);
+    putU32(b, lc + 4,  static_cast<std::uint32_t>(kLcSymtabSz));
+    putU32(b, lc + 8,  static_cast<std::uint32_t>(symtabFileOff));
+    putU32(b, lc + 12, static_cast<std::uint32_t>(syms.size()));
+    putU32(b, lc + 16, static_cast<std::uint32_t>(strtabFileOff));
+    putU32(b, lc + 20, static_cast<std::uint32_t>(strTab.size()));
+
+    for (std::size_t i = 0; i < syms.size(); ++i) {
+        std::size_t const off = symtabFileOff + i * kNlist64Sz;
+        std::uint32_t const strx = (syms[i].n_strx == 0u)
+            ? (i < nameOffsets.size() ? nameOffsets[i] : 0u)
+            : syms[i].n_strx;
+        putU32(b, off + 0, strx);
+        b[off + 4] = syms[i].n_type;
+        b[off + 5] = syms[i].n_sect;
+        putU64(b, off + 8, syms[i].n_value);
+    }
+    for (std::size_t i = 0; i < strTab.size(); ++i)
+        b[strtabFileOff + i] = strTab[i];
+    return b;
+}
+
+} // namespace
+
+// -- (c160-1) export-trie kind classification: the red-on-disable pin --
+// One Function (address in __text), one Object (address in __data), one
+// Reexport (EXPORT_SYMBOL_FLAGS_REEXPORT -> Forwarder + forwardTarget).
+// Reverting the trie walk (defaulting every export to Function) fails
+// the Object + Forwarder assertions; dropping the reexport branch
+// surfaces the reexport as a bogus regular export.
+TEST(BinaryReaderMacho, TrieClassifiesFunctionDataAndReexport) {
+    auto const built = buildMachoDylib({
+        {"_dss_add",    TrieKind::Function},
+        {"_dss_global", TrieKind::Data},
+        {"_dss_reexp",  TrieKind::Reexport, "_target_sym", 1},
+    });
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "libmixed.dylib", rep);
+    ASSERT_TRUE(r.has_value())
+        << "reader rejected the mixed-kind dylib: "
+        << (r.has_value() ? "" : r.error().detail);
+    ASSERT_EQ(r->size(), 3u);
+
+    auto const* fn = findRow(*r, "_dss_add");
+    ASSERT_NE(fn, nullptr);
+    EXPECT_EQ(fn->kind, SymbolKind::Function);
+    EXPECT_TRUE(fn->forwardTarget.empty());
+    EXPECT_EQ(fn->libraryPath, "libmixed.dylib");
+
+    auto const* da = findRow(*r, "_dss_global");
+    ASSERT_NE(da, nullptr);
+    EXPECT_EQ(da->kind, SymbolKind::Object)
+        << "an export whose address lands in a non-executable data "
+           "section is Object (the __data / STT_OBJECT precedent)";
+    EXPECT_TRUE(da->forwardTarget.empty());
+
+    auto const* rx = findRow(*r, "_dss_reexp");
+    ASSERT_NE(rx, nullptr);
+    EXPECT_EQ(rx->kind, SymbolKind::Forwarder);
+    EXPECT_EQ(rx->forwardTarget, "libReexport.dylib._target_sym")
+        << "reexport target = <dylib-leaf>.<import-name>";
+
+    for (auto const& row : *r) {
+        EXPECT_EQ(row.visibility, SymbolVisibility::Default);
+        EXPECT_EQ(row.linkage, SymbolLinkage::External);
+    }
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+// A same-name reexport (empty import name) forwards to the export's own
+// name in the target dylib.
+TEST(BinaryReaderMacho, TrieReexportSameNameUsesOwnName) {
+    auto const built = buildMachoDylib({
+        {"_reexp_same", TrieKind::Reexport, /*reexName=*/"", 1},
+    });
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "lib.dylib", rep);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 1u);
+    EXPECT_EQ((*r)[0].kind, SymbolKind::Forwarder);
+    EXPECT_EQ((*r)[0].forwardTarget, "libReexport.dylib._reexp_same");
+}
+
+// (c160-2) W1 -- the in-process WRITER->READER round-trip against a real
+// DSS MH_DYLIB -- lives in test_binary_reader_macho_roundtrip.cpp (it
+// needs the link/asm writer headers, whose `dss::SymbolVisibility`
+// clashes with `dss::ffi::SymbolVisibility` under this file's dual
+// using-directives).
+
+// -- (c160-3) nlist fallback classification by n_sect -----------------
+TEST(BinaryReaderMacho, NlistFallbackClassifiesBySection) {
+    // No export trie -> nlist fallback. n_sect=1 (__text, exec) ->
+    // Function; n_sect=2 (__data) -> Object.
+    std::vector<Nlist> syms{
+        Nlist{0, static_cast<std::uint8_t>(kNTypeSect | kNExtBit), 1, 0, 0x100},
+        Nlist{0, static_cast<std::uint8_t>(kNTypeSect | kNExtBit), 2, 0, 0x200},
+    };
+    std::vector<std::string> names{"_code_sym", "_data_sym"};
+    auto const bytes = buildMachoNlistWithSections(syms, names);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "lib.dylib", rep);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 2u);
+    EXPECT_EQ((*r)[0].mangledName, "_code_sym");
+    EXPECT_EQ((*r)[0].kind, SymbolKind::Function);
+    EXPECT_EQ((*r)[1].mangledName, "_data_sym");
+    EXPECT_EQ((*r)[1].kind, SymbolKind::Object)
+        << "n_sect=2 resolves to __data (non-exec) -> Object; a "
+           "regression that defaulted to Function would fail here";
+}
+
+// nlist entry whose n_sect indexes no parsed section (section table
+// present) is per-entry corruption: skip + Warning, don't abort.
+TEST(BinaryReaderMacho, NlistOutOfRangeNsectSkippedAsPartialCorruption) {
+    std::vector<Nlist> syms{
+        Nlist{0, static_cast<std::uint8_t>(kNTypeSect | kNExtBit), 1, 0, 0x100},
+        Nlist{0, static_cast<std::uint8_t>(kNTypeSect | kNExtBit), 99, 0, 0x200},
+    };
+    std::vector<std::string> names{"_good", "_bad_sect"};
+    auto const bytes = buildMachoNlistWithSections(syms, names);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "lib.dylib", rep);
+    ASSERT_TRUE(r.has_value())
+        << "an out-of-range n_sect must skip that entry, not abort";
+    ASSERT_EQ(r->size(), 1u);
+    EXPECT_EQ((*r)[0].mangledName, "_good");
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_BinaryReaderPartialCorruption), 1u);
+}
+
+// -- (c160-4) export-trie bounds / structural fail-loud pins ----------
+
+TEST(BinaryReaderMacho, TrieRegionPastEofFailsLoud) {
+    auto built = buildMachoDylib({{"_f", TrieKind::Function}});
+    // Poison LC_DYLD_INFO_ONLY.export_size (LC + 44) to overrun the buffer.
+    putU32(built.bytes, built.dyldInfoLcOff + 44, 0x10000u);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "trie-oob.dylib", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
+    EXPECT_NE(r.error().detail.find("export trie"), std::string::npos);
+    EXPECT_NE(r.error().detail.find("runs past EOF"), std::string::npos);
+}
+
+TEST(BinaryReaderMacho, TrieChildOffsetPastTrieFailsLoud) {
+    // Hand-crafted trie: root (non-terminal) with 1 child whose node
+    // offset (99) is past the 5-byte trie -- a corrupted child link.
+    //   [00]=terminalSize 0  [01]=childCount 1  ['x'][00]  [63]=childOff 99
+    std::vector<std::uint8_t> trie{0x00, 0x01,
+                                   static_cast<std::uint8_t>('x'), 0x00, 0x63};
+    auto built = assembleDylib(trie, /*includeLoadDylib=*/false);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "bad-child.dylib", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
+    EXPECT_NE(r.error().detail.find("child node offset"), std::string::npos);
+}
+
+TEST(BinaryReaderMacho, TrieUnterminatedEdgeStringFailsLoud) {
+    // root with childCount 1 whose edge string has no NUL before the
+    // trie end -> fail loud (never read past the region).
+    std::vector<std::uint8_t> trie{0x00, 0x01,
+                                   static_cast<std::uint8_t>('a'),
+                                   static_cast<std::uint8_t>('b')};
+    auto built = assembleDylib(trie, /*includeLoadDylib=*/false);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "bad-edge.dylib", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
+    EXPECT_NE(r.error().detail.find("not NUL-terminated"), std::string::npos);
+}
+
+TEST(BinaryReaderMacho, TrieCycleFailsLoud) {
+    // root's single child edge points back to offset 0 (itself) -> the
+    // visited-offset guard fails loud instead of looping forever.
+    //   [00]=termSize 0  [01]=childCount 1  ['x'][00]  [00]=childOff 0
+    std::vector<std::uint8_t> trie{0x00, 0x01,
+                                   static_cast<std::uint8_t>('x'), 0x00, 0x00};
+    auto built = assembleDylib(trie, /*includeLoadDylib=*/false);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "cycle.dylib", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
+    EXPECT_NE(r.error().detail.find("cycle"), std::string::npos);
+}
+
+TEST(BinaryReaderMacho, TrieTruncatedTerminalUlebFailsLoud) {
+    // A single node whose terminalSize ULEB has the continuation bit set
+    // but no following byte within the trie -> bounded ULEB fails loud.
+    std::vector<std::uint8_t> trie{0x80};   // continuation bit, nothing after
+    auto built = assembleDylib(trie, /*includeLoadDylib=*/false);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "trunc-uleb.dylib", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
+    EXPECT_NE(r.error().detail.find("ULEB"), std::string::npos);
+}
+
+TEST(BinaryReaderMacho, TrieReexportUnterminatedNameFailsLoud) {
+    // A reexport terminal whose import name has no NUL within the
+    // terminal payload -> fail loud (bounded string read).
+    //   root: termSize 0, childCount 1, edge "_r"+NUL, childOff -> leaf
+    //   leaf: termSize = payload len, payload = uleb(0x08) uleb(1) 'A' 'B'
+    //         (NO trailing NUL) , childCount 0
+    std::vector<std::uint8_t> payload{0x08, 0x01,
+                                      static_cast<std::uint8_t>('A'),
+                                      static_cast<std::uint8_t>('B')};
+    std::vector<std::uint8_t> trie;
+    appendUleb(trie, 0u);                            // root terminalSize
+    trie.push_back(0x01);                            // childCount
+    trie.push_back(static_cast<std::uint8_t>('_'));
+    trie.push_back(static_cast<std::uint8_t>('r'));
+    trie.push_back(0x00);                            // edge NUL
+    std::size_t const leafOff = trie.size() + 1;     // +1 for the childOff byte
+    appendUleb(trie, leafOff);                       // childOff (1 byte)
+    appendUleb(trie, payload.size());                // leaf terminalSize
+    trie.insert(trie.end(), payload.begin(), payload.end());
+    trie.push_back(0x00);                            // leaf childCount
+    auto built = assembleDylib(trie, /*includeLoadDylib=*/false);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "bad-reexp.dylib", rep);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
+    EXPECT_NE(r.error().detail.find("import-name"), std::string::npos);
+}
+
+// -- (c160-5) export-trie per-entry corruption: skip + warn -----------
+// An export whose address resolves to no section is skipped + summarized
+// (the trie region + structure are sound, only the one pointer is bad).
+TEST(BinaryReaderMacho, TrieAddressInNoSectionSkippedAsPartialCorruption) {
+    auto const built = buildMachoDylib({
+        {"_ok",  TrieKind::Function},
+        {"_oob", TrieKind::Function, "", 1, /*addrOverride=*/0x9000u},
+    });
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "oob-addr.dylib", rep);
+    ASSERT_TRUE(r.has_value())
+        << "an out-of-section export address must skip, not abort";
+    ASSERT_EQ(r->size(), 1u);
+    EXPECT_EQ((*r)[0].mangledName, "_ok");
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_BinaryReaderPartialCorruption), 1u)
+        << "an export address in no section fires the partial-corruption "
+           "Warning";
+}
+
+// -- (c160-6) export-trie memory-exhaustion DoS (name explosion) ------
+// A "caterpillar" trie is structurally VALID -- distinct node offsets,
+// NUL-terminated edges, all child offsets in range, no cycle -- yet its
+// terminals' accumulated names grow linearly with depth, so the TOTAL
+// materialized name bytes are Theta(depth^2). Without a cap a ~1MB such
+// dylib inflates to gigabytes and OOM-kills the process; the reader's
+// whole job is untrusted real dylibs, so this is a live DoS. The
+// total-name-bytes cap must FAIL LOUD before the quadratic allocation.
+// RED-ON-DISABLE: delete the cap and the reader instead returns `depth`
+// rows (quadratic name materialization), flipping the ASSERT_FALSE.
+TEST(BinaryReaderMacho, TrieCaterpillarNameExplosionFailsLoud) {
+    auto const trie  = buildCaterpillarTrie(/*depth=*/2000);
+    auto const built = assembleDylib(trie, /*includeLoadDylib=*/false);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "caterpillar.dylib", rep);
+    ASSERT_FALSE(r.has_value())
+        << "a caterpillar name-explosion must fail loud, not allocate "
+           "quadratically (surfaced " << (r.has_value() ? r->size() : 0)
+        << " rows)";
+    EXPECT_EQ(r.error().kind, BinaryReadErrorKind::CorruptedBinary);
+    EXPECT_NE(r.error().detail.find("total materialized name"),
+              std::string::npos)
+        << "actual: " << r.error().detail;
+}
+
+// -- (c160-7) empty-name terminal parity with the nlist path ----------
+// A terminal reached with an EMPTY accumulated name (a root-as-terminal
+// here) is not a usable ImportSurface row. The nlist path skip+counts an
+// empty resolved name; the trie path must do the same (not emit a
+// nameless row). The normally-named child export still surfaces.
+TEST(BinaryReaderMacho, TrieEmptyNameTerminalSkippedAsPartialCorruption) {
+    // Root IS a terminal (regular export, addr in __text) AND has one
+    // child "_ok" -> a terminal (addr in __text).
+    std::vector<std::uint8_t> rootPayload;
+    appendUleb(rootPayload, 0u);                 // flags = regular
+    appendUleb(rootPayload, kTextSecAddr);       // addr in __text
+    std::vector<std::uint8_t> trie;
+    appendUleb(trie, rootPayload.size());        // root terminalSize
+    trie.insert(trie.end(), rootPayload.begin(), rootPayload.end());
+    trie.push_back(0x01);                        // childCount = 1
+    trie.push_back(static_cast<std::uint8_t>('_'));
+    trie.push_back(static_cast<std::uint8_t>('o'));
+    trie.push_back(static_cast<std::uint8_t>('k'));
+    trie.push_back(0x00);                        // edge NUL
+    std::size_t const leafOff = trie.size() + 1; // +1 for the 1-byte childOff
+    appendUleb(trie, leafOff);                   // childOff -> leaf
+    std::vector<std::uint8_t> leafPayload;
+    appendUleb(leafPayload, 0u);                 // flags = regular
+    appendUleb(leafPayload, kTextSecAddr + 8u);  // addr in __text
+    appendUleb(trie, leafPayload.size());        // leaf terminalSize
+    trie.insert(trie.end(), leafPayload.begin(), leafPayload.end());
+    trie.push_back(0x00);                        // leaf childCount = 0
+
+    auto const built = assembleDylib(trie, /*includeLoadDylib=*/false);
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "empty-name.dylib", rep);
+    ASSERT_TRUE(r.has_value())
+        << "an empty-name terminal must skip, not abort: "
+        << (r.has_value() ? "" : r.error().detail);
+    ASSERT_EQ(r->size(), 1u)
+        << "the nameless root-terminal must NOT surface as a row; only "
+           "the named child export does";
+    EXPECT_EQ((*r)[0].mangledName, "_ok");
+    EXPECT_EQ((*r)[0].kind, SymbolKind::Function);
+    EXPECT_GE(countCode(rep, DiagnosticCode::F_BinaryReaderPartialCorruption), 1u)
+        << "the empty-name skip fires the partial-corruption Warning "
+           "(parity with the nlist empty-resolved-name path)";
+}
+
+// -- (c160-8) reexport ordinal spans ALL dylib-load commands ----------
+// The reexport library ordinal is 1-based across EVERY dylib-load command
+// (LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB / LC_REEXPORT_DYLIB /
+// LC_LAZY_LOAD_DYLIB / LC_LOAD_UPWARD_DYLIB). A lazy-load command first
+// (ordinal 1) + a real load command second (ordinal 2): a reexport naming
+// ordinal 2 must resolve to the SECOND dylib's leaf. Omitting lazy-load
+// from the ordinal space would shift ordinals and name the wrong dylib.
+TEST(BinaryReaderMacho, ReexportOrdinalSpansAllDylibLoadCommands) {
+    auto const trie = buildExportTrie({
+        {"_reexp", TrieKind::Reexport, "_tgt", /*reexOrdinal=*/2},
+    });
+    auto const built = assembleDylibMulti(trie, {
+        DylibLC{kLcLazyLoadDylib, "/usr/lib/libLazy.dylib"},   // ordinal 1
+        DylibLC{kLcLoadDylibC,    "/usr/lib/libReal.dylib"},   // ordinal 2
+    });
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "reexp-ord.dylib", rep);
+    ASSERT_TRUE(r.has_value())
+        << (r.has_value() ? "" : r.error().detail);
+    ASSERT_EQ(r->size(), 1u);
+    EXPECT_EQ((*r)[0].kind, SymbolKind::Forwarder);
+    EXPECT_EQ((*r)[0].forwardTarget, "libReal.dylib._tgt")
+        << "ordinal 2 must index the SECOND dylib-load command; a "
+           "regression that skipped LC_LAZY_LOAD_DYLIB in the ordinal "
+           "space would resolve the wrong dylib";
 }
