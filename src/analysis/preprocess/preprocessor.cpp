@@ -2,6 +2,7 @@
 
 #include "analysis/preprocess/pp_if_eval.hpp"
 #include "core/types/include_path_resolve.hpp"
+#include "core/substrate/phase_timers.hpp"
 #include "ffi/shipped_lib_descriptor.hpp"
 #include "tokenizer/tokenizer.hpp"
 
@@ -3264,7 +3265,14 @@ PreprocessResult preprocess(
     // the illegal-char oracle can never diverge from the real branch decision.
     SynthBuilder builder{schema, includeDirs, systemDirs, activeFormat,
                          *result.diagnostics, 0, includeStack, result.fatal};
-    builder.build(mainSource, synthText, result.lineMap);
+    {
+        // D-PERF-1 sub-timing: the synth-buffer splice (recursive concat of the
+        // main file + every quote-#include, + the line-map). Nests under the
+        // outer Preprocess scope, so its self-time is subtracted there.
+        substrate::PhaseTimers::Scope ppSplice{
+            substrate::CompilePhase::PreprocessSplice};
+        builder.build(mainSource, synthText, result.lineMap);
+    }
 
     // FC15a (A2 reorder): the `#`/`##` operators produce SYNTHETIC tokens whose
     // text does not exist in the spliced prefix. Their spelling must reach the
@@ -3290,7 +3298,12 @@ PreprocessResult preprocess(
     // a survival oracle keyed on "did the Error token reach the parser" would
     // wrongly drop those).
     DiagnosticReporter provisionalTokDiags;
-    auto ppToks = tokenizeToPP(prefixBuffer, schema, provisionalTokDiags);
+    auto ppToks = [&] {
+        // D-PERF-1 sub-timing: the single tokenize of the synth buffer.
+        substrate::PhaseTimers::Scope ppTok{
+            substrate::CompilePhase::PreprocessTokenize};
+        return tokenizeToPP(prefixBuffer, schema, provisionalTokDiags);
+    }();
     std::vector<Token> synthTokens;
     synthTokens.reserve(ppToks.size());
     for (auto const& tk : ppToks) synthTokens.push_back(tk.tok);
@@ -3306,7 +3319,14 @@ PreprocessResult preprocess(
                            prefixLen,     &result.lineMap,
                            includeDirs,   systemDirs,   activeFormat,
                            fs::path{mainSource->name()}.parent_path()};
-    std::vector<Token> finalTokens = expander.run(synthTokens);
+    std::vector<Token> finalTokens;
+    {
+        // D-PERF-1 sub-timing: the macro pass (table build + stream expansion +
+        // conditional elision) — the dominant preprocess stage on macro-heavy TUs.
+        substrate::PhaseTimers::Scope ppExpand{
+            substrate::CompilePhase::PreprocessExpand};
+        finalTokens = expander.run(synthTokens);
+    }
     // OR in the macro-expansion truncation; the SynthBuilder already wrote
     // `result.fatal` by reference for an include-nesting truncation.
     result.fatal = result.fatal || expander.truncated();

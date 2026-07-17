@@ -40,7 +40,11 @@ namespace dss::substrate {
 // The pipeline's phase seams, in pipeline order. Names (see
 // `compilePhaseName`) are the driver-report vocabulary.
 enum class CompilePhase : std::uint8_t {
-    Preprocess,      // config-selected preprocessor (splice + tokenize + macro expand)
+    Preprocess,        // config-selected preprocessor — the RESIDUAL self-time after the
+                       // three sub-phases below (define prologues, buffer freezes, repackage)
+    PreprocessSplice,  // build the synth buffer: recursive concat of main + quote-#includes + line-map
+    PreprocessTokenize,// tokenize the synth buffer once
+    PreprocessExpand,  // macro table build + stream expansion + conditional elision
     Tokenize,        // standalone tokenize (languages without a preprocess block)
     Parse,           // first parse of each tree
     Reparse,         // the type-name-oracle reparse (counted SEPARATELY so its 2x shows)

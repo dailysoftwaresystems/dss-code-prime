@@ -176,9 +176,12 @@ TEST(Program_CompileFiles, ZeroArgFunctionWiresThroughPipeline) {
 // pipeline necessarily runs recorded at least one run, and (c) the
 // attributed total is a plausible nonzero. RED-on-disable: deleting any
 // instrumented Scope zeroes that phase's run count and the matching
-// EXPECT fails. (Phases a trivial source legitimately skips — tokenize
-// [c-subset preprocesses], reparse [no ambiguous cast], synthesize-ffi
-// [no externs] — are deliberately un-asserted.)
+// EXPECT fails — including the three preprocess sub-phases (splice /
+// tokenize / expand, D-PERF-1), which run for ANY C compile. (Phases a
+// trivial source legitimately skips — the STANDALONE tokenize [c-subset
+// preprocesses, so its tokenize is the preprocess-tokenize sub-phase],
+// reparse [no ambiguous cast], synthesize-ffi [no externs] — are
+// deliberately un-asserted.)
 TEST(Program_CompileFiles, PhaseTimersRecordEveryPipelinePhase) {
     using dss::substrate::CompilePhase;
     using dss::substrate::PhaseTimers;
@@ -208,7 +211,11 @@ TEST(Program_CompileFiles, PhaseTimersRecordEveryPipelinePhase) {
     }
 
     // (b) the phases this compile necessarily exercises each recorded a run.
-    for (CompilePhase p : {CompilePhase::Preprocess, CompilePhase::Parse,
+    for (CompilePhase p : {CompilePhase::Preprocess,
+                           CompilePhase::PreprocessSplice,
+                           CompilePhase::PreprocessTokenize,
+                           CompilePhase::PreprocessExpand,
+                           CompilePhase::Parse,
                            CompilePhase::ResolveImports, CompilePhase::Semantic,
                            CompilePhase::LowerHir, CompilePhase::LowerMir,
                            CompilePhase::Optimize, CompilePhase::LowerLir,
