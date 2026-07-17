@@ -6,6 +6,7 @@ add_library(link OBJECT
     object_format_schema_json.cpp
     format/ar.cpp
     format/elf.cpp
+    format/elf_object_reader.cpp
     format/pe.cpp
     format/macho.cpp
     format/macho_chained_fixups.cpp

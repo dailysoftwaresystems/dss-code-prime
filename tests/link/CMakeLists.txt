@@ -77,3 +77,11 @@ dss_add_test(NAME link/test_lk10_entry_slice_c   SOURCES test_lk10_entry_slice_c
 # fail-loud belts, and the end-to-end `linkAndWriteStaticArchive` composition
 # bundling a real DSS ELF ET_REL `.o` member.
 dss_add_test(NAME link/test_ar_writer            SOURCES test_ar_writer.cpp)
+
+# c164 (D-LK-RELOCATABLE-OBJECT-READER, ELF slice) — the ELF ET_REL
+# relocatable-object MEMBER READER: the inverse of elf.cpp's ET_REL writer.
+# Writer<->reader FULL-object round-trip (functions + data + externs +
+# relocations {offset,target,kind,addend}), real gcc-produced .o cross-check
+# (WSL), and header/section-table/symtab/rela truncation red-pins. Unblocks
+# the c165 static-link (pull a member, read it into a mergeable module, merge).
+dss_add_test(NAME link/test_relocatable_object_reader SOURCES test_relocatable_object_reader.cpp)
