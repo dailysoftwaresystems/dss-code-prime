@@ -14,7 +14,8 @@
     { "name": "TCL_OK",     "replacement": "0" },
     { "name": "TCL_ERROR",  "replacement": "1" },
     { "name": "TCL_STATIC", "replacement": "0" },
-    { "name": "NULL",       "replacement": "((void*)0)" }
+    { "name": "NULL",       "replacement": "((void*)0)" },
+    { "name": "CONST",      "replacement": "const" }
   ],
   "structs": [
     { "name": "Tcl_CmdInfo", "fields": [

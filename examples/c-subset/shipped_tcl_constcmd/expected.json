@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C7 2026-07-17): RUN witness for the `CONST`->`const` compat macro (tcl.json macros). A TCL object command whose signature uses the OLD-Tcl `Tcl_Obj *CONST objv[]` form (30 of 44 sqlite src/test*.c use it; the dominant test-TU blocker after the C6 extern-aggregate fix — 16 TUs P0001'd 'expected ) got objv' on the unexpanded CONST). DSS expands CONST->const, so the const-pointer array param decays to `Tcl_Obj *const *` + binds to Tcl_CreateObjCommand's fn-ptr param; libtcl calls SumCmd back on the parsed args of `mysum 40 2` -> 42. elf-x86_64 only (tcl.json availableObjectFormats:[elf]); CI ubuntu x86_64 legs run it (libtcl8.6), native-arm64 arch-gates, windows/macos compile-only. RED-ON-DISABLE: remove the CONST macro from tcl.json -> `Tcl_Obj *CONST objv[]` P0001s -> fails to compile.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-constcmd-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-constcmd-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

@@ -1566,6 +1566,32 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
         ASSERT_EQ(objvElem.size(), 1u);
         EXPECT_EQ(interner.kind(objvElem[0]), TypeKind::Ptr);   // ptr<ptr<Tcl_Obj>>
     }
+
+    // C4 PP-macros (TCL_OK/TCL_ERROR/TCL_STATIC/NULL) + the C7 `CONST` compat macro.
+    // tcl.h's `#define CONST const` is the OLD-Tcl objProc form used by 30 of the 44
+    // sqlite src/test*.c (`Tcl_Obj *CONST objv[]`) — the dominant test-TU parse
+    // blocker after the C6 extern-aggregate fix (16 TUs P0001'd 'expected ) got objv'
+    // on the unexpanded CONST). RED-ON-DISABLE: remove the CONST macro from tcl.json
+    // and both the presence check and the sawConst check below fail (and the
+    // shipped_tcl_constcmd example stops compiling).
+    {
+        auto hasMacro = [&](std::string_view name) {
+            for (auto const& m : desc->macros)
+                if (m.name == name) return true;
+            return false;
+        };
+        for (auto const* n : {"TCL_OK", "TCL_ERROR", "TCL_STATIC", "NULL", "CONST"})
+            EXPECT_TRUE(hasMacro(n)) << "missing Tcl macro: " << n;
+        bool sawConst = false;
+        for (auto const& m : desc->macros) {
+            if (m.name == "CONST") {
+                sawConst = true;
+                EXPECT_EQ(m.replacement, "const");     // CONST -> const (the C7 fix)
+                EXPECT_FALSE(m.params.has_value());    // object-like macro
+            }
+        }
+        EXPECT_TRUE(sawConst) << "tcl.json must define the CONST compat macro";
+    }
 }
 
 // MF-2: an unsigned constant at the TOP of its range (ULLONG_MAX) round-trips
