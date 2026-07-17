@@ -1,0 +1,154 @@
+{
+  "$comment": "STATIC LIBRARY (`ar` archive of relocatable members) for elf64-aarch64-linux. c171 (D-FF1-AR-STATICLIB-DRIVER-WIRING). IDENTICAL to the `elf64-aarch64-linux` relocatable format -- its ELF ET_REL aarch64 AAPCS64 members are written by the SAME relocatable writer + the same sections[]/relocations[] rows -- PLUS exactly `container: \"archive\"` + `artifactProfiles: [\"staticlib\"]` + the `-staticlib` name. The archive framing itself is FORMAT-BLIND (src/link/format/ar.cpp): the SysV `.a` armap for ELF/Mach-O, the Microsoft `.lib` 2nd linker member for PE (flavor threaded from kind() in linkAndWriteStaticArchive). No writer code is format-specific to the archive. Kept in sync with the relocatable sibling by hand: any section/reloc change there must mirror here.",
+  "dssObjectFormatVersion": 1,
+  "format": {
+    "name": "elf64-aarch64-linux-staticlib",
+    "version": "1.0",
+    "kind": "elf"
+  },
+  "$containerComment": "D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): `container: archive` marks this as a STATIC-LIBRARY format. The driver (compileOneTarget) dispatches on THIS field -- never the artifactProfile name (the artifact_profile.hpp veto) -- routing each CU's relocatable member (.o) into ONE `ar` archive via linkAndWriteStaticArchive. This is the user's Option-1 format-container decision: output SHAPE stays 100% format-driven (cli->exec, lib->shared, staticlib->archive), exactly as elf.type / pe.type / macho.filetype select the single-file shapes.",
+  "container": "archive",
+  "$artifactProfilesComment": "This format SERVES the `staticlib` artifact profile (plan 06). It is the FIRST format to declare it -- the bare relocatable sibling serves NO profile (a `.o` is an internal cross-CU intermediate / a static-archive member, never a project's final artifact). enforceArtifactProfileFormat validates a `staticlib` project against this set.",
+  "artifactProfiles": [
+    "staticlib"
+  ],
+  "$dataModelComment": "FC3 c1: 64-bit linux/darwin are LP64 (int 32, long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I64 here. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
+  "dataModel": "LP64",
+  "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: Linux arm64 (AAPCS64) uses the generic LSB-first bit-field allocation — identical to SysV/GNU gnu_packed for little-endian — so it shares the strategy. Byte-ABI-exact (the qemu arm64-ELF corpus is self-consistent under it; the CI cross-compile-compare confirms against the native compiler).",
+  "bitFieldStrategy": "gnu_packed",
+  "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: AAPCS64 linux-arm64 `long double` = IEEE binary128, 16/16. See elf64-aarch64-linux-exec.",
+  "longDoubleFormat": "ieee128",
+  "$supportedDataSectionsComment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE + D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): a relocatable object carries data — a global lands in `.rodata`/`.data`/`.bss`/`.data.rel.ro` with `sh_addr=0` + a section-relative `.symtab` entry the FINAL linker binds. Same machine-NEUTRAL elf.cpp ET_REL writer as elf64-x86_64-linux (it reads section names/flags + reloc nativeIds from THIS schema, never hardcoding a machine); arch differs only via config — the abs64 data reloc is R_AARCH64_ABS64 (257) here vs R_X86_64_64 (1) on x86_64. A reloc-bearing CONST global (`relro`) emits `.rela.data.rel.ro`; a reloc-bearing MUTABLE pointer emits `.rela.data`. TLS (`tdata`/`tbss`) is deferred to a follow-up.",
+  "supportedDataSections": [
+    "rodata",
+    "data",
+    "bss",
+    "relro"
+  ],
+  "elf": {
+    "$comment": "Elf64_Ehdr identity fields. `class` = ELFCLASS64; `data` = ELFDATA2LSB (little-endian — AArch64 is little-endian by convention on Linux); `osabi` = ELFOSABI_NONE (SysV); `machine` = EM_AARCH64 (183).",
+    "class": "elf64",
+    "data": "lsb",
+    "osabi": "sysv",
+    "abiVersion": 0,
+    "machine": 183
+  },
+  "sections": [
+    {
+      "$comment": "Executable code. sh_type = SHT_PROGBITS (1); sh_flags = SHF_ALLOC | SHF_EXECINSTR (0x6); addralign = 16 (cache-friendly; ARM64 instructions are 4-byte but section alignment is conventionally larger).",
+      "kind": "text",
+      "name": ".text",
+      "type": 1,
+      "flags": 6,
+      "addrAlign": 16,
+      "entrySize": 0
+    },
+    {
+      "$comment": "Relocation table for .text. sh_type = SHT_RELA (4); sh_flags = SHF_INFO_LINK (0x40); addralign = 8; entrysize = 24 (Elf64_Rela). sh_link/sh_info set per-link.",
+      "kind": "reloc",
+      "name": ".rela.text",
+      "type": 4,
+      "flags": 64,
+      "addrAlign": 8,
+      "entrySize": 24
+    },
+    {
+      "$comment": "Symbol table. sh_type = SHT_SYMTAB (2); addralign = 8; entrysize = 24 (Elf64_Sym).",
+      "kind": "symtab",
+      "name": ".symtab",
+      "type": 2,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 24
+    },
+    {
+      "$comment": "Symbol-name string table. sh_type = SHT_STRTAB (3); addralign = 1.",
+      "kind": "strtab",
+      "name": ".strtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0
+    },
+    {
+      "$comment": "Section-header string table. sh_type = SHT_STRTAB (3); addralign = 1.",
+      "kind": "shstrtab",
+      "name": ".shstrtab",
+      "type": 3,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-EXTERN-SYMBOL-NAMES: empty non-executable-stack marker for foreign-toolchain interop. sh_type = SHT_PROGBITS (1); sh_flags = 0 (NO SHF_EXECINSTR); addralign = 1; size 0. The ELF writer emits it (appended last, ET_REL only) iff this row is present.",
+      "kind": "note",
+      "name": ".note.GNU-stack",
+      "type": 1,
+      "flags": 0,
+      "addrAlign": 1,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE: read-only initialized data (string literals, const globals). SHT_PROGBITS(1); SHF_ALLOC(2). sh_addr=0 in a relocatable object — the final linker assigns the VA. Same machine-neutral writer as x86_64.",
+      "kind": "rodata",
+      "name": ".rodata",
+      "type": 1,
+      "flags": 2,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE: writable initialized data (mutable globals). SHT_PROGBITS(1); SHF_ALLOC|SHF_WRITE(3). sh_addr=0 in a relocatable object.",
+      "kind": "data",
+      "name": ".data",
+      "type": 1,
+      "flags": 3,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE: zero-initialized data (tentative globals `int g;`). SHT_NOBITS(8) — occupies no file bytes. SHF_ALLOC|SHF_WRITE(3). sh_addr=0 in a relocatable object.",
+      "kind": "bss",
+      "name": ".bss",
+      "type": 8,
+      "flags": 3,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-RELRO-CONST-DATA-RELOCATABLE (c145): relocated-read-only const data — a CONST global carrying LOAD-TIME relocations (a const function-pointer table / `int *const p = &x;`). gcc's `.data.rel.ro` contract: SHT_PROGBITS(1) + SHF_ALLOC|SHF_WRITE(3) (the loader writes the resolved target VA into each slot; a foreign linker places it in GNU_RELRO, read-only after relocation). sh_addr=0 in a relocatable object. The writer emits this section's OWN relocations into `.rela.data.rel.ro` (R_AARCH64_ABS64, abs64) — the `.rela.<section>` name is synthesized from this row's name.",
+      "kind": "relro",
+      "name": ".data.rel.ro",
+      "type": 1,
+      "flags": 3,
+      "addrAlign": 8,
+      "entrySize": 0
+    }
+  ],
+  "relocations": [
+    {
+      "$comment": "26-bit PC-relative branch with link / branch (BL / B target). ELF type R_AARCH64_CALL26 = 283. `kind` = 1 matches arm64.target.json's `call26` row.",
+      "name": "R_AARCH64_CALL26",
+      "kind": 1,
+      "nativeId": 283
+    },
+    {
+      "$comment": "21-bit PC-relative page-pair (ADRP). ELF type R_AARCH64_ADR_PREL_PG_HI21 = 275. `kind` = 2 matches arm64.target.json's `adr_prel_pg_hi21` row.",
+      "name": "R_AARCH64_ADR_PREL_PG_HI21",
+      "kind": 2,
+      "nativeId": 275
+    },
+    {
+      "$comment": "12-bit absolute low (ADD imm12 / LDST imm12). ELF type R_AARCH64_ADD_ABS_LO12_NC = 277. `kind` = 3 matches arm64.target.json's `add_abs_lo12_nc` row.",
+      "name": "R_AARCH64_ADD_ABS_LO12_NC",
+      "kind": 3,
+      "nativeId": 277
+    },
+    {
+      "$comment": "Absolute 64-bit (data pointer). ELF type R_AARCH64_ABS64 = 257. `kind` = 4 matches arm64.target.json's `abs64` row.",
+      "name": "R_AARCH64_ABS64",
+      "kind": 4,
+      "nativeId": 257
+    }
+  ]
+}

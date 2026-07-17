@@ -1045,6 +1045,16 @@ enum class DiagnosticCode : std::uint16_t {
     // the user asked for; fail loud instead (a language without a preprocessor
     // has no -D semantics).
     D_DefineRequiresPreprocess    = 0xD012,
+    // c171 (D-FF1-AR-STATICLIB-DRIVER-WIRING): a `--resolve-library` STATIC
+    // archive was passed while the target format's output is itself a static
+    // library (`container: archive`). Bundling input archives' members INTO a
+    // new static library (a "fat"/merged archive, à la `libtool`) is a real
+    // but UNBUILT feature (D-FF1-STATICLIB-FAT-ARCHIVE); silently dropping the
+    // input archive would produce a library missing the members the user asked
+    // for. Fail loud instead. (Dynamic `--resolve-library` libraries — for a
+    // member's extern FFI surface — are still accepted; only INPUT static
+    // archives hit this.)
+    D_StaticLibFatArchiveUnsupported = 0xD013,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──

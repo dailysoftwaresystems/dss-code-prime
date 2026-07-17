@@ -34,7 +34,9 @@
 #include "core/types/target_schema.hpp"
 #include "diagnostic_count.hpp"
 #include "ffi/abi/abi_catalog.hpp"
+#include "ffi/binary_readers/ar_reader.hpp"
 #include "link/format/ar.hpp"
+#include "link/format/elf_object_reader.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "program/compile_pipeline.hpp"
@@ -203,6 +205,51 @@ buildArchive(fs::path const& dir, std::string_view archiveName,
             return ms.name == symbol
                 && isExternallyVisible(ms.binding, ms.visibility);
         });
+}
+
+// Read a file's whole contents into a byte vector (for reading a driver-emitted
+// `.a`/`.lib` back off disk). Seek-to-end sizing keeps the read binary-exact.
+[[nodiscard]] std::vector<std::uint8_t> readFileBytes(fs::path const& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) { ADD_FAILURE() << "cannot open " << path.string(); return {}; }
+    auto const end = f.tellg();
+    f.seekg(0);
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(end));
+    if (!bytes.empty()) {
+        f.read(reinterpret_cast<char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+    }
+    return bytes;
+}
+
+// Structurally walk `ar` member headers and count the "/" LINKER-INDEX members
+// (name field exactly "/"): a SysV `.a` carries 1 (the armap); a COFF `.lib`
+// carries 2 (the SysV BE armap + the Microsoft LE 2nd linker member -- the c169
+// flavor threading). Returns -1 on a bad global magic. Header layout: name(16)
+// ... size@+48(10 ASCII-decimal) ... "`\n"(2) = 60; an odd payload is followed
+// by ONE '\n' pad byte external to `size` (the universal 2-byte ar alignment).
+[[nodiscard]] int countArSlashLinkerMembers(std::span<std::uint8_t const> bytes) {
+    if (bytes.size() < 8
+        || std::string_view{reinterpret_cast<char const*>(bytes.data()), 8}
+               != "!<arch>\n") {
+        return -1;
+    }
+    int count = 0;
+    std::size_t off = 8;
+    while (off + 60 <= bytes.size()) {
+        std::string name{reinterpret_cast<char const*>(bytes.data() + off), 16};
+        auto const last = name.find_last_not_of(' ');
+        name = (last == std::string::npos) ? std::string{} : name.substr(0, last + 1);
+        std::string const sizeField{
+            reinterpret_cast<char const*>(bytes.data() + off + 48), 10};
+        std::uint64_t size = 0;
+        for (char c : sizeField) {
+            if (c >= '0' && c <= '9') size = size * 10 + static_cast<std::uint64_t>(c - '0');
+        }
+        if (name == "/") ++count;
+        off += 60 + size + (size & 1);
+    }
+    return count;
 }
 
 }  // namespace
@@ -730,4 +777,189 @@ TEST(StaticLink, DISABLED_RealLibcWitnessArtifactDrop) {
         << "errs=" << rep.errorCount();
     std::cout << "[witness] wrote " << archive.string() << "\n";
     std::cout << "[witness] wrote " << (outDir / "main").string() << "\n";
+}
+
+// == c171 (D-FF1-AR-STATICLIB-DRIVER-WIRING): the DRIVER emits a static library ==
+//
+// The INVERSE arc of the static-LINK tests above: handed a `container: archive`
+// FORMAT target, the production `Program::compileFiles` driver lowers each CU to
+// its OWN relocatable member (NO cross-CU merge -- an archive PACKAGES separate
+// objects) and bundles them into ONE `ar` archive (`.a` for ELF/Mach-O, `.lib`
+// for PE) via `linkAndWriteStaticArchive`, dispatched on the format's declared
+// container (never the artifactProfile). These witness the WHOLE driver path
+// end-to-end: an emitted archive read back through the c161 ar reader with an
+// EXACT member count + armap symbol set, its member bytes a real ET_REL.
+
+namespace {
+// A single 2-function c-subset source -> ONE CU -> ONE archive member exporting
+// BOTH `dss_add` + `dss_sub`. (Shared by the ELF / PE / Mach-O driver witnesses.)
+constexpr std::string_view kTwoFnLibSrc =
+    "int dss_add(int a,int b){ return a+b; }\n"
+    "int dss_sub(int a,int b){ return a-b; }\n";
+}  // namespace
+
+TEST(StaticLink, ElfStaticLibDriverEmitsArchiveWithArmap) {
+    ScratchDir scratch{Location::InsideRepo, "static-link"};
+    auto const dir = scratch.path();
+    auto const src = writeSrc(dir, "dsslibmath.c", kTwoFnLibSrc);
+
+    Program p;
+    p.setOutputDir(dir);
+    DiagnosticReporter rep;
+    int const rc = p.compileFiles(
+        std::vector<std::string>{src.string()}, "c-subset",
+        std::vector<std::string>{"x86_64:elf64-x86_64-linux-staticlib"}, rep);
+    ASSERT_EQ(rc, 0) << "ELF staticlib build must succeed; errs=" << rep.errorCount();
+
+    auto const archivePath = dir / "dsslibmath.a";
+    ASSERT_TRUE(fs::exists(archivePath))
+        << "the driver must emit a `.a` static library at <stem>.a";
+    EXPECT_EQ(archivePath.extension().string(), ".a");
+    EXPECT_TRUE(isArArchiveFile(archivePath))
+        << "the emitted `.a` must carry the !<arch> magic";
+
+    // Read it back with the c161 ar reader: EXACTLY one member; the armap lists
+    // EXACTLY {dss_add, dss_sub} (ELF C mangling is identity -- no underscore).
+    auto const bytes = readFileBytes(archivePath);
+    DiagnosticReporter rrep;
+    auto arch = ffi::readArArchive(bytes, archivePath.string(), rrep);
+    ASSERT_TRUE(arch.has_value()) << arch.error().detail;
+    ASSERT_EQ(arch->members.size(), 1u) << "one source CU -> exactly one member";
+
+    std::vector<std::string> armap;
+    for (auto const& sym : arch->symbols) armap.push_back(sym.name);
+    std::sort(armap.begin(), armap.end());
+    ASSERT_EQ(armap.size(), 2u) << "the armap lists exactly the two exported fns";
+    EXPECT_EQ(armap[0], "dss_add");
+    EXPECT_EQ(armap[1], "dss_sub");
+
+    // The member bytes parse as a valid ELF ET_REL (the c164 reader), defining
+    // BOTH functions -- proof the archived member is a real relocatable object.
+    Schemas const s = loadSchemas();
+    ASSERT_TRUE(s.grammar);
+    auto const memberBytes = std::span<std::uint8_t const>{bytes}.subspan(
+        arch->members[0].dataOffset, arch->members[0].size);
+    DiagnosticReporter mrep;
+    auto member = elf::readRelocatableObject(memberBytes, *s.target, *s.reloc, mrep);
+    ASSERT_TRUE(member) << "the archived member must parse as an ET_REL; errs="
+                        << mrep.errorCount();
+    EXPECT_TRUE(moduleDefinesExternallyVisible(*member, "dss_add"));
+    EXPECT_TRUE(moduleDefinesExternallyVisible(*member, "dss_sub"));
+}
+
+// The PE sibling: a `pe64-*-windows-staticlib` target emits a `.lib` whose bytes
+// carry TWO "/" linker members (the SysV BE 1st + the Microsoft LE 2nd) -- the
+// ArArchiveFlavor::Coff threading. That 2nd linker member is what distinguishes
+// a correct PE static lib from a SysV-only `.a`. Structural on every host (byte
+// parse only, no tool run).
+TEST(StaticLink, PeStaticLibDriverEmitsCoffLibWithSecondLinkerMember) {
+    ScratchDir scratch{Location::InsideRepo, "static-link"};
+    auto const dir = scratch.path();
+    auto const src = writeSrc(dir, "dsslibmath.c", kTwoFnLibSrc);
+
+    Program p;
+    p.setOutputDir(dir);
+    DiagnosticReporter rep;
+    int const rc = p.compileFiles(
+        std::vector<std::string>{src.string()}, "c-subset",
+        std::vector<std::string>{"x86_64:pe64-x86_64-windows-staticlib"}, rep);
+    ASSERT_EQ(rc, 0) << "PE staticlib build must succeed; errs=" << rep.errorCount();
+
+    auto const libPath = dir / "dsslibmath.lib";
+    ASSERT_TRUE(fs::exists(libPath))
+        << "the driver must emit a `.lib` for a PE staticlib";
+    auto const bytes = readFileBytes(libPath);
+
+    // THE COFF-vs-SysV discriminator: TWO "/" linker index members.
+    EXPECT_EQ(countArSlashLinkerMembers(bytes), 2)
+        << "a PE `.lib` must carry the SysV 1st + Microsoft LE 2nd linker members "
+           "(the flavor threading); a SysV-only `.a` would carry just 1";
+
+    // The c161 reader consumes the FIRST (SysV BE) armap: one member, both fns
+    // (PE x64 C mangling is identity -- no leading underscore).
+    DiagnosticReporter rrep;
+    auto arch = ffi::readArArchive(bytes, libPath.string(), rrep);
+    ASSERT_TRUE(arch.has_value()) << arch.error().detail;
+    ASSERT_EQ(arch->members.size(), 1u) << "one source CU -> exactly one member";
+    std::vector<std::string> armap;
+    for (auto const& sym : arch->symbols) armap.push_back(sym.name);
+    std::sort(armap.begin(), armap.end());
+    ASSERT_EQ(armap.size(), 2u);
+    EXPECT_EQ(armap[0], "dss_add");
+    EXPECT_EQ(armap[1], "dss_sub");
+}
+
+// RED-ON-DISABLE for the D_StaticLibFatArchiveUnsupported guard (0xD013): a
+// staticlib-target build handed an INPUT static archive via `--resolve-library`
+// fails loud (bundling input archives into a merged "fat" archive is unbuilt)
+// rather than silently dropping the input's members. Remove the guard and the
+// build would (wrongly) succeed, ignoring the input `.a`.
+TEST(StaticLink, StaticLibDriverRejectsInputStaticArchive) {
+    ScratchDir scratch{Location::InsideRepo, "static-link"};
+    auto const dir = scratch.path();
+    Schemas const s = loadSchemas();
+    ASSERT_TRUE(s.grammar);
+
+    // A real INPUT `.a` on disk (built by this file's own ar writer helper).
+    auto const inputArchive =
+        buildArchive(dir, "libinput.a", {{std::string{kLibSrc}, "lib.o"}}, s);
+    ASSERT_FALSE(inputArchive.empty());
+    ASSERT_TRUE(isArArchiveFile(inputArchive));
+
+    auto const src = writeSrc(dir, "dsslibmath.c",
+                              "int dss_add(int a,int b){ return a+b; }\n");
+
+    Program p;
+    p.setOutputDir(dir);
+    p.setResolveLibraries(std::vector<fs::path>{inputArchive});
+    DiagnosticReporter rep;
+    int const rc = p.compileFiles(
+        std::vector<std::string>{src.string()}, "c-subset",
+        std::vector<std::string>{"x86_64:elf64-x86_64-linux-staticlib"}, rep);
+    EXPECT_NE(rc, 0) << "building a static library WITH an input static archive "
+                        "must fail loud (fat-archive bundling is unbuilt)";
+    EXPECT_EQ(countCode(rep, DiagnosticCode::D_StaticLibFatArchiveUnsupported), 1u)
+        << "the guard must emit D_StaticLibFatArchiveUnsupported exactly once";
+}
+
+// The Mach-O sibling of the ELF driver witness: an arm64 Mach-O staticlib target
+// emits a `.a` whose armap lists both members' symbols (Mach-O C mangling
+// prepends `_`). STRUCTURAL on every host (no run -- the Mach-O runtime witness
+// rides the macOS CI leg).
+TEST(StaticLink, MachoStaticLibDriverEmitsArchive) {
+    ScratchDir scratch{Location::InsideRepo, "static-link"};
+    auto const dir = scratch.path();
+    auto const src = writeSrc(dir, "dsslibmath.c", kTwoFnLibSrc);
+
+    Program p;
+    p.setOutputDir(dir);
+    DiagnosticReporter rep;
+    int const rc = p.compileFiles(
+        std::vector<std::string>{src.string()}, "c-subset",
+        std::vector<std::string>{"arm64:macho64-arm64-darwin-staticlib"}, rep);
+    ASSERT_EQ(rc, 0) << "Mach-O staticlib build must succeed; errs=" << rep.errorCount();
+
+    auto const archivePath = dir / "dsslibmath.a";
+    ASSERT_TRUE(fs::exists(archivePath))
+        << "the driver must emit a `.a` for a Mach-O staticlib";
+    EXPECT_TRUE(isArArchiveFile(archivePath));
+
+    auto const bytes = readFileBytes(archivePath);
+    DiagnosticReporter rrep;
+    auto arch = ffi::readArArchive(bytes, archivePath.string(), rrep);
+    ASSERT_TRUE(arch.has_value()) << arch.error().detail;
+    ASSERT_EQ(arch->members.size(), 1u) << "one source CU -> exactly one member";
+
+    // Mach-O mangles a C name with a leading `_`; pin the EXACT armap size (both
+    // functions, nothing else) and match each symbol by substring.
+    ASSERT_EQ(arch->symbols.size(), 2u)
+        << "the armap lists exactly the two exported fns";
+    auto refsSym = [&](std::string_view want) {
+        return std::any_of(arch->symbols.begin(), arch->symbols.end(),
+            [&](ffi::ArSymbol const& sym) {
+                return sym.name.find(want) != std::string::npos;
+            });
+    };
+    EXPECT_TRUE(refsSym("dss_add"));
+    EXPECT_TRUE(refsSym("dss_sub"));
 }

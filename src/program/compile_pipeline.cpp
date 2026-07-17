@@ -1641,7 +1641,18 @@ bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
             memberNames[i], std::move(image.bytes), std::move(exported)});
     }
 
-    auto const archive = link::format::writeArArchive(members, reporter);
+    // c169/c171 (D-FF1-AR-COFF-WRITER + D-FF1-AR-STATICLIB-DRIVER-WIRING):
+    // the archive FLAVOR is the format ecosystem's `ar` variant — Microsoft
+    // COFF (`.lib`: adds the little-endian 2nd linker member a link.exe
+    // consumer requires) for PE, GNU/System V (`.a`) for ELF + Mach-O.
+    // Derived from `format.kind()` (the closed enum, the existing agnostic
+    // dispatch axis), never a format-name branch. Without this a PE static
+    // library would ship SysV-only and MS link.exe could not resolve its
+    // members (the c169 default was SysV; c171 threads the real flavor).
+    auto const flavor = (format.kind() == ObjectFormatKind::Pe)
+                            ? link::format::ArArchiveFlavor::Coff
+                            : link::format::ArArchiveFlavor::SysV;
+    auto const archive = link::format::writeArArchive(members, reporter, flavor);
     if (!tierClean(reporter, entry)) {
         return false;   // a writer fail-loud belt fired (name/size/offset).
     }

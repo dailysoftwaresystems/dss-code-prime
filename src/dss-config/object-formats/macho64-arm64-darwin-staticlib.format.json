@@ -1,0 +1,115 @@
+{
+  "$comment": "STATIC LIBRARY (`ar` archive of relocatable members) for macho64-arm64-darwin. c171 (D-FF1-AR-STATICLIB-DRIVER-WIRING). IDENTICAL to the `macho64-arm64-darwin` relocatable format -- its Mach-O MH_OBJECT arm64 members are written by the SAME relocatable writer + the same sections[]/relocations[] rows -- PLUS exactly `container: \"archive\"` + `artifactProfiles: [\"staticlib\"]` + the `-staticlib` name. The archive framing itself is FORMAT-BLIND (src/link/format/ar.cpp): the SysV `.a` armap for ELF/Mach-O, the Microsoft `.lib` 2nd linker member for PE (flavor threaded from kind() in linkAndWriteStaticArchive). No writer code is format-specific to the archive. Kept in sync with the relocatable sibling by hand: any section/reloc change there must mirror here.",
+  "dssObjectFormatVersion": 1,
+  "format": {
+    "name": "macho64-arm64-darwin-staticlib",
+    "version": "1.0",
+    "kind": "macho"
+  },
+  "$containerComment": "D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): `container: archive` marks this as a STATIC-LIBRARY format. The driver (compileOneTarget) dispatches on THIS field -- never the artifactProfile name (the artifact_profile.hpp veto) -- routing each CU's relocatable member (.o) into ONE `ar` archive via linkAndWriteStaticArchive. This is the user's Option-1 format-container decision: output SHAPE stays 100% format-driven (cli->exec, lib->shared, staticlib->archive), exactly as elf.type / pe.type / macho.filetype select the single-file shapes.",
+  "container": "archive",
+  "$artifactProfilesComment": "This format SERVES the `staticlib` artifact profile (plan 06). It is the FIRST format to declare it -- the bare relocatable sibling serves NO profile (a `.o` is an internal cross-CU intermediate / a static-archive member, never a project's final artifact). enforceArtifactProfileFormat validates a `staticlib` project against this set.",
+  "artifactProfiles": [
+    "staticlib"
+  ],
+  "$externCallDispatchComment": "D-LK-OBJECT-EXTERN-CALL-MACHO (closed this cycle): extern FUNCTION calls lower into this relocatable object — a plain BL + BRANCH26 reloc against an SHN_UNDEF-style N_UNDF|N_EXT symbol carrying its REAL import name (the macho.cpp undefined-extern loop now emits `externName`, i.e. the pipeline-mangled `_`-prefixed C name, not the internal `_sym_<id>` — the blocker the #42 note documented). The FINAL linker (ld64/clang) synthesizes the stub/GOT, exactly like the ELF c141 `direct-plt` contract; DSS never builds a stub in a `.o`. The x86_64-darwin object sibling stays leaf-only (no runtime leg exists to witness it — the D-LK1-MACHO-X8664-DARWIN-DATA-SECTION untested-form discipline); its walker code is shared and lights up by declaring this field when a runner lands.",
+  "externCallDispatch": "direct-plt",
+  "$dataModelComment": "FC3 c1: 64-bit linux/darwin are LP64 (int 32, long 64, ptr 64). Consumed by the semantic tier (buildCuMir threads format.dataModel() into analyze()): c-subset long binds I64 here. REQUIRED closed-enum field; the loader rejects a missing or unknown value (a silent default would bake wrong widths).",
+  "dataModel": "LP64",
+  "$bitFieldStrategyComment": "D-CSUBSET-BITFIELD-ABI-EXACT: macOS/Darwin (Apple x86_64 + arm64) uses the generic LSB-first bit-field allocation. Apple's enumerated arm64 ABI divergences from generic AAPCS64 are char/wchar_t signedness, long double=double, va_list, the red zone, the stack argument area, and empty-struct handling — NOT bit-field packing — so Mach-O shares gnu_packed (the SAME value the x86_64-darwin object + both darwin exec formats declare).",
+  "bitFieldStrategy": "gnu_packed",
+  "$longDoubleFormatComment": "FC17.9(e) D-CSUBSET-LONG-DOUBLE: Apple arm64 `long double` IS `double` (64-bit IEEE, 8/8) — a documented Apple divergence from generic AAPCS64's binary128. See macho64-arm64-darwin-exec.",
+  "longDoubleFormat": "f64",
+  "$supportedDataSectionsComment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE (Mach-O MH_OBJECT arm, c147 — the macho analog of the ELF c142 `.o` data sections): a relocatable object DOES carry data — a global lands in `__TEXT,__const` / `__DATA,__data` / `__DATA,__bss` / `__DATA,__const` with walker-computed flat-`.o`-space addrs and an N_SECT|N_EXT nlist_64 (n_sect = the section's 1-based ordinal, n_value = the item's FLAT address) the FINAL linker (ld64/clang) binds. Same format-blind `AssembledModule.dataItems` producer path as ELF/PE. D-LK-RELRO-CONST-DATA-RELOCATABLE (Mach-O arm): a CONST global carrying LOAD-TIME relocations (a const function-pointer table / `int *const p = &x;` — sqlite's VFS method tables + `aSyscall[]`) lands in `relro` = `__DATA,__const` and the writer emits its OWN relocation_info table (ARM64_RELOC_UNSIGNED, r_extern=1, addend IN the 8-byte slot bytes — Mach-O's in-place-addend convention; there is no RELA addend column); a reloc-bearing MUTABLE pointer global lands in `data`. TLS (`tdata`/`tbss`) stays UNDECLARED — the linker's acceptsDataSection gate rejects it loud (the MH_OBJECT walker emits no `__thread_data`/`__thread_vars`; the exec TLV machinery is MH_EXECUTE-only, D-CSUBSET-THREAD-LOCAL C4).",
+  "supportedDataSections": [
+    "rodata",
+    "data",
+    "bss",
+    "relro"
+  ],
+  "macho": {
+    "$comment": "mach_header_64 identity. cputype = CPU_TYPE_ARM64 = (12 | CPU_ARCH_ABI64 0x01000000) = 0x0100000C = 16777228 (the SAME value the macho64-arm64-darwin-exec schema declares). cpusubtype = CPU_SUBTYPE_ARM64_ALL (0). filetype = MH_OBJECT (1). flags = 0 — MH_SUBSECTIONS_VIA_SYMBOLS (0x2000) is intentionally NOT set (mirrors the x86_64-darwin object): the walker emits one flat `__text` blob with no N_ALT_ENTRY subsection markers, so advertising the flag would lie to ld64 about function-granular dead-strip safety. The flag returns when the substrate emits per-function subsections (plan 14 §3.1 D-LK3-2).",
+    "cputype": 16777228,
+    "cpusubtype": 0,
+    "filetype": "object",
+    "flags": 0
+  },
+  "sections": [
+    {
+      "$comment": "Executable code. Mach-O two-level naming: section `__text` inside segment `__TEXT`. section_64.flags = S_REGULAR (0x0) | S_ATTR_PURE_INSTRUCTIONS (0x80000000) | S_ATTR_SOME_INSTRUCTIONS (0x00000400) = 0x80000400. addrAlign in log2 form: 4 = 16 bytes — this row's addrAlign IS the literal section_64.align field, written VERBATIM by the walker (the data rows below use the raw-byte-floor convention instead; see their comments). PE's substrate `type` field repurposed for Mach-O section_64.flags. The x86_64-darwin object sibling stays text-only + leaf-only (no runtime leg to witness it); THIS arm64 file carries the data rows (D-LK-OBJECT-DATA-SECTION-RELOCATABLE, c147).",
+      "kind": "text",
+      "name": "__text",
+      "segment": "__TEXT",
+      "type": 2147484672,
+      "flags": 0,
+      "addrAlign": 4,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE (Mach-O arm, c147): read-only initialized data (string literals, const globals WITHOUT relocations) — exactly where clang places it in an arm64 `.o`: section `__const` inside the R+X `__TEXT` segment. section_64.flags (substrate `type`) = S_REGULAR (0). addrAlign = 8 is the RAW-BYTE alignment FLOOR fed to the shared `buildExecDataSection` substrate (the SAME convention the darwin-exec schema's data rows use); the walker H1-raises it to the strictest member alignment and writes section_64.align as log2 (countr_zero) — UNLIKE the `__text` row above, whose addrAlign is the literal log2 field. No `virtualAddress`: MH_OBJECT section addrs are walker-computed in the flat `.o` address space (text at 0, each next section H1-aligned after the previous), and validate() rejects a non-zero VA on an object row.",
+      "kind": "rodata",
+      "name": "__const",
+      "segment": "__TEXT",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE (Mach-O arm, c147): writable initialized data (mutable globals, `int counter = 7;`) — clang's `__DATA,__data`. section_64.flags (substrate `type`) = S_REGULAR (0). addrAlign = 8 raw-byte floor (H1-raised; walker writes log2 — see the rodata row's comment). A reloc-bearing MUTABLE pointer global also lands here and the walker emits its relocation_info against this section (r_address = the slot's section-relative offset).",
+      "kind": "data",
+      "name": "__data",
+      "segment": "__DATA",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-RELRO-CONST-DATA-RELOCATABLE (Mach-O arm, c147): relocated-read-only const data — a CONST global carrying LOAD-TIME relocations (a const function-pointer table / `int *const p = &x;`). In an arm64 `.o` clang emits this as `__DATA,__const` — the `.o` PRECURSOR of the image's `__DATA_CONST,__const` (ld64 gathers `__DATA,__const` input sections into the __DATA_CONST segment, read-only after rebase — the Mach-O analog of gcc's `.data.rel.ro` / GNU_RELRO). section_64.flags (substrate `type`) = S_REGULAR (0); the two `__const` rows are DISTINCT Mach-O sections because the (segment, section) PAIR is the identity — (`__TEXT`,`__const`) is the reloc-free rodata row above. addrAlign = 8 raw-byte floor (H1-raised; walker writes log2). The walker emits this section's OWN relocation_info table (the c145 `.rela.data.rel.ro` analog): ARM64_RELOC_UNSIGNED, r_extern=1, r_length=3, addend written INTO the 8-byte slot (in-place-addend — Mach-O relocation_info has no addend column).",
+      "kind": "relro",
+      "name": "__const",
+      "segment": "__DATA",
+      "type": 0,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0
+    },
+    {
+      "$comment": "D-LK-OBJECT-DATA-SECTION-RELOCATABLE (Mach-O arm, c147): zero-initialized data (tentative globals `int g;`) — clang's `__DATA,__bss`. section_64.flags (substrate `type`) = S_ZEROFILL (1): size > 0 but section_64.offset = 0 and NO file bytes (the flat-space addr still advances — LC_SEGMENT_64.vmsize covers it, filesize does NOT). The walker emits it LAST in the section list (the zerofill-last Mach-O convention). addrAlign = 8 raw-byte floor (H1-raised; walker writes log2).",
+      "kind": "bss",
+      "name": "__bss",
+      "segment": "__DATA",
+      "type": 1,
+      "flags": 0,
+      "addrAlign": 8,
+      "entrySize": 0
+    }
+  ],
+  "relocations": [
+    {
+      "$comment": "32-bit PC-relative BL/B branch (call). r_type = ARM64_RELOC_BRANCH26 (2), r_pcrel = 1, r_length = 2 (4 bytes). Mach-O `relocation_info.r_info` packs bits 28..31=r_type, 27=r_extern, 25..26=r_length, 24=r_pcrel, 0..23=r_symbolnum. The MH_OBJECT walker emits the static portion (type+length+pcrel = 0x25000000) from this nativeId and ORs in r_extern + r_symbolnum at emit time. `kind` = 1 matches arm64.target.json's `call26` (the cross-reference the assembler emits + the walker validates). Mach-O has no Rela addend column — addends live in the patch bytes.",
+      "name": "ARM64_RELOC_BRANCH26",
+      "kind": 1,
+      "nativeId": 620756992
+    },
+    {
+      "$comment": "ADRP page-of high-21 (the `adrp` half of an address materialization). r_type = ARM64_RELOC_PAGE21 (3), r_pcrel = 1, r_length = 2 → nativeId = (3<<28)|(2<<25)|(1<<24) = 0x35000000. `kind` = 2 matches arm64.target.json's `adr_prel_pg_hi21`.",
+      "name": "ARM64_RELOC_PAGE21",
+      "kind": 2,
+      "nativeId": 889192448
+    },
+    {
+      "$comment": "ADD/LDR pageoff low-12 (the `add`/`ldr` half of an address materialization). r_type = ARM64_RELOC_PAGEOFF12 (4), r_pcrel = 0, r_length = 2 → nativeId = (4<<28)|(2<<25)|(0<<24) = 0x44000000. `kind` = 3 matches arm64.target.json's `add_abs_lo12_nc`.",
+      "name": "ARM64_RELOC_PAGEOFF12",
+      "kind": 3,
+      "nativeId": 1140850688
+    },
+    {
+      "$comment": "Absolute 64-bit data pointer. r_type = ARM64_RELOC_UNSIGNED (0), r_pcrel = 0, r_length = 3 (8 bytes) → nativeId = (0<<28)|(3<<25)|(0<<24) = 0x06000000. `kind` = 4 matches arm64.target.json's `abs64`.",
+      "name": "ARM64_RELOC_UNSIGNED",
+      "kind": 4,
+      "nativeId": 100663296
+    }
+  ]
+}

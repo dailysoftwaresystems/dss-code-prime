@@ -1092,3 +1092,118 @@ TEST(ObjectFormatArtifactProfiles, ShippedRelocatableFormatServesNothing) {
     ASSERT_TRUE(r.has_value());
     EXPECT_TRUE((*r)->artifactProfiles().empty());
 }
+
+// ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): the `container` axis ──────────
+//
+// The `ObjectFormatContainer` (single/archive) substrate: the 5 shipped
+// staticlib formats load + validate as Archives, the validate() guard rejects
+// `archive` on an image flavor (RED-ON-DISABLE), the default is Single, and an
+// unknown `container` spelling fails loud at load.
+
+namespace {
+// True iff this format's served artifact-profile set contains "staticlib".
+[[nodiscard]] bool servesStaticlib(ObjectFormatSchema const& fmt) {
+    for (auto const& p : fmt.artifactProfiles()) {
+        if (p == "staticlib") return true;
+    }
+    return false;
+}
+// Count validate() problems whose JSON-pointer path == `want`.
+[[nodiscard]] std::size_t
+countProblemPath(std::vector<ConfigDiagnostic> const& problems,
+                 std::string_view want) {
+    std::size_t n = 0;
+    for (auto const& d : problems) {
+        if (d.path == want) ++n;
+    }
+    return n;
+}
+}  // namespace
+
+TEST(StaticLibraryFormats, AllFiveShippedStaticLibFormatsLoadValidateAndAreArchives) {
+    for (auto const* name : {"elf64-x86_64-linux-staticlib",
+                             "elf64-aarch64-linux-staticlib",
+                             "macho64-x86_64-darwin-staticlib",
+                             "macho64-arm64-darwin-staticlib",
+                             "pe64-x86_64-windows-staticlib"}) {
+        auto r = ObjectFormatSchema::loadShipped(name);
+        ASSERT_TRUE(r.has_value()) << name;
+        auto const& fmt = **r;
+        EXPECT_EQ(fmt.container(), ObjectFormatContainer::Archive) << name;
+        EXPECT_TRUE(fmt.isStaticArchive()) << name;
+        // An archive bundles RELOCATABLE members — never an image flavor
+        // (the two predicates are mutually exclusive by validate()).
+        EXPECT_FALSE(fmt.isImageFlavor()) << name;
+        // Serves exactly the `staticlib` artifact profile.
+        EXPECT_TRUE(servesStaticlib(fmt)) << name;
+    }
+}
+
+// RED-ON-DISABLE for the container validate() guard: `container: archive`
+// REQUIRES a relocatable member type. Build a minimal valid ELF format by
+// value and toggle ONLY elf.objectType between Exec (image, rejected) and Rel
+// (relocatable, accepted) — the guard fires on the former and not the latter.
+TEST(StaticLibraryFormats, ArchiveContainerRejectedOnImageFlavor) {
+    dss::detail::ObjectFormatData data;
+    data.name             = "synth-staticlib";
+    data.kind             = ObjectFormatKind::Elf;
+    data.dataModel        = DataModel::Lp64;
+    data.elf.fileClass    = 2;   // ELFCLASS64
+    data.elf.dataEncoding = 1;   // ELFDATA2LSB
+    data.elf.machine      = 62;  // EM_X86_64
+    data.container        = ObjectFormatContainer::Archive;
+
+    // Negative: an image flavor (ET_EXEC) — archive-on-image fails with
+    // EXACTLY one `/container` problem coded C_MalformedJson.
+    data.elf.objectType = ElfObjectType::Exec;
+    auto const execProblems = data.validate();
+    EXPECT_EQ(countProblemPath(execProblems, "/container"), 1u)
+        << "container: archive on an ELF ET_EXEC (image) must fail at /container";
+    for (auto const& d : execProblems) {
+        if (d.path == "/container") {
+            EXPECT_EQ(d.code, DiagnosticCode::C_MalformedJson);
+        }
+    }
+
+    // Positive: flip to a RELOCATABLE member (ET_REL) — the SAME archive
+    // container is now valid; NO `/container` problem (and the otherwise-
+    // minimal ELF ET_REL schema validates cleanly, so the list is empty).
+    data.elf.objectType = ElfObjectType::Rel;
+    auto const relProblems = data.validate();
+    EXPECT_EQ(countProblemPath(relProblems, "/container"), 0u)
+        << "container: archive on an ELF ET_REL is valid — no /container problem";
+    EXPECT_TRUE(relProblems.empty())
+        << "a minimal ELF ET_REL archive format must validate with no problems";
+}
+
+TEST(StaticLibraryFormats, ContainerDefaultsToSingle) {
+    // Any pre-c171 relocatable format omits `container` — it defaults to
+    // Single (byte-identical to before the axis existed).
+    auto r = ObjectFormatSchema::loadShipped("elf64-x86_64-linux");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ((*r)->container(), ObjectFormatContainer::Single);
+    EXPECT_FALSE((*r)->isStaticArchive());
+}
+
+TEST(StaticLibraryFormats, UnknownContainerSpellingFailsLoud) {
+    // An unknown `container` spelling is a HARD load reject at `/container`
+    // (closed enum; a silent fallback to Single would ship a mis-declared
+    // static-lib format as a lone object).
+    auto r = ObjectFormatSchema::loadFromText(R"({
+      "dssObjectFormatVersion": 1,
+  "dataModel": "LP64",
+      "format": {"name":"synth-elf","kind":"elf"},
+      "elf": {"class":"elf64","data":"lsb","machine":62},
+      "container": "bogus"
+    })");
+    ASSERT_FALSE(r.has_value());
+    bool sawContainer = false;
+    for (auto const& d : r.error()) {
+        if (d.path == "/container") {
+            EXPECT_EQ(d.code, DiagnosticCode::C_MalformedJson);
+            sawContainer = true;
+        }
+    }
+    EXPECT_TRUE(sawContainer)
+        << "an unknown container spelling must fail loud at /container";
+}

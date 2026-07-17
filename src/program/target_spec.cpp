@@ -48,6 +48,15 @@ TargetSpec::parse(std::string_view spec) noexcept {
 
 std::string_view TargetSpec::outputExtension(
         ObjectFormatSchema const& fmt) const noexcept {
+    // D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): a static-library format
+    // (`container: archive`) outputs an `ar` archive; its extension is the
+    // ecosystem's static-lib convention — Unix `.a` (ELF / Mach-O) vs the
+    // Microsoft `.lib` (COFF / PE) — NOT the member object's `.o`/`.obj`.
+    // Keyed on `kind()` (the closed enum, the existing agnostic dispatch
+    // axis), never a format-name branch.
+    if (fmt.isStaticArchive()) {
+        return fmt.kind() == ObjectFormatKind::Pe ? ".lib" : ".a";
+    }
     switch (fmt.kind()) {
         case ObjectFormatKind::Elf:
             switch (fmt.elf().objectType) {
