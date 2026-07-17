@@ -346,11 +346,15 @@ TEST(FfiResolveLibraryRoundTrip, PeMixedBareSystemExternAndOwnLibraryExitFortyTw
 
 // ── ELF dynamic round-trip (Linux host) -- the native witness ──────────────
 //
-// Gated on __linux__ (NOT !_WIN32): the run needs a host that executes an
-// ELF exec. On the ubuntu CI legs this runs for real; on the Windows/macOS
-// legs it is compiled out (the local WSL run is the dev-box witness). The
-// child inherits LD_LIBRARY_PATH=<outDir> so ld.so finds dsslib.so.
-#if defined(__linux__)
+// Gated on __linux__ AND an x86_64 host: the artifacts are built for the
+// x86_64:elf64-x86_64-linux-{dyn,exec} targets, so the run needs an x86_64
+// Linux host to execute them. On the ubuntu-x86_64 CI leg this runs for real;
+// on the ubuntu-ARM64 leg it is compiled out (an x86_64 ELF cannot execute
+// there -- ENOEXEC), matching how the Windows/macOS legs compile it out. There
+// is no aarch64 `.so` (ET_DYN) format flavor yet, so the ELF DYNAMIC round-trip
+// has no arm64 runtime form (follow-up D-LK-ELF-DYN-AARCH64-FLAVOR); the local
+// WSL run is the dev-box witness.
+#if defined(__linux__) && (defined(__x86_64__) || defined(__amd64__))
 TEST(FfiResolveLibraryRoundTrip, ElfDynamicRoundTripExitsFortyTwo) {
     ScratchDir scratch{Location::InsideRepo, "ffi-resolve-lib"};
     auto const dir = scratch.path();

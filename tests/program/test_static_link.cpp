@@ -332,10 +332,16 @@ TEST(StaticLink, DriverStaticLinkBuildsSelfContainedExec) {
     auto const mainPath = dir / "main";
     ASSERT_TRUE(fs::exists(mainPath)) << "the self-contained main exec must exist";
 
-#if defined(__linux__)
-    // RUN: the pulled dss_lib_answer body is IN the exe -> exit 42. No
-    // LD_LIBRARY_PATH needed (nothing dynamic to resolve for dss_lib_answer --
-    // that is the self-containedness).
+#if defined(__linux__) && (defined(__x86_64__) || defined(__amd64__))
+    // RUN (x86_64 Linux host): the artifacts are x86_64:elf64-x86_64-linux-exec,
+    // so the run needs an x86_64 Linux host. On the ubuntu-ARM64 leg this is
+    // compiled out (an x86_64 ELF is ENOEXEC there); the BUILD above still runs
+    // there (cross-compile structural coverage). aarch64-NATIVE static-link
+    // runtime coverage is a named follow-up (D-LK-STATIC-LINK-AARCH64-RUNTIME):
+    // c164/c165 support aarch64, but it needs local qemu validation + the CLI
+    // .a-request surface (D-FF1-AR-STATICLIB-DRIVER-WIRING) to land honestly.
+    // The pulled dss_lib_answer body is IN the exe -> exit 42. No
+    // LD_LIBRARY_PATH needed (that is the self-containedness).
     auto const r = runBinary(mainPath, std::chrono::milliseconds{5000});
     ASSERT_TRUE(r.spawned) << "main must spawn. " << r.diagnostic;
     EXPECT_FALSE(r.timedOut);
