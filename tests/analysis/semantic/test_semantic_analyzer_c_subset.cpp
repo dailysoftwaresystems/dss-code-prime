@@ -72,6 +72,54 @@ TEST(SemanticAnalyzerCSubset, FunctionLocalIntDeclTypedAsI32) {
     EXPECT_EQ(model.lattice().interner().kind(xRec->type), TypeKind::I32);
 }
 
+// D-CSUBSET-EXTERN-AGGREGATE-TYPE (TF arc C6, SQLite testfixture): a file-scope
+// `extern` declaration whose type-specifier is a struct/union/enum aggregate now
+// PARSES (typeBase gained the structSpec/unionSpec/enumSpec arms — the extern path
+// via externDecl→typeRef→typeBase previously omitted them, so `extern struct Foo g;`
+// P0009'd while `static struct`/plain/typedef all worked) AND resolves the extern
+// symbol to the aggregate TypeId, exactly like a `static struct Foo g;` (the type
+// resolver dispatches on the composite node's own rule, not on externDecl — zero
+// semantic change). This is the dominant sqlite-testfixture compile blocker
+// (sqliteInt.h `extern SQLITE_WSD struct Sqlite3Config sqlite3Config;`).
+// RED-ON-DISABLE: revert typeBase's alt list to {typeSpecifierSeq, Identifier,
+// typeofSpecifier} and `assertNoBuilderErrors` fails on the P0009 parse error for
+// every `extern struct/union/enum` line below. The enum form is covered ONLY here
+// (its GLOBAL codegen is a separate pre-existing gap, D-CSUBSET-ENUM-GLOBAL-CODEGEN,
+// so the runtime example extern_aggregate omits it); struct/union/const/pointer are
+// additionally witnessed end-to-end by that example.
+TEST(SemanticAnalyzerCSubset, ExternAggregateSpecifiersParse) {
+    auto cu = buildShippedUnit("c-subset", {
+        "struct S { int v; };\n"
+        "union U { int a; };\n"
+        "enum E { EV = 1 };\n"
+        "extern struct S gS;\n"          // extern + struct tag  (was P0009 "got struct")
+        "extern union U gU;\n"           // extern + union tag   (was P0009 "got union")
+        "extern enum E gE;\n"            // extern + enum tag    (was P0009 "got enum")
+        "extern const struct S gC;\n"    // extern + const struct
+        "extern struct S *gP;\n"         // extern + pointer-to-struct
+        "extern struct SB { int w; } gB;\n"  // extern + struct DEFINITION (inline body form)
+    });
+    assertNoBuilderErrors(*cu);          // red-on-disable hook: every extern line above must parse
+    auto model = analyze(cu);
+    auto rec = [&](std::string_view n) -> SymbolRecord const* {
+        for (std::size_t i = 1; i < model.symbols().size(); ++i)
+            if (model.symbols()[i].name == n) return &model.symbols()[i];
+        return nullptr;
+    };
+    auto const& in = model.lattice().interner();
+    for (char const* n : {"gS", "gU", "gE", "gC", "gP", "gB"}) {
+        auto const* r = rec(n);
+        ASSERT_NE(r, nullptr) << "extern aggregate symbol '" << n << "' was not minted";
+        ASSERT_TRUE(r->type.valid()) << "extern aggregate symbol '" << n << "' has no resolved type";
+    }
+    EXPECT_EQ(in.kind(rec("gS")->type), TypeKind::Struct);
+    EXPECT_EQ(in.kind(rec("gU")->type), TypeKind::Union);
+    EXPECT_EQ(in.kind(rec("gE")->type), TypeKind::Enum);
+    EXPECT_EQ(in.kind(rec("gC")->type), TypeKind::Struct);  // const is a qualifier bit; base kind stays Struct
+    EXPECT_EQ(in.kind(rec("gP")->type), TypeKind::Ptr);     // pointer-to-struct decays to Ptr
+    EXPECT_EQ(in.kind(rec("gB")->type), TypeKind::Struct);  // inline struct-definition-in-extern (body form)
+}
+
 // C99 _Complex (D-CSUBSET-COMPLEX §6.2.5): `double _Complex z;` resolves the
 // `[Complex, Double]` type-specifier multiset to a Complex over F64 (via the
 // `complex:true` typeSpecifiers row + the interner.complex wrap). `float _Complex`

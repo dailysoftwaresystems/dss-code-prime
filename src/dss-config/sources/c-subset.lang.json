@@ -826,7 +826,11 @@
       ]
     },
 
-    "typeBase": { "alt": [ "typeSpecifierSeq", "Identifier", "typeofSpecifier" ] },
+    "typeBase": {
+      "$comment": "The extern-declaration type-base (consumed ONLY by typeRef ← externDecl). D-CSUBSET-EXTERN-AGGREGATE-TYPE (TF arc C6, SQLite testfixture 2026-07-17): admits the struct/union/enum aggregate specifiers so a file-scope `extern struct Foo g;` / `extern union U g;` / `extern enum E g;` (and body/const/pointer forms) parses — the form sqliteInt.h uses at file scope (`extern SQLITE_WSD struct Sqlite3Config sqlite3Config;`, SQLITE_WSD→empty in the default no-WSD build), which 19 of the 44 sqlite `src/test*.c` TUs hit FIRST. Before this, `extern struct` P0009'd (`static struct`/plain/typedef already worked — the extern path was the sole gap). Mirrors `typeBaseAllowingStruct` (the struct-FIELD type-base) — the two stay separate named rules because their WRAPPERS differ: `typeRef` (extern) keeps a `{repeat StarOp}` pointer slot + a leading `{optional ConstKeyword}`, while `typeRefAllowingStruct` (field) drops the stars (they bind per-declarator) and uses a `{repeat headQualifier}` (const|volatile) prefix. SPECULATIVE + lookahead mirror the sibling + topLevelCompositeSpec: the composite FIRSTs (Struct/Union/EnumKeyword) are disjoint from the keyword/ident/typeof arms → unique-survivor direct descent in practice (the flag is defensive, moot). The type RESOLVER dispatches on the composite node's OWN rule (structSpec/unionSpec/enumSpec isTagReference / definition arms), NOT on externDecl, so an aggregate extern flows through the IDENTICAL resolution as `static struct Foo g;` — zero semantic/HIR change.",
+      "alt": [ "typeSpecifierSeq", "structSpec", "unionSpec", "enumSpec", "Identifier", "typeofSpecifier" ],
+      "speculative": true, "lookahead": 256
+    },
 
     "typeRef": {
       "sequence": [
