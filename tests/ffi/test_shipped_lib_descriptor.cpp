@@ -1477,9 +1477,10 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
             if (s.name == name) return &s;
         return nullptr;
     };
-    ASSERT_EQ(desc->symbols.size(), 5u);
+    ASSERT_EQ(desc->symbols.size(), 8u);
     for (auto const* n : {"Tcl_CreateInterp", "Tcl_DeleteInterp", "Tcl_Eval",
-                          "Tcl_GetObjResult", "Tcl_GetIntFromObj"})
+                          "Tcl_GetObjResult", "Tcl_GetIntFromObj",
+                          "Tcl_NewIntObj", "Tcl_SetObjResult", "Tcl_CreateObjCommand"})
         EXPECT_NE(sym(n), nullptr) << "missing Tcl symbol: " << n;
 
     // Tcl_CreateInterp: fn() -> Tcl_Interp* (0 params, pointer result).
@@ -1515,6 +1516,32 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
         auto const elem = interner.operands(params[2]);
         ASSERT_EQ(elem.size(), 1u);
         EXPECT_EQ(interner.kind(elem[0]), TypeKind::I32);
+    }
+    // Tcl_CreateObjCommand (C2): the FUNCTION-POINTER param (index 2) is the
+    // crux — a `ptr<fn(...)>` libtcl calls back into (the core testfixture
+    // command pattern). Pin the callback signature so a wrong/missing fn-ptr
+    // type fails loud (red-on-disable). This is the signal.json handler-pointer
+    // precedent applied to the TCL ObjCmdProc.
+    {
+        auto const* s = sym("Tcl_CreateObjCommand");
+        ASSERT_NE(s, nullptr);
+        ASSERT_EQ(interner.kind(s->signature), TypeKind::FnSig);
+        auto const params = interner.fnParams(s->signature);
+        ASSERT_EQ(params.size(), 5u);
+        // param[2] = Tcl_ObjCmdProc* : ptr<fn(void*, Tcl_Interp*, i32, Tcl_Obj**) -> i32>
+        ASSERT_EQ(interner.kind(params[2]), TypeKind::Ptr);
+        auto const callee = interner.operands(params[2]);
+        ASSERT_EQ(callee.size(), 1u);
+        ASSERT_EQ(interner.kind(callee[0]), TypeKind::FnSig);   // pointer-to-FUNCTION
+        EXPECT_EQ(interner.kind(interner.fnResult(callee[0])), TypeKind::I32);
+        auto const cbParams = interner.fnParams(callee[0]);
+        ASSERT_EQ(cbParams.size(), 4u);
+        EXPECT_EQ(interner.kind(cbParams[0]), TypeKind::Ptr);   // ClientData (void*)
+        EXPECT_EQ(interner.kind(cbParams[2]), TypeKind::I32);   // objc
+        ASSERT_EQ(interner.kind(cbParams[3]), TypeKind::Ptr);   // objv: Tcl_Obj**
+        auto const objvElem = interner.operands(cbParams[3]);
+        ASSERT_EQ(objvElem.size(), 1u);
+        EXPECT_EQ(interner.kind(objvElem[0]), TypeKind::Ptr);   // ptr<ptr<Tcl_Obj>>
     }
 }
 

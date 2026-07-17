@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C2 2026-07-17): the RUN witness for the TCL command-registration (FFI reverse-callback) pattern — the core shape of every SQLite src/test*.c command. DSS models Tcl_CreateObjCommand's function-pointer parameter (tcl.json `ptr<fn(...)>`, the signal.json handler precedent), emits SumCmd as an address-taken SysV-ABI function, and the DSS-linked libtcl calls it BACK: libtcl parses `mysum 40 2`, invokes SumCmd with objv[], SumCmd sums 40+2 via Tcl_GetIntFromObj + returns 42 via Tcl_SetObjResult(Tcl_NewIntObj(42)). elf-x86_64 only (tcl.json is availableObjectFormats:[elf]); the CI ubuntu x86_64 legs execute it (libtcl8.6 installed), the native-arm64 leg arch-gates the run, windows/macos compile-only. RED-ON-DISABLE: revert tcl.json's elf `library` to libc.so.6 -> only NEEDED libc.so.6 -> ld.so refuses to load (undefined symbol: Tcl_CreateInterp, exit 127).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-cmd-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-cmd-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
