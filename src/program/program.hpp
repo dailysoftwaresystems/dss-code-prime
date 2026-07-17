@@ -191,6 +191,15 @@ public:
         return userDefines_;
     }
 
+    /// The CLI `-I<dir>` / `--include-dir <dir>` quote-include search path
+    /// (the C 6.10.2 quote form), stamped from `CliArgs::includeDirs` by
+    /// `Program::run` before dispatch (the setUserDefines pattern). Every CU
+    /// build threads them onto the `UnitBuilder` via `addIncludeDir`.
+    void setIncludeDirs(std::vector<std::string> d) { includeDirs_ = std::move(d); }
+    [[nodiscard]] std::vector<std::string> const& includeDirs() const noexcept {
+        return includeDirs_;
+    }
+
     /// c162 (D-FF1-READER-CONSUMER): the `--resolve-library <path>` binaries
     /// whose export surfaces resolve + validate this run's source-declared
     /// externs. `Program::run` stamps this from `CliArgs::resolveLibraries`;
@@ -208,6 +217,7 @@ private:
     std::optional<::dss::opt::OptPipeline> optimizerPipelineOverride_;
     CompileConfig                          compileConfig_ = CompileConfig::Debug;
     std::vector<std::string>               userDefines_;  // c105: --define
+    std::vector<std::string>               includeDirs_;  // -I<dir> quote-include search path
     std::vector<std::filesystem::path>     resolveLibraries_;  // c162: --resolve-library
 };
 

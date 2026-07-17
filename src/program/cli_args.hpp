@@ -83,6 +83,17 @@ struct DSS_EXPORT CliArgs {
     // non-duplicative capability). Threaded to `CompileOptions.resolveLibraries`.
     std::vector<std::string> resolveLibraries;  // --resolve-library <path>
 
+    // `-I<dir>` / `-I <dir>` / `--include-dir <dir>` (repeatable): the C
+    // quote-include search path (gcc/clang's `-I`). Each dir is threaded to
+    // every CompilationUnit's include dirs (UnitBuilder::addIncludeDir),
+    // searched AFTER the including file's own directory (C 6.10.2 quote form).
+    // Needed for multi-directory source trees — e.g. SQLite's testfixture
+    // compiles `src/test*.c` with `-I. -I<src> -I<ext/...>` so a TU's
+    // `#include "sqlite3.h"` reaches the generated header in the build dir.
+    // Carried verbatim; the driver resolves each to an absolute path (relative
+    // dirs are cwd-relative, gcc semantics) when it threads them to the builder.
+    std::vector<std::string> includeDirs;       // -I<dir> / --include-dir <dir>
+
     // ── Output routing (D-LK10-ENTRY Slice C companion) ─────────
     //
     // `--output <dir>` (or `--output=<dir>`) routes every emitted

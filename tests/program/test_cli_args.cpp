@@ -165,6 +165,37 @@ TEST(CliArgs, MultipleTargetsAccepted) {
     EXPECT_EQ(r->targets[1], "x86_64:pe64-x86_64-windows");
 }
 
+// SQLite-testfixture arc C3: the `-I` quote-include search path — all four
+// accepted spellings parse into `includeDirs`, in order. RED-on-disable: drop
+// any of the four -I parse arms and the corresponding entry vanishes (size != 4).
+TEST(CliArgs, IncludeDirsAllFourForms) {
+    Argv a{"dss-code-prime", "--compile", "hello.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "-I", "spaced_dir",               // -I <dir>
+           "-Iattached_dir",                 // -I<dir> (gcc attached form)
+           "--include-dir", "long_dir",      // --include-dir <dir>
+           "--include-dir=eq_dir"};          // --include-dir=<dir>
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->includeDirs.size(), 4u);
+    EXPECT_EQ(r->includeDirs[0], "spaced_dir");
+    EXPECT_EQ(r->includeDirs[1], "attached_dir");
+    EXPECT_EQ(r->includeDirs[2], "long_dir");
+    EXPECT_EQ(r->includeDirs[3], "eq_dir");
+}
+
+// A dangling `-I` (no directory argument) fails loud, not silently dropped.
+TEST(CliArgs, IncludeDirSpacedFormRequiresValue) {
+    Argv a{"dss-code-prime", "--compile", "hello.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "-I"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::MissingFlagValue);
+}
+
 TEST(CliArgs, CompileModeRejectsEmptyFileList) {
     Argv a{"dss-code-prime", "--compile",
            "--language", "c-subset",

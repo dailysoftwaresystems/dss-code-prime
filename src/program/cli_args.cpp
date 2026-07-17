@@ -483,6 +483,33 @@ parseCliArgs(int argc, char* argv[]) {
             }
         }
         {
+            // `-I<dir>` / `-I <dir>` / `--include-dir <dir>` / `--include-dir=<dir>`
+            // (repeatable): the C quote-include search path (gcc/clang's `-I`).
+            // Each dir is threaded to every CU's include dirs (searched AFTER the
+            // including file's own directory, C 6.10.2 quote form). The attached
+            // `-I<dir>` form is what real build recipes emit (SQLite's testfixture
+            // uses `-I.`); the spaced + long forms round it out. Structural only
+            // here (a non-empty dir); a nonexistent dir is NOT an error (gcc
+            // parity — it simply contributes no hits, and a genuinely-missing
+            // header still fails loud P0016 downstream).
+            if (a == "-I") {                                   // -I <dir> (space)
+                auto v = takeFlagValue(a, i, argc, argv);
+                if (!v) return std::unexpected(v.error());
+                out.includeDirs.push_back(std::move(*v));
+                continue;
+            }
+            if (a.size() > 2 && a.substr(0, 2) == "-I") {       // -I<dir> (attached)
+                out.includeDirs.push_back(std::string{a.substr(2)});
+                continue;
+            }
+            auto m = valueFlag(a, i, "--include-dir");          // --include-dir <dir>/=<dir>
+            if (!m) return std::unexpected(m.error());
+            if (m->has_value()) {
+                out.includeDirs.push_back(std::move(**m));
+                continue;
+            }
+        }
+        {
             // c162 (D-FF1-READER-CONSUMER): `--resolve-library <path>`
             // (repeatable). Names a binary whose export surface resolves
             // this build's source-declared externs. Structural check only

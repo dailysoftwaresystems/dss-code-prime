@@ -793,6 +793,7 @@ int Program::run(int argc, char* argv[]) {
     // D-LK10-ENTRY Slice C companion: route emitted binaries.
     setOutputDir(args.outputDir);
     setUserDefines(args.defines);  // c105: --define NAME[=VALUE] → the CU builds
+    setIncludeDirs(args.includeDirs);  // -I<dir> quote-include path (SQLite-testfixture arc C3)
     // D-OPT1-PIPELINE-CONFIG-FROM-COMPILECONFIG: thread the CLI's
     // `--config=<debug|release>` into the kernel so the right
     // shipped pipeline gets loaded at compile_pipeline step 3.5.
@@ -1056,6 +1057,26 @@ void applySystemDirs(UnitBuilder& builder, GrammarSchema const& grammar) {
     }
 }
 
+// SQLite-testfixture arc C3: thread the CLI `-I` dirs (the C quote-include
+// search path, `Options::includeDirs`) onto `builder` via `addIncludeDir`. Each
+// is resolved to an ABSOLUTE path (a relative dir like `.` is cwd-relative, gcc
+// semantics) so the include resolver's `dir / filename` probe is stable
+// regardless of any later cwd change; the resolver searches these AFTER the
+// including file's own directory (C 6.10.2, the quote form). A nonexistent dir
+// is added anyway (gcc parity — it simply yields no hits, and a genuinely-
+// missing header still fails loud P0016 downstream). Distinct from
+// `applySystemDirs` (the angle-form `/usr/include` analogue via `addSystemDir`).
+// AGNOSTIC: pure path plumbing — no language/target/format branch.
+void applyIncludeDirs(UnitBuilder& builder,
+                      std::vector<std::string> const& dirs) {
+    std::error_code ec;
+    for (std::string const& d : dirs) {
+        fs::path const abs = fs::absolute(fs::path{d}, ec);
+        builder.addIncludeDir(ec ? fs::path{d} : abs);
+        ec.clear();
+    }
+}
+
 int Program::compileFiles(
     const std::vector<std::string>& sourceFiles,
     const std::string& languageName,
@@ -1131,6 +1152,7 @@ int Program::compileFiles(
                 applySystemDirs(builder, *grammar);
                 if (kind) builder.setActiveFormat(*kind);
                 builder.setUserDefines(userDefines());  // c105: --define
+                applyIncludeDirs(builder, includeDirs());  // -I<dir> (arc C3)
                 for (auto const& path : sourceFiles) {
                     builder.addFile(fs::path{path});
                 }
@@ -1215,6 +1237,7 @@ int Program::compileUnits(
                     applySystemDirs(builder, *grammar);
                     if (kind) builder.setActiveFormat(*kind);
                     builder.setUserDefines(userDefines());  // c105: --define
+                    applyIncludeDirs(builder, includeDirs());  // -I<dir> (arc C3)
                     builder.addFile(fs::path{path});
                     return std::move(builder).finish();
                 }));
