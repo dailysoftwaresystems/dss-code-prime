@@ -10,8 +10,10 @@
 #include "ffi/ingest.hpp"
 #include "ffi/mangling/c_mangle.hpp"  // D-LK-OBJECT-EXTERN-SYMBOL-NAMES: applyCMangling
 #include "ffi/shipped_lib_descriptor.hpp"  // c162: collectShippedExternSymbolNames
+#include "core/types/symbol_attrs.hpp"  // isExternallyVisible (armap export filter, c163)
 #include "hir/attributes/ffi_metadata.hpp"
 #include "hir/lowering/cst_to_hir.hpp"
+#include "link/format/ar.hpp"  // writeArArchive (D-LK-STATIC-ARCHIVE-WRITER, c163)
 #include "link/linker.hpp"
 #include "link/writer.hpp"
 #include "lir/lir_2addr_legalize.hpp"
@@ -1363,6 +1365,77 @@ bool linkAndWrite(std::span<AssembledModule const> modules,
     // never an arch/format identity branch) so a produced binary runs
     // directly without a manual `chmod +x`.
     return linker::writeImage(image, outPath, reporter, format.isImageFlavor());
+}
+
+// c163 (D-LK-STATIC-ARCHIVE-WRITER): link N assembled CUs into N relocatable
+// object members + bundle them into ONE `.a` static archive. See the header
+// docblock for the contract.
+bool linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
+                               std::span<std::string const>     memberNames,
+                               TargetSchema const&              target,
+                               ObjectFormatSchema const&        format,
+                               std::filesystem::path const&     outPath,
+                               DiagnosticReporter&              reporter) {
+    substrate::PhaseTimers::Scope linkPhase{substrate::CompilePhase::Link};
+    auto const entry = reporter.errorCount();
+
+    // An archive bundles RELOCATABLE objects a foreign linker later pulls +
+    // merges -- an image-flavor format (.so/.exe/.dylib) is not poolable this
+    // way. Reject loud rather than emit an archive of non-relocatable members.
+    if (format.isImageFlavor()) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "linkAndWriteStaticArchive: object format '{}' is an image flavor "
+            "(.so/.dll/.exe/.dylib); a static archive bundles RELOCATABLE "
+            "objects (ELF ET_REL / Mach-O MH_OBJECT) a foreign linker pulls + "
+            "merges -- select a relocatable object format "
+            "(D-LK-STATIC-ARCHIVE-WRITER).",
+            format.name());
+        reporter.report(std::move(d));
+        return false;
+    }
+    if (modules.size() != memberNames.size()) {
+        ParseDiagnostic d;
+        d.code     = DiagnosticCode::K_NoMatchingObjectFormat;
+        d.severity = DiagnosticSeverity::Error;
+        d.actual   = std::format(
+            "linkAndWriteStaticArchive: {} module(s) but {} member name(s) -- "
+            "the spans must be parallel (one archived file name per member) "
+            "(D-LK-STATIC-ARCHIVE-WRITER).",
+            modules.size(), memberNames.size());
+        reporter.report(std::move(d));
+        return false;
+    }
+
+    // Link each module INDEPENDENTLY to its own `.o` bytes (a 1-element link,
+    // never the cross-CU merge) + collect its DEFINED externally-visible
+    // symbols for the armap (the same on-binary names the object writer put in
+    // the member's symbol table).
+    std::vector<link::format::ArMemberInput> members;
+    members.reserve(modules.size());
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        auto image = linker::link(std::span<AssembledModule const>{&modules[i], 1},
+                                  target, format, reporter);
+        if (!image.ok() || !tierClean(reporter, entry)) {
+            return false;
+        }
+        std::vector<std::string> exported;
+        for (ModuleSymbol const& ms : modules[i].symbols) {
+            if (isExternallyVisible(ms.binding, ms.visibility) && !ms.name.empty()) {
+                exported.push_back(ms.name);
+            }
+        }
+        members.push_back(link::format::ArMemberInput{
+            memberNames[i], std::move(image.bytes), std::move(exported)});
+    }
+
+    auto const archive = link::format::writeArArchive(members, reporter);
+    if (!tierClean(reporter, entry)) {
+        return false;   // a writer fail-loud belt fired (name/size/offset).
+    }
+    return linker::writeBytes(archive, outPath, reporter);
 }
 
 // Assemble ONE CompilationUnit to its AssembledModule (no link/write). Returns

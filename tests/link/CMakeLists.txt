@@ -69,3 +69,11 @@ dss_add_test(NAME link/test_link_writer          SOURCES test_link_writer.cpp)
 # Plan 14 §2.13 D-LK10-ENTRY Slice C — runnable-binary spine
 # (first DSS-produced binary the OS actually runs).
 dss_add_test(NAME link/test_lk10_entry_slice_c   SOURCES test_lk10_entry_slice_c.cpp)
+
+# c163 (D-LK-STATIC-ARCHIVE-WRITER, writer half of D-FF1-AR-WRITER-STATIC-LINK)
+# — the GNU/System V `ar` static-archive WRITER: byte-exact framing + armap
+# pins, round-trip through the shipped c161 reader (the inverse-pair oracle),
+# wrong-endian-count red-on-disable, multi-member + "//" long-name table, the
+# fail-loud belts, and the end-to-end `linkAndWriteStaticArchive` composition
+# bundling a real DSS ELF ET_REL `.o` member.
+dss_add_test(NAME link/test_ar_writer            SOURCES test_ar_writer.cpp)

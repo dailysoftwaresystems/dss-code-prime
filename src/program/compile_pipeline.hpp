@@ -401,4 +401,35 @@ linkAndWrite(std::span<AssembledModule const> modules,
              std::filesystem::path const&     outPath,
              DiagnosticReporter&              reporter);
 
+// c163 (D-LK-STATIC-ARCHIVE-WRITER, the writer half of D-FF1-AR-WRITER-STATIC-
+// LINK): link N assembled CUs into N RELOCATABLE object members and bundle them
+// into ONE GNU/System V `ar` static archive (`.a`) committed to `outPath`. The
+// static-library counterpart of `linkAndWrite` (which emits ONE image).
+//
+// Each module is linked INDEPENDENTLY (a 1-element `link()`, NOT the cross-CU
+// merge) to its own `.o` bytes -- an archive PACKAGES separate objects, it does
+// not merge them; the FINAL (foreign) linker pulls + merges the members it
+// needs. Each member's armap symbol set is its DEFINED, externally-visible
+// symbols (`AssembledModule.symbols` filtered by `isExternallyVisible` -- the
+// same on-binary names the object writer put in the member's symbol table, so
+// the armap round-trips against the member). `format` MUST be a RELOCATABLE
+// object format (ELF ET_REL / Mach-O MH_OBJECT); an image-flavor format would
+// bundle non-relocatable images (a foreign linker cannot pull from those) and
+// fails loud. `memberNames` is parallel to `modules` (each member's archived
+// file name, e.g. "lib.o"). Returns true iff every member linked ok, the
+// archive built, and the bytes committed. The `ar` framing itself is
+// FORMAT-BLIND -- see `link/format/ar.hpp`.
+//
+// The DRIVER/CLI request surface (a project `artifactProfile: "staticlib"` or a
+// `--emit staticlib` flag routing here + the `.a`/`.lib` extension policy +
+// member naming) is the named follow-up D-FF1-AR-STATICLIB-DRIVER-WIRING; this
+// is the shipped composition it will call.
+[[nodiscard]] DSS_EXPORT bool
+linkAndWriteStaticArchive(std::span<AssembledModule const> modules,
+                          std::span<std::string const>     memberNames,
+                          TargetSchema const&              target,
+                          ObjectFormatSchema const&        format,
+                          std::filesystem::path const&     outPath,
+                          DiagnosticReporter&              reporter);
+
 } // namespace dss

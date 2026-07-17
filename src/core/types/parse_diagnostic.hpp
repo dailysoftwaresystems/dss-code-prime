@@ -1883,7 +1883,25 @@ enum class DiagnosticCode : std::uint16_t {
     //   otherwise fully honored. Fires from the PE walker (pe.cpp) when the
     //   max TLS-block var alignment exceeds the format's guaranteed 16.
     K_ThreadLocalOveralignedForFormat = 0x8016,
-    // K-NEXT-SLOT: 0x8017 — grep this marker before adding a K_* code.
+    // K_ArchiveMemberNameInvalid (D-LK-STATIC-ARCHIVE-WRITER): the `ar`
+    //   static-archive writer was handed a member whose file name is empty
+    //   or contains a byte that would corrupt the container framing -- a
+    //   '/' (the GNU short-name terminator + the reserved "/"/"//" special
+    //   member spellings) or a '\n' (the "//" long-name table entry
+    //   terminator). Fail loud rather than emit an archive whose member
+    //   list a reader would mis-resolve. Also fires on an empty EXPORTED
+    //   symbol name (an armap entry with no name is a caller bug -- the
+    //   c161 reader would skip+warn it, silently shrinking the index).
+    K_ArchiveMemberNameInvalid     = 0x8017,
+    // K_ArchiveFieldOverflow (D-LK-STATIC-ARCHIVE-WRITER): an archive field
+    //   cannot represent a value -- a member/armap/long-name-table payload
+    //   longer than the 60-byte `ar_hdr`'s 10-digit ASCII-decimal `size`
+    //   field can hold (>= 10^10 bytes), OR a member-header offset exceeding
+    //   the SysV armap's 32-bit big-endian offset range (a >4 GiB archive --
+    //   the GNU `/SYM64/` 64-bit-armap case, out of scope, see
+    //   D-FF1-AR-BSD-VARIANT). Fail loud rather than truncate a field.
+    K_ArchiveFieldOverflow         = 0x8018,
+    // K-NEXT-SLOT: 0x8019 — grep this marker before adding a K_* code.
 
     // ── F_* — FFI binary-reader (plan 11 §2.2) + C-header-parser (plan 11 §2.3) ──
     // F_FileOpenFailed: shared-library path doesn't exist / permission

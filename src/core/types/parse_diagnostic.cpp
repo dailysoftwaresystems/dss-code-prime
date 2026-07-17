@@ -385,6 +385,10 @@ std::string_view diagnosticCodeName(DiagnosticCode c) noexcept {
             return "K_FormatLacksThreadLocalSupport";
         case DiagnosticCode::K_ThreadLocalOveralignedForFormat:
             return "K_ThreadLocalOveralignedForFormat";
+        case DiagnosticCode::K_ArchiveMemberNameInvalid:
+            return "K_ArchiveMemberNameInvalid";
+        case DiagnosticCode::K_ArchiveFieldOverflow:
+            return "K_ArchiveFieldOverflow";
 
         // Optimizer/pipeline (X_) family.
         case DiagnosticCode::X_UnknownPassId:                return "X_UnknownPassId";

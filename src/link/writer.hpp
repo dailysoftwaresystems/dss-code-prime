@@ -4,7 +4,9 @@
 #include "core/types/diagnostic_reporter.hpp"
 #include "link/linker.hpp"
 
+#include <cstdint>
 #include <filesystem>
+#include <span>
 
 // Linker image file emission — plan 14 LK10 cycle 1 substrate.
 //
@@ -80,5 +82,26 @@ writeImage(LinkedImage const&             image,
            std::filesystem::path const&   path,
            DiagnosticReporter&            reporter,
            bool                           executable = false);
+
+// Commit a raw byte buffer to `path`, truncating any existing file. The
+// byte-integrity core `writeImage` delegates to AFTER its LinkedImage-shape
+// preconditions -- factored out so other artifact producers that are NOT a
+// `LinkedImage` (the c163 `ar` static-archive writer -- an archive has no
+// `ok()`/function-count contract) reuse the SAME open/write/close fail-loud
+// discipline. Returns true iff every byte landed on disk; on failure emits one
+// of the same four remediation-distinct K_* codes into `reporter`:
+//   * `K_ImageWriteParentMissing`  -- parent dir absent
+//   * `K_ImageWriteOpenFailed`     -- open() failbit
+//   * `K_ImageWriteShort`          -- write() mid-stream failbit
+//   * `K_ImageWriteCloseFailed`    -- close() flush failbit
+// Does NOT gate on `bytes.empty()` (that is a LinkedImage-specific contract --
+// an empty write is a legitimate raw-bytes request) and never sets the POSIX
+// execute bit (an archive / relocatable output is not executable; `writeImage`
+// owns the exec-bit step for image-flavor outputs). Parent-directory creation
+// stays the caller's responsibility (the substrate never auto-mkdir's).
+[[nodiscard]] DSS_EXPORT bool
+writeBytes(std::span<std::uint8_t const> bytes,
+           std::filesystem::path const&  path,
+           DiagnosticReporter&           reporter);
 
 } // namespace dss::linker
