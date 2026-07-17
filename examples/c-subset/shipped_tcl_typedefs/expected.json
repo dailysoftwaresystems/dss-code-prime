@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C8 2026-07-17): RUN witness for the 5 TCL typedefs added to tcl.json (Tcl_ObjCmdProc/Tcl_CmdProc = FUNCTION-TYPE typedefs used as fn-pointers, Tcl_WideInt = i64, Tcl_DString = a 216-byte struct, Tcl_Channel = opaque ptr) — the dominant S0006 'undeclared type' blocker after C7 (13/44 src/test*.c hit it, dominantly Tcl_ObjCmdProc [27 uses] / Tcl_CmdProc [19]). The example registers a command via a `Tcl_ObjCmdProc *` (the fn-type typedef used as a pointer), libtcl calls it back on `mysum 2` summing a Tcl_WideInt(40) -> 42; also asserts sizeof(Tcl_DString)==216 at RUNTIME (a layout witness) and references a Tcl_Channel. elf-x86_64 only (tcl.json availableObjectFormats:[elf]); CI ubuntu x86_64 legs run it (libtcl8.6), native-arm64 arch-gates, windows/macos compile-only. RED-ON-DISABLE: drop any of the 5 typedefs from tcl.json -> that type's use fails S0006 -> fails to compile.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-typedefs-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-typedefs-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

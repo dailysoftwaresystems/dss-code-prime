@@ -8,7 +8,12 @@
     { "name": "Tcl_Interp", "type": "struct \"Tcl_Interp\" { arr<u64, 1> }" },
     { "name": "Tcl_Obj",    "type": "struct \"Tcl_Obj\" { arr<u64, 6> }" },
     { "name": "ClientData", "type": "ptr<void>" },
-    { "name": "Tcl_CmdInfo", "type": "struct \"Tcl_CmdInfo\" { i32, ptr<void>, ptr<void>, ptr<void>, ptr<void>, ptr<void>, ptr<void>, ptr<void> }" }
+    { "name": "Tcl_CmdInfo", "type": "struct \"Tcl_CmdInfo\" { i32, ptr<void>, ptr<void>, ptr<void>, ptr<void>, ptr<void>, ptr<void>, ptr<void> }" },
+    { "name": "Tcl_ObjCmdProc", "type": "fn(ptr<void>, ptr<struct \"Tcl_Interp\" { arr<u64, 1> }>, i32, ptr<ptr<struct \"Tcl_Obj\" { arr<u64, 6> }>>) -> i32" },
+    { "name": "Tcl_CmdProc",    "type": "fn(ptr<void>, ptr<struct \"Tcl_Interp\" { arr<u64, 1> }>, i32, ptr<ptr<char>>) -> i32" },
+    { "name": "Tcl_WideInt",    "type": "i64" },
+    { "name": "Tcl_DString",    "type": "struct \"Tcl_DString\" { arr<u64, 27> }" },
+    { "name": "Tcl_Channel",    "type": "ptr<void>" }
   ],
   "macros": [
     { "name": "TCL_OK",     "replacement": "0" },

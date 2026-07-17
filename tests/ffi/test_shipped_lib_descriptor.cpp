@@ -1466,15 +1466,30 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
 
     // The two opaque handles (modeled like stdio.json's FILE — struct types) +
     // the C4 ClientData typedef (void* — a Ptr, not a struct).
-    ASSERT_EQ(desc->typedefs.size(), 4u);
+    ASSERT_EQ(desc->typedefs.size(), 9u);
     EXPECT_EQ(desc->typedefs[0].name, "Tcl_Interp");
     EXPECT_EQ(desc->typedefs[1].name, "Tcl_Obj");
     EXPECT_EQ(desc->typedefs[2].name, "ClientData");
     EXPECT_EQ(desc->typedefs[3].name, "Tcl_CmdInfo");     // C5 (bare-name type)
+    EXPECT_EQ(desc->typedefs[4].name, "Tcl_ObjCmdProc");  // C8: FUNCTION-TYPE typedef
+    EXPECT_EQ(desc->typedefs[5].name, "Tcl_CmdProc");     // C8: FUNCTION-TYPE typedef
+    EXPECT_EQ(desc->typedefs[6].name, "Tcl_WideInt");     // C8
+    EXPECT_EQ(desc->typedefs[7].name, "Tcl_DString");     // C8
+    EXPECT_EQ(desc->typedefs[8].name, "Tcl_Channel");     // C8
     EXPECT_EQ(interner.kind(desc->typedefs[0].type), TypeKind::Struct);
     EXPECT_EQ(interner.kind(desc->typedefs[1].type), TypeKind::Struct);
     EXPECT_EQ(interner.kind(desc->typedefs[2].type), TypeKind::Ptr);     // ClientData = void*
     EXPECT_EQ(interner.kind(desc->typedefs[3].type), TypeKind::Struct);  // Tcl_CmdInfo
+    // C8: the two command-proc typedefs are FUNCTION TYPES (used as `Tcl_ObjCmdProc *`
+    // = a fn-pointer in 34 of the 44 test TUs); Tcl_WideInt = long long (i64);
+    // Tcl_DString = a 216-byte struct (used as a local — the size is load-bearing);
+    // Tcl_Channel = an opaque pointer. RED-ON-DISABLE: drop any of these 5 and the
+    // shipped_tcl_typedefs example (+ ~13 sqlite test TUs) fail S0006 "undeclared type".
+    EXPECT_EQ(interner.kind(desc->typedefs[4].type), TypeKind::FnSig);   // Tcl_ObjCmdProc = fn type
+    EXPECT_EQ(interner.kind(desc->typedefs[5].type), TypeKind::FnSig);   // Tcl_CmdProc = fn type
+    EXPECT_EQ(interner.kind(desc->typedefs[6].type), TypeKind::I64);     // Tcl_WideInt = long long
+    EXPECT_EQ(interner.kind(desc->typedefs[7].type), TypeKind::Struct);  // Tcl_DString (216-byte)
+    EXPECT_EQ(interner.kind(desc->typedefs[8].type), TypeKind::Ptr);     // Tcl_Channel = opaque ptr
 
     // Find a symbol by name (declaration order is not load-bearing).
     auto sym = [&](std::string_view name) -> ShippedSymbol const* {
