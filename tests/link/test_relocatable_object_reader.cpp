@@ -32,6 +32,7 @@
 #include "link/object_format_schema.hpp"
 
 #include "gcc_lib_c164_object.inc"
+#include "gcc_section_relative_c167.inc"
 
 #include <gtest/gtest.h>
 
@@ -427,12 +428,116 @@ TEST(RelocatableObjectReader, ReadsRealGccObjectFunctionsSymbolsRelocations) {
     ASSERT_EQ(greet->relocations.size(), 2u)
         << "lib_greet's two .rela.text entries (msg ref + puts call)";
     bool sawPutsCall = false;
+    bool sawMsgRef = false;
     for (auto const& r : greet->relocations) {
         EXPECT_EQ(r.kind, RelocationKind{1}) << "both are rel32-family";
         EXPECT_EQ(r.addend, 0) << "gcc's -4 addend is the rel32 bias, un-baked to 0";
         if (nameOf(got, r.target) == "puts") sawPutsCall = true;
+        if (nameOf(got, r.target) == "msg") sawMsgRef = true;
     }
     EXPECT_TRUE(sawPutsCall) << "one reloc must target the extern `puts`";
+    // c167 SECTION-RELATIVE RESOLUTION (red-on-disable): gcc references `msg`
+    // via the `.rodata` SECTION symbol (`R_X86_64_PC32 .rodata-4`), NOT `msg`
+    // directly. The reader must REDIRECT that section-relative reference to the
+    // `msg` data atom (offset 0, residual 0). Pre-c167 this reloc targeted a
+    // bodiless `.rodata` section symbol -> nameOf == ".rodata", sawMsgRef false.
+    EXPECT_TRUE(sawMsgRef)
+        << "the .rodata section-relative reference must resolve to the `msg` atom";
+}
+
+// -- c167: section-relative relocations (anonymous content -> gap atoms) ----
+//
+// gcc references string literals / jump tables through a SECTION symbol + addend
+// (`R_X86_64_PC32 .rodata-4`); the bytes have NO symbol of their own. The reader
+// must reconstruct the anonymous region as a synthetic gap atom AND redirect the
+// section-relative reference to it. D-LK-STATIC-LINK-SECTION-RELATIVE-RELOC.
+
+// A `const char*` returning a string literal: the 12-byte "hello world" lives in
+// an anonymous `.rodata` referenced via the `.rodata` section symbol. The reader
+// reconstructs a gap atom with the bytes and binds the reference to it (residual
+// 0). Red-on-disable: without the redirect the reference targets a bodiless
+// `.rodata` section symbol; without gap reconstruction the bytes are lost.
+TEST(RelocatableObjectReader, SectionRelativeStringLiteralReconstructsGapAtom) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    DiagnosticReporter rep;
+    auto got = elf::readRelocatableObject(dss::test::gccStrlitObject(),
+                                          *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errors=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    // The anonymous "hello world\0" (12 bytes) is reconstructed as a data atom.
+    std::string const want = "hello world";
+    AssembledData const* gap = nullptr;
+    for (auto const& d : got->dataItems) {
+        if (d.bytes.size() == 12u
+            && std::equal(want.begin(), want.end(), d.bytes.begin())) {
+            gap = &d;
+        }
+    }
+    ASSERT_NE(gap, nullptr)
+        << "the anonymous string must be reconstructed as a synthetic gap atom";
+    EXPECT_EQ(gap->section, DataSectionKind::Rodata);
+    EXPECT_TRUE(nameOf(*got, gap->symbol).empty())
+        << "the gap atom is anonymous (module-private, no ModuleSymbol)";
+
+    // dss_greet's ONE section-relative reference resolves to the gap atom.
+    auto const* greet = funcNamed(*got, "dss_greet");
+    ASSERT_NE(greet, nullptr);
+    ASSERT_EQ(greet->relocations.size(), 1u);
+    EXPECT_EQ(greet->relocations[0].target, gap->symbol)
+        << "the `.rodata-4` section-relative reloc must redirect to the string gap atom";
+    EXPECT_EQ(greet->relocations[0].addend, 0) << "the string is at offset 0 -> residual 0";
+}
+
+// A dense `switch` -> an anonymous `.rodata` jump table (gap atom) whose entries
+// are PC-relative SELF-references into the containing function. Exercises: (a)
+// gap-atom reconstruction of the table; (b) the `.rela.text` lea-of-table refs
+// redirecting to the gap atom; (c) the `.rela.rodata` entries redirecting to the
+// function at INTERIOR offsets -- the data-section-PC-relative search-offset path.
+TEST(RelocatableObjectReader, SectionRelativeJumpTableResolvesInteriorAndGapAtom) {
+    auto loaded = loadShipped();
+    ASSERT_TRUE(loaded.target && loaded.format);
+
+    DiagnosticReporter rep;
+    auto got = elf::readRelocatableObject(dss::test::gccAnswerJumpTableObject(),
+                                          *loaded.target, *loaded.format, rep);
+    ASSERT_TRUE(got.has_value()) << "errors=" << rep.errorCount();
+    EXPECT_EQ(rep.errorCount(), 0u);
+
+    auto const* fn = funcNamed(*got, "lib_answer");
+    auto const* pad = funcNamed(*got, "lib_pad");
+    ASSERT_NE(fn, nullptr);
+    ASSERT_NE(pad, nullptr)
+        << "both functions of the shared .text must reconstruct (lib_pad + lib_answer)";
+    // lib_pad occupies .text [0, 0x19); lib_answer FOLLOWS at 0x19 -- so the
+    // jump table's interior references must SELECT lib_answer, not lib_pad.
+
+    // The 24-byte anonymous jump table -> a gap atom carrying 6 PC-relative
+    // entries, each an INTERIOR reference into lib_answer.
+    AssembledData const* jt = nullptr;
+    for (auto const& d : got->dataItems) {
+        if (d.relocations.size() == 6u) jt = &d;
+    }
+    ASSERT_NE(jt, nullptr) << "the jump table must reconstruct as a 6-entry gap atom";
+    EXPECT_EQ(jt->bytes.size(), 24u);
+    for (auto const& r : jt->relocations) {
+        EXPECT_EQ(r.target, fn->symbol)
+            << "each jump-table entry must SELECT the containing function lib_answer";
+        EXPECT_NE(r.target, pad->symbol)
+            << "the interior offsets fall inside lib_answer (@0x19+), NOT lib_pad -- "
+               "the atom-selection path (multi-function .text) is locked here";
+    }
+
+    // lib_answer's 2 `.rela.text` lea-of-table refs redirect to the gap atom.
+    ASSERT_EQ(fn->relocations.size(), 2u);
+    for (auto const& r : fn->relocations) {
+        EXPECT_EQ(r.target, jt->symbol)
+            << "the lea-of-table refs resolve to the jump-table gap atom";
+        EXPECT_EQ(r.addend, 0) << "the table base is at .rodata offset 0 -> residual 0";
+    }
+    EXPECT_TRUE(pad->relocations.empty()) << "lib_pad has no relocations";
 }
 
 // -- 3. Bounds / truncation / corruption red-pins --------------------

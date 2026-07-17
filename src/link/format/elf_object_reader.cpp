@@ -409,6 +409,15 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
     std::unordered_map<std::uint16_t, std::vector<Interval>> dataIntervalsBySec;
     // symtab index -> the extern's position in mod.externImports (for isData).
     std::unordered_map<std::uint32_t, std::size_t> externBySym;
+    // symtab indices that became a reconstructed ATOM (a sliced STT_FUNC body or
+    // a sized data OBJECT). A relocation whose target IS such an atom keeps its
+    // by-identity binding (step 7). A section-defined target that is NOT an atom
+    // -- a SECTION symbol (`R_X86_64_PC32 .rodata-4`) or a size-0 `.LC` marker --
+    // is a SECTION-RELATIVE reference: step 7 redirects it to the atom (named or
+    // the synthetic gap atom minted below) that owns its `sym.value + addend`
+    // byte, with a residual addend. This is how gcc names string literals / jump
+    // tables / local objects; without the redirect the merge cannot bind them.
+    std::unordered_set<std::uint32_t> atomSymIdx;
 
     auto sliceInBounds = [&](Shdr const& sec, std::uint64_t off, std::uint64_t len)
         -> bool {
@@ -565,6 +574,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                                 bytes.begin() + bodyOff + sy.size);
                 funcIntervalsBySec[sy.shndx].push_back(
                     Interval{sy.value, sy.size, mod.functions.size()});
+                atomSymIdx.insert(static_cast<std::uint32_t>(i));
                 mod.functions.push_back(std::move(fn));
             }
             pushModuleSym();
@@ -611,6 +621,7 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
             }
             dataIntervalsBySec[sy.shndx].push_back(
                 Interval{sy.value, sy.size, mod.dataItems.size()});
+            atomSymIdx.insert(static_cast<std::uint32_t>(i));
             mod.dataItems.push_back(std::move(di));
             pushModuleSym();
             continue;
@@ -666,6 +677,83 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     "symbols are a deferred shape.");
             }
         }
+    }
+
+    // -- (6.5) Synthetic gap atoms: reconstruct ANONYMOUS data-section content
+    //          (string literals, switch jump tables, `.rodata` constants) that
+    //          is owned by NO sized symbol. gcc references such content via a
+    //          SECTION symbol + addend (`R_X86_64_PC32 .rodata-4`), so without
+    //          the bytes the reference dangles. Every maximal uncovered
+    //          [gapStart,gapEnd) region of a file-backed, allocated DATA section
+    //          becomes one synthetic anonymous AssembledData atom (a fresh
+    //          SymbolId PAST the symtab range -- collision-free -- and NO
+    //          ModuleSymbol, so it is module-private and never cross-CU folded);
+    //          its interval joins `dataIntervalsBySec` so the step-7 redirect
+    //          routes a section-relative reference to it. Only DATA sections gap
+    //          -fill: a `.text` gap is inter-function padding (a code reference
+    //          into it is corrupt -> step 7 fails loud, never fabricates a code
+    //          atom from padding). A section fully covered by named symbols
+    //          (every DSS-written `.o`) yields NO gaps -- this is inert there.
+    // A section's kind resolved ONLY by DECLARED name (exact schema row or a
+    // `<row>.`-style prefix -- `.rodata` / `.rodata.str1.1` / `.data.rel.ro`),
+    // NEVER the SHF_ALLOC flags fallback. Gap-filling must not fire on an
+    // allocated METADATA section the flags fallback would mis-type as Rodata
+    // (`.eh_frame` is SHF_ALLOC PROGBITS): fabricating a data atom there would
+    // un-skip its `.rela.eh_frame` (whose FDE relocs target `.text`) and wrongly
+    // route it. Bodies still reconstruct via the flags fallback in the symbol
+    // loop (a real OBJECT there is genuine data); only ANONYMOUS gap-fill is
+    // restricted to declared data sections.
+    auto declaredDataKind = [&](Shdr const& sec) -> std::optional<DataSectionKind> {
+        std::optional<SectionKind> k = sec.kind;                    // exact schema name
+        if (!k.has_value()) {                                       // longest `<row>.` prefix
+            std::size_t bestLen = 0;
+            for (auto const& row : objectFormatSchema.sections()) {
+                std::size_t const n = row.name.size();
+                if (sec.name.size() > n + 1 && sec.name[n] == '.'
+                    && sec.name.compare(0, n, row.name) == 0 && n + 1 > bestLen) {
+                    k = row.kind;
+                    bestLen = n + 1;
+                }
+            }
+        }
+        return k.has_value() ? dataSectionKindOf(*k) : std::nullopt;
+    };
+    std::uint32_t nextSyntheticId = static_cast<std::uint32_t>(numSyms);
+    for (std::uint16_t si = 0; si < eShnum; ++si) {
+        Shdr const& sec = secs[si];
+        if ((sec.flags & kShfAlloc) == 0u || sec.size == 0u
+            || sec.type == kShtNobits) {
+            continue;  // runtime, file-backed content only
+        }
+        std::optional<DataSectionKind> const dk = declaredDataKind(sec);
+        if (!dk.has_value() || isZeroFill(*dk)) continue;  // a DECLARED DATA (not Text/Bss) kind
+        if (rangeExceedsBuffer(sec.offset, sec.size, bytes.size())) continue;  // belt
+        // Covered = the named data atoms already reconstructed for this section
+        // (a fresh sorted copy -- `emitGap` appends to the live map vector).
+        std::vector<Interval> covered;
+        if (auto it = dataIntervalsBySec.find(si); it != dataIntervalsBySec.end())
+            covered = it->second;
+        std::sort(covered.begin(), covered.end(),
+                  [](Interval const& a, Interval const& b) { return a.start < b.start; });
+        auto emitGap = [&](std::uint64_t gapStart, std::uint64_t gapEnd) {
+            if (gapEnd <= gapStart) return;
+            AssembledData di;
+            di.symbol    = SymbolId{nextSyntheticId++};
+            di.section   = *dk;
+            di.alignment = alignFromSection(sec.addrAlign);
+            std::size_t const b0 = static_cast<std::size_t>(sec.offset + gapStart);
+            di.bytes.assign(bytes.begin() + b0,
+                            bytes.begin() + b0 + static_cast<std::size_t>(gapEnd - gapStart));
+            dataIntervalsBySec[si].push_back(
+                Interval{gapStart, gapEnd - gapStart, mod.dataItems.size()});
+            mod.dataItems.push_back(std::move(di));
+        };
+        std::uint64_t cursor = 0;
+        for (auto const& iv : covered) {
+            if (iv.start > cursor) emitGap(cursor, iv.start);
+            cursor = std::max(cursor, iv.start + iv.len);
+        }
+        if (cursor < sec.size) emitGap(cursor, sec.size);
     }
 
     // -- (7) Reconstruct relocations from every SHT_RELA section -----
@@ -769,11 +857,90 @@ readRelocatableObject(std::span<std::uint8_t const> bytes,
                     + " of section '" + patched.name
                     + "' -- refusing to silently drop it.");
             }
+            // Section-relative resolution: a target symbol that is NOT a
+            // reconstructed atom but IS section-defined -- a SECTION symbol
+            // (`.rodata`) or a size-0 `.LC` marker -- references `sym.value +
+            // nativeAddend` bytes INTO that section, not a named identity the
+            // merge can bind. Redirect it to the atom (a named data/func item OR a
+            // step-6.5 synthetic gap atom) that OWNS that byte, with a residual
+            // addend = offset-within-that-atom. A reconstructed-atom target keeps
+            // its by-identity binding; an extern (SHN_UNDEF) / absolute
+            // (SHN_ABS/COMMON) target is untouched. A `.text` section-relative
+            // reference (a jump-table entry -> a case block inside a function)
+            // resolves to the containing FUNCTION at an interior offset.
+            SymbolId     relTarget = SymbolId{symIdx};
+            std::int64_t relAddend = nativeAddend;
+            if (!atomSymIdx.contains(symIdx)) {
+                Sym const& tsym = syms[symIdx];
+                bool const sectionDefined = tsym.shndx != kShnUndef
+                                         && tsym.shndx < kShnLoReserve
+                                         && tsym.shndx < eShnum;
+                if (sectionDefined) {
+                    // The RESIDUAL is invariant under the redirect: the format
+                    // applies `value = S + A + (pcRel?-P) + addendBias`, so binding
+                    // to `atom` (S = section_base + atom.start) instead of the
+                    // section symbol (S = section_base + tsym.value) requires
+                    // A' = tsym.value + nativeAddend - atom.start to keep `value`
+                    // identical -- independent of pcRel / P / addendBias.
+                    std::int64_t const bindBase =
+                        static_cast<std::int64_t>(tsym.value) + nativeAddend;
+                    // The SEARCH offset is the target's TRUE section offset L, which
+                    // depends on how the reference is consumed. A code / absolute
+                    // reference resolves to `tsym.value + nativeAddend` (the
+                    // addendBias already compensates a code load's RIP+4 bias). A
+                    // DATA-section PC-relative SELF-reference -- a `.rodata`
+                    // jump-table entry, whose displacement is relative to the
+                    // TABLE base (= the containing atom's base = P - relInAtom), not
+                    // RIP -- resolves to `rawAddend - relInAtom`; rawAddend =
+                    // nativeAddend + addendBias. Getting L right picks the correct
+                    // atom when a section holds several (multi-function `.text`); the
+                    // residual above stays bindBase - atom.start regardless.
+                    std::int64_t searchOff = bindBase;
+                    if (tri->pcRelative && patchesData) {
+                        std::int64_t const relInAtom =
+                            static_cast<std::int64_t>(rOffset)
+                            - static_cast<std::int64_t>(iv->start);
+                        searchOff = bindBase
+                                  + static_cast<std::int64_t>(tri->addendBias)
+                                  - relInAtom;
+                    }
+                    Interval const* hit = nullptr;
+                    bool hitFunc = false;
+                    if (searchOff >= 0) {
+                        std::uint64_t const off = static_cast<std::uint64_t>(searchOff);
+                        if (auto funcsIt = funcIntervalsBySec.find(tsym.shndx);
+                            funcsIt != funcIntervalsBySec.end()) {
+                            if (Interval const* h = findInterval(funcsIt->second, off)) {
+                                hit = h; hitFunc = true;
+                            }
+                        }
+                        if (hit == nullptr) {
+                            if (auto datasIt = dataIntervalsBySec.find(tsym.shndx);
+                                datasIt != dataIntervalsBySec.end()) {
+                                hit = findInterval(datasIt->second, off);
+                            }
+                        }
+                    }
+                    if (hit == nullptr) {
+                        return fail(DiagnosticCode::F_CorruptedBinary,
+                            "elf::readRelocatableObject: section-relative relocation "
+                            "in '" + rela.name + "' targets section symbol '"
+                            + tsym.name + "' + offset " + std::to_string(searchOff)
+                            + " (section #" + std::to_string(tsym.shndx) + " '"
+                            + secs[tsym.shndx].name + "'), which lands in no "
+                            "reconstructed atom -- cannot bind the reference (a "
+                            "reference into unmodeled/metadata section content).");
+                    }
+                    relTarget = hitFunc ? mod.functions[hit->outIdx].symbol
+                                        : mod.dataItems[hit->outIdx].symbol;
+                    relAddend = bindBase - static_cast<std::int64_t>(hit->start);
+                }
+            }
             Relocation rel;
             rel.offset = static_cast<std::uint32_t>(rOffset - iv->start);
-            rel.target = SymbolId{symIdx};
+            rel.target = relTarget;
             rel.kind   = kind;
-            rel.addend = nativeAddend;
+            rel.addend = relAddend;
             if (patchesText) mod.functions[iv->outIdx].relocations.push_back(rel);
             else             mod.dataItems[iv->outIdx].relocations.push_back(rel);
 

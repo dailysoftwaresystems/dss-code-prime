@@ -34,12 +34,15 @@
 #include "core/types/target_schema.hpp"
 #include "diagnostic_count.hpp"
 #include "ffi/abi/abi_catalog.hpp"
+#include "link/format/ar.hpp"
 #include "link/linker.hpp"
 #include "link/object_format_schema.hpp"
 #include "program/compile_pipeline.hpp"
 #include "program/program.hpp"
 #include "run_binary.hpp"
 #include "scratch_dir.hpp"
+
+#include "../link/gcc_section_relative_c167.inc"
 
 #include <gtest/gtest.h>
 
@@ -365,6 +368,87 @@ TEST(StaticLink, DriverStaticLinkBuildsSelfContainedExec) {
     EXPECT_TRUE(!r2.spawned || r2.exitCode != 42u)
         << "WITHOUT the static pull, main must NOT exit 42 (undefined symbol at "
            "load). spawned=" << r2.spawned << " exit=" << r2.exitCode;
+#endif  // __linux__
+}
+
+// -- c167: REAL gcc `.a` with SECTION-RELATIVE relocs (the decisive witness) -----
+//
+// The prior tests static-link DSS-assembled members, which use NAMED-symbol
+// relocations. A REAL gcc `.o` references string literals / jump tables through a
+// SECTION symbol + addend, and packs anonymous content (no symbol) into `.rodata`
+// -- exactly what c164's reader could not link until c167. Here a genuine `gcc -c`
+// object (a `switch` jump table computing 42; embedded byte-for-byte) is bundled
+// into a DSS-written `.a` and static-linked through the production driver. The RUN
+// proves the WHOLE chain end-to-end: the anonymous jump table is reconstructed as
+// a synthetic gap atom, the `.rela.text` lea refs redirect to it, the 6
+// `.rela.rodata` entries redirect to lib_answer's INTERIOR, the merge binds it all
+// into the exec, and it executes to 42. Red-on-disable is structural: revert the
+// section-relative resolution and the reader fails loud on the jump table -> the
+// static link fails (rc != 0) -> the exec never builds.
+
+namespace {
+// Bundle RAW object bytes (a real gcc `.o`) into a DSS-written `.a` via the c163
+// ar writer -- hermetic (no gcc/ar at test time; the golden is embedded).
+[[nodiscard]] fs::path
+writeGoldenArchive(fs::path const& dir, std::string_view archiveName,
+                   std::string_view memberName, std::vector<std::uint8_t> objectBytes,
+                   std::vector<std::string> exportedSymbols) {
+    dss::link::format::ArMemberInput member;
+    member.name            = std::string{memberName};
+    member.objectBytes     = std::move(objectBytes);
+    member.exportedSymbols = std::move(exportedSymbols);
+    std::vector<dss::link::format::ArMemberInput> const members{std::move(member)};
+    DiagnosticReporter rep;
+    auto const bytes = dss::link::format::writeArArchive(
+        std::span<dss::link::format::ArMemberInput const>{members.data(), members.size()},
+        rep);
+    if (bytes.empty()) {
+        ADD_FAILURE() << "writeArArchive failed; errs=" << rep.errorCount();
+        return {};
+    }
+    auto const path = dir / std::string{archiveName};
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<char const*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+    return path;
+}
+}  // namespace
+
+TEST(StaticLink, RealGccSectionRelativeJumpTableLibExitsFortyTwo) {
+    ScratchDir scratch{Location::InsideRepo, "static-link"};
+    auto const dir = scratch.path();
+
+    auto const archive = writeGoldenArchive(
+        dir, "libanswer.a", "answer.o",
+        dss::test::gccAnswerJumpTableObject(), {"lib_pad", "lib_answer"});
+    ASSERT_FALSE(archive.empty());
+    EXPECT_TRUE(isArArchiveFile(archive)) << "the bundled golden must be a valid ar archive";
+
+    auto const mainSrc = writeSrc(dir, "main.c",
+        "extern int lib_answer(void);\n"
+        "int main(void){ return lib_answer(); }\n");
+
+    Program p;
+    p.setOutputDir(dir);
+    p.setResolveLibraries(std::vector<fs::path>{archive});
+    DiagnosticReporter rep;
+    int const rc = p.compileFiles(
+        std::vector<std::string>{mainSrc.string()}, "c-subset",
+        std::vector<std::string>{"x86_64:elf64-x86_64-linux-exec"}, rep);
+    ASSERT_EQ(rc, 0)
+        << "static-link of the real gcc jump-table lib must succeed (the reader must "
+           "resolve its section-relative relocs); errs=" << rep.errorCount();
+    auto const mainPath = dir / "main";
+    ASSERT_TRUE(fs::exists(mainPath)) << "the self-contained exec must exist";
+
+#if defined(__linux__) && (defined(__x86_64__) || defined(__amd64__))
+    auto const r = runBinary(mainPath, std::chrono::milliseconds{5000});
+    ASSERT_TRUE(r.spawned) << "main must spawn. " << r.diagnostic;
+    EXPECT_FALSE(r.timedOut);
+    EXPECT_EQ(r.exitCode, 42u)
+        << "THE c167 acceptance criterion: exit 42 = a REAL gcc switch jump table "
+           "(anonymous .rodata gap atom + interior .text relocs) reconstructed, "
+           "merged, and executed from a DSS-written .a.";
 #endif  // __linux__
 }
 
