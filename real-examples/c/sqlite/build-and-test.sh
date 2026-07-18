@@ -13,7 +13,10 @@
 # Linux or WSL host:
 #
 #   1. verify the host is Linux / WSL and online
-#   2. clone-or-update  dss-code-prime   into  ~/src
+#   2. use the dss-code-prime checkout at ~/src AS-IS — an EXISTING checkout is
+#      probed on its CURRENT branch (never switched or pulled, so running this
+#      against a live working repo can't clobber your branch/HEAD); DSS_UPDATE_CHECKOUT=1
+#      opts into the old fetch+checkout "$DSS_BRANCH"; an ABSENT dir is freshly cloned
 #   3. clone-or-update  sqlite/sqlite    into  ~/src
 #   4. amalgamate SQLite -> sqlite3.c    (autotools: `make sqlite3.c`, needs tclsh)
 #   5. build dss-code-prime              (its default CMake-4 Release build)
@@ -43,8 +46,8 @@
 # party wrappers). The amalgamation is produced by `./configure && make sqlite3.c`
 # (requires a `tclsh` 8.6+ interpreter), which is what this harness uses.
 #
-# Overridable via env: DSS_REPO_URL DSS_BRANCH SQLITE_REPO_URL SRC_DIR SQLITE_DIR
-#                      OUT_DIR JOBS  (see the config block below).
+# Overridable via env: DSS_REPO_URL DSS_BRANCH DSS_UPDATE_CHECKOUT SQLITE_REPO_URL
+#                      SRC_DIR SQLITE_DIR OUT_DIR JOBS  (see the config block below).
 # ─────────────────────────────────────────────────────────────────────────────
 set -Eeuo pipefail
 
@@ -65,7 +68,8 @@ fi
 
 # ── config (override via environment) ───────────────────────────────────────
 DSS_REPO_URL="${DSS_REPO_URL:-git@github.com:dailysoftwaresystems/dss-code-prime.git}"
-DSS_BRANCH="${DSS_BRANCH:-main}"                 # compiler is built from main per spec; override to probe a feature branch
+DSS_BRANCH="${DSS_BRANCH:-main}"                 # branch to check out ONLY when cloning fresh (absent SRC_DIR) or when DSS_UPDATE_CHECKOUT=1; an existing checkout is probed as-is
+DSS_UPDATE_CHECKOUT="${DSS_UPDATE_CHECKOUT:-0}"  # 1 = fetch + checkout "$DSS_BRANCH" + pull --rebase an existing checkout (mutates its branch/HEAD); default 0 = probe the current checkout untouched
 SQLITE_REPO_URL="${SQLITE_REPO_URL:-git@github.com:sqlite/sqlite.git}"
 SRC_DIR="${SRC_DIR:-$HOME/src/dss-code-prime}"
 SQLITE_DIR="${SQLITE_DIR:-$HOME/src/sqlite}"
@@ -238,8 +242,24 @@ else
 fi
 
 # ── Step 2 — dss-code-prime -> ~/src ─────────────────────────────────────────
-step "2/8  Fetch dss-code-prime -> $SRC_DIR (branch: $DSS_BRANCH)"
-clone_or_update "$DSS_REPO_URL" "$SRC_DIR" "$DSS_BRANCH"
+# An EXISTING checkout is probed AS-IS on its current branch — the harness must
+# never switch or pull the repo it is run from (a silent `git checkout`/`pull --rebase`
+# would clobber a live working tree, and fails loud when the branch's remote is gone).
+# DSS_UPDATE_CHECKOUT=1 opts back into fetch+checkout "$DSS_BRANCH"; an ABSENT SRC_DIR
+# is always freshly cloned onto DSS_BRANCH (there is no working tree to disturb).
+if [[ -d "$SRC_DIR/.git" && "$DSS_UPDATE_CHECKOUT" != "1" ]]; then
+  step "2/8  Use dss-code-prime at $SRC_DIR (current checkout, no branch switch)"
+  info "probing the CURRENT checkout untouched — set DSS_UPDATE_CHECKOUT=1 to fetch/checkout '$DSS_BRANCH'"
+  info "  at $(git -C "$SRC_DIR" rev-parse --short HEAD) on $(git -C "$SRC_DIR" rev-parse --abbrev-ref HEAD)"
+else
+  step "2/8  Fetch dss-code-prime -> $SRC_DIR (branch: $DSS_BRANCH)"
+  # Opt-in / fresh-clone path: never mutate a DIRTY working tree — fail loud instead
+  # of silently switching branches over uncommitted work.
+  if [[ -d "$SRC_DIR/.git" && -n "$(git -C "$SRC_DIR" status --porcelain)" ]]; then
+    die "$SRC_DIR has uncommitted changes — refusing to checkout/pull '$DSS_BRANCH' (would clobber your working tree). Commit/stash first, or unset DSS_UPDATE_CHECKOUT to probe the current checkout as-is."
+  fi
+  clone_or_update "$DSS_REPO_URL" "$SRC_DIR" "$DSS_BRANCH"
+fi
 pass "dss-code-prime ready"
 
 # ── Step 3 — sqlite -> ~/src ─────────────────────────────────────────────────
