@@ -55,6 +55,7 @@ struct Nlist {
 constexpr std::uint32_t kMachOMagic64 = 0xFEEDFACFu;
 constexpr std::uint32_t kLcSymtab     = 0x2u;
 constexpr std::uint32_t kLcDysymtab   = 0xBu;
+constexpr std::uint32_t kLcIdDylib    = 0xDu;   // LC_ID_DYLIB (this dylib's install name)
 constexpr std::uint32_t kLcSegment64  = 0x19u;  // unused-but-walked filler LC for tests
 
 // n_type encodings used by the tests:
@@ -64,15 +65,26 @@ constexpr std::uint8_t kNTypeUndf  = 0x00u;        // N_TYPE == N_UNDF
 constexpr std::uint8_t kNPextBit   = 0x10u;
 constexpr std::uint8_t kNStabFun   = 0x24u;        // N_FUN stab (high bit of stab range)
 
-// Build a minimal Mach-O 64-bit binary with optional LC_DYSYMTAB.
+// Build a minimal Mach-O 64-bit binary with optional LC_DYSYMTAB and an
+// optional LC_ID_DYLIB.
 //
 // Layout in execution order:
 //   [0..31]    mach_header_64 (32 bytes)
 //   [32..N1]   load commands:
+//                LC_ID_DYLIB (dylib_command) — IF idDylibInstallName non-empty
 //                LC_SYMTAB (24 bytes)
 //                LC_DYSYMTAB (80 bytes) — IF includeDysymtab
 //   [N1..N2]   symbol table — `syms.size() × 16 bytes`
 //   [N2..]     string table — NUL-sentinel + packed NUL-terminated names
+//
+// D-FF1-READER-SONAME (c171): a non-empty `idDylibInstallName` PREPENDS a
+// dylib_command (cmd=LC_ID_DYLIB=0xD): [0..3]=cmd, [4..7]=cmdsize (8-aligned,
+// covering the name), [8..11]=name.offset (24, past the 6 u32 fields),
+// [12..23]=timestamp/current/compat versions (0), then the NUL-terminated
+// install name padded to cmdsize. ncmds + sizeofcmds are bumped accordingly.
+// Empty (the default) reproduces the EXISTING image byte-for-byte (LC_SYMTAB
+// stays at file offset 32), so pre-soname callers + fixed-offset pokes are
+// unaffected.
 //
 // Each `n_strx` field is rewritten to point at the corresponding
 // `nameOffsets[i]` (within the layout-built string table). Pass
@@ -91,11 +103,18 @@ buildMinimalMacho64(std::vector<Nlist> syms,
                     std::vector<std::string> const& names,
                     bool includeDysymtab     = false,
                     std::uint32_t iextdefsym = 0,
-                    std::uint32_t nextdefsym = 0) {
+                    std::uint32_t nextdefsym = 0,
+                    std::string const& idDylibInstallName = {}) {
     constexpr std::size_t kHeaderSize  = 32;
     constexpr std::size_t kLcSymtabSz  = 24;
     constexpr std::size_t kLcDysymtabSz = 80;
     constexpr std::size_t kNlist64Sz   = 16;
+
+    bool const hasIdDylib = !idDylibInstallName.empty();
+    // dylib_command: 24-byte header + NUL-terminated install name, 8-aligned.
+    std::size_t const idDylibSz = hasIdDylib
+        ? ((24u + idDylibInstallName.size() + 1u + 7u) / 8u) * 8u
+        : 0u;
 
     // String table layout: leading NUL sentinel, then names packed.
     std::vector<std::uint8_t> strTab;
@@ -108,8 +127,9 @@ buildMinimalMacho64(std::vector<Nlist> syms,
         strTab.push_back(0);
     }
 
-    std::size_t const lcCount   = includeDysymtab ? 2 : 1;
-    std::size_t const sizeofcmds = (includeDysymtab ? kLcSymtabSz + kLcDysymtabSz
+    std::size_t const lcCount   = (includeDysymtab ? 2 : 1) + (hasIdDylib ? 1 : 0);
+    std::size_t const sizeofcmds = idDylibSz
+                                 + (includeDysymtab ? kLcSymtabSz + kLcDysymtabSz
                                                     : kLcSymtabSz);
     std::size_t const symtabFileOff = kHeaderSize + sizeofcmds;
     std::size_t const strtabFileOff = symtabFileOff + syms.size() * kNlist64Sz;
@@ -127,8 +147,20 @@ buildMinimalMacho64(std::vector<Nlist> syms,
     putU32(b, 24, 0u);                                          // flags
     putU32(b, 28, 0u);                                          // reserved
 
-    // ── LC_SYMTAB ──
+    // ── LC_ID_DYLIB (prepended when an install name is requested) ──
     std::size_t lcOff = kHeaderSize;
+    if (hasIdDylib) {
+        putU32(b, lcOff + 0, kLcIdDylib);                            // cmd = 0xD
+        putU32(b, lcOff + 4, static_cast<std::uint32_t>(idDylibSz)); // cmdsize
+        putU32(b, lcOff + 8, 24u);                                   // name.offset
+        // timestamp / current / compat versions (@ +12/+16/+20) left 0
+        for (std::size_t k = 0; k < idDylibInstallName.size(); ++k)
+            b[lcOff + 24 + k] = static_cast<std::uint8_t>(idDylibInstallName[k]);
+        // trailing NUL already 0 (buffer is zero-initialized)
+        lcOff += idDylibSz;
+    }
+
+    // ── LC_SYMTAB ──
     putU32(b, lcOff + 0,  kLcSymtab);
     putU32(b, lcOff + 4,  static_cast<std::uint32_t>(kLcSymtabSz));
     putU32(b, lcOff + 8,  static_cast<std::uint32_t>(symtabFileOff));
@@ -199,6 +231,50 @@ TEST(BinaryReaderMacho, RoundTripsLcSymtabExternalSymbols) {
     EXPECT_EQ((*r)[0].kind, SymbolKind::Function);
     EXPECT_EQ((*r)[0].visibility, SymbolVisibility::Default);
     EXPECT_EQ((*r)[0].linkage, SymbolLinkage::External);
+}
+
+// ── D-FF1-READER-SONAME (c171): LC_ID_DYLIB install-name extraction ──
+
+// STRICT: the LC_ID_DYLIB install name surfaces VERBATIM on every row's
+// `soname` — the WHOLE "@rpath/..." string, NOT leaf-reduced.
+TEST(BinaryReaderMacho, ExtractsInstallNameFromLcIdDylib) {
+    std::vector<Nlist> syms{sect(1), sect(1)};
+    std::vector<std::string> names{"alpha", "beta"};
+    auto const bytes = buildMinimalMacho64(
+        syms, names, /*includeDysymtab=*/false,
+        /*iextdefsym=*/0u, /*nextdefsym=*/0u,
+        /*idDylibInstallName=*/"@rpath/libwidget.dylib");
+
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "/build/out/libwidget.dylib", rep);
+    ASSERT_TRUE(r.has_value())
+        << "kind=" << binaryReadErrorKindName(r.error().kind)
+        << " detail=" << r.error().detail;
+    ASSERT_EQ(r->size(), 2u);
+    for (auto const& row : *r) {
+        EXPECT_EQ(row.soname, "@rpath/libwidget.dylib")
+            << "install name must be kept whole (not leaf-reduced)";
+    }
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+// RED-ON-DISABLE: the EXISTING synthesizer emits no LC_ID_DYLIB, so
+// every row's soname MUST be empty. Fails if the extractor ever
+// fabricated an install name.
+TEST(BinaryReaderMacho, NoLcIdDylibLeavesSonameEmpty) {
+    std::vector<Nlist> syms{sect(1), sect(1)};
+    std::vector<std::string> names{"alpha", "beta"};
+    auto const bytes = buildMinimalMacho64(syms, names);  // no LC_ID_DYLIB
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "libwidget.dylib", rep);
+    ASSERT_TRUE(r.has_value())
+        << "kind=" << binaryReadErrorKindName(r.error().kind);
+    ASSERT_EQ(r->size(), 2u);
+    for (auto const& row : *r) {
+        EXPECT_TRUE(row.soname.empty())
+            << "no LC_ID_DYLIB must leave soname empty; got '"
+            << row.soname << "'";
+    }
 }
 
 TEST(BinaryReaderMacho, NPextBitMapsToHiddenVisibility) {

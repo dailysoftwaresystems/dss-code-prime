@@ -300,6 +300,23 @@ readPe(std::span<std::uint8_t const> bytes,
     std::uint32_t const addressOfNames        = readU32(bytes, *exportDirFileOff + 32);
     std::uint32_t const addressOfNameOrdinals = readU32(bytes, *exportDirFileOff + 36);
 
+    // D-FF1-READER-SONAME (c171): the export directory's Name field (offset 12)
+    // is the DLL's OWN name (the import DllName a client's `.idata` records) --
+    // its loader-resolvable identity, preferred over the file basename
+    // downstream. OPTIONAL + NON-FATAL: a zero or unresolvable NameRva leaves
+    // `dllName` empty (the driver falls back to the basename).
+    std::string dllName;
+    {
+        std::uint32_t const nameRva = readU32(bytes, *exportDirFileOff + 12);
+        if (nameRva != 0u) {
+            if (auto const nameOff = rvaToFileOff(nameRva);
+                nameOff && *nameOff < bytes.size()) {
+                dllName = readNulTerminated(
+                    bytes, static_cast<std::size_t>(*nameOff), bytes.size(), 0);
+            }
+        }
+    }
+
     if (numberOfNamePointers == 0u) {
         // Export directory exists but has no NAMED exports — only
         // ordinal-only exports. The reader surfaces named exports →
@@ -406,6 +423,7 @@ readPe(std::span<std::uint8_t const> bytes,
             *eatFileOff + static_cast<std::uint64_t>(unbiasedOrdinal) * 4u);
 
         row.libraryPath = std::string{libraryPathLabel};
+        row.soname      = dllName;   // export-directory DllName (empty if none)
         row.visibility  = SymbolVisibility::Default;   // PE export table carries no STV_* granularity
         row.linkage     = SymbolLinkage::External;     // an export is external by definition
 

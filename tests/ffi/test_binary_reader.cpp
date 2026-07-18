@@ -58,11 +58,26 @@ void appendSym(std::vector<std::uint8_t>& b, Sym const& s) {
     appU64(b, s.size);
 }
 
+// DT_* dynamic-array tags (gABI Fig. 5-10). DT_SONAME is the embedded,
+// loader-resolvable library identity the c171 reader extracts.
+constexpr std::uint64_t kDtNull   = 0;    // DT_NULL   — terminates the .dynamic array
+constexpr std::uint64_t kDtSoname = 14;   // DT_SONAME — d_val = a .dynstr offset
+
 // Build a minimal ELF64 LE with `.dynsym` + `.dynstr` containing the
 // given symbols. The shstrtab section gets the well-known names.
 // Returns the byte image.
+//
+// D-FF1-READER-SONAME (c171): a non-empty `soname` (default empty) adds a
+// 5th `.dynamic` section (SHT_DYNAMIC=6, sh_entsize=16) holding two Elf64_Dyn
+// entries — {d_tag=DT_SONAME, d_val=<the soname's .dynstr offset>} and a
+// {DT_NULL, 0} terminator — and appends the soname string into the SAME
+// `.dynstr` the symbol names index. Empty leaves the EXISTING 4-section image
+// byte-for-byte unchanged, so every pre-soname caller (and the
+// NoDynamicSectionLeavesSonameEmpty negative) is exact.
 std::vector<std::uint8_t> buildMinimalElf64(std::vector<Sym> const& syms,
-                                              std::vector<std::string> const& names) {
+                                              std::vector<std::string> const& names,
+                                              std::string const& soname = {}) {
+    bool const hasDynamic = !soname.empty();
     // Layout we'll lay down:
     //   [0..63]            Ehdr (64 bytes)
     //   [64..]             .dynstr  — concatenated NUL-terminated names (starts with NUL sentinel)
@@ -82,6 +97,14 @@ std::vector<std::uint8_t> buildMinimalElf64(std::vector<Sym> const& syms,
     for (auto const& n : names) {
         nameOffsets.push_back(static_cast<std::uint32_t>(dynstr.size()));
         for (char c : n) dynstr.push_back(static_cast<std::uint8_t>(c));
+        dynstr.push_back(0);
+    }
+    // DT_SONAME's d_val indexes this SAME `.dynstr`; record the soname
+    // string's offset before appending it (empty soname adds nothing).
+    std::uint32_t sonameStrOff = 0;
+    if (hasDynamic) {
+        sonameStrOff = static_cast<std::uint32_t>(dynstr.size());
+        for (char c : soname) dynstr.push_back(static_cast<std::uint8_t>(c));
         dynstr.push_back(0);
     }
     std::uint64_t const dynstrOff = bytes.size();
@@ -113,7 +136,20 @@ std::vector<std::uint8_t> buildMinimalElf64(std::vector<Sym> const& syms,
     std::uint32_t const nDynstr   = pushName(".dynstr");
     std::uint32_t const nDynsym   = pushName(".dynsym");
     std::uint32_t const nShstrtab = pushName(".shstrtab");
+    std::uint32_t const nDynamic  = hasDynamic ? pushName(".dynamic") : 0u;
     std::uint64_t const shstrtabSize = bytes.size() - shstrtabOff;
+
+    // `.dynamic` array (only when a soname is requested): one DT_SONAME
+    // entry (d_val = the soname's .dynstr offset) + a DT_NULL terminator,
+    // 8-aligned, between `.shstrtab` and the section header table.
+    std::uint64_t dynamicOff = 0, dynamicSize = 0;
+    if (hasDynamic) {
+        while (bytes.size() % 8 != 0) bytes.push_back(0);
+        dynamicOff = bytes.size();
+        appU64(bytes, kDtSoname); appU64(bytes, sonameStrOff);  // DT_SONAME
+        appU64(bytes, kDtNull);   appU64(bytes, 0);             // DT_NULL
+        dynamicSize = bytes.size() - dynamicOff;
+    }
 
     // Section header table — 4 entries (NULL, dynstr=1, dynsym=2, shstrtab=3)
     while (bytes.size() % 8 != 0) bytes.push_back(0);
@@ -144,6 +180,11 @@ std::vector<std::uint8_t> buildMinimalElf64(std::vector<Sym> const& syms,
     writeShdr(nDynsym,  11, 0, dynsymOff, dynsymSize, 1, 24);
     // .shstrtab (idx 3, SHT_STRTAB=3)
     writeShdr(nShstrtab, 3, 0, shstrtabOff, shstrtabSize, 0, 0);
+    // .dynamic (idx 4, SHT_DYNAMIC=6, sh_link=1 → .dynstr, entsize=16) —
+    // only when a soname was requested. The reader keys on sh_type==6.
+    if (hasDynamic) {
+        writeShdr(nDynamic, 6, 0, dynamicOff, dynamicSize, 1, 16);
+    }
 
     // Now fill in the Ehdr at [0..63]
     bytes[0] = 0x7F; bytes[1] = 'E'; bytes[2] = 'L'; bytes[3] = 'F';
@@ -165,7 +206,7 @@ std::vector<std::uint8_t> buildMinimalElf64(std::vector<Sym> const& syms,
     // e_phnum [56..57] = 0
     // e_shentsize [58..59] = 64; e_shnum [60..61] = 4; e_shstrndx [62..63] = 3
     bytes[58] = 64;
-    bytes[60] = 4;
+    bytes[60] = static_cast<std::uint8_t>(hasDynamic ? 5 : 4);  // e_shnum
     bytes[62] = 3;
 
     return bytes;
@@ -206,6 +247,95 @@ TEST(BinaryReaderElf, ReadsDynamicSymbolsRoundTrip) {
 
     EXPECT_EQ((*r)[2].mangledName, "malloc");
     EXPECT_EQ((*r)[2].linkage, SymbolLinkage::Weak);
+}
+
+// ── D-FF1-READER-SONAME (c171): DT_SONAME extraction ─────────────
+
+// STRICT: the `.dynamic`/DT_SONAME the builder emits must surface on
+// EVERY row's `soname`, verbatim ("libwidget.so.2").
+TEST(BinaryReaderElf, ExtractsDtSonameFromDynamic) {
+    std::vector<std::string> names = {"printf", "malloc"};
+    std::vector<Sym> syms;
+    syms.push_back({0, info(1 /*STB_GLOBAL*/, 2 /*STT_FUNC*/), 0, 1, 0x1000, 16});
+    syms.push_back({0, info(1, 2), 0, 1, 0x2000, 16});
+
+    auto const bytes = buildMinimalElf64(syms, names, "libwidget.so.2");
+    DiagnosticReporter rep;
+    auto const r = readImportsFromBytes(
+        std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+        "/build/out/libwidget-9a3f.so", rep);
+    ASSERT_TRUE(r.has_value()) << r.error().detail;
+    ASSERT_EQ(r->size(), 2u);
+    for (auto const& row : *r) {
+        EXPECT_EQ(row.soname, "libwidget.so.2");
+    }
+    // The path label stays on libraryPath — soname is the SEPARATE
+    // embedded identity, NOT the on-disk basename.
+    EXPECT_EQ((*r)[0].libraryPath, "/build/out/libwidget-9a3f.so");
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+// RED-ON-DISABLE: the EXISTING synthesizer emits no `.dynamic`, so
+// every row's soname MUST be empty. Fails if the extractor ever
+// fabricated a soname (or defaulted it to the basename).
+TEST(BinaryReaderElf, NoDynamicSectionLeavesSonameEmpty) {
+    std::vector<std::string> names = {"printf", "malloc"};
+    std::vector<Sym> syms;
+    syms.push_back({0, info(1, 2), 0, 1, 0x1000, 16});
+    syms.push_back({0, info(1, 2), 0, 1, 0x2000, 16});
+
+    auto const bytes = buildMinimalElf64(syms, names);  // no .dynamic
+    DiagnosticReporter rep;
+    auto const r = readImportsFromBytes(
+        std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+        "libplain.so", rep);
+    ASSERT_TRUE(r.has_value()) << r.error().detail;
+    ASSERT_EQ(r->size(), 2u);
+    for (auto const& row : *r) {
+        EXPECT_TRUE(row.soname.empty())
+            << "no .dynamic/DT_SONAME must leave soname empty; got '"
+            << row.soname << "'";
+    }
+}
+
+// An out-of-range DT_SONAME d_val must bound to an empty soname
+// (readNulTerminated stops at the .dynstr end) — no crash, no garbage.
+TEST(BinaryReaderElf, DtSonameOffsetPastDynstrLeavesSonameEmpty) {
+    std::vector<std::string> names = {"printf"};
+    std::vector<Sym> syms;
+    syms.push_back({0, info(1, 2), 0, 1, 0x1000, 16});
+    auto bytes = buildMinimalElf64(syms, names, "libwidget.so.2");
+
+    // Locate the .dynamic section (SHT_DYNAMIC=6) via the section header
+    // table and poison its first Elf64_Dyn (DT_SONAME) d_val — at
+    // sh_offset+8 — to a wildly out-of-range .dynstr offset.
+    std::uint64_t shtOff = 0;
+    std::memcpy(&shtOff, &bytes[40], 8);
+    std::uint16_t shnum = 0;
+    std::memcpy(&shnum, &bytes[60], 2);
+    std::uint64_t dynOff = 0;
+    for (std::uint16_t i = 0; i < shnum; ++i) {
+        std::size_t const sh = static_cast<std::size_t>(shtOff) + i * 64u;
+        std::uint32_t shType = 0;
+        std::memcpy(&shType, &bytes[sh + 4], 4);
+        if (shType == 6u) {  // SHT_DYNAMIC
+            std::memcpy(&dynOff, &bytes[sh + 24], 8);  // sh_offset
+            break;
+        }
+    }
+    ASSERT_NE(dynOff, 0u) << "fixture must contain a .dynamic section";
+    std::uint64_t const badOff = 0xFFFFFFFFu;
+    std::memcpy(&bytes[static_cast<std::size_t>(dynOff) + 8], &badOff, 8);
+
+    DiagnosticReporter rep;
+    auto const r = readImportsFromBytes(
+        std::span<std::uint8_t const>{bytes.data(), bytes.size()},
+        "libwidget.so", rep);
+    ASSERT_TRUE(r.has_value()) << r.error().detail;
+    ASSERT_EQ(r->size(), 1u);
+    EXPECT_TRUE((*r)[0].soname.empty())
+        << "an out-of-range DT_SONAME d_val must resolve to empty, not read "
+           "past .dynstr; got '" << (*r)[0].soname << "'";
 }
 
 // ── Local symbols are skipped (don't export) ─────────────────────

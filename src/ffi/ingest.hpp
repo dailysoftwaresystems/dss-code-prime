@@ -65,11 +65,14 @@ struct DSS_EXPORT BinaryLibrarySource {
     // to carry `importName` as its `libraryPath`, so the linker records
     // the soname/DLL-name the loader resolves at runtime rather than the
     // absolute build-time path (a Windows path in an ELF DT_NEEDED would
-    // never load). This is the honest stand-in for the binary's OWN
-    // DT_SONAME / export-directory DllName until FF1 extracts them
-    // (anchored `D-FF1-READER-SONAME`): the driver supplies the file's
-    // basename, which is exactly what a foreign linker records for a
-    // `-l<name>` / `gcc -shared` library with no explicit `-soname`.
+    // never load). As of c171 (`D-FF1-READER-SONAME`) the FF1 readers now
+    // EXTRACT the binary's OWN embedded identity (ELF DT_SONAME / Mach-O
+    // LC_ID_DYLIB install name / PE export DllName), and `ingest()` PREFERS
+    // that over this override when the binary declares one — so `importName`
+    // is now the FALLBACK the driver supplies for a library that carries NO
+    // embedded soname (the file's basename, exactly what a foreign linker
+    // records for a `-l<name>` / `gcc -shared` library with no explicit
+    // `-soname`), rather than the primary source it was before FF1 extraction.
     std::string importName;
 };
 

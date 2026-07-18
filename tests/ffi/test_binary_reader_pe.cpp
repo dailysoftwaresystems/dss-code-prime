@@ -81,8 +81,15 @@ struct BuiltPe {
 //   [40]           Export Address Table   — u32 RVA × N
 //   [40+4N]        Name Pointer Table      — u32 RVA × N (INPUT order)
 //   [40+8N]        Ordinal Table           — u16 × N (identity: ord[i]=i)
-//   [40+10N]       name strings, then forwarder-target strings (packed)
-[[nodiscard]] BuiltPe buildPeExports(std::vector<ExportSpec> const& exports) {
+//   [40+10N]       name strings, then forwarder-target strings, then (when
+//                  requested) the DllName string (packed)
+//
+// D-FF1-READER-SONAME (c171): a non-empty `dllName` is packed into `.edata`
+// and its RVA is written to the export directory's Name field (offset +12).
+// Empty (the default) leaves NameRva == 0, so the reader reports an empty
+// soname (the pre-c171 behavior every existing PE test relies on).
+[[nodiscard]] BuiltPe buildPeExports(std::vector<ExportSpec> const& exports,
+                                     std::string const& dllName = {}) {
     constexpr std::uint32_t kPeOffset      = 128;
     constexpr std::uint32_t kNumSections   = 3;
     constexpr std::uint32_t kSectionHdrOff = kPeOffset + 4 + 20 + 240;      // 392
@@ -122,6 +129,15 @@ struct BuiltPe {
         if (exports[i].kind != ExpKind::Forwarder) continue;
         fwdStrRel[i] = strOff + static_cast<std::uint32_t>(strBlob.size());
         for (char c : exports[i].forwardTarget)
+            strBlob.push_back(static_cast<std::uint8_t>(c));
+        strBlob.push_back(0);
+    }
+    // The DLL's own name string (packed last); its section-relative offset
+    // feeds the export directory Name field (edata +12). Empty -> NameRva 0.
+    std::uint32_t dllNameRel = 0;
+    if (!dllName.empty()) {
+        dllNameRel = strOff + static_cast<std::uint32_t>(strBlob.size());
+        for (char c : dllName)
             strBlob.push_back(static_cast<std::uint8_t>(c));
         strBlob.push_back(0);
     }
@@ -174,6 +190,8 @@ struct BuiltPe {
         ed[off + 0] = static_cast<std::uint8_t>(v & 0xFF);
         ed[off + 1] = static_cast<std::uint8_t>((v >> 8) & 0xFF);
     };
+    if (!dllName.empty())
+        edU32(12, edataRva + dllNameRel);  // NameRva (export-directory DllName)
     edU32(16, 1u);                    // OrdinalBase
     edU32(20, n);                     // AddressTableEntries
     edU32(24, n);                     // NumberOfNamePointers
@@ -240,6 +258,43 @@ TEST(BinaryReaderPe, ReadsPe32PlusExportTableRoundTrip) {
     EXPECT_EQ((*r)[0].linkage, SymbolLinkage::External);
     EXPECT_EQ((*r)[1].mangledName, "malloc");
     EXPECT_EQ((*r)[2].mangledName, "free");
+}
+
+// ── D-FF1-READER-SONAME (c171): export-directory DllName extraction ──
+
+// STRICT: the export directory's Name field (DllName) surfaces on EVERY
+// row's `soname`, verbatim ("widget.dll").
+TEST(BinaryReaderPe, ExtractsDllNameFromExportDirectory) {
+    auto built = buildPeExports({{"printf", ExpKind::Function, {}},
+                                 {"malloc", ExpKind::Function, {}}},
+                                /*dllName=*/"widget.dll");
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(built.bytes, "C:/build/out/widget-9a3f.dll", rep);
+    ASSERT_TRUE(r.has_value())
+        << (r.has_value() ? "" : r.error().detail);
+    ASSERT_EQ(r->size(), 2u);
+    for (auto const& row : *r) {
+        EXPECT_EQ(row.soname, "widget.dll");
+    }
+    // The path label stays on libraryPath — soname is the SEPARATE
+    // embedded DllName, NOT the on-disk basename.
+    EXPECT_EQ((*r)[0].libraryPath, "C:/build/out/widget-9a3f.dll");
+    EXPECT_EQ(rep.errorCount(), 0u);
+}
+
+// RED-ON-DISABLE: the EXISTING synthesizer never sets the Name field, so
+// NameRva stays 0 and every row's soname MUST be empty. Fails if the
+// extractor ever fabricated a DllName.
+TEST(BinaryReaderPe, ZeroNameRvaLeavesSonameEmpty) {
+    auto const bytes = buildMinimalPe32Plus({"printf", "malloc"});  // NameRva == 0
+    DiagnosticReporter rep;
+    auto r = readImportsFromBytes(bytes, "widget.dll", rep);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->size(), 2u);
+    for (auto const& row : *r) {
+        EXPECT_TRUE(row.soname.empty())
+            << "NameRva==0 must leave soname empty; got '" << row.soname << "'";
+    }
 }
 
 TEST(BinaryReaderPe, NoNamedExportsReturnsEmptySurface) {
