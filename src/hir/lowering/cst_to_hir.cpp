@@ -4627,6 +4627,42 @@ struct Lowerer {
             // ── TERMINAL / synchronous forms (no nested child statement) ──────
             if (k == "VarDecl")     { stmtResult = lowerVarDecl(n); return; }
             if (k == "TypeDecl")    { stmtResult = lowerTypeDecl(n); return; }
+            // D-CSUBSET-BLOCK-SCOPE-EXTERN (C89 6.7.1): a block-scope `extern`
+            // declaration statement — `extern int f(int);` (function prototype) OR
+            // `extern T *p;` (object reference) inside a function body. It reuses the
+            // FILE-scope externDecl lowering WHOLESALE: `lowerExternDecl` mints the
+            // ExternFunction/ExternGlobal HIR node AND records its import row. We route
+            // that node to the module-decls accumulator (the D-CSUBSET-LOCAL-STATIC /
+            // D-CSUBSET-BLOCK-SCOPE-PROTOTYPE pattern) — NEVER a statement-position push
+            // (lowerStmtNode has no ExternFunction/ExternGlobal arm → it would fail-loud)
+            // — and lower the STATEMENT itself to a no-op (an empty Block, the `Skip`
+            // precedent below), since the extern emits no code in the body. Pass-1 bound
+            // the symbol into the enclosing BLOCK scope (C 6.2.2p4 name scope; NOT
+            // re-homed to file scope the way the bare proto is, so a block extern OBJECT
+            // that shadows an outer local reads the extern), and collectExterns registers
+            // the symbol so a block use resolves via GlobalAddr — identical to a
+            // file-scope extern. An absorbed extern (a same-scope in-TU definition won
+            // the Pass-1 merge) returns an invalid node → push nothing, mirroring the
+            // top-level `lowerDeclInto` ExternDecl arm.
+            if (k == "ExternDecl") {
+                HirNodeId const e = lowerExternDecl(n);
+                if (e.valid()) {
+                    if (moduleDecls_ != nullptr) {
+                        moduleDecls_->push_back(e);
+                    } else {
+                        // Mirrors the block-proto / static-local MF-3 guard: a
+                        // block-scope extern reached with no module-decls accumulator
+                        // (outside a module tree walk) is a bug — a loud error, never a
+                        // silent drop of the import row.
+                        stmtResult = reportedError(n,
+                            "block-scope extern synthesized with no module-decls "
+                            "accumulator (outside a module tree walk)");
+                        return;
+                    }
+                }
+                stmtResult = track(builder.makeBlock({}), n);
+                return;
+            }
             if (k == "ExprStmt")    { stmtResult = lowerExprStmt(n); return; }
             if (k == "ReturnStmt")  { stmtResult = lowerReturn(n); return; }
             if (k == "BreakStmt")    { stmtResult = track(builder.makeBreak(0), n); return; }

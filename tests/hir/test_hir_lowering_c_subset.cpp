@@ -383,6 +383,47 @@ TEST(HirLoweringCSubset, SiblingStaticLocalsGetDistinctGlobals) {
         << "two sibling statics must mint two DISTINCT module globals";
 }
 
+// D-CSUBSET-BLOCK-SCOPE-EXTERN (TF arc C10, C89 6.7.1): a block-scope `extern`
+// declaration — a FUNCTION prototype (`extern int ex_fn(int);`) AND an OBJECT
+// reference (`extern int ex_obj;`) inside a body — RE-HOMES to the module decls
+// as one ExternFunction + one ExternGlobal (the static-local / block-scope-
+// prototype accumulator pattern) and lowers the STATEMENT to a no-op (an empty
+// Block, the Skip precedent), so the function body carries NO stack VarDecl for
+// either extern name. This is the host-independent structural guard the runtime
+// corpus (`block_scope_extern`, cross-CU → exit 42) pairs with. RED-ON-DISABLE:
+// drop the `k == "ExternDecl"` arm in cst_to_hir.cpp's lowerStmt → the externDecl
+// statement hits the terminal default → "statement maps to unsupported HIR kind
+// 'ExternDecl'" and res->ok goes false. (lowerToHir is CST→HIR only, so the
+// ExternGlobal node is produced here regardless of the MIR-tier data-import
+// state — the import resolves at the LK11 cross-CU merge, witnessed by the
+// runtime example.)
+TEST(HirLoweringCSubset, BlockScopeExternRehomesToModuleDecls) {
+    SemanticModel model = analyzeCSubset(
+        "int use(void) { extern int ex_fn(int); extern int ex_obj; "
+        "return ex_fn(ex_obj); }");
+    ASSERT_FALSE(model.hasErrors());
+    DiagnosticReporter r;
+    auto res = lowerToHir(model, r);
+    ASSERT_TRUE(res->ok) << (r.all().empty() ? "" : r.all()[0].actual);
+    std::size_t fns = 0, externFns = 0, externGlobals = 0;
+    for (HirNodeId d : res->hir.moduleDecls(res->hir.root())) {
+        if (res->hir.kind(d) == HirKind::Function)       ++fns;
+        if (res->hir.kind(d) == HirKind::ExternFunction) ++externFns;
+        if (res->hir.kind(d) == HirKind::ExternGlobal)   ++externGlobals;
+    }
+    EXPECT_EQ(fns, 1u);
+    EXPECT_EQ(externFns, 1u)
+        << "the block-scope extern FUNCTION prototype must re-home to ONE "
+           "module ExternFunction";
+    EXPECT_EQ(externGlobals, 1u)
+        << "the block-scope extern OBJECT must re-home to ONE module ExternGlobal";
+    // Both extern statements lower to no-ops: no stack VarDecl for either name.
+    HirNodeId fn = firstFunction(res->hir);
+    for (HirNodeId s : res->hir.children(res->hir.functionBody(fn)))
+        EXPECT_NE(res->hir.kind(s), HirKind::VarDecl)
+            << "a block-scope extern must not leave a stack VarDecl in the body";
+}
+
 TEST(HirLoweringCSubset, ForLoop) {
     SemanticModel model = analyzeCSubset(
         "void f() { for (int i = 0; i < 10; i = i + 1) {} }");
