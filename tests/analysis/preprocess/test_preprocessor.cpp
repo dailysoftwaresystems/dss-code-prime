@@ -3040,6 +3040,104 @@ TEST(Preprocessor, FunctionLikeMacroGuardSkipsIncludeConservatively) {
     (void)lexs;
 }
 
+// ── C19 (D-PP-PRESCAN-DEFINEDNESS-PARITY): the include-gating pre-scan must know
+// COMMAND-LINE `--define`s. A `#ifdef <cmdline-define>`-gated quote-`#include` was
+// FALSELY read dead -- the pre-scan saw only in-source `#define`s (localMacros) +
+// predefined, never the `<command-line>` prologue (spliced straight into synthText)
+// -- so the header was left un-inlined and its `#define`s dropped, surfacing
+// downstream as a spurious P0009 (the real SQLITE_TEST-gated `tclsqlite.h` ->
+// `SQLITE_TCLAPI` drop across 7 `src/test*.c` TUs). These pins reuse the
+// "missing-header-must-error-when-LIVE" oracle of DefineMakesIfBranchLiveSoInclude-
+// Errors, so the gate state is directly observable. ──────────────────────────────
+
+// (Self-contained: `ppLexemesWithDefines` lives later in this file, so these call
+// `preprocess()` directly -- they only need the include-error diagnostic / a short
+// lexeme check.)
+
+// Pin 1 (CORE, RED-ON-DISABLE): a command-line `--define GATE` makes `#ifdef GATE`
+// LIVE in the include-gating pre-scan, so its quote-`#include` RESOLVES (and errors
+// on the missing header). Disable the seed -> GATE unknown -> branch read dead ->
+// include silently skipped -> NO error (the exact silent drop this cycle fixes).
+TEST(Preprocessor, CommandLineDefineMakesIfdefIncludeLive) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#ifdef GATE\n#include \"still_missing.h\"\n#endif\nint x;\n", "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"GATE"};
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "a command-line --define GATE must make #ifdef GATE live in the include-"
+           "gating pre-scan so its quote-#include resolves "
+           "(D-PP-PRESCAN-DEFINEDNESS-PARITY)";
+}
+
+// Pin 2 (SYMMETRY, RED-ON-DISABLE): the `#if defined(GATE)` form agrees with
+// `#ifdef GATE` for a command-line define -- both route through the unified
+// `sbNameDefined`. Before, `#ifdef` saw ONLY localMacros while `#if defined()` also
+// saw predefined, and NEITHER saw a command-line define; now they agree.
+TEST(Preprocessor, CommandLineDefineViaDefinedOperatorIncludeLive) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#if defined(GATE)\n#include \"still_missing.h\"\n#endif\nint x;\n",
+        "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"GATE"};
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "#if defined(GATE) must agree with #ifdef GATE for a command-line define "
+           "(the unified sbNameDefined oracle)";
+}
+
+// Pin 3 (CHILD THREADING, depth>=1, RED-ON-DISABLE): a header included LIVE from an
+// outer command-line-gated conditional must ITSELF see the command-line define for
+// its OWN gated includes -- proving `seededDefines` threads into child builders.
+// `outer.h` (resolved + inlined from main) has its own `#ifdef GATE #include
+// <missing_inner>`; with child-threading that inner include resolves + errors,
+// without it the child never learns GATE -> inner skipped -> no error.
+TEST(Preprocessor, CommandLineDefineSeedThreadsIntoChildBuilders) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path() / "dss_c19_child_seed";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    { std::ofstream(dir / "outer.h", std::ios::binary)
+          << "#ifdef GATE\n#include \"still_missing_inner.h\"\n#endif\n"; }
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString(
+        "#ifdef GATE\n#include \"outer.h\"\n#endif\nint x;\n", "main.c");
+    std::vector<fs::path> includeDirs{dir};
+    std::vector<std::string> defines{"GATE"};
+    auto out = preprocess(buf, schema, includeDirs, {}, std::nullopt, defines);
+    EXPECT_TRUE(hasPPCode(out, DiagnosticCode::P_PreprocessorIncludeError))
+        << "the command-line define seed must thread into the child builder so "
+           "outer.h's own #ifdef GATE-gated include is LIVE (D-PP-PRESCAN-"
+           "DEFINEDNESS-PARITY child-threading)";
+    fs::remove_all(dir, ec);
+}
+
+// Pin 4 (NO OUTPUT CONTAMINATION): the definedness seed is pre-scan knowledge ONLY
+// -- read for branch decisions, never written to the output. `--define GATE=7`
+// still expands GATE to its prologue value `7` in a live branch (not shadowed to
+// empty by a stray seed `#define`), and no extra tokens leak.
+TEST(Preprocessor, CommandLineDefineSeedDoesNotContaminateOutput) {
+    auto schema = cSubset();
+    auto buf = SourceBuffer::fromString("#ifdef GATE\nint v = GATE;\n#endif\n",
+                                        "main.c");
+    std::vector<std::filesystem::path> noDirs;
+    std::vector<std::string> defines{"GATE=7"};
+    auto out = preprocess(buf, schema, noDirs, {}, std::nullopt, defines);
+    EXPECT_FALSE(out.diagnostics->hasErrors());
+    std::vector<std::string> lexs;
+    for (Token const& t : out.tokens) {
+        if (t.coreKind == CoreTokenKind::Eof
+            || t.coreKind == CoreTokenKind::Whitespace
+            || t.coreKind == CoreTokenKind::Newline) continue;
+        lexs.push_back(std::string{out.synthBuffer->slice(t.span)});
+    }
+    ASSERT_EQ(lexs.size(), 5u) << "expected exactly: int v = 7 ;";
+    EXPECT_EQ(lexs[3], "7") << "GATE expands to its prologue value, seed adds no "
+                               "shadowing #define";
+}
+
 // AGNOSTICISM pin (RED-ON-DISABLE): the dead-branch include skip is driven by
 // the CONFIG conditional words, not a hard-coded "if". Rebind `ifDirective` to
 // "whenever" and reload: a quote-`#include` inside `#whenever 0` must STILL be
