@@ -1497,7 +1497,7 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
             if (s.name == name) return &s;
         return nullptr;
     };
-    ASSERT_EQ(desc->symbols.size(), 59u);   // C13: +4 exported backers (55 -> 59): Db{Incr,Decr}RefCount, GetSlave, BackgroundError
+    ASSERT_EQ(desc->symbols.size(), 61u);   // C13: +4 exported backers (55 -> 59); C16: +2 (Tcl_NewDoubleObj + Tcl_AppendStringsToObj, 59 -> 61) for test_func
     for (auto const* n : {"Tcl_CreateInterp", "Tcl_DeleteInterp", "Tcl_Eval",
                           "Tcl_GetObjResult", "Tcl_GetIntFromObj",
                           "Tcl_NewIntObj", "Tcl_SetObjResult", "Tcl_CreateObjCommand",
@@ -1511,7 +1511,11 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
                           "Tcl_DStringInit", "Tcl_ResetResult", "Tcl_DuplicateObj",
                           "Tcl_LinkVar", "Tcl_GetChannel",
                           // C15 (D-FFI-TCL-DESCRIPTOR): the two Tcl BYTE-ARRAY functions.
-                          "Tcl_NewByteArrayObj", "Tcl_GetByteArrayFromObj"})
+                          "Tcl_NewByteArrayObj", "Tcl_GetByteArrayFromObj",
+                          // C16 (D-FFI-TCL-DESCRIPTOR): test_func's 2 missing fns
+                          // (Tcl_NewDoubleObj = fn(f64)->Tcl_Obj*; Tcl_AppendStringsToObj
+                          // = variadic fn(Tcl_Obj*, ...)->void) -> test_func goes CLEAN.
+                          "Tcl_NewDoubleObj", "Tcl_AppendStringsToObj"})
         EXPECT_NE(sym(n), nullptr) << "missing Tcl symbol: " << n;
     // C15 (D-FFI-TCL-DESCRIPTOR): the two byte-array functions' byte-pointer element
     // type is `unsigned char` (u8*), matching the real Tcl 8.6 ABI

@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C16 2026-07-18): RUN witness for the 2 Tcl functions added to tcl.json to clear test_func's last blockers -- Tcl_AppendStringsToObj (variadic void Tcl_AppendStringsToObj(Tcl_Obj*, ...); a NULL-terminated char* list appended to the obj) + Tcl_NewDoubleObj (Tcl_Obj *Tcl_NewDoubleObj(double)). Both are exported libtcl8.6 functions; adding them takes test_func fully CLEAN (32->33; its only errors were S0001 on these two). AppendCmd (libtcl calls it back on the eval) builds \"40\" by appending \"4\",\"0\",NULL via Tcl_AppendStringsToObj then parses it to 40 (Tcl_GetIntFromObj), and makes a 2.0 via Tcl_NewDoubleObj read back as 2 (Tcl_GetDoubleFromObj) -> 40+2 = 42, value-divergent over Tcl_Obj values libtcl round-tripped. elf-x86_64 only (tcl.json availableObjectFormats:[elf]); CI ubuntu x86_64 runs it (libtcl8.6). RED-ON-DISABLE: remove Tcl_AppendStringsToObj or Tcl_NewDoubleObj from tcl.json -> S0001 -> stops compiling.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-append-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-append-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

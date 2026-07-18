@@ -59,6 +59,8 @@
     { "name": "Tcl_GetObjResult",  "signature": "fn(ptr<struct \"Tcl_Interp\" { arr<u64, 1> }>) -> ptr<struct \"Tcl_Obj\" { arr<u64, 6> }>", "kind": "function", "linkage": "external" },
     { "name": "Tcl_GetIntFromObj", "signature": "fn(ptr<struct \"Tcl_Interp\" { arr<u64, 1> }>, ptr<struct \"Tcl_Obj\" { arr<u64, 6> }>, ptr<i32>) -> i32", "kind": "function", "linkage": "external" },
     { "name": "Tcl_NewIntObj",     "signature": "fn(i32) -> ptr<struct \"Tcl_Obj\" { arr<u64, 6> }>", "kind": "function", "linkage": "external" },
+    { "name": "Tcl_NewDoubleObj",  "signature": "fn(f64) -> ptr<struct \"Tcl_Obj\" { arr<u64, 6> }>", "kind": "function", "linkage": "external" },
+    { "name": "Tcl_AppendStringsToObj", "signature": "fn(ptr<struct \"Tcl_Obj\" { arr<u64, 6> }>, ...) -> void", "kind": "function", "linkage": "external" },
     { "name": "Tcl_SetObjResult",  "signature": "fn(ptr<struct \"Tcl_Interp\" { arr<u64, 1> }>, ptr<struct \"Tcl_Obj\" { arr<u64, 6> }>) -> void", "kind": "function", "linkage": "external" },
     { "name": "Tcl_CreateObjCommand", "signature": "fn(ptr<struct \"Tcl_Interp\" { arr<u64, 1> }>, ptr<char>, ptr<fn(ptr<void>, ptr<struct \"Tcl_Interp\" { arr<u64, 1> }>, i32, ptr<ptr<struct \"Tcl_Obj\" { arr<u64, 6> }>>) -> i32>, ptr<void>, ptr<fn(ptr<void>) -> void>) -> ptr<void>", "kind": "function", "linkage": "external" },
     { "name": "Tcl_GetString",    "signature": "fn(ptr<struct \"Tcl_Obj\" { arr<u64, 6> }>) -> ptr<char>", "kind": "function", "linkage": "external" },
