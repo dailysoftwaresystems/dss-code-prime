@@ -130,6 +130,7 @@ std::string_view cliArgsErrorName(CliArgsError e) noexcept {
         case CliArgsError::EmptyFilename:       return "EmptyFilename";
         case CliArgsError::UnexpectedPositional: return "UnexpectedPositional";
         case CliArgsError::InvalidDefine:        return "InvalidDefine";
+        case CliArgsError::InvalidJobs:          return "InvalidJobs";
     }
     return "Unknown";
 }
@@ -177,6 +178,10 @@ std::string cliHelpText() {
         "  --config=<debug|release>  build config "
             "(default: debug; release applies the full optimizer "
             "pipeline — plan 22)\n"
+        "  --jobs <N>             per-CU build parallelism "
+            "(default: auto = min(cores, TUs, 16); --jobs 1 = serial). "
+            "Only the multi-source build parallelizes; the `=`-form is "
+            "also accepted.\n"
         "  --resolve-library <path>  read a binary's (.so/.dll/.dylib) "
             "export table to resolve + validate this build's externs "
             "against it (repeatable; typically a DSS-built library)\n"
@@ -561,6 +566,29 @@ parseCliArgs(int argc, char* argv[]) {
             continue;
         }
         {
+            // D-PERF-4-CU-PARALLELISM: `--jobs N` / `--jobs=N` — worker count for
+            // the per-CU build pool. Must be a positive integer (>= 1); a non-
+            // numeric value, trailing junk, or 0 fails loud (InvalidJobs) rather
+            // than silently falling back to auto (which would mask a typo'd -j).
+            auto m = valueFlag(a, i, "--jobs");
+            if (!m) return std::unexpected(m.error());
+            if (m->has_value()) {
+                std::string const& v = **m;
+                unsigned n = 0;
+                auto const [p, ec] = std::from_chars(
+                    v.data(), v.data() + v.size(), n);
+                if (ec != std::errc{} || p != v.data() + v.size() || n == 0) {
+                    return std::unexpected(make_error(
+                        CliArgsError::InvalidJobs,
+                        std::string{"--jobs: '"} + v
+                        + "' is not a positive integer worker count "
+                          "(e.g. --jobs 4; use --jobs 1 for a serial build)"));
+                }
+                out.jobs = n;
+                continue;
+            }
+        }
+        {
             auto m = valueFlag(a, i, "--suppress");
             if (!m) return std::unexpected(m.error());
             if (m->has_value()) {
@@ -629,6 +657,7 @@ parseCliArgs(int argc, char* argv[]) {
          || !out.resolveLibraries.empty()  // c162 (D-FF1-READER-CONSUMER)
          || out.warningsAsErrors
          || out.time
+         || out.jobs != 0  // D-PERF-4: --jobs supplied without a mode flag
          || out.config != CompileConfig::Debug
          || out.directoryMode != InputResolver::Mode::Recursive;
         if (hasOptions) {

@@ -139,6 +139,15 @@ struct DSS_EXPORT CliArgs {
     // compile finishes (any compile-producing mode). Diagnostic-neutral, off by
     // default; `--time` with no mode flag is a hard NoModeSelected error.
     bool                          time = false;
+
+    // `--jobs N` / `--jobs=N` (D-PERF-4-CU-PARALLELISM): worker-thread count for
+    // the per-CU build pool (the multi-TU `compileUnits` path builds each CU's
+    // MIR concurrently). 0 (the default / absent) = AUTO = min(hardware_
+    // concurrency, CU count, 16). `--jobs 1` forces a single-worker (serialized)
+    // build — the deterministic baseline. A non-numeric or zero value fails loud
+    // (InvalidJobs); the number is stored verbatim and clamped to the CU count at
+    // pool construction. Threaded to `Program::setJobs`.
+    unsigned                      jobs = 0;
 };
 
 // Parse-failure kinds. Mirror the `TargetSpecError` shape so the
@@ -159,6 +168,8 @@ enum class CliArgsError : std::uint8_t {
     InvalidDefine       = 12,   // c105: --define with an empty NAME, or a '('
                                 // in NAME (a function-like --define is not
                                 // supported — use a config predefine)
+    InvalidJobs         = 13,   // D-PERF-4: --jobs with a non-numeric value, a
+                                // zero, or trailing junk (`--jobs 0`, `--jobs x`)
 };
 
 [[nodiscard]] DSS_EXPORT std::string_view

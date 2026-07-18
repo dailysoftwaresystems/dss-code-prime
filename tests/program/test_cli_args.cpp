@@ -370,6 +370,7 @@ TEST(CliArgs, HelpTextContainsCoreFlags) {
     EXPECT_NE(text.find("--warnings-as-errors"), std::string::npos);
     EXPECT_NE(text.find("--suppress"), std::string::npos);
     EXPECT_NE(text.find("--lsp"), std::string::npos);
+    EXPECT_NE(text.find("--jobs"), std::string::npos);  // D-PERF-4-CU-PARALLELISM
 }
 
 // ── --transpile mode (plan 10 dispatch — fail-loud today) ────
@@ -448,6 +449,81 @@ TEST(CliArgs, ConfigRejectsInvalidValue) {
 TEST(CliArgs, CompileConfigNameRoundTrip) {
     EXPECT_EQ(compileConfigName(CompileConfig::Debug),   "debug");
     EXPECT_EQ(compileConfigName(CompileConfig::Release), "release");
+}
+
+// ── --jobs N (D-PERF-4-CU-PARALLELISM: per-CU build pool width) ─────
+
+TEST(CliArgs, JobsDefaultsToZeroAuto) {   // absent → 0 = auto (min(cores,TUs,16))
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    EXPECT_EQ(r->jobs, 0u);
+}
+
+TEST(CliArgs, JobsParsesEqualsForm) {   // RED-on-disable: drop the --jobs arm → this fails
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--jobs=4"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    EXPECT_EQ(r->jobs, 4u);
+}
+
+TEST(CliArgs, JobsParsesSpaceForm) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--jobs", "8"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_TRUE(r.has_value()) << cliArgsErrorName(r.error().kind) << ": " << r.error().detail;
+    EXPECT_EQ(r->jobs, 8u);
+}
+
+TEST(CliArgs, JobsRejectsZero) {   // 0 is not a valid worker count — fail loud, never silent auto
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--jobs", "0"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidJobs);
+}
+
+TEST(CliArgs, JobsRejectsNonNumeric) {
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--jobs=abc"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidJobs);
+    EXPECT_NE(r.error().detail.find("abc"), std::string::npos);
+}
+
+TEST(CliArgs, JobsRejectsTrailingJunk) {   // partial parse ("4x") must fail, not silently take 4
+    Argv a{"dss-code-prime",
+           "--compile", "a.c",
+           "--language", "c-subset",
+           "--target", "x86_64:elf64-x86_64-linux",
+           "--jobs=4x"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::InvalidJobs);
+}
+
+TEST(CliArgs, JobsAloneIsNoModeError) {   // --jobs with no mode flag must fail loud, not be dropped
+    Argv a{"dss-code-prime", "--jobs", "4"};
+    auto r = parseCliArgs(a.argc(), a.argv());
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().kind, CliArgsError::NoModeSelected);
 }
 
 // ── --target=spec equals form ───────────────────────────────

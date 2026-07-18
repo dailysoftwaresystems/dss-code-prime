@@ -1,11 +1,11 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "core/substrate/thread_pool.hpp"
 #include "lsp/document_store.hpp"
 #include "lsp/method_dispatcher.hpp"
 #include "lsp/protocol.hpp"
 #include "lsp/schema_cache.hpp"
-#include "lsp/thread_pool.hpp"
 #include "lsp/transport.hpp"
 
 #include <atomic>
@@ -38,10 +38,10 @@ public:
     // Inject all collaborators. The server owns transport + executor
     // (both move-only); `schemaCache` is held by reference so callers
     // can share it across server lifetimes.
-    LspServer(std::unique_ptr<LspTransport> transport,
-              std::unique_ptr<IExecutor>    executor,
-              SchemaCache&                  schemaCache,
-              LspServerOptions              options = {});
+    LspServer(std::unique_ptr<LspTransport>       transport,
+              std::unique_ptr<substrate::IExecutor> executor,
+              SchemaCache&                         schemaCache,
+              LspServerOptions                     options = {});
 
     ~LspServer() noexcept;
 
@@ -95,8 +95,8 @@ private:
     // store's currently-published diagnostics.
     void publishDiagnostics_(std::string const& uri);
 
-    std::unique_ptr<LspTransport>  transport_;
-    std::unique_ptr<IExecutor>     executor_;
+    std::unique_ptr<LspTransport>         transport_;
+    std::unique_ptr<substrate::IExecutor> executor_;
     SchemaCache&                   schemaCache_;
     LspServerOptions               options_;
     MethodDispatcher               dispatcher_;

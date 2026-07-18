@@ -1,11 +1,11 @@
-#include "lsp/thread_pool.hpp"
+#include "core/substrate/thread_pool.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <exception>
 #include <utility>
 
-namespace dss::lsp {
+namespace dss::substrate {
 
 ThreadPool::ThreadPool(std::size_t workerCount) {
     const auto count = std::max<std::size_t>(1, workerCount);
@@ -58,14 +58,17 @@ void ThreadPool::workerLoop_() {
         // stderr so a bad_alloc / nlohmann throw / future parser
         // invariant violation doesn't become invisible — without
         // this, the user sees "no diagnostics" with no trace at all.
+        // (Batch callers pair each job with an RAII completion signal
+        // that fires on unwind too, so a throwing job cannot deadlock
+        // a caller waiting on the batch.)
         try {
             job();
         } catch (std::exception const& e) {
-            std::fprintf(stderr, "[lsp/thread_pool] job threw: %s\n", e.what());
+            std::fprintf(stderr, "[substrate/thread_pool] job threw: %s\n", e.what());
         } catch (...) {
-            std::fprintf(stderr, "[lsp/thread_pool] job threw (unknown)\n");
+            std::fprintf(stderr, "[substrate/thread_pool] job threw (unknown)\n");
         }
     }
 }
 
-} // namespace dss::lsp
+} // namespace dss::substrate

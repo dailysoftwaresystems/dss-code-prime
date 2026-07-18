@@ -3,6 +3,7 @@
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/substrate/large_stack_call.hpp"  // D-PARSE-DEEP-FRONTEND-STACK: build CUs on a large stack
 #include "core/substrate/phase_timers.hpp"      // c97: --time per-phase breakdown
+#include "core/substrate/thread_pool.hpp"       // D-PERF-4-CU-PARALLELISM: per-CU build pool
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/grammar_schema.hpp"
 #include "core/types/object_format_kind.hpp"
@@ -18,7 +19,6 @@
 #include "mir/merge/synth_threads_shim.hpp"  // synthesizeThreadsShim (FC17.9a D-CSUBSET-C11-THREADS-HEADER)
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
-#include "lsp/thread_pool.hpp"
 #include "lsp/transport.hpp"
 #include "program/cli_args.hpp"
 #include "program/compile_pipeline.hpp"
@@ -29,9 +29,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <latch>
 #include <limits>
 #include <map>
 #include <memory>
@@ -58,7 +60,7 @@ namespace {
     // bound on small files, so 4-8 workers is the sweet spot.
     const auto hw = static_cast<std::size_t>(std::thread::hardware_concurrency());
     const auto workers = std::clamp<std::size_t>(hw == 0 ? 4 : hw, 1, 8);
-    auto executor = std::make_unique<lsp::ThreadPool>(workers);
+    auto executor = std::make_unique<substrate::ThreadPool>(workers);
     lsp::LspServer server{std::move(transport), std::move(executor), cache};
     return server.run();
 }
@@ -199,6 +201,25 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     return "target spec '" + spec + "' failed to parse.";
 }
 
+// D-PERF-4-CU-PARALLELISM: worker count for the INTERNAL per-CU build pool
+// (only consulted when NO executor is injected). Never more workers than there
+// are CUs — extra workers would just block on the empty job queue. An explicit
+// `--jobs` (jobsOverride > 0) pins the count within that ceiling; auto (0) uses
+// min(hardware_concurrency, kMaxAutoWorkers) so a 64-core host doesn't spawn 64
+// threads for a handful of TUs. Only ever called on the N>1 path (cuCount >= 2).
+[[nodiscard]] std::size_t resolveCuPoolWidth(std::size_t cuCount,
+                                             unsigned    jobsOverride) noexcept {
+    constexpr std::size_t kMaxAutoWorkers = 16;
+    std::size_t const ceiling = std::max<std::size_t>(std::size_t{1}, cuCount);
+    if (jobsOverride > 0) {
+        return std::min<std::size_t>(jobsOverride, ceiling);
+    }
+    std::size_t const hw = std::thread::hardware_concurrency();
+    std::size_t const autoWidth =
+        std::min<std::size_t>(hw == 0 ? std::size_t{1} : hw, kMaxAutoWorkers);
+    return std::min<std::size_t>(autoWidth, ceiling);
+}
+
 // Compile one resolved (CU, target, format) triple to one artifact.
 // Returns true on success; emits via `reporter` on failure.
 //
@@ -216,7 +237,12 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
                                     DiagnosticReporter&    reporter,
                                     std::optional<std::filesystem::path> const& outputDir,
                                     bool                   multiTargetBuild,
-                                    CompileOptions const&  compileOpts) {
+                                    CompileOptions const&  compileOpts,
+                                    // D-PERF-4-CU-PARALLELISM: the per-CU build
+                                    // executor (nullptr ⇒ an internal pool sized
+                                    // via `jobsOverride`) + the `--jobs` override.
+                                    substrate::IExecutor*  injectedExecutor,
+                                    unsigned               jobsOverride) {
     auto parsed = TargetSpec::parse(targetSpecStr);
     if (!parsed) {
         emitDriver(reporter, DiagnosticCode::D_InvalidTargetSpec,
@@ -355,16 +381,85 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
 
     // Cycle 24/25 build-then-lower sequence. LOOP 1: build EVERY CU's MIR up front
     // (`buildCuMir` — sem→HIR→FFI→MIR→optimize), holding each `CuMirModule` (which keeps
-    // its SemanticModel — the interner owner — alive). Early-return on the FIRST CU's
-    // build failure preserves the fail-fast contract (diagnostics already reported).
-    std::vector<CuMirModule> cuMirs;
-    cuMirs.reserve(cus.size());
-    for (auto const& cu : cus) {
-        auto cuMir = buildCuMir(cu, grammar, **targetR, **formatR,
-                                ccIndex, reporter, perCuOpts);
-        if (!cuMir) return false;  // front-half tier failure already reported via `reporter`
-        cuMirs.push_back(std::move(*cuMir));
+    // its SemanticModel — the interner owner — alive).
+    //
+    // D-PERF-4-CU-PARALLELISM: for N>1, run the per-CU builds CONCURRENTLY on a thread pool.
+    // Each `buildCuMir` is a PURE per-CU function — its TypeInterner, arenas, SemanticModel,
+    // symbol table and per-CU SymbolId allocator are all private; the shipped-descriptor cache
+    // is `thread_local`; module-id counters are atomic; PhaseTimers accumulate via relaxed
+    // atomics with `thread_local` nesting. The ONE shared-mutable sink — the DiagnosticReporter
+    // — is replaced by a PER-CU scratch reporter written only by that CU's job; the scratches
+    // then drain into `reporter` in CU (index) ORDER after the join, so the diagnostic stream
+    // AND the resulting artifact are byte-deterministic regardless of thread scheduling. N==1
+    // stays INLINE (the hot single-file path: zero pool cost, diagnostics land straight in
+    // `reporter`, byte-identical + fail-FAST exactly as the pre-parallel code).
+    std::vector<std::optional<CuMirModule>> cuMirSlots(cus.size());
+    if (cus.size() <= 1) {
+        if (!cus.empty()) {
+            cuMirSlots[0] = buildCuMir(cus[0], grammar, **targetR, **formatR,
+                                       ccIndex, reporter, perCuOpts);
+            if (!cuMirSlots[0]) return false;  // front-half tier failure already reported
+        }
+    } else {
+        // Per-CU scratch reporters: inherit `reporter`'s POLICY (suppress / overrides /
+        // warningsAsErrors) but RELAX the cap/dedup axes — the run-wide cap is enforced ONCE
+        // when these drain into `reporter` below, so a per-CU cap can't asymmetrically truncate
+        // one CU's diagnostics based on which thread finished first (mirrors the per-target
+        // scratch discipline in `runCusToTargets`).
+        auto cuScratchCfg = reporter.config();
+        cuScratchCfg.maxDiagnostics = std::numeric_limits<std::size_t>::max();
+        cuScratchCfg.maxPerCode     = std::numeric_limits<std::size_t>::max();
+        cuScratchCfg.dedupWindow    = 0;
+        std::vector<DiagnosticReporter> cuScratch;
+        cuScratch.reserve(cus.size());
+        for (std::size_t i = 0; i < cus.size(); ++i) cuScratch.emplace_back(cuScratchCfg);
+
+        // Executor: the injected one (tests / a shared pool) or a fresh internal pool sized to
+        // the CU count (+ the `--jobs` override). `std::optional<ThreadPool>::emplace` builds it
+        // in place (ThreadPool is not movable); it joins its workers at end-of-scope.
+        std::optional<substrate::ThreadPool> localPool;
+        substrate::IExecutor* executor = injectedExecutor;
+        if (executor == nullptr) {
+            localPool.emplace(resolveCuPoolWidth(cus.size(), jobsOverride));
+            executor = &*localPool;
+        }
+
+        // Submit one job per CU, writing BY INDEX `i` into its own slot + scratch — no shared
+        // container is mutated, so there is nothing to lock. A `std::latch` counts completions;
+        // the RAII guard fires `count_down()` even if `buildCuMir` throws (the ThreadPool worker
+        // then logs the throw), so a throwing job can never DEADLOCK `done.wait()` — the slot
+        // just stays nullopt and fails the compile below. `i` is captured BY VALUE so each job
+        // owns its index; everything else is captured by reference and outlives `done.wait()`.
+        std::latch done{static_cast<std::ptrdiff_t>(cus.size())};
+        for (std::size_t i = 0; i < cus.size(); ++i) {
+            executor->submit([&, i] {
+                struct CountDownGuard {
+                    std::latch& latch;
+                    ~CountDownGuard() { latch.count_down(); }
+                } const guard{done};
+                cuMirSlots[i] = buildCuMir(cus[i], grammar, **targetR, **formatR,
+                                           ccIndex, cuScratch[i], perCuOpts);
+            });
+        }
+        done.wait();
+
+        // Merge each CU's diagnostics into `reporter` in CU (index) ORDER — deterministic,
+        // independent of which CU finished first. Merge EVERY CU BEFORE the failure check so a
+        // failing build surfaces every CU's errors deterministically (not just the first-to-
+        // fail's — an improvement the parallel model makes free: every CU is always built).
+        bool allBuilt = true;
+        for (std::size_t i = 0; i < cus.size(); ++i) {
+            copyDiagnostics(cuScratch[i], reporter);
+            if (!cuMirSlots[i].has_value()) allBuilt = false;
+        }
+        if (!allBuilt) return false;  // ≥1 front-half tier failure — all diagnostics reported
     }
+
+    // Collect the built modules into the in-order vector the lower/merge path below consumes
+    // (every slot is engaged here: N==1 built slot 0 inline, N>1 filled every slot + checked).
+    std::vector<CuMirModule> cuMirs;
+    cuMirs.reserve(cuMirSlots.size());
+    for (auto& slot : cuMirSlots) cuMirs.push_back(std::move(*slot));
 
     // ── D-FF1-AR-STATICLIB-DRIVER-WIRING (c171): static-library output ──
     //
@@ -423,7 +518,6 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
         return linkAndWriteStaticArchive(members, memberNames,
                                          **targetR, **formatR, outPath, reporter);
     }
-
     // N==1 (the CU5 multi-file-single-CU case): lower the sole CU + link it. UNCHANGED
     // from cycle 24 — byte-identical single-CU output. Routing N==1 through the merge
     // would re-intern CU0's types into a fresh host (a no-op for correctness, but extra
@@ -677,7 +771,11 @@ int runCusToTargets(
     std::optional<std::filesystem::path> const& outputDir,
     CompileConfig                               config,
     ::dss::opt::OptPipeline const*              pipelineOverride,
-    std::vector<std::filesystem::path> const&   resolveLibraries) {
+    std::vector<std::filesystem::path> const&   resolveLibraries,
+    // D-PERF-4-CU-PARALLELISM: the per-CU build executor (nullptr ⇒ internal
+    // pool) + the `--jobs` override, threaded verbatim to `compileOneTarget`.
+    substrate::IExecutor*                       executor,
+    unsigned                                    jobsOverride) {
     // c9: build the front-end ONCE PER DISTINCT object-format-kind among the
     // targets (≤3). A language WITHOUT a preprocess pass produces identical CUs for
     // every format (activeFormat is inert) → a single nullopt-keyed build, no
@@ -754,7 +852,8 @@ int runCusToTargets(
         bool const ok = compileOneTarget(
             std::span<CompilationUnit const>{cus.data(), cus.size()},
             grammar, sourceStem, spec, scratch,
-            outputDir, /*multiTargetBuild*/ targets.size() > 1u, compileOpts);
+            outputDir, /*multiTargetBuild*/ targets.size() > 1u, compileOpts,
+            executor, jobsOverride);
         mergeWithTargetContext(scratch, spec, rep);
         if (!ok || scratch.hasErrors()) exitCode = 1;
     }
@@ -798,6 +897,7 @@ int Program::run(int argc, char* argv[]) {
     // `--config=<debug|release>` into the kernel so the right
     // shipped pipeline gets loaded at compile_pipeline step 3.5.
     setCompileConfig(args.config);
+    setJobs(args.jobs);  // D-PERF-4-CU-PARALLELISM: --jobs N per-CU build pool width
     // c162 (D-FF1-READER-CONSUMER): thread `--resolve-library <path>` into the
     // kernel so compile_pipeline step 2.5 reads each named binary's export
     // surface to resolve + validate this run's externs. Map the CLI strings to
@@ -1170,7 +1270,7 @@ int Program::compileFiles(
         buildCus, *grammar, sourceStem, targets, rep,
         outputDir_, compileConfig_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
-        resolveLibraries_);
+        resolveLibraries_, executor_, jobs_);
 }
 
 int Program::compileUnits(
@@ -1250,7 +1350,7 @@ int Program::compileUnits(
         buildCus, *grammar, sourceStem,
         targets, rep, outputDir_, compileConfig_,
         optimizerPipelineOverride_.has_value() ? &*optimizerPipelineOverride_ : nullptr,
-        resolveLibraries_);
+        resolveLibraries_, executor_, jobs_);
 }
 
 // D-CAP-MARKER-COMPILE-DIR-PIN anchor: compileDirectory has NO

@@ -1,7 +1,7 @@
 // ThreadPool + SynchronousExecutor: basic submit/drain semantics
 // and exception isolation (a throwing job must not kill the worker).
 
-#include "lsp/thread_pool.hpp"
+#include "core/substrate/thread_pool.hpp"
 
 #include <gtest/gtest.h>
 
@@ -11,8 +11,8 @@
 #include <stdexcept>
 #include <thread>
 
-using dss::lsp::SynchronousExecutor;
-using dss::lsp::ThreadPool;
+using dss::substrate::SynchronousExecutor;
+using dss::substrate::ThreadPool;
 
 TEST(SynchronousExecutor, RunsJobInline) {
     SynchronousExecutor ex;

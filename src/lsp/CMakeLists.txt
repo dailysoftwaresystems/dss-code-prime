@@ -7,7 +7,6 @@ add_library(lsp OBJECT
     method_dispatcher.cpp
     protocol.cpp
     schema_cache.cpp
-    thread_pool.cpp
     transport.cpp
     utf16_column.cpp
 )

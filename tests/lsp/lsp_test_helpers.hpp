@@ -1,9 +1,9 @@
 #pragma once
 
+#include "core/substrate/thread_pool.hpp"
 #include "lsp/json_rpc.hpp"
 #include "lsp/lsp_server.hpp"
 #include "lsp/schema_cache.hpp"
-#include "lsp/thread_pool.hpp"
 #include "lsp/transport.hpp"
 
 #include <atomic>
@@ -101,7 +101,7 @@ public:
     LspTestHarness()
         : transport_(new InMemoryTransport{})
         , server_(std::unique_ptr<LspTransport>{transport_},
-                  std::make_unique<SynchronousExecutor>(),
+                  std::make_unique<substrate::SynchronousExecutor>(),
                   cache_)
         , exitFuture_(std::async(std::launch::async, [this] {
               return server_.run();

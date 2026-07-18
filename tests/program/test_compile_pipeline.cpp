@@ -25,6 +25,7 @@
 
 #include "analysis/compilation_unit/compilation_unit.hpp"
 #include "core/substrate/phase_timers.hpp"   // c97: per-phase --time pin
+#include "core/substrate/thread_pool.hpp"    // D-PERF-4: executor injection (pool vs synchronous)
 #include "core/types/diagnostic_reporter.hpp"
 #include "core/types/extern_import.hpp"
 #include "core/types/grammar_schema.hpp"
@@ -1912,4 +1913,160 @@ TEST(Program_CompileFiles, Alignas32ThreadLocalPAlignAndLayoutE2E) {
     std::size_t const t = static_cast<std::size_t>(pOff);
     EXPECT_EQ(bytes[t + 0], 9u);
     EXPECT_EQ(bytes[t + 4], 7u);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// D-PERF-4-CU-PARALLELISM — per-CU build parallelism: CONCURRENCY
+// correctness + DETERMINISM. compileOneTarget builds every CU's MIR up
+// front; for N>1 the builds run on a thread pool, each writing its OWN
+// result slot + scratch DiagnosticReporter, and the driver merges the
+// scratches into the run-wide reporter in CU (index) ORDER after the
+// join. These pins compare the real ThreadPool path against a
+// SynchronousExecutor (single-threaded, always CU-ordered) reference:
+// same diagnostics in the same order, and byte-identical artifacts.
+// ═══════════════════════════════════════════════════════════════════
+
+// THE load-bearing determinism pin. FOUR TUs, each with a DISTINCT
+// undeclared-identifier — a SEMANTIC error (parse-clean) whose `actual`
+// is the identifier name, so it is produced INSIDE the per-CU build loop
+// (parse errors would short-circuit before it). The pool run's diagnostic
+// stream must equal the SynchronousExecutor baseline EXACTLY and be in CU
+// (source) order.
+//
+// RED-on-disable: change the merge in compileOneTarget to completion order
+// (or drain one shared reporter from the jobs) → the pool run interleaves
+// by thread finish-time → it diverges from the always-CU-ordered
+// synchronous baseline → the vector-equality below fails.
+TEST(Program_CuParallelism, MultiTuDiagnosticsAreCuOrderedPoolVsSynchronous) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    std::vector<std::string> files;
+    for (int i = 0; i < 4; ++i) {
+        auto const body = "int f" + std::to_string(i)
+                        + "(void) { return zzundef_cu" + std::to_string(i) + "; }\n";
+        files.push_back(writeCSubsetSource(
+            scratch.path(), "cu" + std::to_string(i) + ".c", body).generic_string());
+    }
+    scratch.useAsCwd();
+
+    auto runAndCollect = [&](substrate::IExecutor* exec) {
+        Program prog;
+        prog.setExecutor(exec);
+        DiagnosticReporter rep;
+        int const rc = prog.compileUnits(
+            files, "c-subset", {"x86_64:elf64-x86_64-linux"}, rep);
+        EXPECT_NE(rc, 0) << "every CU has an undeclared identifier — must fail loud";
+        std::vector<std::pair<DiagnosticCode, std::string>> out;
+        for (auto const& d : rep.all()) out.emplace_back(d.code, d.actual);
+        return out;
+    };
+
+    substrate::SynchronousExecutor sync;
+    substrate::ThreadPool          pool{4};   // 4 workers: force real concurrency
+    auto const seq = runAndCollect(&sync);
+    auto const par = runAndCollect(&pool);
+
+    // (1) Determinism: the pool stream is element-for-element the sync stream.
+    ASSERT_EQ(seq.size(), par.size())
+        << "pool + synchronous must surface the SAME number of diagnostics";
+    EXPECT_EQ(seq, par)
+        << "pool diagnostics must match the single-threaded reference EXACTLY "
+           "— a mismatch means the merge is completion-ordered, not CU-ordered";
+
+    // (2) The four CUs' markers appear in CU (source) ORDER in the stream.
+    std::string concat;
+    for (auto const& d : par) { concat += d.second; concat += '\n'; }
+    std::size_t prev = 0;
+    for (int i = 0; i < 4; ++i) {
+        auto const pos = concat.find("zzundef_cu" + std::to_string(i));
+        ASSERT_NE(pos, std::string::npos)
+            << "CU " << i << "'s diagnostic (zzundef_cu" << i << ") is missing";
+        if (i > 0) {
+            EXPECT_GT(pos, prev)
+                << "CU " << i << "'s diagnostic must FOLLOW CU " << (i - 1)
+                << "'s — the merge order must be CU (index) order";
+        }
+        prev = pos;
+    }
+}
+
+// Byte-identical artifacts. A VALID 3-TU program of only named global
+// functions (no synthesized-symbol or timestamp bytes ⇒ the relocatable
+// ELF .o is reproducible across compiles) built via the pool + via the
+// SynchronousExecutor must produce IDENTICAL output bytes. The N>1 merge
+// folds CUs in index order and everything after it is serial, so thread
+// scheduling cannot perturb the image.
+TEST(Program_CuParallelism, MultiTuArtifactBytesIdenticalPoolVsSynchronous) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const m = writeCSubsetSource(scratch.path(), "main.c",
+        "int a(void); int b(void);\nint main(void) { return a() + b(); }\n");
+    auto const fa = writeCSubsetSource(scratch.path(), "a.c",
+        "int a(void) { return 20; }\n");
+    auto const fb = writeCSubsetSource(scratch.path(), "b.c",
+        "int b(void) { return 22; }\n");
+    scratch.useAsCwd();
+    std::vector<std::string> const files{
+        m.generic_string(), fa.generic_string(), fb.generic_string()};
+
+    auto compileTo = [&](substrate::IExecutor* exec, fs::path const& outDir) {
+        Program prog;
+        prog.setExecutor(exec);
+        prog.setOutputDir(outDir);
+        int const rc = prog.compileUnits(
+            files, "c-subset", {"x86_64:elf64-x86_64-linux"});
+        EXPECT_EQ(rc, 0) << "the 3-TU program must link + emit an artifact";
+        return readAllBytes(outDir / "main.o");
+    };
+
+    substrate::SynchronousExecutor sync;
+    substrate::ThreadPool          pool{4};
+    auto const seqBytes = compileTo(&sync, scratch.path() / "out_sync");
+    auto const parBytes = compileTo(&pool, scratch.path() / "out_pool");
+
+    ASSERT_FALSE(seqBytes.empty()) << "the artifact must be non-empty";
+    EXPECT_EQ(seqBytes, parBytes)
+        << "the pool-built image must be BYTE-IDENTICAL to the single-threaded "
+           "build — the only observable difference parallelism may introduce is "
+           "speed, never bytes";
+}
+
+// Repeat-stability (a probabilistic race catcher): the SAME multi-TU input
+// built via the pool K=20 times must yield identical artifact bytes AND a
+// clean diagnostic sequence every time. A latent data race in the per-CU
+// build would eventually perturb one of the K runs.
+TEST(Program_CuParallelism, MultiTuPoolCompileIsRepeatStable) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    auto const m = writeCSubsetSource(scratch.path(), "main.c",
+        "int a(void); int b(void); int c(void);\n"
+        "int main(void) { return a() + b() + c(); }\n");
+    auto const fa = writeCSubsetSource(scratch.path(), "a.c", "int a(void) { return 10; }\n");
+    auto const fb = writeCSubsetSource(scratch.path(), "b.c", "int b(void) { return 14; }\n");
+    auto const fc = writeCSubsetSource(scratch.path(), "c.c", "int c(void) { return 18; }\n");
+    scratch.useAsCwd();
+    std::vector<std::string> const files{
+        m.generic_string(), fa.generic_string(),
+        fb.generic_string(), fc.generic_string()};
+
+    substrate::ThreadPool pool{4};   // one pool reused across all K runs
+    auto const outDir = scratch.path() / "out";
+
+    std::vector<std::uint8_t> firstBytes;
+    for (int k = 0; k < 20; ++k) {
+        Program prog;
+        prog.setExecutor(&pool);
+        prog.setOutputDir(outDir);
+        DiagnosticReporter rep;
+        int const rc = prog.compileUnits(
+            files, "c-subset", {"x86_64:elf64-x86_64-linux"}, rep);
+        ASSERT_EQ(rc, 0) << "run " << k << " must succeed";
+        EXPECT_EQ(rep.errorCount(), 0u) << "run " << k << " must be diagnostic-clean";
+        auto const bytes = readAllBytes(outDir / "main.o");
+        ASSERT_FALSE(bytes.empty()) << "run " << k << " produced no artifact";
+        if (k == 0) {
+            firstBytes = bytes;
+        } else {
+            EXPECT_EQ(bytes, firstBytes)
+                << "run " << k << " diverged from run 0 — a data race in the "
+                   "per-CU build pool perturbed the image";
+        }
+    }
 }
