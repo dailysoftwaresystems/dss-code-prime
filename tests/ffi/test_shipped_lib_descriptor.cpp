@@ -1497,7 +1497,7 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
             if (s.name == name) return &s;
         return nullptr;
     };
-    ASSERT_EQ(desc->symbols.size(), 55u);   // C9: +39 exported Tcl functions (16 -> 55)
+    ASSERT_EQ(desc->symbols.size(), 59u);   // C13: +4 exported backers (55 -> 59): Db{Incr,Decr}RefCount, GetSlave, BackgroundError
     for (auto const* n : {"Tcl_CreateInterp", "Tcl_DeleteInterp", "Tcl_Eval",
                           "Tcl_GetObjResult", "Tcl_GetIntFromObj",
                           "Tcl_NewIntObj", "Tcl_SetObjResult", "Tcl_CreateObjCommand",
@@ -1511,12 +1511,72 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
                           "Tcl_DStringInit", "Tcl_ResetResult", "Tcl_DuplicateObj",
                           "Tcl_LinkVar", "Tcl_GetChannel"})
         EXPECT_NE(sym(n), nullptr) << "missing Tcl symbol: " << n;
-    // C9: Tcl_IncrRefCount / Tcl_DecrRefCount are macros in real tcl.h, NOT exported
-    // by libtcl8.6.so. DSS eager-imports ALL descriptor functions (even unreferenced),
-    // so listing an unexported one breaks the LOAD of every tcl binary. They are
-    // deliberately ABSENT, deferred to D-FFI-TCL-REFCOUNT-MACROS.
-    EXPECT_EQ(sym("Tcl_IncrRefCount"), nullptr) << "refcount ops must stay out (unexported by libtcl)";
-    EXPECT_EQ(sym("Tcl_DecrRefCount"), nullptr) << "refcount ops must stay out (unexported by libtcl)";
+    // C13 (D-FFI-TCL-DESCRIPTOR, dissolves D-FFI-TCL-REFCOUNT-MACROS): Tcl_IncrRefCount /
+    // Tcl_DecrRefCount are field-poking MACROS in real tcl.h that libtcl does NOT export.
+    // C9 left them out entirely (a symbol would be eager-imported and break every tcl
+    // binary's LOAD 127). C13 FLIPS that: they are now PRESENT as function-MACROS over
+    // the EXPORTED Tcl_DbIncrRefCount / Tcl_DbDecrRefCount (which do the same ++/--refCount
+    // + free) — so they stay OUT of the symbol table but are IN the macro table, and the
+    // 4 EXPORTED backers ARE symbols (eager-import-safe). Tcl_DStringValue is a new macro
+    // too. Pin BOTH invariants: refcount ops are NOT eager-imported symbols ...
+    EXPECT_EQ(sym("Tcl_IncrRefCount"), nullptr) << "refcount ops are macros, not eager-imported symbols";
+    EXPECT_EQ(sym("Tcl_DecrRefCount"), nullptr) << "refcount ops are macros, not eager-imported symbols";
+    {
+        // ... but the 4 new EXPORTED backers ARE symbols (Db{Incr,Decr}RefCount back the
+        // refcount macros; GetSlave/BackgroundError clear residual test-TU S0001). Because
+        // they are exported, eager-import stays safe (unlike the C9 macro-only attempt).
+        // RED-ON-DISABLE: drop any and the refcount macros expand to an undeclared function
+        // (S0001) or the shipped_tcl_refcount example fails to link (ld exit 127).
+        for (auto const* n : {"Tcl_DbIncrRefCount", "Tcl_DbDecrRefCount",
+                              "Tcl_GetSlave", "Tcl_BackgroundError"})
+            EXPECT_NE(sym(n), nullptr) << "missing C13 exported Tcl symbol: " << n;
+
+        // The FLIP itself: the 3 new function-macros are PRESENT (refcount ops are no
+        // longer absent from the descriptor — they resolve as macros over the Db* backers
+        // / the Tcl_DString `string` field). RED-ON-DISABLE: remove a macro from tcl.json
+        // and both its presence check and its exact-replacement check fail.
+        auto macro = [&](std::string_view name) -> ShippedMacro const* {
+            for (auto const& m : desc->macros)
+                if (m.name == name) return &m;
+            return nullptr;
+        };
+        auto const* incr = macro("Tcl_IncrRefCount");
+        ASSERT_NE(incr, nullptr) << "Tcl_IncrRefCount must now be a macro";
+        ASSERT_TRUE(incr->params.has_value());
+        ASSERT_EQ(incr->params->size(), 1u);
+        EXPECT_EQ((*incr->params)[0], "objPtr");
+        EXPECT_EQ(incr->replacement, "Tcl_DbIncrRefCount((objPtr), \"\", 0)");
+        auto const* decr = macro("Tcl_DecrRefCount");
+        ASSERT_NE(decr, nullptr) << "Tcl_DecrRefCount must now be a macro";
+        EXPECT_EQ(decr->replacement, "Tcl_DbDecrRefCount((objPtr), \"\", 0)");
+        auto const* dsv = macro("Tcl_DStringValue");
+        ASSERT_NE(dsv, nullptr) << "Tcl_DStringValue must be a macro";
+        ASSERT_TRUE(dsv->params.has_value());
+        ASSERT_EQ(dsv->params->size(), 1u);
+        EXPECT_EQ((*dsv->params)[0], "dsPtr");
+        EXPECT_EQ(dsv->replacement, "((dsPtr)->string)");
+    }
+
+    // C13: Tcl_DString gains its REAL named layout so Tcl_DStringValue's `->string` read
+    // resolves — { char *string; int length; int spaceAvl; char staticSpace[200] } = 216
+    // bytes, the same size/align as the old opaque arr<u64,27> blob. Modeled via the
+    // `structs` surface (the Tcl_CmdInfo C5 precedent). Pin `string` at slot 0 so a wrong
+    // layout (which would misread what libtcl fills at the ABI offsets) fails loud.
+    // RED-ON-DISABLE: drop the Tcl_DString struct entry (or rename `string`) and the
+    // shipped_tcl_refcount example's Tcl_DStringValue read fails to resolve.
+    {
+        ShippedStruct const* dstr = nullptr;
+        for (auto const& s : desc->structs)
+            if (s.name == "Tcl_DString") dstr = &s;
+        ASSERT_NE(dstr, nullptr) << "missing Tcl_DString struct";
+        ASSERT_EQ(dstr->fields.size(), 4u);
+        EXPECT_EQ(dstr->fields[0].name, "string");
+        EXPECT_EQ(interner.kind(dstr->fields[0].type), TypeKind::Ptr);   // char* at slot 0
+        EXPECT_EQ(dstr->fields[1].name, "length");
+        EXPECT_EQ(interner.kind(dstr->fields[1].type), TypeKind::I32);
+        EXPECT_EQ(dstr->fields[3].name, "staticSpace");
+        EXPECT_EQ(interner.kind(dstr->fields[3].type), TypeKind::Array);
+    }
 
     // C5: the Tcl_CmdInfo command-introspection struct — the FIRST field-access
     // struct (8 fields: int + 7 pointers). Pin its shape so a wrong field

@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C13 2026-07-18): RUN witness for the TCL REFCOUNT macros + the Tcl_DString named layout added to tcl.json (dissolves D-FFI-TCL-REFCOUNT-MACROS; the dominant post-C9 S0001 test-TU blocker -- test_bestindex/test_func/test_mutex use Tcl_IncrRefCount, test_tclvar Tcl_DecrRefCount, test8 Tcl_DStringValue). Tcl_Incr/DecrRefCount are field-poking macros in real tcl.h that libtcl does NOT export; libtcl DOES export Tcl_DbIncrRefCount/Tcl_DbDecrRefCount (nm -D) doing the same ++/--refCount (+free), so tcl.json models the macros as function-macros over those EXPORTED funcs (the ckalloc/ckfree precedent) -- no Tcl_Obj named-field layout, no ~30-signature ripple, and eager-import stays safe (the C9 lesson). A registered C command pins a Tcl_Obj via Tcl_IncrRefCount, reads 40 while pinned, releases via Tcl_DecrRefCount, then reads a Tcl_DString's `string` field via Tcl_DStringValue(&ds) -> ((&ds)->string) [needing Tcl_DString's REAL named layout] after appending element \"2\" -> 40+2=42; libtcl calls it back on the eval. elf-x86_64 only (tcl.json availableObjectFormats:[elf]); the CI ubuntu x86_64 legs run it (libtcl8.6 installed), native-arm64 arch-gates the run, windows/macos compile-only. RED-ON-DISABLE: remove Tcl_DbIncrRefCount/Tcl_DbDecrRefCount, the Incr/Decr/DStringValue macros, or the Tcl_DString `string` field from tcl.json -> S0001 / field-resolve failure -> fails to compile (or ld.so exit 127 if only the Db* symbol is dropped).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-refcount-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-refcount-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}
