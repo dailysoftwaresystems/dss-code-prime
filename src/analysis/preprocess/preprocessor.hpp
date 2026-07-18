@@ -175,6 +175,13 @@ struct DSS_EXPORT PreprocessResult {
     // error must still parse so the parse-level diagnostics surface.
     bool fatal = false;
 
+    // D-PERF-1 effectiveness metric: total front-splice token-moves in the macro
+    // pass; the O(n^2)->O(n) pin asserts this is <= k*N. Summed across every
+    // `spliceOver` in `MacroExpander::expand`; the front-consumed-deque rewrite
+    // keeps it LINEAR in the token count (zero for an identity pass or a TU with
+    // no macro expansions).
+    std::size_t macroTokenMoves = 0;
+
     // Build a remap closure usable by `DiagnosticReporter::remapBuffers`:
     // it rewrites any diagnostic whose buffer is the synth buffer to the
     // origin (buffer id + offset-shifted span). Diagnostics on other buffers

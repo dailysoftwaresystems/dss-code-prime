@@ -4255,3 +4255,85 @@ TEST(Preprocessor, FC179HasEmbedPreScanParityGatesQuoteInclude) {
            "skipped and the type is unresolved)";
     std::error_code ec; fsemb::remove_all(dir, ec);
 }
+
+// D-PERF-1 (macro-pass O(n^2) -> O(n)) EFFECTIVENESS PIN. The macro expander
+// consumes its stream from a FRONT-CONSUMED deque and splices only at the front,
+// so the TOTAL splice-work (`PreprocessResult::macroTokenMoves`, summing
+// `consumed + produced` over every `spliceOver`) is LINEAR in the invocation
+// count N. On a pathological macro-dense source -- one trivial object-like macro
+// invoked N times -- each `A` pops 1 (`A`) + pushes 1 (`1`) = 2 moves, so the
+// total is ~2*N. We pin it <= 8*N (generous linear headroom; the MEASURED value
+// is 2*N). RED-ON-DISABLE intent: this pins that the pass does LINEAR total
+// splice-work -- a regression that re-splices an ever-GROWING region (the
+// superlinear pattern the front-consumed deque eliminates) blows the bound. The
+// wall-clock O(n^2)->O(n) win itself (the old mid-vector erase+insert paid an
+// O(n) PHYSICAL tail-shift per call on top of the same logical count) is
+// confirmed separately by the sqlite `preprocess-expand` phase re-measure.
+TEST(Preprocessor, DPerf1MacroPassTokenMovesStayLinear) {
+    constexpr std::size_t N = 4000;
+    std::string src = "#define A 1\n";
+    src.reserve(src.size() + N * 2 + 1);
+    for (std::size_t k = 0; k < N; ++k) src += "A ";
+    src += "\n";
+
+    PreprocessResult r;
+    auto lexs = ppLexemes(std::move(src), r);
+    EXPECT_FALSE(r.diagnostics->hasErrors());
+
+    // Non-vacuous: every one of the N `A`s actually expanded to `1` (otherwise a
+    // zero-work pass would trivially satisfy the bound).
+    std::size_t ones = 0;
+    for (auto const& l : lexs)
+        if (l == "1") ++ones;
+    EXPECT_EQ(ones, N) << "each object-like `A` must expand to `1`";
+
+    // The load-bearing assertion: EXACTLY 2 front-splice token-moves per object-
+    // like expansion (pop the name `A`, push its replacement `1`) -> 2*N total,
+    // LINEAR in N. The exact count is the strongest provable property here.
+    // RED-ON-DISABLE: `tokenMoves_` is intrinsic to the D-PERF-1 deque splice;
+    // reverting `spliceOver` to the pre-D-PERF-1 `std::vector` erase+insert removes
+    // it (the counter lives inside the deque splice), so macroTokenMoves -> 0 and
+    // this EQ fails (0 != 2*N). A logical op-counter
+    // cannot by itself distinguish the deque's O(n) front-splice from a
+    // same-formula vector mid-splice; the PHYSICAL O(n^2)->O(n) tail-shift win is
+    // proven separately by the sqlite `preprocess-expand` phase re-measure
+    // (~4.3s -> ~3.3s this cycle) + the independently-audited front-consumed design.
+    EXPECT_EQ(r.macroTokenMoves, 2 * N)
+        << "the macro pass must do exactly 2 front-splice moves per expansion "
+           "(2*N total, linear); got " << r.macroTokenMoves << " for N=" << N;
+}
+
+// AUDIT FIX #1 correctness pin (the one silent-miscompile seam of the deque
+// rewrite). A function-like macro invoked with the WRONG arity fails loud, emits
+// the NAME verbatim, and DROPS the whole malformed `(...)` call -- while any
+// TRAILING tokens after the call survive. In the front-consumed-deque model the
+// arity-bad arm must pop `past` tokens TOTAL off the front (the name + the
+// malformed call); a no-op (or popping only the name) would re-scan/re-expand
+// the dropped args -- a SILENT divergence (and, for a pure no-op, an infinite
+// loop). RED-ON-DISABLE: revert the arm to leave the malformed args on the
+// stream and `(`, `1`, `)` leak into the output (or the pass hangs) -- either
+// way `lexs` is no longer exactly {M, tail_ok}.
+TEST(Preprocessor, ArityMismatchDropsMalformedCallKeepsTrailingTokens) {
+    PreprocessResult r;
+    // M expects 2 args; invoked with 1 -> arity mismatch. `tail_ok` trails the
+    // malformed call and must survive.
+    auto lexs = ppLexemes("#define M(a,b) a b\nM(1) tail_ok\n", r);
+
+    // (1) the arity diagnostic fires.
+    EXPECT_TRUE(hasPPCode(r, DiagnosticCode::P_PreprocessorMacroArgument))
+        << "a 2-parameter macro called with 1 argument must fail loud";
+
+    // (2)+(3)+(4): exactly `M tail_ok` reaches the parser -- the name survives,
+    // the `(1)` is dropped, `tail_ok` survives AFTER it.
+    ASSERT_EQ(lexs.size(), 2u)
+        << "expected exactly {M, tail_ok}: the malformed (1) must be dropped and "
+           "tail_ok must survive";
+    EXPECT_EQ(lexs[0], "M") << "the macro name must be emitted verbatim";
+    EXPECT_EQ(lexs[1], "tail_ok") << "the trailing token must survive the drop";
+    // The dropped call must not leak a single token.
+    for (auto const& l : lexs) {
+        EXPECT_NE(l, "(") << "the malformed call's `(` leaked";
+        EXPECT_NE(l, "1") << "the malformed call's arg leaked";
+        EXPECT_NE(l, ")") << "the malformed call's `)` leaked";
+    }
+}

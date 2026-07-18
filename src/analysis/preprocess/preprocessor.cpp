@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <iterator>
@@ -1319,6 +1320,16 @@ public:
     // TRUE iff a fatal nesting-backstop truncated the expansion.
     [[nodiscard]] bool truncated() const noexcept { return truncated_; }
 
+    // D-PERF-1 effectiveness metric: the total FRONT-splice token-moves the macro
+    // pass performed -- `(consumed + produced)` summed across every `spliceOver`.
+    // With the front-consumed deque each splice's PHYSICAL cost IS exactly this
+    // (pop_front the consumed run + push_front the replacement), so the metric is
+    // the pass's real splice work and stays LINEAR in the token count; a strict
+    // test pins it <= k*N. (The old mid-vector erase+insert did the SAME logical
+    // token-moves but ALSO shifted the whole tail per call -- the O(n^2) wall-clock
+    // the deque removes.) Surfaced onto `PreprocessResult::macroTokenMoves`.
+    [[nodiscard]] std::size_t tokenMoves() const noexcept { return tokenMoves_; }
+
     // c17 (D-PP-CONDITIONAL-INCLUDE-ORDERING, authoritative dead-regions): the
     // dead conditional byte ranges this pass recorded (see `deadRanges_`).
     // `preprocess()` consults them to suppress a `P_IllegalChar` whose source
@@ -2245,7 +2256,7 @@ private:
     // newlines (`FOO\n(1)` is a valid call: once the directive line itself is
     // stripped, C 6.10.3p10/p11 treat the name and the `(` as adjacent across
     // white space, including line breaks). Returns in.size() if none.
-    static std::size_t nextSignificant(std::span<ExpToken const> in,
+    static std::size_t nextSignificant(std::deque<ExpToken> const& in,
                                        std::size_t from) {
         std::size_t j = from;
         while (j < in.size()
@@ -2286,7 +2297,7 @@ private:
     // macro NAME's hide set with the CLOSE paren's). On EOF before the matching
     // close, emits a fail-loud diagnostic and returns std::nullopt.
     std::optional<std::vector<std::vector<ExpToken>>>
-    collectArgs(std::span<ExpToken const> in, std::size_t open,
+    collectArgs(std::deque<ExpToken> const& in, std::size_t open,
                 std::string const& macroName, std::size_t& past,
                 std::vector<ExpToken>& separators, HideSet& closeHide) {
         std::vector<std::vector<ExpToken>> args;
@@ -2870,10 +2881,30 @@ private:
             truncated_ = true;   // stream is now truncated — PP fatal
             return in;
         }
-        std::size_t i = 0;
-        while (i < in.size()) {
-            ExpToken const& t = in[i];
-            if (!isWord(t.tok)) { out.push_back(t); ++i; continue; }
+        // D-PERF-1: the working stream is a FRONT-CONSUMED deque -- the cursor is
+        // ALWAYS the front. The loop consumes `work` strictly front-to-back and
+        // every splice happens AT the front (`spliceOver(work, 0, ...)`), so a
+        // pop_front + push_front is O(consumed + repl) per expansion instead of the
+        // O(n) mid-vector tail-shift the old `std::vector` cursor paid PER
+        // expansion -> the O(n^2) macro pass is gone. `out` still accumulates the
+        // passed-over tokens IN ORDER (byte-identical output). (The backstop above
+        // still reads/returns the vector `in`, so its truncation semantics stay
+        // exactly as before; `in` is moved-FROM here and not touched again.)
+        std::deque<ExpToken> work(std::make_move_iterator(in.begin()),
+                                  std::make_move_iterator(in.end()));
+        while (!work.empty()) {
+            // Audit fix #2 (UAF ordering): COPY the front token before any
+            // pop/splice below -- `t.tok`, `t.hide`, `t.invOffset`, `t.tok.span`
+            // and `name` must all stay valid across the pop_front/push_front that
+            // `spliceOver` (or the emit-then-pop arms) perform on `work`. A
+            // REFERENCE into `work.front()` would dangle the instant the front is
+            // popped.
+            ExpToken t = work.front();
+            if (!isWord(t.tok)) {
+                out.push_back(std::move(t));
+                work.pop_front();
+                continue;
+            }
             const std::string name{text(t.tok)};
             auto it = table_.find(name);
             // Not a `#define`d macro, OR M is in THIS token's hide set (Prosser:
@@ -2904,12 +2935,12 @@ private:
                         for (Token const& v : value) {
                             repl.push_back(ExpToken{v, t.hide, t.invOffset});
                         }
-                        spliceOver(in, i, i + 1, repl);
+                        spliceOver(work, 0, 1, repl);
                         continue;   // rescan from the materialized value
                     }
                 }
-                out.push_back(t);
-                ++i;
+                out.push_back(std::move(t));
+                work.pop_front();
                 continue;
             }
             MacroDef const& def = it->second;
@@ -2937,28 +2968,28 @@ private:
                 // (`#define OBJ a ##`). `#` (stringize) does NOT apply to object-like
                 // macros (C 6.10.3.2) and there is none to handle here.
                 repl = collapsePastes(std::move(repl), hs, t.invOffset);
-                spliceOver(in, i, i + 1, repl);
+                spliceOver(work, 0, 1, repl);
                 continue;          // rescan from i (the first replacement token)
             }
             // FUNCTION-like: an invocation ONLY if the next significant token is
             // the configured `(`. Otherwise emit the name VERBATIM (C 6.10.3p10:
             // a function-like name not followed by `(` is not an invocation).
-            std::size_t openIdx = nextSignificant(in, i + 1);
-            if (openIdx >= in.size() || !isParenOpen(in[openIdx].tok)) {
-                out.push_back(t);
-                ++i;
+            std::size_t openIdx = nextSignificant(work, 1);
+            if (openIdx >= work.size() || !isParenOpen(work[openIdx].tok)) {
+                out.push_back(std::move(t));
+                work.pop_front();
                 continue;
             }
             std::size_t past = 0;
             std::vector<ExpToken> separators;  // depth-1 commas (for __VA_ARGS__)
             HideSet closeHide;                 // close-paren hide set (Prosser ∩)
             auto argsOpt =
-                collectArgs(in, openIdx, name, past, separators, closeHide);
+                collectArgs(work, openIdx, name, past, separators, closeHide);
             if (!argsOpt) {
                 // Unterminated invocation already reported: emit the name as-is
                 // and resume after it (do NOT swallow the rest of the stream).
-                out.push_back(t);
-                ++i;
+                out.push_back(std::move(t));
+                work.pop_front();
                 continue;
             }
             std::vector<std::vector<ExpToken>> args = std::move(*argsOpt);
@@ -2991,8 +3022,16 @@ private:
                            + std::to_string(def.params.size())
                            + " argument(s) but got "
                            + std::to_string(args.size()));
-                out.push_back(t);
-                i = past;     // skip past the malformed call close paren
+                // Audit fix #1 (the silent-miscompile seam): emit the name, then
+                // pop `past` tokens TOTAL off the front -- the name at index 0 PLUS
+                // the malformed `(...)` in `[1, past)` -- pushing NOTHING back. The
+                // old vector code did `i = past` (advance the cursor past the whole
+                // malformed call). In the deque model that MUST become an explicit
+                // pop of `past` front tokens; leaving it a no-op (or popping only
+                // the name) would re-scan/re-expand the malformed args -> a SILENT
+                // divergence from the byte-identical output.
+                out.push_back(std::move(t));
+                for (std::size_t k = 0; k < past; ++k) work.pop_front();
                 continue;
             }
             // The Prosser function-like hide set:
@@ -3068,22 +3107,27 @@ private:
             // RESCAN from i: the invoked macro M is in every substituted token's
             // hide set, so a self-reference is frozen; a function-like name newly
             // exposed at the substitution's tail re-pairs with the parent's `(`.
-            spliceOver(in, i, past, substituted);
-            // resume at i (rescan the substitution + the trailing parent stream)
+            spliceOver(work, 0, past, substituted);
+            continue;   // rescan the substitution + the trailing parent stream
         }
         return out;
     }
 
     // Replace `in[from, to)` with `repl` (the freshly produced tokens) and leave
-    // the cursor implicitly at `from` for a rescan. Both regions can be large;
-    // a vector splice (erase + insert) is the textbook realization and the
-    // rewritten-token volume is bounded by the hide set, so this is fine.
-    static void spliceOver(std::vector<ExpToken>& in, std::size_t from,
-                           std::size_t to, std::vector<ExpToken> const& repl) {
-        in.erase(in.begin() + static_cast<std::ptrdiff_t>(from),
-                 in.begin() + static_cast<std::ptrdiff_t>(to));
-        in.insert(in.begin() + static_cast<std::ptrdiff_t>(from),
-                  repl.begin(), repl.end());
+    // the cursor implicitly at `from` (== the FRONT) for a rescan. D-PERF-1: the
+    // stream is a FRONT-CONSUMED deque and the cursor is ALWAYS the front, so
+    // every call site passes `from == 0`. Pop `[from, to)` off the front, then
+    // push `repl` at the front in REVERSE so `repl[0]` becomes the new front (the
+    // rescan continues there). FRONT ops only -> O(repl + consumed) per expansion,
+    // NOT the O(n) mid-vector tail-shift the old vector erase+insert paid PER
+    // expansion -> the O(n^2) macro pass is gone. Non-`static` so it can bump the
+    // effectiveness counter. (`from` is always 0; the loop-form pop keeps this
+    // general + correct — no hard assert that could fire in a release build.)
+    void spliceOver(std::deque<ExpToken>& in, std::size_t from, std::size_t to,
+                    std::vector<ExpToken> const& repl) {
+        for (std::size_t k = from; k < to; ++k) in.pop_front();
+        for (auto it = repl.rbegin(); it != repl.rend(); ++it) in.push_front(*it);
+        tokenMoves_ += (to - from) + repl.size();
     }
 
     std::shared_ptr<SourceBuffer>        synth_;
@@ -3093,6 +3137,8 @@ private:
     // RETURNS the input verbatim (truncating the expansion). Surfaced via
     // `truncated()` so `preprocess()` can flag the result fatal.
     bool                                 truncated_ = false;
+    // D-PERF-1: accumulated FRONT-splice token-move count (see `tokenMoves()`).
+    std::size_t                          tokenMoves_ = 0;
     SchemaTokenId                        hashKind_{};
     SchemaTokenId                        parenOpen_{};
     SchemaTokenId                        parenClose_{};
@@ -3326,6 +3372,9 @@ PreprocessResult preprocess(
         substrate::PhaseTimers::Scope ppExpand{
             substrate::CompilePhase::PreprocessExpand};
         finalTokens = expander.run(synthTokens);
+        // D-PERF-1: surface the macro pass's front-splice token-move total (the
+        // O(n^2)->O(n) effectiveness metric; a strict test asserts it <= k*N).
+        result.macroTokenMoves = expander.tokenMoves();
     }
     // OR in the macro-expansion truncation; the SynthBuilder already wrote
     // `result.fatal` by reference for an include-nesting truncation.
