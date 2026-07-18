@@ -133,10 +133,11 @@ TEST(SpirvLinkerDispatch, RoutesSpirvKindToWalker) {
     EXPECT_EQ(readU32LE(img.bytes, 0), 0x07230203u);
 }
 
-TEST(SpirvLinkerDispatch, EmptyModuleProducesHeaderButOkIsFalse) {
-    // Mirrors WASM's `bytes ≠ {} ∧ ok() == false` invariant:
-    // the 20-byte header is valid output but ok() requires
-    // expectedFuncCount > 0. Plan 17 lifts when functions populate.
+TEST(SpirvLinkerDispatch, EmptyModuleProducesHeaderAndOkIsTrue) {
+    // Mirrors WASM's empty-module invariant: the 20-byte SPIR-V header is
+    // valid output, and an empty module (0 functions) is a VALID success
+    // (0 == 0) — D-CSUBSET-TESTTU-SILENT-EXIT1. RED-ON-DISABLE: restoring the
+    // `expectedFuncCount > 0` clause in LinkedImage::ok() flips this to false.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped("spirv-1.6");
@@ -146,7 +147,7 @@ TEST(SpirvLinkerDispatch, EmptyModuleProducesHeaderButOkIsFalse) {
     LinkedImage img = linker::link(mod, **target, **fmt, rep);
     EXPECT_EQ(rep.errorCount(), 0u);
     EXPECT_EQ(img.bytes.size(), 20u);
-    EXPECT_FALSE(img.ok());
+    EXPECT_TRUE(img.ok());
 }
 
 // ── Failure modes (substrate discipline) ─────────────────────────────

@@ -52,7 +52,12 @@ TEST(AsmSubstrate, EmptyLirProducesEmptyAssembledModule) {
     auto result = assemble(empty, **schema, {}, rep);
     EXPECT_TRUE(result.functions.empty());
     EXPECT_EQ(result.expectedFuncCount, 0u);
-    EXPECT_FALSE(result.ok());
+    // D-CSUBSET-TESTTU-SILENT-EXIT1: an empty module is a VALID success
+    // (0 == 0) — a declaration-only TU lowers to a valid empty relocatable
+    // object. RED-ON-DISABLE: restoring the `expectedFuncCount > 0` clause in
+    // AssembledModule::ok() makes this false again (and silently rejects the
+    // whole compile of any declaration-only TU).
+    EXPECT_TRUE(result.ok());
     EXPECT_EQ(rep.errorCount(), 0u);
 }
 
@@ -367,13 +372,15 @@ TEST(AsmSubstrate, AssembledModuleOkIsParallelIndexShapeCheck) {
     // ok() is the SHAPE check (parallel-index intact), not the
     // SUCCESS check (no encoding errors). Callers that need
     // "every byte encoded successfully" must also check
-    // reporter.errorCount() == 0. Pin BOTH the happy-path shape
-    // AND the broken-shape — a function-count of 0 (default-
-    // constructed module) and a partial run (expectedFuncCount
-    // populated but functions vector shorter) must both report
-    // not-ok.
+    // reporter.errorCount() == 0. Pin the happy-path shape, the
+    // valid-EMPTY shape, AND the broken shape: a MISMATCH
+    // (expectedFuncCount populated but functions vector shorter)
+    // reports not-ok, while a genuinely EMPTY module (0 == 0) is a
+    // VALID success (D-CSUBSET-TESTTU-SILENT-EXIT1).
     AssembledModule empty;
-    EXPECT_FALSE(empty.ok());
+    // RED-ON-DISABLE: restoring `expectedFuncCount > 0` in
+    // AssembledModule::ok() flips this back to false (the silent-reject bug).
+    EXPECT_TRUE(empty.ok()) << "empty (0 == 0) is a valid empty relocatable object";
 
     AssembledModule populated;
     populated.functions.resize(2);
@@ -388,8 +395,8 @@ TEST(AsmSubstrate, AssembledModuleOkIsParallelIndexShapeCheck) {
     AssembledModule expectedZero;
     expectedZero.functions.resize(0);
     expectedZero.expectedFuncCount = 0;
-    EXPECT_FALSE(expectedZero.ok())
-        << "empty input is not 'ok' — caller distinguishes via expectedFuncCount";
+    EXPECT_TRUE(expectedZero.ok())
+        << "0 == 0 is a valid empty module (a declaration-only TU)";
 }
 
 // ── Substrate surface: cycle-1 fail-loud diagnostics ──────────────────

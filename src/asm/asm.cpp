@@ -163,9 +163,11 @@ AssembledModule assemble(Lir const&                 lir,
     result.expectedFuncCount = funcCount;
 
     // Empty-in is empty-out without error: a default-constructed `Lir`
-    // legitimately produces a zero-function module (e.g. a parse that
-    // emitted no top-level functions). Callers that need a non-empty
-    // result MUST check `ok()` — which returns false here.
+    // legitimately produces a zero-function module (e.g. a declaration-only
+    // TU that emitted no top-level function definitions). This is a VALID
+    // success — `ok()` returns true (0 == 0) and the module lowers to a valid
+    // empty relocatable object (D-CSUBSET-TESTTU-SILENT-EXIT1). Callers that
+    // specifically require a NON-EMPTY module must check `!functions.empty()`.
     if (funcCount == 0) {
         return result;
     }

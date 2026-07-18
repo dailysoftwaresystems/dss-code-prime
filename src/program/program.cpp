@@ -393,12 +393,34 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     // AND the resulting artifact are byte-deterministic regardless of thread scheduling. N==1
     // stays INLINE (the hot single-file path: zero pool cost, diagnostics land straight in
     // `reporter`, byte-identical + fail-FAST exactly as the pre-parallel code).
+    // D-CSUBSET-TESTTU-SILENT-EXIT1 fail-loud net: snapshot the reporter's error
+    // count BEFORE the per-CU build/lower. Every genuine tier failure reports its
+    // own K_/L_/A_/S_/H_ diagnostic; if a per-CU build (`buildCuMir`) or the
+    // back-half lower (`lowerCuMirToAssembly`) returns a NULL module without any
+    // new diagnostic, that is a substrate-contract violation (the D-PERF-4
+    // buildCuMir-null contract) — emit `D_CompileUnitNullNoDiagnostic` so the
+    // driver never exits 1 with ZERO output. A no-op on the happy path and on
+    // every genuine (already-reported) failure. Mirrors the optimizer's
+    // X_OptReturnFalseWithoutDiagnostic belt-and-suspenders guard.
+    auto const errorsBeforeCuBuild = reporter.errorCount();
+    auto const emitNullNoDiagnostic = [&](char const* where) {
+        if (reporter.errorCount() == errorsBeforeCuBuild) {
+            emitDriver(reporter, DiagnosticCode::D_CompileUnitNullNoDiagnostic,
+                       std::string{"internal: "} + where
+                           + " returned a null module without reporting any "
+                             "diagnostic — substrate-contract violation "
+                             "(D-CSUBSET-TESTTU-SILENT-EXIT1 fail-loud net).");
+        }
+    };
     std::vector<std::optional<CuMirModule>> cuMirSlots(cus.size());
     if (cus.size() <= 1) {
         if (!cus.empty()) {
             cuMirSlots[0] = buildCuMir(cus[0], grammar, **targetR, **formatR,
                                        ccIndex, reporter, perCuOpts);
-            if (!cuMirSlots[0]) return false;  // front-half tier failure already reported
+            if (!cuMirSlots[0]) {              // front-half tier failure already reported
+                emitNullNoDiagnostic("per-CU build (buildCuMir)");
+                return false;
+            }
         }
     } else {
         // Per-CU scratch reporters: inherit `reporter`'s POLICY (suppress / overrides /
@@ -452,7 +474,10 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
             copyDiagnostics(cuScratch[i], reporter);
             if (!cuMirSlots[i].has_value()) allBuilt = false;
         }
-        if (!allBuilt) return false;  // ≥1 front-half tier failure — all diagnostics reported
+        if (!allBuilt) {
+            emitNullNoDiagnostic("a per-CU build (buildCuMir)");
+            return false;  // ≥1 front-half tier failure — all diagnostics reported
+        }
     }
 
     // Collect the built modules into the in-order vector the lower/merge path below consumes
@@ -525,7 +550,10 @@ void mergeWithTargetContext(DiagnosticReporter const& src,
     if (cuMirs.size() == 1) {
         auto mod = lowerCuMirToAssembly(cuMirs[0], (*formatR)->processArgs(),
                                         (*formatR)->kind(), reporter);
-        if (!mod) return false;  // back-half tier failure already reported via `reporter`
+        if (!mod) {              // back-half tier failure already reported via `reporter`
+            emitNullNoDiagnostic("back-half lower (lowerCuMirToAssembly)");
+            return false;
+        }
         // c165 (D-LK-STATIC-LINK): link against any `ar` static archives named on
         // `--resolve-library` (pull the referenced members + merge them in). With
         // no static archives this is `linkAndWrite({mod})`, unchanged.

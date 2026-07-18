@@ -3990,7 +3990,13 @@ materializeCallingConvention(Lir const&           src,
             }
         }
     }
-    // `ok()` is derived from output shape — no stored bool to drift.
+    // Reached ONLY on full success: every failure path above returns early
+    // (an empty/partial result), so this is the single point that marks the
+    // pass complete. `ok()` = allFunctionsLaidOut && (perFunc.size() ==
+    // moduleFuncCount()); the flag distinguishes a genuinely EMPTY module
+    // (a valid 0-function success — D-CSUBSET-TESTTU-SILENT-EXIT1) from a
+    // failure that also returned an empty module (0 == 0).
+    out.allFunctionsLaidOut = true;
     return out;
 }
 

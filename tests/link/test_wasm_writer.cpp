@@ -175,16 +175,15 @@ TEST(WasmLinkerDispatch, RoutesWasmKindToWalker) {
     EXPECT_EQ(img.bytes[4], 0x01u);
 }
 
-TEST(WasmLinkerDispatch, EmptyModuleProducesPreambleButOkIsFalse) {
-    // pr-test-analyzer Gap 5 fold (refined): the universal linker
-    // contract `LinkedImage::ok() == (expectedFuncCount > 0 &&
-    // resolvedFuncCount == expectedFuncCount)` holds for WASM
-    // skeletons — `ok() == false` when expectedFuncCount == 0
-    // even though bytes are non-empty (the 8-byte preamble).
-    // WASM is the ONLY format today where `bytes.size() > 0` and
-    // `ok() == false` can co-exist; pin this invariant so a
-    // future caller doesn't conflate "got bytes" with "successful
-    // link." Plan 18 will lift this once functions populate.
+TEST(WasmLinkerDispatch, EmptyModuleProducesPreambleAndOkIsTrue) {
+    // The universal linker contract is `LinkedImage::ok() ==
+    // (resolvedFuncCount == expectedFuncCount)`. An empty module (0 functions,
+    // e.g. a declaration-only TU) is a VALID success (0 == 0) — it links to a
+    // valid empty module (the 8-byte WASM preamble here) — matching gcc/clang
+    // emitting a valid empty relocatable object (D-CSUBSET-TESTTU-SILENT-EXIT1).
+    // RED-ON-DISABLE: restoring the `expectedFuncCount > 0` clause in
+    // LinkedImage::ok() flips this back to false and silently rejects the
+    // whole compile of any declaration-only TU.
     auto target = TargetSchema::loadShipped("x86_64");
     ASSERT_TRUE(target.has_value());
     auto fmt = ObjectFormatSchema::loadShipped("wasm32-v1");
@@ -197,11 +196,10 @@ TEST(WasmLinkerDispatch, EmptyModuleProducesPreambleButOkIsFalse) {
     EXPECT_EQ(img.bytes.size(), 8u);
     EXPECT_EQ(img.resolvedFuncCount, 0u);
     EXPECT_EQ(img.expectedFuncCount, 0u);
-    EXPECT_FALSE(img.ok())
-        << "ok() requires expectedFuncCount > 0; WASM-preamble-only "
-           "output has expectedFuncCount=0, so ok() is false even "
-           "though bytes are non-empty. This is the WASM-specific "
-           "(bytes ≠ {} ∧ ok() == false) case.";
+    EXPECT_TRUE(img.ok())
+        << "an empty module (0 == 0) is a valid empty link — the 8-byte WASM "
+           "preamble is valid output; ok() no longer requires "
+           "expectedFuncCount > 0 (D-CSUBSET-TESTTU-SILENT-EXIT1).";
 }
 
 // ── Failure modes (substrate discipline) ─────────────────────────────

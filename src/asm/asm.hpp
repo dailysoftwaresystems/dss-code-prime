@@ -467,15 +467,22 @@ struct DSS_EXPORT AssembledModule {
     // (entryPoint or functions[0]). Set ⇒ load-bearing.
     std::optional<SymbolId>        userEntrySymbol;     // SymbolId of user-written entry fn
 
-    // Derived: true iff `assemble()` ran on a non-empty LIR module AND
-    // every function received its parallel-index slot. The reporter
-    // separately tracks whether per-instruction encoding errors were
-    // emitted; `ok()` is the SHAPE check, NOT the encoding-success
-    // check. Callers that need "every byte successfully encoded" must
-    // also consult `reporter.errorCount() == 0` (per the cycle-3a
-    // separation of concerns).
+    // Derived: true iff every function received its parallel-index slot —
+    // `functions.size() == expectedFuncCount`. The reporter separately tracks
+    // whether per-instruction encoding errors were emitted; `ok()` is the
+    // SHAPE check, NOT the encoding-success check. Callers that need "every
+    // byte successfully encoded" must also consult `reporter.errorCount() == 0`
+    // (per the cycle-3a separation of concerns). An EMPTY module (0 functions —
+    // a declaration-only / all-preprocessed-out TU) is a VALID success (0 == 0):
+    // `assemble()` returns empty-in ⇒ empty-out and the module lowers to a valid
+    // empty relocatable object, matching gcc/clang. The earlier
+    // `expectedFuncCount > 0` clause wrongly forced ok()==false, silently
+    // rejecting the whole compile (D-CSUBSET-TESTTU-SILENT-EXIT1). A genuine
+    // shape failure (the lirToMir-size-mismatch path leaves expectedFuncCount=N>0
+    // with `functions` empty) is still caught by the count mismatch (0 != N) —
+    // and that path also reports A_LirToMirSizeMismatch.
     [[nodiscard]] bool ok() const noexcept {
-        return expectedFuncCount > 0 && functions.size() == expectedFuncCount;
+        return functions.size() == expectedFuncCount;
     }
 
     // Find an `AssembledFunction` by position in the OUTPUT module.

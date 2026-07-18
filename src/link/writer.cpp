@@ -75,9 +75,12 @@ bool writeImage(LinkedImage const&             image,
                    "before calling writeImage.");
         return false;
     }
-    // The `ok()` check requires expectedFuncCount > 0 AND
-    // resolvedFuncCount == expectedFuncCount; if ok() returned
-    // true but bytes are empty, the walker is contract-broken.
+    // The `ok()` check requires resolvedFuncCount == expectedFuncCount
+    // (0 == 0 for a valid EMPTY module); if ok() returned true but bytes
+    // are empty, the walker is contract-broken. This is the load-bearing
+    // guard for the empty-module case: even a declaration-only TU (0
+    // functions) must still produce real object bytes — a valid header +
+    // section table — never zero bytes (D-CSUBSET-TESTTU-SILENT-EXIT1).
     // Surface here.
     if (image.bytes.empty()) {
         emit(reporter, DiagnosticCode::K_ImageEmpty,

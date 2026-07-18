@@ -1024,6 +1024,15 @@ LinkedImage link(std::span<AssembledModule const> modules,
     // violation. Same shape as the pre-walker gate above.
     if (reporter.errorCount() != errorsAtEntry) {
         image.resolvedFuncCount = 0;
+    } else {
+        // Clean conclusion: the walker produced bytes with no new diagnostic.
+        // This is the ONLY point that marks the link successful — every failure
+        // early-return above returns before here, leaving `linkedCleanly`
+        // false. It distinguishes a genuinely EMPTY module (a valid 0-function
+        // success — D-CSUBSET-TESTTU-SILENT-EXIT1) from a failure that also
+        // ended with `resolvedFuncCount == expectedFuncCount == 0` (e.g. the
+        // undefined-extern early-return at :610-611).
+        image.linkedCleanly = true;
     }
 
     return image;

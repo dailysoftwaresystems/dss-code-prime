@@ -168,6 +168,61 @@ TEST(Program_CompileFiles, ZeroArgFunctionWiresThroughPipeline) {
     EXPECT_EQ(hdr[3], 'F');
 }
 
+// ── D-CSUBSET-TESTTU-SILENT-EXIT1: a declaration-only / empty TU ─────
+//
+// A translation unit with NO function or object DEFINITIONS (empty after
+// preprocessing — only declarations, or all `#if 0`'d out) MUST compile to a
+// VALID EMPTY relocatable object and exit 0, exactly as gcc/clang do. SQLite's
+// testfixture depends on this: several `#if defined(SQLITE_TEST)`-gated test
+// TUs (test_wsd.c, test6.c, …) are empty in a standard build, yet their `.o`
+// files must still be produced and linked. Before the fix such a TU SILENTLY
+// exited 1 with ZERO diagnostics — a fail-loud violation AND wrong behavior —
+// because four sequential `expectedFuncCount > 0` gates (legalize → callconv →
+// assemble → link) each rejected the 0-function module.
+//
+// RED-ON-DISABLE: restore ANY of the four `> 0` clauses (in
+// LirTwoAddrLegalizeResult / LirCallconvResult / AssembledModule / LinkedImage
+// ::ok()) — or drop the empty early-return's `allFunctionsLegalized = true` in
+// legalizeTwoAddress — and this test fails: `compileFiles` returns 1 and NO
+// `.o` is written.
+TEST(Program_CompileFiles, EmptyDeclOnlyTuEmitsValidEmptyObject) {
+    ScratchDir scratch{Location::InsideRepo, "program"};
+    // A declaration-only TU: an extern DATA declaration (not a definition)
+    // plus an all-`#if 0`'d-out block. NOTHING is defined ⇒ 0 functions.
+    auto const src = writeCSubsetSource(
+        scratch.path(), "decl_only.c",
+        "extern int shared_counter;   /* a declaration, not a definition */\n"
+        "#if 0\n"
+        "int never_compiled = 1;      /* preprocessed out */\n"
+        "#endif\n");
+    scratch.useAsCwd();
+
+    Program prog;
+    int const rc = prog.compileFiles(
+        {src.generic_string()},
+        "c-subset",
+        {"x86_64:elf64-x86_64-linux"});
+
+    ASSERT_EQ(rc, 0)
+        << "an empty/declaration-only TU must compile to a valid empty "
+           "relocatable object and exit 0 (D-CSUBSET-TESTTU-SILENT-EXIT1)";
+
+    auto const outDir = scratch.path() / "target" / "elf64-x86_64-linux";
+    auto const out    = outDir / "decl_only.o";
+    ASSERT_TRUE(fs::exists(out)) << "the empty object must be emitted";
+    ASSERT_GT(fs::file_size(out), 0u)
+        << "even an empty module yields a real ELF (header + section table), "
+           "never zero bytes";
+    // Valid ELF magic — a real relocatable object the system linker accepts.
+    std::ifstream in(out, std::ios::binary);
+    char hdr[4] = {0};
+    in.read(hdr, 4);
+    EXPECT_EQ(static_cast<unsigned char>(hdr[0]), 0x7Fu);
+    EXPECT_EQ(hdr[1], 'E');
+    EXPECT_EQ(hdr[2], 'L');
+    EXPECT_EQ(hdr[3], 'F');
+}
+
 // ── c97: per-phase --time accumulators ─────────────────────────
 //
 // Pin for the PhaseTimers substrate the `--time` report reads: after ONE

@@ -235,7 +235,14 @@ TEST(LirTwoAddrLegalize, EmptyModuleProducesEmptyModule) {
     Lir empty{};
     DiagnosticReporter rep;
     auto r = legalizeTwoAddress(empty, *f.schema, rep);
-    EXPECT_FALSE(r.ok());
+    // D-CSUBSET-TESTTU-SILENT-EXIT1: an empty module (a declaration-only TU)
+    // legalizes to nothing and is a VALID success (0 == 0, allFunctionsLegalized
+    // vacuously true). RED-ON-DISABLE: restoring the `expectedFuncCount > 0`
+    // clause in LirTwoAddrLegalizeResult::ok(), OR dropping the
+    // `allFunctionsLegalized = true` from the pass's empty early-return, flips
+    // this back to false and silently rejects the whole compile.
+    EXPECT_TRUE(r.ok());
+    EXPECT_EQ(r.expectedFuncCount, 0u);
     EXPECT_EQ(rep.errorCount(), 0u);
 }
 
@@ -413,9 +420,17 @@ TEST(LirTwoAddrLegalize, BlockRefRemapAcrossBlocks) {
 }
 
 TEST(LirTwoAddrLegalize, OkIsFalseWhenExpectedFuncCountMismatches) {
-    // Convergence-fix B: ok() now derives from expectedFuncCount,
-    // matching the LirCallconvResult discipline.
-    LirTwoAddrLegalizeResult empty;
-    EXPECT_FALSE(empty.ok());
-    EXPECT_EQ(empty.expectedFuncCount, 0u);
+    // ok() = parallel-index invariant (moduleFuncCount() == expectedFuncCount)
+    // AND allFunctionsLegalized, matching the LirCallconvResult discipline. A
+    // genuine SHAPE mismatch (claimed N functions but the rebuild produced a
+    // different count) is not-ok even with allFunctionsLegalized set. (A
+    // genuinely EMPTY result, 0 == 0, IS ok — see EmptyModuleProducesEmptyModule;
+    // D-CSUBSET-TESTTU-SILENT-EXIT1 dropped the old `expectedFuncCount > 0`
+    // clause that used to make this test pass for the wrong reason.)
+    LirTwoAddrLegalizeResult mismatch;
+    mismatch.expectedFuncCount     = 5;    // claimed 5 functions...
+    mismatch.allFunctionsLegalized = true;
+    // ...but the default (empty) lir has moduleFuncCount() == 0 → 0 != 5.
+    EXPECT_FALSE(mismatch.ok());
+    EXPECT_EQ(mismatch.expectedFuncCount, 5u);
 }

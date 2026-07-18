@@ -1055,6 +1055,16 @@ enum class DiagnosticCode : std::uint16_t {
     // member's extern FFI surface — are still accepted; only INPUT static
     // archives hit this.)
     D_StaticLibFatArchiveUnsupported = 0xD013,
+    // D_CompileUnitNullNoDiagnostic: the driver's fail-loud belt-and-
+    //   suspenders guard fired — a per-CU build (`buildCuMir`) OR the back-half
+    //   lower (`lowerCuMirToAssembly`) returned a null module WITHOUT any tier
+    //   having reported a diagnostic. Every real tier failure reports its own
+    //   K_/L_/A_/S_/H_ code; a null-with-silent-reporter is a substrate-contract
+    //   violation (the D-PERF-4 buildCuMir-null contract). Mirrors the
+    //   optimizer's X_OptReturnFalseWithoutDiagnostic guard so a future silent
+    //   tier-reject surfaces loudly here instead of exiting 1 with no output
+    //   (the D-CSUBSET-TESTTU-SILENT-EXIT1 class of silent-exit-1 bug).
+    D_CompileUnitNullNoDiagnostic = 0xD014,
 
     // ── H0xxx — HIR-tier diagnostics (plan 09; the 0xF high nibble renders
     // as the letter `H`, see diagnosticCodePrefix) ──

@@ -124,13 +124,19 @@ struct Loaded {
 
 } // namespace
 
-TEST(Linker, EmptyModuleIsNotOk) {
+TEST(Linker, EmptyModuleIsOk) {
+    // D-CSUBSET-TESTTU-SILENT-EXIT1: an empty module (a declaration-only /
+    // all-preprocessed-out TU) links cleanly to a valid empty relocatable
+    // object — resolvedFuncCount == expectedFuncCount == 0 is a VALID success.
+    // RED-ON-DISABLE: restoring the `expectedFuncCount > 0` clause in
+    // LinkedImage::ok() flips this back to false and silently rejects the
+    // whole compile of any declaration-only TU.
     auto loaded = loadMinimal();
     ASSERT_TRUE(loaded.target && loaded.format);
     AssembledModule empty{};
     DiagnosticReporter rep;
     auto image = linker::link(empty, *loaded.target, *loaded.format, rep);
-    EXPECT_FALSE(image.ok());
+    EXPECT_TRUE(image.ok());
     EXPECT_EQ(image.expectedFuncCount, 0u);
     EXPECT_EQ(image.resolvedFuncCount, 0u);
     EXPECT_EQ(rep.errorCount(), 0u);
