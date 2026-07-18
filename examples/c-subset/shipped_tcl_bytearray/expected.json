@@ -1,0 +1,14 @@
+{
+  "$comment": "D-FFI-TCL-DESCRIPTOR (SQLite testfixture arc, C15 2026-07-18): RUN witness for the Tcl BYTE-ARRAY signature ABI fix. Real Tcl 8.6: `unsigned char *Tcl_GetByteArrayFromObj(Tcl_Obj*, int*)` + `Tcl_Obj *Tcl_NewByteArrayObj(const unsigned char *bytes, int len)` -- the byte pointers are unsigned char* (u8*), not char*. tcl.json modeled both as ptr<char>, so every sqlite test-TU passing/receiving an unsigned char* byte buffer (test5/test_blob/test_hexio) hit S0003 (char* vs unsigned char* is a strict fail-loud pointer mismatch). C15 corrects both to ptr<u8> -> the 3 TUs go fully CLEAN (29->32; the S0003 first-error class 3->0, no regression). BytesCmd (libtcl calls it back on the eval) builds a byte array from an unsigned char[] via Tcl_NewByteArrayObj (ptr<u8> param, no cast) then reads it back via Tcl_GetByteArrayFromObj (ptr<u8> return -> `unsigned char *back`, no cast) and sums back[0]+back[1] = 40+2 = 42, value-divergent over bytes libtcl round-tripped. elf-x86_64 only (tcl.json availableObjectFormats:[elf]); CI ubuntu x86_64 runs it (libtcl8.6). RED-ON-DISABLE: revert the two byte-array signatures in tcl.json to ptr<char> -> BOTH the Tcl_NewByteArrayObj(buf,2) arg AND the `unsigned char *back = Tcl_GetByteArrayFromObj(...)` return raise S0003 -> stops compiling.",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "expectedStdout": "tcl-bytearray-ok\n",
+  "targets": [
+    { "spec": "x86_64:elf64-x86_64-linux-exec", "artifact": "main", "runOn": ["linux"], "expectedStdout": "tcl-bytearray-ok\n" }
+  ],
+  "optimizedPipelines": [
+    {"label": "full-release-like", "passes": ["ConstFold", "Mem2Reg", "CopyProp", "Cse", "Licm", "SimplifyCfg", "Dce"]},
+    {"label": "release", "shippedPipeline": "release"}
+  ]
+}

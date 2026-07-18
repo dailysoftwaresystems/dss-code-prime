@@ -1509,8 +1509,20 @@ TEST(ShippedLibDescriptor, RealTclDescriptorDecodesLinkSurface) {
                           "Tcl_ListObjLength", "Tcl_ListObjIndex", "Tcl_SetVar",
                           "Tcl_SetVar2", "Tcl_GetInt", "Tcl_GetDoubleFromObj",
                           "Tcl_DStringInit", "Tcl_ResetResult", "Tcl_DuplicateObj",
-                          "Tcl_LinkVar", "Tcl_GetChannel"})
+                          "Tcl_LinkVar", "Tcl_GetChannel",
+                          // C15 (D-FFI-TCL-DESCRIPTOR): the two Tcl BYTE-ARRAY functions.
+                          "Tcl_NewByteArrayObj", "Tcl_GetByteArrayFromObj"})
         EXPECT_NE(sym(n), nullptr) << "missing Tcl symbol: " << n;
+    // C15 (D-FFI-TCL-DESCRIPTOR): the two byte-array functions' byte-pointer element
+    // type is `unsigned char` (u8*), matching the real Tcl 8.6 ABI
+    // (`Tcl_NewByteArrayObj(const unsigned char*, int)` /
+    // `unsigned char *Tcl_GetByteArrayFromObj(Tcl_Obj*, int*)`), NOT `char*`. The
+    // former `ptr<char>` descriptor made test5/test_blob/test_hexio S0003 on their
+    // `(u8*)` / `unsigned char *` byte buffers (char* vs unsigned char* is a strict
+    // fail-loud pointer mismatch); the fix takes all three fully CLEAN. The exact
+    // `ptr<u8>` element type is behaviorally RED-ON-DISABLE via the
+    // shipped_tcl_bytearray example: revert the two signatures to `ptr<char>` and
+    // BOTH the u8* arg AND the u8* return raise S0003 -> that example stops compiling.
     // C13 (D-FFI-TCL-DESCRIPTOR, dissolves D-FFI-TCL-REFCOUNT-MACROS): Tcl_IncrRefCount /
     // Tcl_DecrRefCount are field-poking MACROS in real tcl.h that libtcl does NOT export.
     // C9 left them out entirely (a symbol would be eager-imported and break every tcl
