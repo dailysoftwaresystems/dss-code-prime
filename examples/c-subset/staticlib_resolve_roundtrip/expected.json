@@ -1,0 +1,32 @@
+{
+  "$comment": "D-EXAMPLES-RUNNER-MULTI-ARTIFACT (c171): the FIRST multi-artifact corpus example. Each target's `dependsOn` builds `lib.c` (exporting dss_lib_answer) into a STATIC LIBRARY via the c171-D `-staticlib` format (a `.lib` on pe64 / a `.a` on elf64), then builds `main.c` (extern dss_lib_answer) RESOLVING against it via --resolve-library -> the c169/c170 COFF / c165 ELF static-link pulls the member into a SELF-CONTAINED exec -> exit 42. Witnesses, at the corpus tier + end-to-end: the c171 dependsOn runner capability, the c171-D staticlib driver surface, and the static-link pull/merge. PE RUNS natively on the Windows gate; ELF RUNS on the ubuntu leg / under WSL (SkippedCrossHost elsewhere, where the BUILD still gives structural coverage).",
+  "language": "c-subset",
+  "source": "main.c",
+  "exitCode": 42,
+  "targets": [
+    {
+      "spec": "x86_64:pe64-x86_64-windows-exec",
+      "artifact": "main.exe",
+      "runOn": ["windows"],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "x86_64:pe64-x86_64-windows-staticlib",
+          "artifact": "dsslib.lib"
+        }
+      ]
+    },
+    {
+      "spec": "x86_64:elf64-x86_64-linux-exec",
+      "artifact": "main",
+      "runOn": ["linux"],
+      "dependsOn": [
+        {
+          "sources": ["dsslib.c"],
+          "spec": "x86_64:elf64-x86_64-linux-staticlib",
+          "artifact": "dsslib.a"
+        }
+      ]
+    }
+  ]
+}
